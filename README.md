@@ -16,6 +16,9 @@ docs | title ~ "wal"
 docs | title ~ /wal.*/i
 orders | total > 100 | join users on user_id | { id, users.email, total }
 docs | hop wikilink | { id, title }
+docs | id == "…" | graph wikilink depth=2 | { rel, from, to }
+docs | id == "…" | match -wikilink-> b | { id, b.title }
+docs | id == "…" | match a -wikilink-> b -wikilink-> c | { a.title, b.title, c.title }
 docs | search "wal" | take 20
 docs | { id } | union orders | { id }
 let x = docs | wing == "rag" | { id }
@@ -46,9 +49,9 @@ col notes { title: text }
 rel cites
 ```
 
-`union` — совместимые столбцы по имени после последней проекции каждой стороны. `let` — только чтение, не запись. Несколько `append`/`insert`/`delete`/`update` в одной строке `run()` — один пакет, один `gen` (или ничего); запросы после записи видят новое состояние; любая ошибка откатывает всё. Список в `insert`/`append` — один `InsertPack`/`Append`, один `gen`. `cas each` читает hash каждой строки на старте пакета и CAS-ит все; смена mid-pack откатывает всё. `update`/`delete` без `cas` / `cas each` — ошибка. Пустой `[]` — ошибка. `with edge` на списке insert запрещён. `col` / `rel` / `index` создают живую коллекцию/ребро/индекс в store.
+`union` — совместимые столбцы по имени после последней проекции каждой стороны. `hop` — узлы по ребру (depth 1..=3). `graph` — те же обход и лимиты, но строки рёбер `{ rel, from, to }` (после шага scope = edges). `match` — pattern path: `-rel-> bind` (до 3 hops), узлы как `bind.field` (как join); опционально `match a -rel-> b`. `let` — только чтение, не запись. Несколько `append`/`insert`/`delete`/`update` в одной строке `run()` — один пакет, один `gen` (или ничего); запросы после записи видят новое состояние; любая ошибка откатывает всё. Список в `insert`/`append` — один `InsertPack`/`Append`, один `gen`. `cas each` читает hash каждой строки на старте пакета и CAS-ит все; смена mid-pack откатывает всё. `update`/`delete` без `cas` / `cas each` — ошибка. Пустой `[]` — ошибка. `with edge` на списке insert запрещён. `col` / `rel` / `index` создают живую коллекцию/ребро/индекс в store.
 
-Составной индекс: порядок полей = leftmost prefix. `wing == "rag" and ts > ago 7d` по `[wing,ts]` — `IndexSeek index=docs[wing,ts]` (равенство слева + range на следующем). Только `wing ==` — тот же индекс. Только `ts >` — scan, leftmost не закрыт. `id ==` остаётся `Get`.
+Составной индекс: порядок полей = leftmost prefix. `wing == "rag" and ts > ago 7d` по `[wing,ts]` — `IndexSeek index=docs[wing,ts]` (равенство слева + range на следующем). Только `wing ==` — тот же индекс. Только `ts >` — scan, leftmost не закрыт. `id ==` остаётся `Get`. `wing == "rag" or wing == "sys"` — несколько seek по индексу и объединение; если хоть одна ветка `or` не индексируется — scan.
 
 `has` — целое слово (граница токена). `~ "…"` — подстрока. `~ /…/i` — регулярка (литерал проверяется при компиляции). `ago 7d` = `now - 7d` (единица обязательна).
 
@@ -79,29 +82,21 @@ cargo bench --bench compare -- --filter insert_bulk_1k --samples 8
 
 ### Postgres / MySQL
 
-Без сервера кейсы просто пропускаются (Lin/SQLite/DuckDB всё равно бегут). По умолчанию пробуются локальные Docker-порты; либо задайте URL явно:
+Без сервера кейсы пропускаются (Lin/SQLite/DuckDB всё равно бегут). URL: `LIN_BENCH_PG_URL` / `LIN_BENCH_MYSQL_URL`, иначе авто-probe локальных портов.
 
 ```bash
+# рекомендуемый стек (в корне lin)
+docker compose -f docker-compose.bench.yml up -d
+# либо явно:
 export LIN_BENCH_PG_URL='postgresql://lin:lin@127.0.0.1:55432/lin'
 export LIN_BENCH_MYSQL_URL='mysql://lin:lin@127.0.0.1:53306/lin'
 ```
 
-Один раз поднять серверы:
+Альтернативы из `Documents/Sources`:
+- MySQL smoke из **dbill**: `docker compose -f ../dbill/docker-compose.yml up -d mysql` → `mysql://dbill:dbill@127.0.0.1:33306/dbill_smoke`
+- Postgres через Homebrew: задача **ppduster** `macos-stack-postgres` (`postgresql@17`); после старта сервиса probe `postgresql://postgres@127.0.0.1:5432/postgres`
 
-```bash
-docker run -d --name lin-bench-pg \
-  -e POSTGRES_PASSWORD=lin -e POSTGRES_USER=lin -e POSTGRES_DB=lin \
-  -p 55432:5432 postgres:16-alpine
-
-docker run -d --name lin-bench-mysql \
-  -e MYSQL_ROOT_PASSWORD=lin -e MYSQL_DATABASE=lin \
-  -e MYSQL_USER=lin -e MYSQL_PASSWORD=lin \
-  -p 53306:3306 mysql:8.4
-```
-
-Повторный старт: `docker start lin-bench-pg lin-bench-mysql`.
-
-Зависимости бенча: `postgres`, `mysql` (dev-dependencies). `rbench` из git (`branch = "release"`).
+Зависимости бенча: `postgres`, `mysql` (dev-dependencies). `rbench` — path на sibling `../rbench/crates/rbench`.
 
 ## Запуск
 

@@ -58,6 +58,50 @@ fn hop_wikilink() {
 }
 
 #[test]
+fn graph_wikilink() {
+    let g = ok(
+        r#"docs | id == "e7c98d54-b4d6-4165-86e9-9b999e7ce9c3" | graph wikilink depth=2 | { rel, from, to }"#,
+    );
+    assert!(g.contains("Graph wikilink depth=2 cap=300"), "{g}");
+    assert!(g.contains("Project [rel, from, to]"), "{g}");
+}
+
+#[test]
+fn graph_unknown_rel() {
+    let e = err("docs | graph missing");
+    assert!(e.contains("unknown rel: missing"), "{e}");
+}
+
+#[test]
+fn match_path_plan() {
+    let p = ok(
+        r#"docs | id == "e7c98d54-b4d6-4165-86e9-9b999e7ce9c3" | match -wikilink-> b | { id, b.title }"#,
+    );
+    assert!(p.contains("Match -wikilink-> b cap=300"), "{p}");
+    assert!(p.contains("Project [id, b.title]"), "{p}");
+}
+
+#[test]
+fn match_with_start_alias() {
+    let p = ok(
+        r#"docs | id == "e7c98d54-b4d6-4165-86e9-9b999e7ce9c3" | match a -wikilink-> b | { a.title, b.title }"#,
+    );
+    assert!(p.contains("Match a -wikilink-> b cap=300"), "{p}");
+}
+
+#[test]
+fn match_unknown_rel() {
+    let e = err("docs | match -missing-> b");
+    assert!(e.contains("unknown rel: missing"), "{e}");
+}
+
+#[test]
+fn match_duplicate_bind() {
+    let e = err("docs | match -wikilink-> b -wikilink-> b");
+    assert!(e.contains("duplicate match bind: b"), "{e}");
+}
+
+#[test]
 fn search_hybrid_then_take() {
     let plan = ok(r#"docs | wing == "rag" | search "embedding identity" | take 20"#);
     assert!(plan.contains("RRF k=20"));
@@ -424,4 +468,20 @@ fn index_point_get_still() {
 docs | id == "e7c98d54-b4d6-4165-86e9-9b999e7ce9c3""#);
     assert!(plan.contains("Get docs id="), "{plan}");
     assert!(!plan.contains("index=docs[wing,ts]"), "{plan}");
+}
+
+#[test]
+fn index_or_equality_uses_index() {
+    let plan = ok(r#"index docs [wing, ts]
+docs | wing == "rag" or wing == "sys" | { id }"#);
+    assert!(plan.contains("index=docs[wing,ts]"), "{plan}");
+    assert!(!plan.contains("Scan docs"), "{plan}");
+}
+
+#[test]
+fn index_or_with_unindexed_arm_scans() {
+    let plan = ok(r#"index docs [wing, ts]
+docs | wing == "rag" or title has "wal" | { id }"#);
+    assert!(!plan.contains("index=docs[wing,ts]"), "{plan}");
+    assert!(plan.contains("Scan docs"), "{plan}");
 }

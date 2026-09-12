@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::ast::{Decl, TypeExpr};
@@ -711,6 +711,19 @@ impl Store {
         key: &str,
         fields: Option<&[String]>,
     ) -> Option<Row> {
+        // docs hot project: columnar Arc clones, skip full BTreeMap row.
+        if collection == "docs"
+            && let Some(fs) = fields
+            && !fs.is_empty()
+            && fs.iter().all(|f| docs_hot_field(f))
+        {
+            let idx = match field {
+                "id" => self.row_index("docs", key)?,
+                "uri" => *self.docs_by_uri.get(key)?,
+                _ => return None,
+            };
+            return self.project_docs_hot_idx(idx, fs);
+        }
         let row = match field {
             "id" => self.get_by_id(collection, key)?,
             "uri" if collection == "docs" => self.get_by_uri(key)?,
@@ -720,6 +733,25 @@ impl Store {
             Some(fs) if !fs.is_empty() => project_fields(row, fs),
             _ => row.clone(),
         })
+    }
+
+    /// Single-row hot projection from parallel docs columns.
+    pub fn project_docs_hot_idx(&self, i: usize, fields: &[String]) -> Option<Row> {
+        if i >= self.docs_id.len() {
+            return None;
+        }
+        let mut row = BTreeMap::new();
+        for f in fields {
+            let cell = match f.as_str() {
+                "id" => Cell::Text(Arc::clone(&self.docs_id[i])),
+                "title" => Cell::Text(Arc::clone(&self.docs_title[i])),
+                "layer" => Cell::Text(Arc::clone(&self.docs_layer[i])),
+                "wing" => Cell::Text(Arc::clone(&self.docs_wing[i])),
+                _ => return None,
+            };
+            row.insert(f.clone(), cell);
+        }
+        Some(row)
     }
 
     pub fn rebuild_row_maps(&mut self) {
@@ -785,24 +817,35 @@ impl Store {
     }
 
     pub fn row_maps_register(&mut self, collection: &str, idx: usize) {
-        let Some(row) = self.collections.get(collection).and_then(|c| c.get(idx)) else {
+        let snaps = self
+            .collections
+            .get(collection)
+            .and_then(|c| c.get(idx))
+            .map(|row| {
+                (
+                    row.get("id").and_then(Cell::text_shared),
+                    row.get("uri").and_then(Cell::text_shared),
+                    row.get("title").and_then(Cell::text_shared),
+                    row.get("layer").and_then(Cell::text_shared),
+                    row.get("wing").and_then(Cell::text_shared),
+                )
+            });
+        let Some((id, uri, title, layer, wing)) = snaps else {
             return;
         };
-        let id = row_text(row, "id").map(str::to_string);
-        let uri = row_text(row, "uri").map(str::to_string);
-        let did = row.get("id").and_then(Cell::text_shared).unwrap_or_default();
-        let title = row.get("title").and_then(Cell::text_shared).unwrap_or_default();
-        let layer = row.get("layer").and_then(Cell::text_shared).unwrap_or_default();
-        let wing = row.get("wing").and_then(Cell::text_shared).unwrap_or_default();
-        if let Some(id) = id {
+        if let Some(ref id) = id {
             self.by_id
                 .entry(collection.to_string())
                 .or_default()
-                .insert(id, idx);
+                .insert(id.as_ref().to_owned(), idx);
         }
         if collection == "docs" {
+            let did = id.unwrap_or_default();
+            let title = title.unwrap_or_default();
+            let layer = layer.unwrap_or_default();
+            let wing = wing.unwrap_or_default();
             if let Some(uri) = uri {
-                self.docs_by_uri.insert(uri, idx);
+                self.docs_by_uri.insert(uri.as_ref().to_owned(), idx);
             }
             if idx == self.docs_id.len() {
                 self.docs_id.push(did);
@@ -817,6 +860,84 @@ impl Store {
             } else {
                 self.rebuild_row_maps_collection("docs");
             }
+        }
+    }
+
+    /// Register maps/columns from an already-built row (avoids re-fetch).
+    pub fn row_maps_register_row(&mut self, collection: &str, idx: usize, row: &Row) {
+        let id = row.get("id").and_then(Cell::text_shared);
+        let uri = row.get("uri").and_then(Cell::text_shared);
+        if let Some(ref id) = id {
+            self.by_id
+                .entry(collection.to_string())
+                .or_default()
+                .insert(id.as_ref().to_owned(), idx);
+        }
+        if collection == "docs" {
+            let title = row.get("title").and_then(Cell::text_shared).unwrap_or_default();
+            let layer = row.get("layer").and_then(Cell::text_shared).unwrap_or_default();
+            let wing = row.get("wing").and_then(Cell::text_shared).unwrap_or_default();
+            let did = id.clone().unwrap_or_default();
+            if let Some(uri) = uri {
+                self.docs_by_uri.insert(uri.as_ref().to_owned(), idx);
+            }
+            if idx == self.docs_id.len() {
+                self.docs_id.push(did);
+                self.docs_title.push(title);
+                self.docs_layer.push(layer);
+                self.docs_wing.push(wing);
+            } else if idx < self.docs_id.len() {
+                self.docs_id[idx] = did;
+                self.docs_title[idx] = title;
+                self.docs_layer[idx] = layer;
+                self.docs_wing[idx] = wing;
+            } else {
+                self.rebuild_row_maps_collection("docs");
+            }
+        }
+    }
+
+    /// Append-only slab: register `[start, start+rows.len())` from the given rows.
+    pub fn row_maps_register_slab(&mut self, collection: &str, start: usize, rows: &[Row]) {
+        if rows.is_empty() {
+            return;
+        }
+        self.row_maps_reserve(collection, rows.len());
+        if collection == "docs" {
+            if self.docs_id.len() != start {
+                self.rebuild_row_maps_collection("docs");
+                if self.docs_id.len() != start {
+                    for (i, row) in rows.iter().enumerate() {
+                        self.row_maps_register_row(collection, start + i, row);
+                    }
+                    return;
+                }
+            }
+            for (i, row) in rows.iter().enumerate() {
+                let idx = start + i;
+                let id = row.get("id").and_then(Cell::text_shared);
+                let uri = row.get("uri").and_then(Cell::text_shared);
+                if let Some(ref id) = id {
+                    self.by_id
+                        .entry(collection.to_string())
+                        .or_default()
+                        .insert(id.as_ref().to_owned(), idx);
+                }
+                if let Some(uri) = uri {
+                    self.docs_by_uri.insert(uri.as_ref().to_owned(), idx);
+                }
+                self.docs_id.push(id.unwrap_or_default());
+                self.docs_title
+                    .push(row.get("title").and_then(Cell::text_shared).unwrap_or_default());
+                self.docs_layer
+                    .push(row.get("layer").and_then(Cell::text_shared).unwrap_or_default());
+                self.docs_wing
+                    .push(row.get("wing").and_then(Cell::text_shared).unwrap_or_default());
+            }
+            return;
+        }
+        for (i, row) in rows.iter().enumerate() {
+            self.row_maps_register_row(collection, start + i, row);
         }
     }
 
@@ -875,6 +996,30 @@ impl Store {
         Ok(())
     }
 
+    /// Batch secondary-index inserts for a freshly appended slab `[start, start+rows.len())`.
+    pub fn index_insert_slab(&mut self, collection: &str, start: usize, rows: &[Row]) -> Result<(), Error> {
+        let labels: Vec<String> = self
+            .indexes
+            .iter()
+            .filter(|(_, idx)| idx.def.collection == collection)
+            .map(|(k, _)| k.clone())
+            .collect();
+        if labels.is_empty() {
+            return Ok(());
+        }
+        for (i, row) in rows.iter().enumerate() {
+            let row_idx = start + i;
+            for label in &labels {
+                if let Some(idx) = self.indexes.get_mut(label)
+                    && let Err(e) = idx.insert_at_new(row_idx, row)
+                {
+                    return Err(Error::runtime(e));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn index_remove_at(&mut self, collection: &str, row_idx: usize) {
         for idx in self.indexes.values_mut() {
             if idx.def.collection == collection {
@@ -927,40 +1072,65 @@ impl Store {
     pub fn index_seek(
         &self,
         collection: &str,
-        use_: &crate::index::IndexUse,
+        uses: &[crate::index::IndexUse],
         now: i64,
     ) -> Option<Vec<usize>> {
-        let label = use_.def.label();
-        let idx = self.indexes.get(&label)?;
-        if idx.def.collection != collection {
+        if uses.is_empty() {
             return None;
         }
-        Some(idx.seek_idxs(use_, now))
+        if uses.len() == 1 {
+            let use_ = &uses[0];
+            let idx = self.indexes.get(&use_.def.label())?;
+            if idx.def.collection != collection {
+                return None;
+            }
+            return Some(idx.seek_idxs(use_, now));
+        }
+        let mut out = Vec::new();
+        let mut seen = FxHashSet::default();
+        for use_ in uses {
+            let idx = self.indexes.get(&use_.def.label())?;
+            if idx.def.collection != collection {
+                return None;
+            }
+            for i in idx.seek_idxs(use_, now) {
+                if seen.insert(i) {
+                    out.push(i);
+                }
+            }
+        }
+        Some(out)
     }
 
     pub fn index_seek_count(
         &self,
         collection: &str,
-        use_: &crate::index::IndexUse,
+        uses: &[crate::index::IndexUse],
         now: i64,
     ) -> Option<usize> {
-        let label = use_.def.label();
-        let idx = self.indexes.get(&label)?;
-        if idx.def.collection != collection {
+        if uses.is_empty() {
             return None;
         }
-        Some(idx.seek_count(use_, now))
+        if uses.len() == 1 {
+            let use_ = &uses[0];
+            let idx = self.indexes.get(&use_.def.label())?;
+            if idx.def.collection != collection {
+                return None;
+            }
+            return Some(idx.seek_count(use_, now));
+        }
+        // OR branches may overlap — dedupe via seek.
+        Some(self.index_seek(collection, uses, now)?.len())
     }
 
     /// Count `docs.title ~ needle` grouped by layer using columnar titles (no row maps).
-    pub fn docs_title_contains_count_by_layer(&self, needle: &str) -> BTreeMap<String, i64> {
+    pub fn docs_title_contains_count_by_layer(&self, needle: &str) -> BTreeMap<Arc<str>, i64> {
         let finder = memchr::memmem::Finder::new(needle.as_bytes());
-        let mut map: BTreeMap<String, i64> = BTreeMap::new();
+        let mut map: BTreeMap<Arc<str>, i64> = BTreeMap::new();
         let n = self.docs_title.len().min(self.docs_layer.len());
         for i in 0..n {
             if finder.find(self.docs_title[i].as_bytes()).is_some() {
-                let key = format!("{}", Quote(self.docs_layer[i].as_ref()));
-                *map.entry(key).or_insert(0) += 1;
+                *map.entry(Arc::clone(&self.docs_layer[i])).or_insert(0) += 1;
             }
         }
         map
@@ -1102,8 +1272,23 @@ pub fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+#[allow(dead_code)]
 pub fn content_hash(body: &str) -> String {
-    format!("h:{:016x}", fnv1a64(body.as_bytes()))
+    content_hash_arc(body).as_ref().to_owned()
+}
+
+pub fn content_hash_arc(body: &str) -> Arc<str> {
+    let h = fnv1a64(body.as_bytes());
+    let mut buf = [0u8; 18];
+    buf[0] = b'h';
+    buf[1] = b':';
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for i in 0..16 {
+        let shift = (15 - i) * 4;
+        buf[2 + i] = HEX[((h >> shift) & 0xf) as usize];
+    }
+    // SAFETY: buf is always ASCII hex.
+    Arc::from(std::str::from_utf8(&buf).unwrap())
 }
 
 pub fn fnv1a64(bytes: &[u8]) -> u64 {
@@ -1136,7 +1321,7 @@ fn doc_row(d: DocSeed<'_>) -> Row {
     r.insert("room".into(), Cell::text_arc(d.room));
     r.insert("layer".into(), Cell::text_arc(d.layer));
     r.insert("body".into(), Cell::text_arc(d.body));
-    r.insert("hash".into(), Cell::text_arc(content_hash(d.body)));
+    r.insert("hash".into(), Cell::Text(content_hash_arc(d.body)));
     r.insert("snippet".into(), Cell::text_arc(d.snippet));
     r.insert("ts".into(), Cell::Time(d.ts));
     r

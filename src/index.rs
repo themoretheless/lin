@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::ops::Bound;
+use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
 
@@ -14,7 +15,7 @@ pub enum IndexPart {
     Bool(bool),
     Int(i64),
     Time(i64),
-    Text(String),
+    Text(Arc<str>),
     Max,
 }
 
@@ -57,6 +58,23 @@ impl LiveIndex {
 
     pub fn insert_at(&mut self, idx: usize, row: &Row) -> Result<(), String> {
         let key = self.key_of(row);
+        self.insert_key(idx, key)
+    }
+
+    /// Append-only bulk path: no reverse-key replace (fresh indices).
+    pub fn insert_at_new(&mut self, idx: usize, row: &Row) -> Result<(), String> {
+        let key = self.key_of(row);
+        if self.def.unique
+            && self.forward.contains_key(&key)
+        {
+            return Err(format!("unique index {}: duplicate key", self.def.label()));
+        }
+        self.reverse.insert(idx, key.clone());
+        self.forward.entry(key).or_default().push(idx);
+        Ok(())
+    }
+
+    fn insert_key(&mut self, idx: usize, key: IndexKey) -> Result<(), String> {
         if self.def.unique
             && let Some(ids) = self.forward.get(&key)
             && ids.iter().any(|&x| x != idx)
@@ -145,9 +163,9 @@ fn next_part(p: &IndexPart) -> IndexPart {
         IndexPart::Int(n) => IndexPart::Int(n.saturating_add(1)),
         IndexPart::Time(n) => IndexPart::Time(n.saturating_add(1)),
         IndexPart::Text(s) => {
-            let mut t = s.clone();
+            let mut t = s.as_ref().to_owned();
             t.push('\0');
-            IndexPart::Text(t)
+            IndexPart::Text(Arc::from(t))
         }
         IndexPart::Bool(false) => IndexPart::Bool(true),
         other => other.clone(),
@@ -160,15 +178,15 @@ fn cell_part(c: &Cell) -> IndexPart {
         Cell::Bool(b) => IndexPart::Bool(*b),
         Cell::Int(n) => IndexPart::Int(*n),
         Cell::Time(n) => IndexPart::Time(*n),
-        Cell::Text(s) => IndexPart::Text(s.as_ref().to_owned()),
+        Cell::Text(s) => IndexPart::Text(Arc::clone(s)),
         Cell::Float(n) => IndexPart::Int(n.to_bits() as i64),
     }
 }
 
 fn value_part(v: &Value, now: i64) -> IndexPart {
     match v {
-        Value::String(s) => IndexPart::Text(s.clone()),
-        Value::Name(s) => IndexPart::Text(s.clone()),
+        Value::String(s) => IndexPart::Text(Arc::from(s.as_str())),
+        Value::Name(s) => IndexPart::Text(Arc::from(s.as_str())),
         Value::Int(n) => IndexPart::Int(*n),
         Value::Float(n) => IndexPart::Int(n.to_bits() as i64),
         Value::Bool(b) => IndexPart::Bool(*b),
@@ -178,10 +196,17 @@ fn value_part(v: &Value, now: i64) -> IndexPart {
     }
 }
 
-pub fn pick_index(cat: &Catalog, collection: &str, pred: &Pred) -> Option<IndexUse> {
-    if pred_has_or(pred) {
-        return None;
+/// Pick one seek per DNF branch. `or` → union of seeks when every branch is indexable.
+pub fn pick_index(cat: &Catalog, collection: &str, pred: &Pred) -> Option<Vec<IndexUse>> {
+    let branches = dnf(pred);
+    let mut uses = Vec::with_capacity(branches.len());
+    for branch in &branches {
+        uses.push(pick_conjunct(cat, collection, branch)?);
     }
+    Some(uses)
+}
+
+fn pick_conjunct(cat: &Catalog, collection: &str, pred: &Pred) -> Option<IndexUse> {
     let atoms = flatten_and(pred);
     let mut best: Option<IndexUse> = None;
     let mut best_n = 0usize;
@@ -219,11 +244,19 @@ pub fn pick_index(cat: &Catalog, collection: &str, pred: &Pred) -> Option<IndexU
     best
 }
 
-/// True when every atomic predicate is enforced by the index seek (no residual filter).
-pub fn index_covers_pred(pred: &Pred, use_: &IndexUse) -> bool {
-    if pred_has_or(pred) {
+/// True when every atomic predicate is enforced by the index seek(s) (no residual filter).
+pub fn index_covers_pred(pred: &Pred, uses: &[IndexUse]) -> bool {
+    let branches = dnf(pred);
+    if branches.len() != uses.len() {
         return false;
     }
+    branches
+        .iter()
+        .zip(uses.iter())
+        .all(|(branch, use_)| index_covers_conjunct(branch, use_))
+}
+
+fn index_covers_conjunct(pred: &Pred, use_: &IndexUse) -> bool {
     for atom in flatten_and(pred) {
         match atom {
             Pred::Cmp {
@@ -253,11 +286,26 @@ pub fn index_covers_pred(pred: &Pred, use_: &IndexUse) -> bool {
     true
 }
 
-pub fn pred_has_or(pred: &Pred) -> bool {
+/// Disjunctive normal form: list of AND-trees (no top-level `or` inside a branch).
+fn dnf(pred: &Pred) -> Vec<Pred> {
     match pred {
-        Pred::Or(_, _) => true,
-        Pred::And(a, b) => pred_has_or(a) || pred_has_or(b),
-        _ => false,
+        Pred::Or(a, b) => {
+            let mut out = dnf(a);
+            out.extend(dnf(b));
+            out
+        }
+        Pred::And(a, b) => {
+            let left = dnf(a);
+            let right = dnf(b);
+            let mut out = Vec::with_capacity(left.len() * right.len());
+            for l in &left {
+                for r in &right {
+                    out.push(Pred::And(Box::new(l.clone()), Box::new(r.clone())));
+                }
+            }
+            out
+        }
+        other => vec![other.clone()],
     }
 }
 

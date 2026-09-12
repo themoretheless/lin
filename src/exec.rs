@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Instant;
 
 use rustc_hash::FxHashMap;
@@ -13,7 +14,7 @@ use crate::graph::GraphFmt;
 use crate::parse;
 use crate::persist::Pack;
 use crate::plan::{self, Plan};
-use crate::store::{Cell, Edge, Row, Store, compact_row, content_hash, now_ms, project_fields, row_text};
+use crate::store::{Cell, Edge, Row, Store, compact_row, content_hash_arc, now_ms, project_fields, row_text};
 
 type StmtOut = (Vec<Row>, Option<String>, Option<Pack>);
 
@@ -38,7 +39,7 @@ pub struct Done {
 
 #[derive(Debug, Clone)]
 pub struct Handle {
-    pub plan: Plan,
+    pub plan: Arc<Plan>,
     pub rows: Vec<Row>,
     pub done: Done,
     pub message: Option<String>,
@@ -66,7 +67,7 @@ impl Handle {
 pub struct Prepared {
     pub src: String,
     stmts: Vec<Stmt>,
-    pub plan: Plan,
+    pub plan: Arc<Plan>,
     /// True if any statement may mutate catalog or store.
     writes: bool,
     /// Append-only writes (insert/append) — cheap rollback without full clone.
@@ -143,7 +144,7 @@ impl Db {
         let stmts = parse::parse_program(src)?;
         let mut check_cat = self.catalog.clone();
         check::check_program(&stmts, &mut check_cat)?;
-        let plan = plan::plan_program(&stmts, &check_cat)?;
+        let plan = Arc::new(plan::plan_program(&stmts, &check_cat)?);
         let writes = stmts.iter().any(stmt_writes);
         let append_only = writes && stmts.iter().all(|s| stmt_append_only(s) || !stmt_writes(s));
         let schema = stmts.iter().any(stmt_schema);
@@ -529,10 +530,10 @@ impl Db {
                 if let Some(bound) = bindings.get(name) {
                     bound.clone()
                 } else if let Some(pred) = first_filter
-                    && let Some(u) = crate::index::pick_index(&self.catalog, name, pred)
-                    && let Some(idxs) = self.store.index_seek(name, &u, now)
+                    && let Some(uses) = crate::index::pick_index(&self.catalog, name, pred)
+                    && let Some(idxs) = self.store.index_seek(name, &uses, now)
                 {
-                    let covered = crate::index::index_covers_pred(pred, &u);
+                    let covered = crate::index::index_covers_pred(pred, &uses);
                     self.fetch_idxs_filtered(name, &idxs, pred, now, project_fields_step, covered)
                 } else if let Some(pred) = first_filter {
                     self.filter_scan(name, pred, now, project_fields_step)
@@ -578,6 +579,13 @@ impl Db {
                 }
                 Step::Hop { rel, depth } => {
                     rows = self.hop(&primary, &rows, rel, depth.unwrap_or(1))?;
+                }
+                Step::Graph { rel, depth } => {
+                    rows = self.graph_edges(&rows, rel, depth.unwrap_or(1))?;
+                    primary = "edges".into();
+                }
+                Step::Match { start, hops } => {
+                    rows = self.match_path(&primary, rows, start.as_deref(), hops)?;
                 }
                 Step::Search { mode, query } => {
                     rows = self.search_rows(&rows, *mode, query)?;
@@ -673,9 +681,21 @@ impl Db {
         }
         let pred = filter?;
         let (field, key) = point_key(pred)?;
-        // Extra AND atoms beyond id/uri eq are still OK if point_key finds id/uri;
-        // re-check full pred after fetch.
-        let row = self.store.project_by_key(name, field, key, fields.as_deref())?;
+        let simple_eq = matches!(
+            pred,
+            Pred::Cmp {
+                op: CmpOp::Eq,
+                value: Value::String(_),
+                ..
+            }
+        );
+        let row = self
+            .store
+            .project_by_key(name, field, key, fields.as_deref())?;
+        // Lookup already keyed by id/uri equality — skip re-eval for a lone Cmp.
+        if simple_eq {
+            return Some(vec![row]);
+        }
         let now = now_ms();
         if !eval_pred(pred, &row, now) {
             // projected row may miss pred fields — evaluate against full row
@@ -737,19 +757,19 @@ impl Db {
             && by.leaf() == Some("layer")
         {
             let map = self.store.docs_title_contains_count_by_layer(needle);
-            return Some(count_map_to_rows(&by_key, map));
+            return Some(count_arc_map_to_rows(&by_key, map));
         }
 
         // Index-covered + group key fixed by equality → pure seek_count.
-        if let Some(u) = crate::index::pick_index(&self.catalog, name, pred)
-            && crate::index::index_covers_pred(pred, &u)
+        if let Some(uses) = crate::index::pick_index(&self.catalog, name, pred)
+            && crate::index::index_covers_pred(pred, &uses)
         {
             if let Some(v) = eq_value_for_field(pred, &by_key) {
-                let n = self.store.index_seek_count(name, &u, now)?;
+                let n = self.store.index_seek_count(name, &uses, now)?;
                 return Some(vec![count_row(&by_key, v, n as i64)]);
             }
             // Index covers filter but group key varies — read only the by-field.
-            let idxs = self.store.index_seek(name, &u, now)?;
+            let idxs = self.store.index_seek(name, &uses, now)?;
             let mut map: BTreeMap<String, i64> = BTreeMap::new();
             for i in idxs {
                 let Some(row) = self.store.get_by_idx(name, i) else {
@@ -830,10 +850,10 @@ impl Db {
             {
                 self.store
                     .scan_docs_hot_project(&names, Some(needle.as_str()))?
-            } else if let Some(u) = crate::index::pick_index(&self.catalog, name, pred)
-                && let Some(idxs) = self.store.index_seek(name, &u, now)
+            } else if let Some(uses) = crate::index::pick_index(&self.catalog, name, pred)
+                && let Some(idxs) = self.store.index_seek(name, &uses, now)
             {
-                let covered = crate::index::index_covers_pred(pred, &u);
+                let covered = crate::index::index_covers_pred(pred, &uses);
                 if name == "docs" && covered {
                     if let Some(rows) = self.store.project_docs_hot(&idxs, &names) {
                         rows
@@ -1060,6 +1080,137 @@ impl Db {
         Ok(out)
     }
 
+    /// Subgraph edges reachable from `rows` via `rel` (same walk as [`Self::hop`]).
+    fn graph_edges(&self, rows: &[Row], rel: &str, depth: i64) -> Result<Vec<Row>, Error> {
+        let (edge_rel, reverse) = match self.catalog.rel(rel) {
+            Some(r) if let Some(of) = &r.reverse_of => (of.as_str(), true),
+            _ => (rel, false),
+        };
+        let mut frontier: BTreeSet<String> = BTreeSet::new();
+        for r in rows {
+            if let Some(id) = row_text(r, "id") {
+                frontier.insert(id.to_string());
+            }
+            if let Some(uri) = row_text(r, "uri") {
+                frontier.insert(uri.to_string());
+            }
+        }
+        let mut seen_nodes = frontier.clone();
+        let mut seen_edges: BTreeSet<(String, String, String)> = BTreeSet::new();
+        let mut out = Vec::new();
+        let depth = depth.clamp(1, 3);
+        for _ in 0..depth {
+            let mut next = BTreeSet::new();
+            for e in &self.store.edges {
+                if e.rel != edge_rel {
+                    continue;
+                }
+                let (src, dst) = if reverse {
+                    (e.to.as_str(), e.from.as_str())
+                } else {
+                    (e.from.as_str(), e.to.as_str())
+                };
+                if !frontier.contains(src) {
+                    continue;
+                }
+                let key = (e.rel.clone(), e.from.clone(), e.to.clone());
+                if seen_edges.insert(key) {
+                    out.push(edge_row(&e.rel, &e.from, &e.to));
+                    if out.len() >= 300 {
+                        return Ok(out);
+                    }
+                }
+                if seen_nodes.insert(dst.to_string()) {
+                    next.insert(dst.to_string());
+                }
+            }
+            frontier = next;
+            if frontier.is_empty() {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Expand `match [-rel-> bind]+` paths; bound nodes appear as `bind.field`.
+    fn match_path(
+        &self,
+        primary: &str,
+        rows: Vec<Row>,
+        start: Option<&str>,
+        hops: &[MatchHop],
+    ) -> Result<Vec<Row>, Error> {
+        let mut cur = Vec::with_capacity(rows.len());
+        for row in rows {
+            let mut r = row.clone();
+            if let Some(alias) = start {
+                for (k, v) in &row {
+                    r.insert(format!("{alias}.{k}"), v.clone());
+                }
+            }
+            cur.push(r);
+        }
+        let mut prev_bind = start;
+        for hop in hops {
+            let (edge_rel, reverse) = match self.catalog.rel(&hop.rel) {
+                Some(r) if let Some(of) = &r.reverse_of => (of.as_str(), true),
+                _ => (hop.rel.as_str(), false),
+            };
+            let mut next_rows = Vec::new();
+            for row in &cur {
+                let keys = match_frontier_keys(row, prev_bind);
+                if keys.is_empty() {
+                    continue;
+                }
+                for e in &self.store.edges {
+                    if e.rel != edge_rel {
+                        continue;
+                    }
+                    let (src, dst) = if reverse {
+                        (e.to.as_str(), e.from.as_str())
+                    } else {
+                        (e.from.as_str(), e.to.as_str())
+                    };
+                    if !keys.iter().any(|k| k == src) {
+                        continue;
+                    }
+                    let Some(node) = self.resolve_node(primary, dst) else {
+                        continue;
+                    };
+                    let mut merged = row.clone();
+                    for (k, v) in &node {
+                        merged.insert(format!("{}.{k}", hop.bind), v.clone());
+                    }
+                    next_rows.push(merged);
+                    if next_rows.len() >= 300 {
+                        return Ok(next_rows);
+                    }
+                }
+            }
+            cur = next_rows;
+            prev_bind = Some(hop.bind.as_str());
+            if cur.is_empty() {
+                break;
+            }
+        }
+        Ok(cur)
+    }
+
+    fn resolve_node(&self, primary: &str, key: &str) -> Option<Row> {
+        if let Some(row) = self.store.find_doc_key(key) {
+            return Some(row.clone());
+        }
+        if primary != "docs" {
+            return self
+                .store
+                .collection(primary)
+                .iter()
+                .find(|r| row_text(r, "id") == Some(key))
+                .cloned();
+        }
+        None
+    }
+
     fn search_rows(&self, rows: &[Row], mode: SearchMode, query: &str) -> Result<Vec<Row>, Error> {
         if matches!(mode, SearchMode::Vec | SearchMode::Hybrid)
             && self.store.embed_id != self.catalog.embed_id
@@ -1149,23 +1300,24 @@ impl Db {
             if row_text(&row, "id").is_none() {
                 row.insert("id".into(), Cell::text_arc(self.store.alloc_id()));
             }
+            // Hash only when body is present and caller did not supply hash (CAS later).
             if row_text(&row, "hash").is_none()
                 && let Some(body) = row_text(&row, "body")
             {
-                row.insert("hash".into(), Cell::text_arc(content_hash(body)));
+                row.insert("hash".into(), Cell::Text(content_hash_arc(body)));
             }
-            let from_id = row_text(&row, "id").unwrap_or("").to_string();
+            let from_id = row_text(&row, "id").unwrap_or("");
             if !from_id.is_empty() {
-                if !batch_ids.insert(from_id.clone())
-                    || self.store.get_by_id(collection, &from_id).is_some()
+                if !batch_ids.insert(from_id.to_owned())
+                    || self.store.get_by_id(collection, from_id).is_some()
                 {
                     return Err(Error::runtime(format!("duplicate id: {from_id}")));
                 }
             }
-            if let Some(uri) = row_text(&row, "uri").map(str::to_string)
-                && collection == "docs"
+            if collection == "docs"
+                && let Some(uri) = row_text(&row, "uri")
             {
-                if !batch_uris.insert(uri.clone()) || self.store.get_by_uri(&uri).is_some() {
+                if !batch_uris.insert(uri.to_owned()) || self.store.get_by_uri(uri).is_some() {
                     return Err(Error::runtime(format!("duplicate uri: {uri}")));
                 }
             }
@@ -1202,18 +1354,17 @@ impl Db {
             }
         }
 
+        // Append-only slab: reserve → index from built → register maps → clone into store.
+        let start = self.store.collection(collection).len();
         self.store.collection_mut(collection).reserve(n);
         self.store.row_maps_reserve(collection, n);
-
-        let mut out = Vec::with_capacity(n);
-        for row in built {
-            let idx = self.store.collection(collection).len();
-            self.store.index_insert_row(collection, idx, &row)?;
-            out.push(row.clone());
-            self.store.collection_mut(collection).push(row);
-            self.store.row_maps_register(collection, idx);
-        }
-        Ok((out, new_edges))
+        self.store.index_insert_slab(collection, start, &built)?;
+        self.store
+            .row_maps_register_slab(collection, start, &built);
+        self.store
+            .collection_mut(collection)
+            .extend(built.iter().cloned());
+        Ok((built, new_edges))
     }
 
     fn update_cas(
@@ -1271,7 +1422,7 @@ impl Db {
             if patch.contains_key("body")
                 && let Some(body) = row_text(row, "body").map(str::to_string)
             {
-                row.insert("hash".into(), Cell::text_arc(content_hash(&body)));
+                row.insert("hash".into(), Cell::Text(content_hash_arc(&body)));
             }
             let updated = row.clone();
             self.store.index_insert_row(collection, i, &updated)?;
@@ -1509,6 +1660,21 @@ fn edge_row(rel: &str, from: &str, to: &str) -> Row {
     r.insert("from".into(), Cell::text_arc(from));
     r.insert("to".into(), Cell::text_arc(to));
     r
+}
+
+fn match_frontier_keys(row: &Row, bind: Option<&str>) -> Vec<String> {
+    let mut keys = Vec::new();
+    let (id_k, uri_k) = match bind {
+        Some(b) => (format!("{b}.id"), format!("{b}.uri")),
+        None => ("id".into(), "uri".into()),
+    };
+    if let Some(id) = row_text(row, &id_k) {
+        keys.push(id.to_string());
+    }
+    if let Some(uri) = row_text(row, &uri_k) {
+        keys.push(uri.to_string());
+    }
+    keys
 }
 
 fn record_row(record: &Record, now: i64) -> Row {
@@ -1755,6 +1921,17 @@ fn agg_count(rows: &[Row], by: &Field) -> Vec<Row> {
 fn count_map_to_rows(by: &str, map: BTreeMap<String, i64>) -> Vec<Row> {
     map.into_iter()
         .map(|(g, n)| count_row(by, &unquote(&g), n))
+        .collect()
+}
+
+fn count_arc_map_to_rows(by: &str, map: BTreeMap<std::sync::Arc<str>, i64>) -> Vec<Row> {
+    map.into_iter()
+        .map(|(g, n)| {
+            let mut row = BTreeMap::new();
+            row.insert(by.to_string(), Cell::Text(g));
+            row.insert("hits".into(), Cell::Int(n));
+            row
+        })
         .collect()
 }
 

@@ -87,6 +87,153 @@ fn hop_after_insert_with_edge() {
 }
 
 #[test]
+fn graph_after_insert_with_edge() {
+    let mut db = Db::fixture();
+    let ins = db
+        .run(
+            r#"insert docs { uri: "raw://n/graph", title: "grapher", layer: "raw" } with edge wikilink -> page "wiki://rag-overview""#,
+        )
+        .unwrap();
+    let id = text(&ins.rows[0], "id");
+    let g = db
+        .run(&format!(
+            r#"docs | id == "{id}" | graph wikilink | {{ rel, from, to }}"#
+        ))
+        .unwrap();
+    assert_eq!(g.done.n, 1, "{:?}", g.rows);
+    assert_eq!(text(&g.rows[0], "rel"), "wikilink");
+    assert_eq!(text(&g.rows[0], "from"), id);
+    assert!(
+        text(&g.rows[0], "to") == "e7c98d54-b4d6-4165-86e9-9b999e7ce9c3"
+            || text(&g.rows[0], "to") == "wiki://rag-overview",
+        "{:?}",
+        g.rows
+    );
+}
+
+#[test]
+fn graph_depth_chain() {
+    let mut db = Db::fixture();
+    db.run(
+        r#"insert docs [
+      { uri: "raw://g1", title: "G1", layer: "wiki" },
+      { uri: "raw://g2", title: "G2", layer: "wiki" },
+      { uri: "raw://g3", title: "G3", layer: "wiki" }
+    ]"#,
+    )
+    .unwrap();
+    let a = text(
+        &db.run(r#"docs | uri == "raw://g1" | { id }"#).unwrap().rows[0],
+        "id",
+    )
+    .to_string();
+    let b = text(
+        &db.run(r#"docs | uri == "raw://g2" | { id }"#).unwrap().rows[0],
+        "id",
+    )
+    .to_string();
+    let c = text(
+        &db.run(r#"docs | uri == "raw://g3" | { id }"#).unwrap().rows[0],
+        "id",
+    )
+    .to_string();
+    db.run(&format!(
+        r#"append edges [
+      wikilink "{a}" -> "{b}",
+      wikilink "{b}" -> "{c}"
+    ]"#
+    ))
+    .unwrap();
+    let d1 = db
+        .run(&format!(r#"docs | id == "{a}" | graph wikilink | take all"#))
+        .unwrap();
+    assert_eq!(d1.done.n, 1, "{:?}", d1.rows);
+    assert_eq!(text(&d1.rows[0], "to"), b);
+    let d2 = db
+        .run(&format!(
+            r#"docs | id == "{a}" | graph wikilink depth=2 | take all"#
+        ))
+        .unwrap();
+    assert_eq!(d2.done.n, 2, "{:?}", d2.rows);
+    assert!(
+        d2.rows
+            .iter()
+            .any(|r| text(r, "from") == a && text(r, "to") == b)
+    );
+    assert!(
+        d2.rows
+            .iter()
+            .any(|r| text(r, "from") == b && text(r, "to") == c)
+    );
+}
+
+#[test]
+fn match_one_hop() {
+    let mut db = Db::fixture();
+    let ins = db
+        .run(
+            r#"insert docs { uri: "raw://n/match", title: "matcher", layer: "raw" } with edge wikilink -> page "wiki://rag-overview""#,
+        )
+        .unwrap();
+    let id = text(&ins.rows[0], "id");
+    let m = db
+        .run(&format!(
+            r#"docs | id == "{id}" | match -wikilink-> b | {{ id, b.title }}"#
+        ))
+        .unwrap();
+    assert_eq!(m.done.n, 1, "{:?}", m.rows);
+    assert_eq!(text(&m.rows[0], "id"), id);
+    assert!(
+        text(&m.rows[0], "b.title").contains("overview") || !text(&m.rows[0], "b.title").is_empty(),
+        "{:?}",
+        m.rows
+    );
+}
+
+#[test]
+fn match_two_hop_chain() {
+    let mut db = Db::fixture();
+    db.run(
+        r#"insert docs [
+      { uri: "raw://m1", title: "M1", layer: "wiki" },
+      { uri: "raw://m2", title: "M2", layer: "wiki" },
+      { uri: "raw://m3", title: "M3", layer: "wiki" }
+    ]"#,
+    )
+    .unwrap();
+    let a = text(
+        &db.run(r#"docs | uri == "raw://m1" | { id }"#).unwrap().rows[0],
+        "id",
+    )
+    .to_string();
+    let b = text(
+        &db.run(r#"docs | uri == "raw://m2" | { id }"#).unwrap().rows[0],
+        "id",
+    )
+    .to_string();
+    let c = text(
+        &db.run(r#"docs | uri == "raw://m3" | { id }"#).unwrap().rows[0],
+        "id",
+    )
+    .to_string();
+    db.run(&format!(
+        r#"append edges [
+      wikilink "{a}" -> "{b}",
+      wikilink "{b}" -> "{c}"
+    ]"#
+    ))
+    .unwrap();
+    let m = db
+        .run(&format!(
+            r#"docs | id == "{a}" | match -wikilink-> mid -wikilink-> end | {{ mid.title, end.title }}"#
+        ))
+        .unwrap();
+    assert_eq!(m.done.n, 1, "{:?}", m.rows);
+    assert_eq!(text(&m.rows[0], "mid.title"), "M2");
+    assert_eq!(text(&m.rows[0], "end.title"), "M3");
+}
+
+#[test]
 fn unknown_field_still_compile_fail() {
     let mut db = Db::fixture();
     let e = db.run(r#"docs | wign == "rag""#).unwrap_err();
@@ -414,6 +561,22 @@ fn index_filter_explain_and_rows() {
         .run(r#"docs | wing == "rag" and ts > ago 7d | { id, title }"#)
         .unwrap();
     assert_eq!(h.done.n, 2);
+}
+
+#[test]
+fn index_or_equality_rows() {
+    let mut db = Db::fixture();
+    db.run("index docs [wing, ts]").unwrap();
+    let plan = db
+        .explain_as(r#"docs | wing == "rag" or wing == "sys" | take all"#, None)
+        .unwrap();
+    assert!(plan.contains("index=docs[wing,ts]"), "{plan}");
+    let h = db
+        .run(r#"docs | wing == "rag" or wing == "sys" | take all"#)
+        .unwrap();
+    assert_eq!(h.done.n, 3);
+    let only_rag = db.run(r#"docs | wing == "rag" | take all"#).unwrap();
+    assert_eq!(only_rag.done.n, 2);
 }
 
 #[test]

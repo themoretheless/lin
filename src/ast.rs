@@ -70,6 +70,12 @@ pub enum Source {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct MatchHop {
+    pub rel: String,
+    pub bind: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Step {
     Filter(Pred),
     Project(Vec<Field>),
@@ -81,6 +87,17 @@ pub enum Step {
     Hop {
         rel: String,
         depth: Option<i64>,
+    },
+    /// Walk from current rows; emit edge rows `{ rel, from, to }` (not nodes — use `hop`).
+    Graph {
+        rel: String,
+        depth: Option<i64>,
+    },
+    /// Path pattern: `match [-rel-> bind]+` with optional start alias.
+    /// Example: `match -wikilink-> b -wikilink-> c` or `match a -wikilink-> b`.
+    Match {
+        start: Option<String>,
+        hops: Vec<MatchHop>,
     },
     Search {
         mode: SearchMode,

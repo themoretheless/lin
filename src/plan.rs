@@ -88,6 +88,16 @@ pub enum NodeKind {
         depth: i64,
         cap: i64,
     },
+    Graph {
+        rel: String,
+        depth: i64,
+        cap: i64,
+    },
+    Match {
+        start: Option<String>,
+        hops: Vec<String>,
+        cap: i64,
+    },
     Search {
         mode: SearchMode,
         query: String,
@@ -505,6 +515,8 @@ fn plan_query_inner(q: &Query, cat: &Catalog, allow_implicit_take: bool) -> Resu
             Step::Join { on, .. } => push_field(&mut needed, on),
             Step::Sort { field, .. } => push_field(&mut needed, &field.as_str()),
             Step::Hop { .. } => {}
+            Step::Graph { .. } => {}
+            Step::Match { .. } => {}
             Step::Union(_) => {}
         }
     }
@@ -592,6 +604,35 @@ fn plan_query_inner(q: &Query, cat: &Catalog, allow_implicit_take: bool) -> Resu
                     NodeKind::Hop {
                         rel: rel.clone(),
                         depth,
+                        cap: 300,
+                    },
+                    Backend::Native,
+                    Effect::Read,
+                    vec![cur],
+                );
+            }
+            Step::Graph { rel, depth } => {
+                let depth = depth.unwrap_or(1);
+                cur = node(
+                    NodeKind::Graph {
+                        rel: rel.clone(),
+                        depth,
+                        cap: 300,
+                    },
+                    Backend::Native,
+                    Effect::Read,
+                    vec![cur],
+                );
+            }
+            Step::Match { start, hops } => {
+                let hops: Vec<String> = hops
+                    .iter()
+                    .map(|h| format!("-{}-> {}", h.rel, h.bind))
+                    .collect();
+                cur = node(
+                    NodeKind::Match {
+                        start: start.clone(),
+                        hops,
                         cap: 300,
                     },
                     Backend::Native,
@@ -691,12 +732,12 @@ fn apply_filter(cur: Node, pred: &Pred, cat: &Catalog) -> Node {
             vec![],
         );
     } else if let NodeKind::Scan { collection, .. } = &out.kind
-        && let Some(u) = crate::index::pick_index(cat, collection, pred)
+        && let Some(uses) = crate::index::pick_index(cat, collection, pred)
     {
         out = node(
             NodeKind::IndexSeek {
                 collection: collection.clone(),
-                fields: u.def.fields.clone(),
+                fields: uses[0].def.fields.clone(),
             },
             Backend::Native,
             Effect::Read,
@@ -902,12 +943,12 @@ fn point_or_scan(collection: &str, pred: Option<&Pred>, cat: &Catalog) -> Node {
         return n;
     }
     if let Some(p) = pred
-        && let Some(u) = crate::index::pick_index(cat, collection, p)
+        && let Some(uses) = crate::index::pick_index(cat, collection, p)
     {
         let seek = node(
             NodeKind::IndexSeek {
                 collection: collection.to_string(),
-                fields: u.def.fields.clone(),
+                fields: uses[0].def.fields.clone(),
             },
             Backend::Native,
             Effect::Read,

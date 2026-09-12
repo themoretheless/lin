@@ -66,6 +66,16 @@ fn short_label(node: &Node) -> String {
             format!("Join {}", if *left { "left" } else { "inner" })
         }
         NodeKind::Hop { rel, .. } => format!("Hop {rel}"),
+        NodeKind::Graph { rel, .. } => format!("Graph {rel}"),
+        NodeKind::Match { start, hops, .. } => {
+            let mut s = String::from("Match ");
+            if let Some(a) = start {
+                s.push_str(a);
+                s.push(' ');
+            }
+            s.push_str(&hops.join(" "));
+            s
+        }
         NodeKind::Search { mode, query, .. } => {
             let m = match mode {
                 SearchMode::Hybrid => "hybrid",

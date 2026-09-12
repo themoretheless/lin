@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ast::*;
 use crate::catalog::{Catalog, Type};
@@ -320,6 +320,48 @@ fn check_query(q: &Query, cat: &Catalog, env: &Bindings) -> Result<Scope, Error>
                     4.. => return Err(Error::new("hop depth max 3")),
                 }
             }
+            Step::Graph { rel, depth } => {
+                if cat.rel(rel).is_none() {
+                    return Err(Error::new(format!("unknown rel: {rel}")));
+                }
+                match depth.unwrap_or(1) {
+                    1..=3 => {}
+                    ..=0 => return Err(Error::new("graph depth must be ≥ 1")),
+                    4.. => return Err(Error::new("graph depth max 3")),
+                }
+                scope = Scope::edges();
+            }
+            Step::Match { start, hops } => {
+                if hops.is_empty() {
+                    return Err(Error::new("match requires at least one hop"));
+                }
+                if hops.len() > 3 {
+                    return Err(Error::new("match hops max 3"));
+                }
+                let mut names = BTreeSet::new();
+                if let Some(s) = start {
+                    if !names.insert(s.clone()) {
+                        return Err(Error::new(format!("duplicate match bind: {s}")));
+                    }
+                    let primary = scope.primary.clone();
+                    scope.add_bind(s, &primary, cat)?;
+                }
+                for h in hops {
+                    if cat.rel(&h.rel).is_none() {
+                        return Err(Error::new(format!("unknown rel: {}", h.rel)));
+                    }
+                    if !names.insert(h.bind.clone()) {
+                        return Err(Error::new(format!("duplicate match bind: {}", h.bind)));
+                    }
+                    // Path nodes resolve like hop → docs (or current primary).
+                    let node_col = if cat.collection("docs").is_some() {
+                        "docs".to_string()
+                    } else {
+                        scope.primary.clone()
+                    };
+                    scope.add_bind(&h.bind, &node_col, cat)?;
+                }
+            }
             Step::Search { mode, .. } => {
                 let col = cat
                     .collection(&scope.primary)
@@ -627,6 +669,16 @@ impl Scope {
         Ok(())
     }
 
+    fn add_bind(&mut self, bind: &str, collection: &str, cat: &Catalog) -> Result<(), Error> {
+        let col = cat
+            .collection(collection)
+            .ok_or_else(|| Error::new(format!("unknown collection: {collection}")))?;
+        for (name, info) in &col.fields {
+            self.fields.insert(format!("{bind}.{name}"), info.ty);
+        }
+        Ok(())
+    }
+
     fn agg(primary: &str, by: &str, metric_ty: Type, metric: &str) -> Self {
         let mut fields = BTreeMap::new();
         fields.insert(by.to_string(), Type::Text);
@@ -636,6 +688,17 @@ impl Scope {
         }
         Self {
             primary: primary.to_string(),
+            fields,
+        }
+    }
+
+    fn edges() -> Self {
+        let mut fields = BTreeMap::new();
+        fields.insert("rel".into(), Type::Rel);
+        fields.insert("from".into(), Type::Text);
+        fields.insert("to".into(), Type::Text);
+        Self {
+            primary: "edges".into(),
             fields,
         }
     }

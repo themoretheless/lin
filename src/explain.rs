@@ -140,6 +140,22 @@ fn head(node: &Node, kind: ExplainKind, ctx: &ExplainCtx) -> String {
                 node.backend.as_str()
             )
         }
+        NodeKind::Graph { rel, depth, cap } => {
+            format!(
+                "Graph {rel} depth={depth} cap={cap} backend={}",
+                node.backend.as_str()
+            )
+        }
+        NodeKind::Match { start, hops, cap } => {
+            let mut s = String::from("Match ");
+            if let Some(a) = start {
+                s.push_str(a);
+                s.push(' ');
+            }
+            s.push_str(&hops.join(" "));
+            s.push_str(&format!(" cap={cap} backend={}", node.backend.as_str()));
+            s
+        }
         NodeKind::Search { mode, query, k } => {
             let m = match mode {
                 SearchMode::Hybrid => "hybrid",
@@ -216,6 +232,8 @@ fn head(node: &Node, kind: ExplainKind, ctx: &ExplainCtx) -> String {
                 | NodeKind::Get { .. }
                 | NodeKind::Join { .. }
                 | NodeKind::Hop { .. }
+                | NodeKind::Graph { .. }
+                | NodeKind::Match { .. }
                 | NodeKind::Search { .. }
         )
         && matches!(kind, ExplainKind::Cost | ExplainKind::Tree)
@@ -231,6 +249,8 @@ fn head(node: &Node, kind: ExplainKind, ctx: &ExplainCtx) -> String {
     match &node.kind {
         NodeKind::Filter { .. } => s.push_str(" zone skip"),
         NodeKind::Hop { .. } => s.push_str(" serial"),
+        NodeKind::Graph { .. } => s.push_str(" serial"),
+        NodeKind::Match { .. } => s.push_str(" serial"),
         NodeKind::Rrf { .. } => s.push_str(" parallel"),
         _ => {}
     }
@@ -254,6 +274,8 @@ fn head(node: &Node, kind: ExplainKind, ctx: &ExplainCtx) -> String {
                 }
             }
             NodeKind::Hop { .. } => s.push_str(" after search"),
+            NodeKind::Graph { .. } => s.push_str(" after search"),
+            NodeKind::Match { .. } => s.push_str(" after search"),
             NodeKind::Get { .. } => s.push_str(" point"),
             _ => {}
         }
@@ -317,6 +339,8 @@ fn est_rows(node: &Node, sizes: &CollectionSizes) -> f64 {
             child(0).max(1.0)
         }
         NodeKind::Hop { cap, .. } => child(0).min(*cap as f64).max(0.0) * 1.4,
+        NodeKind::Graph { cap, .. } => child(0).min(*cap as f64).max(0.0) * 1.4,
+        NodeKind::Match { cap, .. } => child(0).min(*cap as f64).max(0.0) * 1.6,
         NodeKind::Search { k, .. } | NodeKind::Rrf { k } => {
             let inn = if node.children.is_empty() {
                 sizes.docs
@@ -342,6 +366,8 @@ fn short_name(kind: &NodeKind) -> &'static str {
         NodeKind::Project { .. } => "Project",
         NodeKind::Join { .. } => "Join",
         NodeKind::Hop { .. } => "Hop",
+        NodeKind::Graph { .. } => "Graph",
+        NodeKind::Match { .. } => "Match",
         NodeKind::Search { .. } => "Search",
         NodeKind::Rrf { .. } => "RRF",
         NodeKind::Agg { .. } => "Agg",

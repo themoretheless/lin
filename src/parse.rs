@@ -434,6 +434,19 @@ impl<'a> Parser<'a> {
             };
             return Ok(Step::Hop { rel, depth });
         }
+        if self.eat_kw("graph") {
+            let rel = self.expect_ident()?;
+            let depth = if self.eat_kw("depth") {
+                self.expect_char('=')?;
+                Some(self.expect_int()?)
+            } else {
+                None
+            };
+            return Ok(Step::Graph { rel, depth });
+        }
+        if self.eat_kw("match") {
+            return self.parse_match_step();
+        }
         if self.eat_kw("search") {
             let mode = if self.eat_kw("lex") {
                 SearchMode::Lex
@@ -479,6 +492,39 @@ impl<'a> Parser<'a> {
             return Ok(Step::Filter(self.parse_pred()?));
         }
         Err(self.err("expected a named step or a predicate after `|`"))
+    }
+
+    /// `match [-rel-> bind]+` or `match start -rel-> bind …`
+    fn parse_match_step(&mut self) -> Result<Step, Error> {
+        self.skip();
+        let start = if self.peek() != Some('-') {
+            let name = self.expect_ident()?;
+            self.skip();
+            if self.peek() != Some('-') {
+                return Err(self.err("expected `-rel->` after match start"));
+            }
+            Some(name)
+        } else {
+            None
+        };
+        let mut hops = Vec::new();
+        loop {
+            self.skip();
+            if self.peek() != Some('-') {
+                break;
+            }
+            self.bump();
+            let rel = self.expect_ident()?;
+            if !self.eat_op("->") {
+                return Err(self.err("expected `->` in match hop"));
+            }
+            let bind = self.expect_ident()?;
+            hops.push(MatchHop { rel, bind });
+        }
+        if hops.is_empty() {
+            return Err(self.err("match requires at least one `-rel-> bind`"));
+        }
+        Ok(Step::Match { start, hops })
     }
 
     fn starts_pred(&self) -> bool {
@@ -1137,6 +1183,8 @@ fn is_step_keyword(s: &str) -> bool {
             | "pick"
             | "join"
             | "hop"
+            | "graph"
+            | "match"
             | "search"
             | "count"
             | "sum"
