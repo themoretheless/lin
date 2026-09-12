@@ -202,6 +202,14 @@ impl Field {
     pub fn as_str(&self) -> String {
         self.parts.join(".")
     }
+
+    /// Single-segment field name without allocating (hot path for filters/projects).
+    pub fn leaf(&self) -> Option<&str> {
+        match self.parts.as_slice() {
+            [p] => Some(p.as_str()),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -15,7 +15,7 @@ use std::cell::RefCell;
 
 pub use ast::{ExplainKind, Stmt};
 pub use error::Error;
-pub use exec::{Db, Done, Handle};
+pub use exec::{Db, Done, Handle, Prepared};
 pub use graph::GraphFmt;
 pub use plan::Plan;
 pub use store::{Cell, Row, Store};

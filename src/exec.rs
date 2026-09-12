@@ -2,6 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::Instant;
 
+use rustc_hash::FxHashMap;
+
 use crate::ast::*;
 use crate::catalog::Catalog;
 use crate::check;
@@ -11,7 +13,7 @@ use crate::graph::GraphFmt;
 use crate::parse;
 use crate::persist::Pack;
 use crate::plan::{self, Plan};
-use crate::store::{Cell, Edge, Row, Store, compact_row, content_hash, now_ms, row_text};
+use crate::store::{Cell, Edge, Row, Store, compact_row, content_hash, now_ms, project_fields, row_text};
 
 type StmtOut = (Vec<Row>, Option<String>, Option<Pack>);
 
@@ -59,22 +61,52 @@ impl Handle {
     }
 }
 
+/// Compiled statement: parse + typecheck + plan once, run many times.
+#[derive(Debug, Clone)]
+pub struct Prepared {
+    pub src: String,
+    stmts: Vec<Stmt>,
+    pub plan: Plan,
+    /// True if any statement may mutate catalog or store.
+    writes: bool,
+    /// Append-only writes (insert/append) — cheap rollback without full clone.
+    append_only: bool,
+    /// Schema (col/rel/index) — clears plan cache after success.
+    schema: bool,
+}
+
+impl Prepared {
+    pub fn run(&self, db: &mut Db) -> Result<Handle, Error> {
+        db.run_prepared(self)
+    }
+}
+
 pub struct Db {
     pub catalog: Catalog,
     pub store: Store,
+    /// Source → prepared plan (invalidated on schema change).
+    plan_cache: FxHashMap<String, Prepared>,
 }
 
 impl Db {
     pub fn fixture() -> Self {
         let catalog = crate::catalog::fixture();
         let store = Store::fixture(&catalog);
-        Self { catalog, store }
+        Self {
+            catalog,
+            store,
+            plan_cache: FxHashMap::default(),
+        }
     }
 
     pub fn empty() -> Self {
         let catalog = crate::catalog::fixture();
         let store = Store::empty(catalog.embed_id.clone());
-        Self { catalog, store }
+        Self {
+            catalog,
+            store,
+            plan_cache: FxHashMap::default(),
+        }
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
@@ -82,38 +114,80 @@ impl Db {
         let store = Store::open_with(path, &catalog)?;
         let mut catalog = catalog;
         store.merge_extras_into(&mut catalog);
-        Ok(Self { catalog, store })
+        Ok(Self {
+            catalog,
+            store,
+            plan_cache: FxHashMap::default(),
+        })
     }
 
     pub fn close(&mut self) -> Result<(), Error> {
         self.store.close()
     }
 
-    pub fn run(&mut self, src: &str) -> Result<Handle, Error> {
+    pub fn clear_plan_cache(&mut self) {
+        self.plan_cache.clear();
+    }
+
+    /// Parse, typecheck, and plan once. Reuse via [`Prepared::run`] / [`Self::run_prepared`].
+    pub fn prepare(&mut self, src: &str) -> Result<Prepared, Error> {
+        if let Some(p) = self.plan_cache.get(src) {
+            return Ok(p.clone());
+        }
+        let prepared = self.prepare_uncached(src)?;
+        self.plan_cache.insert(src.to_string(), prepared.clone());
+        Ok(prepared)
+    }
+
+    fn prepare_uncached(&self, src: &str) -> Result<Prepared, Error> {
         let stmts = parse::parse_program(src)?;
         let mut check_cat = self.catalog.clone();
         check::check_program(&stmts, &mut check_cat)?;
         let plan = plan::plan_program(&stmts, &check_cat)?;
+        let writes = stmts.iter().any(stmt_writes);
+        let append_only = writes && stmts.iter().all(|s| stmt_append_only(s) || !stmt_writes(s));
+        let schema = stmts.iter().any(stmt_schema);
+        Ok(Prepared {
+            src: src.to_string(),
+            stmts,
+            plan,
+            writes,
+            append_only,
+            schema,
+        })
+    }
+
+    pub fn run_prepared(&mut self, prepared: &Prepared) -> Result<Handle, Error> {
         let t0 = Instant::now();
-        let store_backup = self.store.mem_backup();
-        let cat_backup = self.catalog.clone();
-        let (rows, message, pack) = match self.exec_program(&stmts) {
+        let undo = if !prepared.writes {
+            Undo::None
+        } else if prepared.append_only {
+            Undo::Append(self.store.append_mark())
+        } else {
+            Undo::Full(self.store.mem_backup())
+        };
+        let cat_backup = if prepared.writes && !prepared.append_only {
+            Some(self.catalog.clone())
+        } else if prepared.schema {
+            Some(self.catalog.clone())
+        } else {
+            None
+        };
+
+        let (rows, message, pack) = match self.exec_program(&prepared.stmts) {
             Ok(v) => v,
             Err(e) => {
-                self.store.mem_restore(store_backup);
-                self.catalog = cat_backup;
+                self.rollback(undo, cat_backup);
                 return Err(e);
             }
         };
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
         if let Some(pack) = pack {
-            // Durable first: fsync the log record, then bump in-memory gen.
             if self.store.is_durable() {
                 self.store
                     .set_catalog_hash(crate::store::catalog_hash(&self.catalog));
                 if let Err(e) = self.store.durable_commit(&pack) {
-                    self.store.mem_restore(store_backup);
-                    self.catalog = cat_backup;
+                    self.rollback(undo, cat_backup);
                     return Err(e);
                 }
             }
@@ -122,9 +196,12 @@ impl Db {
                 self.store.maybe_checkpoint()?;
             }
         }
+        if prepared.schema {
+            self.plan_cache.clear();
+        }
         let n = rows.len();
         Ok(Handle {
-            plan,
+            plan: prepared.plan.clone(),
             rows,
             done: Done {
                 r#gen: self.store.r#gen,
@@ -133,6 +210,22 @@ impl Db {
             message,
             ms,
         })
+    }
+
+    fn rollback(&mut self, undo: Undo, cat_backup: Option<Catalog>) {
+        match undo {
+            Undo::None => {}
+            Undo::Append(mark) => self.store.append_rollback(mark),
+            Undo::Full(b) => self.store.mem_restore(b),
+        }
+        if let Some(cat) = cat_backup {
+            self.catalog = cat;
+        }
+    }
+
+    pub fn run(&mut self, src: &str) -> Result<Handle, Error> {
+        let prepared = self.prepare(src)?;
+        self.run_prepared(&prepared)
     }
 
     pub fn explain_as(&mut self, src: &str, graph: Option<GraphFmt>) -> Result<String, Error> {
@@ -164,8 +257,18 @@ impl Db {
 
     fn exec_program(&mut self, stmts: &[Stmt]) -> Result<StmtOut, Error> {
         let mut bindings: BTreeMap<String, Vec<Row>> = BTreeMap::new();
+        let need_snap = stmts.iter().any(|s| {
+            matches!(
+                s,
+                Stmt::Update { cas_each: true, .. } | Stmt::Delete { cas_each: true, .. }
+            )
+        });
         let mut ctx = PackCtx {
-            snap: self.hash_snapshot(),
+            snap: if need_snap {
+                self.hash_snapshot()
+            } else {
+                BTreeMap::new()
+            },
             written: BTreeSet::new(),
         };
         let mut last_rows = Vec::new();
@@ -259,20 +362,29 @@ impl Db {
                 records,
                 edges,
             } => {
-                let mut rows = Vec::new();
-                let mut packs = Vec::new();
-                for (i, record) in records.iter().enumerate() {
-                    let eds = if i == 0 { edges.as_slice() } else { &[] };
-                    let (row, new_edges) = self.insert_pack(collection, record, eds)?;
-                    packs.push(Pack::Insert {
-                        collection: collection.clone(),
-                        row: row.clone(),
-                        edges: new_edges,
-                    });
-                    rows.push(row);
-                }
+                let (rows, new_edges) =
+                    self.insert_bulk(collection, records, edges.as_slice())?;
                 mark_written(ctx, collection, &rows);
-                Ok((rows, None, fold_packs(packs)))
+                // In-memory: gen bump only — skip cloning every row into Pack.
+                let pack = if self.store.is_durable() {
+                    let packs: Vec<Pack> = rows
+                        .iter()
+                        .enumerate()
+                        .map(|(i, row)| Pack::Insert {
+                            collection: collection.clone(),
+                            row: row.clone(),
+                            edges: if i == 0 {
+                                new_edges.clone()
+                            } else {
+                                Vec::new()
+                            },
+                        })
+                        .collect();
+                    fold_packs(packs)
+                } else {
+                    Some(Pack::Batch { packs: Vec::new() })
+                };
+                Ok((rows, None, pack))
             }
             Stmt::Update {
                 collection,
@@ -369,6 +481,22 @@ impl Db {
         allow_implicit_take: bool,
     ) -> Result<Vec<Row>, Error> {
         let now = now_ms();
+
+        // Point Get short path: map lookup + optional project — no Scan/Filter pipeline.
+        if let Some(rows) = self.try_point_get(q) {
+            return Ok(rows);
+        }
+
+        // Filter → count: index-only or scan-without-clone (fair vs SQL COUNT(*)).
+        if let Some(rows) = self.try_filter_count(q, bindings, now) {
+            return Ok(rows);
+        }
+
+        // Filter → project → take: materialize projected rows without full BTreeMap clones.
+        if let Some(rows) = self.try_filter_project(q, bindings, now) {
+            return Ok(rows);
+        }
+
         let mut primary = check::collection_of(&q.source).to_string();
         let mut implicit_take = true;
         let mut saw_agg = false;
@@ -376,32 +504,58 @@ impl Db {
             Step::Filter(p) => Some(p),
             _ => None,
         });
+        let project_fields_step = {
+            let simple = q.steps.iter().all(|s| {
+                matches!(s, Step::Filter(_) | Step::Project(_) | Step::Take { .. })
+            });
+            if simple {
+                q.steps.iter().find_map(|s| match s {
+                    Step::Project(f) => Some(f.as_slice()),
+                    _ => None,
+                })
+            } else {
+                None
+            }
+        };
+
         let mut rows = match &q.source {
-            Source::Page(uri) => self.get_docs("uri", uri),
+            Source::Page(uri) => self
+                .store
+                .project_by_key("docs", "uri", uri, None)
+                .into_iter()
+                .collect(),
             Source::Catalog => self.scan_catalog(),
             Source::Collection(name) => {
                 if let Some(bound) = bindings.get(name) {
                     bound.clone()
                 } else if let Some(pred) = first_filter
-                    && let Some((field, key)) = point_key(pred)
-                    && matches!(name.as_str(), "docs" | "users" | "orders")
+                    && let Some(u) = crate::index::pick_index(&self.catalog, name, pred)
+                    && let Some(idxs) = self.store.index_seek(name, &u, now)
                 {
-                    self.get_by(name, field, key)
-                } else if let Some(pred) = first_filter
-                    && let Some(ids) = self.seek_index(name, pred, now)
-                {
-                    self.rows_by_ids(name, &ids)
+                    let covered = crate::index::index_covers_pred(pred, &u);
+                    self.fetch_idxs_filtered(name, &idxs, pred, now, project_fields_step, covered)
+                } else if let Some(pred) = first_filter {
+                    self.filter_scan(name, pred, now, project_fields_step)
                 } else {
                     self.scan(name)
                 }
             }
         };
 
+        // If IndexSeek / filter_scan already applied the first filter (+ optional project),
+        // skip only those steps — later filters/projects still run.
+        let mut skip_first_filter = first_filter.is_some()
+            && matches!(&q.source, Source::Collection(n) if bindings.get(n).is_none());
+        let mut skip_first_project = skip_first_filter && project_fields_step.is_some();
+
         for step in &q.steps {
             match step {
                 Step::Filter(pred) => {
+                    if skip_first_filter {
+                        skip_first_filter = false;
+                        continue;
+                    }
                     if let Some((field, key)) = point_key(pred)
-                        && matches!(primary.as_str(), "docs" | "users" | "orders")
                         && rows.len() != 1
                     {
                         rows = self.get_by(&primary, field, key);
@@ -409,6 +563,10 @@ impl Db {
                     rows.retain(|r| eval_pred(pred, r, now));
                 }
                 Step::Project(fields) => {
+                    if skip_first_project {
+                        skip_first_project = false;
+                        continue;
+                    }
                     rows = project(&rows, fields);
                 }
                 Step::Join {
@@ -461,6 +619,322 @@ impl Db {
         Ok(rows)
     }
 
+    /// `docs | id == "…" | { … }` — direct map hit.
+    fn try_point_get(&self, q: &Query) -> Option<Vec<Row>> {
+        let name = match &q.source {
+            Source::Collection(n) => n.as_str(),
+            Source::Page(uri) => {
+                let fields = q.steps.iter().find_map(|s| match s {
+                    Step::Project(f) => Some(field_names(f)),
+                    _ => None,
+                });
+                let row = self.store.project_by_key(
+                    "docs",
+                    "uri",
+                    uri,
+                    fields.as_deref(),
+                )?;
+                // Only allow Filter/Project/Take after page get.
+                if q.steps.iter().any(|s| {
+                    !matches!(s, Step::Filter(_) | Step::Project(_) | Step::Take { .. })
+                }) {
+                    return None;
+                }
+                let mut rows = vec![row];
+                for step in &q.steps {
+                    if let Step::Filter(pred) = step {
+                        let now = now_ms();
+                        rows.retain(|r| eval_pred(pred, r, now));
+                    }
+                }
+                return Some(rows);
+            }
+            _ => return None,
+        };
+        let mut filter: Option<&Pred> = None;
+        let mut fields: Option<Vec<String>> = None;
+        for step in &q.steps {
+            match step {
+                Step::Filter(p) => {
+                    if filter.is_some() {
+                        return None;
+                    }
+                    filter = Some(p);
+                }
+                Step::Project(f) => {
+                    if fields.is_some() {
+                        return None;
+                    }
+                    fields = Some(field_names(f));
+                }
+                Step::Take { .. } => {}
+                _ => return None,
+            }
+        }
+        let pred = filter?;
+        let (field, key) = point_key(pred)?;
+        // Extra AND atoms beyond id/uri eq are still OK if point_key finds id/uri;
+        // re-check full pred after fetch.
+        let row = self.store.project_by_key(name, field, key, fields.as_deref())?;
+        let now = now_ms();
+        if !eval_pred(pred, &row, now) {
+            // projected row may miss pred fields — evaluate against full row
+            let full = self.store.project_by_key(name, field, key, None)?;
+            if !eval_pred(pred, &full, now) {
+                return Some(Vec::new());
+            }
+            // pred ok on full; return projected if requested
+            return Some(vec![self
+                .store
+                .project_by_key(name, field, key, fields.as_deref())
+                .unwrap_or(full)]);
+        }
+        Some(vec![row])
+    }
+
+    /// `col | pred | count by f` — no row materialization when index covers pred
+    /// and `f` is equality-bound (or scan counts in place).
+    fn try_filter_count(
+        &self,
+        q: &Query,
+        bindings: &BTreeMap<String, Vec<Row>>,
+        now: i64,
+    ) -> Option<Vec<Row>> {
+        let Source::Collection(name) = &q.source else {
+            return None;
+        };
+        if bindings.get(name).is_some() {
+            return None;
+        }
+        let mut filter: Option<&Pred> = None;
+        let mut by: Option<&Field> = None;
+        for step in &q.steps {
+            match step {
+                Step::Filter(p) => {
+                    if filter.is_some() {
+                        return None;
+                    }
+                    filter = Some(p);
+                }
+                Step::Count { by: b } => {
+                    if by.is_some() {
+                        return None;
+                    }
+                    by = Some(b);
+                }
+                Step::Take { .. } => {}
+                _ => return None,
+            }
+        }
+        let pred = filter?;
+        let by = by?;
+        let by_key = by.as_str();
+
+        // docs | title ~ "…" | count by layer — columnar title scan + memchr.
+        if name == "docs"
+            && let Pred::Contains { field, needle } = pred
+            && field.leaf() == Some("title")
+            && by.leaf() == Some("layer")
+        {
+            let map = self.store.docs_title_contains_count_by_layer(needle);
+            return Some(count_map_to_rows(&by_key, map));
+        }
+
+        // Index-covered + group key fixed by equality → pure seek_count.
+        if let Some(u) = crate::index::pick_index(&self.catalog, name, pred)
+            && crate::index::index_covers_pred(pred, &u)
+        {
+            if let Some(v) = eq_value_for_field(pred, &by_key) {
+                let n = self.store.index_seek_count(name, &u, now)?;
+                return Some(vec![count_row(&by_key, v, n as i64)]);
+            }
+            // Index covers filter but group key varies — read only the by-field.
+            let idxs = self.store.index_seek(name, &u, now)?;
+            let mut map: BTreeMap<String, i64> = BTreeMap::new();
+            for i in idxs {
+                let Some(row) = self.store.get_by_idx(name, i) else {
+                    continue;
+                };
+                let key = row
+                    .get(&by_key)
+                    .map(Cell::compact)
+                    .unwrap_or_else(|| "null".into());
+                *map.entry(key).or_insert(0) += 1;
+            }
+            return Some(count_map_to_rows(&by_key, map));
+        }
+
+        // Full scan count without cloning rows.
+        let col = self.store.collection(name);
+        let mut map: BTreeMap<String, i64> = BTreeMap::new();
+        for r in col {
+            if eval_pred(pred, r, now) {
+                let key = r
+                    .get(&by_key)
+                    .map(Cell::compact)
+                    .unwrap_or_else(|| "null".into());
+                *map.entry(key).or_insert(0) += 1;
+            }
+        }
+        Some(count_map_to_rows(&by_key, map))
+    }
+
+    /// `col | pred | { fields } | take …` — project from hot columns when possible.
+    fn try_filter_project(
+        &self,
+        q: &Query,
+        bindings: &BTreeMap<String, Vec<Row>>,
+        now: i64,
+    ) -> Option<Vec<Row>> {
+        let Source::Collection(name) = &q.source else {
+            return None;
+        };
+        if bindings.get(name).is_some() {
+            return None;
+        }
+        let mut filter: Option<&Pred> = None;
+        let mut fields: Option<&[Field]> = None;
+        let mut explicit_take: Option<Option<i64>> = None;
+        for step in &q.steps {
+            match step {
+                Step::Filter(p) => {
+                    if filter.is_some() {
+                        return None;
+                    }
+                    filter = Some(p);
+                }
+                Step::Project(f) => {
+                    if fields.is_some() {
+                        return None;
+                    }
+                    fields = Some(f.as_slice());
+                }
+                Step::Take { n } => {
+                    explicit_take = Some(*n);
+                }
+                _ => return None,
+            }
+        }
+        let pred = filter?;
+        let fields = fields?;
+        let names = field_names(fields);
+        if names.is_empty() {
+            return None;
+        }
+
+        let mut rows = {
+            // docs | title ~ needle | { hot… }
+            if name == "docs"
+                && let Pred::Contains { field, needle } = pred
+                && field.leaf() == Some("title")
+            {
+                self.store
+                    .scan_docs_hot_project(&names, Some(needle.as_str()))?
+            } else if let Some(u) = crate::index::pick_index(&self.catalog, name, pred)
+                && let Some(idxs) = self.store.index_seek(name, &u, now)
+            {
+                let covered = crate::index::index_covers_pred(pred, &u);
+                if name == "docs" && covered {
+                    if let Some(rows) = self.store.project_docs_hot(&idxs, &names) {
+                        rows
+                    } else {
+                        self.fetch_idxs_filtered(name, &idxs, pred, now, Some(fields), covered)
+                    }
+                } else {
+                    self.fetch_idxs_filtered(name, &idxs, pred, now, Some(fields), covered)
+                }
+            } else {
+                self.filter_scan(name, pred, now, Some(fields))
+            }
+        };
+
+        match explicit_take {
+            Some(Some(n)) => {
+                let n = n.max(0) as usize;
+                if rows.len() > n {
+                    rows.truncate(n);
+                }
+            }
+            Some(None) => {} // take all
+            None if rows.len() > 50 => rows.truncate(50), // implicit take
+            None => {}
+        }
+        Some(rows)
+    }
+
+    fn filter_scan(
+        &self,
+        name: &str,
+        pred: &Pred,
+        now: i64,
+        project: Option<&[Field]>,
+    ) -> Vec<Row> {
+        let names = project.map(field_names);
+        // docs title-contains → columnar project when fields are hot.
+        if name == "docs"
+            && let Pred::Contains { field, needle } = pred
+            && field.leaf() == Some("title")
+            && let Some(ns) = names.as_deref()
+            && let Some(rows) = self.store.scan_docs_hot_project(ns, Some(needle.as_str()))
+        {
+            return rows;
+        }
+        let col = self.store.collection(name);
+        let mut out = Vec::new();
+        for r in col {
+            if eval_pred(pred, r, now) {
+                out.push(match names.as_deref() {
+                    Some(fs) => project_fields(r, fs),
+                    None => r.clone(),
+                });
+            }
+        }
+        out
+    }
+
+    fn fetch_idxs_filtered(
+        &self,
+        name: &str,
+        idxs: &[usize],
+        pred: &Pred,
+        now: i64,
+        project: Option<&[Field]>,
+        covered: bool,
+    ) -> Vec<Row> {
+        let names = project.map(field_names);
+        if covered
+            && name == "docs"
+            && let Some(ns) = names.as_deref()
+            && let Some(rows) = self.store.project_docs_hot(idxs, ns)
+        {
+            return rows;
+        }
+        let mut out = Vec::with_capacity(idxs.len());
+        let id_only = names.as_deref().is_some_and(|fs| fs.len() == 1 && fs[0] == "id");
+        for &i in idxs {
+            let Some(row) = self.store.get_by_idx(name, i) else {
+                continue;
+            };
+            if !covered && !eval_pred(pred, row, now) {
+                continue;
+            }
+            if id_only {
+                let mut r = BTreeMap::new();
+                r.insert(
+                    "id".into(),
+                    row.get("id").cloned().unwrap_or(Cell::Null),
+                );
+                out.push(r);
+            } else {
+                out.push(match names.as_deref() {
+                    Some(fs) => project_fields(row, fs),
+                    None => row.clone(),
+                });
+            }
+        }
+        out
+    }
+
     fn scan(&self, name: &str) -> Vec<Row> {
         if name == "catalog" {
             return self.scan_catalog();
@@ -479,16 +953,10 @@ impl Db {
         rows
     }
 
-    fn get_docs(&self, field: &str, key: &str) -> Vec<Row> {
-        self.get_by("docs", field, key)
-    }
-
     fn get_by(&self, collection: &str, field: &str, key: &str) -> Vec<Row> {
         self.store
-            .collection(collection)
-            .iter()
-            .filter(|r| row_text(r, field) == Some(key))
-            .cloned()
+            .project_by_key(collection, field, key, None)
+            .into_iter()
             .collect()
     }
 
@@ -634,6 +1102,8 @@ impl Db {
             return Ok((existing.clone(), false));
         }
         self.store.collection_mut("facts").push(row.clone());
+        self.store
+            .row_maps_register("facts", self.store.collection("facts").len() - 1);
         Ok((row, true))
     }
 
@@ -657,86 +1127,93 @@ impl Db {
         Ok((edge_row(rel, &from, &to), true))
     }
 
-    fn insert_pack(
+    fn insert_bulk(
         &mut self,
         collection: &str,
-        record: &Record,
+        records: &[Record],
         edges: &[InsertEdge],
-    ) -> Result<(Row, Vec<Edge>), Error> {
+    ) -> Result<(Vec<Row>, Vec<Edge>), Error> {
         let now = now_ms();
-        let mut row = record_row(record, now);
-        if row_text(&row, "id").is_none() {
-            row.insert("id".into(), Cell::Text(self.store.alloc_id()));
+        let n = records.len();
+        let mut built: Vec<Row> = Vec::with_capacity(n);
+        // Pre-check duplicates within the batch and against store.
+        let mut batch_ids: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
+        batch_ids.reserve(n);
+        let mut batch_uris: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
+        if collection == "docs" {
+            batch_uris.reserve(n);
         }
-        if row_text(&row, "hash").is_none()
-            && let Some(body) = row_text(&row, "body").map(str::to_string)
-        {
-            row.insert("hash".into(), Cell::Text(content_hash(&body)));
-        }
-        if let Some(id) = row_text(&row, "id").map(str::to_string)
-            && self
-                .store
-                .collection(collection)
-                .iter()
-                .any(|r| row_text(r, "id") == Some(id.as_str()))
-        {
-            return Err(Error::runtime(format!("duplicate id: {id}")));
-        }
-        if let Some(uri) = row_text(&row, "uri").map(str::to_string)
-            && collection == "docs"
-            && self
-                .store
-                .collection("docs")
-                .iter()
-                .any(|r| row_text(r, "uri") == Some(uri.as_str()))
-        {
-            return Err(Error::runtime(format!("duplicate uri: {uri}")));
-        }
-        let from_id = row_text(&row, "id").unwrap_or("").to_string();
-        let mut new_edges = Vec::new();
-        for e in edges {
-            let to = match &e.target {
-                EdgeTarget::Page(uri) => self
-                    .store
-                    .find_doc_key(uri)
-                    .and_then(|r| row_text(r, "id").map(|s| s.to_string()))
-                    .unwrap_or_else(|| uri.clone()),
-                EdgeTarget::Value(v) => value_text(v, now),
-            };
-            let edge = Edge {
-                rel: e.rel.clone(),
-                from: from_id.clone(),
-                to,
-            };
-            if !self
-                .store
-                .edges
-                .iter()
-                .any(|x| x.rel == edge.rel && x.from == edge.from && x.to == edge.to)
-            {
-                self.store.edges.push(edge.clone());
+
+        for record in records {
+            let mut row = record_row(record, now);
+            if row_text(&row, "id").is_none() {
+                row.insert("id".into(), Cell::text_arc(self.store.alloc_id()));
             }
-            new_edges.push(edge);
+            if row_text(&row, "hash").is_none()
+                && let Some(body) = row_text(&row, "body")
+            {
+                row.insert("hash".into(), Cell::text_arc(content_hash(body)));
+            }
+            let from_id = row_text(&row, "id").unwrap_or("").to_string();
+            if !from_id.is_empty() {
+                if !batch_ids.insert(from_id.clone())
+                    || self.store.get_by_id(collection, &from_id).is_some()
+                {
+                    return Err(Error::runtime(format!("duplicate id: {from_id}")));
+                }
+            }
+            if let Some(uri) = row_text(&row, "uri").map(str::to_string)
+                && collection == "docs"
+            {
+                if !batch_uris.insert(uri.clone()) || self.store.get_by_uri(&uri).is_some() {
+                    return Err(Error::runtime(format!("duplicate uri: {uri}")));
+                }
+            }
+            built.push(row);
         }
-        self.store.index_insert(collection, &row)?;
-        self.store.collection_mut(collection).push(row.clone());
-        Ok((row, new_edges))
-    }
 
-    fn seek_index(&self, collection: &str, pred: &Pred, now: i64) -> Option<Vec<String>> {
-        let u = crate::index::pick_index(&self.catalog, collection, pred)?;
-        self.store.index_seek(collection, &u, now)
-    }
+        // Edges only on first record (same semantics as before).
+        let mut new_edges = Vec::new();
+        if let Some(first) = built.first() {
+            let from_id = row_text(first, "id").unwrap_or("").to_string();
+            for e in edges {
+                let to = match &e.target {
+                    EdgeTarget::Page(uri) => self
+                        .store
+                        .find_doc_key(uri)
+                        .and_then(|r| row_text(r, "id").map(|s| s.to_string()))
+                        .unwrap_or_else(|| uri.clone()),
+                    EdgeTarget::Value(v) => value_text(v, now),
+                };
+                let edge = Edge {
+                    rel: e.rel.clone(),
+                    from: from_id.clone(),
+                    to,
+                };
+                if !self
+                    .store
+                    .edges
+                    .iter()
+                    .any(|x| x.rel == edge.rel && x.from == edge.from && x.to == edge.to)
+                {
+                    self.store.edges.push(edge.clone());
+                }
+                new_edges.push(edge);
+            }
+        }
 
-    fn rows_by_ids(&self, collection: &str, ids: &[String]) -> Vec<Row> {
-        let col = self.store.collection(collection);
-        ids.iter()
-            .filter_map(|id| {
-                col.iter()
-                    .find(|r| row_text(r, "id") == Some(id.as_str()))
-                    .cloned()
-            })
-            .collect()
+        self.store.collection_mut(collection).reserve(n);
+        self.store.row_maps_reserve(collection, n);
+
+        let mut out = Vec::with_capacity(n);
+        for row in built {
+            let idx = self.store.collection(collection).len();
+            self.store.index_insert_row(collection, idx, &row)?;
+            out.push(row.clone());
+            self.store.collection_mut(collection).push(row);
+            self.store.row_maps_register(collection, idx);
+        }
+        Ok((out, new_edges))
     }
 
     fn update_cas(
@@ -779,14 +1256,13 @@ impl Db {
         let patch = record_row(record, now);
         let mut out = Vec::new();
         for i in idxs {
-            let old = self.store.collection(collection)[i].clone();
-            self.store.index_remove(collection, &old);
+            self.store.index_remove_at(collection, i);
             let rows = self.store.collection_mut(collection);
             let row = &mut rows[i];
             let layer_raw = row_text(row, "layer") == Some("raw")
-                || matches!(patch.get("layer"), Some(Cell::Text(s)) if s == "raw");
+                || matches!(patch.get("layer"), Some(Cell::Text(s)) if s.as_ref() == "raw");
             if layer_raw && patch.contains_key("body") {
-                let _ = self.store.index_insert(collection, &old);
+                let _ = self.store.index_insert_at(collection, i);
                 return Err(Error::runtime("immutable field: docs.body"));
             }
             for (k, v) in &patch {
@@ -795,12 +1271,13 @@ impl Db {
             if patch.contains_key("body")
                 && let Some(body) = row_text(row, "body").map(str::to_string)
             {
-                row.insert("hash".into(), Cell::Text(content_hash(&body)));
+                row.insert("hash".into(), Cell::text_arc(content_hash(&body)));
             }
             let updated = row.clone();
-            self.store.index_insert(collection, &updated)?;
+            self.store.index_insert_row(collection, i, &updated)?;
             out.push(updated);
         }
+        self.store.rebuild_row_maps_collection(collection);
         mark_written(ctx, collection, &out);
         Ok(out)
     }
@@ -850,10 +1327,11 @@ impl Db {
         let mut out = Vec::new();
         for i in idxs.into_iter().rev() {
             let row = self.store.collection_mut(collection).remove(i);
-            self.store.index_remove(collection, &row);
             out.push(row);
         }
         out.reverse();
+        self.store.rebuild_row_maps_collection(collection);
+        self.store.rebuild_indexes_collection(collection);
         mark_written(ctx, collection, &out);
         Ok(out)
     }
@@ -898,6 +1376,7 @@ impl Db {
                         .collect(),
                 };
                 self.store.apply_pack(&pack);
+                self.plan_cache.clear();
                 Ok((Vec::new(), Some(format!("col {name}")), Some(pack)))
             }
             Decl::Rel { name, stub } => {
@@ -907,6 +1386,7 @@ impl Db {
                     reverse_of: None,
                 };
                 self.store.apply_pack(&pack);
+                self.plan_cache.clear();
                 Ok((Vec::new(), Some(format!("rel {name}")), Some(pack)))
             }
             Decl::RelReverse { name, of } => {
@@ -916,6 +1396,7 @@ impl Db {
                     reverse_of: Some(of.clone()),
                 };
                 self.store.apply_pack(&pack);
+                self.plan_cache.clear();
                 Ok((
                     Vec::new(),
                     Some(format!("rel {name} = reverse {of}")),
@@ -933,6 +1414,7 @@ impl Db {
                     fields: fields.clone(),
                 };
                 self.store.apply_pack(&pack);
+                self.plan_cache.clear();
                 Ok((
                     Vec::new(),
                     Some(format!("index {}", pack_index_label(collection, fields))),
@@ -966,6 +1448,42 @@ fn cas_each_ok(collection: &str, row: &Row, got: &str, ctx: &PackCtx) -> Result<
     Ok(())
 }
 
+enum Undo {
+    None,
+    Append(crate::store::AppendMark),
+    Full(crate::store::MemBackup),
+}
+
+fn stmt_writes(s: &Stmt) -> bool {
+    match s {
+        Stmt::Query(_) | Stmt::Let { .. } | Stmt::IdbSlice { .. } => false,
+        Stmt::IdbPull { .. } | Stmt::IdbPush | Stmt::Snapshot { .. } | Stmt::Restore { .. } => false,
+        Stmt::AppendFacts { .. }
+        | Stmt::AppendEdges { .. }
+        | Stmt::Insert { .. }
+        | Stmt::Update { .. }
+        | Stmt::Delete { .. }
+        | Stmt::DeleteEdge { .. }
+        | Stmt::Reembed { .. }
+        | Stmt::Decl(_) => true,
+    }
+}
+
+fn stmt_append_only(s: &Stmt) -> bool {
+    matches!(
+        s,
+        Stmt::AppendFacts { .. } | Stmt::AppendEdges { .. } | Stmt::Insert { .. }
+    )
+}
+
+fn stmt_schema(s: &Stmt) -> bool {
+    matches!(s, Stmt::Decl(_))
+}
+
+fn field_names(fields: &[Field]) -> Vec<String> {
+    fields.iter().map(|f| f.as_str()).collect()
+}
+
 fn pack_index_label(collection: &str, fields: &[String]) -> String {
     format!("{collection}[{}]", fields.join(","))
 }
@@ -980,16 +1498,16 @@ fn fold_packs(packs: Vec<Pack>) -> Option<Pack> {
 
 fn meta_row(kind: &str, name: &str) -> Row {
     let mut r = BTreeMap::new();
-    r.insert("kind".into(), Cell::Text(kind.into()));
-    r.insert("name".into(), Cell::Text(name.into()));
+    r.insert("kind".into(), Cell::text_arc(kind));
+    r.insert("name".into(), Cell::text_arc(name));
     r
 }
 
 fn edge_row(rel: &str, from: &str, to: &str) -> Row {
     let mut r = BTreeMap::new();
-    r.insert("rel".into(), Cell::Text(rel.into()));
-    r.insert("from".into(), Cell::Text(from.into()));
-    r.insert("to".into(), Cell::Text(to.into()));
+    r.insert("rel".into(), Cell::text_arc(rel));
+    r.insert("from".into(), Cell::text_arc(from));
+    r.insert("to".into(), Cell::text_arc(to));
     r
 }
 
@@ -1003,20 +1521,20 @@ fn record_row(record: &Record, now: i64) -> Row {
 
 fn value_cell(v: &Value, now: i64) -> Cell {
     match v {
-        Value::String(s) => Cell::Text(s.clone()),
+        Value::String(s) => Cell::text_arc(s.as_str()),
         Value::Int(n) => Cell::Int(*n),
         Value::Float(n) => Cell::Float(*n),
         Value::Bool(b) => Cell::Bool(*b),
         Value::Now => Cell::Time(now),
         Value::NowMinus(d) => Cell::Time(now - d.as_millis()),
         Value::Duration(d) => Cell::Int(d.as_millis()),
-        Value::Name(n) => Cell::Text(n.clone()),
+        Value::Name(n) => Cell::text_arc(n.as_str()),
     }
 }
 
 fn value_text(v: &Value, now: i64) -> String {
     match value_cell(v, now) {
-        Cell::Text(s) => s,
+        Cell::Text(s) => s.as_ref().to_owned(),
         other => other.compact(),
     }
 }
@@ -1045,7 +1563,7 @@ fn eval_pred(pred: &Pred, row: &Row, now: i64) -> bool {
             .is_some_and(|s| has_word(s, needle, *ci)),
         Pred::Contains { field, needle } => field_cell(row, field)
             .text()
-            .is_some_and(|s| s.contains(needle.as_str())),
+            .is_some_and(|s| text_contains(s, needle)),
         Pred::Regex {
             field,
             pattern,
@@ -1063,9 +1581,25 @@ fn eval_pred(pred: &Pred, row: &Row, now: i64) -> bool {
     }
 }
 
+fn text_contains(hay: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    memchr::memmem::find(hay.as_bytes(), needle.as_bytes()).is_some()
+}
+
 fn field_cell<'a>(row: &'a Row, field: &Field) -> &'a Cell {
     static NULL: Cell = Cell::Null;
-    row.get(&field.as_str()).unwrap_or(&NULL)
+    if let Some(k) = field.leaf() {
+        return row.get(k).unwrap_or(&NULL);
+    }
+    let want = field.as_str();
+    for (k, v) in row {
+        if k == &want {
+            return v;
+        }
+    }
+    &NULL
 }
 
 fn cmp_cell(left: &Cell, value: &Value, op: CmpOp, now: i64) -> bool {
@@ -1106,18 +1640,35 @@ fn cells_eq(a: &Cell, b: &Cell) -> bool {
 }
 
 fn has_word(hay: &str, needle: &str, ci: bool) -> bool {
-    let tokens = |s: &str| {
-        s.split(|c: char| !(c.is_alphanumeric() || c == '_'))
-            .filter(|t| !t.is_empty())
-            .map(|t| if ci { t.to_lowercase() } else { t.to_string() })
-            .collect::<Vec<_>>()
-    };
-    let n = if ci {
-        needle.to_lowercase()
-    } else {
-        needle.to_string()
-    };
-    tokens(hay).iter().any(|w| w == &n)
+    if needle.is_empty() {
+        return false;
+    }
+    if !ci {
+        return hay.split(|c: char| !(c.is_alphanumeric() || c == '_')).any(|w| w == needle);
+    }
+    // Case-insensitive without allocating per-token Vec.
+    let mut nbuf = String::new();
+    for ch in needle.chars() {
+        for c in ch.to_lowercase() {
+            nbuf.push(c);
+        }
+    }
+    let mut wbuf = String::new();
+    for tok in hay.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
+        if tok.is_empty() {
+            continue;
+        }
+        wbuf.clear();
+        for ch in tok.chars() {
+            for c in ch.to_lowercase() {
+                wbuf.push(c);
+            }
+        }
+        if wbuf == nbuf {
+            return true;
+        }
+    }
+    false
 }
 
 fn lex_score(row: &Row, query: &str) -> i64 {
@@ -1198,14 +1749,37 @@ fn agg_count(rows: &[Row], by: &Field) -> Vec<Row> {
             .unwrap_or_else(|| "null".into());
         *map.entry(key).or_insert(0) += 1;
     }
+    count_map_to_rows(&k, map)
+}
+
+fn count_map_to_rows(by: &str, map: BTreeMap<String, i64>) -> Vec<Row> {
     map.into_iter()
-        .map(|(g, n)| {
-            let mut row = BTreeMap::new();
-            row.insert(k.clone(), Cell::Text(unquote(&g)));
-            row.insert("hits".into(), Cell::Int(n));
-            row
-        })
+        .map(|(g, n)| count_row(by, &unquote(&g), n))
         .collect()
+}
+
+fn count_row(by: &str, value: &str, n: i64) -> Row {
+    let mut row = BTreeMap::new();
+    row.insert(by.to_string(), Cell::text_arc(value));
+    row.insert("hits".into(), Cell::Int(n));
+    row
+}
+
+fn eq_value_for_field<'a>(pred: &'a Pred, field: &str) -> Option<&'a str> {
+    match pred {
+        Pred::Cmp {
+            field: f,
+            op: CmpOp::Eq,
+            value: Value::String(s),
+        } if f.as_str() == field => Some(s.as_str()),
+        Pred::Cmp {
+            field: f,
+            op: CmpOp::Eq,
+            value: Value::Name(s),
+        } if f.as_str() == field => Some(s.as_str()),
+        Pred::And(a, b) => eq_value_for_field(a, field).or_else(|| eq_value_for_field(b, field)),
+        _ => None,
+    }
 }
 
 fn agg_sum(rows: &[Row], field: &Field, by: &Field) -> Vec<Row> {
@@ -1223,7 +1797,7 @@ fn agg_sum(rows: &[Row], field: &Field, by: &Field) -> Vec<Row> {
     map.into_iter()
         .map(|(g, n)| {
             let mut row = BTreeMap::new();
-            row.insert(bk.clone(), Cell::Text(unquote(&g)));
+            row.insert(bk.clone(), Cell::text_arc(unquote(&g)));
             row.insert(fk.clone(), Cell::Float(n));
             row
         })
@@ -1240,7 +1814,7 @@ fn unquote(s: &str) -> String {
 
 fn cell_key(c: &Cell) -> Option<String> {
     match c {
-        Cell::Text(s) => Some(s.clone()),
+        Cell::Text(s) => Some(s.as_ref().to_owned()),
         Cell::Int(n) => Some(n.to_string()),
         _ => None,
     }

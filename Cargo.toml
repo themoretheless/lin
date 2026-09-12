@@ -11,14 +11,18 @@ name = "lin"
 path = "src/main.rs"
 
 [dependencies]
+memchr = "2"
 regex = "1.13"
-serde = { version = "1.0.229", features = ["derive"] }
+rustc-hash = "2"
+serde = { version = "1.0.229", features = ["derive", "rc"] }
 serde_json = "1.0.151"
-rbench = { git = "https://github.com/themoretheless/rbench", branch = "release" }
+rbench = { path = "../rbench/crates/rbench" }
 
 [dev-dependencies]
 rusqlite = { version = "0.32", features = ["bundled"] }
 duckdb = { version = "1.10505.0", features = ["bundled"] }
+postgres = "0.19"
+mysql = "25"
 
 [[bench]]
 name = "compare"

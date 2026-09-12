@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::ast::{Decl, TypeExpr};
@@ -14,7 +16,8 @@ use crate::persist::{self, ColSnap, Head, IndexSnap, LogRecord, Pack, Persist, R
 #[serde(tag = "t", content = "v")]
 pub enum Cell {
     Null,
-    Text(String),
+    /// Arc so projecting / cloning rows does not deep-copy large strings.
+    Text(Arc<str>),
     Int(i64),
     Float(f64),
     Bool(bool),
@@ -22,9 +25,20 @@ pub enum Cell {
 }
 
 impl Cell {
+    pub fn text_arc(s: impl Into<Arc<str>>) -> Self {
+        Cell::Text(s.into())
+    }
+
     pub fn text(&self) -> Option<&str> {
         match self {
-            Cell::Text(s) => Some(s),
+            Cell::Text(s) => Some(s.as_ref()),
+            _ => None,
+        }
+    }
+
+    pub fn text_shared(&self) -> Option<Arc<str>> {
+        match self {
+            Cell::Text(s) => Some(Arc::clone(s)),
             _ => None,
         }
     }
@@ -41,12 +55,20 @@ impl Cell {
     pub fn compact(&self) -> String {
         match self {
             Cell::Null => "null".into(),
-            Cell::Text(s) => format!("{s:?}"),
+            Cell::Text(s) => format!("{}", Quote(s.as_ref())),
             Cell::Int(n) => n.to_string(),
             Cell::Float(n) => n.to_string(),
             Cell::Bool(b) => b.to_string(),
             Cell::Time(ms) => fmt_iso_millis(*ms),
         }
+    }
+}
+
+/// Debug-quote like `format!("{s:?}")` without allocating the cell wrapper.
+struct Quote<'a>(&'a str);
+impl std::fmt::Display for Quote<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self.0)
     }
 }
 
@@ -83,7 +105,25 @@ pub struct Store {
     pub extra_rels: BTreeMap<String, RelSnap>,
     pub extra_indexes: BTreeMap<String, IndexSnap>,
     pub indexes: BTreeMap<String, LiveIndex>,
+    /// collection → id → row index (O(1) Get / IndexSeek fetch).
+    by_id: BTreeMap<String, FxHashMap<String, usize>>,
+    /// docs uri → row index.
+    docs_by_uri: FxHashMap<String, usize>,
+    /// Parallel Arc columns for docs — contains scans + projected materialize
+    /// without cloning full `BTreeMap` rows.
+    docs_id: Vec<Arc<str>>,
+    docs_title: Vec<Arc<str>>,
+    docs_layer: Vec<Arc<str>>,
+    docs_wing: Vec<Arc<str>>,
     persist: Option<Persist>,
+}
+
+/// Cheap undo for append-only packs (insert / append) — no full store clone.
+#[derive(Debug, Clone)]
+pub struct AppendMark {
+    next_id: u64,
+    col_lens: BTreeMap<String, usize>,
+    edge_len: usize,
 }
 
 impl Store {
@@ -102,6 +142,12 @@ impl Store {
             extra_rels: BTreeMap::new(),
             extra_indexes: BTreeMap::new(),
             indexes: BTreeMap::new(),
+            by_id: BTreeMap::new(),
+            docs_by_uri: FxHashMap::default(),
+            docs_id: Vec::new(),
+            docs_title: Vec::new(),
+            docs_layer: Vec::new(),
+            docs_wing: Vec::new(),
             persist: None,
         }
     }
@@ -174,6 +220,7 @@ impl Store {
         )?;
 
         store.rebuild_indexes();
+        store.rebuild_row_maps();
         store.persist = Some(Persist {
             dir: dir.to_path_buf(),
             log,
@@ -194,12 +241,19 @@ impl Store {
             extra_rels: s.extra_rels.clone(),
             extra_indexes: s.extra_indexes.clone(),
             indexes: BTreeMap::new(),
+            by_id: BTreeMap::new(),
+            docs_by_uri: FxHashMap::default(),
+            docs_id: Vec::new(),
+            docs_title: Vec::new(),
+            docs_layer: Vec::new(),
+            docs_wing: Vec::new(),
             persist: None,
         };
         for name in store.extra_collections.keys() {
             store.collections.entry(name.clone()).or_default();
         }
         store.rebuild_indexes();
+        store.rebuild_row_maps();
         store
     }
 
@@ -328,7 +382,9 @@ impl Store {
                 edges,
             } => {
                 self.collection_mut(collection).push(row.clone());
-                let _ = self.index_insert(collection, row);
+                let idx = self.collection(collection).len() - 1;
+                self.row_maps_register(collection, idx);
+                let _ = self.index_insert_at(collection, idx);
                 for e in edges {
                     if !self
                         .edges
@@ -352,6 +408,7 @@ impl Store {
                 });
                 if !exists {
                     self.collection_mut("facts").push(row.clone());
+                    self.row_maps_register("facts", self.collection("facts").len() - 1);
                 }
             }
             Pack::AppendEdge { rel, from, to } => {
@@ -370,35 +427,26 @@ impl Store {
             Pack::Update { collection, rows } => {
                 for new in rows {
                     let id = row_text(new, "id").map(str::to_string);
-                    let old = id.as_ref().and_then(|id| {
-                        self.collection(collection)
-                            .iter()
-                            .find(|r| row_text(r, "id") == Some(id.as_str()))
-                            .cloned()
-                    });
-                    if let Some(old) = old {
-                        self.index_remove(collection, &old);
-                        if let Some(slot) = self
-                            .collection_mut(collection)
-                            .iter_mut()
-                            .find(|r| row_text(r, "id") == row_text(new, "id"))
-                        {
-                            *slot = new.clone();
-                        }
-                        let _ = self.index_insert(collection, new);
+                    let idx = id.as_ref().and_then(|id| self.row_index(collection, id));
+                    if let Some(i) = idx {
+                        self.index_remove_at(collection, i);
+                        self.collection_mut(collection)[i] = new.clone();
+                        self.row_maps_reregister(collection, i);
+                        let _ = self.index_insert_at(collection, i);
                         continue;
                     }
                     self.collection_mut(collection).push(new.clone());
-                    let _ = self.index_insert(collection, new);
+                    let i = self.collection(collection).len() - 1;
+                    self.row_maps_register(collection, i);
+                    let _ = self.index_insert_at(collection, i);
                 }
             }
             Pack::Reembed => {}
             Pack::Delete { collection, rows } => {
-                for d in rows {
-                    self.index_remove(collection, d);
-                }
                 self.collection_mut(collection)
                     .retain(|r| !rows.iter().any(|d| same_row_key(collection, r, d)));
+                self.rebuild_row_maps_collection(collection);
+                self.rebuild_indexes_collection(collection);
             }
             Pack::DeleteEdge { rel, from, to } => {
                 self.edges
@@ -451,10 +499,8 @@ impl Store {
                     fields: fields.clone(),
                 };
                 let mut live = LiveIndex::new(def);
-                for row in self.collection(collection) {
-                    if let Some(id) = crate::index::row_id(row) {
-                        let _ = live.insert(&id, row);
-                    }
+                for (i, row) in self.collection(collection).iter().enumerate() {
+                    let _ = live.insert_at(i, row);
                 }
                 self.indexes.insert(label, live);
             }
@@ -476,7 +522,7 @@ impl Store {
             extra_collections: self.extra_collections.clone(),
             extra_rels: self.extra_rels.clone(),
             extra_indexes: self.extra_indexes.clone(),
-            indexes: self.indexes.clone(),
+            // indexes / row maps rebuilt on restore — avoid O(n) clone of trees
         }
     }
 
@@ -489,7 +535,34 @@ impl Store {
         self.extra_collections = b.extra_collections;
         self.extra_rels = b.extra_rels;
         self.extra_indexes = b.extra_indexes;
-        self.indexes = b.indexes;
+        self.rebuild_indexes();
+        self.rebuild_row_maps();
+    }
+
+    /// Mark lengths for append-only rollback (insert/append packs).
+    pub fn append_mark(&self) -> AppendMark {
+        let mut col_lens = BTreeMap::new();
+        for (name, rows) in &self.collections {
+            col_lens.insert(name.clone(), rows.len());
+        }
+        AppendMark {
+            next_id: self.next_id,
+            col_lens,
+            edge_len: self.edges.len(),
+        }
+    }
+
+    pub fn append_rollback(&mut self, mark: AppendMark) {
+        self.next_id = mark.next_id;
+        self.edges.truncate(mark.edge_len);
+        for (name, rows) in self.collections.iter_mut() {
+            let len = mark.col_lens.get(name).copied().unwrap_or(0);
+            rows.truncate(len);
+        }
+        // Drop collections created after the mark (schema col during append-only is rare;
+        // full backup covers schema). Keep extras as-is for append-only path.
+        self.rebuild_indexes();
+        self.rebuild_row_maps();
     }
 
     pub fn fixture(cat: &Catalog) -> Self {
@@ -562,6 +635,7 @@ impl Store {
             to: facts.into(),
         });
         s.next_id = 10;
+        s.rebuild_row_maps();
         s
     }
 
@@ -583,15 +657,208 @@ impl Store {
     }
 
     pub fn find_doc_key(&self, key: &str) -> Option<&Row> {
-        self.collection("docs")
-            .iter()
-            .find(|r| row_text(r, "id") == Some(key) || row_text(r, "uri") == Some(key))
+        self.get_by_id("docs", key)
+            .or_else(|| self.get_by_uri(key))
     }
 
-    pub fn index_insert(&mut self, collection: &str, row: &Row) -> Result<(), Error> {
-        let Some(id) = crate::index::row_id(row) else {
+    pub fn get_by_id(&self, collection: &str, id: &str) -> Option<&Row> {
+        let idx = self.row_index(collection, id)?;
+        self.collections.get(collection)?.get(idx)
+    }
+
+    pub fn get_by_uri(&self, uri: &str) -> Option<&Row> {
+        let idx = *self.docs_by_uri.get(uri)?;
+        self.collections.get("docs")?.get(idx)
+    }
+
+    pub fn row_index(&self, collection: &str, id: &str) -> Option<usize> {
+        self.by_id.get(collection)?.get(id).copied()
+    }
+
+    pub fn get_by_idx(&self, collection: &str, idx: usize) -> Option<&Row> {
+        self.collections.get(collection)?.get(idx)
+    }
+
+    pub fn rows_by_idxs(&self, collection: &str, idxs: &[usize]) -> Vec<Row> {
+        let mut out = Vec::with_capacity(idxs.len());
+        for &i in idxs {
+            if let Some(row) = self.get_by_idx(collection, i) {
+                out.push(row.clone());
+            }
+        }
+        out
+    }
+
+    pub fn rows_by_ids(&self, collection: &str, ids: &[String]) -> Vec<Row> {
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(row) = self.get_by_id(collection, id) {
+                out.push(row.clone());
+            }
+        }
+        out
+    }
+
+    pub fn project_by_id(&self, collection: &str, id: &str, fields: &[String]) -> Option<Row> {
+        let row = self.get_by_id(collection, id)?;
+        Some(project_fields(row, fields))
+    }
+
+    pub fn project_by_key(
+        &self,
+        collection: &str,
+        field: &str,
+        key: &str,
+        fields: Option<&[String]>,
+    ) -> Option<Row> {
+        let row = match field {
+            "id" => self.get_by_id(collection, key)?,
+            "uri" if collection == "docs" => self.get_by_uri(key)?,
+            _ => return None,
+        };
+        Some(match fields {
+            Some(fs) if !fs.is_empty() => project_fields(row, fs),
+            _ => row.clone(),
+        })
+    }
+
+    pub fn rebuild_row_maps(&mut self) {
+        self.by_id.clear();
+        self.docs_by_uri.clear();
+        let names: Vec<String> = self.collections.keys().cloned().collect();
+        for name in names {
+            self.rebuild_row_maps_collection(&name);
+        }
+    }
+
+    pub fn rebuild_row_maps_collection(&mut self, collection: &str) {
+        self.by_id.entry(collection.to_string()).or_default().clear();
+        if collection == "docs" {
+            self.docs_by_uri.clear();
+            self.docs_id.clear();
+            self.docs_title.clear();
+            self.docs_layer.clear();
+            self.docs_wing.clear();
+        }
+        let Some(rows) = self.collections.get(collection) else {
+            return;
+        };
+        let n = rows.len();
+        if collection == "docs" {
+            self.docs_id.reserve(n);
+            self.docs_title.reserve(n);
+            self.docs_layer.reserve(n);
+            self.docs_wing.reserve(n);
+        }
+        // Snapshot Arc handles first so we can fill maps without overlapping borrows.
+        let snaps: Vec<(Option<String>, Option<String>, Arc<str>, Arc<str>, Arc<str>, Arc<str>)> =
+            rows
+                .iter()
+                .map(|row| {
+                    (
+                        row_text(row, "id").map(str::to_string),
+                        row_text(row, "uri").map(str::to_string),
+                        row.get("id").and_then(Cell::text_shared).unwrap_or_default(),
+                        row.get("title").and_then(Cell::text_shared).unwrap_or_default(),
+                        row.get("layer").and_then(Cell::text_shared).unwrap_or_default(),
+                        row.get("wing").and_then(Cell::text_shared).unwrap_or_default(),
+                    )
+                })
+                .collect();
+        for (i, (id, uri, did, title, layer, wing)) in snaps.into_iter().enumerate() {
+            if let Some(id) = id {
+                self.by_id
+                    .get_mut(collection)
+                    .expect("by_id entry")
+                    .insert(id, i);
+            }
+            if collection == "docs" {
+                if let Some(uri) = uri {
+                    self.docs_by_uri.insert(uri, i);
+                }
+                self.docs_id.push(did);
+                self.docs_title.push(title);
+                self.docs_layer.push(layer);
+                self.docs_wing.push(wing);
+            }
+        }
+    }
+
+    pub fn row_maps_register(&mut self, collection: &str, idx: usize) {
+        let Some(row) = self.collections.get(collection).and_then(|c| c.get(idx)) else {
+            return;
+        };
+        let id = row_text(row, "id").map(str::to_string);
+        let uri = row_text(row, "uri").map(str::to_string);
+        let did = row.get("id").and_then(Cell::text_shared).unwrap_or_default();
+        let title = row.get("title").and_then(Cell::text_shared).unwrap_or_default();
+        let layer = row.get("layer").and_then(Cell::text_shared).unwrap_or_default();
+        let wing = row.get("wing").and_then(Cell::text_shared).unwrap_or_default();
+        if let Some(id) = id {
+            self.by_id
+                .entry(collection.to_string())
+                .or_default()
+                .insert(id, idx);
+        }
+        if collection == "docs" {
+            if let Some(uri) = uri {
+                self.docs_by_uri.insert(uri, idx);
+            }
+            if idx == self.docs_id.len() {
+                self.docs_id.push(did);
+                self.docs_title.push(title);
+                self.docs_layer.push(layer);
+                self.docs_wing.push(wing);
+            } else if idx < self.docs_id.len() {
+                self.docs_id[idx] = did;
+                self.docs_title[idx] = title;
+                self.docs_layer[idx] = layer;
+                self.docs_wing[idx] = wing;
+            } else {
+                self.rebuild_row_maps_collection("docs");
+            }
+        }
+    }
+
+    /// Reserve row-map capacity before a bulk insert.
+    pub fn row_maps_reserve(&mut self, collection: &str, additional: usize) {
+        self.by_id
+            .entry(collection.to_string())
+            .or_default()
+            .reserve(additional);
+        if collection == "docs" {
+            self.docs_by_uri.reserve(additional);
+            self.docs_id.reserve(additional);
+            self.docs_title.reserve(additional);
+            self.docs_layer.reserve(additional);
+            self.docs_wing.reserve(additional);
+        }
+    }
+
+    pub fn row_maps_reregister(&mut self, collection: &str, idx: usize) {
+        // uri may have changed; safest is rebuild one collection (small for updates).
+        self.rebuild_row_maps_collection(collection);
+        let _ = idx;
+    }
+
+    pub fn index_insert_at(&mut self, collection: &str, row_idx: usize) -> Result<(), Error> {
+        let Some(row) = self
+            .collections
+            .get(collection)
+            .and_then(|c| c.get(row_idx))
+            .cloned()
+        else {
             return Ok(());
         };
+        self.index_insert_row(collection, row_idx, &row)
+    }
+
+    pub fn index_insert_row(
+        &mut self,
+        collection: &str,
+        row_idx: usize,
+        row: &Row,
+    ) -> Result<(), Error> {
         let labels: Vec<String> = self
             .indexes
             .iter()
@@ -600,7 +867,7 @@ impl Store {
             .collect();
         for label in labels {
             if let Some(idx) = self.indexes.get_mut(&label)
-                && let Err(e) = idx.insert(&id, row)
+                && let Err(e) = idx.insert_at(row_idx, row)
             {
                 return Err(Error::runtime(e));
             }
@@ -608,13 +875,10 @@ impl Store {
         Ok(())
     }
 
-    pub fn index_remove(&mut self, collection: &str, row: &Row) {
-        let Some(id) = crate::index::row_id(row) else {
-            return;
-        };
+    pub fn index_remove_at(&mut self, collection: &str, row_idx: usize) {
         for idx in self.indexes.values_mut() {
             if idx.def.collection == collection {
-                idx.remove(&id);
+                idx.remove_at(row_idx);
             }
         }
     }
@@ -629,10 +893,32 @@ impl Store {
                 fields: snap.fields.clone(),
             };
             let mut live = LiveIndex::new(def);
-            for row in self.collection(&snap.collection) {
-                if let Some(id) = crate::index::row_id(row) {
-                    let _ = live.insert(&id, row);
-                }
+            for (i, row) in self.collection(&snap.collection).iter().enumerate() {
+                let _ = live.insert_at(i, row);
+            }
+            self.indexes.insert(label, live);
+        }
+    }
+
+    pub fn rebuild_indexes_collection(&mut self, collection: &str) {
+        let labels: Vec<String> = self
+            .indexes
+            .iter()
+            .filter(|(_, idx)| idx.def.collection == collection)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for label in labels {
+            let Some(snap) = self.extra_indexes.get(&label).cloned() else {
+                continue;
+            };
+            let def = crate::catalog::IndexDef {
+                collection: snap.collection.clone(),
+                unique: snap.unique,
+                fields: snap.fields.clone(),
+            };
+            let mut live = LiveIndex::new(def);
+            for (i, row) in self.collection(collection).iter().enumerate() {
+                let _ = live.insert_at(i, row);
             }
             self.indexes.insert(label, live);
         }
@@ -643,14 +929,115 @@ impl Store {
         collection: &str,
         use_: &crate::index::IndexUse,
         now: i64,
-    ) -> Option<Vec<String>> {
+    ) -> Option<Vec<usize>> {
         let label = use_.def.label();
         let idx = self.indexes.get(&label)?;
         if idx.def.collection != collection {
             return None;
         }
-        Some(idx.seek(use_, now))
+        Some(idx.seek_idxs(use_, now))
     }
+
+    pub fn index_seek_count(
+        &self,
+        collection: &str,
+        use_: &crate::index::IndexUse,
+        now: i64,
+    ) -> Option<usize> {
+        let label = use_.def.label();
+        let idx = self.indexes.get(&label)?;
+        if idx.def.collection != collection {
+            return None;
+        }
+        Some(idx.seek_count(use_, now))
+    }
+
+    /// Count `docs.title ~ needle` grouped by layer using columnar titles (no row maps).
+    pub fn docs_title_contains_count_by_layer(&self, needle: &str) -> BTreeMap<String, i64> {
+        let finder = memchr::memmem::Finder::new(needle.as_bytes());
+        let mut map: BTreeMap<String, i64> = BTreeMap::new();
+        let n = self.docs_title.len().min(self.docs_layer.len());
+        for i in 0..n {
+            if finder.find(self.docs_title[i].as_bytes()).is_some() {
+                let key = format!("{}", Quote(self.docs_layer[i].as_ref()));
+                *map.entry(key).or_insert(0) += 1;
+            }
+        }
+        map
+    }
+
+    /// Project hot docs fields from parallel columns — Arc clone only, no full row clone.
+    /// Returns None if any requested field is outside the hot set.
+    pub fn project_docs_hot(&self, idxs: &[usize], fields: &[String]) -> Option<Vec<Row>> {
+        if fields.is_empty() || !fields.iter().all(|f| docs_hot_field(f)) {
+            return None;
+        }
+        let mut out = Vec::with_capacity(idxs.len());
+        for &i in idxs {
+            if i >= self.docs_id.len() {
+                continue;
+            }
+            let mut row = BTreeMap::new();
+            for f in fields {
+                let cell = match f.as_str() {
+                    "id" => Cell::Text(Arc::clone(&self.docs_id[i])),
+                    "title" => Cell::Text(Arc::clone(&self.docs_title[i])),
+                    "layer" => Cell::Text(Arc::clone(&self.docs_layer[i])),
+                    "wing" => Cell::Text(Arc::clone(&self.docs_wing[i])),
+                    _ => Cell::Null,
+                };
+                row.insert(f.clone(), cell);
+            }
+            out.push(row);
+        }
+        Some(out)
+    }
+
+    /// Full docs scan projecting only hot columns when filter is title-contains or always-true path.
+    pub fn scan_docs_hot_project(
+        &self,
+        fields: &[String],
+        title_contains: Option<&str>,
+    ) -> Option<Vec<Row>> {
+        if fields.is_empty() || !fields.iter().all(|f| docs_hot_field(f)) {
+            return None;
+        }
+        let n = self.docs_id.len();
+        let mut out = Vec::new();
+        let finder = title_contains.map(|n| memchr::memmem::Finder::new(n.as_bytes()));
+        for i in 0..n {
+            if let Some(f) = &finder
+                && f.find(self.docs_title[i].as_bytes()).is_none()
+            {
+                continue;
+            }
+            let mut row = BTreeMap::new();
+            for f in fields {
+                let cell = match f.as_str() {
+                    "id" => Cell::Text(Arc::clone(&self.docs_id[i])),
+                    "title" => Cell::Text(Arc::clone(&self.docs_title[i])),
+                    "layer" => Cell::Text(Arc::clone(&self.docs_layer[i])),
+                    "wing" => Cell::Text(Arc::clone(&self.docs_wing[i])),
+                    _ => Cell::Null,
+                };
+                row.insert(f.clone(), cell);
+            }
+            out.push(row);
+        }
+        Some(out)
+    }
+}
+
+fn docs_hot_field(f: &str) -> bool {
+    matches!(f, "id" | "title" | "layer" | "wing")
+}
+
+pub fn project_fields(row: &Row, fields: &[String]) -> Row {
+    let mut out = BTreeMap::new();
+    for f in fields {
+        out.insert(f.clone(), row.get(f).cloned().unwrap_or(Cell::Null));
+    }
+    out
 }
 
 #[derive(Clone)]
@@ -663,7 +1050,6 @@ pub struct MemBackup {
     extra_collections: BTreeMap<String, ColSnap>,
     extra_rels: BTreeMap<String, RelSnap>,
     extra_indexes: BTreeMap<String, IndexSnap>,
-    indexes: BTreeMap<String, LiveIndex>,
 }
 
 fn same_row_key(collection: &str, a: &Row, b: &Row) -> bool {
@@ -743,30 +1129,30 @@ struct DocSeed<'a> {
 
 fn doc_row(d: DocSeed<'_>) -> Row {
     let mut r = BTreeMap::new();
-    r.insert("id".into(), Cell::Text(d.id.into()));
-    r.insert("uri".into(), Cell::Text(d.uri.into()));
-    r.insert("title".into(), Cell::Text(d.title.into()));
-    r.insert("wing".into(), Cell::Text(d.wing.into()));
-    r.insert("room".into(), Cell::Text(d.room.into()));
-    r.insert("layer".into(), Cell::Text(d.layer.into()));
-    r.insert("body".into(), Cell::Text(d.body.into()));
-    r.insert("hash".into(), Cell::Text(content_hash(d.body)));
-    r.insert("snippet".into(), Cell::Text(d.snippet.into()));
+    r.insert("id".into(), Cell::text_arc(d.id));
+    r.insert("uri".into(), Cell::text_arc(d.uri));
+    r.insert("title".into(), Cell::text_arc(d.title));
+    r.insert("wing".into(), Cell::text_arc(d.wing));
+    r.insert("room".into(), Cell::text_arc(d.room));
+    r.insert("layer".into(), Cell::text_arc(d.layer));
+    r.insert("body".into(), Cell::text_arc(d.body));
+    r.insert("hash".into(), Cell::text_arc(content_hash(d.body)));
+    r.insert("snippet".into(), Cell::text_arc(d.snippet));
     r.insert("ts".into(), Cell::Time(d.ts));
     r
 }
 
 fn user_row(id: &str, email: &str) -> Row {
     let mut r = BTreeMap::new();
-    r.insert("id".into(), Cell::Text(id.into()));
-    r.insert("email".into(), Cell::Text(email.into()));
+    r.insert("id".into(), Cell::text_arc(id));
+    r.insert("email".into(), Cell::text_arc(email));
     r
 }
 
 fn order_row(id: &str, user_id: &str, total: f64, ts: i64) -> Row {
     let mut r = BTreeMap::new();
-    r.insert("id".into(), Cell::Text(id.into()));
-    r.insert("user_id".into(), Cell::Text(user_id.into()));
+    r.insert("id".into(), Cell::text_arc(id));
+    r.insert("user_id".into(), Cell::text_arc(user_id));
     r.insert("total".into(), Cell::Float(total));
     r.insert("ts".into(), Cell::Time(ts));
     r

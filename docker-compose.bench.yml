@@ -1,0 +1,54 @@
+# Optional peers for `cargo bench --bench compare`.
+# Mirrors patterns from Sources/dbill (MySQL 8.4 + healthcheck + tmpfs)
+# and a dedicated Postgres on non-default ports to avoid clashing with brew.
+#
+#   docker compose -f docker-compose.bench.yml up -d
+#   export LIN_BENCH_PG_URL='postgresql://lin:lin@127.0.0.1:55432/lin'
+#   export LIN_BENCH_MYSQL_URL='mysql://lin:lin@127.0.0.1:53306/lin'
+#
+# Alternate MySQL already in Sources:
+#   docker compose -f ../dbill/docker-compose.yml up -d mysql
+#   export LIN_BENCH_MYSQL_URL='mysql://dbill:dbill@127.0.0.1:33306/dbill_smoke'
+
+name: lin-bench
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: "no"
+    environment:
+      POSTGRES_USER: lin
+      POSTGRES_PASSWORD: lin
+      POSTGRES_DB: lin
+    ports:
+      - "127.0.0.1:55432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lin -d lin"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+    tmpfs:
+      - /var/lib/postgresql/data
+
+  mysql:
+    image: mysql:8.4
+    restart: "no"
+    environment:
+      MYSQL_ROOT_PASSWORD: lin
+      MYSQL_DATABASE: lin
+      MYSQL_USER: lin
+      MYSQL_PASSWORD: lin
+    ports:
+      - "127.0.0.1:53306:3306"
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -ulin -plin --silent"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 20s
+    tmpfs:
+      - /var/lib/mysql

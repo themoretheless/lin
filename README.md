@@ -56,9 +56,9 @@ rel cites
 
 Неявный `take 50`. Hybrid search в плане показывает RRF; исполнитель без эмбеддера идёт только lex-путём (векторные скоры не подделываются). `embed_id=nomic-embed-text/768`.
 
-## Бенчмарки (rbench): Lin vs SQLite vs DuckDB
+## Бенчмарки (rbench): Lin vs SQLite vs DuckDB vs Postgres vs MySQL
 
-Сравнительные in-memory hot paths в `benches/compare.rs` через [rbench](https://github.com/themoretheless/rbench) (`Suite`, `harness = false`).
+Сравнительные hot paths в `benches/compare.rs` через [rbench](https://github.com/themoretheless/rbench) (`Suite`, `harness = false`).
 
 ```bash
 # список кейсов
@@ -72,12 +72,36 @@ cargo bench --bench compare -- --filter point_get
 cargo bench --bench compare -- --filter insert_bulk_1k --samples 8
 ```
 
-Движки: **Lin**, **SQLite** (`rusqlite` bundled), **DuckDB** (bundled; собирается на mac aarch64), плюс **HashMap** только для point get. N=10 000 для тёплых чтений (fixture; setup вне тайминга). Bulk insert: схема/индекс в setup, в тайминге только запись.
+Движки: **Lin**, **SQLite** (`rusqlite` bundled), **DuckDB** (bundled; собирается на mac aarch64), **Postgres** / **MySQL** (опционально, через URL), плюс **HashMap** только для point get. N=10 000 для тёплых чтений (fixture; setup вне тайминга). Bulk insert: схема/индекс в setup, в тайминге только запись.
 
-Сравнимо: point get по id, `wing ==`, range `wing`+`ts`, substring (`title ~ "wal"` ≈ `LIKE '%wal%'`), bulk insert 1k/10k.  
-Не сравниваем здесь (и не подтасовываем): Lin `hop`, hybrid `search`/RRF, CAS — у SQLite/DuckDB нет прямого аналога в этом бенче.
+Сравнимо: point get по id, `wing ==`, range `wing`+`ts`, substring (`title ~ "wal"` ≈ `LIKE '%wal%'`), materialize `SELECT id,title`, bulk insert 1k/10k.  
+Не сравниваем здесь (и не подтасовываем): Lin `hop`, hybrid `search`/RRF, CAS — у SQL-пиров нет прямого аналога в этом бенче.
 
-Зависимость: `rbench` из git (`branch = "main"`; ветки `release` на remote пока нет).
+### Postgres / MySQL
+
+Без сервера кейсы просто пропускаются (Lin/SQLite/DuckDB всё равно бегут). По умолчанию пробуются локальные Docker-порты; либо задайте URL явно:
+
+```bash
+export LIN_BENCH_PG_URL='postgresql://lin:lin@127.0.0.1:55432/lin'
+export LIN_BENCH_MYSQL_URL='mysql://lin:lin@127.0.0.1:53306/lin'
+```
+
+Один раз поднять серверы:
+
+```bash
+docker run -d --name lin-bench-pg \
+  -e POSTGRES_PASSWORD=lin -e POSTGRES_USER=lin -e POSTGRES_DB=lin \
+  -p 55432:5432 postgres:16-alpine
+
+docker run -d --name lin-bench-mysql \
+  -e MYSQL_ROOT_PASSWORD=lin -e MYSQL_DATABASE=lin \
+  -e MYSQL_USER=lin -e MYSQL_PASSWORD=lin \
+  -p 53306:3306 mysql:8.4
+```
+
+Повторный старт: `docker start lin-bench-pg lin-bench-mysql`.
+
+Зависимости бенча: `postgres`, `mysql` (dev-dependencies). `rbench` из git (`branch = "release"`).
 
 ## Запуск
 

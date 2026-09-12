@@ -1,9 +1,11 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::ops::Bound;
+
+use rustc_hash::FxHashMap;
 
 use crate::ast::{CmpOp, Pred, Value};
 use crate::catalog::{Catalog, IndexDef};
-use crate::store::{Cell, Row, row_text};
+use crate::store::{Cell, Row};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum IndexPart {
@@ -19,11 +21,12 @@ pub enum IndexPart {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct IndexKey(pub Vec<IndexPart>);
 
+/// Live secondary index: BTree over composite keys → row indices in the collection vec.
 #[derive(Debug, Clone)]
 pub struct LiveIndex {
     pub def: IndexDef,
-    pub forward: BTreeMap<IndexKey, BTreeSet<String>>,
-    pub reverse: BTreeMap<String, IndexKey>,
+    pub forward: BTreeMap<IndexKey, Vec<usize>>,
+    pub reverse: FxHashMap<usize, IndexKey>,
 }
 
 #[derive(Debug, Clone)]
@@ -38,7 +41,7 @@ impl LiveIndex {
         Self {
             def,
             forward: BTreeMap::new(),
-            reverse: BTreeMap::new(),
+            reverse: FxHashMap::default(),
         }
     }
 
@@ -52,38 +55,42 @@ impl LiveIndex {
         IndexKey(parts)
     }
 
-    pub fn insert(&mut self, id: &str, row: &Row) -> Result<(), String> {
+    pub fn insert_at(&mut self, idx: usize, row: &Row) -> Result<(), String> {
         let key = self.key_of(row);
         if self.def.unique
             && let Some(ids) = self.forward.get(&key)
-            && ids.iter().any(|x| x != id)
+            && ids.iter().any(|&x| x != idx)
         {
             return Err(format!("unique index {}: duplicate key", self.def.label()));
         }
-        if let Some(old) = self.reverse.insert(id.to_string(), key.clone())
-            && let Some(set) = self.forward.get_mut(&old)
+        if let Some(old) = self.reverse.insert(idx, key.clone())
+            && let Some(vec) = self.forward.get_mut(&old)
         {
-            set.remove(id);
-            if set.is_empty() {
+            if let Some(p) = vec.iter().position(|&x| x == idx) {
+                vec.swap_remove(p);
+            }
+            if vec.is_empty() {
                 self.forward.remove(&old);
             }
         }
-        self.forward.entry(key).or_default().insert(id.to_string());
+        self.forward.entry(key).or_default().push(idx);
         Ok(())
     }
 
-    pub fn remove(&mut self, id: &str) {
-        if let Some(key) = self.reverse.remove(id)
-            && let Some(set) = self.forward.get_mut(&key)
+    pub fn remove_at(&mut self, idx: usize) {
+        if let Some(key) = self.reverse.remove(&idx)
+            && let Some(vec) = self.forward.get_mut(&key)
         {
-            set.remove(id);
-            if set.is_empty() {
+            if let Some(p) = vec.iter().position(|&x| x == idx) {
+                vec.swap_remove(p);
+            }
+            if vec.is_empty() {
                 self.forward.remove(&key);
             }
         }
     }
 
-    pub fn seek(&self, use_: &IndexUse, now: i64) -> Vec<String> {
+    fn bounds(&self, use_: &IndexUse, now: i64) -> (Bound<IndexKey>, Bound<IndexKey>) {
         let arity = self.def.fields.len();
         let eqs: Vec<IndexPart> = use_.eqs.iter().map(|(_, v)| value_part(v, now)).collect();
         let mut lo = eqs.clone();
@@ -111,9 +118,23 @@ impl LiveIndex {
             Some((_, CmpOp::Lt, _)) => Bound::Excluded(IndexKey(hi)),
             _ => Bound::Included(IndexKey(hi)),
         };
+        (start, end)
+    }
+
+    /// Count matching row indices without allocating an id/index list.
+    pub fn seek_count(&self, use_: &IndexUse, now: i64) -> usize {
+        let (start, end) = self.bounds(use_, now);
+        self.forward
+            .range((start, end))
+            .map(|(_, idxs)| idxs.len())
+            .sum()
+    }
+
+    pub fn seek_idxs(&self, use_: &IndexUse, now: i64) -> Vec<usize> {
+        let (start, end) = self.bounds(use_, now);
         let mut out = Vec::new();
-        for (_, ids) in self.forward.range((start, end)) {
-            out.extend(ids.iter().cloned());
+        for (_, idxs) in self.forward.range((start, end)) {
+            out.extend_from_slice(idxs);
         }
         out
     }
@@ -139,7 +160,7 @@ fn cell_part(c: &Cell) -> IndexPart {
         Cell::Bool(b) => IndexPart::Bool(*b),
         Cell::Int(n) => IndexPart::Int(*n),
         Cell::Time(n) => IndexPart::Time(*n),
-        Cell::Text(s) => IndexPart::Text(s.clone()),
+        Cell::Text(s) => IndexPart::Text(s.as_ref().to_owned()),
         Cell::Float(n) => IndexPart::Int(n.to_bits() as i64),
     }
 }
@@ -198,6 +219,40 @@ pub fn pick_index(cat: &Catalog, collection: &str, pred: &Pred) -> Option<IndexU
     best
 }
 
+/// True when every atomic predicate is enforced by the index seek (no residual filter).
+pub fn index_covers_pred(pred: &Pred, use_: &IndexUse) -> bool {
+    if pred_has_or(pred) {
+        return false;
+    }
+    for atom in flatten_and(pred) {
+        match atom {
+            Pred::Cmp {
+                field,
+                op: CmpOp::Eq,
+                ..
+            } => {
+                if !use_.eqs.iter().any(|(f, _)| f == &field.as_str()) {
+                    return false;
+                }
+            }
+            Pred::Cmp {
+                field,
+                op,
+                ..
+            } if matches!(op, CmpOp::Gt | CmpOp::Lt | CmpOp::Ge | CmpOp::Le) => {
+                let Some((rf, rop, _)) = &use_.range else {
+                    return false;
+                };
+                if rf != &field.as_str() || rop != op {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
 pub fn pred_has_or(pred: &Pred) -> bool {
     match pred {
         Pred::Or(_, _) => true,
@@ -246,10 +301,4 @@ fn find_range<'a>(atoms: &[&'a Pred], field: &str) -> Option<(CmpOp, &'a Value)>
         }
     }
     None
-}
-
-pub fn row_id(row: &Row) -> Option<String> {
-    row_text(row, "id")
-        .or_else(|| row_text(row, "uri"))
-        .map(str::to_string)
 }

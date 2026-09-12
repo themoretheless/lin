@@ -1,17 +1,26 @@
-//! Comparative hot-path benches: Lin vs SQLite vs DuckDB (+ HashMap point-get baseline).
+//! Comparative hot-path benches: Lin vs SQLite vs DuckDB vs Postgres vs MySQL
+//! (+ HashMap point-get baseline).
 //!
-//! Warm reads use a shared in-memory fixture (setup excluded from timing).
+//! Warm reads use a shared fixture (setup excluded from timing).
 //! Bulk inserts: schema/index in setup; only row writes are timed.
 //!
+//! Postgres / MySQL: optional peers. Set `LIN_BENCH_PG_URL` / `LIN_BENCH_MYSQL_URL`,
+//! or leave unset to probe documented local Docker ports; skip gracefully if unreachable.
+//!
 //! Fairness notes (also in README):
-//! - Same N, same columns (id/uri/wing/title/ts/body), in-memory only.
+//! - Same N, same columns (id/uri/wing/title/ts/body).
+//! - Lin point_get / filter / insert use **prepare once, run many** (like SQL prepared).
+//! - Filter benches: Lin `count by …` vs SQL `COUNT(*)` (same shape: return a count).
 //! - Point get / equality / range / LIKE-style substring are comparable.
 //! - Lin `hop`, hybrid `search`, and CAS are not claimed here.
-//! - SQLite/DuckDB `LIKE '%wal%'` ≈ Lin `title ~ "wal"` (substring), not `has` / FTS.
+//! - SQL `LIKE '%wal%'` ≈ Lin `title ~ "wal"` (substring), not `has` / FTS.
+//! - Server DBs are not in-process; network/IPC cost is part of their number.
 
 use std::collections::HashMap;
 use std::hint::black_box;
+use std::time::Duration;
 
+use mysql::prelude::Queryable;
 use rbench::{Config, DropPolicy, Fixture, Suite};
 
 const N: usize = 10_000;
@@ -19,6 +28,16 @@ const INSERT_1K: usize = 1_000;
 const INSERT_10K: usize = 10_000;
 /// Probe row index inside the seeded set (wing=rag, title contains "wal").
 const PROBE: usize = 20;
+
+/// Prefer env, else probe these (lin compose → dbill compose → local brew defaults).
+const PG_CANDIDATES: &[&str] = &[
+    "postgresql://lin:lin@127.0.0.1:55432/lin", // docker-compose.bench.yml
+    "postgresql://postgres@127.0.0.1:5432/postgres", // brew postgresql@17 (trust/peer)
+];
+const MYSQL_CANDIDATES: &[&str] = &[
+    "mysql://lin:lin@127.0.0.1:53306/lin", // docker-compose.bench.yml
+    "mysql://dbill:dbill@127.0.0.1:33306/dbill_smoke", // Sources/dbill/docker-compose.yml
+];
 
 #[derive(Clone)]
 struct Doc {
@@ -83,9 +102,83 @@ fn lin_insert_src(rows: &[Doc]) -> String {
     out
 }
 
+fn range_cutoff_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+        - 7 * 86_400_000
+}
+
+fn env_url(env_key: &str) -> Option<String> {
+    std::env::var(env_key).ok().and_then(|u| {
+        let t = u.trim();
+        if t.is_empty() {
+            None
+        } else {
+            Some(t.to_string())
+        }
+    })
+}
+
+fn try_pg_client(url: &str) -> Result<postgres::Client, String> {
+    postgres::Client::connect(url, postgres::NoTls).map_err(|e| e.to_string())
+}
+
+fn try_mysql_conn(url: &str) -> Result<mysql::Conn, String> {
+    let opts = mysql::Opts::from_url(url).map_err(|e| e.to_string())?;
+    mysql::Conn::new(opts).map_err(|e| e.to_string())
+}
+
+fn connect_pg() -> Option<(String, postgres::Client)> {
+    let mut tried = Vec::new();
+    let mut urls: Vec<String> = Vec::new();
+    if let Some(u) = env_url("LIN_BENCH_PG_URL") {
+        urls.push(u);
+    } else {
+        urls.extend(PG_CANDIDATES.iter().map(|s| (*s).to_string()));
+    }
+    for url in urls {
+        match try_pg_client(&url) {
+            Ok(c) => return Some((url, c)),
+            Err(e) => tried.push(format!("{url} ({e})")),
+        }
+    }
+    eprintln!(
+        "skip postgres: no reachable server\n  tried: {}\n  set LIN_BENCH_PG_URL or:\n  docker compose -f docker-compose.bench.yml up -d postgres\n  # brew postgresql@17 via Sources/ppduster macos-stack-postgres; start service for :5432",
+        tried.join("; ")
+    );
+    None
+}
+
+fn connect_mysql() -> Option<(String, mysql::Conn)> {
+    let mut tried = Vec::new();
+    let mut urls: Vec<String> = Vec::new();
+    if let Some(u) = env_url("LIN_BENCH_MYSQL_URL") {
+        urls.push(u);
+    } else {
+        urls.extend(MYSQL_CANDIDATES.iter().map(|s| (*s).to_string()));
+    }
+    for url in urls {
+        match try_mysql_conn(&url) {
+            Ok(c) => return Some((url, c)),
+            Err(e) => tried.push(format!("{url} ({e})")),
+        }
+    }
+    eprintln!(
+        "skip mysql: no reachable server\n  tried: {}\n  set LIN_BENCH_MYSQL_URL or:\n  docker compose -f docker-compose.bench.yml up -d mysql\n  # or sibling dbill: docker compose -f ../dbill/docker-compose.yml up -d mysql",
+        tried.join("; ")
+    );
+    None
+}
+
 struct LinWarm {
     db: lin::Db,
-    probe_id: String,
+    point_get: lin::Prepared,
+    filter_eq: lin::Prepared,
+    filter_range: lin::Prepared,
+    text_substr: lin::Prepared,
+    materialize: lin::Prepared,
 }
 
 fn seed_lin(n: usize) -> LinWarm {
@@ -95,9 +188,41 @@ fn seed_lin(n: usize) -> LinWarm {
     for chunk in rows.chunks(500) {
         db.run(&lin_insert_src(chunk)).expect("lin seed");
     }
+    let probe_id = &rows[PROBE].id;
+    let point_get = db
+        .prepare(&format!(
+            r#"docs | id == "{}" | {{ id, title }}"#,
+            escape_lin(probe_id)
+        ))
+        .expect("lin prepare point_get");
+    let filter_eq = db
+        .prepare(r#"docs | wing == "rag" | count by wing"#)
+        .expect("lin prepare filter_eq");
+    let filter_range = db
+        .prepare(r#"docs | wing == "rag" and ts > ago 7d | count by wing"#)
+        .expect("lin prepare filter_range");
+    let text_substr = db
+        .prepare(r#"docs | title ~ "wal" | count by layer"#)
+        .expect("lin prepare text_substr");
+    let materialize = db
+        .prepare(r#"docs | wing == "rag" | { id, title } | take all"#)
+        .expect("lin prepare materialize");
+    let eq_plan = db
+        .explain_as(r#"docs | wing == "rag" | count by wing"#, None)
+        .expect("explain eq");
+    assert!(
+        eq_plan.contains("index=docs[wing,ts]"),
+        "expected IndexSeek, got:\n{eq_plan}"
+    );
+    let mat = materialize.run(&mut db).expect("lin materialize sanity");
+    assert_eq!(mat.done.n, n / 2, "materialize should take all rag rows");
     LinWarm {
-        probe_id: rows[PROBE].id.clone(),
         db,
+        point_get,
+        filter_eq,
+        filter_range,
+        text_substr,
+        materialize,
     }
 }
 
@@ -131,6 +256,13 @@ fn seed_sqlite(n: usize) -> SqlWarm {
             ])
             .expect("sqlite seed");
         }
+    }
+    {
+        let _ = conn.prepare_cached("SELECT COUNT(*) FROM docs WHERE id = ?1");
+        let _ = conn.prepare_cached("SELECT COUNT(*) FROM docs WHERE wing = 'rag'");
+        let _ = conn.prepare_cached("SELECT COUNT(*) FROM docs WHERE wing = 'rag' AND ts > ?1");
+        let _ = conn.prepare_cached("SELECT COUNT(*) FROM docs WHERE title LIKE '%wal%'");
+        let _ = conn.prepare_cached("SELECT id, title FROM docs WHERE wing = 'rag'");
     }
     SqlWarm {
         probe_id: rows[PROBE].id.clone(),
@@ -190,10 +322,151 @@ fn seed_map(n: usize) -> MapWarm {
     MapWarm { by_id, probe_id }
 }
 
+struct PgWarm {
+    client: postgres::Client,
+    probe_id: String,
+    point_get: postgres::Statement,
+    filter_eq: postgres::Statement,
+    filter_range: postgres::Statement,
+    text_substr: postgres::Statement,
+    materialize: postgres::Statement,
+}
+
+fn seed_pg(n: usize, mut client: postgres::Client) -> PgWarm {
+    let rows = docs(n);
+    client
+        .batch_execute(
+            "DROP TABLE IF EXISTS docs;
+             CREATE TABLE docs (
+                id TEXT PRIMARY KEY,
+                uri TEXT UNIQUE NOT NULL,
+                wing TEXT NOT NULL,
+                title TEXT NOT NULL,
+                ts BIGINT NOT NULL,
+                body TEXT NOT NULL
+             );
+             CREATE INDEX docs_wing_ts ON docs(wing, ts);",
+        )
+        .expect("pg schema");
+    {
+        let stmt = client
+            .prepare("INSERT INTO docs (id, uri, wing, title, ts, body) VALUES ($1,$2,$3,$4,$5,$6)")
+            .expect("pg prepare insert");
+        for d in &rows {
+            client
+                .execute(
+                    &stmt,
+                    &[&d.id, &d.uri, &d.wing, &d.title, &d.ts, &d.body],
+                )
+                .expect("pg seed");
+        }
+    }
+    let point_get = client
+        .prepare("SELECT COUNT(*)::bigint FROM docs WHERE id = $1")
+        .expect("pg prepare point_get");
+    let filter_eq = client
+        .prepare("SELECT COUNT(*)::bigint FROM docs WHERE wing = 'rag'")
+        .expect("pg prepare filter_eq");
+    let filter_range = client
+        .prepare("SELECT COUNT(*)::bigint FROM docs WHERE wing = 'rag' AND ts > $1")
+        .expect("pg prepare filter_range");
+    let text_substr = client
+        .prepare("SELECT COUNT(*)::bigint FROM docs WHERE title LIKE '%wal%'")
+        .expect("pg prepare text_substr");
+    let materialize = client
+        .prepare("SELECT id, title FROM docs WHERE wing = 'rag'")
+        .expect("pg prepare materialize");
+    PgWarm {
+        client,
+        probe_id: rows[PROBE].id.clone(),
+        point_get,
+        filter_eq,
+        filter_range,
+        text_substr,
+        materialize,
+    }
+}
+
+struct MysqlWarm {
+    conn: mysql::Conn,
+    probe_id: String,
+    point_get: mysql::Statement,
+    filter_eq: mysql::Statement,
+    filter_range: mysql::Statement,
+    text_substr: mysql::Statement,
+    materialize: mysql::Statement,
+}
+
+fn seed_mysql(n: usize, mut conn: mysql::Conn) -> MysqlWarm {
+    let rows = docs(n);
+    conn.query_drop(
+        "CREATE TABLE IF NOT EXISTS docs (
+            id VARCHAR(64) PRIMARY KEY,
+            uri VARCHAR(255) UNIQUE NOT NULL,
+            wing VARCHAR(64) NOT NULL,
+            title VARCHAR(255) NOT NULL,
+            ts BIGINT NOT NULL,
+            body TEXT NOT NULL,
+            INDEX docs_wing_ts (wing, ts)
+         )",
+    )
+    .expect("mysql schema create");
+    conn.query_drop("TRUNCATE TABLE docs")
+        .expect("mysql truncate");
+    {
+        let stmt = conn
+            .prep("INSERT INTO docs (id, uri, wing, title, ts, body) VALUES (?,?,?,?,?,?)")
+            .expect("mysql prepare insert");
+        for d in &rows {
+            conn.exec_drop(
+                &stmt,
+                (&d.id, &d.uri, &d.wing, &d.title, d.ts, &d.body),
+            )
+            .expect("mysql seed");
+        }
+    }
+    let point_get = conn
+        .prep("SELECT COUNT(*) FROM docs WHERE id = ?")
+        .expect("mysql prepare point_get");
+    let filter_eq = conn
+        .prep("SELECT COUNT(*) FROM docs WHERE wing = 'rag'")
+        .expect("mysql prepare filter_eq");
+    let filter_range = conn
+        .prep("SELECT COUNT(*) FROM docs WHERE wing = 'rag' AND ts > ?")
+        .expect("mysql prepare filter_range");
+    let text_substr = conn
+        .prep("SELECT COUNT(*) FROM docs WHERE title LIKE '%wal%'")
+        .expect("mysql prepare text_substr");
+    let materialize = conn
+        .prep("SELECT id, title FROM docs WHERE wing = 'rag'")
+        .expect("mysql prepare materialize");
+    MysqlWarm {
+        conn,
+        probe_id: rows[PROBE].id.clone(),
+        point_get,
+        filter_eq,
+        filter_range,
+        text_substr,
+        materialize,
+    }
+}
+
 fn empty_lin() -> lin::Db {
     let mut db = lin::Db::empty();
     db.run("index docs [wing, ts]").expect("lin index");
     db
+}
+
+struct LinInsert {
+    db: lin::Db,
+    prepared: lin::Prepared,
+}
+
+fn setup_lin_insert(n: usize) -> LinInsert {
+    let mut db = empty_lin();
+    let src = lin_insert_src(&docs(n));
+    let prepared = db.prepare(&src).expect("lin prepare insert");
+    LinInsert { db, prepared }
 }
 
 fn empty_sqlite() -> rusqlite::Connection {
@@ -230,11 +503,57 @@ fn empty_duck() -> duckdb::Connection {
     conn
 }
 
-fn fill_lin(db: &mut lin::Db, n: usize) {
-    let rows = docs(n);
-    for chunk in rows.chunks(500) {
-        db.run(&lin_insert_src(chunk)).expect("lin insert");
-    }
+/// Fresh bulk table on a dedicated connection (does not touch warm `docs`).
+fn empty_pg(url: String) -> postgres::Client {
+    let mut client = try_pg_client(&url).expect("pg reconnect");
+    client
+        .batch_execute(
+            "DROP TABLE IF EXISTS docs_bulk;
+             CREATE TABLE docs_bulk (
+                id TEXT PRIMARY KEY,
+                uri TEXT UNIQUE NOT NULL,
+                wing TEXT NOT NULL,
+                title TEXT NOT NULL,
+                ts BIGINT NOT NULL,
+                body TEXT NOT NULL
+             );
+             CREATE INDEX docs_bulk_wing_ts ON docs_bulk(wing, ts);",
+        )
+        .expect("pg bulk schema");
+    client
+}
+
+fn empty_mysql(url: String) -> mysql::Conn {
+    let mut conn = try_mysql_conn(&url).expect("mysql reconnect");
+    conn.query_drop("DROP TABLE IF EXISTS docs_bulk")
+        .expect("mysql drop bulk");
+    conn.query_drop(
+        "CREATE TABLE docs_bulk (
+            id VARCHAR(64) PRIMARY KEY,
+            uri VARCHAR(255) UNIQUE NOT NULL,
+            wing VARCHAR(64) NOT NULL,
+            title VARCHAR(255) NOT NULL,
+            ts BIGINT NOT NULL,
+            body TEXT NOT NULL,
+            INDEX docs_bulk_wing_ts (wing, ts)
+         )",
+    )
+    .expect("mysql bulk schema");
+    conn
+}
+
+fn fill_lin(ins: &mut LinInsert) {
+    ins.prepared.run(&mut ins.db).expect("lin insert");
+}
+
+fn lin_hits(h: &lin::Handle) -> i64 {
+    h.rows
+        .first()
+        .and_then(|r| match r.get("hits") {
+            Some(lin::Cell::Int(n)) => Some(*n),
+            _ => None,
+        })
+        .unwrap_or(h.done.n as i64)
 }
 
 fn fill_sqlite(conn: &rusqlite::Connection, n: usize) {
@@ -267,11 +586,64 @@ fn fill_duck(conn: &duckdb::Connection, n: usize) {
     }
 }
 
+fn fill_pg(client: &mut postgres::Client, n: usize) {
+    let rows = docs(n);
+    let mut tx = client.transaction().expect("pg tx");
+    let stmt = tx
+        .prepare(
+            "INSERT INTO docs_bulk (id, uri, wing, title, ts, body) VALUES ($1,$2,$3,$4,$5,$6)",
+        )
+        .expect("pg prepare");
+    for d in &rows {
+        tx.execute(
+            &stmt,
+            &[&d.id, &d.uri, &d.wing, &d.title, &d.ts, &d.body],
+        )
+        .expect("pg insert");
+    }
+    tx.commit().expect("pg commit");
+}
+
+fn fill_mysql(conn: &mut mysql::Conn, n: usize) {
+    let rows = docs(n);
+    let mut tx = conn.start_transaction(mysql::TxOpts::default()).expect("mysql tx");
+    let stmt = tx
+        .prep("INSERT INTO docs_bulk (id, uri, wing, title, ts, body) VALUES (?,?,?,?,?,?)")
+        .expect("mysql prepare");
+    for d in &rows {
+        tx.exec_drop(
+            &stmt,
+            (&d.id, &d.uri, &d.wing, &d.title, d.ts, &d.body),
+        )
+        .expect("mysql insert");
+    }
+    tx.commit().expect("mysql commit");
+}
+
 fn main() -> rbench::Result<()> {
+    let pg = connect_pg();
+    let mysql = connect_mysql();
+
+    let mut engines = String::from(
+        "Lin | SQLite(rusqlite bundled) | DuckDB(bundled) | HashMap(point get only)",
+    );
+    if let Some((ref url, _)) = pg {
+        engines.push_str(&format!(" | Postgres({url})"));
+    } else {
+        engines.push_str(" | Postgres(skipped)");
+    }
+    if let Some((ref url, _)) = mysql {
+        engines.push_str(&format!(" | MySQL({url})"));
+    } else {
+        engines.push_str(" | MySQL(skipped)");
+    }
+
     eprintln!(
         "lin compare: N={N} warm reads (fixture), bulk insert (schema outside timing)\n\
-         engines: Lin | SQLite(rusqlite bundled) | DuckDB(bundled) | HashMap(point get only)\n\
-         substring: Lin `title ~ \"wal\"` vs SQL LIKE '%wal%'"
+         engines: {engines}\n\
+         Lin reads: prepare once / run many; filters use count (fair vs SQL COUNT(*));\n\
+         substring: Lin `title ~ \"wal\"` vs SQL LIKE '%wal%';\n\
+         materialize: Lin `wing==rag | {{id,title}} | take all` vs SQL SELECT id,title"
     );
 
     let mut suite = Suite::new("compare");
@@ -281,24 +653,36 @@ fn main() -> rbench::Result<()> {
     let sql = Fixture::new(|| seed_sqlite(N));
     let duck = Fixture::new(|| seed_duck(N));
     let map = Fixture::new(|| seed_map(N));
+    let (pg_fix, pg_url) = match pg {
+        Some((url, client)) => (
+            Some(Fixture::new(move || seed_pg(N, client))),
+            Some(url),
+        ),
+        None => (None, None),
+    };
+    let (mysql_fix, mysql_url) = match mysql {
+        Some((url, conn)) => (
+            Some(Fixture::new(move || seed_mysql(N, conn))),
+            Some(url),
+        ),
+        None => (None, None),
+    };
 
     suite
         .bench_fixture("point_get/lin", lin.clone(), |s| {
-            let q = format!(r#"docs | id == "{}" | {{ id, title }}"#, s.probe_id);
-            black_box(s.db.run(&q).expect("lin get").done.n)
+            black_box(s.point_get.run(&mut s.db).expect("lin get").done.n)
         })
         .tag("point_get")
         .tag("lin")
         .parameter("n", N);
     suite
         .bench_fixture("point_get/sqlite", sql.clone(), |s| {
-            let n: i64 = s
+            let mut stmt = s
                 .conn
-                .query_row(
-                    "SELECT COUNT(*) FROM docs WHERE id = ?1",
-                    rusqlite::params![s.probe_id],
-                    |r| r.get(0),
-                )
+                .prepare_cached("SELECT COUNT(*) FROM docs WHERE id = ?1")
+                .expect("sqlite prep");
+            let n: i64 = stmt
+                .query_row(rusqlite::params![s.probe_id], |r| r.get(0))
                 .expect("sqlite get");
             black_box(n)
         })
@@ -307,13 +691,12 @@ fn main() -> rbench::Result<()> {
         .parameter("n", N);
     suite
         .bench_fixture("point_get/duckdb", duck.clone(), |s| {
-            let n: i64 = s
+            let mut stmt = s
                 .conn
-                .query_row(
-                    "SELECT COUNT(*) FROM docs WHERE id = ?",
-                    duckdb::params![s.probe_id],
-                    |r| r.get(0),
-                )
+                .prepare_cached("SELECT COUNT(*) FROM docs WHERE id = ?")
+                .expect("duck prep");
+            let n: i64 = stmt
+                .query_row(duckdb::params![s.probe_id], |r| r.get(0))
                 .expect("duck get");
             black_box(n)
         })
@@ -327,30 +710,51 @@ fn main() -> rbench::Result<()> {
         .tag("point_get")
         .tag("hashmap")
         .parameter("n", N);
+    if let Some(pg) = pg_fix.clone() {
+        suite
+            .bench_fixture("point_get/postgres", pg, |s| {
+                let n: i64 = s
+                    .client
+                    .query_one(&s.point_get, &[&s.probe_id])
+                    .expect("pg get")
+                    .get(0);
+                black_box(n)
+            })
+            .tag("point_get")
+            .tag("postgres")
+            .parameter("n", N);
+    }
+    if let Some(mysql) = mysql_fix.clone() {
+        suite
+            .bench_fixture("point_get/mysql", mysql, |s| {
+                let n: i64 = s
+                    .conn
+                    .exec_first(&s.point_get, (&s.probe_id,))
+                    .expect("mysql get")
+                    .expect("mysql get row");
+                black_box(n)
+            })
+            .tag("point_get")
+            .tag("mysql")
+            .parameter("n", N);
+    }
 
     suite
         .bench_fixture("filter_eq/lin", lin.clone(), |s| {
-            black_box(
-                s.db
-                    .run(r#"docs | wing == "rag" | take all"#)
-                    .expect("lin filter")
-                    .done
-                    .n,
-            )
+            black_box(lin_hits(
+                &s.filter_eq.run(&mut s.db).expect("lin filter"),
+            ))
         })
         .tag("filter_eq")
         .tag("lin")
         .parameter("n", N);
     suite
         .bench_fixture("filter_eq/sqlite", sql.clone(), |s| {
-            let n: i64 = s
+            let mut stmt = s
                 .conn
-                .query_row(
-                    "SELECT COUNT(*) FROM docs WHERE wing = 'rag'",
-                    [],
-                    |r| r.get(0),
-                )
-                .expect("sqlite filter");
+                .prepare_cached("SELECT COUNT(*) FROM docs WHERE wing = 'rag'")
+                .expect("sqlite prep");
+            let n: i64 = stmt.query_row([], |r| r.get(0)).expect("sqlite filter");
             black_box(n)
         })
         .tag("filter_eq")
@@ -358,47 +762,63 @@ fn main() -> rbench::Result<()> {
         .parameter("n", N);
     suite
         .bench_fixture("filter_eq/duckdb", duck.clone(), |s| {
-            let n: i64 = s
+            let mut stmt = s
                 .conn
-                .query_row(
-                    "SELECT COUNT(*) FROM docs WHERE wing = 'rag'",
-                    [],
-                    |r| r.get(0),
-                )
-                .expect("duck filter");
+                .prepare_cached("SELECT COUNT(*) FROM docs WHERE wing = 'rag'")
+                .expect("duck prep");
+            let n: i64 = stmt.query_row([], |r| r.get(0)).expect("duck filter");
             black_box(n)
         })
         .tag("filter_eq")
         .tag("duckdb")
         .parameter("n", N);
+    if let Some(pg) = pg_fix.clone() {
+        suite
+            .bench_fixture("filter_eq/postgres", pg, |s| {
+                let n: i64 = s
+                    .client
+                    .query_one(&s.filter_eq, &[])
+                    .expect("pg filter")
+                    .get(0);
+                black_box(n)
+            })
+            .tag("filter_eq")
+            .tag("postgres")
+            .parameter("n", N);
+    }
+    if let Some(mysql) = mysql_fix.clone() {
+        suite
+            .bench_fixture("filter_eq/mysql", mysql, |s| {
+                let n: i64 = s
+                    .conn
+                    .exec_first(&s.filter_eq, ())
+                    .expect("mysql filter")
+                    .expect("mysql filter row");
+                black_box(n)
+            })
+            .tag("filter_eq")
+            .tag("mysql")
+            .parameter("n", N);
+    }
 
     suite
         .bench_fixture("filter_range/lin", lin.clone(), |s| {
-            black_box(
-                s.db
-                    .run(r#"docs | wing == "rag" and ts > ago 7d | take all"#)
-                    .expect("lin range")
-                    .done
-                    .n,
-            )
+            black_box(lin_hits(
+                &s.filter_range.run(&mut s.db).expect("lin range"),
+            ))
         })
         .tag("filter_range")
         .tag("lin")
         .parameter("n", N);
     suite
         .bench_fixture("filter_range/sqlite", sql.clone(), |s| {
-            let cutoff = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as i64
-                - 7 * 86_400_000;
-            let n: i64 = s
+            let cutoff = range_cutoff_ms();
+            let mut stmt = s
                 .conn
-                .query_row(
-                    "SELECT COUNT(*) FROM docs WHERE wing = 'rag' AND ts > ?1",
-                    rusqlite::params![cutoff],
-                    |r| r.get(0),
-                )
+                .prepare_cached("SELECT COUNT(*) FROM docs WHERE wing = 'rag' AND ts > ?1")
+                .expect("sqlite prep");
+            let n: i64 = stmt
+                .query_row(rusqlite::params![cutoff], |r| r.get(0))
                 .expect("sqlite range");
             black_box(n)
         })
@@ -407,68 +827,195 @@ fn main() -> rbench::Result<()> {
         .parameter("n", N);
     suite
         .bench_fixture("filter_range/duckdb", duck.clone(), |s| {
-            let cutoff = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as i64
-                - 7 * 86_400_000;
-            let n: i64 = s
+            let cutoff = range_cutoff_ms();
+            let mut stmt = s
                 .conn
-                .query_row(
-                    "SELECT COUNT(*) FROM docs WHERE wing = 'rag' AND ts > ?",
-                    duckdb::params![cutoff],
-                    |r| r.get(0),
-                )
+                .prepare_cached("SELECT COUNT(*) FROM docs WHERE wing = 'rag' AND ts > ?")
+                .expect("duck prep");
+            let n: i64 = stmt
+                .query_row(duckdb::params![cutoff], |r| r.get(0))
                 .expect("duck range");
             black_box(n)
         })
         .tag("filter_range")
         .tag("duckdb")
         .parameter("n", N);
+    if let Some(pg) = pg_fix.clone() {
+        suite
+            .bench_fixture("filter_range/postgres", pg, |s| {
+                let cutoff = range_cutoff_ms();
+                let n: i64 = s
+                    .client
+                    .query_one(&s.filter_range, &[&cutoff])
+                    .expect("pg range")
+                    .get(0);
+                black_box(n)
+            })
+            .tag("filter_range")
+            .tag("postgres")
+            .parameter("n", N);
+    }
+    if let Some(mysql) = mysql_fix.clone() {
+        suite
+            .bench_fixture("filter_range/mysql", mysql, |s| {
+                let cutoff = range_cutoff_ms();
+                let n: i64 = s
+                    .conn
+                    .exec_first(&s.filter_range, (cutoff,))
+                    .expect("mysql range")
+                    .expect("mysql range row");
+                black_box(n)
+            })
+            .tag("filter_range")
+            .tag("mysql")
+            .parameter("n", N);
+    }
 
     suite
-        .bench_fixture("text_substr/lin", lin, |s| {
-            black_box(
-                s.db
-                    .run(r#"docs | title ~ "wal" | take all"#)
-                    .expect("lin ~")
-                    .done
-                    .n,
-            )
+        .bench_fixture("text_substr/lin", lin.clone(), |s| {
+            black_box(lin_hits(
+                &s.text_substr.run(&mut s.db).expect("lin ~"),
+            ))
         })
         .tag("text_substr")
         .tag("lin")
         .parameter("n", N);
     suite
-        .bench_fixture("text_substr/sqlite", sql, |s| {
-            let n: i64 = s
+        .bench_fixture("text_substr/sqlite", sql.clone(), |s| {
+            let mut stmt = s
                 .conn
-                .query_row(
-                    "SELECT COUNT(*) FROM docs WHERE title LIKE '%wal%'",
-                    [],
-                    |r| r.get(0),
-                )
-                .expect("sqlite like");
+                .prepare_cached("SELECT COUNT(*) FROM docs WHERE title LIKE '%wal%'")
+                .expect("sqlite prep");
+            let n: i64 = stmt.query_row([], |r| r.get(0)).expect("sqlite like");
             black_box(n)
         })
         .tag("text_substr")
         .tag("sqlite")
         .parameter("n", N);
     suite
-        .bench_fixture("text_substr/duckdb", duck, |s| {
-            let n: i64 = s
+        .bench_fixture("text_substr/duckdb", duck.clone(), |s| {
+            let mut stmt = s
                 .conn
-                .query_row(
-                    "SELECT COUNT(*) FROM docs WHERE title LIKE '%wal%'",
-                    [],
-                    |r| r.get(0),
-                )
-                .expect("duck like");
+                .prepare_cached("SELECT COUNT(*) FROM docs WHERE title LIKE '%wal%'")
+                .expect("duck prep");
+            let n: i64 = stmt.query_row([], |r| r.get(0)).expect("duck like");
             black_box(n)
         })
         .tag("text_substr")
         .tag("duckdb")
         .parameter("n", N);
+    if let Some(pg) = pg_fix.clone() {
+        suite
+            .bench_fixture("text_substr/postgres", pg, |s| {
+                let n: i64 = s
+                    .client
+                    .query_one(&s.text_substr, &[])
+                    .expect("pg like")
+                    .get(0);
+                black_box(n)
+            })
+            .tag("text_substr")
+            .tag("postgres")
+            .parameter("n", N);
+    }
+    if let Some(mysql) = mysql_fix.clone() {
+        suite
+            .bench_fixture("text_substr/mysql", mysql, |s| {
+                let n: i64 = s
+                    .conn
+                    .exec_first(&s.text_substr, ())
+                    .expect("mysql like")
+                    .expect("mysql like row");
+                black_box(n)
+            })
+            .tag("text_substr")
+            .tag("mysql")
+            .parameter("n", N);
+    }
+
+    suite
+        .bench_fixture("materialize/lin", lin, |s| {
+            black_box(s.materialize.run(&mut s.db).expect("lin mat").done.n)
+        })
+        .tag("materialize")
+        .tag("lin")
+        .parameter("n", N);
+    suite
+        .bench_fixture("materialize/sqlite", sql, |s| {
+            let mut stmt = s
+                .conn
+                .prepare_cached("SELECT id, title FROM docs WHERE wing = 'rag'")
+                .expect("sqlite prep");
+            let mut rows = stmt.query([]).expect("sqlite mat");
+            let mut n = 0usize;
+            while let Some(row) = rows.next().expect("sqlite row") {
+                let id: String = row.get(0).expect("id");
+                let title: String = row.get(1).expect("title");
+                black_box((id, title));
+                n += 1;
+            }
+            black_box(n)
+        })
+        .tag("materialize")
+        .tag("sqlite")
+        .parameter("n", N);
+    suite
+        .bench_fixture("materialize/duckdb", duck, |s| {
+            let mut stmt = s
+                .conn
+                .prepare_cached("SELECT id, title FROM docs WHERE wing = 'rag'")
+                .expect("duck prep");
+            let mut rows = stmt.query([]).expect("duck mat");
+            let mut n = 0usize;
+            while let Some(row) = rows.next().expect("duck row") {
+                let id: String = row.get(0).expect("id");
+                let title: String = row.get(1).expect("title");
+                black_box((id, title));
+                n += 1;
+            }
+            black_box(n)
+        })
+        .tag("materialize")
+        .tag("duckdb")
+        .parameter("n", N);
+    if let Some(pg) = pg_fix {
+        suite
+            .bench_fixture("materialize/postgres", pg, |s| {
+                let rows = s
+                    .client
+                    .query(&s.materialize, &[])
+                    .expect("pg mat");
+                let mut n = 0usize;
+                for row in rows {
+                    let id: String = row.get(0);
+                    let title: String = row.get(1);
+                    black_box((id, title));
+                    n += 1;
+                }
+                black_box(n)
+            })
+            .tag("materialize")
+            .tag("postgres")
+            .parameter("n", N);
+    }
+    if let Some(mysql) = mysql_fix {
+        suite
+            .bench_fixture("materialize/mysql", mysql, |s| {
+                let rows: Vec<(String, String)> = s
+                    .conn
+                    .exec(&s.materialize, ())
+                    .expect("mysql mat");
+                let mut n = 0usize;
+                for (id, title) in rows {
+                    black_box((id, title));
+                    n += 1;
+                }
+                black_box(n)
+            })
+            .tag("materialize")
+            .tag("mysql")
+            .parameter("n", N);
+    }
 
     macro_rules! insert_bulk {
         ($label:expr, $n:expr) => {{
@@ -476,8 +1023,8 @@ fn main() -> rbench::Result<()> {
             suite
                 .bench_with_input(
                     &format!("insert_bulk_{}/lin", $label),
-                    empty_lin,
-                    move |db| fill_lin(db, n),
+                    move || setup_lin_insert(n),
+                    move |ins| fill_lin(ins),
                     DropPolicy::InsideTiming,
                 )
                 .tag("insert")
@@ -506,12 +1053,37 @@ fn main() -> rbench::Result<()> {
                 .tag("duckdb")
                 .parameter("rows", n)
                 .work_units("rows", n as u64);
+            if let Some(url) = pg_url.clone() {
+                suite
+                    .bench_with_input(
+                        &format!("insert_bulk_{}/postgres", $label),
+                        move || empty_pg(url.clone()),
+                        move |client| fill_pg(client, n),
+                        DropPolicy::InsideTiming,
+                    )
+                    .tag("insert")
+                    .tag("postgres")
+                    .parameter("rows", n)
+                    .work_units("rows", n as u64);
+            }
+            if let Some(url) = mysql_url.clone() {
+                suite
+                    .bench_with_input(
+                        &format!("insert_bulk_{}/mysql", $label),
+                        move || empty_mysql(url.clone()),
+                        move |conn| fill_mysql(conn, n),
+                        DropPolicy::InsideTiming,
+                    )
+                    .tag("insert")
+                    .tag("mysql")
+                    .parameter("rows", n)
+                    .work_units("rows", n as u64);
+            }
         }};
     }
     insert_bulk!("1k", INSERT_1K);
     insert_bulk!("10k", INSERT_10K);
 
-    // `cargo bench` appends `--bench`; rbench Suite::main rejects unknown flags.
     let args: Vec<String> = std::env::args()
         .skip(1)
         .filter(|a| a != "--bench")
@@ -521,7 +1093,6 @@ fn main() -> rbench::Result<()> {
 
 /// Minimal CLI compatible with `Suite::main`, ignoring cargo's injected `--bench`.
 fn run_suite(mut suite: Suite<'_>, args: &[String]) -> rbench::Result<()> {
-    use std::time::Duration;
     let mut config = Config::profile("quick")?;
     let mut profile = None;
     let mut i = 0;

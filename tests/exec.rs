@@ -5,6 +5,22 @@ fn text<'a>(row: &'a lin::Row, k: &str) -> &'a str {
 }
 
 #[test]
+fn prepare_once_run_many() {
+    let mut db = Db::fixture();
+    let id = "e7c98d54-b4d6-4165-86e9-9b999e7ce9c3";
+    let q = format!(r#"docs | id == "{id}" | {{ id, title }}"#);
+    let prep = db.prepare(&q).unwrap();
+    let a = prep.run(&mut db).unwrap();
+    let b = db.run_prepared(&prep).unwrap();
+    assert_eq!(a.done.n, 1);
+    assert_eq!(b.done.n, 1);
+    assert_eq!(text(&a.rows[0], "title"), text(&b.rows[0], "title"));
+    // Cached path via run(&str)
+    let c = db.run(&q).unwrap();
+    assert_eq!(c.done.n, 1);
+}
+
+#[test]
 fn insert_then_query() {
     let mut db = Db::fixture();
     let ins = db
@@ -443,4 +459,52 @@ fn bulk_insert_updates_index() {
     assert!(plan.contains("index=docs[wing,ts]"), "{plan}");
     let h = db.run(r#"docs | wing == "rag" | take all"#).unwrap();
     assert!(h.done.n >= 4);
+}
+
+#[test]
+fn project_take_all_skips_body() {
+    let mut db = Db::empty();
+    db.run("index docs [wing, ts]").unwrap();
+    db.run(
+        r#"insert docs [
+      { uri: "raw://p1", title: "has wal here", layer: "wiki", wing: "rag", body: "huge" },
+      { uri: "raw://p2", title: "plain", layer: "wiki", wing: "sys", body: "huge" },
+      { uri: "raw://p3", title: "wal note", layer: "wiki", wing: "rag", body: "huge" }
+    ]"#,
+    )
+    .unwrap();
+    let h = db
+        .run(r#"docs | wing == "rag" | { id, title } | take all"#)
+        .unwrap();
+    assert_eq!(h.done.n, 2);
+    assert!(h.rows.iter().all(|r| !r.contains_key("body")));
+    assert!(h.rows.iter().all(|r| r.contains_key("title")));
+    let c = db.run(r#"docs | title ~ "wal" | count by layer"#).unwrap();
+    assert_eq!(c.done.n, 1);
+    assert_eq!(
+        c.rows[0].get("hits"),
+        Some(&lin::Cell::Int(2))
+    );
+    // Implicit take 50 still applies without `take all`.
+    let mut db2 = Db::empty();
+    db2.run("index docs [wing, ts]").unwrap();
+    let mut batch = String::from("insert docs [\n");
+    for i in 0..60 {
+        if i > 0 {
+            batch.push_str(",\n");
+        }
+        batch.push_str(&format!(
+            r#"  {{ uri: "raw://m{i}", title: "t{i}", layer: "wiki", wing: "rag" }}"#
+        ));
+    }
+    batch.push_str("\n]");
+    db2.run(&batch).unwrap();
+    let limited = db2
+        .run(r#"docs | wing == "rag" | { id, title }"#)
+        .unwrap();
+    assert_eq!(limited.done.n, 50);
+    let all = db2
+        .run(r#"docs | wing == "rag" | { id, title } | take all"#)
+        .unwrap();
+    assert_eq!(all.done.n, 60);
 }
