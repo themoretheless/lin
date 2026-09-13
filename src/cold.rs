@@ -1,8 +1,9 @@
 //! Cold / mmap-backed collection bodies (P2).
 //!
-//! On checkpoint with `OpenOpts.cold`, large collections are spilled to
-//! `cold/<name>.bin` (single MessagePack `Vec<Row>`) and omitted from the
-//! JSON snapshot. Open mmaps the file and deserializes into RAM.
+//! On checkpoint with `OpenOpts.cold`, large collections are also written to
+//! `cold/<name>.bin` (MessagePack `Vec<Row>`, magic `LIN\x03`) as a decode
+//! cache. The durable `snapshot` (`LIN\x04` MessagePack) stays **self-contained**
+//! with the same rows inlined — backup/copy never depends on cold files alone.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;

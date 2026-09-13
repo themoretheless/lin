@@ -3,23 +3,20 @@
 //! ```text
 //! <data>/
 //!   head       JSON object: gen, catalog_hash, embed_id
-//!   log        append-only length-prefixed JSON records
-//!   snapshot   optional full-store checkpoint (JSON)
+//!   log        append-only framed records (`LIN\x01` / `LIN\x02`)
+//!   snapshot   `LIN\x04` + MessagePack(Snapshot); legacy JSON still reads
+//!   cold/      optional mmap cache of large collections (same rows also inlined
+//!              in snapshot — self-contained)
 //! ```
 //!
 //! Log record framing (v1 binary, dual-read with legacy JSON):
 //! - **v1:** magic `LIN\x01` + `u32` LE payload length + MessagePack(`LogRecord`)
+//! - **v2:** magic `LIN\x02` + raw columnar hot packs
 //! - **legacy:** `u32` LE length + JSON(`LogRecord`) — still replayed on open
 //!
 //! A truncated trailing record is ignored. After replay the log is truncated
 //! to the last complete record. Checkpoint compacts the log to empty.
-//!
-//! Record body: `{"gen":N,"next_id":N,"pack":{"type":"insert"|"delete"|"schema_index"|…}}`.
-//! Snapshot: collections + edges + `log_offset` (byte position after the
-//! last record included in the checkpoint). Written after every 32 commits
-//! and on [`Db::close`](crate::Db::close) / [`Db::checkpoint`](crate::Db::checkpoint).
-//! After a successful snapshot the log is **compacted** (truncated to 0) so
-//! disk stays bounded; `log_offset` in the published snapshot is 0.
+//! Portable backup = self-contained `LIN\x04` MessagePack (never cold stubs).
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -34,6 +31,10 @@ pub const HEAD_NAME: &str = "head";
 pub const LOG_NAME: &str = "log";
 pub const SNAPSHOT_NAME: &str = "snapshot";
 pub const LOCK_NAME: &str = "LOCK";
+/// On-disk snapshot: `LIN\x04` + MessagePack(`Snapshot`). Legacy JSON still reads.
+pub const SNAPSHOT_MAGIC: [u8; 4] = *b"LIN\x04";
+/// Portable backup uses the same MessagePack envelope (self-contained, no cold refs).
+pub const BACKUP_MAGIC: [u8; 4] = *b"LIN\x04";
 pub const SNAPSHOT_EVERY: u32 = 32;
 const MAX_RECORD: u32 = 16 * 1024 * 1024;
 /// New WAL framing magic (`LIN` + version).
@@ -182,7 +183,8 @@ pub struct Snapshot {
     pub extra_rels: std::collections::BTreeMap<String, RelSnap>,
     #[serde(default)]
     pub extra_indexes: std::collections::BTreeMap<String, IndexSnap>,
-    /// Collections stored in `cold/<name>.bin` (mmap), not in JSON bodies.
+    /// Names that also have a `cold/<name>.bin` mmap cache. Rows stay inlined
+    /// in the snapshot (self-contained); cold files are optional decode accel.
     #[serde(default)]
     pub cold_collections: Vec<String>,
 }
@@ -362,25 +364,25 @@ pub fn read_snapshot(dir: &Path) -> Result<Option<Snapshot>, Error> {
     if bytes.is_empty() {
         return Ok(None);
     }
-    match serde_json::from_slice(&bytes) {
-        Ok(s) => Ok(Some(s)),
-        Err(_) => Ok(None),
-    }
+    Ok(decode_snapshot_bytes(&bytes))
 }
 
 pub fn write_snapshot(dir: &Path, snap: &Snapshot) -> Result<(), Error> {
-    let bytes = serde_json::to_vec(snap).map_err(io_err)?;
+    let bytes = encode_snapshot_bytes(snap)?;
     atomic_write(&snapshot_path(dir), &bytes)
 }
 
-/// Portable backup file (same JSON shape as on-disk `snapshot`, any path).
+/// Portable backup: always self-contained MessagePack (`LIN\x04`).
 pub fn write_backup(path: &Path, snap: &Snapshot) -> Result<(), Error> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
         fs::create_dir_all(parent).map_err(io_err)?;
     }
-    let bytes = serde_json::to_vec(snap).map_err(io_err)?;
+    let mut snap = snap.clone();
+    // Portable: never ship cold stubs — rows must already be inlined.
+    snap.cold_collections.clear();
+    let bytes = encode_snapshot_bytes(&snap)?;
     atomic_write(path, &bytes)
 }
 
@@ -389,7 +391,43 @@ pub fn read_backup(path: &Path) -> Result<Snapshot, Error> {
     if bytes.is_empty() {
         return Err(io_err("empty backup"));
     }
-    serde_json::from_slice(&bytes).map_err(io_err)
+    decode_snapshot_bytes(&bytes).ok_or_else(|| io_err("corrupt backup"))
+}
+
+/// Expand cold file refs into inlined collections (for backup / portable copy).
+/// Expand cold file refs into inlined collections (for tools / dir copy).
+#[allow(dead_code)]
+pub fn expand_cold_into(dir: &Path, snap: &mut Snapshot) -> Result<(), Error> {
+    for name in snap.cold_collections.clone() {
+        let need = snap
+            .collections
+            .get(&name)
+            .map(|c| c.is_empty())
+            .unwrap_or(true);
+        if need {
+            let col = crate::cold::map_cold(dir, &name)?;
+            snap.collections.insert(name, col.into_rows()?);
+        }
+    }
+    snap.cold_collections.clear();
+    Ok(())
+}
+
+fn encode_snapshot_bytes(snap: &Snapshot) -> Result<Vec<u8>, Error> {
+    let mut body = Vec::new();
+    rmp_serde::encode::write_named(&mut body, snap).map_err(io_err)?;
+    let mut out = Vec::with_capacity(4 + body.len());
+    out.extend_from_slice(&SNAPSHOT_MAGIC);
+    out.extend_from_slice(&body);
+    Ok(out)
+}
+
+fn decode_snapshot_bytes(bytes: &[u8]) -> Option<Snapshot> {
+    if bytes.len() >= 4 && bytes[..4] == SNAPSHOT_MAGIC {
+        return rmp_serde::from_slice(&bytes[4..]).ok();
+    }
+    // Legacy JSON snapshot / backup.
+    serde_json::from_slice(bytes).ok()
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), Error> {

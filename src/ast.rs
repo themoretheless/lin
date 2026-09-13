@@ -53,6 +53,14 @@ pub enum Stmt {
     Restore {
         name: String,
     },
+    /// Preferred alias of [`Stmt::Snapshot`] — in-memory pin, not durable.
+    Pin {
+        name: String,
+    },
+    /// Preferred alias of [`Stmt::Restore`].
+    Unpin {
+        name: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]

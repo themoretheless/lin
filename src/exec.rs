@@ -105,7 +105,8 @@ pub struct Db {
     /// Accumulated durable append/insert row counts and wall ms (for rows/s).
     append_rows: u64,
     append_ms: f64,
-    /// Named in-memory pins (`snapshot "x"` / `restore "x"`). Not multi-writer MVCC.
+    /// Named in-memory pins (`pin "x"` / `unpin "x"`; aliases snapshot/restore).
+    /// Not a durable checkpoint — see `checkpoint` / `export_backup`.
     pins: BTreeMap<String, crate::store::MemBackup>,
     /// Last `pull idb` payload for in-process `push idb`.
     pulled_wal: Vec<u8>,
@@ -316,15 +317,15 @@ impl Db {
         crate::persist::export_wal_since(&p.dir, since)
     }
 
-    /// Apply shipped WAL frames into an empty / follower memory image.
+    /// Apply shipped WAL frames into an **in-memory** store only.
     ///
-    /// If this Db is a durable writer that already has data, returns an error —
-    /// use on a fresh follower `open` (or in-memory) only. Does not speak a
-    /// network protocol; pair with [`Self::export_wal_since`].
+    /// Refuses any durable Db (`persist.is_some()`): never rewrite a primary
+    /// log. For a durable follower: `apply_wal` on `Db::empty()`, then
+    /// [`Self::export_backup`] / [`Self::import_backup_into`].
     pub fn apply_wal(&mut self, frames: &[u8]) -> Result<usize, Error> {
-        if self.persist.is_some() && self.store.r#gen > 0 {
+        if self.persist.is_some() {
             return Err(Error::runtime(
-                "apply_wal: refuse non-empty durable primary — use a follower/empty store",
+                "apply_wal: in-memory only — refuse durable primary/follower log rewrite",
             ));
         }
         let mut records = Vec::new();
@@ -340,17 +341,6 @@ impl Db {
             self.store.apply_pack(&rec.pack);
             self.store.next_id = rec.next_id;
             self.store.r#gen = rec.r#gen;
-            if let Some(p) = self.persist.as_mut() {
-                let sync = p.sync;
-                crate::persist::append_record(
-                    &mut p.log,
-                    &rec,
-                    &mut p.encode_buf,
-                    sync,
-                    &mut p.log_bytes,
-                )?;
-                p.writes_since_snapshot += 1;
-            }
             n += 1;
         }
         if n > 0 {
@@ -626,7 +616,9 @@ impl Db {
                 | Stmt::IdbPull { .. }
                 | Stmt::IdbPush
                 | Stmt::Snapshot { .. }
-                | Stmt::Restore { .. } => {
+                | Stmt::Restore { .. }
+                | Stmt::Pin { .. }
+                | Stmt::Unpin { .. } => {
                     last_rows = Vec::new();
                     last_msg = Some("no-op".into());
                 }
@@ -1042,36 +1034,47 @@ impl Db {
                         None,
                     ));
                 }
+                if self.persist.is_some() {
+                    return Err(Error::runtime(
+                        "push idb: apply_wal is in-memory only — pull on a memory Db",
+                    ));
+                }
                 let n = self.apply_wal(&frames)?;
                 Ok((
                     Vec::new(),
-                    Some(format!("push idb: applied {n} frames")),
+                    Some(format!("push idb: applied {n} frames (memory)")),
                     None,
                 ))
             }
-            Stmt::Snapshot { name } => {
+            Stmt::Snapshot { name } | Stmt::Pin { name } => {
                 self.pins
                     .insert(name.clone(), self.store.mem_backup());
                 Ok((
                     Vec::new(),
-                    Some(format!("snapshot {name:?}: pinned gen={}", self.store.r#gen)),
+                    Some(format!(
+                        "memory pin {name:?} at gen={} (not durable; use checkpoint/backup for disk)",
+                        self.store.r#gen
+                    )),
                     None,
                 ))
             }
-            Stmt::Restore { name } => {
+            Stmt::Restore { name } | Stmt::Unpin { name } => {
                 let Some(pin) = self.pins.get(name).cloned() else {
-                    return Err(Error::runtime(format!("unknown snapshot {name:?}")));
+                    return Err(Error::runtime(format!("unknown memory pin {name:?}")));
                 };
                 if self.persist.is_some() {
                     return Err(Error::runtime(
-                        "restore: durable store — use reader()/WAL, not memory restore",
+                        "memory pin restore: not allowed on durable Db — use reader()/backup",
                     ));
                 }
                 self.store.mem_restore(pin);
                 self.plan_cache.clear();
                 Ok((
                     Vec::new(),
-                    Some(format!("restore {name:?}: gen={}", self.store.r#gen)),
+                    Some(format!(
+                        "memory pin restore {name:?} → gen={}",
+                        self.store.r#gen
+                    )),
                     None,
                 ))
             }
@@ -2238,7 +2241,12 @@ enum Undo {
 fn stmt_writes(s: &Stmt) -> bool {
     match s {
         Stmt::Query(_) | Stmt::Let { .. } | Stmt::IdbSlice { .. } => false,
-        Stmt::IdbPull { .. } | Stmt::IdbPush | Stmt::Snapshot { .. } | Stmt::Restore { .. } => false,
+        Stmt::IdbPull { .. }
+        | Stmt::IdbPush
+        | Stmt::Snapshot { .. }
+        | Stmt::Restore { .. }
+        | Stmt::Pin { .. }
+        | Stmt::Unpin { .. } => false,
         Stmt::AppendFacts { .. }
         | Stmt::AppendEdges { .. }
         | Stmt::Insert { .. }

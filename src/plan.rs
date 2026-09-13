@@ -442,12 +442,12 @@ pub fn plan(stmt: &Stmt, cat: &Catalog) -> Result<Plan, Error> {
             ),
             ExplainKind::Tree,
         )),
-        Stmt::Snapshot { name } | Stmt::Restore { name } => Ok(write_plan(
+        Stmt::Snapshot { name } | Stmt::Restore { name } | Stmt::Pin { name } | Stmt::Unpin { name } => Ok(write_plan(
             cat,
             vec![Effect::Meta],
             node(
                 NodeKind::Schema {
-                    detail: format!("snapshot {name:?}"),
+                    detail: format!("memory pin {name:?}"),
                 },
                 Backend::Native,
                 Effect::Meta,

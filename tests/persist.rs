@@ -606,7 +606,6 @@ fn cold_checkpoint_reopen() {
 #[test]
 fn wal_export_apply_roundtrip() {
     let a_dir = tmp();
-    let b_dir = tmp();
     let frames;
     {
         let mut a = Db::open(&a_dir).unwrap();
@@ -617,17 +616,19 @@ fn wal_export_apply_roundtrip() {
         a.close().unwrap();
     }
     {
-        let mut b = Db::open(&b_dir).unwrap();
+        let mut b = Db::empty();
         let n = b.apply_wal(&frames).unwrap();
         assert_eq!(n, 1);
         assert_eq!(
             b.run(r#"docs | uri == "raw://w""#).unwrap().done.n,
             1
         );
-        b.close().unwrap();
+        // Durable apply refused.
+        let mut durable = Db::open(&tmp()).unwrap();
+        assert!(durable.apply_wal(&frames).is_err());
+        durable.close().unwrap();
     }
     let _ = fs::remove_dir_all(&a_dir);
-    let _ = fs::remove_dir_all(&b_dir);
 }
 
 #[test]
@@ -635,10 +636,53 @@ fn memory_snapshot_restore() {
     let mut db = Db::empty();
     db.run(r#"insert docs { uri: "raw://p", title: "P", layer: "wiki" }"#)
         .unwrap();
-    db.run(r#"snapshot "s1""#).unwrap();
+    let pin = db.run(r#"pin "s1""#).unwrap();
+    assert!(
+        pin.message.as_deref().unwrap_or("").contains("memory pin"),
+        "{:?}",
+        pin.message
+    );
     db.run(r#"insert docs { uri: "raw://p2", title: "P2", layer: "wiki" }"#)
         .unwrap();
     assert_eq!(db.run(r#"docs | take 10"#).unwrap().done.n, 2);
-    db.run(r#"restore "s1""#).unwrap();
+    db.run(r#"unpin "s1""#).unwrap();
     assert_eq!(db.run(r#"docs | take 10"#).unwrap().done.n, 1);
+    // Legacy aliases still work.
+    db.run(r#"snapshot "s2""#).unwrap();
+    db.run(r#"restore "s2""#).unwrap();
+}
+
+#[test]
+fn cold_backup_self_contained() {
+    let dir = tmp();
+    let bak = dir.join("backup.lin");
+    {
+        let mut db = Db::open_with(
+            &dir,
+            lin::OpenOpts {
+                sync: lin::SyncMode::Full,
+                cold: true,
+            },
+        )
+        .unwrap();
+        let mut rows = String::from("insert docs [\n");
+        for i in 0..40 {
+            if i > 0 {
+                rows.push(',');
+            }
+            rows.push_str(&format!(
+                r#"{{ uri: "raw://b/{i}", title: "T{i}", layer: "wiki" }}"#
+            ));
+        }
+        rows.push_str("\n]");
+        db.run(&rows).unwrap();
+        db.checkpoint().unwrap();
+        assert!(dir.join("cold").join("docs.bin").exists());
+        db.export_backup(&bak).unwrap();
+        db.close().unwrap();
+    }
+    // Backup imports without the data dir / cold files.
+    let mut mem = Db::import_backup(&bak).unwrap();
+    assert_eq!(mem.run(r#"docs | take 100"#).unwrap().done.n, 40);
+    let _ = fs::remove_dir_all(&dir);
 }

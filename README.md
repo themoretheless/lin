@@ -10,7 +10,7 @@ Lin — язык своей локальной БД: пайпы, типизир�
 
 Публичный контракт: `Db::{empty,fixture,open,open_with,open_read,close,checkpoint,run,prepare,explain_as,reader,export_backup,import_backup,import_backup_into,export_wal_since,apply_wal,stats,with_quotas,with_sync_mode}`, `ReadDb::{run,prepare,stats,clone}`, `Quotas`, `SyncMode`, `OpenOpts`, плюс `parse` / `compile` / `run` / `explain*`, типы `Handle` / `Done` / `Prepared` / `Error` / `Row` / `Cell` / `Store` / `Plan` / `Stats` / `VERSION`.
 
-`Db::reader()` — in-process снимок текущего `gen` (`Arc`, `Send`+`Sync`); запись через `ReadDb` отклоняется. Писатель один (`Db` + exclusive flock на `LOCK`). `Db::open_read(dir)` — cold read-only open (**не** параллельно с writer; для concurrent reads — `reader()`). `export_wal_since` / `apply_wal` — байтовый ship хвоста WAL на **пустой** follower; `pull idb` / `push idb` — локальный буфер, не сеть. `snapshot` / `restore` — memory-pins (не durable). `SyncMode::Normal` и `OpenOpts.cold` — явный `open_with`; cold ≠ экономия RAM.
+`Db::reader()` — in-process снимок текущего `gen`. `open_read` не параллелен writer. `export_wal_since` / `apply_wal` — ship WAL; **`apply_wal` только in-memory** (не пишет durable log). `pin`/`unpin` (алиасы `snapshot`/`restore`) — memory-pins, не disk checkpoint. Snapshot на диске: `LIN\x04` MessagePack, self-contained; `cold/*.bin` — опциональный cache.
 
 ## Local-prod guarantees
 
@@ -171,23 +171,22 @@ lin backup import /tmp/lin-bak.json --data .lin2
 lin --data .lin2 stats
 ```
 
-Формат — JSON snapshot (collections + edges + gen). Export перед записью делает checkpoint, если store durable.
+Формат backup — `LIN\x04` + MessagePack (self-contained; legacy JSON backup ещё читается). Export перед записью делает checkpoint, если store durable.
 
 ## Данные на диске
 
 Без `--data` store эфемерный (fixture в памяти) — так живут текущие тесты языка и исполнителя.
 
-`--data <dir>` (привычный путь `./.lin`) открывает durable store: exclusive flock → snapshot + replay tail → RAM. Запись: flush лога после кадра при `SyncMode::Full` (`F_BARRIERFSYNC` на macOS/APFS — как SQLite FULL; иначе `fdatasync`/`sync_data`); при `Normal` — только на checkpoint/close. Потом `gen++`. Checkpoint (каждые 32 commit / `close` / `checkpoint`) пишет snapshot (при `OpenOpts.cold` — spill ≥32 rows в `cold/*.bin`) и **обнуляет log**.
+`--data <dir>` открывает durable store: exclusive flock → snapshot (`LIN\x04` MessagePack, legacy JSON) + replay tail → RAM. Запись: flush при `Full` / на checkpoint при `Normal`. Checkpoint пишет self-contained snapshot (+ опционально `cold/*.bin` cache) и **обнуляет log**.
 
 ```
 .lin/
   LOCK       advisory flock (writer exclusive / open_read shared)
   head       JSON: gen, catalog_hash, embed_id
   log        append-only WAL (compacted on checkpoint):
-             `LIN\x02` raw columnar hot packs (facts/insert),
-             `LIN\x01` MessagePack(LogRecord) for other packs,
-             legacy JSON frames still replayed
-  snapshot   чекпоинт всего store (log_offset=0 после compaction)
+             `LIN\x02` raw columnar / `LIN\x01` MessagePack / legacy JSON
+  snapshot   `LIN\x04` MessagePack(Snapshot), self-contained (legacy JSON reads)
+  cold/      optional mmap cache of large collections (rows also inlined in snapshot)
 ```
 
 Пакет лога: `{"gen":N,"next_id":N,"pack":{"type":"insert"|"insert_bulk"|"append_fact"|"append_facts_bulk"|"append_edge"|"append_edges_bulk"|…}}`. Ячейки: `{"t":"Text","v":"…"}`. Bulk-формы пишут один record вместо Batch-of-N. Обрезанная последняя запись лога игнорируется; при открытии лог обрезается до последнего целого фрейма. `insert … with edge` кладёт рёбра в тот же пакет. Несколько записей в одном `run()` или bulk-список — один `batch` / `*_bulk`. Индекс живёт в `schema_index` + snapshot `extra_indexes`; при open пересобирается.

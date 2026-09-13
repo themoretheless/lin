@@ -318,8 +318,11 @@ impl Store {
             store.collections.entry(name.clone()).or_default();
         }
         for name in &s.cold_collections {
-            let col = cold::map_cold(dir, name)?;
-            store.collections.insert(name.clone(), col.into_rows()?);
+            // Prefer mmap cold cache when present; else keep inlined MessagePack rows.
+            if crate::cold::cold_path(dir, name).exists() {
+                let col = cold::map_cold(dir, name)?;
+                store.collections.insert(name.clone(), col.into_rows()?);
+            }
         }
         store.rebuild_indexes();
         store.rebuild_row_maps();
@@ -420,14 +423,16 @@ impl Store {
     pub fn write_snapshot(&self, persist: &mut Persist) -> Result<(), Error> {
         // Ensure log content is fully durable before publishing snapshot/head.
         // Normal mode: this is the durability point for prior commits.
-        persist::durable_sync(&persist.log).or_else(|_| persist.log.sync_all()).map_err(persist::io_err)?;
+        persist::durable_sync(&persist.log)
+            .or_else(|_| persist.log.sync_all())
+            .map_err(persist::io_err)?;
         let mut snap = self.capture_snapshot_at(persist.catalog_hash.clone(), 0);
         if persist.cold {
+            // Cold bins are a decode cache; snapshot stays self-contained (rows kept).
             let mut cold_names = Vec::new();
-            for (name, rows) in snap.collections.iter_mut() {
+            for (name, rows) in &snap.collections {
                 if rows.len() >= cold::COLD_MIN_ROWS {
                     cold::write_cold(&persist.dir, name, rows)?;
-                    rows.clear();
                     cold_names.push(name.clone());
                 }
             }
@@ -441,7 +446,6 @@ impl Store {
         };
         persist::write_snapshot(&persist.dir, &snap)?;
         persist::write_head(&persist.dir, &head)?;
-        // Compact: drop covered WAL so disk stays bounded.
         persist::compact_log(&mut persist.log)?;
         persist.writes_since_snapshot = 0;
         persist.log_bytes = 0;

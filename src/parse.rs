@@ -282,6 +282,14 @@ impl<'a> Parser<'a> {
             self.expect_kw("idb")?;
             return Ok(Stmt::IdbPush);
         }
+        if self.eat_kw("pin") {
+            let name = self.expect_string()?;
+            return Ok(Stmt::Pin { name });
+        }
+        if self.eat_kw("unpin") {
+            let name = self.expect_string()?;
+            return Ok(Stmt::Unpin { name });
+        }
         if self.eat_kw("snapshot") {
             let name = self.expect_string()?;
             return Ok(Stmt::Snapshot { name });
