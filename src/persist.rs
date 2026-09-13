@@ -193,7 +193,9 @@ pub enum SyncMode {
     /// Flush after every commit frame (default; crash-safe when `run` returns).
     #[default]
     Full,
-    /// Flush only on checkpoint / close. Faster; crash may lose uncheckpointed commits.
+    /// Flush only on checkpoint / close. Faster; **crash may lose uncheckpointed
+    /// commits**. Opt-in via [`OpenOpts`] / [`crate::exec::Db::with_sync_mode`] —
+    /// do not treat as default durable.
     Normal,
 }
 
@@ -218,6 +220,8 @@ pub struct Persist {
     pub sync: SyncMode,
     /// Spill large collections to mmap cold files on checkpoint.
     pub cold: bool,
+    /// Cached `log` file length (avoids metadata() on every commit).
+    pub log_bytes: u64,
 }
 
 pub fn io_err(e: impl std::fmt::Display) -> Error {
@@ -439,10 +443,11 @@ pub fn append_record(
     rec: &LogRecord,
     buf: &mut Vec<u8>,
     sync: SyncMode,
+    log_bytes: &mut u64,
 ) -> Result<(), Error> {
     match &rec.pack {
         Pack::AppendFactsBulk { s, p, o } => {
-            append_facts_v2(log, rec.r#gen, rec.next_id, s, p, o, buf, sync)
+            append_facts_v2(log, rec.r#gen, rec.next_id, s, p, o, buf, sync, log_bytes)
         }
         Pack::InsertCols {
             collection,
@@ -461,8 +466,9 @@ pub fn append_record(
             edges,
             buf,
             sync,
+            log_bytes,
         ),
-        _ => append_record_v1(log, rec, buf, sync),
+        _ => append_record_v1(log, rec, buf, sync, log_bytes),
     }
 }
 
@@ -471,13 +477,14 @@ fn append_record_v1(
     rec: &LogRecord,
     buf: &mut Vec<u8>,
     sync: SyncMode,
+    log_bytes: &mut u64,
 ) -> Result<(), Error> {
     buf.clear();
     rmp_serde::encode::write_named(buf, rec).map_err(io_err)?;
     if buf.len() > MAX_RECORD as usize {
         return Err(io_err("log record exceeds 16MiB"));
     }
-    write_frame(log, &LOG_MAGIC_V1, buf, sync)
+    write_frame(log, &LOG_MAGIC_V1, buf, sync, log_bytes)
 }
 
 fn write_frame(
@@ -485,12 +492,12 @@ fn write_frame(
     magic: &[u8; 4],
     payload: &[u8],
     sync: SyncMode,
+    log_bytes: &mut u64,
 ) -> Result<(), Error> {
     let len = payload.len() as u32;
     if len > MAX_RECORD {
         return Err(io_err("log record exceeds 16MiB"));
     }
-    // Header without copying payload into a giant Vec.
     let mut hdr = [0u8; 8];
     hdr[..4].copy_from_slice(magic);
     hdr[4..].copy_from_slice(&len.to_le_bytes());
@@ -499,6 +506,7 @@ fn write_frame(
     if sync == SyncMode::Full {
         durable_sync(log).map_err(io_err)?;
     }
+    *log_bytes += 8 + u64::from(len);
     Ok(())
 }
 
@@ -541,6 +549,7 @@ fn append_facts_v2(
     o: &[String],
     buf: &mut Vec<u8>,
     sync: SyncMode,
+    log_bytes: &mut u64,
 ) -> Result<(), Error> {
     let n = s.len().min(p.len()).min(o.len());
     buf.clear();
@@ -554,7 +563,7 @@ fn append_facts_v2(
         put_str(buf, &p[i]);
         put_str(buf, &o[i]);
     }
-    write_frame(log, &LOG_MAGIC_V2, buf, sync)
+    write_frame(log, &LOG_MAGIC_V2, buf, sync, log_bytes)
 }
 
 fn append_insert_cols_v2(
@@ -568,6 +577,7 @@ fn append_insert_cols_v2(
     edges: &[Edge],
     buf: &mut Vec<u8>,
     sync: SyncMode,
+    log_bytes: &mut u64,
 ) -> Result<(), Error> {
     // Fallback to msgpack if edges present (rare in bulk benches) or column mismatch.
     if !edges.is_empty() || fields.len() != cols.len() {
@@ -586,6 +596,7 @@ fn append_insert_cols_v2(
             },
             buf,
             sync,
+            log_bytes,
         );
     }
     buf.clear();
@@ -632,7 +643,7 @@ fn append_insert_cols_v2(
             ColData::Null => buf.push(0),
         }
     }
-    write_frame(log, &LOG_MAGIC_V2, buf, sync)
+    write_frame(log, &LOG_MAGIC_V2, buf, sync, log_bytes)
 }
 
 /// Replay complete records with `gen > min_gen`. Returns the byte offset of

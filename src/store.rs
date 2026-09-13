@@ -251,6 +251,7 @@ impl Store {
             encode_buf: Vec::with_capacity(64 * 1024),
             sync: opts.sync,
             cold: opts.cold,
+            log_bytes: persist::log_len(dir).unwrap_or(0),
         };
         Ok((store, persist))
     }
@@ -393,9 +394,12 @@ impl Store {
         let sync = persist.sync;
         {
             let Persist {
-                log, encode_buf, ..
+                log,
+                encode_buf,
+                log_bytes,
+                ..
             } = persist;
-            persist::append_record(log, &rec, encode_buf, sync)?;
+            persist::append_record(log, &rec, encode_buf, sync, log_bytes)?;
         }
         persist.writes_since_snapshot += 1;
         Ok(())
@@ -440,6 +444,7 @@ impl Store {
         // Compact: drop covered WAL so disk stays bounded.
         persist::compact_log(&mut persist.log)?;
         persist.writes_since_snapshot = 0;
+        persist.log_bytes = 0;
         Ok(())
     }
 
@@ -753,6 +758,9 @@ impl Store {
     }
 
     pub fn collection_mut(&mut self, name: &str) -> &mut Vec<Row> {
+        if let Some(v) = self.collections.get_mut(name) {
+            return v;
+        }
         self.collections.entry(name.to_string()).or_default()
     }
 
@@ -905,48 +913,41 @@ impl Store {
         want_rows: bool,
     ) -> (Vec<Row>, usize) {
         let n = s.len().min(p.len()).min(o.len());
-        self.collection_mut("facts").reserve(n);
         self.facts_by_spo.reserve(n);
+        let facts = self
+            .collections
+            .get_mut("facts")
+            .expect("facts collection");
+        facts.reserve(n);
         let mut rows = if want_rows {
             Vec::with_capacity(n)
         } else {
             Vec::new()
         };
         let mut changed = 0usize;
+        // Short keys: clone from static once per insert (SSO), avoid "facts".to_string() churn.
         for i in 0..n {
-            let mut row = BTreeMap::new();
-            row.insert("s".into(), Cell::text_arc(s[i].as_str()));
-            row.insert("p".into(), Cell::text_arc(p[i].as_str()));
-            row.insert("o".into(), Cell::text_arc(o[i].as_str()));
-            let key = spo_key(&row);
-            if let Some(key) = key {
-                if let Some(&idx) = self.facts_by_spo.get(&key) {
-                    if want_rows {
-                        rows.push(self.collection("facts")[idx].clone());
-                    }
-                    continue;
-                }
-                let idx = self.collection("facts").len();
-                self.facts_by_spo.insert(key, idx);
+            let sa: Arc<str> = Arc::from(s[i].as_str());
+            let pa: Arc<str> = Arc::from(p[i].as_str());
+            let oa: Arc<str> = Arc::from(o[i].as_str());
+            let key = (Arc::clone(&sa), Arc::clone(&pa), Arc::clone(&oa));
+            if let Some(&idx) = self.facts_by_spo.get(&key) {
                 if want_rows {
-                    self.collection_mut("facts").push(row.clone());
-                    rows.push(row);
-                } else {
-                    self.collection_mut("facts").push(row);
+                    rows.push(facts[idx].clone());
                 }
-                changed += 1;
-            } else if want_rows {
-                let (r, ok) = self.append_fact_row(row);
-                if ok {
-                    changed += 1;
-                }
-                rows.push(r);
-            } else {
-                let (_, ok) = self.append_fact_row(row);
-                if ok {
-                    changed += 1;
-                }
+                continue;
             }
+            let idx = facts.len();
+            self.facts_by_spo.insert(key, idx);
+            let mut row = BTreeMap::new();
+            row.insert("s".into(), Cell::Text(sa));
+            row.insert("p".into(), Cell::Text(pa));
+            row.insert("o".into(), Cell::Text(oa));
+            if want_rows {
+                rows.push(row.clone());
+            }
+            facts.push(row);
+            changed += 1;
         }
         (rows, changed)
     }

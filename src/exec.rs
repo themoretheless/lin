@@ -150,6 +150,10 @@ pub struct Stats {
     pub append_rows: u64,
     pub append_ms: f64,
     pub writes_since_snapshot: u32,
+    /// `true` when durable and [`SyncMode::Normal`] (crash may lose uncheckpointed commits).
+    pub sync_normal: bool,
+    /// `true` when durable opened with cold spill enabled.
+    pub cold: bool,
 }
 
 impl Stats {
@@ -204,6 +208,11 @@ impl Db {
         self
     }
 
+    /// Open durable store. Default: [`SyncMode::Full`], `cold: false`.
+    ///
+    /// Prefer [`Self::open_with`] when setting `SyncMode::Normal` or cold spill —
+    /// Normal is crash-unsafe until checkpoint; cold is a **disk** spill (still
+    /// full RAM after open), not lazy mmap page-in.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
         Self::open_with(path, OpenOpts::default())
     }
@@ -231,6 +240,10 @@ impl Db {
     }
 
     /// Open a durable data dir as a read-only snapshot (no log truncate / no head write).
+    ///
+    /// Uses a **shared** flock: blocked while a writer holds exclusive `LOCK`.
+    /// Concurrent multi-process readers+writer are not supported — use in-process
+    /// [`Self::reader`] for concurrent reads beside a live writer.
     pub fn open_read(path: impl AsRef<Path>) -> Result<ReadDb, Error> {
         let t0 = Instant::now();
         let catalog = crate::catalog::fixture();
@@ -303,8 +316,17 @@ impl Db {
         crate::persist::export_wal_since(&p.dir, since)
     }
 
-    /// Apply shipped WAL frames into memory (and durable log if writer).
+    /// Apply shipped WAL frames into an empty / follower memory image.
+    ///
+    /// If this Db is a durable writer that already has data, returns an error —
+    /// use on a fresh follower `open` (or in-memory) only. Does not speak a
+    /// network protocol; pair with [`Self::export_wal_since`].
     pub fn apply_wal(&mut self, frames: &[u8]) -> Result<usize, Error> {
+        if self.persist.is_some() && self.store.r#gen > 0 {
+            return Err(Error::runtime(
+                "apply_wal: refuse non-empty durable primary — use a follower/empty store",
+            ));
+        }
         let mut records = Vec::new();
         crate::persist::for_each_wal_frame(frames, |rec| {
             records.push(rec);
@@ -320,7 +342,13 @@ impl Db {
             self.store.r#gen = rec.r#gen;
             if let Some(p) = self.persist.as_mut() {
                 let sync = p.sync;
-                crate::persist::append_record(&mut p.log, &rec, &mut p.encode_buf, sync)?;
+                crate::persist::append_record(
+                    &mut p.log,
+                    &rec,
+                    &mut p.encode_buf,
+                    sync,
+                    &mut p.log_bytes,
+                )?;
                 p.writes_since_snapshot += 1;
             }
             n += 1;
@@ -334,22 +362,15 @@ impl Db {
     }
 
     pub fn stats(&self) -> Stats {
-        let log_bytes = self
-            .persist
-            .as_ref()
-            .and_then(|p| p.log.metadata().ok().map(|m| m.len()))
-            .or_else(|| {
-                self.persist
-                    .as_ref()
-                    .map(|p| crate::persist::log_len(&p.dir).ok())
-                    .flatten()
-            })
-            .unwrap_or(0);
-        let writes_since_snapshot = self
-            .persist
-            .as_ref()
-            .map(|p| p.writes_since_snapshot)
-            .unwrap_or(0);
+        let (log_bytes, writes_since_snapshot, sync_normal, cold) = match self.persist.as_ref() {
+            Some(p) => (
+                p.log_bytes,
+                p.writes_since_snapshot,
+                p.sync == SyncMode::Normal,
+                p.cold,
+            ),
+            None => (0, 0, false, false),
+        };
         Stats {
             r#gen: self.store.r#gen,
             docs: self.store.collection("docs").len(),
@@ -361,6 +382,8 @@ impl Db {
             append_rows: self.append_rows,
             append_ms: self.append_ms,
             writes_since_snapshot,
+            sync_normal,
+            cold,
         }
     }
 
@@ -384,11 +407,10 @@ impl Db {
             )));
         }
         if let Some(p) = self.persist.as_ref() {
-            let n = p.log.metadata().map(|m| m.len()).unwrap_or(0);
-            if n > self.quotas.max_log_bytes {
+            if p.log_bytes > self.quotas.max_log_bytes {
                 return Err(Error::runtime(format!(
-                    "quota: log_bytes {n} > max_log_bytes {}",
-                    self.quotas.max_log_bytes
+                    "quota: log_bytes {} > max_log_bytes {}",
+                    p.log_bytes, self.quotas.max_log_bytes
                 )));
             }
         }
@@ -514,8 +536,7 @@ impl Db {
             }
             // Bound WAL: compact if already over quota before appending.
             if let Some(p) = self.persist.as_mut() {
-                let len = p.log.metadata().map(|m| m.len()).unwrap_or(0);
-                if len > self.quotas.max_log_bytes {
+                if p.log_bytes > self.quotas.max_log_bytes {
                     if let Err(e) = self.store.checkpoint(p) {
                         self.rollback(undo, cat_backup);
                         return Err(e);
@@ -523,7 +544,10 @@ impl Db {
                 }
             }
             if let Some(p) = self.persist.as_mut() {
-                p.catalog_hash = crate::store::catalog_hash(&self.catalog);
+                // Schema packs only — avoid hashing the catalog on every append.
+                if prepared.schema {
+                    p.catalog_hash = crate::store::catalog_hash(&self.catalog);
+                }
                 if let Err(e) = self.store.durable_commit(p, pack) {
                     self.rollback(undo, cat_backup);
                     return Err(e);
@@ -785,24 +809,17 @@ impl Db {
                 let mut bulk_p = Vec::with_capacity(n);
                 let mut bulk_o = Vec::with_capacity(n);
                 for record in records {
-                    let s = record
-                        .fields
-                        .iter()
-                        .find(|(k, _)| k == "s")
-                        .map(|(_, v)| value_text(v, now))
-                        .unwrap_or_default();
-                    let p = record
-                        .fields
-                        .iter()
-                        .find(|(k, _)| k == "p")
-                        .map(|(_, v)| value_text(v, now))
-                        .unwrap_or_default();
-                    let o = record
-                        .fields
-                        .iter()
-                        .find(|(k, _)| k == "o")
-                        .map(|(_, v)| value_text(v, now))
-                        .unwrap_or_default();
+                    let mut s = String::new();
+                    let mut p = String::new();
+                    let mut o = String::new();
+                    for (k, v) in &record.fields {
+                        match k.as_str() {
+                            "s" => s = value_text(v, now),
+                            "p" => p = value_text(v, now),
+                            "o" => o = value_text(v, now),
+                            _ => {}
+                        }
+                    }
                     bulk_s.push(s);
                     bulk_p.push(p);
                     bulk_o.push(o);

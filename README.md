@@ -10,7 +10,7 @@ Lin — язык своей локальной БД: пайпы, типизир�
 
 Публичный контракт: `Db::{empty,fixture,open,open_with,open_read,close,checkpoint,run,prepare,explain_as,reader,export_backup,import_backup,import_backup_into,export_wal_since,apply_wal,stats,with_quotas,with_sync_mode}`, `ReadDb::{run,prepare,stats,clone}`, `Quotas`, `SyncMode`, `OpenOpts`, плюс `parse` / `compile` / `run` / `explain*`, типы `Handle` / `Done` / `Prepared` / `Error` / `Row` / `Cell` / `Store` / `Plan` / `Stats` / `VERSION`.
 
-`Db::reader()` — in-process снимок текущего `gen` (`Arc`, `Send`+`Sync`); запись через `ReadDb` отклоняется. Писатель один (`Db` + exclusive flock на `LOCK`). `Db::open_read(dir)` — холодный read-only open (shared flock; не параллельно с writer). `export_wal_since` / `apply_wal` — байтовый ship хвоста WAL; `pull idb` / `push idb` — in-process обёртка. `snapshot` / `restore` — memory-pins (не durable).
+`Db::reader()` — in-process снимок текущего `gen` (`Arc`, `Send`+`Sync`); запись через `ReadDb` отклоняется. Писатель один (`Db` + exclusive flock на `LOCK`). `Db::open_read(dir)` — cold read-only open (**не** параллельно с writer; для concurrent reads — `reader()`). `export_wal_since` / `apply_wal` — байтовый ship хвоста WAL на **пустой** follower; `pull idb` / `push idb` — локальный буфер, не сеть. `snapshot` / `restore` — memory-pins (не durable). `SyncMode::Normal` и `OpenOpts.cold` — явный `open_with`; cold ≠ экономия RAM.
 
 ## Local-prod guarantees
 
@@ -20,10 +20,10 @@ Lin — язык своей локальной БД: пайпы, типизир�
 | Exclusive flock на writer `open` | Real vec/FTS indexes |
 | Checkpoint уплотняет log → 0 bytes | Полноценный multi-writer MVCC |
 | Quotas: rows / edges / log bytes | |
-| `SyncMode::Normal` — flush на checkpoint/close | |
-| `OpenOpts.cold` → `cold/*.bin` mmap spill | |
-| WAL shipping + gen-pin `reader()` | |
-| `stats`: gen, log_bytes, reopen_ms, … | |
+| `SyncMode::Normal` — **opt-in**, flush только на checkpoint/close (краш теряет хвост) | Multi-process readers+writer |
+| `OpenOpts.cold` — spill на диск (`cold/*.bin`); после open всё равно полный RAM | Lazy mmap page-in |
+| WAL shipping bytes + gen-pin `reader()` | Сеть / multi-writer MVCC |
+| `stats.sync_normal` / `stats.cold` | |
 
 Память = полный image после open (snapshot + cold decode + tail). Durable `Db` на `Drop` делает best-effort checkpoint.
 

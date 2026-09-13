@@ -1566,7 +1566,7 @@ fn main() -> rbench::Result<()> {
     // SyncMode::Normal (flush on checkpoint only) vs Full — same 1k append.
     suite
         .bench_with_input(
-            "durable_append_1k/lin_normal",
+            "durable_append_1k/lin_normal_unsync",
             move || setup_lin_durable_append_sync(INSERT_1K, lin::SyncMode::Normal),
             move |ins| fill_lin_durable_append(ins),
             DropPolicy::OutsideTiming,

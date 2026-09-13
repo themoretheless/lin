@@ -241,7 +241,7 @@ fn cmd_stats(data: Option<PathBuf>) -> ExitCode {
     }) {
         Ok(s) => {
             println!(
-                "gen={} docs={} facts={} edges={} next_id={} log_bytes={} reopen_ms={} writes_since_snapshot={} append_rows={} append_rows_per_s={:.0}",
+                "gen={} docs={} facts={} edges={} next_id={} log_bytes={} reopen_ms={} writes_since_snapshot={} sync_normal={} cold={} append_rows={} append_rows_per_s={:.0}",
                 s.r#gen,
                 s.docs,
                 s.facts,
@@ -250,6 +250,8 @@ fn cmd_stats(data: Option<PathBuf>) -> ExitCode {
                 s.log_bytes,
                 s.reopen_ms,
                 s.writes_since_snapshot,
+                s.sync_normal,
+                s.cold,
                 s.append_rows,
                 s.append_rows_per_s()
             );
