@@ -456,8 +456,32 @@ fn write_frame(log: &mut File, magic: &[u8; 4], payload: &[u8]) -> Result<(), Er
     hdr[4..].copy_from_slice(&len.to_le_bytes());
     log.write_all(&hdr).map_err(io_err)?;
     log.write_all(payload).map_err(io_err)?;
-    log.sync_data().map_err(io_err)?;
+    durable_sync(log).map_err(io_err)?;
     Ok(())
+}
+
+/// Durability flush after a WAL append.
+///
+/// On macOS/APFS, Rust's `File::sync_data` maps to `F_FULLFSYNC` (~ms). SQLite's
+/// `synchronous=FULL` uses `F_BARRIERFSYNC` on modern Darwin — same crash model
+/// for APFS, ~10× cheaper. Match that. Elsewhere: `sync_data` / `fdatasync`.
+fn durable_sync(file: &File) -> io::Result<()> {
+    #[cfg(target_vendor = "apple")]
+    {
+        use std::os::unix::io::AsRawFd;
+        // sys/fcntl.h — not always in libc crate bindings.
+        const F_BARRIERFSYNC: libc::c_int = 85;
+        let rc = unsafe { libc::fcntl(file.as_raw_fd(), F_BARRIERFSYNC) };
+        if rc == 0 {
+            return Ok(());
+        }
+        // Older kernels: fall back to FULLFSYNC via sync_data.
+        return file.sync_data();
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        file.sync_data()
+    }
 }
 
 fn put_str(buf: &mut Vec<u8>, s: &str) {

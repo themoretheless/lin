@@ -173,7 +173,7 @@ lin --data .lin2 stats
 
 Без `--data` store эфемерный (fixture в памяти) — так живут текущие тесты языка и исполнителя.
 
-`--data <dir>` (привычный путь `./.lin`) открывает durable store: exclusive flock → snapshot + replay tail → RAM. Запись: `fsync` записи лога, потом `gen++`. Крах до fsync = записи не было. Checkpoint (каждые 32 commit / `close` / `checkpoint`) пишет snapshot и **обнуляет log**.
+`--data <dir>` (привычный путь `./.lin`) открывает durable store: exclusive flock → snapshot + replay tail → RAM. Запись: flush лога после кадра (`F_BARRIERFSYNC` на macOS/APFS — как SQLite FULL; иначе `fdatasync`/`sync_data`), потом `gen++`. Крах до flush = записи не было. Checkpoint (каждые 32 commit / `close` / `checkpoint`) пишет snapshot и **обнуляет log**.
 
 ```
 .lin/
