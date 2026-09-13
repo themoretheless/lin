@@ -119,7 +119,6 @@ pub struct Store {
     docs_title: Vec<Arc<str>>,
     docs_layer: Vec<Arc<str>>,
     docs_wing: Vec<Arc<str>>,
-    persist: Option<Persist>,
 }
 
 /// Cheap undo for append-only packs (insert / append) — no full store clone.
@@ -154,21 +153,30 @@ impl Store {
             docs_title: Vec::new(),
             docs_layer: Vec::new(),
             docs_wing: Vec::new(),
-            persist: None,
         }
     }
 
-    /// Open a durable store at `path` (created if missing).
-    /// Loads `snapshot` if present, replays `log`, then serves like the
-    /// in-memory store. Writes fsync the log record **before** `gen` bumps.
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
-        let cat = crate::catalog::fixture();
-        Self::open_with(path, &cat)
+    /// Deep-copy the memory image (no durable handle). Used for read snapshots.
+    pub fn clone_mem(&self) -> Self {
+        let mut s = Self::empty(self.embed_id.clone());
+        s.mem_restore(self.mem_backup());
+        s
     }
 
-    pub fn open_with(path: impl AsRef<Path>, cat: &Catalog) -> Result<Self, Error> {
+    /// Load snapshot+log into memory (no writer lock / no Persist).
+    /// Does not truncate the log or rewrite head — safe alongside a writer
+    /// only if the caller coordinates; prefer [`crate::exec::Db::reader`] for
+    /// in-process shared snapshots.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
+        let cat = crate::catalog::fixture();
+        Ok(Self::open_with(path, &cat)?.0)
+    }
+
+    /// Open durable data dir: memory image + exclusive Persist for writes.
+    pub fn open_with(path: impl AsRef<Path>, cat: &Catalog) -> Result<(Self, Persist), Error> {
         let dir = path.as_ref();
         persist::ensure_dir(dir)?;
+        let lock = persist::acquire_writer_lock(dir)?;
         let fixture_hash = catalog_hash(cat);
 
         let snap = persist::read_snapshot(dir)?;
@@ -227,13 +235,52 @@ impl Store {
 
         store.rebuild_indexes();
         store.rebuild_row_maps();
-        store.persist = Some(Persist {
+        let persist = Persist {
             dir: dir.to_path_buf(),
             log,
+            lock,
             catalog_hash: live_hash,
             writes_since_snapshot: 0,
-        });
-        Ok(store)
+        };
+        Ok((store, persist))
+    }
+
+    /// Read-only open: replay into memory, do not truncate log or write head.
+    /// Returns `(store, shared_lock)`.
+    pub fn open_read_with(
+        path: impl AsRef<Path>,
+        cat: &Catalog,
+    ) -> Result<(Self, std::fs::File), Error> {
+        let dir = path.as_ref();
+        if !dir.exists() {
+            return Err(Error::runtime(format!(
+                "data dir not found: {}",
+                dir.display()
+            )));
+        }
+        let lock = persist::acquire_reader_lock(dir)?;
+        let snap = persist::read_snapshot(dir)?;
+        let mut store = match &snap {
+            Some(s) => Self::from_snapshot(s),
+            None => {
+                let embed = persist::read_head(dir)?
+                    .map(|h| h.embed_id)
+                    .unwrap_or_else(|| cat.embed_id.clone());
+                Self::empty(embed)
+            }
+        };
+        let mut log = persist::open_log_read(dir)?;
+        let min_gen = store.r#gen;
+        let start = snap.as_ref().map(|s| s.log_offset).unwrap_or(0);
+        if let Some(log) = log.as_mut() {
+            let _ = persist::replay_log(log, min_gen, start, |rec| {
+                store.apply_record(&rec);
+                Ok(())
+            })?;
+        }
+        store.rebuild_indexes();
+        store.rebuild_row_maps();
+        Ok((store, lock))
     }
 
     pub(crate) fn from_snapshot(s: &Snapshot) -> Self {
@@ -255,7 +302,6 @@ impl Store {
             docs_title: Vec::new(),
             docs_layer: Vec::new(),
             docs_wing: Vec::new(),
-            persist: None,
         };
         for name in store.extra_collections.keys() {
             store.collections.entry(name.clone()).or_default();
@@ -267,16 +313,16 @@ impl Store {
 
     /// Capture current memory image (for backup / checkpoint payload).
     pub fn capture_snapshot(&self, catalog_hash: impl Into<String>) -> Snapshot {
+        self.capture_snapshot_at(catalog_hash, 0)
+    }
+
+    pub fn capture_snapshot_at(&self, catalog_hash: impl Into<String>, log_offset: u64) -> Snapshot {
         Snapshot {
             r#gen: self.r#gen,
             embed_id: self.embed_id.clone(),
             next_id: self.next_id,
             catalog_hash: catalog_hash.into(),
-            log_offset: self
-                .persist
-                .as_ref()
-                .and_then(|p| p.log.metadata().ok().map(|m| m.len()))
-                .unwrap_or(0),
+            log_offset,
             collections: self.collections.clone(),
             edges: self.edges.clone(),
             extra_collections: self.extra_collections.clone(),
@@ -321,95 +367,54 @@ impl Store {
         }
     }
 
-    pub fn set_catalog_hash(&mut self, hash: String) {
-        if let Some(p) = self.persist.as_mut() {
-            p.catalog_hash = hash;
-        }
-    }
-
-    pub fn close(&mut self) -> Result<(), Error> {
-        if self.persist.is_some() {
-            self.write_snapshot()?;
-            self.persist = None;
-        }
-        Ok(())
-    }
-
-    pub fn is_durable(&self) -> bool {
-        self.persist.is_some()
-    }
-
-    /// Force a durable checkpoint (snapshot + head fsync).
-    pub fn checkpoint(&mut self) -> Result<(), Error> {
-        self.write_snapshot()
-    }
-
     /// Flush one committed pack to the log (data sync), then soft-update head.
     /// Full head/snapshot fsync happens on checkpoint / close.
-    pub fn durable_commit(&mut self, pack: &Pack) -> Result<(), Error> {
-        let Some(p) = self.persist.as_mut() else {
-            return Ok(());
-        };
+    pub fn durable_commit(&self, persist: &mut Persist, pack: &Pack) -> Result<(), Error> {
         let rec = LogRecord {
             r#gen: self.r#gen + 1,
             next_id: self.next_id,
             pack: pack.clone(),
         };
-        persist::append_record(&mut p.log, &rec)?;
+        persist::append_record(&mut persist.log, &rec)?;
         let _ = persist::write_head_soft(
-            &p.dir,
+            &persist.dir,
             &Head {
                 r#gen: rec.r#gen,
-                catalog_hash: p.catalog_hash.clone(),
+                catalog_hash: persist.catalog_hash.clone(),
                 embed_id: self.embed_id.clone(),
             },
         );
-        p.writes_since_snapshot += 1;
+        persist.writes_since_snapshot += 1;
         Ok(())
     }
 
-    pub fn maybe_checkpoint(&mut self) -> Result<(), Error> {
-        let n = self
-            .persist
-            .as_ref()
-            .map(|p| p.writes_since_snapshot)
-            .unwrap_or(0);
-        if n >= persist::SNAPSHOT_EVERY {
-            self.write_snapshot()?;
+    pub fn maybe_checkpoint(&self, persist: &mut Persist) -> Result<(), Error> {
+        if persist.writes_since_snapshot >= persist::SNAPSHOT_EVERY {
+            self.write_snapshot(persist)?;
         }
         Ok(())
     }
 
-    fn write_snapshot(&mut self) -> Result<(), Error> {
-        let Some(p) = self.persist.as_mut() else {
-            return Ok(());
-        };
-        let log_offset = p.log.metadata().map_err(persist::io_err)?.len();
+    /// Force a durable checkpoint (snapshot + head fsync).
+    pub fn checkpoint(&self, persist: &mut Persist) -> Result<(), Error> {
+        self.write_snapshot(persist)
+    }
+
+    pub fn write_snapshot(&self, persist: &mut Persist) -> Result<(), Error> {
         // Ensure log content is fully durable before publishing snapshot/head.
-        p.log.sync_all().map_err(persist::io_err)?;
-        let snap = Snapshot {
-            r#gen: self.r#gen,
-            embed_id: self.embed_id.clone(),
-            next_id: self.next_id,
-            catalog_hash: p.catalog_hash.clone(),
-            log_offset,
-            collections: self.collections.clone(),
-            edges: self.edges.clone(),
-            extra_collections: self.extra_collections.clone(),
-            extra_rels: self.extra_rels.clone(),
-            extra_indexes: self.extra_indexes.clone(),
-        };
+        persist.log.sync_all().map_err(persist::io_err)?;
+        // Snapshot is a full memory image — after publish the log prefix is redundant.
+        let snap = self.capture_snapshot_at(persist.catalog_hash.clone(), 0);
         let head = Head {
             r#gen: self.r#gen,
-            catalog_hash: p.catalog_hash.clone(),
+            catalog_hash: persist.catalog_hash.clone(),
             embed_id: self.embed_id.clone(),
         };
-        let dir = p.dir.clone();
-        persist::write_snapshot(&dir, &snap)?;
-        persist::write_head(&dir, &head)?;
-        if let Some(p) = self.persist.as_mut() {
-            p.writes_since_snapshot = 0;
-        }
+        persist::write_snapshot(&persist.dir, &snap)?;
+        persist::write_head(&persist.dir, &head)?;
+        // Compact: drop covered WAL so disk stays bounded.
+        persist::compact_log(&mut persist.log)?;
+        persist.writes_since_snapshot = 0;
         Ok(())
     }
 

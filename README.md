@@ -2,13 +2,27 @@
 
 Lin — язык своей локальной БД: пайпы, типизированный каталог, два мира записи (`append` / reducer), свой план. Не SQL и не Kusto.
 
-**0.2** — встраиваемый локальный прототип с durable `--data`, backup export/import и честным lex-search. Не multi-writer / не сеть.
+**0.2** — встраиваемая локальная БД: durable `--data`, backup, multi-reader snapshots, log compaction, writer flock, quotas, ops counters. Не multi-writer / не сеть.
 
-Сейчас есть парсер, typecheck, IR плана, in-memory store (один reducer, один `gen`), исполнитель, WAL+snapshot, `backup` CLI. DuckDB/IDB/WASM backends в этом milestone нет. Векторный search в плане не обещается: `search` → lex (`hybrid→lex (no embedder)`).
+Сейчас есть парсер, typecheck, IR плана, in-memory store (один reducer, один `gen`), исполнитель, WAL+snapshot с compaction, `backup` CLI. DuckDB/IDB/WASM backends в этом milestone нет. Векторный search в плане не обещается: `search` → lex (`hybrid→lex (no embedder)`).
 
 ## Стабильный API (0.2)
 
-Публичный контракт: `Db::{empty,fixture,open,close,run,prepare,explain_as,export_backup,import_backup,import_backup_into,stats}`, плюс `parse` / `compile` / `run` / `explain*`, типы `Handle` / `Done` / `Prepared` / `Error` / `Row` / `Cell` / `Store` / `Plan` / `Stats` / `VERSION`.
+Публичный контракт: `Db::{empty,fixture,open,open_read,close,checkpoint,run,prepare,explain_as,reader,export_backup,import_backup,import_backup_into,stats,with_quotas}`, `ReadDb::{run,prepare,stats,clone}`, `Quotas`, плюс `parse` / `compile` / `run` / `explain*`, типы `Handle` / `Done` / `Prepared` / `Error` / `Row` / `Cell` / `Store` / `Plan` / `Stats` / `VERSION`.
+
+`Db::reader()` — in-process снимок текущего `gen` (`Arc`, `Send`+`Sync`); запись через `ReadDb` отклоняется. Писатель один (`Db` + exclusive flock на `LOCK`). `Db::open_read(dir)` — холодный read-only open (shared flock; не параллельно с writer).
+
+## Local-prod guarantees
+
+| Есть | Нет |
+|---|---|
+| Crash после успешного commit → данные в log/snapshot | Multi-process multi-writer |
+| Exclusive flock на writer `open` | mmap / cold collections |
+| Checkpoint уплотняет log → 0 bytes | Real vec/FTS indexes |
+| Quotas: rows / edges / log bytes (defaults + `with_quotas`) | Сеть / реплики / MVCC |
+| `stats`: gen, log_bytes, reopen_ms, append_rows_per_s, … | |
+
+Память = полный image после open (snapshot + tail). Durable `Db` на `Drop` делает best-effort checkpoint.
 
 ## Лаконичный диалект
 
@@ -72,10 +86,9 @@ rel cites
 
 | Фаза | Статус |
 |---|---|
-| P0 semver 0.2 + честный search | **сейчас** |
-| P1 backup export/import + stats | **сейчас** |
-| P1 multi-reader / compaction | дальше |
-| P2 mmap/cold + quotas | позже |
+| P0 semver 0.2 + честный search | **готово** |
+| P1 backup + multi-reader + compaction + ops + flock + quotas | **готово** |
+| P2 mmap/cold collections | позже |
 | P3 сеть / MVCC | другой продукт |
 
 ## Бенчмарки (rbench): Lin vs SQLite vs DuckDB vs Postgres vs MySQL
@@ -160,13 +173,14 @@ lin --data .lin2 stats
 
 Без `--data` store эфемерный (fixture в памяти) — так живут текущие тесты языка и исполнителя.
 
-`--data <dir>` (привычный путь `./.lin`) открывает durable store: `Store::open`, replay в память, дальше тот же исполнитель. Запись сначала `fsync` записи лога, потом инкремент `gen`. Крах до fsync = записи не было.
+`--data <dir>` (привычный путь `./.lin`) открывает durable store: exclusive flock → snapshot + replay tail → RAM. Запись: `fsync` записи лога, потом `gen++`. Крах до fsync = записи не было. Checkpoint (каждые 32 commit / `close` / `checkpoint`) пишет snapshot и **обнуляет log**.
 
 ```
 .lin/
+  LOCK       advisory flock (writer exclusive / open_read shared)
   head       JSON: gen, catalog_hash, embed_id
-  log        append-only: u32 LE длина + JSON пакета
-  snapshot   опциональный чекпоинт всего store (после 32 записей или close)
+  log        append-only: u32 LE длина + JSON пакета (compacted on checkpoint)
+  snapshot   чекпоинт всего store (log_offset=0 после compaction)
 ```
 
 Пакет лога: `{"gen":N,"next_id":N,"pack":{"type":"insert"|"insert_bulk"|"append_fact"|"append_facts_bulk"|"append_edge"|"append_edges_bulk"|…}}`. Ячейки: `{"t":"Text","v":"…"}`. Bulk-формы пишут один record вместо Batch-of-N. Обрезанная последняя запись лога игнорируется; при открытии лог обрезается до последнего целого фрейма. `insert … with edge` кладёт рёбра в тот же пакет. Несколько записей в одном `run()` или bulk-список — один `batch` / `*_bulk`. Индекс живёт в `schema_index` + snapshot `extra_indexes`; при open пересобирается.

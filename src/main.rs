@@ -233,7 +233,7 @@ fn cmd_stats(data: Option<PathBuf>) -> ExitCode {
         let s = match db {
             Some(db) => db.stats(),
             None => {
-                let mut tmp = Db::fixture();
+                let tmp = Db::fixture();
                 tmp.stats()
             }
         };
@@ -241,8 +241,17 @@ fn cmd_stats(data: Option<PathBuf>) -> ExitCode {
     }) {
         Ok(s) => {
             println!(
-                "gen={} docs={} facts={} edges={} next_id={}",
-                s.r#gen, s.docs, s.facts, s.edges, s.next_id
+                "gen={} docs={} facts={} edges={} next_id={} log_bytes={} reopen_ms={} writes_since_snapshot={} append_rows={} append_rows_per_s={:.0}",
+                s.r#gen,
+                s.docs,
+                s.facts,
+                s.edges,
+                s.next_id,
+                s.log_bytes,
+                s.reopen_ms,
+                s.writes_since_snapshot,
+                s.append_rows,
+                s.append_rows_per_s()
             );
             ExitCode::SUCCESS
         }

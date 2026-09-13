@@ -387,3 +387,153 @@ fn backup_export_import_roundtrip() {
     let _ = fs::remove_dir_all(&dir);
     let _ = fs::remove_dir_all(&dir2);
 }
+
+#[test]
+fn reader_snapshot_is_frozen_and_read_only() {
+    let mut db = Db::empty();
+    db.run(r#"insert docs { uri: "raw://r1", title: "R1", layer: "wiki" }"#)
+        .unwrap();
+    let snap = db.reader();
+    assert_eq!(snap.r#gen(), 1);
+    let q = snap.run(r#"docs | uri == "raw://r1""#).unwrap();
+    assert_eq!(q.done.n, 1);
+
+    // Writer advances; snapshot stays at gen=1.
+    db.run(r#"insert docs { uri: "raw://r2", title: "R2", layer: "wiki" }"#)
+        .unwrap();
+    assert_eq!(db.stats().r#gen, 2);
+    assert_eq!(snap.r#gen(), 1);
+    assert_eq!(
+        snap.run(r#"docs | uri == "raw://r2""#).unwrap().done.n,
+        0
+    );
+
+    let err = snap
+        .run(r#"insert docs { uri: "raw://x", title: "X", layer: "wiki" }"#)
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("read-only"),
+        "{err}"
+    );
+}
+
+#[test]
+fn shared_readers_across_threads() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<lin::ReadDb>();
+
+    let mut db = Db::empty();
+    db.run(r#"insert docs { uri: "raw://t", title: "T", layer: "wiki" }"#)
+        .unwrap();
+    let snap = db.reader();
+    let mut handles = Vec::new();
+    for _ in 0..4 {
+        let r = snap.clone();
+        handles.push(std::thread::spawn(move || {
+            let q = r.run(r#"docs | uri == "raw://t""#).unwrap();
+            assert_eq!(q.done.n, 1);
+            assert_eq!(r.r#gen(), 1);
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+}
+
+#[test]
+fn open_read_loads_durable_without_writer() {
+    let dir = tmp();
+    {
+        let mut db = Db::open(&dir).unwrap();
+        db.run(r#"insert docs { uri: "raw://or", title: "OR", layer: "wiki" }"#)
+            .unwrap();
+        db.close().unwrap();
+    }
+    let r = Db::open_read(&dir).unwrap();
+    let q = r.run(r#"docs | uri == "raw://or""#).unwrap();
+    assert_eq!(q.done.n, 1);
+    let err = r
+        .run(r#"insert docs { uri: "raw://no", title: "NO", layer: "wiki" }"#)
+        .unwrap_err();
+    assert!(err.to_string().contains("read-only"), "{err}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn checkpoint_compacts_log() {
+    let dir = tmp();
+    {
+        let mut db = Db::open(&dir).unwrap();
+        for i in 0..5 {
+            db.run(&format!(
+                r#"insert docs {{ uri: "raw://c{i}", title: "C{i}", layer: "wiki" }}"#
+            ))
+            .unwrap();
+        }
+        let before = fs::metadata(dir.join("log")).unwrap().len();
+        assert!(before > 0, "log should have grown");
+        db.checkpoint().unwrap();
+        let after = fs::metadata(dir.join("log")).unwrap().len();
+        assert_eq!(after, 0, "log compacted to empty");
+        assert_eq!(db.stats().writes_since_snapshot, 0);
+        db.close().unwrap();
+    }
+    {
+        let mut db = Db::open(&dir).unwrap();
+        let q = db
+            .run(r#"docs | uri == "raw://c0" or uri == "raw://c4" | take all"#)
+            .unwrap();
+        assert_eq!(q.done.n, 2);
+        assert!(db.stats().reopen_ms > 0 || db.stats().r#gen >= 5);
+        db.close().unwrap();
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn writer_lock_rejects_second_open() {
+    let dir = tmp();
+    let mut a = Db::open(&dir).unwrap();
+    a.run(r#"insert docs { uri: "raw://lock", title: "L", layer: "wiki" }"#)
+        .unwrap();
+    let err = match Db::open(&dir) {
+        Ok(_) => panic!("second writer open should fail"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string().contains("locked"),
+        "expected lock error, got {err}"
+    );
+    // Cold reader also blocked while exclusive writer holds LOCK.
+    let err = match Db::open_read(&dir) {
+        Ok(_) => panic!("open_read under writer should fail"),
+        Err(e) => e,
+    };
+    assert!(err.to_string().contains("locked"), "{err}");
+    a.close().unwrap();
+    let mut b = Db::open(&dir).unwrap();
+    assert_eq!(
+        b.run(r#"docs | uri == "raw://lock""#).unwrap().done.n,
+        1
+    );
+    b.close().unwrap();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn quotas_reject_excess_rows() {
+    let mut db = Db::empty().with_quotas(lin::Quotas {
+        max_rows: 2,
+        max_edges: 10_000,
+        max_log_bytes: 512 * 1024 * 1024,
+    });
+    // fixture empty collections still count? empty() has empty docs/users/orders/facts — 0 rows
+    db.run(r#"insert docs { uri: "raw://q1", title: "Q1", layer: "wiki" }"#)
+        .unwrap();
+    db.run(r#"insert docs { uri: "raw://q2", title: "Q2", layer: "wiki" }"#)
+        .unwrap();
+    let err = db
+        .run(r#"insert docs { uri: "raw://q3", title: "Q3", layer: "wiki" }"#)
+        .unwrap_err();
+    assert!(err.to_string().contains("quota"), "{err}");
+}

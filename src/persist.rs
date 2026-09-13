@@ -16,7 +16,9 @@
 //! Record body: `{"gen":N,"next_id":N,"pack":{"type":"insert"|"delete"|"schema_index"|…}}`.
 //! Snapshot: collections + edges + `log_offset` (byte position after the
 //! last record included in the checkpoint). Written after every 32 commits
-//! and on [`Store::close`](crate::store::Store::close).
+//! and on [`Db::close`](crate::Db::close) / [`Db::checkpoint`](crate::Db::checkpoint).
+//! After a successful snapshot the log is **compacted** (truncated to 0) so
+//! disk stays bounded; `log_offset` in the published snapshot is 0.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -30,6 +32,7 @@ use crate::store::{Edge, Row};
 pub const HEAD_NAME: &str = "head";
 pub const LOG_NAME: &str = "log";
 pub const SNAPSHOT_NAME: &str = "snapshot";
+pub const LOCK_NAME: &str = "LOCK";
 pub const SNAPSHOT_EVERY: u32 = 32;
 const MAX_RECORD: u32 = 16 * 1024 * 1024;
 
@@ -156,6 +159,8 @@ pub struct Snapshot {
 pub struct Persist {
     pub dir: PathBuf,
     pub log: File,
+    /// Advisory exclusive flock on `LOCK` — released when Persist drops.
+    pub lock: File,
     pub catalog_hash: String,
     pub writes_since_snapshot: u32,
 }
@@ -178,6 +183,85 @@ pub fn log_path(dir: &Path) -> PathBuf {
 
 pub fn snapshot_path(dir: &Path) -> PathBuf {
     dir.join(SNAPSHOT_NAME)
+}
+
+pub fn lock_path(dir: &Path) -> PathBuf {
+    dir.join(LOCK_NAME)
+}
+
+pub fn log_len(dir: &Path) -> Result<u64, Error> {
+    let path = log_path(dir);
+    if !path.exists() {
+        return Ok(0);
+    }
+    Ok(fs::metadata(&path).map_err(io_err)?.len())
+}
+
+/// Exclusive advisory lock for a writer. Errors if another writer holds the dir.
+pub fn acquire_writer_lock(dir: &Path) -> Result<File, Error> {
+    ensure_dir(dir)?;
+    let f = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(lock_path(dir))
+        .map_err(io_err)?;
+    flock_nb(&f, true).map_err(|e| {
+        if e.kind() == io::ErrorKind::WouldBlock {
+            Error::runtime("data dir locked by another writer")
+        } else {
+            io_err(e)
+        }
+    })?;
+    Ok(f)
+}
+
+/// Shared advisory lock for cold readers (allows multiple readers, blocks writers).
+pub fn acquire_reader_lock(dir: &Path) -> Result<File, Error> {
+    let path = lock_path(dir);
+    if !path.exists() {
+        // No writer has created LOCK yet — open/create for shared.
+        let _ = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(io_err)?;
+    }
+    let f = OpenOptions::new()
+        .read(true)
+        .open(&path)
+        .map_err(io_err)?;
+    flock_nb(&f, false).map_err(|e| {
+        if e.kind() == io::ErrorKind::WouldBlock {
+            Error::runtime("data dir locked by another writer")
+        } else {
+            io_err(e)
+        }
+    })?;
+    Ok(f)
+}
+
+#[cfg(unix)]
+fn flock_nb(f: &File, exclusive: bool) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let op = if exclusive {
+        libc::LOCK_EX | libc::LOCK_NB
+    } else {
+        libc::LOCK_SH | libc::LOCK_NB
+    };
+    let rc = unsafe { libc::flock(f.as_raw_fd(), op) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(unix))]
+fn flock_nb(_f: &File, _exclusive: bool) -> io::Result<()> {
+    // Best-effort: no advisory flock on this platform.
+    Ok(())
 }
 
 pub fn read_head(dir: &Path) -> Result<Option<Head>, Error> {
@@ -273,6 +357,20 @@ pub fn open_log(dir: &Path) -> Result<File, Error> {
         .create(true)
         .truncate(false)
         .open(log_path(dir))
+        .map_err(io_err)
+}
+
+/// Open log for read-only replay (no create / no truncate).
+/// Returns `None` if the log file does not exist yet.
+pub fn open_log_read(dir: &Path) -> Result<Option<File>, Error> {
+    let path = log_path(dir);
+    if !path.exists() {
+        return Ok(None);
+    }
+    OpenOptions::new()
+        .read(true)
+        .open(&path)
+        .map(Some)
         .map_err(io_err)
 }
 
@@ -402,4 +500,10 @@ pub fn truncate_log(log: &mut File, end: u64) -> Result<(), Error> {
     log.seek(SeekFrom::End(0)).map_err(io_err)?;
     log.sync_all().map_err(io_err)?;
     Ok(())
+}
+
+/// After a durable snapshot of the full memory image, drop the covered log prefix
+/// so the file does not grow forever. Sets length to 0 and seeks to start.
+pub fn compact_log(log: &mut File) -> Result<(), Error> {
+    truncate_log(log, 0)
 }

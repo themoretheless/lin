@@ -3,11 +3,14 @@
 //! ## Stable public API (0.2 freeze)
 //!
 //! Prefer these entry points; treat other `pub` items as evolving:
-//! - [`Db`]: [`Db::empty`], [`Db::fixture`], [`Db::open`], [`Db::close`],
-//!   [`Db::run`], [`Db::prepare`], [`Db::explain_as`],
-//!   [`Db::export_backup`], [`Db::import_backup`], [`Db::stats`]
+//! - [`Db`]: [`Db::empty`], [`Db::fixture`], [`Db::open`], [`Db::open_read`],
+//!   [`Db::close`], [`Db::checkpoint`], [`Db::run`], [`Db::prepare`], [`Db::explain_as`],
+//!   [`Db::reader`], [`Db::export_backup`], [`Db::import_backup`], [`Db::stats`],
+//!   [`Db::with_quotas`]
+//! - [`ReadDb`]: shared read-only snapshot ([`ReadDb::run`], [`ReadDb::clone`])
 //! - Free functions: [`parse`], [`compile`], [`run`], [`explain`], [`explain_as`]
-//! - Types: [`Handle`], [`Done`], [`Prepared`], [`Error`], [`Row`], [`Cell`], [`Store`], [`Plan`], [`Stats`]
+//! - Types: [`Handle`], [`Done`], [`Prepared`], [`Error`], [`Row`], [`Cell`], [`Store`],
+//!   [`Plan`], [`Stats`], [`Quotas`]
 //!
 //! Semver: breaking changes to the list above require a major bump after 1.0;
 //! until then minors may still adjust experimental surfaces (`Stmt`, plan IR).
@@ -35,7 +38,7 @@ use std::cell::RefCell;
 
 pub use ast::{ExplainKind, Stmt};
 pub use error::Error;
-pub use exec::{Db, Done, Handle, Prepared, Stats};
+pub use exec::{Db, Done, Handle, Prepared, Quotas, ReadDb, Stats};
 pub use graph::GraphFmt;
 pub use plan::Plan;
 pub use store::{Cell, Row, Store};

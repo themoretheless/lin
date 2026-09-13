@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
@@ -12,7 +13,7 @@ use crate::error::Error;
 use crate::explain::{self, ExplainCtx, RunStats};
 use crate::graph::GraphFmt;
 use crate::parse;
-use crate::persist::Pack;
+use crate::persist::{Pack, Persist};
 use crate::plan::{self, Plan};
 use crate::store::{Cell, Edge, Row, Store, compact_row, content_hash_arc, now_ms, project_fields, row_text};
 
@@ -80,80 +81,270 @@ impl Prepared {
     pub fn run(&self, db: &mut Db) -> Result<Handle, Error> {
         db.run_prepared(self)
     }
+
+    pub fn run_read(&self, db: &ReadDb) -> Result<Handle, Error> {
+        db.run_prepared(self)
+    }
 }
 
 pub struct Db {
     pub catalog: Catalog,
     pub store: Store,
+    /// Durable log handle (writer only). Absent on in-memory and read snapshots.
+    persist: Option<Persist>,
+    /// Shared flock for [`Db::open_read`] (kept alive for lock lifetime).
+    reader_lock: Option<File>,
     /// Source → prepared plan (invalidated on schema change).
     plan_cache: FxHashMap<String, Prepared>,
+    /// Hard limits (local prod).
+    quotas: Quotas,
+    /// Wall ms of last open / open_read (0 if in-memory).
+    reopen_ms: u64,
+    /// Accumulated durable append/insert row counts and wall ms (for rows/s).
+    append_rows: u64,
+    append_ms: f64,
 }
 
-/// Lightweight store counters (stable in 0.2).
+/// Shared read-only snapshot of a [`Db`] at a fixed `gen`.
+///
+/// Cheap to `Clone` (`Arc`). Safe to share across threads. Writes are rejected.
+#[derive(Clone)]
+pub struct ReadDb {
+    inner: Arc<Db>,
+}
+
+/// Row / edge / log byte caps. Defaults suit embeddable single-node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Quotas {
+    pub max_rows: usize,
+    pub max_edges: usize,
+    pub max_log_bytes: u64,
+}
+
+impl Default for Quotas {
+    fn default() -> Self {
+        Self {
+            max_rows: 10_000_000,
+            max_edges: 10_000_000,
+            max_log_bytes: 512 * 1024 * 1024,
+        }
+    }
+}
+
+/// Lightweight store counters (stable in 0.2+).
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Stats {
     pub r#gen: u64,
     pub docs: usize,
     pub facts: usize,
     pub edges: usize,
     pub next_id: u64,
+    pub log_bytes: u64,
+    pub reopen_ms: u64,
+    pub append_rows: u64,
+    pub append_ms: f64,
+    pub writes_since_snapshot: u32,
+}
+
+impl Stats {
+    /// Durable append/insert throughput estimate (0 if no samples).
+    pub fn append_rows_per_s(&self) -> f64 {
+        if self.append_ms <= 0.0 {
+            0.0
+        } else {
+            (self.append_rows as f64) / (self.append_ms / 1000.0)
+        }
+    }
 }
 
 impl Db {
-    pub fn fixture() -> Self {
-        let catalog = crate::catalog::fixture();
-        let store = Store::fixture(&catalog);
+    fn bare(catalog: Catalog, store: Store) -> Self {
         Self {
             catalog,
             store,
+            persist: None,
+            reader_lock: None,
             plan_cache: FxHashMap::default(),
+            quotas: Quotas::default(),
+            reopen_ms: 0,
+            append_rows: 0,
+            append_ms: 0.0,
         }
+    }
+
+    pub fn fixture() -> Self {
+        let catalog = crate::catalog::fixture();
+        let store = Store::fixture(&catalog);
+        Self::bare(catalog, store)
     }
 
     pub fn empty() -> Self {
         let catalog = crate::catalog::fixture();
         let store = Store::empty(catalog.embed_id.clone());
-        Self {
-            catalog,
-            store,
-            plan_cache: FxHashMap::default(),
-        }
+        Self::bare(catalog, store)
+    }
+
+    pub fn with_quotas(mut self, quotas: Quotas) -> Self {
+        self.quotas = quotas;
+        self
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
+        let t0 = Instant::now();
         let catalog = crate::catalog::fixture();
-        let store = Store::open_with(path, &catalog)?;
+        let (store, persist) = Store::open_with(path, &catalog)?;
         let mut catalog = catalog;
         store.merge_extras_into(&mut catalog);
+        let reopen_ms = t0.elapsed().as_secs_f64() * 1000.0;
         Ok(Self {
             catalog,
             store,
+            persist: Some(persist),
+            reader_lock: None,
             plan_cache: FxHashMap::default(),
+            quotas: Quotas::default(),
+            reopen_ms: reopen_ms as u64,
+            append_rows: 0,
+            append_ms: 0.0,
+        })
+    }
+
+    /// Open a durable data dir as a read-only snapshot (no log truncate / no head write).
+    pub fn open_read(path: impl AsRef<Path>) -> Result<ReadDb, Error> {
+        let t0 = Instant::now();
+        let catalog = crate::catalog::fixture();
+        let (store, lock) = Store::open_read_with(path, &catalog)?;
+        let mut catalog = catalog;
+        store.merge_extras_into(&mut catalog);
+        let reopen_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        Ok(ReadDb {
+            inner: Arc::new(Self {
+                catalog,
+                store,
+                persist: None,
+                reader_lock: Some(lock),
+                plan_cache: FxHashMap::default(),
+                quotas: Quotas::default(),
+                reopen_ms: reopen_ms as u64,
+                append_rows: 0,
+                append_ms: 0.0,
+            }),
         })
     }
 
     pub fn close(&mut self) -> Result<(), Error> {
-        self.store.close()
+        if let Some(mut p) = self.persist.take() {
+            self.store.checkpoint(&mut p)?;
+            // lock released when p drops
+        }
+        self.reader_lock = None;
+        Ok(())
+    }
+
+    /// Force a durable checkpoint + log compaction (no-op if in-memory).
+    pub fn checkpoint(&mut self) -> Result<(), Error> {
+        if let Some(p) = self.persist.as_mut() {
+            self.store.checkpoint(p)?;
+        }
+        Ok(())
+    }
+
+    pub fn is_durable(&self) -> bool {
+        self.persist.is_some()
+    }
+
+    /// Freeze a consistent in-memory snapshot at the current `gen` for concurrent readers.
+    pub fn reader(&self) -> ReadDb {
+        ReadDb {
+            inner: Arc::new(Self {
+                catalog: self.catalog.clone(),
+                store: self.store.clone_mem(),
+                persist: None,
+                reader_lock: None,
+                plan_cache: FxHashMap::default(),
+                quotas: self.quotas,
+                reopen_ms: self.reopen_ms,
+                append_rows: 0,
+                append_ms: 0.0,
+            }),
+        }
     }
 
     pub fn stats(&self) -> Stats {
+        let log_bytes = self
+            .persist
+            .as_ref()
+            .and_then(|p| p.log.metadata().ok().map(|m| m.len()))
+            .or_else(|| {
+                self.persist
+                    .as_ref()
+                    .map(|p| crate::persist::log_len(&p.dir).ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        let writes_since_snapshot = self
+            .persist
+            .as_ref()
+            .map(|p| p.writes_since_snapshot)
+            .unwrap_or(0);
         Stats {
             r#gen: self.store.r#gen,
             docs: self.store.collection("docs").len(),
             facts: self.store.collection("facts").len(),
             edges: self.store.edges.len(),
             next_id: self.store.next_id,
+            log_bytes,
+            reopen_ms: self.reopen_ms,
+            append_rows: self.append_rows,
+            append_ms: self.append_ms,
+            writes_since_snapshot,
         }
+    }
+
+    fn total_rows(&self) -> usize {
+        self.store.collections.values().map(|c| c.len()).sum()
+    }
+
+    fn check_quotas(&self) -> Result<(), Error> {
+        let rows = self.total_rows();
+        if rows > self.quotas.max_rows {
+            return Err(Error::runtime(format!(
+                "quota: rows {rows} > max_rows {}",
+                self.quotas.max_rows
+            )));
+        }
+        let edges = self.store.edges.len();
+        if edges > self.quotas.max_edges {
+            return Err(Error::runtime(format!(
+                "quota: edges {edges} > max_edges {}",
+                self.quotas.max_edges
+            )));
+        }
+        if let Some(p) = self.persist.as_ref() {
+            let n = p.log.metadata().map(|m| m.len()).unwrap_or(0);
+            if n > self.quotas.max_log_bytes {
+                return Err(Error::runtime(format!(
+                    "quota: log_bytes {n} > max_log_bytes {}",
+                    self.quotas.max_log_bytes
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Write a portable JSON backup of the current memory image.
     /// If this Db is durable, checkpoints the log first.
     pub fn export_backup(&mut self, path: impl AsRef<Path>) -> Result<(), Error> {
-        if self.store.is_durable() {
-            self.store.checkpoint()?;
+        if let Some(p) = self.persist.as_mut() {
+            self.store.checkpoint(p)?;
         }
         let hash = crate::store::catalog_hash(&self.catalog);
-        let snap = self.store.capture_snapshot(hash);
+        let log_offset = self
+            .persist
+            .as_ref()
+            .and_then(|p| p.log.metadata().ok().map(|m| m.len()))
+            .unwrap_or(0);
+        let snap = self.store.capture_snapshot_at(hash, log_offset);
         crate::persist::write_backup(path.as_ref(), &snap)
     }
 
@@ -164,11 +355,7 @@ impl Db {
         let store = Store::from_snapshot(&snap);
         let mut catalog = crate::catalog::fixture();
         store.merge_extras_into(&mut catalog);
-        Ok(Self {
-            catalog,
-            store,
-            plan_cache: FxHashMap::default(),
-        })
+        Ok(Self::bare(catalog, store))
     }
 
     /// Import backup into a durable data directory (replaces store files).
@@ -253,17 +440,34 @@ impl Db {
         };
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
         if let Some(pack) = pack {
-            if self.store.is_durable() {
-                self.store
-                    .set_catalog_hash(crate::store::catalog_hash(&self.catalog));
-                if let Err(e) = self.store.durable_commit(&pack) {
+            if let Err(e) = self.check_quotas() {
+                self.rollback(undo, cat_backup);
+                return Err(e);
+            }
+            // Bound WAL: compact if already over quota before appending.
+            if let Some(p) = self.persist.as_mut() {
+                let len = p.log.metadata().map(|m| m.len()).unwrap_or(0);
+                if len > self.quotas.max_log_bytes {
+                    if let Err(e) = self.store.checkpoint(p) {
+                        self.rollback(undo, cat_backup);
+                        return Err(e);
+                    }
+                }
+            }
+            if let Some(p) = self.persist.as_mut() {
+                p.catalog_hash = crate::store::catalog_hash(&self.catalog);
+                if let Err(e) = self.store.durable_commit(p, &pack) {
                     self.rollback(undo, cat_backup);
                     return Err(e);
                 }
             }
             self.store.r#gen += 1;
-            if self.store.is_durable() {
-                self.store.maybe_checkpoint()?;
+            if let Some(p) = self.persist.as_mut() {
+                self.store.maybe_checkpoint(p)?;
+            }
+            if prepared.append_only {
+                self.append_rows += rows.len() as u64;
+                self.append_ms += ms;
             }
         }
         if prepared.schema {
@@ -280,6 +484,69 @@ impl Db {
             message,
             ms,
         })
+    }
+
+    /// Read-only run (`&self`): rejects mutating statements.
+    pub fn run_readonly(&self, src: &str) -> Result<Handle, Error> {
+        let prepared = self.prepare_uncached(src)?;
+        self.run_prepared_readonly(&prepared)
+    }
+
+    pub fn run_prepared_readonly(&self, prepared: &Prepared) -> Result<Handle, Error> {
+        if prepared.writes {
+            return Err(Error::runtime(
+                "read-only snapshot: writes not allowed",
+            ));
+        }
+        let t0 = Instant::now();
+        let (rows, message, pack) = self.exec_program_readonly(&prepared.stmts)?;
+        debug_assert!(pack.is_none());
+        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let n = rows.len();
+        Ok(Handle {
+            plan: prepared.plan.clone(),
+            rows,
+            done: Done {
+                r#gen: self.store.r#gen,
+                n,
+            },
+            message,
+            ms,
+        })
+    }
+
+    fn exec_program_readonly(&self, stmts: &[Stmt]) -> Result<StmtOut, Error> {
+        let mut bindings: BTreeMap<String, Vec<Row>> = BTreeMap::new();
+        let mut last_rows = Vec::new();
+        let mut last_msg = None;
+        for stmt in stmts {
+            match stmt {
+                Stmt::Let { name, query } => {
+                    let rows = self.exec_query(query, &bindings)?;
+                    last_rows = rows.clone();
+                    last_msg = None;
+                    bindings.insert(name.clone(), rows);
+                }
+                Stmt::Query(q) => {
+                    last_rows = self.exec_query(q, &bindings)?;
+                    last_msg = None;
+                }
+                Stmt::IdbSlice { .. }
+                | Stmt::IdbPull { .. }
+                | Stmt::IdbPush
+                | Stmt::Snapshot { .. }
+                | Stmt::Restore { .. } => {
+                    last_rows = Vec::new();
+                    last_msg = Some("no-op".into());
+                }
+                _ => {
+                    return Err(Error::runtime(
+                        "read-only snapshot: writes not allowed",
+                    ));
+                }
+            }
+        }
+        Ok((last_rows, last_msg, None))
     }
 
     fn rollback(&mut self, undo: Undo, cat_backup: Option<Catalog>) {
@@ -324,7 +591,66 @@ impl Db {
         }
         Ok(explain::format_with(&plan, &ctx))
     }
+}
 
+impl Drop for Db {
+    fn drop(&mut self) {
+        if self.persist.is_some() {
+            let _ = self.close();
+        }
+    }
+}
+
+impl ReadDb {
+    pub fn stats(&self) -> Stats {
+        self.inner.stats()
+    }
+
+    pub fn r#gen(&self) -> u64 {
+        self.inner.store.r#gen
+    }
+
+    pub fn prepare(&self, src: &str) -> Result<Prepared, Error> {
+        self.inner.prepare_uncached(src)
+    }
+
+    pub fn run(&self, src: &str) -> Result<Handle, Error> {
+        self.inner.run_readonly(src)
+    }
+
+    pub fn run_prepared(&self, prepared: &Prepared) -> Result<Handle, Error> {
+        self.inner.run_prepared_readonly(prepared)
+    }
+
+    pub fn explain_as(&self, src: &str, graph: Option<GraphFmt>) -> Result<String, Error> {
+        let stmts = parse::parse_program(src)?;
+        let mut cat = self.inner.catalog.clone();
+        check::check_program(&stmts, &mut cat)?;
+        let mut plan = plan::plan_program(&stmts, &cat)?;
+        if let Some(fmt) = graph {
+            plan.explain = match fmt {
+                GraphFmt::Mermaid => crate::ast::ExplainKind::Graph,
+                GraphFmt::Dot => crate::ast::ExplainKind::Dot,
+            };
+        }
+        let mut ctx = ExplainCtx {
+            r#gen: Some(self.inner.store.r#gen),
+            ..ExplainCtx::default()
+        };
+        if plan.explain == crate::ast::ExplainKind::Run {
+            let handle = self.run(src)?;
+            ctx.stats = Some(RunStats {
+                rows: handle.done.n,
+                ms: handle.ms,
+            });
+            ctx.r#gen = Some(handle.done.r#gen);
+            return Ok(explain::format_with(&handle.plan, &ctx));
+        }
+        Ok(explain::format_with(&plan, &ctx))
+    }
+}
+
+impl Db {
     fn exec_program(&mut self, stmts: &[Stmt]) -> Result<StmtOut, Error> {
         let mut bindings: BTreeMap<String, Vec<Row>> = BTreeMap::new();
         let need_snap = stmts.iter().any(|s| {
@@ -392,7 +718,7 @@ impl Db {
                 self.store.facts_by_spo.reserve(n);
                 let mut rows = Vec::with_capacity(n);
                 let mut changed_n = 0usize;
-                let durable = self.store.is_durable();
+                let durable = self.is_durable();
                 let mut bulk_s = if durable {
                     Vec::with_capacity(n)
                 } else {
@@ -445,7 +771,7 @@ impl Db {
                 self.store.edge_keys.reserve(n);
                 let mut rows = Vec::with_capacity(n);
                 let mut changed_n = 0usize;
-                let durable = self.store.is_durable();
+                let durable = self.is_durable();
                 let mut bulk_rel = if durable {
                     Vec::with_capacity(n)
                 } else {
@@ -499,7 +825,7 @@ impl Db {
                 let (rows, new_edges) =
                     self.insert_bulk(collection, records, edges.as_slice())?;
                 mark_written(ctx, collection, &rows);
-                let pack = if self.store.is_durable() {
+                let pack = if self.is_durable() {
                     Some(Pack::InsertBulk {
                         collection: collection.clone(),
                         rows: rows.clone(),
