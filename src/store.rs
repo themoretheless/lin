@@ -367,23 +367,15 @@ impl Store {
         }
     }
 
-    /// Flush one committed pack to the log (data sync), then soft-update head.
-    /// Full head/snapshot fsync happens on checkpoint / close.
-    pub fn durable_commit(&self, persist: &mut Persist, pack: &Pack) -> Result<(), Error> {
+    /// Flush one committed pack to the log (data sync). Head is updated durably
+    /// on checkpoint/close only (soft head skipped on the hot path).
+    pub fn durable_commit(&self, persist: &mut Persist, pack: Pack) -> Result<(), Error> {
         let rec = LogRecord {
             r#gen: self.r#gen + 1,
             next_id: self.next_id,
-            pack: pack.clone(),
+            pack,
         };
         persist::append_record(&mut persist.log, &rec)?;
-        let _ = persist::write_head_soft(
-            &persist.dir,
-            &Head {
-                r#gen: rec.r#gen,
-                catalog_hash: persist.catalog_hash.clone(),
-                embed_id: self.embed_id.clone(),
-            },
-        );
         persist.writes_since_snapshot += 1;
         Ok(())
     }
@@ -451,6 +443,25 @@ impl Store {
                 self.row_maps_register_slab(collection, start, rows);
                 self.collection_mut(collection)
                     .extend(rows.iter().cloned());
+                for e in edges {
+                    let _ = self.append_edge_parts(&e.rel, &e.from, &e.to);
+                }
+            }
+            Pack::InsertCols {
+                collection,
+                fields,
+                cols,
+                n,
+                edges,
+            } => {
+                let n = *n as usize;
+                let rows = persist::cols_to_rows(fields, cols, n);
+                let start = self.collection(collection).len();
+                self.collection_mut(collection).reserve(rows.len());
+                self.row_maps_reserve(collection, rows.len());
+                let _ = self.index_insert_slab(collection, start, &rows);
+                self.row_maps_register_slab(collection, start, &rows);
+                self.collection_mut(collection).extend(rows);
                 for e in edges {
                     let _ = self.append_edge_parts(&e.rel, &e.from, &e.to);
                 }

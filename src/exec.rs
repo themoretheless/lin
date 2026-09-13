@@ -456,7 +456,7 @@ impl Db {
             }
             if let Some(p) = self.persist.as_mut() {
                 p.catalog_hash = crate::store::catalog_hash(&self.catalog);
-                if let Err(e) = self.store.durable_commit(p, &pack) {
+                if let Err(e) = self.store.durable_commit(p, pack) {
                     self.rollback(undo, cat_backup);
                     return Err(e);
                 }
@@ -826,11 +826,11 @@ impl Db {
                     self.insert_bulk(collection, records, edges.as_slice())?;
                 mark_written(ctx, collection, &rows);
                 let pack = if self.is_durable() {
-                    Some(Pack::InsertBulk {
-                        collection: collection.clone(),
-                        rows: rows.clone(),
-                        edges: new_edges.clone(),
-                    })
+                    Some(crate::persist::rows_to_insert_cols(
+                        collection.clone(),
+                        &rows,
+                        new_edges,
+                    ))
                 } else {
                     Some(Pack::Batch { packs: Vec::new() })
                 };

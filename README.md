@@ -179,7 +179,10 @@ lin --data .lin2 stats
 .lin/
   LOCK       advisory flock (writer exclusive / open_read shared)
   head       JSON: gen, catalog_hash, embed_id
-  log        append-only: u32 LE длина + JSON пакета (compacted on checkpoint)
+  log        append-only WAL (compacted on checkpoint):
+             `LIN\x02` raw columnar hot packs (facts/insert),
+             `LIN\x01` MessagePack(LogRecord) for other packs,
+             legacy JSON frames still replayed
   snapshot   чекпоинт всего store (log_offset=0 после compaction)
 ```
 
