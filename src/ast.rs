@@ -72,7 +72,36 @@ pub enum Source {
 #[derive(Debug, Clone, PartialEq)]
 pub struct MatchHop {
     pub rel: String,
+    /// Bound end node of this hop.
     pub bind: String,
+    /// Optional edge bind: `-[e:rel]->`.
+    pub edge: Option<String>,
+    /// `<-rel-` / `<-[e:rel]-` instead of forward.
+    pub reverse: bool,
+    /// Inclusive range; default 1..=1. Cap 3.
+    pub min_depth: i64,
+    pub max_depth: i64,
+}
+
+impl MatchHop {
+    pub fn label(&self) -> String {
+        let star = if self.min_depth == 1 && self.max_depth == 1 {
+            String::new()
+        } else if self.min_depth == self.max_depth {
+            format!("*{}", self.min_depth)
+        } else {
+            format!("*{}..{}", self.min_depth, self.max_depth)
+        };
+        let mid = match &self.edge {
+            Some(e) => format!("[{e}:{}{star}]", self.rel),
+            None => format!("{}{star}", self.rel),
+        };
+        if self.reverse {
+            format!("<-{mid}- {}", self.bind)
+        } else {
+            format!("-{mid}-> {}", self.bind)
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

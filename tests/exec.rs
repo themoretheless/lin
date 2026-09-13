@@ -231,6 +231,35 @@ fn match_two_hop_chain() {
     assert_eq!(m.done.n, 1, "{:?}", m.rows);
     assert_eq!(text(&m.rows[0], "mid.title"), "M2");
     assert_eq!(text(&m.rows[0], "end.title"), "M3");
+
+    let star = db
+        .run(&format!(
+            r#"docs | id == "{a}" | match -wikilink*2-> end | {{ end.title }}"#
+        ))
+        .unwrap();
+    assert_eq!(star.done.n, 1, "{:?}", star.rows);
+    assert_eq!(text(&star.rows[0], "end.title"), "M3");
+
+    let rev = db
+        .run(&format!(
+            r#"docs | id == "{c}" | match <-wikilink- src | {{ src.title }}"#
+        ))
+        .unwrap();
+    assert!(
+        rev.rows.iter().any(|r| text(r, "src.title") == "M2"),
+        "{:?}",
+        rev.rows
+    );
+
+    let edge = db
+        .run(&format!(
+            r#"docs | id == "{a}" | match -[e:wikilink]-> b | {{ e.from, e.to, b.title }}"#
+        ))
+        .unwrap();
+    assert_eq!(edge.done.n, 1, "{:?}", edge.rows);
+    assert_eq!(text(&edge.rows[0], "e.from"), a);
+    assert_eq!(text(&edge.rows[0], "e.to"), b);
+    assert_eq!(text(&edge.rows[0], "b.title"), "M2");
 }
 
 #[test]

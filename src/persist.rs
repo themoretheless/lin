@@ -55,13 +55,30 @@ pub enum Pack {
         row: Row,
         edges: Vec<Edge>,
     },
+    /// One durable record for many inserts (avoids Batch-of-N JSON tax).
+    InsertBulk {
+        collection: String,
+        rows: Vec<Row>,
+        edges: Vec<Edge>,
+    },
     AppendFact {
         row: Row,
+    },
+    /// Columnar facts — far denser than N× `{s,p,o}` Cell maps.
+    AppendFactsBulk {
+        s: Vec<String>,
+        p: Vec<String>,
+        o: Vec<String>,
     },
     AppendEdge {
         rel: String,
         from: String,
         to: String,
+    },
+    AppendEdgesBulk {
+        rel: Vec<String>,
+        from: Vec<String>,
+        to: Vec<String>,
     },
     Update {
         collection: String,
@@ -181,6 +198,16 @@ pub fn write_head(dir: &Path, head: &Head) -> Result<(), Error> {
     atomic_write(&head_path(dir), &bytes)
 }
 
+/// Update `head` without fsync — log is authoritative; head is refreshed durably on snapshot/close.
+pub fn write_head_soft(dir: &Path, head: &Head) -> Result<(), Error> {
+    let bytes = serde_json::to_vec(head).map_err(io_err)?;
+    let path = head_path(dir);
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, &bytes).map_err(io_err)?;
+    fs::rename(&tmp, &path).map_err(io_err)?;
+    Ok(())
+}
+
 pub fn read_snapshot(dir: &Path) -> Result<Option<Snapshot>, Error> {
     let path = snapshot_path(dir);
     if !path.exists() {
@@ -199,6 +226,25 @@ pub fn read_snapshot(dir: &Path) -> Result<Option<Snapshot>, Error> {
 pub fn write_snapshot(dir: &Path, snap: &Snapshot) -> Result<(), Error> {
     let bytes = serde_json::to_vec(snap).map_err(io_err)?;
     atomic_write(&snapshot_path(dir), &bytes)
+}
+
+/// Portable backup file (same JSON shape as on-disk `snapshot`, any path).
+pub fn write_backup(path: &Path, snap: &Snapshot) -> Result<(), Error> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).map_err(io_err)?;
+    }
+    let bytes = serde_json::to_vec(snap).map_err(io_err)?;
+    atomic_write(path, &bytes)
+}
+
+pub fn read_backup(path: &Path) -> Result<Snapshot, Error> {
+    let bytes = fs::read(path).map_err(io_err)?;
+    if bytes.is_empty() {
+        return Err(io_err("empty backup"));
+    }
+    serde_json::from_slice(&bytes).map_err(io_err)
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), Error> {
@@ -230,7 +276,8 @@ pub fn open_log(dir: &Path) -> Result<File, Error> {
         .map_err(io_err)
 }
 
-/// Append one record and `fsync` the log file. Must complete before `gen` bumps.
+/// Append one record and durability-flush the log. Must complete before `gen` bumps.
+/// Uses `sync_data` (content) rather than full `sync_all` — head/metadata catch up on checkpoint.
 pub fn append_record(log: &mut File, rec: &LogRecord) -> Result<(), Error> {
     let payload = serde_json::to_vec(rec).map_err(io_err)?;
     if payload.len() > MAX_RECORD as usize {
@@ -239,7 +286,8 @@ pub fn append_record(log: &mut File, rec: &LogRecord) -> Result<(), Error> {
     let len = payload.len() as u32;
     log.write_all(&len.to_le_bytes()).map_err(io_err)?;
     log.write_all(&payload).map_err(io_err)?;
-    log.sync_all().map_err(io_err)?;
+    // Data durability without forcing inode metadata on every pack.
+    log.sync_data().map_err(io_err)?;
     Ok(())
 }
 

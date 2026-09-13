@@ -620,6 +620,308 @@ fn fill_mysql(conn: &mut mysql::Conn, n: usize) {
     tx.commit().expect("mysql commit");
 }
 
+/// Append-only log lines (Lin `append facts` vs SQL `INSERT INTO logs`).
+fn lin_append_log_src(n: usize) -> String {
+    let mut out = String::from("append facts [\n");
+    for i in 0..n {
+        if i > 0 {
+            out.push_str(",\n");
+        }
+        out.push_str(&format!(
+            r#"  {{ s: "log-{i}", p: tagged, o: "msg {i} wal event" }}"#
+        ));
+    }
+    out.push_str("\n]");
+    out
+}
+
+struct LinAppendLog {
+    db: lin::Db,
+    prepared: lin::Prepared,
+}
+
+fn setup_lin_append_log(n: usize) -> LinAppendLog {
+    let mut db = lin::Db::empty();
+    let prepared = db
+        .prepare(&lin_append_log_src(n))
+        .expect("lin prepare append facts");
+    LinAppendLog { db, prepared }
+}
+
+fn fill_lin_append_log(ins: &mut LinAppendLog) {
+    ins.prepared.run(&mut ins.db).expect("lin append facts");
+}
+
+/// Temp dir kept alive for the timed durable run.
+struct TmpKeep(std::path::PathBuf);
+
+impl Drop for TmpKeep {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn fresh_tmp(label: &str) -> TmpKeep {
+    let p = std::env::temp_dir().join(format!(
+        "lin-bench-{label}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&p);
+    std::fs::create_dir_all(&p).expect("tmpdir");
+    TmpKeep(p)
+}
+
+struct LinDurableAppend {
+    _dir: TmpKeep,
+    db: lin::Db,
+    prepared: lin::Prepared,
+}
+
+fn setup_lin_durable_append(n: usize) -> LinDurableAppend {
+    let dir = fresh_tmp("append");
+    let mut db = lin::Db::open(&dir.0).expect("lin durable open");
+    let prepared = db
+        .prepare(&lin_append_log_src(n))
+        .expect("lin prepare durable append");
+    LinDurableAppend {
+        _dir: dir,
+        db,
+        prepared,
+    }
+}
+
+fn fill_lin_durable_append(ins: &mut LinDurableAppend) {
+    ins.prepared.run(&mut ins.db).expect("lin durable append");
+}
+
+struct LinDurableInsert {
+    _dir: TmpKeep,
+    db: lin::Db,
+    prepared: lin::Prepared,
+}
+
+fn setup_lin_durable_insert(n: usize) -> LinDurableInsert {
+    let dir = fresh_tmp("insert");
+    let mut db = lin::Db::open(&dir.0).expect("lin durable open");
+    db.run("index docs [wing, ts]").expect("lin index");
+    let prepared = db
+        .prepare(&lin_insert_src(&docs(n)))
+        .expect("lin prepare durable insert");
+    LinDurableInsert {
+        _dir: dir,
+        db,
+        prepared,
+    }
+}
+
+fn fill_lin_durable_insert(ins: &mut LinDurableInsert) {
+    ins.prepared.run(&mut ins.db).expect("lin durable insert");
+}
+
+struct SqliteDurable {
+    _dir: TmpKeep,
+    conn: rusqlite::Connection,
+    n: usize,
+    kind: &'static str,
+}
+
+fn setup_sqlite_durable(kind: &'static str, n: usize) -> SqliteDurable {
+    let dir = fresh_tmp("sqlite");
+    let path = dir.0.join("db.sqlite");
+    let conn = rusqlite::Connection::open(&path).expect("sqlite open");
+    conn.execute_batch(
+        "PRAGMA synchronous = FULL;
+         PRAGMA journal_mode = DELETE;",
+    )
+    .expect("sqlite pragma");
+    match kind {
+        "logs" => {
+            conn.execute_batch(
+                "CREATE TABLE logs (
+                    id TEXT PRIMARY KEY,
+                    ts INTEGER NOT NULL,
+                    msg TEXT NOT NULL
+                 );",
+            )
+            .expect("sqlite logs");
+        }
+        _ => {
+            conn.execute_batch(
+                "CREATE TABLE docs (
+                    id TEXT PRIMARY KEY,
+                    uri TEXT UNIQUE NOT NULL,
+                    wing TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    ts INTEGER NOT NULL,
+                    body TEXT NOT NULL
+                 );
+                 CREATE INDEX docs_wing_ts ON docs(wing, ts);",
+            )
+            .expect("sqlite docs");
+        }
+    }
+    SqliteDurable {
+        _dir: dir,
+        conn,
+        n,
+        kind,
+    }
+}
+
+fn fill_sqlite_durable(s: &mut SqliteDurable) {
+    match s.kind {
+        "logs" => fill_sqlite_logs(&s.conn, s.n),
+        _ => fill_sqlite(&s.conn, s.n),
+    }
+}
+
+fn empty_sqlite_logs() -> rusqlite::Connection {
+    let conn = rusqlite::Connection::open_in_memory().expect("sqlite open");
+    conn.execute_batch(
+        "CREATE TABLE logs (
+            id TEXT PRIMARY KEY,
+            ts INTEGER NOT NULL,
+            msg TEXT NOT NULL
+         );",
+    )
+    .expect("sqlite logs schema");
+    conn
+}
+
+fn empty_duck_logs() -> duckdb::Connection {
+    let conn = duckdb::Connection::open_in_memory().expect("duck open");
+    conn.execute_batch(
+        "CREATE TABLE logs (
+            id VARCHAR PRIMARY KEY,
+            ts BIGINT NOT NULL,
+            msg VARCHAR NOT NULL
+         );",
+    )
+    .expect("duck logs schema");
+    conn
+}
+
+fn empty_pg_logs(url: String) -> postgres::Client {
+    let mut client = try_pg_client(&url).expect("pg reconnect");
+    client
+        .batch_execute(
+            "DROP TABLE IF EXISTS logs_bulk;
+             CREATE TABLE logs_bulk (
+                id TEXT PRIMARY KEY,
+                ts BIGINT NOT NULL,
+                msg TEXT NOT NULL
+             );",
+        )
+        .expect("pg logs schema");
+    client
+}
+
+fn empty_mysql_logs(url: String) -> mysql::Conn {
+    let mut conn = try_mysql_conn(&url).expect("mysql reconnect");
+    conn.query_drop("DROP TABLE IF EXISTS logs_bulk")
+        .expect("mysql drop logs");
+    conn.query_drop(
+        "CREATE TABLE logs_bulk (
+            id VARCHAR(64) PRIMARY KEY,
+            ts BIGINT NOT NULL,
+            msg TEXT NOT NULL
+         ) ENGINE=InnoDB",
+    )
+    .expect("mysql logs schema");
+    conn
+}
+
+fn fill_sqlite_logs(conn: &rusqlite::Connection, n: usize) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let tx = conn.unchecked_transaction().expect("sqlite tx");
+    {
+        let mut stmt = tx
+            .prepare("INSERT INTO logs (id, ts, msg) VALUES (?1, ?2, ?3)")
+            .expect("sqlite prep");
+        for i in 0..n {
+            stmt.execute(rusqlite::params![
+                format!("log-{i}"),
+                now + i as i64,
+                format!("msg {i} wal event")
+            ])
+            .expect("sqlite log insert");
+        }
+    }
+    tx.commit().expect("sqlite commit");
+}
+
+fn fill_duck_logs(conn: &duckdb::Connection, n: usize) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let mut app = conn.appender("logs").expect("duck appender");
+    for i in 0..n {
+        app.append_row(duckdb::params![
+            format!("log-{i}"),
+            now + i as i64,
+            format!("msg {i} wal event")
+        ])
+        .expect("duck log insert");
+    }
+    drop(app);
+}
+
+fn fill_pg_logs(client: &mut postgres::Client, n: usize) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let mut tx = client.transaction().expect("pg tx");
+    let stmt = tx
+        .prepare("INSERT INTO logs_bulk (id, ts, msg) VALUES ($1, $2, $3)")
+        .expect("pg prep");
+    for i in 0..n {
+        tx.execute(
+            &stmt,
+            &[
+                &format!("log-{i}"),
+                &(now + i as i64),
+                &format!("msg {i} wal event"),
+            ],
+        )
+        .expect("pg log insert");
+    }
+    tx.commit().expect("pg commit");
+}
+
+fn fill_mysql_logs(conn: &mut mysql::Conn, n: usize) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let mut tx = conn
+        .start_transaction(mysql::TxOpts::default())
+        .expect("mysql tx");
+    let stmt = tx
+        .prep("INSERT INTO logs_bulk (id, ts, msg) VALUES (?, ?, ?)")
+        .expect("mysql prep");
+    for i in 0..n {
+        tx.exec_drop(
+            &stmt,
+            (
+                format!("log-{i}"),
+                now + i as i64,
+                format!("msg {i} wal event"),
+            ),
+        )
+        .expect("mysql log insert");
+    }
+    tx.commit().expect("mysql commit");
+}
+
 fn main() -> rbench::Result<()> {
     let pg = connect_pg();
     let mysql = connect_mysql();
@@ -643,7 +945,8 @@ fn main() -> rbench::Result<()> {
          engines: {engines}\n\
          Lin reads: prepare once / run many; filters use count (fair vs SQL COUNT(*));\n\
          substring: Lin `title ~ \"wal\"` vs SQL LIKE '%wal%';\n\
-         materialize: Lin `wing==rag | {{id,title}} | take all` vs SQL SELECT id,title"
+         materialize: Lin `wing==rag | {{id,title}} | take all` vs SQL SELECT id,title;\n\
+         append_log: Lin `append facts` vs SQL INSERT INTO logs (append-only shape)"
     );
 
     let mut suite = Suite::new("compare");
@@ -1083,6 +1386,125 @@ fn main() -> rbench::Result<()> {
     }
     insert_bulk!("1k", INSERT_1K);
     insert_bulk!("10k", INSERT_10K);
+
+    macro_rules! append_log {
+        ($label:expr, $n:expr) => {{
+            let n = $n;
+            suite
+                .bench_with_input(
+                    &format!("append_log_{}/lin", $label),
+                    move || setup_lin_append_log(n),
+                    move |ins| fill_lin_append_log(ins),
+                    DropPolicy::InsideTiming,
+                )
+                .tag("append_log")
+                .tag("lin")
+                .parameter("rows", n)
+                .work_units("rows", n as u64);
+            suite
+                .bench_with_input(
+                    &format!("append_log_{}/sqlite", $label),
+                    empty_sqlite_logs,
+                    move |conn| fill_sqlite_logs(conn, n),
+                    DropPolicy::InsideTiming,
+                )
+                .tag("append_log")
+                .tag("sqlite")
+                .parameter("rows", n)
+                .work_units("rows", n as u64);
+            suite
+                .bench_with_input(
+                    &format!("append_log_{}/duckdb", $label),
+                    empty_duck_logs,
+                    move |conn| fill_duck_logs(conn, n),
+                    DropPolicy::InsideTiming,
+                )
+                .tag("append_log")
+                .tag("duckdb")
+                .parameter("rows", n)
+                .work_units("rows", n as u64);
+            if let Some(url) = pg_url.clone() {
+                suite
+                    .bench_with_input(
+                        &format!("append_log_{}/postgres", $label),
+                        move || empty_pg_logs(url.clone()),
+                        move |client| fill_pg_logs(client, n),
+                        DropPolicy::InsideTiming,
+                    )
+                    .tag("append_log")
+                    .tag("postgres")
+                    .parameter("rows", n)
+                    .work_units("rows", n as u64);
+            }
+            if let Some(url) = mysql_url.clone() {
+                suite
+                    .bench_with_input(
+                        &format!("append_log_{}/mysql", $label),
+                        move || empty_mysql_logs(url.clone()),
+                        move |conn| fill_mysql_logs(conn, n),
+                        DropPolicy::InsideTiming,
+                    )
+                    .tag("append_log")
+                    .tag("mysql")
+                    .parameter("rows", n)
+                    .work_units("rows", n as u64);
+            }
+        }};
+    }
+    append_log!("1k", INSERT_1K);
+    append_log!("10k", INSERT_10K);
+
+    // Durable path: Lin WAL sync_data vs SQLite synchronous=FULL (same machine, temp files).
+    for (label, n) in [("1k", INSERT_1K), ("10k", INSERT_10K)] {
+        suite
+            .bench_with_input(
+                &format!("durable_append_{label}/lin"),
+                move || setup_lin_durable_append(n),
+                move |ins| fill_lin_durable_append(ins),
+                DropPolicy::InsideTiming,
+            )
+            .tag("durable")
+            .tag("append_log")
+            .tag("lin")
+            .parameter("rows", n)
+            .work_units("rows", n as u64);
+        suite
+            .bench_with_input(
+                &format!("durable_append_{label}/sqlite"),
+                move || setup_sqlite_durable("logs", n),
+                move |s| fill_sqlite_durable(s),
+                DropPolicy::InsideTiming,
+            )
+            .tag("durable")
+            .tag("append_log")
+            .tag("sqlite")
+            .parameter("rows", n)
+            .work_units("rows", n as u64);
+        suite
+            .bench_with_input(
+                &format!("durable_insert_{label}/lin"),
+                move || setup_lin_durable_insert(n),
+                move |ins| fill_lin_durable_insert(ins),
+                DropPolicy::InsideTiming,
+            )
+            .tag("durable")
+            .tag("insert")
+            .tag("lin")
+            .parameter("rows", n)
+            .work_units("rows", n as u64);
+        suite
+            .bench_with_input(
+                &format!("durable_insert_{label}/sqlite"),
+                move || setup_sqlite_durable("docs", n),
+                move |s| fill_sqlite_durable(s),
+                DropPolicy::InsideTiming,
+            )
+            .tag("durable")
+            .tag("insert")
+            .tag("sqlite")
+            .parameter("rows", n)
+            .work_units("rows", n as u64);
+    }
 
     let args: Vec<String> = std::env::args()
         .skip(1)

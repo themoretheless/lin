@@ -64,13 +64,20 @@ impl LiveIndex {
     /// Append-only bulk path: no reverse-key replace (fresh indices).
     pub fn insert_at_new(&mut self, idx: usize, row: &Row) -> Result<(), String> {
         let key = self.key_of(row);
-        if self.def.unique
-            && self.forward.contains_key(&key)
-        {
+        if self.def.unique && self.forward.contains_key(&key) {
             return Err(format!("unique index {}: duplicate key", self.def.label()));
         }
-        self.reverse.insert(idx, key.clone());
-        self.forward.entry(key).or_default().push(idx);
+        use std::collections::btree_map::Entry;
+        match self.forward.entry(key) {
+            Entry::Vacant(v) => {
+                self.reverse.insert(idx, v.key().clone());
+                v.insert(vec![idx]);
+            }
+            Entry::Occupied(mut o) => {
+                self.reverse.insert(idx, o.key().clone());
+                o.get_mut().push(idx);
+            }
+        }
         Ok(())
     }
 

@@ -350,10 +350,27 @@ fn check_query(q: &Query, cat: &Catalog, env: &Bindings) -> Result<Scope, Error>
                     if cat.rel(&h.rel).is_none() {
                         return Err(Error::new(format!("unknown rel: {}", h.rel)));
                     }
+                    if h.min_depth < 1 {
+                        return Err(Error::new("match depth must be ≥ 1"));
+                    }
+                    if h.max_depth > 3 {
+                        return Err(Error::new("match depth max 3"));
+                    }
+                    if h.min_depth > h.max_depth {
+                        return Err(Error::new("match depth min > max"));
+                    }
+                    if h.edge.is_some() && (h.min_depth != 1 || h.max_depth != 1) {
+                        return Err(Error::new("edge bind requires depth 1"));
+                    }
+                    if let Some(e) = &h.edge {
+                        if !names.insert(e.clone()) {
+                            return Err(Error::new(format!("duplicate match bind: {e}")));
+                        }
+                        scope.add_edge_bind(e);
+                    }
                     if !names.insert(h.bind.clone()) {
                         return Err(Error::new(format!("duplicate match bind: {}", h.bind)));
                     }
-                    // Path nodes resolve like hop → docs (or current primary).
                     let node_col = if cat.collection("docs").is_some() {
                         "docs".to_string()
                     } else {
@@ -677,6 +694,12 @@ impl Scope {
             self.fields.insert(format!("{bind}.{name}"), info.ty);
         }
         Ok(())
+    }
+
+    fn add_edge_bind(&mut self, bind: &str) {
+        self.fields.insert(format!("{bind}.rel"), Type::Rel);
+        self.fields.insert(format!("{bind}.from"), Type::Text);
+        self.fields.insert(format!("{bind}.to"), Type::Text);
     }
 
     fn agg(primary: &str, by: &str, metric_ty: Type, metric: &str) -> Self {

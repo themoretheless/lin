@@ -2,7 +2,13 @@
 
 Lin — язык своей локальной БД: пайпы, типизированный каталог, два мира записи (`append` / reducer), свой план. Не SQL и не Kusto.
 
-Сейчас есть парсер, typecheck, IR плана, in-memory store (один reducer, один `gen`) и исполнитель. DuckDB, IDB и WASM в этом milestone нет.
+**0.2** — встраиваемый локальный прототип с durable `--data`, backup export/import и честным lex-search. Не multi-writer / не сеть.
+
+Сейчас есть парсер, typecheck, IR плана, in-memory store (один reducer, один `gen`), исполнитель, WAL+snapshot, `backup` CLI. DuckDB/IDB/WASM backends в этом milestone нет. Векторный search в плане не обещается: `search` → lex (`hybrid→lex (no embedder)`).
+
+## Стабильный API (0.2)
+
+Публичный контракт: `Db::{empty,fixture,open,close,run,prepare,explain_as,export_backup,import_backup,import_backup_into,stats}`, плюс `parse` / `compile` / `run` / `explain*`, типы `Handle` / `Done` / `Prepared` / `Error` / `Row` / `Cell` / `Store` / `Plan` / `Stats` / `VERSION`.
 
 ## Лаконичный диалект
 
@@ -19,6 +25,9 @@ docs | hop wikilink | { id, title }
 docs | id == "…" | graph wikilink depth=2 | { rel, from, to }
 docs | id == "…" | match -wikilink-> b | { id, b.title }
 docs | id == "…" | match a -wikilink-> b -wikilink-> c | { a.title, b.title, c.title }
+docs | id == "…" | match -wikilink*1..2-> b | { b.title }
+docs | id == "…" | match <-wikilink- src | { src.title }
+docs | id == "…" | match -[e:wikilink]-> b | { e.from, e.to, b.title }
 docs | search "wal" | take 20
 docs | { id } | union orders | { id }
 let x = docs | wing == "rag" | { id }
@@ -49,7 +58,7 @@ col notes { title: text }
 rel cites
 ```
 
-`union` — совместимые столбцы по имени после последней проекции каждой стороны. `hop` — узлы по ребру (depth 1..=3). `graph` — те же обход и лимиты, но строки рёбер `{ rel, from, to }` (после шага scope = edges). `match` — pattern path: `-rel-> bind` (до 3 hops), узлы как `bind.field` (как join); опционально `match a -rel-> b`. `let` — только чтение, не запись. Несколько `append`/`insert`/`delete`/`update` в одной строке `run()` — один пакет, один `gen` (или ничего); запросы после записи видят новое состояние; любая ошибка откатывает всё. Список в `insert`/`append` — один `InsertPack`/`Append`, один `gen`. `cas each` читает hash каждой строки на старте пакета и CAS-ит все; смена mid-pack откатывает всё. `update`/`delete` без `cas` / `cas each` — ошибка. Пустой `[]` — ошибка. `with edge` на списке insert запрещён. `col` / `rel` / `index` создают живую коллекцию/ребро/индекс в store.
+`union` — совместимые столбцы по имени после последней проекции каждой стороны. `hop` — узлы по ребру (depth 1..=3). `graph` — те же обход и лимиты, но строки рёбер `{ rel, from, to }` (после шага scope = edges). `match` — path pattern: `-rel-> bind`, `<-rel- bind`, `-rel*1..3-> bind`, `-[e:rel]-> bind` (до 3 hops, depth ≤3; edge bind только при depth 1). Узлы как `bind.field`, ребро как `e.rel`/`from`/`to`. `let` — только чтение, не запись. Несколько `append`/`insert`/`delete`/`update` в одной строке `run()` — один пакет, один `gen` (или ничего); запросы после записи видят новое состояние; любая ошибка откатывает всё. Список в `insert`/`append` — один `InsertPack`/`Append`, один `gen`. `cas each` читает hash каждой строки на старте пакета и CAS-ит все; смена mid-pack откатывает всё. `update`/`delete` без `cas` / `cas each` — ошибка. Пустой `[]` — ошибка. `with edge` на списке insert запрещён. `col` / `rel` / `index` создают живую коллекцию/ребро/индекс в store.
 
 Составной индекс: порядок полей = leftmost prefix. `wing == "rag" and ts > ago 7d` по `[wing,ts]` — `IndexSeek index=docs[wing,ts]` (равенство слева + range на следующем). Только `wing ==` — тот же индекс. Только `ts >` — scan, leftmost не закрыт. `id ==` остаётся `Get`. `wing == "rag" or wing == "sys"` — несколько seek по индексу и объединение; если хоть одна ветка `or` не индексируется — scan.
 
@@ -57,7 +66,17 @@ rel cites
 
 Запись — отдельный statement, не хвост пайпа. Неизвестный столбец, hop без `rel`, join без `fk`, `update` без `cas` — ошибка компиляции.
 
-Неявный `take 50`. Hybrid search в плане показывает RRF; исполнитель без эмбеддера идёт только lex-путём (векторные скоры не подделываются). `embed_id=nomic-embed-text/768`.
+Неявный `take 50`. `search` / `search hybrid` исполняются **только lex** (эмбеддера нет); в explain: `Search lex` + `hybrid→lex (no embedder)`. `search vec` планируется, но возвращает пусто. `embed_id=nomic-embed-text/768` — метка каталога, не живой embedder.
+
+## Roadmap (кратко)
+
+| Фаза | Статус |
+|---|---|
+| P0 semver 0.2 + честный search | **сейчас** |
+| P1 backup export/import + stats | **сейчас** |
+| P1 multi-reader / compaction | дальше |
+| P2 mmap/cold + quotas | позже |
+| P3 сеть / MVCC | другой продукт |
 
 ## Бенчмарки (rbench): Lin vs SQLite vs DuckDB vs Postgres vs MySQL
 
@@ -70,15 +89,16 @@ cargo bench --bench compare -- --list
 # быстрый прогон (нужен --release; rbench отказывается от debug)
 cargo bench --bench compare -- --profile quick
 
-# только point get / только insert
+# только point get / только insert / только append_log
 cargo bench --bench compare -- --filter point_get
 cargo bench --bench compare -- --filter insert_bulk_1k --samples 8
+cargo bench --bench compare -- --profile quick --filter append_log
 ```
 
 Движки: **Lin**, **SQLite** (`rusqlite` bundled), **DuckDB** (bundled; собирается на mac aarch64), **Postgres** / **MySQL** (опционально, через URL), плюс **HashMap** только для point get. N=10 000 для тёплых чтений (fixture; setup вне тайминга). Bulk insert: схема/индекс в setup, в тайминге только запись.
 
-Сравнимо: point get по id, `wing ==`, range `wing`+`ts`, substring (`title ~ "wal"` ≈ `LIKE '%wal%'`), materialize `SELECT id,title`, bulk insert 1k/10k.  
-Не сравниваем здесь (и не подтасовываем): Lin `hop`, hybrid `search`/RRF, CAS — у SQL-пиров нет прямого аналога в этом бенче.
+Сравнимо: point get по id, `wing ==`, range `wing`+`ts`, substring (`title ~ "wal"` ≈ `LIKE '%wal%'`), materialize `SELECT id,title`, bulk insert 1k/10k, **append_log** (`append facts` vs `INSERT INTO logs`) 1k/10k.  
+Не сравниваем здесь (и не подтасовываем): Lin `hop`/`match`, real vec/hybrid, CAS, durable fsync (`--data`) — отдельный слой.
 
 ### Postgres / MySQL
 
@@ -124,7 +144,17 @@ cargo run -- run - < batch.lin
 
 То же в языке: `| explain graph` (Mermaid) и `| explain dot` (Graphviz). `| explain run` после исполнения пишет фактические `rows`/`ms`.
 
-CLI: `lin run '<запрос>'` печатает строки и `gen`. `lin run --file batch.lin` и `lin run -` читают программу из файла / stdin. `lin explain '<запрос>'` печатает план или ошибку компиляции. `lin --data .lin run '…'` пишет в каталог данных.
+CLI: `lin run '<запрос>'` печатает строки и `gen`. `lin run --file batch.lin` и `lin run -` читают программу из файла / stdin. `lin explain '<запрос>'` печатает план или ошибку компиляции. `lin --data .lin run '…'` пишет в каталог данных. `lin backup export|import`, `lin stats`, `lin version`.
+
+## Backup
+
+```bash
+lin --data .lin backup export /tmp/lin-bak.json
+lin backup import /tmp/lin-bak.json --data .lin2
+lin --data .lin2 stats
+```
+
+Формат — JSON snapshot (collections + edges + gen). Export перед записью делает checkpoint, если store durable.
 
 ## Данные на диске
 
@@ -139,7 +169,7 @@ CLI: `lin run '<запрос>'` печатает строки и `gen`. `lin run
   snapshot   опциональный чекпоинт всего store (после 32 записей или close)
 ```
 
-Пакет лога: `{"gen":N,"next_id":N,"pack":{"type":"insert"|"append_fact"|"append_edge"|"update"|"reembed"|"delete"|"delete_edge"|"schema_col"|"schema_rel"|"schema_index"|"batch",…}}`. Ячейки: `{"t":"Text","v":"…"}`. Обрезанная последняя запись лога игнорируется; при открытии лог обрезается до последнего целого фрейма. `insert … with edge` кладёт рёбра в тот же пакет. Несколько записей в одном `run()` или bulk-список — один `batch`. Индекс живёт в `schema_index` + snapshot `extra_indexes`; при open пересобирается.
+Пакет лога: `{"gen":N,"next_id":N,"pack":{"type":"insert"|"insert_bulk"|"append_fact"|"append_facts_bulk"|"append_edge"|"append_edges_bulk"|…}}`. Ячейки: `{"t":"Text","v":"…"}`. Bulk-формы пишут один record вместо Batch-of-N. Обрезанная последняя запись лога игнорируется; при открытии лог обрезается до последнего целого фрейма. `insert … with edge` кладёт рёбра в тот же пакет. Несколько записей в одном `run()` или bulk-список — один `batch` / `*_bulk`. Индекс живёт в `schema_index` + snapshot `extra_indexes`; при open пересобирается.
 
 ## Как смотреть граф
 

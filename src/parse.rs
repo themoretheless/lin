@@ -494,37 +494,99 @@ impl<'a> Parser<'a> {
         Err(self.err("expected a named step or a predicate after `|`"))
     }
 
-    /// `match [-rel-> bind]+` or `match start -rel-> bind …`
+    /// `match` path: `-rel-> b`, `<-rel- b`, `-rel*1..3-> b`, `-[e:rel]-> b`.
     fn parse_match_step(&mut self) -> Result<Step, Error> {
         self.skip();
-        let start = if self.peek() != Some('-') {
-            let name = self.expect_ident()?;
-            self.skip();
-            if self.peek() != Some('-') {
-                return Err(self.err("expected `-rel->` after match start"));
+        let start = match self.peek() {
+            Some('-') | Some('<') => None,
+            Some(c) if is_ident_start(c) => {
+                let name = self.expect_ident()?;
+                self.skip();
+                match self.peek() {
+                    Some('-') | Some('<') => Some(name),
+                    _ => {
+                        return Err(self.err("expected `-rel->` or `<-rel-` after match start"));
+                    }
+                }
             }
-            Some(name)
-        } else {
-            None
+            _ => {
+                return Err(self.err("expected match path `-rel-> bind`"));
+            }
         };
         let mut hops = Vec::new();
         loop {
             self.skip();
-            if self.peek() != Some('-') {
-                break;
+            match self.peek() {
+                Some('-') | Some('<') => hops.push(self.parse_match_hop()?),
+                _ => break,
             }
-            self.bump();
-            let rel = self.expect_ident()?;
-            if !self.eat_op("->") {
-                return Err(self.err("expected `->` in match hop"));
-            }
-            let bind = self.expect_ident()?;
-            hops.push(MatchHop { rel, bind });
         }
         if hops.is_empty() {
-            return Err(self.err("match requires at least one `-rel-> bind`"));
+            return Err(self.err("match requires at least one hop"));
         }
         Ok(Step::Match { start, hops })
+    }
+
+    fn parse_match_hop(&mut self) -> Result<MatchHop, Error> {
+        self.skip();
+        let reverse = if self.eat_op("<-") {
+            true
+        } else if self.eat_char('-') {
+            false
+        } else {
+            return Err(self.err("expected `-` or `<-` in match hop"));
+        };
+
+        let (edge, rel, min_depth, max_depth) = if self.eat_char('[') {
+            let edge = {
+                let id = self.expect_ident()?;
+                self.expect_char(':')?;
+                Some(id)
+            };
+            let rel = self.expect_ident()?;
+            let (min_depth, max_depth) = self.parse_match_star()?;
+            self.expect_char(']')?;
+            (edge, rel, min_depth, max_depth)
+        } else {
+            let rel = self.expect_ident()?;
+            let (min_depth, max_depth) = self.parse_match_star()?;
+            (None, rel, min_depth, max_depth)
+        };
+
+        if reverse {
+            // `<-rel-` / `<-[e:rel]-` — trailing `-` (already consumed `[...]` / rel)
+            if !self.eat_char('-') {
+                return Err(self.err("expected trailing `-` after reverse match hop"));
+            }
+        } else if !self.eat_op("->") {
+            return Err(self.err("expected `->` in match hop"));
+        }
+
+        let bind = self.expect_ident()?;
+        Ok(MatchHop {
+            rel,
+            bind,
+            edge,
+            reverse,
+            min_depth,
+            max_depth,
+        })
+    }
+
+    /// Optional `*N` or `*N..M` after rel.
+    fn parse_match_star(&mut self) -> Result<(i64, i64), Error> {
+        self.skip();
+        if !self.eat_char('*') {
+            return Ok((1, 1));
+        }
+        let min = self.expect_int()?;
+        self.skip();
+        if self.eat_op("..") {
+            let max = self.expect_int()?;
+            Ok((min, max))
+        } else {
+            Ok((min, min))
+        }
     }
 
     fn starts_pred(&self) -> bool {

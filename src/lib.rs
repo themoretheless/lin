@@ -1,3 +1,23 @@
+//! # Lin 0.2 — local pipe database
+//!
+//! ## Stable public API (0.2 freeze)
+//!
+//! Prefer these entry points; treat other `pub` items as evolving:
+//! - [`Db`]: [`Db::empty`], [`Db::fixture`], [`Db::open`], [`Db::close`],
+//!   [`Db::run`], [`Db::prepare`], [`Db::explain_as`],
+//!   [`Db::export_backup`], [`Db::import_backup`], [`Db::stats`]
+//! - Free functions: [`parse`], [`compile`], [`run`], [`explain`], [`explain_as`]
+//! - Types: [`Handle`], [`Done`], [`Prepared`], [`Error`], [`Row`], [`Cell`], [`Store`], [`Plan`], [`Stats`]
+//!
+//! Semver: breaking changes to the list above require a major bump after 1.0;
+//! until then minors may still adjust experimental surfaces (`Stmt`, plan IR).
+//!
+//! ## Search honesty
+//!
+//! Default `search` is **lex-only** in this build (no embedder). Plans show
+//! `Search lex` with note `hybrid→lex (no embedder)`. Explicit `search vec`
+//! plans as vec but returns no rows until an embedder is wired.
+
 mod ast;
 mod catalog;
 mod check;
@@ -15,10 +35,13 @@ use std::cell::RefCell;
 
 pub use ast::{ExplainKind, Stmt};
 pub use error::Error;
-pub use exec::{Db, Done, Handle, Prepared};
+pub use exec::{Db, Done, Handle, Prepared, Stats};
 pub use graph::GraphFmt;
 pub use plan::Plan;
 pub use store::{Cell, Row, Store};
+
+/// Crate version string (same as `CARGO_PKG_VERSION`).
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 thread_local! {
     static DEFAULT_DB: RefCell<Db> = RefCell::new(Db::fixture());

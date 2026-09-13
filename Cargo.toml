@@ -1,10 +1,11 @@
 [package]
 name = "lin"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Lin — язык локальной БД: пайпы, каталог, свой план"
 license = "MIT"
+readme = "README.md"
 
 [[bin]]
 name = "lin"
@@ -18,7 +19,7 @@ serde = { version = "1.0.229", features = ["derive", "rc"] }
 serde_json = "1.0.151"
 
 [dev-dependencies]
-rbench = { path = "../airbug/bench" }
+rbench = { package = "airbug-bench", path = "../airbug/bench" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 duckdb = { version = "1.10505.0", features = ["bundled"] }
 postgres = "0.19"

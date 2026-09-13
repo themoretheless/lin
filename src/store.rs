@@ -109,6 +109,10 @@ pub struct Store {
     by_id: BTreeMap<String, FxHashMap<String, usize>>,
     /// docs uri → row index.
     docs_by_uri: FxHashMap<String, usize>,
+    /// facts (s,p,o) → row index — O(1) append idempotency.
+    pub(crate) facts_by_spo: FxHashMap<(Arc<str>, Arc<str>, Arc<str>), usize>,
+    /// edge (rel,from,to) set — O(1) append/delete edge.
+    pub(crate) edge_keys: FxHashSet<(Arc<str>, Arc<str>, Arc<str>)>,
     /// Parallel Arc columns for docs — contains scans + projected materialize
     /// without cloning full `BTreeMap` rows.
     docs_id: Vec<Arc<str>>,
@@ -144,6 +148,8 @@ impl Store {
             indexes: BTreeMap::new(),
             by_id: BTreeMap::new(),
             docs_by_uri: FxHashMap::default(),
+            facts_by_spo: FxHashMap::default(),
+            edge_keys: FxHashSet::default(),
             docs_id: Vec::new(),
             docs_title: Vec::new(),
             docs_layer: Vec::new(),
@@ -230,7 +236,7 @@ impl Store {
         Ok(store)
     }
 
-    fn from_snapshot(s: &Snapshot) -> Self {
+    pub(crate) fn from_snapshot(s: &Snapshot) -> Self {
         let mut store = Self {
             r#gen: s.r#gen,
             embed_id: s.embed_id.clone(),
@@ -243,6 +249,8 @@ impl Store {
             indexes: BTreeMap::new(),
             by_id: BTreeMap::new(),
             docs_by_uri: FxHashMap::default(),
+            facts_by_spo: FxHashMap::default(),
+            edge_keys: FxHashSet::default(),
             docs_id: Vec::new(),
             docs_title: Vec::new(),
             docs_layer: Vec::new(),
@@ -255,6 +263,26 @@ impl Store {
         store.rebuild_indexes();
         store.rebuild_row_maps();
         store
+    }
+
+    /// Capture current memory image (for backup / checkpoint payload).
+    pub fn capture_snapshot(&self, catalog_hash: impl Into<String>) -> Snapshot {
+        Snapshot {
+            r#gen: self.r#gen,
+            embed_id: self.embed_id.clone(),
+            next_id: self.next_id,
+            catalog_hash: catalog_hash.into(),
+            log_offset: self
+                .persist
+                .as_ref()
+                .and_then(|p| p.log.metadata().ok().map(|m| m.len()))
+                .unwrap_or(0),
+            collections: self.collections.clone(),
+            edges: self.edges.clone(),
+            extra_collections: self.extra_collections.clone(),
+            extra_rels: self.extra_rels.clone(),
+            extra_indexes: self.extra_indexes.clone(),
+        }
     }
 
     pub fn merge_extras_into(&self, cat: &mut Catalog) {
@@ -311,7 +339,13 @@ impl Store {
         self.persist.is_some()
     }
 
-    /// Fsync one committed pack, then the caller bumps `gen`.
+    /// Force a durable checkpoint (snapshot + head fsync).
+    pub fn checkpoint(&mut self) -> Result<(), Error> {
+        self.write_snapshot()
+    }
+
+    /// Flush one committed pack to the log (data sync), then soft-update head.
+    /// Full head/snapshot fsync happens on checkpoint / close.
     pub fn durable_commit(&mut self, pack: &Pack) -> Result<(), Error> {
         let Some(p) = self.persist.as_mut() else {
             return Ok(());
@@ -322,7 +356,7 @@ impl Store {
             pack: pack.clone(),
         };
         persist::append_record(&mut p.log, &rec)?;
-        let _ = persist::write_head(
+        let _ = persist::write_head_soft(
             &p.dir,
             &Head {
                 r#gen: rec.r#gen,
@@ -351,6 +385,8 @@ impl Store {
             return Ok(());
         };
         let log_offset = p.log.metadata().map_err(persist::io_err)?.len();
+        // Ensure log content is fully durable before publishing snapshot/head.
+        p.log.sync_all().map_err(persist::io_err)?;
         let snap = Snapshot {
             r#gen: self.r#gen,
             embed_id: self.embed_id.clone(),
@@ -363,8 +399,17 @@ impl Store {
             extra_rels: self.extra_rels.clone(),
             extra_indexes: self.extra_indexes.clone(),
         };
-        persist::write_snapshot(&p.dir, &snap)?;
-        p.writes_since_snapshot = 0;
+        let head = Head {
+            r#gen: self.r#gen,
+            catalog_hash: p.catalog_hash.clone(),
+            embed_id: self.embed_id.clone(),
+        };
+        let dir = p.dir.clone();
+        persist::write_snapshot(&dir, &snap)?;
+        persist::write_head(&dir, &head)?;
+        if let Some(p) = self.persist.as_mut() {
+            p.writes_since_snapshot = 0;
+        }
         Ok(())
     }
 
@@ -386,42 +431,49 @@ impl Store {
                 self.row_maps_register(collection, idx);
                 let _ = self.index_insert_at(collection, idx);
                 for e in edges {
-                    if !self
-                        .edges
-                        .iter()
-                        .any(|x| x.rel == e.rel && x.from == e.from && x.to == e.to)
-                    {
-                        self.edges.push(e.clone());
-                    }
+                    let _ = self.append_edge_parts(&e.rel, &e.from, &e.to);
+                }
+            }
+            Pack::InsertBulk {
+                collection,
+                rows,
+                edges,
+            } => {
+                let start = self.collection(collection).len();
+                self.collection_mut(collection).reserve(rows.len());
+                self.row_maps_reserve(collection, rows.len());
+                let _ = self.index_insert_slab(collection, start, rows);
+                self.row_maps_register_slab(collection, start, rows);
+                self.collection_mut(collection)
+                    .extend(rows.iter().cloned());
+                for e in edges {
+                    let _ = self.append_edge_parts(&e.rel, &e.from, &e.to);
                 }
             }
             Pack::AppendFact { row } => {
-                let key = (
-                    row_text(row, "s").unwrap_or("").to_string(),
-                    row_text(row, "p").unwrap_or("").to_string(),
-                    row_text(row, "o").unwrap_or("").to_string(),
-                );
-                let exists = self.collection("facts").iter().any(|r| {
-                    row_text(r, "s") == Some(key.0.as_str())
-                        && row_text(r, "p") == Some(key.1.as_str())
-                        && row_text(r, "o") == Some(key.2.as_str())
-                });
-                if !exists {
-                    self.collection_mut("facts").push(row.clone());
-                    self.row_maps_register("facts", self.collection("facts").len() - 1);
+                let _ = self.append_fact_row(row.clone());
+            }
+            Pack::AppendFactsBulk { s, p, o } => {
+                let n = s.len().min(p.len()).min(o.len());
+                self.collection_mut("facts").reserve(n);
+                self.facts_by_spo.reserve(n);
+                for i in 0..n {
+                    let mut row = BTreeMap::new();
+                    row.insert("s".into(), Cell::text_arc(s[i].as_str()));
+                    row.insert("p".into(), Cell::text_arc(p[i].as_str()));
+                    row.insert("o".into(), Cell::text_arc(o[i].as_str()));
+                    let _ = self.append_fact_row(row);
                 }
             }
             Pack::AppendEdge { rel, from, to } => {
-                if !self
-                    .edges
-                    .iter()
-                    .any(|e| e.rel == *rel && e.from == *from && e.to == *to)
-                {
-                    self.edges.push(Edge {
-                        rel: rel.clone(),
-                        from: from.clone(),
-                        to: to.clone(),
-                    });
+                let _ = self.append_edge_parts(rel, from, to);
+            }
+            Pack::AppendEdgesBulk { rel, from, to } => {
+                let n = rel.len().min(from.len()).min(to.len());
+                self.edges.reserve(n);
+                self.edge_keys.reserve(n);
+                for i in 0..n {
+                    let _ = self.append_edge_parts(&rel[i], &from[i], &to[i]);
                 }
             }
             Pack::Update { collection, rows } => {
@@ -449,8 +501,7 @@ impl Store {
                 self.rebuild_indexes_collection(collection);
             }
             Pack::DeleteEdge { rel, from, to } => {
-                self.edges
-                    .retain(|e| !(e.rel == *rel && e.from == *from && e.to == *to));
+                self.remove_edge(rel, from, to);
             }
             Pack::SchemaCol {
                 name,
@@ -757,10 +808,80 @@ impl Store {
     pub fn rebuild_row_maps(&mut self) {
         self.by_id.clear();
         self.docs_by_uri.clear();
+        self.facts_by_spo.clear();
+        self.edge_keys.clear();
         let names: Vec<String> = self.collections.keys().cloned().collect();
         for name in names {
             self.rebuild_row_maps_collection(&name);
         }
+        self.rebuild_edge_keys();
+    }
+
+    fn rebuild_edge_keys(&mut self) {
+        self.edge_keys.clear();
+        self.edge_keys.reserve(self.edges.len());
+        for e in &self.edges {
+            self.edge_keys.insert((
+                Arc::<str>::from(e.rel.as_str()),
+                Arc::<str>::from(e.from.as_str()),
+                Arc::<str>::from(e.to.as_str()),
+            ));
+        }
+    }
+
+    /// Idempotent fact insert. Returns `(row, changed)`.
+    pub fn append_fact_row(&mut self, row: Row) -> (Row, bool) {
+        let Some(key) = spo_key(&row) else {
+            let facts = self.collection_mut("facts");
+            facts.push(row.clone());
+            return (row, true);
+        };
+        if let Some(&idx) = self.facts_by_spo.get(&key) {
+            return (self.collection("facts")[idx].clone(), false);
+        }
+        let idx = self.collection("facts").len();
+        self.facts_by_spo.insert(key, idx);
+        self.collection_mut("facts").push(row.clone());
+        (row, true)
+    }
+
+    pub fn append_edge_parts(&mut self, rel: &str, from: &str, to: &str) -> bool {
+        let key = (
+            Arc::<str>::from(rel),
+            Arc::<str>::from(from),
+            Arc::<str>::from(to),
+        );
+        if !self.edge_keys.insert(key.clone()) {
+            return false;
+        }
+        self.edges.push(Edge {
+            rel: key.0.as_ref().to_owned(),
+            from: key.1.as_ref().to_owned(),
+            to: key.2.as_ref().to_owned(),
+        });
+        true
+    }
+
+    pub fn has_edge(&self, rel: &str, from: &str, to: &str) -> bool {
+        self.edge_keys.contains(&(
+            Arc::<str>::from(rel),
+            Arc::<str>::from(from),
+            Arc::<str>::from(to),
+        ))
+    }
+
+    pub fn remove_edge(&mut self, rel: &str, from: &str, to: &str) -> bool {
+        let key = (
+            Arc::<str>::from(rel),
+            Arc::<str>::from(from),
+            Arc::<str>::from(to),
+        );
+        if !self.edge_keys.remove(&key) {
+            return false;
+        }
+        self.edges
+            .retain(|e| !(e.rel == rel && e.from == from && e.to == to));
+        true
     }
 
     pub fn rebuild_row_maps_collection(&mut self, collection: &str) {
@@ -772,6 +893,9 @@ impl Store {
             self.docs_layer.clear();
             self.docs_wing.clear();
         }
+        if collection == "facts" {
+            self.facts_by_spo.clear();
+        }
         let Some(rows) = self.collections.get(collection) else {
             return;
         };
@@ -782,27 +906,42 @@ impl Store {
             self.docs_layer.reserve(n);
             self.docs_wing.reserve(n);
         }
-        // Snapshot Arc handles first so we can fill maps without overlapping borrows.
-        let snaps: Vec<(Option<String>, Option<String>, Arc<str>, Arc<str>, Arc<str>, Arc<str>)> =
-            rows
-                .iter()
-                .map(|row| {
-                    (
-                        row_text(row, "id").map(str::to_string),
-                        row_text(row, "uri").map(str::to_string),
-                        row.get("id").and_then(Cell::text_shared).unwrap_or_default(),
-                        row.get("title").and_then(Cell::text_shared).unwrap_or_default(),
-                        row.get("layer").and_then(Cell::text_shared).unwrap_or_default(),
-                        row.get("wing").and_then(Cell::text_shared).unwrap_or_default(),
-                    )
-                })
-                .collect();
-        for (i, (id, uri, did, title, layer, wing)) in snaps.into_iter().enumerate() {
+        // Snapshot first so we can mutate maps without overlapping borrows.
+        let snaps: Vec<(
+            Option<String>,
+            Option<String>,
+            Arc<str>,
+            Arc<str>,
+            Arc<str>,
+            Arc<str>,
+            Option<(Arc<str>, Arc<str>, Arc<str>)>,
+        )> = rows
+            .iter()
+            .map(|row| {
+                (
+                    row_text(row, "id").map(str::to_string),
+                    row_text(row, "uri").map(str::to_string),
+                    row.get("id").and_then(Cell::text_shared).unwrap_or_default(),
+                    row.get("title").and_then(Cell::text_shared).unwrap_or_default(),
+                    row.get("layer").and_then(Cell::text_shared).unwrap_or_default(),
+                    row.get("wing").and_then(Cell::text_shared).unwrap_or_default(),
+                    if collection == "facts" {
+                        spo_key(row)
+                    } else {
+                        None
+                    },
+                )
+            })
+            .collect();
+        for (i, (id, uri, did, title, layer, wing, spo)) in snaps.into_iter().enumerate() {
             if let Some(id) = id {
                 self.by_id
                     .get_mut(collection)
                     .expect("by_id entry")
                     .insert(id, i);
+            }
+            if let Some(spo) = spo {
+                self.facts_by_spo.insert(spo, i);
             }
             if collection == "docs" {
                 if let Some(uri) = uri {
@@ -1200,6 +1339,14 @@ impl Store {
 
 fn docs_hot_field(f: &str) -> bool {
     matches!(f, "id" | "title" | "layer" | "wing")
+}
+
+fn spo_key(row: &Row) -> Option<(Arc<str>, Arc<str>, Arc<str>)> {
+    Some((
+        row.get("s").and_then(Cell::text_shared)?,
+        row.get("p").and_then(Cell::text_shared)?,
+        row.get("o").and_then(Cell::text_shared)?,
+    ))
 }
 
 pub fn project_fields(row: &Row, fields: &[String]) -> Row {

@@ -357,3 +357,33 @@ fn index_survives_reopen() {
     }
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn backup_export_import_roundtrip() {
+    let dir = tmp();
+    let bak = dir.join("backup.json");
+    {
+        let mut db = Db::open(&dir).unwrap();
+        db.run(r#"insert docs { uri: "raw://bak", title: "Backup", layer: "wiki" }"#)
+            .unwrap();
+        db.run(r#"append facts { s: "bak", p: tagged, o: "ok" }"#)
+            .unwrap();
+        db.export_backup(&bak).unwrap();
+        db.close().unwrap();
+    }
+    assert!(bak.is_file());
+    let mem = Db::import_backup(&bak).unwrap();
+    let s = mem.stats();
+    assert!(s.docs >= 1, "{s:?}");
+    assert!(s.facts >= 1, "{s:?}");
+
+    let dir2 = tmp();
+    let mut db2 = Db::import_backup_into(&bak, &dir2).unwrap();
+    let q = db2
+        .run(r#"docs | uri == "raw://bak" | { title }"#)
+        .unwrap();
+    assert_eq!(q.done.n, 1);
+    db2.close().unwrap();
+    let _ = fs::remove_dir_all(&dir);
+    let _ = fs::remove_dir_all(&dir2);
+}

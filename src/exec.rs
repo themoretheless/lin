@@ -89,6 +89,16 @@ pub struct Db {
     plan_cache: FxHashMap<String, Prepared>,
 }
 
+/// Lightweight store counters (stable in 0.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stats {
+    pub r#gen: u64,
+    pub docs: usize,
+    pub facts: usize,
+    pub edges: usize,
+    pub next_id: u64,
+}
+
 impl Db {
     pub fn fixture() -> Self {
         let catalog = crate::catalog::fixture();
@@ -124,6 +134,65 @@ impl Db {
 
     pub fn close(&mut self) -> Result<(), Error> {
         self.store.close()
+    }
+
+    pub fn stats(&self) -> Stats {
+        Stats {
+            r#gen: self.store.r#gen,
+            docs: self.store.collection("docs").len(),
+            facts: self.store.collection("facts").len(),
+            edges: self.store.edges.len(),
+            next_id: self.store.next_id,
+        }
+    }
+
+    /// Write a portable JSON backup of the current memory image.
+    /// If this Db is durable, checkpoints the log first.
+    pub fn export_backup(&mut self, path: impl AsRef<Path>) -> Result<(), Error> {
+        if self.store.is_durable() {
+            self.store.checkpoint()?;
+        }
+        let hash = crate::store::catalog_hash(&self.catalog);
+        let snap = self.store.capture_snapshot(hash);
+        crate::persist::write_backup(path.as_ref(), &snap)
+    }
+
+    /// Load a backup file into a fresh in-memory Db (call [`Self::open`] + restore
+    /// into a data dir separately if durable is needed — use `lin backup import --data`).
+    pub fn import_backup(path: impl AsRef<Path>) -> Result<Self, Error> {
+        let snap = crate::persist::read_backup(path.as_ref())?;
+        let store = Store::from_snapshot(&snap);
+        let mut catalog = crate::catalog::fixture();
+        store.merge_extras_into(&mut catalog);
+        Ok(Self {
+            catalog,
+            store,
+            plan_cache: FxHashMap::default(),
+        })
+    }
+
+    /// Import backup into a durable data directory (replaces store files).
+    pub fn import_backup_into(
+        backup: impl AsRef<Path>,
+        data_dir: impl AsRef<Path>,
+    ) -> Result<Self, Error> {
+        let snap = crate::persist::read_backup(backup.as_ref())?;
+        let dir = data_dir.as_ref();
+        crate::persist::ensure_dir(dir)?;
+        // Fresh durable dir from snapshot image.
+        crate::persist::write_snapshot(dir, &snap)?;
+        crate::persist::write_head(
+            dir,
+            &crate::persist::Head {
+                r#gen: snap.r#gen,
+                catalog_hash: snap.catalog_hash.clone(),
+                embed_id: snap.embed_id.clone(),
+            },
+        )?;
+        // Empty log after snapshot offset semantics: truncate/create empty log.
+        let log_path = dir.join(crate::persist::LOG_NAME);
+        std::fs::write(&log_path, []).map_err(|e| Error::runtime(format!("persist: {e}")))?;
+        Self::open(dir)
     }
 
     pub fn clear_plan_cache(&mut self) {
@@ -317,46 +386,110 @@ impl Db {
         match stmt {
             Stmt::Query(q) => Ok((self.exec_query(q, bindings)?, None, None)),
             Stmt::AppendFacts { records } => {
-                let mut rows = Vec::new();
-                let mut packs = Vec::new();
-                let mut all_idemp = true;
+                let now = now_ms();
+                let n = records.len();
+                self.store.collection_mut("facts").reserve(n);
+                self.store.facts_by_spo.reserve(n);
+                let mut rows = Vec::with_capacity(n);
+                let mut changed_n = 0usize;
+                let durable = self.store.is_durable();
+                let mut bulk_s = if durable {
+                    Vec::with_capacity(n)
+                } else {
+                    Vec::new()
+                };
+                let mut bulk_p = if durable {
+                    Vec::with_capacity(n)
+                } else {
+                    Vec::new()
+                };
+                let mut bulk_o = if durable {
+                    Vec::with_capacity(n)
+                } else {
+                    Vec::new()
+                };
                 for record in records {
-                    let (row, changed) = self.append_fact(record)?;
+                    let row = record_row(record, now);
+                    let (row, changed) = self.store.append_fact_row(row);
                     if changed {
-                        all_idemp = false;
-                        packs.push(Pack::AppendFact { row: row.clone() });
+                        changed_n += 1;
+                        if durable {
+                            bulk_s.push(row_text(&row, "s").unwrap_or("").to_string());
+                            bulk_p.push(row_text(&row, "p").unwrap_or("").to_string());
+                            bulk_o.push(row_text(&row, "o").unwrap_or("").to_string());
+                        }
                     }
                     rows.push(row);
                 }
-                let msg = if all_idemp {
+                let msg = if changed_n == 0 {
                     Some("idempotent".into())
                 } else {
                     None
                 };
-                Ok((rows, msg, fold_packs(packs)))
+                let pack = if changed_n == 0 {
+                    None
+                } else if durable {
+                    Some(Pack::AppendFactsBulk {
+                        s: bulk_s,
+                        p: bulk_p,
+                        o: bulk_o,
+                    })
+                } else {
+                    Some(Pack::Batch { packs: Vec::new() })
+                };
+                Ok((rows, msg, pack))
             }
             Stmt::AppendEdges { edges } => {
-                let mut rows = Vec::new();
-                let mut packs = Vec::new();
-                let mut all_idemp = true;
+                let n = edges.len();
+                self.store.edges.reserve(n);
+                self.store.edge_keys.reserve(n);
+                let mut rows = Vec::with_capacity(n);
+                let mut changed_n = 0usize;
+                let durable = self.store.is_durable();
+                let mut bulk_rel = if durable {
+                    Vec::with_capacity(n)
+                } else {
+                    Vec::new()
+                };
+                let mut bulk_from = if durable {
+                    Vec::with_capacity(n)
+                } else {
+                    Vec::new()
+                };
+                let mut bulk_to = if durable {
+                    Vec::with_capacity(n)
+                } else {
+                    Vec::new()
+                };
                 for e in edges {
                     let (row, changed) = self.append_edge(&e.rel, &e.from, &e.to)?;
                     if changed {
-                        all_idemp = false;
-                        packs.push(Pack::AppendEdge {
-                            rel: e.rel.clone(),
-                            from: row_text(&row, "from").unwrap_or("").to_string(),
-                            to: row_text(&row, "to").unwrap_or("").to_string(),
-                        });
+                        changed_n += 1;
+                        if durable {
+                            bulk_rel.push(e.rel.clone());
+                            bulk_from.push(row_text(&row, "from").unwrap_or("").to_string());
+                            bulk_to.push(row_text(&row, "to").unwrap_or("").to_string());
+                        }
                     }
                     rows.push(row);
                 }
-                let msg = if all_idemp {
+                let msg = if changed_n == 0 {
                     Some("idempotent".into())
                 } else {
                     None
                 };
-                Ok((rows, msg, fold_packs(packs)))
+                let pack = if changed_n == 0 {
+                    None
+                } else if durable {
+                    Some(Pack::AppendEdgesBulk {
+                        rel: bulk_rel,
+                        from: bulk_from,
+                        to: bulk_to,
+                    })
+                } else {
+                    Some(Pack::Batch { packs: Vec::new() })
+                };
+                Ok((rows, msg, pack))
             }
             Stmt::Insert {
                 collection,
@@ -366,22 +499,12 @@ impl Db {
                 let (rows, new_edges) =
                     self.insert_bulk(collection, records, edges.as_slice())?;
                 mark_written(ctx, collection, &rows);
-                // In-memory: gen bump only — skip cloning every row into Pack.
                 let pack = if self.store.is_durable() {
-                    let packs: Vec<Pack> = rows
-                        .iter()
-                        .enumerate()
-                        .map(|(i, row)| Pack::Insert {
-                            collection: collection.clone(),
-                            row: row.clone(),
-                            edges: if i == 0 {
-                                new_edges.clone()
-                            } else {
-                                Vec::new()
-                            },
-                        })
-                        .collect();
-                    fold_packs(packs)
+                    Some(Pack::InsertBulk {
+                        collection: collection.clone(),
+                        rows: rows.clone(),
+                        edges: new_edges.clone(),
+                    })
                 } else {
                     Some(Pack::Batch { packs: Vec::new() })
                 };
@@ -1132,7 +1255,7 @@ impl Db {
         Ok(out)
     }
 
-    /// Expand `match [-rel-> bind]+` paths; bound nodes appear as `bind.field`.
+    /// Expand `match` hops; bound nodes as `bind.field`, optional edge as `e.rel|from|to`.
     fn match_path(
         &self,
         primary: &str,
@@ -1152,39 +1275,11 @@ impl Db {
         }
         let mut prev_bind = start;
         for hop in hops {
-            let (edge_rel, reverse) = match self.catalog.rel(&hop.rel) {
-                Some(r) if let Some(of) = &r.reverse_of => (of.as_str(), true),
-                _ => (hop.rel.as_str(), false),
-            };
             let mut next_rows = Vec::new();
             for row in &cur {
-                let keys = match_frontier_keys(row, prev_bind);
-                if keys.is_empty() {
-                    continue;
-                }
-                for e in &self.store.edges {
-                    if e.rel != edge_rel {
-                        continue;
-                    }
-                    let (src, dst) = if reverse {
-                        (e.to.as_str(), e.from.as_str())
-                    } else {
-                        (e.from.as_str(), e.to.as_str())
-                    };
-                    if !keys.iter().any(|k| k == src) {
-                        continue;
-                    }
-                    let Some(node) = self.resolve_node(primary, dst) else {
-                        continue;
-                    };
-                    let mut merged = row.clone();
-                    for (k, v) in &node {
-                        merged.insert(format!("{}.{k}", hop.bind), v.clone());
-                    }
-                    next_rows.push(merged);
-                    if next_rows.len() >= 300 {
-                        return Ok(next_rows);
-                    }
+                self.match_expand_hop(primary, row, prev_bind, hop, &mut next_rows)?;
+                if next_rows.len() >= 300 {
+                    return Ok(next_rows);
                 }
             }
             cur = next_rows;
@@ -1194,6 +1289,84 @@ impl Db {
             }
         }
         Ok(cur)
+    }
+
+    fn match_expand_hop(
+        &self,
+        primary: &str,
+        row: &Row,
+        prev_bind: Option<&str>,
+        hop: &MatchHop,
+        out: &mut Vec<Row>,
+    ) -> Result<(), Error> {
+        let (edge_rel, rev_catalog) = match self.catalog.rel(&hop.rel) {
+            Some(r) if let Some(of) = &r.reverse_of => (of.as_str(), true),
+            _ => (hop.rel.as_str(), false),
+        };
+        let reverse = hop.reverse ^ rev_catalog;
+        let keys = match_frontier_keys(row, prev_bind);
+        if keys.is_empty() {
+            return Ok(());
+        }
+        for start_key in keys {
+            let mut stack: Vec<(String, i64, BTreeSet<String>, Option<(String, String, String)>)> =
+                vec![(
+                    start_key,
+                    0,
+                    BTreeSet::new(),
+                    None,
+                )];
+            while let Some((at, depth, path, last_edge)) = stack.pop() {
+                if depth > 0
+                    && depth >= hop.min_depth
+                    && depth <= hop.max_depth
+                {
+                    if let Some(node) = self.resolve_node(primary, &at) {
+                        let mut merged = row.clone();
+                        for (k, v) in &node {
+                            merged.insert(format!("{}.{k}", hop.bind), v.clone());
+                        }
+                        if let (Some(e_bind), Some((r, f, t))) = (&hop.edge, &last_edge) {
+                            merged.insert(format!("{e_bind}.rel"), Cell::text_arc(r.as_str()));
+                            merged.insert(format!("{e_bind}.from"), Cell::text_arc(f.as_str()));
+                            merged.insert(format!("{e_bind}.to"), Cell::text_arc(t.as_str()));
+                        }
+                        out.push(merged);
+                        if out.len() >= 300 {
+                            return Ok(());
+                        }
+                    }
+                }
+                if depth >= hop.max_depth {
+                    continue;
+                }
+                let mut visited = path;
+                visited.insert(at.clone());
+                for e in &self.store.edges {
+                    if e.rel != edge_rel {
+                        continue;
+                    }
+                    let (src, dst) = if reverse {
+                        (e.to.as_str(), e.from.as_str())
+                    } else {
+                        (e.from.as_str(), e.to.as_str())
+                    };
+                    if src != at {
+                        continue;
+                    }
+                    if visited.contains(dst) {
+                        continue;
+                    }
+                    stack.push((
+                        dst.to_string(),
+                        depth + 1,
+                        visited.clone(),
+                        Some((e.rel.clone(), e.from.clone(), e.to.clone())),
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn resolve_node(&self, primary: &str, key: &str) -> Option<Row> {
@@ -1236,46 +1409,19 @@ impl Db {
         }
     }
 
+    #[allow(dead_code)]
     fn append_fact(&mut self, record: &Record) -> Result<(Row, bool), Error> {
         let now = now_ms();
         let row = record_row(record, now);
-        let key = (
-            row_text(&row, "s").unwrap_or("").to_string(),
-            row_text(&row, "p").unwrap_or("").to_string(),
-            row_text(&row, "o").unwrap_or("").to_string(),
-        );
-        let facts = self.store.collection("facts");
-        if let Some(existing) = facts.iter().find(|r| {
-            row_text(r, "s") == Some(key.0.as_str())
-                && row_text(r, "p") == Some(key.1.as_str())
-                && row_text(r, "o") == Some(key.2.as_str())
-        }) {
-            return Ok((existing.clone(), false));
-        }
-        self.store.collection_mut("facts").push(row.clone());
-        self.store
-            .row_maps_register("facts", self.store.collection("facts").len() - 1);
-        Ok((row, true))
+        Ok(self.store.append_fact_row(row))
     }
 
     fn append_edge(&mut self, rel: &str, from: &Value, to: &Value) -> Result<(Row, bool), Error> {
         let now = now_ms();
         let from = value_text(from, now);
         let to = value_text(to, now);
-        if self
-            .store
-            .edges
-            .iter()
-            .any(|e| e.rel == rel && e.from == from && e.to == to)
-        {
-            return Ok((edge_row(rel, &from, &to), false));
-        }
-        self.store.edges.push(Edge {
-            rel: rel.to_string(),
-            from: from.clone(),
-            to: to.clone(),
-        });
-        Ok((edge_row(rel, &from, &to), true))
+        let changed = self.store.append_edge_parts(rel, &from, &to);
+        Ok((edge_row(rel, &from, &to), changed))
     }
 
     fn insert_bulk(
@@ -1287,47 +1433,49 @@ impl Db {
         let now = now_ms();
         let n = records.len();
         let mut built: Vec<Row> = Vec::with_capacity(n);
-        // Pre-check duplicates within the batch and against store.
-        let mut batch_ids: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
+        let mut batch_ids: rustc_hash::FxHashSet<std::sync::Arc<str>> =
+            rustc_hash::FxHashSet::default();
         batch_ids.reserve(n);
-        let mut batch_uris: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
+        let mut batch_uris: rustc_hash::FxHashSet<std::sync::Arc<str>> =
+            rustc_hash::FxHashSet::default();
         if collection == "docs" {
             batch_uris.reserve(n);
         }
 
         for record in records {
             let mut row = record_row(record, now);
-            if row_text(&row, "id").is_none() {
+            if row.get("id").and_then(Cell::text).is_none() {
                 row.insert("id".into(), Cell::text_arc(self.store.alloc_id()));
             }
-            // Hash only when body is present and caller did not supply hash (CAS later).
-            if row_text(&row, "hash").is_none()
-                && let Some(body) = row_text(&row, "body")
+            if row.get("hash").and_then(Cell::text).is_none()
+                && let Some(body) = row.get("body").and_then(Cell::text_shared)
             {
-                row.insert("hash".into(), Cell::Text(content_hash_arc(body)));
+                row.insert("hash".into(), Cell::Text(content_hash_arc(body.as_ref())));
             }
-            let from_id = row_text(&row, "id").unwrap_or("");
-            if !from_id.is_empty() {
-                if !batch_ids.insert(from_id.to_owned())
-                    || self.store.get_by_id(collection, from_id).is_some()
+            if let Some(id) = row.get("id").and_then(Cell::text_shared) {
+                if !batch_ids.insert(std::sync::Arc::clone(&id))
+                    || self.store.get_by_id(collection, id.as_ref()).is_some()
                 {
-                    return Err(Error::runtime(format!("duplicate id: {from_id}")));
+                    return Err(Error::runtime(format!("duplicate id: {id}")));
                 }
             }
             if collection == "docs"
-                && let Some(uri) = row_text(&row, "uri")
+                && let Some(uri) = row.get("uri").and_then(Cell::text_shared)
             {
-                if !batch_uris.insert(uri.to_owned()) || self.store.get_by_uri(uri).is_some() {
+                if !batch_uris.insert(std::sync::Arc::clone(&uri))
+                    || self.store.get_by_uri(uri.as_ref()).is_some()
+                {
                     return Err(Error::runtime(format!("duplicate uri: {uri}")));
                 }
             }
             built.push(row);
         }
 
-        // Edges only on first record (same semantics as before).
         let mut new_edges = Vec::new();
         if let Some(first) = built.first() {
             let from_id = row_text(first, "id").unwrap_or("").to_string();
+            self.store.edges.reserve(edges.len());
+            self.store.edge_keys.reserve(edges.len());
             for e in edges {
                 let to = match &e.target {
                     EdgeTarget::Page(uri) => self
@@ -1337,30 +1485,22 @@ impl Db {
                         .unwrap_or_else(|| uri.clone()),
                     EdgeTarget::Value(v) => value_text(v, now),
                 };
-                let edge = Edge {
+                let _ = self.store.append_edge_parts(&e.rel, &from_id, &to);
+                new_edges.push(Edge {
                     rel: e.rel.clone(),
                     from: from_id.clone(),
                     to,
-                };
-                if !self
-                    .store
-                    .edges
-                    .iter()
-                    .any(|x| x.rel == edge.rel && x.from == edge.from && x.to == edge.to)
-                {
-                    self.store.edges.push(edge.clone());
-                }
-                new_edges.push(edge);
+                });
             }
         }
 
-        // Append-only slab: reserve → index from built → register maps → clone into store.
         let start = self.store.collection(collection).len();
         self.store.collection_mut(collection).reserve(n);
         self.store.row_maps_reserve(collection, n);
         self.store.index_insert_slab(collection, start, &built)?;
         self.store
             .row_maps_register_slab(collection, start, &built);
+        // Move rows into the store (one ownership transfer; return keeps `built` via clone only if needed).
         self.store
             .collection_mut(collection)
             .extend(built.iter().cloned());
@@ -1491,11 +1631,7 @@ impl Db {
         let now = now_ms();
         let from = value_text(from, now);
         let to = value_text(to, now);
-        let before = self.store.edges.len();
-        self.store
-            .edges
-            .retain(|e| !(e.rel == rel && e.from == from && e.to == to));
-        if self.store.edges.len() == before {
+        if !self.store.remove_edge(rel, &from, &to) {
             return Err(Error::runtime("delete: edge not found"));
         }
         Ok(edge_row(rel, &from, &to))

@@ -10,6 +10,12 @@ fn main() -> ExitCode {
     match rest.first().map(String::as_str) {
         Some("explain") => cmd_explain(&rest[1..], data),
         Some("run") => cmd_run(&rest[1..], data),
+        Some("backup") => cmd_backup(&rest[1..], data),
+        Some("stats") => cmd_stats(data),
+        Some("version") | Some("--version") => {
+            println!("lin {}", lin::VERSION);
+            ExitCode::SUCCESS
+        }
         _ => usage(2),
     }
 }
@@ -211,7 +217,122 @@ fn load_program(file: Option<PathBuf>, rest: &[String]) -> Result<String, String
 
 fn usage(code: u8) -> ExitCode {
     eprintln!(
-        "usage:\n  lin [--data <dir>] run [--explain] [--file <path> | - | '<query>']\n  lin [--data <dir>] explain [--graph mermaid|dot] '<query>'"
+        "usage:\n  \
+         lin [--data <dir>] run [--explain] [--file <path> | - | '<query>']\n  \
+         lin [--data <dir>] explain [--graph mermaid|dot] '<query>'\n  \
+         lin [--data <dir>] backup export <file.json>\n  \
+         lin backup import <file.json> [--data <dir>]\n  \
+         lin [--data <dir>] stats\n  \
+         lin version"
     );
     ExitCode::from(code)
+}
+
+fn cmd_stats(data: Option<PathBuf>) -> ExitCode {
+    match with_data(data, |db| {
+        let s = match db {
+            Some(db) => db.stats(),
+            None => {
+                let mut tmp = Db::fixture();
+                tmp.stats()
+            }
+        };
+        Ok(s)
+    }) {
+        Ok(s) => {
+            println!(
+                "gen={} docs={} facts={} edges={} next_id={}",
+                s.r#gen, s.docs, s.facts, s.edges, s.next_id
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn cmd_backup(args: &[String], data: Option<PathBuf>) -> ExitCode {
+    match args.first().map(String::as_str) {
+        Some("export") => {
+            let Some(path) = args.get(1) else {
+                eprintln!("usage: lin [--data <dir>] backup export <file.json>");
+                return ExitCode::from(2);
+            };
+            match with_data(data, |db| match db {
+                Some(db) => db.export_backup(path),
+                None => {
+                    let mut tmp = Db::fixture();
+                    tmp.export_backup(path)
+                }
+            }) {
+                Ok(()) => {
+                    println!("exported {path}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    ExitCode::from(1)
+                }
+            }
+        }
+        Some("import") => {
+            let Some(path) = args.get(1) else {
+                eprintln!("usage: lin backup import <file.json> [--data <dir>]");
+                return ExitCode::from(2);
+            };
+            // Allow `--data` after import path as well.
+            let mut data = data;
+            let mut i = 2;
+            while i < args.len() {
+                if args[i] == "--data" {
+                    i += 1;
+                    data = Some(PathBuf::from(
+                        args.get(i).map(String::as_str).unwrap_or(".lin"),
+                    ));
+                    i += 1;
+                } else {
+                    i += 1;
+                }
+            }
+            match data {
+                Some(dir) => match Db::import_backup_into(path, &dir) {
+                    Ok(mut db) => {
+                        let s = db.stats();
+                        let _ = db.close();
+                        println!(
+                            "imported {path} → {}  gen={} docs={}",
+                            dir.display(),
+                            s.r#gen,
+                            s.docs
+                        );
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("{e}");
+                        ExitCode::from(1)
+                    }
+                },
+                None => match Db::import_backup(path) {
+                    Ok(db) => {
+                        let s = db.stats();
+                        println!(
+                            "imported {path} (memory) gen={} docs={} facts={} edges={}",
+                            s.r#gen, s.docs, s.facts, s.edges
+                        );
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("{e}");
+                        ExitCode::from(1)
+                    }
+                },
+            }
+        }
+        _ => {
+            eprintln!("usage: lin backup export|import …");
+            ExitCode::from(2)
+        }
+    }
 }

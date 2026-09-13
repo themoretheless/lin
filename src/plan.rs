@@ -625,10 +625,7 @@ fn plan_query_inner(q: &Query, cat: &Catalog, allow_implicit_take: bool) -> Resu
                 );
             }
             Step::Match { start, hops } => {
-                let hops: Vec<String> = hops
-                    .iter()
-                    .map(|h| format!("-{}-> {}", h.rel, h.bind))
-                    .collect();
+                let hops: Vec<String> = hops.iter().map(|h| h.label()).collect();
                 cur = node(
                     NodeKind::Match {
                         start: start.clone(),
@@ -813,39 +810,32 @@ fn extract_point(pred: &Pred) -> (Option<(String, Value)>, Option<Pred>) {
 
 fn wrap_search(input: Node, mode: SearchMode, query: &str, k: i64) -> Node {
     match mode {
-        SearchMode::Hybrid => {
-            let lex = node(
-                NodeKind::Search {
-                    mode: SearchMode::Lex,
-                    query: query.to_string(),
-                    k,
-                },
-                Backend::Native,
-                Effect::Read,
-                vec![],
-            )
-            .with_note("after Filter");
-            let vec_n = node(
-                NodeKind::Search {
-                    mode: SearchMode::Vec,
-                    query: query.to_string(),
-                    k,
-                },
-                Backend::Native,
-                Effect::Read,
-                vec![input],
-            )
-            .with_note("candidates←lex");
-            node(
-                NodeKind::Rrf { k },
-                Backend::Native,
-                Effect::Read,
-                vec![lex, vec_n],
-            )
-        }
-        other => node(
+        // No in-process embedder in 0.2 — hybrid executes as lex; plan must match.
+        SearchMode::Hybrid => node(
             NodeKind::Search {
-                mode: other,
+                mode: SearchMode::Lex,
+                query: query.to_string(),
+                k,
+            },
+            Backend::Native,
+            Effect::Read,
+            vec![input],
+        )
+        .with_note("hybrid→lex (no embedder)"),
+        SearchMode::Vec => node(
+            NodeKind::Search {
+                mode: SearchMode::Vec,
+                query: query.to_string(),
+                k,
+            },
+            Backend::Native,
+            Effect::Read,
+            vec![input],
+        )
+        .with_note("vec unsupported: empty until embedder"),
+        SearchMode::Lex => node(
+            NodeKind::Search {
+                mode: SearchMode::Lex,
                 query: query.to_string(),
                 k,
             },

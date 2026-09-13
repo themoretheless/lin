@@ -90,6 +90,22 @@ fn match_with_start_alias() {
 }
 
 #[test]
+fn match_star_and_reverse_and_edge_plan() {
+    let star = ok(
+        r#"docs | id == "e7c98d54-b4d6-4165-86e9-9b999e7ce9c3" | match -wikilink*1..2-> b | { b.title }"#,
+    );
+    assert!(star.contains("Match -wikilink*1..2-> b cap=300"), "{star}");
+    let rev = ok(
+        r#"docs | id == "e7c98d54-b4d6-4165-86e9-9b999e7ce9c3" | match <-wikilink- src | { src.title }"#,
+    );
+    assert!(rev.contains("Match <-wikilink- src cap=300"), "{rev}");
+    let edge = ok(
+        r#"docs | id == "e7c98d54-b4d6-4165-86e9-9b999e7ce9c3" | match -[e:wikilink]-> b | { e.from, e.to, b.title }"#,
+    );
+    assert!(edge.contains("Match -[e:wikilink]-> b cap=300"), "{edge}");
+}
+
+#[test]
 fn match_unknown_rel() {
     let e = err("docs | match -missing-> b");
     assert!(e.contains("unknown rel: missing"), "{e}");
@@ -102,11 +118,24 @@ fn match_duplicate_bind() {
 }
 
 #[test]
+fn match_edge_bind_rejects_star() {
+    let e = err("docs | match -[e:wikilink*2]-> b");
+    assert!(e.contains("edge bind requires depth 1"), "{e}");
+}
+
+#[test]
 fn search_hybrid_then_take() {
     let plan = ok(r#"docs | wing == "rag" | search "embedding identity" | take 20"#);
-    assert!(plan.contains("RRF k=20"));
-    assert!(plan.contains("Search lex \"embedding identity\""));
-    assert!(plan.contains("Search vec \"embedding identity\""));
+    assert!(
+        plan.contains("Search lex \"embedding identity\""),
+        "{plan}"
+    );
+    assert!(
+        plan.contains("hybrid→lex (no embedder)"),
+        "{plan}"
+    );
+    assert!(!plan.contains("RRF"), "{plan}");
+    assert!(!plan.contains("Search vec"), "{plan}");
     assert!(plan.contains("Take 20"));
     assert!(!plan.contains("Take 20 implicit"));
     assert!(plan.contains("embed=nomic-embed-text/768"));
@@ -118,7 +147,8 @@ fn search_count_sort() {
     assert!(plan.contains("Agg count by room"));
     assert!(plan.contains("Sort hits desc"));
     assert!(plan.contains("Take 50"));
-    assert!(plan.contains("RRF"));
+    assert!(plan.contains("Search lex"));
+    assert!(!plan.contains("RRF"), "{plan}");
 }
 
 #[test]
@@ -154,7 +184,9 @@ fn explain_cost_search() {
     let plan = ok(r#"docs | wing == "rag" | search "wal" | { id, title } | explain cost"#);
     assert!(plan.contains("budget.take=50"));
     assert!(plan.contains("zone skip"));
-    assert!(plan.contains("RRF"));
+    assert!(plan.contains("Search lex"));
+    assert!(plan.contains("hybrid→lex (no embedder)"), "{plan}");
+    assert!(!plan.contains("RRF"), "{plan}");
     assert!(plan.contains("Project [id, title]"));
     assert!(plan.contains("-- no body"));
 }
@@ -292,7 +324,7 @@ fn explain_graph_mermaid_search_filter() {
     assert!(g.contains("flowchart TD"), "{g}");
     assert!(g.contains("Search lex"), "{g}");
     assert!(g.contains("Filter"), "{g}");
-    assert!(g.contains("RRF") || g.contains("Search"), "{g}");
+    assert!(!g.contains("RRF"), "{g}");
     assert!(g.contains("Take 50"), "{g}");
     assert!(g.contains("classDef read"), "{g}");
     assert!(g.contains("classDef reduce"), "{g}");
