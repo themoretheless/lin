@@ -423,8 +423,13 @@ fn check_query(q: &Query, cat: &Catalog, env: &Bindings) -> Result<Scope, Error>
                 }
             }
             Step::Count { by } => {
-                require_field(&scope, by)?;
-                scope = Scope::agg(&scope.primary, &by.as_str(), Type::I64, "hits");
+                scope = match by {
+                    Some(by) => {
+                        require_field(&scope, by)?;
+                        Scope::agg(&scope.primary, &by.as_str(), Type::I64, "hits")
+                    }
+                    None => Scope::agg_total(&scope.primary, Type::I64, "hits"),
+                };
             }
             Step::Sum { field, by } => {
                 let ty = require_field(&scope, field)?;
@@ -709,6 +714,15 @@ impl Scope {
         if by.contains('.') {
             fields.insert(by.to_string(), Type::Text);
         }
+        Self {
+            primary: primary.to_string(),
+            fields,
+        }
+    }
+
+    fn agg_total(primary: &str, metric_ty: Type, metric: &str) -> Self {
+        let mut fields = BTreeMap::new();
+        fields.insert(metric.to_string(), metric_ty);
         Self {
             primary: primary.to_string(),
             fields,

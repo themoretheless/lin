@@ -474,6 +474,13 @@ impl Db {
 
     fn prepare_uncached(&self, src: &str) -> Result<Prepared, Error> {
         let stmts = parse::parse_program(src)?;
+        let mut prepared = self.prepare_stmts(stmts)?;
+        prepared.src = src.to_string();
+        Ok(prepared)
+    }
+
+    /// Typecheck + plan a program already parsed as AST (no string cache).
+    pub fn prepare_stmts(&self, stmts: Vec<Stmt>) -> Result<Prepared, Error> {
         let mut check_cat = self.catalog.clone();
         check::check_program(&stmts, &mut check_cat)?;
         let plan = Arc::new(plan::plan_program(&stmts, &check_cat)?);
@@ -481,13 +488,27 @@ impl Db {
         let append_only = writes && stmts.iter().all(|s| stmt_append_only(s) || !stmt_writes(s));
         let schema = stmts.iter().any(stmt_schema);
         Ok(Prepared {
-            src: src.to_string(),
+            src: String::new(),
             stmts,
             plan,
             writes,
             append_only,
             schema,
         })
+    }
+
+    pub fn prepare_stmt(&self, stmt: Stmt) -> Result<Prepared, Error> {
+        self.prepare_stmts(vec![stmt])
+    }
+
+    pub fn run_stmt(&mut self, stmt: Stmt) -> Result<Handle, Error> {
+        let prepared = self.prepare_stmt(stmt)?;
+        self.run_prepared(&prepared)
+    }
+
+    pub fn run_stmts(&mut self, stmts: Vec<Stmt>) -> Result<Handle, Error> {
+        let prepared = self.prepare_stmts(stmts)?;
+        self.run_prepared(&prepared)
     }
 
     pub fn run_prepared(&mut self, prepared: &Prepared) -> Result<Handle, Error> {
@@ -698,8 +719,26 @@ impl ReadDb {
         self.inner.prepare_uncached(src)
     }
 
+    pub fn prepare_stmt(&self, stmt: Stmt) -> Result<Prepared, Error> {
+        self.inner.prepare_stmt(stmt)
+    }
+
+    pub fn prepare_stmts(&self, stmts: Vec<Stmt>) -> Result<Prepared, Error> {
+        self.inner.prepare_stmts(stmts)
+    }
+
     pub fn run(&self, src: &str) -> Result<Handle, Error> {
         self.inner.run_readonly(src)
+    }
+
+    pub fn run_stmt(&self, stmt: Stmt) -> Result<Handle, Error> {
+        let prepared = self.prepare_stmt(stmt)?;
+        self.run_prepared(&prepared)
+    }
+
+    pub fn run_stmts(&self, stmts: Vec<Stmt>) -> Result<Handle, Error> {
+        let prepared = self.prepare_stmts(stmts)?;
+        self.run_prepared(&prepared)
     }
 
     pub fn run_prepared(&self, prepared: &Prepared) -> Result<Handle, Error> {
@@ -1208,7 +1247,10 @@ impl Db {
                 Step::Count { by } => {
                     implicit_take = false;
                     saw_agg = true;
-                    rows = agg_count(&rows, by);
+                    rows = match by {
+                        Some(by) => agg_count(&rows, by),
+                        None => vec![hits_row(rows.len() as i64)],
+                    };
                     primary = String::new();
                 }
                 Step::Sum { field, by } => {
@@ -1327,8 +1369,7 @@ impl Db {
         Some(vec![row])
     }
 
-    /// `col | pred | count by f` — no row materialization when index covers pred
-    /// and `f` is equality-bound (or scan counts in place).
+    /// `col | pred | count` / `count by f` — no row materialization when possible.
     fn try_filter_count(
         &self,
         q: &Query,
@@ -1342,7 +1383,7 @@ impl Db {
             return None;
         }
         let mut filter: Option<&Pred> = None;
-        let mut by: Option<&Field> = None;
+        let mut by: Option<Option<&Field>> = None;
         for step in &q.steps {
             match step {
                 Step::Filter(p) => {
@@ -1355,7 +1396,7 @@ impl Db {
                     if by.is_some() {
                         return None;
                     }
-                    by = Some(b);
+                    by = Some(b.as_ref());
                 }
                 Step::Take { .. } => {}
                 _ => return None,
@@ -1363,17 +1404,45 @@ impl Db {
         }
         let pred = filter?;
         let by = by?;
-        let by_key = by.as_str();
+
+        // docs | title ~ "…" | count — columnar title scan + memchr (fair vs SQL COUNT(*)).
+        if name == "docs"
+            && by.is_none()
+            && let Pred::Contains { field, needle } = pred
+            && field.leaf() == Some("title")
+        {
+            let n = self.store.docs_title_contains_count(needle);
+            return Some(vec![hits_row(n)]);
+        }
 
         // docs | title ~ "…" | count by layer — columnar title scan + memchr.
         if name == "docs"
+            && let Some(by_field) = by
             && let Pred::Contains { field, needle } = pred
             && field.leaf() == Some("title")
-            && by.leaf() == Some("layer")
+            && by_field.leaf() == Some("layer")
         {
             let map = self.store.docs_title_contains_count_by_layer(needle);
-            return Some(count_arc_map_to_rows(&by_key, map));
+            return Some(count_arc_map_to_rows(&by_field.as_str(), map));
         }
+
+        let Some(by_field) = by else {
+            if let Some(uses) = crate::index::pick_index(&self.catalog, name, pred)
+                && crate::index::index_covers_pred(pred, &uses)
+            {
+                let n = self.store.index_seek_count(name, &uses, now)?;
+                return Some(vec![hits_row(n as i64)]);
+            }
+            let col = self.store.collection(name);
+            let mut n = 0i64;
+            for row in col {
+                if eval_pred(pred, row, now) {
+                    n += 1;
+                }
+            }
+            return Some(vec![hits_row(n)]);
+        };
+        let by_key = by_field.as_str();
 
         // Index-covered + group key fixed by equality → pure seek_count.
         if let Some(uses) = crate::index::pick_index(&self.catalog, name, pred)
@@ -2586,6 +2655,12 @@ fn count_arc_map_to_rows(by: &str, map: BTreeMap<std::sync::Arc<str>, i64>) -> V
             row
         })
         .collect()
+}
+
+fn hits_row(n: i64) -> Row {
+    let mut row = BTreeMap::new();
+    row.insert("hits".into(), Cell::Int(n));
+    row
 }
 
 fn count_row(by: &str, value: &str, n: i64) -> Row {

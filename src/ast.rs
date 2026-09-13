@@ -140,8 +140,9 @@ pub enum Step {
         mode: SearchMode,
         query: String,
     },
+    /// `count` (total hits) or `count by field` (group).
     Count {
-        by: Field,
+        by: Option<Field>,
     },
     Sum {
         field: Field,
@@ -251,6 +252,17 @@ impl Field {
         Self {
             parts: vec![name.into()],
         }
+    }
+
+    /// Dotted path: `"users.email"` → `["users", "email"]`.
+    pub fn path(path: impl AsRef<str>) -> Self {
+        let parts: Vec<String> = path
+            .as_ref()
+            .split('.')
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+            .collect();
+        Self { parts }
     }
 
     pub fn as_str(&self) -> String {

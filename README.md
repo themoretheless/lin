@@ -33,6 +33,7 @@ docs | wing == "rag" and ts > ago 7d | { id, title, room }
 docs | id == "e7c98d54-b4d6-4165-86e9-9b999e7ce9c3"
 docs | title has "wal"
 docs | title ~ "wal"
+docs | title ~ "wal" | count
 docs | title ~ /wal.*/i
 orders | total > 100 | join users on user_id | { id, users.email, total }
 docs | hop wikilink | { id, title }
@@ -92,15 +93,15 @@ rel cites
 | SyncMode::Normal | **готово** |
 | P3 сеть / MVCC | WAL ship + `reader()` + `open_read`∥writer (FENCE); не multi-writer |
 
-## Бенчмарки (rbench): Lin vs SQLite vs DuckDB vs Postgres vs MySQL
+## Бенчмарки (airbug-bench): Lin vs SQLite vs DuckDB vs Postgres vs MySQL
 
-Сравнительные hot paths в `benches/compare.rs` через [rbench](https://github.com/themoretheless/rbench) (`Suite`, `harness = false`).
+Сравнительные hot paths в `benches/compare.rs` через [airbug](https://github.com/themoretheless/airbug) (`airbug` + `airbug-bench` @ git `release`, `Suite`, `harness = false`).
 
 ```bash
 # список кейсов
 cargo bench --bench compare -- --list
 
-# быстрый прогон (нужен --release; rbench отказывается от debug)
+# быстрый прогон (нужен --release; airbug-bench отказывается от debug)
 cargo bench --bench compare -- --profile quick
 
 # только point get / только insert / только append_log
@@ -111,7 +112,7 @@ cargo bench --bench compare -- --profile quick --filter append_log
 
 Движки: **Lin**, **SQLite** (`rusqlite` bundled), **DuckDB** (bundled; собирается на mac aarch64), **Postgres** / **MySQL** (опционально, через URL), плюс **HashMap** только для point get. N=10 000 для тёплых чтений (fixture; setup вне тайминга). Bulk insert: схема/индекс в setup, в тайминге только запись.
 
-Сравнимо: point get по id, `wing ==`, range `wing`+`ts`, substring (`title ~ "wal"` ≈ `LIKE '%wal%'`), materialize `SELECT id,title`, bulk insert 1k/10k, **append_log** (`append facts` vs `INSERT INTO logs`) 1k/10k.  
+Сравнимо: point get по id, `wing ==`, range `wing`+`ts`, substring (`title ~ "wal" | count` ≈ `COUNT(*) … LIKE '%wal%'`), materialize `SELECT id,title`, bulk insert 1k/10k, **append_log** (`append facts` vs `INSERT INTO logs`) 1k/10k.  
 Не сравниваем здесь (и не подтасовываем): Lin `hop`/`match`, real vec/hybrid, CAS, durable fsync (`--data`) — отдельный слой.
 
 ### Postgres / MySQL
@@ -130,7 +131,7 @@ export LIN_BENCH_MYSQL_URL='mysql://lin:lin@127.0.0.1:53306/lin'
 - MySQL smoke из **dbill**: `docker compose -f ../dbill/docker-compose.yml up -d mysql` → `mysql://dbill:dbill@127.0.0.1:33306/dbill_smoke`
 - Postgres через Homebrew: задача **ppduster** `macos-stack-postgres` (`postgresql@17`); после старта сервиса probe `postgresql://postgres@127.0.0.1:5432/postgres`
 
-Зависимости бенча: `postgres`, `mysql` (dev-dependencies). `rbench` — path на sibling `../rbench/crates/rbench`.
+Dev-deps: `airbug` (unit) и `airbug-bench` (бенчи) с ветки `release`; плюс `postgres` / `mysql`.
 
 ## Запуск
 

@@ -1494,14 +1494,35 @@ impl Store {
         Some(self.index_seek(collection, uses, now)?.len())
     }
 
+    /// Count `docs.title ~ needle` (no group) using columnar titles + memchr.
+    pub fn docs_title_contains_count(&self, needle: &str) -> i64 {
+        let finder = memchr::memmem::Finder::new(needle.as_bytes());
+        let mut n = 0i64;
+        for title in &self.docs_title {
+            if finder.find(title.as_bytes()).is_some() {
+                n += 1;
+            }
+        }
+        n
+    }
+
     /// Count `docs.title ~ needle` grouped by layer using columnar titles (no row maps).
     pub fn docs_title_contains_count_by_layer(&self, needle: &str) -> BTreeMap<Arc<str>, i64> {
         let finder = memchr::memmem::Finder::new(needle.as_bytes());
         let mut map: BTreeMap<Arc<str>, i64> = BTreeMap::new();
         let n = self.docs_title.len().min(self.docs_layer.len());
+        let titles = &self.docs_title[..n];
+        let layers = &self.docs_layer[..n];
         for i in 0..n {
-            if finder.find(self.docs_title[i].as_bytes()).is_some() {
-                *map.entry(Arc::clone(&self.docs_layer[i])).or_insert(0) += 1;
+            if finder.find(titles[i].as_bytes()).is_none() {
+                continue;
+            }
+            let layer = &layers[i];
+            // Borrow as str so hits reuse the existing key without Arc clone.
+            if let Some(c) = map.get_mut(layer.as_ref()) {
+                *c += 1;
+            } else {
+                map.insert(Arc::clone(layer), 1);
             }
         }
         map

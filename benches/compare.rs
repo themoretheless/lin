@@ -21,7 +21,7 @@ use std::hint::black_box;
 use std::time::Duration;
 
 use mysql::prelude::Queryable;
-use rbench::{Config, DropPolicy, Fixture, Suite};
+use airbug_bench::{Config, DropPolicy, Fixture, Suite};
 
 const N: usize = 10_000;
 const INSERT_1K: usize = 1_000;
@@ -202,7 +202,7 @@ fn seed_lin(n: usize) -> LinWarm {
         .prepare(r#"docs | wing == "rag" and ts > ago 7d | count by wing"#)
         .expect("lin prepare filter_range");
     let text_substr = db
-        .prepare(r#"docs | title ~ "wal" | count by layer"#)
+        .prepare(r#"docs | title ~ "wal" | count"#)
         .expect("lin prepare text_substr");
     let materialize = db
         .prepare(r#"docs | wing == "rag" | { id, title } | take all"#)
@@ -977,7 +977,7 @@ fn fill_mysql_logs(conn: &mut mysql::Conn, n: usize) {
     tx.commit().expect("mysql commit");
 }
 
-fn main() -> rbench::Result<()> {
+fn main() -> airbug_bench::Result<()> {
     let pg = connect_pg();
     let mysql = connect_mysql();
 
@@ -999,7 +999,7 @@ fn main() -> rbench::Result<()> {
         "lin compare: N={N} warm reads (fixture), bulk insert (schema outside timing)\n\
          engines: {engines}\n\
          Lin reads: prepare once / run many; filters use count (fair vs SQL COUNT(*));\n\
-         substring: Lin `title ~ \"wal\"` vs SQL LIKE '%wal%';\n\
+         substring: Lin `title ~ \"wal\" | count` vs SQL LIKE '%wal%' COUNT(*);\n\
          materialize: Lin `wing==rag | {{id,title}} | take all` vs SQL SELECT id,title;\n\
          append_log: Lin `append facts` vs SQL INSERT INTO logs (append-only shape)"
     );
@@ -1637,7 +1637,7 @@ fn main() -> rbench::Result<()> {
 }
 
 /// Minimal CLI compatible with `Suite::main`, ignoring cargo's injected `--bench`.
-fn run_suite(mut suite: Suite<'_>, args: &[String]) -> rbench::Result<()> {
+fn run_suite(mut suite: Suite<'_>, args: &[String]) -> airbug_bench::Result<()> {
     let mut config = Config::profile("quick")?;
     let mut profile = None;
     let mut i = 0;
@@ -1646,7 +1646,7 @@ fn run_suite(mut suite: Suite<'_>, args: &[String]) -> rbench::Result<()> {
             i += 1;
             profile = Some(
                 args.get(i)
-                    .ok_or_else(|| rbench::error("--profile requires value"))?
+                    .ok_or_else(|| airbug_bench::error("--profile requires value"))?
                     .clone(),
             );
         }
@@ -1655,7 +1655,7 @@ fn run_suite(mut suite: Suite<'_>, args: &[String]) -> rbench::Result<()> {
     if let Some(p) = &profile {
         config = Config::profile(p)?;
     }
-    let mut selection = rbench::Selection::default();
+    let mut selection = airbug_bench::Selection::default();
     let mut list = false;
     let mut json = false;
     let mut output = None;
@@ -1673,14 +1673,14 @@ fn run_suite(mut suite: Suite<'_>, args: &[String]) -> rbench::Result<()> {
                 i += 1;
                 selection.pattern = args
                     .get(i)
-                    .ok_or_else(|| rbench::error("--filter requires value"))?
+                    .ok_or_else(|| airbug_bench::error("--filter requires value"))?
                     .clone();
             }
             "--tag" => {
                 i += 1;
                 selection.tags.push(
                     args.get(i)
-                        .ok_or_else(|| rbench::error("--tag requires value"))?
+                        .ok_or_else(|| airbug_bench::error("--tag requires value"))?
                         .clone(),
                 );
             }
@@ -1688,7 +1688,7 @@ fn run_suite(mut suite: Suite<'_>, args: &[String]) -> rbench::Result<()> {
                 i += 1;
                 selection.exclude.push(
                     args.get(i)
-                        .ok_or_else(|| rbench::error("--exclude requires glob"))?
+                        .ok_or_else(|| airbug_bench::error("--exclude requires glob"))?
                         .clone(),
                 );
             }
@@ -1696,14 +1696,14 @@ fn run_suite(mut suite: Suite<'_>, args: &[String]) -> rbench::Result<()> {
                 i += 1;
                 config.samples = args
                     .get(i)
-                    .ok_or_else(|| rbench::error("--samples requires value"))?
+                    .ok_or_else(|| airbug_bench::error("--samples requires value"))?
                     .parse()?;
             }
             "--sample-ms" => {
                 i += 1;
                 config.sample_time = Duration::from_millis(
                     args.get(i)
-                        .ok_or_else(|| rbench::error("--sample-ms requires value"))?
+                        .ok_or_else(|| airbug_bench::error("--sample-ms requires value"))?
                         .parse()?,
                 );
             }
@@ -1711,7 +1711,7 @@ fn run_suite(mut suite: Suite<'_>, args: &[String]) -> rbench::Result<()> {
                 i += 1;
                 config.warmup = Duration::from_millis(
                     args.get(i)
-                        .ok_or_else(|| rbench::error("--warmup-ms requires value"))?
+                        .ok_or_else(|| airbug_bench::error("--warmup-ms requires value"))?
                         .parse()?,
                 );
             }
@@ -1719,7 +1719,7 @@ fn run_suite(mut suite: Suite<'_>, args: &[String]) -> rbench::Result<()> {
                 i += 1;
                 output = Some(
                     args.get(i)
-                        .ok_or_else(|| rbench::error("--output requires directory"))?
+                        .ok_or_else(|| airbug_bench::error("--output requires directory"))?
                         .clone(),
                 );
             }
@@ -1729,7 +1729,7 @@ fn run_suite(mut suite: Suite<'_>, args: &[String]) -> rbench::Result<()> {
                 );
                 return Ok(());
             }
-            other => return Err(rbench::error(format!("unknown argument {other}"))),
+            other => return Err(airbug_bench::error(format!("unknown argument {other}"))),
         }
         i += 1;
     }
@@ -1742,7 +1742,7 @@ fn run_suite(mut suite: Suite<'_>, args: &[String]) -> rbench::Result<()> {
         return Ok(());
     }
     if cfg!(debug_assertions) {
-        return Err(rbench::error(
+        return Err(airbug_bench::error(
             "benchmarks require an optimized build; use cargo bench or cargo run --release",
         ));
     }
@@ -1753,7 +1753,7 @@ fn run_suite(mut suite: Suite<'_>, args: &[String]) -> rbench::Result<()> {
     if json {
         println!("RBENCH_RESULT={}", serde_json::to_string(&run)?);
     } else {
-        println!("{}", rbench::report::markdown(&run)?);
+        println!("{}", airbug_bench::report::markdown(&run)?);
     }
     Ok(())
 }

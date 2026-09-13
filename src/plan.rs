@@ -491,7 +491,9 @@ fn plan_query_inner(q: &Query, cat: &Catalog, allow_implicit_take: bool) -> Resu
             Step::Count { by } => {
                 implicit_take = false;
                 saw_agg = true;
-                push_field(&mut needed, &by.as_str());
+                if let Some(by) = by {
+                    push_field(&mut needed, &by.as_str());
+                }
             }
             Step::Sum { field, by } => {
                 implicit_take = false;
@@ -644,7 +646,10 @@ fn plan_query_inner(q: &Query, cat: &Catalog, allow_implicit_take: bool) -> Resu
                 cur = node(
                     NodeKind::Agg {
                         op: "count".into(),
-                        by: by.as_str(),
+                        by: by
+                            .as_ref()
+                            .map(|b| b.as_str())
+                            .unwrap_or_else(|| "*".into()),
                     },
                     Backend::Native,
                     Effect::Read,

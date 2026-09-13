@@ -677,6 +677,10 @@ fn project_take_all_skips_body() {
         c.rows[0].get("hits"),
         Some(&lin::Cell::Int(2))
     );
+    let total = db.run(r#"docs | title ~ "wal" | count"#).unwrap();
+    assert_eq!(total.done.n, 1);
+    assert_eq!(total.rows[0].get("hits"), Some(&lin::Cell::Int(2)));
+    assert!(!total.rows[0].contains_key("layer"));
     // Implicit take 50 still applies without `take all`.
     let mut db2 = Db::empty();
     db2.run("index docs [wing, ts]").unwrap();

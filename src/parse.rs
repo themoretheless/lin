@@ -467,10 +467,12 @@ impl<'a> Parser<'a> {
             return Ok(Step::Search { mode, query });
         }
         if self.eat_kw("count") {
-            self.expect_kw("by")?;
-            return Ok(Step::Count {
-                by: self.parse_field()?,
-            });
+            let by = if self.eat_kw("by") {
+                Some(self.parse_field()?)
+            } else {
+                None
+            };
+            return Ok(Step::Count { by });
         }
         if self.eat_kw("sum") {
             let field = self.parse_field()?;
