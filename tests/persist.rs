@@ -504,12 +504,17 @@ fn writer_lock_rejects_second_open() {
         err.to_string().contains("locked"),
         "expected lock error, got {err}"
     );
-    // Cold reader also blocked while exclusive writer holds LOCK.
-    let err = match Db::open_read(&dir) {
-        Ok(_) => panic!("open_read under writer should fail"),
-        Err(e) => e,
-    };
-    assert!(err.to_string().contains("locked"), "{err}");
+    // open_read uses FENCE shared — compatible with live writer.
+    let reader = Db::open_read(&dir).expect("open_read beside writer");
+    assert_eq!(
+        reader
+            .run(r#"docs | uri == "raw://lock""#)
+            .unwrap()
+            .done
+            .n,
+        1
+    );
+    drop(reader);
     a.close().unwrap();
     let mut b = Db::open(&dir).unwrap();
     assert_eq!(

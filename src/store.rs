@@ -122,6 +122,15 @@ pub struct Store {
     docs_title: Vec<Arc<str>>,
     docs_layer: Vec<Arc<str>>,
     docs_wing: Vec<Arc<str>>,
+    /// Columnar facts (append hot path). `collections["facts"]` may lag until
+    /// [`Self::ensure_facts_rows`].
+    facts_s: Vec<Arc<str>>,
+    facts_p: Vec<Arc<str>>,
+    facts_o: Vec<Arc<str>>,
+    /// When true, columnar facts are ahead of `collections["facts"]`.
+    facts_rows_stale: bool,
+    /// mmap cold collections not yet promoted into `collections`.
+    cold: BTreeMap<String, crate::cold::ColdCol>,
 }
 
 /// Cheap undo for append-only packs (insert / append) — no full store clone.
@@ -156,11 +165,16 @@ impl Store {
             docs_title: Vec::new(),
             docs_layer: Vec::new(),
             docs_wing: Vec::new(),
+            facts_s: Vec::new(),
+            facts_p: Vec::new(),
+            facts_o: Vec::new(),
+            facts_rows_stale: false,
+            cold: BTreeMap::new(),
         }
     }
 
     /// Deep-copy the memory image (no durable handle). Used for read snapshots.
-    pub fn clone_mem(&self) -> Self {
+    pub fn clone_mem(&mut self) -> Self {
         let mut s = Self::empty(self.embed_id.clone());
         s.mem_restore(self.mem_backup());
         s
@@ -313,15 +327,21 @@ impl Store {
             docs_title: Vec::new(),
             docs_layer: Vec::new(),
             docs_wing: Vec::new(),
+            facts_s: Vec::new(),
+            facts_p: Vec::new(),
+            facts_o: Vec::new(),
+            facts_rows_stale: false,
+            cold: BTreeMap::new(),
         };
         for name in store.extra_collections.keys() {
             store.collections.entry(name.clone()).or_default();
         }
         for name in &s.cold_collections {
-            // Prefer mmap cold cache when present; else keep inlined MessagePack rows.
             if crate::cold::cold_path(dir, name).exists() {
+                // Lazy: mmap only; rows page-in on first collection() access.
                 let col = cold::map_cold(dir, name)?;
-                store.collections.insert(name.clone(), col.into_rows()?);
+                store.collections.insert(name.clone(), Vec::new());
+                store.cold.insert(name.clone(), col);
             }
         }
         store.rebuild_indexes();
@@ -330,11 +350,16 @@ impl Store {
     }
 
     /// Capture current memory image (for backup / checkpoint payload).
-    pub fn capture_snapshot(&self, catalog_hash: impl Into<String>) -> Snapshot {
+    pub fn capture_snapshot(&mut self, catalog_hash: impl Into<String>) -> Snapshot {
         self.capture_snapshot_at(catalog_hash, 0)
     }
 
-    pub fn capture_snapshot_at(&self, catalog_hash: impl Into<String>, log_offset: u64) -> Snapshot {
+    pub fn capture_snapshot_at(&mut self, catalog_hash: impl Into<String>, log_offset: u64) -> Snapshot {
+        self.ensure_facts_rows();
+        let cold_names: Vec<String> = self.cold.keys().cloned().collect();
+        for name in cold_names {
+            self.promote_cold(&name);
+        }
         Snapshot {
             r#gen: self.r#gen,
             embed_id: self.embed_id.clone(),
@@ -408,7 +433,7 @@ impl Store {
         Ok(())
     }
 
-    pub fn maybe_checkpoint(&self, persist: &mut Persist) -> Result<(), Error> {
+    pub fn maybe_checkpoint(&mut self, persist: &mut Persist) -> Result<(), Error> {
         if persist.writes_since_snapshot >= persist::SNAPSHOT_EVERY {
             self.write_snapshot(persist)?;
         }
@@ -416,11 +441,13 @@ impl Store {
     }
 
     /// Force a durable checkpoint (snapshot + head fsync).
-    pub fn checkpoint(&self, persist: &mut Persist) -> Result<(), Error> {
+    pub fn checkpoint(&mut self, persist: &mut Persist) -> Result<(), Error> {
         self.write_snapshot(persist)
     }
 
-    pub fn write_snapshot(&self, persist: &mut Persist) -> Result<(), Error> {
+    pub fn write_snapshot(&mut self, persist: &mut Persist) -> Result<(), Error> {
+        // Exclude open_read processes while publishing snapshot + compacting log.
+        let _fence = persist::acquire_fence_exclusive(&persist.dir)?;
         // Ensure log content is fully durable before publishing snapshot/head.
         // Normal mode: this is the durability point for prior commits.
         persist::durable_sync(&persist.log)
@@ -512,16 +539,7 @@ impl Store {
                 let _ = self.append_fact_row(row.clone());
             }
             Pack::AppendFactsBulk { s, p, o } => {
-                let n = s.len().min(p.len()).min(o.len());
-                self.collection_mut("facts").reserve(n);
-                self.facts_by_spo.reserve(n);
-                for i in 0..n {
-                    let mut row = BTreeMap::new();
-                    row.insert("s".into(), Cell::text_arc(s[i].as_str()));
-                    row.insert("p".into(), Cell::text_arc(p[i].as_str()));
-                    row.insert("o".into(), Cell::text_arc(o[i].as_str()));
-                    let _ = self.append_fact_row(row);
-                }
+                let _ = self.append_facts_spo_bulk(s, p, o, false);
             }
             Pack::AppendEdge { rel, from, to } => {
                 let _ = self.append_edge_parts(rel, from, to);
@@ -621,7 +639,12 @@ impl Store {
         }
     }
 
-    pub fn mem_backup(&self) -> MemBackup {
+    pub fn mem_backup(&mut self) -> MemBackup {
+        self.ensure_facts_rows();
+        let cold_names: Vec<String> = self.cold.keys().cloned().collect();
+        for name in cold_names {
+            self.promote_cold(&name);
+        }
         MemBackup {
             r#gen: self.r#gen,
             embed_id: self.embed_id.clone(),
@@ -631,7 +654,6 @@ impl Store {
             extra_collections: self.extra_collections.clone(),
             extra_rels: self.extra_rels.clone(),
             extra_indexes: self.extra_indexes.clone(),
-            // indexes / row maps rebuilt on restore — avoid O(n) clone of trees
         }
     }
 
@@ -754,7 +776,65 @@ impl Store {
         id
     }
 
+    /// Facts row count (columnar or materialized).
+    pub fn facts_len(&self) -> usize {
+        self.facts_s
+            .len()
+            .max(self.collections.get("facts").map(|c| c.len()).unwrap_or(0))
+    }
+
+    /// Row count including columnar facts not yet materialized into `collections`.
+    pub fn row_count(&self) -> usize {
+        let mut n = 0usize;
+        for (name, rows) in &self.collections {
+            if name == "facts" && self.facts_rows_stale {
+                n += self.facts_s.len();
+            } else if rows.is_empty() {
+                if let Some(c) = self.cold.get(name) {
+                    n += c.rows().map(|r| r.len()).unwrap_or(0);
+                }
+            } else {
+                n += rows.len();
+            }
+        }
+        n
+    }
+
+    /// Materialize columnar facts into `collections["facts"]` (no-op if fresh).
+    pub fn ensure_facts_rows(&mut self) {
+        if !self.facts_rows_stale {
+            return;
+        }
+        let n = self.facts_s.len();
+        let facts = self.collections.entry("facts".into()).or_default();
+        facts.clear();
+        facts.reserve(n);
+        for i in 0..n {
+            let mut row = BTreeMap::new();
+            row.insert("s".into(), Cell::Text(Arc::clone(&self.facts_s[i])));
+            row.insert("p".into(), Cell::Text(Arc::clone(&self.facts_p[i])));
+            row.insert("o".into(), Cell::Text(Arc::clone(&self.facts_o[i])));
+            facts.push(row);
+        }
+        self.facts_rows_stale = false;
+    }
+
+    /// Promote a cold mmap collection into `collections` (idempotent).
+    pub fn promote_cold(&mut self, name: &str) {
+        let Some(col) = self.cold.remove(name) else {
+            return;
+        };
+        if let Ok(rows) = col.into_rows() {
+            self.collections.insert(name.to_string(), rows);
+        }
+    }
+
     pub fn collection(&self, name: &str) -> &[Row] {
+        if let Some(c) = self.cold.get(name) {
+            if let Ok(rows) = c.rows() {
+                return rows;
+            }
+        }
         self.collections
             .get(name)
             .map(|v| v.as_slice())
@@ -762,6 +842,10 @@ impl Store {
     }
 
     pub fn collection_mut(&mut self, name: &str) -> &mut Vec<Row> {
+        if name == "facts" {
+            self.ensure_facts_rows();
+        }
+        self.promote_cold(name);
         if let Some(v) = self.collections.get_mut(name) {
             return v;
         }
@@ -867,6 +951,7 @@ impl Store {
     }
 
     pub fn rebuild_row_maps(&mut self) {
+        self.ensure_facts_rows();
         self.by_id.clear();
         self.docs_by_uri.clear();
         self.facts_by_spo.clear();
@@ -876,6 +961,27 @@ impl Store {
             self.rebuild_row_maps_collection(&name);
         }
         self.rebuild_edge_keys();
+        // Keep columnar facts aligned with materialized rows.
+        self.facts_s.clear();
+        self.facts_p.clear();
+        self.facts_o.clear();
+        if let Some(facts) = self.collections.get("facts") {
+            self.facts_s.reserve(facts.len());
+            self.facts_p.reserve(facts.len());
+            self.facts_o.reserve(facts.len());
+            for row in facts {
+                if let Some((s, p, o)) = spo_key(row) {
+                    self.facts_s.push(s);
+                    self.facts_p.push(p);
+                    self.facts_o.push(o);
+                } else {
+                    self.facts_s.push(Arc::from(""));
+                    self.facts_p.push(Arc::from(""));
+                    self.facts_o.push(Arc::from(""));
+                }
+            }
+        }
+        self.facts_rows_stale = false;
     }
 
     fn rebuild_edge_keys(&mut self) {
@@ -893,22 +999,32 @@ impl Store {
     /// Idempotent fact insert. Returns `(row, changed)`.
     pub fn append_fact_row(&mut self, row: Row) -> (Row, bool) {
         let Some(key) = spo_key(&row) else {
+            self.ensure_facts_rows();
             self.collection_mut("facts").push(row);
             let row = self.collection("facts").last().unwrap().clone();
             return (row, true);
         };
         if let Some(&idx) = self.facts_by_spo.get(&key) {
+            self.ensure_facts_rows();
             return (self.collection("facts")[idx].clone(), false);
         }
-        let idx = self.collection("facts").len();
+        let sa = Arc::clone(&key.0);
+        let pa = Arc::clone(&key.1);
+        let oa = Arc::clone(&key.2);
+        let idx = self.facts_s.len();
         self.facts_by_spo.insert(key, idx);
-        self.collection_mut("facts").push(row);
+        self.facts_s.push(sa);
+        self.facts_p.push(pa);
+        self.facts_o.push(oa);
+        self.facts_rows_stale = true;
+        self.ensure_facts_rows();
         let out = self.collection("facts")[idx].clone();
         (out, true)
     }
 
-    /// Bulk append facts from columnar s/p/o (one map insert each, no double-clone).
-    /// If `want_rows` is false, skips cloning rows for the Handle (large bulk path).
+    /// Bulk append facts from columnar s/p/o.
+    /// When `want_rows` is false, skips `BTreeMap` row builds (materialize later via
+    /// [`Self::ensure_facts_rows`]) — keeps durable_append sync off the alloc path.
     pub fn append_facts_spo_bulk(
         &mut self,
         s: &[String],
@@ -918,18 +1034,15 @@ impl Store {
     ) -> (Vec<Row>, usize) {
         let n = s.len().min(p.len()).min(o.len());
         self.facts_by_spo.reserve(n);
-        let facts = self
-            .collections
-            .get_mut("facts")
-            .expect("facts collection");
-        facts.reserve(n);
+        self.facts_s.reserve(n);
+        self.facts_p.reserve(n);
+        self.facts_o.reserve(n);
         let mut rows = if want_rows {
             Vec::with_capacity(n)
         } else {
             Vec::new()
         };
         let mut changed = 0usize;
-        // Short keys: clone from static once per insert (SSO), avoid "facts".to_string() churn.
         for i in 0..n {
             let sa: Arc<str> = Arc::from(s[i].as_str());
             let pa: Arc<str> = Arc::from(p[i].as_str());
@@ -937,21 +1050,29 @@ impl Store {
             let key = (Arc::clone(&sa), Arc::clone(&pa), Arc::clone(&oa));
             if let Some(&idx) = self.facts_by_spo.get(&key) {
                 if want_rows {
-                    rows.push(facts[idx].clone());
+                    self.ensure_facts_rows();
+                    rows.push(self.collections["facts"][idx].clone());
                 }
                 continue;
             }
-            let idx = facts.len();
+            let idx = self.facts_s.len();
             self.facts_by_spo.insert(key, idx);
-            let mut row = BTreeMap::new();
-            row.insert("s".into(), Cell::Text(sa));
-            row.insert("p".into(), Cell::Text(pa));
-            row.insert("o".into(), Cell::Text(oa));
-            if want_rows {
-                rows.push(row.clone());
-            }
-            facts.push(row);
+            self.facts_s.push(sa);
+            self.facts_p.push(pa);
+            self.facts_o.push(oa);
+            self.facts_rows_stale = true;
             changed += 1;
+            if want_rows {
+                // Build only the returned row; full vec sync via ensure later.
+                let mut row = BTreeMap::new();
+                row.insert("s".into(), Cell::Text(Arc::clone(&self.facts_s[idx])));
+                row.insert("p".into(), Cell::Text(Arc::clone(&self.facts_p[idx])));
+                row.insert("o".into(), Cell::Text(Arc::clone(&self.facts_o[idx])));
+                rows.push(row);
+            }
+        }
+        if want_rows && changed > 0 {
+            self.ensure_facts_rows();
         }
         (rows, changed)
     }

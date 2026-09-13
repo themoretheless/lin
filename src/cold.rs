@@ -3,11 +3,13 @@
 //! On checkpoint with `OpenOpts.cold`, large collections are also written to
 //! `cold/<name>.bin` (MessagePack `Vec<Row>`, magic `LIN\x03`) as a decode
 //! cache. The durable `snapshot` (`LIN\x04` MessagePack) stays **self-contained**
-//! with the same rows inlined — backup/copy never depends on cold files alone.
+//! with the same rows inlined. Open may keep cold cols mmapped and page-in
+//! lazily on first access.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use memmap2::Mmap;
 
@@ -28,21 +30,38 @@ pub fn cold_path(data: &Path, name: &str) -> PathBuf {
     cold_dir(data).join(format!("{name}.bin"))
 }
 
-/// Memory-map of a MessagePack-encoded `Vec<Row>`.
+/// Memory-map of a MessagePack-encoded `Vec<Row>` with lazy materialize.
 pub struct ColdCol {
     mmap: Mmap,
+    hot: OnceLock<Vec<Row>>,
 }
 
 impl std::fmt::Debug for ColdCol {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ColdCol")
             .field("bytes", &self.mmap.len())
+            .field("materialized", &self.hot.get().is_some())
             .finish()
     }
 }
 
 impl ColdCol {
-    pub fn into_rows(self) -> Result<Vec<Row>, Error> {
+    pub fn rows(&self) -> Result<&[Row], Error> {
+        if self.hot.get().is_none() {
+            let decoded = self.decode()?;
+            let _ = self.hot.set(decoded);
+        }
+        Ok(self.hot.get().map(|v| v.as_slice()).unwrap_or(&[]))
+    }
+
+    pub fn into_rows(mut self) -> Result<Vec<Row>, Error> {
+        if let Some(v) = self.hot.take() {
+            return Ok(v);
+        }
+        self.decode()
+    }
+
+    fn decode(&self) -> Result<Vec<Row>, Error> {
         if self.mmap.len() < 4 || self.mmap[0..4] != COLD_MAGIC {
             return Err(io_err("bad cold magic"));
         }
@@ -81,7 +100,10 @@ pub fn map_cold(data: &Path, name: &str) -> Result<ColdCol, Error> {
     if mmap.len() < 4 || mmap[0..4] != COLD_MAGIC {
         return Err(io_err(format!("bad cold file: {}", path.display())));
     }
-    Ok(ColdCol { mmap })
+    Ok(ColdCol {
+        mmap,
+        hot: OnceLock::new(),
+    })
 }
 
 /// Drop stale cold files not listed in `keep`.

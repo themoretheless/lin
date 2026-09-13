@@ -31,6 +31,8 @@ pub const HEAD_NAME: &str = "head";
 pub const LOG_NAME: &str = "log";
 pub const SNAPSHOT_NAME: &str = "snapshot";
 pub const LOCK_NAME: &str = "LOCK";
+/// Shared fence for multi-process readers; writer takes exclusive only during checkpoint.
+pub const FENCE_NAME: &str = "FENCE";
 /// On-disk snapshot: `LIN\x04` + MessagePack(`Snapshot`). Legacy JSON still reads.
 pub const SNAPSHOT_MAGIC: [u8; 4] = *b"LIN\x04";
 /// Portable backup uses the same MessagePack envelope (self-contained, no cold refs).
@@ -250,6 +252,10 @@ pub fn lock_path(dir: &Path) -> PathBuf {
     dir.join(LOCK_NAME)
 }
 
+pub fn fence_path(dir: &Path) -> PathBuf {
+    dir.join(FENCE_NAME)
+}
+
 pub fn log_len(dir: &Path) -> Result<u64, Error> {
     let path = log_path(dir);
     if !path.exists() {
@@ -258,7 +264,7 @@ pub fn log_len(dir: &Path) -> Result<u64, Error> {
     Ok(fs::metadata(&path).map_err(io_err)?.len())
 }
 
-/// Exclusive advisory lock for a writer. Errors if another writer holds the dir.
+/// Exclusive advisory lock for a writer (writer↔writer only).
 pub fn acquire_writer_lock(dir: &Path) -> Result<File, Error> {
     ensure_dir(dir)?;
     let f = OpenOptions::new()
@@ -274,14 +280,28 @@ pub fn acquire_writer_lock(dir: &Path) -> Result<File, Error> {
             io_err(e)
         }
     })?;
+    // Ensure fence file exists for readers.
+    let _ = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(fence_path(dir))
+        .map_err(io_err)?;
     Ok(f)
 }
 
-/// Shared advisory lock for cold readers (allows multiple readers, blocks writers).
+/// Shared fence lock for cold readers — **compatible with a live writer**.
+/// Blocks only while a writer holds an exclusive fence during checkpoint.
 pub fn acquire_reader_lock(dir: &Path) -> Result<File, Error> {
-    let path = lock_path(dir);
+    let path = fence_path(dir);
     if !path.exists() {
-        // No writer has created LOCK yet — open/create for shared.
+        let lock = lock_path(dir);
+        if !lock.exists() && !dir.exists() {
+            return Err(Error::runtime(format!(
+                "data dir not found: {}",
+                dir.display()
+            )));
+        }
         let _ = OpenOptions::new()
             .create(true)
             .read(true)
@@ -295,11 +315,31 @@ pub fn acquire_reader_lock(dir: &Path) -> Result<File, Error> {
         .map_err(io_err)?;
     flock_nb(&f, false).map_err(|e| {
         if e.kind() == io::ErrorKind::WouldBlock {
-            Error::runtime("data dir locked by another writer")
+            Error::runtime("data dir checkpoint in progress")
         } else {
             io_err(e)
         }
     })?;
+    Ok(f)
+}
+
+/// Exclusive fence for publishing a snapshot (waits out shared readers).
+pub fn acquire_fence_exclusive(dir: &Path) -> Result<File, Error> {
+    let f = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(fence_path(dir))
+        .map_err(io_err)?;
+    // Blocking exclusive — checkpoint waits for open_read holders.
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) };
+        if rc != 0 {
+            return Err(io_err(std::io::Error::last_os_error()));
+        }
+    }
     Ok(f)
 }
 

@@ -10,22 +10,19 @@ Lin — язык своей локальной БД: пайпы, типизир�
 
 Публичный контракт: `Db::{empty,fixture,open,open_with,open_read,close,checkpoint,run,prepare,explain_as,reader,export_backup,import_backup,import_backup_into,export_wal_since,apply_wal,stats,with_quotas,with_sync_mode}`, `ReadDb::{run,prepare,stats,clone}`, `Quotas`, `SyncMode`, `OpenOpts`, плюс `parse` / `compile` / `run` / `explain*`, типы `Handle` / `Done` / `Prepared` / `Error` / `Row` / `Cell` / `Store` / `Plan` / `Stats` / `VERSION`.
 
-`Db::reader()` — in-process снимок текущего `gen`. `open_read` не параллелен writer. `export_wal_since` / `apply_wal` — ship WAL; **`apply_wal` только in-memory** (не пишет durable log). `pin`/`unpin` (алиасы `snapshot`/`restore`) — memory-pins, не disk checkpoint. Snapshot на диске: `LIN\x04` MessagePack, self-contained; `cold/*.bin` — опциональный cache.
+`Db::reader()` — in-process снимок текущего `gen`. `open_read` — shared **FENCE** (можно рядом с writer; checkpoint ждёт readers). `export_wal_since` / `apply_wal` — ship WAL; **`apply_wal` только in-memory**. `pin`/`unpin` — memory-pins. Snapshot: `LIN\x04` MessagePack self-contained; `cold/*.bin` — lazy mmap page-in.
 
 ## Local-prod guarantees
 
 | Есть | Нет |
 |---|---|
-| Crash после успешного commit (`SyncMode::Full`) → log/snapshot | Multi-process multi-writer |
-| Exclusive flock на writer `open` | Real vec/FTS indexes |
-| Checkpoint уплотняет log → 0 bytes | Полноценный multi-writer MVCC |
-| Quotas: rows / edges / log bytes | |
-| `SyncMode::Normal` — **opt-in**, flush только на checkpoint/close (краш теряет хвост) | Multi-process readers+writer |
-| `OpenOpts.cold` — spill на диск (`cold/*.bin`); после open всё равно полный RAM | Lazy mmap page-in |
-| WAL shipping bytes + gen-pin `reader()` | Сеть / multi-writer MVCC |
-| `stats.sync_normal` / `stats.cold` | |
+| Crash после успешного commit (`SyncMode::Full`) → log/snapshot | Multi-writer / сеть / полный MVCC |
+| Exclusive `LOCK` (writer↔writer) | Real vec/FTS indexes |
+| Shared `FENCE` — `open_read`∥writer; checkpoint ждёт readers | |
+| Cold lazy mmap page-in | |
+| Quotas / `SyncMode::Normal` (opt-in) / WAL ship / pins | |
 
-Память = полный image после open (snapshot + cold decode + tail). Durable `Db` на `Drop` делает best-effort checkpoint.
+Память = snapshot + lazy cold page-in + WAL tail. Durable `Db` на `Drop` — best-effort checkpoint.
 
 ## Лаконичный диалект
 
@@ -91,9 +88,9 @@ rel cites
 |---|---|
 | P0 semver 0.2 + честный search | **готово** |
 | P1 backup + multi-reader + compaction + ops + flock + quotas | **готово** |
-| P2 mmap/cold collections | **готово** (`OpenOpts.cold`) |
+| P2 mmap/cold collections | **готово** + lazy page-in |
 | SyncMode::Normal | **готово** |
-| P3 сеть / MVCC | **тонкий срез**: WAL ship + `reader()`; не multi-writer |
+| P3 сеть / MVCC | WAL ship + `reader()` + `open_read`∥writer (FENCE); не multi-writer |
 
 ## Бенчмарки (rbench): Lin vs SQLite vs DuckDB vs Postgres vs MySQL
 

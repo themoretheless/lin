@@ -242,9 +242,10 @@ impl Db {
 
     /// Open a durable data dir as a read-only snapshot (no log truncate / no head write).
     ///
-    /// Uses a **shared** flock: blocked while a writer holds exclusive `LOCK`.
-    /// Concurrent multi-process readers+writer are not supported — use in-process
-    /// [`Self::reader`] for concurrent reads beside a live writer.
+    /// Uses a **shared FENCE** lock: compatible with a live writer. May see a
+    /// slightly stale image (commits after open are not visible). Checkpoint waits
+    /// for readers. For in-process concurrent reads beside a writer, prefer
+    /// [`Self::reader`].
     pub fn open_read(path: impl AsRef<Path>) -> Result<ReadDb, Error> {
         let t0 = Instant::now();
         let catalog = crate::catalog::fixture();
@@ -291,7 +292,7 @@ impl Db {
     }
 
     /// Freeze a consistent in-memory snapshot at the current `gen` for concurrent readers.
-    pub fn reader(&self) -> ReadDb {
+    pub fn reader(&mut self) -> ReadDb {
         ReadDb {
             inner: Arc::new(Self {
                 catalog: self.catalog.clone(),
@@ -364,7 +365,7 @@ impl Db {
         Stats {
             r#gen: self.store.r#gen,
             docs: self.store.collection("docs").len(),
-            facts: self.store.collection("facts").len(),
+            facts: self.store.facts_len(),
             edges: self.store.edges.len(),
             next_id: self.store.next_id,
             log_bytes,
@@ -378,7 +379,7 @@ impl Db {
     }
 
     fn total_rows(&self) -> usize {
-        self.store.collections.values().map(|c| c.len()).sum()
+        self.store.row_count()
     }
 
     fn check_quotas(&self) -> Result<(), Error> {
