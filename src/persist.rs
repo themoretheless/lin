@@ -192,6 +192,8 @@ pub struct Persist {
     pub lock: File,
     pub catalog_hash: String,
     pub writes_since_snapshot: u32,
+    /// Reused WAL encode buffer (avoids per-commit alloc).
+    pub(crate) encode_buf: Vec<u8>,
 }
 
 pub fn io_err(e: impl std::fmt::Display) -> Error {
@@ -408,26 +410,39 @@ pub fn open_log_read(dir: &Path) -> Result<Option<File>, Error> {
 /// Append one record and durability-flush the log. Must complete before `gen` bumps.
 /// Hot packs (`AppendFactsBulk` / `InsertCols`) use raw `LIN\x02` framing (no serde).
 /// Other packs use MessagePack behind `LIN\x01`. Legacy JSON still replays.
-pub fn append_record(log: &mut File, rec: &LogRecord) -> Result<(), Error> {
+pub fn append_record(log: &mut File, rec: &LogRecord, buf: &mut Vec<u8>) -> Result<(), Error> {
     match &rec.pack {
-        Pack::AppendFactsBulk { s, p, o } => append_facts_v2(log, rec.r#gen, rec.next_id, s, p, o),
+        Pack::AppendFactsBulk { s, p, o } => {
+            append_facts_v2(log, rec.r#gen, rec.next_id, s, p, o, buf)
+        }
         Pack::InsertCols {
             collection,
             fields,
             cols,
             n,
             edges,
-        } => append_insert_cols_v2(log, rec.r#gen, rec.next_id, collection, fields, cols, *n, edges),
-        _ => append_record_v1(log, rec),
+        } => append_insert_cols_v2(
+            log,
+            rec.r#gen,
+            rec.next_id,
+            collection,
+            fields,
+            cols,
+            *n,
+            edges,
+            buf,
+        ),
+        _ => append_record_v1(log, rec, buf),
     }
 }
 
-fn append_record_v1(log: &mut File, rec: &LogRecord) -> Result<(), Error> {
-    let payload = rmp_serde::to_vec_named(rec).map_err(io_err)?;
-    if payload.len() > MAX_RECORD as usize {
+fn append_record_v1(log: &mut File, rec: &LogRecord, buf: &mut Vec<u8>) -> Result<(), Error> {
+    buf.clear();
+    rmp_serde::encode::write_named(buf, rec).map_err(io_err)?;
+    if buf.len() > MAX_RECORD as usize {
         return Err(io_err("log record exceeds 16MiB"));
     }
-    write_frame(log, &LOG_MAGIC_V1, &payload)
+    write_frame(log, &LOG_MAGIC_V1, buf)
 }
 
 fn write_frame(log: &mut File, magic: &[u8; 4], payload: &[u8]) -> Result<(), Error> {
@@ -435,11 +450,12 @@ fn write_frame(log: &mut File, magic: &[u8; 4], payload: &[u8]) -> Result<(), Er
     if len > MAX_RECORD {
         return Err(io_err("log record exceeds 16MiB"));
     }
-    let mut buf = Vec::with_capacity(4 + 4 + payload.len());
-    buf.extend_from_slice(magic);
-    buf.extend_from_slice(&len.to_le_bytes());
-    buf.extend_from_slice(payload);
-    log.write_all(&buf).map_err(io_err)?;
+    // Header without copying payload into a giant Vec.
+    let mut hdr = [0u8; 8];
+    hdr[..4].copy_from_slice(magic);
+    hdr[4..].copy_from_slice(&len.to_le_bytes());
+    log.write_all(&hdr).map_err(io_err)?;
+    log.write_all(payload).map_err(io_err)?;
     log.sync_data().map_err(io_err)?;
     Ok(())
 }
@@ -457,19 +473,21 @@ fn append_facts_v2(
     s: &[String],
     p: &[String],
     o: &[String],
+    buf: &mut Vec<u8>,
 ) -> Result<(), Error> {
     let n = s.len().min(p.len()).min(o.len());
-    let mut payload = Vec::with_capacity(1 + 8 + 8 + 4 + n * 24);
-    payload.push(V2_FACTS_BULK);
-    payload.extend_from_slice(&rec_gen.to_le_bytes());
-    payload.extend_from_slice(&next_id.to_le_bytes());
-    payload.extend_from_slice(&(n as u32).to_le_bytes());
+    buf.clear();
+    buf.reserve(1 + 8 + 8 + 4 + n * 24);
+    buf.push(V2_FACTS_BULK);
+    buf.extend_from_slice(&rec_gen.to_le_bytes());
+    buf.extend_from_slice(&next_id.to_le_bytes());
+    buf.extend_from_slice(&(n as u32).to_le_bytes());
     for i in 0..n {
-        put_str(&mut payload, &s[i]);
-        put_str(&mut payload, &p[i]);
-        put_str(&mut payload, &o[i]);
+        put_str(buf, &s[i]);
+        put_str(buf, &p[i]);
+        put_str(buf, &o[i]);
     }
-    write_frame(log, &LOG_MAGIC_V2, &payload)
+    write_frame(log, &LOG_MAGIC_V2, buf)
 }
 
 fn append_insert_cols_v2(
@@ -481,6 +499,7 @@ fn append_insert_cols_v2(
     cols: &[ColData],
     n: u32,
     edges: &[Edge],
+    buf: &mut Vec<u8>,
 ) -> Result<(), Error> {
     // Fallback to msgpack if edges present (rare in bulk benches) or column mismatch.
     if !edges.is_empty() || fields.len() != cols.len() {
@@ -497,52 +516,54 @@ fn append_insert_cols_v2(
                     edges: edges.to_vec(),
                 },
             },
+            buf,
         );
     }
-    let mut payload = Vec::with_capacity(64 + fields.len() * 16 + (n as usize) * 32);
-    payload.push(V2_INSERT_COLS);
-    payload.extend_from_slice(&rec_gen.to_le_bytes());
-    payload.extend_from_slice(&next_id.to_le_bytes());
-    put_str(&mut payload, collection);
-    payload.extend_from_slice(&n.to_le_bytes());
-    payload.extend_from_slice(&(fields.len() as u32).to_le_bytes());
+    buf.clear();
+    buf.reserve(64 + fields.len() * 16 + (n as usize) * 32);
+    buf.push(V2_INSERT_COLS);
+    buf.extend_from_slice(&rec_gen.to_le_bytes());
+    buf.extend_from_slice(&next_id.to_le_bytes());
+    put_str(buf, collection);
+    buf.extend_from_slice(&n.to_le_bytes());
+    buf.extend_from_slice(&(fields.len() as u32).to_le_bytes());
     for (f, c) in fields.iter().zip(cols.iter()) {
-        put_str(&mut payload, f);
+        put_str(buf, f);
         match c {
             ColData::Text(v) => {
-                payload.push(1);
+                buf.push(1);
                 for s in v {
-                    put_str(&mut payload, s);
+                    put_str(buf, s);
                 }
             }
             ColData::Int(v) => {
-                payload.push(2);
+                buf.push(2);
                 for x in v {
-                    payload.extend_from_slice(&x.to_le_bytes());
+                    buf.extend_from_slice(&x.to_le_bytes());
                 }
             }
             ColData::Float(v) => {
-                payload.push(3);
+                buf.push(3);
                 for x in v {
-                    payload.extend_from_slice(&x.to_le_bytes());
+                    buf.extend_from_slice(&x.to_le_bytes());
                 }
             }
             ColData::Bool(v) => {
-                payload.push(4);
+                buf.push(4);
                 for x in v {
-                    payload.push(u8::from(*x));
+                    buf.push(u8::from(*x));
                 }
             }
             ColData::Time(v) => {
-                payload.push(5);
+                buf.push(5);
                 for x in v {
-                    payload.extend_from_slice(&x.to_le_bytes());
+                    buf.extend_from_slice(&x.to_le_bytes());
                 }
             }
-            ColData::Null => payload.push(0),
+            ColData::Null => buf.push(0),
         }
     }
-    write_frame(log, &LOG_MAGIC_V2, &payload)
+    write_frame(log, &LOG_MAGIC_V2, buf)
 }
 
 /// Replay complete records with `gen > min_gen`. Returns the byte offset of
@@ -847,7 +868,7 @@ pub fn compact_log(log: &mut File) -> Result<(), Error> {
     truncate_log(log, 0)
 }
 
-/// Build columnar WAL pack from row maps (for durable insert).
+/// Build columnar insert pack in one pass (field set from first row + union).
 pub fn rows_to_insert_cols(
     collection: impl Into<String>,
     rows: &[crate::store::Row],
@@ -857,8 +878,21 @@ pub fn rows_to_insert_cols(
     use std::collections::BTreeSet;
 
     let n = rows.len() as u32;
+    if rows.is_empty() {
+        return Pack::InsertCols {
+            collection: collection.into(),
+            fields: Vec::new(),
+            cols: Vec::new(),
+            n: 0,
+            edges,
+        };
+    }
+    // Prefer key order of first row (hot docs path), then any extras.
     let mut field_set = BTreeSet::new();
-    for r in rows {
+    for k in rows[0].keys() {
+        field_set.insert(k.clone());
+    }
+    for r in rows.iter().skip(1) {
         for k in r.keys() {
             field_set.insert(k.clone());
         }
@@ -866,8 +900,8 @@ pub fn rows_to_insert_cols(
     let fields: Vec<String> = field_set.into_iter().collect();
     let mut cols = Vec::with_capacity(fields.len());
     for f in &fields {
-        // Infer column kind from first non-null cell.
-        let mut kind = 0u8; // 0 null, 1 text, 2 int, 3 float, 4 bool, 5 time
+        // Infer from first non-null in column.
+        let mut kind = 0u8;
         for r in rows {
             match r.get(f) {
                 Some(Cell::Text(_)) => {
@@ -897,12 +931,7 @@ pub fn rows_to_insert_cols(
             1 => {
                 let mut v = Vec::with_capacity(rows.len());
                 for r in rows {
-                    v.push(
-                        r.get(f)
-                            .and_then(Cell::text)
-                            .unwrap_or("")
-                            .to_string(),
-                    );
+                    v.push(r.get(f).and_then(Cell::text).unwrap_or("").to_string());
                 }
                 ColData::Text(v)
             }

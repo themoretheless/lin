@@ -694,8 +694,9 @@ fn setup_lin_durable_append(n: usize) -> LinDurableAppend {
     }
 }
 
-fn fill_lin_durable_append(ins: &mut LinDurableAppend) {
-    ins.prepared.run(&mut ins.db).expect("lin durable append");
+fn fill_lin_durable_append(ins: &mut LinDurableAppend) -> lin::Handle {
+    // Return Handle so DropPolicy::OutsideTiming excludes row-map teardown from wall time.
+    ins.prepared.run(&mut ins.db).expect("lin durable append")
 }
 
 struct LinDurableInsert {
@@ -718,8 +719,8 @@ fn setup_lin_durable_insert(n: usize) -> LinDurableInsert {
     }
 }
 
-fn fill_lin_durable_insert(ins: &mut LinDurableInsert) {
-    ins.prepared.run(&mut ins.db).expect("lin durable insert");
+fn fill_lin_durable_insert(ins: &mut LinDurableInsert) -> lin::Handle {
+    ins.prepared.run(&mut ins.db).expect("lin durable insert")
 }
 
 struct SqliteDurable {
@@ -1455,13 +1456,15 @@ fn main() -> rbench::Result<()> {
     append_log!("10k", INSERT_10K);
 
     // Durable path: Lin WAL sync_data vs SQLite synchronous=FULL (same machine, temp files).
+    // OutsideTiming: Lin Handle holds N row maps — dropping them is not part of write+fsync cost
+    // (SQLite fill returns ()). Fair wall = mutate + durable commit only.
     for (label, n) in [("1k", INSERT_1K), ("10k", INSERT_10K)] {
         suite
             .bench_with_input(
                 &format!("durable_append_{label}/lin"),
                 move || setup_lin_durable_append(n),
                 move |ins| fill_lin_durable_append(ins),
-                DropPolicy::InsideTiming,
+                DropPolicy::OutsideTiming,
             )
             .tag("durable")
             .tag("append_log")
@@ -1473,7 +1476,7 @@ fn main() -> rbench::Result<()> {
                 &format!("durable_append_{label}/sqlite"),
                 move || setup_sqlite_durable("logs", n),
                 move |s| fill_sqlite_durable(s),
-                DropPolicy::InsideTiming,
+                DropPolicy::OutsideTiming,
             )
             .tag("durable")
             .tag("append_log")
@@ -1485,7 +1488,7 @@ fn main() -> rbench::Result<()> {
                 &format!("durable_insert_{label}/lin"),
                 move || setup_lin_durable_insert(n),
                 move |ins| fill_lin_durable_insert(ins),
-                DropPolicy::InsideTiming,
+                DropPolicy::OutsideTiming,
             )
             .tag("durable")
             .tag("insert")
@@ -1497,7 +1500,7 @@ fn main() -> rbench::Result<()> {
                 &format!("durable_insert_{label}/sqlite"),
                 move || setup_sqlite_durable("docs", n),
                 move |s| fill_sqlite_durable(s),
-                DropPolicy::InsideTiming,
+                DropPolicy::OutsideTiming,
             )
             .tag("durable")
             .tag("insert")

@@ -241,6 +241,7 @@ impl Store {
             lock,
             catalog_hash: live_hash,
             writes_since_snapshot: 0,
+            encode_buf: Vec::with_capacity(64 * 1024),
         };
         Ok((store, persist))
     }
@@ -375,7 +376,12 @@ impl Store {
             next_id: self.next_id,
             pack,
         };
-        persist::append_record(&mut persist.log, &rec)?;
+        {
+            let Persist {
+                log, encode_buf, ..
+            } = persist;
+            persist::append_record(log, &rec, encode_buf)?;
+        }
         persist.writes_since_snapshot += 1;
         Ok(())
     }
@@ -848,8 +854,8 @@ impl Store {
     /// Idempotent fact insert. Returns `(row, changed)`.
     pub fn append_fact_row(&mut self, row: Row) -> (Row, bool) {
         let Some(key) = spo_key(&row) else {
-            let facts = self.collection_mut("facts");
-            facts.push(row.clone());
+            self.collection_mut("facts").push(row);
+            let row = self.collection("facts").last().unwrap().clone();
             return (row, true);
         };
         if let Some(&idx) = self.facts_by_spo.get(&key) {
@@ -857,8 +863,65 @@ impl Store {
         }
         let idx = self.collection("facts").len();
         self.facts_by_spo.insert(key, idx);
-        self.collection_mut("facts").push(row.clone());
-        (row, true)
+        self.collection_mut("facts").push(row);
+        let out = self.collection("facts")[idx].clone();
+        (out, true)
+    }
+
+    /// Bulk append facts from columnar s/p/o (one map insert each, no double-clone).
+    /// If `want_rows` is false, skips cloning rows for the Handle (large bulk path).
+    pub fn append_facts_spo_bulk(
+        &mut self,
+        s: &[String],
+        p: &[String],
+        o: &[String],
+        want_rows: bool,
+    ) -> (Vec<Row>, usize) {
+        let n = s.len().min(p.len()).min(o.len());
+        self.collection_mut("facts").reserve(n);
+        self.facts_by_spo.reserve(n);
+        let mut rows = if want_rows {
+            Vec::with_capacity(n)
+        } else {
+            Vec::new()
+        };
+        let mut changed = 0usize;
+        for i in 0..n {
+            let mut row = BTreeMap::new();
+            row.insert("s".into(), Cell::text_arc(s[i].as_str()));
+            row.insert("p".into(), Cell::text_arc(p[i].as_str()));
+            row.insert("o".into(), Cell::text_arc(o[i].as_str()));
+            let key = spo_key(&row);
+            if let Some(key) = key {
+                if let Some(&idx) = self.facts_by_spo.get(&key) {
+                    if want_rows {
+                        rows.push(self.collection("facts")[idx].clone());
+                    }
+                    continue;
+                }
+                let idx = self.collection("facts").len();
+                self.facts_by_spo.insert(key, idx);
+                if want_rows {
+                    self.collection_mut("facts").push(row.clone());
+                    rows.push(row);
+                } else {
+                    self.collection_mut("facts").push(row);
+                }
+                changed += 1;
+            } else if want_rows {
+                let (r, ok) = self.append_fact_row(row);
+                if ok {
+                    changed += 1;
+                }
+                rows.push(r);
+            } else {
+                let (_, ok) = self.append_fact_row(row);
+                if ok {
+                    changed += 1;
+                }
+            }
+        }
+        (rows, changed)
     }
 
     pub fn append_edge_parts(&mut self, rel: &str, from: &str, to: &str) -> bool {

@@ -439,6 +439,11 @@ impl Db {
             }
         };
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let n = if rows.is_empty() {
+            pack_affect_n(pack.as_ref()).unwrap_or(0)
+        } else {
+            rows.len()
+        };
         if let Some(pack) = pack {
             if let Err(e) = self.check_quotas() {
                 self.rollback(undo, cat_backup);
@@ -466,14 +471,13 @@ impl Db {
                 self.store.maybe_checkpoint(p)?;
             }
             if prepared.append_only {
-                self.append_rows += rows.len() as u64;
+                self.append_rows += n as u64;
                 self.append_ms += ms;
             }
         }
         if prepared.schema {
             self.plan_cache.clear();
         }
-        let n = rows.len();
         Ok(Handle {
             plan: prepared.plan.clone(),
             rows,
@@ -714,39 +718,36 @@ impl Db {
             Stmt::AppendFacts { records } => {
                 let now = now_ms();
                 let n = records.len();
-                self.store.collection_mut("facts").reserve(n);
-                self.store.facts_by_spo.reserve(n);
-                let mut rows = Vec::with_capacity(n);
-                let mut changed_n = 0usize;
-                let durable = self.is_durable();
-                let mut bulk_s = if durable {
-                    Vec::with_capacity(n)
-                } else {
-                    Vec::new()
-                };
-                let mut bulk_p = if durable {
-                    Vec::with_capacity(n)
-                } else {
-                    Vec::new()
-                };
-                let mut bulk_o = if durable {
-                    Vec::with_capacity(n)
-                } else {
-                    Vec::new()
-                };
+                let mut bulk_s = Vec::with_capacity(n);
+                let mut bulk_p = Vec::with_capacity(n);
+                let mut bulk_o = Vec::with_capacity(n);
                 for record in records {
-                    let row = record_row(record, now);
-                    let (row, changed) = self.store.append_fact_row(row);
-                    if changed {
-                        changed_n += 1;
-                        if durable {
-                            bulk_s.push(row_text(&row, "s").unwrap_or("").to_string());
-                            bulk_p.push(row_text(&row, "p").unwrap_or("").to_string());
-                            bulk_o.push(row_text(&row, "o").unwrap_or("").to_string());
-                        }
-                    }
-                    rows.push(row);
+                    let s = record
+                        .fields
+                        .iter()
+                        .find(|(k, _)| k == "s")
+                        .map(|(_, v)| value_text(v, now))
+                        .unwrap_or_default();
+                    let p = record
+                        .fields
+                        .iter()
+                        .find(|(k, _)| k == "p")
+                        .map(|(_, v)| value_text(v, now))
+                        .unwrap_or_default();
+                    let o = record
+                        .fields
+                        .iter()
+                        .find(|(k, _)| k == "o")
+                        .map(|(_, v)| value_text(v, now))
+                        .unwrap_or_default();
+                    bulk_s.push(s);
+                    bulk_p.push(p);
+                    bulk_o.push(o);
                 }
+                let want_rows = n <= 128;
+                let (rows, changed_n) =
+                    self.store
+                        .append_facts_spo_bulk(&bulk_s, &bulk_p, &bulk_o, want_rows);
                 let msg = if changed_n == 0 {
                     Some("idempotent".into())
                 } else {
@@ -754,7 +755,7 @@ impl Db {
                 };
                 let pack = if changed_n == 0 {
                     None
-                } else if durable {
+                } else if self.is_durable() {
                     Some(Pack::AppendFactsBulk {
                         s: bulk_s,
                         p: bulk_p,
@@ -1826,11 +1827,17 @@ impl Db {
         self.store.index_insert_slab(collection, start, &built)?;
         self.store
             .row_maps_register_slab(collection, start, &built);
-        // Move rows into the store (one ownership transfer; return keeps `built` via clone only if needed).
-        self.store
-            .collection_mut(collection)
-            .extend(built.iter().cloned());
-        Ok((built, new_edges))
+        let want_rows = built.len() <= 128;
+        if want_rows {
+            self.store
+                .collection_mut(collection)
+                .extend(built.iter().cloned());
+            Ok((built, new_edges))
+        } else {
+            // Large bulk: move into store, elide Handle.rows (done.n from pack).
+            self.store.collection_mut(collection).extend(built);
+            Ok((Vec::new(), new_edges))
+        }
     }
 
     fn update_cas(
@@ -2099,6 +2106,20 @@ fn field_names(fields: &[Field]) -> Vec<String> {
 
 fn pack_index_label(collection: &str, fields: &[String]) -> String {
     format!("{collection}[{}]", fields.join(","))
+}
+
+fn pack_affect_n(pack: Option<&Pack>) -> Option<usize> {
+    match pack? {
+        Pack::AppendFactsBulk { s, .. } => Some(s.len()),
+        Pack::AppendEdgesBulk { rel, .. } => Some(rel.len()),
+        Pack::InsertCols { n, .. } => Some(*n as usize),
+        Pack::InsertBulk { rows, .. } => Some(rows.len()),
+        Pack::Insert { .. } => Some(1),
+        Pack::AppendFact { .. } | Pack::AppendEdge { .. } | Pack::DeleteEdge { .. } => Some(1),
+        Pack::Update { rows, .. } | Pack::Delete { rows, .. } => Some(rows.len()),
+        Pack::Batch { packs } => Some(packs.iter().filter_map(|p| pack_affect_n(Some(p))).sum()),
+        _ => None,
+    }
 }
 
 fn fold_packs(packs: Vec<Pack>) -> Option<Pack> {
