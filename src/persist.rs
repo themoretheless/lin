@@ -182,6 +182,27 @@ pub struct Snapshot {
     pub extra_rels: std::collections::BTreeMap<String, RelSnap>,
     #[serde(default)]
     pub extra_indexes: std::collections::BTreeMap<String, IndexSnap>,
+    /// Collections stored in `cold/<name>.bin` (mmap), not in JSON bodies.
+    #[serde(default)]
+    pub cold_collections: Vec<String>,
+}
+
+/// When to durability-flush the WAL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SyncMode {
+    /// Flush after every commit frame (default; crash-safe when `run` returns).
+    #[default]
+    Full,
+    /// Flush only on checkpoint / close. Faster; crash may lose uncheckpointed commits.
+    Normal,
+}
+
+/// Options for durable [`Store::open_with`] / [`crate::exec::Db::open_with`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct OpenMemOpts {
+    pub sync: SyncMode,
+    /// Spill large collections to `cold/*.bin` on checkpoint; load via mmap.
+    pub cold: bool,
 }
 
 #[derive(Debug)]
@@ -194,6 +215,9 @@ pub struct Persist {
     pub writes_since_snapshot: u32,
     /// Reused WAL encode buffer (avoids per-commit alloc).
     pub(crate) encode_buf: Vec<u8>,
+    pub sync: SyncMode,
+    /// Spill large collections to mmap cold files on checkpoint.
+    pub cold: bool,
 }
 
 pub fn io_err(e: impl std::fmt::Display) -> Error {
@@ -407,13 +431,18 @@ pub fn open_log_read(dir: &Path) -> Result<Option<File>, Error> {
         .map_err(io_err)
 }
 
-/// Append one record and durability-flush the log. Must complete before `gen` bumps.
+/// Append one record and optionally durability-flush the log ([`SyncMode::Full`]).
 /// Hot packs (`AppendFactsBulk` / `InsertCols`) use raw `LIN\x02` framing (no serde).
 /// Other packs use MessagePack behind `LIN\x01`. Legacy JSON still replays.
-pub fn append_record(log: &mut File, rec: &LogRecord, buf: &mut Vec<u8>) -> Result<(), Error> {
+pub fn append_record(
+    log: &mut File,
+    rec: &LogRecord,
+    buf: &mut Vec<u8>,
+    sync: SyncMode,
+) -> Result<(), Error> {
     match &rec.pack {
         Pack::AppendFactsBulk { s, p, o } => {
-            append_facts_v2(log, rec.r#gen, rec.next_id, s, p, o, buf)
+            append_facts_v2(log, rec.r#gen, rec.next_id, s, p, o, buf, sync)
         }
         Pack::InsertCols {
             collection,
@@ -431,21 +460,32 @@ pub fn append_record(log: &mut File, rec: &LogRecord, buf: &mut Vec<u8>) -> Resu
             *n,
             edges,
             buf,
+            sync,
         ),
-        _ => append_record_v1(log, rec, buf),
+        _ => append_record_v1(log, rec, buf, sync),
     }
 }
 
-fn append_record_v1(log: &mut File, rec: &LogRecord, buf: &mut Vec<u8>) -> Result<(), Error> {
+fn append_record_v1(
+    log: &mut File,
+    rec: &LogRecord,
+    buf: &mut Vec<u8>,
+    sync: SyncMode,
+) -> Result<(), Error> {
     buf.clear();
     rmp_serde::encode::write_named(buf, rec).map_err(io_err)?;
     if buf.len() > MAX_RECORD as usize {
         return Err(io_err("log record exceeds 16MiB"));
     }
-    write_frame(log, &LOG_MAGIC_V1, buf)
+    write_frame(log, &LOG_MAGIC_V1, buf, sync)
 }
 
-fn write_frame(log: &mut File, magic: &[u8; 4], payload: &[u8]) -> Result<(), Error> {
+fn write_frame(
+    log: &mut File,
+    magic: &[u8; 4],
+    payload: &[u8],
+    sync: SyncMode,
+) -> Result<(), Error> {
     let len = payload.len() as u32;
     if len > MAX_RECORD {
         return Err(io_err("log record exceeds 16MiB"));
@@ -456,7 +496,9 @@ fn write_frame(log: &mut File, magic: &[u8; 4], payload: &[u8]) -> Result<(), Er
     hdr[4..].copy_from_slice(&len.to_le_bytes());
     log.write_all(&hdr).map_err(io_err)?;
     log.write_all(payload).map_err(io_err)?;
-    durable_sync(log).map_err(io_err)?;
+    if sync == SyncMode::Full {
+        durable_sync(log).map_err(io_err)?;
+    }
     Ok(())
 }
 
@@ -465,7 +507,7 @@ fn write_frame(log: &mut File, magic: &[u8; 4], payload: &[u8]) -> Result<(), Er
 /// On macOS/APFS, Rust's `File::sync_data` maps to `F_FULLFSYNC` (~ms). SQLite's
 /// `synchronous=FULL` uses `F_BARRIERFSYNC` on modern Darwin — same crash model
 /// for APFS, ~10× cheaper. Match that. Elsewhere: `sync_data` / `fdatasync`.
-fn durable_sync(file: &File) -> io::Result<()> {
+pub(crate) fn durable_sync(file: &File) -> io::Result<()> {
     #[cfg(target_vendor = "apple")]
     {
         use std::os::unix::io::AsRawFd;
@@ -498,6 +540,7 @@ fn append_facts_v2(
     p: &[String],
     o: &[String],
     buf: &mut Vec<u8>,
+    sync: SyncMode,
 ) -> Result<(), Error> {
     let n = s.len().min(p.len()).min(o.len());
     buf.clear();
@@ -511,7 +554,7 @@ fn append_facts_v2(
         put_str(buf, &p[i]);
         put_str(buf, &o[i]);
     }
-    write_frame(log, &LOG_MAGIC_V2, buf)
+    write_frame(log, &LOG_MAGIC_V2, buf, sync)
 }
 
 fn append_insert_cols_v2(
@@ -524,6 +567,7 @@ fn append_insert_cols_v2(
     n: u32,
     edges: &[Edge],
     buf: &mut Vec<u8>,
+    sync: SyncMode,
 ) -> Result<(), Error> {
     // Fallback to msgpack if edges present (rare in bulk benches) or column mismatch.
     if !edges.is_empty() || fields.len() != cols.len() {
@@ -541,6 +585,7 @@ fn append_insert_cols_v2(
                 },
             },
             buf,
+            sync,
         );
     }
     buf.clear();
@@ -587,7 +632,7 @@ fn append_insert_cols_v2(
             ColData::Null => buf.push(0),
         }
     }
-    write_frame(log, &LOG_MAGIC_V2, buf)
+    write_frame(log, &LOG_MAGIC_V2, buf, sync)
 }
 
 /// Replay complete records with `gen > min_gen`. Returns the byte offset of
@@ -890,6 +935,68 @@ pub fn truncate_log(log: &mut File, end: u64) -> Result<(), Error> {
 /// so the file does not grow forever. Sets length to 0 and seeks to start.
 pub fn compact_log(log: &mut File) -> Result<(), Error> {
     truncate_log(log, 0)
+}
+
+/// Export raw WAL frames with `gen > since_gen` (network / follower shipping).
+pub fn export_wal_since(dir: &Path, since_gen: u64) -> Result<Vec<u8>, Error> {
+    let mut log = match open_log_read(dir)? {
+        Some(f) => f,
+        None => return Ok(Vec::new()),
+    };
+    let file_len = log.metadata().map_err(io_err)?.len();
+    let mut out = Vec::new();
+    let mut pos = 0u64;
+    loop {
+        match read_one(&mut log, file_len, pos) {
+            ReadOne::Eof | ReadOne::Truncated => break,
+            ReadOne::Corrupt => return Err(io_err("corrupt log")),
+            ReadOne::Io(e) => return Err(e),
+            ReadOne::Ok { rec, next } => {
+                if rec.r#gen > since_gen {
+                    // Re-read raw frame bytes [pos, next).
+                    let len = (next - pos) as usize;
+                    let mut frame = vec![0u8; len];
+                    log.seek(SeekFrom::Start(pos)).map_err(io_err)?;
+                    log.read_exact(&mut frame).map_err(io_err)?;
+                    out.extend_from_slice(&frame);
+                    log.seek(SeekFrom::Start(next)).map_err(io_err)?;
+                }
+                pos = next;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Decode shipped WAL frames and invoke `on_rec` for each record.
+pub fn for_each_wal_frame(
+    frames: &[u8],
+    mut on_rec: impl FnMut(LogRecord) -> Result<(), Error>,
+) -> Result<usize, Error> {
+    let mut pos = 0usize;
+    let mut n = 0usize;
+    while pos < frames.len() {
+        if pos + 8 > frames.len() {
+            return Err(io_err("truncated wal frame"));
+        }
+        let magic: [u8; 4] = frames[pos..pos + 4].try_into().unwrap();
+        let len = u32::from_le_bytes(frames[pos + 4..pos + 8].try_into().unwrap()) as usize;
+        if len == 0 || len > MAX_RECORD as usize || pos + 8 + len > frames.len() {
+            return Err(io_err("bad wal frame length"));
+        }
+        let payload = &frames[pos + 8..pos + 8 + len];
+        let rec = if magic == LOG_MAGIC_V2 {
+            decode_v2(payload).map_err(|_| io_err("bad v2 wal payload"))?
+        } else if magic == LOG_MAGIC_V1 {
+            rmp_serde::from_slice(payload).map_err(io_err)?
+        } else {
+            return Err(io_err("unknown wal magic"));
+        };
+        on_rec(rec)?;
+        n += 1;
+        pos += 8 + len;
+    }
+    Ok(n)
 }
 
 /// Build columnar insert pack in one pass (field set from first row + union).

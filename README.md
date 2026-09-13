@@ -2,27 +2,30 @@
 
 Lin — язык своей локальной БД: пайпы, типизированный каталог, два мира записи (`append` / reducer), свой план. Не SQL и не Kusto.
 
-**0.2** — встраиваемая локальная БД: durable `--data`, backup, multi-reader snapshots, log compaction, writer flock, quotas, ops counters. Не multi-writer / не сеть.
+**0.2** — встраиваемая локальная БД: durable `--data`, backup, multi-reader, compaction, flock, quotas, `SyncMode`, cold/mmap, WAL shipping. Не multi-writer.
 
-Сейчас есть парсер, typecheck, IR плана, in-memory store (один reducer, один `gen`), исполнитель, WAL+snapshot с compaction, `backup` CLI. DuckDB/IDB/WASM backends в этом milestone нет. Векторный search в плане не обещается: `search` → lex (`hybrid→lex (no embedder)`).
+Сейчас есть парсер, typecheck, IR плана, in-memory store (один reducer, один `gen`), исполнитель, WAL+snapshot с compaction, `backup` CLI. DuckDB/WASM backends в этом milestone нет. Векторный search в плане не обещается: `search` → lex (`hybrid→lex (no embedder)`).
 
 ## Стабильный API (0.2)
 
-Публичный контракт: `Db::{empty,fixture,open,open_read,close,checkpoint,run,prepare,explain_as,reader,export_backup,import_backup,import_backup_into,stats,with_quotas}`, `ReadDb::{run,prepare,stats,clone}`, `Quotas`, плюс `parse` / `compile` / `run` / `explain*`, типы `Handle` / `Done` / `Prepared` / `Error` / `Row` / `Cell` / `Store` / `Plan` / `Stats` / `VERSION`.
+Публичный контракт: `Db::{empty,fixture,open,open_with,open_read,close,checkpoint,run,prepare,explain_as,reader,export_backup,import_backup,import_backup_into,export_wal_since,apply_wal,stats,with_quotas,with_sync_mode}`, `ReadDb::{run,prepare,stats,clone}`, `Quotas`, `SyncMode`, `OpenOpts`, плюс `parse` / `compile` / `run` / `explain*`, типы `Handle` / `Done` / `Prepared` / `Error` / `Row` / `Cell` / `Store` / `Plan` / `Stats` / `VERSION`.
 
-`Db::reader()` — in-process снимок текущего `gen` (`Arc`, `Send`+`Sync`); запись через `ReadDb` отклоняется. Писатель один (`Db` + exclusive flock на `LOCK`). `Db::open_read(dir)` — холодный read-only open (shared flock; не параллельно с writer).
+`Db::reader()` — in-process снимок текущего `gen` (`Arc`, `Send`+`Sync`); запись через `ReadDb` отклоняется. Писатель один (`Db` + exclusive flock на `LOCK`). `Db::open_read(dir)` — холодный read-only open (shared flock; не параллельно с writer). `export_wal_since` / `apply_wal` — байтовый ship хвоста WAL; `pull idb` / `push idb` — in-process обёртка. `snapshot` / `restore` — memory-pins (не durable).
 
 ## Local-prod guarantees
 
 | Есть | Нет |
 |---|---|
-| Crash после успешного commit → данные в log/snapshot | Multi-process multi-writer |
-| Exclusive flock на writer `open` | mmap / cold collections |
-| Checkpoint уплотняет log → 0 bytes | Real vec/FTS indexes |
-| Quotas: rows / edges / log bytes (defaults + `with_quotas`) | Сеть / реплики / MVCC |
-| `stats`: gen, log_bytes, reopen_ms, append_rows_per_s, … | |
+| Crash после успешного commit (`SyncMode::Full`) → log/snapshot | Multi-process multi-writer |
+| Exclusive flock на writer `open` | Real vec/FTS indexes |
+| Checkpoint уплотняет log → 0 bytes | Полноценный multi-writer MVCC |
+| Quotas: rows / edges / log bytes | |
+| `SyncMode::Normal` — flush на checkpoint/close | |
+| `OpenOpts.cold` → `cold/*.bin` mmap spill | |
+| WAL shipping + gen-pin `reader()` | |
+| `stats`: gen, log_bytes, reopen_ms, … | |
 
-Память = полный image после open (snapshot + tail). Durable `Db` на `Drop` делает best-effort checkpoint.
+Память = полный image после open (snapshot + cold decode + tail). Durable `Db` на `Drop` делает best-effort checkpoint.
 
 ## Лаконичный диалект
 
@@ -88,8 +91,9 @@ rel cites
 |---|---|
 | P0 semver 0.2 + честный search | **готово** |
 | P1 backup + multi-reader + compaction + ops + flock + quotas | **готово** |
-| P2 mmap/cold collections | позже |
-| P3 сеть / MVCC | другой продукт |
+| P2 mmap/cold collections | **готово** (`OpenOpts.cold`) |
+| SyncMode::Normal | **готово** |
+| P3 сеть / MVCC | **тонкий срез**: WAL ship + `reader()`; не multi-writer |
 
 ## Бенчмарки (rbench): Lin vs SQLite vs DuckDB vs Postgres vs MySQL
 
@@ -173,7 +177,7 @@ lin --data .lin2 stats
 
 Без `--data` store эфемерный (fixture в памяти) — так живут текущие тесты языка и исполнителя.
 
-`--data <dir>` (привычный путь `./.lin`) открывает durable store: exclusive flock → snapshot + replay tail → RAM. Запись: flush лога после кадра (`F_BARRIERFSYNC` на macOS/APFS — как SQLite FULL; иначе `fdatasync`/`sync_data`), потом `gen++`. Крах до flush = записи не было. Checkpoint (каждые 32 commit / `close` / `checkpoint`) пишет snapshot и **обнуляет log**.
+`--data <dir>` (привычный путь `./.lin`) открывает durable store: exclusive flock → snapshot + replay tail → RAM. Запись: flush лога после кадра при `SyncMode::Full` (`F_BARRIERFSYNC` на macOS/APFS — как SQLite FULL; иначе `fdatasync`/`sync_data`); при `Normal` — только на checkpoint/close. Потом `gen++`. Checkpoint (каждые 32 commit / `close` / `checkpoint`) пишет snapshot (при `OpenOpts.cold` — spill ≥32 rows в `cold/*.bin`) и **обнуляет log**.
 
 ```
 .lin/

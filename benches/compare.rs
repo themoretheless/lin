@@ -682,8 +682,19 @@ struct LinDurableAppend {
 }
 
 fn setup_lin_durable_append(n: usize) -> LinDurableAppend {
+    setup_lin_durable_append_sync(n, lin::SyncMode::Full)
+}
+
+fn setup_lin_durable_append_sync(n: usize, sync: lin::SyncMode) -> LinDurableAppend {
     let dir = fresh_tmp("append");
-    let mut db = lin::Db::open(&dir.0).expect("lin durable open");
+    let mut db = lin::Db::open_with(
+        &dir.0,
+        lin::OpenOpts {
+            sync,
+            cold: false,
+        },
+    )
+    .expect("lin durable open");
     let prepared = db
         .prepare(&lin_append_log_src(n))
         .expect("lin prepare durable append");
@@ -721,6 +732,49 @@ fn setup_lin_durable_insert(n: usize) -> LinDurableInsert {
 
 fn fill_lin_durable_insert(ins: &mut LinDurableInsert) -> lin::Handle {
     ins.prepared.run(&mut ins.db).expect("lin durable insert")
+}
+
+struct LinColdReopen {
+    dir: TmpKeep,
+}
+
+fn setup_lin_cold_reopen(n: usize) -> LinColdReopen {
+    let dir = fresh_tmp("cold");
+    let mut db = lin::Db::open_with(
+        &dir.0,
+        lin::OpenOpts {
+            sync: lin::SyncMode::Full,
+            cold: true,
+        },
+    )
+    .expect("open cold");
+    db.run(&lin_insert_src(&docs(n))).expect("seed");
+    db.checkpoint().expect("cold checkpoint");
+    db.close().expect("close");
+    LinColdReopen { dir }
+}
+
+fn setup_lin_hot_reopen(n: usize) -> LinColdReopen {
+    let dir = fresh_tmp("hot");
+    let mut db = lin::Db::open(&dir.0).expect("open");
+    db.run(&lin_insert_src(&docs(n))).expect("seed");
+    db.checkpoint().expect("checkpoint");
+    db.close().expect("close");
+    LinColdReopen { dir }
+}
+
+struct LinWalShip {
+    frames: Vec<u8>,
+}
+
+fn setup_lin_wal_ship(n: usize) -> LinWalShip {
+    let src_dir = fresh_tmp("wal_src");
+    let mut src = lin::Db::open(&src_dir.0).expect("src");
+    src.run(&lin_append_log_src(n)).expect("seed wal");
+    let frames = src.export_wal_since(0).expect("export");
+    // Drop src without close/checkpoint so we keep frames; dir can go.
+    drop(src);
+    LinWalShip { frames }
 }
 
 struct SqliteDurable {
@@ -1508,6 +1562,72 @@ fn main() -> rbench::Result<()> {
             .parameter("rows", n)
             .work_units("rows", n as u64);
     }
+
+    // SyncMode::Normal (flush on checkpoint only) vs Full — same 1k append.
+    suite
+        .bench_with_input(
+            "durable_append_1k/lin_normal",
+            move || setup_lin_durable_append_sync(INSERT_1K, lin::SyncMode::Normal),
+            move |ins| fill_lin_durable_append(ins),
+            DropPolicy::OutsideTiming,
+        )
+        .tag("durable")
+        .tag("sync_normal")
+        .tag("lin")
+        .parameter("rows", INSERT_1K)
+        .work_units("rows", INSERT_1K as u64);
+
+    // Cold mmap checkpoint + reopen (50k docs).
+    const COLD_N: usize = 5_000;
+    suite
+        .bench_with_input(
+            "cold_reopen_5k/lin",
+            move || setup_lin_cold_reopen(COLD_N),
+            move |s| {
+                let _ = black_box(lin::Db::open_with(
+                    &s.dir.0,
+                    lin::OpenOpts {
+                        sync: lin::SyncMode::Full,
+                        cold: true,
+                    },
+                ));
+            },
+            DropPolicy::OutsideTiming,
+        )
+        .tag("cold")
+        .tag("lin")
+        .parameter("rows", COLD_N)
+        .work_units("rows", COLD_N as u64);
+    suite
+        .bench_with_input(
+            "hot_reopen_5k/lin",
+            move || setup_lin_hot_reopen(COLD_N),
+            move |s| {
+                let _ = black_box(lin::Db::open(&s.dir.0));
+            },
+            DropPolicy::OutsideTiming,
+        )
+        .tag("cold")
+        .tag("lin")
+        .parameter("rows", COLD_N)
+        .work_units("rows", COLD_N as u64);
+
+    // WAL ship: export + apply 1k-row commit frames.
+    suite
+        .bench_with_input(
+            "wal_ship_1k/lin",
+            move || setup_lin_wal_ship(INSERT_1K),
+            move |s| {
+                let mut dst = lin::Db::empty();
+                let n = dst.apply_wal(&s.frames).expect("apply");
+                black_box(n);
+            },
+            DropPolicy::OutsideTiming,
+        )
+        .tag("wal")
+        .tag("lin")
+        .parameter("rows", INSERT_1K)
+        .work_units("rows", INSERT_1K as u64);
 
     let args: Vec<String> = std::env::args()
         .skip(1)

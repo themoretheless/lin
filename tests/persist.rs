@@ -537,3 +537,108 @@ fn quotas_reject_excess_rows() {
         .unwrap_err();
     assert!(err.to_string().contains("quota"), "{err}");
 }
+
+#[test]
+fn sync_normal_survives_checkpoint() {
+    let dir = tmp();
+    {
+        let mut db = Db::open_with(
+            &dir,
+            lin::OpenOpts {
+                sync: lin::SyncMode::Normal,
+                cold: false,
+            },
+        )
+        .unwrap();
+        db.run(r#"insert docs { uri: "raw://n", title: "N", layer: "wiki" }"#)
+            .unwrap();
+        db.checkpoint().unwrap();
+        db.close().unwrap();
+    }
+    let mut db = Db::open(&dir).unwrap();
+    assert_eq!(
+        db.run(r#"docs | uri == "raw://n""#).unwrap().done.n,
+        1
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn cold_checkpoint_reopen() {
+    let dir = tmp();
+    {
+        let mut db = Db::open_with(
+            &dir,
+            lin::OpenOpts {
+                sync: lin::SyncMode::Full,
+                cold: true,
+            },
+        )
+        .unwrap();
+        // COLD_MIN_ROWS = 32
+        let mut rows = String::from("insert docs [\n");
+        for i in 0..40 {
+            if i > 0 {
+                rows.push(',');
+            }
+            rows.push_str(&format!(
+                r#"{{ uri: "raw://c/{i}", title: "T{i}", layer: "wiki" }}"#
+            ));
+        }
+        rows.push_str("\n]");
+        db.run(&rows).unwrap();
+        db.checkpoint().unwrap();
+        assert!(dir.join("cold").join("docs.bin").exists());
+        db.close().unwrap();
+    }
+    let mut db = Db::open_with(
+        &dir,
+        lin::OpenOpts {
+            sync: lin::SyncMode::Full,
+            cold: true,
+        },
+    )
+    .unwrap();
+    assert_eq!(db.run(r#"docs | take 100"#).unwrap().done.n, 40);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn wal_export_apply_roundtrip() {
+    let a_dir = tmp();
+    let b_dir = tmp();
+    let frames;
+    {
+        let mut a = Db::open(&a_dir).unwrap();
+        a.run(r#"insert docs { uri: "raw://w", title: "W", layer: "wiki" }"#)
+            .unwrap();
+        frames = a.export_wal_since(0).unwrap();
+        assert!(!frames.is_empty());
+        a.close().unwrap();
+    }
+    {
+        let mut b = Db::open(&b_dir).unwrap();
+        let n = b.apply_wal(&frames).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(
+            b.run(r#"docs | uri == "raw://w""#).unwrap().done.n,
+            1
+        );
+        b.close().unwrap();
+    }
+    let _ = fs::remove_dir_all(&a_dir);
+    let _ = fs::remove_dir_all(&b_dir);
+}
+
+#[test]
+fn memory_snapshot_restore() {
+    let mut db = Db::empty();
+    db.run(r#"insert docs { uri: "raw://p", title: "P", layer: "wiki" }"#)
+        .unwrap();
+    db.run(r#"snapshot "s1""#).unwrap();
+    db.run(r#"insert docs { uri: "raw://p2", title: "P2", layer: "wiki" }"#)
+        .unwrap();
+    assert_eq!(db.run(r#"docs | take 10"#).unwrap().done.n, 2);
+    db.run(r#"restore "s1""#).unwrap();
+    assert_eq!(db.run(r#"docs | take 10"#).unwrap().done.n, 1);
+}

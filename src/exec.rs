@@ -17,6 +17,8 @@ use crate::persist::{Pack, Persist};
 use crate::plan::{self, Plan};
 use crate::store::{Cell, Edge, Row, Store, compact_row, content_hash_arc, now_ms, project_fields, row_text};
 
+pub use crate::persist::{OpenMemOpts as OpenOpts, SyncMode};
+
 type StmtOut = (Vec<Row>, Option<String>, Option<Pack>);
 
 struct PackCtx {
@@ -103,6 +105,10 @@ pub struct Db {
     /// Accumulated durable append/insert row counts and wall ms (for rows/s).
     append_rows: u64,
     append_ms: f64,
+    /// Named in-memory pins (`snapshot "x"` / `restore "x"`). Not multi-writer MVCC.
+    pins: BTreeMap<String, crate::store::MemBackup>,
+    /// Last `pull idb` payload for in-process `push idb`.
+    pulled_wal: Vec<u8>,
 }
 
 /// Shared read-only snapshot of a [`Db`] at a fixed `gen`.
@@ -169,6 +175,8 @@ impl Db {
             reopen_ms: 0,
             append_rows: 0,
             append_ms: 0.0,
+            pins: BTreeMap::new(),
+            pulled_wal: Vec::new(),
         }
     }
 
@@ -189,10 +197,21 @@ impl Db {
         self
     }
 
+    pub fn with_sync_mode(mut self, sync: SyncMode) -> Self {
+        if let Some(p) = self.persist.as_mut() {
+            p.sync = sync;
+        }
+        self
+    }
+
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
+        Self::open_with(path, OpenOpts::default())
+    }
+
+    pub fn open_with(path: impl AsRef<Path>, opts: OpenOpts) -> Result<Self, Error> {
         let t0 = Instant::now();
         let catalog = crate::catalog::fixture();
-        let (store, persist) = Store::open_with(path, &catalog)?;
+        let (store, persist) = Store::open_with(path, &catalog, opts)?;
         let mut catalog = catalog;
         store.merge_extras_into(&mut catalog);
         let reopen_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -206,6 +225,8 @@ impl Db {
             reopen_ms: reopen_ms as u64,
             append_rows: 0,
             append_ms: 0.0,
+            pins: BTreeMap::new(),
+            pulled_wal: Vec::new(),
         })
     }
 
@@ -228,6 +249,8 @@ impl Db {
                 reopen_ms: reopen_ms as u64,
                 append_rows: 0,
                 append_ms: 0.0,
+                pins: BTreeMap::new(),
+                pulled_wal: Vec::new(),
             }),
         })
     }
@@ -266,8 +289,48 @@ impl Db {
                 reopen_ms: self.reopen_ms,
                 append_rows: 0,
                 append_ms: 0.0,
+                pins: BTreeMap::new(),
+                pulled_wal: Vec::new(),
             }),
         }
+    }
+
+    /// Ship WAL frames with `gen > since` (follower / network).
+    pub fn export_wal_since(&self, since: u64) -> Result<Vec<u8>, Error> {
+        let Some(p) = self.persist.as_ref() else {
+            return Ok(Vec::new());
+        };
+        crate::persist::export_wal_since(&p.dir, since)
+    }
+
+    /// Apply shipped WAL frames into memory (and durable log if writer).
+    pub fn apply_wal(&mut self, frames: &[u8]) -> Result<usize, Error> {
+        let mut records = Vec::new();
+        crate::persist::for_each_wal_frame(frames, |rec| {
+            records.push(rec);
+            Ok(())
+        })?;
+        let mut n = 0usize;
+        for rec in records {
+            if rec.r#gen <= self.store.r#gen {
+                continue;
+            }
+            self.store.apply_pack(&rec.pack);
+            self.store.next_id = rec.next_id;
+            self.store.r#gen = rec.r#gen;
+            if let Some(p) = self.persist.as_mut() {
+                let sync = p.sync;
+                crate::persist::append_record(&mut p.log, &rec, &mut p.encode_buf, sync)?;
+                p.writes_since_snapshot += 1;
+            }
+            n += 1;
+        }
+        if n > 0 {
+            self.store.rebuild_indexes();
+            self.store.rebuild_row_maps();
+            self.plan_cache.clear();
+        }
+        Ok(n)
     }
 
     pub fn stats(&self) -> Stats {
@@ -352,7 +415,7 @@ impl Db {
     /// into a data dir separately if durable is needed — use `lin backup import --data`).
     pub fn import_backup(path: impl AsRef<Path>) -> Result<Self, Error> {
         let snap = crate::persist::read_backup(path.as_ref())?;
-        let store = Store::from_snapshot(&snap);
+        let store = Store::from_snapshot(std::path::Path::new("."), &snap)?;
         let mut catalog = crate::catalog::fixture();
         store.merge_extras_into(&mut catalog);
         Ok(Self::bare(catalog, store))
@@ -906,13 +969,94 @@ impl Db {
                 Some("idb slice: native".into()),
                 None,
             )),
-            Stmt::IdbPull { .. } | Stmt::IdbPush => Ok((
-                Vec::new(),
-                Some("idb: not available in-process".into()),
-                None,
-            )),
-            Stmt::Snapshot { name } | Stmt::Restore { name } => {
-                Ok((Vec::new(), Some(format!("snapshot {name:?}: no-op")), None))
+            Stmt::IdbPull { since, take } => {
+                let since = (*since).max(0) as u64;
+                let frames = self.export_wal_since(since)?;
+                self.pulled_wal = frames.clone();
+                let mut rows = Vec::new();
+                let mut n = 0i64;
+                let limit = take.unwrap_or(i64::MAX);
+                crate::persist::for_each_wal_frame(&frames, |rec| {
+                    if n >= limit {
+                        return Ok(());
+                    }
+                    let mut row = Row::new();
+                    row.insert("gen".into(), Cell::Int(rec.r#gen as i64));
+                    row.insert("next_id".into(), Cell::Int(rec.next_id as i64));
+                    row.insert(
+                        "bytes".into(),
+                        Cell::Int(
+                            // approximate: filled after; use pack dbg size
+                            0,
+                        ),
+                    );
+                    rows.push(row);
+                    n += 1;
+                    Ok(())
+                })?;
+                // One summary row with total frame bytes for shipping.
+                if rows.is_empty() {
+                    let mut row = Row::new();
+                    row.insert("gen".into(), Cell::Int(since as i64));
+                    row.insert("frames".into(), Cell::Int(0));
+                    row.insert("bytes".into(), Cell::Int(0));
+                    rows.push(row);
+                } else {
+                    for r in &mut rows {
+                        r.insert("bytes".into(), Cell::Int(frames.len() as i64));
+                        r.insert("frames".into(), Cell::Int(n));
+                    }
+                }
+                Ok((
+                    rows,
+                    Some(format!(
+                        "pull idb since {since}: {} bytes (push idb applies)",
+                        frames.len()
+                    )),
+                    None,
+                ))
+            }
+            Stmt::IdbPush => {
+                let frames = std::mem::take(&mut self.pulled_wal);
+                if frames.is_empty() {
+                    return Ok((
+                        Vec::new(),
+                        Some("push idb: nothing pulled".into()),
+                        None,
+                    ));
+                }
+                let n = self.apply_wal(&frames)?;
+                Ok((
+                    Vec::new(),
+                    Some(format!("push idb: applied {n} frames")),
+                    None,
+                ))
+            }
+            Stmt::Snapshot { name } => {
+                self.pins
+                    .insert(name.clone(), self.store.mem_backup());
+                Ok((
+                    Vec::new(),
+                    Some(format!("snapshot {name:?}: pinned gen={}", self.store.r#gen)),
+                    None,
+                ))
+            }
+            Stmt::Restore { name } => {
+                let Some(pin) = self.pins.get(name).cloned() else {
+                    return Err(Error::runtime(format!("unknown snapshot {name:?}")));
+                };
+                if self.persist.is_some() {
+                    return Err(Error::runtime(
+                        "restore: durable store — use reader()/WAL, not memory restore",
+                    ));
+                }
+                self.store.mem_restore(pin);
+                self.plan_cache.clear();
+                Ok((
+                    Vec::new(),
+                    Some(format!("restore {name:?}: gen={}", self.store.r#gen)),
+                    None,
+                ))
             }
         }
     }

@@ -10,7 +10,10 @@ use crate::ast::{Decl, TypeExpr};
 use crate::catalog::Catalog;
 use crate::error::Error;
 use crate::index::LiveIndex;
-use crate::persist::{self, ColSnap, Head, IndexSnap, LogRecord, Pack, Persist, RelSnap, Snapshot};
+use crate::cold;
+use crate::persist::{
+    self, ColSnap, Head, IndexSnap, LogRecord, OpenMemOpts, Pack, Persist, RelSnap, Snapshot,
+};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "t", content = "v")]
@@ -169,11 +172,15 @@ impl Store {
     /// in-process shared snapshots.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
         let cat = crate::catalog::fixture();
-        Ok(Self::open_with(path, &cat)?.0)
+        Ok(Self::open_with(path, &cat, OpenMemOpts::default())?.0)
     }
 
     /// Open durable data dir: memory image + exclusive Persist for writes.
-    pub fn open_with(path: impl AsRef<Path>, cat: &Catalog) -> Result<(Self, Persist), Error> {
+    pub fn open_with(
+        path: impl AsRef<Path>,
+        cat: &Catalog,
+        opts: OpenMemOpts,
+    ) -> Result<(Self, Persist), Error> {
         let dir = path.as_ref();
         persist::ensure_dir(dir)?;
         let lock = persist::acquire_writer_lock(dir)?;
@@ -181,7 +188,7 @@ impl Store {
 
         let snap = persist::read_snapshot(dir)?;
         let mut store = match &snap {
-            Some(s) => Self::from_snapshot(s),
+            Some(s) => Self::from_snapshot(dir, s)?,
             None => {
                 let embed = persist::read_head(dir)?
                     .map(|h| h.embed_id)
@@ -242,6 +249,8 @@ impl Store {
             catalog_hash: live_hash,
             writes_since_snapshot: 0,
             encode_buf: Vec::with_capacity(64 * 1024),
+            sync: opts.sync,
+            cold: opts.cold,
         };
         Ok((store, persist))
     }
@@ -262,7 +271,7 @@ impl Store {
         let lock = persist::acquire_reader_lock(dir)?;
         let snap = persist::read_snapshot(dir)?;
         let mut store = match &snap {
-            Some(s) => Self::from_snapshot(s),
+            Some(s) => Self::from_snapshot(dir, s)?,
             None => {
                 let embed = persist::read_head(dir)?
                     .map(|h| h.embed_id)
@@ -284,7 +293,7 @@ impl Store {
         Ok((store, lock))
     }
 
-    pub(crate) fn from_snapshot(s: &Snapshot) -> Self {
+    pub(crate) fn from_snapshot(dir: &Path, s: &Snapshot) -> Result<Self, Error> {
         let mut store = Self {
             r#gen: s.r#gen,
             embed_id: s.embed_id.clone(),
@@ -307,9 +316,13 @@ impl Store {
         for name in store.extra_collections.keys() {
             store.collections.entry(name.clone()).or_default();
         }
+        for name in &s.cold_collections {
+            let col = cold::map_cold(dir, name)?;
+            store.collections.insert(name.clone(), col.into_rows()?);
+        }
         store.rebuild_indexes();
         store.rebuild_row_maps();
-        store
+        Ok(store)
     }
 
     /// Capture current memory image (for backup / checkpoint payload).
@@ -329,6 +342,7 @@ impl Store {
             extra_collections: self.extra_collections.clone(),
             extra_rels: self.extra_rels.clone(),
             extra_indexes: self.extra_indexes.clone(),
+            cold_collections: Vec::new(),
         }
     }
 
@@ -376,11 +390,12 @@ impl Store {
             next_id: self.next_id,
             pack,
         };
+        let sync = persist.sync;
         {
             let Persist {
                 log, encode_buf, ..
             } = persist;
-            persist::append_record(log, &rec, encode_buf)?;
+            persist::append_record(log, &rec, encode_buf, sync)?;
         }
         persist.writes_since_snapshot += 1;
         Ok(())
@@ -400,9 +415,21 @@ impl Store {
 
     pub fn write_snapshot(&self, persist: &mut Persist) -> Result<(), Error> {
         // Ensure log content is fully durable before publishing snapshot/head.
-        persist.log.sync_all().map_err(persist::io_err)?;
-        // Snapshot is a full memory image — after publish the log prefix is redundant.
-        let snap = self.capture_snapshot_at(persist.catalog_hash.clone(), 0);
+        // Normal mode: this is the durability point for prior commits.
+        persist::durable_sync(&persist.log).or_else(|_| persist.log.sync_all()).map_err(persist::io_err)?;
+        let mut snap = self.capture_snapshot_at(persist.catalog_hash.clone(), 0);
+        if persist.cold {
+            let mut cold_names = Vec::new();
+            for (name, rows) in snap.collections.iter_mut() {
+                if rows.len() >= cold::COLD_MIN_ROWS {
+                    cold::write_cold(&persist.dir, name, rows)?;
+                    rows.clear();
+                    cold_names.push(name.clone());
+                }
+            }
+            cold::prune_cold(&persist.dir, &cold_names)?;
+            snap.cold_collections = cold_names;
+        }
         let head = Head {
             r#gen: self.r#gen,
             catalog_hash: persist.catalog_hash.clone(),

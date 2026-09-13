@@ -6,11 +6,12 @@
 //! - [`Db`]: [`Db::empty`], [`Db::fixture`], [`Db::open`], [`Db::open_read`],
 //!   [`Db::close`], [`Db::checkpoint`], [`Db::run`], [`Db::prepare`], [`Db::explain_as`],
 //!   [`Db::reader`], [`Db::export_backup`], [`Db::import_backup`], [`Db::stats`],
-//!   [`Db::with_quotas`]
+//!   [`Db::with_quotas`], [`Db::with_sync_mode`], [`Db::open_with`],
+//!   [`Db::export_wal_since`], [`Db::apply_wal`]
 //! - [`ReadDb`]: shared read-only snapshot ([`ReadDb::run`], [`ReadDb::clone`])
 //! - Free functions: [`parse`], [`compile`], [`run`], [`explain`], [`explain_as`]
 //! - Types: [`Handle`], [`Done`], [`Prepared`], [`Error`], [`Row`], [`Cell`], [`Store`],
-//!   [`Plan`], [`Stats`], [`Quotas`]
+//!   [`Plan`], [`Stats`], [`Quotas`], [`SyncMode`], [`OpenOpts`]
 //!
 //! Semver: breaking changes to the list above require a major bump after 1.0;
 //! until then minors may still adjust experimental surfaces (`Stmt`, plan IR).
@@ -24,6 +25,7 @@
 mod ast;
 mod catalog;
 mod check;
+mod cold;
 mod error;
 mod exec;
 mod explain;
@@ -38,7 +40,7 @@ use std::cell::RefCell;
 
 pub use ast::{ExplainKind, Stmt};
 pub use error::Error;
-pub use exec::{Db, Done, Handle, Prepared, Quotas, ReadDb, Stats};
+pub use exec::{Db, Done, Handle, OpenOpts, Prepared, Quotas, ReadDb, Stats, SyncMode};
 pub use graph::GraphFmt;
 pub use plan::Plan;
 pub use store::{Cell, Row, Store};
