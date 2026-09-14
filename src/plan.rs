@@ -114,6 +114,9 @@ pub enum NodeKind {
         field: String,
         desc: bool,
     },
+    Skip {
+        n: i64,
+    },
     Take {
         n: Option<i64>,
         implicit: bool,
@@ -488,6 +491,9 @@ fn plan_query_inner(q: &Query, cat: &Catalog, allow_implicit_take: bool) -> Resu
                     search_k = *v;
                 }
             }
+            Step::Skip { .. } => {
+                // Does not cancel implicit take by itself; take/agg still apply.
+            }
             Step::Count { by } => {
                 implicit_take = false;
                 saw_agg = true;
@@ -673,6 +679,14 @@ fn plan_query_inner(q: &Query, cat: &Catalog, allow_implicit_take: bool) -> Resu
                         field: field.as_str(),
                         desc: *desc,
                     },
+                    Backend::Native,
+                    Effect::Read,
+                    vec![cur],
+                );
+            }
+            Step::Skip { n } => {
+                cur = node(
+                    NodeKind::Skip { n: *n },
                     Backend::Native,
                     Effect::Read,
                     vec![cur],

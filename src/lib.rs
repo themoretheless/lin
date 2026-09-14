@@ -13,6 +13,10 @@
 //! - Types: [`Handle`], [`Done`], [`Prepared`], [`Error`], [`Row`], [`Cell`], [`Store`],
 //!   [`Plan`], [`Stats`], [`Quotas`], [`SyncMode`], [`OpenOpts`]
 //!
+//! Experimental (outside freeze): [`query`] fluent builder, [`FromRow`] / [`LinRow`],
+//! [`Db::run_stmt`], [`RowExt`], [`RecordBatch`] (columnar OLAP results), feature `async`
+//! ([`AsyncDb`], `stream_*`).
+//!
 //! Semver: breaking changes to the list above require a major bump after 1.0;
 //! until then minors may still adjust experimental surfaces (`Stmt`, plan IR).
 //!
@@ -23,9 +27,11 @@
 //! plans as vec but returns no rows until an embedder is wired.
 
 mod ast;
+mod batch;
 mod catalog;
 mod check;
 mod cold;
+mod cursor;
 mod error;
 mod exec;
 mod explain;
@@ -36,14 +42,33 @@ mod persist;
 mod plan;
 mod store;
 
+pub mod query;
+pub mod row;
+
+#[cfg(feature = "async")]
+pub mod async_db;
+
 use std::cell::RefCell;
 
-pub use ast::{ExplainKind, Stmt};
+pub use ast::{
+    CmpOp, Duration, DurUnit, ExplainKind, Field, MatchHop, Pred, Query, SearchMode, Source, Stmt,
+    Step, Value,
+};
+pub use batch::RecordBatch;
+pub use cursor::QueryCursor;
 pub use error::Error;
 pub use exec::{Db, Done, Handle, OpenOpts, Prepared, Quotas, ReadDb, Stats, SyncMode};
 pub use graph::GraphFmt;
 pub use plan::Plan;
-pub use store::{Cell, Row, Store};
+pub use query::{BoundQueryable, IntoFieldList, MatchPath, Queryable};
+pub use row::{FromCell, FromRow, LinRow, cell_get, map_rows};
+pub use store::{Cell, Row, RowExt, Store};
+
+#[cfg(feature = "async")]
+pub use async_db::{AsyncDb, AsyncReadDb};
+
+#[cfg(feature = "derive")]
+pub use lin_derive::LinRow;
 
 /// Crate version string (same as `CARGO_PKG_VERSION`).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

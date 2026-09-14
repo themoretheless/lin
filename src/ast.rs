@@ -152,6 +152,10 @@ pub enum Step {
         field: Field,
         desc: bool,
     },
+    /// Drop the first `n` rows (alias `offset` in the surface language).
+    Skip {
+        n: i64,
+    },
     Take {
         n: Option<i64>,
     },

@@ -490,6 +490,10 @@ impl<'a> Parser<'a> {
             }
             return Ok(Step::Sort { field, desc });
         }
+        if self.eat_kw("skip") || self.eat_kw("offset") {
+            let n = self.expect_int()?;
+            return Ok(Step::Skip { n });
+        }
         if self.eat_kw("take") {
             if self.eat_kw("all") {
                 return Ok(Step::Take { n: None });
@@ -1261,6 +1265,8 @@ fn is_step_keyword(s: &str) -> bool {
             | "count"
             | "sum"
             | "sort"
+            | "skip"
+            | "offset"
             | "take"
             | "explain"
             | "union"

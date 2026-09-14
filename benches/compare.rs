@@ -12,6 +12,10 @@
 //! - Lin point_get / filter / insert use **prepare once, run many** (like SQL prepared).
 //! - Filter benches: Lin `count by …` vs SQL `COUNT(*)` (same shape: return a count).
 //! - Point get / equality / range / LIKE-style substring are comparable.
+//! - Join: inner `orders ⋈ users` (FK `orders.user_id → users.id`) — Lin `run_batch`
+//!   (SoA + [`RecordBatch`]), Lin lazy cursor, SQL `INNER JOIN`. Filter+join: `total > 100`.
+//!   Row-API `run` still materializes `Vec<Row>` from the same path.
+//!   DuckDB may still win (mature OLAP); Lin now has an in-process columnar join path.
 //! - Lin `hop`, hybrid `search`, and CAS are not claimed here.
 //! - SQL `LIKE '%wal%'` ≈ Lin `title ~ "wal"` (substring), not `has` / FTS.
 //! - Server DBs are not in-process; network/IPC cost is part of their number.
@@ -22,12 +26,20 @@ use std::time::Duration;
 
 use mysql::prelude::Queryable;
 use airbug_bench::{Config, DropPolicy, Fixture, Suite};
+use lin::query::pred;
+use lin::Queryable as LinQueryable;
 
 const N: usize = 10_000;
 const INSERT_1K: usize = 1_000;
 const INSERT_10K: usize = 10_000;
 /// Probe row index inside the seeded set (wing=rag, title contains "wal").
 const PROBE: usize = 20;
+const JOIN_USERS: usize = 1_000;
+const JOIN_ORDERS: usize = 10_000;
+const JOIN_FILTER_N: usize = JOIN_ORDERS / 2;
+const JOIN_INNER_SQL: &str =
+    "SELECT o.id, u.email, o.total FROM orders o INNER JOIN users u ON o.user_id = u.id";
+const JOIN_FILTER_SQL: &str = "SELECT o.id, u.email, o.total FROM orders o INNER JOIN users u ON o.user_id = u.id WHERE o.total > 100";
 
 /// Prefer env, else probe these (lin compose → dbill compose → local brew defaults).
 const PG_CANDIDATES: &[&str] = &[
@@ -449,6 +461,352 @@ fn seed_mysql(n: usize, mut conn: mysql::Conn) -> MysqlWarm {
         text_substr,
         materialize,
     }
+}
+
+struct JoinUser {
+    id: String,
+    email: String,
+}
+
+struct JoinOrder {
+    id: String,
+    user_id: String,
+    total: f64,
+}
+
+fn join_data() -> (Vec<JoinUser>, Vec<JoinOrder>) {
+    let users: Vec<JoinUser> = (0..JOIN_USERS)
+        .map(|i| JoinUser {
+            id: format!("u-{i}"),
+            email: format!("u{i}@b.dev"),
+        })
+        .collect();
+    let orders: Vec<JoinOrder> = (0..JOIN_ORDERS)
+        .map(|i| JoinOrder {
+            id: format!("o-{i}"),
+            user_id: format!("u-{}", i % JOIN_USERS),
+            total: ((i % 200) + 1) as f64,
+        })
+        .collect();
+    (users, orders)
+}
+
+fn lin_insert_users(rows: &[JoinUser]) -> String {
+    let mut out = String::from("insert users [\n");
+    for (i, u) in rows.iter().enumerate() {
+        if i > 0 {
+            out.push_str(",\n");
+        }
+        out.push_str(&format!(
+            r#"  {{ id: "{}", email: "{}" }}"#,
+            escape_lin(&u.id),
+            escape_lin(&u.email)
+        ));
+    }
+    out.push_str("\n]");
+    out
+}
+
+fn lin_insert_orders(rows: &[JoinOrder]) -> String {
+    let mut out = String::from("insert orders [\n");
+    for (i, o) in rows.iter().enumerate() {
+        if i > 0 {
+            out.push_str(",\n");
+        }
+        out.push_str(&format!(
+            r#"  {{ id: "{}", user_id: "{}", total: {}, ts: ago 1d }}"#,
+            escape_lin(&o.id),
+            escape_lin(&o.user_id),
+            o.total
+        ));
+    }
+    out.push_str("\n]");
+    out
+}
+
+struct JoinLin {
+    db: lin::Db,
+    inner: lin::Prepared,
+    filter: lin::Prepared,
+    inner_q: LinQueryable,
+    filter_q: LinQueryable,
+}
+
+fn seed_join_lin() -> JoinLin {
+    let (users, orders) = join_data();
+    let mut db = lin::Db::empty();
+    db.run("index orders [user_id]").expect("lin orders index");
+    for chunk in users.chunks(500) {
+        db.run(&lin_insert_users(chunk)).expect("lin seed users");
+    }
+    for chunk in orders.chunks(500) {
+        db.run(&lin_insert_orders(chunk)).expect("lin seed orders");
+    }
+    let inner = db
+        .prepare(r#"orders | join users on user_id | { id, users.email, total } | take all"#)
+        .expect("lin prepare join inner");
+    let filter = db
+        .prepare(
+            r#"orders | total > 100 | join users on user_id | { id, users.email, total } | take all"#,
+        )
+        .expect("lin prepare join filter");
+    let got = inner.run(&mut db).expect("lin join sanity");
+    assert_eq!(got.done.n, JOIN_ORDERS, "inner join should keep all orders");
+    let got_f = filter.run(&mut db).expect("lin join filter sanity");
+    assert_eq!(got_f.done.n, JOIN_FILTER_N);
+    let batch_n = inner.run_batch(&mut db).expect("lin join batch").n();
+    assert_eq!(batch_n, JOIN_ORDERS);
+    let inner_q = LinQueryable::from("orders")
+        .join("users", "user_id")
+        .select(["id", "users.email", "total"])
+        .take_all();
+    let filter_q = LinQueryable::from("orders")
+        .filter(pred::gt("total", 100.0))
+        .join("users", "user_id")
+        .select(["id", "users.email", "total"])
+        .take_all();
+    let cur_n = inner_q
+        .cursor(&db)
+        .expect("lin join cursor")
+        .map(|r| r.expect("row"))
+        .count();
+    assert_eq!(cur_n, JOIN_ORDERS);
+    assert!(inner_q.cursor(&db).expect("lazy").is_lazy());
+    JoinLin {
+        db,
+        inner,
+        filter,
+        inner_q,
+        filter_q,
+    }
+}
+
+fn consume_join_cursor(db: &lin::Db, q: &LinQueryable) -> usize {
+    let mut n = 0usize;
+    for row in q.cursor(db).expect("lin join cursor") {
+        black_box(row.expect("row"));
+        n += 1;
+    }
+    n
+}
+
+struct JoinSql {
+    conn: rusqlite::Connection,
+}
+
+fn seed_join_sqlite() -> JoinSql {
+    let (users, orders) = join_data();
+    let conn = rusqlite::Connection::open_in_memory().expect("sqlite open");
+    conn.execute_batch(
+        "CREATE TABLE users (id TEXT PRIMARY KEY, email TEXT NOT NULL);
+         CREATE TABLE orders (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            total REAL NOT NULL
+         );
+         CREATE INDEX orders_user_id ON orders(user_id);",
+    )
+    .expect("sqlite join schema");
+    {
+        let mut u = conn
+            .prepare("INSERT INTO users (id, email) VALUES (?1, ?2)")
+            .expect("sqlite users");
+        for x in &users {
+            u.execute(rusqlite::params![x.id, x.email])
+                .expect("sqlite user");
+        }
+        let mut o = conn
+            .prepare("INSERT INTO orders (id, user_id, total) VALUES (?1, ?2, ?3)")
+            .expect("sqlite orders");
+        for x in &orders {
+            o.execute(rusqlite::params![x.id, x.user_id, x.total])
+                .expect("sqlite order");
+        }
+    }
+    let _ = conn.prepare_cached(JOIN_INNER_SQL);
+    let _ = conn.prepare_cached(JOIN_FILTER_SQL);
+    JoinSql { conn }
+}
+
+fn sqlite_join_n(conn: &rusqlite::Connection, sql: &str) -> usize {
+    let mut stmt = conn.prepare_cached(sql).expect("sqlite join prep");
+    let mut rows = stmt.query([]).expect("sqlite join");
+    let mut n = 0usize;
+    while let Some(row) = rows.next().expect("sqlite row") {
+        let id: String = row.get(0).expect("id");
+        let email: String = row.get(1).expect("email");
+        let total: f64 = row.get(2).expect("total");
+        black_box((id, email, total));
+        n += 1;
+    }
+    n
+}
+
+struct JoinDuck {
+    conn: duckdb::Connection,
+}
+
+fn seed_join_duck() -> JoinDuck {
+    let (users, orders) = join_data();
+    let conn = duckdb::Connection::open_in_memory().expect("duckdb open");
+    conn.execute_batch(
+        "CREATE TABLE users (id VARCHAR PRIMARY KEY, email VARCHAR NOT NULL);
+         CREATE TABLE orders (
+            id VARCHAR PRIMARY KEY,
+            user_id VARCHAR NOT NULL,
+            total DOUBLE NOT NULL
+         );
+         CREATE INDEX orders_user_id ON orders(user_id);",
+    )
+    .expect("duck join schema");
+    {
+        let mut u = conn
+            .prepare("INSERT INTO users (id, email) VALUES (?, ?)")
+            .expect("duck users");
+        for x in &users {
+            u.execute(duckdb::params![x.id, x.email])
+                .expect("duck user");
+        }
+        let mut o = conn
+            .prepare("INSERT INTO orders (id, user_id, total) VALUES (?, ?, ?)")
+            .expect("duck orders");
+        for x in &orders {
+            o.execute(duckdb::params![x.id, x.user_id, x.total])
+                .expect("duck order");
+        }
+    }
+    JoinDuck { conn }
+}
+
+fn duck_join_n(conn: &duckdb::Connection, sql: &str) -> usize {
+    let mut stmt = conn.prepare_cached(sql).expect("duck join prep");
+    let mut rows = stmt.query([]).expect("duck join");
+    let mut n = 0usize;
+    while let Some(row) = rows.next().expect("duck row") {
+        let id: String = row.get(0).expect("id");
+        let email: String = row.get(1).expect("email");
+        let total: f64 = row.get(2).expect("total");
+        black_box((id, email, total));
+        n += 1;
+    }
+    n
+}
+
+struct JoinPg {
+    client: postgres::Client,
+    inner: postgres::Statement,
+    filter: postgres::Statement,
+}
+
+fn seed_join_pg(mut client: postgres::Client) -> JoinPg {
+    let (users, orders) = join_data();
+    client
+        .batch_execute(
+            "DROP TABLE IF EXISTS orders;
+             DROP TABLE IF EXISTS users;
+             CREATE TABLE users (id TEXT PRIMARY KEY, email TEXT NOT NULL);
+             CREATE TABLE orders (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                total DOUBLE PRECISION NOT NULL
+             );
+             CREATE INDEX orders_user_id ON orders(user_id);",
+        )
+        .expect("pg join schema");
+    for x in &users {
+        client
+            .execute(
+                "INSERT INTO users (id, email) VALUES ($1, $2)",
+                &[&x.id, &x.email],
+            )
+            .expect("pg user");
+    }
+    for x in &orders {
+        client
+            .execute(
+                "INSERT INTO orders (id, user_id, total) VALUES ($1, $2, $3)",
+                &[&x.id, &x.user_id, &x.total],
+            )
+            .expect("pg order");
+    }
+    let inner = client.prepare(JOIN_INNER_SQL).expect("pg join inner");
+    let filter = client.prepare(JOIN_FILTER_SQL).expect("pg join filter");
+    JoinPg {
+        client,
+        inner,
+        filter,
+    }
+}
+
+fn pg_join_n(client: &mut postgres::Client, stmt: &postgres::Statement) -> usize {
+    let rows = client.query(stmt, &[]).expect("pg join");
+    let mut n = 0usize;
+    for row in rows {
+        let id: String = row.get(0);
+        let email: String = row.get(1);
+        let total: f64 = row.get(2);
+        black_box((id, email, total));
+        n += 1;
+    }
+    n
+}
+
+struct JoinMysql {
+    conn: mysql::Conn,
+    inner: mysql::Statement,
+    filter: mysql::Statement,
+}
+
+fn seed_join_mysql(mut conn: mysql::Conn) -> JoinMysql {
+    let (users, orders) = join_data();
+    conn.query_drop("DROP TABLE IF EXISTS orders")
+        .expect("mysql drop orders");
+    conn.query_drop("DROP TABLE IF EXISTS users")
+        .expect("mysql drop users");
+    conn.query_drop(
+        "CREATE TABLE users (id VARCHAR(64) PRIMARY KEY, email VARCHAR(255) NOT NULL)",
+    )
+    .expect("mysql users");
+    conn.query_drop(
+        "CREATE TABLE orders (
+            id VARCHAR(64) PRIMARY KEY,
+            user_id VARCHAR(64) NOT NULL,
+            total DOUBLE NOT NULL,
+            INDEX orders_user_id (user_id)
+         )",
+    )
+    .expect("mysql orders");
+    {
+        let ust = conn
+            .prep("INSERT INTO users (id, email) VALUES (?, ?)")
+            .expect("mysql users prep");
+        for x in &users {
+            conn.exec_drop(&ust, (&x.id, &x.email)).expect("mysql user");
+        }
+        let ost = conn
+            .prep("INSERT INTO orders (id, user_id, total) VALUES (?, ?, ?)")
+            .expect("mysql orders prep");
+        for x in &orders {
+            conn.exec_drop(&ost, (&x.id, &x.user_id, x.total))
+                .expect("mysql order");
+        }
+    }
+    let inner = conn.prep(JOIN_INNER_SQL).expect("mysql join inner");
+    let filter = conn.prep(JOIN_FILTER_SQL).expect("mysql join filter");
+    JoinMysql {
+        conn,
+        inner,
+        filter,
+    }
+}
+
+fn mysql_join_n(conn: &mut mysql::Conn, stmt: &mysql::Statement) -> usize {
+    let rows: Vec<(String, String, f64)> = conn.exec(stmt, ()).expect("mysql join");
+    let n = rows.len();
+    for row in rows {
+        black_box(row);
+    }
+    n
 }
 
 fn empty_lin() -> lin::Db {
@@ -1001,6 +1359,7 @@ fn main() -> airbug_bench::Result<()> {
          Lin reads: prepare once / run many; filters use count (fair vs SQL COUNT(*));\n\
          substring: Lin `title ~ \"wal\" | count` vs SQL LIKE '%wal%' COUNT(*);\n\
          materialize: Lin `wing==rag | {{id,title}} | take all` vs SQL SELECT id,title;\n\
+         join: {JOIN_ORDERS} orders ⋈ {JOIN_USERS} users (Lin run_batch SoA / cursor vs SQL INNER JOIN);\n\
          append_log: Lin `append facts` vs SQL INSERT INTO logs (append-only shape)"
     );
 
@@ -1025,6 +1384,22 @@ fn main() -> airbug_bench::Result<()> {
         ),
         None => (None, None),
     };
+
+    let lin_join = Fixture::new(seed_join_lin);
+    let sql_join = Fixture::new(seed_join_sqlite);
+    let duck_join = Fixture::new(seed_join_duck);
+    let pg_join = pg_url.clone().map(|url| {
+        Fixture::new(move || {
+            let c = try_pg_client(&url).unwrap_or_else(|e| panic!("postgres join: {e}"));
+            seed_join_pg(c)
+        })
+    });
+    let mysql_join = mysql_url.clone().map(|url| {
+        Fixture::new(move || {
+            let c = try_mysql_conn(&url).unwrap_or_else(|e| panic!("mysql join: {e}"));
+            seed_join_mysql(c)
+        })
+    });
 
     suite
         .bench_fixture("point_get/lin", lin.clone(), |s| {
@@ -1373,6 +1748,124 @@ fn main() -> airbug_bench::Result<()> {
             .tag("materialize")
             .tag("mysql")
             .parameter("n", N);
+    }
+
+    suite
+        .bench_fixture("join_inner/lin", lin_join.clone(), |s| {
+            black_box(s.inner.run_batch(&mut s.db).expect("lin join").n())
+        })
+        .tag("join_inner")
+        .tag("lin")
+        .parameter("users", JOIN_USERS)
+        .parameter("orders", JOIN_ORDERS)
+        .work_units("rows", JOIN_ORDERS as u64);
+    suite
+        .bench_fixture("join_inner/lin_cursor", lin_join.clone(), |s| {
+            black_box(consume_join_cursor(&s.db, &s.inner_q))
+        })
+        .tag("join_inner")
+        .tag("lin_cursor")
+        .parameter("users", JOIN_USERS)
+        .parameter("orders", JOIN_ORDERS)
+        .work_units("rows", JOIN_ORDERS as u64);
+    suite
+        .bench_fixture("join_inner/sqlite", sql_join.clone(), |s| {
+            black_box(sqlite_join_n(&s.conn, JOIN_INNER_SQL))
+        })
+        .tag("join_inner")
+        .tag("sqlite")
+        .parameter("users", JOIN_USERS)
+        .parameter("orders", JOIN_ORDERS)
+        .work_units("rows", JOIN_ORDERS as u64);
+    suite
+        .bench_fixture("join_inner/duckdb", duck_join.clone(), |s| {
+            black_box(duck_join_n(&s.conn, JOIN_INNER_SQL))
+        })
+        .tag("join_inner")
+        .tag("duckdb")
+        .parameter("users", JOIN_USERS)
+        .parameter("orders", JOIN_ORDERS)
+        .work_units("rows", JOIN_ORDERS as u64);
+    if let Some(pg) = pg_join.clone() {
+        suite
+            .bench_fixture("join_inner/postgres", pg, |s| {
+                black_box(pg_join_n(&mut s.client, &s.inner))
+            })
+            .tag("join_inner")
+            .tag("postgres")
+            .parameter("users", JOIN_USERS)
+            .parameter("orders", JOIN_ORDERS)
+            .work_units("rows", JOIN_ORDERS as u64);
+    }
+    if let Some(mysql) = mysql_join.clone() {
+        suite
+            .bench_fixture("join_inner/mysql", mysql, |s| {
+                black_box(mysql_join_n(&mut s.conn, &s.inner))
+            })
+            .tag("join_inner")
+            .tag("mysql")
+            .parameter("users", JOIN_USERS)
+            .parameter("orders", JOIN_ORDERS)
+            .work_units("rows", JOIN_ORDERS as u64);
+    }
+
+    suite
+        .bench_fixture("join_filter/lin", lin_join.clone(), |s| {
+            black_box(s.filter.run_batch(&mut s.db).expect("lin join filter").n())
+        })
+        .tag("join_filter")
+        .tag("lin")
+        .parameter("users", JOIN_USERS)
+        .parameter("orders", JOIN_ORDERS)
+        .work_units("rows", JOIN_FILTER_N as u64);
+    suite
+        .bench_fixture("join_filter/lin_cursor", lin_join, |s| {
+            black_box(consume_join_cursor(&s.db, &s.filter_q))
+        })
+        .tag("join_filter")
+        .tag("lin_cursor")
+        .parameter("users", JOIN_USERS)
+        .parameter("orders", JOIN_ORDERS)
+        .work_units("rows", JOIN_FILTER_N as u64);
+    suite
+        .bench_fixture("join_filter/sqlite", sql_join, |s| {
+            black_box(sqlite_join_n(&s.conn, JOIN_FILTER_SQL))
+        })
+        .tag("join_filter")
+        .tag("sqlite")
+        .parameter("users", JOIN_USERS)
+        .parameter("orders", JOIN_ORDERS)
+        .work_units("rows", JOIN_FILTER_N as u64);
+    suite
+        .bench_fixture("join_filter/duckdb", duck_join, |s| {
+            black_box(duck_join_n(&s.conn, JOIN_FILTER_SQL))
+        })
+        .tag("join_filter")
+        .tag("duckdb")
+        .parameter("users", JOIN_USERS)
+        .parameter("orders", JOIN_ORDERS)
+        .work_units("rows", JOIN_FILTER_N as u64);
+    if let Some(pg) = pg_join {
+        suite
+            .bench_fixture("join_filter/postgres", pg, |s| {
+                black_box(pg_join_n(&mut s.client, &s.filter))
+            })
+            .tag("join_filter")
+            .tag("postgres")
+            .parameter("users", JOIN_USERS)
+            .parameter("orders", JOIN_ORDERS)
+            .work_units("rows", JOIN_FILTER_N as u64);
+    }
+    if let Some(mysql) = mysql_join {
+        suite
+            .bench_fixture("join_filter/mysql", mysql, |s| {
+                black_box(mysql_join_n(&mut s.conn, &s.filter))
+            })
+            .tag("join_filter")
+            .tag("mysql")
+            .parameter("users", JOIN_USERS)
+            .parameter("orders", JOIN_ORDERS)
+            .work_units("rows", JOIN_FILTER_N as u64);
     }
 
     macro_rules! insert_bulk {

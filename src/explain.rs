@@ -172,6 +172,7 @@ fn head(node: &Node, kind: ExplainKind, ctx: &ExplainCtx) -> String {
         NodeKind::Sort { field, desc } => {
             format!("Sort {field} {}", if *desc { "desc" } else { "asc" })
         }
+        NodeKind::Skip { n } => format!("Skip {n}"),
         NodeKind::Take { n, implicit } => match n {
             Some(n) if *implicit => format!("Take {n} implicit"),
             Some(n) => format!("Take {n}"),
@@ -319,6 +320,7 @@ fn est_rows(node: &Node, sizes: &CollectionSizes) -> f64 {
         NodeKind::Filter { .. } => (child(0) * 0.35).max(0.0),
         NodeKind::Project { .. }
         | NodeKind::Sort { .. }
+        | NodeKind::Skip { .. }
         | NodeKind::Cas { .. }
         | NodeKind::BatchCAS { .. } => child(0),
         NodeKind::Take { n, .. } => match n {
@@ -372,6 +374,7 @@ fn short_name(kind: &NodeKind) -> &'static str {
         NodeKind::Rrf { .. } => "RRF",
         NodeKind::Agg { .. } => "Agg",
         NodeKind::Sort { .. } => "Sort",
+        NodeKind::Skip { .. } => "Skip",
         NodeKind::Take { .. } => "Take",
         NodeKind::Get { .. } => "Get",
         NodeKind::Append { .. } => "Append",

@@ -445,6 +445,11 @@ fn check_query(q: &Query, cat: &Catalog, env: &Bindings) -> Result<Scope, Error>
             Step::Sort { field, .. } => {
                 require_field(&scope, field)?;
             }
+            Step::Skip { n } => {
+                if *n < 0 {
+                    return Err(Error::new("skip/offset must be ≥ 0"));
+                }
+            }
             Step::Take { n } => {
                 if let Some(v) = n
                     && *v < 0

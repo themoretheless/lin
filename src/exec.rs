@@ -7,6 +7,7 @@ use std::time::Instant;
 use rustc_hash::FxHashMap;
 
 use crate::ast::*;
+use crate::batch::RecordBatch;
 use crate::catalog::Catalog;
 use crate::check;
 use crate::error::Error;
@@ -86,6 +87,16 @@ impl Prepared {
 
     pub fn run_read(&self, db: &ReadDb) -> Result<Handle, Error> {
         db.run_prepared(self)
+    }
+
+    /// Columnar OLAP path when the statement is a supported batch query (FK join+project).
+    /// Falls back to row materialization for other statements.
+    pub fn run_batch(&self, db: &mut Db) -> Result<RecordBatch, Error> {
+        db.run_prepared_batch(self)
+    }
+
+    pub fn run_batch_read(&self, db: &ReadDb) -> Result<RecordBatch, Error> {
+        db.run_prepared_batch(self)
     }
 }
 
@@ -589,6 +600,26 @@ impl Db {
         })
     }
 
+    /// Columnar read path: FK join+project returns [`RecordBatch`] without row-maps.
+    pub fn run_prepared_batch(&mut self, prepared: &Prepared) -> Result<RecordBatch, Error> {
+        if prepared.writes {
+            return Err(Error::runtime("run_batch is read-only"));
+        }
+        if prepared.stmts.len() == 1
+            && let Stmt::Query(q) = &prepared.stmts[0]
+            && let Some(batch) = self.try_join_project_batch(q, &Default::default(), now_ms())
+        {
+            return Ok(batch);
+        }
+        let h = self.run_prepared(prepared)?;
+        Ok(rows_to_rough_batch(&h.rows))
+    }
+
+    pub fn run_batch(&mut self, src: &str) -> Result<RecordBatch, Error> {
+        let prepared = self.prepare(src)?;
+        self.run_prepared_batch(&prepared)
+    }
+
     /// Read-only run (`&self`): rejects mutating statements.
     pub fn run_readonly(&self, src: &str) -> Result<Handle, Error> {
         let prepared = self.prepare_uncached(src)?;
@@ -672,6 +703,24 @@ impl Db {
 
     pub fn explain_as(&mut self, src: &str, graph: Option<GraphFmt>) -> Result<String, Error> {
         let stmts = parse::parse_program(src)?;
+        self.explain_stmts(stmts, graph, Some(src))
+    }
+
+    /// Explain a program already parsed as AST.
+    pub fn explain_stmt(
+        &mut self,
+        stmt: Stmt,
+        graph: Option<GraphFmt>,
+    ) -> Result<String, Error> {
+        self.explain_stmts(vec![stmt], graph, None)
+    }
+
+    pub fn explain_stmts(
+        &mut self,
+        stmts: Vec<Stmt>,
+        graph: Option<GraphFmt>,
+        run_src: Option<&str>,
+    ) -> Result<String, Error> {
         let mut cat = self.catalog.clone();
         check::check_program(&stmts, &mut cat)?;
         let mut plan = plan::plan_program(&stmts, &cat)?;
@@ -686,7 +735,11 @@ impl Db {
             ..ExplainCtx::default()
         };
         if plan.explain == crate::ast::ExplainKind::Run {
-            let handle = self.run(src)?;
+            let handle = if let Some(src) = run_src {
+                self.run(src)?
+            } else {
+                self.run_stmts(stmts)?
+            };
             ctx.stats = Some(RunStats {
                 rows: handle.done.n,
                 ms: handle.ms,
@@ -709,6 +762,10 @@ impl Drop for Db {
 impl ReadDb {
     pub fn stats(&self) -> Stats {
         self.inner.stats()
+    }
+
+    pub(crate) fn as_db(&self) -> &Db {
+        &self.inner
     }
 
     pub fn r#gen(&self) -> u64 {
@@ -745,8 +802,42 @@ impl ReadDb {
         self.inner.run_prepared_readonly(prepared)
     }
 
+    pub fn run_prepared_batch(&self, prepared: &Prepared) -> Result<RecordBatch, Error> {
+        if prepared.writes {
+            return Err(Error::runtime("run_batch is read-only"));
+        }
+        if prepared.stmts.len() == 1
+            && let Stmt::Query(q) = &prepared.stmts[0]
+            && let Some(batch) =
+                self.inner
+                    .try_join_project_batch(q, &Default::default(), now_ms())
+        {
+            return Ok(batch);
+        }
+        let h = self.run_prepared(prepared)?;
+        Ok(rows_to_rough_batch(&h.rows))
+    }
+
+    pub fn run_batch(&self, src: &str) -> Result<RecordBatch, Error> {
+        let prepared = self.prepare(src)?;
+        self.run_prepared_batch(&prepared)
+    }
+
     pub fn explain_as(&self, src: &str, graph: Option<GraphFmt>) -> Result<String, Error> {
         let stmts = parse::parse_program(src)?;
+        self.explain_stmts(stmts, graph, Some(src))
+    }
+
+    pub fn explain_stmt(&self, stmt: Stmt, graph: Option<GraphFmt>) -> Result<String, Error> {
+        self.explain_stmts(vec![stmt], graph, None)
+    }
+
+    pub fn explain_stmts(
+        &self,
+        stmts: Vec<Stmt>,
+        graph: Option<GraphFmt>,
+        run_src: Option<&str>,
+    ) -> Result<String, Error> {
         let mut cat = self.inner.catalog.clone();
         check::check_program(&stmts, &mut cat)?;
         let mut plan = plan::plan_program(&stmts, &cat)?;
@@ -761,7 +852,11 @@ impl ReadDb {
             ..ExplainCtx::default()
         };
         if plan.explain == crate::ast::ExplainKind::Run {
-            let handle = self.run(src)?;
+            let handle = if let Some(src) = run_src {
+                self.run(src)?
+            } else {
+                self.run_stmts(stmts)?
+            };
             ctx.stats = Some(RunStats {
                 rows: handle.done.n,
                 ms: handle.ms,
@@ -1121,7 +1216,7 @@ impl Db {
         }
     }
 
-    fn exec_query(
+    pub(crate) fn exec_query(
         &self,
         q: &Query,
         bindings: &BTreeMap<String, Vec<Row>>,
@@ -1152,6 +1247,11 @@ impl Db {
             return Ok(rows);
         }
 
+        // [filter?] | join | project | take — FK point-get, no full right scan / merge.
+        if let Some(rows) = self.try_join_project(q, bindings, now) {
+            return Ok(rows);
+        }
+
         let mut primary = check::collection_of(&q.source).to_string();
         let mut implicit_take = true;
         let mut saw_agg = false;
@@ -1161,7 +1261,10 @@ impl Db {
         });
         let project_fields_step = {
             let simple = q.steps.iter().all(|s| {
-                matches!(s, Step::Filter(_) | Step::Project(_) | Step::Take { .. })
+                matches!(
+                    s,
+                    Step::Filter(_) | Step::Project(_) | Step::Skip { .. } | Step::Take { .. }
+                )
             });
             if simple {
                 q.steps.iter().find_map(|s| match s {
@@ -1262,6 +1365,14 @@ impl Db {
                 Step::Sort { field, desc } => {
                     sort_rows(&mut rows, field, *desc);
                 }
+                Step::Skip { n } => {
+                    let n = (*n).max(0) as usize;
+                    if n >= rows.len() {
+                        rows.clear();
+                    } else if n > 0 {
+                        rows.drain(0..n);
+                    }
+                }
                 Step::Take { n } => {
                     implicit_take = false;
                     if let Some(n) = n {
@@ -1299,9 +1410,12 @@ impl Db {
                     uri,
                     fields.as_deref(),
                 )?;
-                // Only allow Filter/Project/Take after page get.
+                // Only allow Filter/Project/Skip/Take after page get.
                 if q.steps.iter().any(|s| {
-                    !matches!(s, Step::Filter(_) | Step::Project(_) | Step::Take { .. })
+                    !matches!(
+                        s,
+                        Step::Filter(_) | Step::Project(_) | Step::Skip { .. } | Step::Take { .. }
+                    )
                 }) {
                     return None;
                 }
@@ -1333,6 +1447,7 @@ impl Db {
                     fields = Some(field_names(f));
                 }
                 Step::Take { .. } => {}
+                Step::Skip { .. } => {}
                 _ => return None,
             }
         }
@@ -1399,6 +1514,7 @@ impl Db {
                     by = Some(b.as_ref());
                 }
                 Step::Take { .. } => {}
+                Step::Skip { .. } => {}
                 _ => return None,
             }
         }
@@ -1499,6 +1615,7 @@ impl Db {
         let mut filter: Option<&Pred> = None;
         let mut fields: Option<&[Field]> = None;
         let mut explicit_take: Option<Option<i64>> = None;
+        let mut skip_n: usize = 0;
         for step in &q.steps {
             match step {
                 Step::Filter(p) => {
@@ -1512,6 +1629,9 @@ impl Db {
                         return None;
                     }
                     fields = Some(f.as_slice());
+                }
+                Step::Skip { n } => {
+                    skip_n = skip_n.saturating_add((*n).max(0) as usize);
                 }
                 Step::Take { n } => {
                     explicit_take = Some(*n);
@@ -1552,6 +1672,12 @@ impl Db {
             }
         };
 
+        if skip_n >= rows.len() {
+            rows.clear();
+        } else if skip_n > 0 {
+            rows.drain(0..skip_n);
+        }
+
         match explicit_take {
             Some(Some(n)) => {
                 let n = n.max(0) as usize;
@@ -1564,6 +1690,305 @@ impl Db {
             None => {}
         }
         Some(rows)
+    }
+
+    /// `[filter?] | join | { fields } | take…` — row-API wrapper over columnar join.
+    fn try_join_project(
+        &self,
+        q: &Query,
+        bindings: &BTreeMap<String, Vec<Row>>,
+        now: i64,
+    ) -> Option<Vec<Row>> {
+        Some(self.try_join_project_batch(q, bindings, now)?.to_rows())
+    }
+
+    /// Columnar FK join+project (OLAP). Prefer [`Self::run_prepared_batch`].
+    fn try_join_project_batch(
+        &self,
+        q: &Query,
+        bindings: &BTreeMap<String, Vec<Row>>,
+        now: i64,
+    ) -> Option<RecordBatch> {
+        let Source::Collection(left_name) = &q.source else {
+            return None;
+        };
+        if bindings.get(left_name).is_some() {
+            return None;
+        }
+
+        let mut filter: Option<&Pred> = None;
+        let mut join: Option<(bool, &str, &str)> = None;
+        let mut fields: Option<&[Field]> = None;
+        let mut explicit_take: Option<Option<i64>> = None;
+        let mut skip_n: usize = 0;
+        let mut saw_join = false;
+
+        for step in &q.steps {
+            match step {
+                Step::Filter(p) if !saw_join => {
+                    if filter.is_some() {
+                        return None;
+                    }
+                    filter = Some(p);
+                }
+                Step::Join {
+                    left,
+                    collection,
+                    on,
+                } if !saw_join => {
+                    saw_join = true;
+                    join = Some((*left, collection.as_str(), on.as_str()));
+                }
+                Step::Project(f) if saw_join => {
+                    if fields.is_some() {
+                        return None;
+                    }
+                    fields = Some(f.as_slice());
+                }
+                Step::Skip { n } if saw_join => {
+                    skip_n = skip_n.saturating_add((*n).max(0) as usize);
+                }
+                Step::Take { n } if saw_join => {
+                    if explicit_take.is_some() {
+                        return None;
+                    }
+                    explicit_take = Some(*n);
+                }
+                Step::Project(_) | Step::Skip { .. } | Step::Take { .. } if !saw_join => {
+                    return None;
+                }
+                _ => return None,
+            }
+        }
+
+        let (left_join, right_col, on) = join?;
+        let fields = fields?;
+        let names = field_names(fields);
+        if names.is_empty() {
+            return None;
+        }
+
+        let to_field = self
+            .catalog
+            .find_fk(left_name, on, right_col)
+            .map(|fk| fk.to_field.as_str())
+            .unwrap_or("id");
+        if to_field != "id" {
+            return None;
+        }
+
+        // Hot path: orders ⋈ users via SoA columns → RecordBatch (no per-row BTreeMap).
+        if left_name == "orders"
+            && right_col == "users"
+            && on == "user_id"
+            && self.store.orders_soa_ready()
+            && self.store.users_soa_ready()
+        {
+            return self.join_orders_users_soa_batch(
+                filter,
+                left_join,
+                &names,
+                skip_n,
+                explicit_take,
+                now,
+            );
+        }
+
+        let (right_fields, plan) = plan_join_fields(right_col, &names);
+        let rights = self.store.collection(right_col);
+        let probe = build_right_probe(rights, &right_fields);
+
+        let (source, need_filter) = {
+            if let Some(pred) = filter {
+                if let Some(uses) = crate::index::pick_index(&self.catalog, left_name, pred)
+                    && let Some(idxs) = self.store.index_seek(left_name, &uses, now)
+                {
+                    let covered = crate::index::index_covers_pred(pred, &uses);
+                    (JoinLeftSource::Idxs(idxs), !covered)
+                } else {
+                    (
+                        JoinLeftSource::Scan {
+                            len: self.store.collection(left_name).len(),
+                        },
+                        true,
+                    )
+                }
+            } else {
+                (
+                    JoinLeftSource::Scan {
+                        len: self.store.collection(left_name).len(),
+                    },
+                    false,
+                )
+            }
+        };
+
+        let left_len = match &source {
+            JoinLeftSource::Idxs(i) => i.len(),
+            JoinLeftSource::Scan { len } => *len,
+        };
+        let names_arc: Arc<[String]> = names.clone().into();
+        let mut batch = RecordBatch::with_capacity(names_arc, left_len);
+        let mut pos = 0usize;
+        loop {
+            let idx = match &source {
+                JoinLeftSource::Idxs(idxs) => {
+                    if pos >= idxs.len() {
+                        break;
+                    }
+                    let i = idxs[pos];
+                    pos += 1;
+                    i
+                }
+                JoinLeftSource::Scan { len } => {
+                    if pos >= *len {
+                        break;
+                    }
+                    let i = pos;
+                    pos += 1;
+                    i
+                }
+            };
+            let Some(left_row) = self.store.get_by_idx(left_name, idx) else {
+                continue;
+            };
+            if need_filter
+                && let Some(pred) = filter
+                && !eval_pred(pred, left_row, now)
+            {
+                continue;
+            }
+
+            let right_cells = left_row
+                .get(on)
+                .and_then(Cell::text)
+                .and_then(|k| probe.get(k).map(|v| v.as_slice()));
+            if right_cells.is_none() && !left_join {
+                continue;
+            }
+            push_join_batch_row(&mut batch, left_row, right_cells, &plan);
+        }
+
+        finish_batch(&mut batch, skip_n, explicit_take);
+        Some(batch)
+    }
+
+    /// orders ⋈ users using parallel columns + hash probe on users.
+    fn join_orders_users_soa_batch(
+        &self,
+        filter: Option<&Pred>,
+        left_join: bool,
+        names: &[String],
+        skip_n: usize,
+        explicit_take: Option<Option<i64>>,
+        now: i64,
+    ) -> Option<RecordBatch> {
+        let (right_fields, plan) = plan_join_fields("users", names);
+        let users_id = self.store.users_id();
+        let users_email = self.store.users_email();
+        let mut probe: FxHashMap<&str, Vec<Cell>> = FxHashMap::default();
+        probe.reserve(users_id.len());
+        for i in 0..users_id.len() {
+            let cells: Vec<Cell> = right_fields
+                .iter()
+                .map(|f| match f.as_str() {
+                    "id" => Cell::Text(Arc::clone(&users_id[i])),
+                    "email" => Cell::Text(Arc::clone(&users_email[i])),
+                    _ => Cell::Null,
+                })
+                .collect();
+            probe.insert(users_id[i].as_ref(), cells);
+        }
+
+        let orders_id = self.store.orders_id();
+        let orders_uid = self.store.orders_user_id();
+        let orders_total = self.store.orders_total();
+        let n = orders_id.len();
+
+        let total_gt = filter.and_then(pred_total_gt);
+        let (source, need_row_filter) = if total_gt.is_some() {
+            (JoinLeftSource::Scan { len: n }, false)
+        } else if let Some(pred) = filter {
+            if let Some(uses) = crate::index::pick_index(&self.catalog, "orders", pred)
+                && let Some(idxs) = self.store.index_seek("orders", &uses, now)
+            {
+                let covered = crate::index::index_covers_pred(pred, &uses);
+                (JoinLeftSource::Idxs(idxs), !covered)
+            } else {
+                (JoinLeftSource::Scan { len: n }, true)
+            }
+        } else {
+            (JoinLeftSource::Scan { len: n }, false)
+        };
+
+        let names_arc: Arc<[String]> = names.to_vec().into();
+        let mut batch = RecordBatch::with_capacity(names_arc, n);
+        let mut pos = 0usize;
+        loop {
+            let idx = match &source {
+                JoinLeftSource::Idxs(idxs) => {
+                    if pos >= idxs.len() {
+                        break;
+                    }
+                    let i = idxs[pos];
+                    pos += 1;
+                    i
+                }
+                JoinLeftSource::Scan { len } => {
+                    if pos >= *len {
+                        break;
+                    }
+                    let i = pos;
+                    pos += 1;
+                    i
+                }
+            };
+            if idx >= n {
+                continue;
+            }
+            if let Some(min) = total_gt {
+                if !(orders_total[idx] > min) {
+                    continue;
+                }
+            } else if need_row_filter
+                && let Some(pred) = filter
+            {
+                let Some(left_row) = self.store.get_by_idx("orders", idx) else {
+                    continue;
+                };
+                if !eval_pred(pred, left_row, now) {
+                    continue;
+                }
+            }
+
+            let uid = orders_uid[idx].as_ref();
+            let right_cells = probe.get(uid).map(|v| v.as_slice());
+            if right_cells.is_none() && !left_join {
+                continue;
+            }
+
+            for (col_i, p) in plan.iter().enumerate() {
+                let cell = match p {
+                    JoinFieldPlan::Left(k) => match k.as_str() {
+                        "id" => Cell::Text(Arc::clone(&orders_id[idx])),
+                        "user_id" => Cell::Text(Arc::clone(&orders_uid[idx])),
+                        "total" => Cell::Float(orders_total[idx]),
+                        _ => self
+                            .store
+                            .get_by_idx("orders", idx)
+                            .and_then(|r| r.get(k).cloned())
+                            .unwrap_or(Cell::Null),
+                    },
+                    JoinFieldPlan::Right { out: _, idx: ri } => right_cells
+                        .and_then(|r| r.get(*ri).cloned())
+                        .unwrap_or(Cell::Null),
+                };
+                batch.cols[col_i].push(cell);
+            }
+        }
+
+        finish_batch(&mut batch, skip_n, explicit_take);
+        Some(batch)
     }
 
     fn filter_scan(
@@ -1677,24 +2102,53 @@ impl Db {
             .find_fk(left_col, on, right_col)
             .map(|fk| fk.to_field.as_str())
             .unwrap_or("id");
-        let right = self.scan(right_col);
-        let mut idx: BTreeMap<String, Vec<&Row>> = BTreeMap::new();
-        for r in &right {
+
+        // FK → unique id: hash-build right once, then probe (tight map, no by_id indirection).
+        if to_field == "id" {
+            let right = self.store.collection(right_col);
+            let mut by_id: FxHashMap<&str, &Row> = FxHashMap::default();
+            by_id.reserve(right.len());
+            for r in right {
+                if let Some(id) = r.get("id").and_then(Cell::text) {
+                    by_id.insert(id, r);
+                }
+            }
+            let mut out = Vec::with_capacity(left.len());
+            for l in left {
+                let right = l
+                    .get(on)
+                    .and_then(Cell::text)
+                    .and_then(|k| by_id.get(k).copied());
+                match right {
+                    Some(r) => out.push(merge_join_row(l, r, right_col)),
+                    None if left_join => out.push(l),
+                    None => {}
+                }
+            }
+            return out;
+        }
+
+        // Non-id join key: hash probe without cloning the right collection.
+        let right = self.store.collection(right_col);
+        let mut idx: FxHashMap<String, Vec<&Row>> = FxHashMap::default();
+        idx.reserve(right.len());
+        for r in right {
             if let Some(k) = cell_key(r.get(to_field).unwrap_or(&Cell::Null)) {
                 idx.entry(k).or_default().push(r);
             }
         }
-        let mut out = Vec::new();
-        for l in left {
+        let mut out = Vec::with_capacity(left.len());
+        for mut l in left {
             let key = l.get(on).and_then(cell_key);
             let hits = key.as_ref().and_then(|k| idx.get(k));
             if let Some(rs) = hits {
-                for r in rs {
-                    let mut merged = l.clone();
-                    for (k, v) in *r {
-                        merged.insert(format!("{right_col}.{k}"), v.clone());
-                    }
-                    out.push(merged);
+                for (i, r) in rs.iter().enumerate() {
+                    let base = if i + 1 == rs.len() {
+                        std::mem::take(&mut l)
+                    } else {
+                        l.clone()
+                    };
+                    out.push(merge_join_row(base, r, right_col));
                 }
             } else if left_join {
                 out.push(l);
@@ -2335,11 +2789,212 @@ fn stmt_append_only(s: &Stmt) -> bool {
     )
 }
 
+fn merge_join_row(mut left: Row, right: &Row, right_col: &str) -> Row {
+    for (k, v) in right {
+        left.insert(format!("{right_col}.{k}"), v.clone());
+    }
+    left
+}
+
+fn push_join_batch_row(
+    batch: &mut RecordBatch,
+    left: &Row,
+    right: Option<&[Cell]>,
+    plan: &[JoinFieldPlan],
+) {
+    for (col_i, p) in plan.iter().enumerate() {
+        let cell = match p {
+            JoinFieldPlan::Left(k) => left.get(k).cloned().unwrap_or(Cell::Null),
+            JoinFieldPlan::Right { out: _, idx } => right
+                .and_then(|r| r.get(*idx).cloned())
+                .unwrap_or(Cell::Null),
+        };
+        batch.cols[col_i].push(cell);
+    }
+}
+
+fn finish_batch(batch: &mut RecordBatch, skip_n: usize, explicit_take: Option<Option<i64>>) {
+    let n = batch.n();
+    if skip_n >= n {
+        batch.truncate(0);
+    } else if skip_n > 0 {
+        batch.drain_prefix(skip_n);
+    }
+    match explicit_take {
+        Some(Some(t)) => {
+            let t = t.max(0) as usize;
+            if batch.n() > t {
+                batch.truncate(t);
+            }
+        }
+        Some(None) => {}
+        None if batch.n() > 50 => batch.truncate(50),
+        None => {}
+    }
+}
+
+fn pred_total_gt(pred: &Pred) -> Option<f64> {
+    match pred {
+        Pred::Cmp {
+            field,
+            op: CmpOp::Gt,
+            value,
+        } if field.leaf() == Some("total") => match value {
+            Value::Float(n) => Some(*n),
+            Value::Int(n) => Some(*n as f64),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn rows_to_rough_batch(rows: &[Row]) -> RecordBatch {
+    if rows.is_empty() {
+        return RecordBatch::empty(Arc::<[String]>::from(Vec::<String>::new()));
+    }
+    let names: Vec<String> = rows[0].keys().cloned().collect();
+    let names_arc: Arc<[String]> = names.clone().into();
+    let mut batch = RecordBatch::with_capacity(names_arc, rows.len());
+    for row in rows {
+        for (i, name) in names.iter().enumerate() {
+            batch.cols[i].push(row.get(name).cloned().unwrap_or(Cell::Null));
+        }
+    }
+    batch
+}
+
+/// Output field for a projected FK join: left column or right probe slot.
+#[derive(Debug, Clone)]
+pub(crate) enum JoinFieldPlan {
+    Left(String),
+    Right { out: String, idx: usize },
+}
+
+pub(crate) fn plan_join_fields(
+    right_col: &str,
+    names: &[String],
+) -> (Vec<String>, Vec<JoinFieldPlan>) {
+    let mut right_fields = Vec::new();
+    let mut plan = Vec::with_capacity(names.len());
+    for f in names {
+        if let Some(rest) = f
+            .strip_prefix(right_col)
+            .and_then(|s| s.strip_prefix('.'))
+        {
+            let idx = if let Some(i) = right_fields.iter().position(|x| x == rest) {
+                i
+            } else {
+                right_fields.push(rest.to_string());
+                right_fields.len() - 1
+            };
+            plan.push(JoinFieldPlan::Right {
+                out: f.clone(),
+                idx,
+            });
+        } else {
+            plan.push(JoinFieldPlan::Left(f.clone()));
+        }
+    }
+    (right_fields, plan)
+}
+
+pub(crate) fn build_right_probe<'a>(
+    rights: &'a [Row],
+    right_fields: &[String],
+) -> FxHashMap<&'a str, Vec<Cell>> {
+    let mut probe = FxHashMap::default();
+    probe.reserve(rights.len());
+    for r in rights {
+        let Some(id) = r.get("id").and_then(Cell::text) else {
+            continue;
+        };
+        let cells = right_fields
+            .iter()
+            .map(|f| r.get(f).cloned().unwrap_or(Cell::Null))
+            .collect();
+        probe.insert(id, cells);
+    }
+    probe
+}
+
+pub(crate) fn build_right_probe_owned(
+    rights: &[Row],
+    right_fields: &[String],
+) -> FxHashMap<String, Vec<Cell>> {
+    let mut probe = FxHashMap::default();
+    probe.reserve(rights.len());
+    for r in rights {
+        let Some(id) = r.get("id").and_then(Cell::text) else {
+            continue;
+        };
+        let cells = right_fields
+            .iter()
+            .map(|f| r.get(f).cloned().unwrap_or(Cell::Null))
+            .collect();
+        probe.insert(id.to_string(), cells);
+    }
+    probe
+}
+
+pub(crate) fn emit_join_row(
+    left: &Row,
+    right: Option<&[Cell]>,
+    plan: &[JoinFieldPlan],
+) -> Row {
+    let mut out = BTreeMap::new();
+    for p in plan {
+        match p {
+            JoinFieldPlan::Left(k) => {
+                out.insert(k.clone(), left.get(k).cloned().unwrap_or(Cell::Null));
+            }
+            JoinFieldPlan::Right { out: k, idx } => {
+                out.insert(
+                    k.clone(),
+                    right
+                        .and_then(|r| r.get(*idx).cloned())
+                        .unwrap_or(Cell::Null),
+                );
+            }
+        }
+    }
+    out
+}
+
+/// Project join output without building a full merged left∪right map.
+pub(crate) fn project_join_fields(
+    left: &Row,
+    right: Option<&Row>,
+    right_col: &str,
+    fields: &[String],
+) -> Row {
+    let mut out = BTreeMap::new();
+    for f in fields {
+        let cell = if let Some(rest) = f
+            .strip_prefix(right_col)
+            .and_then(|s| s.strip_prefix('.'))
+        {
+            right
+                .and_then(|r| r.get(rest))
+                .cloned()
+                .unwrap_or(Cell::Null)
+        } else {
+            left.get(f).cloned().unwrap_or(Cell::Null)
+        };
+        out.insert(f.clone(), cell);
+    }
+    out
+}
+
+enum JoinLeftSource {
+    Idxs(Vec<usize>),
+    Scan { len: usize },
+}
+
 fn stmt_schema(s: &Stmt) -> bool {
     matches!(s, Stmt::Decl(_))
 }
 
-fn field_names(fields: &[Field]) -> Vec<String> {
+pub(crate) fn field_names(fields: &[Field]) -> Vec<String> {
     fields.iter().map(|f| f.as_str()).collect()
 }
 
@@ -2441,7 +3096,7 @@ fn point_key(pred: &Pred) -> Option<(&str, &str)> {
     }
 }
 
-fn eval_pred(pred: &Pred, row: &Row, now: i64) -> bool {
+pub(crate) fn eval_pred(pred: &Pred, row: &Row, now: i64) -> bool {
     match pred {
         Pred::And(a, b) => eval_pred(a, row, now) && eval_pred(b, row, now),
         Pred::Or(a, b) => eval_pred(a, row, now) || eval_pred(b, row, now),
@@ -2717,7 +3372,7 @@ fn unquote(s: &str) -> String {
     }
 }
 
-fn cell_key(c: &Cell) -> Option<String> {
+pub(crate) fn cell_key(c: &Cell) -> Option<String> {
     match c {
         Cell::Text(s) => Some(s.as_ref().to_owned()),
         Cell::Int(n) => Some(n.to_string()),

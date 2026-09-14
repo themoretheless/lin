@@ -10,6 +10,55 @@ Lin — язык своей локальной БД: пайпы, типизир�
 
 Публичный контракт: `Db::{empty,fixture,open,open_with,open_read,close,checkpoint,run,prepare,explain_as,reader,export_backup,import_backup,import_backup_into,export_wal_since,apply_wal,stats,with_quotas,with_sync_mode}`, `ReadDb::{run,prepare,stats,clone}`, `Quotas`, `SyncMode`, `OpenOpts`, плюс `parse` / `compile` / `run` / `explain*`, типы `Handle` / `Done` / `Prepared` / `Error` / `Row` / `Cell` / `Store` / `Plan` / `Stats` / `VERSION`.
 
+### Experimental: Queryable + typed + async
+
+Fluent builder (без строк DSL), typed rows, async/stream/cursor — вне 0.2 freeze:
+
+```rust
+use lin::query::pred;
+use lin::{Db, MatchPath, Queryable};
+
+let mut db = Db::fixture();
+
+// explain without string DSL
+let plan = Queryable::from("docs")
+    .filter(pred::eq("wing", "rag"))
+    .take(5)
+    .explain(&mut db)?;
+
+// Keyset paging — prefer over deep skip (field must allow `>`: num/time, not text id)
+let page1 = db.from("orders").select(["id", "total"]).sort("total", false).take(20).to_vec()?;
+let last = page1.last().unwrap().get("total").and_then(|c| c.as_f64()).unwrap();
+let page2 = db.from("orders").after("total", last).sort("total", false).take(20).to_vec()?;
+
+// Lazy cursor: filter|project|skip|take, or one FK join
+let cur = Queryable::from("orders")
+    .filter(pred::gt("total", 100.0))
+    .join("users", "user_id")
+    .select(["id", "users.email", "total"])
+    .take(10)
+    .cursor(&db)?;
+assert!(cur.is_lazy());
+
+// hop / match fluent (cursor materializes — not lazy)
+let _ = Queryable::from("docs")
+    .filter(pred::eq("id", id))
+    .hop("wikilink")
+    .select(["id", "title"])
+    .to_vec(&mut db)?;
+let _ = Queryable::from("docs")
+    .filter(pred::eq("id", id))
+    .match_path(MatchPath::fwd("wikilink", "b"))
+    .select(["id", "b.title"])
+    .to_vec(&mut db)?;
+```
+
+**Lazy cursor:** `filter` / `project` / `skip` / `take`, плюс один `join`/`left_join` по FK (nested-loop + point get). `hop` / `graph` / `match` / `sort` / `union` / `search` — buffered. Deep `skip` дороже keyset (`.after` + `take`).
+
+**OLAP рядом с row-API:** `Db::run` / `Prepared::run` → `Vec<Row>`; `run_batch` → [`RecordBatch`] (колонки). Hot join `orders ⋈ users` идёт через SoA + batch; `run` материализует batch в row-maps.
+
+Features: `derive`, `async` — в `default`. Также `Db::run_stmt` / `explain_stmt` / `cursor`.
+
 `Db::reader()` — in-process снимок текущего `gen`. `open_read` — shared **FENCE** (можно рядом с writer; checkpoint ждёт readers). `export_wal_since` / `apply_wal` — ship WAL; **`apply_wal` только in-memory**. `pin`/`unpin` — memory-pins. Snapshot: `LIN\x04` MessagePack self-contained; `cold/*.bin` — lazy mmap page-in.
 
 ## Local-prod guarantees
@@ -44,6 +93,7 @@ docs | id == "…" | match -wikilink*1..2-> b | { b.title }
 docs | id == "…" | match <-wikilink- src | { src.title }
 docs | id == "…" | match -[e:wikilink]-> b | { e.from, e.to, b.title }
 docs | search "wal" | take 20
+docs | wing == "rag" | { id, title } | skip 40 | take 20
 docs | { id } | union orders | { id }
 let x = docs | wing == "rag" | { id }
 x | take 5
@@ -81,7 +131,7 @@ rel cites
 
 Запись — отдельный statement, не хвост пайпа. Неизвестный столбец, hop без `rel`, join без `fk`, `update` без `cas` — ошибка компиляции.
 
-Неявный `take 50`. `search` / `search hybrid` исполняются **только lex** (эмбеддера нет); в explain: `Search lex` + `hybrid→lex (no embedder)`. `search vec` планируется, но возвращает пусто. `embed_id=nomic-embed-text/768` — метка каталога, не живой embedder.
+Неявный `take 50`. `skip N` / `offset N` — отбросить первые N строк (пейджинг: `skip 40 | take 20`). `search` / `search hybrid` исполняются **только lex** (эмбеддера нет); в explain: `Search lex` + `hybrid→lex (no embedder)`. `search vec` планируется, но возвращает пусто. `embed_id=nomic-embed-text/768` — метка каталога, не живой embedder.
 
 ## Roadmap (кратко)
 
@@ -104,15 +154,17 @@ cargo bench --bench compare -- --list
 # быстрый прогон (нужен --release; airbug-bench отказывается от debug)
 cargo bench --bench compare -- --profile quick
 
-# только point get / только insert / только append_log
+# только point get / только insert / только join / только append_log
 cargo bench --bench compare -- --filter point_get
 cargo bench --bench compare -- --filter insert_bulk_1k --samples 8
+cargo bench --bench compare -- --filter join
 cargo bench --bench compare -- --profile quick --filter append_log
 ```
 
 Движки: **Lin**, **SQLite** (`rusqlite` bundled), **DuckDB** (bundled; собирается на mac aarch64), **Postgres** / **MySQL** (опционально, через URL), плюс **HashMap** только для point get. N=10 000 для тёплых чтений (fixture; setup вне тайминга). Bulk insert: схема/индекс в setup, в тайминге только запись.
 
-Сравнимо: point get по id, `wing ==`, range `wing`+`ts`, substring (`title ~ "wal" | count` ≈ `COUNT(*) … LIKE '%wal%'`), materialize `SELECT id,title`, bulk insert 1k/10k, **append_log** (`append facts` vs `INSERT INTO logs`) 1k/10k.  
+Сравнимо: point get по id, `wing ==`, range `wing`+`ts`, substring (`title ~ "wal" | count` ≈ `COUNT(*) … LIKE '%wal%'`), materialize `SELECT id,title`, **join** (10k `orders` ⋈ 1k `users` по FK; Lin `run_batch` / SoA+`RecordBatch` и lazy cursor vs SQL `INNER JOIN`; плюс `total > 100` затем join), bulk insert 1k/10k, **append_log** (`append facts` vs `INSERT INTO logs`) 1k/10k.  
+Join: row-API (`run` → `Vec<Row>`) и OLAP-путь (`run_batch` → `RecordBatch`) рядом; бенч join меряет batch. DuckDB — референс columnar OLAP.  
 Не сравниваем здесь (и не подтасовываем): Lin `hop`/`match`, real vec/hybrid, CAS, durable fsync (`--data`) — отдельный слой.
 
 ### Postgres / MySQL

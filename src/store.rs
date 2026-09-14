@@ -55,6 +55,31 @@ impl Cell {
         }
     }
 
+    pub fn as_int(&self) -> Option<i64> {
+        match self {
+            Cell::Int(n) => Some(*n),
+            _ => None,
+        }
+    }
+
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            Cell::Bool(b) => Some(*b),
+            _ => None,
+        }
+    }
+
+    pub fn as_time(&self) -> Option<i64> {
+        match self {
+            Cell::Time(ms) => Some(*ms),
+            _ => None,
+        }
+    }
+
+    pub fn is_null(&self) -> bool {
+        matches!(self, Cell::Null)
+    }
+
     pub fn compact(&self) -> String {
         match self {
             Cell::Null => "null".into(),
@@ -76,6 +101,19 @@ impl std::fmt::Display for Quote<'_> {
 }
 
 pub type Row = BTreeMap<String, Cell>;
+
+/// Ergonomics for `match row.cell("col") { Cell::Text(s) => …, Cell::Null => … }`.
+pub trait RowExt {
+    /// Column value, or [`Cell::Null`] if the key is missing.
+    fn cell(&self, key: &str) -> &Cell;
+}
+
+impl RowExt for Row {
+    fn cell(&self, key: &str) -> &Cell {
+        static NULL: Cell = Cell::Null;
+        self.get(key).unwrap_or(&NULL)
+    }
+}
 
 pub fn compact_row(row: &Row) -> String {
     let parts: Vec<String> = row
@@ -122,6 +160,12 @@ pub struct Store {
     docs_title: Vec<Arc<str>>,
     docs_layer: Vec<Arc<str>>,
     docs_wing: Vec<Arc<str>>,
+    /// SoA for orders / users — FK join + OLAP project without per-row maps.
+    orders_id: Vec<Arc<str>>,
+    orders_user_id: Vec<Arc<str>>,
+    orders_total: Vec<f64>,
+    users_id: Vec<Arc<str>>,
+    users_email: Vec<Arc<str>>,
     /// Columnar facts (append hot path). `collections["facts"]` may lag until
     /// [`Self::ensure_facts_rows`].
     facts_s: Vec<Arc<str>>,
@@ -165,6 +209,11 @@ impl Store {
             docs_title: Vec::new(),
             docs_layer: Vec::new(),
             docs_wing: Vec::new(),
+            orders_id: Vec::new(),
+            orders_user_id: Vec::new(),
+            orders_total: Vec::new(),
+            users_id: Vec::new(),
+            users_email: Vec::new(),
             facts_s: Vec::new(),
             facts_p: Vec::new(),
             facts_o: Vec::new(),
@@ -327,6 +376,11 @@ impl Store {
             docs_title: Vec::new(),
             docs_layer: Vec::new(),
             docs_wing: Vec::new(),
+            orders_id: Vec::new(),
+            orders_user_id: Vec::new(),
+            orders_total: Vec::new(),
+            users_id: Vec::new(),
+            users_email: Vec::new(),
             facts_s: Vec::new(),
             facts_p: Vec::new(),
             facts_o: Vec::new(),
@@ -1125,6 +1179,15 @@ impl Store {
             self.docs_layer.clear();
             self.docs_wing.clear();
         }
+        if collection == "orders" {
+            self.orders_id.clear();
+            self.orders_user_id.clear();
+            self.orders_total.clear();
+        }
+        if collection == "users" {
+            self.users_id.clear();
+            self.users_email.clear();
+        }
         if collection == "facts" {
             self.facts_by_spo.clear();
         }
@@ -1138,6 +1201,15 @@ impl Store {
             self.docs_layer.reserve(n);
             self.docs_wing.reserve(n);
         }
+        if collection == "orders" {
+            self.orders_id.reserve(n);
+            self.orders_user_id.reserve(n);
+            self.orders_total.reserve(n);
+        }
+        if collection == "users" {
+            self.users_id.reserve(n);
+            self.users_email.reserve(n);
+        }
         // Snapshot first so we can mutate maps without overlapping borrows.
         let snaps: Vec<(
             Option<String>,
@@ -1147,6 +1219,8 @@ impl Store {
             Arc<str>,
             Arc<str>,
             Option<(Arc<str>, Arc<str>, Arc<str>)>,
+            Arc<str>, // user_id / email extra
+            f64,      // total
         )> = rows
             .iter()
             .map(|row| {
@@ -1162,10 +1236,28 @@ impl Store {
                     } else {
                         None
                     },
+                    if collection == "orders" {
+                        row.get("user_id")
+                            .and_then(Cell::text_shared)
+                            .unwrap_or_default()
+                    } else if collection == "users" {
+                        row.get("email")
+                            .and_then(Cell::text_shared)
+                            .unwrap_or_default()
+                    } else {
+                        Arc::<str>::from("")
+                    },
+                    if collection == "orders" {
+                        row.get("total").and_then(Cell::as_f64).unwrap_or(0.0)
+                    } else {
+                        0.0
+                    },
                 )
             })
             .collect();
-        for (i, (id, uri, did, title, layer, wing, spo)) in snaps.into_iter().enumerate() {
+        for (i, (id, uri, did, title, layer, wing, spo, extra, total)) in
+            snaps.into_iter().enumerate()
+        {
             if let Some(id) = id {
                 self.by_id
                     .get_mut(collection)
@@ -1183,6 +1275,13 @@ impl Store {
                 self.docs_title.push(title);
                 self.docs_layer.push(layer);
                 self.docs_wing.push(wing);
+            } else if collection == "orders" {
+                self.orders_id.push(did);
+                self.orders_user_id.push(extra);
+                self.orders_total.push(total);
+            } else if collection == "users" {
+                self.users_id.push(did);
+                self.users_email.push(extra);
             }
         }
     }
@@ -1232,6 +1331,48 @@ impl Store {
                 self.rebuild_row_maps_collection("docs");
             }
         }
+        if collection == "orders" || collection == "users" {
+            self.row_maps_register_soa(collection, idx);
+        }
+    }
+
+    fn row_maps_register_soa(&mut self, collection: &str, idx: usize) {
+        let Some(row) = self.collections.get(collection).and_then(|c| c.get(idx)) else {
+            return;
+        };
+        let id = row.get("id").and_then(Cell::text_shared).unwrap_or_default();
+        if collection == "orders" {
+            let uid = row
+                .get("user_id")
+                .and_then(Cell::text_shared)
+                .unwrap_or_default();
+            let total = row.get("total").and_then(Cell::as_f64).unwrap_or(0.0);
+            if idx == self.orders_id.len() {
+                self.orders_id.push(id);
+                self.orders_user_id.push(uid);
+                self.orders_total.push(total);
+            } else if idx < self.orders_id.len() {
+                self.orders_id[idx] = id;
+                self.orders_user_id[idx] = uid;
+                self.orders_total[idx] = total;
+            } else {
+                self.rebuild_row_maps_collection("orders");
+            }
+        } else if collection == "users" {
+            let email = row
+                .get("email")
+                .and_then(Cell::text_shared)
+                .unwrap_or_default();
+            if idx == self.users_id.len() {
+                self.users_id.push(id);
+                self.users_email.push(email);
+            } else if idx < self.users_id.len() {
+                self.users_id[idx] = id;
+                self.users_email[idx] = email;
+            } else {
+                self.rebuild_row_maps_collection("users");
+            }
+        }
     }
 
     /// Register maps/columns from an already-built row (avoids re-fetch).
@@ -1264,6 +1405,41 @@ impl Store {
                 self.docs_wing[idx] = wing;
             } else {
                 self.rebuild_row_maps_collection("docs");
+            }
+        }
+        if collection == "orders" {
+            let uid = row
+                .get("user_id")
+                .and_then(Cell::text_shared)
+                .unwrap_or_default();
+            let total = row.get("total").and_then(Cell::as_f64).unwrap_or(0.0);
+            let did = id.clone().unwrap_or_default();
+            if idx == self.orders_id.len() {
+                self.orders_id.push(did);
+                self.orders_user_id.push(uid);
+                self.orders_total.push(total);
+            } else if idx < self.orders_id.len() {
+                self.orders_id[idx] = did;
+                self.orders_user_id[idx] = uid;
+                self.orders_total[idx] = total;
+            } else {
+                self.rebuild_row_maps_collection("orders");
+            }
+        }
+        if collection == "users" {
+            let email = row
+                .get("email")
+                .and_then(Cell::text_shared)
+                .unwrap_or_default();
+            let did = id.clone().unwrap_or_default();
+            if idx == self.users_id.len() {
+                self.users_id.push(did);
+                self.users_email.push(email);
+            } else if idx < self.users_id.len() {
+                self.users_id[idx] = did;
+                self.users_email[idx] = email;
+            } else {
+                self.rebuild_row_maps_collection("users");
             }
         }
     }
@@ -1324,6 +1500,15 @@ impl Store {
             self.docs_title.reserve(additional);
             self.docs_layer.reserve(additional);
             self.docs_wing.reserve(additional);
+        }
+        if collection == "orders" {
+            self.orders_id.reserve(additional);
+            self.orders_user_id.reserve(additional);
+            self.orders_total.reserve(additional);
+        }
+        if collection == "users" {
+            self.users_id.reserve(additional);
+            self.users_email.reserve(additional);
         }
     }
 
@@ -1529,6 +1714,36 @@ impl Store {
     }
 
     /// Project hot docs fields from parallel columns — Arc clone only, no full row clone.
+    /// True when orders SoA matches `collections["orders"]` length.
+    pub fn orders_soa_ready(&self) -> bool {
+        let n = self.collection("orders").len();
+        self.orders_id.len() == n
+            && self.orders_user_id.len() == n
+            && self.orders_total.len() == n
+    }
+
+    /// True when users SoA matches `collections["users"]` length.
+    pub fn users_soa_ready(&self) -> bool {
+        let n = self.collection("users").len();
+        self.users_id.len() == n && self.users_email.len() == n
+    }
+
+    pub fn orders_id(&self) -> &[Arc<str>] {
+        &self.orders_id
+    }
+    pub fn orders_user_id(&self) -> &[Arc<str>] {
+        &self.orders_user_id
+    }
+    pub fn orders_total(&self) -> &[f64] {
+        &self.orders_total
+    }
+    pub fn users_id(&self) -> &[Arc<str>] {
+        &self.users_id
+    }
+    pub fn users_email(&self) -> &[Arc<str>] {
+        &self.users_email
+    }
+
     /// Returns None if any requested field is outside the hot set.
     pub fn project_docs_hot(&self, idxs: &[usize], fields: &[String]) -> Option<Vec<Row>> {
         if fields.is_empty() || !fields.iter().all(|f| docs_hot_field(f)) {
