@@ -2,17 +2,17 @@
 
 Lin — язык своей локальной БД: пайпы, типизированный каталог, два мира записи (`append` / reducer), свой план. Не SQL и не Kusto.
 
-**0.2** — встраиваемая локальная БД: durable `--data`, backup, multi-reader, compaction, flock, quotas, `SyncMode`, cold/mmap, WAL shipping, **durable follower** (`open_follower` / `apply_wal`). Не multi-writer.
+**0.3** — встраиваемая локальная БД: durable `--data`, backup, multi-reader, compaction, flock, quotas, `SyncMode`, cold/mmap, WAL shipping, durable follower, **stable** Queryable/cursor/typed/async. Не multi-writer.
 
 Сейчас есть парсер, typecheck, IR плана, in-memory store (один reducer, один `gen`), исполнитель, WAL+snapshot с compaction, `backup` CLI, durable follower, **живой search vec/hybrid** (локальный hashing-эмбеддер по `embed_id`). DuckDB/WASM backends и multi-writer в этом milestone нет.
 
-## Стабильный API (0.2)
+## Стабильный API (0.3)
 
-Публичный контракт: `Db::{empty,fixture,open,open_with,open_read,open_follower,open_follower_with,bootstrap_follower,close,checkpoint,run,prepare,explain_as,reader,export_backup,import_backup,import_backup_into,export_wal_since,apply_wal,stats,with_quotas,with_sync_mode}`, `ReadDb::{run,prepare,stats,clone}`, `Quotas`, `SyncMode`, `OpenOpts`, плюс `parse` / `compile` / `run` / `explain*`, типы `Handle` / `Done` / `Prepared` / `Error` / `Row` / `Cell` / `Store` / `Plan` / `Stats` / `VERSION`.
+Публичный контракт: `Db::{empty,fixture,open,open_with,open_read,open_follower,open_follower_with,bootstrap_follower,close,checkpoint,run,prepare,explain_as,reader,export_backup,import_backup,import_backup_into,export_wal_since,apply_wal,stats,with_quotas,with_sync_mode,with_embedder}`, `ReadDb::{run,prepare,stats,clone}`, `Quotas`, `SyncMode`, `OpenOpts`, `Embedder` / `HashingEmbedder`, плюс `parse` / `compile` / `run` / `explain*`, типы `Handle` / `Done` / `Prepared` / `Error` / `Row` / `Cell` / `Store` / `Plan` / `Stats` / `VERSION`.
 
-### Experimental: Queryable + typed + async
+**Также stable:** `Queryable` / `BoundQueryable` / `query::pred`, `QueryCursor`, `FromRow` / `LinRow` / `FromCell` / `map_rows` / `cell_get`, feature `async` (default-on): `AsyncDb` / `AsyncReadDb` / `to_vec_async` / `stream_*` (`spawn_blocking`, не async storage).
 
-Fluent builder (без строк DSL), typed rows, async/stream/cursor — вне 0.2 freeze:
+### Queryable + typed + async
 
 ```rust
 use lin::query::pred;
@@ -51,13 +51,18 @@ let _ = Queryable::from("docs")
     .match_path(MatchPath::fwd("wikilink", "b"))
     .select(["id", "b.title"])
     .to_vec(&mut db)?;
+
+// search: hybrid (default), lex, or vec
+let _ = Queryable::from("docs").search_vec("wal shipping").take(5).to_vec(&mut db)?;
 ```
 
-**Lazy cursor:** `filter` / `project` / `skip` / `take`, плюс один `join`/`left_join` по FK (nested-loop + point get). `hop` / `graph` / `match` / `sort` / `union` / `search` — buffered. Deep `skip` дороже keyset (`.after` + `take`).
+**Lazy cursor:** `filter` / `project` / `skip` / `take`, плюс один `join`/`left_join` по FK (nested-loop + point get). `hop` / `graph` / `match` / `sort` / `union` / `search*` — buffered. Deep `skip` дороже keyset (`.after` + `take`).
 
-**OLAP рядом с row-API:** `Db::run` / `Prepared::run` → `Vec<Row>`; `run_batch` → [`RecordBatch`] (колонки). Hot join `orders ⋈ users` идёт через SoA + batch; `run` материализует batch в row-maps.
+**Experimental (вне freeze):** `ship` (TCP WAL, без TLS), `RecordBatch` / `run_batch`, `Db::run_stmt`, `RowExt`. См. [CHANGELOG](CHANGELOG.md).
 
-Features: `derive`, `async` — в `default`. Также `Db::run_stmt` / `explain_stmt` / `cursor`.
+**OLAP рядом с row-API:** `Db::run` / `Prepared::run` → `Vec<Row>`; `run_batch` → [`RecordBatch`] (колонки, experimental). Hot join `orders ⋈ users` идёт через SoA + batch; `run` материализует batch в row-maps.
+
+Features: `derive`, `async` — в `default` (часть 0.3 контракта).
 
 `Db::reader()` — in-process снимок текущего `gen`. `open_read` — shared **FENCE** (можно рядом с writer; checkpoint ждёт readers). `export_wal_since` / `apply_wal` — ship WAL; **`apply_wal` на primary durable запрещён**; на **follower** (`open_follower` / `bootstrap_follower`) пишет frames в log и применяет (hot standby). In-memory `apply_wal` как раньше. `pin`/`unpin` — memory-pins. Snapshot: `LIN\x04` MessagePack self-contained; `cold/*.bin` — lazy mmap page-in.
 
@@ -144,7 +149,7 @@ rel cites
 | P3 hot standby | **готово** (`open_follower` / `apply_wal`) |
 | P3c live vec/hybrid | **готово** (hashing embedder + RRF; neural → `with_embedder`) |
 | **0.2.x ship + ops** | **готово** (критерии met: n1–n4 · tests · README recipe) |
-| **0.3** | Freeze Queryable/cursor/FromRow/async + CHANGELOG/migration → 0.3.0 |
+| **0.3** | **готово** — Queryable/cursor/FromRow/async в stable + CHANGELOG |
 | **0.4** | Neural embed · FTS postings · wider `run_batch` · lazy hop/search |
 | **0.5** | Optional ANN · wasm32 memory-only · TLS/auth/fanout (после скучного ship) |
 | **Не 0.x** | Multi-writer / полный MVCC / consensus · DuckDB как storage backend |

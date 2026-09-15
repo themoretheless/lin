@@ -262,6 +262,21 @@ fn fluent_hop_and_match() {
     assert!(!cur.is_lazy(), "hop is buffered, not lazy");
 }
 
+#[test]
+fn fluent_search_vec() {
+    let mut db = Db::fixture();
+    let via_dsl = db
+        .run(r#"docs | search vec "wal shipping" | take 5"#)
+        .unwrap();
+    let via_fluent = Queryable::from("docs")
+        .search_vec("wal shipping")
+        .take(5)
+        .to_vec(&mut db)
+        .unwrap();
+    assert_eq!(via_fluent.len(), via_dsl.rows.len());
+    assert!(!via_fluent.is_empty());
+}
+
 #[tokio::test]
 async fn async_offload_to_vec() {
     let db = AsyncDb::new(Db::fixture());

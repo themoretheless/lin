@@ -273,6 +273,14 @@ impl Queryable {
         self
     }
 
+    pub fn search_vec(mut self, q: impl Into<String>) -> Self {
+        self.query.steps.push(Step::Search {
+            mode: SearchMode::Vec,
+            query: q.into(),
+        });
+        self
+    }
+
     pub fn count(mut self) -> Self {
         self.query.steps.push(Step::Count { by: None });
         self
@@ -561,6 +569,11 @@ impl<'a> BoundQueryable<'a> {
 
     pub fn search_lex(mut self, query: impl Into<String>) -> Self {
         self.q = self.q.search_lex(query);
+        self
+    }
+
+    pub fn search_vec(mut self, query: impl Into<String>) -> Self {
+        self.q = self.q.search_vec(query);
         self
     }
 
