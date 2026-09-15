@@ -628,12 +628,113 @@ fn wal_export_apply_roundtrip() {
             b.run(r#"docs | uri == "raw://w""#).unwrap().done.n,
             1
         );
-        // Durable apply refused.
+        // Durable primary apply refused.
         let mut durable = Db::open(&tmp()).unwrap();
         assert!(durable.apply_wal(&frames).is_err());
         durable.close().unwrap();
     }
     let _ = fs::remove_dir_all(&a_dir);
+}
+
+#[test]
+fn durable_follower_hot_standby() {
+    let primary_dir = tmp();
+    let follower_dir = tmp();
+    let bak = tmp().join("boot.linbak");
+
+    {
+        let mut primary = Db::open(&primary_dir).unwrap();
+        primary
+            .run(r#"insert docs { uri: "raw://a", title: "A", layer: "wiki" }"#)
+            .unwrap();
+        primary.export_backup(&bak).unwrap();
+        // After backup checkpoint the log is compacted — ship post-bootstrap WAL.
+        primary
+            .run(r#"insert docs { uri: "raw://b", title: "B", layer: "wiki" }"#)
+            .unwrap();
+        let frames = primary.export_wal_since(0).unwrap();
+        assert!(!frames.is_empty());
+
+        let mut follower = Db::bootstrap_follower(&bak, &follower_dir).unwrap();
+        assert!(follower.is_follower());
+        assert_eq!(follower.r#gen(), 1);
+        assert!(
+            follower
+                .run(r#"insert docs { uri: "raw://x", title: "X", layer: "wiki" }"#)
+                .is_err(),
+            "follower rejects user writes"
+        );
+        let n = follower.apply_wal(&frames).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(
+            follower.run(r#"docs | uri == "raw://b""#).unwrap().done.n,
+            1
+        );
+        assert_eq!(follower.run(r#"docs | take 10"#).unwrap().done.n, 2);
+        follower.close().unwrap();
+        primary.close().unwrap();
+    }
+
+    // Reopen follower: durable apply survived.
+    {
+        let mut follower = Db::open_follower(&follower_dir).unwrap();
+        assert_eq!(follower.run(r#"docs | take 10"#).unwrap().done.n, 2);
+        follower.close().unwrap();
+    }
+    // open_read on follower dir for query processes.
+    {
+        let r = Db::open_read(&follower_dir).unwrap();
+        assert_eq!(r.run(r#"docs | uri == "raw://b""#).unwrap().done.n, 1);
+    }
+
+    let _ = fs::remove_dir_all(&primary_dir);
+    let _ = fs::remove_dir_all(&follower_dir);
+    let _ = fs::remove_file(&bak);
+}
+
+#[test]
+fn follower_rejects_wal_gap() {
+    let primary_dir = tmp();
+    let follower_dir = tmp();
+    {
+        let mut primary = Db::open(&primary_dir).unwrap();
+        primary
+            .run(r#"insert docs { uri: "raw://1", title: "1", layer: "wiki" }"#)
+            .unwrap();
+        primary
+            .run(r#"insert docs { uri: "raw://2", title: "2", layer: "wiki" }"#)
+            .unwrap();
+        let frames = primary.export_wal_since(0).unwrap();
+        // Empty follower at gen 0 needs gen=1 first; skip by applying only later
+        // frames via a truncated ship is simulated by applying frames twice with
+        // a hole: apply none, then only gen=2 is impossible from export — instead
+        // open empty follower and feed frames starting after a fake gen.
+        let mut follower = Db::open_follower(&follower_dir).unwrap();
+        // Apply all — ok from empty (gen 0 → 1,2…).
+        assert!(follower.apply_wal(&frames).is_ok());
+        follower.close().unwrap();
+        primary.close().unwrap();
+    }
+    // Fresh follower without bootstrap cannot jump to mid-stream after primary
+    // checkpoint emptied the log — export may be empty; gap when skipping gens:
+    {
+        let mut primary = Db::open(&primary_dir).unwrap();
+        primary
+            .run(r#"insert docs { uri: "raw://3", title: "3", layer: "wiki" }"#)
+            .unwrap();
+        let frames = primary.export_wal_since(0).unwrap();
+        let mut other = Db::open_follower(tmp()).unwrap();
+        // other at gen 0; frames start at gen after primary reopen (not 1).
+        let err = other.apply_wal(&frames).unwrap_err();
+        assert!(
+            err.to_string().contains("gap"),
+            "expected gap, got {err}"
+        );
+        other.close().unwrap();
+        primary.close().unwrap();
+    }
+    let _ = fs::remove_dir_all(&primary_dir);
+    let _ = fs::remove_dir_all(&follower_dir);
 }
 
 #[test]

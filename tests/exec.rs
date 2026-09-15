@@ -335,13 +335,34 @@ fn seed_join_and_search() {
 }
 
 #[test]
-fn reembed_noop_keeps_embed_id() {
+fn reembed_updates_embeddings() {
     let mut db = Db::fixture();
     let before = db.store.embed_id.clone();
     let h = db.run("reembed docs").unwrap();
     assert_eq!(db.store.embed_id, before);
-    assert!(h.message.as_deref().unwrap_or("").contains("no embedder"));
+    assert!(
+        h.message.as_deref().unwrap_or("").contains("rows"),
+        "{:?}",
+        h.message
+    );
     assert!(h.message.as_deref().unwrap_or("").contains(&before));
+    let v = db.run(r#"docs | search vec "embedding identity" | take 5"#).unwrap();
+    assert!(v.done.n >= 1, "vec search should hit fixture docs");
+}
+
+#[test]
+fn search_vec_and_hybrid_rank() {
+    let mut db = Db::empty();
+    db.run(r#"insert docs { uri: "raw://a", title: "wal shipping", layer: "wiki", body: "durable log" }"#)
+        .unwrap();
+    db.run(r#"insert docs { uri: "raw://b", title: "cats", layer: "wiki", body: "meow purr" }"#)
+        .unwrap();
+    let vec = db.run(r#"docs | search vec "wal shipping" | take 5"#).unwrap();
+    assert!(vec.done.n >= 1);
+    assert_eq!(text(&vec.rows[0], "title"), "wal shipping");
+    let hy = db.run(r#"docs | search "wal" | take 5"#).unwrap();
+    assert!(hy.done.n >= 1);
+    assert!(hy.rows.iter().any(|r| text(r, "title").contains("wal")));
 }
 
 #[test]

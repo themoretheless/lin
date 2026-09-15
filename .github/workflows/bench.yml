@@ -1,0 +1,58 @@
+name: bench
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88"
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run compare benches
+        run: |
+          set -euo pipefail
+          rm -rf .airbug-bench/ci
+          cargo bench --bench compare -- \
+            --profile quick \
+            --exclude 'compare/durable*' \
+            --exclude 'compare/cold*' \
+            --exclude 'compare/wal*' \
+            --exclude 'compare/hot_reopen*' \
+            --output .airbug-bench/ci \
+            | tee bench-report.md
+          {
+            echo "## Lin compare benches (quick)"
+            echo
+            echo "Engines: Lin / SQLite / DuckDB / HashMap (Postgres & MySQL skipped without servers)."
+            echo "Excluded: compare/durable*, compare/cold*, compare/wal*, compare/hot_reopen*."
+            echo
+            echo "Local dash (after hub serve): http://127.0.0.1:8790/"
+            echo
+            cat bench-report.md
+          } >> "$GITHUB_STEP_SUMMARY"
+          cp bench-report.md .airbug-bench/ci/bench-report.md
+
+      - name: Upload bench report
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-report
+          path: |
+            .airbug-bench/ci/
+            bench-report.md
+          if-no-files-found: error

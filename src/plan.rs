@@ -829,10 +829,9 @@ fn extract_point(pred: &Pred) -> (Option<(String, Value)>, Option<Pred>) {
 
 fn wrap_search(input: Node, mode: SearchMode, query: &str, k: i64) -> Node {
     match mode {
-        // No in-process embedder in 0.2 — hybrid executes as lex; plan must match.
         SearchMode::Hybrid => node(
             NodeKind::Search {
-                mode: SearchMode::Lex,
+                mode: SearchMode::Hybrid,
                 query: query.to_string(),
                 k,
             },
@@ -840,7 +839,7 @@ fn wrap_search(input: Node, mode: SearchMode, query: &str, k: i64) -> Node {
             Effect::Read,
             vec![input],
         )
-        .with_note("hybrid→lex (no embedder)"),
+        .with_note("hybrid→lex+vec (hash embedder)"),
         SearchMode::Vec => node(
             NodeKind::Search {
                 mode: SearchMode::Vec,
@@ -851,7 +850,7 @@ fn wrap_search(input: Node, mode: SearchMode, query: &str, k: i64) -> Node {
             Effect::Read,
             vec![input],
         )
-        .with_note("vec unsupported: empty until embedder"),
+        .with_note("vec cosine (hash embedder)"),
         SearchMode::Lex => node(
             NodeKind::Search {
                 mode: SearchMode::Lex,

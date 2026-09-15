@@ -25,11 +25,17 @@ pub enum Cell {
     Float(f64),
     Bool(bool),
     Time(i64),
+    /// Dense embedding (L2-normalized by the active embedder).
+    Vec(Arc<[f32]>),
 }
 
 impl Cell {
     pub fn text_arc(s: impl Into<Arc<str>>) -> Self {
         Cell::Text(s.into())
+    }
+
+    pub fn vec_arc(v: impl Into<Arc<[f32]>>) -> Self {
+        Cell::Vec(v.into())
     }
 
     pub fn text(&self) -> Option<&str> {
@@ -42,6 +48,13 @@ impl Cell {
     pub fn text_shared(&self) -> Option<Arc<str>> {
         match self {
             Cell::Text(s) => Some(Arc::clone(s)),
+            _ => None,
+        }
+    }
+
+    pub fn as_vec(&self) -> Option<&[f32]> {
+        match self {
+            Cell::Vec(v) => Some(v.as_ref()),
             _ => None,
         }
     }
@@ -88,6 +101,7 @@ impl Cell {
             Cell::Float(n) => n.to_string(),
             Cell::Bool(b) => b.to_string(),
             Cell::Time(ms) => fmt_iso_millis(*ms),
+            Cell::Vec(v) => format!("vec[{}]", v.len()),
         }
     }
 }

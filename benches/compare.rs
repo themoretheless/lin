@@ -1356,6 +1356,7 @@ fn main() -> airbug_bench::Result<()> {
     eprintln!(
         "lin compare: N={N} warm reads (fixture), bulk insert (schema outside timing)\n\
          engines: {engines}\n\
+         airbug dash: http://127.0.0.1:8790/\n\
          Lin reads: prepare once / run many; filters use count (fair vs SQL COUNT(*));\n\
          substring: Lin `title ~ \"wal\" | count` vs SQL LIKE '%wal%' COUNT(*);\n\
          materialize: Lin `wing==rag | {{id,title}} | take all` vs SQL SELECT id,title;\n\
@@ -2239,9 +2240,85 @@ fn run_suite(mut suite: Suite<'_>, args: &[String]) -> airbug_bench::Result<()> 
             "benchmarks require an optimized build; use cargo bench or cargo run --release",
         ));
     }
-    let run = suite.run_selected(&selection)?;
+    let selected = suite.list_selected(&selection);
+    let total = selected.len();
+    if let Some(p) = output.as_ref() {
+        let dir = std::path::Path::new(p);
+        if let Some(parent) = dir.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| airbug_bench::error(e.to_string()))?;
+            }
+        }
+        if !dir.exists() {
+            std::fs::create_dir(dir).map_err(|e| airbug_bench::error(e.to_string()))?;
+        }
+        let progress = serde_json::json!({
+            "state": "running",
+            "completed": 0,
+            "total": total,
+            "variant": "compare"
+        });
+        std::fs::write(
+            dir.join("progress.json"),
+            serde_json::to_string_pretty(&progress)?,
+        )
+        .map_err(|e| airbug_bench::error(e.to_string()))?;
+        if let Ok(url) = std::env::var("AIRBUG_DASH_URL") {
+            eprintln!("airbug dash: {url}");
+        } else if let Ok(hub) = std::env::var("AIRBUG_HUB") {
+            eprintln!("airbug dash: {hub}/#/bench (see register response)");
+        } else {
+            eprintln!("airbug dash: http://127.0.0.1:8790/#/bench");
+        }
+    } else {
+        eprintln!("airbug dash: http://127.0.0.1:8790/#/bench");
+    }
+    let run_result = suite.run_selected(&selection);
+    if let Some(p) = output.as_ref() {
+        let dir = std::path::Path::new(p);
+        let final_state = if run_result.is_ok() {
+            "complete"
+        } else {
+            "failed"
+        };
+        let _ = std::fs::write(
+            dir.join("status-final.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "state": final_state,
+                "error": run_result.as_ref().err().map(|e| e.to_string()),
+            }))?,
+        );
+        let progress = serde_json::json!({
+            "state": final_state,
+            "completed": total,
+            "total": total,
+            "variant": "compare"
+        });
+        let _ = std::fs::write(
+            dir.join("progress.json"),
+            serde_json::to_string_pretty(&progress)?,
+        );
+    }
+    let run = run_result?;
     if let Some(p) = output {
-        run.save_new(p)?;
+        let dir = std::path::Path::new(&p);
+        // Hub may have already created the directory; write artifacts in place.
+        let run_path = dir.join("run.json");
+        if run_path.exists() {
+            return Err(airbug_bench::error(format!(
+                "run.json already exists in {}",
+                dir.display()
+            )));
+        }
+        std::fs::write(
+            &run_path,
+            serde_json::to_string_pretty(&run)?,
+        )
+        .map_err(|e| airbug_bench::error(e.to_string()))?;
+        let html = airbug_bench::report::html_run(&run)?;
+        std::fs::write(dir.join("report.html"), html)
+            .map_err(|e| airbug_bench::error(e.to_string()))?;
     }
     if json {
         println!("RBENCH_RESULT={}", serde_json::to_string(&run)?);

@@ -2,13 +2,13 @@
 
 Lin — язык своей локальной БД: пайпы, типизированный каталог, два мира записи (`append` / reducer), свой план. Не SQL и не Kusto.
 
-**0.2** — встраиваемая локальная БД: durable `--data`, backup, multi-reader, compaction, flock, quotas, `SyncMode`, cold/mmap, WAL shipping. Не multi-writer.
+**0.2** — встраиваемая локальная БД: durable `--data`, backup, multi-reader, compaction, flock, quotas, `SyncMode`, cold/mmap, WAL shipping, **durable follower** (`open_follower` / `apply_wal`). Не multi-writer.
 
-Сейчас есть парсер, typecheck, IR плана, in-memory store (один reducer, один `gen`), исполнитель, WAL+snapshot с compaction, `backup` CLI. DuckDB/WASM backends в этом milestone нет. Векторный search в плане не обещается: `search` → lex (`hybrid→lex (no embedder)`).
+Сейчас есть парсер, typecheck, IR плана, in-memory store (один reducer, один `gen`), исполнитель, WAL+snapshot с compaction, `backup` CLI, durable follower, **живой search vec/hybrid** (локальный hashing-эмбеддер по `embed_id`). DuckDB/WASM backends и multi-writer в этом milestone нет.
 
 ## Стабильный API (0.2)
 
-Публичный контракт: `Db::{empty,fixture,open,open_with,open_read,close,checkpoint,run,prepare,explain_as,reader,export_backup,import_backup,import_backup_into,export_wal_since,apply_wal,stats,with_quotas,with_sync_mode}`, `ReadDb::{run,prepare,stats,clone}`, `Quotas`, `SyncMode`, `OpenOpts`, плюс `parse` / `compile` / `run` / `explain*`, типы `Handle` / `Done` / `Prepared` / `Error` / `Row` / `Cell` / `Store` / `Plan` / `Stats` / `VERSION`.
+Публичный контракт: `Db::{empty,fixture,open,open_with,open_read,open_follower,open_follower_with,bootstrap_follower,close,checkpoint,run,prepare,explain_as,reader,export_backup,import_backup,import_backup_into,export_wal_since,apply_wal,stats,with_quotas,with_sync_mode}`, `ReadDb::{run,prepare,stats,clone}`, `Quotas`, `SyncMode`, `OpenOpts`, плюс `parse` / `compile` / `run` / `explain*`, типы `Handle` / `Done` / `Prepared` / `Error` / `Row` / `Cell` / `Store` / `Plan` / `Stats` / `VERSION`.
 
 ### Experimental: Queryable + typed + async
 
@@ -59,15 +59,16 @@ let _ = Queryable::from("docs")
 
 Features: `derive`, `async` — в `default`. Также `Db::run_stmt` / `explain_stmt` / `cursor`.
 
-`Db::reader()` — in-process снимок текущего `gen`. `open_read` — shared **FENCE** (можно рядом с writer; checkpoint ждёт readers). `export_wal_since` / `apply_wal` — ship WAL; **`apply_wal` только in-memory**. `pin`/`unpin` — memory-pins. Snapshot: `LIN\x04` MessagePack self-contained; `cold/*.bin` — lazy mmap page-in.
+`Db::reader()` — in-process снимок текущего `gen`. `open_read` — shared **FENCE** (можно рядом с writer; checkpoint ждёт readers). `export_wal_since` / `apply_wal` — ship WAL; **`apply_wal` на primary durable запрещён**; на **follower** (`open_follower` / `bootstrap_follower`) пишет frames в log и применяет (hot standby). In-memory `apply_wal` как раньше. `pin`/`unpin` — memory-pins. Snapshot: `LIN\x04` MessagePack self-contained; `cold/*.bin` — lazy mmap page-in.
 
 ## Local-prod guarantees
 
 | Есть | Нет |
 |---|---|
 | Crash после успешного commit (`SyncMode::Full`) → log/snapshot | Multi-writer / сеть / полный MVCC |
-| Exclusive `LOCK` (writer↔writer) | Real vec/FTS indexes |
+| Exclusive `LOCK` (writer↔writer) | ANN/FTS indexes (hashing vec есть) |
 | Shared `FENCE` — `open_read`∥writer; checkpoint ждёт readers | |
+| Durable follower: `bootstrap_follower` + `apply_wal` | |
 | Cold lazy mmap page-in | |
 | Quotas / `SyncMode::Normal` (opt-in) / WAL ship / pins | |
 
@@ -131,7 +132,7 @@ rel cites
 
 Запись — отдельный statement, не хвост пайпа. Неизвестный столбец, hop без `rel`, join без `fk`, `update` без `cas` — ошибка компиляции.
 
-Неявный `take 50`. `skip N` / `offset N` — отбросить первые N строк (пейджинг: `skip 40 | take 20`). `search` / `search hybrid` исполняются **только lex** (эмбеддера нет); в explain: `Search lex` + `hybrid→lex (no embedder)`. `search vec` планируется, но возвращает пусто. `embed_id=nomic-embed-text/768` — метка каталога, не живой embedder.
+Неявный `take 50`. `skip N` / `offset N` — отбросить первые N строк (пейджинг: `skip 40 | take 20`). `search` / `search hybrid` — RRF(lex + vec) через локальный hashing-эмбеддер (`embed_id`, по умолчанию dim из суффикса `/768`); не нейросеть. `search vec` — cosine по полю `embedding` (пишется на insert / `reembed`). Подмена: `Db::with_embedder`.
 
 ## Roadmap (кратко)
 
@@ -141,7 +142,10 @@ rel cites
 | P1 backup + multi-reader + compaction + ops + flock + quotas | **готово** |
 | P2 mmap/cold collections | **готово** + lazy page-in |
 | SyncMode::Normal | **готово** |
-| P3 сеть / MVCC | WAL ship + `reader()` + `open_read`∥writer (FENCE); не multi-writer |
+| P3 hot standby | **готово**: durable `apply_wal` + `open_follower` / `bootstrap_follower`; `open_read` на follower |
+| P3c live vec/hybrid | **готово**: hashing embedder + cosine/RRF; neural model — через `with_embedder` |
+| P3b сеть / MVCC | не multi-writer; не полный MVCC / consensus |
+| DuckDB/WASM backends | не сейчас |
 
 ## Бенчмарки (airbug-bench): Lin vs SQLite vs DuckDB vs Postgres vs MySQL
 
@@ -154,12 +158,22 @@ cargo bench --bench compare -- --list
 # быстрый прогон (нужен --release; airbug-bench отказывается от debug)
 cargo bench --bench compare -- --profile quick
 
+# как в CI: без durable/cold/wal + markdown + .airbug-bench/ci/
+# после прогона печатает ссылку на airbug dash (http://127.0.0.1:8790/)
+./scripts/ci-bench.sh
+
 # только point get / только insert / только join / только append_log
 cargo bench --bench compare -- --filter point_get
 cargo bench --bench compare -- --filter insert_bulk_1k --samples 8
 cargo bench --bench compare -- --filter join
 cargo bench --bench compare -- --profile quick --filter append_log
 ```
+
+### CI
+
+Workflow [`.github/workflows/bench.yml`](.github/workflows/bench.yml) на `push`/`pull_request` → `main`: `--profile quick`, без Docker. В отчёте Lin / SQLite / DuckDB / HashMap; Postgres и MySQL пропускаются без серверов. Исключены шумные кейсы: `compare/durable*`, `compare/cold*`, `compare/wal*`, `compare/hot_reopen*`. Job падает только при ошибке compile/harness (не при «медленнее peer»).
+
+Где смотреть: **Actions → bench → Job summary** (markdown-таблица) и artifact **`bench-report`** (`run.json` + `report.html` + `bench-report.md`). Локально: `./scripts/ci-bench.sh` сразу печатает (и при живом hub открывает) **airbug dash** `http://127.0.0.1:8790/`, затем гоняет бенчи в `.airbug-bench/ci/` (hub: `cargo run -p airbug-hub -- serve --root <lin>`).
 
 Движки: **Lin**, **SQLite** (`rusqlite` bundled), **DuckDB** (bundled; собирается на mac aarch64), **Postgres** / **MySQL** (опционально, через URL), плюс **HashMap** только для point get. N=10 000 для тёплых чтений (fixture; setup вне тайминга). Bulk insert: схема/индекс в setup, в тайминге только запись.
 
@@ -211,7 +225,7 @@ cargo run -- run - < batch.lin
 
 То же в языке: `| explain graph` (Mermaid) и `| explain dot` (Graphviz). `| explain run` после исполнения пишет фактические `rows`/`ms`.
 
-CLI: `lin run '<запрос>'` печатает строки и `gen`. `lin run --file batch.lin` и `lin run -` читают программу из файла / stdin. `lin explain '<запрос>'` печатает план или ошибку компиляции. `lin --data .lin run '…'` пишет в каталог данных. `lin backup export|import`, `lin stats`, `lin version`.
+CLI: `lin run '<запрос>'` печатает строки и `gen`. `lin run --file batch.lin` и `lin run -` читают программу из файла / stdin. `lin explain '<запрос>'` печатает план или ошибку компиляции. `lin --data .lin run '…'` пишет в каталог данных. Hot standby: `lin --data follower --follower apply-wal frames.bin`, затем `lin --data follower --follower run '…'` или `Db::open_read`. `lin backup export|import`, `lin stats`, `lin version`.
 
 ## Backup
 

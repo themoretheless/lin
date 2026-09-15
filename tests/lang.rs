@@ -127,15 +127,14 @@ fn match_edge_bind_rejects_star() {
 fn search_hybrid_then_take() {
     let plan = ok(r#"docs | wing == "rag" | search "embedding identity" | take 20"#);
     assert!(
-        plan.contains("Search lex \"embedding identity\""),
+        plan.contains("Search hybrid \"embedding identity\""),
         "{plan}"
     );
     assert!(
-        plan.contains("hybrid→lex (no embedder)"),
+        plan.contains("hybrid→lex+vec (hash embedder)"),
         "{plan}"
     );
     assert!(!plan.contains("RRF"), "{plan}");
-    assert!(!plan.contains("Search vec"), "{plan}");
     assert!(plan.contains("Take 20"));
     assert!(!plan.contains("Take 20 implicit"));
     assert!(plan.contains("embed=nomic-embed-text/768"));
@@ -147,7 +146,7 @@ fn search_count_sort() {
     assert!(plan.contains("Agg count by room"));
     assert!(plan.contains("Sort hits desc"));
     assert!(plan.contains("Take 50"));
-    assert!(plan.contains("Search lex"));
+    assert!(plan.contains("Search hybrid"));
     assert!(!plan.contains("RRF"), "{plan}");
 }
 
@@ -184,8 +183,8 @@ fn explain_cost_search() {
     let plan = ok(r#"docs | wing == "rag" | search "wal" | { id, title } | explain cost"#);
     assert!(plan.contains("budget.take=50"));
     assert!(plan.contains("zone skip"));
-    assert!(plan.contains("Search lex"));
-    assert!(plan.contains("hybrid→lex (no embedder)"), "{plan}");
+    assert!(plan.contains("Search hybrid"));
+    assert!(plan.contains("hybrid→lex+vec (hash embedder)"), "{plan}");
     assert!(!plan.contains("RRF"), "{plan}");
     assert!(plan.contains("Project [id, title]"));
     assert!(plan.contains("-- no body"));
@@ -322,7 +321,7 @@ fn bare_predicate_without_keyword_is_where() {
 fn explain_graph_mermaid_search_filter() {
     let g = ok(r#"docs | wing == "rag" | search "wal" | { id, title } | explain graph"#);
     assert!(g.contains("flowchart TD"), "{g}");
-    assert!(g.contains("Search lex"), "{g}");
+    assert!(g.contains("Search hybrid"), "{g}");
     assert!(g.contains("Filter"), "{g}");
     assert!(!g.contains("RRF"), "{g}");
     assert!(g.contains("Take 50"), "{g}");
@@ -334,7 +333,7 @@ fn explain_graph_mermaid_search_filter() {
 fn explain_graph_dot_search_filter() {
     let g = ok(r#"docs | wing == "rag" | search "wal" | { id, title } | explain dot"#);
     assert!(g.contains("digraph"), "{g}");
-    assert!(g.contains("Search lex"), "{g}");
+    assert!(g.contains("Search hybrid"), "{g}");
     assert!(g.contains("Filter"), "{g}");
     assert!(g.contains("Take 50"), "{g}");
 }

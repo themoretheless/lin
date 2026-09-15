@@ -4,7 +4,8 @@
 //!
 //! Prefer these entry points; treat other `pub` items as evolving:
 //! - [`Db`]: [`Db::empty`], [`Db::fixture`], [`Db::open`], [`Db::open_read`],
-//!   [`Db::close`], [`Db::checkpoint`], [`Db::run`], [`Db::prepare`], [`Db::explain_as`],
+//!   [`Db::open_follower`], [`Db::bootstrap_follower`], [`Db::close`], [`Db::checkpoint`],
+//!   [`Db::run`], [`Db::prepare`], [`Db::explain_as`],
 //!   [`Db::reader`], [`Db::export_backup`], [`Db::import_backup`], [`Db::stats`],
 //!   [`Db::with_quotas`], [`Db::with_sync_mode`], [`Db::open_with`],
 //!   [`Db::export_wal_since`], [`Db::apply_wal`]
@@ -22,9 +23,15 @@
 //!
 //! ## Search honesty
 //!
-//! Default `search` is **lex-only** in this build (no embedder). Plans show
-//! `Search lex` with note `hybrid→lex (no embedder)`. Explicit `search vec`
-//! plans as vec but returns no rows until an embedder is wired.
+//! Default `search` / `search hybrid` use **lex + local hashing vec** (feature-hash
+//! embedder bound to catalog `embed_id`, not a neural model). `search vec` ranks by
+//! cosine over stored `embedding` cells. Swap via [`Db::with_embedder`].
+//!
+//! ## Hot standby
+//!
+//! Primary: [`Db::open`] + [`Db::export_wal_since`]. Follower: [`Db::bootstrap_follower`]
+//! (or [`Db::open_follower`] after backup) + [`Db::apply_wal`]. Concurrent readers:
+//! [`Db::open_read`] on the follower dir. Not multi-writer.
 
 mod ast;
 mod batch;
@@ -32,6 +39,7 @@ mod catalog;
 mod check;
 mod cold;
 mod cursor;
+mod embed;
 mod error;
 mod exec;
 mod explain;
@@ -56,6 +64,7 @@ pub use ast::{
 };
 pub use batch::RecordBatch;
 pub use cursor::QueryCursor;
+pub use embed::{Embedder, HashingEmbedder};
 pub use error::Error;
 pub use exec::{Db, Done, Handle, OpenOpts, Prepared, Quotas, ReadDb, Stats, SyncMode};
 pub use graph::GraphFmt;

@@ -10,6 +10,7 @@ use crate::ast::*;
 use crate::batch::RecordBatch;
 use crate::catalog::Catalog;
 use crate::check;
+use crate::embed::{self, Embedder, HashingEmbedder};
 use crate::error::Error;
 use crate::explain::{self, ExplainCtx, RunStats};
 use crate::graph::GraphFmt;
@@ -121,6 +122,10 @@ pub struct Db {
     pins: BTreeMap<String, crate::store::MemBackup>,
     /// Last `pull idb` payload for in-process `push idb`.
     pulled_wal: Vec<u8>,
+    /// Durable hot-standby: [`Self::apply_wal`] OK, user writes rejected.
+    follower: bool,
+    /// Active embedder (`search vec` / hybrid / auto-embed on insert).
+    embedder: Option<Arc<dyn Embedder>>,
 }
 
 /// Shared read-only snapshot of a [`Db`] at a fixed `gen`.
@@ -180,7 +185,12 @@ impl Stats {
 }
 
 impl Db {
+    fn default_embedder(catalog: &Catalog) -> Arc<dyn Embedder> {
+        Arc::new(HashingEmbedder::from_embed_id(&catalog.embed_id))
+    }
+
     fn bare(catalog: Catalog, store: Store) -> Self {
+        let embedder = Self::default_embedder(&catalog);
         Self {
             catalog,
             store,
@@ -193,13 +203,17 @@ impl Db {
             append_ms: 0.0,
             pins: BTreeMap::new(),
             pulled_wal: Vec::new(),
+            follower: false,
+            embedder: Some(embedder),
         }
     }
 
     pub fn fixture() -> Self {
         let catalog = crate::catalog::fixture();
         let store = Store::fixture(&catalog);
-        Self::bare(catalog, store)
+        let mut db = Self::bare(catalog, store);
+        let _ = db.reembed_collection("docs");
+        db
     }
 
     pub fn empty() -> Self {
@@ -210,6 +224,22 @@ impl Db {
 
     pub fn with_quotas(mut self, quotas: Quotas) -> Self {
         self.quotas = quotas;
+        self
+    }
+
+    /// Replace the active embedder. Updates `store.embed_id` / catalog to match.
+    pub fn with_embedder(mut self, embedder: Arc<dyn Embedder>) -> Self {
+        self.catalog.embed_id = embedder.id().to_string();
+        self.store.embed_id = embedder.id().to_string();
+        self.embedder = Some(embedder);
+        self.plan_cache.clear();
+        self
+    }
+
+    /// Disable embedding (vec/hybrid degrade: vec empty, hybrid→lex only).
+    pub fn without_embedder(mut self) -> Self {
+        self.embedder = None;
+        self.plan_cache.clear();
         self
     }
 
@@ -236,6 +266,7 @@ impl Db {
         let mut catalog = catalog;
         store.merge_extras_into(&mut catalog);
         let reopen_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let embedder = Self::default_embedder(&catalog);
         Ok(Self {
             catalog,
             store,
@@ -248,7 +279,53 @@ impl Db {
             append_ms: 0.0,
             pins: BTreeMap::new(),
             pulled_wal: Vec::new(),
+            follower: false,
+            embedder: Some(embedder),
         })
+    }
+
+    /// Open a durable **read-only follower** (hot standby).
+    ///
+    /// Same on-disk layout as [`Self::open`], but:
+    /// - user writes (`insert` / `append` / …) are rejected;
+    /// - [`Self::apply_wal`] appends shipped frames to the log and applies them;
+    /// - exclusive writer lock (one applicator); use [`Self::open_read`] for
+    ///   concurrent query processes against the same dir.
+    ///
+    /// Bootstrap: [`Self::bootstrap_follower`] from a primary backup, then
+    /// periodically `primary.export_wal_since(follower.gen())` → `apply_wal`.
+    /// Applying WAL alone cannot recreate history already compacted into a
+    /// primary snapshot.
+    pub fn open_follower(path: impl AsRef<Path>) -> Result<Self, Error> {
+        Self::open_follower_with(path, OpenOpts::default())
+    }
+
+    pub fn open_follower_with(path: impl AsRef<Path>, opts: OpenOpts) -> Result<Self, Error> {
+        let mut db = Self::open_with(path, opts)?;
+        db.follower = true;
+        Ok(db)
+    }
+
+    /// Write a portable backup into `data_dir` and open it as a follower.
+    pub fn bootstrap_follower(
+        backup: impl AsRef<Path>,
+        data_dir: impl AsRef<Path>,
+    ) -> Result<Self, Error> {
+        let snap = crate::persist::read_backup(backup.as_ref())?;
+        let dir = data_dir.as_ref();
+        crate::persist::ensure_dir(dir)?;
+        crate::persist::write_snapshot(dir, &snap)?;
+        crate::persist::write_head(
+            dir,
+            &crate::persist::Head {
+                r#gen: snap.r#gen,
+                catalog_hash: snap.catalog_hash.clone(),
+                embed_id: snap.embed_id.clone(),
+            },
+        )?;
+        let log_path = dir.join(crate::persist::LOG_NAME);
+        std::fs::write(&log_path, []).map_err(|e| Error::runtime(format!("persist: {e}")))?;
+        Self::open_follower(dir)
     }
 
     /// Open a durable data dir as a read-only snapshot (no log truncate / no head write).
@@ -264,6 +341,7 @@ impl Db {
         let mut catalog = catalog;
         store.merge_extras_into(&mut catalog);
         let reopen_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let embedder = Self::default_embedder(&catalog);
         Ok(ReadDb {
             inner: Arc::new(Self {
                 catalog,
@@ -277,6 +355,8 @@ impl Db {
                 append_ms: 0.0,
                 pins: BTreeMap::new(),
                 pulled_wal: Vec::new(),
+                follower: false,
+                embedder: Some(embedder),
             }),
         })
     }
@@ -302,6 +382,16 @@ impl Db {
         self.persist.is_some()
     }
 
+    /// True when opened via [`Self::open_follower`] / [`Self::bootstrap_follower`].
+    pub fn is_follower(&self) -> bool {
+        self.follower
+    }
+
+    /// Current commit generation.
+    pub fn r#gen(&self) -> u64 {
+        self.store.r#gen
+    }
+
     /// Freeze a consistent in-memory snapshot at the current `gen` for concurrent readers.
     pub fn reader(&mut self) -> ReadDb {
         ReadDb {
@@ -317,6 +407,8 @@ impl Db {
                 append_ms: 0.0,
                 pins: BTreeMap::new(),
                 pulled_wal: Vec::new(),
+                follower: false,
+                embedder: self.embedder.clone(),
             }),
         }
     }
@@ -329,37 +421,71 @@ impl Db {
         crate::persist::export_wal_since(&p.dir, since)
     }
 
-    /// Apply shipped WAL frames into an **in-memory** store only.
+    /// Apply shipped WAL frames.
     ///
-    /// Refuses any durable Db (`persist.is_some()`): never rewrite a primary
-    /// log. For a durable follower: `apply_wal` on `Db::empty()`, then
-    /// [`Self::export_backup`] / [`Self::import_backup_into`].
+    /// - **In-memory** [`Self::empty`]: apply packs only (no log).
+    /// - **Follower** ([`Self::open_follower`]): append raw frames to the durable
+    ///   log (verbatim), then apply; respects [`SyncMode`].
+    /// - **Primary durable**: refused — never rewrite a primary log from ships.
     pub fn apply_wal(&mut self, frames: &[u8]) -> Result<usize, Error> {
-        if self.persist.is_some() {
+        if self.persist.is_some() && !self.follower {
             return Err(Error::runtime(
-                "apply_wal: in-memory only — refuse durable primary/follower log rewrite",
+                "apply_wal: refused on durable primary — use open_follower / bootstrap_follower",
             ));
         }
-        let mut records = Vec::new();
-        crate::persist::for_each_wal_frame(frames, |rec| {
-            records.push(rec);
+
+        let mut to_apply: Vec<(Vec<u8>, crate::persist::LogRecord)> = Vec::new();
+        let mut next_needed = self.store.r#gen + 1;
+        crate::persist::for_each_wal_frame_raw(frames, |raw, rec| {
+            if rec.r#gen < next_needed {
+                return Ok(());
+            }
+            if rec.r#gen != next_needed {
+                return Err(Error::runtime(format!(
+                    "apply_wal: gap — need gen {}, got {} (follower at {})",
+                    next_needed, rec.r#gen, self.store.r#gen
+                )));
+            }
+            next_needed += 1;
+            to_apply.push((raw.to_vec(), rec));
             Ok(())
         })?;
-        let mut n = 0usize;
-        for rec in records {
-            if rec.r#gen <= self.store.r#gen {
-                continue;
+
+        if to_apply.is_empty() {
+            return Ok(0);
+        }
+
+        if self.persist.is_some() {
+            let raw_len: u64 = to_apply.iter().map(|(r, _)| r.len() as u64).sum();
+            if let Some(p) = self.persist.as_mut() {
+                if p.log_bytes + raw_len > self.quotas.max_log_bytes {
+                    self.store.checkpoint(p)?;
+                }
             }
+            if let Some(p) = self.persist.as_mut() {
+                let mut raw_buf = Vec::with_capacity(raw_len as usize);
+                for (raw, _) in &to_apply {
+                    raw_buf.extend_from_slice(raw);
+                }
+                crate::persist::append_raw_frames(&mut p.log, &raw_buf, p.sync, &mut p.log_bytes)?;
+                p.writes_since_snapshot += to_apply.len() as u32;
+            }
+        }
+
+        let n = to_apply.len();
+        for (_, rec) in &to_apply {
             self.store.apply_pack(&rec.pack);
             self.store.next_id = rec.next_id;
             self.store.r#gen = rec.r#gen;
-            n += 1;
         }
-        if n > 0 {
-            self.store.rebuild_indexes();
-            self.store.rebuild_row_maps();
-            self.plan_cache.clear();
+        self.store.rebuild_indexes();
+        self.store.rebuild_row_maps();
+        self.store.merge_extras_into(&mut self.catalog);
+        if let Some(p) = self.persist.as_mut() {
+            p.catalog_hash = crate::store::catalog_hash(&self.catalog);
+            self.store.maybe_checkpoint(p)?;
         }
+        self.plan_cache.clear();
         Ok(n)
     }
 
@@ -523,6 +649,11 @@ impl Db {
     }
 
     pub fn run_prepared(&mut self, prepared: &Prepared) -> Result<Handle, Error> {
+        if self.follower && prepared.writes {
+            return Err(Error::runtime(
+                "follower: read-only — apply_wal for replication, open primary for writes",
+            ));
+        }
         let t0 = Instant::now();
         let undo = if !prepared.writes {
             Undo::None
@@ -1101,11 +1232,17 @@ impl Db {
                 Ok((rows, Some(format!("let {name}")), None))
             }
             Stmt::Reembed { collection, .. } => {
-                let msg = format!(
-                    "reembed {collection}: identity-preserving no-op (no embedder); embed_id={}",
-                    self.store.embed_id
-                );
-                Ok((Vec::new(), Some(msg), Some(Pack::Reembed)))
+                let n = self.reembed_collection(collection)?;
+                let id = self
+                    .embedder
+                    .as_ref()
+                    .map(|e| e.id().to_string())
+                    .unwrap_or_else(|| self.store.embed_id.clone());
+                Ok((
+                    Vec::new(),
+                    Some(format!("reembed {collection}: {n} rows; embed_id={id}")),
+                    Some(Pack::Reembed),
+                ))
             }
             Stmt::Decl(d) => self.exec_decl(d),
             Stmt::IdbSlice { query } => Ok((
@@ -1169,15 +1306,20 @@ impl Db {
                         None,
                     ));
                 }
-                if self.persist.is_some() {
+                if self.persist.is_some() && !self.follower {
                     return Err(Error::runtime(
-                        "push idb: apply_wal is in-memory only — pull on a memory Db",
+                        "push idb: refused on durable primary — pull/push on memory or follower",
                     ));
                 }
                 let n = self.apply_wal(&frames)?;
+                let where_ = if self.follower {
+                    "follower"
+                } else {
+                    "memory"
+                };
                 Ok((
                     Vec::new(),
-                    Some(format!("push idb: applied {n} frames (memory)")),
+                    Some(format!("push idb: applied {n} frames ({where_})")),
                     None,
                 ))
             }
@@ -2409,19 +2551,127 @@ impl Db {
             )));
         }
         match mode {
-            SearchMode::Vec => Ok(Vec::new()),
-            SearchMode::Lex | SearchMode::Hybrid => {
+            SearchMode::Lex => {
                 let mut scored: Vec<(i64, Row)> = rows
                     .iter()
                     .filter_map(|r| {
                         let s = lex_score(r, query);
-                        if s > 0 { Some((s, r.clone())) } else { None }
+                        if s > 0 {
+                            Some((s, r.clone()))
+                        } else {
+                            None
+                        }
                     })
                     .collect();
                 scored.sort_by_key(|a| std::cmp::Reverse(a.0));
                 Ok(scored.into_iter().map(|(_, r)| r).collect())
             }
+            SearchMode::Vec => {
+                let Some(emb) = self.embedder.as_ref() else {
+                    return Ok(Vec::new());
+                };
+                let qv = emb.embed(query);
+                let mut scored: Vec<(f64, Row)> = rows
+                    .iter()
+                    .filter_map(|r| {
+                        let v = r.get("embedding").and_then(Cell::as_vec)?;
+                        let s = embed::cosine(qv.as_ref(), v);
+                        if s > 0.01 {
+                            Some((s, r.clone()))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+                Ok(scored.into_iter().map(|(_, r)| r).collect())
+            }
+            SearchMode::Hybrid => {
+                // Reciprocal rank fusion over lex + vec lists.
+                const RRF_K: f64 = 60.0;
+                let lex = self.search_rows(rows, SearchMode::Lex, query)?;
+                let vec = self.search_rows(rows, SearchMode::Vec, query)?;
+                let mut scores: BTreeMap<String, f64> = BTreeMap::new();
+                let mut by_id: BTreeMap<String, Row> = BTreeMap::new();
+                for (rank, r) in lex.iter().enumerate() {
+                    let id = row_text(r, "id")
+                        .or_else(|| row_text(r, "uri"))
+                        .unwrap_or("")
+                        .to_string();
+                    *scores.entry(id.clone()).or_default() += 1.0 / (RRF_K + rank as f64 + 1.0);
+                    by_id.entry(id).or_insert_with(|| r.clone());
+                }
+                for (rank, r) in vec.iter().enumerate() {
+                    let id = row_text(r, "id")
+                        .or_else(|| row_text(r, "uri"))
+                        .unwrap_or("")
+                        .to_string();
+                    *scores.entry(id.clone()).or_default() += 1.0 / (RRF_K + rank as f64 + 1.0);
+                    by_id.entry(id).or_insert_with(|| r.clone());
+                }
+                let mut ranked: Vec<(f64, Row)> = scores
+                    .into_iter()
+                    .filter_map(|(id, s)| by_id.remove(&id).map(|r| (s, r)))
+                    .collect();
+                ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+                Ok(ranked.into_iter().map(|(_, r)| r).collect())
+            }
         }
+    }
+
+    /// Recompute `embedding` for every row in a collection that has a vec field.
+    pub fn reembed_collection(&mut self, collection: &str) -> Result<usize, Error> {
+        let Some(emb) = self.embedder.clone() else {
+            return Err(Error::runtime(format!(
+                "reembed {collection}: no embedder"
+            )));
+        };
+        if self
+            .catalog
+            .collection(collection)
+            .is_none_or(|c| !c.has_vec())
+        {
+            return Err(Error::runtime(format!(
+                "reembed requires embedding: {collection}"
+            )));
+        }
+        self.store.embed_id = emb.id().to_string();
+        self.catalog.embed_id = emb.id().to_string();
+        let rows = self.store.collection_mut(collection);
+        let mut n = 0usize;
+        for row in rows.iter_mut() {
+            let text = embed::row_embed_text(row);
+            if text.is_empty() {
+                row.insert("embedding".into(), Cell::Null);
+                continue;
+            }
+            row.insert("embedding".into(), Cell::Vec(emb.embed(&text)));
+            n += 1;
+        }
+        self.store.rebuild_row_maps();
+        self.plan_cache.clear();
+        Ok(n)
+    }
+
+    fn maybe_embed_row(&self, collection: &str, row: &mut Row) {
+        let Some(emb) = self.embedder.as_ref() else {
+            return;
+        };
+        if self
+            .catalog
+            .collection(collection)
+            .is_none_or(|c| !c.has_vec())
+        {
+            return;
+        }
+        if row.get("embedding").and_then(Cell::as_vec).is_some() {
+            return;
+        }
+        let text = embed::row_embed_text(row);
+        if text.is_empty() {
+            return;
+        }
+        row.insert("embedding".into(), Cell::Vec(emb.embed(&text)));
     }
 
     #[allow(dead_code)]
@@ -2483,6 +2733,7 @@ impl Db {
                     return Err(Error::runtime(format!("duplicate uri: {uri}")));
                 }
             }
+            self.maybe_embed_row(collection, &mut row);
             built.push(row);
         }
 
@@ -3176,6 +3427,7 @@ fn cells_eq(a: &Cell, b: &Cell) -> bool {
         (Cell::Int(x), Cell::Int(y)) => x == y,
         (Cell::Float(x), Cell::Float(y)) => x == y,
         (Cell::Time(x), Cell::Time(y)) => x == y,
+        (Cell::Vec(x), Cell::Vec(y)) => x.as_ref() == y.as_ref(),
         (Cell::Int(x), Cell::Float(y)) => *x as f64 == *y,
         (Cell::Float(x), Cell::Int(y)) => *x == *y as f64,
         _ => false,

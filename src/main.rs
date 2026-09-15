@@ -6,12 +6,13 @@ use lin::{Db, GraphFmt, explain_as};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let (data, rest) = parse_global(&args);
+    let (data, follower, rest) = parse_global(&args);
     match rest.first().map(String::as_str) {
-        Some("explain") => cmd_explain(&rest[1..], data),
-        Some("run") => cmd_run(&rest[1..], data),
+        Some("explain") => cmd_explain(&rest[1..], data, follower),
+        Some("run") => cmd_run(&rest[1..], data, follower),
         Some("backup") => cmd_backup(&rest[1..], data),
-        Some("stats") => cmd_stats(data),
+        Some("apply-wal") => cmd_apply_wal(&rest[1..], data, follower),
+        Some("stats") => cmd_stats(data, follower),
         Some("version") | Some("--version") => {
             println!("lin {}", lin::VERSION);
             ExitCode::SUCCESS
@@ -20,8 +21,9 @@ fn main() -> ExitCode {
     }
 }
 
-fn parse_global(args: &[String]) -> (Option<PathBuf>, Vec<String>) {
+fn parse_global(args: &[String]) -> (Option<PathBuf>, bool, Vec<String>) {
     let mut data = None;
+    let mut follower = false;
     let mut rest = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -34,15 +36,18 @@ fn parse_global(args: &[String]) -> (Option<PathBuf>, Vec<String>) {
                 }
                 None => data = Some(PathBuf::from(".lin")),
             }
+        } else if args[i] == "--follower" {
+            follower = true;
+            i += 1;
         } else {
             rest.push(args[i].clone());
             i += 1;
         }
     }
-    (data, rest)
+    (data, follower, rest)
 }
 
-fn cmd_explain(args: &[String], data: Option<PathBuf>) -> ExitCode {
+fn cmd_explain(args: &[String], data: Option<PathBuf>, follower: bool) -> ExitCode {
     let mut graph = None;
     let mut rest = Vec::new();
     let mut i = 0;
@@ -79,7 +84,7 @@ fn cmd_explain(args: &[String], data: Option<PathBuf>) -> ExitCode {
         eprintln!("usage: lin [--data <dir>] explain [--graph mermaid|dot] '<query>'");
         return ExitCode::from(2);
     }
-    match with_data(data, |db| match db {
+    match with_data(data, follower, |db| match db {
         Some(db) => db.explain_as(&q, graph),
         None => explain_as(&q, graph),
     }) {
@@ -97,7 +102,7 @@ fn cmd_explain(args: &[String], data: Option<PathBuf>) -> ExitCode {
     }
 }
 
-fn cmd_run(args: &[String], data: Option<PathBuf>) -> ExitCode {
+fn cmd_run(args: &[String], data: Option<PathBuf>, follower: bool) -> ExitCode {
     let mut show_plan = false;
     let mut file: Option<PathBuf> = None;
     let mut rest = Vec::new();
@@ -144,7 +149,7 @@ fn cmd_run(args: &[String], data: Option<PathBuf>) -> ExitCode {
         eprintln!("usage: lin [--data <dir>] run [--explain] [--file <path> | - | '<query>']");
         return ExitCode::from(2);
     }
-    match with_data(data, |db| match db {
+    match with_data(data, follower, |db| match db {
         Some(db) => {
             let h = db.run(&q)?;
             let plan = if show_plan {
@@ -181,11 +186,16 @@ fn cmd_run(args: &[String], data: Option<PathBuf>) -> ExitCode {
 
 fn with_data<T>(
     data: Option<PathBuf>,
+    follower: bool,
     f: impl FnOnce(Option<&mut Db>) -> Result<T, lin::Error>,
 ) -> Result<T, lin::Error> {
     match data {
         Some(path) => {
-            let mut db = Db::open(path)?;
+            let mut db = if follower {
+                Db::open_follower(path)?
+            } else {
+                Db::open(path)?
+            };
             let out = f(Some(&mut db));
             let close = db.close();
             let result = match (out, close) {
@@ -196,7 +206,14 @@ fn with_data<T>(
             drop(db);
             result
         }
-        None => f(None),
+        None => {
+            if follower {
+                return Err(lin::Error::runtime(
+                    "--follower requires --data <dir>",
+                ));
+            }
+            f(None)
+        }
     }
 }
 
@@ -218,18 +235,19 @@ fn load_program(file: Option<PathBuf>, rest: &[String]) -> Result<String, String
 fn usage(code: u8) -> ExitCode {
     eprintln!(
         "usage:\n  \
-         lin [--data <dir>] run [--explain] [--file <path> | - | '<query>']\n  \
-         lin [--data <dir>] explain [--graph mermaid|dot] '<query>'\n  \
+         lin [--data <dir>] [--follower] run [--explain] [--file <path> | - | '<query>']\n  \
+         lin [--data <dir>] [--follower] explain [--graph mermaid|dot] '<query>'\n  \
+         lin --data <dir> --follower apply-wal <frames.bin | ->\n  \
          lin [--data <dir>] backup export <file.json>\n  \
          lin backup import <file.json> [--data <dir>]\n  \
-         lin [--data <dir>] stats\n  \
+         lin [--data <dir>] [--follower] stats\n  \
          lin version"
     );
     ExitCode::from(code)
 }
 
-fn cmd_stats(data: Option<PathBuf>) -> ExitCode {
-    match with_data(data, |db| {
+fn cmd_stats(data: Option<PathBuf>, follower: bool) -> ExitCode {
+    match with_data(data, follower, |db| {
         let s = match db {
             Some(db) => db.stats(),
             None => {
@@ -264,6 +282,60 @@ fn cmd_stats(data: Option<PathBuf>) -> ExitCode {
     }
 }
 
+fn cmd_apply_wal(args: &[String], data: Option<PathBuf>, follower: bool) -> ExitCode {
+    let Some(dir) = data else {
+        eprintln!("usage: lin --data <dir> --follower apply-wal <frames.bin | ->");
+        return ExitCode::from(2);
+    };
+    if !follower {
+        eprintln!("apply-wal requires --follower (refuses durable primary)");
+        return ExitCode::from(2);
+    }
+    let src = args.first().map(String::as_str).unwrap_or("-");
+    let frames = if src == "-" {
+        let mut buf = Vec::new();
+        match io::stdin().read_to_end(&mut buf) {
+            Ok(_) => buf,
+            Err(e) => {
+                eprintln!("read stdin: {e}");
+                return ExitCode::from(1);
+            }
+        }
+    } else {
+        match std::fs::read(src) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("read {src}: {e}");
+                return ExitCode::from(1);
+            }
+        }
+    };
+    match Db::open_follower(&dir) {
+        Ok(mut db) => {
+            let since = db.r#gen();
+            match db.apply_wal(&frames) {
+                Ok(n) => {
+                    let new_gen = db.r#gen();
+                    let _ = db.close();
+                    println!(
+                        "applied {n} frames since={since} gen={new_gen} → {}",
+                        dir.display()
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    ExitCode::from(1)
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
 fn cmd_backup(args: &[String], data: Option<PathBuf>) -> ExitCode {
     match args.first().map(String::as_str) {
         Some("export") => {
@@ -271,7 +343,7 @@ fn cmd_backup(args: &[String], data: Option<PathBuf>) -> ExitCode {
                 eprintln!("usage: lin [--data <dir>] backup export <file.json>");
                 return ExitCode::from(2);
             };
-            match with_data(data, |db| match db {
+            match with_data(data, false, |db| match db {
                 Some(db) => db.export_backup(path),
                 None => {
                     let mut tmp = Db::fixture();

@@ -145,6 +145,8 @@ pub enum ColData {
     Float(Vec<f64>),
     Bool(Vec<bool>),
     Time(Vec<i64>),
+    /// Per-row dense vectors (`None` / empty = null).
+    Vec(Vec<Option<Vec<f32>>>),
     /// Homogeneous null column of length `n` (n stored in InsertCols.n).
     Null,
 }
@@ -657,8 +659,12 @@ fn append_insert_cols_v2(
     sync: SyncMode,
     log_bytes: &mut u64,
 ) -> Result<(), Error> {
-    // Fallback to msgpack if edges present (rare in bulk benches) or column mismatch.
-    if !edges.is_empty() || fields.len() != cols.len() {
+    // Fallback to msgpack if edges present (rare in bulk benches), column mismatch,
+    // or dense vec columns (embeddings).
+    if !edges.is_empty()
+        || fields.len() != cols.len()
+        || cols.iter().any(|c| matches!(c, ColData::Vec(_)))
+    {
         return append_record_v1(
             log,
             &LogRecord {
@@ -718,6 +724,7 @@ fn append_insert_cols_v2(
                     buf.extend_from_slice(&x.to_le_bytes());
                 }
             }
+            ColData::Vec(_) => unreachable!("vec cols use msgpack fallback"),
             ColData::Null => buf.push(0),
         }
     }
@@ -1062,6 +1069,15 @@ pub fn for_each_wal_frame(
     frames: &[u8],
     mut on_rec: impl FnMut(LogRecord) -> Result<(), Error>,
 ) -> Result<usize, Error> {
+    for_each_wal_frame_raw(frames, |_raw, rec| on_rec(rec))
+}
+
+/// Like [`for_each_wal_frame`], but also yields the raw framed bytes
+/// (`magic + len + payload`) so a follower can append them verbatim.
+pub fn for_each_wal_frame_raw(
+    frames: &[u8],
+    mut on_frame: impl FnMut(&[u8], LogRecord) -> Result<(), Error>,
+) -> Result<usize, Error> {
     let mut pos = 0usize;
     let mut n = 0usize;
     while pos < frames.len() {
@@ -1073,7 +1089,8 @@ pub fn for_each_wal_frame(
         if len == 0 || len > MAX_RECORD as usize || pos + 8 + len > frames.len() {
             return Err(io_err("bad wal frame length"));
         }
-        let payload = &frames[pos + 8..pos + 8 + len];
+        let end = pos + 8 + len;
+        let payload = &frames[pos + 8..end];
         let rec = if magic == LOG_MAGIC_V2 {
             decode_v2(payload).map_err(|_| io_err("bad v2 wal payload"))?
         } else if magic == LOG_MAGIC_V1 {
@@ -1081,11 +1098,32 @@ pub fn for_each_wal_frame(
         } else {
             return Err(io_err("unknown wal magic"));
         };
-        on_rec(rec)?;
+        on_frame(&frames[pos..end], rec)?;
         n += 1;
-        pos += 8 + len;
+        pos = end;
     }
     Ok(n)
+}
+
+/// Append pre-framed WAL bytes (as produced by [`export_wal_since`]) and
+/// durability-flush according to [`SyncMode`].
+pub fn append_raw_frames(
+    log: &mut File,
+    frames: &[u8],
+    sync: SyncMode,
+    log_bytes: &mut u64,
+) -> Result<(), Error> {
+    if frames.is_empty() {
+        return Ok(());
+    }
+    // Validate framing before touching the log.
+    for_each_wal_frame_raw(frames, |_, _| Ok(()))?;
+    log.write_all(frames).map_err(io_err)?;
+    if sync == SyncMode::Full {
+        durable_sync(log).map_err(io_err)?;
+    }
+    *log_bytes += frames.len() as u64;
+    Ok(())
 }
 
 /// Build columnar insert pack in one pass (field set from first row + union).
@@ -1144,6 +1182,10 @@ pub fn rows_to_insert_cols(
                     kind = 5;
                     break;
                 }
+                Some(Cell::Vec(_)) => {
+                    kind = 6;
+                    break;
+                }
                 _ => {}
             }
         }
@@ -1194,6 +1236,13 @@ pub fn rows_to_insert_cols(
                 }
                 ColData::Time(v)
             }
+            6 => {
+                let mut v = Vec::with_capacity(rows.len());
+                for r in rows {
+                    v.push(r.get(f).and_then(Cell::as_vec).map(|s| s.to_vec()));
+                }
+                ColData::Vec(v)
+            }
             _ => ColData::Null,
         };
         cols.push(col);
@@ -1219,6 +1268,10 @@ pub fn cols_to_rows(fields: &[String], cols: &[ColData], n: usize) -> Vec<crate:
                 Some(ColData::Float(v)) => Cell::Float(v.get(i).copied().unwrap_or(0.0)),
                 Some(ColData::Bool(v)) => Cell::Bool(v.get(i).copied().unwrap_or(false)),
                 Some(ColData::Time(v)) => Cell::Time(v.get(i).copied().unwrap_or(0)),
+                Some(ColData::Vec(v)) => match v.get(i).and_then(|o| o.as_ref()) {
+                    Some(emb) if !emb.is_empty() => Cell::vec_arc(emb.as_slice()),
+                    _ => Cell::Null,
+                },
                 Some(ColData::Null) | None => Cell::Null,
             };
             row.insert(f.clone(), cell);

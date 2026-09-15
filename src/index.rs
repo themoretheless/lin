@@ -187,6 +187,7 @@ fn cell_part(c: &Cell) -> IndexPart {
         Cell::Time(n) => IndexPart::Time(*n),
         Cell::Text(s) => IndexPart::Text(Arc::clone(s)),
         Cell::Float(n) => IndexPart::Int(n.to_bits() as i64),
+        Cell::Vec(_) => IndexPart::Null,
     }
 }
 
