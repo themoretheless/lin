@@ -659,12 +659,8 @@ fn append_insert_cols_v2(
     sync: SyncMode,
     log_bytes: &mut u64,
 ) -> Result<(), Error> {
-    // Fallback to msgpack if edges present (rare in bulk benches), column mismatch,
-    // or dense vec columns (embeddings).
-    if !edges.is_empty()
-        || fields.len() != cols.len()
-        || cols.iter().any(|c| matches!(c, ColData::Vec(_)))
-    {
+    // Fallback to msgpack if edges present (rare in bulk benches) or column mismatch.
+    if !edges.is_empty() || fields.len() != cols.len() {
         return append_record_v1(
             log,
             &LogRecord {
@@ -724,7 +720,20 @@ fn append_insert_cols_v2(
                     buf.extend_from_slice(&x.to_le_bytes());
                 }
             }
-            ColData::Vec(_) => unreachable!("vec cols use msgpack fallback"),
+            ColData::Vec(v) => {
+                buf.push(6);
+                for row in v {
+                    match row {
+                        Some(emb) if !emb.is_empty() => {
+                            buf.extend_from_slice(&(emb.len() as u32).to_le_bytes());
+                            for x in emb {
+                                buf.extend_from_slice(&x.to_le_bytes());
+                            }
+                        }
+                        _ => buf.extend_from_slice(&0u32.to_le_bytes()),
+                    }
+                }
+            }
             ColData::Null => buf.push(0),
         }
     }
@@ -999,6 +1008,31 @@ fn decode_v2(buf: &[u8]) -> Result<LogRecord, ()> {
                             i += 8;
                         }
                         ColData::Time(v)
+                    }
+                    6 => {
+                        let mut v = Vec::with_capacity(n as usize);
+                        for _ in 0..n {
+                            if i + 4 > buf.len() {
+                                return Err(());
+                            }
+                            let dim = u32::from_le_bytes(buf[i..i + 4].try_into().unwrap()) as usize;
+                            i += 4;
+                            if dim == 0 {
+                                v.push(None);
+                                continue;
+                            }
+                            let nbytes = dim.checked_mul(4).ok_or(())?;
+                            if i + nbytes > buf.len() {
+                                return Err(());
+                            }
+                            let mut emb = Vec::with_capacity(dim);
+                            for _ in 0..dim {
+                                emb.push(f32::from_le_bytes(buf[i..i + 4].try_into().unwrap()));
+                                i += 4;
+                            }
+                            v.push(Some(emb));
+                        }
+                        ColData::Vec(v)
                     }
                     _ => return Err(()),
                 };

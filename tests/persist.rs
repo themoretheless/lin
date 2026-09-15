@@ -1,7 +1,11 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Barrier};
+use std::thread;
+use std::time::Duration;
 
 use lin::{Db, Store};
 
@@ -17,6 +21,58 @@ fn tmp() -> PathBuf {
 
 fn text<'a>(row: &'a lin::Row, k: &str) -> &'a str {
     row.get(k).and_then(|c| c.text()).unwrap_or("")
+}
+
+#[test]
+fn embedding_survives_durable_reopen() {
+    let dir = tmp();
+    {
+        let mut db = Db::open(&dir).unwrap();
+        db.run(
+            r#"insert docs { uri: "raw://emb", title: "vector wal", layer: "wiki", body: "dense" }"#,
+        )
+        .unwrap();
+        let q = db
+            .run(r#"docs | uri == "raw://emb" | { id, title, embedding }"#)
+            .unwrap();
+        assert_eq!(q.done.n, 1);
+        assert!(
+            q.rows[0].get("embedding").and_then(|c| c.as_vec()).is_some(),
+            "insert should auto-embed"
+        );
+        // WAL path (before checkpoint): ship frames into a fresh memory db.
+        let frames = db.export_wal_since(0).unwrap();
+        assert!(!frames.is_empty(), "expected WAL frames before checkpoint");
+        let mut mem = Db::empty();
+        assert_eq!(mem.apply_wal(&frames).unwrap(), 1);
+        assert!(
+            mem.run(r#"docs | uri == "raw://emb""#)
+                .unwrap()
+                .rows[0]
+                .get("embedding")
+                .and_then(|c| c.as_vec())
+                .is_some()
+        );
+        db.close().unwrap();
+    }
+    {
+        let mut db = Db::open(&dir).unwrap();
+        let q = db
+            .run(r#"docs | uri == "raw://emb" | { title, embedding }"#)
+            .unwrap();
+        assert_eq!(q.done.n, 1);
+        let emb = q.rows[0]
+            .get("embedding")
+            .and_then(|c| c.as_vec())
+            .expect("embedding after reopen");
+        assert!(emb.len() >= 8, "dim={}", emb.len());
+        let v = db
+            .run(r#"docs | search vec "vector wal" | take 5"#)
+            .unwrap();
+        assert!(v.done.n >= 1);
+        db.close().unwrap();
+    }
+    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -733,6 +789,58 @@ fn follower_rejects_wal_gap() {
         other.close().unwrap();
         primary.close().unwrap();
     }
+    let _ = fs::remove_dir_all(&primary_dir);
+    let _ = fs::remove_dir_all(&follower_dir);
+}
+
+#[test]
+fn ship_tcp_follower_sync() {
+    let primary_dir = tmp();
+    let follower_dir = tmp();
+    let bak = primary_dir.join("boot.linbak");
+
+    let mut primary = Db::open(&primary_dir).unwrap();
+    primary
+        .run(r#"insert docs { uri: "raw://s0", title: "S0", layer: "wiki" }"#)
+        .unwrap();
+    primary.export_backup(&bak).unwrap();
+    primary
+        .run(r#"insert docs { uri: "raw://s1", title: "S1", layer: "wiki" }"#)
+        .unwrap();
+    // Keep primary open so post-backup WAL frames remain in the log.
+
+    let mut follower = Db::bootstrap_follower(&bak, &follower_dir).unwrap();
+    assert_eq!(follower.r#gen(), 1);
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let ready = Arc::new(Barrier::new(2));
+    let ready2 = Arc::clone(&ready);
+    let serve = thread::spawn(move || {
+        ready2.wait();
+        lin::ship::serve_one(&primary, &listener).unwrap();
+        let _ = primary.close();
+    });
+
+    ready.wait();
+    thread::sleep(Duration::from_millis(20));
+    let frames = lin::ship::pull(addr, follower.r#gen()).unwrap();
+    let n = follower.apply_wal(&frames).unwrap();
+    assert_eq!(n, 1);
+    assert_eq!(
+        follower
+            .run(r#"docs | uri == "raw://s1""#)
+            .unwrap()
+            .done
+            .n,
+        1
+    );
+    follower.close().unwrap();
+    serve.join().unwrap();
+
+    let r = Db::open_read(&follower_dir).unwrap();
+    assert_eq!(r.run(r#"docs | take 10"#).unwrap().done.n, 2);
+
     let _ = fs::remove_dir_all(&primary_dir);
     let _ = fs::remove_dir_all(&follower_dir);
 }

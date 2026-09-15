@@ -16,7 +16,7 @@
 //!
 //! Experimental (outside freeze): [`query`] fluent builder, [`FromRow`] / [`LinRow`],
 //! [`Db::run_stmt`], [`RowExt`], [`RecordBatch`] (columnar OLAP results), feature `async`
-//! ([`AsyncDb`], `stream_*`).
+//! ([`AsyncDb`], `stream_*`), [`ship`] TCP WAL pull/serve.
 //!
 //! Semver: breaking changes to the list above require a major bump after 1.0;
 //! until then minors may still adjust experimental surfaces (`Stmt`, plan IR).
@@ -29,9 +29,9 @@
 //!
 //! ## Hot standby
 //!
-//! Primary: [`Db::open`] + [`Db::export_wal_since`]. Follower: [`Db::bootstrap_follower`]
-//! (or [`Db::open_follower`] after backup) + [`Db::apply_wal`]. Concurrent readers:
-//! [`Db::open_read`] on the follower dir. Not multi-writer.
+//! Primary: [`Db::open`] + [`Db::export_wal_since`] / [`ship::serve_blocking`].
+//! Follower: [`Db::bootstrap_follower`] + [`ship::pull`] + [`Db::apply_wal`].
+//! Concurrent readers: [`Db::open_read`] on the follower dir. Not multi-writer.
 
 mod ast;
 mod batch;
@@ -52,6 +52,7 @@ mod store;
 
 pub mod query;
 pub mod row;
+pub mod ship;
 
 #[cfg(feature = "async")]
 pub mod async_db;

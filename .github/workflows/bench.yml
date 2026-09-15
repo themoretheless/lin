@@ -47,7 +47,9 @@ jobs:
             cat bench-report.md
           } >> "$GITHUB_STEP_SUMMARY"
           cp bench-report.md .airbug-bench/ci/bench-report.md
-
+          export BENCH_RUN_JSON=.airbug-bench/ci/run.json
+          python3 scripts/check-bench-budget.py
+          # exit 2 = hard regress (>3×); exit 0 includes soft WARN (>1.5×)
       - name: Upload bench report
         uses: actions/upload-artifact@v4
         with:

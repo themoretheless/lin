@@ -134,18 +134,46 @@ rel cites
 
 Неявный `take 50`. `skip N` / `offset N` — отбросить первые N строк (пейджинг: `skip 40 | take 20`). `search` / `search hybrid` — RRF(lex + vec) через локальный hashing-эмбеддер (`embed_id`, по умолчанию dim из суффикса `/768`); не нейросеть. `search vec` — cosine по полю `embedding` (пишется на insert / `reembed`). Подмена: `Db::with_embedder`.
 
-## Roadmap (кратко)
+## Roadmap
+
+Кратко ниже; полный план — canvas / wiki `lin-roadmap`.
 
 | Фаза | Статус |
 |---|---|
-| P0 semver 0.2 + честный search | **готово** |
-| P1 backup + multi-reader + compaction + ops + flock + quotas | **готово** |
-| P2 mmap/cold collections | **готово** + lazy page-in |
-| SyncMode::Normal | **готово** |
-| P3 hot standby | **готово**: durable `apply_wal` + `open_follower` / `bootstrap_follower`; `open_read` на follower |
-| P3c live vec/hybrid | **готово**: hashing embedder + cosine/RRF; neural model — через `with_embedder` |
-| P3b сеть / MVCC | не multi-writer; не полный MVCC / consensus |
-| DuckDB/WASM backends | не сейчас |
+| P0–P2: 0.2 + backup/FENCE/cold/SyncMode | **готово** |
+| P3 hot standby | **готово** (`open_follower` / `apply_wal`) |
+| P3c live vec/hybrid | **готово** (hashing embedder + RRF; neural → `with_embedder`) |
+| **0.2.x ship + ops** | **готово** (критерии met: n1–n4 · tests · README recipe) |
+| **0.3** | Freeze Queryable/cursor/FromRow/async + CHANGELOG/migration → 0.3.0 |
+| **0.4** | Neural embed · FTS postings · wider `run_batch` · lazy hop/search |
+| **0.5** | Optional ANN · wasm32 memory-only · TLS/auth/fanout (после скучного ship) |
+| **Не 0.x** | Multi-writer / полный MVCC / consensus · DuckDB как storage backend |
+
+## Hot standby (recipe)
+
+Primary держит writer lock на `--data` (в т.ч. пока крутится `wal-serve`). После checkpoint log пуст — bootstrap с backup, sync догоняет только хвост WAL.
+
+```bash
+# 1) primary: данные + portable backup
+lin --data primary run 'insert docs { uri: "raw://a", title: "A", layer: "wiki" }'
+lin --data primary backup export /tmp/boot.linbak
+
+# 2) follower из backup
+lin --data follower follower bootstrap --backup /tmp/boot.linbak
+
+# 3) primary: ещё запись (не закрывать / не checkpoint'ить зря перед serve)
+lin --data primary run 'insert docs { uri: "raw://b", title: "B", layer: "wiki" }'
+
+# 4) в одном терминале — отдать WAL (держит writer lock)
+lin --data primary wal-serve --listen 127.0.0.1:9876
+
+# 5) в другом — one-shot sync (или --loop 2)
+lin --data follower follower sync --from 127.0.0.1:9876
+lin --data follower follower status
+lin --data follower --follower run 'docs | take 10'
+```
+
+Low-level: `lin --data follower --follower apply-wal frames.bin`. API: `lin::ship::{pull,serve_blocking}`.
 
 ## Бенчмарки (airbug-bench): Lin vs SQLite vs DuckDB vs Postgres vs MySQL
 
@@ -171,7 +199,7 @@ cargo bench --bench compare -- --profile quick --filter append_log
 
 ### CI
 
-Workflow [`.github/workflows/bench.yml`](.github/workflows/bench.yml) на `push`/`pull_request` → `main`: `--profile quick`, без Docker. В отчёте Lin / SQLite / DuckDB / HashMap; Postgres и MySQL пропускаются без серверов. Исключены шумные кейсы: `compare/durable*`, `compare/cold*`, `compare/wal*`, `compare/hot_reopen*`. Job падает только при ошибке compile/harness (не при «медленнее peer»).
+Workflow [`.github/workflows/bench.yml`](.github/workflows/bench.yml) на `push`/`pull_request` → `main`: `--profile quick`, без Docker. В отчёте Lin / SQLite / DuckDB / HashMap; Postgres и MySQL пропускаются без серверов. Исключены шумные кейсы: `compare/durable*`, `compare/cold*`, `compare/wal*`, `compare/hot_reopen*`. После прогона `scripts/check-bench-budget.py` сравнивает Lin median с [`benches/ci-baseline.json`](benches/ci-baseline.json): **warn** при >1.5×, **fail** при >3× на `point_get` / `filter_eq` / `join_inner`. Иначе job падает только при ошибке compile/harness.
 
 Где смотреть: **Actions → bench → Job summary** (markdown-таблица) и artifact **`bench-report`** (`run.json` + `report.html` + `bench-report.md`). Локально: `./scripts/ci-bench.sh` сразу печатает (и при живом hub открывает) **airbug dash** `http://127.0.0.1:8790/`, затем гоняет бенчи в `.airbug-bench/ci/` (hub: `cargo run -p airbug-hub -- serve --root <lin>`).
 
@@ -225,7 +253,7 @@ cargo run -- run - < batch.lin
 
 То же в языке: `| explain graph` (Mermaid) и `| explain dot` (Graphviz). `| explain run` после исполнения пишет фактические `rows`/`ms`.
 
-CLI: `lin run '<запрос>'` печатает строки и `gen`. `lin run --file batch.lin` и `lin run -` читают программу из файла / stdin. `lin explain '<запрос>'` печатает план или ошибку компиляции. `lin --data .lin run '…'` пишет в каталог данных. Hot standby: `lin --data follower --follower apply-wal frames.bin`, затем `lin --data follower --follower run '…'` или `Db::open_read`. `lin backup export|import`, `lin stats`, `lin version`.
+CLI: `lin run '<запрос>'` печатает строки и `gen`. `lin run --file batch.lin` и `lin run -` читают программу из файла / stdin. `lin explain '<запрос>'` печатает план или ошибку компиляции. `lin --data .lin run '…'` пишет в каталог данных. Hot standby: `wal-serve` + `follower sync` (см. recipe выше); low-level `apply-wal`. `lin backup export|import`, `lin stats`, `lin version`.
 
 ## Backup
 

@@ -1,6 +1,9 @@
 use std::io::{self, Read};
+use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::thread;
+use std::time::Duration;
 
 use lin::{Db, GraphFmt, explain_as};
 
@@ -12,6 +15,8 @@ fn main() -> ExitCode {
         Some("run") => cmd_run(&rest[1..], data, follower),
         Some("backup") => cmd_backup(&rest[1..], data),
         Some("apply-wal") => cmd_apply_wal(&rest[1..], data, follower),
+        Some("wal-serve") => cmd_wal_serve(&rest[1..], data),
+        Some("follower") => cmd_follower(&rest[1..], data),
         Some("stats") => cmd_stats(data, follower),
         Some("version") | Some("--version") => {
             println!("lin {}", lin::VERSION);
@@ -237,6 +242,8 @@ fn usage(code: u8) -> ExitCode {
         "usage:\n  \
          lin [--data <dir>] [--follower] run [--explain] [--file <path> | - | '<query>']\n  \
          lin [--data <dir>] [--follower] explain [--graph mermaid|dot] '<query>'\n  \
+         lin --data <dir> wal-serve [--listen HOST:PORT]\n  \
+         lin --data <dir> follower status|bootstrap|sync …\n  \
          lin --data <dir> --follower apply-wal <frames.bin | ->\n  \
          lin [--data <dir>] backup export <file.json>\n  \
          lin backup import <file.json> [--data <dir>]\n  \
@@ -334,6 +341,221 @@ fn cmd_apply_wal(args: &[String], data: Option<PathBuf>, follower: bool) -> Exit
             ExitCode::from(1)
         }
     }
+}
+
+fn cmd_wal_serve(args: &[String], data: Option<PathBuf>) -> ExitCode {
+    let Some(dir) = data else {
+        eprintln!("usage: lin --data <dir> wal-serve [--listen HOST:PORT]");
+        return ExitCode::from(2);
+    };
+    let mut listen = "127.0.0.1:9876".to_string();
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--listen" {
+            i += 1;
+            match args.get(i) {
+                Some(a) => {
+                    listen = a.clone();
+                    i += 1;
+                }
+                None => {
+                    eprintln!("usage: lin --data <dir> wal-serve [--listen HOST:PORT]");
+                    return ExitCode::from(2);
+                }
+            }
+        } else {
+            eprintln!("unknown wal-serve arg {}", args[i]);
+            return ExitCode::from(2);
+        }
+    }
+    let listener = match TcpListener::bind(&listen) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("bind {listen}: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let addr = listener.local_addr().map(|a| a.to_string()).unwrap_or(listen);
+    eprintln!("wal-serve {} on {addr} (writer lock held)", dir.display());
+    match Db::open(&dir) {
+        Ok(db) => match lin::ship::serve_blocking(&db, listener) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::from(1)
+            }
+        },
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn cmd_follower(args: &[String], data: Option<PathBuf>) -> ExitCode {
+    match args.first().map(String::as_str) {
+        Some("status") => {
+            let Some(dir) = data else {
+                eprintln!("usage: lin --data <dir> follower status");
+                return ExitCode::from(2);
+            };
+            match Db::open_follower(&dir) {
+                Ok(mut db) => {
+                    let s = db.stats();
+                    println!(
+                        "follower={} gen={} docs={} facts={} edges={} log_bytes={} embed_id={}",
+                        db.is_follower(),
+                        s.r#gen,
+                        s.docs,
+                        s.facts,
+                        s.edges,
+                        s.log_bytes,
+                        db.store.embed_id
+                    );
+                    let _ = db.close();
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    ExitCode::from(1)
+                }
+            }
+        }
+        Some("bootstrap") => {
+            let mut backup: Option<PathBuf> = None;
+            let mut i = 1;
+            while i < args.len() {
+                if args[i] == "--backup" {
+                    i += 1;
+                    match args.get(i) {
+                        Some(p) => {
+                            backup = Some(PathBuf::from(p));
+                            i += 1;
+                        }
+                        None => break,
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            let Some(dir) = data else {
+                eprintln!("usage: lin --data <dir> follower bootstrap --backup <file>");
+                return ExitCode::from(2);
+            };
+            let Some(bak) = backup else {
+                eprintln!("usage: lin --data <dir> follower bootstrap --backup <file>");
+                return ExitCode::from(2);
+            };
+            match Db::bootstrap_follower(&bak, &dir) {
+                Ok(mut db) => {
+                    let s = db.stats();
+                    println!(
+                        "bootstrapped {} → {}  gen={} docs={}",
+                        bak.display(),
+                        dir.display(),
+                        s.r#gen,
+                        s.docs
+                    );
+                    let _ = db.close();
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    ExitCode::from(1)
+                }
+            }
+        }
+        Some("sync") => {
+            let Some(dir) = data else {
+                eprintln!(
+                    "usage: lin --data <dir> follower sync --from HOST:PORT [--loop SECS]"
+                );
+                return ExitCode::from(2);
+            };
+            let mut from: Option<String> = None;
+            let mut loop_secs: Option<u64> = None;
+            let mut i = 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--from" => {
+                        i += 1;
+                        match args.get(i) {
+                            Some(a) => {
+                                from = Some(a.clone());
+                                i += 1;
+                            }
+                            None => break,
+                        }
+                    }
+                    "--loop" => {
+                        i += 1;
+                        match args.get(i).and_then(|s| s.parse().ok()) {
+                            Some(n) => {
+                                loop_secs = Some(n);
+                                i += 1;
+                            }
+                            None => {
+                                eprintln!("--loop requires seconds");
+                                return ExitCode::from(2);
+                            }
+                        }
+                    }
+                    other => {
+                        eprintln!("unknown follower sync arg {other}");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            let Some(addr) = from else {
+                eprintln!(
+                    "usage: lin --data <dir> follower sync --from HOST:PORT [--loop SECS]"
+                );
+                return ExitCode::from(2);
+            };
+            loop {
+                match sync_once(&dir, &addr) {
+                    Ok(()) => {}
+                    Err(code) => return code,
+                }
+                match loop_secs {
+                    Some(secs) => thread::sleep(Duration::from_secs(secs.max(1))),
+                    None => return ExitCode::SUCCESS,
+                }
+            }
+        }
+        _ => {
+            eprintln!(
+                "usage:\n  \
+                 lin --data <dir> follower status\n  \
+                 lin --data <dir> follower bootstrap --backup <file>\n  \
+                 lin --data <dir> follower sync --from HOST:PORT [--loop SECS]"
+            );
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn sync_once(dir: &PathBuf, addr: &str) -> Result<(), ExitCode> {
+    let mut db = Db::open_follower(dir).map_err(|e| {
+        eprintln!("{e}");
+        ExitCode::from(1)
+    })?;
+    let since = db.r#gen();
+    let frames = lin::ship::pull(addr, since).map_err(|e| {
+        eprintln!("{e}");
+        ExitCode::from(1)
+    })?;
+    let n = db.apply_wal(&frames).map_err(|e| {
+        eprintln!("{e}");
+        if e.to_string().contains("gap") {
+            eprintln!("hint: re-bootstrap from a fresh primary backup");
+        }
+        ExitCode::from(1)
+    })?;
+    let new_gen = db.r#gen();
+    let _ = db.close();
+    println!("sync applied={n} since={since} gen={new_gen} from={addr}");
+    Ok(())
 }
 
 fn cmd_backup(args: &[String], data: Option<PathBuf>) -> ExitCode {
