@@ -1004,6 +1004,9 @@ impl Store {
         if i >= self.docs_id.len() {
             return None;
         }
+        if fields.len() == 2 && fields[0] == "id" && fields[1] == "title" {
+            return Some(row_id_title(&self.docs_id[i], &self.docs_title[i]));
+        }
         let mut row = BTreeMap::new();
         for f in fields {
             let cell = match f.as_str() {
@@ -1763,6 +1766,17 @@ impl Store {
         if fields.is_empty() || !fields.iter().all(|f| docs_hot_field(f)) {
             return None;
         }
+        // Hot path: { id, title } — compact 2-entry maps.
+        if fields.len() == 2 && fields[0] == "id" && fields[1] == "title" {
+            let mut out = Vec::with_capacity(idxs.len());
+            for &i in idxs {
+                if i >= self.docs_id.len() {
+                    continue;
+                }
+                out.push(row_id_title(&self.docs_id[i], &self.docs_title[i]));
+            }
+            return Some(out);
+        }
         let mut out = Vec::with_capacity(idxs.len());
         for &i in idxs {
             if i >= self.docs_id.len() {
@@ -1796,10 +1810,15 @@ impl Store {
         let n = self.docs_id.len();
         let mut out = Vec::new();
         let finder = title_contains.map(|n| memchr::memmem::Finder::new(n.as_bytes()));
+        let id_title = fields.len() == 2 && fields[0] == "id" && fields[1] == "title";
         for i in 0..n {
             if let Some(f) = &finder
                 && f.find(self.docs_title[i].as_bytes()).is_none()
             {
+                continue;
+            }
+            if id_title {
+                out.push(row_id_title(&self.docs_id[i], &self.docs_title[i]));
                 continue;
             }
             let mut row = BTreeMap::new();
@@ -1821,6 +1840,14 @@ impl Store {
 
 fn docs_hot_field(f: &str) -> bool {
     matches!(f, "id" | "title" | "layer" | "wing")
+}
+
+#[inline]
+fn row_id_title(id: &Arc<str>, title: &Arc<str>) -> Row {
+    BTreeMap::from([
+        (String::from("id"), Cell::Text(Arc::clone(id))),
+        (String::from("title"), Cell::Text(Arc::clone(title))),
+    ])
 }
 
 fn spo_key(row: &Row) -> Option<(Arc<str>, Arc<str>, Arc<str>)> {

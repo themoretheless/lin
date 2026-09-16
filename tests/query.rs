@@ -218,6 +218,21 @@ fn join_run_batch_matches_rows() {
 }
 
 #[test]
+fn filter_project_run_batch_matches_rows() {
+    let mut db = Db::fixture();
+    let src = r#"docs | wing == "rag" | { id, title, wing } | take 10"#;
+    let rows = db.run(src).unwrap();
+    let batch = db.run_batch(src).unwrap();
+    assert_eq!(batch.n(), rows.done.n);
+    assert_eq!(batch.to_rows(), rows.rows);
+    assert!(batch.n() > 0);
+    assert_eq!(
+        batch.names.as_ref(),
+        &["id".to_string(), "title".to_string(), "wing".to_string()][..]
+    );
+}
+
+#[test]
 fn fluent_hop_and_match() {
     let mut db = Db::fixture();
     let ins = db

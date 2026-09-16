@@ -19,6 +19,9 @@
 //!   [`Plan`], [`Stats`], [`Quotas`], [`SyncMode`], [`OpenOpts`], [`Embedder`],
 //!   [`HashingEmbedder`], [`VERSION`]
 //!
+//! Opt-in neural embed (not default): feature `embed-ollama` ([`OllamaEmbedder`]),
+//! `embed-onnx` ([`OnnxEmbedder`]).
+//!
 //! Experimental (outside freeze): [`Db::run_stmt`], [`RowExt`], [`RecordBatch`]
 //! (columnar OLAP), [`ship`] TCP WAL pull/serve (no TLS).
 //!
@@ -31,6 +34,8 @@
 //! Default `search` / `search hybrid` use **lex + local hashing vec** (feature-hash
 //! embedder bound to catalog `embed_id`, not a neural model). `search vec` ranks by
 //! cosine over stored `embedding` cells. Swap via [`Db::with_embedder`].
+//! Opt-in neural backends: feature `embed-ollama` ([`OllamaEmbedder`]),
+//! `embed-onnx` ([`OnnxEmbedder`]).
 //!
 //! ## Hot standby
 //!
@@ -45,6 +50,10 @@ mod check;
 mod cold;
 mod cursor;
 mod embed;
+#[cfg(feature = "embed-ollama")]
+mod embed_ollama;
+#[cfg(feature = "embed-onnx")]
+mod embed_onnx;
 mod error;
 mod exec;
 mod explain;
@@ -71,6 +80,10 @@ pub use ast::{
 pub use batch::RecordBatch;
 pub use cursor::QueryCursor;
 pub use embed::{Embedder, HashingEmbedder};
+#[cfg(feature = "embed-ollama")]
+pub use embed_ollama::OllamaEmbedder;
+#[cfg(feature = "embed-onnx")]
+pub use embed_onnx::{OnnxEmbedder, EmbeddingModel};
 pub use error::Error;
 pub use exec::{Db, Done, Handle, OpenOpts, Prepared, Quotas, ReadDb, Stats, SyncMode};
 pub use graph::GraphFmt;

@@ -4,16 +4,18 @@
 //! - `collection | filter? | project? | skip* | take?`
 //! - `collection | filter? | join|left_join right on f | project? | skip* | take?`
 //!   (nested-loop: left scan/index + point lookup on the right via FK)
+//! - Hot SoA: `orders [| total >] | join users on user_id | { id, users.email, total }`
 //!
 //! hop / graph / match / sort / union / search / multi-join → **buffered** materialize.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::Arc;
 
 use crate::ast::{Pred, Query, Source, Stmt, Step};
 use crate::error::Error;
 use crate::exec::{
     Db, ReadDb, JoinFieldPlan, build_right_probe_owned, emit_join_row, eval_pred, field_names,
-    plan_join_fields, project_join_fields,
+    plan_join_fields, pred_total_gt, project_join_fields,
 };
 use crate::query::Queryable;
 use crate::store::{Cell, Row, Store, now_ms, project_fields};
@@ -65,6 +67,8 @@ impl CursorDb<'_> {
 enum CursorState {
     Lazy(LazyCursor),
     LazyJoin(LazyJoinCursor),
+    /// Hot SoA: `orders [| total >] | join users on user_id | { id, users.email, total }`
+    LazyJoinSoa(LazyJoinSoa),
     Buffered(std::vec::IntoIter<Row>),
     Done,
 }
@@ -96,6 +100,22 @@ struct LazyJoinCursor {
     pending: VecDeque<Row>,
 }
 
+/// Columnar left + user-index probe; emits compact 3-field rows.
+struct LazyJoinSoa {
+    source: RowSource,
+    pos: usize,
+    left_join: bool,
+    /// When set, filter `orders.total > min` without row maps.
+    total_gt: Option<f64>,
+    /// user_id → index into users SoA columns.
+    probe: FxHashMap<Arc<str>, usize>,
+    skip_left: usize,
+    take_left: Option<usize>,
+    key_id: String,
+    key_email: String,
+    key_total: String,
+}
+
 enum RowSource {
     Idxs(Vec<usize>),
     Scan { len: usize },
@@ -113,6 +133,12 @@ impl<'a> QueryCursor<'a> {
     fn open(db: CursorDb<'a>, q: &Query) -> Result<Self, Error> {
         db.prepare_query(q)?;
 
+        if let Some(join) = try_lazy_join_soa(&db, q)? {
+            return Ok(Self {
+                db,
+                state: CursorState::LazyJoinSoa(join),
+            });
+        }
         if let Some(join) = try_lazy_join(&db, q)? {
             return Ok(Self {
                 db,
@@ -137,7 +163,7 @@ impl<'a> QueryCursor<'a> {
     pub fn is_lazy(&self) -> bool {
         matches!(
             self.state,
-            CursorState::Lazy(_) | CursorState::LazyJoin(_)
+            CursorState::Lazy(_) | CursorState::LazyJoin(_) | CursorState::LazyJoinSoa(_)
         )
     }
 }
@@ -162,6 +188,7 @@ impl Iterator for QueryCursor<'_> {
         let item = match &mut state {
             CursorState::Lazy(lazy) => next_lazy(store, lazy),
             CursorState::LazyJoin(join) => next_lazy_join(store, join),
+            CursorState::LazyJoinSoa(join) => next_lazy_join_soa(store, join),
             _ => None,
         };
 
@@ -447,6 +474,199 @@ fn try_lazy_simple(db: &CursorDb<'_>, q: &Query) -> Result<Option<LazyCursor>, E
         skip_left: skip_n,
         take_left,
         now,
+    }))
+}
+
+fn next_lazy_join_soa(store: &Store, join: &mut LazyJoinSoa) -> Option<Result<Row, Error>> {
+    let orders_id = store.orders_id();
+    let orders_uid = store.orders_user_id();
+    let orders_total = store.orders_total();
+    let users_email = store.users_email();
+    let n = orders_id.len();
+
+    loop {
+        if join.take_left == Some(0) {
+            return None;
+        }
+        let idx = match &join.source {
+            RowSource::Idxs(idxs) => {
+                if join.pos >= idxs.len() {
+                    return None;
+                }
+                let i = idxs[join.pos];
+                join.pos += 1;
+                i
+            }
+            RowSource::Scan { len } => {
+                if join.pos >= *len {
+                    return None;
+                }
+                let i = join.pos;
+                join.pos += 1;
+                i
+            }
+        };
+        if idx >= n {
+            continue;
+        }
+        if let Some(min) = join.total_gt
+            && !(orders_total[idx] > min)
+        {
+            continue;
+        }
+        let uid = orders_uid[idx].as_ref();
+        let right = join.probe.get(uid).copied();
+        if right.is_none() && !join.left_join {
+            continue;
+        }
+        if join.skip_left > 0 {
+            join.skip_left -= 1;
+            continue;
+        }
+        if let Some(t) = join.take_left.as_mut() {
+            *t = t.saturating_sub(1);
+        }
+
+        let mut row = BTreeMap::new();
+        row.insert(
+            join.key_id.clone(),
+            Cell::Text(Arc::clone(&orders_id[idx])),
+        );
+        row.insert(
+            join.key_email.clone(),
+            match right {
+                Some(ui) => Cell::Text(Arc::clone(&users_email[ui])),
+                None => Cell::Null,
+            },
+        );
+        row.insert(
+            join.key_total.clone(),
+            Cell::Float(orders_total[idx]),
+        );
+        return Some(Ok(row));
+    }
+}
+
+fn is_orders_users_id_email_total(fields: &[String]) -> bool {
+    fields.len() == 3
+        && fields[0] == "id"
+        && fields[1] == "users.email"
+        && fields[2] == "total"
+}
+
+fn try_lazy_join_soa(db: &CursorDb<'_>, q: &Query) -> Result<Option<LazyJoinSoa>, Error> {
+    let Source::Collection(name) = &q.source else {
+        return Ok(None);
+    };
+    if name != "orders" {
+        return Ok(None);
+    }
+
+    let mut filter: Option<&Pred> = None;
+    let mut join: Option<(bool, &str, &str)> = None;
+    let mut project: Option<Vec<String>> = None;
+    let mut skip_n: usize = 0;
+    let mut take_n: Option<Option<i64>> = None;
+    let mut saw_take = false;
+    let mut saw_join = false;
+
+    for step in &q.steps {
+        match step {
+            Step::Filter(p) if !saw_join => {
+                if filter.is_some() {
+                    return Ok(None);
+                }
+                filter = Some(p);
+            }
+            Step::Join {
+                left,
+                collection,
+                on,
+            } if !saw_join => {
+                saw_join = true;
+                join = Some((*left, collection.as_str(), on.as_str()));
+            }
+            Step::Project(f) if saw_join => {
+                if project.is_some() {
+                    return Ok(None);
+                }
+                project = Some(field_names(f));
+            }
+            Step::Skip { n } if saw_join => {
+                skip_n = skip_n.saturating_add((*n).max(0) as usize);
+            }
+            Step::Take { n } if saw_join => {
+                if saw_take {
+                    return Ok(None);
+                }
+                saw_take = true;
+                take_n = Some(*n);
+            }
+            Step::Project(_) | Step::Skip { .. } | Step::Take { .. } if !saw_join => {
+                return Ok(None);
+            }
+            _ => return Ok(None),
+        }
+    }
+
+    let Some((left_join, right_col, on)) = join else {
+        return Ok(None);
+    };
+    if right_col != "users" || on != "user_id" {
+        return Ok(None);
+    }
+    let Some(fields) = project.as_ref() else {
+        return Ok(None);
+    };
+    if !is_orders_users_id_email_total(fields) {
+        return Ok(None);
+    }
+
+    let (store, catalog) = db.store_catalog();
+    if !store.orders_soa_ready() || !store.users_soa_ready() {
+        return Ok(None);
+    }
+    let to_field = catalog
+        .find_fk(name, on, right_col)
+        .map(|fk| fk.to_field.as_str())
+        .unwrap_or("id");
+    if to_field != "id" {
+        return Ok(None);
+    }
+
+    let total_gt = filter.and_then(pred_total_gt);
+    if filter.is_some() && total_gt.is_none() {
+        // Non-SoA filter — fall back to generic lazy join.
+        return Ok(None);
+    }
+
+    let take_left = match take_n {
+        Some(Some(n)) => Some(n.max(0) as usize),
+        Some(None) => None,
+        None => Some(50),
+    };
+
+    let n = store.orders_id().len();
+    let source = RowSource::Scan { len: n };
+
+    let users_id = store.users_id();
+    let mut probe: FxHashMap<Arc<str>, usize> = FxHashMap::default();
+    probe.reserve(users_id.len());
+    for (i, id) in users_id.iter().enumerate() {
+        probe.insert(Arc::clone(id), i);
+    }
+
+    Ok(Some(LazyJoinSoa {
+        source,
+        pos: 0,
+        left_join,
+        total_gt,
+        probe,
+        skip_left: skip_n,
+        take_left,
+        key_id: String::from("id"),
+        key_email: String::from("users.email"),
+        key_total: String::from("total"),
     }))
 }
 

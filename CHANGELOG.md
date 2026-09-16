@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.3.1] — 2026-09-16
+
+### Added
+
+- **m1 (opt-in):** feature `embed-ollama` → [`OllamaEmbedder`] (HTTP `/api/embeddings`);
+  feature `embed-onnx` → [`OnnxEmbedder`] (fastembed / ONNX Runtime). Same [`Embedder`]
+  trait; wire with `Db::with_embedder`. **Default remains [`HashingEmbedder`]**.
+- **m4:** `run_batch` columnar path for `filter? | project | skip* | take?`
+  (`try_filter_project_batch`) without row-map materialization; join path unchanged.
+
+### Performance
+
+- Join SoA (`orders ⋈ users`): probe by user index (no per-user `Vec<Cell>`); unrolled
+  hot project `{ id, users.email, total }` (~24% faster `join_inner/lin` on quick profile).
+- Lazy join cursor: SoA path for the same hot shape (`LazyJoinSoa`) — ~3.0 ms → ~1.7 ms
+  on `join_inner/lin_cursor`.
+- Materialize: compact `{ id, title }` row builder (`row_id_title`).
+
+### Honesty
+
+Neural backends are feature-gated and never the default. `search` / hybrid without
+`with_embedder` still use local hashing vec. ONNX first use may download model/
+runtime weights.
+
 ## [0.3.0] — 2026-09-15
 
 ### Stable API freeze

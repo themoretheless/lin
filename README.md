@@ -60,9 +60,9 @@ let _ = Queryable::from("docs").search_vec("wal shipping").take(5).to_vec(&mut d
 
 **Experimental (вне freeze):** `ship` (TCP WAL, без TLS), `RecordBatch` / `run_batch`, `Db::run_stmt`, `RowExt`. См. [CHANGELOG](CHANGELOG.md).
 
-**OLAP рядом с row-API:** `Db::run` / `Prepared::run` → `Vec<Row>`; `run_batch` → [`RecordBatch`] (колонки, experimental). Hot join `orders ⋈ users` идёт через SoA + batch; `run` материализует batch в row-maps.
+**OLAP рядом с row-API:** `Db::run` / `Prepared::run` → `Vec<Row>`; `run_batch` → [`RecordBatch`] (колонки, experimental). Columnar: `filter?|project|take` и hot join `orders ⋈ users` (SoA); иначе fallback в row-maps.
 
-Features: `derive`, `async` — в `default` (часть 0.3 контракта).
+Features: `derive`, `async` — в `default` (часть 0.3 контракта). Opt-in neural: `embed-ollama` (`OllamaEmbedder`), `embed-onnx` (`OnnxEmbedder`) — **не** default; hashing остаётся.
 
 `Db::reader()` — in-process снимок текущего `gen`. `open_read` — shared **FENCE** (можно рядом с writer; checkpoint ждёт readers). `export_wal_since` / `apply_wal` — ship WAL; **`apply_wal` на primary durable запрещён**; на **follower** (`open_follower` / `bootstrap_follower`) пишет frames в log и применяет (hot standby). In-memory `apply_wal` как раньше. `pin`/`unpin` — memory-pins. Snapshot: `LIN\x04` MessagePack self-contained; `cold/*.bin` — lazy mmap page-in.
 
@@ -150,9 +150,12 @@ rel cites
 | P3c live vec/hybrid | **готово** (hashing embedder + RRF; neural → `with_embedder`) |
 | **0.2.x ship + ops** | **готово** (критерии met: n1–n4 · tests · README recipe) |
 | **0.3** | **готово** — Queryable/cursor/FromRow/async в stable + CHANGELOG |
-| **0.4** | Neural embed · FTS postings · wider `run_batch` · lazy hop/search |
-| **0.5** | Optional ANN · wasm32 memory-only · TLS/auth/fanout (после скучного ship) |
+| **0.3.x** | m1 Neural embed features · m4 filter+project `run_batch` |
+| **0.4** | m2 FTS postings → m5 lazy hop/search (+ polish m1/m4) |
+| **0.5** | m3 ANN · m6 wasm32 · o1 TLS/auth/fanout (после скучного ship) |
 | **Не 0.x** | Multi-writer / полный MVCC / consensus · DuckDB как storage backend |
+
+Подробный план (чеклисты, файлы, риски): см. wiki `lin-roadmap` / canvas.
 
 ## Hot standby (recipe)
 

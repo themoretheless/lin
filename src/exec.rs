@@ -731,16 +731,22 @@ impl Db {
         })
     }
 
-    /// Columnar read path: FK join+project returns [`RecordBatch`] without row-maps.
+    /// Columnar read path: FK join+project or filter+project → [`RecordBatch`].
     pub fn run_prepared_batch(&mut self, prepared: &Prepared) -> Result<RecordBatch, Error> {
         if prepared.writes {
             return Err(Error::runtime("run_batch is read-only"));
         }
         if prepared.stmts.len() == 1
             && let Stmt::Query(q) = &prepared.stmts[0]
-            && let Some(batch) = self.try_join_project_batch(q, &Default::default(), now_ms())
         {
-            return Ok(batch);
+            let now = now_ms();
+            let bindings = Default::default();
+            if let Some(batch) = self.try_filter_project_batch(q, &bindings, now) {
+                return Ok(batch);
+            }
+            if let Some(batch) = self.try_join_project_batch(q, &bindings, now) {
+                return Ok(batch);
+            }
         }
         let h = self.run_prepared(prepared)?;
         Ok(rows_to_rough_batch(&h.rows))
@@ -939,11 +945,15 @@ impl ReadDb {
         }
         if prepared.stmts.len() == 1
             && let Stmt::Query(q) = &prepared.stmts[0]
-            && let Some(batch) =
-                self.inner
-                    .try_join_project_batch(q, &Default::default(), now_ms())
         {
-            return Ok(batch);
+            let now = now_ms();
+            let bindings = Default::default();
+            if let Some(batch) = self.inner.try_filter_project_batch(q, &bindings, now) {
+                return Ok(batch);
+            }
+            if let Some(batch) = self.inner.try_join_project_batch(q, &bindings, now) {
+                return Ok(batch);
+            }
         }
         let h = self.run_prepared(prepared)?;
         Ok(rows_to_rough_batch(&h.rows))
@@ -1844,6 +1854,128 @@ impl Db {
         Some(self.try_join_project_batch(q, bindings, now)?.to_rows())
     }
 
+    /// Columnar filter? + project + skip*/take? (no join). Prefer [`Self::run_prepared_batch`].
+    fn try_filter_project_batch(
+        &self,
+        q: &Query,
+        bindings: &BTreeMap<String, Vec<Row>>,
+        now: i64,
+    ) -> Option<RecordBatch> {
+        let Source::Collection(name) = &q.source else {
+            return None;
+        };
+        if bindings.get(name).is_some() {
+            return None;
+        }
+
+        let mut filter: Option<&Pred> = None;
+        let mut fields: Option<&[Field]> = None;
+        let mut explicit_take: Option<Option<i64>> = None;
+        let mut skip_n: usize = 0;
+
+        for step in &q.steps {
+            match step {
+                Step::Filter(p) => {
+                    if filter.is_some() || fields.is_some() {
+                        return None;
+                    }
+                    filter = Some(p);
+                }
+                Step::Project(f) => {
+                    if fields.is_some() {
+                        return None;
+                    }
+                    fields = Some(f.as_slice());
+                }
+                Step::Skip { n } => {
+                    if fields.is_none() {
+                        return None;
+                    }
+                    skip_n = skip_n.saturating_add((*n).max(0) as usize);
+                }
+                Step::Take { n } => {
+                    if fields.is_none() || explicit_take.is_some() {
+                        return None;
+                    }
+                    explicit_take = Some(*n);
+                }
+                _ => return None,
+            }
+        }
+
+        let fields = fields?;
+        let names = field_names(fields);
+        if names.is_empty() {
+            return None;
+        }
+
+        let (source, need_filter) = {
+            if let Some(pred) = filter {
+                if let Some(uses) = crate::index::pick_index(&self.catalog, name, pred)
+                    && let Some(idxs) = self.store.index_seek(name, &uses, now)
+                {
+                    let covered = crate::index::index_covers_pred(pred, &uses);
+                    (JoinLeftSource::Idxs(idxs), !covered)
+                } else {
+                    (
+                        JoinLeftSource::Scan {
+                            len: self.store.collection(name).len(),
+                        },
+                        true,
+                    )
+                }
+            } else {
+                (
+                    JoinLeftSource::Scan {
+                        len: self.store.collection(name).len(),
+                    },
+                    false,
+                )
+            }
+        };
+
+        let left_len = match &source {
+            JoinLeftSource::Idxs(i) => i.len(),
+            JoinLeftSource::Scan { len } => *len,
+        };
+        let names_arc: Arc<[String]> = names.clone().into();
+        let mut batch = RecordBatch::with_capacity(names_arc, left_len);
+        let mut pos = 0usize;
+        loop {
+            let idx = match &source {
+                JoinLeftSource::Idxs(idxs) => {
+                    if pos >= idxs.len() {
+                        break;
+                    }
+                    let i = idxs[pos];
+                    pos += 1;
+                    i
+                }
+                JoinLeftSource::Scan { len } => {
+                    if pos >= *len {
+                        break;
+                    }
+                    let i = pos;
+                    pos += 1;
+                    i
+                }
+            };
+            let Some(row) = self.store.get_by_idx(name, idx) else {
+                continue;
+            };
+            if need_filter
+                && let Some(pred) = filter
+                && !eval_pred(pred, row, now)
+            {
+                continue;
+            }
+            push_project_batch_row(&mut batch, row, &names);
+        }
+
+        finish_batch(&mut batch, skip_n, explicit_take);
+        Some(batch)
+    }
+
     /// Columnar FK join+project (OLAP). Prefer [`Self::run_prepared_batch`].
     fn try_join_project_batch(
         &self,
@@ -2028,18 +2160,11 @@ impl Db {
         let (right_fields, plan) = plan_join_fields("users", names);
         let users_id = self.store.users_id();
         let users_email = self.store.users_email();
-        let mut probe: FxHashMap<&str, Vec<Cell>> = FxHashMap::default();
+        // Index into SoA columns — avoid allocating Vec<Cell> per user on every run.
+        let mut probe: FxHashMap<&str, usize> = FxHashMap::default();
         probe.reserve(users_id.len());
         for i in 0..users_id.len() {
-            let cells: Vec<Cell> = right_fields
-                .iter()
-                .map(|f| match f.as_str() {
-                    "id" => Cell::Text(Arc::clone(&users_id[i])),
-                    "email" => Cell::Text(Arc::clone(&users_email[i])),
-                    _ => Cell::Null,
-                })
-                .collect();
-            probe.insert(users_id[i].as_ref(), cells);
+            probe.insert(users_id[i].as_ref(), i);
         }
 
         let orders_id = self.store.orders_id();
@@ -2065,7 +2190,72 @@ impl Db {
 
         let names_arc: Arc<[String]> = names.to_vec().into();
         let mut batch = RecordBatch::with_capacity(names_arc, n);
+
+        // Specialized: { id, users.email, total } — hottest bench / OLAP shape.
+        let fast_id_email_total = plan.len() == 3
+            && matches!(plan[0], JoinFieldPlan::Left(ref k) if k == "id")
+            && matches!(
+                plan[1],
+                JoinFieldPlan::Right { ref out, idx: 0 } if out == "users.email"
+                    || right_fields.first().is_some_and(|f| f == "email")
+            )
+            && matches!(plan[2], JoinFieldPlan::Left(ref k) if k == "total");
+
         let mut pos = 0usize;
+        if fast_id_email_total {
+            loop {
+                let idx = match &source {
+                    JoinLeftSource::Idxs(idxs) => {
+                        if pos >= idxs.len() {
+                            break;
+                        }
+                        let i = idxs[pos];
+                        pos += 1;
+                        i
+                    }
+                    JoinLeftSource::Scan { len } => {
+                        if pos >= *len {
+                            break;
+                        }
+                        let i = pos;
+                        pos += 1;
+                        i
+                    }
+                };
+                if idx >= n {
+                    continue;
+                }
+                if let Some(min) = total_gt {
+                    if !(orders_total[idx] > min) {
+                        continue;
+                    }
+                } else if need_row_filter
+                    && let Some(pred) = filter
+                {
+                    let Some(left_row) = self.store.get_by_idx("orders", idx) else {
+                        continue;
+                    };
+                    if !eval_pred(pred, left_row, now) {
+                        continue;
+                    }
+                }
+                let uid = orders_uid[idx].as_ref();
+                let Some(ui) = probe.get(uid).copied() else {
+                    if left_join {
+                        batch.cols[0].push(Cell::Text(Arc::clone(&orders_id[idx])));
+                        batch.cols[1].push(Cell::Null);
+                        batch.cols[2].push(Cell::Float(orders_total[idx]));
+                    }
+                    continue;
+                };
+                batch.cols[0].push(Cell::Text(Arc::clone(&orders_id[idx])));
+                batch.cols[1].push(Cell::Text(Arc::clone(&users_email[ui])));
+                batch.cols[2].push(Cell::Float(orders_total[idx]));
+            }
+            finish_batch(&mut batch, skip_n, explicit_take);
+            return Some(batch);
+        }
+
         loop {
             let idx = match &source {
                 JoinLeftSource::Idxs(idxs) => {
@@ -2104,8 +2294,8 @@ impl Db {
             }
 
             let uid = orders_uid[idx].as_ref();
-            let right_cells = probe.get(uid).map(|v| v.as_slice());
-            if right_cells.is_none() && !left_join {
+            let right_i = probe.get(uid).copied();
+            if right_i.is_none() && !left_join {
                 continue;
             }
 
@@ -2121,9 +2311,18 @@ impl Db {
                             .and_then(|r| r.get(k).cloned())
                             .unwrap_or(Cell::Null),
                     },
-                    JoinFieldPlan::Right { out: _, idx: ri } => right_cells
-                        .and_then(|r| r.get(*ri).cloned())
-                        .unwrap_or(Cell::Null),
+                    JoinFieldPlan::Right { out: _, idx: ri } => {
+                        let Some(ui) = right_i else {
+                            batch.cols[col_i].push(Cell::Null);
+                            continue;
+                        };
+                        let fname = right_fields.get(*ri).map(|s| s.as_str()).unwrap_or("");
+                        match fname {
+                            "id" => Cell::Text(Arc::clone(&users_id[ui])),
+                            "email" => Cell::Text(Arc::clone(&users_email[ui])),
+                            _ => Cell::Null,
+                        }
+                    }
                 };
                 batch.cols[col_i].push(cell);
             }
@@ -3047,6 +3246,12 @@ fn merge_join_row(mut left: Row, right: &Row, right_col: &str) -> Row {
     left
 }
 
+fn push_project_batch_row(batch: &mut RecordBatch, row: &Row, names: &[String]) {
+    for (col_i, name) in names.iter().enumerate() {
+        batch.cols[col_i].push(row.get(name).cloned().unwrap_or(Cell::Null));
+    }
+}
+
 fn push_join_batch_row(
     batch: &mut RecordBatch,
     left: &Row,
@@ -3084,7 +3289,8 @@ fn finish_batch(batch: &mut RecordBatch, skip_n: usize, explicit_take: Option<Op
     }
 }
 
-fn pred_total_gt(pred: &Pred) -> Option<f64> {
+/// `orders | total > N` — used by SoA join / cursor hot paths.
+pub(crate) fn pred_total_gt(pred: &Pred) -> Option<f64> {
     match pred {
         Pred::Cmp {
             field,
