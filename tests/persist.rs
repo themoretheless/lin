@@ -37,7 +37,10 @@ fn embedding_survives_durable_reopen() {
             .unwrap();
         assert_eq!(q.done.n, 1);
         assert!(
-            q.rows[0].get("embedding").and_then(|c| c.as_vec()).is_some(),
+            q.rows[0]
+                .get("embedding")
+                .and_then(|c| c.as_vec())
+                .is_some(),
             "insert should auto-embed"
         );
         // WAL path (before checkpoint): ship frames into a fresh memory db.
@@ -46,9 +49,7 @@ fn embedding_survives_durable_reopen() {
         let mut mem = Db::empty();
         assert_eq!(mem.apply_wal(&frames).unwrap(), 1);
         assert!(
-            mem.run(r#"docs | uri == "raw://emb""#)
-                .unwrap()
-                .rows[0]
+            mem.run(r#"docs | uri == "raw://emb""#).unwrap().rows[0]
                 .get("embedding")
                 .and_then(|c| c.as_vec())
                 .is_some()
@@ -435,9 +436,7 @@ fn backup_export_import_roundtrip() {
 
     let dir2 = tmp();
     let mut db2 = Db::import_backup_into(&bak, &dir2).unwrap();
-    let q = db2
-        .run(r#"docs | uri == "raw://bak" | { title }"#)
-        .unwrap();
+    let q = db2.run(r#"docs | uri == "raw://bak" | { title }"#).unwrap();
     assert_eq!(q.done.n, 1);
     db2.close().unwrap();
     let _ = fs::remove_dir_all(&dir);
@@ -459,18 +458,12 @@ fn reader_snapshot_is_frozen_and_read_only() {
         .unwrap();
     assert_eq!(db.stats().r#gen, 2);
     assert_eq!(snap.r#gen(), 1);
-    assert_eq!(
-        snap.run(r#"docs | uri == "raw://r2""#).unwrap().done.n,
-        0
-    );
+    assert_eq!(snap.run(r#"docs | uri == "raw://r2""#).unwrap().done.n, 0);
 
     let err = snap
         .run(r#"insert docs { uri: "raw://x", title: "X", layer: "wiki" }"#)
         .unwrap_err();
-    assert!(
-        err.to_string().contains("read-only"),
-        "{err}"
-    );
+    assert!(err.to_string().contains("read-only"), "{err}");
 }
 
 #[test]
@@ -563,20 +556,13 @@ fn writer_lock_rejects_second_open() {
     // open_read uses FENCE shared — compatible with live writer.
     let reader = Db::open_read(&dir).expect("open_read beside writer");
     assert_eq!(
-        reader
-            .run(r#"docs | uri == "raw://lock""#)
-            .unwrap()
-            .done
-            .n,
+        reader.run(r#"docs | uri == "raw://lock""#).unwrap().done.n,
         1
     );
     drop(reader);
     a.close().unwrap();
     let mut b = Db::open(&dir).unwrap();
-    assert_eq!(
-        b.run(r#"docs | uri == "raw://lock""#).unwrap().done.n,
-        1
-    );
+    assert_eq!(b.run(r#"docs | uri == "raw://lock""#).unwrap().done.n, 1);
     b.close().unwrap();
     let _ = fs::remove_dir_all(&dir);
 }
@@ -617,10 +603,7 @@ fn sync_normal_survives_checkpoint() {
         db.close().unwrap();
     }
     let mut db = Db::open(&dir).unwrap();
-    assert_eq!(
-        db.run(r#"docs | uri == "raw://n""#).unwrap().done.n,
-        1
-    );
+    assert_eq!(db.run(r#"docs | uri == "raw://n""#).unwrap().done.n, 1);
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -680,10 +663,7 @@ fn wal_export_apply_roundtrip() {
         let mut b = Db::empty();
         let n = b.apply_wal(&frames).unwrap();
         assert_eq!(n, 1);
-        assert_eq!(
-            b.run(r#"docs | uri == "raw://w""#).unwrap().done.n,
-            1
-        );
+        assert_eq!(b.run(r#"docs | uri == "raw://w""#).unwrap().done.n, 1);
         // Durable primary apply refused.
         let mut durable = Db::open(&tmp()).unwrap();
         assert!(durable.apply_wal(&frames).is_err());
@@ -782,10 +762,7 @@ fn follower_rejects_wal_gap() {
         let mut other = Db::open_follower(tmp()).unwrap();
         // other at gen 0; frames start at gen after primary reopen (not 1).
         let err = other.apply_wal(&frames).unwrap_err();
-        assert!(
-            err.to_string().contains("gap"),
-            "expected gap, got {err}"
-        );
+        assert!(err.to_string().contains("gap"), "expected gap, got {err}");
         other.close().unwrap();
         primary.close().unwrap();
     }
@@ -828,11 +805,7 @@ fn ship_tcp_follower_sync() {
     let n = follower.apply_wal(&frames).unwrap();
     assert_eq!(n, 1);
     assert_eq!(
-        follower
-            .run(r#"docs | uri == "raw://s1""#)
-            .unwrap()
-            .done
-            .n,
+        follower.run(r#"docs | uri == "raw://s1""#).unwrap().done.n,
         1
     );
     follower.close().unwrap();

@@ -24,10 +24,10 @@ use std::collections::HashMap;
 use std::hint::black_box;
 use std::time::Duration;
 
-use mysql::prelude::Queryable;
 use airbug_bench::{Config, DropPolicy, Fixture, Suite};
-use lin::query::pred;
 use lin::Queryable as LinQueryable;
+use lin::query::pred;
+use mysql::prelude::Queryable;
 
 const N: usize = 10_000;
 const INSERT_1K: usize = 1_000;
@@ -307,10 +307,8 @@ fn seed_duck(n: usize) -> DuckWarm {
             .prepare("INSERT INTO docs (id, uri, wing, title, ts, body) VALUES (?,?,?,?,?,?)")
             .expect("duck prepare");
         for d in &rows {
-            stmt.execute(duckdb::params![
-                d.id, d.uri, d.wing, d.title, d.ts, d.body
-            ])
-            .expect("duck seed");
+            stmt.execute(duckdb::params![d.id, d.uri, d.wing, d.title, d.ts, d.body])
+                .expect("duck seed");
         }
     }
     DuckWarm {
@@ -366,10 +364,7 @@ fn seed_pg(n: usize, mut client: postgres::Client) -> PgWarm {
             .expect("pg prepare insert");
         for d in &rows {
             client
-                .execute(
-                    &stmt,
-                    &[&d.id, &d.uri, &d.wing, &d.title, &d.ts, &d.body],
-                )
+                .execute(&stmt, &[&d.id, &d.uri, &d.wing, &d.title, &d.ts, &d.body])
                 .expect("pg seed");
         }
     }
@@ -430,11 +425,8 @@ fn seed_mysql(n: usize, mut conn: mysql::Conn) -> MysqlWarm {
             .prep("INSERT INTO docs (id, uri, wing, title, ts, body) VALUES (?,?,?,?,?,?)")
             .expect("mysql prepare insert");
         for d in &rows {
-            conn.exec_drop(
-                &stmt,
-                (&d.id, &d.uri, &d.wing, &d.title, d.ts, &d.body),
-            )
-            .expect("mysql seed");
+            conn.exec_drop(&stmt, (&d.id, &d.uri, &d.wing, &d.title, d.ts, &d.body))
+                .expect("mysql seed");
         }
     }
     let point_get = conn
@@ -763,10 +755,8 @@ fn seed_join_mysql(mut conn: mysql::Conn) -> JoinMysql {
         .expect("mysql drop orders");
     conn.query_drop("DROP TABLE IF EXISTS users")
         .expect("mysql drop users");
-    conn.query_drop(
-        "CREATE TABLE users (id VARCHAR(64) PRIMARY KEY, email VARCHAR(255) NOT NULL)",
-    )
-    .expect("mysql users");
+    conn.query_drop("CREATE TABLE users (id VARCHAR(64) PRIMARY KEY, email VARCHAR(255) NOT NULL)")
+        .expect("mysql users");
     conn.query_drop(
         "CREATE TABLE orders (
             id VARCHAR(64) PRIMARY KEY,
@@ -937,10 +927,8 @@ fn fill_duck(conn: &duckdb::Connection, n: usize) {
         .prepare("INSERT INTO docs (id, uri, wing, title, ts, body) VALUES (?,?,?,?,?,?)")
         .expect("prepare");
     for d in &rows {
-        stmt.execute(duckdb::params![
-            d.id, d.uri, d.wing, d.title, d.ts, d.body
-        ])
-        .expect("insert");
+        stmt.execute(duckdb::params![d.id, d.uri, d.wing, d.title, d.ts, d.body])
+            .expect("insert");
     }
 }
 
@@ -953,27 +941,23 @@ fn fill_pg(client: &mut postgres::Client, n: usize) {
         )
         .expect("pg prepare");
     for d in &rows {
-        tx.execute(
-            &stmt,
-            &[&d.id, &d.uri, &d.wing, &d.title, &d.ts, &d.body],
-        )
-        .expect("pg insert");
+        tx.execute(&stmt, &[&d.id, &d.uri, &d.wing, &d.title, &d.ts, &d.body])
+            .expect("pg insert");
     }
     tx.commit().expect("pg commit");
 }
 
 fn fill_mysql(conn: &mut mysql::Conn, n: usize) {
     let rows = docs(n);
-    let mut tx = conn.start_transaction(mysql::TxOpts::default()).expect("mysql tx");
+    let mut tx = conn
+        .start_transaction(mysql::TxOpts::default())
+        .expect("mysql tx");
     let stmt = tx
         .prep("INSERT INTO docs_bulk (id, uri, wing, title, ts, body) VALUES (?,?,?,?,?,?)")
         .expect("mysql prepare");
     for d in &rows {
-        tx.exec_drop(
-            &stmt,
-            (&d.id, &d.uri, &d.wing, &d.title, d.ts, &d.body),
-        )
-        .expect("mysql insert");
+        tx.exec_drop(&stmt, (&d.id, &d.uri, &d.wing, &d.title, d.ts, &d.body))
+            .expect("mysql insert");
     }
     tx.commit().expect("mysql commit");
 }
@@ -1045,14 +1029,8 @@ fn setup_lin_durable_append(n: usize) -> LinDurableAppend {
 
 fn setup_lin_durable_append_sync(n: usize, sync: lin::SyncMode) -> LinDurableAppend {
     let dir = fresh_tmp("append");
-    let mut db = lin::Db::open_with(
-        &dir.0,
-        lin::OpenOpts {
-            sync,
-            cold: false,
-        },
-    )
-    .expect("lin durable open");
+    let mut db =
+        lin::Db::open_with(&dir.0, lin::OpenOpts { sync, cold: false }).expect("lin durable open");
     let prepared = db
         .prepare(&lin_append_log_src(n))
         .expect("lin prepare durable append");
@@ -1339,9 +1317,8 @@ fn main() -> airbug_bench::Result<()> {
     let pg = connect_pg();
     let mysql = connect_mysql();
 
-    let mut engines = String::from(
-        "Lin | SQLite(rusqlite bundled) | DuckDB(bundled) | HashMap(point get only)",
-    );
+    let mut engines =
+        String::from("Lin | SQLite(rusqlite bundled) | DuckDB(bundled) | HashMap(point get only)");
     if let Some((ref url, _)) = pg {
         engines.push_str(&format!(" | Postgres({url})"));
     } else {
@@ -1372,17 +1349,11 @@ fn main() -> airbug_bench::Result<()> {
     let duck = Fixture::new(|| seed_duck(N));
     let map = Fixture::new(|| seed_map(N));
     let (pg_fix, pg_url) = match pg {
-        Some((url, client)) => (
-            Some(Fixture::new(move || seed_pg(N, client))),
-            Some(url),
-        ),
+        Some((url, client)) => (Some(Fixture::new(move || seed_pg(N, client))), Some(url)),
         None => (None, None),
     };
     let (mysql_fix, mysql_url) = match mysql {
-        Some((url, conn)) => (
-            Some(Fixture::new(move || seed_mysql(N, conn))),
-            Some(url),
-        ),
+        Some((url, conn)) => (Some(Fixture::new(move || seed_mysql(N, conn))), Some(url)),
         None => (None, None),
     };
 
@@ -1475,9 +1446,7 @@ fn main() -> airbug_bench::Result<()> {
 
     suite
         .bench_fixture("filter_eq/lin", lin.clone(), |s| {
-            black_box(lin_hits(
-                &s.filter_eq.run(&mut s.db).expect("lin filter"),
-            ))
+            black_box(lin_hits(&s.filter_eq.run(&mut s.db).expect("lin filter")))
         })
         .tag("filter_eq")
         .tag("lin")
@@ -1537,9 +1506,7 @@ fn main() -> airbug_bench::Result<()> {
 
     suite
         .bench_fixture("filter_range/lin", lin.clone(), |s| {
-            black_box(lin_hits(
-                &s.filter_range.run(&mut s.db).expect("lin range"),
-            ))
+            black_box(lin_hits(&s.filter_range.run(&mut s.db).expect("lin range")))
         })
         .tag("filter_range")
         .tag("lin")
@@ -1607,9 +1574,7 @@ fn main() -> airbug_bench::Result<()> {
 
     suite
         .bench_fixture("text_substr/lin", lin.clone(), |s| {
-            black_box(lin_hits(
-                &s.text_substr.run(&mut s.db).expect("lin ~"),
-            ))
+            black_box(lin_hits(&s.text_substr.run(&mut s.db).expect("lin ~")))
         })
         .tag("text_substr")
         .tag("lin")
@@ -1715,10 +1680,7 @@ fn main() -> airbug_bench::Result<()> {
     if let Some(pg) = pg_fix {
         suite
             .bench_fixture("materialize/postgres", pg, |s| {
-                let rows = s
-                    .client
-                    .query(&s.materialize, &[])
-                    .expect("pg mat");
+                let rows = s.client.query(&s.materialize, &[]).expect("pg mat");
                 let mut n = 0usize;
                 for row in rows {
                     let id: String = row.get(0);
@@ -1735,10 +1697,8 @@ fn main() -> airbug_bench::Result<()> {
     if let Some(mysql) = mysql_fix {
         suite
             .bench_fixture("materialize/mysql", mysql, |s| {
-                let rows: Vec<(String, String)> = s
-                    .conn
-                    .exec(&s.materialize, ())
-                    .expect("mysql mat");
+                let rows: Vec<(String, String)> =
+                    s.conn.exec(&s.materialize, ()).expect("mysql mat");
                 let mut n = 0usize;
                 for (id, title) in rows {
                     black_box((id, title));
@@ -2246,8 +2206,7 @@ fn run_suite(mut suite: Suite<'_>, args: &[String]) -> airbug_bench::Result<()> 
         let dir = std::path::Path::new(p);
         if let Some(parent) = dir.parent() {
             if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| airbug_bench::error(e.to_string()))?;
+                std::fs::create_dir_all(parent).map_err(|e| airbug_bench::error(e.to_string()))?;
             }
         }
         if !dir.exists() {
@@ -2311,11 +2270,8 @@ fn run_suite(mut suite: Suite<'_>, args: &[String]) -> airbug_bench::Result<()> 
                 dir.display()
             )));
         }
-        std::fs::write(
-            &run_path,
-            serde_json::to_string_pretty(&run)?,
-        )
-        .map_err(|e| airbug_bench::error(e.to_string()))?;
+        std::fs::write(&run_path, serde_json::to_string_pretty(&run)?)
+            .map_err(|e| airbug_bench::error(e.to_string()))?;
         let html = airbug_bench::report::html_run(&run)?;
         std::fs::write(dir.join("report.html"), html)
             .map_err(|e| airbug_bench::error(e.to_string()))?;

@@ -22,9 +22,7 @@ impl RecordBatch {
 
     pub fn with_capacity(names: impl Into<Arc<[String]>>, cap: usize) -> Self {
         let names = names.into();
-        let cols = (0..names.len())
-            .map(|_| Vec::with_capacity(cap))
-            .collect();
+        let cols = (0..names.len()).map(|_| Vec::with_capacity(cap)).collect();
         Self { names, cols }
     }
 

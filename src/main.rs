@@ -213,9 +213,7 @@ fn with_data<T>(
         }
         None => {
             if follower {
-                return Err(lin::Error::runtime(
-                    "--follower requires --data <dir>",
-                ));
+                return Err(lin::Error::runtime("--follower requires --data <dir>"));
             }
             f(None)
         }
@@ -375,7 +373,10 @@ fn cmd_wal_serve(args: &[String], data: Option<PathBuf>) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let addr = listener.local_addr().map(|a| a.to_string()).unwrap_or(listen);
+    let addr = listener
+        .local_addr()
+        .map(|a| a.to_string())
+        .unwrap_or(listen);
     eprintln!("wal-serve {} on {addr} (writer lock held)", dir.display());
     match Db::open(&dir) {
         Ok(db) => match lin::ship::serve_blocking(&db, listener) {
@@ -467,9 +468,7 @@ fn cmd_follower(args: &[String], data: Option<PathBuf>) -> ExitCode {
         }
         Some("sync") => {
             let Some(dir) = data else {
-                eprintln!(
-                    "usage: lin --data <dir> follower sync --from HOST:PORT [--loop SECS]"
-                );
+                eprintln!("usage: lin --data <dir> follower sync --from HOST:PORT [--loop SECS]");
                 return ExitCode::from(2);
             };
             let mut from: Option<String> = None;
@@ -507,9 +506,7 @@ fn cmd_follower(args: &[String], data: Option<PathBuf>) -> ExitCode {
                 }
             }
             let Some(addr) = from else {
-                eprintln!(
-                    "usage: lin --data <dir> follower sync --from HOST:PORT [--loop SECS]"
-                );
+                eprintln!("usage: lin --data <dir> follower sync --from HOST:PORT [--loop SECS]");
                 return ExitCode::from(2);
             };
             loop {

@@ -311,10 +311,7 @@ pub fn acquire_reader_lock(dir: &Path) -> Result<File, Error> {
             .open(&path)
             .map_err(io_err)?;
     }
-    let f = OpenOptions::new()
-        .read(true)
-        .open(&path)
-        .map_err(io_err)?;
+    let f = OpenOptions::new().read(true).open(&path).map_err(io_err)?;
     flock_nb(&f, false).map_err(|e| {
         if e.kind() == io::ErrorKind::WouldBlock {
             Error::runtime("data dir checkpoint in progress")
@@ -912,7 +909,9 @@ fn take_str(buf: &[u8], i: &mut usize) -> Result<String, ()> {
     if *i + n > buf.len() {
         return Err(());
     }
-    let s = std::str::from_utf8(&buf[*i..*i + n]).map_err(|_| ())?.to_string();
+    let s = std::str::from_utf8(&buf[*i..*i + n])
+        .map_err(|_| ())?
+        .to_string();
     *i += n;
     Ok(s)
 }
@@ -1015,7 +1014,8 @@ fn decode_v2(buf: &[u8]) -> Result<LogRecord, ()> {
                             if i + 4 > buf.len() {
                                 return Err(());
                             }
-                            let dim = u32::from_le_bytes(buf[i..i + 4].try_into().unwrap()) as usize;
+                            let dim =
+                                u32::from_le_bytes(buf[i..i + 4].try_into().unwrap()) as usize;
                             i += 4;
                             if dim == 0 {
                                 v.push(None);
@@ -1297,7 +1297,9 @@ pub fn cols_to_rows(fields: &[String], cols: &[ColData], n: usize) -> Vec<crate:
         let mut row = crate::store::Row::new();
         for (fi, f) in fields.iter().enumerate() {
             let cell = match cols.get(fi) {
-                Some(ColData::Text(v)) => Cell::text_arc(v.get(i).map(String::as_str).unwrap_or("")),
+                Some(ColData::Text(v)) => {
+                    Cell::text_arc(v.get(i).map(String::as_str).unwrap_or(""))
+                }
                 Some(ColData::Int(v)) => Cell::Int(v.get(i).copied().unwrap_or(0)),
                 Some(ColData::Float(v)) => Cell::Float(v.get(i).copied().unwrap_or(0.0)),
                 Some(ColData::Bool(v)) => Cell::Bool(v.get(i).copied().unwrap_or(false)),

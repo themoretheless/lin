@@ -101,10 +101,7 @@ impl AsyncDb {
         spawn_cursor_or_run(read, CursorJob::Src(src))
     }
 
-    pub async fn stream_stmt(
-        &self,
-        stmt: Stmt,
-    ) -> impl Stream<Item = Result<Row, Error>> + Send {
+    pub async fn stream_stmt(&self, stmt: Stmt) -> impl Stream<Item = Result<Row, Error>> + Send {
         let read = self.snapshot().await;
         spawn_cursor_or_run(read, CursorJob::Stmt(stmt))
     }
@@ -122,10 +119,7 @@ impl AsyncDb {
         q: Queryable,
     ) -> impl Stream<Item = Result<T, Error>> + Send {
         let read = self.snapshot().await;
-        typed_map_stream(spawn_cursor_or_run(
-            read,
-            CursorJob::Query(q.into_query()),
-        ))
+        typed_map_stream(spawn_cursor_or_run(read, CursorJob::Query(q.into_query())))
     }
 
     pub fn reader(&self) -> impl std::future::Future<Output = AsyncReadDb> + '_ {
@@ -187,10 +181,7 @@ impl AsyncReadDb {
         spawn_cursor_or_run(self.inner.clone(), CursorJob::Src(src.into()))
     }
 
-    pub async fn stream_stmt(
-        &self,
-        stmt: Stmt,
-    ) -> impl Stream<Item = Result<Row, Error>> + Send {
+    pub async fn stream_stmt(&self, stmt: Stmt) -> impl Stream<Item = Result<Row, Error>> + Send {
         spawn_cursor_or_run(self.inner.clone(), CursorJob::Stmt(stmt))
     }
 

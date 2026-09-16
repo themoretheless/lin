@@ -1,8 +1,6 @@
 //! Fluent deferred query builder (IQueryable-style) over Lin AST.
 
-use crate::ast::{
-    CmpOp, Field, MatchHop, Pred, Query, SearchMode, Source, Stmt, Step, Value,
-};
+use crate::ast::{CmpOp, Field, MatchHop, Pred, Query, SearchMode, Source, Step, Stmt, Value};
 use crate::error::Error;
 use crate::exec::{Db, Handle, ReadDb};
 use crate::graph::GraphFmt;

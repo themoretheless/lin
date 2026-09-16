@@ -159,10 +159,7 @@ mod tests {
         let mut mem = Db::empty();
         let n = mem.apply_wal(&frames).unwrap();
         assert_eq!(n, 1);
-        assert_eq!(
-            mem.run(r#"docs | uri == "raw://ship""#).unwrap().done.n,
-            1
-        );
+        assert_eq!(mem.run(r#"docs | uri == "raw://ship""#).unwrap().done.n, 1);
 
         handle.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);

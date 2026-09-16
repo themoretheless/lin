@@ -27,10 +27,7 @@ pub struct HashingEmbedder {
 impl HashingEmbedder {
     pub fn new(id: impl Into<String>, dim: usize) -> Self {
         let dim = dim.max(8);
-        Self {
-            id: id.into(),
-            dim,
-        }
+        Self { id: id.into(), dim }
     }
 
     /// Parse `name/dim` (e.g. `nomic-embed-text/768`); default dim 768.

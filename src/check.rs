@@ -160,7 +160,12 @@ fn check_in(stmt: &Stmt, cat: &Catalog, env: &Bindings) -> Result<(), Error> {
         Stmt::IdbSlice { query } => {
             check_query(query, cat, env)?;
         }
-        Stmt::IdbPull { .. } | Stmt::IdbPush | Stmt::Snapshot { .. } | Stmt::Restore { .. } | Stmt::Pin { .. } | Stmt::Unpin { .. } => {}
+        Stmt::IdbPull { .. }
+        | Stmt::IdbPush
+        | Stmt::Snapshot { .. }
+        | Stmt::Restore { .. }
+        | Stmt::Pin { .. }
+        | Stmt::Unpin { .. } => {}
     }
     Ok(())
 }

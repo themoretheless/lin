@@ -38,10 +38,9 @@ impl OnnxEmbedder {
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(model_dim_hint(&model))
             .max(8);
-        let inner = TextEmbedding::try_new(
-            InitOptions::new(model).with_show_download_progress(false),
-        )
-        .map_err(|e| Error::runtime(format!("onnx embedder: {e}")))?;
+        let inner =
+            TextEmbedding::try_new(InitOptions::new(model).with_show_download_progress(false))
+                .map_err(|e| Error::runtime(format!("onnx embedder: {e}")))?;
         Ok(Self {
             id,
             dim,
@@ -51,10 +50,7 @@ impl OnnxEmbedder {
 
     /// Convenience: All-MiniLM-L6-v2 (384-d) under embed_id `all-minilm-l6-v2/384`.
     pub fn all_minilm_l6_v2() -> Result<Self, Error> {
-        Self::try_new(
-            EmbeddingModel::AllMiniLML6V2,
-            "all-minilm-l6-v2/384",
-        )
+        Self::try_new(EmbeddingModel::AllMiniLML6V2, "all-minilm-l6-v2/384")
     }
 }
 

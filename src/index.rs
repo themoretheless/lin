@@ -276,11 +276,9 @@ fn index_covers_conjunct(pred: &Pred, use_: &IndexUse) -> bool {
                     return false;
                 }
             }
-            Pred::Cmp {
-                field,
-                op,
-                ..
-            } if matches!(op, CmpOp::Gt | CmpOp::Lt | CmpOp::Ge | CmpOp::Le) => {
+            Pred::Cmp { field, op, .. }
+                if matches!(op, CmpOp::Gt | CmpOp::Lt | CmpOp::Ge | CmpOp::Le) =>
+            {
                 let Some((rf, rop, _)) = &use_.range else {
                     return false;
                 };
