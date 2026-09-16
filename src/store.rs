@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
@@ -14,6 +14,16 @@ use crate::index::LiveIndex;
 use crate::persist::{
     self, ColSnap, Head, IndexSnap, LogRecord, OpenMemOpts, Pack, Persist, RelSnap, Snapshot,
 };
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct StoreOpenPhases {
+    pub setup_ms: f64,
+    pub snapshot_ms: f64,
+    pub wal_ms: f64,
+    pub metadata_ms: f64,
+    pub indexes_ms: f64,
+    pub row_maps_ms: f64,
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "t", content = "v")]
@@ -262,14 +272,27 @@ impl Store {
         cat: &Catalog,
         opts: OpenMemOpts,
     ) -> Result<(Self, Persist), Error> {
+        let (store, persist, _) = Self::open_with_profiled(path, cat, opts)?;
+        Ok((store, persist))
+    }
+
+    pub(crate) fn open_with_profiled(
+        path: impl AsRef<Path>,
+        cat: &Catalog,
+        opts: OpenMemOpts,
+    ) -> Result<(Self, Persist, StoreOpenPhases), Error> {
+        let mut phases = StoreOpenPhases::default();
+        let phase = Instant::now();
         let dir = path.as_ref();
         persist::ensure_dir(dir)?;
         let lock = persist::acquire_writer_lock(dir)?;
         let fixture_hash = catalog_hash(cat);
+        phases.setup_ms = phase.elapsed().as_secs_f64() * 1000.0;
 
+        let phase = Instant::now();
         let snap = persist::read_snapshot(dir)?;
         let mut store = match &snap {
-            Some(s) => Self::from_snapshot(dir, s)?,
+            Some(s) => Self::from_snapshot_unindexed(dir, s)?,
             None => {
                 let embed = persist::read_head(dir)?
                     .map(|h| h.embed_id)
@@ -277,7 +300,16 @@ impl Store {
                 Self::empty(embed)
             }
         };
+        phases.snapshot_ms = phase.elapsed().as_secs_f64() * 1000.0;
 
+        let phase = Instant::now();
+        store.rebuild_indexes();
+        phases.indexes_ms = phase.elapsed().as_secs_f64() * 1000.0;
+        let phase = Instant::now();
+        store.rebuild_row_maps();
+        phases.row_maps_ms = phase.elapsed().as_secs_f64() * 1000.0;
+
+        let phase = Instant::now();
         let mut log = persist::open_log(dir)?;
         let min_gen = store.r#gen;
         let start = snap.as_ref().map(|s| s.log_offset).unwrap_or(0);
@@ -286,7 +318,9 @@ impl Store {
             Ok(())
         })?;
         persist::truncate_log(&mut log, end)?;
+        phases.wal_ms = phase.elapsed().as_secs_f64() * 1000.0;
 
+        let phase = Instant::now();
         let mut live = cat.clone();
         store.merge_extras_into(&mut live);
         let live_hash = catalog_hash(&live);
@@ -320,9 +354,8 @@ impl Store {
                 embed_id: store.embed_id.clone(),
             },
         )?;
+        phases.metadata_ms = phase.elapsed().as_secs_f64() * 1000.0;
 
-        store.rebuild_indexes();
-        store.rebuild_row_maps();
         let persist = Persist {
             dir: dir.to_path_buf(),
             log,
@@ -334,7 +367,7 @@ impl Store {
             cold: opts.cold,
             log_bytes: persist::log_len(dir).unwrap_or(0),
         };
-        Ok((store, persist))
+        Ok((store, persist, phases))
     }
 
     /// Read-only open: replay into memory, do not truncate log or write head.
@@ -343,6 +376,16 @@ impl Store {
         path: impl AsRef<Path>,
         cat: &Catalog,
     ) -> Result<(Self, std::fs::File), Error> {
+        let (store, lock, _) = Self::open_read_with_profiled(path, cat)?;
+        Ok((store, lock))
+    }
+
+    pub(crate) fn open_read_with_profiled(
+        path: impl AsRef<Path>,
+        cat: &Catalog,
+    ) -> Result<(Self, std::fs::File, StoreOpenPhases), Error> {
+        let mut phases = StoreOpenPhases::default();
+        let phase = Instant::now();
         let dir = path.as_ref();
         if !dir.exists() {
             return Err(Error::runtime(format!(
@@ -351,9 +394,11 @@ impl Store {
             )));
         }
         let lock = persist::acquire_reader_lock(dir)?;
+        phases.setup_ms = phase.elapsed().as_secs_f64() * 1000.0;
+        let phase = Instant::now();
         let snap = persist::read_snapshot(dir)?;
         let mut store = match &snap {
-            Some(s) => Self::from_snapshot(dir, s)?,
+            Some(s) => Self::from_snapshot_unindexed(dir, s)?,
             None => {
                 let embed = persist::read_head(dir)?
                     .map(|h| h.embed_id)
@@ -361,6 +406,14 @@ impl Store {
                 Self::empty(embed)
             }
         };
+        phases.snapshot_ms = phase.elapsed().as_secs_f64() * 1000.0;
+        let phase = Instant::now();
+        store.rebuild_indexes();
+        phases.indexes_ms = phase.elapsed().as_secs_f64() * 1000.0;
+        let phase = Instant::now();
+        store.rebuild_row_maps();
+        phases.row_maps_ms = phase.elapsed().as_secs_f64() * 1000.0;
+        let phase = Instant::now();
         let mut log = persist::open_log_read(dir)?;
         let min_gen = store.r#gen;
         let start = snap.as_ref().map(|s| s.log_offset).unwrap_or(0);
@@ -370,12 +423,18 @@ impl Store {
                 Ok(())
             })?;
         }
-        store.rebuild_indexes();
-        store.rebuild_row_maps();
-        Ok((store, lock))
+        phases.wal_ms = phase.elapsed().as_secs_f64() * 1000.0;
+        Ok((store, lock, phases))
     }
 
     pub(crate) fn from_snapshot(dir: &Path, s: &Snapshot) -> Result<Self, Error> {
+        let mut store = Self::from_snapshot_unindexed(dir, s)?;
+        store.rebuild_indexes();
+        store.rebuild_row_maps();
+        Ok(store)
+    }
+
+    fn from_snapshot_unindexed(dir: &Path, s: &Snapshot) -> Result<Self, Error> {
         let mut store = Self {
             r#gen: s.r#gen,
             embed_id: s.embed_id.clone(),
@@ -417,8 +476,6 @@ impl Store {
                 store.cold.insert(name.clone(), col);
             }
         }
-        store.rebuild_indexes();
-        store.rebuild_row_maps();
         Ok(store)
     }
 
@@ -751,6 +808,7 @@ impl Store {
         self.extra_indexes = b.extra_indexes;
         self.rebuild_indexes();
         self.rebuild_row_maps();
+        self.rebuild_all_fts_inplace();
     }
 
     /// Mark lengths for append-only rollback (insert/append packs).
@@ -777,6 +835,14 @@ impl Store {
         // full backup covers schema). Keep extras as-is for append-only path.
         self.rebuild_indexes();
         self.rebuild_row_maps();
+        self.rebuild_all_fts_inplace();
+    }
+
+    fn rebuild_all_fts_inplace(&mut self) {
+        let names = self.fts.keys().cloned().collect::<Vec<_>>();
+        for name in names {
+            self.rebuild_fts_inplace(&name);
+        }
     }
 
     pub fn fixture(cat: &Catalog) -> Self {

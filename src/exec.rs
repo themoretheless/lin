@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
@@ -114,8 +115,8 @@ pub struct Db {
     plan_cache: FxHashMap<String, Prepared>,
     /// Hard limits (local prod).
     quotas: Quotas,
-    /// Wall ms of last open / open_read (0 if in-memory).
-    reopen_ms: u64,
+    /// Detailed wall-time phases of last open / open_read.
+    reopen: ReopenPhases,
     /// Accumulated durable append/insert row counts and wall ms (for rows/s).
     append_rows: u64,
     append_ms: f64,
@@ -157,6 +158,33 @@ impl Default for Quotas {
 }
 
 /// Lightweight store counters (stable in 0.2+).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ReopenPhases {
+    pub total_ms: f64,
+    pub setup_ms: f64,
+    pub snapshot_ms: f64,
+    pub wal_ms: f64,
+    pub metadata_ms: f64,
+    pub indexes_ms: f64,
+    pub row_maps_ms: f64,
+    pub fts_ms: f64,
+}
+
+impl From<crate::store::StoreOpenPhases> for ReopenPhases {
+    fn from(value: crate::store::StoreOpenPhases) -> Self {
+        Self {
+            setup_ms: value.setup_ms,
+            snapshot_ms: value.snapshot_ms,
+            wal_ms: value.wal_ms,
+            metadata_ms: value.metadata_ms,
+            indexes_ms: value.indexes_ms,
+            row_maps_ms: value.row_maps_ms,
+            ..Self::default()
+        }
+    }
+}
+
+/// Lightweight store counters (stable in 0.2+).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Stats {
     pub r#gen: u64,
@@ -166,6 +194,7 @@ pub struct Stats {
     pub next_id: u64,
     pub log_bytes: u64,
     pub reopen_ms: u64,
+    pub reopen: ReopenPhases,
     pub append_rows: u64,
     pub append_ms: f64,
     pub writes_since_snapshot: u32,
@@ -200,7 +229,7 @@ impl Db {
             reader_lock: None,
             plan_cache: FxHashMap::default(),
             quotas: Quotas::default(),
-            reopen_ms: 0,
+            reopen: ReopenPhases::default(),
             append_rows: 0,
             append_ms: 0.0,
             pins: BTreeMap::new(),
@@ -266,10 +295,9 @@ impl Db {
     pub fn open_with(path: impl AsRef<Path>, opts: OpenOpts) -> Result<Self, Error> {
         let t0 = Instant::now();
         let catalog = crate::catalog::fixture();
-        let (store, persist) = Store::open_with(path, &catalog, opts)?;
+        let (store, persist, store_phases) = Store::open_with_profiled(path, &catalog, opts)?;
         let mut catalog = catalog;
         store.merge_extras_into(&mut catalog);
-        let reopen_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let embedder = Self::default_embedder(&catalog);
         let mut db = Self {
             catalog,
@@ -278,7 +306,7 @@ impl Db {
             reader_lock: None,
             plan_cache: FxHashMap::default(),
             quotas: Quotas::default(),
-            reopen_ms: reopen_ms as u64,
+            reopen: store_phases.into(),
             append_rows: 0,
             append_ms: 0.0,
             pins: BTreeMap::new(),
@@ -286,7 +314,10 @@ impl Db {
             follower: false,
             embedder: Some(embedder),
         };
+        let phase = Instant::now();
         db.store.rebuild_fts(&db.catalog);
+        db.reopen.fts_ms = phase.elapsed().as_secs_f64() * 1000.0;
+        db.reopen.total_ms = t0.elapsed().as_secs_f64() * 1000.0;
         Ok(db)
     }
 
@@ -343,10 +374,9 @@ impl Db {
     pub fn open_read(path: impl AsRef<Path>) -> Result<ReadDb, Error> {
         let t0 = Instant::now();
         let catalog = crate::catalog::fixture();
-        let (store, lock) = Store::open_read_with(path, &catalog)?;
+        let (store, lock, store_phases) = Store::open_read_with_profiled(path, &catalog)?;
         let mut catalog = catalog;
         store.merge_extras_into(&mut catalog);
-        let reopen_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let embedder = Self::default_embedder(&catalog);
         let mut inner = Self {
             catalog,
@@ -355,7 +385,7 @@ impl Db {
             reader_lock: Some(lock),
             plan_cache: FxHashMap::default(),
             quotas: Quotas::default(),
-            reopen_ms: reopen_ms as u64,
+            reopen: store_phases.into(),
             append_rows: 0,
             append_ms: 0.0,
             pins: BTreeMap::new(),
@@ -363,7 +393,10 @@ impl Db {
             follower: false,
             embedder: Some(embedder),
         };
+        let phase = Instant::now();
         inner.store.rebuild_fts(&inner.catalog);
+        inner.reopen.fts_ms = phase.elapsed().as_secs_f64() * 1000.0;
+        inner.reopen.total_ms = t0.elapsed().as_secs_f64() * 1000.0;
         Ok(ReadDb {
             inner: Arc::new(inner),
         })
@@ -410,7 +443,7 @@ impl Db {
                 reader_lock: None,
                 plan_cache: FxHashMap::default(),
                 quotas: self.quotas,
-                reopen_ms: self.reopen_ms,
+                reopen: self.reopen,
                 append_rows: 0,
                 append_ms: 0.0,
                 pins: BTreeMap::new(),
@@ -515,7 +548,8 @@ impl Db {
             edges: self.store.edges.len(),
             next_id: self.store.next_id,
             log_bytes,
-            reopen_ms: self.reopen_ms,
+            reopen_ms: self.reopen.total_ms as u64,
+            reopen: self.reopen,
             append_rows: self.append_rows,
             append_ms: self.append_ms,
             writes_since_snapshot,
@@ -655,6 +689,23 @@ impl Db {
     pub fn run_stmts(&mut self, stmts: Vec<Stmt>) -> Result<Handle, Error> {
         let prepared = self.prepare_stmts(stmts)?;
         self.run_prepared(&prepared)
+    }
+
+    /// Execute independent source snippets atomically as one commit.
+    ///
+    /// On a durable [`SyncMode::Full`] database this emits one WAL frame and
+    /// performs one durability flush for the entire group. Any parse, check, or
+    /// runtime error rolls back the whole group.
+    pub fn run_group<I, S>(&mut self, sources: I) -> Result<Handle, Error>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut stmts = Vec::new();
+        for source in sources {
+            stmts.extend(parse::parse_program(source.as_ref())?);
+        }
+        self.run_stmts(stmts)
     }
 
     pub fn run_prepared(&mut self, prepared: &Prepared) -> Result<Handle, Error> {
@@ -1689,7 +1740,17 @@ impl Db {
             return Ok(None);
         };
 
-        let mut rows = self.search_fts(name, mode, query)?;
+        let limit = match take_n {
+            Some(Some(n)) => Some(n.max(0) as usize),
+            Some(None) => None,
+            None => Some(50),
+        };
+        let rank_limit = if mode == SearchMode::Lex {
+            limit.map(|n| n.saturating_add(skip_n))
+        } else {
+            None
+        };
+        let mut rows = self.search_fts(name, mode, query, rank_limit)?;
         if skip_n > 0 {
             if skip_n >= rows.len() {
                 rows.clear();
@@ -1697,11 +1758,6 @@ impl Db {
                 rows.drain(0..skip_n);
             }
         }
-        let limit = match take_n {
-            Some(Some(n)) => Some(n.max(0) as usize),
-            Some(None) => None,
-            None => Some(50),
-        };
         if let Some(n) = limit
             && rows.len() > n
         {
@@ -1718,26 +1774,13 @@ impl Db {
         collection: &str,
         mode: SearchMode,
         query: &str,
+        rank_limit: Option<usize>,
     ) -> Result<Vec<Row>, Error> {
         match mode {
-            SearchMode::Lex => {
-                let fts = self.store.fts.get(collection).unwrap();
-                let idxs = fts.candidate_idxs(query);
-                let col = self.store.collection(collection);
-                let mut scored: Vec<(i64, Row)> = idxs
-                    .into_iter()
-                    .filter_map(|i| {
-                        let r = col.get(i)?;
-                        let s = lex_score(r, query);
-                        if s > 0 { Some((s, r.clone())) } else { None }
-                    })
-                    .collect();
-                scored.sort_by_key(|a| std::cmp::Reverse(a.0));
-                Ok(scored.into_iter().map(|(_, r)| r).collect())
-            }
+            SearchMode::Lex => Ok(self.search_fts_lex(collection, query, rank_limit)),
             SearchMode::Hybrid => {
                 const RRF_K: f64 = 60.0;
-                let lex = self.search_fts(collection, SearchMode::Lex, query)?;
+                let lex = self.search_fts(collection, SearchMode::Lex, query, None)?;
                 let all = self.store.collection(collection);
                 let vec = self.search_rows(all, SearchMode::Vec, query)?;
                 let mut scores: BTreeMap<String, f64> = BTreeMap::new();
@@ -1767,6 +1810,57 @@ impl Db {
             }
             SearchMode::Vec => self.search_rows(self.store.collection(collection), mode, query),
         }
+    }
+
+    fn search_fts_lex(&self, collection: &str, query: &str, rank_limit: Option<usize>) -> Vec<Row> {
+        if rank_limit == Some(0) {
+            return Vec::new();
+        }
+        let fts = self
+            .store
+            .fts
+            .get(collection)
+            .expect("checked FTS collection");
+        let idxs = fts.candidate_idxs(query);
+        let col = self.store.collection(collection);
+        let query = LexQuery::new(query);
+
+        let mut scored = match rank_limit {
+            Some(k) => {
+                // The max-heap root is the worst retained result:
+                // lower score first, then larger row index. This preserves the
+                // old stable ordering (score desc, source row index asc).
+                let mut heap: BinaryHeap<(Reverse<i64>, usize)> =
+                    BinaryHeap::with_capacity(k.saturating_add(1));
+                for i in idxs {
+                    let Some(row) = col.get(i) else { continue };
+                    let score = lex_score_prepared(row, &query);
+                    if score == 0 {
+                        continue;
+                    }
+                    heap.push((Reverse(score), i));
+                    if heap.len() > k {
+                        heap.pop();
+                    }
+                }
+                heap.into_iter()
+                    .map(|(Reverse(score), i)| (score, i))
+                    .collect::<Vec<_>>()
+            }
+            None => idxs
+                .into_iter()
+                .filter_map(|i| {
+                    let row = col.get(i)?;
+                    let score = lex_score_prepared(row, &query);
+                    (score > 0).then_some((score, i))
+                })
+                .collect(),
+        };
+        scored.sort_unstable_by(|(sa, ia), (sb, ib)| sb.cmp(sa).then_with(|| ia.cmp(ib)));
+        scored
+            .into_iter()
+            .filter_map(|(_, i)| col.get(i).cloned())
+            .collect()
     }
 
     /// `col | pred | count` / `count by f` — no row materialization when possible.
@@ -2875,10 +2969,11 @@ impl Db {
         }
         match mode {
             SearchMode::Lex => {
+                let query = LexQuery::new(query);
                 let mut scored: Vec<(i64, Row)> = rows
                     .iter()
                     .filter_map(|r| {
-                        let s = lex_score(r, query);
+                        let s = lex_score_prepared(r, &query);
                         if s > 0 { Some((s, r.clone())) } else { None }
                     })
                     .collect();
@@ -2966,7 +3061,7 @@ impl Db {
         Ok(n)
     }
 
-    fn maybe_embed_row(&self, collection: &str, row: &mut Row) {
+    fn maybe_embed_rows(&self, collection: &str, rows: &mut [Row]) {
         let Some(emb) = self.embedder.as_ref() else {
             return;
         };
@@ -2977,14 +3072,29 @@ impl Db {
         {
             return;
         }
-        if row.get("embedding").and_then(Cell::as_vec).is_some() {
-            return;
+
+        let mut row_idxs = Vec::with_capacity(rows.len());
+        let mut texts = Vec::with_capacity(rows.len());
+        for (i, row) in rows.iter().enumerate() {
+            if row.get("embedding").and_then(Cell::as_vec).is_some() {
+                continue;
+            }
+            let text = embed::row_embed_text(row);
+            if !text.is_empty() {
+                row_idxs.push(i);
+                texts.push(text);
+            }
         }
-        let text = embed::row_embed_text(row);
-        if text.is_empty() {
-            return;
+        let refs = texts.iter().map(String::as_str).collect::<Vec<_>>();
+        let mut vectors = emb.embed_batch(&refs);
+        if vectors.len() != row_idxs.len() {
+            // Keep third-party embedders with a broken batch implementation
+            // from silently leaving a partially embedded slab.
+            vectors = refs.iter().map(|text| emb.embed(text)).collect();
         }
-        row.insert("embedding".into(), Cell::Vec(emb.embed(&text)));
+        for (i, vector) in row_idxs.into_iter().zip(vectors) {
+            rows[i].insert("embedding".into(), Cell::Vec(vector));
+        }
     }
 
     #[allow(dead_code)]
@@ -3000,6 +3110,52 @@ impl Db {
         let to = value_text(to, now);
         let changed = self.store.append_edge_parts(rel, &from, &to);
         Ok((edge_row(rel, &from, &to), changed))
+    }
+
+    fn check_row_fks(&self, collection: &str, row: &Row) -> Result<(), Error> {
+        for fk in &self.catalog.fks {
+            if fk.from_col != collection {
+                continue;
+            }
+            let Some(val) = row_text(row, &fk.from_field) else {
+                continue;
+            };
+            if val.is_empty() {
+                continue;
+            }
+            if !self.fk_target_exists(&fk.to_col, &fk.to_field, val) {
+                return Err(Error::runtime(format!(
+                    "fk: {collection}.{} → {}.{} missing {val}",
+                    fk.from_field, fk.to_col, fk.to_field
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn fk_target_exists(&self, to_col: &str, to_field: &str, val: &str) -> bool {
+        if to_field == "id" {
+            return self.store.get_by_id(to_col, val).is_some();
+        }
+        self.store
+            .collection(to_col)
+            .iter()
+            .any(|r| row_text(r, to_field) == Some(val))
+    }
+
+    fn assert_unique_index(&self, collection: &str, fields: &[String]) -> Result<(), Error> {
+        let def = crate::catalog::IndexDef {
+            collection: collection.to_string(),
+            unique: true,
+            fields: fields.to_vec(),
+        };
+        let mut live = crate::index::LiveIndex::new(def);
+        for (i, row) in self.store.collection(collection).iter().enumerate() {
+            if let Err(e) = live.insert_at(i, row) {
+                return Err(Error::runtime(e));
+            }
+        }
+        Ok(())
     }
 
     fn insert_bulk(
@@ -3046,9 +3202,10 @@ impl Db {
                     return Err(Error::runtime(format!("duplicate uri: {uri}")));
                 }
             }
-            self.maybe_embed_row(collection, &mut row);
+            self.check_row_fks(collection, &row)?;
             built.push(row);
         }
+        self.maybe_embed_rows(collection, &mut built);
 
         let mut new_edges = Vec::new();
         if let Some(first) = built.first() {
@@ -3152,6 +3309,7 @@ impl Db {
                 row.insert("hash".into(), Cell::Text(content_hash_arc(&body)));
             }
             let updated = row.clone();
+            self.check_row_fks(collection, &updated)?;
             self.store.index_insert_row(collection, i, &updated)?;
             self.store.fts_insert_at(collection, i);
             out.push(updated);
@@ -3284,6 +3442,9 @@ impl Db {
                 unique,
                 fields,
             } => {
+                if *unique {
+                    self.assert_unique_index(collection, fields)?;
+                }
                 let pack = Pack::SchemaIndex {
                     collection: collection.clone(),
                     unique: *unique,
@@ -3782,7 +3943,21 @@ fn has_word(hay: &str, needle: &str, ci: bool) -> bool {
     false
 }
 
-fn lex_score(row: &Row, query: &str) -> i64 {
+struct LexQuery {
+    lower: String,
+    tokens: Vec<String>,
+}
+
+impl LexQuery {
+    fn new(query: &str) -> Self {
+        let lower = query.to_lowercase();
+        let tokens = lower.split_whitespace().map(str::to_owned).collect();
+        Self { lower, tokens }
+    }
+}
+
+#[inline]
+fn lex_score_prepared(row: &Row, query: &LexQuery) -> i64 {
     let mut blob = String::new();
     for k in ["title", "body", "snippet"] {
         if let Some(t) = row_text(row, k) {
@@ -3794,17 +3969,19 @@ fn lex_score(row: &Row, query: &str) -> i64 {
         return 0;
     }
     let blob_l = blob.to_lowercase();
-    let q_l = query.to_lowercase();
     let mut score = 0i64;
-    for tok in q_l.split_whitespace() {
+    for tok in &query.tokens {
         if blob_l.contains(tok) {
             score += 1;
-            if has_word(&blob, tok, true) {
+            if blob_l
+                .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .any(|word| word == tok)
+            {
                 score += 2;
             }
         }
     }
-    if !q_l.is_empty() && blob_l.contains(&q_l) {
+    if !query.lower.is_empty() && blob_l.contains(&query.lower) {
         score += 3;
     }
     score

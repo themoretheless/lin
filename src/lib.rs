@@ -79,14 +79,16 @@ pub use ast::{
     Stmt, Value,
 };
 pub use batch::RecordBatch;
-pub use cursor::QueryCursor;
+pub use cursor::{ProjectedRow, QueryCursor};
 pub use embed::{Embedder, HashingEmbedder};
 #[cfg(feature = "embed-ollama")]
 pub use embed_ollama::OllamaEmbedder;
 #[cfg(feature = "embed-onnx")]
 pub use embed_onnx::{EmbeddingModel, OnnxEmbedder};
 pub use error::Error;
-pub use exec::{Db, Done, Handle, OpenOpts, Prepared, Quotas, ReadDb, Stats, SyncMode};
+pub use exec::{
+    Db, Done, Handle, OpenOpts, Prepared, Quotas, ReadDb, ReopenPhases, Stats, SyncMode,
+};
 pub use graph::GraphFmt;
 pub use plan::Plan;
 pub use query::{BoundQueryable, IntoFieldList, MatchPath, Queryable};

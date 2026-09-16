@@ -8,7 +8,7 @@ Lin — язык своей локальной БД: пайпы, типизир�
 
 ## Стабильный API (0.3+)
 
-Публичный контракт: `Db::{empty,fixture,open,open_with,open_read,open_follower,open_follower_with,bootstrap_follower,close,checkpoint,run,prepare,explain_as,reader,export_backup,import_backup,import_backup_into,export_wal_since,apply_wal,stats,with_quotas,with_sync_mode,with_embedder}`, `ReadDb::{run,prepare,stats,clone}`, `Quotas`, `SyncMode`, `OpenOpts`, `Embedder` / `HashingEmbedder`, плюс `parse` / `compile` / `run` / `explain*`, типы `Handle` / `Done` / `Prepared` / `Error` / `Row` / `Cell` / `Store` / `Plan` / `Stats` / `VERSION`.
+Публичный контракт: `Db::{empty,fixture,open,open_with,open_read,open_follower,open_follower_with,bootstrap_follower,close,checkpoint,run,run_group,prepare,explain_as,reader,export_backup,import_backup,import_backup_into,export_wal_since,apply_wal,stats,with_quotas,with_sync_mode,with_embedder}`, `ReadDb::{run,prepare,stats,clone}`, `Quotas`, `SyncMode`, `OpenOpts`, `Embedder` / `HashingEmbedder`, плюс `parse` / `compile` / `run` / `explain*`, типы `Handle` / `Done` / `Prepared` / `Error` / `Row` / `ProjectedRow` / `Cell` / `Store` / `Plan` / `Stats` / `ReopenPhases` / `VERSION`.
 
 **Также stable:** `Queryable` / `BoundQueryable` / `query::pred`, `QueryCursor`, `FromRow` / `LinRow` / `FromCell` / `map_rows` / `cell_get`, feature `async` (default-on): `AsyncDb` / `AsyncReadDb` / `to_vec_async` / `stream_*` (`spawn_blocking`, не async storage).
 
@@ -32,13 +32,17 @@ let last = page1.last().unwrap().get("total").and_then(|c| c.as_f64()).unwrap();
 let page2 = db.from("orders").after("total", last).sort("total", false).take(20).to_vec()?;
 
 // Lazy cursor: filter|project|skip|take, FK join, hop d=1, search lex|hybrid|take
-let cur = Queryable::from("orders")
+let mut cur = Queryable::from("orders")
     .filter(pred::gt("total", 100.0))
     .join("users", "user_id")
     .select(["id", "users.email", "total"])
     .take(10)
     .cursor(&db)?;
 assert!(cur.is_lazy());
+while let Some(row) = cur.next_projected() {
+    let row = row?; // shared field schema + Vec<Cell>, no BTreeMap per row
+    let _email = row.get("users.email");
+}
 
 // hop depth=1 is lazy; match / hop depth>1 materialize
 let _ = Queryable::from("docs")
@@ -57,7 +61,7 @@ let _ = Queryable::from("docs").search_lex("wal").take(5).cursor(&db)?;
 let _ = Queryable::from("docs").search_vec("wal shipping").take(5).to_vec(&mut db)?;
 ```
 
-**Lazy cursor:** `filter` / `project` / `skip` / `take`, один `join`/`left_join` по FK, **`hop` depth=1**, **`search lex|hybrid` + take** (FTS idxs). `graph` / `match` / `sort` / `union` / `search vec` / hop depth>1 — buffered. Deep `skip` дороже keyset (`.after` + `take`).
+**Lazy cursor:** `filter` / `project` / `skip` / `take`, один `join`/`left_join` по FK, **`hop` depth=1**, **`search lex|hybrid` + take** (FTS idxs). Для проекций `next_projected()` возвращает compact `ProjectedRow`; обычный `Iterator<Item=Row>` сохранён совместимым. `graph` / `match` / `sort` / `union` / `search vec` / hop depth>1 — buffered. Deep `skip` дороже keyset (`.after` + `take`).
 
 **Experimental (вне freeze):** `ship` (TCP WAL, без TLS), `RecordBatch` / `run_batch`, `Db::run_stmt`, `RowExt`. См. [CHANGELOG](CHANGELOG.md).
 
@@ -66,6 +70,8 @@ let _ = Queryable::from("docs").search_vec("wal shipping").take(5).to_vec(&mut d
 Features: `derive`, `async` — в `default` (часть 0.3 контракта). Opt-in neural: `embed-ollama` (`OllamaEmbedder`), `embed-onnx` (`OnnxEmbedder`) — **не** default; hashing остаётся.
 
 `Db::reader()` — in-process снимок текущего `gen`. `open_read` — shared **FENCE** (можно рядом с writer; checkpoint ждёт readers). `export_wal_since` / `apply_wal` — ship WAL; **`apply_wal` на primary durable запрещён**; на **follower** (`open_follower` / `bootstrap_follower`) пишет frames в log и применяет (hot standby). In-memory `apply_wal` как раньше. `pin`/`unpin` — memory-pins. Snapshot: `LIN\x04` MessagePack self-contained; `cold/*.bin` — lazy mmap page-in.
+
+`Db::run_group([...])` исполняет независимые snippets атомарно и в `SyncMode::Full` делает один WAL frame + один durability flush на группу. Ошибка откатывает всю группу, включая live indexes и FTS.
 
 ## Local-prod guarantees
 
@@ -200,24 +206,34 @@ cargo bench --bench compare -- --profile quick
 # после прогона печатает ссылку на airbug dash (http://127.0.0.1:8790/)
 ./scripts/ci-bench.sh
 
-# только point get / только insert / только join / только append_log
+# только point get / insert / join / append_log / FTS / фазовый профиль
 cargo bench --bench compare -- --filter point_get
 cargo bench --bench compare -- --filter insert_bulk_1k --samples 8
 cargo bench --bench compare -- --filter join
 cargo bench --bench compare -- --profile quick --filter append_log
+cargo bench --bench compare -- --profile thorough --tag fts
+cargo bench --bench compare -- --profile thorough --tag phase
 ```
 
 ### CI
 
-Workflow [`.github/workflows/bench.yml`](.github/workflows/bench.yml) на `push`/`pull_request` → `main`: `--profile quick`, без Docker. В отчёте Lin / SQLite / DuckDB / HashMap; Postgres и MySQL пропускаются без серверов. Исключены шумные кейсы: `compare/durable*`, `compare/cold*`, `compare/wal*`, `compare/hot_reopen*`. После прогона `scripts/check-bench-budget.py` сравнивает Lin median с [`benches/ci-baseline.json`](benches/ci-baseline.json): **warn** при >1.5×, **fail** при >3× на `point_get` / `filter_eq` / `join_inner`. Иначе job падает только при ошибке compile/harness.
+Workflow [`.github/workflows/bench.yml`](.github/workflows/bench.yml) на `push`/`pull_request` → `main`: `--profile quick`, без Docker. В отчёте Lin / SQLite / DuckDB / HashMap; Postgres и MySQL пропускаются без серверов. FTS query cases включены; диагностические `*phase*` и шумные durable/cold/wal/reopen cases исключены. После прогона `scripts/check-bench-budget.py` сравнивает Lin median с [`benches/ci-baseline.json`](benches/ci-baseline.json): **warn** при >1.5×, **fail** при >3× на `point_get` / `filter_eq` / `join_inner`. Иначе job падает только при ошибке compile/harness.
 
 Где смотреть: **Actions → bench → Job summary** (markdown-таблица) и artifact **`bench-report`** (`run.json` + `report.html` + `bench-report.md`). Локально: `./scripts/ci-bench.sh` сразу печатает (и при живом hub открывает) **airbug dash** `http://127.0.0.1:8790/`, затем гоняет бенчи в `.airbug-bench/ci/` (hub: `cargo run -p airbug-hub -- serve --root <lin>`).
 
 Движки: **Lin**, **SQLite** (`rusqlite` bundled), **DuckDB** (bundled; собирается на mac aarch64), **Postgres** / **MySQL** (опционально, через URL), плюс **HashMap** только для point get. N=10 000 для тёплых чтений (fixture; setup вне тайминга). Bulk insert: схема/индекс в setup, в тайминге только запись.
 
-Сравнимо: point get по id, `wing ==`, range `wing`+`ts`, substring (`title ~ "wal" | count` ≈ `COUNT(*) … LIKE '%wal%'`), materialize `SELECT id,title`, **join** (10k `orders` ⋈ 1k `users` по FK; Lin `run_batch` / SoA+`RecordBatch` и lazy cursor vs SQL `INNER JOIN`; плюс `total > 100` затем join), bulk insert 1k/10k, **append_log** (`append facts` vs `INSERT INTO logs`) 1k/10k.  
+Сравнимо: point get по id, `wing ==`, range `wing`+`ts`, substring (`title ~ "wal" | count` ≈ `COUNT(*) … LIKE '%wal%'`), materialize `SELECT id,title`, **join** (10k `orders` ⋈ 1k `users` по FK; Lin `run_batch` / SoA+`RecordBatch` и lazy cursor vs SQL `INNER JOIN`; плюс `total > 100` затем join), bulk insert 1k/10k, **append_log** (`append facts` vs `INSERT INTO logs`) 1k/10k.
 Join: row-API (`run` → `Vec<Row>`) и OLAP-путь (`run_batch` → `RecordBatch`) рядом; бенч join меряет batch. DuckDB — референс columnar OLAP.  
-Не сравниваем здесь (и не подтасовываем): Lin `hop`/`match`, real vec/hybrid, CAS, durable fsync (`--data`) — отдельный слой.
+
+Lin-only diagnostics:
+- **FTS:** `fts_lex_selective`, `fts_lex_common`, `fts_lex_miss`, `fts_hybrid_common`, плюс `reopen_phase_5k/rebuild_fts`. Lex `take` использует bounded top-k heap и клонирует только результат; SQL `LIKE` остаётся отдельным сравнительным shape.
+- **Insert phases:** обычный insert, `lin_no_embed`, `lin_no_embed_no_scalar_index` и `lin_no_embed_no_scalar_no_fts`; последовательные разницы оценивают цену hashing embedder, scalar-index и FTS maintenance.
+- **Cursor phases:** `lin_cursor_open`, `lin_cursor_scan_project`, `lin_cursor_scan_projected_row`, обычный и compact lazy join cursor. Разницы отделяют setup, `Row=BTreeMap` materialization и join probe/emission.
+- **Reopen phases:** полный hot/cold open рядом с отдельными rebuild row maps / scalar indexes / FTS на 5k строк. `Stats::reopen` даёт real-open breakdown: setup/lock, snapshot decode, WAL replay, metadata/head, indexes, row maps и FTS.
+- **Group commit:** `group_commit_16/lin_sequential_full` против `lin_grouped_full` — одинаковые 16 уникальных append statements, 16 flush против одного.
+
+Не сравниваем здесь (и не подтасовываем): Lin `hop`/`match`, neural vec, CAS — отдельный слой. Фазовые цифры являются диагностическими разностями медиан, не additive tracing: их нельзя механически суммировать из-за cache state и allocator noise.
 
 ### Postgres / MySQL
 
@@ -279,7 +295,7 @@ lin --data .lin2 stats
 
 Без `--data` store эфемерный (fixture в памяти) — так живут текущие тесты языка и исполнителя.
 
-`--data <dir>` открывает durable store: exclusive flock → snapshot (`LIN\x04` MessagePack, legacy JSON) + replay tail → RAM. Запись: flush при `Full` / на checkpoint при `Normal`. Checkpoint пишет self-contained snapshot (+ опционально `cold/*.bin` cache) и **обнуляет log**.
+`--data <dir>` открывает durable store: exclusive flock → snapshot (`LIN\x04` MessagePack, legacy JSON) + replay tail → RAM. `lin stats` печатает все `reopen_*_ms` фазы. Запись: flush при `Full` / на checkpoint при `Normal`; `run_group` объединяет атомарную группу в один flush. Checkpoint пишет self-contained snapshot (+ опционально `cold/*.bin` cache) и **обнуляет log**.
 
 ```
 .lin/

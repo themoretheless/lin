@@ -382,6 +382,40 @@ fn search_vec_and_hybrid_rank() {
 }
 
 #[test]
+fn search_lex_top_k_matches_full_ranking_prefix_and_skip() {
+    let mut db = Db::fixture();
+    for i in 0..80 {
+        let title = if i % 3 == 0 {
+            "wal wal tuning"
+        } else {
+            "wal tuning"
+        };
+        db.run(&format!(
+            r#"insert docs {{ uri: "raw://top-k/{i:03}", title: "{title}", layer: "wiki", body: "wal storage" }}"#
+        ))
+        .unwrap();
+    }
+
+    let all = db
+        .run(r#"docs | search lex "wal" | take all"#)
+        .unwrap()
+        .rows;
+    let top = db.run(r#"docs | search lex "wal" | take 17"#).unwrap().rows;
+    let skipped = db
+        .run(r#"docs | search lex "wal" | skip 11 | take 13"#)
+        .unwrap()
+        .rows;
+
+    let ids = |rows: &[lin::Row]| {
+        rows.iter()
+            .map(|row| text(row, "id").to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ids(&top), ids(&all[..17]));
+    assert_eq!(ids(&skipped), ids(&all[11..24]));
+}
+
+#[test]
 fn delete_docs_cas_and_edge_and_facts() {
     let mut db = Db::fixture();
     let ins = db
@@ -669,6 +703,78 @@ fn index_maintain_delete_update() {
         .unwrap();
     let again = db.run(r#"docs | uri == "raw://ix""#).unwrap();
     assert_eq!(again.done.n, 0);
+}
+
+#[test]
+fn unique_index_rejects_duplicate_and_rolls_back() {
+    let mut db = Db::fixture();
+    db.run("index docs unique [title]").unwrap();
+    db.run(r#"insert docs { uri: "raw://u-a", title: "same", layer: "wiki" }"#)
+        .unwrap();
+    let before = db.store.r#gen;
+    let n = db.store.collection("docs").len();
+    let e = db
+        .run(r#"insert docs { uri: "raw://u-b", title: "same", layer: "wiki" }"#)
+        .unwrap_err();
+    assert!(e.to_string().contains("unique index"), "{e}");
+    assert_eq!(db.store.r#gen, before);
+    assert_eq!(db.store.collection("docs").len(), n);
+    assert_eq!(db.run(r#"docs | uri == "raw://u-b""#).unwrap().done.n, 0);
+}
+
+#[test]
+fn grouped_commit_rolls_back_rows_and_fts_on_runtime_error() {
+    let mut db = Db::fixture();
+    db.run("index docs unique [title]").unwrap();
+    let before = db.store.r#gen;
+    let error = db
+        .run_group([
+            r#"insert docs { uri: "raw://group/a", title: "group-duplicate", layer: "wiki", body: "group rollback token" }"#,
+            r#"insert docs { uri: "raw://group/b", title: "group-duplicate", layer: "wiki", body: "group rollback token" }"#,
+        ])
+        .unwrap_err();
+    assert!(error.to_string().contains("unique index"), "{error}");
+    assert_eq!(db.store.r#gen, before);
+    assert_eq!(
+        db.run(r#"docs | search lex "rollback token" | take all"#)
+            .unwrap()
+            .done
+            .n,
+        0
+    );
+}
+
+#[test]
+fn unique_index_refuses_existing_duplicates() {
+    let mut db = Db::fixture();
+    db.run(r#"insert docs { uri: "raw://d1", title: "dup", layer: "wiki" }"#)
+        .unwrap();
+    db.run(r#"insert docs { uri: "raw://d2", title: "dup", layer: "wiki" }"#)
+        .unwrap();
+    let e = db.run("index docs unique [title]").unwrap_err();
+    assert!(e.to_string().contains("unique index"), "{e}");
+}
+
+#[test]
+fn fk_insert_requires_parent_row() {
+    let mut db = Db::empty();
+    let e = db
+        .run(r#"insert orders { user_id: "missing", total: 1 }"#)
+        .unwrap_err();
+    assert!(e.to_string().contains("fk:"), "{e}");
+}
+
+#[test]
+fn fk_insert_ok_when_parent_exists() {
+    let mut db = Db::empty();
+    let u = db.run(r#"insert users { email: "a@b.c" }"#).unwrap();
+    let uid = text(&u.rows[0], "id");
+    let o = db
+        .run(&format!(
+            r#"insert orders {{ user_id: "{uid}", total: 9 }}"#
+        ))
+        .unwrap();
+    assert_eq!(o.done.n, 1);
 }
 
 #[test]

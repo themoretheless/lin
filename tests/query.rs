@@ -148,6 +148,20 @@ fn lazy_cursor_matches_to_vec() {
     assert!(cur.is_lazy());
     let via_cur: Vec<_> = cur.map(|r| r.unwrap()).collect();
     assert_eq!(via_cur, via_vec);
+
+    let mut projected = q.cursor(&db).unwrap();
+    let via_projected: Vec<_> = std::iter::from_fn(|| projected.next_projected())
+        .map(|row| row.unwrap())
+        .collect();
+    assert_eq!(via_projected[0].fields(), ["id", "title"]);
+    assert!(via_projected[0].get("id").is_some());
+    assert_eq!(
+        via_projected
+            .into_iter()
+            .map(lin::ProjectedRow::into_row)
+            .collect::<Vec<_>>(),
+        via_vec
+    );
 }
 
 #[test]
@@ -201,6 +215,12 @@ fn lazy_join_cursor() {
     assert!(cur.is_lazy(), "FK join should be lazy");
     let via_cur: Vec<_> = cur.map(|r| r.unwrap()).collect();
     assert_eq!(via_cur, via_vec);
+
+    let mut projected = q.cursor(&db).unwrap();
+    let via_projected: Vec<_> = std::iter::from_fn(|| projected.next_projected())
+        .map(|row| row.unwrap().into_row())
+        .collect();
+    assert_eq!(via_projected, via_vec);
 }
 
 #[test]

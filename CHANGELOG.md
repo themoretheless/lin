@@ -1,5 +1,20 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- Compact `ProjectedRow` cursor output via `QueryCursor::next_projected`.
+- `Db::run_group` atomic group commit and real-open phase metrics in `Stats::reopen`.
+- Batch embedder hook; hashing embed reuses lowercase scratch across slabs.
+
+### Performance
+
+- FTS lex `take` uses borrowed `(score, row_idx)` top-k instead of cloning and
+  fully sorting all candidate rows.
+- Reopen no longer builds row maps and scalar indexes twice around WAL replay.
+- Profile-backed `#[inline]` and bounds-check removal in the aligned SoA cursor loop.
+
 ## [0.4.0] — 2026-09-16
 
 ### Added

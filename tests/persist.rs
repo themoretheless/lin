@@ -533,7 +533,19 @@ fn checkpoint_compacts_log() {
             .run(r#"docs | uri == "raw://c0" or uri == "raw://c4" | take all"#)
             .unwrap();
         assert_eq!(q.done.n, 2);
-        assert!(db.stats().reopen_ms > 0 || db.stats().r#gen >= 5);
+        let stats = db.stats();
+        assert!(stats.reopen_ms > 0 || stats.r#gen >= 5);
+        let phases = stats.reopen;
+        assert!(phases.total_ms > 0.0, "{phases:?}");
+        assert!(phases.snapshot_ms > 0.0, "{phases:?}");
+        let measured = phases.setup_ms
+            + phases.snapshot_ms
+            + phases.wal_ms
+            + phases.metadata_ms
+            + phases.indexes_ms
+            + phases.row_maps_ms
+            + phases.fts_ms;
+        assert!(measured <= phases.total_ms + 0.5, "{phases:?}");
         db.close().unwrap();
     }
     let _ = fs::remove_dir_all(&dir);
@@ -871,5 +883,112 @@ fn cold_backup_self_contained() {
     // Backup imports without the data dir / cold files.
     let mut mem = Db::import_backup(&bak).unwrap();
     assert_eq!(mem.run(r#"docs | take 100"#).unwrap().done.n, 40);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn open_read_does_not_see_commits_after_open() {
+    let dir = tmp();
+    let mut w = Db::open(&dir).unwrap();
+    w.run(r#"insert docs { uri: "raw://before", title: "B", layer: "wiki" }"#)
+        .unwrap();
+    let r = Db::open_read(&dir).unwrap();
+    assert_eq!(r.run(r#"docs | uri == "raw://before""#).unwrap().done.n, 1);
+    w.run(r#"insert docs { uri: "raw://after", title: "A", layer: "wiki" }"#)
+        .unwrap();
+    assert_eq!(r.run(r#"docs | uri == "raw://after""#).unwrap().done.n, 0);
+    drop(r);
+    w.close().unwrap();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn crash_exit_keeps_full_commit() {
+    if let Ok(child) = std::env::var("LIN_CRASH_CHILD") {
+        let mut db = Db::open(&child).unwrap();
+        db.run(r#"insert docs { uri: "raw://crash", title: "K", layer: "wiki" }"#)
+            .unwrap();
+        unsafe { libc::_exit(1) };
+    }
+    let dir = tmp();
+    let exe = std::env::current_exe().unwrap();
+    let status = std::process::Command::new(&exe)
+        .env("LIN_CRASH_CHILD", &dir)
+        .args(["crash_exit_keeps_full_commit", "--exact"])
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(1), "child should _exit(1) after commit");
+    let mut db = Db::open(&dir).unwrap();
+    assert_eq!(
+        db.run(r#"docs | uri == "raw://crash""#).unwrap().done.n,
+        1,
+        "Full WAL must survive process abort without Drop/close"
+    );
+    db.close().unwrap();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn crash_exit_keeps_entire_group_commit() {
+    if let Ok(child) = std::env::var("LIN_GROUP_CRASH_CHILD") {
+        let mut db = Db::open(&child).unwrap();
+        db.run_group([
+            r#"insert docs { uri: "raw://group-crash/a", title: "A", layer: "wiki" }"#,
+            r#"insert docs { uri: "raw://group-crash/b", title: "B", layer: "wiki" }"#,
+        ])
+        .unwrap();
+        unsafe { libc::_exit(1) };
+    }
+    let dir = tmp();
+    let exe = std::env::current_exe().unwrap();
+    let status = std::process::Command::new(&exe)
+        .env("LIN_GROUP_CRASH_CHILD", &dir)
+        .args(["crash_exit_keeps_entire_group_commit", "--exact"])
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(1), "child should _exit after commit");
+    let mut db = Db::open(&dir).unwrap();
+    assert_eq!(
+        db.run(r#"docs | uri == "raw://group-crash/a" or uri == "raw://group-crash/b" | take all"#)
+            .unwrap()
+            .done
+            .n,
+        2
+    );
+    db.close().unwrap();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn wal_update_after_snapshot_replays_against_row_maps() {
+    if let Ok(child) = std::env::var("LIN_UPDATE_REPLAY_CHILD") {
+        let mut db = Db::open(&child).unwrap();
+        db.run(r#"update docs[uri == "raw://update-replay"] { title: "after" }"#)
+            .unwrap();
+        unsafe { libc::_exit(1) };
+    }
+
+    let dir = tmp();
+    let mut db = Db::open(&dir).unwrap();
+    db.run(
+        r#"insert docs { uri: "raw://update-replay", title: "before", layer: "wiki", body: "replay term" }"#,
+    )
+    .unwrap();
+    db.close().unwrap();
+
+    let exe = std::env::current_exe().unwrap();
+    let status = std::process::Command::new(&exe)
+        .env("LIN_UPDATE_REPLAY_CHILD", &dir)
+        .args(["wal_update_after_snapshot_replays_against_row_maps", "--exact"])
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(1));
+
+    let mut reopened = Db::open(&dir).unwrap();
+    let row = reopened
+        .run(r#"docs | uri == "raw://update-replay" | { title }"#)
+        .unwrap();
+    assert_eq!(text(&row.rows[0], "title"), "after");
+    reopened.close().unwrap();
     let _ = fs::remove_dir_all(&dir);
 }

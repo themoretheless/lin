@@ -15,6 +15,12 @@ pub trait Embedder: Send + Sync {
     fn id(&self) -> &str;
     fn dim(&self) -> usize;
     fn embed(&self, text: &str) -> Arc<[f32]>;
+
+    /// Embed a slab. Implementations may reuse scratch buffers or issue a
+    /// backend-native batch; output order and length must match `texts`.
+    fn embed_batch(&self, texts: &[&str]) -> Vec<Arc<[f32]>> {
+        texts.iter().map(|text| self.embed(text)).collect()
+    }
 }
 
 /// Local hashing embedder (unigram + char trigrams → L2-normalized bag).
@@ -52,8 +58,27 @@ impl Embedder for HashingEmbedder {
     }
 
     fn embed(&self, text: &str) -> Arc<[f32]> {
+        let mut lower = String::with_capacity(text.len());
+        lowercase_into(text, &mut lower);
+        self.embed_lowered(&lower)
+    }
+
+    fn embed_batch(&self, texts: &[&str]) -> Vec<Arc<[f32]>> {
+        let mut lower = String::new();
+        let mut out = Vec::with_capacity(texts.len());
+        for text in texts {
+            lower.clear();
+            lower.reserve(text.len());
+            lowercase_into(text, &mut lower);
+            out.push(self.embed_lowered(&lower));
+        }
+        out
+    }
+}
+
+impl HashingEmbedder {
+    fn embed_lowered(&self, lower: &str) -> Arc<[f32]> {
         let mut v = vec![0f32; self.dim];
-        let lower = text.to_lowercase();
         for token in lower.split_whitespace() {
             if token.is_empty() {
                 continue;
@@ -78,6 +103,15 @@ impl Embedder for HashingEmbedder {
     }
 }
 
+fn lowercase_into(text: &str, out: &mut String) {
+    for ch in text.chars() {
+        for lower in ch.to_lowercase() {
+            out.push(lower);
+        }
+    }
+}
+
+#[inline]
 fn bump(v: &mut [f32], key: impl Hash, w: f32) {
     let mut h = FxHasher::default();
     key.hash(&mut h);
@@ -100,6 +134,7 @@ fn l2_normalize(v: &mut [f32]) {
 }
 
 /// Cosine similarity for L2-normalized (or arbitrary) vectors.
+#[inline]
 pub fn cosine(a: &[f32], b: &[f32]) -> f64 {
     let n = a.len().min(b.len());
     if n == 0 {
@@ -133,4 +168,20 @@ pub fn row_embed_text(row: &crate::store::Row) -> String {
         }
     }
     blob
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hashing_batch_matches_single_embedding() {
+        let embedder = HashingEmbedder::new("test/32", 32);
+        let texts = ["WAL tuning", "short", "СМЕШАННЫЙ Регистр", ""];
+        let batch = embedder.embed_batch(&texts);
+        assert_eq!(batch.len(), texts.len());
+        for (text, got) in texts.iter().zip(batch) {
+            assert_eq!(got.as_ref(), embedder.embed(text).as_ref());
+        }
+    }
 }

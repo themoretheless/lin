@@ -29,6 +29,50 @@ pub struct QueryCursor<'a> {
     state: CursorState,
 }
 
+/// Compact cursor projection: one shared field schema plus row-local cells.
+///
+/// Use [`QueryCursor::next_projected`] to avoid allocating a
+/// `BTreeMap<String, Cell>` for every projected row.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProjectedRow {
+    fields: Arc<[String]>,
+    cells: Vec<Cell>,
+}
+
+impl ProjectedRow {
+    pub fn fields(&self) -> &[String] {
+        &self.fields
+    }
+
+    pub fn cells(&self) -> &[Cell] {
+        &self.cells
+    }
+
+    #[inline]
+    pub fn get(&self, field: &str) -> Option<&Cell> {
+        self.fields
+            .iter()
+            .position(|candidate| candidate == field)
+            .and_then(|i| self.cells.get(i))
+    }
+
+    pub fn into_row(self) -> Row {
+        self.fields
+            .iter()
+            .cloned()
+            .zip(self.cells)
+            .collect::<BTreeMap<_, _>>()
+    }
+
+    fn from_row(row: Row) -> Self {
+        let (fields, cells): (Vec<_>, Vec<_>) = row.into_iter().unzip();
+        Self {
+            fields: fields.into(),
+            cells,
+        }
+    }
+}
+
 enum CursorDb<'a> {
     Writer(&'a Db),
     Reader(&'a ReadDb),
@@ -57,10 +101,11 @@ impl CursorDb<'_> {
         collection: &str,
         mode: SearchMode,
         query: &str,
+        rank_limit: Option<usize>,
     ) -> Result<Vec<Row>, Error> {
         match self {
-            CursorDb::Writer(db) => db.search_fts(collection, mode, query),
-            CursorDb::Reader(db) => db.as_db().search_fts(collection, mode, query),
+            CursorDb::Writer(db) => db.search_fts(collection, mode, query, rank_limit),
+            CursorDb::Reader(db) => db.as_db().search_fts(collection, mode, query, rank_limit),
         }
     }
 
@@ -93,7 +138,7 @@ struct LazyCursor {
     pos: usize,
     pred: Option<Pred>,
     need_filter: bool,
-    project: Option<Vec<String>>,
+    project: Option<Arc<[String]>>,
     skip_left: usize,
     take_left: Option<usize>,
     now: i64,
@@ -125,9 +170,7 @@ struct LazyJoinSoa {
     probe: FxHashMap<Arc<str>, usize>,
     skip_left: usize,
     take_left: Option<usize>,
-    key_id: String,
-    key_email: String,
-    key_total: String,
+    fields: Arc<[String]>,
 }
 
 enum RowSource {
@@ -192,6 +235,28 @@ impl<'a> QueryCursor<'a> {
             CursorState::Lazy(_) | CursorState::LazyJoin(_) | CursorState::LazyJoinSoa(_)
         )
     }
+
+    /// Pull a compact projected row. Projection schemas are shared across rows;
+    /// non-projected or buffered plans fall back to converting the regular row.
+    pub fn next_projected(&mut self) -> Option<Result<ProjectedRow, Error>> {
+        let native = matches!(&self.state, CursorState::Lazy(lazy) if lazy.project.is_some())
+            || matches!(self.state, CursorState::LazyJoinSoa(_));
+        if !native {
+            return self.next().map(|row| row.map(ProjectedRow::from_row));
+        }
+
+        let mut state = std::mem::replace(&mut self.state, CursorState::Done);
+        let (store, _) = self.db.store_catalog();
+        let item = match &mut state {
+            CursorState::Lazy(lazy) => next_lazy_projected(store, lazy),
+            CursorState::LazyJoinSoa(join) => next_lazy_join_soa_projected(store, join),
+            _ => unreachable!("native projected state checked above"),
+        };
+        if item.is_some() {
+            self.state = state;
+        }
+        item
+    }
 }
 
 impl Iterator for QueryCursor<'_> {
@@ -226,6 +291,36 @@ impl Iterator for QueryCursor<'_> {
 }
 
 fn next_lazy(store: &Store, lazy: &mut LazyCursor) -> Option<Result<Row, Error>> {
+    let idx = next_lazy_match_idx(store, lazy)?;
+    let row = store.get_by_idx(&lazy.collection, idx)?;
+    let out = if let Some(fields) = &lazy.project {
+        project_fields(row, fields)
+    } else {
+        row.clone()
+    };
+    Some(Ok(out))
+}
+
+#[inline]
+fn next_lazy_projected(
+    store: &Store,
+    lazy: &mut LazyCursor,
+) -> Option<Result<ProjectedRow, Error>> {
+    let idx = next_lazy_match_idx(store, lazy)?;
+    let row = store.get_by_idx(&lazy.collection, idx)?;
+    let fields = lazy.project.as_ref().expect("projected state checked");
+    let cells = fields
+        .iter()
+        .map(|field| row.get(field).cloned().unwrap_or(Cell::Null))
+        .collect();
+    Some(Ok(ProjectedRow {
+        fields: Arc::clone(fields),
+        cells,
+    }))
+}
+
+#[inline]
+fn next_lazy_match_idx(store: &Store, lazy: &mut LazyCursor) -> Option<usize> {
     loop {
         if lazy.take_left == Some(0) {
             return None;
@@ -264,12 +359,7 @@ fn next_lazy(store: &Store, lazy: &mut LazyCursor) -> Option<Result<Row, Error>>
         if let Some(t) = lazy.take_left.as_mut() {
             *t = t.saturating_sub(1);
         }
-        let out = if let Some(fields) = &lazy.project {
-            project_fields(row, fields)
-        } else {
-            row.clone()
-        };
-        return Some(Ok(out));
+        return Some(idx);
     }
 }
 
@@ -496,7 +586,7 @@ fn try_lazy_simple(db: &CursorDb<'_>, q: &Query) -> Result<Option<LazyCursor>, E
         pos: 0,
         pred: filter.cloned(),
         need_filter,
-        project,
+        project: project.map(Into::into),
         skip_left: skip_n,
         take_left,
         now,
@@ -555,7 +645,17 @@ fn try_lazy_search(db: &CursorDb<'_>, q: &Query) -> Result<Option<LazyCursor>, E
         return Ok(None);
     }
 
-    let ranked = db.search_fts(name, mode, query)?;
+    let take_left = match take_n {
+        Some(Some(n)) => Some(n.max(0) as usize),
+        Some(None) => None,
+        None => Some(50),
+    };
+    let rank_limit = if mode == SearchMode::Lex {
+        take_left.map(|n| n.saturating_add(skip_n))
+    } else {
+        None
+    };
+    let ranked = db.search_fts(name, mode, query, rank_limit)?;
     let mut idxs = Vec::with_capacity(ranked.len());
     for r in &ranked {
         let Some(id) = row_text(r, "id") else {
@@ -566,19 +666,13 @@ fn try_lazy_search(db: &CursorDb<'_>, q: &Query) -> Result<Option<LazyCursor>, E
         }
     }
 
-    let take_left = match take_n {
-        Some(Some(n)) => Some(n.max(0) as usize),
-        Some(None) => None,
-        None => Some(50),
-    };
-
     Ok(Some(LazyCursor {
         collection: name.clone(),
         source: RowSource::Idxs(idxs),
         pos: 0,
         pred: None,
         need_filter: false,
-        project,
+        project: project.map(Into::into),
         skip_left: skip_n,
         take_left,
         now: now_ms(),
@@ -710,7 +804,7 @@ fn try_lazy_hop(db: &CursorDb<'_>, q: &Query) -> Result<Option<LazyCursor>, Erro
         pos: 0,
         pred: None,
         need_filter: false,
-        project,
+        project: project.map(Into::into),
         skip_left: skip_n,
         take_left,
         now,
@@ -778,6 +872,14 @@ fn collect_seed_keys(
 }
 
 fn next_lazy_join_soa(store: &Store, join: &mut LazyJoinSoa) -> Option<Result<Row, Error>> {
+    next_lazy_join_soa_projected(store, join).map(|row| row.map(ProjectedRow::into_row))
+}
+
+#[inline]
+fn next_lazy_join_soa_projected(
+    store: &Store,
+    join: &mut LazyJoinSoa,
+) -> Option<Result<ProjectedRow, Error>> {
     let orders_id = store.orders_id();
     let orders_uid = store.orders_user_id();
     let orders_total = store.orders_total();
@@ -814,7 +916,18 @@ fn next_lazy_join_soa(store: &Store, join: &mut LazyJoinSoa) -> Option<Result<Ro
         {
             continue;
         }
-        let uid = orders_uid[idx].as_ref();
+        debug_assert_eq!(orders_id.len(), orders_uid.len());
+        debug_assert_eq!(orders_id.len(), orders_total.len());
+        // SAFETY: `LazyJoinSoa` is constructed only after `orders_soa_ready()`;
+        // `idx < orders_id.len()` was checked above, and the cursor's shared Db
+        // borrow prevents mutation while these parallel columns are consumed.
+        let (order_id, uid, total) = unsafe {
+            (
+                orders_id.get_unchecked(idx),
+                orders_uid.get_unchecked(idx).as_ref(),
+                *orders_total.get_unchecked(idx),
+            )
+        };
         let right = join.probe.get(uid).copied();
         if right.is_none() && !join.left_join {
             continue;
@@ -827,17 +940,23 @@ fn next_lazy_join_soa(store: &Store, join: &mut LazyJoinSoa) -> Option<Result<Ro
             *t = t.saturating_sub(1);
         }
 
-        let mut row = BTreeMap::new();
-        row.insert(join.key_id.clone(), Cell::Text(Arc::clone(&orders_id[idx])));
-        row.insert(
-            join.key_email.clone(),
+        let cells = vec![
+            Cell::Text(Arc::clone(order_id)),
             match right {
-                Some(ui) => Cell::Text(Arc::clone(&users_email[ui])),
+                Some(ui) => {
+                    debug_assert!(ui < users_email.len());
+                    // SAFETY: probe indices are built from aligned users SoA
+                    // columns after `users_soa_ready()` and cannot mutate here.
+                    Cell::Text(Arc::clone(unsafe { users_email.get_unchecked(ui) }))
+                }
                 None => Cell::Null,
             },
-        );
-        row.insert(join.key_total.clone(), Cell::Float(orders_total[idx]));
-        return Some(Ok(row));
+            Cell::Float(total),
+        ];
+        return Some(Ok(ProjectedRow {
+            fields: Arc::clone(&join.fields),
+            cells,
+        }));
     }
 }
 
@@ -955,9 +1074,12 @@ fn try_lazy_join_soa(db: &CursorDb<'_>, q: &Query) -> Result<Option<LazyJoinSoa>
         probe,
         skip_left: skip_n,
         take_left,
-        key_id: String::from("id"),
-        key_email: String::from("users.email"),
-        key_total: String::from("total"),
+        fields: vec![
+            String::from("id"),
+            String::from("users.email"),
+            String::from("total"),
+        ]
+        .into(),
     }))
 }
 

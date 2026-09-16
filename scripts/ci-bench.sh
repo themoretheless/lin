@@ -46,6 +46,7 @@ cargo bench --bench compare -- \
   --exclude 'compare/cold*' \
   --exclude 'compare/wal*' \
   --exclude 'compare/hot_reopen*' \
+  --exclude 'compare/*phase*' \
   --output "$OUT" \
   | tee "$REPORT"
 

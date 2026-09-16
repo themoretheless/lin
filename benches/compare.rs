@@ -16,7 +16,9 @@
 //!   (SoA + [`RecordBatch`]), Lin lazy cursor, SQL `INNER JOIN`. Filter+join: `total > 100`.
 //!   Row-API `run` still materializes `Vec<Row>` from the same path.
 //!   DuckDB may still win (mature OLAP); Lin now has an in-process columnar join path.
-//! - Lin `hop`, hybrid `search`, and CAS are not claimed here.
+//! - FTS cases isolate selective/common/miss `FtsSeek`, hybrid, and index rebuild.
+//! - Phase cases decompose insert variants, cursor open/scan/join, and reopen rebuilds.
+//! - Lin `hop` and CAS are not claimed here.
 //! - SQL `LIKE '%wal%'` ≈ Lin `title ~ "wal"` (substring), not `has` / FTS.
 //! - Server DBs are not in-process; network/IPC cost is part of their number.
 
@@ -190,6 +192,10 @@ struct LinWarm {
     filter_eq: lin::Prepared,
     filter_range: lin::Prepared,
     text_substr: lin::Prepared,
+    fts_selective: lin::Prepared,
+    fts_common: lin::Prepared,
+    fts_miss: lin::Prepared,
+    fts_hybrid: lin::Prepared,
     materialize: lin::Prepared,
 }
 
@@ -216,6 +222,18 @@ fn seed_lin(n: usize) -> LinWarm {
     let text_substr = db
         .prepare(r#"docs | title ~ "wal" | count"#)
         .expect("lin prepare text_substr");
+    let fts_selective = db
+        .prepare(r#"docs | search lex "9999" | take 20"#)
+        .expect("lin prepare selective FTS");
+    let fts_common = db
+        .prepare(r#"docs | search lex "wal" | take 20"#)
+        .expect("lin prepare common FTS");
+    let fts_miss = db
+        .prepare(r#"docs | search lex "not-in-corpus" | take 20"#)
+        .expect("lin prepare miss FTS");
+    let fts_hybrid = db
+        .prepare(r#"docs | search "wal" | take 20"#)
+        .expect("lin prepare hybrid FTS");
     let materialize = db
         .prepare(r#"docs | wing == "rag" | { id, title } | take all"#)
         .expect("lin prepare materialize");
@@ -226,6 +244,13 @@ fn seed_lin(n: usize) -> LinWarm {
         eq_plan.contains("index=docs[wing,ts]"),
         "expected IndexSeek, got:\n{eq_plan}"
     );
+    let fts_plan = db
+        .explain_as(r#"docs | search lex "wal" | take 20"#, None)
+        .expect("explain FTS");
+    assert!(
+        fts_plan.contains("FtsSeek"),
+        "expected FtsSeek, got:\n{fts_plan}"
+    );
     let mat = materialize.run(&mut db).expect("lin materialize sanity");
     assert_eq!(mat.done.n, n / 2, "materialize should take all rag rows");
     LinWarm {
@@ -234,6 +259,10 @@ fn seed_lin(n: usize) -> LinWarm {
         filter_eq,
         filter_range,
         text_substr,
+        fts_selective,
+        fts_common,
+        fts_miss,
+        fts_hybrid,
         materialize,
     }
 }
@@ -522,6 +551,7 @@ struct JoinLin {
     filter: lin::Prepared,
     inner_q: LinQueryable,
     filter_q: LinQueryable,
+    orders_q: LinQueryable,
 }
 
 fn seed_join_lin() -> JoinLin {
@@ -557,6 +587,9 @@ fn seed_join_lin() -> JoinLin {
         .join("users", "user_id")
         .select(["id", "users.email", "total"])
         .take_all();
+    let orders_q = LinQueryable::from("orders")
+        .select(["id", "user_id", "total"])
+        .take_all();
     let cur_n = inner_q
         .cursor(&db)
         .expect("lin join cursor")
@@ -570,6 +603,7 @@ fn seed_join_lin() -> JoinLin {
         filter,
         inner_q,
         filter_q,
+        orders_q,
     }
 }
 
@@ -577,6 +611,16 @@ fn consume_join_cursor(db: &lin::Db, q: &LinQueryable) -> usize {
     let mut n = 0usize;
     for row in q.cursor(db).expect("lin join cursor") {
         black_box(row.expect("row"));
+        n += 1;
+    }
+    n
+}
+
+fn consume_projected_cursor(db: &lin::Db, q: &LinQueryable) -> usize {
+    let mut cursor = q.cursor(db).expect("lin projected cursor");
+    let mut n = 0usize;
+    while let Some(row) = cursor.next_projected() {
+        black_box(row.expect("projected row"));
         n += 1;
     }
     n
@@ -799,22 +843,38 @@ fn mysql_join_n(conn: &mut mysql::Conn, stmt: &mysql::Statement) -> usize {
     n
 }
 
-fn empty_lin() -> lin::Db {
-    let mut db = lin::Db::empty();
-    db.run("index docs [wing, ts]").expect("lin index");
-    db
-}
-
 struct LinInsert {
     db: lin::Db,
     prepared: lin::Prepared,
 }
 
-fn setup_lin_insert(n: usize) -> LinInsert {
-    let mut db = empty_lin();
+fn setup_lin_insert_variant(n: usize, embed: bool, scalar_index: bool, fts: bool) -> LinInsert {
+    let mut db = if embed {
+        lin::Db::empty()
+    } else {
+        lin::Db::empty().without_embedder()
+    };
+    if !fts {
+        let docs = db
+            .catalog
+            .collections
+            .get_mut("docs")
+            .expect("docs catalog");
+        for field in docs.fields.values_mut() {
+            field.fts = false;
+        }
+        db.store.rebuild_fts(&db.catalog);
+    }
+    if scalar_index {
+        db.run("index docs [wing, ts]").expect("lin index");
+    }
     let src = lin_insert_src(&docs(n));
     let prepared = db.prepare(&src).expect("lin prepare insert");
     LinInsert { db, prepared }
+}
+
+fn setup_lin_insert(n: usize) -> LinInsert {
+    setup_lin_insert_variant(n, true, true, true)
 }
 
 fn empty_sqlite() -> rusqlite::Connection {
@@ -892,6 +952,19 @@ fn empty_mysql(url: String) -> mysql::Conn {
 
 fn fill_lin(ins: &mut LinInsert) {
     ins.prepared.run(&mut ins.db).expect("lin insert");
+}
+
+struct LinRebuildWarm {
+    db: lin::Db,
+}
+
+fn seed_lin_rebuild(n: usize) -> LinRebuildWarm {
+    let mut db = lin::Db::empty().without_embedder();
+    db.run("index docs [wing, ts]").expect("lin index");
+    for chunk in docs(n).chunks(500) {
+        db.run(&lin_insert_src(chunk)).expect("lin rebuild seed");
+    }
+    LinRebuildWarm { db }
 }
 
 fn lin_hits(h: &lin::Handle) -> i64 {
@@ -1054,7 +1127,7 @@ struct LinDurableInsert {
 
 fn setup_lin_durable_insert(n: usize) -> LinDurableInsert {
     let dir = fresh_tmp("insert");
-    let mut db = lin::Db::open(&dir.0).expect("lin durable open");
+    let db = lin::Db::open(&dir.0).expect("lin durable open");
     db.run("index docs [wing, ts]").expect("lin index");
     let prepared = db
         .prepare(&lin_insert_src(&docs(n)))
@@ -1068,6 +1141,53 @@ fn setup_lin_durable_insert(n: usize) -> LinDurableInsert {
 
 fn fill_lin_durable_insert(ins: &mut LinDurableInsert) -> lin::Handle {
     ins.prepared.run(&mut ins.db).expect("lin durable insert")
+}
+
+const GROUP_COMMITS: usize = 16;
+
+struct LinGroupCommit {
+    _dir: TmpKeep,
+    db: lin::Db,
+    singles: Vec<lin::Prepared>,
+    grouped: lin::Prepared,
+}
+
+fn setup_lin_group_commit() -> LinGroupCommit {
+    let dir = fresh_tmp("group-commit");
+    let mut db = lin::Db::open(&dir.0).expect("lin durable open");
+    let mut statements = Vec::with_capacity(GROUP_COMMITS);
+    let mut singles = Vec::with_capacity(GROUP_COMMITS);
+    for i in 0..GROUP_COMMITS {
+        let source = format!(r#"append facts {{ s: "group", p: "item", o: "{i}" }}"#);
+        let statement = lin::parse(&source).expect("parse grouped commit");
+        singles.push(
+            db.prepare_stmt(statement.clone())
+                .expect("prepare single commit"),
+        );
+        statements.push(statement);
+    }
+    let grouped = db
+        .prepare_stmts(statements)
+        .expect("prepare grouped commit");
+    LinGroupCommit {
+        _dir: dir,
+        db,
+        singles,
+        grouped,
+    }
+}
+
+fn fill_lin_sequential_commits(group: &mut LinGroupCommit) {
+    for prepared in &group.singles {
+        black_box(prepared.run(&mut group.db).expect("single durable commit"));
+    }
+}
+
+fn fill_lin_group_commit(group: &mut LinGroupCommit) -> lin::Handle {
+    group
+        .grouped
+        .run(&mut group.db)
+        .expect("grouped durable commit")
 }
 
 struct LinColdReopen {
@@ -1345,6 +1465,7 @@ fn main() -> airbug_bench::Result<()> {
     suite.config(Config::profile("quick")?);
 
     let lin = Fixture::new(|| seed_lin(N));
+    let lin_rebuild = Fixture::new(|| seed_lin_rebuild(5_000));
     let sql = Fixture::new(|| seed_sqlite(N));
     let duck = Fixture::new(|| seed_duck(N));
     let map = Fixture::new(|| seed_map(N));
@@ -1579,6 +1700,49 @@ fn main() -> airbug_bench::Result<()> {
         .tag("text_substr")
         .tag("lin")
         .parameter("n", N);
+
+    suite
+        .bench_fixture("fts_lex_selective/lin", lin.clone(), |s| {
+            black_box(
+                s.fts_selective
+                    .run(&mut s.db)
+                    .expect("lin selective FTS")
+                    .done
+                    .n,
+            )
+        })
+        .tag("fts")
+        .tag("fts_selective")
+        .tag("lin")
+        .parameter("n", N)
+        .parameter("hits", 1);
+    suite
+        .bench_fixture("fts_lex_common/lin", lin.clone(), |s| {
+            black_box(s.fts_common.run(&mut s.db).expect("lin common FTS").done.n)
+        })
+        .tag("fts")
+        .tag("fts_common")
+        .tag("lin")
+        .parameter("n", N)
+        .parameter("candidates", N / 10);
+    suite
+        .bench_fixture("fts_lex_miss/lin", lin.clone(), |s| {
+            black_box(s.fts_miss.run(&mut s.db).expect("lin miss FTS").done.n)
+        })
+        .tag("fts")
+        .tag("fts_miss")
+        .tag("lin")
+        .parameter("n", N)
+        .parameter("hits", 0);
+    suite
+        .bench_fixture("fts_hybrid_common/lin", lin.clone(), |s| {
+            black_box(s.fts_hybrid.run(&mut s.db).expect("lin hybrid FTS").done.n)
+        })
+        .tag("fts")
+        .tag("hybrid")
+        .tag("lin")
+        .parameter("n", N)
+        .parameter("candidates", N / 10);
     suite
         .bench_fixture("text_substr/sqlite", sql.clone(), |s| {
             let mut stmt = s
@@ -1716,6 +1880,7 @@ fn main() -> airbug_bench::Result<()> {
             black_box(s.inner.run_batch(&mut s.db).expect("lin join").n())
         })
         .tag("join_inner")
+        .tag("phase")
         .tag("lin")
         .parameter("users", JOIN_USERS)
         .parameter("orders", JOIN_ORDERS)
@@ -1725,8 +1890,52 @@ fn main() -> airbug_bench::Result<()> {
             black_box(consume_join_cursor(&s.db, &s.inner_q))
         })
         .tag("join_inner")
+        .tag("phase")
         .tag("lin_cursor")
         .parameter("users", JOIN_USERS)
+        .parameter("orders", JOIN_ORDERS)
+        .work_units("rows", JOIN_ORDERS as u64);
+    suite
+        .bench_fixture("join_inner/lin_cursor_projected", lin_join.clone(), |s| {
+            black_box(consume_projected_cursor(&s.db, &s.inner_q))
+        })
+        .tag("join_inner")
+        .tag("phase")
+        .tag("lin_cursor")
+        .tag("projected")
+        .parameter("users", JOIN_USERS)
+        .parameter("orders", JOIN_ORDERS)
+        .work_units("rows", JOIN_ORDERS as u64);
+    suite
+        .bench_fixture("join_phase/lin_cursor_open", lin_join.clone(), |s| {
+            let cur = s.inner_q.cursor(&s.db).expect("lin join cursor open");
+            black_box(cur.is_lazy())
+        })
+        .tag("phase")
+        .tag("cursor")
+        .tag("lin")
+        .parameter("orders", JOIN_ORDERS);
+    suite
+        .bench_fixture(
+            "join_phase/lin_cursor_scan_project",
+            lin_join.clone(),
+            |s| black_box(consume_join_cursor(&s.db, &s.orders_q)),
+        )
+        .tag("phase")
+        .tag("cursor")
+        .tag("lin")
+        .parameter("orders", JOIN_ORDERS)
+        .work_units("rows", JOIN_ORDERS as u64);
+    suite
+        .bench_fixture(
+            "join_phase/lin_cursor_scan_projected_row",
+            lin_join.clone(),
+            |s| black_box(consume_projected_cursor(&s.db, &s.orders_q)),
+        )
+        .tag("phase")
+        .tag("cursor")
+        .tag("lin")
+        .tag("projected")
         .parameter("orders", JOIN_ORDERS)
         .work_units("rows", JOIN_ORDERS as u64);
     suite
@@ -1896,6 +2105,67 @@ fn main() -> airbug_bench::Result<()> {
     insert_bulk!("1k", INSERT_1K);
     insert_bulk!("10k", INSERT_10K);
 
+    suite
+        .bench_with_input(
+            "insert_phase_10k/lin_full",
+            move || setup_lin_insert_variant(INSERT_10K, true, true, true),
+            fill_lin,
+            DropPolicy::InsideTiming,
+        )
+        .tag("phase")
+        .tag("insert")
+        .tag("lin")
+        .parameter("rows", INSERT_10K)
+        .parameter("embed", 1)
+        .parameter("scalar_index", 1)
+        .parameter("fts", 1)
+        .work_units("rows", INSERT_10K as u64);
+    suite
+        .bench_with_input(
+            "insert_phase_10k/lin_no_embed",
+            move || setup_lin_insert_variant(INSERT_10K, false, true, true),
+            fill_lin,
+            DropPolicy::InsideTiming,
+        )
+        .tag("phase")
+        .tag("insert")
+        .tag("lin")
+        .parameter("rows", INSERT_10K)
+        .parameter("embed", 0)
+        .parameter("scalar_index", 1)
+        .parameter("fts", 1)
+        .work_units("rows", INSERT_10K as u64);
+    suite
+        .bench_with_input(
+            "insert_phase_10k/lin_no_embed_no_scalar_index",
+            move || setup_lin_insert_variant(INSERT_10K, false, false, true),
+            fill_lin,
+            DropPolicy::InsideTiming,
+        )
+        .tag("phase")
+        .tag("insert")
+        .tag("lin")
+        .parameter("rows", INSERT_10K)
+        .parameter("embed", 0)
+        .parameter("scalar_index", 0)
+        .parameter("fts", 1)
+        .work_units("rows", INSERT_10K as u64);
+    suite
+        .bench_with_input(
+            "insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+            move || setup_lin_insert_variant(INSERT_10K, false, false, false),
+            fill_lin,
+            DropPolicy::InsideTiming,
+        )
+        .tag("phase")
+        .tag("insert")
+        .tag("lin")
+        .parameter("rows", INSERT_10K)
+        .parameter("embed", 0)
+        .parameter("scalar_index", 0)
+        .parameter("fts", 0)
+        .work_units("rows", INSERT_10K as u64);
+
     macro_rules! append_log {
         ($label:expr, $n:expr) => {{
             let n = $n;
@@ -2031,6 +2301,34 @@ fn main() -> airbug_bench::Result<()> {
         .parameter("rows", INSERT_1K)
         .work_units("rows", INSERT_1K as u64);
 
+    suite
+        .bench_with_input(
+            "group_commit_16/lin_sequential_full",
+            setup_lin_group_commit,
+            fill_lin_sequential_commits,
+            DropPolicy::OutsideTiming,
+        )
+        .tag("phase")
+        .tag("durable")
+        .tag("group_commit")
+        .tag("lin")
+        .parameter("commits", GROUP_COMMITS)
+        .work_units("commits", GROUP_COMMITS as u64);
+    suite
+        .bench_with_input(
+            "group_commit_16/lin_grouped_full",
+            setup_lin_group_commit,
+            fill_lin_group_commit,
+            DropPolicy::OutsideTiming,
+        )
+        .tag("phase")
+        .tag("durable")
+        .tag("group_commit")
+        .tag("lin")
+        .parameter("commits", 1)
+        .parameter("statements", GROUP_COMMITS)
+        .work_units("statements", GROUP_COMMITS as u64);
+
     // Cold mmap checkpoint + reopen (50k docs).
     const COLD_N: usize = 5_000;
     suite
@@ -2049,6 +2347,8 @@ fn main() -> airbug_bench::Result<()> {
             DropPolicy::OutsideTiming,
         )
         .tag("cold")
+        .tag("phase")
+        .tag("reopen")
         .tag("lin")
         .parameter("rows", COLD_N)
         .work_units("rows", COLD_N as u64);
@@ -2062,6 +2362,48 @@ fn main() -> airbug_bench::Result<()> {
             DropPolicy::OutsideTiming,
         )
         .tag("cold")
+        .tag("phase")
+        .tag("reopen")
+        .tag("lin")
+        .parameter("rows", COLD_N)
+        .work_units("rows", COLD_N as u64);
+
+    suite
+        .bench_fixture(
+            "reopen_phase_5k/rebuild_row_maps",
+            lin_rebuild.clone(),
+            |s| {
+                s.db.store.rebuild_row_maps();
+                black_box(s.db.store.row_count())
+            },
+        )
+        .tag("phase")
+        .tag("reopen")
+        .tag("lin")
+        .parameter("rows", COLD_N)
+        .work_units("rows", COLD_N as u64);
+    suite
+        .bench_fixture(
+            "reopen_phase_5k/rebuild_scalar_indexes",
+            lin_rebuild.clone(),
+            |s| {
+                s.db.store.rebuild_indexes();
+                black_box(s.db.store.row_count())
+            },
+        )
+        .tag("phase")
+        .tag("reopen")
+        .tag("lin")
+        .parameter("rows", COLD_N)
+        .work_units("rows", COLD_N as u64);
+    suite
+        .bench_fixture("reopen_phase_5k/rebuild_fts", lin_rebuild, |s| {
+            s.db.store.rebuild_fts(&s.db.catalog);
+            black_box(s.db.store.row_count())
+        })
+        .tag("phase")
+        .tag("reopen")
+        .tag("fts")
         .tag("lin")
         .parameter("rows", COLD_N)
         .work_units("rows", COLD_N as u64);
