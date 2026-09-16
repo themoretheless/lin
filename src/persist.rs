@@ -5,6 +5,7 @@
 //!   head       JSON object: gen, catalog_hash, embed_id
 //!   log        append-only framed records (`LIN\x01` / `LIN\x02`)
 //!   snapshot   `LIN\x04` + MessagePack(Snapshot); legacy JSON still reads
+//!   fts/       posting lists per collection (`LIN\x05`), written on checkpoint
 //!   cold/      optional mmap cache of large collections (same rows also inlined
 //!              in snapshot — self-contained)
 //! ```
@@ -17,6 +18,7 @@
 //! A truncated trailing record is ignored. After replay the log is truncated
 //! to the last complete record. Checkpoint compacts the log to empty.
 //! Portable backup = self-contained `LIN\x04` MessagePack (never cold stubs).
+//! FTS blobs are local accel; missing/stale files rebuild on open.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};

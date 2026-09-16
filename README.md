@@ -63,7 +63,7 @@ let _ = Queryable::from("docs").search_vec("wal shipping").take(5).to_vec(&mut d
 
 **Lazy cursor:** `filter` / `project` / `skip` / `take`, один `join`/`left_join` по FK, **`hop` depth=1**, **`search lex|hybrid` + take** (FTS idxs). Для проекций `next_projected()` возвращает compact `ProjectedRow`; обычный `Iterator<Item=Row>` сохранён совместимым. `graph` / `match` / `sort` / `union` / `search vec` / hop depth>1 — buffered. Deep `skip` дороже keyset (`.after` + `take`).
 
-**Experimental (вне freeze):** `ship` (TCP WAL, без TLS), `RecordBatch` / `run_batch`, `Db::run_stmt`, `RowExt`. См. [CHANGELOG](CHANGELOG.md).
+**Experimental (вне freeze):** `ship` (WAL `LIN\x06`, token, optional TLS, one sink), `RecordBatch` / `run_batch`, `Db::run_stmt`, `RowExt`. См. [CHANGELOG](CHANGELOG.md).
 
 **OLAP рядом с row-API:** `Db::run` / `Prepared::run` → `Vec<Row>`; `run_batch` → [`RecordBatch`] (колонки, experimental). Columnar: `filter?|project|take` и hot join `orders ⋈ users` (SoA); иначе fallback в row-maps.
 
@@ -82,7 +82,7 @@ Features: `derive`, `async` — в `default` (часть 0.3 контракта)
 | Shared `FENCE` — `open_read`∥writer; checkpoint ждёт readers | |
 | Durable follower: `bootstrap_follower` + `apply_wal` | |
 | Cold lazy mmap page-in | |
-| FTS postings (`FtsSeek`, rebuild-on-open) | |
+| FTS postings (`FtsSeek`, checkpoint blob + validated rebuild fallback) | |
 | Quotas / `SyncMode::Normal` (opt-in) / WAL ship / pins | |
 
 Память = snapshot + lazy cold page-in + WAL tail. Durable `Db` на `Drop` — best-effort checkpoint.
@@ -160,7 +160,7 @@ rel cites
 | **0.3** | **готово** — Queryable/cursor/FromRow/async в stable + CHANGELOG |
 | **0.3.x** | **готово** — m1 Neural embed features · m4 filter+project `run_batch` · join SoA |
 | **0.4** | **готово** — m2 FTS postings / `FtsSeek` · m5 lazy hop d=1 + search lex\|hybrid |
-| **0.5** | m3 ANN · m6 wasm32 · o1 TLS/auth/fanout (после скучного ship) |
+| **0.5** | m3 ANN · m6 wasm32 · o1 fanout (TLS/token/one-sink — в Unreleased) |
 | **Не 0.x** | Multi-writer / полный MVCC / consensus · DuckDB как storage backend |
 
 Подробный план (чеклисты, файлы, риски): см. wiki `lin-roadmap` / canvas.
@@ -181,15 +181,16 @@ lin --data follower follower bootstrap --backup /tmp/boot.linbak
 lin --data primary run 'insert docs { uri: "raw://b", title: "B", layer: "wiki" }'
 
 # 4) в одном терминале — отдать WAL (держит writer lock)
-lin --data primary wal-serve --listen 127.0.0.1:9876
+# localhost: plaintext ok. Другая машина: --tls-cert/--tls-key --token
+lin --data primary wal-serve --listen 127.0.0.1:9876 --token lab
 
 # 5) в другом — one-shot sync (или --loop 2)
-lin --data follower follower sync --from 127.0.0.1:9876
+lin --data follower follower sync --from 127.0.0.1:9876 --token lab
 lin --data follower follower status
 lin --data follower --follower run 'docs | take 10'
 ```
 
-Low-level: `lin --data follower --follower apply-wal frames.bin`. API: `lin::ship::{pull,serve_blocking}`.
+Low-level: `lin --data follower --follower apply-wal frames.bin`. API: `lin::ship::{pull, pull_with, serve_blocking_opts}`. Token also via `LIN_SHIP_TOKEN`. TLS: `--tls-ca` on the follower (or `--tls-insecure` only in lab).
 
 ## Бенчмарки (airbug-bench): Lin vs SQLite vs DuckDB vs Postgres vs MySQL
 
@@ -234,6 +235,8 @@ Lin-only diagnostics:
 - **Group commit:** `group_commit_16/lin_sequential_full` против `lin_grouped_full` — одинаковые 16 уникальных append statements, 16 flush против одного.
 
 Не сравниваем здесь (и не подтасовываем): Lin `hop`/`match`, neural vec, CAS — отдельный слой. Фазовые цифры являются диагностическими разностями медиан, не additive tracing: их нельзя механически суммировать из-за cache state и allocator noise.
+
+Таргетированный `thorough` прогон 2026-09-17 (один процесс, локальная машина): FTS common top-20 `568 → 182 µs`; insert 10k full `27.38 → 20.47 ms`; compact scan/project `1.68 → 0.90 ms`; compact SoA join cursor `1.70 → 0.48 ms`; hot reopen 5k `158.6 → 82.0 ms`; 16 уникальных Full commits `5.05 ms` sequential против `0.83 ms` grouped. Это benchmark evidence, не переносимый SLA.
 
 ### Postgres / MySQL
 
@@ -295,7 +298,7 @@ lin --data .lin2 stats
 
 Без `--data` store эфемерный (fixture в памяти) — так живут текущие тесты языка и исполнителя.
 
-`--data <dir>` открывает durable store: exclusive flock → snapshot (`LIN\x04` MessagePack, legacy JSON) + replay tail → RAM. `lin stats` печатает все `reopen_*_ms` фазы. Запись: flush при `Full` / на checkpoint при `Normal`; `run_group` объединяет атомарную группу в один flush. Checkpoint пишет self-contained snapshot (+ опционально `cold/*.bin` cache) и **обнуляет log**.
+`--data <dir>` открывает durable store: exclusive flock → snapshot (`LIN\x04` MessagePack, legacy JSON) + optional `fts/*.bin` + replay tail → RAM. `lin stats` печатает все `reopen_*_ms` фазы. Запись: flush при `Full` / на checkpoint при `Normal`; `run_group` объединяет атомарную группу в один flush. Checkpoint пишет self-contained snapshot (+ `fts/*.bin` postings, опционально `cold/*.bin` cache) и **обнуляет log**.
 
 ```
 .lin/
@@ -304,10 +307,11 @@ lin --data .lin2 stats
   log        append-only WAL (compacted on checkpoint):
              `LIN\x02` raw columnar / `LIN\x01` MessagePack / legacy JSON
   snapshot   `LIN\x04` MessagePack(Snapshot), self-contained (legacy JSON reads)
+  fts/       posting lists (`LIN\x05`) per FTS collection; rebuild if missing/stale
   cold/      optional mmap cache of large collections (rows also inlined in snapshot)
 ```
 
-Пакет лога: `{"gen":N,"next_id":N,"pack":{"type":"insert"|"insert_bulk"|"append_fact"|"append_facts_bulk"|"append_edge"|"append_edges_bulk"|…}}`. Ячейки: `{"t":"Text","v":"…"}`. Bulk-формы пишут один record вместо Batch-of-N. Обрезанная последняя запись лога игнорируется; при открытии лог обрезается до последнего целого фрейма. `insert … with edge` кладёт рёбра в тот же пакет. Несколько записей в одном `run()` или bulk-список — один `batch` / `*_bulk`. Индекс живёт в `schema_index` + snapshot `extra_indexes`; при open пересобирается.
+Пакет лога: `{"gen":N,"next_id":N,"pack":{"type":"insert"|"insert_bulk"|"append_fact"|"append_facts_bulk"|"append_edge"|"append_edges_bulk"|…}}`. Ячейки: `{"t":"Text","v":"…"}`. Bulk-формы пишут один record вместо Batch-of-N. Обрезанная последняя запись лога игнорируется; при открытии лог обрезается до последнего целого фрейма. `insert … with edge` кладёт рёбра в тот же пакет. Несколько записей в одном `run()` или bulk-список — один `batch` / `*_bulk`. Индекс живёт в `schema_index` + snapshot `extra_indexes`; при open пересобирается. FTS postings — `fts/*.bin` на checkpoint; несовпадение gen/nrows/fields → rebuild.
 
 ## Как смотреть граф
 

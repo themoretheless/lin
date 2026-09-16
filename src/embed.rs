@@ -83,7 +83,7 @@ impl HashingEmbedder {
             if token.is_empty() {
                 continue;
             }
-            bump(&mut v, &token, 1.0);
+            bump(&mut v, token, 1.0);
             let b = token.as_bytes();
             if b.len() >= 3 {
                 for w in b.windows(3) {

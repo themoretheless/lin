@@ -4,6 +4,11 @@
 
 ### Added
 
+- **Durable FTS:** checkpoint writes `fts/<collection>.bin` (`LIN\x05` posting lists).
+  Open loads matching gen/nrows/fields and incrementally applies the WAL tail;
+  missing or stale blobs still rebuild.
+- **Ship:** protocol `LIN\x06` + shared token; optional rustls (`--tls-cert` /
+  `--tls-key` / `--tls-ca`); one live sink. Loopback plaintext remains the local recipe.
 - Compact `ProjectedRow` cursor output via `QueryCursor::next_projected`.
 - `Db::run_group` atomic group commit and real-open phase metrics in `Stats::reopen`.
 - Batch embedder hook; hashing embed reuses lowercase scratch across slabs.

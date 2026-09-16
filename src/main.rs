@@ -240,7 +240,7 @@ fn usage(code: u8) -> ExitCode {
         "usage:\n  \
          lin [--data <dir>] [--follower] run [--explain] [--file <path> | - | '<query>']\n  \
          lin [--data <dir>] [--follower] explain [--graph mermaid|dot] '<query>'\n  \
-         lin --data <dir> wal-serve [--listen HOST:PORT]\n  \
+         lin --data <dir> wal-serve [--listen HOST:PORT] [--token TOKEN] [--tls-cert PEM --tls-key PEM]\n  \
          lin --data <dir> follower status|bootstrap|sync …\n  \
          lin --data <dir> --follower apply-wal <frames.bin | ->\n  \
          lin [--data <dir>] backup export <file.json>\n  \
@@ -350,28 +350,100 @@ fn cmd_apply_wal(args: &[String], data: Option<PathBuf>, follower: bool) -> Exit
 
 fn cmd_wal_serve(args: &[String], data: Option<PathBuf>) -> ExitCode {
     let Some(dir) = data else {
-        eprintln!("usage: lin --data <dir> wal-serve [--listen HOST:PORT]");
+        eprintln!(
+            "usage: lin --data <dir> wal-serve [--listen HOST:PORT] [--token TOKEN] [--tls-cert PEM --tls-key PEM]"
+        );
         return ExitCode::from(2);
     };
     let mut listen = "127.0.0.1:9876".to_string();
+    let mut token: Option<String> = std::env::var("LIN_SHIP_TOKEN")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let mut cert: Option<PathBuf> = None;
+    let mut key: Option<PathBuf> = None;
     let mut i = 0;
     while i < args.len() {
-        if args[i] == "--listen" {
-            i += 1;
-            match args.get(i) {
-                Some(a) => {
-                    listen = a.clone();
-                    i += 1;
-                }
-                None => {
-                    eprintln!("usage: lin --data <dir> wal-serve [--listen HOST:PORT]");
-                    return ExitCode::from(2);
+        match args[i].as_str() {
+            "--listen" => {
+                i += 1;
+                match args.get(i) {
+                    Some(a) => {
+                        listen = a.clone();
+                        i += 1;
+                    }
+                    None => {
+                        eprintln!(
+                            "usage: lin --data <dir> wal-serve [--listen HOST:PORT] [--token TOKEN] [--tls-cert PEM --tls-key PEM]"
+                        );
+                        return ExitCode::from(2);
+                    }
                 }
             }
-        } else {
-            eprintln!("unknown wal-serve arg {}", args[i]);
+            "--token" => {
+                i += 1;
+                match args.get(i) {
+                    Some(a) => {
+                        token = Some(a.clone());
+                        i += 1;
+                    }
+                    None => {
+                        eprintln!("--token requires a value");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            "--tls-cert" => {
+                i += 1;
+                match args.get(i) {
+                    Some(a) => {
+                        cert = Some(PathBuf::from(a));
+                        i += 1;
+                    }
+                    None => {
+                        eprintln!("--tls-cert requires a path");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            "--tls-key" => {
+                i += 1;
+                match args.get(i) {
+                    Some(a) => {
+                        key = Some(PathBuf::from(a));
+                        i += 1;
+                    }
+                    None => {
+                        eprintln!("--tls-key requires a path");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            other => {
+                eprintln!("unknown wal-serve arg {other}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let tls = match (cert, key) {
+        (Some(c), Some(k)) => match (std::fs::read(&c), std::fs::read(&k)) {
+            (Ok(cert_pem), Ok(key_pem)) => Some(lin::ship::TlsServer { cert_pem, key_pem }),
+            (Err(e), _) => {
+                eprintln!("tls-cert: {e}");
+                return ExitCode::from(1);
+            }
+            (_, Err(e)) => {
+                eprintln!("tls-key: {e}");
+                return ExitCode::from(1);
+            }
+        },
+        (None, None) => None,
+        _ => {
+            eprintln!("tls requires both --tls-cert and --tls-key");
             return ExitCode::from(2);
         }
+    };
+    if tls.is_none() && !listen.starts_with("127.") && !listen.starts_with("[::1]") {
+        eprintln!("warning: plaintext wal-serve on {listen}; use --tls-cert/--tls-key and --token");
     }
     let listener = match TcpListener::bind(&listen) {
         Ok(l) => l,
@@ -384,9 +456,15 @@ fn cmd_wal_serve(args: &[String], data: Option<PathBuf>) -> ExitCode {
         .local_addr()
         .map(|a| a.to_string())
         .unwrap_or(listen);
-    eprintln!("wal-serve {} on {addr} (writer lock held)", dir.display());
+    eprintln!(
+        "wal-serve {} on {addr} tls={} token={} one-sink (writer lock held)",
+        dir.display(),
+        tls.is_some(),
+        token.is_some()
+    );
+    let opts = lin::ship::ServeOpts { token, tls };
     match Db::open(&dir) {
-        Ok(db) => match lin::ship::serve_blocking(&db, listener) {
+        Ok(db) => match lin::ship::serve_blocking_opts(&db, listener, &opts) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("{e}");
@@ -475,11 +553,18 @@ fn cmd_follower(args: &[String], data: Option<PathBuf>) -> ExitCode {
         }
         Some("sync") => {
             let Some(dir) = data else {
-                eprintln!("usage: lin --data <dir> follower sync --from HOST:PORT [--loop SECS]");
+                eprintln!(
+                    "usage: lin --data <dir> follower sync --from HOST:PORT [--loop SECS] [--token TOKEN] [--tls-ca PEM | --tls-insecure]"
+                );
                 return ExitCode::from(2);
             };
             let mut from: Option<String> = None;
             let mut loop_secs: Option<u64> = None;
+            let mut token: Option<String> = std::env::var("LIN_SHIP_TOKEN")
+                .ok()
+                .filter(|s| !s.is_empty());
+            let mut tls_ca: Option<PathBuf> = None;
+            let mut tls_insecure = false;
             let mut i = 1;
             while i < args.len() {
                 match args[i].as_str() {
@@ -506,6 +591,36 @@ fn cmd_follower(args: &[String], data: Option<PathBuf>) -> ExitCode {
                             }
                         }
                     }
+                    "--token" => {
+                        i += 1;
+                        match args.get(i) {
+                            Some(a) => {
+                                token = Some(a.clone());
+                                i += 1;
+                            }
+                            None => {
+                                eprintln!("--token requires a value");
+                                return ExitCode::from(2);
+                            }
+                        }
+                    }
+                    "--tls-ca" => {
+                        i += 1;
+                        match args.get(i) {
+                            Some(a) => {
+                                tls_ca = Some(PathBuf::from(a));
+                                i += 1;
+                            }
+                            None => {
+                                eprintln!("--tls-ca requires a path");
+                                return ExitCode::from(2);
+                            }
+                        }
+                    }
+                    "--tls-insecure" => {
+                        tls_insecure = true;
+                        i += 1;
+                    }
                     other => {
                         eprintln!("unknown follower sync arg {other}");
                         return ExitCode::from(2);
@@ -513,11 +628,27 @@ fn cmd_follower(args: &[String], data: Option<PathBuf>) -> ExitCode {
                 }
             }
             let Some(addr) = from else {
-                eprintln!("usage: lin --data <dir> follower sync --from HOST:PORT [--loop SECS]");
+                eprintln!(
+                    "usage: lin --data <dir> follower sync --from HOST:PORT [--loop SECS] [--token TOKEN] [--tls-ca PEM | --tls-insecure]"
+                );
                 return ExitCode::from(2);
             };
+            let tls = if tls_insecure {
+                lin::ship::TlsClient::Insecure
+            } else if let Some(p) = tls_ca {
+                match std::fs::read(&p) {
+                    Ok(pem) => lin::ship::TlsClient::CaPem(pem),
+                    Err(e) => {
+                        eprintln!("tls-ca: {e}");
+                        return ExitCode::from(1);
+                    }
+                }
+            } else {
+                lin::ship::TlsClient::Off
+            };
+            let pull = lin::ship::PullOpts { token, tls };
             loop {
-                match sync_once(&dir, &addr) {
+                match sync_once(&dir, &addr, &pull) {
                     Ok(()) => {}
                     Err(code) => return code,
                 }
@@ -532,20 +663,20 @@ fn cmd_follower(args: &[String], data: Option<PathBuf>) -> ExitCode {
                 "usage:\n  \
                  lin --data <dir> follower status\n  \
                  lin --data <dir> follower bootstrap --backup <file>\n  \
-                 lin --data <dir> follower sync --from HOST:PORT [--loop SECS]"
+                 lin --data <dir> follower sync --from HOST:PORT [--loop SECS] [--token TOKEN] [--tls-ca PEM | --tls-insecure]"
             );
             ExitCode::from(2)
         }
     }
 }
 
-fn sync_once(dir: &PathBuf, addr: &str) -> Result<(), ExitCode> {
+fn sync_once(dir: &PathBuf, addr: &str, pull: &lin::ship::PullOpts) -> Result<(), ExitCode> {
     let mut db = Db::open_follower(dir).map_err(|e| {
         eprintln!("{e}");
         ExitCode::from(1)
     })?;
     let since = db.r#gen();
-    let frames = lin::ship::pull(addr, since).map_err(|e| {
+    let frames = lin::ship::pull_with(addr, since, pull).map_err(|e| {
         eprintln!("{e}");
         ExitCode::from(1)
     })?;

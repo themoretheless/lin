@@ -179,6 +179,7 @@ impl From<crate::store::StoreOpenPhases> for ReopenPhases {
             metadata_ms: value.metadata_ms,
             indexes_ms: value.indexes_ms,
             row_maps_ms: value.row_maps_ms,
+            fts_ms: value.fts_ms,
             ..Self::default()
         }
     }
@@ -314,9 +315,6 @@ impl Db {
             follower: false,
             embedder: Some(embedder),
         };
-        let phase = Instant::now();
-        db.store.rebuild_fts(&db.catalog);
-        db.reopen.fts_ms = phase.elapsed().as_secs_f64() * 1000.0;
         db.reopen.total_ms = t0.elapsed().as_secs_f64() * 1000.0;
         Ok(db)
     }
@@ -393,9 +391,6 @@ impl Db {
             follower: false,
             embedder: Some(embedder),
         };
-        let phase = Instant::now();
-        inner.store.rebuild_fts(&inner.catalog);
-        inner.reopen.fts_ms = phase.elapsed().as_secs_f64() * 1000.0;
         inner.reopen.total_ms = t0.elapsed().as_secs_f64() * 1000.0;
         Ok(ReadDb {
             inner: Arc::new(inner),
@@ -522,7 +517,7 @@ impl Db {
         self.store.rebuild_indexes();
         self.store.rebuild_row_maps();
         self.store.merge_extras_into(&mut self.catalog);
-        self.store.rebuild_fts(&self.catalog);
+        self.store.ensure_fts(&self.catalog);
         if let Some(p) = self.persist.as_mut() {
             p.catalog_hash = crate::store::catalog_hash(&self.catalog);
             self.store.maybe_checkpoint(p)?;

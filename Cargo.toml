@@ -38,6 +38,8 @@ futures-util = { version = "0.3", optional = true, default-features = false, fea
 tokio-stream = { version = "0.1", optional = true, default-features = false, features = ["sync"] }
 ureq = { version = "3", optional = true, default-features = false, features = ["json", "rustls"] }
 fastembed = { version = "6", optional = true, default-features = false, features = ["ort-download-binaries-native-tls", "hf-hub-native-tls"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+rustls-pemfile = "2"
 
 [dev-dependencies]
 airbug = { git = "https://github.com/themoretheless/airbug", branch = "release", package = "airbug", features = ["macros"] }
@@ -48,6 +50,7 @@ postgres = "0.19"
 mysql = "25"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+rcgen = "0.13"
 
 [[bench]]
 name = "compare"

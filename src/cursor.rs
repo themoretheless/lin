@@ -911,11 +911,6 @@ fn next_lazy_join_soa_projected(
         if idx >= n {
             continue;
         }
-        if let Some(min) = join.total_gt
-            && !(orders_total[idx] > min)
-        {
-            continue;
-        }
         debug_assert_eq!(orders_id.len(), orders_uid.len());
         debug_assert_eq!(orders_id.len(), orders_total.len());
         // SAFETY: `LazyJoinSoa` is constructed only after `orders_soa_ready()`;
@@ -928,6 +923,11 @@ fn next_lazy_join_soa_projected(
                 *orders_total.get_unchecked(idx),
             )
         };
+        if let Some(min) = join.total_gt
+            && total.partial_cmp(&min) != Some(std::cmp::Ordering::Greater)
+        {
+            continue;
+        }
         let right = join.probe.get(uid).copied();
         if right.is_none() && !join.left_join {
             continue;

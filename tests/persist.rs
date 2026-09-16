@@ -963,23 +963,32 @@ fn crash_exit_keeps_entire_group_commit() {
 fn wal_update_after_snapshot_replays_against_row_maps() {
     if let Ok(child) = std::env::var("LIN_UPDATE_REPLAY_CHILD") {
         let mut db = Db::open(&child).unwrap();
-        db.run(r#"update docs[uri == "raw://update-replay"] { title: "after" }"#)
-            .unwrap();
+        let hash = std::env::var("LIN_UPDATE_REPLAY_HASH").unwrap();
+        db.run(&format!(
+            r#"update docs[uri == "raw://update-replay"] cas "{hash}" {{ title: "after" }}"#
+        ))
+        .unwrap();
         unsafe { libc::_exit(1) };
     }
 
     let dir = tmp();
     let mut db = Db::open(&dir).unwrap();
-    db.run(
+    let inserted = db
+        .run(
         r#"insert docs { uri: "raw://update-replay", title: "before", layer: "wiki", body: "replay term" }"#,
     )
     .unwrap();
+    let hash = text(&inserted.rows[0], "hash").to_string();
     db.close().unwrap();
 
     let exe = std::env::current_exe().unwrap();
     let status = std::process::Command::new(&exe)
         .env("LIN_UPDATE_REPLAY_CHILD", &dir)
-        .args(["wal_update_after_snapshot_replays_against_row_maps", "--exact"])
+        .env("LIN_UPDATE_REPLAY_HASH", hash)
+        .args([
+            "wal_update_after_snapshot_replays_against_row_maps",
+            "--exact",
+        ])
         .status()
         .unwrap();
     assert_eq!(status.code(), Some(1));
@@ -991,4 +1000,88 @@ fn wal_update_after_snapshot_replays_against_row_maps() {
     assert_eq!(text(&row.rows[0], "title"), "after");
     reopened.close().unwrap();
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn durable_fts_blob_survives_checkpoint_reopen() {
+    let dir = tmp();
+    {
+        let mut db = Db::open(&dir).unwrap();
+        db.run(
+            r#"insert docs { uri: "raw://fts", title: "wal postings", layer: "wiki", body: "durable lex" }"#,
+        )
+        .unwrap();
+        db.checkpoint().unwrap();
+        assert!(
+            dir.join("fts").join("docs.bin").is_file(),
+            "checkpoint should write fts/docs.bin"
+        );
+        db.close().unwrap();
+    }
+    {
+        let mut db = Db::open(&dir).unwrap();
+        let q = db.run(r#"docs | search lex "postings" | take 5"#).unwrap();
+        assert_eq!(q.done.n, 1, "loaded postings should find the row");
+        db.close().unwrap();
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn ship_tls_token_roundtrip() {
+    let primary_dir = tmp();
+    let follower_dir = tmp();
+    let bak = primary_dir.join("boot.linbak");
+
+    let cert = rcgen::generate_simple_self_signed(["localhost".into()]).unwrap();
+    let tls = lin::ship::TlsServer {
+        cert_pem: cert.cert.pem().into_bytes(),
+        key_pem: cert.key_pair.serialize_pem().into_bytes(),
+    };
+    let ca = tls.cert_pem.clone();
+
+    let mut primary = Db::open(&primary_dir).unwrap();
+    primary
+        .run(r#"insert docs { uri: "raw://tls0", title: "T0", layer: "wiki" }"#)
+        .unwrap();
+    primary.export_backup(&bak).unwrap();
+    primary
+        .run(r#"insert docs { uri: "raw://tls1", title: "T1", layer: "wiki" }"#)
+        .unwrap();
+
+    let mut follower = Db::bootstrap_follower(&bak, &follower_dir).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let serve_opts = lin::ship::ServeOpts {
+        token: Some("s3cret".into()),
+        tls: Some(tls),
+    };
+    let serve = thread::spawn(move || {
+        lin::ship::serve_one_opts(&primary, &listener, &serve_opts).unwrap();
+        let _ = primary.close();
+    });
+    thread::sleep(Duration::from_millis(40));
+    let frames = lin::ship::pull_with(
+        addr,
+        follower.r#gen(),
+        &lin::ship::PullOpts {
+            token: Some("s3cret".into()),
+            tls: lin::ship::TlsClient::CaPem(ca),
+        },
+    )
+    .unwrap();
+    let n = follower.apply_wal(&frames).unwrap();
+    assert_eq!(n, 1);
+    assert_eq!(
+        follower
+            .run(r#"docs | uri == "raw://tls1""#)
+            .unwrap()
+            .done
+            .n,
+        1
+    );
+    follower.close().unwrap();
+    serve.join().unwrap();
+    let _ = fs::remove_dir_all(&primary_dir);
+    let _ = fs::remove_dir_all(&follower_dir);
 }

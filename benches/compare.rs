@@ -1127,7 +1127,7 @@ struct LinDurableInsert {
 
 fn setup_lin_durable_insert(n: usize) -> LinDurableInsert {
     let dir = fresh_tmp("insert");
-    let db = lin::Db::open(&dir.0).expect("lin durable open");
+    let mut db = lin::Db::open(&dir.0).expect("lin durable open");
     db.run("index docs [wing, ts]").expect("lin index");
     let prepared = db
         .prepare(&lin_insert_src(&docs(n)))
@@ -1154,7 +1154,7 @@ struct LinGroupCommit {
 
 fn setup_lin_group_commit() -> LinGroupCommit {
     let dir = fresh_tmp("group-commit");
-    let mut db = lin::Db::open(&dir.0).expect("lin durable open");
+    let db = lin::Db::open(&dir.0).expect("lin durable open");
     let mut statements = Vec::with_capacity(GROUP_COMMITS);
     let mut singles = Vec::with_capacity(GROUP_COMMITS);
     for i in 0..GROUP_COMMITS {

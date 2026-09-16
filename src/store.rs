@@ -23,6 +23,7 @@ pub(crate) struct StoreOpenPhases {
     pub metadata_ms: f64,
     pub indexes_ms: f64,
     pub row_maps_ms: f64,
+    pub fts_ms: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -309,6 +310,12 @@ impl Store {
         store.rebuild_row_maps();
         phases.row_maps_ms = phase.elapsed().as_secs_f64() * 1000.0;
 
+        let mut fts_cat = cat.clone();
+        store.merge_extras_into(&mut fts_cat);
+        let fts_t0 = Instant::now();
+        store.try_load_fts(dir, &fts_cat);
+        let mut fts_ms = fts_t0.elapsed().as_secs_f64() * 1000.0;
+
         let phase = Instant::now();
         let mut log = persist::open_log(dir)?;
         let min_gen = store.r#gen;
@@ -355,6 +362,11 @@ impl Store {
             },
         )?;
         phases.metadata_ms = phase.elapsed().as_secs_f64() * 1000.0;
+
+        let fts_t1 = Instant::now();
+        store.ensure_fts(&live);
+        fts_ms += fts_t1.elapsed().as_secs_f64() * 1000.0;
+        phases.fts_ms = fts_ms;
 
         let persist = Persist {
             dir: dir.to_path_buf(),
@@ -413,6 +425,11 @@ impl Store {
         let phase = Instant::now();
         store.rebuild_row_maps();
         phases.row_maps_ms = phase.elapsed().as_secs_f64() * 1000.0;
+        let mut fts_cat = cat.clone();
+        store.merge_extras_into(&mut fts_cat);
+        let fts_t0 = Instant::now();
+        store.try_load_fts(dir, &fts_cat);
+        let mut fts_ms = fts_t0.elapsed().as_secs_f64() * 1000.0;
         let phase = Instant::now();
         let mut log = persist::open_log_read(dir)?;
         let min_gen = store.r#gen;
@@ -424,6 +441,12 @@ impl Store {
             })?;
         }
         phases.wal_ms = phase.elapsed().as_secs_f64() * 1000.0;
+        let mut live = cat.clone();
+        store.merge_extras_into(&mut live);
+        let fts_t1 = Instant::now();
+        store.ensure_fts(&live);
+        fts_ms += fts_t1.elapsed().as_secs_f64() * 1000.0;
+        phases.fts_ms = fts_ms;
         Ok((store, lock, phases))
     }
 
@@ -607,6 +630,7 @@ impl Store {
         };
         persist::write_snapshot(&persist.dir, &snap)?;
         persist::write_head(&persist.dir, &head)?;
+        self.write_fts_files(&persist.dir)?;
         persist::compact_log(&mut persist.log)?;
         persist.writes_since_snapshot = 0;
         persist.log_bytes = 0;
@@ -1735,7 +1759,36 @@ impl Store {
         }
     }
 
-    /// Rebuild FTS postings from catalog `fts` fields (rebuild-on-open / after writes).
+    /// Load checkpointed posting lists when gen/nrows/fields match; ignore stale files.
+    fn try_load_fts(&mut self, dir: &Path, catalog: &crate::catalog::Catalog) {
+        for cname in catalog.collections.keys() {
+            let fields = crate::fts::fts_fields(catalog, cname);
+            if fields.is_empty() {
+                continue;
+            }
+            let nrows = self.collection(cname).len() as u64;
+            match crate::fts::read_fts(dir, cname) {
+                Ok((generation, file_rows, idx))
+                    if generation == self.r#gen && file_rows == nrows && idx.fields == fields =>
+                {
+                    self.fts.insert(cname.clone(), idx);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn write_fts_files(&self, dir: &Path) -> Result<(), Error> {
+        let mut keep = Vec::new();
+        for (name, idx) in &self.fts {
+            let nrows = self.collection(name).len() as u64;
+            crate::fts::write_fts(dir, name, idx, self.r#gen, nrows)?;
+            keep.push(name.clone());
+        }
+        crate::fts::prune_fts(dir, &keep)
+    }
+
+    /// Rebuild FTS postings from catalog `fts` fields (memory / missing durable blob).
     pub fn rebuild_fts(&mut self, catalog: &crate::catalog::Catalog) {
         self.fts.clear();
         for (cname, cdef) in &catalog.collections {
@@ -1746,6 +1799,28 @@ impl Store {
                 .map(|(n, _)| n.clone())
                 .collect();
             if fields.is_empty() {
+                continue;
+            }
+            let rows = self.collection(cname);
+            self.fts
+                .insert(cname.clone(), crate::fts::FtsIndex::build(rows, &fields));
+        }
+    }
+
+    /// Rebuild only collections that have no live posting list.
+    pub fn ensure_fts(&mut self, catalog: &crate::catalog::Catalog) {
+        for (cname, cdef) in &catalog.collections {
+            let fields: Vec<String> = cdef
+                .fields
+                .iter()
+                .filter(|(_, f)| f.fts)
+                .map(|(n, _)| n.clone())
+                .collect();
+            if fields.is_empty() {
+                self.fts.remove(cname);
+                continue;
+            }
+            if self.fts.contains_key(cname) {
                 continue;
             }
             let rows = self.collection(cname);

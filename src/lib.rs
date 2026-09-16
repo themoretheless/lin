@@ -5,25 +5,25 @@
 //! Prefer these entry points; treat other `pub` items as evolving:
 //! - [`Db`]: [`Db::empty`], [`Db::fixture`], [`Db::open`], [`Db::open_read`],
 //!   [`Db::open_follower`], [`Db::bootstrap_follower`], [`Db::close`], [`Db::checkpoint`],
-//!   [`Db::run`], [`Db::prepare`], [`Db::explain_as`],
+//!   [`Db::run`], [`Db::run_group`], [`Db::prepare`], [`Db::explain_as`],
 //!   [`Db::reader`], [`Db::export_backup`], [`Db::import_backup`], [`Db::stats`],
 //!   [`Db::with_quotas`], [`Db::with_sync_mode`], [`Db::open_with`],
 //!   [`Db::export_wal_since`], [`Db::apply_wal`], [`Db::with_embedder`]
 //! - [`ReadDb`]: shared read-only snapshot ([`ReadDb::run`], [`ReadDb::clone`])
 //! - Fluent / typed: [`Queryable`], [`BoundQueryable`], [`query`], [`QueryCursor`],
-//!   [`FromRow`], [`LinRow`], [`FromCell`], [`map_rows`], [`cell_get`]
+//!   [`ProjectedRow`], [`FromRow`], [`LinRow`], [`FromCell`], [`map_rows`], [`cell_get`]
 //! - Feature `async` (default-on): [`AsyncDb`], [`AsyncReadDb`], `to_vec_async` /
 //!   `stream_*` (offload via `spawn_blocking` — not async storage I/O)
 //! - Free functions: [`parse`], [`compile`], [`run`], [`explain`], [`explain_as`]
 //! - Types: [`Handle`], [`Done`], [`Prepared`], [`Error`], [`Row`], [`Cell`], [`Store`],
-//!   [`Plan`], [`Stats`], [`Quotas`], [`SyncMode`], [`OpenOpts`], [`Embedder`],
+//!   [`Plan`], [`Stats`], [`ReopenPhases`], [`Quotas`], [`SyncMode`], [`OpenOpts`], [`Embedder`],
 //!   [`HashingEmbedder`], [`VERSION`]
 //!
 //! Opt-in neural embed (not default): feature `embed-ollama` ([`OllamaEmbedder`]),
 //! `embed-onnx` ([`OnnxEmbedder`]).
 //!
 //! Experimental (outside freeze): [`Db::run_stmt`], [`RowExt`], [`RecordBatch`]
-//! (columnar OLAP), [`ship`] TCP WAL pull/serve (no TLS).
+//! (columnar OLAP), [`ship`] WAL pull/serve (TLS + token, one sink).
 //!
 //! Semver: breaking changes to the stable list require a major bump after 1.0;
 //! until then minors may still adjust experimental surfaces (`Stmt`, plan IR,
