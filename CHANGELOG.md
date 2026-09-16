@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.4.0] — 2026-09-16
+
+### Added
+
+- **m2 FTS:** in-memory postings (`src/fts.rs`) for catalog fields with `fts: true`
+  (`docs.title` / `docs.body`). Rebuild-on-open / after writes (no durable FTS blob).
+  `search lex` and hybrid lex-half use postings → residual `lex_score`. Plan/explain
+  label **`FtsSeek`** (not `IndexSeek`).
+- **m5 lazy cursor:** `hop` depth=1 and `search lex|hybrid | take` are lazy
+  (`QueryCursor::is_lazy()`), driven by FTS/neighbor idxs.
+
+### Docs
+
+- README roadmap: 0.4 done; guarantees table lists FTS; lazy cursor shapes updated.
+
 ## [0.3.1] — 2026-09-16
 
 ### Added

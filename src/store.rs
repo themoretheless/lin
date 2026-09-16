@@ -8,9 +8,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::ast::{Decl, TypeExpr};
 use crate::catalog::Catalog;
+use crate::cold;
 use crate::error::Error;
 use crate::index::LiveIndex;
-use crate::cold;
 use crate::persist::{
     self, ColSnap, Head, IndexSnap, LogRecord, OpenMemOpts, Pack, Persist, RelSnap, Snapshot,
 };
@@ -160,6 +160,8 @@ pub struct Store {
     pub extra_rels: BTreeMap<String, RelSnap>,
     pub extra_indexes: BTreeMap<String, IndexSnap>,
     pub indexes: BTreeMap<String, LiveIndex>,
+    /// collection → FTS postings (fields with catalog `fts`).
+    pub(crate) fts: BTreeMap<String, crate::fts::FtsIndex>,
     /// collection → id → row index (O(1) Get / IndexSeek fetch).
     by_id: BTreeMap<String, FxHashMap<String, usize>>,
     /// docs uri → row index.
@@ -215,6 +217,7 @@ impl Store {
             extra_rels: BTreeMap::new(),
             extra_indexes: BTreeMap::new(),
             indexes: BTreeMap::new(),
+            fts: BTreeMap::new(),
             by_id: BTreeMap::new(),
             docs_by_uri: FxHashMap::default(),
             facts_by_spo: FxHashMap::default(),
@@ -240,6 +243,7 @@ impl Store {
     pub fn clone_mem(&mut self) -> Self {
         let mut s = Self::empty(self.embed_id.clone());
         s.mem_restore(self.mem_backup());
+        s.fts = self.fts.clone();
         s
     }
 
@@ -382,6 +386,7 @@ impl Store {
             extra_rels: s.extra_rels.clone(),
             extra_indexes: s.extra_indexes.clone(),
             indexes: BTreeMap::new(),
+            fts: BTreeMap::new(),
             by_id: BTreeMap::new(),
             docs_by_uri: FxHashMap::default(),
             facts_by_spo: FxHashMap::default(),
@@ -422,7 +427,11 @@ impl Store {
         self.capture_snapshot_at(catalog_hash, 0)
     }
 
-    pub fn capture_snapshot_at(&mut self, catalog_hash: impl Into<String>, log_offset: u64) -> Snapshot {
+    pub fn capture_snapshot_at(
+        &mut self,
+        catalog_hash: impl Into<String>,
+        log_offset: u64,
+    ) -> Snapshot {
         self.ensure_facts_rows();
         let cold_names: Vec<String> = self.cold.keys().cloned().collect();
         for name in cold_names {
@@ -564,6 +573,7 @@ impl Store {
                 let idx = self.collection(collection).len() - 1;
                 self.row_maps_register(collection, idx);
                 let _ = self.index_insert_at(collection, idx);
+                self.fts_insert_at(collection, idx);
                 for e in edges {
                     let _ = self.append_edge_parts(&e.rel, &e.from, &e.to);
                 }
@@ -577,9 +587,9 @@ impl Store {
                 self.collection_mut(collection).reserve(rows.len());
                 self.row_maps_reserve(collection, rows.len());
                 let _ = self.index_insert_slab(collection, start, rows);
+                self.fts_insert_slab(collection, start, rows);
                 self.row_maps_register_slab(collection, start, rows);
-                self.collection_mut(collection)
-                    .extend(rows.iter().cloned());
+                self.collection_mut(collection).extend(rows.iter().cloned());
                 for e in edges {
                     let _ = self.append_edge_parts(&e.rel, &e.from, &e.to);
                 }
@@ -597,6 +607,7 @@ impl Store {
                 self.collection_mut(collection).reserve(rows.len());
                 self.row_maps_reserve(collection, rows.len());
                 let _ = self.index_insert_slab(collection, start, &rows);
+                self.fts_insert_slab(collection, start, &rows);
                 self.row_maps_register_slab(collection, start, &rows);
                 self.collection_mut(collection).extend(rows);
                 for e in edges {
@@ -626,15 +637,18 @@ impl Store {
                     let idx = id.as_ref().and_then(|id| self.row_index(collection, id));
                     if let Some(i) = idx {
                         self.index_remove_at(collection, i);
+                        self.fts_remove_at(collection, i);
                         self.collection_mut(collection)[i] = new.clone();
                         self.row_maps_reregister(collection, i);
                         let _ = self.index_insert_at(collection, i);
+                        self.fts_insert_at(collection, i);
                         continue;
                     }
                     self.collection_mut(collection).push(new.clone());
                     let i = self.collection(collection).len() - 1;
                     self.row_maps_register(collection, i);
                     let _ = self.index_insert_at(collection, i);
+                    self.fts_insert_at(collection, i);
                 }
             }
             Pack::Reembed => {}
@@ -643,6 +657,7 @@ impl Store {
                     .retain(|r| !rows.iter().any(|d| same_row_key(collection, r, d)));
                 self.rebuild_row_maps_collection(collection);
                 self.rebuild_indexes_collection(collection);
+                self.rebuild_fts_inplace(collection);
             }
             Pack::DeleteEdge { rel, from, to } => {
                 self.remove_edge(rel, from, to);
@@ -921,8 +936,7 @@ impl Store {
     }
 
     pub fn find_doc_key(&self, key: &str) -> Option<&Row> {
-        self.get_by_id("docs", key)
-            .or_else(|| self.get_by_uri(key))
+        self.get_by_id("docs", key).or_else(|| self.get_by_uri(key))
     }
 
     pub fn get_by_id(&self, collection: &str, id: &str) -> Option<&Row> {
@@ -1188,7 +1202,10 @@ impl Store {
     }
 
     pub fn rebuild_row_maps_collection(&mut self, collection: &str) {
-        self.by_id.entry(collection.to_string()).or_default().clear();
+        self.by_id
+            .entry(collection.to_string())
+            .or_default()
+            .clear();
         if collection == "docs" {
             self.docs_by_uri.clear();
             self.docs_id.clear();
@@ -1244,10 +1261,18 @@ impl Store {
                 (
                     row_text(row, "id").map(str::to_string),
                     row_text(row, "uri").map(str::to_string),
-                    row.get("id").and_then(Cell::text_shared).unwrap_or_default(),
-                    row.get("title").and_then(Cell::text_shared).unwrap_or_default(),
-                    row.get("layer").and_then(Cell::text_shared).unwrap_or_default(),
-                    row.get("wing").and_then(Cell::text_shared).unwrap_or_default(),
+                    row.get("id")
+                        .and_then(Cell::text_shared)
+                        .unwrap_or_default(),
+                    row.get("title")
+                        .and_then(Cell::text_shared)
+                        .unwrap_or_default(),
+                    row.get("layer")
+                        .and_then(Cell::text_shared)
+                        .unwrap_or_default(),
+                    row.get("wing")
+                        .and_then(Cell::text_shared)
+                        .unwrap_or_default(),
                     if collection == "facts" {
                         spo_key(row)
                     } else {
@@ -1357,7 +1382,10 @@ impl Store {
         let Some(row) = self.collections.get(collection).and_then(|c| c.get(idx)) else {
             return;
         };
-        let id = row.get("id").and_then(Cell::text_shared).unwrap_or_default();
+        let id = row
+            .get("id")
+            .and_then(Cell::text_shared)
+            .unwrap_or_default();
         if collection == "orders" {
             let uid = row
                 .get("user_id")
@@ -1403,9 +1431,18 @@ impl Store {
                 .insert(id.as_ref().to_owned(), idx);
         }
         if collection == "docs" {
-            let title = row.get("title").and_then(Cell::text_shared).unwrap_or_default();
-            let layer = row.get("layer").and_then(Cell::text_shared).unwrap_or_default();
-            let wing = row.get("wing").and_then(Cell::text_shared).unwrap_or_default();
+            let title = row
+                .get("title")
+                .and_then(Cell::text_shared)
+                .unwrap_or_default();
+            let layer = row
+                .get("layer")
+                .and_then(Cell::text_shared)
+                .unwrap_or_default();
+            let wing = row
+                .get("wing")
+                .and_then(Cell::text_shared)
+                .unwrap_or_default();
             let did = id.clone().unwrap_or_default();
             if let Some(uri) = uri {
                 self.docs_by_uri.insert(uri.as_ref().to_owned(), idx);
@@ -1491,12 +1528,21 @@ impl Store {
                     self.docs_by_uri.insert(uri.as_ref().to_owned(), idx);
                 }
                 self.docs_id.push(id.unwrap_or_default());
-                self.docs_title
-                    .push(row.get("title").and_then(Cell::text_shared).unwrap_or_default());
-                self.docs_layer
-                    .push(row.get("layer").and_then(Cell::text_shared).unwrap_or_default());
-                self.docs_wing
-                    .push(row.get("wing").and_then(Cell::text_shared).unwrap_or_default());
+                self.docs_title.push(
+                    row.get("title")
+                        .and_then(Cell::text_shared)
+                        .unwrap_or_default(),
+                );
+                self.docs_layer.push(
+                    row.get("layer")
+                        .and_then(Cell::text_shared)
+                        .unwrap_or_default(),
+                );
+                self.docs_wing.push(
+                    row.get("wing")
+                        .and_then(Cell::text_shared)
+                        .unwrap_or_default(),
+                );
             }
             return;
         }
@@ -1570,7 +1616,12 @@ impl Store {
     }
 
     /// Batch secondary-index inserts for a freshly appended slab `[start, start+rows.len())`.
-    pub fn index_insert_slab(&mut self, collection: &str, start: usize, rows: &[Row]) -> Result<(), Error> {
+    pub fn index_insert_slab(
+        &mut self,
+        collection: &str,
+        start: usize,
+        rows: &[Row],
+    ) -> Result<(), Error> {
         let labels: Vec<String> = self
             .indexes
             .iter()
@@ -1616,6 +1667,88 @@ impl Store {
             }
             self.indexes.insert(label, live);
         }
+    }
+
+    /// Rebuild FTS postings from catalog `fts` fields (rebuild-on-open / after writes).
+    pub fn rebuild_fts(&mut self, catalog: &crate::catalog::Catalog) {
+        self.fts.clear();
+        for (cname, cdef) in &catalog.collections {
+            let fields: Vec<String> = cdef
+                .fields
+                .iter()
+                .filter(|(_, f)| f.fts)
+                .map(|(n, _)| n.clone())
+                .collect();
+            if fields.is_empty() {
+                continue;
+            }
+            let rows = self.collection(cname);
+            self.fts
+                .insert(cname.clone(), crate::fts::FtsIndex::build(rows, &fields));
+        }
+    }
+
+    pub fn rebuild_fts_collection(&mut self, catalog: &crate::catalog::Catalog, collection: &str) {
+        let Some(cdef) = catalog.collections.get(collection) else {
+            self.fts.remove(collection);
+            return;
+        };
+        let fields: Vec<String> = cdef
+            .fields
+            .iter()
+            .filter(|(_, f)| f.fts)
+            .map(|(n, _)| n.clone())
+            .collect();
+        if fields.is_empty() {
+            self.fts.remove(collection);
+            return;
+        }
+        let rows = self.collection(collection);
+        self.fts.insert(
+            collection.to_string(),
+            crate::fts::FtsIndex::build(rows, &fields),
+        );
+    }
+
+    pub fn fts_insert_at(&mut self, collection: &str, row_idx: usize) {
+        let Some(row) = self
+            .collections
+            .get(collection)
+            .and_then(|c| c.get(row_idx))
+            .cloned()
+        else {
+            return;
+        };
+        if let Some(fts) = self.fts.get_mut(collection) {
+            fts.insert_row(row_idx, &row);
+        }
+    }
+
+    pub fn fts_insert_slab(&mut self, collection: &str, start: usize, rows: &[Row]) {
+        let Some(fts) = self.fts.get_mut(collection) else {
+            return;
+        };
+        for (i, row) in rows.iter().enumerate() {
+            fts.insert_row(start + i, row);
+        }
+    }
+
+    pub fn fts_remove_at(&mut self, collection: &str, row_idx: usize) {
+        if let Some(fts) = self.fts.get_mut(collection) {
+            fts.remove_row_idx(row_idx);
+        }
+    }
+
+    /// Rebuild one collection's FTS using existing field list (after delete / compact).
+    pub fn rebuild_fts_inplace(&mut self, collection: &str) {
+        let Some(fields) = self.fts.get(collection).map(|f| f.fields.clone()) else {
+            return;
+        };
+        let rows = self.collection(collection);
+        self.fts.insert(
+            collection.to_string(),
+            crate::fts::FtsIndex::build(rows, &fields),
+        );
     }
 
     pub fn rebuild_indexes_collection(&mut self, collection: &str) {
@@ -1734,9 +1867,7 @@ impl Store {
     /// True when orders SoA matches `collections["orders"]` length.
     pub fn orders_soa_ready(&self) -> bool {
         let n = self.collection("orders").len();
-        self.orders_id.len() == n
-            && self.orders_user_id.len() == n
-            && self.orders_total.len() == n
+        self.orders_id.len() == n && self.orders_user_id.len() == n && self.orders_total.len() == n
     }
 
     /// True when users SoA matches `collections["users"]` length.

@@ -17,7 +17,9 @@ use crate::graph::GraphFmt;
 use crate::parse;
 use crate::persist::{Pack, Persist};
 use crate::plan::{self, Plan};
-use crate::store::{Cell, Edge, Row, Store, compact_row, content_hash_arc, now_ms, project_fields, row_text};
+use crate::store::{
+    Cell, Edge, Row, Store, compact_row, content_hash_arc, now_ms, project_fields, row_text,
+};
 
 pub use crate::persist::{OpenMemOpts as OpenOpts, SyncMode};
 
@@ -191,7 +193,7 @@ impl Db {
 
     fn bare(catalog: Catalog, store: Store) -> Self {
         let embedder = Self::default_embedder(&catalog);
-        Self {
+        let mut db = Self {
             catalog,
             store,
             persist: None,
@@ -205,7 +207,9 @@ impl Db {
             pulled_wal: Vec::new(),
             follower: false,
             embedder: Some(embedder),
-        }
+        };
+        db.store.rebuild_fts(&db.catalog);
+        db
     }
 
     pub fn fixture() -> Self {
@@ -267,7 +271,7 @@ impl Db {
         store.merge_extras_into(&mut catalog);
         let reopen_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let embedder = Self::default_embedder(&catalog);
-        Ok(Self {
+        let mut db = Self {
             catalog,
             store,
             persist: Some(persist),
@@ -281,7 +285,9 @@ impl Db {
             pulled_wal: Vec::new(),
             follower: false,
             embedder: Some(embedder),
-        })
+        };
+        db.store.rebuild_fts(&db.catalog);
+        Ok(db)
     }
 
     /// Open a durable **read-only follower** (hot standby).
@@ -342,22 +348,24 @@ impl Db {
         store.merge_extras_into(&mut catalog);
         let reopen_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let embedder = Self::default_embedder(&catalog);
+        let mut inner = Self {
+            catalog,
+            store,
+            persist: None,
+            reader_lock: Some(lock),
+            plan_cache: FxHashMap::default(),
+            quotas: Quotas::default(),
+            reopen_ms: reopen_ms as u64,
+            append_rows: 0,
+            append_ms: 0.0,
+            pins: BTreeMap::new(),
+            pulled_wal: Vec::new(),
+            follower: false,
+            embedder: Some(embedder),
+        };
+        inner.store.rebuild_fts(&inner.catalog);
         Ok(ReadDb {
-            inner: Arc::new(Self {
-                catalog,
-                store,
-                persist: None,
-                reader_lock: Some(lock),
-                plan_cache: FxHashMap::default(),
-                quotas: Quotas::default(),
-                reopen_ms: reopen_ms as u64,
-                append_rows: 0,
-                append_ms: 0.0,
-                pins: BTreeMap::new(),
-                pulled_wal: Vec::new(),
-                follower: false,
-                embedder: Some(embedder),
-            }),
+            inner: Arc::new(inner),
         })
     }
 
@@ -481,6 +489,7 @@ impl Db {
         self.store.rebuild_indexes();
         self.store.rebuild_row_maps();
         self.store.merge_extras_into(&mut self.catalog);
+        self.store.rebuild_fts(&self.catalog);
         if let Some(p) = self.persist.as_mut() {
             p.catalog_hash = crate::store::catalog_hash(&self.catalog);
             self.store.maybe_checkpoint(p)?;
@@ -765,9 +774,7 @@ impl Db {
 
     pub fn run_prepared_readonly(&self, prepared: &Prepared) -> Result<Handle, Error> {
         if prepared.writes {
-            return Err(Error::runtime(
-                "read-only snapshot: writes not allowed",
-            ));
+            return Err(Error::runtime("read-only snapshot: writes not allowed"));
         }
         let t0 = Instant::now();
         let (rows, message, pack) = self.exec_program_readonly(&prepared.stmts)?;
@@ -813,9 +820,7 @@ impl Db {
                     last_msg = Some("no-op".into());
                 }
                 _ => {
-                    return Err(Error::runtime(
-                        "read-only snapshot: writes not allowed",
-                    ));
+                    return Err(Error::runtime("read-only snapshot: writes not allowed"));
                 }
             }
         }
@@ -844,11 +849,7 @@ impl Db {
     }
 
     /// Explain a program already parsed as AST.
-    pub fn explain_stmt(
-        &mut self,
-        stmt: Stmt,
-        graph: Option<GraphFmt>,
-    ) -> Result<String, Error> {
+    pub fn explain_stmt(&mut self, stmt: Stmt, graph: Option<GraphFmt>) -> Result<String, Error> {
         self.explain_stmts(vec![stmt], graph, None)
     }
 
@@ -1093,9 +1094,9 @@ impl Db {
                     bulk_o.push(o);
                 }
                 let want_rows = n <= 128;
-                let (rows, changed_n) =
-                    self.store
-                        .append_facts_spo_bulk(&bulk_s, &bulk_p, &bulk_o, want_rows);
+                let (rows, changed_n) = self
+                    .store
+                    .append_facts_spo_bulk(&bulk_s, &bulk_p, &bulk_o, want_rows);
                 let msg = if changed_n == 0 {
                     Some("idempotent".into())
                 } else {
@@ -1171,8 +1172,7 @@ impl Db {
                 records,
                 edges,
             } => {
-                let (rows, new_edges) =
-                    self.insert_bulk(collection, records, edges.as_slice())?;
+                let (rows, new_edges) = self.insert_bulk(collection, records, edges.as_slice())?;
                 mark_written(ctx, collection, &rows);
                 let pack = if self.is_durable() {
                     Some(crate::persist::rows_to_insert_cols(
@@ -1310,11 +1310,7 @@ impl Db {
             Stmt::IdbPush => {
                 let frames = std::mem::take(&mut self.pulled_wal);
                 if frames.is_empty() {
-                    return Ok((
-                        Vec::new(),
-                        Some("push idb: nothing pulled".into()),
-                        None,
-                    ));
+                    return Ok((Vec::new(), Some("push idb: nothing pulled".into()), None));
                 }
                 if self.persist.is_some() && !self.follower {
                     return Err(Error::runtime(
@@ -1322,11 +1318,7 @@ impl Db {
                     ));
                 }
                 let n = self.apply_wal(&frames)?;
-                let where_ = if self.follower {
-                    "follower"
-                } else {
-                    "memory"
-                };
+                let where_ = if self.follower { "follower" } else { "memory" };
                 Ok((
                     Vec::new(),
                     Some(format!("push idb: applied {n} frames ({where_})")),
@@ -1334,8 +1326,7 @@ impl Db {
                 ))
             }
             Stmt::Snapshot { name } | Stmt::Pin { name } => {
-                self.pins
-                    .insert(name.clone(), self.store.mem_backup());
+                self.pins.insert(name.clone(), self.store.mem_backup());
                 Ok((
                     Vec::new(),
                     Some(format!(
@@ -1396,6 +1387,11 @@ impl Db {
 
         // Filter → project → take: materialize projected rows without full BTreeMap clones.
         if let Some(rows) = self.try_filter_project(q, bindings, now) {
+            return Ok(rows);
+        }
+
+        // collection | search lex|hybrid | … — FTS postings, no full scan.
+        if let Some(rows) = self.try_fts_search(q, bindings)? {
             return Ok(rows);
         }
 
@@ -1556,12 +1552,9 @@ impl Db {
                     Step::Project(f) => Some(field_names(f)),
                     _ => None,
                 });
-                let row = self.store.project_by_key(
-                    "docs",
-                    "uri",
-                    uri,
-                    fields.as_deref(),
-                )?;
+                let row = self
+                    .store
+                    .project_by_key("docs", "uri", uri, fields.as_deref())?;
                 // Only allow Filter/Project/Skip/Take after page get.
                 if q.steps.iter().any(|s| {
                     !matches!(
@@ -1628,12 +1621,152 @@ impl Db {
                 return Some(Vec::new());
             }
             // pred ok on full; return projected if requested
-            return Some(vec![self
-                .store
-                .project_by_key(name, field, key, fields.as_deref())
-                .unwrap_or(full)]);
+            return Some(vec![
+                self.store
+                    .project_by_key(name, field, key, fields.as_deref())
+                    .unwrap_or(full),
+            ]);
         }
         Some(vec![row])
+    }
+
+    /// `col | search lex|hybrid …` — FTS postings → residual score (no full scan).
+    fn try_fts_search(
+        &self,
+        q: &Query,
+        bindings: &BTreeMap<String, Vec<Row>>,
+    ) -> Result<Option<Vec<Row>>, Error> {
+        let Source::Collection(name) = &q.source else {
+            return Ok(None);
+        };
+        if bindings.get(name).is_some() {
+            return Ok(None);
+        }
+        if !self.store.fts.contains_key(name) {
+            return Ok(None);
+        }
+
+        let mut mode: Option<SearchMode> = None;
+        let mut query: Option<&str> = None;
+        let mut skip_n: usize = 0;
+        let mut take_n: Option<Option<i64>> = None;
+        let mut proj: Option<&[Field]> = None;
+        let mut saw_take = false;
+
+        for step in &q.steps {
+            match step {
+                Step::Search { mode: m, query: qq } => {
+                    if mode.is_some() {
+                        return Ok(None);
+                    }
+                    if !matches!(m, SearchMode::Lex | SearchMode::Hybrid) {
+                        return Ok(None);
+                    }
+                    mode = Some(*m);
+                    query = Some(qq.as_str());
+                }
+                Step::Skip { n } => {
+                    skip_n = skip_n.saturating_add((*n).max(0) as usize);
+                }
+                Step::Take { n } => {
+                    if saw_take {
+                        return Ok(None);
+                    }
+                    saw_take = true;
+                    take_n = Some(*n);
+                }
+                Step::Project(f) => {
+                    if proj.is_some() {
+                        return Ok(None);
+                    }
+                    proj = Some(f.as_slice());
+                }
+                _ => return Ok(None),
+            }
+        }
+
+        let (Some(mode), Some(query)) = (mode, query) else {
+            return Ok(None);
+        };
+
+        let mut rows = self.search_fts(name, mode, query)?;
+        if skip_n > 0 {
+            if skip_n >= rows.len() {
+                rows.clear();
+            } else {
+                rows.drain(0..skip_n);
+            }
+        }
+        let limit = match take_n {
+            Some(Some(n)) => Some(n.max(0) as usize),
+            Some(None) => None,
+            None => Some(50),
+        };
+        if let Some(n) = limit
+            && rows.len() > n
+        {
+            rows.truncate(n);
+        }
+        if let Some(fields) = proj {
+            rows = project(&rows, fields);
+        }
+        Ok(Some(rows))
+    }
+
+    pub(crate) fn search_fts(
+        &self,
+        collection: &str,
+        mode: SearchMode,
+        query: &str,
+    ) -> Result<Vec<Row>, Error> {
+        match mode {
+            SearchMode::Lex => {
+                let fts = self.store.fts.get(collection).unwrap();
+                let idxs = fts.candidate_idxs(query);
+                let col = self.store.collection(collection);
+                let mut scored: Vec<(i64, Row)> = idxs
+                    .into_iter()
+                    .filter_map(|i| {
+                        let r = col.get(i)?;
+                        let s = lex_score(r, query);
+                        if s > 0 { Some((s, r.clone())) } else { None }
+                    })
+                    .collect();
+                scored.sort_by_key(|a| std::cmp::Reverse(a.0));
+                Ok(scored.into_iter().map(|(_, r)| r).collect())
+            }
+            SearchMode::Hybrid => {
+                const RRF_K: f64 = 60.0;
+                let lex = self.search_fts(collection, SearchMode::Lex, query)?;
+                let all = self.store.collection(collection);
+                let vec = self.search_rows(all, SearchMode::Vec, query)?;
+                let mut scores: BTreeMap<String, f64> = BTreeMap::new();
+                let mut by_id: BTreeMap<String, Row> = BTreeMap::new();
+                for (rank, r) in lex.iter().enumerate() {
+                    let id = row_text(r, "id")
+                        .or_else(|| row_text(r, "uri"))
+                        .unwrap_or("")
+                        .to_string();
+                    *scores.entry(id.clone()).or_default() += 1.0 / (RRF_K + rank as f64 + 1.0);
+                    by_id.entry(id).or_insert_with(|| r.clone());
+                }
+                for (rank, r) in vec.iter().enumerate() {
+                    let id = row_text(r, "id")
+                        .or_else(|| row_text(r, "uri"))
+                        .unwrap_or("")
+                        .to_string();
+                    *scores.entry(id.clone()).or_default() += 1.0 / (RRF_K + rank as f64 + 1.0);
+                    by_id.entry(id).or_insert_with(|| r.clone());
+                }
+                let mut ranked: Vec<(f64, Row)> = scores
+                    .into_iter()
+                    .filter_map(|(id, s)| by_id.remove(&id).map(|r| (s, r)))
+                    .collect();
+                ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+                Ok(ranked.into_iter().map(|(_, r)| r).collect())
+            }
+            SearchMode::Vec => self.search_rows(self.store.collection(collection), mode, query),
+        }
     }
 
     /// `col | pred | count` / `count by f` — no row materialization when possible.
@@ -1837,7 +1970,7 @@ impl Db {
                     rows.truncate(n);
                 }
             }
-            Some(None) => {} // take all
+            Some(None) => {}                              // take all
             None if rows.len() > 50 => rows.truncate(50), // implicit take
             None => {}
         }
@@ -2229,9 +2362,7 @@ impl Db {
                     if !(orders_total[idx] > min) {
                         continue;
                     }
-                } else if need_row_filter
-                    && let Some(pred) = filter
-                {
+                } else if need_row_filter && let Some(pred) = filter {
                     let Some(left_row) = self.store.get_by_idx("orders", idx) else {
                         continue;
                     };
@@ -2282,9 +2413,7 @@ impl Db {
                 if !(orders_total[idx] > min) {
                     continue;
                 }
-            } else if need_row_filter
-                && let Some(pred) = filter
-            {
+            } else if need_row_filter && let Some(pred) = filter {
                 let Some(left_row) = self.store.get_by_idx("orders", idx) else {
                     continue;
                 };
@@ -2380,7 +2509,9 @@ impl Db {
             return rows;
         }
         let mut out = Vec::with_capacity(idxs.len());
-        let id_only = names.as_deref().is_some_and(|fs| fs.len() == 1 && fs[0] == "id");
+        let id_only = names
+            .as_deref()
+            .is_some_and(|fs| fs.len() == 1 && fs[0] == "id");
         for &i in idxs {
             let Some(row) = self.store.get_by_idx(name, i) else {
                 continue;
@@ -2390,10 +2521,7 @@ impl Db {
             }
             if id_only {
                 let mut r = BTreeMap::new();
-                r.insert(
-                    "id".into(),
-                    row.get("id").cloned().unwrap_or(Cell::Null),
-                );
+                r.insert("id".into(), row.get("id").cloned().unwrap_or(Cell::Null));
                 out.push(r);
             } else {
                 out.push(match names.as_deref() {
@@ -2665,18 +2793,14 @@ impl Db {
             return Ok(());
         }
         for start_key in keys {
-            let mut stack: Vec<(String, i64, BTreeSet<String>, Option<(String, String, String)>)> =
-                vec![(
-                    start_key,
-                    0,
-                    BTreeSet::new(),
-                    None,
-                )];
+            let mut stack: Vec<(
+                String,
+                i64,
+                BTreeSet<String>,
+                Option<(String, String, String)>,
+            )> = vec![(start_key, 0, BTreeSet::new(), None)];
             while let Some((at, depth, path, last_edge)) = stack.pop() {
-                if depth > 0
-                    && depth >= hop.min_depth
-                    && depth <= hop.max_depth
-                {
+                if depth > 0 && depth >= hop.min_depth && depth <= hop.max_depth {
                     if let Some(node) = self.resolve_node(primary, &at) {
                         let mut merged = row.clone();
                         for (k, v) in &node {
@@ -2755,11 +2879,7 @@ impl Db {
                     .iter()
                     .filter_map(|r| {
                         let s = lex_score(r, query);
-                        if s > 0 {
-                            Some((s, r.clone()))
-                        } else {
-                            None
-                        }
+                        if s > 0 { Some((s, r.clone())) } else { None }
                     })
                     .collect();
                 scored.sort_by_key(|a| std::cmp::Reverse(a.0));
@@ -2775,11 +2895,7 @@ impl Db {
                     .filter_map(|r| {
                         let v = r.get("embedding").and_then(Cell::as_vec)?;
                         let s = embed::cosine(qv.as_ref(), v);
-                        if s > 0.01 {
-                            Some((s, r.clone()))
-                        } else {
-                            None
-                        }
+                        if s > 0.01 { Some((s, r.clone())) } else { None }
                     })
                     .collect();
                 scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
@@ -2821,9 +2937,7 @@ impl Db {
     /// Recompute `embedding` for every row in a collection that has a vec field.
     pub fn reembed_collection(&mut self, collection: &str) -> Result<usize, Error> {
         let Some(emb) = self.embedder.clone() else {
-            return Err(Error::runtime(format!(
-                "reembed {collection}: no embedder"
-            )));
+            return Err(Error::runtime(format!("reembed {collection}: no embedder")));
         };
         if self
             .catalog
@@ -2963,8 +3077,8 @@ impl Db {
         self.store.collection_mut(collection).reserve(n);
         self.store.row_maps_reserve(collection, n);
         self.store.index_insert_slab(collection, start, &built)?;
-        self.store
-            .row_maps_register_slab(collection, start, &built);
+        self.store.fts_insert_slab(collection, start, &built);
+        self.store.row_maps_register_slab(collection, start, &built);
         let want_rows = built.len() <= 128;
         if want_rows {
             self.store
@@ -3019,12 +3133,14 @@ impl Db {
         let mut out = Vec::new();
         for i in idxs {
             self.store.index_remove_at(collection, i);
+            self.store.fts_remove_at(collection, i);
             let rows = self.store.collection_mut(collection);
             let row = &mut rows[i];
             let layer_raw = row_text(row, "layer") == Some("raw")
                 || matches!(patch.get("layer"), Some(Cell::Text(s)) if s.as_ref() == "raw");
             if layer_raw && patch.contains_key("body") {
                 let _ = self.store.index_insert_at(collection, i);
+                self.store.fts_insert_at(collection, i);
                 return Err(Error::runtime("immutable field: docs.body"));
             }
             for (k, v) in &patch {
@@ -3037,6 +3153,7 @@ impl Db {
             }
             let updated = row.clone();
             self.store.index_insert_row(collection, i, &updated)?;
+            self.store.fts_insert_at(collection, i);
             out.push(updated);
         }
         self.store.rebuild_row_maps_collection(collection);
@@ -3094,6 +3211,7 @@ impl Db {
         out.reverse();
         self.store.rebuild_row_maps_collection(collection);
         self.store.rebuild_indexes_collection(collection);
+        self.store.rebuild_fts_inplace(collection);
         mark_written(ctx, collection, &out);
         Ok(out)
     }
@@ -3334,10 +3452,7 @@ pub(crate) fn plan_join_fields(
     let mut right_fields = Vec::new();
     let mut plan = Vec::with_capacity(names.len());
     for f in names {
-        if let Some(rest) = f
-            .strip_prefix(right_col)
-            .and_then(|s| s.strip_prefix('.'))
-        {
+        if let Some(rest) = f.strip_prefix(right_col).and_then(|s| s.strip_prefix('.')) {
             let idx = if let Some(i) = right_fields.iter().position(|x| x == rest) {
                 i
             } else {
@@ -3393,11 +3508,7 @@ pub(crate) fn build_right_probe_owned(
     probe
 }
 
-pub(crate) fn emit_join_row(
-    left: &Row,
-    right: Option<&[Cell]>,
-    plan: &[JoinFieldPlan],
-) -> Row {
+pub(crate) fn emit_join_row(left: &Row, right: Option<&[Cell]>, plan: &[JoinFieldPlan]) -> Row {
     let mut out = BTreeMap::new();
     for p in plan {
         match p {
@@ -3426,10 +3537,7 @@ pub(crate) fn project_join_fields(
 ) -> Row {
     let mut out = BTreeMap::new();
     for f in fields {
-        let cell = if let Some(rest) = f
-            .strip_prefix(right_col)
-            .and_then(|s| s.strip_prefix('.'))
-        {
+        let cell = if let Some(rest) = f.strip_prefix(right_col).and_then(|s| s.strip_prefix('.')) {
             right
                 .and_then(|r| r.get(rest))
                 .cloned()
@@ -3645,7 +3753,9 @@ fn has_word(hay: &str, needle: &str, ci: bool) -> bool {
         return false;
     }
     if !ci {
-        return hay.split(|c: char| !(c.is_alphanumeric() || c == '_')).any(|w| w == needle);
+        return hay
+            .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .any(|w| w == needle);
     }
     // Case-insensitive without allocating per-token Vec.
     let mut nbuf = String::new();

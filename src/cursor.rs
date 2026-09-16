@@ -5,20 +5,22 @@
 //! - `collection | filter? | join|left_join right on f | project? | skip* | take?`
 //!   (nested-loop: left scan/index + point lookup on the right via FK)
 //! - Hot SoA: `orders [| total >] | join users on user_id | { id, users.email, total }`
+//! - `collection | filter? | hop rel` (depth 1) `| project? | skip* | take?`
+//! - `collection | search lex|hybrid "…" | project? | skip* | take?` (FTS candidates)
 //!
-//! hop / graph / match / sort / union / search / multi-join → **buffered** materialize.
+//! graph / match / sort / union / search vec / hop depth>1 / multi-join → **buffered**.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
-use crate::ast::{Pred, Query, Source, Stmt, Step};
+use crate::ast::{Pred, Query, SearchMode, Source, Step, Stmt};
 use crate::error::Error;
 use crate::exec::{
-    Db, ReadDb, JoinFieldPlan, build_right_probe_owned, emit_join_row, eval_pred, field_names,
+    Db, JoinFieldPlan, ReadDb, build_right_probe_owned, emit_join_row, eval_pred, field_names,
     plan_join_fields, pred_total_gt, project_join_fields,
 };
 use crate::query::Queryable;
-use crate::store::{Cell, Row, Store, now_ms, project_fields};
+use crate::store::{Cell, Row, Store, now_ms, project_fields, row_text};
 use rustc_hash::FxHashMap;
 
 /// Sync pull cursor over query results.
@@ -47,6 +49,18 @@ impl CursorDb<'_> {
         match self {
             CursorDb::Writer(db) => db.run_query_readonly(q),
             CursorDb::Reader(db) => Ok(db.run_stmt(Stmt::Query(q.clone()))?.rows),
+        }
+    }
+
+    fn search_fts(
+        &self,
+        collection: &str,
+        mode: SearchMode,
+        query: &str,
+    ) -> Result<Vec<Row>, Error> {
+        match self {
+            CursorDb::Writer(db) => db.search_fts(collection, mode, query),
+            CursorDb::Reader(db) => db.as_db().search_fts(collection, mode, query),
         }
     }
 
@@ -143,6 +157,18 @@ impl<'a> QueryCursor<'a> {
             return Ok(Self {
                 db,
                 state: CursorState::LazyJoin(join),
+            });
+        }
+        if let Some(lazy) = try_lazy_search(&db, q)? {
+            return Ok(Self {
+                db,
+                state: CursorState::Lazy(lazy),
+            });
+        }
+        if let Some(lazy) = try_lazy_hop(&db, q)? {
+            return Ok(Self {
+                db,
+                state: CursorState::Lazy(lazy),
             });
         }
         if let Some(lazy) = try_lazy_simple(&db, q)? {
@@ -477,6 +503,280 @@ fn try_lazy_simple(db: &CursorDb<'_>, q: &Query) -> Result<Option<LazyCursor>, E
     }))
 }
 
+/// `col | search lex|hybrid … | project? | skip* | take?` via FTS-ordered idxs.
+fn try_lazy_search(db: &CursorDb<'_>, q: &Query) -> Result<Option<LazyCursor>, Error> {
+    let Source::Collection(name) = &q.source else {
+        return Ok(None);
+    };
+    let mut mode: Option<SearchMode> = None;
+    let mut query: Option<&str> = None;
+    let mut project: Option<Vec<String>> = None;
+    let mut skip_n: usize = 0;
+    let mut take_n: Option<Option<i64>> = None;
+    let mut saw_take = false;
+
+    for step in &q.steps {
+        match step {
+            Step::Search { mode: m, query: qq } => {
+                if mode.is_some() {
+                    return Ok(None);
+                }
+                if !matches!(m, SearchMode::Lex | SearchMode::Hybrid) {
+                    return Ok(None);
+                }
+                mode = Some(*m);
+                query = Some(qq.as_str());
+            }
+            Step::Project(f) => {
+                if project.is_some() {
+                    return Ok(None);
+                }
+                project = Some(field_names(f));
+            }
+            Step::Skip { n } => {
+                skip_n = skip_n.saturating_add((*n).max(0) as usize);
+            }
+            Step::Take { n } => {
+                if saw_take {
+                    return Ok(None);
+                }
+                saw_take = true;
+                take_n = Some(*n);
+            }
+            _ => return Ok(None),
+        }
+    }
+
+    let (Some(mode), Some(query)) = (mode, query) else {
+        return Ok(None);
+    };
+    let (store, _) = db.store_catalog();
+    if !store.fts.contains_key(name) {
+        return Ok(None);
+    }
+
+    let ranked = db.search_fts(name, mode, query)?;
+    let mut idxs = Vec::with_capacity(ranked.len());
+    for r in &ranked {
+        let Some(id) = row_text(r, "id") else {
+            continue;
+        };
+        if let Some(i) = store.row_index(name, id) {
+            idxs.push(i);
+        }
+    }
+
+    let take_left = match take_n {
+        Some(Some(n)) => Some(n.max(0) as usize),
+        Some(None) => None,
+        None => Some(50),
+    };
+
+    Ok(Some(LazyCursor {
+        collection: name.clone(),
+        source: RowSource::Idxs(idxs),
+        pos: 0,
+        pred: None,
+        need_filter: false,
+        project,
+        skip_left: skip_n,
+        take_left,
+        now: now_ms(),
+    }))
+}
+
+/// `col | filter? | hop rel` (depth 1) `| project? | skip* | take?`.
+fn try_lazy_hop(db: &CursorDb<'_>, q: &Query) -> Result<Option<LazyCursor>, Error> {
+    let Source::Collection(name) = &q.source else {
+        return Ok(None);
+    };
+    let mut filter: Option<&Pred> = None;
+    let mut hop_rel: Option<&str> = None;
+    let mut project: Option<Vec<String>> = None;
+    let mut skip_n: usize = 0;
+    let mut take_n: Option<Option<i64>> = None;
+    let mut saw_take = false;
+
+    for step in &q.steps {
+        match step {
+            Step::Filter(p) => {
+                if filter.is_some() || hop_rel.is_some() {
+                    return Ok(None);
+                }
+                filter = Some(p);
+            }
+            Step::Hop { rel, depth } => {
+                if hop_rel.is_some() {
+                    return Ok(None);
+                }
+                if let Some(d) = depth
+                    && *d != 1
+                {
+                    return Ok(None);
+                }
+                hop_rel = Some(rel.as_str());
+            }
+            Step::Project(f) => {
+                if hop_rel.is_none() || project.is_some() {
+                    return Ok(None);
+                }
+                project = Some(field_names(f));
+            }
+            Step::Skip { n } => {
+                if hop_rel.is_none() {
+                    return Ok(None);
+                }
+                skip_n = skip_n.saturating_add((*n).max(0) as usize);
+            }
+            Step::Take { n } => {
+                if hop_rel.is_none() || saw_take {
+                    return Ok(None);
+                }
+                saw_take = true;
+                take_n = Some(*n);
+            }
+            _ => return Ok(None),
+        }
+    }
+
+    let Some(rel) = hop_rel else {
+        return Ok(None);
+    };
+
+    let (store, catalog) = db.store_catalog();
+    let now = now_ms();
+    let (source, need_filter) = build_left_source(store, catalog, name, filter, now);
+
+    let (edge_rel, reverse) = match catalog.rel(rel) {
+        Some(r) if let Some(of) = &r.reverse_of => (of.as_str(), true),
+        _ => (rel, false),
+    };
+
+    let mut frontier: BTreeSet<String> = BTreeSet::new();
+    collect_seed_keys(
+        store,
+        name,
+        &source,
+        filter,
+        need_filter,
+        now,
+        &mut frontier,
+    );
+
+    let mut seen = frontier.clone();
+    let mut reached: BTreeSet<String> = BTreeSet::new();
+    for e in &store.edges {
+        if e.rel != edge_rel {
+            continue;
+        }
+        let (src, dst) = if reverse {
+            (e.to.as_str(), e.from.as_str())
+        } else {
+            (e.from.as_str(), e.to.as_str())
+        };
+        if frontier.contains(src) && seen.insert(dst.to_string()) {
+            reached.insert(dst.to_string());
+            if reached.len() >= 300 {
+                break;
+            }
+        }
+    }
+
+    let out_collection = if name == "docs" || store.collections.contains_key("docs") {
+        // hop resolves via find_doc_key → docs first
+        "docs"
+    } else {
+        name.as_str()
+    };
+    let mut idxs = Vec::new();
+    for key in reached {
+        if let Some(i) = neighbor_idx(store, name, out_collection, &key) {
+            idxs.push(i);
+        }
+        if idxs.len() >= 300 {
+            break;
+        }
+    }
+
+    let take_left = match take_n {
+        Some(Some(n)) => Some(n.max(0) as usize),
+        Some(None) => None,
+        None => Some(50),
+    };
+
+    Ok(Some(LazyCursor {
+        collection: out_collection.to_string(),
+        source: RowSource::Idxs(idxs),
+        pos: 0,
+        pred: None,
+        need_filter: false,
+        project,
+        skip_left: skip_n,
+        take_left,
+        now,
+    }))
+}
+
+fn neighbor_idx(store: &Store, primary: &str, out_collection: &str, key: &str) -> Option<usize> {
+    if let Some(row) = store.find_doc_key(key) {
+        let id = row_text(row, "id")?;
+        return store.row_index(out_collection, id);
+    }
+    if primary != "docs" {
+        return store.row_index(primary, key);
+    }
+    None
+}
+
+fn collect_seed_keys(
+    store: &Store,
+    collection: &str,
+    source: &RowSource,
+    pred: Option<&Pred>,
+    need_filter: bool,
+    now: i64,
+    out: &mut BTreeSet<String>,
+) {
+    let rows = store.collection(collection);
+    let push = |row: &Row, out: &mut BTreeSet<String>| {
+        if let Some(id) = row_text(row, "id") {
+            out.insert(id.to_string());
+        }
+        if let Some(uri) = row_text(row, "uri") {
+            out.insert(uri.to_string());
+        }
+    };
+    match source {
+        RowSource::Idxs(idxs) => {
+            for &i in idxs {
+                let Some(row) = rows.get(i) else {
+                    continue;
+                };
+                if need_filter
+                    && let Some(p) = pred
+                    && !eval_pred(p, row, now)
+                {
+                    continue;
+                }
+                push(row, out);
+            }
+        }
+        RowSource::Scan { len } => {
+            for i in 0..*len {
+                let Some(row) = rows.get(i) else {
+                    continue;
+                };
+                if let Some(p) = pred
+                    && !eval_pred(p, row, now)
+                {
+                    continue;
+                }
+                push(row, out);
+            }
+        }
+    }
+}
+
 fn next_lazy_join_soa(store: &Store, join: &mut LazyJoinSoa) -> Option<Result<Row, Error>> {
     let orders_id = store.orders_id();
     let orders_uid = store.orders_user_id();
@@ -528,10 +828,7 @@ fn next_lazy_join_soa(store: &Store, join: &mut LazyJoinSoa) -> Option<Result<Ro
         }
 
         let mut row = BTreeMap::new();
-        row.insert(
-            join.key_id.clone(),
-            Cell::Text(Arc::clone(&orders_id[idx])),
-        );
+        row.insert(join.key_id.clone(), Cell::Text(Arc::clone(&orders_id[idx])));
         row.insert(
             join.key_email.clone(),
             match right {
@@ -539,19 +836,13 @@ fn next_lazy_join_soa(store: &Store, join: &mut LazyJoinSoa) -> Option<Result<Ro
                 None => Cell::Null,
             },
         );
-        row.insert(
-            join.key_total.clone(),
-            Cell::Float(orders_total[idx]),
-        );
+        row.insert(join.key_total.clone(), Cell::Float(orders_total[idx]));
         return Some(Ok(row));
     }
 }
 
 fn is_orders_users_id_email_total(fields: &[String]) -> bool {
-    fields.len() == 3
-        && fields[0] == "id"
-        && fields[1] == "users.email"
-        && fields[2] == "total"
+    fields.len() == 3 && fields[0] == "id" && fields[1] == "users.email" && fields[2] == "total"
 }
 
 fn try_lazy_join_soa(db: &CursorDb<'_>, q: &Query) -> Result<Option<LazyJoinSoa>, Error> {

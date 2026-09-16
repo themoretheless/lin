@@ -210,6 +210,13 @@ fn head(node: &Node, kind: ExplainKind, ctx: &ExplainCtx) -> String {
         NodeKind::IndexSeek { collection, fields } => {
             format!("IndexSeek index={collection}[{}]", fields.join(","))
         }
+        NodeKind::FtsSeek {
+            collection,
+            fields,
+            query,
+        } => {
+            format!("FtsSeek {collection}[{}] query={query:?}", fields.join(","))
+        }
         NodeKind::Schema { detail } => format!("Schema {detail}"),
         NodeKind::Reembed { collection, to } => match to {
             Some(t) => format!("Reembed {collection} to {t}"),
@@ -236,6 +243,7 @@ fn head(node: &Node, kind: ExplainKind, ctx: &ExplainCtx) -> String {
                 | NodeKind::Graph { .. }
                 | NodeKind::Match { .. }
                 | NodeKind::Search { .. }
+                | NodeKind::FtsSeek { .. }
         )
         && matches!(kind, ExplainKind::Cost | ExplainKind::Tree)
         && !s.contains("backend=")
@@ -317,6 +325,7 @@ fn est_rows(node: &Node, sizes: &CollectionSizes) -> f64 {
         NodeKind::Scan { collection, .. } => sizes.get(collection),
         NodeKind::Get { .. } => 1.0,
         NodeKind::IndexSeek { collection, .. } => (sizes.get(collection) * 0.25).max(1.0),
+        NodeKind::FtsSeek { collection, .. } => (sizes.get(collection) * 0.15).max(1.0),
         NodeKind::Filter { .. } => (child(0) * 0.35).max(0.0),
         NodeKind::Project { .. }
         | NodeKind::Sort { .. }
@@ -382,6 +391,7 @@ fn short_name(kind: &NodeKind) -> &'static str {
         NodeKind::Cas { .. } => "CAS",
         NodeKind::BatchCAS { .. } => "BatchCAS",
         NodeKind::IndexSeek { .. } => "IndexSeek",
+        NodeKind::FtsSeek { .. } => "FtsSeek",
         NodeKind::Schema { .. } => "Schema",
         NodeKind::Reembed { .. } => "Reembed",
         NodeKind::Delete { .. } => "Delete",

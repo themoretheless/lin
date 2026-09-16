@@ -145,6 +145,12 @@ pub enum NodeKind {
         collection: String,
         fields: Vec<String>,
     },
+    /// FTS posting seek (lex / hybrid lex-half). Not an overload of IndexSeek.
+    FtsSeek {
+        collection: String,
+        fields: Vec<String>,
+        query: String,
+    },
     Schema {
         detail: String,
     },
@@ -445,7 +451,10 @@ pub fn plan(stmt: &Stmt, cat: &Catalog) -> Result<Plan, Error> {
             ),
             ExplainKind::Tree,
         )),
-        Stmt::Snapshot { name } | Stmt::Restore { name } | Stmt::Pin { name } | Stmt::Unpin { name } => Ok(write_plan(
+        Stmt::Snapshot { name }
+        | Stmt::Restore { name }
+        | Stmt::Pin { name }
+        | Stmt::Unpin { name } => Ok(write_plan(
             cat,
             vec![Effect::Meta],
             node(
@@ -646,7 +655,7 @@ fn plan_query_inner(q: &Query, cat: &Catalog, allow_implicit_take: bool) -> Resu
                 );
             }
             Step::Search { mode, query } => {
-                cur = wrap_search(cur, *mode, query, search_k);
+                cur = wrap_search(cur, *mode, query, search_k, cat);
             }
             Step::Count { by } => {
                 cur = node(
@@ -827,7 +836,8 @@ fn extract_point(pred: &Pred) -> (Option<(String, Value)>, Option<Pred>) {
     }
 }
 
-fn wrap_search(input: Node, mode: SearchMode, query: &str, k: i64) -> Node {
+fn wrap_search(input: Node, mode: SearchMode, query: &str, k: i64, cat: &Catalog) -> Node {
+    let input = maybe_fts_seek(input, mode, query, cat);
     match mode {
         SearchMode::Hybrid => node(
             NodeKind::Search {
@@ -839,7 +849,7 @@ fn wrap_search(input: Node, mode: SearchMode, query: &str, k: i64) -> Node {
             Effect::Read,
             vec![input],
         )
-        .with_note("hybrid→lex+vec (hash embedder)"),
+        .with_note("hybrid→lex(FtsSeek)+vec (hash embedder)"),
         SearchMode::Vec => node(
             NodeKind::Search {
                 mode: SearchMode::Vec,
@@ -860,8 +870,40 @@ fn wrap_search(input: Node, mode: SearchMode, query: &str, k: i64) -> Node {
             Backend::Native,
             Effect::Read,
             vec![input],
-        ),
+        )
+        .with_note("lex via FtsSeek when available"),
     }
+}
+
+fn maybe_fts_seek(input: Node, mode: SearchMode, query: &str, cat: &Catalog) -> Node {
+    if !matches!(mode, SearchMode::Lex | SearchMode::Hybrid) {
+        return input;
+    }
+    let NodeKind::Scan { collection, .. } = &input.kind else {
+        return input;
+    };
+    let Some(cdef) = cat.collections.get(collection) else {
+        return input;
+    };
+    let fields: Vec<String> = cdef
+        .fields
+        .iter()
+        .filter(|(_, f)| f.fts)
+        .map(|(n, _)| n.clone())
+        .collect();
+    if fields.is_empty() {
+        return input;
+    }
+    node(
+        NodeKind::FtsSeek {
+            collection: collection.clone(),
+            fields,
+            query: query.to_string(),
+        },
+        Backend::Native,
+        Effect::Read,
+        vec![],
+    )
 }
 
 fn scan_cols(

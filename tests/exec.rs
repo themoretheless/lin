@@ -145,7 +145,9 @@ fn graph_depth_chain() {
     ))
     .unwrap();
     let d1 = db
-        .run(&format!(r#"docs | id == "{a}" | graph wikilink | take all"#))
+        .run(&format!(
+            r#"docs | id == "{a}" | graph wikilink | take all"#
+        ))
         .unwrap();
     assert_eq!(d1.done.n, 1, "{:?}", d1.rows);
     assert_eq!(text(&d1.rows[0], "to"), b);
@@ -346,7 +348,9 @@ fn reembed_updates_embeddings() {
         h.message
     );
     assert!(h.message.as_deref().unwrap_or("").contains(&before));
-    let v = db.run(r#"docs | search vec "embedding identity" | take 5"#).unwrap();
+    let v = db
+        .run(r#"docs | search vec "embedding identity" | take 5"#)
+        .unwrap();
     assert!(v.done.n >= 1, "vec search should hit fixture docs");
 }
 
@@ -357,12 +361,24 @@ fn search_vec_and_hybrid_rank() {
         .unwrap();
     db.run(r#"insert docs { uri: "raw://b", title: "cats", layer: "wiki", body: "meow purr" }"#)
         .unwrap();
-    let vec = db.run(r#"docs | search vec "wal shipping" | take 5"#).unwrap();
+    let _ = db.reembed_collection("docs");
+
+    let vec = db
+        .run(r#"docs | search vec "wal shipping" | take 5"#)
+        .unwrap();
     assert!(vec.done.n >= 1);
     assert_eq!(text(&vec.rows[0], "title"), "wal shipping");
     let hy = db.run(r#"docs | search "wal" | take 5"#).unwrap();
     assert!(hy.done.n >= 1);
     assert!(hy.rows.iter().any(|r| text(r, "title").contains("wal")));
+
+    let lex = db.run(r#"docs | search lex "wal" | take 5"#).unwrap();
+    assert!(lex.done.n >= 1);
+    assert!(lex.rows.iter().any(|r| text(r, "title").contains("wal")));
+    let plan = db
+        .explain_as(r#"docs | search lex "wal" | take 5"#, None)
+        .unwrap();
+    assert!(plan.contains("FtsSeek"), "{plan}");
 }
 
 #[test]
@@ -694,10 +710,7 @@ fn project_take_all_skips_body() {
     assert!(h.rows.iter().all(|r| r.contains_key("title")));
     let c = db.run(r#"docs | title ~ "wal" | count by layer"#).unwrap();
     assert_eq!(c.done.n, 1);
-    assert_eq!(
-        c.rows[0].get("hits"),
-        Some(&lin::Cell::Int(2))
-    );
+    assert_eq!(c.rows[0].get("hits"), Some(&lin::Cell::Int(2)));
     let total = db.run(r#"docs | title ~ "wal" | count"#).unwrap();
     assert_eq!(total.done.n, 1);
     assert_eq!(total.rows[0].get("hits"), Some(&lin::Cell::Int(2)));
@@ -716,9 +729,7 @@ fn project_take_all_skips_body() {
     }
     batch.push_str("\n]");
     db2.run(&batch).unwrap();
-    let limited = db2
-        .run(r#"docs | wing == "rag" | { id, title }"#)
-        .unwrap();
+    let limited = db2.run(r#"docs | wing == "rag" | { id, title }"#).unwrap();
     assert_eq!(limited.done.n, 50);
     let all = db2
         .run(r#"docs | wing == "rag" | { id, title } | take all"#)

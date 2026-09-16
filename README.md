@@ -2,11 +2,11 @@
 
 Lin — язык своей локальной БД: пайпы, типизированный каталог, два мира записи (`append` / reducer), свой план. Не SQL и не Kusto.
 
-**0.3** — встраиваемая локальная БД: durable `--data`, backup, multi-reader, compaction, flock, quotas, `SyncMode`, cold/mmap, WAL shipping, durable follower, **stable** Queryable/cursor/typed/async. Не multi-writer.
+**0.4** — встраиваемая локальная БД: durable `--data`, backup, multi-reader, compaction, flock, quotas, `SyncMode`, cold/mmap, WAL shipping, durable follower, **stable** Queryable/cursor/typed/async, **FTS postings** (`FtsSeek`) + lazy hop/search. Не multi-writer.
 
-Сейчас есть парсер, typecheck, IR плана, in-memory store (один reducer, один `gen`), исполнитель, WAL+snapshot с compaction, `backup` CLI, durable follower, **живой search vec/hybrid** (локальный hashing-эмбеддер по `embed_id`). DuckDB/WASM backends и multi-writer в этом milestone нет.
+Сейчас есть парсер, typecheck, IR плана, in-memory store (один reducer, один `gen`), исполнитель, WAL+snapshot с compaction, `backup` CLI, durable follower, **живой search lex/vec/hybrid** (FTS postings + hashing-эмбеддер по `embed_id`). DuckDB/WASM backends и multi-writer в этом milestone нет.
 
-## Стабильный API (0.3)
+## Стабильный API (0.3+)
 
 Публичный контракт: `Db::{empty,fixture,open,open_with,open_read,open_follower,open_follower_with,bootstrap_follower,close,checkpoint,run,prepare,explain_as,reader,export_backup,import_backup,import_backup_into,export_wal_since,apply_wal,stats,with_quotas,with_sync_mode,with_embedder}`, `ReadDb::{run,prepare,stats,clone}`, `Quotas`, `SyncMode`, `OpenOpts`, `Embedder` / `HashingEmbedder`, плюс `parse` / `compile` / `run` / `explain*`, типы `Handle` / `Done` / `Prepared` / `Error` / `Row` / `Cell` / `Store` / `Plan` / `Stats` / `VERSION`.
 
@@ -31,7 +31,7 @@ let page1 = db.from("orders").select(["id", "total"]).sort("total", false).take(
 let last = page1.last().unwrap().get("total").and_then(|c| c.as_f64()).unwrap();
 let page2 = db.from("orders").after("total", last).sort("total", false).take(20).to_vec()?;
 
-// Lazy cursor: filter|project|skip|take, or one FK join
+// Lazy cursor: filter|project|skip|take, FK join, hop d=1, search lex|hybrid|take
 let cur = Queryable::from("orders")
     .filter(pred::gt("total", 100.0))
     .join("users", "user_id")
@@ -40,7 +40,7 @@ let cur = Queryable::from("orders")
     .cursor(&db)?;
 assert!(cur.is_lazy());
 
-// hop / match fluent (cursor materializes — not lazy)
+// hop depth=1 is lazy; match / hop depth>1 materialize
 let _ = Queryable::from("docs")
     .filter(pred::eq("id", id))
     .hop("wikilink")
@@ -52,11 +52,12 @@ let _ = Queryable::from("docs")
     .select(["id", "b.title"])
     .to_vec(&mut db)?;
 
-// search: hybrid (default), lex, or vec
+// search: hybrid (default), lex (FTS), or vec
+let _ = Queryable::from("docs").search_lex("wal").take(5).cursor(&db)?;
 let _ = Queryable::from("docs").search_vec("wal shipping").take(5).to_vec(&mut db)?;
 ```
 
-**Lazy cursor:** `filter` / `project` / `skip` / `take`, плюс один `join`/`left_join` по FK (nested-loop + point get). `hop` / `graph` / `match` / `sort` / `union` / `search*` — buffered. Deep `skip` дороже keyset (`.after` + `take`).
+**Lazy cursor:** `filter` / `project` / `skip` / `take`, один `join`/`left_join` по FK, **`hop` depth=1**, **`search lex|hybrid` + take** (FTS idxs). `graph` / `match` / `sort` / `union` / `search vec` / hop depth>1 — buffered. Deep `skip` дороже keyset (`.after` + `take`).
 
 **Experimental (вне freeze):** `ship` (TCP WAL, без TLS), `RecordBatch` / `run_batch`, `Db::run_stmt`, `RowExt`. См. [CHANGELOG](CHANGELOG.md).
 
@@ -71,10 +72,11 @@ Features: `derive`, `async` — в `default` (часть 0.3 контракта)
 | Есть | Нет |
 |---|---|
 | Crash после успешного commit (`SyncMode::Full`) → log/snapshot | Multi-writer / сеть / полный MVCC |
-| Exclusive `LOCK` (writer↔writer) | ANN/FTS indexes (hashing vec есть) |
+| Exclusive `LOCK` (writer↔writer) | ANN indexes (hashing vec есть) |
 | Shared `FENCE` — `open_read`∥writer; checkpoint ждёт readers | |
 | Durable follower: `bootstrap_follower` + `apply_wal` | |
 | Cold lazy mmap page-in | |
+| FTS postings (`FtsSeek`, rebuild-on-open) | |
 | Quotas / `SyncMode::Normal` (opt-in) / WAL ship / pins | |
 
 Память = snapshot + lazy cold page-in + WAL tail. Durable `Db` на `Drop` — best-effort checkpoint.
@@ -137,7 +139,7 @@ rel cites
 
 Запись — отдельный statement, не хвост пайпа. Неизвестный столбец, hop без `rel`, join без `fk`, `update` без `cas` — ошибка компиляции.
 
-Неявный `take 50`. `skip N` / `offset N` — отбросить первые N строк (пейджинг: `skip 40 | take 20`). `search` / `search hybrid` — RRF(lex + vec) через локальный hashing-эмбеддер (`embed_id`, по умолчанию dim из суффикса `/768`); не нейросеть. `search vec` — cosine по полю `embedding` (пишется на insert / `reembed`). Подмена: `Db::with_embedder`.
+Неявный `take 50`. `skip N` / `offset N` — отбросить первые N строк (пейджинг: `skip 40 | take 20`). `search` / `search hybrid` — RRF(lex + vec): lex через **FTS postings** (`FtsSeek`, поля с `fts` в каталоге), vec через локальный hashing-эмбеддер (`embed_id`, по умолчанию dim из суффикса `/768`); не нейросеть. `search lex` — только FTS+residual score. `search vec` — cosine по полю `embedding` (пишется на insert / `reembed`). Подмена: `Db::with_embedder`.
 
 ## Roadmap
 
@@ -150,8 +152,8 @@ rel cites
 | P3c live vec/hybrid | **готово** (hashing embedder + RRF; neural → `with_embedder`) |
 | **0.2.x ship + ops** | **готово** (критерии met: n1–n4 · tests · README recipe) |
 | **0.3** | **готово** — Queryable/cursor/FromRow/async в stable + CHANGELOG |
-| **0.3.x** | m1 Neural embed features · m4 filter+project `run_batch` |
-| **0.4** | m2 FTS postings → m5 lazy hop/search (+ polish m1/m4) |
+| **0.3.x** | **готово** — m1 Neural embed features · m4 filter+project `run_batch` · join SoA |
+| **0.4** | **готово** — m2 FTS postings / `FtsSeek` · m5 lazy hop d=1 + search lex\|hybrid |
 | **0.5** | m3 ANN · m6 wasm32 · o1 TLS/auth/fanout (после скучного ship) |
 | **Не 0.x** | Multi-writer / полный MVCC / consensus · DuckDB как storage backend |
 

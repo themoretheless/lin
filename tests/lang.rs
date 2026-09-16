@@ -131,7 +131,7 @@ fn search_hybrid_then_take() {
         "{plan}"
     );
     assert!(
-        plan.contains("hybrid→lex+vec (hash embedder)"),
+        plan.contains("hybrid→lex(FtsSeek)+vec (hash embedder)"),
         "{plan}"
     );
     assert!(!plan.contains("RRF"), "{plan}");
@@ -147,7 +147,16 @@ fn search_count_sort() {
     assert!(plan.contains("Sort hits desc"));
     assert!(plan.contains("Take 50"));
     assert!(plan.contains("Search hybrid"));
+    assert!(plan.contains("FtsSeek docs[body,title]"), "{plan}");
     assert!(!plan.contains("RRF"), "{plan}");
+}
+
+#[test]
+fn search_lex_fts_seek() {
+    let plan = ok(r#"docs | search lex "wal" | take 10"#);
+    assert!(plan.contains("FtsSeek docs[body,title]"), "{plan}");
+    assert!(plan.contains("Search lex"), "{plan}");
+    assert!(!plan.contains("Scan docs"), "{plan}");
 }
 
 #[test]
@@ -184,7 +193,10 @@ fn explain_cost_search() {
     assert!(plan.contains("budget.take=50"));
     assert!(plan.contains("zone skip"));
     assert!(plan.contains("Search hybrid"));
-    assert!(plan.contains("hybrid→lex+vec (hash embedder)"), "{plan}");
+    assert!(
+        plan.contains("hybrid→lex(FtsSeek)+vec (hash embedder)"),
+        "{plan}"
+    );
     assert!(!plan.contains("RRF"), "{plan}");
     assert!(plan.contains("Project [id, title]"));
     assert!(plan.contains("-- no body"));

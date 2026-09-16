@@ -57,6 +57,7 @@ mod embed_onnx;
 mod error;
 mod exec;
 mod explain;
+mod fts;
 mod graph;
 mod index;
 mod parse;
@@ -74,8 +75,8 @@ pub mod async_db;
 use std::cell::RefCell;
 
 pub use ast::{
-    CmpOp, Duration, DurUnit, ExplainKind, Field, MatchHop, Pred, Query, SearchMode, Source, Stmt,
-    Step, Value,
+    CmpOp, DurUnit, Duration, ExplainKind, Field, MatchHop, Pred, Query, SearchMode, Source, Step,
+    Stmt, Value,
 };
 pub use batch::RecordBatch;
 pub use cursor::QueryCursor;
@@ -83,7 +84,7 @@ pub use embed::{Embedder, HashingEmbedder};
 #[cfg(feature = "embed-ollama")]
 pub use embed_ollama::OllamaEmbedder;
 #[cfg(feature = "embed-onnx")]
-pub use embed_onnx::{OnnxEmbedder, EmbeddingModel};
+pub use embed_onnx::{EmbeddingModel, OnnxEmbedder};
 pub use error::Error;
 pub use exec::{Db, Done, Handle, OpenOpts, Prepared, Quotas, ReadDb, Stats, SyncMode};
 pub use graph::GraphFmt;

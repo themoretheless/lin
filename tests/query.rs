@@ -1,8 +1,6 @@
 use futures_util::StreamExt;
 use lin::query::pred;
-use lin::{
-    AsyncDb, Cell, Db, Duration, DurUnit, LinRow, MatchPath, Queryable, RowExt, Value,
-};
+use lin::{AsyncDb, Cell, Db, DurUnit, Duration, LinRow, MatchPath, Queryable, RowExt, Value};
 
 #[derive(Debug, LinRow)]
 #[lin(collection = "docs")]
@@ -75,15 +73,13 @@ fn pred_and_with_ago() {
     let mut db = Db::fixture();
     let rows = db
         .from("docs")
-        .filter(
-            pred::eq("wing", "rag").and(pred::gt(
-                "ts",
-                Value::NowMinus(Duration {
-                    n: 3650,
-                    unit: DurUnit::Day,
-                }),
-            )),
-        )
+        .filter(pred::eq("wing", "rag").and(pred::gt(
+            "ts",
+            Value::NowMinus(Duration {
+                n: 3650,
+                unit: DurUnit::Day,
+            }),
+        )))
         .select(["id", "title"])
         .take(5)
         .to_vec()
@@ -210,7 +206,8 @@ fn lazy_join_cursor() {
 #[test]
 fn join_run_batch_matches_rows() {
     let mut db = Db::fixture();
-    let src = r#"orders | total > 100 | join users on user_id | { id, users.email, total } | take all"#;
+    let src =
+        r#"orders | total > 100 | join users on user_id | { id, users.email, total } | take all"#;
     let rows = db.run(src).unwrap();
     let batch = db.run_batch(src).unwrap();
     assert_eq!(batch.n(), rows.done.n);
@@ -274,7 +271,27 @@ fn fluent_hop_and_match() {
         .select(["id", "title"])
         .cursor(&db)
         .unwrap();
-    assert!(!cur.is_lazy(), "hop is buffered, not lazy");
+    assert!(cur.is_lazy(), "hop depth=1 should be lazy");
+    let via_cur: Vec<_> = cur.filter_map(Result::ok).collect();
+    assert_eq!(via_cur.len(), via_fluent.len());
+}
+
+#[test]
+fn lazy_search_lex_cursor() {
+    let mut db = Db::fixture();
+    let via_vec = Queryable::from("docs")
+        .search_lex("wal")
+        .take(5)
+        .to_vec(&mut db)
+        .unwrap();
+    let cur = Queryable::from("docs")
+        .search_lex("wal")
+        .take(5)
+        .cursor(&db)
+        .unwrap();
+    assert!(cur.is_lazy(), "search lex|take should be lazy");
+    let via_cur: Vec<_> = cur.filter_map(Result::ok).collect();
+    assert_eq!(via_cur.len(), via_vec.len());
 }
 
 #[test]

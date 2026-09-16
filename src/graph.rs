@@ -115,6 +115,15 @@ fn short_label(node: &Node) -> String {
         NodeKind::IndexSeek { collection, fields } => {
             format!("index={collection}[{}]", fields.join(","))
         }
+        NodeKind::FtsSeek {
+            collection,
+            fields,
+            query,
+        } => format!(
+            "FtsSeek {collection}[{}] {}",
+            fields.join(","),
+            clip(query, 16)
+        ),
         NodeKind::Schema { .. } => "Schema".into(),
         NodeKind::Reembed { collection, .. } => format!("Reembed {collection}"),
         NodeKind::Delete { collection } => format!("Delete {collection}"),
