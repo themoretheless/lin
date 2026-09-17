@@ -1085,3 +1085,49 @@ fn ship_tls_token_roundtrip() {
     let _ = fs::remove_dir_all(&primary_dir);
     let _ = fs::remove_dir_all(&follower_dir);
 }
+
+#[test]
+fn catalog_filter_survives_checkpoint_reopen() {
+    let dir = tmp();
+    {
+        let mut db = Db::open(&dir).unwrap();
+        db.run(
+            r#"insert docs [
+          { uri: "raw://w", title: "W", layer: "wiki" },
+          { uri: "raw://r", title: "R", layer: "raw" }
+        ]"#,
+        )
+        .unwrap();
+        db.run(r#"filter docs layer == "wiki""#).unwrap();
+        db.checkpoint().unwrap();
+        db.close().unwrap();
+    }
+    {
+        let mut db = Db::open(&dir).unwrap();
+        assert_eq!(db.run(r#"docs | take all"#).unwrap().done.n, 1);
+        assert_eq!(db.run(r#"docs all | take all"#).unwrap().done.n, 2);
+        db.close().unwrap();
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn owned_survives_checkpoint_reopen() {
+    let dir = tmp();
+    {
+        let mut db = Db::open(&dir).unwrap();
+        db.run("owned stamp { hash: text, ts: time }").unwrap();
+        db.run("col notes { title: text, stamp }").unwrap();
+        db.run(r#"insert notes { title: "n", hash: "h", ts: ago 1s }"#)
+            .unwrap();
+        db.checkpoint().unwrap();
+        db.close().unwrap();
+    }
+    {
+        let mut db = Db::open(&dir).unwrap();
+        let h = db.run(r#"notes | { title, hash } | take all"#).unwrap();
+        assert_eq!(h.done.n, 1);
+        db.close().unwrap();
+    }
+    let _ = fs::remove_dir_all(&dir);
+}

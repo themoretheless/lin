@@ -9,7 +9,17 @@
   missing or stale blobs still rebuild.
 - **Ship:** protocol `LIN\x06` + shared token; optional rustls (`--tls-cert` /
   `--tls-key` / `--tls-ca`); one live sink. Loopback plaintext remains the local recipe.
+- Dapper/ADO verbs: `Db::execute` (`n`+`gen`), `Db::scalar` / `Queryable::scalar`,
+  `first` / `first_or` / `single` (explicit `take 1`/`2`, not implicit 50),
+  `BoundQueryable::cursor`, `buffered` alias for `to_vec`.
+  Typed: `first_typed` / `first_or_typed` / `single_typed`, `QueryCursor::next_typed`,
+  `Handle::{first,first_typed,rows_typed}`. `ToCell`/`FromCell`
+  for `Option`, `Arc<str>`, `Vec<f32>` / `Arc<[f32]>`; `cell_opt`.
+- `#[lin(rename = "users.email")]` now parses (`owned` no longer dropped the `rename` value).
 - Compact `ProjectedRow` cursor output via `QueryCursor::next_projected`.
+- Catalog `filter` / `unfilter` (read-path global pred) and `docs all` / `Queryable::ignore_filters`.
+- `Queryable::prepare` / `Db::prepare_query` cache Query AST → `Prepared` (no typecheck on hit).
+- `owned` value objects flatten onto a collection; `ToCell` + `#[lin(owned)]` nested `FromRow`.
 - `Db::run_group` atomic group commit and real-open phase metrics in `Stats::reopen`.
 - Batch embedder hook; hashing embed reuses lowercase scratch across slabs.
 

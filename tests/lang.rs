@@ -528,3 +528,33 @@ docs | wing == "rag" or title has "wal" | { id }"#);
     assert!(!plan.contains("index=docs[wing,ts]"), "{plan}");
     assert!(plan.contains("Scan docs"), "{plan}");
 }
+
+#[test]
+fn catalog_filter_in_plan() {
+    let plan = ok(r#"filter docs wing == "rag"
+docs | { id }"#);
+    assert!(plan.contains("wing == \"rag\""), "{plan}");
+}
+
+#[test]
+fn catalog_filter_all_skips() {
+    let with = ok(r#"filter docs wing == "rag"
+docs | { id }"#);
+    let all = ok(r#"filter docs wing == "rag"
+docs all | { id }"#);
+    assert!(with.contains("wing == \"rag\""), "{with}");
+    assert_eq!(
+        all.matches("wing == \"rag\"").count(),
+        1,
+        "docs all should not add a Filter step (only the schema decl): {all}"
+    );
+}
+
+#[test]
+fn owned_flattens_into_col() {
+    let plan = ok(r#"owned stamp { hash: text, ts: time }
+col notes { title: text, stamp }
+notes | { id, title, hash, ts }"#);
+    assert!(plan.contains("Scan notes"), "{plan}");
+    assert!(plan.contains("hash"), "{plan}");
+}

@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::ast::{Decl, Pred, TypeExpr};
+use crate::ast::{Decl, Pred, Query, Source, Step, TypeExpr};
 use crate::error::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +73,9 @@ pub struct Collection {
     pub name: String,
     pub append_only: bool,
     pub fields: BTreeMap<String, FieldInfo>,
+    /// Applied as the first `Filter` on reads from this collection.
+    pub filter: Option<Pred>,
+    pub filter_src: Option<String>,
 }
 
 impl Collection {
@@ -131,6 +134,7 @@ pub struct Catalog {
     pub fks: Vec<Fk>,
     pub guards: Vec<Guard>,
     pub indexes: BTreeMap<String, IndexDef>,
+    pub owned: BTreeMap<String, Vec<(String, FieldInfo)>>,
     pub embed_id: String,
 }
 
@@ -174,22 +178,41 @@ impl Catalog {
                 }
                 let mut map = BTreeMap::new();
                 for (fname, ty) in fields {
-                    let (ty, fts) = match ty {
+                    match ty {
+                        TypeExpr::Named(n) if self.owned.contains_key(n) => {
+                            let owned = self.owned[n].clone();
+                            for (of, info) in owned {
+                                if map.contains_key(&of) {
+                                    return Err(Error::new(format!(
+                                        "owned field collision: {name}.{of}"
+                                    )));
+                                }
+                                map.insert(of, info);
+                            }
+                        }
                         TypeExpr::Named(n) => {
                             let ty = Type::from_name(n)
                                 .ok_or_else(|| Error::new(format!("unknown type: {n}")))?;
-                            (ty, ty == Type::Text)
+                            map.insert(
+                                fname.clone(),
+                                FieldInfo {
+                                    ty,
+                                    fts: ty == Type::Text,
+                                    unique: fname == "id" || fname == "uri",
+                                },
+                            );
                         }
-                        TypeExpr::Vec { .. } => (Type::Vec, false),
-                    };
-                    map.insert(
-                        fname.clone(),
-                        FieldInfo {
-                            ty,
-                            fts,
-                            unique: fname == "id" || fname == "uri",
-                        },
-                    );
+                        TypeExpr::Vec { .. } => {
+                            map.insert(
+                                fname.clone(),
+                                FieldInfo {
+                                    ty: Type::Vec,
+                                    fts: false,
+                                    unique: false,
+                                },
+                            );
+                        }
+                    }
                 }
                 if !map.contains_key("id") && !*append {
                     map.insert("id".into(), field(Type::Id, false, true));
@@ -200,6 +223,8 @@ impl Catalog {
                         name: name.clone(),
                         append_only: *append,
                         fields: map,
+                        filter: None,
+                        filter_src: None,
                     },
                 );
             }
@@ -256,6 +281,51 @@ impl Catalog {
                     pred: pred.clone(),
                 });
             }
+            Decl::Filter {
+                collection,
+                pred,
+                src,
+            } => {
+                let col = self
+                    .collections
+                    .get_mut(collection)
+                    .ok_or_else(|| Error::new(format!("unknown collection: {collection}")))?;
+                if pred.is_none() {
+                    col.filter = None;
+                    col.filter_src = None;
+                } else {
+                    col.filter = pred.clone();
+                    col.filter_src = Some(src.clone());
+                }
+            }
+            Decl::Owned { name, fields } => {
+                if self.owned.contains_key(name) || self.collections.contains_key(name) {
+                    return Err(Error::new(format!("owned exists: {name}")));
+                }
+                let mut owned_fields = Vec::new();
+                for (fname, ty) in fields {
+                    let (ty, fts) = match ty {
+                        TypeExpr::Named(n) => {
+                            let ty = Type::from_name(n)
+                                .ok_or_else(|| Error::new(format!("unknown type: {n}")))?;
+                            (ty, ty == Type::Text)
+                        }
+                        TypeExpr::Vec { .. } => (Type::Vec, false),
+                    };
+                    owned_fields.push((
+                        fname.clone(),
+                        FieldInfo {
+                            ty,
+                            fts,
+                            unique: false,
+                        },
+                    ));
+                }
+                if owned_fields.is_empty() {
+                    return Err(Error::new("empty owned"));
+                }
+                self.owned.insert(name.clone(), owned_fields);
+            }
             Decl::Index {
                 collection,
                 unique,
@@ -290,7 +360,34 @@ fn col(name: &str, append_only: bool, fields: &[(&str, Type, bool, bool)]) -> Co
         name: name.to_string(),
         append_only,
         fields: map,
+        filter: None,
+        filter_src: None,
     }
+}
+
+/// Prepend catalog `filter` so check / plan / exec / cursor share one rewrite.
+pub fn with_catalog_filter(q: &Query, cat: &Catalog) -> Query {
+    let mut q = q.clone();
+    apply_catalog_filter(&mut q, cat);
+    q
+}
+
+fn apply_catalog_filter(q: &mut Query, cat: &Catalog) {
+    for step in &mut q.steps {
+        if let Step::Union(inner) = step {
+            apply_catalog_filter(inner, cat);
+        }
+    }
+    if q.ignore_filter {
+        return;
+    }
+    let Source::Collection(name) = &q.source else {
+        return;
+    };
+    let Some(pred) = cat.collection(name).and_then(|c| c.filter.clone()) else {
+        return;
+    };
+    q.steps.insert(0, Step::Filter(pred));
 }
 
 pub fn fixture() -> Catalog {
@@ -416,6 +513,7 @@ pub fn fixture() -> Catalog {
             },
         }],
         indexes: BTreeMap::new(),
+        owned: BTreeMap::new(),
         embed_id: "nomic-embed-text/768".into(),
     }
 }

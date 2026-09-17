@@ -5,7 +5,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHasher};
+use std::hash::{Hash, Hasher};
 
 use crate::ast::*;
 use crate::batch::RecordBatch;
@@ -39,7 +40,7 @@ fn mark_written(ctx: &mut PackCtx, collection: &str, rows: &[Row]) {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct Done {
     pub r#gen: u64,
     pub n: usize,
@@ -55,6 +56,40 @@ pub struct Handle {
 }
 
 impl Handle {
+    /// First cell of the first row (`ExecuteScalar`). Empty result is an error.
+    pub fn scalar(&self) -> Result<crate::store::Cell, Error> {
+        let row = self.rows.first().ok_or_else(|| Error::runtime("no rows"))?;
+        row.values()
+            .next()
+            .cloned()
+            .ok_or_else(|| Error::runtime("empty row"))
+    }
+
+    pub fn scalar_as<T: crate::row::FromCell>(&self) -> Result<T, Error> {
+        T::from_cell(&self.scalar()?)
+    }
+
+    /// Write verb: affected `n` and `gen` (Dapper `Execute`).
+    pub fn execute(&self) -> Done {
+        self.done
+    }
+
+    pub fn first(&self) -> Result<&Row, Error> {
+        self.rows.first().ok_or_else(|| Error::runtime("no rows"))
+    }
+
+    pub fn first_or(&self) -> Option<&Row> {
+        self.rows.first()
+    }
+
+    pub fn first_typed<T: crate::row::FromRow>(&self) -> Result<T, Error> {
+        T::from_row(self.first()?)
+    }
+
+    pub fn rows_typed<T: crate::row::FromRow>(&self) -> Result<Vec<T>, Error> {
+        crate::row::map_rows(&self.rows)
+    }
+
     pub fn compact(&self) -> String {
         let mut out = String::new();
         for row in &self.rows {
@@ -102,6 +137,18 @@ impl Prepared {
     pub fn run_batch_read(&self, db: &ReadDb) -> Result<RecordBatch, Error> {
         db.run_prepared_batch(self)
     }
+
+    pub fn execute(&self, db: &mut Db) -> Result<Done, Error> {
+        Ok(self.run(db)?.done)
+    }
+
+    pub fn scalar(&self, db: &mut Db) -> Result<crate::store::Cell, Error> {
+        self.run(db)?.scalar()
+    }
+
+    pub fn scalar_read(&self, db: &ReadDb) -> Result<crate::store::Cell, Error> {
+        self.run_read(db)?.scalar()
+    }
 }
 
 pub struct Db {
@@ -113,6 +160,8 @@ pub struct Db {
     reader_lock: Option<File>,
     /// Source → prepared plan (invalidated on schema change).
     plan_cache: FxHashMap<String, Prepared>,
+    /// Queryable AST shape → prepared (no typecheck on hit).
+    query_cache: FxHashMap<u64, Prepared>,
     /// Hard limits (local prod).
     quotas: Quotas,
     /// Detailed wall-time phases of last open / open_read.
@@ -229,6 +278,7 @@ impl Db {
             persist: None,
             reader_lock: None,
             plan_cache: FxHashMap::default(),
+            query_cache: FxHashMap::default(),
             quotas: Quotas::default(),
             reopen: ReopenPhases::default(),
             append_rows: 0,
@@ -267,6 +317,7 @@ impl Db {
         self.store.embed_id = embedder.id().to_string();
         self.embedder = Some(embedder);
         self.plan_cache.clear();
+        self.query_cache.clear();
         self
     }
 
@@ -274,6 +325,7 @@ impl Db {
     pub fn without_embedder(mut self) -> Self {
         self.embedder = None;
         self.plan_cache.clear();
+        self.query_cache.clear();
         self
     }
 
@@ -306,6 +358,7 @@ impl Db {
             persist: Some(persist),
             reader_lock: None,
             plan_cache: FxHashMap::default(),
+            query_cache: FxHashMap::default(),
             quotas: Quotas::default(),
             reopen: store_phases.into(),
             append_rows: 0,
@@ -382,6 +435,7 @@ impl Db {
             persist: None,
             reader_lock: Some(lock),
             plan_cache: FxHashMap::default(),
+            query_cache: FxHashMap::default(),
             quotas: Quotas::default(),
             reopen: store_phases.into(),
             append_rows: 0,
@@ -437,6 +491,7 @@ impl Db {
                 persist: None,
                 reader_lock: None,
                 plan_cache: FxHashMap::default(),
+                query_cache: FxHashMap::default(),
                 quotas: self.quotas,
                 reopen: self.reopen,
                 append_rows: 0,
@@ -523,6 +578,7 @@ impl Db {
             self.store.maybe_checkpoint(p)?;
         }
         self.plan_cache.clear();
+        self.query_cache.clear();
         Ok(n)
     }
 
@@ -635,6 +691,25 @@ impl Db {
 
     pub fn clear_plan_cache(&mut self) {
         self.plan_cache.clear();
+        self.query_cache.clear();
+    }
+
+    fn query_cache_key(&self, q: &Query) -> u64 {
+        let mut h = FxHasher::default();
+        crate::store::catalog_hash(&self.catalog).hash(&mut h);
+        q.hash(&mut h);
+        h.finish()
+    }
+
+    /// Compile a fluent [`Query`] once; cache hit skips typecheck/plan.
+    pub fn prepare_query(&mut self, q: &Query) -> Result<Prepared, Error> {
+        let key = self.query_cache_key(q);
+        if let Some(p) = self.query_cache.get(&key) {
+            return Ok(p.clone());
+        }
+        let prepared = self.prepare_stmt(Stmt::Query(q.clone()))?;
+        self.query_cache.insert(key, prepared.clone());
+        Ok(prepared)
     }
 
     /// Parse, typecheck, and plan once. Reuse via [`Prepared::run`] / [`Self::run_prepared`].
@@ -773,6 +848,7 @@ impl Db {
         }
         if prepared.schema {
             self.plan_cache.clear();
+            self.query_cache.clear();
         }
         Ok(Handle {
             plan: prepared.plan.clone(),
@@ -794,12 +870,13 @@ impl Db {
         if prepared.stmts.len() == 1
             && let Stmt::Query(q) = &prepared.stmts[0]
         {
+            let q = crate::catalog::with_catalog_filter(q, &self.catalog);
             let now = now_ms();
             let bindings = Default::default();
-            if let Some(batch) = self.try_filter_project_batch(q, &bindings, now) {
+            if let Some(batch) = self.try_filter_project_batch(&q, &bindings, now) {
                 return Ok(batch);
             }
-            if let Some(batch) = self.try_join_project_batch(q, &bindings, now) {
+            if let Some(batch) = self.try_join_project_batch(&q, &bindings, now) {
                 return Ok(batch);
             }
         }
@@ -889,6 +966,16 @@ impl Db {
         self.run_prepared(&prepared)
     }
 
+    /// Write / batch verb: `n` + `gen` without keeping the row buffer.
+    pub fn execute(&mut self, src: &str) -> Result<Done, Error> {
+        Ok(self.run(src)?.done)
+    }
+
+    /// Scalar verb: first cell of the first row (`count`, `take 1` project).
+    pub fn scalar(&mut self, src: &str) -> Result<crate::store::Cell, Error> {
+        self.run(src)?.scalar()
+    }
+
     pub fn explain_as(&mut self, src: &str, graph: Option<GraphFmt>) -> Result<String, Error> {
         let stmts = parse::parse_program(src)?;
         self.explain_stmts(stmts, graph, Some(src))
@@ -972,6 +1059,10 @@ impl ReadDb {
         self.inner.run_readonly(src)
     }
 
+    pub fn scalar(&self, src: &str) -> Result<crate::store::Cell, Error> {
+        self.run(src)?.scalar()
+    }
+
     pub fn run_stmt(&self, stmt: Stmt) -> Result<Handle, Error> {
         let prepared = self.prepare_stmt(stmt)?;
         self.run_prepared(&prepared)
@@ -993,12 +1084,13 @@ impl ReadDb {
         if prepared.stmts.len() == 1
             && let Stmt::Query(q) = &prepared.stmts[0]
         {
+            let q = crate::catalog::with_catalog_filter(q, &self.inner.catalog);
             let now = now_ms();
             let bindings = Default::default();
-            if let Some(batch) = self.inner.try_filter_project_batch(q, &bindings, now) {
+            if let Some(batch) = self.inner.try_filter_project_batch(&q, &bindings, now) {
                 return Ok(batch);
             }
-            if let Some(batch) = self.inner.try_join_project_batch(q, &bindings, now) {
+            if let Some(batch) = self.inner.try_join_project_batch(&q, &bindings, now) {
                 return Ok(batch);
             }
         }
@@ -1393,6 +1485,7 @@ impl Db {
                 }
                 self.store.mem_restore(pin);
                 self.plan_cache.clear();
+                self.query_cache.clear();
                 Ok((
                     Vec::new(),
                     Some(format!(
@@ -1419,6 +1512,8 @@ impl Db {
         bindings: &BTreeMap<String, Vec<Row>>,
         allow_implicit_take: bool,
     ) -> Result<Vec<Row>, Error> {
+        let q = crate::catalog::with_catalog_filter(q, &self.catalog);
+        let q = &q;
         let now = now_ms();
 
         // Point Get short path: map lookup + optional project — no Scan/Filter pipeline.
@@ -3053,6 +3148,7 @@ impl Db {
         }
         self.store.rebuild_row_maps();
         self.plan_cache.clear();
+        self.query_cache.clear();
         Ok(n)
     }
 
@@ -3406,6 +3502,7 @@ impl Db {
                 };
                 self.store.apply_pack(&pack);
                 self.plan_cache.clear();
+                self.query_cache.clear();
                 Ok((Vec::new(), Some(format!("col {name}")), Some(pack)))
             }
             Decl::Rel { name, stub } => {
@@ -3416,6 +3513,7 @@ impl Db {
                 };
                 self.store.apply_pack(&pack);
                 self.plan_cache.clear();
+                self.query_cache.clear();
                 Ok((Vec::new(), Some(format!("rel {name}")), Some(pack)))
             }
             Decl::RelReverse { name, of } => {
@@ -3426,6 +3524,7 @@ impl Db {
                 };
                 self.store.apply_pack(&pack);
                 self.plan_cache.clear();
+                self.query_cache.clear();
                 Ok((
                     Vec::new(),
                     Some(format!("rel {name} = reverse {of}")),
@@ -3447,6 +3546,7 @@ impl Db {
                 };
                 self.store.apply_pack(&pack);
                 self.plan_cache.clear();
+                self.query_cache.clear();
                 Ok((
                     Vec::new(),
                     Some(format!("index {}", pack_index_label(collection, fields))),
@@ -3455,6 +3555,50 @@ impl Db {
             }
             Decl::Fk { .. } | Decl::Guard { .. } => {
                 Ok((Vec::new(), Some("schema: session only".into()), None))
+            }
+            Decl::Filter {
+                collection,
+                pred: _,
+                src,
+            } => {
+                let pack = Pack::SchemaFilter {
+                    collection: collection.clone(),
+                    pred_src: if src.is_empty() {
+                        None
+                    } else {
+                        Some(src.clone())
+                    },
+                };
+                self.store.apply_pack(&pack);
+                self.plan_cache.clear();
+                self.query_cache.clear();
+                let msg = if src.is_empty() {
+                    format!("unfilter {collection}")
+                } else {
+                    format!("filter {collection} {src}")
+                };
+                Ok((Vec::new(), Some(msg), Some(pack)))
+            }
+            Decl::Owned { name, fields } => {
+                let pack = Pack::SchemaOwned {
+                    name: name.clone(),
+                    fields: fields
+                        .iter()
+                        .map(|(n, ty)| {
+                            (
+                                n.clone(),
+                                match ty {
+                                    TypeExpr::Named(t) => t.clone(),
+                                    TypeExpr::Vec { model, .. } => format!("vec@{model}"),
+                                },
+                            )
+                        })
+                        .collect(),
+                };
+                self.store.apply_pack(&pack);
+                self.plan_cache.clear();
+                self.query_cache.clear();
+                Ok((Vec::new(), Some(format!("owned {name}")), Some(pack)))
             }
         }
     }

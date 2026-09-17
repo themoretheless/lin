@@ -5,13 +5,13 @@
 //! Prefer these entry points; treat other `pub` items as evolving:
 //! - [`Db`]: [`Db::empty`], [`Db::fixture`], [`Db::open`], [`Db::open_read`],
 //!   [`Db::open_follower`], [`Db::bootstrap_follower`], [`Db::close`], [`Db::checkpoint`],
-//!   [`Db::run`], [`Db::run_group`], [`Db::prepare`], [`Db::explain_as`],
+//!   [`Db::run`], [`Db::execute`], [`Db::scalar`], [`Db::run_group`], [`Db::prepare`], [`Db::explain_as`],
 //!   [`Db::reader`], [`Db::export_backup`], [`Db::import_backup`], [`Db::stats`],
 //!   [`Db::with_quotas`], [`Db::with_sync_mode`], [`Db::open_with`],
-//!   [`Db::export_wal_since`], [`Db::apply_wal`], [`Db::with_embedder`]
+//!   [`Db::export_wal_since`], [`Db::apply_wal`], [`Db::with_embedder`], [`Db::prepare_query`]
 //! - [`ReadDb`]: shared read-only snapshot ([`ReadDb::run`], [`ReadDb::clone`])
 //! - Fluent / typed: [`Queryable`], [`BoundQueryable`], [`query`], [`QueryCursor`],
-//!   [`ProjectedRow`], [`FromRow`], [`LinRow`], [`FromCell`], [`map_rows`], [`cell_get`]
+//!   [`ProjectedRow`], [`FromRow`], [`LinRow`], [`FromCell`], [`ToCell`], [`map_rows`], [`cell_get`], [`cell_opt`]
 //! - Feature `async` (default-on): [`AsyncDb`], [`AsyncReadDb`], `to_vec_async` /
 //!   `stream_*` (offload via `spawn_blocking` — not async storage I/O)
 //! - Free functions: [`parse`], [`compile`], [`run`], [`explain`], [`explain_as`]
@@ -92,7 +92,7 @@ pub use exec::{
 pub use graph::GraphFmt;
 pub use plan::Plan;
 pub use query::{BoundQueryable, IntoFieldList, MatchPath, Queryable};
-pub use row::{FromCell, FromRow, LinRow, cell_get, map_rows};
+pub use row::{FromCell, FromRow, LinRow, ToCell, cell_get, cell_opt, map_rows};
 pub use store::{Cell, Row, RowExt, Store};
 
 #[cfg(feature = "async")]

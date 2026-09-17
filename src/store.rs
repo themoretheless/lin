@@ -170,6 +170,8 @@ pub struct Store {
     pub extra_collections: BTreeMap<String, ColSnap>,
     pub extra_rels: BTreeMap<String, RelSnap>,
     pub extra_indexes: BTreeMap<String, IndexSnap>,
+    pub extra_filters: BTreeMap<String, String>,
+    pub extra_owned: BTreeMap<String, Vec<(String, String)>>,
     pub indexes: BTreeMap<String, LiveIndex>,
     /// collection → FTS postings (fields with catalog `fts`).
     pub(crate) fts: BTreeMap<String, crate::fts::FtsIndex>,
@@ -227,6 +229,8 @@ impl Store {
             extra_collections: BTreeMap::new(),
             extra_rels: BTreeMap::new(),
             extra_indexes: BTreeMap::new(),
+            extra_filters: BTreeMap::new(),
+            extra_owned: BTreeMap::new(),
             indexes: BTreeMap::new(),
             fts: BTreeMap::new(),
             by_id: BTreeMap::new(),
@@ -345,6 +349,8 @@ impl Store {
             && s.extra_collections.is_empty()
             && s.extra_rels.is_empty()
             && s.extra_indexes.is_empty()
+            && s.extra_filters.is_empty()
+            && s.extra_owned.is_empty()
             && s.catalog_hash != fixture_hash
         {
             return Err(Error::runtime(format!(
@@ -467,6 +473,8 @@ impl Store {
             extra_collections: s.extra_collections.clone(),
             extra_rels: s.extra_rels.clone(),
             extra_indexes: s.extra_indexes.clone(),
+            extra_filters: s.extra_filters.clone(),
+            extra_owned: s.extra_owned.clone(),
             indexes: BTreeMap::new(),
             fts: BTreeMap::new(),
             by_id: BTreeMap::new(),
@@ -528,11 +536,23 @@ impl Store {
             extra_collections: self.extra_collections.clone(),
             extra_rels: self.extra_rels.clone(),
             extra_indexes: self.extra_indexes.clone(),
+            extra_filters: self.extra_filters.clone(),
+            extra_owned: self.extra_owned.clone(),
             cold_collections: Vec::new(),
         }
     }
 
     pub fn merge_extras_into(&self, cat: &mut Catalog) {
+        for (name, fields) in &self.extra_owned {
+            let fields = fields
+                .iter()
+                .map(|(n, t)| (n.clone(), TypeExpr::Named(t.clone())))
+                .collect();
+            let _ = cat.apply_decl(&Decl::Owned {
+                name: name.clone(),
+                fields,
+            });
+        }
         for c in self.extra_collections.values() {
             let fields = c
                 .fields
@@ -565,6 +585,18 @@ impl Store {
                 unique: idx.unique,
                 fields: idx.fields.clone(),
             });
+        }
+        for (collection, src) in &self.extra_filters {
+            match crate::parse::parse_pred_src(src) {
+                Ok(pred) => {
+                    let _ = cat.apply_decl(&Decl::Filter {
+                        collection: collection.clone(),
+                        pred: Some(pred),
+                        src: src.clone(),
+                    });
+                }
+                Err(_) => {}
+            }
         }
     }
 
@@ -795,6 +827,20 @@ impl Store {
                 }
                 self.indexes.insert(label, live);
             }
+            Pack::SchemaFilter {
+                collection,
+                pred_src,
+            } => match pred_src {
+                Some(src) => {
+                    self.extra_filters.insert(collection.clone(), src.clone());
+                }
+                None => {
+                    self.extra_filters.remove(collection);
+                }
+            },
+            Pack::SchemaOwned { name, fields } => {
+                self.extra_owned.insert(name.clone(), fields.clone());
+            }
             Pack::Batch { packs } => {
                 for p in packs {
                     self.apply_pack(p);
@@ -818,6 +864,8 @@ impl Store {
             extra_collections: self.extra_collections.clone(),
             extra_rels: self.extra_rels.clone(),
             extra_indexes: self.extra_indexes.clone(),
+            extra_filters: self.extra_filters.clone(),
+            extra_owned: self.extra_owned.clone(),
         }
     }
 
@@ -830,6 +878,8 @@ impl Store {
         self.extra_collections = b.extra_collections;
         self.extra_rels = b.extra_rels;
         self.extra_indexes = b.extra_indexes;
+        self.extra_filters = b.extra_filters;
+        self.extra_owned = b.extra_owned;
         self.rebuild_indexes();
         self.rebuild_row_maps();
         self.rebuild_all_fts_inplace();
@@ -2148,6 +2198,8 @@ pub struct MemBackup {
     extra_collections: BTreeMap<String, ColSnap>,
     extra_rels: BTreeMap<String, RelSnap>,
     extra_indexes: BTreeMap<String, IndexSnap>,
+    extra_filters: BTreeMap<String, String>,
+    extra_owned: BTreeMap<String, Vec<(String, String)>>,
 }
 
 fn same_row_key(collection: &str, a: &Row, b: &Row) -> bool {
@@ -2174,6 +2226,9 @@ pub fn catalog_hash(cat: &Catalog) -> String {
             buf.push_str(f);
             buf.push_str(info.ty.name());
         }
+        if let Some(src) = &c.filter_src {
+            buf.push_str(src);
+        }
     }
     for (n, r) in &cat.rels {
         buf.push_str(n);
@@ -2188,6 +2243,13 @@ pub fn catalog_hash(cat: &Catalog) -> String {
         }
         for f in &idx.fields {
             buf.push_str(f);
+        }
+    }
+    for (n, fields) in &cat.owned {
+        buf.push_str(n);
+        for (f, info) in fields {
+            buf.push_str(f);
+            buf.push_str(info.ty.name());
         }
     }
     format!("h:{:016x}", fnv1a64(buf.as_bytes()))

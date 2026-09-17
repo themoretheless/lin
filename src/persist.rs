@@ -133,6 +133,15 @@ pub enum Pack {
         unique: bool,
         fields: Vec<String>,
     },
+    SchemaFilter {
+        collection: String,
+        /// `None` drops the catalog filter (`unfilter`).
+        pred_src: Option<String>,
+    },
+    SchemaOwned {
+        name: String,
+        fields: Vec<(String, String)>,
+    },
     Batch {
         packs: Vec<Pack>,
     },
@@ -189,6 +198,10 @@ pub struct Snapshot {
     pub extra_rels: std::collections::BTreeMap<String, RelSnap>,
     #[serde(default)]
     pub extra_indexes: std::collections::BTreeMap<String, IndexSnap>,
+    #[serde(default)]
+    pub extra_filters: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub extra_owned: std::collections::BTreeMap<String, Vec<(String, String)>>,
     /// Names that also have a `cold/<name>.bin` mmap cache. Rows stay inlined
     /// in the snapshot (self-contained); cold files are optional decode accel.
     #[serde(default)]

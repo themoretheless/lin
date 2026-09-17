@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ast::*;
-use crate::catalog::{Catalog, Type};
+use crate::catalog::{self, Catalog, Type};
 use crate::error::Error;
 
 #[expect(dead_code)]
@@ -179,19 +179,7 @@ fn check_decl(d: &Decl, cat: &Catalog) -> Result<(), Error> {
             for (_, ty) in fields {
                 match ty {
                     TypeExpr::Named(n) => {
-                        if !matches!(
-                            n.as_str(),
-                            "text"
-                                | "i64"
-                                | "f64"
-                                | "bool"
-                                | "time"
-                                | "dur"
-                                | "id"
-                                | "uri"
-                                | "rel"
-                                | "var"
-                        ) {
+                        if Type::from_name(n).is_none() && !cat.owned.contains_key(n) {
                             return Err(Error::new(format!("unknown type: {n}")));
                         }
                     }
@@ -248,6 +236,37 @@ fn check_decl(d: &Decl, cat: &Catalog) -> Result<(), Error> {
             }
             check_pred(pred, &scope, cat)?;
         }
+        Decl::Filter {
+            collection,
+            pred,
+            src: _,
+        } => {
+            let scope = scope_of(collection, cat)?;
+            if let Some(pred) = pred {
+                check_pred(pred, &scope, cat)?;
+            }
+        }
+        Decl::Owned { name, fields } => {
+            if cat.owned.contains_key(name) || cat.collection(name).is_some() {
+                return Err(Error::new(format!("owned exists: {name}")));
+            }
+            if fields.is_empty() {
+                return Err(Error::new("empty owned"));
+            }
+            for (fname, ty) in fields {
+                match ty {
+                    TypeExpr::Named(n) => {
+                        if Type::from_name(n).is_none() {
+                            return Err(Error::new(format!("unknown type: {n}")));
+                        }
+                    }
+                    TypeExpr::Vec { .. } => {}
+                }
+                if fname.is_empty() {
+                    return Err(Error::new("empty owned field"));
+                }
+            }
+        }
         Decl::Index {
             collection,
             fields,
@@ -274,6 +293,8 @@ fn check_decl(d: &Decl, cat: &Catalog) -> Result<(), Error> {
 }
 
 fn check_query(q: &Query, cat: &Catalog, env: &Bindings) -> Result<Scope, Error> {
+    let q = catalog::with_catalog_filter(q, cat);
+    let q = &q;
     let mut scope = match &q.source {
         Source::Collection(name) => {
             if cat.collection(name).is_some() {

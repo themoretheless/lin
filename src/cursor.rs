@@ -188,6 +188,11 @@ impl<'a> QueryCursor<'a> {
     }
 
     fn open(db: CursorDb<'a>, q: &Query) -> Result<Self, Error> {
+        let q = {
+            let (_, cat) = db.store_catalog();
+            crate::catalog::with_catalog_filter(q, cat)
+        };
+        let q = &q;
         db.prepare_query(q)?;
 
         if let Some(join) = try_lazy_join_soa(&db, q)? {
@@ -256,6 +261,11 @@ impl<'a> QueryCursor<'a> {
             self.state = state;
         }
         item
+    }
+
+    /// Map the next row through [`crate::row::FromRow`].
+    pub fn next_typed<T: crate::row::FromRow>(&mut self) -> Option<Result<T, Error>> {
+        self.next().map(|row| row.and_then(|row| T::from_row(&row)))
     }
 }
 

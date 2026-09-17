@@ -1,6 +1,17 @@
 use crate::ast::*;
 use crate::error::Error;
 
+pub fn parse_pred_src(src: &str) -> Result<Pred, Error> {
+    let mut p = Parser::new(src);
+    p.skip();
+    let pred = p.parse_pred()?;
+    p.skip();
+    if !p.eof() {
+        return Err(p.err("trailing input"));
+    }
+    Ok(pred)
+}
+
 pub fn parse(src: &str) -> Result<Stmt, Error> {
     let mut p = Parser::new(src);
     p.skip();
@@ -252,6 +263,9 @@ impl<'a> Parser<'a> {
         if self.eat_kw("index") {
             return Ok(Stmt::Decl(self.parse_index()?));
         }
+        if self.eat_kw("owned") {
+            return Ok(Stmt::Decl(self.parse_owned()?));
+        }
         if self.eat_kw("col") {
             return Ok(Stmt::Decl(self.parse_col()?));
         }
@@ -263,6 +277,17 @@ impl<'a> Parser<'a> {
         }
         if self.eat_kw("guard") {
             return Ok(Stmt::Decl(self.parse_guard()?));
+        }
+        if self.eat_kw("filter") {
+            return Ok(Stmt::Decl(self.parse_filter()?));
+        }
+        if self.eat_kw("unfilter") {
+            let collection = self.expect_ident()?;
+            return Ok(Stmt::Decl(Decl::Filter {
+                collection,
+                pred: None,
+                src: String::new(),
+            }));
         }
         if self.eat_kw("idb") {
             return self.parse_idb();
@@ -303,6 +328,7 @@ impl<'a> Parser<'a> {
 
     fn parse_query(&mut self) -> Result<Query, Error> {
         let source = self.parse_source()?;
+        let ignore_filter = self.eat_kw("all");
         let mut steps = Vec::new();
         let mut explain = None;
         while self.peek_after_skip() == Some('|') {
@@ -333,13 +359,25 @@ impl<'a> Parser<'a> {
             source,
             steps,
             explain,
+            ignore_filter,
         })
     }
 
     fn looks_like_mutation(&self) -> bool {
         matches!(
             self.peek_ident().as_deref(),
-            Some("update" | "insert" | "append" | "reembed" | "delete" | "let" | "index")
+            Some(
+                "update"
+                    | "insert"
+                    | "append"
+                    | "reembed"
+                    | "delete"
+                    | "let"
+                    | "index"
+                    | "filter"
+                    | "unfilter"
+                    | "owned",
+            )
         )
     }
 
@@ -1153,6 +1191,25 @@ impl<'a> Parser<'a> {
         Ok(Stmt::Reembed { collection, to })
     }
 
+    fn parse_owned(&mut self) -> Result<Decl, Error> {
+        let name = self.expect_ident()?;
+        self.expect_char('{')?;
+        let mut fields = Vec::new();
+        loop {
+            self.skip();
+            if self.peek() == Some('}') {
+                break;
+            }
+            let fname = self.expect_ident()?;
+            self.expect_char(':')?;
+            let ty = self.parse_type_expr()?;
+            fields.push((fname, ty));
+            self.eat_char(',');
+        }
+        self.expect_char('}')?;
+        Ok(Decl::Owned { name, fields })
+    }
+
     fn parse_col(&mut self) -> Result<Decl, Error> {
         let name = self.expect_ident()?;
         let append = self.eat_kw("append");
@@ -1164,8 +1221,11 @@ impl<'a> Parser<'a> {
                 break;
             }
             let fname = self.expect_ident()?;
-            self.expect_char(':')?;
-            let ty = self.parse_type_expr()?;
+            let ty = if self.eat_char(':') {
+                self.parse_type_expr()?
+            } else {
+                TypeExpr::Named(fname.clone())
+            };
             fields.push((fname, ty));
             self.eat_char(',');
         }
@@ -1217,6 +1277,19 @@ impl<'a> Parser<'a> {
             from_field,
             to_col,
             to_field,
+        })
+    }
+
+    fn parse_filter(&mut self) -> Result<Decl, Error> {
+        let collection = self.expect_ident()?;
+        self.skip();
+        let start = self.pos;
+        let pred = self.parse_pred()?;
+        let src = self.src[start..self.pos].trim().to_string();
+        Ok(Decl::Filter {
+            collection,
+            pred: Some(pred),
+            src,
         })
     }
 

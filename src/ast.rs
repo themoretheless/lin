@@ -63,21 +63,23 @@ pub enum Stmt {
     },
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Query {
     pub source: Source,
     pub steps: Vec<Step>,
     pub explain: Option<ExplainKind>,
+    /// Skip catalog `filter` (EF `IgnoreQueryFilters`). DSL: `docs all | …`.
+    pub ignore_filter: bool,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Source {
     Collection(String),
     Page(String),
     Catalog,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MatchHop {
     pub rel: String,
     /// Bound end node of this hop.
@@ -112,7 +114,7 @@ impl MatchHop {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Step {
     Filter(Pred),
     Project(Vec<Field>),
@@ -162,14 +164,14 @@ pub enum Step {
     Union(Query),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SearchMode {
     Hybrid,
     Lex,
     Vec,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ExplainKind {
     Tree,
     Cost,
@@ -179,7 +181,7 @@ pub enum ExplainKind {
     Dot,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Pred {
     And(Box<Pred>, Box<Pred>),
     Or(Box<Pred>, Box<Pred>),
@@ -223,7 +225,7 @@ impl Pred {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CmpOp {
     Eq,
     Ne,
@@ -294,13 +296,29 @@ pub enum Value {
     Name(String),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+impl Eq for Value {}
+
+impl std::hash::Hash for Value {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Value::String(s) | Value::Name(s) => s.hash(state),
+            Value::Int(n) => n.hash(state),
+            Value::Float(f) => f.to_bits().hash(state),
+            Value::Bool(b) => b.hash(state),
+            Value::NowMinus(d) | Value::Duration(d) => d.hash(state),
+            Value::Now => {}
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Duration {
     pub n: i64,
     pub unit: DurUnit,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DurUnit {
     Week,
     Day,
@@ -412,10 +430,21 @@ pub enum Decl {
         field: String,
         pred: Pred,
     },
+    /// Catalog query filter (reads only). `pred`/`src` empty → drop filter.
+    Filter {
+        collection: String,
+        pred: Option<Pred>,
+        src: String,
+    },
     Index {
         collection: String,
         unique: bool,
         fields: Vec<String>,
+    },
+    /// Nested value object (flattened onto a collection, not a table).
+    Owned {
+        name: String,
+        fields: Vec<(String, TypeExpr)>,
     },
 }
 

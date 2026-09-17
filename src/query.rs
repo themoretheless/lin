@@ -1,11 +1,12 @@
 //! Fluent deferred query builder (IQueryable-style) over Lin AST.
 
 use crate::ast::{CmpOp, Field, MatchHop, Pred, Query, SearchMode, Source, Step, Stmt, Value};
+use crate::cursor::QueryCursor;
 use crate::error::Error;
 use crate::exec::{Db, Handle, ReadDb};
 use crate::graph::GraphFmt;
-use crate::row::{self, FromRow, LinRow};
-use crate::store::Row;
+use crate::row::{self, FromCell, FromRow, LinRow};
+use crate::store::{Cell, Row};
 
 /// Helpers for building [`Pred`] values.
 pub mod pred {
@@ -117,6 +118,7 @@ impl Queryable {
                 source: Source::Collection(collection.into()),
                 steps: Vec::new(),
                 explain: None,
+                ignore_filter: false,
             },
         }
     }
@@ -127,6 +129,7 @@ impl Queryable {
                 source: Source::Page(page.into()),
                 steps: Vec::new(),
                 explain: None,
+                ignore_filter: false,
             },
         }
     }
@@ -137,6 +140,7 @@ impl Queryable {
                 source: Source::Catalog,
                 steps: Vec::new(),
                 explain: None,
+                ignore_filter: false,
             },
         }
     }
@@ -159,6 +163,21 @@ impl Queryable {
 
     pub fn stmt(&self) -> Stmt {
         Stmt::Query(self.query.clone())
+    }
+
+    /// Skip catalog `filter` (EF `IgnoreQueryFilters`). DSL: `docs all | …`.
+    pub fn ignore_filters(mut self) -> Self {
+        self.query.ignore_filter = true;
+        self
+    }
+
+    /// Typecheck + plan once (cached by Query AST + catalog hash).
+    pub fn prepare(&self, db: &mut Db) -> Result<crate::exec::Prepared, Error> {
+        db.prepare_query(&self.query)
+    }
+
+    pub fn prepare_read(&self, db: &ReadDb) -> Result<crate::exec::Prepared, Error> {
+        db.prepare_stmt(self.stmt())
     }
 
     pub fn filter(mut self, pred: Pred) -> Self {
@@ -297,7 +316,8 @@ impl Queryable {
     }
 
     pub fn run(&self, db: &mut Db) -> Result<Handle, Error> {
-        db.run_stmt(self.stmt())
+        let prepared = db.prepare_query(&self.query)?;
+        db.run_prepared(&prepared)
     }
 
     pub fn run_read(&self, db: &ReadDb) -> Result<Handle, Error> {
@@ -318,6 +338,87 @@ impl Queryable {
 
     pub fn to_vec_typed_read<T: FromRow>(&self, db: &ReadDb) -> Result<Vec<T>, Error> {
         row::map_rows(&self.to_vec_read(db)?)
+    }
+
+    /// Materialize (`buffered: true`). Prefer [`Self::cursor`] on the hot path.
+    pub fn buffered(&self, db: &mut Db) -> Result<Vec<Row>, Error> {
+        self.to_vec(db)
+    }
+
+    pub fn buffered_read(&self, db: &ReadDb) -> Result<Vec<Row>, Error> {
+        self.to_vec_read(db)
+    }
+
+    /// First row with explicit `take 1` (not implicit take 50).
+    pub fn first(&self, db: &mut Db) -> Result<Row, Error> {
+        first_from_cursor(&mut self.clone().take(1).cursor(db)?)
+    }
+
+    pub fn first_read(&self, db: &ReadDb) -> Result<Row, Error> {
+        first_from_cursor(&mut self.clone().take(1).cursor_read(db)?)
+    }
+
+    pub fn first_or(&self, db: &mut Db) -> Result<Option<Row>, Error> {
+        first_or_from_cursor(&mut self.clone().take(1).cursor(db)?)
+    }
+
+    pub fn first_or_read(&self, db: &ReadDb) -> Result<Option<Row>, Error> {
+        first_or_from_cursor(&mut self.clone().take(1).cursor_read(db)?)
+    }
+
+    pub fn first_typed<T: FromRow>(&self, db: &mut Db) -> Result<T, Error> {
+        T::from_row(&self.first(db)?)
+    }
+
+    pub fn first_typed_read<T: FromRow>(&self, db: &ReadDb) -> Result<T, Error> {
+        T::from_row(&self.first_read(db)?)
+    }
+
+    pub fn first_or_typed<T: FromRow>(&self, db: &mut Db) -> Result<Option<T>, Error> {
+        match self.first_or(db)? {
+            Some(row) => T::from_row(&row).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    pub fn first_or_typed_read<T: FromRow>(&self, db: &ReadDb) -> Result<Option<T>, Error> {
+        match self.first_or_read(db)? {
+            Some(row) => T::from_row(&row).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Exactly one row (`take 2` to detect extras).
+    pub fn single(&self, db: &mut Db) -> Result<Row, Error> {
+        single_from_cursor(&mut self.clone().take(2).cursor(db)?)
+    }
+
+    pub fn single_read(&self, db: &ReadDb) -> Result<Row, Error> {
+        single_from_cursor(&mut self.clone().take(2).cursor_read(db)?)
+    }
+
+    pub fn single_typed<T: FromRow>(&self, db: &mut Db) -> Result<T, Error> {
+        T::from_row(&self.single(db)?)
+    }
+
+    pub fn single_typed_read<T: FromRow>(&self, db: &ReadDb) -> Result<T, Error> {
+        T::from_row(&self.single_read(db)?)
+    }
+
+    pub fn scalar(&self, db: &mut Db) -> Result<Cell, Error> {
+        scalar_from_row(&self.first(db)?)
+    }
+
+    pub fn scalar_read(&self, db: &ReadDb) -> Result<Cell, Error> {
+        scalar_from_row(&self.first_read(db)?)
+    }
+
+    pub fn scalar_as<T: FromCell>(&self, db: &mut Db) -> Result<T, Error> {
+        T::from_cell(&self.scalar(db)?)
+    }
+
+    pub fn scalar_as_read<T: FromCell>(&self, db: &ReadDb) -> Result<T, Error> {
+        T::from_cell(&self.scalar_read(db)?)
     }
 
     pub fn explain(&self, db: &mut Db) -> Result<String, Error> {
@@ -495,6 +596,18 @@ impl<'a> BoundQueryable<'a> {
         self
     }
 
+    pub fn ignore_filters(mut self) -> Self {
+        self.q = self.q.ignore_filters();
+        self
+    }
+
+    pub fn prepare(self) -> Result<crate::exec::Prepared, Error> {
+        match self.db {
+            BoundDb::Mut(db) => self.q.prepare(db),
+            BoundDb::Read(db) => self.q.prepare_read(db),
+        }
+    }
+
     pub fn select(mut self, fields: impl IntoFieldList) -> Self {
         self.q = self.q.select(fields);
         self
@@ -611,6 +724,89 @@ impl<'a> BoundQueryable<'a> {
     pub fn to_vec_typed<T: FromRow>(self) -> Result<Vec<T>, Error> {
         row::map_rows(&self.to_vec()?)
     }
+
+    pub fn buffered(self) -> Result<Vec<Row>, Error> {
+        self.to_vec()
+    }
+
+    pub fn cursor(self) -> Result<QueryCursor<'a>, Error> {
+        match self.db {
+            BoundDb::Mut(db) => self.q.cursor(db),
+            BoundDb::Read(db) => self.q.cursor_read(db),
+        }
+    }
+
+    pub fn first(self) -> Result<Row, Error> {
+        match self.db {
+            BoundDb::Mut(db) => self.q.first(db),
+            BoundDb::Read(db) => self.q.first_read(db),
+        }
+    }
+
+    pub fn first_or(self) -> Result<Option<Row>, Error> {
+        match self.db {
+            BoundDb::Mut(db) => self.q.first_or(db),
+            BoundDb::Read(db) => self.q.first_or_read(db),
+        }
+    }
+
+    pub fn first_typed<T: FromRow>(self) -> Result<T, Error> {
+        T::from_row(&self.first()?)
+    }
+
+    pub fn first_or_typed<T: FromRow>(self) -> Result<Option<T>, Error> {
+        match self.first_or()? {
+            Some(row) => T::from_row(&row).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    pub fn single(self) -> Result<Row, Error> {
+        match self.db {
+            BoundDb::Mut(db) => self.q.single(db),
+            BoundDb::Read(db) => self.q.single_read(db),
+        }
+    }
+
+    pub fn single_typed<T: FromRow>(self) -> Result<T, Error> {
+        T::from_row(&self.single()?)
+    }
+
+    pub fn scalar(self) -> Result<Cell, Error> {
+        match self.db {
+            BoundDb::Mut(db) => self.q.scalar(db),
+            BoundDb::Read(db) => self.q.scalar_read(db),
+        }
+    }
+
+    pub fn scalar_as<T: FromCell>(self) -> Result<T, Error> {
+        T::from_cell(&self.scalar()?)
+    }
+}
+
+fn first_from_cursor(cur: &mut QueryCursor<'_>) -> Result<Row, Error> {
+    cur.next()
+        .transpose()?
+        .ok_or_else(|| Error::runtime("no rows"))
+}
+
+fn first_or_from_cursor(cur: &mut QueryCursor<'_>) -> Result<Option<Row>, Error> {
+    cur.next().transpose()
+}
+
+fn single_from_cursor(cur: &mut QueryCursor<'_>) -> Result<Row, Error> {
+    let first = first_from_cursor(cur)?;
+    if first_or_from_cursor(cur)?.is_some() {
+        return Err(Error::runtime("expected one row, got more"));
+    }
+    Ok(first)
+}
+
+fn scalar_from_row(row: &Row) -> Result<Cell, Error> {
+    row.values()
+        .next()
+        .cloned()
+        .ok_or_else(|| Error::runtime("empty row"))
 }
 
 impl From<&str> for Value {

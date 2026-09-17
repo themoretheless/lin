@@ -475,7 +475,8 @@ fn plan_pipeline(q: &Query, cat: &Catalog, implicit_take: bool) -> Result<Node, 
 }
 
 fn plan_query(q: &Query, cat: &Catalog, explain: ExplainKind) -> Result<Plan, Error> {
-    let cur = plan_query_inner(q, cat, true)?;
+    let q = crate::catalog::with_catalog_filter(q, cat);
+    let cur = plan_query_inner(&q, cat, true)?;
     let root = reduce(cat, vec![Effect::Read], cur);
     Ok(Plan { root, explain })
 }
@@ -1109,6 +1110,18 @@ fn decl_detail(d: &Decl) -> String {
         Decl::Guard {
             collection, field, ..
         } => format!("guard {collection}.{field} immutable"),
+        Decl::Filter {
+            collection,
+            pred,
+            src,
+        } => {
+            if pred.is_none() {
+                format!("unfilter {collection}")
+            } else {
+                format!("filter {collection} {src}")
+            }
+        }
+        Decl::Owned { name, .. } => format!("owned {name}"),
         Decl::Index {
             collection,
             unique,

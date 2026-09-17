@@ -842,3 +842,41 @@ fn project_take_all_skips_body() {
         .unwrap();
     assert_eq!(all.done.n, 60);
 }
+
+#[test]
+fn catalog_filter_hides_reads_not_writes() {
+    let mut db = Db::empty();
+    db.run(
+        r#"insert docs [
+      { uri: "raw://wiki", title: "W", layer: "wiki" },
+      { uri: "raw://raw", title: "R", layer: "raw" }
+    ]"#,
+    )
+    .unwrap();
+    db.run(r#"filter docs layer == "wiki""#).unwrap();
+    let vis = db.run(r#"docs | take all"#).unwrap();
+    assert_eq!(vis.done.n, 1);
+    assert_eq!(text(&vis.rows[0], "title"), "W");
+    let all = db.run(r#"docs all | take all"#).unwrap();
+    assert_eq!(all.done.n, 2);
+    let del = db
+        .run(r#"delete docs[uri == "raw://raw"] cas each"#)
+        .unwrap();
+    assert_eq!(del.done.n, 1);
+    db.run("unfilter docs").unwrap();
+    assert_eq!(db.run(r#"docs | take all"#).unwrap().done.n, 1);
+}
+
+#[test]
+fn owned_type_is_not_a_collection() {
+    let mut db = Db::empty();
+    db.run("owned stamp { hash: text, ts: time }").unwrap();
+    db.run("col notes { title: text, stamp }").unwrap();
+    db.run(r#"insert notes { title: "n", hash: "h", ts: ago 1s }"#)
+        .unwrap();
+    let h = db.run(r#"notes | { title, hash, ts } | take all"#).unwrap();
+    assert_eq!(h.done.n, 1);
+    assert_eq!(text(&h.rows[0], "hash"), "h");
+    let err = db.run("insert stamp { hash: \"x\" }").unwrap_err();
+    assert!(err.to_string().contains("unknown collection"), "{err}");
+}

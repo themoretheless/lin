@@ -10,13 +10,13 @@ Lin — язык своей локальной БД: пайпы, типизир�
 
 Публичный контракт: `Db::{empty,fixture,open,open_with,open_read,open_follower,open_follower_with,bootstrap_follower,close,checkpoint,run,run_group,prepare,explain_as,reader,export_backup,import_backup,import_backup_into,export_wal_since,apply_wal,stats,with_quotas,with_sync_mode,with_embedder}`, `ReadDb::{run,prepare,stats,clone}`, `Quotas`, `SyncMode`, `OpenOpts`, `Embedder` / `HashingEmbedder`, плюс `parse` / `compile` / `run` / `explain*`, типы `Handle` / `Done` / `Prepared` / `Error` / `Row` / `ProjectedRow` / `Cell` / `Store` / `Plan` / `Stats` / `ReopenPhases` / `VERSION`.
 
-**Также stable:** `Queryable` / `BoundQueryable` / `query::pred`, `QueryCursor`, `FromRow` / `LinRow` / `FromCell` / `map_rows` / `cell_get`, feature `async` (default-on): `AsyncDb` / `AsyncReadDb` / `to_vec_async` / `stream_*` (`spawn_blocking`, не async storage).
+**Также stable:** `Queryable` / `BoundQueryable` / `query::pred`, `QueryCursor`, `FromRow` / `LinRow` / `FromCell` / `ToCell` / `map_rows` / `cell_get` / `cell_opt`, `Db::execute` / `scalar`, `Queryable::{first,first_or,first_typed,single,scalar,cursor,buffered}`, `QueryCursor::next_typed`, feature `async` (default-on): `AsyncDb` / `AsyncReadDb` / `to_vec_async` / `stream_*` (`spawn_blocking`, не async storage).
 
 ### Queryable + typed + async
 
 ```rust
 use lin::query::pred;
-use lin::{Db, MatchPath, Queryable};
+use lin::{Db, LinRow, MatchPath, Queryable};
 
 let mut db = Db::fixture();
 
@@ -25,6 +25,16 @@ let plan = Queryable::from("docs")
     .filter(pred::eq("wing", "rag"))
     .take(5)
     .explain(&mut db)?;
+
+let _one = db.from("docs").filter(pred::eq("wing", "rag")).select(["id"]).first()?;
+let _hits: i64 = db.from("docs").count().scalar_as()?;
+
+#[derive(LinRow)]
+#[lin(collection = "docs")]
+struct DocTitle { id: String, title: String }
+let _page: Vec<DocTitle> = db.from_typed::<DocTitle>()?.take(5).to_vec_typed()?;
+let mut cur = db.from_typed::<DocTitle>()?.take(5).cursor()?;
+let _ = cur.next_typed::<DocTitle>();
 
 // Keyset paging — prefer over deep skip (field must allow `>`: num/time, not text id)
 let page1 = db.from("orders").select(["id", "total"]).sort("total", false).take(20).to_vec()?;
@@ -133,11 +143,15 @@ update docs[id == "…"] cas "sha256:…" { room: "inbox" }
 delete docs[id == "…"] cas "sha256:…"
 delete edge wikilink "a" -> "b"
 delete facts[s == "lin" and p == tagged and o == "db"]
-col notes { title: text }
 rel cites
+owned stamp { hash: text, ts: time }
+col notes { title: text, stamp }
+filter docs layer == "wiki"
+docs all | take 5
+unfilter docs
 ```
 
-`union` — совместимые столбцы по имени после последней проекции каждой стороны. `hop` — узлы по ребру (depth 1..=3). `graph` — те же обход и лимиты, но строки рёбер `{ rel, from, to }` (после шага scope = edges). `match` — path pattern: `-rel-> bind`, `<-rel- bind`, `-rel*1..3-> bind`, `-[e:rel]-> bind` (до 3 hops, depth ≤3; edge bind только при depth 1). Узлы как `bind.field`, ребро как `e.rel`/`from`/`to`. `let` — только чтение, не запись. Несколько `append`/`insert`/`delete`/`update` в одной строке `run()` — один пакет, один `gen` (или ничего); запросы после записи видят новое состояние; любая ошибка откатывает всё. Список в `insert`/`append` — один `InsertPack`/`Append`, один `gen`. `cas each` читает hash каждой строки на старте пакета и CAS-ит все; смена mid-pack откатывает всё. `update`/`delete` без `cas` / `cas each` — ошибка. Пустой `[]` — ошибка. `with edge` на списке insert запрещён. `col` / `rel` / `index` создают живую коллекцию/ребро/индекс в store.
+`union` — совместимые столбцы по имени после последней проекции каждой стороны. `hop` — узлы по ребру (depth 1..=3). `graph` — те же обход и лимиты, но строки рёбер `{ rel, from, to }` (после шага scope = edges). `match` — path pattern: `-rel-> bind`, `<-rel- bind`, `-rel*1..3-> bind`, `-[e:rel]-> bind` (до 3 hops, depth ≤3; edge bind только при depth 1). Узлы как `bind.field`, ребро как `e.rel`/`from`/`to`. `let` — только чтение, не запись. Несколько `append`/`insert`/`delete`/`update` в одной строке `run()` — один пакет, один `gen` (или ничего); запросы после записи видят новое состояние; любая ошибка откатывает всё. Список в `insert`/`append` — один `InsertPack`/`Append`, один `gen`. `cas each` читает hash каждой строки на старте пакета и CAS-ит все; смена mid-pack откатывает всё. `update`/`delete` без `cas` / `cas each` — ошибка. Пустой `[]` — ошибка. `with edge` на списке insert запрещён. `col` / `rel` / `index` создают живую коллекцию/ребро/индекс в store. `owned stamp { hash, ts }` — value object: поля впечатываются в коллекцию, отдельной таблицы нет. `filter docs pred` — каталожный предикат на **чтение** (план видит первый `Filter`); `docs all` / `Queryable::ignore_filters` его обходят; `unfilter` снимает. Запись (`update`/`delete` по pred) фильтр не прячет. Связи — объявленные `rel`/`fk` и явный `join`/`hop`/`match`, не Include. Чтение — snapshot/`ReadDb` без трекера; запись — `update … cas` / один `run()` = один `gen`.
 
 Составной индекс: порядок полей = leftmost prefix. `wing == "rag" and ts > ago 7d` по `[wing,ts]` — `IndexSeek index=docs[wing,ts]` (равенство слева + range на следующем). Только `wing ==` — тот же индекс. Только `ts >` — scan, leftmost не закрыт. `id ==` остаётся `Get`. `wing == "rag" or wing == "sys"` — несколько seek по индексу и объединение; если хоть одна ветка `or` не индексируется — scan.
 

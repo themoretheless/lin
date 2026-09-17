@@ -47,6 +47,14 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
 
     for field in &fields.named {
         let ident = field.ident.as_ref().unwrap();
+        let ty = &field.ty;
+        let owned = parse_owned(&field.attrs)?;
+        if owned {
+            assignments.push(quote! {
+                #ident: <#ty as ::lin::FromRow>::from_row(__row)?,
+            });
+            continue;
+        }
         let col = parse_rename(&field.attrs)?.unwrap_or_else(|| ident.to_string());
         let col_lit = LitStr::new(&col, ident.span());
         col_lits.push(col_lit.clone());
@@ -98,6 +106,27 @@ fn parse_collection(attrs: &[Attribute]) -> syn::Result<Option<String>> {
     Ok(out)
 }
 
+fn parse_owned(attrs: &[Attribute]) -> syn::Result<bool> {
+    let mut owned = false;
+    for attr in attrs {
+        if !attr.path().is_ident("lin") {
+            continue;
+        }
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("owned") {
+                owned = true;
+                Ok(())
+            } else if meta.path.is_ident("rename") {
+                let _: LitStr = meta.value()?.parse()?;
+                Ok(())
+            } else {
+                Err(meta.error("unsupported lin attribute on field (expected rename or owned)"))
+            }
+        })?;
+    }
+    Ok(owned)
+}
+
 fn parse_rename(attrs: &[Attribute]) -> syn::Result<Option<String>> {
     let mut out = None;
     for attr in attrs {
@@ -109,8 +138,10 @@ fn parse_rename(attrs: &[Attribute]) -> syn::Result<Option<String>> {
                 let value: LitStr = meta.value()?.parse()?;
                 out = Some(value.value());
                 Ok(())
+            } else if meta.path.is_ident("owned") {
+                Ok(())
             } else {
-                Err(meta.error("unsupported lin attribute on field (expected rename)"))
+                Err(meta.error("unsupported lin attribute on field (expected rename or owned)"))
             }
         })?;
     }

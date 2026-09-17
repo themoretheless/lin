@@ -9,6 +9,29 @@ struct DocTitle {
     title: String,
 }
 
+#[derive(Debug, LinRow)]
+struct Stamp {
+    hash: String,
+    ts: i64,
+}
+
+#[derive(Debug, LinRow)]
+#[lin(collection = "docs")]
+struct DocStamp {
+    id: String,
+    title: String,
+    #[lin(owned)]
+    stamp: Stamp,
+}
+
+#[derive(Debug, LinRow)]
+struct OrderLine {
+    id: String,
+    total: f64,
+    #[lin(rename = "users.email")]
+    email: String,
+}
+
 #[test]
 fn fluent_filter_select_take() {
     let mut db = Db::fixture();
@@ -104,6 +127,80 @@ fn cell_match_via_row_ext() {
     }
     assert!(matches!(row.cell("missing_col"), Cell::Null));
     assert!(row.cell("missing_col").is_null());
+}
+
+#[test]
+fn first_not_implicit_take() {
+    let mut db = Db::fixture();
+    let row = db.from("docs").select(["id"]).first().unwrap();
+    assert!(row.contains_key("id"));
+
+    let missing = db
+        .from("docs")
+        .filter(pred::eq("id", "__no_such_doc__"))
+        .first_or()
+        .unwrap();
+    assert!(missing.is_none());
+
+    let err = db
+        .from("docs")
+        .filter(pred::eq("id", "__no_such_doc__"))
+        .first()
+        .unwrap_err();
+    assert!(err.to_string().contains("no rows"));
+
+    let extra = db.from("docs").select(["id"]).single().unwrap_err();
+    assert!(extra.to_string().contains("expected one row"));
+}
+
+#[test]
+fn scalar_and_execute() {
+    let mut db = Db::fixture();
+    let hits: i64 = db.from("docs").count().scalar_as().unwrap();
+    assert!(hits > 0);
+    assert_eq!(db.scalar("docs | count").unwrap(), Cell::Int(hits));
+
+    let done = db
+        .execute(r#"insert docs { uri: "raw://n/ado", title: "ado", layer: "raw", body: "x" }"#)
+        .unwrap();
+    assert_eq!(done.n, 1);
+    assert!(done.r#gen >= 1);
+}
+
+#[test]
+fn typed_cursor_join_and_first_or() {
+    let mut db = Db::fixture();
+    let doc: DocTitle = db.from_typed::<DocTitle>().unwrap().first_typed().unwrap();
+    assert!(!doc.id.is_empty());
+
+    let none = db
+        .from_typed::<DocTitle>()
+        .unwrap()
+        .filter(pred::eq("id", "__no_such_doc__"))
+        .first_or_typed::<DocTitle>()
+        .unwrap();
+    assert!(none.is_none());
+
+    let mut cur = db
+        .from_typed::<DocTitle>()
+        .unwrap()
+        .take(3)
+        .cursor()
+        .unwrap();
+    let row = cur.next_typed::<DocTitle>().unwrap().unwrap();
+    assert!(!row.title.is_empty() || !row.id.is_empty());
+
+    let lines: Vec<OrderLine> = db
+        .from("orders")
+        .join("users", "user_id")
+        .select_row::<OrderLine>()
+        .take(5)
+        .to_vec_typed()
+        .unwrap();
+    assert!(!lines.is_empty());
+    assert!(lines[0].email.contains('@'));
+    assert!(!lines[0].id.is_empty());
+    assert!(lines[0].total > 0.0);
 }
 
 #[test]
@@ -377,4 +474,48 @@ async fn async_stream_matches_to_vec() {
         typed.push(item.unwrap());
     }
     assert_eq!(typed.len(), via_vec.len());
+}
+
+#[test]
+fn fluent_prepare_and_ignore_filters() {
+    let mut db = Db::empty();
+    db.run(
+        r#"insert docs [
+      { uri: "raw://a", title: "A", layer: "wiki", wing: "rag" },
+      { uri: "raw://b", title: "B", layer: "raw", wing: "sys" }
+    ]"#,
+    )
+    .unwrap();
+    db.run(r#"filter docs wing == "rag""#).unwrap();
+    let prep = Queryable::from("docs").take_all().prepare(&mut db).unwrap();
+    assert_eq!(prep.run(&mut db).unwrap().done.n, 1);
+    let all = Queryable::from("docs")
+        .ignore_filters()
+        .take_all()
+        .to_vec(&mut db)
+        .unwrap();
+    assert_eq!(all.len(), 2);
+}
+
+#[test]
+fn prepare_query_cache_hits() {
+    let mut db = Db::empty();
+    let q = Queryable::from("docs").take(3);
+    let a = q.prepare(&mut db).unwrap();
+    let b = q.prepare(&mut db).unwrap();
+    assert!(std::sync::Arc::ptr_eq(&a.plan, &b.plan));
+}
+
+#[test]
+fn owned_linrow_and_to_cell() {
+    use lin::ToCell;
+    let mut db = Db::fixture();
+    let rows: Vec<DocStamp> = Queryable::from("docs")
+        .select(["id", "title", "hash", "ts"])
+        .take(3)
+        .to_vec_typed(&mut db)
+        .unwrap();
+    assert!(!rows[0].id.is_empty());
+    assert!(!rows[0].title.is_empty() || !rows[0].stamp.hash.is_empty() || rows[0].stamp.ts >= 0);
+    let _ = "x".to_cell();
 }

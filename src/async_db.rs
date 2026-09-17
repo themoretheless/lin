@@ -52,6 +52,14 @@ impl AsyncDb {
         .map_err(|e| Error::runtime(format!("async join: {e}")))?
     }
 
+    pub async fn execute(&self, src: impl Into<String>) -> Result<crate::exec::Done, Error> {
+        Ok(self.run(src).await?.done)
+    }
+
+    pub async fn scalar(&self, src: impl Into<String>) -> Result<crate::store::Cell, Error> {
+        self.run(src).await?.scalar()
+    }
+
     pub async fn run_stmt(&self, stmt: Stmt) -> Result<Handle, Error> {
         let db = Arc::clone(&self.inner);
         spawn_blocking(move || {
@@ -204,6 +212,29 @@ impl AsyncReadDb {
 }
 
 impl Queryable {
+    pub async fn first_async(self, db: &AsyncDb) -> Result<Row, Error> {
+        let rows = db.to_vec(self.take(1)).await?;
+        rows.into_iter()
+            .next()
+            .ok_or_else(|| Error::runtime("no rows"))
+    }
+
+    pub async fn first_or_async(self, db: &AsyncDb) -> Result<Option<Row>, Error> {
+        Ok(db.to_vec(self.take(1)).await?.into_iter().next())
+    }
+
+    pub async fn first_typed_async<T: FromRow + Send>(self, db: &AsyncDb) -> Result<T, Error> {
+        T::from_row(&self.first_async(db).await?)
+    }
+
+    pub async fn scalar_async(self, db: &AsyncDb) -> Result<crate::store::Cell, Error> {
+        let row = self.first_async(db).await?;
+        row.values()
+            .next()
+            .cloned()
+            .ok_or_else(|| Error::runtime("empty row"))
+    }
+
     pub async fn to_vec_async(self, db: &AsyncDb) -> Result<Vec<Row>, Error> {
         db.to_vec(self).await
     }
