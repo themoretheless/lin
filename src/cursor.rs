@@ -252,15 +252,14 @@ impl<'a> QueryCursor<'a> {
             return self.next().map(|row| row.map(ProjectedRow::from_row));
         }
 
-        let mut state = std::mem::replace(&mut self.state, CursorState::Done);
         let (store, _) = self.db.store_catalog();
-        let item = match &mut state {
+        let item = match &mut self.state {
             CursorState::Lazy(lazy) => next_lazy_projected(store, lazy),
             CursorState::LazyJoinSoa(join) => next_lazy_join_soa_projected(store, join),
             _ => unreachable!("native projected state checked above"),
         };
-        if item.is_some() {
-            self.state = state;
+        if item.is_none() {
+            self.state = CursorState::Done;
         }
         item
     }
@@ -285,18 +284,17 @@ impl Iterator for QueryCursor<'_> {
             return it.next().map(Ok);
         }
 
-        let mut state = std::mem::replace(&mut self.state, CursorState::Done);
         let (store, _) = self.db.store_catalog();
 
-        let item = match &mut state {
+        let item = match &mut self.state {
             CursorState::Lazy(lazy) => next_lazy(store, lazy),
             CursorState::LazyJoin(join) => next_lazy_join(store, join),
             CursorState::LazyJoinSoa(join) => next_lazy_join_soa(store, join),
             _ => None,
         };
 
-        if item.is_some() {
-            self.state = state;
+        if item.is_none() {
+            self.state = CursorState::Done;
         }
         item
     }
