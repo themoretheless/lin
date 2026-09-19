@@ -216,15 +216,34 @@ fn row_tokens_vec(row: &Row, fields: &[String]) -> Vec<String> {
 }
 
 fn add_tokens(out: &mut FxHashSet<String>, text: &str) {
-    for tok in text.to_lowercase().split_whitespace() {
-        out.insert(tok.to_string());
+    if text.is_ascii() {
+        for tok in text.split_whitespace() {
+            out.insert(lower_ascii_token(tok));
+        }
+    } else {
+        for tok in text.to_lowercase().split_whitespace() {
+            out.insert(tok.to_string());
+        }
     }
 }
 
 fn add_tokens_vec(out: &mut Vec<String>, text: &str) {
-    for tok in text.to_lowercase().split_whitespace() {
-        out.push(tok.to_string());
+    if text.is_ascii() {
+        for tok in text.split_whitespace() {
+            out.push(lower_ascii_token(tok));
+        }
+    } else {
+        for tok in text.to_lowercase().split_whitespace() {
+            out.push(tok.to_string());
+        }
     }
+}
+
+fn lower_ascii_token(token: &str) -> String {
+    if token.bytes().all(|b| !b.is_ascii_uppercase()) {
+        return token.to_string();
+    }
+    token.bytes().map(|b| b.to_ascii_lowercase() as char).collect()
 }
 
 pub fn fts_dir(data: &Path) -> PathBuf {

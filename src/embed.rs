@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use rustc_hash::FxHasher;
-use std::hash::{Hash, Hasher};
+use std::hash::Hasher;
 
 /// Text → dense vector. Must be `Send + Sync` for [`crate::exec::ReadDb`] sharing.
 pub trait Embedder: Send + Sync {
@@ -83,7 +83,7 @@ impl HashingEmbedder {
             if token.is_empty() {
                 continue;
             }
-            bump(&mut v, token, 1.0);
+            bump(&mut v, token.as_bytes(), 1.0);
             let b = token.as_bytes();
             if b.len() >= 3 {
                 for w in b.windows(3) {
@@ -104,6 +104,13 @@ impl HashingEmbedder {
 }
 
 fn lowercase_into(text: &str, out: &mut String) {
+    if text.is_ascii() {
+        out.reserve(text.len());
+        for byte in text.bytes() {
+            out.push(byte.to_ascii_lowercase() as char);
+        }
+        return;
+    }
     for ch in text.chars() {
         for lower in ch.to_lowercase() {
             out.push(lower);
@@ -112,9 +119,9 @@ fn lowercase_into(text: &str, out: &mut String) {
 }
 
 #[inline]
-fn bump(v: &mut [f32], key: impl Hash, w: f32) {
+fn bump(v: &mut [f32], key: &[u8], w: f32) {
     let mut h = FxHasher::default();
-    key.hash(&mut h);
+    h.write(key);
     let i = (h.finish() as usize) % v.len();
     v[i] += w;
 }
