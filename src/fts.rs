@@ -6,7 +6,7 @@
 //! them and only rebuilds missing / mismatched collections. WAL replay then
 //! updates postings incrementally.
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -37,9 +37,7 @@ impl FtsIndex {
 
     pub fn build(rows: &[Row], fields: &[String]) -> Self {
         let mut idx = Self::empty(fields);
-        for (i, row) in rows.iter().enumerate() {
-            idx.insert_row(i, row);
-        }
+        idx.insert_rows(0, rows);
         idx
     }
 
@@ -52,6 +50,20 @@ impl FtsIndex {
                     Err(pos) => list.insert(pos, row_idx),
                 }
             }
+        }
+    }
+
+    pub fn insert_rows(&mut self, start: usize, rows: &[Row]) {
+        let mut additions: FxHashMap<String, Vec<usize>> = FxHashMap::default();
+        for (offset, row) in rows.iter().enumerate() {
+            for tok in row_tokens_vec(row, &self.fields) {
+                additions.entry(tok).or_default().push(start + offset);
+            }
+        }
+        for (tok, mut indices) in additions {
+            indices.sort_unstable();
+            indices.dedup();
+            self.postings.entry(tok).or_default().extend(indices);
         }
     }
 
@@ -172,24 +184,47 @@ pub fn tokenize(text: &str) -> Vec<String> {
         .collect()
 }
 
-fn row_tokens(row: &Row, fields: &[String]) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
+fn row_tokens(row: &Row, fields: &[String]) -> FxHashSet<String> {
+    let mut out = FxHashSet::default();
     for f in fields {
         if let Some(t) = row_text(row, f) {
-            for tok in tokenize(t) {
-                out.insert(tok);
-            }
+            add_tokens(&mut out, t);
         }
     }
     // Also index snippet when present (lex_score reads it) even if not fts-flagged.
     if !fields.iter().any(|f| f == "snippet")
         && let Some(t) = row_text(row, "snippet")
     {
-        for tok in tokenize(t) {
-            out.insert(tok);
-        }
+        add_tokens(&mut out, t);
     }
     out
+}
+
+fn row_tokens_vec(row: &Row, fields: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for f in fields {
+        if let Some(t) = row_text(row, f) {
+            add_tokens_vec(&mut out, t);
+        }
+    }
+    if !fields.iter().any(|f| f == "snippet")
+        && let Some(t) = row_text(row, "snippet")
+    {
+        add_tokens_vec(&mut out, t);
+    }
+    out
+}
+
+fn add_tokens(out: &mut FxHashSet<String>, text: &str) {
+    for tok in text.to_lowercase().split_whitespace() {
+        out.insert(tok.to_string());
+    }
+}
+
+fn add_tokens_vec(out: &mut Vec<String>, text: &str) {
+    for tok in text.to_lowercase().split_whitespace() {
+        out.push(tok.to_string());
+    }
 }
 
 pub fn fts_dir(data: &Path) -> PathBuf {

@@ -123,6 +123,7 @@ impl CursorDb<'_> {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 enum CursorState {
     Lazy(LazyCursor),
     LazyJoin(LazyJoinCursor),
@@ -154,6 +155,7 @@ struct LazyJoinCursor {
     /// When `to_field == "id"` and project is set: hash-built right cells.
     right_probe: Option<FxHashMap<String, Vec<Cell>>>,
     join_plan: Option<Vec<JoinFieldPlan>>,
+    left_fields: Option<Vec<String>>,
     skip_left: usize,
     take_left: Option<usize>,
     pending: VecDeque<Row>,
@@ -389,7 +391,11 @@ fn next_lazy_join(store: &Store, join: &mut LazyJoinCursor) -> Option<Result<Row
             return Some(Ok(row));
         }
 
-        let left_row = next_lazy_raw(store, &mut join.left)?;
+        let left_row = if let Some(fields) = &join.left_fields {
+            next_lazy_raw_projected(store, &mut join.left, fields)?
+        } else {
+            next_lazy_raw(store, &mut join.left)?
+        };
 
         let Ok(left_row) = left_row else {
             return Some(left_row);
@@ -447,10 +453,10 @@ fn next_lazy_join(store: &Store, join: &mut LazyJoinCursor) -> Option<Result<Row
 
         // Non-id: clone via project_by_key (rare for catalog FKs).
         let mut hits = Vec::new();
-        if let Some(k) = key {
-            if let Some(r) = store.project_by_key(&join.right_col, &join.to_field, k, None) {
-                hits.push(r);
-            }
+        if let Some(k) = key
+            && let Some(r) = store.project_by_key(&join.right_col, &join.to_field, k, None)
+        {
+            hits.push(r);
         }
 
         if hits.is_empty() {
@@ -504,6 +510,43 @@ fn next_lazy_raw(store: &Store, lazy: &mut LazyCursor) -> Option<Result<Row, Err
             continue;
         }
         return Some(Ok(row.clone()));
+    }
+}
+
+fn next_lazy_raw_projected(
+    store: &Store,
+    lazy: &mut LazyCursor,
+    fields: &[String],
+) -> Option<Result<Row, Error>> {
+    loop {
+        let idx = match &lazy.source {
+            RowSource::Idxs(idxs) => {
+                if lazy.pos >= idxs.len() {
+                    return None;
+                }
+                let i = idxs[lazy.pos];
+                lazy.pos += 1;
+                i
+            }
+            RowSource::Scan { len } => {
+                if lazy.pos >= *len {
+                    return None;
+                }
+                let i = lazy.pos;
+                lazy.pos += 1;
+                i
+            }
+        };
+        let Some(row) = store.get_by_idx(&lazy.collection, idx) else {
+            continue;
+        };
+        if lazy.need_filter
+            && let Some(pred) = &lazy.pred
+            && !eval_pred(pred, row, lazy.now)
+        {
+            continue;
+        }
+        return Some(Ok(project_fields(row, fields)));
     }
 }
 
@@ -1164,18 +1207,25 @@ fn try_lazy_join(db: &CursorDb<'_>, q: &Query) -> Result<Option<LazyJoinCursor>,
     };
     let (source, need_filter) = build_left_source(store, catalog, name, filter, now);
 
-    let (right_probe, join_plan) = if to_field == "id" {
+    let (right_probe, join_plan, left_fields) = if to_field == "id" {
         if let Some(ref fields) = project {
             let (right_fields, plan) = plan_join_fields(&right_col, fields);
             let probe = build_right_probe_owned(store.collection(&right_col), &right_fields);
-            (Some(probe), Some(plan))
+            let left_fields = plan
+                .iter()
+                .filter_map(|p| match p {
+                    JoinFieldPlan::Left(name) => Some(name.clone()),
+                    JoinFieldPlan::Right { .. } => None,
+                })
+                .collect();
+            (Some(probe), Some(plan), Some(left_fields))
         } else {
             // Full-row probe by id index into collection — build id→row clone map would be heavy;
             // keep point-get via get_by_id in next (no owned full-row hash).
-            (None, None)
+            (None, None, None)
         }
     } else {
-        (None, None)
+        (None, None, None)
     };
 
     Ok(Some(LazyJoinCursor {
@@ -1197,6 +1247,7 @@ fn try_lazy_join(db: &CursorDb<'_>, q: &Query) -> Result<Option<LazyJoinCursor>,
         project,
         right_probe,
         join_plan,
+        left_fields,
         skip_left: skip_n,
         take_left,
         pending: VecDeque::new(),
