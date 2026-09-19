@@ -548,10 +548,10 @@ impl Db {
 
         if self.persist.is_some() {
             let raw_len: u64 = to_apply.iter().map(|(r, _)| r.len() as u64).sum();
-            if let Some(p) = self.persist.as_mut() {
-                if p.log_bytes + raw_len > self.quotas.max_log_bytes {
-                    self.store.checkpoint(p)?;
-                }
+            if let Some(p) = self.persist.as_mut()
+                && p.log_bytes + raw_len > self.quotas.max_log_bytes
+            {
+                self.store.checkpoint(p)?;
             }
             if let Some(p) = self.persist.as_mut() {
                 let mut raw_buf = Vec::with_capacity(raw_len as usize);
@@ -628,13 +628,13 @@ impl Db {
                 self.quotas.max_edges
             )));
         }
-        if let Some(p) = self.persist.as_ref() {
-            if p.log_bytes > self.quotas.max_log_bytes {
-                return Err(Error::runtime(format!(
-                    "quota: log_bytes {} > max_log_bytes {}",
-                    p.log_bytes, self.quotas.max_log_bytes
-                )));
-            }
+        if let Some(p) = self.persist.as_ref()
+            && p.log_bytes > self.quotas.max_log_bytes
+        {
+            return Err(Error::runtime(format!(
+                "quota: log_bytes {} > max_log_bytes {}",
+                p.log_bytes, self.quotas.max_log_bytes
+            )));
         }
         Ok(())
     }
@@ -792,9 +792,7 @@ impl Db {
         } else {
             Undo::Full(self.store.mem_backup())
         };
-        let cat_backup = if prepared.writes && !prepared.append_only {
-            Some(self.catalog.clone())
-        } else if prepared.schema {
+        let cat_backup = if (prepared.writes && !prepared.append_only) || prepared.schema {
             Some(self.catalog.clone())
         } else {
             None
@@ -819,13 +817,12 @@ impl Db {
                 return Err(e);
             }
             // Bound WAL: compact if already over quota before appending.
-            if let Some(p) = self.persist.as_mut() {
-                if p.log_bytes > self.quotas.max_log_bytes {
-                    if let Err(e) = self.store.checkpoint(p) {
-                        self.rollback(undo, cat_backup);
-                        return Err(e);
-                    }
-                }
+            if let Some(p) = self.persist.as_mut()
+                && p.log_bytes > self.quotas.max_log_bytes
+                && let Err(e) = self.store.checkpoint(p)
+            {
+                self.rollback(undo, cat_backup);
+                return Err(e);
             }
             if let Some(p) = self.persist.as_mut() {
                 // Schema packs only — avoid hashing the catalog on every append.
@@ -1870,39 +1867,48 @@ impl Db {
             SearchMode::Lex => Ok(self.search_fts_lex(collection, query, rank_limit)),
             SearchMode::Hybrid => {
                 const RRF_K: f64 = 60.0;
-                let lex = self.search_fts(collection, SearchMode::Lex, query, None)?;
                 let all = self.store.collection(collection);
-                let vec = self.search_rows(all, SearchMode::Vec, query)?;
-                let mut scores: BTreeMap<String, f64> = BTreeMap::new();
-                let mut by_id: BTreeMap<String, Row> = BTreeMap::new();
-                for (rank, r) in lex.iter().enumerate() {
-                    let id = row_text(r, "id")
-                        .or_else(|| row_text(r, "uri"))
-                        .unwrap_or("")
-                        .to_string();
-                    *scores.entry(id.clone()).or_default() += 1.0 / (RRF_K + rank as f64 + 1.0);
-                    by_id.entry(id).or_insert_with(|| r.clone());
+                let lex = self.search_fts_lex_indices(collection, query, None);
+                let vec = self.vector_search_indices(all, query)?;
+                let mut scores: FxHashMap<usize, f64> = FxHashMap::default();
+                for (rank, (_, i)) in lex.iter().enumerate() {
+                    *scores.entry(*i).or_default() += 1.0 / (RRF_K + rank as f64 + 1.0);
                 }
-                for (rank, r) in vec.iter().enumerate() {
-                    let id = row_text(r, "id")
-                        .or_else(|| row_text(r, "uri"))
-                        .unwrap_or("")
-                        .to_string();
-                    *scores.entry(id.clone()).or_default() += 1.0 / (RRF_K + rank as f64 + 1.0);
-                    by_id.entry(id).or_insert_with(|| r.clone());
+                for (rank, (_, i)) in vec.iter().enumerate() {
+                    *scores.entry(*i).or_default() += 1.0 / (RRF_K + rank as f64 + 1.0);
                 }
-                let mut ranked: Vec<(f64, Row)> = scores
+                let mut ranked: Vec<(f64, usize)> = scores
                     .into_iter()
-                    .filter_map(|(id, s)| by_id.remove(&id).map(|r| (s, r)))
+                    .map(|(i, score)| (score, i))
                     .collect();
-                ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-                Ok(ranked.into_iter().map(|(_, r)| r).collect())
+                ranked.sort_by(|a, b| {
+                    b.0.partial_cmp(&a.0)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.1.cmp(&b.1))
+                });
+                Ok(ranked
+                    .into_iter()
+                    .filter_map(|(_, i)| all.get(i).cloned())
+                    .collect())
             }
             SearchMode::Vec => self.search_rows(self.store.collection(collection), mode, query),
         }
     }
 
     fn search_fts_lex(&self, collection: &str, query: &str, rank_limit: Option<usize>) -> Vec<Row> {
+        let col = self.store.collection(collection);
+        self.search_fts_lex_indices(collection, query, rank_limit)
+            .into_iter()
+            .filter_map(|(_, i)| col.get(i).cloned())
+            .collect()
+    }
+
+    fn search_fts_lex_indices(
+        &self,
+        collection: &str,
+        query: &str,
+        rank_limit: Option<usize>,
+    ) -> Vec<(i64, usize)> {
         if rank_limit == Some(0) {
             return Vec::new();
         }
@@ -1948,9 +1954,31 @@ impl Db {
         };
         scored.sort_unstable_by(|(sa, ia), (sb, ib)| sb.cmp(sa).then_with(|| ia.cmp(ib)));
         scored
-            .into_iter()
-            .filter_map(|(_, i)| col.get(i).cloned())
-            .collect()
+    }
+
+    fn vector_search_indices(
+        &self,
+        rows: &[Row],
+        query: &str,
+    ) -> Result<Vec<(f64, usize)>, Error> {
+        let Some(emb) = self.embedder.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let qv = emb.embed(query);
+        let mut scored = rows
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| {
+                let v = r.get("embedding").and_then(Cell::as_vec)?;
+                let score = embed::cosine(qv.as_ref(), v);
+                (score > 0.01).then_some((score, i))
+            })
+            .collect::<Vec<_>>();
+        scored.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        Ok(scored)
     }
 
     /// `col | pred | count` / `count by f` — no row materialization when possible.
@@ -2205,9 +2233,7 @@ impl Db {
                     fields = Some(f.as_slice());
                 }
                 Step::Skip { n } => {
-                    if fields.is_none() {
-                        return None;
-                    }
+                    fields?;
                     skip_n = skip_n.saturating_add((*n).max(0) as usize);
                 }
                 Step::Take { n } => {
@@ -2480,8 +2506,8 @@ impl Db {
         // Index into SoA columns — avoid allocating Vec<Cell> per user on every run.
         let mut probe: FxHashMap<&str, usize> = FxHashMap::default();
         probe.reserve(users_id.len());
-        for i in 0..users_id.len() {
-            probe.insert(users_id[i].as_ref(), i);
+        for (i, user_id) in users_id.iter().enumerate() {
+            probe.insert(user_id.as_ref(), i);
         }
 
         let orders_id = self.store.orders_id();
@@ -2543,7 +2569,7 @@ impl Db {
                     continue;
                 }
                 if let Some(min) = total_gt {
-                    if !(orders_total[idx] > min) {
+                    if orders_total[idx] <= min {
                         continue;
                     }
                 } else if need_row_filter && let Some(pred) = filter {
@@ -2594,7 +2620,7 @@ impl Db {
                 continue;
             }
             if let Some(min) = total_gt {
-                if !(orders_total[idx] > min) {
+                if orders_total[idx] <= min {
                     continue;
                 }
             } else if need_row_filter && let Some(pred) = filter {
@@ -2977,28 +3003,29 @@ impl Db {
             return Ok(());
         }
         for start_key in keys {
-            let mut stack: Vec<(
+            type GraphSearchFrame = (
                 String,
                 i64,
                 BTreeSet<String>,
                 Option<(String, String, String)>,
-            )> = vec![(start_key, 0, BTreeSet::new(), None)];
+            );
+            let mut stack: Vec<GraphSearchFrame> = vec![(start_key, 0, BTreeSet::new(), None)];
             while let Some((at, depth, path, last_edge)) = stack.pop() {
-                if depth > 0 && depth >= hop.min_depth && depth <= hop.max_depth {
-                    if let Some(node) = self.resolve_node(primary, &at) {
-                        let mut merged = row.clone();
-                        for (k, v) in &node {
-                            merged.insert(format!("{}.{k}", hop.bind), v.clone());
-                        }
-                        if let (Some(e_bind), Some((r, f, t))) = (&hop.edge, &last_edge) {
-                            merged.insert(format!("{e_bind}.rel"), Cell::text_arc(r.as_str()));
-                            merged.insert(format!("{e_bind}.from"), Cell::text_arc(f.as_str()));
-                            merged.insert(format!("{e_bind}.to"), Cell::text_arc(t.as_str()));
-                        }
-                        out.push(merged);
-                        if out.len() >= 300 {
-                            return Ok(());
-                        }
+                if depth > 0 && depth >= hop.min_depth && depth <= hop.max_depth
+                    && let Some(node) = self.resolve_node(primary, &at)
+                {
+                    let mut merged = row.clone();
+                    for (k, v) in &node {
+                        merged.insert(format!("{}.{k}", hop.bind), v.clone());
+                    }
+                    if let (Some(e_bind), Some((r, f, t))) = (&hop.edge, &last_edge) {
+                        merged.insert(format!("{e_bind}.rel"), Cell::text_arc(r.as_str()));
+                        merged.insert(format!("{e_bind}.from"), Cell::text_arc(f.as_str()));
+                        merged.insert(format!("{e_bind}.to"), Cell::text_arc(t.as_str()));
+                    }
+                    out.push(merged);
+                    if out.len() >= 300 {
+                        return Ok(());
                     }
                 }
                 if depth >= hop.max_depth {
@@ -3277,21 +3304,18 @@ impl Db {
             {
                 row.insert("hash".into(), Cell::Text(content_hash_arc(body.as_ref())));
             }
-            if let Some(id) = row.get("id").and_then(Cell::text_shared) {
-                if !batch_ids.insert(std::sync::Arc::clone(&id))
-                    || self.store.get_by_id(collection, id.as_ref()).is_some()
-                {
-                    return Err(Error::runtime(format!("duplicate id: {id}")));
-                }
+            if let Some(id) = row.get("id").and_then(Cell::text_shared)
+                && (!batch_ids.insert(std::sync::Arc::clone(&id))
+                    || self.store.get_by_id(collection, id.as_ref()).is_some())
+            {
+                return Err(Error::runtime(format!("duplicate id: {id}")));
             }
             if collection == "docs"
                 && let Some(uri) = row.get("uri").and_then(Cell::text_shared)
+                && (!batch_uris.insert(std::sync::Arc::clone(&uri))
+                    || self.store.get_by_uri(uri.as_ref()).is_some())
             {
-                if !batch_uris.insert(std::sync::Arc::clone(&uri))
-                    || self.store.get_by_uri(uri.as_ref()).is_some()
-                {
-                    return Err(Error::runtime(format!("duplicate uri: {uri}")));
-                }
+                return Err(Error::runtime(format!("duplicate uri: {uri}")));
             }
             self.check_row_fks(collection, &row)?;
             built.push(row);

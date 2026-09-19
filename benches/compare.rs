@@ -24,11 +24,13 @@
 
 use std::collections::HashMap;
 use std::hint::black_box;
+use std::sync::Arc;
 use std::time::Duration;
 
 use airbug_bench::{Config, DropPolicy, Fixture, Suite};
 use lin::Queryable as LinQueryable;
 use lin::query::pred;
+use lin::MatchPath;
 use mysql::prelude::Queryable;
 
 const N: usize = 10_000;
@@ -590,11 +592,7 @@ fn seed_join_lin() -> JoinLin {
     let orders_q = LinQueryable::from("orders")
         .select(["id", "user_id", "total"])
         .take_all();
-    let cur_n = inner_q
-        .cursor(&db)
-        .expect("lin join cursor")
-        .map(|r| r.expect("row"))
-        .count();
+    let cur_n = inner_q.cursor(&db).expect("lin join cursor").count();
     assert_eq!(cur_n, JOIN_ORDERS);
     assert!(inner_q.cursor(&db).expect("lazy").is_lazy());
     JoinLin {
@@ -2241,7 +2239,7 @@ fn main() -> airbug_bench::Result<()> {
             .bench_with_input(
                 &format!("durable_append_{label}/lin"),
                 move || setup_lin_durable_append(n),
-                move |ins| fill_lin_durable_append(ins),
+                fill_lin_durable_append,
                 DropPolicy::OutsideTiming,
             )
             .tag("durable")
@@ -2253,7 +2251,7 @@ fn main() -> airbug_bench::Result<()> {
             .bench_with_input(
                 &format!("durable_append_{label}/sqlite"),
                 move || setup_sqlite_durable("logs", n),
-                move |s| fill_sqlite_durable(s),
+                fill_sqlite_durable,
                 DropPolicy::OutsideTiming,
             )
             .tag("durable")
@@ -2265,7 +2263,7 @@ fn main() -> airbug_bench::Result<()> {
             .bench_with_input(
                 &format!("durable_insert_{label}/lin"),
                 move || setup_lin_durable_insert(n),
-                move |ins| fill_lin_durable_insert(ins),
+                fill_lin_durable_insert,
                 DropPolicy::OutsideTiming,
             )
             .tag("durable")
@@ -2277,7 +2275,7 @@ fn main() -> airbug_bench::Result<()> {
             .bench_with_input(
                 &format!("durable_insert_{label}/sqlite"),
                 move || setup_sqlite_durable("docs", n),
-                move |s| fill_sqlite_durable(s),
+                fill_sqlite_durable,
                 DropPolicy::OutsideTiming,
             )
             .tag("durable")
@@ -2292,7 +2290,7 @@ fn main() -> airbug_bench::Result<()> {
         .bench_with_input(
             "durable_append_1k/lin_normal_unsync",
             move || setup_lin_durable_append_sync(INSERT_1K, lin::SyncMode::Normal),
-            move |ins| fill_lin_durable_append(ins),
+            fill_lin_durable_append,
             DropPolicy::OutsideTiming,
         )
         .tag("durable")
@@ -2425,6 +2423,233 @@ fn main() -> airbug_bench::Result<()> {
         .parameter("rows", INSERT_1K)
         .work_units("rows", INSERT_1K as u64);
 
+    // Extended coverage: mutation, graph, async, concurrency, lifecycle, and
+    // scale/selectivity paths not represented by the SQL comparison fixtures.
+    let cas = Fixture::new(|| {
+        let mut db = lin::Db::fixture();
+        let inserted = db
+            .run(r#"insert docs { uri: "bench://cas", title: "cas", layer: "wiki", body: "x" }"#)
+            .expect("seed cas");
+        let id = inserted.rows[0].get("id").and_then(|c| c.text()).unwrap().to_string();
+        let q = db
+            .prepare(&format!(r#"update docs[id == "{id}"] cas each {{ room: "bench" }}"#))
+            .expect("prepare cas");
+        (db, q)
+    });
+    suite
+        .bench_fixture("update_cas_each/lin", cas, |s| {
+            black_box(s.1.run(&mut s.0).expect("cas update").done.n)
+        })
+        .tag("mutation")
+        .tag("cas")
+        .tag("lin")
+        .work_units("rows", 1);
+
+    let delete_cas = || {
+        let mut db = lin::Db::fixture();
+        let inserted = db
+            .run(r#"insert docs { uri: "bench://delete", title: "delete", layer: "wiki", body: "x" }"#)
+            .expect("seed delete");
+        let id = inserted.rows[0].get("id").and_then(|c| c.text()).unwrap().to_string();
+        let hash = inserted.rows[0].get("hash").and_then(|c| c.text()).unwrap().to_string();
+        let q = db
+            .prepare(&format!(r#"delete docs[id == "{id}"] cas "{hash}""#))
+            .expect("prepare delete");
+        (db, q)
+    };
+    suite
+        .bench_with_input("delete_cas/lin", delete_cas, |s| {
+            black_box(s.1.run(&mut s.0).expect("cas delete").done.n)
+        }, DropPolicy::OutsideTiming)
+        .tag("mutation")
+        .tag("cas")
+        .tag("lin")
+        .work_units("rows", 1);
+
+    suite
+        .bench_with_input("schema_catalog_mutation/lin", lin::Db::empty, |db| {
+            black_box(
+                db.run(
+                    r#"col bench_notes { title: text }
+index bench_notes [title]"#,
+                )
+                .expect("schema mutation")
+                .done
+                .n,
+            )
+        }, DropPolicy::OutsideTiming)
+        .tag("schema")
+        .tag("catalog")
+        .tag("lin")
+        .work_units("operations", 2);
+
+    let match_graph = Fixture::new(|| {
+        let mut db = lin::Db::fixture();
+        let q = LinQueryable::from("docs")
+            .filter(pred::eq("id", "e7c98d54-b4d6-4165-86e9-9b999e7ce9c3"))
+            .match_path(MatchPath::fwd("wikilink", "b"))
+            .take_all();
+        q.run(&mut db).expect("match setup");
+        (db, q)
+    });
+    suite
+        .bench_fixture("graph_match_path/lin", match_graph, |s| {
+            black_box(s.1.run(&mut s.0).expect("match").done.n)
+        })
+        .tag("graph")
+        .tag("match")
+        .tag("lin")
+        .work_units("rows", 1);
+
+    let graph = Fixture::new(|| {
+        let mut db = lin::Db::fixture();
+        let q = LinQueryable::from("docs")
+            .filter(pred::eq("id", "e7c98d54-b4d6-4165-86e9-9b999e7ce3c9"))
+            .hop("wikilink")
+            .take_all();
+        // Compile and validate the query shape during fixture setup.
+        q.run(&mut db).expect("hop setup");
+        (db, q)
+    });
+    suite
+        .bench_fixture("graph_hop/lin", graph, |s| {
+            black_box(s.1.run(&mut s.0).expect("hop").done.n)
+        })
+        .tag("graph")
+        .tag("lin")
+        .work_units("rows", 1);
+
+    let async_fix = Fixture::new(|| {
+        let db = lin::AsyncDb::new(lin::Db::fixture());
+        let q = LinQueryable::from("docs").take(1);
+        (tokio::runtime::Runtime::new().expect("runtime"), db, q)
+    });
+    suite
+        .bench_fixture("async_read/lin", async_fix, |s| {
+            black_box(s.0.block_on(s.2.clone().to_vec_async(&s.1)).expect("async").len())
+        })
+        .tag("async")
+        .tag("lin")
+        .work_units("rows", 1);
+
+    let readers = Fixture::new(|| {
+        let mut db = lin::Db::fixture();
+        Arc::new(db.reader())
+    });
+    suite
+        .bench_fixture("concurrent_readers_4/lin", readers, |read| {
+            let mut joins = Vec::with_capacity(4);
+            for _ in 0..4 {
+                let db = Arc::clone(read);
+                joins.push(std::thread::spawn(move || {
+                    black_box(db.run(r#"docs | wing == "rag" | count"#).expect("reader").done.n)
+                }));
+            }
+            black_box(joins.into_iter().map(|j| j.join().expect("join")).sum::<usize>())
+        })
+        .tag("concurrency")
+        .tag("lin")
+        .work_units("rows", 4);
+
+    let backup = Fixture::new(|| {
+        let db = lin::Db::fixture();
+        let path = std::env::temp_dir().join(format!(
+            "lin-bench-{}.linbak",
+            std::process::id()
+        ));
+        (db, path)
+    });
+    suite
+        .bench_fixture("backup_export/lin", backup, |s| {
+            s.0.export_backup(&s.1).expect("backup");
+            let imported = lin::Db::import_backup(&s.1).expect("import");
+            black_box(imported.stats().docs)
+        })
+        .tag("backup")
+        .tag("lin")
+        .work_units("rows", 10_000);
+
+    let cold_query = Fixture::new(|| setup_lin_cold_reopen(COLD_N));
+    suite
+        .bench_fixture("cold_mmap_first_query/lin", cold_query, |s| {
+            let mut db = lin::Db::open_with(
+                &s.dir.0,
+                lin::OpenOpts {
+                    sync: lin::SyncMode::Full,
+                    cold: true,
+                },
+            )
+            .expect("cold open");
+            let result = db
+                .run(r#"docs | wing == "rag" | { id, title } | take 20"#)
+                .expect("cold query");
+            black_box(result.done.n)
+        })
+        .tag("cold")
+        .tag("mmap")
+        .tag("lin")
+        .parameter("rows", COLD_N)
+        .work_units("rows", 20);
+
+    let replication = Fixture::new(|| setup_lin_wal_ship(INSERT_1K));
+    suite
+        .bench_fixture("replication_sustained_10x/lin", replication, |s| {
+            let mut total = 0;
+            for _ in 0..10 {
+                let mut follower = lin::Db::empty();
+                total += follower.apply_wal(&s.frames).expect("replication");
+            }
+            black_box(total)
+        })
+        .tag("replication")
+        .tag("wal")
+        .tag("lin")
+        .parameter("batches", 10)
+        .work_units("rows", (INSERT_1K * 10) as u64);
+
+    let tail = Fixture::new(|| seed_lin(10_000));
+    suite
+        .bench_fixture("tail_latency_mixed_filters/lin", tail, |s| {
+            let mut total = 0;
+            for query in [
+                &s.filter_eq,
+                &s.filter_range,
+                &s.fts_selective,
+                &s.fts_common,
+                &s.materialize,
+            ] {
+                total += query.run(&mut s.db).expect("tail query").done.n;
+            }
+            black_box(total)
+        })
+        .tag("tail")
+        .tag("latency")
+        .tag("lin")
+        .parameter("operations", 5)
+        .work_units("operations", 5);
+
+    let sizes_1k = Fixture::new(|| seed_lin(1_000));
+    suite
+        .bench_fixture("filter_selectivity_1k/lin", sizes_1k, |s| {
+            black_box(s.filter_eq.run(&mut s.db).expect("filter").done.n)
+        })
+        .tag("scale")
+        .tag("selectivity")
+        .tag("lin")
+        .parameter("rows", 1_000)
+        .work_units("rows", 1_000);
+
+    let sizes_100k = Fixture::new(|| seed_lin(100_000));
+    suite
+        .bench_fixture("filter_selectivity_100k/lin", sizes_100k, |s| {
+            black_box(s.filter_eq.run(&mut s.db).expect("filter").done.n)
+        })
+        .tag("scale")
+        .tag("selectivity")
+        .tag("lin")
+        .parameter("rows", 100_000)
+        .work_units("rows", 100_000);
+
     let args: Vec<String> = std::env::args()
         .skip(1)
         .filter(|a| a != "--bench")
@@ -2546,10 +2771,10 @@ fn run_suite(mut suite: Suite<'_>, args: &[String]) -> airbug_bench::Result<()> 
     let total = selected.len();
     if let Some(p) = output.as_ref() {
         let dir = std::path::Path::new(p);
-        if let Some(parent) = dir.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent).map_err(|e| airbug_bench::error(e.to_string()))?;
-            }
+        if let Some(parent) = dir.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent).map_err(|e| airbug_bench::error(e.to_string()))?;
         }
         if !dir.exists() {
             std::fs::create_dir(dir).map_err(|e| airbug_bench::error(e.to_string()))?;

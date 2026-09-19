@@ -160,6 +160,19 @@ pub struct Edge {
     pub to: String,
 }
 
+type FactKey = (Arc<str>, Arc<str>, Arc<str>);
+type StoreRowSnap = (
+    Option<String>,
+    Option<String>,
+    Arc<str>,
+    Arc<str>,
+    Arc<str>,
+    Arc<str>,
+    Option<(Arc<str>, Arc<str>, Arc<str>)>,
+    Arc<str>,
+    f64,
+);
+
 #[derive(Debug)]
 pub struct Store {
     pub r#gen: u64,
@@ -180,7 +193,7 @@ pub struct Store {
     /// docs uri → row index.
     docs_by_uri: FxHashMap<String, usize>,
     /// facts (s,p,o) → row index — O(1) append idempotency.
-    pub(crate) facts_by_spo: FxHashMap<(Arc<str>, Arc<str>, Arc<str>), usize>,
+    pub(crate) facts_by_spo: FxHashMap<FactKey, usize>,
     /// edge (rel,from,to) set — O(1) append/delete edge.
     pub(crate) edge_keys: FxHashSet<(Arc<str>, Arc<str>, Arc<str>)>,
     /// Parallel Arc columns for docs — contains scans + projected materialize
@@ -587,15 +600,12 @@ impl Store {
             });
         }
         for (collection, src) in &self.extra_filters {
-            match crate::parse::parse_pred_src(src) {
-                Ok(pred) => {
-                    let _ = cat.apply_decl(&Decl::Filter {
-                        collection: collection.clone(),
-                        pred: Some(pred),
-                        src: src.clone(),
-                    });
-                }
-                Err(_) => {}
+            if let Ok(pred) = crate::parse::parse_pred_src(src) {
+                let _ = cat.apply_decl(&Decl::Filter {
+                    collection: collection.clone(),
+                    pred: Some(pred),
+                    src: src.clone(),
+                });
             }
         }
     }
@@ -1053,10 +1063,10 @@ impl Store {
     }
 
     pub fn collection(&self, name: &str) -> &[Row] {
-        if let Some(c) = self.cold.get(name) {
-            if let Ok(rows) = c.rows() {
-                return rows;
-            }
+        if let Some(c) = self.cold.get(name)
+            && let Ok(rows) = c.rows()
+        {
+            return rows;
         }
         self.collections
             .get(name)
@@ -1385,17 +1395,7 @@ impl Store {
             self.users_email.reserve(n);
         }
         // Snapshot first so we can mutate maps without overlapping borrows.
-        let snaps: Vec<(
-            Option<String>,
-            Option<String>,
-            Arc<str>,
-            Arc<str>,
-            Arc<str>,
-            Arc<str>,
-            Option<(Arc<str>, Arc<str>, Arc<str>)>,
-            Arc<str>, // user_id / email extra
-            f64,      // total
-        )> = rows
+        let snaps: Vec<StoreRowSnap> = rows
             .iter()
             .map(|row| {
                 (
@@ -1771,12 +1771,12 @@ impl Store {
         if labels.is_empty() {
             return Ok(());
         }
-        for (i, row) in rows.iter().enumerate() {
-            let row_idx = start + i;
-            for label in &labels {
-                if let Some(idx) = self.indexes.get_mut(label)
-                    && let Err(e) = idx.insert_at_new(row_idx, row)
-                {
+        for label in &labels {
+            let Some(idx) = self.indexes.get_mut(label) else {
+                continue;
+            };
+            for (i, row) in rows.iter().enumerate() {
+                if let Err(e) = idx.insert_at_new(start + i, row) {
                     return Err(Error::runtime(e));
                 }
             }
@@ -1919,9 +1919,7 @@ impl Store {
         let Some(fts) = self.fts.get_mut(collection) else {
             return;
         };
-        for (i, row) in rows.iter().enumerate() {
-            fts.insert_row(start + i, row);
-        }
+        fts.insert_rows(start, rows);
     }
 
     pub fn fts_remove_at(&mut self, collection: &str, row_idx: usize) {

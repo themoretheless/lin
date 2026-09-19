@@ -192,7 +192,7 @@ impl Queryable {
 
     /// Project using [`LinRow::COLUMNS`].
     pub fn select_row<T: LinRow>(self) -> Self {
-        self.select(&T::COLUMNS[..])
+        self.select(T::COLUMNS)
     }
 
     pub fn take(mut self, n: i64) -> Self {

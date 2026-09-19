@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::server::ServerConfig;
 use rustls::{ClientConfig, RootCertStore, ServerConnection, StreamOwned};
 
@@ -197,7 +197,6 @@ fn server_config(tls: &TlsServer) -> Result<Arc<ServerConfig>, Error> {
     let key = rustls_pemfile::private_key(&mut key_cursor)
         .map_err(io_err)?
         .ok_or_else(|| Error::runtime("wal ship: no TLS private key"))?;
-    let key = PrivateKeyDer::from(key);
     let cfg = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)

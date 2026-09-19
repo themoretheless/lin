@@ -286,6 +286,7 @@ pub fn acquire_writer_lock(dir: &Path) -> Result<File, Error> {
     ensure_dir(dir)?;
     let f = OpenOptions::new()
         .create(true)
+        .truncate(true)
         .read(true)
         .write(true)
         .open(lock_path(dir))
@@ -300,6 +301,7 @@ pub fn acquire_writer_lock(dir: &Path) -> Result<File, Error> {
     // Ensure fence file exists for readers.
     let _ = OpenOptions::new()
         .create(true)
+        .truncate(true)
         .read(true)
         .write(true)
         .open(fence_path(dir))
@@ -321,6 +323,7 @@ pub fn acquire_reader_lock(dir: &Path) -> Result<File, Error> {
         }
         let _ = OpenOptions::new()
             .create(true)
+            .truncate(true)
             .read(true)
             .write(true)
             .open(&path)
@@ -341,6 +344,7 @@ pub fn acquire_reader_lock(dir: &Path) -> Result<File, Error> {
 pub fn acquire_fence_exclusive(dir: &Path) -> Result<File, Error> {
     let f = OpenOptions::new()
         .create(true)
+        .truncate(true)
         .read(true)
         .write(true)
         .open(fence_path(dir))
@@ -436,7 +440,7 @@ pub fn write_backup(path: &Path, snap: &Snapshot) -> Result<(), Error> {
     let mut snap = snap.clone();
     // Portable: never ship cold stubs — rows must already be inlined.
     snap.cold_collections.clear();
-    let bytes = encode_snapshot_bytes(&snap)?;
+    let bytes = encode_backup_bytes(&snap)?;
     atomic_write(path, &bytes)
 }
 
@@ -468,16 +472,24 @@ pub fn expand_cold_into(dir: &Path, snap: &mut Snapshot) -> Result<(), Error> {
 }
 
 fn encode_snapshot_bytes(snap: &Snapshot) -> Result<Vec<u8>, Error> {
+    encode_snapshot_bytes_with_magic(snap, SNAPSHOT_MAGIC)
+}
+
+fn encode_backup_bytes(snap: &Snapshot) -> Result<Vec<u8>, Error> {
+    encode_snapshot_bytes_with_magic(snap, BACKUP_MAGIC)
+}
+
+fn encode_snapshot_bytes_with_magic(snap: &Snapshot, magic: [u8; 4]) -> Result<Vec<u8>, Error> {
     let mut body = Vec::new();
     rmp_serde::encode::write_named(&mut body, snap).map_err(io_err)?;
     let mut out = Vec::with_capacity(4 + body.len());
-    out.extend_from_slice(&SNAPSHOT_MAGIC);
+    out.extend_from_slice(&magic);
     out.extend_from_slice(&body);
     Ok(out)
 }
 
 fn decode_snapshot_bytes(bytes: &[u8]) -> Option<Snapshot> {
-    if bytes.len() >= 4 && bytes[..4] == SNAPSHOT_MAGIC {
+    if bytes.len() >= 4 && (bytes[..4] == SNAPSHOT_MAGIC || bytes[..4] == BACKUP_MAGIC) {
         return rmp_serde::from_slice(&bytes[4..]).ok();
     }
     // Legacy JSON snapshot / backup.
@@ -618,7 +630,7 @@ pub(crate) fn durable_sync(file: &File) -> io::Result<()> {
             return Ok(());
         }
         // Older kernels: fall back to FULLFSYNC via sync_data.
-        return file.sync_data();
+        file.sync_data()
     }
     #[cfg(not(target_vendor = "apple"))]
     {
@@ -632,6 +644,7 @@ fn put_str(buf: &mut Vec<u8>, s: &str) {
     buf.extend_from_slice(b);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_facts_v2(
     log: &mut File,
     rec_gen: u64,
@@ -658,6 +671,7 @@ fn append_facts_v2(
     write_frame(log, &LOG_MAGIC_V2, buf, sync, log_bytes)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_insert_cols_v2(
     log: &mut File,
     rec_gen: u64,
