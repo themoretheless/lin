@@ -2800,6 +2800,121 @@ index bench_notes [title]"#,
         .parameter("rows", 100_000)
         .work_units("rows", 100_000);
 
+    macro_rules! scale_filter_matrix {
+        ($label:literal, $n:expr) => {{
+            let n = $n;
+            let lin_scale = Fixture::new(move || seed_lin(n));
+            let sql_scale = Fixture::new(move || seed_sqlite(n));
+            let duck_scale = Fixture::new(move || seed_duck(n));
+            suite
+                .bench_fixture(
+                    concat!("filter_selectivity_", $label, "/lin"),
+                    lin_scale,
+                    |s| black_box(s.filter_eq.run(&mut s.db).expect("lin scale filter").done.n),
+                )
+                .tag("scale")
+                .tag("selectivity")
+                .tag("lin")
+                .tag("core")
+                .parameter("rows", n)
+                .work_units("rows", n as u64);
+            suite
+                .bench_fixture(
+                    concat!("filter_selectivity_", $label, "/sqlite"),
+                    sql_scale,
+                    |s| {
+                        let mut stmt = s
+                            .conn
+                            .prepare_cached("SELECT COUNT(*) FROM docs WHERE wing = 'rag'")
+                            .expect("sqlite scale filter");
+                        black_box(
+                            stmt.query_row([], |row| row.get::<_, i64>(0))
+                                .expect("sqlite count"),
+                        )
+                    },
+                )
+                .tag("scale")
+                .tag("selectivity")
+                .tag("sqlite")
+                .tag("core")
+                .parameter("rows", n)
+                .work_units("rows", n as u64);
+            suite
+                .bench_fixture(
+                    concat!("filter_selectivity_", $label, "/duckdb"),
+                    duck_scale,
+                    |s| {
+                        let mut stmt = s
+                            .conn
+                            .prepare_cached("SELECT COUNT(*) FROM docs WHERE wing = 'rag'")
+                            .expect("duck scale filter");
+                        black_box(
+                            stmt.query_row([], |row| row.get::<_, i64>(0))
+                                .expect("duck count"),
+                        )
+                    },
+                )
+                .tag("scale")
+                .tag("selectivity")
+                .tag("duckdb")
+                .tag("core")
+                .parameter("rows", n)
+                .work_units("rows", n as u64);
+            if let Some(url) = pg_url.clone() {
+                let pg_scale = Fixture::new(move || {
+                    let client =
+                        try_pg_client(&url).unwrap_or_else(|e| panic!("postgres scale: {e}"));
+                    seed_pg(n, client)
+                });
+                suite
+                    .bench_fixture(
+                        concat!("filter_selectivity_", $label, "/postgres"),
+                        pg_scale,
+                        |s| {
+                            black_box(
+                                s.client
+                                    .query_one(&s.filter_eq, &[])
+                                    .expect("postgres scale filter")
+                                    .get::<_, i64>(0),
+                            )
+                        },
+                    )
+                    .tag("scale")
+                    .tag("selectivity")
+                    .tag("postgres")
+                    .tag("core")
+                    .parameter("rows", n)
+                    .work_units("rows", n as u64);
+            }
+            if let Some(url) = mysql_url.clone() {
+                let mysql_scale = Fixture::new(move || {
+                    let conn = try_mysql_conn(&url).unwrap_or_else(|e| panic!("mysql scale: {e}"));
+                    seed_mysql(n, conn)
+                });
+                suite
+                    .bench_fixture(
+                        concat!("filter_selectivity_", $label, "/mysql"),
+                        mysql_scale,
+                        |s| {
+                            let row: Option<(i64,)> = s
+                                .conn
+                                .exec_first(&s.filter_eq, ())
+                                .expect("mysql scale filter");
+                            black_box(row.expect("mysql count").0)
+                        },
+                    )
+                    .tag("scale")
+                    .tag("selectivity")
+                    .tag("mysql")
+                    .tag("core")
+                    .parameter("rows", n)
+                    .work_units("rows", n as u64);
+            }
+        }};
+    }
+    scale_filter_matrix!("1k_db", 1_000);
+    scale_filter_matrix!("100k_db", 100_000);
+
     let args: Vec<String> = std::env::args()
         .skip(1)
         .filter(|a| a != "--bench")
