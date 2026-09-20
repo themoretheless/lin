@@ -252,15 +252,14 @@ impl<'a> QueryCursor<'a> {
             return self.next().map(|row| row.map(ProjectedRow::from_row));
         }
 
-        let mut state = std::mem::replace(&mut self.state, CursorState::Done);
         let (store, _) = self.db.store_catalog();
-        let item = match &mut state {
+        let item = match &mut self.state {
             CursorState::Lazy(lazy) => next_lazy_projected(store, lazy),
             CursorState::LazyJoinSoa(join) => next_lazy_join_soa_projected(store, join),
             _ => unreachable!("native projected state checked above"),
         };
-        if item.is_some() {
-            self.state = state;
+        if item.is_none() {
+            self.state = CursorState::Done;
         }
         item
     }
@@ -285,18 +284,17 @@ impl Iterator for QueryCursor<'_> {
             return it.next().map(Ok);
         }
 
-        let mut state = std::mem::replace(&mut self.state, CursorState::Done);
         let (store, _) = self.db.store_catalog();
 
-        let item = match &mut state {
+        let item = match &mut self.state {
             CursorState::Lazy(lazy) => next_lazy(store, lazy),
             CursorState::LazyJoin(join) => next_lazy_join(store, join),
             CursorState::LazyJoinSoa(join) => next_lazy_join_soa(store, join),
             _ => None,
         };
 
-        if item.is_some() {
-            self.state = state;
+        if item.is_none() {
+            self.state = CursorState::Done;
         }
         item
     }
@@ -925,7 +923,73 @@ fn collect_seed_keys(
 }
 
 fn next_lazy_join_soa(store: &Store, join: &mut LazyJoinSoa) -> Option<Result<Row, Error>> {
-    next_lazy_join_soa_projected(store, join).map(|row| row.map(ProjectedRow::into_row))
+    let orders_id = store.orders_id();
+    let orders_uid = store.orders_user_id();
+    let orders_total = store.orders_total();
+    let users_email = store.users_email();
+    let n = orders_id.len();
+
+    loop {
+        if join.take_left == Some(0) {
+            return None;
+        }
+        let idx = match &join.source {
+            RowSource::Idxs(idxs) => {
+                if join.pos >= idxs.len() {
+                    return None;
+                }
+                let i = idxs[join.pos];
+                join.pos += 1;
+                i
+            }
+            RowSource::Scan { len } => {
+                if join.pos >= *len {
+                    return None;
+                }
+                let i = join.pos;
+                join.pos += 1;
+                i
+            }
+        };
+        if idx >= n {
+            continue;
+        }
+        let (order_id, uid, total) = unsafe {
+            (
+                orders_id.get_unchecked(idx),
+                orders_uid.get_unchecked(idx).as_ref(),
+                *orders_total.get_unchecked(idx),
+            )
+        };
+        if let Some(min) = join.total_gt
+            && total.partial_cmp(&min) != Some(std::cmp::Ordering::Greater)
+        {
+            continue;
+        }
+        let right = join.probe.get(uid).copied();
+        if right.is_none() && !join.left_join {
+            continue;
+        }
+        if join.skip_left > 0 {
+            join.skip_left -= 1;
+            continue;
+        }
+        if let Some(t) = join.take_left.as_mut() {
+            *t = t.saturating_sub(1);
+        }
+
+        let mut row = Row::new();
+        row.insert("id".into(), Cell::Text(Arc::clone(order_id)));
+        row.insert(
+            "users.email".into(),
+            match right {
+                Some(ui) => Cell::Text(Arc::clone(unsafe { users_email.get_unchecked(ui) })),
+                None => Cell::Null,
+            },
+        );
+        row.insert("total".into(), Cell::Float(total));
+        return Some(Ok(row));
+    }
 }
 
 #[inline]

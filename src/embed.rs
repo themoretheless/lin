@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use rustc_hash::FxHasher;
-use std::hash::{Hash, Hasher};
+use std::hash::Hasher;
 
 /// Text → dense vector. Must be `Send + Sync` for [`crate::exec::ReadDb`] sharing.
 pub trait Embedder: Send + Sync {
@@ -83,7 +83,7 @@ impl HashingEmbedder {
             if token.is_empty() {
                 continue;
             }
-            bump(&mut v, token, 1.0);
+            bump(&mut v, token.as_bytes(), 1.0);
             let b = token.as_bytes();
             if b.len() >= 3 {
                 for w in b.windows(3) {
@@ -104,6 +104,13 @@ impl HashingEmbedder {
 }
 
 fn lowercase_into(text: &str, out: &mut String) {
+    if text.is_ascii() {
+        out.reserve(text.len());
+        for byte in text.bytes() {
+            out.push(byte.to_ascii_lowercase() as char);
+        }
+        return;
+    }
     for ch in text.chars() {
         for lower in ch.to_lowercase() {
             out.push(lower);
@@ -112,9 +119,9 @@ fn lowercase_into(text: &str, out: &mut String) {
 }
 
 #[inline]
-fn bump(v: &mut [f32], key: impl Hash, w: f32) {
+fn bump(v: &mut [f32], key: &[u8], w: f32) {
     let mut h = FxHasher::default();
-    key.hash(&mut h);
+    h.write(key);
     let i = (h.finish() as usize) % v.len();
     v[i] += w;
 }
@@ -158,13 +165,25 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f64 {
 
 /// Text blob used for embedding a row (title / body / snippet).
 pub fn row_embed_text(row: &crate::store::Row) -> String {
-    let mut blob = String::new();
-    for k in ["title", "body", "snippet"] {
-        if let Some(t) = crate::store::row_text(row, k) {
-            if !blob.is_empty() {
+    let fields = ["title", "body", "snippet"];
+    let mut capacity = 0;
+    let mut count = 0usize;
+    for field in fields {
+        if let Some(text) = crate::store::row_text(row, field) {
+            capacity += text.len();
+            count += 1;
+        }
+    }
+    capacity += count.saturating_sub(1);
+    let mut blob = String::with_capacity(capacity);
+    let mut written = 0;
+    for field in fields {
+        if let Some(text) = crate::store::row_text(row, field) {
+            if written != 0 {
                 blob.push(' ');
             }
-            blob.push_str(t);
+            blob.push_str(text);
+            written += 1;
         }
     }
     blob
