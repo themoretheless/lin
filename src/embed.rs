@@ -65,12 +65,14 @@ impl Embedder for HashingEmbedder {
 
     fn embed_batch(&self, texts: &[&str]) -> Vec<Arc<[f32]>> {
         let mut lower = String::new();
+        let mut scratch = vec![0f32; self.dim];
         let mut out = Vec::with_capacity(texts.len());
         for text in texts {
             lower.clear();
             lower.reserve(text.len());
             lowercase_into(text, &mut lower);
-            out.push(self.embed_lowered(&lower));
+            self.embed_lowered_into(&lower, &mut scratch);
+            out.push(Arc::from(scratch.clone()));
         }
         out
     }
@@ -79,27 +81,32 @@ impl Embedder for HashingEmbedder {
 impl HashingEmbedder {
     fn embed_lowered(&self, lower: &str) -> Arc<[f32]> {
         let mut v = vec![0f32; self.dim];
+        self.embed_lowered_into(lower, &mut v);
+        Arc::from(v)
+    }
+
+    fn embed_lowered_into(&self, lower: &str, v: &mut [f32]) {
+        v.fill(0.0);
         for token in lower.split_whitespace() {
             if token.is_empty() {
                 continue;
             }
-            bump(&mut v, token.as_bytes(), 1.0);
+            bump(v, token.as_bytes(), 1.0);
             let b = token.as_bytes();
             if b.len() >= 3 {
                 for w in b.windows(3) {
-                    bump(&mut v, w, 0.5);
+                    bump(v, w, 0.5);
                 }
             } else {
-                bump(&mut v, b, 0.5);
+                bump(v, b, 0.5);
             }
         }
         // Character bigrams over the whole string catch short queries.
         let bytes = lower.as_bytes();
         for w in bytes.windows(2) {
-            bump(&mut v, w, 0.25);
+            bump(v, w, 0.25);
         }
-        l2_normalize(&mut v);
-        Arc::from(v)
+        l2_normalize(v);
     }
 }
 
