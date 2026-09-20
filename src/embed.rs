@@ -165,13 +165,25 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f64 {
 
 /// Text blob used for embedding a row (title / body / snippet).
 pub fn row_embed_text(row: &crate::store::Row) -> String {
-    let mut blob = String::new();
-    for k in ["title", "body", "snippet"] {
-        if let Some(t) = crate::store::row_text(row, k) {
-            if !blob.is_empty() {
+    let fields = ["title", "body", "snippet"];
+    let mut capacity = 0;
+    let mut count = 0usize;
+    for field in fields {
+        if let Some(text) = crate::store::row_text(row, field) {
+            capacity += text.len();
+            count += 1;
+        }
+    }
+    capacity += count.saturating_sub(1);
+    let mut blob = String::with_capacity(capacity);
+    let mut written = 0;
+    for field in fields {
+        if let Some(text) = crate::store::row_text(row, field) {
+            if written != 0 {
                 blob.push(' ');
             }
-            blob.push_str(t);
+            blob.push_str(text);
+            written += 1;
         }
     }
     blob
