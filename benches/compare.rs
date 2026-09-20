@@ -28,9 +28,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use airbug_bench::{Config, DropPolicy, Fixture, Suite};
+use lin::MatchPath;
 use lin::Queryable as LinQueryable;
 use lin::query::pred;
-use lin::MatchPath;
 use mysql::prelude::Queryable;
 
 const N: usize = 10_000;
@@ -2430,9 +2430,15 @@ fn main() -> airbug_bench::Result<()> {
         let inserted = db
             .run(r#"insert docs { uri: "bench://cas", title: "cas", layer: "wiki", body: "x" }"#)
             .expect("seed cas");
-        let id = inserted.rows[0].get("id").and_then(|c| c.text()).unwrap().to_string();
+        let id = inserted.rows[0]
+            .get("id")
+            .and_then(|c| c.text())
+            .unwrap()
+            .to_string();
         let q = db
-            .prepare(&format!(r#"update docs[id == "{id}"] cas each {{ room: "bench" }}"#))
+            .prepare(&format!(
+                r#"update docs[id == "{id}"] cas each {{ room: "bench" }}"#
+            ))
             .expect("prepare cas");
         (db, q)
     });
@@ -2450,34 +2456,50 @@ fn main() -> airbug_bench::Result<()> {
         let inserted = db
             .run(r#"insert docs { uri: "bench://delete", title: "delete", layer: "wiki", body: "x" }"#)
             .expect("seed delete");
-        let id = inserted.rows[0].get("id").and_then(|c| c.text()).unwrap().to_string();
-        let hash = inserted.rows[0].get("hash").and_then(|c| c.text()).unwrap().to_string();
+        let id = inserted.rows[0]
+            .get("id")
+            .and_then(|c| c.text())
+            .unwrap()
+            .to_string();
+        let hash = inserted.rows[0]
+            .get("hash")
+            .and_then(|c| c.text())
+            .unwrap()
+            .to_string();
         let q = db
             .prepare(&format!(r#"delete docs[id == "{id}"] cas "{hash}""#))
             .expect("prepare delete");
         (db, q)
     };
     suite
-        .bench_with_input("delete_cas/lin", delete_cas, |s| {
-            black_box(s.1.run(&mut s.0).expect("cas delete").done.n)
-        }, DropPolicy::OutsideTiming)
+        .bench_with_input(
+            "delete_cas/lin",
+            delete_cas,
+            |s| black_box(s.1.run(&mut s.0).expect("cas delete").done.n),
+            DropPolicy::OutsideTiming,
+        )
         .tag("mutation")
         .tag("cas")
         .tag("lin")
         .work_units("rows", 1);
 
     suite
-        .bench_with_input("schema_catalog_mutation/lin", lin::Db::empty, |db| {
-            black_box(
-                db.run(
-                    r#"col bench_notes { title: text }
+        .bench_with_input(
+            "schema_catalog_mutation/lin",
+            lin::Db::empty,
+            |db| {
+                black_box(
+                    db.run(
+                        r#"col bench_notes { title: text }
 index bench_notes [title]"#,
+                    )
+                    .expect("schema mutation")
+                    .done
+                    .n,
                 )
-                .expect("schema mutation")
-                .done
-                .n,
-            )
-        }, DropPolicy::OutsideTiming)
+            },
+            DropPolicy::OutsideTiming,
+        )
         .tag("schema")
         .tag("catalog")
         .tag("lin")
@@ -2526,11 +2548,37 @@ index bench_notes [title]"#,
     });
     suite
         .bench_fixture("async_read/lin", async_fix, |s| {
-            black_box(s.0.block_on(s.2.clone().to_vec_async(&s.1)).expect("async").len())
+            black_box(
+                s.0.block_on(s.2.clone().to_vec_async(&s.1))
+                    .expect("async")
+                    .len(),
+            )
         })
         .tag("async")
         .tag("lin")
         .work_units("rows", 1);
+
+    let async_batch = Fixture::new(|| {
+        let db = lin::AsyncDb::new(lin::Db::fixture());
+        let q = LinQueryable::from("docs").take(1);
+        (tokio::runtime::Runtime::new().expect("runtime"), db, q)
+    });
+    suite
+        .bench_fixture("async_read_batch_32/lin", async_batch, |s| {
+            let mut total = 0;
+            for _ in 0..32 {
+                total +=
+                    s.0.block_on(s.2.clone().to_vec_async(&s.1))
+                        .expect("async batch")
+                        .len();
+            }
+            black_box(total)
+        })
+        .tag("async")
+        .tag("batch")
+        .tag("lin")
+        .parameter("operations", 32)
+        .work_units("rows", 32);
 
     let readers = Fixture::new(|| {
         let mut db = lin::Db::fixture();
@@ -2542,21 +2590,59 @@ index bench_notes [title]"#,
             for _ in 0..4 {
                 let db = Arc::clone(read);
                 joins.push(std::thread::spawn(move || {
-                    black_box(db.run(r#"docs | wing == "rag" | count"#).expect("reader").done.n)
+                    black_box(
+                        db.run(r#"docs | wing == "rag" | count"#)
+                            .expect("reader")
+                            .done
+                            .n,
+                    )
                 }));
             }
-            black_box(joins.into_iter().map(|j| j.join().expect("join")).sum::<usize>())
+            black_box(
+                joins
+                    .into_iter()
+                    .map(|j| j.join().expect("join"))
+                    .sum::<usize>(),
+            )
         })
         .tag("concurrency")
         .tag("lin")
         .work_units("rows", 4);
 
+    let readers_8 = Fixture::new(|| {
+        let mut db = lin::Db::fixture();
+        Arc::new(db.reader())
+    });
+    suite
+        .bench_fixture("concurrent_readers_8/lin", readers_8, |read| {
+            let mut joins = Vec::with_capacity(8);
+            for _ in 0..8 {
+                let db = Arc::clone(read);
+                joins.push(std::thread::spawn(move || {
+                    black_box(
+                        db.run(r#"docs | wing == "rag" | count"#)
+                            .expect("reader")
+                            .done
+                            .n,
+                    )
+                }));
+            }
+            black_box(
+                joins
+                    .into_iter()
+                    .map(|j| j.join().expect("join"))
+                    .sum::<usize>(),
+            )
+        })
+        .tag("concurrency")
+        .tag("batch")
+        .tag("lin")
+        .parameter("readers", 8)
+        .work_units("rows", 8);
+
     let backup = Fixture::new(|| {
         let db = lin::Db::fixture();
-        let path = std::env::temp_dir().join(format!(
-            "lin-bench-{}.linbak",
-            std::process::id()
-        ));
+        let path = std::env::temp_dir().join(format!("lin-bench-{}.linbak", std::process::id()));
         (db, path)
     });
     suite
@@ -2568,6 +2654,28 @@ index bench_notes [title]"#,
         .tag("backup")
         .tag("lin")
         .work_units("rows", 10_000);
+
+    let backup_batch = Fixture::new(|| {
+        let db = lin::Db::fixture();
+        let path =
+            std::env::temp_dir().join(format!("lin-bench-batch-{}.linbak", std::process::id()));
+        (db, path)
+    });
+    suite
+        .bench_fixture("backup_export_10x/lin", backup_batch, |s| {
+            let mut total = 0;
+            for _ in 0..10 {
+                s.0.export_backup(&s.1).expect("backup");
+                let imported = lin::Db::import_backup(&s.1).expect("import");
+                total += imported.stats().docs;
+            }
+            black_box(total)
+        })
+        .tag("backup")
+        .tag("batch")
+        .tag("lin")
+        .parameter("operations", 10)
+        .work_units("rows", 100_000);
 
     let cold_query = Fixture::new(|| setup_lin_cold_reopen(COLD_N));
     suite
@@ -2607,6 +2715,23 @@ index bench_notes [title]"#,
         .parameter("batches", 10)
         .work_units("rows", (INSERT_1K * 10) as u64);
 
+    let replication_50 = Fixture::new(|| setup_lin_wal_ship(INSERT_1K));
+    suite
+        .bench_fixture("replication_sustained_50x/lin", replication_50, |s| {
+            let mut total = 0;
+            for _ in 0..50 {
+                let mut follower = lin::Db::empty();
+                total += follower.apply_wal(&s.frames).expect("replication");
+            }
+            black_box(total)
+        })
+        .tag("replication")
+        .tag("wal")
+        .tag("batch")
+        .tag("lin")
+        .parameter("batches", 50)
+        .work_units("rows", (INSERT_1K * 50) as u64);
+
     let tail = Fixture::new(|| seed_lin(10_000));
     suite
         .bench_fixture("tail_latency_mixed_filters/lin", tail, |s| {
@@ -2627,6 +2752,31 @@ index bench_notes [title]"#,
         .tag("lin")
         .parameter("operations", 5)
         .work_units("operations", 5);
+
+    let tail_long = Fixture::new(|| seed_lin(10_000));
+    suite
+        .bench_fixture("tail_latency_mixed_filters_20x/lin", tail_long, |s| {
+            let mut total = 0;
+            for _ in 0..20 {
+                for query in [
+                    &s.filter_eq,
+                    &s.filter_range,
+                    &s.fts_selective,
+                    &s.fts_common,
+                    &s.materialize,
+                ] {
+                    total += query.run(&mut s.db).expect("tail query").done.n;
+                }
+            }
+            black_box(total)
+        })
+        .tag("tail")
+        .tag("latency")
+        .tag("batch")
+        .tag("lin")
+        .parameter("cycles", 20)
+        .parameter("operations", 100)
+        .work_units("operations", 100);
 
     let sizes_1k = Fixture::new(|| seed_lin(1_000));
     suite
