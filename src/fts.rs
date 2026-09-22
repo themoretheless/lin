@@ -62,9 +62,12 @@ impl FtsIndex {
             .values()
             .all(|indices| indices.last().is_none_or(|&last| last < start));
         if append_only {
+            let mut tokens = FxHashSet::default();
             for (offset, row) in rows.iter().enumerate() {
                 let row_idx = start + offset;
-                for tok in row_tokens(row, &self.fields) {
+                tokens.clear();
+                row_tokens_into(&mut tokens, row, &self.fields);
+                for tok in tokens.drain() {
                     self.postings.entry(tok).or_default().push(row_idx);
                 }
             }
@@ -203,18 +206,22 @@ pub fn tokenize(text: &str) -> Vec<String> {
 
 fn row_tokens(row: &Row, fields: &[String]) -> FxHashSet<String> {
     let mut out = FxHashSet::default();
+    row_tokens_into(&mut out, row, fields);
+    out
+}
+
+fn row_tokens_into(out: &mut FxHashSet<String>, row: &Row, fields: &[String]) {
     for f in fields {
         if let Some(t) = row_text(row, f) {
-            add_tokens(&mut out, t);
+            add_tokens(out, t);
         }
     }
     // Also index snippet when present (lex_score reads it) even if not fts-flagged.
     if !fields.iter().any(|f| f == "snippet")
         && let Some(t) = row_text(row, "snippet")
     {
-        add_tokens(&mut out, t);
+        add_tokens(out, t);
     }
-    out
 }
 
 fn row_tokens_vec(row: &Row, fields: &[String]) -> Vec<String> {
