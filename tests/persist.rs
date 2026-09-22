@@ -393,6 +393,34 @@ fn bulk_insert_survives_reopen() {
 }
 
 #[test]
+fn large_bulk_insert_survives_reopen() {
+    let dir = tmp();
+    {
+        let mut db = Db::open(&dir).unwrap();
+        let mut src = String::from("insert docs [\n");
+        for i in 0..256 {
+            if i != 0 {
+                src.push_str(",\n");
+            }
+            src.push_str(&format!(
+                r#"{{ uri: "raw://large/{i}", title: "large {i}", layer: "wiki" }}"#
+            ));
+        }
+        src.push_str("\n]");
+        let h = db.run(&src).unwrap();
+        assert_eq!(h.done.n, 256);
+        db.close().unwrap();
+    }
+    {
+        let mut db = Db::open(&dir).unwrap();
+        let q = db.run(r#"docs | count"#).unwrap();
+        assert_eq!(q.scalar().unwrap().as_int(), Some(256));
+        db.close().unwrap();
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn index_survives_reopen() {
     let dir = tmp();
     {

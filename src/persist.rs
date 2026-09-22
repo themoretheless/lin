@@ -40,7 +40,10 @@ pub const SNAPSHOT_MAGIC: [u8; 4] = *b"LIN\x04";
 /// Portable backup uses the same MessagePack envelope (self-contained, no cold refs).
 pub const BACKUP_MAGIC: [u8; 4] = *b"LIN\x04";
 pub const SNAPSHOT_EVERY: u32 = 32;
-const MAX_RECORD: u32 = 16 * 1024 * 1024;
+// A 10k-row insert with the default 768d embeddings is roughly 30 MiB.
+// Keep one columnar insert pack atomic instead of silently truncating or
+// forcing a non-replayable split.
+const MAX_RECORD: u32 = 64 * 1024 * 1024;
 /// New WAL framing magic (`LIN` + version).
 /// `\x01` = MessagePack(LogRecord); `\x02` = raw columnar hot packs.
 const LOG_MAGIC_V1: [u8; 4] = *b"LIN\x01";

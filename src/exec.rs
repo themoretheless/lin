@@ -1307,17 +1307,8 @@ impl Db {
                 records,
                 edges,
             } => {
-                let (rows, new_edges) = self.insert_bulk(collection, records, edges.as_slice())?;
+                let (rows, pack) = self.insert_bulk(collection, records, edges.as_slice())?;
                 mark_written(ctx, collection, &rows);
-                let pack = if self.is_durable() {
-                    Some(crate::persist::rows_to_insert_cols(
-                        collection.clone(),
-                        &rows,
-                        new_edges,
-                    ))
-                } else {
-                    Some(Pack::Batch { packs: Vec::new() })
-                };
                 Ok((rows, None, pack))
             }
             Stmt::Update {
@@ -3299,7 +3290,7 @@ impl Db {
         collection: &str,
         records: &[Record],
         edges: &[InsertEdge],
-    ) -> Result<(Vec<Row>, Vec<Edge>), Error> {
+    ) -> Result<(Vec<Row>, Option<Pack>), Error> {
         let now = now_ms();
         let n = records.len();
         let mut built: Vec<Row> = Vec::with_capacity(n);
@@ -3369,16 +3360,25 @@ impl Db {
         self.store.index_insert_slab(collection, start, &built)?;
         self.store.fts_insert_slab(collection, start, &built);
         self.store.row_maps_register_slab(collection, start, &built);
+        let pack = if self.is_durable() {
+            Some(crate::persist::rows_to_insert_cols(
+                collection.to_string(),
+                &built,
+                new_edges,
+            ))
+        } else {
+            Some(Pack::Batch { packs: Vec::new() })
+        };
         let want_rows = built.len() <= 128;
         if want_rows {
             self.store
                 .collection_mut(collection)
                 .extend(built.iter().cloned());
-            Ok((built, new_edges))
+            Ok((built, pack))
         } else {
             // Large bulk: move into store, elide Handle.rows (done.n from pack).
             self.store.collection_mut(collection).extend(built);
-            Ok((Vec::new(), new_edges))
+            Ok((Vec::new(), pack))
         }
     }
 
