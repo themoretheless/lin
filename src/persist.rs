@@ -23,6 +23,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -161,6 +162,8 @@ pub enum ColData {
     Time(Vec<i64>),
     /// Per-row dense vectors (`None` / empty = null).
     Vec(Vec<Option<Vec<f32>>>),
+    /// In-memory zero-copy variant; encoded identically to `Vec`.
+    VecArc(Vec<Option<Arc<[f32]>>>),
     /// Homogeneous null column of length `n` (n stored in InsertCols.n).
     Null,
 }
@@ -763,6 +766,20 @@ fn append_insert_cols_v2(
                     }
                 }
             }
+            ColData::VecArc(v) => {
+                buf.push(6);
+                for row in v {
+                    match row {
+                        Some(emb) if !emb.is_empty() => {
+                            buf.extend_from_slice(&(emb.len() as u32).to_le_bytes());
+                            for x in emb.iter() {
+                                buf.extend_from_slice(&x.to_le_bytes());
+                            }
+                        }
+                        _ => buf.extend_from_slice(&0u32.to_le_bytes()),
+                    }
+                }
+            }
             ColData::Null => buf.push(0),
         }
     }
@@ -1305,9 +1322,12 @@ pub fn rows_to_insert_cols(
             6 => {
                 let mut v = Vec::with_capacity(rows.len());
                 for r in rows {
-                    v.push(r.get(f).and_then(Cell::as_vec).map(|s| s.to_vec()));
+                    v.push(r.get(f).and_then(|cell| match cell {
+                        Cell::Vec(vector) => Some(Arc::clone(vector)),
+                        _ => None,
+                    }));
                 }
-                ColData::Vec(v)
+                ColData::VecArc(v)
             }
             _ => ColData::Null,
         };
@@ -1338,6 +1358,10 @@ pub fn cols_to_rows(fields: &[String], cols: &[ColData], n: usize) -> Vec<crate:
                 Some(ColData::Time(v)) => Cell::Time(v.get(i).copied().unwrap_or(0)),
                 Some(ColData::Vec(v)) => match v.get(i).and_then(|o| o.as_ref()) {
                     Some(emb) if !emb.is_empty() => Cell::vec_arc(emb.as_slice()),
+                    _ => Cell::Null,
+                },
+                Some(ColData::VecArc(v)) => match v.get(i).and_then(|o| o.as_ref()) {
+                    Some(emb) if !emb.is_empty() => Cell::vec_arc(Arc::clone(emb)),
                     _ => Cell::Null,
                 },
                 Some(ColData::Null) | None => Cell::Null,
