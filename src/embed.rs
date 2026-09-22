@@ -58,6 +58,9 @@ impl Embedder for HashingEmbedder {
     }
 
     fn embed(&self, text: &str) -> Arc<[f32]> {
+        if text.is_ascii() && !has_ascii_uppercase(text) {
+            return self.embed_lowered(text);
+        }
         let mut lower = String::with_capacity(text.len());
         lowercase_into(text, &mut lower);
         self.embed_lowered(&lower)
@@ -68,6 +71,11 @@ impl Embedder for HashingEmbedder {
         let mut scratch = vec![0f32; self.dim];
         let mut out = Vec::with_capacity(texts.len());
         for text in texts {
+            if text.is_ascii() && !has_ascii_uppercase(text) {
+                self.embed_lowered_into(text, &mut scratch);
+                out.push(Arc::from(scratch.clone()));
+                continue;
+            }
             lower.clear();
             lower.reserve(text.len());
             lowercase_into(text, &mut lower);
@@ -86,28 +94,38 @@ impl HashingEmbedder {
     }
 
     fn embed_lowered_into(&self, lower: &str, v: &mut [f32]) {
+        let dim = v.len();
+        if dim == 0 {
+            return;
+        }
+        let dim_is_power_of_two = dim.is_power_of_two();
         v.fill(0.0);
         for token in lower.split_whitespace() {
             if token.is_empty() {
                 continue;
             }
-            bump(v, token.as_bytes(), 1.0);
-            let b = token.as_bytes();
-            if b.len() >= 3 {
-                for w in b.windows(3) {
-                    bump(v, w, 0.5);
+            let bytes = token.as_bytes();
+            bump_hashed(v, bytes, dim, 1.0, dim_is_power_of_two);
+            if bytes.len() >= 3 {
+                for window in bytes.windows(3) {
+                    bump_hashed(v, window, dim, 0.5, dim_is_power_of_two);
                 }
             } else {
-                bump(v, b, 0.5);
+                bump_hashed(v, bytes, dim, 0.5, dim_is_power_of_two);
             }
         }
         // Character bigrams over the whole string catch short queries.
         let bytes = lower.as_bytes();
-        for w in bytes.windows(2) {
-            bump(v, w, 0.25);
+        for window in bytes.windows(2) {
+            bump_hashed(v, window, dim, 0.25, dim_is_power_of_two);
         }
         l2_normalize(v);
     }
+}
+
+#[inline]
+fn has_ascii_uppercase(text: &str) -> bool {
+    text.bytes().any(|byte| byte.is_ascii_uppercase())
 }
 
 fn lowercase_into(text: &str, out: &mut String) {
@@ -126,11 +144,26 @@ fn lowercase_into(text: &str, out: &mut String) {
 }
 
 #[inline]
-fn bump(v: &mut [f32], key: &[u8], w: f32) {
+fn hash_bytes(key: &[u8]) -> u64 {
     let mut h = FxHasher::default();
     h.write(key);
-    let i = (h.finish() as usize) % v.len();
-    v[i] += w;
+    h.finish()
+}
+
+#[inline]
+fn bucket_index(hash_value: u64, dim: usize, dim_is_power_of_two: bool) -> usize {
+    let hash = hash_value as usize;
+    if dim_is_power_of_two {
+        hash & (dim - 1)
+    } else {
+        hash % dim
+    }
+}
+
+#[inline]
+fn bump_hashed(v: &mut [f32], key: &[u8], dim: usize, w: f32, dim_is_power_of_two: bool) {
+    let idx = bucket_index(hash_bytes(key), dim, dim_is_power_of_two);
+    v[idx] += w;
 }
 
 fn l2_normalize(v: &mut [f32]) {

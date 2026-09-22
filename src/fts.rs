@@ -54,6 +54,23 @@ impl FtsIndex {
     }
 
     pub fn insert_rows(&mut self, start: usize, rows: &[Row]) {
+        // Bulk inserts append a fresh, monotonically increasing slab. In that
+        // case postings can be updated directly, avoiding a second global map,
+        // per-token index vectors, and their sort/dedup pass.
+        let append_only = self
+            .postings
+            .values()
+            .all(|indices| indices.last().is_none_or(|&last| last < start));
+        if append_only {
+            for (offset, row) in rows.iter().enumerate() {
+                let row_idx = start + offset;
+                for tok in row_tokens(row, &self.fields) {
+                    self.postings.entry(tok).or_default().push(row_idx);
+                }
+            }
+            return;
+        }
+
         let mut additions: FxHashMap<String, Vec<usize>> = FxHashMap::default();
         for (offset, row) in rows.iter().enumerate() {
             for tok in row_tokens_vec(row, &self.fields) {
@@ -243,7 +260,10 @@ fn lower_ascii_token(token: &str) -> String {
     if token.bytes().all(|b| !b.is_ascii_uppercase()) {
         return token.to_string();
     }
-    token.bytes().map(|b| b.to_ascii_lowercase() as char).collect()
+    token
+        .bytes()
+        .map(|b| b.to_ascii_lowercase() as char)
+        .collect()
 }
 
 pub fn fts_dir(data: &Path) -> PathBuf {
@@ -343,5 +363,21 @@ mod tests {
         assert_eq!(decoded.fields, fields);
         assert_eq!(decoded.candidate_idxs("wal"), vec![0]);
         assert!(FtsIndex::decode(&encoded[..encoded.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn append_slab_keeps_postings_sorted_and_unique() {
+        let fields = vec![String::from("title"), String::from("body")];
+        let mut first = Row::new();
+        first.insert("title".into(), Cell::text_arc("wal"));
+        first.insert("body".into(), Cell::text_arc("wal durable"));
+        let mut second = Row::new();
+        second.insert("title".into(), Cell::text_arc("wal"));
+
+        let mut index = FtsIndex::empty(&fields);
+        index.insert_rows(0, &[first]);
+        index.insert_rows(1, &[second]);
+
+        assert_eq!(index.candidate_idxs("wal"), vec![0, 1]);
     }
 }

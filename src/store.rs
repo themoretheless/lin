@@ -1654,15 +1654,13 @@ impl Store {
                     return;
                 }
             }
+            let by_id = self.by_id.entry(collection.to_string()).or_default();
             for (i, row) in rows.iter().enumerate() {
                 let idx = start + i;
                 let id = row.get("id").and_then(Cell::text_shared);
                 let uri = row.get("uri").and_then(Cell::text_shared);
                 if let Some(ref id) = id {
-                    self.by_id
-                        .entry(collection.to_string())
-                        .or_default()
-                        .insert(id.as_ref().to_owned(), idx);
+                    by_id.insert(id.as_ref().to_owned(), idx);
                 }
                 if let Some(uri) = uri {
                     self.docs_by_uri.insert(uri.as_ref().to_owned(), idx);
