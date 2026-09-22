@@ -21,6 +21,15 @@ pub trait Embedder: Send + Sync {
     fn embed_batch(&self, texts: &[&str]) -> Vec<Arc<[f32]>> {
         texts.iter().map(|text| self.embed(text)).collect()
     }
+
+    /// Embed a slab into owned vectors. Implementations can use this to
+    /// transfer vector allocations directly into storage without copying.
+    fn embed_batch_owned(&self, texts: &[&str]) -> Vec<Vec<f32>> {
+        self.embed_batch(texts)
+            .into_iter()
+            .map(|vector| vector.as_ref().to_vec())
+            .collect()
+    }
 }
 
 /// Local hashing embedder (unigram + char trigrams → L2-normalized bag).
@@ -81,6 +90,25 @@ impl Embedder for HashingEmbedder {
             lowercase_into(text, &mut lower);
             self.embed_lowered_into(&lower, &mut scratch);
             out.push(Arc::from(scratch.clone()));
+        }
+        out
+    }
+
+    fn embed_batch_owned(&self, texts: &[&str]) -> Vec<Vec<f32>> {
+        let mut lower = String::new();
+        let mut out = Vec::with_capacity(texts.len());
+        for text in texts {
+            let mut vector = vec![0f32; self.dim];
+            if text.is_ascii() && !has_ascii_uppercase(text) {
+                self.embed_lowered_into(text, &mut vector);
+                out.push(vector);
+                continue;
+            }
+            lower.clear();
+            lower.reserve(text.len());
+            lowercase_into(text, &mut lower);
+            self.embed_lowered_into(&lower, &mut vector);
+            out.push(vector);
         }
         out
     }

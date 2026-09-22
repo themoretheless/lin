@@ -3214,11 +3214,19 @@ impl Db {
             }
         }
         let refs = texts.iter().map(String::as_str).collect::<Vec<_>>();
-        let mut vectors = emb.embed_batch(&refs);
+        let vectors = emb
+            .embed_batch_owned(&refs)
+            .into_iter()
+            .map(Arc::from)
+            .collect::<Vec<_>>();
         if vectors.len() != row_idxs.len() {
             // Keep third-party embedders with a broken batch implementation
             // from silently leaving a partially embedded slab.
-            vectors = refs.iter().map(|text| emb.embed(text)).collect();
+            let vectors = refs.iter().map(|text| emb.embed(text)).collect::<Vec<_>>();
+            for (i, vector) in row_idxs.into_iter().zip(vectors) {
+                rows[i].insert("embedding".into(), Cell::Vec(vector));
+            }
+            return;
         }
         for (i, vector) in row_idxs.into_iter().zip(vectors) {
             rows[i].insert("embedding".into(), Cell::Vec(vector));
