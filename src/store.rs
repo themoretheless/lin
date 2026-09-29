@@ -2065,10 +2065,10 @@ impl Store {
     }
 
     /// Drop one row's index entries, given the row itself.
-    pub fn index_remove_row(&mut self, collection: &str, row_idx: usize, row: &Row) {
+    pub fn index_remove_row(&mut self, collection: &str, row_idx: usize, _row: &Row) {
         for idx in self.indexes.values_mut() {
             if idx.def.collection == collection {
-                idx.remove_at(row_idx, row);
+                idx.remove_at(row_idx);
             }
         }
     }
@@ -2214,7 +2214,9 @@ impl Store {
         let Some(fts) = self.fts.get_mut(collection) else {
             return;
         };
-        fts.insert_rows(start, rows);
+        for (i, row) in rows.iter().enumerate() {
+            fts.insert_row(start + i, row);
+        }
     }
 
     /// Drop the postings of the row currently at `row_idx`.
