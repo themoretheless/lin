@@ -558,3 +558,25 @@ notes | { id, title, hash, ts }"#);
     assert!(plan.contains("Scan notes"), "{plan}");
     assert!(plan.contains("hash"), "{plan}");
 }
+
+#[test]
+fn signed_number_literals() {
+    let plan = ok(r"orders | total < -1.5 and total >= -3 | { id }");
+    assert!(plan.contains("total < -1.5"), "{plan}");
+    assert!(plan.contains("total >= -3"), "{plan}");
+    let min = ok(r"orders | total > -9223372036854775808 | { id }");
+    assert!(min.contains("-9223372036854775808"), "{min}");
+
+    // A `-` only starts a number when a digit follows, so the match hop and
+    // `now - <dur>` keep their meaning, and durations stay unsigned.
+    let hop = ok(
+        r#"docs | id == "e7c98d54-b4d6-4165-86e9-9b999e7ce9c3" | match -wikilink-> b | { id, b.title }"#,
+    );
+    assert!(hop.contains("Match -wikilink-> b cap=300"), "{hop}");
+    assert_eq!(
+        ok(r"docs | ts > now - 1d | { id }"),
+        ok(r"docs | ts > ago 1d | { id }")
+    );
+    let dur = err(r"orders | total > ago -1d | { id }");
+    assert!(dur.contains("ago requires a duration"), "{dur}");
+}

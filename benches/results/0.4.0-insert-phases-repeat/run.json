@@ -1,0 +1,5337 @@
+{
+  "schema": 1,
+  "id": "1789598222201471000-66746",
+  "status": "complete",
+  "environment": {
+    "arch": "aarch64",
+    "os": "macos"
+  },
+  "provenance": {
+    "bench_version": "0.6.0",
+    "samples": "100",
+    "warmup_ns": "200000000"
+  },
+  "cases": [
+    {
+      "id": "compare/insert_phase_10k/lin_full",
+      "contract": {
+        "completion": "synchronous function return",
+        "lifecycle": "fresh input per operation; input setup/drop excluded; output drop included; chunks of <=64",
+        "param.embed": "1",
+        "param.fts": "1",
+        "param.rows": "10000",
+        "param.scalar_index": "1",
+        "sample_target_ns": "10000000",
+        "samples": "100",
+        "tag.insert": "true",
+        "tag.lin": "true",
+        "tag.phase": "true",
+        "warmup_ns": "200000000",
+        "work.count": "10000",
+        "work.unit": "rows"
+      },
+      "metrics": [
+        {
+          "id": "wall",
+          "unit": "ns",
+          "scope": "current thread wall clock; scheduler included",
+          "phase": "measurement",
+          "statistic": "batch_total",
+          "direction": "lower"
+        }
+      ]
+    },
+    {
+      "id": "compare/insert_phase_10k/lin_no_embed",
+      "contract": {
+        "completion": "synchronous function return",
+        "lifecycle": "fresh input per operation; input setup/drop excluded; output drop included; chunks of <=64",
+        "param.embed": "0",
+        "param.fts": "1",
+        "param.rows": "10000",
+        "param.scalar_index": "1",
+        "sample_target_ns": "10000000",
+        "samples": "100",
+        "tag.insert": "true",
+        "tag.lin": "true",
+        "tag.phase": "true",
+        "warmup_ns": "200000000",
+        "work.count": "10000",
+        "work.unit": "rows"
+      },
+      "metrics": [
+        {
+          "id": "wall",
+          "unit": "ns",
+          "scope": "current thread wall clock; scheduler included",
+          "phase": "measurement",
+          "statistic": "batch_total",
+          "direction": "lower"
+        }
+      ]
+    },
+    {
+      "id": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "contract": {
+        "completion": "synchronous function return",
+        "lifecycle": "fresh input per operation; input setup/drop excluded; output drop included; chunks of <=64",
+        "param.embed": "0",
+        "param.fts": "1",
+        "param.rows": "10000",
+        "param.scalar_index": "0",
+        "sample_target_ns": "10000000",
+        "samples": "100",
+        "tag.insert": "true",
+        "tag.lin": "true",
+        "tag.phase": "true",
+        "warmup_ns": "200000000",
+        "work.count": "10000",
+        "work.unit": "rows"
+      },
+      "metrics": [
+        {
+          "id": "wall",
+          "unit": "ns",
+          "scope": "current thread wall clock; scheduler included",
+          "phase": "measurement",
+          "statistic": "batch_total",
+          "direction": "lower"
+        }
+      ]
+    },
+    {
+      "id": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "contract": {
+        "completion": "synchronous function return",
+        "lifecycle": "fresh input per operation; input setup/drop excluded; output drop included; chunks of <=64",
+        "param.embed": "0",
+        "param.fts": "0",
+        "param.rows": "10000",
+        "param.scalar_index": "0",
+        "sample_target_ns": "10000000",
+        "samples": "100",
+        "tag.insert": "true",
+        "tag.lin": "true",
+        "tag.phase": "true",
+        "warmup_ns": "200000000",
+        "work.count": "10000",
+        "work.unit": "rows"
+      },
+      "metrics": [
+        {
+          "id": "wall",
+          "unit": "ns",
+          "scope": "current thread wall clock; scheduler included",
+          "phase": "measurement",
+          "statistic": "batch_total",
+          "direction": "lower"
+        }
+      ]
+    }
+  ],
+  "observations": [
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 0,
+      "value": "28359666",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 1,
+      "value": "27893667",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 2,
+      "value": "27840625",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 3,
+      "value": "28045042",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 4,
+      "value": "29023000",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 5,
+      "value": "28873000",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 6,
+      "value": "28403916",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 7,
+      "value": "30350625",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 8,
+      "value": "27871708",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 9,
+      "value": "29178625",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 10,
+      "value": "29318666",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 11,
+      "value": "30383250",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 12,
+      "value": "37611917",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 13,
+      "value": "30644000",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 14,
+      "value": "33439167",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 15,
+      "value": "42504583",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 16,
+      "value": "30693000",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 17,
+      "value": "30612459",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 18,
+      "value": "31100500",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 19,
+      "value": "27450833",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 20,
+      "value": "28572416",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 21,
+      "value": "28548250",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 22,
+      "value": "27879834",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 23,
+      "value": "28210250",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 24,
+      "value": "27808958",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 25,
+      "value": "27771000",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 26,
+      "value": "25658041",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 27,
+      "value": "26364375",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 28,
+      "value": "25574583",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 29,
+      "value": "26849334",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 30,
+      "value": "26067708",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 31,
+      "value": "25798291",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 32,
+      "value": "26750666",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 33,
+      "value": "28369167",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 34,
+      "value": "27840541",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 35,
+      "value": "27506250",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 36,
+      "value": "30919000",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 37,
+      "value": "29161584",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 38,
+      "value": "28204834",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 39,
+      "value": "27955375",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 40,
+      "value": "28290458",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 41,
+      "value": "27755625",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 42,
+      "value": "25824458",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 43,
+      "value": "26511875",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 44,
+      "value": "26027083",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 45,
+      "value": "26020291",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 46,
+      "value": "28943000",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 47,
+      "value": "26202250",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 48,
+      "value": "26584041",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 49,
+      "value": "28016000",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 50,
+      "value": "25771875",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 51,
+      "value": "26125375",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 52,
+      "value": "25629625",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 53,
+      "value": "25850125",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 54,
+      "value": "26547416",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 55,
+      "value": "26450583",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 56,
+      "value": "28196417",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 57,
+      "value": "28276458",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 58,
+      "value": "28843208",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 59,
+      "value": "27788167",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 60,
+      "value": "27532291",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 61,
+      "value": "25981292",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 62,
+      "value": "25951917",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 63,
+      "value": "25644083",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 64,
+      "value": "25901333",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 65,
+      "value": "26922084",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 66,
+      "value": "25622334",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 67,
+      "value": "25926333",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 68,
+      "value": "25927167",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 69,
+      "value": "25827334",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 70,
+      "value": "25735292",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 71,
+      "value": "26181541",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 72,
+      "value": "25651000",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 73,
+      "value": "25902125",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 74,
+      "value": "25928000",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 75,
+      "value": "25507833",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 76,
+      "value": "26345958",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 77,
+      "value": "26074500",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 78,
+      "value": "26121250",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 79,
+      "value": "26043708",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 80,
+      "value": "31495542",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 81,
+      "value": "27636083",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 82,
+      "value": "26612125",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 83,
+      "value": "26332917",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 84,
+      "value": "26258250",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 85,
+      "value": "26139167",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 86,
+      "value": "26784750",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 87,
+      "value": "26070708",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 88,
+      "value": "28060792",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 89,
+      "value": "28235541",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 90,
+      "value": "27958041",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 91,
+      "value": "28462416",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 92,
+      "value": "27875000",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 93,
+      "value": "27307084",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 94,
+      "value": "27905209",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 95,
+      "value": "25864416",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 96,
+      "value": "25972250",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 97,
+      "value": "26344250",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 98,
+      "value": "26919500",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_full",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 99,
+      "value": "26397542",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 0,
+      "value": "14029667",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 1,
+      "value": "14162625",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 2,
+      "value": "14154041",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 3,
+      "value": "14124416",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 4,
+      "value": "14411125",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 5,
+      "value": "12962416",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 6,
+      "value": "13041167",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 7,
+      "value": "13953625",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 8,
+      "value": "13433542",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 9,
+      "value": "13216125",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 10,
+      "value": "13241584",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 11,
+      "value": "13328084",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 12,
+      "value": "13599958",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 13,
+      "value": "13418375",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 14,
+      "value": "13787875",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 15,
+      "value": "13404833",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 16,
+      "value": "13168833",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 17,
+      "value": "13383000",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 18,
+      "value": "13447792",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 19,
+      "value": "13755417",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 20,
+      "value": "13492209",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 21,
+      "value": "13188333",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 22,
+      "value": "13435500",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 23,
+      "value": "13209875",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 24,
+      "value": "13414875",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 25,
+      "value": "13029167",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 26,
+      "value": "13604834",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 27,
+      "value": "13475959",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 28,
+      "value": "12762375",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 29,
+      "value": "13637916",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 30,
+      "value": "13260167",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 31,
+      "value": "12544500",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 32,
+      "value": "13067833",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 33,
+      "value": "12664042",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 34,
+      "value": "12652500",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 35,
+      "value": "12791417",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 36,
+      "value": "12566750",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 37,
+      "value": "12866333",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 38,
+      "value": "13072042",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 39,
+      "value": "13106125",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 40,
+      "value": "12671791",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 41,
+      "value": "12955042",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 42,
+      "value": "13267333",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 43,
+      "value": "13106333",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 44,
+      "value": "12766333",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 45,
+      "value": "12709666",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 46,
+      "value": "13282125",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 47,
+      "value": "12699584",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 48,
+      "value": "12778625",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 49,
+      "value": "12820250",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 50,
+      "value": "13272500",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 51,
+      "value": "13027083",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 52,
+      "value": "12985375",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 53,
+      "value": "12855041",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 54,
+      "value": "12751791",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 55,
+      "value": "13296000",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 56,
+      "value": "12652167",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 57,
+      "value": "12960000",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 58,
+      "value": "12877792",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 59,
+      "value": "13474250",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 60,
+      "value": "13008250",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 61,
+      "value": "13063666",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 62,
+      "value": "13045209",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 63,
+      "value": "13703917",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 64,
+      "value": "13700458",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 65,
+      "value": "13244709",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 66,
+      "value": "13293708",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 67,
+      "value": "12894708",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 68,
+      "value": "13492500",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 69,
+      "value": "13501792",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 70,
+      "value": "13225166",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 71,
+      "value": "13126792",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 72,
+      "value": "13413000",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 73,
+      "value": "12863083",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 74,
+      "value": "13275084",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 75,
+      "value": "13180959",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 76,
+      "value": "13348917",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 77,
+      "value": "13890583",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 78,
+      "value": "13958209",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 79,
+      "value": "14082334",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 80,
+      "value": "13824375",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 81,
+      "value": "13576000",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 82,
+      "value": "14123625",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 83,
+      "value": "14291500",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 84,
+      "value": "13579042",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 85,
+      "value": "14455625",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 86,
+      "value": "13857167",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 87,
+      "value": "13964292",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 88,
+      "value": "13777916",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 89,
+      "value": "13946500",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 90,
+      "value": "13103625",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 91,
+      "value": "13392375",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 92,
+      "value": "13152417",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 93,
+      "value": "13150333",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 94,
+      "value": "13405500",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 95,
+      "value": "13453959",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 96,
+      "value": "13507667",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 97,
+      "value": "13949958",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 98,
+      "value": "13662958",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 99,
+      "value": "13385792",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 0,
+      "value": "11772917",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 1,
+      "value": "11764959",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 2,
+      "value": "11471708",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 3,
+      "value": "11954708",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 4,
+      "value": "11912125",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 5,
+      "value": "11336875",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 6,
+      "value": "12044125",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 7,
+      "value": "11393375",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 8,
+      "value": "11526208",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 9,
+      "value": "11518291",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 10,
+      "value": "11602375",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 11,
+      "value": "11507667",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 12,
+      "value": "12045708",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 13,
+      "value": "17079959",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 14,
+      "value": "13602916",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 15,
+      "value": "13340000",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 16,
+      "value": "12161958",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 17,
+      "value": "12173958",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 18,
+      "value": "12185750",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 19,
+      "value": "11870959",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 20,
+      "value": "11817541",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 21,
+      "value": "12197208",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 22,
+      "value": "12127333",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 23,
+      "value": "11842916",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 24,
+      "value": "11746208",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 25,
+      "value": "11399750",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 26,
+      "value": "11905709",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 27,
+      "value": "12305000",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 28,
+      "value": "12363292",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 29,
+      "value": "12051209",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 30,
+      "value": "11893666",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 31,
+      "value": "12342000",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 32,
+      "value": "12199625",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 33,
+      "value": "11934166",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 34,
+      "value": "11827666",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 35,
+      "value": "12663750",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 36,
+      "value": "12045791",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 37,
+      "value": "12082625",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 38,
+      "value": "12289750",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 39,
+      "value": "11954791",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 40,
+      "value": "12225708",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 41,
+      "value": "11972833",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 42,
+      "value": "14975208",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 43,
+      "value": "13002041",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 44,
+      "value": "13117125",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 45,
+      "value": "12868666",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 46,
+      "value": "13813708",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 47,
+      "value": "13356625",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 48,
+      "value": "13462958",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 49,
+      "value": "13382250",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 50,
+      "value": "13553875",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 51,
+      "value": "13990333",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 52,
+      "value": "16135916",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 53,
+      "value": "14756000",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 54,
+      "value": "14214792",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 55,
+      "value": "14483541",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 56,
+      "value": "14055625",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 57,
+      "value": "13394833",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 58,
+      "value": "13583792",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 59,
+      "value": "13987417",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 60,
+      "value": "13040250",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 61,
+      "value": "13852584",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 62,
+      "value": "12852042",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 63,
+      "value": "12625458",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 64,
+      "value": "13113667",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 65,
+      "value": "12905542",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 66,
+      "value": "12739583",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 67,
+      "value": "12467334",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 68,
+      "value": "12918208",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 69,
+      "value": "11749292",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 70,
+      "value": "11978833",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 71,
+      "value": "11949625",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 72,
+      "value": "12242708",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 73,
+      "value": "12667417",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 74,
+      "value": "11892250",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 75,
+      "value": "11940500",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 76,
+      "value": "12342083",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 77,
+      "value": "11686250",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 78,
+      "value": "11452459",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 79,
+      "value": "12018416",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 80,
+      "value": "12012500",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 81,
+      "value": "11591500",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 82,
+      "value": "11345375",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 83,
+      "value": "11764208",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 84,
+      "value": "11758958",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 85,
+      "value": "11543667",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 86,
+      "value": "11844334",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 87,
+      "value": "11195208",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 88,
+      "value": "11272250",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 89,
+      "value": "10986583",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 90,
+      "value": "11422583",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 91,
+      "value": "11251708",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 92,
+      "value": "11190375",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 93,
+      "value": "11131708",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 94,
+      "value": "11951375",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 95,
+      "value": "11214916",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 96,
+      "value": "10808916",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 97,
+      "value": "10975083",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 98,
+      "value": "10993166",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_index",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 99,
+      "value": "10948541",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 0,
+      "value": "11908834",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 1,
+      "value": "15600542",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 2,
+      "value": "12401917",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 3,
+      "value": "12539083",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 4,
+      "value": "11563958",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 5,
+      "value": "12001167",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 6,
+      "value": "12638708",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 7,
+      "value": "12424709",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 8,
+      "value": "12258666",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 9,
+      "value": "12287291",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 10,
+      "value": "12255875",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 11,
+      "value": "11931000",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 12,
+      "value": "12822375",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 13,
+      "value": "12435708",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 14,
+      "value": "11677708",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 15,
+      "value": "12674291",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 16,
+      "value": "12060959",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 17,
+      "value": "12608250",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 18,
+      "value": "12432416",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 19,
+      "value": "12129125",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 20,
+      "value": "12019958",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 21,
+      "value": "12432416",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 22,
+      "value": "12349834",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 23,
+      "value": "13320666",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 24,
+      "value": "13066750",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 25,
+      "value": "12406666",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 26,
+      "value": "12970625",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 27,
+      "value": "12462959",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 28,
+      "value": "12837042",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 29,
+      "value": "12667375",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 30,
+      "value": "12624000",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 31,
+      "value": "13014500",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 32,
+      "value": "12418750",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 33,
+      "value": "12944250",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 34,
+      "value": "13046875",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 35,
+      "value": "12485375",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 36,
+      "value": "12766375",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 37,
+      "value": "12696000",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 38,
+      "value": "12642209",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 39,
+      "value": "12538917",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 40,
+      "value": "12358375",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 41,
+      "value": "12817250",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 42,
+      "value": "13478417",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 43,
+      "value": "12759125",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 44,
+      "value": "12781458",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 45,
+      "value": "12559834",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 46,
+      "value": "12673334",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 47,
+      "value": "12415792",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 48,
+      "value": "12572000",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 49,
+      "value": "12775333",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 50,
+      "value": "12666708",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 51,
+      "value": "12653500",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 52,
+      "value": "12127541",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 53,
+      "value": "12874291",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 54,
+      "value": "13464625",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 55,
+      "value": "13227542",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 56,
+      "value": "13440791",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 57,
+      "value": "12968750",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 58,
+      "value": "13581333",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 59,
+      "value": "13158375",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 60,
+      "value": "13099583",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 61,
+      "value": "12406583",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 62,
+      "value": "13130041",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 63,
+      "value": "12823625",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 64,
+      "value": "13201666",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 65,
+      "value": "13076750",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 66,
+      "value": "13550584",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 67,
+      "value": "13280792",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 68,
+      "value": "13396875",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 69,
+      "value": "13669708",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 70,
+      "value": "12846167",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 71,
+      "value": "12874292",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 72,
+      "value": "13539208",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 73,
+      "value": "13195209",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 74,
+      "value": "14117542",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 75,
+      "value": "13635791",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 76,
+      "value": "13613458",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 77,
+      "value": "13577208",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 78,
+      "value": "13208375",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 79,
+      "value": "13088666",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 80,
+      "value": "13935167",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 81,
+      "value": "13304875",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 82,
+      "value": "14274625",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 83,
+      "value": "13695542",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 84,
+      "value": "14083542",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 85,
+      "value": "14164584",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 86,
+      "value": "13678667",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 87,
+      "value": "15535417",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 88,
+      "value": "21534209",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 89,
+      "value": "17951209",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 90,
+      "value": "26302167",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 91,
+      "value": "30505083",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 92,
+      "value": "27203125",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 93,
+      "value": "26833459",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 94,
+      "value": "26009625",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 95,
+      "value": "25300875",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 96,
+      "value": "33289167",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 97,
+      "value": "30044500",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 98,
+      "value": "29244000",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 99,
+      "value": "31963334",
+      "operations": 2,
+      "availability": {
+        "state": "available"
+      }
+    }
+  ],
+  "notes": [
+    "Raw batches are not independent process replications. Batch averages are not individual-operation latency. CPU frequency and background load are uncontrolled."
+  ]
+}

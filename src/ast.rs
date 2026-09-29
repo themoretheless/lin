@@ -211,6 +211,10 @@ impl Pred {
         Pred::And(Box::new(self), Box::new(other))
     }
 
+    pub fn or(self, other: Pred) -> Pred {
+        Pred::Or(Box::new(self), Box::new(other))
+    }
+
     pub fn walk_fields<'a>(&'a self, out: &mut Vec<&'a Field>) {
         match self {
             Pred::And(a, b) | Pred::Or(a, b) => {
@@ -222,6 +226,20 @@ impl Pred {
             | Pred::Contains { field, .. }
             | Pred::Regex { field, .. } => out.push(field),
         }
+    }
+}
+
+impl std::ops::BitAnd for Pred {
+    type Output = Pred;
+    fn bitand(self, rhs: Pred) -> Pred {
+        self.and(rhs)
+    }
+}
+
+impl std::ops::BitOr for Pred {
+    type Output = Pred;
+    fn bitor(self, rhs: Pred) -> Pred {
+        self.or(rhs)
     }
 }
 

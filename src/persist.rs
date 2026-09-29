@@ -286,6 +286,7 @@ pub fn acquire_writer_lock(dir: &Path) -> Result<File, Error> {
     ensure_dir(dir)?;
     let f = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(lock_path(dir))
@@ -300,6 +301,7 @@ pub fn acquire_writer_lock(dir: &Path) -> Result<File, Error> {
     // Ensure fence file exists for readers.
     let _ = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(fence_path(dir))
@@ -308,7 +310,8 @@ pub fn acquire_writer_lock(dir: &Path) -> Result<File, Error> {
 }
 
 /// Shared fence lock for cold readers — **compatible with a live writer**.
-/// Blocks only while a writer holds an exclusive fence during checkpoint.
+/// Fails fast (never waits) while a writer holds the exclusive fence during a
+/// checkpoint: a reader that finds the dir mid-publish retries at its own pace.
 pub fn acquire_reader_lock(dir: &Path) -> Result<File, Error> {
     let path = fence_path(dir);
     if !path.exists() {
@@ -321,6 +324,7 @@ pub fn acquire_reader_lock(dir: &Path) -> Result<File, Error> {
         }
         let _ = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&path)
@@ -341,6 +345,7 @@ pub fn acquire_reader_lock(dir: &Path) -> Result<File, Error> {
 pub fn acquire_fence_exclusive(dir: &Path) -> Result<File, Error> {
     let f = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(fence_path(dir))
@@ -485,15 +490,55 @@ fn decode_snapshot_bytes(bytes: &[u8]) -> Option<Snapshot> {
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), Error> {
-    let tmp = path.with_extension("tmp");
-    {
-        let mut f = File::create(&tmp).map_err(io_err)?;
-        f.write_all(bytes).map_err(io_err)?;
-        f.sync_all().map_err(io_err)?;
-    }
-    fs::rename(&tmp, path).map_err(io_err)?;
+    write_through_tmp(path, &path.with_extension("tmp"), bytes)?;
     if let Some(parent) = path.parent() {
         let _ = sync_dir(parent);
+    }
+    Ok(())
+}
+
+/// Replace `path` with `bytes` through `tmp`: write, fsync, rename. A failed
+/// step removes the temp file, and the `cold`/`fts` prunes sweep whatever a
+/// killed process left behind — safe because prune only runs under the
+/// exclusive fence, when no live writer can hold a temp open.
+pub(crate) fn write_through_tmp(path: &Path, tmp: &Path, bytes: &[u8]) -> Result<(), Error> {
+    let result = (|| -> Result<(), Error> {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(tmp)
+            .map_err(io_err)?;
+        file.write_all(bytes).map_err(io_err)?;
+        file.sync_all().map_err(io_err)?;
+        drop(file);
+        fs::rename(tmp, path).map_err(io_err)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(tmp);
+    }
+    result
+}
+
+/// Drop `dir`'s `*.bin` files whose stem is not in `keep`, and every `*.tmp`
+/// still sitting there (see [`write_through_tmp`]).
+pub(crate) fn prune_bins(dir: &Path, keep: &[String]) -> Result<(), Error> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    for ent in fs::read_dir(dir).map_err(io_err)? {
+        let ent = ent.map_err(io_err)?;
+        let path = ent.path();
+        let extension = path.extension().and_then(|e| e.to_str());
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        let stale = match extension {
+            Some("tmp") => true,
+            Some("bin") => !keep.iter().any(|k| k == stem),
+            _ => false,
+        };
+        if stale {
+            let _ = fs::remove_file(&path);
+        }
     }
     Ok(())
 }

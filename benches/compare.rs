@@ -18,7 +18,9 @@
 //!   DuckDB may still win (mature OLAP); Lin now has an in-process columnar join path.
 //! - FTS cases isolate selective/common/miss `FtsSeek`, hybrid, and index rebuild.
 //! - Phase cases decompose insert variants, cursor open/scan/join, and reopen rebuilds.
-//! - Lin `hop` and CAS are not claimed here.
+//! - Audit group (`update_1row_*` / `delete_1row_*` / `plan_dnf_*` / `graph_depth_*` /
+//!   `reader_snapshot`): Lin CAS writes vs SQLite single-row DML, planner DNF growth,
+//!   graph walks, snapshot open. `graph_depth` / `plan_dnf` are Lin-only (no SQL analogue).
 //! - SQL `LIKE '%wal%'` ≈ Lin `title ~ "wal"` (substring), not `has` / FTS.
 //! - Server DBs are not in-process; network/IPC cost is part of their number.
 
@@ -2425,11 +2427,241 @@ fn main() -> airbug_bench::Result<()> {
         .parameter("rows", INSERT_1K)
         .work_units("rows", INSERT_1K as u64);
 
+    // Audit group: per-statement whole-store undo, planner DNF cross-product,
+    // graph walks without an adjacency index, reader snapshot clone.
+    for (label, n) in [("1k", 1_000usize), ("10k", N)] {
+        suite
+            .bench_with_input(
+                &format!("update_1row_{label}/lin"),
+                move || setup_lin_write(n),
+                write_update_lin,
+                DropPolicy::InsideTiming,
+            )
+            .tag("audit")
+            .tag("write")
+            .tag("undo")
+            .tag("lin")
+            .parameter("rows", n)
+            .work_units("stmts", 1);
+        suite
+            .bench_with_input(
+                &format!("update_1row_{label}/sqlite"),
+                move || seed_sqlite(n),
+                write_update_sqlite,
+                DropPolicy::InsideTiming,
+            )
+            .tag("audit")
+            .tag("write")
+            .tag("sqlite")
+            .parameter("rows", n)
+            .work_units("stmts", 1);
+        suite
+            .bench_with_input(
+                &format!("delete_1row_{label}/lin"),
+                move || setup_lin_write(n),
+                write_delete_lin,
+                DropPolicy::InsideTiming,
+            )
+            .tag("audit")
+            .tag("write")
+            .tag("undo")
+            .tag("lin")
+            .parameter("rows", n)
+            .work_units("stmts", 1);
+        suite
+            .bench_with_input(
+                &format!("delete_1row_{label}/sqlite"),
+                move || seed_sqlite(n),
+                write_delete_sqlite,
+                DropPolicy::InsideTiming,
+            )
+            .tag("audit")
+            .tag("write")
+            .tag("sqlite")
+            .parameter("rows", n)
+            .work_units("stmts", 1);
+    }
+
+    for groups in [6usize, 10, 14] {
+        suite
+            .bench_with_input(
+                &format!("plan_dnf_{groups}/lin"),
+                move || setup_lin_plan(groups),
+                |s| {
+                    s.db.clear_plan_cache();
+                    black_box(s.db.prepare(&s.src).expect("lin prepare dnf"));
+                },
+                DropPolicy::InsideTiming,
+            )
+            .tag("audit")
+            .tag("planner")
+            .tag("dnf")
+            .tag("lin")
+            .parameter("or_groups", groups);
+    }
+
+    let lin_graph = Fixture::new(|| setup_lin_graph(GRAPH_N));
+    for depth in [1usize, 2, 3] {
+        suite
+            .bench_fixture(
+                &format!("graph_depth_{depth}/lin"),
+                lin_graph.clone(),
+                move |s| black_box(s.graph[depth - 1].run(&mut s.db).expect("lin graph").done.n),
+            )
+            .tag("audit")
+            .tag("graph")
+            .tag("lin")
+            .parameter("rows", GRAPH_N)
+            .parameter("depth", depth);
+    }
+
+    let lin_snapshot = Fixture::new(|| seed_lin(N));
+    suite
+        .bench_fixture("reader_snapshot/lin", lin_snapshot, |s| {
+            black_box(
+                s.db.reader()
+                    .run(r#"docs | { id } | take 10"#)
+                    .expect("reader run")
+                    .done
+                    .n,
+            )
+        })
+        .tag("audit")
+        .tag("snapshot")
+        .tag("lin")
+        .parameter("rows", N);
+
     let args: Vec<String> = std::env::args()
         .skip(1)
         .filter(|a| a != "--bench")
         .collect();
     run_suite(suite, &args)
+}
+
+const GRAPH_N: usize = 5_000;
+
+struct LinWrite {
+    db: lin::Db,
+    probe_id: String,
+    hash: String,
+}
+
+/// Same shape as `seed_lin`, kept for the write path (CAS hash resolved once).
+fn setup_lin_write(n: usize) -> LinWrite {
+    let rows = docs(n);
+    let mut db = lin::Db::empty();
+    db.run("index docs [wing, ts]").expect("lin index");
+    for chunk in rows.chunks(500) {
+        db.run(&lin_insert_src(chunk)).expect("lin seed");
+    }
+    let probe_id = rows[PROBE].id.clone();
+    let hash = db
+        .run(&format!(
+            r#"docs | id == "{}" | {{ hash }}"#,
+            escape_lin(&probe_id)
+        ))
+        .expect("lin hash")
+        .rows[0]
+        .get("hash")
+        .and_then(|c| c.text())
+        .unwrap_or("")
+        .to_string();
+    assert!(hash.starts_with("h:"), "unexpected cas hash: {hash}");
+    LinWrite { db, probe_id, hash }
+}
+
+fn write_update_lin(s: &mut LinWrite) {
+    let src = format!(
+        r#"update docs[id == "{}"] cas "{}" {{ wing: "sys" }}"#,
+        escape_lin(&s.probe_id),
+        escape_lin(&s.hash)
+    );
+    black_box(s.db.run(&src).expect("lin update").done.n);
+}
+
+fn write_delete_lin(s: &mut LinWrite) {
+    let src = format!(
+        r#"delete docs[id == "{}"] cas "{}""#,
+        escape_lin(&s.probe_id),
+        escape_lin(&s.hash)
+    );
+    black_box(s.db.run(&src).expect("lin delete").done.n);
+}
+
+fn write_update_sqlite(s: &mut SqlWarm) {
+    let mut stmt = s
+        .conn
+        .prepare_cached("UPDATE docs SET wing = ?1 WHERE id = ?2")
+        .expect("sqlite prep");
+    black_box(
+        stmt.execute(rusqlite::params!["sys", s.probe_id])
+            .expect("sqlite update"),
+    );
+}
+
+fn write_delete_sqlite(s: &mut SqlWarm) {
+    let mut stmt = s
+        .conn
+        .prepare_cached("DELETE FROM docs WHERE id = ?1")
+        .expect("sqlite prep");
+    black_box(
+        stmt.execute(rusqlite::params![s.probe_id])
+            .expect("sqlite delete"),
+    );
+}
+
+struct LinPlan {
+    db: lin::Db,
+    src: String,
+}
+
+/// `wing == "rag" and (… or …) × groups` → `dnf()` cross-product = 2^groups branches.
+fn setup_lin_plan(groups: usize) -> LinPlan {
+    let src = format!(
+        r#"docs | wing == "rag" and {} | count"#,
+        vec![r#"(title == "a" or title == "b")"#; groups].join(" and ")
+    );
+    LinPlan {
+        db: lin::Db::empty(),
+        src,
+    }
+}
+
+struct LinGraph {
+    db: lin::Db,
+    graph: Vec<lin::Prepared>,
+}
+
+/// Chain of `GRAPH_N` docs; `graph wikilink depth=D` has no adjacency index to use.
+fn setup_lin_graph(n: usize) -> LinGraph {
+    let rows = docs(n);
+    let mut db = lin::Db::empty();
+    for chunk in rows.chunks(500) {
+        db.run(&lin_insert_src(chunk)).expect("lin seed");
+    }
+    let edges: Vec<String> = rows
+        .windows(2)
+        .map(|w| {
+            format!(
+                r#"wikilink "{}" -> "{}""#,
+                escape_lin(&w[0].id),
+                escape_lin(&w[1].id)
+            )
+        })
+        .collect();
+    db.run(&format!("append edges [{}]", edges.join(", ")))
+        .expect("lin edges");
+    let head = escape_lin(&rows[0].id);
+    let graph = [1, 2, 3]
+        .iter()
+        .map(|d| {
+            db.prepare(&format!(
+                r#"docs | id == "{head}" | graph wikilink depth={d} | take all"#
+            ))
+            .expect("lin prepare graph")
+        })
+        .collect();
+    LinGraph { db, graph }
 }
 
 /// Minimal CLI compatible with `Suite::main`, ignoring cargo's injected `--bench`.

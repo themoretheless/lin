@@ -88,3 +88,70 @@ mod ollama {
         assert_eq!(e.dim(), 768);
     }
 }
+use rustc_hash::FxHasher;
+use std::hash::{Hash, Hasher};
+
+/// Reference copy of the feature-hash recipe (unigram 1.0, char trigram 0.5,
+/// string bigram 0.25, then L2 over the dense vector). The sparse accumulator
+/// in `HashingEmbedder` must keep producing exactly these vectors, or rows
+/// stored earlier would score against embeddings nobody computes any more.
+fn bump(v: &mut [f32], key: impl Hash, w: f32) {
+    let mut h = FxHasher::default();
+    key.hash(&mut h);
+    let i = (h.finish() as usize) % v.len();
+    v[i] += w;
+}
+
+fn reference_vector(text: &str, dim: usize) -> Vec<f32> {
+    let mut lower = String::new();
+    for ch in text.chars() {
+        for l in ch.to_lowercase() {
+            lower.push(l);
+        }
+    }
+    let mut v = vec![0f32; dim];
+    for token in lower.split_whitespace() {
+        bump(&mut v, token, 1.0);
+        let b = token.as_bytes();
+        if b.len() >= 3 {
+            for w in b.windows(3) {
+                bump(&mut v, w, 0.5);
+            }
+        } else {
+            bump(&mut v, b, 0.5);
+        }
+    }
+    for w in lower.as_bytes().windows(2) {
+        bump(&mut v, w, 0.25);
+    }
+    let s: f32 = v.iter().map(|x| x * x).sum();
+    if s > 1e-12 {
+        let inv = s.sqrt().recip();
+        for x in v.iter_mut() {
+            *x *= inv;
+        }
+    }
+    v
+}
+
+#[test]
+fn hashing_vectors_match_the_reference_recipe() {
+    let long = "the quick brown fox jumps over the lazy dog ".repeat(120);
+    let texts = ["wal shipping", "WAL École Write-Ahead", "a", &long];
+    let e = HashingEmbedder::from_embed_id("nomic-embed-text/768");
+    for text in &texts {
+        assert_eq!(
+            e.embed(text).as_ref(),
+            reference_vector(text, 768).as_slice(),
+            "single embed for {text:?}"
+        );
+    }
+    for (n, got) in e.embed_batch(&texts).iter().enumerate() {
+        assert_eq!(
+            got.as_ref(),
+            reference_vector(texts[n], 768).as_slice(),
+            "batch embed for {:?}",
+            texts[n]
+        );
+    }
+}

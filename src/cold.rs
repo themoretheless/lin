@@ -6,8 +6,7 @@
 //! with the same rows inlined. Open may keep cold cols mmapped and page-in
 //! lazily on first access.
 
-use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -80,17 +79,7 @@ pub fn write_cold(data: &Path, name: &str, rows: &[Row]) -> Result<(), Error> {
     body.extend_from_slice(&COLD_MAGIC);
     rmp_serde::encode::write_named(&mut body, rows).map_err(io_err)?;
 
-    let mut file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&tmp)
-        .map_err(io_err)?;
-    file.write_all(&body).map_err(io_err)?;
-    file.sync_all().map_err(io_err)?;
-    drop(file);
-    fs::rename(&tmp, &path).map_err(io_err)?;
-    Ok(())
+    crate::persist::write_through_tmp(&path, &tmp, &body)
 }
 
 pub fn map_cold(data: &Path, name: &str) -> Result<ColdCol, Error> {
@@ -108,24 +97,5 @@ pub fn map_cold(data: &Path, name: &str) -> Result<ColdCol, Error> {
 
 /// Drop stale cold files not listed in `keep`.
 pub fn prune_cold(data: &Path, keep: &[String]) -> Result<(), Error> {
-    let dir = cold_dir(data);
-    if !dir.exists() {
-        return Ok(());
-    }
-    for ent in fs::read_dir(&dir).map_err(io_err)? {
-        let ent = ent.map_err(io_err)?;
-        let path = ent.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("bin") {
-            continue;
-        }
-        let stem = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_string();
-        if !keep.iter().any(|k| k == &stem) {
-            let _ = fs::remove_file(&path);
-        }
-    }
-    Ok(())
+    crate::persist::prune_bins(&cold_dir(data), keep)
 }

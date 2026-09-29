@@ -886,15 +886,30 @@ impl<'a> Parser<'a> {
         Err(self.err("ago requires a duration with unit (7d, 3h, 15m, 30s, 1w)"))
     }
 
+    /// Number literal, optionally signed. A `-` only starts a number when a
+    /// digit follows it, so `-rel->` match hops and `foo-bar` names still lex
+    /// as before, and durations stay unsigned.
     fn try_number(&mut self) -> Result<Option<Value>, Error> {
         self.skip();
+        let start = self.pos;
+        let neg = self.peek() == Some('-')
+            && self
+                .rest()
+                .chars()
+                .nth(1)
+                .is_some_and(|c| c.is_ascii_digit());
+        if neg {
+            self.bump();
+        }
         if !self.peek().is_some_and(|c| c.is_ascii_digit()) {
+            self.pos = start;
             return Ok(None);
         }
-        if let Some(dur) = self.try_duration()? {
-            return Ok(Some(Value::Duration(dur)));
+        if !neg {
+            if let Some(dur) = self.try_duration()? {
+                return Ok(Some(Value::Duration(dur)));
+            }
         }
-        let start = self.pos;
         while self.peek().is_some_and(|c| c.is_ascii_digit()) {
             self.bump();
         }

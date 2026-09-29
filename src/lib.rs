@@ -11,7 +11,7 @@
 //!   [`Db::export_wal_since`], [`Db::apply_wal`], [`Db::with_embedder`], [`Db::prepare_query`]
 //! - [`ReadDb`]: shared read-only snapshot ([`ReadDb::run`], [`ReadDb::clone`])
 //! - Fluent / typed: [`Queryable`], [`BoundQueryable`], [`query`], [`QueryCursor`],
-//!   [`ProjectedRow`], [`FromRow`], [`LinRow`], [`FromCell`], [`ToCell`], [`map_rows`], [`cell_get`], [`cell_opt`]
+//!   [`ProjectedRow`], [`FromRow`], [`LinRow`], [`FromCell`], [`ToCell`], [`Col`], [`map_rows`], [`cell_get`], [`cell_opt`]
 //! - Feature `async` (default-on): [`AsyncDb`], [`AsyncReadDb`], `to_vec_async` /
 //!   `stream_*` (offload via `spawn_blocking` — not async storage I/O)
 //! - Free functions: [`parse`], [`compile`], [`run`], [`explain`], [`explain_as`]
@@ -91,7 +91,7 @@ pub use exec::{
 };
 pub use graph::GraphFmt;
 pub use plan::Plan;
-pub use query::{BoundQueryable, IntoFieldList, MatchPath, Queryable};
+pub use query::{BoundFilter, BoundQueryable, Col, FilterArg, IntoFieldList, MatchPath, Queryable};
 pub use row::{FromCell, FromRow, LinRow, ToCell, cell_get, cell_opt, map_rows};
 pub use store::{Cell, Row, RowExt, Store};
 
@@ -112,11 +112,38 @@ pub fn parse(src: &str) -> Result<Stmt, Error> {
     parse::parse(src)
 }
 
+pub fn parse_pred(src: &str) -> Result<Pred, Error> {
+    parse::parse_pred_src(src)
+}
+
+/// Dialect comparison → [`Pred`]: `p!(coin > 300)`, `p!(wing == "rag")`.
+#[macro_export]
+macro_rules! p {
+    ($field:ident > $val:expr) => {
+        $crate::query::pred::gt(stringify!($field), $val)
+    };
+    ($field:ident < $val:expr) => {
+        $crate::query::pred::lt(stringify!($field), $val)
+    };
+    ($field:ident >= $val:expr) => {
+        $crate::query::pred::ge(stringify!($field), $val)
+    };
+    ($field:ident <= $val:expr) => {
+        $crate::query::pred::le(stringify!($field), $val)
+    };
+    ($field:ident == $val:expr) => {
+        $crate::query::pred::eq(stringify!($field), $val)
+    };
+    ($field:ident != $val:expr) => {
+        $crate::query::pred::ne(stringify!($field), $val)
+    };
+}
+
 pub fn compile(src: &str) -> Result<Plan, Error> {
     let stmts = parse::parse_program(src)?;
-    let mut cat = catalog::fixture();
-    check::check_program(&stmts, &mut cat)?;
-    plan::plan_program(&stmts, &cat)
+    let cat = catalog::fixture();
+    let (_, staged) = check::check_program(&stmts, &cat)?;
+    plan::plan_program(&stmts, staged.as_ref().unwrap_or(&cat))
 }
 
 pub fn explain(src: &str) -> Result<String, Error> {

@@ -176,6 +176,9 @@ pub trait LinRow: FromRow {
     const COLLECTION: Option<&'static str> = None;
     /// Projection column names (leaf or dotted).
     const COLUMNS: &'static [&'static str];
+    /// Column proxies for [`crate::query::Queryable::filter_by`].
+    type Cols;
+    fn cols() -> Self::Cols;
 }
 
 /// Read a required column via [`FromCell`].

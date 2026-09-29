@@ -1,5 +1,7 @@
 //! Fluent deferred query builder (IQueryable-style) over Lin AST.
 
+use std::marker::PhantomData;
+
 use crate::ast::{CmpOp, Field, MatchHop, Pred, Query, SearchMode, Source, Step, Stmt, Value};
 use crate::cursor::QueryCursor;
 use crate::error::Error;
@@ -105,10 +107,125 @@ pub mod pred {
     }
 }
 
+/// Column proxy for typed `filter_by` closures. The closure runs once at
+/// query-build time and must return a [`Pred`] (planner sees the same AST).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Col {
+    name: &'static str,
+}
+
+impl Col {
+    pub const fn new(name: &'static str) -> Self {
+        Self { name }
+    }
+
+    pub fn name(self) -> &'static str {
+        self.name
+    }
+
+    pub fn eq(self, value: impl Into<Value>) -> Pred {
+        pred::eq(self.name, value)
+    }
+
+    pub fn ne(self, value: impl Into<Value>) -> Pred {
+        pred::ne(self.name, value)
+    }
+
+    pub fn gt(self, value: impl Into<Value>) -> Pred {
+        pred::gt(self.name, value)
+    }
+
+    pub fn lt(self, value: impl Into<Value>) -> Pred {
+        pred::lt(self.name, value)
+    }
+
+    pub fn ge(self, value: impl Into<Value>) -> Pred {
+        pred::ge(self.name, value)
+    }
+
+    pub fn le(self, value: impl Into<Value>) -> Pred {
+        pred::le(self.name, value)
+    }
+
+    pub fn has(self, needle: impl Into<String>) -> Pred {
+        pred::has(self.name, needle)
+    }
+
+    pub fn contains(self, needle: impl Into<String>) -> Pred {
+        pred::contains(self.name, needle)
+    }
+
+    pub fn regex(self, pattern: impl Into<String>, flags: impl Into<String>) -> Pred {
+        pred::regex(self.name, pattern, flags)
+    }
+
+    pub fn after(self, value: impl Into<Value>) -> Pred {
+        pred::after(self.name, value)
+    }
+}
+
 /// Deferred query: compose steps, then execute against a [`Db`] / [`ReadDb`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct Queryable {
     pub(crate) query: Query,
+    filter_err: Option<Error>,
+}
+
+/// [`Queryable::filter`] argument: a [`Pred`] or dialect text (`coin > 300`).
+pub trait FilterArg {
+    fn into_pred(self) -> Result<Pred, Error>;
+}
+
+impl FilterArg for Pred {
+    fn into_pred(self) -> Result<Pred, Error> {
+        Ok(self)
+    }
+}
+
+impl FilterArg for &str {
+    fn into_pred(self) -> Result<Pred, Error> {
+        crate::parse::parse_pred_src(self)
+    }
+}
+
+impl FilterArg for String {
+    fn into_pred(self) -> Result<Pred, Error> {
+        crate::parse::parse_pred_src(&self)
+    }
+}
+
+/// Argument to [`BoundQueryable::filter`]: dialect string, [`Pred`], or
+/// `|row| row.col.gt(300)` when the query is [`Db::from_typed`].
+pub trait BoundFilter<T> {
+    fn into_filter(self) -> Result<Pred, Error>;
+}
+
+impl<T> BoundFilter<T> for Pred {
+    fn into_filter(self) -> Result<Pred, Error> {
+        Ok(self)
+    }
+}
+
+impl<T> BoundFilter<T> for &str {
+    fn into_filter(self) -> Result<Pred, Error> {
+        crate::parse::parse_pred_src(self)
+    }
+}
+
+impl<T> BoundFilter<T> for String {
+    fn into_filter(self) -> Result<Pred, Error> {
+        crate::parse::parse_pred_src(&self)
+    }
+}
+
+impl<T, F> BoundFilter<T> for F
+where
+    T: LinRow,
+    F: FnOnce(T::Cols) -> Pred,
+{
+    fn into_filter(self) -> Result<Pred, Error> {
+        Ok(self(T::cols()))
+    }
 }
 
 impl Queryable {
@@ -120,6 +237,7 @@ impl Queryable {
                 explain: None,
                 ignore_filter: false,
             },
+            filter_err: None,
         }
     }
 
@@ -131,6 +249,7 @@ impl Queryable {
                 explain: None,
                 ignore_filter: false,
             },
+            filter_err: None,
         }
     }
 
@@ -142,6 +261,7 @@ impl Queryable {
                 explain: None,
                 ignore_filter: false,
             },
+            filter_err: None,
         }
     }
 
@@ -173,16 +293,34 @@ impl Queryable {
 
     /// Typecheck + plan once (cached by Query AST + catalog hash).
     pub fn prepare(&self, db: &mut Db) -> Result<crate::exec::Prepared, Error> {
+        self.ensure()?;
         db.prepare_query(&self.query)
     }
 
     pub fn prepare_read(&self, db: &ReadDb) -> Result<crate::exec::Prepared, Error> {
+        self.ensure()?;
         db.prepare_stmt(self.stmt())
     }
 
-    pub fn filter(mut self, pred: Pred) -> Self {
-        self.query.steps.push(Step::Filter(pred));
+    pub(crate) fn ensure(&self) -> Result<(), Error> {
+        match &self.filter_err {
+            Some(e) => Err(e.clone()),
+            None => Ok(()),
+        }
+    }
+
+    pub fn filter(mut self, pred: impl FilterArg) -> Self {
+        match pred.into_pred() {
+            Ok(pred) => self.query.steps.push(Step::Filter(pred)),
+            Err(e) => self.filter_err = Some(e),
+        }
         self
+    }
+
+    /// Build a [`Pred`] from column proxies. The closure is not a row predicate:
+    /// it runs once and the returned AST is planned (`IndexSeek` / `Get`).
+    pub fn filter_by<T: LinRow>(self, f: impl FnOnce(T::Cols) -> Pred) -> Self {
+        self.filter(f(T::cols()))
     }
 
     pub fn select(mut self, fields: impl IntoFieldList) -> Self {
@@ -311,16 +449,21 @@ impl Queryable {
     }
 
     pub fn union(mut self, other: Queryable) -> Self {
+        if self.filter_err.is_none() {
+            self.filter_err = other.filter_err.clone();
+        }
         self.query.steps.push(Step::Union(other.query));
         self
     }
 
     pub fn run(&self, db: &mut Db) -> Result<Handle, Error> {
+        self.ensure()?;
         let prepared = db.prepare_query(&self.query)?;
         db.run_prepared(&prepared)
     }
 
     pub fn run_read(&self, db: &ReadDb) -> Result<Handle, Error> {
+        self.ensure()?;
         db.run_stmt(self.stmt())
     }
 
@@ -422,14 +565,17 @@ impl Queryable {
     }
 
     pub fn explain(&self, db: &mut Db) -> Result<String, Error> {
+        self.ensure()?;
         db.explain_stmt(self.stmt(), None)
     }
 
     pub fn explain_graph(&self, db: &mut Db, fmt: GraphFmt) -> Result<String, Error> {
+        self.ensure()?;
         db.explain_stmt(self.stmt(), Some(fmt))
     }
 
     pub fn explain_read(&self, db: &ReadDb) -> Result<String, Error> {
+        self.ensure()?;
         db.explain_stmt(self.stmt(), None)
     }
 }
@@ -548,13 +694,15 @@ impl Db {
         BoundQueryable {
             db: BoundDb::Mut(self),
             q: Queryable::from(collection),
+            _t: PhantomData,
         }
     }
 
-    pub fn from_typed<T: LinRow>(&mut self) -> Result<BoundQueryable<'_>, Error> {
+    pub fn from_typed<T: LinRow>(&mut self) -> Result<BoundQueryable<'_, T>, Error> {
         Ok(BoundQueryable {
             db: BoundDb::Mut(self),
             q: Queryable::from_typed::<T>()?,
+            _t: PhantomData,
         })
     }
 }
@@ -564,13 +712,15 @@ impl ReadDb {
         BoundQueryable {
             db: BoundDb::Read(self),
             q: Queryable::from(collection),
+            _t: PhantomData,
         }
     }
 
-    pub fn from_typed<T: LinRow>(&self) -> Result<BoundQueryable<'_>, Error> {
+    pub fn from_typed<T: LinRow>(&self) -> Result<BoundQueryable<'_, T>, Error> {
         Ok(BoundQueryable {
             db: BoundDb::Read(self),
             q: Queryable::from_typed::<T>()?,
+            _t: PhantomData,
         })
     }
 }
@@ -581,18 +731,22 @@ enum BoundDb<'a> {
 }
 
 /// Fluent query bound to a live [`Db`] or [`ReadDb`] (sync execute).
-pub struct BoundQueryable<'a> {
+///
+/// `T` is `()` for [`Db::from`]. [`Db::from_typed`] sets `T` so
+/// `.filter(|u| u.coin.gt(300))` builds a [`Pred`].
+pub struct BoundQueryable<'a, T = ()> {
     db: BoundDb<'a>,
     q: Queryable,
+    _t: PhantomData<T>,
 }
 
-impl<'a> BoundQueryable<'a> {
+impl<'a, T> BoundQueryable<'a, T> {
     pub fn into_queryable(self) -> Queryable {
         self.q
     }
 
-    pub fn filter(mut self, pred: Pred) -> Self {
-        self.q = self.q.filter(pred);
+    pub fn filter_by<U: LinRow>(mut self, f: impl FnOnce(U::Cols) -> Pred) -> Self {
+        self.q = self.q.filter_by::<U>(f);
         self
     }
 
@@ -613,8 +767,8 @@ impl<'a> BoundQueryable<'a> {
         self
     }
 
-    pub fn select_row<T: LinRow>(mut self) -> Self {
-        self.q = self.q.select_row::<T>();
+    pub fn select_row<U: LinRow>(mut self) -> Self {
+        self.q = self.q.select_row::<U>();
         self
     }
 
@@ -704,6 +858,7 @@ impl<'a> BoundQueryable<'a> {
     }
 
     pub fn explain(self) -> Result<String, Error> {
+        self.q.ensure()?;
         match self.db {
             BoundDb::Mut(db) => db.explain_stmt(self.q.stmt(), None),
             BoundDb::Read(db) => db.explain_stmt(self.q.stmt(), None),
@@ -721,7 +876,7 @@ impl<'a> BoundQueryable<'a> {
         Ok(self.run()?.rows)
     }
 
-    pub fn to_vec_typed<T: FromRow>(self) -> Result<Vec<T>, Error> {
+    pub fn to_vec_typed<U: FromRow>(self) -> Result<Vec<U>, Error> {
         row::map_rows(&self.to_vec()?)
     }
 
@@ -750,13 +905,13 @@ impl<'a> BoundQueryable<'a> {
         }
     }
 
-    pub fn first_typed<T: FromRow>(self) -> Result<T, Error> {
-        T::from_row(&self.first()?)
+    pub fn first_typed<U: FromRow>(self) -> Result<U, Error> {
+        U::from_row(&self.first()?)
     }
 
-    pub fn first_or_typed<T: FromRow>(self) -> Result<Option<T>, Error> {
+    pub fn first_or_typed<U: FromRow>(self) -> Result<Option<U>, Error> {
         match self.first_or()? {
-            Some(row) => T::from_row(&row).map(Some),
+            Some(row) => U::from_row(&row).map(Some),
             None => Ok(None),
         }
     }
@@ -768,8 +923,8 @@ impl<'a> BoundQueryable<'a> {
         }
     }
 
-    pub fn single_typed<T: FromRow>(self) -> Result<T, Error> {
-        T::from_row(&self.single()?)
+    pub fn single_typed<U: FromRow>(self) -> Result<U, Error> {
+        U::from_row(&self.single()?)
     }
 
     pub fn scalar(self) -> Result<Cell, Error> {
@@ -779,8 +934,24 @@ impl<'a> BoundQueryable<'a> {
         }
     }
 
-    pub fn scalar_as<T: FromCell>(self) -> Result<T, Error> {
-        T::from_cell(&self.scalar()?)
+    pub fn scalar_as<U: FromCell>(self) -> Result<U, Error> {
+        U::from_cell(&self.scalar()?)
+    }
+}
+
+impl<'a> BoundQueryable<'a, ()> {
+    pub fn filter(mut self, pred: impl FilterArg) -> Self {
+        self.q = self.q.filter(pred);
+        self
+    }
+}
+
+impl<'a, T: LinRow> BoundQueryable<'a, T> {
+    /// Closure runs once; columns are proxies, result is a planned [`Pred`].
+    /// `u.coin > 300` is not valid Rust — use `u.coin.gt(300)`.
+    pub fn filter(mut self, f: impl FnOnce(T::Cols) -> Pred) -> Self {
+        self.q = self.q.filter(f(T::cols()));
+        self
     }
 }
 

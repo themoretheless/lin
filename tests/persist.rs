@@ -1067,6 +1067,7 @@ fn ship_tls_token_roundtrip() {
         &lin::ship::PullOpts {
             token: Some("s3cret".into()),
             tls: lin::ship::TlsClient::CaPem(ca),
+            server_name: None,
         },
     )
     .unwrap();

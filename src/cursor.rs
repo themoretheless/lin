@@ -522,11 +522,10 @@ fn build_left_source(
     now: i64,
 ) -> (RowSource, bool) {
     if let Some(pred) = filter {
-        if let Some(uses) = crate::index::pick_index(catalog, name, pred)
-            && let Some(idxs) = store.index_seek(name, &uses, now)
-        {
-            let covered = crate::index::index_covers_pred(pred, &uses);
-            return (RowSource::Idxs(idxs), !covered);
+        if let Some(uses) = crate::index::pick_index(catalog, name, pred) {
+            if let Some(idxs) = store.index_seek(name, &uses[..1], now) {
+                return (RowSource::Idxs(idxs), false);
+            }
         }
         return (
             RowSource::Scan {
@@ -1231,10 +1230,12 @@ impl ReadDb {
 
 impl Queryable {
     pub fn cursor<'a>(&self, db: &'a Db) -> Result<QueryCursor<'a>, Error> {
+        self.ensure()?;
         db.cursor(self.query())
     }
 
     pub fn cursor_read<'a>(&self, db: &'a ReadDb) -> Result<QueryCursor<'a>, Error> {
+        self.ensure()?;
         db.cursor(self.query())
     }
 }

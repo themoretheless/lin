@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use crate::ast::{Decl, Pred, Query, Source, Step, TypeExpr};
@@ -366,10 +367,29 @@ fn col(name: &str, append_only: bool, fields: &[(&str, Type, bool, bool)]) -> Co
 }
 
 /// Prepend catalog `filter` so check / plan / exec / cursor share one rewrite.
-pub fn with_catalog_filter(q: &Query, cat: &Catalog) -> Query {
+///
+/// Borrows when nothing applies: the rewrite deep-clones the query tree, and the
+/// exec path calls it on every run — allocating there taxes even a point get.
+pub fn with_catalog_filter<'a>(q: &'a Query, cat: &Catalog) -> Cow<'a, Query> {
+    if !has_catalog_filter(q, cat) {
+        return Cow::Borrowed(q);
+    }
     let mut q = q.clone();
     apply_catalog_filter(&mut q, cat);
-    q
+    Cow::Owned(q)
+}
+
+/// Whether [`with_catalog_filter`] would insert a step anywhere in `q`.
+fn has_catalog_filter(q: &Query, cat: &Catalog) -> bool {
+    if !q.ignore_filter
+        && let Source::Collection(name) = &q.source
+        && cat.collection(name).is_some_and(|c| c.filter.is_some())
+    {
+        return true;
+    }
+    q.steps
+        .iter()
+        .any(|s| matches!(s, Step::Union(inner) if has_catalog_filter(inner, cat)))
 }
 
 fn apply_catalog_filter(q: &mut Query, cat: &Catalog) {
@@ -515,5 +535,58 @@ pub fn fixture() -> Catalog {
         indexes: BTreeMap::new(),
         owned: BTreeMap::new(),
         embed_id: "nomic-embed-text/768".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ast::Stmt;
+    use crate::parse::{parse, parse_pred_src};
+
+    fn query(src: &str) -> Query {
+        match parse(src).unwrap() {
+            Stmt::Query(q) => q,
+            other => panic!("expected a query, got {other:?}"),
+        }
+    }
+
+    fn guarded() -> Catalog {
+        let mut cat = fixture();
+        let col = cat.collections.get_mut("docs").unwrap();
+        col.filter = Some(parse_pred_src(r#"layer == "wiki""#).unwrap());
+        cat
+    }
+
+    #[test]
+    fn rewrite_only_allocates_when_a_filter_applies() {
+        let q = query(r#"docs | wing == "rag""#);
+        let plain = fixture();
+        assert!(
+            matches!(with_catalog_filter(&q, &plain), Cow::Borrowed(_)),
+            "no catalog filter: the query tree must not be cloned"
+        );
+        assert!(matches!(with_catalog_filter(&q, &guarded()), Cow::Owned(_)));
+        let skipped = query(r#"docs all | wing == "rag""#);
+        assert!(matches!(
+            with_catalog_filter(&skipped, &guarded()),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn nested_union_queries_still_reach_the_borrow_check() {
+        let mut outer = query(r#"docs | take 5"#);
+        let inner = query(r#"docs | take 5"#);
+        outer.steps.push(Step::Union(inner));
+        let filtered = with_catalog_filter(&outer, &guarded());
+        assert!(matches!(filtered, Cow::Owned(_)));
+        let Step::Union(inner) = filtered.steps.last().unwrap() else {
+            panic!("union step lost");
+        };
+        assert!(
+            matches!(inner.steps.first(), Some(Step::Filter(_))),
+            "union branch missed its catalog filter"
+        );
     }
 }

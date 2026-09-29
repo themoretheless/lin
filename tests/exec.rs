@@ -4,6 +4,10 @@ fn text<'a>(row: &'a lin::Row, k: &str) -> &'a str {
     row.get(k).and_then(|c| c.text()).unwrap_or("")
 }
 
+fn ids(h: &lin::Handle) -> Vec<String> {
+    h.rows.iter().map(|r| text(r, "id").to_string()).collect()
+}
+
 #[test]
 fn prepare_once_run_many() {
     let mut db = Db::fixture();
@@ -879,4 +883,353 @@ fn owned_type_is_not_a_collection() {
     assert_eq!(text(&h.rows[0], "hash"), "h");
     let err = db.run("insert stamp { hash: \"x\" }").unwrap_err();
     assert!(err.to_string().contains("unknown collection"), "{err}");
+}
+
+/// Snapshot every structure the write path maintains across a rollback: row
+/// order, SoA columns, scalar index, FTS postings, id/uri point maps.
+fn digest(db: &mut Db) -> String {
+    let mut out = String::new();
+    for src in [
+        r#"docs | { id, uri, title, wing, layer, hash } | take all"#,
+        r#"docs | wing == "rag" | { id, title } | take all"#,
+        r#"docs | search lex "wal" | { id } | take all"#,
+        r#"docs | uri == "raw://n/wal" | { id, title } | take all"#,
+        r#"users | { id, email } | take all"#,
+        r#"orders | { id, user_id, total } | take all"#,
+    ] {
+        let h = db.run(src).expect(src);
+        out.push_str(&format!("{src} => {:#?}\n", h.rows));
+    }
+    out
+}
+
+#[test]
+fn update_rollback_restores_rows_and_indexes() {
+    let mut db = Db::fixture();
+    db.run("index docs unique [title]").unwrap();
+    let before = digest(&mut db);
+    let e = db
+        .run(r#"update docs[wing == "rag"] cas each { title: "same" }"#)
+        .unwrap_err();
+    assert!(e.to_string().contains("unique index"), "{e}");
+    assert_eq!(before, digest(&mut db), "row journal undo must be exact");
+}
+
+#[test]
+fn delete_rollback_restores_positions_and_structures() {
+    let mut db = Db::fixture();
+    db.run("index docs unique [title]").unwrap();
+    let before = digest(&mut db);
+    let e = db
+        .run_group([
+            r#"delete docs[uri == "raw://n/wal"] cas each"#,
+            r#"delete docs[uri == "raw://gone"] cas each"#,
+        ])
+        .unwrap_err();
+    assert!(e.to_string().contains("no matching row"), "{e}");
+    assert_eq!(before, digest(&mut db));
+    let again = db
+        .run(r#"delete docs[uri == "raw://n/wal"] cas each"#)
+        .unwrap();
+    assert_eq!(again.done.n, 1);
+    assert_eq!(db.run(r#"docs | take all"#).unwrap().done.n, 2);
+    let dup = db
+        .run(r#"insert docs { uri: "raw://dup", title: "Lin facts", layer: "wiki" }"#)
+        .unwrap_err();
+    assert!(dup.to_string().contains("unique index"), "{dup}");
+}
+
+#[test]
+fn delete_rollback_across_collections_keeps_soa_and_maps() {
+    let mut db = Db::fixture();
+    let users = db.run(r#"users | { email } | take 1"#).unwrap();
+    let email = text(&users.rows[0], "email").to_string();
+    let before = digest(&mut db);
+    let e = db
+        .run_group([
+            format!(r#"delete users[email == "{email}"] cas each"#),
+            r#"delete docs[uri == "wiki://rag-overview"] cas each"#.to_string(),
+            r#"delete orders[total > 100000] cas each"#.to_string(),
+        ])
+        .unwrap_err();
+    assert!(e.to_string().contains("no matching row"), "{e}");
+    assert_eq!(before, digest(&mut db));
+    let joined = db
+        .run(r#"orders | join users on user_id | { id, users.email, total } | take all"#)
+        .unwrap();
+    assert!(joined.done.n >= 1, "join should still resolve users");
+    let by_email = db
+        .run(&format!(r#"users | email == "{email}" | {{ id }}"#))
+        .unwrap();
+    assert_eq!(by_email.done.n, 1, "row map must still resolve by email");
+}
+
+fn three_docs() -> Db {
+    let mut db = Db::empty();
+    db.run("index docs [wing, ts]").unwrap();
+    db.run(
+        r#"insert docs [
+          { uri: "raw://a", title: "alpha zeta", wing: "rag", layer: "wiki" },
+          { uri: "raw://b", title: "beta zeta", wing: "rag", layer: "wiki" },
+          { uri: "raw://c", title: "gamma zeta", wing: "rag", layer: "wiki" }
+        ]"#,
+    )
+    .unwrap();
+    db
+}
+
+fn hash_of(db: &mut Db, uri: &str) -> String {
+    let q = format!(r#"docs | uri == "{uri}" | {{ hash }}"#);
+    let h = db.run(&q).unwrap();
+    text(&h.rows[0], "hash").to_string()
+}
+
+#[test]
+fn update_repairs_fts_and_index_keys() {
+    let mut db = three_docs();
+    let hash = hash_of(&mut db, "raw://a");
+    db.run(&format!(
+        r#"update docs[uri == "raw://a"] cas "{hash}" {{ wing: "sys", title: "omega nova" }}"#
+    ))
+    .unwrap();
+
+    let zeta = db
+        .run(r#"docs | search lex "zeta" | { uri } | take all"#)
+        .unwrap();
+    assert_eq!(
+        zeta.rows.iter().map(|r| text(r, "uri")).collect::<Vec<_>>(),
+        vec!["raw://b", "raw://c"],
+        "token left the updated row's postings"
+    );
+    let omega = db
+        .run(r#"docs | search lex "omega" | { uri } | take all"#)
+        .unwrap();
+    assert_eq!(
+        omega
+            .rows
+            .iter()
+            .map(|r| text(r, "uri"))
+            .collect::<Vec<_>>(),
+        vec!["raw://a"],
+        "token entered the updated row's postings"
+    );
+    let alpha = db
+        .run(r#"docs | search lex "alpha" | { uri } | take all"#)
+        .unwrap();
+    assert_eq!(alpha.done.n, 0, "old token dropped from the old posting");
+
+    let old_wing = db
+        .run(r#"docs | wing == "rag" | { uri } | take all"#)
+        .unwrap();
+    assert_eq!(old_wing.done.n, 2, "index key must drop the old value");
+    let new_wing = db.run(r#"docs | wing == "sys" | { uri }"#).unwrap();
+    assert_eq!(new_wing.done.n, 1);
+    assert_eq!(text(&new_wing.rows[0], "uri"), "raw://a");
+    // The point map still resolves the row it moved in the vec.
+    let by_uri = db
+        .run(r#"docs | uri == "raw://a" | { title, wing }"#)
+        .unwrap();
+    assert_eq!(text(&by_uri.rows[0], "wing"), "sys");
+    assert_eq!(text(&by_uri.rows[0], "title"), "omega nova");
+}
+
+#[test]
+fn delete_reindexes_maps_and_postings() {
+    let mut db = three_docs();
+    // Front delete: the last live row swaps into the vacated slot, so survivors keep
+    // their entries but the vec is no longer insertion-ordered (`sort` restores that).
+    let hash = hash_of(&mut db, "raw://a");
+    db.run(&format!(r#"delete docs[uri == "raw://a"] cas "{hash}""#))
+        .unwrap();
+    let shared = db
+        .run(r#"docs | search lex "zeta" | { uri } | take all"#)
+        .unwrap();
+    let mut survivors: Vec<String> = shared
+        .rows
+        .iter()
+        .map(|r| text(r, "uri").to_string())
+        .collect();
+    survivors.sort();
+    assert_eq!(
+        survivors,
+        vec!["raw://b", "raw://c"],
+        "survivors keep their postings after the swap"
+    );
+    let gone = db
+        .run(r#"docs | search lex "alpha" | { uri } | take all"#)
+        .unwrap();
+    assert_eq!(gone.done.n, 0, "deleted row left every posting");
+    let rag = db
+        .run(r#"docs | wing == "rag" | { uri } | take all"#)
+        .unwrap();
+    assert_eq!(rag.done.n, 2, "index postings moved with their rows");
+    let by_uri = db.run(r#"docs | uri == "raw://c" | { title }"#).unwrap();
+    assert_eq!(
+        text(&by_uri.rows[0], "title"),
+        "gamma zeta",
+        "uri map survived"
+    );
+
+    // Tail delete: positions below the hole must keep their postings.
+    let hash_c = hash_of(&mut db, "raw://c");
+    db.run(&format!(r#"delete docs[uri == "raw://c"] cas "{hash_c}""#))
+        .unwrap();
+    let b = db
+        .run(r#"docs | uri == "raw://b" | { title, wing }"#)
+        .unwrap();
+    assert_eq!(text(&b.rows[0], "title"), "beta zeta");
+    let shared = db
+        .run(r#"docs | search lex "zeta" | { uri } | take all"#)
+        .unwrap();
+    assert_eq!(
+        shared
+            .rows
+            .iter()
+            .map(|r| text(r, "uri"))
+            .collect::<Vec<_>>(),
+        vec!["raw://b"],
+        "tail delete dropped only its own posting entries"
+    );
+    let gamma = db
+        .run(r#"docs | search lex "gamma" | { uri } | take all"#)
+        .unwrap();
+    assert_eq!(gamma.done.n, 0);
+}
+
+#[test]
+fn fts_case_folds_both_paths() {
+    let mut db = Db::empty();
+    db.run(
+        r#"insert docs [
+          { uri: "raw://up", title: "WAL École Write-Ahead", body: "text" },
+          { uri: "raw://low", title: "wal école write-ahead", body: "text" }
+        ]"#,
+    )
+    .unwrap();
+    // Mixed-case rows take the lowering path, lowercase rows borrow as-is.
+    for q in ["wal", "école", "write-ahead"] {
+        let hits = db
+            .run(&format!(
+                r#"docs | search lex "{q}" | {{ uri }} | take all"#
+            ))
+            .unwrap();
+        assert_eq!(hits.done.n, 2, "{q} must match both rows");
+    }
+    let miss = db.run(r#"docs | search lex "writing" | take all"#).unwrap();
+    assert_eq!(miss.done.n, 0);
+
+    let hash = hash_of(&mut db, "raw://up");
+    db.run(&format!(
+        r#"update docs[uri == "raw://up"] cas "{hash}" {{ title: "École" }}"#
+    ))
+    .unwrap();
+    let gone = db
+        .run(r#"docs | search lex "wal" | { uri } | take all"#)
+        .unwrap();
+    assert_eq!(
+        gone.rows.iter().map(|r| text(r, "uri")).collect::<Vec<_>>(),
+        vec!["raw://low"],
+        "removing an upper-case token must find its folded posting"
+    );
+}
+#[test]
+fn deep_dnf_plans_as_scan_but_returns_seek_rows() {
+    fn groups(n: usize) -> String {
+        let mut s = String::new();
+        for _ in 0..n {
+            if !s.is_empty() {
+                s.push_str(" and ");
+            }
+            s.push_str(r#"(wing == "rag" or wing == "sys")"#);
+        }
+        format!(r#"docs | {s} | {{ id }} | take all"#)
+    }
+
+    let mut indexed = Db::fixture();
+    indexed.run("index docs [wing, ts]").unwrap();
+    let mut plain = Db::fixture();
+
+    let deep = groups(14);
+    let plan = indexed.explain_as(&deep, None).unwrap();
+    assert!(
+        !plan.contains("index=docs[wing,ts]"),
+        "a 2^14-branch predicate must plan a scan: {plan}"
+    );
+    let shallow = groups(4);
+    let plan = indexed.explain_as(&shallow, None).unwrap();
+    assert!(
+        plan.contains("index=docs[wing,ts]"),
+        "a 2^4-branch predicate must still plan seeks: {plan}"
+    );
+
+    let with_index = indexed.run(&deep).unwrap();
+    let scan_rows = plain.run(&deep).unwrap();
+    assert_eq!(with_index.done.n, scan_rows.done.n);
+    assert!(with_index.done.n > 0, "fixture must match the predicate");
+    let ids = |rows: &[lin::Row]| {
+        rows.iter()
+            .map(|r| text(r, "id").to_string())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ids(&with_index.rows), ids(&scan_rows.rows));
+    assert_eq!(
+        ids(&indexed.run(&shallow).unwrap().rows),
+        ids(&scan_rows.rows)
+    );
+}
+
+/// A numeric field can hold `Int` and `Float` cells at once (the checker lets
+/// either literal through), so index keys must rank both on the scale the scan
+/// compares them on.
+#[test]
+fn index_seeks_mixed_int_and_float_numbers_like_the_scan() {
+    let mut plain = Db::fixture();
+    let uid = {
+        let h = plain.run(r"users | take 1 | { id }").unwrap();
+        text(&h.rows[0], "id").to_string()
+    };
+    let mut idx = Db::fixture();
+    idx.run("index orders [total]").unwrap();
+    for db in [&mut plain, &mut idx] {
+        for (n, t) in [
+            ("a", "9"),
+            ("b", "10.5"),
+            ("c", "3"),
+            ("d", "2.25"),
+            ("e", "100"),
+            ("f", "0.5"),
+            ("g", "-4"),
+            ("h", "-4.0"),
+            ("i", "-2.5"),
+        ] {
+            db.run(&format!(
+                r#"insert orders {{ id: "{n}", user_id: "{uid}", total: {t}, ts: ago 1d }}"#
+            ))
+            .unwrap();
+        }
+    }
+
+    for q in [
+        r"total > 8.5",
+        r"total < 9.5",
+        r"total >= 2.25",
+        r"total <= 2.25",
+        r"total == 9",
+        r"total == 10.5",
+        r"total > 2 and total < 100",
+        r"total < -1.5",
+        r"total >= -4",
+        r"total == -4",
+        r"total > -4 and total < 0",
+    ] {
+        let stmt = format!(r"orders | {q} | {{ id }} | sort id asc | take all");
+        let plan = idx.explain_as(&stmt, None).unwrap();
+        assert!(
+            plan.contains("index=orders[total]"),
+            "{q} must seek: {plan}"
+        );
+        let want: Vec<String> = ids(&plain.run(&stmt).unwrap());
+        let got: Vec<String> = ids(&idx.run(&stmt).unwrap());
+        assert_eq!(got, want, "{q} disagrees with the scan");
+    }
 }

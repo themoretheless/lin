@@ -749,12 +749,12 @@ impl Store {
                     let id = row_text(new, "id").map(str::to_string);
                     let idx = id.as_ref().and_then(|id| self.row_index(collection, id));
                     if let Some(i) = idx {
+                        let before = self.collection(collection)[i].clone();
                         self.index_remove_at(collection, i);
-                        self.fts_remove_at(collection, i);
                         self.collection_mut(collection)[i] = new.clone();
-                        self.row_maps_reregister(collection, i);
+                        self.row_maps_sync_updated(collection, i, &before, new);
                         let _ = self.index_insert_at(collection, i);
-                        self.fts_insert_at(collection, i);
+                        self.fts_sync_at(collection, i, &before);
                         continue;
                     }
                     self.collection_mut(collection).push(new.clone());
@@ -766,11 +766,8 @@ impl Store {
             }
             Pack::Reembed => {}
             Pack::Delete { collection, rows } => {
-                self.collection_mut(collection)
-                    .retain(|r| !rows.iter().any(|d| same_row_key(collection, r, d)));
-                self.rebuild_row_maps_collection(collection);
-                self.rebuild_indexes_collection(collection);
-                self.rebuild_fts_inplace(collection);
+                let dead = self.dead_positions(collection, rows);
+                self.delete_rows_at(collection, &dead);
             }
             Pack::DeleteEdge { rel, from, to } => {
                 self.remove_edge(rel, from, to);
@@ -855,6 +852,7 @@ impl Store {
         for name in cold_names {
             self.promote_cold(&name);
         }
+        // Deletions bitmap is not persisted (snapshots are always compacted)
         MemBackup {
             r#gen: self.r#gen,
             embed_id: self.embed_id.clone(),
@@ -1052,6 +1050,12 @@ impl Store {
         }
     }
 
+    /// True when rows live in `collections` (not cold-only), so position-keyed
+    /// journals can be replayed against it.
+    pub fn has_collection(&self, name: &str) -> bool {
+        self.collections.contains_key(name)
+    }
+
     pub fn collection(&self, name: &str) -> &[Row] {
         if let Some(c) = self.cold.get(name) {
             if let Ok(rows) = c.rows() {
@@ -1091,6 +1095,20 @@ impl Store {
 
     pub fn row_index(&self, collection: &str, id: &str) -> Option<usize> {
         self.by_id.get(collection)?.get(id).copied()
+    }
+
+    /// Position of a row addressed by an `id` / `uri` point key, when the row
+    /// maps cover that collection and field.
+    pub fn point_index(&self, collection: &str, field: &str, key: &str) -> Option<usize> {
+        match field {
+            "id" => self.row_index(collection, key),
+            "uri" if collection == "docs" => {
+                let idx = *self.docs_by_uri.get(key)?;
+                self.collections.get("docs")?.get(idx)?;
+                Some(idx)
+            }
+            _ => None,
+        }
     }
 
     pub fn get_by_idx(&self, collection: &str, idx: usize) -> Option<&Row> {
@@ -1339,6 +1357,239 @@ impl Store {
         self.edges
             .retain(|e| !(e.rel == rel && e.from == from && e.to == to));
         true
+    }
+
+    /// Physical positions in `collection` whose row key matches any of `rows`.
+    /// Resolves each target through the id/uri maps for an O(D) path, mirroring
+    /// the Update write; falls back to a full scan only when a row's key can't be
+    /// resolved through the maps (e.g. `facts` triples, or id-less rows).
+    fn dead_positions(&self, collection: &str, rows: &[Row]) -> Vec<usize> {
+        let n = self.collection(collection).len();
+        let mut out: Vec<usize> = Vec::with_capacity(rows.len());
+        let mut seen = rustc_hash::FxHashSet::default();
+        for d in rows {
+            let pos = row_text(d, "id")
+                .and_then(|id| self.point_index(collection, "id", id))
+                .or_else(|| {
+                    row_text(d, "uri").and_then(|u| self.point_index(collection, "uri", u))
+                });
+            match pos {
+                Some(p) if p < n && seen.insert(p) => out.push(p),
+                Some(_) => {}
+                None => {
+                    for (i, r) in self.collection(collection).iter().enumerate() {
+                        if same_row_key(collection, r, d) && seen.insert(i) {
+                            out.push(i);
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Mark rows as deleted via a bitmap (O(1)), then compact only when the deletion
+    /// ratio exceeds a threshold to balance between memory efficiency and scan speed.
+    pub fn delete_rows_at(&mut self, collection: &str, dead: &[usize]) {
+        let old_n = self.collection_mut(collection).len();
+        if old_n == 0 || dead.is_empty() {
+            return;
+        }
+
+        let mut dead: Vec<usize> = dead.iter().copied().filter(|&d| d < old_n).collect();
+        dead.sort_unstable();
+        dead.dedup();
+        if dead.is_empty() {
+            return;
+        }
+
+        // Swap-remove, highest slot first: the last live row moves into each vacated
+        // slot, so the array stays dense and only the doomed row's and the moved
+        // row's index / FTS / map entries change. Positions are derived (maps,
+        // postings and columnar arrays are rebuilt from the rows on restore), so row
+        // order is not a contract — `sort` is the explicit remedy when one is needed.
+        for &p in dead.iter().rev() {
+            let last = match self.collections.get(collection) {
+                Some(rows) if p < rows.len() => rows.len() - 1,
+                _ => break,
+            };
+            let doomed = self.collections[collection][p].clone();
+            let moved = (p != last).then(|| self.collections[collection][last].clone());
+            self.index_remove_row(collection, p, &doomed);
+            self.fts_remove_row(collection, p, &doomed);
+            self.row_maps_drop_keys(collection, &doomed);
+            let Some(moved) = moved else {
+                self.swap_pop_columns(collection, p, last + 1);
+                if let Some(rows) = self.collections.get_mut(collection) {
+                    rows.truncate(last);
+                }
+                continue;
+            };
+            self.index_remove_row(collection, last, &moved);
+            self.fts_move_row(collection, last, p, &moved);
+            self.row_maps_drop_keys(collection, &moved);
+            self.swap_pop_columns(collection, p, last + 1);
+            if let Some(rows) = self.collections.get_mut(collection) {
+                rows[p] = moved.clone();
+                rows.truncate(last);
+            }
+            let _ = self.index_insert_row(collection, p, &moved);
+            self.swap_maps_register(collection, p, &moved);
+        }
+
+        let new_n = old_n - dead.len();
+        let soa_len = match collection {
+            "docs" => self.docs_id.len(),
+            "orders" => self.orders_id.len(),
+            "users" => self.users_id.len(),
+            _ => new_n,
+        };
+        if soa_len != new_n {
+            self.rebuild_row_maps_collection(collection);
+        }
+    }
+
+    /// Mirror [`swap_pop_at`] across the collection's columnar arrays, skipping
+    /// columns that aren't parallel to the rows (the caller's length guard rebuilds).
+    fn swap_pop_columns(&mut self, collection: &str, p: usize, len: usize) {
+        match collection {
+            "docs" => {
+                swap_pop_at(&mut self.docs_id, p, len);
+                swap_pop_at(&mut self.docs_title, p, len);
+                swap_pop_at(&mut self.docs_layer, p, len);
+                swap_pop_at(&mut self.docs_wing, p, len);
+            }
+            "orders" => {
+                swap_pop_at(&mut self.orders_id, p, len);
+                swap_pop_at(&mut self.orders_user_id, p, len);
+                swap_pop_at(&mut self.orders_total, p, len);
+            }
+            "users" => {
+                swap_pop_at(&mut self.users_id, p, len);
+                swap_pop_at(&mut self.users_email, p, len);
+            }
+            "facts" => {
+                swap_pop_at(&mut self.facts_s, p, len);
+                swap_pop_at(&mut self.facts_p, p, len);
+                swap_pop_at(&mut self.facts_o, p, len);
+            }
+            _ => {}
+        }
+    }
+
+    /// Drop a row's `key → position` entries after its slot is vacated.
+    fn row_maps_drop_keys(&mut self, collection: &str, row: &Row) {
+        if let Some(id) = row_text(row, "id")
+            && let Some(map) = self.by_id.get_mut(collection)
+        {
+            map.remove(id);
+        }
+        if collection == "docs"
+            && let Some(uri) = row_text(row, "uri")
+        {
+            self.docs_by_uri.remove(uri);
+        }
+        if collection == "facts"
+            && let Some(spo) = spo_key(row)
+        {
+            self.facts_by_spo.remove(&spo);
+        }
+    }
+
+    /// [`Store::row_maps_register_row`] plus the `facts` key that helper ignores.
+    fn swap_maps_register(&mut self, collection: &str, idx: usize, row: &Row) {
+        self.row_maps_register_row(collection, idx, row);
+        if collection == "facts"
+            && let Some(spo) = spo_key(row)
+        {
+            self.facts_by_spo.insert(spo, idx);
+        }
+    }
+
+    /// Reverse in-place row mutations from a `Rows` undo journal. Positions never
+    /// shift during an update, so each entry restores one row plus its own index /
+    /// FTS / map slots — no whole-store clone, no per-collection rebuild.
+    pub fn restore_rows(&mut self, journal: &[(String, usize, Row)]) {
+        for (collection, idx, row) in journal.iter().rev() {
+            let live = self
+                .collections
+                .get(collection)
+                .is_some_and(|rows| *idx < rows.len());
+            if !live {
+                continue;
+            }
+            let current = self.collection(collection)[*idx].clone();
+            self.index_remove_at(collection, *idx);
+            self.fts_remove_at(collection, *idx);
+            self.collection_mut(collection)[*idx] = row.clone();
+            let _ = self.index_insert_at(collection, *idx);
+            self.fts_insert_at(collection, *idx);
+            self.row_maps_sync_updated(collection, *idx, &current, row);
+        }
+    }
+
+    /// Inverse of [`Self::delete_rows_at`]: drop each removed row back into its old
+    /// slot and push whatever the swap parked there onto the tail. Walking `positions`
+    /// ascending reproduces the forward pass's intermediate lengths exactly, so
+    /// `p == rows.len()` marks the slots that were the tail and need no push.
+    pub fn restore_rows_at(&mut self, collection: &str, positions: &[usize], rows: &[Row]) {
+        for (&p, doomed) in positions.iter().zip(rows) {
+            let Some(current) = self.collections.get(collection) else {
+                return;
+            };
+            let len = current.len();
+            if p > len {
+                continue;
+            }
+            if p < len {
+                let moved = self.collections[collection][p].clone();
+                self.index_remove_row(collection, p, &moved);
+                self.fts_move_row(collection, p, len, &moved);
+                self.row_maps_drop_keys(collection, &moved);
+                if let Some(rows) = self.collections.get_mut(collection) {
+                    rows.push(moved.clone());
+                }
+                let _ = self.index_insert_row(collection, len, &moved);
+                self.swap_maps_register(collection, len, &moved);
+            }
+            if let Some(rows) = self.collections.get_mut(collection) {
+                if p == rows.len() {
+                    rows.push(doomed.clone());
+                } else {
+                    rows[p] = doomed.clone();
+                }
+            }
+            let _ = self.index_insert_row(collection, p, doomed);
+            self.fts_insert_row(collection, p, doomed);
+            self.swap_maps_register(collection, p, doomed);
+            // The slab's columns follow the rows array: the value at `p` moves to the
+            // tail and the restored row takes `p`, which one swap-push expresses.
+            if collection == "facts" {
+                let get = |f: &str| {
+                    doomed
+                        .get(f)
+                        .and_then(Cell::text_shared)
+                        .unwrap_or_default()
+                };
+                swap_push_at(&mut self.facts_s, p, len, get("s"));
+                swap_push_at(&mut self.facts_p, p, len, get("p"));
+                swap_push_at(&mut self.facts_o, p, len, get("o"));
+            }
+        }
+        let n = self
+            .collections
+            .get(collection)
+            .map_or(0, std::vec::Vec::len);
+        let soa_len = match collection {
+            "docs" => self.docs_id.len(),
+            "orders" => self.orders_id.len(),
+            "users" => self.users_id.len(),
+            "facts" => self.facts_s.len(),
+            _ => n,
+        };
+        if soa_len != n {
+            self.rebuild_row_maps_collection(collection);
+        }
     }
 
     pub fn rebuild_row_maps_collection(&mut self, collection: &str) {
@@ -1715,10 +1966,25 @@ impl Store {
         }
     }
 
-    pub fn row_maps_reregister(&mut self, collection: &str, idx: usize) {
-        // uri may have changed; safest is rebuild one collection (small for updates).
-        self.rebuild_row_maps_collection(collection);
-        let _ = idx;
+    /// Sync maps / SoA after an **in-place** row update. Identity fields are immutable,
+    /// so the normal path only rewrites the slots and keys of this one row; a moved
+    /// `id`/`uri` (owned collections aside) falls back to rebuilding the collection.
+    pub fn row_maps_sync_updated(
+        &mut self,
+        collection: &str,
+        idx: usize,
+        before: &Row,
+        after: &Row,
+    ) {
+        let id = row_text(after, "id");
+        let identity_moved =
+            row_text(before, "id") != id || row_text(before, "uri") != row_text(after, "uri");
+        let stale_slot = id.is_some_and(|key| self.row_index(collection, key) != Some(idx));
+        if identity_moved || stale_slot {
+            self.rebuild_row_maps_collection(collection);
+            return;
+        }
+        self.row_maps_register_row(collection, idx, after);
     }
 
     pub fn index_insert_at(&mut self, collection: &str, row_idx: usize) -> Result<(), Error> {
@@ -1784,10 +2050,25 @@ impl Store {
         Ok(())
     }
 
+    /// Drop a position from every index of `collection`. The row at that position
+    /// must still be the indexed version — keys are recomputed from it.
     pub fn index_remove_at(&mut self, collection: &str, row_idx: usize) {
+        let Some(row) = self
+            .collections
+            .get(collection)
+            .and_then(|c| c.get(row_idx))
+            .cloned()
+        else {
+            return;
+        };
+        self.index_remove_row(collection, row_idx, &row);
+    }
+
+    /// Drop one row's index entries, given the row itself.
+    pub fn index_remove_row(&mut self, collection: &str, row_idx: usize, row: &Row) {
         for idx in self.indexes.values_mut() {
             if idx.def.collection == collection {
-                idx.remove_at(row_idx);
+                idx.remove_at(row_idx, row);
             }
         }
     }
@@ -1828,12 +2109,19 @@ impl Store {
         }
     }
 
-    fn write_fts_files(&self, dir: &Path) -> Result<(), Error> {
+    fn write_fts_files(&mut self, dir: &Path) -> Result<(), Error> {
         let mut keep = Vec::new();
-        for (name, idx) in &self.fts {
-            let nrows = self.collection(name).len() as u64;
-            crate::fts::write_fts(dir, name, idx, self.r#gen, nrows)?;
-            keep.push(name.clone());
+        let rows_per_collection: Vec<(String, u64)> = self
+            .fts
+            .keys()
+            .map(|name| (name.clone(), self.collection(name).len() as u64))
+            .collect();
+        let generation = self.r#gen;
+        for (name, nrows) in rows_per_collection {
+            if let Some(idx) = self.fts.get_mut(&name) {
+                crate::fts::write_fts(dir, &name, idx, generation, nrows)?;
+            }
+            keep.push(name);
         }
         crate::fts::prune_fts(dir, &keep)
     }
@@ -1915,6 +2203,13 @@ impl Store {
         }
     }
 
+    /// Register one row's postings at `row_idx`, given the row itself.
+    pub fn fts_insert_row(&mut self, collection: &str, row_idx: usize, row: &Row) {
+        if let Some(fts) = self.fts.get_mut(collection) {
+            fts.insert_row(row_idx, row);
+        }
+    }
+
     pub fn fts_insert_slab(&mut self, collection: &str, start: usize, rows: &[Row]) {
         let Some(fts) = self.fts.get_mut(collection) else {
             return;
@@ -1924,9 +2219,48 @@ impl Store {
         }
     }
 
+    /// Drop the postings of the row currently at `row_idx`.
     pub fn fts_remove_at(&mut self, collection: &str, row_idx: usize) {
+        let Some(row) = self
+            .collections
+            .get(collection)
+            .and_then(|c| c.get(row_idx))
+            .cloned()
+        else {
+            return;
+        };
+        self.fts_remove_row(collection, row_idx, &row);
+    }
+
+    /// Drop one row's postings, given the row itself: only that row's tokens are
+    /// visited, so the cost is per-row rather than per-vocabulary.
+    pub fn fts_remove_row(&mut self, collection: &str, row_idx: usize, row: &Row) {
         if let Some(fts) = self.fts.get_mut(collection) {
-            fts.remove_row_idx(row_idx);
+            fts.remove_row(row_idx, row);
+        }
+    }
+
+    /// Re-point a row's postings between slots after a swap-move, tokenizing it
+    /// once rather than once per edit.
+    pub fn fts_move_row(&mut self, collection: &str, from: usize, to: usize, row: &Row) {
+        if let Some(fts) = self.fts.get_mut(collection) {
+            fts.move_row(from, to, row);
+        }
+    }
+
+    /// Re-point a single row's postings after an in-place field update, given
+    /// the row as it was before the write.
+    pub fn fts_sync_at(&mut self, collection: &str, row_idx: usize, before: &Row) {
+        let Some(row) = self
+            .collections
+            .get(collection)
+            .and_then(|c| c.get(row_idx))
+            .cloned()
+        else {
+            return;
+        };
+        if let Some(fts) = self.fts.get_mut(collection) {
+            fts.sync_row(row_idx, before, &row);
         }
     }
 
@@ -2200,6 +2534,35 @@ pub struct MemBackup {
     extra_indexes: BTreeMap<String, IndexSnap>,
     extra_filters: BTreeMap<String, String>,
     extra_owned: BTreeMap<String, Vec<(String, String)>>,
+}
+
+/// Move `v[p]` on top of the tail and drop the tail, keeping the vec dense. A
+/// no-op when `v` isn't parallel to the rows (the caller's length guard rebuilds).
+fn swap_pop_at<T: Clone>(v: &mut Vec<T>, p: usize, len: usize) {
+    if v.len() != len {
+        return;
+    }
+    let last = len - 1;
+    if p < last {
+        let moved = v[last].clone();
+        v[p] = moved;
+    }
+    v.truncate(last);
+}
+
+/// Inverse of [`swap_pop_at`]: `value` takes slot `p` and whatever was there moves
+/// to the tail. A no-op when `v` isn't parallel to the rows.
+fn swap_push_at<T: Clone>(v: &mut Vec<T>, p: usize, len: usize, value: T) {
+    if v.len() != len {
+        return;
+    }
+    if p == len {
+        v.push(value);
+    } else {
+        let moved = v[p].clone();
+        v.push(moved);
+        v[p] = value;
+    }
 }
 
 fn same_row_key(collection: &str, a: &Row, b: &Row) -> bool {

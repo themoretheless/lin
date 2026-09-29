@@ -44,6 +44,8 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
 
     let mut col_lits = Vec::new();
     let mut assignments = Vec::new();
+    let mut col_fields = Vec::new();
+    let mut col_inits = Vec::new();
 
     for field in &fields.named {
         let ident = field.ident.as_ref().unwrap();
@@ -53,6 +55,12 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
             assignments.push(quote! {
                 #ident: <#ty as ::lin::FromRow>::from_row(__row)?,
             });
+            col_fields.push(quote! {
+                pub #ident: <#ty as ::lin::LinRow>::Cols
+            });
+            col_inits.push(quote! {
+                #ident: <#ty as ::lin::LinRow>::cols()
+            });
             continue;
         }
         let col = parse_rename(&field.attrs)?.unwrap_or_else(|| ident.to_string());
@@ -60,6 +68,12 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         col_lits.push(col_lit.clone());
         assignments.push(quote! {
             #ident: ::lin::cell_get::<_>(__row, #col_lit)?,
+        });
+        col_fields.push(quote! {
+            pub #ident: ::lin::Col
+        });
+        col_inits.push(quote! {
+            #ident: ::lin::Col::new(#col_lit)
         });
     }
 
@@ -71,6 +85,8 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         None => quote! { ::core::option::Option::None },
     };
 
+    let cols_name = quote::format_ident!("{}Cols", name);
+
     Ok(quote! {
         impl ::lin::FromRow for #name {
             fn from_row(__row: &::lin::Row) -> ::core::result::Result<Self, ::lin::Error> {
@@ -80,9 +96,20 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
             }
         }
 
+        #[derive(Debug, Clone, Copy)]
+        pub struct #cols_name {
+            #(#col_fields,)*
+        }
+
         impl ::lin::LinRow for #name {
             const COLLECTION: ::core::option::Option<&'static str> = #collection_tokens;
             const COLUMNS: &'static [&'static str] = &[#(#col_lits),*];
+            type Cols = #cols_name;
+            fn cols() -> Self::Cols {
+                #cols_name {
+                    #(#col_inits,)*
+                }
+            }
         }
     })
 }

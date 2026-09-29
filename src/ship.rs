@@ -5,8 +5,11 @@
 //! - server → client: `u64` LE `byte_len` + raw WAL frames (`export_wal_since`)
 //!
 //! Plaintext on loopback is still the local recipe. For another machine: TLS
-//! (`--tls-cert` / `--tls-key` / `--tls-ca`) and a shared token. The server
-//! holds at most **one** live pull at a time (extra accepts are dropped).
+//! (`--tls-cert` / `--tls-key` / `--tls-ca`) and a shared token. A TLS pull
+//! verifies the server certificate against the DNS host in `--from`
+//! ([`PullOpts::server_name`]); a numeric peer keeps the `localhost` default.
+//! The server holds at most **one** live pull at a time (extra accepts are
+//! dropped).
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
@@ -47,6 +50,10 @@ pub enum TlsClient {
 pub struct PullOpts {
     pub token: Option<String>,
     pub tls: TlsClient,
+    /// Host the server certificate is verified against, and the SNI sent to
+    /// it. `None` keeps the loopback recipe's `"localhost"`, so only a peer
+    /// reached by DNS name needs it — see [`tls_server_name`].
+    pub server_name: Option<String>,
 }
 
 /// Server TLS material (PEM).
@@ -61,6 +68,20 @@ pub struct TlsServer {
 pub struct ServeOpts {
     pub token: Option<String>,
     pub tls: Option<TlsServer>,
+}
+
+/// Name to verify a server certificate under, for a `HOST:PORT` target.
+///
+/// `None` means "keep the default": a numeric host cannot be checked against a
+/// DNS-only certificate, and loopback lab certs are issued for `localhost`.
+pub fn tls_server_name(addr: &str) -> Option<String> {
+    let host = addr.rsplit_once(':').map_or(addr, |h| h.0);
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if host.is_empty() || host.parse::<std::net::IpAddr>().is_ok() {
+        None
+    } else {
+        Some(host.to_owned())
+    }
 }
 
 /// Pull WAL frames with `gen > since` (plaintext, empty token).
@@ -81,7 +102,8 @@ pub fn pull_with(addr: impl ToSocketAddrs, since: u64, opts: &PullOpts) -> Resul
         TlsClient::Off => pull_io(stream, since, opts.token.as_deref()),
         other => {
             let cfg = client_config(other)?;
-            let name = ServerName::try_from("localhost").map_err(io_err)?;
+            let host = opts.server_name.as_deref().unwrap_or("localhost");
+            let name = ServerName::try_from(host.to_owned()).map_err(io_err)?;
             let conn = rustls::ClientConnection::new(cfg, name).map_err(io_err)?;
             let mut tls = StreamOwned::new(conn, stream);
             pull_io(&mut tls, since, opts.token.as_deref())
@@ -454,12 +476,80 @@ mod tests {
             0,
             &PullOpts {
                 token: Some("nope".into()),
-                tls: TlsClient::Off,
+                ..Default::default()
             },
         )
         .unwrap_err();
         assert!(err.to_string().contains("wal ship"), "{err}");
         let _ = serve.join();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tls_server_name_only_comes_from_a_dns_host() {
+        assert_eq!(
+            tls_server_name("db.example.com:7001").as_deref(),
+            Some("db.example.com")
+        );
+        assert_eq!(
+            tls_server_name("localhost:7001").as_deref(),
+            Some("localhost")
+        );
+        assert_eq!(tls_server_name("127.0.0.1:7001"), None);
+        assert_eq!(tls_server_name("[::1]:7001"), None);
+        assert_eq!(tls_server_name(":7001"), None);
+    }
+
+    /// A peer reached by DNS name must verify under that name: `server_name`
+    /// replaces the loopback default, so a cert issued for `ship.internal`
+    /// works over a numeric socket.
+    #[test]
+    fn pull_verifies_a_named_server_certificate() {
+        let dir = std::env::temp_dir().join(format!(
+            "lin-ship-name-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut db = Db::open(&dir).unwrap();
+        db.run(r#"insert docs { uri: "raw://named", title: "N", layer: "wiki" }"#)
+            .unwrap();
+
+        let cert = rcgen::generate_simple_self_signed(["ship.internal".into()]).unwrap();
+        let tls = TlsServer {
+            cert_pem: cert.cert.pem().into_bytes(),
+            key_pem: cert.key_pair.serialize_pem().into_bytes(),
+        };
+        let ca = tls.cert_pem.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let opts = ServeOpts {
+            token: None,
+            tls: Some(tls),
+        };
+        let serve = thread::spawn(move || {
+            let r = serve_one_opts(&db, &listener, &opts);
+            let _ = db.close();
+            r
+        });
+        thread::sleep(Duration::from_millis(40));
+
+        let frames = pull_with(
+            addr,
+            0,
+            &PullOpts {
+                tls: TlsClient::CaPem(ca),
+                server_name: Some("ship.internal".into()),
+                ..Default::default()
+            },
+        )
+        .expect("named server verifies under its own name");
+        assert!(!frames.is_empty());
+        let _ = serve.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

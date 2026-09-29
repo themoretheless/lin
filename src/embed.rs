@@ -58,65 +58,108 @@ impl Embedder for HashingEmbedder {
     }
 
     fn embed(&self, text: &str) -> Arc<[f32]> {
-        let mut lower = String::with_capacity(text.len());
-        lowercase_into(text, &mut lower);
-        self.embed_lowered(&lower)
+        let mut scratch = Scratch::new(self.dim);
+        let mut lower = String::new();
+        self.fill(&mut scratch, crate::fts::lowercased(text, &mut lower));
+        scratch.finish()
     }
 
     fn embed_batch(&self, texts: &[&str]) -> Vec<Arc<[f32]>> {
+        let mut scratch = Scratch::new(self.dim);
         let mut lower = String::new();
         let mut out = Vec::with_capacity(texts.len());
         for text in texts {
-            lower.clear();
-            lower.reserve(text.len());
-            lowercase_into(text, &mut lower);
-            out.push(self.embed_lowered(&lower));
+            self.fill(&mut scratch, crate::fts::lowercased(text, &mut lower));
+            out.push(scratch.finish());
         }
         out
     }
 }
 
 impl HashingEmbedder {
-    fn embed_lowered(&self, lower: &str) -> Arc<[f32]> {
-        let mut v = vec![0f32; self.dim];
+    /// Add every feature of `lower` (unigrams, char trigrams, string bigrams)
+    /// into the accumulator.
+    fn fill(&self, s: &mut Scratch, lower: &str) {
         for token in lower.split_whitespace() {
             if token.is_empty() {
                 continue;
             }
-            bump(&mut v, token, 1.0);
+            s.bump(token, 1.0);
             let b = token.as_bytes();
             if b.len() >= 3 {
                 for w in b.windows(3) {
-                    bump(&mut v, w, 0.5);
+                    s.bump(w, 0.5);
                 }
             } else {
-                bump(&mut v, b, 0.5);
+                s.bump(b, 0.5);
             }
         }
         // Character bigrams over the whole string catch short queries.
         let bytes = lower.as_bytes();
         for w in bytes.windows(2) {
-            bump(&mut v, w, 0.25);
-        }
-        l2_normalize(&mut v);
-        Arc::from(v)
-    }
-}
-
-fn lowercase_into(text: &str, out: &mut String) {
-    for ch in text.chars() {
-        for lower in ch.to_lowercase() {
-            out.push(lower);
+            s.bump(w, 0.25);
         }
     }
 }
 
-#[inline]
-fn bump(v: &mut [f32], key: impl Hash, w: f32) {
-    let mut h = FxHasher::default();
-    key.hash(&mut h);
-    let i = (h.finish() as usize) % v.len();
-    v[i] += w;
+/// Dense accumulator plus the list of slots the current row actually wrote, so
+/// a batch reuses one allocation and normalizes only its own features.
+struct Scratch {
+    v: Vec<f32>,
+    seen: Vec<bool>,
+    touched: Vec<u32>,
+}
+
+impl Scratch {
+    fn new(dim: usize) -> Self {
+        Self {
+            v: vec![0f32; dim],
+            seen: vec![false; dim],
+            touched: Vec::new(),
+        }
+    }
+
+    #[inline]
+    fn bump(&mut self, key: impl Hash, w: f32) {
+        let mut h = FxHasher::default();
+        key.hash(&mut h);
+        let i = (h.finish() as usize) % self.v.len();
+        let i = i as u32;
+        if !self.seen[i as usize] {
+            self.seen[i as usize] = true;
+            self.touched.push(i);
+        }
+        self.v[i as usize] += w;
+    }
+
+    /// L2-normalize and hand out the vector. Untouched slots are exact `0.0`, so
+    /// skipping them adds nothing to the sum; `touched` is sorted to keep the
+    /// summation order of the dense walk.
+    fn finish(&mut self) -> Arc<[f32]> {
+        if self.touched.len() * 5 < self.v.len() {
+            self.touched.sort_unstable();
+            let mut s = 0f32;
+            for &i in &self.touched {
+                let x = self.v[i as usize];
+                s += x * x;
+            }
+            if s > 1e-12 {
+                let inv = s.sqrt().recip();
+                for &i in &self.touched {
+                    self.v[i as usize] *= inv;
+                }
+            }
+        } else {
+            l2_normalize(&mut self.v);
+        }
+        let out = Arc::from(&self.v[..]);
+        for &i in &self.touched {
+            self.v[i as usize] = 0.0;
+            self.seen[i as usize] = false;
+        }
+        self.touched.clear();
+        out
+    }
 }
 
 fn l2_normalize(v: &mut [f32]) {

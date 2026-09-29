@@ -8,8 +8,8 @@
 
 use rustc_hash::FxHashMap;
 use std::collections::BTreeSet;
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::fs::{self, File};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::error::Error;
@@ -20,11 +20,25 @@ pub const FTS_DIR: &str = "fts";
 pub const FTS_MAGIC: [u8; 4] = *b"LIN\x05";
 const FTS_VERSION: u8 = 1;
 
-/// Inverted index: token → sorted unique row indices.
+/// Pending entries folded back into a term's base list. A removal from a sorted
+/// list costs a memmove over the whole list, which for a corpus-wide token is
+/// the collection's posting length; deferring it makes a single-row write cost
+/// independent of how often its tokens occur.
+const FOLD_AFTER: usize = 256;
+
+/// Inverted index: token → sorted unique row indices, plus pending edits.
+///
+/// `postings` is the folded base; `adds` / `dels` hold changes not yet merged
+/// into it. A term's live set is `(postings ∪ adds) \ dels`, which is what
+/// [`Self::candidate_idxs`] reads. The three sets may overlap — an entry the
+/// live set already has, or one it never had, is inert — but a position is
+/// never in `adds` and `dels` at the same time.
 #[derive(Debug, Clone, Default)]
 pub struct FtsIndex {
     pub fields: Vec<String>,
     postings: FxHashMap<String, Vec<usize>>,
+    dels: FxHashMap<String, Vec<usize>>,
+    adds: FxHashMap<String, Vec<usize>>,
 }
 
 impl FtsIndex {
@@ -32,45 +46,192 @@ impl FtsIndex {
         Self {
             fields: fields.to_vec(),
             postings: FxHashMap::default(),
+            dels: FxHashMap::default(),
+            adds: FxHashMap::default(),
         }
     }
 
     pub fn build(rows: &[Row], fields: &[String]) -> Self {
         let mut idx = Self::empty(fields);
         for (i, row) in rows.iter().enumerate() {
-            idx.insert_row(i, row);
+            idx.append_row(i, row);
         }
         idx
     }
 
-    pub fn insert_row(&mut self, row_idx: usize, row: &Row) {
-        for tok in row_tokens(row, &self.fields) {
-            let list = self.postings.entry(tok).or_default();
-            if list.last().copied() != Some(row_idx) {
-                match list.binary_search(&row_idx) {
-                    Ok(_) => {}
-                    Err(pos) => list.insert(pos, row_idx),
-                }
+    /// Post a row whose position is new at the tail of the collection: written
+    /// straight into the base list, which keeps appends allocation-cheap.
+    pub fn append_row(&mut self, row_idx: usize, row: &Row) {
+        let mut scratch = String::new();
+        let texts: Vec<&str> = fts_texts(row, &self.fields).collect();
+        for text in texts {
+            let lowered = lowercased(text, &mut scratch);
+            for tok in lowered.split_whitespace() {
+                add_posting(&mut self.postings, tok, row_idx);
             }
         }
     }
 
-    /// Remove row_idx from all postings (after delete / before re-index).
-    pub fn remove_row_idx(&mut self, row_idx: usize) {
-        for list in self.postings.values_mut() {
-            if let Ok(pos) = list.binary_search(&row_idx) {
-                list.remove(pos);
+    /// Post a row at a position chosen by the writer rather than by the row
+    /// count: an ordinary insert still lands as an append, while a position a
+    /// base list already references (a swap-move or an undo restore) is
+    /// registered through the delta set.
+    pub fn insert_row(&mut self, row_idx: usize, row: &Row) {
+        for tok in row_tokens(row, &self.fields) {
+            self.note_add(&tok, row_idx);
+        }
+    }
+
+    /// Drop one row's postings, given the row that produced them: only its own
+    /// tokens are visited, so the cost is per-row rather than per-vocabulary.
+    /// Callers must invoke it while `row` still sits at `row_idx`.
+    pub fn remove_row(&mut self, row_idx: usize, row: &Row) {
+        for tok in row_tokens(row, &self.fields) {
+            self.note_del(&tok, row_idx);
+        }
+    }
+
+    /// Record that `tok` matches `row_idx` from now on.
+    ///
+    /// A position beyond the end of the base list is an append: it goes straight
+    /// onto it, which keeps the insert path free of both the memmove a sorted
+    /// insert costs and the folds a stream of pending adds would trigger.
+    ///
+    /// Cancelling a pending removal is not the end of the edit: the removal may
+    /// have been recorded against a base list that no longer holds the position
+    /// (it folded away in between), so the add still has to be registered.
+    fn note_add(&mut self, tok: &str, row_idx: usize) {
+        if cancel(&mut self.dels, tok, row_idx) {
+            push_pending(&mut self.adds, tok, row_idx);
+            self.fold_if_pending(tok);
+            return;
+        }
+        let beyond_base = !self.adds.contains_key(tok);
+        match self.postings.get_mut(tok) {
+            Some(list) => {
+                if beyond_base && list.last().is_some_and(|&last| row_idx > last) {
+                    list.push(row_idx);
+                    return;
+                }
+                if list.binary_search(&row_idx).is_ok() {
+                    return;
+                }
+            }
+            None => {
+                self.postings.insert(tok.to_owned(), vec![row_idx]);
+                return;
             }
         }
-        self.postings.retain(|_, v| !v.is_empty());
+        push_pending(&mut self.adds, tok, row_idx);
+        self.fold_if_pending(tok);
+    }
+
+    /// Record that `tok` stops matching `row_idx`, cancelling a pending addition
+    /// that never reached the base list.
+    ///
+    /// The base list is deliberately not consulted: proving the position is
+    /// posted means a binary search through a posting list as long as the
+    /// collection, which for a corpus-wide token costs more cache misses than
+    /// the whole edit. A removal of a position the base does not hold is a
+    /// no-op under `(postings ∪ adds) \ dels`.
+    fn note_del(&mut self, tok: &str, row_idx: usize) {
+        if cancel(&mut self.adds, tok, row_idx) {
+            return;
+        }
+        push_pending(&mut self.dels, tok, row_idx);
+        self.fold_if_pending(tok);
+    }
+
+    fn fold_if_pending(&mut self, tok: &str) {
+        let pending =
+            self.dels.get(tok).map_or(0, Vec::len) + self.adds.get(tok).map_or(0, Vec::len);
+        if pending > FOLD_AFTER {
+            self.fold_term(tok);
+        }
+    }
+
+    /// Merge one term's pending edits into its base list, restoring the sorted,
+    /// unique, delta-free form. One pass over that term's postings, so a fold
+    /// stays cheap relative to the `FOLD_AFTER` edits that triggered it.
+    ///
+    /// All three inputs are already sorted and free of duplicates, so the merge
+    /// is a linear walk; sorting the concatenation made a fold the hottest part
+    /// of a delete-heavy run.
+    fn fold_term(&mut self, tok: &str) {
+        let dels = self.dels.remove(tok).unwrap_or_default();
+        let adds = self.adds.remove(tok).unwrap_or_default();
+        if dels.is_empty() && adds.is_empty() {
+            return;
+        }
+        let Some(base) = self.postings.remove(tok) else {
+            if !adds.is_empty() {
+                self.postings.insert(tok.to_owned(), adds);
+            }
+            return;
+        };
+        let kept = subtract_sorted(&base, &dels);
+        let list = union_sorted(&kept, &adds);
+        if !list.is_empty() {
+            self.postings.insert(tok.to_owned(), list);
+        }
+    }
+
+    /// Fold every term; call before serializing so the file format stays base-only.
+    pub fn fold_all(&mut self) {
+        let terms: Vec<String> = self.dels.keys().chain(self.adds.keys()).cloned().collect();
+        for tok in terms {
+            self.fold_term(&tok);
+        }
+    }
+
+    /// Positions where `tok` currently matches.
+    fn matches(&self, tok: &str) -> Option<Vec<usize>> {
+        let dels = self.dels.get(tok).map(Vec::as_slice).unwrap_or(&[]);
+        let adds = self.adds.get(tok).map(Vec::as_slice).unwrap_or(&[]);
+        if dels.is_empty() && adds.is_empty() {
+            return self.postings.get(tok).cloned();
+        }
+        let base = self.postings.get(tok).map(Vec::as_slice).unwrap_or(&[]);
+        let kept = subtract_sorted(base, dels);
+        Some(union_sorted(&kept, adds))
+    }
+
+    /// Re-point a row's postings from `from` to `to`. The token set is the row's
+    /// own and does not change, so it is computed once instead of per edit —
+    /// which is what a swap-move needs, since it moves one row between slots.
+    pub fn move_row(&mut self, from: usize, to: usize, row: &Row) {
+        for tok in row_tokens(row, &self.fields) {
+            self.note_del(&tok, from);
+            self.note_add(&tok, to);
+        }
+    }
+
+    /// Re-point one row's postings after an in-place update: only tokens that
+    /// entered or left the row touch a posting list, so the cost is per-row
+    /// rather than per-vocabulary.
+    pub fn sync_row(&mut self, row_idx: usize, before: &Row, after: &Row) {
+        let old = row_tokens(before, &self.fields);
+        let new = row_tokens(after, &self.fields);
+        for tok in &old {
+            if new.contains(tok) {
+                continue;
+            }
+            self.note_del(tok, row_idx);
+        }
+        for tok in &new {
+            if old.contains(tok) {
+                continue;
+            }
+            self.note_add(tok, row_idx);
+        }
     }
 
     /// Union of posting lists for query tokens (any-token match, then residual score).
     pub fn candidate_idxs(&self, query: &str) -> Vec<usize> {
         let mut set = BTreeSet::new();
         for tok in tokenize(query) {
-            if let Some(list) = self.postings.get(&tok) {
-                set.extend(list.iter().copied());
+            if let Some(list) = self.matches(&tok) {
+                set.extend(list);
             }
         }
         set.into_iter().collect()
@@ -129,7 +290,16 @@ impl FtsIndex {
             }
             postings.insert(tok, list);
         }
-        Ok((generation, nrows, Self { fields, postings }))
+        Ok((
+            generation,
+            nrows,
+            Self {
+                fields,
+                postings,
+                dels: FxHashMap::default(),
+                adds: FxHashMap::default(),
+            },
+        ))
     }
 }
 
@@ -172,22 +342,137 @@ pub fn tokenize(text: &str) -> Vec<String> {
         .collect()
 }
 
-fn row_tokens(row: &Row, fields: &[String]) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
-    for f in fields {
-        if let Some(t) = row_text(row, f) {
-            for tok in tokenize(t) {
-                out.insert(tok);
-            }
+/// Text of every field an index tokenizes: the `fts` fields, plus `snippet`
+/// when it is not one of them (lex scoring reads it).
+fn fts_texts<'a>(row: &'a Row, fields: &'a [String]) -> impl Iterator<Item = &'a str> {
+    let snippet = if fields.iter().any(|f| f == "snippet") {
+        None
+    } else {
+        row_text(row, "snippet")
+    };
+    fields
+        .iter()
+        .filter_map(move |f| row_text(row, f))
+        .chain(snippet)
+}
+
+/// `text` lowercased, borrowed from `text` itself when lowering is a no-op.
+pub(crate) fn lowercased<'a>(text: &'a str, scratch: &'a mut String) -> &'a str {
+    if !text.chars().any(|c| c.to_lowercase().next() != Some(c)) {
+        return text;
+    }
+    scratch.clear();
+    for c in text.chars() {
+        scratch.extend(c.to_lowercase());
+    }
+    scratch
+}
+
+/// `a \ b` for two sorted, duplicate-free lists: one forward walk with a cursor,
+/// which is what posting folds and pending-aware reads are shaped like.
+fn subtract_sorted(a: &[usize], b: &[usize]) -> Vec<usize> {
+    if b.is_empty() {
+        return a.to_vec();
+    }
+    let mut out = Vec::with_capacity(a.len());
+    let mut j = 0;
+    for &x in a {
+        while j < b.len() && b[j] < x {
+            j += 1;
+        }
+        if j < b.len() && b[j] == x {
+            continue;
+        }
+        out.push(x);
+    }
+    out
+}
+
+/// `a ∪ b` for two sorted lists, collapsing any overlap between them.
+fn union_sorted(a: &[usize], b: &[usize]) -> Vec<usize> {
+    if b.is_empty() {
+        return a.to_vec();
+    }
+    if a.is_empty() {
+        return b.to_vec();
+    }
+    let mut out = Vec::with_capacity(a.len() + b.len());
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        let v = if a[i] <= b[j] {
+            i += 1;
+            a[i - 1]
+        } else {
+            j += 1;
+            b[j - 1]
+        };
+        if out.last().copied() != Some(v) {
+            out.push(v);
         }
     }
-    // Also index snippet when present (lex_score reads it) even if not fts-flagged.
-    if !fields.iter().any(|f| f == "snippet")
-        && let Some(t) = row_text(row, "snippet")
-    {
-        for tok in tokenize(t) {
-            out.insert(tok);
+    for &v in &a[i..] {
+        if out.last().copied() != Some(v) {
+            out.push(v);
         }
+    }
+    for &v in &b[j..] {
+        if out.last().copied() != Some(v) {
+            out.push(v);
+        }
+    }
+    out
+}
+
+/// Append to a term's pending list, creating it on first use.
+fn push_pending(map: &mut FxHashMap<String, Vec<usize>>, tok: &str, row_idx: usize) {
+    if let Some(list) = map.get_mut(tok) {
+        list.push(row_idx);
+    } else {
+        map.insert(tok.to_owned(), vec![row_idx]);
+    }
+}
+
+/// Drop `row_idx` from a term's pending list, reporting whether it was there.
+/// A cancelled entry means the base list already holds the right answer.
+fn cancel(map: &mut FxHashMap<String, Vec<usize>>, tok: &str, row_idx: usize) -> bool {
+    let Some(list) = map.get_mut(tok) else {
+        return false;
+    };
+    let Some(k) = list.iter().position(|&p| p == row_idx) else {
+        return false;
+    };
+    list.swap_remove(k);
+    let drained = list.is_empty();
+    if drained {
+        map.remove(tok);
+    }
+    true
+}
+
+/// Add `row_idx` to a token's sorted list, allocating a posting list only when
+/// the token is new.
+fn add_posting(postings: &mut FxHashMap<String, Vec<usize>>, tok: &str, row_idx: usize) {
+    if let Some(list) = postings.get_mut(tok) {
+        if list.last().copied() == Some(row_idx) {
+            return;
+        }
+        if let Err(pos) = list.binary_search(&row_idx) {
+            list.insert(pos, row_idx);
+        }
+    } else {
+        postings.insert(tok.to_owned(), vec![row_idx]);
+    }
+}
+
+fn row_tokens(row: &Row, fields: &[String]) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let mut scratch = String::new();
+    for text in fts_texts(row, fields) {
+        out.extend(
+            lowercased(text, &mut scratch)
+                .split_whitespace()
+                .map(|t| t.to_string()),
+        );
     }
     out
 }
@@ -200,10 +485,12 @@ pub fn fts_path(data: &Path, name: &str) -> PathBuf {
     fts_dir(data).join(format!("{name}.bin"))
 }
 
+/// Persist a collection's postings. Pending edits are folded first, so the file
+/// stays a plain base list and the on-disk format is unchanged.
 pub fn write_fts(
     data: &Path,
     name: &str,
-    idx: &FtsIndex,
+    idx: &mut FtsIndex,
     generation: u64,
     nrows: u64,
 ) -> Result<(), Error> {
@@ -211,18 +498,9 @@ pub fn write_fts(
     fs::create_dir_all(&dir).map_err(io_err)?;
     let path = fts_path(data, name);
     let tmp = path.with_extension("bin.tmp");
+    idx.fold_all();
     let body = idx.encode(generation, nrows);
-    let mut file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&tmp)
-        .map_err(io_err)?;
-    file.write_all(&body).map_err(io_err)?;
-    file.sync_all().map_err(io_err)?;
-    drop(file);
-    fs::rename(&tmp, &path).map_err(io_err)?;
-    Ok(())
+    crate::persist::write_through_tmp(&path, &tmp, &body)
 }
 
 pub fn read_fts(data: &Path, name: &str) -> Result<(u64, u64, FtsIndex), Error> {
@@ -235,26 +513,7 @@ pub fn read_fts(data: &Path, name: &str) -> Result<(u64, u64, FtsIndex), Error> 
 
 /// Drop stale fts files not listed in `keep`.
 pub fn prune_fts(data: &Path, keep: &[String]) -> Result<(), Error> {
-    let dir = fts_dir(data);
-    if !dir.exists() {
-        return Ok(());
-    }
-    for ent in fs::read_dir(&dir).map_err(io_err)? {
-        let ent = ent.map_err(io_err)?;
-        let path = ent.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("bin") {
-            continue;
-        }
-        let stem = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_string();
-        if !keep.iter().any(|k| k == &stem) {
-            let _ = fs::remove_file(&path);
-        }
-    }
-    Ok(())
+    crate::persist::prune_bins(&fts_dir(data), keep)
 }
 
 pub fn fts_fields(catalog: &crate::catalog::Catalog, collection: &str) -> Vec<String> {
@@ -289,5 +548,37 @@ mod tests {
         assert_eq!(decoded.fields, fields);
         assert_eq!(decoded.candidate_idxs("wal"), vec![0]);
         assert!(FtsIndex::decode(&encoded[..encoded.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn prune_drops_stale_blobs_and_half_written_temps() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("lin-prune-fts-{nanos:020}"));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(fts_dir(&dir)).unwrap();
+        let touch = |name: &str| {
+            fs::write(fts_dir(&dir).join(name), b"x").unwrap();
+        };
+        touch("docs.bin");
+        touch("gone.bin");
+        touch("docs.bin.tmp");
+        touch("gone.bin.tmp");
+        touch("notes.txt");
+
+        prune_fts(&dir, &[String::from("docs")]).unwrap();
+
+        let keep = |name: &str| fts_dir(&dir).join(name).exists();
+        assert!(keep("docs.bin"), "current blob survives");
+        assert!(!keep("gone.bin"), "dropped collection is pruned");
+        assert!(
+            !keep("docs.bin.tmp"),
+            "temps never survive: prune only runs under the exclusive fence"
+        );
+        assert!(!keep("gone.bin.tmp"));
+        assert!(keep("notes.txt"), "unrelated files left alone");
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

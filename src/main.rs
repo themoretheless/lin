@@ -646,7 +646,11 @@ fn cmd_follower(args: &[String], data: Option<PathBuf>) -> ExitCode {
             } else {
                 lin::ship::TlsClient::Off
             };
-            let pull = lin::ship::PullOpts { token, tls };
+            let pull = lin::ship::PullOpts {
+                token,
+                tls,
+                server_name: lin::ship::tls_server_name(&addr),
+            };
             loop {
                 match sync_once(&dir, &addr, &pull) {
                     Ok(()) => {}

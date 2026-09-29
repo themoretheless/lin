@@ -9,25 +9,34 @@ pub fn check(stmt: &Stmt, cat: &Catalog) -> Result<(), Error> {
     check_in(stmt, cat, &Bindings::new())
 }
 
-pub fn check_program(stmts: &[Stmt], cat: &mut Catalog) -> Result<Bindings, Error> {
+/// Typecheck a program against the live catalog.
+///
+/// Declarations are staged into a private copy, returned here so the caller can
+/// plan against it: a later statement must see the field or index an earlier one
+/// just created, but the live catalog only changes when the program executes.
+/// A program without a declaration — every read and every DML write — never
+/// copies it, which is what keeps a cold `prepare` from paying for one.
+pub fn check_program(stmts: &[Stmt], cat: &Catalog) -> Result<(Bindings, Option<Catalog>), Error> {
     let mut env = Bindings::new();
+    let mut staged: Option<Catalog> = None;
     for stmt in stmts {
-        check_in(stmt, cat, &env)?;
+        check_in(stmt, staged.as_ref().unwrap_or(cat), &env)?;
         if let Stmt::Decl(d) = stmt {
-            cat.apply_decl(d)?;
+            staged.get_or_insert_with(|| cat.clone()).apply_decl(d)?;
         }
         if let Stmt::Let { name, query } = stmt {
-            if cat.collection(name).is_some() || name == "catalog" {
+            let view = staged.as_ref().unwrap_or(cat);
+            if view.collection(name).is_some() || name == "catalog" {
                 return Err(Error::new(format!("cannot bind over collection: {name}")));
             }
             if env.contains(name) {
                 return Err(Error::new(format!("binding exists: {name}")));
             }
-            let scope = check_query(query, cat, &env)?;
+            let scope = check_query(query, view, &env)?;
             env.insert(name.clone(), scope);
         }
     }
-    Ok(env)
+    Ok((env, staged))
 }
 
 fn check_in(stmt: &Stmt, cat: &Catalog, env: &Bindings) -> Result<(), Error> {

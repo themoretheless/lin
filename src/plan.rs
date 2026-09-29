@@ -995,6 +995,7 @@ fn point_or_scan(collection: &str, pred: Option<&Pred>, cat: &Catalog) -> Node {
     }
     if let Some(p) = pred
         && let Some(uses) = crate::index::pick_index(cat, collection, p)
+        && !uses.is_empty()
     {
         let seek = node(
             NodeKind::IndexSeek {

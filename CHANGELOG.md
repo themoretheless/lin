@@ -9,6 +9,8 @@
   missing or stale blobs still rebuild.
 - **Ship:** protocol `LIN\x06` + shared token; optional rustls (`--tls-cert` /
   `--tls-key` / `--tls-ca`); one live sink. Loopback plaintext remains the local recipe.
+- `.filter(|u| u.coin.gt(300))` on `from_typed` (closure → `Pred`).
+  `.filter("coin > 300")` / `p!(coin > 300)` on untyped `from`.
 - Dapper/ADO verbs: `Db::execute` (`n`+`gen`), `Db::scalar` / `Queryable::scalar`,
   `first` / `first_or` / `single` (explicit `take 1`/`2`, not implicit 50),
   `BoundQueryable::cursor`, `buffered` alias for `to_vec`.

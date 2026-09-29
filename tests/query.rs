@@ -176,7 +176,7 @@ fn typed_cursor_join_and_first_or() {
     let none = db
         .from_typed::<DocTitle>()
         .unwrap()
-        .filter(pred::eq("id", "__no_such_doc__"))
+        .filter(|d| d.id.eq("__no_such_doc__"))
         .first_or_typed::<DocTitle>()
         .unwrap();
     assert!(none.is_none());
@@ -201,6 +201,79 @@ fn typed_cursor_join_and_first_or() {
     assert!(lines[0].email.contains('@'));
     assert!(!lines[0].id.is_empty());
     assert!(lines[0].total > 0.0);
+}
+
+#[test]
+fn filter_by_closure_is_pred() {
+    let mut db = Db::fixture();
+    let via_pred = db
+        .from_typed::<DocTitle>()
+        .unwrap()
+        .filter(|d| d.title.has("WAL"))
+        .take(5)
+        .to_vec_typed::<DocTitle>()
+        .unwrap();
+    let via_fn = db
+        .from_typed::<DocTitle>()
+        .unwrap()
+        .filter_by::<DocTitle>(|d| d.title.has("WAL"))
+        .take(5)
+        .to_vec_typed::<DocTitle>()
+        .unwrap();
+    assert_eq!(via_pred.len(), via_fn.len());
+
+    let owned = db
+        .from("docs")
+        .select(["id", "title", "hash", "ts"])
+        .take(3)
+        .to_vec_typed::<DocStamp>()
+        .unwrap();
+    assert!(!owned.is_empty());
+}
+
+#[test]
+fn filter_dialect_gt() {
+    let mut db = Db::fixture();
+    let via_pred = db
+        .from("orders")
+        .filter(pred::gt("total", 100.0))
+        .take_all()
+        .to_vec()
+        .unwrap();
+    let via_src = db
+        .from("orders")
+        .filter("total > 100")
+        .take_all()
+        .to_vec()
+        .unwrap();
+    let via_macro = db
+        .from("orders")
+        .filter(lin::p!(total > 100.0))
+        .take_all()
+        .to_vec()
+        .unwrap();
+    assert_eq!(via_pred.len(), via_src.len());
+    assert_eq!(via_pred.len(), via_macro.len());
+}
+
+#[test]
+fn filter_typed_lambda() {
+    let mut db = Db::fixture();
+    let via_fn = db
+        .from_typed::<DocTitle>()
+        .unwrap()
+        .filter(|d| d.title.has("WAL"))
+        .take(5)
+        .to_vec_typed::<DocTitle>()
+        .unwrap();
+    let via_src = db
+        .from("docs")
+        .select_row::<DocTitle>()
+        .filter("title has \"WAL\"")
+        .take(5)
+        .to_vec_typed::<DocTitle>()
+        .unwrap();
+    assert_eq!(via_src.len(), via_fn.len());
 }
 
 #[test]

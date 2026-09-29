@@ -26,13 +26,18 @@ let plan = Queryable::from("docs")
     .take(5)
     .explain(&mut db)?;
 
-let _one = db.from("docs").filter(pred::eq("wing", "rag")).select(["id"]).first()?;
+let _one = db.from("docs").filter("wing == \"rag\"").select(["id"]).first()?;
 let _hits: i64 = db.from("docs").count().scalar_as()?;
 
 #[derive(LinRow)]
 #[lin(collection = "docs")]
 struct DocTitle { id: String, title: String }
 let _page: Vec<DocTitle> = db.from_typed::<DocTitle>()?.take(5).to_vec_typed()?;
+let _wal = db
+    .from_typed::<DocTitle>()?
+    .filter(|d| d.title.has("WAL"))
+    .take(5)
+    .to_vec_typed()?;
 let mut cur = db.from_typed::<DocTitle>()?.take(5).cursor()?;
 let _ = cur.next_typed::<DocTitle>();
 
