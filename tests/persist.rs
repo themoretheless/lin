@@ -677,7 +677,7 @@ fn wal_export_apply_roundtrip() {
         assert_eq!(n, 1);
         assert_eq!(b.run(r#"docs | uri == "raw://w""#).unwrap().done.n, 1);
         // Durable primary apply refused.
-        let mut durable = Db::open(&tmp()).unwrap();
+        let mut durable = Db::open(tmp()).unwrap();
         assert!(durable.apply_wal(&frames).is_err());
         durable.close().unwrap();
     }

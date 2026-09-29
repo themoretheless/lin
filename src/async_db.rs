@@ -130,11 +130,9 @@ impl AsyncDb {
         typed_map_stream(spawn_cursor_or_run(read, CursorJob::Query(q.into_query())))
     }
 
-    pub fn reader(&self) -> impl std::future::Future<Output = AsyncReadDb> + '_ {
-        async move {
-            let mut g = self.inner.lock().await;
-            AsyncReadDb::new(g.reader())
-        }
+    pub async fn reader(&self) -> AsyncReadDb {
+        let mut g = self.inner.lock().await;
+        AsyncReadDb::new(g.reader())
     }
 }
 
