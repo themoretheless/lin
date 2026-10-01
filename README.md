@@ -160,7 +160,7 @@ unfilter docs
 
 Составной индекс: порядок полей = leftmost prefix. `wing == "rag" and ts > ago 7d` по `[wing,ts]` — `IndexSeek index=docs[wing,ts]` (равенство слева + range на следующем). Только `wing ==` — тот же индекс. Только `ts >` — scan, leftmost не закрыт. `id ==` остаётся `Get`. `wing == "rag" or wing == "sys"` — несколько seek по индексу и объединение; если хоть одна ветка `or` не индексируется — scan.
 
-`has` — целое слово (граница токена). `~ "…"` — подстрока. `~ /…/i` — регулярка (литерал проверяется при компиляции). `ago 7d` = `now - 7d` (единица обязательна).
+`has` — целое слово (граница токена). `~ "…"` — подстрока. `~ /…/i` — регулярка (литерал проверяется при компиляции). `ago 7d` = `now - 7d` (единица обязательна). `timestamp(1700000000123)` — абсолютное Unix-время в миллисекундах, тип `time`; принимает знаковое i64, включая даты до эпохи.
 
 Запись — отдельный statement, не хвост пайпа. Неизвестный столбец, hop без `rel`, join без `fk`, `update` без `cas` — ошибка компиляции.
 
@@ -257,6 +257,25 @@ Lin-only diagnostics:
 
 Таргетированный `thorough` прогон 2026-09-17 (один процесс, локальная машина): FTS common top-20 `568 → 182 µs`; insert 10k full `27.38 → 20.47 ms`; compact scan/project `1.68 → 0.90 ms`; compact SoA join cursor `1.70 → 0.48 ms`; hot reopen 5k `158.6 → 82.0 ms`; 16 уникальных Full commits `5.05 ms` sequential против `0.83 ms` grouped. Это benchmark evidence, не переносимый SLA.
 
+### Расширенное сравнение и контракт
+
+[`docs/benchmark-contract.md`](docs/benchmark-contract.md) фиксирует условия измерений.
+`scripts/bench-peers.py` сравнивает проверяемые результаты Lin с SQLite, DuckDB,
+PostgreSQL, MySQL, MongoDB, SQL Server, Kusto и pandas. Недоступные движки дают
+неполный отчёт и ненулевой exit code; `--require-wins` дополнительно проверяет
+победу Lin в каждом измеренном сценарии. Rust row API и Python driver/DataFrame
+API измеряются отдельно от существующего native Rust harness.
+
+```sh
+python3 -m venv .bench-venv
+.bench-venv/bin/python -m pip install -r scripts/bench-peers-requirements.lock
+cargo build --release --example peer_bench
+.bench-venv/bin/python scripts/bench-peers.py --engines lin sqlite duckdb postgres mysql mongo pandas --repeats 3 --require-wins --output .airbug-bench/peers
+```
+
+Update/delete: подготовка вне таймера, read-back validation, 1k/10k/100k строк.
+`--max-iterations 1 --warmup-ms 0` ограничивает дорогие fresh-input прогоны.
+
 ### Postgres / MySQL
 
 Без сервера кейсы пропускаются (Lin/SQLite/DuckDB всё равно бегут). URL: `LIN_BENCH_PG_URL` / `LIN_BENCH_MYSQL_URL`, иначе авто-probe локальных портов.
@@ -324,7 +343,7 @@ lin --data .lin2 stats
   LOCK       advisory flock (writer exclusive / open_read shared)
   head       JSON: gen, catalog_hash, embed_id
   log        append-only WAL (compacted on checkpoint):
-             `LIN\x02` raw columnar / `LIN\x01` MessagePack / legacy JSON
+             `LIN\x06` CRC32 envelope (columnar / MessagePack); reads `LIN\x02` / `LIN\x01` / legacy JSON
   snapshot   `LIN\x04` MessagePack(Snapshot), self-contained (legacy JSON reads)
   fts/       posting lists (`LIN\x05`) per FTS collection; rebuild if missing/stale
   cold/      optional mmap cache of large collections (rows also inlined in snapshot)
@@ -352,3 +371,265 @@ lin explain --graph dot 'docs | search "wal"' | dot -Tsvg > plan.svg
 ```
 
 Узлы — IR плана, рёбра — поток данных. Цвет/форма по эффекту: Read (синий), Append/запись (оранжевый), Reduce (фиолетовый).
+
+Новые WAL-фреймы используют `LIN\x06` с CRC32 по codec/payload. Чтение прежних форматов сохранено; старые бинарники/replication followers не читают новый envelope и должны обновляться вместе с writer. Snapshot и backup остаются `LIN\x04`. Codec 3 внутри `LIN\x06` компактно записывает разреженные embedding-векторы с точным сохранением битов, включая `-0.0` и NaN. Плотные/малые векторы сохраняют codec 2. Перед использованием codec 3 обновите все readers/followers; прежние форматы продолжают читаться. Размер кадра по-прежнему ограничен 16 MiB, сумма декодированных sparse-векторов и их контейнеров — 64 MiB.
+
+## Experimental GPU compute
+
+Покрытие API, операции и результаты проверки: [compute support](docs/compute-support.md).
+
+`cargo run --release --features gpu --example gpu_check` проверяет настоящий
+GPU: cosine против CPU, vec/hybrid и reader; печатает адаптер, погрешность и
+время с передачей данных. Программный адаптер отвергается.
+
+```rust,ignore
+let gpu = std::sync::Arc::new(lin::gpu::GpuCompute::new()?);
+let mut db = lin::Db::fixture().with_gpu(gpu);
+let rows = db.run("docs | search vec \"wal\" | take 20")?.rows;
+```
+
+Feature `gpu` включает wgpu, пользовательский WGSL compute API и шейдеры
+фильтрации, regex, агрегатов, joins, сортировки, поиска и обхода графа.
+GPU-бэкенд сохраняется в `Db::reader()`. Размер пакетов ограничен лимитами
+устройства. Инициализация и ошибки
+readback возвращаются явно; без `with_gpu` остаётся CPU. Это native API,
+блокирующий до завершения GPU; из async вызывается через существующий
+`spawn_blocking`.
+
+GPU накапливает в f32, CPU — в f64: почти равные scores могут поменять порядок
+или перейти порог 0.01. GPU принимает только конечные компоненты. Executor хранит последний корпус
+векторов на GPU, загружая его заново при смене embedding, их порядка или
+размерности запроса. Проверка Arc-владельцев корректна и при прямой мутации
+публичного Store; gen не служит единственным признаком изменения.
+Упаковка и загрузка входят в первый запрос; следующие передают query и scores.
+Это полный cosine scan, ANN-индекса пока нет; ускорение не гарантируется. Парсер, hashing embedder, FTS postings,
+WAL и storage пока выполняются на CPU.
+
+### Пользовательские compute-шейдеры
+
+`lin::gpu::GpuCompute` также предоставляет общий native compute API:
+`compile_wgsl(source, entry)`, `storage_buffer(bytes)`,
+`dispatch(kernel, bind_groups, [x, y, z])`, `read_buffer(buffer)`.
+Каждый dispatch оставляет ресурсы на GPU: несколько шейдеров можно выполнять
+последовательно, считывая только окончательный результат.
+`ComputeKernel::bind_group_layout` возвращает отражённый layout.
+`gpu::native` экспортирует используемую версию wgpu; `device()` / `queue()`
+дают доступ к uniform/storage buffers, textures, samplers, явным layouts,
+command encoders и другим native ресурсам. `checked` преобразует ошибки
+валидации и выделения памяти в `lin::Error`; операции внутри него нельзя
+вкладывать в другой `checked`. При прямом использовании native API управление
+валидацией и синхронизацией остаётся у вызывающего кода.
+
+Проверка пользовательских шейдеров и ошибок на реальном GPU:
+
+```bash
+cargo test --release --features gpu --test gpu -- --ignored --nocapture
+```
+
+Executor использует compute для числовых/текстовых/regex фильтров, boolean
+масок, count, sum, joins, stable sort, lexical/vector/hybrid scoring и ranking,
+hop/graph/match. Подготовка строк, Unicode metadata, dictionaries, проекции,
+skip/take/union и сборка результата выполняются на CPU. Query pipelines ещё
+не объединены в один полностью резидентный GPU-план.
+
+`GpuCompute::with_options(GpuOptions)` задаёт backend, power preference,
+optional features и limits; неподдерживаемые требования возвращают ошибку.
+Для повторных запросов `upload_vectors(dim, vectors)` создаёт `GpuVectors`,
+а `cosine_resident(query, &mut corpus)` передаёт только запрос и считывает
+scores. Корпус привязан к устройству; `&mut` предотвращает одновременные записи
+в его result buffers. Executor автоматически использует этот кеш;
+`Db::gpu_cache_stats()` / `ReadDb::gpu_cache_stats()` показывают uploads/hits.
+Каждый снимок получает отдельный кеш. `Db::enable_gpu` подключает устройство
+к уже открытому Db; `Db::gpu()` / `ReadDb::gpu()` возвращают backend для
+пользовательских compute pipelines.
+
+CLI:
+
+```bash
+cargo run --release --features gpu -- run --gpu 'docs | search vec "wal" | take 5'
+```
+
+Без feature `gpu` флаг возвращает явную ошибку. Для durable Db используйте
+обычный `--data <dir>` перед `run`; GPU-кеш не сохраняется в WAL или snapshot.
+
+
+Числовые `==`, `!=`, `>`, `<`, `>=`, `<=` и комбинации `and` / `or`
+исполняются compute-шейдерами при подключённом GPU, включая `run_batch`,
+ReadDb и запросы с `count`. Сравнения f64 выполняются через упорядоченные
+64-битные ключи (две компоненты u32), без округления до f32; i64 equality
+сохраняет точность выше 2^53. NaN, infinity, signed zero и отсутствующие
+значения сохраняют CPU-семантику. Извлечение значений, упаковка ключей,
+проекция остаются на CPU; count вычисляется отдельным шейдером. Для числового GPU-фильтра
+executor использует общий scan, обходя CPU-оптимизации index/count/project;
+ускорение относительно индекса не обещается. Смешанные числовые/текстовые предикаты также используют GPU. `GpuCompute::comparison_dispatches()`
+показывает фактическое число отправленных числовых dispatch.
+
+
+Текстовые equality/inequality, подстрока `~`, `has` и `has` с игнорированием
+регистра теперь выполняются шейдером. UTF-8 байты, Unicode-границы слов и
+посимвольный lowercase подготавливаются на CPU по тем же правилам Rust,
+что исходный executor. Пустые строки и Null сохраняют прежнюю семантику.
+Regex также вычисляется GPU NFA-интерпретатором; в смешанном предикате
+маски объединяются шейдером boolean. Текст разбивается на пакеты по лимитам
+устройства; строка или needle сверх лимита возвращают Error.
+
+`count` и `count by` считают на GPU через atomic counters. Групповые ключи
+и их ID готовятся на CPU; каждый пакет возвращает u32 counters, накопленные
+в i64 без потери точности. Порядок и представление групп сохраняют CPU API.
+`text_dispatches()` / `count_dispatches()` показывают реальные dispatch.
+
+`sum field by group` складывает на GPU в исходном порядке строк каждой группы.
+WGSL реализует IEEE-754 binary64 через пары u32, поэтому native f64 не требуется,
+включая Metal. Сохраняются округление ties-to-even, signed zero, subnormal,
+overflow и infinity; NaN возвращается как canonical quiet NaN (payload не сохраняется).
+Конечные результаты проверены побитово против CPU, включая границы пакетов.
+Dictionary групп и преобразование Cell в f64 выполняются на CPU по прежним правилам.
+Накопитель остаётся на GPU между пакетами; `sum_dispatches()` считает dispatch.
+Один invocation последовательно складывает свою группу и просматривает пакет;
+это обеспечивает порядок CPU, но не гарантирует ускорение. Размер пакета до 4096 строк;
+число групп ограничено буферами и dispatch-лимитами устройства.
+Lazy cursors для collection с цепочкой `filter` / `join` / `project` / `skip` / `take`
+выполняют поддержанные фильтры и joins на GPU. ID-join читает до 1024 исходных
+строк за порцию. При неуникальном FK берётся одна исходная строка за порцию;
+она может дать много правых совпадений, которые хранятся до выдачи результатов.
+Несколько неуникальных joins могут дополнительно увеличить эту порцию результата.
+Открытие курсора не запускает compute; порядок операций сохраняется,
+`take` останавливает чтение, ошибки последующих порций возвращаются при чтении.
+`next_projected()` сохраняет общую схему полей. Проекции собираются на CPU.
+Lazy lex/hybrid search использует GPU matching/scoring; `run`, `run_batch`
+и buffered queries используют перечисленные GPU-операции.
+
+
+`join` / `join left` теперь используют GPU для сопоставления FK-ключей в
+`run`, `run_batch`, ReadDb и ленивых курсорах. Ключи кодируются в dictionary IDs на CPU;
+отсутствующий ключ получает ID 0 и не совпадает ни с одной строкой.
+Для FK на `id` GPU строит lookup через atomicMax, затем выполняет probe;
+последний дубликат правой строки выигрывает, как в CPU hash path.
+Для неуникальных ключей возвращаются все правые строки в исходном порядке.
+Этот путь сопоставляет ключи блоками (O(left × right)); большие ID dictionaries
+также используют его, если плотная таблица не помещается в лимит буфера.
+Поэтому GPU не гарантирует ускорение относительно CPU hash join.
+Сборка итоговых Row и проекция пока выполняются на CPU.
+`join_dispatches()` показывает реально отправленные build/probe/matching.
+Схема `run_batch` после последней проекции сохраняет порядок колонок
+и при пустом результате, включая общий fallback path.
+
+
+`sort` теперь использует стабильный GPU merge sort: каждый проход выполняет
+параллельный binary-search merge над GPU-индексами, без промежуточных readback.
+Null, UTF-8 text, bool, vector compact labels, числа и time используют тот же
+порядок, что CPU. Числа сортируются по 64-битным ключам, без округления в f32;
+signed zero и равные ключи сохраняют исходный порядок в обоих направлениях.
+NaN теперь определённо идёт после остальных чисел при ascending (перед ними
+при descending); все NaN равны для сортировки. CPU comparator использует ту
+же политику, устраняя прежний нетранзитивный порядок NaN.
+CPU подготавливает ключи и переставляет Row по окончательным GPU-индексам.
+Ключи/текст/индексы должны помещаться в лимиты буферов и dispatch; превышение
+возвращает Error. Ускорение относительно CPU sort пока не измерено.
+`sort_dispatches()` показывает число реально отправленных merge passes.
+
+`hop`, `graph`, lazy hop и `match` используют резидентные compute-обходы,
+описанные ниже. CPU кодирует ключи и собирает Row; `graph_dispatches()` показывает
+отправки BFS/DFS. Reverse relations и обратные match hops сохраняют прежнюю семантику.
+Lazy hop depth=1 выполняет фильтрацию исходных строк и обход при open;
+resolve индексов и выдача строк происходят на CPU. Покрывающий индекс может
+устранить исходный фильтрационный dispatch. Ускорение обходов не измерено.
+
+Лексический поиск передаёт проверки подстрок и целых слов в compute-шейдеры,
+в том числе для FTS-кандидатов и lazy lex/hybrid cursors. CPU готовит строку
+`title + body + snippet`, применяет Rust lowercase и разбивает query по whitespace.
+Веса остаются прежними: +1 за substring токена, +2 за целое слово, +3 за всю phrase.
+Повторные токены считаются повторно; punctuation-токен не получает бонус целого слова.
+Накопление целочисленных весов выполняется GPU-шейдером в резидентном буфере
+из двух u32 на score; перенос между младшим и старшим словом сохраняет i64 точность.
+`weight_dispatches()` показывает эти отправки. Лексическое ранжирование и top-k используют стабильную GPU-сортировку scores;
+RRF также использует GPU reciprocal, binary64 aggregation и sorting;
+векторная часть hybrid использует существующий GPU cosine. `text_dispatches()`
+подтверждает реальное сопоставление шейдером. Ошибки лимитов/readback возвращаются
+через Result, в lazy search — при построении ранжированных индексов на open.
+Ускорение относительно CPU lexical scoring не измерено.
+
+Лексический score-аккумулятор сохраняется на GPU между токенами и phrase.
+Маски текстового matching передаются аккумулятору прямо в GPU-буферах без
+промежуточного readback. Текстовые порции и score-порции могут иметь разные границы:
+compute добавляет веса только в соответствующее пересечение диапазонов.
+Буферы накопителя разбиваются по storage/dispatch-лимитам; окончательные scores
+читаются после всех весов. Переполнение диапазона i64 возвращает Error.
+
+Лексический поиск ранжирует scores стабильным GPU merge sort по точным i64-ключам,
+без преобразования в f64; равные scores сохраняют порядок исходных строк.
+Для FTS сохраняется порядок `score desc, row index asc`. Top-k выбирается из
+GPU-отсортированного списка, вместо CPU heap. Это полная сортировка кандидатов,
+а не отдельный GPU partial-selection алгоритм; действуют лимиты буферов сортировки.
+`sort_dispatches()` подтверждает ранжирование, в том числе при открытии lazy search.
+Фильтрация нулевых scores, выбор префикса индексов и сборка Row остаются на CPU.
+
+Hybrid reciprocal rank fusion теперь вычисляется compute-шейдером: denominator
+`61 + rank` передаётся как u32, GPU выполняет корректно округлённое `1 / denominator`
+и последовательно складывает binary64-веса каждой identity. Native f64 не требуется;
+используется длинное целочисленное деление и та же software binary64 addition,
+что в `sum`. Проверены побитовые результаты против CPU, включая большие denominators,
+повторные identities и границы пакетов. `rrf_dispatches()` показывает отправки.
+Итоговый список сортируется GPU с прежними tie-breaks: source index для FTS,
+identity string для residual rows. Identity dictionary и сборка Row выполняются на CPU.
+Rank должен помещаться в u32 вместе с 61; лимиты групп/сортировки возвращают Error.
+Ускорение не измерено; накопление группы последовательно просматривает пакет.
+
+Regex predicates используют Thompson NFA из regex-automata: переходы по байтам,
+alternation, repetitions, epsilon closure и поиск совпадения выполняются WGSL
+compute-интерпретатором. Captures не нужны для boolean `is_match`; greediness
+не меняет существование совпадения. Unicode-классы компилируются в байтовый NFA,
+а look assertions (anchors, CRLF, ASCII/Unicode word boundaries) готовятся на CPU
+тем же LookMatcher, что Rust regex. Empty matches разрешены только на UTF-8 границах;
+Null всегда false. RegexBuilder проверяет прежнюю семантику flags/invalid patterns:
+внешний `i` включает ignore-case, некорректный regex возвращает false.
+`regex_dispatches()` показывает реальные NFA dispatch. Pure/mixed regex, `run_batch`,
+ReadDb и GPU lazy cursors используют этот путь. Program, scratch и text ограничены
+лимитами GPU; превышение возвращает Error без CPU matching fallback.
+Каждый invocation последовательно симулирует NFA одной строки; scratch выделяется
+порциями по лимитам. Скорость относительно Rust regex не измерена.
+
+`hop` и `graph` в обычных/batch/ReadDb запросах теперь управляют BFS в compute:
+frontier, seen nodes, reached nodes и seen edge identities хранятся на GPU.
+Один invocation последовательно сканирует рёбра в исходном порядке на каждом уровне,
+с прежними правилами cycles, dedup и предела 300 результатов. Для hop ограничение
+проверяется после уровня, для graph — после каждого emitted edge, как на CPU.
+CPU готовит dictionaries и resolves достигнутые ключи в Row. Рёбра и состояние
+полного walk должны помещаться в storage buffers; превышение возвращает Error.
+Это резидентный последовательный GPU walk, не параллельный BFS; ускорение не измерено.
+Lazy hop depth=1 разделяет резидентный walk обычного hop: CPU не обновляет
+frontier/seen после отправки. Итоговые ключи превращаются в индексы строк;
+курсор остаётся lazy для выдачи Row/ProjectedRow и применяет skip/take при чтении.
+
+`match` теперь выполняет DFS каждого start key на GPU: стек кадров и ancestor path
+хранятся в storage buffer, cycles исключаются шейдером, LIFO-порядок сканирования
+и повторные пути сохраняются. Глубина 1..3 соответствует compiler check.
+CPU готовит presence table разрешимых узлов, позволяя GPU пропускать emission
+неразрешимых узлов и продолжать их обход. Каждая expansion получает остаток
+лимита 300; итоговые node/edge indices разрешаются в aliases и Row на CPU.
+Последовательность hops и input rows оркестрирует CPU, без CPU DFS/path sets.
+Stack/program/output сверх лимитов возвращают Error; native f64/features не нужны.
+Это последовательный GPU DFS, ускорение относительно CPU не измерено.
+
+Если `hop` разрешает соседей одновременно в `docs` и исходной коллекции,
+курсор использует buffered result: его lazy index source адресует только одну
+коллекцию. Сам обход остаётся compute-операцией; строки и их порядок совпадают
+с обычным `run`, включая ReadDb.
+
+Векторный поиск сортирует оценки cosine через тот же stable compute merge sort,
+что и `sort`; равные оценки сохраняют порядок исходных строк. Этот путь общий
+для `search vec` и векторной части hybrid, включая ReadDb. CPU готовит ключи
+и собирает строки по возвращённым GPU индексам. Hardware-проверка отдельно
+проверяет рост `sort_dispatches()` при выполнении поиска.
+
+Для reflected layouts с обработкой неверного индекса используйте
+`gpu.bind_group_layout(&kernel, index) -> Result<BindGroupLayout, Error>`.
+Метод `kernel.bind_group_layout(index)` сохраняет native wgpu API и должен
+вызываться с корректным индексом или внутри `gpu.checked(...)`.
+
+`cargo test --features gpu --test shaders` проверяет все WGSL-файлы в
+`src/shaders` без адаптера: синтаксис, Naga validation и baseline capabilities.
+Workflow `.github/workflows/compute.yml` добавляет эту проверку, сборку native
+API/примеров и сборку без GPU для Linux/macOS/Windows. Hardware-тесты запускаются
+отдельно командой `cargo test --release --features gpu --test gpu -- --ignored`;
+обычный CI не является доказательством исполнения на физическом GPU.

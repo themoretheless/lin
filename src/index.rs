@@ -14,13 +14,16 @@ pub enum IndexPart {
     Null,
     Bool(bool),
     Int(i64),
+    /// Ordered f64 bucket, with an exact integer tie-breaker. The tie-breaker
+    /// preserves distinct large integer keys for unique indexes.
+    Num(u64, i128),
     Time(i64),
     Text(Arc<str>),
     Max,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct IndexKey(pub Vec<IndexPart>);
+pub struct IndexKey(pub smallvec::SmallVec<[IndexPart; 2]>);
 
 /// Live secondary index: BTree over composite keys → row indices in the collection vec.
 #[derive(Debug, Clone)]
@@ -117,9 +120,10 @@ impl LiveIndex {
 
     fn bounds(&self, use_: &IndexUse, now: i64) -> (Bound<IndexKey>, Bound<IndexKey>) {
         let arity = self.def.fields.len();
-        let eqs: Vec<IndexPart> = use_.eqs.iter().map(|(_, v)| value_part(v, now)).collect();
-        let mut lo = eqs.clone();
-        let mut hi = eqs;
+        let eqs: smallvec::SmallVec<[IndexPart; 2]> =
+            use_.eqs.iter().map(|(_, v)| value_part(v, now)).collect();
+        let mut lo: smallvec::SmallVec<[IndexPart; 2]> = eqs.iter().map(numeric_low).collect();
+        let mut hi: smallvec::SmallVec<[IndexPart; 2]> = eqs.iter().map(numeric_high).collect();
         while lo.len() < arity {
             lo.push(IndexPart::Min);
         }
@@ -131,14 +135,36 @@ impl LiveIndex {
         {
             let p = value_part(val, now);
             match op {
-                CmpOp::Gt => lo[pos] = next_part(&p),
-                CmpOp::Ge => lo[pos] = p,
-                CmpOp::Lt => hi[pos] = p,
-                CmpOp::Le => hi[pos] = p,
+                CmpOp::Gt => {
+                    lo[pos] = numeric_high(&p);
+                    lo[pos + 1..].fill(IndexPart::Max);
+                }
+                CmpOp::Ge => lo[pos] = numeric_low(&p),
+                CmpOp::Lt => {
+                    hi[pos] = numeric_low(&p);
+                    hi[pos + 1..].fill(IndexPart::Min);
+                    // Null has no numeric value and must not enter a covered range.
+                    lo[pos] = match p {
+                        IndexPart::Num(_, _) => IndexPart::Num(0, i128::MIN),
+                        IndexPart::Time(_) => IndexPart::Time(i64::MIN),
+                        _ => lo[pos].clone(),
+                    };
+                }
+                CmpOp::Le => {
+                    hi[pos] = numeric_high(&p);
+                    lo[pos] = match p {
+                        IndexPart::Num(_, _) => IndexPart::Num(0, i128::MIN),
+                        IndexPart::Time(_) => IndexPart::Time(i64::MIN),
+                        _ => lo[pos].clone(),
+                    };
+                }
                 CmpOp::Eq | CmpOp::Ne => {}
             }
         }
-        let start = Bound::Included(IndexKey(lo));
+        let start = match &use_.range {
+            Some((_, CmpOp::Gt, _)) => Bound::Excluded(IndexKey(lo)),
+            _ => Bound::Included(IndexKey(lo)),
+        };
         let end = match &use_.range {
             Some((_, CmpOp::Lt, _)) => Bound::Excluded(IndexKey(hi)),
             _ => Bound::Included(IndexKey(hi)),
@@ -165,28 +191,45 @@ impl LiveIndex {
     }
 }
 
-fn next_part(p: &IndexPart) -> IndexPart {
+fn numeric_low(p: &IndexPart) -> IndexPart {
     match p {
-        IndexPart::Int(n) => IndexPart::Int(n.saturating_add(1)),
-        IndexPart::Time(n) => IndexPart::Time(n.saturating_add(1)),
-        IndexPart::Text(s) => {
-            let mut t = s.as_ref().to_owned();
-            t.push('\0');
-            IndexPart::Text(Arc::from(t))
-        }
-        IndexPart::Bool(false) => IndexPart::Bool(true),
-        other => other.clone(),
+        IndexPart::Num(bits, _) => IndexPart::Num(*bits, i128::MIN),
+        _ => p.clone(),
     }
+}
+
+fn numeric_high(p: &IndexPart) -> IndexPart {
+    match p {
+        IndexPart::Num(bits, _) => IndexPart::Num(*bits, i128::MAX),
+        _ => p.clone(),
+    }
+}
+
+fn numeric_part(n: f64, integer: Option<i64>) -> IndexPart {
+    if n.is_nan() {
+        return IndexPart::Null;
+    }
+    let n = if n == 0.0 { 0.0 } else { n };
+    let bits = n.to_bits();
+    let ordered = if bits >> 63 != 0 {
+        !bits
+    } else {
+        bits ^ (1 << 63)
+    };
+    let integer = integer.or_else(|| {
+        (n.fract() == 0.0 && n >= i64::MIN as f64 && n < -(i64::MIN as f64)).then_some(n as i64)
+    });
+    IndexPart::Num(ordered, integer.map(i128::from).unwrap_or(i128::MIN + 1))
 }
 
 fn cell_part(c: &Cell) -> IndexPart {
     match c {
         Cell::Null => IndexPart::Null,
         Cell::Bool(b) => IndexPart::Bool(*b),
-        Cell::Int(n) => IndexPart::Int(*n),
+        Cell::Int(n) => numeric_part(*n as f64, Some(*n)),
         Cell::Time(n) => IndexPart::Time(*n),
         Cell::Text(s) => IndexPart::Text(Arc::clone(s)),
-        Cell::Float(n) => IndexPart::Int(n.to_bits() as i64),
+        Cell::Float(n) => numeric_part(*n, None),
         Cell::Vec(_) => IndexPart::Null,
     }
 }
@@ -195,18 +238,19 @@ fn value_part(v: &Value, now: i64) -> IndexPart {
     match v {
         Value::String(s) => IndexPart::Text(Arc::from(s.as_str())),
         Value::Name(s) => IndexPart::Text(Arc::from(s.as_str())),
-        Value::Int(n) => IndexPart::Int(*n),
-        Value::Float(n) => IndexPart::Int(n.to_bits() as i64),
+        Value::Int(n) => numeric_part(*n as f64, Some(*n)),
+        Value::Float(n) => numeric_part(*n, None),
         Value::Bool(b) => IndexPart::Bool(*b),
+        Value::Timestamp(millis) => IndexPart::Time(*millis),
         Value::Now => IndexPart::Time(now),
         Value::NowMinus(d) => IndexPart::Time(now - d.as_millis()),
-        Value::Duration(d) => IndexPart::Int(d.as_millis()),
+        Value::Duration(d) => numeric_part(d.as_millis() as f64, Some(d.as_millis())),
     }
 }
 
 /// Pick one seek per DNF branch. `or` → union of seeks when every branch is indexable.
 pub fn pick_index(cat: &Catalog, collection: &str, pred: &Pred) -> Option<Vec<IndexUse>> {
-    let branches = dnf(pred);
+    let branches = dnf(pred)?;
     let mut uses = Vec::with_capacity(branches.len());
     for branch in &branches {
         uses.push(pick_conjunct(cat, collection, branch)?);
@@ -254,7 +298,9 @@ fn pick_conjunct(cat: &Catalog, collection: &str, pred: &Pred) -> Option<IndexUs
 
 /// True when every atomic predicate is enforced by the index seek(s) (no residual filter).
 pub fn index_covers_pred(pred: &Pred, uses: &[IndexUse]) -> bool {
-    let branches = dnf(pred);
+    let Some(branches) = dnf(pred) else {
+        return false;
+    };
     if branches.len() != uses.len() {
         return false;
     }
@@ -270,19 +316,30 @@ fn index_covers_conjunct(pred: &Pred, use_: &IndexUse) -> bool {
             Pred::Cmp {
                 field,
                 op: CmpOp::Eq,
-                ..
+                value,
             } => {
-                if !use_.eqs.iter().any(|(f, _)| f == &field.as_str()) {
+                // Equal f64 buckets can contain distinct large integer values.
+                // Recheck against the row's original cell in that precision range.
+                if matches!(value, Value::Int(n) if n.unsigned_abs() >= (1 << 53))
+                    || matches!(value, Value::Float(n) if !n.is_finite() || n.abs() >= (1u64 << 53) as f64)
+                {
+                    return false;
+                }
+                if !use_
+                    .eqs
+                    .iter()
+                    .any(|(f, v)| f == &field.as_str() && v == value)
+                {
                     return false;
                 }
             }
-            Pred::Cmp { field, op, .. }
+            Pred::Cmp { field, op, value }
                 if matches!(op, CmpOp::Gt | CmpOp::Lt | CmpOp::Ge | CmpOp::Le) =>
             {
-                let Some((rf, rop, _)) = &use_.range else {
+                let Some((rf, rop, rv)) = &use_.range else {
                     return false;
                 };
-                if rf != &field.as_str() || rop != op {
+                if rf != &field.as_str() || rop != op || rv != value {
                     return false;
                 }
             }
@@ -293,25 +350,51 @@ fn index_covers_conjunct(pred: &Pred, use_: &IndexUse) -> bool {
 }
 
 /// Disjunctive normal form: list of AND-trees (no top-level `or` inside a branch).
-fn dnf(pred: &Pred) -> Vec<Pred> {
+fn dnf(pred: &Pred) -> Option<Vec<Pred>> {
+    // Bound both input size and expansion. Falling back to a scan keeps the
+    // original predicate as a residual filter and preserves query semantics.
+    let mut pending = vec![pred];
+    let mut nodes = 0;
+    while let Some(p) = pending.pop() {
+        nodes += 1;
+        if nodes > 1024 {
+            return None;
+        }
+        if let Pred::And(a, b) | Pred::Or(a, b) = p {
+            pending.extend([a.as_ref(), b.as_ref()]);
+        }
+    }
+    dnf_bounded(pred)
+}
+
+fn dnf_bounded(pred: &Pred) -> Option<Vec<Pred>> {
+    const MAX_BRANCHES: usize = 256;
     match pred {
         Pred::Or(a, b) => {
-            let mut out = dnf(a);
-            out.extend(dnf(b));
-            out
+            let mut out = dnf_bounded(a)?;
+            let right = dnf_bounded(b)?;
+            if out.len().checked_add(right.len())? > MAX_BRANCHES {
+                return None;
+            }
+            out.extend(right);
+            Some(out)
         }
         Pred::And(a, b) => {
-            let left = dnf(a);
-            let right = dnf(b);
-            let mut out = Vec::with_capacity(left.len() * right.len());
+            let left = dnf_bounded(a)?;
+            let right = dnf_bounded(b)?;
+            let len = left.len().checked_mul(right.len())?;
+            if len > MAX_BRANCHES {
+                return None;
+            }
+            let mut out = Vec::with_capacity(len);
             for l in &left {
                 for r in &right {
                     out.push(Pred::And(Box::new(l.clone()), Box::new(r.clone())));
                 }
             }
-            out
+            Some(out)
         }
-        other => vec![other.clone()],
+        other => Some(vec![other.clone()]),
     }
 }
 
@@ -355,4 +438,56 @@ fn find_range<'a>(atoms: &[&'a Pred], field: &str) -> Option<(CmpOp, &'a Value)>
         }
     }
     None
+}
+
+#[cfg(test)]
+mod storage_tests {
+    use super::*;
+
+    #[test]
+    fn inline_and_spilled_keys_keep_lexicographic_order_and_reverse_updates() {
+        let variants = vec![
+            vec![],
+            vec![IndexPart::Null],
+            vec![IndexPart::Min],
+            vec![IndexPart::Text(Arc::from("é"))],
+            vec![IndexPart::Text(Arc::from("a")), IndexPart::Num(1, 2)],
+            vec![
+                IndexPart::Text(Arc::from("a")),
+                IndexPart::Num(1, 2),
+                IndexPart::Max,
+            ],
+        ];
+        for a in &variants {
+            for b in &variants {
+                let ka = IndexKey(a.iter().cloned().collect());
+                let kb = IndexKey(b.iter().cloned().collect());
+                assert_eq!(ka.cmp(&kb), a.cmp(b));
+                assert_eq!(ka.clone(), ka);
+            }
+        }
+        for arity in [1, 2, 3, 5] {
+            let fields = (0..arity).map(|n| format!("f{n}")).collect::<Vec<_>>();
+            let mut index = LiveIndex::new(IndexDef {
+                collection: "test".into(),
+                fields: fields.clone(),
+                unique: true,
+            });
+            let row = fields
+                .iter()
+                .enumerate()
+                .map(|(i, f)| (f.clone(), Cell::Int(i as i64)))
+                .collect::<Row>();
+            index.insert_at_new(7, &row).unwrap();
+            assert!(index.insert_at_new(8, &row).is_err());
+            let mut updated = row.clone();
+            updated.insert("f0".into(), Cell::Int(99));
+            index.insert_at(7, &updated).unwrap();
+            index.insert_at_new(8, &row).unwrap();
+            index.remove_at(7);
+            assert_eq!(index.forward.len(), 1);
+            assert_eq!(index.reverse.len(), 1);
+            assert_eq!(index.forward.get(&index.key_of(&row)), Some(&vec![8]));
+        }
+    }
 }

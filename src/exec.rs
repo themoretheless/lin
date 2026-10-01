@@ -27,12 +27,17 @@ pub use crate::persist::{OpenMemOpts as OpenOpts, SyncMode};
 
 type StmtOut = (Vec<Row>, Option<String>, Option<Pack>);
 
-struct PackCtx {
+struct PackCtx<'a> {
+    track_written: bool,
     snap: BTreeMap<(String, String), String>,
     written: BTreeSet<(String, String)>,
+    undo: &'a mut Undo,
 }
 
 fn mark_written(ctx: &mut PackCtx, collection: &str, rows: &[Row]) {
+    if !ctx.track_written {
+        return;
+    }
     for r in rows {
         if let Some(id) = row_text(r, "id") {
             ctx.written.insert((collection.to_string(), id.to_string()));
@@ -178,6 +183,10 @@ pub struct Db {
     follower: bool,
     /// Active embedder (`search vec` / hybrid / auto-embed on insert).
     embedder: Option<Arc<dyn Embedder>>,
+    #[cfg(feature = "gpu")]
+    gpu: Option<Arc<crate::gpu::GpuCompute>>,
+    #[cfg(feature = "gpu")]
+    gpu_cache: std::sync::Mutex<crate::gpu::SearchCache>,
 }
 
 /// Shared read-only snapshot of a [`Db`] at a fixed `gen`.
@@ -287,6 +296,10 @@ impl Db {
             pulled_wal: Vec::new(),
             follower: false,
             embedder: Some(embedder),
+            #[cfg(feature = "gpu")]
+            gpu: None,
+            #[cfg(feature = "gpu")]
+            gpu_cache: Default::default(),
         };
         db.store.rebuild_fts(&db.catalog);
         db
@@ -311,6 +324,44 @@ impl Db {
         self
     }
 
+    /// Enable experimental GPU cosine scoring. Initialization errors are explicit.
+    #[cfg(feature = "gpu")]
+    pub fn with_gpu(mut self, gpu: Arc<crate::gpu::GpuCompute>) -> Self {
+        self.gpu = Some(gpu);
+        self.gpu_cache = Default::default();
+        self
+    }
+
+    /// Attach a hardware compute backend to an existing database.
+    #[cfg(feature = "gpu")]
+    pub fn enable_gpu(&mut self, gpu: Arc<crate::gpu::GpuCompute>) {
+        self.gpu = Some(gpu);
+        self.gpu_cache = Default::default();
+    }
+
+    /// Release cached GPU data and return search to the CPU backend.
+    #[cfg(feature = "gpu")]
+    pub fn disable_gpu(&mut self) {
+        self.gpu = None;
+        self.gpu_cache = Default::default();
+    }
+
+    /// The attached backend, for custom compute pipelines and native resources.
+    #[cfg(feature = "gpu")]
+    pub fn gpu(&self) -> Option<&Arc<crate::gpu::GpuCompute>> {
+        self.gpu.as_ref()
+    }
+
+    /// Inspect uploads/reuse of the latest vector corpus (experimental GPU API).
+    #[cfg(feature = "gpu")]
+    pub fn gpu_cache_stats(&self) -> Result<crate::gpu::GpuCacheStats, Error> {
+        Ok(self
+            .gpu_cache
+            .lock()
+            .map_err(|_| Error::runtime("GPU cache lock poisoned"))?
+            .stats())
+    }
+
     /// Replace the active embedder. Updates `store.embed_id` / catalog to match.
     pub fn with_embedder(mut self, embedder: Arc<dyn Embedder>) -> Self {
         self.catalog.embed_id = embedder.id().to_string();
@@ -324,6 +375,10 @@ impl Db {
     /// Disable embedding (vec/hybrid degrade: vec empty, hybrid→lex only).
     pub fn without_embedder(mut self) -> Self {
         self.embedder = None;
+        #[cfg(feature = "gpu")]
+        {
+            self.gpu_cache = Default::default();
+        }
         self.plan_cache.clear();
         self.query_cache.clear();
         self
@@ -367,6 +422,10 @@ impl Db {
             pulled_wal: Vec::new(),
             follower: false,
             embedder: Some(embedder),
+            #[cfg(feature = "gpu")]
+            gpu: None,
+            #[cfg(feature = "gpu")]
+            gpu_cache: Default::default(),
         };
         db.reopen.total_ms = t0.elapsed().as_secs_f64() * 1000.0;
         Ok(db)
@@ -444,6 +503,10 @@ impl Db {
             pulled_wal: Vec::new(),
             follower: false,
             embedder: Some(embedder),
+            #[cfg(feature = "gpu")]
+            gpu: None,
+            #[cfg(feature = "gpu")]
+            gpu_cache: Default::default(),
         };
         inner.reopen.total_ms = t0.elapsed().as_secs_f64() * 1000.0;
         Ok(ReadDb {
@@ -500,6 +563,10 @@ impl Db {
                 pulled_wal: Vec::new(),
                 follower: false,
                 embedder: self.embedder.clone(),
+                #[cfg(feature = "gpu")]
+                gpu: self.gpu.clone(),
+                #[cfg(feature = "gpu")]
+                gpu_cache: Default::default(),
             }),
         }
     }
@@ -785,20 +852,27 @@ impl Db {
             ));
         }
         let t0 = Instant::now();
-        let undo = if !prepared.writes {
+        let mut undo = if !prepared.writes {
             Undo::None
         } else if prepared.append_only {
             Undo::Append(self.store.append_mark())
+        } else if prepared.stmts.iter().all(|s| {
+            matches!(
+                s,
+                Stmt::Update { .. } | Stmt::Delete { .. } | Stmt::Query(_) | Stmt::Let { .. }
+            )
+        }) {
+            Undo::Rows(Vec::new())
         } else {
             Undo::Full(self.store.mem_backup())
         };
-        let cat_backup = if (prepared.writes && !prepared.append_only) || prepared.schema {
+        let cat_backup = if matches!(undo, Undo::Full(_)) || prepared.schema {
             Some(self.catalog.clone())
         } else {
             None
         };
 
-        let (rows, message, pack) = match self.exec_program(&prepared.stmts) {
+        let (rows, message, pack) = match self.exec_program(&prepared.stmts, &mut undo) {
             Ok(v) => v,
             Err(e) => {
                 self.rollback(undo, cat_backup);
@@ -807,7 +881,10 @@ impl Db {
         };
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
         let n = if rows.is_empty() {
-            pack_affect_n(pack.as_ref()).unwrap_or(0)
+            match prepared.stmts.last() {
+                Some(Stmt::Insert { records, .. }) => records.len(),
+                _ => pack_affect_n(pack.as_ref()).unwrap_or(0),
+            }
         } else {
             rows.len()
         };
@@ -870,15 +947,24 @@ impl Db {
             let q = crate::catalog::with_catalog_filter(q, &self.catalog);
             let now = now_ms();
             let bindings = Default::default();
-            if let Some(batch) = self.try_filter_project_batch(&q, &bindings, now) {
+            if !self.uses_gpu_filter(&q)
+                && !self.uses_gpu_join(&q)
+                && let Some(batch) = self.try_filter_project_batch(&q, &bindings, now)
+            {
                 return Ok(batch);
             }
-            if let Some(batch) = self.try_join_project_batch(&q, &bindings, now) {
+            if !self.uses_gpu_filter(&q)
+                && !self.uses_gpu_join(&q)
+                && let Some(batch) = self.try_join_project_batch(&q, &bindings, now)
+            {
                 return Ok(batch);
             }
         }
         let h = self.run_prepared(prepared)?;
-        Ok(rows_to_rough_batch(&h.rows))
+        Ok(match prepared.stmts.as_slice() {
+            [Stmt::Query(q)] => rows_to_query_batch(&h.rows, q),
+            _ => rows_to_rough_batch(&h.rows),
+        })
     }
 
     pub fn run_batch(&mut self, src: &str) -> Result<RecordBatch, Error> {
@@ -952,6 +1038,18 @@ impl Db {
             Undo::None => {}
             Undo::Append(mark) => self.store.append_rollback(mark),
             Undo::Full(b) => self.store.mem_restore(b),
+            Undo::Rows(events) => {
+                for event in events.into_iter().rev() {
+                    match event {
+                        RowUndo::Update(collection, idx, row) => {
+                            self.store.restore_rows(&[(collection, idx, row)])
+                        }
+                        RowUndo::Delete(collection, positions, rows) => {
+                            self.store.restore_rows_at(&collection, &positions, &rows)
+                        }
+                    }
+                }
+            }
         }
         if let Some(cat) = cat_backup {
             self.catalog = cat;
@@ -1028,6 +1126,16 @@ impl Drop for Db {
 }
 
 impl ReadDb {
+    #[cfg(feature = "gpu")]
+    pub fn gpu_cache_stats(&self) -> Result<crate::gpu::GpuCacheStats, Error> {
+        self.inner.gpu_cache_stats()
+    }
+
+    #[cfg(feature = "gpu")]
+    pub fn gpu(&self) -> Option<&Arc<crate::gpu::GpuCompute>> {
+        self.inner.gpu()
+    }
+
     pub fn stats(&self) -> Stats {
         self.inner.stats()
     }
@@ -1084,15 +1192,24 @@ impl ReadDb {
             let q = crate::catalog::with_catalog_filter(q, &self.inner.catalog);
             let now = now_ms();
             let bindings = Default::default();
-            if let Some(batch) = self.inner.try_filter_project_batch(&q, &bindings, now) {
+            if !self.inner.uses_gpu_filter(&q)
+                && !self.inner.uses_gpu_join(&q)
+                && let Some(batch) = self.inner.try_filter_project_batch(&q, &bindings, now)
+            {
                 return Ok(batch);
             }
-            if let Some(batch) = self.inner.try_join_project_batch(&q, &bindings, now) {
+            if !self.inner.uses_gpu_filter(&q)
+                && !self.inner.uses_gpu_join(&q)
+                && let Some(batch) = self.inner.try_join_project_batch(&q, &bindings, now)
+            {
                 return Ok(batch);
             }
         }
         let h = self.run_prepared(prepared)?;
-        Ok(rows_to_rough_batch(&h.rows))
+        Ok(match prepared.stmts.as_slice() {
+            [Stmt::Query(q)] => rows_to_query_batch(&h.rows, q),
+            _ => rows_to_rough_batch(&h.rows),
+        })
     }
 
     pub fn run_batch(&self, src: &str) -> Result<RecordBatch, Error> {
@@ -1146,7 +1263,13 @@ impl ReadDb {
 }
 
 impl Db {
-    fn exec_program(&mut self, stmts: &[Stmt]) -> Result<StmtOut, Error> {
+    fn exec_program(&mut self, stmts: &[Stmt], undo: &mut Undo) -> Result<StmtOut, Error> {
+        // Materialize only mutated collections before snapshotting CAS hashes.
+        for stmt in stmts {
+            if let Stmt::Update { collection, .. } | Stmt::Delete { collection, .. } = stmt {
+                self.store.collection_mut(collection);
+            }
+        }
         let mut bindings: BTreeMap<String, Vec<Row>> = BTreeMap::new();
         let need_snap = stmts.iter().any(|s| {
             matches!(
@@ -1155,12 +1278,14 @@ impl Db {
             )
         });
         let mut ctx = PackCtx {
+            track_written: need_snap,
             snap: if need_snap {
                 self.hash_snapshot()
             } else {
                 BTreeMap::new()
             },
             written: BTreeSet::new(),
+            undo,
         };
         let mut last_rows = Vec::new();
         let mut last_msg = None;
@@ -1307,12 +1432,14 @@ impl Db {
                 records,
                 edges,
             } => {
+                let start = self.store.collection(collection).len();
                 let (rows, new_edges) = self.insert_bulk(collection, records, edges.as_slice())?;
-                mark_written(ctx, collection, &rows);
+                let inserted = &self.store.collection(collection)[start..];
+                mark_written(ctx, collection, inserted);
                 let pack = if self.is_durable() {
                     Some(crate::persist::rows_to_insert_cols(
                         collection.clone(),
-                        &rows,
+                        inserted,
                         new_edges,
                     ))
                 } else {
@@ -1513,38 +1640,47 @@ impl Db {
         let q = &q;
         let now = now_ms();
 
-        // Point Get short path: map lookup + optional project — no Scan/Filter pipeline.
-        if let Some(rows) = self.try_point_get(q) {
-            return Ok(rows);
-        }
+        let gpu_filter = self.uses_gpu_filter(q)
+            || self.uses_gpu_count(q)
+            || self.uses_gpu_join(q)
+            || self.uses_gpu_sort(q)
+            || self.uses_gpu_graph(q);
+        if !gpu_filter {
+            // Point Get short path: map lookup + optional project — no Scan/Filter pipeline.
+            if let Some(rows) = self.try_point_get(q) {
+                return Ok(rows);
+            }
 
-        // Filter → count: index-only or scan-without-clone (fair vs SQL COUNT(*)).
-        if let Some(rows) = self.try_filter_count(q, bindings, now) {
-            return Ok(rows);
-        }
+            // Filter → count: index-only or scan-without-clone (fair vs SQL COUNT(*)).
+            if let Some(rows) = self.try_filter_count(q, bindings, now) {
+                return Ok(rows);
+            }
 
-        // Filter → project → take: materialize projected rows without full BTreeMap clones.
-        if let Some(rows) = self.try_filter_project(q, bindings, now) {
-            return Ok(rows);
-        }
+            // Filter → project → take: materialize projected rows without full BTreeMap clones.
+            if let Some(rows) = self.try_filter_project(q, bindings, now) {
+                return Ok(rows);
+            }
 
-        // collection | search lex|hybrid | … — FTS postings, no full scan.
-        if let Some(rows) = self.try_fts_search(q, bindings)? {
-            return Ok(rows);
-        }
+            // collection | search lex|hybrid | … — FTS postings, no full scan.
+            if let Some(rows) = self.try_fts_search(q, bindings)? {
+                return Ok(rows);
+            }
 
-        // [filter?] | join | project | take — FK point-get, no full right scan / merge.
-        if let Some(rows) = self.try_join_project(q, bindings, now) {
-            return Ok(rows);
+            // [filter?] | join | project | take — FK point-get, no full right scan / merge.
+            if let Some(rows) = self.try_join_project(q, bindings, now) {
+                return Ok(rows);
+            }
         }
 
         let mut primary = check::collection_of(&q.source).to_string();
         let mut implicit_take = true;
         let mut saw_agg = false;
-        let first_filter = q.steps.iter().find_map(|s| match s {
-            Step::Filter(p) => Some(p),
+        // Only a leading filter can run against source rows. A filter after
+        // count/join/skip/project refers to that stage's output, not the source.
+        let first_filter = match q.steps.first() {
+            Some(Step::Filter(p)) if !gpu_filter => Some(p),
             _ => None,
-        });
+        };
         let project_fields_step = {
             let simple = q.steps.iter().all(|s| {
                 matches!(
@@ -1552,7 +1688,13 @@ impl Db {
                     Step::Filter(_) | Step::Project(_) | Step::Skip { .. } | Step::Take { .. }
                 )
             });
-            if simple {
+            let can_project_source = matches!(q.steps.first(), Some(Step::Filter(_)))
+                && matches!(q.steps.get(1), Some(Step::Project(_)))
+                && q.steps
+                    .iter()
+                    .skip(2)
+                    .all(|step| matches!(step, Step::Skip { .. } | Step::Take { .. }));
+            if simple && can_project_source {
                 q.steps.iter().find_map(|s| match s {
                     Step::Project(f) => Some(f.as_slice()),
                     _ => None,
@@ -1599,10 +1741,11 @@ impl Db {
                         skip_first_filter = false;
                         continue;
                     }
-                    if let Some((field, key)) = point_key(pred)
-                        && rows.len() != 1
-                    {
-                        rows = self.get_by(&primary, field, key);
+                    #[cfg(feature = "gpu")]
+                    if let Some(mask) = self.gpu_filter_mask(pred, &rows, now)? {
+                        let mut mask = mask.into_iter();
+                        rows.retain(|_| mask.next().expect("one GPU mask per row"));
+                        continue;
                     }
                     rows.retain(|r| eval_pred(pred, r, now));
                 }
@@ -1618,6 +1761,11 @@ impl Db {
                     collection,
                     on,
                 } => {
+                    #[cfg(feature = "gpu")]
+                    if self.gpu.is_some() {
+                        rows = self.gpu_join_rows(&primary, rows, collection, on, *left)?;
+                        continue;
+                    }
                     rows = self.join_rows(&primary, rows, collection, on, *left);
                 }
                 Step::Hop { rel, depth } => {
@@ -1636,6 +1784,12 @@ impl Db {
                 Step::Count { by } => {
                     implicit_take = false;
                     saw_agg = true;
+                    #[cfg(feature = "gpu")]
+                    if let Some(result) = self.gpu_count_rows(&rows, by.as_ref())? {
+                        rows = result;
+                        primary = String::new();
+                        continue;
+                    }
                     rows = match by {
                         Some(by) => agg_count(&rows, by),
                         None => vec![hits_row(rows.len() as i64)],
@@ -1645,10 +1799,31 @@ impl Db {
                 Step::Sum { field, by } => {
                     implicit_take = false;
                     saw_agg = true;
+                    #[cfg(feature = "gpu")]
+                    if let Some(result) = self.gpu_sum_rows(&rows, field, by)? {
+                        rows = result;
+                        primary = String::new();
+                        continue;
+                    }
                     rows = agg_sum(&rows, field, by);
                     primary = String::new();
                 }
                 Step::Sort { field, desc } => {
+                    #[cfg(feature = "gpu")]
+                    if let Some(gpu) = &self.gpu {
+                        let key = field.as_str();
+                        let cells: Vec<&Cell> = rows
+                            .iter()
+                            .map(|row| row.get(&key).unwrap_or(&Cell::Null))
+                            .collect();
+                        let indices = gpu.sort_indices(&cells, *desc)?;
+                        let mut source: Vec<Option<Row>> = rows.into_iter().map(Some).collect();
+                        rows = indices
+                            .into_iter()
+                            .map(|i| source[i].take().expect("GPU sort permutation"))
+                            .collect();
+                        continue;
+                    }
                     sort_rows(&mut rows, field, *desc);
                 }
                 Step::Skip { n } => {
@@ -1686,33 +1861,36 @@ impl Db {
         let name = match &q.source {
             Source::Collection(n) => n.as_str(),
             Source::Page(uri) => {
-                let fields = q.steps.iter().find_map(|s| match s {
-                    Step::Project(f) => Some(field_names(f)),
-                    _ => None,
-                });
-                let row = self
-                    .store
-                    .project_by_key("docs", "uri", uri, fields.as_deref())?;
-                // Only allow Filter/Project/Skip/Take after page get.
-                if q.steps.iter().any(|s| {
+                if q.steps.iter().any(|step| {
                     !matches!(
-                        s,
+                        step,
                         Step::Filter(_) | Step::Project(_) | Step::Skip { .. } | Step::Take { .. }
                     )
                 }) {
                     return None;
                 }
-                let mut rows = vec![row];
+                let mut rows: Vec<Row> = self
+                    .store
+                    .project_by_key("docs", "uri", uri, None)
+                    .into_iter()
+                    .collect();
+                let now = now_ms();
                 for step in &q.steps {
-                    if let Step::Filter(pred) = step {
-                        let now = now_ms();
-                        rows.retain(|r| eval_pred(pred, r, now));
+                    match step {
+                        Step::Filter(pred) => rows.retain(|row| eval_pred(pred, row, now)),
+                        Step::Project(fields) => rows = project(&rows, fields),
+                        Step::Skip { n } if *n > 0 => rows.clear(),
+                        Step::Take { n: Some(n) } if *n <= 0 => rows.clear(),
+                        _ => {}
                     }
                 }
                 return Some(rows);
             }
             _ => return None,
         };
+        if !matches!(q.steps.first(), Some(Step::Filter(_))) {
+            return None;
+        }
         let mut filter: Option<&Pred> = None;
         let mut fields: Option<Vec<String>> = None;
         for step in &q.steps {
@@ -1736,6 +1914,13 @@ impl Db {
         }
         let pred = filter?;
         let (field, key) = point_key(pred)?;
+        if q.steps.iter().any(|step| {
+            matches!(step, Step::Skip { n } if *n > 0)
+                || matches!(step, Step::Take { n: Some(n) } if *n <= 0)
+        }) {
+            return Some(Vec::new());
+        }
+
         let simple_eq = matches!(
             pred,
             Pred::Cmp {
@@ -1794,7 +1979,7 @@ impl Db {
         for step in &q.steps {
             match step {
                 Step::Search { mode: m, query: qq } => {
-                    if mode.is_some() {
+                    if mode.is_some() || proj.is_some() || skip_n > 0 || saw_take {
                         return Ok(None);
                     }
                     if !matches!(m, SearchMode::Lex | SearchMode::Hybrid) {
@@ -1804,6 +1989,9 @@ impl Db {
                     query = Some(qq.as_str());
                 }
                 Step::Skip { n } => {
+                    if mode.is_none() || saw_take {
+                        return Ok(None);
+                    }
                     skip_n = skip_n.saturating_add((*n).max(0) as usize);
                 }
                 Step::Take { n } => {
@@ -1864,12 +2052,22 @@ impl Db {
         rank_limit: Option<usize>,
     ) -> Result<Vec<Row>, Error> {
         match mode {
-            SearchMode::Lex => Ok(self.search_fts_lex(collection, query, rank_limit)),
+            SearchMode::Lex => self.search_fts_lex(collection, query, rank_limit),
             SearchMode::Hybrid => {
                 const RRF_K: f64 = 60.0;
                 let all = self.store.collection(collection);
-                let lex = self.search_fts_lex_indices(collection, query, None);
+                let lex = self.search_fts_lex_indices(collection, query, None)?;
                 let vec = self.vector_search_indices(all, query)?;
+                #[cfg(feature = "gpu")]
+                if let Some(gpu) = &self.gpu {
+                    let lex_keys: Vec<usize> = lex.iter().map(|&(_, i)| i).collect();
+                    let vec_keys: Vec<usize> = vec.iter().map(|&(_, i)| i).collect();
+                    let ranked = gpu_rrf_keys(gpu, &lex_keys, &vec_keys)?;
+                    return Ok(ranked
+                        .into_iter()
+                        .filter_map(|i| all.get(i).cloned())
+                        .collect());
+                }
                 let mut scores: FxHashMap<usize, f64> = FxHashMap::default();
                 for (rank, (_, i)) in lex.iter().enumerate() {
                     *scores.entry(*i).or_default() += 1.0 / (RRF_K + rank as f64 + 1.0);
@@ -1877,10 +2075,8 @@ impl Db {
                 for (rank, (_, i)) in vec.iter().enumerate() {
                     *scores.entry(*i).or_default() += 1.0 / (RRF_K + rank as f64 + 1.0);
                 }
-                let mut ranked: Vec<(f64, usize)> = scores
-                    .into_iter()
-                    .map(|(i, score)| (score, i))
-                    .collect();
+                let mut ranked: Vec<(f64, usize)> =
+                    scores.into_iter().map(|(i, score)| (score, i)).collect();
                 ranked.sort_by(|a, b| {
                     b.0.partial_cmp(&a.0)
                         .unwrap_or(std::cmp::Ordering::Equal)
@@ -1895,12 +2091,18 @@ impl Db {
         }
     }
 
-    fn search_fts_lex(&self, collection: &str, query: &str, rank_limit: Option<usize>) -> Vec<Row> {
+    fn search_fts_lex(
+        &self,
+        collection: &str,
+        query: &str,
+        rank_limit: Option<usize>,
+    ) -> Result<Vec<Row>, Error> {
         let col = self.store.collection(collection);
-        self.search_fts_lex_indices(collection, query, rank_limit)
+        Ok(self
+            .search_fts_lex_indices(collection, query, rank_limit)?
             .into_iter()
             .filter_map(|(_, i)| col.get(i).cloned())
-            .collect()
+            .collect())
     }
 
     fn search_fts_lex_indices(
@@ -1908,18 +2110,30 @@ impl Db {
         collection: &str,
         query: &str,
         rank_limit: Option<usize>,
-    ) -> Vec<(i64, usize)> {
+    ) -> Result<Vec<(i64, usize)>, Error> {
         if rank_limit == Some(0) {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let fts = self
             .store
             .fts
             .get(collection)
             .expect("checked FTS collection");
-        let idxs = fts.candidate_idxs(query);
+        let mut idxs = fts.candidate_idxs(query);
         let col = self.store.collection(collection);
         let query = LexQuery::new(query);
+        idxs.retain(|&i| col.get(i).is_some());
+        let gpu_scores = self.gpu_lex_scores(idxs.iter().map(|&i| &col[i]), &query)?;
+        #[cfg(feature = "gpu")]
+        if let Some(scores) = &gpu_scores {
+            let positions = self.gpu.as_ref().expect("GPU scores").rank_i64(scores)?;
+            return Ok(positions
+                .into_iter()
+                .filter(|&position| scores[position] > 0)
+                .take(rank_limit.unwrap_or(usize::MAX))
+                .map(|position| (scores[position], idxs[position]))
+                .collect());
+        }
 
         let mut scored = match rank_limit {
             Some(k) => {
@@ -1928,9 +2142,12 @@ impl Db {
                 // old stable ordering (score desc, source row index asc).
                 let mut heap: BinaryHeap<(Reverse<i64>, usize)> =
                     BinaryHeap::with_capacity(k.saturating_add(1));
-                for i in idxs {
+                for (position, i) in idxs.into_iter().enumerate() {
                     let Some(row) = col.get(i) else { continue };
-                    let score = lex_score_prepared(row, &query);
+                    let score = gpu_scores.as_ref().map_or_else(
+                        || lex_score_prepared(row, &query),
+                        |scores| scores[position],
+                    );
                     if score == 0 {
                         continue;
                     }
@@ -1945,39 +2162,79 @@ impl Db {
             }
             None => idxs
                 .into_iter()
-                .filter_map(|i| {
+                .enumerate()
+                .filter_map(|(position, i)| {
                     let row = col.get(i)?;
-                    let score = lex_score_prepared(row, &query);
+                    let score = gpu_scores.as_ref().map_or_else(
+                        || lex_score_prepared(row, &query),
+                        |scores| scores[position],
+                    );
                     (score > 0).then_some((score, i))
                 })
                 .collect(),
         };
         scored.sort_unstable_by(|(sa, ia), (sb, ib)| sb.cmp(sa).then_with(|| ia.cmp(ib)));
-        scored
+        Ok(scored)
     }
 
-    fn vector_search_indices(
-        &self,
-        rows: &[Row],
-        query: &str,
-    ) -> Result<Vec<(f64, usize)>, Error> {
+    fn vector_search_indices(&self, rows: &[Row], query: &str) -> Result<Vec<(f64, usize)>, Error> {
         let Some(emb) = self.embedder.as_ref() else {
             return Ok(Vec::new());
         };
         let qv = emb.embed(query);
-        let mut scored = rows
+        let vectors: Vec<(usize, &[f32])> = rows
             .iter()
             .enumerate()
-            .filter_map(|(i, r)| {
-                let v = r.get("embedding").and_then(Cell::as_vec)?;
-                let score = embed::cosine(qv.as_ref(), v);
-                (score > 0.01).then_some((score, i))
+            .filter_map(|(i, r)| Some((i, r.get("embedding")?.as_vec()?)))
+            .collect();
+        #[cfg(feature = "gpu")]
+        let gpu_scores = self
+            .gpu
+            .as_ref()
+            .map(|gpu| {
+                let shared: Vec<Arc<[f32]>> = rows
+                    .iter()
+                    .filter_map(|r| match r.get("embedding") {
+                        Some(Cell::Vec(v)) => Some(v.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                self.gpu_cache
+                    .lock()
+                    .map_err(|_| Error::runtime("GPU cache lock poisoned"))?
+                    .score(gpu, &qv, &shared)
+            })
+            .transpose()?;
+        let mut scored = vectors
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, (i, v))| {
+                #[cfg(feature = "gpu")]
+                let score = gpu_scores
+                    .as_ref()
+                    .map_or_else(|| embed::cosine(&qv, v), |s| s[slot] as f64);
+                #[cfg(not(feature = "gpu"))]
+                let score = {
+                    let _ = slot;
+                    embed::cosine(&qv, v)
+                };
+                (score > 0.01).then_some((score, *i))
             })
             .collect::<Vec<_>>();
-        scored.sort_by(|a, b| {
-            b.0.partial_cmp(&a.0)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        #[cfg(feature = "gpu")]
+        if let Some(gpu) = &self.gpu {
+            let keys: Vec<Cell> = scored
+                .iter()
+                .map(|(score, _)| Cell::Float(*score))
+                .collect();
+            let references: Vec<&Cell> = keys.iter().collect();
+            return Ok(gpu
+                .sort_indices(&references, true)?
+                .into_iter()
+                .map(|index| scored[index])
+                .collect());
+        }
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         Ok(scored)
     }
 
@@ -2113,7 +2370,20 @@ impl Db {
         let mut fields: Option<&[Field]> = None;
         let mut explicit_take: Option<Option<i64>> = None;
         let mut skip_n: usize = 0;
+        // This shortcut combines stages; only accept their canonical order.
+        let mut phase = 0;
         for step in &q.steps {
+            let next_phase = match step {
+                Step::Filter(_) => 0,
+                Step::Project(_) => 1,
+                Step::Skip { .. } => 2,
+                Step::Take { .. } => 3,
+                _ => return None,
+            };
+            if next_phase < phase || (next_phase == 3 && explicit_take.is_some()) {
+                return None;
+            }
+            phase = next_phase;
             match step {
                 Step::Filter(p) => {
                     if filter.is_some() {
@@ -2218,7 +2488,20 @@ impl Db {
         let mut explicit_take: Option<Option<i64>> = None;
         let mut skip_n: usize = 0;
 
+        // This shortcut combines stages; only accept their canonical order.
+        let mut phase = 0;
         for step in &q.steps {
+            let next_phase = match step {
+                Step::Filter(_) => 0,
+                Step::Project(_) => 1,
+                Step::Skip { .. } => 2,
+                Step::Take { .. } => 3,
+                _ => return None,
+            };
+            if next_phase < phase || (next_phase == 3 && explicit_take.is_some()) {
+                return None;
+            }
+            phase = next_phase;
             match step {
                 Step::Filter(p) => {
                     if filter.is_some() || fields.is_some() {
@@ -2761,13 +3044,6 @@ impl Db {
         rows
     }
 
-    fn get_by(&self, collection: &str, field: &str, key: &str) -> Vec<Row> {
-        self.store
-            .project_by_key(collection, field, key, None)
-            .into_iter()
-            .collect()
-    }
-
     fn join_rows(
         &self,
         left_col: &str,
@@ -2841,6 +3117,10 @@ impl Db {
             Some(r) if let Some(of) = &r.reverse_of => (of.as_str(), true),
             _ => (rel, false),
         };
+        #[cfg(feature = "gpu")]
+        if self.gpu.is_some() {
+            return self.gpu_walk_rows(primary, rows, edge_rel, reverse, depth, false);
+        }
         let mut frontier: BTreeSet<String> = BTreeSet::new();
         for r in rows {
             if let Some(id) = row_text(r, "id") {
@@ -2855,7 +3135,8 @@ impl Db {
         let depth = depth.clamp(1, 3);
         for _ in 0..depth {
             let mut next = BTreeSet::new();
-            for e in &self.store.edges {
+            let gpu_mask = self.graph_frontier_mask(edge_rel, reverse, &frontier)?;
+            for (edge_index, e) in self.store.edges.iter().enumerate() {
                 if e.rel != edge_rel {
                     continue;
                 }
@@ -2864,7 +3145,10 @@ impl Db {
                 } else {
                     (e.from.as_str(), e.to.as_str())
                 };
-                if frontier.contains(src) && seen.insert(dst.to_string()) {
+                let hit = gpu_mask
+                    .as_ref()
+                    .map_or_else(|| frontier.contains(src), |mask| mask[edge_index]);
+                if hit && seen.insert(dst.to_string()) {
                     next.insert(dst.to_string());
                     reached.insert(dst.to_string());
                 }
@@ -2903,6 +3187,10 @@ impl Db {
             Some(r) if let Some(of) = &r.reverse_of => (of.as_str(), true),
             _ => (rel, false),
         };
+        #[cfg(feature = "gpu")]
+        if self.gpu.is_some() {
+            return self.gpu_walk_rows("docs", rows, edge_rel, reverse, depth, true);
+        }
         let mut frontier: BTreeSet<String> = BTreeSet::new();
         for r in rows {
             if let Some(id) = row_text(r, "id") {
@@ -2918,7 +3206,8 @@ impl Db {
         let depth = depth.clamp(1, 3);
         for _ in 0..depth {
             let mut next = BTreeSet::new();
-            for e in &self.store.edges {
+            let gpu_mask = self.graph_frontier_mask(edge_rel, reverse, &frontier)?;
+            for (edge_index, e) in self.store.edges.iter().enumerate() {
                 if e.rel != edge_rel {
                     continue;
                 }
@@ -2927,7 +3216,10 @@ impl Db {
                 } else {
                     (e.from.as_str(), e.to.as_str())
                 };
-                if !frontier.contains(src) {
+                let hit = gpu_mask
+                    .as_ref()
+                    .map_or_else(|| frontier.contains(src), |mask| mask[edge_index]);
+                if !hit {
                     continue;
                 }
                 let key = (e.rel.clone(), e.from.clone(), e.to.clone());
@@ -3002,6 +3294,10 @@ impl Db {
         if keys.is_empty() {
             return Ok(());
         }
+        #[cfg(feature = "gpu")]
+        if self.gpu.is_some() {
+            return self.gpu_match_expand(primary, row, hop, &keys, edge_rel, reverse, out);
+        }
         for start_key in keys {
             type GraphSearchFrame = (
                 String,
@@ -3011,7 +3307,9 @@ impl Db {
             );
             let mut stack: Vec<GraphSearchFrame> = vec![(start_key, 0, BTreeSet::new(), None)];
             while let Some((at, depth, path, last_edge)) = stack.pop() {
-                if depth > 0 && depth >= hop.min_depth && depth <= hop.max_depth
+                if depth > 0
+                    && depth >= hop.min_depth
+                    && depth <= hop.max_depth
                     && let Some(node) = self.resolve_node(primary, &at)
                 {
                     let mut merged = row.clone();
@@ -3033,7 +3331,9 @@ impl Db {
                 }
                 let mut visited = path;
                 visited.insert(at.clone());
-                for e in &self.store.edges {
+                let gpu_mask =
+                    self.graph_frontier_mask(edge_rel, reverse, &BTreeSet::from([at.clone()]))?;
+                for (edge_index, e) in self.store.edges.iter().enumerate() {
                     if e.rel != edge_rel {
                         continue;
                     }
@@ -3042,7 +3342,10 @@ impl Db {
                     } else {
                         (e.from.as_str(), e.to.as_str())
                     };
-                    if src != at {
+                    let hit = gpu_mask
+                        .as_ref()
+                        .map_or_else(|| src == at, |mask| mask[edge_index]);
+                    if !hit {
                         continue;
                     }
                     if visited.contains(dst) {
@@ -3061,16 +3364,18 @@ impl Db {
     }
 
     fn resolve_node(&self, primary: &str, key: &str) -> Option<Row> {
+        self.resolve_node_ref(primary, key).cloned()
+    }
+    fn resolve_node_ref(&self, primary: &str, key: &str) -> Option<&Row> {
         if let Some(row) = self.store.find_doc_key(key) {
-            return Some(row.clone());
+            return Some(row);
         }
         if primary != "docs" {
             return self
                 .store
                 .collection(primary)
                 .iter()
-                .find(|r| row_text(r, "id") == Some(key))
-                .cloned();
+                .find(|r| row_text(r, "id") == Some(key));
         }
         None
     }
@@ -3087,37 +3392,59 @@ impl Db {
         match mode {
             SearchMode::Lex => {
                 let query = LexQuery::new(query);
+                let gpu_scores = self.gpu_lex_scores(rows.iter(), &query)?;
+                #[cfg(feature = "gpu")]
+                if let Some(scores) = &gpu_scores {
+                    let positions = self.gpu.as_ref().expect("GPU scores").rank_i64(scores)?;
+                    return Ok(positions
+                        .into_iter()
+                        .filter(|&i| scores[i] > 0)
+                        .map(|i| rows[i].clone())
+                        .collect());
+                }
                 let mut scored: Vec<(i64, Row)> = rows
                     .iter()
-                    .filter_map(|r| {
-                        let s = lex_score_prepared(r, &query);
+                    .enumerate()
+                    .filter_map(|(i, r)| {
+                        let s = gpu_scores
+                            .as_ref()
+                            .map_or_else(|| lex_score_prepared(r, &query), |scores| scores[i]);
                         if s > 0 { Some((s, r.clone())) } else { None }
                     })
                     .collect();
                 scored.sort_by_key(|a| std::cmp::Reverse(a.0));
                 Ok(scored.into_iter().map(|(_, r)| r).collect())
             }
-            SearchMode::Vec => {
-                let Some(emb) = self.embedder.as_ref() else {
-                    return Ok(Vec::new());
-                };
-                let qv = emb.embed(query);
-                let mut scored: Vec<(f64, Row)> = rows
-                    .iter()
-                    .filter_map(|r| {
-                        let v = r.get("embedding").and_then(Cell::as_vec)?;
-                        let s = embed::cosine(qv.as_ref(), v);
-                        if s > 0.01 { Some((s, r.clone())) } else { None }
-                    })
-                    .collect();
-                scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-                Ok(scored.into_iter().map(|(_, r)| r).collect())
-            }
+            SearchMode::Vec => Ok(self
+                .vector_search_indices(rows, query)?
+                .into_iter()
+                .map(|(_, i)| rows[i].clone())
+                .collect()),
+
             SearchMode::Hybrid => {
                 // Reciprocal rank fusion over lex + vec lists.
                 const RRF_K: f64 = 60.0;
                 let lex = self.search_rows(rows, SearchMode::Lex, query)?;
                 let vec = self.search_rows(rows, SearchMode::Vec, query)?;
+                #[cfg(feature = "gpu")]
+                if let Some(gpu) = &self.gpu {
+                    let key = |row: &Row| {
+                        row_text(row, "id")
+                            .or_else(|| row_text(row, "uri"))
+                            .unwrap_or("")
+                            .to_owned()
+                    };
+                    let lex_keys: Vec<String> = lex.iter().map(key).collect();
+                    let vec_keys: Vec<String> = vec.iter().map(key).collect();
+                    let mut by_id: BTreeMap<String, Row> = BTreeMap::new();
+                    for (id, row) in lex_keys.iter().zip(&lex).chain(vec_keys.iter().zip(&vec)) {
+                        by_id.entry(id.clone()).or_insert_with(|| row.clone());
+                    }
+                    return Ok(gpu_rrf_keys(gpu, &lex_keys, &vec_keys)?
+                        .into_iter()
+                        .filter_map(|id| by_id.remove(&id))
+                        .collect());
+                }
                 let mut scores: BTreeMap<String, f64> = BTreeMap::new();
                 let mut by_id: BTreeMap<String, Row> = BTreeMap::new();
                 for (rank, r) in lex.iter().enumerate() {
@@ -3203,7 +3530,7 @@ impl Db {
                 texts.push(text);
             }
         }
-        let refs = texts.iter().map(String::as_str).collect::<Vec<_>>();
+        let refs = texts.iter().map(|text| text.as_ref()).collect::<Vec<_>>();
         let mut vectors = emb.embed_batch(&refs);
         if vectors.len() != row_idxs.len() {
             // Keep third-party embedders with a broken batch implementation
@@ -3364,6 +3691,30 @@ impl Db {
         }
     }
 
+    fn mutation_positions(&self, collection: &str, pred: Option<&Pred>, now: i64) -> Vec<usize> {
+        if let Some(pred) = pred
+            && let Some((field, key)) = point_key(pred)
+            && (field == "id" || (field == "uri" && collection == "docs"))
+        {
+            return self
+                .store
+                .point_index(collection, field, key)
+                .into_iter()
+                .filter(|&i| {
+                    self.store
+                        .get_by_idx(collection, i)
+                        .is_some_and(|row| eval_pred(pred, row, now))
+                })
+                .collect();
+        }
+        self.store
+            .collection(collection)
+            .iter()
+            .enumerate()
+            .filter_map(|(i, row)| pred.is_none_or(|p| eval_pred(p, row, now)).then_some(i))
+            .collect()
+    }
+
     fn update_cas(
         &mut self,
         collection: &str,
@@ -3377,13 +3728,8 @@ impl Db {
         if !cas_each && cas.is_none() {
             return Err(Error::runtime("update requires cas"));
         }
+        let idxs = self.mutation_positions(collection, pred, now);
         let rows = self.store.collection(collection);
-        let mut idxs = Vec::new();
-        for (i, row) in rows.iter().enumerate() {
-            if pred.is_none_or(|p| eval_pred(p, row, now)) {
-                idxs.push(i);
-            }
-        }
         if idxs.is_empty() {
             return Err(Error::runtime("update: no matching row"));
         }
@@ -3404,15 +3750,12 @@ impl Db {
         let patch = record_row(record, now);
         let mut out = Vec::new();
         for i in idxs {
-            self.store.index_remove_at(collection, i);
-            self.store.fts_remove_at(collection, i);
-            let rows = self.store.collection_mut(collection);
-            let row = &mut rows[i];
+            let before = self.store.collection(collection)[i].clone();
+            let mut updated = before.clone();
+            let row = &mut updated;
             let layer_raw = row_text(row, "layer") == Some("raw")
                 || matches!(patch.get("layer"), Some(Cell::Text(s)) if s.as_ref() == "raw");
             if layer_raw && patch.contains_key("body") {
-                let _ = self.store.index_insert_at(collection, i);
-                self.store.fts_insert_at(collection, i);
                 return Err(Error::runtime("immutable field: docs.body"));
             }
             for (k, v) in &patch {
@@ -3423,13 +3766,17 @@ impl Db {
             {
                 row.insert("hash".into(), Cell::Text(content_hash_arc(&body)));
             }
-            let updated = row.clone();
             self.check_row_fks(collection, &updated)?;
+            if let Undo::Rows(events) = ctx.undo {
+                events.push(RowUndo::Update(collection.to_string(), i, before.clone()));
+            }
+            self.store.collection_mut(collection)[i] = updated.clone();
             self.store.index_insert_row(collection, i, &updated)?;
-            self.store.fts_insert_at(collection, i);
+            self.store.fts_sync_at(collection, i, &before);
+            self.store
+                .row_maps_sync_updated(collection, i, &before, &updated);
             out.push(updated);
         }
-        self.store.rebuild_row_maps_collection(collection);
         mark_written(ctx, collection, &out);
         Ok(out)
     }
@@ -3450,13 +3797,8 @@ impl Db {
         if !append_only && cas.is_none() && !cas_each {
             return Err(Error::runtime("delete requires cas"));
         }
+        let mut idxs = self.mutation_positions(collection, Some(pred), now);
         let rows = self.store.collection(collection);
-        let mut idxs = Vec::new();
-        for (i, row) in rows.iter().enumerate() {
-            if eval_pred(pred, row, now) {
-                idxs.push(i);
-            }
-        }
         if idxs.is_empty() {
             return Err(Error::runtime("delete: no matching row"));
         }
@@ -3476,15 +3818,15 @@ impl Db {
             }
         }
         idxs.sort_unstable();
-        let mut out = Vec::new();
-        for i in idxs.into_iter().rev() {
-            let row = self.store.collection_mut(collection).remove(i);
-            out.push(row);
+        let out: Vec<Row> = idxs.iter().map(|&i| rows[i].clone()).collect();
+        if let Undo::Rows(events) = ctx.undo {
+            events.push(RowUndo::Delete(
+                collection.to_string(),
+                idxs.clone(),
+                out.clone(),
+            ));
         }
-        out.reverse();
-        self.store.rebuild_row_maps_collection(collection);
-        self.store.rebuild_indexes_collection(collection);
-        self.store.rebuild_fts_inplace(collection);
+        self.store.delete_rows_at(collection, &idxs);
         mark_written(ctx, collection, &out);
         Ok(out)
     }
@@ -3652,6 +3994,12 @@ enum Undo {
     None,
     Append(crate::store::AppendMark),
     Full(crate::store::MemBackup),
+    Rows(Vec<RowUndo>),
+}
+
+enum RowUndo {
+    Update(String, usize, Row),
+    Delete(String, Vec<usize>, Vec<Row>),
 }
 
 fn stmt_writes(s: &Stmt) -> bool {
@@ -3951,12 +4299,35 @@ fn record_row(record: &Record, now: i64) -> Row {
     row
 }
 
+#[cfg(test)]
+mod record_tests {
+    use super::*;
+
+    #[test]
+    fn row_build_preserves_last_duplicate_and_execution_time() {
+        let record = Record {
+            fields: vec![
+                ("z".into(), Value::String("old".into())),
+                ("a".into(), Value::Now),
+                ("z".into(), Value::String("new".into())),
+                ("m".into(), Value::Int(42)),
+            ],
+        };
+        let row = record_row(&record, 123);
+        assert_eq!(row.len(), 3);
+        assert_eq!(row_text(&row, "z"), Some("new"));
+        assert_eq!(row.get("a"), Some(&Cell::Time(123)));
+        assert_eq!(record_row(&record, 456).get("a"), Some(&Cell::Time(456)));
+    }
+}
+
 fn value_cell(v: &Value, now: i64) -> Cell {
     match v {
         Value::String(s) => Cell::text_arc(s.as_str()),
         Value::Int(n) => Cell::Int(*n),
         Value::Float(n) => Cell::Float(*n),
         Value::Bool(b) => Cell::Bool(*b),
+        Value::Timestamp(millis) => Cell::Time(*millis),
         Value::Now => Cell::Time(now),
         Value::NowMinus(d) => Cell::Time(now - d.as_millis()),
         Value::Duration(d) => Cell::Int(d.as_millis()),
@@ -4182,7 +4553,12 @@ fn cmp_sort(a: &Cell, b: &Cell) -> std::cmp::Ordering {
         (Cell::Text(x), Cell::Text(y)) => x.cmp(y),
         (Cell::Bool(x), Cell::Bool(y)) => x.cmp(y),
         _ => match (a.as_f64(), b.as_f64()) {
-            (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(Ordering::Equal),
+            (Some(x), Some(y)) => match (x.is_nan(), y.is_nan()) {
+                (true, true) => Ordering::Equal,
+                (true, false) => Ordering::Greater,
+                (false, true) => Ordering::Less,
+                (false, false) => x.partial_cmp(&y).expect("ordered numeric values"),
+            },
             (Some(_), None) => Ordering::Greater,
             (None, Some(_)) => Ordering::Less,
             _ => a.compact().cmp(&b.compact()),
@@ -4285,5 +4661,712 @@ pub(crate) fn cell_key(c: &Cell) -> Option<String> {
         Cell::Text(s) => Some(s.as_ref().to_owned()),
         Cell::Int(n) => Some(n.to_string()),
         _ => None,
+    }
+}
+
+impl Db {
+    fn uses_gpu_filter(&self, query: &Query) -> bool {
+        #[cfg(feature = "gpu")]
+        {
+            self.gpu.is_some()
+                && query
+                    .steps
+                    .iter()
+                    .any(|step| matches!(step, Step::Filter(p) if gpu_supported_pred(p)))
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            let _ = query;
+            false
+        }
+    }
+    #[cfg(feature = "gpu")]
+    pub(crate) fn gpu_filter_mask(
+        &self,
+        pred: &Pred,
+        rows: &[Row],
+        now: i64,
+    ) -> Result<Option<Vec<bool>>, Error> {
+        let Some(gpu) = &self.gpu else {
+            return Ok(None);
+        };
+        if !gpu_supported_pred(pred) {
+            return Ok(None);
+        }
+        match pred {
+            Pred::And(a, b) | Pred::Or(a, b) => {
+                let a = self
+                    .gpu_filter_mask(a, rows, now)?
+                    .unwrap_or_else(|| rows.iter().map(|row| eval_pred(a, row, now)).collect());
+                let b = self
+                    .gpu_filter_mask(b, rows, now)?
+                    .unwrap_or_else(|| rows.iter().map(|row| eval_pred(b, row, now)).collect());
+                Ok(Some(gpu.combine_masks(
+                    &a,
+                    &b,
+                    matches!(pred, Pred::Or(..)),
+                )?))
+            }
+            Pred::Cmp { field, op, value } => {
+                let right = value_cell(value, now);
+                if let Cell::Text(needle) = &right {
+                    if !matches!(op, CmpOp::Eq | CmpOp::Ne) {
+                        return Ok(Some(vec![false; rows.len()]));
+                    }
+                    let texts: Vec<_> = rows.iter().map(|r| field_cell(r, field).text()).collect();
+                    return Ok(Some(gpu.text_mask(
+                        &texts,
+                        needle,
+                        if *op == CmpOp::Ne { 2 } else { 1 },
+                        false,
+                    )?));
+                }
+                let records: Vec<_> = rows
+                    .iter()
+                    .map(|r| gpu_comparison_record(field_cell(r, field), &right, *op))
+                    .collect();
+                Ok(Some(gpu.comparison_mask(&records, *op)?))
+            }
+            Pred::Contains { field, needle } => {
+                let texts: Vec<_> = rows.iter().map(|r| field_cell(r, field).text()).collect();
+                Ok(Some(gpu.text_mask(&texts, needle, 0, false)?))
+            }
+            Pred::Has { field, needle, ci } => {
+                let texts: Vec<_> = rows.iter().map(|r| field_cell(r, field).text()).collect();
+                Ok(Some(gpu.text_mask(&texts, needle, 3, *ci)?))
+            }
+            Pred::Regex {
+                field,
+                pattern,
+                flags,
+            } => {
+                let texts: Vec<_> = rows
+                    .iter()
+                    .map(|row| field_cell(row, field).text())
+                    .collect();
+                Ok(Some(gpu.regex_mask(&texts, pattern, flags)?))
+            }
+        }
+    }
+}
+#[cfg(feature = "gpu")]
+fn gpu_supported_pred(pred: &Pred) -> bool {
+    match pred {
+        Pred::And(a, b) | Pred::Or(a, b) => gpu_supported_pred(a) || gpu_supported_pred(b),
+        Pred::Cmp { .. } | Pred::Has { .. } | Pred::Contains { .. } => true,
+        Pred::Regex { .. } => true,
+    }
+}
+
+#[cfg(feature = "gpu")]
+fn gpu_comparison_record(left: &Cell, right: &Cell, op: CmpOp) -> [u32; 5] {
+    let integer_key = |v: i64| (v as u64) ^ (1u64 << 63);
+    let float_key = |v: f64| {
+        let bits = if v == 0.0 { 0 } else { v.to_bits() };
+        if bits >> 63 != 0 {
+            !bits
+        } else {
+            bits ^ (1u64 << 63)
+        }
+    };
+    let keys = if matches!(op, CmpOp::Eq | CmpOp::Ne) {
+        match (left, right) {
+            (Cell::Bool(a), Cell::Bool(b)) => Some((*a as u64, *b as u64)),
+            (Cell::Int(a), Cell::Int(b)) | (Cell::Time(a), Cell::Time(b)) => {
+                Some((integer_key(*a), integer_key(*b)))
+            }
+            (Cell::Float(_), Cell::Float(_) | Cell::Int(_)) | (Cell::Int(_), Cell::Float(_)) => {
+                left.as_f64()
+                    .zip(right.as_f64())
+                    .filter(|(a, b)| !a.is_nan() && !b.is_nan())
+                    .map(|(a, b)| (float_key(a), float_key(b)))
+            }
+            _ => None,
+        }
+    } else {
+        left.as_f64()
+            .zip(right.as_f64())
+            .filter(|(a, b)| !a.is_nan() && !b.is_nan())
+            .map(|(a, b)| (float_key(a), float_key(b)))
+    };
+    match keys {
+        Some((a, b)) => [a as u32, (a >> 32) as u32, b as u32, (b >> 32) as u32, 1],
+        None => [0; 5],
+    }
+}
+
+impl Db {
+    fn uses_gpu_count(&self, query: &Query) -> bool {
+        #[cfg(feature = "gpu")]
+        {
+            self.gpu.is_some()
+                && query
+                    .steps
+                    .iter()
+                    .any(|step| matches!(step, Step::Count { .. } | Step::Sum { .. }))
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            let _ = query;
+            false
+        }
+    }
+    #[cfg(feature = "gpu")]
+    fn gpu_count_rows(&self, rows: &[Row], by: Option<&Field>) -> Result<Option<Vec<Row>>, Error> {
+        let Some(gpu) = &self.gpu else {
+            return Ok(None);
+        };
+        let Some(by) = by else {
+            let counts = gpu.group_counts(&vec![0u32; rows.len()], 1)?;
+            return Ok(Some(vec![hits_row(counts[0])]));
+        };
+        let field = by.as_str();
+        let row_keys: Vec<String> = rows
+            .iter()
+            .map(|row| {
+                row.get(&field)
+                    .map(Cell::compact)
+                    .unwrap_or_else(|| "null".into())
+            })
+            .collect();
+        let mut keys = row_keys.clone();
+        keys.sort();
+        keys.dedup();
+        if keys.len() > u32::MAX as usize {
+            return Err(Error::runtime("GPU count has too many groups"));
+        }
+        let ids: Vec<u32> = row_keys
+            .iter()
+            .map(|key| keys.binary_search(key).expect("known group") as u32)
+            .collect();
+        let counts = gpu.group_counts(&ids, keys.len())?;
+        Ok(Some(
+            keys.into_iter()
+                .zip(counts)
+                .map(|(key, count)| count_row(&field, &unquote(&key), count))
+                .collect(),
+        ))
+    }
+}
+
+impl Db {
+    fn uses_gpu_join(&self, query: &Query) -> bool {
+        #[cfg(feature = "gpu")]
+        {
+            self.gpu.is_some()
+                && query
+                    .steps
+                    .iter()
+                    .any(|step| matches!(step, Step::Join { .. }))
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            let _ = query;
+            false
+        }
+    }
+    #[cfg(feature = "gpu")]
+    pub(crate) fn gpu_join_rows(
+        &self,
+        left_col: &str,
+        left: Vec<Row>,
+        right_col: &str,
+        on: &str,
+        left_join: bool,
+    ) -> Result<Vec<Row>, Error> {
+        let gpu = self.gpu.as_ref().expect("GPU join selected");
+        let to_field = self
+            .catalog
+            .find_fk(left_col, on, right_col)
+            .map(|fk| fk.to_field.as_str())
+            .unwrap_or("id");
+        let right = self.store.collection(right_col);
+        let mut dictionary: FxHashMap<String, u32> = FxHashMap::default();
+        let key = |row: &Row, field: &str| {
+            if to_field == "id" {
+                row.get(field).and_then(Cell::text).map(str::to_owned)
+            } else {
+                row.get(field).and_then(cell_key)
+            }
+        };
+        let mut encode = |value: Option<String>| -> Result<u32, Error> {
+            let Some(value) = value else {
+                return Ok(0);
+            };
+            if let Some(&id) = dictionary.get(&value) {
+                return Ok(id);
+            }
+            let id = u32::try_from(dictionary.len() + 1)
+                .map_err(|_| Error::runtime("GPU join has too many distinct keys"))?;
+            dictionary.insert(value, id);
+            Ok(id)
+        };
+        let left_keys: Vec<u32> = left
+            .iter()
+            .map(|row| encode(key(row, on)))
+            .collect::<Result<_, _>>()?;
+        let right_keys: Vec<u32> = right
+            .iter()
+            .map(|row| encode(key(row, to_field)))
+            .collect::<Result<_, _>>()?;
+        if to_field == "id" {
+            let hits = gpu.join_id_matches(&left_keys, &right_keys)?;
+            let mut out = Vec::new();
+            for (row, hit) in left.into_iter().zip(hits) {
+                if let Some(hit) = hit {
+                    out.push(merge_join_row(row, &right[hit], right_col));
+                } else if left_join {
+                    out.push(row);
+                }
+            }
+            return Ok(out);
+        }
+        let hits = gpu.join_matches(&left_keys, &right_keys)?;
+        let mut out = Vec::new();
+        for (row, hits) in left.into_iter().zip(hits) {
+            if hits.is_empty() {
+                if left_join {
+                    out.push(row);
+                }
+            } else {
+                for &hit in &hits {
+                    out.push(merge_join_row(row.clone(), &right[hit], right_col));
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+fn rows_to_query_batch(rows: &[Row], query: &Query) -> RecordBatch {
+    let mut projection = None;
+    for step in &query.steps {
+        match step {
+            Step::Project(fields) => projection = Some(field_names(fields)),
+            Step::Join { .. }
+            | Step::Hop { .. }
+            | Step::Graph { .. }
+            | Step::Match { .. }
+            | Step::Count { .. }
+            | Step::Sum { .. }
+            | Step::Union(_) => projection = None,
+            _ => {}
+        }
+    }
+    let Some(names) = projection else {
+        return rows_to_rough_batch(rows);
+    };
+    let mut batch = RecordBatch::with_capacity(Arc::<[String]>::from(names.clone()), rows.len());
+    for row in rows {
+        push_project_batch_row(&mut batch, row, &names);
+    }
+    batch
+}
+
+impl Db {
+    fn uses_gpu_sort(&self, query: &Query) -> bool {
+        #[cfg(feature = "gpu")]
+        {
+            self.gpu.is_some()
+                && query
+                    .steps
+                    .iter()
+                    .any(|step| matches!(step, Step::Sort { .. }))
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            let _ = query;
+            false
+        }
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl Db {
+    fn gpu_sum_rows(
+        &self,
+        rows: &[Row],
+        field: &Field,
+        by: &Field,
+    ) -> Result<Option<Vec<Row>>, Error> {
+        let Some(gpu) = &self.gpu else {
+            return Ok(None);
+        };
+        let fk = field.as_str();
+        let bk = by.as_str();
+        let row_keys: Vec<String> = rows
+            .iter()
+            .map(|row| {
+                row.get(&bk)
+                    .map(Cell::compact)
+                    .unwrap_or_else(|| "null".into())
+            })
+            .collect();
+        let mut keys = row_keys.clone();
+        keys.sort();
+        keys.dedup();
+        if keys.len() > u32::MAX as usize {
+            return Err(Error::runtime("GPU sum has too many groups"));
+        }
+        let ids: Vec<u32> = row_keys
+            .iter()
+            .map(|key| keys.binary_search(key).expect("known group") as u32)
+            .collect();
+        let values: Vec<f64> = rows
+            .iter()
+            .map(|row| row.get(&fk).and_then(Cell::as_f64).unwrap_or(0.0))
+            .collect();
+        let sums = gpu.group_sums(&ids, &values, keys.len())?;
+        Ok(Some(
+            keys.into_iter()
+                .zip(sums)
+                .map(|(key, sum)| {
+                    let mut row = BTreeMap::new();
+                    row.insert(bk.clone(), Cell::text_arc(unquote(&key)));
+                    row.insert(fk.clone(), Cell::Float(sum));
+                    row
+                })
+                .collect(),
+        ))
+    }
+}
+
+impl Db {
+    fn uses_gpu_graph(&self, query: &Query) -> bool {
+        #[cfg(feature = "gpu")]
+        {
+            self.gpu.is_some()
+                && query.steps.iter().any(|step| {
+                    matches!(
+                        step,
+                        Step::Hop { .. } | Step::Graph { .. } | Step::Match { .. }
+                    )
+                })
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            let _ = query;
+            false
+        }
+    }
+    pub(crate) fn graph_frontier_mask(
+        &self,
+        relation: &str,
+        reverse: bool,
+        frontier: &BTreeSet<String>,
+    ) -> Result<Option<Vec<bool>>, Error> {
+        #[cfg(feature = "gpu")]
+        {
+            let Some(gpu) = &self.gpu else {
+                return Ok(None);
+            };
+            let mut dictionary: FxHashMap<&str, u32> = FxHashMap::default();
+            let mut keys: BTreeSet<&str> = frontier.iter().map(String::as_str).collect();
+            for edge in &self.store.edges {
+                if edge.rel == relation {
+                    keys.insert(if reverse {
+                        edge.to.as_str()
+                    } else {
+                        edge.from.as_str()
+                    });
+                }
+            }
+            for key in keys {
+                let id = u32::try_from(dictionary.len() + 1)
+                    .map_err(|_| Error::runtime("GPU graph has too many keys"))?;
+                dictionary.insert(key, id);
+            }
+            let ids: Vec<u32> = frontier
+                .iter()
+                .map(|key| dictionary[key.as_str()])
+                .collect();
+            let sources: Vec<u32> = self
+                .store
+                .edges
+                .iter()
+                .map(|edge| {
+                    if edge.rel != relation {
+                        return 0;
+                    }
+                    let key = if reverse {
+                        edge.to.as_str()
+                    } else {
+                        edge.from.as_str()
+                    };
+                    dictionary.get(key).copied().unwrap_or(0)
+                })
+                .collect();
+            Ok(Some(gpu.graph_edge_mask(&sources, &ids)?))
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            let _ = (relation, reverse, frontier);
+            Ok(None)
+        }
+    }
+}
+
+impl Db {
+    fn gpu_lex_scores<'a>(
+        &self,
+        rows: impl Iterator<Item = &'a Row>,
+        query: &LexQuery,
+    ) -> Result<Option<Vec<i64>>, Error> {
+        #[cfg(feature = "gpu")]
+        {
+            let Some(gpu) = &self.gpu else {
+                return Ok(None);
+            };
+            let blobs: Vec<String> = rows
+                .map(|row| {
+                    let mut blob = String::new();
+                    for field in ["title", "body", "snippet"] {
+                        if let Some(text) = row_text(row, field) {
+                            blob.push_str(text);
+                            blob.push(' ');
+                        }
+                    }
+                    blob.to_lowercase()
+                })
+                .collect();
+            let texts: Vec<Option<&str>> = blobs.iter().map(|blob| Some(blob.as_str())).collect();
+            if query.tokens.is_empty() && query.lower.is_empty() {
+                return Ok(Some(vec![0i64; blobs.len()]));
+            }
+            let mut scores = gpu.weight_accumulator(blobs.len())?;
+            for token in &query.tokens {
+                gpu.text_accumulate(&texts, token, 0, &mut scores, 1)?;
+                // Punctuation-bearing tokens cannot equal a CPU-split word.
+                if token.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                    gpu.text_accumulate(&texts, token, 3, &mut scores, 2)?;
+                }
+            }
+            if !query.lower.is_empty() {
+                gpu.text_accumulate(&texts, &query.lower, 0, &mut scores, 3)?;
+            }
+            Ok(Some(scores.finish()?))
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            let _ = (rows, query);
+            Ok(None)
+        }
+    }
+}
+
+#[cfg(feature = "gpu")]
+fn gpu_rrf_keys<K: Ord + Clone>(
+    gpu: &crate::gpu::GpuCompute,
+    lex: &[K],
+    vectors: &[K],
+) -> Result<Vec<K>, Error> {
+    let keys: Vec<K> = lex
+        .iter()
+        .chain(vectors)
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if keys.len() > u32::MAX as usize {
+        return Err(Error::runtime("GPU RRF has too many identities"));
+    }
+    let mut ids = Vec::with_capacity(lex.len() + vectors.len());
+    let mut denominators = Vec::with_capacity(ids.capacity());
+    for list in [lex, vectors] {
+        for (rank, key) in list.iter().enumerate() {
+            let denominator = u32::try_from(rank)
+                .ok()
+                .and_then(|rank| rank.checked_add(61))
+                .ok_or_else(|| Error::runtime("GPU RRF rank exceeds integer range"))?;
+            ids.push(keys.binary_search(key).expect("known identity") as u32);
+            denominators.push(denominator);
+        }
+    }
+    let scores = gpu.group_rrf(&ids, &denominators, keys.len())?;
+    let cells: Vec<Cell> = scores.into_iter().map(Cell::Float).collect();
+    let references: Vec<&Cell> = cells.iter().collect();
+    Ok(gpu
+        .sort_indices(&references, true)?
+        .into_iter()
+        .map(|i| keys[i].clone())
+        .collect())
+}
+
+#[cfg(feature = "gpu")]
+impl Db {
+    fn gpu_walk_rows(
+        &self,
+        primary: &str,
+        rows: &[Row],
+        relation: &str,
+        reverse: bool,
+        depth: i64,
+        graph: bool,
+    ) -> Result<Vec<Row>, Error> {
+        let mut seeds = BTreeSet::new();
+        for row in rows {
+            for field in ["id", "uri"] {
+                if let Some(key) = row_text(row, field) {
+                    seeds.insert(key.to_owned());
+                }
+            }
+        }
+        let (keys, reached) = self.gpu_walk_state(&seeds, relation, reverse, depth, graph)?;
+        if graph {
+            let edges: Vec<_> = self
+                .store
+                .edges
+                .iter()
+                .filter(|edge| edge.rel == relation)
+                .collect();
+            return Ok(reached
+                .into_iter()
+                .map(|i| {
+                    let edge = edges[i];
+                    edge_row(&edge.rel, &edge.from, &edge.to)
+                })
+                .collect());
+        }
+        Ok(reached
+            .into_iter()
+            .filter_map(|i| self.resolve_node(primary, &keys[i]))
+            .take(300)
+            .collect())
+    }
+    pub(crate) fn gpu_hop_keys(
+        &self,
+        seeds: &BTreeSet<String>,
+        relation: &str,
+        reverse: bool,
+    ) -> Result<Vec<String>, Error> {
+        let (keys, reached) = self.gpu_walk_state(seeds, relation, reverse, 1, false)?;
+        Ok(reached.into_iter().map(|i| keys[i].clone()).collect())
+    }
+    fn gpu_walk_state(
+        &self,
+        seeds: &BTreeSet<String>,
+        relation: &str,
+        reverse: bool,
+        depth: i64,
+        graph: bool,
+    ) -> Result<(Vec<String>, Vec<usize>), Error> {
+        let edges: Vec<_> = self
+            .store
+            .edges
+            .iter()
+            .filter(|edge| edge.rel == relation)
+            .collect();
+        let mut keys = seeds.clone();
+        for edge in &edges {
+            keys.insert(edge.from.clone());
+            keys.insert(edge.to.clone());
+        }
+        let keys: Vec<String> = keys.into_iter().collect();
+        let id = |key: &str| {
+            keys.binary_search_by(|v| v.as_str().cmp(key))
+                .expect("known node") as u32
+        };
+        let mut identities = BTreeMap::new();
+        let encoded: Vec<[u32; 4]> = edges
+            .iter()
+            .map(|edge| {
+                let next = identities.len() as u32;
+                let identity = *identities
+                    .entry((edge.from.as_str(), edge.to.as_str()))
+                    .or_insert(next);
+                let (src, dst) = if reverse {
+                    (&edge.to, &edge.from)
+                } else {
+                    (&edge.from, &edge.to)
+                };
+                [id(src), id(dst), identity, 0]
+            })
+            .collect();
+        let seed_ids: Vec<u32> = seeds.iter().map(|key| id(key)).collect();
+        let reached = self.gpu.as_ref().unwrap().walk_graph(
+            &encoded,
+            &seed_ids,
+            keys.len(),
+            identities.len(),
+            depth.clamp(1, 3) as u32,
+            graph,
+        )?;
+        Ok((keys, reached))
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl Db {
+    fn gpu_match_expand(
+        &self,
+        primary: &str,
+        row: &Row,
+        hop: &MatchHop,
+        seeds: &[String],
+        relation: &str,
+        reverse: bool,
+        out: &mut Vec<Row>,
+    ) -> Result<(), Error> {
+        let edges: Vec<_> = self
+            .store
+            .edges
+            .iter()
+            .filter(|e| e.rel == relation)
+            .collect();
+        let mut keys: BTreeSet<String> = seeds.iter().cloned().collect();
+        for edge in &edges {
+            keys.insert(edge.from.clone());
+            keys.insert(edge.to.clone());
+        }
+        let keys: Vec<String> = keys.into_iter().collect();
+        let id = |key: &str| {
+            keys.binary_search_by(|s| s.as_str().cmp(key))
+                .expect("known key") as u32
+        };
+        let encoded: Vec<[u32; 4]> = edges
+            .iter()
+            .map(|e| {
+                let (src, dst) = if reverse {
+                    (&e.to, &e.from)
+                } else {
+                    (&e.from, &e.to)
+                };
+                [id(src), id(dst), 0, 0]
+            })
+            .collect();
+        let eligible: Vec<u32> = keys
+            .iter()
+            .map(|key| u32::from(self.resolve_node_ref(primary, key).is_some()))
+            .collect();
+        for seed in seeds {
+            let hits = self.gpu.as_ref().unwrap().match_dfs(
+                &encoded,
+                &eligible,
+                id(seed),
+                hop.min_depth as u32,
+                hop.max_depth as u32,
+                300usize.saturating_sub(out.len()),
+            )?;
+            for (node_id, edge_id) in hits {
+                let node = self
+                    .resolve_node_ref(primary, &keys[node_id])
+                    .expect("eligible node");
+                let mut merged = row.clone();
+                for (k, v) in node {
+                    merged.insert(format!("{}.{k}", hop.bind), v.clone());
+                }
+                if let Some(bind) = &hop.edge {
+                    let edge = edges[edge_id];
+                    merged.insert(format!("{bind}.rel"), Cell::text_arc(edge.rel.as_str()));
+                    merged.insert(format!("{bind}.from"), Cell::text_arc(edge.from.as_str()));
+                    merged.insert(format!("{bind}.to"), Cell::text_arc(edge.to.as_str()));
+                }
+                out.push(merged);
+            }
+            if out.len() >= 300 {
+                break;
+            }
+        }
+        Ok(())
     }
 }

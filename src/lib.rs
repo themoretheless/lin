@@ -1,3 +1,4 @@
+#![cfg_attr(feature = "gpu", recursion_limit = "256")]
 //! # Lin 0.3 — local pipe database
 //!
 //! ## Stable public API (0.3 freeze)
@@ -58,6 +59,8 @@ mod error;
 mod exec;
 mod explain;
 mod fts;
+#[cfg(feature = "gpu")]
+pub mod gpu;
 mod graph;
 mod index;
 mod parse;

@@ -46,6 +46,7 @@ cargo bench --bench compare -- \
   --exclude 'compare/cold*' \
   --exclude 'compare/wal*' \
   --exclude 'compare/hot_reopen*' \
+  --exclude 'compare/*1row*' \
   --exclude 'compare/*phase*' \
   --output "$OUT" \
   | tee "$REPORT"
@@ -54,7 +55,9 @@ cp "$REPORT" "$OUT/bench-report.md"
 echo "Wrote $REPORT and $OUT/ (run.json + report.html)"
 
 export BENCH_RUN_JSON="${BENCH_RUN_JSON:-$OUT/run.json}"
-if ! python3 "$ROOT/scripts/check-bench-budget.py"; then
+if python3 "$ROOT/scripts/check-bench-budget.py"; then
+  :
+else
   code=$?
   if [[ $code -eq 2 ]]; then
     echo "bench budget: hard fail (>3× baseline)"

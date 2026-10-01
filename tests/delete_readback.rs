@@ -226,10 +226,15 @@ fn posting_deltas_fold_without_losing_or_resurrecting_rows() {
     let path = dir.join("store.lin");
     let mut persisted = lin::Db::open(&path).unwrap();
     persisted.run("index docs [wing]").ok();
-    for i in 0..10_000 {
-        persisted.run(&format!(
-            r#"insert docs {{ id: "d-{i}", uri: "b://{i}", wing: "rag", title: "wal doc{i}", body: "zeta alpha unique{i}" }}"#
-        )).unwrap();
+    // Fixture loading is not the assertion: exercise all 900 individual deletes
+    // and posting folds below, without 10k unrelated durable seed commits.
+    for start in (0..10_000).step_by(500) {
+        let records = (start..start + 500).map(|i| format!(
+            r#"{{ id: "d-{i}", uri: "b://{i}", wing: "rag", title: "wal doc{i}", body: "zeta alpha unique{i}" }}"#
+        )).collect::<Vec<_>>();
+        persisted
+            .run(&format!("insert docs [{}]", records.join(",")))
+            .unwrap();
     }
     for i in (0..900).rev() {
         let hv = hash_of(&mut persisted, i);

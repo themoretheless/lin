@@ -34,13 +34,14 @@ jobs:
             --exclude 'compare/cold*' \
             --exclude 'compare/wal*' \
             --exclude 'compare/hot_reopen*' \
+            --exclude 'compare/*1row*' \
             --output .airbug-bench/ci \
             | tee bench-report.md
           {
             echo "## Lin compare benches (quick)"
             echo
             echo "Engines: Lin / SQLite / DuckDB / HashMap (Postgres & MySQL skipped without servers)."
-            echo "Excluded: compare/durable*, compare/cold*, compare/wal*, compare/hot_reopen*."
+            echo "Excluded: compare/durable*, compare/cold*, compare/wal*, compare/hot_reopen*, compare/*1row*."
             echo
             echo "Local dash (after hub serve): http://127.0.0.1:8790/"
             echo
@@ -50,6 +51,14 @@ jobs:
           export BENCH_RUN_JSON=.airbug-bench/ci/run.json
           python3 scripts/check-bench-budget.py
           # exit 2 = hard regress (>3×); exit 0 includes soft WARN (>1.5×)
+      - name: Run fresh-fixture mutation benches
+        run: |
+          cargo bench --bench compare -- \
+            --filter 1row \
+            --samples 8 --warmup-ms 0 --max-iterations 1 \
+            --output .airbug-bench/ci-mutations \
+            | tee mutation-report.md
+          cat mutation-report.md >> "$GITHUB_STEP_SUMMARY"
       - name: Upload bench report
         uses: actions/upload-artifact@v4
         with:
@@ -57,4 +66,6 @@ jobs:
           path: |
             .airbug-bench/ci/
             bench-report.md
+            .airbug-bench/ci-mutations/
+            mutation-report.md
           if-no-files-found: error

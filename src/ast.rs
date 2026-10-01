@@ -308,6 +308,8 @@ pub enum Value {
     Int(i64),
     Float(f64),
     Bool(bool),
+    /// Absolute Unix timestamp in milliseconds.
+    Timestamp(i64),
     NowMinus(Duration),
     Now,
     Duration(Duration),
@@ -321,7 +323,7 @@ impl std::hash::Hash for Value {
         std::mem::discriminant(self).hash(state);
         match self {
             Value::String(s) | Value::Name(s) => s.hash(state),
-            Value::Int(n) => n.hash(state),
+            Value::Int(n) | Value::Timestamp(n) => n.hash(state),
             Value::Float(f) => f.to_bits().hash(state),
             Value::Bool(b) => b.hash(state),
             Value::NowMinus(d) | Value::Duration(d) => d.hash(state),

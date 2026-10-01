@@ -1,0 +1,73 @@
+skip postgres: no reachable server
+  tried: postgresql://lin:lin@127.0.0.1:55432/lin (error connecting to server); postgresql://postgres@127.0.0.1:5432/postgres (error connecting to server)
+  set LIN_BENCH_PG_URL or:
+  docker compose -f docker-compose.bench.yml up -d postgres
+  # brew postgresql@17 via Sources/ppduster macos-stack-postgres; start service for :5432
+skip mysql: no reachable server
+  tried: mysql://lin:lin@127.0.0.1:53306/lin (DriverError { Could not connect to address `127.0.0.1:53306': Connection refused (os error 61) }); mysql://dbill:dbill@127.0.0.1:33306/dbill_smoke (DriverError { Could not connect to address `127.0.0.1:33306': Connection refused (os error 61) })
+  set LIN_BENCH_MYSQL_URL or:
+  docker compose -f docker-compose.bench.yml up -d mysql
+  # or sibling dbill: docker compose -f ../dbill/docker-compose.yml up -d mysql
+lin compare: N=10000 warm reads (fixture), bulk insert (schema outside timing)
+engines: Lin | SQLite(rusqlite bundled) | DuckDB(bundled) | HashMap(point get only) | Postgres(skipped) | MySQL(skipped)
+airbug dash: http://127.0.0.1:8790/
+Lin reads: prepare once / run many; filters use count (fair vs SQL COUNT(*));
+substring: Lin `title ~ "wal" | count` vs SQL LIKE '%wal%' COUNT(*);
+materialize: Lin `wing==rag | {id,title} | take all` vs SQL SELECT id,title;
+join: 10000 orders ⋈ 1000 users (Lin run_batch SoA / cursor vs SQL INNER JOIN);
+append_log: Lin `append facts` vs SQL INSERT INTO logs (append-only shape)
+airbug dash: http://127.0.0.1:8790/#/bench
+bench: compare/delete_1row_1k/lin — validating and calibrating
+bench: compare/delete_1row_1k/lin — measuring 24 samples
+bench: compare/delete_1row_1k/sqlite — validating and calibrating
+bench: compare/delete_1row_1k/sqlite — measuring 24 samples
+bench: compare/delete_1row_10k/lin — validating and calibrating
+bench: compare/delete_1row_10k/lin — measuring 24 samples
+bench: compare/delete_1row_10k/sqlite — validating and calibrating
+bench: compare/delete_1row_10k/sqlite — measuring 24 samples
+bench: compare/delete_1row_100k/lin — validating and calibrating
+bench: compare/delete_1row_100k/lin — measuring 24 samples
+bench: compare/delete_1row_100k/sqlite — validating and calibrating
+bench: compare/delete_1row_100k/sqlite — measuring 24 samples
+# bench 1790854057542218000-99643
+
+Status: Complete
+
+| Case | Metric | Median | Unit | Scope / statistic | Observations | Processes |
+|---|---|---:|---|---|---:|---:|
+| compare/delete_1row_1k/lin [candidate] | wall | 12563.0000 | ns | current thread wall clock; scheduler included / batch_total | 24 | 1 |
+| compare/delete_1row_1k/sqlite [candidate] | wall | 4020.5000 | ns | current thread wall clock; scheduler included / batch_total | 24 | 1 |
+| compare/delete_1row_10k/lin [candidate] | wall | 16396.0000 | ns | current thread wall clock; scheduler included / batch_total | 24 | 1 |
+| compare/delete_1row_10k/sqlite [candidate] | wall | 12541.5000 | ns | current thread wall clock; scheduler included / batch_total | 24 | 1 |
+| compare/delete_1row_100k/lin [candidate] | wall | 23458.5000 | ns | current thread wall clock; scheduler included / batch_total | 24 | 1 |
+| compare/delete_1row_100k/sqlite [candidate] | wall | 15521.0000 | ns | current thread wall clock; scheduler included / batch_total | 24 | 1 |
+
+# Useful work throughput
+
+| Case | Median batch throughput | Unit |
+|---|---:|---|
+| compare/delete_1row_1k/lin [candidate] | 79599.0444 | stmts/s |
+| compare/delete_1row_1k/sqlite [candidate] | 248731.7496 | stmts/s |
+| compare/delete_1row_10k/lin [candidate] | 60992.9395 | stmts/s |
+| compare/delete_1row_10k/sqlite [candidate] | 79738.8135 | stmts/s |
+| compare/delete_1row_100k/lin [candidate] | 42635.0549 | stmts/s |
+| compare/delete_1row_100k/sqlite [candidate] | 64462.3714 | stmts/s |
+
+Derived from positive wall batches and declared units per operation; zero/unavailable durations omitted.
+
+Medians above summarize observations, not pooled operation-latency percentiles. Comparisons aggregate within each process first.
+
+- Raw batches are not independent process replications. Batch averages are not individual-operation latency. CPU frequency and background load are uncontrolled.
+
+- compare/delete_1row_1k/lin: some samples below half the requested duration; iteration cap or workload drift may limit precision
+
+- compare/delete_1row_1k/sqlite: some samples below half the requested duration; iteration cap or workload drift may limit precision
+
+- compare/delete_1row_10k/lin: some samples below half the requested duration; iteration cap or workload drift may limit precision
+
+- compare/delete_1row_10k/sqlite: some samples below half the requested duration; iteration cap or workload drift may limit precision
+
+- compare/delete_1row_100k/lin: some samples below half the requested duration; iteration cap or workload drift may limit precision
+
+- compare/delete_1row_100k/sqlite: some samples below half the requested duration; iteration cap or workload drift may limit precision
+

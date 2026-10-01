@@ -839,6 +839,14 @@ impl<'a> Parser<'a> {
 
     fn parse_value(&mut self) -> Result<Value, Error> {
         self.skip();
+        let saved = self.pos;
+        if self.eat_kw("timestamp") && self.eat_char('(') {
+            let millis = self.expect_int()?;
+            self.expect_char(')')?;
+            return Ok(Value::Timestamp(millis));
+        }
+        // Bare `timestamp` retains its existing name semantics.
+        self.pos = saved;
         if self.eat_kw("now") {
             if self.eat_char('-') {
                 let dur = self.expect_duration()?;
@@ -1359,4 +1367,37 @@ fn is_step_keyword(s: &str) -> bool {
             | "explain"
             | "union"
     )
+}
+
+#[cfg(test)]
+mod absolute_timestamp_tests {
+    use super::*;
+
+    #[test]
+    fn timestamp_literals_preserve_signed_milliseconds_and_name_syntax() {
+        for millis in [i64::MIN, -1, 0, 1, 1700000000123, i64::MAX] {
+            let src = format!("timestamp({millis})");
+            let mut parser = Parser::new(&src);
+            let value = parser.parse_value().unwrap();
+            assert_eq!(value, Value::Timestamp(millis));
+            assert!(parser.eof());
+            assert_eq!(crate::plan::fmt_value(&value), src);
+        }
+        let mut parser = Parser::new("timestamp");
+        assert_eq!(
+            parser.parse_value().unwrap(),
+            Value::Name("timestamp".into())
+        );
+        for src in [
+            "timestamp()",
+            "timestamp(1.2)",
+            "timestamp(1d)",
+            "timestamp(9223372036854775808)",
+            "timestamp(-9223372036854775809)",
+            "timestamp(1",
+            "timestamp(now)",
+        ] {
+            assert!(Parser::new(src).parse_value().is_err(), "{src}");
+        }
+    }
 }

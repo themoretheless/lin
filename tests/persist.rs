@@ -1132,3 +1132,143 @@ fn owned_survives_checkpoint_reopen() {
     }
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn large_insert_wal_contains_rows_elided_from_handle() {
+    let dir = tmp();
+    let mut primary = Db::open(&dir).unwrap();
+    primary
+        .run(r#"insert docs { uri: "raw://prefix", title: "before bulk", layer: "wiki" }"#)
+        .unwrap();
+    let records = (0..129)
+        .map(|i| {
+            format!(
+                r#"{{ uri: "raw://bulk/{i}", title: "wal {i}", layer: "wiki", body: "body {i}" }}"#
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let handle = primary.run(&format!("insert docs [{records}]")).unwrap();
+    assert!(handle.rows.is_empty(), "large result rows remain elided");
+    let expected = primary.store.collection("docs").to_vec();
+    assert_eq!(expected.len(), 130);
+    let frames = primary.export_wal_since(0).unwrap();
+    let mut replica = Db::empty();
+    assert_eq!(replica.apply_wal(&frames).unwrap(), 2);
+    assert!(
+        replica.store.collection("docs") == expected.as_slice(),
+        "WAL must include every field and embedding despite empty Handle.rows"
+    );
+    assert_eq!(handle.done.n, 129);
+    primary.close().unwrap();
+    let mut reopened = Db::open(&dir).unwrap();
+    assert_eq!(
+        reopened
+            .run("docs | count")
+            .unwrap()
+            .scalar_as::<i64>()
+            .unwrap(),
+        130
+    );
+    reopened.close().unwrap();
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn absolute_timestamps_survive_bulk_wal_checkpoint_and_reopen() {
+    let dir = tmp();
+    let values = [i64::MIN, -1, 1700000000123, i64::MAX];
+    let expected;
+    {
+        let mut primary = Db::open(&dir).unwrap();
+        primary.run("index docs [ts]").unwrap();
+        let records = (0..129)
+            .map(|i| {
+                format!(
+                    r#"{{ id: "t{i}", uri: "time://{i}", ts: timestamp({}) }}"#,
+                    values[i % values.len()]
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        assert_eq!(
+            primary
+                .run(&format!("insert docs [{records}]"))
+                .unwrap()
+                .done
+                .n,
+            129
+        );
+        expected = primary.store.collection("docs").to_vec();
+        for (i, row) in expected.iter().enumerate() {
+            assert_eq!(
+                row.get("ts"),
+                Some(&lin::Cell::Time(values[i % values.len()]))
+            );
+        }
+        let frames = primary.export_wal_since(0).unwrap();
+        let mut replica = Db::empty();
+        replica.apply_wal(&frames).unwrap();
+        assert_eq!(replica.store.collection("docs"), expected.as_slice());
+        primary.checkpoint().unwrap();
+    }
+    let mut reopened = Db::open(&dir).unwrap();
+    assert_eq!(reopened.store.collection("docs"), expected.as_slice());
+    assert_eq!(
+        reopened
+            .run("docs | ts == timestamp(-1) | take all")
+            .unwrap()
+            .done
+            .n,
+        32
+    );
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn large_sparse_embedding_insert_is_one_durable_frame_and_replays_exactly() {
+    let dir = tmp();
+    let expected;
+    let log_len;
+    {
+        let mut primary = Db::open(&dir).unwrap();
+        let records = (0..10_000).map(|i| format!(r#"{{ id: "sp{i}", uri: "sparse://{i}", title: "shared sparse title", body: "body {i}", ts: timestamp(1700000000123) }}"#)).collect::<Vec<_>>().join(",");
+        let handle = primary.run(&format!("insert docs [{records}]")).unwrap();
+        assert_eq!(handle.done.n, 10_000);
+        expected = primary.store.collection("docs").to_vec();
+        let frames = primary.export_wal_since(0).unwrap();
+        assert_eq!(frames[8], 3);
+        log_len = frames.len();
+        let dense_vector_bytes = expected
+            .iter()
+            .map(|row| {
+                row.get("embedding")
+                    .and_then(lin::Cell::as_vec)
+                    .map_or(4, |v| 4 + v.len() * 4)
+            })
+            .sum::<usize>();
+        eprintln!(
+            "SPARSE_WAL rows=10000 frame_bytes={log_len} dense_vector_bytes={dense_vector_bytes}"
+        );
+        assert!(log_len < 16 * 1024 * 1024);
+        let mut replica = Db::empty();
+        assert_eq!(replica.apply_wal(&frames).unwrap(), 1, "one atomic frame");
+        assert_eq!(replica.store.collection("docs"), expected.as_slice());
+        let replay_dir = tmp();
+        drop(Db::open(&replay_dir).unwrap()); // Empty generation-zero checkpoint.
+        fs::write(replay_dir.join("log"), &frames).unwrap();
+        let replayed = Db::open(&replay_dir).unwrap();
+        assert_eq!(
+            replayed.store.collection("docs"),
+            expected.as_slice(),
+            "local WAL replay"
+        );
+        drop(replayed);
+        fs::remove_dir_all(replay_dir).unwrap();
+        primary.checkpoint().unwrap();
+    }
+    let reopened = Db::open(&dir).unwrap();
+    assert_eq!(reopened.store.collection("docs"), expected.as_slice());
+    drop(reopened);
+    fs::remove_dir_all(dir).unwrap();
+}

@@ -3,7 +3,7 @@
 //! ```text
 //! <data>/
 //!   head       JSON object: gen, catalog_hash, embed_id
-//!   log        append-only framed records (`LIN\x01` / `LIN\x02`)
+//!   log        append-only checksummed records (`LIN\x06`; reads v1/v2)
 //!   snapshot   `LIN\x04` + MessagePack(Snapshot); legacy JSON still reads
 //!   fts/       posting lists per collection (`LIN\x05`), written on checkpoint
 //!   cold/      optional mmap cache of large collections (same rows also inlined
@@ -13,6 +13,8 @@
 //! Log record framing (v1 binary, dual-read with legacy JSON):
 //! - **v1:** magic `LIN\x01` + `u32` LE payload length + MessagePack(`LogRecord`)
 //! - **v2:** magic `LIN\x02` + raw columnar hot packs
+//! - **v3:** magic `LIN\x06` + `u32` LE envelope length + codec byte (1/2/3)
+//!   + encoded payload + CRC32 LE of codec/payload; all new writes use v3
 //! - **legacy:** `u32` LE length + JSON(`LogRecord`) — still replayed on open
 //!
 //! A truncated trailing record is ignored. After replay the log is truncated
@@ -45,6 +47,12 @@ const MAX_RECORD: u32 = 16 * 1024 * 1024;
 /// `\x01` = MessagePack(LogRecord); `\x02` = raw columnar hot packs.
 const LOG_MAGIC_V1: [u8; 4] = *b"LIN\x01";
 const LOG_MAGIC_V2: [u8; 4] = *b"LIN\x02";
+// Internal codec identity; new sparse records are only written inside LIN\x06.
+const LOG_MAGIC_SPARSE: [u8; 4] = *b"LIN\x03";
+const MAX_SPARSE_DECODED_BYTES: usize = 64 * 1024 * 1024;
+const SPARSE_VECTOR_THRESHOLD: usize = 64 * 1024;
+/// Checksummed envelope: codec byte (1/2/3), encoded record, CRC32 of codec + record.
+const LOG_MAGIC_CHECKSUM: [u8; 4] = *b"LIN\x06";
 const V2_FACTS_BULK: u8 = 1;
 const V2_INSERT_COLS: u8 = 2;
 
@@ -492,7 +500,7 @@ fn decode_snapshot_bytes(bytes: &[u8]) -> Option<Snapshot> {
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), Error> {
     write_through_tmp(path, &path.with_extension("tmp"), bytes)?;
     if let Some(parent) = path.parent() {
-        let _ = sync_dir(parent);
+        sync_dir(parent).map_err(io_err)?;
     }
     Ok(())
 }
@@ -573,8 +581,8 @@ pub fn open_log_read(dir: &Path) -> Result<Option<File>, Error> {
 }
 
 /// Append one record and optionally durability-flush the log ([`SyncMode::Full`]).
-/// Hot packs (`AppendFactsBulk` / `InsertCols`) use raw `LIN\x02` framing (no serde).
-/// Other packs use MessagePack behind `LIN\x01`. Legacy JSON still replays.
+/// Hot packs use a raw columnar codec; others use MessagePack. Both are wrapped
+/// in checksummed v3 frames. Legacy v1/v2/JSON still replay.
 pub fn append_record(
     log: &mut File,
     rec: &LogRecord,
@@ -631,19 +639,29 @@ fn write_frame(
     sync: SyncMode,
     log_bytes: &mut u64,
 ) -> Result<(), Error> {
-    let len = payload.len() as u32;
-    if len > MAX_RECORD {
+    let Some(len) = payload
+        .len()
+        .checked_add(5)
+        .filter(|&n| n <= MAX_RECORD as usize)
+    else {
         return Err(io_err("log record exceeds 16MiB"));
-    }
+    };
+    let codec = [magic[3]];
+    let mut checksum = crc32fast::Hasher::new();
+    checksum.update(&codec);
+    checksum.update(payload);
+    let checksum = checksum.finalize().to_le_bytes();
     let mut hdr = [0u8; 8];
-    hdr[..4].copy_from_slice(magic);
-    hdr[4..].copy_from_slice(&len.to_le_bytes());
+    hdr[..4].copy_from_slice(&LOG_MAGIC_CHECKSUM);
+    hdr[4..].copy_from_slice(&(len as u32).to_le_bytes());
     log.write_all(&hdr).map_err(io_err)?;
+    log.write_all(&codec).map_err(io_err)?;
     log.write_all(payload).map_err(io_err)?;
+    log.write_all(&checksum).map_err(io_err)?;
     if sync == SyncMode::Full {
         durable_sync(log).map_err(io_err)?;
     }
-    *log_bytes += 8 + u64::from(len);
+    *log_bytes += 8 + len as u64;
     Ok(())
 }
 
@@ -703,6 +721,36 @@ fn append_facts_v2(
     write_frame(log, &LOG_MAGIC_V2, buf, sync, log_bytes)
 }
 
+fn use_sparse_vectors(rows: &[Option<Vec<f32>>]) -> bool {
+    let dense = rows
+        .iter()
+        .map(|row| 4usize.saturating_add(row.as_ref().map_or(0, |v| v.len().saturating_mul(4))))
+        .fold(0usize, usize::saturating_add);
+    if rows
+        .iter()
+        .any(|row| row.as_ref().is_some_and(Vec::is_empty))
+    {
+        return true; // Preserve Some(empty), which the legacy vector tag cannot express.
+    }
+    if dense < SPARSE_VECTOR_THRESHOLD {
+        return false;
+    }
+    let sparse = rows
+        .iter()
+        .map(|row| {
+            row.as_ref().map_or(4, |v| {
+                8usize.saturating_add(
+                    v.iter()
+                        .filter(|value| value.to_bits() != 0)
+                        .count()
+                        .saturating_mul(8),
+                )
+            })
+        })
+        .fold(0usize, usize::saturating_add);
+    sparse < dense
+}
+
 fn append_insert_cols_v2(
     log: &mut File,
     rec_gen: u64,
@@ -744,6 +792,8 @@ fn append_insert_cols_v2(
     put_str(buf, collection);
     buf.extend_from_slice(&n.to_le_bytes());
     buf.extend_from_slice(&(fields.len() as u32).to_le_bytes());
+    let mut sparse_codec = false;
+    let mut sparse_decoded_bytes = 0usize;
     for (f, c) in fields.iter().zip(cols.iter()) {
         put_str(buf, f);
         match c {
@@ -777,6 +827,50 @@ fn append_insert_cols_v2(
                     buf.extend_from_slice(&x.to_le_bytes());
                 }
             }
+            ColData::Vec(v) if use_sparse_vectors(v) => {
+                if v.len() != n as usize {
+                    return Err(io_err("sparse vector column length mismatch"));
+                }
+                let storage = v
+                    .len()
+                    .checked_mul(std::mem::size_of::<Option<Vec<f32>>>())
+                    .ok_or_else(|| io_err("sparse vector size overflow"))?;
+                sparse_decoded_bytes = sparse_decoded_bytes
+                    .checked_add(storage)
+                    .ok_or_else(|| io_err("sparse vector size overflow"))?;
+                sparse_codec = true;
+                buf.push(7);
+                for row in v {
+                    let Some(emb) = row else {
+                        buf.extend_from_slice(&0u32.to_le_bytes());
+                        continue;
+                    };
+                    let bytes = emb
+                        .len()
+                        .checked_mul(4)
+                        .ok_or_else(|| io_err("sparse vector size overflow"))?;
+                    sparse_decoded_bytes = sparse_decoded_bytes
+                        .checked_add(bytes)
+                        .filter(|&bytes| bytes <= MAX_SPARSE_DECODED_BYTES)
+                        .ok_or_else(|| io_err("sparse vectors exceed decoded 64MiB budget"))?;
+                    let dim = u32::try_from(emb.len())
+                        .ok()
+                        .and_then(|n| n.checked_add(1))
+                        .ok_or_else(|| io_err("sparse vector dimension overflow"))?;
+                    let count = emb.iter().filter(|value| value.to_bits() != 0).count() as u32;
+                    buf.extend_from_slice(&dim.to_le_bytes());
+                    buf.extend_from_slice(&count.to_le_bytes());
+                    for (index, value) in emb.iter().enumerate() {
+                        if value.to_bits() != 0 {
+                            buf.extend_from_slice(&(index as u32).to_le_bytes());
+                            buf.extend_from_slice(&value.to_bits().to_le_bytes());
+                        }
+                    }
+                }
+                if sparse_decoded_bytes > MAX_SPARSE_DECODED_BYTES {
+                    return Err(io_err("sparse vectors exceed decoded 64MiB budget"));
+                }
+            }
             ColData::Vec(v) => {
                 buf.push(6);
                 for row in v {
@@ -794,7 +888,17 @@ fn append_insert_cols_v2(
             ColData::Null => buf.push(0),
         }
     }
-    write_frame(log, &LOG_MAGIC_V2, buf, sync, log_bytes)
+    write_frame(
+        log,
+        if sparse_codec {
+            &LOG_MAGIC_SPARSE
+        } else {
+            &LOG_MAGIC_V2
+        },
+        buf,
+        sync,
+        log_bytes,
+    )
 }
 
 /// Replay complete records with `gen > min_gen`. Returns the byte offset of
@@ -877,7 +981,7 @@ fn read_one(log: &mut File, file_len: u64, pos: u64) -> ReadOne {
         Err(e) => return ReadOne::Io(io_err(e)),
     }
     // v1/v2 framed: magic + u32 len + payload
-    if head == LOG_MAGIC_V1 || head == LOG_MAGIC_V2 {
+    if head == LOG_MAGIC_V1 || head == LOG_MAGIC_V2 || head == LOG_MAGIC_CHECKSUM {
         let mut len_buf = [0u8; 4];
         match log.read_exact(&mut len_buf) {
             Ok(()) => {}
@@ -902,16 +1006,9 @@ fn read_one(log: &mut File, file_len: u64, pos: u64) -> ReadOne {
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return ReadOne::Truncated,
             Err(e) => return ReadOne::Io(io_err(e)),
         }
-        let rec = if head == LOG_MAGIC_V2 {
-            match decode_v2(&buf) {
-                Ok(r) => r,
-                Err(_) => return ReadOne::Corrupt,
-            }
-        } else {
-            match rmp_serde::from_slice::<LogRecord>(&buf) {
-                Ok(r) => r,
-                Err(_) => return ReadOne::Corrupt,
-            }
+        let rec = match decode_frame(&head, &buf) {
+            Ok(r) => r,
+            Err(_) => return ReadOne::Corrupt,
         };
         return ReadOne::Ok {
             rec,
@@ -977,15 +1074,23 @@ fn take_str(buf: &[u8], i: &mut usize) -> Result<String, ()> {
 }
 
 fn decode_v2(buf: &[u8]) -> Result<LogRecord, ()> {
+    decode_column_record(buf, false)
+}
+
+fn decode_column_record(buf: &[u8], allow_sparse: bool) -> Result<LogRecord, ()> {
     if buf.is_empty() {
         return Err(());
     }
     let mut i = 0usize;
     let kind = buf[i];
     i += 1;
+    if allow_sparse && kind != V2_INSERT_COLS {
+        return Err(());
+    }
     let rec_gen = take_u64(buf, &mut i)?;
     let next_id = take_u64(buf, &mut i)?;
-    match kind {
+    let mut saw_sparse = false;
+    let record = match kind {
         V2_FACTS_BULK => {
             let n = take_u32(buf, &mut i)? as usize;
             let mut s = Vec::with_capacity(n);
@@ -1006,6 +1111,15 @@ fn decode_v2(buf: &[u8]) -> Result<LogRecord, ()> {
             let collection = take_str(buf, &mut i)?;
             let n = take_u32(buf, &mut i)?;
             let nf = take_u32(buf, &mut i)? as usize;
+            if allow_sparse
+                && (nf > buf.len().saturating_sub(i) / 5
+                    || (n as usize)
+                        .checked_mul(std::mem::size_of::<Option<Vec<f32>>>())
+                        .is_none_or(|bytes| bytes > MAX_SPARSE_DECODED_BYTES))
+            {
+                return Err(());
+            }
+            let mut sparse_decoded_bytes = 0usize;
             let mut fields = Vec::with_capacity(nf);
             let mut cols = Vec::with_capacity(nf);
             for _ in 0..nf {
@@ -1094,6 +1208,49 @@ fn decode_v2(buf: &[u8]) -> Result<LogRecord, ()> {
                         }
                         ColData::Vec(v)
                     }
+                    7 if allow_sparse => {
+                        saw_sparse = true;
+                        let storage = (n as usize)
+                            .checked_mul(std::mem::size_of::<Option<Vec<f32>>>())
+                            .ok_or(())?;
+                        sparse_decoded_bytes = sparse_decoded_bytes
+                            .checked_add(storage)
+                            .filter(|&bytes| bytes <= MAX_SPARSE_DECODED_BYTES)
+                            .ok_or(())?;
+                        if n as usize > buf.len().saturating_sub(i) / 4 {
+                            return Err(());
+                        }
+                        let mut rows = Vec::with_capacity(n as usize);
+                        for _ in 0..n {
+                            let code = take_u32(buf, &mut i)?;
+                            if code == 0 {
+                                rows.push(None);
+                                continue;
+                            }
+                            let dim = (code - 1) as usize;
+                            let count = take_u32(buf, &mut i)? as usize;
+                            if count > dim || count > buf.len().saturating_sub(i) / 8 {
+                                return Err(());
+                            }
+                            sparse_decoded_bytes = sparse_decoded_bytes
+                                .checked_add(dim.checked_mul(4).ok_or(())?)
+                                .filter(|&bytes| bytes <= MAX_SPARSE_DECODED_BYTES)
+                                .ok_or(())?;
+                            let mut values = vec![0.0f32; dim];
+                            let mut previous = None;
+                            for _ in 0..count {
+                                let pos = take_u32(buf, &mut i)? as usize;
+                                let bits = take_u32(buf, &mut i)?;
+                                if pos >= dim || previous.is_some_and(|last| pos <= last) {
+                                    return Err(());
+                                }
+                                values[pos] = f32::from_bits(bits);
+                                previous = Some(pos);
+                            }
+                            rows.push(Some(values));
+                        }
+                        ColData::Vec(rows)
+                    }
                     _ => return Err(()),
                 };
                 cols.push(col);
@@ -1111,7 +1268,11 @@ fn decode_v2(buf: &[u8]) -> Result<LogRecord, ()> {
             })
         }
         _ => Err(()),
+    }?;
+    if allow_sparse && (!saw_sparse || i != buf.len()) {
+        return Err(());
     }
+    Ok(record)
 }
 
 pub fn truncate_log(log: &mut File, end: u64) -> Result<(), Error> {
@@ -1158,6 +1319,35 @@ pub fn export_wal_since(dir: &Path, since_gen: u64) -> Result<Vec<u8>, Error> {
     Ok(out)
 }
 
+fn decode_frame(magic: &[u8; 4], payload: &[u8]) -> Result<LogRecord, Error> {
+    if *magic == LOG_MAGIC_CHECKSUM {
+        if payload.len() < 5 {
+            return Err(io_err("short checksummed wal payload"));
+        }
+        let end = payload.len() - 4;
+        let expected = u32::from_le_bytes(payload[end..].try_into().unwrap());
+        if crc32fast::hash(&payload[..end]) != expected {
+            return Err(io_err("wal checksum mismatch"));
+        }
+        let codec = match payload[0] {
+            1 => LOG_MAGIC_V1,
+            2 => LOG_MAGIC_V2,
+            3 => LOG_MAGIC_SPARSE,
+            _ => return Err(io_err("unknown wal codec")),
+        };
+        return decode_frame(&codec, &payload[1..end]);
+    }
+    if *magic == LOG_MAGIC_SPARSE {
+        decode_column_record(payload, true).map_err(|_| io_err("bad sparse wal payload"))
+    } else if *magic == LOG_MAGIC_V2 {
+        decode_v2(payload).map_err(|_| io_err("bad v2 wal payload"))
+    } else if *magic == LOG_MAGIC_V1 {
+        rmp_serde::from_slice(payload).map_err(io_err)
+    } else {
+        Err(io_err("unknown wal magic"))
+    }
+}
+
 /// Decode shipped WAL frames and invoke `on_rec` for each record.
 pub fn for_each_wal_frame(
     frames: &[u8],
@@ -1185,13 +1375,7 @@ pub fn for_each_wal_frame_raw(
         }
         let end = pos + 8 + len;
         let payload = &frames[pos + 8..end];
-        let rec = if magic == LOG_MAGIC_V2 {
-            decode_v2(payload).map_err(|_| io_err("bad v2 wal payload"))?
-        } else if magic == LOG_MAGIC_V1 {
-            rmp_serde::from_slice(payload).map_err(io_err)?
-        } else {
-            return Err(io_err("unknown wal magic"));
-        };
+        let rec = decode_frame(&magic, payload)?;
         on_frame(&frames[pos..end], rec)?;
         n += 1;
         pos = end;
@@ -1375,4 +1559,217 @@ pub fn cols_to_rows(fields: &[String], cols: &[ColData], n: usize) -> Vec<crate:
         rows.push(row);
     }
     rows
+}
+
+#[cfg(test)]
+mod wal_integrity_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    fn with_log(test: impl FnOnce(&mut File)) {
+        let path = std::env::temp_dir().join(format!(
+            "lin-wal-integrity-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        test(&mut file);
+        drop(file);
+        fs::remove_file(path).unwrap();
+    }
+
+    fn frame(file: &mut File, pack: Pack) -> Vec<u8> {
+        append_record(
+            file,
+            &LogRecord {
+                r#gen: 1,
+                next_id: 2,
+                pack,
+            },
+            &mut Vec::new(),
+            SyncMode::Normal,
+            &mut 0,
+        )
+        .unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        bytes
+    }
+
+    fn vector_pack(vectors: Vec<Option<Vec<f32>>>) -> Pack {
+        Pack::InsertCols {
+            collection: "docs".into(),
+            fields: vec!["embedding".into()],
+            n: vectors.len() as u32,
+            cols: vec![ColData::Vec(vectors)],
+            edges: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn sparse_vectors_preserve_bits_presence_and_checksum() {
+        let expected = vec![
+            None,
+            Some(Vec::new()),
+            Some(vec![
+                0.0,
+                -0.0,
+                f32::from_bits(0x7fc00001),
+                f32::INFINITY,
+                -1.25,
+            ]),
+        ];
+        with_log(|file| {
+            let bytes = frame(file, vector_pack(expected.clone()));
+            assert_eq!(bytes[8], 3);
+            for_each_wal_frame(&bytes, |record| {
+                let Pack::InsertCols { cols, .. } = record.pack else {
+                    panic!("insert")
+                };
+                let ColData::Vec(actual) = &cols[0] else {
+                    panic!("vectors")
+                };
+                let bits = |rows: &[Option<Vec<f32>>]| {
+                    rows.iter()
+                        .map(|row| {
+                            row.as_ref()
+                                .map(|v| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>())
+                        })
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(bits(actual), bits(&expected));
+                Ok(())
+            })
+            .unwrap();
+            for offset in [8, 9, bytes.len() - 5, bytes.len() - 1] {
+                let mut corrupt = bytes.clone();
+                corrupt[offset] ^= 1;
+                assert!(for_each_wal_frame(&corrupt, |_| Ok(())).is_err());
+            }
+            for cut in 1..bytes.len() {
+                assert!(for_each_wal_frame(&bytes[..cut], |_| Ok(())).is_err());
+            }
+        });
+        with_log(|file| {
+            let bytes = frame(file, vector_pack(vec![Some(vec![1.0; 1024]); 100]));
+            assert_eq!(bytes[8], 2, "dense data keeps legacy raw codec");
+            assert_eq!(for_each_wal_frame(&bytes, |_| Ok(())).unwrap(), 1);
+        });
+    }
+
+    #[test]
+    fn sparse_vector_decoder_rejects_dimensions_indices_and_trailing_bytes() {
+        with_log(|file| {
+            let bytes = frame(
+                file,
+                vector_pack(vec![Some(vec![0.0, 1.0, 0.0, 2.0]), Some(Vec::new())]),
+            );
+            let raw = &bytes[9..bytes.len() - 4];
+            assert!(
+                decode_v2(raw).is_err(),
+                "legacy codec must reject new vector tag"
+            );
+            let mut cursor = 17;
+            take_str(raw, &mut cursor).unwrap();
+            take_u32(raw, &mut cursor).unwrap();
+            take_u32(raw, &mut cursor).unwrap();
+            take_str(raw, &mut cursor).unwrap();
+            assert_eq!(raw[cursor], 7);
+            cursor += 1;
+            for (offset, value) in [
+                (cursor, u32::MAX),
+                (cursor + 4, 5),
+                (cursor + 8, 4),
+                (cursor + 16, 1),
+            ] {
+                let mut bad = raw.to_vec();
+                bad[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+                assert!(decode_column_record(&bad, true).is_err());
+            }
+            let mut extra = raw.to_vec();
+            extra.push(0);
+            assert!(decode_column_record(&extra, true).is_err());
+            let mut wrong_kind = raw.to_vec();
+            wrong_kind[0] = V2_FACTS_BULK;
+            assert!(decode_column_record(&wrong_kind, true).is_err());
+        });
+    }
+
+    #[test]
+    fn checksum_detects_bit_flips_in_both_codecs() {
+        for pack in [
+            Pack::Batch { packs: Vec::new() },
+            Pack::AppendFactsBulk {
+                s: vec!["subject".into()],
+                p: vec!["predicate".into()],
+                o: vec!["object".into()],
+            },
+        ] {
+            with_log(|file| {
+                let bytes = frame(file, pack);
+                assert_eq!(&bytes[..4], &LOG_MAGIC_CHECKSUM);
+                assert_eq!(for_each_wal_frame(&bytes, |_| Ok(())).unwrap(), 1);
+                for offset in 8..bytes.len() {
+                    let mut corrupt = bytes.clone();
+                    corrupt[offset] ^= 1;
+                    assert!(
+                        for_each_wal_frame(&corrupt, |_| Ok(())).is_err(),
+                        "offset {offset}"
+                    );
+                }
+                // Old v1/v2 envelopes remain readable by both shipping and replay.
+                let mut legacy = vec![b'L', b'I', b'N', bytes[8]];
+                let payload = &bytes[9..bytes.len() - 4];
+                legacy.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+                legacy.extend_from_slice(payload);
+                assert_eq!(for_each_wal_frame(&legacy, |_| Ok(())).unwrap(), 1);
+                file.set_len(0).unwrap();
+                file.seek(SeekFrom::Start(0)).unwrap();
+                file.write_all(&legacy).unwrap();
+                let mut seen = 0;
+                assert_eq!(
+                    replay_log(file, 0, 0, |_| {
+                        seen += 1;
+                        Ok(())
+                    })
+                    .unwrap(),
+                    legacy.len() as u64
+                );
+                assert_eq!(seen, 1);
+            });
+        }
+    }
+
+    #[test]
+    fn every_truncated_checksummed_tail_is_ignored_but_complete_corruption_fails() {
+        with_log(|file| {
+            let bytes = frame(file, Pack::Batch { packs: Vec::new() });
+            for length in 0..bytes.len() {
+                file.set_len(0).unwrap();
+                file.seek(SeekFrom::Start(0)).unwrap();
+                file.write_all(&bytes[..length]).unwrap();
+                assert_eq!(
+                    replay_log(file, 0, 0, |_| panic!("partial record replayed")).unwrap(),
+                    0
+                );
+                assert_eq!(file.metadata().unwrap().len(), length as u64);
+            }
+            let mut corrupt = bytes.clone();
+            corrupt[9] ^= 1;
+            corrupt.extend_from_slice(&bytes);
+            file.set_len(0).unwrap();
+            file.seek(SeekFrom::Start(0)).unwrap();
+            file.write_all(&corrupt).unwrap();
+            assert!(replay_log(file, 0, 0, |_| Ok(())).is_err());
+            assert_eq!(file.metadata().unwrap().len(), corrupt.len() as u64);
+        });
+    }
 }

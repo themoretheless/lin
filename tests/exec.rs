@@ -916,6 +916,73 @@ fn update_rollback_restores_rows_and_indexes() {
 }
 
 #[test]
+fn mixed_row_journal_rolls_back_multiple_swaps_and_updates() {
+    let mut db = Db::fixture();
+    db.run("index docs unique [title]").unwrap();
+    let before = digest(&mut db);
+    let generation = db.r#gen();
+    let error = db
+        .run_group([
+        r#"update docs[uri == "wiki://rag-overview"] cas each { title: "journal token", wing: "sys" }"#,
+            r#"delete docs[uri == "raw://n/wal"] cas each"#,
+            r#"delete docs[wing == "rag"] cas each"#,
+            r#"delete docs[uri == "missing"] cas each"#,
+        ])
+        .unwrap_err();
+    assert!(error.to_string().contains("no matching row"), "{error}");
+    assert_eq!(db.r#gen(), generation);
+    assert_eq!(digest(&mut db), before);
+    assert_eq!(
+        db.run(r#"docs | search lex "journal" | take all"#)
+            .unwrap()
+            .done
+            .n,
+        0
+    );
+}
+
+#[test]
+fn bounded_dnf_falls_back_without_changing_results() {
+    let mut db = Db::fixture();
+    db.run("index docs [wing]").unwrap();
+    let branches = (0..14)
+        .map(|_| r#"(wing == "rag" or wing == "sys")"#)
+        .collect::<Vec<_>>()
+        .join(" and ");
+    let query = format!("docs | {branches} | {{ id }} | sort id | take all");
+    let expected = db
+        .run(r#"docs | (wing == "rag" or wing == "sys") | { id } | sort id | take all"#)
+        .unwrap()
+        .rows;
+    let prepared = db.prepare(&query).unwrap();
+    assert!(!format!("{:?}", prepared.plan).contains("IndexSeek"));
+    assert_eq!(prepared.run(&mut db).unwrap().rows, expected);
+    // Small disjunctions still use the scalar index.
+    let small = db
+        .prepare(r#"docs | wing == "rag" or wing == "sys" | { id } | take all"#)
+        .unwrap();
+    assert!(format!("{:?}", small.plan).contains("IndexSeek"));
+}
+
+#[test]
+fn point_mutation_keeps_residual_predicate() {
+    let mut db = Db::fixture();
+    let before = digest(&mut db);
+    for source in [
+        r#"update docs[uri == "raw://n/wal" and wing == "missing"] cas each { title: "wrong" }"#,
+        r#"delete docs[uri == "raw://n/wal" and wing == "missing"] cas each"#,
+    ] {
+        assert!(
+            db.run(source)
+                .unwrap_err()
+                .to_string()
+                .contains("no matching row")
+        );
+        assert_eq!(digest(&mut db), before);
+    }
+}
+
+#[test]
 fn delete_rollback_restores_positions_and_structures() {
     let mut db = Db::fixture();
     db.run("index docs unique [title]").unwrap();
@@ -1201,6 +1268,11 @@ fn index_seeks_mixed_int_and_float_numbers_like_the_scan() {
             ("g", "-4"),
             ("h", "-4.0"),
             ("i", "-2.5"),
+            ("j", "9007199254740992"),
+            ("k", "9007199254740993"),
+            ("l", "9007199254740992.0"),
+            ("m", "0"),
+            ("n", "-0.0"),
         ] {
             db.run(&format!(
                 r#"insert orders {{ id: "{n}", user_id: "{uid}", total: {t}, ts: ago 1d }}"#
@@ -1221,6 +1293,12 @@ fn index_seeks_mixed_int_and_float_numbers_like_the_scan() {
         r"total >= -4",
         r"total == -4",
         r"total > -4 and total < 0",
+        r"total == 9007199254740992",
+        r"total == 9007199254740993",
+        r"total == 9007199254740992.0",
+        r"total == 0.0",
+        r"total > 2 and total > 100",
+        r"total == 9 and total == 10.5",
     ] {
         let stmt = format!(r"orders | {q} | {{ id }} | sort id asc | take all");
         let plan = idx.explain_as(&stmt, None).unwrap();
@@ -1232,4 +1310,339 @@ fn index_seeks_mixed_int_and_float_numbers_like_the_scan() {
         let got: Vec<String> = ids(&idx.run(&stmt).unwrap());
         assert_eq!(got, want, "{q} disagrees with the scan");
     }
+}
+
+#[test]
+fn title_contains_count_matches_string_search_at_boundaries() {
+    let mut db = lin::Db::empty();
+    let titles = [
+        "",
+        "a",
+        "aaaaab",
+        "wal",
+        "prefix wal",
+        "walwal",
+        "ёжик 🦔",
+        "0123456789abcdefg",
+        "0123456789abcdef",
+    ];
+    for (i, title) in titles.iter().enumerate() {
+        db.run(&format!(
+            r#"insert docs [{{id: "t-{i}", uri: "test://{i}", title: {}, body: ""}}]"#,
+            serde_json::to_string(title).unwrap()
+        ))
+        .unwrap();
+    }
+    for needle in [
+        "",
+        "a",
+        "aaab",
+        "wal",
+        "al",
+        "missing",
+        "ёж",
+        "🦔",
+        "0123456789abcdef",
+        "0123456789abcdefg",
+        "0123456789abcdefgh",
+    ] {
+        let got = db
+            .run(&format!(
+                "docs | title ~ {} | count",
+                serde_json::to_string(needle).unwrap()
+            ))
+            .unwrap();
+        let want = titles.iter().filter(|title| title.contains(needle)).count() as i64;
+        assert_eq!(
+            got.rows[0].values().next(),
+            Some(&lin::Cell::Int(want)),
+            "needle={needle:?}"
+        );
+    }
+}
+
+#[test]
+fn packed_title_scan_tracks_mutations_and_rejects_cross_row_matches() {
+    let mut db = lin::Db::empty();
+    db.run(r#"insert docs [{id: "a", uri: "test://a", title: "aa", body: ""}, {id: "b", uri: "test://b", title: "aaa", body: ""}]"#).unwrap();
+    let count = |db: &mut lin::Db, needle: &str| {
+        let result = db
+            .run(&format!(
+                "docs | title ~ {} | count",
+                serde_json::to_string(needle).unwrap()
+            ))
+            .unwrap();
+        result.rows[0].values().next().unwrap().clone()
+    };
+    assert_eq!(count(&mut db, "aaaa"), lin::Cell::Int(0));
+    assert_eq!(count(&mut db, "aaa"), lin::Cell::Int(1));
+    db.run(r#"update docs[id == "a"] cas each {title: "aaaa"}"#)
+        .unwrap();
+    assert_eq!(count(&mut db, "aaaa"), lin::Cell::Int(1));
+    db.run(r#"delete docs[id == "a"] cas each"#).unwrap();
+    assert_eq!(count(&mut db, "aaaa"), lin::Cell::Int(0));
+    assert_eq!(count(&mut db, "aaa"), lin::Cell::Int(1));
+    db.run(r#"insert docs [{id: "c", uri: "test://c", title: "aaaa", body: ""}]"#)
+        .unwrap();
+    assert_eq!(count(&mut db, "aaaa"), lin::Cell::Int(1));
+    // Rebuild the physical column between a mutation and its rollback.
+    assert!(
+        db.run(
+            r#"update docs[id == "b"] cas each {title: "changed"}
+        docs | title ~ "changed" | count
+        update docs[id == "c"] cas "wrong" {title: "bad"}"#
+        )
+        .is_err()
+    );
+    assert_eq!(count(&mut db, "aaa"), lin::Cell::Int(2));
+    assert_eq!(count(&mut db, "changed"), lin::Cell::Int(0));
+}
+
+#[test]
+fn deleted_rows_keep_original_order_and_rollback_positions() {
+    let mut db = Db::fixture();
+    db.run(
+        r#"col notes { title: text }
+insert notes [
+ {id: "n0", title: "live"}, {id: "n1", title: "dead"},
+ {id: "n2", title: "live"}, {id: "n3", title: "dead"},
+ {id: "n4", title: "live"}
+]
+index notes [title]"#,
+    )
+    .unwrap();
+    let before = db.store.collection("notes").to_vec();
+    assert!(
+        db.run(
+            r#"delete notes[title == "dead"] cas ""
+update notes[id == "missing"] cas "" { title: "x" }"#
+        )
+        .is_err()
+    );
+    assert_eq!(db.store.collection("notes"), before);
+    let removed = db.run(r#"delete notes[title == "dead"] cas """#).unwrap();
+    assert_eq!(ids(&removed), vec!["n1", "n3"]);
+    assert_eq!(
+        db.run(r#"notes | title == "dead" | count"#)
+            .unwrap()
+            .scalar_as::<i64>()
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn prepared_insert_pack_keeps_statement_alignment_time_and_new_ids() {
+    let mut db = Db::fixture();
+    db.run("col notes { title: text, stamp: time }").unwrap();
+    let prepared = db
+        .prepare(
+            r#"insert notes { title: "first", stamp: now }
+notes | count
+insert notes { title: "second", stamp: now }"#,
+        )
+        .unwrap();
+    prepared.run(&mut db).unwrap();
+    prepared.clone().run(&mut db).unwrap();
+    let rows = db.store.collection("notes");
+    assert_eq!(
+        rows.iter().map(|r| text(r, "title")).collect::<Vec<_>>(),
+        vec!["first", "second", "first", "second"]
+    );
+    let ids = rows
+        .iter()
+        .map(|r| text(r, "id"))
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(ids.len(), 4);
+    for row in rows {
+        assert!(matches!(row.get("stamp"), Some(lin::Cell::Time(t)) if *t > 0));
+    }
+}
+
+#[test]
+fn bulk_insert_count_survives_result_elision_boundary() {
+    for n in [1, 128, 129, 256] {
+        let mut db = Db::empty();
+        let records = (0..n)
+            .map(|i| format!(r#"{{ uri: "raw://count/{i}", title: "wal {i}", layer: "wiki" }}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let handle = db.run(&format!("insert docs [{records}]")).unwrap();
+        assert_eq!(handle.done.n, n, "n={n}");
+        assert_eq!(handle.rows.len(), if n > 128 { 0 } else { n });
+        assert_eq!(
+            db.run("docs | count").unwrap().scalar_as::<i64>().unwrap(),
+            n as i64
+        );
+    }
+}
+
+#[test]
+fn filters_after_aggregation_and_skip_apply_to_stage_output() {
+    let mut db = Db::empty();
+    db.run(
+        r#"col stage_rows { group: text, n: i64 }
+        insert stage_rows [ { group: "a", n: 1 }, { group: "a", n: 2 }, { group: "b", n: 3 } ]"#,
+    )
+    .unwrap();
+    let first = db.run("stage_rows | take 1").unwrap().rows;
+    let id = text(&first[0], "id");
+    let skipped = db
+        .run(&format!("stage_rows | skip 3 | id == \"{id}\" | take all"))
+        .unwrap()
+        .rows;
+    assert!(
+        skipped.is_empty(),
+        "late point filter must not restore skipped rows"
+    );
+    let q = "stage_rows | count by group | hits > 1 | { group } | take all";
+    let rows = db.run(q).unwrap().rows;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(text(&rows[0], "group"), "a");
+    assert_eq!(db.run_batch(q).unwrap().to_rows(), rows);
+    assert_eq!(db.reader().run(q).unwrap().rows, rows);
+    let rows = db
+        .run("stage_rows | skip 1 | n < 2 | take all")
+        .unwrap()
+        .rows;
+    assert!(rows.is_empty(), "skip must happen before filtering");
+    let rows = db
+        .run("stage_rows | sort n desc | take 1 | n < 3 | take all")
+        .unwrap()
+        .rows;
+    assert!(rows.is_empty(), "take must happen before filtering");
+}
+
+#[test]
+fn numeric_sort_orders_nan_after_numbers_and_keeps_zero_and_nan_ties_stable() {
+    let mut db = Db::empty();
+    db.run("col numeric_sort { value: f64, ordinal: i64 }")
+        .unwrap();
+    for i in 0..5 {
+        db.run(&format!(
+            "insert numeric_sort {{ value: 1.0, ordinal: {i} }}"
+        ))
+        .unwrap();
+    }
+    let values = [f64::NAN, -0.0, 0.0, 1.0, f64::NAN];
+    for (row, value) in db
+        .store
+        .collections
+        .get_mut("numeric_sort")
+        .unwrap()
+        .iter_mut()
+        .zip(values)
+    {
+        row.insert("value".into(), lin::Cell::Float(value));
+    }
+    for (q, expected) in [
+        (
+            "numeric_sort | sort value | { ordinal } | take all",
+            vec![1, 2, 3, 0, 4],
+        ),
+        (
+            "numeric_sort | sort value desc | { ordinal } | take all",
+            vec![0, 4, 3, 1, 2],
+        ),
+    ] {
+        let actual: Vec<_> = db
+            .run(q)
+            .unwrap()
+            .rows
+            .iter()
+            .map(|row| row.get("ordinal").unwrap().as_int().unwrap())
+            .collect();
+        assert_eq!(actual, expected);
+    }
+}
+
+#[test]
+fn filter_project_shortcuts_preserve_multiple_filters_and_windows() {
+    let mut db = Db::empty();
+    db.run("col shortcut_rows { n: i64, text: text }").unwrap();
+    for n in 0..8 {
+        db.run(&format!(
+            "insert shortcut_rows {{ n: {n}, text: \"{}\" }}",
+            if n % 2 == 0 { "hit" } else { "miss" }
+        ))
+        .unwrap();
+    }
+    for (q, expected) in [
+        (
+            "shortcut_rows | n >= 0 | take 4 | n > 1 | { n } | take all",
+            vec![2, 3],
+        ),
+        (
+            "shortcut_rows | n > 1 | text ~ \"hit\" | { n } | take all",
+            vec![2, 4, 6],
+        ),
+        (
+            "shortcut_rows | n >= 0 | { n } | take 4 | skip 2 | take all",
+            vec![2, 3],
+        ),
+    ] {
+        let rows = db.run(q).unwrap().rows;
+        let values: Vec<_> = rows.iter().map(|r| r["n"].as_int().unwrap()).collect();
+        assert_eq!(values, expected, "{q}");
+        let rows = db.run_batch(q).unwrap().to_rows();
+        let values: Vec<_> = rows.iter().map(|r| r["n"].as_int().unwrap()).collect();
+        assert_eq!(values, expected, "batch {q}");
+    }
+}
+
+#[test]
+fn absolute_timestamps_compare_identically_in_scans_and_indexes() {
+    let mut db = Db::empty();
+    db.run("col stamps { id: text, stamp: time }").unwrap();
+    let values = [i64::MIN, -1, 0, i64::MAX];
+    for (i, millis) in values.into_iter().enumerate() {
+        db.run(&format!(
+            r#"insert stamps {{ id: "s{i}", stamp: timestamp({millis}) }}"#
+        ))
+        .unwrap();
+    }
+    let queries = [
+        "stamp == timestamp(-1)",
+        "stamp < timestamp(0)",
+        "stamp <= timestamp(0)",
+        "stamp >= timestamp(0)",
+        "stamp > timestamp(0)",
+        "stamp == timestamp(-9223372036854775808)",
+        "stamp == timestamp(9223372036854775807)",
+    ];
+    let read = |db: &mut Db, pred: &str| {
+        db.run(&format!("stamps | {pred} | {{ id }} | take all"))
+            .unwrap()
+            .rows
+            .into_iter()
+            .map(|row| row["id"].text().unwrap().to_string())
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let scan = queries.iter().map(|q| read(&mut db, q)).collect::<Vec<_>>();
+    assert_eq!(
+        scan[0],
+        std::collections::BTreeSet::from(["s1".to_string()])
+    );
+    assert_eq!(
+        scan[1],
+        std::collections::BTreeSet::from(["s0".to_string(), "s1".to_string()])
+    );
+    db.run("index stamps [stamp]").unwrap();
+    for (query, expected) in queries.iter().zip(scan) {
+        assert_eq!(read(&mut db, query), expected);
+    }
+    let prepared = db
+        .prepare("insert stamps { stamp: timestamp(123456789) }")
+        .unwrap();
+    prepared.run(&mut db).unwrap();
+    prepared.run(&mut db).unwrap();
+    assert_eq!(
+        db.store
+            .collection("stamps")
+            .iter()
+            .filter(|row| row.get("stamp") == Some(&lin::Cell::Time(123456789)))
+            .count(),
+        2
+    );
+    assert!(db.prepare("insert stamps { stamp: 123 }").is_err());
 }

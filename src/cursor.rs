@@ -79,6 +79,13 @@ enum CursorDb<'a> {
 }
 
 impl CursorDb<'_> {
+    #[cfg(feature = "gpu")]
+    fn inner(&self) -> &Db {
+        match self {
+            Self::Writer(db) => db,
+            Self::Reader(db) => db.as_db(),
+        }
+    }
     fn store_catalog(&self) -> (&Store, &crate::catalog::Catalog) {
         match self {
             CursorDb::Writer(db) => (&db.store, &db.catalog),
@@ -125,6 +132,8 @@ impl CursorDb<'_> {
 
 #[allow(clippy::large_enum_variant)]
 enum CursorState {
+    #[cfg(feature = "gpu")]
+    GpuStream(GpuStreamCursor),
     Lazy(LazyCursor),
     LazyJoin(LazyJoinCursor),
     /// Hot SoA: `orders [| total >] | join users on user_id | { id, users.email, total }`
@@ -197,6 +206,13 @@ impl<'a> QueryCursor<'a> {
         let q = &q;
         db.prepare_query(q)?;
 
+        #[cfg(feature = "gpu")]
+        if let Some(stream) = try_gpu_stream(&db, q) {
+            return Ok(Self {
+                db,
+                state: CursorState::GpuStream(stream),
+            });
+        }
         if let Some(join) = try_lazy_join_soa(&db, q)? {
             return Ok(Self {
                 db,
@@ -237,10 +253,12 @@ impl<'a> QueryCursor<'a> {
 
     /// Whether this cursor pulls lazily (not a pre-built `Vec`).
     pub fn is_lazy(&self) -> bool {
-        matches!(
-            self.state,
-            CursorState::Lazy(_) | CursorState::LazyJoin(_) | CursorState::LazyJoinSoa(_)
-        )
+        match &self.state {
+            #[cfg(feature = "gpu")]
+            CursorState::GpuStream(_) => true,
+            CursorState::Lazy(_) | CursorState::LazyJoin(_) | CursorState::LazyJoinSoa(_) => true,
+            _ => false,
+        }
     }
 
     /// Pull a compact projected row. Projection schemas are shared across rows;
@@ -248,12 +266,26 @@ impl<'a> QueryCursor<'a> {
     pub fn next_projected(&mut self) -> Option<Result<ProjectedRow, Error>> {
         let native = matches!(&self.state, CursorState::Lazy(lazy) if lazy.project.is_some())
             || matches!(self.state, CursorState::LazyJoinSoa(_));
+        #[cfg(feature = "gpu")]
+        let native = native
+            || matches!(&self.state, CursorState::GpuStream(stream) if stream.project.is_some());
         if !native {
             return self.next().map(|row| row.map(ProjectedRow::from_row));
         }
 
         let (store, _) = self.db.store_catalog();
         let item = match &mut self.state {
+            #[cfg(feature = "gpu")]
+            CursorState::GpuStream(stream) => next_gpu_stream(&self.db, stream).map(|row| {
+                row.map(|row| {
+                    let fields = stream.project.as_ref().expect("native projection").clone();
+                    let cells = fields
+                        .iter()
+                        .map(|name| row.get(name).cloned().unwrap_or(Cell::Null))
+                        .collect();
+                    ProjectedRow { fields, cells }
+                })
+            }),
             CursorState::Lazy(lazy) => next_lazy_projected(store, lazy),
             CursorState::LazyJoinSoa(join) => next_lazy_join_soa_projected(store, join),
             _ => unreachable!("native projected state checked above"),
@@ -287,6 +319,8 @@ impl Iterator for QueryCursor<'_> {
         let (store, _) = self.db.store_catalog();
 
         let item = match &mut self.state {
+            #[cfg(feature = "gpu")]
+            CursorState::GpuStream(stream) => next_gpu_stream(&self.db, stream),
             CursorState::Lazy(lazy) => next_lazy(store, lazy),
             CursorState::LazyJoin(join) => next_lazy_join(store, join),
             CursorState::LazyJoinSoa(join) => next_lazy_join_soa(store, join),
@@ -658,7 +692,7 @@ fn try_lazy_search(db: &CursorDb<'_>, q: &Query) -> Result<Option<LazyCursor>, E
     for step in &q.steps {
         match step {
             Step::Search { mode: m, query: qq } => {
-                if mode.is_some() {
+                if mode.is_some() || project.is_some() || skip_n > 0 || saw_take {
                     return Ok(None);
                 }
                 if !matches!(m, SearchMode::Lex | SearchMode::Hybrid) {
@@ -674,6 +708,9 @@ fn try_lazy_search(db: &CursorDb<'_>, q: &Query) -> Result<Option<LazyCursor>, E
                 project = Some(field_names(f));
             }
             Step::Skip { n } => {
+                if mode.is_none() || saw_take {
+                    return Ok(None);
+                }
                 skip_n = skip_n.saturating_add((*n).max(0) as usize);
             }
             Step::Take { n } => {
@@ -767,7 +804,7 @@ fn try_lazy_hop(db: &CursorDb<'_>, q: &Query) -> Result<Option<LazyCursor>, Erro
                 project = Some(field_names(f));
             }
             Step::Skip { n } => {
-                if hop_rel.is_none() {
+                if hop_rel.is_none() || saw_take {
                     return Ok(None);
                 }
                 skip_n = skip_n.saturating_add((*n).max(0) as usize);
@@ -797,34 +834,63 @@ fn try_lazy_hop(db: &CursorDb<'_>, q: &Query) -> Result<Option<LazyCursor>, Erro
     };
 
     let mut frontier: BTreeSet<String> = BTreeSet::new();
-    collect_seed_keys(
-        store,
-        name,
-        &source,
-        filter,
-        need_filter,
-        now,
-        &mut frontier,
-    );
+    #[cfg(feature = "gpu")]
+    let gpu_seeded = if db.inner().gpu().is_some() {
+        collect_gpu_seed_keys(
+            db.inner(),
+            name,
+            &source,
+            filter,
+            need_filter,
+            now,
+            &mut frontier,
+        )?;
+        true
+    } else {
+        false
+    };
+    #[cfg(not(feature = "gpu"))]
+    let gpu_seeded = false;
+    if !gpu_seeded {
+        collect_seed_keys(
+            store,
+            name,
+            &source,
+            filter,
+            need_filter,
+            now,
+            &mut frontier,
+        );
+    }
 
-    let mut seen = frontier.clone();
-    let mut reached: BTreeSet<String> = BTreeSet::new();
-    for e in &store.edges {
-        if e.rel != edge_rel {
-            continue;
-        }
-        let (src, dst) = if reverse {
-            (e.to.as_str(), e.from.as_str())
-        } else {
-            (e.from.as_str(), e.to.as_str())
-        };
-        if frontier.contains(src) && seen.insert(dst.to_string()) {
-            reached.insert(dst.to_string());
-            if reached.len() >= 300 {
-                break;
+    #[cfg(feature = "gpu")]
+    let gpu_reached = if db.inner().gpu().is_some() {
+        Some(db.inner().gpu_hop_keys(&frontier, edge_rel, reverse)?)
+    } else {
+        None
+    };
+    #[cfg(not(feature = "gpu"))]
+    let gpu_reached: Option<Vec<String>> = None;
+    let reached: BTreeSet<String> = if let Some(keys) = gpu_reached {
+        keys.into_iter().collect()
+    } else {
+        let mut seen = frontier.clone();
+        let mut reached = BTreeSet::new();
+        for edge in &store.edges {
+            if edge.rel != edge_rel {
+                continue;
+            }
+            let (src, dst) = if reverse {
+                (edge.to.as_str(), edge.from.as_str())
+            } else {
+                (edge.from.as_str(), edge.to.as_str())
+            };
+            if frontier.contains(src) && seen.insert(dst.to_owned()) {
+                reached.insert(dst.to_owned());
             }
         }
-    }
+        reached
+    };
 
     let out_collection = if name == "docs" || store.collections.contains_key("docs") {
         // hop resolves via find_doc_key → docs first
@@ -834,6 +900,14 @@ fn try_lazy_hop(db: &CursorDb<'_>, q: &Query) -> Result<Option<LazyCursor>, Erro
     };
     let mut idxs = Vec::new();
     for key in reached {
+        // A lazy source indexes one collection. Eager hop can resolve a mix
+        // of docs and primary rows; primary indices cannot index docs.
+        if out_collection != name
+            && store.find_doc_key(&key).is_none()
+            && store.row_index(name, &key).is_some()
+        {
+            return Ok(None);
+        }
         if let Some(i) = neighbor_idx(store, name, out_collection, &key) {
             idxs.push(i);
         }
@@ -1353,4 +1427,212 @@ impl Queryable {
         self.ensure()?;
         db.cursor(self.query())
     }
+}
+
+#[cfg(feature = "gpu")]
+struct GpuStreamCursor {
+    collection: String,
+    pos: usize,
+    len: usize,
+    batch_rows: usize,
+    steps: Vec<GpuStreamStep>,
+    pending: VecDeque<Row>,
+    stopped: bool,
+    project: Option<Arc<[String]>>,
+    now: i64,
+}
+#[cfg(feature = "gpu")]
+enum GpuStreamStep {
+    Filter(Pred),
+    Project(Vec<String>),
+    Join {
+        left: bool,
+        collection: String,
+        on: String,
+    },
+    Skip(usize),
+    Take(Option<usize>),
+}
+#[cfg(feature = "gpu")]
+fn try_gpu_stream(db: &CursorDb<'_>, query: &Query) -> Option<GpuStreamCursor> {
+    db.inner().gpu()?;
+    let Source::Collection(collection) = &query.source else {
+        return None;
+    };
+    let mut steps = Vec::new();
+    let mut project = None;
+    let mut explicit_take = false;
+    let mut stopped = false;
+    let mut batch_rows = 1024;
+    for step in &query.steps {
+        steps.push(match step {
+            Step::Filter(pred) => GpuStreamStep::Filter(pred.clone()),
+            Step::Project(fields) => {
+                let names = field_names(fields);
+                project = Some(Arc::from(names.clone()));
+                GpuStreamStep::Project(names)
+            }
+            Step::Join {
+                left,
+                collection: right,
+                on,
+            } => {
+                project = None;
+                let to_field = db
+                    .inner()
+                    .catalog
+                    .find_fk(collection, on, right)
+                    .map(|fk| fk.to_field.as_str())
+                    .unwrap_or("id");
+                if to_field != "id" {
+                    batch_rows = 1;
+                }
+                GpuStreamStep::Join {
+                    left: *left,
+                    collection: right.clone(),
+                    on: on.clone(),
+                }
+            }
+            Step::Skip { n } => GpuStreamStep::Skip((*n).max(0) as usize),
+            Step::Take { n } => {
+                explicit_take = true;
+                let n = n.map(|n| n.max(0) as usize);
+                stopped |= n == Some(0);
+                GpuStreamStep::Take(n)
+            }
+            _ => return None,
+        });
+    }
+    if !explicit_take {
+        steps.push(GpuStreamStep::Take(Some(50)));
+    }
+    Some(GpuStreamCursor {
+        collection: collection.clone(),
+        pos: 0,
+        len: db.inner().store.collection(collection).len(),
+        batch_rows,
+        steps,
+        pending: VecDeque::new(),
+        stopped,
+        project,
+        now: now_ms(),
+    })
+}
+#[cfg(feature = "gpu")]
+fn next_gpu_stream(db: &CursorDb<'_>, stream: &mut GpuStreamCursor) -> Option<Result<Row, Error>> {
+    loop {
+        if let Some(row) = stream.pending.pop_front() {
+            return Some(Ok(row));
+        }
+        if stream.stopped || stream.pos >= stream.len {
+            return None;
+        }
+        let end = stream.pos.saturating_add(stream.batch_rows).min(stream.len);
+        let mut rows: Vec<Row> = (stream.pos..end)
+            .filter_map(|i| db.inner().store.get_by_idx(&stream.collection, i).cloned())
+            .collect();
+        stream.pos = end;
+        for step in &mut stream.steps {
+            match step {
+                GpuStreamStep::Filter(pred) => {
+                    match db.inner().gpu_filter_mask(pred, &rows, stream.now) {
+                        Ok(Some(mask)) => {
+                            let mut mask = mask.into_iter();
+                            rows.retain(|_| mask.next().expect("one mask per row"));
+                        }
+                        Ok(None) => rows.retain(|row| eval_pred(pred, row, stream.now)),
+                        Err(error) => {
+                            stream.stopped = true;
+                            return Some(Err(error));
+                        }
+                    }
+                }
+                GpuStreamStep::Project(fields) => {
+                    rows = rows.iter().map(|row| project_fields(row, fields)).collect()
+                }
+                GpuStreamStep::Join {
+                    left,
+                    collection,
+                    on,
+                } => {
+                    match db
+                        .inner()
+                        .gpu_join_rows(&stream.collection, rows, collection, on, *left)
+                    {
+                        Ok(joined) => rows = joined,
+                        Err(error) => {
+                            stream.stopped = true;
+                            return Some(Err(error));
+                        }
+                    }
+                }
+                GpuStreamStep::Skip(left) => {
+                    let n = (*left).min(rows.len());
+                    rows.drain(..n);
+                    *left -= n;
+                }
+                GpuStreamStep::Take(Some(left)) => {
+                    rows.truncate(*left);
+                    *left -= rows.len();
+                    if *left == 0 {
+                        stream.stopped = true;
+                    }
+                }
+                GpuStreamStep::Take(None) => {}
+            }
+        }
+        stream.pending.extend(rows);
+    }
+}
+
+#[cfg(feature = "gpu")]
+fn collect_gpu_seed_keys(
+    db: &Db,
+    name: &str,
+    source: &RowSource,
+    pred: Option<&Pred>,
+    need_filter: bool,
+    now: i64,
+    out: &mut BTreeSet<String>,
+) -> Result<(), Error> {
+    let len = match source {
+        RowSource::Idxs(ids) => ids.len(),
+        RowSource::Scan { len } => *len,
+    };
+    let pred = if need_filter || matches!(source, RowSource::Scan { .. }) {
+        pred
+    } else {
+        None
+    };
+    for start in (0..len).step_by(1024) {
+        let rows: Vec<Row> = (start..len.min(start + 1024))
+            .filter_map(|i| {
+                let index = match source {
+                    RowSource::Idxs(ids) => ids[i],
+                    RowSource::Scan { .. } => i,
+                };
+                db.store.get_by_idx(name, index).cloned()
+            })
+            .collect();
+        let mask = if let Some(pred) = pred {
+            db.gpu_filter_mask(pred, &rows, now)?
+        } else {
+            None
+        };
+        for (i, row) in rows.iter().enumerate() {
+            let hit = mask.as_ref().map_or_else(
+                || pred.is_none_or(|p| eval_pred(p, row, now)),
+                |mask| mask[i],
+            );
+            if hit {
+                if let Some(id) = row_text(row, "id") {
+                    out.insert(id.to_owned());
+                }
+                if let Some(uri) = row_text(row, "uri") {
+                    out.insert(uri.to_owned());
+                }
+            }
+        }
+    }
+    Ok(())
 }

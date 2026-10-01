@@ -1,0 +1,33 @@
+name: compute
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  compile-and-validate:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88"
+      - uses: Swatinem/rust-cache@v2
+      - name: Compile native compute API and examples
+        run: cargo check --locked --features gpu --lib --bin lin --examples
+      - name: Validate all shipped WGSL with baseline capabilities
+        run: cargo test --locked --features gpu --test shaders
+      - name: Verify CPU feature isolation
+        run: cargo check --locked --no-default-features --lib --bin lin
+      - name: Verify explicit CLI error without compute feature
+        run: cargo test --locked --no-default-features --test compute_cli

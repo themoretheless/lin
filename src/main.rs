@@ -109,11 +109,16 @@ fn cmd_explain(args: &[String], data: Option<PathBuf>, follower: bool) -> ExitCo
 
 fn cmd_run(args: &[String], data: Option<PathBuf>, follower: bool) -> ExitCode {
     let mut show_plan = false;
+    let mut use_gpu = false;
     let mut file: Option<PathBuf> = None;
     let mut rest = Vec::new();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            "--gpu" => {
+                use_gpu = true;
+                i += 1;
+            }
             "--explain" => {
                 show_plan = true;
                 i += 1;
@@ -127,7 +132,7 @@ fn cmd_run(args: &[String], data: Option<PathBuf>, follower: bool) -> ExitCode {
                     }
                     None => {
                         eprintln!(
-                            "usage: lin [--data <dir>] run [--explain] [--file <path> | - | '<query>']"
+                            "usage: lin [--data <dir>] run [--gpu] [--explain] [--file <path> | - | '<query>']"
                         );
                         return ExitCode::from(2);
                     }
@@ -151,11 +156,34 @@ fn cmd_run(args: &[String], data: Option<PathBuf>, follower: bool) -> ExitCode {
         }
     };
     if q.trim().is_empty() {
-        eprintln!("usage: lin [--data <dir>] run [--explain] [--file <path> | - | '<query>']");
+        eprintln!(
+            "usage: lin [--data <dir>] run [--gpu] [--explain] [--file <path> | - | '<query>']"
+        );
         return ExitCode::from(2);
     }
+    #[cfg(not(feature = "gpu"))]
+    if use_gpu {
+        eprintln!("GPU support requires building Lin with --features gpu");
+        return ExitCode::from(2);
+    }
+    #[cfg(feature = "gpu")]
+    let gpu = if use_gpu {
+        match lin::gpu::GpuCompute::new() {
+            Ok(gpu) => Some(std::sync::Arc::new(gpu)),
+            Err(error) => {
+                eprintln!("{error}");
+                return ExitCode::from(1);
+            }
+        }
+    } else {
+        None
+    };
     match with_data(data, follower, |db| match db {
         Some(db) => {
+            #[cfg(feature = "gpu")]
+            if let Some(gpu) = &gpu {
+                db.enable_gpu(gpu.clone());
+            }
             let h = db.run(&q)?;
             let plan = if show_plan {
                 Some(db.explain_as(&q, None)?)
@@ -165,6 +193,17 @@ fn cmd_run(args: &[String], data: Option<PathBuf>, follower: bool) -> ExitCode {
             Ok((h, plan))
         }
         None => {
+            #[cfg(feature = "gpu")]
+            if let Some(gpu) = &gpu {
+                let mut db = Db::fixture().with_gpu(gpu.clone());
+                let h = db.run(&q)?;
+                let plan = if show_plan {
+                    Some(db.explain_as(&q, None)?)
+                } else {
+                    None
+                };
+                return Ok((h, plan));
+            }
             let h = lin::run(&q)?;
             let plan = if show_plan {
                 Some(explain_as(&q, None)?)
@@ -238,7 +277,7 @@ fn load_program(file: Option<PathBuf>, rest: &[String]) -> Result<String, String
 fn usage(code: u8) -> ExitCode {
     eprintln!(
         "usage:\n  \
-         lin [--data <dir>] [--follower] run [--explain] [--file <path> | - | '<query>']\n  \
+         lin [--data <dir>] [--follower] run [--gpu] [--explain] [--file <path> | - | '<query>']\n  \
          lin [--data <dir>] [--follower] explain [--graph mermaid|dot] '<query>'\n  \
          lin --data <dir> wal-serve [--listen HOST:PORT] [--token TOKEN] [--tls-cert PEM --tls-key PEM]\n  \
          lin --data <dir> follower status|bootstrap|sync …\n  \

@@ -66,10 +66,14 @@ struct Doc {
 }
 
 fn docs(n: usize) -> Vec<Doc> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64;
+    // All engines and fresh fixtures in this process share a timestamp anchor.
+    static FIXTURE_NOW: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    let now = *FIXTURE_NOW.get_or_init(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+    });
     (0..n)
         .map(|i| {
             let wal = i % 10 == 0;
@@ -103,19 +107,46 @@ fn lin_insert_src(rows: &[Doc]) -> String {
         if i > 0 {
             out.push_str(",\n");
         }
-        let ago = if i % 2 == 0 { "ago 1d" } else { "ago 30d" };
         out.push_str(&format!(
-            r#"  {{ id: "{}", uri: "{}", title: "{}", layer: "wiki", wing: "{}", body: "{}", ts: {} }}"#,
+            r#"  {{ id: "{}", uri: "{}", title: "{}", layer: "wiki", wing: "{}", body: "{}", ts: timestamp({}) }}"#,
             escape_lin(&d.id),
             escape_lin(&d.uri),
             escape_lin(&d.title),
             escape_lin(&d.wing),
             escape_lin(&d.body),
-            ago
+            d.ts
         ));
     }
     out.push_str("\n]");
     out
+}
+
+/// Verify exact input values and scalar-index shape before measuring warm work.
+fn validate_lin_fixture_timestamps(db: &lin::Db, fixtures: &[Doc]) {
+    let rows = db.store.collection("docs");
+    assert_eq!(rows.len(), fixtures.len());
+    for (row, fixture) in rows.iter().zip(fixtures) {
+        assert_eq!(
+            row.get("id").and_then(lin::Cell::text),
+            Some(fixture.id.as_str())
+        );
+        assert_eq!(row.get("ts"), Some(&lin::Cell::Time(fixture.ts)));
+    }
+    for index in db
+        .store
+        .indexes
+        .values()
+        .filter(|index| index.def.collection == "docs")
+    {
+        assert_eq!(
+            index.forward.len(),
+            if fixtures.len() >= 2 {
+                2
+            } else {
+                fixtures.len()
+            }
+        );
+    }
 }
 
 fn range_cutoff_ms() -> i64 {
@@ -208,6 +239,7 @@ fn seed_lin(n: usize) -> LinWarm {
     for chunk in rows.chunks(500) {
         db.run(&lin_insert_src(chunk)).expect("lin seed");
     }
+    validate_lin_fixture_timestamps(&db, &rows);
     let probe_id = &rows[PROBE].id;
     let point_get = db
         .prepare(&format!(
@@ -952,8 +984,33 @@ fn empty_mysql(url: String) -> mysql::Conn {
     conn
 }
 
-fn fill_lin(ins: &mut LinInsert) {
-    ins.prepared.run(&mut ins.db).expect("lin insert");
+fn fill_lin(ins: &mut LinInsert) -> usize {
+    ins.prepared.run(&mut ins.db).expect("lin insert").done.n
+}
+
+fn validate_lin_insert(ins: &LinInsert, n: usize) {
+    validate_lin_rows(&ins.db, n);
+}
+
+fn validate_lin_rows(db: &lin::Db, n: usize) {
+    let rows = db.store.collection("docs");
+    assert_eq!(rows.len(), n);
+    let fixtures = docs(n);
+    for (i, row) in rows.iter().enumerate() {
+        let text = |key: &str| row.get(key).and_then(lin::Cell::text);
+        assert_eq!(text("id"), Some(format!("d-{i}").as_str()));
+        assert_eq!(text("uri"), Some(format!("bench://{i}").as_str()));
+        assert_eq!(text("wing"), Some(if i % 2 == 0 { "rag" } else { "sys" }));
+        let title = if i % 10 == 0 {
+            format!("doc {i} wal note")
+        } else {
+            format!("doc {i} plain")
+        };
+        assert_eq!(text("title"), Some(title.as_str()));
+        assert_eq!(text("body"), Some(format!("body {i}").as_str()));
+        assert_eq!(row.get("ts"), Some(&lin::Cell::Time(fixtures[i].ts)));
+        assert!(row.get("embedding").and_then(lin::Cell::as_vec).is_some());
+    }
 }
 
 struct LinRebuildWarm {
@@ -980,13 +1037,52 @@ fn lin_hits(h: &lin::Handle) -> i64 {
 }
 
 fn fill_sqlite(conn: &rusqlite::Connection, n: usize) {
-    let rows = docs(n);
+    fill_sqlite_rows(conn, &docs(n));
+}
+
+fn validate_sqlite_docs(conn: &rusqlite::Connection, expected: &[Doc]) -> airbug_bench::Result<()> {
+    let mut stmt = conn
+        .prepare("SELECT id, uri, wing, title, ts, body FROM docs ORDER BY id")
+        .unwrap();
+    let got = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, String>(5)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let mut want = expected
+        .iter()
+        .map(|d| {
+            (
+                d.id.clone(),
+                d.uri.clone(),
+                d.wing.clone(),
+                d.title.clone(),
+                d.ts,
+                d.body.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    want.sort();
+    assert_eq!(got, want, "SQLite native ingestion readback");
+    Ok(())
+}
+
+fn fill_sqlite_rows(conn: &rusqlite::Connection, rows: &[Doc]) {
     let tx = conn.unchecked_transaction().expect("tx");
     {
         let mut stmt = tx
             .prepare("INSERT INTO docs (id, uri, wing, title, ts, body) VALUES (?1,?2,?3,?4,?5,?6)")
             .expect("prepare");
-        for d in &rows {
+        for d in rows {
             stmt.execute(rusqlite::params![
                 d.id, d.uri, d.wing, d.title, d.ts, d.body
             ])
@@ -996,41 +1092,48 @@ fn fill_sqlite(conn: &rusqlite::Connection, n: usize) {
     tx.commit().expect("commit");
 }
 
-fn fill_duck(conn: &duckdb::Connection, n: usize) {
-    let rows = docs(n);
+fn fill_duck_appender(conn: &duckdb::Connection, rows: &[Doc]) {
+    let mut appender = conn.appender("docs").expect("duck appender");
+    for d in rows {
+        appender
+            .append_row(duckdb::params![d.id, d.uri, d.wing, d.title, d.ts, d.body])
+            .expect("duck append row");
+    }
+    appender.flush().expect("duck appender flush");
+}
+
+fn fill_duck_rows(conn: &duckdb::Connection, rows: &[Doc]) {
     let mut stmt = conn
         .prepare("INSERT INTO docs (id, uri, wing, title, ts, body) VALUES (?,?,?,?,?,?)")
         .expect("prepare");
-    for d in &rows {
+    for d in rows {
         stmt.execute(duckdb::params![d.id, d.uri, d.wing, d.title, d.ts, d.body])
             .expect("insert");
     }
 }
 
-fn fill_pg(client: &mut postgres::Client, n: usize) {
-    let rows = docs(n);
+fn fill_pg_rows(client: &mut postgres::Client, rows: &[Doc]) {
     let mut tx = client.transaction().expect("pg tx");
     let stmt = tx
         .prepare(
             "INSERT INTO docs_bulk (id, uri, wing, title, ts, body) VALUES ($1,$2,$3,$4,$5,$6)",
         )
         .expect("pg prepare");
-    for d in &rows {
+    for d in rows {
         tx.execute(&stmt, &[&d.id, &d.uri, &d.wing, &d.title, &d.ts, &d.body])
             .expect("pg insert");
     }
     tx.commit().expect("pg commit");
 }
 
-fn fill_mysql(conn: &mut mysql::Conn, n: usize) {
-    let rows = docs(n);
+fn fill_mysql_rows(conn: &mut mysql::Conn, rows: &[Doc]) {
     let mut tx = conn
         .start_transaction(mysql::TxOpts::default())
         .expect("mysql tx");
     let stmt = tx
         .prep("INSERT INTO docs_bulk (id, uri, wing, title, ts, body) VALUES (?,?,?,?,?,?)")
         .expect("mysql prepare");
-    for d in &rows {
+    for d in rows {
         tx.exec_drop(&stmt, (&d.id, &d.uri, &d.wing, &d.title, d.ts, &d.body))
             .expect("mysql insert");
     }
@@ -2044,10 +2147,15 @@ fn main() -> airbug_bench::Result<()> {
         ($label:expr, $n:expr) => {{
             let n = $n;
             suite
-                .bench_with_input(
+                .bench_checked(
                     &format!("insert_bulk_{}/lin", $label),
                     move || setup_lin_insert(n),
                     move |ins| fill_lin(ins),
+                    move |ins, affected| {
+                        assert_eq!(*affected, n);
+                        validate_lin_insert(ins, n);
+                        Ok(())
+                    },
                     DropPolicy::InsideTiming,
                 )
                 .tag("insert")
@@ -2055,10 +2163,11 @@ fn main() -> airbug_bench::Result<()> {
                 .parameter("rows", n)
                 .work_units("rows", n as u64);
             suite
-                .bench_with_input(
+                .bench_checked(
                     &format!("insert_bulk_{}/sqlite", $label),
-                    empty_sqlite,
-                    move |conn| fill_sqlite(conn, n),
+                    move || (empty_sqlite(), docs(n)),
+                    |(conn, rows)| fill_sqlite_rows(conn, rows),
+                    |(conn, expected), _| validate_sqlite_docs(conn, expected),
                     DropPolicy::InsideTiming,
                 )
                 .tag("insert")
@@ -2068,8 +2177,8 @@ fn main() -> airbug_bench::Result<()> {
             suite
                 .bench_with_input(
                     &format!("insert_bulk_{}/duckdb", $label),
-                    empty_duck,
-                    move |conn| fill_duck(conn, n),
+                    move || (empty_duck(), docs(n)),
+                    |(conn, rows)| fill_duck_rows(conn, rows),
                     DropPolicy::InsideTiming,
                 )
                 .tag("insert")
@@ -2080,8 +2189,8 @@ fn main() -> airbug_bench::Result<()> {
                 suite
                     .bench_with_input(
                         &format!("insert_bulk_{}/postgres", $label),
-                        move || empty_pg(url.clone()),
-                        move |client| fill_pg(client, n),
+                        move || (empty_pg(url.clone()), docs(n)),
+                        |(client, rows)| fill_pg_rows(client, rows),
                         DropPolicy::InsideTiming,
                     )
                     .tag("insert")
@@ -2093,8 +2202,8 @@ fn main() -> airbug_bench::Result<()> {
                 suite
                     .bench_with_input(
                         &format!("insert_bulk_{}/mysql", $label),
-                        move || empty_mysql(url.clone()),
-                        move |conn| fill_mysql(conn, n),
+                        move || (empty_mysql(url.clone()), docs(n)),
+                        |(conn, rows)| fill_mysql_rows(conn, rows),
                         DropPolicy::InsideTiming,
                     )
                     .tag("insert")
@@ -2106,6 +2215,56 @@ fn main() -> airbug_bench::Result<()> {
     }
     insert_bulk!("1k", INSERT_1K);
     insert_bulk!("10k", INSERT_10K);
+    // Optimized ingestion is a separate competitor from SQL row-by-row inserts.
+    for (label, n) in [("1k", INSERT_1K), ("10k", INSERT_10K)] {
+        suite
+            .bench_checked(
+                &format!("insert_native_{label}/duckdb_appender"),
+                move || (empty_duck(), docs(n)),
+                |(conn, rows)| fill_duck_appender(conn, rows),
+                |(conn, expected), _| {
+                    let mut stmt = conn
+                        .prepare("SELECT id, uri, wing, title, ts, body FROM docs ORDER BY id")
+                        .unwrap();
+                    let got = stmt
+                        .query_map([], |r| {
+                            Ok((
+                                r.get::<_, String>(0)?,
+                                r.get::<_, String>(1)?,
+                                r.get::<_, String>(2)?,
+                                r.get::<_, String>(3)?,
+                                r.get::<_, i64>(4)?,
+                                r.get::<_, String>(5)?,
+                            ))
+                        })
+                        .unwrap()
+                        .collect::<Result<Vec<_>, _>>()
+                        .unwrap();
+                    let mut want = expected
+                        .iter()
+                        .map(|d| {
+                            (
+                                d.id.clone(),
+                                d.uri.clone(),
+                                d.wing.clone(),
+                                d.title.clone(),
+                                d.ts,
+                                d.body.clone(),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    want.sort();
+                    assert_eq!(got, want, "native ingestion readback");
+                    Ok(())
+                },
+                DropPolicy::OutsideTiming,
+            )
+            .tag("insert")
+            .tag("native")
+            .tag("duckdb")
+            .parameter("rows", n)
+            .work_units("rows", n as u64);
+    }
 
     suite
         .bench_with_input(
@@ -2264,10 +2423,15 @@ fn main() -> airbug_bench::Result<()> {
             .parameter("rows", n)
             .work_units("rows", n as u64);
         suite
-            .bench_with_input(
+            .bench_checked(
                 &format!("durable_insert_{label}/lin"),
                 move || setup_lin_durable_insert(n),
                 move |ins| fill_lin_durable_insert(ins),
+                move |ins, handle| {
+                    assert_eq!(handle.done.n, n);
+                    validate_lin_rows(&ins.db, n);
+                    Ok(())
+                },
                 DropPolicy::OutsideTiming,
             )
             .tag("durable")
@@ -2276,10 +2440,11 @@ fn main() -> airbug_bench::Result<()> {
             .parameter("rows", n)
             .work_units("rows", n as u64);
         suite
-            .bench_with_input(
+            .bench_checked(
                 &format!("durable_insert_{label}/sqlite"),
                 move || setup_sqlite_durable("docs", n),
                 move |s| fill_sqlite_durable(s),
+                move |s, _| validate_sqlite_docs(&s.conn, &docs(n)),
                 DropPolicy::OutsideTiming,
             )
             .tag("durable")
@@ -2427,15 +2592,23 @@ fn main() -> airbug_bench::Result<()> {
         .parameter("rows", INSERT_1K)
         .work_units("rows", INSERT_1K as u64);
 
-    // Audit group: per-statement whole-store undo, planner DNF cross-product,
-    // graph walks without an adjacency index, reader snapshot clone.
-    for (label, n) in [("1k", 1_000usize), ("10k", N)] {
+    // Prepared single-row writes, sampled read-back validation outside timing.
+    // Setup and fixture destruction are excluded by bench_checked's input lifecycle.
+    for (label, n) in [("1k", 1_000usize), ("10k", N), ("100k", 100_000)] {
         suite
-            .bench_with_input(
+            .bench_checked(
                 &format!("update_1row_{label}/lin"),
                 move || setup_lin_write(n),
                 write_update_lin,
-                DropPolicy::InsideTiming,
+                |s, affected| {
+                    assert_eq!(*affected, 1);
+                    assert_eq!(
+                        s.db.store.get_by_id("docs", &s.probe_id).unwrap()["wing"].text(),
+                        Some("sys")
+                    );
+                    Ok(())
+                },
+                DropPolicy::OutsideTiming,
             )
             .tag("audit")
             .tag("write")
@@ -2444,11 +2617,22 @@ fn main() -> airbug_bench::Result<()> {
             .parameter("rows", n)
             .work_units("stmts", 1);
         suite
-            .bench_with_input(
+            .bench_checked(
                 &format!("update_1row_{label}/sqlite"),
-                move || seed_sqlite(n),
+                move || setup_sqlite_write(n),
                 write_update_sqlite,
-                DropPolicy::InsideTiming,
+                |s, affected| {
+                    assert_eq!(*affected, 1);
+                    let wing: String = s
+                        .conn
+                        .query_row("SELECT wing FROM docs WHERE id = ?1", [&s.probe_id], |r| {
+                            r.get(0)
+                        })
+                        .unwrap();
+                    assert_eq!(wing, "sys");
+                    Ok(())
+                },
+                DropPolicy::OutsideTiming,
             )
             .tag("audit")
             .tag("write")
@@ -2456,11 +2640,17 @@ fn main() -> airbug_bench::Result<()> {
             .parameter("rows", n)
             .work_units("stmts", 1);
         suite
-            .bench_with_input(
+            .bench_checked(
                 &format!("delete_1row_{label}/lin"),
                 move || setup_lin_write(n),
                 write_delete_lin,
-                DropPolicy::InsideTiming,
+                move |s, affected| {
+                    assert_eq!(*affected, 1);
+                    assert!(s.db.store.get_by_id("docs", &s.probe_id).is_none());
+                    assert_eq!(s.db.store.collection("docs").len(), n - 1);
+                    Ok(())
+                },
+                DropPolicy::OutsideTiming,
             )
             .tag("audit")
             .tag("write")
@@ -2469,11 +2659,24 @@ fn main() -> airbug_bench::Result<()> {
             .parameter("rows", n)
             .work_units("stmts", 1);
         suite
-            .bench_with_input(
+            .bench_checked(
                 &format!("delete_1row_{label}/sqlite"),
-                move || seed_sqlite(n),
+                move || setup_sqlite_write(n),
                 write_delete_sqlite,
-                DropPolicy::InsideTiming,
+                |s, affected| {
+                    assert_eq!(*affected, 1);
+                    let count: i64 = s
+                        .conn
+                        .query_row(
+                            "SELECT COUNT(*) FROM docs WHERE id = ?1",
+                            [&s.probe_id],
+                            |r| r.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(count, 0);
+                    Ok(())
+                },
+                DropPolicy::OutsideTiming,
             )
             .tag("audit")
             .tag("write")
@@ -2543,7 +2746,8 @@ const GRAPH_N: usize = 5_000;
 struct LinWrite {
     db: lin::Db,
     probe_id: String,
-    hash: String,
+    update: lin::Prepared,
+    delete: lin::Prepared,
 }
 
 /// Same shape as `seed_lin`, kept for the write path (CAS hash resolved once).
@@ -2554,6 +2758,7 @@ fn setup_lin_write(n: usize) -> LinWrite {
     for chunk in rows.chunks(500) {
         db.run(&lin_insert_src(chunk)).expect("lin seed");
     }
+    validate_lin_fixture_timestamps(&db, &rows);
     let probe_id = rows[PROBE].id.clone();
     let hash = db
         .run(&format!(
@@ -2567,28 +2772,48 @@ fn setup_lin_write(n: usize) -> LinWrite {
         .unwrap_or("")
         .to_string();
     assert!(hash.starts_with("h:"), "unexpected cas hash: {hash}");
-    LinWrite { db, probe_id, hash }
+    let update = db
+        .prepare(&format!(
+            r#"update docs[id == "{}"] cas "{}" {{ wing: "sys" }}"#,
+            escape_lin(&probe_id),
+            escape_lin(&hash)
+        ))
+        .expect("prepare update");
+    let delete = db
+        .prepare(&format!(
+            r#"delete docs[id == "{}"] cas "{}""#,
+            escape_lin(&probe_id),
+            escape_lin(&hash)
+        ))
+        .expect("prepare delete");
+    LinWrite {
+        db,
+        probe_id,
+        update,
+        delete,
+    }
 }
 
-fn write_update_lin(s: &mut LinWrite) {
-    let src = format!(
-        r#"update docs[id == "{}"] cas "{}" {{ wing: "sys" }}"#,
-        escape_lin(&s.probe_id),
-        escape_lin(&s.hash)
-    );
-    black_box(s.db.run(&src).expect("lin update").done.n);
+fn write_update_lin(s: &mut LinWrite) -> usize {
+    black_box(s.update.run(&mut s.db).expect("lin update").done.n)
 }
 
-fn write_delete_lin(s: &mut LinWrite) {
-    let src = format!(
-        r#"delete docs[id == "{}"] cas "{}""#,
-        escape_lin(&s.probe_id),
-        escape_lin(&s.hash)
-    );
-    black_box(s.db.run(&src).expect("lin delete").done.n);
+fn write_delete_lin(s: &mut LinWrite) -> usize {
+    black_box(s.delete.run(&mut s.db).expect("lin delete").done.n)
 }
 
-fn write_update_sqlite(s: &mut SqlWarm) {
+fn setup_sqlite_write(n: usize) -> SqlWarm {
+    let s = seed_sqlite(n);
+    s.conn
+        .prepare_cached("UPDATE docs SET wing = ?1 WHERE id = ?2")
+        .unwrap();
+    s.conn
+        .prepare_cached("DELETE FROM docs WHERE id = ?1")
+        .unwrap();
+    s
+}
+
+fn write_update_sqlite(s: &mut SqlWarm) -> usize {
     let mut stmt = s
         .conn
         .prepare_cached("UPDATE docs SET wing = ?1 WHERE id = ?2")
@@ -2596,10 +2821,10 @@ fn write_update_sqlite(s: &mut SqlWarm) {
     black_box(
         stmt.execute(rusqlite::params!["sys", s.probe_id])
             .expect("sqlite update"),
-    );
+    )
 }
 
-fn write_delete_sqlite(s: &mut SqlWarm) {
+fn write_delete_sqlite(s: &mut SqlWarm) -> usize {
     let mut stmt = s
         .conn
         .prepare_cached("DELETE FROM docs WHERE id = ?1")
@@ -2607,7 +2832,7 @@ fn write_delete_sqlite(s: &mut SqlWarm) {
     black_box(
         stmt.execute(rusqlite::params![s.probe_id])
             .expect("sqlite delete"),
-    );
+    )
 }
 
 struct LinPlan {
@@ -2727,6 +2952,13 @@ fn run_suite(mut suite: Suite<'_>, args: &[String]) -> airbug_bench::Result<()> 
                     .ok_or_else(|| airbug_bench::error("--samples requires value"))?
                     .parse()?;
             }
+            "--max-iterations" => {
+                i += 1;
+                config.max_iterations = args
+                    .get(i)
+                    .ok_or_else(|| airbug_bench::error("--max-iterations requires value"))?
+                    .parse()?;
+            }
             "--sample-ms" => {
                 i += 1;
                 config.sample_time = Duration::from_millis(
@@ -2753,7 +2985,7 @@ fn run_suite(mut suite: Suite<'_>, args: &[String]) -> airbug_bench::Result<()> 
             }
             "--help" | "-h" => {
                 println!(
-                    "--list --profile quick|normal|thorough --filter TEXT [--exact|--glob] --exclude GLOB --tag TAG --samples N --sample-ms N --warmup-ms N --json --output NEW_DIRECTORY"
+                    "--list --profile quick|normal|thorough --filter TEXT [--exact|--glob] --exclude GLOB --tag TAG --samples N --max-iterations N --sample-ms N --warmup-ms N --json --output NEW_DIRECTORY"
                 );
                 return Ok(());
             }

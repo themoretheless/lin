@@ -1,0 +1,38 @@
+   Compiling lin v0.4.0 (/Users/themoretheless/Documents/Sources/lin)
+warning: constant `BACKUP_MAGIC` is never used
+  --> src/persist.rs:43:11
+   |
+43 | pub const BACKUP_MAGIC: [u8; 4] = *b"LIN\x04";
+   |           ^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `lin` (lib) generated 1 warning
+    Finished `bench` profile [optimized] target(s) in 14.54s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running benches/compare.rs (target/release/build/lin/6d633ee837827fae/out/compare-6d633ee837827fae)
+skip postgres: no reachable server
+  tried: postgresql://lin:lin@127.0.0.1:55432/lin (error connecting to server); postgresql://postgres@127.0.0.1:5432/postgres (error connecting to server)
+  set LIN_BENCH_PG_URL or:
+  docker compose -f docker-compose.bench.yml up -d postgres
+  # brew postgresql@17 via Sources/ppduster macos-stack-postgres; start service for :5432
+skip mysql: no reachable server
+  tried: mysql://lin:lin@127.0.0.1:53306/lin (DriverError { Could not connect to address `127.0.0.1:53306': Connection refused (os error 61) }); mysql://dbill:dbill@127.0.0.1:33306/dbill_smoke (DriverError { Could not connect to address `127.0.0.1:33306': Connection refused (os error 61) })
+  set LIN_BENCH_MYSQL_URL or:
+  docker compose -f docker-compose.bench.yml up -d mysql
+  # or sibling dbill: docker compose -f ../dbill/docker-compose.yml up -d mysql
+lin compare: N=10000 warm reads (fixture), bulk insert (schema outside timing)
+engines: Lin | SQLite(rusqlite bundled) | DuckDB(bundled) | HashMap(point get only) | Postgres(skipped) | MySQL(skipped)
+airbug dash: http://127.0.0.1:8790/
+Lin reads: prepare once / run many; filters use count (fair vs SQL COUNT(*));
+substring: Lin `title ~ "wal" | count` vs SQL LIKE '%wal%' COUNT(*);
+materialize: Lin `wing==rag | {id,title} | take all` vs SQL SELECT id,title;
+join: 10000 orders ⋈ 1000 users (Lin run_batch SoA / cursor vs SQL INNER JOIN);
+append_log: Lin `append facts` vs SQL INSERT INTO logs (append-only shape)
+airbug dash: http://127.0.0.1:8790/#/bench
+Error: Message("run has no cases")
+error: bench failed, to rerun pass `--bench compare`
+
+Caused by:
+  process didn't exit successfully: `/Users/themoretheless/Documents/Sources/lin/target/release/build/lin/6d633ee837827fae/out/compare-6d633ee837827fae --filter __build_only__ --exact --output /Users/themoretheless/Documents/Sources/lin/benches/results/2026-10-01-inline-index-ab/build-vec --bench` (exit status: 1)

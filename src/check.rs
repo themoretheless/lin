@@ -575,7 +575,7 @@ fn value_type(value: &Value, cat: &Catalog) -> Result<Type, Error> {
         Value::Int(_) => Ok(Type::I64),
         Value::Float(_) => Ok(Type::F64),
         Value::Bool(_) => Ok(Type::Bool),
-        Value::Now | Value::NowMinus(_) => Ok(Type::Time),
+        Value::Timestamp(_) | Value::Now | Value::NowMinus(_) => Ok(Type::Time),
         Value::Duration(_) => Ok(Type::Dur),
         Value::Name(n) => {
             if cat.rel(n).is_some() {

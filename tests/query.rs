@@ -592,3 +592,124 @@ fn owned_linrow_and_to_cell() {
     assert!(!rows[0].title.is_empty() || !rows[0].stamp.hash.is_empty() || rows[0].stamp.ts >= 0);
     let _ = "x".to_cell();
 }
+
+#[test]
+fn fallback_batch_preserves_projection_schema_and_order_even_when_empty() {
+    let mut db = Db::fixture();
+    for q in [
+        "docs | title ~ \"no-such-token-batch\" | sort ts | { title, id } | take all",
+        "docs | title ~ \"wal\" | sort ts | { title, id } | take all",
+    ] {
+        let rows = db.run(q).unwrap().rows;
+        let batch = db.run_batch(q).unwrap();
+        assert_eq!(batch.names.as_ref(), &["title", "id"]);
+        assert_eq!(batch.to_rows(), rows);
+        assert_eq!(db.reader().run_batch(q).unwrap(), batch);
+    }
+}
+
+#[test]
+fn lazy_hop_resolves_before_result_cap_and_preserves_take_skip_order() {
+    let mut db = Db::fixture();
+    db.store.edges.clear();
+    db.run("insert docs { uri: \"cursor://root\", title: \"Root\", layer: \"wiki\" }")
+        .unwrap();
+    for i in (0..305).rev() {
+        db.run(&format!(
+            "insert docs {{ uri: \"cursor://n{i:03}\", title: \"N{i}\", layer: \"wiki\" }}"
+        ))
+        .unwrap();
+    }
+    for i in 0..10 {
+        db.run(&format!(
+            "append edge wikilink \"cursor://root\" -> \"aa-missing{i}\""
+        ))
+        .unwrap();
+    }
+    for i in (0..305).rev() {
+        db.run(&format!(
+            "append edge wikilink \"cursor://root\" -> \"cursor://n{i:03}\""
+        ))
+        .unwrap();
+    }
+    let base = Queryable::from("docs")
+        .filter("uri == \"cursor://root\"")
+        .hop("wikilink")
+        .select(["uri"]);
+    let q = base.clone().take_all();
+    let expected = q.to_vec(&mut db).unwrap();
+    assert_eq!(expected.len(), 300);
+    let mut cursor = q.cursor(&db).unwrap();
+    assert!(cursor.is_lazy());
+    assert_eq!(
+        cursor.by_ref().collect::<Result<Vec<_>, _>>().unwrap(),
+        expected
+    );
+    let q = base.take(5).skip(2).take_all();
+    let expected = q.to_vec(&mut db).unwrap();
+    assert_eq!(expected.len(), 3);
+    assert_eq!(
+        q.cursor(&db)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap(),
+        expected
+    );
+}
+
+#[test]
+fn hop_cursor_preserves_mixed_primary_and_doc_rows() {
+    let mut db = Db::fixture();
+    let mut edge = db.store.edges[0].clone();
+    edge.rel = "wikilink".into();
+    edge.from = "u1".into();
+    edge.to = "u2".into();
+    db.store.edges = vec![edge.clone()];
+    edge.to = db.store.collection("docs")[0]["id"]
+        .text()
+        .unwrap()
+        .to_owned();
+    db.store.edges.push(edge);
+    let query = Queryable::from("users")
+        .filter("id == \"u1\"")
+        .hop("wikilink")
+        .take_all();
+    let expected = query.to_vec(&mut db).unwrap();
+    assert_eq!(expected.len(), 2);
+    assert_eq!(
+        query
+            .cursor(&db)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap(),
+        expected
+    );
+}
+
+#[test]
+fn search_shortcuts_preserve_take_then_skip_and_projection_before_search() {
+    let mut db = Db::fixture();
+    for i in 0..8 {
+        db.run(&format!("insert docs {{ uri: \"search-order://{i}\", title: \"uniquestageword\", layer: \"wiki\" }}")).unwrap();
+    }
+    let q = Queryable::from("docs")
+        .search_lex("uniquestageword")
+        .take(5)
+        .skip(2)
+        .select(["uri"]);
+    let expected = q.to_vec(&mut db).unwrap();
+    assert_eq!(expected.len(), 3);
+    assert_eq!(
+        q.cursor(&db)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap(),
+        expected
+    );
+    let q = Queryable::from("docs")
+        .select(["id"])
+        .search_lex("uniquestageword")
+        .take_all();
+    assert!(q.to_vec(&mut db).unwrap().is_empty());
+    assert!(q.cursor(&db).unwrap().next().is_none());
+}

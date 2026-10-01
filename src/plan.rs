@@ -1168,6 +1168,7 @@ pub fn fmt_value(v: &Value) -> String {
         Value::Int(n) => n.to_string(),
         Value::Float(n) => n.to_string(),
         Value::Bool(b) => b.to_string(),
+        Value::Timestamp(millis) => format!("timestamp({millis})"),
         Value::Now => "now".into(),
         Value::NowMinus(d) => format!("now - {}", d.display()),
         Value::Duration(d) => d.display(),
