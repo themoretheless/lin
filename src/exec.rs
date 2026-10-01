@@ -4304,6 +4304,31 @@ mod record_tests {
     use super::*;
 
     #[test]
+    fn prepared_insert_keeps_last_duplicate_and_dynamic_time() {
+        let source = r#"insert docs {title:"old",ts:now,title:"middle",uri:"prepared://duplicate",title:"new",id:"prepared-id"}"#;
+        let mut db = Db::empty();
+        let prepared = db.prepare(source).unwrap();
+        let Stmt::Insert { records, .. } = &prepared.stmts[0] else {
+            panic!("insert")
+        };
+        for now in [123, 456] {
+            let row = record_row(&records[0], now);
+            assert_eq!(row_text(&row, "title"), Some("new"));
+            assert_eq!(row.get("ts"), Some(&Cell::Time(now)));
+        }
+        let before = now_ms();
+        let handle = prepared.run(&mut db).unwrap();
+        let after = now_ms();
+        assert_eq!(handle.done.n, 1);
+        let row = db.store.get_by_id("docs", "prepared-id").unwrap();
+        assert_eq!(row_text(row, "title"), Some("new"));
+        let Cell::Time(timestamp) = row["ts"] else {
+            panic!("time")
+        };
+        assert!((before..=after).contains(&timestamp));
+    }
+
+    #[test]
     fn row_build_preserves_last_duplicate_and_execution_time() {
         let record = Record {
             fields: vec![

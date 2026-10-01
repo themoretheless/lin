@@ -2000,8 +2000,19 @@ impl Store {
             let by_id = self.by_id.entry(collection.to_owned()).or_default();
             for (i, row) in rows.iter().enumerate() {
                 let idx = start + i;
-                let id = row.get("id").and_then(Cell::text_shared);
-                let uri = row.get("uri").and_then(Cell::text_shared);
+                let mut texts: [Option<Arc<str>>; 5] = std::array::from_fn(|_| None);
+                for (field, value) in row {
+                    let slot = match field.as_str() {
+                        "id" => 0,
+                        "uri" => 1,
+                        "title" => 2,
+                        "layer" => 3,
+                        "wing" => 4,
+                        _ => continue,
+                    };
+                    texts[slot] = value.text_shared();
+                }
+                let [id, uri, title, layer, wing] = texts;
                 if let Some(ref id) = id {
                     by_id.insert(Arc::clone(id), idx);
                 }
@@ -2009,21 +2020,9 @@ impl Store {
                     self.docs_by_uri.insert(uri, idx);
                 }
                 self.docs_id.push(id.unwrap_or_default());
-                self.docs_title.push(
-                    row.get("title")
-                        .and_then(Cell::text_shared)
-                        .unwrap_or_default(),
-                );
-                self.docs_layer.push(
-                    row.get("layer")
-                        .and_then(Cell::text_shared)
-                        .unwrap_or_default(),
-                );
-                self.docs_wing.push(
-                    row.get("wing")
-                        .and_then(Cell::text_shared)
-                        .unwrap_or_default(),
-                );
+                self.docs_title.push(title.unwrap_or_default());
+                self.docs_layer.push(layer.unwrap_or_default());
+                self.docs_wing.push(wing.unwrap_or_default());
             }
             return;
         }
@@ -2857,6 +2856,42 @@ fn civil_from_days(days: i64) -> (i32, u32, u32) {
 #[cfg(test)]
 mod borrowed_delete_tests {
     use super::*;
+
+    #[test]
+    fn doc_slab_registration_matches_single_rows_with_missing_and_nontext_fields() {
+        let rows = (0..64)
+            .map(|i| {
+                let mut row = Row::new();
+                for field in ["id", "uri", "title", "layer", "wing", "extra"] {
+                    match (i + field.len()) % 4 {
+                        0 => {}
+                        1 => {
+                            row.insert(field.into(), Cell::Null);
+                        }
+                        2 => {
+                            row.insert(field.into(), Cell::Int(i as i64));
+                        }
+                        _ => {
+                            row.insert(field.into(), Cell::text_arc(format!("{field}-{}", i % 9)));
+                        }
+                    }
+                }
+                row
+            })
+            .collect::<Vec<_>>();
+        let mut slab = Store::empty("test/8");
+        let mut scalar = Store::empty("test/8");
+        slab.row_maps_register_slab("docs", 0, &rows);
+        for (i, row) in rows.iter().enumerate() {
+            scalar.row_maps_register_row("docs", i, row);
+        }
+        assert_eq!(slab.by_id, scalar.by_id);
+        assert_eq!(slab.docs_by_uri, scalar.docs_by_uri);
+        assert_eq!(slab.docs_id, scalar.docs_id);
+        assert_eq!(slab.docs_title, scalar.docs_title);
+        assert_eq!(slab.docs_layer, scalar.docs_layer);
+        assert_eq!(slab.docs_wing, scalar.docs_wing);
+    }
     use crate::catalog::IndexDef;
 
     fn seed(collection: &str, rows: Vec<Row>) -> Store {

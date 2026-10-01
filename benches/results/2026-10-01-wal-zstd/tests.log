@@ -1,0 +1,337 @@
+   Compiling lin v0.4.0 (/Users/themoretheless/Documents/Sources/lin)
+warning: constant `BACKUP_MAGIC` is never used
+  --> src/persist.rs:43:11
+   |
+43 | pub const BACKUP_MAGIC: [u8; 4] = *b"LIN\x04";
+   |           ^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `lin` (lib) generated 1 warning
+warning: `lin` (lib test) generated 1 warning (1 duplicate)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.85s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/lib.rs (target/debug/build/lin/5c3740b180a9afda/out/lin-5c3740b180a9afda)
+
+running 32 tests
+test fts::pending_order_tests::ascii_lowering_and_unicode_fallback_match_original_character_mapping ... ok
+test embed::tests::hashing_batch_matches_single_embedding ... ok
+test exec::record_tests::row_build_preserves_last_duplicate_and_execution_time ... ok
+test embed::tests::single_embedding_field_borrows_the_row_text ... ok
+test catalog::tests::nested_union_queries_still_reach_the_borrow_check ... ok
+test embed::tests::embedding_text_preserves_empty_fields_and_separators ... ok
+test fts::tests::posting_codec_roundtrips_and_rejects_truncation ... ok
+test fts::pending_order_tests::out_of_order_pending_edits_match_live_positions ... ok
+test fts::tests::prune_drops_stale_blobs_and_half_written_temps ... ok
+test embed::tests::hashing_embedding_matches_original_dense_modulo_bits ... ok
+test catalog::tests::rewrite_only_allocates_when_a_filter_applies ... ok
+test parse::absolute_timestamp_tests::timestamp_literals_preserve_signed_milliseconds_and_name_syntax ... ok
+test index::storage_tests::inline_and_spilled_keys_keep_lexicographic_order_and_reverse_updates ... ok
+test persist::wal_integrity_tests::column_field_union_keeps_later_extra_and_replaced_fields ... ok
+test ship::tests::tls_server_name_only_comes_from_a_dns_host ... ok
+test persist::wal_integrity_tests::shared_text_columns_preserve_legacy_bytes_and_row_values ... ok
+test store::borrowed_delete_tests::doc_slab_registration_matches_single_rows_with_missing_and_nontext_fields ... ok
+test store::borrowed_delete_tests::nonparallel_columns_keep_the_rebuild_fallback ... ok
+test fts::tests::borrowed_tokens_deduplicate_and_normalize_across_fields_and_edits ... ok
+test fts::tests::repeated_term_removal_and_reinsertion_matches_current_rows ... ok
+test persist::wal_integrity_tests::sparse_vector_decoder_rejects_dimensions_indices_and_trailing_bytes ... ok
+test fts::tests::appended_slabs_match_general_insert_after_tail_recycling ... ok
+test fts::pending_order_tests::fused_merge_matches_two_pass_on_all_small_sets ... ok
+test embed::tests::sparse_normalization_preserves_dense_bits_at_exact_sum_boundary ... ok
+test store::borrowed_delete_tests::borrowed_moves_match_rebuilt_rows_maps_columns_indexes_and_fts ... ok
+test persist::wal_integrity_tests::sparse_vectors_preserve_bits_presence_and_checksum ... ok
+test persist::wal_integrity_tests::checksum_detects_bit_flips_in_both_codecs ... ok
+test persist::wal_integrity_tests::every_truncated_checksummed_tail_is_ignored_but_complete_corruption_fails ... ok
+test fts::pending_order_tests::descending_and_random_edits_survive_folding_and_codec ... ok
+test ship::tests::pull_roundtrip_ephemeral ... ok
+test ship::tests::pull_rejects_bad_token ... ok
+test ship::tests::pull_verifies_a_named_server_certificate ... ok
+
+test result: ok. 32 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.24s
+
+     Running unittests src/main.rs (target/debug/build/lin/c033ea241a00c191/out/lin-c033ea241a00c191)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/compute_cli.rs (target/debug/build/lin/bb6f530bf035b6b2/out/compute_cli-bb6f530bf035b6b2)
+
+running 1 test
+test gpu_flag_requires_compute_feature ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.60s
+
+     Running tests/delete_readback.rs (target/debug/build/lin/d41efc2916b9a299/out/delete_readback-d41efc2916b9a299)
+
+running 4 tests
+test repeated_deletes_do_not_drift ... ok
+test single_delete_is_visible_through_every_lookup_path ... ok
+test many_at_once_survive_reopen ... ok
+test posting_deltas_fold_without_losing_or_resurrecting_rows ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 19.74s
+
+     Running tests/embed.rs (target/debug/build/lin/2d5ed1f2e1a1412e/out/embed-2d5ed1f2e1a1412e)
+
+running 4 tests
+test with_embedder_swap_roundtrip ... ok
+test hashing_remains_default_embedder ... ok
+test bulk_insert_uses_embedder_batch_api_once ... ok
+test hashing_vectors_match_the_reference_recipe ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/exec.rs (target/debug/build/lin/62a7f42bd75453c4/out/exec-62a7f42bd75453c4)
+
+running 60 tests
+test bulk_insert_then_count ... ok
+test cas_reject ... ok
+test append_idempotent ... ok
+test bulk_append_edges_hop ... ok
+test cas_each_all_or_nothing ... ok
+test bulk_insert_uniqueness_checks_empty_batch_and_existing_rows_atomically ... ok
+test bulk_insert_updates_index ... ok
+test cas_each_ok ... ok
+test catalog_filter_hides_reads_not_writes ... ok
+test delete_docs_cas_and_edge_and_facts ... ok
+test fk_insert_ok_when_parent_exists ... ok
+test empty_list_exec ... ok
+test delete_reindexes_maps_and_postings ... ok
+test fk_insert_requires_parent_row ... ok
+test filter_ago_and_has ... ok
+test deleted_rows_keep_original_order_and_rollback_positions ... ok
+test graph_after_insert_with_edge ... ok
+test filters_after_aggregation_and_skip_apply_to_stage_output ... ok
+test fts_case_folds_both_paths ... ok
+test hop_after_insert_with_edge ... ok
+test grouped_commit_rolls_back_rows_and_fts_on_runtime_error ... ok
+test index_filter_explain_and_rows ... ok
+test filter_project_shortcuts_preserve_multiple_filters_and_windows ... ok
+test delete_rollback_restores_positions_and_structures ... ok
+test delete_rollback_across_collections_keeps_soa_and_maps ... ok
+test let_then_use ... ok
+test absolute_timestamps_compare_identically_in_scans_and_indexes ... ok
+test insert_then_query ... ok
+test index_maintain_delete_update ... ok
+test match_one_hop ... ok
+test live_col_insert_query ... ok
+test multi_stmt_one_pack_and_sees_writes ... ok
+test multi_stmt_atomic_rollback ... ok
+test index_or_equality_rows ... ok
+test owned_type_is_not_a_collection ... ok
+test prepare_once_run_many ... ok
+test match_two_hop_chain ... ok
+test graph_depth_chain ... ok
+test prepared_insert_pack_keeps_statement_alignment_time_and_new_ids ... ok
+test numeric_sort_orders_nan_after_numbers_and_keeps_zero_and_nan_ties_stable ... ok
+test mixed_row_journal_rolls_back_multiple_swaps_and_updates ... ok
+test packed_title_scan_tracks_mutations_and_rejects_cross_row_matches ... ok
+test reembed_updates_embeddings ... ok
+test seed_join_and_search ... ok
+test search_vec_and_hybrid_rank ... ok
+test union_concat_then_take ... ok
+test unknown_field_still_compile_fail ... ok
+test bounded_dnf_falls_back_without_changing_results ... ok
+test unique_index_refuses_existing_duplicates ... ok
+test update_repairs_fts_and_index_keys ... ok
+test title_contains_count_matches_string_search_at_boundaries ... ok
+test point_mutation_keeps_residual_predicate ... ok
+test unique_index_rejects_duplicate_and_rolls_back ... ok
+test update_rollback_restores_rows_and_indexes ... ok
+test project_take_all_skips_body ... ok
+test take_50_implicit ... ok
+test deep_dnf_plans_as_scan_but_returns_seek_rows ... ok
+test index_seeks_mixed_int_and_float_numbers_like_the_scan ... ok
+test search_lex_top_k_matches_full_ranking_prefix_and_skip ... ok
+test bulk_insert_count_survives_result_elision_boundary ... ok
+
+test result: ok. 60 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/gpu.rs (target/debug/build/lin/b59ca4558202ef9e/out/gpu-b59ca4558202ef9e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/lang.rs (target/debug/build/lin/d76b9d88ba14ead2/out/lang-d76b9d88ba14ead2)
+
+running 62 tests
+test bulk_insert_with_forbidden ... ok
+test delete_on_pipe_is_mutation ... ok
+test ago_rejects_unitless_and_string ... ok
+test empty_list_is_error ... ok
+test delete_keyed_requires_cas ... ok
+test graph_unknown_rel ... ok
+test append_facts ... ok
+test catalog_filter_in_plan ... ok
+test bulk_insert_plan ... ok
+test graph_wikilink ... ok
+test explain_graph_mermaid_search_filter ... ok
+test delete_keyed_cas_plan ... ok
+test explain_graph_dot_search_filter ... ok
+test bare_predicate_without_keyword_is_where ... ok
+test bulk_append_plan ... ok
+test explain_cost_still_has_budget ... ok
+test explain_cost_search ... ok
+test delete_edge_and_facts ... ok
+test cas_each_plan ... ok
+test ago_equals_now_minus ... ok
+test catalog_filter_all_skips ... ok
+test hop_unknown_rel ... ok
+test decls_and_idb_parse ... ok
+test hop_wikilink ... ok
+test index_or_equality_uses_index ... ok
+test index_or_with_unindexed_arm_scans ... ok
+test index_point_get_still ... ok
+test join_without_fk ... ok
+test index_prefix_only_uses_index ... ok
+test let_cannot_shadow_collection ... ok
+test insert_with_edge ... ok
+test index_ts_only_does_not_claim_composite ... ok
+test match_unknown_rel ... ok
+test join_fk ... ok
+test index_wing_ts_uses_composite ... ok
+test mutation_on_pipe ... ok
+test match_duplicate_bind ... ok
+test match_edge_bind_rejects_star ... ok
+test laconic_filter_project_ago ... ok
+test let_binding_plan ... ok
+test match_path_plan ... ok
+test live_col_then_query ... ok
+test match_with_start_alias ... ok
+test owned_flattens_into_col ... ok
+test point_get_by_id ... ok
+test search_vec_on_users ... ok
+test page_and_catalog_and_reembed ... ok
+test update_body_immutable ... ok
+test unknown_field ... ok
+test search_lex_fts_seek ... ok
+test update_without_cas ... ok
+test regex_errors_and_has_type ... ok
+test match_star_and_reverse_and_edge_plan ... ok
+test union_compatible_plan ... ok
+test search_count_sort ... ok
+test update_cas ... ok
+test union_paren_and_mismatch ... ok
+test required_combo_explain ... ok
+test search_hybrid_then_take ... ok
+test verbose_where_pick_alias ... ok
+test signed_number_literals ... ok
+test title_has_and_regex_and_substr ... ok
+
+test result: ok. 62 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/persist.rs (target/debug/build/lin/ae61c583df5d53c8/out/persist-ae61c583df5d53c8)
+
+running 38 tests
+
+running 1 test
+
+running 1 test
+test crash_exit_keeps_full_commit ... ok
+test crash_exit_keeps_entire_group_commit ... ok
+test append_idempotent_after_reopen ... ok
+test bulk_insert_survives_reopen ... ok
+test embedding_survives_durable_reopen ... ok
+test absolute_timestamps_survive_bulk_wal_checkpoint_and_reopen ... ok
+test memory_snapshot_restore ... ok
+test cold_checkpoint_reopen ... ok
+test delete_survives_reopen ... ok
+test catalog_filter_survives_checkpoint_reopen ... ok
+test cas_after_reopen ... ok
+test durable_fts_blob_survives_checkpoint_reopen ... ok
+test quotas_reject_excess_rows ... ok
+test reader_snapshot_is_frozen_and_read_only ... ok
+test shared_readers_across_threads ... ok
+test checkpoint_compacts_log ... ok
+test cold_backup_self_contained ... ok
+test backup_export_import_roundtrip ... ok
+test open_read_does_not_see_commits_after_open ... ok
+test index_survives_reopen ... ok
+test insert_survives_reopen ... ok
+test open_read_loads_durable_without_writer ... ok
+test insert_with_edge_survives ... ok
+test durable_follower_hot_standby ... ok
+test multi_stmt_one_gen_and_atomic_durable ... ok
+test large_insert_wal_contains_rows_elided_from_handle ... ok
+test follower_rejects_wal_gap ... ok
+test new_col_survives_reopen ... ok
+
+running 1 test
+test store_open_api_and_snapshot ... ok
+test sync_normal_survives_checkpoint ... ok
+test owned_survives_checkpoint_reopen ... ok
+test writer_lock_rejects_second_open ... ok
+test wal_export_apply_roundtrip ... ok
+test wal_update_after_snapshot_replays_against_row_maps ... ok
+test ship_tls_token_roundtrip ... ok
+test ship_tcp_follower_sync ... ok
+test truncated_last_record_ignored ... ok
+test large_sparse_embedding_insert_is_one_durable_frame_and_replays_exactly ... ok
+
+test result: ok. 38 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.15s
+
+     Running tests/query.rs (target/debug/build/lin/caec4065e5442890/out/query-caec4065e5442890)
+
+running 30 tests
+test cell_match_via_row_ext ... ok
+test filter_by_closure_is_pred ... ok
+test fluent_filter_select_take ... ok
+test filter_dialect_gt ... ok
+test explain_and_after_keyset ... ok
+test fluent_prepare_and_ignore_filters ... ok
+test filter_typed_lambda ... ok
+test fluent_search_vec ... ok
+test from_typed_uses_collection ... ok
+test first_not_implicit_take ... ok
+test fluent_hop_and_match ... ok
+test hop_cursor_preserves_mixed_primary_and_doc_rows ... ok
+test join_run_batch_matches_rows ... ok
+test filter_project_run_batch_matches_rows ... ok
+test lazy_cursor_matches_to_vec ... ok
+test prepare_query_cache_hits ... ok
+test lazy_search_lex_cursor ... ok
+test async_offload_to_vec ... ok
+test lazy_join_cursor ... ok
+test pred_and_with_ago ... ok
+test owned_linrow_and_to_cell ... ok
+test typed_from_row ... ok
+test skip_offset_paging ... ok
+test async_stream_matches_to_vec ... ok
+test typed_cursor_join_and_first_or ... ok
+test run_stmt_matches_string ... ok
+test scalar_and_execute ... ok
+test fallback_batch_preserves_projection_schema_and_order_even_when_empty ... ok
+test search_shortcuts_preserve_take_then_skip_and_projection_before_search ... ok
+test lazy_hop_resolves_before_result_cap_and_preserves_take_skip_order ... ok
+
+test result: ok. 30 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/shaders.rs (target/debug/build/lin/97ac523ea4ed5db6/out/shaders-97ac523ea4ed5db6)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/build/lin-derive/863bb8c8b1c00341/out/lin_derive-863bb8c8b1c00341)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests lin
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests lin_derive
+
+running 1 test
+test lin-derive/src/lib.rs - derive_lin_row (line 9) ... ignored
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+all doctests ran in 4.73s; merged doctests compilation took 0.11s

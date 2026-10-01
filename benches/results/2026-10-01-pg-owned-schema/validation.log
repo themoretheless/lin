@@ -1,0 +1,73 @@
+skip mysql: LIN_BENCH_SKIP_MYSQL is set
+lin compare: N=10000 warm reads (fixture), bulk insert (schema outside timing)
+engines: Lin | SQLite(rusqlite bundled) | DuckDB(bundled) | HashMap(point get only) | Postgres(postgresql://lin:lin@127.0.0.1:55432/lin_scope_validation_83884_1790865050947815000) | MySQL(skipped)
+airbug dash: http://127.0.0.1:8790/
+Lin reads: prepare once / run many; filters use count (fair vs SQL COUNT(*));
+substring: Lin `title ~ "wal" | count` vs SQL LIKE '%wal%' COUNT(*);
+materialize: Lin `wing==rag | {id,title} | take all` vs SQL SELECT id,title;
+join: 10000 orders ⋈ 1000 users (Lin run_batch SoA / cursor vs SQL INNER JOIN);
+append_log: Lin `append facts` vs SQL INSERT INTO logs (append-only shape)
+airbug dash: http://127.0.0.1:8790/#/bench
+bench: compare/point_get/postgres — validating and calibrating
+bench: compare/point_get/postgres — measuring 1 samples
+bench: compare/filter_eq/postgres — validating and calibrating
+bench: compare/filter_eq/postgres — measuring 1 samples
+bench: compare/filter_range/postgres — validating and calibrating
+bench: compare/filter_range/postgres — measuring 1 samples
+bench: compare/text_substr/postgres — validating and calibrating
+bench: compare/text_substr/postgres — measuring 1 samples
+bench: compare/materialize/postgres — validating and calibrating
+bench: compare/materialize/postgres — measuring 1 samples
+bench: compare/join_inner/postgres — validating and calibrating
+bench: compare/join_inner/postgres — measuring 1 samples
+bench: compare/join_filter/postgres — validating and calibrating
+bench: compare/join_filter/postgres — measuring 1 samples
+bench: compare/insert_bulk_1k/postgres — validating and calibrating
+bench: compare/insert_bulk_1k/postgres — measuring 1 samples
+bench: compare/insert_bulk_10k/postgres — validating and calibrating
+bench: compare/insert_bulk_10k/postgres — measuring 1 samples
+bench: compare/append_log_1k/postgres — validating and calibrating
+bench: compare/append_log_1k/postgres — measuring 1 samples
+bench: compare/append_log_10k/postgres — validating and calibrating
+bench: compare/append_log_10k/postgres — measuring 1 samples
+# bench 1790865052323960000-83897
+
+Status: Complete
+
+| Case | Metric | Median | Unit | Scope / statistic | Observations | Processes |
+|---|---|---:|---|---|---:|---:|
+| compare/point_get/postgres [candidate] | wall | 295750.0000 | ns | current thread wall clock; scheduler included / batch_total | 1 | 1 |
+| compare/filter_eq/postgres [candidate] | wall | 438792.0000 | ns | current thread wall clock; scheduler included / batch_total | 1 | 1 |
+| compare/filter_range/postgres [candidate] | wall | 456083.0000 | ns | current thread wall clock; scheduler included / batch_total | 1 | 1 |
+| compare/text_substr/postgres [candidate] | wall | 773750.0000 | ns | current thread wall clock; scheduler included / batch_total | 1 | 1 |
+| compare/materialize/postgres [candidate] | wall | 1678708.0000 | ns | current thread wall clock; scheduler included / batch_total | 1 | 1 |
+| compare/join_inner/postgres [candidate] | wall | 3274250.0000 | ns | current thread wall clock; scheduler included / batch_total | 1 | 1 |
+| compare/join_filter/postgres [candidate] | wall | 1901042.0000 | ns | current thread wall clock; scheduler included / batch_total | 1 | 1 |
+| compare/insert_bulk_1k/postgres [candidate] | wall | 222296542.0000 | ns | current thread wall clock; scheduler included / batch_total | 1 | 1 |
+| compare/insert_bulk_10k/postgres [candidate] | wall | 1956821791.0000 | ns | current thread wall clock; scheduler included / batch_total | 1 | 1 |
+| compare/append_log_1k/postgres [candidate] | wall | 212175458.0000 | ns | current thread wall clock; scheduler included / batch_total | 1 | 1 |
+| compare/append_log_10k/postgres [candidate] | wall | 1963401833.0000 | ns | current thread wall clock; scheduler included / batch_total | 1 | 1 |
+
+# Useful work throughput
+
+| Case | Median batch throughput | Unit |
+|---|---:|---|
+| compare/join_inner/postgres [candidate] | 3054134.5346 | rows/s |
+| compare/join_filter/postgres [candidate] | 2630136.5251 | rows/s |
+| compare/insert_bulk_1k/postgres [candidate] | 4498.4955 | rows/s |
+| compare/insert_bulk_10k/postgres [candidate] | 5110.3274 | rows/s |
+| compare/append_log_1k/postgres [candidate] | 4713.0804 | rows/s |
+| compare/append_log_10k/postgres [candidate] | 5093.2009 | rows/s |
+
+Derived from positive wall batches and declared units per operation; zero/unavailable durations omitted.
+
+Medians above summarize observations, not pooled operation-latency percentiles. Comparisons aggregate within each process first.
+
+- Raw batches are not independent process replications. Batch averages are not individual-operation latency. CPU frequency and background load are uncontrolled.
+
+- compare/point_get/postgres: some samples below half the requested duration; iteration cap or workload drift may limit precision
+
+- compare/filter_eq/postgres: some samples below half the requested duration; iteration cap or workload drift may limit precision
+
+- compare/filter_range/postgres: some samples below half the requested duration; iteration cap or workload drift may limit precision
+

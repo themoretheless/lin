@@ -63,8 +63,12 @@ impl FtsIndex {
     /// straight into the base list, which keeps appends allocation-cheap.
     pub fn append_row(&mut self, row_idx: usize, row: &Row) {
         let mut scratch = String::new();
+        self.append_row_with_scratch(row_idx, row, &mut scratch);
+    }
+
+    fn append_row_with_scratch(&mut self, row_idx: usize, row: &Row, scratch: &mut String) {
         for text in fts_texts(row, &self.fields) {
-            let lowered = lowercased(text, &mut scratch);
+            let lowered = lowercased(text, scratch);
             for tok in lowered.split_whitespace() {
                 add_posting(&mut self.postings, tok, row_idx);
             }
@@ -75,8 +79,9 @@ impl FtsIndex {
     /// because a recycled tail position can still occur in an old base posting.
     pub fn append_slab(&mut self, start: usize, rows: &[Row]) {
         if self.adds.is_empty() && self.dels.is_empty() {
+            let mut scratch = String::new();
             for (i, row) in rows.iter().enumerate() {
-                self.append_row(start + i, row);
+                self.append_row_with_scratch(start + i, row, &mut scratch);
             }
         } else {
             for (i, row) in rows.iter().enumerate() {
@@ -583,6 +588,30 @@ pub fn fts_fields(catalog: &crate::catalog::Catalog, collection: &str) -> Vec<St
 mod tests {
     use super::*;
     use crate::store::Cell;
+
+    #[test]
+    fn slab_normalization_scratch_matches_individual_rows() {
+        let fields = vec!["title".into(), "body".into()];
+        let rows = ["LONG UPPERCASE TITLE", "x", "ЁЖ İ 🦔", "", "MiXeD", "lower"]
+            .into_iter()
+            .map(|title| {
+                Row::from([
+                    ("title".into(), Cell::text_arc(title)),
+                    ("body".into(), Cell::text_arc("Body BODY")),
+                    ("snippet".into(), Cell::text_arc("SNIPPET")),
+                ])
+            })
+            .collect::<Vec<_>>();
+        let mut slab = FtsIndex::empty(&fields);
+        let mut single = FtsIndex::empty(&fields);
+        slab.append_slab(17, &rows);
+        for (i, row) in rows.iter().enumerate() {
+            single.append_row(17 + i, row);
+        }
+        assert_eq!(slab.postings, single.postings);
+        assert_eq!(slab.adds, single.adds);
+        assert_eq!(slab.dels, single.dels);
+    }
 
     #[test]
     fn appended_slabs_match_general_insert_after_tail_recycling() {

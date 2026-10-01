@@ -1,0 +1,68 @@
+skip mysql: LIN_BENCH_SKIP_MYSQL is set
+lin compare: N=10000 warm reads (fixture), bulk insert (schema outside timing)
+engines: Lin | SQLite(rusqlite bundled) | DuckDB(bundled) | HashMap(point get only) | Postgres(postgresql://lin:lin@127.0.0.1:55432/lin_pg_checked_89237_1790865632459906000) | MySQL(skipped)
+airbug dash: http://127.0.0.1:8790/
+Lin reads: prepare once / run many; filters use count (fair vs SQL COUNT(*));
+substring: Lin `title ~ "wal" | count` vs SQL LIKE '%wal%' COUNT(*);
+materialize: Lin `wing==rag | {id,title} | take all` vs SQL SELECT id,title;
+join: 10000 orders ⋈ 1000 users (Lin run_batch SoA / cursor vs SQL INNER JOIN);
+append_log: Lin `append facts` vs SQL INSERT INTO logs (append-only shape)
+airbug dash: http://127.0.0.1:8790/#/bench
+bench: compare/insert_bulk_1k/lin — validating and calibrating
+bench: compare/insert_bulk_1k/lin — measuring 8 samples
+bench: compare/insert_bulk_1k/sqlite — validating and calibrating
+bench: compare/insert_bulk_1k/sqlite — measuring 8 samples
+bench: compare/insert_bulk_1k/postgres — validating and calibrating
+bench: compare/insert_bulk_1k/postgres — measuring 8 samples
+bench: compare/insert_native_1k/postgres_copy — validating and calibrating
+bench: compare/insert_native_1k/postgres_copy — measuring 8 samples
+bench: compare/insert_bulk_10k/lin — validating and calibrating
+bench: compare/insert_bulk_10k/lin — measuring 8 samples
+bench: compare/insert_bulk_10k/sqlite — validating and calibrating
+bench: compare/insert_bulk_10k/sqlite — measuring 8 samples
+bench: compare/insert_bulk_10k/postgres — validating and calibrating
+bench: compare/insert_bulk_10k/postgres — measuring 8 samples
+bench: compare/insert_native_10k/postgres_copy — validating and calibrating
+bench: compare/insert_native_10k/postgres_copy — measuring 8 samples
+bench: compare/insert_native_1k/duckdb_appender — validating and calibrating
+bench: compare/insert_native_1k/duckdb_appender — measuring 8 samples
+bench: compare/insert_native_10k/duckdb_appender — validating and calibrating
+bench: compare/insert_native_10k/duckdb_appender — measuring 8 samples
+# bench 1790865706486077000-89815
+
+Status: Complete
+
+| Case | Metric | Median | Unit | Scope / statistic | Observations | Processes |
+|---|---|---:|---|---|---:|---:|
+| compare/insert_bulk_1k/lin [candidate] | wall | 962958.5000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+| compare/insert_bulk_1k/sqlite [candidate] | wall | 828104.5000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+| compare/insert_bulk_1k/postgres [candidate] | wall | 234260937.5000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+| compare/insert_native_1k/postgres_copy [candidate] | wall | 4715833.5000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+| compare/insert_bulk_10k/lin [candidate] | wall | 10101458.5000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+| compare/insert_bulk_10k/sqlite [candidate] | wall | 10586812.5000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+| compare/insert_bulk_10k/postgres [candidate] | wall | 2028728125.0000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+| compare/insert_native_10k/postgres_copy [candidate] | wall | 28884771.0000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+| compare/insert_native_1k/duckdb_appender [candidate] | wall | 1436562.5000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+| compare/insert_native_10k/duckdb_appender [candidate] | wall | 10729833.0000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+
+# Useful work throughput
+
+| Case | Median batch throughput | Unit |
+|---|---:|---|
+| compare/insert_bulk_1k/lin [candidate] | 1038484.2745 | rows/s |
+| compare/insert_bulk_1k/sqlite [candidate] | 1207580.0965 | rows/s |
+| compare/insert_bulk_1k/postgres [candidate] | 4271.8991 | rows/s |
+| compare/insert_native_1k/postgres_copy [candidate] | 212052.9457 | rows/s |
+| compare/insert_bulk_10k/lin [candidate] | 989959.5875 | rows/s |
+| compare/insert_bulk_10k/sqlite [candidate] | 944575.6935 | rows/s |
+| compare/insert_bulk_10k/postgres [candidate] | 4929.2596 | rows/s |
+| compare/insert_native_10k/postgres_copy [candidate] | 346205.9920 | rows/s |
+| compare/insert_native_1k/duckdb_appender [candidate] | 699876.3394 | rows/s |
+| compare/insert_native_10k/duckdb_appender [candidate] | 932081.3798 | rows/s |
+
+Derived from positive wall batches and declared units per operation; zero/unavailable durations omitted.
+
+Medians above summarize observations, not pooled operation-latency percentiles. Comparisons aggregate within each process first.
+
+- Raw batches are not independent process replications. Batch averages are not individual-operation latency. CPU frequency and background load are uncontrolled.
+

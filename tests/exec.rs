@@ -710,6 +710,48 @@ fn index_maintain_delete_update() {
 }
 
 #[test]
+fn bulk_insert_uniqueness_checks_empty_batch_and_existing_rows_atomically() {
+    for (seed, source, expected_error) in [
+        (
+            false,
+            r#"insert docs [{id:"same",uri:"u://1"},{id:"same",uri:"u://2"}]"#,
+            "duplicate id",
+        ),
+        (
+            false,
+            r#"insert docs [{id:"one",uri:"u://same"},{id:"two",uri:"u://same"}]"#,
+            "duplicate uri",
+        ),
+        (
+            true,
+            r#"insert docs [{id:"new",uri:"u://new"},{id:"seed",uri:"u://other"}]"#,
+            "duplicate id",
+        ),
+        (
+            true,
+            r#"insert docs [{id:"new",uri:"u://new"},{id:"other",uri:"u://seed"}]"#,
+            "duplicate uri",
+        ),
+    ] {
+        let mut db = Db::empty();
+        if seed {
+            db.run(r#"insert docs {id:"seed",uri:"u://seed"}"#).unwrap();
+        }
+        let before = db.store.collection("docs").to_vec();
+        let generation = db.store.r#gen;
+        let error = db.run(source).unwrap_err();
+        assert!(error.to_string().contains(expected_error), "{error}");
+        assert_eq!(db.store.collection("docs"), before);
+        assert_eq!(db.store.r#gen, generation);
+        db.run(r#"insert docs [{id:"new",uri:"u://new"},{id:"other",uri:"u://other"}]"#)
+            .unwrap();
+        assert_eq!(db.store.collection("docs").len(), before.len() + 2);
+        assert!(db.store.get_by_id("docs", "new").is_some());
+        assert!(db.store.get_by_uri("u://other").is_some());
+    }
+}
+
+#[test]
 fn unique_index_rejects_duplicate_and_rolls_back() {
     let mut db = Db::fixture();
     db.run("index docs unique [title]").unwrap();

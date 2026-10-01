@@ -243,6 +243,10 @@ Workflow [`.github/workflows/bench.yml`](.github/workflows/bench.yml) на `push
 
 Движки: **Lin**, **SQLite** (`rusqlite` bundled), **DuckDB** (bundled; собирается на mac aarch64), **Postgres** / **MySQL** (опционально, через URL), плюс **HashMap** только для point get. N=10 000 для тёплых чтений (fixture; setup вне тайминга). Bulk insert: схема/индекс в setup, в тайминге только запись.
 
+Postgres bulk insert проверяет все шесть записанных полей отдельным подключением после commit, вне таймера. Помимо построчного INSERT в транзакции есть `insert_native_1k/postgres_copy` и `insert_native_10k/postgres_copy`: binary COPY с теми же индексами, проверкой числа строк и полным readback.
+
+Для проверки затрат нормализации FTS на bulk insert можно задать `LIN_BENCH_MIXED_CASE=1` и выбрать `--filter insert_bulk`: заголовки fixture будут со смешанным регистром у всех движков. Этот режим предназначен для вставок; обычные read cases используют условия для стандартных строчных заголовков.
+
 Сравнимо: point get по id, `wing ==`, range `wing`+`ts`, substring (`title ~ "wal" | count` ≈ `COUNT(*) … LIKE '%wal%'`), materialize `SELECT id,title`, **join** (10k `orders` ⋈ 1k `users` по FK; Lin `run_batch` / SoA+`RecordBatch` и lazy cursor vs SQL `INNER JOIN`; плюс `total > 100` затем join), bulk insert 1k/10k, **append_log** (`append facts` vs `INSERT INTO logs`) 1k/10k.
 Join: row-API (`run` → `Vec<Row>`) и OLAP-путь (`run_batch` → `RecordBatch`) рядом; бенч join меряет batch. DuckDB — референс columnar OLAP.  
 
@@ -277,6 +281,8 @@ Update/delete: подготовка вне таймера, read-back validation,
 `--max-iterations 1 --warmup-ms 0` ограничивает дорогие fresh-input прогоны.
 
 ### Postgres / MySQL
+
+Postgres fixtures создают отдельную схему `lin_bench_*` для каждого подключения и удаляют её при завершении. Таблицы остаются обычными WAL-logged таблицами; schema setup и cleanup находятся вне таймера. Пользователю подключения нужен `CREATE` на тестовой базе. Для отдельного прогона PostgreSQL установите `LIN_BENCH_SKIP_MYSQL=1`: это отключает подключение и setup MySQL.
 
 Без сервера кейсы пропускаются (Lin/SQLite/DuckDB всё равно бегут). URL: `LIN_BENCH_PG_URL` / `LIN_BENCH_MYSQL_URL`, иначе авто-probe локальных портов.
 

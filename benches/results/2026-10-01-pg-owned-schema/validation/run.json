@@ -1,0 +1,434 @@
+{
+  "schema": 1,
+  "id": "1790865052323960000-83897",
+  "status": "complete",
+  "environment": {
+    "arch": "aarch64",
+    "os": "macos"
+  },
+  "provenance": {
+    "bench_version": "0.6.0",
+    "samples": "1",
+    "warmup_ns": "0"
+  },
+  "cases": [
+    {
+      "id": "compare/point_get/postgres",
+      "contract": {
+        "completion": "synchronous function return",
+        "lifecycle": "shared lazy process fixture; setup/borrow/drop excluded; output drop included",
+        "param.n": "10000",
+        "sample_target_ns": "1000000",
+        "samples": "1",
+        "tag.point_get": "true",
+        "tag.postgres": "true",
+        "warmup_ns": "0"
+      },
+      "metrics": [
+        {
+          "id": "wall",
+          "unit": "ns",
+          "scope": "current thread wall clock; scheduler included",
+          "phase": "measurement",
+          "statistic": "batch_total",
+          "direction": "lower"
+        }
+      ]
+    },
+    {
+      "id": "compare/filter_eq/postgres",
+      "contract": {
+        "completion": "synchronous function return",
+        "lifecycle": "shared lazy process fixture; setup/borrow/drop excluded; output drop included",
+        "param.n": "10000",
+        "sample_target_ns": "1000000",
+        "samples": "1",
+        "tag.filter_eq": "true",
+        "tag.postgres": "true",
+        "warmup_ns": "0"
+      },
+      "metrics": [
+        {
+          "id": "wall",
+          "unit": "ns",
+          "scope": "current thread wall clock; scheduler included",
+          "phase": "measurement",
+          "statistic": "batch_total",
+          "direction": "lower"
+        }
+      ]
+    },
+    {
+      "id": "compare/filter_range/postgres",
+      "contract": {
+        "completion": "synchronous function return",
+        "lifecycle": "shared lazy process fixture; setup/borrow/drop excluded; output drop included",
+        "param.n": "10000",
+        "sample_target_ns": "1000000",
+        "samples": "1",
+        "tag.filter_range": "true",
+        "tag.postgres": "true",
+        "warmup_ns": "0"
+      },
+      "metrics": [
+        {
+          "id": "wall",
+          "unit": "ns",
+          "scope": "current thread wall clock; scheduler included",
+          "phase": "measurement",
+          "statistic": "batch_total",
+          "direction": "lower"
+        }
+      ]
+    },
+    {
+      "id": "compare/text_substr/postgres",
+      "contract": {
+        "completion": "synchronous function return",
+        "lifecycle": "shared lazy process fixture; setup/borrow/drop excluded; output drop included",
+        "param.n": "10000",
+        "sample_target_ns": "1000000",
+        "samples": "1",
+        "tag.postgres": "true",
+        "tag.text_substr": "true",
+        "warmup_ns": "0"
+      },
+      "metrics": [
+        {
+          "id": "wall",
+          "unit": "ns",
+          "scope": "current thread wall clock; scheduler included",
+          "phase": "measurement",
+          "statistic": "batch_total",
+          "direction": "lower"
+        }
+      ]
+    },
+    {
+      "id": "compare/materialize/postgres",
+      "contract": {
+        "completion": "synchronous function return",
+        "lifecycle": "shared lazy process fixture; setup/borrow/drop excluded; output drop included",
+        "param.n": "10000",
+        "sample_target_ns": "1000000",
+        "samples": "1",
+        "tag.materialize": "true",
+        "tag.postgres": "true",
+        "warmup_ns": "0"
+      },
+      "metrics": [
+        {
+          "id": "wall",
+          "unit": "ns",
+          "scope": "current thread wall clock; scheduler included",
+          "phase": "measurement",
+          "statistic": "batch_total",
+          "direction": "lower"
+        }
+      ]
+    },
+    {
+      "id": "compare/join_inner/postgres",
+      "contract": {
+        "completion": "synchronous function return",
+        "lifecycle": "shared lazy process fixture; setup/borrow/drop excluded; output drop included",
+        "param.orders": "10000",
+        "param.users": "1000",
+        "sample_target_ns": "1000000",
+        "samples": "1",
+        "tag.join_inner": "true",
+        "tag.postgres": "true",
+        "warmup_ns": "0",
+        "work.count": "10000",
+        "work.unit": "rows"
+      },
+      "metrics": [
+        {
+          "id": "wall",
+          "unit": "ns",
+          "scope": "current thread wall clock; scheduler included",
+          "phase": "measurement",
+          "statistic": "batch_total",
+          "direction": "lower"
+        }
+      ]
+    },
+    {
+      "id": "compare/join_filter/postgres",
+      "contract": {
+        "completion": "synchronous function return",
+        "lifecycle": "shared lazy process fixture; setup/borrow/drop excluded; output drop included",
+        "param.orders": "10000",
+        "param.users": "1000",
+        "sample_target_ns": "1000000",
+        "samples": "1",
+        "tag.join_filter": "true",
+        "tag.postgres": "true",
+        "warmup_ns": "0",
+        "work.count": "5000",
+        "work.unit": "rows"
+      },
+      "metrics": [
+        {
+          "id": "wall",
+          "unit": "ns",
+          "scope": "current thread wall clock; scheduler included",
+          "phase": "measurement",
+          "statistic": "batch_total",
+          "direction": "lower"
+        }
+      ]
+    },
+    {
+      "id": "compare/insert_bulk_1k/postgres",
+      "contract": {
+        "completion": "synchronous function return",
+        "lifecycle": "fresh input per operation; input setup/drop excluded; output drop included; chunks of <=64",
+        "param.rows": "1000",
+        "sample_target_ns": "1000000",
+        "samples": "1",
+        "tag.insert": "true",
+        "tag.postgres": "true",
+        "warmup_ns": "0",
+        "work.count": "1000",
+        "work.unit": "rows"
+      },
+      "metrics": [
+        {
+          "id": "wall",
+          "unit": "ns",
+          "scope": "current thread wall clock; scheduler included",
+          "phase": "measurement",
+          "statistic": "batch_total",
+          "direction": "lower"
+        }
+      ]
+    },
+    {
+      "id": "compare/insert_bulk_10k/postgres",
+      "contract": {
+        "completion": "synchronous function return",
+        "lifecycle": "fresh input per operation; input setup/drop excluded; output drop included; chunks of <=64",
+        "param.rows": "10000",
+        "sample_target_ns": "1000000",
+        "samples": "1",
+        "tag.insert": "true",
+        "tag.postgres": "true",
+        "warmup_ns": "0",
+        "work.count": "10000",
+        "work.unit": "rows"
+      },
+      "metrics": [
+        {
+          "id": "wall",
+          "unit": "ns",
+          "scope": "current thread wall clock; scheduler included",
+          "phase": "measurement",
+          "statistic": "batch_total",
+          "direction": "lower"
+        }
+      ]
+    },
+    {
+      "id": "compare/append_log_1k/postgres",
+      "contract": {
+        "completion": "synchronous function return",
+        "lifecycle": "fresh input per operation; input setup/drop excluded; output drop included; chunks of <=64",
+        "param.rows": "1000",
+        "sample_target_ns": "1000000",
+        "samples": "1",
+        "tag.append_log": "true",
+        "tag.postgres": "true",
+        "warmup_ns": "0",
+        "work.count": "1000",
+        "work.unit": "rows"
+      },
+      "metrics": [
+        {
+          "id": "wall",
+          "unit": "ns",
+          "scope": "current thread wall clock; scheduler included",
+          "phase": "measurement",
+          "statistic": "batch_total",
+          "direction": "lower"
+        }
+      ]
+    },
+    {
+      "id": "compare/append_log_10k/postgres",
+      "contract": {
+        "completion": "synchronous function return",
+        "lifecycle": "fresh input per operation; input setup/drop excluded; output drop included; chunks of <=64",
+        "param.rows": "10000",
+        "sample_target_ns": "1000000",
+        "samples": "1",
+        "tag.append_log": "true",
+        "tag.postgres": "true",
+        "warmup_ns": "0",
+        "work.count": "10000",
+        "work.unit": "rows"
+      },
+      "metrics": [
+        {
+          "id": "wall",
+          "unit": "ns",
+          "scope": "current thread wall clock; scheduler included",
+          "phase": "measurement",
+          "statistic": "batch_total",
+          "direction": "lower"
+        }
+      ]
+    }
+  ],
+  "observations": [
+    {
+      "case": "compare/point_get/postgres",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 0,
+      "value": "295750",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/filter_eq/postgres",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 0,
+      "value": "438792",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/filter_range/postgres",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 0,
+      "value": "456083",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/text_substr/postgres",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 0,
+      "value": "773750",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/materialize/postgres",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 0,
+      "value": "1678708",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/join_inner/postgres",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 0,
+      "value": "3274250",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/join_filter/postgres",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 0,
+      "value": "1901042",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_bulk_1k/postgres",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 0,
+      "value": "222296542",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/insert_bulk_10k/postgres",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 0,
+      "value": "1956821791",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/append_log_1k/postgres",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 0,
+      "value": "212175458",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/append_log_10k/postgres",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 0,
+      "value": "1963401833",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    }
+  ],
+  "notes": [
+    "Raw batches are not independent process replications. Batch averages are not individual-operation latency. CPU frequency and background load are uncontrolled.",
+    "compare/point_get/postgres: some samples below half the requested duration; iteration cap or workload drift may limit precision",
+    "compare/filter_eq/postgres: some samples below half the requested duration; iteration cap or workload drift may limit precision",
+    "compare/filter_range/postgres: some samples below half the requested duration; iteration cap or workload drift may limit precision"
+  ]
+}

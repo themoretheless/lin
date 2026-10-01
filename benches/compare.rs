@@ -66,6 +66,8 @@ struct Doc {
 }
 
 fn docs(n: usize) -> Vec<Doc> {
+    // Optional mixed-case fixture exercises FTS normalization in every engine.
+    let mixed_case = std::env::var_os("LIN_BENCH_MIXED_CASE").is_some();
     // All engines and fresh fixtures in this process share a timestamp anchor.
     static FIXTURE_NOW: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
     let now = *FIXTURE_NOW.get_or_init(|| {
@@ -81,7 +83,11 @@ fn docs(n: usize) -> Vec<Doc> {
                 id: format!("d-{i}"),
                 uri: format!("bench://{i}"),
                 wing: if i % 2 == 0 { "rag" } else { "sys" }.into(),
-                title: if wal {
+                title: if mixed_case && wal {
+                    format!("Doc {i} WAL Note")
+                } else if mixed_case {
+                    format!("Doc {i} Plain")
+                } else if wal {
                     format!("doc {i} wal note")
                 } else {
                     format!("doc {i} plain")
@@ -172,6 +178,54 @@ fn try_pg_client(url: &str) -> Result<postgres::Client, String> {
     postgres::Client::connect(url, postgres::NoTls).map_err(|e| e.to_string())
 }
 
+/// A fixture owns one persistent schema; default/public tables are never touched.
+struct PgBenchClient {
+    client: postgres::Client,
+    schema: String,
+}
+
+impl PgBenchClient {
+    fn new(mut client: postgres::Client) -> Result<Self, postgres::Error> {
+        static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let schema = format!("lin_bench_{}_{}_{}", std::process::id(), stamp, sequence);
+        client.batch_execute(&format!("CREATE SCHEMA \"{schema}\""))?;
+        let mut owned = Self { client, schema };
+        owned
+            .client
+            .batch_execute(&format!("SET search_path TO \"{}\"", owned.schema))?;
+        Ok(owned)
+    }
+}
+
+impl std::ops::Deref for PgBenchClient {
+    type Target = postgres::Client;
+    fn deref(&self) -> &Self::Target {
+        &self.client
+    }
+}
+
+impl std::ops::DerefMut for PgBenchClient {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.client
+    }
+}
+
+impl Drop for PgBenchClient {
+    fn drop(&mut self) {
+        if let Err(error) = self
+            .client
+            .batch_execute(&format!("DROP SCHEMA \"{}\" CASCADE", self.schema))
+        {
+            eprintln!("failed to clean owned PostgreSQL benchmark schema: {error}");
+        }
+    }
+}
+
 fn try_mysql_conn(url: &str) -> Result<mysql::Conn, String> {
     let opts = mysql::Opts::from_url(url).map_err(|e| e.to_string())?;
     mysql::Conn::new(opts).map_err(|e| e.to_string())
@@ -199,6 +253,10 @@ fn connect_pg() -> Option<(String, postgres::Client)> {
 }
 
 fn connect_mysql() -> Option<(String, mysql::Conn)> {
+    if std::env::var_os("LIN_BENCH_SKIP_MYSQL").is_some() {
+        eprintln!("skip mysql: LIN_BENCH_SKIP_MYSQL is set");
+        return None;
+    }
     let mut tried = Vec::new();
     let mut urls: Vec<String> = Vec::new();
     if let Some(u) = env_url("LIN_BENCH_MYSQL_URL") {
@@ -396,7 +454,7 @@ fn seed_map(n: usize) -> MapWarm {
 }
 
 struct PgWarm {
-    client: postgres::Client,
+    client: PgBenchClient,
     probe_id: String,
     point_get: postgres::Statement,
     filter_eq: postgres::Statement,
@@ -405,7 +463,8 @@ struct PgWarm {
     materialize: postgres::Statement,
 }
 
-fn seed_pg(n: usize, mut client: postgres::Client) -> PgWarm {
+fn seed_pg(n: usize, client: postgres::Client) -> PgWarm {
+    let mut client = PgBenchClient::new(client).expect("pg owned schema");
     let rows = docs(n);
     client
         .batch_execute(
@@ -763,12 +822,13 @@ fn duck_join_n(conn: &duckdb::Connection, sql: &str) -> usize {
 }
 
 struct JoinPg {
-    client: postgres::Client,
+    client: PgBenchClient,
     inner: postgres::Statement,
     filter: postgres::Statement,
 }
 
-fn seed_join_pg(mut client: postgres::Client) -> JoinPg {
+fn seed_join_pg(client: postgres::Client) -> JoinPg {
+    let mut client = PgBenchClient::new(client).expect("pg owned join schema");
     let (users, orders) = join_data();
     client
         .batch_execute(
@@ -946,8 +1006,9 @@ fn empty_duck() -> duckdb::Connection {
 }
 
 /// Fresh bulk table on a dedicated connection (does not touch warm `docs`).
-fn empty_pg(url: String) -> postgres::Client {
-    let mut client = try_pg_client(&url).expect("pg reconnect");
+fn empty_pg(url: String) -> PgBenchClient {
+    let mut client = PgBenchClient::new(try_pg_client(&url).expect("pg reconnect"))
+        .expect("pg owned bulk schema");
     client
         .batch_execute(
             "DROP TABLE IF EXISTS docs_bulk;
@@ -1001,12 +1062,7 @@ fn validate_lin_rows(db: &lin::Db, n: usize) {
         assert_eq!(text("id"), Some(format!("d-{i}").as_str()));
         assert_eq!(text("uri"), Some(format!("bench://{i}").as_str()));
         assert_eq!(text("wing"), Some(if i % 2 == 0 { "rag" } else { "sys" }));
-        let title = if i % 10 == 0 {
-            format!("doc {i} wal note")
-        } else {
-            format!("doc {i} plain")
-        };
-        assert_eq!(text("title"), Some(title.as_str()));
+        assert_eq!(text("title"), Some(fixtures[i].title.as_str()));
         assert_eq!(text("body"), Some(format!("body {i}").as_str()));
         assert_eq!(row.get("ts"), Some(&lin::Cell::Time(fixtures[i].ts)));
         assert!(row.get("embedding").and_then(lin::Cell::as_vec).is_some());
@@ -1124,6 +1180,80 @@ fn fill_pg_rows(client: &mut postgres::Client, rows: &[Doc]) {
             .expect("pg insert");
     }
     tx.commit().expect("pg commit");
+}
+
+fn fill_pg_copy(client: &mut postgres::Client, rows: &[Doc]) -> u64 {
+    use postgres::binary_copy::BinaryCopyInWriter;
+    use postgres::types::Type;
+    let mut tx = client.transaction().expect("pg copy tx");
+    let count = {
+        let sink = tx
+            .copy_in("COPY docs_bulk (id, uri, wing, title, ts, body) FROM STDIN BINARY")
+            .expect("pg copy start");
+        let mut writer = BinaryCopyInWriter::new(
+            sink,
+            &[
+                Type::TEXT,
+                Type::TEXT,
+                Type::TEXT,
+                Type::TEXT,
+                Type::INT8,
+                Type::TEXT,
+            ],
+        );
+        for d in rows {
+            writer
+                .write(&[&d.id, &d.uri, &d.wing, &d.title, &d.ts, &d.body])
+                .expect("pg copy row");
+        }
+        writer.finish().expect("pg copy finish")
+    };
+    tx.commit().expect("pg copy commit");
+    count
+}
+
+fn validate_pg_docs(
+    client: &PgBenchClient,
+    url: &str,
+    expected: &[Doc],
+) -> airbug_bench::Result<()> {
+    let mut reader = try_pg_client(url).expect("pg readback connection");
+    let sql = format!(
+        "SELECT id, uri, wing, title, ts, body FROM \"{}\".docs_bulk",
+        client.schema
+    );
+    let mut got = reader
+        .query(&sql, &[])
+        .expect("pg readback")
+        .into_iter()
+        .map(|r| {
+            (
+                r.get::<_, String>(0),
+                r.get::<_, String>(1),
+                r.get::<_, String>(2),
+                r.get::<_, String>(3),
+                r.get::<_, i64>(4),
+                r.get::<_, String>(5),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut want = expected
+        .iter()
+        .map(|d| {
+            (
+                d.id.clone(),
+                d.uri.clone(),
+                d.wing.clone(),
+                d.title.clone(),
+                d.ts,
+                d.body.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    got.sort();
+    want.sort();
+    assert_eq!(got, want, "PostgreSQL native ingestion readback");
+    Ok(())
 }
 
 fn fill_mysql_rows(conn: &mut mysql::Conn, rows: &[Doc]) {
@@ -1421,8 +1551,9 @@ fn empty_duck_logs() -> duckdb::Connection {
     conn
 }
 
-fn empty_pg_logs(url: String) -> postgres::Client {
-    let mut client = try_pg_client(&url).expect("pg reconnect");
+fn empty_pg_logs(url: String) -> PgBenchClient {
+    let mut client = PgBenchClient::new(try_pg_client(&url).expect("pg reconnect"))
+        .expect("pg owned logs schema");
     client
         .batch_execute(
             "DROP TABLE IF EXISTS logs_bulk;
@@ -2186,14 +2317,32 @@ fn main() -> airbug_bench::Result<()> {
                 .parameter("rows", n)
                 .work_units("rows", n as u64);
             if let Some(url) = pg_url.clone() {
+                let rowwise_url = url.clone();
                 suite
-                    .bench_with_input(
+                    .bench_checked(
                         &format!("insert_bulk_{}/postgres", $label),
-                        move || (empty_pg(url.clone()), docs(n)),
-                        |(client, rows)| fill_pg_rows(client, rows),
+                        move || (empty_pg(rowwise_url.clone()), docs(n), rowwise_url.clone()),
+                        |(client, rows, _)| fill_pg_rows(client, rows),
+                        |(client, expected, url), _| validate_pg_docs(client, url, expected),
                         DropPolicy::InsideTiming,
                     )
                     .tag("insert")
+                    .tag("postgres")
+                    .parameter("rows", n)
+                    .work_units("rows", n as u64);
+                suite
+                    .bench_checked(
+                        &format!("insert_native_{}/postgres_copy", $label),
+                        move || (empty_pg(url.clone()), docs(n), url.clone()),
+                        |(client, rows, _)| fill_pg_copy(client, rows),
+                        |(client, expected, url), count| {
+                            assert_eq!(*count, expected.len() as u64);
+                            validate_pg_docs(client, url, expected)
+                        },
+                        DropPolicy::InsideTiming,
+                    )
+                    .tag("insert")
+                    .tag("native")
                     .tag("postgres")
                     .parameter("rows", n)
                     .work_units("rows", n as u64);
