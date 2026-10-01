@@ -1,0 +1,181 @@
+--- a/src/embed.rs
++++ b/src/embed.rs
+@@ -20,6 +20,16 @@
+     /// backend-native batch; output order and length must match `texts`.
+     fn embed_batch(&self, texts: &[&str]) -> Vec<Arc<[f32]>> {
+         texts.iter().map(|text| self.embed(text)).collect()
++    }
++
++    /// Embed segments joined by one space, preserving batch overrides.
++    fn embed_segments_batch(&self, texts: &[&[&str]]) -> Vec<Arc<[f32]>> {
++        let joined = texts
++            .iter()
++            .map(|parts| parts.join(" "))
++            .collect::<Vec<_>>();
++        let refs = joined.iter().map(String::as_str).collect::<Vec<_>>();
++        self.embed_batch(&refs)
+     }
+ }
+ 
+@@ -74,9 +84,57 @@
+         }
+         out
+     }
++    fn embed_segments_batch(&self, texts: &[&[&str]]) -> Vec<Arc<[f32]>> {
++        let mut scratch = Scratch::new(self.dim);
++        let mut lower = String::new();
++        texts
++            .iter()
++            .map(|parts| {
++                self.fill_segments(&mut scratch, parts, &mut lower);
++                scratch.finish()
++            })
++            .collect()
++    }
+ }
+ 
+ impl HashingEmbedder {
++    fn fill_segments(&self, s: &mut Scratch, parts: &[&str], lower: &mut String) {
++        for part in parts {
++            let text = crate::fts::lowercased(part, lower);
++            for token in text.split_whitespace() {
++                s.bump(token, 1.0);
++                let bytes = token.as_bytes();
++                if bytes.len() >= 3 {
++                    for window in bytes.windows(3) {
++                        s.bump(window, 0.5);
++                    }
++                } else {
++                    s.bump(bytes, 0.5);
++                }
++            }
++        }
++        let mut previous = None;
++        for (part_index, part) in parts.iter().enumerate() {
++            if part_index != 0 {
++                if let Some(last) = previous {
++                    s.bump(&[last, b' '][..], 0.25);
++                }
++                previous = Some(b' ');
++            }
++            let text = crate::fts::lowercased(part, lower);
++            let bytes = text.as_bytes();
++            if let Some(&first) = bytes.first() {
++                if let Some(last) = previous {
++                    s.bump(&[last, first][..], 0.25);
++                }
++                for window in bytes.windows(2) {
++                    s.bump(window, 0.25);
++                }
++                previous = bytes.last().copied();
++            }
++        }
++    }
++
+     /// Add every feature of `lower` (unigrams, char trigrams, string bigrams)
+     /// into the accumulator.
+     fn fill(&self, s: &mut Scratch, lower: &str) {
+@@ -209,6 +267,18 @@
+ }
+ 
+ /// Text blob used for embedding a row (title / body / snippet).
++pub(crate) fn row_embed_segments(row: &crate::store::Row) -> smallvec::SmallVec<[&str; 3]> {
++    let mut parts = smallvec::SmallVec::new();
++    for key in ["title", "body", "snippet"] {
++        if let Some(text) = row.get(key).and_then(crate::store::Cell::text) {
++            if !parts.is_empty() || !text.is_empty() {
++                parts.push(text);
++            }
++        }
++    }
++    parts
++}
++
+ pub(crate) fn row_embed_text(row: &crate::store::Row) -> std::borrow::Cow<'_, str> {
+     let texts = ["title", "body", "snippet"].map(|k| crate::store::row_text(row, k));
+     let bytes = texts.iter().flatten().map(|t| t.len()).sum::<usize>();
+@@ -235,6 +305,56 @@
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++
++    #[test]
++    fn segmented_embeddings_preserve_dense_bits_and_row_separators() {
++        use crate::store::{Cell, Row};
++        let values = [
++            None,
++            Some(""),
++            Some(" "),
++            Some("Title WAL"),
++            Some("body"),
++            Some("ЁЖ İ Σ 🦔"),
++            Some("a\tb\nc"),
++            Some("\0"),
++        ];
++        for dim in [8, 768, 4096] {
++            let embedder = HashingEmbedder::new("test", dim);
++            for title in values {
++                for body in values {
++                    for snippet in values {
++                        let row = ["title", "body", "snippet"]
++                            .into_iter()
++                            .zip([title, body, snippet])
++                            .map(|(k, v)| {
++                                (k.to_owned(), v.map(Cell::text_arc).unwrap_or(Cell::Null))
++                            })
++                            .collect::<Row>();
++                        let parts = row_embed_segments(&row);
++                        assert_eq!(parts.join(" "), row_embed_text(&row));
++                        let got = embedder.embed_segments_batch(&[parts.as_slice()]);
++                        let expected = embedder.embed(&row_embed_text(&row));
++                        assert_eq!(
++                            got[0].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
++                            expected.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
++                        );
++                    }
++                }
++            }
++            let long = "WAL ЁЖ ".repeat(100000);
++            let parts = [long.as_str(), "", long.as_str()];
++            let got = embedder.embed_segments_batch(&[&parts]);
++            assert_eq!(
++                got[0].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
++                embedder
++                    .embed(&parts.join(" "))
++                    .iter()
++                    .map(|x| x.to_bits())
++                    .collect::<Vec<_>>()
++            );
++        }
++    }
+ 
+     #[test]
+     fn single_embedding_field_borrows_the_row_text() {
+--- a/src/exec.rs
++++ b/src/exec.rs
+@@ -3524,19 +3524,21 @@
+             if row.get("embedding").and_then(Cell::as_vec).is_some() {
+                 continue;
+             }
+-            let text = embed::row_embed_text(row);
++            let text = embed::row_embed_segments(row);
+             if !text.is_empty() {
+                 row_idxs.push(i);
+                 texts.push(text);
+             }
+         }
+         let refs = texts.iter().map(|text| text.as_ref()).collect::<Vec<_>>();
+-        let mut vectors = emb.embed_batch(&refs);
++        let mut vectors = emb.embed_segments_batch(&refs);
+         if vectors.len() != row_idxs.len() {
+             // Keep third-party embedders with a broken batch implementation
+             // from silently leaving a partially embedded slab.
+-            vectors = refs.iter().map(|text| emb.embed(text)).collect();
+-        }
++            vectors = refs.iter().map(|text| emb.embed(&text.join(" "))).collect();
++        }
++        drop(refs);
++        drop(texts);
+         for (i, vector) in row_idxs.into_iter().zip(vectors) {
+             rows[i].insert("embedding".into(), Cell::Vec(vector));
+         }
