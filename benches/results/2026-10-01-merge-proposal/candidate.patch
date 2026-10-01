@@ -1,0 +1,106 @@
+--- a/src/embed.rs
++++ b/src/embed.rs
+@@ -20,6 +20,11 @@
+     /// backend-native batch; output order and length must match `texts`.
+     fn embed_batch(&self, texts: &[&str]) -> Vec<Arc<[f32]>> {
+         texts.iter().map(|text| self.embed(text)).collect()
++    }
++
++    /// Return owned vectors while preserving existing batch overrides.
++    fn embed_batch_owned(&self, texts: &[&str]) -> Vec<Vec<f32>> {
++        self.embed_batch(texts).into_iter().map(|v| v.as_ref().to_vec()).collect()
+     }
+ }
+ 
+--- a/src/exec.rs
++++ b/src/exec.rs
+@@ -2020,11 +2020,7 @@
+             Some(None) => None,
+             None => Some(50),
+         };
+-        let rank_limit = if mode == SearchMode::Lex {
+-            limit.map(|n| n.saturating_add(skip_n))
+-        } else {
+-            None
+-        };
++        let rank_limit = limit.map(|n| n.saturating_add(skip_n));
+         let mut rows = self.search_fts(name, mode, query, rank_limit)?;
+         if skip_n > 0 {
+             if skip_n >= rows.len() {
+@@ -2077,6 +2073,16 @@
+                 }
+                 let mut ranked: Vec<(f64, usize)> =
+                     scores.into_iter().map(|(i, score)| (score, i)).collect();
++                if let Some(limit) = rank_limit {
++                    if limit == 0 { return Ok(Vec::new()); }
++                    if ranked.len() > limit {
++                        ranked.select_nth_unstable_by(limit - 1, |a, b| {
++                            b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
++                                .then_with(|| a.1.cmp(&b.1))
++                        });
++                        ranked.truncate(limit);
++                    }
++                }
+                 ranked.sort_by(|a, b| {
+                     b.0.partial_cmp(&a.0)
+                         .unwrap_or(std::cmp::Ordering::Equal)
+--- a/tests/exec.rs
++++ b/tests/exec.rs
+@@ -1688,3 +1688,20 @@
+     );
+     assert!(db.prepare("insert stamps { stamp: 123 }").is_err());
+ }
++
++#[test]
++fn hybrid_bounded_results_match_full_ranking() {
++    let mut db = lin::Db::empty();
++    let records = (0..211).map(|i| format!(r#"{{id:"h-{i}",uri:"hybrid://{i}",title:"wal {}",body:"body {}"}}"#, i%7,i%3)).collect::<Vec<_>>();
++    db.run(&format!("insert docs [{}]",records.join(","))).unwrap();
++    for query in ["wal", "missing", "body"] {
++        let all = db.run(&format!(r#"docs | search "{query}" | {{id}} | take all"#)).unwrap().rows;
++        for skip in [0,1,17,210,211,250] { for take in [0,1,7,50,210,211,300] {
++            let got=db.run(&format!(r#"docs | search "{query}" | {{id}} | skip {skip} | take {take}"#)).unwrap().rows;
++            let want=all.iter().skip(skip).take(take).cloned().collect::<Vec<_>>();
++            assert_eq!(got,want,"{query}, skip={skip}, take={take}");
++        } }
++        let default=db.run(&format!(r#"docs | search "{query}" | {{id}}"#)).unwrap().rows;
++        assert_eq!(default,all.iter().take(50).cloned().collect::<Vec<_>>());
++    }
++}
+--- a/tests/persist.rs
++++ b/tests/persist.rs
+@@ -387,6 +387,34 @@
+             .run(r#"docs | uri == "raw://ba" or uri == "raw://bb" | take all"#)
+             .unwrap();
+         assert_eq!(q.done.n, 2);
++        db.close().unwrap();
++    }
++    let _ = fs::remove_dir_all(&dir);
++}
++
++#[test]
++fn large_bulk_insert_survives_reopen() {
++    let dir = tmp();
++    {
++        let mut db = Db::open(&dir).unwrap();
++        let mut src = String::from("insert docs [\n");
++        for i in 0..256 {
++            if i != 0 {
++                src.push_str(",\n");
++            }
++            src.push_str(&format!(
++                r#"{{ uri: "raw://large/{i}", title: "large {i}", layer: "wiki" }}"#
++            ));
++        }
++        src.push_str("\n]");
++        let h = db.run(&src).unwrap();
++        assert_eq!(h.done.n, 256);
++        db.close().unwrap();
++    }
++    {
++        let mut db = Db::open(&dir).unwrap();
++        let q = db.run(r#"docs | count"#).unwrap();
++        assert_eq!(q.scalar().unwrap().as_int(), Some(256));
+         db.close().unwrap();
+     }
+     let _ = fs::remove_dir_all(&dir);

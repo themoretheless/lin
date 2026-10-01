@@ -2020,11 +2020,7 @@ impl Db {
             Some(None) => None,
             None => Some(50),
         };
-        let rank_limit = if mode == SearchMode::Lex {
-            limit.map(|n| n.saturating_add(skip_n))
-        } else {
-            None
-        };
+        let rank_limit = limit.map(|n| n.saturating_add(skip_n));
         let mut rows = self.search_fts(name, mode, query, rank_limit)?;
         if skip_n > 0 {
             if skip_n >= rows.len() {
@@ -2077,6 +2073,19 @@ impl Db {
                 }
                 let mut ranked: Vec<(f64, usize)> =
                     scores.into_iter().map(|(i, score)| (score, i)).collect();
+                if let Some(limit) = rank_limit {
+                    if limit == 0 {
+                        return Ok(Vec::new());
+                    }
+                    if ranked.len() > limit {
+                        ranked.select_nth_unstable_by(limit - 1, |a, b| {
+                            b.0.partial_cmp(&a.0)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                                .then_with(|| a.1.cmp(&b.1))
+                        });
+                        ranked.truncate(limit);
+                    }
+                }
                 ranked.sort_by(|a, b| {
                     b.0.partial_cmp(&a.0)
                         .unwrap_or(std::cmp::Ordering::Equal)

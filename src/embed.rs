@@ -21,6 +21,14 @@ pub trait Embedder: Send + Sync {
     fn embed_batch(&self, texts: &[&str]) -> Vec<Arc<[f32]>> {
         texts.iter().map(|text| self.embed(text)).collect()
     }
+
+    /// Return owned vectors while preserving existing batch overrides.
+    fn embed_batch_owned(&self, texts: &[&str]) -> Vec<Vec<f32>> {
+        self.embed_batch(texts)
+            .into_iter()
+            .map(|v| v.as_ref().to_vec())
+            .collect()
+    }
 }
 
 /// Local hashing embedder (unigram + char trigrams → L2-normalized bag).

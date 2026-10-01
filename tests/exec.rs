@@ -1688,3 +1688,47 @@ fn absolute_timestamps_compare_identically_in_scans_and_indexes() {
     );
     assert!(db.prepare("insert stamps { stamp: 123 }").is_err());
 }
+
+#[test]
+fn hybrid_bounded_results_match_full_ranking() {
+    let mut db = lin::Db::empty();
+    let records = (0..211)
+        .map(|i| {
+            format!(
+                r#"{{id:"h-{i}",uri:"hybrid://{i}",title:"wal {}",body:"body {}"}}"#,
+                i % 7,
+                i % 3
+            )
+        })
+        .collect::<Vec<_>>();
+    db.run(&format!("insert docs [{}]", records.join(",")))
+        .unwrap();
+    for query in ["wal", "missing", "body"] {
+        let all = db
+            .run(&format!(r#"docs | search "{query}" | {{id}} | take all"#))
+            .unwrap()
+            .rows;
+        for skip in [0, 1, 17, 210, 211, 250] {
+            for take in [0, 1, 7, 50, 210, 211, 300] {
+                let got = db
+                    .run(&format!(
+                        r#"docs | search "{query}" | {{id}} | skip {skip} | take {take}"#
+                    ))
+                    .unwrap()
+                    .rows;
+                let want = all
+                    .iter()
+                    .skip(skip)
+                    .take(take)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                assert_eq!(got, want, "{query}, skip={skip}, take={take}");
+            }
+        }
+        let default = db
+            .run(&format!(r#"docs | search "{query}" | {{id}}"#))
+            .unwrap()
+            .rows;
+        assert_eq!(default, all.iter().take(50).cloned().collect::<Vec<_>>());
+    }
+}
