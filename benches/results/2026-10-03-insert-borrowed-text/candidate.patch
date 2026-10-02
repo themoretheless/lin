@@ -1,0 +1,29 @@
+--- a/src/exec.rs
++++ b/src/exec.rs
+@@ -3636,19 +3636,19 @@
+                 row.insert("id".into(), Cell::text_arc(self.store.alloc_id()));
+             }
+             if row.get("hash").and_then(Cell::text).is_none()
+-                && let Some(body) = row.get("body").and_then(Cell::text_shared)
++                && let Some(body) = row.get("body").and_then(Cell::text)
+             {
+-                row.insert("hash".into(), Cell::Text(content_hash_arc(body.as_ref())));
+-            }
+-            if let Some(id) = row.get("id").and_then(Cell::text_shared)
+-                && (!batch_ids.insert(std::sync::Arc::clone(&id))
++                row.insert("hash".into(), Cell::Text(content_hash_arc(body)));
++            }
++            if let Some(Cell::Text(id)) = row.get("id")
++                && (!batch_ids.insert(std::sync::Arc::clone(id))
+                     || self.store.get_by_id(collection, id.as_ref()).is_some())
+             {
+                 return Err(Error::runtime(format!("duplicate id: {id}")));
+             }
+             if collection == "docs"
+-                && let Some(uri) = row.get("uri").and_then(Cell::text_shared)
+-                && (!batch_uris.insert(std::sync::Arc::clone(&uri))
++                && let Some(Cell::Text(uri)) = row.get("uri")
++                && (!batch_uris.insert(std::sync::Arc::clone(uri))
+                     || self.store.get_by_uri(uri.as_ref()).is_some())
+             {
+                 return Err(Error::runtime(format!("duplicate uri: {uri}")));

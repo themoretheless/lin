@@ -73,6 +73,18 @@ class BenchmarkContractTests(unittest.TestCase):
             self.assertTrue((output / "process-1/run.json").is_file())
             self.assertTrue((output / "process-2/run.json").is_file())
 
+    def test_unsupported_native_peer_is_incomplete(self):
+        with tempfile.TemporaryDirectory() as directory:
+            command = [sys.executable, str(Path(__file__).with_name("bench-peers.py")),
+                "--engines", "sqlite", "--cases", "insert_native", "--rows", "41",
+                "--samples", "1", "--repeats", "1", "--output", str(Path(directory) / "run")]
+            completed = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(completed.returncode, 2, completed.stderr)
+            run = json.loads((Path(directory) / "run/run.json").read_text())
+            self.assertEqual(run["status"], "incomplete")
+            self.assertEqual(run["medians_ns"], {})
+            self.assertTrue(run["errors"])
+
     def test_kusto_partial_query_failure_is_not_a_success(self):
         def payload(severity, code):
             return {"Tables": [

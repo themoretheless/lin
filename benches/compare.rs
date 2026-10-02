@@ -516,8 +516,117 @@ fn seed_pg(n: usize, client: postgres::Client) -> PgWarm {
     }
 }
 
-struct MysqlWarm {
+/// Each fixture owns regular InnoDB tables with a unique, bounded identifier.
+struct MysqlBenchConn {
     conn: mysql::Conn,
+    prefix: String,
+}
+
+impl MysqlBenchConn {
+    fn new(conn: mysql::Conn) -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self {
+            conn,
+            prefix: format!("lin_bench_{:x}_{stamp:x}_{seq:x}", std::process::id()),
+        }
+    }
+
+    // Only trusted benchmark SQL templates use this identifier substitution.
+    fn owned_sql(&self, sql: &str) -> String {
+        let mut out = String::with_capacity(sql.len() + self.prefix.len());
+        let bytes = sql.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            let start = i;
+            if matches!(bytes[i], b'\'' | b'"' | b'`') {
+                let quote = bytes[i];
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\\' {
+                        i = (i + 2).min(bytes.len());
+                        continue;
+                    }
+                    if bytes[i] == quote {
+                        i += 1;
+                        if i < bytes.len() && bytes[i] == quote {
+                            i += 1;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+                out.push_str(&sql[start..i]);
+            } else if bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' {
+                i += 1;
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                    i += 1;
+                }
+                self.push_identifier(&mut out, &sql[start..i]);
+            } else {
+                let ch = sql[i..].chars().next().unwrap();
+                out.push(ch);
+                i += ch.len_utf8();
+            }
+        }
+        out
+    }
+
+    fn push_identifier(&self, out: &mut String, token: &str) {
+        if matches!(
+            token,
+            "docs" | "docs_bulk" | "users" | "orders" | "logs_bulk"
+        ) {
+            out.push('`');
+            out.push_str(&self.prefix);
+            out.push('_');
+            out.push_str(token);
+            out.push('`');
+        } else {
+            out.push_str(token);
+        }
+    }
+
+    fn query_drop(&mut self, sql: impl AsRef<str>) -> mysql::Result<()> {
+        let sql = self.owned_sql(sql.as_ref());
+        self.conn.query_drop(sql)
+    }
+
+    fn prep(&mut self, sql: impl AsRef<str>) -> mysql::Result<mysql::Statement> {
+        let sql = self.owned_sql(sql.as_ref());
+        self.conn.prep(sql)
+    }
+}
+
+impl std::ops::Deref for MysqlBenchConn {
+    type Target = mysql::Conn;
+    fn deref(&self) -> &Self::Target {
+        &self.conn
+    }
+}
+impl std::ops::DerefMut for MysqlBenchConn {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.conn
+    }
+}
+impl Drop for MysqlBenchConn {
+    fn drop(&mut self) {
+        for table in ["orders", "users", "docs_bulk", "docs", "logs_bulk"] {
+            let sql = self.owned_sql(&format!("DROP TABLE IF EXISTS {table}"));
+            if let Err(error) = self.conn.query_drop(sql) {
+                eprintln!("mysql owned table cleanup failed: {error}");
+            }
+        }
+    }
+}
+
+struct MysqlWarm {
+    conn: MysqlBenchConn,
     probe_id: String,
     point_get: mysql::Statement,
     filter_eq: mysql::Statement,
@@ -526,7 +635,8 @@ struct MysqlWarm {
     materialize: mysql::Statement,
 }
 
-fn seed_mysql(n: usize, mut conn: mysql::Conn) -> MysqlWarm {
+fn seed_mysql(n: usize, conn: mysql::Conn) -> MysqlWarm {
+    let mut conn = MysqlBenchConn::new(conn);
     let rows = docs(n);
     conn.query_drop(
         "CREATE TABLE IF NOT EXISTS docs (
@@ -537,7 +647,7 @@ fn seed_mysql(n: usize, mut conn: mysql::Conn) -> MysqlWarm {
             ts BIGINT NOT NULL,
             body TEXT NOT NULL,
             INDEX docs_wing_ts (wing, ts)
-         )",
+         ) ENGINE=InnoDB",
     )
     .expect("mysql schema create");
     conn.query_drop("TRUNCATE TABLE docs")
@@ -882,18 +992,19 @@ fn pg_join_n(client: &mut postgres::Client, stmt: &postgres::Statement) -> usize
 }
 
 struct JoinMysql {
-    conn: mysql::Conn,
+    conn: MysqlBenchConn,
     inner: mysql::Statement,
     filter: mysql::Statement,
 }
 
-fn seed_join_mysql(mut conn: mysql::Conn) -> JoinMysql {
+fn seed_join_mysql(conn: mysql::Conn) -> JoinMysql {
+    let mut conn = MysqlBenchConn::new(conn);
     let (users, orders) = join_data();
     conn.query_drop("DROP TABLE IF EXISTS orders")
         .expect("mysql drop orders");
     conn.query_drop("DROP TABLE IF EXISTS users")
         .expect("mysql drop users");
-    conn.query_drop("CREATE TABLE users (id VARCHAR(64) PRIMARY KEY, email VARCHAR(255) NOT NULL)")
+    conn.query_drop("CREATE TABLE users (id VARCHAR(64) PRIMARY KEY, email VARCHAR(255) NOT NULL) ENGINE=InnoDB")
         .expect("mysql users");
     conn.query_drop(
         "CREATE TABLE orders (
@@ -901,7 +1012,7 @@ fn seed_join_mysql(mut conn: mysql::Conn) -> JoinMysql {
             user_id VARCHAR(64) NOT NULL,
             total DOUBLE NOT NULL,
             INDEX orders_user_id (user_id)
-         )",
+         ) ENGINE=InnoDB",
     )
     .expect("mysql orders");
     {
@@ -1026,8 +1137,8 @@ fn empty_pg(url: String) -> PgBenchClient {
     client
 }
 
-fn empty_mysql(url: String) -> mysql::Conn {
-    let mut conn = try_mysql_conn(&url).expect("mysql reconnect");
+fn empty_mysql(url: String) -> MysqlBenchConn {
+    let mut conn = MysqlBenchConn::new(try_mysql_conn(&url).expect("mysql reconnect"));
     conn.query_drop("DROP TABLE IF EXISTS docs_bulk")
         .expect("mysql drop bulk");
     conn.query_drop(
@@ -1039,7 +1150,7 @@ fn empty_mysql(url: String) -> mysql::Conn {
             ts BIGINT NOT NULL,
             body TEXT NOT NULL,
             INDEX docs_bulk_wing_ts (wing, ts)
-         )",
+         ) ENGINE=InnoDB",
     )
     .expect("mysql bulk schema");
     conn
@@ -1256,18 +1367,98 @@ fn validate_pg_docs(
     Ok(())
 }
 
-fn fill_mysql_rows(conn: &mut mysql::Conn, rows: &[Doc]) {
+fn fill_mysql_rows(conn: &mut MysqlBenchConn, rows: &[Doc]) {
+    let sql = conn
+        .owned_sql("INSERT INTO docs_bulk (id, uri, wing, title, ts, body) VALUES (?,?,?,?,?,?)");
     let mut tx = conn
         .start_transaction(mysql::TxOpts::default())
         .expect("mysql tx");
-    let stmt = tx
-        .prep("INSERT INTO docs_bulk (id, uri, wing, title, ts, body) VALUES (?,?,?,?,?,?)")
-        .expect("mysql prepare");
+    let stmt = tx.prep(sql).expect("mysql prepare");
     for d in rows {
         tx.exec_drop(&stmt, (&d.id, &d.uri, &d.wing, &d.title, d.ts, &d.body))
             .expect("mysql insert");
     }
     tx.commit().expect("mysql commit");
+}
+
+fn validate_mysql_docs(
+    conn: &MysqlBenchConn,
+    url: &str,
+    expected: &[Doc],
+) -> airbug_bench::Result<()> {
+    let mut reader = try_mysql_conn(url).expect("mysql validation connection");
+    let sql = conn.owned_sql("SELECT id, uri, wing, title, ts, body FROM docs_bulk");
+    let mut got: Vec<(String, String, String, String, i64, String)> =
+        reader.query(sql).expect("mysql exact readback");
+    let mut want = expected
+        .iter()
+        .map(|d| {
+            (
+                d.id.clone(),
+                d.uri.clone(),
+                d.wing.clone(),
+                d.title.clone(),
+                d.ts,
+                d.body.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    got.sort();
+    want.sort();
+    assert_eq!(got, want);
+    Ok(())
+}
+
+struct MysqlNativeInsert {
+    conn: MysqlBenchConn,
+    statement: mysql::Statement,
+    rows: Vec<Doc>,
+    url: String,
+}
+
+fn setup_mysql_native(url: String, n: usize) -> MysqlNativeInsert {
+    assert!(
+        n > 0 && n * 6 <= 65535,
+        "mysql native fixture exceeds prepared parameter limit"
+    );
+    let mut conn = empty_mysql(url.clone());
+    let values = std::iter::repeat_n("(?,?,?,?,?,?)", n)
+        .collect::<Vec<_>>()
+        .join(",");
+    let statement = conn
+        .prep(format!(
+            "INSERT INTO docs_bulk (id, uri, wing, title, ts, body) VALUES {values}"
+        ))
+        .expect("mysql native prepare");
+    MysqlNativeInsert {
+        conn,
+        statement,
+        rows: docs(n),
+        url,
+    }
+}
+
+fn fill_mysql_native(input: &mut MysqlNativeInsert) -> usize {
+    let mut values = Vec::with_capacity(input.rows.len() * 6);
+    for d in &input.rows {
+        values.extend([
+            mysql::Value::Bytes(d.id.as_bytes().to_vec()),
+            mysql::Value::Bytes(d.uri.as_bytes().to_vec()),
+            mysql::Value::Bytes(d.wing.as_bytes().to_vec()),
+            mysql::Value::Bytes(d.title.as_bytes().to_vec()),
+            mysql::Value::Int(d.ts),
+            mysql::Value::Bytes(d.body.as_bytes().to_vec()),
+        ]);
+    }
+    let mut tx = input
+        .conn
+        .start_transaction(mysql::TxOpts::default())
+        .expect("mysql native tx");
+    tx.exec_drop(&input.statement, mysql::Params::Positional(values))
+        .expect("mysql native insert");
+    let affected = tx.affected_rows() as usize;
+    tx.commit().expect("mysql native commit");
+    affected
 }
 
 /// Append-only log lines (Lin `append facts` vs SQL `INSERT INTO logs`).
@@ -1567,8 +1758,8 @@ fn empty_pg_logs(url: String) -> PgBenchClient {
     client
 }
 
-fn empty_mysql_logs(url: String) -> mysql::Conn {
-    let mut conn = try_mysql_conn(&url).expect("mysql reconnect");
+fn empty_mysql_logs(url: String) -> MysqlBenchConn {
+    let mut conn = MysqlBenchConn::new(try_mysql_conn(&url).expect("mysql reconnect"));
     conn.query_drop("DROP TABLE IF EXISTS logs_bulk")
         .expect("mysql drop logs");
     conn.query_drop(
@@ -1644,7 +1835,8 @@ fn fill_pg_logs(client: &mut postgres::Client, n: usize) {
     tx.commit().expect("pg commit");
 }
 
-fn fill_mysql_logs(conn: &mut mysql::Conn, n: usize) {
+fn fill_mysql_logs(conn: &mut MysqlBenchConn, n: usize) {
+    let sql = conn.owned_sql("INSERT INTO logs_bulk (id, ts, msg) VALUES (?, ?, ?)");
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -1652,9 +1844,7 @@ fn fill_mysql_logs(conn: &mut mysql::Conn, n: usize) {
     let mut tx = conn
         .start_transaction(mysql::TxOpts::default())
         .expect("mysql tx");
-    let stmt = tx
-        .prep("INSERT INTO logs_bulk (id, ts, msg) VALUES (?, ?, ?)")
-        .expect("mysql prep");
+    let stmt = tx.prep(sql).expect("mysql prep");
     for i in 0..n {
         tx.exec_drop(
             &stmt,
@@ -2349,13 +2539,33 @@ fn main() -> airbug_bench::Result<()> {
             }
             if let Some(url) = mysql_url.clone() {
                 suite
-                    .bench_with_input(
+                    .bench_checked(
                         &format!("insert_bulk_{}/mysql", $label),
-                        move || (empty_mysql(url.clone()), docs(n)),
-                        |(conn, rows)| fill_mysql_rows(conn, rows),
+                        {
+                            let url = url.clone();
+                            move || (empty_mysql(url.clone()), docs(n), url.clone())
+                        },
+                        |(conn, rows, _)| fill_mysql_rows(conn, rows),
+                        |(conn, rows, url), _| validate_mysql_docs(conn, url, rows),
                         DropPolicy::InsideTiming,
                     )
                     .tag("insert")
+                    .tag("mysql")
+                    .parameter("rows", n)
+                    .work_units("rows", n as u64);
+                suite
+                    .bench_checked(
+                        &format!("insert_native_{}/mysql_batch", $label),
+                        move || setup_mysql_native(url.clone(), n),
+                        fill_mysql_native,
+                        |input, affected| {
+                            assert_eq!(*affected, input.rows.len());
+                            validate_mysql_docs(&input.conn, &input.url, &input.rows)
+                        },
+                        DropPolicy::InsideTiming,
+                    )
+                    .tag("insert")
+                    .tag("native")
                     .tag("mysql")
                     .parameter("rows", n)
                     .work_units("rows", n as u64);

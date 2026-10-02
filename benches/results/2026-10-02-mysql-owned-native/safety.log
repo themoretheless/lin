@@ -1,0 +1,73 @@
+skip postgres: no reachable server
+  tried: postgresql://lin:lin@127.0.0.1:55432/lin (error connecting to server); postgresql://postgres@127.0.0.1:5432/postgres (error connecting to server)
+  set LIN_BENCH_PG_URL or:
+  docker compose -f docker-compose.bench.yml up -d postgres
+  # brew postgresql@17 via Sources/ppduster macos-stack-postgres; start service for :5432
+lin compare: N=10000 warm reads (fixture), bulk insert (schema outside timing)
+engines: Lin | SQLite(rusqlite bundled) | DuckDB(bundled) | HashMap(point get only) | Postgres(skipped) | MySQL(mysql://lin:lin@127.0.0.1:53306/linbench_validate_60097)
+airbug dash: http://127.0.0.1:8790/
+Lin reads: prepare once / run many; filters use count (fair vs SQL COUNT(*));
+substring: Lin `title ~ "wal" | count` vs SQL LIKE '%wal%' COUNT(*);
+materialize: Lin `wing==rag | {id,title} | take all` vs SQL SELECT id,title;
+join: 10000 orders ⋈ 1000 users (Lin run_batch SoA / cursor vs SQL INNER JOIN);
+append_log: Lin `append facts` vs SQL INSERT INTO logs (append-only shape)
+airbug dash: http://127.0.0.1:8790/#/bench
+bench: compare/point_get/mysql — validating and calibrating
+bench: compare/point_get/mysql — measuring 1 samples
+bench: compare/filter_eq/mysql — validating and calibrating
+bench: compare/filter_eq/mysql — measuring 1 samples
+bench: compare/filter_range/mysql — validating and calibrating
+bench: compare/filter_range/mysql — measuring 1 samples
+bench: compare/text_substr/mysql — validating and calibrating
+bench: compare/text_substr/mysql — measuring 1 samples
+bench: compare/materialize/mysql — validating and calibrating
+bench: compare/materialize/mysql — measuring 1 samples
+bench: compare/join_inner/mysql — validating and calibrating
+bench: compare/join_inner/mysql — measuring 1 samples
+bench: compare/join_filter/mysql — validating and calibrating
+bench: compare/join_filter/mysql — measuring 1 samples
+bench: compare/insert_bulk_1k/mysql — validating and calibrating
+bench: compare/insert_bulk_1k/mysql — measuring 1 samples
+bench: compare/insert_bulk_10k/mysql — validating and calibrating
+bench: compare/insert_bulk_10k/mysql — measuring 1 samples
+bench: compare/append_log_1k/mysql — validating and calibrating
+bench: compare/append_log_1k/mysql — measuring 1 samples
+bench: compare/append_log_10k/mysql — validating and calibrating
+bench: compare/append_log_10k/mysql — measuring 1 samples
+# bench 1790901097154019000-60104
+
+Status: Complete
+
+| Case | Metric | Median | Unit | Scope / statistic | Observations | Processes |
+|---|---|---:|---|---|---:|---:|
+| compare/point_get/mysql [candidate] | wall | 289542.0000 | ns | current thread wall clock; scheduler included / batch_total | 1 | 1 |
+| compare/filter_eq/mysql [candidate] | wall | 601458.0000 | ns | current thread wall clock; scheduler included / batch_total | 1 | 1 |
+| compare/filter_range/mysql [candidate] | wall | 802125.0000 | ns | current thread wall clock; scheduler included / batch_total | 1 | 1 |
+| compare/text_substr/mysql [candidate] | wall | 1270083.0000 | ns | current thread wall clock; scheduler included / batch_total | 1 | 1 |
+| compare/materialize/mysql [candidate] | wall | 4329125.0000 | ns | current thread wall clock; scheduler included / batch_total | 1 | 1 |
+| compare/join_inner/mysql [candidate] | wall | 9504167.0000 | ns | current thread wall clock; scheduler included / batch_total | 1 | 1 |
+| compare/join_filter/mysql [candidate] | wall | 9260000.0000 | ns | current thread wall clock; scheduler included / batch_total | 1 | 1 |
+| compare/insert_bulk_1k/mysql [candidate] | wall | 202969916.0000 | ns | current thread wall clock; scheduler included / batch_total | 1 | 1 |
+| compare/insert_bulk_10k/mysql [candidate] | wall | 2210709000.0000 | ns | current thread wall clock; scheduler included / batch_total | 1 | 1 |
+| compare/append_log_1k/mysql [candidate] | wall | 223995292.0000 | ns | current thread wall clock; scheduler included / batch_total | 1 | 1 |
+| compare/append_log_10k/mysql [candidate] | wall | 2101807625.0000 | ns | current thread wall clock; scheduler included / batch_total | 1 | 1 |
+
+# Useful work throughput
+
+| Case | Median batch throughput | Unit |
+|---|---:|---|
+| compare/join_inner/mysql [candidate] | 1052170.0639 | rows/s |
+| compare/join_filter/mysql [candidate] | 539956.8035 | rows/s |
+| compare/insert_bulk_1k/mysql [candidate] | 4926.8385 | rows/s |
+| compare/insert_bulk_10k/mysql [candidate] | 4523.4357 | rows/s |
+| compare/append_log_1k/mysql [candidate] | 4464.3795 | rows/s |
+| compare/append_log_10k/mysql [candidate] | 4757.8094 | rows/s |
+
+Derived from positive wall batches and declared units per operation; zero/unavailable durations omitted.
+
+Medians above summarize observations, not pooled operation-latency percentiles. Comparisons aggregate within each process first.
+
+- Raw batches are not independent process replications. Batch averages are not individual-operation latency. CPU frequency and background load are uncontrolled.
+
+- compare/point_get/mysql: some samples below half the requested duration; iteration cap or workload drift may limit precision
+

@@ -245,6 +245,8 @@ Workflow [`.github/workflows/bench.yml`](.github/workflows/bench.yml) на `push
 
 Postgres bulk insert проверяет все шесть записанных полей отдельным подключением после commit, вне таймера. Помимо построчного INSERT в транзакции есть `insert_native_1k/postgres_copy` и `insert_native_10k/postgres_copy`: binary COPY с теми же индексами, проверкой числа строк и полным readback.
 
+MySQL native fixtures используют уникальные обычные InnoDB-таблицы в выбранной БД; общий `docs`/`users`/`orders` не переиспользуется. Cleanup удаляет только таблицы конкретной fixture. Нужны CREATE/DROP TABLE privileges. `insert_native_1k/mysql_batch` и `insert_native_10k/mysql_batch` выполняют один подготовленный multi-row INSERT в транзакции: подготовка вне таймера, создание параметров, запись и commit внутри. Native и построчные bulk cases проверяют все шесть полей отдельным соединением после измерения.
+
 Для проверки затрат нормализации FTS на bulk insert можно задать `LIN_BENCH_MIXED_CASE=1` и выбрать `--filter insert_bulk`: заголовки fixture будут со смешанным регистром у всех движков. Этот режим предназначен для вставок; обычные read cases используют условия для стандартных строчных заголовков.
 
 Сравнимо: point get по id, `wing ==`, range `wing`+`ts`, substring (`title ~ "wal" | count` ≈ `COUNT(*) … LIKE '%wal%'`), materialize `SELECT id,title`, **join** (10k `orders` ⋈ 1k `users` по FK; Lin `run_batch` / SoA+`RecordBatch` и lazy cursor vs SQL `INNER JOIN`; плюс `total > 100` затем join), bulk insert 1k/10k, **append_log** (`append facts` vs `INSERT INTO logs`) 1k/10k.

@@ -90,3 +90,19 @@ not be used to claim a win against native x86-64 or cloud deployments.
 CI runs fresh-fixture mutation cases separately with one timed operation per sample.
 They are excluded from automatic calibration because untimed 100k-row fixture
 construction can otherwise make calibration take excessively long.
+
+## Native MongoDB insertion
+
+Run `scripts/bench-peers.py --engines lin mongo --cases insert_native --rows 1000
+--samples 9 --repeats 3 --require-wins --output .airbug-bench/mongo-native` with
+`--lin-binary` pointing to the release `peer_bench` example. Native insertion
+cannot be mixed with read cases. Unsupported native adapters fail as incomplete.
+
+Each sample uses a fresh fixture. Schema/index creation, preparation, exact
+six-field readback, cleanup and Lin IPC are excluded from timing. The timestamp
+is shared by both engines within each process. Lin includes default embedding
+and FTS. MongoDB uses ordered `insert_many`, maps `id` to `_id`, creates unique
+URI and wing/ts indexes, and uses acknowledged writes (`w=1`, `j=false`). This
+compares successful native API calls; it does not establish identical bulk
+failure atomicity or physical disk durability. Mongo fixtures use unique owned
+databases and cleanup only objects successfully created by this run.

@@ -1,0 +1,155 @@
+{
+  "rows": 10000,
+  "repeats": 3,
+  "samples": 9,
+  "host": "macOS-26.7.1-arm64-arm-64bit-Mach-O",
+  "engines": [
+    "lin",
+    "mongo"
+  ],
+  "cases": [
+    "insert_native"
+  ],
+  "observations": [
+    {
+      "case": "insert_native/lin",
+      "repetition": 0,
+      "iterations": 1,
+      "samples_ns": [
+        27430875.0,
+        25097083.0,
+        28163875.0,
+        22599625.0,
+        25798792.0,
+        21183917.0,
+        21705625.0,
+        21329459.0,
+        20464000.0
+      ],
+      "validated_rows": 10000
+    },
+    {
+      "case": "insert_native/mongo",
+      "repetition": 0,
+      "iterations": 1,
+      "samples_ns": [
+        111442709,
+        108903458,
+        99124583,
+        103179292,
+        102548000,
+        106278166,
+        102597959,
+        101332500,
+        104749500
+      ],
+      "validated_rows": 10000
+    },
+    {
+      "case": "insert_native/mongo",
+      "repetition": 1,
+      "iterations": 1,
+      "samples_ns": [
+        87938042,
+        86647208,
+        77770666,
+        95282792,
+        86311833,
+        86530125,
+        87794750,
+        86454125,
+        88214167
+      ],
+      "validated_rows": 10000
+    },
+    {
+      "case": "insert_native/lin",
+      "repetition": 1,
+      "iterations": 1,
+      "samples_ns": [
+        23065792.0,
+        22304000.0,
+        22963042.0,
+        18634167.0,
+        18452959.0,
+        18300042.0,
+        18299041.0,
+        18203917.0,
+        17849959.0
+      ],
+      "validated_rows": 10000
+    },
+    {
+      "case": "insert_native/lin",
+      "repetition": 2,
+      "iterations": 1,
+      "samples_ns": [
+        26015541.0,
+        24269084.0,
+        22481000.0,
+        20496416.0,
+        17895541.0,
+        18647708.0,
+        20784166.0,
+        20722250.0,
+        20980833.0
+      ],
+      "validated_rows": 10000
+    },
+    {
+      "case": "insert_native/mongo",
+      "repetition": 2,
+      "iterations": 1,
+      "samples_ns": [
+        95663250,
+        94013125,
+        94456833,
+        100575791,
+        94584250,
+        103544458,
+        104184959,
+        103321167,
+        105470250
+      ],
+      "validated_rows": 10000
+    }
+  ],
+  "errors": [],
+  "versions": {
+    "lin": "0.4.0",
+    "mongo": "8.0.28"
+  },
+  "medians_ns": {
+    "insert_native/lin": 20784166.0,
+    "insert_native/mongo": 100575791
+  },
+  "python": "3.14.7 (main, Aug  5 2026, 10:29:49) [Clang 21.0.0 (clang-2100.1.1.101)]",
+  "clients": {
+    "pandas": "3.0.6",
+    "duckdb": "1.5.6",
+    "pymongo": "4.18.2",
+    "psycopg": "3.3.6",
+    "PyMySQL": "1.2.3",
+    "python-tds": "1.17.1"
+  },
+  "native_contracts": {
+    "lin": {
+      "schema": "id/uri/wing/title/ts/body; unique id and uri; wing+ts index",
+      "fixture": "fresh per sample; schema/index/prepare/validation/drop excluded",
+      "durability": "native memory API comparison; no disk durability equivalence",
+      "api": "Rust prepared run; default embedding and FTS",
+      "storage": "Db::empty"
+    },
+    "mongo": {
+      "schema": "id/uri/wing/title/ts/body; unique id and uri; wing+ts index",
+      "fixture": "fresh per sample; schema/index/prepare/validation/drop excluded",
+      "durability": "native memory API comparison; no disk durability equivalence",
+      "api": "PyMongo ordered insert_many; id maps to native _id",
+      "write_concern": {
+        "j": false,
+        "w": 1
+      }
+    }
+  },
+  "status": "complete"
+}

@@ -268,6 +268,84 @@ class Mongo:
             self.client.close()
 
 
+class NativeInsert(Lin):
+    """Fresh fixtures; real native write plus exact readback on every sample."""
+    def __init__(self, data, args, prefix, engine):
+        self.engine = engine
+        self.proc = None
+        self.client = None
+        self.db = None
+        self.owns_database = False
+        self.timestamp = args.native_timestamp_ms
+        self.want = [[d[0], d[1], d[2], d[3], self.timestamp, d[4]] for d in data[0]]
+        self.contract = {"schema": "id/uri/wing/title/ts/body; unique id and uri; wing+ts index",
+                         "fixture": "fresh per sample; schema/index/prepare/validation/drop excluded",
+                         "durability": "native memory API comparison; no disk durability equivalence"}
+        try:
+            if engine == "lin":
+                binary = Path(args.lin_binary).resolve()
+                self.proc = subprocess.Popen([str(binary)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+                self.version = self.ask({"worker_version": True})["version"]
+                self.contract.update({"api": "Rust prepared run; default embedding and FTS", "storage": "Db::empty"})
+            elif engine == "mongo":
+                from pymongo import MongoClient
+                from pymongo.write_concern import WriteConcern
+                self.client = MongoClient(os.environ.get("LIN_BENCH_MONGO_URL", "mongodb://127.0.0.1:27027"), serverSelectionTimeoutMS=5000)
+                self.version = self.client.server_info()["version"]
+                if prefix in self.client.list_database_names():
+                    raise RuntimeError("refuse existing Mongo fixture database")
+                self.db = self.client[prefix]
+                self.db.create_collection("__linbench_owner")
+                self.owns_database = True
+                self.concern = WriteConcern(w=1, j=False)
+                self.contract.update({"api": "PyMongo ordered insert_many; id maps to native _id", "write_concern": self.concern.document})
+            else:
+                raise RuntimeError("native insert is not implemented for " + engine)
+        except BaseException:
+            self.close()
+            raise
+
+    def measure_insert(self, samples):
+        if self.engine == "lin":
+            result = self.ask({"insert_rows": len(self.want), "samples": samples, "timestamp_ms": self.timestamp})
+            validate(result["result"], self.want, self.engine, "insert_native")
+            return result["samples_ns"], 1, result["result"]
+        timings = []
+        docs = [dict(zip(["_id", "uri", "wing", "title", "ts", "body"], row)) for row in self.want]
+        got = None
+        for sample in range(samples):
+            name = "docs_" + str(sample)
+            created = False
+            try:
+                collection = self.db.create_collection(name, write_concern=self.concern)
+                created = True
+                collection.create_index("uri", unique=True)
+                collection.create_index([("wing", 1), ("ts", 1)])
+                start = time.perf_counter_ns()
+                result = collection.insert_many(docs, ordered=True)
+                timings.append(time.perf_counter_ns() - start)
+                if not result.acknowledged or len(result.inserted_ids) != len(self.want):
+                    raise RuntimeError("Mongo insert acknowledgement/count mismatch")
+                got = [[d[k] for k in ["_id", "uri", "wing", "title", "ts", "body"]] for d in collection.find({})]
+                validate(got, self.want, self.engine, "insert_native")
+            finally:
+                if created:
+                    self.db.drop_collection(name)
+        return timings, 1, got
+
+    def close(self):
+        if self.proc is not None:
+            super().close()
+            self.proc = None
+        if self.client is not None:
+            try:
+                if self.db is not None and self.owns_database:
+                    self.client.drop_database(self.db.name)
+            finally:
+                self.client.close()
+                self.client = None
+
+
 class Kusto:
     def __init__(self, data, args, prefix):
         self.endpoint = os.environ.get("LIN_BENCH_KUSTO_URL")
@@ -351,8 +429,10 @@ class Kusto:
 
 
 def report(data):
-    lines = ["# Validated read API benchmark", "", f"Rows: {data['rows']}; process repetitions: {data['repeats']}; host: {data['host']}", "",
-             "Setup, validation and Lin JSON IPC excluded. Queries return the same materialized columns/values.",
+    native = data["cases"] == ["insert_native"]
+    title = "# Validated native insert API benchmark" if native else "# Validated read API benchmark"
+    lines = [title, "", f"Rows: {data['rows']}; process repetitions: {data['repeats']}; host: {data['host']}", "",
+             ("Fresh fixture per sample; schema/index/preparation, exact readback, drop and Lin JSON IPC excluded. Writes store the same six common fields." if native else "Setup, validation and Lin JSON IPC excluded. Queries return the same materialized columns/values."),
              "Lin: Rust prepared API; Python peers: DBAPI/DataFrame/driver API. Server timings include round-trip and transfer.",
              "Medians are batch averages, not individual latency percentiles. Each process is aggregated first.", "",
              "| Case | Engine | Median µs/op | Peer / Lin | Status |", "|---|---|---:|---:|---|"]
@@ -365,6 +445,8 @@ def report(data):
                 lines.append(f"| {case} | {engine} | {value / 1000:.3f} | {ratio:.2f}× | validated |" if ratio else f"| {case} | {engine} | {value / 1000:.3f} | — | validated |")
             else:
                 lines.append(f"| {case} | {engine} | — | — | unavailable/error |")
+    if data.get("native_contracts"):
+        lines += ["", "Native contracts: " + json.dumps(data["native_contracts"], sort_keys=True)]
     lines += ["", "Versions: " + json.dumps(data["versions"], sort_keys=True), "", "Missing/failed peers are never counted as wins."]
     return "\n".join(lines) + "\n"
 
@@ -372,7 +454,7 @@ def report(data):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--engines", nargs="+", choices=ENGINES, default=ENGINES)
-    parser.add_argument("--cases", nargs="+", choices=CASES, default=CASES)
+    parser.add_argument("--cases", nargs="+", choices=CASES + ["insert_native"], default=CASES)
     parser.add_argument("--rows", type=int, default=10000)
     parser.add_argument("--samples", type=int, default=8)
     parser.add_argument("--repeats", type=int, default=3)
@@ -383,6 +465,9 @@ def main():
     args = parser.parse_args()
     if args.rows <= 20 or min(args.samples, args.repeats, args.sample_ms) <= 0:
         parser.error("rows must exceed 20; samples/repeats/sample-ms must be positive")
+    if "insert_native" in args.cases and args.cases != ["insert_native"]:
+        parser.error("run insert_native separately from read cases")
+    args.native_timestamp_ms = time.time_ns() // 1_000_000
     args.output.mkdir(parents=True, exist_ok=False)
     run = {"rows": args.rows, "repeats": args.repeats, "samples": args.samples,
            "host": platform.platform(), "engines": args.engines, "cases": args.cases,
@@ -410,6 +495,7 @@ def main():
             if completed.returncode not in [0, 2]:
                 run["errors"].append({"repetition": repetition, "reason": "worker exit " + str(completed.returncode)})
             run["versions"].update(child["versions"])
+            run.setdefault("native_contracts", {}).update(child.get("native_contracts", {}))
             (args.output / "run.json").write_text(json.dumps(run, indent=2) + "\n")
         return finish(args, run)
     data = dataset(args.rows)
@@ -420,7 +506,10 @@ def main():
             peer = None
             try:
                 prefix = "linbench_" + uuid.uuid4().hex[:16]
-                if engine == "lin":
+                if args.cases == ["insert_native"]:
+                    peer = NativeInsert(data, args, prefix, engine)
+                    run.setdefault("native_contracts", {})[engine] = peer.contract
+                elif engine == "lin":
                     peer = Lin(data, args, prefix)
                 elif engine in ["sqlite", "duckdb", "postgres", "mysql", "mssql"]:
                     peer = Sql(data, args, prefix, engine)
@@ -428,8 +517,10 @@ def main():
                     peer = {"pandas": Pandas, "mongo": Mongo, "kusto": Kusto}[engine](data, args, prefix)
                 run["versions"][engine] = peer.version
                 for case in args.cases:
-                    want = expected(data, case)
-                    if engine == "lin":
+                    want = peer.want if case == "insert_native" else expected(data, case)
+                    if case == "insert_native":
+                        values, iterations, got = peer.measure_insert(args.samples)
+                    elif engine == "lin":
                         values, iterations, got = peer.measure(case, args.samples, args.sample_ms)
                     else:
                         validate(peer.query(case), want, engine, case)
