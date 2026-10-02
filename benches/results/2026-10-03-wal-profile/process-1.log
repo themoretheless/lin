@@ -1,0 +1,148 @@
+skip postgres: no reachable server
+  tried: postgresql://lin:lin@127.0.0.1:55432/lin (error connecting to server); postgresql://postgres@127.0.0.1:5432/postgres (error connecting to server)
+  set LIN_BENCH_PG_URL or:
+  docker compose -f docker-compose.bench.yml up -d postgres
+  # brew postgresql@17 via Sources/ppduster macos-stack-postgres; start service for :5432
+skip mysql: LIN_BENCH_SKIP_MYSQL is set
+lin compare: N=10000 warm reads (fixture), bulk insert (schema outside timing)
+engines: Lin | SQLite(rusqlite bundled) | DuckDB(bundled) | HashMap(point get only) | Postgres(skipped) | MySQL(skipped)
+airbug dash: http://127.0.0.1:8790/
+Lin reads: prepare once / run many; filters use count (fair vs SQL COUNT(*));
+substring: Lin `title ~ "wal" | count` vs SQL LIKE '%wal%' COUNT(*);
+materialize: Lin `wing==rag | {id,title} | take all` vs SQL SELECT id,title;
+join: 10000 orders ⋈ 1000 users (Lin run_batch SoA / cursor vs SQL INNER JOIN);
+append_log: Lin `append facts` vs SQL INSERT INTO logs (append-only shape)
+airbug dash: http://127.0.0.1:8790/#/bench
+bench: compare/durable_insert_1k/lin — validating and calibrating
+WAL_PROFILE_ENCODE rows=1000 bytes=336968 encode_ns=558458
+WAL_PROFILE_FRAME bytes=336968 checksum_ns=28625 write_ns=43541 sync_ns=982750
+WAL_PROFILE_ENCODE rows=1000 bytes=336968 encode_ns=537041
+WAL_PROFILE_FRAME bytes=336968 checksum_ns=11833 write_ns=42750 sync_ns=715583
+bench: compare/durable_insert_1k/lin — measuring 24 samples
+WAL_PROFILE_ENCODE rows=1000 bytes=336968 encode_ns=536291
+WAL_PROFILE_FRAME bytes=336968 checksum_ns=11583 write_ns=44833 sync_ns=480834
+WAL_PROFILE_ENCODE rows=1000 bytes=336968 encode_ns=538083
+WAL_PROFILE_FRAME bytes=336968 checksum_ns=11917 write_ns=50667 sync_ns=737417
+WAL_PROFILE_ENCODE rows=1000 bytes=336968 encode_ns=522208
+WAL_PROFILE_FRAME bytes=336968 checksum_ns=11417 write_ns=49125 sync_ns=1011458
+WAL_PROFILE_ENCODE rows=1000 bytes=336968 encode_ns=541500
+WAL_PROFILE_FRAME bytes=336968 checksum_ns=11750 write_ns=45208 sync_ns=880667
+WAL_PROFILE_ENCODE rows=1000 bytes=336968 encode_ns=527500
+WAL_PROFILE_FRAME bytes=336968 checksum_ns=11542 write_ns=38916 sync_ns=848542
+WAL_PROFILE_ENCODE rows=1000 bytes=336968 encode_ns=557917
+WAL_PROFILE_FRAME bytes=336968 checksum_ns=11625 write_ns=40458 sync_ns=1034083
+WAL_PROFILE_ENCODE rows=1000 bytes=336968 encode_ns=531834
+WAL_PROFILE_FRAME bytes=336968 checksum_ns=11666 write_ns=38375 sync_ns=663958
+WAL_PROFILE_ENCODE rows=1000 bytes=336968 encode_ns=551333
+WAL_PROFILE_FRAME bytes=336968 checksum_ns=11750 write_ns=39875 sync_ns=583042
+WAL_PROFILE_ENCODE rows=1000 bytes=336968 encode_ns=612209
+WAL_PROFILE_FRAME bytes=336968 checksum_ns=11750 write_ns=44500 sync_ns=917250
+WAL_PROFILE_ENCODE rows=1000 bytes=336968 encode_ns=538625
+WAL_PROFILE_FRAME bytes=336968 checksum_ns=11791 write_ns=59958 sync_ns=956250
+WAL_PROFILE_ENCODE rows=1000 bytes=336968 encode_ns=524625
+WAL_PROFILE_FRAME bytes=336968 checksum_ns=11542 write_ns=48834 sync_ns=999792
+WAL_PROFILE_ENCODE rows=1000 bytes=336968 encode_ns=527875
+WAL_PROFILE_FRAME bytes=336968 checksum_ns=11458 write_ns=57416 sync_ns=639667
+WAL_PROFILE_ENCODE rows=1000 bytes=336968 encode_ns=521916
+WAL_PROFILE_FRAME bytes=336968 checksum_ns=11458 write_ns=40542 sync_ns=1015417
+WAL_PROFILE_ENCODE rows=1000 bytes=336968 encode_ns=524167
+WAL_PROFILE_FRAME bytes=336968 checksum_ns=11375 write_ns=43500 sync_ns=829625
+WAL_PROFILE_ENCODE rows=1000 bytes=336968 encode_ns=526542
+WAL_PROFILE_FRAME bytes=336968 checksum_ns=11584 write_ns=38375 sync_ns=885792
+WAL_PROFILE_ENCODE rows=1000 bytes=336968 encode_ns=537791
+WAL_PROFILE_FRAME bytes=336968 checksum_ns=14875 write_ns=118791 sync_ns=558209
+WAL_PROFILE_ENCODE rows=1000 bytes=336968 encode_ns=526667
+WAL_PROFILE_FRAME bytes=336968 checksum_ns=11458 write_ns=45875 sync_ns=607417
+WAL_PROFILE_ENCODE rows=1000 bytes=336968 encode_ns=511500
+WAL_PROFILE_FRAME bytes=336968 checksum_ns=11375 write_ns=42333 sync_ns=368708
+WAL_PROFILE_ENCODE rows=1000 bytes=336968 encode_ns=510000
+WAL_PROFILE_FRAME bytes=336968 checksum_ns=11375 write_ns=55542 sync_ns=314542
+WAL_PROFILE_ENCODE rows=1000 bytes=336968 encode_ns=543417
+WAL_PROFILE_FRAME bytes=336968 checksum_ns=11708 write_ns=47875 sync_ns=488541
+WAL_PROFILE_ENCODE rows=1000 bytes=336968 encode_ns=518458
+WAL_PROFILE_FRAME bytes=336968 checksum_ns=11583 write_ns=55208 sync_ns=619958
+WAL_PROFILE_ENCODE rows=1000 bytes=336968 encode_ns=537833
+WAL_PROFILE_FRAME bytes=336968 checksum_ns=13333 write_ns=49792 sync_ns=552458
+WAL_PROFILE_ENCODE rows=1000 bytes=336968 encode_ns=523750
+WAL_PROFILE_FRAME bytes=336968 checksum_ns=11167 write_ns=47625 sync_ns=866625
+WAL_PROFILE_ENCODE rows=1000 bytes=336968 encode_ns=535459
+WAL_PROFILE_FRAME bytes=336968 checksum_ns=11625 write_ns=54625 sync_ns=1646417
+WAL_PROFILE_ENCODE rows=1000 bytes=336968 encode_ns=533083
+WAL_PROFILE_FRAME bytes=336968 checksum_ns=11791 write_ns=52208 sync_ns=819209
+bench: compare/durable_insert_10k/lin — validating and calibrating
+WAL_PROFILE_ENCODE rows=10000 bytes=3558340 encode_ns=6403875
+WAL_PROFILE_FRAME bytes=3558340 checksum_ns=114584 write_ns=396292 sync_ns=2181958
+WAL_PROFILE_ENCODE rows=10000 bytes=3558340 encode_ns=5721625
+WAL_PROFILE_FRAME bytes=3558340 checksum_ns=123083 write_ns=275250 sync_ns=2066250
+bench: compare/durable_insert_10k/lin — measuring 24 samples
+WAL_PROFILE_ENCODE rows=10000 bytes=3558340 encode_ns=5910542
+WAL_PROFILE_FRAME bytes=3558340 checksum_ns=117500 write_ns=312042 sync_ns=1016084
+WAL_PROFILE_ENCODE rows=10000 bytes=3558340 encode_ns=5539125
+WAL_PROFILE_FRAME bytes=3558340 checksum_ns=101042 write_ns=248792 sync_ns=1897041
+WAL_PROFILE_ENCODE rows=10000 bytes=3558340 encode_ns=5578167
+WAL_PROFILE_FRAME bytes=3558340 checksum_ns=124084 write_ns=273167 sync_ns=1428708
+WAL_PROFILE_ENCODE rows=10000 bytes=3558340 encode_ns=5508458
+WAL_PROFILE_FRAME bytes=3558340 checksum_ns=121875 write_ns=274875 sync_ns=1612667
+WAL_PROFILE_ENCODE rows=10000 bytes=3558340 encode_ns=5606667
+WAL_PROFILE_FRAME bytes=3558340 checksum_ns=123792 write_ns=479625 sync_ns=1401333
+WAL_PROFILE_ENCODE rows=10000 bytes=3558340 encode_ns=5882250
+WAL_PROFILE_FRAME bytes=3558340 checksum_ns=114500 write_ns=264084 sync_ns=1311500
+WAL_PROFILE_ENCODE rows=10000 bytes=3558340 encode_ns=5444750
+WAL_PROFILE_FRAME bytes=3558340 checksum_ns=117084 write_ns=251750 sync_ns=1216917
+WAL_PROFILE_ENCODE rows=10000 bytes=3558340 encode_ns=5641500
+WAL_PROFILE_FRAME bytes=3558340 checksum_ns=118333 write_ns=408875 sync_ns=1177833
+WAL_PROFILE_ENCODE rows=10000 bytes=3558340 encode_ns=5827916
+WAL_PROFILE_FRAME bytes=3558340 checksum_ns=115958 write_ns=250542 sync_ns=1384584
+WAL_PROFILE_ENCODE rows=10000 bytes=3558340 encode_ns=5760375
+WAL_PROFILE_FRAME bytes=3558340 checksum_ns=114250 write_ns=414459 sync_ns=1246292
+WAL_PROFILE_ENCODE rows=10000 bytes=3558340 encode_ns=5746292
+WAL_PROFILE_FRAME bytes=3558340 checksum_ns=119084 write_ns=251833 sync_ns=1828500
+WAL_PROFILE_ENCODE rows=10000 bytes=3558340 encode_ns=5650250
+WAL_PROFILE_FRAME bytes=3558340 checksum_ns=118542 write_ns=442333 sync_ns=995917
+WAL_PROFILE_ENCODE rows=10000 bytes=3558340 encode_ns=5553458
+WAL_PROFILE_FRAME bytes=3558340 checksum_ns=111875 write_ns=273541 sync_ns=1476917
+WAL_PROFILE_ENCODE rows=10000 bytes=3558340 encode_ns=5525167
+WAL_PROFILE_FRAME bytes=3558340 checksum_ns=111666 write_ns=253833 sync_ns=1336250
+WAL_PROFILE_ENCODE rows=10000 bytes=3558340 encode_ns=5738542
+WAL_PROFILE_FRAME bytes=3558340 checksum_ns=120708 write_ns=323416 sync_ns=1290208
+WAL_PROFILE_ENCODE rows=10000 bytes=3558340 encode_ns=6053125
+WAL_PROFILE_FRAME bytes=3558340 checksum_ns=116334 write_ns=244917 sync_ns=1273625
+WAL_PROFILE_ENCODE rows=10000 bytes=3558340 encode_ns=5675292
+WAL_PROFILE_FRAME bytes=3558340 checksum_ns=116750 write_ns=291167 sync_ns=1413375
+WAL_PROFILE_ENCODE rows=10000 bytes=3558340 encode_ns=5719875
+WAL_PROFILE_FRAME bytes=3558340 checksum_ns=116167 write_ns=267291 sync_ns=1089750
+WAL_PROFILE_ENCODE rows=10000 bytes=3558340 encode_ns=5597917
+WAL_PROFILE_FRAME bytes=3558340 checksum_ns=120958 write_ns=282250 sync_ns=1387708
+WAL_PROFILE_ENCODE rows=10000 bytes=3558340 encode_ns=5766583
+WAL_PROFILE_FRAME bytes=3558340 checksum_ns=114292 write_ns=245500 sync_ns=1654000
+WAL_PROFILE_ENCODE rows=10000 bytes=3558340 encode_ns=5794125
+WAL_PROFILE_FRAME bytes=3558340 checksum_ns=119875 write_ns=245625 sync_ns=1330708
+WAL_PROFILE_ENCODE rows=10000 bytes=3558340 encode_ns=5677291
+WAL_PROFILE_FRAME bytes=3558340 checksum_ns=124292 write_ns=274458 sync_ns=1015458
+WAL_PROFILE_ENCODE rows=10000 bytes=3558340 encode_ns=5962875
+WAL_PROFILE_FRAME bytes=3558340 checksum_ns=120917 write_ns=365292 sync_ns=1379041
+WAL_PROFILE_ENCODE rows=10000 bytes=3558340 encode_ns=5465000
+WAL_PROFILE_FRAME bytes=3558340 checksum_ns=113166 write_ns=250125 sync_ns=1056542
+WAL_PROFILE_ENCODE rows=10000 bytes=3558340 encode_ns=5691500
+WAL_PROFILE_FRAME bytes=3558340 checksum_ns=116375 write_ns=254750 sync_ns=1341334
+# bench 1790980296319450000-99407
+
+Status: Complete
+
+| Case | Metric | Median | Unit | Scope / statistic | Observations | Processes |
+|---|---|---:|---|---|---:|---:|
+| compare/durable_insert_1k/lin [candidate] | wall | 2752145.5000 | ns | current thread wall clock; scheduler included / batch_total | 24 | 1 |
+| compare/durable_insert_10k/lin [candidate] | wall | 21459979.0000 | ns | current thread wall clock; scheduler included / batch_total | 24 | 1 |
+
+# Useful work throughput
+
+| Case | Median batch throughput | Unit |
+|---|---:|---|
+| compare/durable_insert_1k/lin [candidate] | 363354.6700 | rows/s |
+| compare/durable_insert_10k/lin [candidate] | 465983.7020 | rows/s |
+
+Derived from positive wall batches and declared units per operation; zero/unavailable durations omitted.
+
+Medians above summarize observations, not pooled operation-latency percentiles. Comparisons aggregate within each process first.
+
+- Raw batches are not independent process replications. Batch averages are not individual-operation latency. CPU frequency and background load are uncontrolled.
