@@ -1585,11 +1585,11 @@ impl Store {
 
     /// [`Store::row_maps_register_row`] plus the `facts` key that helper ignores.
     fn swap_maps_register(&mut self, collection: &str, idx: usize, row: &Row) {
-        self.row_maps_register_row(collection, idx, row);
-        if collection == "facts"
-            && let Some(spo) = spo_key(row)
-        {
+        // Inline: facts By_SPO lookup is only needed for triples
+        if collection == "facts" && let Some(spo) = spo_key(row) {
             self.facts_by_spo.insert(spo, idx);
+        } else {
+            self.row_maps_register_row(collection, idx, row);
         }
     }
 

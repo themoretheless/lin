@@ -62,7 +62,8 @@ impl FtsIndex {
     /// Post a row whose position is new at the tail of the collection: written
     /// straight into the base list, which keeps appends allocation-cheap.
     pub fn append_row(&mut self, row_idx: usize, row: &Row) {
-        let mut scratch = String::new();
+        // Caller should provide scratch buffer if batching; single-row path uses one-off.
+        let mut scratch = String::with_capacity(128);
         self.append_row_with_scratch(row_idx, row, &mut scratch);
     }
 
@@ -79,7 +80,7 @@ impl FtsIndex {
     /// because a recycled tail position can still occur in an old base posting.
     pub fn append_slab(&mut self, start: usize, rows: &[Row]) {
         if self.adds.is_empty() && self.dels.is_empty() {
-            let mut scratch = String::new();
+            let mut scratch = String::with_capacity(256); // Предварительная аллокация
             for (i, row) in rows.iter().enumerate() {
                 self.append_row_with_scratch(start + i, row, &mut scratch);
             }
@@ -508,7 +509,7 @@ fn add_posting(postings: &mut FxHashMap<String, Vec<usize>>, tok: &str, row_idx:
 
 fn row_tokens<'a>(row: &'a Row, fields: &[String]) -> Vec<std::borrow::Cow<'a, str>> {
     use std::borrow::Cow;
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(fields.len() * 10); // Предположение среднего количества токенов
     for field in fields {
         let Some(text) = row_text(row, field) else {
             continue;
@@ -519,11 +520,8 @@ fn row_tokens<'a>(row: &'a Row, fields: &[String]) -> Vec<std::borrow::Cow<'a, s
         {
             out.extend(text.split_whitespace().map(Cow::Borrowed));
         } else {
-            out.extend(
-                text.to_lowercase()
-                    .split_whitespace()
-                    .map(|t| Cow::Owned(t.to_owned())),
-            );
+            let lowercased = text.to_lowercase();
+            out.extend(lowercased.split_whitespace().map(|t| Cow::Owned(t.to_owned())));
         }
     }
     out.sort_unstable();
