@@ -860,22 +860,10 @@ fn append_insert_cols_v2(
                     let count = emb.iter().filter(|value| value.to_bits() != 0).count() as u32;
                     buf.extend_from_slice(&dim.to_le_bytes());
                     buf.extend_from_slice(&count.to_le_bytes());
-                    for (block, values) in emb.chunks(8).enumerate() {
-                        // Bitwise zero preserves negative zero and NaN payloads.
-                        // Skip empty blocks without branching for each element.
-                        if values
-                            .iter()
-                            .fold(0u32, |bits, value| bits | value.to_bits())
-                            == 0
-                        {
-                            continue;
-                        }
-                        for (offset, value) in values.iter().enumerate() {
-                            if value.to_bits() != 0 {
-                                let index = block * 8 + offset;
-                                buf.extend_from_slice(&(index as u32).to_le_bytes());
-                                buf.extend_from_slice(&value.to_bits().to_le_bytes());
-                            }
+                    for (index, value) in emb.iter().enumerate() {
+                        if value.to_bits() != 0 {
+                            buf.extend_from_slice(&(index as u32).to_le_bytes());
+                            buf.extend_from_slice(&value.to_bits().to_le_bytes());
                         }
                     }
                 }
@@ -1726,14 +1714,6 @@ mod wal_integrity_tests {
                 f32::INFINITY,
                 -1.25,
             ]),
-            Some({
-                let mut values = vec![0.0; 69];
-                values[7] = -0.0;
-                values[8] = f32::from_bits(0x7fc00002);
-                values[32] = f32::INFINITY;
-                values[68] = -1.25;
-                values
-            }),
         ];
         with_log(|file| {
             let bytes = frame(file, vector_pack(expected.clone()));
