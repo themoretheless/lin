@@ -4,7 +4,7 @@
 //! (`…/768` → dim 768). It is **not** a neural model — swap via
 //! [`crate::exec::Db::with_embedder`] when a real backend is available.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use rustc_hash::FxHasher;
 use std::hash::{Hash, Hasher};
@@ -41,9 +41,6 @@ pub struct HashingEmbedder {
 impl HashingEmbedder {
     pub fn new(id: impl Into<String>, dim: usize) -> Self {
         let dim = dim.max(8);
-        if dim == 768 {
-            bigram_slots();
-        }
         Self { id: id.into(), dim }
     }
 
@@ -107,36 +104,10 @@ impl HashingEmbedder {
         }
         // Character bigrams over the whole string catch short queries.
         let bytes = lower.as_bytes();
-        if self.dim == 768 {
-            let slots = bigram_slots();
-            for w in bytes.windows(2) {
-                s.bump_slot(
-                    slots[usize::from(w[0]) * 256 + usize::from(w[1])] as usize,
-                    0.25,
-                );
-            }
-        } else {
-            for w in bytes.windows(2) {
-                s.bump(w, 0.25);
-            }
+        for w in bytes.windows(2) {
+            s.bump(w, 0.25);
         }
     }
-}
-
-// Compute with the active hasher rather than baking platform-dependent hashes.
-// Initialization happens once, including its cost in the first constructor.
-fn bigram_slots() -> &'static [u16] {
-    static SLOTS: OnceLock<Box<[u16]>> = OnceLock::new();
-    SLOTS.get_or_init(|| {
-        (0..65536usize)
-            .map(|key| {
-                let bytes = [(key / 256) as u8, key as u8];
-                let mut h = FxHasher::default();
-                bytes.as_slice().hash(&mut h);
-                ((h.finish() as usize) % 768) as u16
-            })
-            .collect()
-    })
 }
 
 /// Dense accumulator plus the list of slots the current row actually wrote, so
@@ -161,11 +132,6 @@ impl Scratch {
         let mut h = FxHasher::default();
         key.hash(&mut h);
         let i = (h.finish() as usize) % self.v.len();
-        self.bump_slot(i, w);
-    }
-
-    #[inline]
-    fn bump_slot(&mut self, i: usize, w: f32) {
         let i = i as u32;
         if !self.seen[i as usize] {
             self.seen[i as usize] = true;
@@ -352,16 +318,6 @@ mod tests {
             );
             assert!(scratch.v.iter().all(|x| *x == 0.0));
             assert!(scratch.touched.is_empty());
-        }
-    }
-
-    #[test]
-    fn bigram_table_matches_slice_hash_for_every_byte_pair() {
-        for (key, slot) in bigram_slots().iter().enumerate() {
-            let bytes = [(key / 256) as u8, key as u8];
-            let mut h = FxHasher::default();
-            bytes.as_slice().hash(&mut h);
-            assert_eq!(*slot as usize, (h.finish() as usize) % 768);
         }
     }
 
