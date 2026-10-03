@@ -3620,26 +3620,7 @@ impl Db {
     ) -> Result<(Vec<Row>, Vec<Edge>), Error> {
         let now = now_ms();
         let n = records.len();
-        let mut built: Vec<Row> = if n >= 4096 {
-            std::thread::scope(|scope| {
-                let (left, right) = records.split_at(n / 2);
-                let worker = scope.spawn(|| {
-                    right
-                        .iter()
-                        .map(|record| record_row(record, now))
-                        .collect::<Vec<_>>()
-                });
-                let mut rows = Vec::with_capacity(n);
-                rows.extend(left.iter().map(|record| record_row(record, now)));
-                rows.extend(worker.join().expect("row construction worker panicked"));
-                rows
-            })
-        } else {
-            records
-                .iter()
-                .map(|record| record_row(record, now))
-                .collect()
-        };
+        let mut built: Vec<Row> = Vec::with_capacity(n);
         let mut batch_ids: rustc_hash::FxHashSet<std::sync::Arc<str>> =
             rustc_hash::FxHashSet::default();
         batch_ids.reserve(n);
@@ -3649,7 +3630,8 @@ impl Db {
             batch_uris.reserve(n);
         }
 
-        for row in &mut built {
+        for record in records {
+            let mut row = record_row(record, now);
             if row.get("id").and_then(Cell::text).is_none() {
                 row.insert("id".into(), Cell::text_arc(self.store.alloc_id()));
             }
@@ -3671,7 +3653,8 @@ impl Db {
             {
                 return Err(Error::runtime(format!("duplicate uri: {uri}")));
             }
-            self.check_row_fks(collection, row)?;
+            self.check_row_fks(collection, &row)?;
+            built.push(row);
         }
         self.maybe_embed_rows(collection, &mut built);
 
@@ -4328,79 +4311,6 @@ fn record_row(record: &Record, now: i64) -> Row {
 #[cfg(test)]
 mod record_tests {
     use super::*;
-
-    #[test]
-    fn parallel_bulk_rows_preserve_order_generated_ids_and_shared_now() {
-        for n in [4095, 4096, 4101] {
-            let records = (0..n)
-                .map(|i| Record {
-                    fields: vec![
-                        (
-                            "uri".into(),
-                            Value::String(format!("parallel://{i}").into()),
-                        ),
-                        ("title".into(), Value::String("old".into())),
-                        ("title".into(), Value::String(format!("ЁЖ {i}").into())),
-                        ("body".into(), Value::String(format!("body {i}").into())),
-                        ("ts".into(), Value::Now),
-                    ],
-                })
-                .collect::<Vec<_>>();
-            let mut db = Db::empty().without_embedder();
-            let mut reference = Db::empty().without_embedder();
-            let expected_ids = (0..n)
-                .map(|_| reference.store.alloc_id())
-                .collect::<Vec<_>>();
-            let before = now_ms();
-            let (returned, edges) = db.insert_bulk("docs", &records, &[]).unwrap();
-            let after = now_ms();
-            assert!(returned.is_empty());
-            assert!(edges.is_empty());
-            let rows = db.store.collection("docs");
-            assert_eq!(rows.len(), n);
-            let ts = rows[0].get("ts").unwrap();
-            assert!(matches!(ts, Cell::Time(t) if (before..=after).contains(t)));
-            for (i, row) in rows.iter().enumerate() {
-                assert_eq!(row_text(row, "id"), Some(expected_ids[i].as_str()));
-                assert_eq!(row_text(row, "title"), Some(format!("ЁЖ {i}").as_str()));
-                assert_eq!(row.get("ts"), Some(ts));
-                assert_eq!(
-                    row.get("hash"),
-                    Some(&Cell::Text(content_hash_arc(&format!("body {i}"))))
-                );
-                assert!(db.store.get_by_uri(&format!("parallel://{i}")).is_some());
-            }
-        }
-    }
-
-    #[test]
-    fn parallel_bulk_checks_duplicate_keys_across_worker_boundary() {
-        for field in ["id", "uri"] {
-            let mut records = (0..4096)
-                .map(|i| Record {
-                    fields: vec![
-                        ("id".into(), Value::String(format!("id-{i}").into())),
-                        (
-                            "uri".into(),
-                            Value::String(format!("parallel://{i}").into()),
-                        ),
-                    ],
-                })
-                .collect::<Vec<_>>();
-            let value = records[0]
-                .fields
-                .iter()
-                .find(|(k, _)| k == field)
-                .unwrap()
-                .1
-                .clone();
-            records[2048].fields.push((field.into(), value));
-            let mut db = Db::empty().without_embedder();
-            let error = db.insert_bulk("docs", &records, &[]).unwrap_err();
-            assert!(error.to_string().contains(&format!("duplicate {field}")));
-            assert!(db.store.collection("docs").is_empty());
-        }
-    }
 
     #[test]
     fn prepared_insert_keeps_last_duplicate_and_dynamic_time() {
