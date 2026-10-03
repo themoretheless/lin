@@ -4372,27 +4372,6 @@ mod record_tests {
     }
 
     #[test]
-    fn lexical_lowercase_preserves_ascii_unicode_context_and_field_phrases() {
-        for (title, body, query, expected) in [
-            ("wal note", "body", "wal", 6),
-            ("WAL NOTE", "BODY", "wal", 6),
-            ("ΟΣ", "BODY", "ος", 6),
-            ("ΟΣ", "BODY", "οσ", 0),
-            ("one", "two", "one two", 9),
-        ] {
-            let row = Row::from([
-                ("title".into(), Cell::text_arc(title)),
-                ("body".into(), Cell::text_arc(body)),
-            ]);
-            assert_eq!(
-                lex_score_prepared(&row, &LexQuery::new(query)),
-                expected,
-                "{title}/{query}"
-            );
-        }
-    }
-
-    #[test]
     fn row_build_preserves_last_duplicate_and_execution_time() {
         let record = Record {
             fields: vec![

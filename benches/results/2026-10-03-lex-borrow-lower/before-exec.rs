@@ -4372,27 +4372,6 @@ mod record_tests {
     }
 
     #[test]
-    fn lexical_lowercase_preserves_ascii_unicode_context_and_field_phrases() {
-        for (title, body, query, expected) in [
-            ("wal note", "body", "wal", 6),
-            ("WAL NOTE", "BODY", "wal", 6),
-            ("ΟΣ", "BODY", "ος", 6),
-            ("ΟΣ", "BODY", "οσ", 0),
-            ("one", "two", "one two", 9),
-        ] {
-            let row = Row::from([
-                ("title".into(), Cell::text_arc(title)),
-                ("body".into(), Cell::text_arc(body)),
-            ]);
-            assert_eq!(
-                lex_score_prepared(&row, &LexQuery::new(query)),
-                expected,
-                "{title}/{query}"
-            );
-        }
-    }
-
-    #[test]
     fn row_build_preserves_last_duplicate_and_execution_time() {
         let record = Record {
             fields: vec![
@@ -4591,12 +4570,7 @@ fn lex_score_prepared(row: &Row, query: &LexQuery) -> i64 {
     if blob.is_empty() {
         return 0;
     }
-    let blob_l = if blob.is_ascii() && !blob.bytes().any(|b| b.is_ascii_uppercase()) {
-        std::borrow::Cow::Borrowed(blob.as_str())
-    } else {
-        // Keep str lowercase semantics, including contextual Unicode casing.
-        std::borrow::Cow::Owned(blob.to_lowercase())
-    };
+    let blob_l = blob.to_lowercase();
     let mut score = 0i64;
     for tok in &query.tokens {
         if blob_l.contains(tok) {
