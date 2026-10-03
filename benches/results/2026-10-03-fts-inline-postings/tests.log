@@ -1,0 +1,30 @@
+   Compiling lin v0.4.0 (/Users/themoretheless/Documents/Sources/lin)
+warning: constant `BACKUP_MAGIC` is never used
+  --> src/persist.rs:43:11
+   |
+43 | pub const BACKUP_MAGIC: [u8; 4] = *b"LIN\x04";
+   |           ^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `lin` (lib test) generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.40s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/lib.rs (target/debug/build/lin/d22fbd67a6dfeabb/out/lin-d22fbd67a6dfeabb)
+
+running 12 tests
+test fts::pending_order_tests::ascii_lowering_and_unicode_fallback_match_original_character_mapping ... ok
+test fts::tests::slab_normalization_scratch_matches_individual_rows ... ok
+test fts::pending_order_tests::out_of_order_pending_edits_match_live_positions ... ok
+test fts::tests::posting_codec_roundtrips_and_rejects_truncation ... ok
+test fts::tests::prune_drops_stale_blobs_and_half_written_temps ... ok
+test fts::tests::multi_term_candidates_match_scan_with_pending_edits ... ok
+test fts::tests::borrowed_tokens_deduplicate_and_normalize_across_fields_and_edits ... ok
+test fts::tests::repeated_term_removal_and_reinsertion_matches_current_rows ... ok
+test fts::tests::appended_slabs_match_general_insert_after_tail_recycling ... ok
+test fts::pending_order_tests::fused_merge_matches_two_pass_on_all_small_sets ... ok
+test store::borrowed_delete_tests::borrowed_moves_match_rebuilt_rows_maps_columns_indexes_and_fts ... ok
+test fts::pending_order_tests::descending_and_random_edits_survive_folding_and_codec ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 25 filtered out; finished in 0.07s
