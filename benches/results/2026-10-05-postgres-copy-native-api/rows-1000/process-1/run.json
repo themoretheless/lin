@@ -1,0 +1,116 @@
+{
+  "rows": 1000,
+  "repeats": 1,
+  "samples": 24,
+  "host": "macOS-26.7.1-arm64-arm-64bit-Mach-O",
+  "engines": [
+    "lin",
+    "postgres"
+  ],
+  "cases": [
+    "insert_native"
+  ],
+  "observations": [
+    {
+      "case": "insert_native/lin",
+      "repetition": 0,
+      "iterations": 1,
+      "samples_ns": [
+        1149333.0,
+        981542.0,
+        849000.0,
+        895625.0,
+        862041.0,
+        816084.0,
+        861042.0,
+        863958.0,
+        827375.0,
+        977209.0,
+        870958.0,
+        825917.0,
+        863875.0,
+        856208.0,
+        851416.0,
+        872417.0,
+        878958.0,
+        881000.0,
+        881916.0,
+        930875.0,
+        948167.0,
+        869292.0,
+        830875.0,
+        900833.0
+      ],
+      "validated_rows": 1000
+    },
+    {
+      "case": "insert_native/postgres",
+      "repetition": 0,
+      "iterations": 1,
+      "samples_ns": [
+        13498208,
+        5097417,
+        5358084,
+        5230875,
+        5071542,
+        5209750,
+        5191667,
+        4761042,
+        4941208,
+        5159667,
+        4946083,
+        5121375,
+        5287166,
+        5148291,
+        4731750,
+        4835584,
+        5057959,
+        5041667,
+        5214875,
+        5447000,
+        4680583,
+        7281833,
+        5011083,
+        5520000
+      ],
+      "validated_rows": 1000
+    }
+  ],
+  "errors": [],
+  "versions": {
+    "lin": "0.4.0",
+    "postgres": "160015"
+  },
+  "medians_ns": {
+    "insert_native/lin": 870125.0,
+    "insert_native/postgres": 5134833.0
+  },
+  "python": "3.14.8 (main, Sep 30 2026, 17:55:09) [Clang 21.0.0 (clang-2100.3.34.2)]",
+  "clients": {
+    "pandas": "3.0.6",
+    "duckdb": "1.5.6",
+    "pymongo": "4.18.2",
+    "psycopg": "3.3.6",
+    "PyMySQL": "1.2.3",
+    "python-tds": "1.17.1"
+  },
+  "native_contracts": {
+    "lin": {
+      "schema": "id/uri/wing/title/ts/body; unique id and uri; wing+ts index",
+      "fixture": "fresh per sample; schema/index/prepare/validation/drop excluded",
+      "durability": "native memory API comparison; no disk durability equivalence",
+      "api": "Rust prepared run; default embedding and FTS",
+      "storage": "Db::empty"
+    },
+    "postgres": {
+      "schema": "id/uri/wing/title/ts/body; unique id and uri; wing+ts index",
+      "fixture": "fresh per sample; schema/index/prepare/validation/drop excluded",
+      "durability": "native memory API comparison; no disk durability equivalence",
+      "api": "Psycopg COPY CSV block plus transaction commit",
+      "storage": "configured dedicated server",
+      "atomicity": "one transaction per sample",
+      "synchronous_commit": "on"
+    }
+  },
+  "status": "complete"
+}

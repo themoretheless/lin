@@ -128,3 +128,14 @@ and close excluded. Unique id/uri and wing/ts index match the native fixture.
 Lin uses prepared Rust execution with default embedding/FTS and excludes IPC;
 these API and feature differences must remain explicit. No disk durability
 or isolated engine CPU equivalence is claimed.
+
+### PostgreSQL COPY insertion adapter
+
+`--engines lin postgres --cases insert_native` uses Psycopg COPY FROM STDIN CSV
+with a transaction commit. Prepared UTF-8 CSV, connection/cursor/schema/index
+setup, exact readback and owned cleanup are outside timing. COPY transmission,
+server work, acknowledgement and commit are included. The server's actual
+synchronous_commit value is recorded; settings are not weakened. Every sample
+uses an owned unique table, primary id, unique uri and wing/ts index. Only tables
+successfully created by that sample are dropped. Server/WAL/network costs differ
+from Lin Db::empty; tmpfs runs do not demonstrate physical-disk durability.
