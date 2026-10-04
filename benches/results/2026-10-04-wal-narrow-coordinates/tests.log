@@ -1,0 +1,26 @@
+   Compiling lin v0.4.0 (/Users/themoretheless/Documents/Sources/lin)
+warning: constant `BACKUP_MAGIC` is never used
+  --> src/persist.rs:43:11
+   |
+43 | pub const BACKUP_MAGIC: [u8; 4] = *b"LIN\x04";
+   |           ^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `lin` (lib test) generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.65s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/lib.rs (target/debug/build/lin/d22fbd67a6dfeabb/out/lin-d22fbd67a6dfeabb)
+
+running 8 tests
+test persist::wal_integrity_tests::column_field_union_keeps_later_extra_and_replaced_fields ... ok
+test persist::wal_integrity_tests::shared_text_columns_preserve_legacy_bytes_and_row_values ... ok
+test persist::wal_integrity_tests::sparse_vector_decoder_rejects_dimensions_indices_and_trailing_bytes ... ok
+test persist::wal_integrity_tests::narrow_decoder_rejects_bad_dimensions_counts_and_order ... ok
+test persist::wal_integrity_tests::every_truncated_checksummed_tail_is_ignored_but_complete_corruption_fails ... ok
+test persist::wal_integrity_tests::checksum_detects_bit_flips_in_both_codecs ... ok
+test persist::wal_integrity_tests::narrow_vectors_preserve_bits_presence_and_width_boundary ... ok
+test persist::wal_integrity_tests::sparse_vectors_preserve_bits_presence_and_checksum ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 35 filtered out; finished in 0.02s
