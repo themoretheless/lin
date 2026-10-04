@@ -1452,53 +1452,6 @@ pub fn rows_to_insert_cols(
         }
     }
     let fields: Vec<String> = field_set.into_iter().map(str::to_owned).collect();
-    if uniform && rows.len() >= 4096 && rows[0].values().all(|cell| !matches!(cell, Cell::Null)) {
-        let mut cols = rows[0]
-            .values()
-            .map(|cell| match cell {
-                Cell::Text(_) => ColData::Text(Vec::with_capacity(rows.len())),
-                Cell::Int(_) => ColData::Int(Vec::with_capacity(rows.len())),
-                Cell::Float(_) => ColData::Float(Vec::with_capacity(rows.len())),
-                Cell::Bool(_) => ColData::Bool(Vec::with_capacity(rows.len())),
-                Cell::Time(_) => ColData::Time(Vec::with_capacity(rows.len())),
-                Cell::Vec(_) => ColData::Vec(Vec::with_capacity(rows.len())),
-                Cell::Null => ColData::Null,
-            })
-            .collect::<Vec<_>>();
-        for row in rows {
-            for (col, cell) in cols.iter_mut().zip(row.values()) {
-                match col {
-                    ColData::Text(v) => v.push(
-                        cell.text_shared()
-                            .unwrap_or_else(|| std::sync::Arc::from("")),
-                    ),
-                    ColData::Int(v) => v.push(match cell {
-                        Cell::Int(n) => *n,
-                        _ => 0,
-                    }),
-                    ColData::Float(v) => v.push(match cell {
-                        Cell::Float(n) => *n,
-                        Cell::Int(n) => *n as f64,
-                        _ => 0.0,
-                    }),
-                    ColData::Bool(v) => v.push(matches!(cell, Cell::Bool(true))),
-                    ColData::Time(v) => v.push(match cell {
-                        Cell::Time(n) | Cell::Int(n) => *n,
-                        _ => 0,
-                    }),
-                    ColData::Vec(v) => v.push(cell.as_vec().map(<[f32]>::to_vec)),
-                    ColData::Null => {}
-                }
-            }
-        }
-        return Pack::InsertCols {
-            collection: collection.into(),
-            fields,
-            cols,
-            n,
-            edges,
-        };
-    }
     // Matching BTreeMap key order lets every column borrow cells by position,
     // avoiding another tree search per row and field. No cell values are cloned here.
     let cells = uniform.then(|| rows.iter().flat_map(|row| row.values()).collect::<Vec<_>>());
@@ -1683,75 +1636,6 @@ mod wal_integrity_tests {
             panic!("text cell")
         };
         assert!(Arc::ptr_eq(actual, &text));
-    }
-
-    #[test]
-    fn row_major_column_pack_keeps_type_coercions_and_exact_wire_bytes() {
-        use crate::store::{Cell, Row};
-        let values = vec![-0.0f32, f32::from_bits(0x7fc00001), f32::INFINITY];
-        let rows = [
-            Row::from([
-                ("bool".into(), Cell::Bool(true)),
-                ("float".into(), Cell::Float(1.5)),
-                ("int".into(), Cell::Int(10)),
-                ("text".into(), Cell::text_arc("a")),
-                ("time".into(), Cell::Time(12)),
-                ("vector".into(), Cell::vec_arc(values.clone())),
-            ]),
-            Row::from([
-                ("bool".into(), Cell::Null),
-                ("float".into(), Cell::Int(7)),
-                ("int".into(), Cell::Float(8.5)),
-                ("text".into(), Cell::Int(99)),
-                ("time".into(), Cell::Int(42)),
-                ("vector".into(), Cell::Null),
-            ]),
-        ];
-        let rows = rows.into_iter().cycle().take(4096).collect::<Vec<_>>();
-        let actual = rows_to_insert_cols("test", &rows, vec![]);
-        let expected = Pack::InsertCols {
-            collection: "test".into(),
-            fields: ["bool", "float", "int", "text", "time", "vector"]
-                .map(String::from)
-                .to_vec(),
-            n: 4096,
-            edges: vec![],
-            cols: vec![
-                ColData::Bool([true, false].into_iter().cycle().take(4096).collect()),
-                ColData::Float([1.5, 7.0].into_iter().cycle().take(4096).collect()),
-                ColData::Int([10, 0].into_iter().cycle().take(4096).collect()),
-                ColData::Text(
-                    [std::sync::Arc::from("a"), std::sync::Arc::from("")]
-                        .into_iter()
-                        .cycle()
-                        .take(4096)
-                        .collect(),
-                ),
-                ColData::Time([12, 42].into_iter().cycle().take(4096).collect()),
-                ColData::Vec(
-                    [Some(values), None]
-                        .into_iter()
-                        .cycle()
-                        .take(4096)
-                        .collect(),
-                ),
-            ],
-        };
-        with_log(|file| {
-            let actual = frame(file, actual);
-            file.set_len(0).unwrap();
-            file.seek(SeekFrom::Start(0)).unwrap();
-            let expected = frame(file, expected);
-            assert_eq!(actual, expected);
-        });
-        let rows = [
-            Row::from([("x".into(), Cell::Null)]),
-            Row::from([("x".into(), Cell::Int(9))]),
-        ];
-        let Pack::InsertCols { cols, .. } = rows_to_insert_cols("test", &rows, vec![]) else {
-            panic!("columns")
-        };
-        assert!(matches!(&cols[0],ColData::Int(values) if values==&[0,9]));
     }
 
     #[test]

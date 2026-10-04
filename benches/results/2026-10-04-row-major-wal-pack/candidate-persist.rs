@@ -1452,7 +1452,7 @@ pub fn rows_to_insert_cols(
         }
     }
     let fields: Vec<String> = field_set.into_iter().map(str::to_owned).collect();
-    if uniform && rows.len() >= 4096 && rows[0].values().all(|cell| !matches!(cell, Cell::Null)) {
+    if uniform && rows[0].values().all(|cell| !matches!(cell, Cell::Null)) {
         let mut cols = rows[0]
             .values()
             .map(|cell| match cell {
@@ -1707,34 +1707,21 @@ mod wal_integrity_tests {
                 ("vector".into(), Cell::Null),
             ]),
         ];
-        let rows = rows.into_iter().cycle().take(4096).collect::<Vec<_>>();
         let actual = rows_to_insert_cols("test", &rows, vec![]);
         let expected = Pack::InsertCols {
             collection: "test".into(),
             fields: ["bool", "float", "int", "text", "time", "vector"]
                 .map(String::from)
                 .to_vec(),
-            n: 4096,
+            n: 2,
             edges: vec![],
             cols: vec![
-                ColData::Bool([true, false].into_iter().cycle().take(4096).collect()),
-                ColData::Float([1.5, 7.0].into_iter().cycle().take(4096).collect()),
-                ColData::Int([10, 0].into_iter().cycle().take(4096).collect()),
-                ColData::Text(
-                    [std::sync::Arc::from("a"), std::sync::Arc::from("")]
-                        .into_iter()
-                        .cycle()
-                        .take(4096)
-                        .collect(),
-                ),
-                ColData::Time([12, 42].into_iter().cycle().take(4096).collect()),
-                ColData::Vec(
-                    [Some(values), None]
-                        .into_iter()
-                        .cycle()
-                        .take(4096)
-                        .collect(),
-                ),
+                ColData::Bool(vec![true, false]),
+                ColData::Float(vec![1.5, 7.0]),
+                ColData::Int(vec![10, 0]),
+                ColData::Text(vec![std::sync::Arc::from("a"), std::sync::Arc::from("")]),
+                ColData::Time(vec![12, 42]),
+                ColData::Vec(vec![Some(values), None]),
             ],
         };
         with_log(|file| {
