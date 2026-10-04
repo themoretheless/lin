@@ -121,8 +121,8 @@ native Rust benchmark or prove equal feature costs or disk durability.
 ### DuckDB native ingestion adapter
 
 `--engines lin duckdb --cases insert_native` uses DuckDB INSERT SELECT from a
-registered pandas DataFrame, not row-loop executemany. DataFrame construction
-and registration are outside timing. BEGIN, SQL execute/binding/planning,
+registered pandas DataFrame, not row-loop executemany. DataFrame construction,
+registration and PREPARE of INSERT SELECT are outside timing. BEGIN, EXECUTE,
 insertion and commit are timed; fresh schema/index setup, six-field readback
 and close excluded. Unique id/uri and wing/ts index match the native fixture.
 Lin uses prepared Rust execution with default embedding/FTS and excludes IPC;
