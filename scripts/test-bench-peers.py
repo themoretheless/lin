@@ -39,6 +39,19 @@ class BenchmarkContractTests(unittest.TestCase):
         finally:
             peer.close()
 
+    def test_native_duckdb_fresh_samples_validate_all_fields(self):
+        data = bench.dataset(41)
+        peer = bench.NativeInsert(data, SimpleNamespace(native_timestamp_ms=123456), "linbench_contract", "duckdb")
+        try:
+            timings, iterations, rows = peer.measure_insert(3)
+            self.assertEqual(len(timings), 3)
+            self.assertTrue(all(value > 0 for value in timings))
+            self.assertEqual(iterations, 1)
+            bench.validate(rows, peer.want, "duckdb", "insert_native")
+            self.assertTrue(all(row[4] == 123456 for row in rows))
+        finally:
+            peer.close()
+
     def test_same_count_with_wrong_values_or_duplicates_is_rejected(self):
         for wrong in [[["b"], ["a"]], [["a"], ["a"]]]:
             with self.assertRaises(AssertionError):

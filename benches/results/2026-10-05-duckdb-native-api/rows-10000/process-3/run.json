@@ -1,0 +1,115 @@
+{
+  "rows": 10000,
+  "repeats": 1,
+  "samples": 24,
+  "host": "macOS-26.7.1-arm64-arm-64bit-Mach-O",
+  "engines": [
+    "lin",
+    "duckdb"
+  ],
+  "cases": [
+    "insert_native"
+  ],
+  "observations": [
+    {
+      "case": "insert_native/lin",
+      "repetition": 0,
+      "iterations": 1,
+      "samples_ns": [
+        17133417.0,
+        17421166.0,
+        13667666.0,
+        13657500.0,
+        11928750.0,
+        14572000.0,
+        16704667.0,
+        12369459.0,
+        11801083.0,
+        13329750.0,
+        15863875.0,
+        13090375.0,
+        13794167.0,
+        12509250.0,
+        13751875.0,
+        13212708.0,
+        14007167.0,
+        15014125.0,
+        13299583.0,
+        12262250.0,
+        13531000.0,
+        17291250.0,
+        12528291.0,
+        11632959.0
+      ],
+      "validated_rows": 10000
+    },
+    {
+      "case": "insert_native/duckdb",
+      "repetition": 0,
+      "iterations": 1,
+      "samples_ns": [
+        16817708,
+        15563791,
+        15410166,
+        15452833,
+        15178250,
+        15153750,
+        16579750,
+        16112000,
+        15513625,
+        16108375,
+        19166416,
+        17622959,
+        16104916,
+        18128083,
+        15402958,
+        15741500,
+        15182667,
+        16489375,
+        17404959,
+        18607792,
+        16548500,
+        15849000,
+        16691917,
+        16602709
+      ],
+      "validated_rows": 10000
+    }
+  ],
+  "errors": [],
+  "versions": {
+    "lin": "0.4.0",
+    "duckdb": "1.5.6"
+  },
+  "medians_ns": {
+    "insert_native/lin": 13594250.0,
+    "insert_native/duckdb": 16110187.5
+  },
+  "python": "3.14.8 (main, Sep 30 2026, 17:55:09) [Clang 21.0.0 (clang-2100.3.34.2)]",
+  "clients": {
+    "pandas": "3.0.6",
+    "duckdb": "1.5.6",
+    "pymongo": "4.18.2",
+    "psycopg": "3.3.6",
+    "PyMySQL": "1.2.3",
+    "python-tds": "1.17.1"
+  },
+  "native_contracts": {
+    "lin": {
+      "schema": "id/uri/wing/title/ts/body; unique id and uri; wing+ts index",
+      "fixture": "fresh per sample; schema/index/prepare/validation/drop excluded",
+      "durability": "native memory API comparison; no disk durability equivalence",
+      "api": "Rust prepared run; default embedding and FTS",
+      "storage": "Db::empty"
+    },
+    "duckdb": {
+      "schema": "id/uri/wing/title/ts/body; unique id and uri; wing+ts index",
+      "fixture": "fresh per sample; schema/index/prepare/validation/drop excluded",
+      "durability": "native memory API comparison; no disk durability equivalence",
+      "api": "DuckDB INSERT SELECT from registered prepared pandas DataFrame plus commit",
+      "storage": ":memory:",
+      "atomicity": "one transaction per sample"
+    }
+  },
+  "status": "complete"
+}
