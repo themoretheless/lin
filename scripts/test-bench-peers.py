@@ -26,6 +26,19 @@ class BenchmarkContractTests(unittest.TestCase):
         finally:
             peer.close()
 
+    def test_native_sqlite_fresh_samples_validate_all_fields(self):
+        data = bench.dataset(41)
+        peer = bench.NativeInsert(data, SimpleNamespace(native_timestamp_ms=123456), "linbench_contract", "sqlite")
+        try:
+            timings, iterations, rows = peer.measure_insert(3)
+            self.assertEqual(len(timings), 3)
+            self.assertTrue(all(value > 0 for value in timings))
+            self.assertEqual(iterations, 1)
+            bench.validate(rows, peer.want, "sqlite", "insert_native")
+            self.assertTrue(all(row[4] == 123456 for row in rows))
+        finally:
+            peer.close()
+
     def test_same_count_with_wrong_values_or_duplicates_is_rejected(self):
         for wrong in [[["b"], ["a"]], [["a"], ["a"]]]:
             with self.assertRaises(AssertionError):
@@ -76,7 +89,7 @@ class BenchmarkContractTests(unittest.TestCase):
     def test_unsupported_native_peer_is_incomplete(self):
         with tempfile.TemporaryDirectory() as directory:
             command = [sys.executable, str(Path(__file__).with_name("bench-peers.py")),
-                "--engines", "sqlite", "--cases", "insert_native", "--rows", "41",
+                "--engines", "pandas", "--cases", "insert_native", "--rows", "41",
                 "--samples", "1", "--repeats", "1", "--output", str(Path(directory) / "run")]
             completed = subprocess.run(command, capture_output=True, text=True)
             self.assertEqual(completed.returncode, 2, completed.stderr)

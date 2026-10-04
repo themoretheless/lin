@@ -287,6 +287,10 @@ class NativeInsert(Lin):
                 self.proc = subprocess.Popen([str(binary)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
                 self.version = self.ask({"worker_version": True})["version"]
                 self.contract.update({"api": "Rust prepared run; default embedding and FTS", "storage": "Db::empty"})
+            elif engine == "sqlite":
+                import sqlite3
+                self.version = sqlite3.sqlite_version
+                self.contract.update({"api": "Python sqlite3 executemany plus transaction commit", "storage": ":memory:", "atomicity": "one transaction per sample"})
             elif engine == "mongo":
                 from pymongo import MongoClient
                 from pymongo.write_concern import WriteConcern
@@ -310,6 +314,25 @@ class NativeInsert(Lin):
             result = self.ask({"insert_rows": len(self.want), "samples": samples, "timestamp_ms": self.timestamp})
             validate(result["result"], self.want, self.engine, "insert_native")
             return result["samples_ns"], 1, result["result"]
+        if self.engine == "sqlite":
+            import sqlite3
+            timings = []
+            got = None
+            for _ in range(samples):
+                conn = sqlite3.connect(":memory:")
+                try:
+                    conn.execute("CREATE TABLE docs (id TEXT PRIMARY KEY, uri TEXT UNIQUE, wing TEXT, title TEXT, ts INTEGER, body TEXT)")
+                    conn.execute("CREATE INDEX docs_wing_ts ON docs(wing, ts)")
+                    cursor = conn.cursor()
+                    start = time.perf_counter_ns()
+                    cursor.executemany("INSERT INTO docs VALUES (?, ?, ?, ?, ?, ?)", self.want)
+                    conn.commit()
+                    timings.append(time.perf_counter_ns() - start)
+                    got = [list(row) for row in conn.execute("SELECT id, uri, wing, title, ts, body FROM docs")]
+                    validate(got, self.want, self.engine, "insert_native")
+                finally:
+                    conn.close()
+            return timings, 1, got
         timings = []
         docs = [dict(zip(["_id", "uri", "wing", "title", "ts", "body"], row)) for row in self.want]
         got = None

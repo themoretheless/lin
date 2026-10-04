@@ -106,3 +106,14 @@ URI and wing/ts indexes, and uses acknowledged writes (`w=1`, `j=false`). This
 compares successful native API calls; it does not establish identical bulk
 failure atomicity or physical disk durability. Mongo fixtures use unique owned
 databases and cleanup only objects successfully created by this run.
+
+### SQLite native insertion adapter
+
+`--engines lin sqlite --cases insert_native` additionally compares Python sqlite3
+`executemany` and commit in one transaction to the Lin prepared Rust call.
+Each SQLite sample uses a fresh `:memory:` connection, unique id/uri and wing/ts
+index. Six-field values and multiplicity are validated outside timing. Schema,
+index setup and cursor creation are excluded; binding, insertion and commit are
+included. Python overhead is included for SQLite; Lin IPC is excluded. Lin also
+maintains default embedding and FTS. This API comparison does not replace the
+native Rust benchmark or prove equal feature costs or disk durability.

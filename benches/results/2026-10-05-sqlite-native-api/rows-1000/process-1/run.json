@@ -1,0 +1,115 @@
+{
+  "rows": 1000,
+  "repeats": 1,
+  "samples": 24,
+  "host": "macOS-26.7.1-arm64-arm-64bit-Mach-O",
+  "engines": [
+    "lin",
+    "sqlite"
+  ],
+  "cases": [
+    "insert_native"
+  ],
+  "observations": [
+    {
+      "case": "insert_native/lin",
+      "repetition": 0,
+      "iterations": 1,
+      "samples_ns": [
+        2655708.0,
+        1296125.0,
+        1218625.0,
+        1205458.0,
+        1347291.0,
+        1335542.0,
+        1362125.0,
+        1231916.0,
+        1226042.0,
+        1212584.0,
+        1224125.0,
+        1215625.0,
+        1354625.0,
+        1364458.0,
+        1436334.0,
+        1229583.0,
+        1234958.0,
+        1216083.0,
+        1328875.0,
+        1324084.0,
+        1215084.0,
+        1227000.0,
+        1245667.0,
+        1224500.0
+      ],
+      "validated_rows": 1000
+    },
+    {
+      "case": "insert_native/sqlite",
+      "repetition": 0,
+      "iterations": 1,
+      "samples_ns": [
+        2255667,
+        2184500,
+        1890833,
+        1765417,
+        1653750,
+        1603125,
+        1556500,
+        1557333,
+        1547792,
+        1534417,
+        1529500,
+        1529416,
+        1617541,
+        1706917,
+        1713875,
+        1714042,
+        1706791,
+        1703375,
+        1707125,
+        1708667,
+        1656833,
+        1536000,
+        1533375,
+        1534333
+      ],
+      "validated_rows": 1000
+    }
+  ],
+  "errors": [],
+  "versions": {
+    "lin": "0.4.0",
+    "sqlite": "3.53.4"
+  },
+  "medians_ns": {
+    "insert_native/lin": 1233437.0,
+    "insert_native/sqlite": 1655291.5
+  },
+  "python": "3.14.8 (main, Sep 30 2026, 17:55:09) [Clang 21.0.0 (clang-2100.3.34.2)]",
+  "clients": {
+    "pandas": "3.0.6",
+    "duckdb": "1.5.6",
+    "pymongo": "4.18.2",
+    "psycopg": "3.3.6",
+    "PyMySQL": "1.2.3",
+    "python-tds": "1.17.1"
+  },
+  "native_contracts": {
+    "lin": {
+      "schema": "id/uri/wing/title/ts/body; unique id and uri; wing+ts index",
+      "fixture": "fresh per sample; schema/index/prepare/validation/drop excluded",
+      "durability": "native memory API comparison; no disk durability equivalence",
+      "api": "Rust prepared run; default embedding and FTS",
+      "storage": "Db::empty"
+    },
+    "sqlite": {
+      "schema": "id/uri/wing/title/ts/body; unique id and uri; wing+ts index",
+      "fixture": "fresh per sample; schema/index/prepare/validation/drop excluded",
+      "durability": "native memory API comparison; no disk durability equivalence",
+      "api": "Python sqlite3 executemany plus transaction commit",
+      "storage": ":memory:",
+      "atomicity": "one transaction per sample"
+    }
+  },
+  "status": "complete"
+}
