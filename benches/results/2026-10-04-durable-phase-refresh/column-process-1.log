@@ -1,0 +1,851 @@
+skip postgres: no reachable server
+  tried: postgresql://lin:lin@127.0.0.1:55432/lin (error connecting to server); postgresql://postgres@127.0.0.1:5432/postgres (error connecting to server)
+  set LIN_BENCH_PG_URL or:
+  docker compose -f docker-compose.bench.yml up -d postgres
+  # brew postgresql@17 via Sources/ppduster macos-stack-postgres; start service for :5432
+skip mysql: LIN_BENCH_SKIP_MYSQL is set
+lin compare: N=10000 warm reads (fixture), bulk insert (schema outside timing)
+engines: Lin | SQLite(rusqlite bundled) | DuckDB(bundled) | HashMap(point get only) | Postgres(skipped) | MySQL(skipped)
+airbug dash: http://127.0.0.1:8790/
+Lin reads: prepare once / run many; filters use count (fair vs SQL COUNT(*));
+substring: Lin `title ~ "wal" | count` vs SQL LIKE '%wal%' COUNT(*);
+materialize: Lin `wing==rag | {id,title} | take all` vs SQL SELECT id,title;
+join: 10000 orders ⋈ 1000 users (Lin run_batch SoA / cursor vs SQL INNER JOIN);
+append_log: Lin `append facts` vs SQL INSERT INTO logs (append-only shape)
+airbug dash: http://127.0.0.1:8790/#/bench
+bench: compare/durable_insert_1k/lin — validating and calibrating
+WAL_FRAME bytes=79 checksum_ns=12166 write_ns=75458 sync_ns=1394167
+INSERT_PROFILE rows=1000 build_ns=330667 checks_ns=165291 embed_ns=685500 index_ns=210875 fts_ns=201125 maps_ns=51792
+WAL_PACK rows=1000 elapsed_ns=460666
+WAL_COLUMN rows=1000 field=body elapsed_ns=3500
+WAL_CLASSIFY rows=1000 elapsed_ns=124958
+WAL_COLUMN rows=1000 field=embedding elapsed_ns=687125
+WAL_COLUMN rows=1000 field=hash elapsed_ns=6750
+WAL_COLUMN rows=1000 field=id elapsed_ns=7209
+WAL_COLUMN rows=1000 field=layer elapsed_ns=5084
+WAL_COLUMN rows=1000 field=title elapsed_ns=5375
+WAL_COLUMN rows=1000 field=ts elapsed_ns=2250
+WAL_COLUMN rows=1000 field=uri elapsed_ns=4583
+WAL_COLUMN rows=1000 field=wing elapsed_ns=2875
+WAL_ENCODE rows=1000 bytes=336968 elapsed_ns=880584
+WAL_FRAME bytes=336968 checksum_ns=31542 write_ns=50666 sync_ns=746583
+WAL_FRAME bytes=79 checksum_ns=167 write_ns=74542 sync_ns=978125
+INSERT_PROFILE rows=1000 build_ns=274792 checks_ns=141375 embed_ns=464334 index_ns=166500 fts_ns=192667 maps_ns=36292
+WAL_PACK rows=1000 elapsed_ns=456041
+WAL_COLUMN rows=1000 field=body elapsed_ns=3459
+WAL_CLASSIFY rows=1000 elapsed_ns=124250
+WAL_COLUMN rows=1000 field=embedding elapsed_ns=682000
+WAL_COLUMN rows=1000 field=hash elapsed_ns=6125
+WAL_COLUMN rows=1000 field=id elapsed_ns=6291
+WAL_COLUMN rows=1000 field=layer elapsed_ns=7833
+WAL_COLUMN rows=1000 field=title elapsed_ns=5416
+WAL_COLUMN rows=1000 field=ts elapsed_ns=2125
+WAL_COLUMN rows=1000 field=uri elapsed_ns=4333
+WAL_COLUMN rows=1000 field=wing elapsed_ns=3166
+WAL_ENCODE rows=1000 bytes=336968 elapsed_ns=876375
+WAL_FRAME bytes=336968 checksum_ns=16125 write_ns=48083 sync_ns=1236333
+bench: compare/durable_insert_1k/lin — measuring 24 samples
+WAL_FRAME bytes=79 checksum_ns=166 write_ns=74958 sync_ns=1040542
+INSERT_PROFILE rows=1000 build_ns=277833 checks_ns=142375 embed_ns=381000 index_ns=139416 fts_ns=208792 maps_ns=35584
+WAL_PACK rows=1000 elapsed_ns=338916
+WAL_COLUMN rows=1000 field=body elapsed_ns=4292
+WAL_CLASSIFY rows=1000 elapsed_ns=184333
+WAL_COLUMN rows=1000 field=embedding elapsed_ns=756792
+WAL_COLUMN rows=1000 field=hash elapsed_ns=5333
+WAL_COLUMN rows=1000 field=id elapsed_ns=5708
+WAL_COLUMN rows=1000 field=layer elapsed_ns=4042
+WAL_COLUMN rows=1000 field=title elapsed_ns=4333
+WAL_COLUMN rows=1000 field=ts elapsed_ns=791
+WAL_COLUMN rows=1000 field=uri elapsed_ns=3541
+WAL_COLUMN rows=1000 field=wing elapsed_ns=3125
+WAL_ENCODE rows=1000 bytes=336968 elapsed_ns=962042
+WAL_FRAME bytes=336968 checksum_ns=16125 write_ns=46833 sync_ns=704625
+WAL_FRAME bytes=79 checksum_ns=125 write_ns=76333 sync_ns=962167
+INSERT_PROFILE rows=1000 build_ns=282291 checks_ns=153375 embed_ns=368541 index_ns=131334 fts_ns=189459 maps_ns=38125
+WAL_PACK rows=1000 elapsed_ns=232125
+WAL_COLUMN rows=1000 field=body elapsed_ns=3167
+WAL_CLASSIFY rows=1000 elapsed_ns=123792
+WAL_COLUMN rows=1000 field=embedding elapsed_ns=617584
+WAL_COLUMN rows=1000 field=hash elapsed_ns=4875
+WAL_COLUMN rows=1000 field=id elapsed_ns=3667
+WAL_COLUMN rows=1000 field=layer elapsed_ns=3667
+WAL_COLUMN rows=1000 field=title elapsed_ns=4208
+WAL_COLUMN rows=1000 field=ts elapsed_ns=833
+WAL_COLUMN rows=1000 field=uri elapsed_ns=3292
+WAL_COLUMN rows=1000 field=wing elapsed_ns=2875
+WAL_ENCODE rows=1000 bytes=336968 elapsed_ns=794500
+WAL_FRAME bytes=336968 checksum_ns=15708 write_ns=56416 sync_ns=736792
+WAL_FRAME bytes=79 checksum_ns=209 write_ns=74667 sync_ns=1201750
+INSERT_PROFILE rows=1000 build_ns=285791 checks_ns=145042 embed_ns=381333 index_ns=122667 fts_ns=188083 maps_ns=37458
+WAL_PACK rows=1000 elapsed_ns=233000
+WAL_COLUMN rows=1000 field=body elapsed_ns=3458
+WAL_CLASSIFY rows=1000 elapsed_ns=123875
+WAL_COLUMN rows=1000 field=embedding elapsed_ns=640625
+WAL_COLUMN rows=1000 field=hash elapsed_ns=4916
+WAL_COLUMN rows=1000 field=id elapsed_ns=4708
+WAL_COLUMN rows=1000 field=layer elapsed_ns=3625
+WAL_COLUMN rows=1000 field=title elapsed_ns=4208
+WAL_COLUMN rows=1000 field=ts elapsed_ns=1041
+WAL_COLUMN rows=1000 field=uri elapsed_ns=3417
+WAL_COLUMN rows=1000 field=wing elapsed_ns=2875
+WAL_ENCODE rows=1000 bytes=336968 elapsed_ns=768792
+WAL_FRAME bytes=336968 checksum_ns=16333 write_ns=54958 sync_ns=617291
+WAL_FRAME bytes=79 checksum_ns=125 write_ns=72333 sync_ns=570417
+INSERT_PROFILE rows=1000 build_ns=279833 checks_ns=151917 embed_ns=385500 index_ns=138833 fts_ns=190125 maps_ns=37792
+WAL_PACK rows=1000 elapsed_ns=240792
+WAL_COLUMN rows=1000 field=body elapsed_ns=4000
+WAL_CLASSIFY rows=1000 elapsed_ns=124125
+WAL_COLUMN rows=1000 field=embedding elapsed_ns=638833
+WAL_COLUMN rows=1000 field=hash elapsed_ns=4792
+WAL_COLUMN rows=1000 field=id elapsed_ns=5916
+WAL_COLUMN rows=1000 field=layer elapsed_ns=3458
+WAL_COLUMN rows=1000 field=title elapsed_ns=5334
+WAL_COLUMN rows=1000 field=ts elapsed_ns=1750
+WAL_COLUMN rows=1000 field=uri elapsed_ns=4166
+WAL_COLUMN rows=1000 field=wing elapsed_ns=3000
+WAL_ENCODE rows=1000 bytes=336968 elapsed_ns=777375
+WAL_FRAME bytes=336968 checksum_ns=15667 write_ns=50417 sync_ns=1055708
+WAL_FRAME bytes=79 checksum_ns=167 write_ns=76125 sync_ns=1077917
+INSERT_PROFILE rows=1000 build_ns=279209 checks_ns=143250 embed_ns=381083 index_ns=130458 fts_ns=189917 maps_ns=36250
+WAL_PACK rows=1000 elapsed_ns=242375
+WAL_COLUMN rows=1000 field=body elapsed_ns=3541
+WAL_CLASSIFY rows=1000 elapsed_ns=123709
+WAL_COLUMN rows=1000 field=embedding elapsed_ns=645459
+WAL_COLUMN rows=1000 field=hash elapsed_ns=4750
+WAL_COLUMN rows=1000 field=id elapsed_ns=3708
+WAL_COLUMN rows=1000 field=layer elapsed_ns=3334
+WAL_COLUMN rows=1000 field=title elapsed_ns=4125
+WAL_COLUMN rows=1000 field=ts elapsed_ns=834
+WAL_COLUMN rows=1000 field=uri elapsed_ns=4292
+WAL_COLUMN rows=1000 field=wing elapsed_ns=3000
+WAL_ENCODE rows=1000 bytes=336968 elapsed_ns=778542
+WAL_FRAME bytes=336968 checksum_ns=15833 write_ns=55125 sync_ns=1034125
+WAL_FRAME bytes=79 checksum_ns=166 write_ns=68833 sync_ns=1154375
+INSERT_PROFILE rows=1000 build_ns=299250 checks_ns=151291 embed_ns=387917 index_ns=127750 fts_ns=193958 maps_ns=37917
+WAL_PACK rows=1000 elapsed_ns=265375
+WAL_COLUMN rows=1000 field=body elapsed_ns=4042
+WAL_CLASSIFY rows=1000 elapsed_ns=126833
+WAL_COLUMN rows=1000 field=embedding elapsed_ns=681458
+WAL_COLUMN rows=1000 field=hash elapsed_ns=5250
+WAL_COLUMN rows=1000 field=id elapsed_ns=4583
+WAL_COLUMN rows=1000 field=layer elapsed_ns=3625
+WAL_COLUMN rows=1000 field=title elapsed_ns=4292
+WAL_COLUMN rows=1000 field=ts elapsed_ns=1000
+WAL_COLUMN rows=1000 field=uri elapsed_ns=3333
+WAL_COLUMN rows=1000 field=wing elapsed_ns=3291
+WAL_ENCODE rows=1000 bytes=336968 elapsed_ns=1200959
+WAL_FRAME bytes=336968 checksum_ns=16250 write_ns=51375 sync_ns=1254708
+WAL_FRAME bytes=79 checksum_ns=167 write_ns=76167 sync_ns=829250
+INSERT_PROFILE rows=1000 build_ns=282500 checks_ns=141750 embed_ns=386625 index_ns=124500 fts_ns=187084 maps_ns=36667
+WAL_PACK rows=1000 elapsed_ns=255416
+WAL_COLUMN rows=1000 field=body elapsed_ns=3500
+WAL_CLASSIFY rows=1000 elapsed_ns=123917
+WAL_COLUMN rows=1000 field=embedding elapsed_ns=631042
+WAL_COLUMN rows=1000 field=hash elapsed_ns=4875
+WAL_COLUMN rows=1000 field=id elapsed_ns=3833
+WAL_COLUMN rows=1000 field=layer elapsed_ns=3375
+WAL_COLUMN rows=1000 field=title elapsed_ns=4250
+WAL_COLUMN rows=1000 field=ts elapsed_ns=833
+WAL_COLUMN rows=1000 field=uri elapsed_ns=3333
+WAL_COLUMN rows=1000 field=wing elapsed_ns=2875
+WAL_ENCODE rows=1000 bytes=336968 elapsed_ns=768542
+WAL_FRAME bytes=336968 checksum_ns=15709 write_ns=43667 sync_ns=504000
+WAL_FRAME bytes=79 checksum_ns=125 write_ns=213000 sync_ns=602959
+INSERT_PROFILE rows=1000 build_ns=279500 checks_ns=143333 embed_ns=430083 index_ns=128125 fts_ns=192208 maps_ns=37500
+WAL_PACK rows=1000 elapsed_ns=253833
+WAL_COLUMN rows=1000 field=body elapsed_ns=3292
+WAL_CLASSIFY rows=1000 elapsed_ns=124208
+WAL_COLUMN rows=1000 field=embedding elapsed_ns=621625
+WAL_COLUMN rows=1000 field=hash elapsed_ns=4959
+WAL_COLUMN rows=1000 field=id elapsed_ns=3791
+WAL_COLUMN rows=1000 field=layer elapsed_ns=5042
+WAL_COLUMN rows=1000 field=title elapsed_ns=4375
+WAL_COLUMN rows=1000 field=ts elapsed_ns=875
+WAL_COLUMN rows=1000 field=uri elapsed_ns=3375
+WAL_COLUMN rows=1000 field=wing elapsed_ns=3125
+WAL_ENCODE rows=1000 bytes=336968 elapsed_ns=766292
+WAL_FRAME bytes=336968 checksum_ns=15667 write_ns=50792 sync_ns=560291
+WAL_FRAME bytes=79 checksum_ns=125 write_ns=59125 sync_ns=716292
+INSERT_PROFILE rows=1000 build_ns=284291 checks_ns=154209 embed_ns=384500 index_ns=125291 fts_ns=189917 maps_ns=36459
+WAL_PACK rows=1000 elapsed_ns=255041
+WAL_COLUMN rows=1000 field=body elapsed_ns=3417
+WAL_CLASSIFY rows=1000 elapsed_ns=124166
+WAL_COLUMN rows=1000 field=embedding elapsed_ns=638958
+WAL_COLUMN rows=1000 field=hash elapsed_ns=5000
+WAL_COLUMN rows=1000 field=id elapsed_ns=3750
+WAL_COLUMN rows=1000 field=layer elapsed_ns=3334
+WAL_COLUMN rows=1000 field=title elapsed_ns=4125
+WAL_COLUMN rows=1000 field=ts elapsed_ns=917
+WAL_COLUMN rows=1000 field=uri elapsed_ns=4250
+WAL_COLUMN rows=1000 field=wing elapsed_ns=2916
+WAL_ENCODE rows=1000 bytes=336968 elapsed_ns=768917
+WAL_FRAME bytes=336968 checksum_ns=15833 write_ns=50333 sync_ns=558500
+WAL_FRAME bytes=79 checksum_ns=209 write_ns=82291 sync_ns=771750
+INSERT_PROFILE rows=1000 build_ns=283583 checks_ns=144833 embed_ns=395500 index_ns=121417 fts_ns=227792 maps_ns=40750
+WAL_PACK rows=1000 elapsed_ns=295708
+WAL_COLUMN rows=1000 field=body elapsed_ns=3208
+WAL_CLASSIFY rows=1000 elapsed_ns=125917
+WAL_COLUMN rows=1000 field=embedding elapsed_ns=621541
+WAL_COLUMN rows=1000 field=hash elapsed_ns=5542
+WAL_COLUMN rows=1000 field=id elapsed_ns=6708
+WAL_COLUMN rows=1000 field=layer elapsed_ns=6750
+WAL_COLUMN rows=1000 field=title elapsed_ns=4417
+WAL_COLUMN rows=1000 field=ts elapsed_ns=1209
+WAL_COLUMN rows=1000 field=uri elapsed_ns=3375
+WAL_COLUMN rows=1000 field=wing elapsed_ns=2958
+WAL_ENCODE rows=1000 bytes=336968 elapsed_ns=767458
+WAL_FRAME bytes=336968 checksum_ns=15792 write_ns=57375 sync_ns=485583
+WAL_FRAME bytes=79 checksum_ns=125 write_ns=67667 sync_ns=575583
+INSERT_PROFILE rows=1000 build_ns=281541 checks_ns=143292 embed_ns=390958 index_ns=131000 fts_ns=190584 maps_ns=37459
+WAL_PACK rows=1000 elapsed_ns=253000
+WAL_COLUMN rows=1000 field=body elapsed_ns=3375
+WAL_CLASSIFY rows=1000 elapsed_ns=124417
+WAL_COLUMN rows=1000 field=embedding elapsed_ns=652083
+WAL_COLUMN rows=1000 field=hash elapsed_ns=5000
+WAL_COLUMN rows=1000 field=id elapsed_ns=3875
+WAL_COLUMN rows=1000 field=layer elapsed_ns=3250
+WAL_COLUMN rows=1000 field=title elapsed_ns=4292
+WAL_COLUMN rows=1000 field=ts elapsed_ns=792
+WAL_COLUMN rows=1000 field=uri elapsed_ns=4292
+WAL_COLUMN rows=1000 field=wing elapsed_ns=2875
+WAL_ENCODE rows=1000 bytes=336968 elapsed_ns=804125
+WAL_FRAME bytes=336968 checksum_ns=15708 write_ns=56208 sync_ns=604083
+WAL_FRAME bytes=79 checksum_ns=208 write_ns=68291 sync_ns=499542
+INSERT_PROFILE rows=1000 build_ns=285208 checks_ns=152000 embed_ns=398542 index_ns=127167 fts_ns=183209 maps_ns=37000
+WAL_PACK rows=1000 elapsed_ns=278166
+WAL_COLUMN rows=1000 field=body elapsed_ns=3416
+WAL_CLASSIFY rows=1000 elapsed_ns=124041
+WAL_COLUMN rows=1000 field=embedding elapsed_ns=620458
+WAL_COLUMN rows=1000 field=hash elapsed_ns=4792
+WAL_COLUMN rows=1000 field=id elapsed_ns=3667
+WAL_COLUMN rows=1000 field=layer elapsed_ns=3250
+WAL_COLUMN rows=1000 field=title elapsed_ns=4167
+WAL_COLUMN rows=1000 field=ts elapsed_ns=1042
+WAL_COLUMN rows=1000 field=uri elapsed_ns=3333
+WAL_COLUMN rows=1000 field=wing elapsed_ns=3125
+WAL_ENCODE rows=1000 bytes=336968 elapsed_ns=769167
+WAL_FRAME bytes=336968 checksum_ns=16083 write_ns=42833 sync_ns=547417
+WAL_FRAME bytes=79 checksum_ns=208 write_ns=82167 sync_ns=482667
+INSERT_PROFILE rows=1000 build_ns=277916 checks_ns=146083 embed_ns=392208 index_ns=122250 fts_ns=192416 maps_ns=37334
+WAL_PACK rows=1000 elapsed_ns=256458
+WAL_COLUMN rows=1000 field=body elapsed_ns=3500
+WAL_CLASSIFY rows=1000 elapsed_ns=124375
+WAL_COLUMN rows=1000 field=embedding elapsed_ns=639375
+WAL_COLUMN rows=1000 field=hash elapsed_ns=4875
+WAL_COLUMN rows=1000 field=id elapsed_ns=3667
+WAL_COLUMN rows=1000 field=layer elapsed_ns=3250
+WAL_COLUMN rows=1000 field=title elapsed_ns=4167
+WAL_COLUMN rows=1000 field=ts elapsed_ns=833
+WAL_COLUMN rows=1000 field=uri elapsed_ns=3375
+WAL_COLUMN rows=1000 field=wing elapsed_ns=3083
+WAL_ENCODE rows=1000 bytes=336968 elapsed_ns=769792
+WAL_FRAME bytes=336968 checksum_ns=15750 write_ns=52000 sync_ns=982458
+WAL_FRAME bytes=79 checksum_ns=209 write_ns=73625 sync_ns=696750
+INSERT_PROFILE rows=1000 build_ns=288042 checks_ns=188375 embed_ns=404000 index_ns=120709 fts_ns=199125 maps_ns=37875
+WAL_PACK rows=1000 elapsed_ns=264792
+WAL_COLUMN rows=1000 field=body elapsed_ns=3709
+WAL_CLASSIFY rows=1000 elapsed_ns=125166
+WAL_COLUMN rows=1000 field=embedding elapsed_ns=641083
+WAL_COLUMN rows=1000 field=hash elapsed_ns=5000
+WAL_COLUMN rows=1000 field=id elapsed_ns=3917
+WAL_COLUMN rows=1000 field=layer elapsed_ns=4084
+WAL_COLUMN rows=1000 field=title elapsed_ns=4250
+WAL_COLUMN rows=1000 field=ts elapsed_ns=1000
+WAL_COLUMN rows=1000 field=uri elapsed_ns=3459
+WAL_COLUMN rows=1000 field=wing elapsed_ns=2833
+WAL_ENCODE rows=1000 bytes=336968 elapsed_ns=776000
+WAL_FRAME bytes=336968 checksum_ns=16250 write_ns=61542 sync_ns=595209
+WAL_FRAME bytes=79 checksum_ns=209 write_ns=104875 sync_ns=604292
+INSERT_PROFILE rows=1000 build_ns=292042 checks_ns=146792 embed_ns=403000 index_ns=125084 fts_ns=190000 maps_ns=38667
+WAL_PACK rows=1000 elapsed_ns=263625
+WAL_COLUMN rows=1000 field=body elapsed_ns=3583
+WAL_CLASSIFY rows=1000 elapsed_ns=124583
+WAL_COLUMN rows=1000 field=embedding elapsed_ns=660667
+WAL_COLUMN rows=1000 field=hash elapsed_ns=4916
+WAL_COLUMN rows=1000 field=id elapsed_ns=3833
+WAL_COLUMN rows=1000 field=layer elapsed_ns=3458
+WAL_COLUMN rows=1000 field=title elapsed_ns=4250
+WAL_COLUMN rows=1000 field=ts elapsed_ns=958
+WAL_COLUMN rows=1000 field=uri elapsed_ns=3375
+WAL_COLUMN rows=1000 field=wing elapsed_ns=2875
+WAL_ENCODE rows=1000 bytes=336968 elapsed_ns=787583
+WAL_FRAME bytes=336968 checksum_ns=15708 write_ns=49042 sync_ns=525667
+WAL_FRAME bytes=79 checksum_ns=125 write_ns=59958 sync_ns=528250
+INSERT_PROFILE rows=1000 build_ns=285041 checks_ns=150125 embed_ns=406167 index_ns=125000 fts_ns=199916 maps_ns=37959
+WAL_PACK rows=1000 elapsed_ns=266666
+WAL_COLUMN rows=1000 field=body elapsed_ns=3375
+WAL_CLASSIFY rows=1000 elapsed_ns=123917
+WAL_COLUMN rows=1000 field=embedding elapsed_ns=659291
+WAL_COLUMN rows=1000 field=hash elapsed_ns=4833
+WAL_COLUMN rows=1000 field=id elapsed_ns=3667
+WAL_COLUMN rows=1000 field=layer elapsed_ns=3209
+WAL_COLUMN rows=1000 field=title elapsed_ns=4333
+WAL_COLUMN rows=1000 field=ts elapsed_ns=917
+WAL_COLUMN rows=1000 field=uri elapsed_ns=4250
+WAL_COLUMN rows=1000 field=wing elapsed_ns=3041
+WAL_ENCODE rows=1000 bytes=336968 elapsed_ns=785458
+WAL_FRAME bytes=336968 checksum_ns=17583 write_ns=45083 sync_ns=711000
+WAL_FRAME bytes=79 checksum_ns=167 write_ns=71417 sync_ns=1073542
+INSERT_PROFILE rows=1000 build_ns=283709 checks_ns=154750 embed_ns=412917 index_ns=129584 fts_ns=191000 maps_ns=36667
+WAL_PACK rows=1000 elapsed_ns=265375
+WAL_COLUMN rows=1000 field=body elapsed_ns=3375
+WAL_CLASSIFY rows=1000 elapsed_ns=123875
+WAL_COLUMN rows=1000 field=embedding elapsed_ns=648125
+WAL_COLUMN rows=1000 field=hash elapsed_ns=4750
+WAL_COLUMN rows=1000 field=id elapsed_ns=4583
+WAL_COLUMN rows=1000 field=layer elapsed_ns=3292
+WAL_COLUMN rows=1000 field=title elapsed_ns=4208
+WAL_COLUMN rows=1000 field=ts elapsed_ns=916
+WAL_COLUMN rows=1000 field=uri elapsed_ns=3291
+WAL_COLUMN rows=1000 field=wing elapsed_ns=3042
+WAL_ENCODE rows=1000 bytes=336968 elapsed_ns=789625
+WAL_FRAME bytes=336968 checksum_ns=15833 write_ns=51000 sync_ns=892292
+WAL_FRAME bytes=79 checksum_ns=209 write_ns=84417 sync_ns=536583
+INSERT_PROFILE rows=1000 build_ns=284292 checks_ns=143125 embed_ns=404209 index_ns=124209 fts_ns=190709 maps_ns=37334
+WAL_PACK rows=1000 elapsed_ns=269625
+WAL_COLUMN rows=1000 field=body elapsed_ns=3375
+WAL_CLASSIFY rows=1000 elapsed_ns=173583
+WAL_COLUMN rows=1000 field=embedding elapsed_ns=719459
+WAL_COLUMN rows=1000 field=hash elapsed_ns=5209
+WAL_COLUMN rows=1000 field=id elapsed_ns=4208
+WAL_COLUMN rows=1000 field=layer elapsed_ns=3583
+WAL_COLUMN rows=1000 field=title elapsed_ns=4125
+WAL_COLUMN rows=1000 field=ts elapsed_ns=917
+WAL_COLUMN rows=1000 field=uri elapsed_ns=3333
+WAL_COLUMN rows=1000 field=wing elapsed_ns=2917
+WAL_ENCODE rows=1000 bytes=336968 elapsed_ns=847167
+WAL_FRAME bytes=336968 checksum_ns=15708 write_ns=53375 sync_ns=557459
+WAL_FRAME bytes=79 checksum_ns=167 write_ns=81417 sync_ns=640625
+INSERT_PROFILE rows=1000 build_ns=286084 checks_ns=151000 embed_ns=412625 index_ns=126834 fts_ns=194125 maps_ns=37333
+WAL_PACK rows=1000 elapsed_ns=270209
+WAL_COLUMN rows=1000 field=body elapsed_ns=3333
+WAL_CLASSIFY rows=1000 elapsed_ns=123875
+WAL_COLUMN rows=1000 field=embedding elapsed_ns=637500
+WAL_COLUMN rows=1000 field=hash elapsed_ns=4958
+WAL_COLUMN rows=1000 field=id elapsed_ns=3875
+WAL_COLUMN rows=1000 field=layer elapsed_ns=3666
+WAL_COLUMN rows=1000 field=title elapsed_ns=4291
+WAL_COLUMN rows=1000 field=ts elapsed_ns=1125
+WAL_COLUMN rows=1000 field=uri elapsed_ns=3291
+WAL_COLUMN rows=1000 field=wing elapsed_ns=2875
+WAL_ENCODE rows=1000 bytes=336968 elapsed_ns=761208
+WAL_FRAME bytes=336968 checksum_ns=16084 write_ns=55458 sync_ns=788208
+WAL_FRAME bytes=79 checksum_ns=250 write_ns=88666 sync_ns=579833
+INSERT_PROFILE rows=1000 build_ns=290583 checks_ns=148083 embed_ns=411084 index_ns=125833 fts_ns=195833 maps_ns=36542
+WAL_PACK rows=1000 elapsed_ns=270875
+WAL_COLUMN rows=1000 field=body elapsed_ns=3542
+WAL_CLASSIFY rows=1000 elapsed_ns=124000
+WAL_COLUMN rows=1000 field=embedding elapsed_ns=663916
+WAL_COLUMN rows=1000 field=hash elapsed_ns=4875
+WAL_COLUMN rows=1000 field=id elapsed_ns=3834
+WAL_COLUMN rows=1000 field=layer elapsed_ns=3416
+WAL_COLUMN rows=1000 field=title elapsed_ns=4333
+WAL_COLUMN rows=1000 field=ts elapsed_ns=875
+WAL_COLUMN rows=1000 field=uri elapsed_ns=3458
+WAL_COLUMN rows=1000 field=wing elapsed_ns=2833
+WAL_ENCODE rows=1000 bytes=336968 elapsed_ns=790875
+WAL_FRAME bytes=336968 checksum_ns=15791 write_ns=55958 sync_ns=578625
+WAL_FRAME bytes=79 checksum_ns=208 write_ns=68458 sync_ns=1167000
+INSERT_PROFILE rows=1000 build_ns=287625 checks_ns=145625 embed_ns=414708 index_ns=135458 fts_ns=193667 maps_ns=36375
+WAL_PACK rows=1000 elapsed_ns=271791
+WAL_COLUMN rows=1000 field=body elapsed_ns=3500
+WAL_CLASSIFY rows=1000 elapsed_ns=125125
+WAL_COLUMN rows=1000 field=embedding elapsed_ns=614417
+WAL_COLUMN rows=1000 field=hash elapsed_ns=4875
+WAL_COLUMN rows=1000 field=id elapsed_ns=3750
+WAL_COLUMN rows=1000 field=layer elapsed_ns=3375
+WAL_COLUMN rows=1000 field=title elapsed_ns=4250
+WAL_COLUMN rows=1000 field=ts elapsed_ns=792
+WAL_COLUMN rows=1000 field=uri elapsed_ns=3375
+WAL_COLUMN rows=1000 field=wing elapsed_ns=2875
+WAL_ENCODE rows=1000 bytes=336968 elapsed_ns=738083
+WAL_FRAME bytes=336968 checksum_ns=15834 write_ns=53292 sync_ns=838625
+WAL_FRAME bytes=79 checksum_ns=250 write_ns=70916 sync_ns=1175042
+INSERT_PROFILE rows=1000 build_ns=287875 checks_ns=141958 embed_ns=414083 index_ns=128292 fts_ns=185792 maps_ns=36083
+WAL_PACK rows=1000 elapsed_ns=265125
+WAL_COLUMN rows=1000 field=body elapsed_ns=3459
+WAL_CLASSIFY rows=1000 elapsed_ns=123666
+WAL_COLUMN rows=1000 field=embedding elapsed_ns=668875
+WAL_COLUMN rows=1000 field=hash elapsed_ns=5000
+WAL_COLUMN rows=1000 field=id elapsed_ns=4750
+WAL_COLUMN rows=1000 field=layer elapsed_ns=4666
+WAL_COLUMN rows=1000 field=title elapsed_ns=4333
+WAL_COLUMN rows=1000 field=ts elapsed_ns=916
+WAL_COLUMN rows=1000 field=uri elapsed_ns=3375
+WAL_COLUMN rows=1000 field=wing elapsed_ns=2959
+WAL_ENCODE rows=1000 bytes=336968 elapsed_ns=808667
+WAL_FRAME bytes=336968 checksum_ns=15834 write_ns=52208 sync_ns=883250
+WAL_FRAME bytes=79 checksum_ns=250 write_ns=110792 sync_ns=975708
+INSERT_PROFILE rows=1000 build_ns=290167 checks_ns=233542 embed_ns=496291 index_ns=135250 fts_ns=196083 maps_ns=38750
+WAL_PACK rows=1000 elapsed_ns=304542
+WAL_COLUMN rows=1000 field=body elapsed_ns=3417
+WAL_CLASSIFY rows=1000 elapsed_ns=124667
+WAL_COLUMN rows=1000 field=embedding elapsed_ns=647042
+WAL_COLUMN rows=1000 field=hash elapsed_ns=5291
+WAL_COLUMN rows=1000 field=id elapsed_ns=5542
+WAL_COLUMN rows=1000 field=layer elapsed_ns=5000
+WAL_COLUMN rows=1000 field=title elapsed_ns=4167
+WAL_COLUMN rows=1000 field=ts elapsed_ns=1042
+WAL_COLUMN rows=1000 field=uri elapsed_ns=3458
+WAL_COLUMN rows=1000 field=wing elapsed_ns=2917
+WAL_ENCODE rows=1000 bytes=336968 elapsed_ns=787834
+WAL_FRAME bytes=336968 checksum_ns=15834 write_ns=245375 sync_ns=704667
+WAL_FRAME bytes=79 checksum_ns=250 write_ns=79792 sync_ns=591125
+INSERT_PROFILE rows=1000 build_ns=280625 checks_ns=144750 embed_ns=416792 index_ns=132709 fts_ns=184167 maps_ns=35791
+WAL_PACK rows=1000 elapsed_ns=263500
+WAL_COLUMN rows=1000 field=body elapsed_ns=3375
+WAL_CLASSIFY rows=1000 elapsed_ns=123958
+WAL_COLUMN rows=1000 field=embedding elapsed_ns=609000
+WAL_COLUMN rows=1000 field=hash elapsed_ns=4667
+WAL_COLUMN rows=1000 field=id elapsed_ns=3667
+WAL_COLUMN rows=1000 field=layer elapsed_ns=3250
+WAL_COLUMN rows=1000 field=title elapsed_ns=4125
+WAL_COLUMN rows=1000 field=ts elapsed_ns=958
+WAL_COLUMN rows=1000 field=uri elapsed_ns=4167
+WAL_COLUMN rows=1000 field=wing elapsed_ns=2875
+WAL_ENCODE rows=1000 bytes=336968 elapsed_ns=753792
+WAL_FRAME bytes=336968 checksum_ns=15709 write_ns=52334 sync_ns=1000541
+WAL_FRAME bytes=79 checksum_ns=208 write_ns=81250 sync_ns=1097250
+INSERT_PROFILE rows=1000 build_ns=280333 checks_ns=146084 embed_ns=487167 index_ns=127542 fts_ns=188792 maps_ns=36541
+WAL_PACK rows=1000 elapsed_ns=272917
+WAL_COLUMN rows=1000 field=body elapsed_ns=3583
+WAL_CLASSIFY rows=1000 elapsed_ns=123500
+WAL_COLUMN rows=1000 field=embedding elapsed_ns=645958
+WAL_COLUMN rows=1000 field=hash elapsed_ns=4875
+WAL_COLUMN rows=1000 field=id elapsed_ns=3708
+WAL_COLUMN rows=1000 field=layer elapsed_ns=3500
+WAL_COLUMN rows=1000 field=title elapsed_ns=4166
+WAL_COLUMN rows=1000 field=ts elapsed_ns=833
+WAL_COLUMN rows=1000 field=uri elapsed_ns=3334
+WAL_COLUMN rows=1000 field=wing elapsed_ns=2875
+WAL_ENCODE rows=1000 bytes=336968 elapsed_ns=768667
+WAL_FRAME bytes=336968 checksum_ns=15958 write_ns=61625 sync_ns=875209
+bench: compare/durable_insert_10k/lin — validating and calibrating
+WAL_FRAME bytes=79 checksum_ns=584 write_ns=82458 sync_ns=1103833
+INSERT_PROFILE rows=10000 build_ns=2111416 checks_ns=1672125 embed_ns=6728208 index_ns=1339916 fts_ns=2015250 maps_ns=508958
+WAL_PACK rows=10000 elapsed_ns=4602375
+WAL_COLUMN rows=10000 field=body elapsed_ns=87500
+WAL_CLASSIFY rows=10000 elapsed_ns=1765708
+WAL_COLUMN rows=10000 field=embedding elapsed_ns=7753375
+WAL_COLUMN rows=10000 field=hash elapsed_ns=68666
+WAL_COLUMN rows=10000 field=id elapsed_ns=109541
+WAL_COLUMN rows=10000 field=layer elapsed_ns=63000
+WAL_COLUMN rows=10000 field=title elapsed_ns=57333
+WAL_COLUMN rows=10000 field=ts elapsed_ns=13750
+WAL_COLUMN rows=10000 field=uri elapsed_ns=46833
+WAL_COLUMN rows=10000 field=wing elapsed_ns=35208
+WAL_ENCODE rows=10000 bytes=3558340 elapsed_ns=8393750
+WAL_FRAME bytes=3558340 checksum_ns=157666 write_ns=296375 sync_ns=2028417
+WAL_FRAME bytes=79 checksum_ns=0 write_ns=73250 sync_ns=512334
+INSERT_PROFILE rows=10000 build_ns=2037292 checks_ns=2215584 embed_ns=5606708 index_ns=1465333 fts_ns=2837833 maps_ns=642750
+WAL_PACK rows=10000 elapsed_ns=5204750
+WAL_COLUMN rows=10000 field=body elapsed_ns=72792
+WAL_CLASSIFY rows=10000 elapsed_ns=1310083
+WAL_COLUMN rows=10000 field=embedding elapsed_ns=6904208
+WAL_COLUMN rows=10000 field=hash elapsed_ns=68834
+WAL_COLUMN rows=10000 field=id elapsed_ns=100750
+WAL_COLUMN rows=10000 field=layer elapsed_ns=56417
+WAL_COLUMN rows=10000 field=title elapsed_ns=60875
+WAL_COLUMN rows=10000 field=ts elapsed_ns=12291
+WAL_COLUMN rows=10000 field=uri elapsed_ns=47541
+WAL_COLUMN rows=10000 field=wing elapsed_ns=36333
+WAL_ENCODE rows=10000 bytes=3558340 elapsed_ns=7522541
+WAL_FRAME bytes=3558340 checksum_ns=158792 write_ns=340375 sync_ns=1608834
+bench: compare/durable_insert_10k/lin — measuring 24 samples
+WAL_FRAME bytes=79 checksum_ns=208 write_ns=68167 sync_ns=545416
+INSERT_PROFILE rows=10000 build_ns=2179375 checks_ns=1670833 embed_ns=6424583 index_ns=1387292 fts_ns=1976833 maps_ns=552500
+WAL_PACK rows=10000 elapsed_ns=4979625
+WAL_COLUMN rows=10000 field=body elapsed_ns=55625
+WAL_CLASSIFY rows=10000 elapsed_ns=1237958
+WAL_COLUMN rows=10000 field=embedding elapsed_ns=6917125
+WAL_COLUMN rows=10000 field=hash elapsed_ns=67375
+WAL_COLUMN rows=10000 field=id elapsed_ns=104500
+WAL_COLUMN rows=10000 field=layer elapsed_ns=74000
+WAL_COLUMN rows=10000 field=title elapsed_ns=56291
+WAL_COLUMN rows=10000 field=ts elapsed_ns=12833
+WAL_COLUMN rows=10000 field=uri elapsed_ns=47875
+WAL_COLUMN rows=10000 field=wing elapsed_ns=35958
+WAL_ENCODE rows=10000 bytes=3558340 elapsed_ns=7541541
+WAL_FRAME bytes=3558340 checksum_ns=159916 write_ns=289958 sync_ns=2014500
+WAL_FRAME bytes=79 checksum_ns=375 write_ns=99708 sync_ns=835250
+INSERT_PROFILE rows=10000 build_ns=1704167 checks_ns=1655584 embed_ns=4780334 index_ns=1155625 fts_ns=1728834 maps_ns=439833
+WAL_PACK rows=10000 elapsed_ns=2413583
+WAL_COLUMN rows=10000 field=body elapsed_ns=43875
+WAL_CLASSIFY rows=10000 elapsed_ns=1238166
+WAL_COLUMN rows=10000 field=embedding elapsed_ns=6516500
+WAL_COLUMN rows=10000 field=hash elapsed_ns=51167
+WAL_COLUMN rows=10000 field=id elapsed_ns=86542
+WAL_COLUMN rows=10000 field=layer elapsed_ns=57917
+WAL_COLUMN rows=10000 field=title elapsed_ns=45583
+WAL_COLUMN rows=10000 field=ts elapsed_ns=7541
+WAL_COLUMN rows=10000 field=uri elapsed_ns=45750
+WAL_COLUMN rows=10000 field=wing elapsed_ns=29042
+WAL_ENCODE rows=10000 bytes=3558340 elapsed_ns=7009500
+WAL_FRAME bytes=3558340 checksum_ns=161667 write_ns=333542 sync_ns=1412084
+WAL_FRAME bytes=79 checksum_ns=208 write_ns=87250 sync_ns=625209
+INSERT_PROFILE rows=10000 build_ns=1910500 checks_ns=1552667 embed_ns=4355083 index_ns=1189375 fts_ns=1802875 maps_ns=426792
+WAL_PACK rows=10000 elapsed_ns=2722208
+WAL_COLUMN rows=10000 field=body elapsed_ns=69708
+WAL_CLASSIFY rows=10000 elapsed_ns=1250250
+WAL_COLUMN rows=10000 field=embedding elapsed_ns=6384166
+WAL_COLUMN rows=10000 field=hash elapsed_ns=51459
+WAL_COLUMN rows=10000 field=id elapsed_ns=66917
+WAL_COLUMN rows=10000 field=layer elapsed_ns=46458
+WAL_COLUMN rows=10000 field=title elapsed_ns=42041
+WAL_COLUMN rows=10000 field=ts elapsed_ns=7334
+WAL_COLUMN rows=10000 field=uri elapsed_ns=35250
+WAL_COLUMN rows=10000 field=wing elapsed_ns=28250
+WAL_ENCODE rows=10000 bytes=3558340 elapsed_ns=6845666
+WAL_FRAME bytes=3558340 checksum_ns=160292 write_ns=313083 sync_ns=1556125
+WAL_FRAME bytes=79 checksum_ns=125 write_ns=95667 sync_ns=1072458
+INSERT_PROFILE rows=10000 build_ns=1945583 checks_ns=1776333 embed_ns=4200958 index_ns=1484834 fts_ns=1955041 maps_ns=743959
+WAL_PACK rows=10000 elapsed_ns=2678250
+WAL_COLUMN rows=10000 field=body elapsed_ns=38250
+WAL_CLASSIFY rows=10000 elapsed_ns=1241416
+WAL_COLUMN rows=10000 field=embedding elapsed_ns=6698125
+WAL_COLUMN rows=10000 field=hash elapsed_ns=53083
+WAL_COLUMN rows=10000 field=id elapsed_ns=108000
+WAL_COLUMN rows=10000 field=layer elapsed_ns=63667
+WAL_COLUMN rows=10000 field=title elapsed_ns=43000
+WAL_COLUMN rows=10000 field=ts elapsed_ns=7750
+WAL_COLUMN rows=10000 field=uri elapsed_ns=36125
+WAL_COLUMN rows=10000 field=wing elapsed_ns=28625
+WAL_ENCODE rows=10000 bytes=3558340 elapsed_ns=7223417
+WAL_FRAME bytes=3558340 checksum_ns=157125 write_ns=295791 sync_ns=1387125
+WAL_FRAME bytes=79 checksum_ns=0 write_ns=98084 sync_ns=936875
+INSERT_PROFILE rows=10000 build_ns=1675542 checks_ns=1598916 embed_ns=4225042 index_ns=1216458 fts_ns=1882125 maps_ns=435917
+WAL_PACK rows=10000 elapsed_ns=2823958
+WAL_COLUMN rows=10000 field=body elapsed_ns=72209
+WAL_CLASSIFY rows=10000 elapsed_ns=1256833
+WAL_COLUMN rows=10000 field=embedding elapsed_ns=6723875
+WAL_COLUMN rows=10000 field=hash elapsed_ns=57125
+WAL_COLUMN rows=10000 field=id elapsed_ns=158167
+WAL_COLUMN rows=10000 field=layer elapsed_ns=92167
+WAL_COLUMN rows=10000 field=title elapsed_ns=57042
+WAL_COLUMN rows=10000 field=ts elapsed_ns=7458
+WAL_COLUMN rows=10000 field=uri elapsed_ns=38625
+WAL_COLUMN rows=10000 field=wing elapsed_ns=29833
+WAL_ENCODE rows=10000 bytes=3558340 elapsed_ns=7524375
+WAL_FRAME bytes=3558340 checksum_ns=157292 write_ns=328458 sync_ns=1063125
+WAL_FRAME bytes=79 checksum_ns=167 write_ns=88417 sync_ns=1040834
+INSERT_PROFILE rows=10000 build_ns=1667083 checks_ns=1685250 embed_ns=4322208 index_ns=1459291 fts_ns=1914916 maps_ns=437292
+WAL_PACK rows=10000 elapsed_ns=2262125
+WAL_COLUMN rows=10000 field=body elapsed_ns=45292
+WAL_CLASSIFY rows=10000 elapsed_ns=1249666
+WAL_COLUMN rows=10000 field=embedding elapsed_ns=7216542
+WAL_COLUMN rows=10000 field=hash elapsed_ns=49708
+WAL_COLUMN rows=10000 field=id elapsed_ns=87375
+WAL_COLUMN rows=10000 field=layer elapsed_ns=55417
+WAL_COLUMN rows=10000 field=title elapsed_ns=42250
+WAL_COLUMN rows=10000 field=ts elapsed_ns=7333
+WAL_COLUMN rows=10000 field=uri elapsed_ns=35167
+WAL_COLUMN rows=10000 field=wing elapsed_ns=28833
+WAL_ENCODE rows=10000 bytes=3558340 elapsed_ns=7725916
+WAL_FRAME bytes=3558340 checksum_ns=157459 write_ns=305209 sync_ns=1559584
+WAL_FRAME bytes=79 checksum_ns=208 write_ns=108416 sync_ns=962708
+INSERT_PROFILE rows=10000 build_ns=2157625 checks_ns=1714125 embed_ns=4402792 index_ns=1199417 fts_ns=1834666 maps_ns=495500
+WAL_PACK rows=10000 elapsed_ns=2674625
+WAL_COLUMN rows=10000 field=body elapsed_ns=84291
+WAL_CLASSIFY rows=10000 elapsed_ns=1340833
+WAL_COLUMN rows=10000 field=embedding elapsed_ns=6665708
+WAL_COLUMN rows=10000 field=hash elapsed_ns=63334
+WAL_COLUMN rows=10000 field=id elapsed_ns=133375
+WAL_COLUMN rows=10000 field=layer elapsed_ns=70000
+WAL_COLUMN rows=10000 field=title elapsed_ns=42791
+WAL_COLUMN rows=10000 field=ts elapsed_ns=7625
+WAL_COLUMN rows=10000 field=uri elapsed_ns=43166
+WAL_COLUMN rows=10000 field=wing elapsed_ns=28625
+WAL_ENCODE rows=10000 bytes=3558340 elapsed_ns=7278833
+WAL_FRAME bytes=3558340 checksum_ns=166208 write_ns=334125 sync_ns=1650250
+WAL_FRAME bytes=79 checksum_ns=209 write_ns=126084 sync_ns=457667
+INSERT_PROFILE rows=10000 build_ns=1622416 checks_ns=1592041 embed_ns=4027875 index_ns=1199417 fts_ns=1834250 maps_ns=422958
+WAL_PACK rows=10000 elapsed_ns=2328333
+WAL_COLUMN rows=10000 field=body elapsed_ns=44083
+WAL_CLASSIFY rows=10000 elapsed_ns=1255291
+WAL_COLUMN rows=10000 field=embedding elapsed_ns=6427500
+WAL_COLUMN rows=10000 field=hash elapsed_ns=53875
+WAL_COLUMN rows=10000 field=id elapsed_ns=96042
+WAL_COLUMN rows=10000 field=layer elapsed_ns=50834
+WAL_COLUMN rows=10000 field=title elapsed_ns=48625
+WAL_COLUMN rows=10000 field=ts elapsed_ns=7459
+WAL_COLUMN rows=10000 field=uri elapsed_ns=46917
+WAL_COLUMN rows=10000 field=wing elapsed_ns=29125
+WAL_ENCODE rows=10000 bytes=3558340 elapsed_ns=6945709
+WAL_FRAME bytes=3558340 checksum_ns=158750 write_ns=298458 sync_ns=1455750
+WAL_FRAME bytes=79 checksum_ns=250 write_ns=97709 sync_ns=518708
+INSERT_PROFILE rows=10000 build_ns=1641292 checks_ns=1608167 embed_ns=4494250 index_ns=1210292 fts_ns=1791916 maps_ns=423458
+WAL_PACK rows=10000 elapsed_ns=2436125
+WAL_COLUMN rows=10000 field=body elapsed_ns=56292
+WAL_CLASSIFY rows=10000 elapsed_ns=1272125
+WAL_COLUMN rows=10000 field=embedding elapsed_ns=6418917
+WAL_COLUMN rows=10000 field=hash elapsed_ns=58666
+WAL_COLUMN rows=10000 field=id elapsed_ns=74833
+WAL_COLUMN rows=10000 field=layer elapsed_ns=65875
+WAL_COLUMN rows=10000 field=title elapsed_ns=48083
+WAL_COLUMN rows=10000 field=ts elapsed_ns=7375
+WAL_COLUMN rows=10000 field=uri elapsed_ns=45000
+WAL_COLUMN rows=10000 field=wing elapsed_ns=29708
+WAL_ENCODE rows=10000 bytes=3558340 elapsed_ns=6933667
+WAL_FRAME bytes=3558340 checksum_ns=157375 write_ns=283375 sync_ns=1224333
+WAL_FRAME bytes=79 checksum_ns=167 write_ns=83125 sync_ns=1062500
+INSERT_PROFILE rows=10000 build_ns=1904959 checks_ns=1661375 embed_ns=4380625 index_ns=1168041 fts_ns=1908542 maps_ns=603583
+WAL_PACK rows=10000 elapsed_ns=2306542
+WAL_COLUMN rows=10000 field=body elapsed_ns=42334
+WAL_CLASSIFY rows=10000 elapsed_ns=1305250
+WAL_COLUMN rows=10000 field=embedding elapsed_ns=6685042
+WAL_COLUMN rows=10000 field=hash elapsed_ns=53875
+WAL_COLUMN rows=10000 field=id elapsed_ns=101375
+WAL_COLUMN rows=10000 field=layer elapsed_ns=70083
+WAL_COLUMN rows=10000 field=title elapsed_ns=42208
+WAL_COLUMN rows=10000 field=ts elapsed_ns=7667
+WAL_COLUMN rows=10000 field=uri elapsed_ns=37125
+WAL_COLUMN rows=10000 field=wing elapsed_ns=29708
+WAL_ENCODE rows=10000 bytes=3558340 elapsed_ns=7210834
+WAL_FRAME bytes=3558340 checksum_ns=157000 write_ns=323500 sync_ns=1478959
+WAL_FRAME bytes=79 checksum_ns=167 write_ns=82125 sync_ns=544625
+INSERT_PROFILE rows=10000 build_ns=2051666 checks_ns=1748458 embed_ns=4341417 index_ns=1250208 fts_ns=1808917 maps_ns=447209
+WAL_PACK rows=10000 elapsed_ns=2601667
+WAL_COLUMN rows=10000 field=body elapsed_ns=61625
+WAL_CLASSIFY rows=10000 elapsed_ns=1263292
+WAL_COLUMN rows=10000 field=embedding elapsed_ns=6689791
+WAL_COLUMN rows=10000 field=hash elapsed_ns=49375
+WAL_COLUMN rows=10000 field=id elapsed_ns=107917
+WAL_COLUMN rows=10000 field=layer elapsed_ns=55500
+WAL_COLUMN rows=10000 field=title elapsed_ns=43125
+WAL_COLUMN rows=10000 field=ts elapsed_ns=9083
+WAL_COLUMN rows=10000 field=uri elapsed_ns=35542
+WAL_COLUMN rows=10000 field=wing elapsed_ns=29166
+WAL_ENCODE rows=10000 bytes=3558340 elapsed_ns=7257541
+WAL_FRAME bytes=3558340 checksum_ns=157584 write_ns=320084 sync_ns=1085291
+WAL_FRAME bytes=79 checksum_ns=209 write_ns=91209 sync_ns=706792
+INSERT_PROFILE rows=10000 build_ns=1942042 checks_ns=1758541 embed_ns=4361917 index_ns=1162667 fts_ns=1923458 maps_ns=604041
+WAL_PACK rows=10000 elapsed_ns=2548625
+WAL_COLUMN rows=10000 field=body elapsed_ns=49250
+WAL_CLASSIFY rows=10000 elapsed_ns=1261041
+WAL_COLUMN rows=10000 field=embedding elapsed_ns=6649750
+WAL_COLUMN rows=10000 field=hash elapsed_ns=49042
+WAL_COLUMN rows=10000 field=id elapsed_ns=111166
+WAL_COLUMN rows=10000 field=layer elapsed_ns=66500
+WAL_COLUMN rows=10000 field=title elapsed_ns=44458
+WAL_COLUMN rows=10000 field=ts elapsed_ns=7875
+WAL_COLUMN rows=10000 field=uri elapsed_ns=35500
+WAL_COLUMN rows=10000 field=wing elapsed_ns=28625
+WAL_ENCODE rows=10000 bytes=3558340 elapsed_ns=7184583
+WAL_FRAME bytes=3558340 checksum_ns=157167 write_ns=323250 sync_ns=1066750
+WAL_FRAME bytes=79 checksum_ns=250 write_ns=92541 sync_ns=502750
+INSERT_PROFILE rows=10000 build_ns=1959875 checks_ns=1608167 embed_ns=4250958 index_ns=1227292 fts_ns=1955459 maps_ns=584166
+WAL_PACK rows=10000 elapsed_ns=2399625
+WAL_COLUMN rows=10000 field=body elapsed_ns=43334
+WAL_CLASSIFY rows=10000 elapsed_ns=1312333
+WAL_COLUMN rows=10000 field=embedding elapsed_ns=6800167
+WAL_COLUMN rows=10000 field=hash elapsed_ns=49333
+WAL_COLUMN rows=10000 field=id elapsed_ns=99584
+WAL_COLUMN rows=10000 field=layer elapsed_ns=54542
+WAL_COLUMN rows=10000 field=title elapsed_ns=42583
+WAL_COLUMN rows=10000 field=ts elapsed_ns=7541
+WAL_COLUMN rows=10000 field=uri elapsed_ns=35292
+WAL_COLUMN rows=10000 field=wing elapsed_ns=28458
+WAL_ENCODE rows=10000 bytes=3558340 elapsed_ns=7299834
+WAL_FRAME bytes=3558340 checksum_ns=157167 write_ns=298542 sync_ns=1090625
+WAL_FRAME bytes=79 checksum_ns=208 write_ns=101125 sync_ns=1038584
+INSERT_PROFILE rows=10000 build_ns=1905917 checks_ns=2099500 embed_ns=4878167 index_ns=1162541 fts_ns=2230875 maps_ns=593625
+WAL_PACK rows=10000 elapsed_ns=2374958
+WAL_COLUMN rows=10000 field=body elapsed_ns=44792
+WAL_CLASSIFY rows=10000 elapsed_ns=1251458
+WAL_COLUMN rows=10000 field=embedding elapsed_ns=7035834
+WAL_COLUMN rows=10000 field=hash elapsed_ns=50666
+WAL_COLUMN rows=10000 field=id elapsed_ns=101875
+WAL_COLUMN rows=10000 field=layer elapsed_ns=47042
+WAL_COLUMN rows=10000 field=title elapsed_ns=43666
+WAL_COLUMN rows=10000 field=ts elapsed_ns=7500
+WAL_COLUMN rows=10000 field=uri elapsed_ns=36833
+WAL_COLUMN rows=10000 field=wing elapsed_ns=29000
+WAL_ENCODE rows=10000 bytes=3558340 elapsed_ns=7559500
+WAL_FRAME bytes=3558340 checksum_ns=158125 write_ns=312666 sync_ns=1039833
+WAL_FRAME bytes=79 checksum_ns=208 write_ns=95750 sync_ns=831250
+INSERT_PROFILE rows=10000 build_ns=1876458 checks_ns=1685250 embed_ns=4482333 index_ns=1217375 fts_ns=1911709 maps_ns=462083
+WAL_PACK rows=10000 elapsed_ns=3295208
+WAL_COLUMN rows=10000 field=body elapsed_ns=73458
+WAL_CLASSIFY rows=10000 elapsed_ns=1291708
+WAL_COLUMN rows=10000 field=embedding elapsed_ns=6447583
+WAL_COLUMN rows=10000 field=hash elapsed_ns=49917
+WAL_COLUMN rows=10000 field=id elapsed_ns=110250
+WAL_COLUMN rows=10000 field=layer elapsed_ns=65333
+WAL_COLUMN rows=10000 field=title elapsed_ns=44500
+WAL_COLUMN rows=10000 field=ts elapsed_ns=8125
+WAL_COLUMN rows=10000 field=uri elapsed_ns=35875
+WAL_COLUMN rows=10000 field=wing elapsed_ns=28834
+WAL_ENCODE rows=10000 bytes=3558340 elapsed_ns=6982666
+WAL_FRAME bytes=3558340 checksum_ns=158333 write_ns=305125 sync_ns=1047416
+WAL_FRAME bytes=79 checksum_ns=250 write_ns=90166 sync_ns=1009708
+INSERT_PROFILE rows=10000 build_ns=1940666 checks_ns=1717042 embed_ns=4948875 index_ns=1268333 fts_ns=2061083 maps_ns=584917
+WAL_PACK rows=10000 elapsed_ns=2791875
+WAL_COLUMN rows=10000 field=body elapsed_ns=71000
+WAL_CLASSIFY rows=10000 elapsed_ns=1438791
+WAL_COLUMN rows=10000 field=embedding elapsed_ns=6560583
+WAL_COLUMN rows=10000 field=hash elapsed_ns=49375
+WAL_COLUMN rows=10000 field=id elapsed_ns=107250
+WAL_COLUMN rows=10000 field=layer elapsed_ns=56042
+WAL_COLUMN rows=10000 field=title elapsed_ns=48375
+WAL_COLUMN rows=10000 field=ts elapsed_ns=7417
+WAL_COLUMN rows=10000 field=uri elapsed_ns=37000
+WAL_COLUMN rows=10000 field=wing elapsed_ns=30291
+WAL_ENCODE rows=10000 bytes=3558340 elapsed_ns=7089334
+WAL_FRAME bytes=3558340 checksum_ns=197375 write_ns=316916 sync_ns=1189459
+WAL_FRAME bytes=79 checksum_ns=250 write_ns=85750 sync_ns=993250
+INSERT_PROFILE rows=10000 build_ns=1980584 checks_ns=1761667 embed_ns=4284500 index_ns=1913000 fts_ns=2109334 maps_ns=539625
+WAL_PACK rows=10000 elapsed_ns=2458333
+WAL_COLUMN rows=10000 field=body elapsed_ns=46000
+WAL_CLASSIFY rows=10000 elapsed_ns=1256459
+WAL_COLUMN rows=10000 field=embedding elapsed_ns=6897250
+WAL_COLUMN rows=10000 field=hash elapsed_ns=48708
+WAL_COLUMN rows=10000 field=id elapsed_ns=106000
+WAL_COLUMN rows=10000 field=layer elapsed_ns=47958
+WAL_COLUMN rows=10000 field=title elapsed_ns=42250
+WAL_COLUMN rows=10000 field=ts elapsed_ns=7334
+WAL_COLUMN rows=10000 field=uri elapsed_ns=35000
+WAL_COLUMN rows=10000 field=wing elapsed_ns=28375
+WAL_ENCODE rows=10000 bytes=3558340 elapsed_ns=7398750
+WAL_FRAME bytes=3558340 checksum_ns=157458 write_ns=313625 sync_ns=1065083
+WAL_FRAME bytes=79 checksum_ns=125 write_ns=92083 sync_ns=546959
+INSERT_PROFILE rows=10000 build_ns=1894833 checks_ns=1664917 embed_ns=4455916 index_ns=1265833 fts_ns=1889833 maps_ns=457583
+WAL_PACK rows=10000 elapsed_ns=2616834
+WAL_COLUMN rows=10000 field=body elapsed_ns=66000
+WAL_CLASSIFY rows=10000 elapsed_ns=1329125
+WAL_COLUMN rows=10000 field=embedding elapsed_ns=6639500
+WAL_COLUMN rows=10000 field=hash elapsed_ns=52750
+WAL_COLUMN rows=10000 field=id elapsed_ns=76584
+WAL_COLUMN rows=10000 field=layer elapsed_ns=44583
+WAL_COLUMN rows=10000 field=title elapsed_ns=44750
+WAL_COLUMN rows=10000 field=ts elapsed_ns=7500
+WAL_COLUMN rows=10000 field=uri elapsed_ns=35042
+WAL_COLUMN rows=10000 field=wing elapsed_ns=28208
+WAL_ENCODE rows=10000 bytes=3558340 elapsed_ns=7112875
+WAL_FRAME bytes=3558340 checksum_ns=157375 write_ns=360625 sync_ns=1678833
+WAL_FRAME bytes=79 checksum_ns=167 write_ns=86458 sync_ns=1018041
+INSERT_PROFILE rows=10000 build_ns=1960833 checks_ns=1702959 embed_ns=4272375 index_ns=1346375 fts_ns=2005917 maps_ns=534584
+WAL_PACK rows=10000 elapsed_ns=2783958
+WAL_COLUMN rows=10000 field=body elapsed_ns=47292
+WAL_CLASSIFY rows=10000 elapsed_ns=1258250
+WAL_COLUMN rows=10000 field=embedding elapsed_ns=6638125
+WAL_COLUMN rows=10000 field=hash elapsed_ns=51875
+WAL_COLUMN rows=10000 field=id elapsed_ns=102417
+WAL_COLUMN rows=10000 field=layer elapsed_ns=57417
+WAL_COLUMN rows=10000 field=title elapsed_ns=45625
+WAL_COLUMN rows=10000 field=ts elapsed_ns=7500
+WAL_COLUMN rows=10000 field=uri elapsed_ns=44583
+WAL_COLUMN rows=10000 field=wing elapsed_ns=28500
+WAL_ENCODE rows=10000 bytes=3558340 elapsed_ns=7175708
+WAL_FRAME bytes=3558340 checksum_ns=174458 write_ns=332000 sync_ns=1462625
+WAL_FRAME bytes=79 checksum_ns=250 write_ns=237625 sync_ns=536709
+INSERT_PROFILE rows=10000 build_ns=2382250 checks_ns=1797209 embed_ns=4145125 index_ns=1143375 fts_ns=1915291 maps_ns=608792
+WAL_PACK rows=10000 elapsed_ns=2417041
+WAL_COLUMN rows=10000 field=body elapsed_ns=53792
+WAL_CLASSIFY rows=10000 elapsed_ns=1265250
+WAL_COLUMN rows=10000 field=embedding elapsed_ns=6729084
+WAL_COLUMN rows=10000 field=hash elapsed_ns=50042
+WAL_COLUMN rows=10000 field=id elapsed_ns=105416
+WAL_COLUMN rows=10000 field=layer elapsed_ns=60208
+WAL_COLUMN rows=10000 field=title elapsed_ns=47375
+WAL_COLUMN rows=10000 field=ts elapsed_ns=7917
+WAL_COLUMN rows=10000 field=uri elapsed_ns=35625
+WAL_COLUMN rows=10000 field=wing elapsed_ns=29208
+WAL_ENCODE rows=10000 bytes=3558340 elapsed_ns=7264292
+WAL_FRAME bytes=3558340 checksum_ns=157625 write_ns=317416 sync_ns=1416625
+WAL_FRAME bytes=79 checksum_ns=84 write_ns=95792 sync_ns=1089291
+INSERT_PROFILE rows=10000 build_ns=2495584 checks_ns=1563667 embed_ns=3973417 index_ns=1142708 fts_ns=2063459 maps_ns=638709
+WAL_PACK rows=10000 elapsed_ns=2500958
+WAL_COLUMN rows=10000 field=body elapsed_ns=69375
+WAL_CLASSIFY rows=10000 elapsed_ns=1285083
+WAL_COLUMN rows=10000 field=embedding elapsed_ns=7168583
+WAL_COLUMN rows=10000 field=hash elapsed_ns=59292
+WAL_COLUMN rows=10000 field=id elapsed_ns=98750
+WAL_COLUMN rows=10000 field=layer elapsed_ns=68792
+WAL_COLUMN rows=10000 field=title elapsed_ns=43584
+WAL_COLUMN rows=10000 field=ts elapsed_ns=7583
+WAL_COLUMN rows=10000 field=uri elapsed_ns=45000
+WAL_COLUMN rows=10000 field=wing elapsed_ns=33041
+WAL_ENCODE rows=10000 bytes=3558340 elapsed_ns=7805792
+WAL_FRAME bytes=3558340 checksum_ns=186416 write_ns=365333 sync_ns=7213667
+WAL_FRAME bytes=79 checksum_ns=42 write_ns=86250 sync_ns=2191750
+INSERT_PROFILE rows=10000 build_ns=1896417 checks_ns=1537750 embed_ns=4290667 index_ns=1243667 fts_ns=1898584 maps_ns=501959
+WAL_PACK rows=10000 elapsed_ns=2440083
+WAL_COLUMN rows=10000 field=body elapsed_ns=45875
+WAL_CLASSIFY rows=10000 elapsed_ns=2088416
+WAL_COLUMN rows=10000 field=embedding elapsed_ns=7445292
+WAL_COLUMN rows=10000 field=hash elapsed_ns=49125
+WAL_COLUMN rows=10000 field=id elapsed_ns=109292
+WAL_COLUMN rows=10000 field=layer elapsed_ns=62208
+WAL_COLUMN rows=10000 field=title elapsed_ns=47084
+WAL_COLUMN rows=10000 field=ts elapsed_ns=7750
+WAL_COLUMN rows=10000 field=uri elapsed_ns=45166
+WAL_COLUMN rows=10000 field=wing elapsed_ns=29583
+WAL_ENCODE rows=10000 bytes=3558340 elapsed_ns=7965667
+WAL_FRAME bytes=3558340 checksum_ns=161291 write_ns=333667 sync_ns=1346541
+WAL_FRAME bytes=79 checksum_ns=208 write_ns=92250 sync_ns=666959
+INSERT_PROFILE rows=10000 build_ns=1950834 checks_ns=1768875 embed_ns=4411708 index_ns=1167000 fts_ns=1971250 maps_ns=518292
+WAL_PACK rows=10000 elapsed_ns=2835208
+WAL_COLUMN rows=10000 field=body elapsed_ns=55250
+WAL_CLASSIFY rows=10000 elapsed_ns=1271042
+WAL_COLUMN rows=10000 field=embedding elapsed_ns=7427750
+WAL_COLUMN rows=10000 field=hash elapsed_ns=49292
+WAL_COLUMN rows=10000 field=id elapsed_ns=106458
+WAL_COLUMN rows=10000 field=layer elapsed_ns=54459
+WAL_COLUMN rows=10000 field=title elapsed_ns=43542
+WAL_COLUMN rows=10000 field=ts elapsed_ns=7375
+WAL_COLUMN rows=10000 field=uri elapsed_ns=36708
+WAL_COLUMN rows=10000 field=wing elapsed_ns=29208
+WAL_ENCODE rows=10000 bytes=3558340 elapsed_ns=7974667
+WAL_FRAME bytes=3558340 checksum_ns=157750 write_ns=292208 sync_ns=1159583
+WAL_FRAME bytes=79 checksum_ns=208 write_ns=104166 sync_ns=658833
+INSERT_PROFILE rows=10000 build_ns=1908625 checks_ns=1548959 embed_ns=4631417 index_ns=1198583 fts_ns=1858458 maps_ns=454000
+WAL_PACK rows=10000 elapsed_ns=2905583
+WAL_COLUMN rows=10000 field=body elapsed_ns=72833
+WAL_CLASSIFY rows=10000 elapsed_ns=1353542
+WAL_COLUMN rows=10000 field=embedding elapsed_ns=6735125
+WAL_COLUMN rows=10000 field=hash elapsed_ns=59042
+WAL_COLUMN rows=10000 field=id elapsed_ns=108834
+WAL_COLUMN rows=10000 field=layer elapsed_ns=66458
+WAL_COLUMN rows=10000 field=title elapsed_ns=43458
+WAL_COLUMN rows=10000 field=ts elapsed_ns=8583
+WAL_COLUMN rows=10000 field=uri elapsed_ns=41958
+WAL_COLUMN rows=10000 field=wing elapsed_ns=29875
+WAL_ENCODE rows=10000 bytes=3558340 elapsed_ns=7317958
+WAL_FRAME bytes=3558340 checksum_ns=158000 write_ns=330333 sync_ns=1027292
+WAL_FRAME bytes=79 checksum_ns=209 write_ns=91667 sync_ns=1176250
+INSERT_PROFILE rows=10000 build_ns=1882625 checks_ns=1596584 embed_ns=5228250 index_ns=1325375 fts_ns=1940250 maps_ns=545917
+WAL_PACK rows=10000 elapsed_ns=2725708
+WAL_COLUMN rows=10000 field=body elapsed_ns=63958
+WAL_CLASSIFY rows=10000 elapsed_ns=1299625
+WAL_COLUMN rows=10000 field=embedding elapsed_ns=6657750
+WAL_COLUMN rows=10000 field=hash elapsed_ns=49625
+WAL_COLUMN rows=10000 field=id elapsed_ns=104334
+WAL_COLUMN rows=10000 field=layer elapsed_ns=62500
+WAL_COLUMN rows=10000 field=title elapsed_ns=46500
+WAL_COLUMN rows=10000 field=ts elapsed_ns=7458
+WAL_COLUMN rows=10000 field=uri elapsed_ns=45333
+WAL_COLUMN rows=10000 field=wing elapsed_ns=29125
+WAL_ENCODE rows=10000 bytes=3558340 elapsed_ns=7188042
+WAL_FRAME bytes=3558340 checksum_ns=161333 write_ns=338042 sync_ns=1151625
+# bench 1791137220303629000-12793
+
+Status: Complete
+
+| Case | Metric | Median | Unit | Scope / statistic | Observations | Processes |
+|---|---|---:|---|---|---:|---:|
+| compare/durable_insert_1k/lin [candidate] | wall | 3220604.0000 | ns | current thread wall clock; scheduler included / batch_total | 24 | 1 |
+| compare/durable_insert_10k/lin [candidate] | wall | 24097271.0000 | ns | current thread wall clock; scheduler included / batch_total | 24 | 1 |
+
+# Useful work throughput
+
+| Case | Median batch throughput | Unit |
+|---|---:|---|
+| compare/durable_insert_1k/lin [candidate] | 310503.3362 | rows/s |
+| compare/durable_insert_10k/lin [candidate] | 414989.3747 | rows/s |
+
+Derived from positive wall batches and declared units per operation; zero/unavailable durations omitted.
+
+Medians above summarize observations, not pooled operation-latency percentiles. Comparisons aggregate within each process first.
+
+- Raw batches are not independent process replications. Batch averages are not individual-operation latency. CPU frequency and background load are uncontrolled.
+
