@@ -1,0 +1,127 @@
+--- a/src/exec.rs
++++ b/src/exec.rs
+@@ -1436,6 +1436,7 @@
+                 let (rows, new_edges) = self.insert_bulk(collection, records, edges.as_slice())?;
+                 let inserted = &self.store.collection(collection)[start..];
+                 mark_written(ctx, collection, inserted);
++                let profile_pack = std::time::Instant::now();
+                 let pack = if self.is_durable() {
+                     Some(crate::persist::rows_to_insert_cols(
+                         collection.clone(),
+@@ -1445,6 +1446,9 @@
+                 } else {
+                     Some(Pack::Batch { packs: Vec::new() })
+                 };
++                if self.is_durable() {
++                    eprintln!("WAL_PACK rows={} elapsed_ns={}", records.len(), profile_pack.elapsed().as_nanos());
++                }
+                 Ok((rows, None, pack))
+             }
+             Stmt::Update {
+@@ -3620,6 +3624,7 @@
+     ) -> Result<(Vec<Row>, Vec<Edge>), Error> {
+         let now = now_ms();
+         let n = records.len();
++        let profile_build = std::time::Instant::now();
+         let mut built: Vec<Row> = if n >= 4096 {
+             std::thread::scope(|scope| {
+                 let (left, right) = records.split_at(n / 2);
+@@ -3640,6 +3645,8 @@
+                 .map(|record| record_row(record, now))
+                 .collect()
+         };
++        let profile_build_ns = profile_build.elapsed().as_nanos();
++        let profile_checks = std::time::Instant::now();
+         let mut batch_ids: rustc_hash::FxHashSet<std::sync::Arc<str>> =
+             rustc_hash::FxHashSet::default();
+         batch_ids.reserve(n);
+@@ -3673,7 +3680,10 @@
+             }
+             self.check_row_fks(collection, row)?;
+         }
++        let profile_checks_ns = profile_checks.elapsed().as_nanos();
++        let profile_embed = std::time::Instant::now();
+         self.maybe_embed_rows(collection, &mut built);
++        let profile_embed_ns = profile_embed.elapsed().as_nanos();
+ 
+         let mut new_edges = Vec::new();
+         if let Some(first) = built.first() {
+@@ -3701,9 +3711,18 @@
+         let start = self.store.collection(collection).len();
+         self.store.collection_mut(collection).reserve(n);
+         self.store.row_maps_reserve(collection, n);
++        let profile_index = std::time::Instant::now();
+         self.store.index_insert_slab(collection, start, &built)?;
++        let profile_index_ns = profile_index.elapsed().as_nanos();
++        let profile_fts = std::time::Instant::now();
+         self.store.fts_insert_slab(collection, start, &built);
++        let profile_fts_ns = profile_fts.elapsed().as_nanos();
++        let profile_maps = std::time::Instant::now();
+         self.store.row_maps_register_slab(collection, start, &built);
++        let profile_maps_ns = profile_maps.elapsed().as_nanos();
++        if n >= 1000 {
++            eprintln!("INSERT_PROFILE rows={} build_ns={} checks_ns={} embed_ns={} index_ns={} fts_ns={} maps_ns={}", n, profile_build_ns, profile_checks_ns, profile_embed_ns, profile_index_ns, profile_fts_ns, profile_maps_ns);
++        }
+         let want_rows = built.len() <= 128;
+         if want_rows {
+             self.store
+--- a/src/persist.rs
++++ b/src/persist.rs
+@@ -646,6 +646,7 @@
+     else {
+         return Err(io_err("log record exceeds 16MiB"));
+     };
++    let profile_checksum = std::time::Instant::now();
+     let codec = [magic[3]];
+     let mut checksum = crc32fast::Hasher::new();
+     checksum.update(&codec);
+@@ -654,13 +655,19 @@
+     let mut hdr = [0u8; 8];
+     hdr[..4].copy_from_slice(&LOG_MAGIC_CHECKSUM);
+     hdr[4..].copy_from_slice(&(len as u32).to_le_bytes());
++    let profile_checksum_ns = profile_checksum.elapsed().as_nanos();
++    let profile_write = std::time::Instant::now();
+     log.write_all(&hdr).map_err(io_err)?;
+     log.write_all(&codec).map_err(io_err)?;
+     log.write_all(payload).map_err(io_err)?;
+     log.write_all(&checksum).map_err(io_err)?;
++    let profile_write_ns = profile_write.elapsed().as_nanos();
++    let profile_sync = std::time::Instant::now();
+     if sync == SyncMode::Full {
+         durable_sync(log).map_err(io_err)?;
+     }
++    let profile_sync_ns = profile_sync.elapsed().as_nanos();
++    eprintln!("WAL_FRAME bytes={} checksum_ns={} write_ns={} sync_ns={}", payload.len(), profile_checksum_ns, profile_write_ns, profile_sync_ns);
+     *log_bytes += 8 + len as u64;
+     Ok(())
+ }
+@@ -722,6 +729,13 @@
+ }
+ 
+ fn use_sparse_vectors(rows: &[Option<Vec<f32>>]) -> bool {
++    let timer = std::time::Instant::now();
++    let result = use_sparse_vectors_impl(rows);
++    eprintln!("WAL_CLASSIFY rows={} elapsed_ns={}", rows.len(), timer.elapsed().as_nanos());
++    result
++}
++
++fn use_sparse_vectors_impl(rows: &[Option<Vec<f32>>]) -> bool {
+     let dense = rows
+         .iter()
+         .map(|row| 4usize.saturating_add(row.as_ref().map_or(0, |v| v.len().saturating_mul(4))))
+@@ -785,6 +799,7 @@
+         );
+     }
+     buf.clear();
++    let profile_encode = std::time::Instant::now();
+     buf.reserve(64 + fields.len() * 16 + (n as usize) * 32);
+     buf.push(V2_INSERT_COLS);
+     buf.extend_from_slice(&rec_gen.to_le_bytes());
+@@ -900,6 +915,7 @@
+             ColData::Null => buf.push(0),
+         }
+     }
++    eprintln!("WAL_ENCODE rows={} bytes={} elapsed_ns={}", n, buf.len(), profile_encode.elapsed().as_nanos());
+     write_frame(
+         log,
+         if sparse_codec {
