@@ -3623,7 +3623,7 @@ impl Db {
         let mut built: Vec<Row> = if n >= 4096 {
             std::thread::scope(|scope| {
                 let (left, right) = records.split_at(n / 2);
-                let worker = std::thread::Builder::new().spawn_scoped(scope, || {
+                let worker = scope.spawn(|| {
                     right
                         .iter()
                         .map(|record| record_row(record, now))
@@ -3631,7 +3631,7 @@ impl Db {
                 });
                 let mut rows = Vec::with_capacity(n);
                 rows.extend(left.iter().map(|record| record_row(record, now)));
-                append_bulk_worker_rows(&mut rows, right, now, worker);
+                rows.extend(worker.join().expect("row construction worker panicked"));
                 rows
             })
         } else {
@@ -4317,22 +4317,6 @@ fn match_frontier_keys(row: &Row, bind: Option<&str>) -> Vec<String> {
     keys
 }
 
-fn append_bulk_worker_rows(
-    rows: &mut Vec<Row>,
-    records: &[Record],
-    now: i64,
-    worker: std::io::Result<std::thread::ScopedJoinHandle<'_, Vec<Row>>>,
-) {
-    match worker {
-        Ok(worker) => rows.extend(worker.join().expect("row construction worker panicked")),
-        Err(_) => {
-            // Parallelism is optional: keep inserts available when the OS
-            // cannot allocate an additional worker thread.
-            rows.extend(records.iter().map(|record| record_row(record, now)));
-        }
-    }
-}
-
 fn record_row(record: &Record, now: i64) -> Row {
     let mut row = BTreeMap::new();
     for (k, v) in &record.fields {
@@ -4344,40 +4328,6 @@ fn record_row(record: &Record, now: i64) -> Row {
 #[cfg(test)]
 mod record_tests {
     use super::*;
-
-    #[test]
-    fn bulk_worker_spawn_failure_preserves_tail_and_timestamp() {
-        let left = Record {
-            fields: vec![("id".into(), Value::String("left".into()))],
-        };
-        let right = (0..2053)
-            .map(|i| Record {
-                fields: vec![
-                    ("id".into(), Value::String(format!("right-{i}").into())),
-                    ("title".into(), Value::String("old".into())),
-                    ("title".into(), Value::String(format!("ЁЖ {i}").into())),
-                    ("ts".into(), Value::Now),
-                ],
-            })
-            .collect::<Vec<_>>();
-        let mut rows = vec![record_row(&left, 123)];
-        append_bulk_worker_rows(
-            &mut rows,
-            &right,
-            123,
-            Err(std::io::Error::new(
-                std::io::ErrorKind::WouldBlock,
-                "worker unavailable",
-            )),
-        );
-        assert_eq!(rows.len(), 2054);
-        assert_eq!(row_text(&rows[0], "id"), Some("left"));
-        for (i, row) in rows[1..].iter().enumerate() {
-            assert_eq!(row_text(row, "id"), Some(format!("right-{i}").as_str()));
-            assert_eq!(row_text(row, "title"), Some(format!("ЁЖ {i}").as_str()));
-            assert_eq!(row.get("ts"), Some(&Cell::Time(123)));
-        }
-    }
 
     #[test]
     fn parallel_bulk_rows_preserve_order_generated_ids_and_shared_now() {
