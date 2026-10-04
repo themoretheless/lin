@@ -1,0 +1,117 @@
+{
+  "rows": 10000,
+  "repeats": 1,
+  "samples": 24,
+  "host": "macOS-26.7.1-arm64-arm-64bit-Mach-O",
+  "engines": [
+    "lin",
+    "mysql"
+  ],
+  "cases": [
+    "insert_native"
+  ],
+  "observations": [
+    {
+      "case": "insert_native/lin",
+      "repetition": 0,
+      "iterations": 1,
+      "samples_ns": [
+        42492333.0,
+        34798125.0,
+        32928625.0,
+        15298958.0,
+        47664292.0,
+        20577416.0,
+        21352625.0,
+        27334834.0,
+        33182292.0,
+        21788875.0,
+        35666875.0,
+        27470458.0,
+        49714125.0,
+        42100667.0,
+        107823708.0,
+        52962791.0,
+        77271958.0,
+        56063167.0,
+        39640292.0,
+        41337916.0,
+        29492500.0,
+        31567084.0,
+        48414875.0,
+        202209583.0
+      ],
+      "validated_rows": 10000
+    },
+    {
+      "case": "insert_native/mysql",
+      "repetition": 0,
+      "iterations": 1,
+      "samples_ns": [
+        247671000,
+        237062750,
+        233201167,
+        205991000,
+        277618291,
+        219162000,
+        227532583,
+        175599959,
+        172315958,
+        163311666,
+        169318292,
+        130233500,
+        129980291,
+        134523458,
+        116294541,
+        114230250,
+        118179750,
+        108690250,
+        106049125,
+        111339417,
+        104965625,
+        101378458,
+        98191875,
+        100236375
+      ],
+      "validated_rows": 10000
+    }
+  ],
+  "errors": [],
+  "versions": {
+    "lin": "0.4.0",
+    "mysql": "8.4.11"
+  },
+  "medians_ns": {
+    "insert_native/lin": 37653583.5,
+    "insert_native/mysql": 132378479.0
+  },
+  "python": "3.14.8 (main, Sep 30 2026, 17:55:09) [Clang 21.0.0 (clang-2100.3.34.2)]",
+  "clients": {
+    "pandas": "3.0.6",
+    "duckdb": "1.5.6",
+    "pymongo": "4.18.2",
+    "psycopg": "3.3.6",
+    "PyMySQL": "1.2.3",
+    "python-tds": "1.17.1"
+  },
+  "native_contracts": {
+    "lin": {
+      "schema": "id/uri/wing/title/ts/body; unique id and uri; wing+ts index",
+      "fixture": "fresh per sample; schema/index/prepare/validation/drop excluded",
+      "durability": "native memory API comparison; no disk durability equivalence",
+      "api": "Rust prepared run; default embedding and FTS",
+      "storage": "Db::empty"
+    },
+    "mysql": {
+      "schema": "id/uri/wing/title/ts/body; unique id and uri; wing+ts index",
+      "fixture": "fresh per sample; schema/index/prepare/validation/drop excluded",
+      "durability": "native memory API comparison; no disk durability equivalence",
+      "api": "PyMySQL executemany multi-row INSERT plus transaction commit",
+      "storage": "configured dedicated server",
+      "atomicity": "one transaction per sample",
+      "innodb_flush_log_at_trx_commit": 1,
+      "sync_binlog": 1
+    }
+  },
+  "status": "complete"
+}

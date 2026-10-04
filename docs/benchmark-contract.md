@@ -139,3 +139,14 @@ synchronous_commit value is recorded; settings are not weakened. Every sample
 uses an owned unique table, primary id, unique uri and wing/ts index. Only tables
 successfully created by that sample are dropped. Server/WAL/network costs differ
 from Lin Db::empty; tmpfs runs do not demonstrate physical-disk durability.
+
+### MySQL native insertion adapter
+
+`--engines lin mysql --cases insert_native` uses PyMySQL multi-row executemany
+in one transaction per sample. BEGIN, escaping/SQL construction/transmission,
+insertion and commit included; owned table/index/cursor/input setup, six-field
+readback and cleanup excluded. Primary id/unique uri and wing/ts index use
+bounded VARCHAR fields with utf8mb4; MySQL collation semantics differ from Lin.
+Flush/binlog settings are recorded without weakening. Dedicated tmpfs server
+results include driver/network/WAL costs and do not prove disk durability
+or parity with Lin Db::empty. Cleanup rolls back and drops only created tables.
