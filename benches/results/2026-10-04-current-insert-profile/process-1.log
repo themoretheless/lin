@@ -1,0 +1,94 @@
+skip postgres: no reachable server
+  tried: postgresql://lin:lin@127.0.0.1:55432/lin (error connecting to server); postgresql://postgres@127.0.0.1:5432/postgres (error connecting to server)
+  set LIN_BENCH_PG_URL or:
+  docker compose -f docker-compose.bench.yml up -d postgres
+  # brew postgresql@17 via Sources/ppduster macos-stack-postgres; start service for :5432
+skip mysql: LIN_BENCH_SKIP_MYSQL is set
+lin compare: N=10000 warm reads (fixture), bulk insert (schema outside timing)
+engines: Lin | SQLite(rusqlite bundled) | DuckDB(bundled) | HashMap(point get only) | Postgres(skipped) | MySQL(skipped)
+airbug dash: http://127.0.0.1:8790/
+Lin reads: prepare once / run many; filters use count (fair vs SQL COUNT(*));
+substring: Lin `title ~ "wal" | count` vs SQL LIKE '%wal%' COUNT(*);
+materialize: Lin `wing==rag | {id,title} | take all` vs SQL SELECT id,title;
+join: 10000 orders ⋈ 1000 users (Lin run_batch SoA / cursor vs SQL INNER JOIN);
+append_log: Lin `append facts` vs SQL INSERT INTO logs (append-only shape)
+airbug dash: http://127.0.0.1:8790/#/bench
+bench: compare/insert_bulk_1k/lin — validating and calibrating
+INSERT_PROFILE rows=1000 build_ns=253500 checks_ns=149792 embed_ns=514750 index_ns=161458 fts_ns=155958 maps_ns=45458
+INSERT_PROFILE rows=1000 build_ns=212334 checks_ns=109333 embed_ns=429791 index_ns=208083 fts_ns=329916 maps_ns=46625
+bench: compare/insert_bulk_1k/lin — measuring 24 samples
+INSERT_PROFILE rows=1000 build_ns=207084 checks_ns=111333 embed_ns=289458 index_ns=100667 fts_ns=136083 maps_ns=45292
+INSERT_PROFILE rows=1000 build_ns=206292 checks_ns=103666 embed_ns=268875 index_ns=89459 fts_ns=134166 maps_ns=38167
+INSERT_PROFILE rows=1000 build_ns=206958 checks_ns=114167 embed_ns=293958 index_ns=98042 fts_ns=143917 maps_ns=52208
+INSERT_PROFILE rows=1000 build_ns=209000 checks_ns=110083 embed_ns=279500 index_ns=90000 fts_ns=132458 maps_ns=38000
+INSERT_PROFILE rows=1000 build_ns=201083 checks_ns=110292 embed_ns=334041 index_ns=99209 fts_ns=139292 maps_ns=48500
+INSERT_PROFILE rows=1000 build_ns=206916 checks_ns=115416 embed_ns=285709 index_ns=93417 fts_ns=130125 maps_ns=43500
+INSERT_PROFILE rows=1000 build_ns=212750 checks_ns=105833 embed_ns=273083 index_ns=109333 fts_ns=131708 maps_ns=40917
+INSERT_PROFILE rows=1000 build_ns=209000 checks_ns=115333 embed_ns=412458 index_ns=106500 fts_ns=138375 maps_ns=44500
+INSERT_PROFILE rows=1000 build_ns=202292 checks_ns=113875 embed_ns=322459 index_ns=97583 fts_ns=147500 maps_ns=50125
+INSERT_PROFILE rows=1000 build_ns=203875 checks_ns=118750 embed_ns=328709 index_ns=135750 fts_ns=152250 maps_ns=40458
+INSERT_PROFILE rows=1000 build_ns=204125 checks_ns=106250 embed_ns=312042 index_ns=97083 fts_ns=133167 maps_ns=37458
+INSERT_PROFILE rows=1000 build_ns=201667 checks_ns=102417 embed_ns=256708 index_ns=91667 fts_ns=127750 maps_ns=35583
+INSERT_PROFILE rows=1000 build_ns=214125 checks_ns=107167 embed_ns=306459 index_ns=92625 fts_ns=137250 maps_ns=50875
+INSERT_PROFILE rows=1000 build_ns=196000 checks_ns=99417 embed_ns=255791 index_ns=85500 fts_ns=127458 maps_ns=34000
+INSERT_PROFILE rows=1000 build_ns=197959 checks_ns=101834 embed_ns=253583 index_ns=87084 fts_ns=126750 maps_ns=34334
+INSERT_PROFILE rows=1000 build_ns=206500 checks_ns=112500 embed_ns=276167 index_ns=89000 fts_ns=128041 maps_ns=35500
+INSERT_PROFILE rows=1000 build_ns=206125 checks_ns=104166 embed_ns=285375 index_ns=93750 fts_ns=128875 maps_ns=36208
+INSERT_PROFILE rows=1000 build_ns=208667 checks_ns=101083 embed_ns=263250 index_ns=83917 fts_ns=171542 maps_ns=37959
+INSERT_PROFILE rows=1000 build_ns=210666 checks_ns=109333 embed_ns=298292 index_ns=87459 fts_ns=129416 maps_ns=40167
+INSERT_PROFILE rows=1000 build_ns=205458 checks_ns=114042 embed_ns=331250 index_ns=101125 fts_ns=138916 maps_ns=50250
+INSERT_PROFILE rows=1000 build_ns=208541 checks_ns=123875 embed_ns=337625 index_ns=100167 fts_ns=156916 maps_ns=59417
+INSERT_PROFILE rows=1000 build_ns=208917 checks_ns=110208 embed_ns=301833 index_ns=92209 fts_ns=130417 maps_ns=36667
+INSERT_PROFILE rows=1000 build_ns=210792 checks_ns=115375 embed_ns=339916 index_ns=87500 fts_ns=154250 maps_ns=48792
+INSERT_PROFILE rows=1000 build_ns=215500 checks_ns=114833 embed_ns=319459 index_ns=90375 fts_ns=131417 maps_ns=38916
+INSERT_PROFILE rows=1000 build_ns=210458 checks_ns=103750 embed_ns=266250 index_ns=83667 fts_ns=126209 maps_ns=29959
+bench: compare/insert_bulk_10k/lin — validating and calibrating
+INSERT_PROFILE rows=10000 build_ns=2138250 checks_ns=1261000 embed_ns=5283708 index_ns=1032083 fts_ns=1408125 maps_ns=452250
+INSERT_PROFILE rows=10000 build_ns=1904833 checks_ns=1219709 embed_ns=6574000 index_ns=1185708 fts_ns=1376166 maps_ns=534167
+bench: compare/insert_bulk_10k/lin — measuring 24 samples
+INSERT_PROFILE rows=10000 build_ns=1789250 checks_ns=1425041 embed_ns=3997667 index_ns=897583 fts_ns=1248833 maps_ns=462959
+INSERT_PROFILE rows=10000 build_ns=1446250 checks_ns=1379708 embed_ns=4564875 index_ns=980958 fts_ns=1490834 maps_ns=618875
+INSERT_PROFILE rows=10000 build_ns=1428375 checks_ns=1823583 embed_ns=3408541 index_ns=912791 fts_ns=1659000 maps_ns=646500
+INSERT_PROFILE rows=10000 build_ns=2026958 checks_ns=1456166 embed_ns=5859042 index_ns=919959 fts_ns=1342250 maps_ns=486250
+INSERT_PROFILE rows=10000 build_ns=1228083 checks_ns=1424125 embed_ns=4041584 index_ns=840542 fts_ns=1270584 maps_ns=460792
+INSERT_PROFILE rows=10000 build_ns=1438792 checks_ns=1496958 embed_ns=3049750 index_ns=866209 fts_ns=1283250 maps_ns=449000
+INSERT_PROFILE rows=10000 build_ns=1192042 checks_ns=1382000 embed_ns=4192625 index_ns=849708 fts_ns=1284500 maps_ns=485625
+INSERT_PROFILE rows=10000 build_ns=1444083 checks_ns=1213208 embed_ns=3899584 index_ns=892167 fts_ns=1362750 maps_ns=482458
+INSERT_PROFILE rows=10000 build_ns=2144292 checks_ns=2742292 embed_ns=4424209 index_ns=895792 fts_ns=2343125 maps_ns=1543959
+INSERT_PROFILE rows=10000 build_ns=1281792 checks_ns=1247750 embed_ns=3683042 index_ns=830959 fts_ns=1277834 maps_ns=480584
+INSERT_PROFILE rows=10000 build_ns=1299500 checks_ns=1177500 embed_ns=3308833 index_ns=922750 fts_ns=1319208 maps_ns=504791
+INSERT_PROFILE rows=10000 build_ns=1412709 checks_ns=1262750 embed_ns=3346708 index_ns=914125 fts_ns=1395583 maps_ns=633250
+INSERT_PROFILE rows=10000 build_ns=1241250 checks_ns=1158250 embed_ns=2981792 index_ns=927667 fts_ns=1369000 maps_ns=548500
+INSERT_PROFILE rows=10000 build_ns=1418667 checks_ns=1352417 embed_ns=3667292 index_ns=1077084 fts_ns=1480834 maps_ns=573584
+INSERT_PROFILE rows=10000 build_ns=1553833 checks_ns=1262625 embed_ns=3708958 index_ns=1016500 fts_ns=1657333 maps_ns=698000
+INSERT_PROFILE rows=10000 build_ns=1484750 checks_ns=1345209 embed_ns=3543250 index_ns=908875 fts_ns=1415917 maps_ns=565833
+INSERT_PROFILE rows=10000 build_ns=1672333 checks_ns=3211500 embed_ns=4006375 index_ns=895875 fts_ns=1655042 maps_ns=769875
+INSERT_PROFILE rows=10000 build_ns=1230500 checks_ns=1304833 embed_ns=3389916 index_ns=935708 fts_ns=1398416 maps_ns=553833
+INSERT_PROFILE rows=10000 build_ns=1507917 checks_ns=1386750 embed_ns=3654875 index_ns=901250 fts_ns=1470084 maps_ns=605000
+INSERT_PROFILE rows=10000 build_ns=1607541 checks_ns=1245791 embed_ns=3233750 index_ns=1103083 fts_ns=1354917 maps_ns=914583
+INSERT_PROFILE rows=10000 build_ns=1547833 checks_ns=1405416 embed_ns=3793250 index_ns=903291 fts_ns=1447250 maps_ns=752333
+INSERT_PROFILE rows=10000 build_ns=1451458 checks_ns=1216667 embed_ns=3097500 index_ns=1499084 fts_ns=1582750 maps_ns=701333
+INSERT_PROFILE rows=10000 build_ns=1454334 checks_ns=1260041 embed_ns=3537500 index_ns=957334 fts_ns=1573125 maps_ns=591167
+INSERT_PROFILE rows=10000 build_ns=1380250 checks_ns=1291917 embed_ns=3579208 index_ns=1148917 fts_ns=1396916 maps_ns=623750
+INSERT_PROFILE rows=10000 build_ns=1192958 checks_ns=3227791 embed_ns=3791459 index_ns=953125 fts_ns=1353292 maps_ns=1136208
+# bench 1791130553081886000-33297
+
+Status: Complete
+
+| Case | Metric | Median | Unit | Scope / statistic | Observations | Processes |
+|---|---|---:|---|---|---:|---:|
+| compare/insert_bulk_1k/lin [candidate] | wall | 961166.5000 | ns | current thread wall clock; scheduler included / batch_total | 24 | 1 |
+| compare/insert_bulk_10k/lin [candidate] | wall | 9580187.5000 | ns | current thread wall clock; scheduler included / batch_total | 24 | 1 |
+
+# Useful work throughput
+
+| Case | Median batch throughput | Unit |
+|---|---:|---|
+| compare/insert_bulk_1k/lin [candidate] | 1040402.6272 | rows/s |
+| compare/insert_bulk_10k/lin [candidate] | 1043829.8897 | rows/s |
+
+Derived from positive wall batches and declared units per operation; zero/unavailable durations omitted.
+
+Medians above summarize observations, not pooled operation-latency percentiles. Comparisons aggregate within each process first.
+
+- Raw batches are not independent process replications. Batch averages are not individual-operation latency. CPU frequency and background load are uncontrolled.
