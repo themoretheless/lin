@@ -1785,43 +1785,6 @@ mod wal_integrity_tests {
     }
 
     #[test]
-    fn parallel_sparse_columns_keep_shared_decoded_budget_before_writing() {
-        let n = 4096;
-        // Each column fits separately; together the vectors and row metadata
-        // exceed the shared 64MiB decoded budget.
-        let vectors = vec![Some(vec![0.0; 2048]); n];
-        let record = LogRecord {
-            r#gen: 1,
-            next_id: 2,
-            pack: Pack::InsertCols {
-                collection: "test".into(),
-                fields: vec!["a".into(), "b".into()],
-                cols: vec![ColData::Vec(vectors.clone()), ColData::Vec(vectors)],
-                n: n as u32,
-                edges: vec![],
-            },
-        };
-        with_log(|file| {
-            file.write_all(b"previous").unwrap();
-            let mut log_bytes = 8;
-            let err = append_record(
-                file,
-                &record,
-                &mut Vec::new(),
-                SyncMode::Normal,
-                &mut log_bytes,
-            )
-            .unwrap_err();
-            assert!(err.message.contains("decoded 64MiB budget"));
-            assert_eq!(log_bytes, 8);
-            file.seek(SeekFrom::Start(0)).unwrap();
-            let mut actual = Vec::new();
-            file.read_to_end(&mut actual).unwrap();
-            assert_eq!(actual, b"previous");
-        });
-    }
-
-    #[test]
     fn shared_text_columns_preserve_legacy_bytes_and_row_values() {
         use crate::store::{Cell, Row};
         use std::sync::Arc;

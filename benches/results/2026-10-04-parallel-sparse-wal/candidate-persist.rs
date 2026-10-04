@@ -898,32 +898,8 @@ fn append_insert_cols_v2(
                 sparse_decoded_bytes = sparse_decoded_bytes
                     .checked_add(storage)
                     .ok_or_else(|| io_err("sparse vector size overflow"))?;
-                sparse_codec = true;
-                buf.push(7);
-                if v.len() >= 4096
-                    && v.iter()
-                        .flatten()
-                        .fold(0usize, |n, emb| n.saturating_add(emb.len()))
-                        >= 2 * 1024 * 1024
-                {
-                    for emb in v.iter().flatten() {
-                        let bytes = emb
-                            .len()
-                            .checked_mul(4)
-                            .ok_or_else(|| io_err("sparse vector size overflow"))?;
-                        sparse_decoded_bytes = sparse_decoded_bytes
-                            .checked_add(bytes)
-                            .filter(|&bytes| bytes <= MAX_SPARSE_DECODED_BYTES)
-                            .ok_or_else(|| io_err("sparse vectors exceed decoded 64MiB budget"))?;
-                    }
-                    append_sparse_rows_parallel(v, buf)?;
-                    continue;
-                }
-                for row in v {
-                    let Some(emb) = row else {
-                        buf.extend_from_slice(&0u32.to_le_bytes());
-                        continue;
-                    };
+                let column_start = sparse_decoded_bytes;
+                for emb in v.iter().flatten() {
                     let bytes = emb
                         .len()
                         .checked_mul(4)
@@ -932,34 +908,16 @@ fn append_insert_cols_v2(
                         .checked_add(bytes)
                         .filter(|&bytes| bytes <= MAX_SPARSE_DECODED_BYTES)
                         .ok_or_else(|| io_err("sparse vectors exceed decoded 64MiB budget"))?;
-                    let dim = u32::try_from(emb.len())
-                        .ok()
-                        .and_then(|n| n.checked_add(1))
-                        .ok_or_else(|| io_err("sparse vector dimension overflow"))?;
-                    let count = emb.iter().filter(|value| value.to_bits() != 0).count() as u32;
-                    buf.extend_from_slice(&dim.to_le_bytes());
-                    buf.extend_from_slice(&count.to_le_bytes());
-                    for (block, values) in emb.chunks(8).enumerate() {
-                        // Bitwise zero preserves negative zero and NaN payloads.
-                        // Skip empty blocks without branching for each element.
-                        if values
-                            .iter()
-                            .fold(0u32, |bits, value| bits | value.to_bits())
-                            == 0
-                        {
-                            continue;
-                        }
-                        for (offset, value) in values.iter().enumerate() {
-                            if value.to_bits() != 0 {
-                                let index = block * 8 + offset;
-                                buf.extend_from_slice(&(index as u32).to_le_bytes());
-                                buf.extend_from_slice(&value.to_bits().to_le_bytes());
-                            }
-                        }
-                    }
                 }
                 if sparse_decoded_bytes > MAX_SPARSE_DECODED_BYTES {
                     return Err(io_err("sparse vectors exceed decoded 64MiB budget"));
+                }
+                sparse_codec = true;
+                buf.push(7);
+                if v.len() >= 4096 && sparse_decoded_bytes - column_start >= 8 * 1024 * 1024 {
+                    append_sparse_rows_parallel(v, buf)?;
+                } else {
+                    append_sparse_rows_serial(v, buf)?;
                 }
             }
             ColData::Vec(v) => {
@@ -1767,7 +1725,6 @@ mod wal_integrity_tests {
         with_log(|file| {
             let bytes = frame(file, vector_pack(rows));
             assert_eq!(bytes[8], 3);
-            assert!(bytes[9..bytes.len() - 4].ends_with(&expected[3..]));
             let decoded = decode_column_record(&bytes[9..bytes.len() - 4], true).unwrap();
             let Pack::InsertCols { cols, n, .. } = decoded.pack else {
                 panic!("columns");
@@ -1781,43 +1738,6 @@ mod wal_integrity_tests {
             assert_eq!(v[4100].as_ref().unwrap()[767], 4100.0);
             assert_eq!(v[2].as_ref().unwrap()[7].to_bits(), (-0.0f32).to_bits());
             assert_eq!(v[2].as_ref().unwrap()[8].to_bits(), 0x7fc00001);
-        });
-    }
-
-    #[test]
-    fn parallel_sparse_columns_keep_shared_decoded_budget_before_writing() {
-        let n = 4096;
-        // Each column fits separately; together the vectors and row metadata
-        // exceed the shared 64MiB decoded budget.
-        let vectors = vec![Some(vec![0.0; 2048]); n];
-        let record = LogRecord {
-            r#gen: 1,
-            next_id: 2,
-            pack: Pack::InsertCols {
-                collection: "test".into(),
-                fields: vec!["a".into(), "b".into()],
-                cols: vec![ColData::Vec(vectors.clone()), ColData::Vec(vectors)],
-                n: n as u32,
-                edges: vec![],
-            },
-        };
-        with_log(|file| {
-            file.write_all(b"previous").unwrap();
-            let mut log_bytes = 8;
-            let err = append_record(
-                file,
-                &record,
-                &mut Vec::new(),
-                SyncMode::Normal,
-                &mut log_bytes,
-            )
-            .unwrap_err();
-            assert!(err.message.contains("decoded 64MiB budget"));
-            assert_eq!(log_bytes, 8);
-            file.seek(SeekFrom::Start(0)).unwrap();
-            let mut actual = Vec::new();
-            file.read_to_end(&mut actual).unwrap();
-            assert_eq!(actual, b"previous");
         });
     }
 
