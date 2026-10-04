@@ -735,9 +735,6 @@ fn use_sparse_vectors(rows: &[Option<Vec<f32>>]) -> bool {
     if dense < SPARSE_VECTOR_THRESHOLD {
         return false;
     }
-    if rows.len() >= 4096 && dense >= 8 * 1024 * 1024 {
-        return sparse_bytes_parallel(rows) < dense;
-    }
     let sparse = rows
         .iter()
         .map(|row| {
@@ -752,49 +749,6 @@ fn use_sparse_vectors(rows: &[Option<Vec<f32>>]) -> bool {
         })
         .fold(0usize, usize::saturating_add);
     sparse < dense
-}
-
-fn sparse_bytes_serial(rows: &[Option<Vec<f32>>]) -> usize {
-    rows.iter()
-        .map(|row| {
-            row.as_ref().map_or(4, |v| {
-                8usize.saturating_add(
-                    v.iter()
-                        .filter(|value| value.to_bits() != 0)
-                        .count()
-                        .saturating_mul(8),
-                )
-            })
-        })
-        .fold(0usize, usize::saturating_add)
-}
-
-fn sparse_count_worker(
-    rows: &[Option<Vec<f32>>],
-    worker: io::Result<std::thread::ScopedJoinHandle<'_, usize>>,
-) -> usize {
-    match worker {
-        Ok(worker) => worker.join().expect("sparse size worker panicked"),
-        Err(_) => sparse_bytes_serial(rows),
-    }
-}
-
-fn sparse_bytes_parallel(rows: &[Option<Vec<f32>>]) -> usize {
-    std::thread::scope(|scope| {
-        let chunk_len = rows.len().div_ceil(4);
-        let (left, rest) = rows.split_at(chunk_len);
-        let mut workers = Vec::with_capacity(3);
-        for right in rest.chunks(chunk_len.max(1)) {
-            let worker =
-                std::thread::Builder::new().spawn_scoped(scope, move || sparse_bytes_serial(right));
-            workers.push((right, worker));
-        }
-        let mut size = sparse_bytes_serial(left);
-        for (right, worker) in workers {
-            size = size.saturating_add(sparse_count_worker(right, worker));
-        }
-        size
-    })
 }
 
 fn append_sparse_rows_serial(rows: &[Option<Vec<f32>>], buf: &mut Vec<u8>) -> Result<(), Error> {
@@ -1873,41 +1827,6 @@ mod wal_integrity_tests {
             file.read_to_end(&mut actual).unwrap();
             assert_eq!(actual, b"previous");
         });
-    }
-
-    #[test]
-    fn parallel_sparse_classifier_preserves_exact_counts_and_selection() {
-        for n in [0, 1, 3, 4095, 4096, 4101] {
-            let rows = (0..n)
-                .map(|i| {
-                    if i % 11 == 0 {
-                        None
-                    } else {
-                        let mut values = vec![0.0; 768];
-                        values[7] = -0.0;
-                        values[8] = f32::from_bits(0x7fc00001);
-                        values[767] = f32::INFINITY;
-                        Some(values)
-                    }
-                })
-                .collect::<Vec<_>>();
-            let expected = rows
-                .iter()
-                .map(|r| if r.is_some() { 8 + 3 * 8 } else { 4 })
-                .sum::<usize>();
-            assert_eq!(sparse_bytes_parallel(&rows), expected);
-            assert_eq!(
-                sparse_count_worker(&rows, Err(io::ErrorKind::WouldBlock.into())),
-                expected
-            );
-            assert_eq!(use_sparse_vectors(&rows), n >= 4095);
-        }
-        let dense = vec![Some(vec![1.0; 768]); 4096];
-        assert_eq!(sparse_bytes_parallel(&dense), 4096 * (8 + 768 * 8));
-        assert!(!use_sparse_vectors(&dense));
-        let mut empty = dense;
-        empty[4095] = Some(Vec::new());
-        assert!(use_sparse_vectors(&empty));
     }
 
     #[test]
