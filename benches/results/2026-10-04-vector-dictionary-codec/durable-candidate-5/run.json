@@ -1,0 +1,1377 @@
+{
+  "schema": 1,
+  "id": "1791133618900185000-72244",
+  "status": "complete",
+  "environment": {
+    "arch": "aarch64",
+    "os": "macos"
+  },
+  "provenance": {
+    "bench_version": "0.6.0",
+    "samples": "24",
+    "warmup_ns": "0"
+  },
+  "cases": [
+    {
+      "id": "compare/durable_insert_1k/lin",
+      "contract": {
+        "completion": "synchronous function return",
+        "lifecycle": "fresh input per operation; input setup/drop and output drop excluded; chunks of <=64",
+        "param.rows": "1000",
+        "sample_target_ns": "1000000",
+        "samples": "24",
+        "tag.durable": "true",
+        "tag.insert": "true",
+        "tag.lin": "true",
+        "validation": "fresh operation before calibration and after measurement",
+        "warmup_ns": "0",
+        "work.count": "1000",
+        "work.unit": "rows"
+      },
+      "metrics": [
+        {
+          "id": "wall",
+          "unit": "ns",
+          "scope": "current thread wall clock; scheduler included",
+          "phase": "measurement",
+          "statistic": "batch_total",
+          "direction": "lower"
+        }
+      ]
+    },
+    {
+      "id": "compare/durable_insert_1k/sqlite",
+      "contract": {
+        "completion": "synchronous function return",
+        "lifecycle": "fresh input per operation; input setup/drop and output drop excluded; chunks of <=64",
+        "param.rows": "1000",
+        "sample_target_ns": "1000000",
+        "samples": "24",
+        "tag.durable": "true",
+        "tag.insert": "true",
+        "tag.sqlite": "true",
+        "validation": "fresh operation before calibration and after measurement",
+        "warmup_ns": "0",
+        "work.count": "1000",
+        "work.unit": "rows"
+      },
+      "metrics": [
+        {
+          "id": "wall",
+          "unit": "ns",
+          "scope": "current thread wall clock; scheduler included",
+          "phase": "measurement",
+          "statistic": "batch_total",
+          "direction": "lower"
+        }
+      ]
+    },
+    {
+      "id": "compare/durable_insert_10k/lin",
+      "contract": {
+        "completion": "synchronous function return",
+        "lifecycle": "fresh input per operation; input setup/drop and output drop excluded; chunks of <=64",
+        "param.rows": "10000",
+        "sample_target_ns": "1000000",
+        "samples": "24",
+        "tag.durable": "true",
+        "tag.insert": "true",
+        "tag.lin": "true",
+        "validation": "fresh operation before calibration and after measurement",
+        "warmup_ns": "0",
+        "work.count": "10000",
+        "work.unit": "rows"
+      },
+      "metrics": [
+        {
+          "id": "wall",
+          "unit": "ns",
+          "scope": "current thread wall clock; scheduler included",
+          "phase": "measurement",
+          "statistic": "batch_total",
+          "direction": "lower"
+        }
+      ]
+    },
+    {
+      "id": "compare/durable_insert_10k/sqlite",
+      "contract": {
+        "completion": "synchronous function return",
+        "lifecycle": "fresh input per operation; input setup/drop and output drop excluded; chunks of <=64",
+        "param.rows": "10000",
+        "sample_target_ns": "1000000",
+        "samples": "24",
+        "tag.durable": "true",
+        "tag.insert": "true",
+        "tag.sqlite": "true",
+        "validation": "fresh operation before calibration and after measurement",
+        "warmup_ns": "0",
+        "work.count": "10000",
+        "work.unit": "rows"
+      },
+      "metrics": [
+        {
+          "id": "wall",
+          "unit": "ns",
+          "scope": "current thread wall clock; scheduler included",
+          "phase": "measurement",
+          "statistic": "batch_total",
+          "direction": "lower"
+        }
+      ]
+    }
+  ],
+  "observations": [
+    {
+      "case": "compare/durable_insert_1k/lin",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 0,
+      "value": "3664416",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_1k/lin",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 1,
+      "value": "3557709",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_1k/lin",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 2,
+      "value": "3818625",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_1k/lin",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 3,
+      "value": "3849000",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_1k/lin",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 4,
+      "value": "4065917",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_1k/lin",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 5,
+      "value": "4221791",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_1k/lin",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 6,
+      "value": "3606583",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_1k/lin",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 7,
+      "value": "3801875",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_1k/lin",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 8,
+      "value": "4238709",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_1k/lin",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 9,
+      "value": "3993875",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_1k/lin",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 10,
+      "value": "4069167",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_1k/lin",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 11,
+      "value": "4387667",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_1k/lin",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 12,
+      "value": "3910958",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_1k/lin",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 13,
+      "value": "3974458",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_1k/lin",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 14,
+      "value": "4830375",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_1k/lin",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 15,
+      "value": "4266417",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_1k/lin",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 16,
+      "value": "3834375",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_1k/lin",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 17,
+      "value": "4248709",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_1k/lin",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 18,
+      "value": "4470750",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_1k/lin",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 19,
+      "value": "4142375",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_1k/lin",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 20,
+      "value": "4410083",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_1k/lin",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 21,
+      "value": "3991625",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_1k/lin",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 22,
+      "value": "4308333",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_1k/lin",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 23,
+      "value": "4322333",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_1k/sqlite",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 0,
+      "value": "1850083",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_1k/sqlite",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 1,
+      "value": "1803500",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_1k/sqlite",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 2,
+      "value": "1831708",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_1k/sqlite",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 3,
+      "value": "1851000",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_1k/sqlite",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 4,
+      "value": "1790916",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_1k/sqlite",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 5,
+      "value": "1828125",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_1k/sqlite",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 6,
+      "value": "1834833",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_1k/sqlite",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 7,
+      "value": "1765458",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_1k/sqlite",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 8,
+      "value": "1980833",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_1k/sqlite",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 9,
+      "value": "1807959",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_1k/sqlite",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 10,
+      "value": "1797750",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_1k/sqlite",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 11,
+      "value": "1811291",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_1k/sqlite",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 12,
+      "value": "1785042",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_1k/sqlite",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 13,
+      "value": "1764250",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_1k/sqlite",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 14,
+      "value": "1740500",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_1k/sqlite",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 15,
+      "value": "1797500",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_1k/sqlite",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 16,
+      "value": "1776209",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_1k/sqlite",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 17,
+      "value": "1792291",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_1k/sqlite",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 18,
+      "value": "1778875",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_1k/sqlite",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 19,
+      "value": "1741042",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_1k/sqlite",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 20,
+      "value": "1769833",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_1k/sqlite",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 21,
+      "value": "1758333",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_1k/sqlite",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 22,
+      "value": "1730167",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_1k/sqlite",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 23,
+      "value": "1759417",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_10k/lin",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 0,
+      "value": "35015584",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_10k/lin",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 1,
+      "value": "30113917",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_10k/lin",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 2,
+      "value": "30890875",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_10k/lin",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 3,
+      "value": "30701041",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_10k/lin",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 4,
+      "value": "29648833",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_10k/lin",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 5,
+      "value": "29972125",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_10k/lin",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 6,
+      "value": "30478833",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_10k/lin",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 7,
+      "value": "30662500",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_10k/lin",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 8,
+      "value": "29802833",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_10k/lin",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 9,
+      "value": "30157375",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_10k/lin",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 10,
+      "value": "32282917",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_10k/lin",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 11,
+      "value": "30323375",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_10k/lin",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 12,
+      "value": "30366083",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_10k/lin",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 13,
+      "value": "31025708",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_10k/lin",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 14,
+      "value": "33033625",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_10k/lin",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 15,
+      "value": "31540375",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_10k/lin",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 16,
+      "value": "30692959",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_10k/lin",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 17,
+      "value": "31626375",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_10k/lin",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 18,
+      "value": "30629125",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_10k/lin",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 19,
+      "value": "32014125",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_10k/lin",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 20,
+      "value": "32319542",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_10k/lin",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 21,
+      "value": "32792166",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_10k/lin",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 22,
+      "value": "30208583",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_10k/lin",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 23,
+      "value": "31936791",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_10k/sqlite",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 0,
+      "value": "18733583",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_10k/sqlite",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 1,
+      "value": "18648708",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_10k/sqlite",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 2,
+      "value": "18480625",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_10k/sqlite",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 3,
+      "value": "18555541",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_10k/sqlite",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 4,
+      "value": "18510917",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_10k/sqlite",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 5,
+      "value": "18446375",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_10k/sqlite",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 6,
+      "value": "18332875",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_10k/sqlite",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 7,
+      "value": "18522708",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_10k/sqlite",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 8,
+      "value": "18378666",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_10k/sqlite",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 9,
+      "value": "18324625",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_10k/sqlite",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 10,
+      "value": "18365166",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_10k/sqlite",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 11,
+      "value": "18438875",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_10k/sqlite",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 12,
+      "value": "18293875",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_10k/sqlite",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 13,
+      "value": "18067542",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_10k/sqlite",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 14,
+      "value": "18322583",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_10k/sqlite",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 15,
+      "value": "18126459",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_10k/sqlite",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 16,
+      "value": "18290958",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_10k/sqlite",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 17,
+      "value": "18201583",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_10k/sqlite",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 18,
+      "value": "18314167",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_10k/sqlite",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 19,
+      "value": "18360625",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_10k/sqlite",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 20,
+      "value": "18320709",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_10k/sqlite",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 21,
+      "value": "18384000",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_10k/sqlite",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 22,
+      "value": "18264500",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    },
+    {
+      "case": "compare/durable_insert_10k/sqlite",
+      "metric": "wall",
+      "variant": "candidate",
+      "process": 0,
+      "pair": null,
+      "sequence": 23,
+      "value": "18040750",
+      "operations": 1,
+      "availability": {
+        "state": "available"
+      }
+    }
+  ],
+  "notes": [
+    "Raw batches are not independent process replications. Batch averages are not individual-operation latency. CPU frequency and background load are uncontrolled."
+  ]
+}
