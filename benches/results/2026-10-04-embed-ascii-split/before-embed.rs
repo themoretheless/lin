@@ -91,14 +91,18 @@ impl HashingEmbedder {
     /// Add every feature of `lower` (unigrams, char trigrams, string bigrams)
     /// into the accumulator.
     fn fill(&self, s: &mut Scratch, lower: &str) {
-        // The ASCII splitter excludes vertical tab; Unicode splitting includes it.
-        if lower.is_ascii() && !lower.as_bytes().contains(&0x0b) {
-            for token in lower.split_ascii_whitespace() {
-                s.bump_token(token);
+        for token in lower.split_whitespace() {
+            if token.is_empty() {
+                continue;
             }
-        } else {
-            for token in lower.split_whitespace() {
-                s.bump_token(token);
+            s.bump(token, 1.0);
+            let b = token.as_bytes();
+            if b.len() >= 3 {
+                for w in b.windows(3) {
+                    s.bump(w, 0.5);
+                }
+            } else {
+                s.bump(b, 0.5);
             }
         }
         // Character bigrams over the whole string catch short queries.
@@ -149,19 +153,6 @@ impl Scratch {
             v: vec![0f32; dim],
             seen: vec![false; dim],
             touched: Vec::new(),
-        }
-    }
-
-    #[inline]
-    fn bump_token(&mut self, token: &str) {
-        self.bump(token, 1.0);
-        let bytes = token.as_bytes();
-        if bytes.len() >= 3 {
-            for window in bytes.windows(3) {
-                self.bump(window, 0.5);
-            }
-        } else {
-            self.bump(bytes, 0.5);
         }
     }
 
@@ -384,24 +375,13 @@ mod tests {
         }
         for dim in [8, 9, 32, 384, 768, 1024, 1536] {
             let embedder = HashingEmbedder::new("test", dim);
-            let mut texts = [
+            for text in [
                 "",
                 "WAL tuning",
                 "aa aa wal",
                 "СМЕШАННЫЙ Регистр 🦔",
                 "longer text with several tokens and repeated repeated words",
-            ]
-            .map(String::from)
-            .to_vec();
-            texts.extend((0u8..=127).map(|c| format!("ab{}cd", char::from(c))));
-            texts.extend(
-                [
-                    '\u{85}', '\u{a0}', '\u{1680}', '\u{2000}', '\u{200a}', '\u{2028}', '\u{2029}',
-                    '\u{202f}', '\u{205f}', '\u{3000}',
-                ]
-                .map(|c| format!("ab{c}cd")),
-            );
-            for text in texts {
+            ] {
                 let lower = text.to_lowercase();
                 let mut expected = vec![0f32; dim];
                 for token in lower.split_whitespace() {
@@ -418,7 +398,7 @@ mod tests {
                     bump(&mut expected, w, 0.25);
                 }
                 l2_normalize(&mut expected);
-                let got = embedder.embed(&text);
+                let got = embedder.embed(text);
                 assert_eq!(
                     got.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
                     expected.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),

@@ -91,7 +91,6 @@ impl HashingEmbedder {
     /// Add every feature of `lower` (unigrams, char trigrams, string bigrams)
     /// into the accumulator.
     fn fill(&self, s: &mut Scratch, lower: &str) {
-        // The ASCII splitter excludes vertical tab; Unicode splitting includes it.
         if lower.is_ascii() && !lower.as_bytes().contains(&0x0b) {
             for token in lower.split_ascii_whitespace() {
                 s.bump_token(token);
