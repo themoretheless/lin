@@ -800,22 +800,14 @@ fn append_sparse_worker(
 
 fn append_sparse_rows_parallel(rows: &[Option<Vec<f32>>], buf: &mut Vec<u8>) -> Result<(), Error> {
     std::thread::scope(|scope| {
-        let chunk_len = rows.len().div_ceil(4);
-        let (left, rest) = rows.split_at(chunk_len);
-        let mut workers = Vec::with_capacity(3);
-        for right in rest.chunks(chunk_len.max(1)) {
-            let worker = std::thread::Builder::new().spawn_scoped(scope, move || {
-                let mut bytes = Vec::with_capacity(right.len() * 32);
-                append_sparse_rows_serial(right, &mut bytes)?;
-                Ok(bytes)
-            });
-            workers.push((right, worker));
-        }
+        let (left, right) = rows.split_at(rows.len() / 2);
+        let worker = std::thread::Builder::new().spawn_scoped(scope, || {
+            let mut bytes = Vec::with_capacity(right.len() * 32);
+            append_sparse_rows_serial(right, &mut bytes)?;
+            Ok(bytes)
+        });
         append_sparse_rows_serial(left, buf)?;
-        for (right, worker) in workers {
-            append_sparse_worker(buf, right, worker)?;
-        }
-        Ok(())
+        append_sparse_worker(buf, right, worker)
     })
 }
 
