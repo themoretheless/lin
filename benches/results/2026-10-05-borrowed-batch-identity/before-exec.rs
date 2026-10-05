@@ -3640,10 +3640,10 @@ impl Db {
                 .map(|record| record_row(record, now))
                 .collect()
         };
-        let mut batch_ids: rustc_hash::FxHashSet<&str> =
+        let mut batch_ids: rustc_hash::FxHashSet<std::sync::Arc<str>> =
             rustc_hash::FxHashSet::default();
         batch_ids.reserve(n);
-        let mut batch_uris: rustc_hash::FxHashSet<&str> =
+        let mut batch_uris: rustc_hash::FxHashSet<std::sync::Arc<str>> =
             rustc_hash::FxHashSet::default();
         if collection == "docs" {
             batch_uris.reserve(n);
@@ -3658,23 +3658,21 @@ impl Db {
             {
                 row.insert("hash".into(), Cell::Text(content_hash_arc(body.as_ref())));
             }
-            if let Some(id) = row.get("id").and_then(Cell::text)
-                && (!batch_ids.insert(id)
-                    || self.store.get_by_id(collection, id).is_some())
+            if let Some(id) = row.get("id").and_then(Cell::text_shared)
+                && (!batch_ids.insert(std::sync::Arc::clone(&id))
+                    || self.store.get_by_id(collection, id.as_ref()).is_some())
             {
                 return Err(Error::runtime(format!("duplicate id: {id}")));
             }
             if collection == "docs"
-                && let Some(uri) = row.get("uri").and_then(Cell::text)
-                && (!batch_uris.insert(uri)
-                    || self.store.get_by_uri(uri).is_some())
+                && let Some(uri) = row.get("uri").and_then(Cell::text_shared)
+                && (!batch_uris.insert(std::sync::Arc::clone(&uri))
+                    || self.store.get_by_uri(uri.as_ref()).is_some())
             {
                 return Err(Error::runtime(format!("duplicate uri: {uri}")));
             }
             self.check_row_fks(collection, row)?;
         }
-        drop(batch_ids);
-        drop(batch_uris);
         self.maybe_embed_rows(collection, &mut built);
 
         let mut new_edges = Vec::new();
