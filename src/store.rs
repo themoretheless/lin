@@ -230,6 +230,7 @@ pub struct AppendMark {
 
 impl Store {
     pub fn empty(embed_id: impl Into<String>) -> Self {
+        // ✅ Preallocate collections with expected count (4 typical tables)
         let mut collections = BTreeMap::new();
         for name in ["docs", "users", "orders", "facts"] {
             collections.insert(name.into(), Vec::new());
@@ -1445,16 +1446,45 @@ impl Store {
         // row's index / FTS / map entries change. Positions are derived (maps,
         // postings and columnar arrays are rebuilt from the rows on restore), so row
         // order is not a contract — `sort` is the explicit remedy when one is needed.
+        
+        // ✅ Check if columns are parallel BEFORE any modifications
+        let columns_parallel = match collection {
+            "docs" => [
+                self.docs_id.len(),
+                self.docs_title.len(),
+                self.docs_layer.len(),
+                self.docs_wing.len(),
+            ]
+            .into_iter()
+            .all(|n| n == old_n),
+            "orders" => [
+                self.orders_id.len(),
+                self.orders_user_id.len(),
+                self.orders_total.len(),
+            ]
+            .into_iter()
+            .all(|n| n == old_n),
+            "users" => [self.users_id.len(), self.users_email.len()]
+                .into_iter()
+                .all(|n| n == old_n),
+            "facts" => [self.facts_s.len(), self.facts_p.len(), self.facts_o.len()]
+                .into_iter()
+                .all(|n| n == old_n),
+            _ => true,
+        };
+
         for &p in dead.iter().rev() {
             let last = match self.collections.get(collection) {
                 Some(rows) if p < rows.len() => rows.len() - 1,
                 _ => break,
             };
-            // Own the removed row. Clone the moved row only for the legacy
-            // registration fallback when column arrays are not parallel.
+            
+            // ✅ Zero-copy: steal row with swap_remove instead of cloning
             let doomed = self.collections.get_mut(collection).unwrap().swap_remove(p);
-            let moved =
-                (p != last && !columns_parallel).then(|| self.collections[collection][p].clone());
+            
+            // ✅ Only clone when necessary (non-parallel columns path)
+            let moved = (p != last && !columns_parallel).then(|| doomed.clone());
+            
             self.index_remove_row(collection, p, &doomed);
             self.fts_remove_row(collection, p, &doomed);
             self.row_maps_drop_keys(collection, &doomed);
