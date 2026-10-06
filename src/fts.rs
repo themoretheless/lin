@@ -229,21 +229,33 @@ impl FtsIndex {
             .fields
             .iter()
             .all(|field| before.get(field) == after.get(field))
+            && before.get("snippet") == after.get("snippet")
         {
             return;
         }
         let old = row_tokens(before, &self.fields);
         let new = row_tokens(after, &self.fields);
-        for tok in &old {
-            if new.contains(tok) {
-                continue;
+        let (mut old_pos, mut new_pos) = (0, 0);
+        while old_pos < old.len() && new_pos < new.len() {
+            match old[old_pos].cmp(&new[new_pos]) {
+                std::cmp::Ordering::Less => {
+                    self.note_del(&old[old_pos], row_idx);
+                    old_pos += 1;
+                }
+                std::cmp::Ordering::Greater => {
+                    self.note_add(&new[new_pos], row_idx);
+                    new_pos += 1;
+                }
+                std::cmp::Ordering::Equal => {
+                    old_pos += 1;
+                    new_pos += 1;
+                }
             }
+        }
+        for tok in &old[old_pos..] {
             self.note_del(tok, row_idx);
         }
-        for tok in &new {
-            if old.contains(tok) {
-                continue;
-            }
+        for tok in &new[new_pos..] {
             self.note_add(tok, row_idx);
         }
     }
@@ -370,7 +382,7 @@ pub fn tokenize(text: &str) -> Vec<String> {
 
 /// Text of every field an index tokenizes: the `fts` fields, plus `snippet`
 /// when it is not one of them (lex scoring reads it).
-fn fts_texts<'a>(row: &'a Row, fields: &'a [String]) -> impl Iterator<Item = &'a str> {
+fn fts_texts<'a: 'b, 'b>(row: &'a Row, fields: &'b [String]) -> impl Iterator<Item = &'a str> + 'b {
     let snippet = if fields.iter().any(|f| f == "snippet") {
         None
     } else {
@@ -512,10 +524,7 @@ fn add_posting(postings: &mut FxHashMap<String, Vec<usize>>, tok: &str, row_idx:
 fn row_tokens<'a>(row: &'a Row, fields: &[String]) -> Vec<std::borrow::Cow<'a, str>> {
     use std::borrow::Cow;
     let mut out = Vec::with_capacity(fields.len() * 10); // Предположение среднего количества токенов
-    for field in fields {
-        let Some(text) = row_text(row, field) else {
-            continue;
-        };
+    for text in fts_texts(row, fields) {
         if text
             .bytes()
             .all(|b| b.is_ascii() && !b.is_ascii_uppercase())
@@ -592,6 +601,110 @@ pub fn fts_fields(catalog: &crate::catalog::Catalog, collection: &str) -> Vec<St
 mod tests {
     use super::*;
     use crate::store::Cell;
+
+    #[test]
+    fn snippet_mutations_match_rebuilt_index() {
+        for fields in [vec!["title".into()], vec!["title".into(), "snippet".into()]] {
+            let before = Row::from([
+                ("title".into(), Cell::text_arc("shared")),
+                ("snippet".into(), Cell::text_arc("OLD shared ЁЖ")),
+            ]);
+            let after = Row::from([
+                ("title".into(), Cell::text_arc("shared")),
+                ("snippet".into(), Cell::text_arc("NEW shared ИГЛА")),
+            ]);
+            let mut index = FtsIndex::build(&[before.clone()], &fields);
+            index.sync_row(0, &before, &after);
+            let reference = FtsIndex::build(&[after.clone()], &fields);
+            for query in ["old", "new", "shared", "ёж", "игла"] {
+                assert_eq!(
+                    index.candidate_idxs(query),
+                    reference.candidate_idxs(query),
+                    "{query}"
+                );
+            }
+            index.move_row(0, 1, &after);
+            assert_eq!(index.candidate_idxs("new"), vec![1]);
+            index.remove_row(1, &after);
+            assert!(index.candidate_idxs("new shared игла").is_empty());
+            index.insert_row(0, &before);
+            assert_eq!(index.candidate_idxs("old ёж"), vec![0]);
+            index.fold_all();
+            assert_eq!(index.postings, FtsIndex::build(&[before], &fields).postings);
+        }
+    }
+
+    #[test]
+    fn sync_token_sets_match_rebuild() {
+        let fields = vec!["title".into(), "body".into()];
+        for old_mask in 0..32 {
+            for new_mask in 0..32 {
+                let row = |mask: usize| {
+                    Row::from([(
+                        "title".into(),
+                        Cell::text_arc(
+                            (0..5)
+                                .filter(|i| mask & (1 << i) != 0)
+                                .map(|i| format!("WORD{i} word{i}"))
+                                .collect::<Vec<_>>()
+                                .join(" "),
+                        ),
+                    )])
+                };
+                let before = row(old_mask);
+                let after = row(new_mask);
+                let mut index = FtsIndex::build(&[before.clone()], &fields);
+                index.sync_row(0, &before, &after);
+                index.fold_all();
+                assert_eq!(index.postings, FtsIndex::build(&[after], &fields).postings);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "manual paired performance measurement"]
+    fn optimization_measurement() {
+        use std::{hint::black_box, time::Instant};
+        let fields = vec!["title".into()];
+        for text in [
+            "already lowercase words",
+            "UPPERCASE WORDS",
+            "РУССКИЙ ТЕКСТ ЁЖ",
+        ] {
+            let rows = (0..10000)
+                .map(|_| Row::from([("title".into(), Cell::text_arc(text))]))
+                .collect::<Vec<_>>();
+            let start = Instant::now();
+            for _ in 0..30 {
+                black_box(FtsIndex::build(black_box(&rows), &fields));
+            }
+            println!("build {text}: {} ns", start.elapsed().as_nanos() / 30);
+        }
+        for n in [10, 100, 1000] {
+            let make = |shift| {
+                Row::from([(
+                    "title".into(),
+                    Cell::text_arc(
+                        (shift..n + shift)
+                            .map(|i| format!("word{i}"))
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                    ),
+                )])
+            };
+            let before = make(0);
+            let after = make(n / 2);
+            let mut index = FtsIndex::build(&[before.clone()], &fields);
+            let start = Instant::now();
+            for _ in 0..100 {
+                index.sync_row(0, &before, &after);
+                index.sync_row(0, &after, &before);
+            }
+            black_box(&index);
+            println!("sync {n}: {} ns", start.elapsed().as_nanos() / 200);
+            assert_eq!(index.candidate_idxs("word0"), vec![0]);
+        }
+    }
 
     #[test]
     fn slab_normalization_scratch_matches_individual_rows() {

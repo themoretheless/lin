@@ -1,0 +1,268 @@
+   Compiling proc-macro2 v1.0.107
+   Compiling quote v1.0.47
+   Compiling unicode-ident v1.0.24
+   Compiling libc v0.2.189
+   Compiling shlex v2.0.1
+   Compiling find-msvc-tools v0.1.12
+   Compiling cfg-if v1.0.4
+   Compiling autocfg v1.5.1
+   Compiling serde_core v1.0.229
+   Compiling zeroize v1.9.0
+   Compiling pin-project-lite v0.2.17
+   Compiling memchr v2.8.3
+   Compiling untrusted v0.9.0
+   Compiling futures-core v0.3.34
+   Compiling zmij v1.0.23
+   Compiling serde v1.0.229
+   Compiling regex-syntax v0.8.11
+   Compiling crc32fast v1.5.1
+   Compiling rustls-pki-types v1.15.1
+   Compiling futures-sink v0.3.34
+   Compiling bytes v1.12.1
+   Compiling serde_json v1.0.151
+   Compiling rustls v0.23.44
+   Compiling cc v1.4.5
+   Compiling slab v0.4.12
+   Compiling futures-task v0.3.34
+   Compiling time-core v0.1.9
+   Compiling num-traits v0.2.19
+   Compiling powerfmt v0.2.0
+   Compiling num-conv v0.2.2
+   Compiling deranged v0.5.8
+   Compiling once_cell v1.21.4
+   Compiling aho-corasick v1.1.5
+   Compiling itoa v1.0.18
+   Compiling subtle v2.6.1
+   Compiling rustls-pemfile v2.2.0
+   Compiling futures-util v0.3.34
+   Compiling base64 v0.22.1
+   Compiling smallvec v1.16.1
+   Compiling rustc-hash v2.1.3
+   Compiling pem v3.0.6
+   Compiling syn v3.0.5
+   Compiling syn v2.0.119
+   Compiling ring v0.17.14
+   Compiling time v0.3.55
+   Compiling getrandom v0.2.17
+   Compiling memmap2 v0.9.11
+   Compiling rmp v0.8.15
+   Compiling yasna v0.5.2
+   Compiling regex-automata v0.4.18
+   Compiling tokio-macros v2.7.2
+   Compiling serde_derive v1.0.229
+   Compiling lin-derive v0.4.0 (/Users/themoretheless/Documents/Sources/lin/lin-derive)
+   Compiling tokio v1.53.1
+   Compiling rustls-webpki v0.103.15
+   Compiling rcgen v0.13.2
+   Compiling regex v1.13.1
+   Compiling tokio-util v0.7.19
+   Compiling tokio-stream v0.1.19
+   Compiling rmp-serde v1.3.1
+   Compiling lin v0.4.0 (/tmp/lin-fts-check)
+warning: constant `BACKUP_MAGIC` is never used
+  --> /Users/themoretheless/Documents/Sources/lin/src/persist.rs:43:11
+   |
+43 | pub const BACKUP_MAGIC: [u8; 4] = *b"LIN\x04";
+   |           ^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `lin` (lib) generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 40.85s
+     Running /Users/themoretheless/Documents/Sources/lin/tests/delete_readback.rs (/tmp/lin-fts-check/target/debug/build/lin/b101df4cd3417037/out/delete_readback-b101df4cd3417037)
+
+running 4 tests
+test repeated_deletes_do_not_drift ... ok
+test single_delete_is_visible_through_every_lookup_path ... ok
+test many_at_once_survive_reopen ... ok
+test posting_deltas_fold_without_losing_or_resurrecting_rows has been running for over 60 seconds
+test posting_deltas_fold_without_losing_or_resurrecting_rows ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 95.65s
+
+     Running /Users/themoretheless/Documents/Sources/lin/tests/exec.rs (/tmp/lin-fts-check/target/debug/build/lin/d2a03136c7a19a23/out/exec-d2a03136c7a19a23)
+
+running 61 tests
+test cas_each_ok ... ok
+test bulk_insert_then_count ... ok
+test bulk_append_edges_hop ... ok
+test catalog_filter_hides_reads_not_writes ... ok
+test delete_docs_cas_and_edge_and_facts ... ok
+test bulk_insert_uniqueness_checks_empty_batch_and_existing_rows_atomically ... ok
+test delete_rollback_across_collections_keeps_soa_and_maps ... ok
+test cas_reject ... ok
+test delete_reindexes_maps_and_postings ... ok
+test cas_each_all_or_nothing ... ok
+test append_idempotent ... ok
+test absolute_timestamps_compare_identically_in_scans_and_indexes ... ok
+test bulk_insert_updates_index ... ok
+test empty_list_exec ... ok
+test fk_insert_requires_parent_row ... ok
+test filter_ago_and_has ... ok
+test graph_after_insert_with_edge ... ok
+test bounded_dnf_falls_back_without_changing_results ... ok
+test delete_rollback_restores_positions_and_structures ... ok
+test graph_depth_chain ... ok
+test fts_case_folds_both_paths ... ok
+test hop_after_insert_with_edge ... ok
+test grouped_commit_rolls_back_rows_and_fts_on_runtime_error ... ok
+test filter_project_shortcuts_preserve_multiple_filters_and_windows ... ok
+test fk_insert_ok_when_parent_exists ... ok
+test index_filter_explain_and_rows ... ok
+test filters_after_aggregation_and_skip_apply_to_stage_output ... ok
+test index_maintain_delete_update ... ok
+test deleted_rows_keep_original_order_and_rollback_positions ... ok
+test multi_stmt_one_pack_and_sees_writes ... ok
+test owned_type_is_not_a_collection ... ok
+test index_or_equality_rows ... ok
+test insert_then_query ... ok
+test multi_stmt_atomic_rollback ... ok
+test let_then_use ... ok
+test packed_title_scan_tracks_mutations_and_rejects_cross_row_matches ... ok
+test match_two_hop_chain ... ok
+test numeric_sort_orders_nan_after_numbers_and_keeps_zero_and_nan_ties_stable ... ok
+test prepared_insert_pack_keeps_statement_alignment_time_and_new_ids ... ok
+test reembed_updates_embeddings ... ok
+test union_concat_then_take ... ok
+test prepare_once_run_many ... ok
+test match_one_hop ... ok
+test live_col_insert_query ... ok
+test title_contains_count_matches_string_search_at_boundaries ... ok
+test mixed_row_journal_rolls_back_multiple_swaps_and_updates ... ok
+test seed_join_and_search ... ok
+test unknown_field_still_compile_fail ... ok
+test unique_index_refuses_existing_duplicates ... ok
+test unique_index_rejects_duplicate_and_rolls_back ... ok
+test search_vec_and_hybrid_rank ... ok
+test deep_dnf_plans_as_scan_but_returns_seek_rows ... ok
+test update_rollback_restores_rows_and_indexes ... ok
+test update_repairs_fts_and_index_keys ... ok
+test point_mutation_keeps_residual_predicate ... ok
+test bulk_insert_count_survives_result_elision_boundary ... ok
+test index_seeks_mixed_int_and_float_numbers_like_the_scan ... ok
+test project_take_all_skips_body ... ok
+test take_50_implicit ... ok
+test search_lex_top_k_matches_full_ranking_prefix_and_skip ... ok
+test hybrid_bounded_results_match_full_ranking ... ok
+
+test result: ok. 61 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.31s
+
+     Running /Users/themoretheless/Documents/Sources/lin/tests/lang.rs (/tmp/lin-fts-check/target/debug/build/lin/dfe2dab92db93249/out/lang-dfe2dab92db93249)
+
+running 62 tests
+test empty_list_is_error ... ok
+test delete_on_pipe_is_mutation ... ok
+test bulk_insert_with_forbidden ... ok
+test ago_rejects_unitless_and_string ... ok
+test delete_keyed_requires_cas ... ok
+test graph_unknown_rel ... ok
+test bare_predicate_without_keyword_is_where ... ok
+test explain_graph_mermaid_search_filter ... ok
+test catalog_filter_in_plan ... ok
+test explain_graph_dot_search_filter ... ok
+test append_facts ... ok
+test explain_cost_still_has_budget ... ok
+test bulk_insert_plan ... ok
+test decls_and_idb_parse ... ok
+test ago_equals_now_minus ... ok
+test bulk_append_plan ... ok
+test delete_keyed_cas_plan ... ok
+test explain_cost_search ... ok
+test cas_each_plan ... ok
+test delete_edge_and_facts ... ok
+test hop_unknown_rel ... ok
+test graph_wikilink ... ok
+test index_prefix_only_uses_index ... ok
+test index_ts_only_does_not_claim_composite ... ok
+test insert_with_edge ... ok
+test join_fk ... ok
+test join_without_fk ... ok
+test index_point_get_still ... ok
+test index_or_with_unindexed_arm_scans ... ok
+test index_wing_ts_uses_composite ... ok
+test let_cannot_shadow_collection ... ok
+test let_binding_plan ... ok
+test catalog_filter_all_skips ... ok
+test index_or_equality_uses_index ... ok
+test hop_wikilink ... ok
+test live_col_then_query ... ok
+test match_unknown_rel ... ok
+test match_edge_bind_rejects_star ... ok
+test match_duplicate_bind ... ok
+test laconic_filter_project_ago ... ok
+test match_with_start_alias ... ok
+test mutation_on_pipe ... ok
+test owned_flattens_into_col ... ok
+test match_star_and_reverse_and_edge_plan ... ok
+test page_and_catalog_and_reembed ... ok
+test match_path_plan ... ok
+test required_combo_explain ... ok
+test search_vec_on_users ... ok
+test search_lex_fts_seek ... ok
+test update_body_immutable ... ok
+test search_hybrid_then_take ... ok
+test search_count_sort ... ok
+test point_get_by_id ... ok
+test union_paren_and_mismatch ... ok
+test unknown_field ... ok
+test signed_number_literals ... ok
+test update_without_cas ... ok
+test union_compatible_plan ... ok
+test title_has_and_regex_and_substr ... ok
+test regex_errors_and_has_type ... ok
+test update_cas ... ok
+test verbose_where_pick_alias ... ok
+
+test result: ok. 62 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running /Users/themoretheless/Documents/Sources/lin/tests/persist.rs (/tmp/lin-fts-check/target/debug/build/lin/78324143cc8660bc/out/persist-78324143cc8660bc)
+
+running 39 tests
+
+running 1 test
+
+running 1 test
+test crash_exit_keeps_full_commit ... ok
+test crash_exit_keeps_entire_group_commit ... ok
+test bulk_insert_survives_reopen ... ok
+test catalog_filter_survives_checkpoint_reopen ... ok
+test absolute_timestamps_survive_bulk_wal_checkpoint_and_reopen ... ok
+test embedding_survives_durable_reopen ... ok
+test cold_checkpoint_reopen ... ok
+test memory_snapshot_restore ... ok
+test delete_survives_reopen ... ok
+test append_idempotent_after_reopen ... ok
+test durable_fts_blob_survives_checkpoint_reopen ... ok
+test cas_after_reopen ... ok
+test checkpoint_compacts_log ... ok
+test index_survives_reopen ... ok
+test follower_rejects_wal_gap ... ok
+test quotas_reject_excess_rows ... ok
+test reader_snapshot_is_frozen_and_read_only ... ok
+test shared_readers_across_threads ... ok
+test insert_survives_reopen ... ok
+test cold_backup_self_contained ... ok
+test insert_with_edge_survives ... ok
+test open_read_loads_durable_without_writer ... ok
+test durable_follower_hot_standby ... ok
+test open_read_does_not_see_commits_after_open ... ok
+test large_insert_wal_contains_rows_elided_from_handle ... ok
+test large_bulk_insert_survives_reopen ... ok
+test backup_export_import_roundtrip ... ok
+test multi_stmt_one_gen_and_atomic_durable ... ok
+
+running 1 test
+test new_col_survives_reopen ... ok
+test sync_normal_survives_checkpoint ... ok
+test store_open_api_and_snapshot ... ok
+test wal_export_apply_roundtrip ... ok
+test ship_tcp_follower_sync ... ok
+test owned_survives_checkpoint_reopen ... ok
+test writer_lock_rejects_second_open ... ok
+test truncated_last_record_ignored ... ok
+test wal_update_after_snapshot_replays_against_row_maps ... ok
+test ship_tls_token_roundtrip ... ok
+test large_sparse_embedding_insert_is_one_durable_frame_and_replays_exactly ... ok
+
+test result: ok. 39 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 20.02s
+

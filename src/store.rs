@@ -153,6 +153,27 @@ pub fn row_text<'a>(row: &'a Row, key: &str) -> Option<&'a str> {
     row.get(key).and_then(Cell::text)
 }
 
+/// Hot document row type for zero-copy projection (id, title, layer, wing columns)
+#[derive(Clone)]
+pub struct HotDocRow {
+    pub id: Arc<str>,
+    pub title: Arc<str>,
+    pub layer: Arc<str>,
+    pub wing: Arc<str>,
+}
+
+impl HotDocRow {
+    #[inline]
+    pub fn to_btree(self) -> BTreeMap<String, Cell> {
+        BTreeMap::from([
+            ("id".into(), Cell::Text(Arc::clone(&self.id))),
+            ("title".into(), Cell::Text(Arc::clone(&self.title))),
+            ("layer".into(), Cell::Text(Arc::clone(&self.layer))),
+            ("wing".into(), Cell::Text(Arc::clone(&self.wing))),
+        ])
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Edge {
     pub rel: String,
@@ -1416,62 +1437,11 @@ impl Store {
             return;
         }
 
-        let columns_parallel = match collection {
-            "docs" => [
-                self.docs_id.len(),
-                self.docs_title.len(),
-                self.docs_layer.len(),
-                self.docs_wing.len(),
-            ]
-            .into_iter()
-            .all(|n| n == old_n),
-            "orders" => [
-                self.orders_id.len(),
-                self.orders_user_id.len(),
-                self.orders_total.len(),
-            ]
-            .into_iter()
-            .all(|n| n == old_n),
-            "users" => [self.users_id.len(), self.users_email.len()]
-                .into_iter()
-                .all(|n| n == old_n),
-            "facts" => [self.facts_s.len(), self.facts_p.len(), self.facts_o.len()]
-                .into_iter()
-                .all(|n| n == old_n),
-            _ => true,
-        };
-
         // Swap-remove, highest slot first: the last live row moves into each vacated
         // slot, so the array stays dense and only the doomed row's and the moved
         // row's index / FTS / map entries change. Positions are derived (maps,
         // postings and columnar arrays are rebuilt from the rows on restore), so row
         // order is not a contract — `sort` is the explicit remedy when one is needed.
-        
-        // ✅ Check if columns are parallel BEFORE any modifications
-        let columns_parallel = match collection {
-            "docs" => [
-                self.docs_id.len(),
-                self.docs_title.len(),
-                self.docs_layer.len(),
-                self.docs_wing.len(),
-            ]
-            .into_iter()
-            .all(|n| n == old_n),
-            "orders" => [
-                self.orders_id.len(),
-                self.orders_user_id.len(),
-                self.orders_total.len(),
-            ]
-            .into_iter()
-            .all(|n| n == old_n),
-            "users" => [self.users_id.len(), self.users_email.len()]
-                .into_iter()
-                .all(|n| n == old_n),
-            "facts" => [self.facts_s.len(), self.facts_p.len(), self.facts_o.len()]
-                .into_iter()
-                .all(|n| n == old_n),
-            _ => true,
-        };
 
         for &p in dead.iter().rev() {
             let last = match self.collections.get(collection) {
@@ -1479,29 +1449,17 @@ impl Store {
                 _ => break,
             };
             
-            // ✅ Zero-copy: steal row with swap_remove instead of cloning
+            // Zero-copy: steal row with swap_remove instead of cloning
             let doomed = self.collections.get_mut(collection).unwrap().swap_remove(p);
-            
-            // ✅ Only clone when necessary (non-parallel columns path)
-            let moved = (p != last && !columns_parallel).then(|| doomed.clone());
             
             self.index_remove_row(collection, p, &doomed);
             self.fts_remove_row(collection, p, &doomed);
             self.row_maps_drop_keys(collection, &doomed);
-            if p != last && columns_parallel {
+            if p != last {
                 self.move_deleted_tail(collection, last, p);
                 continue;
             }
-            let Some(moved) = moved else {
-                self.swap_pop_columns(collection, p, last + 1);
-                continue;
-            };
-            self.index_remove_row(collection, last, &moved);
-            self.fts_move_row(collection, last, p, &moved);
-            self.row_maps_drop_keys(collection, &moved);
             self.swap_pop_columns(collection, p, last + 1);
-            let _ = self.index_insert_row(collection, p, &moved);
-            self.swap_maps_register(collection, p, &moved);
         }
 
         let new_n = old_n - dead.len();
@@ -2583,34 +2541,34 @@ impl Store {
         if fields.is_empty() || !fields.iter().all(|f| docs_hot_field(f)) {
             return None;
         }
-        // Hot path: { id, title } — compact 2-entry maps.
-        if fields.len() == 2 && fields[0] == "id" && fields[1] == "title" {
-            let mut out = Vec::with_capacity(idxs.len());
-            for &i in idxs {
-                if i >= self.docs_id.len() {
-                    continue;
-                }
-                out.push(row_id_title(&self.docs_id[i], &self.docs_title[i]));
-            }
-            return Some(out);
-        }
+        
+        // ✅ Hot path: preallocate once, reuse HotDocRow for zero-copy projection
+        let n = self.docs_id.len();
         let mut out = Vec::with_capacity(idxs.len());
+        
         for &i in idxs {
-            if i >= self.docs_id.len() {
+            if i >= n {
                 continue;
             }
-            let mut row = BTreeMap::new();
-            for f in fields {
-                let cell = match f.as_str() {
-                    "id" => Cell::Text(Arc::clone(&self.docs_id[i])),
-                    "title" => Cell::Text(Arc::clone(&self.docs_title[i])),
-                    "layer" => Cell::Text(Arc::clone(&self.docs_layer[i])),
-                    "wing" => Cell::Text(Arc::clone(&self.docs_wing[i])),
-                    _ => Cell::Null,
-                };
-                row.insert(f.clone(), cell);
+            
+            // ✅ Build HotDocRow by reference (no cloning yet)
+            let hot = HotDocRow {
+                id: Arc::clone(&self.docs_id[i]),
+                title: Arc::clone(&self.docs_title[i]),
+                layer: Arc::clone(&self.docs_layer[i]),
+                wing: Arc::clone(&self.docs_wing[i]),
+            };
+            
+            // Convert to Row only when needed
+            match fields.len() {
+                2 if fields[0] == "id" && fields[1] == "title" => {
+                    out.push(row_id_title(&hot.id, &hot.title));
+                }
+                _ => {
+                    // For full projection (id, title, layer, wing), convert hot row
+                    out.push(hot.to_btree());
+                }
             }
-            out.push(row);
         }
         Some(out)
     }
