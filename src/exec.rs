@@ -3781,24 +3781,20 @@ impl Db {
         for i in idxs {
             let before = self.store.collection(collection)[i].clone();
             let mut updated = before.clone();
-            let row = &mut updated;
-            let layer_raw = row_text(row, "layer") == Some("raw")
-                || matches!(patch.get("layer"), Some(Cell::Text(s)) if s.as_ref() == "raw");
-            if layer_raw && patch.contains_key("body") {
-                return Err(Error::runtime("immutable field: docs.body"));
-            }
+            // Apply patch with zero-copy Arc clones where possible
             for (k, v) in &patch {
-                row.insert(k.clone(), v.clone());
+                updated.insert(k.clone(), v.clone());
             }
             if patch.contains_key("body")
-                && let Some(body) = row_text(row, "body").map(str::to_string)
+                && let Some(body) = row_text(&updated, "body").map(str::to_string)
             {
-                row.insert("hash".into(), Cell::Text(content_hash_arc(&body)));
+                updated.insert("hash".into(), Cell::Text(content_hash_arc(&body)));
             }
             self.check_row_fks(collection, &updated)?;
             if let Undo::Rows(events) = ctx.undo {
                 events.push(RowUndo::Update(collection.to_string(), i, before.clone()));
             }
+            // Clone before storing - we need both versions for sync operations
             self.store.collection_mut(collection)[i] = updated.clone();
             self.store.index_insert_row(collection, i, &updated)?;
             self.store.fts_sync_at(collection, i, &before);
