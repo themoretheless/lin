@@ -3677,9 +3677,9 @@ impl Db {
         drop(batch_uris);
         self.maybe_embed_rows(collection, &mut built);
 
-        let mut new_edges = Vec::new();
+        let mut new_edges = Vec::with_capacity(edges.len());
         if let Some(first) = built.first() {
-            let from_id = row_text(first, "id").unwrap_or("").to_string();
+            let from_id = row_text(first, "id").unwrap_or("");
             self.store.edges.reserve(edges.len());
             self.store.edge_keys.reserve(edges.len());
             for e in edges {
@@ -3687,14 +3687,15 @@ impl Db {
                     EdgeTarget::Page(uri) => self
                         .store
                         .find_doc_key(uri)
-                        .and_then(|r| row_text(r, "id").map(|s| s.to_string()))
+                        .and_then(|r| row_text(r, "id"))
+                        .map(|s| s.to_string())
                         .unwrap_or_else(|| uri.clone()),
                     EdgeTarget::Value(v) => value_text(v, now),
                 };
-                let _ = self.store.append_edge_parts(&e.rel, &from_id, &to);
+                let _ = self.store.append_edge_parts(&e.rel, from_id, &to);
                 new_edges.push(Edge {
                     rel: e.rel.clone(),
-                    from: from_id.clone(),
+                    from: from_id.to_string(),
                     to,
                 });
             }
