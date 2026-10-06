@@ -522,20 +522,19 @@ fn add_posting(postings: &mut FxHashMap<String, Vec<usize>>, tok: &str, row_idx:
 }
 
 fn row_tokens<'a>(row: &'a Row, fields: &[String]) -> Vec<std::borrow::Cow<'a, str>> {
-    use std::borrow::Cow;
-    let mut out = Vec::with_capacity(fields.len() * 10); // Предположение среднего количества токенов
+    let mut out = Vec::with_capacity(fields.len() * 10);
     for text in fts_texts(row, fields) {
         if text
             .bytes()
             .all(|b| b.is_ascii() && !b.is_ascii_uppercase())
         {
-            out.extend(text.split_whitespace().map(Cow::Borrowed));
+            out.extend(text.split_whitespace().map(std::borrow::Cow::Borrowed));
         } else {
             let lowercased = text.to_lowercase();
             out.extend(
                 lowercased
                     .split_whitespace()
-                    .map(|t| Cow::Owned(t.to_owned())),
+                    .map(|t| std::borrow::Cow::Owned(t.into())),
             );
         }
     }
