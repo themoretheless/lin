@@ -1,0 +1,255 @@
+diff --git a/src/fts.rs b/src/fts.rs
+index 4465596..a345f1d 100644
+--- a/src/fts.rs
++++ b/src/fts.rs
+@@ -7,6 +7,7 @@
+ //! updates postings incrementally.
+ 
+ use rustc_hash::FxHashMap;
++use std::borrow::Cow;
+ use std::fs::{self, File};
+ use std::io::Read;
+ use std::path::{Path, PathBuf};
+@@ -201,14 +202,17 @@ impl FtsIndex {
+     }
+ 
+     /// Positions where `tok` currently matches.
+-    fn matches(&self, tok: &str) -> Option<Vec<usize>> {
++    fn matches(&self, tok: &str) -> Option<Cow<'_, [usize]>> {
+         let dels = self.dels.get(tok).map(Vec::as_slice).unwrap_or(&[]);
+         let adds = self.adds.get(tok).map(Vec::as_slice).unwrap_or(&[]);
+         if dels.is_empty() && adds.is_empty() {
+-            return self.postings.get(tok).cloned();
++            return self
++                .postings
++                .get(tok)
++                .map(|list| Cow::Borrowed(list.as_slice()));
+         }
+         let base = self.postings.get(tok).map(Vec::as_slice).unwrap_or(&[]);
+-        Some(merge_edits(base, dels, adds))
++        Some(Cow::Owned(merge_edits(base, dels, adds)))
+     }
+ 
+     /// Re-point a row's postings from `from` to `to`. The token set is the row's
+@@ -262,17 +266,17 @@ impl FtsIndex {
+ 
+     /// Union of posting lists for query tokens (any-token match, then residual score).
+     pub fn candidate_idxs(&self, query: &str) -> Vec<usize> {
+-        let mut candidates = Vec::new();
++        let mut candidates: Cow<'_, [usize]> = Cow::Borrowed(&[]);
+         for tok in tokenize(query) {
+             if let Some(list) = self.matches(&tok) {
+                 candidates = if candidates.is_empty() {
+                     list
+                 } else {
+-                    union_sorted(&candidates, &list)
++                    Cow::Owned(union_sorted(&candidates, &list))
+                 };
+             }
+         }
+-        candidates
++        candidates.into_owned()
+     }
+ 
+     pub fn encode(&self, generation: u64, nrows: u64) -> Vec<u8> {
+@@ -602,6 +606,40 @@ mod tests {
+     use super::*;
+     use crate::store::Cell;
+ 
++    #[test]
++    #[ignore = "manual paired performance measurement"]
++    fn posting_optimization_measurement() {
++        use std::{hint::black_box, time::Instant};
++        let fields = vec!["title".into()];
++        let rows = (0..100000)
++            .map(|_| Row::from([("title".into(), Cell::text_arc("common group other"))]))
++            .collect::<Vec<_>>();
++        let mut index = FtsIndex::build(&rows, &fields);
++        for pending in [false, true] {
++            if pending {
++                index.remove_row(17, &rows[17]);
++            }
++            for query in [
++                "common",
++                "common group other",
++                "common common common common common",
++            ] {
++                let expected = (0..rows.len())
++                    .filter(|&i| !pending || i != 17)
++                    .collect::<Vec<_>>();
++                assert_eq!(index.candidate_idxs(query), expected);
++                let start = Instant::now();
++                for _ in 0..100 {
++                    black_box(index.candidate_idxs(black_box(query)));
++                }
++                println!(
++                    "postings {pending} {query}: {} ns",
++                    start.elapsed().as_nanos() / 100
++                );
++            }
++        }
++    }
++
+     #[test]
+     fn snippet_mutations_match_rebuilt_index() {
+         for fields in [vec!["title".into()], vec!["title".into(), "snippet".into()]] {
+@@ -966,7 +1004,7 @@ mod pending_order_tests {
+             index.note_del("wal", pos);
+             expected.remove(&pos);
+             assert_eq!(
+-                index.matches("wal").unwrap_or_default(),
++                index.matches("wal").unwrap_or_default().into_owned(),
+                 expected.iter().copied().collect::<Vec<_>>()
+             );
+         }
+@@ -985,14 +1023,14 @@ mod pending_order_tests {
+                 index.fold_all();
+             }
+             assert_eq!(
+-                index.matches("wal").unwrap_or_default(),
++                index.matches("wal").unwrap_or_default().into_owned(),
+                 expected.iter().copied().collect::<Vec<_>>()
+             );
+         }
+         index.fold_all();
+         let (_, _, decoded) = FtsIndex::decode(&index.encode(2, 900)).unwrap();
+         assert_eq!(
+-            decoded.matches("wal").unwrap_or_default(),
++            decoded.matches("wal").unwrap_or_default().into_owned(),
+             expected.into_iter().collect::<Vec<_>>()
+         );
+     }
+@@ -1021,13 +1059,13 @@ mod pending_order_tests {
+                 expected.remove(&pos);
+             }
+             assert_eq!(
+-                index.matches("wal").unwrap_or_default(),
++                index.matches("wal").unwrap_or_default().into_owned(),
+                 expected.iter().copied().collect::<Vec<_>>()
+             );
+         }
+         index.fold_all();
+         assert_eq!(
+-            index.matches("wal").unwrap_or_default(),
++            index.matches("wal").unwrap_or_default().into_owned(),
+             expected.into_iter().collect::<Vec<_>>()
+         );
+     }
+diff --git a/src/index.rs b/src/index.rs
+index 0fb6b2b..3b5cbc4 100644
+--- a/src/index.rs
++++ b/src/index.rs
+@@ -67,15 +67,15 @@ impl LiveIndex {
+     /// Append-only bulk path: no reverse-key replace (fresh indices).
+     pub fn insert_at_new(&mut self, idx: usize, row: &Row) -> Result<(), String> {
+         let key = self.key_of(row);
+-        if self.def.unique && self.forward.contains_key(&key) {
+-            return Err(format!("unique index {}: duplicate key", self.def.label()));
+-        }
+         use std::collections::btree_map::Entry;
+         match self.forward.entry(key) {
+             Entry::Vacant(v) => {
+                 self.reverse.insert(idx, v.key().clone());
+                 v.insert(vec![idx]);
+             }
++            Entry::Occupied(_) if self.def.unique => {
++                return Err(format!("unique index {}: duplicate key", self.def.label()));
++            }
+             Entry::Occupied(mut o) => {
+                 self.reverse.insert(idx, o.key().clone());
+                 o.get_mut().push(idx);
+@@ -91,6 +91,9 @@ impl LiveIndex {
+         {
+             return Err(format!("unique index {}: duplicate key", self.def.label()));
+         }
++        if self.reverse.get(&idx) == Some(&key) {
++            return Ok(());
++        }
+         if let Some(old) = self.reverse.insert(idx, key.clone())
+             && let Some(vec) = self.forward.get_mut(&old)
+         {
+@@ -444,6 +447,84 @@ fn find_range<'a>(atoms: &[&'a Pred], field: &str) -> Option<(CmpOp, &'a Value)>
+ mod storage_tests {
+     use super::*;
+ 
++    #[test]
++    fn unchanged_and_conflicting_keys_preserve_index_state() {
++        for unique in [false, true] {
++            let mut index = LiveIndex::new(IndexDef {
++                collection: "test".into(),
++                fields: vec!["key".into()],
++                unique,
++            });
++            let a = Row::from([("key".into(), Cell::Int(1))]);
++            let b = Row::from([("key".into(), Cell::Int(2))]);
++            index.insert_at_new(0, &a).unwrap();
++            index
++                .insert_at_new(1, if unique { &b } else { &a })
++                .unwrap();
++            for _ in 0..10 {
++                index.insert_at(0, &a).unwrap();
++            }
++            let mut actual = index.forward[&index.key_of(&a)].clone();
++            actual.sort_unstable();
++            assert_eq!(actual, if unique { vec![0] } else { vec![0, 1] });
++            if unique {
++                let forward = index.forward.clone();
++                let reverse = index.reverse.clone();
++                assert!(index.insert_at(0, &b).is_err());
++                assert!(index.insert_at_new(2, &a).is_err());
++                assert_eq!(index.forward, forward);
++                assert_eq!(index.reverse, reverse);
++            }
++            index
++                .insert_at(0, &Row::from([("key".into(), Cell::Int(3))]))
++                .unwrap();
++            assert_eq!(index.forward[&index.reverse[&0]], vec![0]);
++            index.remove_at(0);
++            assert!(!index.reverse.contains_key(&0));
++        }
++    }
++
++    #[test]
++    #[ignore = "manual paired performance measurement"]
++    fn index_optimization_measurement() {
++        use std::{hint::black_box, time::Instant};
++        for n in [1000, 10000, 100000] {
++            let mut index = LiveIndex::new(IndexDef {
++                collection: "test".into(),
++                fields: vec!["key".into()],
++                unique: false,
++            });
++            let row = Row::from([("key".into(), Cell::Int(1))]);
++            for i in 0..n {
++                index.insert_at_new(i, &row).unwrap();
++            }
++            let start = Instant::now();
++            for _ in 0..1000 {
++                index.insert_at(black_box(n - 1), black_box(&row)).unwrap();
++            }
++            println!("unchanged {n}: {} ns", start.elapsed().as_nanos() / 1000);
++            assert_eq!(index.forward[&index.key_of(&row)].len(), n);
++            assert_eq!(index.reverse.len(), n);
++        }
++        let rows = (0..10000)
++            .map(|i| Row::from([("key".into(), Cell::Int(i))]))
++            .collect::<Vec<_>>();
++        let start = Instant::now();
++        for _ in 0..20 {
++            let mut index = LiveIndex::new(IndexDef {
++                collection: "test".into(),
++                fields: vec!["key".into()],
++                unique: true,
++            });
++            for (i, row) in rows.iter().enumerate() {
++                index.insert_at_new(i, black_box(row)).unwrap();
++            }
++            assert_eq!(index.reverse.len(), rows.len());
++            black_box(index);
++        }
++        println!("unique 10000: {} ns", start.elapsed().as_nanos() / 20);
++    }
++
+     #[test]
+     fn inline_and_spilled_keys_keep_lexicographic_order_and_reverse_updates() {
+         let variants = vec![

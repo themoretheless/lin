@@ -91,6 +91,9 @@ impl LiveIndex {
         {
             return Err(format!("unique index {}: duplicate key", self.def.label()));
         }
+        if self.reverse.get(&idx) == Some(&key) {
+            return Ok(());
+        }
         if let Some(old) = self.reverse.insert(idx, key.clone())
             && let Some(vec) = self.forward.get_mut(&old)
         {
@@ -443,6 +446,84 @@ fn find_range<'a>(atoms: &[&'a Pred], field: &str) -> Option<(CmpOp, &'a Value)>
 #[cfg(test)]
 mod storage_tests {
     use super::*;
+
+    #[test]
+    fn unchanged_and_conflicting_keys_preserve_index_state() {
+        for unique in [false, true] {
+            let mut index = LiveIndex::new(IndexDef {
+                collection: "test".into(),
+                fields: vec!["key".into()],
+                unique,
+            });
+            let a = Row::from([("key".into(), Cell::Int(1))]);
+            let b = Row::from([("key".into(), Cell::Int(2))]);
+            index.insert_at_new(0, &a).unwrap();
+            index
+                .insert_at_new(1, if unique { &b } else { &a })
+                .unwrap();
+            for _ in 0..10 {
+                index.insert_at(0, &a).unwrap();
+            }
+            let mut actual = index.forward[&index.key_of(&a)].clone();
+            actual.sort_unstable();
+            assert_eq!(actual, if unique { vec![0] } else { vec![0, 1] });
+            if unique {
+                let forward = index.forward.clone();
+                let reverse = index.reverse.clone();
+                assert!(index.insert_at(0, &b).is_err());
+                assert!(index.insert_at_new(2, &a).is_err());
+                assert_eq!(index.forward, forward);
+                assert_eq!(index.reverse, reverse);
+            }
+            index
+                .insert_at(0, &Row::from([("key".into(), Cell::Int(3))]))
+                .unwrap();
+            assert_eq!(index.forward[&index.reverse[&0]], vec![0]);
+            index.remove_at(0);
+            assert!(!index.reverse.contains_key(&0));
+        }
+    }
+
+    #[test]
+    #[ignore = "manual paired performance measurement"]
+    fn index_optimization_measurement() {
+        use std::{hint::black_box, time::Instant};
+        for n in [1000, 10000, 100000] {
+            let mut index = LiveIndex::new(IndexDef {
+                collection: "test".into(),
+                fields: vec!["key".into()],
+                unique: false,
+            });
+            let row = Row::from([("key".into(), Cell::Int(1))]);
+            for i in 0..n {
+                index.insert_at_new(i, &row).unwrap();
+            }
+            let start = Instant::now();
+            for _ in 0..1000 {
+                index.insert_at(black_box(n - 1), black_box(&row)).unwrap();
+            }
+            println!("unchanged {n}: {} ns", start.elapsed().as_nanos() / 1000);
+            assert_eq!(index.forward[&index.key_of(&row)].len(), n);
+            assert_eq!(index.reverse.len(), n);
+        }
+        let rows = (0..10000)
+            .map(|i| Row::from([("key".into(), Cell::Int(i))]))
+            .collect::<Vec<_>>();
+        let start = Instant::now();
+        for _ in 0..20 {
+            let mut index = LiveIndex::new(IndexDef {
+                collection: "test".into(),
+                fields: vec!["key".into()],
+                unique: true,
+            });
+            for (i, row) in rows.iter().enumerate() {
+                index.insert_at_new(i, black_box(row)).unwrap();
+            }
+            assert_eq!(index.reverse.len(), rows.len());
+            black_box(index);
+        }
+        println!("unique 10000: {} ns", start.elapsed().as_nanos() / 20);
+    }
 
     #[test]
     fn inline_and_spilled_keys_keep_lexicographic_order_and_reverse_updates() {
