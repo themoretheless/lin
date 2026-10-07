@@ -1756,7 +1756,7 @@ pub fn cols_to_rows(fields: &[String], cols: &[ColData], n: usize) -> Vec<crate:
             let cell = match cols.get(fi) {
                 Some(ColData::Text(v)) => v
                     .get(i)
-                    .map(|s| Cell::text_arc(std::sync::Arc::clone(s)))
+                    .map(|s| Cell::text_arc((*s).clone())) // Zero-copy: deref Arc to str, then Into<Arc<str>> reuses
                     .unwrap_or_else(|| Cell::text_arc("")),
                 Some(ColData::Int(v)) => Cell::Int(v.get(i).copied().unwrap_or(0)),
                 Some(ColData::Float(v)) => Cell::Float(v.get(i).copied().unwrap_or(0.0)),
