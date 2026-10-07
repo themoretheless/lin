@@ -63,6 +63,21 @@ impl Cell {
         }
     }
 
+    /// Zero-copy clone for borrow scenarios: just clone the Arc reference, don't copy data
+    #[inline]
+    pub fn clone_for_borrow(&self) -> Self {
+        match self {
+            Cell::Text(s) => Cell::Text(Arc::clone(s)),
+            Cell::Vec(v) => Cell::Vec(Arc::clone(v)),
+            // Other types are Copy, use standard clone
+            Cell::Int(n) => Cell::Int(*n),
+            Cell::Float(f) => Cell::Float(*f),
+            Cell::Bool(b) => Cell::Bool(*b),
+            Cell::Time(t) => Cell::Time(*t),
+            Cell::Null => Cell::Null,
+        }
+    }
+
     pub fn as_vec(&self) -> Option<&[f32]> {
         match self {
             Cell::Vec(v) => Some(v.as_ref()),

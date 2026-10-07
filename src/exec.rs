@@ -3844,6 +3844,7 @@ impl Db {
         }
         idxs.sort_unstable();
         let out: Vec<Row> = idxs.iter().map(|&i| rows[i].clone()).collect();
+        
         if let Undo::Rows(events) = ctx.undo {
             events.push(RowUndo::Delete(
                 collection.to_string(),
@@ -4210,15 +4211,17 @@ pub(crate) fn emit_join_row(left: &Row, right: Option<&[Cell]>, plan: &[JoinFiel
     for p in plan {
         match p {
             JoinFieldPlan::Left(k) => {
-                out.insert(k.clone(), left.get(k).cloned().unwrap_or(Cell::Null));
+                // Zero-copy: use clone_for_borrow instead of full Row.clone()
+                let cell = left.get(k).map(|c| c.clone_for_borrow()).unwrap_or(Cell::Null);
+                out.insert(k.clone(), cell);
             }
             JoinFieldPlan::Right { out: k, idx } => {
-                out.insert(
-                    k.clone(),
-                    right
-                        .and_then(|r| r.get(*idx).cloned())
-                        .unwrap_or(Cell::Null),
-                );
+                // Zero-copy borrow from right cells array
+                let cell = right
+                    .and_then(|r| r.get(*idx))
+                    .map(|c| c.clone_for_borrow())
+                    .unwrap_or(Cell::Null);
+                out.insert(k.clone(), cell);
             }
         }
     }
