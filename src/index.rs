@@ -84,6 +84,37 @@ impl LiveIndex {
         Ok(())
     }
 
+    /// Batch-only insert for slab operations: compute all keys first, then bulk insert
+    /// to reduce per-row HashMap overhead and key cloning.
+    pub fn insert_slab_batch(
+        &mut self,
+        start: usize,
+        rows: &[Row],
+    ) -> Result<(), String> {
+        // Pre-compute all keys in a single pass
+        let keys: Vec<_> = rows.iter().map(|r| self.key_of(r)).collect();
+        
+        // Bulk insert using pre-computed keys
+        for (i, key) in keys.into_iter().enumerate() {
+            let idx = start + i;
+            if self.def.unique && self.forward.contains_key(&key) {
+                return Err(format!("unique index {}: duplicate key", self.def.label()));
+            }
+            use std::collections::btree_map::Entry;
+            match self.forward.entry(key) {
+                Entry::Vacant(v) => {
+                    self.reverse.insert(idx, v.key().clone());
+                    v.insert(vec![idx]);
+                }
+                Entry::Occupied(mut o) => {
+                    self.reverse.insert(idx, o.key().clone());
+                    o.get_mut().push(idx);
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn insert_key(&mut self, idx: usize, key: IndexKey) -> Result<(), String> {
         if self.def.unique
             && let Some(ids) = self.forward.get(&key)

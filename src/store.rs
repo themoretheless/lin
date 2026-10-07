@@ -2151,12 +2151,21 @@ impl Store {
         if labels.is_empty() {
             return Ok(());
         }
+        
+        // Batch-only path for slab insertions to reduce per-row overhead
         for label in &labels {
             let Some(idx) = self.indexes.get_mut(label) else {
                 continue;
             };
-            for (i, row) in rows.iter().enumerate() {
-                if let Err(e) = idx.insert_at_new(start + i, row) {
+            
+            // Use batch insert when multiple rows
+            if rows.len() > 1 {
+                if let Err(e) = idx.insert_slab_batch(start, rows) {
+                    return Err(Error::runtime(e));
+                }
+            } else {
+                // Fall back to single insert for edge case
+                if let Err(e) = idx.insert_at_new(start, &rows[0]) {
                     return Err(Error::runtime(e));
                 }
             }
