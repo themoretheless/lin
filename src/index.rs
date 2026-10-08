@@ -135,7 +135,8 @@ pub struct IndexKey(pub smallvec::SmallVec<[IndexPart; 2]>);
 #[derive(Debug, Clone)]
 pub struct LiveIndex {
     pub def: IndexDef,
-    pub forward: BTreeMap<IndexKey, Vec<usize>>,
+    /// Either Vec<usize> (standard) or BitSet (for low-cardinality columns)
+    pub forward: BTreeMap<IndexKey, PostingList>,
     pub reverse: FxHashMap<usize, IndexKey>,
     
     /// Bloom filter for fast negative lookups during seek operations
@@ -148,6 +149,139 @@ pub struct IndexUse {
     pub def: IndexDef,
     pub eqs: Vec<(String, Value)>,
     pub range: Option<(String, CmpOp, Value)>,
+}
+
+/// Posting list - either Vec<usize> (standard) or BitSet (for low-cardinality columns)
+#[derive(Debug, Clone, PartialEq)]
+pub enum PostingList {
+    Standard(Vec<usize>),
+    Bitmap(BitSet),
+}
+
+impl PostingList {
+    pub fn new(is_bitmap: bool, capacity: usize) -> Self {
+        if is_bitmap {
+            PostingList::Bitmap(BitSet::new(capacity))
+        } else {
+            PostingList::Standard(Vec::new())
+        }
+    }
+
+    #[inline]
+    pub fn insert(&mut self, pos: usize) {
+        match self {
+            PostingList::Standard(vec) => vec.push(pos),
+            PostingList::Bitmap(set) => set.insert(pos),
+        }
+    }
+
+    #[inline]
+    pub fn remove(&mut self, pos: usize) {
+        match self {
+            PostingList::Standard(vec) => {
+                if let Some(p) = vec.iter().position(|&x| x == pos) {
+                    vec.swap_remove(p);
+                }
+            }
+            PostingList::Bitmap(set) => set.remove(pos),
+        }
+    }
+
+    #[inline]
+    pub fn push_back(&mut self, pos: usize) {
+        match self {
+            PostingList::Standard(vec) => vec.push(pos),
+            PostingList::Bitmap(set) => set.insert(pos),
+        }
+    }
+
+    #[inline]
+    pub fn push(&mut self, pos: usize) {
+        self.push_back(pos);
+    }
+
+    pub fn sort_unstable(&mut self) {
+        match self {
+            PostingList::Standard(vec) => vec.sort_unstable(),
+            PostingList::Bitmap(_) => { /* already sorted */ }
+        }
+    }
+
+    pub fn dedup(&mut self) {
+        match self {
+            PostingList::Standard(vec) => vec.dedup(),
+            PostingList::Bitmap(_) => { /* no duplicates in bitmap */ }
+        }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.count()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.count() == 0
+    }
+
+    pub fn is_bitmap(&self) -> bool {
+        matches!(self, PostingList::Bitmap(_))
+    }
+
+    pub fn count(&self) -> usize {
+        match self {
+            PostingList::Standard(vec) => vec.len(),
+            PostingList::Bitmap(set) => set.count(),
+        }
+    }
+
+    pub fn to_indices(&self) -> Vec<usize> {
+        match self {
+            PostingList::Standard(vec) => vec.clone(),
+            PostingList::Bitmap(set) => set.to_indices(),
+        }
+    }
+
+    pub fn and_assign(&mut self, other: PostingList) {
+        // Both bitmaps: do bitwise AND
+        if let PostingList::Bitmap(self_set) = self {
+            if let PostingList::Bitmap(other_set) = &other {
+                let mut new_set = (*self_set).clone();
+                new_set.and_assign(other_set);
+                *self = PostingList::Bitmap(new_set);
+                return;
+            }
+        }
+        
+        // Otherwise: standard intersection
+        let self_indices = self.to_indices();
+        let other_indices = other.to_indices();
+        let result = self_indices.into_iter().filter(|i| other_indices.contains(i)).collect();
+        *self = PostingList::Standard(result);
+    }
+
+    pub fn or_assign(&mut self, other: PostingList) {
+        // Both bitmaps: do bitwise OR
+        if let PostingList::Bitmap(self_set) = self {
+            if let PostingList::Bitmap(other_set) = &other {
+                let mut new_set = (*self_set).clone();
+                new_set.or_assign(other_set);
+                *self = PostingList::Bitmap(new_set);
+                return;
+            }
+        }
+        
+        // Otherwise: standard union
+        let mut self_indices = self.to_indices();
+        let other_indices = other.to_indices();
+        for i in other_indices {
+            if !self_indices.contains(&i) {
+                self_indices.push(i);
+            }
+        }
+        self_indices.sort_unstable();
+        self_indices.dedup();
+        *self = PostingList::Standard(self_indices);
+    }
 }
 
 impl LiveIndex {
@@ -225,10 +359,22 @@ impl LiveIndex {
             return Err(format!("unique index {}: duplicate key", self.def.label()));
         }
         use std::collections::btree_map::Entry;
+        
+        // Check if this is a bitmap index (for boolean fields)
+        let is_bitmap = self.def.bitmap_card_field.as_ref().map_or(false, |field| {
+            if let Some(cell) = row.get(field) {
+                matches!(cell, Cell::Bool(_))
+            } else {
+                false
+            }
+        });
+        
         match self.forward.entry(key) {
             Entry::Vacant(v) => {
                 self.reverse.insert(idx, v.key().clone());
-                v.insert(vec![idx]);
+                let mut posting = PostingList::new(is_bitmap, 1 << 16);
+                posting.push(idx);
+                v.insert(posting);
             }
             Entry::Occupied(mut o) => {
                 self.reverse.insert(idx, o.key().clone());
@@ -265,15 +411,27 @@ impl LiveIndex {
         let keys: Vec<_> = keyed_rows.iter().map(|(_, r)| self.key_of(r)).collect();
         
         // Bulk insert using pre-computed keys
-        for ((orig_idx, _), key) in keyed_rows.iter().zip(keys.into_iter()) {
+        for ((orig_idx, row), key) in keyed_rows.iter().zip(keys.into_iter()) {
             if self.def.unique && self.forward.contains_key(&key) {
                 return Err(format!("unique index {}: duplicate key", self.def.label()));
             }
             use std::collections::btree_map::Entry;
+            
+            // Check if this is a bitmap index (for boolean fields)
+            let is_bitmap = self.def.bitmap_card_field.as_ref().map_or(false, |field| {
+                if let Some(cell) = row.get(field) {
+                    matches!(cell, Cell::Bool(_))
+                } else {
+                    false
+                }
+            });
+            
             match self.forward.entry(key) {
                 Entry::Vacant(v) => {
                     self.reverse.insert(*orig_idx, v.key().clone());
-                    v.insert(vec![*orig_idx]);
+                    let mut posting = PostingList::new(is_bitmap, 1 << 16);
+                    posting.push(*orig_idx);
+                    v.insert(posting);
                 }
                 Entry::Occupied(mut o) => {
                     self.reverse.insert(*orig_idx, o.key().clone());
@@ -287,24 +445,45 @@ impl LiveIndex {
     fn insert_key(&mut self, idx: usize, key: IndexKey) -> Result<(), String> {
         if self.def.unique
             && let Some(ids) = self.forward.get(&key)
-            && ids.iter().any(|&x| x != idx)
+            && ids.to_indices().iter().any(|&x| x != idx)
         {
             return Err(format!("unique index {}: duplicate key", self.def.label()));
         }
         if self.reverse.get(&idx) == Some(&key) {
             return Ok(());
         }
+        
+        // Check if this is a bitmap index (low cardinality column)
+        let is_bitmap = self.def.bitmap_card_field.as_ref().map_or(false, |field| {
+            if let Some(cell) = self.reverse.get(&idx).and_then(|k| k.0.first()) {
+                matches!(cell, IndexPart::Bool(_))
+            } else {
+                false
+            }
+        });
+        
         if let Some(old) = self.reverse.insert(idx, key.clone())
             && let Some(vec) = self.forward.get_mut(&old)
         {
-            if let Some(p) = vec.iter().position(|&x| x == idx) {
-                vec.swap_remove(p);
-            }
-            if vec.is_empty() {
+            vec.remove(idx);
+            if vec.count() == 0 {
                 self.forward.remove(&old);
             }
         }
-        self.forward.entry(key).or_default().push(idx);
+        
+        // Use BitSet for boolean fields (≤2 distinct values)
+        match self.forward.entry(key) {
+            std::collections::btree_map::Entry::Vacant(v) => {
+                self.reverse.insert(idx, v.key().clone());
+                let mut posting = PostingList::new(is_bitmap, 1 << 16); // Support up to 65K rows
+                posting.insert(idx);
+                v.insert(posting);
+            }
+            std::collections::btree_map::Entry::Occupied(mut o) => {
+                self.reverse.insert(idx, o.key().clone());
+                o.get_mut().insert(idx);
+            }
+        }
         Ok(())
     }
 
@@ -312,10 +491,8 @@ impl LiveIndex {
         if let Some(key) = self.reverse.remove(&idx)
             && let Some(vec) = self.forward.get_mut(&key)
         {
-            if let Some(p) = vec.iter().position(|&x| x == idx) {
-                vec.swap_remove(p);
-            }
-            if vec.is_empty() {
+            vec.remove(idx);
+            if vec.count() == 0 {
                 self.forward.remove(&key);
             }
         }
@@ -381,7 +558,7 @@ impl LiveIndex {
         let (start, end) = self.bounds(use_, now);
         self.forward
             .range((start, end))
-            .map(|(_, idxs)| idxs.len())
+            .map(|(_, list)| list.count())
             .sum()
     }
 
@@ -395,8 +572,8 @@ impl LiveIndex {
         let (start, end) = self.bounds(use_, now);
         
         let mut count = 0;
-        for (_, idxs) in self.forward.range((start, end)) {
-            count += idxs.len();
+        for (_, list) in self.forward.range((start, end)) {
+            count += list.count();
             if count > threshold {
                 return None; // Exceeded threshold
             }
@@ -423,8 +600,8 @@ impl LiveIndex {
         }
         
         let mut out = Vec::new();
-        for (_, idxs) in self.forward.range((start, end)) {
-            out.extend_from_slice(idxs);
+        for (_, list) in self.forward.range((start, end)) {
+            out.extend_from_slice(&list.to_indices());
         }
         out
     }
@@ -443,8 +620,8 @@ impl LiveIndex {
             .map(|use_| {
                 let (start, end) = self.bounds(use_, now);
                 let mut out = Vec::new();
-                for (_, idxs) in self.forward.range((start, end)) {
-                    out.extend_from_slice(idxs);
+                for (_, list) in self.forward.range((start, end)) {
+                    out.extend_from_slice(&list.to_indices());
                 }
                 out
             })
@@ -506,6 +683,102 @@ fn value_part(v: &Value, now: i64) -> IndexPart {
         Value::Now => IndexPart::Time(now),
         Value::NowMinus(d) => IndexPart::Time(now - d.as_millis()),
         Value::Duration(d) => numeric_part(d.as_millis() as f64, Some(d.as_millis())),
+    }
+}
+
+/// Simple bitset using Vec<u64> - no external dependency required
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BitSet {
+    bits: Vec<u64>,
+    capacity: usize,
+}
+
+impl BitSet {
+    pub fn new(capacity: usize) -> Self {
+        let num_words = (capacity + 63) / 64;
+        Self {
+            bits: vec![0u64; num_words],
+            capacity,
+        }
+    }
+
+    #[inline]
+    pub fn insert(&mut self, pos: usize) {
+        if pos >= self.capacity {
+            return;
+        }
+        let word_idx = pos >> 6; // pos / 64
+        let bit_idx = pos & 63;   // pos % 64
+        self.bits[word_idx] |= 1u64 << bit_idx;
+    }
+
+    #[inline]
+    pub fn remove(&mut self, pos: usize) {
+        if pos >= self.capacity {
+            return;
+        }
+        let word_idx = pos >> 6;
+        let bit_idx = pos & 63;
+        self.bits[word_idx] &= !(1u64 << bit_idx);
+    }
+
+    #[inline]
+    pub fn contains(&self, pos: usize) -> bool {
+        if pos >= self.capacity {
+            return false;
+        }
+        let word_idx = pos >> 6;
+        let bit_idx = pos & 63;
+        (self.bits[word_idx] & (1u64 << bit_idx)) != 0
+    }
+
+    #[inline]
+    pub fn count(&self) -> usize {
+        self.bits.iter().map(|w| w.count_ones() as usize).sum()
+    }
+
+    /// Convert to Vec<usize> of set positions
+    pub fn to_indices(&self) -> Vec<usize> {
+        let mut out = Vec::with_capacity(self.count());
+        for (word_idx, &word) in self.bits.iter().enumerate() {
+            if word == 0 {
+                continue;
+            }
+            let base_pos = word_idx << 6;
+            for bit_idx in 0..64 {
+                if (word & (1u64 << bit_idx)) != 0 {
+                    let pos = base_pos + bit_idx as usize;
+                    if pos < self.capacity {
+                        out.push(pos);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Bitwise AND (intersection) - modifies self
+    pub fn and_assign(&mut self, other: &BitSet) {
+        for (a, b) in self.bits.iter_mut().zip(other.bits.iter()) {
+            *a &= b;
+        }
+    }
+
+    /// Bitwise OR (union) - modifies self
+    pub fn or_assign(&mut self, other: &BitSet) {
+        for (a, b) in self.bits.iter_mut().zip(other.bits.iter()) {
+            *a |= b;
+        }
+    }
+
+    /// Check if any bits are set
+    pub fn is_empty(&self) -> bool {
+        self.bits.iter().all(|&w| w == 0)
+    }
+
+    /// Check if all bits would be within capacity
+    pub fn can_hold(&self, pos: usize) -> bool {
+        pos < self.capacity
     }
 }
 
@@ -726,7 +999,7 @@ mod storage_tests {
             }
             let mut actual = index.forward[&index.key_of(&a)].clone();
             actual.sort_unstable();
-            assert_eq!(actual, if unique { vec![0] } else { vec![0, 1] });
+            assert_eq!(actual.to_indices(), if unique { vec![0] } else { vec![0, 1] });
             if unique {
                 let forward = index.forward.clone();
                 let reverse = index.reverse.clone();
@@ -738,7 +1011,7 @@ mod storage_tests {
             index
                 .insert_at(0, &Row::from([("key".into(), Cell::Int(3))]))
                 .unwrap();
-            assert_eq!(index.forward[&index.reverse[&0]], vec![0]);
+            assert_eq!(index.forward[&index.reverse[&0]], PostingList::Standard(vec![0]));
             index.remove_at(0);
             assert!(!index.reverse.contains_key(&0));
         }
@@ -834,7 +1107,7 @@ mod storage_tests {
             index.remove_at(7);
             assert_eq!(index.forward.len(), 1);
             assert_eq!(index.reverse.len(), 1);
-            assert_eq!(index.forward.get(&index.key_of(&row)), Some(&vec![8]));
+            assert_eq!(index.forward.get(&index.key_of(&row)), Some(&PostingList::Standard(vec![8])));
         }
     }
 }
