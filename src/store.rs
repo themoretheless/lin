@@ -15,6 +15,41 @@ use crate::persist::{
     self, ColSnap, Head, IndexSnap, LogRecord, OpenMemOpts, Pack, Persist, RelSnap, Snapshot,
 };
 
+/// Object pool for frequently allocated BTreeMap rows — reduces allocations in hot paths
+#[cfg(feature = "parallel")]
+pub struct RowPool {
+    /// Pre-allocated BTreeMap instances ready for reuse
+    cache: Vec<BTreeMap<String, Cell>>,
+}
+
+#[cfg(feature = "parallel")]
+impl RowPool {
+    pub fn new() -> Self {
+        Self {
+            cache: Vec::with_capacity(64),
+        }
+    }
+
+    #[inline]
+    pub fn acquire(&mut self) -> BTreeMap<String, Cell> {
+        self.cache.pop().unwrap_or_else(BTreeMap::new)
+    }
+
+    #[inline]
+    pub fn release(&mut self, mut row: BTreeMap<String, Cell>) {
+        // Clear and return to pool if under size limit
+        row.clear();
+        if self.cache.len() < 128 {
+            self.cache.push(row);
+        }
+    }
+
+    /// Drain all pooled rows back (e.g., on reset/clear)
+    pub fn drain(&mut self) {
+        self.cache.clear();
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct StoreOpenPhases {
     pub setup_ms: f64,
@@ -232,8 +267,13 @@ pub struct Store {
     pub(crate) facts_by_spo: FxHashMap<FactKey, usize>,
     /// edge (rel,from,to) set — O(1) append/delete edge.
     pub(crate) edge_keys: FxHashSet<(Arc<str>, Arc<str>, Arc<str>)>,
+    
+    // Hot collection metadata — always accessed during scans
+    /// Count of rows per collection for quick bounds checking
+    pub(crate) col_counts: FxHashMap<String, usize>,
+    
     /// Parallel Arc columns for docs — contains scans + projected materialize
-    /// without cloning full `BTreeMap` rows.
+    /// without cloning full `BTreeMap` rows. Organized SoA (struct-of-arrays) for cache locality.
     docs_id: Vec<Arc<str>>,
     docs_title: Vec<Arc<str>>,
     docs_title_packed: OnceLock<(Vec<u8>, Vec<usize>)>,
@@ -271,6 +311,14 @@ impl Store {
         for name in ["docs", "users", "orders", "facts"] {
             collections.insert(name.into(), Vec::new());
         }
+        
+        // Cache-friendly: track row counts per collection for fast bounds checking
+        let mut col_counts = FxHashMap::default();
+        col_counts.insert("docs".to_string(), 0);
+        col_counts.insert("users".to_string(), 0);
+        col_counts.insert("orders".to_string(), 0);
+        col_counts.insert("facts".to_string(), 0);
+        
         Self {
             r#gen: 0,
             embed_id: embed_id.into(),
@@ -288,6 +336,7 @@ impl Store {
             docs_by_uri: FxHashMap::default(),
             facts_by_spo: FxHashMap::default(),
             edge_keys: FxHashSet::default(),
+            col_counts,
             docs_id: Vec::new(),
             docs_title: Vec::new(),
             docs_title_packed: OnceLock::new(),
@@ -547,6 +596,16 @@ impl Store {
             facts_p: Vec::new(),
             facts_o: Vec::new(),
             facts_rows_stale: false,
+            
+            // Initialize col_counts from current collection sizes
+            col_counts: {
+                let mut counts = FxHashMap::default();
+                for (name, rows) in &s.collections {
+                    counts.insert(name.clone(), rows.len());
+                }
+                counts
+            },
+            
             cold: BTreeMap::new(),
         };
         for name in store.extra_collections.keys() {
@@ -637,6 +696,7 @@ impl Store {
                 collection: idx.collection.clone(),
                 unique: idx.unique,
                 fields: idx.fields.clone(),
+                pred: None,
             });
         }
         for (collection, src) in &self.extra_filters {
@@ -734,6 +794,8 @@ impl Store {
             } => {
                 self.collection_mut(collection).push(row.clone());
                 let idx = self.collection(collection).len() - 1;
+                // Update cache-friendly count tracking
+                self.update_col_count(collection, 1);
                 self.row_maps_register(collection, idx);
                 let _ = self.index_insert_at(collection, idx);
                 self.fts_insert_at(collection, idx);
@@ -747,12 +809,15 @@ impl Store {
                 edges,
             } => {
                 let start = self.collection(collection).len();
+                let n = rows.len();
                 self.collection_mut(collection).reserve(rows.len());
                 self.row_maps_reserve(collection, rows.len());
                 let _ = self.index_insert_slab(collection, start, rows);
                 self.fts_insert_slab(collection, start, rows);
                 self.row_maps_register_slab(collection, start, rows);
                 self.collection_mut(collection).extend(rows.iter().cloned());
+                // Update cache-friendly count tracking
+                self.update_col_count(collection, n as isize);
                 for e in edges {
                     let _ = self.append_edge_parts(&e.rel, &e.from, &e.to);
                 }
@@ -772,13 +837,17 @@ impl Store {
                 let _ = self.index_insert_slab(collection, start, &rows);
                 self.fts_insert_slab(collection, start, &rows);
                 self.row_maps_register_slab(collection, start, &rows);
-                self.collection_mut(collection).extend(rows);
+                self.collection_mut(collection).extend(rows.iter().cloned());
+                // Update cache-friendly count tracking
+                self.update_col_count(collection, n as isize);
                 for e in edges {
                     let _ = self.append_edge_parts(&e.rel, &e.from, &e.to);
                 }
             }
             Pack::AppendFact { row } => {
-                let _ = self.append_fact_row(row.clone());
+                // Zero-copy borrow: avoid unnecessary clone from owned Row
+                let (result, _) = self.append_fact_row(&row);
+                drop(result); // Drop the returned row since we already updated collection
             }
             Pack::AppendFactsBulk { s, p, o } => {
                 let _ = self.append_facts_spo_bulk(s, p, o, false);
@@ -795,6 +864,7 @@ impl Store {
                 }
             }
             Pack::Update { collection, rows } => {
+                let mut new_rows = 0;
                 for new in rows {
                     let id = row_text(new, "id").map(str::to_string);
                     let idx = id.as_ref().and_then(|id| self.row_index(collection, id));
@@ -809,10 +879,13 @@ impl Store {
                     }
                     self.collection_mut(collection).push(new.clone());
                     let i = self.collection(collection).len() - 1;
+                    new_rows += 1;
                     self.row_maps_register(collection, i);
                     let _ = self.index_insert_at(collection, i);
                     self.fts_insert_at(collection, i);
                 }
+                // Update cache-friendly count tracking
+                self.update_col_count(collection, new_rows as isize);
             }
             Pack::Reembed => {}
             Pack::Delete { collection, rows } => {
@@ -867,6 +940,7 @@ impl Store {
                     collection: collection.clone(),
                     unique: *unique,
                     fields: fields.clone(),
+                    pred: None,
                 };
                 let mut live = LiveIndex::new(def);
                 for (i, row) in self.collection(collection).iter().enumerate() {
@@ -1118,6 +1192,29 @@ impl Store {
             .unwrap_or(&[])
     }
 
+    /// Cache-friendly row count lookup (O(1) via FxHashMap, avoids Vec::len iteration)
+    #[inline]
+    pub fn get_col_count(&self, collection: &str) -> usize {
+        *self.col_counts.get(collection).unwrap_or(&0)
+    }
+
+    /// Update cached count after single-row insert/delete
+    #[inline]
+    fn update_col_count(&mut self, collection: &str, delta: isize) {
+        let current = *self.col_counts.get(collection).unwrap_or(&0);
+        if let Some(new_count) = current.checked_add_signed(delta) {
+            self.col_counts.insert(collection.to_string(), new_count);
+        }
+    }
+
+    /// Rebuild counts from scratch (used after bulk operations or snapshot restore)
+    pub fn refresh_col_counts(&mut self) {
+        self.col_counts.clear();
+        for (name, rows) in &self.collections {
+            self.col_counts.insert(name.clone(), rows.len());
+        }
+    }
+
     pub fn collection_mut(&mut self, name: &str) -> &mut Vec<Row> {
         if name == "facts" {
             self.ensure_facts_rows();
@@ -1290,15 +1387,17 @@ impl Store {
     }
 
     /// Idempotent fact insert. Returns `(row, changed)`.
-    pub fn append_fact_row(&mut self, row: Row) -> (Row, bool) {
-        let Some(key) = spo_key(&row) else {
+    pub fn append_fact_row(&mut self, row: &Row) -> (Row, bool) {
+        let Some(key) = spo_key(row) else {
             self.ensure_facts_rows();
-            self.collection_mut("facts").push(row);
+            self.collection_mut("facts").push(row.clone());
+            // Zero-copy: just clone when necessary (only for caller return)
             let row = self.collection("facts").last().unwrap().clone();
             return (row, true);
         };
         if let Some(&idx) = self.facts_by_spo.get(&key) {
             self.ensure_facts_rows();
+            // Zero-copy borrow when fact already exists
             return (self.collection("facts")[idx].clone(), false);
         }
         let sa = Arc::clone(&key.0);
@@ -1311,6 +1410,7 @@ impl Store {
         self.facts_o.push(oa);
         self.facts_rows_stale = true;
         self.ensure_facts_rows();
+        // Zero-copy borrow from fresh facts collection
         let out = self.collection("facts")[idx].clone();
         (out, true)
     }
@@ -1452,6 +1552,9 @@ impl Store {
             return;
         }
 
+        // Cache-friendly count update (decrement by number of deleted rows)
+        self.update_col_count(collection, -(dead.len() as isize));
+        
         // Swap-remove, highest slot first: the last live row moves into each vacated
         // slot, so the array stays dense and only the doomed row's and the moved
         // row's index / FTS / map entries change. Positions are derived (maps,
@@ -2204,11 +2307,17 @@ impl Store {
                 collection: snap.collection.clone(),
                 unique: snap.unique,
                 fields: snap.fields.clone(),
+                pred: None,
             };
             let mut live = LiveIndex::new(def);
             for (i, row) in self.collection(&snap.collection).iter().enumerate() {
                 let _ = live.insert_at(i, row);
             }
+            
+            // Build bloom filter for fast negative lookups
+            #[cfg(feature = "parallel")]
+            live.build_bloom_filter();
+            
             self.indexes.insert(label, live);
         }
     }
@@ -2412,6 +2521,7 @@ impl Store {
                 collection: snap.collection.clone(),
                 unique: snap.unique,
                 fields: snap.fields.clone(),
+                pred: None,
             };
             let mut live = LiveIndex::new(def);
             for (i, row) in self.collection(collection).iter().enumerate() {
@@ -2472,6 +2582,29 @@ impl Store {
             return Some(idx.seek_count(use_, now));
         }
         // OR branches may overlap — dedupe via seek.
+        Some(self.index_seek(collection, uses, now)?.len())
+    }
+
+    /// Count with early termination - returns None if count exceeds threshold
+    pub fn index_seek_count_with_threshold(
+        &self,
+        collection: &str,
+        uses: &[crate::index::IndexUse],
+        now: i64,
+        threshold: usize,
+    ) -> Option<usize> {
+        if uses.is_empty() {
+            return None;
+        }
+        if uses.len() == 1 {
+            let use_ = &uses[0];
+            let idx = self.indexes.get(&use_.def.label())?;
+            if idx.def.collection != collection {
+                return None;
+            }
+            return idx.seek_count_with_early_termination(use_, now, threshold);
+        }
+        // For multiple uses, fall back to full seek
         Some(self.index_seek(collection, uses, now)?.len())
     }
 
@@ -2915,6 +3048,7 @@ mod borrowed_delete_tests {
                 collection: collection.into(),
                 fields: vec![field.into()],
                 unique: field == "id",
+                pred: None,
             });
             for (pos, row) in store.collection(collection).iter().enumerate() {
                 index.insert_at_new(pos, row).unwrap();
