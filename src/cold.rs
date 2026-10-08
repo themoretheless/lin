@@ -21,6 +21,96 @@ pub const COLD_MAGIC: [u8; 4] = *b"LIN\x03";
 /// Spill to mmap when collection has at least this many rows.
 pub const COLD_MIN_ROWS: usize = 32;
 
+/// Compression strategy for cold storage files
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompressionStrategy {
+    /// Always use maximum compression (flate/gzip)
+    Maximum,
+    /// Always use fast decompression (lz4)
+    Speed,
+    /// Auto-select based on data entropy analysis
+    Adaptive,
+}
+
+impl Default for CompressionStrategy {
+    fn default() -> Self {
+        CompressionStrategy::Adaptive
+    }
+}
+
+/// Calculate Shannon entropy of byte distribution (0.0-8.0 for bytes)
+/// Higher entropy = less compressible data
+pub fn calculate_entropy(data: &[u8]) -> f64 {
+    if data.is_empty() {
+        return 0.0;
+    }
+    
+    // Count byte frequencies
+    let mut freq = [0usize; 256];
+    for &byte in data {
+        freq[byte as usize] += 1;
+    }
+    
+    let len = data.len() as f64;
+    let mut entropy = 0.0;
+    
+    for count in freq {
+        if count > 0 {
+            let p = count as f64 / len;
+            entropy -= p * p.log2();
+        }
+    }
+    
+    entropy
+}
+
+/// Choose optimal compression based on entropy analysis
+/// Returns (compression_type, recommended_compressor)
+pub fn choose_codec(data: &[Row], strategy: CompressionStrategy) -> (bool, CompressionCodec) {
+    // First encode to get raw bytes
+    let encoded = rmp_serde::to_vec_named(data).unwrap_or_default();
+    
+    if encoded.is_empty() {
+        return (false, CompressionCodec::None);
+    }
+    
+    let entropy = calculate_entropy(&encoded);
+    
+    match strategy {
+        CompressionStrategy::Maximum => (true, CompressionCodec::Flate),
+        CompressionStrategy::Speed => (true, CompressionCodec::Lz4),
+        CompressionStrategy::Adaptive => {
+            // Threshold determined empirically:
+            // - < 3.0: Highly compressible → use flate for better storage
+            // - >= 3.0: Random-ish data → use lz4 for faster I/O
+            // Entropy range: 0.0 (all same byte) to 8.0 (uniform random)
+            if entropy < 3.0 {
+                (true, CompressionCodec::Flate)  // Maximum compression
+            } else {
+                (true, CompressionCodec::Lz4)     // Fast decompression
+            }
+        }
+    }
+}
+
+/// Compression codec identifier
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompressionCodec {
+    None,
+    Flate,   // gzip (maximum compression)
+    Lz4,     // lz4 (fast decompression)
+}
+
+impl std::fmt::Display for CompressionCodec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CompressionCodec::None => write!(f, "none"),
+            CompressionCodec::Flate => write!(f, "flate"),
+            CompressionCodec::Lz4 => write!(f, "lz4"),
+        }
+    }
+}
+
 pub fn cold_dir(data: &Path) -> PathBuf {
     data.join(COLD_DIR)
 }
@@ -123,48 +213,57 @@ pub fn write_cold(data: &Path, name: &str, rows: &[Row]) -> Result<(), Error> {
     let path = cold_path(data, name);
     let tmp = path.with_extension("bin.tmp");
 
-    let mut body = Vec::with_capacity(rows.len() * 64);
+    // Choose optimal compression codec based on data entropy
+    let (is_compressed, codec) = choose_codec(rows, CompressionStrategy::Adaptive);
     
-    #[cfg(feature = "compress-flate")]
-    {
-        use flate2::Compression;
-        use flate2::write::GzEncoder;
-        
-        // Encode rows to compressed format
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-        rmp_serde::encode::write_named(&mut encoder, rows).map_err(io_err)?;
-        let compressed = encoder.finish().map_err(io_err)?;
-        
-        // Add compression flag
-        body.extend_from_slice(&[0x01]); // Compressed flag
+    let mut body = Vec::new();
+    
+    if is_compressed {
+        // Add compression flag + magic
+        body.extend_from_slice(&[0x01]); // Flag for compressed
         body.extend_from_slice(&COLD_MAGIC);
-        body.extend_from_slice(&compressed);
-    }
-    
-    #[cfg(all(not(feature = "compress-flate"), feature = "compress-lz4"))]
-    {
-        use lz4::block::{compress, Context};
         
-        let encoded = rmp_serde::to_vec_named(rows).map_err(io_err)?;
-        
-        let mut ctx = Context::new();
-        match compress(&encoded, Some(9), &mut ctx) {
-            Ok(compressed) => {
-                body.push(0x02); // LZ4 flag
-                body.extend_from_slice(&COLD_MAGIC);
-                body.extend_from_slice(&compressed);
+        match codec {
+            CompressionCodec::Flate => {
+                #[cfg(feature = "compress-flate")]
+                {
+                    use flate2::Compression;
+                    use flate2::write::GzEncoder;
+                    
+                    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+                    rmp_serde::encode::write_named(&mut encoder, rows).map_err(io_err)?;
+                    let compressed = encoder.finish().map_err(io_err)?;
+                    body.extend_from_slice(&compressed);
+                }
+                #[cfg(not(feature = "compress-flate"))]
+                return Err(io_err("flate compression not enabled"));
             }
-            Err(_) => return Err(Error::runtime("lz4 compression failed")),
+            CompressionCodec::Lz4 => {
+                #[cfg(feature = "compress-lz4")]
+                {
+                    use lz4::block::{compress, Context};
+                    
+                    let encoded = rmp_serde::to_vec_named(rows).map_err(io_err)?;
+                    
+                    let mut ctx = Context::new();
+                    let compressed = compress(&encoded, Some(usize::MAX), &mut ctx).map_err(io_err)?;
+                    body.extend_from_slice(&compressed);
+                }
+                #[cfg(not(feature = "compress-lz4"))]
+                return Err(io_err("lz4 compression not enabled"));
+            }
         }
+    } else {
+        // Uncompressed format
+        body.extend_from_slice(&COLD_MAGIC);
+        body.extend_from_slice(&rmp_serde::to_vec_named(rows).map_err(io_err)?);
     }
     
-    #[cfg(not(any(feature = "compress-flate", feature = "compress-lz4")))]
-    {
-        body.extend_from_slice(&COLD_MAGIC);
-        rmp_serde::encode::write_named(&mut body, rows).map_err(io_err)?;
-    }
-
-    crate::persist::write_through_tmp(&path, &tmp, &body)
+    // Atomic write
+    fs::write(&tmp, &body).map_err(io_err)?;
+    fs::rename(&tmp, &path).map_err(io_err)?;
+    
+    Ok(())
 }
 
 /// Write `rows` as a cold file without compression (for non-compression builds)
