@@ -5,6 +5,7 @@
 - [Content Hash Caching](content-hash-caching.md) — thread-local memoization of FNV-1a hashes to avoid redundant computations on inserts/updates  
 - [Cache-Friendly Layout](cache-friendly-layout.md) — SoA columnar arrays and fast O(1) count tracking via col_counts
 - [Row Pooling](row-pooling.md) — global BTreeMap object pool for batch operations to reduce heap allocations
+- [SIMD-FTS ASCII](simd-fts-ascii.md) — auto-vectorized lowercase conversion using rustc's make_ascii_lowercase() intrinsics
 
 ## Implementation Patterns
 - [Feature Flags Pattern](feature-flags.md) — parallel, compress-flate, compress-lz4, compress-wal gated optional dependencies
