@@ -22,7 +22,149 @@ thread_local! {
         Mutex::new(FxHashMap::default());
 }
 
+/// Query result cache with LRU eviction policy
+/// Caches intermediate results for repeated queries to avoid recomputation
+thread_local! {
+    static QUERY_CACHE: Cache = Cache::new();
+}
+
 use crate::ast::*;
+
+/// LRU cache entry for cached query results
+struct CacheEntry {
+    /// Result rows stored as Vec<Row>
+    rows: Vec<Row>,
+    /// Last access timestamp for LRU tracking
+    last_access: std::time::Instant,
+}
+
+/// Simple LRU cache implementation using FxHashMap + Vec for order tracking
+pub struct Cache {
+    /// Cache key → entry mapping
+    entries: FxHashMap<String, CacheEntry>,
+    /// LRU order: head is most recently used
+    lru_order: Vec<String>,
+    /// Maximum number of cache entries
+    max_entries: usize,
+    /// Current cache size in bytes (estimate)
+    size_bytes: usize,
+}
+
+impl Cache {
+    const DEFAULT_MAX_ENTRIES: usize = 256;
+    
+    fn new() -> Self {
+        Self {
+            entries: FxHashMap::default(),
+            lru_order: Vec::with_capacity(Self::DEFAULT_MAX_ENTRIES),
+            max_entries: Self::DEFAULT_MAX_ENTRIES,
+            size_bytes: 0,
+        }
+    }
+
+    /// Get a cached result, moving it to front of LRU list if found
+    pub fn get(&mut self, key: &str) -> Option<&Vec<Row>> {
+        // Extract key first to avoid double-mutable-borrow issues
+        let key_string = key.to_string();
+        
+        if let Some(entry) = self.entries.get_mut(&key_string) {
+            // Update access time and move to front of LRU list
+            entry.last_access = std::time::Instant::now();
+            drop(entry); // Drop the mutable reference before calling evict_to_front
+            self.evict_to_front(&key_string);
+            return self.entries.get(&key_string).map(|e| &e.rows);
+        }
+        None
+    }
+
+    /// Insert a new result into the cache
+    pub fn insert(&mut self, key: String, rows: Vec<Row>) {
+        let estimated_size = rows.len() * 1024; // Rough estimate: ~1KB per row
+        
+        // Evict if at capacity
+        while self.size_bytes + estimated_size > self.max_bytes() {
+            self.evict_lru();
+        }
+
+        // Remove old entry if exists
+        if let Some(old_entry) = self.entries.get(&key) {
+            self.size_bytes -= old_entry.rows.len() * 1024;
+            self.lru_order.retain(|k| k != &key);
+        }
+
+        // Insert new entry
+        let entry = CacheEntry {
+            rows: rows.clone(),
+            last_access: std::time::Instant::now(),
+        };
+        
+        self.entries.insert(key.clone(), entry);
+        self.lru_order.push(key);
+        self.size_bytes += estimated_size;
+    }
+
+    /// Check if a key exists in cache (without updating LRU)
+    pub fn contains(&self, key: &str) -> bool {
+        self.entries.contains_key(key)
+    }
+
+    /// Clear the entire cache
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.lru_order.clear();
+        self.size_bytes = 0;
+    }
+
+    /// Get current cache statistics
+    pub fn stats(&self) -> (usize, usize) {
+        (self.entries.len(), self.size_bytes)
+    }
+
+    /// Calculate maximum allowed bytes based on entry count limit
+    fn max_bytes(&self) -> usize {
+        self.max_entries * 1024 * 1024 // ~1MB per entry budget
+    }
+
+    /// Evict least recently used entry
+    fn evict_lru(&mut self) {
+        if self.lru_order.is_empty() {
+            return;
+        }
+
+        // Find oldest entry by scanning all (simple O(n) approach)
+        // Could be optimized with doubly-linked list for O(1) removal
+        let oldest_idx = self.find_oldest_index();
+        if let Some(oldest_key) = self.lru_order.get(oldest_idx).cloned() {
+            if let Some(entry) = self.entries.remove(&oldest_key) {
+                self.size_bytes -= entry.rows.len() * 1024;
+            }
+            self.lru_order.remove(oldest_idx);
+        }
+    }
+
+    /// Find index of oldest entry in LRU list
+    fn find_oldest_index(&self) -> usize {
+        self.lru_order.iter().enumerate()
+            .min_by_key(|(_, key)| {
+                if let Some(entry) = self.entries.get(*key) {
+                    entry.last_access
+                } else {
+                    std::time::Instant::now() // Treat missing as very old
+                }
+            })
+            .map(|(idx, _)| idx)
+            .unwrap_or(0)
+    }
+
+    /// Move key to front of LRU order (most recently used)
+    fn evict_to_front(&mut self, key: &str) {
+        // Remove from middle and push to end
+        self.lru_order.retain(|k| k != key);
+        self.lru_order.push(key.to_string());
+    }
+}
+
+/// Thread-local regex compilation cache: (pattern, flags) -> Regex
 use crate::batch::RecordBatch;
 use crate::catalog::Catalog;
 use crate::check;
