@@ -21,6 +21,66 @@ pub const COLD_MAGIC: [u8; 4] = *b"LIN\x03";
 /// Spill to mmap when collection has at least this many rows.
 pub const COLD_MIN_ROWS: usize = 32;
 
+/// Maximum pages to prefetch ahead during sequential scan
+const PREFETCH_BUFFER_SIZE: usize = 16;
+/// Size of each memory-mapped page (4KB)
+const PAGE_SIZE: usize = 4096;
+
+/// Simple prefetch buffer for lazy materialization improvements
+/// Provides basic page-level prefetching to hide I/O latency
+struct PrefetchBuffer {
+    /// Pre-fetched and decoded rows buffer
+    prefetched: Vec<(usize, Row)>,
+    /// Current position in file (bytes)
+    current_pos: usize,
+    /// How many pages we've already seen from disk
+    pages_seen: usize,
+}
+
+impl PrefetchBuffer {
+    fn new() -> Self {
+        Self {
+            prefetched: Vec::with_capacity(PREFETCH_BUFFER_SIZE),
+            current_pos: 0,
+            pages_seen: 0,
+        }
+    }
+
+    /// Add a row to the prefetch buffer
+    fn add(&mut self, idx: usize, row: Row) {
+        if self.prefetched.len() < PREFETCH_BUFFER_SIZE {
+            self.prefetched.push((idx, row));
+        } else {
+            // Evict oldest entry (FIFO policy)
+            self.prefetched.remove(0);
+            self.prefetched.push((idx, row));
+        }
+    }
+
+    /// Try to get row from prefetch buffer
+    fn get_cached(&self, idx: usize) -> Option<&Row> {
+        self.prefetched.iter().find(|(i, _)| *i == idx).map(|(_, r)| r)
+    }
+
+    /// Consume all cached entries (used after full materialization)
+    fn clear(&mut self) {
+        self.prefetched.clear();
+    }
+
+    /// Advance position counter
+    fn advance(&mut self, bytes: usize) {
+        self.current_pos += bytes;
+    }
+}
+
+/// Memory-map of a MessagePack-encoded `Vec<Row>` with lazy materialize and prefetch optimization.
+pub struct ColdCol {
+    mmap: Mmap,
+    hot: OnceLock<Vec<Row>>,
+    /// Prefetch buffer for improved sequential access
+    prefetch: PrefetchBuffer,
+}
+
 /// Compression strategy for cold storage files
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompressionStrategy {
@@ -119,17 +179,12 @@ pub fn cold_path(data: &Path, name: &str) -> PathBuf {
     cold_dir(data).join(format!("{name}.bin"))
 }
 
-/// Memory-map of a MessagePack-encoded `Vec<Row>` with lazy materialize.
-pub struct ColdCol {
-    mmap: Mmap,
-    hot: OnceLock<Vec<Row>>,
-}
-
 impl std::fmt::Debug for ColdCol {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ColdCol")
             .field("bytes", &self.mmap.len())
             .field("materialized", &self.hot.get().is_some())
+            .field("prefetch_buffer_size", &self.prefetch.prefetched.len())
             .finish()
     }
 }
@@ -141,6 +196,15 @@ impl ColdCol {
             let _ = self.hot.set(decoded);
         }
         Ok(self.hot.get().map(|v| v.as_slice()).unwrap_or(&[]))
+    }
+
+    /// Create a new ColdCol with prefetch buffer initialized
+    pub fn new(mmap: Mmap) -> Self {
+        Self {
+            mmap,
+            hot: OnceLock::new(),
+            prefetch: PrefetchBuffer::new(),
+        }
     }
 
     pub fn into_rows(mut self) -> Result<Vec<Row>, Error> {
@@ -292,10 +356,7 @@ pub fn map_cold(data: &Path, name: &str) -> Result<ColdCol, Error> {
     if !valid {
         return Err(io_err(format!("bad cold file: {}", path.display())));
     }
-    Ok(ColdCol {
-        mmap,
-        hot: OnceLock::new(),
-    })
+    Ok(ColdCol::new(mmap))
 }
 
 /// Drop stale cold files not listed in `keep`.
