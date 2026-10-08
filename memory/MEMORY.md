@@ -4,6 +4,7 @@
 - [Partial Indexes](partial-indexes.md) — WHERE predicates for selective index population with memory/performance savings
 - [Content Hash Caching](content-hash-caching.md) — thread-local memoization of FNV-1a hashes to avoid redundant computations on inserts/updates  
 - [Cache-Friendly Layout](cache-friendly-layout.md) — SoA columnar arrays and fast O(1) count tracking via col_counts
+- [Row Pooling](row-pooling.md) — global BTreeMap object pool for batch operations to reduce heap allocations
 
 ## Implementation Patterns
 - [Feature Flags Pattern](feature-flags.md) — parallel, compress-flate, compress-lz4, compress-wal gated optional dependencies

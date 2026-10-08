@@ -15,14 +15,34 @@ use crate::persist::{
     self, ColSnap, Head, IndexSnap, LogRecord, OpenMemOpts, Pack, Persist, RelSnap, Snapshot,
 };
 
+/// Global row pool for batch operations - reused across queries
+static ROW_POOL_INIT: std::sync::OnceLock<std::sync::Mutex<Option<RowPool>>> = 
+    std::sync::OnceLock::new();
+
+/// Get or create the global row pool (thread-safe)
+pub fn get_row_pool() -> &'static std::sync::Mutex<Option<RowPool>> {
+    ROW_POOL_INIT.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Initialize the row pool with a pre-sized capacity
+pub fn init_row_pool(capacity: usize) {
+    let pool = RowPool {
+        cache: Vec::with_capacity(capacity),
+    };
+    if let Some(pool_mutex) = ROW_POOL_INIT.get() {
+        *pool_mutex.lock().unwrap() = Some(pool);
+    } else {
+        // Fallback: direct assignment on first call
+        let _ = ROW_POOL_INIT.set(std::sync::Mutex::new(Some(pool)));
+    }
+}
+
 /// Object pool for frequently allocated BTreeMap rows — reduces allocations in hot paths
-#[cfg(feature = "parallel")]
 pub struct RowPool {
     /// Pre-allocated BTreeMap instances ready for reuse
     cache: Vec<BTreeMap<String, Cell>>,
 }
 
-#[cfg(feature = "parallel")]
 impl RowPool {
     pub fn new() -> Self {
         Self {
@@ -37,7 +57,7 @@ impl RowPool {
 
     #[inline]
     pub fn release(&mut self, mut row: BTreeMap<String, Cell>) {
-        // Clear and return to pool if under size limit
+        // Clear Arc references but keep capacity (Arc is zero-copy drop)
         row.clear();
         if self.cache.len() < 128 {
             self.cache.push(row);
@@ -47,6 +67,17 @@ impl RowPool {
     /// Drain all pooled rows back (e.g., on reset/clear)
     pub fn drain(&mut self) {
         self.cache.clear();
+    }
+
+    /// Check how many rows are currently pooled
+    pub fn pool_size(&self) -> usize {
+        self.cache.len()
+    }
+}
+
+impl Default for RowPool {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -311,6 +342,9 @@ impl Store {
         for name in ["docs", "users", "orders", "facts"] {
             collections.insert(name.into(), Vec::new());
         }
+        
+        // Initialize global row pool for batch operations
+        init_row_pool(32);
         
         // Cache-friendly: track row counts per collection for fast bounds checking
         let mut col_counts = FxHashMap::default();
@@ -1212,6 +1246,30 @@ impl Store {
         self.col_counts.clear();
         for (name, rows) in &self.collections {
             self.col_counts.insert(name.clone(), rows.len());
+        }
+    }
+
+    /// Acquire a pooled BTreeMap for temporary batch operations
+    /// Reuses previously released allocations to reduce heap pressure
+    #[inline]
+    pub fn acquire_pooled_row(&self) -> Row {
+        let pool_mutex = get_row_pool();
+        if let Ok(mut pool_opt) = pool_mutex.lock() {
+            if let Some(pool) = pool_opt.as_mut() {
+                return pool.acquire();
+            }
+        }
+        BTreeMap::new()
+    }
+
+    /// Return a pooled BTreeMap back to the global cache
+    #[inline]
+    pub fn release_pooled_row(row: Row) {
+        let pool_mutex = get_row_pool();
+        if let Ok(mut pool_opt) = pool_mutex.lock() {
+            if let Some(pool) = pool_opt.as_mut() {
+                pool.release(row);
+            }
         }
     }
 
