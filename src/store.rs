@@ -975,6 +975,7 @@ impl Store {
                     unique: *unique,
                     fields: fields.clone(),
                     pred: None,
+                    bitmap_card_field: None,
                 };
                 let mut live = LiveIndex::new(def);
                 for (i, row) in self.collection(collection).iter().enumerate() {
@@ -2366,6 +2367,7 @@ impl Store {
                 unique: snap.unique,
                 fields: snap.fields.clone(),
                 pred: None,
+                bitmap_card_field: None,
             };
             let mut live = LiveIndex::new(def);
             for (i, row) in self.collection(&snap.collection).iter().enumerate() {
@@ -2580,6 +2582,7 @@ impl Store {
                 unique: snap.unique,
                 fields: snap.fields.clone(),
                 pred: None,
+                bitmap_card_field: None,
             };
             let mut live = LiveIndex::new(def);
             for (i, row) in self.collection(collection).iter().enumerate() {
@@ -3107,6 +3110,7 @@ mod borrowed_delete_tests {
                 fields: vec![field.into()],
                 unique: field == "id",
                 pred: None,
+                bitmap_card_field: None,
             });
             for (pos, row) in store.collection(collection).iter().enumerate() {
                 index.insert_at_new(pos, row).unwrap();

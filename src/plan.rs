@@ -1127,6 +1127,7 @@ fn decl_detail(d: &Decl) -> String {
             collection,
             unique,
             fields,
+            pred: _,
         } => {
             if *unique {
                 format!("index {collection} unique [{}]", fields.join(", "))

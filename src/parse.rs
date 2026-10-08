@@ -1188,10 +1188,19 @@ impl<'a> Parser<'a> {
         if fields.is_empty() {
             return Err(self.err("empty index"));
         }
+        
+        // Check for optional WHERE clause (partial index)
+        let pred = if self.eat_kw("where") {
+            Some(self.parse_pred()?)
+        } else {
+            None
+        };
+        
         Ok(Decl::Index {
             collection,
             unique,
             fields,
+            pred,
         })
     }
 

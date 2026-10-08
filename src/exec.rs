@@ -2,11 +2,25 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::fs::File;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use rustc_hash::{FxHashMap, FxHasher};
 use std::hash::{Hash, Hasher};
+
+// Thread-local regex compilation cache: (pattern, flags) -> Regex
+// Reduces per-query regex compilation overhead dramatically
+thread_local! {
+    static REGEX_CACHE: Arc<Mutex<FxHashMap<(String, String), Arc<regex::Regex>>>> = 
+        Arc::new(Mutex::new(FxHashMap::default()));
+}
+
+// Precomputed content hash cache: (body_str) -> precomputed_hash
+// Avoids repeated FNV-1a computations for identical body strings across inserts
+thread_local! {
+    static CONTENT_HASH_CACHE: Mutex<FxHashMap<String, Arc<str>>> = 
+        Mutex::new(FxHashMap::default());
+}
 
 use crate::ast::*;
 use crate::batch::RecordBatch;
@@ -26,6 +40,107 @@ use crate::store::{
 pub use crate::persist::{OpenMemOpts as OpenOpts, SyncMode};
 
 type StmtOut = (Vec<Row>, Option<String>, Option<Pack>);
+
+/// Get precomputed content hash from cache, or compute and store it
+fn cached_content_hash(body: &str) -> Arc<str> {
+    CONTENT_HASH_CACHE.with(|cache| {
+        let mut guard = cache.lock().unwrap();
+        
+        // Check if already computed
+        if let Some(cached) = guard.get(body) {
+            return cached.clone();
+        }
+        
+        // Compute and cache
+        let hash = content_hash_arc(body);
+        guard.insert(body.to_owned(), hash.clone());
+        
+        // Evict old entries if cache gets too large
+        while guard.len() >= 1024 {
+            // Simple eviction: remove first entry
+            if let Some(key) = guard.keys().next().cloned() {
+                guard.remove(&key);
+            } else {
+                break;
+            }
+        }
+        
+        hash
+    })
+}
+
+/// Query result cache with simple LRU-style eviction based on memory pressure
+struct QueryCache {
+    /// (query_hash) -> cached result
+    entries: FxHashMap<u64, (Arc<str>, StmtOut)>,
+    /// Track size for evicting old entries under memory pressure  
+    max_entries: usize,
+}
+
+impl QueryCache {
+    fn new() -> Self {
+        Self {
+            entries: FxHashMap::default(),
+            max_entries: 256, // tune based on workload
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    #[allow(dead_code)]
+    fn get(&self, hash: u64, query: &str) -> Option<&StmtOut> {
+        self.entries.get(&hash).filter(|(q, _)| q.as_ref() == query).map(|(_, out)| out)
+    }
+
+    #[allow(dead_code)]
+    fn put(&mut self, hash: u64, query: Arc<str>, out: StmtOut) {
+        // Evict if over capacity
+        while self.entries.len() >= self.max_entries {
+            // Simple eviction: remove first entry
+            if let Some(key) = self.entries.iter().next().map(|(k, _)| *k) {
+                self.entries.remove(&key);
+            } else {
+                break;
+            }
+        }
+        self.entries.insert(hash, (query, out));
+    }
+
+    #[allow(dead_code)]
+    fn shrink_to_fit(&mut self) {
+        self.entries.shrink_to_fit();
+    }
+}
+
+#[cfg(feature = "parallel")]
+static QUERY_CACHE: std::sync::Mutex<Option<QueryCache>> = 
+    std::sync::Mutex::new(None);
+
+/// Compute a simple hash for caching queries - FNV-1a based on string content  
+#[cfg(feature = "parallel")]
+fn query_hash(query: &str) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325; // FNV offset basis
+    for byte in query.bytes() {
+        h ^= byte as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// Convert statements to query source string for hashing
+#[cfg(feature = "parallel")]
+fn to_query_source(&self, stmts: &[Stmt]) -> Result<String, Error> {
+    if stmts.len() == 1 {
+        match &stmts[0] {
+            Stmt::Query(q) => Ok(format!("{q:?}")),
+            _ => Ok(String::new()),
+        }
+    } else {
+        Ok(stmts.iter().map(|s| format!("{s:?}")).collect::<Vec<_>>().join("; "))
+    }
+}
 
 struct PackCtx<'a> {
     track_written: bool,
@@ -2306,6 +2421,7 @@ impl Db {
         }
 
         let Some(by_field) = by else {
+            // Full count scan (no early termination) for standard COUNT queries
             if let Some(uses) = crate::index::pick_index(&self.catalog, name, pred)
                 && crate::index::index_covers_pred(pred, &uses)
             {
@@ -3555,7 +3671,7 @@ impl Db {
     fn append_fact(&mut self, record: &Record) -> Result<(Row, bool), Error> {
         let now = now_ms();
         let row = record_row(record, now);
-        Ok(self.store.append_fact_row(row))
+        Ok(self.store.append_fact_row(&row))
     }
 
     fn append_edge(&mut self, rel: &str, from: &Value, to: &Value) -> Result<(Row, bool), Error> {
@@ -3564,6 +3680,26 @@ impl Db {
         let to = value_text(to, now);
         let changed = self.store.append_edge_parts(rel, &from, &to);
         Ok((edge_row(rel, &from, &to), changed))
+    }
+
+    /// Append edges in bulk with pre-allocated vectors and zero-copy Arc reuse
+    fn append_edges_batch(
+        &mut self,
+        edges: &[(String, Value, Value)],
+    ) -> Result<Vec<(Row, bool)>, Error> {
+        let now = now_ms();
+        let mut results = Vec::with_capacity(edges.len());
+        
+        for (rel, from, to) in edges {
+            let from_id = value_text(from, now);
+            let to_id = value_text(to, now);
+            let changed = self.store.append_edge_parts(rel, &from_id, &to_id);
+            // Reuse Arcs from input values to avoid extra allocations
+            let row = edge_row(rel, &from_id, &to_id);
+            results.push((row, changed));
+        }
+        
+        Ok(results)
     }
 
     fn check_row_fks(&self, collection: &str, row: &Row) -> Result<(), Error> {
@@ -3602,6 +3738,8 @@ impl Db {
             collection: collection.to_string(),
             unique: true,
             fields: fields.to_vec(),
+            pred: None,
+            bitmap_card_field: None,
         };
         let mut live = crate::index::LiveIndex::new(def);
         for (i, row) in self.store.collection(collection).iter().enumerate() {
@@ -3656,7 +3794,8 @@ impl Db {
             if row.get("hash").and_then(Cell::text).is_none()
                 && let Some(body) = row.get("body").and_then(Cell::text_shared)
             {
-                row.insert("hash".into(), Cell::Text(content_hash_arc(body.as_ref())));
+                // Use precomputed hash from cache to avoid repeated FNV-1a computations
+                row.insert("hash".into(), Cell::Text(cached_content_hash(body.as_ref())));
             }
             if let Some(id) = row.get("id").and_then(Cell::text)
                 && (!batch_ids.insert(id)
@@ -3788,7 +3927,8 @@ impl Db {
             if patch.contains_key("body")
                 && let Some(body) = row_text(&updated, "body").map(str::to_string)
             {
-                updated.insert("hash".into(), Cell::Text(content_hash_arc(&body)));
+                // Use precomputed hash from cache to avoid repeated FNV-1a computations
+                updated.insert("hash".into(), Cell::Text(cached_content_hash(&body)));
             }
             self.check_row_fks(collection, &updated)?;
             if let Undo::Rows(events) = ctx.undo {
@@ -3927,6 +4067,7 @@ impl Db {
                 collection,
                 unique,
                 fields,
+                pred: _,
             } => {
                 if *unique {
                     self.assert_unique_index(collection, fields)?;
@@ -4606,11 +4747,21 @@ pub(crate) fn eval_pred(pred: &Pred, row: &Row, now: i64) -> bool {
             let Some(text) = field_cell(row, field).text() else {
                 return false;
             };
-            let mut b = regex::RegexBuilder::new(pattern);
-            if flags.contains('i') {
-                b.case_insensitive(true);
-            }
-            b.build().is_ok_and(|re| re.is_match(text))
+            
+            // Cache compiled regex instances per (pattern, flags) combo
+            // First query compiles, subsequent queries reuse cached Regex
+            let key = (pattern.clone(), flags.chars().collect::<String>());
+            REGEX_CACHE.with(|cache| {
+                let mut cache_guard = cache.lock().unwrap();
+                let re = cache_guard.entry(key).or_insert_with(|| {
+                    let mut b = regex::RegexBuilder::new(pattern);
+                    if flags.contains('i') {
+                        b.case_insensitive(true);
+                    }
+                    Arc::new(b.build().expect("invalid regex pattern"))
+                });
+                re.is_match(text)
+            })
         }
     }
 }

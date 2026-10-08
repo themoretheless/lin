@@ -280,6 +280,7 @@ fn check_decl(d: &Decl, cat: &Catalog) -> Result<(), Error> {
             collection,
             fields,
             unique: _,
+            pred: _,
         } => {
             let col = cat
                 .collection(collection)

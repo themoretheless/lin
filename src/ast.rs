@@ -462,6 +462,8 @@ pub enum Decl {
         collection: String,
         unique: bool,
         fields: Vec<String>,
+        /// Partial index predicate - only index rows where this pred is true
+        pred: Option<Pred>,
     },
     /// Nested value object (flattened onto a collection, not a table).
     Owned {

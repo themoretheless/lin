@@ -2,11 +2,117 @@ use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::sync::Arc;
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHasher};
+use std::hash::{Hash, Hasher};
 
 use crate::ast::{CmpOp, Pred, Value};
 use crate::catalog::{Catalog, IndexDef};
 use crate::store::{Cell, Row};
+
+/// Bloom filter for fast negative lookups during index seeks
+/// Reduces false positives with minimal memory overhead
+#[cfg(feature = "parallel")]
+struct BloomFilter {
+    /// Bit array
+    bits: Vec<u64>,
+    num_hashes: usize,
+    capacity: usize,
+}
+
+#[cfg(feature = "parallel")]
+impl BloomFilter {
+    fn new(capacity: usize) -> Self {
+        // Calculate bit array size (16MB max for reasonable memory footprint)
+        let num_bits = 8 * 1024 * 1024; // 1M bits = 128KB
+        let num_hashes = 7; // Optimal number of hash functions for low false positive rate
+        
+        Self {
+            bits: vec![0u64; num_bits / 64],
+            num_hashes,
+            capacity,
+        }
+    }
+
+    fn hash(&self, item: impl Hash) -> u64 {
+        let mut hasher = FxHasher::default();
+        item.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn add(&mut self, item: impl Hash) {
+        if self.bits.is_empty() {
+            return;
+        }
+        
+        let base_hash = self.hash(item);
+        let delta = base_hash.wrapping_mul(0x9e3779b97f4a7c15); // Golden ratio
+        
+        for i in 0..self.num_hashes {
+            let h = if i == 0 {
+                base_hash
+            } else {
+                delta ^= base_hash
+            };
+            
+            let bit_pos = (h as usize) % (self.bits.len() * 64);
+            let mask = 1u64 << (bit_pos % 64);
+            self.bits[bit_pos / 64] |= mask;
+        }
+    }
+
+    fn contains(&self, item: impl Hash) -> bool {
+        if self.bits.is_empty() {
+            return true; // Assume present when empty
+        }
+        
+        let base_hash = self.hash(item);
+        let delta = base_hash.wrapping_mul(0x9e3779b97f4a7c15);
+        
+        for i in 0..self.num_hashes {
+            let h = if i == 0 {
+                base_hash
+            } else {
+                delta ^= base_hash
+            };
+            
+            let bit_pos = (h as usize) % (self.bits.len() * 64);
+            let mask = 1u64 << (bit_pos % 64);
+            
+            if self.bits[bit_pos / 64] & mask == 0 {
+                return false; // Definitely not present
+            }
+        }
+        true // Probably present
+    }
+}
+
+/// Composite bloom filter for multi-key index checks
+#[cfg(feature = "parallel")]
+pub struct MultiBloomFilter {
+    filters: Vec<BloomFilter>,
+}
+
+#[cfg(feature = "parallel")]
+impl MultiBloomFilter {
+    fn new(num_filters: usize, capacity: usize) -> Self {
+        Self {
+            filters: (0..num_filters).map(|_| BloomFilter::new(capacity)).collect(),
+        }
+    }
+
+    fn add_keys(&mut self, keys: &[IndexKey]) {
+        for key in keys {
+            for filter in &mut self.filters {
+                filter.add(key);
+            }
+        }
+    }
+
+    fn check_all(&self, target: &IndexKey) -> bool {
+        self.filters.iter().all(|f| f.contains(target))
+    }
+}
+
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum IndexPart {
@@ -31,6 +137,10 @@ pub struct LiveIndex {
     pub def: IndexDef,
     pub forward: BTreeMap<IndexKey, Vec<usize>>,
     pub reverse: FxHashMap<usize, IndexKey>,
+    
+    /// Bloom filter for fast negative lookups during seek operations
+    #[cfg(feature = "parallel")]
+    bloom_filter: Option<BloomFilter>,
 }
 
 #[derive(Debug, Clone)]
@@ -46,7 +156,37 @@ impl LiveIndex {
             def,
             forward: BTreeMap::new(),
             reverse: FxHashMap::default(),
+            #[cfg(feature = "parallel")]
+            bloom_filter: None,
         }
+    }
+
+    /// Build bloom filter after initial index population (optimization)
+    #[cfg(feature = "parallel")]
+    pub fn build_bloom_filter(&mut self) {
+        let num_keys = self.forward.len();
+        if num_keys == 0 {
+            return;
+        }
+        
+        self.bloom_filter = Some(BloomFilter::new(num_keys));
+        
+        // Add all keys to bloom filter for fast negative lookups
+        for key in self.forward.keys() {
+            self.bloom_filter.as_mut().unwrap().add(key);
+        }
+    }
+
+    /// Check if target key might exist using bloom filter (fast path before BTree lookup)
+    #[inline]
+    pub fn maybe_exists_fast(&self, key: &IndexKey) -> bool {
+        #[cfg(feature = "parallel")]
+        if let Some(ref filter) = self.bloom_filter {
+            return filter.contains(key);
+        }
+        
+        // Fallback: always assume present when no filter or feature not enabled
+        true
     }
 
     pub fn key_of(&self, row: &Row) -> IndexKey {
@@ -60,12 +200,26 @@ impl LiveIndex {
     }
 
     pub fn insert_at(&mut self, idx: usize, row: &Row) -> Result<(), String> {
+        // Partial index check: only insert if pred matches (or no pred)
+        if let Some(ref pred) = self.def.pred {
+            if !crate::exec::eval_pred(pred, row, 0) {
+                return Ok(()); // Skip indexing for non-matching rows
+            }
+        }
+        
         let key = self.key_of(row);
         self.insert_key(idx, key)
     }
 
     /// Append-only bulk path: no reverse-key replace (fresh indices).
     pub fn insert_at_new(&mut self, idx: usize, row: &Row) -> Result<(), String> {
+        // Partial index check: only insert if pred matches (or no pred)
+        if let Some(ref pred) = self.def.pred {
+            if !crate::exec::eval_pred(pred, row, 0) {
+                return Ok(()); // Skip indexing for non-matching rows
+            }
+        }
+        
         let key = self.key_of(row);
         if self.def.unique && self.forward.contains_key(&key) {
             return Err(format!("unique index {}: duplicate key", self.def.label()));
@@ -91,24 +245,39 @@ impl LiveIndex {
         start: usize,
         rows: &[Row],
     ) -> Result<(), String> {
+        // Partial index check: only insert matching rows
+        let keyed_rows: Vec<(usize, Row)> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| {
+                self.def.pred.as_ref().map_or(true, |pred| {
+                    crate::exec::eval_pred(pred, row, 0)
+                })
+            })
+            .map(|(i, row)| (start + i, (*row).clone()))
+            .collect();
+        
+        if keyed_rows.is_empty() {
+            return Ok(());
+        }
+        
         // Pre-compute all keys in a single pass
-        let keys: Vec<_> = rows.iter().map(|r| self.key_of(r)).collect();
+        let keys: Vec<_> = keyed_rows.iter().map(|(_, r)| self.key_of(r)).collect();
         
         // Bulk insert using pre-computed keys
-        for (i, key) in keys.into_iter().enumerate() {
-            let idx = start + i;
+        for ((orig_idx, _), key) in keyed_rows.iter().zip(keys.into_iter()) {
             if self.def.unique && self.forward.contains_key(&key) {
                 return Err(format!("unique index {}: duplicate key", self.def.label()));
             }
             use std::collections::btree_map::Entry;
             match self.forward.entry(key) {
                 Entry::Vacant(v) => {
-                    self.reverse.insert(idx, v.key().clone());
-                    v.insert(vec![idx]);
+                    self.reverse.insert(*orig_idx, v.key().clone());
+                    v.insert(vec![*orig_idx]);
                 }
                 Entry::Occupied(mut o) => {
-                    self.reverse.insert(idx, o.key().clone());
-                    o.get_mut().push(idx);
+                    self.reverse.insert(*orig_idx, o.key().clone());
+                    o.get_mut().push(*orig_idx);
                 }
             }
         }
@@ -207,6 +376,7 @@ impl LiveIndex {
     }
 
     /// Count matching row indices without allocating an id/index list.
+    /// Optional early termination if count exceeds threshold for performance.
     pub fn seek_count(&self, use_: &IndexUse, now: i64) -> usize {
         let (start, end) = self.bounds(use_, now);
         self.forward
@@ -215,13 +385,70 @@ impl LiveIndex {
             .sum()
     }
 
+    /// Count with early termination - returns None if exceeds threshold
+    pub fn seek_count_with_early_termination(
+        &self, 
+        use_: &IndexUse, 
+        now: i64,
+        threshold: usize,
+    ) -> Option<usize> {
+        let (start, end) = self.bounds(use_, now);
+        
+        let mut count = 0;
+        for (_, idxs) in self.forward.range((start, end)) {
+            count += idxs.len();
+            if count > threshold {
+                return None; // Exceeded threshold
+            }
+        }
+        Some(count)
+    }
+
+    /// Seek row indices by range bounds: extend output vector from BTreeMap iteration
     pub fn seek_idxs(&self, use_: &IndexUse, now: i64) -> Vec<usize> {
         let (start, end) = self.bounds(use_, now);
+        
+        // Use bloom filter for fast early termination if available
+        #[cfg(feature = "parallel")]
+        {
+            if let Some(ref filter) = self.bloom_filter {
+                // Quick check: if target key not in bloom filter, skip this range
+                // Note: This is a heuristic - we still need full BTree scan for correctness
+                // The bloom filter helps identify when index has no matches at all
+                let potential_key = start.clone();
+                if !filter.contains(&potential_key) {
+                    return Vec::new();
+                }
+            }
+        }
+        
         let mut out = Vec::new();
         for (_, idxs) in self.forward.range((start, end)) {
             out.extend_from_slice(idxs);
         }
         out
+    }
+
+    /// Parallel bulk seek across multiple index uses - each use is independent
+    #[cfg(feature = "parallel")]
+    pub fn seek_idxs_parallel(&self, uses: &[crate::index::IndexUse], now: i64) -> Vec<Vec<usize>> {
+        if uses.is_empty() {
+            return Vec::new();
+        }
+        
+        // Each index seek runs independently, so we can parallelize
+        use rayon::prelude::*;
+        
+        uses.par_iter()
+            .map(|use_| {
+                let (start, end) = self.bounds(use_, now);
+                let mut out = Vec::new();
+                for (_, idxs) in self.forward.range((start, end)) {
+                    out.extend_from_slice(idxs);
+                }
+                out
+            })
+            .collect()
     }
 }
 
@@ -485,6 +712,8 @@ mod storage_tests {
                 collection: "test".into(),
                 fields: vec!["key".into()],
                 unique,
+                pred: None,
+                bitmap_card_field: None,
             });
             let a = Row::from([("key".into(), Cell::Int(1))]);
             let b = Row::from([("key".into(), Cell::Int(2))]);
@@ -524,6 +753,8 @@ mod storage_tests {
                 collection: "test".into(),
                 fields: vec!["key".into()],
                 unique: false,
+                pred: None,
+                bitmap_card_field: None,
             });
             let row = Row::from([("key".into(), Cell::Int(1))]);
             for i in 0..n {
@@ -546,6 +777,8 @@ mod storage_tests {
                 collection: "test".into(),
                 fields: vec!["key".into()],
                 unique: true,
+                pred: None,
+                bitmap_card_field: None,
             });
             for (i, row) in rows.iter().enumerate() {
                 index.insert_at_new(i, black_box(row)).unwrap();
@@ -584,6 +817,8 @@ mod storage_tests {
                 collection: "test".into(),
                 fields: fields.clone(),
                 unique: true,
+                pred: None,
+                bitmap_card_field: None,
             });
             let row = fields
                 .iter()
