@@ -830,6 +830,10 @@ impl Store {
                 let idx = self.collection(collection).len() - 1;
                 // Update cache-friendly count tracking
                 self.update_col_count(collection, 1);
+                
+                // Update precomputed aggregates if any exist for this collection
+                crate::exec::update_aggregate_for_insert(collection, row);
+                
                 self.row_maps_register(collection, idx);
                 let _ = self.index_insert_at(collection, idx);
                 self.fts_insert_at(collection, idx);

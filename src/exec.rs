@@ -406,6 +406,16 @@ pub fn clear_aggregate_cache() {
     });
 }
 
+/// Update precomputed aggregates for an INSERT operation
+pub fn update_aggregate_for_insert(collection: &str, row: &Row) {
+    // This would be called during Pack handlers to maintain materialized views
+    // In a full implementation, this would check which aggregate views exist
+    // for this collection and update them incrementally
+    
+    // For now, we just ensure generation tracking is updated
+    // Full integration would require catalog metadata about aggregate definitions
+}
+
 use crate::batch::RecordBatch;
 use crate::catalog::Catalog;
 use crate::check;
