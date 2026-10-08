@@ -164,7 +164,248 @@ impl Cache {
     }
 }
 
-/// Thread-local regex compilation cache: (pattern, flags) -> Regex
+/// Aggregate function types for precomputed aggregation views
+#[derive(Debug, Clone, PartialEq)]
+pub enum AggregateType {
+    Count,      // COUNT(*) or COUNT(column)
+    Sum,        // SUM(column) - numeric only
+    Avg,        // AVG(column) - numeric only  
+    Min,        // MIN(column)
+    Max,        // MAX(column)
+}
+
+impl std::fmt::Display for AggregateType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AggregateType::Count => write!(f, "COUNT"),
+            AggregateType::Sum => write!(f, "SUM"),
+            AggregateType::Avg => write!(f, "AVG"),
+            AggregateType::Min => write!(f, "MIN"),
+            AggregateType::Max => write!(f, "MAX"),
+        }
+    }
+}
+
+/// Values for different aggregate types maintained incrementally
+#[derive(Debug, Clone, Default)]
+pub struct AggregateValue {
+    pub count: u64,
+    pub sum: f64,
+    pub avg_sum: f64,     // Running sum for average calculation
+    pub avg_count: u64,   // Running count for average calculation
+    pub min: Option<f64>,
+    pub max: Option<f64>,
+}
+
+impl AggregateValue {
+    /// Increment count-only metrics
+    #[inline]
+    pub fn inc_count(&mut self) {
+        self.count += 1;
+    }
+
+    /// Add numeric value to running totals
+    #[inline]
+    pub fn add_value(&mut self, value: f64) {
+        self.sum += value;
+        self.avg_sum += value;
+        self.avg_count += 1;
+        
+        if let Some(current_min) = self.min {
+            self.min = Some(current_min.min(value));
+        } else {
+            self.min = Some(value);
+        }
+        
+        if let Some(current_max) = self.max {
+            self.max = Some(current_max.max(value));
+        } else {
+            self.max = Some(value);
+        }
+    }
+
+    /// Get computed average
+    #[inline]
+    pub fn avg(&self) -> Option<f64> {
+        if self.avg_count == 0 {
+            None
+        } else {
+            Some(self.avg_sum / self.avg_count as f64)
+        }
+    }
+
+    /// Merge two aggregate values (for parallel compute)
+    #[inline]
+    pub fn merge(&mut self, other: &AggregateValue) {
+        self.count += other.count;
+        self.sum += other.sum;
+        self.avg_sum += other.avg_sum;
+        self.avg_count += other.avg_count;
+        
+        if let Some(other_min) = other.min {
+            if let Some(current_min) = self.min {
+                self.min = Some(current_min.min(other_min));
+            } else {
+                self.min = Some(other_min);
+            }
+        }
+        
+        if let Some(other_max) = other.max {
+            if let Some(current_max) = self.max {
+                self.max = Some(current_max.max(other_max));
+            } else {
+                self.max = Some(other_max);
+            }
+        }
+    }
+
+    /// Clear all accumulated values
+    #[inline]
+    pub fn clear(&mut self) {
+        *self = AggregateValue::default();
+    }
+}
+
+/// Materialized aggregate view for a collection + group + agg type
+/// Stores precomputed results to avoid repeated computation
+#[derive(Debug, Clone)]
+pub struct AggregateView {
+    /// Collection name this view applies to
+    pub collection: String,
+    /// Grouping keys (empty for total aggregate over entire collection)
+    pub group_keys: Vec<String>,
+    /// Aggregation types to maintain
+    pub aggs: Vec<AggregateType>,
+    /// Latest stored values per group
+    /// Key: concatenated group key values, Value: aggregated counts/sums
+    pub data: FxHashMap<String, AggregateValue>,
+    /// Last update generation number (for invalidation)
+    pub r#gen: u64,
+}
+
+/// Thread-local storage for aggregate views
+/// Indexed by (collection, group_fields, agg_types) → AggregateView
+thread_local! {
+    static AGGREGATE_VIEWS: std::sync::Mutex<FxHashMap<String, AggregateView>> = 
+        std::sync::Mutex::new(FxHashMap::default());
+}
+
+/// Compute cache key from collection, group fields, and aggregation types
+fn agg_view_key(collection: &str, group_keys: &[String], aggs: &[AggregateType]) -> String {
+    let mut key = format!("{}:", collection);
+    if !group_keys.is_empty() {
+        key.push_str(&group_keys.join(","));
+        key.push('|');
+    }
+    key.push_str(&aggs.iter().map(|a| match a {
+        AggregateType::Count => "C",
+        AggregateType::Sum => "S",
+        AggregateType::Avg => "A",
+        AggregateType::Min => "M",
+        AggregateType::Max => "X",
+    }).collect::<Vec<_>>().join(""));
+    key
+}
+
+/// Initialize or retrieve an aggregate view for the given parameters
+pub fn get_or_init_aggregate_view(
+    collection: &str,
+    group_keys: Vec<String>,
+    aggs: Vec<AggregateType>,
+    r#gen: u64,
+) -> AggregateView {
+    let key = agg_view_key(collection, &group_keys, &aggs);
+    
+    AGGREGATE_VIEWS.with(|views| {
+        let mut map = views.lock().unwrap();
+        // Clone entry if exists, otherwise insert and return copy
+        map.entry(key).or_insert_with(|| AggregateView {
+            collection: collection.to_string(),
+            group_keys,
+            aggs,
+            data: FxHashMap::default(),
+            r#gen,
+        }).clone()
+    })
+}
+
+/// Update aggregate view with a new row's data
+pub fn update_aggregate(view: &mut AggregateView, group_values: &[String], row: &Row) {
+    // Build group key string
+    let group_key = group_values.join(":");
+    
+    // Get or create entry for this group
+    let entry = view.data.entry(group_key).or_insert_with(AggregateValue::default);
+    
+    // Update based on aggregation types
+    for agg in &view.aggs {
+        match agg {
+            AggregateType::Count => {
+                entry.inc_count();
+            }
+            AggregateType::Sum | AggregateType::Avg => {
+                // Find numeric field to aggregate
+                if let Some(field) = view.group_keys.first() {
+                    if let Some(cell) = row.get(field) {
+                        if let Some(value) = cell.as_f64() {
+                            entry.add_value(value);
+                        }
+                    }
+                }
+            }
+            AggregateType::Min | AggregateType::Max => {
+                // Find numeric field
+                if let Some(field) = view.group_keys.first() {
+                    if let Some(cell) = row.get(field) {
+                        if let Some(value) = cell.as_f64() {
+                            entry.add_value(value);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // Update generation number
+    view.r#gen = now_ms() as u64;
+}
+
+/// Get computed aggregate results for a group
+pub fn get_aggregate_result(entry: &AggregateValue, aggs: &[AggregateType]) -> Vec<(String, Cell)> {
+    let mut result = Vec::with_capacity(aggs.len());
+    
+    for agg in aggs {
+        let cell = match agg {
+            AggregateType::Count => Cell::Int(entry.count as i64),
+            AggregateType::Sum => Cell::Float(entry.sum),
+            AggregateType::Avg => Cell::Float(entry.avg().unwrap_or(0.0)),
+            AggregateType::Min => Cell::Float(entry.min.unwrap_or(0.0)),
+            AggregateType::Max => Cell::Float(entry.max.unwrap_or(0.0)),
+        };
+        result.push((format!("{}", agg), cell));
+    }
+    
+    result
+}
+
+/// Invalidate aggregate views after store mutation
+pub fn invalidate_aggregates(r#gen: u64) {
+    AGGREGATE_VIEWS.with(|views| {
+        let mut map = views.lock().unwrap();
+        // Remove entries that are older than current generation
+        map.retain(|_, view| view.r#gen >= r#gen);
+    });
+}
+
+/// Clear all cached aggregate views
+pub fn clear_aggregate_cache() {
+    AGGREGATE_VIEWS.with(|views| {
+        if let Ok(mut map) = views.lock() {
+            map.clear();
+        }
+    });
+}
+
 use crate::batch::RecordBatch;
 use crate::catalog::Catalog;
 use crate::check;
