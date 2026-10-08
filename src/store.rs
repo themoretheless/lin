@@ -1626,6 +1626,9 @@ impl Store {
                 _ => break,
             };
             
+            // Update cache-friendly count tracking (decrement by number of deleted rows)
+            self.update_col_count(collection, -(dead.len() as isize));
+            
             // Zero-copy: steal row with swap_remove instead of cloning
             let doomed = self.collections.get_mut(collection).unwrap().swap_remove(p);
             
