@@ -834,6 +834,9 @@ impl Store {
                 // Update precomputed aggregates if any exist for this collection
                 crate::exec::update_aggregate_for_insert(collection, row);
                 
+                // Update window function states if any exist for this collection
+                crate::window::update_window_states(collection, idx, row);
+                
                 self.row_maps_register(collection, idx);
                 let _ = self.index_insert_at(collection, idx);
                 self.fts_insert_at(collection, idx);

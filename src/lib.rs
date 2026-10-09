@@ -67,6 +67,7 @@ mod parse;
 mod persist;
 mod plan;
 mod store;
+mod window;
 
 pub mod query;
 pub mod row;

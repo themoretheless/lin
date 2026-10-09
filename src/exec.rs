@@ -283,6 +283,45 @@ pub struct AggregateView {
     pub r#gen: u64,
 }
 
+/// Window function types for analytical queries
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WindowFunction {
+    Rank,           // RANK() OVER (ORDER BY ...)
+    DenseRank,      // DENSE_RANK() OVER (ORDER BY ...)
+    RowNumber,      // ROW_NUMBER() OVER (ORDER BY ...)
+    Lead { offset: usize },     // LEAD(col, offset)
+    Lag { offset: usize },      // LAG(col, offset)
+    FirstValue,     // FIRST_VALUE(col)
+    LastValue,      // LAST_VALUE(col)
+}
+
+impl std::fmt::Display for WindowFunction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WindowFunction::Rank => write!(f, "RANK"),
+            WindowFunction::DenseRank => write!(f, "DENSE_RANK"),
+            WindowFunction::RowNumber => write!(f, "ROW_NUMBER"),
+            WindowFunction::Lead { offset } => write!(f, "LEAD({})", offset),
+            WindowFunction::Lag { offset } => write!(f, "LAG({})", offset),
+            WindowFunction::FirstValue => write!(f, "FIRST_VALUE"),
+            WindowFunction::LastValue => write!(f, "LAST_VALUE"),
+        }
+    }
+}
+
+/// Precomputed window state for maintaining running rank/order info
+#[derive(Debug, Clone)]
+pub struct WindowState {
+    /// Window function being computed
+    pub func: WindowFunction,
+    /// Partitions (GROUP BY columns for window scope)
+    pub partitions: Vec<String>,
+    /// Order by columns
+    pub order_by: Vec<(String, bool)>,  // (field, descending)
+    /// Running totals for this window
+    pub running_data: FxHashMap<String, Vec<f64>>,  // partition_key -> [values]
+}
+
 /// Thread-local storage for aggregate views
 /// Indexed by (collection, group_fields, agg_types) → AggregateView
 thread_local! {
