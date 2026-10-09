@@ -837,6 +837,9 @@ impl Store {
                 // Update window function states if any exist for this collection
                 crate::window::update_window_states(collection, idx, row);
                 
+                // Invalidate aggregate views on mutation (generation-based)
+                crate::exec::invalidate_aggregates(self.r#gen);
+                
                 self.row_maps_register(collection, idx);
                 let _ = self.index_insert_at(collection, idx);
                 self.fts_insert_at(collection, idx);

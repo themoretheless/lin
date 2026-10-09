@@ -1,6 +1,6 @@
 # Lin Database Optimizations - Implementation Summary
 
-**Current Progress:** 14/20 optimizations complete  
+**Current Progress:** 15/20 optimizations complete  
 **Date:** 2026-10-09
 
 ## ✅ Completed Optimizations
@@ -28,13 +28,6 @@ index tasks[description] where priority >= 5
 ### 2. Content Hash Caching (FNV-1a memoization)
 **Status:** ✅ Complete  
 **Files Modified:** exec.rs  
-**Implementation:**
-- Thread-local cache: `(body_str) -> precomputed_hash`
-- LRU eviction when cache exceeds 1024 entries  
-- Applied at INSERT bulk path and PATCH update path
-- Zero-copy Arc clones preserve hash references
-
-**Performance:** 80-90% cache hit rate on news feeds, 50-70% on chat logs
 
 **Location:** Lines 45-70 in exec.rs
 
@@ -167,6 +160,45 @@ store::release_pooled_row(row);         // Return to cache
 **Location:** Lines 56-269 in src/cold.rs
 
 
+### 15. Window Functions Infrastructure
+**Status:** ✅ Complete  
+**Files Modified:** lib.rs, store.rs, window.rs (new file)  
+**Implementation:**
+- Created src/window.rs with complete window function framework
+- Implemented RANK, DENSE_RANK, ROW_NUMBER, LEAD, LAG, FIRST_VALUE, LAST_VALUE
+- Added WindowSpec for PARTITION BY and ORDER BY clause support
+- Frame specification (ROWS/RANGE between) for SQL-standard window frames
+- Stateful maintenance with running_data cache and results_cache
+- Integration with store.rs Pack handlers for incremental updates
+- Generation-based invalidation via thread-local WINDOW_STATE_CACHE
+- Tests: window_rank_basic, window_lead_lag_basic passing
+
+**Architecture:**
+```rust
+pub struct WindowState {
+    pub func: WindowFunction,
+    pub spec: WindowSpec,
+    pub running_data: FxHashMap<String, Vec<f64>>,  // partition_key -> values
+    pub results_cache: FxHashMap<usize, f64>,       // row_idx -> computed value
+}
+```
+
+**Usage Pattern:**
+```sql
+SELECT 
+    id,
+    priority,
+    RANK() OVER (PARTITION BY status ORDER BY priority DESC) as rank,
+    LEAD(priority, 1) OVER (ORDER BY id) as next_priority
+FROM tasks
+```
+
+**Verification:**
+✅ All 2 window function tests passing
+✅ Integration tested with store.rs insert path
+✅ Committed as `86e66eb`
+
+---
 ## 🔄 Remaining Optimizations (8 total)
 
 ### High Priority
