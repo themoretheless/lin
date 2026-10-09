@@ -1,6 +1,6 @@
 # Lin Database Optimizations - Implementation Summary
 
-**Current Progress:** 15/20 optimizations complete  
+**Current Progress:** 16/20 optimizations complete  
 **Date:** 2026-10-09
 
 ## ✅ Completed Optimizations
@@ -199,30 +199,9 @@ FROM tasks
 ✅ Committed as `86e66eb`
 
 ---
-## 🔄 Remaining Optimizations (8 total)
+## 🔄 Remaining Optimizations (7 total)
 
 ### High Priority
-
-#### 8. Precomputed Aggregates (Materialized Views)
-**Target:** SUM/COUNT/AVG/GROUP BY query acceleration  
-**Approach:** 
-- Maintain running totals per group key
-- Incremental updates instead of recomputation
-- Invalidate views on store mutations (generation-based)
-
-**Implementation Plan:**
-```rust
-struct AggregateView {
-    collection: String,
-    group_keys: Vec<String>,
-    aggs: Vec<AggregateType>, // Count/Sum/Avg/Min/Max
-    data: FxHashMap<group_key, AggregateValue>,
-}
-```
-
-**Impact:** Analytical queries 10-100x faster for repeated aggregations
-
----
 
 #### 9. Advanced Predicate Pushdown Through Joins
 **Target:** Filter rows BEFORE join operation  
@@ -250,18 +229,7 @@ plan.pushdown_predicate(join_plan, where_clause.right);
 - AND/OR/NOT operations on bitmaps in parallel
 - Convert bitmap to row indices only at result materialization
 
-**Implementation Plan:**
-```rust
-pub struct BitmapIndex {
-    postings: FxHashMap<Value, BitSet>,  // Instead of Vec<usize>
-    card_field: String,                  // Low-cardinality column name
-}
-
-impl BitmapIndex {
-    fn seek(&self, value: &Value) -> BitSet { ... }
-    fn intersect(a: &BitSet, b: &BitSet) -> BitSet { ... }
-}
-```
+**Impact:** 10-100x memory savings for boolean/status columns
 
 **Impact:** 10-100x memory savings for boolean/status columns
 
