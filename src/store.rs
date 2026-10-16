@@ -15,16 +15,23 @@ use crate::persist::{
     self, ColSnap, Head, IndexSnap, LogRecord, OpenMemOpts, Pack, Persist, RelSnap, Snapshot,
 };
 
+thread_local! {
+    static TLS_ROW_POOL: std::cell::RefCell<RowPool> = std::cell::RefCell::new(RowPool::new());
+}
+
 /// Global row pool for batch operations - reused across queries
+#[allow(dead_code)]
 static ROW_POOL_INIT: std::sync::OnceLock<std::sync::Mutex<Option<RowPool>>> = 
     std::sync::OnceLock::new();
 
 /// Get or create the global row pool (thread-safe)
+#[allow(dead_code)]
 pub fn get_row_pool() -> &'static std::sync::Mutex<Option<RowPool>> {
     ROW_POOL_INIT.get_or_init(|| std::sync::Mutex::new(None))
 }
 
 /// Initialize the row pool with a pre-sized capacity
+#[allow(dead_code)]
 pub fn init_row_pool(capacity: usize) {
     let pool = RowPool {
         cache: Vec::with_capacity(capacity),
@@ -59,7 +66,7 @@ impl RowPool {
     pub fn release(&mut self, mut row: BTreeMap<String, Cell>) {
         // Clear Arc references but keep capacity (Arc is zero-copy drop)
         row.clear();
-        if self.cache.len() < 128 {
+        if self.cache.len() < 256 {
             self.cache.push(row);
         }
     }
@@ -75,6 +82,18 @@ impl RowPool {
     pub fn pool_size(&self) -> usize {
         self.cache.len()
     }
+}
+
+/// Acquire a pooled BTreeMap row lock-free from the thread-local pool
+#[inline]
+pub fn acquire_row() -> Row {
+    TLS_ROW_POOL.with(|p| p.borrow_mut().acquire())
+}
+
+/// Release a BTreeMap row back to the thread-local pool for reuse
+#[inline]
+pub fn release_row(row: Row) {
+    TLS_ROW_POOL.with(|p| p.borrow_mut().release(row));
 }
 
 impl Default for RowPool {
@@ -1335,27 +1354,16 @@ impl Store {
     }
 
     /// Acquire a pooled BTreeMap for temporary batch operations
-    /// Reuses previously released allocations to reduce heap pressure
+    /// Reuses previously released allocations to reduce heap pressure lock-free
     #[inline]
     pub fn acquire_pooled_row(&self) -> Row {
-        let pool_mutex = get_row_pool();
-        if let Ok(mut pool_opt) = pool_mutex.lock() {
-            if let Some(pool) = pool_opt.as_mut() {
-                return pool.acquire();
-            }
-        }
-        BTreeMap::new()
+        acquire_row()
     }
 
-    /// Return a pooled BTreeMap back to the global cache
+    /// Return a pooled BTreeMap back to the thread-local pool
     #[inline]
     pub fn release_pooled_row(row: Row) {
-        let pool_mutex = get_row_pool();
-        if let Ok(mut pool_opt) = pool_mutex.lock() {
-            if let Some(pool) = pool_opt.as_mut() {
-                pool.release(row);
-            }
-        }
+        release_row(row);
     }
 
     pub fn collection_mut(&mut self, name: &str) -> &mut Vec<Row> {

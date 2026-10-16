@@ -1,6 +1,5 @@
 //! Columnar result batch — in-process OLAP shape beside row-API (`Vec<Row>`).
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::store::{Cell, Row};
@@ -68,7 +67,7 @@ impl RecordBatch {
         let mut out = Vec::with_capacity(n);
         
         for i in start..end {
-            let mut row = BTreeMap::new();
+            let mut row = crate::store::acquire_row();
             // Use clone_for_borrow() to preserve Arc references instead of full clone
             for (name, col) in self.names.iter().zip(self.cols.iter()) {
                 row.insert(name.clone(), col[i].clone_for_borrow());
@@ -78,10 +77,25 @@ impl RecordBatch {
         out
     }
 
-    /// Drain and materialize all rows, consuming the batch efficiently
+    /// Drain and materialize all rows, consuming the batch efficiently without cloning cells
     pub fn drain_to_rows(&mut self) -> Vec<Row> {
-        let out = self.to_rows();
-        self.truncate(0);
+        let n = self.n();
+        if n == 0 {
+            return Vec::new();
+        }
+        let cols = std::mem::take(&mut self.cols);
+        self.cols = (0..self.names.len()).map(|_| Vec::new()).collect();
+        let mut col_iters: Vec<_> = cols.into_iter().map(|col| col.into_iter()).collect();
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            let mut row = crate::store::acquire_row();
+            for (name, iter) in self.names.iter().zip(col_iters.iter_mut()) {
+                if let Some(cell) = iter.next() {
+                    row.insert(name.clone(), cell);
+                }
+            }
+            out.push(row);
+        }
         out
     }
 

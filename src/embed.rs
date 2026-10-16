@@ -69,21 +69,27 @@ impl Embedder for HashingEmbedder {
     }
 
     fn embed(&self, text: &str) -> Arc<[f32]> {
-        let mut scratch = Scratch::new(self.dim);
-        let mut lower = String::new();
-        self.fill(&mut scratch, crate::fts::lowercased(text, &mut lower));
-        scratch.finish()
+        EMBED_SCRATCH.with(|cell| {
+            let mut guard = cell.borrow_mut();
+            let (scratch, lower) = &mut *guard;
+            scratch.ensure_dim(self.dim);
+            self.fill(scratch, crate::fts::lowercased(text, lower));
+            scratch.finish()
+        })
     }
 
     fn embed_batch(&self, texts: &[&str]) -> Vec<Arc<[f32]>> {
-        let mut scratch = Scratch::new(self.dim);
-        let mut lower = String::new();
-        let mut out = Vec::with_capacity(texts.len());
-        for text in texts {
-            self.fill(&mut scratch, crate::fts::lowercased(text, &mut lower));
-            out.push(scratch.finish());
-        }
-        out
+        EMBED_SCRATCH.with(|cell| {
+            let mut guard = cell.borrow_mut();
+            let (scratch, lower) = &mut *guard;
+            scratch.ensure_dim(self.dim);
+            let mut out = Vec::with_capacity(texts.len());
+            for text in texts {
+                self.fill(scratch, crate::fts::lowercased(text, lower));
+                out.push(scratch.finish());
+            }
+            out
+        })
     }
 }
 
@@ -135,6 +141,13 @@ fn bigram_slots() -> &'static [u16] {
     })
 }
 
+thread_local! {
+    static EMBED_SCRATCH: std::cell::RefCell<(Scratch, String)> = std::cell::RefCell::new((
+        Scratch::new(768),
+        String::with_capacity(256),
+    ));
+}
+
 /// Dense accumulator plus the list of slots the current row actually wrote, so
 /// a batch reuses one allocation and normalizes only its own features.
 struct Scratch {
@@ -148,7 +161,15 @@ impl Scratch {
         Self {
             v: vec![0f32; dim],
             seen: vec![false; dim],
-            touched: Vec::new(),
+            touched: Vec::with_capacity(dim / 4),
+        }
+    }
+
+    fn ensure_dim(&mut self, dim: usize) {
+        if self.v.len() != dim {
+            self.v = vec![0f32; dim];
+            self.seen = vec![false; dim];
+            self.touched.clear();
         }
     }
 
@@ -243,16 +264,62 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f64 {
     if n == 0 {
         return 0.0;
     }
-    let mut dot = 0f64;
-    let mut na = 0f64;
-    let mut nb = 0f64;
-    for i in 0..n {
+    let chunks = n / 4;
+    let mut dot0 = 0.0f64;
+    let mut dot1 = 0.0f64;
+    let mut dot2 = 0.0f64;
+    let mut dot3 = 0.0f64;
+
+    let mut na0 = 0.0f64;
+    let mut na1 = 0.0f64;
+    let mut na2 = 0.0f64;
+    let mut na3 = 0.0f64;
+
+    let mut nb0 = 0.0f64;
+    let mut nb1 = 0.0f64;
+    let mut nb2 = 0.0f64;
+    let mut nb3 = 0.0f64;
+
+    for c in 0..chunks {
+        let base = c * 4;
+        let a0 = a[base] as f64;
+        let a1 = a[base + 1] as f64;
+        let a2 = a[base + 2] as f64;
+        let a3 = a[base + 3] as f64;
+
+        let b0 = b[base] as f64;
+        let b1 = b[base + 1] as f64;
+        let b2 = b[base + 2] as f64;
+        let b3 = b[base + 3] as f64;
+
+        dot0 += a0 * b0;
+        dot1 += a1 * b1;
+        dot2 += a2 * b2;
+        dot3 += a3 * b3;
+
+        na0 += a0 * a0;
+        na1 += a1 * a1;
+        na2 += a2 * a2;
+        na3 += a3 * a3;
+
+        nb0 += b0 * b0;
+        nb1 += b1 * b1;
+        nb2 += b2 * b2;
+        nb3 += b3 * b3;
+    }
+
+    let mut dot = (dot0 + dot1) + (dot2 + dot3);
+    let mut na = (na0 + na1) + (na2 + na3);
+    let mut nb = (nb0 + nb1) + (nb2 + nb3);
+
+    for i in (chunks * 4)..n {
         let x = a[i] as f64;
         let y = b[i] as f64;
         dot += x * y;
         na += x * x;
         nb += y * y;
     }
+
     if na <= 1e-18 || nb <= 1e-18 {
         return 0.0;
     }

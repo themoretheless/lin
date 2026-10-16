@@ -4679,7 +4679,7 @@ fn merge_join_row(mut left: Row, right: &Row, right_col: &str) -> Row {
 
 fn push_project_batch_row(batch: &mut RecordBatch, row: &Row, names: &[String]) {
     for (col_i, name) in names.iter().enumerate() {
-        batch.cols[col_i].push(row.get(name).cloned().unwrap_or(Cell::Null));
+        batch.cols[col_i].push(row.get(name).map(Cell::clone_for_borrow).unwrap_or(Cell::Null));
     }
 }
 
@@ -4691,9 +4691,9 @@ fn push_join_batch_row(
 ) {
     for (col_i, p) in plan.iter().enumerate() {
         let cell = match p {
-            JoinFieldPlan::Left(k) => left.get(k).cloned().unwrap_or(Cell::Null),
+            JoinFieldPlan::Left(k) => left.get(k).map(Cell::clone_for_borrow).unwrap_or(Cell::Null),
             JoinFieldPlan::Right { out: _, idx } => right
-                .and_then(|r| r.get(*idx).cloned())
+                .and_then(|r| r.get(*idx).map(Cell::clone_for_borrow))
                 .unwrap_or(Cell::Null),
         };
         batch.cols[col_i].push(cell);
@@ -5919,7 +5919,7 @@ fn agg_count(rows: &[Row], by: &Field) -> Vec<Row> {
 fn count_cell_map_to_rows(by: &str, map: BTreeMap<String, (Cell, i64)>) -> Vec<Row> {
     map.into_values()
         .map(|(cell, n)| {
-            let mut row = BTreeMap::new();
+            let mut row = crate::store::acquire_row();
             row.insert(by.to_string(), cell);
             row.insert("hits".into(), Cell::Int(n));
             row
@@ -5930,7 +5930,7 @@ fn count_cell_map_to_rows(by: &str, map: BTreeMap<String, (Cell, i64)>) -> Vec<R
 fn count_arc_map_to_rows(by: &str, map: BTreeMap<std::sync::Arc<str>, i64>) -> Vec<Row> {
     map.into_iter()
         .map(|(g, n)| {
-            let mut row = BTreeMap::new();
+            let mut row = crate::store::acquire_row();
             row.insert(by.to_string(), Cell::Text(g));
             row.insert("hits".into(), Cell::Int(n));
             row
@@ -5939,13 +5939,13 @@ fn count_arc_map_to_rows(by: &str, map: BTreeMap<std::sync::Arc<str>, i64>) -> V
 }
 
 fn hits_row(n: i64) -> Row {
-    let mut row = BTreeMap::new();
+    let mut row = crate::store::acquire_row();
     row.insert("hits".into(), Cell::Int(n));
     row
 }
 
 fn count_row(by: &str, value: &str, n: i64) -> Row {
-    let mut row = BTreeMap::new();
+    let mut row = crate::store::acquire_row();
     row.insert(by.to_string(), Cell::text_arc(value));
     row.insert("hits".into(), Cell::Int(n));
     row
@@ -5975,7 +5975,7 @@ fn agg_sum(rows: &[Row], field: &Field, by: Option<&Field>) -> Vec<Row> {
             .iter()
             .map(|r| r.get(&fk).and_then(Cell::as_f64).unwrap_or(0.0))
             .sum();
-        let mut row = BTreeMap::new();
+        let mut row = crate::store::acquire_row();
         row.insert(fk, Cell::Float(total));
         return vec![row];
     };
@@ -5996,7 +5996,7 @@ fn agg_sum(rows: &[Row], field: &Field, by: Option<&Field>) -> Vec<Row> {
     }
     map.into_values()
         .map(|(cell, n)| {
-            let mut row = BTreeMap::new();
+            let mut row = crate::store::acquire_row();
             row.insert(bk.clone(), cell);
             row.insert(fk.clone(), Cell::Float(n));
             row
@@ -6022,7 +6022,7 @@ fn agg_min(rows: &[Row], field: &Field, by: Option<&Field>) -> Vec<Row> {
                 });
             }
         }
-        let mut row = BTreeMap::new();
+        let mut row = crate::store::acquire_row();
         row.insert(fk, best.unwrap_or(Cell::Null));
         return vec![row];
     };
@@ -6055,7 +6055,7 @@ fn agg_min(rows: &[Row], field: &Field, by: Option<&Field>) -> Vec<Row> {
     }
     map.into_values()
         .map(|(gcell, val)| {
-            let mut row = BTreeMap::new();
+            let mut row = crate::store::acquire_row();
             row.insert(bk.clone(), gcell);
             row.insert(fk.clone(), val.unwrap_or(Cell::Null));
             row
@@ -6081,7 +6081,7 @@ fn agg_max(rows: &[Row], field: &Field, by: Option<&Field>) -> Vec<Row> {
                 });
             }
         }
-        let mut row = BTreeMap::new();
+        let mut row = crate::store::acquire_row();
         row.insert(fk, best.unwrap_or(Cell::Null));
         return vec![row];
     };
@@ -6114,7 +6114,7 @@ fn agg_max(rows: &[Row], field: &Field, by: Option<&Field>) -> Vec<Row> {
     }
     map.into_values()
         .map(|(gcell, val)| {
-            let mut row = BTreeMap::new();
+            let mut row = crate::store::acquire_row();
             row.insert(bk.clone(), gcell);
             row.insert(fk.clone(), val.unwrap_or(Cell::Null));
             row
@@ -6134,7 +6134,7 @@ fn agg_avg(rows: &[Row], field: &Field, by: Option<&Field>) -> Vec<Row> {
             }
         }
         let avg = if count == 0 { 0.0 } else { sum / (count as f64) };
-        let mut row = BTreeMap::new();
+        let mut row = crate::store::acquire_row();
         row.insert(fk, Cell::Float(avg));
         return vec![row];
     };
@@ -6160,7 +6160,7 @@ fn agg_avg(rows: &[Row], field: &Field, by: Option<&Field>) -> Vec<Row> {
     map.into_values()
         .map(|(gcell, sum, count)| {
             let avg = if count == 0 { 0.0 } else { sum / (count as f64) };
-            let mut row = BTreeMap::new();
+            let mut row = crate::store::acquire_row();
             row.insert(bk.clone(), gcell);
             row.insert(fk.clone(), Cell::Float(avg));
             row
