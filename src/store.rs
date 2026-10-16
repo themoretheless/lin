@@ -187,26 +187,38 @@ impl Cell {
         matches!(self, Cell::Null)
     }
 
-    pub fn compact(&self) -> String {
+    pub fn compact_into(&self, out: &mut String) {
+        use std::fmt::Write;
         match self {
-            Cell::Null => "null".into(),
-            Cell::Text(s) => format!("{}", Quote(s.as_ref())),
-            Cell::Int(n) => n.to_string(),
-            Cell::Float(n) => n.to_string(),
-            Cell::Bool(b) => b.to_string(),
-            Cell::Time(ms) => fmt_iso_millis(*ms),
-            Cell::Vec(v) => format!("vec[{}]", v.len()),
+            Cell::Null => out.push_str("null"),
+            Cell::Text(s) => {
+                let _ = write!(out, "{:?}", s.as_ref());
+            }
+            Cell::Int(n) => {
+                let _ = write!(out, "{n}");
+            }
+            Cell::Float(n) => {
+                let _ = write!(out, "{n}");
+            }
+            Cell::Bool(b) => {
+                out.push_str(if *b { "true" } else { "false" });
+            }
+            Cell::Time(ms) => {
+                out.push_str(&fmt_iso_millis(*ms));
+            }
+            Cell::Vec(v) => {
+                let _ = write!(out, "vec[{}]", v.len());
+            }
         }
+    }
+
+    pub fn compact(&self) -> String {
+        let mut out = String::with_capacity(16);
+        self.compact_into(&mut out);
+        out
     }
 }
 
-/// Debug-quote like `format!("{s:?}")` without allocating the cell wrapper.
-struct Quote<'a>(&'a str);
-impl std::fmt::Display for Quote<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self.0)
-    }
-}
 
 pub type Row = BTreeMap<String, Cell>;
 
@@ -224,12 +236,22 @@ impl RowExt for Row {
 }
 
 pub fn compact_row(row: &Row) -> String {
-    let parts: Vec<String> = row
-        .iter()
-        .filter(|(_, v)| !matches!(v, Cell::Null))
-        .map(|(k, v)| format!("{k}: {}", v.compact()))
-        .collect();
-    format!("{{{}}}", parts.join(", "))
+    let mut out = String::with_capacity(64);
+    out.push('{');
+    let mut first = true;
+    for (k, v) in row {
+        if !matches!(v, Cell::Null) {
+            if !first {
+                out.push_str(", ");
+            }
+            first = false;
+            out.push_str(k);
+            out.push_str(": ");
+            v.compact_into(&mut out);
+        }
+    }
+    out.push('}');
+    out
 }
 
 pub fn row_text<'a>(row: &'a Row, key: &str) -> Option<&'a str> {

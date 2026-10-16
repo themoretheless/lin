@@ -2857,12 +2857,20 @@ impl Db {
             // Index covers filter but group key varies — read only the by-field.
             let idxs = self.store.index_seek(name, &uses, now)?;
             let mut map: BTreeMap<String, (Cell, i64)> = BTreeMap::new();
+            let mut key_buf = String::with_capacity(32);
             for i in idxs {
                 let Some(row) = self.store.get_by_idx(name, i) else {
                     continue;
                 };
-                let (key, cell) = group_cell_key_and_val(row.get(&by_key));
-                map.entry(key).or_insert((cell, 0)).1 += 1;
+                let cell_opt = row.get(&by_key);
+                key_buf.clear();
+                group_cell_key_into(cell_opt, &mut key_buf);
+                if let Some(entry) = map.get_mut(&key_buf) {
+                    entry.1 += 1;
+                } else {
+                    let cell = cell_opt.map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
+                    map.insert(key_buf.clone(), (cell, 1));
+                }
             }
             return Some(count_cell_map_to_rows(&by_key, map));
         }
@@ -2870,10 +2878,18 @@ impl Db {
         // Full scan count without cloning rows.
         let col = self.store.collection(name);
         let mut map: BTreeMap<String, (Cell, i64)> = BTreeMap::new();
+        let mut key_buf = String::with_capacity(32);
         for r in col {
             if eval_pred(pred, r, now) {
-                let (key, cell) = group_cell_key_and_val(r.get(&by_key));
-                map.entry(key).or_insert((cell, 0)).1 += 1;
+                let cell_opt = r.get(&by_key);
+                key_buf.clear();
+                group_cell_key_into(cell_opt, &mut key_buf);
+                if let Some(entry) = map.get_mut(&key_buf) {
+                    entry.1 += 1;
+                } else {
+                    let cell = cell_opt.map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
+                    map.insert(key_buf.clone(), (cell, 1));
+                }
             }
         }
         Some(count_cell_map_to_rows(&by_key, map))
@@ -5441,13 +5457,19 @@ fn cmp_sort(a: &Cell, b: &Cell) -> std::cmp::Ordering {
     }
 }
 
-fn group_cell_key_and_val(c: Option<&Cell>) -> (String, Cell) {
+#[inline]
+fn group_cell_key_into(c: Option<&Cell>, out: &mut String) {
     match c {
-        Some(Cell::Text(s)) => (format!("\"{s}\""), Cell::Text(std::sync::Arc::clone(s))),
-        Some(Cell::Null) | None => ("null".into(), Cell::text_arc("null")),
-        Some(other) => (other.compact(), other.clone()),
+        Some(Cell::Text(s)) => {
+            out.push('"');
+            out.push_str(s.as_ref());
+            out.push('"');
+        }
+        Some(Cell::Null) | None => out.push_str("null"),
+        Some(other) => other.compact_into(out),
     }
 }
+
 
 fn get_frame_bounds(
     i: usize,
@@ -5503,27 +5525,25 @@ pub(crate) fn eval_window(
 
     let mut partition_keys = Vec::new();
     let mut partitions: FxHashMap<String, Vec<Row>> = FxHashMap::default();
+    let mut key_buf = String::with_capacity(32);
 
     for row in rows {
-        let key = if by_keys.is_empty() {
-            String::new()
-        } else {
-            let mut k = String::new();
-            for bk in &by_keys {
-                if !k.is_empty() {
-                    k.push('\x1f');
+        key_buf.clear();
+        if !by_keys.is_empty() {
+            for (idx, bk) in by_keys.iter().enumerate() {
+                if idx > 0 {
+                    key_buf.push('\x1f');
                 }
-                k.push_str(&group_cell_key_and_val(row.get(bk.as_str())).0);
+                group_cell_key_into(row.get(bk.as_str()), &mut key_buf);
             }
-            k
-        };
-        partitions
-            .entry(key.clone())
-            .or_insert_with(|| {
-                partition_keys.push(key);
-                Vec::new()
-            })
-            .push(row);
+        }
+        if let Some(part) = partitions.get_mut(&key_buf) {
+            part.push(row);
+        } else {
+            let key = key_buf.clone();
+            partition_keys.push(key.clone());
+            partitions.insert(key, vec![row]);
+        }
     }
 
     let mut result_rows = Vec::new();
@@ -5647,66 +5667,83 @@ pub(crate) fn eval_window(
                 }
             }
             crate::window::WindowFunction::Sum => {
-                let mut sums = Vec::with_capacity(n);
-                for i in 0..n {
-                    let (s, e) = get_frame_bounds(i, n, frame, !order_keys.is_empty());
-                    if s <= e && s < n {
-                        let slice = &part[s..=e.min(n - 1)];
-                        let mut int_sum = 0i64;
-                        let mut float_sum = 0.0f64;
-                        let mut has_float = false;
-                        let mut has_val = false;
-                        for r in slice {
-                            if let Some(c) = r.get(tf) {
-                                match c {
-                                    Cell::Int(v) => {
-                                        int_sum += *v;
-                                        float_sum += *v as f64;
-                                        has_val = true;
-                                    }
-                                    Cell::Float(v) => {
-                                        has_float = true;
-                                        float_sum += *v;
-                                        has_val = true;
-                                    }
-                                    _ => {
-                                        if let Some(v) = c.as_f64() {
-                                            has_float = true;
-                                            float_sum += v;
-                                            has_val = true;
-                                        }
-                                    }
-                                }
-                            }
+                let mut has_float = false;
+                for r in &part {
+                    if let Some(c) = r.get(tf) {
+                        if matches!(c, Cell::Float(_)) {
+                            has_float = true;
+                            break;
                         }
-                        let cell = if !has_val {
-                            Cell::Int(0)
-                        } else if has_float {
-                            Cell::Float(float_sum)
-                        } else {
-                            Cell::Int(int_sum)
-                        };
-                        sums.push(cell);
-                    } else {
-                        sums.push(Cell::Int(0));
                     }
                 }
-                sums
+                if has_float {
+                    let mut prefix = Vec::with_capacity(n + 1);
+                    prefix.push(0.0f64);
+                    let mut acc = 0.0f64;
+                    for r in &part {
+                        if let Some(c) = r.get(tf) && let Some(v) = c.as_f64() {
+                            acc += v;
+                        }
+                        prefix.push(acc);
+                    }
+                    let mut sums = Vec::with_capacity(n);
+                    for i in 0..n {
+                        let (s, e) = get_frame_bounds(i, n, frame, !order_keys.is_empty());
+                        if s <= e && s < n {
+                            let end_idx = e.min(n - 1);
+                            let sum = prefix[end_idx + 1] - prefix[s];
+                            sums.push(Cell::Float(sum));
+                        } else {
+                            sums.push(Cell::Float(0.0));
+                        }
+                    }
+                    sums
+                } else {
+                    let mut prefix = Vec::with_capacity(n + 1);
+                    prefix.push(0i64);
+                    let mut acc = 0i64;
+                    for r in &part {
+                        if let Some(c) = r.get(tf) && let Some(v) = c.as_int() {
+                            acc += v;
+                        }
+                        prefix.push(acc);
+                    }
+                    let mut sums = Vec::with_capacity(n);
+                    for i in 0..n {
+                        let (s, e) = get_frame_bounds(i, n, frame, !order_keys.is_empty());
+                        if s <= e && s < n {
+                            let end_idx = e.min(n - 1);
+                            let sum = prefix[end_idx + 1] - prefix[s];
+                            sums.push(Cell::Int(sum));
+                        } else {
+                            sums.push(Cell::Int(0));
+                        }
+                    }
+                    sums
+                }
             }
             crate::window::WindowFunction::Avg => {
+                let mut prefix_sum = Vec::with_capacity(n + 1);
+                let mut prefix_cnt = Vec::with_capacity(n + 1);
+                prefix_sum.push(0.0f64);
+                prefix_cnt.push(0usize);
+                let mut sum_acc = 0.0f64;
+                let mut cnt_acc = 0usize;
+                for r in &part {
+                    if let Some(c) = r.get(tf) && let Some(v) = c.as_f64() {
+                        sum_acc += v;
+                        cnt_acc += 1;
+                    }
+                    prefix_sum.push(sum_acc);
+                    prefix_cnt.push(cnt_acc);
+                }
                 let mut avgs = Vec::with_capacity(n);
                 for i in 0..n {
                     let (s, e) = get_frame_bounds(i, n, frame, !order_keys.is_empty());
                     if s <= e && s < n {
-                        let slice = &part[s..=e.min(n - 1)];
-                        let mut sum = 0.0f64;
-                        let mut count = 0usize;
-                        for r in slice {
-                            if let Some(c) = r.get(tf) && let Some(v) = c.as_f64() {
-                                sum += v;
-                                count += 1;
-                            }
-                        }
+                        let end_idx = e.min(n - 1);
+                        let sum = prefix_sum[end_idx + 1] - prefix_sum[s];
+                        let count = prefix_cnt[end_idx + 1] - prefix_cnt[s];
                         let avg = if count == 0 { 0.0 } else { sum / count as f64 };
                         avgs.push(Cell::Float(avg));
                     } else {
@@ -5716,66 +5753,139 @@ pub(crate) fn eval_window(
                 avgs
             }
             crate::window::WindowFunction::Min => {
-                let mut mins = Vec::with_capacity(n);
-                for i in 0..n {
-                    let (s, e) = get_frame_bounds(i, n, frame, !order_keys.is_empty());
-                    if s <= e && s < n {
-                        let slice = &part[s..=e.min(n - 1)];
-                        let mut min_cell: Option<Cell> = None;
-                        for r in slice {
-                            if let Some(c) = r.get(tf).filter(|c| !matches!(c, Cell::Null)) {
-                                min_cell = Some(match min_cell {
-                                    None => c.clone(),
-                                    Some(prev) => if cmp_sort(c, &prev).is_lt() { c.clone() } else { prev },
-                                });
-                            }
+                let is_running = frame.is_none() && !order_keys.is_empty();
+                let is_whole = frame.is_none() && order_keys.is_empty();
+                if is_whole {
+                    let mut min_cell: Option<Cell> = None;
+                    for r in &part {
+                        if let Some(c) = r.get(tf).filter(|c| !matches!(c, Cell::Null)) {
+                            min_cell = Some(match min_cell {
+                                None => c.clone_for_borrow(),
+                                Some(prev) => if cmp_sort(c, &prev).is_lt() { c.clone_for_borrow() } else { prev },
+                            });
                         }
-                        mins.push(min_cell.unwrap_or(Cell::Null));
-                    } else {
-                        mins.push(Cell::Null);
                     }
+                    let cell = min_cell.unwrap_or(Cell::Null);
+                    vec![cell; n]
+                } else if is_running {
+                    let mut mins = Vec::with_capacity(n);
+                    let mut min_cell: Option<Cell> = None;
+                    for r in &part {
+                        if let Some(c) = r.get(tf).filter(|c| !matches!(c, Cell::Null)) {
+                            min_cell = Some(match min_cell {
+                                None => c.clone_for_borrow(),
+                                Some(prev) => if cmp_sort(c, &prev).is_lt() { c.clone_for_borrow() } else { prev },
+                            });
+                        }
+                        mins.push(min_cell.clone().unwrap_or(Cell::Null));
+                    }
+                    mins
+                } else {
+                    let mut mins = Vec::with_capacity(n);
+                    for i in 0..n {
+                        let (s, e) = get_frame_bounds(i, n, frame, !order_keys.is_empty());
+                        if s <= e && s < n {
+                            let slice = &part[s..=e.min(n - 1)];
+                            let mut min_cell: Option<Cell> = None;
+                            for r in slice {
+                                if let Some(c) = r.get(tf).filter(|c| !matches!(c, Cell::Null)) {
+                                    min_cell = Some(match min_cell {
+                                        None => c.clone_for_borrow(),
+                                        Some(prev) => if cmp_sort(c, &prev).is_lt() { c.clone_for_borrow() } else { prev },
+                                    });
+                                }
+                            }
+                            mins.push(min_cell.unwrap_or(Cell::Null));
+                        } else {
+                            mins.push(Cell::Null);
+                        }
+                    }
+                    mins
                 }
-                mins
             }
             crate::window::WindowFunction::Max => {
-                let mut maxs = Vec::with_capacity(n);
-                for i in 0..n {
-                    let (s, e) = get_frame_bounds(i, n, frame, !order_keys.is_empty());
-                    if s <= e && s < n {
-                        let slice = &part[s..=e.min(n - 1)];
-                        let mut max_cell: Option<Cell> = None;
-                        for r in slice {
-                            if let Some(c) = r.get(tf).filter(|c| !matches!(c, Cell::Null)) {
-                                max_cell = Some(match max_cell {
-                                    None => c.clone(),
-                                    Some(prev) => if cmp_sort(c, &prev).is_gt() { c.clone() } else { prev },
-                                });
-                            }
+                let is_running = frame.is_none() && !order_keys.is_empty();
+                let is_whole = frame.is_none() && order_keys.is_empty();
+                if is_whole {
+                    let mut max_cell: Option<Cell> = None;
+                    for r in &part {
+                        if let Some(c) = r.get(tf).filter(|c| !matches!(c, Cell::Null)) {
+                            max_cell = Some(match max_cell {
+                                None => c.clone_for_borrow(),
+                                Some(prev) => if cmp_sort(c, &prev).is_gt() { c.clone_for_borrow() } else { prev },
+                            });
                         }
-                        maxs.push(max_cell.unwrap_or(Cell::Null));
-                    } else {
-                        maxs.push(Cell::Null);
                     }
+                    let cell = max_cell.unwrap_or(Cell::Null);
+                    vec![cell; n]
+                } else if is_running {
+                    let mut maxs = Vec::with_capacity(n);
+                    let mut max_cell: Option<Cell> = None;
+                    for r in &part {
+                        if let Some(c) = r.get(tf).filter(|c| !matches!(c, Cell::Null)) {
+                            max_cell = Some(match max_cell {
+                                None => c.clone_for_borrow(),
+                                Some(prev) => if cmp_sort(c, &prev).is_gt() { c.clone_for_borrow() } else { prev },
+                            });
+                        }
+                        maxs.push(max_cell.clone().unwrap_or(Cell::Null));
+                    }
+                    maxs
+                } else {
+                    let mut maxs = Vec::with_capacity(n);
+                    for i in 0..n {
+                        let (s, e) = get_frame_bounds(i, n, frame, !order_keys.is_empty());
+                        if s <= e && s < n {
+                            let slice = &part[s..=e.min(n - 1)];
+                            let mut max_cell: Option<Cell> = None;
+                            for r in slice {
+                                if let Some(c) = r.get(tf).filter(|c| !matches!(c, Cell::Null)) {
+                                    max_cell = Some(match max_cell {
+                                        None => c.clone_for_borrow(),
+                                        Some(prev) => if cmp_sort(c, &prev).is_gt() { c.clone_for_borrow() } else { prev },
+                                    });
+                                }
+                            }
+                            maxs.push(max_cell.unwrap_or(Cell::Null));
+                        } else {
+                            maxs.push(Cell::Null);
+                        }
+                    }
+                    maxs
                 }
-                maxs
             }
             crate::window::WindowFunction::Count => {
-                let mut counts = Vec::with_capacity(n);
-                for i in 0..n {
-                    let (s, e) = get_frame_bounds(i, n, frame, !order_keys.is_empty());
-                    if s <= e && s < n {
-                        let slice = &part[s..=e.min(n - 1)];
-                        let count = if target_field.is_some() {
-                            slice.iter().filter(|r| r.get(tf).is_some_and(|c| !matches!(c, Cell::Null))).count()
-                        } else {
-                            slice.len()
-                        };
-                        counts.push(Cell::Int(count as i64));
-                    } else {
-                        counts.push(Cell::Int(0));
+                if target_field.is_some() {
+                    let mut prefix_cnt = Vec::with_capacity(n + 1);
+                    prefix_cnt.push(0usize);
+                    let mut cnt_acc = 0usize;
+                    for r in &part {
+                        if r.get(tf).is_some_and(|c| !matches!(c, Cell::Null)) {
+                            cnt_acc += 1;
+                        }
+                        prefix_cnt.push(cnt_acc);
                     }
+                    let mut counts = Vec::with_capacity(n);
+                    for i in 0..n {
+                        let (s, e) = get_frame_bounds(i, n, frame, !order_keys.is_empty());
+                        if s <= e && s < n {
+                            let end_idx = e.min(n - 1);
+                            let count = prefix_cnt[end_idx + 1] - prefix_cnt[s];
+                            counts.push(Cell::Int(count as i64));
+                        } else {
+                            counts.push(Cell::Int(0));
+                        }
+                    }
+                    counts
+                } else {
+                    let mut counts = Vec::with_capacity(n);
+                    for i in 0..n {
+                        let (s, e) = get_frame_bounds(i, n, frame, !order_keys.is_empty());
+                        let count = if s <= e && s < n { e.min(n - 1) - s + 1 } else { 0 };
+                        counts.push(Cell::Int(count as i64));
+                    }
+                    counts
                 }
-                counts
             }
         };
 
@@ -5791,9 +5901,17 @@ pub(crate) fn eval_window(
 fn agg_count(rows: &[Row], by: &Field) -> Vec<Row> {
     let k = by.as_str();
     let mut map: BTreeMap<String, (Cell, i64)> = BTreeMap::new();
+    let mut key_buf = String::with_capacity(32);
     for r in rows {
-        let (key, cell) = group_cell_key_and_val(r.get(&k));
-        map.entry(key).or_insert((cell, 0)).1 += 1;
+        let cell_opt = r.get(&k);
+        key_buf.clear();
+        group_cell_key_into(cell_opt, &mut key_buf);
+        if let Some(entry) = map.get_mut(&key_buf) {
+            entry.1 += 1;
+        } else {
+            let cell = cell_opt.map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
+            map.insert(key_buf.clone(), (cell, 1));
+        }
     }
     count_cell_map_to_rows(&k, map)
 }
@@ -5863,10 +5981,18 @@ fn agg_sum(rows: &[Row], field: &Field, by: Option<&Field>) -> Vec<Row> {
     };
     let bk = by.as_str();
     let mut map: BTreeMap<String, (Cell, f64)> = BTreeMap::new();
+    let mut key_buf = String::with_capacity(32);
     for r in rows {
-        let (key, cell) = group_cell_key_and_val(r.get(&bk));
+        let cell_opt = r.get(&bk);
         let n = r.get(&fk).and_then(Cell::as_f64).unwrap_or(0.0);
-        map.entry(key).or_insert((cell, 0.0)).1 += n;
+        key_buf.clear();
+        group_cell_key_into(cell_opt, &mut key_buf);
+        if let Some(entry) = map.get_mut(&key_buf) {
+            entry.1 += n;
+        } else {
+            let cell = cell_opt.map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
+            map.insert(key_buf.clone(), (cell, n));
+        }
     }
     map.into_values()
         .map(|(cell, n)| {
@@ -5885,10 +6011,10 @@ fn agg_min(rows: &[Row], field: &Field, by: Option<&Field>) -> Vec<Row> {
         for r in rows {
             if let Some(c) = r.get(&fk).filter(|c| !matches!(c, Cell::Null)) {
                 best = Some(match best {
-                    None => c.clone(),
+                    None => c.clone_for_borrow(),
                     Some(prev) => {
                         if cmp_sort(c, &prev).is_lt() {
-                            c.clone()
+                            c.clone_for_borrow()
                         } else {
                             prev
                         }
@@ -5902,20 +6028,29 @@ fn agg_min(rows: &[Row], field: &Field, by: Option<&Field>) -> Vec<Row> {
     };
     let bk = by.as_str();
     let mut map: BTreeMap<String, (Cell, Option<Cell>)> = BTreeMap::new();
+    let mut key_buf = String::with_capacity(32);
     for r in rows {
-        let (key, gcell) = group_cell_key_and_val(r.get(&bk));
-        let entry = map.entry(key).or_insert((gcell, None));
-        if let Some(c) = r.get(&fk).filter(|c| !matches!(c, Cell::Null)) {
-            entry.1 = Some(match entry.1.take() {
-                None => c.clone(),
-                Some(prev) => {
-                    if cmp_sort(c, &prev).is_lt() {
-                        c.clone()
-                    } else {
-                        prev
+        let cell_opt = r.get(&bk);
+        key_buf.clear();
+        group_cell_key_into(cell_opt, &mut key_buf);
+        let f_val = r.get(&fk).filter(|c| !matches!(c, Cell::Null));
+        if let Some(entry) = map.get_mut(&key_buf) {
+            if let Some(c) = f_val {
+                entry.1 = Some(match entry.1.take() {
+                    None => c.clone_for_borrow(),
+                    Some(prev) => {
+                        if cmp_sort(c, &prev).is_lt() {
+                            c.clone_for_borrow()
+                        } else {
+                            prev
+                        }
                     }
-                }
-            });
+                });
+            }
+        } else {
+            let gcell = cell_opt.map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
+            let val = f_val.map(Cell::clone_for_borrow);
+            map.insert(key_buf.clone(), (gcell, val));
         }
     }
     map.into_values()
@@ -5935,10 +6070,10 @@ fn agg_max(rows: &[Row], field: &Field, by: Option<&Field>) -> Vec<Row> {
         for r in rows {
             if let Some(c) = r.get(&fk).filter(|c| !matches!(c, Cell::Null)) {
                 best = Some(match best {
-                    None => c.clone(),
+                    None => c.clone_for_borrow(),
                     Some(prev) => {
                         if cmp_sort(c, &prev).is_gt() {
-                            c.clone()
+                            c.clone_for_borrow()
                         } else {
                             prev
                         }
@@ -5952,20 +6087,29 @@ fn agg_max(rows: &[Row], field: &Field, by: Option<&Field>) -> Vec<Row> {
     };
     let bk = by.as_str();
     let mut map: BTreeMap<String, (Cell, Option<Cell>)> = BTreeMap::new();
+    let mut key_buf = String::with_capacity(32);
     for r in rows {
-        let (key, gcell) = group_cell_key_and_val(r.get(&bk));
-        let entry = map.entry(key).or_insert((gcell, None));
-        if let Some(c) = r.get(&fk).filter(|c| !matches!(c, Cell::Null)) {
-            entry.1 = Some(match entry.1.take() {
-                None => c.clone(),
-                Some(prev) => {
-                    if cmp_sort(c, &prev).is_gt() {
-                        c.clone()
-                    } else {
-                        prev
+        let cell_opt = r.get(&bk);
+        key_buf.clear();
+        group_cell_key_into(cell_opt, &mut key_buf);
+        let f_val = r.get(&fk).filter(|c| !matches!(c, Cell::Null));
+        if let Some(entry) = map.get_mut(&key_buf) {
+            if let Some(c) = f_val {
+                entry.1 = Some(match entry.1.take() {
+                    None => c.clone_for_borrow(),
+                    Some(prev) => {
+                        if cmp_sort(c, &prev).is_gt() {
+                            c.clone_for_borrow()
+                        } else {
+                            prev
+                        }
                     }
-                }
-            });
+                });
+            }
+        } else {
+            let gcell = cell_opt.map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
+            let val = f_val.map(Cell::clone_for_borrow);
+            map.insert(key_buf.clone(), (gcell, val));
         }
     }
     map.into_values()
@@ -5996,12 +6140,21 @@ fn agg_avg(rows: &[Row], field: &Field, by: Option<&Field>) -> Vec<Row> {
     };
     let bk = by.as_str();
     let mut map: BTreeMap<String, (Cell, f64, usize)> = BTreeMap::new();
+    let mut key_buf = String::with_capacity(32);
     for r in rows {
-        let (key, gcell) = group_cell_key_and_val(r.get(&bk));
-        let entry = map.entry(key).or_insert((gcell, 0.0, 0));
-        if let Some(v) = r.get(&fk).and_then(Cell::as_f64) {
-            entry.1 += v;
-            entry.2 += 1;
+        let cell_opt = r.get(&bk);
+        let v_opt = r.get(&fk).and_then(Cell::as_f64);
+        key_buf.clear();
+        group_cell_key_into(cell_opt, &mut key_buf);
+        if let Some(entry) = map.get_mut(&key_buf) {
+            if let Some(v) = v_opt {
+                entry.1 += v;
+                entry.2 += 1;
+            }
+        } else {
+            let gcell = cell_opt.map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
+            let (sum, count) = if let Some(v) = v_opt { (v, 1) } else { (0.0, 0) };
+            map.insert(key_buf.clone(), (gcell, sum, count));
         }
     }
     map.into_values()
@@ -6184,10 +6337,15 @@ impl Db {
         let field = by.as_str();
         let mut key_cells: BTreeMap<String, Cell> = BTreeMap::new();
         let mut row_keys: Vec<String> = Vec::with_capacity(rows.len());
+        let mut key_buf = String::with_capacity(32);
         for row in rows {
-            let (key, cell) = group_cell_key_and_val(row.get(&field));
-            key_cells.entry(key.clone()).or_insert(cell);
-            row_keys.push(key);
+            let cell_opt = row.get(&field);
+            key_buf.clear();
+            group_cell_key_into(cell_opt, &mut key_buf);
+            if !key_cells.contains_key(&key_buf) {
+                key_cells.insert(key_buf.clone(), cell_opt.map(Cell::clone_for_borrow).unwrap_or(Cell::Null));
+            }
+            row_keys.push(key_buf.clone());
         }
         let keys: Vec<String> = key_cells.keys().cloned().collect();
         if keys.len() > u32::MAX as usize {
@@ -6373,10 +6531,15 @@ impl Db {
         let bk = by.as_str();
         let mut key_cells: BTreeMap<String, Cell> = BTreeMap::new();
         let mut row_keys: Vec<String> = Vec::with_capacity(rows.len());
+        let mut key_buf = String::with_capacity(32);
         for row in rows {
-            let (key, cell) = group_cell_key_and_val(row.get(&bk));
-            key_cells.entry(key.clone()).or_insert(cell);
-            row_keys.push(key);
+            let cell_opt = row.get(&bk);
+            key_buf.clear();
+            group_cell_key_into(cell_opt, &mut key_buf);
+            if !key_cells.contains_key(&key_buf) {
+                key_cells.insert(key_buf.clone(), cell_opt.map(Cell::clone_for_borrow).unwrap_or(Cell::Null));
+            }
+            row_keys.push(key_buf.clone());
         }
         let keys: Vec<String> = key_cells.keys().cloned().collect();
         if keys.len() > u32::MAX as usize {
