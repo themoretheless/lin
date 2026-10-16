@@ -92,6 +92,7 @@ pub fn pull(addr: impl ToSocketAddrs, since: u64) -> Result<Vec<u8>, Error> {
 /// Pull WAL frames with token / TLS.
 pub fn pull_with(addr: impl ToSocketAddrs, since: u64, opts: &PullOpts) -> Result<Vec<u8>, Error> {
     let stream = TcpStream::connect(addr).map_err(io_err)?;
+    let _ = stream.set_nodelay(true);
     stream
         .set_read_timeout(Some(Duration::from_secs(30)))
         .map_err(io_err)?;
@@ -136,11 +137,12 @@ fn write_hello<W: Write>(w: &mut W, token: &str, since: u64) -> Result<(), Error
     if token.len() > MAX_TOKEN {
         return Err(Error::runtime("wal ship: token too long"));
     }
-    w.write_all(&PROTO_MAGIC).map_err(io_err)?;
-    w.write_all(&(token.len() as u16).to_le_bytes())
-        .map_err(io_err)?;
-    w.write_all(token.as_bytes()).map_err(io_err)?;
-    w.write_all(&since.to_le_bytes()).map_err(io_err)?;
+    let mut buf = Vec::with_capacity(4 + 2 + token.len() + 8);
+    buf.extend_from_slice(&PROTO_MAGIC);
+    buf.extend_from_slice(&(token.len() as u16).to_le_bytes());
+    buf.extend_from_slice(token.as_bytes());
+    buf.extend_from_slice(&since.to_le_bytes());
+    w.write_all(&buf).map_err(io_err)?;
     w.flush().map_err(io_err)?;
     Ok(())
 }
@@ -351,6 +353,7 @@ fn handle_conn(
     expect_token: Option<&str>,
     tls: Option<Arc<ServerConfig>>,
 ) -> Result<(), Error> {
+    let _ = stream.set_nodelay(true);
     stream
         .set_read_timeout(Some(Duration::from_secs(30)))
         .map_err(io_err)?;
