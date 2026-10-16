@@ -2823,11 +2823,11 @@ impl Store {
             if idx.def.collection != collection {
                 return None;
             }
-            for i in idx.seek_idxs(use_, now) {
+            idx.seek_each(use_, now, |i| {
                 if seen.insert(i) {
                     out.push(i);
                 }
-            }
+            });
         }
         Some(out)
     }
