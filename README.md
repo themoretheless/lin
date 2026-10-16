@@ -125,7 +125,9 @@ orders | min total by user_id
 orders | max total by user_id
 employees | window row_number sort salary desc as rnk | rnk <= 10
 employees | window rank by dept sort salary desc as rnk | rnk <= 3
-employees | window dense_rank by dept sort salary desc as rnk
+employees | window dense_rank by [dept, role] sort [salary desc, id asc] as rnk
+employees | window sum salary sort salary asc as running_sal
+employees | window avg salary sort salary asc rows between 2 preceding and current row as rolling_avg
 employees | window lead salary by dept sort salary asc as next_sal
 employees | window first_value salary by dept sort salary asc as lowest_sal
 docs | hop wikilink | { id, title }
@@ -135,6 +137,7 @@ docs | id == "…" | match a -wikilink-> b -wikilink-> c | { a.title, b.title, c
 docs | id == "…" | match -wikilink*1..2-> b | { b.title }
 docs | id == "…" | match <-wikilink- src | { src.title }
 docs | id == "…" | match -[e:wikilink]-> b | { e.from, e.to, b.title }
+docs | search "wal*" | take 20
 docs | search "wal" | take 20
 docs | wing == "rag" | { id, title } | skip 40 | take 20
 docs | { id } | union orders | { id }

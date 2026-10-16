@@ -570,7 +570,7 @@ impl Queryable {
     }
 
     pub fn window(
-        mut self,
+        self,
         func: crate::window::WindowFunction,
         field: Option<impl AsRef<str>>,
         by: Option<impl AsRef<str>>,
@@ -578,12 +578,34 @@ impl Queryable {
         desc: bool,
         as_field: impl Into<String>,
     ) -> Self {
+        let by_vec: Vec<String> = by.map(|b| vec![b.as_ref().to_string()]).unwrap_or_default();
+        let order_vec: Vec<(String, bool)> = order.map(|o| vec![(o.as_ref().to_string(), desc)]).unwrap_or_default();
+        self.window_with_frame(func, field, by_vec, order_vec, None, as_field)
+    }
+
+    pub fn window_with_frame(
+        mut self,
+        func: crate::window::WindowFunction,
+        field: Option<impl AsRef<str>>,
+        by: impl IntoIterator<Item = impl AsRef<str>>,
+        order: impl IntoIterator<Item = (impl AsRef<str>, bool)>,
+        frame: Option<crate::window::WindowFrame>,
+        as_field: impl Into<String>,
+    ) -> Self {
+        let by_fields: Vec<Field> = by.into_iter().map(|b| Field::path(b.as_ref())).collect();
+        let order_sorts: Vec<crate::ast::WindowSort> = order
+            .into_iter()
+            .map(|(o, desc)| crate::ast::WindowSort {
+                field: Field::path(o.as_ref()),
+                desc,
+            })
+            .collect();
         self.query.steps.push(Step::Window {
             func,
             field: field.map(|f| Field::path(f.as_ref())),
-            by: by.map(|b| Field::path(b.as_ref())),
-            order: order.map(|o| Field::path(o.as_ref())),
-            desc,
+            by: by_fields,
+            order: order_sorts,
+            frame,
             as_field: as_field.into(),
         });
         self
@@ -635,6 +657,42 @@ impl Queryable {
             None::<&str>,
             by,
             order,
+            desc,
+            as_field,
+        )
+    }
+
+    pub fn running_sum(
+        self,
+        field: impl AsRef<str>,
+        order: impl AsRef<str>,
+        desc: bool,
+        as_field: impl Into<String>,
+    ) -> Self {
+        let f = field.as_ref();
+        self.window(
+            crate::window::WindowFunction::Sum,
+            Some(f),
+            None::<&str>,
+            Some(order),
+            desc,
+            as_field,
+        )
+    }
+
+    pub fn running_avg(
+        self,
+        field: impl AsRef<str>,
+        order: impl AsRef<str>,
+        desc: bool,
+        as_field: impl Into<String>,
+    ) -> Self {
+        let f = field.as_ref();
+        self.window(
+            crate::window::WindowFunction::Avg,
+            Some(f),
+            None::<&str>,
+            Some(order),
             desc,
             as_field,
         )
@@ -1127,6 +1185,41 @@ impl<'a, T> BoundQueryable<'a, T> {
         as_field: impl Into<String>,
     ) -> Self {
         self.q = self.q.dense_rank_by(by, order, desc, as_field);
+        self
+    }
+
+    pub fn window_with_frame(
+        mut self,
+        func: crate::window::WindowFunction,
+        field: Option<impl AsRef<str>>,
+        by: impl IntoIterator<Item = impl AsRef<str>>,
+        order: impl IntoIterator<Item = (impl AsRef<str>, bool)>,
+        frame: Option<crate::window::WindowFrame>,
+        as_field: impl Into<String>,
+    ) -> Self {
+        self.q = self.q.window_with_frame(func, field, by, order, frame, as_field);
+        self
+    }
+
+    pub fn running_sum(
+        mut self,
+        field: impl AsRef<str>,
+        order: impl AsRef<str>,
+        desc: bool,
+        as_field: impl Into<String>,
+    ) -> Self {
+        self.q = self.q.running_sum(field, order, desc, as_field);
+        self
+    }
+
+    pub fn running_avg(
+        mut self,
+        field: impl AsRef<str>,
+        order: impl AsRef<str>,
+        desc: bool,
+        as_field: impl Into<String>,
+    ) -> Self {
+        self.q = self.q.running_avg(field, order, desc, as_field);
         self
     }
 

@@ -166,13 +166,13 @@ pub enum Step {
         field: Field,
         desc: bool,
     },
-    /// Window analytical function (rank, dense_rank, row_number, lead, lag, first_value, last_value).
+    /// Window analytical function (rank, dense_rank, row_number, lead, lag, first_value, last_value, sum, avg, min, max, count).
     Window {
         func: crate::window::WindowFunction,
         field: Option<Field>,
-        by: Option<Field>,
-        order: Option<Field>,
-        desc: bool,
+        by: Vec<Field>,
+        order: Vec<WindowSort>,
+        frame: Option<crate::window::WindowFrame>,
         as_field: String,
     },
     /// Drop the first `n` rows (alias `offset` in the surface language).
@@ -183,6 +183,13 @@ pub enum Step {
         n: Option<i64>,
     },
     Union(Query),
+}
+
+/// Sort column specification for window functions
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct WindowSort {
+    pub field: Field,
+    pub desc: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

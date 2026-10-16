@@ -2340,16 +2340,16 @@ impl Db {
                     field,
                     by,
                     order,
-                    desc,
+                    frame,
                     as_field,
                 } => {
                     rows = eval_window(
                         rows,
                         func,
                         field.as_ref(),
-                        by.as_ref(),
-                        order.as_ref(),
-                        *desc,
+                        by,
+                        order,
+                        frame.as_ref(),
                         as_field,
                     );
                 }
@@ -5357,7 +5357,19 @@ fn lex_score_prepared(row: &Row, query: &LexQuery) -> i64 {
     };
     let mut score = 0i64;
     for tok in &query.tokens {
-        if blob_l.contains(tok) {
+        if let Some(prefix) = tok.strip_suffix('*') {
+            if !prefix.is_empty() {
+                if blob_l.contains(prefix) {
+                    score += 1;
+                    if blob_l
+                        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                        .any(|word| word.starts_with(prefix))
+                    {
+                        score += 2;
+                    }
+                }
+            }
+        } else if blob_l.contains(tok) {
             score += 1;
             if blob_l
                 .split(|c: char| !(c.is_alphanumeric() || c == '_'))
@@ -5437,27 +5449,73 @@ fn group_cell_key_and_val(c: Option<&Cell>) -> (String, Cell) {
     }
 }
 
+fn get_frame_bounds(
+    i: usize,
+    n: usize,
+    frame: Option<&crate::window::WindowFrame>,
+    has_order: bool,
+) -> (usize, usize) {
+    match frame {
+        Some(fr) => {
+            let s = match fr.start {
+                crate::window::FrameBound::UnboundedPreceding => 0,
+                crate::window::FrameBound::Preceding(k) => i.saturating_sub(k),
+                crate::window::FrameBound::CurrentRow => i,
+                crate::window::FrameBound::Following(k) => (i + k).min(n.saturating_sub(1)),
+                crate::window::FrameBound::UnboundedFollowing => n.saturating_sub(1),
+            };
+            let e = match fr.end {
+                crate::window::FrameBound::UnboundedPreceding => 0,
+                crate::window::FrameBound::Preceding(k) => i.saturating_sub(k),
+                crate::window::FrameBound::CurrentRow => i,
+                crate::window::FrameBound::Following(k) => (i + k).min(n.saturating_sub(1)),
+                crate::window::FrameBound::UnboundedFollowing => n.saturating_sub(1),
+            };
+            (s, e)
+        }
+        None => {
+            if has_order {
+                (0, i)
+            } else {
+                (0, n.saturating_sub(1))
+            }
+        }
+    }
+}
+
 pub(crate) fn eval_window(
     rows: Vec<Row>,
     func: &crate::window::WindowFunction,
     field: Option<&Field>,
-    by: Option<&Field>,
-    order: Option<&Field>,
-    desc: bool,
+    by: &[Field],
+    order: &[crate::ast::WindowSort],
+    frame: Option<&crate::window::WindowFrame>,
     as_field: &str,
 ) -> Vec<Row> {
     if rows.is_empty() {
         return rows;
     }
 
-    let by_key = by.map(|b| b.as_str());
+    let by_keys: Vec<String> = by.iter().map(|b| b.as_str()).collect();
+    let order_keys: Vec<(String, bool)> = order.iter().map(|s| (s.field.as_str(), s.desc)).collect();
+    let target_field: Option<String> = field.map(|f| f.as_str());
+    let tf: &str = target_field.as_deref().unwrap_or_default();
+
     let mut partition_keys = Vec::new();
     let mut partitions: FxHashMap<String, Vec<Row>> = FxHashMap::default();
 
     for row in rows {
-        let key = match &by_key {
-            Some(bk) => group_cell_key_and_val(row.get(bk)).0,
-            None => String::new(),
+        let key = if by_keys.is_empty() {
+            String::new()
+        } else {
+            let mut k = String::new();
+            for bk in &by_keys {
+                if !k.is_empty() {
+                    k.push('\x1f');
+                }
+                k.push_str(&group_cell_key_and_val(row.get(bk.as_str())).0);
+            }
+            k
         };
         partitions
             .entry(key.clone())
@@ -5468,76 +5526,70 @@ pub(crate) fn eval_window(
             .push(row);
     }
 
-    let order_key = order.map(|o| o.as_str());
-    let target_field = field.map(|f| f.as_str());
-
     let mut result_rows = Vec::new();
 
     for pkey in partition_keys {
         let mut part = partitions.remove(&pkey).unwrap_or_default();
 
-        if let Some(ok) = &order_key {
-            let cmp = |a: &Row, b: &Row| {
-                let av = a.get(ok).unwrap_or(&Cell::Null);
-                let bv = b.get(ok).unwrap_or(&Cell::Null);
-                let ord = cmp_sort(av, bv);
-                if desc {
-                    ord.reverse()
-                } else {
-                    ord
+        if !order_keys.is_empty() {
+            part.sort_by(|a, b| {
+                for (ok, desc) in &order_keys {
+                    let av = a.get(ok.as_str()).unwrap_or(&Cell::Null);
+                    let bv = b.get(ok.as_str()).unwrap_or(&Cell::Null);
+                    let ord = cmp_sort(av, bv);
+                    let ord = if *desc { ord.reverse() } else { ord };
+                    if ord != std::cmp::Ordering::Equal {
+                        return ord;
+                    }
                 }
-            };
-            part.sort_by(cmp);
+                std::cmp::Ordering::Equal
+            });
         }
 
         let n = part.len();
-        match func {
+        let vals: Vec<Cell> = match func {
             crate::window::WindowFunction::RowNumber => {
-                for (i, mut row) in part.into_iter().enumerate() {
-                    row.insert(as_field.to_string(), Cell::Int((i + 1) as i64));
-                    result_rows.push(row);
-                }
+                (0..n).map(|i| Cell::Int((i + 1) as i64)).collect()
             }
             crate::window::WindowFunction::Rank => {
                 let mut ranks = Vec::with_capacity(n);
                 let mut current_rank = 1i64;
                 for i in 0..n {
-                    if i > 0 && let Some(ok) = &order_key {
-                        let prev = part[i - 1].get(ok).unwrap_or(&Cell::Null);
-                        let curr = part[i].get(ok).unwrap_or(&Cell::Null);
-                        if cmp_sort(prev, curr) != std::cmp::Ordering::Equal {
+                    if i > 0 && !order_keys.is_empty() {
+                        let all_equal = order_keys.iter().all(|(ok, _)| {
+                            let prev = part[i - 1].get(ok.as_str()).unwrap_or(&Cell::Null);
+                            let curr = part[i].get(ok.as_str()).unwrap_or(&Cell::Null);
+                            cmp_sort(prev, curr) == std::cmp::Ordering::Equal
+                        });
+                        if !all_equal {
                             current_rank = (i + 1) as i64;
                         }
                     }
-                    ranks.push(current_rank);
+                    ranks.push(Cell::Int(current_rank));
                 }
-                for (i, mut row) in part.into_iter().enumerate() {
-                    row.insert(as_field.to_string(), Cell::Int(ranks[i]));
-                    result_rows.push(row);
-                }
+                ranks
             }
             crate::window::WindowFunction::DenseRank => {
                 let mut ranks = Vec::with_capacity(n);
                 let mut current_rank = 1i64;
                 for i in 0..n {
-                    if i > 0 && let Some(ok) = &order_key {
-                        let prev = part[i - 1].get(ok).unwrap_or(&Cell::Null);
-                        let curr = part[i].get(ok).unwrap_or(&Cell::Null);
-                        if cmp_sort(prev, curr) != std::cmp::Ordering::Equal {
+                    if i > 0 && !order_keys.is_empty() {
+                        let all_equal = order_keys.iter().all(|(ok, _)| {
+                            let prev = part[i - 1].get(ok.as_str()).unwrap_or(&Cell::Null);
+                            let curr = part[i].get(ok.as_str()).unwrap_or(&Cell::Null);
+                            cmp_sort(prev, curr) == std::cmp::Ordering::Equal
+                        });
+                        if !all_equal {
                             current_rank += 1;
                         }
                     }
-                    ranks.push(current_rank);
+                    ranks.push(Cell::Int(current_rank));
                 }
-                for (i, mut row) in part.into_iter().enumerate() {
-                    row.insert(as_field.to_string(), Cell::Int(ranks[i]));
-                    result_rows.push(row);
-                }
+                ranks
             }
             crate::window::WindowFunction::Lead { offset } => {
                 let off = *offset;
-                let tf = target_field.as_deref().unwrap_or_default();
-                let vals: Vec<Cell> = (0..n)
+                (0..n)
                     .map(|i| {
                         if i + off < n {
                             part[i + off].get(tf).cloned().unwrap_or(Cell::Null)
@@ -5545,16 +5597,11 @@ pub(crate) fn eval_window(
                             Cell::Null
                         }
                     })
-                    .collect();
-                for (i, mut row) in part.into_iter().enumerate() {
-                    row.insert(as_field.to_string(), vals[i].clone());
-                    result_rows.push(row);
-                }
+                    .collect()
             }
             crate::window::WindowFunction::Lag { offset } => {
                 let off = *offset;
-                let tf = target_field.as_deref().unwrap_or_default();
-                let vals: Vec<Cell> = (0..n)
+                (0..n)
                     .map(|i| {
                         if i >= off {
                             part[i - off].get(tf).cloned().unwrap_or(Cell::Null)
@@ -5562,28 +5609,179 @@ pub(crate) fn eval_window(
                             Cell::Null
                         }
                     })
-                    .collect();
-                for (i, mut row) in part.into_iter().enumerate() {
-                    row.insert(as_field.to_string(), vals[i].clone());
-                    result_rows.push(row);
-                }
+                    .collect()
             }
             crate::window::WindowFunction::FirstValue => {
-                let tf = target_field.as_deref().unwrap_or_default();
-                let first_val = part.first().and_then(|r| r.get(tf)).cloned().unwrap_or(Cell::Null);
-                for mut row in part {
-                    row.insert(as_field.to_string(), first_val.clone());
-                    result_rows.push(row);
+                if let Some(fr) = frame {
+                    (0..n)
+                        .map(|i| {
+                            let (s, e) = get_frame_bounds(i, n, Some(fr), !order_keys.is_empty());
+                            if s <= e && s < n {
+                                part[s].get(tf).cloned().unwrap_or(Cell::Null)
+                            } else {
+                                Cell::Null
+                            }
+                        })
+                        .collect()
+                } else {
+                    let first_val = part.first().and_then(|r| r.get(tf)).cloned().unwrap_or(Cell::Null);
+                    vec![first_val; n]
                 }
             }
             crate::window::WindowFunction::LastValue => {
-                let tf = target_field.as_deref().unwrap_or_default();
-                let last_val = part.last().and_then(|r| r.get(tf)).cloned().unwrap_or(Cell::Null);
-                for mut row in part {
-                    row.insert(as_field.to_string(), last_val.clone());
-                    result_rows.push(row);
+                if let Some(fr) = frame {
+                    (0..n)
+                        .map(|i| {
+                            let (s, e) = get_frame_bounds(i, n, Some(fr), !order_keys.is_empty());
+                            if s <= e && s < n {
+                                let end_idx = e.min(n - 1);
+                                part[end_idx].get(tf).cloned().unwrap_or(Cell::Null)
+                            } else {
+                                Cell::Null
+                            }
+                        })
+                        .collect()
+                } else {
+                    let last_val = part.last().and_then(|r| r.get(tf)).cloned().unwrap_or(Cell::Null);
+                    vec![last_val; n]
                 }
             }
+            crate::window::WindowFunction::Sum => {
+                let mut sums = Vec::with_capacity(n);
+                for i in 0..n {
+                    let (s, e) = get_frame_bounds(i, n, frame, !order_keys.is_empty());
+                    if s <= e && s < n {
+                        let slice = &part[s..=e.min(n - 1)];
+                        let mut int_sum = 0i64;
+                        let mut float_sum = 0.0f64;
+                        let mut has_float = false;
+                        let mut has_val = false;
+                        for r in slice {
+                            if let Some(c) = r.get(tf) {
+                                match c {
+                                    Cell::Int(v) => {
+                                        int_sum += *v;
+                                        float_sum += *v as f64;
+                                        has_val = true;
+                                    }
+                                    Cell::Float(v) => {
+                                        has_float = true;
+                                        float_sum += *v;
+                                        has_val = true;
+                                    }
+                                    _ => {
+                                        if let Some(v) = c.as_f64() {
+                                            has_float = true;
+                                            float_sum += v;
+                                            has_val = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        let cell = if !has_val {
+                            Cell::Int(0)
+                        } else if has_float {
+                            Cell::Float(float_sum)
+                        } else {
+                            Cell::Int(int_sum)
+                        };
+                        sums.push(cell);
+                    } else {
+                        sums.push(Cell::Int(0));
+                    }
+                }
+                sums
+            }
+            crate::window::WindowFunction::Avg => {
+                let mut avgs = Vec::with_capacity(n);
+                for i in 0..n {
+                    let (s, e) = get_frame_bounds(i, n, frame, !order_keys.is_empty());
+                    if s <= e && s < n {
+                        let slice = &part[s..=e.min(n - 1)];
+                        let mut sum = 0.0f64;
+                        let mut count = 0usize;
+                        for r in slice {
+                            if let Some(c) = r.get(tf) && let Some(v) = c.as_f64() {
+                                sum += v;
+                                count += 1;
+                            }
+                        }
+                        let avg = if count == 0 { 0.0 } else { sum / count as f64 };
+                        avgs.push(Cell::Float(avg));
+                    } else {
+                        avgs.push(Cell::Float(0.0));
+                    }
+                }
+                avgs
+            }
+            crate::window::WindowFunction::Min => {
+                let mut mins = Vec::with_capacity(n);
+                for i in 0..n {
+                    let (s, e) = get_frame_bounds(i, n, frame, !order_keys.is_empty());
+                    if s <= e && s < n {
+                        let slice = &part[s..=e.min(n - 1)];
+                        let mut min_cell: Option<Cell> = None;
+                        for r in slice {
+                            if let Some(c) = r.get(tf).filter(|c| !matches!(c, Cell::Null)) {
+                                min_cell = Some(match min_cell {
+                                    None => c.clone(),
+                                    Some(prev) => if cmp_sort(c, &prev).is_lt() { c.clone() } else { prev },
+                                });
+                            }
+                        }
+                        mins.push(min_cell.unwrap_or(Cell::Null));
+                    } else {
+                        mins.push(Cell::Null);
+                    }
+                }
+                mins
+            }
+            crate::window::WindowFunction::Max => {
+                let mut maxs = Vec::with_capacity(n);
+                for i in 0..n {
+                    let (s, e) = get_frame_bounds(i, n, frame, !order_keys.is_empty());
+                    if s <= e && s < n {
+                        let slice = &part[s..=e.min(n - 1)];
+                        let mut max_cell: Option<Cell> = None;
+                        for r in slice {
+                            if let Some(c) = r.get(tf).filter(|c| !matches!(c, Cell::Null)) {
+                                max_cell = Some(match max_cell {
+                                    None => c.clone(),
+                                    Some(prev) => if cmp_sort(c, &prev).is_gt() { c.clone() } else { prev },
+                                });
+                            }
+                        }
+                        maxs.push(max_cell.unwrap_or(Cell::Null));
+                    } else {
+                        maxs.push(Cell::Null);
+                    }
+                }
+                maxs
+            }
+            crate::window::WindowFunction::Count => {
+                let mut counts = Vec::with_capacity(n);
+                for i in 0..n {
+                    let (s, e) = get_frame_bounds(i, n, frame, !order_keys.is_empty());
+                    if s <= e && s < n {
+                        let slice = &part[s..=e.min(n - 1)];
+                        let count = if target_field.is_some() {
+                            slice.iter().filter(|r| r.get(tf).is_some_and(|c| !matches!(c, Cell::Null))).count()
+                        } else {
+                            slice.len()
+                        };
+                        counts.push(Cell::Int(count as i64));
+                    } else {
+                        counts.push(Cell::Int(0));
+                    }
+                }
+                counts
+            }
+        };
+
+        for (i, mut row) in part.into_iter().enumerate() {
+            row.insert(as_field.to_string(), vals[i].clone());
+            result_rows.push(row);
         }
     }
 

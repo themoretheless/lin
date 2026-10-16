@@ -264,7 +264,33 @@ impl FtsIndex {
     pub fn candidate_idxs(&self, query: &str) -> Vec<usize> {
         let mut candidates = Vec::new();
         for tok in tokenize(query) {
-            if let Some(list) = self.matches(&tok) {
+            if let Some(prefix) = tok.strip_suffix('*') {
+                if !prefix.is_empty() {
+                    let mut prefix_candidates = Vec::new();
+                    let mut matched_terms = std::collections::BTreeSet::new();
+                    for k in self.postings.keys().chain(self.adds.keys()) {
+                        if k.starts_with(prefix) {
+                            matched_terms.insert(k.as_str());
+                        }
+                    }
+                    for term in matched_terms {
+                        if let Some(list) = self.matches(term) {
+                            prefix_candidates = if prefix_candidates.is_empty() {
+                                list
+                            } else {
+                                union_sorted(&prefix_candidates, &list)
+                            };
+                        }
+                    }
+                    if !prefix_candidates.is_empty() {
+                        candidates = if candidates.is_empty() {
+                            prefix_candidates
+                        } else {
+                            union_sorted(&candidates, &prefix_candidates)
+                        };
+                    }
+                }
+            } else if let Some(list) = self.matches(&tok) {
                 candidates = if candidates.is_empty() {
                     list
                 } else {

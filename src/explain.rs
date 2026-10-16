@@ -199,15 +199,22 @@ fn head(node: &Node, kind: ExplainKind, ctx: &ExplainCtx) -> String {
             func,
             by,
             order,
-            desc,
+            frame,
             as_field,
         } => {
             let mut s = format!("Window {func}");
-            if let Some(by) = by {
-                s.push_str(&format!(" by {by}"));
+            if !by.is_empty() {
+                s.push_str(&format!(" by {}", by.join(", ")));
             }
-            if let Some(order) = order {
-                s.push_str(&format!(" sort {order} {}", if *desc { "desc" } else { "asc" }));
+            if !order.is_empty() {
+                let orders: Vec<String> = order
+                    .iter()
+                    .map(|(f, desc)| format!("{f} {}", if *desc { "desc" } else { "asc" }))
+                    .collect();
+                s.push_str(&format!(" sort {}", orders.join(", ")));
+            }
+            if let Some(frame) = frame {
+                s.push_str(&format!(" {frame}"));
             }
             s.push_str(&format!(" as {as_field}"));
             s

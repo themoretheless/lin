@@ -521,19 +521,48 @@ fn check_query(q: &Query, cat: &Catalog, env: &Bindings) -> Result<Scope, Error>
                 field,
                 by,
                 order,
-                desc: _,
+                frame: _,
                 as_field,
             } => {
-                if let Some(by) = by {
-                    require_field(&scope, by)?;
+                for b in by {
+                    require_field(&scope, b)?;
                 }
-                if let Some(order) = order {
-                    require_field(&scope, order)?;
+                for s in order {
+                    require_field(&scope, &s.field)?;
                 }
                 let out_ty = match func {
                     crate::window::WindowFunction::RowNumber
                     | crate::window::WindowFunction::Rank
-                    | crate::window::WindowFunction::DenseRank => Type::I64,
+                    | crate::window::WindowFunction::DenseRank
+                    | crate::window::WindowFunction::Count => Type::I64,
+                    crate::window::WindowFunction::Sum
+                    | crate::window::WindowFunction::Min
+                    | crate::window::WindowFunction::Max => {
+                        let f = field.as_ref().ok_or_else(|| {
+                            Error::new(format!("{func} requires a field argument"))
+                        })?;
+                        let ty = require_field(&scope, f)?;
+                        if !ty.is_numeric() {
+                            return Err(Error::new(format!(
+                                "{func} requires numeric field, found {}",
+                                ty.name()
+                            )));
+                        }
+                        ty
+                    }
+                    crate::window::WindowFunction::Avg => {
+                        let f = field.as_ref().ok_or_else(|| {
+                            Error::new(format!("{func} requires a field argument"))
+                        })?;
+                        let ty = require_field(&scope, f)?;
+                        if !ty.is_numeric() {
+                            return Err(Error::new(format!(
+                                "avg requires numeric field, found {}",
+                                ty.name()
+                            )));
+                        }
+                        Type::F64
+                    }
                     crate::window::WindowFunction::Lead { .. }
                     | crate::window::WindowFunction::Lag { .. }
                     | crate::window::WindowFunction::FirstValue

@@ -1977,6 +1977,96 @@ fn test_window_functions_analytical_queries() {
         .unwrap();
     assert_eq!(h7.len(), 6);
     assert!(h7.iter().all(|r| r.get("r_num").is_some()));
+
+    // 8. Running Sum (default unbounded preceding to current row when ordered)
+    let h8 = db
+        .run("emp | dept == \"Eng\" | window sum salary sort salary asc as running_sal | pick { name, salary, running_sal }")
+        .unwrap();
+    assert_eq!(h8.rows.len(), 4);
+    assert_eq!(h8.rows[0].get("running_sal").unwrap(), &lin::Cell::Int(80)); // Dave: 80
+    assert_eq!(h8.rows[1].get("running_sal").unwrap(), &lin::Cell::Int(170)); // Bob: 80 + 90 = 170
+    assert_eq!(h8.rows[2].get("running_sal").unwrap(), &lin::Cell::Int(260)); // Charlie: 170 + 90 = 260
+    assert_eq!(h8.rows[3].get("running_sal").unwrap(), &lin::Cell::Int(360)); // Alice: 260 + 100 = 360
+
+    // 9. Rolling Average with explicit frame (ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)
+    let h9 = db
+        .run("emp | dept == \"Eng\" | window avg salary sort salary asc rows between 1 preceding and current row as rolling_avg | pick { name, rolling_avg }")
+        .unwrap();
+    assert_eq!(h9.rows.len(), 4);
+    assert_eq!(h9.rows[0].get("rolling_avg").unwrap(), &lin::Cell::Float(80.0));
+    assert_eq!(h9.rows[1].get("rolling_avg").unwrap(), &lin::Cell::Float(85.0)); // (80 + 90) / 2
+    assert_eq!(h9.rows[2].get("rolling_avg").unwrap(), &lin::Cell::Float(90.0)); // (90 + 90) / 2
+    assert_eq!(h9.rows[3].get("rolling_avg").unwrap(), &lin::Cell::Float(95.0)); // (90 + 100) / 2
+
+    // 10. Multi-column sort in window function
+    let h10 = db
+        .run("emp | dept == \"Eng\" | window row_number sort [salary desc, id asc] as rnk | pick { name, rnk }")
+        .unwrap();
+    assert_eq!(h10.rows.len(), 4);
+    assert_eq!(h10.rows[0].get("name").unwrap().text().unwrap(), "Alice");
+    assert_eq!(h10.rows[0].get("rnk").unwrap(), &lin::Cell::Int(1));
+    assert_eq!(h10.rows[1].get("name").unwrap().text().unwrap(), "Bob"); // e2 before e3
+    assert_eq!(h10.rows[1].get("rnk").unwrap(), &lin::Cell::Int(2));
+    assert_eq!(h10.rows[2].get("name").unwrap().text().unwrap(), "Charlie"); // e3
+    assert_eq!(h10.rows[2].get("rnk").unwrap(), &lin::Cell::Int(3));
+
+    // 11. Fluent running_sum and running_avg builder
+    let h11 = db
+        .from("emp")
+        .filter(r#"dept == "Eng""#)
+        .running_sum("salary", "salary", false, "run_sum")
+        .to_vec()
+        .unwrap();
+    assert_eq!(h11.len(), 4);
+    assert_eq!(h11[0].get("run_sum").unwrap(), &lin::Cell::Int(80));
+    assert_eq!(h11[3].get("run_sum").unwrap(), &lin::Cell::Int(360));
 }
+
+#[test]
+fn test_window_multi_column_partition_and_fts_wildcard_prefix() {
+    let mut db = lin::Db::empty();
+    db.run(
+        r#"col sales { id: text, region: text, country: text, year: i64, amount: i64 }
+        insert sales [
+            { id: "s1", region: "EMEA", country: "DE", year: 2024, amount: 100 },
+            { id: "s2", region: "EMEA", country: "DE", year: 2024, amount: 200 },
+            { id: "s3", region: "EMEA", country: "FR", year: 2024, amount: 150 },
+            { id: "s4", region: "APAC", country: "JP", year: 2024, amount: 300 }
+        ]"#,
+    )
+    .unwrap();
+
+    // Multi-column partition: by [region, country]
+    let h = db
+        .run("sales | window sum amount by [region, country] as country_total | sort amount asc | pick { id, region, country, country_total }")
+        .unwrap();
+    assert_eq!(h.rows.len(), 4);
+    // DE total is 300, FR total is 150, JP total is 300
+    for r in &h.rows {
+        let country = r.get("country").unwrap().text().unwrap();
+        let total = r.get("country_total").unwrap();
+        if country == "DE" {
+            assert_eq!(total, &lin::Cell::Int(300));
+        } else if country == "FR" {
+            assert_eq!(total, &lin::Cell::Int(150));
+        } else if country == "JP" {
+            assert_eq!(total, &lin::Cell::Int(300));
+        }
+    }
+
+    // FTS prefix wildcard search on fixture docs
+    let mut fixture_db = lin::Db::fixture();
+    let fts_res = fixture_db
+        .run(r#"docs | search lex "wal*" | take 5"#)
+        .unwrap();
+    assert!(!fts_res.rows.is_empty(), "FTS prefix search should match wal* entries");
+    for row in &fts_res.rows {
+        let body = row.get("body").and_then(|c| c.text()).unwrap_or("");
+        let title = row.get("title").and_then(|c| c.text()).unwrap_or("");
+        let lower = format!("{title} {body}").to_lowercase();
+        assert!(lower.contains("wal"), "Row must contain prefix 'wal': {lower}");
+    }
+}
+
 
 

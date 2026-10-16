@@ -18,6 +18,11 @@ pub enum WindowFunction {
     Lag { offset: usize },      // LAG(col, offset) default 1
     FirstValue,     // FIRST_VALUE(col)
     LastValue,      // LAST_VALUE(col)
+    Sum,            // SUM(col) OVER (...)
+    Avg,            // AVG(col) OVER (...)
+    Min,            // MIN(col) OVER (...)
+    Max,            // MAX(col) OVER (...)
+    Count,          // COUNT(col) OVER (...)
 }
 
 impl std::fmt::Display for WindowFunction {
@@ -30,7 +35,25 @@ impl std::fmt::Display for WindowFunction {
             WindowFunction::Lag { offset } => write!(f, "LAG({})", offset),
             WindowFunction::FirstValue => write!(f, "FIRST_VALUE"),
             WindowFunction::LastValue => write!(f, "LAST_VALUE"),
+            WindowFunction::Sum => write!(f, "SUM"),
+            WindowFunction::Avg => write!(f, "AVG"),
+            WindowFunction::Min => write!(f, "MIN"),
+            WindowFunction::Max => write!(f, "MAX"),
+            WindowFunction::Count => write!(f, "COUNT"),
         }
+    }
+}
+
+/// Window frame specification (ROWS BETWEEN start AND end)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct WindowFrame {
+    pub start: FrameBound,
+    pub end: FrameBound,
+}
+
+impl std::fmt::Display for WindowFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "rows between {} and {}", self.start, self.end)
     }
 }
 
@@ -48,14 +71,25 @@ pub struct WindowSpec {
 }
 
 /// Frame bound specification
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FrameBound {
     UnboundedPreceding,
     UnboundedFollowing,
     CurrentRow,
     Preceding(usize),  // N rows before
     Following(usize),  // N rows after
+}
+
+impl std::fmt::Display for FrameBound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FrameBound::UnboundedPreceding => write!(f, "unbounded preceding"),
+            FrameBound::UnboundedFollowing => write!(f, "unbounded following"),
+            FrameBound::CurrentRow => write!(f, "current row"),
+            FrameBound::Preceding(n) => write!(f, "{n} preceding"),
+            FrameBound::Following(n) => write!(f, "{n} following"),
+        }
+    }
 }
 
 /// Precomputed window state for maintaining running rank/order info
@@ -153,6 +187,11 @@ impl WindowState {
             }
             WindowFunction::FirstValue => data.first().copied().unwrap_or(order_value),
             WindowFunction::LastValue => order_value,
+            WindowFunction::Sum => data.iter().sum::<f64>() + order_value,
+            WindowFunction::Avg => (data.iter().sum::<f64>() + order_value) / (data.len() + 1) as f64,
+            WindowFunction::Min => data.iter().copied().fold(order_value, f64::min),
+            WindowFunction::Max => data.iter().copied().fold(order_value, f64::max),
+            WindowFunction::Count => (data.len() + 1) as f64,
         };
 
         // Store in cache
@@ -215,7 +254,7 @@ pub fn update_window_states(_collection: &str, idx: usize, row: &Row) {
         let mut guard = cache.lock().unwrap();
 
         // Iterate over all cached window states and update if applicable
-        for (_, state) in guard.iter_mut() {
+        for state in guard.values_mut() {
             if !state.spec.order_by.is_empty()
                 && let Some((field_name, _)) = state.spec.order_by.first()
                 && let Some(order_value) = row.get(field_name).and_then(|c| c.as_f64())

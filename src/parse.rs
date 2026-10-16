@@ -581,6 +581,33 @@ impl<'a> Parser<'a> {
         Err(self.err("expected a named step or a predicate after `|`"))
     }
 
+    fn parse_frame_bound(&mut self) -> Result<crate::window::FrameBound, Error> {
+        if self.eat_kw("unbounded") {
+            if self.eat_kw("preceding") {
+                Ok(crate::window::FrameBound::UnboundedPreceding)
+            } else if self.eat_kw("following") {
+                Ok(crate::window::FrameBound::UnboundedFollowing)
+            } else {
+                Err(self.err("expected `preceding` or `following` after `unbounded`"))
+            }
+        } else if self.eat_kw("current") {
+            self.expect_kw("row")?;
+            Ok(crate::window::FrameBound::CurrentRow)
+        } else {
+            let n = self.expect_int()?;
+            if n < 0 {
+                return Err(self.err("frame offset must be non-negative"));
+            }
+            if self.eat_kw("preceding") {
+                Ok(crate::window::FrameBound::Preceding(n as usize))
+            } else if self.eat_kw("following") {
+                Ok(crate::window::FrameBound::Following(n as usize))
+            } else {
+                Err(self.err("expected `preceding` or `following` after frame offset number"))
+            }
+        }
+    }
+
     fn parse_window_step(&mut self) -> Result<Step, Error> {
         let func_name = self.expect_ident()?;
         let (func, field) = match func_name.to_lowercase().as_str() {
@@ -614,37 +641,162 @@ impl<'a> Parser<'a> {
                 (crate::window::WindowFunction::Lag { offset }, Some(f))
             }
             "first_value" | "first" => {
-                let f = self.parse_field()?;
+                let f = if self.eat_char('(') {
+                    let field = self.parse_field()?;
+                    self.expect_char(')')?;
+                    field
+                } else {
+                    self.parse_field()?
+                };
                 (crate::window::WindowFunction::FirstValue, Some(f))
             }
             "last_value" | "last" => {
-                let f = self.parse_field()?;
+                let f = if self.eat_char('(') {
+                    let field = self.parse_field()?;
+                    self.expect_char(')')?;
+                    field
+                } else {
+                    self.parse_field()?
+                };
                 (crate::window::WindowFunction::LastValue, Some(f))
+            }
+            "sum" => {
+                let f = if self.eat_char('(') {
+                    let field = self.parse_field()?;
+                    self.expect_char(')')?;
+                    field
+                } else {
+                    self.parse_field()?
+                };
+                (crate::window::WindowFunction::Sum, Some(f))
+            }
+            "avg" => {
+                let f = if self.eat_char('(') {
+                    let field = self.parse_field()?;
+                    self.expect_char(')')?;
+                    field
+                } else {
+                    self.parse_field()?
+                };
+                (crate::window::WindowFunction::Avg, Some(f))
+            }
+            "min" => {
+                let f = if self.eat_char('(') {
+                    let field = self.parse_field()?;
+                    self.expect_char(')')?;
+                    field
+                } else {
+                    self.parse_field()?
+                };
+                (crate::window::WindowFunction::Min, Some(f))
+            }
+            "max" => {
+                let f = if self.eat_char('(') {
+                    let field = self.parse_field()?;
+                    self.expect_char(')')?;
+                    field
+                } else {
+                    self.parse_field()?
+                };
+                (crate::window::WindowFunction::Max, Some(f))
+            }
+            "count" => {
+                let f = if self.eat_char('(') {
+                    let inner = if self.eat_char('*') {
+                        None
+                    } else {
+                        Some(self.parse_field()?)
+                    };
+                    self.expect_char(')')?;
+                    inner
+                } else if let Some(ident) = self.peek_ident() {
+                    if ["by", "partition", "sort", "order", "rows", "as"].contains(&ident.to_lowercase().as_str()) {
+                        None
+                    } else {
+                        Some(self.parse_field()?)
+                    }
+                } else {
+                    None
+                };
+                (crate::window::WindowFunction::Count, f)
             }
             other => {
                 return Err(self.err(format!(
-                    "unknown window function `{other}`; supported: row_number, rank, dense_rank, lead, lag, first_value, last_value"
+                    "unknown window function `{other}`; supported: row_number, rank, dense_rank, lead, lag, first_value, last_value, sum, avg, min, max, count"
                 )));
             }
         };
 
         let by = if self.eat_kw("by") || self.eat_kw("partition") {
             let _ = self.eat_kw("by");
-            Some(self.parse_field()?)
+            let mut fields = Vec::new();
+            if self.eat_char('[') {
+                while !self.eat_char(']') {
+                    fields.push(self.parse_field()?);
+                    if !self.eat_char(',') {
+                        self.expect_char(']')?;
+                        break;
+                    }
+                }
+            } else {
+                fields.push(self.parse_field()?);
+                while self.eat_char(',') {
+                    fields.push(self.parse_field()?);
+                }
+            }
+            fields
         } else {
-            None
+            Vec::new()
         };
 
-        let (order, desc) = if self.eat_kw("sort") || self.eat_kw("order") {
+        let order = if self.eat_kw("sort") || self.eat_kw("order") {
             let _ = self.eat_kw("by");
-            let order_field = self.parse_field()?;
-            let desc = self.eat_kw("desc");
-            if !desc {
-                self.eat_kw("asc");
+            let mut sorts = Vec::new();
+            if self.eat_char('[') {
+                while !self.eat_char(']') {
+                    let field = self.parse_field()?;
+                    let desc = self.eat_kw("desc");
+                    if !desc {
+                        self.eat_kw("asc");
+                    }
+                    sorts.push(crate::ast::WindowSort { field, desc });
+                    if !self.eat_char(',') {
+                        self.expect_char(']')?;
+                        break;
+                    }
+                }
+            } else {
+                loop {
+                    let field = self.parse_field()?;
+                    let desc = self.eat_kw("desc");
+                    if !desc {
+                        self.eat_kw("asc");
+                    }
+                    sorts.push(crate::ast::WindowSort { field, desc });
+                    if !self.eat_char(',') {
+                        break;
+                    }
+                }
             }
-            (Some(order_field), desc)
+            sorts
         } else {
-            (None, false)
+            Vec::new()
+        };
+
+        let frame = if self.eat_kw("rows") {
+            let _ = self.eat_kw("between");
+            let start = self.parse_frame_bound()?;
+            if self.eat_kw("and") {
+                let end = self.parse_frame_bound()?;
+                Some(crate::window::WindowFrame { start, end })
+            } else {
+                Some(crate::window::WindowFrame {
+                    start,
+                    end: crate::window::FrameBound::CurrentRow,
+                })
+            }
+        } else {
+            None
         };
 
         self.expect_kw("as")?;
@@ -655,7 +807,7 @@ impl<'a> Parser<'a> {
             field,
             by,
             order,
-            desc,
+            frame,
             as_field,
         })
     }

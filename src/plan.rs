@@ -116,9 +116,9 @@ pub enum NodeKind {
     },
     Window {
         func: String,
-        by: Option<String>,
-        order: Option<String>,
-        desc: bool,
+        by: Vec<String>,
+        order: Vec<(String, bool)>,
+        frame: Option<String>,
         as_field: String,
     },
     Skip {
@@ -553,11 +553,11 @@ fn plan_query_inner(q: &Query, cat: &Catalog, allow_implicit_take: bool) -> Resu
                 if let Some(f) = field {
                     push_field(&mut needed, &f.as_str());
                 }
-                if let Some(b) = by {
+                for b in by {
                     push_field(&mut needed, &b.as_str());
                 }
-                if let Some(o) = order {
-                    push_field(&mut needed, &o.as_str());
+                for s in order {
+                    push_field(&mut needed, &s.field.as_str());
                 }
             }
             Step::Hop { .. } => {}
@@ -772,7 +772,7 @@ fn plan_query_inner(q: &Query, cat: &Catalog, allow_implicit_take: bool) -> Resu
                 field,
                 by,
                 order,
-                desc,
+                frame,
                 as_field,
             } => {
                 let func_str = match field {
@@ -782,9 +782,9 @@ fn plan_query_inner(q: &Query, cat: &Catalog, allow_implicit_take: bool) -> Resu
                 cur = node(
                     NodeKind::Window {
                         func: func_str,
-                        by: by.as_ref().map(|b| b.as_str()),
-                        order: order.as_ref().map(|o| o.as_str()),
-                        desc: *desc,
+                        by: by.iter().map(|b| b.as_str().to_string()).collect(),
+                        order: order.iter().map(|s| (s.field.as_str().to_string(), s.desc)).collect(),
+                        frame: frame.map(|fr| fr.to_string()),
                         as_field: as_field.clone(),
                     },
                     Backend::Native,

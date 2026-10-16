@@ -23,10 +23,13 @@
 - `Queryable::prepare` / `Db::prepare_query` cache Query AST → `Prepared` (no typecheck on hit).
 - `owned` value objects flatten onto a collection; `ToCell` + `#[lin(owned)]` nested `FromRow`.
 - `Db::run_group` atomic group commit and real-open phase metrics in `Stats::reopen`.
-- **Window analytical functions:** `window <func> [<field>] [by <col>] [sort <col> [desc|asc]] as <ident>`.
-  Full support for `row_number`, `rank`, `dense_rank`, `lead`, `lag`, `first_value`, and `last_value`.
+- **Window analytical & aggregate functions:** `window <func> [<field>] [by <cols>] [sort <cols> [desc|asc]] [rows [between] <start> and <end>] as <ident>`.
+  Full support for `row_number`, `rank`, `dense_rank`, `lead`, `lag`, `first_value`, `last_value`, `sum`, `avg`, `min`, `max`, and `count`.
+  Multi-column partitioning (`by [col1, col2]`) and multi-column ordering (`sort [col1 desc, col2 asc]`).
+  Window framing: `rows between <start> and <end>` and `rows <n> preceding` for running totals, moving averages, rolling bounds.
   Allows downstream filtering (`| rnk <= 3`) and projections without subqueries.
-  Fluent methods on `Queryable` and `BoundQueryable`: `.window()`, `.row_number_by()`, `.rank_by()`, `.dense_rank_by()`.
+  Fluent methods on `Queryable` and `BoundQueryable`: `.window()`, `.window_with_frame()`, `.row_number_by()`, `.rank_by()`, `.dense_rank_by()`, `.running_sum()`, `.running_avg()`.
+- **Full-Text Search (FTS) wildcard prefix matching:** `search lex "prefix*"` / `search "prefix*"` merges vocabulary posting lists and scores word prefixes accurately.
 - **Extended aggregations:** `sum <col>` (total without `by`), `min <col> [by <grp>]`, `max <col> [by <grp>]`, `avg <col> [by <grp>]`.
 - **New query predicates:** `not <pred>` / `!<pred>`, `<col> is null`, `<col> is not null`, `<col> in [v1, v2, ...]`, and case-insensitive token search `<col> has_ci "needle"`.
 - **Expanded numeric conversion:** `FromCell` and `ToCell` implementations for `i32`, `i16`, `i8`, `u32`, `u16`, `u8`, `usize`, `f32`.
