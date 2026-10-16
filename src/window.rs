@@ -120,17 +120,15 @@ impl WindowState {
     /// Update window state with new row data
     pub fn update(&mut self, row_idx: usize, row: &Row, _catalog: &Catalog) -> f64 {
         // Calculate partition key
-        let partition_key = if self.spec.partitions.is_empty() {
-            String::from("")
-        } else {
-            let keys: Vec<_> = self
-                .spec
-                .partitions
-                .iter()
-                .filter_map(|field| row.get(field).map(|c| c.compact()))
-                .collect();
-            keys.join("|")
-        };
+        let mut partition_key = String::with_capacity(32);
+        for (i, field) in self.spec.partitions.iter().enumerate() {
+            if i > 0 {
+                partition_key.push('|');
+            }
+            if let Some(c) = row.get(field) {
+                c.compact_into(&mut partition_key);
+            }
+        }
 
         // Get or initialize partition data
         let data = self

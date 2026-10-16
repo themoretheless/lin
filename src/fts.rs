@@ -263,16 +263,20 @@ impl FtsIndex {
     /// Union of posting lists for query tokens (any-token match, then residual score).
     pub fn candidate_idxs(&self, query: &str) -> Vec<usize> {
         let mut candidates = Vec::new();
-        for tok in tokenize(query) {
+        let mut scratch = String::with_capacity(query.len());
+        let lowered = lowercased(query, &mut scratch);
+        for tok in lowered.split_whitespace() {
             if let Some(prefix) = tok.strip_suffix('*') {
                 if !prefix.is_empty() {
                     let mut prefix_candidates = Vec::new();
-                    let mut matched_terms = std::collections::BTreeSet::new();
+                    let mut matched_terms: Vec<&str> = Vec::new();
                     for k in self.postings.keys().chain(self.adds.keys()) {
                         if k.starts_with(prefix) {
-                            matched_terms.insert(k.as_str());
+                            matched_terms.push(k.as_str());
                         }
                     }
+                    matched_terms.sort_unstable();
+                    matched_terms.dedup();
                     for term in matched_terms {
                         if let Some(list) = self.matches(term) {
                             prefix_candidates = if prefix_candidates.is_empty() {
@@ -290,7 +294,7 @@ impl FtsIndex {
                         };
                     }
                 }
-            } else if let Some(list) = self.matches(&tok) {
+            } else if let Some(list) = self.matches(tok) {
                 candidates = if candidates.is_empty() {
                     list
                 } else {
@@ -398,10 +402,12 @@ fn read_str(b: &[u8], i: &mut usize) -> Result<String, Error> {
     Ok(s.to_string())
 }
 
+#[allow(dead_code)]
 pub fn tokenize(text: &str) -> Vec<String> {
-    text.to_lowercase()
+    let mut scratch = String::with_capacity(text.len());
+    let lowered = lowercased(text, &mut scratch);
+    lowered
         .split_whitespace()
-        .filter(|t| !t.is_empty())
         .map(|t| t.to_string())
         .collect()
 }

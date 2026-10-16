@@ -3056,9 +3056,13 @@ fn spo_key(row: &Row) -> Option<(Arc<str>, Arc<str>, Arc<str>)> {
 }
 
 pub fn project_fields(row: &Row, fields: &[String]) -> Row {
-    let mut out = BTreeMap::new();
+    let mut out = acquire_row();
     for f in fields {
-        out.insert(f.clone(), row.get(f).cloned().unwrap_or(Cell::Null));
+        if let Some((k, v)) = row.get_key_value(f) {
+            out.insert(k.clone(), v.clone_for_borrow());
+        } else {
+            out.insert(f.clone(), Cell::Null);
+        }
     }
     out
 }

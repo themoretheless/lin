@@ -10,7 +10,7 @@
 //!
 //! graph / match / sort / union / search vec / hop depth>1 / multi-join → **buffered**.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 
 use crate::ast::{Pred, Query, SearchMode, Source, Step, Stmt};
@@ -57,11 +57,11 @@ impl ProjectedRow {
     }
 
     pub fn into_row(self) -> Row {
-        self.fields
-            .iter()
-            .cloned()
-            .zip(self.cells)
-            .collect::<BTreeMap<_, _>>()
+        let mut row = crate::store::acquire_row();
+        for (f, c) in self.fields.iter().cloned().zip(self.cells) {
+            row.insert(f, c);
+        }
+        row
     }
 
     fn from_row(row: Row) -> Self {
@@ -353,10 +353,10 @@ fn next_lazy_projected(
     let idx = next_lazy_match_idx(store, lazy)?;
     let row = store.get_by_idx(&lazy.collection, idx)?;
     let fields = lazy.project.as_ref().expect("projected state checked");
-    let cells = fields
-        .iter()
-        .map(|field| row.get(field).cloned().unwrap_or(Cell::Null))
-        .collect();
+    let mut cells = Vec::with_capacity(fields.len());
+    for field in fields.iter() {
+        cells.push(row.get(field).map(Cell::clone_for_borrow).unwrap_or(Cell::Null));
+    }
     Some(Ok(ProjectedRow {
         fields: Arc::clone(fields),
         cells,

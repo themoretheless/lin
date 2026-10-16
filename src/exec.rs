@@ -3555,8 +3555,8 @@ impl Db {
                 continue;
             }
             if id_only {
-                let mut r = BTreeMap::new();
-                r.insert("id".into(), row.get("id").cloned().unwrap_or(Cell::Null));
+                let mut r = crate::store::acquire_row();
+                r.insert("id".into(), row.get("id").map(Cell::clone_for_borrow).unwrap_or(Cell::Null));
                 out.push(r);
             } else {
                 out.push(match names.as_deref() {
