@@ -1571,18 +1571,41 @@ impl Store {
         }
     }
 
+    /// Invoke closure for each outgoing or incoming neighbor key without allocating vectors.
+    #[inline]
+    pub fn for_each_neighbor(&self, rel: &str, node: &str, reverse: bool, mut f: impl FnMut(&str)) {
+        let synced = self.edge_keys.len() == self.edges.len();
+        if synced {
+            let key = (Arc::<str>::from(rel), Arc::<str>::from(node));
+            let map = if reverse {
+                &self.edges_in
+            } else {
+                &self.edges_out
+            };
+            if let Some(list) = map.get(&key) {
+                for dst in list {
+                    f(dst.as_ref());
+                }
+                return;
+            }
+        }
+        for e in &self.edges {
+            if e.rel == rel {
+                if reverse {
+                    if e.to == node {
+                        f(e.from.as_str());
+                    }
+                } else if e.from == node {
+                    f(e.to.as_str());
+                }
+            }
+        }
+    }
+
     /// Outgoing or incoming neighbor keys for `(rel, node)` in $O(1)$ lookup.
     #[inline]
     pub fn edge_neighbors(&self, rel: &str, node: &str, reverse: bool) -> Vec<Arc<str>> {
-        let synced = self.edge_keys.len() == self.edges.len()
-            && self
-                .edges
-                .first()
-                .is_none_or(|e| self.has_edge(&e.rel, &e.from, &e.to))
-            && self
-                .edges
-                .last()
-                .is_none_or(|e| self.has_edge(&e.rel, &e.from, &e.to));
+        let synced = self.edge_keys.len() == self.edges.len();
         if !synced {
             return self
                 .edges

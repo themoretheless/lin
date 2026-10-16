@@ -878,11 +878,11 @@ fn try_lazy_hop(db: &CursorDb<'_>, q: &Query) -> Result<Option<LazyCursor>, Erro
         let mut seen = frontier.clone();
         let mut reached = BTreeSet::new();
         for src in &frontier {
-            for dst in store.edge_neighbors(edge_rel, src, reverse) {
+            store.for_each_neighbor(edge_rel, src, reverse, |dst| {
                 if seen.insert(dst.to_string()) {
                     reached.insert(dst.to_string());
                 }
-            }
+            });
         }
         reached
     };

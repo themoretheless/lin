@@ -3695,12 +3695,12 @@ impl Db {
                 }
             } else {
                 for src in &frontier {
-                    for dst in self.store.edge_neighbors(edge_rel, src, reverse) {
+                    self.store.for_each_neighbor(edge_rel, src, reverse, |dst| {
                         if seen.insert(dst.to_string()) {
                             next.insert(dst.to_string());
                             reached.insert(dst.to_string());
                         }
-                    }
+                    });
                 }
             }
             if reached.len() >= 300 {
@@ -3783,22 +3783,30 @@ impl Db {
                 }
             } else {
                 for src in &frontier {
-                    for dst in self.store.edge_neighbors(edge_rel, src, reverse) {
+                    let mut early_stop = false;
+                    self.store.for_each_neighbor(edge_rel, src, reverse, |dst| {
+                        if early_stop {
+                            return;
+                        }
                         let (from, to) = if reverse {
-                            (dst.as_ref(), src.as_str())
+                            (dst, src.as_str())
                         } else {
-                            (src.as_str(), dst.as_ref())
+                            (src.as_str(), dst)
                         };
                         let key = (edge_rel.to_string(), from.to_string(), to.to_string());
                         if seen_edges.insert(key) {
                             out.push(edge_row(edge_rel, from, to));
                             if out.len() >= 300 {
-                                return Ok(out);
+                                early_stop = true;
+                                return;
                             }
                         }
                         if seen_nodes.insert(dst.to_string()) {
                             next.insert(dst.to_string());
                         }
+                    });
+                    if out.len() >= 300 {
+                        return Ok(out);
                     }
                 }
             }
@@ -3923,9 +3931,9 @@ impl Db {
                         ));
                     }
                 } else {
-                    for dst in self.store.edge_neighbors(edge_rel, &at, reverse) {
-                        if visited.contains(dst.as_ref()) {
-                            continue;
+                    self.store.for_each_neighbor(edge_rel, &at, reverse, |dst| {
+                        if visited.contains(dst) {
+                            return;
                         }
                         let (from, to) = if reverse {
                             (dst.to_string(), at.clone())
@@ -3938,7 +3946,7 @@ impl Db {
                             visited.clone(),
                             Some((edge_rel.to_string(), from, to)),
                         ));
-                    }
+                    });
                 }
             }
         }
