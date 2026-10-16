@@ -23,9 +23,29 @@
 - `Queryable::prepare` / `Db::prepare_query` cache Query AST → `Prepared` (no typecheck on hit).
 - `owned` value objects flatten onto a collection; `ToCell` + `#[lin(owned)]` nested `FromRow`.
 - `Db::run_group` atomic group commit and real-open phase metrics in `Stats::reopen`.
+- **Window analytical functions:** `window <func> [<field>] [by <col>] [sort <col> [desc|asc]] as <ident>`.
+  Full support for `row_number`, `rank`, `dense_rank`, `lead`, `lag`, `first_value`, and `last_value`.
+  Allows downstream filtering (`| rnk <= 3`) and projections without subqueries.
+  Fluent methods on `Queryable` and `BoundQueryable`: `.window()`, `.row_number_by()`, `.rank_by()`, `.dense_rank_by()`.
+- **Extended aggregations:** `sum <col>` (total without `by`), `min <col> [by <grp>]`, `max <col> [by <grp>]`, `avg <col> [by <grp>]`.
+- **New query predicates:** `not <pred>` / `!<pred>`, `<col> is null`, `<col> is not null`, `<col> in [v1, v2, ...]`, and case-insensitive token search `<col> has_ci "needle"`.
+- **Expanded numeric conversion:** `FromCell` and `ToCell` implementations for `i32`, `i16`, `i8`, `u32`, `u16`, `u8`, `usize`, `f32`.
 - Batch embedder hook; hashing embed reuses lowercase scratch across slabs.
 
+### Fixed
+
+- **Partial index persistence:** preserved `pred_src` in `Pack::SchemaIndex` and checkpoint `IndexSnap`.
+- **Cold storage lookup:** point/index lookups now read through `store.collection()` supporting `ColdCol` mmap storage.
+- **Transaction rollback:** `facts` rollback restored for materialized rows and `facts_by_spo` index maps on batch abort.
+- **Collection counts:** fixed double-decrement of `col_counts` on delete.
+- **Facts append performance:** eliminated $O(N^2)$ regression on single fact row appends.
+- **Cursor multi-conjunct filters:** preserved unindexed conjuncts and all DNF branches when reading via partial index.
+
 ### Performance
+
+- **Graph adjacency index:** added `edges_out` and `edges_in` in `Store` for $O(1)$ neighbor lookup during `hop`, `graph`, and `match`.
+- **PK join cursor fast path:** joins on primary key (`to_field == "id"`) use $O(1)$ point lookup (`get_by_id`) instead of constructing a hash table across the entire right collection.
+- **Top-K partial sorting:** `sort | take K` uses `select_nth_unstable_by` instead of sorting all rows.
 
 - FTS lex `take` uses borrowed `(score, row_idx)` top-k instead of cloning and
   fully sorting all candidate rows.

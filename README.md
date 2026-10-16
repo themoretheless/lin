@@ -110,10 +110,24 @@ Features: `derive`, `async` — в `default` (часть 0.3 контракта)
 docs | wing == "rag" and ts > ago 7d | { id, title, room }
 docs | id == "e7c98d54-b4d6-4165-86e9-9b999e7ce9c3"
 docs | title has "wal"
+docs | title has_ci "wal"
 docs | title ~ "wal"
 docs | title ~ "wal" | count
 docs | title ~ /wal.*/i
+docs | not (wing == "rag")
+docs | room is null or room is not null
+orders | status in ["paid", "shipped"]
 orders | total > 100 | join users on user_id | { id, users.email, total }
+orders | sum total
+orders | sum total by user_id
+orders | avg total by user_id
+orders | min total by user_id
+orders | max total by user_id
+employees | window row_number sort salary desc as rnk | rnk <= 10
+employees | window rank by dept sort salary desc as rnk | rnk <= 3
+employees | window dense_rank by dept sort salary desc as rnk
+employees | window lead salary by dept sort salary asc as next_sal
+employees | window first_value salary by dept sort salary asc as lowest_sal
 docs | hop wikilink | { id, title }
 docs | id == "…" | graph wikilink depth=2 | { rel, from, to }
 docs | id == "…" | match -wikilink-> b | { id, b.title }
