@@ -13,6 +13,7 @@ use crate::error::Error;
 use crate::index::LiveIndex;
 use crate::persist::{
     self, ColSnap, Head, IndexSnap, LogRecord, OpenMemOpts, Pack, Persist, RelSnap, Snapshot,
+    SnapshotRef,
 };
 
 thread_local! {
@@ -844,25 +845,43 @@ impl Store {
         persist::durable_sync(&persist.log)
             .or_else(|_| persist.log.sync_all())
             .map_err(persist::io_err)?;
-        let mut snap = self.capture_snapshot_at(persist.catalog_hash.clone(), 0);
+        self.ensure_facts_rows();
+        let cold_names_to_promote: Vec<String> = self.cold.keys().cloned().collect();
+        for name in cold_names_to_promote {
+            self.promote_cold(&name);
+        }
+        let mut cold_names = Vec::new();
         if persist.cold {
             // Cold bins are a decode cache; snapshot stays self-contained (rows kept).
-            let mut cold_names = Vec::new();
-            for (name, rows) in &snap.collections {
+            for (name, rows) in &self.collections {
                 if rows.len() >= cold::COLD_MIN_ROWS {
                     cold::write_cold(&persist.dir, name, rows)?;
                     cold_names.push(name.clone());
                 }
             }
             cold::prune_cold(&persist.dir, &cold_names)?;
-            snap.cold_collections = cold_names;
         }
         let head = Head {
             r#gen: self.r#gen,
             catalog_hash: persist.catalog_hash.clone(),
             embed_id: self.embed_id.clone(),
         };
-        persist::write_snapshot(&persist.dir, &snap)?;
+        let snap_ref = SnapshotRef {
+            r#gen: self.r#gen,
+            embed_id: &self.embed_id,
+            next_id: self.next_id,
+            catalog_hash: &persist.catalog_hash,
+            log_offset: 0,
+            collections: &self.collections,
+            edges: &self.edges,
+            extra_collections: &self.extra_collections,
+            extra_rels: &self.extra_rels,
+            extra_indexes: &self.extra_indexes,
+            extra_filters: &self.extra_filters,
+            extra_owned: &self.extra_owned,
+            cold_collections: &cold_names,
+        };
+        persist::write_snapshot_ref(&persist.dir, &snap_ref)?;
         persist::write_head(&persist.dir, &head)?;
         self.write_fts_files(&persist.dir)?;
         persist::compact_log(&mut persist.log)?;

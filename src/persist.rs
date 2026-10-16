@@ -23,7 +23,7 @@
 //! FTS blobs are local accel; missing/stale files rebuild on open.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, IoSlice, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -219,6 +219,30 @@ pub struct Snapshot {
     /// in the snapshot (self-contained); cold files are optional decode accel.
     #[serde(default)]
     pub cold_collections: Vec<String>,
+}
+
+/// Zero-copy borrowed snapshot view for serialization without cloning collections.
+#[derive(Debug, Clone, Serialize)]
+pub struct SnapshotRef<'a> {
+    pub r#gen: u64,
+    pub embed_id: &'a str,
+    pub next_id: u64,
+    pub catalog_hash: &'a str,
+    pub log_offset: u64,
+    pub collections: &'a std::collections::BTreeMap<String, Vec<Row>>,
+    pub edges: &'a [Edge],
+    #[serde(default)]
+    pub extra_collections: &'a std::collections::BTreeMap<String, ColSnap>,
+    #[serde(default)]
+    pub extra_rels: &'a std::collections::BTreeMap<String, RelSnap>,
+    #[serde(default)]
+    pub extra_indexes: &'a std::collections::BTreeMap<String, IndexSnap>,
+    #[serde(default)]
+    pub extra_filters: &'a std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub extra_owned: &'a std::collections::BTreeMap<String, Vec<(String, String)>>,
+    #[serde(default)]
+    pub cold_collections: &'a [String],
 }
 
 /// When to durability-flush the WAL.
@@ -446,6 +470,11 @@ pub fn write_snapshot(dir: &Path, snap: &Snapshot) -> Result<(), Error> {
     atomic_write(&snapshot_path(dir), &bytes)
 }
 
+pub fn write_snapshot_ref(dir: &Path, snap: &SnapshotRef<'_>) -> Result<(), Error> {
+    let bytes = encode_snapshot_ref_bytes(snap)?;
+    atomic_write(&snapshot_path(dir), &bytes)
+}
+
 /// Portable backup: always self-contained MessagePack (`LIN\x04`).
 pub fn write_backup(path: &Path, snap: &Snapshot) -> Result<(), Error> {
     if let Some(parent) = path.parent()
@@ -453,10 +482,24 @@ pub fn write_backup(path: &Path, snap: &Snapshot) -> Result<(), Error> {
     {
         fs::create_dir_all(parent).map_err(io_err)?;
     }
-    let mut snap = snap.clone();
     // Portable: never ship cold stubs — rows must already be inlined.
-    snap.cold_collections.clear();
-    let bytes = encode_snapshot_bytes(&snap)?;
+    // Use SnapshotRef with cold_collections: &[] to avoid cloning collections/edges.
+    let snap_ref = SnapshotRef {
+        r#gen: snap.r#gen,
+        embed_id: &snap.embed_id,
+        next_id: snap.next_id,
+        catalog_hash: &snap.catalog_hash,
+        log_offset: snap.log_offset,
+        collections: &snap.collections,
+        edges: &snap.edges,
+        extra_collections: &snap.extra_collections,
+        extra_rels: &snap.extra_rels,
+        extra_indexes: &snap.extra_indexes,
+        extra_filters: &snap.extra_filters,
+        extra_owned: &snap.extra_owned,
+        cold_collections: &[],
+    };
+    let bytes = encode_snapshot_ref_bytes(&snap_ref)?;
     atomic_write(path, &bytes)
 }
 
@@ -487,12 +530,17 @@ pub fn expand_cold_into(dir: &Path, snap: &mut Snapshot) -> Result<(), Error> {
     Ok(())
 }
 
-fn encode_snapshot_bytes(snap: &Snapshot) -> Result<Vec<u8>, Error> {
-    let mut body = Vec::new();
-    rmp_serde::encode::write_named(&mut body, snap).map_err(io_err)?;
-    let mut out = Vec::with_capacity(4 + body.len());
+pub fn encode_snapshot_ref_bytes(snap: &SnapshotRef<'_>) -> Result<Vec<u8>, Error> {
+    let mut out = Vec::with_capacity(64 * 1024);
     out.extend_from_slice(&SNAPSHOT_MAGIC);
-    out.extend_from_slice(&body);
+    rmp_serde::encode::write_named(&mut out, snap).map_err(io_err)?;
+    Ok(out)
+}
+
+fn encode_snapshot_bytes(snap: &Snapshot) -> Result<Vec<u8>, Error> {
+    let mut out = Vec::with_capacity(64 * 1024);
+    out.extend_from_slice(&SNAPSHOT_MAGIC);
+    rmp_serde::encode::write_named(&mut out, snap).map_err(io_err)?;
     Ok(out)
 }
 
@@ -711,10 +759,13 @@ pub fn append_batch_records(
         hdr[..4].copy_from_slice(&LOG_MAGIC_CHECKSUM);
         hdr[4..].copy_from_slice(&(len as u32).to_le_bytes());
 
-        log.write_all(&hdr).map_err(io_err)?;
-        log.write_all(&codec).map_err(io_err)?;
-        log.write_all(&payload).map_err(io_err)?;
-        log.write_all(&checksum_bytes).map_err(io_err)?;
+        let slices = [
+            IoSlice::new(&hdr),
+            IoSlice::new(&codec),
+            IoSlice::new(&payload),
+            IoSlice::new(&checksum_bytes),
+        ];
+        write_all_vectored(log, &slices).map_err(io_err)?;
 
         *log_bytes += 8 + len as u64;
     }
@@ -762,10 +813,13 @@ pub fn append_compressed_batch(
             let mut hdr = [0u8; 8];
             hdr[..4].copy_from_slice(&LOG_MAGIC_CHECKSUM);
             hdr[4..].copy_from_slice(&(len as u32).to_le_bytes());
-            log.write_all(&hdr).map_err(io_err)?;
-            log.write_all(&codec).map_err(io_err)?;
-            log.write_all(&compressed).map_err(io_err)?;
-            log.write_all(&crc).map_err(io_err)?;
+            let slices = [
+                IoSlice::new(&hdr),
+                IoSlice::new(&codec),
+                IoSlice::new(&compressed),
+                IoSlice::new(&crc),
+            ];
+            write_all_vectored(log, &slices).map_err(io_err)?;
             *log_bytes += 8 + len as u64;
         }
 
@@ -832,6 +886,29 @@ fn append_record_v1(
     write_frame(log, &LOG_MAGIC_V1, buf, sync, log_bytes)
 }
 
+fn write_all_vectored(log: &mut File, slices: &[IoSlice<'_>]) -> io::Result<()> {
+    let total: usize = slices.iter().map(|s| s.len()).sum();
+    let mut written = log.write_vectored(slices)?;
+    if written == total {
+        return Ok(());
+    }
+    let mut slice_idx = 0;
+    while written > 0 && slice_idx < slices.len() {
+        if written >= slices[slice_idx].len() {
+            written -= slices[slice_idx].len();
+            slice_idx += 1;
+        } else {
+            log.write_all(&slices[slice_idx][written..])?;
+            slice_idx += 1;
+            break;
+        }
+    }
+    for slice in &slices[slice_idx..] {
+        log.write_all(slice)?;
+    }
+    Ok(())
+}
+
 fn write_frame(
     log: &mut File,
     magic: &[u8; 4],
@@ -854,10 +931,15 @@ fn write_frame(
     let mut hdr = [0u8; 8];
     hdr[..4].copy_from_slice(&LOG_MAGIC_CHECKSUM);
     hdr[4..].copy_from_slice(&(len as u32).to_le_bytes());
-    log.write_all(&hdr).map_err(io_err)?;
-    log.write_all(&codec).map_err(io_err)?;
-    log.write_all(payload).map_err(io_err)?;
-    log.write_all(&checksum).map_err(io_err)?;
+
+    let slices = [
+        IoSlice::new(&hdr),
+        IoSlice::new(&codec),
+        IoSlice::new(payload),
+        IoSlice::new(&checksum),
+    ];
+    write_all_vectored(log, &slices).map_err(io_err)?;
+
     if sync == SyncMode::Full {
         durable_sync(log).map_err(io_err)?;
     }
@@ -1289,8 +1371,9 @@ fn replay_from(
         .map_err(|e| ReplayFail::Io(io_err(e)))?;
     let mut pos = start;
     let mut saw_any = false;
+    let mut buf = Vec::with_capacity(8192);
     loop {
-        match read_one(log, file_len, pos) {
+        match read_one(log, file_len, pos, &mut buf) {
             ReadOne::Eof | ReadOne::Truncated => break,
             ReadOne::Corrupt if !saw_any && start > 0 => return Err(ReplayFail::BadStart),
             ReadOne::Corrupt => return Err(ReplayFail::Io(io_err("corrupt log record"))),
@@ -1315,7 +1398,7 @@ enum ReadOne {
     Io(Error),
 }
 
-fn read_one(log: &mut File, file_len: u64, pos: u64) -> ReadOne {
+fn read_one(log: &mut File, file_len: u64, pos: u64, buf: &mut Vec<u8>) -> ReadOne {
     if pos >= file_len {
         return ReadOne::Eof;
     }
@@ -1345,13 +1428,15 @@ fn read_one(log: &mut File, file_len: u64, pos: u64) -> ReadOne {
         if pos + 8 + need > file_len {
             return ReadOne::Truncated;
         }
-        let mut buf = vec![0u8; len as usize];
-        match log.read_exact(&mut buf) {
+        buf.resize(8 + len as usize, 0);
+        buf[..4].copy_from_slice(&head);
+        buf[4..8].copy_from_slice(&len_buf);
+        match log.read_exact(&mut buf[8..]) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return ReadOne::Truncated,
             Err(e) => return ReadOne::Io(io_err(e)),
         }
-        let rec = match decode_frame(&head, &buf) {
+        let rec = match decode_frame(&head, &buf[8..]) {
             Ok(r) => r,
             Err(_) => return ReadOne::Corrupt,
         };
@@ -1373,13 +1458,14 @@ fn read_one(log: &mut File, file_len: u64, pos: u64) -> ReadOne {
     if pos + 4 + need > file_len {
         return ReadOne::Truncated;
     }
-    let mut buf = vec![0u8; len as usize];
-    match log.read_exact(&mut buf) {
+    buf.resize(4 + len as usize, 0);
+    buf[..4].copy_from_slice(&head);
+    match log.read_exact(&mut buf[4..]) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return ReadOne::Truncated,
         Err(e) => return ReadOne::Io(io_err(e)),
     }
-    match serde_json::from_slice::<LogRecord>(&buf) {
+    match serde_json::from_slice::<LogRecord>(&buf[4..]) {
         Ok(rec) => ReadOne::Ok {
             rec,
             next: pos + 4 + need,
@@ -1641,22 +1727,17 @@ pub fn export_wal_since(dir: &Path, since_gen: u64) -> Result<Vec<u8>, Error> {
         None => return Ok(Vec::new()),
     };
     let file_len = log.metadata().map_err(io_err)?.len();
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(file_len.min(64 * 1024) as usize);
     let mut pos = 0u64;
+    let mut buf = Vec::with_capacity(8192);
     loop {
-        match read_one(&mut log, file_len, pos) {
+        match read_one(&mut log, file_len, pos, &mut buf) {
             ReadOne::Eof | ReadOne::Truncated => break,
             ReadOne::Corrupt => return Err(io_err("corrupt log")),
             ReadOne::Io(e) => return Err(e),
             ReadOne::Ok { rec, next } => {
                 if rec.r#gen > since_gen {
-                    // Re-read raw frame bytes [pos, next).
-                    let len = (next - pos) as usize;
-                    let mut frame = vec![0u8; len];
-                    log.seek(SeekFrom::Start(pos)).map_err(io_err)?;
-                    log.read_exact(&mut frame).map_err(io_err)?;
-                    out.extend_from_slice(&frame);
-                    log.seek(SeekFrom::Start(next)).map_err(io_err)?;
+                    out.extend_from_slice(&buf);
                 }
                 pos = next;
             }
