@@ -5402,37 +5402,77 @@ fn lex_score_prepared(row: &Row, query: &LexQuery) -> i64 {
 }
 
 fn project(rows: &[Row], fields: &[Field]) -> Vec<Row> {
-    rows.iter()
-        .map(|r| {
-            let mut out = BTreeMap::new();
-            for f in fields {
-                let k = f.as_str();
-                out.insert(k.clone(), r.get(&k).cloned().unwrap_or(Cell::Null));
-            }
-            out
-        })
-        .collect()
+    let mut result = Vec::with_capacity(rows.len());
+    let keys: Vec<String> = fields.iter().map(|f| f.as_str()).collect();
+    for r in rows {
+        let mut out = crate::store::acquire_row();
+        for k in &keys {
+            let cell = r.get(k).map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
+            out.insert(k.clone(), cell);
+        }
+        result.push(out);
+    }
+    result
 }
 
 fn sort_rows_top_k(rows: &mut Vec<Row>, field: &Field, desc: bool, top_k: Option<usize>) {
     let k = field.as_str();
-    let cmp = |a: &Row, b: &Row| {
-        let av = a.get(&k).unwrap_or(&Cell::Null);
-        let bv = b.get(&k).unwrap_or(&Cell::Null);
-        let ord = cmp_sort(av, bv);
-        if desc { ord.reverse() } else { ord }
-    };
-    if let Some(limit) = top_k {
-        if limit == 0 {
-            rows.clear();
-            return;
-        }
-        if rows.len() > limit {
-            rows.select_nth_unstable_by(limit - 1, cmp);
-            rows.truncate(limit);
-        }
+    let n = rows.len();
+    if n <= 1 {
+        return;
     }
-    rows.sort_by(cmp);
+    if let Some(0) = top_k {
+        rows.clear();
+        return;
+    }
+
+    if n <= 32 {
+        let cmp = |a: &Row, b: &Row| {
+            let av = a.get(&k).unwrap_or(&Cell::Null);
+            let bv = b.get(&k).unwrap_or(&Cell::Null);
+            let ord = cmp_sort(av, bv);
+            if desc { ord.reverse() } else { ord }
+        };
+        if let Some(limit) = top_k {
+            if rows.len() > limit {
+                rows.select_nth_unstable_by(limit - 1, cmp);
+                rows.truncate(limit);
+            }
+        }
+        rows.sort_by(cmp);
+        return;
+    }
+
+    // Decorate: extract sort keys once in O(N) instead of O(N log N) BTree lookups
+    let mut keys: Vec<(Cell, usize)> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, r)| (r.get(&k).map(Cell::clone_for_borrow).unwrap_or(Cell::Null), i))
+        .collect();
+
+    let cmp_keys = |a: &(Cell, usize), b: &(Cell, usize)| {
+        let ord = cmp_sort(&a.0, &b.0);
+        let ord = if desc { ord.reverse() } else { ord };
+        ord.then_with(|| a.1.cmp(&b.1))
+    };
+
+    let target_len = if let Some(limit) = top_k {
+        if limit < keys.len() {
+            keys.select_nth_unstable_by(limit - 1, cmp_keys);
+            keys.truncate(limit);
+        }
+        keys.len()
+    } else {
+        keys.len()
+    };
+
+    keys.sort_by(cmp_keys);
+
+    // Undecorate: permute rows into final order in O(N) without cloning
+    let mut old_rows = std::mem::replace(rows, Vec::with_capacity(target_len));
+    for (_, orig_idx) in keys {
+        rows.push(std::mem::take(&mut old_rows[orig_idx]));
+    }
 }
 
 fn cmp_sort(a: &Cell, b: &Cell) -> std::cmp::Ordering {

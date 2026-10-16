@@ -295,6 +295,9 @@ pub fn map_cold(data: &Path, name: &str) -> Result<ColdCol, Error> {
     let path = cold_path(data, name);
     let file = File::open(&path).map_err(io_err)?;
     let mmap = unsafe { Mmap::map(&file) }.map_err(io_err)?;
+
+    #[cfg(unix)]
+    let _ = mmap.advise(memmap2::Advice::Sequential);
     
     // Check both compressed (magic at offset 1) and uncompressed (magic at offset 0)
     let valid = mmap.len() >= 5 && mmap[1..5] == COLD_MAGIC || 
