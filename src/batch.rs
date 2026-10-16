@@ -80,9 +80,9 @@ impl RecordBatch {
 
     /// Drain and materialize all rows, consuming the batch efficiently
     pub fn drain_to_rows(&mut self) -> Vec<Row> {
-        let batch = self.clone();
+        let out = self.to_rows();
         self.truncate(0);
-        batch.to_rows()
+        out
     }
 
     pub fn truncate(&mut self, n: usize) {

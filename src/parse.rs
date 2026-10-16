@@ -457,6 +457,10 @@ impl<'a> Parser<'a> {
             return Ok(Step::Filter(self.parse_pred()?));
         }
         if self.eat_kw("pick") {
+            self.skip();
+            if self.peek() == Some('{') {
+                return Ok(Step::Project(self.parse_project_brace()?));
+            }
             return Ok(Step::Project(self.parse_field_list()?));
         }
         if self.eat_kw("join") {
@@ -514,11 +518,39 @@ impl<'a> Parser<'a> {
         }
         if self.eat_kw("sum") {
             let field = self.parse_field()?;
-            self.expect_kw("by")?;
-            return Ok(Step::Sum {
-                field,
-                by: self.parse_field()?,
-            });
+            let by = if self.eat_kw("by") {
+                Some(self.parse_field()?)
+            } else {
+                None
+            };
+            return Ok(Step::Sum { field, by });
+        }
+        if self.eat_kw("min") {
+            let field = self.parse_field()?;
+            let by = if self.eat_kw("by") {
+                Some(self.parse_field()?)
+            } else {
+                None
+            };
+            return Ok(Step::Min { field, by });
+        }
+        if self.eat_kw("max") {
+            let field = self.parse_field()?;
+            let by = if self.eat_kw("by") {
+                Some(self.parse_field()?)
+            } else {
+                None
+            };
+            return Ok(Step::Max { field, by });
+        }
+        if self.eat_kw("avg") {
+            let field = self.parse_field()?;
+            let by = if self.eat_kw("by") {
+                Some(self.parse_field()?)
+            } else {
+                None
+            };
+            return Ok(Step::Avg { field, by });
         }
         if self.eat_kw("sort") {
             let field = self.parse_field()?;
@@ -527,6 +559,9 @@ impl<'a> Parser<'a> {
                 self.eat_kw("asc");
             }
             return Ok(Step::Sort { field, desc });
+        }
+        if self.eat_kw("window") {
+            return self.parse_window_step();
         }
         if self.eat_kw("skip") || self.eat_kw("offset") {
             let n = self.expect_int()?;
@@ -544,6 +579,85 @@ impl<'a> Parser<'a> {
             return Ok(Step::Filter(self.parse_pred()?));
         }
         Err(self.err("expected a named step or a predicate after `|`"))
+    }
+
+    fn parse_window_step(&mut self) -> Result<Step, Error> {
+        let func_name = self.expect_ident()?;
+        let (func, field) = match func_name.to_lowercase().as_str() {
+            "row_number" => (crate::window::WindowFunction::RowNumber, None),
+            "rank" => (crate::window::WindowFunction::Rank, None),
+            "dense_rank" => (crate::window::WindowFunction::DenseRank, None),
+            "lead" => {
+                let offset = if self.eat_char('(') {
+                    let off = self.expect_int()? as usize;
+                    self.expect_char(')')?;
+                    off
+                } else if self.peek().is_some_and(|c| c.is_ascii_digit()) {
+                    self.expect_int()? as usize
+                } else {
+                    1
+                };
+                let f = self.parse_field()?;
+                (crate::window::WindowFunction::Lead { offset }, Some(f))
+            }
+            "lag" => {
+                let offset = if self.eat_char('(') {
+                    let off = self.expect_int()? as usize;
+                    self.expect_char(')')?;
+                    off
+                } else if self.peek().is_some_and(|c| c.is_ascii_digit()) {
+                    self.expect_int()? as usize
+                } else {
+                    1
+                };
+                let f = self.parse_field()?;
+                (crate::window::WindowFunction::Lag { offset }, Some(f))
+            }
+            "first_value" | "first" => {
+                let f = self.parse_field()?;
+                (crate::window::WindowFunction::FirstValue, Some(f))
+            }
+            "last_value" | "last" => {
+                let f = self.parse_field()?;
+                (crate::window::WindowFunction::LastValue, Some(f))
+            }
+            other => {
+                return Err(self.err(format!(
+                    "unknown window function `{other}`; supported: row_number, rank, dense_rank, lead, lag, first_value, last_value"
+                )));
+            }
+        };
+
+        let by = if self.eat_kw("by") || self.eat_kw("partition") {
+            let _ = self.eat_kw("by");
+            Some(self.parse_field()?)
+        } else {
+            None
+        };
+
+        let (order, desc) = if self.eat_kw("sort") || self.eat_kw("order") {
+            let _ = self.eat_kw("by");
+            let order_field = self.parse_field()?;
+            let desc = self.eat_kw("desc");
+            if !desc {
+                self.eat_kw("asc");
+            }
+            (Some(order_field), desc)
+        } else {
+            (None, false)
+        };
+
+        self.expect_kw("as")?;
+        let as_field = self.expect_ident()?;
+
+        Ok(Step::Window {
+            func,
+            field,
+            by,
+            order,
+            desc,
+            as_field,
+        })
     }
 
     /// `match` path: `-rel-> b`, `<-rel- b`, `-rel*1..3-> b`, `-[e:rel]-> b`.
@@ -643,7 +757,7 @@ impl<'a> Parser<'a> {
 
     fn starts_pred(&self) -> bool {
         match self.peek_after_skip() {
-            Some('(') => true,
+            Some('(') | Some('!') => true,
             Some(_) => matches!(
                 self.peek_ident().as_deref(),
                 Some(id) if !is_step_keyword(id)
@@ -718,6 +832,10 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_unary_pred(&mut self) -> Result<Pred, Error> {
+        if self.eat_kw("not") {
+            let p = self.parse_unary_pred()?;
+            return Ok(Pred::Not(Box::new(p)));
+        }
         if self.eat_char('(') {
             let p = self.parse_pred()?;
             self.expect_char(')')?;
@@ -729,6 +847,43 @@ impl<'a> Parser<'a> {
     fn parse_cmp(&mut self) -> Result<Pred, Error> {
         let field = self.parse_field()?;
         self.skip();
+        if self.eat_kw("is") {
+            let negated = self.eat_kw("not");
+            self.expect_kw("null")?;
+            return Ok(Pred::IsNull { field, negated });
+        }
+        if self.eat_kw("in") {
+            self.expect_char('[')?;
+            let mut values = Vec::new();
+            loop {
+                self.skip();
+                if self.peek() == Some(']') {
+                    break;
+                }
+                values.push(self.parse_value()?);
+                let comma = self.eat_char(',');
+                self.skip();
+                if self.peek() == Some(']') {
+                    break;
+                }
+                if !comma {
+                    return Err(self.err("expected `,` or `]` in `in` list"));
+                }
+            }
+            self.expect_char(']')?;
+            if values.is_empty() {
+                return Err(self.err("empty `in` list"));
+            }
+            return Ok(Pred::In { field, values });
+        }
+        if self.eat_kw("has_ci") {
+            let needle = self.expect_string()?;
+            return Ok(Pred::Has {
+                field,
+                ci: true,
+                needle,
+            });
+        }
         if self.eat_kw("has") {
             let ci = self.eat_kw("ci");
             let needle = self.expect_string()?;
@@ -1369,10 +1524,14 @@ fn is_step_keyword(s: &str) -> bool {
             | "search"
             | "count"
             | "sum"
+            | "min"
+            | "max"
+            | "avg"
             | "sort"
             | "skip"
             | "offset"
             | "take"
+            | "window"
             | "explain"
             | "union"
     )

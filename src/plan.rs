@@ -114,6 +114,13 @@ pub enum NodeKind {
         field: String,
         desc: bool,
     },
+    Window {
+        func: String,
+        by: Option<String>,
+        order: Option<String>,
+        desc: bool,
+        as_field: String,
+    },
     Skip {
         n: i64,
     },
@@ -511,11 +518,16 @@ fn plan_query_inner(q: &Query, cat: &Catalog, allow_implicit_take: bool) -> Resu
                     push_field(&mut needed, &by.as_str());
                 }
             }
-            Step::Sum { field, by } => {
+            Step::Sum { field, by }
+            | Step::Min { field, by }
+            | Step::Max { field, by }
+            | Step::Avg { field, by } => {
                 implicit_take = false;
                 saw_agg = true;
                 push_field(&mut needed, &field.as_str());
-                push_field(&mut needed, &by.as_str());
+                if let Some(by) = by {
+                    push_field(&mut needed, &by.as_str());
+                }
             }
             Step::Search { mode, .. } => {
                 want_search = true;
@@ -532,6 +544,22 @@ fn plan_query_inner(q: &Query, cat: &Catalog, allow_implicit_take: bool) -> Resu
             Step::Filter(pred) => collect_pred_fields(pred, &mut needed),
             Step::Join { on, .. } => push_field(&mut needed, on),
             Step::Sort { field, .. } => push_field(&mut needed, &field.as_str()),
+            Step::Window {
+                field,
+                by,
+                order,
+                ..
+            } => {
+                if let Some(f) = field {
+                    push_field(&mut needed, &f.as_str());
+                }
+                if let Some(b) = by {
+                    push_field(&mut needed, &b.as_str());
+                }
+                if let Some(o) = order {
+                    push_field(&mut needed, &o.as_str());
+                }
+            }
             Step::Hop { .. } => {}
             Step::Graph { .. } => {}
             Step::Match { .. } => {}
@@ -676,7 +704,52 @@ fn plan_query_inner(q: &Query, cat: &Catalog, allow_implicit_take: bool) -> Resu
                 cur = node(
                     NodeKind::Agg {
                         op: format!("sum({})", field.as_str()),
-                        by: by.as_str(),
+                        by: by
+                            .as_ref()
+                            .map(|b| b.as_str())
+                            .unwrap_or_else(|| "*".into()),
+                    },
+                    Backend::Native,
+                    Effect::Read,
+                    vec![cur],
+                );
+            }
+            Step::Min { field, by } => {
+                cur = node(
+                    NodeKind::Agg {
+                        op: format!("min({})", field.as_str()),
+                        by: by
+                            .as_ref()
+                            .map(|b| b.as_str())
+                            .unwrap_or_else(|| "*".into()),
+                    },
+                    Backend::Native,
+                    Effect::Read,
+                    vec![cur],
+                );
+            }
+            Step::Max { field, by } => {
+                cur = node(
+                    NodeKind::Agg {
+                        op: format!("max({})", field.as_str()),
+                        by: by
+                            .as_ref()
+                            .map(|b| b.as_str())
+                            .unwrap_or_else(|| "*".into()),
+                    },
+                    Backend::Native,
+                    Effect::Read,
+                    vec![cur],
+                );
+            }
+            Step::Avg { field, by } => {
+                cur = node(
+                    NodeKind::Agg {
+                        op: format!("avg({})", field.as_str()),
+                        by: by
+                            .as_ref()
+                            .map(|b| b.as_str())
+                            .unwrap_or_else(|| "*".into()),
                     },
                     Backend::Native,
                     Effect::Read,
@@ -688,6 +761,31 @@ fn plan_query_inner(q: &Query, cat: &Catalog, allow_implicit_take: bool) -> Resu
                     NodeKind::Sort {
                         field: field.as_str(),
                         desc: *desc,
+                    },
+                    Backend::Native,
+                    Effect::Read,
+                    vec![cur],
+                );
+            }
+            Step::Window {
+                func,
+                field,
+                by,
+                order,
+                desc,
+                as_field,
+            } => {
+                let func_str = match field {
+                    Some(f) => format!("{}({})", func, f.as_str()),
+                    None => format!("{}", func),
+                };
+                cur = node(
+                    NodeKind::Window {
+                        func: func_str,
+                        by: by.as_ref().map(|b| b.as_str()),
+                        order: order.as_ref().map(|o| o.as_str()),
+                        desc: *desc,
+                        as_field: as_field.clone(),
                     },
                     Backend::Native,
                     Effect::Read,
@@ -1142,8 +1240,20 @@ pub fn fmt_pred(pred: &Pred) -> String {
     match pred {
         Pred::And(a, b) => format!("{} and {}", fmt_pred(a), fmt_pred(b)),
         Pred::Or(a, b) => format!("{} or {}", fmt_pred(a), fmt_pred(b)),
+        Pred::Not(inner) => format!("not ({})", fmt_pred(inner)),
         Pred::Cmp { field, op, value } => {
             format!("{} {} {}", field.as_str(), op.as_str(), fmt_value(value))
+        }
+        Pred::IsNull { field, negated } => {
+            if *negated {
+                format!("{} is not null", field.as_str())
+            } else {
+                format!("{} is null", field.as_str())
+            }
+        }
+        Pred::In { field, values } => {
+            let vals: Vec<String> = values.iter().map(fmt_value).collect();
+            format!("{} in [{}]", field.as_str(), vals.join(", "))
         }
         Pred::Has { field, ci, needle } => {
             if *ci {

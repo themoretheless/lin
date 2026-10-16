@@ -65,11 +65,13 @@ impl RowPool {
     }
 
     /// Drain all pooled rows back (e.g., on reset/clear)
+    #[allow(dead_code)]
     pub fn drain(&mut self) {
         self.cache.clear();
     }
 
     /// Check how many rows are currently pooled
+    #[allow(dead_code)]
     pub fn pool_size(&self) -> usize {
         self.cache.len()
     }
@@ -236,6 +238,7 @@ pub fn row_text<'a>(row: &'a Row, key: &str) -> Option<&'a str> {
 
 /// Hot document row type for zero-copy projection (id, title, layer, wing columns)
 #[derive(Clone)]
+#[allow(dead_code)]
 pub struct HotDocRow {
     pub id: Arc<str>,
     pub title: Arc<str>,
@@ -243,6 +246,7 @@ pub struct HotDocRow {
     pub wing: Arc<str>,
 }
 
+#[allow(dead_code)]
 impl HotDocRow {
     #[inline]
     pub fn to_btree(self) -> BTreeMap<String, Cell> {
@@ -298,6 +302,10 @@ pub struct Store {
     pub(crate) facts_by_spo: FxHashMap<FactKey, usize>,
     /// edge (rel,from,to) set — O(1) append/delete edge.
     pub(crate) edge_keys: FxHashSet<(Arc<str>, Arc<str>, Arc<str>)>,
+    /// (rel, from) → target node keys (outgoing adjacency index).
+    pub(crate) edges_out: FxHashMap<(Arc<str>, Arc<str>), Vec<Arc<str>>>,
+    /// (rel, to) → source node keys (incoming adjacency index).
+    pub(crate) edges_in: FxHashMap<(Arc<str>, Arc<str>), Vec<Arc<str>>>,
     
     // Hot collection metadata — always accessed during scans
     /// Count of rows per collection for quick bounds checking
@@ -333,6 +341,7 @@ pub struct AppendMark {
     next_id: u64,
     col_lens: BTreeMap<String, usize>,
     edge_len: usize,
+    facts_len: usize,
 }
 
 impl Store {
@@ -370,6 +379,8 @@ impl Store {
             docs_by_uri: FxHashMap::default(),
             facts_by_spo: FxHashMap::default(),
             edge_keys: FxHashSet::default(),
+            edges_out: FxHashMap::default(),
+            edges_in: FxHashMap::default(),
             col_counts,
             docs_id: Vec::new(),
             docs_title: Vec::new(),
@@ -616,6 +627,8 @@ impl Store {
             docs_by_uri: FxHashMap::default(),
             facts_by_spo: FxHashMap::default(),
             edge_keys: FxHashSet::default(),
+            edges_out: FxHashMap::default(),
+            edges_in: FxHashMap::default(),
             docs_id: Vec::new(),
             docs_title: Vec::new(),
             docs_title_packed: OnceLock::new(),
@@ -726,11 +739,15 @@ impl Store {
             let _ = cat.apply_decl(&decl);
         }
         for idx in self.extra_indexes.values() {
+            let pred = idx
+                .pred_src
+                .as_deref()
+                .and_then(|src| crate::parse::parse_pred_src(src).ok());
             let _ = cat.apply_decl(&Decl::Index {
                 collection: idx.collection.clone(),
                 unique: idx.unique,
                 fields: idx.fields.clone(),
-                pred: None,
+                pred,
             });
         }
         for (collection, src) in &self.extra_filters {
@@ -953,6 +970,7 @@ impl Store {
                     },
                 );
                 self.collections.entry(name.clone()).or_default();
+                self.col_counts.entry(name.clone()).or_insert(0);
             }
             Pack::SchemaRel {
                 name,
@@ -972,19 +990,24 @@ impl Store {
                 collection,
                 unique,
                 fields,
+                pred_src,
             } => {
                 let snap = IndexSnap {
                     collection: collection.clone(),
                     unique: *unique,
                     fields: fields.clone(),
+                    pred_src: pred_src.clone(),
                 };
                 let label = format!("{}[{}]", collection, fields.join(","));
                 self.extra_indexes.insert(label.clone(), snap);
+                let pred = pred_src
+                    .as_deref()
+                    .and_then(|src| crate::parse::parse_pred_src(src).ok());
                 let def = crate::catalog::IndexDef {
                     collection: collection.clone(),
                     unique: *unique,
                     fields: fields.clone(),
-                    pred: None,
+                    pred,
                     bitmap_card_field: None,
                 };
                 let mut live = LiveIndex::new(def);
@@ -1047,9 +1070,11 @@ impl Store {
         self.extra_indexes = b.extra_indexes;
         self.extra_filters = b.extra_filters;
         self.extra_owned = b.extra_owned;
+        self.facts_rows_stale = false;
         self.rebuild_indexes();
         self.rebuild_row_maps();
         self.rebuild_all_fts_inplace();
+        self.refresh_col_counts();
     }
 
     /// Mark lengths for append-only rollback (insert/append packs).
@@ -1062,13 +1087,22 @@ impl Store {
             next_id: self.next_id,
             col_lens,
             edge_len: self.edges.len(),
+            facts_len: self.facts_s.len(),
         }
     }
 
     pub fn append_rollback(&mut self, mark: AppendMark) {
         self.next_id = mark.next_id;
         self.edges.truncate(mark.edge_len);
+        self.facts_s.truncate(mark.facts_len);
+        self.facts_p.truncate(mark.facts_len);
+        self.facts_o.truncate(mark.facts_len);
+        self.facts_rows_stale = true;
+        self.ensure_facts_rows();
         for (name, rows) in self.collections.iter_mut() {
+            if name == "facts" {
+                continue;
+            }
             let len = mark.col_lens.get(name).copied().unwrap_or(0);
             rows.truncate(len);
         }
@@ -1077,6 +1111,7 @@ impl Store {
         self.rebuild_indexes();
         self.rebuild_row_maps();
         self.rebuild_all_fts_inplace();
+        self.refresh_col_counts();
     }
 
     fn rebuild_all_fts_inplace(&mut self) {
@@ -1157,6 +1192,7 @@ impl Store {
         });
         s.next_id = 10;
         s.rebuild_row_maps();
+        s.refresh_col_counts();
         s
     }
 
@@ -1240,13 +1276,24 @@ impl Store {
     /// Cache-friendly row count lookup (O(1) via FxHashMap, avoids Vec::len iteration)
     #[inline]
     pub fn get_col_count(&self, collection: &str) -> usize {
-        *self.col_counts.get(collection).unwrap_or(&0)
+        if collection == "facts" && self.facts_rows_stale {
+            return self.facts_s.len();
+        }
+        if let Some(&c) = self.col_counts.get(collection)
+            && c > 0
+        {
+            return c;
+        }
+        self.collection(collection).len()
     }
 
     /// Update cached count after single-row insert/delete
     #[inline]
     fn update_col_count(&mut self, collection: &str, delta: isize) {
-        let current = *self.col_counts.get(collection).unwrap_or(&0);
+        let current = *self
+            .col_counts
+            .get(collection)
+            .unwrap_or(&self.collections.get(collection).map_or(0, Vec::len));
         if let Some(new_count) = current.checked_add_signed(delta) {
             self.col_counts.insert(collection.to_string(), new_count);
         }
@@ -1255,8 +1302,13 @@ impl Store {
     /// Rebuild counts from scratch (used after bulk operations or snapshot restore)
     pub fn refresh_col_counts(&mut self) {
         self.col_counts.clear();
-        for (name, rows) in &self.collections {
-            self.col_counts.insert(name.clone(), rows.len());
+        for name in self.collections.keys() {
+            let len = if name == "facts" && self.facts_rows_stale {
+                self.facts_s.len()
+            } else {
+                self.collection(name).len()
+            };
+            self.col_counts.insert(name.clone(), len);
         }
     }
 
@@ -1301,12 +1353,12 @@ impl Store {
 
     pub fn get_by_id(&self, collection: &str, id: &str) -> Option<&Row> {
         let idx = self.row_index(collection, id)?;
-        self.collections.get(collection)?.get(idx)
+        self.get_by_idx(collection, idx)
     }
 
     pub fn get_by_uri(&self, uri: &str) -> Option<&Row> {
         let idx = *self.docs_by_uri.get(uri)?;
-        self.collections.get("docs")?.get(idx)
+        self.get_by_idx("docs", idx)
     }
 
     pub fn row_index(&self, collection: &str, id: &str) -> Option<usize> {
@@ -1320,7 +1372,7 @@ impl Store {
             "id" => self.row_index(collection, key),
             "uri" if collection == "docs" => {
                 let idx = *self.docs_by_uri.get(key)?;
-                self.collections.get("docs")?.get(idx)?;
+                self.get_by_idx("docs", idx)?;
                 Some(idx)
             }
             _ => None,
@@ -1328,13 +1380,14 @@ impl Store {
     }
 
     pub fn get_by_idx(&self, collection: &str, idx: usize) -> Option<&Row> {
-        self.collections.get(collection)?.get(idx)
+        self.collection(collection).get(idx)
     }
 
     pub fn rows_by_idxs(&self, collection: &str, idxs: &[usize]) -> Vec<Row> {
+        let rows = self.collection(collection);
         let mut out = Vec::with_capacity(idxs.len());
         for &i in idxs {
-            if let Some(row) = self.get_by_idx(collection, i) {
+            if let Some(row) = rows.get(i) {
                 out.push(row.clone());
             }
         }
@@ -1424,35 +1477,86 @@ impl Store {
         self.facts_s.clear();
         self.facts_p.clear();
         self.facts_o.clear();
-        if let Some(facts) = self.collections.get("facts") {
-            self.facts_s.reserve(facts.len());
-            self.facts_p.reserve(facts.len());
-            self.facts_o.reserve(facts.len());
-            for row in facts {
-                if let Some((s, p, o)) = spo_key(row) {
-                    self.facts_s.push(s);
-                    self.facts_p.push(p);
-                    self.facts_o.push(o);
-                } else {
-                    self.facts_s.push(Arc::from(""));
-                    self.facts_p.push(Arc::from(""));
-                    self.facts_o.push(Arc::from(""));
-                }
-            }
+        let spo_triples: Vec<(Arc<str>, Arc<str>, Arc<str>)> = self
+            .collection("facts")
+            .iter()
+            .map(|row| {
+                spo_key(row)
+                    .unwrap_or_else(|| (Arc::from(""), Arc::from(""), Arc::from("")))
+            })
+            .collect();
+        self.facts_s.reserve(spo_triples.len());
+        self.facts_p.reserve(spo_triples.len());
+        self.facts_o.reserve(spo_triples.len());
+        for (s, p, o) in spo_triples {
+            self.facts_s.push(s);
+            self.facts_p.push(p);
+            self.facts_o.push(o);
         }
         self.facts_rows_stale = false;
+        self.refresh_col_counts();
     }
 
     fn rebuild_edge_keys(&mut self) {
         self.edge_keys.clear();
+        self.edges_out.clear();
+        self.edges_in.clear();
         self.edge_keys.reserve(self.edges.len());
         for e in &self.edges {
+            let rel_arc = Arc::<str>::from(e.rel.as_str());
+            let from_arc = Arc::<str>::from(e.from.as_str());
+            let to_arc = Arc::<str>::from(e.to.as_str());
             self.edge_keys.insert((
-                Arc::<str>::from(e.rel.as_str()),
-                Arc::<str>::from(e.from.as_str()),
-                Arc::<str>::from(e.to.as_str()),
+                Arc::clone(&rel_arc),
+                Arc::clone(&from_arc),
+                Arc::clone(&to_arc),
             ));
+            self.edges_out
+                .entry((Arc::clone(&rel_arc), Arc::clone(&from_arc)))
+                .or_default()
+                .push(Arc::clone(&to_arc));
+            self.edges_in
+                .entry((rel_arc, to_arc))
+                .or_default()
+                .push(from_arc);
         }
+    }
+
+    /// Outgoing or incoming neighbor keys for `(rel, node)` in $O(1)$ lookup.
+    #[inline]
+    pub fn edge_neighbors(&self, rel: &str, node: &str, reverse: bool) -> Vec<Arc<str>> {
+        let synced = self.edge_keys.len() == self.edges.len()
+            && self
+                .edges
+                .first()
+                .is_none_or(|e| self.has_edge(&e.rel, &e.from, &e.to))
+            && self
+                .edges
+                .last()
+                .is_none_or(|e| self.has_edge(&e.rel, &e.from, &e.to));
+        if !synced {
+            return self
+                .edges
+                .iter()
+                .filter_map(|e| {
+                    if e.rel != rel {
+                        return None;
+                    }
+                    if reverse {
+                        (e.to == node).then(|| Arc::<str>::from(e.from.as_str()))
+                    } else {
+                        (e.from == node).then(|| Arc::<str>::from(e.to.as_str()))
+                    }
+                })
+                .collect();
+        }
+        let key = (Arc::<str>::from(rel), Arc::<str>::from(node));
+        let map = if reverse {
+            &self.edges_in
+        } else {
+            &self.edges_out
+        };
+        map.get(&key).cloned().unwrap_or_default()
     }
 
     /// Idempotent fact insert. Returns `(row, changed)`.
@@ -1460,6 +1564,7 @@ impl Store {
         let Some(key) = spo_key(row) else {
             self.ensure_facts_rows();
             self.collection_mut("facts").push(row.clone());
+            self.update_col_count("facts", 1);
             // Zero-copy: just clone when necessary (only for caller return)
             let row = self.collection("facts").last().unwrap().clone();
             return (row, true);
@@ -1474,14 +1579,26 @@ impl Store {
         let oa = Arc::clone(&key.2);
         let idx = self.facts_s.len();
         self.facts_by_spo.insert(key, idx);
-        self.facts_s.push(sa);
-        self.facts_p.push(pa);
-        self.facts_o.push(oa);
-        self.facts_rows_stale = true;
-        self.ensure_facts_rows();
-        // Zero-copy borrow from fresh facts collection
-        let out = self.collection("facts")[idx].clone();
-        (out, true)
+        self.facts_s.push(Arc::clone(&sa));
+        self.facts_p.push(Arc::clone(&pa));
+        self.facts_o.push(Arc::clone(&oa));
+        let mut built = BTreeMap::new();
+        built.insert("s".into(), Cell::Text(sa));
+        built.insert("p".into(), Cell::Text(pa));
+        built.insert("o".into(), Cell::Text(oa));
+        if self.facts_rows_stale {
+            self.ensure_facts_rows();
+        } else {
+            let facts = self.collections.entry("facts".into()).or_default();
+            if facts.len() == idx {
+                facts.push(built.clone());
+            } else {
+                self.facts_rows_stale = true;
+                self.ensure_facts_rows();
+            }
+        }
+        self.update_col_count("facts", 1);
+        (built, true)
     }
 
     /// Bulk append facts from columnar s/p/o.
@@ -1533,6 +1650,9 @@ impl Store {
                 rows.push(row);
             }
         }
+        if changed > 0 {
+            self.col_counts.insert("facts".into(), self.facts_s.len());
+        }
         if want_rows && changed > 0 {
             self.ensure_facts_rows();
         }
@@ -1540,18 +1660,29 @@ impl Store {
     }
 
     pub fn append_edge_parts(&mut self, rel: &str, from: &str, to: &str) -> bool {
+        let rel_arc = Arc::<str>::from(rel);
+        let from_arc = Arc::<str>::from(from);
+        let to_arc = Arc::<str>::from(to);
         let key = (
-            Arc::<str>::from(rel),
-            Arc::<str>::from(from),
-            Arc::<str>::from(to),
+            Arc::clone(&rel_arc),
+            Arc::clone(&from_arc),
+            Arc::clone(&to_arc),
         );
-        if !self.edge_keys.insert(key.clone()) {
+        if !self.edge_keys.insert(key) {
             return false;
         }
+        self.edges_out
+            .entry((Arc::clone(&rel_arc), Arc::clone(&from_arc)))
+            .or_default()
+            .push(Arc::clone(&to_arc));
+        self.edges_in
+            .entry((rel_arc, to_arc))
+            .or_default()
+            .push(from_arc);
         self.edges.push(Edge {
-            rel: key.0.as_ref().to_owned(),
-            from: key.1.as_ref().to_owned(),
-            to: key.2.as_ref().to_owned(),
+            rel: rel.to_owned(),
+            from: from.to_owned(),
+            to: to.to_owned(),
         });
         true
     }
@@ -1565,13 +1696,25 @@ impl Store {
     }
 
     pub fn remove_edge(&mut self, rel: &str, from: &str, to: &str) -> bool {
+        let rel_arc = Arc::<str>::from(rel);
+        let from_arc = Arc::<str>::from(from);
+        let to_arc = Arc::<str>::from(to);
         let key = (
-            Arc::<str>::from(rel),
-            Arc::<str>::from(from),
-            Arc::<str>::from(to),
+            Arc::clone(&rel_arc),
+            Arc::clone(&from_arc),
+            Arc::clone(&to_arc),
         );
         if !self.edge_keys.remove(&key) {
             return false;
+        }
+        if let Some(list) = self
+            .edges_out
+            .get_mut(&(Arc::clone(&rel_arc), Arc::clone(&from_arc)))
+        {
+            list.retain(|x| x.as_ref() != to);
+        }
+        if let Some(list) = self.edges_in.get_mut(&(rel_arc, to_arc)) {
+            list.retain(|x| x.as_ref() != from);
         }
         self.edges
             .retain(|e| !(e.rel == rel && e.from == from && e.to == to));
@@ -1635,9 +1778,6 @@ impl Store {
                 Some(rows) if p < rows.len() => rows.len() - 1,
                 _ => break,
             };
-            
-            // Update cache-friendly count tracking (decrement by number of deleted rows)
-            self.update_col_count(collection, -(dead.len() as isize));
             
             // Zero-copy: steal row with swap_remove instead of cloning
             let doomed = self.collections.get_mut(collection).unwrap().swap_remove(p);
@@ -1845,6 +1985,7 @@ impl Store {
             .collections
             .get(collection)
             .map_or(0, std::vec::Vec::len);
+        self.col_counts.insert(collection.to_string(), n);
         let soa_len = match collection {
             "docs" => self.docs_id.len(),
             "orders" => self.orders_id.len(),
@@ -2375,11 +2516,15 @@ impl Store {
         self.indexes.clear();
         let snaps = self.extra_indexes.clone();
         for (label, snap) in snaps {
+            let pred = snap
+                .pred_src
+                .as_deref()
+                .and_then(|src| crate::parse::parse_pred_src(src).ok());
             let def = crate::catalog::IndexDef {
                 collection: snap.collection.clone(),
                 unique: snap.unique,
                 fields: snap.fields.clone(),
-                pred: None,
+                pred,
                 bitmap_card_field: None,
             };
             let mut live = LiveIndex::new(def);
@@ -2773,33 +2918,30 @@ impl Store {
             return None;
         }
         
-        // ✅ Hot path: preallocate once, reuse HotDocRow for zero-copy projection
         let n = self.docs_id.len();
         let mut out = Vec::with_capacity(idxs.len());
+        let id_title = fields.len() == 2 && fields[0] == "id" && fields[1] == "title";
         
         for &i in idxs {
             if i >= n {
                 continue;
             }
-            
-            // ✅ Build HotDocRow by reference (no cloning yet)
-            let hot = HotDocRow {
-                id: Arc::clone(&self.docs_id[i]),
-                title: Arc::clone(&self.docs_title[i]),
-                layer: Arc::clone(&self.docs_layer[i]),
-                wing: Arc::clone(&self.docs_wing[i]),
-            };
-            
-            // Convert to Row only when needed
-            match fields.len() {
-                2 if fields[0] == "id" && fields[1] == "title" => {
-                    out.push(row_id_title(&hot.id, &hot.title));
-                }
-                _ => {
-                    // For full projection (id, title, layer, wing), convert hot row
-                    out.push(hot.to_btree());
-                }
+            if id_title {
+                out.push(row_id_title(&self.docs_id[i], &self.docs_title[i]));
+                continue;
             }
+            let mut row = BTreeMap::new();
+            for f in fields {
+                let cell = match f.as_str() {
+                    "id" => Cell::Text(Arc::clone(&self.docs_id[i])),
+                    "title" => Cell::Text(Arc::clone(&self.docs_title[i])),
+                    "layer" => Cell::Text(Arc::clone(&self.docs_layer[i])),
+                    "wing" => Cell::Text(Arc::clone(&self.docs_wing[i])),
+                    _ => Cell::Null,
+                };
+                row.insert(f.clone(), cell);
+            }
+            out.push(row);
         }
         Some(out)
     }
@@ -2932,38 +3074,90 @@ fn same_row_key(collection: &str, a: &Row, b: &Row) -> bool {
 pub fn catalog_hash(cat: &Catalog) -> String {
     let mut buf = String::new();
     buf.push_str(&cat.embed_id);
+    buf.push('|');
     for (n, c) in &cat.collections {
         buf.push_str(n);
+        buf.push(':');
         buf.push(if c.append_only { 'A' } else { 'M' });
+        buf.push('{');
         for (f, info) in &c.fields {
             buf.push_str(f);
+            buf.push(':');
             buf.push_str(info.ty.name());
+            if info.fts {
+                buf.push_str("+fts");
+            }
+            if info.unique {
+                buf.push_str("+uniq");
+            }
+            buf.push(',');
         }
+        buf.push('}');
         if let Some(src) = &c.filter_src {
+            buf.push('?');
             buf.push_str(src);
         }
+        buf.push(';');
     }
+    buf.push('|');
     for (n, r) in &cat.rels {
         buf.push_str(n);
+        if r.stub {
+            buf.push_str(":stub");
+        }
         if let Some(of) = &r.reverse_of {
+            buf.push('=');
             buf.push_str(of);
         }
+        buf.push(';');
     }
+    buf.push('|');
     for (n, idx) in &cat.indexes {
         buf.push_str(n);
+        buf.push(':');
         if idx.unique {
             buf.push('U');
         }
-        for f in &idx.fields {
-            buf.push_str(f);
+        buf.push('[');
+        buf.push_str(&idx.fields.join(","));
+        buf.push(']');
+        if let Some(pred) = &idx.pred {
+            buf.push('?');
+            buf.push_str(&crate::plan::fmt_pred(pred));
         }
+        buf.push(';');
     }
+    buf.push('|');
     for (n, fields) in &cat.owned {
         buf.push_str(n);
+        buf.push('{');
         for (f, info) in fields {
             buf.push_str(f);
+            buf.push(':');
             buf.push_str(info.ty.name());
+            buf.push(',');
         }
+        buf.push_str("};");
+    }
+    buf.push('|');
+    for fk in &cat.fks {
+        buf.push_str(&fk.from_col);
+        buf.push('.');
+        buf.push_str(&fk.from_field);
+        buf.push_str("->");
+        buf.push_str(&fk.to_col);
+        buf.push('.');
+        buf.push_str(&fk.to_field);
+        buf.push(';');
+    }
+    buf.push('|');
+    for g in &cat.guards {
+        buf.push_str(&g.collection);
+        buf.push('.');
+        buf.push_str(&g.field);
+        buf.push('?');
+        buf.push_str(&crate::plan::fmt_pred(&g.pred));
+        buf.push(';');
     }
     format!("h:{:016x}", fnv1a64(buf.as_bytes()))
 }

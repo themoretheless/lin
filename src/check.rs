@@ -280,7 +280,7 @@ fn check_decl(d: &Decl, cat: &Catalog) -> Result<(), Error> {
             collection,
             fields,
             unique: _,
-            pred: _,
+            pred,
         } => {
             let col = cat
                 .collection(collection)
@@ -292,6 +292,10 @@ fn check_decl(d: &Decl, cat: &Catalog) -> Result<(), Error> {
                 if col.field(f).is_none() {
                     return Err(Error::new(format!("unknown field: {f}")));
                 }
+            }
+            if let Some(p) = pred {
+                let scope = scope_of(collection, cat)?;
+                check_pred(p, &scope, cat)?;
             }
             let label = format!("{}[{}]", collection, fields.join(","));
             if cat.indexes.contains_key(&label) {
@@ -461,8 +465,8 @@ fn check_query(q: &Query, cat: &Catalog, env: &Bindings) -> Result<Scope, Error>
             Step::Count { by } => {
                 scope = match by {
                     Some(by) => {
-                        require_field(&scope, by)?;
-                        Scope::agg(&scope.primary, &by.as_str(), Type::I64, "hits")
+                        let by_ty = require_field(&scope, by)?;
+                        Scope::agg(&scope.primary, &by.as_str(), by_ty, Type::I64, "hits")
                     }
                     None => Scope::agg_total(&scope.primary, Type::I64, "hits"),
                 };
@@ -475,11 +479,72 @@ fn check_query(q: &Query, cat: &Catalog, env: &Bindings) -> Result<Scope, Error>
                         ty.name()
                     )));
                 }
-                require_field(&scope, by)?;
-                scope = Scope::agg(&scope.primary, &by.as_str(), Type::F64, &field.as_str());
+                scope = match by {
+                    Some(by) => {
+                        let by_ty = require_field(&scope, by)?;
+                        Scope::agg(&scope.primary, &by.as_str(), by_ty, Type::F64, &field.as_str())
+                    }
+                    None => Scope::agg_total(&scope.primary, Type::F64, &field.as_str()),
+                };
+            }
+            Step::Min { field, by } | Step::Max { field, by } => {
+                let ty = require_field(&scope, field)?;
+                scope = match by {
+                    Some(by) => {
+                        let by_ty = require_field(&scope, by)?;
+                        Scope::agg(&scope.primary, &by.as_str(), by_ty, ty, &field.as_str())
+                    }
+                    None => Scope::agg_total(&scope.primary, ty, &field.as_str()),
+                };
+            }
+            Step::Avg { field, by } => {
+                let ty = require_field(&scope, field)?;
+                if !ty.is_numeric() {
+                    return Err(Error::new(format!(
+                        "avg requires numeric field, found {}",
+                        ty.name()
+                    )));
+                }
+                scope = match by {
+                    Some(by) => {
+                        let by_ty = require_field(&scope, by)?;
+                        Scope::agg(&scope.primary, &by.as_str(), by_ty, Type::F64, &field.as_str())
+                    }
+                    None => Scope::agg_total(&scope.primary, Type::F64, &field.as_str()),
+                };
             }
             Step::Sort { field, .. } => {
                 require_field(&scope, field)?;
+            }
+            Step::Window {
+                func,
+                field,
+                by,
+                order,
+                desc: _,
+                as_field,
+            } => {
+                if let Some(by) = by {
+                    require_field(&scope, by)?;
+                }
+                if let Some(order) = order {
+                    require_field(&scope, order)?;
+                }
+                let out_ty = match func {
+                    crate::window::WindowFunction::RowNumber
+                    | crate::window::WindowFunction::Rank
+                    | crate::window::WindowFunction::DenseRank => Type::I64,
+                    crate::window::WindowFunction::Lead { .. }
+                    | crate::window::WindowFunction::Lag { .. }
+                    | crate::window::WindowFunction::FirstValue
+                    | crate::window::WindowFunction::LastValue => {
+                        let f = field.as_ref().ok_or_else(|| {
+                            Error::new(format!("{func} requires a field argument"))
+                        })?;
+                        require_field(&scope, f)?
+                    }
+                };
+                scope.fields.insert(as_field.clone(), out_ty);
             }
             Step::Skip { n } => {
                 if *n < 0 {
@@ -547,8 +612,34 @@ fn check_record(
             layer_raw = s.as_ref() == "raw";
         }
         check_value_as(value, info.ty, cat)?;
-        if is_update && cat.is_immutable_field(collection, name) {
-            return Err(Error::new(format!("immutable field: {collection}.{name}")));
+    }
+    if is_update {
+        let mut literal_row = BTreeMap::new();
+        for (k, v) in &record.fields {
+            if let Value::String(s) = v {
+                literal_row.insert(k.clone(), crate::store::Cell::Text(s.clone()));
+            } else if let Value::Int(n) = v {
+                literal_row.insert(k.clone(), crate::store::Cell::Int(*n));
+            } else if let Value::Float(n) = v {
+                literal_row.insert(k.clone(), crate::store::Cell::Float(*n));
+            } else if let Value::Bool(b) = v {
+                literal_row.insert(k.clone(), crate::store::Cell::Bool(*b));
+            }
+        }
+        for (name, _) in &record.fields {
+            for g in &cat.guards {
+                if g.collection == collection && &g.field == name {
+                    let mut pred_fields = Vec::new();
+                    g.pred.walk_fields(&mut pred_fields);
+                    let all_present = !pred_fields.is_empty()
+                        && pred_fields
+                            .iter()
+                            .all(|f| literal_row.contains_key(&f.as_str()));
+                    if !all_present || crate::exec::eval_pred(&g.pred, &literal_row, 0) {
+                        return Err(Error::new(format!("immutable field: {collection}.{name}")));
+                    }
+                }
+            }
         }
     }
     if is_update && layer_raw && record.fields.iter().any(|(n, _)| n == "body") {
@@ -605,6 +696,28 @@ fn check_pred(pred: &Pred, scope: &Scope, cat: &Catalog) -> Result<(), Error> {
         Pred::And(a, b) | Pred::Or(a, b) => {
             check_pred(a, scope, cat)?;
             check_pred(b, scope, cat)?;
+        }
+        Pred::Not(inner) => {
+            check_pred(inner, scope, cat)?;
+        }
+        Pred::IsNull { field, .. } => {
+            require_field(scope, field)?;
+        }
+        Pred::In { field, values } => {
+            let lty = require_field(scope, field)?;
+            if values.is_empty() {
+                return Err(Error::new("empty `in` list"));
+            }
+            for v in values {
+                let rty = value_type(v, cat)?;
+                if !types_ok(rty, lty) && !types_ok(lty, rty) {
+                    return Err(Error::new(format!(
+                        "type mismatch in `in`: {} vs {}",
+                        lty.name(),
+                        rty.name()
+                    )));
+                }
+            }
         }
         Pred::Cmp { field, op, value } => {
             let lty = require_field(scope, field)?;
@@ -748,13 +861,10 @@ impl Scope {
         self.fields.insert(format!("{bind}.to"), Type::Text);
     }
 
-    fn agg(primary: &str, by: &str, metric_ty: Type, metric: &str) -> Self {
+    fn agg(primary: &str, by: &str, by_ty: Type, metric_ty: Type, metric: &str) -> Self {
         let mut fields = BTreeMap::new();
-        fields.insert(by.to_string(), Type::Text);
+        fields.insert(by.to_string(), by_ty);
         fields.insert(metric.to_string(), metric_ty);
-        if by.contains('.') {
-            fields.insert(by.to_string(), Type::Text);
-        }
         Self {
             primary: primary.to_string(),
             fields,

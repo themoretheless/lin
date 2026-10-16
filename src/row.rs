@@ -29,10 +29,36 @@ impl FromCell for i64 {
     }
 }
 
+macro_rules! impl_int_cell {
+    ($($t:ty),*) => {
+        $(
+            impl FromCell for $t {
+                fn from_cell(cell: &Cell) -> Result<Self, Error> {
+                    let n = i64::from_cell(cell)?;
+                    <$t>::try_from(n).map_err(|_| Error::runtime(format!("int {n} out of range for {}", stringify!($t))))
+                }
+            }
+            impl ToCell for $t {
+                fn to_cell(&self) -> Cell {
+                    Cell::Int(*self as i64)
+                }
+            }
+        )*
+    };
+}
+
+impl_int_cell!(i32, i16, i8, u32, u16, u8, usize);
+
 impl FromCell for f64 {
     fn from_cell(cell: &Cell) -> Result<Self, Error> {
         cell.as_f64()
             .ok_or_else(|| Error::runtime(format!("expected float, got {cell:?}")))
+    }
+}
+
+impl FromCell for f32 {
+    fn from_cell(cell: &Cell) -> Result<Self, Error> {
+        f64::from_cell(cell).map(|n| n as f32)
     }
 }
 
@@ -117,6 +143,12 @@ impl ToCell for i64 {
 impl ToCell for f64 {
     fn to_cell(&self) -> Cell {
         Cell::Float(*self)
+    }
+}
+
+impl ToCell for f32 {
+    fn to_cell(&self) -> Cell {
+        Cell::Float(*self as f64)
     }
 }
 

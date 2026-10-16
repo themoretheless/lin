@@ -74,6 +74,43 @@ pub mod pred {
         }
     }
 
+    pub fn has_ci(field: impl AsRef<str>, needle: impl Into<String>) -> Pred {
+        Pred::Has {
+            field: Field::path(field.as_ref()),
+            ci: true,
+            needle: needle.into(),
+        }
+    }
+
+    pub fn is_null(field: impl AsRef<str>) -> Pred {
+        Pred::IsNull {
+            field: Field::path(field.as_ref()),
+            negated: false,
+        }
+    }
+
+    pub fn is_not_null(field: impl AsRef<str>) -> Pred {
+        Pred::IsNull {
+            field: Field::path(field.as_ref()),
+            negated: true,
+        }
+    }
+
+    pub fn in_list<I, V>(field: impl AsRef<str>, values: I) -> Pred
+    where
+        I: IntoIterator<Item = V>,
+        V: Into<Value>,
+    {
+        Pred::In {
+            field: Field::path(field.as_ref()),
+            values: values.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    pub fn not(pred: Pred) -> Pred {
+        Pred::Not(Box::new(pred))
+    }
+
     pub fn contains(field: impl AsRef<str>, needle: impl Into<String>) -> Pred {
         Pred::Contains {
             field: Field::path(field.as_ref()),
@@ -149,6 +186,26 @@ impl Col {
 
     pub fn has(self, needle: impl Into<String>) -> Pred {
         pred::has(self.name, needle)
+    }
+
+    pub fn has_ci(self, needle: impl Into<String>) -> Pred {
+        pred::has_ci(self.name, needle)
+    }
+
+    pub fn is_null(self) -> Pred {
+        pred::is_null(self.name)
+    }
+
+    pub fn is_not_null(self) -> Pred {
+        pred::is_not_null(self.name)
+    }
+
+    pub fn in_list<I, V>(self, values: I) -> Pred
+    where
+        I: IntoIterator<Item = V>,
+        V: Into<Value>,
+    {
+        pred::in_list(self.name, values)
     }
 
     pub fn contains(self, needle: impl Into<String>) -> Pred {
@@ -446,6 +503,141 @@ impl Queryable {
             by: Some(Field::path(field.as_ref())),
         });
         self
+    }
+
+    pub fn sum(mut self, field: impl AsRef<str>) -> Self {
+        self.query.steps.push(Step::Sum {
+            field: Field::path(field.as_ref()),
+            by: None,
+        });
+        self
+    }
+
+    pub fn sum_by(mut self, field: impl AsRef<str>, by: impl AsRef<str>) -> Self {
+        self.query.steps.push(Step::Sum {
+            field: Field::path(field.as_ref()),
+            by: Some(Field::path(by.as_ref())),
+        });
+        self
+    }
+
+    pub fn min(mut self, field: impl AsRef<str>) -> Self {
+        self.query.steps.push(Step::Min {
+            field: Field::path(field.as_ref()),
+            by: None,
+        });
+        self
+    }
+
+    pub fn min_by(mut self, field: impl AsRef<str>, by: impl AsRef<str>) -> Self {
+        self.query.steps.push(Step::Min {
+            field: Field::path(field.as_ref()),
+            by: Some(Field::path(by.as_ref())),
+        });
+        self
+    }
+
+    pub fn max(mut self, field: impl AsRef<str>) -> Self {
+        self.query.steps.push(Step::Max {
+            field: Field::path(field.as_ref()),
+            by: None,
+        });
+        self
+    }
+
+    pub fn max_by(mut self, field: impl AsRef<str>, by: impl AsRef<str>) -> Self {
+        self.query.steps.push(Step::Max {
+            field: Field::path(field.as_ref()),
+            by: Some(Field::path(by.as_ref())),
+        });
+        self
+    }
+
+    pub fn avg(mut self, field: impl AsRef<str>) -> Self {
+        self.query.steps.push(Step::Avg {
+            field: Field::path(field.as_ref()),
+            by: None,
+        });
+        self
+    }
+
+    pub fn avg_by(mut self, field: impl AsRef<str>, by: impl AsRef<str>) -> Self {
+        self.query.steps.push(Step::Avg {
+            field: Field::path(field.as_ref()),
+            by: Some(Field::path(by.as_ref())),
+        });
+        self
+    }
+
+    pub fn window(
+        mut self,
+        func: crate::window::WindowFunction,
+        field: Option<impl AsRef<str>>,
+        by: Option<impl AsRef<str>>,
+        order: Option<impl AsRef<str>>,
+        desc: bool,
+        as_field: impl Into<String>,
+    ) -> Self {
+        self.query.steps.push(Step::Window {
+            func,
+            field: field.map(|f| Field::path(f.as_ref())),
+            by: by.map(|b| Field::path(b.as_ref())),
+            order: order.map(|o| Field::path(o.as_ref())),
+            desc,
+            as_field: as_field.into(),
+        });
+        self
+    }
+
+    pub fn row_number_by(
+        self,
+        by: Option<impl AsRef<str>>,
+        order: Option<impl AsRef<str>>,
+        desc: bool,
+        as_field: impl Into<String>,
+    ) -> Self {
+        self.window(
+            crate::window::WindowFunction::RowNumber,
+            None::<&str>,
+            by,
+            order,
+            desc,
+            as_field,
+        )
+    }
+
+    pub fn rank_by(
+        self,
+        by: Option<impl AsRef<str>>,
+        order: Option<impl AsRef<str>>,
+        desc: bool,
+        as_field: impl Into<String>,
+    ) -> Self {
+        self.window(
+            crate::window::WindowFunction::Rank,
+            None::<&str>,
+            by,
+            order,
+            desc,
+            as_field,
+        )
+    }
+
+    pub fn dense_rank_by(
+        self,
+        by: Option<impl AsRef<str>>,
+        order: Option<impl AsRef<str>>,
+        desc: bool,
+        as_field: impl Into<String>,
+    ) -> Self {
+        self.window(
+            crate::window::WindowFunction::DenseRank,
+            None::<&str>,
+            by,
+            order,
+            desc,
+            as_field,
+        )
     }
 
     pub fn union(mut self, other: Queryable) -> Self {
@@ -852,6 +1044,92 @@ impl<'a, T> BoundQueryable<'a, T> {
         self
     }
 
+    pub fn sum(mut self, field: impl AsRef<str>) -> Self {
+        self.q = self.q.sum(field);
+        self
+    }
+
+    pub fn sum_by(mut self, field: impl AsRef<str>, by: impl AsRef<str>) -> Self {
+        self.q = self.q.sum_by(field, by);
+        self
+    }
+
+    pub fn min(mut self, field: impl AsRef<str>) -> Self {
+        self.q = self.q.min(field);
+        self
+    }
+
+    pub fn min_by(mut self, field: impl AsRef<str>, by: impl AsRef<str>) -> Self {
+        self.q = self.q.min_by(field, by);
+        self
+    }
+
+    pub fn max(mut self, field: impl AsRef<str>) -> Self {
+        self.q = self.q.max(field);
+        self
+    }
+
+    pub fn max_by(mut self, field: impl AsRef<str>, by: impl AsRef<str>) -> Self {
+        self.q = self.q.max_by(field, by);
+        self
+    }
+
+    pub fn avg(mut self, field: impl AsRef<str>) -> Self {
+        self.q = self.q.avg(field);
+        self
+    }
+
+    pub fn avg_by(mut self, field: impl AsRef<str>, by: impl AsRef<str>) -> Self {
+        self.q = self.q.avg_by(field, by);
+        self
+    }
+
+    pub fn window(
+        mut self,
+        func: crate::window::WindowFunction,
+        field: Option<impl AsRef<str>>,
+        by: Option<impl AsRef<str>>,
+        order: Option<impl AsRef<str>>,
+        desc: bool,
+        as_field: impl Into<String>,
+    ) -> Self {
+        self.q = self.q.window(func, field, by, order, desc, as_field);
+        self
+    }
+
+    pub fn row_number_by(
+        mut self,
+        by: Option<impl AsRef<str>>,
+        order: Option<impl AsRef<str>>,
+        desc: bool,
+        as_field: impl Into<String>,
+    ) -> Self {
+        self.q = self.q.row_number_by(by, order, desc, as_field);
+        self
+    }
+
+    pub fn rank_by(
+        mut self,
+        by: Option<impl AsRef<str>>,
+        order: Option<impl AsRef<str>>,
+        desc: bool,
+        as_field: impl Into<String>,
+    ) -> Self {
+        self.q = self.q.rank_by(by, order, desc, as_field);
+        self
+    }
+
+    pub fn dense_rank_by(
+        mut self,
+        by: Option<impl AsRef<str>>,
+        order: Option<impl AsRef<str>>,
+        desc: bool,
+        as_field: impl Into<String>,
+    ) -> Self {
+        self.q = self.q.dense_rank_by(by, order, desc, as_field);
+        self
+    }
+
     pub fn union(mut self, other: Queryable) -> Self {
         self.q = self.q.union(other);
         self
@@ -998,9 +1276,27 @@ impl From<i64> for Value {
     }
 }
 
+impl From<i32> for Value {
+    fn from(n: i32) -> Self {
+        Value::Int(i64::from(n))
+    }
+}
+
+impl From<usize> for Value {
+    fn from(n: usize) -> Self {
+        Value::Int(n as i64)
+    }
+}
+
 impl From<f64> for Value {
     fn from(n: f64) -> Self {
         Value::Float(n)
+    }
+}
+
+impl From<f32> for Value {
+    fn from(n: f32) -> Self {
+        Value::Float(f64::from(n))
     }
 }
 

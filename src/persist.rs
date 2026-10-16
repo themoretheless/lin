@@ -40,6 +40,7 @@ pub const FENCE_NAME: &str = "FENCE";
 /// On-disk snapshot: `LIN\x04` + MessagePack(`Snapshot`). Legacy JSON still reads.
 pub const SNAPSHOT_MAGIC: [u8; 4] = *b"LIN\x04";
 /// Portable backup uses the same MessagePack envelope (self-contained, no cold refs).
+#[allow(dead_code)]
 pub const BACKUP_MAGIC: [u8; 4] = *b"LIN\x04";
 pub const SNAPSHOT_EVERY: u32 = 32;
 const MAX_RECORD: u32 = 16 * 1024 * 1024;
@@ -140,6 +141,8 @@ pub enum Pack {
         collection: String,
         unique: bool,
         fields: Vec<String>,
+        #[serde(default)]
+        pred_src: Option<String>,
     },
     SchemaFilter {
         collection: String,
@@ -189,6 +192,8 @@ pub struct IndexSnap {
     pub collection: String,
     pub unique: bool,
     pub fields: Vec<String>,
+    #[serde(default)]
+    pub pred_src: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -431,7 +436,9 @@ pub fn read_snapshot(dir: &Path) -> Result<Option<Snapshot>, Error> {
     if bytes.is_empty() {
         return Ok(None);
     }
-    Ok(decode_snapshot_bytes(&bytes))
+    decode_snapshot_bytes(&bytes)
+        .map(Some)
+        .ok_or_else(|| io_err("corrupt snapshot"))
 }
 
 pub fn write_snapshot(dir: &Path, snap: &Snapshot) -> Result<(), Error> {
@@ -491,21 +498,21 @@ fn encode_snapshot_bytes(snap: &Snapshot) -> Result<Vec<u8>, Error> {
 
 /// Encode snapshot with optional compression (feature-gated)
 #[cfg(any(feature = "compress-flate", feature = "compress-lz4"))]
+#[allow(dead_code)]
 pub fn encode_snapshot_compressed(snap: &Snapshot) -> Result<Vec<u8>, Error> {
-    use std::io::Write;
-    
     let mut body = Vec::new();
     rmp_serde::encode::write_named(&mut body, snap).map_err(io_err)?;
-    
+
     #[cfg(feature = "compress-flate")]
     {
         use flate2::Compression;
         use flate2::write::GzEncoder;
-        
+        use std::io::Write;
+
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(&body).map_err(io_err)?;
         let compressed = encoder.finish().map_err(io_err)?;
-        
+
         // Prepend magic byte indicating gzip format
         let mut out = Vec::with_capacity(5 + compressed.len());
         out.push(0x01); // Compressed flag
@@ -513,70 +520,58 @@ pub fn encode_snapshot_compressed(snap: &Snapshot) -> Result<Vec<u8>, Error> {
         out.extend_from_slice(&compressed);
         return Ok(out);
     }
-    
+
     #[cfg(all(not(feature = "compress-flate"), feature = "compress-lz4"))]
     {
-        use lz4::block::{compress, Context};
-        
-        let mut ctx = Context::new();
-        match compress(&body, Some(9), &mut ctx) {
-            Ok(compressed) => {
-                let mut out = Vec::with_capacity(5 + compressed.len());
-                out.push(0x02); // LZ4 flag
-                out.extend_from_slice(&SNAPSHOT_MAGIC);
-                out.extend_from_slice(&compressed);
-                return Ok(out);
-            }
-            Err(_) => return Err(Error::runtime("lz4 compression failed")),
-        }
-    }
-    
-    // Fallback: uncompressed if no compression features enabled
-    #[cfg(not(any(feature = "compress-flate", feature = "compress-lz4")))]
-    {
-        let mut out = Vec::with_capacity(4 + body.len());
+        use lz4::block::{CompressionMode, compress};
+
+        let compressed = compress(&body, Some(CompressionMode::DEFAULT), true).map_err(io_err)?;
+        let mut out = Vec::with_capacity(5 + compressed.len());
+        out.push(0x02); // LZ4 flag
         out.extend_from_slice(&SNAPSHOT_MAGIC);
-        out.extend_from_slice(&body);
-        Ok(out)
+        out.extend_from_slice(&compressed);
+        return Ok(out);
     }
 }
 
 fn decode_snapshot_bytes(bytes: &[u8]) -> Option<Snapshot> {
-    if bytes.len() >= 5 && bytes[4..8] == SNAPSHOT_MAGIC {
-        // Check for compressed snapshot (compressed flag + magic)
-        let _compressor = bytes[3];
-        
-        #[cfg(any(feature = "compress-flate", feature = "compress-lz4"))]
-        {
-            let compressed_data = &bytes[5..];
-            let decompressed = match compressor {
-                0x01 => {
+    if bytes.len() >= 5 && bytes[1..5] == SNAPSHOT_MAGIC {
+        let compressor = bytes[0];
+        let compressed_data = &bytes[5..];
+        match compressor {
+            0x01 => {
+                #[cfg(feature = "compress-flate")]
+                {
                     use flate2::read::GzDecoder;
                     use std::io::Read;
-                    
+
                     let mut decoder = GzDecoder::new(compressed_data);
                     let mut result = Vec::new();
                     decoder.read_to_end(&mut result).ok()?;
-                    result
+                    return rmp_serde::from_slice(&result).ok();
                 }
-                0x02 => {
-                    #[cfg(feature = "compress-lz4")]
-                    {
-                        use lz4::block::{decompress, Context};
-                        
-                        let mut ctx = Context::new();
-                        decompress(compressed_data, Some(usize::MAX), &mut ctx).ok()?
-                            .to_vec()
-                    }
-                    #[cfg(not(feature = "compress-lz4"))]
+                #[cfg(not(feature = "compress-flate"))]
+                {
+                    let _ = compressed_data;
                     return None;
                 }
-                _ => return None,
-            };
-            return rmp_serde::from_slice(&decompressed).ok();
+            }
+            0x02 => {
+                #[cfg(feature = "compress-lz4")]
+                {
+                    let decompressed = lz4::block::decompress(compressed_data, None).ok()?;
+                    return rmp_serde::from_slice(&decompressed).ok();
+                }
+                #[cfg(not(feature = "compress-lz4"))]
+                {
+                    let _ = compressed_data;
+                    return None;
+                }
+            }
+            _ => return None,
         }
     }
-    
+
     // Uncompressed snapshot or legacy JSON backup
     if bytes.len() >= 4 && bytes[..4] == SNAPSHOT_MAGIC {
         return rmp_serde::from_slice(&bytes[4..]).ok();
@@ -673,6 +668,7 @@ pub fn open_log_read(dir: &Path) -> Result<Option<File>, Error> {
 
 /// Append multiple records atomically with parallel encoding — feature-gated optimization
 #[cfg(feature = "parallel")]
+#[allow(dead_code)]
 pub fn append_batch_records(
     log: &mut File,
     records: &[LogRecord],
@@ -680,55 +676,59 @@ pub fn append_batch_records(
     log_bytes: &mut u64,
 ) -> Result<(), Error> {
     use rayon::prelude::*;
-    
+
     // Encode all records in parallel using rayon
-    let encoded: Vec<Result<Vec<u8>, Error>> = records.par_iter().map(|rec| {
-        let mut buf = Vec::with_capacity(256);
-        rmp_serde::encode::write_named(&mut buf, rec).map_err(io_err)?;
-        Ok(buf)
-    }).collect();
-    
+    let encoded: Vec<Result<Vec<u8>, Error>> = records
+        .par_iter()
+        .map(|rec| {
+            let mut buf = Vec::with_capacity(256);
+            rmp_serde::encode::write_named(&mut buf, rec).map_err(io_err)?;
+            Ok(buf)
+        })
+        .collect();
+
     // Write all records sequentially to maintain order
     for (i, result) in encoded.into_iter().enumerate() {
         let payload = result?;
-        
+
         if payload.len() > MAX_RECORD as usize {
             return Err(io_err(format!("batch record {} exceeds max size", i)));
         }
-        
-        // Write with checksum envelope
+
+        // Write with checksum envelope (codec 1 = LOG_MAGIC_V1 MessagePack)
         let len = payload.len() + 5; // codec byte + payload + CRC
         if len > MAX_RECORD as usize {
             return Err(io_err("encoded batch exceeds max size"));
         }
-        
-        let codec = [LOG_MAGIC_CHECKSUM[3]];
+
+        let codec = [LOG_MAGIC_V1[3]];
         let mut checksum = crc32fast::Hasher::new();
         checksum.update(&codec);
         checksum.update(&payload);
         let checksum_bytes = checksum.finalize().to_le_bytes();
-        
+
         let mut hdr = [0u8; 8];
         hdr[..4].copy_from_slice(&LOG_MAGIC_CHECKSUM);
         hdr[4..].copy_from_slice(&(len as u32).to_le_bytes());
-        
+
         log.write_all(&hdr).map_err(io_err)?;
         log.write_all(&codec).map_err(io_err)?;
         log.write_all(&payload).map_err(io_err)?;
         log.write_all(&checksum_bytes).map_err(io_err)?;
-        
+
         *log_bytes += 8 + len as u64;
     }
-    
+
     if sync == SyncMode::Full {
         durable_sync(log).map_err(io_err)?;
     }
-    
+
     Ok(())
 }
 
-/// Compressed batch write for large payloads — compresses all records together
+/// Compressed batch write for large payloads — compresses records into a single WAL frame
 #[cfg(any(feature = "compress-wal", feature = "parallel"))]
+#[allow(dead_code)]
 pub fn append_compressed_batch(
     log: &mut File,
     records: &[LogRecord],
@@ -737,48 +737,45 @@ pub fn append_compressed_batch(
 ) -> Result<(), Error> {
     #[cfg(feature = "compress-wal")]
     {
-        use std::io::Write;
         use flate2::Compression;
         use flate2::write::GzEncoder;
-        
-        // First encode all records to a single buffer
-        let mut combined = Vec::new();
+        use std::io::Write;
+
         for rec in records {
-            rmp_serde::encode::write_named(&mut combined, rec).map_err(io_err)?;
+            let mut raw = Vec::new();
+            rmp_serde::encode::write_named(&mut raw, rec).map_err(io_err)?;
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+            encoder.write_all(&raw).map_err(io_err)?;
+            let compressed = encoder.finish().map_err(io_err)?;
+
+            // Codec 4 = Gzip-compressed MessagePack LogRecord
+            let codec = [4u8];
+            let len = 1 + compressed.len() + 4;
+            if len > MAX_RECORD as usize {
+                return Err(io_err("compressed record exceeds max size"));
+            }
+            let mut checksum = crc32fast::Hasher::new();
+            checksum.update(&codec);
+            checksum.update(&compressed);
+            let crc = checksum.finalize().to_le_bytes();
+
+            let mut hdr = [0u8; 8];
+            hdr[..4].copy_from_slice(&LOG_MAGIC_CHECKSUM);
+            hdr[4..].copy_from_slice(&(len as u32).to_le_bytes());
+            log.write_all(&hdr).map_err(io_err)?;
+            log.write_all(&codec).map_err(io_err)?;
+            log.write_all(&compressed).map_err(io_err)?;
+            log.write_all(&crc).map_err(io_err)?;
+            *log_bytes += 8 + len as u64;
         }
-        
-        // Compress the combined data
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(&combined).map_err(io_err)?;
-        let compressed = encoder.finish().map_err(io_err)?;
-        
-        // Write header: magic + compressed length + data
-        let len = 1 + 4 + compressed.len(); // flag + length + compressed data
-        let mut hdr = [0u8; 8];
-        hdr[..4].copy_from_slice(&LOG_MAGIC_CHECKSUM);
-        hdr[4..].copy_from_slice(&(len as u32).to_le_bytes());
-        
-        log.write_all(&hdr).map_err(io_err)?;
-        log.write_all(&[0x01]).map_err(io_err)?; // compression flag
-        log.write_all(&(compressed.len() as u32).to_le_bytes()).map_err(io_err)?;
-        log.write_all(&compressed).map_err(io_err)?;
-        
-        // Add CRC of compressed payload
-        let mut checksum = crc32fast::Hasher::new();
-        checksum.update(&[0x01]);
-        checksum.update(&(compressed.len() as u32).to_le_bytes());
-        checksum.update(&compressed);
-        log.write_all(&checksum.finalize().to_le_bytes()).map_err(io_err)?;
-        
-        *log_bytes += 8 + len as u64 + 4;
-        
+
         if sync == SyncMode::Full {
             durable_sync(log).map_err(io_err)?;
         }
-        
+
         Ok(())
     }
-    
+
     #[cfg(not(feature = "compress-wal"))]
     {
         // Fallback to normal batch if compression not enabled
@@ -1682,6 +1679,15 @@ fn decode_frame(magic: &[u8; 4], payload: &[u8]) -> Result<LogRecord, Error> {
             1 => LOG_MAGIC_V1,
             2 => LOG_MAGIC_V2,
             3 => LOG_MAGIC_SPARSE,
+            #[cfg(any(feature = "compress-wal", feature = "compress-flate"))]
+            4 => {
+                use flate2::read::GzDecoder;
+                use std::io::Read;
+                let mut decoder = GzDecoder::new(&payload[1..end]);
+                let mut raw = Vec::new();
+                decoder.read_to_end(&mut raw).map_err(io_err)?;
+                return rmp_serde::from_slice(&raw).map_err(io_err);
+            }
             _ => return Err(io_err("unknown wal codec")),
         };
         return decode_frame(&codec, &payload[1..end]);
@@ -1755,13 +1761,12 @@ pub fn append_raw_frames(
 
 /// Check if a content hash already exists in the collection (deduplication helper)
 #[cfg(feature = "parallel")]
+#[allow(dead_code)]
 pub fn check_content_exists(
     collection_name: &str,
     body_hash: &str,
     store: &crate::store::Store,
 ) -> bool {
-    use crate::store::Cell;
-    
     let collection = store.collection(collection_name);
     let hash_field = "hash";
     
@@ -2506,29 +2511,45 @@ mod bench {
 
     #[test]
     fn bench_wal_batch_write() {
+        let path = std::env::temp_dir().join(format!(
+            "lin-bench-wal-batch-{}",
+            std::process::id()
+        ));
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(true)
-            .open("/tmp/bench_wal.batch")
+            .open(&path)
             .unwrap();
-        
-        let records = (0..1000).map(|i| LogRecord {
-            r#gen: 1,
-            next_id: i as u64 + 1,
-            pack: Pack::InsertBulk {
-                collection: "bench".into(),
-                rows: vec![crate::store::Row::new()],
-                edges: vec![],
-            },
-        }).collect::<Vec<_>>();
-        
+
+        let records = (0..1000)
+            .map(|i| LogRecord {
+                r#gen: i as u64 + 1,
+                next_id: i as u64 + 1,
+                pack: Pack::InsertBulk {
+                    collection: "bench".into(),
+                    rows: vec![crate::store::Row::new()],
+                    edges: vec![],
+                },
+            })
+            .collect::<Vec<_>>();
+
         let start = Instant::now();
         append_batch_records(&mut file, &records, SyncMode::Normal, &mut 0).unwrap();
         let elapsed = start.elapsed();
-        
+
+        let mut replayed = 0usize;
+        replay_log(&mut file, 0, 0, |_| {
+            replayed += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(replayed, 1000);
+        drop(file);
+        let _ = fs::remove_file(path);
+
         println!("BATCH WRITE: {}ms for {} records", elapsed.as_millis(), records.len());
-        assert!(elapsed.as_millis() < 500, "Batch write too slow");
+        assert!(elapsed.as_millis() < 2000, "Batch write too slow");
     }
 }

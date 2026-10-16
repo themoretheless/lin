@@ -22,15 +22,17 @@ thread_local! {
         Mutex::new(FxHashMap::default());
 }
 
-/// Query result cache with LRU eviction policy
-/// Caches intermediate results for repeated queries to avoid recomputation
+// Query result cache with LRU eviction policy
+// Caches intermediate results for repeated queries to avoid recomputation
 thread_local! {
+    #[allow(dead_code)]
     static QUERY_CACHE: Cache = Cache::new();
 }
 
 use crate::ast::*;
 
 /// LRU cache entry for cached query results
+#[allow(dead_code)]
 struct CacheEntry {
     /// Result rows stored as Vec<Row>
     rows: Vec<Row>,
@@ -39,6 +41,7 @@ struct CacheEntry {
 }
 
 /// Simple LRU cache implementation using FxHashMap + Vec for order tracking
+#[allow(dead_code)]
 pub struct Cache {
     /// Cache key → entry mapping
     entries: FxHashMap<String, CacheEntry>,
@@ -50,6 +53,7 @@ pub struct Cache {
     size_bytes: usize,
 }
 
+#[allow(dead_code)]
 impl Cache {
     const DEFAULT_MAX_ENTRIES: usize = 256;
     
@@ -70,7 +74,6 @@ impl Cache {
         if let Some(entry) = self.entries.get_mut(&key_string) {
             // Update access time and move to front of LRU list
             entry.last_access = std::time::Instant::now();
-            drop(entry); // Drop the mutable reference before calling evict_to_front
             self.evict_to_front(&key_string);
             return self.entries.get(&key_string).map(|e| &e.rows);
         }
@@ -166,6 +169,7 @@ impl Cache {
 
 /// Aggregate function types for precomputed aggregation views
 #[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
 pub enum AggregateType {
     Count,      // COUNT(*) or COUNT(column)
     Sum,        // SUM(column) - numeric only
@@ -188,6 +192,7 @@ impl std::fmt::Display for AggregateType {
 
 /// Values for different aggregate types maintained incrementally
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
 pub struct AggregateValue {
     pub count: u64,
     pub sum: f64,
@@ -197,6 +202,7 @@ pub struct AggregateValue {
     pub max: Option<f64>,
 }
 
+#[allow(dead_code)]
 impl AggregateValue {
     /// Increment count-only metrics
     #[inline]
@@ -269,6 +275,7 @@ impl AggregateValue {
 /// Materialized aggregate view for a collection + group + agg type
 /// Stores precomputed results to avoid repeated computation
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct AggregateView {
     /// Collection name this view applies to
     pub collection: String,
@@ -283,70 +290,39 @@ pub struct AggregateView {
     pub r#gen: u64,
 }
 
-/// Window function types for analytical queries
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WindowFunction {
-    Rank,           // RANK() OVER (ORDER BY ...)
-    DenseRank,      // DENSE_RANK() OVER (ORDER BY ...)
-    RowNumber,      // ROW_NUMBER() OVER (ORDER BY ...)
-    Lead { offset: usize },     // LEAD(col, offset)
-    Lag { offset: usize },      // LAG(col, offset)
-    FirstValue,     // FIRST_VALUE(col)
-    LastValue,      // LAST_VALUE(col)
-}
-
-impl std::fmt::Display for WindowFunction {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            WindowFunction::Rank => write!(f, "RANK"),
-            WindowFunction::DenseRank => write!(f, "DENSE_RANK"),
-            WindowFunction::RowNumber => write!(f, "ROW_NUMBER"),
-            WindowFunction::Lead { offset } => write!(f, "LEAD({})", offset),
-            WindowFunction::Lag { offset } => write!(f, "LAG({})", offset),
-            WindowFunction::FirstValue => write!(f, "FIRST_VALUE"),
-            WindowFunction::LastValue => write!(f, "LAST_VALUE"),
-        }
-    }
-}
-
-/// Precomputed window state for maintaining running rank/order info
-#[derive(Debug, Clone)]
-pub struct WindowState {
-    /// Window function being computed
-    pub func: WindowFunction,
-    /// Partitions (GROUP BY columns for window scope)
-    pub partitions: Vec<String>,
-    /// Order by columns
-    pub order_by: Vec<(String, bool)>,  // (field, descending)
-    /// Running totals for this window
-    pub running_data: FxHashMap<String, Vec<f64>>,  // partition_key -> [values]
-}
-
-/// Thread-local storage for aggregate views
-/// Indexed by (collection, group_fields, agg_types) → AggregateView
+// Thread-local storage for aggregate views
+// Indexed by (collection, group_fields, agg_types) → AggregateView
 thread_local! {
-    static AGGREGATE_VIEWS: std::sync::Mutex<FxHashMap<String, AggregateView>> = 
+    static AGGREGATE_VIEWS: std::sync::Mutex<FxHashMap<String, AggregateView>> =
         std::sync::Mutex::new(FxHashMap::default());
 }
 
 /// Compute cache key from collection, group fields, and aggregation types
+#[allow(dead_code)]
 fn agg_view_key(collection: &str, group_keys: &[String], aggs: &[AggregateType]) -> String {
     let mut key = format!("{}:", collection);
     if !group_keys.is_empty() {
         key.push_str(&group_keys.join(","));
         key.push('|');
     }
-    key.push_str(&aggs.iter().map(|a| match a {
-        AggregateType::Count => "C",
-        AggregateType::Sum => "S",
-        AggregateType::Avg => "A",
-        AggregateType::Min => "M",
-        AggregateType::Max => "X",
-    }).collect::<Vec<_>>().join(""));
+    key.push_str(
+        &aggs
+            .iter()
+            .map(|a| match a {
+                AggregateType::Count => "C",
+                AggregateType::Sum => "S",
+                AggregateType::Avg => "A",
+                AggregateType::Min => "M",
+                AggregateType::Max => "X",
+            })
+            .collect::<Vec<_>>()
+            .join(""),
+    );
     key
 }
 
 /// Initialize or retrieve an aggregate view for the given parameters
+#[allow(dead_code)]
 pub fn get_or_init_aggregate_view(
     collection: &str,
     group_keys: Vec<String>,
@@ -354,55 +330,41 @@ pub fn get_or_init_aggregate_view(
     r#gen: u64,
 ) -> AggregateView {
     let key = agg_view_key(collection, &group_keys, &aggs);
-    
+
     AGGREGATE_VIEWS.with(|views| {
         let mut map = views.lock().unwrap();
-        // Clone entry if exists, otherwise insert and return copy
-        map.entry(key).or_insert_with(|| AggregateView {
-            collection: collection.to_string(),
-            group_keys,
-            aggs,
-            data: FxHashMap::default(),
-            r#gen,
-        }).clone()
+        map.entry(key)
+            .or_insert_with(|| AggregateView {
+                collection: collection.to_string(),
+                group_keys,
+                aggs,
+                data: FxHashMap::default(),
+                r#gen,
+            })
+            .clone()
     })
 }
 
 /// Update aggregate view with a new row's data
+#[allow(dead_code)]
 pub fn update_aggregate(view: &mut AggregateView, group_values: &[String], row: &Row) {
-    // Build group key string
     let group_key = group_values.join(":");
-    
-    // Get or create entry for this group
-    let entry = view.data.entry(group_key).or_insert_with(AggregateValue::default);
-    
-    // Update based on aggregation types
+    let entry = view.data.entry(group_key).or_default();
+
     for agg in &view.aggs {
         match agg {
             AggregateType::Count => {
                 entry.inc_count();
             }
-            AggregateType::Sum | AggregateType::Avg => {
-                // Sum/Avg over all numeric fields (simplified: use first group key as proxy)
+            AggregateType::Sum | AggregateType::Avg | AggregateType::Min | AggregateType::Max => {
                 if let Some(field) = view.group_keys.first() {
-                    if let Some(cell) = row.get(field) {
-                        if let Some(value) = cell.as_f64() {
-                            entry.add_value(value);
-                        }
+                    if let Some(cell) = row.get(field)
+                        && let Some(value) = cell.as_f64()
+                    {
+                        entry.add_value(value);
                     }
                 } else {
-                    // Fallback: scan row for numeric values
                     for (_, cell) in row.iter() {
-                        if let Some(value) = cell.as_f64() {
-                            entry.add_value(value);
-                        }
-                    }
-                }
-            }
-            AggregateType::Min | AggregateType::Max => {
-                // Min/Max similar to Sum/Avg
-                if let Some(field) = view.group_keys.first() {
-                    if let Some(cell) = row.get(field) {
                         if let Some(value) = cell.as_f64() {
                             entry.add_value(value);
                         }
@@ -411,14 +373,13 @@ pub fn update_aggregate(view: &mut AggregateView, group_values: &[String], row: 
             }
         }
     }
-    
-    // Note: r#gen is set when creating/retrieving view, not on every update
 }
 
 /// Get computed aggregate results for a group
+#[allow(dead_code)]
 pub fn get_aggregate_result(entry: &AggregateValue, aggs: &[AggregateType]) -> Vec<(String, Cell)> {
     let mut result = Vec::with_capacity(aggs.len());
-    
+
     for agg in aggs {
         let cell = match agg {
             AggregateType::Count => Cell::Int(entry.count as i64),
@@ -429,20 +390,21 @@ pub fn get_aggregate_result(entry: &AggregateValue, aggs: &[AggregateType]) -> V
         };
         result.push((format!("{}", agg), cell));
     }
-    
+
     result
 }
 
 /// Invalidate aggregate views after store mutation
+#[allow(dead_code)]
 pub fn invalidate_aggregates(r#gen: u64) {
     AGGREGATE_VIEWS.with(|views| {
         let mut map = views.lock().unwrap();
-        // Remove entries that are older than current generation
         map.retain(|_, view| view.r#gen >= r#gen);
     });
 }
 
 /// Clear all cached aggregate views
+#[allow(dead_code)]
 pub fn clear_aggregate_cache() {
     AGGREGATE_VIEWS.with(|views| {
         if let Ok(mut map) = views.lock() {
@@ -451,30 +413,24 @@ pub fn clear_aggregate_cache() {
     });
 }
 
-/// Update precomputed aggregates for an INSERT operation
+/// Update precomputed aggregates for an INSERT operation in-place
+#[allow(dead_code)]
 pub fn update_aggregate_for_insert(collection: &str, row: &Row) {
-    // Find aggregate views matching this collection and update incrementally
     AGGREGATE_VIEWS.with(|views| {
-        let map = views.lock().unwrap();
-        
-        for (_, view) in map.iter() {
+        let mut map = views.lock().unwrap();
+
+        for (_, view) in map.iter_mut() {
             if view.collection != collection {
                 continue;
             }
-            
-            // Extract group values from row
-            let group_values: Vec<String> = view.group_keys.iter()
-                .filter_map(|field| row.get(field).and_then(|c| c.as_f64()))
-                .map(|v| format!("{}", v))
+
+            let group_values: Vec<String> = view
+                .group_keys
+                .iter()
+                .filter_map(|field| row.get(field).map(|c| c.compact()))
                 .collect();
-            
-            // Update the aggregate view with new row data
-            let mut mutable_view = view.clone();
-            update_aggregate(&mut mutable_view, &group_values, row);
-            
-            // Note: In production, we would update the cache entry directly
-            // For now, this demonstrates the incremental update pattern
-            drop(mutable_view);
+
+            update_aggregate(view, &group_values, row);
         }
     });
 }
@@ -498,103 +454,45 @@ pub use crate::persist::{OpenMemOpts as OpenOpts, SyncMode};
 type StmtOut = (Vec<Row>, Option<String>, Option<Pack>);
 
 /// Get precomputed content hash from cache, or compute and store it
+#[allow(dead_code)]
 fn cached_content_hash(body: &str) -> Arc<str> {
     CONTENT_HASH_CACHE.with(|cache| {
         let mut guard = cache.lock().unwrap();
-        
-        // Check if already computed
+
         if let Some(cached) = guard.get(body) {
             return cached.clone();
         }
-        
-        // Compute and cache
+
         let hash = content_hash_arc(body);
         guard.insert(body.to_owned(), hash.clone());
-        
-        // Evict old entries if cache gets too large
+
         while guard.len() >= 1024 {
-            // Simple eviction: remove first entry
             if let Some(key) = guard.keys().next().cloned() {
                 guard.remove(&key);
             } else {
                 break;
             }
         }
-        
+
         hash
     })
 }
 
-/// Query result cache with simple LRU-style eviction based on memory pressure
-struct QueryCache {
-    /// (query_hash) -> cached result
-    entries: FxHashMap<u64, (Arc<str>, StmtOut)>,
-    /// Track size for evicting old entries under memory pressure  
-    max_entries: usize,
-}
-
-impl QueryCache {
-    fn new() -> Self {
-        Self {
-            entries: FxHashMap::default(),
-            max_entries: 256, // tune based on workload
-        }
-    }
-
-    fn clear(&mut self) {
-        self.entries.clear();
-    }
-
-    #[allow(dead_code)]
-    fn get(&self, hash: u64, query: &str) -> Option<&StmtOut> {
-        self.entries.get(&hash).filter(|(q, _)| q.as_ref() == query).map(|(_, out)| out)
-    }
-
-    #[allow(dead_code)]
-    fn put(&mut self, hash: u64, query: Arc<str>, out: StmtOut) {
-        // Evict if over capacity
-        while self.entries.len() >= self.max_entries {
-            // Simple eviction: remove first entry
-            if let Some(key) = self.entries.iter().next().map(|(k, _)| *k) {
-                self.entries.remove(&key);
-            } else {
-                break;
-            }
-        }
-        self.entries.insert(hash, (query, out));
-    }
-
-    #[allow(dead_code)]
-    fn shrink_to_fit(&mut self) {
-        self.entries.shrink_to_fit();
-    }
-}
-
-#[cfg(feature = "parallel")]
-static QUERY_CACHE: std::sync::Mutex<Option<QueryCache>> = 
-    std::sync::Mutex::new(None);
-
-/// Compute a simple hash for caching queries - FNV-1a based on string content  
-#[cfg(feature = "parallel")]
-fn query_hash(query: &str) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325; // FNV offset basis
-    for byte in query.bytes() {
-        h ^= byte as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    h
-}
-
 /// Convert statements to query source string for hashing
 #[cfg(feature = "parallel")]
-fn to_query_source(&self, stmts: &[Stmt]) -> Result<String, Error> {
+#[allow(dead_code)]
+fn to_query_source(stmts: &[Stmt]) -> Result<String, Error> {
     if stmts.len() == 1 {
         match &stmts[0] {
             Stmt::Query(q) => Ok(format!("{q:?}")),
             _ => Ok(String::new()),
         }
     } else {
-        Ok(stmts.iter().map(|s| format!("{s:?}")).collect::<Vec<_>>().join("; "))
+        Ok(stmts
+            .iter()
+            .map(|s| format!("{s:?}"))
+            .collect::<Vec<_>>()
+            .join("; "))
     }
 }
 
@@ -1369,9 +1267,9 @@ impl Db {
 
     /// Typecheck + plan a program already parsed as AST (no string cache).
     pub fn prepare_stmts(&self, stmts: Vec<Stmt>) -> Result<Prepared, Error> {
-        let mut check_cat = self.catalog.clone();
-        check::check_program(&stmts, &mut check_cat)?;
-        let plan = Arc::new(plan::plan_program(&stmts, &check_cat)?);
+        let (_, staged) = check::check_program(&stmts, &self.catalog)?;
+        let plan_cat = staged.as_ref().unwrap_or(&self.catalog);
+        let plan = Arc::new(plan::plan_program(&stmts, plan_cat)?);
         let writes = stmts.iter().any(stmt_writes);
         let append_only = writes && stmts.iter().all(|s| stmt_append_only(s) || !stmt_writes(s));
         let schema = stmts.iter().any(stmt_schema);
@@ -1454,6 +1352,9 @@ impl Db {
         let n = if rows.is_empty() {
             match prepared.stmts.last() {
                 Some(Stmt::Insert { records, .. }) => records.len(),
+                Some(Stmt::AppendFacts { records }) if pack.is_some() => {
+                    pack_affect_n(pack.as_ref()).filter(|&c| c > 0).unwrap_or(records.len())
+                }
                 _ => pack_affect_n(pack.as_ref()).unwrap_or(0),
             }
         } else {
@@ -1658,9 +1559,9 @@ impl Db {
         graph: Option<GraphFmt>,
         run_src: Option<&str>,
     ) -> Result<String, Error> {
-        let mut cat = self.catalog.clone();
-        check::check_program(&stmts, &mut cat)?;
-        let mut plan = plan::plan_program(&stmts, &cat)?;
+        let (_, staged) = check::check_program(&stmts, &self.catalog)?;
+        let plan_cat = staged.as_ref().unwrap_or(&self.catalog);
+        let mut plan = plan::plan_program(&stmts, plan_cat)?;
         if let Some(fmt) = graph {
             plan.explain = match fmt {
                 GraphFmt::Mermaid => crate::ast::ExplainKind::Graph,
@@ -1669,6 +1570,7 @@ impl Db {
         }
         let mut ctx = ExplainCtx {
             r#gen: Some(self.store.r#gen),
+            sizes: explain::CollectionSizes::from_store(&self.store, plan_cat),
             ..ExplainCtx::default()
         };
         if plan.explain == crate::ast::ExplainKind::Run {
@@ -1803,9 +1705,9 @@ impl ReadDb {
         graph: Option<GraphFmt>,
         run_src: Option<&str>,
     ) -> Result<String, Error> {
-        let mut cat = self.inner.catalog.clone();
-        check::check_program(&stmts, &mut cat)?;
-        let mut plan = plan::plan_program(&stmts, &cat)?;
+        let (_, staged) = check::check_program(&stmts, &self.inner.catalog)?;
+        let plan_cat = staged.as_ref().unwrap_or(&self.inner.catalog);
+        let mut plan = plan::plan_program(&stmts, plan_cat)?;
         if let Some(fmt) = graph {
             plan.explain = match fmt {
                 GraphFmt::Mermaid => crate::ast::ExplainKind::Graph,
@@ -1814,6 +1716,7 @@ impl ReadDb {
         }
         let mut ctx = ExplainCtx {
             r#gen: Some(self.inner.store.r#gen),
+            sizes: explain::CollectionSizes::from_store(&self.inner.store, plan_cat),
             ..ExplainCtx::default()
         };
         if plan.explain == crate::ast::ExplainKind::Run {
@@ -2305,7 +2208,7 @@ impl Db {
             && matches!(&q.source, Source::Collection(n) if bindings.get(n).is_none());
         let mut skip_first_project = skip_first_filter && project_fields_step.is_some();
 
-        for step in &q.steps {
+        for (step_idx, step) in q.steps.iter().enumerate() {
             match step {
                 Step::Filter(pred) => {
                     if skip_first_filter {
@@ -2371,12 +2274,30 @@ impl Db {
                     implicit_take = false;
                     saw_agg = true;
                     #[cfg(feature = "gpu")]
-                    if let Some(result) = self.gpu_sum_rows(&rows, field, by)? {
+                    if let Some(result) = self.gpu_sum_rows(&rows, field, by.as_ref())? {
                         rows = result;
                         primary = String::new();
                         continue;
                     }
-                    rows = agg_sum(&rows, field, by);
+                    rows = agg_sum(&rows, field, by.as_ref());
+                    primary = String::new();
+                }
+                Step::Min { field, by } => {
+                    implicit_take = false;
+                    saw_agg = true;
+                    rows = agg_min(&rows, field, by.as_ref());
+                    primary = String::new();
+                }
+                Step::Max { field, by } => {
+                    implicit_take = false;
+                    saw_agg = true;
+                    rows = agg_max(&rows, field, by.as_ref());
+                    primary = String::new();
+                }
+                Step::Avg { field, by } => {
+                    implicit_take = false;
+                    saw_agg = true;
+                    rows = agg_avg(&rows, field, by.as_ref());
                     primary = String::new();
                 }
                 Step::Sort { field, desc } => {
@@ -2395,7 +2316,42 @@ impl Db {
                             .collect();
                         continue;
                     }
-                    sort_rows(&mut rows, field, *desc);
+                    let mut look_skip = 0usize;
+                    let mut look_take: Option<usize> = None;
+                    let mut j = step_idx + 1;
+                    while j < q.steps.len() {
+                        match &q.steps[j] {
+                            Step::Skip { n } => {
+                                look_skip = look_skip.saturating_add((*n).max(0) as usize);
+                                j += 1;
+                            }
+                            Step::Take { n: Some(n) } => {
+                                look_take = Some((*n).max(0) as usize);
+                                break;
+                            }
+                            _ => break,
+                        }
+                    }
+                    let top_k = look_take.map(|t| look_skip.saturating_add(t));
+                    sort_rows_top_k(&mut rows, field, *desc, top_k);
+                }
+                Step::Window {
+                    func,
+                    field,
+                    by,
+                    order,
+                    desc,
+                    as_field,
+                } => {
+                    rows = eval_window(
+                        rows,
+                        func,
+                        field.as_ref(),
+                        by.as_ref(),
+                        order.as_ref(),
+                        *desc,
+                        as_field,
+                    );
                 }
                 Step::Skip { n } => {
                     let n = (*n).max(0) as usize;
@@ -2500,28 +2456,22 @@ impl Db {
                 ..
             }
         );
-        let row = self
-            .store
-            .project_by_key(name, field, key, fields.as_deref())?;
-        // Lookup already keyed by id/uri equality — skip re-eval for a lone Cmp.
         if simple_eq {
+            let row = self
+                .store
+                .project_by_key(name, field, key, fields.as_deref())?;
             return Some(vec![row]);
         }
         let now = now_ms();
-        if !eval_pred(pred, &row, now) {
-            // projected row may miss pred fields — evaluate against full row
-            let full = self.store.project_by_key(name, field, key, None)?;
-            if !eval_pred(pred, &full, now) {
-                return Some(Vec::new());
-            }
-            // pred ok on full; return projected if requested
-            return Some(vec![
-                self.store
-                    .project_by_key(name, field, key, fields.as_deref())
-                    .unwrap_or(full),
-            ]);
+        let full = self.store.project_by_key(name, field, key, None)?;
+        if !eval_pred(pred, &full, now) {
+            return Some(Vec::new());
         }
-        Some(vec![row])
+        Some(vec![
+            self.store
+                .project_by_key(name, field, key, fields.as_deref())
+                .unwrap_or(full),
+        ])
     }
 
     /// `col | search lex|hybrid …` — FTS postings → residual score (no full scan).
@@ -2836,7 +2786,7 @@ impl Db {
         for step in &q.steps {
             match step {
                 Step::Filter(p) => {
-                    if filter.is_some() {
+                    if filter.is_some() || by.is_some() {
                         return None;
                     }
                     filter = Some(p);
@@ -2847,8 +2797,6 @@ impl Db {
                     }
                     by = Some(b.as_ref());
                 }
-                Step::Take { .. } => {}
-                Step::Skip { .. } => {}
                 _ => return None,
             }
         }
@@ -2901,37 +2849,34 @@ impl Db {
         {
             if let Some(v) = eq_value_for_field(pred, &by_key) {
                 let n = self.store.index_seek_count(name, &uses, now)?;
+                if n == 0 {
+                    return Some(Vec::new());
+                }
                 return Some(vec![count_row(&by_key, v, n as i64)]);
             }
             // Index covers filter but group key varies — read only the by-field.
             let idxs = self.store.index_seek(name, &uses, now)?;
-            let mut map: BTreeMap<String, i64> = BTreeMap::new();
+            let mut map: BTreeMap<String, (Cell, i64)> = BTreeMap::new();
             for i in idxs {
                 let Some(row) = self.store.get_by_idx(name, i) else {
                     continue;
                 };
-                let key = row
-                    .get(&by_key)
-                    .map(Cell::compact)
-                    .unwrap_or_else(|| "null".into());
-                *map.entry(key).or_insert(0) += 1;
+                let (key, cell) = group_cell_key_and_val(row.get(&by_key));
+                map.entry(key).or_insert((cell, 0)).1 += 1;
             }
-            return Some(count_map_to_rows(&by_key, map));
+            return Some(count_cell_map_to_rows(&by_key, map));
         }
 
         // Full scan count without cloning rows.
         let col = self.store.collection(name);
-        let mut map: BTreeMap<String, i64> = BTreeMap::new();
+        let mut map: BTreeMap<String, (Cell, i64)> = BTreeMap::new();
         for r in col {
             if eval_pred(pred, r, now) {
-                let key = r
-                    .get(&by_key)
-                    .map(Cell::compact)
-                    .unwrap_or_else(|| "null".into());
-                *map.entry(key).or_insert(0) += 1;
+                let (key, cell) = group_cell_key_and_val(r.get(&by_key));
+                map.entry(key).or_insert((cell, 0)).1 += 1;
             }
         }
-        Some(count_map_to_rows(&by_key, map))
+        Some(count_cell_map_to_rows(&by_key, map))
     }
 
     /// `col | pred | { fields } | take …` — project from hot columns when possible.
@@ -3717,21 +3662,29 @@ impl Db {
         for _ in 0..depth {
             let mut next = BTreeSet::new();
             let gpu_mask = self.graph_frontier_mask(edge_rel, reverse, &frontier)?;
-            for (edge_index, e) in self.store.edges.iter().enumerate() {
-                if e.rel != edge_rel {
-                    continue;
+            if let Some(mask) = &gpu_mask {
+                for (edge_index, e) in self.store.edges.iter().enumerate() {
+                    if e.rel != edge_rel {
+                        continue;
+                    }
+                    let dst = if reverse {
+                        e.from.as_str()
+                    } else {
+                        e.to.as_str()
+                    };
+                    if mask[edge_index] && seen.insert(dst.to_string()) {
+                        next.insert(dst.to_string());
+                        reached.insert(dst.to_string());
+                    }
                 }
-                let (src, dst) = if reverse {
-                    (e.to.as_str(), e.from.as_str())
-                } else {
-                    (e.from.as_str(), e.to.as_str())
-                };
-                let hit = gpu_mask
-                    .as_ref()
-                    .map_or_else(|| frontier.contains(src), |mask| mask[edge_index]);
-                if hit && seen.insert(dst.to_string()) {
-                    next.insert(dst.to_string());
-                    reached.insert(dst.to_string());
+            } else {
+                for src in &frontier {
+                    for dst in self.store.edge_neighbors(edge_rel, src, reverse) {
+                        if seen.insert(dst.to_string()) {
+                            next.insert(dst.to_string());
+                            reached.insert(dst.to_string());
+                        }
+                    }
                 }
             }
             if reached.len() >= 300 {
@@ -3746,14 +3699,17 @@ impl Db {
         for key in reached {
             if let Some(row) = self.store.find_doc_key(&key) {
                 out.push(row.clone());
-            } else if primary != "docs"
-                && let Some(row) = self
+            } else if primary != "docs" {
+                if let Some(row) = self.store.get_by_id(primary, &key) {
+                    out.push(row.clone());
+                } else if let Some(row) = self
                     .store
                     .collection(primary)
                     .iter()
                     .find(|r| row_text(r, "id") == Some(key.as_str()))
-            {
-                out.push(row.clone());
+                {
+                    out.push(row.clone());
+                }
             }
             if out.len() >= 300 {
                 break;
@@ -3788,30 +3744,46 @@ impl Db {
         for _ in 0..depth {
             let mut next = BTreeSet::new();
             let gpu_mask = self.graph_frontier_mask(edge_rel, reverse, &frontier)?;
-            for (edge_index, e) in self.store.edges.iter().enumerate() {
-                if e.rel != edge_rel {
-                    continue;
-                }
-                let (src, dst) = if reverse {
-                    (e.to.as_str(), e.from.as_str())
-                } else {
-                    (e.from.as_str(), e.to.as_str())
-                };
-                let hit = gpu_mask
-                    .as_ref()
-                    .map_or_else(|| frontier.contains(src), |mask| mask[edge_index]);
-                if !hit {
-                    continue;
-                }
-                let key = (e.rel.clone(), e.from.clone(), e.to.clone());
-                if seen_edges.insert(key) {
-                    out.push(edge_row(&e.rel, &e.from, &e.to));
-                    if out.len() >= 300 {
-                        return Ok(out);
+            if let Some(mask) = &gpu_mask {
+                for (edge_index, e) in self.store.edges.iter().enumerate() {
+                    if e.rel != edge_rel || !mask[edge_index] {
+                        continue;
+                    }
+                    let dst = if reverse {
+                        e.from.as_str()
+                    } else {
+                        e.to.as_str()
+                    };
+                    let key = (e.rel.clone(), e.from.clone(), e.to.clone());
+                    if seen_edges.insert(key) {
+                        out.push(edge_row(&e.rel, &e.from, &e.to));
+                        if out.len() >= 300 {
+                            return Ok(out);
+                        }
+                    }
+                    if seen_nodes.insert(dst.to_string()) {
+                        next.insert(dst.to_string());
                     }
                 }
-                if seen_nodes.insert(dst.to_string()) {
-                    next.insert(dst.to_string());
+            } else {
+                for src in &frontier {
+                    for dst in self.store.edge_neighbors(edge_rel, src, reverse) {
+                        let (from, to) = if reverse {
+                            (dst.as_ref(), src.as_str())
+                        } else {
+                            (src.as_str(), dst.as_ref())
+                        };
+                        let key = (edge_rel.to_string(), from.to_string(), to.to_string());
+                        if seen_edges.insert(key) {
+                            out.push(edge_row(edge_rel, from, to));
+                            if out.len() >= 300 {
+                                return Ok(out);
+                            }
+                        }
+                        if seen_nodes.insert(dst.to_string()) {
+                            next.insert(dst.to_string());
+                        }
+                    }
                 }
             }
             frontier = next;
@@ -3914,30 +3886,43 @@ impl Db {
                 visited.insert(at.clone());
                 let gpu_mask =
                     self.graph_frontier_mask(edge_rel, reverse, &BTreeSet::from([at.clone()]))?;
-                for (edge_index, e) in self.store.edges.iter().enumerate() {
-                    if e.rel != edge_rel {
-                        continue;
+                if let Some(mask) = &gpu_mask {
+                    for (edge_index, e) in self.store.edges.iter().enumerate() {
+                        if e.rel != edge_rel || !mask[edge_index] {
+                            continue;
+                        }
+                        let dst = if reverse {
+                            e.from.as_str()
+                        } else {
+                            e.to.as_str()
+                        };
+                        if visited.contains(dst) {
+                            continue;
+                        }
+                        stack.push((
+                            dst.to_string(),
+                            depth + 1,
+                            visited.clone(),
+                            Some((e.rel.clone(), e.from.clone(), e.to.clone())),
+                        ));
                     }
-                    let (src, dst) = if reverse {
-                        (e.to.as_str(), e.from.as_str())
-                    } else {
-                        (e.from.as_str(), e.to.as_str())
-                    };
-                    let hit = gpu_mask
-                        .as_ref()
-                        .map_or_else(|| src == at, |mask| mask[edge_index]);
-                    if !hit {
-                        continue;
+                } else {
+                    for dst in self.store.edge_neighbors(edge_rel, &at, reverse) {
+                        if visited.contains(dst.as_ref()) {
+                            continue;
+                        }
+                        let (from, to) = if reverse {
+                            (dst.to_string(), at.clone())
+                        } else {
+                            (at.clone(), dst.to_string())
+                        };
+                        stack.push((
+                            dst.to_string(),
+                            depth + 1,
+                            visited.clone(),
+                            Some((edge_rel.to_string(), from, to)),
+                        ));
                     }
-                    if visited.contains(dst) {
-                        continue;
-                    }
-                    stack.push((
-                        dst.to_string(),
-                        depth + 1,
-                        visited.clone(),
-                        Some((e.rel.clone(), e.from.clone(), e.to.clone())),
-                    ));
                 }
             }
         }
@@ -3952,6 +3937,9 @@ impl Db {
             return Some(row);
         }
         if primary != "docs" {
+            if let Some(row) = self.store.get_by_id(primary, key) {
+                return Some(row);
+            }
             return self
                 .store
                 .collection(primary)
@@ -4139,6 +4127,7 @@ impl Db {
     }
 
     /// Append edges in bulk with pre-allocated vectors and zero-copy Arc reuse
+    #[allow(dead_code)]
     fn append_edges_batch(
         &mut self,
         edges: &[(String, Value, Value)],
@@ -4375,6 +4364,18 @@ impl Db {
         let mut out = Vec::new();
         for i in idxs {
             let before = self.store.collection(collection)[i].clone();
+            for (k, _) in &patch {
+                for g in &self.catalog.guards {
+                    if g.collection == collection
+                        && &g.field == k
+                        && eval_pred(&g.pred, &before, now)
+                    {
+                        return Err(Error::runtime(format!(
+                            "immutable field: {collection}.{k}"
+                        )));
+                    }
+                }
+            }
             let mut updated = before.clone();
             // Apply patch with zero-copy Arc clones where possible
             for (k, v) in &patch {
@@ -4523,7 +4524,7 @@ impl Db {
                 collection,
                 unique,
                 fields,
-                pred: _,
+                pred,
             } => {
                 if *unique {
                     self.assert_unique_index(collection, fields)?;
@@ -4532,6 +4533,7 @@ impl Db {
                     collection: collection.clone(),
                     unique: *unique,
                     fields: fields.clone(),
+                    pred_src: pred.as_ref().map(crate::plan::fmt_pred),
                 };
                 self.store.apply_pack(&pack);
                 self.plan_cache.clear();
@@ -4784,6 +4786,7 @@ pub(crate) fn build_right_probe<'a>(
     probe
 }
 
+#[allow(dead_code)]
 pub(crate) fn build_right_probe_owned(
     rights: &[Row],
     right_fields: &[String],
@@ -5188,6 +5191,17 @@ pub(crate) fn eval_pred(pred: &Pred, row: &Row, now: i64) -> bool {
     match pred {
         Pred::And(a, b) => eval_pred(a, row, now) && eval_pred(b, row, now),
         Pred::Or(a, b) => eval_pred(a, row, now) || eval_pred(b, row, now),
+        Pred::Not(inner) => !eval_pred(inner, row, now),
+        Pred::IsNull { field, negated } => {
+            let is_null = matches!(field_cell(row, field), Cell::Null);
+            if *negated { !is_null } else { is_null }
+        }
+        Pred::In { field, values } => {
+            let left = field_cell(row, field);
+            values
+                .iter()
+                .any(|v| cmp_cell(left, v, CmpOp::Eq, now))
+        }
         Pred::Cmp { field, op, value } => cmp_cell(field_cell(row, field), value, *op, now),
         Pred::Has { field, ci, needle } => field_cell(row, field)
             .text()
@@ -5235,12 +5249,7 @@ fn field_cell<'a>(row: &'a Row, field: &Field) -> &'a Cell {
         return row.get(k).unwrap_or(&NULL);
     }
     let want = field.as_str();
-    for (k, v) in row {
-        if k == &want {
-            return v;
-        }
-    }
-    &NULL
+    row.get(&want).unwrap_or(&NULL)
 }
 
 fn cmp_cell(left: &Cell, value: &Value, op: CmpOp, now: i64) -> bool {
@@ -5377,14 +5386,25 @@ fn project(rows: &[Row], fields: &[Field]) -> Vec<Row> {
         .collect()
 }
 
-fn sort_rows(rows: &mut [Row], field: &Field, desc: bool) {
+fn sort_rows_top_k(rows: &mut Vec<Row>, field: &Field, desc: bool, top_k: Option<usize>) {
     let k = field.as_str();
-    rows.sort_by(|a, b| {
+    let cmp = |a: &Row, b: &Row| {
         let av = a.get(&k).unwrap_or(&Cell::Null);
         let bv = b.get(&k).unwrap_or(&Cell::Null);
         let ord = cmp_sort(av, bv);
         if desc { ord.reverse() } else { ord }
-    });
+    };
+    if let Some(limit) = top_k {
+        if limit == 0 {
+            rows.clear();
+            return;
+        }
+        if rows.len() > limit {
+            rows.select_nth_unstable_by(limit - 1, cmp);
+            rows.truncate(limit);
+        }
+    }
+    rows.sort_by(cmp);
 }
 
 fn cmp_sort(a: &Cell, b: &Cell) -> std::cmp::Ordering {
@@ -5409,22 +5429,185 @@ fn cmp_sort(a: &Cell, b: &Cell) -> std::cmp::Ordering {
     }
 }
 
-fn agg_count(rows: &[Row], by: &Field) -> Vec<Row> {
-    let k = by.as_str();
-    let mut map: BTreeMap<String, i64> = BTreeMap::new();
-    for r in rows {
-        let key = r
-            .get(&k)
-            .map(Cell::compact)
-            .unwrap_or_else(|| "null".into());
-        *map.entry(key).or_insert(0) += 1;
+fn group_cell_key_and_val(c: Option<&Cell>) -> (String, Cell) {
+    match c {
+        Some(Cell::Text(s)) => (format!("\"{s}\""), Cell::Text(std::sync::Arc::clone(s))),
+        Some(Cell::Null) | None => ("null".into(), Cell::text_arc("null")),
+        Some(other) => (other.compact(), other.clone()),
     }
-    count_map_to_rows(&k, map)
 }
 
-fn count_map_to_rows(by: &str, map: BTreeMap<String, i64>) -> Vec<Row> {
-    map.into_iter()
-        .map(|(g, n)| count_row(by, &unquote(&g), n))
+pub(crate) fn eval_window(
+    rows: Vec<Row>,
+    func: &crate::window::WindowFunction,
+    field: Option<&Field>,
+    by: Option<&Field>,
+    order: Option<&Field>,
+    desc: bool,
+    as_field: &str,
+) -> Vec<Row> {
+    if rows.is_empty() {
+        return rows;
+    }
+
+    let by_key = by.map(|b| b.as_str());
+    let mut partition_keys = Vec::new();
+    let mut partitions: FxHashMap<String, Vec<Row>> = FxHashMap::default();
+
+    for row in rows {
+        let key = match &by_key {
+            Some(bk) => group_cell_key_and_val(row.get(bk)).0,
+            None => String::new(),
+        };
+        partitions
+            .entry(key.clone())
+            .or_insert_with(|| {
+                partition_keys.push(key);
+                Vec::new()
+            })
+            .push(row);
+    }
+
+    let order_key = order.map(|o| o.as_str());
+    let target_field = field.map(|f| f.as_str());
+
+    let mut result_rows = Vec::new();
+
+    for pkey in partition_keys {
+        let mut part = partitions.remove(&pkey).unwrap_or_default();
+
+        if let Some(ok) = &order_key {
+            let cmp = |a: &Row, b: &Row| {
+                let av = a.get(ok).unwrap_or(&Cell::Null);
+                let bv = b.get(ok).unwrap_or(&Cell::Null);
+                let ord = cmp_sort(av, bv);
+                if desc {
+                    ord.reverse()
+                } else {
+                    ord
+                }
+            };
+            part.sort_by(cmp);
+        }
+
+        let n = part.len();
+        match func {
+            crate::window::WindowFunction::RowNumber => {
+                for (i, mut row) in part.into_iter().enumerate() {
+                    row.insert(as_field.to_string(), Cell::Int((i + 1) as i64));
+                    result_rows.push(row);
+                }
+            }
+            crate::window::WindowFunction::Rank => {
+                let mut ranks = Vec::with_capacity(n);
+                let mut current_rank = 1i64;
+                for i in 0..n {
+                    if i > 0 && let Some(ok) = &order_key {
+                        let prev = part[i - 1].get(ok).unwrap_or(&Cell::Null);
+                        let curr = part[i].get(ok).unwrap_or(&Cell::Null);
+                        if cmp_sort(prev, curr) != std::cmp::Ordering::Equal {
+                            current_rank = (i + 1) as i64;
+                        }
+                    }
+                    ranks.push(current_rank);
+                }
+                for (i, mut row) in part.into_iter().enumerate() {
+                    row.insert(as_field.to_string(), Cell::Int(ranks[i]));
+                    result_rows.push(row);
+                }
+            }
+            crate::window::WindowFunction::DenseRank => {
+                let mut ranks = Vec::with_capacity(n);
+                let mut current_rank = 1i64;
+                for i in 0..n {
+                    if i > 0 && let Some(ok) = &order_key {
+                        let prev = part[i - 1].get(ok).unwrap_or(&Cell::Null);
+                        let curr = part[i].get(ok).unwrap_or(&Cell::Null);
+                        if cmp_sort(prev, curr) != std::cmp::Ordering::Equal {
+                            current_rank += 1;
+                        }
+                    }
+                    ranks.push(current_rank);
+                }
+                for (i, mut row) in part.into_iter().enumerate() {
+                    row.insert(as_field.to_string(), Cell::Int(ranks[i]));
+                    result_rows.push(row);
+                }
+            }
+            crate::window::WindowFunction::Lead { offset } => {
+                let off = *offset;
+                let tf = target_field.as_deref().unwrap_or_default();
+                let vals: Vec<Cell> = (0..n)
+                    .map(|i| {
+                        if i + off < n {
+                            part[i + off].get(tf).cloned().unwrap_or(Cell::Null)
+                        } else {
+                            Cell::Null
+                        }
+                    })
+                    .collect();
+                for (i, mut row) in part.into_iter().enumerate() {
+                    row.insert(as_field.to_string(), vals[i].clone());
+                    result_rows.push(row);
+                }
+            }
+            crate::window::WindowFunction::Lag { offset } => {
+                let off = *offset;
+                let tf = target_field.as_deref().unwrap_or_default();
+                let vals: Vec<Cell> = (0..n)
+                    .map(|i| {
+                        if i >= off {
+                            part[i - off].get(tf).cloned().unwrap_or(Cell::Null)
+                        } else {
+                            Cell::Null
+                        }
+                    })
+                    .collect();
+                for (i, mut row) in part.into_iter().enumerate() {
+                    row.insert(as_field.to_string(), vals[i].clone());
+                    result_rows.push(row);
+                }
+            }
+            crate::window::WindowFunction::FirstValue => {
+                let tf = target_field.as_deref().unwrap_or_default();
+                let first_val = part.first().and_then(|r| r.get(tf)).cloned().unwrap_or(Cell::Null);
+                for mut row in part {
+                    row.insert(as_field.to_string(), first_val.clone());
+                    result_rows.push(row);
+                }
+            }
+            crate::window::WindowFunction::LastValue => {
+                let tf = target_field.as_deref().unwrap_or_default();
+                let last_val = part.last().and_then(|r| r.get(tf)).cloned().unwrap_or(Cell::Null);
+                for mut row in part {
+                    row.insert(as_field.to_string(), last_val.clone());
+                    result_rows.push(row);
+                }
+            }
+        }
+    }
+
+    result_rows
+}
+
+fn agg_count(rows: &[Row], by: &Field) -> Vec<Row> {
+    let k = by.as_str();
+    let mut map: BTreeMap<String, (Cell, i64)> = BTreeMap::new();
+    for r in rows {
+        let (key, cell) = group_cell_key_and_val(r.get(&k));
+        map.entry(key).or_insert((cell, 0)).1 += 1;
+    }
+    count_cell_map_to_rows(&k, map)
+}
+
+fn count_cell_map_to_rows(by: &str, map: BTreeMap<String, (Cell, i64)>) -> Vec<Row> {
+    map.into_values()
+        .map(|(cell, n)| {
+            let mut row = BTreeMap::new();
+            row.insert(by.to_string(), cell);
+            row.insert("hits".into(), Cell::Int(n));
+            row
+        })
         .collect()
 }
 
@@ -5469,34 +5652,169 @@ fn eq_value_for_field<'a>(pred: &'a Pred, field: &str) -> Option<&'a str> {
     }
 }
 
-fn agg_sum(rows: &[Row], field: &Field, by: &Field) -> Vec<Row> {
+fn agg_sum(rows: &[Row], field: &Field, by: Option<&Field>) -> Vec<Row> {
     let fk = field.as_str();
+    let Some(by) = by else {
+        let total: f64 = rows
+            .iter()
+            .map(|r| r.get(&fk).and_then(Cell::as_f64).unwrap_or(0.0))
+            .sum();
+        let mut row = BTreeMap::new();
+        row.insert(fk, Cell::Float(total));
+        return vec![row];
+    };
     let bk = by.as_str();
-    let mut map: BTreeMap<String, f64> = BTreeMap::new();
+    let mut map: BTreeMap<String, (Cell, f64)> = BTreeMap::new();
     for r in rows {
-        let key = r
-            .get(&bk)
-            .map(Cell::compact)
-            .unwrap_or_else(|| "null".into());
+        let (key, cell) = group_cell_key_and_val(r.get(&bk));
         let n = r.get(&fk).and_then(Cell::as_f64).unwrap_or(0.0);
-        *map.entry(key).or_insert(0.0) += n;
+        map.entry(key).or_insert((cell, 0.0)).1 += n;
     }
-    map.into_iter()
-        .map(|(g, n)| {
+    map.into_values()
+        .map(|(cell, n)| {
             let mut row = BTreeMap::new();
-            row.insert(bk.clone(), Cell::text_arc(unquote(&g)));
+            row.insert(bk.clone(), cell);
             row.insert(fk.clone(), Cell::Float(n));
             row
         })
         .collect()
 }
 
-fn unquote(s: &str) -> String {
-    if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
-        s[1..s.len() - 1].to_string()
-    } else {
-        s.to_string()
+fn agg_min(rows: &[Row], field: &Field, by: Option<&Field>) -> Vec<Row> {
+    let fk = field.as_str();
+    let Some(by) = by else {
+        let mut best: Option<Cell> = None;
+        for r in rows {
+            if let Some(c) = r.get(&fk).filter(|c| !matches!(c, Cell::Null)) {
+                best = Some(match best {
+                    None => c.clone(),
+                    Some(prev) => {
+                        if cmp_sort(c, &prev).is_lt() {
+                            c.clone()
+                        } else {
+                            prev
+                        }
+                    }
+                });
+            }
+        }
+        let mut row = BTreeMap::new();
+        row.insert(fk, best.unwrap_or(Cell::Null));
+        return vec![row];
+    };
+    let bk = by.as_str();
+    let mut map: BTreeMap<String, (Cell, Option<Cell>)> = BTreeMap::new();
+    for r in rows {
+        let (key, gcell) = group_cell_key_and_val(r.get(&bk));
+        let entry = map.entry(key).or_insert((gcell, None));
+        if let Some(c) = r.get(&fk).filter(|c| !matches!(c, Cell::Null)) {
+            entry.1 = Some(match entry.1.take() {
+                None => c.clone(),
+                Some(prev) => {
+                    if cmp_sort(c, &prev).is_lt() {
+                        c.clone()
+                    } else {
+                        prev
+                    }
+                }
+            });
+        }
     }
+    map.into_values()
+        .map(|(gcell, val)| {
+            let mut row = BTreeMap::new();
+            row.insert(bk.clone(), gcell);
+            row.insert(fk.clone(), val.unwrap_or(Cell::Null));
+            row
+        })
+        .collect()
+}
+
+fn agg_max(rows: &[Row], field: &Field, by: Option<&Field>) -> Vec<Row> {
+    let fk = field.as_str();
+    let Some(by) = by else {
+        let mut best: Option<Cell> = None;
+        for r in rows {
+            if let Some(c) = r.get(&fk).filter(|c| !matches!(c, Cell::Null)) {
+                best = Some(match best {
+                    None => c.clone(),
+                    Some(prev) => {
+                        if cmp_sort(c, &prev).is_gt() {
+                            c.clone()
+                        } else {
+                            prev
+                        }
+                    }
+                });
+            }
+        }
+        let mut row = BTreeMap::new();
+        row.insert(fk, best.unwrap_or(Cell::Null));
+        return vec![row];
+    };
+    let bk = by.as_str();
+    let mut map: BTreeMap<String, (Cell, Option<Cell>)> = BTreeMap::new();
+    for r in rows {
+        let (key, gcell) = group_cell_key_and_val(r.get(&bk));
+        let entry = map.entry(key).or_insert((gcell, None));
+        if let Some(c) = r.get(&fk).filter(|c| !matches!(c, Cell::Null)) {
+            entry.1 = Some(match entry.1.take() {
+                None => c.clone(),
+                Some(prev) => {
+                    if cmp_sort(c, &prev).is_gt() {
+                        c.clone()
+                    } else {
+                        prev
+                    }
+                }
+            });
+        }
+    }
+    map.into_values()
+        .map(|(gcell, val)| {
+            let mut row = BTreeMap::new();
+            row.insert(bk.clone(), gcell);
+            row.insert(fk.clone(), val.unwrap_or(Cell::Null));
+            row
+        })
+        .collect()
+}
+
+fn agg_avg(rows: &[Row], field: &Field, by: Option<&Field>) -> Vec<Row> {
+    let fk = field.as_str();
+    let Some(by) = by else {
+        let mut sum = 0.0f64;
+        let mut count = 0usize;
+        for r in rows {
+            if let Some(v) = r.get(&fk).and_then(Cell::as_f64) {
+                sum += v;
+                count += 1;
+            }
+        }
+        let avg = if count == 0 { 0.0 } else { sum / (count as f64) };
+        let mut row = BTreeMap::new();
+        row.insert(fk, Cell::Float(avg));
+        return vec![row];
+    };
+    let bk = by.as_str();
+    let mut map: BTreeMap<String, (Cell, f64, usize)> = BTreeMap::new();
+    for r in rows {
+        let (key, gcell) = group_cell_key_and_val(r.get(&bk));
+        let entry = map.entry(key).or_insert((gcell, 0.0, 0));
+        if let Some(v) = r.get(&fk).and_then(Cell::as_f64) {
+            entry.1 += v;
+            entry.2 += 1;
+        }
+    }
+    map.into_values()
+        .map(|(gcell, sum, count)| {
+            let avg = if count == 0 { 0.0 } else { sum / (count as f64) };
+            let mut row = BTreeMap::new();
+            row.insert(bk.clone(), gcell);
+            row.insert(fk.clone(), Cell::Float(avg));
+            row
+        })
+        .collect()
 }
 
 pub(crate) fn cell_key(c: &Cell) -> Option<String> {
@@ -5550,6 +5868,7 @@ impl Db {
                     matches!(pred, Pred::Or(..)),
                 )?))
             }
+            Pred::Not(_) | Pred::IsNull { .. } | Pred::In { .. } => Ok(None),
             Pred::Cmp { field, op, value } => {
                 let right = value_cell(value, now);
                 if let Cell::Text(needle) = &right {
@@ -5596,6 +5915,7 @@ impl Db {
 fn gpu_supported_pred(pred: &Pred) -> bool {
     match pred {
         Pred::And(a, b) | Pred::Or(a, b) => gpu_supported_pred(a) || gpu_supported_pred(b),
+        Pred::Not(_) | Pred::IsNull { .. } | Pred::In { .. } => false,
         Pred::Cmp { .. } | Pred::Has { .. } | Pred::Contains { .. } => true,
         Pred::Regex { .. } => true,
     }
@@ -5664,17 +5984,14 @@ impl Db {
             return Ok(Some(vec![hits_row(counts[0])]));
         };
         let field = by.as_str();
-        let row_keys: Vec<String> = rows
-            .iter()
-            .map(|row| {
-                row.get(&field)
-                    .map(Cell::compact)
-                    .unwrap_or_else(|| "null".into())
-            })
-            .collect();
-        let mut keys = row_keys.clone();
-        keys.sort();
-        keys.dedup();
+        let mut key_cells: BTreeMap<String, Cell> = BTreeMap::new();
+        let mut row_keys: Vec<String> = Vec::with_capacity(rows.len());
+        for row in rows {
+            let (key, cell) = group_cell_key_and_val(row.get(&field));
+            key_cells.entry(key.clone()).or_insert(cell);
+            row_keys.push(key);
+        }
+        let keys: Vec<String> = key_cells.keys().cloned().collect();
         if keys.len() > u32::MAX as usize {
             return Err(Error::runtime("GPU count has too many groups"));
         }
@@ -5686,7 +6003,13 @@ impl Db {
         Ok(Some(
             keys.into_iter()
                 .zip(counts)
-                .map(|(key, count)| count_row(&field, &unquote(&key), count))
+                .map(|(key, count)| {
+                    let cell = key_cells.remove(&key).unwrap_or(Cell::Null);
+                    let mut row = BTreeMap::new();
+                    row.insert(field.clone(), cell);
+                    row.insert("hits".into(), Cell::Int(count));
+                    row
+                })
                 .collect(),
         ))
     }
@@ -5792,6 +6115,9 @@ fn rows_to_query_batch(rows: &[Row], query: &Query) -> RecordBatch {
             | Step::Match { .. }
             | Step::Count { .. }
             | Step::Sum { .. }
+            | Step::Min { .. }
+            | Step::Max { .. }
+            | Step::Avg { .. }
             | Step::Union(_) => projection = None,
             _ => {}
         }
@@ -5830,24 +6156,31 @@ impl Db {
         &self,
         rows: &[Row],
         field: &Field,
-        by: &Field,
+        by: Option<&Field>,
     ) -> Result<Option<Vec<Row>>, Error> {
         let Some(gpu) = &self.gpu else {
             return Ok(None);
         };
         let fk = field.as_str();
+        let Some(by) = by else {
+            let values: Vec<f64> = rows
+                .iter()
+                .map(|row| row.get(&fk).and_then(Cell::as_f64).unwrap_or(0.0))
+                .collect();
+            let sums = gpu.group_sums(&vec![0u32; rows.len()], &values, 1)?;
+            let mut row = BTreeMap::new();
+            row.insert(fk, Cell::Float(sums[0]));
+            return Ok(Some(vec![row]));
+        };
         let bk = by.as_str();
-        let row_keys: Vec<String> = rows
-            .iter()
-            .map(|row| {
-                row.get(&bk)
-                    .map(Cell::compact)
-                    .unwrap_or_else(|| "null".into())
-            })
-            .collect();
-        let mut keys = row_keys.clone();
-        keys.sort();
-        keys.dedup();
+        let mut key_cells: BTreeMap<String, Cell> = BTreeMap::new();
+        let mut row_keys: Vec<String> = Vec::with_capacity(rows.len());
+        for row in rows {
+            let (key, cell) = group_cell_key_and_val(row.get(&bk));
+            key_cells.entry(key.clone()).or_insert(cell);
+            row_keys.push(key);
+        }
+        let keys: Vec<String> = key_cells.keys().cloned().collect();
         if keys.len() > u32::MAX as usize {
             return Err(Error::runtime("GPU sum has too many groups"));
         }
@@ -5864,8 +6197,9 @@ impl Db {
             keys.into_iter()
                 .zip(sums)
                 .map(|(key, sum)| {
+                    let cell = key_cells.remove(&key).unwrap_or(Cell::Null);
                     let mut row = BTreeMap::new();
-                    row.insert(bk.clone(), Cell::text_arc(unquote(&key)));
+                    row.insert(bk.clone(), cell);
                     row.insert(fk.clone(), Cell::Float(sum));
                     row
                 })

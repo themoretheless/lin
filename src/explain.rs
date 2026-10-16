@@ -32,6 +32,7 @@ pub struct CollectionSizes {
     pub orders: f64,
     pub facts: f64,
     pub catalog: f64,
+    pub custom: std::collections::BTreeMap<String, f64>,
 }
 
 impl CollectionSizes {
@@ -42,6 +43,28 @@ impl CollectionSizes {
             orders: 2.0,
             facts: 0.0,
             catalog: 9.0,
+            custom: std::collections::BTreeMap::new(),
+        }
+    }
+
+    pub fn from_store(store: &crate::store::Store, cat: &crate::catalog::Catalog) -> Self {
+        let mut custom = std::collections::BTreeMap::new();
+        for name in cat.collections.keys() {
+            if !matches!(name.as_str(), "docs" | "users" | "orders" | "facts") {
+                custom.insert(name.clone(), store.get_col_count(name) as f64);
+            }
+        }
+        Self {
+            docs: store.get_col_count("docs") as f64,
+            users: store.get_col_count("users") as f64,
+            orders: store.get_col_count("orders") as f64,
+            facts: store.get_col_count("facts") as f64,
+            catalog: (cat.collections.len()
+                + cat.rels.len()
+                + cat.fks.len()
+                + cat.guards.len()
+                + cat.indexes.len()) as f64,
+            custom,
         }
     }
 
@@ -52,7 +75,7 @@ impl CollectionSizes {
             "orders" => self.orders,
             "facts" => self.facts,
             "catalog" => self.catalog,
-            _ => 8.0,
+            _ => self.custom.get(name).copied().unwrap_or(8.0),
         }
     }
 }
@@ -171,6 +194,23 @@ fn head(node: &Node, kind: ExplainKind, ctx: &ExplainCtx) -> String {
         NodeKind::Agg { op, by } => format!("Agg {op} by {by}"),
         NodeKind::Sort { field, desc } => {
             format!("Sort {field} {}", if *desc { "desc" } else { "asc" })
+        }
+        NodeKind::Window {
+            func,
+            by,
+            order,
+            desc,
+            as_field,
+        } => {
+            let mut s = format!("Window {func}");
+            if let Some(by) = by {
+                s.push_str(&format!(" by {by}"));
+            }
+            if let Some(order) = order {
+                s.push_str(&format!(" sort {order} {}", if *desc { "desc" } else { "asc" }));
+            }
+            s.push_str(&format!(" as {as_field}"));
+            s
         }
         NodeKind::Skip { n } => format!("Skip {n}"),
         NodeKind::Take { n, implicit } => match n {
@@ -329,6 +369,7 @@ fn est_rows(node: &Node, sizes: &CollectionSizes) -> f64 {
         NodeKind::Filter { .. } => (child(0) * 0.35).max(0.0),
         NodeKind::Project { .. }
         | NodeKind::Sort { .. }
+        | NodeKind::Window { .. }
         | NodeKind::Skip { .. }
         | NodeKind::Cas { .. }
         | NodeKind::BatchCAS { .. } => child(0),
@@ -383,6 +424,7 @@ fn short_name(kind: &NodeKind) -> &'static str {
         NodeKind::Rrf { .. } => "RRF",
         NodeKind::Agg { .. } => "Agg",
         NodeKind::Sort { .. } => "Sort",
+        NodeKind::Window { .. } => "Window",
         NodeKind::Skip { .. } => "Skip",
         NodeKind::Take { .. } => "Take",
         NodeKind::Get { .. } => "Get",

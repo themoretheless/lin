@@ -9,7 +9,7 @@ use crate::store::Row;
 use crate::catalog::Catalog;
 
 /// Window function types for analytical queries
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum WindowFunction {
     Rank,           // RANK() OVER (ORDER BY ...)
     DenseRank,      // DENSE_RANK() OVER (ORDER BY ...)
@@ -36,6 +36,7 @@ impl std::fmt::Display for WindowFunction {
 
 /// Window partition specification
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct WindowSpec {
     /// PARTITION BY columns (grouping scope)
     pub partitions: Vec<String>,
@@ -48,6 +49,7 @@ pub struct WindowSpec {
 
 /// Frame bound specification
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum FrameBound {
     UnboundedPreceding,
     UnboundedFollowing,
@@ -58,6 +60,7 @@ pub enum FrameBound {
 
 /// Precomputed window state for maintaining running rank/order info
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct WindowState {
     /// Window function being computed
     pub func: WindowFunction,
@@ -69,6 +72,7 @@ pub struct WindowState {
     pub results_cache: FxHashMap<usize, f64>,
 }
 
+#[allow(dead_code)]
 impl WindowState {
     pub fn new(func: WindowFunction, spec: WindowSpec) -> Self {
         Self {
@@ -85,65 +89,75 @@ impl WindowState {
         let partition_key = if self.spec.partitions.is_empty() {
             String::from("")
         } else {
-            let keys: Vec<_> = self.spec.partitions.iter()
-                .filter_map(|field| row.get(field).and_then(|c| c.as_f64()))
-                .map(|v| format!("{}", v))
+            let keys: Vec<_> = self
+                .spec
+                .partitions
+                .iter()
+                .filter_map(|field| row.get(field).map(|c| c.compact()))
                 .collect();
             keys.join("|")
         };
 
         // Get or initialize partition data
-        let data = self.running_data.entry(partition_key.clone()).or_insert_with(Vec::new);
-        
+        let data = self
+            .running_data
+            .entry(partition_key)
+            .or_default();
+
         // Extract ordered value for ranking
-        let order_field = self.spec.order_by.first()
-            .map(|(f, _)| f.clone())
-            .unwrap_or_else(|| String::from("id"));
-        
-        let order_value = row.get(&order_field)
+        let (order_field, desc) = self
+            .spec
+            .order_by
+            .first()
+            .map(|(f, d)| (f.as_str(), *d))
+            .unwrap_or(("id", false));
+
+        let order_value = row
+            .get(order_field)
             .and_then(|c| c.as_f64())
             .unwrap_or(0.0);
 
         // Compute result based on window function type
         let result = match self.func {
-            WindowFunction::Rank | WindowFunction::DenseRank | WindowFunction::RowNumber => {
-                (data.len() + 1) as f64
+            WindowFunction::RowNumber => (data.len() + 1) as f64,
+            WindowFunction::Rank => {
+                let strictly_before = data
+                    .iter()
+                    .filter(|&&v| if desc { v > order_value } else { v < order_value })
+                    .count();
+                (strictly_before + 1) as f64
+            }
+            WindowFunction::DenseRank => {
+                let mut distinct_before: Vec<u64> = data
+                    .iter()
+                    .copied()
+                    .filter(|&v| if desc { v > order_value } else { v < order_value })
+                    .map(f64::to_bits)
+                    .collect();
+                distinct_before.sort_unstable();
+                distinct_before.dedup();
+                (distinct_before.len() + 1) as f64
             }
             WindowFunction::Lead { offset } => {
-                // LEAD looks ahead: return value from next rows
-                if data.len() > 0 {
-                    // Current row hasn't been added yet, so first inserted will get second's value
-                    let target_idx = data.len(); // Index where we WILL insert
-                    if target_idx < data.len() {
-                        *data.get(target_idx).unwrap_or(&0.0)
-                    } else {
-                        // No more rows, return default
-                        0.0
-                    }
-                } else {
-                    0.0
-                }
+                let target_idx = data.len().saturating_add(offset);
+                data.get(target_idx).copied().unwrap_or(0.0)
             }
             WindowFunction::Lag { offset } => {
-                // LAG looks back: return value from previous row
-                let lag_pos = data.len().saturating_sub(offset);
-                if lag_pos < data.len() && lag_pos > 0 {
-                    *data.get(lag_pos).unwrap_or(&0.0)
+                if offset == 0 {
+                    order_value
+                } else if data.len() >= offset {
+                    data[data.len() - offset]
                 } else {
                     0.0
                 }
             }
-            WindowFunction::FirstValue => {
-                *data.first().unwrap_or(&0.0)
-            }
-            WindowFunction::LastValue => {
-                *data.last().unwrap_or(&0.0)
-            }
+            WindowFunction::FirstValue => data.first().copied().unwrap_or(order_value),
+            WindowFunction::LastValue => order_value,
         };
 
         // Store in cache
         self.results_cache.insert(row_idx, result);
-        
+
         // Add current value to running data
         data.push(order_value);
 
@@ -151,13 +165,14 @@ impl WindowState {
     }
 }
 
-/// Thread-local storage for window states
+// Thread-local storage for window states
 thread_local! {
-    static WINDOW_STATE_CACHE: Mutex<FxHashMap<String, WindowState>> = 
+    static WINDOW_STATE_CACHE: Mutex<FxHashMap<String, WindowState>> =
         Mutex::new(FxHashMap::default());
 }
 
 /// Initialize or retrieve window state for a query plan
+#[allow(dead_code)]
 pub fn get_window_state(
     _collection: &str,
     func: WindowFunction,
@@ -166,10 +181,10 @@ pub fn get_window_state(
 ) -> WindowState {
     WINDOW_STATE_CACHE.with(|cache| {
         let mut guard = cache.lock().unwrap();
-        
+
         // Use simple key based on function type and generation
         let key = format!("{:?}_{}", func, r#gen);
-        
+
         if let Some(state) = guard.get_mut(&key) {
             state.clone()
         } else {
@@ -181,11 +196,16 @@ pub fn get_window_state(
 }
 
 /// Invalidate window states after store mutation
+#[allow(dead_code)]
 pub fn invalidate_windows(r#gen: u64) {
     WINDOW_STATE_CACHE.with(|cache| {
         let mut guard = cache.lock().unwrap();
         // Remove entries older than current generation
-        guard.retain(|_, state| state.spec.order_by.is_empty() || true);
+        guard.retain(|key, _| {
+            key.rsplit_once('_')
+                .and_then(|(_, g)| g.parse::<u64>().ok())
+                .is_some_and(|g| g >= r#gen)
+        });
     });
 }
 
@@ -193,19 +213,14 @@ pub fn invalidate_windows(r#gen: u64) {
 pub fn update_window_states(_collection: &str, idx: usize, row: &Row) {
     WINDOW_STATE_CACHE.with(|cache| {
         let mut guard = cache.lock().unwrap();
-        
+
         // Iterate over all cached window states and update if applicable
         for (_, state) in guard.iter_mut() {
-            // Check if this state might be for our collection by checking order fields
-            if !state.spec.order_by.is_empty() {
-                // Try to extract ordering value from row
-                if let Some((field_name, _)) = state.spec.order_by.first() {
-                    if let Some(order_value) = row.get(field_name).and_then(|c| c.as_f64()) {
-                        // For simplicity, just cache the value
-                        // In production this would compute actual window function result
-                        state.results_cache.insert(idx, order_value);
-                    }
-                }
+            if !state.spec.order_by.is_empty()
+                && let Some((field_name, _)) = state.spec.order_by.first()
+                && let Some(order_value) = row.get(field_name).and_then(|c| c.as_f64())
+            {
+                state.results_cache.insert(idx, order_value);
             }
         }
     });

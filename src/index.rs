@@ -2,8 +2,12 @@ use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::sync::Arc;
 
-use rustc_hash::{FxHashMap, FxHasher};
-use std::hash::{Hash, Hasher};
+use rustc_hash::FxHashMap;
+#[cfg(feature = "parallel")]
+use rustc_hash::FxHasher;
+use std::hash::Hash;
+#[cfg(feature = "parallel")]
+use std::hash::Hasher;
 
 use crate::ast::{CmpOp, Pred, Value};
 use crate::catalog::{Catalog, IndexDef};
@@ -12,20 +16,21 @@ use crate::store::{Cell, Row};
 /// Bloom filter for fast negative lookups during index seeks
 /// Reduces false positives with minimal memory overhead
 #[cfg(feature = "parallel")]
+#[derive(Debug, Clone)]
 struct BloomFilter {
     /// Bit array
     bits: Vec<u64>,
     num_hashes: usize,
+    #[allow(dead_code)]
     capacity: usize,
 }
 
 #[cfg(feature = "parallel")]
 impl BloomFilter {
     fn new(capacity: usize) -> Self {
-        // Calculate bit array size (16MB max for reasonable memory footprint)
         let num_bits = 8 * 1024 * 1024; // 1M bits = 128KB
-        let num_hashes = 7; // Optimal number of hash functions for low false positive rate
-        
+        let num_hashes = 7;
+
         Self {
             bits: vec![0u64; num_bits / 64],
             num_hashes,
@@ -33,74 +38,68 @@ impl BloomFilter {
         }
     }
 
-    fn hash(&self, item: impl Hash) -> u64 {
+    fn hash<T: Hash + ?Sized>(&self, item: &T) -> u64 {
         let mut hasher = FxHasher::default();
         item.hash(&mut hasher);
         hasher.finish()
     }
 
-    fn add(&mut self, item: impl Hash) {
+    fn add<T: Hash + ?Sized>(&mut self, item: &T) {
         if self.bits.is_empty() {
             return;
         }
-        
+
         let base_hash = self.hash(item);
-        let delta = base_hash.wrapping_mul(0x9e3779b97f4a7c15); // Golden ratio
-        
+        let delta = base_hash.wrapping_mul(0x9e3779b97f4a7c15).rotate_left(17) | 1;
+
         for i in 0..self.num_hashes {
-            let h = if i == 0 {
-                base_hash
-            } else {
-                delta ^= base_hash
-            };
-            
+            let h = base_hash.wrapping_add((i as u64).wrapping_mul(delta));
             let bit_pos = (h as usize) % (self.bits.len() * 64);
             let mask = 1u64 << (bit_pos % 64);
             self.bits[bit_pos / 64] |= mask;
         }
     }
 
-    fn contains(&self, item: impl Hash) -> bool {
+    fn contains<T: Hash + ?Sized>(&self, item: &T) -> bool {
         if self.bits.is_empty() {
-            return true; // Assume present when empty
+            return true;
         }
-        
+
         let base_hash = self.hash(item);
-        let delta = base_hash.wrapping_mul(0x9e3779b97f4a7c15);
-        
+        let delta = base_hash.wrapping_mul(0x9e3779b97f4a7c15).rotate_left(17) | 1;
+
         for i in 0..self.num_hashes {
-            let h = if i == 0 {
-                base_hash
-            } else {
-                delta ^= base_hash
-            };
-            
+            let h = base_hash.wrapping_add((i as u64).wrapping_mul(delta));
             let bit_pos = (h as usize) % (self.bits.len() * 64);
             let mask = 1u64 << (bit_pos % 64);
-            
+
             if self.bits[bit_pos / 64] & mask == 0 {
-                return false; // Definitely not present
+                return false;
             }
         }
-        true // Probably present
+        true
     }
 }
 
 /// Composite bloom filter for multi-key index checks
 #[cfg(feature = "parallel")]
+#[allow(dead_code)]
 pub struct MultiBloomFilter {
     filters: Vec<BloomFilter>,
 }
 
 #[cfg(feature = "parallel")]
+#[allow(dead_code)]
 impl MultiBloomFilter {
-    fn new(num_filters: usize, capacity: usize) -> Self {
+    pub fn new(num_filters: usize, capacity: usize) -> Self {
         Self {
-            filters: (0..num_filters).map(|_| BloomFilter::new(capacity)).collect(),
+            filters: (0..num_filters)
+                .map(|_| BloomFilter::new(capacity))
+                .collect(),
         }
     }
 
-    fn add_keys(&mut self, keys: &[IndexKey]) {
+    pub fn add_keys(&mut self, keys: &[IndexKey]) {
         for key in keys {
             for filter in &mut self.filters {
                 filter.add(key);
@@ -108,13 +107,12 @@ impl MultiBloomFilter {
         }
     }
 
-    fn check_all(&self, target: &IndexKey) -> bool {
+    pub fn check_all(&self, target: &IndexKey) -> bool {
         self.filters.iter().all(|f| f.contains(target))
     }
 }
 
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum IndexPart {
     Min,
     Null,
@@ -128,7 +126,7 @@ pub enum IndexPart {
     Max,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct IndexKey(pub smallvec::SmallVec<[IndexPart; 2]>);
 
 /// Live secondary index: BTree over composite keys → row indices in the collection vec.
@@ -243,41 +241,49 @@ impl PostingList {
 
     pub fn and_assign(&mut self, other: PostingList) {
         // Both bitmaps: do bitwise AND
-        if let PostingList::Bitmap(self_set) = self {
-            if let PostingList::Bitmap(other_set) = &other {
-                let mut new_set = (*self_set).clone();
-                new_set.and_assign(other_set);
-                *self = PostingList::Bitmap(new_set);
-                return;
+        if let PostingList::Bitmap(self_set) = self
+            && let PostingList::Bitmap(other_set) = &other
+        {
+            self_set.and_assign(other_set);
+            return;
+        }
+
+        // Standard O(N log N + N + M) sorted intersection
+        let mut a = self.to_indices();
+        let mut b = other.to_indices();
+        a.sort_unstable();
+        a.dedup();
+        b.sort_unstable();
+        b.dedup();
+        let mut result = Vec::with_capacity(a.len().min(b.len()));
+        let (mut i, mut j) = (0, 0);
+        while i < a.len() && j < b.len() {
+            match a[i].cmp(&b[j]) {
+                std::cmp::Ordering::Less => i += 1,
+                std::cmp::Ordering::Greater => j += 1,
+                std::cmp::Ordering::Equal => {
+                    result.push(a[i]);
+                    i += 1;
+                    j += 1;
+                }
             }
         }
-        
-        // Otherwise: standard intersection
-        let self_indices = self.to_indices();
-        let other_indices = other.to_indices();
-        let result = self_indices.into_iter().filter(|i| other_indices.contains(i)).collect();
         *self = PostingList::Standard(result);
     }
 
     pub fn or_assign(&mut self, other: PostingList) {
         // Both bitmaps: do bitwise OR
-        if let PostingList::Bitmap(self_set) = self {
-            if let PostingList::Bitmap(other_set) = &other {
-                let mut new_set = (*self_set).clone();
-                new_set.or_assign(other_set);
-                *self = PostingList::Bitmap(new_set);
-                return;
-            }
+        if let PostingList::Bitmap(self_set) = self
+            && let PostingList::Bitmap(other_set) = &other
+        {
+            self_set.or_assign(other_set);
+            return;
         }
-        
-        // Otherwise: standard union
+
+        // Standard O((N + M) log(N + M)) union
         let mut self_indices = self.to_indices();
         let other_indices = other.to_indices();
-        for i in other_indices {
-            if !self_indices.contains(&i) {
-                self_indices.push(i);
-            }
-        }
+        self_indices.extend(other_indices);
         self_indices.sort_unstable();
         self_indices.dedup();
         *self = PostingList::Standard(self_indices);
@@ -302,9 +308,9 @@ impl LiveIndex {
         if num_keys == 0 {
             return;
         }
-        
+
         self.bloom_filter = Some(BloomFilter::new(num_keys));
-        
+
         // Add all keys to bloom filter for fast negative lookups
         for key in self.forward.keys() {
             self.bloom_filter.as_mut().unwrap().add(key);
@@ -313,12 +319,12 @@ impl LiveIndex {
 
     /// Check if target key might exist using bloom filter (fast path before BTree lookup)
     #[inline]
-    pub fn maybe_exists_fast(&self, key: &IndexKey) -> bool {
+    pub fn maybe_exists_fast(&self, _key: &IndexKey) -> bool {
         #[cfg(feature = "parallel")]
         if let Some(ref filter) = self.bloom_filter {
-            return filter.contains(key);
+            return filter.contains(_key);
         }
-        
+
         // Fallback: always assume present when no filter or feature not enabled
         true
     }
@@ -335,12 +341,12 @@ impl LiveIndex {
 
     pub fn insert_at(&mut self, idx: usize, row: &Row) -> Result<(), String> {
         // Partial index check: only insert if pred matches (or no pred)
-        if let Some(ref pred) = self.def.pred {
-            if !crate::exec::eval_pred(pred, row, 0) {
-                return Ok(()); // Skip indexing for non-matching rows
-            }
+        if let Some(ref pred) = self.def.pred
+            && !crate::exec::eval_pred(pred, row, crate::store::now_ms())
+        {
+            return Ok(()); // Skip indexing for non-matching rows
         }
-        
+
         let key = self.key_of(row);
         self.insert_key(idx, key)
     }
@@ -348,27 +354,25 @@ impl LiveIndex {
     /// Append-only bulk path: no reverse-key replace (fresh indices).
     pub fn insert_at_new(&mut self, idx: usize, row: &Row) -> Result<(), String> {
         // Partial index check: only insert if pred matches (or no pred)
-        if let Some(ref pred) = self.def.pred {
-            if !crate::exec::eval_pred(pred, row, 0) {
-                return Ok(()); // Skip indexing for non-matching rows
-            }
+        if let Some(ref pred) = self.def.pred
+            && !crate::exec::eval_pred(pred, row, crate::store::now_ms())
+        {
+            return Ok(()); // Skip indexing for non-matching rows
         }
-        
+
         let key = self.key_of(row);
         if self.def.unique && self.forward.contains_key(&key) {
             return Err(format!("unique index {}: duplicate key", self.def.label()));
         }
         use std::collections::btree_map::Entry;
-        
+
         // Check if this is a bitmap index (for boolean fields)
-        let is_bitmap = self.def.bitmap_card_field.as_ref().map_or(false, |field| {
-            if let Some(cell) = row.get(field) {
-                matches!(cell, Cell::Bool(_))
-            } else {
-                false
-            }
-        });
-        
+        let is_bitmap = self
+            .def
+            .bitmap_card_field
+            .as_ref()
+            .is_some_and(|field| matches!(row.get(field), Some(Cell::Bool(_))));
+
         match self.forward.entry(key) {
             Entry::Vacant(v) => {
                 self.reverse.insert(idx, v.key().clone());
@@ -386,46 +390,42 @@ impl LiveIndex {
 
     /// Batch-only insert for slab operations: compute all keys first, then bulk insert
     /// to reduce per-row HashMap overhead and key cloning.
-    pub fn insert_slab_batch(
-        &mut self,
-        start: usize,
-        rows: &[Row],
-    ) -> Result<(), String> {
+    pub fn insert_slab_batch(&mut self, start: usize, rows: &[Row]) -> Result<(), String> {
+        let now = crate::store::now_ms();
         // Partial index check: only insert matching rows
-        let keyed_rows: Vec<(usize, Row)> = rows
+        let keyed_rows: Vec<(usize, &Row)> = rows
             .iter()
             .enumerate()
             .filter(|(_, row)| {
-                self.def.pred.as_ref().map_or(true, |pred| {
-                    crate::exec::eval_pred(pred, row, 0)
-                })
+                self.def
+                    .pred
+                    .as_ref()
+                    .is_none_or(|pred| crate::exec::eval_pred(pred, row, now))
             })
-            .map(|(i, row)| (start + i, (*row).clone()))
+            .map(|(i, row)| (start + i, row))
             .collect();
-        
+
         if keyed_rows.is_empty() {
             return Ok(());
         }
-        
+
         // Pre-compute all keys in a single pass
         let keys: Vec<_> = keyed_rows.iter().map(|(_, r)| self.key_of(r)).collect();
-        
+
         // Bulk insert using pre-computed keys
         for ((orig_idx, row), key) in keyed_rows.iter().zip(keys.into_iter()) {
             if self.def.unique && self.forward.contains_key(&key) {
                 return Err(format!("unique index {}: duplicate key", self.def.label()));
             }
             use std::collections::btree_map::Entry;
-            
+
             // Check if this is a bitmap index (for boolean fields)
-            let is_bitmap = self.def.bitmap_card_field.as_ref().map_or(false, |field| {
-                if let Some(cell) = row.get(field) {
-                    matches!(cell, Cell::Bool(_))
-                } else {
-                    false
-                }
-            });
-            
+            let is_bitmap = self
+                .def
+                .bitmap_card_field
+                .as_ref()
+                .is_some_and(|field| matches!(row.get(field), Some(Cell::Bool(_))));
+
             match self.forward.entry(key) {
                 Entry::Vacant(v) => {
                     self.reverse.insert(*orig_idx, v.key().clone());
@@ -452,16 +452,15 @@ impl LiveIndex {
         if self.reverse.get(&idx) == Some(&key) {
             return Ok(());
         }
-        
+
         // Check if this is a bitmap index (low cardinality column)
-        let is_bitmap = self.def.bitmap_card_field.as_ref().map_or(false, |field| {
-            if let Some(cell) = self.reverse.get(&idx).and_then(|k| k.0.first()) {
-                matches!(cell, IndexPart::Bool(_))
-            } else {
-                false
-            }
+        let is_bitmap = self.def.bitmap_card_field.as_ref().is_some_and(|_field| {
+            self.reverse
+                .get(&idx)
+                .and_then(|k| k.0.first())
+                .is_some_and(|cell| matches!(cell, IndexPart::Bool(_)))
         });
-        
+
         if let Some(old) = self.reverse.insert(idx, key.clone())
             && let Some(vec) = self.forward.get_mut(&old)
         {
@@ -470,12 +469,12 @@ impl LiveIndex {
                 self.forward.remove(&old);
             }
         }
-        
+
         // Use BitSet for boolean fields (≤2 distinct values)
         match self.forward.entry(key) {
             std::collections::btree_map::Entry::Vacant(v) => {
                 self.reverse.insert(idx, v.key().clone());
-                let mut posting = PostingList::new(is_bitmap, 1 << 16); // Support up to 65K rows
+                let mut posting = PostingList::new(is_bitmap, 1 << 16);
                 posting.insert(idx);
                 v.insert(posting);
             }
@@ -564,13 +563,13 @@ impl LiveIndex {
 
     /// Count with early termination - returns None if exceeds threshold
     pub fn seek_count_with_early_termination(
-        &self, 
-        use_: &IndexUse, 
+        &self,
+        use_: &IndexUse,
         now: i64,
         threshold: usize,
     ) -> Option<usize> {
         let (start, end) = self.bounds(use_, now);
-        
+
         let mut count = 0;
         for (_, list) in self.forward.range((start, end)) {
             count += list.count();
@@ -584,21 +583,17 @@ impl LiveIndex {
     /// Seek row indices by range bounds: extend output vector from BTreeMap iteration
     pub fn seek_idxs(&self, use_: &IndexUse, now: i64) -> Vec<usize> {
         let (start, end) = self.bounds(use_, now);
-        
-        // Use bloom filter for fast early termination if available
+
+        // Use bloom filter for fast early termination on exact equality seeks
         #[cfg(feature = "parallel")]
+        if let (Bound::Included(lo), Bound::Included(hi)) = (&start, &end)
+            && lo == hi
+            && let Some(ref filter) = self.bloom_filter
+            && !filter.contains(lo)
         {
-            if let Some(ref filter) = self.bloom_filter {
-                // Quick check: if target key not in bloom filter, skip this range
-                // Note: This is a heuristic - we still need full BTree scan for correctness
-                // The bloom filter helps identify when index has no matches at all
-                let potential_key = start.clone();
-                if !filter.contains(&potential_key) {
-                    return Vec::new();
-                }
-            }
+            return Vec::new();
         }
-        
+
         let mut out = Vec::new();
         for (_, list) in self.forward.range((start, end)) {
             out.extend_from_slice(&list.to_indices());
@@ -612,10 +607,10 @@ impl LiveIndex {
         if uses.is_empty() {
             return Vec::new();
         }
-        
+
         // Each index seek runs independently, so we can parallelize
         use rayon::prelude::*;
-        
+
         uses.par_iter()
             .map(|use_| {
                 let (start, end) = self.bounds(use_, now);
@@ -695,7 +690,7 @@ pub struct BitSet {
 
 impl BitSet {
     pub fn new(capacity: usize) -> Self {
-        let num_words = (capacity + 63) / 64;
+        let num_words = capacity.div_ceil(64);
         Self {
             bits: vec![0u64; num_words],
             capacity,
@@ -704,30 +699,34 @@ impl BitSet {
 
     #[inline]
     pub fn insert(&mut self, pos: usize) {
-        if pos >= self.capacity {
-            return;
-        }
         let word_idx = pos >> 6; // pos / 64
-        let bit_idx = pos & 63;   // pos % 64
+        let bit_idx = pos & 63; // pos % 64
+        if word_idx >= self.bits.len() {
+            let new_words = (word_idx + 1).next_power_of_two();
+            self.bits.resize(new_words, 0);
+            self.capacity = new_words * 64;
+        } else if pos >= self.capacity {
+            self.capacity = self.bits.len() * 64;
+        }
         self.bits[word_idx] |= 1u64 << bit_idx;
     }
 
     #[inline]
     pub fn remove(&mut self, pos: usize) {
-        if pos >= self.capacity {
+        let word_idx = pos >> 6;
+        if word_idx >= self.bits.len() {
             return;
         }
-        let word_idx = pos >> 6;
         let bit_idx = pos & 63;
         self.bits[word_idx] &= !(1u64 << bit_idx);
     }
 
     #[inline]
     pub fn contains(&self, pos: usize) -> bool {
-        if pos >= self.capacity {
+        let word_idx = pos >> 6;
+        if word_idx >= self.bits.len() {
             return false;
         }
-        let word_idx = pos >> 6;
         let bit_idx = pos & 63;
         (self.bits[word_idx] & (1u64 << bit_idx)) != 0
     }
@@ -745,13 +744,14 @@ impl BitSet {
                 continue;
             }
             let base_pos = word_idx << 6;
-            for bit_idx in 0..64 {
-                if (word & (1u64 << bit_idx)) != 0 {
-                    let pos = base_pos + bit_idx as usize;
-                    if pos < self.capacity {
-                        out.push(pos);
-                    }
+            let mut w = word;
+            while w != 0 {
+                let bit_idx = w.trailing_zeros() as usize;
+                let pos = base_pos + bit_idx;
+                if pos < self.capacity {
+                    out.push(pos);
                 }
+                w &= w - 1;
             }
         }
         out
@@ -762,10 +762,21 @@ impl BitSet {
         for (a, b) in self.bits.iter_mut().zip(other.bits.iter()) {
             *a &= b;
         }
+        if self.bits.len() > other.bits.len() {
+            for a in &mut self.bits[other.bits.len()..] {
+                *a = 0;
+            }
+        }
     }
 
     /// Bitwise OR (union) - modifies self
     pub fn or_assign(&mut self, other: &BitSet) {
+        if other.bits.len() > self.bits.len() {
+            self.bits.resize(other.bits.len(), 0);
+        }
+        if other.capacity > self.capacity {
+            self.capacity = other.capacity;
+        }
         for (a, b) in self.bits.iter_mut().zip(other.bits.iter()) {
             *a |= b;
         }
@@ -797,6 +808,12 @@ fn pick_conjunct(cat: &Catalog, collection: &str, pred: &Pred) -> Option<IndexUs
     let mut best: Option<IndexUse> = None;
     let mut best_n = 0usize;
     for def in cat.indexes_on(collection) {
+        if let Some(ref index_pred) = def.pred {
+            let req = flatten_and(index_pred);
+            if !req.iter().all(|r| atoms.contains(r)) {
+                continue;
+            }
+        }
         let mut eqs = Vec::new();
         let mut range = None;
         let mut n = 0usize;
@@ -845,7 +862,16 @@ pub fn index_covers_pred(pred: &Pred, uses: &[IndexUse]) -> bool {
 }
 
 fn index_covers_conjunct(pred: &Pred, use_: &IndexUse) -> bool {
+    let pred_atoms = use_
+        .def
+        .pred
+        .as_ref()
+        .map(flatten_and)
+        .unwrap_or_default();
     for atom in flatten_and(pred) {
+        if pred_atoms.contains(&atom) {
+            continue;
+        }
         match atom {
             Pred::Cmp {
                 field,
@@ -894,8 +920,14 @@ fn dnf(pred: &Pred) -> Option<Vec<Pred>> {
         if nodes > 1024 {
             return None;
         }
-        if let Pred::And(a, b) | Pred::Or(a, b) = p {
-            pending.extend([a.as_ref(), b.as_ref()]);
+        match p {
+            Pred::And(a, b) | Pred::Or(a, b) => {
+                pending.extend([a.as_ref(), b.as_ref()]);
+            }
+            Pred::Not(inner) => {
+                pending.push(inner.as_ref());
+            }
+            _ => {}
         }
     }
     dnf_bounded(pred)
@@ -904,6 +936,21 @@ fn dnf(pred: &Pred) -> Option<Vec<Pred>> {
 fn dnf_bounded(pred: &Pred) -> Option<Vec<Pred>> {
     const MAX_BRANCHES: usize = 256;
     match pred {
+        Pred::In { field, values } => {
+            if values.is_empty() || values.len() > MAX_BRANCHES {
+                return None;
+            }
+            Some(
+                values
+                    .iter()
+                    .map(|v| Pred::Cmp {
+                        field: field.clone(),
+                        op: CmpOp::Eq,
+                        value: v.clone(),
+                    })
+                    .collect(),
+            )
+        }
         Pred::Or(a, b) => {
             let mut out = dnf_bounded(a)?;
             let right = dnf_bounded(b)?;

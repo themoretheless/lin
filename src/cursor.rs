@@ -16,8 +16,8 @@ use std::sync::Arc;
 use crate::ast::{Pred, Query, SearchMode, Source, Step, Stmt};
 use crate::error::Error;
 use crate::exec::{
-    Db, JoinFieldPlan, ReadDb, build_right_probe_owned, emit_join_row, eval_pred, field_names,
-    plan_join_fields, pred_total_gt, project_join_fields,
+    Db, JoinFieldPlan, ReadDb, emit_join_row, eval_pred, field_names, plan_join_fields,
+    pred_total_gt, project_join_fields,
 };
 use crate::query::Queryable;
 use crate::store::{Cell, Row, Store, now_ms, project_fields, row_text};
@@ -598,8 +598,9 @@ fn build_left_source(
 ) -> (RowSource, bool) {
     if let Some(pred) = filter {
         if let Some(uses) = crate::index::pick_index(catalog, name, pred) {
-            if let Some(idxs) = store.index_seek(name, &uses[..1], now) {
-                return (RowSource::Idxs(idxs), false);
+            if let Some(idxs) = store.index_seek(name, &uses, now) {
+                let covered = crate::index::index_covers_pred(pred, &uses);
+                return (RowSource::Idxs(idxs), !covered);
             }
         }
         return (
@@ -876,17 +877,11 @@ fn try_lazy_hop(db: &CursorDb<'_>, q: &Query) -> Result<Option<LazyCursor>, Erro
     } else {
         let mut seen = frontier.clone();
         let mut reached = BTreeSet::new();
-        for edge in &store.edges {
-            if edge.rel != edge_rel {
-                continue;
-            }
-            let (src, dst) = if reverse {
-                (edge.to.as_str(), edge.from.as_str())
-            } else {
-                (edge.from.as_str(), edge.to.as_str())
-            };
-            if frontier.contains(src) && seen.insert(dst.to_owned()) {
-                reached.insert(dst.to_owned());
+        for src in &frontier {
+            for dst in store.edge_neighbors(edge_rel, src, reverse) {
+                if seen.insert(dst.to_string()) {
+                    reached.insert(dst.to_string());
+                }
             }
         }
         reached
@@ -1344,21 +1339,23 @@ fn try_lazy_join(db: &CursorDb<'_>, q: &Query) -> Result<Option<LazyJoinCursor>,
     };
     let (source, need_filter) = build_left_source(store, catalog, name, filter, now);
 
+    // When `to_field == "id"`, `next_lazy_join` already uses `store.get_by_id(&join.right_col, k)`
+    // in O(1) via `row_by_id`, so we avoid building an O(R) `FxHashMap` on every `cursor()` call!
     let (right_probe, join_plan, left_fields) = if to_field == "id" {
         if let Some(ref fields) = project {
-            let (right_fields, plan) = plan_join_fields(&right_col, fields);
-            let probe = build_right_probe_owned(store.collection(&right_col), &right_fields);
-            let left_fields = plan
+            let (_right_fields, plan) = plan_join_fields(&right_col, fields);
+            let mut left_fields: Vec<String> = plan
                 .iter()
                 .filter_map(|p| match p {
                     JoinFieldPlan::Left(name) => Some(name.clone()),
                     JoinFieldPlan::Right { .. } => None,
                 })
                 .collect();
-            (Some(probe), Some(plan), Some(left_fields))
+            if !left_fields.iter().any(|f| f == &on) {
+                left_fields.push(on.clone());
+            }
+            (None, None, Some(left_fields))
         } else {
-            // Full-row probe by id index into collection — build id→row clone map would be heavy;
-            // keep point-get via get_by_id in next (no owned full-row hash).
             (None, None, None)
         }
     } else {

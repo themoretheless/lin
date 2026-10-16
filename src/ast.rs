@@ -148,11 +148,32 @@ pub enum Step {
     },
     Sum {
         field: Field,
-        by: Field,
+        by: Option<Field>,
+    },
+    Min {
+        field: Field,
+        by: Option<Field>,
+    },
+    Max {
+        field: Field,
+        by: Option<Field>,
+    },
+    Avg {
+        field: Field,
+        by: Option<Field>,
     },
     Sort {
         field: Field,
         desc: bool,
+    },
+    /// Window analytical function (rank, dense_rank, row_number, lead, lag, first_value, last_value).
+    Window {
+        func: crate::window::WindowFunction,
+        field: Option<Field>,
+        by: Option<Field>,
+        order: Option<Field>,
+        desc: bool,
+        as_field: String,
     },
     /// Drop the first `n` rows (alias `offset` in the surface language).
     Skip {
@@ -185,10 +206,19 @@ pub enum ExplainKind {
 pub enum Pred {
     And(Box<Pred>, Box<Pred>),
     Or(Box<Pred>, Box<Pred>),
+    Not(Box<Pred>),
     Cmp {
         field: Field,
         op: CmpOp,
         value: Value,
+    },
+    IsNull {
+        field: Field,
+        negated: bool,
+    },
+    In {
+        field: Field,
+        values: Vec<Value>,
     },
     Has {
         field: Field,
@@ -215,17 +245,31 @@ impl Pred {
         Pred::Or(Box::new(self), Box::new(other))
     }
 
+    pub fn not(self) -> Pred {
+        Pred::Not(Box::new(self))
+    }
+
     pub fn walk_fields<'a>(&'a self, out: &mut Vec<&'a Field>) {
         match self {
             Pred::And(a, b) | Pred::Or(a, b) => {
                 a.walk_fields(out);
                 b.walk_fields(out);
             }
+            Pred::Not(inner) => inner.walk_fields(out),
             Pred::Cmp { field, .. }
+            | Pred::IsNull { field, .. }
+            | Pred::In { field, .. }
             | Pred::Has { field, .. }
             | Pred::Contains { field, .. }
             | Pred::Regex { field, .. } => out.push(field),
         }
+    }
+}
+
+impl std::ops::Not for Pred {
+    type Output = Pred;
+    fn not(self) -> Pred {
+        Pred::Not(Box::new(self))
     }
 }
 

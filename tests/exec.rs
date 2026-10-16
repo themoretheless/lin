@@ -1732,3 +1732,251 @@ fn hybrid_bounded_results_match_full_ranking() {
         assert_eq!(default, all.iter().take(50).cloned().collect::<Vec<_>>());
     }
 }
+
+#[test]
+fn new_aggregations_sum_min_max_avg_and_group_type_preservation() {
+    let mut db = lin::Db::empty();
+    db.run(
+        r#"col items { grp: i64, val: f64, label: text }
+        insert items [
+            { grp: 10, val: 10.0, label: "b" },
+            { grp: 10, val: 30.0, label: "a" },
+            { grp: 20, val: 50.0, label: "c" }
+        ]"#,
+    )
+    .unwrap();
+
+    // Ungrouped sum, min, max, avg
+    assert_eq!(
+        db.run("items | sum val").unwrap().scalar_as::<f64>().unwrap(),
+        90.0
+    );
+    assert_eq!(
+        db.run("items | min val").unwrap().scalar_as::<f64>().unwrap(),
+        10.0
+    );
+    assert_eq!(
+        db.run("items | max val").unwrap().scalar_as::<f64>().unwrap(),
+        50.0
+    );
+    assert_eq!(
+        db.run("items | avg val").unwrap().scalar_as::<f64>().unwrap(),
+        30.0
+    );
+    assert_eq!(
+        db.run("items | min label").unwrap().scalar_as::<String>().unwrap(),
+        "a"
+    );
+    assert_eq!(
+        db.run("items | max label").unwrap().scalar_as::<String>().unwrap(),
+        "c"
+    );
+
+    // Grouped aggregations preserve group key type (Int, not Text) and allow numeric post-filter
+    let grouped_avg = db
+        .run("items | avg val by grp | grp > 15 | take all")
+        .unwrap()
+        .rows;
+    assert_eq!(grouped_avg.len(), 1);
+    assert_eq!(grouped_avg[0].get("grp"), Some(&lin::Cell::Int(20)));
+    assert_eq!(grouped_avg[0].get("val"), Some(&lin::Cell::Float(50.0)));
+
+    let grouped_min = db
+        .run("items | min val by grp | sort grp | take all")
+        .unwrap()
+        .rows;
+    assert_eq!(grouped_min.len(), 2);
+    assert_eq!(grouped_min[0].get("grp"), Some(&lin::Cell::Int(10)));
+    assert_eq!(grouped_min[0].get("val"), Some(&lin::Cell::Float(10.0)));
+
+    let grouped_max = db
+        .run("items | max val by grp | sort grp | take all")
+        .unwrap()
+        .rows;
+    assert_eq!(grouped_max.len(), 2);
+    assert_eq!(grouped_max[0].get("val"), Some(&lin::Cell::Float(30.0)));
+}
+
+#[test]
+fn new_predicates_not_is_null_in_list_and_has_ci() {
+    let mut db = lin::Db::empty();
+    db.run(
+        r#"col tasks { title: text, tag: text, prio: i64 }
+        index tasks [tag]
+        insert tasks [
+            { id: "t1", title: "Fix WAL Bug", tag: "storage", prio: 1 },
+            { id: "t2", title: "Add GPU Sort", tag: "compute", prio: 2 },
+            { id: "t3", title: "Write Docs", prio: 3 }
+        ]"#,
+    )
+    .unwrap();
+
+    // `in [...]` using index
+    let in_h = db
+        .run(r#"tasks | tag in ["storage", "compute"] | sort prio | { id } | take all"#)
+        .unwrap();
+    assert_eq!(ids(&in_h), vec!["t1", "t2"]);
+
+    // `is null` and `is not null`
+    let null_h = db
+        .run("tasks | tag is null | { id } | take all")
+        .unwrap();
+    assert_eq!(ids(&null_h), vec!["t3"]);
+
+    let not_null_h = db
+        .run("tasks | tag is not null | sort prio | { id } | take all")
+        .unwrap();
+    assert_eq!(ids(&not_null_h), vec!["t1", "t2"]);
+
+    // `not (...)`
+    let not_h = db
+        .run(r#"tasks | not (prio == 2) | sort prio | { id } | take all"#)
+        .unwrap();
+    assert_eq!(ids(&not_h), vec!["t1", "t3"]);
+
+    // `has_ci`
+    let ci_h = db
+        .run(r#"tasks | title has_ci "wal" | { id } | take all"#)
+        .unwrap();
+    assert_eq!(ids(&ci_h), vec!["t1"]);
+}
+
+#[test]
+fn facts_rollback_and_delete_col_count_and_guard_enforcement() {
+    let mut db = lin::Db::empty();
+    // Atomic rollback of facts when a subsequent statement in a batch fails
+    assert!(
+        db.run(
+            r#"append facts { s: "alice", p: "knows", o: "bob" }
+            update docs[id == "nonexistent"] cas "" { title: "boom" }"#
+        )
+        .is_err()
+    );
+    assert_eq!(
+        db.run("facts | count").unwrap().scalar_as::<i64>().unwrap(),
+        0
+    );
+
+    // Delete count accuracy (no double decrement)
+    db.run(
+        r#"insert docs [
+            { id: "c1", uri: "c://1", title: "A", layer: "wiki" },
+            { id: "c2", uri: "c://2", title: "B", layer: "wiki" },
+            { id: "c3", uri: "c://3", title: "C", layer: "wiki" }
+        ]"#,
+    )
+    .unwrap();
+    assert_eq!(db.store.get_col_count("docs"), 3);
+    db.run(r#"delete docs[id == "c2"] cas """#).unwrap();
+    assert_eq!(db.store.get_col_count("docs"), 2);
+
+    // Guard enforcement on `docs.body` (`layer == "raw"`):
+    // 1. Updating `body` without specifying `layer` or with `layer: "raw"` fails static check
+    assert!(
+        db.run(r#"update docs[id == "c1"] cas "" { body: "forbidden" }"#)
+            .is_err()
+    );
+    assert!(
+        db.run(r#"update docs[id == "c1"] cas "" { body: "forbidden", layer: "raw" }"#)
+            .is_err()
+    );
+    // 2. Updating `body` on a wiki row while explicitly specifying `layer: "wiki"` succeeds
+    db.run(r#"update docs[id == "c1"] cas "" { body: "updated wiki body", layer: "wiki" }"#)
+        .unwrap();
+    // 3. Runtime guard check: if the existing row has `layer == "raw"`, updating `body` fails even if update sets `layer: "wiki"`
+    db.run(r#"insert docs { id: "raw1", uri: "c://raw1", title: "Raw", body: "orig", layer: "raw" }"#)
+        .unwrap();
+    assert!(
+        db.run(r#"update docs[id == "raw1"] cas "" { body: "tamper", layer: "wiki" }"#)
+            .is_err()
+    );
+}
+
+#[test]
+fn test_window_functions_analytical_queries() {
+    let mut db = lin::Db::empty();
+    db.run(
+        r#"col emp { id: text, name: text, dept: text, salary: i64 }
+        insert emp [
+            { id: "e1", name: "Alice", dept: "Eng", salary: 100 },
+            { id: "e2", name: "Bob", dept: "Eng", salary: 90 },
+            { id: "e3", name: "Charlie", dept: "Eng", salary: 90 },
+            { id: "e4", name: "Dave", dept: "Eng", salary: 80 },
+            { id: "e5", name: "Eve", dept: "Sales", salary: 120 },
+            { id: "e6", name: "Frank", dept: "Sales", salary: 110 }
+        ]"#,
+    )
+    .unwrap();
+
+    // 1. row_number over all rows ordered by salary desc
+    let h1 = db
+        .run("emp | window row_number sort salary desc as rnk | pick { name, rnk }")
+        .unwrap();
+    assert_eq!(h1.rows.len(), 6);
+    assert_eq!(h1.rows[0].get("name").unwrap().text().unwrap(), "Eve");
+    assert_eq!(h1.rows[0].get("rnk").unwrap(), &lin::Cell::Int(1));
+    assert_eq!(h1.rows[1].get("name").unwrap().text().unwrap(), "Frank");
+    assert_eq!(h1.rows[1].get("rnk").unwrap(), &lin::Cell::Int(2));
+    assert_eq!(h1.rows[2].get("name").unwrap().text().unwrap(), "Alice");
+    assert_eq!(h1.rows[2].get("rnk").unwrap(), &lin::Cell::Int(3));
+
+    // 2. rank partitioned by dept ordered by salary desc (Alice=1, Bob=2, Charlie=2, Dave=4)
+    let h2 = db
+        .run("emp | dept == \"Eng\" | window rank by dept sort salary desc as rnk | pick { name, salary, rnk }")
+        .unwrap();
+    assert_eq!(h2.rows.len(), 4);
+    assert_eq!(h2.rows[0].get("name").unwrap().text().unwrap(), "Alice");
+    assert_eq!(h2.rows[0].get("rnk").unwrap(), &lin::Cell::Int(1));
+    assert_eq!(h2.rows[1].get("rnk").unwrap(), &lin::Cell::Int(2));
+    assert_eq!(h2.rows[2].get("rnk").unwrap(), &lin::Cell::Int(2));
+    assert_eq!(h2.rows[3].get("name").unwrap().text().unwrap(), "Dave");
+    assert_eq!(h2.rows[3].get("rnk").unwrap(), &lin::Cell::Int(4));
+
+    // 3. dense_rank partitioned by dept ordered by salary desc (Alice=1, Bob=2, Charlie=2, Dave=3)
+    let h3 = db
+        .run("emp | dept == \"Eng\" | window dense_rank by dept sort salary desc as rnk | pick { name, rnk }")
+        .unwrap();
+    assert_eq!(h3.rows[3].get("name").unwrap().text().unwrap(), "Dave");
+    assert_eq!(h3.rows[3].get("rnk").unwrap(), &lin::Cell::Int(3));
+
+    // 4. lead and lag
+    let h4 = db
+        .run("emp | dept == \"Sales\" | window lead salary by dept sort salary asc as next_sal | window lag salary by dept sort salary asc as prev_sal | pick { name, salary, next_sal, prev_sal }")
+        .unwrap();
+    assert_eq!(h4.rows.len(), 2);
+    // Frank (110): next_sal=120, prev_sal=null
+    assert_eq!(h4.rows[0].get("name").unwrap().text().unwrap(), "Frank");
+    assert_eq!(h4.rows[0].get("next_sal").unwrap(), &lin::Cell::Int(120));
+    assert!(h4.rows[0].get("prev_sal").unwrap().is_null());
+    // Eve (120): next_sal=null, prev_sal=110
+    assert_eq!(h4.rows[1].get("name").unwrap().text().unwrap(), "Eve");
+    assert!(h4.rows[1].get("next_sal").unwrap().is_null());
+    assert_eq!(h4.rows[1].get("prev_sal").unwrap(), &lin::Cell::Int(110));
+
+    // 5. first_value and last_value
+    let h5 = db
+        .run("emp | dept == \"Eng\" | window first_value salary by dept sort salary asc as lowest | window last_value salary by dept sort salary asc as highest | pick { name, lowest, highest }")
+        .unwrap();
+    assert_eq!(h5.rows[0].get("lowest").unwrap(), &lin::Cell::Int(80));
+    assert_eq!(h5.rows[0].get("highest").unwrap(), &lin::Cell::Int(100));
+
+    // 6. Pipeline filtering by computed window column (top-1 in each department)
+    let h6 = db
+        .run("emp | window rank by dept sort salary desc as rnk | rnk == 1 | pick { name, dept, salary }")
+        .unwrap();
+    assert_eq!(h6.rows.len(), 2);
+    let names: Vec<String> = h6.rows.iter().map(|r| r.get("name").unwrap().text().unwrap().to_string()).collect();
+    assert!(names.contains(&"Alice".to_string()));
+    assert!(names.contains(&"Eve".to_string()));
+
+    // 7. Rust Fluent Query Builder API
+    let h7 = db
+        .from("emp")
+        .row_number_by(Some("dept"), Some("salary"), true, "r_num")
+        .to_vec()
+        .unwrap();
+    assert_eq!(h7.len(), 6);
+    assert!(h7.iter().all(|r| r.get("r_num").is_some()));
+}
+
+

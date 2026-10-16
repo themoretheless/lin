@@ -89,6 +89,7 @@ fn short_label(node: &Node) -> String {
         NodeKind::Sort { field, desc } => {
             format!("Sort {field} {}", if *desc { "desc" } else { "asc" })
         }
+        NodeKind::Window { func, as_field, .. } => format!("Window {func} as {as_field}"),
         NodeKind::Skip { n } => format!("Skip {n}"),
         NodeKind::Take { n, implicit } => match n {
             Some(n) if *implicit => format!("Take {n} implicit"),

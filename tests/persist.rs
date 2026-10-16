@@ -1300,3 +1300,60 @@ fn large_sparse_embedding_insert_is_one_durable_frame_and_replays_exactly() {
     drop(reopened);
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn partial_index_predicate_survives_wal_and_checkpoint_reopen() {
+    let dir = tmp();
+    {
+        let mut db = Db::open(&dir).unwrap();
+        db.run(r#"index docs [wing] where layer == "wiki""#).unwrap();
+        db.run(
+            r#"insert docs [
+                { id: "d1", uri: "p://1", title: "One", layer: "wiki", wing: "rag" },
+                { id: "d2", uri: "p://2", title: "Two", layer: "raw", wing: "rag" }
+            ]"#,
+        )
+        .unwrap();
+    }
+    // Reopen from WAL only (before checkpoint)
+    {
+        let mut db = Db::open(&dir).unwrap();
+        let idx = db
+            .catalog
+            .indexes
+            .values()
+            .find(|i| i.collection == "docs" && i.fields == vec!["wing"])
+            .expect("index exists");
+        assert!(idx.pred.is_some(), "partial index predicate should survive WAL replay");
+        // Querying raw layer by wing=="rag" must NOT mistakenly use the wiki-only partial index
+        let rows = db.run(r#"docs | wing == "rag" | take all"#).unwrap().rows;
+        assert_eq!(rows.len(), 2);
+        db.checkpoint().unwrap();
+    }
+    // Reopen from checkpoint snapshot + cold storage
+    {
+        let mut db = Db::open(&dir).unwrap();
+        let idx = db
+            .catalog
+            .indexes
+            .values()
+            .find(|i| i.collection == "docs" && i.fields == vec!["wing"])
+            .expect("index exists");
+        assert!(idx.pred.is_some(), "partial index predicate should survive checkpoint");
+        // Also verify point lookups and index lookups work against cold (mmap) collections
+        let by_id = db.run(r#"docs | id == "d1" | { title }"#).unwrap().rows;
+        assert_eq!(by_id.len(), 1);
+        assert_eq!(by_id[0]["title"].text(), Some("One"));
+        let by_uri = db.run(r#"docs | uri == "p://2" | { title }"#).unwrap().rows;
+        assert_eq!(by_uri.len(), 1);
+        assert_eq!(by_uri[0]["title"].text(), Some("Two"));
+        let wiki_rag = db
+            .run(r#"docs | layer == "wiki" and wing == "rag" | take all"#)
+            .unwrap()
+            .rows;
+        assert_eq!(wiki_rag.len(), 1);
+        assert_eq!(wiki_rag[0]["id"].text(), Some("d1"));
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
+

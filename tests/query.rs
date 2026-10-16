@@ -713,3 +713,58 @@ fn search_shortcuts_preserve_take_then_skip_and_projection_before_search() {
     assert!(q.to_vec(&mut db).unwrap().is_empty());
     assert!(q.cursor(&db).unwrap().next().is_none());
 }
+
+#[test]
+fn cursor_preserves_unindexed_conjunct_and_or_branches_when_using_index() {
+    let mut db = Db::empty();
+    db.run(
+        r#"insert docs [
+            { id: "m1", uri: "m://1", title: "keep", layer: "wiki", wing: "rag" },
+            { id: "m2", uri: "m://2", title: "drop", layer: "raw", wing: "rag" },
+            { id: "m3", uri: "m://3", title: "sys-keep", layer: "wiki", wing: "sys" }
+        ]
+        index docs [wing]"#,
+    )
+    .unwrap();
+
+    // Indexed on `wing`, unindexed conjunct `layer == "wiki"` must still be evaluated in cursor
+    let q = Queryable::from("docs")
+        .filter(r#"wing == "rag" and layer == "wiki""#)
+        .take_all();
+    let cur_rows: Vec<_> = q.cursor(&db).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+    assert_eq!(cur_rows.len(), 1);
+    assert_eq!(cur_rows[0]["id"].text(), Some("m1"));
+
+    // Indexed OR (`in [...]`) must return all branches in cursor
+    let q_in = Queryable::from("docs")
+        .filter(pred::in_list("wing", ["rag", "sys"]))
+        .take_all();
+    let in_rows: Vec<_> = q_in
+        .cursor(&db)
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(in_rows.len(), 3);
+}
+
+#[test]
+fn fluent_aggregations_and_extended_numeric_conversions() {
+    use lin::{FromCell, ToCell};
+    let mut db = Db::fixture();
+
+    let sum_total: f64 = db.from("orders").sum("total").scalar_as().unwrap();
+    let min_total: f64 = db.from("orders").min("total").scalar_as().unwrap();
+    let max_total: f64 = db.from("orders").max("total").scalar_as().unwrap();
+    let avg_total: f64 = db.from("orders").avg("total").scalar_as().unwrap();
+    assert!(sum_total >= max_total && max_total >= avg_total && avg_total >= min_total);
+
+    // Numeric FromCell / ToCell roundtrip for i32, u32, usize, f32
+    let c_i32 = 42i32.to_cell();
+    assert_eq!(i32::from_cell(&c_i32).unwrap(), 42i32);
+    assert_eq!(u32::from_cell(&c_i32).unwrap(), 42u32);
+    assert_eq!(usize::from_cell(&c_i32).unwrap(), 42usize);
+
+    let c_f32 = 3.5f32.to_cell();
+    assert!((f32::from_cell(&c_f32).unwrap() - 3.5f32).abs() < 1e-6);
+}
+
