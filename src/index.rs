@@ -730,6 +730,7 @@ fn cell_part(c: &Cell) -> IndexPart {
         Cell::Int(n) => numeric_part(*n as f64, Some(*n)),
         Cell::Time(n) => IndexPart::Time(*n),
         Cell::Text(s) => IndexPart::Text(Arc::clone(s)),
+        Cell::SmallText(s) => IndexPart::Text(Arc::from(s.as_str())),
         Cell::Float(n) => numeric_part(*n, None),
         Cell::Vec(_) => IndexPart::Null,
     }

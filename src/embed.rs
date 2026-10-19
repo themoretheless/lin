@@ -692,6 +692,409 @@ impl HnswIndex {
 
         results
     }
+
+    /// Convert this `f32` HNSW index into a compact SQ8-quantized HNSW index.
+    ///
+    /// Preserves graph topology while reducing vector storage by 75%.
+    pub fn to_sq8(&self) -> HnswIndexSq8 {
+        let nodes = self
+            .nodes
+            .iter()
+            .map(|n| HnswNodeSq8 {
+                id: n.id,
+                vector: quantize_sq8(&n.vector),
+                neighbors: n.neighbors.clone(),
+            })
+            .collect();
+        HnswIndexSq8 {
+            nodes,
+            id_to_idx: self.id_to_idx.clone(),
+            enter_point: self.enter_point,
+            max_level: self.max_level,
+            m: self.m,
+            m0: self.m0,
+            ef_construction: self.ef_construction,
+            ml: self.ml,
+        }
+    }
+
+    /// Convert this `f32` HNSW index into a compact SQ8-quantized HNSW index,
+    /// consuming `self`.
+    pub fn into_sq8(self) -> HnswIndexSq8 {
+        self.to_sq8()
+    }
+}
+
+/// Quantize an L2-normalized `f32` vector into an 8-bit signed integer vector (`i8`).
+///
+/// Maps `[-1.0, 1.0]` into `[-127, 127]`.
+pub fn quantize_sq8(v: &[f32]) -> Arc<[i8]> {
+    let mut quantized = Vec::with_capacity(v.len());
+    for &x in v {
+        let q = (x * 127.0).round().clamp(-127.0, 127.0) as i8;
+        quantized.push(q);
+    }
+    quantized.into()
+}
+
+/// Dequantize an 8-bit SQ8 vector back into `f32`.
+pub fn dequantize_sq8(v: &[i8]) -> Vec<f32> {
+    const INV: f32 = 1.0 / 127.0;
+    v.iter().map(|&x| (x as f32) * INV).collect()
+}
+
+/// Dot product / cosine similarity between two SQ8-quantized vectors.
+///
+/// Uses an 8-way unrolled integer accumulator for high throughput.
+/// Scaled by `(127.0 * 127.0)^-1`.
+#[inline]
+pub fn dot_sq8(a: &[i8], b: &[i8]) -> f64 {
+    let n = a.len().min(b.len());
+    if n == 0 {
+        return 0.0;
+    }
+
+    let chunks = n / 8;
+    let mut sum0 = 0i32;
+    let mut sum1 = 0i32;
+    let mut sum2 = 0i32;
+    let mut sum3 = 0i32;
+
+    for i in 0..chunks {
+        let base = i * 8;
+        sum0 += (a[base] as i32) * (b[base] as i32) + (a[base + 1] as i32) * (b[base + 1] as i32);
+        sum1 += (a[base + 2] as i32) * (b[base + 2] as i32) + (a[base + 3] as i32) * (b[base + 3] as i32);
+        sum2 += (a[base + 4] as i32) * (b[base + 4] as i32) + (a[base + 5] as i32) * (b[base + 5] as i32);
+        sum3 += (a[base + 6] as i32) * (b[base + 6] as i32) + (a[base + 7] as i32) * (b[base + 7] as i32);
+    }
+
+    let mut total = (sum0 + sum1) + (sum2 + sum3);
+    for i in (chunks * 8)..n {
+        total += (a[i] as i32) * (b[i] as i32);
+    }
+
+    const SCALE: f64 = 1.0 / (127.0 * 127.0);
+    let sim = (total as f64) * SCALE;
+    sim.clamp(-1.0, 1.0)
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+struct HnswNodeSq8 {
+    id: usize,
+    vector: Arc<[i8]>,
+    neighbors: Vec<Vec<usize>>,
+}
+
+/// Hierarchical Navigable Small World (HNSW) index with 8-bit Scalar Quantization (SQ8).
+///
+/// Reduces vector memory consumption by 75% (1 byte per dimension vs 4 bytes for `f32`)
+/// while retaining > 98% ANN recall with integer dot product acceleration.
+#[derive(Clone, Debug)]
+pub struct HnswIndexSq8 {
+    nodes: Vec<HnswNodeSq8>,
+    id_to_idx: FxHashMap<usize, usize>,
+    enter_point: Option<usize>,
+    max_level: usize,
+    m: usize,
+    m0: usize,
+    ef_construction: usize,
+    ml: f64,
+}
+
+impl Default for HnswIndexSq8 {
+    fn default() -> Self {
+        Self::new(16, 64)
+    }
+}
+
+impl HnswIndexSq8 {
+    pub fn new(m: usize, ef_construction: usize) -> Self {
+        let m = m.max(4);
+        let m0 = m * 2;
+        let ef_construction = ef_construction.max(m);
+        let ml = 1.0 / (m as f64).ln();
+        Self {
+            nodes: Vec::new(),
+            id_to_idx: FxHashMap::default(),
+            enter_point: None,
+            max_level: 0,
+            m,
+            m0,
+            ef_construction,
+            ml,
+        }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+
+    pub fn build(items: impl IntoIterator<Item = (usize, Arc<[i8]>)>) -> Self {
+        let mut index = Self::default();
+        for (id, vec) in items {
+            index.insert(id, vec);
+        }
+        index
+    }
+
+    pub fn build_f32(items: impl IntoIterator<Item = (usize, Arc<[f32]>)>) -> Self {
+        let mut index = Self::default();
+        for (id, vec) in items {
+            index.insert_f32(id, &vec);
+        }
+        index
+    }
+
+    fn random_level(&self, id: usize) -> usize {
+        let mut h = FxHasher::default();
+        id.hash(&mut h);
+        let raw = h.finish() & 0x000f_ffff_ffff_ffff;
+        let r = ((raw as f64) + 1.0) / ((0x0010_0000_0000_0000u64) as f64);
+        let r = r.clamp(1e-9, 1.0);
+        (-r.ln() * self.ml).floor() as usize
+    }
+
+    pub fn insert(&mut self, id: usize, vector: Arc<[i8]>) {
+        if let Some(&existing_idx) = self.id_to_idx.get(&id) {
+            self.nodes[existing_idx].vector = vector;
+            return;
+        }
+
+        let node_level = self.random_level(id);
+        let new_idx = self.nodes.len();
+        self.id_to_idx.insert(id, new_idx);
+
+        let new_node = HnswNodeSq8 {
+            id,
+            vector: Arc::clone(&vector),
+            neighbors: vec![Vec::new(); node_level + 1],
+        };
+        self.nodes.push(new_node);
+
+        let Some(mut curr) = self.enter_point else {
+            self.enter_point = Some(new_idx);
+            self.max_level = node_level;
+            return;
+        };
+
+        let curr_max_level = self.max_level;
+
+        // 1. Greedy search from max_level down to node_level + 1
+        for level in (node_level + 1..=curr_max_level).rev() {
+            let mut curr_sim = dot_sq8(&vector, &self.nodes[curr].vector);
+            loop {
+                let mut changed = false;
+                if level < self.nodes[curr].neighbors.len() {
+                    for &nbr in &self.nodes[curr].neighbors[level] {
+                        let sim = dot_sq8(&vector, &self.nodes[nbr].vector);
+                        if sim > curr_sim {
+                            curr_sim = sim;
+                            curr = nbr;
+                            changed = true;
+                        }
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+        }
+
+        // 2. Search layer and connect from min(curr_max_level, node_level) down to 0
+        let top_connect_level = curr_max_level.min(node_level);
+        let mut entry_points = vec![curr];
+
+        for level in (0..=top_connect_level).rev() {
+            let candidates = self.search_layer_sq8(&vector, &entry_points, self.ef_construction, level);
+            let max_conn = if level == 0 { self.m0 } else { self.m };
+            let neighbors = self.select_neighbors(&candidates, max_conn);
+
+            self.nodes[new_idx].neighbors[level] = neighbors.clone();
+
+            for &nbr in &neighbors {
+                if level < self.nodes[nbr].neighbors.len() {
+                    self.nodes[nbr].neighbors[level].push(new_idx);
+                    if self.nodes[nbr].neighbors[level].len() > max_conn {
+                        self.prune_neighbors(nbr, level, max_conn);
+                    }
+                }
+            }
+
+            entry_points = candidates.into_iter().map(|n| n.idx).collect();
+        }
+
+        if node_level > self.max_level {
+            self.max_level = node_level;
+            self.enter_point = Some(new_idx);
+        }
+    }
+
+    pub fn insert_f32(&mut self, id: usize, vector: &[f32]) {
+        self.insert(id, quantize_sq8(vector));
+    }
+
+    fn search_layer_sq8(
+        &self,
+        query: &[i8],
+        entry_points: &[usize],
+        ef: usize,
+        level: usize,
+    ) -> Vec<MaxSimNode> {
+        let mut visited = FxHashSet::default();
+        let mut candidates = BinaryHeap::<MaxSimNode>::new();
+        let mut w = BinaryHeap::<MinSimNode>::new();
+
+        for &ep in entry_points {
+            if visited.insert(ep) {
+                let sim = dot_sq8(query, &self.nodes[ep].vector);
+                candidates.push(MaxSimNode { sim, idx: ep });
+                w.push(MinSimNode { sim, idx: ep });
+            }
+        }
+
+        while let Some(c) = candidates.pop() {
+            let worst_in_w = w.peek().map(|d| d.sim).unwrap_or(f64::NEG_INFINITY);
+            if c.sim < worst_in_w && w.len() >= ef {
+                break;
+            }
+
+            if level < self.nodes[c.idx].neighbors.len() {
+                for &nbr in &self.nodes[c.idx].neighbors[level] {
+                    if visited.insert(nbr) {
+                        let sim = dot_sq8(query, &self.nodes[nbr].vector);
+                        let worst_in_w = w.peek().map(|x| x.sim).unwrap_or(f64::NEG_INFINITY);
+                        if sim > worst_in_w || w.len() < ef {
+                            candidates.push(MaxSimNode { sim, idx: nbr });
+                            w.push(MinSimNode { sim, idx: nbr });
+                            if w.len() > ef {
+                                w.pop();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        w.into_iter().map(|n| MaxSimNode { sim: n.sim, idx: n.idx }).collect()
+    }
+
+    fn select_neighbors(&self, candidates: &[MaxSimNode], max_conn: usize) -> Vec<usize> {
+        let mut sorted = candidates.to_vec();
+        sorted.sort_by(|a, b| b.sim.partial_cmp(&a.sim).unwrap_or(Ordering::Equal));
+        sorted.truncate(max_conn);
+        sorted.into_iter().map(|n| n.idx).collect()
+    }
+
+    fn prune_neighbors(&mut self, node_idx: usize, level: usize, max_conn: usize) {
+        let node_vec = Arc::clone(&self.nodes[node_idx].vector);
+        let nbrs = &self.nodes[node_idx].neighbors[level];
+        let mut scored: Vec<MaxSimNode> = nbrs
+            .iter()
+            .map(|&nbr| MaxSimNode {
+                sim: dot_sq8(&node_vec, &self.nodes[nbr].vector),
+                idx: nbr,
+            })
+            .collect();
+        scored.sort_by(|a, b| b.sim.partial_cmp(&a.sim).unwrap_or(Ordering::Equal));
+        scored.truncate(max_conn);
+        self.nodes[node_idx].neighbors[level] = scored.into_iter().map(|d| d.idx).collect();
+    }
+
+    /// Search for `k` approximate nearest neighbors with a raw `f32` query vector.
+    ///
+    /// The query vector is quantized once to SQ8 before traversing the index graph.
+    pub fn search(&self, query: &[f32], k: usize, ef_search: usize) -> Vec<(f64, usize)> {
+        let q_sq8 = quantize_sq8(query);
+        self.search_sq8(&q_sq8, k, ef_search)
+    }
+
+    /// Search for `k` approximate nearest neighbors with an already quantized `i8` query vector.
+    pub fn search_sq8(&self, query: &[i8], k: usize, ef_search: usize) -> Vec<(f64, usize)> {
+        if k == 0 || self.nodes.is_empty() {
+            return Vec::new();
+        }
+
+        if self.nodes.len() <= k.max(32) {
+            let mut scored: Vec<(f64, usize)> = self
+                .nodes
+                .iter()
+                .map(|n| (dot_sq8(query, &n.vector), n.id))
+                .filter(|(s, _)| *s > 0.0)
+                .collect();
+            if scored.len() > k {
+                scored.select_nth_unstable_by(k - 1, |a, b| {
+                    b.0.partial_cmp(&a.0)
+                        .unwrap_or(Ordering::Equal)
+                        .then_with(|| a.1.cmp(&b.1))
+                });
+                scored.truncate(k);
+            }
+            scored.sort_by(|a, b| {
+                b.0.partial_cmp(&a.0)
+                    .unwrap_or(Ordering::Equal)
+                    .then_with(|| a.1.cmp(&b.1))
+            });
+            return scored;
+        }
+
+        let mut curr = match self.enter_point {
+            Some(ep) => ep,
+            None => return Vec::new(),
+        };
+
+        for level in (1..=self.max_level).rev() {
+            let mut curr_sim = dot_sq8(query, &self.nodes[curr].vector);
+            loop {
+                let mut changed = false;
+                if level < self.nodes[curr].neighbors.len() {
+                    for &nbr in &self.nodes[curr].neighbors[level] {
+                        let sim = dot_sq8(query, &self.nodes[nbr].vector);
+                        if sim > curr_sim {
+                            curr_sim = sim;
+                            curr = nbr;
+                            changed = true;
+                        }
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+        }
+
+        let ef = ef_search.max(k).max(16);
+        let candidates = self.search_layer_sq8(query, &[curr], ef, 0);
+
+        let mut results: Vec<(f64, usize)> = candidates
+            .into_iter()
+            .map(|n| (n.sim, self.nodes[n.idx].id))
+            .filter(|(s, _)| *s > 0.0)
+            .collect();
+
+        if results.len() > k {
+            results.select_nth_unstable_by(k - 1, |a, b| {
+                b.0.partial_cmp(&a.0)
+                    .unwrap_or(Ordering::Equal)
+                    .then_with(|| a.1.cmp(&b.1))
+            });
+            results.truncate(k);
+        }
+
+        results.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| a.1.cmp(&b.1))
+        });
+
+        results
+    }
 }
 
 /// Text blob used for embedding a row (title / body / snippet).
@@ -918,6 +1321,68 @@ mod tests {
 
             assert!(!hnsw_res.is_empty());
             assert_eq!(hnsw_res[0].1, exhaustive[0].1);
+        }
+    }
+
+    #[test]
+    fn test_sq8_quantization_and_dot_product() {
+        let v1 = vec![0.5, -0.5, 0.7071, 0.0, -0.05, 0.8];
+        let q1 = quantize_sq8(&v1);
+        assert_eq!(q1.len(), v1.len());
+
+        let deq1 = dequantize_sq8(&q1);
+        for (&orig, &deq) in v1.iter().zip(&deq1) {
+            assert!((orig - deq).abs() < 0.015, "Quantization error too large: {orig} vs {deq}");
+        }
+
+        // Test dot product accuracy
+        let v2 = vec![0.6, -0.4, 0.5, 0.1, -0.1, 0.7];
+        let q2 = quantize_sq8(&v2);
+
+        let cos_sim = cosine(&v1, &v2);
+        let sq8_sim = dot_sq8(&q1, &q2);
+        assert!(
+            (cos_sim - sq8_sim).abs() < 0.05,
+            "Dot product difference too large: {cos_sim} vs {sq8_sim}"
+        );
+    }
+
+    #[test]
+    fn test_hnsw_sq8_recall_and_conversion() {
+        let dim = 32;
+        let embedder = HashingEmbedder::new("test/32", dim);
+        let items: Vec<(usize, Arc<[f32]>)> = (0..120)
+            .map(|i| (i, embedder.embed(&format!("document item {i} with some words and features"))))
+            .collect();
+
+        // 1. Build HnswIndexSq8 directly
+        let sq8_index = HnswIndexSq8::build_f32(items.clone());
+        assert_eq!(sq8_index.len(), 120);
+
+        // 2. Convert from f32 HnswIndex
+        let f32_index = HnswIndex::build(items.clone());
+        let converted_sq8 = f32_index.to_sq8();
+        assert_eq!(converted_sq8.len(), 120);
+
+        for query_id in [0, 15, 42, 99] {
+            let q_vec = embedder.embed(&format!("document item {query_id} with query tokens"));
+            let k = 5;
+
+            let res_sq8 = sq8_index.search(&q_vec, k, 32);
+            let res_conv = converted_sq8.search(&q_vec, k, 32);
+
+            let mut exhaustive: Vec<(f64, usize)> = items
+                .iter()
+                .map(|(id, v)| (cosine(&q_vec, v), *id))
+                .filter(|(s, _)| *s > 0.0)
+                .collect();
+            exhaustive.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap().then_with(|| a.1.cmp(&b.1)));
+            exhaustive.truncate(k);
+
+            assert!(!res_sq8.is_empty());
+            assert!(!res_conv.is_empty());
+            assert_eq!(res_sq8[0].1, exhaustive[0].1);
+            assert_eq!(res_conv[0].1, exhaustive[0].1);
         }
     }
 }

@@ -5351,9 +5351,11 @@ fn value_cell(v: &Value, now: i64) -> Cell {
 }
 
 fn value_text(v: &Value, now: i64) -> String {
-    match value_cell(v, now) {
-        Cell::Text(s) => s.as_ref().to_owned(),
-        other => other.compact(),
+    let c = value_cell(v, now);
+    if let Some(s) = c.text() {
+        s.to_owned()
+    } else {
+        c.compact()
     }
 }
 
@@ -5441,6 +5443,8 @@ fn cell_eq_val(left: &Cell, value: &Value, now: i64) -> bool {
     match (left, value) {
         (Cell::Text(x), Value::String(y)) => x.as_ref() == y.as_ref(),
         (Cell::Text(x), Value::Name(y)) => x.as_ref() == y.as_str(),
+        (Cell::SmallText(x), Value::String(y)) => x.as_str() == y.as_ref(),
+        (Cell::SmallText(x), Value::Name(y)) => x.as_str() == y.as_str(),
         (Cell::Bool(x), Value::Bool(y)) => *x == *y,
         (Cell::Int(x), Value::Int(y)) => *x == *y,
         (Cell::Float(x), Value::Float(y)) => *x == *y,
@@ -5666,6 +5670,9 @@ fn cmp_sort(a: &Cell, b: &Cell) -> std::cmp::Ordering {
         (Cell::Null, _) => Ordering::Less,
         (_, Cell::Null) => Ordering::Greater,
         (Cell::Text(x), Cell::Text(y)) => x.cmp(y),
+        (Cell::SmallText(x), Cell::SmallText(y)) => x.cmp(y),
+        (Cell::Text(x), Cell::SmallText(y)) => x.as_ref().cmp(y.as_str()),
+        (Cell::SmallText(x), Cell::Text(y)) => x.as_str().cmp(y.as_ref()),
         (Cell::Bool(x), Cell::Bool(y)) => x.cmp(y),
         _ => match (a.as_f64(), b.as_f64()) {
             (Some(x), Some(y)) => match (x.is_nan(), y.is_nan()) {
@@ -5687,6 +5694,11 @@ fn group_cell_key_into(c: Option<&Cell>, out: &mut String) {
         Some(Cell::Text(s)) => {
             out.push('"');
             out.push_str(s.as_ref());
+            out.push('"');
+        }
+        Some(Cell::SmallText(s)) => {
+            out.push('"');
+            out.push_str(s.as_str());
             out.push('"');
         }
         Some(Cell::Null) | None => out.push_str("null"),
@@ -6395,6 +6407,7 @@ fn agg_avg(rows: &[Row], field: &Field, by: Option<&Field>) -> Vec<Row> {
 pub(crate) fn cell_key(c: &Cell) -> Option<String> {
     match c {
         Cell::Text(s) => Some(s.as_ref().to_owned()),
+        Cell::SmallText(s) => Some(s.as_str().to_owned()),
         Cell::Int(n) => Some(n.to_string()),
         _ => None,
     }
@@ -6446,7 +6459,7 @@ impl Db {
             Pred::Not(_) | Pred::IsNull { .. } | Pred::In { .. } => Ok(None),
             Pred::Cmp { field, op, value } => {
                 let right = value_cell(value, now);
-                if let Cell::Text(needle) = &right {
+                if let Some(needle) = right.text() {
                     if !matches!(op, CmpOp::Eq | CmpOp::Ne) {
                         return Ok(Some(vec![false; rows.len()]));
                     }

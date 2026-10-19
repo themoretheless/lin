@@ -750,7 +750,7 @@ pub fn append_batch_records(
         }
 
         let codec = [LOG_MAGIC_V1[3]];
-        let mut checksum = crc32fast::Hasher::new();
+        let mut checksum = crate::crc::Hasher::new();
         checksum.update(&codec);
         checksum.update(&payload);
         let checksum_bytes = checksum.finalize().to_le_bytes();
@@ -805,7 +805,7 @@ pub fn append_compressed_batch(
             if len > MAX_RECORD as usize {
                 return Err(io_err("compressed record exceeds max size"));
             }
-            let mut checksum = crc32fast::Hasher::new();
+            let mut checksum = crate::crc::Hasher::new();
             checksum.update(&codec);
             checksum.update(&compressed);
             let crc = checksum.finalize().to_le_bytes();
@@ -924,7 +924,7 @@ fn write_frame(
         return Err(io_err("log record exceeds 16MiB"));
     };
     let codec = [magic[3]];
-    let mut checksum = crc32fast::Hasher::new();
+    let mut checksum = crate::crc::Hasher::new();
     checksum.update(&codec);
     checksum.update(payload);
     let checksum = checksum.finalize().to_le_bytes();
@@ -965,7 +965,17 @@ pub(crate) fn durable_sync(file: &File) -> io::Result<()> {
         // Older kernels: fall back to FULLFSYNC via sync_data.
         return file.sync_data();
     }
-    #[cfg(not(target_vendor = "apple"))]
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        let rc = unsafe { libc::fdatasync(file.as_raw_fd()) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+    #[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
     {
         file.sync_data()
     }
@@ -1753,7 +1763,8 @@ fn decode_frame(magic: &[u8; 4], payload: &[u8]) -> Result<LogRecord, Error> {
         }
         let end = payload.len() - 4;
         let expected = u32::from_le_bytes(payload[end..].try_into().unwrap());
-        if crc32fast::hash(&payload[..end]) != expected {
+        let hw_crc = crate::crc::hardware_crc32c(&payload[..end]);
+        if hw_crc != expected && crc32fast::hash(&payload[..end]) != expected {
             return Err(io_err("wal checksum mismatch"));
         }
         let codec = match payload[0] {
@@ -1912,7 +1923,7 @@ pub fn rows_to_insert_cols(
         let mut cols = rows[0]
             .values()
             .map(|cell| match cell {
-                Cell::Text(_) => ColData::Text(Vec::with_capacity(rows.len())),
+                Cell::Text(_) | Cell::SmallText(_) => ColData::Text(Vec::with_capacity(rows.len())),
                 Cell::Int(_) => ColData::Int(Vec::with_capacity(rows.len())),
                 Cell::Float(_) => ColData::Float(Vec::with_capacity(rows.len())),
                 Cell::Bool(_) => ColData::Bool(Vec::with_capacity(rows.len())),
@@ -1973,7 +1984,7 @@ pub fn rows_to_insert_cols(
         let mut kind = 0u8;
         for cell in column_cells(fi) {
             match cell {
-                Some(Cell::Text(_)) => {
+                Some(Cell::Text(_) | Cell::SmallText(_)) => {
                     kind = 1;
                     break;
                 }
@@ -2580,6 +2591,39 @@ mod wal_integrity_tests {
             file.write_all(&corrupt).unwrap();
             assert!(replay_log(file, 0, 0, |_| Ok(())).is_err());
             assert_eq!(file.metadata().unwrap().len(), corrupt.len() as u64);
+        });
+    }
+
+    #[test]
+    fn wal_hardware_crc32c_and_legacy_crc32_both_replay_cleanly() {
+        with_log(|file| {
+            let pack = Pack::AppendFactsBulk {
+                s: vec!["s".into()],
+                p: vec!["p".into()],
+                o: vec!["o".into()],
+            };
+            let hw_frame = frame(file, pack);
+            assert_eq!(&hw_frame[..4], &LOG_MAGIC_CHECKSUM);
+
+            // Verify the frame written uses hardware Castagnoli CRC32-C
+            let end = hw_frame.len() - 4;
+            let written_crc = u32::from_le_bytes(hw_frame[end..].try_into().unwrap());
+            let expected_crc32c = crate::crc::hardware_crc32c(&hw_frame[8..end]);
+            assert_eq!(written_crc, expected_crc32c);
+
+            // Construct an equivalent legacy frame using IEEE 802.3 CRC32
+            let mut legacy_frame = hw_frame.clone();
+            let legacy_crc = crc32fast::hash(&hw_frame[8..end]);
+            legacy_frame[end..].copy_from_slice(&legacy_crc.to_le_bytes());
+
+            // Both frames must replay cleanly without errors
+            assert_eq!(for_each_wal_frame(&hw_frame, |_| Ok(())).unwrap(), 1);
+            assert_eq!(for_each_wal_frame(&legacy_frame, |_| Ok(())).unwrap(), 1);
+
+            // Any corrupt CRC must fail
+            let mut bad_frame = hw_frame.clone();
+            bad_frame[end] ^= 0xff;
+            assert!(for_each_wal_frame(&bad_frame, |_| Ok(())).is_err());
         });
     }
 }

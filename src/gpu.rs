@@ -1209,6 +1209,7 @@ impl GpuCompute {
             let (kind, value, string) = match cell {
                 Cell::Null => (0u32, 0u64, None),
                 Cell::Text(s) => (1, 0, Some(s.to_string())),
+                Cell::SmallText(s) => (1, 0, Some(s.as_str().to_string())),
                 Cell::Bool(b) => (2, *b as u64, None),
                 Cell::Vec(_) => (3, 0, Some(cell.compact())),
                 _ => {

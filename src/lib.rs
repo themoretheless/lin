@@ -49,6 +49,7 @@ mod batch;
 mod catalog;
 mod check;
 mod cold;
+pub mod crc;
 mod cursor;
 mod embed;
 #[cfg(feature = "embed-ollama")]
@@ -84,7 +85,9 @@ pub use ast::{
 };
 pub use batch::RecordBatch;
 pub use cursor::{ProjectedRow, QueryCursor};
-pub use embed::{Embedder, HashingEmbedder, HnswIndex};
+pub use embed::{
+    dequantize_sq8, dot_sq8, quantize_sq8, Embedder, HashingEmbedder, HnswIndex, HnswIndexSq8,
+};
 #[cfg(feature = "embed-ollama")]
 pub use embed_ollama::OllamaEmbedder;
 #[cfg(feature = "embed-onnx")]
@@ -97,7 +100,7 @@ pub use graph::GraphFmt;
 pub use plan::Plan;
 pub use query::{BoundFilter, BoundQueryable, Col, FilterArg, IntoFieldList, MatchPath, Queryable};
 pub use row::{FromCell, FromRow, LinRow, ToCell, cell_get, cell_opt, map_rows};
-pub use store::{Cell, Row, RowExt, Store};
+pub use store::{Cell, InlineStr, Row, RowExt, Store};
 
 #[cfg(feature = "async")]
 pub use async_db::{AsyncDb, AsyncReadDb};

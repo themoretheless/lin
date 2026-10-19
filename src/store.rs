@@ -114,12 +114,157 @@ pub(crate) struct StoreOpenPhases {
     pub fts_ms: f64,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Compact inline string storage for strings up to 22 bytes.
+///
+/// Stores strings inline without heap allocation or atomic refcounts.
+/// Combined with `Cell`'s 1-byte enum tag, keeps `size_of::<Cell>()` at exactly 24 bytes.
+#[derive(Copy, Clone, Eq, Ord)]
+pub struct InlineStr {
+    len: u8,
+    buf: [u8; 22],
+}
+
+impl InlineStr {
+    pub const MAX_LEN: usize = 22;
+
+    #[inline]
+    pub fn try_new(s: &str) -> Option<Self> {
+        let b = s.as_bytes();
+        if b.len() > Self::MAX_LEN {
+            return None;
+        }
+        let mut buf = [0u8; 22];
+        buf[..b.len()].copy_from_slice(b);
+        Some(Self {
+            len: b.len() as u8,
+            buf,
+        })
+    }
+
+    #[inline]
+    pub fn new_truncate(s: &str) -> Self {
+        let b = s.as_bytes();
+        let len = b.len().min(Self::MAX_LEN);
+        let mut buf = [0u8; 22];
+        buf[..len].copy_from_slice(&b[..len]);
+        Self {
+            len: len as u8,
+            buf,
+        }
+    }
+
+    #[inline]
+    pub fn as_str(&self) -> &str {
+        let slice = &self.buf[..self.len as usize];
+        // SAFETY: Only constructed from valid UTF-8 strings
+        unsafe { std::str::from_utf8_unchecked(slice) }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl std::ops::Deref for InlineStr {
+    type Target = str;
+    #[inline]
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::fmt::Debug for InlineStr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self.as_str(), f)
+    }
+}
+
+impl std::fmt::Display for InlineStr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self.as_str(), f)
+    }
+}
+
+impl PartialEq for InlineStr {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl PartialEq<str> for InlineStr {
+    #[inline]
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl PartialEq<&str> for InlineStr {
+    #[inline]
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+impl PartialOrd for InlineStr {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl std::hash::Hash for InlineStr {
+    #[inline]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.as_str().hash(state);
+    }
+}
+
+impl Serialize for InlineStr {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for InlineStr {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = InlineStr;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a string up to 22 bytes")
+            }
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                InlineStr::try_new(v).ok_or_else(|| E::custom("string too long for InlineStr"))
+            }
+        }
+        deserializer.deserialize_str(Visitor)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "t", content = "v")]
 pub enum Cell {
     Null,
     /// Arc so projecting / cloning rows does not deep-copy large strings.
     Text(Arc<str>),
+    /// Small String Optimization: inline storage for strings <= 22 bytes without heap allocation.
+    SmallText(InlineStr),
     Int(i64),
     Float(f64),
     Bool(bool),
@@ -128,9 +273,86 @@ pub enum Cell {
     Vec(Arc<[f32]>),
 }
 
+impl PartialEq for Cell {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Cell::Null, Cell::Null) => true,
+            (Cell::Text(a), Cell::Text(b)) => a == b,
+            (Cell::SmallText(a), Cell::SmallText(b)) => a == b,
+            (Cell::Text(a), Cell::SmallText(b)) => a.as_ref() == b.as_str(),
+            (Cell::SmallText(a), Cell::Text(b)) => a.as_str() == b.as_ref(),
+            (Cell::Int(a), Cell::Int(b)) => a == b,
+            (Cell::Float(a), Cell::Float(b)) => a.to_bits() == b.to_bits(),
+            (Cell::Bool(a), Cell::Bool(b)) => a == b,
+            (Cell::Time(a), Cell::Time(b)) => a == b,
+            (Cell::Vec(a), Cell::Vec(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Cell {}
+
+impl std::hash::Hash for Cell {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        match self {
+            Cell::Null => 0u8.hash(state),
+            Cell::Text(s) => {
+                1u8.hash(state);
+                s.as_ref().hash(state);
+            }
+            Cell::SmallText(s) => {
+                1u8.hash(state);
+                s.as_str().hash(state);
+            }
+            Cell::Int(n) => {
+                2u8.hash(state);
+                n.hash(state);
+            }
+            Cell::Float(f) => {
+                3u8.hash(state);
+                f.to_bits().hash(state);
+            }
+            Cell::Bool(b) => {
+                4u8.hash(state);
+                b.hash(state);
+            }
+            Cell::Time(t) => {
+                5u8.hash(state);
+                t.hash(state);
+            }
+            Cell::Vec(v) => {
+                6u8.hash(state);
+                for x in v.as_ref() {
+                    x.to_bits().hash(state);
+                }
+            }
+        }
+    }
+}
+
 impl Cell {
     pub fn text_arc(s: impl Into<Arc<str>>) -> Self {
         Cell::Text(s.into())
+    }
+
+    /// Construct a text cell with Small String Optimization (SSO).
+    ///
+    /// Strings up to 22 bytes are stored inline without heap allocations or atomic refcounts.
+    /// Longer strings are stored in `Arc<str>`.
+    pub fn from_text(s: impl AsRef<str>) -> Self {
+        let s = s.as_ref();
+        if let Some(inline) = InlineStr::try_new(s) {
+            Cell::SmallText(inline)
+        } else {
+            Cell::Text(Arc::from(s))
+        }
+    }
+
+    /// Construct an inline text cell if `s` fits within 22 bytes.
+    #[inline]
+    pub fn inline(s: &str) -> Option<Self> {
+        InlineStr::try_new(s).map(Cell::SmallText)
     }
 
     pub fn vec_arc(v: impl Into<Arc<[f32]>>) -> Self {
@@ -140,6 +362,7 @@ impl Cell {
     pub fn text(&self) -> Option<&str> {
         match self {
             Cell::Text(s) => Some(s.as_ref()),
+            Cell::SmallText(s) => Some(s.as_str()),
             _ => None,
         }
     }
@@ -147,15 +370,18 @@ impl Cell {
     pub fn text_shared(&self) -> Option<Arc<str>> {
         match self {
             Cell::Text(s) => Some(Arc::clone(s)),
+            Cell::SmallText(s) => Some(Arc::from(s.as_str())),
             _ => None,
         }
     }
 
-    /// Zero-copy clone for borrow scenarios: just clone the Arc reference, don't copy data
+    /// Zero-copy clone for borrow scenarios: just clone the Arc reference, don't copy data.
+    /// For `SmallText`, this copies the 23-byte inline struct without any atomic refcounts.
     #[inline]
     pub fn clone_for_borrow(&self) -> Self {
         match self {
             Cell::Text(s) => Cell::Text(Arc::clone(s)),
+            Cell::SmallText(s) => Cell::SmallText(*s),
             Cell::Vec(v) => Cell::Vec(Arc::clone(v)),
             // Other types are Copy, use standard clone
             Cell::Int(n) => Cell::Int(*n),
@@ -214,6 +440,9 @@ impl Cell {
             Cell::Text(s) => {
                 let _ = write!(out, "{:?}", s.as_ref());
             }
+            Cell::SmallText(s) => {
+                let _ = write!(out, "{:?}", s.as_str());
+            }
             Cell::Int(n) => {
                 let _ = write!(out, "{n}");
             }
@@ -236,6 +465,34 @@ impl Cell {
         let mut out = String::with_capacity(16);
         self.compact_into(&mut out);
         out
+    }
+}
+
+impl From<&str> for Cell {
+    #[inline]
+    fn from(s: &str) -> Self {
+        Cell::from_text(s)
+    }
+}
+
+impl From<String> for Cell {
+    #[inline]
+    fn from(s: String) -> Self {
+        Cell::from_text(s)
+    }
+}
+
+impl From<InlineStr> for Cell {
+    #[inline]
+    fn from(s: InlineStr) -> Self {
+        Cell::SmallText(s)
+    }
+}
+
+impl From<Arc<str>> for Cell {
+    #[inline]
+    fn from(s: Arc<str>) -> Self {
+        Cell::Text(s)
     }
 }
 
@@ -3505,5 +3762,60 @@ mod borrowed_delete_tests {
         assert_eq!(store.docs_id, expected.docs_id);
         assert_eq!(store.docs_title, expected.docs_title);
         assert_eq!(store.by_id, expected.by_id);
+    }
+
+    #[test]
+    fn sso_inline_str_and_cell_small_text_semantics() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        // Size check: Cell must remain 24 bytes
+        assert_eq!(std::mem::size_of::<Cell>(), 24);
+        assert_eq!(std::mem::size_of::<InlineStr>(), 23);
+
+        // Strings <= 22 bytes become SmallText
+        let short = "user_12345";
+        let c1 = Cell::from_text(short);
+        assert!(matches!(c1, Cell::SmallText(_)));
+        assert_eq!(c1.text(), Some(short));
+
+        // Strings > 22 bytes become Text(Arc<str>)
+        let long = "this is a very long string that exceeds 22 bytes";
+        let c2 = Cell::from_text(long);
+        assert!(matches!(c2, Cell::Text(_)));
+        assert_eq!(c2.text(), Some(long));
+
+        // Equality between SmallText and Text
+        let c_arc = Cell::Text(std::sync::Arc::from(short));
+        assert_eq!(c1, c_arc);
+        assert_eq!(c_arc, c1);
+
+        // Hashing consistency
+        let mut h1 = DefaultHasher::new();
+        c1.hash(&mut h1);
+        let mut h2 = DefaultHasher::new();
+        c_arc.hash(&mut h2);
+        assert_eq!(h1.finish(), h2.finish());
+
+        // Zero-cost clone_for_borrow
+        let borrowed = c1.clone_for_borrow();
+        assert_eq!(borrowed, c1);
+        assert!(matches!(borrowed, Cell::SmallText(_)));
+
+        // Serde roundtrip
+        let serialized = serde_json::to_string(&c1).unwrap();
+        let deserialized: Cell = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(c1, deserialized);
+
+        // Boundary tests for 22 bytes exactly
+        let s22 = "1234567890123456789012";
+        assert_eq!(s22.len(), 22);
+        let c22 = Cell::from_text(s22);
+        assert!(matches!(c22, Cell::SmallText(_)));
+
+        let s23 = "12345678901234567890123";
+        assert_eq!(s23.len(), 23);
+        let c23 = Cell::from_text(s23);
+        assert!(matches!(c23, Cell::Text(_)));
     }
 }

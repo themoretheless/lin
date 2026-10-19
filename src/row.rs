@@ -12,6 +12,7 @@ impl FromCell for String {
     fn from_cell(cell: &Cell) -> Result<Self, Error> {
         match cell {
             Cell::Text(s) => Ok(s.to_string()),
+            Cell::SmallText(s) => Ok(s.as_str().to_string()),
             Cell::Null => Err(Error::runtime("expected text, got null")),
             other => Err(Error::runtime(format!("expected text, got {other:?}"))),
         }
@@ -76,8 +77,21 @@ impl FromCell for std::sync::Arc<str> {
     fn from_cell(cell: &Cell) -> Result<Self, Error> {
         match cell {
             Cell::Text(s) => Ok(s.clone()),
+            Cell::SmallText(s) => Ok(std::sync::Arc::from(s.as_str())),
             Cell::Null => Err(Error::runtime("expected text, got null")),
             other => Err(Error::runtime(format!("expected text, got {other:?}"))),
+        }
+    }
+}
+
+impl FromCell for crate::store::InlineStr {
+    fn from_cell(cell: &Cell) -> Result<Self, Error> {
+        match cell {
+            Cell::SmallText(s) => Ok(*s),
+            Cell::Text(s) => crate::store::InlineStr::try_new(s.as_ref())
+                .ok_or_else(|| Error::runtime(format!("expected small text, got {s}"))),
+            Cell::Null => Err(Error::runtime("expected small text, got null")),
+            other => Err(Error::runtime(format!("expected small text, got {other:?}"))),
         }
     }
 }
@@ -122,15 +136,21 @@ impl ToCell for Cell {
     }
 }
 
+impl ToCell for crate::store::InlineStr {
+    fn to_cell(&self) -> Cell {
+        Cell::SmallText(*self)
+    }
+}
+
 impl ToCell for String {
     fn to_cell(&self) -> Cell {
-        Cell::text_arc(self.as_str())
+        Cell::from_text(self.as_str())
     }
 }
 
 impl ToCell for str {
     fn to_cell(&self) -> Cell {
-        Cell::text_arc(self)
+        Cell::from_text(self)
     }
 }
 
