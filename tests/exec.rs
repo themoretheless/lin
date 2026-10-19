@@ -2068,5 +2068,66 @@ fn test_window_multi_column_partition_and_fts_wildcard_prefix() {
     }
 }
 
+#[test]
+fn test_vector_search_top_k_shortcut_and_asymmetric_join() {
+    let mut db = lin::Db::empty();
+    // 1. Vector search Top-K shortcut test
+    for i in 0..100 {
+        let title = if i == 7 {
+            "critical fast path target query"
+        } else {
+            "generic background noise item"
+        };
+        db.run(&format!(
+            r#"insert docs {{ uri: "raw://topk/{i}", title: "{title}", layer: "wiki", body: "text {i}" }}"#
+        ))
+        .unwrap();
+    }
+    db.reembed_collection("docs").unwrap();
+
+    let res = db
+        .run(r#"docs | search vec "critical fast path" | { uri, title } | take 3"#)
+        .unwrap();
+    assert_eq!(res.rows.len(), 3);
+    assert_eq!(res.rows[0].get("uri").unwrap().text().unwrap(), "raw://topk/7");
+    assert_eq!(
+        res.rows[0].get("title").unwrap().text().unwrap(),
+        "critical fast path target query"
+    );
+
+    // 2. Asymmetric hash join & semi-join key filtering test
+    // Insert 50 users (large right side)
+    for i in 0..50 {
+        db.run(&format!(
+            r#"insert users {{ id: "u{i}", email: "user{i}@example.com" }}"#
+        ))
+        .unwrap();
+    }
+
+    // Insert 3 orders (small left side)
+    db.run(r#"insert orders { id: "o1", user_id: "u5", total: 100 }"#).unwrap();
+    db.run(r#"insert orders { id: "o2", user_id: "u42", total: 200 }"#).unwrap();
+    db.run(r#"insert orders { id: "o3", total: 300 }"#).unwrap(); // omitted user_id is null
+
+    // Inner join: null dropped, u5 and u42 resolved
+    let inner = db
+        .run("orders | join users on user_id | { id, user_id, users.email, total } | take all")
+        .unwrap();
+    assert_eq!(inner.rows.len(), 2);
+    let ids: Vec<String> = inner
+        .rows
+        .iter()
+        .map(|r| r.get("id").unwrap().text().unwrap().to_string())
+        .collect();
+    assert_eq!(ids, vec!["o1", "o2"]);
+
+    // Left join: null kept without users fields
+    let left = db
+        .run("orders | join left users on user_id | { id, user_id, users.email, total } | take all")
+        .unwrap();
+    assert_eq!(left.rows.len(), 3);
+}
+
+
 
 

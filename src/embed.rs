@@ -4,10 +4,12 @@
 //! (`…/768` → dim 768). It is **not** a neural model — swap via
 //! [`crate::exec::Db::with_embedder`] when a real backend is available.
 
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
+use std::hash::{Hash, Hasher};
 use std::sync::{Arc, OnceLock};
 
-use rustc_hash::FxHasher;
-use std::hash::{Hash, Hasher};
+use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 
 /// Text → dense vector. Must be `Send + Sync` for [`crate::exec::ReadDb`] sharing.
 pub trait Embedder: Send + Sync {
@@ -326,6 +328,372 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f64 {
     (dot / (na.sqrt() * nb.sqrt())).clamp(-1.0, 1.0)
 }
 
+/// Candidate in max-heap: highest similarity at the top (popped first).
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug)]
+struct MaxSimNode {
+    sim: f64,
+    idx: usize,
+}
+
+impl PartialEq for MaxSimNode {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.sim == other.sim && self.idx == other.idx
+    }
+}
+
+impl Eq for MaxSimNode {}
+
+impl PartialOrd for MaxSimNode {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for MaxSimNode {
+    #[inline]
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.sim
+            .partial_cmp(&other.sim)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| other.idx.cmp(&self.idx))
+    }
+}
+
+/// Dynamic result set in min-heap: lowest similarity at the top (evicted first).
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug)]
+struct MinSimNode {
+    sim: f64,
+    idx: usize,
+}
+
+impl PartialEq for MinSimNode {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.sim == other.sim && self.idx == other.idx
+    }
+}
+
+impl Eq for MinSimNode {}
+
+impl PartialOrd for MinSimNode {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for MinSimNode {
+    #[inline]
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .sim
+            .partial_cmp(&self.sim)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| self.idx.cmp(&other.idx))
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+struct HnswNode {
+    id: usize,
+    vector: Arc<[f32]>,
+    neighbors: Vec<Vec<usize>>,
+}
+
+/// Hierarchical Navigable Small World (HNSW) index for approximate nearest neighbor search.
+#[derive(Clone, Debug)]
+pub struct HnswIndex {
+    nodes: Vec<HnswNode>,
+    id_to_idx: FxHashMap<usize, usize>,
+    enter_point: Option<usize>,
+    max_level: usize,
+    m: usize,
+    m0: usize,
+    ef_construction: usize,
+    ml: f64,
+}
+
+impl Default for HnswIndex {
+    fn default() -> Self {
+        Self::new(16, 64)
+    }
+}
+
+impl HnswIndex {
+    pub fn new(m: usize, ef_construction: usize) -> Self {
+        let m = m.max(4);
+        let m0 = m * 2;
+        let ef_construction = ef_construction.max(m);
+        let ml = 1.0 / (m as f64).ln();
+        Self {
+            nodes: Vec::new(),
+            id_to_idx: FxHashMap::default(),
+            enter_point: None,
+            max_level: 0,
+            m,
+            m0,
+            ef_construction,
+            ml,
+        }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+
+    pub fn build(items: impl IntoIterator<Item = (usize, Arc<[f32]>)>) -> Self {
+        let mut index = Self::default();
+        for (id, vec) in items {
+            index.insert(id, vec);
+        }
+        index
+    }
+
+    fn random_level(&self, id: usize) -> usize {
+        let mut h = FxHasher::default();
+        id.hash(&mut h);
+        let raw = h.finish() & 0x000f_ffff_ffff_ffff;
+        let r = ((raw as f64) + 1.0) / ((0x0010_0000_0000_0000u64) as f64);
+        let r = r.clamp(1e-9, 1.0);
+        (-r.ln() * self.ml).floor() as usize
+    }
+
+    pub fn insert(&mut self, id: usize, vector: Arc<[f32]>) {
+        if let Some(&existing_idx) = self.id_to_idx.get(&id) {
+            self.nodes[existing_idx].vector = vector;
+            return;
+        }
+
+        let node_level = self.random_level(id);
+        let new_idx = self.nodes.len();
+        self.id_to_idx.insert(id, new_idx);
+
+        let new_node = HnswNode {
+            id,
+            vector: Arc::clone(&vector),
+            neighbors: vec![Vec::new(); node_level + 1],
+        };
+        self.nodes.push(new_node);
+
+        let Some(mut curr) = self.enter_point else {
+            self.enter_point = Some(new_idx);
+            self.max_level = node_level;
+            return;
+        };
+
+        let curr_max_level = self.max_level;
+
+        // 1. Greedy search from max_level down to node_level + 1
+        for level in (node_level + 1..=curr_max_level).rev() {
+            let mut curr_sim = cosine(&vector, &self.nodes[curr].vector);
+            loop {
+                let mut changed = false;
+                if level < self.nodes[curr].neighbors.len() {
+                    for &nbr in &self.nodes[curr].neighbors[level] {
+                        let sim = cosine(&vector, &self.nodes[nbr].vector);
+                        if sim > curr_sim {
+                            curr_sim = sim;
+                            curr = nbr;
+                            changed = true;
+                        }
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+        }
+
+        // 2. Search layer and connect from min(curr_max_level, node_level) down to 0
+        let top_connect_level = curr_max_level.min(node_level);
+        let mut entry_points = vec![curr];
+
+        for level in (0..=top_connect_level).rev() {
+            let candidates = self.search_layer(&vector, &entry_points, self.ef_construction, level);
+            let max_conn = if level == 0 { self.m0 } else { self.m };
+            let neighbors = self.select_neighbors(&candidates, max_conn);
+
+            self.nodes[new_idx].neighbors[level] = neighbors.clone();
+
+            for &nbr in &neighbors {
+                if level < self.nodes[nbr].neighbors.len() {
+                    self.nodes[nbr].neighbors[level].push(new_idx);
+                    if self.nodes[nbr].neighbors[level].len() > max_conn {
+                        self.prune_neighbors(nbr, level, max_conn);
+                    }
+                }
+            }
+
+            entry_points = candidates.into_iter().map(|n| n.idx).collect();
+        }
+
+        if node_level > self.max_level {
+            self.max_level = node_level;
+            self.enter_point = Some(new_idx);
+        }
+    }
+
+    fn search_layer(
+        &self,
+        query: &[f32],
+        entry_points: &[usize],
+        ef: usize,
+        level: usize,
+    ) -> Vec<MaxSimNode> {
+        let mut visited = FxHashSet::default();
+        let mut candidates = BinaryHeap::<MaxSimNode>::new();
+        let mut w = BinaryHeap::<MinSimNode>::new();
+
+        for &ep in entry_points {
+            if visited.insert(ep) {
+                let sim = cosine(query, &self.nodes[ep].vector);
+                candidates.push(MaxSimNode { sim, idx: ep });
+                w.push(MinSimNode { sim, idx: ep });
+            }
+        }
+
+        while let Some(c) = candidates.pop() {
+            let worst_in_w = w.peek().map(|d| d.sim).unwrap_or(f64::NEG_INFINITY);
+            if c.sim < worst_in_w && w.len() >= ef {
+                break;
+            }
+
+            if level < self.nodes[c.idx].neighbors.len() {
+                for &nbr in &self.nodes[c.idx].neighbors[level] {
+                    if visited.insert(nbr) {
+                        let sim = cosine(query, &self.nodes[nbr].vector);
+                        let worst_in_w = w.peek().map(|x| x.sim).unwrap_or(f64::NEG_INFINITY);
+                        if sim > worst_in_w || w.len() < ef {
+                            candidates.push(MaxSimNode { sim, idx: nbr });
+                            w.push(MinSimNode { sim, idx: nbr });
+                            if w.len() > ef {
+                                w.pop();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        w.into_iter().map(|n| MaxSimNode { sim: n.sim, idx: n.idx }).collect()
+    }
+
+    fn select_neighbors(&self, candidates: &[MaxSimNode], max_conn: usize) -> Vec<usize> {
+        let mut sorted = candidates.to_vec();
+        sorted.sort_by(|a, b| b.sim.partial_cmp(&a.sim).unwrap_or(Ordering::Equal));
+        sorted.truncate(max_conn);
+        sorted.into_iter().map(|n| n.idx).collect()
+    }
+
+    fn prune_neighbors(&mut self, node_idx: usize, level: usize, max_conn: usize) {
+        let node_vec = Arc::clone(&self.nodes[node_idx].vector);
+        let nbrs = &self.nodes[node_idx].neighbors[level];
+        let mut scored: Vec<MaxSimNode> = nbrs
+            .iter()
+            .map(|&nbr| MaxSimNode {
+                sim: cosine(&node_vec, &self.nodes[nbr].vector),
+                idx: nbr,
+            })
+            .collect();
+        scored.sort_by(|a, b| b.sim.partial_cmp(&a.sim).unwrap_or(Ordering::Equal));
+        scored.truncate(max_conn);
+        self.nodes[node_idx].neighbors[level] = scored.into_iter().map(|d| d.idx).collect();
+    }
+
+    /// Search for the `k` approximate nearest neighbors to `query`.
+    /// Returns pairs of `(cosine_similarity, external_id)` sorted descending by similarity.
+    pub fn search(&self, query: &[f32], k: usize, ef_search: usize) -> Vec<(f64, usize)> {
+        if k == 0 || self.nodes.is_empty() {
+            return Vec::new();
+        }
+
+        if self.nodes.len() <= k.max(32) {
+            let mut scored: Vec<(f64, usize)> = self
+                .nodes
+                .iter()
+                .map(|n| (cosine(query, &n.vector), n.id))
+                .filter(|(s, _)| *s > 0.0)
+                .collect();
+            if scored.len() > k {
+                scored.select_nth_unstable_by(k - 1, |a, b| {
+                    b.0.partial_cmp(&a.0)
+                        .unwrap_or(Ordering::Equal)
+                        .then_with(|| a.1.cmp(&b.1))
+                });
+                scored.truncate(k);
+            }
+            scored.sort_by(|a, b| {
+                b.0.partial_cmp(&a.0)
+                    .unwrap_or(Ordering::Equal)
+                    .then_with(|| a.1.cmp(&b.1))
+            });
+            return scored;
+        }
+
+        let mut curr = match self.enter_point {
+            Some(ep) => ep,
+            None => return Vec::new(),
+        };
+
+        for level in (1..=self.max_level).rev() {
+            let mut curr_sim = cosine(query, &self.nodes[curr].vector);
+            loop {
+                let mut changed = false;
+                if level < self.nodes[curr].neighbors.len() {
+                    for &nbr in &self.nodes[curr].neighbors[level] {
+                        let sim = cosine(query, &self.nodes[nbr].vector);
+                        if sim > curr_sim {
+                            curr_sim = sim;
+                            curr = nbr;
+                            changed = true;
+                        }
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+        }
+
+        let ef = ef_search.max(k).max(16);
+        let candidates = self.search_layer(query, &[curr], ef, 0);
+
+        let mut results: Vec<(f64, usize)> = candidates
+            .into_iter()
+            .map(|n| (n.sim, self.nodes[n.idx].id))
+            .filter(|(s, _)| *s > 0.0)
+            .collect();
+
+        if results.len() > k {
+            results.select_nth_unstable_by(k - 1, |a, b| {
+                b.0.partial_cmp(&a.0)
+                    .unwrap_or(Ordering::Equal)
+                    .then_with(|| a.1.cmp(&b.1))
+            });
+            results.truncate(k);
+        }
+
+        results.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| a.1.cmp(&b.1))
+        });
+
+        results
+    }
+}
+
 /// Text blob used for embedding a row (title / body / snippet).
 pub(crate) fn row_embed_text(row: &crate::store::Row) -> std::borrow::Cow<'_, str> {
     let texts = ["title", "body", "snippet"].map(|k| crate::store::row_text(row, k));
@@ -503,6 +871,53 @@ mod tests {
         assert_eq!(batch.len(), texts.len());
         for (text, got) in texts.iter().zip(batch) {
             assert_eq!(got.as_ref(), embedder.embed(text).as_ref());
+        }
+    }
+
+    #[test]
+    fn test_hnsw_empty_and_single() {
+        let index = HnswIndex::default();
+        assert!(index.is_empty());
+        assert_eq!(index.len(), 0);
+        assert!(index.search(&[1.0, 0.0, 0.0], 5, 16).is_empty());
+
+        let mut index = HnswIndex::default();
+        let v: Arc<[f32]> = Arc::from([1.0, 0.0, 0.0]);
+        index.insert(42, Arc::clone(&v));
+        assert_eq!(index.len(), 1);
+        assert!(!index.is_empty());
+        let res = index.search(&[1.0, 0.0, 0.0], 5, 16);
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].1, 42);
+        assert!((res[0].0 - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_hnsw_recall_against_exhaustive() {
+        let dim = 32;
+        let embedder = HashingEmbedder::new("test/32", dim);
+        let items: Vec<(usize, Arc<[f32]>)> = (0..120)
+            .map(|i| (i, embedder.embed(&format!("document item {i} with some words and features"))))
+            .collect();
+
+        let index = HnswIndex::build(items.clone());
+        assert_eq!(index.len(), 120);
+
+        for query_id in [0, 15, 42, 99] {
+            let q_vec = embedder.embed(&format!("document item {query_id} with query tokens"));
+            let k = 5;
+            let hnsw_res = index.search(&q_vec, k, 32);
+
+            let mut exhaustive: Vec<(f64, usize)> = items
+                .iter()
+                .map(|(id, v)| (cosine(&q_vec, v), *id))
+                .filter(|(s, _)| *s > 0.0)
+                .collect();
+            exhaustive.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap().then_with(|| a.1.cmp(&b.1)));
+            exhaustive.truncate(k);
+
+            assert!(!hnsw_res.is_empty());
+            assert_eq!(hnsw_res[0].1, exhaustive[0].1);
         }
     }
 }

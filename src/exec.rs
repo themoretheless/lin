@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use rustc_hash::{FxHashMap, FxHasher};
+use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 use std::hash::{Hash, Hasher};
 
 // Thread-local regex compilation cache: (pattern, flags) -> Regex
@@ -2519,9 +2519,6 @@ impl Db {
         if bindings.get(name).is_some() {
             return Ok(None);
         }
-        if !self.store.fts.contains_key(name) {
-            return Ok(None);
-        }
 
         let mut mode: Option<SearchMode> = None;
         let mut query: Option<&str> = None;
@@ -2534,9 +2531,6 @@ impl Db {
             match step {
                 Step::Search { mode: m, query: qq } => {
                     if mode.is_some() || proj.is_some() || skip_n > 0 || saw_take {
-                        return Ok(None);
-                    }
-                    if !matches!(m, SearchMode::Lex | SearchMode::Hybrid) {
                         return Ok(None);
                     }
                     mode = Some(*m);
@@ -2568,6 +2562,10 @@ impl Db {
         let (Some(mode), Some(query)) = (mode, query) else {
             return Ok(None);
         };
+
+        if mode != SearchMode::Vec && !self.store.fts.contains_key(name) {
+            return Ok(None);
+        }
 
         let limit = match take_n {
             Some(Some(n)) => Some(n.max(0) as usize),
@@ -2607,7 +2605,7 @@ impl Db {
                 const RRF_K: f64 = 60.0;
                 let all = self.store.collection(collection);
                 let lex = self.search_fts_lex_indices(collection, query, None)?;
-                let vec = self.vector_search_indices(all, query)?;
+                let vec = self.vector_search_indices(all, query, None)?;
                 #[cfg(feature = "gpu")]
                 if let Some(gpu) = &self.gpu {
                     let lex_keys: Vec<usize> = lex.iter().map(|&(_, i)| i).collect();
@@ -2650,7 +2648,14 @@ impl Db {
                     .filter_map(|(_, i)| all.get(i).cloned())
                     .collect())
             }
-            SearchMode::Vec => self.search_rows(self.store.collection(collection), mode, query),
+            SearchMode::Vec => {
+                let all = self.store.collection(collection);
+                let ranked = self.vector_search_indices(all, query, rank_limit)?;
+                Ok(ranked
+                    .into_iter()
+                    .filter_map(|(_, i)| all.get(i).cloned())
+                    .collect())
+            }
         }
     }
 
@@ -2740,7 +2745,12 @@ impl Db {
         Ok(scored)
     }
 
-    fn vector_search_indices(&self, rows: &[Row], query: &str) -> Result<Vec<(f64, usize)>, Error> {
+    fn vector_search_indices(
+        &self,
+        rows: &[Row],
+        query: &str,
+        rank_limit: Option<usize>,
+    ) -> Result<Vec<(f64, usize)>, Error> {
         let Some(emb) = self.embedder.as_ref() else {
             return Ok(Vec::new());
         };
@@ -2791,13 +2801,34 @@ impl Db {
                 .map(|(score, _)| Cell::Float(*score))
                 .collect();
             let references: Vec<&Cell> = keys.iter().collect();
-            return Ok(gpu
+            let mut res: Vec<(f64, usize)> = gpu
                 .sort_indices(&references, true)?
                 .into_iter()
                 .map(|index| scored[index])
-                .collect());
+                .collect();
+            if let Some(limit) = rank_limit {
+                res.truncate(limit);
+            }
+            return Ok(res);
         }
-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        if let Some(limit) = rank_limit {
+            if limit == 0 {
+                return Ok(Vec::new());
+            }
+            if scored.len() > limit {
+                scored.select_nth_unstable_by(limit - 1, |a, b| {
+                    b.0.partial_cmp(&a.0)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.1.cmp(&b.1))
+                });
+                scored.truncate(limit);
+            }
+        }
+        scored.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.cmp(&b.1))
+        });
         Ok(scored)
     }
 
@@ -3663,16 +3694,60 @@ impl Db {
             .map(|fk| fk.to_field.as_str())
             .unwrap_or("id");
 
+        if left.is_empty() {
+            return Vec::new();
+        }
+
         // FK → unique id: hash-build right once, then probe (tight map, no by_id indirection).
         if to_field == "id" {
             let right = self.store.collection(right_col);
+            let store_has_all_ids = self
+                .store
+                .by_id
+                .get(right_col)
+                .map_or(false, |m| m.len() == right.len());
+            if store_has_all_ids {
+                let mut out = Vec::with_capacity(left.len());
+                for l in left {
+                    let right = l
+                        .get(on)
+                        .and_then(Cell::text)
+                        .and_then(|k| self.store.get_by_id(right_col, k));
+                    match right {
+                        Some(r) => out.push(merge_join_row(l, r, right_col)),
+                        None if left_join => out.push(l),
+                        None => {}
+                    }
+                }
+                return out;
+            }
+
+            // Asymmetric hash join: if left is smaller, only index keys needed by left
+            let needed: Option<FxHashSet<&str>> = if left.len() * 4 < right.len() {
+                Some(left.iter().filter_map(|l| l.get(on).and_then(Cell::text)).collect())
+            } else {
+                None
+            };
+
             let mut by_id: FxHashMap<&str, &Row> = FxHashMap::default();
-            by_id.reserve(right.len());
-            for r in right {
-                if let Some(id) = r.get("id").and_then(Cell::text) {
-                    by_id.insert(id, r);
+            if let Some(ref needed_set) = needed {
+                by_id.reserve(needed_set.len());
+                for r in right {
+                    if let Some(id) = r.get("id").and_then(Cell::text) {
+                        if needed_set.contains(id) {
+                            by_id.insert(id, r);
+                        }
+                    }
+                }
+            } else {
+                by_id.reserve(right.len());
+                for r in right {
+                    if let Some(id) = r.get("id").and_then(Cell::text) {
+                        by_id.insert(id, r);
+                    }
                 }
             }
+
             let mut out = Vec::with_capacity(left.len());
             for l in left {
                 let right = l
@@ -3690,11 +3765,21 @@ impl Db {
 
         // Non-id join key: hash probe without cloning the right collection.
         let right = self.store.collection(right_col);
+        let needed_keys: FxHashSet<String> = left
+            .iter()
+            .filter_map(|l| l.get(on).and_then(cell_key))
+            .collect();
+        if needed_keys.is_empty() {
+            return if left_join { left } else { Vec::new() };
+        }
+
         let mut idx: FxHashMap<String, Vec<&Row>> = FxHashMap::default();
-        idx.reserve(right.len());
+        idx.reserve(needed_keys.len());
         for r in right {
             if let Some(k) = cell_key(r.get(to_field).unwrap_or(&Cell::Null)) {
-                idx.entry(k).or_default().push(r);
+                if needed_keys.contains(&k) {
+                    idx.entry(k).or_default().push(r);
+                }
             }
         }
         let mut out = Vec::with_capacity(left.len());
@@ -4072,7 +4157,7 @@ impl Db {
                 Ok(scored.into_iter().map(|(_, r)| r).collect())
             }
             SearchMode::Vec => Ok(self
-                .vector_search_indices(rows, query)?
+                .vector_search_indices(rows, query, None)?
                 .into_iter()
                 .map(|(_, i)| rows[i].clone())
                 .collect()),
@@ -4743,7 +4828,7 @@ fn stmt_append_only(s: &Stmt) -> bool {
 
 fn merge_join_row(mut left: Row, right: &Row, right_col: &str) -> Row {
     for (k, v) in right {
-        left.insert(format!("{right_col}.{k}"), v.clone());
+        left.insert(format!("{right_col}.{k}"), v.clone_for_borrow());
     }
     left
 }

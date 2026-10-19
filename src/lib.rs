@@ -84,7 +84,7 @@ pub use ast::{
 };
 pub use batch::RecordBatch;
 pub use cursor::{ProjectedRow, QueryCursor};
-pub use embed::{Embedder, HashingEmbedder};
+pub use embed::{Embedder, HashingEmbedder, HnswIndex};
 #[cfg(feature = "embed-ollama")]
 pub use embed_ollama::OllamaEmbedder;
 #[cfg(feature = "embed-onnx")]

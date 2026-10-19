@@ -337,7 +337,7 @@ pub struct Store {
     /// collection → FTS postings (fields with catalog `fts`).
     pub(crate) fts: BTreeMap<String, crate::fts::FtsIndex>,
     /// collection → id → row index (O(1) Get / IndexSeek fetch).
-    by_id: BTreeMap<String, FxHashMap<Arc<str>, usize>>,
+    pub(crate) by_id: BTreeMap<String, FxHashMap<Arc<str>, usize>>,
     /// docs uri → row index.
     docs_by_uri: FxHashMap<Arc<str>, usize>,
     /// facts (s,p,o) → row index — O(1) append idempotency.
