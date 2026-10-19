@@ -3583,7 +3583,13 @@ impl Db {
             if eval_pred(pred, r, now) {
                 out.push(match names.as_deref() {
                     Some(fs) => project_fields(r, fs),
-                    None => r.clone(),
+                    None => {
+                        let mut row = crate::store::acquire_row();
+                        for (k, v) in r {
+                            row.insert(k.clone(), v.clone_for_borrow());
+                        }
+                        row
+                    }
                 });
             }
         }
@@ -3625,7 +3631,13 @@ impl Db {
             } else {
                 out.push(match names.as_deref() {
                     Some(fs) => project_fields(row, fs),
-                    None => row.clone(),
+                    None => {
+                        let mut r = crate::store::acquire_row();
+                        for (k, v) in row {
+                            r.insert(k.clone(), v.clone_for_borrow());
+                        }
+                        r
+                    }
                 });
             }
         }
