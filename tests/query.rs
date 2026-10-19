@@ -485,6 +485,36 @@ fn lazy_search_lex_cursor() {
 }
 
 #[test]
+fn lazy_search_vec_cursor() {
+    let mut db = Db::fixture();
+    let via_vec = Queryable::from("docs")
+        .search_vec("wal shipping")
+        .take(5)
+        .to_vec(&mut db)
+        .unwrap();
+    let mut cur = Queryable::from("docs")
+        .search_vec("wal shipping")
+        .take(5)
+        .cursor(&db)
+        .unwrap();
+    assert!(cur.is_lazy(), "search vec|take should be lazy");
+    let via_cur: Vec<_> = cur.by_ref().filter_map(Result::ok).collect();
+    assert_eq!(via_cur.len(), via_vec.len());
+
+    // Test next_projected on lazy vector cursor
+    let mut cur_proj = Queryable::from("docs")
+        .search_vec("wal shipping")
+        .select(["id", "title"])
+        .take(3)
+        .cursor(&db)
+        .unwrap();
+    assert!(cur_proj.is_lazy(), "search vec with projection should be lazy");
+    let p1 = cur_proj.next_projected().unwrap().unwrap();
+    assert_eq!(p1.fields(), &["id", "title"]);
+    assert!(p1.get("title").is_some());
+}
+
+#[test]
 fn fluent_search_vec() {
     let mut db = Db::fixture();
     let via_dsl = db

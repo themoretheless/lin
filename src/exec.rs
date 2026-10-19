@@ -2745,7 +2745,7 @@ impl Db {
         Ok(scored)
     }
 
-    fn vector_search_indices(
+    pub(crate) fn vector_search_indices(
         &self,
         rows: &[Row],
         query: &str,

@@ -6,9 +6,9 @@
 //!   (nested-loop: left scan/index + point lookup on the right via FK)
 //! - Hot SoA: `orders [| total >] | join users on user_id | { id, users.email, total }`
 //! - `collection | filter? | hop rel` (depth 1) `| project? | skip* | take?`
-//! - `collection | search lex|hybrid "…" | project? | skip* | take?` (FTS candidates)
+//! - `collection | search lex|hybrid|vec "…" | project? | skip* | take?` (FTS / vector candidates)
 //!
-//! graph / match / sort / union / search vec / hop depth>1 / multi-join → **buffered**.
+//! graph / match / sort / union / hop depth>1 / multi-join → **buffered**.
 
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
@@ -113,6 +113,18 @@ impl CursorDb<'_> {
         match self {
             CursorDb::Writer(db) => db.search_fts(collection, mode, query, rank_limit),
             CursorDb::Reader(db) => db.as_db().search_fts(collection, mode, query, rank_limit),
+        }
+    }
+
+    fn vector_search_indices(
+        &self,
+        rows: &[Row],
+        query: &str,
+        rank_limit: Option<usize>,
+    ) -> Result<Vec<(f64, usize)>, Error> {
+        match self {
+            CursorDb::Writer(db) => db.vector_search_indices(rows, query, rank_limit),
+            CursorDb::Reader(db) => db.as_db().vector_search_indices(rows, query, rank_limit),
         }
     }
 
@@ -696,9 +708,6 @@ fn try_lazy_search(db: &CursorDb<'_>, q: &Query) -> Result<Option<LazyCursor>, E
                 if mode.is_some() || project.is_some() || skip_n > 0 || saw_take {
                     return Ok(None);
                 }
-                if !matches!(m, SearchMode::Lex | SearchMode::Hybrid) {
-                    return Ok(None);
-                }
                 mode = Some(*m);
                 query = Some(qq.as_str());
             }
@@ -729,15 +738,35 @@ fn try_lazy_search(db: &CursorDb<'_>, q: &Query) -> Result<Option<LazyCursor>, E
         return Ok(None);
     };
     let (store, _) = db.store_catalog();
-    if !store.fts.contains_key(name) {
-        return Ok(None);
-    }
 
     let take_left = match take_n {
         Some(Some(n)) => Some(n.max(0) as usize),
         Some(None) => None,
         None => Some(50),
     };
+
+    if mode == SearchMode::Vec {
+        let col = store.collection(name);
+        let rank_limit = take_left.map(|n| n.saturating_add(skip_n));
+        let ranked = db.vector_search_indices(col, query, rank_limit)?;
+        let idxs: Vec<usize> = ranked.into_iter().map(|(_, i)| i).collect();
+        return Ok(Some(LazyCursor {
+            collection: name.clone(),
+            source: RowSource::Idxs(idxs),
+            pos: 0,
+            pred: None,
+            need_filter: false,
+            project: project.map(Into::into),
+            skip_left: skip_n,
+            take_left,
+            now: now_ms(),
+        }));
+    }
+
+    if !store.fts.contains_key(name) {
+        return Ok(None);
+    }
+
     let rank_limit = if mode == SearchMode::Lex {
         take_left.map(|n| n.saturating_add(skip_n))
     } else {
