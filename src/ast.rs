@@ -72,6 +72,23 @@ pub struct Query {
     pub ignore_filter: bool,
 }
 
+impl Query {
+    pub fn simplify_predicates(&mut self) {
+        for step in &mut self.steps {
+            if let Step::Filter(pred) = step {
+                let p = std::mem::replace(
+                    pred,
+                    Pred::IsNull {
+                        field: Field { parts: vec![] },
+                        negated: false,
+                    },
+                );
+                *pred = p.simplify();
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Source {
     Collection(String),
@@ -269,6 +286,66 @@ impl Pred {
             | Pred::Has { field, .. }
             | Pred::Contains { field, .. }
             | Pred::Regex { field, .. } => out.push(field),
+        }
+    }
+
+    pub fn simplify(self) -> Pred {
+        match self {
+            Pred::Not(inner) => {
+                let inner = inner.simplify();
+                match inner {
+                    Pred::Not(x) => *x,
+                    Pred::IsNull { field, negated } => Pred::IsNull {
+                        field,
+                        negated: !negated,
+                    },
+                    Pred::Cmp { field, op, value } => Pred::Cmp {
+                        field,
+                        op: match op {
+                            CmpOp::Eq => CmpOp::Ne,
+                            CmpOp::Ne => CmpOp::Eq,
+                            CmpOp::Gt => CmpOp::Le,
+                            CmpOp::Lt => CmpOp::Ge,
+                            CmpOp::Ge => CmpOp::Lt,
+                            CmpOp::Le => CmpOp::Gt,
+                        },
+                        value,
+                    },
+                    other => Pred::Not(Box::new(other)),
+                }
+            }
+            Pred::And(a, b) => {
+                let a = a.simplify();
+                let b = b.simplify();
+                Pred::And(Box::new(a), Box::new(b))
+            }
+            Pred::Or(a, b) => {
+                let a = a.simplify();
+                let b = b.simplify();
+                Pred::Or(Box::new(a), Box::new(b))
+            }
+            Pred::In { field, mut values } => {
+                if values.len() == 1 {
+                    Pred::Cmp {
+                        field,
+                        op: CmpOp::Eq,
+                        value: values.pop().unwrap(),
+                    }
+                } else {
+                    let mut seen = std::collections::HashSet::new();
+                    values.retain(|v| seen.insert(v.clone()));
+                    if values.len() == 1 {
+                        Pred::Cmp {
+                            field,
+                            op: CmpOp::Eq,
+                            value: values.pop().unwrap(),
+                        }
+                    } else {
+                        Pred::In { field, values }
+                    }
+                }
+            }
+            other => other,
         }
     }
 }

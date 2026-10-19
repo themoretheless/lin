@@ -478,11 +478,14 @@ pub fn plan(stmt: &Stmt, cat: &Catalog) -> Result<Plan, Error> {
 }
 
 fn plan_pipeline(q: &Query, cat: &Catalog, implicit_take: bool) -> Result<Node, Error> {
-    plan_query_inner(q, cat, implicit_take)
+    let mut q = q.clone();
+    q.simplify_predicates();
+    plan_query_inner(&q, cat, implicit_take)
 }
 
 fn plan_query(q: &Query, cat: &Catalog, explain: ExplainKind) -> Result<Plan, Error> {
-    let q = crate::catalog::with_catalog_filter(q, cat);
+    let mut q = crate::catalog::with_catalog_filter(q, cat);
+    q.to_mut().simplify_predicates();
     let cur = plan_query_inner(&q, cat, true)?;
     let root = reduce(cat, vec![Effect::Read], cur);
     Ok(Plan { root, explain })

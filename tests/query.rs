@@ -768,3 +768,44 @@ fn fluent_aggregations_and_extended_numeric_conversions() {
     assert!((f32::from_cell(&c_f32).unwrap() - 3.5f32).abs() < 1e-6);
 }
 
+#[test]
+fn test_predicate_simplification_and_scan_projection() {
+    let mut db = Db::fixture();
+
+    // 1. Direct point-get via simplified in-list: `id in ["d-wal"]` simplifies to `id == "d-wal"`
+    let rows = db.run(r#"docs | id in ["d-wal"] | { id, title } | take 1"#).unwrap().rows;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"].text(), Some("d-wal"));
+
+    // 2. Simplified inverted comparison: `not (total > 50.0)` -> `total <= 50.0`
+    let rows_not = db.run(r#"orders | not (total > 50.0) | { id } | take all"#).unwrap().rows;
+    let rows_le = db.run(r#"orders | total <= 50.0 | { id } | take all"#).unwrap().rows;
+    assert_eq!(rows_not, rows_le);
+
+    // 3. Fast scan limit + scan_projected: without filter, scanning projected columns with limit
+    let rows_proj = db.run(r#"docs | { id, title } | take 2"#).unwrap().rows;
+    assert_eq!(rows_proj.len(), 2);
+    assert!(rows_proj[0].get("id").is_some());
+    assert!(rows_proj[0].get("title").is_some());
+    assert!(rows_proj[0].get("body").is_none());
+
+    // 4. Pred::simplify unit tests
+    let p_double_not = lin::Pred::Not(Box::new(lin::Pred::Not(Box::new(lin::Pred::IsNull {
+        field: lin::Field::name("x"),
+        negated: false,
+    })))).simplify();
+    assert_eq!(p_double_not, lin::Pred::IsNull {
+        field: lin::Field::name("x"),
+        negated: false,
+    });
+
+    let p_not_null = lin::Pred::Not(Box::new(lin::Pred::IsNull {
+        field: lin::Field::name("x"),
+        negated: false,
+    })).simplify();
+    assert_eq!(p_not_null, lin::Pred::IsNull {
+        field: lin::Field::name("x"),
+        negated: true,
+    });
+}
+

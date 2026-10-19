@@ -2110,8 +2110,9 @@ impl Db {
         bindings: &BTreeMap<String, Vec<Row>>,
         allow_implicit_take: bool,
     ) -> Result<Vec<Row>, Error> {
-        let q = crate::catalog::with_catalog_filter(q, &self.catalog);
-        let q = &q;
+        let mut q = crate::catalog::with_catalog_filter(q, &self.catalog);
+        q.to_mut().simplify_predicates();
+        let q = &*q;
         let now = now_ms();
 
         let gpu_filter = self.uses_gpu_filter(q)
@@ -2155,20 +2156,25 @@ impl Db {
             Some(Step::Filter(p)) if !gpu_filter => Some(p),
             _ => None,
         };
+        let simple_scan = q.steps.iter().all(|s| {
+            matches!(
+                s,
+                Step::Filter(_) | Step::Project(_) | Step::Skip { .. } | Step::Take { .. }
+            )
+        });
         let project_fields_step = {
-            let simple = q.steps.iter().all(|s| {
-                matches!(
-                    s,
-                    Step::Filter(_) | Step::Project(_) | Step::Skip { .. } | Step::Take { .. }
-                )
-            });
-            let can_project_source = matches!(q.steps.first(), Some(Step::Filter(_)))
+            let can_project_source = (matches!(q.steps.first(), Some(Step::Filter(_)))
                 && matches!(q.steps.get(1), Some(Step::Project(_)))
                 && q.steps
                     .iter()
                     .skip(2)
-                    .all(|step| matches!(step, Step::Skip { .. } | Step::Take { .. }));
-            if simple && can_project_source {
+                    .all(|step| matches!(step, Step::Skip { .. } | Step::Take { .. })))
+                || (matches!(q.steps.first(), Some(Step::Project(_)))
+                    && q.steps
+                        .iter()
+                        .skip(1)
+                        .all(|step| matches!(step, Step::Skip { .. } | Step::Take { .. })));
+            if simple_scan && can_project_source {
                 q.steps.iter().find_map(|s| match s {
                     Step::Project(f) => Some(f.as_slice()),
                     _ => None,
@@ -2176,6 +2182,30 @@ impl Db {
             } else {
                 None
             }
+        };
+
+        let scan_limit: Option<usize> = if simple_scan && first_filter.is_none() {
+            let mut skip_n = 0usize;
+            let mut take_n: Option<usize> = None;
+            for s in &q.steps {
+                match s {
+                    Step::Skip { n } => skip_n = skip_n.saturating_add((*n).max(0) as usize),
+                    Step::Take { n: Some(n) } => {
+                        take_n = Some((*n).max(0) as usize);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(t) = take_n {
+                Some(skip_n.saturating_add(t))
+            } else if allow_implicit_take {
+                Some(skip_n.saturating_add(50))
+            } else {
+                None
+            }
+        } else {
+            None
         };
 
         let mut rows = match &q.source {
@@ -2196,17 +2226,20 @@ impl Db {
                     self.fetch_idxs_filtered(name, &idxs, pred, now, project_fields_step, covered)
                 } else if let Some(pred) = first_filter {
                     self.filter_scan(name, pred, now, project_fields_step)
+                } else if let Some(fields) = project_fields_step {
+                    self.scan_projected(name, fields, scan_limit)
                 } else {
-                    self.scan(name)
+                    self.scan(name, scan_limit)
                 }
             }
         };
 
-        // If IndexSeek / filter_scan already applied the first filter (+ optional project),
+        // If IndexSeek / filter_scan / scan_projected already applied the first filter (+ optional project),
         // skip only those steps — later filters/projects still run.
         let mut skip_first_filter = first_filter.is_some()
             && matches!(&q.source, Source::Collection(n) if bindings.get(n).is_none());
-        let mut skip_first_project = skip_first_filter && project_fields_step.is_some();
+        let mut skip_first_project = project_fields_step.is_some()
+            && matches!(&q.source, Source::Collection(n) if bindings.get(n).is_none());
 
         for (step_idx, step) in q.steps.iter().enumerate() {
             match step {
@@ -3568,11 +3601,41 @@ impl Db {
         out
     }
 
-    fn scan(&self, name: &str) -> Vec<Row> {
+    fn scan_projected(&self, name: &str, fields: &[Field], limit: Option<usize>) -> Vec<Row> {
         if name == "catalog" {
-            return self.scan_catalog();
+            let mut r = self.scan_catalog();
+            r = project(&r, fields);
+            if let Some(lim) = limit {
+                r.truncate(lim);
+            }
+            return r;
         }
-        self.store.collection(name).to_vec()
+        let names = field_names(fields);
+        let col = self.store.collection(name);
+        let count = match limit {
+            Some(lim) => lim.min(col.len()),
+            None => col.len(),
+        };
+        let mut out = Vec::with_capacity(count);
+        for r in col.iter().take(count) {
+            out.push(project_fields(r, &names));
+        }
+        out
+    }
+
+    fn scan(&self, name: &str, limit: Option<usize>) -> Vec<Row> {
+        if name == "catalog" {
+            let mut r = self.scan_catalog();
+            if let Some(lim) = limit {
+                r.truncate(lim);
+            }
+            return r;
+        }
+        let col = self.store.collection(name);
+        match limit {
+            Some(lim) => col.iter().take(lim).cloned().collect(),
+            None => col.to_vec(),
+        }
     }
 
     fn scan_catalog(&self) -> Vec<Row> {
@@ -5224,7 +5287,7 @@ pub(crate) fn eval_pred(pred: &Pred, row: &Row, now: i64) -> bool {
             let left = field_cell(row, field);
             values
                 .iter()
-                .any(|v| cmp_cell(left, v, CmpOp::Eq, now))
+                .any(|v| cell_eq_val(left, v, now))
         }
         Pred::Cmp { field, op, value } => cmp_cell(field_cell(row, field), value, *op, now),
         Pred::Has { field, ci, needle } => field_cell(row, field)
@@ -5276,16 +5339,47 @@ fn field_cell<'a>(row: &'a Row, field: &Field) -> &'a Cell {
     row.get(&want).unwrap_or(&NULL)
 }
 
+#[inline]
+fn cell_eq_val(left: &Cell, value: &Value, now: i64) -> bool {
+    match (left, value) {
+        (Cell::Text(x), Value::String(y)) => x.as_ref() == y.as_ref(),
+        (Cell::Text(x), Value::Name(y)) => x.as_ref() == y.as_str(),
+        (Cell::Bool(x), Value::Bool(y)) => *x == *y,
+        (Cell::Int(x), Value::Int(y)) => *x == *y,
+        (Cell::Float(x), Value::Float(y)) => *x == *y,
+        (Cell::Int(x), Value::Float(y)) => *x as f64 == *y,
+        (Cell::Float(x), Value::Int(y)) => *x == *y as f64,
+        (Cell::Time(x), Value::Timestamp(y)) => *x == *y,
+        (Cell::Time(x), Value::Now) => *x == now,
+        (Cell::Time(x), Value::NowMinus(d)) => *x == now - d.as_millis(),
+        (Cell::Int(x), Value::Duration(d)) => *x == d.as_millis(),
+        (Cell::Float(x), Value::Duration(d)) => *x == d.as_millis() as f64,
+        _ => false,
+    }
+}
+
+#[inline]
+fn value_as_f64(v: &Value, now: i64) -> Option<f64> {
+    match v {
+        Value::Int(n) => Some(*n as f64),
+        Value::Float(n) => Some(*n),
+        Value::Timestamp(millis) => Some(*millis as f64),
+        Value::Now => Some(now as f64),
+        Value::NowMinus(d) => Some((now - d.as_millis()) as f64),
+        Value::Duration(d) => Some(d.as_millis() as f64),
+        _ => None,
+    }
+}
+
 fn cmp_cell(left: &Cell, value: &Value, op: CmpOp, now: i64) -> bool {
-    let right = value_cell(value, now);
     match op {
-        CmpOp::Eq => cells_eq(left, &right),
-        CmpOp::Ne => !cells_eq(left, &right),
+        CmpOp::Eq => cell_eq_val(left, value, now),
+        CmpOp::Ne => !cell_eq_val(left, value, now),
         CmpOp::Gt | CmpOp::Lt | CmpOp::Ge | CmpOp::Le => {
             let Some(l) = left.as_f64() else {
                 return false;
             };
-            let Some(r) = right.as_f64() else {
+            let Some(r) = value_as_f64(value, now) else {
                 return false;
             };
             match op {
@@ -5296,21 +5390,6 @@ fn cmp_cell(left: &Cell, value: &Value, op: CmpOp, now: i64) -> bool {
                 _ => false,
             }
         }
-    }
-}
-
-fn cells_eq(a: &Cell, b: &Cell) -> bool {
-    match (a, b) {
-        (Cell::Null, Cell::Null) => true,
-        (Cell::Text(x), Cell::Text(y)) => x == y,
-        (Cell::Bool(x), Cell::Bool(y)) => x == y,
-        (Cell::Int(x), Cell::Int(y)) => x == y,
-        (Cell::Float(x), Cell::Float(y)) => x == y,
-        (Cell::Time(x), Cell::Time(y)) => x == y,
-        (Cell::Vec(x), Cell::Vec(y)) => x.as_ref() == y.as_ref(),
-        (Cell::Int(x), Cell::Float(y)) => *x as f64 == *y,
-        (Cell::Float(x), Cell::Int(y)) => *x == *y as f64,
-        _ => false,
     }
 }
 
