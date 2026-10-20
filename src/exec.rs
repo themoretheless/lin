@@ -6136,20 +6136,22 @@ pub(crate) fn eval_window(
 
 fn agg_count(rows: &[Row], by: &Field) -> Vec<Row> {
     let k = by.as_str();
-    let mut map: BTreeMap<String, (Cell, i64)> = BTreeMap::new();
-    let mut key_buf = String::with_capacity(32);
+    let mut map: FxHashMap<Cell, i64> = FxHashMap::default();
     for r in rows {
-        let cell_opt = r.get(&k);
-        key_buf.clear();
-        group_cell_key_into(cell_opt, &mut key_buf);
-        if let Some(entry) = map.get_mut(&key_buf) {
-            entry.1 += 1;
-        } else {
-            let cell = cell_opt.map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
-            map.insert(key_buf.clone(), (cell, 1));
-        }
+        let cell = r.get(&k).map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
+        *map.entry(cell).or_insert(0) += 1;
     }
-    count_cell_map_to_rows(&k, map)
+    let mut entries: Vec<(Cell, i64)> = map.into_iter().collect();
+    entries.sort_unstable_by(|(a, _), (b, _)| cmp_sort(a, b));
+    entries
+        .into_iter()
+        .map(|(cell, n)| {
+            let mut row = crate::store::acquire_row();
+            row.insert(k.to_string(), cell);
+            row.insert("hits".into(), Cell::Int(n));
+            row
+        })
+        .collect()
 }
 
 fn count_cell_map_to_rows(by: &str, map: BTreeMap<String, (Cell, i64)>) -> Vec<Row> {
@@ -6216,21 +6218,16 @@ fn agg_sum(rows: &[Row], field: &Field, by: Option<&Field>) -> Vec<Row> {
         return vec![row];
     };
     let bk = by.as_str();
-    let mut map: BTreeMap<String, (Cell, f64)> = BTreeMap::new();
-    let mut key_buf = String::with_capacity(32);
+    let mut map: FxHashMap<Cell, f64> = FxHashMap::default();
     for r in rows {
-        let cell_opt = r.get(&bk);
+        let cell = r.get(&bk).map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
         let n = r.get(&fk).and_then(Cell::as_f64).unwrap_or(0.0);
-        key_buf.clear();
-        group_cell_key_into(cell_opt, &mut key_buf);
-        if let Some(entry) = map.get_mut(&key_buf) {
-            entry.1 += n;
-        } else {
-            let cell = cell_opt.map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
-            map.insert(key_buf.clone(), (cell, n));
-        }
+        *map.entry(cell).or_insert(0.0) += n;
     }
-    map.into_values()
+    let mut entries: Vec<(Cell, f64)> = map.into_iter().collect();
+    entries.sort_unstable_by(|(a, _), (b, _)| cmp_sort(a, b));
+    entries
+        .into_iter()
         .map(|(cell, n)| {
             let mut row = crate::store::acquire_row();
             row.insert(bk.clone(), cell);
@@ -6263,33 +6260,28 @@ fn agg_min(rows: &[Row], field: &Field, by: Option<&Field>) -> Vec<Row> {
         return vec![row];
     };
     let bk = by.as_str();
-    let mut map: BTreeMap<String, (Cell, Option<Cell>)> = BTreeMap::new();
-    let mut key_buf = String::with_capacity(32);
+    let mut map: FxHashMap<Cell, Option<Cell>> = FxHashMap::default();
     for r in rows {
-        let cell_opt = r.get(&bk);
-        key_buf.clear();
-        group_cell_key_into(cell_opt, &mut key_buf);
+        let cell = r.get(&bk).map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
         let f_val = r.get(&fk).filter(|c| !matches!(c, Cell::Null));
-        if let Some(entry) = map.get_mut(&key_buf) {
-            if let Some(c) = f_val {
-                entry.1 = Some(match entry.1.take() {
-                    None => c.clone_for_borrow(),
-                    Some(prev) => {
-                        if cmp_sort(c, &prev).is_lt() {
-                            c.clone_for_borrow()
-                        } else {
-                            prev
-                        }
+        let entry = map.entry(cell).or_insert(None);
+        if let Some(c) = f_val {
+            *entry = Some(match entry.take() {
+                None => c.clone_for_borrow(),
+                Some(prev) => {
+                    if cmp_sort(c, &prev).is_lt() {
+                        c.clone_for_borrow()
+                    } else {
+                        prev
                     }
-                });
-            }
-        } else {
-            let gcell = cell_opt.map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
-            let val = f_val.map(Cell::clone_for_borrow);
-            map.insert(key_buf.clone(), (gcell, val));
+                }
+            });
         }
     }
-    map.into_values()
+    let mut entries: Vec<(Cell, Option<Cell>)> = map.into_iter().collect();
+    entries.sort_unstable_by(|(a, _), (b, _)| cmp_sort(a, b));
+    entries
+        .into_iter()
         .map(|(gcell, val)| {
             let mut row = crate::store::acquire_row();
             row.insert(bk.clone(), gcell);
@@ -6322,33 +6314,28 @@ fn agg_max(rows: &[Row], field: &Field, by: Option<&Field>) -> Vec<Row> {
         return vec![row];
     };
     let bk = by.as_str();
-    let mut map: BTreeMap<String, (Cell, Option<Cell>)> = BTreeMap::new();
-    let mut key_buf = String::with_capacity(32);
+    let mut map: FxHashMap<Cell, Option<Cell>> = FxHashMap::default();
     for r in rows {
-        let cell_opt = r.get(&bk);
-        key_buf.clear();
-        group_cell_key_into(cell_opt, &mut key_buf);
+        let cell = r.get(&bk).map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
         let f_val = r.get(&fk).filter(|c| !matches!(c, Cell::Null));
-        if let Some(entry) = map.get_mut(&key_buf) {
-            if let Some(c) = f_val {
-                entry.1 = Some(match entry.1.take() {
-                    None => c.clone_for_borrow(),
-                    Some(prev) => {
-                        if cmp_sort(c, &prev).is_gt() {
-                            c.clone_for_borrow()
-                        } else {
-                            prev
-                        }
+        let entry = map.entry(cell).or_insert(None);
+        if let Some(c) = f_val {
+            *entry = Some(match entry.take() {
+                None => c.clone_for_borrow(),
+                Some(prev) => {
+                    if cmp_sort(c, &prev).is_gt() {
+                        c.clone_for_borrow()
+                    } else {
+                        prev
                     }
-                });
-            }
-        } else {
-            let gcell = cell_opt.map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
-            let val = f_val.map(Cell::clone_for_borrow);
-            map.insert(key_buf.clone(), (gcell, val));
+                }
+            });
         }
     }
-    map.into_values()
+    let mut entries: Vec<(Cell, Option<Cell>)> = map.into_iter().collect();
+    entries.sort_unstable_by(|(a, _), (b, _)| cmp_sort(a, b));
+    entries
+        .into_iter()
         .map(|(gcell, val)| {
             let mut row = crate::store::acquire_row();
             row.insert(bk.clone(), gcell);
@@ -6375,26 +6362,21 @@ fn agg_avg(rows: &[Row], field: &Field, by: Option<&Field>) -> Vec<Row> {
         return vec![row];
     };
     let bk = by.as_str();
-    let mut map: BTreeMap<String, (Cell, f64, usize)> = BTreeMap::new();
-    let mut key_buf = String::with_capacity(32);
+    let mut map: FxHashMap<Cell, (f64, usize)> = FxHashMap::default();
     for r in rows {
-        let cell_opt = r.get(&bk);
+        let cell = r.get(&bk).map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
         let v_opt = r.get(&fk).and_then(Cell::as_f64);
-        key_buf.clear();
-        group_cell_key_into(cell_opt, &mut key_buf);
-        if let Some(entry) = map.get_mut(&key_buf) {
-            if let Some(v) = v_opt {
-                entry.1 += v;
-                entry.2 += 1;
-            }
-        } else {
-            let gcell = cell_opt.map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
-            let (sum, count) = if let Some(v) = v_opt { (v, 1) } else { (0.0, 0) };
-            map.insert(key_buf.clone(), (gcell, sum, count));
+        let entry = map.entry(cell).or_insert((0.0, 0));
+        if let Some(v) = v_opt {
+            entry.0 += v;
+            entry.1 += 1;
         }
     }
-    map.into_values()
-        .map(|(gcell, sum, count)| {
+    let mut entries: Vec<(Cell, (f64, usize))> = map.into_iter().collect();
+    entries.sort_unstable_by(|(a, _), (b, _)| cmp_sort(a, b));
+    entries
+        .into_iter()
+        .map(|(gcell, (sum, count))| {
             let avg = if count == 0 { 0.0 } else { sum / (count as f64) };
             let mut row = crate::store::acquire_row();
             row.insert(bk.clone(), gcell);
