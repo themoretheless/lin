@@ -200,15 +200,24 @@ impl FtsIndex {
         }
     }
 
-    /// Positions where `tok` currently matches.
-    fn matches(&self, tok: &str) -> Option<Vec<usize>> {
+    /// Positions where `tok` currently matches, borrowed when no pending edits exist.
+    pub fn matches_cow<'a>(&'a self, tok: &str) -> Option<std::borrow::Cow<'a, [usize]>> {
         let dels = self.dels.get(tok).map(Vec::as_slice).unwrap_or(&[]);
         let adds = self.adds.get(tok).map(Vec::as_slice).unwrap_or(&[]);
         if dels.is_empty() && adds.is_empty() {
-            return self.postings.get(tok).cloned();
+            return self
+                .postings
+                .get(tok)
+                .map(|list| std::borrow::Cow::Borrowed(list.as_slice()));
         }
         let base = self.postings.get(tok).map(Vec::as_slice).unwrap_or(&[]);
-        Some(merge_edits(base, dels, adds))
+        Some(std::borrow::Cow::Owned(merge_edits(base, dels, adds)))
+    }
+
+    /// Positions where `tok` currently matches.
+    #[allow(dead_code)]
+    pub fn matches(&self, tok: &str) -> Option<Vec<usize>> {
+        self.matches_cow(tok).map(std::borrow::Cow::into_owned)
     }
 
     /// Re-point a row's postings from `from` to `to`. The token set is the row's
@@ -262,13 +271,13 @@ impl FtsIndex {
 
     /// Union of posting lists for query tokens (any-token match, then residual score).
     pub fn candidate_idxs(&self, query: &str) -> Vec<usize> {
-        let mut candidates = Vec::new();
         let mut scratch = String::with_capacity(query.len());
         let lowered = lowercased(query, &mut scratch);
+        let mut terms = Vec::new();
+
         for tok in lowered.split_whitespace() {
             if let Some(prefix) = tok.strip_suffix('*') {
                 if !prefix.is_empty() {
-                    let mut prefix_candidates = Vec::new();
                     let mut matched_terms: Vec<&str> = Vec::new();
                     for k in self.postings.keys().chain(self.adds.keys()) {
                         if k.starts_with(prefix) {
@@ -278,31 +287,46 @@ impl FtsIndex {
                     matched_terms.sort_unstable();
                     matched_terms.dedup();
                     for term in matched_terms {
-                        if let Some(list) = self.matches(term) {
-                            prefix_candidates = if prefix_candidates.is_empty() {
-                                list
-                            } else {
-                                union_sorted(&prefix_candidates, &list)
-                            };
-                        }
-                    }
-                    if !prefix_candidates.is_empty() {
-                        candidates = if candidates.is_empty() {
-                            prefix_candidates
-                        } else {
-                            union_sorted(&candidates, &prefix_candidates)
-                        };
+                        terms.push(term);
                     }
                 }
-            } else if let Some(list) = self.matches(tok) {
-                candidates = if candidates.is_empty() {
-                    list
-                } else {
-                    union_sorted(&candidates, &list)
-                };
+            } else {
+                terms.push(tok);
             }
         }
-        candidates
+
+        if terms.is_empty() {
+            return Vec::new();
+        }
+
+        terms.sort_unstable();
+        terms.dedup();
+
+        let mut matched_lists: Vec<std::borrow::Cow<'_, [usize]>> = Vec::with_capacity(terms.len());
+        for term in terms {
+            if let Some(list) = self.matches_cow(term) {
+                if !list.is_empty() {
+                    matched_lists.push(list);
+                }
+            }
+        }
+
+        if matched_lists.is_empty() {
+            return Vec::new();
+        }
+        if matched_lists.len() == 1 {
+            return matched_lists.pop().unwrap().into_owned();
+        }
+
+        let mut buf_a = matched_lists[0].to_vec();
+        let mut buf_b = Vec::new();
+
+        for next_list in &matched_lists[1..] {
+            union_sorted_into(&buf_a, next_list.as_ref(), &mut buf_b);
+            std::mem::swap(&mut buf_a, &mut buf_b);
+        }
+
+        buf_a
     }
 
     pub fn encode(&self, generation: u64, nrows: u64) -> Vec<u8> {
@@ -480,15 +504,10 @@ fn subtract_sorted(a: &[usize], b: &[usize]) -> Vec<usize> {
     out
 }
 
-/// `a ∪ b` for two sorted lists, collapsing any overlap between them.
-fn union_sorted(a: &[usize], b: &[usize]) -> Vec<usize> {
-    if b.is_empty() {
-        return a.to_vec();
-    }
-    if a.is_empty() {
-        return b.to_vec();
-    }
-    let mut out = Vec::with_capacity(a.len() + b.len());
+/// `a ∪ b` for two sorted lists into `out`, collapsing any overlap between them.
+fn union_sorted_into(a: &[usize], b: &[usize], out: &mut Vec<usize>) {
+    out.clear();
+    out.reserve(a.len() + b.len());
     let (mut i, mut j) = (0, 0);
     while i < a.len() && j < b.len() {
         let v = if a[i] <= b[j] {
@@ -512,6 +531,19 @@ fn union_sorted(a: &[usize], b: &[usize]) -> Vec<usize> {
             out.push(v);
         }
     }
+}
+
+/// `a ∪ b` for two sorted lists, collapsing any overlap between them.
+#[allow(dead_code)]
+fn union_sorted(a: &[usize], b: &[usize]) -> Vec<usize> {
+    if b.is_empty() {
+        return a.to_vec();
+    }
+    if a.is_empty() {
+        return b.to_vec();
+    }
+    let mut out = Vec::with_capacity(a.len() + b.len());
+    union_sorted_into(a, b, &mut out);
     out
 }
 
@@ -951,6 +983,30 @@ mod tests {
 #[cfg(test)]
 mod pending_order_tests {
     use super::*;
+    use crate::store::Cell;
+
+    #[test]
+    fn fts_matches_cow_and_ping_pong_union() {
+        let rows = vec![
+            Row::from([("text".into(), Cell::from_text("apple banana cherry"))]),
+            Row::from([("text".into(), Cell::from_text("banana cherry date"))]),
+            Row::from([("text".into(), Cell::from_text("cherry date elderberry"))]),
+        ];
+        let index = FtsIndex::build(&rows, &["text".to_string()]);
+
+        // matches_cow returns Borrowed when no pending edits exist
+        let cow = index.matches_cow("banana").unwrap();
+        assert!(matches!(cow, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(cow.as_ref(), &[0, 1]);
+
+        // Multi-term candidate union
+        let candidates = index.candidate_idxs("apple date");
+        assert_eq!(candidates, &[0, 1, 2]);
+
+        // Prefix candidate union
+        let prefix_cand = index.candidate_idxs("elder*");
+        assert_eq!(prefix_cand, &[2]);
+    }
     #[test]
     fn ascii_lowering_and_unicode_fallback_match_original_character_mapping() {
         let ascii = (0..128u8).map(char::from).collect::<String>();

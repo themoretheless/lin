@@ -5,9 +5,7 @@ use std::sync::Arc;
 use rustc_hash::FxHashMap;
 #[cfg(feature = "parallel")]
 use rustc_hash::FxHasher;
-use std::hash::Hash;
-#[cfg(feature = "parallel")]
-use std::hash::Hasher;
+use std::hash::{Hash, Hasher};
 
 use crate::ast::{CmpOp, Pred, Value};
 use crate::catalog::{Catalog, IndexDef};
@@ -112,7 +110,7 @@ impl MultiBloomFilter {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone)]
 pub enum IndexPart {
     Min,
     Null,
@@ -123,7 +121,83 @@ pub enum IndexPart {
     Num(u64, i128),
     Time(i64),
     Text(Arc<str>),
+    /// Small String Optimization: inline storage for strings <= 22 bytes.
+    SmallText(crate::store::InlineStr),
     Max,
+}
+
+#[inline]
+fn part_rank(p: &IndexPart) -> u8 {
+    match p {
+        IndexPart::Min => 0,
+        IndexPart::Null => 1,
+        IndexPart::Bool(_) => 2,
+        IndexPart::Int(_) => 3,
+        IndexPart::Num(_, _) => 4,
+        IndexPart::Time(_) => 5,
+        IndexPart::Text(_) | IndexPart::SmallText(_) => 6,
+        IndexPart::Max => 7,
+    }
+}
+
+impl Ord for IndexPart {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        let r1 = part_rank(self);
+        let r2 = part_rank(other);
+        if r1 != r2 {
+            return r1.cmp(&r2);
+        }
+        match (self, other) {
+            (IndexPart::Min, IndexPart::Min) => std::cmp::Ordering::Equal,
+            (IndexPart::Null, IndexPart::Null) => std::cmp::Ordering::Equal,
+            (IndexPart::Bool(a), IndexPart::Bool(b)) => a.cmp(b),
+            (IndexPart::Int(a), IndexPart::Int(b)) => a.cmp(b),
+            (IndexPart::Num(b1, t1), IndexPart::Num(b2, t2)) => {
+                b1.cmp(b2).then_with(|| t1.cmp(t2))
+            }
+            (IndexPart::Time(a), IndexPart::Time(b)) => a.cmp(b),
+            (IndexPart::Text(a), IndexPart::Text(b)) => a.cmp(b),
+            (IndexPart::SmallText(a), IndexPart::SmallText(b)) => a.cmp(b),
+            (IndexPart::Text(a), IndexPart::SmallText(b)) => a.as_ref().cmp(b.as_str()),
+            (IndexPart::SmallText(a), IndexPart::Text(b)) => a.as_str().cmp(b.as_ref()),
+            (IndexPart::Max, IndexPart::Max) => std::cmp::Ordering::Equal,
+            _ => std::cmp::Ordering::Equal,
+        }
+    }
+}
+
+impl PartialOrd for IndexPart {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for IndexPart {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for IndexPart {}
+
+impl Hash for IndexPart {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        part_rank(self).hash(state);
+        match self {
+            IndexPart::Min | IndexPart::Null | IndexPart::Max => {}
+            IndexPart::Bool(b) => b.hash(state),
+            IndexPart::Int(n) => n.hash(state),
+            IndexPart::Num(b, t) => {
+                b.hash(state);
+                t.hash(state);
+            }
+            IndexPart::Time(t) => t.hash(state),
+            IndexPart::Text(s) => s.as_ref().hash(state),
+            IndexPart::SmallText(s) => s.as_str().hash(state),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -730,7 +804,7 @@ fn cell_part(c: &Cell) -> IndexPart {
         Cell::Int(n) => numeric_part(*n as f64, Some(*n)),
         Cell::Time(n) => IndexPart::Time(*n),
         Cell::Text(s) => IndexPart::Text(Arc::clone(s)),
-        Cell::SmallText(s) => IndexPart::Text(Arc::from(s.as_str())),
+        Cell::SmallText(s) => IndexPart::SmallText(*s),
         Cell::Float(n) => numeric_part(*n, None),
         Cell::Vec(_) => IndexPart::Null,
     }
@@ -738,8 +812,20 @@ fn cell_part(c: &Cell) -> IndexPart {
 
 fn value_part(v: &Value, now: i64) -> IndexPart {
     match v {
-        Value::String(s) => IndexPart::Text(Arc::clone(s)),
-        Value::Name(s) => IndexPart::Text(Arc::from(s.as_str())),
+        Value::String(s) => {
+            if let Some(inline) = crate::store::InlineStr::try_new(s.as_ref()) {
+                IndexPart::SmallText(inline)
+            } else {
+                IndexPart::Text(Arc::clone(s))
+            }
+        }
+        Value::Name(s) => {
+            if let Some(inline) = crate::store::InlineStr::try_new(s.as_str()) {
+                IndexPart::SmallText(inline)
+            } else {
+                IndexPart::Text(Arc::from(s.as_str()))
+            }
+        }
         Value::Int(n) => numeric_part(*n as f64, Some(*n)),
         Value::Float(n) => numeric_part(*n, None),
         Value::Bool(b) => IndexPart::Bool(*b),
@@ -1122,6 +1208,47 @@ fn find_range<'a>(atoms: &[&'a Pred], field: &str) -> Option<(CmpOp, &'a Value)>
 #[cfg(test)]
 mod storage_tests {
     use super::*;
+
+    #[test]
+    fn index_part_small_text_semantics_and_zero_alloc() {
+        use std::collections::hash_map::DefaultHasher;
+
+        // Size check: IndexPart doesn't blow up
+        assert_eq!(std::mem::size_of::<IndexPart>(), 32);
+
+        let inline = crate::store::InlineStr::try_new("user_101").unwrap();
+        let p_small = IndexPart::SmallText(inline);
+        let p_text = IndexPart::Text(Arc::from("user_101"));
+
+        // Equality between SmallText and Text
+        assert_eq!(p_small, p_text);
+        assert_eq!(p_text, p_small);
+
+        // Hashing consistency
+        let mut h1 = DefaultHasher::new();
+        p_small.hash(&mut h1);
+        let mut h2 = DefaultHasher::new();
+        p_text.hash(&mut h2);
+        assert_eq!(h1.finish(), h2.finish());
+
+        // Lexicographical ordering
+        let p_smaller = IndexPart::SmallText(crate::store::InlineStr::try_new("user_099").unwrap());
+        let p_larger = IndexPart::Text(Arc::from("user_200"));
+        assert!(p_smaller < p_small);
+        assert!(p_smaller < p_text);
+        assert!(p_small < p_larger);
+        assert!(p_text < p_larger);
+
+        // Cell::SmallText lowers to IndexPart::SmallText
+        let cell_small = Cell::SmallText(inline);
+        let part_from_cell = cell_part(&cell_small);
+        assert!(matches!(part_from_cell, IndexPart::SmallText(_)));
+
+        // Value::String lowers to IndexPart::SmallText when short
+        let val_short = Value::String(Arc::from("short_key"));
+        let part_from_val = value_part(&val_short, 0);
+        assert!(matches!(part_from_val, IndexPart::SmallText(_)));
+    }
 
     #[test]
     fn unchanged_and_conflicting_keys_preserve_index_state() {
