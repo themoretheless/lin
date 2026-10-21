@@ -1099,9 +1099,10 @@ fn append_sparse_rows_serial(rows: &[Option<Vec<f32>>], buf: &mut Vec<u8>) -> Re
             .ok()
             .and_then(|n| n.checked_add(1))
             .ok_or_else(|| io_err("sparse vector dimension overflow"))?;
-        let count = emb.iter().filter(|value| value.to_bits() != 0).count() as u32;
         buf.extend_from_slice(&dim.to_le_bytes());
-        buf.extend_from_slice(&count.to_le_bytes());
+        let count_offset = buf.len();
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        let mut count = 0u32;
         for (block, values) in emb.chunks(8).enumerate() {
             // Bitwise zero preserves negative zero and NaN payloads.
             // Skip empty blocks without branching for each element.
@@ -1113,13 +1114,18 @@ fn append_sparse_rows_serial(rows: &[Option<Vec<f32>>], buf: &mut Vec<u8>) -> Re
                 continue;
             }
             for (offset, value) in values.iter().enumerate() {
-                if value.to_bits() != 0 {
-                    let index = block * 8 + offset;
-                    buf.extend_from_slice(&(index as u32).to_le_bytes());
-                    buf.extend_from_slice(&value.to_bits().to_le_bytes());
+                let bits = value.to_bits();
+                if bits != 0 {
+                    let index = (block * 8 + offset) as u32;
+                    let mut entry = [0u8; 8];
+                    entry[..4].copy_from_slice(&index.to_le_bytes());
+                    entry[4..].copy_from_slice(&bits.to_le_bytes());
+                    buf.extend_from_slice(&entry);
+                    count += 1;
                 }
             }
         }
+        buf[count_offset..count_offset + 4].copy_from_slice(&count.to_le_bytes());
     }
     Ok(())
 }
@@ -1190,8 +1196,21 @@ fn append_insert_cols_v2(
             log_bytes,
         );
     }
+    let mut est_per_row = 32usize;
+    for col in cols {
+        match col {
+            ColData::Vec(v) => {
+                let dim = v.first().and_then(|opt| opt.as_ref()).map_or(0, |vec| vec.len());
+                est_per_row = est_per_row.saturating_add(8 + dim * 4);
+            }
+            ColData::Text(_) => est_per_row = est_per_row.saturating_add(16),
+            ColData::Int(_) | ColData::Float(_) | ColData::Time(_) => est_per_row = est_per_row.saturating_add(8),
+            ColData::Bool(_) => est_per_row = est_per_row.saturating_add(1),
+            ColData::Null => {}
+        }
+    }
     buf.clear();
-    buf.reserve(64 + fields.len() * 16 + (n as usize) * 32);
+    buf.reserve(64 + fields.len() * 16 + (n as usize) * est_per_row);
     buf.push(V2_INSERT_COLS);
     buf.extend_from_slice(&rec_gen.to_le_bytes());
     buf.extend_from_slice(&next_id.to_le_bytes());
@@ -1265,11 +1284,7 @@ fn append_insert_cols_v2(
                     append_sparse_rows_parallel(v, buf)?;
                     continue;
                 }
-                for row in v {
-                    let Some(emb) = row else {
-                        buf.extend_from_slice(&0u32.to_le_bytes());
-                        continue;
-                    };
+                for emb in v.iter().flatten() {
                     let bytes = emb
                         .len()
                         .checked_mul(4)
@@ -1278,32 +1293,8 @@ fn append_insert_cols_v2(
                         .checked_add(bytes)
                         .filter(|&bytes| bytes <= MAX_SPARSE_DECODED_BYTES)
                         .ok_or_else(|| io_err("sparse vectors exceed decoded 64MiB budget"))?;
-                    let dim = u32::try_from(emb.len())
-                        .ok()
-                        .and_then(|n| n.checked_add(1))
-                        .ok_or_else(|| io_err("sparse vector dimension overflow"))?;
-                    let count = emb.iter().filter(|value| value.to_bits() != 0).count() as u32;
-                    buf.extend_from_slice(&dim.to_le_bytes());
-                    buf.extend_from_slice(&count.to_le_bytes());
-                    for (block, values) in emb.chunks(8).enumerate() {
-                        // Bitwise zero preserves negative zero and NaN payloads.
-                        // Skip empty blocks without branching for each element.
-                        if values
-                            .iter()
-                            .fold(0u32, |bits, value| bits | value.to_bits())
-                            == 0
-                        {
-                            continue;
-                        }
-                        for (offset, value) in values.iter().enumerate() {
-                            if value.to_bits() != 0 {
-                                let index = block * 8 + offset;
-                                buf.extend_from_slice(&(index as u32).to_le_bytes());
-                                buf.extend_from_slice(&value.to_bits().to_le_bytes());
-                            }
-                        }
-                    }
                 }
+                append_sparse_rows_serial(v, buf)?;
                 if sparse_decoded_bytes > MAX_SPARSE_DECODED_BYTES {
                     return Err(io_err("sparse vectors exceed decoded 64MiB budget"));
                 }
@@ -1314,8 +1305,22 @@ fn append_insert_cols_v2(
                     match row {
                         Some(emb) if !emb.is_empty() => {
                             buf.extend_from_slice(&(emb.len() as u32).to_le_bytes());
-                            for x in emb {
-                                buf.extend_from_slice(&x.to_le_bytes());
+                            #[cfg(target_endian = "little")]
+                            {
+                                // Safety: [f32] on little-endian has the exact IEEE 754 LE byte representation.
+                                let bytes = unsafe {
+                                    std::slice::from_raw_parts(
+                                        emb.as_ptr() as *const u8,
+                                        emb.len() * std::mem::size_of::<f32>(),
+                                    )
+                                };
+                                buf.extend_from_slice(bytes);
+                            }
+                            #[cfg(not(target_endian = "little"))]
+                            {
+                                for x in emb {
+                                    buf.extend_from_slice(&x.to_le_bytes());
+                                }
                             }
                         }
                         _ => buf.extend_from_slice(&0u32.to_le_bytes()),
@@ -1919,7 +1924,7 @@ pub fn rows_to_insert_cols(
         }
     }
     let fields: Vec<String> = field_set.into_iter().map(str::to_owned).collect();
-    if uniform && rows.len() >= 4096 && rows[0].values().all(|cell| !matches!(cell, Cell::Null)) {
+    if uniform && !rows.is_empty() && rows[0].values().all(|cell| !matches!(cell, Cell::Null)) {
         let mut cols = rows[0]
             .values()
             .map(|cell| match cell {

@@ -25,6 +25,8 @@ trait ComputeBackend: Send + Sync {
     fn validation_lock(&self) -> &std::sync::Mutex<()>;
     fn adapter_info(&self) -> &wgpu::AdapterInfo;
     fn cosine_batch(&self, query: &[f32], vectors: &[&[f32]]) -> Result<Vec<f32>, Error>;
+    fn pool(&self) -> &std::sync::Mutex<GpuBufferPool>;
+    fn kernels(&self) -> &std::sync::Mutex<BuiltinKernels>;
 }
 impl ComputeBackend for WgpuCompute {
     fn device(&self) -> &wgpu::Device {
@@ -41,6 +43,12 @@ impl ComputeBackend for WgpuCompute {
     }
     fn cosine_batch(&self, query: &[f32], vectors: &[&[f32]]) -> Result<Vec<f32>, Error> {
         WgpuCompute::cosine_batch(self, query, vectors)
+    }
+    fn pool(&self) -> &std::sync::Mutex<GpuBufferPool> {
+        &self.pool
+    }
+    fn kernels(&self) -> &std::sync::Mutex<BuiltinKernels> {
+        &self.kernels
     }
 }
 /// Backend selection and capabilities requested at device creation.
@@ -102,6 +110,43 @@ impl GpuCompute {
     }
 }
 
+/// Reusable Scratch/Pool buffers for cosine_batch and readback to eliminate per-call allocations.
+#[derive(Default)]
+struct GpuBufferPool {
+    cosine: Option<CosineScratch>,
+    readback: Option<wgpu::Buffer>,
+    packed_f32: Vec<f32>,
+    lengths_u32: Vec<u32>,
+}
+
+struct CosineScratch {
+    query: wgpu::Buffer,
+    lengths: wgpu::Buffer,
+    scores: wgpu::Buffer,
+    readback: wgpu::Buffer,
+}
+
+/// Cached built-in WGSL compute kernels compiled once per GpuCompute device.
+#[derive(Default)]
+pub(crate) struct BuiltinKernels {
+    pub(crate) cosine: Option<ComputeKernel>,
+    pub(crate) compare: Option<ComputeKernel>,
+    pub(crate) boolean: Option<ComputeKernel>,
+    pub(crate) text: Option<ComputeKernel>,
+    pub(crate) count: Option<ComputeKernel>,
+    pub(crate) join: Option<ComputeKernel>,
+    pub(crate) join_id_build: Option<ComputeKernel>,
+    pub(crate) join_id_probe: Option<ComputeKernel>,
+    pub(crate) sort: Option<ComputeKernel>,
+    pub(crate) sum: Option<ComputeKernel>,
+    pub(crate) rrf: Option<ComputeKernel>,
+    pub(crate) graph: Option<ComputeKernel>,
+    pub(crate) weights: Option<ComputeKernel>,
+    pub(crate) walk: Option<ComputeKernel>,
+    pub(crate) match_dfs: Option<ComputeKernel>,
+    pub(crate) regex: Option<ComputeKernel>,
+}
+
 /// Reusable device and cosine compute pipeline. Share with `Arc` across readers.
 struct WgpuCompute {
     device: wgpu::Device,
@@ -109,6 +154,8 @@ struct WgpuCompute {
     pipeline: wgpu::ComputePipeline,
     adapter: wgpu::AdapterInfo,
     validation_lock: std::sync::Mutex<()>,
+    pool: std::sync::Mutex<GpuBufferPool>,
+    kernels: std::sync::Mutex<BuiltinKernels>,
 }
 
 impl WgpuCompute {
@@ -172,6 +219,8 @@ impl WgpuCompute {
             pipeline,
             adapter: info,
             validation_lock: std::sync::Mutex::new(()),
+            pool: std::sync::Mutex::new(GpuBufferPool::default()),
+            kernels: std::sync::Mutex::new(BuiltinKernels::default()),
         })
     }
 
@@ -208,49 +257,155 @@ impl WgpuCompute {
     }
 
     fn score_chunk(&self, query: &[f32], vectors: &[&[f32]]) -> Result<Vec<f32>, Error> {
-        let mut packed = vec![0f32; query.len() * vectors.len()];
-        let lengths: Vec<u32> = vectors
-            .iter()
-            .enumerate()
-            .map(|(i, v)| {
-                let n = query.len().min(v.len());
-                packed[i * query.len()..i * query.len() + n].copy_from_slice(&v[..n]);
-                n as u32
-            })
-            .collect();
-        let storage = |label, bytes: &[u8]| {
+        let mut pool = self
+            .pool
+            .lock()
+            .map_err(|_| Error::runtime("GPU buffer pool lock poisoned"))?;
+        let GpuBufferPool {
+            cosine,
+            packed_f32,
+            lengths_u32,
+            ..
+        } = &mut *pool;
+
+        let is_uma = matches!(self.adapter.device_type, wgpu::DeviceType::IntegratedGpu);
+        let dim = query.len();
+        let rows = vectors.len();
+        let total_f32 = dim * rows;
+        let q_bytes = bytemuck::cast_slice::<f32, u8>(query);
+        let q_size = q_bytes.len() as u64;
+        let v_size = (total_f32 * 4) as u64;
+        let n_size = (rows * 4) as u64;
+        let s_size = n_size;
+
+        lengths_u32.clear();
+        lengths_u32.reserve(rows);
+        let vectors_buf = if is_uma {
+            let v_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("vectors"),
+                size: v_size,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: true,
+            });
+            {
+                let mut v_map = v_buf.slice(..).get_mapped_range_mut();
+                let v_slice = bytemuck::cast_slice_mut::<u8, f32>(&mut v_map);
+                for (i, v) in vectors.iter().enumerate() {
+                    let n = dim.min(v.len());
+                    let row_out = &mut v_slice[i * dim..(i + 1) * dim];
+                    row_out[..n].copy_from_slice(&v[..n]);
+                    if n < dim {
+                        row_out[n..].fill(0.0);
+                    }
+                    lengths_u32.push(n as u32);
+                }
+            }
+            v_buf.unmap();
+            v_buf
+        } else {
+            packed_f32.clear();
+            packed_f32.resize(total_f32, 0.0);
+            for (i, v) in vectors.iter().enumerate() {
+                let n = dim.min(v.len());
+                packed_f32[i * dim..i * dim + n].copy_from_slice(&v[..n]);
+                lengths_u32.push(n as u32);
+            }
             self.device
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some(label),
-                    contents: bytes,
+                    label: Some("vectors"),
+                    contents: bytemuck::cast_slice(packed_f32),
                     usage: wgpu::BufferUsages::STORAGE,
                 })
         };
-        let q = storage("query", bytemuck::cast_slice(query));
-        let v = storage("vectors", bytemuck::cast_slice(&packed));
-        let n = storage("lengths", bytemuck::cast_slice(&lengths));
-        let size = (vectors.len() * 4) as u64;
-        let scores = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("scores"),
-            size,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
+
+        let n_bytes = bytemuck::cast_slice::<u32, u8>(lengths_u32);
+        let needs_alloc = cosine.as_ref().is_none_or(|c| {
+            c.query.size() < q_size
+                || c.lengths.size() < n_size
+                || c.scores.size() < s_size
+                || c.readback.size() < s_size
         });
-        let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("readback"),
-            size,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let buffers = [&q, &v, &n, &scores];
-        let entries: Vec<_> = buffers
-            .iter()
-            .enumerate()
-            .map(|(i, b)| wgpu::BindGroupEntry {
-                binding: i as u32,
-                resource: b.as_entire_binding(),
-            })
-            .collect();
+
+        let mut uploaded_at_creation = false;
+        if needs_alloc {
+            let storage_dst = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
+            let prev_q = cosine.as_ref().map_or(0, |c| c.query.size());
+            let prev_n = cosine.as_ref().map_or(0, |c| c.lengths.size());
+            let prev_s = cosine.as_ref().map_or(0, |c| c.scores.size());
+            let alloc_q = q_size.max(prev_q);
+            let alloc_n = n_size.max(prev_n);
+            let alloc_s = s_size.max(prev_s);
+
+            let create_upload = |label, alloc_size: u64, data: &[u8]| {
+                let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(label),
+                    size: alloc_size,
+                    usage: storage_dst,
+                    mapped_at_creation: is_uma,
+                });
+                if is_uma {
+                    buf.slice(..data.len() as u64)
+                        .get_mapped_range_mut()
+                        .copy_from_slice(data);
+                    buf.unmap();
+                }
+                buf
+            };
+            *cosine = Some(CosineScratch {
+                query: create_upload("query", alloc_q, q_bytes),
+                lengths: create_upload("lengths", alloc_n, n_bytes),
+                scores: self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("scores"),
+                    size: alloc_s,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                }),
+                readback: self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("readback"),
+                    size: alloc_s,
+                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }),
+            });
+            uploaded_at_creation = is_uma;
+        }
+
+        let scratch = cosine.as_ref().expect("allocated cosine scratch");
+        if !uploaded_at_creation {
+            self.queue.write_buffer(&scratch.query, 0, q_bytes);
+            self.queue.write_buffer(&scratch.lengths, 0, n_bytes);
+        }
+
+        let entries = [
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &scratch.query,
+                    offset: 0,
+                    size: std::num::NonZeroU64::new(q_size),
+                }),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: vectors_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &scratch.lengths,
+                    offset: 0,
+                    size: std::num::NonZeroU64::new(n_size),
+                }),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &scratch.scores,
+                    offset: 0,
+                    size: std::num::NonZeroU64::new(s_size),
+                }),
+            },
+        ];
         let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("cosine"),
             layout: &self.pipeline.get_bind_group_layout(0),
@@ -261,25 +416,24 @@ impl WgpuCompute {
             let mut pass = encoder.begin_compute_pass(&Default::default());
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &group, &[]);
-            pass.dispatch_workgroups(vectors.len() as u32, 1, 1);
+            pass.dispatch_workgroups(rows as u32, 1, 1);
         }
-        encoder.copy_buffer_to_buffer(&scores, 0, &readback, 0, size);
+        encoder.copy_buffer_to_buffer(&scratch.scores, 0, &scratch.readback, 0, s_size);
         let submission = self.queue.submit([encoder.finish()]);
+        let slice = scratch.readback.slice(..s_size);
         let (tx, rx) = std::sync::mpsc::channel();
-        readback
-            .slice(..)
-            .map_async(wgpu::MapMode::Read, move |result| {
-                let _ = tx.send(result);
-            });
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
         self.device
             .poll(wgpu::Maintain::WaitForSubmissionIndex(submission));
         rx.recv()
             .map_err(|e| Error::runtime(format!("GPU readback: {e}")))?
             .map_err(|e| Error::runtime(format!("GPU mapping: {e}")))?;
-        let mapped = readback.slice(..).get_mapped_range();
+        let mapped = slice.get_mapped_range();
         let result = bytemuck::cast_slice::<u8, f32>(&mapped).to_vec();
         drop(mapped);
-        readback.unmap();
+        scratch.readback.unmap();
         Ok(result)
     }
 }
@@ -288,6 +442,7 @@ impl WgpuCompute {
 pub use wgpu as native;
 
 /// A compiled compute entry point. Resources are retained by wgpu handles.
+#[derive(Clone)]
 pub struct ComputeKernel {
     pipeline: wgpu::ComputePipeline,
 }
@@ -362,6 +517,26 @@ impl GpuCompute {
         })
     }
 
+    pub(crate) fn builtin_kernel(
+        &self,
+        slot: impl FnOnce(&mut BuiltinKernels) -> &mut Option<ComputeKernel>,
+        source: &str,
+        entry: &str,
+    ) -> Result<ComputeKernel, Error> {
+        let mut kernels = self
+            .inner
+            .kernels()
+            .lock()
+            .map_err(|_| Error::runtime("GPU kernel cache lock poisoned"))?;
+        let target = slot(&mut kernels);
+        if let Some(kernel) = target.as_ref() {
+            return Ok(kernel.clone());
+        }
+        let compiled = self.compile_wgsl(source, entry)?;
+        *target = Some(compiled.clone());
+        Ok(compiled)
+    }
+
     /// Submit a compute dispatch. Buffers and textures remain on GPU for subsequent dispatches.
     /// Workgroups are three-dimensional; binding/layout/device errors return `Error`.
     pub fn dispatch(
@@ -414,31 +589,42 @@ impl GpuCompute {
                 "GPU readback size must be a nonzero multiple of 4",
             ));
         }
+        let mut pool = self
+            .inner
+            .pool()
+            .lock()
+            .map_err(|_| Error::runtime("GPU buffer pool lock poisoned"))?;
+        let pooled = pool
+            .readback
+            .take()
+            .filter(|b| b.size() >= size);
         let (buffer, submission) = self.checked(|device, queue| {
-            let buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("lin readback"),
-                size,
-                mapped_at_creation: false,
-                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            let buffer = pooled.unwrap_or_else(|| {
+                device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("lin readback"),
+                    size,
+                    mapped_at_creation: false,
+                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                })
             });
             let mut encoder = device.create_command_encoder(&Default::default());
             encoder.copy_buffer_to_buffer(source, 0, &buffer, 0, size);
             let submission = queue.submit([encoder.finish()]);
             (buffer, submission)
         })?;
+        let slice = buffer.slice(..size);
         let (tx, rx) = std::sync::mpsc::channel();
-        buffer
-            .slice(..)
-            .map_async(wgpu::MapMode::Read, move |result| {
-                let _ = tx.send(result);
-            });
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
         self.device()
             .poll(wgpu::Maintain::WaitForSubmissionIndex(submission));
         rx.recv()
             .map_err(|e| Error::runtime(format!("GPU readback: {e}")))?
             .map_err(|e| Error::runtime(format!("GPU mapping: {e}")))?;
-        let bytes = buffer.slice(..).get_mapped_range().to_vec();
+        let bytes = slice.get_mapped_range().to_vec();
         buffer.unmap();
+        pool.readback = Some(buffer);
         Ok(bytes)
     }
 }
@@ -449,12 +635,14 @@ pub struct GpuVectors {
     dimension: usize,
     rows: usize,
     kernel: ComputeKernel,
+    query: Option<wgpu::Buffer>,
     chunks: Vec<ResidentChunk>,
 }
 struct ResidentChunk {
     vectors: wgpu::Buffer,
     lengths: wgpu::Buffer,
     scores: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
     rows: usize,
 }
 impl GpuVectors {
@@ -491,23 +679,119 @@ impl GpuCompute {
         }
         let chunk_rows = (max_bytes as usize / row_bytes)
             .min(limits.max_compute_workgroups_per_dimension as usize);
-        let kernel = self.compile_wgsl(include_str!("shaders/cosine.wgsl"), "main")?;
+        let kernel = self.builtin_kernel(
+            |k| &mut k.cosine,
+            include_str!("shaders/cosine.wgsl"),
+            "main",
+        )?;
+        let query = if vectors.is_empty() {
+            None
+        } else {
+            Some(self.checked(|device, _| {
+                device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("resident query"),
+                    size: row_bytes as u64,
+                    mapped_at_creation: false,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                })
+            })?)
+        };
+        let is_uma = matches!(
+            self.adapter_info().device_type,
+            wgpu::DeviceType::IntegratedGpu
+        );
         let mut chunks = Vec::new();
         for chunk in vectors.chunks(chunk_rows) {
-            let mut packed = vec![0f32; dimension * chunk.len()];
-            let lengths: Vec<u32> = chunk
-                .iter()
-                .enumerate()
-                .map(|(i, v)| {
-                    let n = dimension.min(v.len());
-                    packed[i * dimension..i * dimension + n].copy_from_slice(&v[..n]);
-                    n as u32
-                })
-                .collect();
+            let total_f32 = dimension * chunk.len();
+            let v_size = (total_f32 * 4) as u64;
+            let n_size = (chunk.len() * 4) as u64;
+            let s_size = n_size;
+            let (vectors_buf, lengths_buf, scores_buf, bind_group) = self.checked(|device, _| {
+                let usage = wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST;
+                let (vectors_buf, lengths_buf) = if is_uma {
+                    let v_buf = device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("resident vectors"),
+                        size: v_size,
+                        usage,
+                        mapped_at_creation: true,
+                    });
+                    let n_buf = device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("resident lengths"),
+                        size: n_size,
+                        usage,
+                        mapped_at_creation: true,
+                    });
+                    {
+                        let mut v_map = v_buf.slice(..).get_mapped_range_mut();
+                        let v_slice = bytemuck::cast_slice_mut::<u8, f32>(&mut v_map);
+                        let mut n_map = n_buf.slice(..).get_mapped_range_mut();
+                        let n_slice = bytemuck::cast_slice_mut::<u8, u32>(&mut n_map);
+                        for (i, v) in chunk.iter().enumerate() {
+                            let n = dimension.min(v.len());
+                            let row_out = &mut v_slice[i * dimension..(i + 1) * dimension];
+                            row_out[..n].copy_from_slice(&v[..n]);
+                            if n < dimension {
+                                row_out[n..].fill(0.0);
+                            }
+                            n_slice[i] = n as u32;
+                        }
+                    }
+                    v_buf.unmap();
+                    n_buf.unmap();
+                    (v_buf, n_buf)
+                } else {
+                    let mut packed = vec![0f32; total_f32];
+                    let lengths: Vec<u32> = chunk
+                        .iter()
+                        .enumerate()
+                        .map(|(i, v)| {
+                            let n = dimension.min(v.len());
+                            packed[i * dimension..i * dimension + n].copy_from_slice(&v[..n]);
+                            n as u32
+                        })
+                        .collect();
+                    let v_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("resident vectors"),
+                        contents: bytemuck::cast_slice(&packed),
+                        usage,
+                    });
+                    let n_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("resident lengths"),
+                        contents: bytemuck::cast_slice(&lengths),
+                        usage,
+                    });
+                    (v_buf, n_buf)
+                };
+                let scores_buf = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("resident scores"),
+                    size: s_size,
+                    usage,
+                    mapped_at_creation: false,
+                });
+                let q_ref = query.as_ref().expect("non-empty corpus query buffer");
+                let buffers = [q_ref, &vectors_buf, &lengths_buf, &scores_buf];
+                let entries: Vec<_> = buffers
+                    .iter()
+                    .enumerate()
+                    .map(|(i, b)| wgpu::BindGroupEntry {
+                        binding: i as u32,
+                        resource: b.as_entire_binding(),
+                    })
+                    .collect();
+                let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("resident cosine"),
+                    layout: &kernel.bind_group_layout(0),
+                    entries: &entries,
+                });
+                (vectors_buf, lengths_buf, scores_buf, bind_group)
+            })?;
             chunks.push(ResidentChunk {
-                vectors: self.storage_buffer(bytemuck::cast_slice(&packed))?,
-                lengths: self.storage_buffer(bytemuck::cast_slice(&lengths))?,
-                scores: self.storage_buffer(&vec![0u8; chunk.len() * 4])?,
+                vectors: vectors_buf,
+                lengths: lengths_buf,
+                scores: scores_buf,
+                bind_group,
                 rows: chunk.len(),
             });
         }
@@ -515,6 +799,7 @@ impl GpuCompute {
             dimension,
             rows: vectors.len(),
             kernel,
+            query,
             chunks,
         })
     }
@@ -535,28 +820,53 @@ impl GpuCompute {
         if corpus.is_empty() {
             return Ok(Vec::new());
         }
-        let query = self.storage_buffer(bytemuck::cast_slice(query))?;
+        let q_buf = corpus.query.as_ref().expect("resident query buffer");
+        self.queue()
+            .write_buffer(q_buf, 0, bytemuck::cast_slice(query));
         let mut result = Vec::with_capacity(corpus.rows);
         for chunk in &corpus.chunks {
-            let buffers = [&query, &chunk.vectors, &chunk.lengths, &chunk.scores];
-            let group = self.checked(|device, _| {
-                let entries: Vec<_> = buffers
-                    .iter()
-                    .enumerate()
-                    .map(|(i, b)| wgpu::BindGroupEntry {
-                        binding: i as u32,
-                        resource: b.as_entire_binding(),
-                    })
-                    .collect();
-                device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("resident cosine"),
-                    layout: &corpus.kernel.bind_group_layout(0),
-                    entries: &entries,
+            let _ = (&chunk.vectors, &chunk.lengths);
+            let size = chunk.scores.size();
+            let mut pool = self
+                .inner
+                .pool()
+                .lock()
+                .map_err(|_| Error::runtime("GPU buffer pool lock poisoned"))?;
+            let pooled = pool.readback.take().filter(|b| b.size() >= size);
+            let device = self.device();
+            let queue = self.queue();
+            let buffer = pooled.unwrap_or_else(|| {
+                device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("lin readback"),
+                    size,
+                    mapped_at_creation: false,
+                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
                 })
-            })?;
-            self.dispatch(&corpus.kernel, &[&group], [chunk.rows as u32, 1, 1])?;
-            let bytes = self.read_buffer(&chunk.scores)?;
-            result.extend_from_slice(bytemuck::cast_slice::<u8, f32>(&bytes));
+            });
+            let mut encoder = device.create_command_encoder(&Default::default());
+            {
+                let mut pass = encoder.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&corpus.kernel.pipeline);
+                pass.set_bind_group(0, &chunk.bind_group, &[]);
+                pass.dispatch_workgroups(chunk.rows as u32, 1, 1);
+            }
+            encoder.copy_buffer_to_buffer(&chunk.scores, 0, &buffer, 0, size);
+            let submission = queue.submit([encoder.finish()]);
+            let slice = buffer.slice(..size);
+            let (tx, rx) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |res| {
+                let _ = tx.send(res);
+            });
+            device.poll(wgpu::Maintain::WaitForSubmissionIndex(submission));
+            rx.recv()
+                .map_err(|e| Error::runtime(format!("GPU readback: {e}")))?
+                .map_err(|e| Error::runtime(format!("GPU mapping: {e}")))?;
+            {
+                let mapped = slice.get_mapped_range();
+                result.extend_from_slice(bytemuck::cast_slice::<u8, f32>(&mapped));
+            }
+            buffer.unmap();
+            pool.readback = Some(buffer);
         }
         Ok(result)
     }
@@ -649,7 +959,11 @@ impl GpuCompute {
         if records.is_empty() {
             return Ok(Vec::new());
         }
-        let kernel = self.compile_wgsl(include_str!("shaders/compare.wgsl"), "main")?;
+        let kernel = self.builtin_kernel(
+            |k| &mut k.compare,
+            include_str!("shaders/compare.wgsl"),
+            "main",
+        )?;
         let opcode: u32 = match op {
             crate::CmpOp::Eq => 0,
             crate::CmpOp::Ne => 1,
@@ -720,7 +1034,11 @@ impl GpuCompute {
         if a.is_empty() {
             return Ok(Vec::new());
         }
-        let kernel = self.compile_wgsl(include_str!("shaders/boolean.wgsl"), "main")?;
+        let kernel = self.builtin_kernel(
+            |k| &mut k.boolean,
+            include_str!("shaders/boolean.wgsl"),
+            "main",
+        )?;
         let operation = self.storage_buffer(bytemuck::bytes_of(&(or as u32)))?;
         let limits = self.device().limits();
         let count = (limits.max_storage_buffer_binding_size as usize / 4)
@@ -856,7 +1174,8 @@ impl GpuCompute {
         if needle.len().checked_add(2).is_none_or(|n| n > max_words) {
             return Err(Error::runtime("GPU text needle exceeds buffer limits"));
         }
-        let kernel = self.compile_wgsl(include_str!("shaders/text.wgsl"), "main")?;
+        let kernel =
+            self.builtin_kernel(|k| &mut k.text, include_str!("shaders/text.wgsl"), "main")?;
         let mut params = vec![op, needle.len() as u32];
         params.extend(needle.bytes().map(u32::from));
         let params = self.storage_buffer(bytemuck::cast_slice(&params))?;
@@ -967,7 +1286,11 @@ impl GpuCompute {
         if ids.is_empty() {
             return Ok(result);
         }
-        let kernel = self.compile_wgsl(include_str!("shaders/count.wgsl"), "main")?;
+        let kernel = self.builtin_kernel(
+            |k| &mut k.count,
+            include_str!("shaders/count.wgsl"),
+            "main",
+        )?;
         for chunk in ids.chunks(chunk_rows) {
             let input = self.storage_buffer(bytemuck::cast_slice(chunk))?;
             let output = self.storage_buffer(&vec![0u8; groups * 4])?;
@@ -1028,7 +1351,8 @@ impl GpuCompute {
         if left_rows == 0 {
             return Err(Error::runtime("GPU limits cannot hold join input"));
         }
-        let kernel = self.compile_wgsl(include_str!("shaders/join.wgsl"), "main")?;
+        let kernel =
+            self.builtin_kernel(|k| &mut k.join, include_str!("shaders/join.wgsl"), "main")?;
         for (left_tile, left_keys) in left.chunks(left_rows).enumerate() {
             let left_buffer = self.storage_buffer(bytemuck::cast_slice(left_keys))?;
             let right_rows = 4096usize
@@ -1105,8 +1429,8 @@ impl GpuCompute {
             return Err(Error::runtime("GPU limits cannot hold ID join input"));
         }
         let source = include_str!("shaders/join_id.wgsl");
-        let build = self.compile_wgsl(source, "build")?;
-        let probe = self.compile_wgsl(source, "probe")?;
+        let build = self.builtin_kernel(|k| &mut k.join_id_build, source, "build")?;
+        let probe = self.builtin_kernel(|k| &mut k.join_id_probe, source, "probe")?;
         let lookup = self.storage_buffer(&vec![0u8; groups * 4])?;
         for (tile, keys) in right.chunks(chunk_rows).enumerate() {
             let input = self.storage_buffer(bytemuck::cast_slice(keys))?;
@@ -1284,7 +1608,8 @@ impl GpuCompute {
         let indices: Vec<u32> = (0..rows as u32).collect();
         let mut source = self.storage_buffer(bytemuck::cast_slice(&indices))?;
         let mut target = self.storage_buffer(&vec![0u8; indices.len() * 4])?;
-        let kernel = self.compile_wgsl(include_str!("shaders/sort.wgsl"), "main")?;
+        let kernel =
+            self.builtin_kernel(|k| &mut k.sort, include_str!("shaders/sort.wgsl"), "main")?;
         let mut width = 1u32;
         while (width as usize) < rows {
             let values = [width, desc as u32, 0, 0];
@@ -1359,7 +1684,8 @@ impl GpuCompute {
         if ids.is_empty() {
             return Ok(vec![0.0; groups]);
         }
-        let kernel = self.compile_wgsl(include_str!("shaders/sum.wgsl"), "main")?;
+        let kernel =
+            self.builtin_kernel(|k| &mut k.sum, include_str!("shaders/sum.wgsl"), "main")?;
         let output = self.storage_buffer(&vec![0u8; groups * 8])?;
         for (id_chunk, value_chunk) in ids.chunks(chunk_rows).zip(values.chunks(chunk_rows)) {
             let words: Vec<u32> = id_chunk
@@ -1431,7 +1757,11 @@ impl GpuCompute {
         if chunk == 0 {
             return Err(Error::runtime("GPU limits cannot dispatch graph input"));
         }
-        let kernel = self.compile_wgsl(include_str!("shaders/graph.wgsl"), "main")?;
+        let kernel = self.builtin_kernel(
+            |k| &mut k.graph,
+            include_str!("shaders/graph.wgsl"),
+            "main",
+        )?;
         let mut result = vec![false; sources.len()];
         for frontier_chunk in frontier.chunks(max_words) {
             let frontier_buffer = self.storage_buffer(bytemuck::cast_slice(frontier_chunk))?;
@@ -1502,7 +1832,11 @@ impl GpuCompute {
             for start in (0..rows).step_by(chunk_rows) {
                 chunks.push(self.storage_buffer(&vec![0u8; (rows - start).min(chunk_rows) * 8])?);
             }
-            Some(self.compile_wgsl(include_str!("shaders/weights.wgsl"), "main")?)
+            Some(self.builtin_kernel(
+                |k| &mut k.weights,
+                include_str!("shaders/weights.wgsl"),
+                "main",
+            )?)
         };
         Ok(GpuWeightAccumulator {
             gpu: self,
@@ -1801,7 +2135,8 @@ impl GpuCompute {
         if ids.is_empty() {
             return Ok(vec![0.0; groups]);
         }
-        let kernel = self.compile_wgsl(include_str!("shaders/sum.wgsl"), "rrf")?;
+        let kernel =
+            self.builtin_kernel(|k| &mut k.rrf, include_str!("shaders/sum.wgsl"), "rrf")?;
         let output = self.storage_buffer(&vec![0u8; groups * 8])?;
         for (id_chunk, value_chunk) in ids.chunks(chunk_rows).zip(values.chunks(chunk_rows)) {
             let words: Vec<u32> = id_chunk
@@ -1885,7 +2220,8 @@ impl GpuCompute {
         {
             return Err(Error::runtime("GPU graph walk exceeds buffer limits"));
         }
-        let kernel = self.compile_wgsl(include_str!("shaders/walk.wgsl"), "main")?;
+        let kernel =
+            self.builtin_kernel(|k| &mut k.walk, include_str!("shaders/walk.wgsl"), "main")?;
         let edge_buffer = self.storage_buffer(bytemuck::cast_slice(edges))?;
         let mut params = vec![nodes as u32, depth, graph as u32, 0];
         params.extend(seeds);
@@ -2008,7 +2344,11 @@ impl GpuCompute {
         {
             return Err(Error::runtime("GPU match exceeds buffer limits"));
         }
-        let kernel = self.compile_wgsl(include_str!("shaders/match.wgsl"), "main")?;
+        let kernel = self.builtin_kernel(
+            |k| &mut k.match_dfs,
+            include_str!("shaders/match.wgsl"),
+            "main",
+        )?;
         let edges = self.storage_buffer(bytemuck::cast_slice(edges))?;
         let mut params = vec![start, min_depth, max_depth, limit as u32];
         params.extend(eligible);

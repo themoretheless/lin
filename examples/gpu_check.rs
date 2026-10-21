@@ -42,7 +42,9 @@ pub fn main() -> Result<(), lin::Error> {
             .all(|s| (*s - 1.0).abs() < 1e-6)
     );
     let mut cpu = lin::Db::fixture();
-    let mut accelerated = lin::Db::fixture().with_gpu(gpu.clone());
+    let mut accelerated = lin::Db::empty().with_gpu(gpu.clone());
+    accelerated.catalog = cpu.catalog.clone();
+    accelerated.store = cpu.store.clone_mem();
     for q in [
         "docs | search vec \"wal\" | take 20",
         "docs | search \"wal\" | take 20",

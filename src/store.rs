@@ -415,6 +415,11 @@ impl Cell {
         }
     }
 
+    #[inline]
+    pub fn as_i64(&self) -> Option<i64> {
+        self.as_int()
+    }
+
     pub fn as_bool(&self) -> Option<bool> {
         match self {
             Cell::Bool(b) => Some(*b),
@@ -3817,5 +3822,64 @@ mod borrowed_delete_tests {
         assert_eq!(s23.len(), 23);
         let c23 = Cell::from_text(s23);
         assert!(matches!(c23, Cell::Text(_)));
+    }
+
+    #[test]
+    fn cell_equality_and_hash_contract_across_all_variants() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        fn hash_cell(c: &Cell) -> u64 {
+            let mut h = DefaultHasher::new();
+            c.hash(&mut h);
+            h.finish()
+        }
+
+        let nan_q = Cell::Float(f64::from_bits(0x7ff8_0000_0000_0000));
+        let nan_payload = Cell::Float(f64::from_bits(0x7ff8_0000_0000_0001));
+        assert_eq!(nan_q, nan_q.clone());
+        assert_eq!(hash_cell(&nan_q), hash_cell(&nan_q.clone()));
+        assert_ne!(nan_q, nan_payload);
+
+        // Int(1) and Float(1.0) are distinct Cell variants in Eq/Hash
+        let int_one = Cell::Int(1);
+        let float_one = Cell::Float(1.0);
+        assert_ne!(int_one, float_one);
+        assert_ne!(hash_cell(&int_one), hash_cell(&float_one));
+
+        // Signed zeros have distinct bit representations in Cell::Float
+        let pos_zero = Cell::Float(0.0);
+        let neg_zero = Cell::Float(-0.0);
+        assert_ne!(pos_zero, neg_zero);
+
+        // SmallText and Text with identical UTF-8 content must be equal and have identical hashes
+        let s_inline = Cell::from_text("group_key");
+        let s_arc = Cell::Text(Arc::from("group_key"));
+        assert_eq!(s_inline, s_arc);
+        assert_eq!(hash_cell(&s_inline), hash_cell(&s_arc));
+
+        // Every equal pair of cells must produce the exact same hash
+        let samples = [
+            Cell::Null,
+            s_inline,
+            s_arc,
+            Cell::from_text("this string is longer than twenty-two bytes"),
+            int_one,
+            float_one,
+            pos_zero,
+            neg_zero,
+            nan_q,
+            Cell::Bool(true),
+            Cell::Bool(false),
+            Cell::Time(1_700_000_000_000),
+            Cell::Vec(Arc::from([0.5_f32, -0.5_f32].as_slice())),
+        ];
+        for a in &samples {
+            for b in &samples {
+                if a == b {
+                    assert_eq!(hash_cell(a), hash_cell(b), "Hash/Eq mismatch for {a:?} and {b:?}");
+                }
+            }
+        }
     }
 }

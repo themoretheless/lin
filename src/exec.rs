@@ -2163,7 +2163,7 @@ impl Db {
             )
         });
         let project_fields_step = {
-            let can_project_source = (matches!(q.steps.first(), Some(Step::Filter(_)))
+            let can_project_source = (first_filter.is_some()
                 && matches!(q.steps.get(1), Some(Step::Project(_)))
                 && q.steps
                     .iter()
@@ -2184,7 +2184,7 @@ impl Db {
             }
         };
 
-        let scan_limit: Option<usize> = if simple_scan && first_filter.is_none() {
+        let scan_limit: Option<usize> = if !gpu_filter && simple_scan && first_filter.is_none() {
             let mut skip_n = 0usize;
             let mut take_n: Option<usize> = None;
             for s in &q.steps {
@@ -2920,40 +2920,24 @@ impl Db {
             }
             // Index covers filter but group key varies — read only the by-field.
             let idxs = self.store.index_seek(name, &uses, now)?;
-            let mut map: BTreeMap<String, (Cell, i64)> = BTreeMap::new();
-            let mut key_buf = String::with_capacity(32);
+            let mut map: FxHashMap<Cell, i64> = FxHashMap::default();
             for i in idxs {
                 let Some(row) = self.store.get_by_idx(name, i) else {
                     continue;
                 };
-                let cell_opt = row.get(&by_key);
-                key_buf.clear();
-                group_cell_key_into(cell_opt, &mut key_buf);
-                if let Some(entry) = map.get_mut(&key_buf) {
-                    entry.1 += 1;
-                } else {
-                    let cell = cell_opt.map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
-                    map.insert(key_buf.clone(), (cell, 1));
-                }
+                let cell = row.get(&by_key).map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
+                *map.entry(cell).or_insert(0) += 1;
             }
             return Some(count_cell_map_to_rows(&by_key, map));
         }
 
         // Full scan count without cloning rows.
         let col = self.store.collection(name);
-        let mut map: BTreeMap<String, (Cell, i64)> = BTreeMap::new();
-        let mut key_buf = String::with_capacity(32);
+        let mut map: FxHashMap<Cell, i64> = FxHashMap::default();
         for r in col {
             if eval_pred(pred, r, now) {
-                let cell_opt = r.get(&by_key);
-                key_buf.clear();
-                group_cell_key_into(cell_opt, &mut key_buf);
-                if let Some(entry) = map.get_mut(&key_buf) {
-                    entry.1 += 1;
-                } else {
-                    let cell = cell_opt.map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
-                    map.insert(key_buf.clone(), (cell, 1));
-                }
+                let cell = r.get(&by_key).map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
+                *map.entry(cell).or_insert(0) += 1;
             }
         }
         Some(count_cell_map_to_rows(&by_key, map))
@@ -3942,31 +3926,28 @@ impl Db {
                     }
                 }
             } else {
-                for src in &frontier {
-                    let mut early_stop = false;
-                    self.store.for_each_neighbor(edge_rel, src, reverse, |dst| {
-                        if early_stop {
-                            return;
+                for (edge_index, e) in self.store.edges.iter().enumerate() {
+                    if e.rel != edge_rel {
+                        continue;
+                    }
+                    let (src, dst) = if reverse {
+                        (e.to.as_str(), e.from.as_str())
+                    } else {
+                        (e.from.as_str(), e.to.as_str())
+                    };
+                    if !frontier.contains(src) {
+                        continue;
+                    }
+                    let _ = edge_index;
+                    let key = (e.rel.clone(), e.from.clone(), e.to.clone());
+                    if seen_edges.insert(key) {
+                        out.push(edge_row(&e.rel, &e.from, &e.to));
+                        if out.len() >= 300 {
+                            return Ok(out);
                         }
-                        let (from, to) = if reverse {
-                            (dst, src.as_str())
-                        } else {
-                            (src.as_str(), dst)
-                        };
-                        let key = (edge_rel.to_string(), from.to_string(), to.to_string());
-                        if seen_edges.insert(key) {
-                            out.push(edge_row(edge_rel, from, to));
-                            if out.len() >= 300 {
-                                early_stop = true;
-                                return;
-                            }
-                        }
-                        if seen_nodes.insert(dst.to_string()) {
-                            next.insert(dst.to_string());
-                        }
-                    });
-                    if out.len() >= 300 {
-                        return Ok(out);
+                    }
+                    if seen_nodes.insert(dst.to_string()) {
+                        next.insert(dst.to_string());
                     }
                 }
             }
@@ -4402,10 +4383,9 @@ impl Db {
                 rows
             })
         } else {
-            records
-                .iter()
-                .map(|record| record_row(record, now))
-                .collect()
+            let mut rows = Vec::with_capacity(n);
+            rows.extend(records.iter().map(|record| record_row(record, now)));
+            rows
         };
         let mut batch_ids: rustc_hash::FxHashSet<&str> =
             rustc_hash::FxHashSet::default();
@@ -4415,6 +4395,9 @@ impl Db {
         if collection == "docs" {
             batch_uris.reserve(n);
         }
+
+        let store_empty = self.store.collection(collection).is_empty();
+        let has_fks = self.catalog.fks.iter().any(|fk| fk.from_col == collection);
 
         for row in &mut built {
             if row.get("id").and_then(Cell::text).is_none() {
@@ -4428,18 +4411,20 @@ impl Db {
             }
             if let Some(id) = row.get("id").and_then(Cell::text)
                 && (!batch_ids.insert(id)
-                    || self.store.get_by_id(collection, id).is_some())
+                    || (!store_empty && self.store.get_by_id(collection, id).is_some()))
             {
                 return Err(Error::runtime(format!("duplicate id: {id}")));
             }
             if collection == "docs"
                 && let Some(uri) = row.get("uri").and_then(Cell::text)
                 && (!batch_uris.insert(uri)
-                    || self.store.get_by_uri(uri).is_some())
+                    || (!store_empty && self.store.get_by_uri(uri).is_some()))
             {
                 return Err(Error::runtime(format!("duplicate uri: {uri}")));
             }
-            self.check_row_fks(collection, row)?;
+            if has_fks {
+                self.check_row_fks(collection, row)?;
+            }
         }
         drop(batch_ids);
         drop(batch_uris);
@@ -5688,25 +5673,6 @@ fn cmp_sort(a: &Cell, b: &Cell) -> std::cmp::Ordering {
     }
 }
 
-#[inline]
-fn group_cell_key_into(c: Option<&Cell>, out: &mut String) {
-    match c {
-        Some(Cell::Text(s)) => {
-            out.push('"');
-            out.push_str(s.as_ref());
-            out.push('"');
-        }
-        Some(Cell::SmallText(s)) => {
-            out.push('"');
-            out.push_str(s.as_str());
-            out.push('"');
-        }
-        Some(Cell::Null) | None => out.push_str("null"),
-        Some(other) => other.compact_into(out),
-    }
-}
-
-
 fn get_frame_bounds(
     i: usize,
     n: usize,
@@ -5759,19 +5725,18 @@ pub(crate) fn eval_window(
     let target_field: Option<String> = field.map(|f| f.as_str());
     let tf: &str = target_field.as_deref().unwrap_or_default();
 
-    let mut partition_keys = Vec::new();
-    let mut partitions: FxHashMap<String, Vec<Row>> = FxHashMap::default();
-    let mut key_buf = String::with_capacity(32);
+    let mut partition_keys: Vec<Vec<Cell>> = Vec::new();
+    let mut partitions: FxHashMap<Vec<Cell>, Vec<Row>> = FxHashMap::default();
+    let mut key_buf: Vec<Cell> = Vec::with_capacity(by_keys.len());
 
     for row in rows {
         key_buf.clear();
-        if !by_keys.is_empty() {
-            for (idx, bk) in by_keys.iter().enumerate() {
-                if idx > 0 {
-                    key_buf.push('\x1f');
-                }
-                group_cell_key_into(row.get(bk.as_str()), &mut key_buf);
-            }
+        for bk in &by_keys {
+            key_buf.push(
+                row.get(bk.as_str())
+                    .map(Cell::clone_for_borrow)
+                    .unwrap_or(Cell::Null),
+            );
         }
         if let Some(part) = partitions.get_mut(&key_buf) {
             part.push(row);
@@ -6154,8 +6119,11 @@ fn agg_count(rows: &[Row], by: &Field) -> Vec<Row> {
         .collect()
 }
 
-fn count_cell_map_to_rows(by: &str, map: BTreeMap<String, (Cell, i64)>) -> Vec<Row> {
-    map.into_values()
+fn count_cell_map_to_rows(by: &str, map: FxHashMap<Cell, i64>) -> Vec<Row> {
+    let mut entries: Vec<(Cell, i64)> = map.into_iter().collect();
+    entries.sort_unstable_by(|(a, _), (b, _)| cmp_sort(a, b));
+    entries
+        .into_iter()
         .map(|(cell, n)| {
             let mut row = crate::store::acquire_row();
             row.insert(by.to_string(), cell);
@@ -6554,33 +6522,30 @@ impl Db {
             return Ok(Some(vec![hits_row(counts[0])]));
         };
         let field = by.as_str();
-        let mut key_cells: BTreeMap<String, Cell> = BTreeMap::new();
-        let mut row_keys: Vec<String> = Vec::with_capacity(rows.len());
-        let mut key_buf = String::with_capacity(32);
+        let mut group_ids: FxHashMap<Cell, u32> = FxHashMap::default();
+        let mut group_cells: Vec<Cell> = Vec::new();
+        let mut ids: Vec<u32> = Vec::with_capacity(rows.len());
         for row in rows {
-            let cell_opt = row.get(&field);
-            key_buf.clear();
-            group_cell_key_into(cell_opt, &mut key_buf);
-            if !key_cells.contains_key(&key_buf) {
-                key_cells.insert(key_buf.clone(), cell_opt.map(Cell::clone_for_borrow).unwrap_or(Cell::Null));
-            }
-            row_keys.push(key_buf.clone());
+            let cell = row.get(&field).map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
+            let id = if let Some(&id) = group_ids.get(&cell) {
+                id
+            } else {
+                let id = u32::try_from(group_cells.len())
+                    .map_err(|_| Error::runtime("GPU count has too many groups"))?;
+                group_cells.push(cell.clone());
+                group_ids.insert(cell, id);
+                id
+            };
+            ids.push(id);
         }
-        let keys: Vec<String> = key_cells.keys().cloned().collect();
-        if keys.len() > u32::MAX as usize {
-            return Err(Error::runtime("GPU count has too many groups"));
-        }
-        let ids: Vec<u32> = row_keys
-            .iter()
-            .map(|key| keys.binary_search(key).expect("known group") as u32)
-            .collect();
-        let counts = gpu.group_counts(&ids, keys.len())?;
+        let counts = gpu.group_counts(&ids, group_cells.len())?;
+        let mut entries: Vec<(Cell, i64)> = group_cells.into_iter().zip(counts).collect();
+        entries.sort_unstable_by(|(a, _), (b, _)| cmp_sort(a, b));
         Ok(Some(
-            keys.into_iter()
-                .zip(counts)
-                .map(|(key, count)| {
-                    let cell = key_cells.remove(&key).unwrap_or(Cell::Null);
-                    let mut row = BTreeMap::new();
+            entries
+                .into_iter()
+                .map(|(cell, count)| {
+                    let mut row = crate::store::acquire_row();
                     row.insert(field.clone(), cell);
                     row.insert("hits".into(), Cell::Int(count));
                     row
@@ -6748,37 +6713,34 @@ impl Db {
             return Ok(Some(vec![row]));
         };
         let bk = by.as_str();
-        let mut key_cells: BTreeMap<String, Cell> = BTreeMap::new();
-        let mut row_keys: Vec<String> = Vec::with_capacity(rows.len());
-        let mut key_buf = String::with_capacity(32);
+        let mut group_ids: FxHashMap<Cell, u32> = FxHashMap::default();
+        let mut group_cells: Vec<Cell> = Vec::new();
+        let mut ids: Vec<u32> = Vec::with_capacity(rows.len());
         for row in rows {
-            let cell_opt = row.get(&bk);
-            key_buf.clear();
-            group_cell_key_into(cell_opt, &mut key_buf);
-            if !key_cells.contains_key(&key_buf) {
-                key_cells.insert(key_buf.clone(), cell_opt.map(Cell::clone_for_borrow).unwrap_or(Cell::Null));
-            }
-            row_keys.push(key_buf.clone());
+            let cell = row.get(&bk).map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
+            let id = if let Some(&id) = group_ids.get(&cell) {
+                id
+            } else {
+                let id = u32::try_from(group_cells.len())
+                    .map_err(|_| Error::runtime("GPU sum has too many groups"))?;
+                group_cells.push(cell.clone());
+                group_ids.insert(cell, id);
+                id
+            };
+            ids.push(id);
         }
-        let keys: Vec<String> = key_cells.keys().cloned().collect();
-        if keys.len() > u32::MAX as usize {
-            return Err(Error::runtime("GPU sum has too many groups"));
-        }
-        let ids: Vec<u32> = row_keys
-            .iter()
-            .map(|key| keys.binary_search(key).expect("known group") as u32)
-            .collect();
         let values: Vec<f64> = rows
             .iter()
             .map(|row| row.get(&fk).and_then(Cell::as_f64).unwrap_or(0.0))
             .collect();
-        let sums = gpu.group_sums(&ids, &values, keys.len())?;
+        let sums = gpu.group_sums(&ids, &values, group_cells.len())?;
+        let mut entries: Vec<(Cell, f64)> = group_cells.into_iter().zip(sums).collect();
+        entries.sort_unstable_by(|(a, _), (b, _)| cmp_sort(a, b));
         Ok(Some(
-            keys.into_iter()
-                .zip(sums)
-                .map(|(key, sum)| {
-                    let cell = key_cells.remove(&key).unwrap_or(Cell::Null);
-                    let mut row = BTreeMap::new();
+            entries
+                .into_iter()
+                .map(|(cell, sum)| {
+                    let mut row = crate::store::acquire_row();
                     row.insert(bk.clone(), cell);
                     row.insert(fk.clone(), Cell::Float(sum));
                     row
@@ -7127,3 +7089,47 @@ impl Db {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod grouping_tests {
+    use crate::store::Cell;
+    use crate::Db;
+
+    #[test]
+    fn mixed_numeric_and_text_grouping_preserves_cell_identity_across_operators() {
+        let mut db = Db::empty();
+        db.run("col items { k: f64, v: i64, tag: text }").unwrap();
+        db.run(
+            r#"insert items [
+                { id: "i1", k: 1, v: 10, tag: "active" },
+                { id: "i2", k: 1.0, v: 20, tag: "active" },
+                { id: "i3", k: 0.0, v: 30, tag: "active" },
+                { id: "i4", k: -0.0, v: 40, tag: "active" },
+                { id: "i5", v: 50, tag: "active" }
+            ]"#,
+        )
+        .unwrap();
+
+        // Unfiltered count by k (agg_count) and filtered count by k (try_filter_count) must agree
+        let unfiltered = db.run("items | count by k").unwrap().rows;
+        let filtered = db.run(r#"items | tag == "active" | count by k"#).unwrap().rows;
+        assert_eq!(unfiltered, filtered);
+        assert_eq!(unfiltered.len(), 5);
+        assert_eq!(unfiltered[0]["k"], Cell::Null);
+
+        // Sum by k must keep Int(1) and Float(1.0) in distinct groups
+        let sums = db.run("items | sum v by k").unwrap().rows;
+        assert_eq!(sums.len(), 5);
+
+        // Window PARTITION BY must also use Cell identity without string-formatting collisions
+        let win = db
+            .run("items | window row_number by k as rn")
+            .unwrap()
+            .rows;
+        assert_eq!(win.len(), 5);
+        for row in &win {
+            assert_eq!(row["rn"], Cell::Int(1));
+        }
+    }
+}
+

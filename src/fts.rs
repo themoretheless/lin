@@ -1129,6 +1129,37 @@ mod pending_order_tests {
             expected.into_iter().collect::<Vec<_>>()
         );
     }
+
+    #[test]
+    fn implicit_snippet_indexing_and_two_cursor_token_diff() {
+        let mut r0 = Row::new();
+        r0.insert("title".into(), Cell::from_text("alpha beta"));
+        r0.insert("snippet".into(), Cell::from_text("implicit_tok shared_tok"));
+        let rows = vec![r0.clone()];
+
+        // Even when "snippet" is omitted from declared FTS fields, FtsIndex indexes it implicitly.
+        let mut index = FtsIndex::build(&rows, &[String::from("title")]);
+        assert_eq!(index.matches("alpha"), Some(vec![0]));
+        assert_eq!(index.matches("implicit_tok"), Some(vec![0]));
+        assert_eq!(index.matches("shared_tok"), Some(vec![0]));
+
+        // Update only snippet: removes "implicit_tok", keeps "shared_tok", adds "fresh_tok".
+        let mut r1 = r0.clone();
+        r1.insert("snippet".into(), Cell::from_text("shared_tok fresh_tok"));
+        index.sync_row(0, &r0, &r1);
+        assert_eq!(index.matches("implicit_tok").unwrap_or_default(), Vec::<usize>::new());
+        assert_eq!(index.matches("shared_tok"), Some(vec![0]));
+        assert_eq!(index.matches("fresh_tok"), Some(vec![0]));
+
+        // Remove the last remaining terms by clearing the row and folding pending edits.
+        let empty = Row::new();
+        index.sync_row(0, &r1, &empty);
+        assert_eq!(index.matches("alpha").unwrap_or_default(), Vec::<usize>::new());
+        assert_eq!(index.matches("shared_tok").unwrap_or_default(), Vec::<usize>::new());
+        assert_eq!(index.matches("fresh_tok").unwrap_or_default(), Vec::<usize>::new());
+        index.fold_all();
+        assert_eq!(index.matches("alpha"), None);
+    }
 }
 
 fn merge_edits(base: &[usize], dels: &[usize], adds: &[usize]) -> Vec<usize> {
