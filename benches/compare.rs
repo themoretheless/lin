@@ -232,6 +232,10 @@ fn try_mysql_conn(url: &str) -> Result<mysql::Conn, String> {
 }
 
 fn connect_pg() -> Option<(String, postgres::Client)> {
+    if std::env::var_os("LIN_BENCH_SKIP_PG").is_some() {
+        eprintln!("skip postgres: LIN_BENCH_SKIP_PG is set");
+        return None;
+    }
     let mut tried = Vec::new();
     let mut urls: Vec<String> = Vec::new();
     if let Some(u) = env_url("LIN_BENCH_PG_URL") {

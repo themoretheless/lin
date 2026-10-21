@@ -499,6 +499,36 @@ impl LiveIndex {
         Ok(())
     }
 
+    /// Determine if this index should use bitmap encoding based on cardinality estimation
+    fn should_use_bitmap(&self, _orig_idx: usize, row: &Row, rows: &[Row]) -> bool {
+        // If bitmap_card_field is set, estimate cardinality from sample
+        if let Some(field_name) = self.def.bitmap_card_field.as_ref() {
+            // Quick check: if first value is boolean, always use bitmap
+            if matches!(row.get(field_name), Some(Cell::Bool(_))) {
+                return true;
+            }
+            
+            // Sample up to 100 rows to estimate cardinality
+            let sample_size = std::cmp::min(100, rows.len());
+            let mut distinct_values = rustc_hash::FxHashSet::default();
+            
+            for row in rows.iter().take(sample_size) {
+                if let Some(cell) = row.get(field_name) {
+                    if matches!(cell, Cell::Bool(_)) {
+                        return true;
+                    }
+                    distinct_values.insert(cell);
+                }
+            }
+            
+            // Use bitmap if cardinality <= 16 (or <= 32 for larger indexes)
+            let threshold = if self.forward.len() > 10_000 { 32 } else { 16 };
+            !distinct_values.is_empty() && distinct_values.len() <= threshold
+        } else {
+            false
+        }
+    }
+
     /// Batch-only insert for slab operations: compute all keys first, then bulk insert
     /// to reduce per-row HashMap overhead and key cloning.
     pub fn insert_slab_batch(&mut self, start: usize, rows: &[Row]) -> Result<(), String> {
@@ -527,12 +557,9 @@ impl LiveIndex {
         for ((orig_idx, row), key) in keyed_rows.iter().zip(keys.into_iter()) {
             use std::collections::btree_map::Entry;
 
-            // Check if this is a bitmap index (for boolean fields)
-            let is_bitmap = self
-                .def
-                .bitmap_card_field
-                .as_ref()
-                .is_some_and(|field| matches!(row.get(field), Some(Cell::Bool(_))));
+            // Auto-detect bitmap index based on field cardinality
+            // If bitmap_card_field is set, estimate cardinality from sample
+            let is_bitmap = self.should_use_bitmap(*orig_idx, row, rows);
 
             match self.forward.entry(key) {
                 Entry::Vacant(v) => {
@@ -1208,6 +1235,7 @@ fn find_range<'a>(atoms: &[&'a Pred], field: &str) -> Option<(CmpOp, &'a Value)>
 #[cfg(test)]
 mod storage_tests {
     use super::*;
+    use crate::store::Cell;
 
     #[test]
     fn index_part_small_text_semantics_and_zero_alloc() {
@@ -1248,6 +1276,89 @@ mod storage_tests {
         let val_short = Value::String(Arc::from("short_key"));
         let part_from_val = value_part(&val_short, 0);
         assert!(matches!(part_from_val, IndexPart::SmallText(_)));
+    }
+
+    #[test]
+    fn test_bitmap_auto_detection() {
+        let index_def = IndexDef {
+            collection: "tasks".into(),
+            unique: false,
+            fields: vec!["status".into()],
+            pred: None,
+            bitmap_card_field: Some("status".into()),
+        };
+
+        let index = LiveIndex {
+            def: index_def,
+            forward: BTreeMap::new(),
+            reverse: FxHashMap::default(),
+            #[cfg(feature = "parallel")]
+            bloom_filter: None,
+        };
+
+        // Test with boolean field - should always use bitmap
+        let row_pending = Row::from([("status".into(), Cell::Bool(false))]);
+        let row_active = Row::from([("status".into(), Cell::Bool(true))]);
+        let sample = [row_pending.clone(), row_active.clone()];
+        
+        assert!(index.should_use_bitmap(0, &row_pending, &sample));
+        assert!(index.should_use_bitmap(1, &row_active, &sample));
+    }
+
+    #[test]
+    fn test_low_cardinality_detection() {
+        let index_def = IndexDef {
+            collection: "orders".into(),
+            unique: false,
+            fields: vec!["priority".into()],
+            pred: None,
+            bitmap_card_field: Some("priority".into()),
+        };
+
+        let index = LiveIndex {
+            def: index_def,
+            forward: BTreeMap::new(),
+            reverse: FxHashMap::default(),
+            #[cfg(feature = "parallel")]
+            bloom_filter: None,
+        };
+
+        // Create sample data with low cardinality (only 3 distinct values)
+        let rows: Vec<Row> = (0..100).map(|i| {
+            Row::from([("priority".into(), Cell::Int((i % 3) as i64))])
+        }).collect();
+
+        // With only 3 distinct values out of 100, should use bitmap
+        let row = &rows[0];
+        assert!(index.should_use_bitmap(0, row, &rows));
+    }
+
+    #[test]
+    fn test_high_cardinality_no_bitmap() {
+        let index_def = IndexDef {
+            collection: "users".into(),
+            unique: false,
+            fields: vec!["id".into()],
+            pred: None,
+            bitmap_card_field: Some("id".into()),
+        };
+
+        let index = LiveIndex {
+            def: index_def,
+            forward: BTreeMap::new(),
+            reverse: FxHashMap::default(),
+            #[cfg(feature = "parallel")]
+            bloom_filter: None,
+        };
+
+        // Create sample data with high cardinality (100 distinct values in sample)
+        let rows: Vec<Row> = (0..100).map(|i| {
+            Row::from([("id".into(), Cell::Int(i as i64))])
+        }).collect();
+
+        // With 100 distinct values, should NOT use bitmap (> 16 threshold)
+        let row = &rows[0];
+        assert!(!index.should_use_bitmap(0, row, &rows));
     }
 
     #[test]

@@ -4275,6 +4275,9 @@ impl Db {
                 texts.push(text);
             }
         }
+        if texts.is_empty() {
+            return;
+        }
         let refs = texts.iter().map(|text| text.as_ref()).collect::<Vec<_>>();
         let mut vectors = emb.embed_batch(&refs);
         if vectors.len() != row_idxs.len() {

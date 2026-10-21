@@ -22,6 +22,7 @@
 //! Portable backup = self-contained `LIN\x04` MessagePack (never cold stubs).
 //! FTS blobs are local accel; missing/stale files rebuild on open.
 
+use std::cell::RefCell;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, IoSlice, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -56,6 +57,10 @@ const SPARSE_VECTOR_THRESHOLD: usize = 64 * 1024;
 const LOG_MAGIC_CHECKSUM: [u8; 4] = *b"LIN\x06";
 const V2_FACTS_BULK: u8 = 1;
 const V2_INSERT_COLS: u8 = 2;
+
+thread_local! {
+    static FRAME_WRITE_SCRATCH: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(64 * 1024));
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Head {
@@ -566,7 +571,7 @@ pub fn encode_snapshot_compressed(snap: &Snapshot) -> Result<Vec<u8>, Error> {
         out.push(0x01); // Compressed flag
         out.extend_from_slice(&SNAPSHOT_MAGIC);
         out.extend_from_slice(&compressed);
-        return Ok(out);
+        Ok(out)
     }
 
     #[cfg(all(not(feature = "compress-flate"), feature = "compress-lz4"))]
@@ -710,10 +715,6 @@ pub fn open_log_read(dir: &Path) -> Result<Option<File>, Error> {
         .map_err(io_err)
 }
 
-/// Append one record and optionally durability-flush the log ([`SyncMode::Full`]).
-/// Hot packs use a raw columnar codec; others use MessagePack. Both are wrapped
-/// in checksummed v3 frames. Legacy v1/v2 still replay.
-
 /// Append multiple records atomically with parallel encoding — feature-gated optimization
 #[cfg(feature = "parallel")]
 #[allow(dead_code)]
@@ -749,23 +750,13 @@ pub fn append_batch_records(
             return Err(io_err("encoded batch exceeds max size"));
         }
 
-        let codec = [LOG_MAGIC_V1[3]];
+        let codec = LOG_MAGIC_V1[3];
         let mut checksum = crate::crc::Hasher::new();
-        checksum.update(&codec);
+        checksum.update(&[codec]);
         checksum.update(&payload);
         let checksum_bytes = checksum.finalize().to_le_bytes();
 
-        let mut hdr = [0u8; 8];
-        hdr[..4].copy_from_slice(&LOG_MAGIC_CHECKSUM);
-        hdr[4..].copy_from_slice(&(len as u32).to_le_bytes());
-
-        let slices = [
-            IoSlice::new(&hdr),
-            IoSlice::new(&codec),
-            IoSlice::new(&payload),
-            IoSlice::new(&checksum_bytes),
-        ];
-        write_all_vectored(log, &slices).map_err(io_err)?;
+        write_frame_bytes(log, codec, &payload, checksum_bytes, len as u32).map_err(io_err)?;
 
         *log_bytes += 8 + len as u64;
     }
@@ -909,6 +900,41 @@ fn write_all_vectored(log: &mut File, slices: &[IoSlice<'_>]) -> io::Result<()> 
     Ok(())
 }
 
+fn write_frame_bytes(
+    log: &mut File,
+    codec_byte: u8,
+    payload: &[u8],
+    checksum: [u8; 4],
+    len: u32,
+) -> io::Result<()> {
+    const INLINE_MAX: usize = 1024 * 1024;
+    if payload.len() <= INLINE_MAX {
+        FRAME_WRITE_SCRATCH.with(|cell| {
+            let mut scratch = cell.borrow_mut();
+            scratch.clear();
+            scratch.reserve(8 + 1 + payload.len() + 4);
+            scratch.extend_from_slice(&LOG_MAGIC_CHECKSUM);
+            scratch.extend_from_slice(&len.to_le_bytes());
+            scratch.push(codec_byte);
+            scratch.extend_from_slice(payload);
+            scratch.extend_from_slice(&checksum);
+            log.write_all(&scratch)
+        })
+    } else {
+        let mut hdr = [0u8; 8];
+        hdr[..4].copy_from_slice(&LOG_MAGIC_CHECKSUM);
+        hdr[4..].copy_from_slice(&len.to_le_bytes());
+        let codec = [codec_byte];
+        let slices = [
+            IoSlice::new(&hdr),
+            IoSlice::new(&codec),
+            IoSlice::new(payload),
+            IoSlice::new(&checksum),
+        ];
+        write_all_vectored(log, &slices)
+    }
+}
+
 fn write_frame(
     log: &mut File,
     magic: &[u8; 4],
@@ -923,22 +949,13 @@ fn write_frame(
     else {
         return Err(io_err("log record exceeds 16MiB"));
     };
-    let codec = [magic[3]];
+    let codec = magic[3];
     let mut checksum = crate::crc::Hasher::new();
-    checksum.update(&codec);
+    checksum.update(&[codec]);
     checksum.update(payload);
     let checksum = checksum.finalize().to_le_bytes();
-    let mut hdr = [0u8; 8];
-    hdr[..4].copy_from_slice(&LOG_MAGIC_CHECKSUM);
-    hdr[4..].copy_from_slice(&(len as u32).to_le_bytes());
 
-    let slices = [
-        IoSlice::new(&hdr),
-        IoSlice::new(&codec),
-        IoSlice::new(payload),
-        IoSlice::new(&checksum),
-    ];
-    write_all_vectored(log, &slices).map_err(io_err)?;
+    write_frame_bytes(log, codec, payload, checksum, len as u32).map_err(io_err)?;
 
     if sync == SyncMode::Full {
         durable_sync(log).map_err(io_err)?;
@@ -963,7 +980,7 @@ pub(crate) fn durable_sync(file: &File) -> io::Result<()> {
             return Ok(());
         }
         // Older kernels: fall back to FULLFSYNC via sync_data.
-        return file.sync_data();
+        file.sync_data()
     }
     #[cfg(target_os = "linux")]
     {
