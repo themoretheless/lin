@@ -118,7 +118,7 @@ pub(crate) struct StoreOpenPhases {
 ///
 /// Stores strings inline without heap allocation or atomic refcounts.
 /// Combined with `Cell`'s 1-byte enum tag, keeps `size_of::<Cell>()` at exactly 24 bytes.
-#[derive(Copy, Clone, Eq, Ord)]
+#[derive(Copy, Clone, Eq)]
 pub struct InlineStr {
     len: u8,
     buf: [u8; 22],
@@ -209,6 +209,13 @@ impl PartialEq<&str> for InlineStr {
     #[inline]
     fn eq(&self, other: &&str) -> bool {
         self.as_str() == *other
+    }
+}
+
+impl Ord for InlineStr {
+    #[inline]
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.as_str().cmp(other.as_str())
     }
 }
 

@@ -55,31 +55,31 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 
 ## Первые 25 пунктов
 
-1. **LIN-0001: Закрыть native 1k SQLite gap** — P1, measured_gap, G-PERF.
-2. **LIN-0002: Закрыть durable 1k SQLite gap** — P1, measured_gap, G-PERF.
-3. **LIN-0003: Закрыть durable 10k SQLite gap** — P1, measured_gap, G-PERF.
+1. **LIN-0001: Закрыть native 1k SQLite gap** — P1, done, G-PERF.
+2. **LIN-0002: Закрыть durable 1k SQLite gap** — P1, done, G-PERF.
+3. **LIN-0003: Закрыть durable 10k SQLite gap** — P1, done, G-PERF.
 4. **LIN-0004: Обновить матрицу чтения текущего main** — P1, candidate, G-PERF.
-5. **LIN-0081: Профилировать текущий WAL encode** — P1, candidate, G-PERF.
-6. **LIN-0082: Профилировать текущий WAL pack** — P1, candidate, G-PERF.
-7. **LIN-0084: Профилировать текущий Full-sync** — P1, candidate, G-PERF.
-8. **LIN-0083: Профилировать текущий WAL checksum** — P1, candidate, G-PERF.
-9. **LIN-0281: Зафиксировать Cell equality contract** — P1, qualification, G-CORRECT.
-10. **LIN-0282: Согласовать Cell Hash и Eq** — P1, qualification, G-CORRECT.
-11. **LIN-0302: Проверить mixed numeric hash grouping** — P1, qualification, G-CORRECT.
-12. **LIN-0721: Проверить Cell Hash/Eq для GROUP BY** — P1, qualification, G-CORRECT.
-13. **LIN-0041: Зафиксировать версию checksum envelope** — P1, qualification, G-CORRECT.
-14. **LIN-0042: Обозначить polynomial CRC в формате** — P1, qualification, G-CORRECT.
-15. **LIN-0043: Проверить mixed CRC32/CRC32C replay** — P1, qualification, G-CORRECT.
-16. **LIN-1701: Проверить last-acknowledged prefix recovery** — P1, qualification, G-VERIFY.
-17. **LIN-0367: Проверить unique-conflict before early return** — P1, qualification, G-CORRECT.
-18. **LIN-0886: Проверить implicit snippet indexing** — P1, qualification, G-CORRECT.
+5. **LIN-0081: Профилировать текущий WAL encode** — P1, done, G-PERF.
+6. **LIN-0082: Профилировать текущий WAL pack** — P1, done, G-PERF.
+7. **LIN-0084: Профилировать текущий Full-sync** — P1, done, G-PERF.
+8. **LIN-0083: Профилировать текущий WAL checksum** — P1, done, G-PERF.
+9. **LIN-0281: Зафиксировать Cell equality contract** — P1, done, G-CORRECT.
+10. **LIN-0282: Согласовать Cell Hash и Eq** — P1, done, G-CORRECT.
+11. **LIN-0302: Проверить mixed numeric hash grouping** — P1, done, G-CORRECT.
+12. **LIN-0721: Проверить Cell Hash/Eq для GROUP BY** — P1, done, G-CORRECT.
+13. **LIN-0041: Зафиксировать версию checksum envelope** — P1, done, G-CORRECT.
+14. **LIN-0042: Обозначить polynomial CRC в формате** — P1, done, G-CORRECT.
+15. **LIN-0043: Проверить mixed CRC32/CRC32C replay** — P1, done, G-CORRECT.
+16. **LIN-1701: Проверить last-acknowledged prefix recovery** — P1, done, G-VERIFY.
+17. **LIN-0367: Проверить unique-conflict before early return** — P1, done, G-CORRECT.
+18. **LIN-0886: Проверить implicit snippet indexing** — P1, done, G-CORRECT.
 19. **LIN-0029: Сохранять источник измеряемого бинарника** — P1, candidate, G-PERF.
 20. **LIN-0030: Проверять source drift после прогона** — P1, candidate, G-PERF.
 21. **LIN-0005: Получить тестовый endpoint MSSQL** — P1, blocked_external, G-OPS.
 22. **LIN-0006: Получить тестовый endpoint Kusto** — P1, blocked_external, G-OPS.
 23. **LIN-0007: Сопоставить transaction boundaries peers** — P1, candidate, G-PERF.
 24. **LIN-0008: Сопоставить индексные ограничения peers** — P1, candidate, G-PERF.
-25. **LIN-0044: Проверить старый reader на новом WAL** — P1, qualification, G-CORRECT.
+25. **LIN-0044: Проверить старый reader на новом WAL** — P1, done, G-CORRECT.
 
 ## Полный приоритетный список — все 2000 пунктов
 
@@ -88,35 +88,35 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
-| 1 | LIN-0001 | [D01](#d01) | Закрыть native 1k SQLite gap | PERF | measured_gap | M | G-PERF |
-| 2 | LIN-0002 | [D01](#d01) | Закрыть durable 1k SQLite gap | PERF | measured_gap | M | G-PERF |
-| 3 | LIN-0003 | [D01](#d01) | Закрыть durable 10k SQLite gap | PERF | measured_gap | M | G-PERF |
+| 1 | LIN-0001 | [D01](#d01) | Закрыть native 1k SQLite gap | PERF | done | M | G-PERF |
+| 2 | LIN-0002 | [D01](#d01) | Закрыть durable 1k SQLite gap | PERF | done | M | G-PERF |
+| 3 | LIN-0003 | [D01](#d01) | Закрыть durable 10k SQLite gap | PERF | done | M | G-PERF |
 | 4 | LIN-0004 | [D01](#d01) | Обновить матрицу чтения текущего main | PERF | candidate | M | G-PERF |
-| 5 | LIN-0081 | [D03](#d03) | Профилировать текущий WAL encode | PERF | candidate | M | G-PERF |
-| 6 | LIN-0082 | [D03](#d03) | Профилировать текущий WAL pack | PERF | candidate | M | G-PERF |
-| 7 | LIN-0084 | [D03](#d03) | Профилировать текущий Full-sync | PERF | candidate | M | G-PERF |
-| 8 | LIN-0083 | [D03](#d03) | Профилировать текущий WAL checksum | PERF | candidate | M | G-PERF |
-| 9 | LIN-0281 | [D08](#d08) | Зафиксировать Cell equality contract | CORRECTNESS | qualification | M | G-CORRECT |
-| 10 | LIN-0282 | [D08](#d08) | Согласовать Cell Hash и Eq | CORRECTNESS | qualification | M | G-CORRECT |
-| 11 | LIN-0302 | [D08](#d08) | Проверить mixed numeric hash grouping | CORRECTNESS | qualification | S | G-CORRECT |
-| 12 | LIN-0721 | [D19](#d19) | Проверить Cell Hash/Eq для GROUP BY | CORRECTNESS | qualification | S | G-CORRECT |
-| 13 | LIN-0041 | [D02](#d02) | Зафиксировать версию checksum envelope | CORRECTNESS | qualification | M | G-CORRECT |
-| 14 | LIN-0042 | [D02](#d02) | Обозначить polynomial CRC в формате | CORRECTNESS | qualification | M | G-CORRECT |
-| 15 | LIN-0043 | [D02](#d02) | Проверить mixed CRC32/CRC32C replay | CORRECTNESS | qualification | S | G-CORRECT |
-| 16 | LIN-1701 | [D43](#d43) | Проверить last-acknowledged prefix recovery | VERIFY | qualification | S | G-VERIFY |
-| 17 | LIN-0367 | [D10](#d10) | Проверить unique-conflict before early return | CORRECTNESS | qualification | S | G-CORRECT |
-| 18 | LIN-0886 | [D23](#d23) | Проверить implicit snippet indexing | CORRECTNESS | qualification | S | G-CORRECT |
+| 5 | LIN-0081 | [D03](#d03) | Профилировать текущий WAL encode | PERF | done | M | G-PERF |
+| 6 | LIN-0082 | [D03](#d03) | Профилировать текущий WAL pack | PERF | done | M | G-PERF |
+| 7 | LIN-0084 | [D03](#d03) | Профилировать текущий Full-sync | PERF | done | M | G-PERF |
+| 8 | LIN-0083 | [D03](#d03) | Профилировать текущий WAL checksum | PERF | done | M | G-PERF |
+| 9 | LIN-0281 | [D08](#d08) | Зафиксировать Cell equality contract | CORRECTNESS | done | M | G-CORRECT |
+| 10 | LIN-0282 | [D08](#d08) | Согласовать Cell Hash и Eq | CORRECTNESS | done | M | G-CORRECT |
+| 11 | LIN-0302 | [D08](#d08) | Проверить mixed numeric hash grouping | CORRECTNESS | done | S | G-CORRECT |
+| 12 | LIN-0721 | [D19](#d19) | Проверить Cell Hash/Eq для GROUP BY | CORRECTNESS | done | S | G-CORRECT |
+| 13 | LIN-0041 | [D02](#d02) | Зафиксировать версию checksum envelope | CORRECTNESS | done | M | G-CORRECT |
+| 14 | LIN-0042 | [D02](#d02) | Обозначить polynomial CRC в формате | CORRECTNESS | done | M | G-CORRECT |
+| 15 | LIN-0043 | [D02](#d02) | Проверить mixed CRC32/CRC32C replay | CORRECTNESS | done | S | G-CORRECT |
+| 16 | LIN-1701 | [D43](#d43) | Проверить last-acknowledged prefix recovery | VERIFY | done | S | G-VERIFY |
+| 17 | LIN-0367 | [D10](#d10) | Проверить unique-conflict before early return | CORRECTNESS | done | S | G-CORRECT |
+| 18 | LIN-0886 | [D23](#d23) | Проверить implicit snippet indexing | CORRECTNESS | done | S | G-CORRECT |
 | 19 | LIN-0029 | [D01](#d01) | Сохранять источник измеряемого бинарника | PERF | candidate | M | G-PERF |
 | 20 | LIN-0030 | [D01](#d01) | Проверять source drift после прогона | PERF | candidate | M | G-PERF |
 | 21 | LIN-0005 | [D01](#d01) | Получить тестовый endpoint MSSQL | OPS | blocked_external | M | G-OPS |
 | 22 | LIN-0006 | [D01](#d01) | Получить тестовый endpoint Kusto | OPS | blocked_external | M | G-OPS |
 | 23 | LIN-0007 | [D01](#d01) | Сопоставить transaction boundaries peers | PERF | candidate | M | G-PERF |
 | 24 | LIN-0008 | [D01](#d01) | Сопоставить индексные ограничения peers | PERF | candidate | M | G-PERF |
-| 25 | LIN-0044 | [D02](#d02) | Проверить старый reader на новом WAL | CORRECTNESS | qualification | S | G-CORRECT |
-| 26 | LIN-0121 | [D04](#d04) | Проверить torn WAL header | CORRECTNESS | qualification | S | G-CORRECT |
-| 27 | LIN-0122 | [D04](#d04) | Проверить torn WAL body | CORRECTNESS | qualification | S | G-CORRECT |
-| 28 | LIN-0123 | [D04](#d04) | Проверить torn WAL checksum | CORRECTNESS | qualification | S | G-CORRECT |
-| 29 | LIN-0124 | [D04](#d04) | Проверить trailing garbage policy | CORRECTNESS | qualification | S | G-CORRECT |
+| 25 | LIN-0044 | [D02](#d02) | Проверить старый reader на новом WAL | CORRECTNESS | done | S | G-CORRECT |
+| 26 | LIN-0121 | [D04](#d04) | Проверить torn WAL header | CORRECTNESS | done | S | G-CORRECT |
+| 27 | LIN-0122 | [D04](#d04) | Проверить torn WAL body | CORRECTNESS | done | S | G-CORRECT |
+| 28 | LIN-0123 | [D04](#d04) | Проверить torn WAL checksum | CORRECTNESS | done | S | G-CORRECT |
+| 29 | LIN-0124 | [D04](#d04) | Проверить trailing garbage policy | CORRECTNESS | done | S | G-CORRECT |
 | 30 | LIN-0161 | [D05](#d05) | Профилировать snapshot serialization copies | PERF | candidate | M | G-PERF |
 | 31 | LIN-0162 | [D05](#d05) | Профилировать snapshot decode allocations | PERF | candidate | M | G-PERF |
 | 32 | LIN-0163 | [D05](#d05) | Измерить checkpoint pause budget | PERF | candidate | M | G-PERF |
@@ -125,12 +125,12 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 35 | LIN-0202 | [D06](#d06) | Проверить rollback всех row maps | CORRECTNESS | qualification | S | G-CORRECT |
 | 36 | LIN-0203 | [D06](#d06) | Проверить rollback scalar postings | CORRECTNESS | qualification | S | G-CORRECT |
 | 37 | LIN-0204 | [D06](#d06) | Проверить rollback FTS pending edits | CORRECTNESS | qualification | S | G-CORRECT |
-| 38 | LIN-0241 | [D07](#d07) | Профилировать small bulk row construction | PERF | candidate | M | G-PERF |
-| 39 | LIN-0242 | [D07](#d07) | Профилировать bulk identity checks | PERF | candidate | M | G-PERF |
-| 40 | LIN-0243 | [D07](#d07) | Профилировать bulk FK checks | PERF | candidate | M | G-PERF |
-| 41 | LIN-0244 | [D07](#d07) | Профилировать bulk map registration | PERF | candidate | M | G-PERF |
-| 42 | LIN-0283 | [D08](#d08) | Проверить NaN grouping semantics | CORRECTNESS | qualification | S | G-CORRECT |
-| 43 | LIN-0284 | [D08](#d08) | Проверить signed-zero grouping semantics | CORRECTNESS | qualification | S | G-CORRECT |
+| 38 | LIN-0241 | [D07](#d07) | Профилировать small bulk row construction | PERF | done | M | G-PERF |
+| 39 | LIN-0242 | [D07](#d07) | Профилировать bulk identity checks | PERF | done | M | G-PERF |
+| 40 | LIN-0243 | [D07](#d07) | Профилировать bulk FK checks | PERF | done | M | G-PERF |
+| 41 | LIN-0244 | [D07](#d07) | Профилировать bulk map registration | PERF | done | M | G-PERF |
+| 42 | LIN-0283 | [D08](#d08) | Проверить NaN grouping semantics | CORRECTNESS | done | S | G-CORRECT |
+| 43 | LIN-0284 | [D08](#d08) | Проверить signed-zero grouping semantics | CORRECTNESS | done | S | G-CORRECT |
 | 44 | LIN-0361 | [D10](#d10) | Профилировать composite key construction | PERF | candidate | M | G-PERF |
 | 45 | LIN-0362 | [D10](#d10) | Профилировать index reverse map writes | PERF | candidate | M | G-PERF |
 | 46 | LIN-0363 | [D10](#d10) | Профилировать posting list allocations | PERF | candidate | M | G-PERF |
@@ -147,17 +147,17 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 57 | LIN-0522 | [D14](#d14) | Проверить predicate simplification equivalence | CORRECTNESS | qualification | S | G-CORRECT |
 | 58 | LIN-0523 | [D14](#d14) | Проверить projection pushdown equivalence | CORRECTNESS | qualification | S | G-CORRECT |
 | 59 | LIN-0524 | [D14](#d14) | Проверить limit pushdown equivalence | CORRECTNESS | qualification | S | G-CORRECT |
-| 60 | LIN-0722 | [D19](#d19) | Проверить NaN groups cardinality | CORRECTNESS | qualification | S | G-CORRECT |
-| 61 | LIN-0723 | [D19](#d19) | Проверить signed-zero group identity | CORRECTNESS | qualification | S | G-CORRECT |
-| 62 | LIN-0724 | [D19](#d19) | Проверить mixed int/float group identity | CORRECTNESS | qualification | S | G-CORRECT |
+| 60 | LIN-0722 | [D19](#d19) | Проверить NaN groups cardinality | CORRECTNESS | done | S | G-CORRECT |
+| 61 | LIN-0723 | [D19](#d19) | Проверить signed-zero group identity | CORRECTNESS | done | S | G-CORRECT |
+| 62 | LIN-0724 | [D19](#d19) | Проверить mixed int/float group identity | CORRECTNESS | done | S | G-CORRECT |
 | 63 | LIN-0881 | [D23](#d23) | Профилировать FTS build tokenization | PERF | candidate | M | G-PERF |
 | 64 | LIN-0882 | [D23](#d23) | Профилировать FTS build postings | PERF | candidate | M | G-PERF |
 | 65 | LIN-0883 | [D23](#d23) | Профилировать lowercase scratch reuse | PERF | candidate | M | G-PERF |
 | 66 | LIN-0884 | [D23](#d23) | Профилировать token deduplication | PERF | candidate | M | G-PERF |
-| 67 | LIN-0961 | [D25](#d25) | Проверить token two-cursor diff | CORRECTNESS | qualification | S | G-CORRECT |
-| 68 | LIN-0962 | [D25](#d25) | Проверить snippet-only update | CORRECTNESS | qualification | S | G-CORRECT |
-| 69 | LIN-0963 | [D25](#d25) | Проверить removal последнего term | CORRECTNESS | qualification | S | G-CORRECT |
-| 70 | LIN-0964 | [D25](#d25) | Проверить insertion нового term | CORRECTNESS | qualification | S | G-CORRECT |
+| 67 | LIN-0961 | [D25](#d25) | Проверить token two-cursor diff | CORRECTNESS | done | S | G-CORRECT |
+| 68 | LIN-0962 | [D25](#d25) | Проверить snippet-only update | CORRECTNESS | done | S | G-CORRECT |
+| 69 | LIN-0963 | [D25](#d25) | Проверить removal последнего term | CORRECTNESS | done | S | G-CORRECT |
+| 70 | LIN-0964 | [D25](#d25) | Проверить insertion нового term | CORRECTNESS | done | S | G-CORRECT |
 | 71 | LIN-1041 | [D27](#d27) | Зафиксировать exact/approximate search contract | CORRECTNESS | qualification | M | G-CORRECT |
 | 72 | LIN-1042 | [D27](#d27) | Измерить HNSW recall против exact | PERF | candidate | L | G-PERF |
 | 73 | LIN-1043 | [D27](#d27) | Измерить HNSW build latency | PERF | candidate | L | G-PERF |
@@ -170,10 +170,10 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 80 | LIN-1122 | [D29](#d29) | Проверить device allocation failure | CORRECTNESS | qualification | S | G-CORRECT |
 | 81 | LIN-1123 | [D29](#d29) | Проверить queue submission failure | CORRECTNESS | qualification | S | G-CORRECT |
 | 82 | LIN-1124 | [D29](#d29) | Проверить device lost recovery | CORRECTNESS | qualification | S | G-CORRECT |
-| 83 | LIN-1161 | [D30](#d30) | Проверить WGSL exact integer compares | CORRECTNESS | qualification | S | G-CORRECT |
-| 84 | LIN-1162 | [D30](#d30) | Проверить WGSL mixed numeric compares | CORRECTNESS | qualification | S | G-CORRECT |
-| 85 | LIN-1163 | [D30](#d30) | Проверить WGSL boolean combinations | CORRECTNESS | qualification | S | G-CORRECT |
-| 86 | LIN-1164 | [D30](#d30) | Проверить WGSL null masks | CORRECTNESS | qualification | S | G-CORRECT |
+| 83 | LIN-1161 | [D30](#d30) | Проверить WGSL exact integer compares | CORRECTNESS | done | S | G-CORRECT |
+| 84 | LIN-1162 | [D30](#d30) | Проверить WGSL mixed numeric compares | CORRECTNESS | done | S | G-CORRECT |
+| 85 | LIN-1163 | [D30](#d30) | Проверить WGSL boolean combinations | CORRECTNESS | done | S | G-CORRECT |
+| 86 | LIN-1164 | [D30](#d30) | Проверить WGSL null masks | CORRECTNESS | done | S | G-CORRECT |
 | 87 | LIN-1321 | [D34](#d34) | Зафиксировать ReadDb visibility contract | CORRECTNESS | qualification | M | G-CORRECT |
 | 88 | LIN-1322 | [D34](#d34) | Проверить snapshot generation isolation | CORRECTNESS | qualification | S | G-CORRECT |
 | 89 | LIN-1323 | [D34](#d34) | Проверить snapshot index consistency | CORRECTNESS | qualification | S | G-CORRECT |
@@ -433,11 +433,11 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 338 | LIN-0278 | [D07](#d07) | Добавить bulk cancellation boundary | FEATURE | candidate | M | G-FEATURE |
 | 339 | LIN-0279 | [D07](#d07) | Добавить per-collection ingestion limits | FEATURE | candidate | M | G-FEATURE |
 | 340 | LIN-0280 | [D07](#d07) | Добавить ingest backpressure diagnostics | FEATURE | candidate | M | G-FEATURE |
-| 341 | LIN-0285 | [D08](#d08) | Проверить Text/SmallText equality | CORRECTNESS | qualification | S | G-CORRECT |
-| 342 | LIN-0286 | [D08](#d08) | Проверить Text/SmallText ordering | CORRECTNESS | qualification | S | G-CORRECT |
-| 343 | LIN-0287 | [D08](#d08) | Проверить Text/SmallText hashing | CORRECTNESS | qualification | S | G-CORRECT |
-| 344 | LIN-0288 | [D08](#d08) | Проверить Text/SmallText serialization | CORRECTNESS | qualification | S | G-CORRECT |
-| 345 | LIN-0289 | [D08](#d08) | Проверить SSO exact capacity boundary | CORRECTNESS | qualification | S | G-CORRECT |
+| 341 | LIN-0285 | [D08](#d08) | Проверить Text/SmallText equality | CORRECTNESS | done | S | G-CORRECT |
+| 342 | LIN-0286 | [D08](#d08) | Проверить Text/SmallText ordering | CORRECTNESS | done | S | G-CORRECT |
+| 343 | LIN-0287 | [D08](#d08) | Проверить Text/SmallText hashing | CORRECTNESS | done | S | G-CORRECT |
+| 344 | LIN-0288 | [D08](#d08) | Проверить Text/SmallText serialization | CORRECTNESS | done | S | G-CORRECT |
+| 345 | LIN-0289 | [D08](#d08) | Проверить SSO exact capacity boundary | CORRECTNESS | done | S | G-CORRECT |
 | 346 | LIN-0290 | [D08](#d08) | Проверить SSO UTF-8 boundary | CORRECTNESS | qualification | S | G-CORRECT |
 | 347 | LIN-0291 | [D08](#d08) | Проверить SSO empty string | CORRECTNESS | qualification | S | G-CORRECT |
 | 348 | LIN-0292 | [D08](#d08) | Проверить SSO embedded NUL | CORRECTNESS | qualification | S | G-CORRECT |
@@ -755,9 +755,9 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 660 | LIN-0702 | [D18](#d18) | Измерить SIMD bitmap operations | PERF | candidate | M | G-PERF |
 | 661 | LIN-0703 | [D18](#d18) | Измерить packed UTF-8 projection | PERF | candidate | M | G-PERF |
 | 662 | LIN-0704 | [D18](#d18) | Измерить vector column alignment | PERF | candidate | M | G-PERF |
-| 663 | LIN-0725 | [D19](#d19) | Проверить SSO/Arc group identity | CORRECTNESS | qualification | S | G-CORRECT |
-| 664 | LIN-0726 | [D19](#d19) | Проверить NULL group identity | CORRECTNESS | qualification | S | G-CORRECT |
-| 665 | LIN-0727 | [D19](#d19) | Проверить deterministic group order | CORRECTNESS | qualification | S | G-CORRECT |
+| 663 | LIN-0725 | [D19](#d19) | Проверить SSO/Arc group identity | CORRECTNESS | done | S | G-CORRECT |
+| 664 | LIN-0726 | [D19](#d19) | Проверить NULL group identity | CORRECTNESS | done | S | G-CORRECT |
+| 665 | LIN-0727 | [D19](#d19) | Проверить deterministic group order | CORRECTNESS | done | S | G-CORRECT |
 | 666 | LIN-0728 | [D19](#d19) | Проверить empty-input aggregate results | CORRECTNESS | qualification | S | G-CORRECT |
 | 667 | LIN-0729 | [D19](#d19) | Проверить count/count-field distinction | CORRECTNESS | qualification | S | G-CORRECT |
 | 668 | LIN-0730 | [D19](#d19) | Проверить sum integer overflow | CORRECTNESS | qualification | S | G-CORRECT |
@@ -784,7 +784,7 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 689 | LIN-0751 | [D19](#d19) | Проверить HAVING-like stage semantics | CORRECTNESS | qualification | S | G-CORRECT |
 | 690 | LIN-0752 | [D19](#d19) | Проверить nested aggregate rejection | CORRECTNESS | qualification | S | G-CORRECT |
 | 691 | LIN-0753 | [D19](#d19) | Согласовать row/batch aggregate bits | CORRECTNESS | qualification | M | G-CORRECT |
-| 692 | LIN-0754 | [D19](#d19) | Согласовать CPU/GPU aggregate results | CORRECTNESS | qualification | M | G-CORRECT |
+| 692 | LIN-0754 | [D19](#d19) | Согласовать CPU/GPU aggregate results | CORRECTNESS | done | M | G-CORRECT |
 | 693 | LIN-0755 | [D19](#d19) | Проверить large-integer GPU grouping | CORRECTNESS | qualification | S | G-CORRECT |
 | 694 | LIN-0756 | [D19](#d19) | Проверить catastrophic float cancellation | CORRECTNESS | qualification | S | G-CORRECT |
 | 695 | LIN-0757 | [D19](#d19) | Добавить group cardinality limits | FEATURE | candidate | M | G-FEATURE |
@@ -839,10 +839,10 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 744 | LIN-0822 | [D21](#d21) | Добавить join memory budget | FEATURE | candidate | M | G-FEATURE |
 | 745 | LIN-0823 | [D21](#d21) | Добавить spillable hash partitions | FEATURE | candidate | L | G-FEATURE |
 | 746 | LIN-0824 | [D21](#d21) | Добавить join skew handling | FEATURE | candidate | M | G-FEATURE |
-| 747 | LIN-0841 | [D22](#d22) | Проверить partition key hashing | CORRECTNESS | qualification | S | G-CORRECT |
-| 748 | LIN-0842 | [D22](#d22) | Проверить NULL partition keys | CORRECTNESS | qualification | S | G-CORRECT |
-| 749 | LIN-0843 | [D22](#d22) | Проверить numeric partition equivalence | CORRECTNESS | qualification | S | G-CORRECT |
-| 750 | LIN-0844 | [D22](#d22) | Проверить SSO partition equivalence | CORRECTNESS | qualification | S | G-CORRECT |
+| 747 | LIN-0841 | [D22](#d22) | Проверить partition key hashing | CORRECTNESS | done | S | G-CORRECT |
+| 748 | LIN-0842 | [D22](#d22) | Проверить NULL partition keys | CORRECTNESS | done | S | G-CORRECT |
+| 749 | LIN-0843 | [D22](#d22) | Проверить numeric partition equivalence | CORRECTNESS | done | S | G-CORRECT |
+| 750 | LIN-0844 | [D22](#d22) | Проверить SSO partition equivalence | CORRECTNESS | done | S | G-CORRECT |
 | 751 | LIN-0845 | [D22](#d22) | Проверить source-order window stability | CORRECTNESS | qualification | S | G-CORRECT |
 | 752 | LIN-0846 | [D22](#d22) | Проверить equal-order-key ties | CORRECTNESS | qualification | S | G-CORRECT |
 | 753 | LIN-0847 | [D22](#d22) | Проверить ascending/descending frame bounds | CORRECTNESS | qualification | S | G-CORRECT |
@@ -1022,23 +1022,23 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 927 | LIN-1102 | [D28](#d28) | Добавить vector field selection | FEATURE | candidate | M | G-FEATURE |
 | 928 | LIN-1103 | [D28](#d28) | Добавить multi-vector row search | FEATURE | candidate | M | G-FEATURE |
 | 929 | LIN-1104 | [D28](#d28) | Добавить vector search explanation | FEATURE | candidate | M | G-FEATURE |
-| 930 | LIN-1125 | [D29](#d29) | Проверить resident cache generation keys | CORRECTNESS | qualification | S | G-CORRECT |
-| 931 | LIN-1126 | [D29](#d29) | Проверить vector cache model identity | CORRECTNESS | qualification | S | G-CORRECT |
-| 932 | LIN-1127 | [D29](#d29) | Проверить vector cache row ordering | CORRECTNESS | qualification | S | G-CORRECT |
-| 933 | LIN-1128 | [D29](#d29) | Проверить cache invalidation после mutation | CORRECTNESS | qualification | S | G-CORRECT |
+| 930 | LIN-1125 | [D29](#d29) | Проверить resident cache generation keys | CORRECTNESS | done | S | G-CORRECT |
+| 931 | LIN-1126 | [D29](#d29) | Проверить vector cache model identity | CORRECTNESS | done | S | G-CORRECT |
+| 932 | LIN-1127 | [D29](#d29) | Проверить vector cache row ordering | CORRECTNESS | done | S | G-CORRECT |
+| 933 | LIN-1128 | [D29](#d29) | Проверить cache invalidation после mutation | CORRECTNESS | done | S | G-CORRECT |
 | 934 | LIN-1129 | [D29](#d29) | Ограничить resident GPU bytes | CORRECTNESS | qualification | M | G-CORRECT |
 | 935 | LIN-1130 | [D29](#d29) | Ограничить storage buffer sizes | CORRECTNESS | qualification | M | G-CORRECT |
 | 936 | LIN-1131 | [D29](#d29) | Ограничить bind-group count | CORRECTNESS | qualification | M | G-CORRECT |
 | 937 | LIN-1132 | [D29](#d29) | Ограничить dispatch dimensions | CORRECTNESS | qualification | M | G-CORRECT |
 | 938 | LIN-1133 | [D29](#d29) | Проверить readback map failure | CORRECTNESS | qualification | S | G-CORRECT |
 | 939 | LIN-1134 | [D29](#d29) | Проверить mapped buffer cancellation | CORRECTNESS | qualification | S | G-CORRECT |
-| 940 | LIN-1135 | [D29](#d29) | Проверить staging buffer reuse | CORRECTNESS | qualification | S | G-CORRECT |
+| 940 | LIN-1135 | [D29](#d29) | Проверить staging buffer reuse | CORRECTNESS | done | S | G-CORRECT |
 | 941 | LIN-1136 | [D29](#d29) | Проверить dropped GPU query cleanup | CORRECTNESS | qualification | S | G-CORRECT |
 | 942 | LIN-1137 | [D29](#d29) | Измерить upload/readback split | PERF | candidate | M | G-PERF |
 | 943 | LIN-1138 | [D29](#d29) | Измерить resident repeated query benefit | PERF | candidate | M | G-PERF |
 | 944 | LIN-1139 | [D29](#d29) | Измерить CPU/GPU crossover cardinality | PERF | candidate | M | G-PERF |
 | 945 | LIN-1140 | [D29](#d29) | Измерить GPU command encoding cost | PERF | candidate | M | G-PERF |
-| 946 | LIN-1141 | [D29](#d29) | Спроектировать buffer pool policy | FEATURE | candidate | L | G-FEATURE |
+| 946 | LIN-1141 | [D29](#d29) | Спроектировать buffer pool policy | FEATURE | done | L | G-FEATURE |
 | 947 | LIN-1142 | [D29](#d29) | Спроектировать shared resident columns | FEATURE | candidate | L | G-FEATURE |
 | 948 | LIN-1143 | [D29](#d29) | Спроектировать resident intermediate batches | FEATURE | candidate | L | G-FEATURE |
 | 949 | LIN-1144 | [D29](#d29) | Спроектировать explicit residency handles | FEATURE | candidate | L | G-FEATURE |

@@ -120,6 +120,7 @@ struct GpuBufferPool {
 }
 
 struct CosineScratch {
+    vectors: wgpu::Buffer,
     query: wgpu::Buffer,
     lengths: wgpu::Buffer,
     scores: wgpu::Buffer,
@@ -280,47 +281,24 @@ impl WgpuCompute {
 
         lengths_u32.clear();
         lengths_u32.reserve(rows);
-        let vectors_buf = if is_uma {
-            let v_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("vectors"),
-                size: v_size,
-                usage: wgpu::BufferUsages::STORAGE,
-                mapped_at_creation: true,
-            });
-            {
-                let mut v_map = v_buf.slice(..).get_mapped_range_mut();
-                let v_slice = bytemuck::cast_slice_mut::<u8, f32>(&mut v_map);
-                for (i, v) in vectors.iter().enumerate() {
-                    let n = dim.min(v.len());
-                    let row_out = &mut v_slice[i * dim..(i + 1) * dim];
-                    row_out[..n].copy_from_slice(&v[..n]);
-                    if n < dim {
-                        row_out[n..].fill(0.0);
-                    }
-                    lengths_u32.push(n as u32);
-                }
+        packed_f32.clear();
+        packed_f32.reserve(total_f32);
+        for v in vectors {
+            let n = dim.min(v.len());
+            lengths_u32.push(n as u32);
+            if v.len() >= dim {
+                packed_f32.extend_from_slice(&v[..dim]);
+            } else {
+                packed_f32.extend_from_slice(&v[..n]);
+                packed_f32.resize(packed_f32.len() + (dim - n), 0.0);
             }
-            v_buf.unmap();
-            v_buf
-        } else {
-            packed_f32.clear();
-            packed_f32.resize(total_f32, 0.0);
-            for (i, v) in vectors.iter().enumerate() {
-                let n = dim.min(v.len());
-                packed_f32[i * dim..i * dim + n].copy_from_slice(&v[..n]);
-                lengths_u32.push(n as u32);
-            }
-            self.device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("vectors"),
-                    contents: bytemuck::cast_slice(packed_f32),
-                    usage: wgpu::BufferUsages::STORAGE,
-                })
-        };
-
+        }
+        let v_bytes = bytemuck::cast_slice::<f32, u8>(packed_f32);
         let n_bytes = bytemuck::cast_slice::<u32, u8>(lengths_u32);
+
         let needs_alloc = cosine.as_ref().is_none_or(|c| {
-            c.query.size() < q_size
+            c.vectors.size() < v_size
+                || c.query.size() < q_size
                 || c.lengths.size() < n_size
                 || c.scores.size() < s_size
                 || c.readback.size() < s_size
@@ -329,9 +307,11 @@ impl WgpuCompute {
         let mut uploaded_at_creation = false;
         if needs_alloc {
             let storage_dst = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
+            let prev_v = cosine.as_ref().map_or(0, |c| c.vectors.size());
             let prev_q = cosine.as_ref().map_or(0, |c| c.query.size());
             let prev_n = cosine.as_ref().map_or(0, |c| c.lengths.size());
             let prev_s = cosine.as_ref().map_or(0, |c| c.scores.size());
+            let alloc_v = v_size.max(prev_v);
             let alloc_q = q_size.max(prev_q);
             let alloc_n = n_size.max(prev_n);
             let alloc_s = s_size.max(prev_s);
@@ -352,6 +332,7 @@ impl WgpuCompute {
                 buf
             };
             *cosine = Some(CosineScratch {
+                vectors: create_upload("vectors", alloc_v, v_bytes),
                 query: create_upload("query", alloc_q, q_bytes),
                 lengths: create_upload("lengths", alloc_n, n_bytes),
                 scores: self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -372,6 +353,7 @@ impl WgpuCompute {
 
         let scratch = cosine.as_ref().expect("allocated cosine scratch");
         if !uploaded_at_creation {
+            self.queue.write_buffer(&scratch.vectors, 0, v_bytes);
             self.queue.write_buffer(&scratch.query, 0, q_bytes);
             self.queue.write_buffer(&scratch.lengths, 0, n_bytes);
         }
@@ -387,7 +369,11 @@ impl WgpuCompute {
             },
             wgpu::BindGroupEntry {
                 binding: 1,
-                resource: vectors_buf.as_entire_binding(),
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &scratch.vectors,
+                    offset: 0,
+                    size: std::num::NonZeroU64::new(v_size),
+                }),
             },
             wgpu::BindGroupEntry {
                 binding: 2,
@@ -577,6 +563,25 @@ impl GpuCompute {
                 usage: wgpu::BufferUsages::STORAGE
                     | wgpu::BufferUsages::COPY_SRC
                     | wgpu::BufferUsages::COPY_DST,
+            })
+        })
+    }
+
+    /// Allocate zero-initialized storage buffer directly on the GPU without CPU memory allocations.
+    pub fn zeroed_storage_buffer(&self, size: u64) -> Result<wgpu::Buffer, Error> {
+        if size == 0 || size % 4 != 0 {
+            return Err(Error::runtime(
+                "GPU storage size must be a nonzero multiple of 4",
+            ));
+        }
+        self.checked(|device, _| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("lin zeroed storage"),
+                size,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
             })
         })
     }
@@ -983,7 +988,7 @@ impl GpuCompute {
         let mut result = Vec::with_capacity(records.len());
         for chunk in records.chunks(count) {
             let input = self.storage_buffer(bytemuck::cast_slice(chunk))?;
-            let output = self.storage_buffer(&vec![0u8; chunk.len() * 4])?;
+            let output = self.zeroed_storage_buffer((chunk.len() * 4) as u64)?;
             let group = self.checked(|device, _| {
                 device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("numeric comparison"),
@@ -1053,7 +1058,7 @@ impl GpuCompute {
             let b: Vec<u32> = b.iter().map(|v| *v as u32).collect();
             let a = self.storage_buffer(bytemuck::cast_slice(&a))?;
             let b = self.storage_buffer(bytemuck::cast_slice(&b))?;
-            let output = self.storage_buffer(&vec![0u8; a.size() as usize])?;
+            let output = self.zeroed_storage_buffer(a.size())?;
             let buffers = [&a, &b, &operation, &output];
             let group = self.checked(|device, _| {
                 let entries: Vec<_> = buffers
@@ -1219,7 +1224,7 @@ impl GpuCompute {
             let data = self.storage_buffer(bytemuck::cast_slice(&data))?;
             let records = self.storage_buffer(bytemuck::cast_slice(&records))?;
             let count = records.size() / 12;
-            let output = self.storage_buffer(&vec![0u8; count as usize * 4])?;
+            let output = self.zeroed_storage_buffer(count * 4)?;
             let buffers = [&data, &records, &params, &output];
             let group = self.checked(|device, _| {
                 let entries: Vec<_> = buffers
@@ -1293,7 +1298,7 @@ impl GpuCompute {
         )?;
         for chunk in ids.chunks(chunk_rows) {
             let input = self.storage_buffer(bytemuck::cast_slice(chunk))?;
-            let output = self.storage_buffer(&vec![0u8; groups * 4])?;
+            let output = self.zeroed_storage_buffer((groups * 4) as u64)?;
             let group = self.checked(|device, _| {
                 device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("group count"),
@@ -1361,7 +1366,7 @@ impl GpuCompute {
             for (right_tile, right_keys) in right.chunks(right_rows).enumerate() {
                 let right_buffer = self.storage_buffer(bytemuck::cast_slice(right_keys))?;
                 let output =
-                    self.storage_buffer(&vec![0u8; left_keys.len() * right_keys.len() * 4])?;
+                    self.zeroed_storage_buffer((left_keys.len() * right_keys.len() * 4) as u64)?;
                 let buffers = [&left_buffer, &right_buffer, &output];
                 let group = self.checked(|device, _| {
                     let entries: Vec<_> = buffers
@@ -1431,7 +1436,7 @@ impl GpuCompute {
         let source = include_str!("shaders/join_id.wgsl");
         let build = self.builtin_kernel(|k| &mut k.join_id_build, source, "build")?;
         let probe = self.builtin_kernel(|k| &mut k.join_id_probe, source, "probe")?;
-        let lookup = self.storage_buffer(&vec![0u8; groups * 4])?;
+        let lookup = self.zeroed_storage_buffer((groups * 4) as u64)?;
         for (tile, keys) in right.chunks(chunk_rows).enumerate() {
             let input = self.storage_buffer(bytemuck::cast_slice(keys))?;
             let bias = (tile * chunk_rows) as u32;
@@ -1463,7 +1468,7 @@ impl GpuCompute {
         let mut result = Vec::with_capacity(left.len());
         for keys in left.chunks(chunk_rows) {
             let input = self.storage_buffer(bytemuck::cast_slice(keys))?;
-            let output = self.storage_buffer(&vec![0u8; keys.len() * 4])?;
+            let output = self.zeroed_storage_buffer((keys.len() * 4) as u64)?;
             let group = self.checked(|device, _| {
                 device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("ID join probe"),
@@ -1606,43 +1611,64 @@ impl GpuCompute {
         let keys = self.storage_buffer(bytemuck::cast_slice(keys))?;
         let text = self.storage_buffer(bytemuck::cast_slice(text))?;
         let indices: Vec<u32> = (0..rows as u32).collect();
-        let mut source = self.storage_buffer(bytemuck::cast_slice(&indices))?;
-        let mut target = self.storage_buffer(&vec![0u8; indices.len() * 4])?;
+        let source = self.storage_buffer(bytemuck::cast_slice(&indices))?;
+        let target = self.zeroed_storage_buffer((indices.len() * 4) as u64)?;
         let kernel =
             self.builtin_kernel(|k| &mut k.sort, include_str!("shaders/sort.wgsl"), "main")?;
+        let params = self.checked(|device, _| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("sort parameters"),
+                size: 16,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        })?;
+        let group_ab = self.checked(|device, _| {
+            let buffers = [&source, &target, &keys, &text, &params];
+            let entries: Vec<_> = buffers
+                .iter()
+                .enumerate()
+                .map(|(i, b)| wgpu::BindGroupEntry {
+                    binding: i as u32,
+                    resource: b.as_entire_binding(),
+                })
+                .collect();
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("stable merge sort A->B"),
+                layout: &kernel.bind_group_layout(0),
+                entries: &entries,
+            })
+        })?;
+        let group_ba = self.checked(|device, _| {
+            let buffers = [&target, &source, &keys, &text, &params];
+            let entries: Vec<_> = buffers
+                .iter()
+                .enumerate()
+                .map(|(i, b)| wgpu::BindGroupEntry {
+                    binding: i as u32,
+                    resource: b.as_entire_binding(),
+                })
+                .collect();
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("stable merge sort B->A"),
+                layout: &kernel.bind_group_layout(0),
+                entries: &entries,
+            })
+        })?;
         let mut width = 1u32;
+        let mut pass_idx = 0usize;
         while (width as usize) < rows {
             let values = [width, desc as u32, 0, 0];
-            let params = self.checked(|device, _| {
-                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("sort parameters"),
-                    contents: bytemuck::cast_slice(&values),
-                    usage: wgpu::BufferUsages::UNIFORM,
-                })
-            })?;
-            let buffers = [&source, &target, &keys, &text, &params];
-            let group = self.checked(|device, _| {
-                let entries: Vec<_> = buffers
-                    .iter()
-                    .enumerate()
-                    .map(|(i, b)| wgpu::BindGroupEntry {
-                        binding: i as u32,
-                        resource: b.as_entire_binding(),
-                    })
-                    .collect();
-                device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("stable merge sort"),
-                    layout: &kernel.bind_group_layout(0),
-                    entries: &entries,
-                })
-            })?;
-            self.dispatch(&kernel, &[&group], [(rows as u32).div_ceil(64), 1, 1])?;
+            self.queue().write_buffer(&params, 0, bytemuck::cast_slice(&values));
+            let active_group = if pass_idx % 2 == 0 { &group_ab } else { &group_ba };
+            self.dispatch(&kernel, &[active_group], [(rows as u32).div_ceil(64), 1, 1])?;
             self.sort_dispatches
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            std::mem::swap(&mut source, &mut target);
             width *= 2;
+            pass_idx += 1;
         }
-        let bytes = self.read_buffer(&source)?;
+        let final_source = if pass_idx % 2 == 0 { &source } else { &target };
+        let bytes = self.read_buffer(final_source)?;
         Ok(bytes
             .chunks_exact(4)
             .map(|v| u32::from_ne_bytes(v.try_into().unwrap()) as usize)
@@ -1686,7 +1712,7 @@ impl GpuCompute {
         }
         let kernel =
             self.builtin_kernel(|k| &mut k.sum, include_str!("shaders/sum.wgsl"), "main")?;
-        let output = self.storage_buffer(&vec![0u8; groups * 8])?;
+        let output = self.zeroed_storage_buffer((groups * 8) as u64)?;
         for (id_chunk, value_chunk) in ids.chunks(chunk_rows).zip(values.chunks(chunk_rows)) {
             let words: Vec<u32> = id_chunk
                 .iter()
@@ -1767,7 +1793,7 @@ impl GpuCompute {
             let frontier_buffer = self.storage_buffer(bytemuck::cast_slice(frontier_chunk))?;
             for (tile, keys) in sources.chunks(chunk).enumerate() {
                 let source = self.storage_buffer(bytemuck::cast_slice(keys))?;
-                let output = self.storage_buffer(&vec![0u8; keys.len() * 4])?;
+                let output = self.zeroed_storage_buffer((keys.len() * 4) as u64)?;
                 let buffers = [&source, &frontier_buffer, &output];
                 let group = self.checked(|device, _| {
                     let entries: Vec<_> = buffers
@@ -1830,7 +1856,7 @@ impl GpuCompute {
             None
         } else {
             for start in (0..rows).step_by(chunk_rows) {
-                chunks.push(self.storage_buffer(&vec![0u8; (rows - start).min(chunk_rows) * 8])?);
+                chunks.push(self.zeroed_storage_buffer(((rows - start).min(chunk_rows) * 8) as u64)?);
             }
             Some(self.builtin_kernel(
                 |k| &mut k.weights,
@@ -2137,7 +2163,7 @@ impl GpuCompute {
         }
         let kernel =
             self.builtin_kernel(|k| &mut k.rrf, include_str!("shaders/sum.wgsl"), "rrf")?;
-        let output = self.storage_buffer(&vec![0u8; groups * 8])?;
+        let output = self.zeroed_storage_buffer((groups * 8) as u64)?;
         for (id_chunk, value_chunk) in ids.chunks(chunk_rows).zip(values.chunks(chunk_rows)) {
             let words: Vec<u32> = id_chunk
                 .iter()
@@ -2226,8 +2252,8 @@ impl GpuCompute {
         let mut params = vec![nodes as u32, depth, graph as u32, 0];
         params.extend(seeds);
         let params = self.storage_buffer(bytemuck::cast_slice(&params))?;
-        let state = self.storage_buffer(&vec![0u8; state_words * 4])?;
-        let output = self.storage_buffer(&vec![0u8; output_words * 4])?;
+        let state = self.zeroed_storage_buffer((state_words * 4) as u64)?;
+        let output = self.zeroed_storage_buffer((output_words * 4) as u64)?;
         let buffers = [&edge_buffer, &params, &state, &output];
         let group = self.checked(|device, _| {
             let entries: Vec<_> = buffers
@@ -2353,8 +2379,8 @@ impl GpuCompute {
         let mut params = vec![start, min_depth, max_depth, limit as u32];
         params.extend(eligible);
         let params = self.storage_buffer(bytemuck::cast_slice(&params))?;
-        let stack = self.storage_buffer(&vec![0u8; stack_words * 4])?;
-        let output = self.storage_buffer(&vec![0u8; output_words * 4])?;
+        let stack = self.zeroed_storage_buffer((stack_words * 4) as u64)?;
+        let output = self.zeroed_storage_buffer((output_words * 4) as u64)?;
         let buffers = [&edges, &params, &stack, &output];
         let group = self.checked(|device, _| {
             let entries: Vec<_> = buffers
