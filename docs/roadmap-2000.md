@@ -1726,9 +1726,9 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 1626 | LIN-1146 | [D29](#d29) | Проверить invalid shader recovery | CORRECTNESS | qualification | S | G-CORRECT |
 | 1627 | LIN-1147 | [D29](#d29) | Проверить invalid binding recovery | CORRECTNESS | qualification | S | G-CORRECT |
 | 1628 | LIN-1148 | [D29](#d29) | Проверить invalid dispatch recovery | CORRECTNESS | qualification | S | G-CORRECT |
-| 1629 | LIN-1149 | [D29](#d29) | Добавить adapter capability report | FEATURE | candidate | M | G-FEATURE |
-| 1630 | LIN-1150 | [D29](#d29) | Добавить resident allocation counters | FEATURE | candidate | M | G-FEATURE |
-| 1631 | LIN-1151 | [D29](#d29) | Добавить transfer byte counters | FEATURE | candidate | M | G-FEATURE |
+| 1629 | LIN-1149 | [D29](#d29) | Добавить adapter capability report | FEATURE | done | M | G-FEATURE |
+| 1630 | LIN-1150 | [D29](#d29) | Добавить resident allocation counters | FEATURE | done | M | G-FEATURE |
+| 1631 | LIN-1151 | [D29](#d29) | Добавить transfer byte counters | FEATURE | done | M | G-FEATURE |
 | 1632 | LIN-1152 | [D29](#d29) | Добавить device error provenance | FEATURE | candidate | M | G-FEATURE |
 | 1633 | LIN-1153 | [D29](#d29) | Проверить Metal backend conformance | CORRECTNESS | qualification | S | G-CORRECT |
 | 1634 | LIN-1154 | [D29](#d29) | Проверить Vulkan backend conformance | CORRECTNESS | qualification | S | G-CORRECT |

@@ -831,6 +831,12 @@ impl Db {
             .stats())
     }
 
+    /// Return the active GPU adapter capabilities, memory limits, and UMA status.
+    #[cfg(feature = "gpu")]
+    pub fn gpu_adapter_report(&self) -> Option<crate::gpu::GpuAdapterReport> {
+        self.gpu.as_ref().map(|g| g.adapter_report())
+    }
+
     /// Replace the active embedder. Updates `store.embed_id` / catalog to match.
     pub fn with_embedder(mut self, embedder: Arc<dyn Embedder>) -> Self {
         self.catalog.embed_id = embedder.id().to_string();
@@ -1607,6 +1613,11 @@ impl ReadDb {
     #[cfg(feature = "gpu")]
     pub fn gpu(&self) -> Option<&Arc<crate::gpu::GpuCompute>> {
         self.inner.gpu()
+    }
+
+    #[cfg(feature = "gpu")]
+    pub fn gpu_adapter_report(&self) -> Option<crate::gpu::GpuAdapterReport> {
+        self.inner.gpu_adapter_report()
     }
 
     pub fn stats(&self) -> Stats {

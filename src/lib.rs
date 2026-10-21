@@ -105,6 +105,9 @@ pub use store::{Cell, InlineStr, Row, RowExt, Store};
 #[cfg(feature = "async")]
 pub use async_db::{AsyncDb, AsyncReadDb};
 
+#[cfg(feature = "gpu")]
+pub use gpu::{GpuAdapterReport, GpuCompute};
+
 #[cfg(feature = "derive")]
 pub use lin_derive::LinRow;
 

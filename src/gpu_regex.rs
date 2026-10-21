@@ -176,8 +176,8 @@ impl GpuCompute {
             input.extend(records);
             input.extend(data);
             let input = self.storage_buffer(bytemuck::cast_slice(&input))?;
-            let scratch = self.storage_buffer(&vec![0u8; count * scratch_words * 4])?;
-            let output = self.storage_buffer(&vec![0u8; count * 4])?;
+            let scratch = self.zeroed_storage_buffer((count * scratch_words * 4) as u64)?;
+            let output = self.zeroed_storage_buffer((count * 4) as u64)?;
             let buffers = [&program, &input, &scratch, &output];
             let group = self.checked(|device, _| {
                 let entries: Vec<_> = buffers
@@ -197,10 +197,11 @@ impl GpuCompute {
             self.dispatch(&kernel, &[&group], [count.div_ceil(64) as u32, 1, 1])?;
             self.regex_dispatches
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let bytes = self.read_buffer(&output)?;
             result.extend(
-                self.read_buffer(&output)?
-                    .chunks_exact(4)
-                    .map(|b| u32::from_ne_bytes(b.try_into().unwrap()) != 0),
+                bytemuck::cast_slice::<u8, u32>(&bytes)
+                    .iter()
+                    .map(|&b| b != 0),
             );
         }
         Ok(result)

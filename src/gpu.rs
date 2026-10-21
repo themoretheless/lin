@@ -18,6 +18,8 @@ pub struct GpuCompute {
     regex_dispatches: std::sync::atomic::AtomicU64,
     join_dispatches: std::sync::atomic::AtomicU64,
     sort_dispatches: std::sync::atomic::AtomicU64,
+    bytes_uploaded: std::sync::atomic::AtomicU64,
+    bytes_readback: std::sync::atomic::AtomicU64,
 }
 trait ComputeBackend: Send + Sync {
     fn device(&self) -> &wgpu::Device;
@@ -83,6 +85,8 @@ impl GpuCompute {
             regex_dispatches: Default::default(),
             join_dispatches: Default::default(),
             sort_dispatches: Default::default(),
+            bytes_uploaded: Default::default(),
+            bytes_readback: Default::default(),
         })
     }
     /// Request optional shader features and device limits explicitly.
@@ -99,15 +103,58 @@ impl GpuCompute {
             regex_dispatches: Default::default(),
             join_dispatches: Default::default(),
             sort_dispatches: Default::default(),
+            bytes_uploaded: Default::default(),
+            bytes_readback: Default::default(),
         })
     }
     pub fn adapter_info(&self) -> &wgpu::AdapterInfo {
         self.inner.adapter_info()
     }
+    /// Generate a structured capability and hardware architecture report.
+    pub fn adapter_report(&self) -> GpuAdapterReport {
+        let info = self.adapter_info();
+        let limits = self.device().limits();
+        let is_uma = matches!(info.device_type, wgpu::DeviceType::IntegratedGpu);
+        GpuAdapterReport {
+            name: info.name.clone(),
+            backend: format!("{:?}", info.backend),
+            device_type: format!("{:?}", info.device_type),
+            driver: info.driver.clone(),
+            driver_info: info.driver_info.clone(),
+            is_uma,
+            max_buffer_size: limits.max_buffer_size,
+            max_storage_buffer_binding_size: limits.max_storage_buffer_binding_size as u64,
+            max_compute_workgroups_per_dimension: limits.max_compute_workgroups_per_dimension,
+            max_compute_invocations_per_workgroup: limits.max_compute_invocations_per_workgroup,
+        }
+    }
+    /// Cumulative bytes transferred from CPU to GPU buffers.
+    pub fn bytes_uploaded(&self) -> u64 {
+        self.bytes_uploaded.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    /// Cumulative bytes read back from GPU buffers to CPU memory.
+    pub fn bytes_readback(&self) -> u64 {
+        self.bytes_readback.load(std::sync::atomic::Ordering::Relaxed)
+    }
     /// f32 cosine scores, in input order; variable lengths use the shared prefix.
     pub fn cosine_batch(&self, query: &[f32], vectors: &[&[f32]]) -> Result<Vec<f32>, Error> {
         self.inner.cosine_batch(query, vectors)
     }
+}
+
+/// Report on GPU hardware capabilities, limits, and Unified Memory Architecture (UMA) status.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GpuAdapterReport {
+    pub name: String,
+    pub backend: String,
+    pub device_type: String,
+    pub driver: String,
+    pub driver_info: String,
+    pub is_uma: bool,
+    pub max_buffer_size: u64,
+    pub max_storage_buffer_binding_size: u64,
+    pub max_compute_workgroups_per_dimension: u32,
+    pub max_compute_invocations_per_workgroup: u32,
 }
 
 /// Reusable Scratch/Pool buffers for cosine_batch and readback to eliminate per-call allocations.
@@ -556,6 +603,8 @@ impl GpuCompute {
                 "GPU storage size must be a nonzero multiple of 4",
             ));
         }
+        self.bytes_uploaded
+            .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
         self.checked(|device, _| {
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("lin storage"),
@@ -628,6 +677,8 @@ impl GpuCompute {
             .map_err(|e| Error::runtime(format!("GPU readback: {e}")))?
             .map_err(|e| Error::runtime(format!("GPU mapping: {e}")))?;
         let bytes = slice.get_mapped_range().to_vec();
+        self.bytes_readback
+            .fetch_add(size, std::sync::atomic::Ordering::Relaxed);
         buffer.unmap();
         pool.readback = Some(buffer);
         Ok(bytes)
@@ -659,6 +710,10 @@ impl GpuVectors {
     }
     pub fn dimension(&self) -> usize {
         self.dimension
+    }
+    /// Total resident bytes occupied by vectors and length buffers in GPU memory.
+    pub fn resident_bytes(&self) -> u64 {
+        (self.rows * self.dimension * 4 + self.rows * 4) as u64
     }
 }
 impl GpuCompute {
@@ -800,6 +855,9 @@ impl GpuCompute {
                 rows: chunk.len(),
             });
         }
+        let total_uploaded = (vectors.len() * dimension * 4 + vectors.len() * 4) as u64;
+        self.bytes_uploaded
+            .fetch_add(total_uploaded, std::sync::atomic::Ordering::Relaxed);
         Ok(GpuVectors {
             dimension,
             rows: vectors.len(),
@@ -878,11 +936,12 @@ impl GpuCompute {
 }
 
 /// Counters for the executor's resident vector corpus cache.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GpuCacheStats {
     pub uploads: u64,
     pub hits: u64,
     pub resident_rows: usize,
+    pub resident_bytes: u64,
 }
 #[derive(Default)]
 pub(crate) struct SearchCache {
@@ -896,11 +955,15 @@ struct SearchEntry {
 }
 trait CachedCorpus: Send + Sync {
     fn dimension(&self) -> usize;
+    fn resident_bytes(&self) -> u64;
     fn score(&mut self, gpu: &GpuCompute, query: &[f32]) -> Result<Vec<f32>, Error>;
 }
 impl CachedCorpus for GpuVectors {
     fn dimension(&self) -> usize {
         self.dimension()
+    }
+    fn resident_bytes(&self) -> u64 {
+        self.resident_bytes()
     }
     fn score(&mut self, gpu: &GpuCompute, query: &[f32]) -> Result<Vec<f32>, Error> {
         gpu.cosine_resident(query, self)
@@ -908,7 +971,11 @@ impl CachedCorpus for GpuVectors {
 }
 impl SearchCache {
     pub(crate) fn stats(&self) -> GpuCacheStats {
-        self.stats
+        let mut stats = self.stats;
+        if let Some(entry) = &self.entry {
+            stats.resident_bytes = entry.corpus.resident_bytes();
+        }
+        stats
     }
     pub(crate) fn score(
         &mut self,
@@ -933,6 +1000,7 @@ impl SearchCache {
         } else {
             let refs: Vec<&[f32]> = vectors.iter().map(|v| v.as_ref()).collect();
             let corpus = gpu.upload_vectors(query.len(), &refs)?;
+            self.stats.resident_bytes = corpus.resident_bytes();
             self.entry = Some(SearchEntry {
                 vectors: vectors.to_vec(),
                 corpus: Box::new(corpus),
@@ -1018,9 +1086,9 @@ impl GpuCompute {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let bytes = self.read_buffer(&output)?;
             result.extend(
-                bytes
-                    .chunks_exact(4)
-                    .map(|v| u32::from_ne_bytes(v.try_into().unwrap()) != 0),
+                bytemuck::cast_slice::<u8, u32>(&bytes)
+                    .iter()
+                    .map(|&v| v != 0),
             );
         }
         Ok(result)
@@ -1082,9 +1150,9 @@ impl GpuCompute {
             )?;
             let bytes = self.read_buffer(&output)?;
             result.extend(
-                bytes
-                    .chunks_exact(4)
-                    .map(|v| u32::from_ne_bytes(v.try_into().unwrap()) != 0),
+                bytemuck::cast_slice::<u8, u32>(&bytes)
+                    .iter()
+                    .map(|&v| v != 0),
             );
         }
         Ok(result)
@@ -1249,9 +1317,9 @@ impl GpuCompute {
             } else {
                 let bytes = self.read_buffer(&output)?;
                 result.extend(
-                    bytes
-                        .chunks_exact(4)
-                        .map(|v| u32::from_ne_bytes(v.try_into().unwrap()) != 0),
+                    bytemuck::cast_slice::<u8, u32>(&bytes)
+                        .iter()
+                        .map(|&v| v != 0),
                 );
             }
         }
@@ -1323,8 +1391,8 @@ impl GpuCompute {
             self.count_dispatches
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let bytes = self.read_buffer(&output)?;
-            for (total, bytes) in result.iter_mut().zip(bytes.chunks_exact(4)) {
-                *total += u32::from_ne_bytes(bytes.try_into().unwrap()) as i64;
+            for (total, &count) in result.iter_mut().zip(bytemuck::cast_slice::<u8, u32>(&bytes)) {
+                *total += count as i64;
             }
         }
         Ok(result)
@@ -1391,8 +1459,8 @@ impl GpuCompute {
                 self.join_dispatches
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let bytes = self.read_buffer(&output)?;
-                for (pair, bytes) in bytes.chunks_exact(4).enumerate() {
-                    if u32::from_ne_bytes(bytes.try_into().unwrap()) != 0 {
+                for (pair, &matched) in bytemuck::cast_slice::<u8, u32>(&bytes).iter().enumerate() {
+                    if matched != 0 {
                         let l = left_tile * left_rows + pair / right_keys.len();
                         let r = right_tile * right_rows + pair % right_keys.len();
                         hits[l].push(r);
@@ -1493,8 +1561,7 @@ impl GpuCompute {
             self.join_dispatches
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let bytes = self.read_buffer(&output)?;
-            result.extend(bytes.chunks_exact(4).map(|bytes| {
-                let value = u32::from_ne_bytes(bytes.try_into().unwrap());
+            result.extend(bytemuck::cast_slice::<u8, u32>(&bytes).iter().map(|&value| {
                 if value == 0 {
                     None
                 } else {
@@ -1669,9 +1736,9 @@ impl GpuCompute {
         }
         let final_source = if pass_idx % 2 == 0 { &source } else { &target };
         let bytes = self.read_buffer(final_source)?;
-        Ok(bytes
-            .chunks_exact(4)
-            .map(|v| u32::from_ne_bytes(v.try_into().unwrap()) as usize)
+        Ok(bytemuck::cast_slice::<u8, u32>(&bytes)
+            .iter()
+            .map(|&v| v as usize)
             .collect())
     }
 }
@@ -1744,13 +1811,9 @@ impl GpuCompute {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         let bytes = self.read_buffer(&output)?;
-        Ok(bytes
-            .chunks_exact(8)
-            .map(|b| {
-                let lo = u32::from_ne_bytes(b[..4].try_into().unwrap()) as u64;
-                let hi = u32::from_ne_bytes(b[4..].try_into().unwrap()) as u64;
-                f64::from_bits(lo | (hi << 32))
-            })
+        Ok(bytemuck::cast_slice::<u8, [u32; 2]>(&bytes)
+            .iter()
+            .map(|&[lo, hi]| f64::from_bits((lo as u64) | ((hi as u64) << 32)))
             .collect())
     }
 }
@@ -1813,8 +1876,9 @@ impl GpuCompute {
                 self.dispatch(&kernel, &[&group], [keys.len().div_ceil(64) as u32, 1, 1])?;
                 self.graph_dispatches
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                for (i, bytes) in self.read_buffer(&output)?.chunks_exact(4).enumerate() {
-                    result[tile * chunk + i] |= u32::from_ne_bytes(bytes.try_into().unwrap()) != 0;
+                let bytes = self.read_buffer(&output)?;
+                for (i, &matched) in bytemuck::cast_slice::<u8, u32>(&bytes).iter().enumerate() {
+                    result[tile * chunk + i] |= matched != 0;
                 }
             }
         }
@@ -1948,10 +2012,9 @@ impl GpuWeightAccumulator<'_> {
     pub(crate) fn finish(self) -> Result<Vec<i64>, Error> {
         let mut result = Vec::with_capacity(self.rows);
         for buffer in &self.chunks {
-            for bytes in self.gpu.read_buffer(buffer)?.chunks_exact(8) {
-                let low = u32::from_ne_bytes(bytes[..4].try_into().unwrap()) as u64;
-                let high = u32::from_ne_bytes(bytes[4..].try_into().unwrap()) as u64;
-                let score = i64::try_from(low | (high << 32))
+            let bytes = self.gpu.read_buffer(buffer)?;
+            for &[low, high] in bytemuck::cast_slice::<u8, [u32; 2]>(&bytes) {
+                let score = i64::try_from((low as u64) | ((high as u64) << 32))
                     .map_err(|_| Error::runtime("GPU scoring overflow"))?;
                 result.push(score);
             }
@@ -2192,13 +2255,9 @@ impl GpuCompute {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         let bytes = self.read_buffer(&output)?;
-        Ok(bytes
-            .chunks_exact(8)
-            .map(|b| {
-                let lo = u32::from_ne_bytes(b[..4].try_into().unwrap()) as u64;
-                let hi = u32::from_ne_bytes(b[4..].try_into().unwrap()) as u64;
-                f64::from_bits(lo | (hi << 32))
-            })
+        Ok(bytemuck::cast_slice::<u8, [u32; 2]>(&bytes)
+            .iter()
+            .map(|&[lo, hi]| f64::from_bits((lo as u64) | ((hi as u64) << 32)))
             .collect())
     }
 }
@@ -2273,11 +2332,8 @@ impl GpuCompute {
         self.dispatch(&kernel, &[&group], [1, 1, 1])?;
         self.graph_dispatches
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let words: Vec<u32> = self
-            .read_buffer(&output)?
-            .chunks_exact(4)
-            .map(|b| u32::from_ne_bytes(b.try_into().unwrap()))
-            .collect();
+        let bytes = self.read_buffer(&output)?;
+        let words = bytemuck::cast_slice::<u8, u32>(&bytes);
         Ok(if graph {
             words[1..1 + words[0] as usize]
                 .iter()
@@ -2400,17 +2456,15 @@ impl GpuCompute {
         self.dispatch(&kernel, &[&group], [1, 1, 1])?;
         self.graph_dispatches
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let words: Vec<u32> = self
-            .read_buffer(&output)?
-            .chunks_exact(4)
-            .map(|b| u32::from_ne_bytes(b.try_into().unwrap()))
-            .collect();
+        let bytes = self.read_buffer(&output)?;
+        let words = bytemuck::cast_slice::<u8, u32>(&bytes);
         if words[1] != 0 {
             return Err(Error::runtime("GPU match stack overflow"));
         }
-        Ok(words[2..2 + words[0] as usize * 2]
-            .chunks_exact(2)
-            .map(|p| (p[0] as usize, p[1] as usize))
+        let pairs: &[[u32; 2]] = bytemuck::cast_slice(&words[2..2 + words[0] as usize * 2]);
+        Ok(pairs
+            .iter()
+            .map(|&p| (p[0] as usize, p[1] as usize))
             .collect())
     }
 }

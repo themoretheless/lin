@@ -1685,3 +1685,41 @@ fn regex_executor_and_lazy_cursor_match_cpu_and_dispatch() {
         );
     }
 }
+
+#[test]
+#[ignore = "requires a hardware GPU"]
+fn gpu_adapter_report_metrics_and_uma_status() {
+    use lin::{Db, Queryable};
+    use std::sync::Arc;
+
+    let gpu = Arc::new(lin::gpu::GpuCompute::new().unwrap());
+    let mut db = Db::fixture().with_gpu(gpu.clone());
+    let reader = db.reader();
+
+    let report = db.gpu_adapter_report().expect("adapter report");
+    assert!(!report.name.is_empty());
+    assert!(!report.backend.is_empty());
+    assert!(report.max_buffer_size > 0);
+    assert_eq!(reader.gpu_adapter_report(), Some(report.clone()));
+
+    #[cfg(target_os = "macos")]
+    assert!(report.is_uma, "Apple Silicon Metal adapter should report is_uma = true");
+
+    let uploaded_before = gpu.bytes_uploaded();
+    let readback_before = gpu.bytes_readback();
+
+    let rows = Queryable::from("docs")
+        .filter(r#"title ~ /wal/i"#)
+        .select(["title"])
+        .to_vec(&mut db)
+        .unwrap();
+    assert!(!rows.is_empty());
+
+    let uploaded_after = gpu.bytes_uploaded();
+    let readback_after = gpu.bytes_readback();
+    assert!(uploaded_after >= uploaded_before);
+    assert!(readback_after >= readback_before);
+
+    db.disable_gpu();
+    assert!(db.gpu_adapter_report().is_none());
+}
