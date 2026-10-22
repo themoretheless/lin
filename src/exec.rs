@@ -579,6 +579,17 @@ impl Handle {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct PointGetPlan {
+    pub collection: String,
+    pub field: String,
+    pub key: String,
+    pub fields: Option<Vec<String>>,
+    pub is_simple_eq: bool,
+    pub pred: Option<Pred>,
+    pub is_docs_id_title: bool,
+}
+
 /// Compiled statement: parse + typecheck + plan once, run many times.
 #[derive(Debug, Clone)]
 pub struct Prepared {
@@ -591,6 +602,7 @@ pub struct Prepared {
     append_only: bool,
     /// Schema (col/rel/index) — clears plan cache after success.
     schema: bool,
+    pub(crate) point_get: Option<PointGetPlan>,
 }
 
 impl Prepared {
@@ -1279,6 +1291,14 @@ impl Db {
         let writes = stmts.iter().any(stmt_writes);
         let append_only = writes && stmts.iter().all(|s| stmt_append_only(s) || !stmt_writes(s));
         let schema = stmts.iter().any(stmt_schema);
+        let point_get = if stmts.len() == 1
+            && let Stmt::Query(q) = &stmts[0]
+            && !writes
+        {
+            Self::try_extract_point_get(q, plan_cat)
+        } else {
+            None
+        };
         Ok(Prepared {
             src: String::new(),
             stmts,
@@ -1286,6 +1306,7 @@ impl Db {
             writes,
             append_only,
             schema,
+            point_get,
         })
     }
 
@@ -1325,6 +1346,46 @@ impl Db {
             return Err(Error::runtime(
                 "follower: read-only — apply_wal for replication, open primary for writes",
             ));
+        }
+        if let Some(pg) = &prepared.point_get {
+            let t0 = Instant::now();
+            let row = if pg.is_docs_id_title {
+                self.store.point_get_docs_id_title(&pg.key)
+            } else if pg.is_simple_eq {
+                self.store
+                    .project_by_key(&pg.collection, &pg.field, &pg.key, pg.fields.as_deref())
+            } else {
+                let full = self.store.project_by_key(&pg.collection, &pg.field, &pg.key, None);
+                match full {
+                    Some(full) => {
+                        let now = now_ms();
+                        if let Some(pred) = &pg.pred && !eval_pred(pred, &full, now) {
+                            None
+                        } else if let Some(fs) = &pg.fields {
+                            Some(self.store.project_by_key(&pg.collection, &pg.field, &pg.key, Some(fs)).unwrap_or(full))
+                        } else {
+                            Some(full)
+                        }
+                    }
+                    None => None,
+                }
+            };
+            let rows = match row {
+                Some(r) => vec![r],
+                None => Vec::new(),
+            };
+            let n = rows.len();
+            let ms = t0.elapsed().as_secs_f64() * 1000.0;
+            return Ok(Handle {
+                plan: prepared.plan.clone(),
+                rows,
+                done: Done {
+                    r#gen: self.store.r#gen,
+                    n,
+                },
+                message: None,
+                ms,
+            });
         }
         let t0 = Instant::now();
         let mut undo = if !prepared.writes {
@@ -1459,6 +1520,46 @@ impl Db {
     pub fn run_prepared_readonly(&self, prepared: &Prepared) -> Result<Handle, Error> {
         if prepared.writes {
             return Err(Error::runtime("read-only snapshot: writes not allowed"));
+        }
+        if let Some(pg) = &prepared.point_get {
+            let t0 = Instant::now();
+            let row = if pg.is_docs_id_title {
+                self.store.point_get_docs_id_title(&pg.key)
+            } else if pg.is_simple_eq {
+                self.store
+                    .project_by_key(&pg.collection, &pg.field, &pg.key, pg.fields.as_deref())
+            } else {
+                let full = self.store.project_by_key(&pg.collection, &pg.field, &pg.key, None);
+                match full {
+                    Some(full) => {
+                        let now = now_ms();
+                        if let Some(pred) = &pg.pred && !eval_pred(pred, &full, now) {
+                            None
+                        } else if let Some(fs) = &pg.fields {
+                            Some(self.store.project_by_key(&pg.collection, &pg.field, &pg.key, Some(fs)).unwrap_or(full))
+                        } else {
+                            Some(full)
+                        }
+                    }
+                    None => None,
+                }
+            };
+            let rows = match row {
+                Some(r) => vec![r],
+                None => Vec::new(),
+            };
+            let n = rows.len();
+            let ms = t0.elapsed().as_secs_f64() * 1000.0;
+            return Ok(Handle {
+                plan: prepared.plan.clone(),
+                rows,
+                done: Done {
+                    r#gen: self.store.r#gen,
+                    n,
+                },
+                message: None,
+                ms,
+            });
         }
         let t0 = Instant::now();
         let (rows, message, pack) = self.exec_program_readonly(&prepared.stmts)?;
@@ -2425,6 +2526,70 @@ impl Db {
             rows.truncate(50);
         }
         Ok(rows)
+    }
+
+    pub(crate) fn try_extract_point_get(q: &Query, cat: &crate::catalog::Catalog) -> Option<PointGetPlan> {
+        let mut q = crate::catalog::with_catalog_filter(q, cat);
+        q.to_mut().simplify_predicates();
+        let q = &*q;
+        let name = match &q.source {
+            Source::Collection(n) => n.clone(),
+            _ => return None,
+        };
+        if !matches!(q.steps.first(), Some(Step::Filter(_))) {
+            return None;
+        }
+        let mut filter: Option<&Pred> = None;
+        let mut fields: Option<Vec<String>> = None;
+        for step in &q.steps {
+            match step {
+                Step::Filter(p) => {
+                    if filter.is_some() {
+                        return None;
+                    }
+                    filter = Some(p);
+                }
+                Step::Project(f) => {
+                    if fields.is_some() {
+                        return None;
+                    }
+                    fields = Some(field_names(f));
+                }
+                Step::Take { n: Some(n) } if *n <= 0 => return None,
+                Step::Skip { n } if *n > 0 => return None,
+                Step::Take { .. } | Step::Skip { .. } => {}
+                _ => return None,
+            }
+        }
+        let pred = filter?;
+        let (field, key) = point_key(pred)?;
+        if field == "uri" && name != "docs" {
+            return None;
+        }
+        let simple_eq = matches!(
+            pred,
+            Pred::Cmp {
+                op: CmpOp::Eq,
+                value: Value::String(_),
+                ..
+            }
+        );
+        let is_docs_id_title = simple_eq
+            && name == "docs"
+            && field == "id"
+            && fields
+                .as_deref()
+                .map(|fs| fs.len() == 2 && fs[0] == "id" && fs[1] == "title")
+                .unwrap_or(false);
+        Some(PointGetPlan {
+            collection: name,
+            field: field.to_string(),
+            key: key.to_string(),
+            fields,
+            is_simple_eq: simple_eq,
+            pred: if simple_eq { None } else { Some(pred.clone()) },
+            is_docs_id_title,
+        })
     }
 
     /// `docs | id == "…" | { … }` — direct map hit.

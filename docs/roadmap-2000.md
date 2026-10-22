@@ -635,7 +635,7 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 540 | LIN-0550 | [D14](#d14) | Добавить no-optimization execution mode | FEATURE | candidate | M | G-FEATURE |
 | 541 | LIN-0551 | [D14](#d14) | Добавить reproducible plan fingerprints | FEATURE | candidate | M | G-FEATURE |
 | 542 | LIN-0552 | [D14](#d14) | Добавить optimizer debug counters | FEATURE | candidate | M | G-FEATURE |
-| 543 | LIN-0553 | [D14](#d14) | Измерить prepared plan reuse | PERF | candidate | M | G-PERF |
+| 543 | LIN-0553 | [D14](#d14) | Измерить prepared plan reuse | PERF | done | M | G-PERF |
 | 544 | LIN-0554 | [D14](#d14) | Измерить plan cache key construction | PERF | candidate | M | G-PERF |
 | 545 | LIN-0555 | [D14](#d14) | Ограничить retained plan-cache bytes | CORRECTNESS | qualification | M | G-CORRECT |
 | 546 | LIN-0556 | [D14](#d14) | Проверить schema-aware plan invalidation | CORRECTNESS | qualification | S | G-CORRECT |

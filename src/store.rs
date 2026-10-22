@@ -1766,6 +1766,16 @@ impl Store {
         })
     }
 
+    #[inline]
+    pub fn point_get_docs_id_title(&self, id: &str) -> Option<Row> {
+        let idx = self.row_index("docs", id)?;
+        if idx < self.docs_id.len() {
+            Some(row_id_title(&self.docs_id[idx], &self.docs_title[idx]))
+        } else {
+            None
+        }
+    }
+
     /// Single-row hot projection from parallel docs columns.
     pub fn project_docs_hot_idx(&self, i: usize, fields: &[String]) -> Option<Row> {
         if i >= self.docs_id.len() {
@@ -3341,10 +3351,10 @@ fn docs_hot_field(f: &str) -> bool {
 
 #[inline]
 fn row_id_title(id: &Arc<str>, title: &Arc<str>) -> Row {
-    BTreeMap::from([
-        (String::from("id"), Cell::Text(Arc::clone(id))),
-        (String::from("title"), Cell::Text(Arc::clone(title))),
-    ])
+    let mut row = BTreeMap::new();
+    row.insert(String::from("id"), Cell::Text(Arc::clone(id)));
+    row.insert(String::from("title"), Cell::Text(Arc::clone(title)));
+    row
 }
 
 fn spo_key(row: &Row) -> Option<(Arc<str>, Arc<str>, Arc<str>)> {
