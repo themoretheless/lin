@@ -444,12 +444,38 @@ impl HnswIndex {
 
     #[inline]
     pub fn len(&self) -> usize {
-        self.nodes.len()
+        self.id_to_idx.len()
     }
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.nodes.is_empty()
+        self.id_to_idx.is_empty()
+    }
+
+    pub fn remove(&mut self, id: usize) {
+        if let Some(node_idx) = self.id_to_idx.remove(&id) {
+            self.nodes[node_idx].id = usize::MAX;
+            if self.enter_point == Some(node_idx) {
+                self.enter_point = self.id_to_idx.values().next().copied();
+            }
+        }
+    }
+
+    pub fn move_id(&mut self, from: usize, to: usize) {
+        if from == to {
+            return;
+        }
+        if let Some(node_idx) = self.id_to_idx.remove(&from) {
+            self.nodes[node_idx].id = to;
+            self.id_to_idx.insert(to, node_idx);
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.nodes.clear();
+        self.id_to_idx.clear();
+        self.enter_point = None;
+        self.max_level = 0;
     }
 
     pub fn build(items: impl IntoIterator<Item = (usize, Arc<[f32]>)>) -> Self {
@@ -618,10 +644,11 @@ impl HnswIndex {
             return Vec::new();
         }
 
-        if self.nodes.len() <= k.max(32) {
+        if self.id_to_idx.len() <= k.max(32) {
             let mut scored: Vec<(f64, usize)> = self
                 .nodes
                 .iter()
+                .filter(|n| n.id != usize::MAX)
                 .map(|n| (cosine(query, &n.vector), n.id))
                 .filter(|(s, _)| *s > 0.0)
                 .collect();
@@ -672,7 +699,7 @@ impl HnswIndex {
         let mut results: Vec<(f64, usize)> = candidates
             .into_iter()
             .map(|n| (n.sim, self.nodes[n.idx].id))
-            .filter(|(s, _)| *s > 0.0)
+            .filter(|(s, id)| *s > 0.0 && *id != usize::MAX)
             .collect();
 
         if results.len() > k {
@@ -828,12 +855,38 @@ impl HnswIndexSq8 {
 
     #[inline]
     pub fn len(&self) -> usize {
-        self.nodes.len()
+        self.id_to_idx.len()
     }
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.nodes.is_empty()
+        self.id_to_idx.is_empty()
+    }
+
+    pub fn remove(&mut self, id: usize) {
+        if let Some(node_idx) = self.id_to_idx.remove(&id) {
+            self.nodes[node_idx].id = usize::MAX;
+            if self.enter_point == Some(node_idx) {
+                self.enter_point = self.id_to_idx.values().next().copied();
+            }
+        }
+    }
+
+    pub fn move_id(&mut self, from: usize, to: usize) {
+        if from == to {
+            return;
+        }
+        if let Some(node_idx) = self.id_to_idx.remove(&from) {
+            self.nodes[node_idx].id = to;
+            self.id_to_idx.insert(to, node_idx);
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.nodes.clear();
+        self.id_to_idx.clear();
+        self.enter_point = None;
+        self.max_level = 0;
     }
 
     pub fn build(items: impl IntoIterator<Item = (usize, Arc<[i8]>)>) -> Self {
@@ -1021,10 +1074,11 @@ impl HnswIndexSq8 {
             return Vec::new();
         }
 
-        if self.nodes.len() <= k.max(32) {
+        if self.id_to_idx.len() <= k.max(32) {
             let mut scored: Vec<(f64, usize)> = self
                 .nodes
                 .iter()
+                .filter(|n| n.id != usize::MAX)
                 .map(|n| (dot_sq8(query, &n.vector), n.id))
                 .filter(|(s, _)| *s > 0.0)
                 .collect();
@@ -1075,7 +1129,7 @@ impl HnswIndexSq8 {
         let mut results: Vec<(f64, usize)> = candidates
             .into_iter()
             .map(|n| (n.sim, self.nodes[n.idx].id))
-            .filter(|(s, _)| *s > 0.0)
+            .filter(|(s, id)| *s > 0.0 && *id != usize::MAX)
             .collect();
 
         if results.len() > k {
@@ -1384,5 +1438,50 @@ mod tests {
             assert_eq!(res_sq8[0].1, exhaustive[0].1);
             assert_eq!(res_conv[0].1, exhaustive[0].1);
         }
+    }
+
+    #[test]
+    fn test_hnsw_remove_and_move_id() {
+        let dim = 16;
+        let embedder = HashingEmbedder::new("test/16", dim);
+        let items: Vec<(usize, Arc<[f32]>)> = (0..50)
+            .map(|i| (i, embedder.embed(&format!("sample document number {i}"))))
+            .collect();
+
+        let mut index = HnswIndex::build(items.clone());
+        assert_eq!(index.len(), 50);
+
+        // Remove node 10
+        index.remove(10);
+        assert_eq!(index.len(), 49);
+
+        // Search should not yield node 10
+        let q_vec = items[10].1.clone();
+        let res = index.search(&q_vec, 10, 32);
+        for (_, id) in &res {
+            assert_ne!(*id, 10, "removed node 10 should not be returned");
+        }
+
+        // Move node 49 to 10 (simulating swap_remove)
+        index.move_id(49, 10);
+        assert_eq!(index.len(), 49);
+
+        // Search for node 49's vector should now return id 10
+        let q_vec_49 = items[49].1.clone();
+        let res_49 = index.search(&q_vec_49, 5, 32);
+        assert!(!res_49.is_empty());
+        assert_eq!(res_49[0].1, 10, "moved node should be found under its new id");
+
+        // SQ8 index removal and move
+        let mut sq8_index = HnswIndexSq8::build_f32(items.clone());
+        sq8_index.remove(20);
+        assert_eq!(sq8_index.len(), 49);
+        let res_sq8 = sq8_index.search(&items[20].1, 5, 32);
+        for (_, id) in &res_sq8 {
+            assert_ne!(*id, 20);
+        }
+        sq8_index.move_id(49, 20);
+        let res_sq8_49 = sq8_index.search(&items[49].1, 5, 32);
+        assert_eq!(res_sq8_49[0].1, 20);
     }
 }

@@ -95,6 +95,7 @@ pub use embed_onnx::{EmbeddingModel, OnnxEmbedder};
 pub use error::Error;
 pub use exec::{
     Db, Done, Handle, OpenOpts, Prepared, Quotas, ReadDb, ReopenPhases, Stats, SyncMode,
+    Transaction,
 };
 pub use graph::GraphFmt;
 pub use plan::Plan;

@@ -605,6 +605,8 @@ pub struct Store {
     pub indexes: BTreeMap<String, LiveIndex>,
     /// collection → FTS postings (fields with catalog `fts`).
     pub(crate) fts: BTreeMap<String, crate::fts::FtsIndex>,
+    /// collection → HNSW vector index
+    pub(crate) hnsw: BTreeMap<String, crate::embed::HnswIndex>,
     /// collection → id → row index (O(1) Get / IndexSeek fetch).
     pub(crate) by_id: BTreeMap<String, FxHashMap<Arc<str>, usize>>,
     /// docs uri → row index.
@@ -686,6 +688,7 @@ impl Store {
             extra_owned: BTreeMap::new(),
             indexes: BTreeMap::new(),
             fts: BTreeMap::new(),
+            hnsw: BTreeMap::new(),
             by_id: BTreeMap::new(),
             docs_by_uri: FxHashMap::default(),
             facts_by_spo: FxHashMap::default(),
@@ -716,6 +719,7 @@ impl Store {
         let mut s = Self::empty(self.embed_id.clone());
         s.mem_restore(self.mem_backup());
         s.fts = self.fts.clone();
+        s.hnsw = self.hnsw.clone();
         s
     }
 
@@ -951,6 +955,7 @@ impl Store {
             extra_owned: std::mem::take(&mut s.extra_owned),
             indexes: BTreeMap::new(),
             fts: BTreeMap::new(),
+            hnsw: BTreeMap::new(),
             by_id: BTreeMap::new(),
             docs_by_uri: FxHashMap::default(),
             facts_by_spo: FxHashMap::default(),
@@ -1212,6 +1217,7 @@ impl Store {
                 self.row_maps_reserve(collection, rows.len());
                 let _ = self.index_insert_slab(collection, start, rows);
                 self.fts_insert_slab(collection, start, rows);
+                self.hnsw_insert_slab(collection, start, rows);
                 self.row_maps_register_slab(collection, start, rows);
                 self.collection_mut(collection).extend(rows.iter().cloned());
                 // Update cache-friendly count tracking
@@ -1234,6 +1240,7 @@ impl Store {
                 self.row_maps_reserve(collection, rows.len());
                 let _ = self.index_insert_slab(collection, start, &rows);
                 self.fts_insert_slab(collection, start, &rows);
+                self.hnsw_insert_slab(collection, start, &rows);
                 self.row_maps_register_slab(collection, start, &rows);
                 self.collection_mut(collection).extend(rows.iter().cloned());
                 // Update cache-friendly count tracking
@@ -1352,6 +1359,9 @@ impl Store {
                     let _ = live.insert_at(i, row);
                 }
                 self.indexes.insert(label, live);
+                if fields.iter().any(|f| f == "embedding") {
+                    self.build_hnsw(collection, 16, 64);
+                }
             }
             Pack::SchemaFilter {
                 collection,
@@ -1393,6 +1403,7 @@ impl Store {
             extra_indexes: self.extra_indexes.clone(),
             extra_filters: self.extra_filters.clone(),
             extra_owned: self.extra_owned.clone(),
+            hnsw: self.hnsw.clone(),
         }
     }
 
@@ -1407,6 +1418,7 @@ impl Store {
         self.extra_indexes = b.extra_indexes;
         self.extra_filters = b.extra_filters;
         self.extra_owned = b.extra_owned;
+        self.hnsw = b.hnsw;
         self.facts_rows_stale = false;
         self.rebuild_indexes();
         self.rebuild_row_maps();
@@ -2143,6 +2155,9 @@ impl Store {
             
             self.index_remove_row(collection, p, &doomed);
             self.fts_remove_row(collection, p, &doomed);
+            if let Some(hnsw) = self.hnsw.get_mut(collection) {
+                hnsw.remove(p);
+            }
             self.row_maps_drop_keys(collection, &doomed);
             if p != last {
                 self.move_deleted_tail(collection, last, p);
@@ -2175,6 +2190,9 @@ impl Store {
         }
         if let Some(fts) = self.fts.get_mut(collection) {
             fts.move_row(from, to, row);
+        }
+        if let Some(hnsw) = self.hnsw.get_mut(collection) {
+            hnsw.move_id(from, to);
         }
         let id = row.get("id").and_then(Cell::text_shared);
         let uri = (collection == "docs")
@@ -3015,6 +3033,29 @@ impl Store {
         fts.append_slab(start, rows);
     }
 
+    pub fn hnsw_insert_slab(&mut self, collection: &str, start: usize, rows: &[Row]) {
+        let Some(hnsw) = self.hnsw.get_mut(collection) else {
+            return;
+        };
+        for (i, row) in rows.iter().enumerate() {
+            if let Some(Cell::Vec(v)) = row.get("embedding") {
+                hnsw.insert(start + i, v.clone());
+            }
+        }
+    }
+
+    pub fn build_hnsw(&mut self, collection: &str, m: usize, ef: usize) {
+        let mut index = crate::embed::HnswIndex::new(m, ef);
+        if let Some(rows) = self.collections.get(collection) {
+            for (i, row) in rows.iter().enumerate() {
+                if let Some(Cell::Vec(v)) = row.get("embedding") {
+                    index.insert(i, v.clone());
+                }
+            }
+        }
+        self.hnsw.insert(collection.to_string(), index);
+    }
+
     /// Drop the postings of the row currently at `row_idx`.
     pub fn fts_remove_at(&mut self, collection: &str, row_idx: usize) {
         let Some(row) = self
@@ -3041,6 +3082,9 @@ impl Store {
     pub fn fts_move_row(&mut self, collection: &str, from: usize, to: usize, row: &Row) {
         if let Some(fts) = self.fts.get_mut(collection) {
             fts.move_row(from, to, row);
+        }
+        if let Some(hnsw) = self.hnsw.get_mut(collection) {
+            hnsw.move_id(from, to);
         }
     }
 
@@ -3381,6 +3425,7 @@ pub struct MemBackup {
     extra_indexes: BTreeMap<String, IndexSnap>,
     extra_filters: BTreeMap<String, String>,
     extra_owned: BTreeMap<String, Vec<(String, String)>>,
+    hnsw: BTreeMap<String, crate::embed::HnswIndex>,
 }
 
 /// Move `v[p]` on top of the tail and drop the tail, keeping the vec dense. A

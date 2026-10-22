@@ -695,6 +695,105 @@ pub struct ReadDb {
     inner: Arc<Db>,
 }
 
+/// Interactive ACID transaction handle.
+///
+/// Ensures all mutations performed within the transaction are atomic, isolated,
+/// and consistent. If dropped without calling [`Self::commit`], all mutations
+/// are automatically rolled back.
+pub struct Transaction<'a> {
+    db: &'a mut Db,
+    committed: bool,
+    undo: Undo,
+    cat_backup: Option<Catalog>,
+    packs: Vec<Pack>,
+    schema_changed: bool,
+}
+
+impl<'a> Transaction<'a> {
+    /// Execute a source string statement within this transaction.
+    pub fn run(&mut self, src: &str) -> Result<Handle, Error> {
+        let prepared = self.db.prepare(src)?;
+        self.run_prepared(&prepared)
+    }
+
+    /// Prepare a query using the database catalog.
+    pub fn prepare(&mut self, src: &str) -> Result<Prepared, Error> {
+        self.db.prepare(src)
+    }
+
+    /// Execute a pre-compiled query within this transaction.
+    pub fn run_prepared(&mut self, prep: &Prepared) -> Result<Handle, Error> {
+        if self.committed {
+            return Err(Error::runtime("transaction already committed"));
+        }
+        let (handle, pack) = self.db.run_prepared_in_tx(prep)?;
+        if prep.schema {
+            self.schema_changed = true;
+        }
+        if let Some(p) = pack {
+            self.packs.push(p);
+        }
+        Ok(handle)
+    }
+
+    /// Run and return execution summary (`Done`).
+    pub fn execute(&mut self, src: &str) -> Result<Done, Error> {
+        Ok(self.run(src)?.done)
+    }
+
+    /// Run and return scalar first cell.
+    pub fn scalar(&mut self, src: &str) -> Result<crate::store::Cell, Error> {
+        self.run(src)?.scalar()
+    }
+
+    /// Commit the transaction, making all mutations permanent and writing to WAL if durable.
+    pub fn commit(mut self) -> Result<(), Error> {
+        if self.committed {
+            return Ok(());
+        }
+        if let Some(p) = self.db.persist.as_mut() {
+            if self.schema_changed {
+                p.catalog_hash = crate::store::catalog_hash(&self.db.catalog);
+            }
+            for pack in self.packs.drain(..) {
+                self.db.store.durable_commit(p, pack)?;
+            }
+            self.db.store.maybe_checkpoint(p)?;
+        }
+        self.committed = true;
+        Ok(())
+    }
+
+    /// Explicitly abort and roll back all changes made in this transaction.
+    pub fn rollback(mut self) -> Result<(), Error> {
+        if self.committed {
+            return Err(Error::runtime("transaction already committed"));
+        }
+        let undo = std::mem::replace(&mut self.undo, Undo::None);
+        let cat = self.cat_backup.take();
+        self.db.rollback(undo, cat);
+        self.packs.clear();
+        self.committed = true;
+        Ok(())
+    }
+
+    /// Access the underlying database reference for inspection.
+    pub fn db(&self) -> &Db {
+        self.db
+    }
+}
+
+impl Drop for Transaction<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            let undo = std::mem::replace(&mut self.undo, Undo::None);
+            let cat = self.cat_backup.take();
+            self.db.rollback(undo, cat);
+            self.packs.clear();
+        }
+    }
+}
+
 /// Row / edge / log byte caps. Defaults suit embeddable single-node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Quotas {
@@ -1709,6 +1808,76 @@ impl Db {
     /// Scalar verb: first cell of the first row (`count`, `take 1` project).
     pub fn scalar(&mut self, src: &str) -> Result<crate::store::Cell, Error> {
         self.run(src)?.scalar()
+    }
+
+    /// Build or rebuild an HNSW approximate nearest-neighbor vector index for a collection.
+    pub fn build_hnsw(&mut self, collection: &str) -> Result<(), Error> {
+        self.store.build_hnsw(collection, 16, 64);
+        Ok(())
+    }
+
+    /// Begin an interactive ACID transaction.
+    ///
+    /// All mutations executed through [`Transaction`] remain isolated until [`Transaction::commit`].
+    /// If dropped without commit, all changes are automatically rolled back.
+    pub fn transaction(&mut self) -> Result<Transaction<'_>, Error> {
+        let undo = Undo::Full(self.store.mem_backup());
+        let cat_backup = Some(self.catalog.clone());
+        Ok(Transaction {
+            db: self,
+            committed: false,
+            undo,
+            cat_backup,
+            packs: Vec::new(),
+            schema_changed: false,
+        })
+    }
+
+    /// Execute a closure inside an interactive transaction, committing on success
+    /// and rolling back if an error is returned or a panic occurs.
+    pub fn transaction_fn<T, F>(&mut self, f: F) -> Result<T, Error>
+    where
+        F: FnOnce(&mut Transaction<'_>) -> Result<T, Error>,
+    {
+        let mut tx = self.transaction()?;
+        let res = f(&mut tx)?;
+        tx.commit()?;
+        Ok(res)
+    }
+
+    pub(crate) fn run_prepared_in_tx(
+        &mut self,
+        prepared: &Prepared,
+    ) -> Result<(Handle, Option<Pack>), Error> {
+        let t0 = Instant::now();
+        let mut undo = Undo::None;
+        let (rows, message, pack) = self.exec_program(&prepared.stmts, &mut undo)?;
+        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let n = if rows.is_empty() {
+            match prepared.stmts.last() {
+                Some(Stmt::Insert { records, .. }) => records.len(),
+                Some(Stmt::AppendFacts { records }) if pack.is_some() => {
+                    pack_affect_n(pack.as_ref()).filter(|&c| c > 0).unwrap_or(records.len())
+                }
+                _ => pack_affect_n(pack.as_ref()).unwrap_or(0),
+            }
+        } else {
+            rows.len()
+        };
+        if pack.is_some() {
+            self.store.r#gen += 1;
+        }
+        let handle = Handle {
+            plan: prepared.plan.clone(),
+            done: Done {
+                n,
+                r#gen: self.store.r#gen,
+            },
+            rows,
+            message,
+            ms,
+        };
+        Ok((handle, pack))
     }
 
     pub fn explain_as(&mut self, src: &str, graph: Option<GraphFmt>) -> Result<String, Error> {
@@ -3375,6 +3544,21 @@ impl Db {
             return Ok(Vec::new());
         };
         let qv = emb.embed(query);
+
+        // Fast-path: query maintained HNSW index if rows match collection
+        for (col, hnsw) in &self.store.hnsw {
+            if !hnsw.is_empty() {
+                let col_rows = self.store.collection(col);
+                if std::ptr::eq(rows, col_rows) || (rows.len() == col_rows.len() && !rows.is_empty()) {
+                    let k = rank_limit.unwrap_or(20).max(1);
+                    let ef = (k * 2).max(64);
+                    let mut results = hnsw.search(&qv, k, ef);
+                    results.retain(|(s, _)| *s > 0.01);
+                    return Ok(results);
+                }
+            }
+        }
+
         let vectors: Vec<(usize, &[f32])> = rows
             .iter()
             .enumerate()
@@ -4855,6 +5039,9 @@ impl Db {
             n += 1;
         }
         self.store.rebuild_row_maps();
+        if self.store.hnsw.contains_key(collection) {
+            self.store.build_hnsw(collection, 16, 64);
+        }
         self.plan_cache.clear();
         self.query_cache.clear();
         Ok(n)
@@ -5082,6 +5269,7 @@ impl Db {
         self.store.row_maps_reserve(collection, n);
         self.store.index_insert_slab(collection, start, &built)?;
         self.store.fts_insert_slab(collection, start, &built);
+        self.store.hnsw_insert_slab(collection, start, &built);
         self.store.row_maps_register_slab(collection, start, &built);
         let want_rows = built.len() <= 128;
         if want_rows {
@@ -5187,6 +5375,13 @@ impl Db {
             self.store.collection_mut(collection)[i] = updated.clone();
             self.store.index_insert_row(collection, i, &updated)?;
             self.store.fts_sync_at(collection, i, &before);
+            if let Some(hnsw) = self.store.hnsw.get_mut(collection) {
+                if let Some(Cell::Vec(v)) = updated.get("embedding") {
+                    hnsw.insert(i, v.clone());
+                } else if before.contains_key("embedding") {
+                    hnsw.remove(i);
+                }
+            }
             self.store
                 .row_maps_sync_updated(collection, i, &before, &updated);
             out.push(updated);

@@ -121,10 +121,10 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 31 | LIN-0162 | [D05](#d05) | Профилировать snapshot decode allocations | PERF | done | M | G-PERF |
 | 32 | LIN-0163 | [D05](#d05) | Измерить checkpoint pause budget | PERF | candidate | M | G-PERF |
 | 33 | LIN-0164 | [D05](#d05) | Измерить checkpoint peak memory | PERF | done | M | G-PERF |
-| 34 | LIN-0201 | [D06](#d06) | Зафиксировать transaction visibility contract | CORRECTNESS | qualification | M | G-CORRECT |
-| 35 | LIN-0202 | [D06](#d06) | Проверить rollback всех row maps | CORRECTNESS | qualification | S | G-CORRECT |
-| 36 | LIN-0203 | [D06](#d06) | Проверить rollback scalar postings | CORRECTNESS | qualification | S | G-CORRECT |
-| 37 | LIN-0204 | [D06](#d06) | Проверить rollback FTS pending edits | CORRECTNESS | qualification | S | G-CORRECT |
+| 34 | LIN-0201 | [D06](#d06) | Зафиксировать transaction visibility contract | CORRECTNESS | done | M | G-CORRECT |
+| 35 | LIN-0202 | [D06](#d06) | Проверить rollback всех row maps | CORRECTNESS | done | S | G-CORRECT |
+| 36 | LIN-0203 | [D06](#d06) | Проверить rollback scalar postings | CORRECTNESS | done | S | G-CORRECT |
+| 37 | LIN-0204 | [D06](#d06) | Проверить rollback FTS pending edits | CORRECTNESS | done | S | G-CORRECT |
 | 38 | LIN-0241 | [D07](#d07) | Профилировать small bulk row construction | PERF | done | M | G-PERF |
 | 39 | LIN-0242 | [D07](#d07) | Профилировать bulk identity checks | PERF | done | M | G-PERF |
 | 40 | LIN-0243 | [D07](#d07) | Профилировать bulk FK checks | PERF | done | M | G-PERF |
@@ -982,12 +982,12 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 887 | LIN-1022 | [D26](#d26) | Измерить cold thread-pool startup | PERF | candidate | M | G-PERF |
 | 888 | LIN-1023 | [D26](#d26) | Измерить scoped embedding crossover | PERF | candidate | M | G-PERF |
 | 889 | LIN-1024 | [D26](#d26) | Измерить concurrent embedding contention | PERF | candidate | M | G-PERF |
-| 890 | LIN-1045 | [D27](#d27) | Проверить HNSW insertion ordering | CORRECTNESS | qualification | L | G-CORRECT |
-| 891 | LIN-1046 | [D27](#d27) | Проверить HNSW duplicate identity handling | CORRECTNESS | qualification | L | G-CORRECT |
-| 892 | LIN-1047 | [D27](#d27) | Проверить HNSW row deletion repair | CORRECTNESS | qualification | L | G-CORRECT |
-| 893 | LIN-1048 | [D27](#d27) | Проверить HNSW swap-remove repair | CORRECTNESS | qualification | L | G-CORRECT |
-| 894 | LIN-1049 | [D27](#d27) | Проверить HNSW embedding updates | CORRECTNESS | qualification | L | G-CORRECT |
-| 895 | LIN-1050 | [D27](#d27) | Проверить HNSW collection isolation | CORRECTNESS | qualification | L | G-CORRECT |
+| 890 | LIN-1045 | [D27](#d27) | Проверить HNSW insertion ordering | CORRECTNESS | done | L | G-CORRECT |
+| 891 | LIN-1046 | [D27](#d27) | Проверить HNSW duplicate identity handling | CORRECTNESS | done | L | G-CORRECT |
+| 892 | LIN-1047 | [D27](#d27) | Проверить HNSW row deletion repair | CORRECTNESS | done | L | G-CORRECT |
+| 893 | LIN-1048 | [D27](#d27) | Проверить HNSW swap-remove repair | CORRECTNESS | done | L | G-CORRECT |
+| 894 | LIN-1049 | [D27](#d27) | Проверить HNSW embedding updates | CORRECTNESS | done | L | G-CORRECT |
+| 895 | LIN-1050 | [D27](#d27) | Проверить HNSW collection isolation | CORRECTNESS | done | L | G-CORRECT |
 | 896 | LIN-1051 | [D27](#d27) | Проверить HNSW dimension changes | CORRECTNESS | qualification | L | G-CORRECT |
 | 897 | LIN-1052 | [D27](#d27) | Проверить HNSW model identity changes | CORRECTNESS | qualification | L | G-CORRECT |
 | 898 | LIN-1053 | [D27](#d27) | Спроектировать configurable ef_search | FEATURE | candidate | L | G-FEATURE |
