@@ -461,23 +461,81 @@ pub fn read_snapshot(dir: &Path) -> Result<Option<Snapshot>, Error> {
     if !path.exists() {
         return Ok(None);
     }
-    let bytes = fs::read(&path).map_err(io_err)?;
-    if bytes.is_empty() {
+    let file = fs::File::open(&path).map_err(io_err)?;
+    let meta = file.metadata().map_err(io_err)?;
+    let len = meta.len();
+    if len == 0 {
         return Ok(None);
     }
-    decode_snapshot_bytes(&bytes)
-        .map(Some)
-        .ok_or_else(|| io_err("corrupt snapshot"))
+    if len >= 16 * 1024 {
+        let mmap = unsafe { memmap2::MmapOptions::new().map(&file) }.map_err(io_err)?;
+        let _ = mmap.advise(memmap2::Advice::Sequential);
+        decode_snapshot_bytes(&mmap)
+            .map(Some)
+            .ok_or_else(|| io_err("corrupt snapshot"))
+    } else {
+        use std::io::Read;
+        let mut bytes = Vec::with_capacity(len as usize);
+        let mut reader = std::io::BufReader::new(file);
+        reader.read_to_end(&mut bytes).map_err(io_err)?;
+        decode_snapshot_bytes(&bytes)
+            .map(Some)
+            .ok_or_else(|| io_err("corrupt snapshot"))
+    }
+}
+
+/// Write snapshot directly to a file via a temporary file without intermediate full-image in-memory buffering.
+pub fn write_snapshot_ref_to_file(path: &Path, snap: &SnapshotRef<'_>) -> Result<(), Error> {
+    let tmp = path.with_extension("bin.tmp");
+    let result = (|| -> Result<(), Error> {
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)
+            .map_err(io_err)?;
+        let mut writer = std::io::BufWriter::with_capacity(128 * 1024, file);
+        writer.write_all(&SNAPSHOT_MAGIC).map_err(io_err)?;
+        rmp_serde::encode::write_named(&mut writer, snap).map_err(io_err)?;
+        writer.flush().map_err(io_err)?;
+        let file = writer.into_inner().map_err(io_err)?;
+        durable_sync(&file).or_else(|_| file.sync_all()).map_err(io_err)?;
+        drop(file);
+        fs::rename(&tmp, path).map_err(io_err)?;
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            sync_dir(parent).map_err(io_err)?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
 }
 
 pub fn write_snapshot(dir: &Path, snap: &Snapshot) -> Result<(), Error> {
-    let bytes = encode_snapshot_bytes(snap)?;
-    atomic_write(&snapshot_path(dir), &bytes)
+    let snap_ref = SnapshotRef {
+        r#gen: snap.r#gen,
+        embed_id: &snap.embed_id,
+        next_id: snap.next_id,
+        catalog_hash: &snap.catalog_hash,
+        log_offset: snap.log_offset,
+        collections: &snap.collections,
+        edges: &snap.edges,
+        extra_collections: &snap.extra_collections,
+        extra_rels: &snap.extra_rels,
+        extra_indexes: &snap.extra_indexes,
+        extra_filters: &snap.extra_filters,
+        extra_owned: &snap.extra_owned,
+        cold_collections: &snap.cold_collections,
+    };
+    write_snapshot_ref(dir, &snap_ref)
 }
 
 pub fn write_snapshot_ref(dir: &Path, snap: &SnapshotRef<'_>) -> Result<(), Error> {
-    let bytes = encode_snapshot_ref_bytes(snap)?;
-    atomic_write(&snapshot_path(dir), &bytes)
+    write_snapshot_ref_to_file(&snapshot_path(dir), snap)
 }
 
 /// Portable backup: always self-contained MessagePack (`LIN\x04`).
@@ -504,16 +562,27 @@ pub fn write_backup(path: &Path, snap: &Snapshot) -> Result<(), Error> {
         extra_owned: &snap.extra_owned,
         cold_collections: &[],
     };
-    let bytes = encode_snapshot_ref_bytes(&snap_ref)?;
-    atomic_write(path, &bytes)
+    write_snapshot_ref_to_file(path, &snap_ref)
 }
 
 pub fn read_backup(path: &Path) -> Result<Snapshot, Error> {
-    let bytes = fs::read(path).map_err(io_err)?;
-    if bytes.is_empty() {
+    let file = fs::File::open(path).map_err(io_err)?;
+    let meta = file.metadata().map_err(io_err)?;
+    let len = meta.len();
+    if len == 0 {
         return Err(io_err("empty backup"));
     }
-    decode_snapshot_bytes(&bytes).ok_or_else(|| io_err("corrupt backup"))
+    if len >= 16 * 1024 {
+        let mmap = unsafe { memmap2::MmapOptions::new().map(&file) }.map_err(io_err)?;
+        let _ = mmap.advise(memmap2::Advice::Sequential);
+        decode_snapshot_bytes(&mmap).ok_or_else(|| io_err("corrupt backup"))
+    } else {
+        use std::io::Read;
+        let mut bytes = Vec::with_capacity(len as usize);
+        let mut reader = std::io::BufReader::new(file);
+        reader.read_to_end(&mut bytes).map_err(io_err)?;
+        decode_snapshot_bytes(&bytes).ok_or_else(|| io_err("corrupt backup"))
+    }
 }
 
 /// Expand cold file refs into inlined collections (for backup / portable copy).
@@ -535,6 +604,7 @@ pub fn expand_cold_into(dir: &Path, snap: &mut Snapshot) -> Result<(), Error> {
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn encode_snapshot_ref_bytes(snap: &SnapshotRef<'_>) -> Result<Vec<u8>, Error> {
     let mut out = Vec::with_capacity(64 * 1024);
     out.extend_from_slice(&SNAPSHOT_MAGIC);
@@ -542,6 +612,7 @@ pub fn encode_snapshot_ref_bytes(snap: &SnapshotRef<'_>) -> Result<Vec<u8>, Erro
     Ok(out)
 }
 
+#[allow(dead_code)]
 fn encode_snapshot_bytes(snap: &Snapshot) -> Result<Vec<u8>, Error> {
     let mut out = Vec::with_capacity(64 * 1024);
     out.extend_from_slice(&SNAPSHOT_MAGIC);
@@ -653,7 +724,7 @@ pub(crate) fn write_through_tmp(path: &Path, tmp: &Path, bytes: &[u8]) -> Result
             .open(tmp)
             .map_err(io_err)?;
         file.write_all(bytes).map_err(io_err)?;
-        file.sync_all().map_err(io_err)?;
+        durable_sync(&file).or_else(|_| file.sync_all()).map_err(io_err)?;
         drop(file);
         fs::rename(tmp, path).map_err(io_err)
     })();

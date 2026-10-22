@@ -753,7 +753,17 @@ impl Store {
 
         let phase = Instant::now();
         let snap = persist::read_snapshot(dir)?;
-        let mut store = match &snap {
+        let start = snap.as_ref().map(|s| s.log_offset).unwrap_or(0);
+        let snap_catalog_hash = snap.as_ref().map(|s| s.catalog_hash.clone());
+        let snap_has_extras = snap.as_ref().map(|s| {
+            !s.extra_collections.is_empty()
+                || !s.extra_rels.is_empty()
+                || !s.extra_indexes.is_empty()
+                || !s.extra_filters.is_empty()
+                || !s.extra_owned.is_empty()
+        }).unwrap_or(false);
+
+        let mut store = match snap {
             Some(s) => Self::from_snapshot_unindexed(dir, s)?,
             None => {
                 let embed = persist::read_head(dir)?
@@ -780,7 +790,6 @@ impl Store {
         let phase = Instant::now();
         let mut log = persist::open_log(dir)?;
         let min_gen = store.r#gen;
-        let start = snap.as_ref().map(|s| s.log_offset).unwrap_or(0);
         let end = persist::replay_log(&mut log, min_gen, start, |rec| {
             store.apply_record(&rec);
             Ok(())
@@ -801,18 +810,14 @@ impl Store {
                 head.catalog_hash, live_hash
             )));
         }
-        if let Some(s) = &snap
-            && s.catalog_hash != live_hash
-            && s.extra_collections.is_empty()
-            && s.extra_rels.is_empty()
-            && s.extra_indexes.is_empty()
-            && s.extra_filters.is_empty()
-            && s.extra_owned.is_empty()
-            && s.catalog_hash != fixture_hash
+        if let Some(snap_hash) = snap_catalog_hash
+            && snap_hash != live_hash
+            && !snap_has_extras
+            && snap_hash != fixture_hash
         {
             return Err(Error::runtime(format!(
                 "catalog_hash mismatch: snapshot={} catalog={}",
-                s.catalog_hash, live_hash
+                snap_hash, live_hash
             )));
         }
 
@@ -872,7 +877,8 @@ impl Store {
         phases.setup_ms = phase.elapsed().as_secs_f64() * 1000.0;
         let phase = Instant::now();
         let snap = persist::read_snapshot(dir)?;
-        let mut store = match &snap {
+        let start = snap.as_ref().map(|s| s.log_offset).unwrap_or(0);
+        let mut store = match snap {
             Some(s) => Self::from_snapshot_unindexed(dir, s)?,
             None => {
                 let embed = persist::read_head(dir)?
@@ -896,7 +902,6 @@ impl Store {
         let phase = Instant::now();
         let mut log = persist::open_log_read(dir)?;
         let min_gen = store.r#gen;
-        let start = snap.as_ref().map(|s| s.log_offset).unwrap_or(0);
         if let Some(log) = log.as_mut() {
             let _ = persist::replay_log(log, min_gen, start, |rec| {
                 store.apply_record(&rec);
@@ -913,25 +918,37 @@ impl Store {
         Ok((store, lock, phases))
     }
 
-    pub(crate) fn from_snapshot(dir: &Path, s: &Snapshot) -> Result<Self, Error> {
+    pub(crate) fn from_snapshot(dir: &Path, s: Snapshot) -> Result<Self, Error> {
         let mut store = Self::from_snapshot_unindexed(dir, s)?;
         store.rebuild_indexes();
         store.rebuild_row_maps();
         Ok(store)
     }
 
-    fn from_snapshot_unindexed(dir: &Path, s: &Snapshot) -> Result<Self, Error> {
+    #[allow(dead_code)]
+    pub(crate) fn from_snapshot_ref(dir: &Path, s: &Snapshot) -> Result<Self, Error> {
+        Self::from_snapshot(dir, s.clone())
+    }
+
+    fn from_snapshot_unindexed(dir: &Path, mut s: Snapshot) -> Result<Self, Error> {
+        let col_counts = {
+            let mut counts = FxHashMap::default();
+            for (name, rows) in &s.collections {
+                counts.insert(name.clone(), rows.len());
+            }
+            counts
+        };
         let mut store = Self {
             r#gen: s.r#gen,
-            embed_id: s.embed_id.clone(),
+            embed_id: std::mem::take(&mut s.embed_id),
             next_id: s.next_id,
-            collections: s.collections.clone(),
-            edges: s.edges.clone(),
-            extra_collections: s.extra_collections.clone(),
-            extra_rels: s.extra_rels.clone(),
-            extra_indexes: s.extra_indexes.clone(),
-            extra_filters: s.extra_filters.clone(),
-            extra_owned: s.extra_owned.clone(),
+            collections: std::mem::take(&mut s.collections),
+            edges: std::mem::take(&mut s.edges),
+            extra_collections: std::mem::take(&mut s.extra_collections),
+            extra_rels: std::mem::take(&mut s.extra_rels),
+            extra_indexes: std::mem::take(&mut s.extra_indexes),
+            extra_filters: std::mem::take(&mut s.extra_filters),
+            extra_owned: std::mem::take(&mut s.extra_owned),
             indexes: BTreeMap::new(),
             fts: BTreeMap::new(),
             by_id: BTreeMap::new(),
@@ -954,16 +971,7 @@ impl Store {
             facts_p: Vec::new(),
             facts_o: Vec::new(),
             facts_rows_stale: false,
-            
-            // Initialize col_counts from current collection sizes
-            col_counts: {
-                let mut counts = FxHashMap::default();
-                for (name, rows) in &s.collections {
-                    counts.insert(name.clone(), rows.len());
-                }
-                counts
-            },
-            
+            col_counts,
             cold: BTreeMap::new(),
         };
         for name in store.extra_collections.keys() {

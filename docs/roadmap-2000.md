@@ -117,10 +117,10 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 27 | LIN-0122 | [D04](#d04) | Проверить torn WAL body | CORRECTNESS | done | S | G-CORRECT |
 | 28 | LIN-0123 | [D04](#d04) | Проверить torn WAL checksum | CORRECTNESS | done | S | G-CORRECT |
 | 29 | LIN-0124 | [D04](#d04) | Проверить trailing garbage policy | CORRECTNESS | done | S | G-CORRECT |
-| 30 | LIN-0161 | [D05](#d05) | Профилировать snapshot serialization copies | PERF | candidate | M | G-PERF |
-| 31 | LIN-0162 | [D05](#d05) | Профилировать snapshot decode allocations | PERF | candidate | M | G-PERF |
+| 30 | LIN-0161 | [D05](#d05) | Профилировать snapshot serialization copies | PERF | done | M | G-PERF |
+| 31 | LIN-0162 | [D05](#d05) | Профилировать snapshot decode allocations | PERF | done | M | G-PERF |
 | 32 | LIN-0163 | [D05](#d05) | Измерить checkpoint pause budget | PERF | candidate | M | G-PERF |
-| 33 | LIN-0164 | [D05](#d05) | Измерить checkpoint peak memory | PERF | candidate | M | G-PERF |
+| 33 | LIN-0164 | [D05](#d05) | Измерить checkpoint peak memory | PERF | done | M | G-PERF |
 | 34 | LIN-0201 | [D06](#d06) | Зафиксировать transaction visibility contract | CORRECTNESS | qualification | M | G-CORRECT |
 | 35 | LIN-0202 | [D06](#d06) | Проверить rollback всех row maps | CORRECTNESS | qualification | S | G-CORRECT |
 | 36 | LIN-0203 | [D06](#d06) | Проверить rollback scalar postings | CORRECTNESS | qualification | S | G-CORRECT |
@@ -352,7 +352,7 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 257 | LIN-0173 | [D05](#d05) | Измерить incremental checkpoint | PERF | candidate | M | G-PERF |
 | 258 | LIN-0174 | [D05](#d05) | Измерить section-local compression | PERF | candidate | M | G-PERF |
 | 259 | LIN-0175 | [D05](#d05) | Измерить parallel snapshot sections | PERF | candidate | M | G-PERF |
-| 260 | LIN-0176 | [D05](#d05) | Измерить streaming snapshot encoder | PERF | candidate | M | G-PERF |
+| 260 | LIN-0176 | [D05](#d05) | Измерить streaming snapshot encoder | PERF | done | M | G-PERF |
 | 261 | LIN-0177 | [D05](#d05) | Проверить atomic snapshot replacement | CORRECTNESS | qualification | S | G-CORRECT |
 | 262 | LIN-0178 | [D05](#d05) | Проверить failed rename cleanup | CORRECTNESS | qualification | S | G-CORRECT |
 | 263 | LIN-0179 | [D05](#d05) | Проверить temp snapshot ownership | CORRECTNESS | qualification | S | G-CORRECT |
@@ -1508,7 +1508,7 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 1408 | LIN-0192 | [D05](#d05) | Добавить checkpoint error provenance | FEATURE | candidate | M | G-FEATURE |
 | 1409 | LIN-0193 | [D05](#d05) | Сравнить cold snapshot formats | PERF | candidate | M | G-PERF |
 | 1410 | LIN-0194 | [D05](#d05) | Сравнить snapshot encode chunk sizes | PERF | candidate | M | G-PERF |
-| 1411 | LIN-0195 | [D05](#d05) | Сравнить mmap и buffered decode | PERF | candidate | M | G-PERF |
+| 1411 | LIN-0195 | [D05](#d05) | Сравнить mmap и buffered decode | PERF | done | M | G-PERF |
 | 1412 | LIN-0196 | [D05](#d05) | Сравнить dictionary text snapshots | PERF | candidate | M | G-PERF |
 | 1413 | LIN-0197 | [D05](#d05) | Проверить snapshot disk quota | CORRECTNESS | qualification | S | G-CORRECT |
 | 1414 | LIN-0198 | [D05](#d05) | Проверить snapshot corruption isolation | CORRECTNESS | qualification | S | G-CORRECT |

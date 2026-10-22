@@ -1201,7 +1201,7 @@ impl Db {
     /// into a data dir separately if durable is needed — use `lin backup import --data`).
     pub fn import_backup(path: impl AsRef<Path>) -> Result<Self, Error> {
         let snap = crate::persist::read_backup(path.as_ref())?;
-        let store = Store::from_snapshot(std::path::Path::new("."), &snap)?;
+        let store = Store::from_snapshot(std::path::Path::new("."), snap)?;
         let mut catalog = crate::catalog::fixture();
         store.merge_extras_into(&mut catalog);
         Ok(Self::bare(catalog, store))
