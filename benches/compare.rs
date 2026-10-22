@@ -3196,6 +3196,96 @@ fn main() -> airbug_bench::Result<()> {
             .work_units("stmts", 1);
     }
 
+    for (label, n) in [("1k", 1_000usize), ("10k", N)] {
+        suite
+            .bench_checked(
+                &format!("tx_commit_1row_{label}/lin"),
+                move || setup_lin_write(n),
+                tx_update_commit_lin,
+                |s, affected| {
+                    assert_eq!(*affected, 1);
+                    assert_eq!(
+                        s.db.store.get_by_id("docs", &s.probe_id).unwrap()["wing"].text(),
+                        Some("sys")
+                    );
+                    Ok(())
+                },
+                DropPolicy::OutsideTiming,
+            )
+            .tag("transaction")
+            .tag("write")
+            .tag("lin")
+            .parameter("rows", n)
+            .work_units("tx", 1);
+        suite
+            .bench_checked(
+                &format!("tx_commit_1row_{label}/sqlite"),
+                move || setup_sqlite_write(n),
+                tx_update_commit_sqlite,
+                |s, affected| {
+                    assert_eq!(*affected, 1);
+                    let wing: String = s
+                        .conn
+                        .query_row("SELECT wing FROM docs WHERE id = ?1", [&s.probe_id], |r| {
+                            r.get(0)
+                        })
+                        .unwrap();
+                    assert_eq!(wing, "sys");
+                    Ok(())
+                },
+                DropPolicy::OutsideTiming,
+            )
+            .tag("transaction")
+            .tag("write")
+            .tag("sqlite")
+            .parameter("rows", n)
+            .work_units("tx", 1);
+
+        suite
+            .bench_checked(
+                &format!("tx_rollback_1row_{label}/lin"),
+                move || setup_lin_write(n),
+                tx_update_rollback_lin,
+                |s, affected| {
+                    assert_eq!(*affected, 1);
+                    assert_ne!(
+                        s.db.store.get_by_id("docs", &s.probe_id).unwrap()["wing"].text(),
+                        Some("sys")
+                    );
+                    Ok(())
+                },
+                DropPolicy::OutsideTiming,
+            )
+            .tag("transaction")
+            .tag("rollback")
+            .tag("lin")
+            .parameter("rows", n)
+            .work_units("tx", 1);
+        suite
+            .bench_checked(
+                &format!("tx_rollback_1row_{label}/sqlite"),
+                move || setup_sqlite_write(n),
+                tx_update_rollback_sqlite,
+                |s, affected| {
+                    assert_eq!(*affected, 1);
+                    let wing: String = s
+                        .conn
+                        .query_row("SELECT wing FROM docs WHERE id = ?1", [&s.probe_id], |r| {
+                            r.get(0)
+                        })
+                        .unwrap();
+                    assert_ne!(wing, "sys");
+                    Ok(())
+                },
+                DropPolicy::OutsideTiming,
+            )
+            .tag("transaction")
+            .tag("rollback")
+            .tag("sqlite")
+            .parameter("rows", n)
+            .work_units("tx", 1);
+    }
+
     for groups in [6usize, 10, 14] {
         suite
             .bench_with_input(
@@ -3344,6 +3434,46 @@ fn write_delete_sqlite(s: &mut SqlWarm) -> usize {
         stmt.execute(rusqlite::params![s.probe_id])
             .expect("sqlite delete"),
     )
+}
+
+fn tx_update_commit_lin(s: &mut LinWrite) -> usize {
+    let mut tx = s.db.transaction().expect("lin tx");
+    let n = tx.run_prepared(&s.update).expect("lin update").done.n;
+    tx.commit().expect("lin commit");
+    black_box(n)
+}
+
+fn tx_update_commit_sqlite(s: &mut SqlWarm) -> usize {
+    let tx = s.conn.unchecked_transaction().expect("sqlite tx");
+    let affected = {
+        let mut stmt = tx
+            .prepare_cached("UPDATE docs SET wing = ?1 WHERE id = ?2")
+            .expect("sqlite prep");
+        stmt.execute(rusqlite::params!["sys", s.probe_id])
+            .expect("sqlite update")
+    };
+    tx.commit().expect("sqlite commit");
+    black_box(affected)
+}
+
+fn tx_update_rollback_lin(s: &mut LinWrite) -> usize {
+    let mut tx = s.db.transaction().expect("lin tx");
+    let n = tx.run_prepared(&s.update).expect("lin update").done.n;
+    tx.rollback().expect("lin rollback");
+    black_box(n)
+}
+
+fn tx_update_rollback_sqlite(s: &mut SqlWarm) -> usize {
+    let tx = s.conn.unchecked_transaction().expect("sqlite tx");
+    let affected = {
+        let mut stmt = tx
+            .prepare_cached("UPDATE docs SET wing = ?1 WHERE id = ?2")
+            .expect("sqlite prep");
+        stmt.execute(rusqlite::params!["sys", s.probe_id])
+            .expect("sqlite update")
+    };
+    tx.rollback().expect("sqlite rollback");
+    black_box(affected)
 }
 
 struct LinPlan {

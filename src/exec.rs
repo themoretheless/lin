@@ -721,15 +721,68 @@ impl<'a> Transaction<'a> {
         self.db.prepare(src)
     }
 
+    fn ensure_undo(&mut self, prep: &Prepared) {
+        match &mut self.undo {
+            Undo::None => {
+                if prep.append_only && !prep.schema {
+                    self.undo = Undo::Append(self.db.store.append_mark());
+                } else if prep.stmts.iter().all(|s| {
+                    matches!(
+                        s,
+                        Stmt::Update { .. } | Stmt::Delete { .. } | Stmt::Query(_) | Stmt::Let { .. }
+                    )
+                }) {
+                    self.undo = Undo::Rows(Vec::new());
+                } else {
+                    self.undo = Undo::Full(self.db.store.mem_backup());
+                }
+            }
+            Undo::Append(mark) => {
+                if !prep.append_only || prep.schema {
+                    if prep.stmts.iter().all(|s| {
+                        matches!(
+                            s,
+                            Stmt::Update { .. } | Stmt::Delete { .. } | Stmt::Query(_) | Stmt::Let { .. }
+                        )
+                    }) {
+                        let m = mark.clone();
+                        self.undo = Undo::Mixed {
+                            append: m,
+                            events: Vec::new(),
+                        };
+                    } else {
+                        self.undo = Undo::Full(self.db.store.mem_backup());
+                    }
+                }
+            }
+            Undo::Rows(events) => {
+                if prep.append_only && !prep.schema {
+                    let ev = std::mem::take(events);
+                    self.undo = Undo::Mixed {
+                        append: self.db.store.append_mark(),
+                        events: ev,
+                    };
+                }
+            }
+            Undo::Mixed { .. } | Undo::Full(_) => {}
+        }
+    }
+
     /// Execute a pre-compiled query within this transaction.
     pub fn run_prepared(&mut self, prep: &Prepared) -> Result<Handle, Error> {
         if self.committed {
             return Err(Error::runtime("transaction already committed"));
         }
-        let (handle, pack) = self.db.run_prepared_in_tx(prep)?;
         if prep.schema {
+            if self.cat_backup.is_none() {
+                self.cat_backup = Some(self.db.catalog.clone());
+            }
             self.schema_changed = true;
         }
+        if prep.writes {
+            self.ensure_undo(prep);
+        }
+        let (handle, pack) = self.db.run_prepared_in_tx(prep, &mut self.undo)?;
         if let Some(p) = pack {
             self.packs.push(p);
         }
@@ -1789,6 +1842,19 @@ impl Db {
                     }
                 }
             }
+            Undo::Mixed { append, events } => {
+                for event in events.into_iter().rev() {
+                    match event {
+                        RowUndo::Update(collection, idx, row) => {
+                            self.store.restore_rows(&[(collection, idx, row)])
+                        }
+                        RowUndo::Delete(collection, positions, rows) => {
+                            self.store.restore_rows_at(&collection, &positions, &rows)
+                        }
+                    }
+                }
+                self.store.append_rollback(append);
+            }
         }
         if let Some(cat) = cat_backup {
             self.catalog = cat;
@@ -1821,13 +1887,11 @@ impl Db {
     /// All mutations executed through [`Transaction`] remain isolated until [`Transaction::commit`].
     /// If dropped without commit, all changes are automatically rolled back.
     pub fn transaction(&mut self) -> Result<Transaction<'_>, Error> {
-        let undo = Undo::Full(self.store.mem_backup());
-        let cat_backup = Some(self.catalog.clone());
         Ok(Transaction {
             db: self,
             committed: false,
-            undo,
-            cat_backup,
+            undo: Undo::None,
+            cat_backup: None,
             packs: Vec::new(),
             schema_changed: false,
         })
@@ -1848,10 +1912,10 @@ impl Db {
     pub(crate) fn run_prepared_in_tx(
         &mut self,
         prepared: &Prepared,
+        undo: &mut Undo,
     ) -> Result<(Handle, Option<Pack>), Error> {
         let t0 = Instant::now();
-        let mut undo = Undo::None;
-        let (rows, message, pack) = self.exec_program(&prepared.stmts, &mut undo)?;
+        let (rows, message, pack) = self.exec_program(&prepared.stmts, undo)?;
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
         let n = if rows.is_empty() {
             match prepared.stmts.last() {
@@ -5368,7 +5432,7 @@ impl Db {
                 updated.insert("hash".into(), Cell::Text(cached_content_hash(&body)));
             }
             self.check_row_fks(collection, &updated)?;
-            if let Undo::Rows(events) = ctx.undo {
+            if let Undo::Rows(events) | Undo::Mixed { events, .. } = ctx.undo {
                 events.push(RowUndo::Update(collection.to_string(), i, before.clone()));
             }
             // Clone before storing - we need both versions for sync operations
@@ -5429,7 +5493,7 @@ impl Db {
         idxs.sort_unstable();
         let out: Vec<Row> = idxs.iter().map(|&i| rows[i].clone()).collect();
         
-        if let Undo::Rows(events) = ctx.undo {
+        if let Undo::Rows(events) | Undo::Mixed { events, .. } = ctx.undo {
             events.push(RowUndo::Delete(
                 collection.to_string(),
                 idxs.clone(),
@@ -5602,14 +5666,18 @@ fn cas_each_ok(collection: &str, row: &Row, got: &str, ctx: &PackCtx) -> Result<
     Ok(())
 }
 
-enum Undo {
+pub(crate) enum Undo {
     None,
     Append(crate::store::AppendMark),
     Full(crate::store::MemBackup),
     Rows(Vec<RowUndo>),
+    Mixed {
+        append: crate::store::AppendMark,
+        events: Vec<RowUndo>,
+    },
 }
 
-enum RowUndo {
+pub(crate) enum RowUndo {
     Update(String, usize, Row),
     Delete(String, Vec<usize>, Vec<Row>),
 }

@@ -77,7 +77,7 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 20. **LIN-0030: Проверять source drift после прогона** — P1, candidate, G-PERF.
 21. **LIN-0005: Получить тестовый endpoint MSSQL** — P1, blocked_external, G-OPS.
 22. **LIN-0006: Получить тестовый endpoint Kusto** — P1, blocked_external, G-OPS.
-23. **LIN-0007: Сопоставить transaction boundaries peers** — P1, candidate, G-PERF.
+23. **LIN-0007: Сопоставить transaction boundaries peers** — P1, done, G-PERF.
 24. **LIN-0008: Сопоставить индексные ограничения peers** — P1, candidate, G-PERF.
 25. **LIN-0044: Проверить старый reader на новом WAL** — P1, done, G-CORRECT.
 
@@ -110,7 +110,7 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 20 | LIN-0030 | [D01](#d01) | Проверять source drift после прогона | PERF | candidate | M | G-PERF |
 | 21 | LIN-0005 | [D01](#d01) | Получить тестовый endpoint MSSQL | OPS | blocked_external | M | G-OPS |
 | 22 | LIN-0006 | [D01](#d01) | Получить тестовый endpoint Kusto | OPS | blocked_external | M | G-OPS |
-| 23 | LIN-0007 | [D01](#d01) | Сопоставить transaction boundaries peers | PERF | candidate | M | G-PERF |
+| 23 | LIN-0007 | [D01](#d01) | Сопоставить transaction boundaries peers | PERF | done | M | G-PERF |
 | 24 | LIN-0008 | [D01](#d01) | Сопоставить индексные ограничения peers | PERF | candidate | M | G-PERF |
 | 25 | LIN-0044 | [D02](#d02) | Проверить старый reader на новом WAL | CORRECTNESS | done | S | G-CORRECT |
 | 26 | LIN-0121 | [D04](#d04) | Проверить torn WAL header | CORRECTNESS | done | S | G-CORRECT |
@@ -213,7 +213,7 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 118 | LIN-0016 | [D01](#d01) | Измерять cold constructor latency | PERF | candidate | M | G-PERF |
 | 119 | LIN-0017 | [D01](#d01) | Ввести matched mixed-case fixtures | VERIFY | qualification | S | G-VERIFY |
 | 120 | LIN-0018 | [D01](#d01) | Проверять adversarial строковые fixtures | VERIFY | qualification | S | G-VERIFY |
-| 121 | LIN-0019 | [D01](#d01) | Отдельно измерять tiny transactions | PERF | candidate | M | G-PERF |
+| 121 | LIN-0019 | [D01](#d01) | Отдельно измерять tiny transactions | PERF | done | M | G-PERF |
 | 122 | LIN-0020 | [D01](#d01) | Отдельно измерять 1M-row ingestion | PERF | candidate | M | G-PERF |
 | 123 | LIN-0021 | [D01](#d01) | Измерять wide-row insertion | PERF | candidate | M | G-PERF |
 | 124 | LIN-0022 | [D01](#d01) | Измерять skewed-key insertion | PERF | candidate | M | G-PERF |
@@ -373,7 +373,7 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 278 | LIN-0214 | [D06](#d06) | Ограничить transaction mutation count | CORRECTNESS | qualification | M | G-CORRECT |
 | 279 | LIN-0215 | [D06](#d06) | Измерить rollback work amplification | PERF | candidate | M | G-PERF |
 | 280 | LIN-0216 | [D06](#d06) | Измерить journal clone elimination | PERF | candidate | M | G-PERF |
-| 281 | LIN-0217 | [D06](#d06) | Подготовить explicit transaction API | CORRECTNESS | qualification | M | G-CORRECT |
+| 281 | LIN-0217 | [D06](#d06) | Подготовить explicit transaction API | CORRECTNESS | done | M | G-CORRECT |
 | 282 | LIN-0218 | [D06](#d06) | Спроектировать bounded savepoints | FEATURE | candidate | L | G-FEATURE |
 | 283 | LIN-0219 | [D06](#d06) | Спроектировать read-your-writes contract | FEATURE | candidate | L | G-FEATURE |
 | 284 | LIN-0220 | [D06](#d06) | Спроектировать nested transaction rejection | FEATURE | candidate | L | G-FEATURE |
