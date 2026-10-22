@@ -242,7 +242,18 @@ impl PostingList {
     #[inline]
     pub fn insert(&mut self, pos: usize) {
         match self {
-            PostingList::Standard(vec) => vec.push(pos),
+            PostingList::Standard(vec) => {
+                if vec.len() >= 32 {
+                    let mut set = BitSet::new(pos + 1);
+                    for &p in vec.iter() {
+                        set.insert(p);
+                    }
+                    set.insert(pos);
+                    *self = PostingList::Bitmap(set);
+                } else {
+                    vec.push(pos);
+                }
+            }
             PostingList::Bitmap(set) => set.insert(pos),
         }
     }
@@ -261,10 +272,7 @@ impl PostingList {
 
     #[inline]
     pub fn push_back(&mut self, pos: usize) {
-        match self {
-            PostingList::Standard(vec) => vec.push(pos),
-            PostingList::Bitmap(set) => set.insert(pos),
-        }
+        self.insert(pos);
     }
 
     #[inline]
@@ -629,6 +637,16 @@ impl LiveIndex {
             if vec.count() == 0 {
                 self.forward.remove(&key);
             }
+        }
+    }
+
+    pub fn move_at(&mut self, from: usize, to: usize) {
+        if let Some(key) = self.reverse.remove(&from) {
+            if let Some(vec) = self.forward.get_mut(&key) {
+                vec.remove(from);
+                vec.insert(to);
+            }
+            self.reverse.insert(to, key);
         }
     }
 

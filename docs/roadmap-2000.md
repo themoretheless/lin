@@ -525,7 +525,7 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 430 | LIN-0396 | [D10](#d10) | Добавить index consistency inspector | FEATURE | candidate | M | G-FEATURE |
 | 431 | LIN-0397 | [D10](#d10) | Сравнить dense reverse map crossover | PERF | candidate | M | G-PERF |
 | 432 | LIN-0398 | [D10](#d10) | Сравнить adaptive posting representation | PERF | candidate | M | G-PERF |
-| 433 | LIN-0399 | [D10](#d10) | Сравнить bitmap postings для dense keys | PERF | candidate | M | G-PERF |
+| 433 | LIN-0399 | [D10](#d10) | Сравнить bitmap postings для dense keys | PERF | done | M | G-PERF |
 | 434 | LIN-0400 | [D10](#d10) | Сравнить hash-only equality indexes | PERF | candidate | M | G-PERF |
 | 435 | LIN-0405 | [D11](#d11) | Проверить NaN unique key policy | CORRECTNESS | qualification | S | G-CORRECT |
 | 436 | LIN-0406 | [D11](#d11) | Проверить negative-zero unique policy | CORRECTNESS | qualification | S | G-CORRECT |
@@ -770,7 +770,7 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 675 | LIN-0737 | [D19](#d19) | Измерить FxHashMap grouping capacity | PERF | candidate | M | G-PERF |
 | 676 | LIN-0738 | [D19](#d19) | Измерить inline group key buffers | PERF | candidate | M | G-PERF |
 | 677 | LIN-0739 | [D19](#d19) | Измерить group aggregate state layout | PERF | candidate | M | G-PERF |
-| 678 | LIN-0740 | [D19](#d19) | Измерить grouped projection allocation | PERF | candidate | M | G-PERF |
+| 678 | LIN-0740 | [D19](#d19) | Измерить grouped projection allocation | PERF | done | M | G-PERF |
 | 679 | LIN-0741 | [D19](#d19) | Спроектировать streaming aggregation | FEATURE | candidate | L | G-FEATURE |
 | 680 | LIN-0742 | [D19](#d19) | Спроектировать spillable hash aggregation | FEATURE | candidate | L | G-FEATURE |
 | 681 | LIN-0743 | [D19](#d19) | Спроектировать sorted-key aggregation | FEATURE | candidate | L | G-FEATURE |

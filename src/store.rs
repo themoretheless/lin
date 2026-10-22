@@ -2170,7 +2170,7 @@ impl Store {
         let row = &self.collections[collection][to];
         for index in self.indexes.values_mut() {
             if index.def.collection == collection {
-                index.remove_at(from);
+                index.move_at(from, to);
             }
         }
         if let Some(fts) = self.fts.get_mut(collection) {
@@ -2181,28 +2181,17 @@ impl Store {
             .then(|| row.get("uri").and_then(Cell::text_shared))
             .flatten();
         let spo = (collection == "facts").then(|| spo_key(row)).flatten();
-        for index in self.indexes.values_mut() {
-            if index.def.collection == collection && index.insert_at(to, row).is_err() {
-                // Preserve index_insert_row's first-error boundary.
-                break;
-            }
-        }
         // Keep the original remove/register semantics for duplicate identities.
         if let Some(id) = id {
-            if let Some(map) = self.by_id.get_mut(collection) {
-                map.remove(id.as_ref());
-            }
             self.by_id
                 .entry(collection.to_string())
                 .or_default()
                 .insert(id, to);
         }
         if let Some(uri) = uri {
-            self.docs_by_uri.remove(uri.as_ref());
             self.docs_by_uri.insert(uri, to);
         }
         if let Some(spo) = spo {
-            self.facts_by_spo.remove(&spo);
             self.facts_by_spo.insert(spo, to);
         }
         // These arrays are known parallel; swap-pop already transfers every
@@ -3263,6 +3252,9 @@ impl Store {
     }
     pub fn orders_total(&self) -> &[f64] {
         &self.orders_total
+    }
+    pub fn docs_wing(&self) -> &[Arc<str>] {
+        &self.docs_wing
     }
     pub fn users_id(&self) -> &[Arc<str>] {
         &self.users_id

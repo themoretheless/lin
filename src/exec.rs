@@ -590,6 +590,22 @@ pub(crate) struct PointGetPlan {
     pub is_docs_id_title: bool,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) enum AggKind {
+    Count { by: Option<Field> },
+    Sum { field: Field, by: Option<Field> },
+    Avg { field: Field, by: Option<Field> },
+    Min { field: Field, by: Option<Field> },
+    Max { field: Field, by: Option<Field> },
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct AggPlan {
+    pub collection: String,
+    pub filter: Option<Pred>,
+    pub kind: AggKind,
+}
+
 /// Compiled statement: parse + typecheck + plan once, run many times.
 #[derive(Debug, Clone)]
 pub struct Prepared {
@@ -603,6 +619,7 @@ pub struct Prepared {
     /// Schema (col/rel/index) — clears plan cache after success.
     schema: bool,
     pub(crate) point_get: Option<PointGetPlan>,
+    pub(crate) agg_plan: Option<AggPlan>,
 }
 
 impl Prepared {
@@ -1299,6 +1316,15 @@ impl Db {
         } else {
             None
         };
+        let agg_plan = if stmts.len() == 1
+            && let Stmt::Query(q) = &stmts[0]
+            && !writes
+            && point_get.is_none()
+        {
+            Self::try_extract_agg_plan(q, plan_cat)
+        } else {
+            None
+        };
         Ok(Prepared {
             src: String::new(),
             stmts,
@@ -1307,6 +1333,7 @@ impl Db {
             append_only,
             schema,
             point_get,
+            agg_plan,
         })
     }
 
@@ -1376,6 +1403,23 @@ impl Db {
             };
             let n = rows.len();
             let ms = t0.elapsed().as_secs_f64() * 1000.0;
+            return Ok(Handle {
+                plan: prepared.plan.clone(),
+                rows,
+                done: Done {
+                    r#gen: self.store.r#gen,
+                    n,
+                },
+                message: None,
+                ms,
+            });
+        }
+        if let Some(agg) = &prepared.agg_plan {
+            let t0 = Instant::now();
+            let now = now_ms();
+            let rows = self.execute_agg_plan(agg, now);
+            let ms = t0.elapsed().as_secs_f64() * 1000.0;
+            let n = rows.len();
             return Ok(Handle {
                 plan: prepared.plan.clone(),
                 rows,
@@ -1550,6 +1594,23 @@ impl Db {
             };
             let n = rows.len();
             let ms = t0.elapsed().as_secs_f64() * 1000.0;
+            return Ok(Handle {
+                plan: prepared.plan.clone(),
+                rows,
+                done: Done {
+                    r#gen: self.store.r#gen,
+                    n,
+                },
+                message: None,
+                ms,
+            });
+        }
+        if let Some(agg) = &prepared.agg_plan {
+            let t0 = Instant::now();
+            let now = now_ms();
+            let rows = self.execute_agg_plan(agg, now);
+            let ms = t0.elapsed().as_secs_f64() * 1000.0;
+            let n = rows.len();
             return Ok(Handle {
                 plan: prepared.plan.clone(),
                 rows,
@@ -2243,6 +2304,11 @@ impl Db {
                 return Ok(rows);
             }
 
+            // Zero-copy aggregates: sum/avg/min/max/count directly over columnar or borrowed rows.
+            if let Some(rows) = self.try_agg(q, bindings, now) {
+                return Ok(rows);
+            }
+
             // Filter → project → take: materialize projected rows without full BTreeMap clones.
             if let Some(rows) = self.try_filter_project(q, bindings, now) {
                 return Ok(rows);
@@ -2681,6 +2747,384 @@ impl Db {
                 .project_by_key(name, field, key, fields.as_deref())
                 .unwrap_or(full),
         ])
+    }
+
+    pub(crate) fn try_extract_agg_plan(q: &Query, cat: &crate::catalog::Catalog) -> Option<AggPlan> {
+        let mut q = crate::catalog::with_catalog_filter(q, cat);
+        q.to_mut().simplify_predicates();
+        let q = &*q;
+        let name = match &q.source {
+            Source::Collection(n) => n.clone(),
+            _ => return None,
+        };
+        let mut filter: Option<Pred> = None;
+        let mut kind: Option<AggKind> = None;
+        for step in &q.steps {
+            match step {
+                Step::Filter(p) => {
+                    if filter.is_some() || kind.is_some() {
+                        return None;
+                    }
+                    filter = Some(p.clone());
+                }
+                Step::Count { by } => {
+                    if kind.is_some() {
+                        return None;
+                    }
+                    kind = Some(AggKind::Count { by: by.clone() });
+                }
+                Step::Sum { field, by } => {
+                    if kind.is_some() {
+                        return None;
+                    }
+                    kind = Some(AggKind::Sum {
+                        field: field.clone(),
+                        by: by.clone(),
+                    });
+                }
+                Step::Avg { field, by } => {
+                    if kind.is_some() {
+                        return None;
+                    }
+                    kind = Some(AggKind::Avg {
+                        field: field.clone(),
+                        by: by.clone(),
+                    });
+                }
+                Step::Min { field, by } => {
+                    if kind.is_some() {
+                        return None;
+                    }
+                    kind = Some(AggKind::Min {
+                        field: field.clone(),
+                        by: by.clone(),
+                    });
+                }
+                Step::Max { field, by } => {
+                    if kind.is_some() {
+                        return None;
+                    }
+                    kind = Some(AggKind::Max {
+                        field: field.clone(),
+                        by: by.clone(),
+                    });
+                }
+                _ => return None,
+            }
+        }
+        let kind = kind?;
+        Some(AggPlan {
+            collection: name,
+            filter,
+            kind,
+        })
+    }
+
+    pub(crate) fn execute_agg_plan(&self, plan: &AggPlan, now: i64) -> Vec<Row> {
+        // 1. SoA paths for orders
+        if plan.collection == "orders" && self.store.orders_soa_ready() {
+            match &plan.kind {
+                AggKind::Sum { field, by } if field.leaf() == Some("total") => {
+                    if by.is_none() && plan.filter.is_none() {
+                        let total: f64 = self.store.orders_total().iter().sum();
+                        let mut row = crate::store::acquire_row();
+                        row.insert("total".into(), Cell::Float(total));
+                        return vec![row];
+                    }
+                    if let Some(by_field) = by && by_field.leaf() == Some("user_id") {
+                        if plan.filter.is_none() {
+                            let uids = self.store.orders_user_id();
+                            let totals = self.store.orders_total();
+                            let mut map: FxHashMap<Arc<str>, f64> = FxHashMap::default();
+                            for (uid, &tot) in uids.iter().zip(totals) {
+                                *map.entry(Arc::clone(uid)).or_insert(0.0) += tot;
+                            }
+                            let mut entries: Vec<(Arc<str>, f64)> = map.into_iter().collect();
+                            entries.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+                            return entries
+                                .into_iter()
+                                .map(|(uid, tot)| {
+                                    let mut row = crate::store::acquire_row();
+                                    row.insert("user_id".into(), Cell::Text(uid));
+                                    row.insert("total".into(), Cell::Float(tot));
+                                    row
+                                })
+                                .collect();
+                        } else if let Some(Pred::Cmp { field: filt_field, op: CmpOp::Gt, value }) = &plan.filter
+                            && filt_field.leaf() == Some("total")
+                        {
+                            let thresh = match value {
+                                Value::Float(f) => Some(*f),
+                                Value::Int(n) => Some(*n as f64),
+                                _ => None,
+                            };
+                            if let Some(threshold) = thresh {
+                                let uids = self.store.orders_user_id();
+                                let totals = self.store.orders_total();
+                                let mut map: FxHashMap<Arc<str>, f64> = FxHashMap::default();
+                                for (uid, &tot) in uids.iter().zip(totals) {
+                                    if tot > threshold {
+                                        *map.entry(Arc::clone(uid)).or_insert(0.0) += tot;
+                                    }
+                                }
+                                let mut entries: Vec<(Arc<str>, f64)> = map.into_iter().collect();
+                                entries.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+                                return entries
+                                    .into_iter()
+                                    .map(|(uid, tot)| {
+                                        let mut row = crate::store::acquire_row();
+                                        row.insert("user_id".into(), Cell::Text(uid));
+                                        row.insert("total".into(), Cell::Float(tot));
+                                        row
+                                    })
+                                    .collect();
+                            }
+                        }
+                    }
+                }
+                AggKind::Avg { field, by } if field.leaf() == Some("total") && by.is_none() && plan.filter.is_none() => {
+                    let totals = self.store.orders_total();
+                    let avg = if totals.is_empty() { 0.0 } else { totals.iter().sum::<f64>() / totals.len() as f64 };
+                    let mut row = crate::store::acquire_row();
+                    row.insert("total".into(), Cell::Float(avg));
+                    return vec![row];
+                }
+                _ => {}
+            }
+        }
+
+        // 2. SoA paths for docs
+        if plan.collection == "docs" && self.store.docs_wing().len() == self.store.collection("docs").len() {
+            if let AggKind::Count { by: Some(by_field) } = &plan.kind
+                && by_field.leaf() == Some("wing")
+                && plan.filter.is_none()
+            {
+                let mut map: FxHashMap<Arc<str>, i64> = FxHashMap::default();
+                for w in self.store.docs_wing() {
+                    *map.entry(Arc::clone(w)).or_insert(0) += 1;
+                }
+                let mut entries: Vec<(Arc<str>, i64)> = map.into_iter().collect();
+                entries.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+                return entries
+                    .into_iter()
+                    .map(|(w, count)| {
+                        let mut row = crate::store::acquire_row();
+                        row.insert("wing".into(), Cell::Text(w));
+                        row.insert("hits".into(), Cell::Int(count));
+                        row
+                    })
+                    .collect();
+            }
+        }
+
+        // 3. Generic fallback: iterate `&[Row]` without cloning!
+        let col = self.store.collection(&plan.collection);
+        let filter = plan.filter.as_ref();
+        match &plan.kind {
+            AggKind::Count { by } => {
+                let Some(by) = by else {
+                    let mut n = 0i64;
+                    for r in col {
+                        if filter.is_none_or(|p| eval_pred(p, r, now)) {
+                            n += 1;
+                        }
+                    }
+                    return vec![hits_row(n)];
+                };
+                let bk = by.as_str();
+                let mut map: FxHashMap<Cell, i64> = FxHashMap::default();
+                for r in col {
+                    if filter.is_none_or(|p| eval_pred(p, r, now)) {
+                        let cell = r.get(&bk).map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
+                        *map.entry(cell).or_insert(0) += 1;
+                    }
+                }
+                count_cell_map_to_rows(&bk, map)
+            }
+            AggKind::Sum { field, by } => {
+                let fk = field.as_str();
+                let Some(by) = by else {
+                    let mut total = 0.0f64;
+                    for r in col {
+                        if filter.is_none_or(|p| eval_pred(p, r, now)) {
+                            total += r.get(&fk).and_then(Cell::as_f64).unwrap_or(0.0);
+                        }
+                    }
+                    let mut row = crate::store::acquire_row();
+                    row.insert(fk, Cell::Float(total));
+                    return vec![row];
+                };
+                let bk = by.as_str();
+                let mut map: FxHashMap<Cell, f64> = FxHashMap::default();
+                for r in col {
+                    if filter.is_none_or(|p| eval_pred(p, r, now)) {
+                        let cell = r.get(&bk).map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
+                        let n = r.get(&fk).and_then(Cell::as_f64).unwrap_or(0.0);
+                        *map.entry(cell).or_insert(0.0) += n;
+                    }
+                }
+                let mut entries: Vec<(Cell, f64)> = map.into_iter().collect();
+                entries.sort_unstable_by(|(a, _), (b, _)| cmp_sort(a, b));
+                entries
+                    .into_iter()
+                    .map(|(cell, n)| {
+                        let mut row = crate::store::acquire_row();
+                        row.insert(bk.clone(), cell);
+                        row.insert(fk.clone(), Cell::Float(n));
+                        row
+                    })
+                    .collect()
+            }
+            AggKind::Avg { field, by } => {
+                let fk = field.as_str();
+                let Some(by) = by else {
+                    let mut sum = 0.0f64;
+                    let mut count = 0usize;
+                    for r in col {
+                        if filter.is_none_or(|p| eval_pred(p, r, now)) {
+                            if let Some(v) = r.get(&fk).and_then(Cell::as_f64) {
+                                sum += v;
+                                count += 1;
+                            }
+                        }
+                    }
+                    let avg = if count == 0 { 0.0 } else { sum / (count as f64) };
+                    let mut row = crate::store::acquire_row();
+                    row.insert(fk, Cell::Float(avg));
+                    return vec![row];
+                };
+                let bk = by.as_str();
+                let mut map: FxHashMap<Cell, (f64, usize)> = FxHashMap::default();
+                for r in col {
+                    if filter.is_none_or(|p| eval_pred(p, r, now)) {
+                        let cell = r.get(&bk).map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
+                        let entry = map.entry(cell).or_insert((0.0, 0));
+                        if let Some(v) = r.get(&fk).and_then(Cell::as_f64) {
+                            entry.0 += v;
+                            entry.1 += 1;
+                        }
+                    }
+                }
+                let mut entries: Vec<(Cell, (f64, usize))> = map.into_iter().collect();
+                entries.sort_unstable_by(|(a, _), (b, _)| cmp_sort(a, b));
+                entries
+                    .into_iter()
+                    .map(|(gcell, (sum, count))| {
+                        let avg = if count == 0 { 0.0 } else { sum / (count as f64) };
+                        let mut row = crate::store::acquire_row();
+                        row.insert(bk.clone(), gcell);
+                        row.insert(fk.clone(), Cell::Float(avg));
+                        row
+                    })
+                    .collect()
+            }
+            AggKind::Min { field, by } => {
+                let fk = field.as_str();
+                let Some(by) = by else {
+                    let mut best: Option<Cell> = None;
+                    for r in col {
+                        if filter.is_none_or(|p| eval_pred(p, r, now)) {
+                            if let Some(c) = r.get(&fk).filter(|c| !matches!(c, Cell::Null)) {
+                                best = Some(match best {
+                                    None => c.clone_for_borrow(),
+                                    Some(prev) => if cmp_sort(c, &prev).is_lt() { c.clone_for_borrow() } else { prev },
+                                });
+                            }
+                        }
+                    }
+                    let mut row = crate::store::acquire_row();
+                    row.insert(fk, best.unwrap_or(Cell::Null));
+                    return vec![row];
+                };
+                let bk = by.as_str();
+                let mut map: FxHashMap<Cell, Option<Cell>> = FxHashMap::default();
+                for r in col {
+                    if filter.is_none_or(|p| eval_pred(p, r, now)) {
+                        let cell = r.get(&bk).map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
+                        let f_val = r.get(&fk).filter(|c| !matches!(c, Cell::Null));
+                        let entry = map.entry(cell).or_insert(None);
+                        if let Some(c) = f_val {
+                            *entry = Some(match entry.take() {
+                                None => c.clone_for_borrow(),
+                                Some(prev) => if cmp_sort(c, &prev).is_lt() { c.clone_for_borrow() } else { prev },
+                            });
+                        }
+                    }
+                }
+                let mut entries: Vec<(Cell, Option<Cell>)> = map.into_iter().collect();
+                entries.sort_unstable_by(|(a, _), (b, _)| cmp_sort(a, b));
+                entries
+                    .into_iter()
+                    .map(|(gcell, val)| {
+                        let mut row = crate::store::acquire_row();
+                        row.insert(bk.clone(), gcell);
+                        row.insert(fk.clone(), val.unwrap_or(Cell::Null));
+                        row
+                    })
+                    .collect()
+            }
+            AggKind::Max { field, by } => {
+                let fk = field.as_str();
+                let Some(by) = by else {
+                    let mut best: Option<Cell> = None;
+                    for r in col {
+                        if filter.is_none_or(|p| eval_pred(p, r, now)) {
+                            if let Some(c) = r.get(&fk).filter(|c| !matches!(c, Cell::Null)) {
+                                best = Some(match best {
+                                    None => c.clone_for_borrow(),
+                                    Some(prev) => if cmp_sort(c, &prev).is_gt() { c.clone_for_borrow() } else { prev },
+                                });
+                            }
+                        }
+                    }
+                    let mut row = crate::store::acquire_row();
+                    row.insert(fk, best.unwrap_or(Cell::Null));
+                    return vec![row];
+                };
+                let bk = by.as_str();
+                let mut map: FxHashMap<Cell, Option<Cell>> = FxHashMap::default();
+                for r in col {
+                    if filter.is_none_or(|p| eval_pred(p, r, now)) {
+                        let cell = r.get(&bk).map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
+                        let f_val = r.get(&fk).filter(|c| !matches!(c, Cell::Null));
+                        let entry = map.entry(cell).or_insert(None);
+                        if let Some(c) = f_val {
+                            *entry = Some(match entry.take() {
+                                None => c.clone_for_borrow(),
+                                Some(prev) => if cmp_sort(c, &prev).is_gt() { c.clone_for_borrow() } else { prev },
+                            });
+                        }
+                    }
+                }
+                let mut entries: Vec<(Cell, Option<Cell>)> = map.into_iter().collect();
+                entries.sort_unstable_by(|(a, _), (b, _)| cmp_sort(a, b));
+                entries
+                    .into_iter()
+                    .map(|(gcell, val)| {
+                        let mut row = crate::store::acquire_row();
+                        row.insert(bk.clone(), gcell);
+                        row.insert(fk.clone(), val.unwrap_or(Cell::Null));
+                        row
+                    })
+                    .collect()
+            }
+        }
+    }
+
+    fn try_agg(
+        &self,
+        q: &Query,
+        bindings: &BTreeMap<String, Vec<Row>>,
+        now: i64,
+    ) -> Option<Vec<Row>> {
+        if let Source::Collection(name) = &q.source
+            && bindings.get(name).is_none()
+            && let Some(plan) = Self::try_extract_agg_plan(q, &self.catalog)
+        {
+            Some(self.execute_agg_plan(&plan, now))
+        } else {
+            None
+        }
     }
 
     /// `col | search lex|hybrid …` — FTS postings → residual score (no full scan).

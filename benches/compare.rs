@@ -292,6 +292,7 @@ struct LinWarm {
     fts_miss: lin::Prepared,
     fts_hybrid: lin::Prepared,
     materialize: lin::Prepared,
+    count_by_wing: lin::Prepared,
 }
 
 fn seed_lin(n: usize) -> LinWarm {
@@ -333,6 +334,9 @@ fn seed_lin(n: usize) -> LinWarm {
     let materialize = db
         .prepare(r#"docs | wing == "rag" | { id, title } | take all"#)
         .expect("lin prepare materialize");
+    let count_by_wing = db
+        .prepare(r#"docs | count by wing"#)
+        .expect("lin prepare count_by_wing");
     let eq_plan = db
         .explain_as(r#"docs | wing == "rag" | count by wing"#, None)
         .expect("explain eq");
@@ -360,6 +364,7 @@ fn seed_lin(n: usize) -> LinWarm {
         fts_miss,
         fts_hybrid,
         materialize,
+        count_by_wing,
     }
 }
 
@@ -759,6 +764,8 @@ struct JoinLin {
     inner_q: LinQueryable,
     filter_q: LinQueryable,
     orders_q: LinQueryable,
+    agg_sum: lin::Prepared,
+    agg_sum_by: lin::Prepared,
 }
 
 fn seed_join_lin() -> JoinLin {
@@ -804,6 +811,12 @@ fn seed_join_lin() -> JoinLin {
         .count();
     assert_eq!(cur_n, JOIN_ORDERS);
     assert!(inner_q.cursor(&db).expect("lazy").is_lazy());
+    let agg_sum = db
+        .prepare(r#"orders | sum total"#)
+        .expect("lin prepare agg_sum");
+    let agg_sum_by = db
+        .prepare(r#"orders | sum total by user_id"#)
+        .expect("lin prepare agg_sum_by");
     JoinLin {
         db,
         inner,
@@ -811,6 +824,8 @@ fn seed_join_lin() -> JoinLin {
         inner_q,
         filter_q,
         orders_q,
+        agg_sum,
+        agg_sum_by,
     }
 }
 
@@ -2227,14 +2242,14 @@ fn main() -> airbug_bench::Result<()> {
     }
 
     suite
-        .bench_fixture("materialize/lin", lin, |s| {
+        .bench_fixture("materialize/lin", lin.clone(), |s| {
             black_box(s.materialize.run(&mut s.db).expect("lin mat").done.n)
         })
         .tag("materialize")
         .tag("lin")
         .parameter("n", N);
     suite
-        .bench_fixture("materialize/sqlite", sql, |s| {
+        .bench_fixture("materialize/sqlite", sql.clone(), |s| {
             let mut stmt = s
                 .conn
                 .prepare_cached("SELECT id, title FROM docs WHERE wing = 'rag'")
@@ -2253,7 +2268,7 @@ fn main() -> airbug_bench::Result<()> {
         .tag("sqlite")
         .parameter("n", N);
     suite
-        .bench_fixture("materialize/duckdb", duck, |s| {
+        .bench_fixture("materialize/duckdb", duck.clone(), |s| {
             let mut stmt = s
                 .conn
                 .prepare_cached("SELECT id, title FROM docs WHERE wing = 'rag'")
@@ -2419,7 +2434,7 @@ fn main() -> airbug_bench::Result<()> {
         .parameter("orders", JOIN_ORDERS)
         .work_units("rows", JOIN_FILTER_N as u64);
     suite
-        .bench_fixture("join_filter/lin_cursor", lin_join, |s| {
+        .bench_fixture("join_filter/lin_cursor", lin_join.clone(), |s| {
             black_box(consume_join_cursor(&s.db, &s.filter_q))
         })
         .tag("join_filter")
@@ -2428,7 +2443,7 @@ fn main() -> airbug_bench::Result<()> {
         .parameter("orders", JOIN_ORDERS)
         .work_units("rows", JOIN_FILTER_N as u64);
     suite
-        .bench_fixture("join_filter/sqlite", sql_join, |s| {
+        .bench_fixture("join_filter/sqlite", sql_join.clone(), |s| {
             black_box(sqlite_join_n(&s.conn, JOIN_FILTER_SQL))
         })
         .tag("join_filter")
@@ -2437,7 +2452,7 @@ fn main() -> airbug_bench::Result<()> {
         .parameter("orders", JOIN_ORDERS)
         .work_units("rows", JOIN_FILTER_N as u64);
     suite
-        .bench_fixture("join_filter/duckdb", duck_join, |s| {
+        .bench_fixture("join_filter/duckdb", duck_join.clone(), |s| {
             black_box(duck_join_n(&s.conn, JOIN_FILTER_SQL))
         })
         .tag("join_filter")
@@ -2467,6 +2482,139 @@ fn main() -> airbug_bench::Result<()> {
             .parameter("orders", JOIN_ORDERS)
             .work_units("rows", JOIN_FILTER_N as u64);
     }
+
+    // Heavy Aggregates: zero-copy SoA folds vs SQLite / DuckDB
+    suite
+        .bench_fixture("agg_sum/lin", lin_join.clone(), |s| {
+            let res = s.agg_sum.run(&mut s.db).expect("lin sum");
+            black_box(res.done.n)
+        })
+        .tag("agg")
+        .tag("lin")
+        .parameter("orders", JOIN_ORDERS)
+        .work_units("rows", JOIN_ORDERS as u64);
+    suite
+        .bench_fixture("agg_sum/sqlite", sql_join.clone(), |s| {
+            let mut stmt = s
+                .conn
+                .prepare_cached("SELECT SUM(total) FROM orders")
+                .expect("sqlite prep");
+            let sum: f64 = stmt.query_row([], |r| r.get(0)).expect("sqlite sum");
+            black_box(sum)
+        })
+        .tag("agg")
+        .tag("sqlite")
+        .parameter("orders", JOIN_ORDERS)
+        .work_units("rows", JOIN_ORDERS as u64);
+    suite
+        .bench_fixture("agg_sum/duckdb", duck_join.clone(), |s| {
+            let mut stmt = s
+                .conn
+                .prepare_cached("SELECT SUM(total) FROM orders")
+                .expect("duck prep");
+            let sum: f64 = stmt.query_row([], |r| r.get(0)).expect("duck sum");
+            black_box(sum)
+        })
+        .tag("agg")
+        .tag("duckdb")
+        .parameter("orders", JOIN_ORDERS)
+        .work_units("rows", JOIN_ORDERS as u64);
+
+    suite
+        .bench_fixture("agg_sum_by/lin", lin_join, |s| {
+            let res = s.agg_sum_by.run(&mut s.db).expect("lin sum by");
+            black_box(res.done.n)
+        })
+        .tag("agg")
+        .tag("lin")
+        .parameter("orders", JOIN_ORDERS)
+        .work_units("rows", JOIN_ORDERS as u64);
+    suite
+        .bench_fixture("agg_sum_by/sqlite", sql_join, |s| {
+            let mut stmt = s
+                .conn
+                .prepare_cached("SELECT user_id, SUM(total) FROM orders GROUP BY user_id")
+                .expect("sqlite prep");
+            let mut rows = stmt.query([]).expect("sqlite sum by");
+            let mut count = 0usize;
+            while let Some(row) = rows.next().expect("sqlite row") {
+                let _user: String = row.get(0).expect("user");
+                let _sum: f64 = row.get(1).expect("sum");
+                count += 1;
+            }
+            black_box(count)
+        })
+        .tag("agg")
+        .tag("sqlite")
+        .parameter("orders", JOIN_ORDERS)
+        .work_units("rows", JOIN_ORDERS as u64);
+    suite
+        .bench_fixture("agg_sum_by/duckdb", duck_join, |s| {
+            let mut stmt = s
+                .conn
+                .prepare_cached("SELECT user_id, SUM(total) FROM orders GROUP BY user_id")
+                .expect("duck prep");
+            let mut rows = stmt.query([]).expect("duck sum by");
+            let mut count = 0usize;
+            while let Some(row) = rows.next().expect("duck row") {
+                let _user: String = row.get(0).expect("user");
+                let _sum: f64 = row.get(1).expect("sum");
+                count += 1;
+            }
+            black_box(count)
+        })
+        .tag("agg")
+        .tag("duckdb")
+        .parameter("orders", JOIN_ORDERS)
+        .work_units("rows", JOIN_ORDERS as u64);
+
+    suite
+        .bench_fixture("agg_count_by/lin", lin, |s| {
+            let res = s.count_by_wing.run(&mut s.db).expect("lin count by");
+            black_box(res.done.n)
+        })
+        .tag("agg")
+        .tag("lin")
+        .parameter("docs", N)
+        .work_units("rows", N as u64);
+    suite
+        .bench_fixture("agg_count_by/sqlite", sql, |s| {
+            let mut stmt = s
+                .conn
+                .prepare_cached("SELECT wing, COUNT(*) FROM docs GROUP BY wing")
+                .expect("sqlite prep");
+            let mut rows = stmt.query([]).expect("sqlite count by");
+            let mut count = 0usize;
+            while let Some(row) = rows.next().expect("sqlite row") {
+                let _wing: String = row.get(0).expect("wing");
+                let _cnt: i64 = row.get(1).expect("cnt");
+                count += 1;
+            }
+            black_box(count)
+        })
+        .tag("agg")
+        .tag("sqlite")
+        .parameter("docs", N)
+        .work_units("rows", N as u64);
+    suite
+        .bench_fixture("agg_count_by/duckdb", duck, |s| {
+            let mut stmt = s
+                .conn
+                .prepare_cached("SELECT wing, COUNT(*) FROM docs GROUP BY wing")
+                .expect("duck prep");
+            let mut rows = stmt.query([]).expect("duck count by");
+            let mut count = 0usize;
+            while let Some(row) = rows.next().expect("duck row") {
+                let _wing: String = row.get(0).expect("wing");
+                let _cnt: i64 = row.get(1).expect("cnt");
+                count += 1;
+            }
+            black_box(count)
+        })
+        .tag("agg")
+        .tag("duckdb")
+        .parameter("docs", N)
+        .work_units("rows", N as u64);
 
     macro_rules! insert_bulk {
         ($label:expr, $n:expr) => {{
