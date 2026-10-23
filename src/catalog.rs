@@ -122,7 +122,7 @@ pub struct IndexDef {
     pub fields: Vec<String>,
     /// Partial index predicate - only index rows where this pred is true
     pub pred: Option<Pred>,
-    
+
     /// Bitmap index mode - use bitset instead of BTreeMap for low-cardinality columns
     /// Automatically detected when field has <= 16 distinct values
     pub bitmap_card_field: Option<String>,
@@ -344,7 +344,7 @@ impl Catalog {
                     unique: *unique,
                     fields: fields.clone(),
                     pred: pred.clone(),
-                    bitmap_card_field: None,  // DEFAULT: No bitmap optimization
+                    bitmap_card_field: None, // DEFAULT: No bitmap optimization
                 };
                 let label = def.label();
                 if self.indexes.contains_key(&label) {

@@ -548,10 +548,7 @@ fn plan_query_inner(q: &Query, cat: &Catalog, allow_implicit_take: bool) -> Resu
             Step::Join { on, .. } => push_field(&mut needed, on),
             Step::Sort { field, .. } => push_field(&mut needed, &field.as_str()),
             Step::Window {
-                field,
-                by,
-                order,
-                ..
+                field, by, order, ..
             } => {
                 if let Some(f) = field {
                     push_field(&mut needed, &f.as_str());
@@ -786,7 +783,10 @@ fn plan_query_inner(q: &Query, cat: &Catalog, allow_implicit_take: bool) -> Resu
                     NodeKind::Window {
                         func: func_str,
                         by: by.iter().map(|b| b.as_str().to_string()).collect(),
-                        order: order.iter().map(|s| (s.field.as_str().to_string(), s.desc)).collect(),
+                        order: order
+                            .iter()
+                            .map(|s| (s.field.as_str().to_string(), s.desc))
+                            .collect(),
                         frame: frame.map(|fr| fr.to_string()),
                         as_field: as_field.clone(),
                     },

@@ -121,11 +121,8 @@ impl GpuCompute {
             ]);
             program.extend(transitions.into_iter().flatten());
         }
-        let kernel = self.builtin_kernel(
-            |k| &mut k.regex,
-            include_str!("shaders/regex.wgsl"),
-            "main",
-        )?;
+        let kernel =
+            self.builtin_kernel(|k| &mut k.regex, include_str!("shaders/regex.wgsl"), "main")?;
         let program = self.storage_buffer(bytemuck::cast_slice(&program))?;
         let mut result = Vec::with_capacity(texts.len());
         let mut position = 0;

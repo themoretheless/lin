@@ -430,10 +430,7 @@ fn read_str(b: &[u8], i: &mut usize) -> Result<String, Error> {
 pub fn tokenize(text: &str) -> Vec<String> {
     let mut scratch = String::with_capacity(text.len());
     let lowered = lowercased(text, &mut scratch);
-    lowered
-        .split_whitespace()
-        .map(|t| t.to_string())
-        .collect()
+    lowered.split_whitespace().map(|t| t.to_string()).collect()
 }
 
 /// Text of every field an index tokenizes: the `fts` fields, plus `snippet`
@@ -451,7 +448,7 @@ fn fts_texts<'a: 'b, 'b>(row: &'a Row, fields: &'b [String]) -> impl Iterator<It
 }
 
 /// `text` lowercased, borrowed from `text` itself when lowering is a no-op.
-/// 
+///
 /// Uses SIMD-optimized ASCII handling via make_ascii_lowercase() which rustc
 /// compiles to SSE4/AVX2 instructions on x86_64 targets.
 #[inline]
@@ -462,7 +459,7 @@ pub(crate) fn lowercased<'a>(text: &'a str, scratch: &'a mut String) -> &'a str 
         if !text.bytes().any(|b| b.is_ascii_uppercase()) {
             return text;
         }
-        
+
         scratch.clear();
         // make_ascii_lowercase() uses single-instruction conversion on modern CPUs:
         // x86_64: AND with 0xDF to preserve case + OR with 0x20 unconditionally
@@ -1147,16 +1144,28 @@ mod pending_order_tests {
         let mut r1 = r0.clone();
         r1.insert("snippet".into(), Cell::from_text("shared_tok fresh_tok"));
         index.sync_row(0, &r0, &r1);
-        assert_eq!(index.matches("implicit_tok").unwrap_or_default(), Vec::<usize>::new());
+        assert_eq!(
+            index.matches("implicit_tok").unwrap_or_default(),
+            Vec::<usize>::new()
+        );
         assert_eq!(index.matches("shared_tok"), Some(vec![0]));
         assert_eq!(index.matches("fresh_tok"), Some(vec![0]));
 
         // Remove the last remaining terms by clearing the row and folding pending edits.
         let empty = Row::new();
         index.sync_row(0, &r1, &empty);
-        assert_eq!(index.matches("alpha").unwrap_or_default(), Vec::<usize>::new());
-        assert_eq!(index.matches("shared_tok").unwrap_or_default(), Vec::<usize>::new());
-        assert_eq!(index.matches("fresh_tok").unwrap_or_default(), Vec::<usize>::new());
+        assert_eq!(
+            index.matches("alpha").unwrap_or_default(),
+            Vec::<usize>::new()
+        );
+        assert_eq!(
+            index.matches("shared_tok").unwrap_or_default(),
+            Vec::<usize>::new()
+        );
+        assert_eq!(
+            index.matches("fresh_tok").unwrap_or_default(),
+            Vec::<usize>::new()
+        );
         index.fold_all();
         assert_eq!(index.matches("alpha"), None);
     }

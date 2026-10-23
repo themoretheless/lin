@@ -579,7 +579,9 @@ impl Queryable {
         as_field: impl Into<String>,
     ) -> Self {
         let by_vec: Vec<String> = by.map(|b| vec![b.as_ref().to_string()]).unwrap_or_default();
-        let order_vec: Vec<(String, bool)> = order.map(|o| vec![(o.as_ref().to_string(), desc)]).unwrap_or_default();
+        let order_vec: Vec<(String, bool)> = order
+            .map(|o| vec![(o.as_ref().to_string(), desc)])
+            .unwrap_or_default();
         self.window_with_frame(func, field, by_vec, order_vec, None, as_field)
     }
 
@@ -1197,7 +1199,9 @@ impl<'a, T> BoundQueryable<'a, T> {
         frame: Option<crate::window::WindowFrame>,
         as_field: impl Into<String>,
     ) -> Self {
-        self.q = self.q.window_with_frame(func, field, by, order, frame, as_field);
+        self.q = self
+            .q
+            .window_with_frame(func, field, by, order, frame, as_field);
         self
     }
 

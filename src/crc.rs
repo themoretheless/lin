@@ -163,7 +163,11 @@ mod tests {
         for i in 0..original.len() {
             let mut corrupted = original.to_vec();
             corrupted[i] ^= 1;
-            assert_ne!(hardware_crc32c(&corrupted), base_crc, "missed bit flip at {i}");
+            assert_ne!(
+                hardware_crc32c(&corrupted),
+                base_crc,
+                "missed bit flip at {i}"
+            );
         }
     }
 }

@@ -22,7 +22,7 @@ thread_local! {
 
 /// Global row pool for batch operations - reused across queries
 #[allow(dead_code)]
-static ROW_POOL_INIT: std::sync::OnceLock<std::sync::Mutex<Option<RowPool>>> = 
+static ROW_POOL_INIT: std::sync::OnceLock<std::sync::Mutex<Option<RowPool>>> =
     std::sync::OnceLock::new();
 
 /// Get or create the global row pool (thread-safe)
@@ -508,7 +508,6 @@ impl From<Arc<str>> for Cell {
     }
 }
 
-
 pub type Row = BTreeMap<String, Cell>;
 
 /// Ergonomics for `match row.cell("col") { Cell::Text(s) => …, Cell::Null => … }`.
@@ -619,11 +618,11 @@ pub struct Store {
     pub(crate) edges_out: FxHashMap<(Arc<str>, Arc<str>), Vec<Arc<str>>>,
     /// (rel, to) → source node keys (incoming adjacency index).
     pub(crate) edges_in: FxHashMap<(Arc<str>, Arc<str>), Vec<Arc<str>>>,
-    
+
     // Hot collection metadata — always accessed during scans
     /// Count of rows per collection for quick bounds checking
     pub(crate) col_counts: FxHashMap<String, usize>,
-    
+
     /// Parallel Arc columns for docs — contains scans + projected materialize
     /// without cloning full `BTreeMap` rows. Organized SoA (struct-of-arrays) for cache locality.
     docs_id: Vec<Arc<str>>,
@@ -664,17 +663,17 @@ impl Store {
         for name in ["docs", "users", "orders", "facts"] {
             collections.insert(name.into(), Vec::new());
         }
-        
+
         // Initialize global row pool for batch operations
         init_row_pool(32);
-        
+
         // Cache-friendly: track row counts per collection for fast bounds checking
         let mut col_counts = FxHashMap::default();
         col_counts.insert("docs".to_string(), 0);
         col_counts.insert("users".to_string(), 0);
         col_counts.insert("orders".to_string(), 0);
         col_counts.insert("facts".to_string(), 0);
-        
+
         Self {
             r#gen: 0,
             embed_id: embed_id.into(),
@@ -759,13 +758,16 @@ impl Store {
         let snap = persist::read_snapshot(dir)?;
         let start = snap.as_ref().map(|s| s.log_offset).unwrap_or(0);
         let snap_catalog_hash = snap.as_ref().map(|s| s.catalog_hash.clone());
-        let snap_has_extras = snap.as_ref().map(|s| {
-            !s.extra_collections.is_empty()
-                || !s.extra_rels.is_empty()
-                || !s.extra_indexes.is_empty()
-                || !s.extra_filters.is_empty()
-                || !s.extra_owned.is_empty()
-        }).unwrap_or(false);
+        let snap_has_extras = snap
+            .as_ref()
+            .map(|s| {
+                !s.extra_collections.is_empty()
+                    || !s.extra_rels.is_empty()
+                    || !s.extra_indexes.is_empty()
+                    || !s.extra_filters.is_empty()
+                    || !s.extra_owned.is_empty()
+            })
+            .unwrap_or(false);
 
         let mut store = match snap {
             Some(s) => Self::from_snapshot_unindexed(dir, s)?,
@@ -1189,16 +1191,16 @@ impl Store {
                 let idx = self.collection(collection).len() - 1;
                 // Update cache-friendly count tracking
                 self.update_col_count(collection, 1);
-                
+
                 // Update precomputed aggregates if any exist for this collection
                 crate::exec::update_aggregate_for_insert(collection, row);
-                
+
                 // Update window function states if any exist for this collection
                 crate::window::update_window_states(collection, idx, row);
-                
+
                 // Invalidate aggregate views on mutation (generation-based)
                 crate::exec::invalidate_aggregates(self.r#gen);
-                
+
                 self.row_maps_register(collection, idx);
                 let _ = self.index_insert_at(collection, idx);
                 self.fts_insert_at(collection, idx);
@@ -1829,8 +1831,7 @@ impl Store {
             .collection("facts")
             .iter()
             .map(|row| {
-                spo_key(row)
-                    .unwrap_or_else(|| (Arc::from(""), Arc::from(""), Arc::from("")))
+                spo_key(row).unwrap_or_else(|| (Arc::from(""), Arc::from(""), Arc::from("")))
             })
             .collect();
         self.facts_s.reserve(spo_triples.len());
@@ -2137,7 +2138,7 @@ impl Store {
 
         // Cache-friendly count update (decrement by number of deleted rows)
         self.update_col_count(collection, -(dead.len() as isize));
-        
+
         // Swap-remove, highest slot first: the last live row moves into each vacated
         // slot, so the array stays dense and only the doomed row's and the moved
         // row's index / FTS / map entries change. Positions are derived (maps,
@@ -2149,10 +2150,10 @@ impl Store {
                 Some(rows) if p < rows.len() => rows.len() - 1,
                 _ => break,
             };
-            
+
             // Zero-copy: steal row with swap_remove instead of cloning
             let doomed = self.collections.get_mut(collection).unwrap().swap_remove(p);
-            
+
             self.index_remove_row(collection, p, &doomed);
             self.fts_remove_row(collection, p, &doomed);
             if let Some(hnsw) = self.hnsw.get_mut(collection) {
@@ -2270,7 +2271,9 @@ impl Store {
     /// [`Store::row_maps_register_row`] plus the `facts` key that helper ignores.
     fn swap_maps_register(&mut self, collection: &str, idx: usize, row: &Row) {
         // Inline: facts By_SPO lookup is only needed for triples
-        if collection == "facts" && let Some(spo) = spo_key(row) {
+        if collection == "facts"
+            && let Some(spo) = spo_key(row)
+        {
             self.facts_by_spo.insert(spo, idx);
         } else {
             self.row_maps_register_row(collection, idx, row);
@@ -2833,13 +2836,13 @@ impl Store {
         if labels.is_empty() {
             return Ok(());
         }
-        
+
         // Batch-only path for slab insertions to reduce per-row overhead
         for label in &labels {
             let Some(idx) = self.indexes.get_mut(label) else {
                 continue;
             };
-            
+
             // Use batch insert when multiple rows
             if rows.len() > 1 {
                 if let Err(e) = idx.insert_slab_batch(start, rows) {
@@ -2897,11 +2900,11 @@ impl Store {
             for (i, row) in self.collection(&snap.collection).iter().enumerate() {
                 let _ = live.insert_at(i, row);
             }
-            
+
             // Build bloom filter for fast negative lookups
             #[cfg(feature = "parallel")]
             live.build_bloom_filter();
-            
+
             self.indexes.insert(label, live);
         }
     }
@@ -3312,11 +3315,11 @@ impl Store {
         if fields.is_empty() || !fields.iter().all(|f| docs_hot_field(f)) {
             return None;
         }
-        
+
         let n = self.docs_id.len();
         let mut out = Vec::with_capacity(idxs.len());
         let id_title = fields.len() == 2 && fields[0] == "id" && fields[1] == "title";
-        
+
         for &i in idxs {
             if i >= n {
                 continue;
@@ -3939,7 +3942,11 @@ mod borrowed_delete_tests {
         for a in &samples {
             for b in &samples {
                 if a == b {
-                    assert_eq!(hash_cell(a), hash_cell(b), "Hash/Eq mismatch for {a:?} and {b:?}");
+                    assert_eq!(
+                        hash_cell(a),
+                        hash_cell(b),
+                        "Hash/Eq mismatch for {a:?} and {b:?}"
+                    );
                 }
             }
         }

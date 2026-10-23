@@ -612,7 +612,12 @@ impl HnswIndex {
             }
         }
 
-        w.into_iter().map(|n| MaxSimNode { sim: n.sim, idx: n.idx }).collect()
+        w.into_iter()
+            .map(|n| MaxSimNode {
+                sim: n.sim,
+                idx: n.idx,
+            })
+            .collect()
     }
 
     fn select_neighbors(&self, candidates: &[MaxSimNode], max_conn: usize) -> Vec<usize> {
@@ -790,9 +795,12 @@ pub fn dot_sq8(a: &[i8], b: &[i8]) -> f64 {
     for i in 0..chunks {
         let base = i * 8;
         sum0 += (a[base] as i32) * (b[base] as i32) + (a[base + 1] as i32) * (b[base + 1] as i32);
-        sum1 += (a[base + 2] as i32) * (b[base + 2] as i32) + (a[base + 3] as i32) * (b[base + 3] as i32);
-        sum2 += (a[base + 4] as i32) * (b[base + 4] as i32) + (a[base + 5] as i32) * (b[base + 5] as i32);
-        sum3 += (a[base + 6] as i32) * (b[base + 6] as i32) + (a[base + 7] as i32) * (b[base + 7] as i32);
+        sum1 += (a[base + 2] as i32) * (b[base + 2] as i32)
+            + (a[base + 3] as i32) * (b[base + 3] as i32);
+        sum2 += (a[base + 4] as i32) * (b[base + 4] as i32)
+            + (a[base + 5] as i32) * (b[base + 5] as i32);
+        sum3 += (a[base + 6] as i32) * (b[base + 6] as i32)
+            + (a[base + 7] as i32) * (b[base + 7] as i32);
     }
 
     let mut total = (sum0 + sum1) + (sum2 + sum3);
@@ -965,7 +973,8 @@ impl HnswIndexSq8 {
         let mut entry_points = vec![curr];
 
         for level in (0..=top_connect_level).rev() {
-            let candidates = self.search_layer_sq8(&vector, &entry_points, self.ef_construction, level);
+            let candidates =
+                self.search_layer_sq8(&vector, &entry_points, self.ef_construction, level);
             let max_conn = if level == 0 { self.m0 } else { self.m };
             let neighbors = self.select_neighbors(&candidates, max_conn);
 
@@ -1035,7 +1044,12 @@ impl HnswIndexSq8 {
             }
         }
 
-        w.into_iter().map(|n| MaxSimNode { sim: n.sim, idx: n.idx }).collect()
+        w.into_iter()
+            .map(|n| MaxSimNode {
+                sim: n.sim,
+                idx: n.idx,
+            })
+            .collect()
     }
 
     fn select_neighbors(&self, candidates: &[MaxSimNode], max_conn: usize) -> Vec<usize> {
@@ -1354,7 +1368,12 @@ mod tests {
         let dim = 32;
         let embedder = HashingEmbedder::new("test/32", dim);
         let items: Vec<(usize, Arc<[f32]>)> = (0..120)
-            .map(|i| (i, embedder.embed(&format!("document item {i} with some words and features"))))
+            .map(|i| {
+                (
+                    i,
+                    embedder.embed(&format!("document item {i} with some words and features")),
+                )
+            })
             .collect();
 
         let index = HnswIndex::build(items.clone());
@@ -1386,7 +1405,10 @@ mod tests {
 
         let deq1 = dequantize_sq8(&q1);
         for (&orig, &deq) in v1.iter().zip(&deq1) {
-            assert!((orig - deq).abs() < 0.015, "Quantization error too large: {orig} vs {deq}");
+            assert!(
+                (orig - deq).abs() < 0.015,
+                "Quantization error too large: {orig} vs {deq}"
+            );
         }
 
         // Test dot product accuracy
@@ -1406,7 +1428,12 @@ mod tests {
         let dim = 32;
         let embedder = HashingEmbedder::new("test/32", dim);
         let items: Vec<(usize, Arc<[f32]>)> = (0..120)
-            .map(|i| (i, embedder.embed(&format!("document item {i} with some words and features"))))
+            .map(|i| {
+                (
+                    i,
+                    embedder.embed(&format!("document item {i} with some words and features")),
+                )
+            })
             .collect();
 
         // 1. Build HnswIndexSq8 directly
@@ -1470,7 +1497,10 @@ mod tests {
         let q_vec_49 = items[49].1.clone();
         let res_49 = index.search(&q_vec_49, 5, 32);
         assert!(!res_49.is_empty());
-        assert_eq!(res_49[0].1, 10, "moved node should be found under its new id");
+        assert_eq!(
+            res_49[0].1, 10,
+            "moved node should be found under its new id"
+        );
 
         // SQ8 index removal and move
         let mut sq8_index = HnswIndexSq8::build_f32(items.clone());

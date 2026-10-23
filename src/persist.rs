@@ -499,7 +499,9 @@ pub fn write_snapshot_ref_to_file(path: &Path, snap: &SnapshotRef<'_>) -> Result
         rmp_serde::encode::write_named(&mut writer, snap).map_err(io_err)?;
         writer.flush().map_err(io_err)?;
         let file = writer.into_inner().map_err(io_err)?;
-        durable_sync(&file).or_else(|_| file.sync_all()).map_err(io_err)?;
+        durable_sync(&file)
+            .or_else(|_| file.sync_all())
+            .map_err(io_err)?;
         drop(file);
         fs::rename(&tmp, path).map_err(io_err)?;
         if let Some(parent) = path.parent()
@@ -724,7 +726,9 @@ pub(crate) fn write_through_tmp(path: &Path, tmp: &Path, bytes: &[u8]) -> Result
             .open(tmp)
             .map_err(io_err)?;
         file.write_all(bytes).map_err(io_err)?;
-        durable_sync(&file).or_else(|_| file.sync_all()).map_err(io_err)?;
+        durable_sync(&file)
+            .or_else(|_| file.sync_all())
+            .map_err(io_err)?;
         drop(file);
         fs::rename(tmp, path).map_err(io_err)
     })();
@@ -1288,11 +1292,16 @@ fn append_insert_cols_v2(
     for col in cols {
         match col {
             ColData::Vec(v) => {
-                let dim = v.first().and_then(|opt| opt.as_ref()).map_or(0, |vec| vec.len());
+                let dim = v
+                    .first()
+                    .and_then(|opt| opt.as_ref())
+                    .map_or(0, |vec| vec.len());
                 est_per_row = est_per_row.saturating_add(8 + dim * 4);
             }
             ColData::Text(_) => est_per_row = est_per_row.saturating_add(16),
-            ColData::Int(_) | ColData::Float(_) | ColData::Time(_) => est_per_row = est_per_row.saturating_add(8),
+            ColData::Int(_) | ColData::Float(_) | ColData::Time(_) => {
+                est_per_row = est_per_row.saturating_add(8)
+            }
             ColData::Bool(_) => est_per_row = est_per_row.saturating_add(1),
             ColData::Null => {}
         }
@@ -1954,19 +1963,19 @@ pub fn check_content_exists(
 ) -> bool {
     let collection = store.collection(collection_name);
     let hash_field = "hash";
-    
+
     // Parallel search across collection rows
     #[cfg(feature = "parallel")]
     {
         use rayon::prelude::*;
-        
+
         collection.par_iter().any(|row| {
             row.get(hash_field)
                 .and_then(|cell| cell.text())
                 .is_some_and(|h| h == body_hash)
         })
     }
-    
+
     #[cfg(not(feature = "parallel"))]
     {
         collection.iter().any(|row| {
@@ -2729,10 +2738,7 @@ mod bench {
 
     #[test]
     fn bench_wal_batch_write() {
-        let path = std::env::temp_dir().join(format!(
-            "lin-bench-wal-batch-{}",
-            std::process::id()
-        ));
+        let path = std::env::temp_dir().join(format!("lin-bench-wal-batch-{}", std::process::id()));
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -2767,7 +2773,11 @@ mod bench {
         drop(file);
         let _ = fs::remove_file(path);
 
-        println!("BATCH WRITE: {}ms for {} records", elapsed.as_millis(), records.len());
+        println!(
+            "BATCH WRITE: {}ms for {} records",
+            elapsed.as_millis(),
+            records.len()
+        );
         assert!(elapsed.as_millis() < 2000, "Batch write too slow");
     }
 }

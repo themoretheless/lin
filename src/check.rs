@@ -482,7 +482,13 @@ fn check_query(q: &Query, cat: &Catalog, env: &Bindings) -> Result<Scope, Error>
                 scope = match by {
                     Some(by) => {
                         let by_ty = require_field(&scope, by)?;
-                        Scope::agg(&scope.primary, &by.as_str(), by_ty, Type::F64, &field.as_str())
+                        Scope::agg(
+                            &scope.primary,
+                            &by.as_str(),
+                            by_ty,
+                            Type::F64,
+                            &field.as_str(),
+                        )
                     }
                     None => Scope::agg_total(&scope.primary, Type::F64, &field.as_str()),
                 };
@@ -508,7 +514,13 @@ fn check_query(q: &Query, cat: &Catalog, env: &Bindings) -> Result<Scope, Error>
                 scope = match by {
                     Some(by) => {
                         let by_ty = require_field(&scope, by)?;
-                        Scope::agg(&scope.primary, &by.as_str(), by_ty, Type::F64, &field.as_str())
+                        Scope::agg(
+                            &scope.primary,
+                            &by.as_str(),
+                            by_ty,
+                            Type::F64,
+                            &field.as_str(),
+                        )
                     }
                     None => Scope::agg_total(&scope.primary, Type::F64, &field.as_str()),
                 };

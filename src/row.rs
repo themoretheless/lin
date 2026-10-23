@@ -91,7 +91,9 @@ impl FromCell for crate::store::InlineStr {
             Cell::Text(s) => crate::store::InlineStr::try_new(s.as_ref())
                 .ok_or_else(|| Error::runtime(format!("expected small text, got {s}"))),
             Cell::Null => Err(Error::runtime("expected small text, got null")),
-            other => Err(Error::runtime(format!("expected small text, got {other:?}"))),
+            other => Err(Error::runtime(format!(
+                "expected small text, got {other:?}"
+            ))),
         }
     }
 }

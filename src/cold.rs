@@ -67,7 +67,10 @@ pub fn calculate_entropy(data: &[u8]) -> f64 {
 }
 
 /// Choose optimal compression based on entropy analysis of already-encoded bytes.
-pub fn choose_codec_bytes(encoded: &[u8], strategy: CompressionStrategy) -> (bool, CompressionCodec) {
+pub fn choose_codec_bytes(
+    encoded: &[u8],
+    strategy: CompressionStrategy,
+) -> (bool, CompressionCodec) {
     if encoded.is_empty() {
         return (false, CompressionCodec::None);
     }
@@ -298,10 +301,10 @@ pub fn map_cold(data: &Path, name: &str) -> Result<ColdCol, Error> {
 
     #[cfg(unix)]
     let _ = mmap.advise(memmap2::Advice::Sequential);
-    
+
     // Check both compressed (magic at offset 1) and uncompressed (magic at offset 0)
-    let valid = mmap.len() >= 5 && mmap[1..5] == COLD_MAGIC || 
-                mmap.len() >= 4 && mmap[0..4] == COLD_MAGIC;
+    let valid =
+        mmap.len() >= 5 && mmap[1..5] == COLD_MAGIC || mmap.len() >= 4 && mmap[0..4] == COLD_MAGIC;
     if !valid {
         return Err(io_err(format!("bad cold file: {}", path.display())));
     }

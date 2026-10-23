@@ -367,7 +367,11 @@ fn next_lazy_projected(
     let fields = lazy.project.as_ref().expect("projected state checked");
     let mut cells = Vec::with_capacity(fields.len());
     for field in fields.iter() {
-        cells.push(row.get(field).map(Cell::clone_for_borrow).unwrap_or(Cell::Null));
+        cells.push(
+            row.get(field)
+                .map(Cell::clone_for_borrow)
+                .unwrap_or(Cell::Null),
+        );
     }
     Some(Ok(ProjectedRow {
         fields: Arc::clone(fields),

@@ -11,14 +11,14 @@ use std::hash::{Hash, Hasher};
 // Thread-local regex compilation cache: (pattern, flags) -> Regex
 // Reduces per-query regex compilation overhead dramatically
 thread_local! {
-    static REGEX_CACHE: Arc<Mutex<FxHashMap<(String, String), Arc<regex::Regex>>>> = 
+    static REGEX_CACHE: Arc<Mutex<FxHashMap<(String, String), Arc<regex::Regex>>>> =
         Arc::new(Mutex::new(FxHashMap::default()));
 }
 
 // Precomputed content hash cache: (body_str) -> precomputed_hash
 // Avoids repeated FNV-1a computations for identical body strings across inserts
 thread_local! {
-    static CONTENT_HASH_CACHE: Mutex<FxHashMap<String, Arc<str>>> = 
+    static CONTENT_HASH_CACHE: Mutex<FxHashMap<String, Arc<str>>> =
         Mutex::new(FxHashMap::default());
 }
 
@@ -56,7 +56,7 @@ pub struct Cache {
 #[allow(dead_code)]
 impl Cache {
     const DEFAULT_MAX_ENTRIES: usize = 256;
-    
+
     fn new() -> Self {
         Self {
             entries: FxHashMap::default(),
@@ -70,7 +70,7 @@ impl Cache {
     pub fn get(&mut self, key: &str) -> Option<&Vec<Row>> {
         // Extract key first to avoid double-mutable-borrow issues
         let key_string = key.to_string();
-        
+
         if let Some(entry) = self.entries.get_mut(&key_string) {
             // Update access time and move to front of LRU list
             entry.last_access = std::time::Instant::now();
@@ -83,7 +83,7 @@ impl Cache {
     /// Insert a new result into the cache
     pub fn insert(&mut self, key: String, rows: Vec<Row>) {
         let estimated_size = rows.len() * 1024; // Rough estimate: ~1KB per row
-        
+
         // Evict if at capacity
         while self.size_bytes + estimated_size > self.max_bytes() {
             self.evict_lru();
@@ -100,7 +100,7 @@ impl Cache {
             rows: rows.clone(),
             last_access: std::time::Instant::now(),
         };
-        
+
         self.entries.insert(key.clone(), entry);
         self.lru_order.push(key);
         self.size_bytes += estimated_size;
@@ -147,7 +147,9 @@ impl Cache {
 
     /// Find index of oldest entry in LRU list
     fn find_oldest_index(&self) -> usize {
-        self.lru_order.iter().enumerate()
+        self.lru_order
+            .iter()
+            .enumerate()
             .min_by_key(|(_, key)| {
                 if let Some(entry) = self.entries.get(*key) {
                     entry.last_access
@@ -171,11 +173,11 @@ impl Cache {
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
 pub enum AggregateType {
-    Count,      // COUNT(*) or COUNT(column)
-    Sum,        // SUM(column) - numeric only
-    Avg,        // AVG(column) - numeric only  
-    Min,        // MIN(column)
-    Max,        // MAX(column)
+    Count, // COUNT(*) or COUNT(column)
+    Sum,   // SUM(column) - numeric only
+    Avg,   // AVG(column) - numeric only
+    Min,   // MIN(column)
+    Max,   // MAX(column)
 }
 
 impl std::fmt::Display for AggregateType {
@@ -196,8 +198,8 @@ impl std::fmt::Display for AggregateType {
 pub struct AggregateValue {
     pub count: u64,
     pub sum: f64,
-    pub avg_sum: f64,     // Running sum for average calculation
-    pub avg_count: u64,   // Running count for average calculation
+    pub avg_sum: f64,   // Running sum for average calculation
+    pub avg_count: u64, // Running count for average calculation
     pub min: Option<f64>,
     pub max: Option<f64>,
 }
@@ -216,13 +218,13 @@ impl AggregateValue {
         self.sum += value;
         self.avg_sum += value;
         self.avg_count += 1;
-        
+
         if let Some(current_min) = self.min {
             self.min = Some(current_min.min(value));
         } else {
             self.min = Some(value);
         }
-        
+
         if let Some(current_max) = self.max {
             self.max = Some(current_max.max(value));
         } else {
@@ -247,7 +249,7 @@ impl AggregateValue {
         self.sum += other.sum;
         self.avg_sum += other.avg_sum;
         self.avg_count += other.avg_count;
-        
+
         if let Some(other_min) = other.min {
             if let Some(current_min) = self.min {
                 self.min = Some(current_min.min(other_min));
@@ -255,7 +257,7 @@ impl AggregateValue {
                 self.min = Some(other_min);
             }
         }
-        
+
         if let Some(other_max) = other.max {
             if let Some(current_max) = self.max {
                 self.max = Some(current_max.max(other_max));
@@ -729,7 +731,10 @@ impl<'a> Transaction<'a> {
                 } else if prep.stmts.iter().all(|s| {
                     matches!(
                         s,
-                        Stmt::Update { .. } | Stmt::Delete { .. } | Stmt::Query(_) | Stmt::Let { .. }
+                        Stmt::Update { .. }
+                            | Stmt::Delete { .. }
+                            | Stmt::Query(_)
+                            | Stmt::Let { .. }
                     )
                 }) {
                     self.undo = Undo::Rows(Vec::new());
@@ -742,7 +747,10 @@ impl<'a> Transaction<'a> {
                     if prep.stmts.iter().all(|s| {
                         matches!(
                             s,
-                            Stmt::Update { .. } | Stmt::Delete { .. } | Stmt::Query(_) | Stmt::Let { .. }
+                            Stmt::Update { .. }
+                                | Stmt::Delete { .. }
+                                | Stmt::Query(_)
+                                | Stmt::Let { .. }
                         )
                     }) {
                         let m = mark.clone();
@@ -1534,14 +1542,22 @@ impl Db {
                 self.store
                     .project_by_key(&pg.collection, &pg.field, &pg.key, pg.fields.as_deref())
             } else {
-                let full = self.store.project_by_key(&pg.collection, &pg.field, &pg.key, None);
+                let full = self
+                    .store
+                    .project_by_key(&pg.collection, &pg.field, &pg.key, None);
                 match full {
                     Some(full) => {
                         let now = now_ms();
-                        if let Some(pred) = &pg.pred && !eval_pred(pred, &full, now) {
+                        if let Some(pred) = &pg.pred
+                            && !eval_pred(pred, &full, now)
+                        {
                             None
                         } else if let Some(fs) = &pg.fields {
-                            Some(self.store.project_by_key(&pg.collection, &pg.field, &pg.key, Some(fs)).unwrap_or(full))
+                            Some(
+                                self.store
+                                    .project_by_key(&pg.collection, &pg.field, &pg.key, Some(fs))
+                                    .unwrap_or(full),
+                            )
                         } else {
                             Some(full)
                         }
@@ -1616,7 +1632,9 @@ impl Db {
             match prepared.stmts.last() {
                 Some(Stmt::Insert { records, .. }) => records.len(),
                 Some(Stmt::AppendFacts { records }) if pack.is_some() => {
-                    pack_affect_n(pack.as_ref()).filter(|&c| c > 0).unwrap_or(records.len())
+                    pack_affect_n(pack.as_ref())
+                        .filter(|&c| c > 0)
+                        .unwrap_or(records.len())
                 }
                 _ => pack_affect_n(pack.as_ref()).unwrap_or(0),
             }
@@ -1725,14 +1743,22 @@ impl Db {
                 self.store
                     .project_by_key(&pg.collection, &pg.field, &pg.key, pg.fields.as_deref())
             } else {
-                let full = self.store.project_by_key(&pg.collection, &pg.field, &pg.key, None);
+                let full = self
+                    .store
+                    .project_by_key(&pg.collection, &pg.field, &pg.key, None);
                 match full {
                     Some(full) => {
                         let now = now_ms();
-                        if let Some(pred) = &pg.pred && !eval_pred(pred, &full, now) {
+                        if let Some(pred) = &pg.pred
+                            && !eval_pred(pred, &full, now)
+                        {
                             None
                         } else if let Some(fs) = &pg.fields {
-                            Some(self.store.project_by_key(&pg.collection, &pg.field, &pg.key, Some(fs)).unwrap_or(full))
+                            Some(
+                                self.store
+                                    .project_by_key(&pg.collection, &pg.field, &pg.key, Some(fs))
+                                    .unwrap_or(full),
+                            )
                         } else {
                             Some(full)
                         }
@@ -1921,7 +1947,9 @@ impl Db {
             match prepared.stmts.last() {
                 Some(Stmt::Insert { records, .. }) => records.len(),
                 Some(Stmt::AppendFacts { records }) if pack.is_some() => {
-                    pack_affect_n(pack.as_ref()).filter(|&c| c > 0).unwrap_or(records.len())
+                    pack_affect_n(pack.as_ref())
+                        .filter(|&c| c > 0)
+                        .unwrap_or(records.len())
                 }
                 _ => pack_affect_n(pack.as_ref()).unwrap_or(0),
             }
@@ -2827,7 +2855,10 @@ impl Db {
         Ok(rows)
     }
 
-    pub(crate) fn try_extract_point_get(q: &Query, cat: &crate::catalog::Catalog) -> Option<PointGetPlan> {
+    pub(crate) fn try_extract_point_get(
+        q: &Query,
+        cat: &crate::catalog::Catalog,
+    ) -> Option<PointGetPlan> {
         let mut q = crate::catalog::with_catalog_filter(q, cat);
         q.to_mut().simplify_predicates();
         let q = &*q;
@@ -2982,7 +3013,10 @@ impl Db {
         ])
     }
 
-    pub(crate) fn try_extract_agg_plan(q: &Query, cat: &crate::catalog::Catalog) -> Option<AggPlan> {
+    pub(crate) fn try_extract_agg_plan(
+        q: &Query,
+        cat: &crate::catalog::Catalog,
+    ) -> Option<AggPlan> {
         let mut q = crate::catalog::with_catalog_filter(q, cat);
         q.to_mut().simplify_predicates();
         let q = &*q;
@@ -3064,7 +3098,9 @@ impl Db {
                         row.insert("total".into(), Cell::Float(total));
                         return vec![row];
                     }
-                    if let Some(by_field) = by && by_field.leaf() == Some("user_id") {
+                    if let Some(by_field) = by
+                        && by_field.leaf() == Some("user_id")
+                    {
                         if plan.filter.is_none() {
                             let uids = self.store.orders_user_id();
                             let totals = self.store.orders_total();
@@ -3083,7 +3119,11 @@ impl Db {
                                     row
                                 })
                                 .collect();
-                        } else if let Some(Pred::Cmp { field: filt_field, op: CmpOp::Gt, value }) = &plan.filter
+                        } else if let Some(Pred::Cmp {
+                            field: filt_field,
+                            op: CmpOp::Gt,
+                            value,
+                        }) = &plan.filter
                             && filt_field.leaf() == Some("total")
                         {
                             let thresh = match value {
@@ -3115,9 +3155,15 @@ impl Db {
                         }
                     }
                 }
-                AggKind::Avg { field, by } if field.leaf() == Some("total") && by.is_none() && plan.filter.is_none() => {
+                AggKind::Avg { field, by }
+                    if field.leaf() == Some("total") && by.is_none() && plan.filter.is_none() =>
+                {
                     let totals = self.store.orders_total();
-                    let avg = if totals.is_empty() { 0.0 } else { totals.iter().sum::<f64>() / totals.len() as f64 };
+                    let avg = if totals.is_empty() {
+                        0.0
+                    } else {
+                        totals.iter().sum::<f64>() / totals.len() as f64
+                    };
                     let mut row = crate::store::acquire_row();
                     row.insert("total".into(), Cell::Float(avg));
                     return vec![row];
@@ -3127,7 +3173,9 @@ impl Db {
         }
 
         // 2. SoA paths for docs
-        if plan.collection == "docs" && self.store.docs_wing().len() == self.store.collection("docs").len() {
+        if plan.collection == "docs"
+            && self.store.docs_wing().len() == self.store.collection("docs").len()
+        {
             if let AggKind::Count { by: Some(by_field) } = &plan.kind
                 && by_field.leaf() == Some("wing")
                 && plan.filter.is_none()
@@ -3221,7 +3269,11 @@ impl Db {
                             }
                         }
                     }
-                    let avg = if count == 0 { 0.0 } else { sum / (count as f64) };
+                    let avg = if count == 0 {
+                        0.0
+                    } else {
+                        sum / (count as f64)
+                    };
                     let mut row = crate::store::acquire_row();
                     row.insert(fk, Cell::Float(avg));
                     return vec![row];
@@ -3243,7 +3295,11 @@ impl Db {
                 entries
                     .into_iter()
                     .map(|(gcell, (sum, count))| {
-                        let avg = if count == 0 { 0.0 } else { sum / (count as f64) };
+                        let avg = if count == 0 {
+                            0.0
+                        } else {
+                            sum / (count as f64)
+                        };
                         let mut row = crate::store::acquire_row();
                         row.insert(bk.clone(), gcell);
                         row.insert(fk.clone(), Cell::Float(avg));
@@ -3260,7 +3316,13 @@ impl Db {
                             if let Some(c) = r.get(&fk).filter(|c| !matches!(c, Cell::Null)) {
                                 best = Some(match best {
                                     None => c.clone_for_borrow(),
-                                    Some(prev) => if cmp_sort(c, &prev).is_lt() { c.clone_for_borrow() } else { prev },
+                                    Some(prev) => {
+                                        if cmp_sort(c, &prev).is_lt() {
+                                            c.clone_for_borrow()
+                                        } else {
+                                            prev
+                                        }
+                                    }
                                 });
                             }
                         }
@@ -3279,7 +3341,13 @@ impl Db {
                         if let Some(c) = f_val {
                             *entry = Some(match entry.take() {
                                 None => c.clone_for_borrow(),
-                                Some(prev) => if cmp_sort(c, &prev).is_lt() { c.clone_for_borrow() } else { prev },
+                                Some(prev) => {
+                                    if cmp_sort(c, &prev).is_lt() {
+                                        c.clone_for_borrow()
+                                    } else {
+                                        prev
+                                    }
+                                }
                             });
                         }
                     }
@@ -3305,7 +3373,13 @@ impl Db {
                             if let Some(c) = r.get(&fk).filter(|c| !matches!(c, Cell::Null)) {
                                 best = Some(match best {
                                     None => c.clone_for_borrow(),
-                                    Some(prev) => if cmp_sort(c, &prev).is_gt() { c.clone_for_borrow() } else { prev },
+                                    Some(prev) => {
+                                        if cmp_sort(c, &prev).is_gt() {
+                                            c.clone_for_borrow()
+                                        } else {
+                                            prev
+                                        }
+                                    }
                                 });
                             }
                         }
@@ -3324,7 +3398,13 @@ impl Db {
                         if let Some(c) = f_val {
                             *entry = Some(match entry.take() {
                                 None => c.clone_for_borrow(),
-                                Some(prev) => if cmp_sort(c, &prev).is_gt() { c.clone_for_borrow() } else { prev },
+                                Some(prev) => {
+                                    if cmp_sort(c, &prev).is_gt() {
+                                        c.clone_for_borrow()
+                                    } else {
+                                        prev
+                                    }
+                                }
                             });
                         }
                     }
@@ -3613,7 +3693,9 @@ impl Db {
         for (col, hnsw) in &self.store.hnsw {
             if !hnsw.is_empty() {
                 let col_rows = self.store.collection(col);
-                if std::ptr::eq(rows, col_rows) || (rows.len() == col_rows.len() && !rows.is_empty()) {
+                if std::ptr::eq(rows, col_rows)
+                    || (rows.len() == col_rows.len() && !rows.is_empty())
+                {
                     let k = rank_limit.unwrap_or(20).max(1);
                     let ef = (k * 2).max(64);
                     let mut results = hnsw.search(&qv, k, ef);
@@ -3793,7 +3875,10 @@ impl Db {
                 let Some(row) = self.store.get_by_idx(name, i) else {
                     continue;
                 };
-                let cell = row.get(&by_key).map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
+                let cell = row
+                    .get(&by_key)
+                    .map(Cell::clone_for_borrow)
+                    .unwrap_or(Cell::Null);
                 *map.entry(cell).or_insert(0) += 1;
             }
             return Some(count_cell_map_to_rows(&by_key, map));
@@ -3804,7 +3889,10 @@ impl Db {
         let mut map: FxHashMap<Cell, i64> = FxHashMap::default();
         for r in col {
             if eval_pred(pred, r, now) {
-                let cell = r.get(&by_key).map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
+                let cell = r
+                    .get(&by_key)
+                    .map(Cell::clone_for_borrow)
+                    .unwrap_or(Cell::Null);
                 *map.entry(cell).or_insert(0) += 1;
             }
         }
@@ -4478,7 +4566,12 @@ impl Db {
             }
             if id_only {
                 let mut r = crate::store::acquire_row();
-                r.insert("id".into(), row.get("id").map(Cell::clone_for_borrow).unwrap_or(Cell::Null));
+                r.insert(
+                    "id".into(),
+                    row.get("id")
+                        .map(Cell::clone_for_borrow)
+                        .unwrap_or(Cell::Null),
+                );
                 out.push(r);
             } else {
                 out.push(match names.as_deref() {
@@ -4588,7 +4681,11 @@ impl Db {
 
             // Asymmetric hash join: if left is smaller, only index keys needed by left
             let needed: Option<FxHashSet<&str>> = if left.len() * 4 < right.len() {
-                Some(left.iter().filter_map(|l| l.get(on).and_then(Cell::text)).collect())
+                Some(
+                    left.iter()
+                        .filter_map(|l| l.get(on).and_then(Cell::text))
+                        .collect(),
+                )
             } else {
                 None
             };
@@ -5173,7 +5270,7 @@ impl Db {
     ) -> Result<Vec<(Row, bool)>, Error> {
         let now = now_ms();
         let mut results = Vec::with_capacity(edges.len());
-        
+
         for (rel, from, to) in edges {
             let from_id = value_text(from, now);
             let to_id = value_text(to, now);
@@ -5182,7 +5279,7 @@ impl Db {
             let row = edge_row(rel, &from_id, &to_id);
             results.push((row, changed));
         }
-        
+
         Ok(results)
     }
 
@@ -5261,11 +5358,9 @@ impl Db {
             rows.extend(records.iter().map(|record| record_row(record, now)));
             rows
         };
-        let mut batch_ids: rustc_hash::FxHashSet<&str> =
-            rustc_hash::FxHashSet::default();
+        let mut batch_ids: rustc_hash::FxHashSet<&str> = rustc_hash::FxHashSet::default();
         batch_ids.reserve(n);
-        let mut batch_uris: rustc_hash::FxHashSet<&str> =
-            rustc_hash::FxHashSet::default();
+        let mut batch_uris: rustc_hash::FxHashSet<&str> = rustc_hash::FxHashSet::default();
         if collection == "docs" {
             batch_uris.reserve(n);
         }
@@ -5281,7 +5376,10 @@ impl Db {
                 && let Some(body) = row.get("body").and_then(Cell::text_shared)
             {
                 // Use precomputed hash from cache to avoid repeated FNV-1a computations
-                row.insert("hash".into(), Cell::Text(cached_content_hash(body.as_ref())));
+                row.insert(
+                    "hash".into(),
+                    Cell::Text(cached_content_hash(body.as_ref())),
+                );
             }
             if let Some(id) = row.get("id").and_then(Cell::text)
                 && (!batch_ids.insert(id)
@@ -5414,9 +5512,7 @@ impl Db {
                         && &g.field == k
                         && eval_pred(&g.pred, &before, now)
                     {
-                        return Err(Error::runtime(format!(
-                            "immutable field: {collection}.{k}"
-                        )));
+                        return Err(Error::runtime(format!("immutable field: {collection}.{k}")));
                     }
                 }
             }
@@ -5492,7 +5588,7 @@ impl Db {
         }
         idxs.sort_unstable();
         let out: Vec<Row> = idxs.iter().map(|&i| rows[i].clone()).collect();
-        
+
         if let Undo::Rows(events) | Undo::Mixed { events, .. } = ctx.undo {
             events.push(RowUndo::Delete(
                 collection.to_string(),
@@ -5718,7 +5814,11 @@ fn merge_join_row(mut left: Row, right: &Row, right_col: &str) -> Row {
 
 fn push_project_batch_row(batch: &mut RecordBatch, row: &Row, names: &[String]) {
     for (col_i, name) in names.iter().enumerate() {
-        batch.cols[col_i].push(row.get(name).map(Cell::clone_for_borrow).unwrap_or(Cell::Null));
+        batch.cols[col_i].push(
+            row.get(name)
+                .map(Cell::clone_for_borrow)
+                .unwrap_or(Cell::Null),
+        );
     }
 }
 
@@ -5730,7 +5830,10 @@ fn push_join_batch_row(
 ) {
     for (col_i, p) in plan.iter().enumerate() {
         let cell = match p {
-            JoinFieldPlan::Left(k) => left.get(k).map(Cell::clone_for_borrow).unwrap_or(Cell::Null),
+            JoinFieldPlan::Left(k) => left
+                .get(k)
+                .map(Cell::clone_for_borrow)
+                .unwrap_or(Cell::Null),
             JoinFieldPlan::Right { out: _, idx } => right
                 .and_then(|r| r.get(*idx).map(Cell::clone_for_borrow))
                 .unwrap_or(Cell::Null),
@@ -5867,7 +5970,10 @@ pub(crate) fn emit_join_row(left: &Row, right: Option<&[Cell]>, plan: &[JoinFiel
         match p {
             JoinFieldPlan::Left(k) => {
                 // Zero-copy: use clone_for_borrow instead of full Row.clone()
-                let cell = left.get(k).map(|c| c.clone_for_borrow()).unwrap_or(Cell::Null);
+                let cell = left
+                    .get(k)
+                    .map(|c| c.clone_for_borrow())
+                    .unwrap_or(Cell::Null);
                 out.insert(k.clone(), cell);
             }
             JoinFieldPlan::Right { out: k, idx } => {
@@ -6255,9 +6361,7 @@ pub(crate) fn eval_pred(pred: &Pred, row: &Row, now: i64) -> bool {
         }
         Pred::In { field, values } => {
             let left = field_cell(row, field);
-            values
-                .iter()
-                .any(|v| cell_eq_val(left, v, now))
+            values.iter().any(|v| cell_eq_val(left, v, now))
         }
         Pred::Cmp { field, op, value } => cmp_cell(field_cell(row, field), value, *op, now),
         Pred::Has { field, ci, needle } => field_cell(row, field)
@@ -6274,7 +6378,7 @@ pub(crate) fn eval_pred(pred: &Pred, row: &Row, now: i64) -> bool {
             let Some(text) = field_cell(row, field).text() else {
                 return false;
             };
-            
+
             // Cache compiled regex instances per (pattern, flags) combo
             // First query compiles, subsequent queries reuse cached Regex
             let key = (pattern.clone(), flags.chars().collect::<String>());
@@ -6506,7 +6610,12 @@ fn sort_rows_top_k(rows: &mut Vec<Row>, field: &Field, desc: bool, top_k: Option
     let mut keys: Vec<(Cell, usize)> = rows
         .iter()
         .enumerate()
-        .map(|(i, r)| (r.get(&k).map(Cell::clone_for_borrow).unwrap_or(Cell::Null), i))
+        .map(|(i, r)| {
+            (
+                r.get(&k).map(Cell::clone_for_borrow).unwrap_or(Cell::Null),
+                i,
+            )
+        })
         .collect();
 
     let cmp_keys = |a: &(Cell, usize), b: &(Cell, usize)| {
@@ -6607,7 +6716,8 @@ pub(crate) fn eval_window(
     }
 
     let by_keys: Vec<String> = by.iter().map(|b| b.as_str()).collect();
-    let order_keys: Vec<(String, bool)> = order.iter().map(|s| (s.field.as_str(), s.desc)).collect();
+    let order_keys: Vec<(String, bool)> =
+        order.iter().map(|s| (s.field.as_str(), s.desc)).collect();
     let target_field: Option<String> = field.map(|f| f.as_str());
     let tf: &str = target_field.as_deref().unwrap_or_default();
 
@@ -6731,7 +6841,11 @@ pub(crate) fn eval_window(
                         })
                         .collect()
                 } else {
-                    let first_val = part.first().and_then(|r| r.get(tf)).cloned().unwrap_or(Cell::Null);
+                    let first_val = part
+                        .first()
+                        .and_then(|r| r.get(tf))
+                        .cloned()
+                        .unwrap_or(Cell::Null);
                     vec![first_val; n]
                 }
             }
@@ -6749,7 +6863,11 @@ pub(crate) fn eval_window(
                         })
                         .collect()
                 } else {
-                    let last_val = part.last().and_then(|r| r.get(tf)).cloned().unwrap_or(Cell::Null);
+                    let last_val = part
+                        .last()
+                        .and_then(|r| r.get(tf))
+                        .cloned()
+                        .unwrap_or(Cell::Null);
                     vec![last_val; n]
                 }
             }
@@ -6768,7 +6886,9 @@ pub(crate) fn eval_window(
                     prefix.push(0.0f64);
                     let mut acc = 0.0f64;
                     for r in &part {
-                        if let Some(c) = r.get(tf) && let Some(v) = c.as_f64() {
+                        if let Some(c) = r.get(tf)
+                            && let Some(v) = c.as_f64()
+                        {
                             acc += v;
                         }
                         prefix.push(acc);
@@ -6790,7 +6910,9 @@ pub(crate) fn eval_window(
                     prefix.push(0i64);
                     let mut acc = 0i64;
                     for r in &part {
-                        if let Some(c) = r.get(tf) && let Some(v) = c.as_int() {
+                        if let Some(c) = r.get(tf)
+                            && let Some(v) = c.as_int()
+                        {
                             acc += v;
                         }
                         prefix.push(acc);
@@ -6817,7 +6939,9 @@ pub(crate) fn eval_window(
                 let mut sum_acc = 0.0f64;
                 let mut cnt_acc = 0usize;
                 for r in &part {
-                    if let Some(c) = r.get(tf) && let Some(v) = c.as_f64() {
+                    if let Some(c) = r.get(tf)
+                        && let Some(v) = c.as_f64()
+                    {
                         sum_acc += v;
                         cnt_acc += 1;
                     }
@@ -6848,7 +6972,13 @@ pub(crate) fn eval_window(
                         if let Some(c) = r.get(tf).filter(|c| !matches!(c, Cell::Null)) {
                             min_cell = Some(match min_cell {
                                 None => c.clone_for_borrow(),
-                                Some(prev) => if cmp_sort(c, &prev).is_lt() { c.clone_for_borrow() } else { prev },
+                                Some(prev) => {
+                                    if cmp_sort(c, &prev).is_lt() {
+                                        c.clone_for_borrow()
+                                    } else {
+                                        prev
+                                    }
+                                }
                             });
                         }
                     }
@@ -6861,7 +6991,13 @@ pub(crate) fn eval_window(
                         if let Some(c) = r.get(tf).filter(|c| !matches!(c, Cell::Null)) {
                             min_cell = Some(match min_cell {
                                 None => c.clone_for_borrow(),
-                                Some(prev) => if cmp_sort(c, &prev).is_lt() { c.clone_for_borrow() } else { prev },
+                                Some(prev) => {
+                                    if cmp_sort(c, &prev).is_lt() {
+                                        c.clone_for_borrow()
+                                    } else {
+                                        prev
+                                    }
+                                }
                             });
                         }
                         mins.push(min_cell.clone().unwrap_or(Cell::Null));
@@ -6878,7 +7014,13 @@ pub(crate) fn eval_window(
                                 if let Some(c) = r.get(tf).filter(|c| !matches!(c, Cell::Null)) {
                                     min_cell = Some(match min_cell {
                                         None => c.clone_for_borrow(),
-                                        Some(prev) => if cmp_sort(c, &prev).is_lt() { c.clone_for_borrow() } else { prev },
+                                        Some(prev) => {
+                                            if cmp_sort(c, &prev).is_lt() {
+                                                c.clone_for_borrow()
+                                            } else {
+                                                prev
+                                            }
+                                        }
                                     });
                                 }
                             }
@@ -6899,7 +7041,13 @@ pub(crate) fn eval_window(
                         if let Some(c) = r.get(tf).filter(|c| !matches!(c, Cell::Null)) {
                             max_cell = Some(match max_cell {
                                 None => c.clone_for_borrow(),
-                                Some(prev) => if cmp_sort(c, &prev).is_gt() { c.clone_for_borrow() } else { prev },
+                                Some(prev) => {
+                                    if cmp_sort(c, &prev).is_gt() {
+                                        c.clone_for_borrow()
+                                    } else {
+                                        prev
+                                    }
+                                }
                             });
                         }
                     }
@@ -6912,7 +7060,13 @@ pub(crate) fn eval_window(
                         if let Some(c) = r.get(tf).filter(|c| !matches!(c, Cell::Null)) {
                             max_cell = Some(match max_cell {
                                 None => c.clone_for_borrow(),
-                                Some(prev) => if cmp_sort(c, &prev).is_gt() { c.clone_for_borrow() } else { prev },
+                                Some(prev) => {
+                                    if cmp_sort(c, &prev).is_gt() {
+                                        c.clone_for_borrow()
+                                    } else {
+                                        prev
+                                    }
+                                }
                             });
                         }
                         maxs.push(max_cell.clone().unwrap_or(Cell::Null));
@@ -6929,7 +7083,13 @@ pub(crate) fn eval_window(
                                 if let Some(c) = r.get(tf).filter(|c| !matches!(c, Cell::Null)) {
                                     max_cell = Some(match max_cell {
                                         None => c.clone_for_borrow(),
-                                        Some(prev) => if cmp_sort(c, &prev).is_gt() { c.clone_for_borrow() } else { prev },
+                                        Some(prev) => {
+                                            if cmp_sort(c, &prev).is_gt() {
+                                                c.clone_for_borrow()
+                                            } else {
+                                                prev
+                                            }
+                                        }
                                     });
                                 }
                             }
@@ -6968,7 +7128,11 @@ pub(crate) fn eval_window(
                     let mut counts = Vec::with_capacity(n);
                     for i in 0..n {
                         let (s, e) = get_frame_bounds(i, n, frame, !order_keys.is_empty());
-                        let count = if s <= e && s < n { e.min(n - 1) - s + 1 } else { 0 };
+                        let count = if s <= e && s < n {
+                            e.min(n - 1) - s + 1
+                        } else {
+                            0
+                        };
                         counts.push(Cell::Int(count as i64));
                     }
                     counts
@@ -7210,7 +7374,11 @@ fn agg_avg(rows: &[Row], field: &Field, by: Option<&Field>) -> Vec<Row> {
                 count += 1;
             }
         }
-        let avg = if count == 0 { 0.0 } else { sum / (count as f64) };
+        let avg = if count == 0 {
+            0.0
+        } else {
+            sum / (count as f64)
+        };
         let mut row = crate::store::acquire_row();
         row.insert(fk, Cell::Float(avg));
         return vec![row];
@@ -7231,7 +7399,11 @@ fn agg_avg(rows: &[Row], field: &Field, by: Option<&Field>) -> Vec<Row> {
     entries
         .into_iter()
         .map(|(gcell, (sum, count))| {
-            let avg = if count == 0 { 0.0 } else { sum / (count as f64) };
+            let avg = if count == 0 {
+                0.0
+            } else {
+                sum / (count as f64)
+            };
             let mut row = crate::store::acquire_row();
             row.insert(bk.clone(), gcell);
             row.insert(fk.clone(), Cell::Float(avg));
@@ -7412,7 +7584,10 @@ impl Db {
         let mut group_cells: Vec<Cell> = Vec::new();
         let mut ids: Vec<u32> = Vec::with_capacity(rows.len());
         for row in rows {
-            let cell = row.get(&field).map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
+            let cell = row
+                .get(&field)
+                .map(Cell::clone_for_borrow)
+                .unwrap_or(Cell::Null);
             let id = if let Some(&id) = group_ids.get(&cell) {
                 id
             } else {
@@ -7603,7 +7778,10 @@ impl Db {
         let mut group_cells: Vec<Cell> = Vec::new();
         let mut ids: Vec<u32> = Vec::with_capacity(rows.len());
         for row in rows {
-            let cell = row.get(&bk).map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
+            let cell = row
+                .get(&bk)
+                .map(Cell::clone_for_borrow)
+                .unwrap_or(Cell::Null);
             let id = if let Some(&id) = group_ids.get(&cell) {
                 id
             } else {
@@ -7978,8 +8156,8 @@ impl Db {
 
 #[cfg(test)]
 mod grouping_tests {
-    use crate::store::Cell;
     use crate::Db;
+    use crate::store::Cell;
 
     #[test]
     fn mixed_numeric_and_text_grouping_preserves_cell_identity_across_operators() {
@@ -7998,7 +8176,10 @@ mod grouping_tests {
 
         // Unfiltered count by k (agg_count) and filtered count by k (try_filter_count) must agree
         let unfiltered = db.run("items | count by k").unwrap().rows;
-        let filtered = db.run(r#"items | tag == "active" | count by k"#).unwrap().rows;
+        let filtered = db
+            .run(r#"items | tag == "active" | count by k"#)
+            .unwrap()
+            .rows;
         assert_eq!(unfiltered, filtered);
         assert_eq!(unfiltered.len(), 5);
         assert_eq!(unfiltered[0]["k"], Cell::Null);
@@ -8008,14 +8189,10 @@ mod grouping_tests {
         assert_eq!(sums.len(), 5);
 
         // Window PARTITION BY must also use Cell identity without string-formatting collisions
-        let win = db
-            .run("items | window row_number by k as rn")
-            .unwrap()
-            .rows;
+        let win = db.run("items | window row_number by k as rn").unwrap().rows;
         assert_eq!(win.len(), 5);
         for row in &win {
             assert_eq!(row["rn"], Cell::Int(1));
         }
     }
 }
-

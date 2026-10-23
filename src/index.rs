@@ -152,9 +152,7 @@ impl Ord for IndexPart {
             (IndexPart::Null, IndexPart::Null) => std::cmp::Ordering::Equal,
             (IndexPart::Bool(a), IndexPart::Bool(b)) => a.cmp(b),
             (IndexPart::Int(a), IndexPart::Int(b)) => a.cmp(b),
-            (IndexPart::Num(b1, t1), IndexPart::Num(b2, t2)) => {
-                b1.cmp(b2).then_with(|| t1.cmp(t2))
-            }
+            (IndexPart::Num(b1, t1), IndexPart::Num(b2, t2)) => b1.cmp(b2).then_with(|| t1.cmp(t2)),
             (IndexPart::Time(a), IndexPart::Time(b)) => a.cmp(b),
             (IndexPart::Text(a), IndexPart::Text(b)) => a.cmp(b),
             (IndexPart::SmallText(a), IndexPart::SmallText(b)) => a.cmp(b),
@@ -210,7 +208,7 @@ pub struct LiveIndex {
     /// Either Vec<usize> (standard) or BitSet (for low-cardinality columns)
     pub forward: BTreeMap<IndexKey, PostingList>,
     pub reverse: FxHashMap<usize, IndexKey>,
-    
+
     /// Bloom filter for fast negative lookups during seek operations
     #[cfg(feature = "parallel")]
     bloom_filter: Option<BloomFilter>,
@@ -515,11 +513,11 @@ impl LiveIndex {
             if matches!(row.get(field_name), Some(Cell::Bool(_))) {
                 return true;
             }
-            
+
             // Sample up to 100 rows to estimate cardinality
             let sample_size = std::cmp::min(100, rows.len());
             let mut distinct_values = rustc_hash::FxHashSet::default();
-            
+
             for row in rows.iter().take(sample_size) {
                 if let Some(cell) = row.get(field_name) {
                     if matches!(cell, Cell::Bool(_)) {
@@ -528,7 +526,7 @@ impl LiveIndex {
                     distinct_values.insert(cell);
                 }
             }
-            
+
             // Use bitmap if cardinality <= 16 (or <= 32 for larger indexes)
             let threshold = if self.forward.len() > 10_000 { 32 } else { 16 };
             !distinct_values.is_empty() && distinct_values.len() <= threshold
@@ -601,7 +599,9 @@ impl LiveIndex {
 
         // Check if this is a bitmap index (low cardinality column)
         let is_bitmap = self.def.bitmap_card_field.as_ref().is_some_and(|_field| {
-            key.0.first().is_some_and(|cell| matches!(cell, IndexPart::Bool(_)))
+            key.0
+                .first()
+                .is_some_and(|cell| matches!(cell, IndexPart::Bool(_)))
         });
 
         if let Some(old) = self.reverse.insert(idx, key.clone())
@@ -1086,12 +1086,7 @@ pub fn index_covers_pred(pred: &Pred, uses: &[IndexUse]) -> bool {
 }
 
 fn index_covers_conjunct(pred: &Pred, use_: &IndexUse) -> bool {
-    let pred_atoms = use_
-        .def
-        .pred
-        .as_ref()
-        .map(flatten_and)
-        .unwrap_or_default();
+    let pred_atoms = use_.def.pred.as_ref().map(flatten_and).unwrap_or_default();
     for atom in flatten_and(pred) {
         if pred_atoms.contains(&atom) {
             continue;
@@ -1318,7 +1313,7 @@ mod storage_tests {
         let row_pending = Row::from([("status".into(), Cell::Bool(false))]);
         let row_active = Row::from([("status".into(), Cell::Bool(true))]);
         let sample = [row_pending.clone(), row_active.clone()];
-        
+
         assert!(index.should_use_bitmap(0, &row_pending, &sample));
         assert!(index.should_use_bitmap(1, &row_active, &sample));
     }
@@ -1342,9 +1337,9 @@ mod storage_tests {
         };
 
         // Create sample data with low cardinality (only 3 distinct values)
-        let rows: Vec<Row> = (0..100).map(|i| {
-            Row::from([("priority".into(), Cell::Int((i % 3) as i64))])
-        }).collect();
+        let rows: Vec<Row> = (0..100)
+            .map(|i| Row::from([("priority".into(), Cell::Int((i % 3) as i64))]))
+            .collect();
 
         // With only 3 distinct values out of 100, should use bitmap
         let row = &rows[0];
@@ -1370,9 +1365,9 @@ mod storage_tests {
         };
 
         // Create sample data with high cardinality (100 distinct values in sample)
-        let rows: Vec<Row> = (0..100).map(|i| {
-            Row::from([("id".into(), Cell::Int(i as i64))])
-        }).collect();
+        let rows: Vec<Row> = (0..100)
+            .map(|i| Row::from([("id".into(), Cell::Int(i as i64))]))
+            .collect();
 
         // With 100 distinct values, should NOT use bitmap (> 16 threshold)
         let row = &rows[0];
@@ -1400,7 +1395,10 @@ mod storage_tests {
             }
             let mut actual = index.forward[&index.key_of(&a)].clone();
             actual.sort_unstable();
-            assert_eq!(actual.to_indices(), if unique { vec![0] } else { vec![0, 1] });
+            assert_eq!(
+                actual.to_indices(),
+                if unique { vec![0] } else { vec![0, 1] }
+            );
             if unique {
                 let forward = index.forward.clone();
                 let reverse = index.reverse.clone();
@@ -1412,7 +1410,10 @@ mod storage_tests {
             index
                 .insert_at(0, &Row::from([("key".into(), Cell::Int(3))]))
                 .unwrap();
-            assert_eq!(index.forward[&index.reverse[&0]], PostingList::Standard(vec![0]));
+            assert_eq!(
+                index.forward[&index.reverse[&0]],
+                PostingList::Standard(vec![0])
+            );
             index.remove_at(0);
             assert!(!index.reverse.contains_key(&0));
         }
@@ -1508,7 +1509,10 @@ mod storage_tests {
             index.remove_at(7);
             assert_eq!(index.forward.len(), 1);
             assert_eq!(index.reverse.len(), 1);
-            assert_eq!(index.forward.get(&index.key_of(&row)), Some(&PostingList::Standard(vec![8])));
+            assert_eq!(
+                index.forward.get(&index.key_of(&row)),
+                Some(&PostingList::Standard(vec![8]))
+            );
         }
     }
 }

@@ -710,7 +710,9 @@ impl<'a> Parser<'a> {
                     self.expect_char(')')?;
                     inner
                 } else if let Some(ident) = self.peek_ident() {
-                    if ["by", "partition", "sort", "order", "rows", "as"].contains(&ident.to_lowercase().as_str()) {
+                    if ["by", "partition", "sort", "order", "rows", "as"]
+                        .contains(&ident.to_lowercase().as_str())
+                    {
                         None
                     } else {
                         Some(self.parse_field()?)
@@ -1495,14 +1497,14 @@ impl<'a> Parser<'a> {
         if fields.is_empty() {
             return Err(self.err("empty index"));
         }
-        
+
         // Check for optional WHERE clause (partial index)
         let pred = if self.eat_kw("where") {
             Some(self.parse_pred()?)
         } else {
             None
         };
-        
+
         Ok(Decl::Index {
             collection,
             unique,

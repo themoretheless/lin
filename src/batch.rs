@@ -62,10 +62,10 @@ impl RecordBatch {
         }
         let end = end.min(self.n());
         let n = end - start;
-        
+
         // Pre-allocate based on expected size
         let mut out = Vec::with_capacity(n);
-        
+
         for i in start..end {
             let mut row = crate::store::acquire_row();
             // Use clone_for_borrow() to preserve Arc references instead of full clone
@@ -122,7 +122,10 @@ impl RecordBatch {
 
     /// Create a batch from columnar data with pre-allocated capacity
     pub fn from_columns(names: impl Into<Arc<[String]>>, cols: Vec<Vec<Cell>>) -> Self {
-        debug_assert!(cols.iter().all(|c| c.len() == cols.first().map(|f| f.len()).unwrap_or(0)));
+        debug_assert!(
+            cols.iter()
+                .all(|c| c.len() == cols.first().map(|f| f.len()).unwrap_or(0))
+        );
         Self {
             names: names.into(),
             cols,
