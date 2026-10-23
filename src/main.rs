@@ -17,6 +17,7 @@ fn main() -> ExitCode {
         Some("apply-wal") => cmd_apply_wal(&rest[1..], data, follower),
         Some("wal-serve") => cmd_wal_serve(&rest[1..], data),
         Some("follower") => cmd_follower(&rest[1..], data),
+        Some("cache") | Some("cacha") => cmd_cache(&rest[1..], data),
         Some("stats") => cmd_stats(data, follower),
         Some("version") | Some("--version") => {
             println!("lin {}", lin::VERSION);
@@ -284,6 +285,8 @@ fn usage(code: u8) -> ExitCode {
          lin --data <dir> --follower apply-wal <frames.bin | ->\n  \
          lin [--data <dir>] backup export <file.json>\n  \
          lin backup import <file.json> [--data <dir>]\n  \
+         lin [--data <dir>] cache serve [--node-id ID] [--listen HOST:PORT] [--peer ID=HOST:PORT] [--max-entries N]\n  \
+         lin cache cli [--connect HOST:PORT] [COMMAND...]\n  \
          lin [--data <dir>] [--follower] stats\n  \
          lin version"
     );
@@ -815,6 +818,285 @@ fn cmd_backup(args: &[String], data: Option<PathBuf>) -> ExitCode {
         }
         _ => {
             eprintln!("usage: lin backup export|import …");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn cmd_cache(args: &[String], data: Option<PathBuf>) -> ExitCode {
+    match args.first().map(String::as_str) {
+        Some("serve") => {
+            let mut cfg = lin::cache::CacheConfig::default();
+            let mut peers: Vec<(String, String)> = Vec::new();
+            let mut i = 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--node-id" | "--id" => {
+                        i += 1;
+                        let Some(v) = args.get(i) else {
+                            eprintln!("--node-id requires an identifier");
+                            return ExitCode::from(2);
+                        };
+                        cfg.node_id = v.clone();
+                        i += 1;
+                    }
+                    "--listen" | "--bind" => {
+                        i += 1;
+                        let Some(v) = args.get(i) else {
+                            eprintln!("--listen requires HOST:PORT");
+                            return ExitCode::from(2);
+                        };
+                        cfg.listen_addr = v.clone();
+                        i += 1;
+                    }
+                    "--peer" => {
+                        i += 1;
+                        let Some(v) = args.get(i) else {
+                            eprintln!("--peer requires ID=HOST:PORT");
+                            return ExitCode::from(2);
+                        };
+                        if let Some((pid, paddr)) = v.split_once('=') {
+                            peers.push((pid.to_string(), paddr.to_string()));
+                        } else {
+                            peers.push((v.clone(), v.clone()));
+                        }
+                        i += 1;
+                    }
+                    "--max-entries" => {
+                        i += 1;
+                        let Some(v) = args.get(i).and_then(|s| s.parse().ok()) else {
+                            eprintln!("--max-entries requires a number");
+                            return ExitCode::from(2);
+                        };
+                        cfg.max_entries = v;
+                        i += 1;
+                    }
+                    "--max-bytes" => {
+                        i += 1;
+                        let Some(v) = args.get(i).and_then(|s| s.parse().ok()) else {
+                            eprintln!("--max-bytes requires a number");
+                            return ExitCode::from(2);
+                        };
+                        cfg.max_bytes = v;
+                        i += 1;
+                    }
+                    "--vnodes" => {
+                        i += 1;
+                        let Some(v) = args.get(i).and_then(|s| s.parse().ok()) else {
+                            eprintln!("--vnodes requires a number");
+                            return ExitCode::from(2);
+                        };
+                        cfg.vnodes = v;
+                        i += 1;
+                    }
+                    "--replicas" => {
+                        i += 1;
+                        let Some(v) = args.get(i).and_then(|s| s.parse().ok()) else {
+                            eprintln!("--replicas requires a number");
+                            return ExitCode::from(2);
+                        };
+                        cfg.replication_factor = v;
+                        i += 1;
+                    }
+                    "--no-sharding" => {
+                        cfg.sharding_enabled = false;
+                        i += 1;
+                    }
+                    other => {
+                        eprintln!("unknown cache serve option: {other}");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+
+            let listener = match TcpListener::bind(&cfg.listen_addr) {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("bind {}: {e}", cfg.listen_addr);
+                    return ExitCode::from(1);
+                }
+            };
+            if let Ok(local) = listener.local_addr() {
+                cfg.listen_addr = local.to_string();
+            }
+
+            let node_res = match &data {
+                Some(dir) => lin::cache::CacheNode::open_durable(dir, cfg.clone()),
+                None => lin::cache::CacheNode::new_in_memory(cfg.clone()),
+            };
+            let node = match node_res {
+                Ok(n) => n,
+                Err(e) => {
+                    eprintln!("{e}");
+                    return ExitCode::from(1);
+                }
+            };
+
+            for (pid, paddr) in &peers {
+                node.meet(pid.clone(), paddr.clone());
+                let _ = node.gossip_once_with(paddr);
+            }
+
+            eprintln!(
+                "cacha node={} listening on {} durable={} peers={}",
+                cfg.node_id,
+                cfg.listen_addr,
+                data.is_some(),
+                peers.len()
+            );
+
+            match node.serve(listener) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("{e}");
+                    ExitCode::from(1)
+                }
+            }
+        }
+        Some("cli") => {
+            let mut connect = "127.0.0.1:6380".to_string();
+            let mut cmd_tokens: Vec<String> = Vec::new();
+            let mut i = 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--connect" | "-c" | "-h" => {
+                        i += 1;
+                        let Some(v) = args.get(i) else {
+                            eprintln!("--connect requires HOST:PORT");
+                            return ExitCode::from(2);
+                        };
+                        connect = v.clone();
+                        i += 1;
+                    }
+                    "--" => {
+                        cmd_tokens.extend(args[i + 1..].iter().cloned());
+                        break;
+                    }
+                    other => {
+                        cmd_tokens.push(other.to_string());
+                        i += 1;
+                    }
+                }
+            }
+
+            let mut client = match lin::cache::CacheClient::connect(&connect) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("connect {connect}: {e}");
+                    return ExitCode::from(1);
+                }
+            };
+
+            if !cmd_tokens.is_empty() {
+                let line = if cmd_tokens.len() == 1 {
+                    cmd_tokens[0].clone()
+                } else if cmd_tokens[0].eq_ignore_ascii_case("lin")
+                    || cmd_tokens[0].eq_ignore_ascii_case("query")
+                {
+                    cmd_tokens.join(" ")
+                } else {
+                    cmd_tokens
+                        .iter()
+                        .map(|t| {
+                            if t.contains(char::is_whitespace) {
+                                format!("{t:?}")
+                            } else {
+                                t.clone()
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                };
+                match lin::cache::parse_cli_command(&line) {
+                    Ok(req) => {
+                        let is_sub = matches!(req, lin::cache::CacheRequest::Subscribe { .. });
+                        match client.send(&req) {
+                            Ok(resp) => {
+                                println!("{}", resp.format_cli());
+                                if is_sub {
+                                    while let Ok(msg) = client.read_next() {
+                                        println!("{}", msg.format_cli());
+                                    }
+                                }
+                                return ExitCode::SUCCESS;
+                            }
+                            Err(e) => {
+                                eprintln!("{e}");
+                                return ExitCode::from(1);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("{e}");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+
+            // Interactive REPL mode
+            use std::io::{BufRead, Write};
+            println!(
+                "Connected to cacha (Lin Distributed Cache) at {}. Type HELP or QUIT.",
+                client.addr()
+            );
+            let stdin = io::stdin();
+            let mut stdout = io::stdout();
+            let mut lines = stdin.lock().lines();
+            loop {
+                print!("cacha ({})> ", client.addr());
+                let _ = stdout.flush();
+                let Some(Ok(line)) = lines.next() else {
+                    println!();
+                    break;
+                };
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if trimmed.eq_ignore_ascii_case("quit") || trimmed.eq_ignore_ascii_case("exit") {
+                    break;
+                }
+                if trimmed.eq_ignore_ascii_case("help") {
+                    println!(
+                        "Commands:\n  \
+                         Strings: GET k | SET k v [EX s | PX ms] | DEL k.. | EXISTS k | INCR k | DECR k | INCRBY k n | EXPIRE k s | TTL k | KEYS prefix*\n  \
+                         Hashes:  HSET k f v | HGET k f | HDEL k f.. | HGETALL k\n  \
+                         Lists:   LPUSH k v.. | RPUSH k v.. | LPOP k | RPOP k | LRANGE k start stop\n  \
+                         Sets:    SADD k m.. | SREM k m.. | SMEMBERS k | SISMEMBER k m\n  \
+                         Pub/Sub: PUBLISH ch msg | SUBSCRIBE ch..\n  \
+                         Lin DB:  LIN <pipe-query>   (e.g. `LIN docs | take 3` or `LIN cache_kv | count`)\n  \
+                         Cluster: INFO | CLUSTER INFO | CLUSTER NODES | CLUSTER MEET id addr | CLUSTER KEYSLOT k | RAFT STATUS | RAFT ELECT"
+                    );
+                    continue;
+                }
+                match lin::cache::parse_cli_command(trimmed) {
+                    Ok(req) => {
+                        let is_sub = matches!(req, lin::cache::CacheRequest::Subscribe { .. });
+                        match client.send(&req) {
+                            Ok(resp) => {
+                                println!("{}", resp.format_cli());
+                                if is_sub {
+                                    println!("(listening for messages — Ctrl+C to exit)");
+                                    while let Ok(msg) = client.read_next() {
+                                        println!("{}", msg.format_cli());
+                                    }
+                                    break;
+                                }
+                            }
+                            Err(e) => eprintln!("(io error) {e}"),
+                        }
+                    }
+                    Err(e) => eprintln!("(syntax error) {e}"),
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        _ => {
+            eprintln!(
+                "usage:\n  \
+                 lin [--data <dir>] cache serve [--node-id ID] [--listen HOST:PORT] [--peer ID=HOST:PORT] [--max-entries N]\n  \
+                 lin cache cli [--connect HOST:PORT] [COMMAND...]"
+            );
             ExitCode::from(2)
         }
     }

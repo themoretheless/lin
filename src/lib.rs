@@ -70,6 +70,7 @@ mod plan;
 mod store;
 mod window;
 
+pub mod cache;
 pub mod query;
 pub mod row;
 pub mod ship;
@@ -86,7 +87,7 @@ pub use ast::{
 pub use batch::RecordBatch;
 pub use cursor::{ProjectedRow, QueryCursor};
 pub use embed::{
-    dequantize_sq8, dot_sq8, quantize_sq8, Embedder, HashingEmbedder, HnswIndex, HnswIndexSq8,
+    Embedder, HashingEmbedder, HnswIndex, HnswIndexSq8, dequantize_sq8, dot_sq8, quantize_sq8,
 };
 #[cfg(feature = "embed-ollama")]
 pub use embed_ollama::OllamaEmbedder;
