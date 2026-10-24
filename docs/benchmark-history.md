@@ -8,6 +8,8 @@
 
 ## Обновление 2026-10-24
 
+- [Sparse-only fused output CPU](../benches/results/2026-10-24-embedding-sparse-fused-output-cpu/report.md) / [engine gate — отклонено](../benches/results/2026-10-24-embedding-sparse-fused-engine/report.md): dense fallback убрал CPU Unicode-регресс, default 1k CPU +3,40% /+3,17%; полный durable 1k −0,49% /−2,93%, native flat. Workspace/bit checks прошли; production восстановлен, engine gain не подтверждён.
+
 - [Fused embedding normalize/output CPU — отклонено](../benches/results/2026-10-24-embedding-fused-output-cpu/report.md): default 1k +2,50% /+3,67%, но Unicode −4,51% /−1,19%, повтор 0/6. Finite bit-exact gates прошли; глобальная политика не принята, production и allocator unchanged, engine gain не заявлен.
 
 - [Embedding whole-batch allocation audit](../benches/results/2026-10-24-embedding-batch-allocation/report.md): 12 процессов, проверка чувствительности allocator observer, warm counters совпали. Default 1k: 1001 allocations /3 104 000 requested bytes, ровно выходные Arc и Vec; realloc/transient churn не обнаружены. Это счётчики запросов, не RSS/latency; production не менялся.

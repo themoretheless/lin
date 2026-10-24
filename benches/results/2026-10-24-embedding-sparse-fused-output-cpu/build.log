@@ -1,0 +1,111 @@
+   Compiling lin v0.4.0 (/Users/themoretheless/Documents/Sources/lin)
+warning: unused import: `std::cmp::Ordering`
+  --> examples/embedding_sparse_fused_output_gate.rs:29:18
+   |
+29 | mod baseline{use std::cmp::Ordering;
+   |                  ^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `std::collections::BinaryHeap`
+  --> examples/embedding_sparse_fused_output_gate.rs:30:5
+   |
+30 | use std::collections::BinaryHeap;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `FxHashMap` and `FxHashSet`
+  --> examples/embedding_sparse_fused_output_gate.rs:34:18
+   |
+34 | use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
+   |                  ^^^^^^^^^  ^^^^^^^^^
+
+warning: unused import: `std::cmp::Ordering`
+   --> examples/embedding_sparse_fused_output_gate.rs:285:19
+    |
+285 | mod candidate{use std::cmp::Ordering;
+    |                   ^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `std::collections::BinaryHeap`
+   --> examples/embedding_sparse_fused_output_gate.rs:286:5
+    |
+286 | use std::collections::BinaryHeap;
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `FxHashMap` and `FxHashSet`
+   --> examples/embedding_sparse_fused_output_gate.rs:290:18
+    |
+290 | use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
+    |                  ^^^^^^^^^  ^^^^^^^^^
+
+warning: methods `id`, `dim`, and `embed_batch_owned` are never used
+  --> examples/embedding_sparse_fused_output_gate.rs:39:8
+   |
+37 | pub trait Embedder: Send + Sync {
+   |           -------- methods in this trait
+38 |     /// Stable identity (should match [`crate::catalog::Catalog::embed_id`] when active).
+39 |     fn id(&self) -> &str;
+   |        ^^
+40 |     fn dim(&self) -> usize;
+   |        ^^^
+...
+50 |     fn embed_batch_owned(&self, texts: &[&str]) -> Vec<Vec<f32>> {
+   |        ^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `id` is never read
+  --> examples/embedding_sparse_fused_output_gate.rs:61:5
+   |
+60 | pub struct HashingEmbedder {
+   |            --------------- field in this struct
+61 |     id: String,
+   |     ^^
+   |
+   = note: `HashingEmbedder` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: associated function `from_embed_id` is never used
+  --> examples/embedding_sparse_fused_output_gate.rs:75:12
+   |
+65 | impl HashingEmbedder {
+   | -------------------- associated function in this implementation
+...
+75 |     pub fn from_embed_id(embed_id: &str) -> Self {
+   |            ^^^^^^^^^^^^^
+
+warning: methods `id`, `dim`, and `embed_batch_owned` are never used
+   --> examples/embedding_sparse_fused_output_gate.rs:295:8
+    |
+293 | pub trait Embedder: Send + Sync {
+    |           -------- methods in this trait
+294 |     /// Stable identity (should match [`crate::catalog::Catalog::embed_id`] when active).
+295 |     fn id(&self) -> &str;
+    |        ^^
+296 |     fn dim(&self) -> usize;
+    |        ^^^
+...
+306 |     fn embed_batch_owned(&self, texts: &[&str]) -> Vec<Vec<f32>> {
+    |        ^^^^^^^^^^^^^^^^^
+
+warning: field `id` is never read
+   --> examples/embedding_sparse_fused_output_gate.rs:317:5
+    |
+316 | pub struct HashingEmbedder {
+    |            --------------- field in this struct
+317 |     id: String,
+    |     ^^
+    |
+    = note: `HashingEmbedder` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: associated function `from_embed_id` is never used
+   --> examples/embedding_sparse_fused_output_gate.rs:331:12
+    |
+321 | impl HashingEmbedder {
+    | -------------------- associated function in this implementation
+...
+331 |     pub fn from_embed_id(embed_id: &str) -> Self {
+    |            ^^^^^^^^^^^^^
+
+warning: `lin` (example "embedding_sparse_fused_output_gate") generated 12 warnings (run `cargo fix --example "embedding_sparse_fused_output_gate" -p lin` to apply 6 suggestions)
+    Finished `release` profile [optimized] target(s) in 1.18s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
