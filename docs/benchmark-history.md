@@ -10,6 +10,8 @@
 
 Исторический каталог ниже сохраняет срез 5 октября. Новые измерения текущего кода:
 
+- [Streamed embedding text CPU gate](../benches/results/2026-10-24-streamed-embedding-text-cpu/report.md): один переиспользуемый String + последовательный embed; default 1k +7,9% (~18 мкс), single-field guard −2,3% во всех шести процессах. Глобальная замена не принята, end-to-end выигрыша нет, production не менялся.
+
 - [Persistent embed worker](../benches/results/2026-10-24-persistent-embed-worker-cpu/report.md) / [arena transfer](../benches/results/2026-10-24-persistent-embed-worker-arena-cpu/report.md): warm CPU batch gate; короткий 1k −10,6% / −1,0%, поэтому глобальная worker-политика отклонена. Длинный Unicode выигрывает ~44%, но это не закрывает целевой durable gap. Production не менялся.
 
 - [LZ4 write+Full-sync — отклонён](../benches/results/2026-10-24-lz4-wal-io/report.md): реальный 1k payload, два raw A/A контроля и FAST(8), 864 проверенных операции. LZ4 −13,3% / −43,9% в двух сериях; production-кодек не менялся. Standalone I/O gate, не скорость всей БД.
