@@ -8,6 +8,8 @@
 
 ## Обновление 2026-10-24
 
+- [Sparse branch/entry CPU gate](../benches/results/2026-10-24-sparse-branch-entry-cpu/report.md): OR reduction против early exit и packed u64 index/value; две серии по шесть процессов, exact bytes. Packed-only — кандидат для engine gate; это компонентный CPU результат, production не менялся, durable SQLite gap не закрыт.
+
 - [Apple WAL preallocation — real engine](../benches/results/2026-10-24-wal-preallocation-engine/report.md): durable 1k paired +11,58% / +6,37%; interleaved +3,16% (на уровне A/A) / +7,22% (6/6). Резерв 1 МиБ увеличивает физическую allocation открытого WAL; workspace/replay прошли. Durable 1k всё ещё проигрывает SQLite; цель всех peers остаётся открытой.
 
 Исторический каталог ниже сохраняет срез 5 октября. Новые измерения текущего кода:
