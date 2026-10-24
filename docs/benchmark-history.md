@@ -10,6 +10,8 @@
 
 Исторический каталог ниже сохраняет срез 5 октября. Новые измерения текущего кода:
 
+- [WAL preallocation fresh-file](../benches/results/2026-10-24-wal-preallocation-io/report.md) / [32-append amortization](../benches/results/2026-10-24-wal-preallocation-amortized-io/report.md): физический резерв 1 МиБ без изменения логических bytes/Full sync. С учётом refill суммарный I/O +20,5% / +10,6%, но повторный A/A-контроль расходится ~9,6%; гипотеза требует лучшей изоляции и real-Db проверки, production не менялся.
+
 - [Kusto native streaming adapter](../benches/results/2026-10-24-kusto-streaming-adapter/report.md): реализованы streaming REST, byte-bounded CSV, timed visibility и exact readback; 17 adapter-тестов прошли. Setup владения таблицами заменён на create-only .set; live schema/streaming/cleanup ещё не проверены. Отсутствующий endpoint даёт incomplete/exit 2, победа не заявляется.
 
 - [MSSQL native bulk adapter](../benches/results/2026-10-24-mssql-native-adapter/report.md): реализован typed PyTDS bulk-copy в одной явной транзакции; 15 adapter-тестов прошли, отсутствие endpoint даёт incomplete/exit 2. Live SQL Server gate и замеры ещё отсутствуют, победа не заявляется.
