@@ -223,3 +223,20 @@ run keeps Full sync/default embedding/FTS/indexes. It is an additional affected
 Lin control, not a replacement for native/large-batch guards or peer timings.
 Two A/A series show remaining noise; differences near that variation remain
 inconclusive. Do not compare protocol changes as a causal engine speedup.
+
+
+## SQL Server native insertion adapter
+
+`--engines lin mssql --cases insert_native` now has a PyTDS typed bulk-copy
+path. Each sample creates a fresh owned dbo table with primary id, unique uri
+and wing/ts index outside timing. Explicit BEGIN, copy_to transfer/serialization
+and COMMIT are timed; full six-field/multiplicity readback and cleanup are
+excluded. NVARCHAR text and BIGINT timestamp metadata are explicit; constraints,
+triggers and null preservation are enabled. Version, recovery model and delayed
+durability are recorded without weakening settings. Only a successful CREATE
+marks ownership; cleanup attempts rollback then DROP even on rollback failure.
+
+This is native API coverage, not equal disk durability. SQL Server still
+requires live read/typed bulk/transaction/cleanup qualification before any
+performance result is accepted. The [implementation and mock/CLI evidence](../benches/results/2026-10-24-mssql-native-adapter/report.md)
+do not replace a server run. No MSSQL win is claimed from adapter tests.

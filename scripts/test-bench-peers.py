@@ -137,6 +137,70 @@ class BenchmarkContractTests(unittest.TestCase):
             self.assertEqual(run["medians_ns"], {})
             self.assertTrue(run["errors"])
 
+    def test_native_mssql_bulk_transaction_and_owned_cleanup(self):
+        import pytds
+        data = bench.dataset(41)
+        first = data[0][0]
+        data[0][0] = (*first[:3], "ЁЖ SQL 🦔", "quote ' comma, tab\t newline\n")
+        want = [[d[0], d[1], d[2], d[3], 123456, d[4]] for d in data[0]]
+        for mode in ["ok", "bulk_failure", "wrong_readback", "create_failure", "rollback_failure"]:
+            with self.subTest(mode=mode):
+                events = []
+                copies = []
+                class Cursor:
+                    def __enter__(self): return self
+                    def __exit__(self, *args): events.append("cursor_close")
+                    def execute(self, sql):
+                        self.last = sql
+                        events.append(sql)
+                        if mode == "create_failure" and sql.startswith("CREATE TABLE"):
+                            raise RuntimeError("injected existing fixture")
+                        if mode == "rollback_failure" and "ROLLBACK TRANSACTION" in sql:
+                            raise RuntimeError("injected rollback failure")
+                    def fetchone(self):
+                        return ("16.test",) if "SERVERPROPERTY" in self.last else ("FULL", "DISABLED")
+                    def copy_to(self, **kwargs):
+                        copies.append(kwargs)
+                        events.append("COPY")
+                        if mode == "bulk_failure": raise RuntimeError("injected bulk failure")
+                    def fetchall(self):
+                        return want[:-1] + [want[0]] if mode == "wrong_readback" else want
+                class Connection:
+                    def cursor(self): return Cursor()
+                    def close(self): events.append("connection_close")
+                with patch.dict(os.environ, {"LIN_BENCH_MSSQL_HOST": "test-only", "LIN_BENCH_MSSQL_USER": "u", "LIN_BENCH_MSSQL_PASSWORD": "p", "LIN_BENCH_MSSQL_DATABASE": "testdb"}):
+                    with patch.object(pytds, "connect", return_value=Connection()) as connect:
+                        peer = bench.NativeInsert(data, SimpleNamespace(native_timestamp_ms=123456), "linbench_mssql_owned", "mssql")
+                        try:
+                            if mode == "ok":
+                                ns, iterations, got = peer.measure_insert(2)
+                                self.assertEqual(len(ns), 2)
+                                self.assertEqual(iterations, 1)
+                                self.assertEqual(got, want)
+                            else:
+                                with self.assertRaises((RuntimeError, AssertionError)):
+                                    peer.measure_insert(1)
+                            self.assertTrue(connect.call_args.kwargs["autocommit"])
+                            self.assertEqual(peer.contract["delayed_durability"], "DISABLED")
+                        finally: peer.close()
+                creates = [e for e in events if e.startswith("CREATE TABLE")]
+                drops = [e for e in events if e.startswith("DROP TABLE")]
+                self.assertEqual(len(drops), 0 if mode == "create_failure" else len(creates))
+                for drop in drops: self.assertIn("linbench_mssql_owned_docs_", drop)
+                self.assertIn("connection_close", events)
+                if copies:
+                    for copy in copies:
+                        self.assertEqual(copy["data"], want)
+                        self.assertTrue(copy["check_constraints"])
+                        self.assertTrue(copy["fire_triggers"])
+                        self.assertEqual(copy["schema"], "dbo")
+                        self.assertEqual([c.column_name for c in copy["columns"]], ["id", "uri", "wing", "title", "ts", "body"])
+                        self.assertEqual([c.type.get_declaration() for c in copy["columns"]], ["NVARCHAR(64)", "NVARCHAR(128)", "NVARCHAR(16)", "NVARCHAR(128)", "BIGINT", "NVARCHAR(128)"])
+                    self.assertIn("BEGIN TRANSACTION", events)
+                    if mode == "bulk_failure": self.assertNotIn("COMMIT TRANSACTION", events)
+                    else: self.assertIn("COMMIT TRANSACTION", events)
+                    self.assertTrue(any("ROLLBACK TRANSACTION" in e for e in events))
+
     def test_kusto_cleanup_attempts_every_owned_table_after_drop_failure(self):
         peer = object.__new__(bench.Kusto)
         peer.created = ["linbench_owned_docs", "linbench_owned_users", "linbench_owned_orders"]

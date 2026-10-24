@@ -276,6 +276,7 @@ class NativeInsert(Lin):
         self.proc = None
         self.pg_conn = None
         self.mysql_conn = None
+        self.mssql_conn = None
         self.prefix = prefix
         self.client = None
         self.db = None
@@ -291,6 +292,26 @@ class NativeInsert(Lin):
                 self.proc = subprocess.Popen([str(binary)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
                 self.version = self.ask({"worker_version": True})["version"]
                 self.contract.update({"api": "Rust prepared run; default embedding and FTS", "storage": "Db::empty"})
+            elif engine == "mssql":
+                import pytds
+                from pytds import tds_base, tds_types
+                host = os.environ.get("LIN_BENCH_MSSQL_HOST")
+                if not host:
+                    raise RuntimeError("set LIN_BENCH_MSSQL_HOST/USER/PASSWORD/DATABASE (dedicated test server)")
+                self.mssql_conn = pytds.connect(server=host, port=int(os.environ.get("LIN_BENCH_MSSQL_PORT", "1433")),
+                    user=os.environ["LIN_BENCH_MSSQL_USER"], password=os.environ["LIN_BENCH_MSSQL_PASSWORD"],
+                    database=os.environ["LIN_BENCH_MSSQL_DATABASE"], login_timeout=5, timeout=60, autocommit=True)
+                self.mssql_columns = [tds_base.Column(name=name, type=kind, flags=0 if name == "id" else tds_base.Column.fNullable)
+                    for name, kind in [("id", tds_types.NVarCharType(64)), ("uri", tds_types.NVarCharType(128)),
+                        ("wing", tds_types.NVarCharType(16)), ("title", tds_types.NVarCharType(128)),
+                        ("ts", tds_types.BigIntType()), ("body", tds_types.NVarCharType(128))]]
+                with self.mssql_conn.cursor() as cursor:
+                    cursor.execute("SELECT CAST(SERVERPROPERTY('ProductVersion') AS VARCHAR(128))")
+                    self.version = cursor.fetchone()[0]
+                    cursor.execute("SELECT recovery_model_desc, delayed_durability_desc FROM sys.databases WHERE database_id = DB_ID()")
+                    recovery, delayed = cursor.fetchone()
+                    cursor.execute("SET XACT_ABORT ON")
+                self.contract.update({"api": "PyTDS typed bulk copy plus explicit transaction commit", "storage": "configured dedicated SQL Server", "atomicity": "one transaction per sample", "recovery_model": recovery, "delayed_durability": delayed, "collation": "server/database defaults; no cross-engine collation equivalence"})
             elif engine == "mysql":
                 import pymysql
                 url = urllib.parse.urlsplit(os.environ.get("LIN_BENCH_MYSQL_URL", "mysql://lin:lin@127.0.0.1:53306/lin"))
@@ -348,6 +369,37 @@ class NativeInsert(Lin):
             if "api" in result:
                 self.contract["execution_path"] = result["api"]
             return result["samples_ns"], 1, result["result"]
+        if self.engine == "mssql":
+            from pytds.tds_base import tds_quote_id
+            timings = []
+            got = None
+            for sample in range(samples):
+                table = self.prefix + "_docs_" + str(sample)
+                if len(table) > 128:
+                    raise RuntimeError("SQL Server fixture identifier exceeds 128 characters")
+                name = "[dbo]." + tds_quote_id(table)
+                created = False
+                with self.mssql_conn.cursor() as cursor:
+                    try:
+                        cursor.execute(f"CREATE TABLE {name} (id NVARCHAR(64) PRIMARY KEY, uri NVARCHAR(128) UNIQUE, wing NVARCHAR(16), title NVARCHAR(128), ts BIGINT, body NVARCHAR(128))")
+                        created = True
+                        cursor.execute(f"CREATE INDEX [docs_wing_ts] ON {name} (wing, ts)")
+                        start = time.perf_counter_ns()
+                        cursor.execute("BEGIN TRANSACTION")
+                        cursor.copy_to(table_or_view=table, schema="dbo", columns=self.mssql_columns,
+                            data=self.want, check_constraints=True, fire_triggers=True, keep_nulls=True)
+                        cursor.execute("COMMIT TRANSACTION")
+                        timings.append(time.perf_counter_ns() - start)
+                        cursor.execute(f"SELECT id, uri, wing, title, ts, body FROM {name}")
+                        got = [list(row) for row in cursor.fetchall()]
+                        validate(got, self.want, self.engine, "insert_native")
+                    finally:
+                        if created:
+                            try:
+                                cursor.execute("IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION")
+                            finally:
+                                cursor.execute(f"DROP TABLE {name}")
+            return timings, 1, got
         if self.engine == "mysql":
             timings = []
             got = None
@@ -461,6 +513,9 @@ class NativeInsert(Lin):
         return timings, 1, got
 
     def close(self):
+        if self.mssql_conn is not None:
+            self.mssql_conn.close()
+            self.mssql_conn = None
         if self.mysql_conn is not None:
             self.mysql_conn.close()
             self.mysql_conn = None
