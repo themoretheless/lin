@@ -10,6 +10,8 @@
 
 Исторический каталог ниже сохраняет срез 5 октября. Новые измерения текущего кода:
 
+- [FTS ASCII append — отклонён](../benches/results/2026-10-24-fts-ascii-append/report.md): ASCII split с Unicode/vertical-tab fallback; postings oracle и workspace прошли. Durable 10k −1,3% / −2,8%, целевой 1k не дал повторяемого выигрыша; production восстановлен.
+
 - [Inline embedding text — отклонён](../benches/results/2026-10-24-inline-embedding-text/report.md): 22-byte inline join вместо части временных String; 512 комбинаций/битовая точность и workspace прошли. Durable 1k +5,4% затем −4,9%, контроль во второй серии тоже сдвинулся; устойчивого выигрыша нет, production восстановлен.
 
 - [Current insert-stage profile](../benches/results/2026-10-24-current-insert-stage-profile/report.md): три процесса native/Full durable 1k/10k; durable 1k embedding 0,391 мс, build 0,190 мс, FTS 0,177 мс. Частичные диагностические spans; production восстановлен, ускорение не заявляется.
