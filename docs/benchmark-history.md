@@ -8,6 +8,8 @@
 
 ## Обновление 2026-10-24
 
+- [Index key streaming — глобально отклонено](../benches/results/2026-10-24-index-key-stream/report.md): без временного Vec<IndexKey>, bitmap sample-once сохранён. Двухполевой disabled путь −4,7…−7,8% CPU на 1k и −5,6…−6,3% на 10k, 0/6 в двух сериях. Три поля +2,44% /+5,18%, но отдельная dispatch-политика не квалифицирована. Workspace/oracle прошли; production восстановлен.
+
 - [Bitmap cardinality sample once — принято](../benches/results/2026-10-24-bitmap-sample-once/report.md): первые 100 строк оцениваются один раз на slab вместо каждой строки; включённый sampling ускоряет index operation примерно 16–18× в двух сериях, с сохранением ошибок/типов postings/partial/boolean/порога 10k. Workspace прошёл, финальные бинарники совпали с измеренными; peer refresh 108/108 read и 15/15 native. Обычный bitmap-disabled путь без доказанного общего ускорения; durable SQLite gap/MSSQL/Kusto открыты.
 
 - [Row template clone vs sorted collect — отклонено](../benches/results/2026-10-24-row-template-collect-cpu/report.md): текущее clone/fill против bulk collect отсортированных slots; uniform 1k/10k около −42% CPU в обеих сериях, 0/6 побед. Scalar-row oracle/duplicates/Now/batch boundaries прошли; production не менялся. Лишней полной rollback-копии в текущем append-path не найдено.
