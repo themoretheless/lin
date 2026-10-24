@@ -10,7 +10,7 @@ Shared 64MiB logical decoded-vector budget includes legacy Option<Vec<f32>> meta
 
 ## Verified bug and fix
 
-The first reopen regression failed: codec retained Some(empty), but unchanged cols_to_rows mapped it to Cell::Null. Pre-fix log/status preserved in pre-empty-fix-tests.log/json. Materialization now clones every Some Arc, including empty; None stays Null. Separate legacy sparse reopen/checkpoint regression verifies the fix also applies to existing sparse records. Old Null snapshots are not magically recovered.
+The first reopen regression failed: codec retained Some(empty), but unchanged cols_to_rows mapped it to Cell::Null. Pre-fix log/status preserved in pre-empty-fix-tests.log and pre-empty-fix-status.json. Materialization now clones every Some Arc, including empty; None stays Null. Separate legacy sparse reopen/checkpoint regression verifies the fix also applies to existing sparse records. Old Null snapshots are not magically recovered.
 
 ## Gates and evidence
 
