@@ -8,6 +8,8 @@
 
 ## Обновление 2026-10-24
 
+- [Fused embedding normalize/output CPU — отклонено](../benches/results/2026-10-24-embedding-fused-output-cpu/report.md): default 1k +2,50% /+3,67%, но Unicode −4,51% /−1,19%, повтор 0/6. Finite bit-exact gates прошли; глобальная политика не принята, production и allocator unchanged, engine gain не заявлен.
+
 - [Embedding whole-batch allocation audit](../benches/results/2026-10-24-embedding-batch-allocation/report.md): 12 процессов, проверка чувствительности allocator observer, warm counters совпали. Default 1k: 1001 allocations /3 104 000 requested bytes, ровно выходные Arc и Vec; realloc/transient churn не обнаружены. Это счётчики запросов, не RSS/latency; production не менялся.
 
 - [Embedding fill/finish sampled diagnostic](../benches/results/2026-10-24-embedding-fill-finish-profile/report.md): 3 процесса, побитовый oracle, stride 16. Короткие spans 83/125 нс сопоставимы с дискретностью часов; доли фаз и hotspot не доказаны. Production не менялся; следующий allocation-анализ требует более крупных интервалов или tracing.
