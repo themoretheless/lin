@@ -33,6 +33,26 @@ impl RecordBatch {
         self.n() == 0
     }
 
+    /// Estimated byte size of column buffers and schema in memory.
+    pub fn byte_size(&self) -> usize {
+        let mut total = std::mem::size_of::<Self>();
+        for name in self.names.iter() {
+            total += name.len() + 16;
+        }
+        for col in &self.cols {
+            total +=
+                std::mem::size_of::<Vec<Cell>>() + col.capacity() * std::mem::size_of::<Cell>();
+            for cell in col {
+                match cell {
+                    Cell::Text(s) => total += s.len(),
+                    Cell::Vec(v) => total += v.len() * 4,
+                    _ => {}
+                }
+            }
+        }
+        total
+    }
+
     pub fn push_row(&mut self, cells: &[Cell]) {
         debug_assert_eq!(cells.len(), self.cols.len());
         for (col, cell) in self.cols.iter_mut().zip(cells.iter()) {

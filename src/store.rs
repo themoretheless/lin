@@ -510,6 +510,24 @@ impl From<Arc<str>> for Cell {
 
 pub type Row = BTreeMap<String, Cell>;
 
+/// Estimated in-memory byte size of a row (keys + values + container overhead).
+#[inline]
+pub fn row_byte_size(row: &Row) -> usize {
+    let mut total = std::mem::size_of::<Row>() + row.len() * 32;
+    for (k, v) in row {
+        total += k.len();
+        total += match v {
+            Cell::Null | Cell::Int(_) | Cell::Float(_) | Cell::Bool(_) | Cell::Time(_) => {
+                std::mem::size_of::<Cell>()
+            }
+            Cell::SmallText(_) => std::mem::size_of::<Cell>(),
+            Cell::Text(s) => std::mem::size_of::<Cell>() + s.len(),
+            Cell::Vec(vec) => std::mem::size_of::<Cell>() + vec.len() * 4,
+        };
+    }
+    total
+}
+
 /// Ergonomics for `match row.cell("col") { Cell::Text(s) => …, Cell::Null => … }`.
 pub trait RowExt {
     /// Column value, or [`Cell::Null`] if the key is missing.

@@ -613,6 +613,7 @@ fn quotas_reject_excess_rows() {
         max_rows: 2,
         max_edges: 10_000,
         max_log_bytes: 512 * 1024 * 1024,
+        ..Default::default()
     });
     // fixture empty collections still count? empty() has empty docs/users/orders/facts — 0 rows
     db.run(r#"insert docs { uri: "raw://q1", title: "Q1", layer: "wiki" }"#)
@@ -1306,7 +1307,8 @@ fn partial_index_predicate_survives_wal_and_checkpoint_reopen() {
     let dir = tmp();
     {
         let mut db = Db::open(&dir).unwrap();
-        db.run(r#"index docs [wing] where layer == "wiki""#).unwrap();
+        db.run(r#"index docs [wing] where layer == "wiki""#)
+            .unwrap();
         db.run(
             r#"insert docs [
                 { id: "d1", uri: "p://1", title: "One", layer: "wiki", wing: "rag" },
@@ -1324,7 +1326,10 @@ fn partial_index_predicate_survives_wal_and_checkpoint_reopen() {
             .values()
             .find(|i| i.collection == "docs" && i.fields == vec!["wing"])
             .expect("index exists");
-        assert!(idx.pred.is_some(), "partial index predicate should survive WAL replay");
+        assert!(
+            idx.pred.is_some(),
+            "partial index predicate should survive WAL replay"
+        );
         // Querying raw layer by wing=="rag" must NOT mistakenly use the wiki-only partial index
         let rows = db.run(r#"docs | wing == "rag" | take all"#).unwrap().rows;
         assert_eq!(rows.len(), 2);
@@ -1339,7 +1344,10 @@ fn partial_index_predicate_survives_wal_and_checkpoint_reopen() {
             .values()
             .find(|i| i.collection == "docs" && i.fields == vec!["wing"])
             .expect("index exists");
-        assert!(idx.pred.is_some(), "partial index predicate should survive checkpoint");
+        assert!(
+            idx.pred.is_some(),
+            "partial index predicate should survive checkpoint"
+        );
         // Also verify point lookups and index lookups work against cold (mmap) collections
         let by_id = db.run(r#"docs | id == "d1" | { title }"#).unwrap().rows;
         assert_eq!(by_id.len(), 1);
@@ -1429,8 +1437,10 @@ fn last_acknowledged_prefix_recovers_after_torn_trailing_frame_and_continues_wri
     fs::write(dir.join("log"), &half).unwrap();
     {
         let mut db = Db::open(&dir).unwrap();
-        db.run(r#"insert docs { id: "ack4", uri: "ack://4-clean", title: "Clean 4", layer: "wiki" }"#)
-            .unwrap();
+        db.run(
+            r#"insert docs { id: "ack4", uri: "ack://4-clean", title: "Clean 4", layer: "wiki" }"#,
+        )
+        .unwrap();
         assert_eq!(db.r#gen(), 4);
     }
     let mut final_db = Db::open(&dir).unwrap();
@@ -1445,5 +1455,3 @@ fn last_acknowledged_prefix_recovers_after_torn_trailing_frame_and_continues_wri
     );
     fs::remove_dir_all(dir).unwrap();
 }
-
-

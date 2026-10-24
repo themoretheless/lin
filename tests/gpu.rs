@@ -1703,7 +1703,10 @@ fn gpu_adapter_report_metrics_and_uma_status() {
     assert_eq!(reader.gpu_adapter_report(), Some(report.clone()));
 
     #[cfg(target_os = "macos")]
-    assert!(report.is_uma, "Apple Silicon Metal adapter should report is_uma = true");
+    assert!(
+        report.is_uma,
+        "Apple Silicon Metal adapter should report is_uma = true"
+    );
 
     let uploaded_before = gpu.bytes_uploaded();
     let readback_before = gpu.bytes_readback();

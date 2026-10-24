@@ -135,18 +135,18 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 45 | LIN-0362 | [D10](#d10) | Профилировать index reverse map writes | PERF | candidate | M | G-PERF |
 | 46 | LIN-0363 | [D10](#d10) | Профилировать posting list allocations | PERF | candidate | M | G-PERF |
 | 47 | LIN-0364 | [D10](#d10) | Профилировать BTree node locality | PERF | candidate | M | G-PERF |
-| 48 | LIN-0401 | [D11](#d11) | Проверить int выше 2^53 уникальность | CORRECTNESS | qualification | S | G-CORRECT |
-| 49 | LIN-0402 | [D11](#d11) | Проверить float integer tie-breaker | CORRECTNESS | qualification | S | G-CORRECT |
-| 50 | LIN-0403 | [D11](#d11) | Проверить negative infinity ordering | CORRECTNESS | qualification | S | G-CORRECT |
-| 51 | LIN-0404 | [D11](#d11) | Проверить positive infinity ordering | CORRECTNESS | qualification | S | G-CORRECT |
-| 52 | LIN-0481 | [D13](#d13) | Зафиксировать NULL predicate semantics | CORRECTNESS | qualification | M | G-CORRECT |
-| 53 | LIN-0482 | [D13](#d13) | Зафиксировать absent-field semantics | CORRECTNESS | qualification | M | G-CORRECT |
-| 54 | LIN-0483 | [D13](#d13) | Зафиксировать mixed numeric coercions | CORRECTNESS | qualification | M | G-CORRECT |
-| 55 | LIN-0484 | [D13](#d13) | Зафиксировать boolean coercion policy | CORRECTNESS | qualification | M | G-CORRECT |
-| 56 | LIN-0521 | [D14](#d14) | Проверить constant folding equivalence | CORRECTNESS | qualification | S | G-CORRECT |
-| 57 | LIN-0522 | [D14](#d14) | Проверить predicate simplification equivalence | CORRECTNESS | qualification | S | G-CORRECT |
-| 58 | LIN-0523 | [D14](#d14) | Проверить projection pushdown equivalence | CORRECTNESS | qualification | S | G-CORRECT |
-| 59 | LIN-0524 | [D14](#d14) | Проверить limit pushdown equivalence | CORRECTNESS | qualification | S | G-CORRECT |
+| 48 | LIN-0401 | [D11](#d11) | Проверить int выше 2^53 уникальность | CORRECTNESS | done | S | G-CORRECT |
+| 49 | LIN-0402 | [D11](#d11) | Проверить float integer tie-breaker | CORRECTNESS | done | S | G-CORRECT |
+| 50 | LIN-0403 | [D11](#d11) | Проверить negative infinity ordering | CORRECTNESS | done | S | G-CORRECT |
+| 51 | LIN-0404 | [D11](#d11) | Проверить positive infinity ordering | CORRECTNESS | done | S | G-CORRECT |
+| 52 | LIN-0481 | [D13](#d13) | Зафиксировать NULL predicate semantics | CORRECTNESS | done | M | G-CORRECT |
+| 53 | LIN-0482 | [D13](#d13) | Зафиксировать absent-field semantics | CORRECTNESS | done | M | G-CORRECT |
+| 54 | LIN-0483 | [D13](#d13) | Зафиксировать mixed numeric coercions | CORRECTNESS | done | M | G-CORRECT |
+| 55 | LIN-0484 | [D13](#d13) | Зафиксировать boolean coercion policy | CORRECTNESS | done | M | G-CORRECT |
+| 56 | LIN-0521 | [D14](#d14) | Проверить constant folding equivalence | CORRECTNESS | done | S | G-CORRECT |
+| 57 | LIN-0522 | [D14](#d14) | Проверить predicate simplification equivalence | CORRECTNESS | done | S | G-CORRECT |
+| 58 | LIN-0523 | [D14](#d14) | Проверить projection pushdown equivalence | CORRECTNESS | done | S | G-CORRECT |
+| 59 | LIN-0524 | [D14](#d14) | Проверить limit pushdown equivalence | CORRECTNESS | done | S | G-CORRECT |
 | 60 | LIN-0722 | [D19](#d19) | Проверить NaN groups cardinality | CORRECTNESS | done | S | G-CORRECT |
 | 61 | LIN-0723 | [D19](#d19) | Проверить signed-zero group identity | CORRECTNESS | done | S | G-CORRECT |
 | 62 | LIN-0724 | [D19](#d19) | Проверить mixed int/float group identity | CORRECTNESS | done | S | G-CORRECT |
@@ -162,10 +162,10 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 72 | LIN-1042 | [D27](#d27) | Измерить HNSW recall против exact | PERF | candidate | L | G-PERF |
 | 73 | LIN-1043 | [D27](#d27) | Измерить HNSW build latency | PERF | candidate | L | G-PERF |
 | 74 | LIN-1044 | [D27](#d27) | Измерить HNSW resident memory | PERF | candidate | L | G-PERF |
-| 75 | LIN-1081 | [D28](#d28) | Проверить cosine dimensional mismatch | CORRECTNESS | qualification | S | G-CORRECT |
-| 76 | LIN-1082 | [D28](#d28) | Проверить cosine zero norms | CORRECTNESS | qualification | S | G-CORRECT |
-| 77 | LIN-1083 | [D28](#d28) | Проверить cosine NaN handling | CORRECTNESS | qualification | S | G-CORRECT |
-| 78 | LIN-1084 | [D28](#d28) | Проверить cosine infinity handling | CORRECTNESS | qualification | S | G-CORRECT |
+| 75 | LIN-1081 | [D28](#d28) | Проверить cosine dimensional mismatch | CORRECTNESS | done | S | G-CORRECT |
+| 76 | LIN-1082 | [D28](#d28) | Проверить cosine zero norms | CORRECTNESS | done | S | G-CORRECT |
+| 77 | LIN-1083 | [D28](#d28) | Проверить cosine NaN handling | CORRECTNESS | done | S | G-CORRECT |
+| 78 | LIN-1084 | [D28](#d28) | Проверить cosine infinity handling | CORRECTNESS | done | S | G-CORRECT |
 | 79 | LIN-1121 | [D29](#d29) | Проверить adapter selection diagnostics | CORRECTNESS | qualification | S | G-CORRECT |
 | 80 | LIN-1122 | [D29](#d29) | Проверить device allocation failure | CORRECTNESS | qualification | S | G-CORRECT |
 | 81 | LIN-1123 | [D29](#d29) | Проверить queue submission failure | CORRECTNESS | qualification | S | G-CORRECT |
@@ -190,14 +190,14 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 100 | LIN-1642 | [D42](#d42) | Генерировать typed/untyped roundtrip cases | VERIFY | qualification | S | G-VERIFY |
 | 101 | LIN-1643 | [D42](#d42) | Генерировать row/batch equivalence cases | VERIFY | qualification | S | G-VERIFY |
 | 102 | LIN-1644 | [D42](#d42) | Генерировать cursor/materialized equivalence cases | VERIFY | qualification | S | G-VERIFY |
-| 103 | LIN-1681 | [D43](#d43) | Инъецировать crash перед WAL append | VERIFY | qualification | S | G-VERIFY |
-| 104 | LIN-1682 | [D43](#d43) | Инъецировать crash после header write | VERIFY | qualification | S | G-VERIFY |
-| 105 | LIN-1683 | [D43](#d43) | Инъецировать crash после payload write | VERIFY | qualification | S | G-VERIFY |
-| 106 | LIN-1684 | [D43](#d43) | Инъецировать crash после checksum write | VERIFY | qualification | S | G-VERIFY |
-| 107 | LIN-1761 | [D45](#d45) | Ограничить untrusted query bytes | CORRECTNESS | qualification | M | G-CORRECT |
-| 108 | LIN-1762 | [D45](#d45) | Ограничить prepared AST bytes | CORRECTNESS | qualification | M | G-CORRECT |
-| 109 | LIN-1763 | [D45](#d45) | Ограничить query output bytes | CORRECTNESS | qualification | M | G-CORRECT |
-| 110 | LIN-1764 | [D45](#d45) | Ограничить query execution work | CORRECTNESS | qualification | M | G-CORRECT |
+| 103 | LIN-1681 | [D43](#d43) | Инъецировать crash перед WAL append | VERIFY | done | S | G-VERIFY |
+| 104 | LIN-1682 | [D43](#d43) | Инъецировать crash после header write | VERIFY | done | S | G-VERIFY |
+| 105 | LIN-1683 | [D43](#d43) | Инъецировать crash после payload write | VERIFY | done | S | G-VERIFY |
+| 106 | LIN-1684 | [D43](#d43) | Инъецировать crash после checksum write | VERIFY | done | S | G-VERIFY |
+| 107 | LIN-1761 | [D45](#d45) | Ограничить untrusted query bytes | CORRECTNESS | done | M | G-CORRECT |
+| 108 | LIN-1762 | [D45](#d45) | Ограничить prepared AST bytes | CORRECTNESS | done | M | G-CORRECT |
+| 109 | LIN-1763 | [D45](#d45) | Ограничить query output bytes | CORRECTNESS | done | M | G-CORRECT |
+| 110 | LIN-1764 | [D45](#d45) | Ограничить query execution work | CORRECTNESS | done | M | G-CORRECT |
 
 ### P2: 1290 пунктов
 

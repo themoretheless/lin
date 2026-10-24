@@ -605,3 +605,204 @@ pub enum TypeExpr {
     Named(String),
     Vec { dim: i64, model: String },
 }
+
+impl Stmt {
+    pub fn estimate_bytes(&self) -> usize {
+        let mut bytes = std::mem::size_of::<Self>();
+        match self {
+            Stmt::Query(q) => bytes += q.estimate_bytes(),
+            Stmt::Let { name, query } => {
+                bytes += name.len() + query.estimate_bytes();
+            }
+            Stmt::Insert {
+                collection,
+                records,
+                edges,
+            } => {
+                bytes += collection.len();
+                for r in records {
+                    bytes += std::mem::size_of::<Record>() + 24;
+                    for (k, v) in &r.fields {
+                        bytes += k.len() + v.estimate_bytes();
+                    }
+                }
+                for e in edges {
+                    bytes += e.rel.len()
+                        + match &e.target {
+                            EdgeTarget::Page(p) => p.len(),
+                            EdgeTarget::Value(v) => v.estimate_bytes(),
+                        };
+                }
+            }
+            Stmt::Update {
+                collection,
+                pred,
+                cas,
+                record,
+                ..
+            } => {
+                bytes += collection.len();
+                if let Some(p) = pred {
+                    bytes += p.estimate_bytes();
+                }
+                if let Some(c) = cas {
+                    bytes += c.len();
+                }
+                for (k, v) in &record.fields {
+                    bytes += k.len() + v.estimate_bytes();
+                }
+            }
+            Stmt::Delete {
+                collection,
+                pred,
+                cas,
+                ..
+            } => {
+                bytes += collection.len() + pred.estimate_bytes();
+                if let Some(c) = cas {
+                    bytes += c.len();
+                }
+            }
+            Stmt::DeleteEdge { rel, from, to } => {
+                bytes += rel.len() + from.estimate_bytes() + to.estimate_bytes();
+            }
+            Stmt::AppendFacts { records } => {
+                for r in records {
+                    bytes += std::mem::size_of::<Record>() + 24;
+                    for (k, v) in &r.fields {
+                        bytes += k.len() + v.estimate_bytes();
+                    }
+                }
+            }
+            Stmt::AppendEdges { edges } => {
+                for e in edges {
+                    bytes += e.rel.len() + e.from.estimate_bytes() + e.to.estimate_bytes();
+                }
+            }
+            Stmt::Decl(d) => bytes += std::mem::size_of_val(d),
+            Stmt::Snapshot { name }
+            | Stmt::Restore { name }
+            | Stmt::Pin { name }
+            | Stmt::Unpin { name } => {
+                bytes += name.len();
+            }
+            Stmt::IdbSlice { query } => bytes += query.estimate_bytes(),
+            Stmt::Reembed { collection, .. } => bytes += collection.len(),
+            Stmt::IdbPull { .. } | Stmt::IdbPush => {}
+        }
+        bytes
+    }
+}
+
+impl Query {
+    pub fn estimate_bytes(&self) -> usize {
+        let mut bytes = std::mem::size_of::<Self>();
+        for step in &self.steps {
+            bytes += step.estimate_bytes();
+        }
+        bytes
+    }
+}
+
+impl Step {
+    pub fn estimate_bytes(&self) -> usize {
+        let mut bytes = std::mem::size_of::<Self>();
+        match self {
+            Step::Filter(p) => bytes += p.estimate_bytes(),
+            Step::Project(fields) => {
+                for f in fields {
+                    bytes += f.estimate_bytes();
+                }
+            }
+            Step::Join { collection, on, .. } => {
+                bytes += collection.len() + on.len();
+            }
+            Step::Hop { rel, .. } | Step::Graph { rel, .. } => bytes += rel.len(),
+            Step::Match { hops, .. } => {
+                for h in hops {
+                    bytes += h.rel.len();
+                }
+            }
+            Step::Sort { field, .. } => {
+                bytes += field.estimate_bytes();
+            }
+            Step::Count { by: Some(by) } => {
+                bytes += by.estimate_bytes();
+            }
+            Step::Sum { field, by }
+            | Step::Avg { field, by }
+            | Step::Min { field, by }
+            | Step::Max { field, by } => {
+                bytes += field.estimate_bytes();
+                if let Some(b) = by {
+                    bytes += b.estimate_bytes();
+                }
+            }
+            Step::Search { query, .. } => bytes += query.len(),
+            _ => {}
+        }
+        bytes
+    }
+}
+
+impl Pred {
+    pub fn estimate_bytes(&self) -> usize {
+        let mut bytes = std::mem::size_of::<Self>();
+        match self {
+            Pred::And(a, b) | Pred::Or(a, b) => bytes += a.estimate_bytes() + b.estimate_bytes(),
+            Pred::Not(inner) => bytes += inner.estimate_bytes(),
+            Pred::IsNull { field, .. } => bytes += field.estimate_bytes(),
+            Pred::Cmp { field, value, .. } => {
+                bytes += field.estimate_bytes() + value.estimate_bytes()
+            }
+            Pred::In { field, values } => {
+                bytes += field.estimate_bytes();
+                for v in values {
+                    bytes += v.estimate_bytes();
+                }
+            }
+            Pred::Has { field, needle, .. } | Pred::Contains { field, needle } => {
+                bytes += field.estimate_bytes() + needle.len();
+            }
+            Pred::Regex {
+                field,
+                pattern,
+                flags,
+            } => {
+                bytes += field.estimate_bytes() + pattern.len() + flags.len();
+            }
+        }
+        bytes
+    }
+}
+
+impl Value {
+    pub fn estimate_bytes(&self) -> usize {
+        let mut bytes = std::mem::size_of::<Self>();
+        match self {
+            Value::String(s) => bytes += s.len(),
+            Value::Name(s) => bytes += s.len(),
+            _ => {}
+        }
+        bytes
+    }
+}
+
+impl Field {
+    pub fn estimate_bytes(&self) -> usize {
+        let mut bytes = std::mem::size_of::<Self>();
+        for p in &self.parts {
+            bytes += p.len();
+        }
+        bytes
+    }
+}
+
+/// Estimate memory bytes required by an AST of statements.
+pub fn estimate_ast_bytes(stmts: &[Stmt]) -> usize {
+    let mut total = std::mem::size_of_val(stmts);
+    for s in stmts {
+        total += s.estimate_bytes();
+    }
+    total
+}

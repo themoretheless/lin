@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use lin::{Db, HashingEmbedder};
+use std::sync::Arc;
 
 #[test]
 fn test_hnsw_build_and_search() {
@@ -20,7 +20,9 @@ fn test_hnsw_build_and_search() {
 
     // Query with vector search for exact item 42
     let query_text = "document category 8 specific detail item 42";
-    let res = db.run(&format!(r#"docs | search vec "{query_text}" | take 5"#)).unwrap();
+    let res = db
+        .run(&format!(r#"docs | search vec "{query_text}" | take 5"#))
+        .unwrap();
     assert!(!res.rows.is_empty());
     assert_eq!(res.rows[0]["id"].text().unwrap(), "doc_42");
 }
@@ -52,15 +54,23 @@ fn test_hnsw_incremental_insert_and_deletion() {
     }
 
     // Search for newly inserted chunk 25
-    let res = db.run(r#"docs | search vec "chunk item 25" | take 1"#).unwrap();
+    let res = db
+        .run(r#"docs | search vec "chunk item 25" | take 1"#)
+        .unwrap();
     assert_eq!(res.rows[0]["id"].text().unwrap(), "d_25");
 
     // Delete a row
-    let hash = db.run(r#"docs | id == "d_25" | { hash }"#).unwrap().rows[0]["hash"].text().unwrap().to_string();
-    db.run(&format!(r#"delete docs[id == "d_25"] cas "{hash}""#)).unwrap();
+    let hash = db.run(r#"docs | id == "d_25" | { hash }"#).unwrap().rows[0]["hash"]
+        .text()
+        .unwrap()
+        .to_string();
+    db.run(&format!(r#"delete docs[id == "d_25"] cas "{hash}""#))
+        .unwrap();
 
     // Search should no longer return d_25 as top result
-    let res2 = db.run(r#"docs | search vec "chunk item 25" | take 1"#).unwrap();
+    let res2 = db
+        .run(r#"docs | search vec "chunk item 25" | take 1"#)
+        .unwrap();
     assert_ne!(res2.rows[0]["id"].text().unwrap(), "d_25");
 }
 
@@ -74,7 +84,9 @@ fn test_hnsw_collection_isolation() {
 
     db.build_hnsw("docs").unwrap();
 
-    let res = db.run(r#"docs | search vec "quantum physics mechanics" | take 1"#).unwrap();
+    let res = db
+        .run(r#"docs | search vec "quantum physics mechanics" | take 1"#)
+        .unwrap();
     assert_eq!(res.rows.len(), 1);
     assert_eq!(res.rows[0]["id"].text().unwrap(), "art1");
 }

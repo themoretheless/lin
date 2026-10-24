@@ -87,7 +87,8 @@ pub use ast::{
 pub use batch::RecordBatch;
 pub use cursor::{ProjectedRow, QueryCursor};
 pub use embed::{
-    Embedder, HashingEmbedder, HnswIndex, HnswIndexSq8, dequantize_sq8, dot_sq8, quantize_sq8,
+    Embedder, HashingEmbedder, HnswIndex, HnswIndexSq8, cosine, dequantize_sq8, dot_sq8,
+    quantize_sq8,
 };
 #[cfg(feature = "embed-ollama")]
 pub use embed_ollama::OllamaEmbedder;

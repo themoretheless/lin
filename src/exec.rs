@@ -855,12 +855,17 @@ impl Drop for Transaction<'_> {
     }
 }
 
-/// Row / edge / log byte caps. Defaults suit embeddable single-node.
+/// Row / edge / log byte / query resource caps. Defaults suit embeddable single-node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Quotas {
     pub max_rows: usize,
     pub max_edges: usize,
     pub max_log_bytes: u64,
+    pub max_query_bytes: usize,
+    pub max_ast_depth: usize,
+    pub max_ast_bytes: usize,
+    pub max_output_bytes: usize,
+    pub max_execution_work: usize,
 }
 
 impl Default for Quotas {
@@ -869,6 +874,11 @@ impl Default for Quotas {
             max_rows: 10_000_000,
             max_edges: 10_000_000,
             max_log_bytes: 512 * 1024 * 1024,
+            max_query_bytes: 16 * 1024 * 1024,
+            max_ast_depth: 128,
+            max_ast_bytes: 8 * 1024 * 1024,
+            max_output_bytes: 256 * 1024 * 1024,
+            max_execution_work: 50_000_000,
         }
     }
 }
@@ -1454,7 +1464,18 @@ impl Db {
     }
 
     fn prepare_uncached(&self, src: &str) -> Result<Prepared, Error> {
-        let stmts = parse::parse_program(src)?;
+        if src.len() > self.quotas.max_query_bytes {
+            return Err(Error::new(format!(
+                "query length {} exceeds max_query_bytes quota {}",
+                src.len(),
+                self.quotas.max_query_bytes
+            )));
+        }
+        let stmts = parse::parse_program_with_limits(
+            src,
+            self.quotas.max_query_bytes,
+            self.quotas.max_ast_depth,
+        )?;
         let mut prepared = self.prepare_stmts(stmts)?;
         prepared.src = src.to_string();
         Ok(prepared)
@@ -1462,6 +1483,13 @@ impl Db {
 
     /// Typecheck + plan a program already parsed as AST (no string cache).
     pub fn prepare_stmts(&self, stmts: Vec<Stmt>) -> Result<Prepared, Error> {
+        let ast_bytes = crate::ast::estimate_ast_bytes(&stmts);
+        if ast_bytes > self.quotas.max_ast_bytes {
+            return Err(Error::new(format!(
+                "prepared AST size {} exceeds max_ast_bytes quota {}",
+                ast_bytes, self.quotas.max_ast_bytes
+            )));
+        }
         let (_, staged) = check::check_program(&stmts, &self.catalog)?;
         let plan_cat = staged.as_ref().unwrap_or(&self.catalog);
         let plan = Arc::new(plan::plan_program(&stmts, plan_cat)?);
@@ -1677,6 +1705,16 @@ impl Db {
             self.plan_cache.clear();
             self.query_cache.clear();
         }
+        let out_bytes = rows
+            .iter()
+            .map(|r| crate::store::row_byte_size(r))
+            .sum::<usize>();
+        if out_bytes > self.quotas.max_output_bytes {
+            return Err(Error::runtime(format!(
+                "query output bytes {} exceeds max_output_bytes quota {}",
+                out_bytes, self.quotas.max_output_bytes
+            )));
+        }
         Ok(Handle {
             plan: prepared.plan.clone(),
             rows,
@@ -1803,6 +1841,16 @@ impl Db {
         let t0 = Instant::now();
         let (rows, message, pack) = self.exec_program_readonly(&prepared.stmts)?;
         debug_assert!(pack.is_none());
+        let out_bytes = rows
+            .iter()
+            .map(|r| crate::store::row_byte_size(r))
+            .sum::<usize>();
+        if out_bytes > self.quotas.max_output_bytes {
+            return Err(Error::runtime(format!(
+                "query output bytes {} exceeds max_output_bytes quota {}",
+                out_bytes, self.quotas.max_output_bytes
+            )));
+        }
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
         let n = rows.len();
         Ok(Handle {
@@ -2664,6 +2712,13 @@ impl Db {
                     let covered = crate::index::index_covers_pred(pred, &uses);
                     self.fetch_idxs_filtered(name, &idxs, pred, now, project_fields_step, covered)
                 } else if let Some(pred) = first_filter {
+                    let col_len = self.store.collection(name).len();
+                    if col_len > self.quotas.max_execution_work {
+                        return Err(Error::runtime(format!(
+                            "query execution work {} exceeds max_execution_work quota {}",
+                            col_len, self.quotas.max_execution_work
+                        )));
+                    }
                     self.filter_scan(name, pred, now, project_fields_step)
                 } else if let Some(fields) = project_fields_step {
                     self.scan_projected(name, fields, scan_limit)
@@ -2680,7 +2735,22 @@ impl Db {
         let mut skip_first_project = project_fields_step.is_some()
             && matches!(&q.source, Source::Collection(n) if bindings.get(n).is_none());
 
+        let mut work = rows.len();
+        if work > self.quotas.max_execution_work {
+            return Err(Error::runtime(format!(
+                "query execution work {} exceeds max_execution_work quota {}",
+                work, self.quotas.max_execution_work
+            )));
+        }
+
         for (step_idx, step) in q.steps.iter().enumerate() {
+            work = work.saturating_add(rows.len());
+            if work > self.quotas.max_execution_work {
+                return Err(Error::runtime(format!(
+                    "query execution work {} exceeds max_execution_work quota {}",
+                    work, self.quotas.max_execution_work
+                )));
+            }
             match step {
                 Step::Filter(pred) => {
                     if skip_first_filter {
@@ -6414,6 +6484,53 @@ fn field_cell<'a>(row: &'a Row, field: &Field) -> &'a Cell {
 }
 
 #[inline]
+fn int_eq_f64(i: i64, f: f64) -> bool {
+    if !f.is_finite() || f.fract() != 0.0 {
+        return false;
+    }
+    if f < -9223372036854775808.0 || f >= 9223372036854775808.0 {
+        return false;
+    }
+    let fi = f as i64;
+    (fi as f64 == f) && (i == fi)
+}
+
+#[inline]
+fn cmp_i64_f64(i: i64, f: f64) -> Option<std::cmp::Ordering> {
+    if f.is_nan() {
+        return None;
+    }
+    if f.is_infinite() {
+        return if f.is_sign_positive() {
+            Some(std::cmp::Ordering::Less)
+        } else {
+            Some(std::cmp::Ordering::Greater)
+        };
+    }
+    if f < -9223372036854775808.0 {
+        return Some(std::cmp::Ordering::Greater);
+    }
+    if f >= 9223372036854775808.0 {
+        return Some(std::cmp::Ordering::Less);
+    }
+    let fi = f as i64;
+    let f_back = fi as f64;
+    if f_back == f {
+        Some(i.cmp(&fi))
+    } else if f > f_back {
+        if i <= fi {
+            Some(std::cmp::Ordering::Less)
+        } else {
+            Some(std::cmp::Ordering::Greater)
+        }
+    } else if i >= fi {
+        Some(std::cmp::Ordering::Greater)
+    } else {
+        Some(std::cmp::Ordering::Less)
+    }
+}
+
+#[inline]
 fn cell_eq_val(left: &Cell, value: &Value, now: i64) -> bool {
     match (left, value) {
         (Cell::Text(x), Value::String(y)) => x.as_ref() == y.as_ref(),
@@ -6422,28 +6539,21 @@ fn cell_eq_val(left: &Cell, value: &Value, now: i64) -> bool {
         (Cell::SmallText(x), Value::Name(y)) => x.as_str() == y.as_str(),
         (Cell::Bool(x), Value::Bool(y)) => *x == *y,
         (Cell::Int(x), Value::Int(y)) => *x == *y,
-        (Cell::Float(x), Value::Float(y)) => *x == *y,
-        (Cell::Int(x), Value::Float(y)) => *x as f64 == *y,
-        (Cell::Float(x), Value::Int(y)) => *x == *y as f64,
+        (Cell::Float(x), Value::Float(y)) => {
+            if x.is_nan() || y.is_nan() {
+                false
+            } else {
+                *x == *y
+            }
+        }
+        (Cell::Int(x), Value::Float(y)) => int_eq_f64(*x, *y),
+        (Cell::Float(x), Value::Int(y)) => int_eq_f64(*y, *x),
         (Cell::Time(x), Value::Timestamp(y)) => *x == *y,
         (Cell::Time(x), Value::Now) => *x == now,
         (Cell::Time(x), Value::NowMinus(d)) => *x == now - d.as_millis(),
         (Cell::Int(x), Value::Duration(d)) => *x == d.as_millis(),
-        (Cell::Float(x), Value::Duration(d)) => *x == d.as_millis() as f64,
+        (Cell::Float(x), Value::Duration(d)) => int_eq_f64(d.as_millis(), *x),
         _ => false,
-    }
-}
-
-#[inline]
-fn value_as_f64(v: &Value, now: i64) -> Option<f64> {
-    match v {
-        Value::Int(n) => Some(*n as f64),
-        Value::Float(n) => Some(*n),
-        Value::Timestamp(millis) => Some(*millis as f64),
-        Value::Now => Some(now as f64),
-        Value::NowMinus(d) => Some((now - d.as_millis()) as f64),
-        Value::Duration(d) => Some(d.as_millis() as f64),
-        _ => None,
     }
 }
 
@@ -6452,17 +6562,32 @@ fn cmp_cell(left: &Cell, value: &Value, op: CmpOp, now: i64) -> bool {
         CmpOp::Eq => cell_eq_val(left, value, now),
         CmpOp::Ne => !cell_eq_val(left, value, now),
         CmpOp::Gt | CmpOp::Lt | CmpOp::Ge | CmpOp::Le => {
-            let Some(l) = left.as_f64() else {
-                return false;
+            let ord = match (left, value) {
+                (Cell::Int(l), Value::Int(r)) => Some(l.cmp(r)),
+                (Cell::Time(l), Value::Timestamp(r)) => Some(l.cmp(r)),
+                (Cell::Time(l), Value::Now) => Some(l.cmp(&now)),
+                (Cell::Time(l), Value::NowMinus(d)) => Some(l.cmp(&(now - d.as_millis()))),
+                (Cell::Int(l), Value::Duration(d)) => Some(l.cmp(&d.as_millis())),
+                (Cell::Float(l), Value::Float(r)) => l.partial_cmp(r),
+                (Cell::Int(l), Value::Float(r)) => cmp_i64_f64(*l, *r),
+                (Cell::Float(l), Value::Int(r)) => cmp_i64_f64(*r, *l).map(|o| o.reverse()),
+                (Cell::Float(l), Value::Duration(d)) => {
+                    cmp_i64_f64(d.as_millis(), *l).map(|o| o.reverse())
+                }
+                (Cell::Text(l), Value::String(r)) => Some(l.as_ref().cmp(r.as_ref())),
+                (Cell::Text(l), Value::Name(r)) => Some(l.as_ref().cmp(r.as_str())),
+                (Cell::SmallText(l), Value::String(r)) => Some(l.as_str().cmp(r.as_ref())),
+                (Cell::SmallText(l), Value::Name(r)) => Some(l.as_str().cmp(r.as_str())),
+                _ => None,
             };
-            let Some(r) = value_as_f64(value, now) else {
+            let Some(ord) = ord else {
                 return false;
             };
             match op {
-                CmpOp::Gt => l > r,
-                CmpOp::Lt => l < r,
-                CmpOp::Ge => l >= r,
-                CmpOp::Le => l <= r,
+                CmpOp::Gt => ord == std::cmp::Ordering::Greater,
+                CmpOp::Lt => ord == std::cmp::Ordering::Less,
+                CmpOp::Ge => ord != std::cmp::Ordering::Less,
+                CmpOp::Le => ord != std::cmp::Ordering::Greater,
                 _ => false,
             }
         }

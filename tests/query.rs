@@ -508,7 +508,10 @@ fn lazy_search_vec_cursor() {
         .take(3)
         .cursor(&db)
         .unwrap();
-    assert!(cur_proj.is_lazy(), "search vec with projection should be lazy");
+    assert!(
+        cur_proj.is_lazy(),
+        "search vec with projection should be lazy"
+    );
     let p1 = cur_proj.next_projected().unwrap().unwrap();
     assert_eq!(p1.fields(), &["id", "title"]);
     assert!(p1.get("title").is_some());
@@ -761,7 +764,11 @@ fn cursor_preserves_unindexed_conjunct_and_or_branches_when_using_index() {
     let q = Queryable::from("docs")
         .filter(r#"wing == "rag" and layer == "wiki""#)
         .take_all();
-    let cur_rows: Vec<_> = q.cursor(&db).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+    let cur_rows: Vec<_> = q
+        .cursor(&db)
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
     assert_eq!(cur_rows.len(), 1);
     assert_eq!(cur_rows[0]["id"].text(), Some("m1"));
 
@@ -803,13 +810,22 @@ fn test_predicate_simplification_and_scan_projection() {
     let mut db = Db::fixture();
 
     // 1. Direct point-get via simplified in-list: `id in ["d-wal"]` simplifies to `id == "d-wal"`
-    let rows = db.run(r#"docs | id in ["d-wal"] | { id, title } | take 1"#).unwrap().rows;
+    let rows = db
+        .run(r#"docs | id in ["d-wal"] | { id, title } | take 1"#)
+        .unwrap()
+        .rows;
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["id"].text(), Some("d-wal"));
 
     // 2. Simplified inverted comparison: `not (total > 50.0)` -> `total <= 50.0`
-    let rows_not = db.run(r#"orders | not (total > 50.0) | { id } | take all"#).unwrap().rows;
-    let rows_le = db.run(r#"orders | total <= 50.0 | { id } | take all"#).unwrap().rows;
+    let rows_not = db
+        .run(r#"orders | not (total > 50.0) | { id } | take all"#)
+        .unwrap()
+        .rows;
+    let rows_le = db
+        .run(r#"orders | total <= 50.0 | { id } | take all"#)
+        .unwrap()
+        .rows;
     assert_eq!(rows_not, rows_le);
 
     // 3. Fast scan limit + scan_projected: without filter, scanning projected columns with limit
@@ -823,19 +839,26 @@ fn test_predicate_simplification_and_scan_projection() {
     let p_double_not = lin::Pred::Not(Box::new(lin::Pred::Not(Box::new(lin::Pred::IsNull {
         field: lin::Field::name("x"),
         negated: false,
-    })))).simplify();
-    assert_eq!(p_double_not, lin::Pred::IsNull {
-        field: lin::Field::name("x"),
-        negated: false,
-    });
+    }))))
+    .simplify();
+    assert_eq!(
+        p_double_not,
+        lin::Pred::IsNull {
+            field: lin::Field::name("x"),
+            negated: false,
+        }
+    );
 
     let p_not_null = lin::Pred::Not(Box::new(lin::Pred::IsNull {
         field: lin::Field::name("x"),
         negated: false,
-    })).simplify();
-    assert_eq!(p_not_null, lin::Pred::IsNull {
-        field: lin::Field::name("x"),
-        negated: true,
-    });
+    }))
+    .simplify();
+    assert_eq!(
+        p_not_null,
+        lin::Pred::IsNull {
+            field: lin::Field::name("x"),
+            negated: true,
+        }
+    );
 }
-

@@ -1,8 +1,26 @@
 use crate::ast::*;
 use crate::error::Error;
 
+pub const DEFAULT_MAX_QUERY_BYTES: usize = 16 * 1024 * 1024;
+pub const DEFAULT_MAX_AST_DEPTH: usize = 128;
+
 pub fn parse_pred_src(src: &str) -> Result<Pred, Error> {
-    let mut p = Parser::new(src);
+    parse_pred_src_with_limits(src, DEFAULT_MAX_QUERY_BYTES, DEFAULT_MAX_AST_DEPTH)
+}
+
+pub fn parse_pred_src_with_limits(
+    src: &str,
+    max_bytes: usize,
+    max_depth: usize,
+) -> Result<Pred, Error> {
+    if src.len() > max_bytes {
+        return Err(Error::new(format!(
+            "query length {} exceeds maximum allowed {} bytes",
+            src.len(),
+            max_bytes
+        )));
+    }
+    let mut p = Parser::new_with_limits(src, max_depth);
     p.skip();
     let pred = p.parse_pred()?;
     p.skip();
@@ -13,7 +31,18 @@ pub fn parse_pred_src(src: &str) -> Result<Pred, Error> {
 }
 
 pub fn parse(src: &str) -> Result<Stmt, Error> {
-    let mut p = Parser::new(src);
+    parse_with_limits(src, DEFAULT_MAX_QUERY_BYTES, DEFAULT_MAX_AST_DEPTH)
+}
+
+pub fn parse_with_limits(src: &str, max_bytes: usize, max_depth: usize) -> Result<Stmt, Error> {
+    if src.len() > max_bytes {
+        return Err(Error::new(format!(
+            "query length {} exceeds maximum allowed {} bytes",
+            src.len(),
+            max_bytes
+        )));
+    }
+    let mut p = Parser::new_with_limits(src, max_depth);
     p.skip();
     let stmt = p.parse_stmt()?;
     p.skip();
@@ -24,7 +53,22 @@ pub fn parse(src: &str) -> Result<Stmt, Error> {
 }
 
 pub fn parse_program(src: &str) -> Result<Vec<Stmt>, Error> {
-    let mut p = Parser::new(src);
+    parse_program_with_limits(src, DEFAULT_MAX_QUERY_BYTES, DEFAULT_MAX_AST_DEPTH)
+}
+
+pub fn parse_program_with_limits(
+    src: &str,
+    max_bytes: usize,
+    max_depth: usize,
+) -> Result<Vec<Stmt>, Error> {
+    if src.len() > max_bytes {
+        return Err(Error::new(format!(
+            "query length {} exceeds maximum allowed {} bytes",
+            src.len(),
+            max_bytes
+        )));
+    }
+    let mut p = Parser::new_with_limits(src, max_depth);
     let mut stmts = Vec::new();
     loop {
         p.skip();
@@ -42,11 +86,42 @@ pub fn parse_program(src: &str) -> Result<Vec<Stmt>, Error> {
 struct Parser<'a> {
     src: &'a str,
     pos: usize,
+    depth: usize,
+    max_depth: usize,
 }
 
 impl<'a> Parser<'a> {
+    #[allow(dead_code)]
     fn new(src: &'a str) -> Self {
-        Self { src, pos: 0 }
+        Self::new_with_limits(src, DEFAULT_MAX_AST_DEPTH)
+    }
+
+    fn new_with_limits(src: &'a str, max_depth: usize) -> Self {
+        Self {
+            src,
+            pos: 0,
+            depth: 0,
+            max_depth,
+        }
+    }
+
+    #[inline]
+    fn enter_depth(&mut self) -> Result<(), Error> {
+        self.depth += 1;
+        if self.depth > self.max_depth {
+            return Err(self.err(format!(
+                "AST recursion depth limit exceeded (max {})",
+                self.max_depth
+            )));
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn leave_depth(&mut self) {
+        if self.depth > 0 {
+            self.depth -= 1;
+        }
     }
 
     fn eof(&self) -> bool {
@@ -241,6 +316,13 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_stmt(&mut self) -> Result<Stmt, Error> {
+        self.enter_depth()?;
+        let res = self.parse_stmt_inner();
+        self.leave_depth();
+        res
+    }
+
+    fn parse_stmt_inner(&mut self) -> Result<Stmt, Error> {
         self.skip();
         if self.eat_kw("let") {
             return self.parse_let();
@@ -327,6 +409,13 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_query(&mut self) -> Result<Query, Error> {
+        self.enter_depth()?;
+        let res = self.parse_query_inner();
+        self.leave_depth();
+        res
+    }
+
+    fn parse_query_inner(&mut self) -> Result<Query, Error> {
         let source = self.parse_source()?;
         let ignore_filter = self.eat_kw("all");
         let mut steps = Vec::new();
@@ -986,16 +1075,21 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_unary_pred(&mut self) -> Result<Pred, Error> {
-        if self.eat_kw("not") {
-            let p = self.parse_unary_pred()?;
-            return Ok(Pred::Not(Box::new(p)));
-        }
-        if self.eat_char('(') {
-            let p = self.parse_pred()?;
-            self.expect_char(')')?;
-            return Ok(p);
-        }
-        self.parse_cmp()
+        self.enter_depth()?;
+        let res = (|| {
+            if self.eat_kw("not") {
+                let p = self.parse_unary_pred()?;
+                return Ok(Pred::Not(Box::new(p)));
+            }
+            if self.eat_char('(') {
+                let p = self.parse_pred()?;
+                self.expect_char(')')?;
+                return Ok(p);
+            }
+            self.parse_cmp()
+        })();
+        self.leave_depth();
+        res
     }
 
     fn parse_cmp(&mut self) -> Result<Pred, Error> {

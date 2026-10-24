@@ -260,12 +260,14 @@ fn l2_normalize(v: &mut [f32]) {
 }
 
 /// Cosine similarity for L2-normalized (or arbitrary) vectors.
+///
+/// Returns 0.0 for mismatched dimensions, zero norms, or non-finite inputs (NaN, ±inf).
 #[inline]
 pub fn cosine(a: &[f32], b: &[f32]) -> f64 {
-    let n = a.len().min(b.len());
-    if n == 0 {
+    if a.len() != b.len() || a.is_empty() {
         return 0.0;
     }
+    let n = a.len();
     let chunks = n / 4;
     let mut dot0 = 0.0f64;
     let mut dot1 = 0.0f64;
@@ -322,10 +324,19 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f64 {
         nb += y * y;
     }
 
-    if na <= 1e-18 || nb <= 1e-18 {
+    if !dot.is_finite() || !na.is_finite() || !nb.is_finite() || na <= 1e-18 || nb <= 1e-18 {
         return 0.0;
     }
-    (dot / (na.sqrt() * nb.sqrt())).clamp(-1.0, 1.0)
+    let denom = na.sqrt() * nb.sqrt();
+    if denom <= 1e-18 || !denom.is_finite() {
+        return 0.0;
+    }
+    let sim = dot / denom;
+    if sim.is_nan() {
+        0.0
+    } else {
+        sim.clamp(-1.0, 1.0)
+    }
 }
 
 /// Candidate in max-heap: highest similarity at the top (popped first).

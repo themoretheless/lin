@@ -1748,27 +1748,45 @@ fn new_aggregations_sum_min_max_avg_and_group_type_preservation() {
 
     // Ungrouped sum, min, max, avg
     assert_eq!(
-        db.run("items | sum val").unwrap().scalar_as::<f64>().unwrap(),
+        db.run("items | sum val")
+            .unwrap()
+            .scalar_as::<f64>()
+            .unwrap(),
         90.0
     );
     assert_eq!(
-        db.run("items | min val").unwrap().scalar_as::<f64>().unwrap(),
+        db.run("items | min val")
+            .unwrap()
+            .scalar_as::<f64>()
+            .unwrap(),
         10.0
     );
     assert_eq!(
-        db.run("items | max val").unwrap().scalar_as::<f64>().unwrap(),
+        db.run("items | max val")
+            .unwrap()
+            .scalar_as::<f64>()
+            .unwrap(),
         50.0
     );
     assert_eq!(
-        db.run("items | avg val").unwrap().scalar_as::<f64>().unwrap(),
+        db.run("items | avg val")
+            .unwrap()
+            .scalar_as::<f64>()
+            .unwrap(),
         30.0
     );
     assert_eq!(
-        db.run("items | min label").unwrap().scalar_as::<String>().unwrap(),
+        db.run("items | min label")
+            .unwrap()
+            .scalar_as::<String>()
+            .unwrap(),
         "a"
     );
     assert_eq!(
-        db.run("items | max label").unwrap().scalar_as::<String>().unwrap(),
+        db.run("items | max label")
+            .unwrap()
+            .scalar_as::<String>()
+            .unwrap(),
         "c"
     );
 
@@ -1818,9 +1836,7 @@ fn new_predicates_not_is_null_in_list_and_has_ci() {
     assert_eq!(ids(&in_h), vec!["t1", "t2"]);
 
     // `is null` and `is not null`
-    let null_h = db
-        .run("tasks | tag is null | { id } | take all")
-        .unwrap();
+    let null_h = db.run("tasks | tag is null | { id } | take all").unwrap();
     assert_eq!(ids(&null_h), vec!["t3"]);
 
     let not_null_h = db
@@ -1884,8 +1900,10 @@ fn facts_rollback_and_delete_col_count_and_guard_enforcement() {
     db.run(r#"update docs[id == "c1"] cas "" { body: "updated wiki body", layer: "wiki" }"#)
         .unwrap();
     // 3. Runtime guard check: if the existing row has `layer == "raw"`, updating `body` fails even if update sets `layer: "wiki"`
-    db.run(r#"insert docs { id: "raw1", uri: "c://raw1", title: "Raw", body: "orig", layer: "raw" }"#)
-        .unwrap();
+    db.run(
+        r#"insert docs { id: "raw1", uri: "c://raw1", title: "Raw", body: "orig", layer: "raw" }"#,
+    )
+    .unwrap();
     assert!(
         db.run(r#"update docs[id == "raw1"] cas "" { body: "tamper", layer: "wiki" }"#)
             .is_err()
@@ -1965,7 +1983,11 @@ fn test_window_functions_analytical_queries() {
         .run("emp | window rank by dept sort salary desc as rnk | rnk == 1 | pick { name, dept, salary }")
         .unwrap();
     assert_eq!(h6.rows.len(), 2);
-    let names: Vec<String> = h6.rows.iter().map(|r| r.get("name").unwrap().text().unwrap().to_string()).collect();
+    let names: Vec<String> = h6
+        .rows
+        .iter()
+        .map(|r| r.get("name").unwrap().text().unwrap().to_string())
+        .collect();
     assert!(names.contains(&"Alice".to_string()));
     assert!(names.contains(&"Eve".to_string()));
 
@@ -1993,10 +2015,22 @@ fn test_window_functions_analytical_queries() {
         .run("emp | dept == \"Eng\" | window avg salary sort salary asc rows between 1 preceding and current row as rolling_avg | pick { name, rolling_avg }")
         .unwrap();
     assert_eq!(h9.rows.len(), 4);
-    assert_eq!(h9.rows[0].get("rolling_avg").unwrap(), &lin::Cell::Float(80.0));
-    assert_eq!(h9.rows[1].get("rolling_avg").unwrap(), &lin::Cell::Float(85.0)); // (80 + 90) / 2
-    assert_eq!(h9.rows[2].get("rolling_avg").unwrap(), &lin::Cell::Float(90.0)); // (90 + 90) / 2
-    assert_eq!(h9.rows[3].get("rolling_avg").unwrap(), &lin::Cell::Float(95.0)); // (90 + 100) / 2
+    assert_eq!(
+        h9.rows[0].get("rolling_avg").unwrap(),
+        &lin::Cell::Float(80.0)
+    );
+    assert_eq!(
+        h9.rows[1].get("rolling_avg").unwrap(),
+        &lin::Cell::Float(85.0)
+    ); // (80 + 90) / 2
+    assert_eq!(
+        h9.rows[2].get("rolling_avg").unwrap(),
+        &lin::Cell::Float(90.0)
+    ); // (90 + 90) / 2
+    assert_eq!(
+        h9.rows[3].get("rolling_avg").unwrap(),
+        &lin::Cell::Float(95.0)
+    ); // (90 + 100) / 2
 
     // 10. Multi-column sort in window function
     let h10 = db
@@ -2059,12 +2093,18 @@ fn test_window_multi_column_partition_and_fts_wildcard_prefix() {
     let fts_res = fixture_db
         .run(r#"docs | search lex "wal*" | take 5"#)
         .unwrap();
-    assert!(!fts_res.rows.is_empty(), "FTS prefix search should match wal* entries");
+    assert!(
+        !fts_res.rows.is_empty(),
+        "FTS prefix search should match wal* entries"
+    );
     for row in &fts_res.rows {
         let body = row.get("body").and_then(|c| c.text()).unwrap_or("");
         let title = row.get("title").and_then(|c| c.text()).unwrap_or("");
         let lower = format!("{title} {body}").to_lowercase();
-        assert!(lower.contains("wal"), "Row must contain prefix 'wal': {lower}");
+        assert!(
+            lower.contains("wal"),
+            "Row must contain prefix 'wal': {lower}"
+        );
     }
 }
 
@@ -2089,7 +2129,10 @@ fn test_vector_search_top_k_shortcut_and_asymmetric_join() {
         .run(r#"docs | search vec "critical fast path" | { uri, title } | take 3"#)
         .unwrap();
     assert_eq!(res.rows.len(), 3);
-    assert_eq!(res.rows[0].get("uri").unwrap().text().unwrap(), "raw://topk/7");
+    assert_eq!(
+        res.rows[0].get("uri").unwrap().text().unwrap(),
+        "raw://topk/7"
+    );
     assert_eq!(
         res.rows[0].get("title").unwrap().text().unwrap(),
         "critical fast path target query"
@@ -2105,8 +2148,10 @@ fn test_vector_search_top_k_shortcut_and_asymmetric_join() {
     }
 
     // Insert 3 orders (small left side)
-    db.run(r#"insert orders { id: "o1", user_id: "u5", total: 100 }"#).unwrap();
-    db.run(r#"insert orders { id: "o2", user_id: "u42", total: 200 }"#).unwrap();
+    db.run(r#"insert orders { id: "o1", user_id: "u5", total: 100 }"#)
+        .unwrap();
+    db.run(r#"insert orders { id: "o2", user_id: "u42", total: 200 }"#)
+        .unwrap();
     db.run(r#"insert orders { id: "o3", total: 300 }"#).unwrap(); // omitted user_id is null
 
     // Inner join: null dropped, u5 and u42 resolved
@@ -2127,7 +2172,3 @@ fn test_vector_search_top_k_shortcut_and_asymmetric_join() {
         .unwrap();
     assert_eq!(left.rows.len(), 3);
 }
-
-
-
-
