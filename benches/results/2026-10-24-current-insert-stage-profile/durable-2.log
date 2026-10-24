@@ -1,0 +1,94 @@
+skip postgres: no reachable server
+  tried: postgresql://lin:lin@127.0.0.1:55432/lin (error connecting to server); postgresql://postgres@127.0.0.1:5432/postgres (error connecting to server)
+  set LIN_BENCH_PG_URL or:
+  docker compose -f docker-compose.bench.yml up -d postgres
+  # brew postgresql@17 via Sources/ppduster macos-stack-postgres; start service for :5432
+skip mysql: LIN_BENCH_SKIP_MYSQL is set
+lin compare: N=10000 warm reads (fixture), bulk insert (schema outside timing)
+engines: Lin | SQLite(rusqlite bundled) | DuckDB(bundled) | HashMap(point get only) | Postgres(skipped) | MySQL(skipped)
+airbug dash: http://127.0.0.1:8790/
+Lin reads: prepare once / run many; filters use count (fair vs SQL COUNT(*));
+substring: Lin `title ~ "wal" | count` vs SQL LIKE '%wal%' COUNT(*);
+materialize: Lin `wing==rag | {id,title} | take all` vs SQL SELECT id,title;
+join: 10000 orders ⋈ 1000 users (Lin run_batch SoA / cursor vs SQL INNER JOIN);
+append_log: Lin `append facts` vs SQL INSERT INTO logs (append-only shape)
+airbug dash: http://127.0.0.1:8790/#/bench
+bench: compare/durable_insert_1k/lin — validating and calibrating
+INSERT_PHASE rows=1000 build_ns=175250 checks_ns=160542 embed_ns=439084 index_ns=120666 fts_ns=151208 hnsw_ns=0 maps_ns=41041
+INSERT_PHASE rows=1000 build_ns=150833 checks_ns=111958 embed_ns=286292 index_ns=92208 fts_ns=143042 hnsw_ns=0 maps_ns=37792
+bench: compare/durable_insert_1k/lin — measuring 24 samples
+INSERT_PHASE rows=1000 build_ns=147792 checks_ns=98083 embed_ns=300625 index_ns=95667 fts_ns=146542 hnsw_ns=125 maps_ns=39875
+INSERT_PHASE rows=1000 build_ns=151041 checks_ns=104500 embed_ns=294292 index_ns=103833 fts_ns=149292 hnsw_ns=0 maps_ns=41542
+INSERT_PHASE rows=1000 build_ns=169792 checks_ns=113584 embed_ns=295041 index_ns=108667 fts_ns=160875 hnsw_ns=42 maps_ns=44708
+INSERT_PHASE rows=1000 build_ns=161166 checks_ns=110292 embed_ns=300500 index_ns=111000 fts_ns=159000 hnsw_ns=0 maps_ns=51583
+INSERT_PHASE rows=1000 build_ns=185959 checks_ns=117459 embed_ns=345959 index_ns=109042 fts_ns=173416 hnsw_ns=42 maps_ns=46333
+INSERT_PHASE rows=1000 build_ns=182125 checks_ns=111083 embed_ns=315333 index_ns=112542 fts_ns=167958 hnsw_ns=0 maps_ns=44667
+INSERT_PHASE rows=1000 build_ns=181291 checks_ns=122833 embed_ns=324375 index_ns=119667 fts_ns=170500 hnsw_ns=0 maps_ns=46417
+INSERT_PHASE rows=1000 build_ns=192042 checks_ns=135625 embed_ns=335500 index_ns=119416 fts_ns=166833 hnsw_ns=42 maps_ns=45291
+INSERT_PHASE rows=1000 build_ns=181875 checks_ns=123208 embed_ns=351000 index_ns=120750 fts_ns=177458 hnsw_ns=0 maps_ns=50625
+INSERT_PHASE rows=1000 build_ns=187542 checks_ns=134625 embed_ns=352125 index_ns=123625 fts_ns=177041 hnsw_ns=0 maps_ns=49291
+INSERT_PHASE rows=1000 build_ns=189708 checks_ns=137208 embed_ns=358708 index_ns=118708 fts_ns=177708 hnsw_ns=42 maps_ns=49500
+INSERT_PHASE rows=1000 build_ns=207458 checks_ns=144666 embed_ns=391125 index_ns=139458 fts_ns=181708 hnsw_ns=41 maps_ns=50375
+INSERT_PHASE rows=1000 build_ns=204125 checks_ns=134125 embed_ns=395791 index_ns=132083 fts_ns=196125 hnsw_ns=42 maps_ns=53792
+INSERT_PHASE rows=1000 build_ns=199583 checks_ns=141792 embed_ns=401875 index_ns=134500 fts_ns=195167 hnsw_ns=42 maps_ns=52041
+INSERT_PHASE rows=1000 build_ns=205833 checks_ns=146041 embed_ns=407500 index_ns=137458 fts_ns=192916 hnsw_ns=125 maps_ns=52416
+INSERT_PHASE rows=1000 build_ns=192541 checks_ns=133917 embed_ns=390584 index_ns=129042 fts_ns=176209 hnsw_ns=0 maps_ns=48000
+INSERT_PHASE rows=1000 build_ns=204375 checks_ns=142209 embed_ns=411834 index_ns=136458 fts_ns=193291 hnsw_ns=42 maps_ns=53500
+INSERT_PHASE rows=1000 build_ns=205041 checks_ns=138083 embed_ns=411084 index_ns=133958 fts_ns=195958 hnsw_ns=42 maps_ns=51750
+INSERT_PHASE rows=1000 build_ns=204500 checks_ns=133542 embed_ns=396875 index_ns=132875 fts_ns=187834 hnsw_ns=0 maps_ns=51750
+INSERT_PHASE rows=1000 build_ns=202500 checks_ns=134500 embed_ns=399875 index_ns=133625 fts_ns=191833 hnsw_ns=0 maps_ns=56000
+INSERT_PHASE rows=1000 build_ns=197625 checks_ns=135042 embed_ns=426708 index_ns=132291 fts_ns=190375 hnsw_ns=166 maps_ns=54292
+INSERT_PHASE rows=1000 build_ns=223708 checks_ns=141125 embed_ns=428834 index_ns=142042 fts_ns=189291 hnsw_ns=0 maps_ns=51625
+INSERT_PHASE rows=1000 build_ns=197792 checks_ns=125709 embed_ns=435750 index_ns=133042 fts_ns=189208 hnsw_ns=41 maps_ns=52542
+INSERT_PHASE rows=1000 build_ns=178834 checks_ns=149916 embed_ns=464667 index_ns=127542 fts_ns=170334 hnsw_ns=0 maps_ns=46375
+INSERT_PHASE rows=1000 build_ns=152833 checks_ns=123167 embed_ns=400000 index_ns=117167 fts_ns=151166 hnsw_ns=0 maps_ns=42375
+bench: compare/durable_insert_10k/lin — validating and calibrating
+INSERT_PHASE rows=10000 build_ns=1482958 checks_ns=1122458 embed_ns=5060541 index_ns=1091125 fts_ns=1487167 hnsw_ns=42 maps_ns=591916
+INSERT_PHASE rows=10000 build_ns=1508750 checks_ns=1186625 embed_ns=5609666 index_ns=1115292 fts_ns=1459583 hnsw_ns=83 maps_ns=551667
+bench: compare/durable_insert_10k/lin — measuring 24 samples
+INSERT_PHASE rows=10000 build_ns=1105833 checks_ns=991167 embed_ns=2873458 index_ns=925917 fts_ns=1351291 hnsw_ns=0 maps_ns=491208
+INSERT_PHASE rows=10000 build_ns=1101458 checks_ns=1025750 embed_ns=2918416 index_ns=885500 fts_ns=1344875 hnsw_ns=41 maps_ns=488292
+INSERT_PHASE rows=10000 build_ns=1082000 checks_ns=1024000 embed_ns=2813208 index_ns=959375 fts_ns=1363541 hnsw_ns=42 maps_ns=527042
+INSERT_PHASE rows=10000 build_ns=1113583 checks_ns=1049375 embed_ns=2871750 index_ns=923750 fts_ns=1330250 hnsw_ns=42 maps_ns=509417
+INSERT_PHASE rows=10000 build_ns=1121750 checks_ns=975250 embed_ns=2918000 index_ns=900334 fts_ns=1298209 hnsw_ns=0 maps_ns=480333
+INSERT_PHASE rows=10000 build_ns=1164000 checks_ns=1115542 embed_ns=2898917 index_ns=942042 fts_ns=1347625 hnsw_ns=0 maps_ns=488959
+INSERT_PHASE rows=10000 build_ns=1098584 checks_ns=1003209 embed_ns=2950875 index_ns=935583 fts_ns=1335666 hnsw_ns=84 maps_ns=535041
+INSERT_PHASE rows=10000 build_ns=1071125 checks_ns=1004709 embed_ns=2784042 index_ns=913834 fts_ns=1314625 hnsw_ns=41 maps_ns=522709
+INSERT_PHASE rows=10000 build_ns=1096167 checks_ns=986542 embed_ns=2811083 index_ns=919459 fts_ns=1319334 hnsw_ns=0 maps_ns=489417
+INSERT_PHASE rows=10000 build_ns=1081125 checks_ns=1030291 embed_ns=2852042 index_ns=945958 fts_ns=1391834 hnsw_ns=42 maps_ns=506292
+INSERT_PHASE rows=10000 build_ns=1092667 checks_ns=1012792 embed_ns=2843334 index_ns=913125 fts_ns=1293000 hnsw_ns=0 maps_ns=496875
+INSERT_PHASE rows=10000 build_ns=1130292 checks_ns=983917 embed_ns=2956459 index_ns=1056959 fts_ns=1363000 hnsw_ns=42 maps_ns=491458
+INSERT_PHASE rows=10000 build_ns=1078667 checks_ns=965833 embed_ns=2791875 index_ns=915791 fts_ns=1327542 hnsw_ns=0 maps_ns=500375
+INSERT_PHASE rows=10000 build_ns=1116209 checks_ns=1021541 embed_ns=2950708 index_ns=911209 fts_ns=1327417 hnsw_ns=166 maps_ns=484750
+INSERT_PHASE rows=10000 build_ns=1086792 checks_ns=1003583 embed_ns=2819500 index_ns=895500 fts_ns=1272083 hnsw_ns=42 maps_ns=488208
+INSERT_PHASE rows=10000 build_ns=1079334 checks_ns=975417 embed_ns=2843042 index_ns=888416 fts_ns=1327250 hnsw_ns=0 maps_ns=475500
+INSERT_PHASE rows=10000 build_ns=1085791 checks_ns=1020042 embed_ns=2907834 index_ns=911000 fts_ns=1271584 hnsw_ns=0 maps_ns=477750
+INSERT_PHASE rows=10000 build_ns=1068375 checks_ns=963417 embed_ns=2855500 index_ns=919208 fts_ns=1317250 hnsw_ns=0 maps_ns=489209
+INSERT_PHASE rows=10000 build_ns=1080167 checks_ns=975791 embed_ns=2798167 index_ns=911417 fts_ns=1297625 hnsw_ns=0 maps_ns=489000
+INSERT_PHASE rows=10000 build_ns=1068209 checks_ns=1013875 embed_ns=2843500 index_ns=879083 fts_ns=1340541 hnsw_ns=0 maps_ns=487250
+INSERT_PHASE rows=10000 build_ns=1086709 checks_ns=992042 embed_ns=2904542 index_ns=941542 fts_ns=1319708 hnsw_ns=42 maps_ns=482750
+INSERT_PHASE rows=10000 build_ns=1086916 checks_ns=971125 embed_ns=2784083 index_ns=902375 fts_ns=1310750 hnsw_ns=0 maps_ns=484958
+INSERT_PHASE rows=10000 build_ns=1099000 checks_ns=961667 embed_ns=2754834 index_ns=905542 fts_ns=1325416 hnsw_ns=42 maps_ns=486375
+INSERT_PHASE rows=10000 build_ns=1074750 checks_ns=972333 embed_ns=2977834 index_ns=954292 fts_ns=1315958 hnsw_ns=42 maps_ns=483500
+INSERT_PHASE rows=10000 build_ns=1078083 checks_ns=978417 embed_ns=2830125 index_ns=926083 fts_ns=1300542 hnsw_ns=0 maps_ns=486083
+# bench 1792815448044271000-28746
+
+Status: Complete
+
+| Case | Metric | Median | Unit | Scope / statistic | Observations | Processes |
+|---|---|---:|---|---|---:|---:|
+| compare/durable_insert_1k/lin [candidate] | wall | 2814875.0000 | ns | current thread wall clock; scheduler included / batch_total | 24 | 1 |
+| compare/durable_insert_10k/lin [candidate] | wall | 12663291.0000 | ns | current thread wall clock; scheduler included / batch_total | 24 | 1 |
+
+# Useful work throughput
+
+| Case | Median batch throughput | Unit |
+|---|---:|---|
+| compare/durable_insert_1k/lin [candidate] | 355264.2973 | rows/s |
+| compare/durable_insert_10k/lin [candidate] | 789686.1544 | rows/s |
+
+Derived from positive wall batches and declared units per operation; zero/unavailable durations omitted.
+
+Medians above summarize observations, not pooled operation-latency percentiles. Comparisons aggregate within each process first.
+
+- Raw batches are not independent process replications. Batch averages are not individual-operation latency. CPU frequency and background load are uncontrolled.
