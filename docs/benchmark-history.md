@@ -8,6 +8,8 @@
 
 ## Обновление 2026-10-24
 
+- [WAL CPU / index-FTS overlap feasibility](../benches/results/2026-10-24-wal-maintenance-overlap-cpu/report.md): первая 1k серия −53,5%, повтор +33,2%; сохранены. Новый matched A/A/C gate: 1k +34,3% /+27,6%, 6/6 в обеих сериях, A/A 0,46% /1,02%; 10k около +30%. Только CPU-композиция, без полного payload/write/sync. Transaction-прототип ещё не реализован; production не менялся.
+
 - [Empty indexed slab — исправление корректности](../benches/results/2026-10-24-empty-index-slab/report.md): настоящий rows[0] panic воспроизведён до правки. Пустой slab теперь no-op; 18 комбинаций состояния/коллекции/start, focused и workspace прошли. Новых измерений/peer-побед нет; это регрессия корректности, не ускорение.
 
 - [Spilled-only index key streaming — отклонено](../benches/results/2026-10-24-index-spilled-key-stream/report.md): dispatch только для >2 полей даёт +3,01% /+3,59% CPU на трёх полях, но disabled two-field 10k −1,57% /−3,94% (1/6 в обеих сериях). Новый oracle/полный workspace прошли; production восстановлен, engine/peer gain не заявлен.
