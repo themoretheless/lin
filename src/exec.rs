@@ -5413,19 +5413,18 @@ impl Db {
             std::thread::scope(|scope| {
                 let (left, right) = records.split_at(n / 2);
                 let worker = std::thread::Builder::new().spawn_scoped(scope, || {
-                    right
-                        .iter()
-                        .map(|record| record_row(record, now))
-                        .collect::<Vec<_>>()
+                    let mut rows = Vec::with_capacity(right.len());
+                    append_batch_shape_rows(&mut rows, right, now);
+                    rows
                 });
                 let mut rows = Vec::with_capacity(n);
-                rows.extend(left.iter().map(|record| record_row(record, now)));
+                append_batch_shape_rows(&mut rows, left, now);
                 append_bulk_worker_rows(&mut rows, right, now, worker);
                 rows
             })
         } else {
             let mut rows = Vec::with_capacity(n);
-            rows.extend(records.iter().map(|record| record_row(record, now)));
+            append_batch_shape_rows(&mut rows, records, now);
             rows
         };
         let mut batch_ids: rustc_hash::FxHashSet<&str> = rustc_hash::FxHashSet::default();
@@ -6166,6 +6165,48 @@ fn append_bulk_worker_rows(
     }
 }
 
+fn append_batch_shape_rows(rows: &mut Vec<Row>, records: &[Record], now: i64) {
+    let Some(first) = records.first() else {
+        return;
+    };
+    if records.len() < 128 || first.fields.is_empty() || first.fields.len() > 32 {
+        rows.extend(records.iter().map(|record| record_row(record, now)));
+        return;
+    }
+    let template = first
+        .fields
+        .iter()
+        .map(|(key, _)| (key.clone(), Cell::Null))
+        .collect::<Row>();
+    let slots = template
+        .keys()
+        .map(|key| {
+            first
+                .fields
+                .iter()
+                .rposition(|(field, _)| field == key)
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    for record in records {
+        if record.fields.len() != first.fields.len()
+            || !record
+                .fields
+                .iter()
+                .map(|(key, _)| key.as_str())
+                .eq(first.fields.iter().map(|(key, _)| key.as_str()))
+        {
+            rows.push(record_row(record, now));
+            continue;
+        }
+        let mut row = template.clone();
+        for (cell, &source) in row.values_mut().zip(&slots) {
+            *cell = value_cell(&record.fields[source].1, now);
+        }
+        rows.push(row);
+    }
+}
+
 fn record_row(record: &Record, now: i64) -> Row {
     let mut row = BTreeMap::new();
     for (k, v) in &record.fields {
@@ -6177,6 +6218,62 @@ fn record_row(record: &Record, now: i64) -> Row {
 #[cfg(test)]
 mod record_tests {
     use super::*;
+
+    #[test]
+    fn batch_shape_matches_reference_and_keeps_source_records() {
+        for n in [0, 1, 127, 128, 129, 4095, 4096] {
+            let mut records = (0..n)
+                .map(|i| Record {
+                    fields: vec![
+                        ("z".into(), Value::String(format!("v-{i}").into())),
+                        ("a".into(), Value::Int(1)),
+                        ("t".into(), Value::Now),
+                        ("a".into(), Value::Int(i as i64)),
+                    ],
+                })
+                .collect::<Vec<_>>();
+            if n > 2 {
+                records[n / 2].fields.swap(0, 1);
+                records[n - 1]
+                    .fields
+                    .push(("extra".into(), Value::Bool(true)));
+            }
+            let before = records.clone();
+            for now in [123, 456] {
+                let mut actual = vec![Row::from([("prefix".into(), Cell::Int(9))])];
+                append_batch_shape_rows(&mut actual, &records, now);
+                assert_eq!(actual.len(), n + 1);
+                assert_eq!(actual[0]["prefix"], Cell::Int(9));
+                let expected = records
+                    .iter()
+                    .map(|r| record_row(r, now))
+                    .collect::<Vec<_>>();
+                assert_eq!(&actual[1..], expected);
+                assert_eq!(records, before);
+            }
+        }
+    }
+
+    #[test]
+    fn wide_and_empty_shape_batches_use_reference_semantics() {
+        for width in [0, 32, 33, 80] {
+            let record = Record {
+                fields: (0..width)
+                    .map(|i| (format!("f{i}"), Value::Int(i)))
+                    .collect(),
+            };
+            let records = vec![record; 129];
+            let mut actual = Vec::new();
+            append_batch_shape_rows(&mut actual, &records, 55);
+            assert_eq!(
+                actual,
+                records
+                    .iter()
+                    .map(|r| record_row(r, 55))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
 
     #[test]
     fn bulk_worker_spawn_failure_preserves_tail_and_timestamp() {
