@@ -10,6 +10,8 @@
 
 Исторический каталог ниже сохраняет срез 5 октября. Новые измерения текущего кода:
 
+- [Persistent embed worker](../benches/results/2026-10-24-persistent-embed-worker-cpu/report.md) / [arena transfer](../benches/results/2026-10-24-persistent-embed-worker-arena-cpu/report.md): warm CPU batch gate; короткий 1k −10,6% / −1,0%, поэтому глобальная worker-политика отклонена. Длинный Unicode выигрывает ~44%, но это не закрывает целевой durable gap. Production не менялся.
+
 - [LZ4 write+Full-sync — отклонён](../benches/results/2026-10-24-lz4-wal-io/report.md): реальный 1k payload, два raw A/A контроля и FAST(8), 864 проверенных операции. LZ4 −13,3% / −43,9% в двух сериях; production-кодек не менялся. Standalone I/O gate, не скорость всей БД.
 
 - [LZ4 WAL CPU/byte gate](../benches/results/2026-10-24-lz4-wal-cpu/report.md): реальные codec-3 payload 1k/10k; 1k уменьшается ~4,4–4,7×, но CPU +0,106–0,122 мс; 10k CPU +2,1–2,3 мс. Write+sync ещё не измерены, compression/default codec в production не менялись.
