@@ -8,6 +8,8 @@
 
 ## Обновление 2026-10-24
 
+- [FTS postings reserve CPU/capacity gate](../benches/results/2026-10-24-fts-postings-reserve-cpu/report.md): reserve min(rows,4096) даёт +10,4% /+9,9% CPU на default 1k, но двухтермовый corpus увеличивает capacity 3→1792 без выигрыша. Безусловный reserve не принят; требуется cardinality-aware кандидат, engine/peer gain не заявлен. Production не менялся.
+
 - [Current WAL profile после preallocation](../benches/results/2026-10-24-post-preallocation-profile/report.md): 1k encode 0,435 мс, sync 0,458 мс, reserve check 0,00246 мс; 486 barrier sync, без fallback. Диагностические spans, не ускорение; production восстановлен. Следующая область — CPU вне WAL, а не повтор отклонённых sparse-микрооптимизаций.
 
 - [NEON sparse count CPU](../benches/results/2026-10-24-sparse-neon-count-cpu/report.md) / [engine gate — не принято](../benches/results/2026-10-24-neon-count-engine/report.md): CPU 1k +54,9% в обеих сериях; обычный durable 1k +6,63% /+5,57%, но interleaved +1,17% ниже A/A-разброса, 10k смешанный и содержит peer-проигрыши. Workspace/exact bits прошли; production восстановлен, ускорение движка не заявляется.
