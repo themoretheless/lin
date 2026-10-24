@@ -8,6 +8,8 @@
 
 ## Обновление 2026-10-24
 
+- [Empty indexed slab — исправление корректности](../benches/results/2026-10-24-empty-index-slab/report.md): настоящий rows[0] panic воспроизведён до правки. Пустой slab теперь no-op; 18 комбинаций состояния/коллекции/start, focused и workspace прошли. Новых измерений/peer-побед нет; это регрессия корректности, не ускорение.
+
 - [Spilled-only index key streaming — отклонено](../benches/results/2026-10-24-index-spilled-key-stream/report.md): dispatch только для >2 полей даёт +3,01% /+3,59% CPU на трёх полях, но disabled two-field 10k −1,57% /−3,94% (1/6 в обеих сериях). Новый oracle/полный workspace прошли; production восстановлен, engine/peer gain не заявлен.
 
 - [Index key streaming — глобально отклонено](../benches/results/2026-10-24-index-key-stream/report.md): без временного Vec<IndexKey>, bitmap sample-once сохранён. Двухполевой disabled путь −4,7…−7,8% CPU на 1k и −5,6…−6,3% на 10k, 0/6 в двух сериях. Три поля +2,44% /+5,18%, но отдельная dispatch-политика не квалифицирована. Workspace/oracle прошли; production восстановлен.

@@ -2845,6 +2845,9 @@ impl Store {
         start: usize,
         rows: &[Row],
     ) -> Result<(), Error> {
+        if rows.is_empty() {
+            return Ok(());
+        }
         let labels: Vec<String> = self
             .indexes
             .iter()
@@ -3965,6 +3968,35 @@ mod borrowed_delete_tests {
                         hash_cell(b),
                         "Hash/Eq mismatch for {a:?} and {b:?}"
                     );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod empty_index_slab_tests {
+    #[test]
+    fn empty_index_slab_preserves_empty_and_populated_indexes() {
+        for populated in [false, true] {
+            let mut db = crate::Db::empty();
+            db.run("index docs [wing, ts]").unwrap();
+            if populated {
+                db.run(r#"insert docs [{id:"a",uri:"a",wing:"rag",body:"first"},{id:"b",uri:"b",wing:"sys",body:"second"}]"#).unwrap();
+            }
+            let before = db.store.indexes.clone();
+            let rows_before = db.store.collection("docs").to_vec();
+            for collection in ["docs", "users", "missing"] {
+                for start in [0, rows_before.len(), usize::MAX] {
+                    db.store.index_insert_slab(collection, start, &[]).unwrap();
+                    assert_eq!(db.store.indexes.len(), before.len());
+                    for (label, index) in &before {
+                        let after = &db.store.indexes[label];
+                        assert_eq!(after.forward, index.forward);
+                        assert_eq!(after.reverse, index.reverse);
+                        assert_eq!(after.def.fields, index.def.fields);
+                    }
+                    assert_eq!(db.store.collection("docs"), rows_before);
                 }
             }
         }
