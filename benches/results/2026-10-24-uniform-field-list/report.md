@@ -18,3 +18,5 @@ Four focused tests pass: 1001 uniform Unicode/SSO/text rows preserve names/value
 Reject: target durable 10k is flat/slightly slower with 3/6 wins. The apparent 1k gain has a much larger 29.2% SQLite control improvement; this is insufficient evidence for retention or a causal speedup. Do not normalize away this control shift or report an isolated gain. No independent repeat or full workspace run was required for this rejected prototype. persist.rs restored byte-for-byte in the isolated checkout; no production DB changes ship. Before/candidate snapshots preserve code and focused tests.
 
 The prior profile's packing cost remains an open target. This result narrows the next hypothesis toward per-value copying/allocation rather than first-key traversal, but does not directly attribute cost to either mechanism. Full named-peer objective remains active, including current committed/candidate verification, SQLite gaps, unconfigured MSSQL/Kusto and honest cross-engine feature/durability scope.
+
+Text logs have trailing blank lines normalized; run.json observations and source snapshots are unchanged.
