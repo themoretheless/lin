@@ -8,6 +8,8 @@
 
 ## Обновление 2026-10-24
 
+- [Sparse delta-index CPU/byte gate](../benches/results/2026-10-24-sparse-delta-index-cpu/report.md): vector-секция 1k 238992→152370 bytes (−36,24%), но serial CPU −5,99% /−7,12% (~14–17 мкс дороже). Exact legacy-byte re-expansion прошла; формат только proposal. Следующий gate encode+write+Full sync; production reader/writer не менялись, DB gain не заявлен.
+
 - [Sparse-only fused output CPU](../benches/results/2026-10-24-embedding-sparse-fused-output-cpu/report.md) / [engine gate — отклонено](../benches/results/2026-10-24-embedding-sparse-fused-engine/report.md): dense fallback убрал CPU Unicode-регресс, default 1k CPU +3,40% /+3,17%; полный durable 1k −0,49% /−2,93%, native flat. Workspace/bit checks прошли; production восстановлен, engine gain не подтверждён.
 
 - [Fused embedding normalize/output CPU — отклонено](../benches/results/2026-10-24-embedding-fused-output-cpu/report.md): default 1k +2,50% /+3,67%, но Unicode −4,51% /−1,19%, повтор 0/6. Finite bit-exact gates прошли; глобальная политика не принята, production и allocator unchanged, engine gain не заявлен.
