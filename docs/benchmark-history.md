@@ -10,6 +10,7 @@
 
 Исторический каталог ниже сохраняет срез 5 октября. Новые измерения текущего кода:
 
+- [Large-bulk short-body hashing](../benches/results/2026-10-24-bulk-short-body-hash/report.md): повторно закрыты агрегированные native 100k DuckDB и Rust durable 10k SQLite gaps. Сохранены небольшие отрицательные эффекты 1k и рост whole-worker RSS ~4%; durable 1k проигрывает. [Безусловный обход кэша отклонён](../benches/results/2026-10-24-short-body-hash-cache/report.md).
 - [Текущая native bulk API matrix](../benches/results/2026-10-24-bounded-native-insert/report.md): **14/15** агрегированных сравнений; 100k проигрывает DuckDB (112,806 / 101,463 мс). Default AST quotas сохранены, >10k выполняется подготовленными порциями в одной memory-транзакции. [Исходный 100k отказ по квоте](../benches/results/2026-10-24-current-native-insert-matrix/report.md) сохранён отдельно.
 - [Полная текущая read matrix с серверами](../benches/results/2026-10-24-current-server-read-matrix/report.md): **108/108** агрегированных сравнений с SQLite, DuckDB, PostgreSQL, MySQL, MongoDB и pandas на 1k/10k/100k. Native ARM64, версии/settings/hash/cleanup сохранены; MSSQL/Kusto ещё не настроены, write/durable-контракты отдельные.
 - [Полная локальная read matrix после исправления prepared COUNT](../benches/results/2026-10-24-post-count-read-matrix/report.md): **54/54** агрегированных сравнений с SQLite, DuckDB и pandas на 1k/10k/100k; все шесть сценариев и exact validation. PostgreSQL/MySQL/MongoDB/MSSQL/Kusto этим прогоном не подтверждены.

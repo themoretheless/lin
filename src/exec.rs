@@ -5458,10 +5458,14 @@ impl Db {
             if row.get("hash").and_then(Cell::text).is_none()
                 && let Some(body) = row.get("body").and_then(Cell::text_shared)
             {
-                // Use precomputed hash from cache to avoid repeated FNV-1a computations
+                // Large short-body batches bypass the cache; small batches retain reuse.
                 row.insert(
                     "hash".into(),
-                    Cell::Text(cached_content_hash(body.as_ref())),
+                    Cell::Text(if n >= 4096 && body.len() <= 64 {
+                        content_hash_arc(body.as_ref())
+                    } else {
+                        cached_content_hash(body.as_ref())
+                    }),
                 );
             }
             if let Some(id) = row.get("id").and_then(Cell::text)
@@ -6232,6 +6236,44 @@ fn record_row(record: &Record, now: i64) -> Row {
 #[cfg(test)]
 mod record_tests {
     use super::*;
+
+    #[test]
+    fn bulk_short_body_hash_preserves_values_at_batch_and_byte_boundaries() {
+        for n in [127, 128, 4095, 4096, 8192] {
+            let records = (0..n)
+                .map(|i| {
+                    let body = match i % 4 {
+                        0 => format!("body-{i}"),
+                        1 => "repeated body".to_owned(),
+                        2 => "λ".repeat(32),
+                        _ => "λ".repeat(33),
+                    };
+                    let mut fields = vec![
+                        ("id".into(), Value::String(format!("d-{i}").into())),
+                        ("uri".into(), Value::String(format!("bench://{i}").into())),
+                        ("title".into(), Value::String("title".into())),
+                        ("body".into(), Value::String(body.into())),
+                    ];
+                    if i % 257 == 0 {
+                        fields.push(("hash".into(), Value::String("caller-hash".into())));
+                    }
+                    Record { fields }
+                })
+                .collect::<Vec<_>>();
+            let mut db = Db::empty();
+            db.insert_bulk("docs", &records, &[]).unwrap();
+            let rows = db.store.collection("docs");
+            assert_eq!(rows.len(), n);
+            for (i, row) in rows.iter().enumerate() {
+                let expected = if i % 257 == 0 {
+                    Arc::<str>::from("caller-hash")
+                } else {
+                    content_hash_arc(row["body"].text().unwrap())
+                };
+                assert_eq!(row["hash"].text(), Some(expected.as_ref()));
+            }
+        }
+    }
 
     #[test]
     fn batch_shape_matches_reference_and_keeps_source_records() {
