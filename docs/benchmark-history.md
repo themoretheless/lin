@@ -8,6 +8,8 @@
 
 ## Обновление 2026-10-24
 
+- [NEON sparse count CPU](../benches/results/2026-10-24-sparse-neon-count-cpu/report.md) / [engine gate — не принято](../benches/results/2026-10-24-neon-count-engine/report.md): CPU 1k +54,9% в обеих сериях; обычный durable 1k +6,63% /+5,57%, но interleaved +1,17% ниже A/A-разброса, 10k смешанный и содержит peer-проигрыши. Workspace/exact bits прошли; production восстановлен, ускорение движка не заявляется.
+
 - [Sparse packed entry — engine gate, не принято](../benches/results/2026-10-24-sparse-entry-engine/report.md): CPU-only +4% не подтвердился как устойчивое ускорение commit: durable 1k −0,003% / +3,605%, 3/6 /4/6. Две серии native/durable с SQLite-контролем и workspace прошли; production сохранён без патча.
 
 - [Sparse branch/entry CPU gate](../benches/results/2026-10-24-sparse-branch-entry-cpu/report.md): OR reduction против early exit и packed u64 index/value; две серии по шесть процессов, exact bytes. Packed-only — кандидат для engine gate; это компонентный CPU результат, production не менялся, durable SQLite gap не закрыт.
