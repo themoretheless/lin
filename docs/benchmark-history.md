@@ -10,6 +10,7 @@
 
 Исторический каталог ниже сохраняет срез 5 октября. Новые измерения текущего кода:
 
+- [Полная текущая read matrix с серверами](../benches/results/2026-10-24-current-server-read-matrix/report.md): **108/108** агрегированных сравнений с SQLite, DuckDB, PostgreSQL, MySQL, MongoDB и pandas на 1k/10k/100k. Native ARM64, версии/settings/hash/cleanup сохранены; MSSQL/Kusto ещё не настроены, write/durable-контракты отдельные.
 - [Полная локальная read matrix после исправления prepared COUNT](../benches/results/2026-10-24-post-count-read-matrix/report.md): **54/54** агрегированных сравнений с SQLite, DuckDB и pandas на 1k/10k/100k; все шесть сценариев и exact validation. PostgreSQL/MySQL/MongoDB/MSSQL/Kusto этим прогоном не подтверждены.
 - [Prepared COUNT before/after](../benches/results/2026-10-24-prepared-count-fastpaths/report.md): две серии по шесть пар; устранён обход index/columnar fast paths.
 - [Матрица до исправления](../benches/results/2026-10-24-current-read-refresh/report.md): 43/54; сохранена вместе с проигрышами.
