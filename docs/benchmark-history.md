@@ -8,6 +8,8 @@
 
 ## Обновление 2026-10-24
 
+- [Row template clone vs sorted collect — отклонено](../benches/results/2026-10-24-row-template-collect-cpu/report.md): текущее clone/fill против bulk collect отсортированных slots; uniform 1k/10k около −42% CPU в обеих сериях, 0/6 побед. Scalar-row oracle/duplicates/Now/batch boundaries прошли; production не менялся. Лишней полной rollback-копии в текущем append-path не найдено.
+
 - [Delta-index encode/write/Full-sync — не принято](../benches/results/2026-10-24-sparse-delta-index-io/report.md): реальные frames 336981→250359 bytes, но +0,35% /+0,65% ниже A/A-различий 0,87% /0,77%. 864 exact-validated операции, reserve для всех вариантов; production-кодек не вводится, ускорение БД не заявлено.
 
 - [Sparse delta-index CPU/byte gate](../benches/results/2026-10-24-sparse-delta-index-cpu/report.md): vector-секция 1k 238992→152370 bytes (−36,24%), но serial CPU −5,99% /−7,12% (~14–17 мкс дороже). Exact legacy-byte re-expansion прошла; формат только proposal. Следующий gate encode+write+Full sync; production reader/writer не менялись, DB gain не заявлен.
