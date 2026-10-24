@@ -1,0 +1,27 @@
+F
+======================================================================
+FAIL: test_kusto_cleanup_attempts_every_owned_table_after_drop_failure (__main__.BenchmarkContractTests.test_kusto_cleanup_attempts_every_owned_table_after_drop_failure)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/themoretheless/Documents/Sources/lin/scripts/test-bench-peers.py", line 128, in test_kusto_cleanup_attempts_every_owned_table_after_drop_failure
+    self.assertEqual(attempted, [f".drop table {name} ifexists" for name in reversed(peer.created)])
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: Lists differ: ['.dr[35 chars]ists'] != ['.dr[35 chars]ists', '.drop table linbench_owned_users ifexi[44 chars]sts']
+
+Second list contains 2 additional elements.
+First extra element 1:
+'.drop table linbench_owned_users ifexists'
+
+- ['.drop table linbench_owned_orders ifexists']
+?                                              ^
+
++ ['.drop table linbench_owned_orders ifexists',
+?                                              ^
+
++  '.drop table linbench_owned_users ifexists',
++  '.drop table linbench_owned_docs ifexists']
+
+----------------------------------------------------------------------
+Ran 1 test in 0.001s
+
+FAILED (failures=1)

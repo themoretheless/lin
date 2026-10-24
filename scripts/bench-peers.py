@@ -553,11 +553,19 @@ class Kusto:
         return self.execute(self.queries[case])
 
     def close(self):
+        first_error = None
         try:
             for table in reversed(self.created):
-                self.execute(f".drop table {table} ifexists", management=True)
+                try:
+                    self.execute(f".drop table {table} ifexists", management=True)
+                except Exception as error:
+                    # One failed drop must not strand the remaining owned fixtures.
+                    if first_error is None:
+                        first_error = error
         finally:
             self.connection.close()
+        if first_error is not None:
+            raise first_error
 
 
 def report(data):

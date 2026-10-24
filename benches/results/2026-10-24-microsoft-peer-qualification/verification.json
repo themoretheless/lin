@@ -1,0 +1,35 @@
+{
+  "source_commit": "5aa55451dd94d1d0dc93ad93ab3e8cf3a1a530b5",
+  "host_machine": "arm64",
+  "docker_architecture": "aarch64",
+  "configured": {
+    "LIN_BENCH_MSSQL_HOST": false,
+    "LIN_BENCH_MSSQL_USER": false,
+    "LIN_BENCH_MSSQL_PASSWORD": false,
+    "LIN_BENCH_MSSQL_DATABASE": false,
+    "LIN_BENCH_KUSTO_URL": false,
+    "LIN_BENCH_KUSTO_DATABASE": false
+  },
+  "live_microsoft_peer_benchmarks_run": false,
+  "downloaded_or_started_emulator": false,
+  "pre_fix_regression_exit": 1,
+  "adapter_tests_exit": 0,
+  "source_sha256": {
+    "scripts/bench-peers.py": "54fd8a94132c5f2d27cf8dffa79de4eba9856a22ad0c7f7ea01e4c7fbee1edd3",
+    "scripts/test-bench-peers.py": "fa3658910f4542ad1d524543efbd33a1c93832238cefa97f55814eb9092aa704"
+  },
+  "sources": [
+    {
+      "url": "https://learn.microsoft.com/en-us/azure/data-explorer/kusto-emulator-overview",
+      "finding": "emulator benchmark tests expressly prohibited; different service performance profile"
+    },
+    {
+      "url": "https://learn.microsoft.com/en-us/azure/data-explorer/kusto-emulator-install",
+      "finding": "ARM processors unsupported"
+    },
+    {
+      "url": "https://learn.microsoft.com/sql/linux/quickstart-install-connect-docker",
+      "finding": "SQL Server containers supported on Intel/AMD x86-64 Linux; translation/emulation untested and unsupported"
+    }
+  ]
+}

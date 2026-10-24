@@ -184,3 +184,17 @@ older source-specific results. Do not change sync/features/quotas or interfere
 with unrelated host processes to manufacture stable wins. When attribution is
 weak, improve isolation/protocol or target a larger measured effect before
 retaining a production optimization.
+
+
+## Microsoft peer execution environments
+
+Kusto Emulator is for functional development/testing, not this performance
+matrix: Microsoft explicitly prohibits emulator benchmark tests and describes a
+different performance profile from Azure Data Explorer. It also excludes ARM
+processors. Use a dedicated permitted service endpoint for Kusto timings.
+SQL Server Linux containers are supported on Intel/AMD x86-64; an emulated ARM
+host is a separate unsupported environment and cannot stand in for native peer
+qualification. See the [checked sources and adapter regression](../benches/results/2026-10-24-microsoft-peer-qualification/report.md).
+Missing endpoints remain missing coverage, never wins. Kusto cleanup attempts
+all created tables even if one drop fails; any remaining failure still makes
+the run incomplete rather than silently accepting leaked fixtures.

@@ -111,6 +111,23 @@ class BenchmarkContractTests(unittest.TestCase):
             self.assertEqual(run["medians_ns"], {})
             self.assertTrue(run["errors"])
 
+    def test_kusto_cleanup_attempts_every_owned_table_after_drop_failure(self):
+        peer = object.__new__(bench.Kusto)
+        peer.created = ["linbench_owned_docs", "linbench_owned_users", "linbench_owned_orders"]
+        attempted = []
+        closed = []
+        peer.connection = SimpleNamespace(close=lambda: closed.append(True))
+        def execute(query, management=False):
+            self.assertTrue(management)
+            attempted.append(query)
+            if "orders" in query or "docs" in query:
+                raise RuntimeError("injected drop failure")
+        peer.execute = execute
+        with self.assertRaises(RuntimeError):
+            peer.close()
+        self.assertEqual(attempted, [f".drop table {name} ifexists" for name in reversed(peer.created)])
+        self.assertEqual(closed, [True])
+
     def test_kusto_partial_query_failure_is_not_a_success(self):
         def payload(severity, code):
             return {"Tables": [
