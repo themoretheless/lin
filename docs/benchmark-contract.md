@@ -211,3 +211,15 @@ exit 3. Numeric superiority still requires the separate calibration and
 independent-repeat evidence before claiming a causal optimization. The
 [gate regression and saved-matrix revalidation](../benches/results/2026-10-24-strict-win-gate/report.md)
 retain evidence; re-finalizing saved observations is not a fresh benchmark.
+
+
+## Interleaved affected-engine control
+
+The [persistent-worker durable A/A protocol](../benches/results/2026-10-24-interleaved-durable-control/report.md)
+alternates individual checked fresh-fixture samples between two pinned workers,
+rather than timing all samples of one executable before the other. Setup,
+preparation, readback, IPC and drop/checkpoint are excluded; the timed prepared
+run keeps Full sync/default embedding/FTS/indexes. It is an additional affected
+Lin control, not a replacement for native/large-batch guards or peer timings.
+Two A/A series show remaining noise; differences near that variation remain
+inconclusive. Do not compare protocol changes as a causal engine speedup.

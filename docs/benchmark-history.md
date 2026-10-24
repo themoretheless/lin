@@ -10,6 +10,8 @@
 
 Исторический каталог ниже сохраняет срез 5 октября. Новые измерения текущего кода:
 
+- [Interleaved durable A/A protocol](../benches/results/2026-10-24-interleaved-durable-control/report.md): постоянные workers, чередование каждого sample, 1152 измерения с exact/bit-check. Абсолютные pair-различия 1k: медианы 2,1% / 3,1%, максимум 8,2%; отдельная квалификация протокола, не ускорение движка.
+
 - [Strict win/completion gate](../benches/results/2026-10-24-strict-win-gate/report.md): ties больше не win, дубли process IDs и невалидные samples не дают complete. 14 adapter-тестов прошли; сохранённые 108 read + 15 native сравнений перепроверены без изменения медиан и без новых замеров.
 
 - [Microsoft peer qualification / Kusto cleanup fix](../benches/results/2026-10-24-microsoft-peer-qualification/report.md): проверены официальные ограничения эмуляторов, новых peer-замеров нет. Исправлено прерывание cleanup после первого DROP failure; regression до/после и 10 adapter-тестов сохранены.
