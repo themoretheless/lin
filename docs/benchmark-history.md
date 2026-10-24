@@ -8,6 +8,8 @@
 
 ## Обновление 2026-10-24
 
+- [Embedding whole-batch allocation audit](../benches/results/2026-10-24-embedding-batch-allocation/report.md): 12 процессов, проверка чувствительности allocator observer, warm counters совпали. Default 1k: 1001 allocations /3 104 000 requested bytes, ровно выходные Arc и Vec; realloc/transient churn не обнаружены. Это счётчики запросов, не RSS/latency; production не менялся.
+
 - [Embedding fill/finish sampled diagnostic](../benches/results/2026-10-24-embedding-fill-finish-profile/report.md): 3 процесса, побитовый oracle, stride 16. Короткие spans 83/125 нс сопоставимы с дискретностью часов; доли фаз и hotspot не доказаны. Production не менялся; следующий allocation-анализ требует более крупных интервалов или tracing.
 
 - [Adaptive FTS reserve — не принято](../benches/results/2026-10-24-fts-adaptive-reserve-cpu/report.md): prefix-cardinality guard сохраняет capacity 3 для повторяющихся слов, но default 1k CPU лишь +2,09% /+2,10% (~3 мкс). Diverse-prefix/repeated-tail раздувает capacity 56→448 без устойчивой пользы; production не менялся, engine gain не заявлен.
