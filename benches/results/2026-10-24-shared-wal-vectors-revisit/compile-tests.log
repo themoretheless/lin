@@ -1,0 +1,195 @@
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+   Compiling lin v0.4.0 (/Users/themoretheless/.codex/worktrees/lin-durable-profile-20261024/lin)
+error[E0308]: mismatched types
+    --> src/persist.rs:2264:37
+     |
+2264 |         append_sparse_rows_parallel(&rows, &mut actual).unwrap();
+     |         --------------------------- ^^^^^ expected `&[Option<Arc<[f32]>>]`, found `&Vec<Option<Vec<f32>>>`
+     |         |
+     |         arguments to this function are incorrect
+     |
+     = note: expected reference `&[std::option::Option<std::sync::Arc<[f32]>>]`
+                found reference `&Vec<std::option::Option<Vec<f32>>>`
+note: function defined here
+    --> src/persist.rs:1240:4
+     |
+1240 | fn append_sparse_rows_parallel(
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+1241 |     rows: &[Option<std::sync::Arc<[f32]>>],
+     |     --------------------------------------
+
+error[E0308]: mismatched types
+    --> src/persist.rs:2267:45
+     |
+2267 |         append_sparse_worker(&mut fallback, &rows, Err(io::ErrorKind::WouldBlock.into())).unwrap();
+     |         --------------------                ^^^^^ expected `&[Option<Arc<[f32]>>]`, found `&Vec<Option<Vec<f32>>>`
+     |         |
+     |         arguments to this function are incorrect
+     |
+     = note: expected reference `&[std::option::Option<std::sync::Arc<[f32]>>]`
+                found reference `&Vec<std::option::Option<Vec<f32>>>`
+note: function defined here
+    --> src/persist.rs:1228:4
+     |
+1228 | fn append_sparse_worker(
+     |    ^^^^^^^^^^^^^^^^^^^^
+1229 |     buf: &mut Vec<u8>,
+1230 |     right: &[Option<std::sync::Arc<[f32]>>],
+     |     ---------------------------------------
+
+error[E0308]: mismatched types
+    --> src/persist.rs:2301:41
+     |
+2301 |                 cols: vec![ColData::Vec(vectors.clone()), ColData::Vec(vectors)],
+     |                            ------------ ^^^^^^^^^^^^^^^ expected `Vec<Option<Arc<[f32]>>>`, found `Vec<Option<Vec<{float}>>>`
+     |                            |
+     |                            arguments to this enum variant are incorrect
+     |
+     = note: expected struct `Vec<Option<std::sync::Arc<[f32]>>>`
+                found struct `Vec<Option<Vec<{float}>>>`
+note: tuple variant defined here
+    --> src/persist.rs:176:5
+     |
+ 176 |     Vec(Vec<Option<std::sync::Arc<[f32]>>>),
+     |     ^^^
+
+error[E0308]: mismatched types
+    --> src/persist.rs:2301:72
+     |
+2301 |                 cols: vec![ColData::Vec(vectors.clone()), ColData::Vec(vectors)],
+     |                                                           ------------ ^^^^^^^ expected `Vec<Option<Arc<[f32]>>>`, found `Vec<Option<Vec<{float}>>>`
+     |                                                           |
+     |                                                           arguments to this enum variant are incorrect
+     |
+     = note: expected struct `Vec<Option<std::sync::Arc<[f32]>>>`
+                found struct `Vec<Option<Vec<{float}>>>`
+note: tuple variant defined here
+    --> src/persist.rs:176:5
+     |
+ 176 |     Vec(Vec<Option<std::sync::Arc<[f32]>>>),
+     |     ^^^
+
+error[E0308]: mismatched types
+    --> src/persist.rs:2346:46
+     |
+2346 |             assert_eq!(sparse_bytes_parallel(&rows), expected);
+     |                        --------------------- ^^^^^ expected `&[Option<Arc<[f32]>>]`, found `&Vec<Option<Vec<f32>>>`
+     |                        |
+     |                        arguments to this function are incorrect
+     |
+     = note: expected reference `&[std::option::Option<std::sync::Arc<[f32]>>]`
+                found reference `&Vec<std::option::Option<Vec<f32>>>`
+note: function defined here
+    --> src/persist.rs:1166:4
+     |
+1166 | fn sparse_bytes_parallel(rows: &[Option<std::sync::Arc<[f32]>>]) -> usize {
+     |    ^^^^^^^^^^^^^^^^^^^^^ --------------------------------------
+
+error[E0308]: mismatched types
+    --> src/persist.rs:2348:37
+     |
+2348 |                 sparse_count_worker(&rows, Err(io::ErrorKind::WouldBlock.into())),
+     |                 ------------------- ^^^^^ expected `&[Option<Arc<[f32]>>]`, found `&Vec<Option<Vec<f32>>>`
+     |                 |
+     |                 arguments to this function are incorrect
+     |
+     = note: expected reference `&[std::option::Option<std::sync::Arc<[f32]>>]`
+                found reference `&Vec<std::option::Option<Vec<f32>>>`
+note: function defined here
+    --> src/persist.rs:1156:4
+     |
+1156 | fn sparse_count_worker(
+     |    ^^^^^^^^^^^^^^^^^^^
+1157 |     rows: &[Option<std::sync::Arc<[f32]>>],
+     |     --------------------------------------
+
+error[E0308]: mismatched types
+    --> src/persist.rs:2351:43
+     |
+2351 |             assert_eq!(use_sparse_vectors(&rows), n >= 4095);
+     |                        ------------------ ^^^^^ expected `&[Option<Arc<[f32]>>]`, found `&Vec<Option<Vec<f32>>>`
+     |                        |
+     |                        arguments to this function are incorrect
+     |
+     = note: expected reference `&[std::option::Option<std::sync::Arc<[f32]>>]`
+                found reference `&Vec<std::option::Option<Vec<f32>>>`
+note: function defined here
+    --> src/persist.rs:1108:4
+     |
+1108 | fn use_sparse_vectors(rows: &[Option<std::sync::Arc<[f32]>>]) -> bool {
+     |    ^^^^^^^^^^^^^^^^^^ --------------------------------------
+
+error[E0308]: mismatched types
+    --> src/persist.rs:2354:42
+     |
+2354 |         assert_eq!(sparse_bytes_parallel(&dense), 4096 * (8 + 768 * 8));
+     |                    --------------------- ^^^^^^ expected `&[Option<Arc<[f32]>>]`, found `&Vec<Option<Vec<{float}>>>`
+     |                    |
+     |                    arguments to this function are incorrect
+     |
+     = note: expected reference `&[std::option::Option<std::sync::Arc<[f32]>>]`
+                found reference `&Vec<std::option::Option<Vec<{float}>>>`
+note: function defined here
+    --> src/persist.rs:1166:4
+     |
+1166 | fn sparse_bytes_parallel(rows: &[Option<std::sync::Arc<[f32]>>]) -> usize {
+     |    ^^^^^^^^^^^^^^^^^^^^^ --------------------------------------
+
+error[E0308]: mismatched types
+    --> src/persist.rs:2355:37
+     |
+2355 |         assert!(!use_sparse_vectors(&dense));
+     |                  ------------------ ^^^^^^ expected `&[Option<Arc<[f32]>>]`, found `&Vec<Option<Vec<{float}>>>`
+     |                  |
+     |                  arguments to this function are incorrect
+     |
+     = note: expected reference `&[std::option::Option<std::sync::Arc<[f32]>>]`
+                found reference `&Vec<std::option::Option<Vec<{float}>>>`
+note: function defined here
+    --> src/persist.rs:1108:4
+     |
+1108 | fn use_sparse_vectors(rows: &[Option<std::sync::Arc<[f32]>>]) -> bool {
+     |    ^^^^^^^^^^^^^^^^^^ --------------------------------------
+
+error[E0308]: mismatched types
+    --> src/persist.rs:2358:36
+     |
+2358 |         assert!(use_sparse_vectors(&empty));
+     |                 ------------------ ^^^^^^ expected `&[Option<Arc<[f32]>>]`, found `&Vec<Option<Vec<{float}>>>`
+     |                 |
+     |                 arguments to this function are incorrect
+     |
+     = note: expected reference `&[std::option::Option<std::sync::Arc<[f32]>>]`
+                found reference `&Vec<std::option::Option<Vec<{float}>>>`
+note: function defined here
+    --> src/persist.rs:1108:4
+     |
+1108 | fn use_sparse_vectors(rows: &[Option<std::sync::Arc<[f32]>>]) -> bool {
+     |    ^^^^^^^^^^^^^^^^^^ --------------------------------------
+
+error[E0277]: a value of type `Vec<std::option::Option<std::sync::Arc<[f32]>>>` cannot be built from an iterator over elements of type `std::option::Option<Vec<f32>>`
+    --> src/persist.rs:2447:26
+     |
+2447 |                         .collect(),
+     |                          ^^^^^^^ value of type `Vec<std::option::Option<std::sync::Arc<[f32]>>>` cannot be built from `std::iter::Iterator<Item=std::option::Option<Vec<f32>>>`
+     |
+help: the trait `FromIterator<Option<Vec<f32>>>` is not implemented for `Vec<std::option::Option<std::sync::Arc<[f32]>>>`
+      but trait `FromIterator<Option<std::sync::Arc<[f32]>>>` is implemented for it
+    --> /Users/themoretheless/.rustup/toolchains/nightly-aarch64-apple-darwin/lib/rustlib/src/rust/library/alloc/src/vec/mod.rs:4106:1
+     |
+4106 | impl<T> FromIterator<T> for Vec<T> {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     = help: for that trait implementation, expected `std::sync::Arc<[f32]>`, found `Vec<f32>`
+note: required by a bound in `std::iter::Iterator::collect`
+    --> /Users/themoretheless/.rustup/toolchains/nightly-aarch64-apple-darwin/lib/rustlib/src/rust/library/core/src/iter/traits/iterator.rs:2087:19
+     |
+  42 | pub const trait Iterator {
+...
+2087 |     fn collect<B: FromIterator<Self::Item>>(self) -> B
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `Iterator::collect`
+
+Some errors have detailed explanations: E0277, E0308.
+For more information about an error, try `rustc --explain E0277`.
+error: could not compile `lin` (lib test) due to 11 previous errors

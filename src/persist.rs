@@ -173,7 +173,7 @@ pub enum ColData {
     Bool(Vec<bool>),
     Time(Vec<i64>),
     /// Per-row dense vectors (`None` / empty = null).
-    Vec(Vec<Option<Vec<f32>>>),
+    Vec(Vec<Option<std::sync::Arc<[f32]>>>),
     /// Homogeneous null column of length `n` (n stored in InsertCols.n).
     Null,
 }
@@ -1105,14 +1105,14 @@ fn append_facts_v2(
     write_frame(log, &LOG_MAGIC_V2, buf, sync, log_bytes)
 }
 
-fn use_sparse_vectors(rows: &[Option<Vec<f32>>]) -> bool {
+fn use_sparse_vectors(rows: &[Option<std::sync::Arc<[f32]>>]) -> bool {
     let dense = rows
         .iter()
         .map(|row| 4usize.saturating_add(row.as_ref().map_or(0, |v| v.len().saturating_mul(4))))
         .fold(0usize, usize::saturating_add);
     if rows
         .iter()
-        .any(|row| row.as_ref().is_some_and(Vec::is_empty))
+        .any(|row| row.as_ref().is_some_and(|v| v.is_empty()))
     {
         return true; // Preserve Some(empty), which the legacy vector tag cannot express.
     }
@@ -1138,7 +1138,7 @@ fn use_sparse_vectors(rows: &[Option<Vec<f32>>]) -> bool {
     sparse < dense
 }
 
-fn sparse_bytes_serial(rows: &[Option<Vec<f32>>]) -> usize {
+fn sparse_bytes_serial(rows: &[Option<std::sync::Arc<[f32]>>]) -> usize {
     rows.iter()
         .map(|row| {
             row.as_ref().map_or(4, |v| {
@@ -1154,7 +1154,7 @@ fn sparse_bytes_serial(rows: &[Option<Vec<f32>>]) -> usize {
 }
 
 fn sparse_count_worker(
-    rows: &[Option<Vec<f32>>],
+    rows: &[Option<std::sync::Arc<[f32]>>],
     worker: io::Result<std::thread::ScopedJoinHandle<'_, usize>>,
 ) -> usize {
     match worker {
@@ -1163,7 +1163,7 @@ fn sparse_count_worker(
     }
 }
 
-fn sparse_bytes_parallel(rows: &[Option<Vec<f32>>]) -> usize {
+fn sparse_bytes_parallel(rows: &[Option<std::sync::Arc<[f32]>>]) -> usize {
     std::thread::scope(|scope| {
         let chunk_len = rows.len().div_ceil(4);
         let (left, rest) = rows.split_at(chunk_len);
@@ -1181,7 +1181,10 @@ fn sparse_bytes_parallel(rows: &[Option<Vec<f32>>]) -> usize {
     })
 }
 
-fn append_sparse_rows_serial(rows: &[Option<Vec<f32>>], buf: &mut Vec<u8>) -> Result<(), Error> {
+fn append_sparse_rows_serial(
+    rows: &[Option<std::sync::Arc<[f32]>>],
+    buf: &mut Vec<u8>,
+) -> Result<(), Error> {
     for row in rows {
         let Some(emb) = row else {
             buf.extend_from_slice(&0u32.to_le_bytes());
@@ -1224,7 +1227,7 @@ fn append_sparse_rows_serial(rows: &[Option<Vec<f32>>], buf: &mut Vec<u8>) -> Re
 
 fn append_sparse_worker(
     buf: &mut Vec<u8>,
-    right: &[Option<Vec<f32>>],
+    right: &[Option<std::sync::Arc<[f32]>>],
     worker: io::Result<std::thread::ScopedJoinHandle<'_, Result<Vec<u8>, Error>>>,
 ) -> Result<(), Error> {
     match worker {
@@ -1234,7 +1237,10 @@ fn append_sparse_worker(
     Ok(())
 }
 
-fn append_sparse_rows_parallel(rows: &[Option<Vec<f32>>], buf: &mut Vec<u8>) -> Result<(), Error> {
+fn append_sparse_rows_parallel(
+    rows: &[Option<std::sync::Arc<[f32]>>],
+    buf: &mut Vec<u8>,
+) -> Result<(), Error> {
     std::thread::scope(|scope| {
         let chunk_len = rows.len().div_ceil(4);
         let (left, rest) = rows.split_at(chunk_len);
@@ -1415,7 +1421,7 @@ fn append_insert_cols_v2(
                             }
                             #[cfg(not(target_endian = "little"))]
                             {
-                                for x in emb {
+                                for x in emb.iter() {
                                     buf.extend_from_slice(&x.to_le_bytes());
                                 }
                             }
@@ -1748,7 +1754,7 @@ fn decode_column_record(buf: &[u8], allow_sparse: bool) -> Result<LogRecord, ()>
                                 emb.push(f32::from_le_bytes(buf[i..i + 4].try_into().unwrap()));
                                 i += 4;
                             }
-                            v.push(Some(emb));
+                            v.push(Some(emb.into()));
                         }
                         ColData::Vec(v)
                     }
@@ -1791,7 +1797,7 @@ fn decode_column_record(buf: &[u8], allow_sparse: bool) -> Result<LogRecord, ()>
                                 values[pos] = f32::from_bits(bits);
                                 previous = Some(pos);
                             }
-                            rows.push(Some(values));
+                            rows.push(Some(values.into()));
                         }
                         ColData::Vec(rows)
                     }
@@ -2055,7 +2061,10 @@ pub fn rows_to_insert_cols(
                         Cell::Time(n) | Cell::Int(n) => *n,
                         _ => 0,
                     }),
-                    ColData::Vec(v) => v.push(cell.as_vec().map(<[f32]>::to_vec)),
+                    ColData::Vec(v) => v.push(match cell {
+                        Cell::Vec(embedding) => Some(std::sync::Arc::clone(embedding)),
+                        _ => None,
+                    }),
                     ColData::Null => {}
                 }
             }
@@ -2166,7 +2175,10 @@ pub fn rows_to_insert_cols(
             6 => {
                 let mut v = Vec::with_capacity(rows.len());
                 for cell in column_cells(fi) {
-                    v.push(cell.and_then(Cell::as_vec).map(|s| s.to_vec()));
+                    v.push(match cell {
+                        Some(Cell::Vec(embedding)) => Some(std::sync::Arc::clone(embedding)),
+                        _ => None,
+                    });
                 }
                 ColData::Vec(v)
             }
@@ -2199,7 +2211,7 @@ pub fn cols_to_rows(fields: &[String], cols: &[ColData], n: usize) -> Vec<crate:
                 Some(ColData::Bool(v)) => Cell::Bool(v.get(i).copied().unwrap_or(false)),
                 Some(ColData::Time(v)) => Cell::Time(v.get(i).copied().unwrap_or(0)),
                 Some(ColData::Vec(v)) => match v.get(i).and_then(|o| o.as_ref()) {
-                    Some(emb) if !emb.is_empty() => Cell::vec_arc(emb.as_slice()),
+                    Some(emb) if !emb.is_empty() => Cell::vec_arc(std::sync::Arc::clone(emb)),
                     _ => Cell::Null,
                 },
                 Some(ColData::Null) | None => Cell::Null,
@@ -2249,10 +2261,19 @@ mod wal_integrity_tests {
             }
         }
         let mut actual = vec![1, 2, 3];
-        append_sparse_rows_parallel(&rows, &mut actual).unwrap();
+        let shared_rows = rows
+            .iter()
+            .map(|v| v.as_ref().map(|v| std::sync::Arc::from(v.as_slice())))
+            .collect::<Vec<_>>();
+        append_sparse_rows_parallel(&shared_rows, &mut actual).unwrap();
         assert_eq!(actual, expected);
         let mut fallback = vec![1, 2, 3];
-        append_sparse_worker(&mut fallback, &rows, Err(io::ErrorKind::WouldBlock.into())).unwrap();
+        append_sparse_worker(
+            &mut fallback,
+            &shared_rows,
+            Err(io::ErrorKind::WouldBlock.into()),
+        )
+        .unwrap();
         assert_eq!(fallback, expected);
         with_log(|file| {
             let bytes = frame(file, vector_pack(rows));
@@ -2279,7 +2300,7 @@ mod wal_integrity_tests {
         let n = 4096;
         // Each column fits separately; together the vectors and row metadata
         // exceed the shared 64MiB decoded budget.
-        let vectors = vec![Some(vec![0.0; 2048]); n];
+        let vectors: Vec<Option<std::sync::Arc<[f32]>>> = vec![Some(vec![0.0; 2048].into()); n];
         let record = LogRecord {
             r#gen: 1,
             next_id: 2,
@@ -2323,7 +2344,7 @@ mod wal_integrity_tests {
                         values[7] = -0.0;
                         values[8] = f32::from_bits(0x7fc00001);
                         values[767] = f32::INFINITY;
-                        Some(values)
+                        Some(values.into())
                     }
                 })
                 .collect::<Vec<_>>();
@@ -2338,11 +2359,11 @@ mod wal_integrity_tests {
             );
             assert_eq!(use_sparse_vectors(&rows), n >= 4095);
         }
-        let dense = vec![Some(vec![1.0; 768]); 4096];
+        let dense: Vec<Option<std::sync::Arc<[f32]>>> = vec![Some(vec![1.0; 768].into()); 4096];
         assert_eq!(sparse_bytes_parallel(&dense), 4096 * (8 + 768 * 8));
         assert!(!use_sparse_vectors(&dense));
         let mut empty = dense;
-        empty[4095] = Some(Vec::new());
+        empty[4095] = Some(std::sync::Arc::from([]));
         assert!(use_sparse_vectors(&empty));
     }
 
@@ -2428,7 +2449,7 @@ mod wal_integrity_tests {
                 ),
                 ColData::Time([12, 42].into_iter().cycle().take(4096).collect()),
                 ColData::Vec(
-                    [Some(values), None]
+                    [Some(std::sync::Arc::<[f32]>::from(values)), None]
                         .into_iter()
                         .cycle()
                         .take(4096)
@@ -2524,7 +2545,9 @@ mod wal_integrity_tests {
             collection: "docs".into(),
             fields: vec!["embedding".into()],
             n: vectors.len() as u32,
-            cols: vec![ColData::Vec(vectors)],
+            cols: vec![ColData::Vec(
+                vectors.into_iter().map(|v| v.map(Into::into)).collect(),
+            )],
             edges: Vec::new(),
         }
     }
@@ -2560,7 +2583,7 @@ mod wal_integrity_tests {
                 let ColData::Vec(actual) = &cols[0] else {
                     panic!("vectors")
                 };
-                let bits = |rows: &[Option<Vec<f32>>]| {
+                let bits = |rows: &[Option<std::sync::Arc<[f32]>>]| {
                     rows.iter()
                         .map(|row| {
                             row.as_ref()
@@ -2568,7 +2591,11 @@ mod wal_integrity_tests {
                         })
                         .collect::<Vec<_>>()
                 };
-                assert_eq!(bits(actual), bits(&expected));
+                let expected_shared = expected
+                    .iter()
+                    .map(|v| v.clone().map(Into::into))
+                    .collect::<Vec<_>>();
+                assert_eq!(bits(actual), bits(&expected_shared));
                 Ok(())
             })
             .unwrap();
@@ -2779,5 +2806,46 @@ mod bench {
             records.len()
         );
         assert!(elapsed.as_millis() < 2000, "Batch write too slow");
+    }
+}
+
+#[cfg(test)]
+mod shared_vector_wire_tests {
+    use super::*;
+    #[test]
+    fn shared_vector_columns_keep_legacy_messagepack_and_share_row_storage() {
+        use crate::store::{Cell, Row};
+        use std::sync::Arc;
+        #[derive(Serialize)]
+        #[serde(tag = "t", content = "v")]
+        enum LegacyColumn {
+            Vec(Vec<Option<Vec<f32>>>),
+        }
+        let values = vec![Some(vec![0.0, -0.0, 1.25]), None, Some(vec![])];
+        let legacy = rmp_serde::to_vec_named(&LegacyColumn::Vec(values.clone())).unwrap();
+        let shared = ColData::Vec(values.into_iter().map(|v| v.map(Into::into)).collect());
+        assert_eq!(rmp_serde::to_vec_named(&shared).unwrap(), legacy);
+        let decoded: ColData = rmp_serde::from_slice(&legacy).unwrap();
+        assert_eq!(rmp_serde::to_vec_named(&decoded).unwrap(), legacy);
+        let embedding: Arc<[f32]> = Arc::from([0.0, -0.0, 1.25]);
+        let rows = [Row::from([(
+            "embedding".into(),
+            Cell::vec_arc(Arc::clone(&embedding)),
+        )])];
+        let Pack::InsertCols {
+            fields, cols, n, ..
+        } = rows_to_insert_cols("test", &rows, vec![])
+        else {
+            panic!("column pack")
+        };
+        let ColData::Vec(column) = &cols[0] else {
+            panic!("vector column")
+        };
+        assert!(Arc::ptr_eq(column[0].as_ref().unwrap(), &embedding));
+        let restored = cols_to_rows(&fields, &cols, n as usize);
+        let Cell::Vec(restored_embedding) = &restored[0]["embedding"] else {
+            panic!("vector cell")
+        };
+        assert!(Arc::ptr_eq(restored_embedding, &embedding));
     }
 }
