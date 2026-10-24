@@ -1,0 +1,205 @@
+{
+  "rows": 100000,
+  "repeats": 1,
+  "samples": 12,
+  "host": "macOS-26.7.2-arm64-arm-64bit-Mach-O",
+  "engines": [
+    "sqlite",
+    "duckdb",
+    "postgres",
+    "mysql",
+    "mongo",
+    "lin"
+  ],
+  "cases": [
+    "insert_native"
+  ],
+  "observations": [
+    {
+      "case": "insert_native/sqlite",
+      "repetition": 0,
+      "iterations": 1,
+      "samples_ns": [
+        147048666,
+        142442875,
+        141824125,
+        143739291,
+        142944209,
+        142973000,
+        143406250,
+        143685333,
+        156843084,
+        270548458,
+        145458750,
+        146534375
+      ],
+      "validated_rows": 100000
+    },
+    {
+      "case": "insert_native/duckdb",
+      "repetition": 0,
+      "iterations": 1,
+      "samples_ns": [
+        100463875,
+        100089791,
+        100454834,
+        102184791,
+        99163084,
+        100070250,
+        98659500,
+        99752292,
+        98775333,
+        98772375,
+        100841625,
+        99192458
+      ],
+      "validated_rows": 100000
+    },
+    {
+      "case": "insert_native/postgres",
+      "repetition": 0,
+      "iterations": 1,
+      "samples_ns": [
+        301945541,
+        280842417,
+        284096833,
+        273734125,
+        268227208,
+        275348708,
+        271752958,
+        270793834,
+        274214333,
+        278273375,
+        273589667,
+        276491833
+      ],
+      "validated_rows": 100000
+    },
+    {
+      "case": "insert_native/mysql",
+      "repetition": 0,
+      "iterations": 1,
+      "samples_ns": [
+        858306292,
+        868627958,
+        885471500,
+        852594875,
+        869754125,
+        872555875,
+        874711958,
+        871853959,
+        857031959,
+        862692083,
+        868468958,
+        861579542
+      ],
+      "validated_rows": 100000
+    },
+    {
+      "case": "insert_native/mongo",
+      "repetition": 0,
+      "iterations": 1,
+      "samples_ns": [
+        542588917,
+        568212458,
+        563251000,
+        573223459,
+        561812500,
+        636977500,
+        547880000,
+        526802125,
+        616949958,
+        573070167,
+        591705041,
+        564479709
+      ],
+      "validated_rows": 100000
+    }
+  ],
+  "errors": [
+    {
+      "engine": "lin",
+      "repetition": 0,
+      "reason": "Lin worker exited"
+    }
+  ],
+  "versions": {
+    "sqlite": "3.54.1",
+    "duckdb": "1.5.6",
+    "postgres": "160015",
+    "mysql": "8.4.11",
+    "mongo": "8.0.34",
+    "lin": "0.4.0"
+  },
+  "medians_ns": {
+    "insert_native/sqlite": 143712312.0,
+    "insert_native/duckdb": 99911271.0,
+    "insert_native/postgres": 274781520.5,
+    "insert_native/mysql": 868548458.0,
+    "insert_native/mongo": 566346083.5
+  },
+  "python": "3.14.9 (main, Oct 21 2026, 06:02:15) [Clang 21.0.0 (clang-2100.3.34.2)]",
+  "clients": {
+    "pandas": "3.0.6",
+    "duckdb": "1.5.6",
+    "pymongo": "4.18.2",
+    "psycopg": "3.3.6",
+    "PyMySQL": "1.2.3",
+    "python-tds": "1.17.1"
+  },
+  "native_contracts": {
+    "sqlite": {
+      "schema": "id/uri/wing/title/ts/body; unique id and uri; wing+ts index",
+      "fixture": "fresh per sample; schema/index/prepare/validation/drop excluded",
+      "durability": "native memory API comparison; no disk durability equivalence",
+      "api": "Python sqlite3 executemany plus transaction commit",
+      "storage": ":memory:",
+      "atomicity": "one transaction per sample"
+    },
+    "duckdb": {
+      "schema": "id/uri/wing/title/ts/body; unique id and uri; wing+ts index",
+      "fixture": "fresh per sample; schema/index/prepare/validation/drop excluded",
+      "durability": "native memory API comparison; no disk durability equivalence",
+      "api": "DuckDB prepared INSERT SELECT from registered pandas DataFrame plus commit",
+      "storage": ":memory:",
+      "atomicity": "one transaction per sample"
+    },
+    "postgres": {
+      "schema": "id/uri/wing/title/ts/body; unique id and uri; wing+ts index",
+      "fixture": "fresh per sample; schema/index/prepare/validation/drop excluded",
+      "durability": "native memory API comparison; no disk durability equivalence",
+      "api": "Psycopg COPY CSV block plus transaction commit",
+      "storage": "configured dedicated server",
+      "atomicity": "one transaction per sample",
+      "synchronous_commit": "on"
+    },
+    "mysql": {
+      "schema": "id/uri/wing/title/ts/body; unique id and uri; wing+ts index",
+      "fixture": "fresh per sample; schema/index/prepare/validation/drop excluded",
+      "durability": "native memory API comparison; no disk durability equivalence",
+      "api": "PyMySQL executemany multi-row INSERT plus transaction commit",
+      "storage": "configured dedicated server",
+      "atomicity": "one transaction per sample",
+      "innodb_flush_log_at_trx_commit": 1,
+      "sync_binlog": 1
+    },
+    "mongo": {
+      "schema": "id/uri/wing/title/ts/body; unique id and uri; wing+ts index",
+      "fixture": "fresh per sample; schema/index/prepare/validation/drop excluded",
+      "durability": "native memory API comparison; no disk durability equivalence",
+      "api": "PyMongo ordered insert_many; id maps to native _id",
+      "write_concern": {
+        "j": false,
+        "w": 1
+      }
+    },
+    "lin": {
+      "schema": "id/uri/wing/title/ts/body; unique id and uri; wing+ts index",
+      "fixture": "fresh per sample; schema/index/prepare/validation/drop excluded",
+      "durability": "native memory API comparison; no disk durability equivalence",
+      "api": "Rust prepared run; default embedding and FTS",
+      "storage": "Db::empty"
+    }
+  },
+  "status": "incomplete"
+}

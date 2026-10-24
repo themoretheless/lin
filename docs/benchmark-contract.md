@@ -150,3 +150,16 @@ bounded VARCHAR fields with utf8mb4; MySQL collation semantics differ from Lin.
 Flush/binlog settings are recorded without weakening. Dedicated tmpfs server
 results include driver/network/WAL costs and do not prove disk durability
 or parity with Lin Db::empty. Cleanup rolls back and drops only created tables.
+
+## Bounded Lin native insertion
+
+The native insertion worker retains the single prepared call at <=10,000 rows.
+Larger fixtures prepare statements of at most 10,000 rows outside timing, then
+measure one `Db::empty` memory transaction containing all prepared calls and its
+commit. Affected-row aggregation stays inside timing; exact six-field readback
+and default embedding checks remain outside. Contract metadata records statement
+count, row bound and actual execution path. No quota is raised: the previous
+100k single-statement fixture exceeded the default 8 MiB AST limit and remains a
+recorded incomplete result. This chunked memory invocation is a distinct API
+contract and does not establish durable transaction atomicity or physical-disk
+performance. It is compared with each peer's existing bulk ingestion adapter.

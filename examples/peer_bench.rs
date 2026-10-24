@@ -96,16 +96,34 @@ fn measure_insert(
         ));
         expected.push(json!([id, uri, wing, title, timestamp, body]));
     }
-    let source = format!("insert docs [{}]", records.join(","));
+    // Respect the per-statement AST quota without relaxing production limits.
+    // Large batches use the public memory transaction API with bounded statements.
+    let sources = records
+        .chunks(10_000)
+        .map(|chunk| format!("insert docs [{}]", chunk.join(",")))
+        .collect::<Vec<_>>();
     let fields = ["id", "uri", "wing", "title", "ts", "body"].map(String::from);
     let mut timings = Vec::with_capacity(samples);
     let mut result = Value::Null;
     for _ in 0..samples {
         let mut db = Db::empty();
         db.run("index docs [wing, ts]")?;
-        let prepared = db.prepare(&source)?;
+        let prepared = sources
+            .iter()
+            .map(|source| db.prepare(source))
+            .collect::<Result<Vec<_>, _>>()?;
         let start = Instant::now();
-        let affected = black_box(prepared.run(&mut db)?).done.n;
+        let affected = if prepared.len() == 1 {
+            black_box(prepared[0].run(&mut db)?).done.n
+        } else {
+            let mut tx = db.transaction()?;
+            let mut affected = 0;
+            for statement in &prepared {
+                affected += black_box(tx.run_prepared(statement)?).done.n;
+            }
+            tx.commit()?;
+            affected
+        };
         timings.push(start.elapsed().as_nanos() as f64);
         if affected != n {
             return Err("insert affected count mismatch".into());
@@ -123,7 +141,9 @@ fn measure_insert(
             return Err("insert exact values mismatch".into());
         }
     }
-    Ok(json!({"samples_ns":timings,"result":result}))
+    Ok(json!({"samples_ns":timings,"result":result,
+        "statement_rows_limit":10_000,"statements":sources.len(),
+        "api":if sources.len()==1 {"prepared run"} else {"prepared chunks in one memory transaction"}}))
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -177,4 +197,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         out.flush()?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hundred_thousand_native_rows_respect_default_statement_quotas() {
+        // A single AST for this fixture exceeds the default 8 MiB quota.
+        // Exact six-field readback and default embeddings are checked by measure_insert.
+        let measured = measure_insert(100_000, 1, 123456).unwrap();
+        assert_eq!(measured["statements"], 10);
+        assert_eq!(measured["samples_ns"].as_array().unwrap().len(), 1);
+        assert_eq!(measured["result"].as_array().unwrap().len(), 100_000);
+        assert_eq!(measured["result"][99_999][0], "d-99999");
+        assert_eq!(measured["result"][99_999][4], 123456);
+    }
 }

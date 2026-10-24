@@ -341,6 +341,11 @@ class NativeInsert(Lin):
         if self.engine == "lin":
             result = self.ask({"insert_rows": len(self.want), "samples": samples, "timestamp_ms": self.timestamp})
             validate(result["result"], self.want, self.engine, "insert_native")
+            for key in ["statement_rows_limit", "statements"]:
+                if key in result:
+                    self.contract[key] = result[key]
+            if "api" in result:
+                self.contract["execution_path"] = result["api"]
             return result["samples_ns"], 1, result["result"]
         if self.engine == "mysql":
             timings = []

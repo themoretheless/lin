@@ -1,0 +1,215 @@
+{
+  "wins": 14,
+  "comparisons": 15,
+  "datasets": {
+    "1000": {
+      "lin_ns": 749958.5,
+      "losses": [],
+      "versions": {
+        "lin": "0.4.0",
+        "sqlite": "3.54.1",
+        "duckdb": "1.5.6",
+        "postgres": "160015",
+        "mysql": "8.4.11",
+        "mongo": "8.0.34"
+      },
+      "contracts": {
+        "lin": {
+          "schema": "id/uri/wing/title/ts/body; unique id and uri; wing+ts index",
+          "fixture": "fresh per sample; schema/index/prepare/validation/drop excluded",
+          "durability": "native memory API comparison; no disk durability equivalence",
+          "api": "Rust prepared run; default embedding and FTS",
+          "storage": "Db::empty",
+          "statement_rows_limit": 10000,
+          "statements": 1,
+          "execution_path": "prepared run"
+        },
+        "sqlite": {
+          "schema": "id/uri/wing/title/ts/body; unique id and uri; wing+ts index",
+          "fixture": "fresh per sample; schema/index/prepare/validation/drop excluded",
+          "durability": "native memory API comparison; no disk durability equivalence",
+          "api": "Python sqlite3 executemany plus transaction commit",
+          "storage": ":memory:",
+          "atomicity": "one transaction per sample"
+        },
+        "duckdb": {
+          "schema": "id/uri/wing/title/ts/body; unique id and uri; wing+ts index",
+          "fixture": "fresh per sample; schema/index/prepare/validation/drop excluded",
+          "durability": "native memory API comparison; no disk durability equivalence",
+          "api": "DuckDB prepared INSERT SELECT from registered pandas DataFrame plus commit",
+          "storage": ":memory:",
+          "atomicity": "one transaction per sample"
+        },
+        "postgres": {
+          "schema": "id/uri/wing/title/ts/body; unique id and uri; wing+ts index",
+          "fixture": "fresh per sample; schema/index/prepare/validation/drop excluded",
+          "durability": "native memory API comparison; no disk durability equivalence",
+          "api": "Psycopg COPY CSV block plus transaction commit",
+          "storage": "configured dedicated server",
+          "atomicity": "one transaction per sample",
+          "synchronous_commit": "on"
+        },
+        "mysql": {
+          "schema": "id/uri/wing/title/ts/body; unique id and uri; wing+ts index",
+          "fixture": "fresh per sample; schema/index/prepare/validation/drop excluded",
+          "durability": "native memory API comparison; no disk durability equivalence",
+          "api": "PyMySQL executemany multi-row INSERT plus transaction commit",
+          "storage": "configured dedicated server",
+          "atomicity": "one transaction per sample",
+          "innodb_flush_log_at_trx_commit": 1,
+          "sync_binlog": 1
+        },
+        "mongo": {
+          "schema": "id/uri/wing/title/ts/body; unique id and uri; wing+ts index",
+          "fixture": "fresh per sample; schema/index/prepare/validation/drop excluded",
+          "durability": "native memory API comparison; no disk durability equivalence",
+          "api": "PyMongo ordered insert_many; id maps to native _id",
+          "write_concern": {
+            "j": false,
+            "w": 1
+          }
+        }
+      }
+    },
+    "10000": {
+      "lin_ns": 9411937.5,
+      "losses": [],
+      "versions": {
+        "lin": "0.4.0",
+        "sqlite": "3.54.1",
+        "duckdb": "1.5.6",
+        "postgres": "160015",
+        "mysql": "8.4.11",
+        "mongo": "8.0.34"
+      },
+      "contracts": {
+        "lin": {
+          "schema": "id/uri/wing/title/ts/body; unique id and uri; wing+ts index",
+          "fixture": "fresh per sample; schema/index/prepare/validation/drop excluded",
+          "durability": "native memory API comparison; no disk durability equivalence",
+          "api": "Rust prepared run; default embedding and FTS",
+          "storage": "Db::empty",
+          "statement_rows_limit": 10000,
+          "statements": 1,
+          "execution_path": "prepared run"
+        },
+        "sqlite": {
+          "schema": "id/uri/wing/title/ts/body; unique id and uri; wing+ts index",
+          "fixture": "fresh per sample; schema/index/prepare/validation/drop excluded",
+          "durability": "native memory API comparison; no disk durability equivalence",
+          "api": "Python sqlite3 executemany plus transaction commit",
+          "storage": ":memory:",
+          "atomicity": "one transaction per sample"
+        },
+        "duckdb": {
+          "schema": "id/uri/wing/title/ts/body; unique id and uri; wing+ts index",
+          "fixture": "fresh per sample; schema/index/prepare/validation/drop excluded",
+          "durability": "native memory API comparison; no disk durability equivalence",
+          "api": "DuckDB prepared INSERT SELECT from registered pandas DataFrame plus commit",
+          "storage": ":memory:",
+          "atomicity": "one transaction per sample"
+        },
+        "postgres": {
+          "schema": "id/uri/wing/title/ts/body; unique id and uri; wing+ts index",
+          "fixture": "fresh per sample; schema/index/prepare/validation/drop excluded",
+          "durability": "native memory API comparison; no disk durability equivalence",
+          "api": "Psycopg COPY CSV block plus transaction commit",
+          "storage": "configured dedicated server",
+          "atomicity": "one transaction per sample",
+          "synchronous_commit": "on"
+        },
+        "mysql": {
+          "schema": "id/uri/wing/title/ts/body; unique id and uri; wing+ts index",
+          "fixture": "fresh per sample; schema/index/prepare/validation/drop excluded",
+          "durability": "native memory API comparison; no disk durability equivalence",
+          "api": "PyMySQL executemany multi-row INSERT plus transaction commit",
+          "storage": "configured dedicated server",
+          "atomicity": "one transaction per sample",
+          "innodb_flush_log_at_trx_commit": 1,
+          "sync_binlog": 1
+        },
+        "mongo": {
+          "schema": "id/uri/wing/title/ts/body; unique id and uri; wing+ts index",
+          "fixture": "fresh per sample; schema/index/prepare/validation/drop excluded",
+          "durability": "native memory API comparison; no disk durability equivalence",
+          "api": "PyMongo ordered insert_many; id maps to native _id",
+          "write_concern": {
+            "j": false,
+            "w": 1
+          }
+        }
+      }
+    },
+    "100000": {
+      "lin_ns": 112805979.0,
+      "losses": [
+        "duckdb"
+      ],
+      "versions": {
+        "lin": "0.4.0",
+        "sqlite": "3.54.1",
+        "duckdb": "1.5.6",
+        "postgres": "160015",
+        "mysql": "8.4.11",
+        "mongo": "8.0.34"
+      },
+      "contracts": {
+        "lin": {
+          "schema": "id/uri/wing/title/ts/body; unique id and uri; wing+ts index",
+          "fixture": "fresh per sample; schema/index/prepare/validation/drop excluded",
+          "durability": "native memory API comparison; no disk durability equivalence",
+          "api": "Rust prepared run; default embedding and FTS",
+          "storage": "Db::empty",
+          "statement_rows_limit": 10000,
+          "statements": 10,
+          "execution_path": "prepared chunks in one memory transaction"
+        },
+        "sqlite": {
+          "schema": "id/uri/wing/title/ts/body; unique id and uri; wing+ts index",
+          "fixture": "fresh per sample; schema/index/prepare/validation/drop excluded",
+          "durability": "native memory API comparison; no disk durability equivalence",
+          "api": "Python sqlite3 executemany plus transaction commit",
+          "storage": ":memory:",
+          "atomicity": "one transaction per sample"
+        },
+        "duckdb": {
+          "schema": "id/uri/wing/title/ts/body; unique id and uri; wing+ts index",
+          "fixture": "fresh per sample; schema/index/prepare/validation/drop excluded",
+          "durability": "native memory API comparison; no disk durability equivalence",
+          "api": "DuckDB prepared INSERT SELECT from registered pandas DataFrame plus commit",
+          "storage": ":memory:",
+          "atomicity": "one transaction per sample"
+        },
+        "postgres": {
+          "schema": "id/uri/wing/title/ts/body; unique id and uri; wing+ts index",
+          "fixture": "fresh per sample; schema/index/prepare/validation/drop excluded",
+          "durability": "native memory API comparison; no disk durability equivalence",
+          "api": "Psycopg COPY CSV block plus transaction commit",
+          "storage": "configured dedicated server",
+          "atomicity": "one transaction per sample",
+          "synchronous_commit": "on"
+        },
+        "mysql": {
+          "schema": "id/uri/wing/title/ts/body; unique id and uri; wing+ts index",
+          "fixture": "fresh per sample; schema/index/prepare/validation/drop excluded",
+          "durability": "native memory API comparison; no disk durability equivalence",
+          "api": "PyMySQL executemany multi-row INSERT plus transaction commit",
+          "storage": "configured dedicated server",
+          "atomicity": "one transaction per sample",
+          "innodb_flush_log_at_trx_commit": 1,
+          "sync_binlog": 1
+        },
+        "mongo": {
+          "schema": "id/uri/wing/title/ts/body; unique id and uri; wing+ts index",
+          "fixture": "fresh per sample; schema/index/prepare/validation/drop excluded",
+          "durability": "native memory API comparison; no disk durability equivalence",
+          "api": "PyMongo ordered insert_many; id maps to native _id",
+          "write_concern": {
+            "j": false,
+            "w": 1
+          }
+        }
+      }
+    }
+  }
+}
