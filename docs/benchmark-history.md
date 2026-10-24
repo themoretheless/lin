@@ -8,6 +8,8 @@
 
 ## Обновление 2026-10-24
 
+- [Apple WAL preallocation — real engine](../benches/results/2026-10-24-wal-preallocation-engine/report.md): durable 1k paired +11,58% / +6,37%; interleaved +3,16% (на уровне A/A) / +7,22% (6/6). Резерв 1 МиБ увеличивает физическую allocation открытого WAL; workspace/replay прошли. Durable 1k всё ещё проигрывает SQLite; цель всех peers остаётся открытой.
+
 Исторический каталог ниже сохраняет срез 5 октября. Новые измерения текущего кода:
 
 - [WAL preallocation fresh-file](../benches/results/2026-10-24-wal-preallocation-io/report.md) / [32-append amortization](../benches/results/2026-10-24-wal-preallocation-amortized-io/report.md): физический резерв 1 МиБ без изменения логических bytes/Full sync. С учётом refill суммарный I/O +20,5% / +10,6%, но повторный A/A-контроль расходится ~9,6%; гипотеза требует лучшей изоляции и real-Db проверки, production не менялся.

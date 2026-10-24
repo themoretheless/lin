@@ -768,14 +768,65 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
     f.sync_all()
 }
 
+// Best-effort physical allocation only; logical WAL bytes/length and sync stay unchanged.
+fn reserve_wal_space(log: &File, additional: usize, empty_only: bool) {
+    #[cfg(target_vendor = "apple")]
+    {
+        use std::os::unix::{fs::MetadataExt, io::AsRawFd};
+        const CHUNK: u64 = 1024 * 1024;
+        let Ok(metadata) = log.metadata() else {
+            return;
+        };
+        if empty_only && metadata.len() != 0 {
+            return;
+        }
+        let Ok(additional) = u64::try_from(additional) else {
+            return;
+        };
+        let Some(required) = metadata.len().checked_add(additional) else {
+            return;
+        };
+        let allocated = metadata.blocks().saturating_mul(512);
+        if allocated >= required {
+            return;
+        }
+        let Some(rounded) = required.checked_add(CHUNK - 1).map(|n| n / CHUNK * CHUNK) else {
+            return;
+        };
+        // Do not reserve an arbitrarily large sparse-file backlog.
+        let length = rounded
+            .saturating_sub(allocated)
+            .min(additional.saturating_add(CHUNK));
+        let Ok(length) = i64::try_from(length) else {
+            return;
+        };
+        if length == 0 {
+            return;
+        }
+        let mut request = libc::fstore_t {
+            fst_flags: libc::F_ALLOCATEALL,
+            fst_posmode: libc::F_PEOFPOSMODE,
+            fst_offset: 0,
+            fst_length: length,
+            fst_bytesalloc: 0,
+        };
+        // Unsupported filesystem / allocation failure retains the ordinary write path.
+        let _ = unsafe { libc::fcntl(log.as_raw_fd(), libc::F_PREALLOCATE, &mut request) };
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    let _ = (log, additional, empty_only);
+}
+
 pub fn open_log(dir: &Path) -> Result<File, Error> {
-    OpenOptions::new()
+    let file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
         .open(log_path(dir))
-        .map_err(io_err)
+        .map_err(io_err)?;
+    reserve_wal_space(&file, 1024 * 1024, true);
+    Ok(file)
 }
 
 /// Open log for read-only replay (no create / no truncate).
@@ -985,6 +1036,9 @@ fn write_frame_bytes(
     len: u32,
 ) -> io::Result<()> {
     const INLINE_MAX: usize = 1024 * 1024;
+    if payload.len() >= 64 * 1024 {
+        reserve_wal_space(log, payload.len().saturating_add(13), false);
+    }
     if payload.len() <= INLINE_MAX {
         FRAME_WRITE_SCRATCH.with(|cell| {
             let mut scratch = cell.borrow_mut();
@@ -3616,5 +3670,45 @@ mod dictionary_wal_tests {
             }
             fs::remove_dir_all(root).unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod wal_preallocation_tests {
+    use super::*;
+    use std::io::{Seek, SeekFrom};
+    #[test]
+    fn reservation_preserves_contents_length_position_and_read_only_open() {
+        let path = std::env::temp_dir().join(format!(
+            "lin-preallocation-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&path).unwrap();
+        let mut file = open_log(&path).unwrap();
+        assert_eq!(file.metadata().unwrap().len(), 0);
+        assert_eq!(file.stream_position().unwrap(), 0);
+        file.write_all(b"prefix").unwrap();
+        file.seek(SeekFrom::Start(2)).unwrap();
+        reserve_wal_space(&file, 2 * 1024 * 1024, false);
+        assert_eq!(file.metadata().unwrap().len(), 6);
+        assert_eq!(file.stream_position().unwrap(), 2);
+        assert_eq!(std::fs::read(log_path(&path)).unwrap(), b"prefix");
+        reserve_wal_space(&file, usize::MAX, false);
+        assert_eq!(file.metadata().unwrap().len(), 6);
+        file.seek(SeekFrom::End(0)).unwrap();
+        file.write_all(b"suffix").unwrap();
+        drop(file);
+        let file = open_log(&path).unwrap();
+        assert_eq!(file.metadata().unwrap().len(), 12);
+        drop(file);
+        let before = std::fs::read(log_path(&path)).unwrap();
+        drop(open_log_read(&path).unwrap());
+        assert_eq!(std::fs::read(log_path(&path)).unwrap(), before);
+        assert_eq!(before, b"prefixsuffix");
+        std::fs::remove_dir_all(path).unwrap();
     }
 }
