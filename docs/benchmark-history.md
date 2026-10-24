@@ -10,6 +10,8 @@
 
 Исторический каталог ниже сохраняет срез 5 октября. Новые измерения текущего кода:
 
+- [LZ4 WAL CPU/byte gate](../benches/results/2026-10-24-lz4-wal-cpu/report.md): реальные codec-3 payload 1k/10k; 1k уменьшается ~4,4–4,7×, но CPU +0,106–0,122 мс; 10k CPU +2,1–2,3 мс. Write+sync ещё не измерены, compression/default codec в production не менялись.
+
 - [TLS hash-cache CPU gate](../benches/results/2026-10-24-tls-hash-cache-cpu/report.md): Mutex → RefCell в source-derived TLS helper; warm 1k +27,1% CPU, но абсолютная разница ~3 мкс/1000 обращений. Только компонентная feasibility, production не менялся, ускорение БД не доказано.
 
 - [Interleaved durable A/A protocol](../benches/results/2026-10-24-interleaved-durable-control/report.md): постоянные workers, чередование каждого sample, 1152 измерения с exact/bit-check. Абсолютные pair-различия 1k: медианы 2,1% / 3,1%, максимум 8,2%; отдельная квалификация протокола, не ускорение движка.
