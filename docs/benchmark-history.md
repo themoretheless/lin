@@ -10,6 +10,8 @@
 
 Исторический каталог ниже сохраняет срез 5 октября. Новые измерения текущего кода:
 
+- [Current-source read refresh](../benches/results/2026-10-24-current-read-refresh-final/report.md): **108/108** агрегированных побед в шести сценариях против SQLite/DuckDB/PostgreSQL/MySQL/MongoDB/pandas, 1k/10k/100k, три процесса × 12 samples. Hash/значения/cleanup проверены; MSSQL/Kusto и durable 1k остаются открыты.
+
 - [Native insert refresh на текущем коде](../benches/results/2026-10-24-current-native-refresh/report.md): **15/15** агрегированных побед против SQLite/DuckDB/PostgreSQL/MySQL/MongoDB, 1k/10k/100k, три процесса × 12 samples. На 100k Lin 90,296 мс / DuckDB 99,004 мс. Native memory API контракт; durable и MSSQL/Kusto этим не закрыты.
 
 - [Production dictionary WAL writer — отклонён](../benches/results/2026-10-24-dictionary-wal-writer/report.md): durable 1k −3,3% и −4,9% в двух независимых сериях. Workspace и crash/bit-exact проверки прошли; меньший WAL не дал end-to-end ускорения. Writer восстановлен побайтно, автоматическая запись codec 5 выключена.
