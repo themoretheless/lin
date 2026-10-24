@@ -1,0 +1,311 @@
+skip postgres: no reachable server
+  tried: postgresql://lin:lin@127.0.0.1:55432/lin (error connecting to server); postgresql://postgres@127.0.0.1:5432/postgres (error connecting to server)
+  set LIN_BENCH_PG_URL or:
+  docker compose -f docker-compose.bench.yml up -d postgres
+  # brew postgresql@17 via Sources/ppduster macos-stack-postgres; start service for :5432
+skip mysql: LIN_BENCH_SKIP_MYSQL is set
+lin compare: N=10000 warm reads (fixture), bulk insert (schema outside timing)
+engines: Lin | SQLite(rusqlite bundled) | DuckDB(bundled) | HashMap(point get only) | Postgres(skipped) | MySQL(skipped)
+airbug dash: http://127.0.0.1:8790/
+Lin reads: prepare once / run many; filters use count (fair vs SQL COUNT(*));
+substring: Lin `title ~ "wal" | count` vs SQL LIKE '%wal%' COUNT(*);
+materialize: Lin `wing==rag | {id,title} | take all` vs SQL SELECT id,title;
+join: 10000 orders ⋈ 1000 users (Lin run_batch SoA / cursor vs SQL INNER JOIN);
+append_log: Lin `append facts` vs SQL INSERT INTO logs (append-only shape)
+airbug dash: http://127.0.0.1:8790/#/bench
+bench: compare/durable_insert_1k/lin — validating and calibrating
+WAL_FRAME bytes=89 checksum_ns=0 write_ns=627000 sync_ns=12758750
+WAL_PACK rows=1000 elapsed_ns=369917
+WAL_CLASSIFY rows=1000 elapsed_ns=115000
+WAL_ENCODE rows=1000 bytes=336968 elapsed_ns=621875
+WAL_FRAME bytes=336968 checksum_ns=40833 write_ns=89416 sync_ns=1655375
+WAL_FRAME bytes=89 checksum_ns=42 write_ns=644792 sync_ns=838500
+WAL_PACK rows=1000 elapsed_ns=206292
+WAL_CLASSIFY rows=1000 elapsed_ns=114791
+WAL_ENCODE rows=1000 bytes=336968 elapsed_ns=564250
+WAL_FRAME bytes=336968 checksum_ns=40958 write_ns=59584 sync_ns=4234834
+bench: compare/durable_insert_1k/lin — measuring 24 samples
+WAL_FRAME bytes=89 checksum_ns=84 write_ns=78042 sync_ns=751333
+WAL_PACK rows=1000 elapsed_ns=217041
+WAL_CLASSIFY rows=1000 elapsed_ns=114542
+WAL_ENCODE rows=1000 bytes=336968 elapsed_ns=538708
+WAL_FRAME bytes=336968 checksum_ns=40833 write_ns=62000 sync_ns=805666
+WAL_FRAME bytes=89 checksum_ns=42 write_ns=80333 sync_ns=793000
+WAL_PACK rows=1000 elapsed_ns=216792
+WAL_CLASSIFY rows=1000 elapsed_ns=115959
+WAL_ENCODE rows=1000 bytes=336968 elapsed_ns=542417
+WAL_FRAME bytes=336968 checksum_ns=40917 write_ns=60375 sync_ns=689458
+WAL_FRAME bytes=89 checksum_ns=125 write_ns=61042 sync_ns=1056000
+WAL_PACK rows=1000 elapsed_ns=262375
+WAL_CLASSIFY rows=1000 elapsed_ns=118584
+WAL_ENCODE rows=1000 bytes=336968 elapsed_ns=506209
+WAL_FRAME bytes=336968 checksum_ns=40958 write_ns=58583 sync_ns=759458
+WAL_FRAME bytes=89 checksum_ns=84 write_ns=100334 sync_ns=913500
+WAL_PACK rows=1000 elapsed_ns=229667
+WAL_CLASSIFY rows=1000 elapsed_ns=116291
+WAL_ENCODE rows=1000 bytes=336968 elapsed_ns=525209
+WAL_FRAME bytes=336968 checksum_ns=40959 write_ns=53000 sync_ns=906709
+WAL_FRAME bytes=89 checksum_ns=41 write_ns=93417 sync_ns=906125
+WAL_PACK rows=1000 elapsed_ns=237416
+WAL_CLASSIFY rows=1000 elapsed_ns=126334
+WAL_ENCODE rows=1000 bytes=336968 elapsed_ns=557083
+WAL_FRAME bytes=336968 checksum_ns=44167 write_ns=55416 sync_ns=814583
+WAL_FRAME bytes=89 checksum_ns=41 write_ns=334959 sync_ns=624791
+WAL_PACK rows=1000 elapsed_ns=239709
+WAL_CLASSIFY rows=1000 elapsed_ns=124958
+WAL_ENCODE rows=1000 bytes=336968 elapsed_ns=558458
+WAL_FRAME bytes=336968 checksum_ns=44125 write_ns=51542 sync_ns=1090500
+WAL_FRAME bytes=89 checksum_ns=167 write_ns=68292 sync_ns=964750
+WAL_PACK rows=1000 elapsed_ns=244458
+WAL_CLASSIFY rows=1000 elapsed_ns=125709
+WAL_ENCODE rows=1000 bytes=336968 elapsed_ns=521625
+WAL_FRAME bytes=336968 checksum_ns=44125 write_ns=52833 sync_ns=1016667
+WAL_FRAME bytes=89 checksum_ns=83 write_ns=64000 sync_ns=838209
+WAL_PACK rows=1000 elapsed_ns=251250
+WAL_CLASSIFY rows=1000 elapsed_ns=126667
+WAL_ENCODE rows=1000 bytes=336968 elapsed_ns=592542
+WAL_FRAME bytes=336968 checksum_ns=44083 write_ns=50458 sync_ns=721958
+WAL_FRAME bytes=89 checksum_ns=125 write_ns=84709 sync_ns=832000
+WAL_PACK rows=1000 elapsed_ns=229166
+WAL_CLASSIFY rows=1000 elapsed_ns=124875
+WAL_ENCODE rows=1000 bytes=336968 elapsed_ns=589125
+WAL_FRAME bytes=336968 checksum_ns=44125 write_ns=50625 sync_ns=776375
+WAL_FRAME bytes=89 checksum_ns=84 write_ns=69084 sync_ns=954709
+WAL_PACK rows=1000 elapsed_ns=247708
+WAL_CLASSIFY rows=1000 elapsed_ns=141042
+WAL_ENCODE rows=1000 bytes=336968 elapsed_ns=630750
+WAL_FRAME bytes=336968 checksum_ns=44166 write_ns=55375 sync_ns=1146083
+WAL_FRAME bytes=89 checksum_ns=125 write_ns=63708 sync_ns=1130750
+WAL_PACK rows=1000 elapsed_ns=244458
+WAL_CLASSIFY rows=1000 elapsed_ns=125458
+WAL_ENCODE rows=1000 bytes=336968 elapsed_ns=573542
+WAL_FRAME bytes=336968 checksum_ns=44125 write_ns=55584 sync_ns=673625
+WAL_FRAME bytes=89 checksum_ns=42 write_ns=87833 sync_ns=982625
+WAL_PACK rows=1000 elapsed_ns=238417
+WAL_CLASSIFY rows=1000 elapsed_ns=125459
+WAL_ENCODE rows=1000 bytes=336968 elapsed_ns=544792
+WAL_FRAME bytes=336968 checksum_ns=44167 write_ns=54334 sync_ns=820209
+WAL_FRAME bytes=89 checksum_ns=42 write_ns=77000 sync_ns=949958
+WAL_PACK rows=1000 elapsed_ns=268792
+WAL_CLASSIFY rows=1000 elapsed_ns=133417
+WAL_ENCODE rows=1000 bytes=336968 elapsed_ns=588709
+WAL_FRAME bytes=336968 checksum_ns=44250 write_ns=53708 sync_ns=835792
+WAL_FRAME bytes=89 checksum_ns=42 write_ns=81958 sync_ns=846500
+WAL_PACK rows=1000 elapsed_ns=249834
+WAL_CLASSIFY rows=1000 elapsed_ns=125458
+WAL_ENCODE rows=1000 bytes=336968 elapsed_ns=578625
+WAL_FRAME bytes=336968 checksum_ns=44166 write_ns=54125 sync_ns=695209
+WAL_FRAME bytes=89 checksum_ns=83 write_ns=146250 sync_ns=971625
+WAL_PACK rows=1000 elapsed_ns=252708
+WAL_CLASSIFY rows=1000 elapsed_ns=127500
+WAL_ENCODE rows=1000 bytes=336968 elapsed_ns=548584
+WAL_FRAME bytes=336968 checksum_ns=44167 write_ns=113708 sync_ns=773083
+WAL_FRAME bytes=89 checksum_ns=41 write_ns=83042 sync_ns=881792
+WAL_PACK rows=1000 elapsed_ns=263833
+WAL_CLASSIFY rows=1000 elapsed_ns=125208
+WAL_ENCODE rows=1000 bytes=336968 elapsed_ns=569375
+WAL_FRAME bytes=336968 checksum_ns=51875 write_ns=57791 sync_ns=785417
+WAL_FRAME bytes=89 checksum_ns=41 write_ns=85959 sync_ns=1167292
+WAL_PACK rows=1000 elapsed_ns=272292
+WAL_CLASSIFY rows=1000 elapsed_ns=126916
+WAL_ENCODE rows=1000 bytes=336968 elapsed_ns=583625
+WAL_FRAME bytes=336968 checksum_ns=44167 write_ns=49750 sync_ns=839000
+WAL_FRAME bytes=89 checksum_ns=42 write_ns=43250 sync_ns=921167
+WAL_PACK rows=1000 elapsed_ns=275208
+WAL_CLASSIFY rows=1000 elapsed_ns=126833
+WAL_ENCODE rows=1000 bytes=336968 elapsed_ns=585334
+WAL_FRAME bytes=336968 checksum_ns=44209 write_ns=77875 sync_ns=1597083
+WAL_FRAME bytes=89 checksum_ns=250 write_ns=97666 sync_ns=939958
+WAL_PACK rows=1000 elapsed_ns=260292
+WAL_CLASSIFY rows=1000 elapsed_ns=124875
+WAL_ENCODE rows=1000 bytes=336968 elapsed_ns=573333
+WAL_FRAME bytes=336968 checksum_ns=44208 write_ns=64708 sync_ns=773875
+WAL_FRAME bytes=89 checksum_ns=42 write_ns=146417 sync_ns=1127500
+WAL_PACK rows=1000 elapsed_ns=272541
+WAL_CLASSIFY rows=1000 elapsed_ns=126208
+WAL_ENCODE rows=1000 bytes=336968 elapsed_ns=584417
+WAL_FRAME bytes=336968 checksum_ns=44208 write_ns=63708 sync_ns=802750
+WAL_FRAME bytes=89 checksum_ns=0 write_ns=89709 sync_ns=749625
+WAL_PACK rows=1000 elapsed_ns=280625
+WAL_CLASSIFY rows=1000 elapsed_ns=129625
+WAL_ENCODE rows=1000 bytes=336968 elapsed_ns=572667
+WAL_FRAME bytes=336968 checksum_ns=44125 write_ns=59750 sync_ns=776666
+WAL_FRAME bytes=89 checksum_ns=0 write_ns=82291 sync_ns=1409000
+WAL_PACK rows=1000 elapsed_ns=265291
+WAL_CLASSIFY rows=1000 elapsed_ns=125208
+WAL_ENCODE rows=1000 bytes=336968 elapsed_ns=628833
+WAL_FRAME bytes=336968 checksum_ns=56542 write_ns=55333 sync_ns=1239500
+WAL_FRAME bytes=89 checksum_ns=0 write_ns=115042 sync_ns=2421208
+WAL_PACK rows=1000 elapsed_ns=288875
+WAL_CLASSIFY rows=1000 elapsed_ns=131000
+WAL_ENCODE rows=1000 bytes=336968 elapsed_ns=601000
+WAL_FRAME bytes=336968 checksum_ns=44209 write_ns=76125 sync_ns=1313250
+WAL_FRAME bytes=89 checksum_ns=42 write_ns=81875 sync_ns=863125
+WAL_PACK rows=1000 elapsed_ns=265375
+WAL_CLASSIFY rows=1000 elapsed_ns=126750
+WAL_ENCODE rows=1000 bytes=336968 elapsed_ns=576750
+WAL_FRAME bytes=336968 checksum_ns=44250 write_ns=71458 sync_ns=679625
+WAL_FRAME bytes=89 checksum_ns=42 write_ns=133542 sync_ns=1628167
+WAL_PACK rows=1000 elapsed_ns=265542
+WAL_CLASSIFY rows=1000 elapsed_ns=124875
+WAL_ENCODE rows=1000 bytes=336968 elapsed_ns=572041
+WAL_FRAME bytes=336968 checksum_ns=44167 write_ns=56541 sync_ns=993167
+bench: compare/durable_insert_10k/lin — validating and calibrating
+WAL_FRAME bytes=89 checksum_ns=42 write_ns=111416 sync_ns=1306458
+WAL_PACK rows=10000 elapsed_ns=5553750
+WAL_CLASSIFY rows=10000 elapsed_ns=428750
+WAL_ENCODE rows=10000 bytes=3558340 elapsed_ns=2505959
+WAL_FRAME bytes=3558340 checksum_ns=466084 write_ns=268000 sync_ns=2116792
+WAL_FRAME bytes=89 checksum_ns=42 write_ns=65750 sync_ns=797625
+WAL_PACK rows=10000 elapsed_ns=5612000
+WAL_CLASSIFY rows=10000 elapsed_ns=410750
+WAL_ENCODE rows=10000 bytes=3558340 elapsed_ns=2274334
+WAL_FRAME bytes=3558340 checksum_ns=517042 write_ns=276209 sync_ns=1691042
+bench: compare/durable_insert_10k/lin — measuring 24 samples
+WAL_FRAME bytes=89 checksum_ns=83 write_ns=57875 sync_ns=830209
+WAL_PACK rows=10000 elapsed_ns=5105042
+WAL_CLASSIFY rows=10000 elapsed_ns=425042
+WAL_ENCODE rows=10000 bytes=3558340 elapsed_ns=2368042
+WAL_FRAME bytes=3558340 checksum_ns=465459 write_ns=234292 sync_ns=1434792
+WAL_FRAME bytes=89 checksum_ns=42 write_ns=83125 sync_ns=875584
+WAL_PACK rows=10000 elapsed_ns=2564917
+WAL_CLASSIFY rows=10000 elapsed_ns=419333
+WAL_ENCODE rows=10000 bytes=3558340 elapsed_ns=2011417
+WAL_FRAME bytes=3558340 checksum_ns=476667 write_ns=285334 sync_ns=1507209
+WAL_FRAME bytes=89 checksum_ns=125 write_ns=75584 sync_ns=1788250
+WAL_PACK rows=10000 elapsed_ns=2888666
+WAL_CLASSIFY rows=10000 elapsed_ns=430458
+WAL_ENCODE rows=10000 bytes=3558340 elapsed_ns=2014500
+WAL_FRAME bytes=3558340 checksum_ns=443208 write_ns=260333 sync_ns=1427000
+WAL_FRAME bytes=89 checksum_ns=0 write_ns=52666 sync_ns=1204250
+WAL_PACK rows=10000 elapsed_ns=2785208
+WAL_CLASSIFY rows=10000 elapsed_ns=442375
+WAL_ENCODE rows=10000 bytes=3558340 elapsed_ns=2013209
+WAL_FRAME bytes=3558340 checksum_ns=431250 write_ns=270875 sync_ns=1205666
+WAL_FRAME bytes=89 checksum_ns=0 write_ns=57334 sync_ns=853041
+WAL_PACK rows=10000 elapsed_ns=2863125
+WAL_CLASSIFY rows=10000 elapsed_ns=459083
+WAL_ENCODE rows=10000 bytes=3558340 elapsed_ns=1990583
+WAL_FRAME bytes=3558340 checksum_ns=431375 write_ns=251750 sync_ns=1323208
+WAL_FRAME bytes=89 checksum_ns=42 write_ns=88500 sync_ns=1213959
+WAL_PACK rows=10000 elapsed_ns=2929791
+WAL_CLASSIFY rows=10000 elapsed_ns=452417
+WAL_ENCODE rows=10000 bytes=3558340 elapsed_ns=2109750
+WAL_FRAME bytes=3558340 checksum_ns=432625 write_ns=264958 sync_ns=1863834
+WAL_FRAME bytes=89 checksum_ns=84 write_ns=87167 sync_ns=876125
+WAL_PACK rows=10000 elapsed_ns=3188667
+WAL_CLASSIFY rows=10000 elapsed_ns=459250
+WAL_ENCODE rows=10000 bytes=3558340 elapsed_ns=2002333
+WAL_FRAME bytes=3558340 checksum_ns=431208 write_ns=277542 sync_ns=1596709
+WAL_FRAME bytes=89 checksum_ns=125 write_ns=54666 sync_ns=1444375
+WAL_PACK rows=10000 elapsed_ns=2861625
+WAL_CLASSIFY rows=10000 elapsed_ns=454792
+WAL_ENCODE rows=10000 bytes=3558340 elapsed_ns=2337958
+WAL_FRAME bytes=3558340 checksum_ns=457250 write_ns=289500 sync_ns=1588250
+WAL_FRAME bytes=89 checksum_ns=84 write_ns=63416 sync_ns=870958
+WAL_PACK rows=10000 elapsed_ns=2641833
+WAL_CLASSIFY rows=10000 elapsed_ns=439666
+WAL_ENCODE rows=10000 bytes=3558340 elapsed_ns=2062708
+WAL_FRAME bytes=3558340 checksum_ns=465458 write_ns=248083 sync_ns=1230208
+WAL_FRAME bytes=89 checksum_ns=83 write_ns=66875 sync_ns=1022541
+WAL_PACK rows=10000 elapsed_ns=3194833
+WAL_CLASSIFY rows=10000 elapsed_ns=416125
+WAL_ENCODE rows=10000 bytes=3558340 elapsed_ns=1883541
+WAL_FRAME bytes=3558340 checksum_ns=431250 write_ns=222834 sync_ns=1243209
+WAL_FRAME bytes=89 checksum_ns=83 write_ns=60416 sync_ns=869792
+WAL_PACK rows=10000 elapsed_ns=3259750
+WAL_CLASSIFY rows=10000 elapsed_ns=473709
+WAL_ENCODE rows=10000 bytes=3558340 elapsed_ns=2176250
+WAL_FRAME bytes=3558340 checksum_ns=473166 write_ns=255709 sync_ns=1448333
+WAL_FRAME bytes=89 checksum_ns=42 write_ns=63750 sync_ns=994208
+WAL_PACK rows=10000 elapsed_ns=2441958
+WAL_CLASSIFY rows=10000 elapsed_ns=464458
+WAL_ENCODE rows=10000 bytes=3558340 elapsed_ns=1972167
+WAL_FRAME bytes=3558340 checksum_ns=431166 write_ns=239166 sync_ns=1100333
+WAL_FRAME bytes=89 checksum_ns=84 write_ns=66375 sync_ns=884167
+WAL_PACK rows=10000 elapsed_ns=2581208
+WAL_CLASSIFY rows=10000 elapsed_ns=421000
+WAL_ENCODE rows=10000 bytes=3558340 elapsed_ns=2011750
+WAL_FRAME bytes=3558340 checksum_ns=431375 write_ns=251125 sync_ns=3312667
+WAL_FRAME bytes=89 checksum_ns=167 write_ns=81125 sync_ns=1008875
+WAL_PACK rows=10000 elapsed_ns=2632042
+WAL_CLASSIFY rows=10000 elapsed_ns=455208
+WAL_ENCODE rows=10000 bytes=3558340 elapsed_ns=2067083
+WAL_FRAME bytes=3558340 checksum_ns=468000 write_ns=238792 sync_ns=1421750
+WAL_FRAME bytes=89 checksum_ns=42 write_ns=62042 sync_ns=986833
+WAL_PACK rows=10000 elapsed_ns=2548208
+WAL_CLASSIFY rows=10000 elapsed_ns=443625
+WAL_ENCODE rows=10000 bytes=3558340 elapsed_ns=1944084
+WAL_FRAME bytes=3558340 checksum_ns=445791 write_ns=249084 sync_ns=1272917
+WAL_FRAME bytes=89 checksum_ns=125 write_ns=68292 sync_ns=848208
+WAL_PACK rows=10000 elapsed_ns=2697334
+WAL_CLASSIFY rows=10000 elapsed_ns=478708
+WAL_ENCODE rows=10000 bytes=3558340 elapsed_ns=1993416
+WAL_FRAME bytes=3558340 checksum_ns=436667 write_ns=270333 sync_ns=1359333
+WAL_FRAME bytes=89 checksum_ns=0 write_ns=76125 sync_ns=775500
+WAL_PACK rows=10000 elapsed_ns=2410166
+WAL_CLASSIFY rows=10000 elapsed_ns=447958
+WAL_ENCODE rows=10000 bytes=3558340 elapsed_ns=2012292
+WAL_FRAME bytes=3558340 checksum_ns=437458 write_ns=236458 sync_ns=1104208
+WAL_FRAME bytes=89 checksum_ns=42 write_ns=53917 sync_ns=890500
+WAL_PACK rows=10000 elapsed_ns=2528166
+WAL_CLASSIFY rows=10000 elapsed_ns=438708
+WAL_ENCODE rows=10000 bytes=3558340 elapsed_ns=1962208
+WAL_FRAME bytes=3558340 checksum_ns=437416 write_ns=235708 sync_ns=1531667
+WAL_FRAME bytes=89 checksum_ns=42 write_ns=33125 sync_ns=935250
+WAL_PACK rows=10000 elapsed_ns=2594792
+WAL_CLASSIFY rows=10000 elapsed_ns=454958
+WAL_ENCODE rows=10000 bytes=3558340 elapsed_ns=2074167
+WAL_FRAME bytes=3558340 checksum_ns=465417 write_ns=245417 sync_ns=1141500
+WAL_FRAME bytes=89 checksum_ns=84 write_ns=53541 sync_ns=814208
+WAL_PACK rows=10000 elapsed_ns=3615584
+WAL_CLASSIFY rows=10000 elapsed_ns=580625
+WAL_ENCODE rows=10000 bytes=3558340 elapsed_ns=2418083
+WAL_FRAME bytes=3558340 checksum_ns=465834 write_ns=281167 sync_ns=1901041
+WAL_FRAME bytes=89 checksum_ns=42 write_ns=64583 sync_ns=892208
+WAL_PACK rows=10000 elapsed_ns=3204125
+WAL_CLASSIFY rows=10000 elapsed_ns=538417
+WAL_ENCODE rows=10000 bytes=3558340 elapsed_ns=2237417
+WAL_FRAME bytes=3558340 checksum_ns=482708 write_ns=287000 sync_ns=1587208
+WAL_FRAME bytes=89 checksum_ns=42 write_ns=60291 sync_ns=911250
+WAL_PACK rows=10000 elapsed_ns=2901083
+WAL_CLASSIFY rows=10000 elapsed_ns=503791
+WAL_ENCODE rows=10000 bytes=3558340 elapsed_ns=2025333
+WAL_FRAME bytes=3558340 checksum_ns=436541 write_ns=239334 sync_ns=1453459
+WAL_FRAME bytes=89 checksum_ns=125 write_ns=85333 sync_ns=1518334
+WAL_PACK rows=10000 elapsed_ns=3333458
+WAL_CLASSIFY rows=10000 elapsed_ns=506875
+WAL_ENCODE rows=10000 bytes=3558340 elapsed_ns=2122875
+WAL_FRAME bytes=3558340 checksum_ns=436875 write_ns=297416 sync_ns=1578125
+WAL_FRAME bytes=89 checksum_ns=41 write_ns=66292 sync_ns=752541
+WAL_PACK rows=10000 elapsed_ns=3289625
+WAL_CLASSIFY rows=10000 elapsed_ns=571416
+WAL_ENCODE rows=10000 bytes=3558340 elapsed_ns=2310542
+WAL_FRAME bytes=3558340 checksum_ns=465709 write_ns=308958 sync_ns=1249500
+WAL_FRAME bytes=89 checksum_ns=0 write_ns=68334 sync_ns=803084
+WAL_PACK rows=10000 elapsed_ns=2532375
+WAL_CLASSIFY rows=10000 elapsed_ns=487750
+WAL_ENCODE rows=10000 bytes=3558340 elapsed_ns=2060958
+WAL_FRAME bytes=3558340 checksum_ns=476000 write_ns=240083 sync_ns=1535333
+# bench 1792801481517884000-94880
+
+Status: Complete
+
+| Case | Metric | Median | Unit | Scope / statistic | Observations | Processes |
+|---|---|---:|---|---|---:|---:|
+| compare/durable_insert_1k/lin [candidate] | wall | 3144479.5000 | ns | current thread wall clock; scheduler included / batch_total | 24 | 1 |
+| compare/durable_insert_10k/lin [candidate] | wall | 20970562.5000 | ns | current thread wall clock; scheduler included / batch_total | 24 | 1 |
+
+# Useful work throughput
+
+| Case | Median batch throughput | Unit |
+|---|---:|---|
+| compare/durable_insert_1k/lin [candidate] | 318017.6818 | rows/s |
+| compare/durable_insert_10k/lin [candidate] | 476889.6053 | rows/s |
+
+Derived from positive wall batches and declared units per operation; zero/unavailable durations omitted.
+
+Medians above summarize observations, not pooled operation-latency percentiles. Comparisons aggregate within each process first.
+
+- Raw batches are not independent process replications. Batch averages are not individual-operation latency. CPU frequency and background load are uncontrolled.
+
