@@ -201,6 +201,100 @@ class BenchmarkContractTests(unittest.TestCase):
                     else: self.assertIn("COMMIT TRANSACTION", events)
                     self.assertTrue(any("ROLLBACK TRANSACTION" in e for e in events))
 
+    def test_native_kusto_streaming_visibility_readback_and_cleanup(self):
+        import csv
+        import io
+        data = bench.dataset(41)
+        first = data[0][0]
+        data[0][0] = (*first[:3], "ЁЖ 🦔", "quote ' comma, tab\t newline\n")
+        want = [[d[0], d[1], d[2], d[3], 123456, d[4]] for d in data[0]]
+        for mode in ["ok", "stream_failure", "wrong_readback", "create_failure", "count_overflow", "count_invalid", "timeout", "drop_failure"]:
+            with self.subTest(mode=mode):
+                events = []
+                received = []
+                count_calls = []
+                drop_calls = []
+                def connect(peer):
+                    peer.database = "testdb"
+                    peer.created = []
+                    peer.connection = SimpleNamespace(close=lambda: events.append("close"))
+                def execute(peer, query, management=False):
+                    events.append(query)
+                    if query == ".show version": return [["test"]]
+                    if query.startswith(".show database"): return [["streaming-policy"]]
+                    if query.startswith(".set "):
+                        if mode == "create_failure": raise RuntimeError("existing table")
+                        received.clear()
+                        return []
+                    if query.startswith(".drop table"):
+                        drop_calls.append(query)
+                        if mode == "drop_failure" and len(drop_calls) == 1: raise RuntimeError("drop failure")
+                        return []
+                    if query.endswith("| count"):
+                        count_calls.append(query)
+                        if mode == "count_overflow": return [[len(want)+1]]
+                        if mode == "count_invalid": return [[float(len(want))]]
+                        if mode == "timeout" or len(count_calls) == 1: return [[0]]
+                        return [[len(received)]]
+                    if "| project" in query:
+                        return received[:-1]+[received[0]] if mode == "wrong_readback" else list(received)
+                    raise AssertionError(query)
+                def stream(peer, table, payload):
+                    events.append("STREAM")
+                    self.assertTrue(table.startswith("linbench_stream_owned_docs_"))
+                    self.assertLessEqual(len(payload), 512)
+                    if mode == "stream_failure": raise RuntimeError("stream failure")
+                    for row in csv.reader(io.StringIO(payload.decode())):
+                        row[4] = int(row[4])
+                        received.append(row)
+                with patch.object(bench.Kusto, "connect", connect), patch.object(bench.Kusto, "execute", execute), patch.object(bench.Kusto, "stream_ingest", stream), patch.object(bench, "KUSTO_STREAM_MAX_BYTES", 512), patch.object(bench.time, "sleep"):
+                    clock = patch.object(bench.time, "monotonic", side_effect=[0.0, 61.0]) if mode == "timeout" else patch.object(bench.time, "monotonic", wraps=bench.time.monotonic)
+                    with clock:
+                        peer = bench.NativeInsert(data, SimpleNamespace(native_timestamp_ms=123456), "linbench_stream_owned", "kusto")
+                        try:
+                            if mode == "ok":
+                                times, iterations, got = peer.measure_insert(1)
+                                self.assertEqual(len(times), 1)
+                                self.assertEqual(iterations, 1)
+                                self.assertEqual(got, want)
+                                self.assertGreater(peer.contract["requests_per_sample"], 1)
+                            else:
+                                with self.assertRaises((RuntimeError, AssertionError)):
+                                    peer.measure_insert(1)
+                        finally: peer.close()
+                self.assertIn("close", events)
+                self.assertEqual(bool(drop_calls), mode != "create_failure")
+                self.assertFalse(any(q.startswith(".alter") for q in events))
+                if mode == "ok":
+                    self.assertEqual(received, want)
+                    self.assertGreaterEqual(len(count_calls), 2)
+
+    def test_kusto_streaming_http_error_and_url_gates(self):
+        peer = object.__new__(bench.Kusto)
+        peer.database = "db/name"
+        peer.base_path = "/root"
+        requests = []
+        class Connection:
+            status = 200
+            body = b""
+            def request(self, *args): requests.append(args)
+            def getresponse(self): return SimpleNamespace(status=self.status, read=lambda:self.body)
+        peer.connection = Connection()
+        with patch.dict(os.environ, {"LIN_BENCH_KUSTO_TOKEN": ""}):
+            peer.stream_ingest("table name", b"a,b")
+            self.assertEqual(requests[-1][1], "/root/v1/rest/ingest/db%2Fname/table%20name?streamFormat=Csv")
+            self.assertEqual(requests[-1][2], b"a,b")
+            peer.connection.status = 413
+            with self.assertRaises(RuntimeError): peer.stream_ingest("t", b"a")
+            peer.connection.status = 200
+            peer.connection.body = b'{"error":{"code":"failed"}}'
+            with self.assertRaises(RuntimeError): peer.stream_ingest("t", b"a")
+            peer.connection.body = json.dumps({"Tables":[{"TableName":"QueryStatus","Columns":[{"ColumnName":"Severity"},{"ColumnName":"StatusCode"}],"Rows":[[2,0]]}]}).encode()
+            with self.assertRaises(RuntimeError): peer.stream_ingest("t", b"a")
+            before = len(requests)
+            with self.assertRaises(RuntimeError): peer.stream_ingest("t", b"a"*(bench.KUSTO_STREAM_MAX_BYTES+1))
+            self.assertEqual(len(requests), before)
+
     def test_kusto_cleanup_attempts_every_owned_table_after_drop_failure(self):
         peer = object.__new__(bench.Kusto)
         peer.created = ["linbench_owned_docs", "linbench_owned_users", "linbench_owned_orders"]

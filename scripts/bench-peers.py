@@ -21,6 +21,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 ENGINES = ["lin", "sqlite", "duckdb", "postgres", "mysql", "mongo", "mssql", "kusto", "pandas"]
+KUSTO_STREAM_MAX_BYTES = 4 * 1024 * 1024
 CASES = ["point_get", "filter_eq", "text_substr", "materialize", "join_inner", "join_filter"]
 
 
@@ -277,6 +278,7 @@ class NativeInsert(Lin):
         self.pg_conn = None
         self.mysql_conn = None
         self.mssql_conn = None
+        self.kusto_peer = None
         self.prefix = prefix
         self.client = None
         self.db = None
@@ -292,6 +294,31 @@ class NativeInsert(Lin):
                 self.proc = subprocess.Popen([str(binary)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
                 self.version = self.ask({"worker_version": True})["version"]
                 self.contract.update({"api": "Rust prepared run; default embedding and FTS", "storage": "Db::empty"})
+            elif engine == "kusto":
+                peer = object.__new__(Kusto)
+                peer.connect()
+                self.kusto_peer = peer
+                self.version = peer.execute(".show version", management=True)
+                database = "[" + json.dumps(peer.database) + "]"
+                policy = peer.execute(f".show database {database} policy streamingingestion", management=True)
+                self.stream_chunks = []
+                chunk = bytearray()
+                row_buffer = io.StringIO(newline="")
+                writer = csv.writer(row_buffer, lineterminator="\n", quoting=csv.QUOTE_ALL)
+                for row in self.want:
+                    row_buffer.seek(0)
+                    row_buffer.truncate(0)
+                    writer.writerow(row)
+                    encoded = row_buffer.getvalue().encode("utf-8")
+                    if len(encoded) > KUSTO_STREAM_MAX_BYTES:
+                        raise RuntimeError("Kusto single CSV row exceeds streaming byte limit")
+                    if chunk and len(chunk) + len(encoded) > KUSTO_STREAM_MAX_BYTES:
+                        self.stream_chunks.append(bytes(chunk))
+                        chunk.clear()
+                    chunk.extend(encoded)
+                if chunk:
+                    self.stream_chunks.append(bytes(chunk))
+                self.contract.update({"api": "Kusto REST streaming ingestion plus full row visibility", "schema": "id/uri/wing/title/ts:long/body; unique fixture values but no SQL uniqueness constraints", "storage": "configured service; default Kusto indexing", "atomicity": "one or more streaming requests; no cross-request transaction", "requests_per_sample": len(self.stream_chunks), "request_byte_limit": KUSTO_STREAM_MAX_BYTES, "timed_visibility_poll_ms": 10, "streaming_policy": policy, "policy_changed_by_adapter": False})
             elif engine == "mssql":
                 import pytds
                 from pytds import tds_base, tds_types
@@ -369,6 +396,37 @@ class NativeInsert(Lin):
             if "api" in result:
                 self.contract["execution_path"] = result["api"]
             return result["samples_ns"], 1, result["result"]
+        if self.engine == "kusto":
+            timings = []
+            got = None
+            for sample in range(samples):
+                table = self.prefix + "_docs_" + str(sample)
+                created = False
+                try:
+                    self.kusto_peer.create_empty_table(table, "id:string,uri:string,wing:string,title:string,ts:long,body:string")
+                    created = True
+                    start = time.perf_counter_ns()
+                    for payload in self.stream_chunks:
+                        self.kusto_peer.stream_ingest(table, payload)
+                    deadline = time.monotonic() + 60
+                    while True:
+                        count = self.kusto_peer.execute(f"{table} | count")
+                        if (not isinstance(count, list) or len(count) != 1 or len(count[0]) != 1
+                                or type(count[0][0]) is not int or not 0 <= count[0][0] <= len(self.want)):
+                            raise RuntimeError("Kusto ingestion returned invalid row count")
+                        if count[0][0] == len(self.want):
+                            break
+                        if time.monotonic() >= deadline:
+                            raise RuntimeError("Kusto streaming visibility timeout")
+                        time.sleep(0.01)
+                    timings.append(time.perf_counter_ns() - start)
+                    got = self.kusto_peer.execute(f"{table} | project id,uri,wing,title,ts,body")
+                    validate(got, self.want, self.engine, "insert_native")
+                finally:
+                    if created:
+                        self.kusto_peer.execute(f".drop table {table} ifexists", management=True)
+                        self.kusto_peer.created.remove(table)
+            return timings, 1, got
         if self.engine == "mssql":
             from pytds.tds_base import tds_quote_id
             timings = []
@@ -513,6 +571,11 @@ class NativeInsert(Lin):
         return timings, 1, got
 
     def close(self):
+        if self.kusto_peer is not None:
+            try:
+                self.kusto_peer.close()
+            finally:
+                self.kusto_peer = None
         if self.mssql_conn is not None:
             self.mssql_conn.close()
             self.mssql_conn = None
@@ -535,7 +598,7 @@ class NativeInsert(Lin):
 
 
 class Kusto:
-    def __init__(self, data, args, prefix):
+    def connect(self):
         self.endpoint = os.environ.get("LIN_BENCH_KUSTO_URL")
         self.database = os.environ.get("LIN_BENCH_KUSTO_DATABASE")
         if not self.endpoint or not self.database:
@@ -549,13 +612,15 @@ class Kusto:
         self.connection = connection(url.hostname, port=url.port, timeout=60)
         self.base_path = url.path.rstrip("/")
         self.created = []
+
+    def __init__(self, data, args, prefix):
+        self.connect()
         self.tables = [prefix + "_" + name for name in ["docs", "users", "orders"]]
         try:
             self.version = self.execute(".show version", management=True)
             for table, columns, rows in zip(self.tables,
                     ["id:string,uri:string,wing:string,title:string,body:string", "id:string,email:string", "id:string,user_id:string,total:long"], data):
-                self.execute(f".create table {table} ({columns})", management=True)
-                self.created.append(table)
+                self.create_empty_table(table, columns)
                 for start in range(0, len(rows), 1000):
                     buf = io.StringIO()
                     csv.writer(buf, lineterminator="\n").writerows(rows[start:start+1000])
@@ -604,6 +669,38 @@ class Kusto:
             raise RuntimeError("Kusto returned no result tables")
         primary = next((table for table in tables if table.get("TableName") == "PrimaryResult"), tables[0] if tables else {})
         return primary.get("Rows", [])
+
+    def create_empty_table(self, table, columns):
+        # Unlike .create table, .set rejects existing names. An acknowledged
+        # empty datatable command establishes ownership without a check/create race.
+        self.execute(f".set {table} <| datatable({columns})[]", management=True)
+        self.created.append(table)
+
+    def stream_ingest(self, table, payload):
+        if not payload or len(payload) > KUSTO_STREAM_MAX_BYTES:
+            raise RuntimeError("Kusto streaming payload outside configured byte bounds")
+        path = self.base_path + "/v1/rest/ingest/" + urllib.parse.quote(self.database, safe="") + "/" + urllib.parse.quote(table, safe="") + "?streamFormat=Csv"
+        headers = {"Content-Type": "application/octet-stream", "Accept": "application/json"}
+        token = os.environ.get("LIN_BENCH_KUSTO_TOKEN")
+        if token:
+            headers["Authorization"] = "Bearer " + token
+        self.connection.request("POST", path, payload, headers)
+        response = self.connection.getresponse()
+        raw = response.read()
+        if response.status != 200:
+            raise RuntimeError(f"Kusto streaming HTTP status {response.status}")
+        # A transport acknowledgement is insufficient: the caller must still
+        # wait for row visibility and validate every projected value.
+        if raw:
+            result = json.loads(raw)
+            if not isinstance(result, dict) or "error" in result:
+                raise RuntimeError("Kusto streaming response reported an error")
+            for table_result in result.get("Tables", []):
+                if table_result.get("TableName") == "QueryStatus":
+                    columns = [c["ColumnName"] for c in table_result.get("Columns", [])]
+                    severity, code = columns.index("Severity"), columns.index("StatusCode")
+                    if any(row[severity] <= 2 or row[code] != 0 for row in table_result.get("Rows", [])):
+                        raise RuntimeError("Kusto streaming response reported an error")
 
     def query(self, case):
         return self.execute(self.queries[case])

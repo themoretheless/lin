@@ -10,6 +10,8 @@
 
 Исторический каталог ниже сохраняет срез 5 октября. Новые измерения текущего кода:
 
+- [Kusto native streaming adapter](../benches/results/2026-10-24-kusto-streaming-adapter/report.md): реализованы streaming REST, byte-bounded CSV, timed visibility и exact readback; 17 adapter-тестов прошли. Setup владения таблицами заменён на create-only .set; live schema/streaming/cleanup ещё не проверены. Отсутствующий endpoint даёт incomplete/exit 2, победа не заявляется.
+
 - [MSSQL native bulk adapter](../benches/results/2026-10-24-mssql-native-adapter/report.md): реализован typed PyTDS bulk-copy в одной явной транзакции; 15 adapter-тестов прошли, отсутствие endpoint даёт incomplete/exit 2. Live SQL Server gate и замеры ещё отсутствуют, победа не заявляется.
 
 - [Embedding sparse-coordinate capture — отклонён](../benches/results/2026-10-24-embedding-sparse-capture/report.md): кэш координат из нормализованного embedding для legacy WAL; workspace/replay/побайтный baseline прошли. Interleaved 1k +0,85% при A/A-разбросе 3,22%; 10k −1,30%, 0/6 побед. Три source-файла восстановлены, все серии сохранены.

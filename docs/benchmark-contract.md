@@ -240,3 +240,23 @@ This is native API coverage, not equal disk durability. SQL Server still
 requires live read/typed bulk/transaction/cleanup qualification before any
 performance result is accepted. The [implementation and mock/CLI evidence](../benches/results/2026-10-24-mssql-native-adapter/report.md)
 do not replace a server run. No MSSQL win is claimed from adapter tests.
+
+
+## Kusto native visible streaming ingestion
+
+`--engines lin kusto --cases insert_native` has a bounded streaming REST path:
+UTF-8 CSV input chunks prepared outside timing; all uploads/acknowledgements and
+row-visibility polling timed; full six-field/multiplicity readback and owned
+fixture setup/drop excluded. The 4MiB request cap is a conservative adapter
+policy. Requests/visibility timeout and current streaming policy are recorded.
+Cluster/database streaming must be preconfigured and inherited by fresh tables;
+the adapter never changes those policies or silently falls back to queued ingest.
+This API-specific case is not saturated ingestion throughput or SQL transaction,
+uniqueness/index/durability equivalence.
+
+Kusto .create table is idempotent even for an existing table; fixture ownership
+therefore uses acknowledged .set with an empty typed datatable, which rejects an
+existing name. This applies to read fixtures too. Live empty-schema creation,
+streaming readiness, values and cleanup remain required before timing is valid.
+[Implementation, official protocol references and mock/CLI gates](../benches/results/2026-10-24-kusto-streaming-adapter/report.md)
+do not count as a live Kusto result or a win.
