@@ -2172,3 +2172,55 @@ fn test_vector_search_top_k_shortcut_and_asymmetric_join() {
         .unwrap();
     assert_eq!(left.rows.len(), 3);
 }
+
+#[test]
+fn prepared_count_fastpaths_follow_mutations_and_catalog_filters() {
+    let mut db = Db::empty();
+    db.run("index docs [wing]").unwrap();
+    db.run(
+        r#"insert docs [
+        {id:"a", uri:"bench://a", wing:"rag", title:"wal wal", layer:"wiki"},
+        {id:"b", uri:"bench://b", wing:"sys", title:"wa", layer:"raw"},
+        {id:"c", uri:"bench://c", wing:"rag", title:"l unicode λ", layer:"wiki"},
+        {id:"d", uri:"bench://d", wing:"sys", title:"wal", layer:"raw"}
+    ]"#,
+    )
+    .unwrap();
+    let eq = db.prepare(r#"docs | wing == "rag" | count"#).unwrap();
+    let contains = db.prepare(r#"docs | title ~ "wal" | count"#).unwrap();
+    let empty = db.prepare(r#"docs | title ~ "" | count"#).unwrap();
+    let overlap = db
+        .prepare(r#"docs | wing == "rag" or wing == "rag" | count"#)
+        .unwrap();
+    let residual = db
+        .prepare(r#"docs | wing == "rag" and title ~ "wal" | count"#)
+        .unwrap();
+    let check = |db: &mut Db, p: &lin::Prepared, expected: i64| {
+        let a = p.run(db).unwrap();
+        let b = db.run_prepared_readonly(p).unwrap();
+        assert_eq!(a.rows, b.rows);
+        assert_eq!(a.rows.len(), 1);
+        assert_eq!(a.rows[0]["hits"], lin::Cell::Int(expected));
+    };
+    check(&mut db, &eq, 2);
+    check(&mut db, &contains, 2);
+    check(&mut db, &empty, 4);
+    check(&mut db, &overlap, 2);
+    check(&mut db, &residual, 1);
+    db.run(r#"update docs[id == "a"] cas each {wing:"sys", title:"plain"}"#)
+        .unwrap();
+    check(&mut db, &eq, 1);
+    check(&mut db, &contains, 1);
+    db.run(r#"delete docs[id == "d"] cas each"#).unwrap();
+    check(&mut db, &contains, 0);
+    check(&mut db, &empty, 3);
+    db.run(r#"insert docs {id:"e", uri:"bench://e", wing:"rag", title:"wal", layer:"raw"}"#)
+        .unwrap();
+    check(&mut db, &eq, 2);
+    check(&mut db, &contains, 1);
+    db.run(r#"filter docs layer == "wiki""#).unwrap();
+    let visible = db.prepare(r#"docs | title ~ "wal" | count"#).unwrap();
+    let all = db.prepare(r#"docs all | title ~ "wal" | count"#).unwrap();
+    check(&mut db, &visible, 0);
+    check(&mut db, &all, 1);
+}

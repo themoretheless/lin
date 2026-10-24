@@ -3158,6 +3158,13 @@ impl Db {
     }
 
     pub(crate) fn execute_agg_plan(&self, plan: &AggPlan, now: i64) -> Vec<Row> {
+        // Prepared COUNT must share index/columnar paths with ordinary execution.
+        if let AggKind::Count { by: None } = &plan.kind
+            && let Some(pred) = &plan.filter
+            && let Some(rows) = self.execute_filter_count(&plan.collection, pred, None, now)
+        {
+            return rows;
+        }
         // 1. SoA paths for orders
         if plan.collection == "orders" && self.store.orders_soa_ready() {
             match &plan.kind {
@@ -3884,9 +3891,16 @@ impl Db {
                 _ => return None,
             }
         }
-        let pred = filter?;
-        let by = by?;
+        self.execute_filter_count(name, filter?, by?, now)
+    }
 
+    fn execute_filter_count(
+        &self,
+        name: &str,
+        pred: &Pred,
+        by: Option<&Field>,
+        now: i64,
+    ) -> Option<Vec<Row>> {
         // docs | title ~ "…" | count — columnar title scan + memchr (fair vs SQL COUNT(*)).
         if name == "docs"
             && by.is_none()
