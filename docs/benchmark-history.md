@@ -8,6 +8,8 @@
 
 ## Обновление 2026-10-24
 
+- [Adaptive FTS reserve — не принято](../benches/results/2026-10-24-fts-adaptive-reserve-cpu/report.md): prefix-cardinality guard сохраняет capacity 3 для повторяющихся слов, но default 1k CPU лишь +2,09% /+2,10% (~3 мкс). Diverse-prefix/repeated-tail раздувает capacity 56→448 без устойчивой пользы; production не менялся, engine gain не заявлен.
+
 - [FTS postings reserve CPU/capacity gate](../benches/results/2026-10-24-fts-postings-reserve-cpu/report.md): reserve min(rows,4096) даёт +10,4% /+9,9% CPU на default 1k, но двухтермовый corpus увеличивает capacity 3→1792 без выигрыша. Безусловный reserve не принят; требуется cardinality-aware кандидат, engine/peer gain не заявлен. Production не менялся.
 
 - [Current WAL profile после preallocation](../benches/results/2026-10-24-post-preallocation-profile/report.md): 1k encode 0,435 мс, sync 0,458 мс, reserve check 0,00246 мс; 486 barrier sync, без fallback. Диагностические spans, не ускорение; production восстановлен. Следующая область — CPU вне WAL, а не повтор отклонённых sparse-микрооптимизаций.
