@@ -10,6 +10,8 @@
 
 Исторический каталог ниже сохраняет срез 5 октября. Новые измерения текущего кода:
 
+- [Sparse spare-capacity CPU gate](../benches/results/2026-10-24-sparse-capacity-cpu/report.md): резервирование на блок вместо проверки ёмкости на entry; default 1k +0,036%, 3/6 процессов — эффекта нет, production не менялся. Forced-dense gain не переносится на реальный dense fallback.
+
 - [Sparse encoder block-width CPU gate](../benches/results/2026-10-24-sparse-block-width-cpu/report.md): варианты 4/16/32 против текущих 8 элементов; целевой 1k −1,4% / +0,56% / −17,9%. Достаточного сигнала нет, production не менялся; это CPU-only диагностика.
 
 - [Current-source read refresh](../benches/results/2026-10-24-current-read-refresh-final/report.md): **108/108** агрегированных побед в шести сценариях против SQLite/DuckDB/PostgreSQL/MySQL/MongoDB/pandas, 1k/10k/100k, три процесса × 12 samples. Hash/значения/cleanup проверены; MSSQL/Kusto и durable 1k остаются открыты.
