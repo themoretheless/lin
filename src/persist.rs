@@ -51,6 +51,8 @@ const LOG_MAGIC_V1: [u8; 4] = *b"LIN\x01";
 const LOG_MAGIC_V2: [u8; 4] = *b"LIN\x02";
 // Internal codec identity; new sparse records are only written inside LIN\x06.
 const LOG_MAGIC_SPARSE: [u8; 4] = *b"LIN\x03";
+// Read capability only; default writers do not emit this codec yet.
+const LOG_MAGIC_DICTIONARY: [u8; 4] = *b"LIN\x05";
 const MAX_SPARSE_DECODED_BYTES: usize = 64 * 1024 * 1024;
 const SPARSE_VECTOR_THRESHOLD: usize = 64 * 1024;
 /// Checksummed envelope: codec byte (1/2/3), encoded record, CRC32 of codec + record.
@@ -1627,7 +1629,122 @@ fn decode_v2(buf: &[u8]) -> Result<LogRecord, ()> {
     decode_column_record(buf, false)
 }
 
+// Shared decoded-vector accounting deliberately retains the legacy Vec metadata cost.
+fn dictionary_budget_add(budget: &mut usize, bytes: usize) -> Result<(), ()> {
+    *budget = budget
+        .checked_add(bytes)
+        .filter(|&n| n <= MAX_SPARSE_DECODED_BYTES)
+        .ok_or(())?;
+    Ok(())
+}
+fn take_dictionary_entry(
+    buf: &[u8],
+    i: &mut usize,
+    index_bytes: usize,
+    dictionary: &[u32],
+) -> Result<(usize, u32, u16), ()> {
+    let end = (*i).checked_add(index_bytes).ok_or(())?;
+    let bytes = buf.get(*i..end).ok_or(())?;
+    let index = match index_bytes {
+        2 => u16::from_le_bytes(bytes.try_into().map_err(|_| ())?) as usize,
+        4 => u32::from_le_bytes(bytes.try_into().map_err(|_| ())?) as usize,
+        _ => return Err(()),
+    };
+    *i = end;
+    if dictionary.is_empty() {
+        let end = (*i).checked_add(4).ok_or(())?;
+        let bits = u32::from_le_bytes(buf.get(*i..end).ok_or(())?.try_into().map_err(|_| ())?);
+        *i = end;
+        Ok((index, bits, 0))
+    } else {
+        let ordinal = *buf.get(*i).ok_or(())? as usize;
+        *i += 1;
+        let bits = *dictionary.get(ordinal).ok_or(())?;
+        Ok((index, bits, 1u16 << ordinal))
+    }
+}
+fn take_dictionary_vectors(
+    buf: &[u8],
+    i: &mut usize,
+    n: usize,
+    budget: &mut usize,
+) -> Result<Vec<Option<std::sync::Arc<[f32]>>>, ()> {
+    dictionary_budget_add(
+        budget,
+        n.checked_mul(std::mem::size_of::<Option<Vec<f32>>>())
+            .ok_or(())?,
+    )?;
+    if n > buf.len().saturating_sub(*i) / 4 {
+        return Err(());
+    }
+    let mut rows = Vec::with_capacity(n);
+    for _ in 0..n {
+        let code = take_u32(buf, i)?;
+        if code == 0 {
+            rows.push(None);
+            continue;
+        }
+        let dim = (code - 1) as usize;
+        let count = take_u32(buf, i)? as usize;
+        let d = *buf.get(*i).ok_or(())? as usize;
+        *i += 1;
+        if count > dim || d > 16 || d > count {
+            return Err(());
+        }
+        let mut dictionary = [0u32; 16];
+        for slot in 0..d {
+            let bits = take_u32(buf, i)?;
+            if bits == 0 || dictionary[..slot].contains(&bits) {
+                return Err(());
+            }
+            dictionary[slot] = bits;
+        }
+        let index_bytes = if d > 0 && dim <= 65536 {
+            2usize
+        } else {
+            4usize
+        };
+        let entry_bytes = index_bytes + if d > 0 { 1 } else { 4 };
+        if count.checked_mul(entry_bytes).ok_or(())? > buf.len().saturating_sub(*i) {
+            return Err(());
+        }
+        dictionary_budget_add(budget, dim.checked_mul(4).ok_or(())?)?;
+        let entries_start = *i;
+        let mut previous = None;
+        let mut used = 0u16;
+        // Validate the entire compact row before allocating its decoded values.
+        for _ in 0..count {
+            let (index, bits, mask) = take_dictionary_entry(buf, i, index_bytes, &dictionary[..d])?;
+            if index >= dim || previous.is_some_and(|last| index <= last) || bits == 0 {
+                return Err(());
+            }
+            used |= mask;
+            previous = Some(index);
+        }
+        if d > 0 && u32::from(used) != (1u32 << d) - 1 {
+            return Err(());
+        }
+        let mut values = vec![0.0f32; dim];
+        let mut entry_i = entries_start;
+        for _ in 0..count {
+            let (index, bits, _) =
+                take_dictionary_entry(buf, &mut entry_i, index_bytes, &dictionary[..d])?;
+            values[index] = f32::from_bits(bits);
+        }
+        debug_assert_eq!(entry_i, *i);
+        rows.push(Some(values.into()));
+    }
+    Ok(rows)
+}
+
 fn decode_column_record(buf: &[u8], allow_sparse: bool) -> Result<LogRecord, ()> {
+    decode_column_record_mode(buf, allow_sparse, false)
+}
+fn decode_column_record_mode(
+    buf: &[u8],
+    allow_sparse: bool,
+    allow_dictionary: bool,
+) -> Result<LogRecord, ()> {
     if buf.is_empty() {
         return Err(());
     }
@@ -1640,6 +1757,7 @@ fn decode_column_record(buf: &[u8], allow_sparse: bool) -> Result<LogRecord, ()>
     let rec_gen = take_u64(buf, &mut i)?;
     let next_id = take_u64(buf, &mut i)?;
     let mut saw_sparse = false;
+    let mut saw_dictionary = false;
     let record = match kind {
         V2_FACTS_BULK => {
             let n = take_u32(buf, &mut i)? as usize;
@@ -1733,6 +1851,17 @@ fn decode_column_record(buf: &[u8], allow_sparse: bool) -> Result<LogRecord, ()>
                         ColData::Time(v)
                     }
                     6 => {
+                        if allow_dictionary {
+                            dictionary_budget_add(
+                                &mut sparse_decoded_bytes,
+                                (n as usize)
+                                    .checked_mul(std::mem::size_of::<Option<Vec<f32>>>())
+                                    .ok_or(())?,
+                            )?;
+                            if n as usize > buf.len().saturating_sub(i) / 4 {
+                                return Err(());
+                            }
+                        }
                         let mut v = Vec::with_capacity(n as usize);
                         for _ in 0..n {
                             if i + 4 > buf.len() {
@@ -1749,6 +1878,9 @@ fn decode_column_record(buf: &[u8], allow_sparse: bool) -> Result<LogRecord, ()>
                             if nbytes > buf.len().saturating_sub(i) {
                                 return Err(());
                             }
+                            if allow_dictionary {
+                                dictionary_budget_add(&mut sparse_decoded_bytes, nbytes)?;
+                            }
                             let mut emb = Vec::with_capacity(dim);
                             for _ in 0..dim {
                                 emb.push(f32::from_le_bytes(buf[i..i + 4].try_into().unwrap()));
@@ -1757,6 +1889,16 @@ fn decode_column_record(buf: &[u8], allow_sparse: bool) -> Result<LogRecord, ()>
                             v.push(Some(emb.into()));
                         }
                         ColData::Vec(v)
+                    }
+                    8 if allow_dictionary => {
+                        saw_sparse = true;
+                        saw_dictionary = true;
+                        ColData::Vec(take_dictionary_vectors(
+                            buf,
+                            &mut i,
+                            n as usize,
+                            &mut sparse_decoded_bytes,
+                        )?)
                     }
                     7 if allow_sparse => {
                         saw_sparse = true;
@@ -1822,6 +1964,9 @@ fn decode_column_record(buf: &[u8], allow_sparse: bool) -> Result<LogRecord, ()>
     if allow_sparse && (!saw_sparse || i != buf.len()) {
         return Err(());
     }
+    if allow_dictionary && !saw_dictionary {
+        return Err(());
+    }
     Ok(record)
 }
 
@@ -1879,6 +2024,7 @@ fn decode_frame(magic: &[u8; 4], payload: &[u8]) -> Result<LogRecord, Error> {
             1 => LOG_MAGIC_V1,
             2 => LOG_MAGIC_V2,
             3 => LOG_MAGIC_SPARSE,
+            5 => LOG_MAGIC_DICTIONARY,
             #[cfg(any(feature = "compress-wal", feature = "compress-flate"))]
             4 => {
                 use flate2::read::GzDecoder;
@@ -1892,7 +2038,10 @@ fn decode_frame(magic: &[u8; 4], payload: &[u8]) -> Result<LogRecord, Error> {
         };
         return decode_frame(&codec, &payload[1..end]);
     }
-    if *magic == LOG_MAGIC_SPARSE {
+    if *magic == LOG_MAGIC_DICTIONARY {
+        decode_column_record_mode(payload, true, true)
+            .map_err(|_| io_err("bad dictionary wal payload"))
+    } else if *magic == LOG_MAGIC_SPARSE {
         decode_column_record(payload, true).map_err(|_| io_err("bad sparse wal payload"))
     } else if *magic == LOG_MAGIC_V2 {
         decode_v2(payload).map_err(|_| io_err("bad v2 wal payload"))
@@ -2211,7 +2360,7 @@ pub fn cols_to_rows(fields: &[String], cols: &[ColData], n: usize) -> Vec<crate:
                 Some(ColData::Bool(v)) => Cell::Bool(v.get(i).copied().unwrap_or(false)),
                 Some(ColData::Time(v)) => Cell::Time(v.get(i).copied().unwrap_or(0)),
                 Some(ColData::Vec(v)) => match v.get(i).and_then(|o| o.as_ref()) {
-                    Some(emb) if !emb.is_empty() => Cell::vec_arc(std::sync::Arc::clone(emb)),
+                    Some(emb) => Cell::vec_arc(std::sync::Arc::clone(emb)),
                     _ => Cell::Null,
                 },
                 Some(ColData::Null) | None => Cell::Null,
@@ -2847,5 +2996,625 @@ mod shared_vector_wire_tests {
             panic!("vector cell")
         };
         assert!(Arc::ptr_eq(restored_embedding, &embedding));
+    }
+}
+
+#[cfg(test)]
+mod dictionary_wal_tests {
+    use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    fn fresh() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "lin-dictionary-reader-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+    // Independent scalar fixture encoder: sorted dictionaries, unlike the CPU prototype's insertion order.
+    fn rows_bytes(rows: &[Option<Vec<u32>>]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for row in rows {
+            let Some(values) = row else {
+                out.extend_from_slice(&0u32.to_le_bytes());
+                continue;
+            };
+            out.extend_from_slice(&u32::try_from(values.len() + 1).unwrap().to_le_bytes());
+            let entries = values
+                .iter()
+                .enumerate()
+                .filter(|(_, b)| **b != 0)
+                .map(|(i, b)| (i, *b))
+                .collect::<Vec<_>>();
+            out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+            let dictionary = entries
+                .iter()
+                .map(|(_, b)| *b)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            let use_dict = !dictionary.is_empty() && dictionary.len() <= 16;
+            out.push(if use_dict { dictionary.len() as u8 } else { 0 });
+            if use_dict {
+                for bits in &dictionary {
+                    out.extend_from_slice(&bits.to_le_bytes());
+                }
+            }
+            for (index, bits) in entries {
+                if use_dict && values.len() <= 65536 {
+                    out.extend_from_slice(&(index as u16).to_le_bytes());
+                } else {
+                    out.extend_from_slice(&(index as u32).to_le_bytes());
+                }
+                if use_dict {
+                    out.push(dictionary.binary_search(&bits).unwrap() as u8);
+                } else {
+                    out.extend_from_slice(&bits.to_le_bytes());
+                }
+            }
+        }
+        out
+    }
+    fn payload(n: u32, columns: Vec<(&str, u8, Vec<u8>)>) -> Vec<u8> {
+        let mut out = vec![V2_INSERT_COLS];
+        out.extend_from_slice(&2u64.to_le_bytes());
+        out.extend_from_slice(&3u64.to_le_bytes());
+        put_str(&mut out, "docs");
+        out.extend_from_slice(&n.to_le_bytes());
+        out.extend_from_slice(&(columns.len() as u32).to_le_bytes());
+        for (name, tag, bytes) in columns {
+            put_str(&mut out, name);
+            out.push(tag);
+            out.extend(bytes);
+        }
+        out
+    }
+    fn dict_payload(row: Vec<u8>) -> Vec<u8> {
+        payload(1, vec![("embedding", 8, row)])
+    }
+    fn bits(rec: LogRecord) -> Vec<Option<Vec<u32>>> {
+        let Pack::InsertCols { cols, .. } = rec.pack else {
+            panic!("insert")
+        };
+        let ColData::Vec(rows) = cols.into_iter().next().unwrap() else {
+            panic!("vectors")
+        };
+        rows.into_iter()
+            .map(|v| v.map(|v| v.iter().map(|x| x.to_bits()).collect()))
+            .collect()
+    }
+    fn frame(payload: &[u8]) -> Vec<u8> {
+        let path = fresh();
+        let mut f = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        write_frame(
+            &mut f,
+            &LOG_MAGIC_DICTIONARY,
+            payload,
+            SyncMode::Normal,
+            &mut 0,
+        )
+        .unwrap();
+        f.seek(SeekFrom::Start(0)).unwrap();
+        let mut bytes = Vec::new();
+        f.read_to_end(&mut bytes).unwrap();
+        drop(f);
+        fs::remove_file(path).unwrap();
+        bytes
+    }
+    #[test]
+    fn dictionary_materialization_keeps_empty_separate_from_null() {
+        let columns = [ColData::Vec(vec![
+            None,
+            Some(Vec::<f32>::new().into()),
+            Some(vec![-0.0].into()),
+        ])];
+        let rows = cols_to_rows(&["embedding".into()], &columns, 3);
+        assert!(matches!(rows[0]["embedding"], crate::Cell::Null));
+        assert_eq!(rows[1]["embedding"].as_vec(), Some(&[][..]));
+        assert_eq!(
+            rows[2]["embedding"].as_vec().unwrap()[0].to_bits(),
+            0x80000000
+        );
+    }
+    #[test]
+    fn dictionary_mixed_vector_columns_share_budget_and_preserve_bits() {
+        let a = rows_bytes(&[Some(vec![0x80000000, 0x7fc00001])]);
+        let sparse = [Some(std::sync::Arc::<[f32]>::from([
+            f32::from_bits(0x7fc00002),
+            -0.0,
+        ]))];
+        let mut b = Vec::new();
+        append_sparse_rows_serial(&sparse, &mut b).unwrap();
+        let mut c = Vec::new();
+        c.extend_from_slice(&2u32.to_le_bytes());
+        c.extend_from_slice(&0x7fa00001u32.to_le_bytes());
+        c.extend_from_slice(&0x80000000u32.to_le_bytes());
+        let p = payload(1, vec![("a", 8, a), ("b", 7, b), ("c", 6, c)]);
+        let rec = decode_column_record_mode(&p, true, true).unwrap();
+        let Pack::InsertCols { cols, .. } = rec.pack else {
+            panic!("insert")
+        };
+        let actual = cols
+            .into_iter()
+            .map(|c| {
+                let ColData::Vec(v) = c else { panic!("vector") };
+                v[0].as_ref()
+                    .unwrap()
+                    .iter()
+                    .map(|x| x.to_bits())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual,
+            vec![
+                vec![0x80000000, 0x7fc00001],
+                vec![0x7fc00002, 0x80000000],
+                vec![0x7fa00001, 0x80000000]
+            ]
+        );
+    }
+    #[test]
+    fn dictionary_reader_does_not_enable_new_writer_codec() {
+        let path = fresh();
+        let mut f = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let mut v = vec![0.0; 768];
+        v[7] = -0.0;
+        let rec = LogRecord {
+            r#gen: 1,
+            next_id: 2,
+            pack: Pack::InsertCols {
+                collection: "docs".into(),
+                fields: vec!["embedding".into()],
+                cols: vec![ColData::Vec(vec![Some(std::sync::Arc::from(v)); 1000])],
+                n: 1000,
+                edges: vec![],
+            },
+        };
+        append_record(&mut f, &rec, &mut Vec::new(), SyncMode::Normal, &mut 0).unwrap();
+        f.seek(SeekFrom::Start(0)).unwrap();
+        let mut bytes = Vec::new();
+        f.read_to_end(&mut bytes).unwrap();
+        assert_eq!(&bytes[..4], &LOG_MAGIC_CHECKSUM);
+        assert_eq!(bytes[8], 3);
+        decode_frame(&LOG_MAGIC_CHECKSUM, &bytes[8..]).unwrap();
+        drop(f);
+        fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn dictionary_roundtrip_bits_widths_none_empty_and_raw_escape() {
+        let mut rows = vec![
+            None,
+            Some(vec![]),
+            Some(vec![0; 9]),
+            Some(vec![
+                0x80000000, 0x7fc00001, 0x7fc00002, 0x7fa00001, 0x7f800000, 0xff800000, 0x80000000,
+            ]),
+        ];
+        for dim in [8, 9, 65535, 65536, 65537] {
+            let mut v = vec![0; dim];
+            v[0] = 0x80000000;
+            v[dim / 2] = 0x7fc00001;
+            v[dim - 1] = 0x3fc00000;
+            rows.push(Some(v));
+        }
+        rows.push(Some((1..=64).map(|i| 0x3f000000 + i).collect()));
+        rows.push(Some((0..32).map(|i| 0x3f000000 + (i % 16) + 1).collect()));
+        let p = payload(rows.len() as u32, vec![("embedding", 8, rows_bytes(&rows))]);
+        assert_eq!(
+            bits(decode_column_record_mode(&p, true, true).unwrap()),
+            rows
+        );
+        let f = frame(&p);
+        assert_eq!(&f[..4], &LOG_MAGIC_CHECKSUM);
+        assert_eq!(f[8], 5);
+        assert_eq!(
+            bits(decode_frame(&LOG_MAGIC_CHECKSUM, &f[8..]).unwrap()),
+            rows
+        );
+        let mut ieee = f.clone();
+        let end = ieee.len() - 4;
+        let crc = crc32fast::hash(&ieee[8..end]).to_le_bytes();
+        ieee[end..].copy_from_slice(&crc);
+        assert_eq!(
+            bits(decode_frame(&LOG_MAGIC_CHECKSUM, &ieee[8..]).unwrap()),
+            rows
+        );
+
+        assert!(decode_column_record(&p, true).is_err());
+        assert!(decode_v2(&p).is_err());
+        let mut bad = f.clone();
+        bad[15] ^= 1;
+        assert!(decode_frame(&LOG_MAGIC_CHECKSUM, &bad[8..]).is_err());
+    }
+    #[test]
+    fn dictionary_rejects_bad_tables_indices_counts_ordinals_and_trailing_bytes() {
+        let valid = rows_bytes(&[Some(vec![0x3f800000, 0, 0, 0])]); // d=1, index u16, ordinal at 15.
+        assert_eq!(valid.len(), 16);
+        let mut cases = Vec::new();
+        let mut b = valid.clone();
+        b[8] = 17;
+        cases.push(b);
+        let mut b = valid.clone();
+        b[9..13].fill(0);
+        cases.push(b);
+        let mut b = valid.clone();
+        b[13..15].copy_from_slice(&4u16.to_le_bytes());
+        cases.push(b);
+        let mut b = valid.clone();
+        b[15] = 1;
+        cases.push(b);
+        let mut b = valid.clone();
+        b[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+        cases.push(b);
+        let mut b = valid.clone();
+        b[0..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        cases.push(b);
+        let mut b = valid.clone();
+        b.push(0);
+        cases.push(b);
+        let two = rows_bytes(&[Some(vec![0x3f800000, 0x40000000, 0, 0])]);
+        let mut b = two.clone();
+        b[13..17].copy_from_slice(&0x3f800000u32.to_le_bytes());
+        cases.push(b); // duplicate dictionary value.
+        let mut b = two.clone();
+        b[22] = 0;
+        cases.push(b); // unused second dictionary entry.
+        let mut b = two.clone();
+        b[20..22].copy_from_slice(&0u16.to_le_bytes());
+        cases.push(b); // duplicate index.
+        let mut b = two.clone();
+        b[17..19].copy_from_slice(&2u16.to_le_bytes());
+        cases.push(b); // descending indexes.
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&5u32.to_le_bytes());
+        raw.extend_from_slice(&1u32.to_le_bytes());
+        raw.push(0);
+        raw.extend_from_slice(&0u32.to_le_bytes());
+        raw.extend_from_slice(&0u32.to_le_bytes());
+        cases.push(raw); // redundant +0 raw entry.
+        for b in cases {
+            let payload = dict_payload(b);
+            assert!(decode_column_record_mode(&payload, true, true).is_err());
+            let bytes = frame(&payload);
+            assert!(decode_frame(&LOG_MAGIC_CHECKSUM, &bytes[8..]).is_err());
+        }
+        let p = dict_payload(valid);
+        for end in 0..p.len() {
+            assert!(
+                decode_column_record_mode(&p[..end], true, true).is_err(),
+                "prefix {end}"
+            );
+        }
+        for tag in [0, 9, 255] {
+            let mut b = payload(1, vec![("embedding", tag, vec![])]);
+            assert!(decode_column_record_mode(&b, true, true).is_err());
+            b.push(0);
+        }
+        let no_dictionary = payload(1, vec![("embedding", 7, vec![0; 4])]);
+        assert!(decode_column_record_mode(&no_dictionary, true, true).is_err());
+    }
+    #[test]
+    fn dictionary_budget_covers_metadata_vectors_and_mixed_dense_columns() {
+        let b = rows_bytes(&[Some(vec![0x3f800000])]);
+        let mut offset = 0;
+        let mut budget = MAX_SPARSE_DECODED_BYTES - std::mem::size_of::<Option<Vec<f32>>>();
+        assert!(take_dictionary_vectors(&b, &mut offset, 1, &mut budget).is_err()); // dimension rejected before value allocation.
+        let mut offset = 0;
+        let mut budget = 0;
+        assert!(
+            take_dictionary_vectors(
+                &[],
+                &mut offset,
+                MAX_SPARSE_DECODED_BYTES / 24 + 1,
+                &mut budget
+            )
+            .is_err()
+        );
+        let too_many = payload(
+            (MAX_SPARSE_DECODED_BYTES / 24 + 1) as u32,
+            vec![("embedding", 8, vec![])],
+        );
+        assert!(decode_column_record_mode(&too_many, true, true).is_err());
+        // Two zero-valued dictionary vectors: 32MiB each plus metadata exceeds shared 64MiB.
+        let mut row = Vec::new();
+        row.extend_from_slice(&(8_388_608u32 + 1).to_le_bytes());
+        row.extend_from_slice(&0u32.to_le_bytes());
+        row.push(0);
+        let p = payload(1, vec![("a", 8, row.clone()), ("b", 8, row)]);
+        assert!(decode_column_record_mode(&p, true, true).is_err());
+        // Include legacy dense allocation in codec-5 shared accounting.
+        let mut row = Vec::new();
+        row.extend_from_slice(&(16_777_210u32 + 1).to_le_bytes());
+        row.extend_from_slice(&0u32.to_le_bytes());
+        row.push(0);
+        let mut dense = Vec::new();
+        dense.extend_from_slice(&1u32.to_le_bytes());
+        dense.extend_from_slice(&1f32.to_le_bytes());
+        assert!(
+            decode_column_record_mode(
+                &payload(1, vec![("a", 8, row), ("b", 6, dense)]),
+                true,
+                true
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn dictionary_torn_tails_and_complete_corruption_follow_replay_contract() {
+        let p = dict_payload(rows_bytes(&[Some(vec![0x80000000, 0x3f800000])]));
+        let valid = frame(&p);
+        let path = fresh();
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        for end in 0..valid.len() {
+            file.set_len(0).unwrap();
+            file.seek(SeekFrom::Start(0)).unwrap();
+            file.write_all(&valid[..end]).unwrap();
+            assert_eq!(
+                replay_log(&mut file, 0, 0, |_| panic!("truncated frame applied")).unwrap(),
+                0
+            );
+            assert_eq!(file.metadata().unwrap().len(), end as u64);
+        }
+        file.set_len(0).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(&valid).unwrap();
+        let mut applied = 0;
+        assert_eq!(
+            replay_log(&mut file, 0, 0, |_| {
+                applied += 1;
+                Ok(())
+            })
+            .unwrap(),
+            valid.len() as u64
+        );
+        assert_eq!(applied, 1);
+        let mut invalid = valid.clone();
+        invalid[12] ^= 1;
+        let mut invalid_payload = p.clone();
+        *invalid_payload.last_mut().unwrap() = 255;
+        let checked_but_invalid = frame(&invalid_payload);
+        for bad in [invalid, checked_but_invalid] {
+            let mut bytes = valid.clone();
+            bytes.extend_from_slice(&bad);
+            file.set_len(0).unwrap();
+            file.seek(SeekFrom::Start(0)).unwrap();
+            file.write_all(&bytes).unwrap();
+            assert!(replay_log(&mut file, 0, 0, |_| Ok(())).is_err());
+            file.seek(SeekFrom::Start(0)).unwrap();
+            let mut after = Vec::new();
+            file.read_to_end(&mut after).unwrap();
+            assert_eq!(after, bytes);
+        }
+        drop(file);
+        fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn dictionary_mutated_payloads_never_panic() {
+        let p = dict_payload(rows_bytes(&[Some(vec![
+            0x80000000, 0x7fc00001, 0, 0x3f800000,
+        ])]));
+        for i in 0..p.len() {
+            for bit in 0..8 {
+                let mut b = p.clone();
+                b[i] ^= 1 << bit;
+                assert!(
+                    std::panic::catch_unwind(|| decode_column_record_mode(&b, true, true)).is_ok()
+                );
+            }
+        }
+    }
+    fn directory_bytes(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        fn walk(root: &Path, path: &Path, out: &mut BTreeMap<PathBuf, Vec<u8>>) {
+            for entry in fs::read_dir(path).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(root, &path, out);
+                } else {
+                    out.insert(
+                        path.strip_prefix(root).unwrap().to_path_buf(),
+                        fs::read(path).unwrap(),
+                    );
+                }
+            }
+        }
+        let mut out = BTreeMap::new();
+        walk(root, root, &mut out);
+        out
+    }
+    #[test]
+    fn dictionary_legacy_sparse_empty_vector_survives_reopen_and_checkpoint() {
+        use crate::{Db, OpenOpts};
+        let root = fresh();
+        assert!(!root.exists());
+        {
+            let mut db = Db::open_with(&root, OpenOpts::default()).unwrap();
+            db.run("index docs [wing]").unwrap();
+        }
+        let pack = Pack::InsertCols {
+            collection: "docs".into(),
+            fields: vec!["id".into(), "uri".into(), "embedding".into()],
+            cols: vec![
+                ColData::Text(vec![std::sync::Arc::from("legacy-empty")]),
+                ColData::Text(vec![std::sync::Arc::from("bench://legacy-empty")]),
+                ColData::Vec(vec![Some(Vec::<f32>::new().into())]),
+            ],
+            n: 1,
+            edges: vec![],
+        };
+        let mut file = open_log(&root).unwrap();
+        file.seek(SeekFrom::End(0)).unwrap();
+        let start = file.stream_position().unwrap();
+        let mut len = start;
+        append_record(
+            &mut file,
+            &LogRecord {
+                r#gen: 2,
+                next_id: 3,
+                pack,
+            },
+            &mut Vec::new(),
+            SyncMode::Full,
+            &mut len,
+        )
+        .unwrap();
+        file.seek(SeekFrom::Start(start + 8)).unwrap();
+        let mut codec = [0];
+        file.read_exact(&mut codec).unwrap();
+        assert_eq!(codec[0], 3);
+        drop(file);
+        {
+            let mut db = Db::open_with(&root, OpenOpts::default()).unwrap();
+            assert_eq!(
+                db.store.collection("docs")[0]["embedding"].as_vec(),
+                Some(&[][..])
+            );
+            db.checkpoint().unwrap();
+        }
+        {
+            let db = Db::open_with(&root, OpenOpts::default()).unwrap();
+            assert_eq!(
+                db.store.collection("docs")[0]["embedding"].as_vec(),
+                Some(&[][..])
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn dictionary_reopen_fixture_and_old_reader_rejection() {
+        use crate::{Db, OpenOpts};
+        let preserve = std::env::var_os("LIN_DICTIONARY_FIXTURE").map(PathBuf::from);
+        let root = preserve.clone().unwrap_or_else(fresh);
+        assert!(!root.exists(), "refuse existing fixture");
+        {
+            let mut db = Db::open_with(&root, OpenOpts::default()).unwrap();
+            db.run("index docs [wing]").unwrap();
+            assert_eq!(db.r#gen(), 1);
+        }
+        let old = std::env::var_os("LIN_DICTIONARY_OLD_READER");
+        if let Some(binary) = &old {
+            let r = std::process::Command::new(binary)
+                .arg(&root)
+                .output()
+                .unwrap();
+            assert!(
+                r.status.success(),
+                "old reader must open pre-dictionary fixture: {:?}",
+                r.stderr
+            );
+        }
+        let expected = vec![
+            Some(vec![
+                0x80000000, 0x7fc00001, 0x7fa00001, 0x7f800000, 0xff800000, 0, 0x3f800000,
+                0x80000000,
+            ]),
+            Some(vec![]),
+        ];
+        let mut ids = Vec::new();
+        for id in ["dict-0", "dict-1"] {
+            put_str(&mut ids, id);
+        }
+        let mut uris = Vec::new();
+        for uri in ["bench://dict-0", "bench://dict-1"] {
+            put_str(&mut uris, uri);
+        }
+        let p = payload(
+            2,
+            vec![
+                ("id", 1, ids),
+                ("uri", 1, uris),
+                ("embedding", 8, rows_bytes(&expected)),
+            ],
+        );
+        let mut file = open_log(&root).unwrap();
+        file.seek(SeekFrom::End(0)).unwrap();
+        let mut len = file.metadata().unwrap().len();
+        write_frame(
+            &mut file,
+            &LOG_MAGIC_DICTIONARY,
+            &p,
+            SyncMode::Full,
+            &mut len,
+        )
+        .unwrap();
+        drop(file);
+        if let Some(binary) = &old {
+            let before = directory_bytes(&root);
+            let r = std::process::Command::new(binary)
+                .arg(&root)
+                .output()
+                .unwrap();
+            assert_eq!(r.status.code(), Some(2));
+            assert_eq!(
+                directory_bytes(&root),
+                before,
+                "old reader must not change bytes"
+            );
+            println!(
+                "DICT_COMPAT {}",
+                serde_json::json!({"old_reader_exit":2,"files_unchanged":true,"files":before.iter().map(|(p,b)|(p.display().to_string(),b.len())).collect::<BTreeMap<_,_>>(),"stderr":String::from_utf8_lossy(&r.stderr)})
+            );
+        }
+        let assert_rows = |db: &Db| {
+            let actual = db
+                .store
+                .collection("docs")
+                .iter()
+                .map(|r| {
+                    r.get("embedding")
+                        .and_then(|x| x.as_vec())
+                        .map(|v| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>())
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected);
+        };
+        let before_read = directory_bytes(&root);
+        {
+            let read = Db::open_read(&root).unwrap();
+            let handle = read.run("docs | { embedding } | take all").unwrap();
+            let actual = handle
+                .rows
+                .iter()
+                .map(|row| {
+                    row.get("embedding")
+                        .and_then(|cell| cell.as_vec())
+                        .map(|v| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>())
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected);
+        }
+        assert_eq!(
+            directory_bytes(&root),
+            before_read,
+            "read-only replay must not mutate fixture"
+        );
+        if preserve.is_none() {
+            {
+                let mut db = Db::open_with(&root, OpenOpts::default()).unwrap();
+                assert_rows(&db);
+                db.checkpoint().unwrap();
+            }
+            {
+                let db = Db::open_with(&root, OpenOpts::default()).unwrap();
+                assert_rows(&db);
+            }
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 }

@@ -1,0 +1,27 @@
+   Compiling lin v0.4.0 (/Users/themoretheless/Documents/Sources/lin)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.43s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/lib.rs (target/debug/build/lin/9b69f1e840b117a4/out/lin-9b69f1e840b117a4)
+
+running 5 tests
+test persist::dictionary_wal_tests::dictionary_mutated_payloads_never_panic ... ok
+test persist::dictionary_wal_tests::dictionary_roundtrip_bits_widths_none_empty_and_raw_escape ... ok
+test persist::dictionary_wal_tests::dictionary_rejects_bad_tables_indices_counts_ordinals_and_trailing_bytes ... ok
+test persist::dictionary_wal_tests::dictionary_budget_covers_metadata_vectors_and_mixed_dense_columns ... ok
+
+thread 'persist::dictionary_wal_tests::dictionary_reopen_fixture_and_old_reader_rejection' (49524511) panicked at src/persist.rs:3360:13:
+assertion `left == right` failed
+  left: [Some([2147483648, 2143289345, 2141192193, 2139095040, 4286578688, 0, 1065353216, 2147483648]), None]
+ right: [Some([2147483648, 2143289345, 2141192193, 2139095040, 4286578688, 0, 1065353216, 2147483648]), Some([])]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test persist::dictionary_wal_tests::dictionary_reopen_fixture_and_old_reader_rejection ... FAILED
+
+failures:
+
+failures:
+    persist::dictionary_wal_tests::dictionary_reopen_fixture_and_old_reader_rejection
+
+test result: FAILED. 4 passed; 1 failed; 0 ignored; 0 measured; 78 filtered out; finished in 0.09s
+
+error: test failed, to rerun pass `--lib`

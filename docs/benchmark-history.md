@@ -10,6 +10,7 @@
 
 Исторический каталог ниже сохраняет срез 5 октября. Новые измерения текущего кода:
 
+- [Dictionary WAL reader и empty-vector fix](../benches/results/2026-10-24-dictionary-wal-reader/report.md): 10 reader-проверок и workspace прошли, старый pinned reader отвергает codec 5 без изменения файлов. Автоматическая запись нового codec пока выключена; ускорение БД не заявляется.
 - [Dictionary CPU gate, четыре варианта](../benches/results/2026-10-24-vector-dictionary-cpu-gate-v4/report.md): полный выбор представления векторов 1k быстрее на 11,6% (6/6 процессов), vector bytes −52,9%. Первые три serial-варианта медленнее и сохранены. Это CPU/byte-прототип; production WAL/reader не изменены, durable-ускорение ещё не доказано.
 - [Текущий WAL-профиль после bulk-hash оптимизации](../benches/results/2026-10-24-current-wal-phase-profile/report.md): durable 1k pack 0,078 мс, encoder 0,434 мс, sync 0,827 мс; 486 barrier-вызовов без fallback. Новый codec не реализован; dictionary-план и ограничения сохранены отдельно.
 - [Large-bulk short-body hashing](../benches/results/2026-10-24-bulk-short-body-hash/report.md): повторно закрыты агрегированные native 100k DuckDB и Rust durable 10k SQLite gaps. Сохранены небольшие отрицательные эффекты 1k и рост whole-worker RSS ~4%; durable 1k проигрывает. [Безусловный обход кэша отклонён](../benches/results/2026-10-24-short-body-hash-cache/report.md).
