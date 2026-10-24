@@ -10,6 +10,8 @@
 
 Исторический каталог ниже сохраняет срез 5 октября. Новые измерения текущего кода:
 
+- [Identical-binary A/A control](../benches/results/2026-10-24-nochange-control/report.md): побайтно одинаковые Lin binaries дали durable 1k −12,8% / −2,2%; медианное абсолютное различие пар 12,5%. SQLite-контроль этот сдвиг не отражает. Малые durable-эффекты требуют A/A-калибровки, причинность прежних отклонений не доказана.
+
 - [FTS ASCII append — отклонён](../benches/results/2026-10-24-fts-ascii-append/report.md): ASCII split с Unicode/vertical-tab fallback; postings oracle и workspace прошли. Durable 10k −1,3% / −2,8%, целевой 1k не дал повторяемого выигрыша; production восстановлен.
 
 - [Inline embedding text — отклонён](../benches/results/2026-10-24-inline-embedding-text/report.md): 22-byte inline join вместо части временных String; 512 комбинаций/битовая точность и workspace прошли. Durable 1k +5,4% затем −4,9%, контроль во второй серии тоже сдвинулся; устойчивого выигрыша нет, production восстановлен.

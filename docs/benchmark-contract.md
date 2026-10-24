@@ -163,3 +163,24 @@ count, row bound and actual execution path. No quota is raised: the previous
 recorded incomplete result. This chunked memory invocation is a distinct API
 contract and does not establish durable transaction atomicity or physical-disk
 performance. It is compared with each peer's existing bulk ingestion adapter.
+
+
+## No-change calibration for optimization claims
+
+A separate SQLite control does not establish that changes in Lin timings are
+caused by code. The [identical-binary control](../benches/results/2026-10-24-nochange-control/report.md)
+showed material Lin durable 1k drift even while SQLite was comparatively stable.
+For a modest durable optimization, calibrate the affected Lin workload with
+same-source, identical-binary A/A pairs in comparable conditions, retain raw
+observations and alternate order, then require independent before/after
+repetition distinguishable from the observed no-change variation. A small
+median difference overlapping that variation is inconclusive. The observed
+sample is not a universal acceptance threshold or a confidence interval.
+
+Keep rejected/noisy series and controls; do not select only a favorable repeat.
+Do not infer a causal code regression merely from an unqualified negative value.
+An A/A run from another time does not retroactively validate or invalidate
+older source-specific results. Do not change sync/features/quotas or interfere
+with unrelated host processes to manufacture stable wins. When attribution is
+weak, improve isolation/protocol or target a larger measured effect before
+retaining a production optimization.
