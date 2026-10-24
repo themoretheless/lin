@@ -198,3 +198,16 @@ qualification. See the [checked sources and adapter regression](../benches/resul
 Missing endpoints remain missing coverage, never wins. Kusto cleanup attempts
 all created tables even if one drop fails; any remaining failure still makes
 the run incomplete rather than silently accepting leaked fixtures.
+
+
+## Strict completion and numeric wins
+
+Finalization derives medians from observations, requiring the expected distinct
+process repetition IDs and nonempty finite positive samples. Invalid groups
+cannot contribute medians; errors/missing groups yield incomplete status and
+exit 2. With --require-wins, Lin must have a strictly smaller aggregate median
+than every requested peer. A tie is complete evidence but fails that gate with
+exit 3. Numeric superiority still requires the separate calibration and
+independent-repeat evidence before claiming a causal optimization. The
+[gate regression and saved-matrix revalidation](../benches/results/2026-10-24-strict-win-gate/report.md)
+retain evidence; re-finalizing saved observations is not a fresh benchmark.

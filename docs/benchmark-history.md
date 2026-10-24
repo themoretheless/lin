@@ -10,6 +10,8 @@
 
 Исторический каталог ниже сохраняет срез 5 октября. Новые измерения текущего кода:
 
+- [Strict win/completion gate](../benches/results/2026-10-24-strict-win-gate/report.md): ties больше не win, дубли process IDs и невалидные samples не дают complete. 14 adapter-тестов прошли; сохранённые 108 read + 15 native сравнений перепроверены без изменения медиан и без новых замеров.
+
 - [Microsoft peer qualification / Kusto cleanup fix](../benches/results/2026-10-24-microsoft-peer-qualification/report.md): проверены официальные ограничения эмуляторов, новых peer-замеров нет. Исправлено прерывание cleanup после первого DROP failure; regression до/после и 10 adapter-тестов сохранены.
 
 - [Identical-binary A/A control](../benches/results/2026-10-24-nochange-control/report.md): побайтно одинаковые Lin binaries дали durable 1k −12,8% / −2,2%; медианное абсолютное различие пар 12,5%. SQLite-контроль этот сдвиг не отражает. Малые durable-эффекты требуют A/A-калибровки, причинность прежних отклонений не доказана.

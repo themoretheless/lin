@@ -8,6 +8,7 @@ import http.client
 import importlib.metadata
 import io
 import json
+import math
 import os
 import platform
 import statistics
@@ -686,10 +687,23 @@ def main():
 
 
 def finish(args, run):
+    # Derive completion from observations, never from cached medians.
+    run["medians_ns"] = {}
     for case in args.cases:
         for engine in args.engines:
             rows = [o for o in run["observations"] if o["case"] == f"{case}/{engine}"]
-            if len(rows) == args.repeats:
+            if len(rows) == args.repeats and args.repeats > 0:
+                valid = (
+                    all(type(o.get("repetition")) is int for o in rows)
+                    and {o["repetition"] for o in rows} == set(range(args.repeats))
+                    and all(o.get("samples_ns") and all(
+                        type(value) in (int, float) and math.isfinite(value) and value > 0
+                        for value in o["samples_ns"]
+                    ) for o in rows)
+                )
+                if not valid:
+                    run["errors"].append({"engine": engine, "case": case, "reason": "invalid process repetitions or timing samples"})
+                    continue
                 run["medians_ns"][f"{case}/{engine}"] = statistics.median(statistics.median(o["samples_ns"]) for o in rows)
     complete = len(run["medians_ns"]) == len(args.cases) * len(args.engines) and not run["errors"]
     run["status"] = "complete" if complete else "incomplete"
@@ -700,7 +714,7 @@ def finish(args, run):
     if args.require_wins:
         for case in args.cases:
             lin = run["medians_ns"].get(f"{case}/lin")
-            if lin is None or any(v < lin for k, v in run["medians_ns"].items() if k.startswith(case + "/") and not k.endswith("/lin")):
+            if lin is None or any(v <= lin for k, v in run["medians_ns"].items() if k.startswith(case + "/") and not k.endswith("/lin")):
                 return 3
     return 0
 

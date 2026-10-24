@@ -79,6 +79,32 @@ class BenchmarkContractTests(unittest.TestCase):
         self.assertEqual(run["medians_ns"]["point_get/lin"], 550)
         self.assertEqual(result, 3, "a measured loss must fail the wins gate")
 
+    def test_tied_times_are_not_a_win(self):
+        observations = [{"case": "point_get/" + engine, "repetition": i, "samples_ns": [100]} for engine in ["lin", "sqlite"] for i in range(2)]
+        result, run = self.run_gate(observations)
+        self.assertEqual(run["status"], "complete")
+        self.assertEqual(result, 3)
+
+    def test_duplicate_process_ids_are_incomplete(self):
+        observations = [{"case": "point_get/" + engine, "repetition": 0, "samples_ns": [100 if engine == "lin" else 200]} for engine in ["lin", "sqlite"] for _ in range(2)]
+        result, run = self.run_gate(observations)
+        self.assertEqual(result, 2)
+        self.assertEqual(run["status"], "incomplete")
+
+    def test_invalid_timing_samples_are_incomplete(self):
+        for sample in [float("nan"), float("inf"), -1, 0]:
+            with self.subTest(sample=sample):
+                observations = [{"case": "point_get/" + engine, "repetition": i, "samples_ns": [sample if engine == "lin" else 200]} for engine in ["lin", "sqlite"] for i in range(2)]
+                result, run = self.run_gate(observations)
+                self.assertEqual(result, 2)
+                self.assertEqual(run["status"], "incomplete")
+
+    def test_empty_timing_samples_are_incomplete(self):
+        observations = [{"case": "point_get/" + engine, "repetition": i, "samples_ns": []} for engine in ["lin", "sqlite"] for i in range(2)]
+        result, run = self.run_gate(observations)
+        self.assertEqual(result, 2)
+        self.assertEqual(run["status"], "incomplete")
+
     def test_missing_peer_is_incomplete(self):
         observations = [{"case": "point_get/lin", "repetition": i, "samples_ns": [100]} for i in range(2)]
         result, run = self.run_gate(observations)
