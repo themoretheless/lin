@@ -33,3 +33,5 @@ For reference, current measured 1k full legacy payload is336968 bytes. If exactl
 The small target CPU penalty does not alone decide total disk cost. Next: actual encode+write+Full-sync feasibility with old/new identical full-fixture inputs, calibrated A/A and all costs included. Only if that passes should a versioned bounded production decoder, backward rejection/nonmutation, crash/replay, optional-platform and calibrated full-engine gates be implemented. Do not claim a DB speedup or shipping compression from this report.
 
 Production source unchanged and source hashes verified after all runs. No workspace rerun for diagnostic-only source, no peak RSS/power-cut/live peer qualification. SQLite durable gap and live MSSQL/Kusto remain open; full eight-peer objective unchanged.
+
+Follow-up [encode/write/Full-sync gate](../2026-10-24-sparse-delta-index-io/report.md) found no calibrated gain. New-codec proposal not accepted; no production reader/writer changes.

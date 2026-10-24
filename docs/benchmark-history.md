@@ -8,6 +8,8 @@
 
 ## Обновление 2026-10-24
 
+- [Delta-index encode/write/Full-sync — не принято](../benches/results/2026-10-24-sparse-delta-index-io/report.md): реальные frames 336981→250359 bytes, но +0,35% /+0,65% ниже A/A-различий 0,87% /0,77%. 864 exact-validated операции, reserve для всех вариантов; production-кодек не вводится, ускорение БД не заявлено.
+
 - [Sparse delta-index CPU/byte gate](../benches/results/2026-10-24-sparse-delta-index-cpu/report.md): vector-секция 1k 238992→152370 bytes (−36,24%), но serial CPU −5,99% /−7,12% (~14–17 мкс дороже). Exact legacy-byte re-expansion прошла; формат только proposal. Следующий gate encode+write+Full sync; production reader/writer не менялись, DB gain не заявлен.
 
 - [Sparse-only fused output CPU](../benches/results/2026-10-24-embedding-sparse-fused-output-cpu/report.md) / [engine gate — отклонено](../benches/results/2026-10-24-embedding-sparse-fused-engine/report.md): dense fallback убрал CPU Unicode-регресс, default 1k CPU +3,40% /+3,17%; полный durable 1k −0,49% /−2,93%, native flat. Workspace/bit checks прошли; production восстановлен, engine gain не подтверждён.
