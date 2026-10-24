@@ -10,6 +10,8 @@
 
 Исторический каталог ниже сохраняет срез 5 октября. Новые измерения текущего кода:
 
+- [Sparse encoder block-width CPU gate](../benches/results/2026-10-24-sparse-block-width-cpu/report.md): варианты 4/16/32 против текущих 8 элементов; целевой 1k −1,4% / +0,56% / −17,9%. Достаточного сигнала нет, production не менялся; это CPU-only диагностика.
+
 - [Current-source read refresh](../benches/results/2026-10-24-current-read-refresh-final/report.md): **108/108** агрегированных побед в шести сценариях против SQLite/DuckDB/PostgreSQL/MySQL/MongoDB/pandas, 1k/10k/100k, три процесса × 12 samples. Hash/значения/cleanup проверены; MSSQL/Kusto и durable 1k остаются открыты.
 
 - [Native insert refresh на текущем коде](../benches/results/2026-10-24-current-native-refresh/report.md): **15/15** агрегированных побед против SQLite/DuckDB/PostgreSQL/MySQL/MongoDB, 1k/10k/100k, три процесса × 12 samples. На 100k Lin 90,296 мс / DuckDB 99,004 мс. Native memory API контракт; durable и MSSQL/Kusto этим не закрыты.
