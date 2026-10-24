@@ -8,6 +8,8 @@
 
 ## Обновление 2026-10-24
 
+- [Bitmap cardinality sample once — принято](../benches/results/2026-10-24-bitmap-sample-once/report.md): первые 100 строк оцениваются один раз на slab вместо каждой строки; включённый sampling ускоряет index operation примерно 16–18× в двух сериях, с сохранением ошибок/типов postings/partial/boolean/порога 10k. Workspace прошёл, финальные бинарники совпали с измеренными; peer refresh 108/108 read и 15/15 native. Обычный bitmap-disabled путь без доказанного общего ускорения; durable SQLite gap/MSSQL/Kusto открыты.
+
 - [Row template clone vs sorted collect — отклонено](../benches/results/2026-10-24-row-template-collect-cpu/report.md): текущее clone/fill против bulk collect отсортированных slots; uniform 1k/10k около −42% CPU в обеих сериях, 0/6 побед. Scalar-row oracle/duplicates/Now/batch boundaries прошли; production не менялся. Лишней полной rollback-копии в текущем append-path не найдено.
 
 - [Delta-index encode/write/Full-sync — не принято](../benches/results/2026-10-24-sparse-delta-index-io/report.md): реальные frames 336981→250359 bytes, но +0,35% /+0,65% ниже A/A-различий 0,87% /0,77%. 864 exact-validated операции, reserve для всех вариантов; production-кодек не вводится, ускорение БД не заявлено.

@@ -506,6 +506,7 @@ impl LiveIndex {
     }
 
     /// Determine if this index should use bitmap encoding based on cardinality estimation
+    #[cfg(test)]
     fn should_use_bitmap(&self, _orig_idx: usize, row: &Row, rows: &[Row]) -> bool {
         // If bitmap_card_field is set, estimate cardinality from sample
         if let Some(field_name) = self.def.bitmap_card_field.as_ref() {
@@ -559,13 +560,35 @@ impl LiveIndex {
         // Pre-compute all keys in a single pass
         let keys: Vec<_> = keyed_rows.iter().map(|(_, r)| self.key_of(r)).collect();
 
+        let bitmap_sample = self.def.bitmap_card_field.as_ref().map(|field| {
+            let mut distinct = rustc_hash::FxHashSet::default();
+            for row in rows.iter().take(100) {
+                if let Some(cell) = row.get(field) {
+                    if matches!(cell, Cell::Bool(_)) {
+                        return (true, 0);
+                    }
+                    distinct.insert(cell);
+                }
+            }
+            (false, distinct.len())
+        });
+
         // Bulk insert using pre-computed keys
         for ((orig_idx, row), key) in keyed_rows.iter().zip(keys.into_iter()) {
             use std::collections::btree_map::Entry;
 
             // Auto-detect bitmap index based on field cardinality
             // If bitmap_card_field is set, estimate cardinality from sample
-            let is_bitmap = self.should_use_bitmap(*orig_idx, row, rows);
+            let is_bitmap = self
+                .def
+                .bitmap_card_field
+                .as_ref()
+                .zip(bitmap_sample)
+                .is_some_and(|(field, (sample_has_bool, count))| {
+                    matches!(row.get(field), Some(Cell::Bool(_)))
+                        || sample_has_bool
+                        || (count > 0 && count <= if self.forward.len() > 10_000 { 32 } else { 16 })
+                });
 
             match self.forward.entry(key) {
                 Entry::Vacant(v) => {
@@ -1513,6 +1536,163 @@ mod storage_tests {
                 index.forward.get(&index.key_of(&row)),
                 Some(&PostingList::Standard(vec![8]))
             );
+        }
+    }
+}
+
+#[cfg(test)]
+impl LiveIndex {
+    fn insert_slab_batch_reference(&mut self, start: usize, rows: &[Row]) -> Result<(), String> {
+        let now = crate::store::now_ms();
+        // Partial index check: only insert matching rows
+        let keyed_rows: Vec<(usize, &Row)> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| {
+                self.def
+                    .pred
+                    .as_ref()
+                    .is_none_or(|pred| crate::exec::eval_pred(pred, row, now))
+            })
+            .map(|(i, row)| (start + i, row))
+            .collect();
+
+        if keyed_rows.is_empty() {
+            return Ok(());
+        }
+
+        // Pre-compute all keys in a single pass
+        let keys: Vec<_> = keyed_rows.iter().map(|(_, r)| self.key_of(r)).collect();
+
+        // Bulk insert using pre-computed keys
+        for ((orig_idx, row), key) in keyed_rows.iter().zip(keys.into_iter()) {
+            use std::collections::btree_map::Entry;
+
+            // Auto-detect bitmap index based on field cardinality
+            // If bitmap_card_field is set, estimate cardinality from sample
+            let is_bitmap = self.should_use_bitmap(*orig_idx, row, rows);
+
+            match self.forward.entry(key) {
+                Entry::Vacant(v) => {
+                    self.reverse.insert(*orig_idx, v.key().clone());
+                    let mut posting = PostingList::new(is_bitmap, 1 << 16);
+                    posting.push(*orig_idx);
+                    v.insert(posting);
+                }
+                Entry::Occupied(mut o) => {
+                    if self.def.unique {
+                        return Err(format!("unique index {}: duplicate key", self.def.label()));
+                    }
+                    self.reverse.insert(*orig_idx, o.key().clone());
+                    o.get_mut().push(*orig_idx);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod bitmap_sample_once_tests {
+    use super::*;
+    fn compare(rows: &[Row], unique: bool, partial: bool, populated: usize) {
+        let def = IndexDef {
+            collection: "docs".into(),
+            unique,
+            fields: vec!["key".into()],
+            pred: if partial {
+                Some(Pred::Cmp {
+                    field: crate::ast::Field {
+                        parts: vec!["keep".into()],
+                    },
+                    op: CmpOp::Eq,
+                    value: Value::Bool(true),
+                })
+            } else {
+                None
+            },
+            bitmap_card_field: Some("sample".into()),
+        };
+        let mut expected = LiveIndex::new(def.clone());
+        if populated > 0 {
+            expected.def.bitmap_card_field = None;
+            for i in 0..populated {
+                let row = Row::from([("key".into(), Cell::Int(-1 - i as i64))]);
+                expected.insert_at_new(i as usize, &row).unwrap();
+            }
+            expected.def.bitmap_card_field = def.bitmap_card_field;
+        }
+        let mut actual = expected.clone();
+        let a = expected.insert_slab_batch_reference(20_000, rows);
+        let b = actual.insert_slab_batch(20_000, rows);
+        assert_eq!(a, b);
+        assert_eq!(expected.reverse, actual.reverse);
+        let a: Vec<_> = expected
+            .forward
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    matches!(v, PostingList::Bitmap(_)),
+                    v.to_indices(),
+                )
+            })
+            .collect();
+        let b: Vec<_> = actual
+            .forward
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    matches!(v, PostingList::Bitmap(_)),
+                    v.to_indices(),
+                )
+            })
+            .collect();
+        assert_eq!(a, b);
+    }
+    #[test]
+    fn sample_once_matches_per_row_reference() {
+        for n in [0, 1, 2, 99, 100, 101, 128] {
+            for cardinality in [0, 1, 16, 17, 32, 33] {
+                let rows: Vec<Row> = (0..n)
+                    .map(|i| {
+                        let mut r = Row::from([
+                            ("key".into(), Cell::Int((i % 37) as i64)),
+                            ("keep".into(), Cell::Bool(i % 3 != 0)),
+                        ]);
+                        if cardinality > 0 {
+                            r.insert("sample".into(), Cell::Int((i % cardinality) as i64));
+                        }
+                        r
+                    })
+                    .collect();
+                for boolean_at in [None, Some(0), Some(100)] {
+                    let mut case_rows = rows.clone();
+                    if let Some(i) = boolean_at {
+                        if let Some(row) = case_rows.get_mut(i) {
+                            row.insert("sample".into(), Cell::Bool(true));
+                        }
+                    }
+                    for unique in [false, true] {
+                        for partial in [false, true] {
+                            compare(&case_rows, unique, partial, 0);
+                        }
+                    }
+                }
+            }
+        }
+        let rows: Vec<Row> = (0..128)
+            .map(|i| {
+                Row::from([
+                    ("key".into(), Cell::Int(i)),
+                    ("sample".into(), Cell::Int(i % 24)),
+                    ("keep".into(), Cell::Bool(true)),
+                ])
+            })
+            .collect();
+        for population in [9_999, 10_000, 10_001] {
+            compare(&rows, false, false, population);
         }
     }
 }
