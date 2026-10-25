@@ -1,0 +1,16 @@
+   Compiling lin v0.4.0 (/Users/themoretheless/Documents/Sources/lin)
+error[E0433]: cannot find type `Cell` in this scope
+    --> src/persist.rs:4153:49
+     |
+4153 |             .map(|i| Row::from([("body".into(), Cell::Text(format!("body {i}").into()))]))
+     |                                                 ^^^^ use of undeclared type `Cell`
+     |
+help: consider importing one of these items
+     |
+4147 +     use crate::Cell;
+     |
+4147 +     use std::cell::Cell;
+     |
+
+For more information about this error, try `rustc --explain E0433`.
+error: could not compile `lin` (lib test) due to 1 previous error

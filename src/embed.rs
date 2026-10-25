@@ -463,6 +463,20 @@ impl HnswIndex {
         self.id_to_idx.is_empty()
     }
 
+    /// Estimated resident memory in bytes (nodes, vectors, adjacency graph, and lookup map).
+    pub fn resident_memory(&self) -> usize {
+        let mut total = std::mem::size_of::<Self>();
+        total += self.nodes.capacity() * std::mem::size_of::<HnswNode>();
+        for node in &self.nodes {
+            total += node.vector.len() * 4;
+            for level in &node.neighbors {
+                total += level.capacity() * std::mem::size_of::<usize>();
+            }
+        }
+        total += self.id_to_idx.capacity() * (std::mem::size_of::<usize>() * 2 + 8);
+        total
+    }
+
     pub fn remove(&mut self, id: usize) {
         if let Some(node_idx) = self.id_to_idx.remove(&id) {
             self.nodes[node_idx].id = usize::MAX;
@@ -880,6 +894,20 @@ impl HnswIndexSq8 {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.id_to_idx.is_empty()
+    }
+
+    /// Estimated resident memory in bytes (nodes, quantized vectors, adjacency graph, and lookup map).
+    pub fn resident_memory(&self) -> usize {
+        let mut total = std::mem::size_of::<Self>();
+        total += self.nodes.capacity() * std::mem::size_of::<HnswNodeSq8>();
+        for node in &self.nodes {
+            total += node.vector.len();
+            for level in &node.neighbors {
+                total += level.capacity() * std::mem::size_of::<usize>();
+            }
+        }
+        total += self.id_to_idx.capacity() * (std::mem::size_of::<usize>() * 2 + 8);
+        total
     }
 
     pub fn remove(&mut self, id: usize) {

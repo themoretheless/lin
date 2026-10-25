@@ -175,10 +175,10 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 68 | LIN-0962 | [D25](#d25) | Проверить snippet-only update | CORRECTNESS | done | S | G-CORRECT |
 | 69 | LIN-0963 | [D25](#d25) | Проверить removal последнего term | CORRECTNESS | done | S | G-CORRECT |
 | 70 | LIN-0964 | [D25](#d25) | Проверить insertion нового term | CORRECTNESS | done | S | G-CORRECT |
-| 71 | LIN-1041 | [D27](#d27) | Зафиксировать exact/approximate search contract | CORRECTNESS | qualification | M | G-CORRECT |
-| 72 | LIN-1042 | [D27](#d27) | Измерить HNSW recall против exact | PERF | candidate | L | G-PERF |
-| 73 | LIN-1043 | [D27](#d27) | Измерить HNSW build latency | PERF | candidate | L | G-PERF |
-| 74 | LIN-1044 | [D27](#d27) | Измерить HNSW resident memory | PERF | candidate | L | G-PERF |
+| 71 | LIN-1041 | [D27](#d27) | Зафиксировать exact/approximate search contract | CORRECTNESS | done | M | G-CORRECT |
+| 72 | LIN-1042 | [D27](#d27) | Измерить HNSW recall против exact | PERF | done | L | G-PERF |
+| 73 | LIN-1043 | [D27](#d27) | Измерить HNSW build latency | PERF | done | L | G-PERF |
+| 74 | LIN-1044 | [D27](#d27) | Измерить HNSW resident memory | PERF | done | L | G-PERF |
 | 75 | LIN-1081 | [D28](#d28) | Проверить cosine dimensional mismatch | CORRECTNESS | done | S | G-CORRECT |
 | 76 | LIN-1082 | [D28](#d28) | Проверить cosine zero norms | CORRECTNESS | done | S | G-CORRECT |
 | 77 | LIN-1083 | [D28](#d28) | Проверить cosine NaN handling | CORRECTNESS | done | S | G-CORRECT |
@@ -191,22 +191,22 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 84 | LIN-1162 | [D30](#d30) | Проверить WGSL mixed numeric compares | CORRECTNESS | done | S | G-CORRECT |
 | 85 | LIN-1163 | [D30](#d30) | Проверить WGSL boolean combinations | CORRECTNESS | done | S | G-CORRECT |
 | 86 | LIN-1164 | [D30](#d30) | Проверить WGSL null masks | CORRECTNESS | done | S | G-CORRECT |
-| 87 | LIN-1321 | [D34](#d34) | Зафиксировать ReadDb visibility contract | CORRECTNESS | qualification | M | G-CORRECT |
-| 88 | LIN-1322 | [D34](#d34) | Проверить snapshot generation isolation | CORRECTNESS | qualification | S | G-CORRECT |
-| 89 | LIN-1323 | [D34](#d34) | Проверить snapshot index consistency | CORRECTNESS | qualification | S | G-CORRECT |
-| 90 | LIN-1324 | [D34](#d34) | Проверить snapshot FTS consistency | CORRECTNESS | qualification | S | G-CORRECT |
-| 91 | LIN-1361 | [D35](#d35) | Проверить handshake protocol version | CORRECTNESS | qualification | S | G-CORRECT |
-| 92 | LIN-1362 | [D35](#d35) | Проверить server identity validation | CORRECTNESS | qualification | S | G-CORRECT |
-| 93 | LIN-1363 | [D35](#d35) | Проверить transport framing limits | CORRECTNESS | qualification | S | G-CORRECT |
-| 94 | LIN-1364 | [D35](#d35) | Проверить replication byte order | CORRECTNESS | qualification | S | G-CORRECT |
-| 95 | LIN-1401 | [D36](#d36) | Проверить follower generation continuity | CORRECTNESS | qualification | S | G-CORRECT |
-| 96 | LIN-1402 | [D36](#d36) | Проверить duplicate incoming records | CORRECTNESS | qualification | S | G-CORRECT |
-| 97 | LIN-1403 | [D36](#d36) | Проверить out-of-order incoming records | CORRECTNESS | qualification | S | G-CORRECT |
-| 98 | LIN-1404 | [D36](#d36) | Проверить missing incoming generation | CORRECTNESS | qualification | S | G-CORRECT |
-| 99 | LIN-1641 | [D42](#d42) | Генерировать AST parser roundtrip cases | VERIFY | qualification | S | G-VERIFY |
-| 100 | LIN-1642 | [D42](#d42) | Генерировать typed/untyped roundtrip cases | VERIFY | qualification | S | G-VERIFY |
-| 101 | LIN-1643 | [D42](#d42) | Генерировать row/batch equivalence cases | VERIFY | qualification | S | G-VERIFY |
-| 102 | LIN-1644 | [D42](#d42) | Генерировать cursor/materialized equivalence cases | VERIFY | qualification | S | G-VERIFY |
+| 87 | LIN-1321 | [D34](#d34) | Зафиксировать ReadDb visibility contract | CORRECTNESS | done | M | G-CORRECT |
+| 88 | LIN-1322 | [D34](#d34) | Проверить snapshot generation isolation | CORRECTNESS | done | S | G-CORRECT |
+| 89 | LIN-1323 | [D34](#d34) | Проверить snapshot index consistency | CORRECTNESS | done | S | G-CORRECT |
+| 90 | LIN-1324 | [D34](#d34) | Проверить snapshot FTS consistency | CORRECTNESS | done | S | G-CORRECT |
+| 91 | LIN-1361 | [D35](#d35) | Проверить handshake protocol version | CORRECTNESS | done | S | G-CORRECT |
+| 92 | LIN-1362 | [D35](#d35) | Проверить server identity validation | CORRECTNESS | done | S | G-CORRECT |
+| 93 | LIN-1363 | [D35](#d35) | Проверить transport framing limits | CORRECTNESS | done | S | G-CORRECT |
+| 94 | LIN-1364 | [D35](#d35) | Проверить replication byte order | CORRECTNESS | done | S | G-CORRECT |
+| 95 | LIN-1401 | [D36](#d36) | Проверить follower generation continuity | CORRECTNESS | done | S | G-CORRECT |
+| 96 | LIN-1402 | [D36](#d36) | Проверить duplicate incoming records | CORRECTNESS | done | S | G-CORRECT |
+| 97 | LIN-1403 | [D36](#d36) | Проверить out-of-order incoming records | CORRECTNESS | done | S | G-CORRECT |
+| 98 | LIN-1404 | [D36](#d36) | Проверить missing incoming generation | CORRECTNESS | done | S | G-CORRECT |
+| 99 | LIN-1641 | [D42](#d42) | Генерировать AST parser roundtrip cases | VERIFY | done | S | G-VERIFY |
+| 100 | LIN-1642 | [D42](#d42) | Генерировать typed/untyped roundtrip cases | VERIFY | done | S | G-VERIFY |
+| 101 | LIN-1643 | [D42](#d42) | Генерировать row/batch equivalence cases | VERIFY | done | S | G-VERIFY |
+| 102 | LIN-1644 | [D42](#d42) | Генерировать cursor/materialized equivalence cases | VERIFY | done | S | G-VERIFY |
 | 103 | LIN-1681 | [D43](#d43) | Инъецировать crash перед WAL append | VERIFY | done | S | G-VERIFY |
 | 104 | LIN-1682 | [D43](#d43) | Инъецировать crash после header write | VERIFY | done | S | G-VERIFY |
 | 105 | LIN-1683 | [D43](#d43) | Инъецировать crash после payload write | VERIFY | done | S | G-VERIFY |

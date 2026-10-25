@@ -1,0 +1,28 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.12s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/lib.rs (target/debug/build/lin/9b69f1e840b117a4/out/lin-9b69f1e840b117a4)
+
+running 3 tests
+
+thread '<unnamed>' (51947480) panicked at src/exec.rs:5574:29:
+injected WAL encoder panic
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread '<unnamed>' (51947481) panicked at src/exec.rs:5574:29:
+injected WAL encoder panic
+
+thread 'exec::preencoded_insert_tests::noneligible_native_small_and_explicit_transactions_stay_serial' (51947477) panicked at src/exec.rs:8694:59:
+called `Result::unwrap()` on an `Err` value: Error { message: "expected identifier", pos: Some(12757), phase: Compile }
+test exec::preencoded_insert_tests::worker_spawn_fallback_matches_normal_values_and_readonly_replay ... ok
+test exec::preencoded_insert_tests::noneligible_native_small_and_explicit_transactions_stay_serial ... FAILED
+test exec::preencoded_insert_tests::encoded_errors_defer_until_quota_and_index_checks ... ok
+
+failures:
+
+failures:
+    exec::preencoded_insert_tests::noneligible_native_small_and_explicit_transactions_stay_serial
+
+test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 93 filtered out; finished in 0.30s
+
+error: test failed, to rerun pass `--lib`
