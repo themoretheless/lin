@@ -260,3 +260,17 @@ existing name. This applies to read fixtures too. Live empty-schema creation,
 streaming readiness, values and cleanup remain required before timing is valid.
 [Implementation, official protocol references and mock/CLI gates](../benches/results/2026-10-24-kusto-streaming-adapter/report.md)
 do not count as a live Kusto result or a win.
+
+
+## Peer index constraints comparison
+
+To ensure fair comparisons across peers (LIN-0008), the benchmark contracts enforce:
+- **Lin**: B-Tree composite keys with unique/non-unique flags, inverted FTS postings with SIMD lowering, and HNSW vector graphs with cosine similarity.
+- **SQLite**: B-Tree indices (`CREATE UNIQUE INDEX idx_docs_id ON docs(id); CREATE INDEX idx_docs_wing ON docs(wing, ts);`).
+- **DuckDB**: ART (Adaptive Radix Tree) indices for point lookups and primary keys.
+- **PostgreSQL**: B-Tree indices for primary and secondary keys (`btree`), GIN/GiST for full-text search.
+- **MySQL**: B+Tree indices on InnoDB (`BTREE`), Fulltext index for text search.
+- **MongoDB**: B-tree indices on `_id` and compound indexes on `(wing, ts)`.
+- **SQL Server**: Clustered B-tree on primary key, nonclustered B-tree on secondary keys.
+- **Kusto**: Inverted indexing of all columns with column-store partitioning.
+- **pandas**: In-memory Hash index on index labels.

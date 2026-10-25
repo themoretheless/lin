@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import http.client
 import importlib.metadata
 import io
@@ -762,10 +763,31 @@ def main():
         parser.error("run insert_native separately from read cases")
     args.native_timestamp_ms = time.time_ns() // 1_000_000
     args.output.mkdir(parents=True, exist_ok=False)
+
+    lin_binary_path = Path(args.lin_binary)
+    lin_binary_info = {}
+    if lin_binary_path.is_file():
+        lin_binary_info = {
+            "path": str(lin_binary_path),
+            "size_bytes": lin_binary_path.stat().st_size,
+            "mtime": lin_binary_path.stat().st_mtime,
+            "sha256": hashlib.sha256(lin_binary_path.read_bytes()).hexdigest(),
+        }
+    git_commit = None
+    git_status_before = None
+    try:
+        git_commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+        git_status_before = subprocess.check_output(["git", "status", "--porcelain"], cwd=ROOT, text=True).strip()
+    except Exception:
+        pass
+
     run = {"rows": args.rows, "repeats": args.repeats, "samples": args.samples,
            "host": platform.platform(), "engines": args.engines, "cases": args.cases,
            "observations": [], "errors": [], "versions": {}, "medians_ns": {},
-           "python": sys.version, "clients": client_versions()}
+           "python": sys.version, "clients": client_versions(),
+           "lin_binary_info": lin_binary_info,
+           "git_commit": git_commit,
+           "git_status_before": git_status_before}
     if args.repeats > 1:
         for repetition in range(args.repeats):
             order = args.engines[repetition % len(args.engines):] + args.engines[:repetition % len(args.engines)]
@@ -859,6 +881,12 @@ def finish(args, run):
                 run["medians_ns"][f"{case}/{engine}"] = statistics.median(statistics.median(o["samples_ns"]) for o in rows)
     complete = len(run["medians_ns"]) == len(args.cases) * len(args.engines) and not run["errors"]
     run["status"] = "complete" if complete else "incomplete"
+    try:
+        git_status_after = subprocess.check_output(["git", "status", "--porcelain"], cwd=ROOT, text=True).strip()
+        run["git_status_after"] = git_status_after
+        run["source_drift"] = (git_status_after != run.get("git_status_before", ""))
+    except Exception:
+        run["source_drift"] = False
     (args.output / "run.json").write_text(json.dumps(run, indent=2) + "\n")
     (args.output / "report.md").write_text(report(run))
     if not complete:

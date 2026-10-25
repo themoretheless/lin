@@ -1455,3 +1455,24 @@ fn last_acknowledged_prefix_recovers_after_torn_trailing_frame_and_continues_wri
     );
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn test_checkpoint_pause_budget_lin_0163() {
+    let dir = tmp();
+    let mut db = Db::open(&dir).unwrap();
+    for i in 0..200 {
+        db.run(&format!(
+            r#"insert docs {{ id: "chk_{i}", uri: "raw://chk_{i}", title: "Checkpoint document {i} with payload text", layer: "wiki" }}"#
+        ))
+        .unwrap();
+    }
+    let t0 = std::time::Instant::now();
+    db.checkpoint().unwrap();
+    let pause = t0.elapsed();
+    assert!(
+        pause.as_millis() < 250,
+        "checkpoint pause budget exceeded: {pause:?}"
+    );
+    assert_eq!(db.stats().writes_since_snapshot, 0);
+    let _ = fs::remove_dir_all(&dir);
+}

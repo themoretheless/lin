@@ -1726,3 +1726,73 @@ fn gpu_adapter_report_metrics_and_uma_status() {
     db.disable_gpu();
     assert!(db.gpu_adapter_report().is_none());
 }
+
+#[test]
+#[ignore = "requires a hardware GPU"]
+fn test_adapter_selection_diagnostics_lin_1121() {
+    use lin::gpu::{GpuCompute, GpuOptions};
+    let mut options = GpuOptions::default();
+    options.limits.max_compute_workgroups_per_dimension = u32::MAX;
+    let err = match GpuCompute::with_options(options) {
+        Err(e) => e,
+        Ok(_) => panic!("expected error with unsatisfiable limits"),
+    };
+    assert!(
+        err.to_string().contains("unsupported") || err.to_string().contains("GPU"),
+        "{err}"
+    );
+
+    let gpu = GpuCompute::new().expect("valid hardware adapter");
+    let info = gpu.adapter_info();
+    assert!(!info.name.is_empty());
+    let report = gpu.adapter_report();
+    assert_eq!(report.name, info.name);
+    assert!(report.max_buffer_size > 0);
+}
+
+#[test]
+#[ignore = "requires a hardware GPU"]
+fn test_device_allocation_failure_lin_1122() {
+    use lin::gpu::GpuCompute;
+    let gpu = GpuCompute::new().expect("valid hardware adapter");
+    assert!(gpu.storage_buffer(&[]).is_err());
+    assert!(gpu.storage_buffer(&[1, 2, 3]).is_err());
+}
+
+#[test]
+#[ignore = "requires a hardware GPU"]
+fn test_queue_submission_failure_lin_1123() {
+    use lin::gpu::GpuCompute;
+    let gpu = GpuCompute::new().expect("valid hardware adapter");
+    let source = r#"
+        @group(0) @binding(0) var<storage, read_write> values: array<u32>;
+        @compute @workgroup_size(64)
+        fn run(@builtin(global_invocation_id) id: vec3<u32>) {
+            if id.x < arrayLength(&values) { values[id.x] += 1u; }
+        }
+    "#;
+    let kernel = gpu.compile_wgsl(source, "run").unwrap();
+    let err = gpu.dispatch(&kernel, &[], [1, 1, 1]).unwrap_err();
+    assert!(
+        err.to_string().contains("bind group") || err.to_string().contains("error"),
+        "{err}"
+    );
+    let err2 = gpu.dispatch(&kernel, &[], [u32::MAX, 1, 1]).unwrap_err();
+    assert!(!err2.to_string().is_empty());
+}
+
+#[test]
+#[ignore = "requires a hardware GPU"]
+fn test_device_lost_recovery_lin_1124() {
+    use lin::Db;
+    use std::sync::Arc;
+    let gpu = Arc::new(lin::gpu::GpuCompute::new().unwrap());
+    let mut db = Db::fixture().with_gpu(gpu);
+    let r1 = db.run("orders | total > 1 | count").unwrap();
+    assert_eq!(r1.rows[0]["hits"].as_i64(), Some(2));
+
+    db.disable_gpu();
+    assert!(db.gpu_adapter_report().is_none());
+    let r2 = db.run("orders | total > 1 | count").unwrap();
+    assert_eq!(r2.rows[0]["hits"].as_i64(), Some(2));
+}

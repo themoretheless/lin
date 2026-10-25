@@ -52,14 +52,16 @@ impl FtsIndex {
 
     pub fn build(rows: &[Row], fields: &[String]) -> Self {
         let mut idx = Self::empty(fields);
+        let mut scratch = String::with_capacity(256);
         for (i, row) in rows.iter().enumerate() {
-            idx.append_row(i, row);
+            idx.append_row_with_scratch(i, row, &mut scratch);
         }
         idx
     }
 
     /// Post a row whose position is new at the tail of the collection: written
     /// straight into the base list, which keeps appends allocation-cheap.
+    #[allow(dead_code)]
     pub fn append_row(&mut self, row_idx: usize, row: &Row) {
         // Caller should provide scratch buffer if batching; single-row path uses one-off.
         let mut scratch = String::with_capacity(128);
@@ -595,6 +597,9 @@ fn add_posting(postings: &mut FxHashMap<String, Vec<usize>>, tok: &str, row_idx:
 
 fn row_tokens<'a>(row: &'a Row, fields: &[String]) -> Vec<std::borrow::Cow<'a, str>> {
     let mut out = Vec::with_capacity(fields.len() * 10);
+    thread_local! {
+        static SCRATCH: std::cell::RefCell<String> = std::cell::RefCell::new(String::with_capacity(512));
+    }
     for text in fts_texts(row, fields) {
         if text
             .bytes()
@@ -602,12 +607,13 @@ fn row_tokens<'a>(row: &'a Row, fields: &[String]) -> Vec<std::borrow::Cow<'a, s
         {
             out.extend(text.split_whitespace().map(std::borrow::Cow::Borrowed));
         } else {
-            let lowercased = text.to_lowercase();
-            out.extend(
-                lowercased
-                    .split_whitespace()
-                    .map(|t| std::borrow::Cow::Owned(t.into())),
-            );
+            SCRATCH.with(|sc| {
+                let mut scratch = sc.borrow_mut();
+                let lowered = lowercased(text, &mut scratch);
+                for tok in lowered.split_whitespace() {
+                    out.push(std::borrow::Cow::Owned(tok.to_string()));
+                }
+            });
         }
     }
     out.sort_unstable();

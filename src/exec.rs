@@ -1610,22 +1610,33 @@ impl Db {
                 ms,
             });
         }
-        if let Some(agg) = &prepared.agg_plan {
-            let t0 = Instant::now();
-            let now = now_ms();
-            let rows = self.execute_agg_plan(agg, now);
-            let ms = t0.elapsed().as_secs_f64() * 1000.0;
-            let n = rows.len();
-            return Ok(Handle {
-                plan: prepared.plan.clone(),
-                rows,
-                done: Done {
-                    r#gen: self.store.r#gen,
-                    n,
-                },
-                message: None,
-                ms,
+        #[cfg(feature = "gpu")]
+        let has_gpu_agg = self.gpu.is_some()
+            && prepared.stmts.first().map_or(false, |s| match s {
+                Stmt::Query(q) => self.uses_gpu_filter(q) || self.uses_gpu_count(q),
+                _ => false,
             });
+        #[cfg(not(feature = "gpu"))]
+        let has_gpu_agg = false;
+
+        if !has_gpu_agg {
+            if let Some(agg) = &prepared.agg_plan {
+                let t0 = Instant::now();
+                let now = now_ms();
+                let rows = self.execute_agg_plan(agg, now);
+                let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                let n = rows.len();
+                return Ok(Handle {
+                    plan: prepared.plan.clone(),
+                    rows,
+                    done: Done {
+                        r#gen: self.store.r#gen,
+                        n,
+                    },
+                    message: None,
+                    ms,
+                });
+            }
         }
         let t0 = Instant::now();
         let mut undo = if !prepared.writes {
@@ -1821,22 +1832,33 @@ impl Db {
                 ms,
             });
         }
-        if let Some(agg) = &prepared.agg_plan {
-            let t0 = Instant::now();
-            let now = now_ms();
-            let rows = self.execute_agg_plan(agg, now);
-            let ms = t0.elapsed().as_secs_f64() * 1000.0;
-            let n = rows.len();
-            return Ok(Handle {
-                plan: prepared.plan.clone(),
-                rows,
-                done: Done {
-                    r#gen: self.store.r#gen,
-                    n,
-                },
-                message: None,
-                ms,
+        #[cfg(feature = "gpu")]
+        let has_gpu_agg = self.gpu.is_some()
+            && prepared.stmts.first().map_or(false, |s| match s {
+                Stmt::Query(q) => self.uses_gpu_filter(q) || self.uses_gpu_count(q),
+                _ => false,
             });
+        #[cfg(not(feature = "gpu"))]
+        let has_gpu_agg = false;
+
+        if !has_gpu_agg {
+            if let Some(agg) = &prepared.agg_plan {
+                let t0 = Instant::now();
+                let now = now_ms();
+                let rows = self.execute_agg_plan(agg, now);
+                let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                let n = rows.len();
+                return Ok(Handle {
+                    plan: prepared.plan.clone(),
+                    rows,
+                    done: Done {
+                        r#gen: self.store.r#gen,
+                        n,
+                    },
+                    message: None,
+                    ms,
+                });
+            }
         }
         let t0 = Instant::now();
         let (rows, message, pack) = self.exec_program_readonly(&prepared.stmts)?;
@@ -7796,7 +7818,7 @@ fn gpu_supported_pred(pred: &Pred) -> bool {
 }
 
 #[cfg(feature = "gpu")]
-fn gpu_comparison_record(left: &Cell, right: &Cell, op: CmpOp) -> [u32; 5] {
+fn gpu_comparison_record(left: &Cell, right: &Cell, _op: CmpOp) -> [u32; 5] {
     let integer_key = |v: i64| (v as u64) ^ (1u64 << 63);
     let float_key = |v: f64| {
         let bits = if v == 0.0 { 0 } else { v.to_bits() };
@@ -7806,25 +7828,19 @@ fn gpu_comparison_record(left: &Cell, right: &Cell, op: CmpOp) -> [u32; 5] {
             bits ^ (1u64 << 63)
         }
     };
-    let keys = if matches!(op, CmpOp::Eq | CmpOp::Ne) {
-        match (left, right) {
-            (Cell::Bool(a), Cell::Bool(b)) => Some((*a as u64, *b as u64)),
-            (Cell::Int(a), Cell::Int(b)) | (Cell::Time(a), Cell::Time(b)) => {
-                Some((integer_key(*a), integer_key(*b)))
-            }
-            (Cell::Float(_), Cell::Float(_) | Cell::Int(_)) | (Cell::Int(_), Cell::Float(_)) => {
-                left.as_f64()
-                    .zip(right.as_f64())
-                    .filter(|(a, b)| !a.is_nan() && !b.is_nan())
-                    .map(|(a, b)| (float_key(a), float_key(b)))
-            }
-            _ => None,
+    let keys = match (left, right) {
+        (Cell::Bool(a), Cell::Bool(b)) => Some((*a as u64, *b as u64)),
+        (Cell::Int(a), Cell::Int(b)) | (Cell::Time(a), Cell::Time(b)) => {
+            Some((integer_key(*a), integer_key(*b)))
         }
-    } else {
-        left.as_f64()
+        (Cell::Float(_), Cell::Float(_))
+        | (Cell::Float(_), Cell::Int(_))
+        | (Cell::Int(_), Cell::Float(_)) => left
+            .as_f64()
             .zip(right.as_f64())
             .filter(|(a, b)| !a.is_nan() && !b.is_nan())
-            .map(|(a, b)| (float_key(a), float_key(b)))
+            .map(|(a, b)| (float_key(a), float_key(b))),
+        _ => None,
     };
     match keys {
         Some((a, b)) => [a as u32, (a >> 32) as u32, b as u32, (b >> 32) as u32, 1],
