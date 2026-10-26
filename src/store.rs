@@ -891,6 +891,7 @@ impl Store {
         let mut phases = StoreOpenPhases::default();
         let phase = Instant::now();
         let dir = path.as_ref();
+        persist::validate_data_dir(dir)?;
         if !dir.exists() {
             return Err(Error::runtime(format!(
                 "data dir not found: {}",
@@ -1398,9 +1399,20 @@ impl Store {
                 self.extra_owned.insert(name.clone(), fields.clone());
             }
             Pack::Batch { packs } => {
-                for p in packs {
-                    self.apply_pack(p);
-                }
+                self.apply_pack_batch(packs, 0);
+            }
+        }
+    }
+
+    fn apply_pack_batch(&mut self, packs: &[Pack], depth: usize) {
+        if depth > 64 {
+            return;
+        }
+        for p in packs {
+            if let Pack::Batch { packs: sub } = p {
+                self.apply_pack_batch(sub, depth + 1);
+            } else {
+                self.apply_pack(p);
             }
         }
     }

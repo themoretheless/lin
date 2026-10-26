@@ -1395,25 +1395,25 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 1283 | LIN-1743 | [D44](#d44) | Добавить dependency lock drift checks | OPS | candidate | M | G-OPS |
 | 1284 | LIN-1744 | [D44](#d44) | Добавить baseline approval metadata | OPS | candidate | M | G-OPS |
 | 1285 | LIN-1765 | [D45](#d45) | Ограничить regex automaton size | CORRECTNESS | done | M | G-CORRECT |
-| 1286 | LIN-1766 | [D45](#d45) | Ограничить graph expansion count | CORRECTNESS | qualification | M | G-CORRECT |
+| 1286 | LIN-1766 | [D45](#d45) | Ограничить graph expansion count | CORRECTNESS | done | M | G-CORRECT |
 | 1287 | LIN-1767 | [D45](#d45) | Ограничить Cartesian join expansion | CORRECTNESS | done | M | G-CORRECT |
-| 1288 | LIN-1768 | [D45](#d45) | Ограничить aggregate state bytes | CORRECTNESS | qualification | M | G-CORRECT |
+| 1288 | LIN-1768 | [D45](#d45) | Ограничить aggregate state bytes | CORRECTNESS | done | M | G-CORRECT |
 | 1289 | LIN-1769 | [D45](#d45) | Проверить archive path traversal rejection | CORRECTNESS | done | S | G-CORRECT |
 | 1290 | LIN-1770 | [D45](#d45) | Проверить backup symlink policy | CORRECTNESS | done | S | G-CORRECT |
-| 1291 | LIN-1771 | [D45](#d45) | Проверить data-directory traversal policy | CORRECTNESS | qualification | S | G-CORRECT |
+| 1291 | LIN-1771 | [D45](#d45) | Проверить data-directory traversal policy | CORRECTNESS | done | S | G-CORRECT |
 | 1292 | LIN-1772 | [D45](#d45) | Проверить temp-file permission policy | CORRECTNESS | done | S | G-CORRECT |
 | 1293 | LIN-1773 | [D45](#d45) | Проверить replication token comparison | CORRECTNESS | done | S | G-CORRECT |
-| 1294 | LIN-1774 | [D45](#d45) | Проверить secret lifetime in diagnostics | CORRECTNESS | qualification | S | G-CORRECT |
-| 1295 | LIN-1775 | [D45](#d45) | Проверить HTTP remote TLS requirement | CORRECTNESS | qualification | S | G-CORRECT |
-| 1296 | LIN-1776 | [D45](#d45) | Проверить accidental insecure endpoint reuse | CORRECTNESS | qualification | S | G-CORRECT |
+| 1294 | LIN-1774 | [D45](#d45) | Проверить secret lifetime in diagnostics | CORRECTNESS | done | S | G-CORRECT |
+| 1295 | LIN-1775 | [D45](#d45) | Проверить HTTP remote TLS requirement | CORRECTNESS | done | S | G-CORRECT |
+| 1296 | LIN-1776 | [D45](#d45) | Проверить accidental insecure endpoint reuse | CORRECTNESS | done | S | G-CORRECT |
 | 1297 | LIN-1777 | [D45](#d45) | Спроектировать read-only capabilities | FEATURE | candidate | L | G-FEATURE |
 | 1298 | LIN-1778 | [D45](#d45) | Спроектировать collection-level capabilities | FEATURE | candidate | L | G-FEATURE |
 | 1299 | LIN-1779 | [D45](#d45) | Спроектировать extension trust boundaries | FEATURE | candidate | L | G-FEATURE |
 | 1300 | LIN-1780 | [D45](#d45) | Спроектировать untrusted model isolation | FEATURE | candidate | L | G-FEATURE |
 | 1301 | LIN-1781 | [D45](#d45) | Проверить compressed payload bomb rejection | CORRECTNESS | done | S | G-CORRECT |
-| 1302 | LIN-1782 | [D45](#d45) | Проверить nested format recursion limits | CORRECTNESS | qualification | S | G-CORRECT |
+| 1302 | LIN-1782 | [D45](#d45) | Проверить nested format recursion limits | CORRECTNESS | done | S | G-CORRECT |
 | 1303 | LIN-1783 | [D45](#d45) | Проверить pathological UTF-8 scan cost | CORRECTNESS | qualification | S | G-CORRECT |
-| 1304 | LIN-1784 | [D45](#d45) | Проверить adversarial hash collision handling | CORRECTNESS | qualification | S | G-CORRECT |
+| 1304 | LIN-1784 | [D45](#d45) | Проверить adversarial hash collision handling | CORRECTNESS | done | S | G-CORRECT |
 | 1305 | LIN-1801 | [D46](#d46) | Спроектировать schema generation counters | FEATURE | candidate | L | G-FEATURE |
 | 1306 | LIN-1802 | [D46](#d46) | Спроектировать explicit schema version | FEATURE | candidate | L | G-FEATURE |
 | 1307 | LIN-1803 | [D46](#d46) | Спроектировать migration transaction contract | FEATURE | candidate | L | G-FEATURE |
@@ -2000,17 +2000,17 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 1883 | LIN-1787 | [D45](#d45) | Добавить explicit network model permissions | FEATURE | candidate | M | G-FEATURE |
 | 1884 | LIN-1788 | [D45](#d45) | Добавить import file-root restrictions | FEATURE | candidate | M | G-FEATURE |
 | 1885 | LIN-1789 | [D45](#d45) | Проверить C ABI pointer validation design | CORRECTNESS | qualification | S | G-CORRECT |
-| 1886 | LIN-1790 | [D45](#d45) | Проверить unsafe GPU buffer boundaries | CORRECTNESS | qualification | S | G-CORRECT |
-| 1887 | LIN-1791 | [D45](#d45) | Проверить mmap bounds arithmetic | CORRECTNESS | qualification | S | G-CORRECT |
-| 1888 | LIN-1792 | [D45](#d45) | Проверить SIMD unaligned tail safety | CORRECTNESS | qualification | S | G-CORRECT |
+| 1886 | LIN-1790 | [D45](#d45) | Проверить unsafe GPU buffer boundaries | CORRECTNESS | done | S | G-CORRECT |
+| 1887 | LIN-1791 | [D45](#d45) | Проверить mmap bounds arithmetic | CORRECTNESS | done | S | G-CORRECT |
+| 1888 | LIN-1792 | [D45](#d45) | Проверить SIMD unaligned tail safety | CORRECTNESS | done | S | G-CORRECT |
 | 1889 | LIN-1793 | [D45](#d45) | Добавить security regression corpus | VERIFY | qualification | S | G-VERIFY |
 | 1890 | LIN-1794 | [D45](#d45) | Добавить responsible disclosure guidance | FEATURE | candidate | M | G-FEATURE |
 | 1891 | LIN-1795 | [D45](#d45) | Добавить dependency provenance inventory | FEATURE | candidate | M | G-FEATURE |
 | 1892 | LIN-1796 | [D45](#d45) | Добавить offline execution qualification | FEATURE | candidate | M | G-FEATURE |
-| 1893 | LIN-1797 | [D45](#d45) | Проверить no implicit executable loading | CORRECTNESS | qualification | S | G-CORRECT |
-| 1894 | LIN-1798 | [D45](#d45) | Проверить no silent external requests | CORRECTNESS | qualification | S | G-CORRECT |
-| 1895 | LIN-1799 | [D45](#d45) | Проверить CLI history secret filtering | CORRECTNESS | qualification | S | G-CORRECT |
-| 1896 | LIN-1800 | [D45](#d45) | Проверить logs bounded-value formatting | CORRECTNESS | qualification | S | G-CORRECT |
+| 1893 | LIN-1797 | [D45](#d45) | Проверить no implicit executable loading | CORRECTNESS | done | S | G-CORRECT |
+| 1894 | LIN-1798 | [D45](#d45) | Проверить no silent external requests | CORRECTNESS | done | S | G-CORRECT |
+| 1895 | LIN-1799 | [D45](#d45) | Проверить CLI history secret filtering | CORRECTNESS | done | S | G-CORRECT |
+| 1896 | LIN-1800 | [D45](#d45) | Проверить logs bounded-value formatting | CORRECTNESS | done | S | G-CORRECT |
 | 1897 | LIN-1825 | [D46](#d46) | Проверить unknown catalog versions | CORRECTNESS | qualification | S | G-CORRECT |
 | 1898 | LIN-1826 | [D46](#d46) | Проверить duplicate collection declarations | CORRECTNESS | qualification | S | G-CORRECT |
 | 1899 | LIN-1827 | [D46](#d46) | Проверить reserved field policy | CORRECTNESS | qualification | S | G-CORRECT |

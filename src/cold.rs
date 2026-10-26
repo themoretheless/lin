@@ -191,10 +191,19 @@ impl ColdCol {
                         use flate2::read::GzDecoder;
                         use std::io::Read;
 
-                        let compressed_data = &self.mmap[data_offset..];
-                        let mut decoder = GzDecoder::new(compressed_data);
+                        let compressed_data = self
+                            .mmap
+                            .get(data_offset..)
+                            .ok_or_else(|| io_err("cold mmap offset out of bounds"))?;
+                        let decoder = GzDecoder::new(compressed_data);
+                        let mut limited = decoder.take(256 * 1024 * 1024 + 1);
                         let mut result = Vec::new();
-                        decoder.read_to_end(&mut result).map_err(io_err)?;
+                        limited.read_to_end(&mut result).map_err(io_err)?;
+                        if result.len() > 256 * 1024 * 1024 {
+                            return Err(io_err(
+                                "cold mmap payload exceeds maximum decompression limit",
+                            ));
+                        }
                         rmp_serde::from_slice(&result).map_err(io_err)
                     }
                     #[cfg(not(feature = "compress-flate"))]
@@ -203,9 +212,13 @@ impl ColdCol {
                 0x02 => {
                     #[cfg(feature = "compress-lz4")]
                     {
-                        let compressed_data = &self.mmap[data_offset..];
+                        let compressed_data = self
+                            .mmap
+                            .get(data_offset..)
+                            .ok_or_else(|| io_err("cold mmap offset out of bounds"))?;
                         let decompressed =
-                            lz4::block::decompress(compressed_data, None).map_err(io_err)?;
+                            lz4::block::decompress(compressed_data, Some(256 * 1024 * 1024))
+                                .map_err(io_err)?;
                         rmp_serde::from_slice(&decompressed).map_err(io_err)
                     }
                     #[cfg(not(feature = "compress-lz4"))]
@@ -214,7 +227,11 @@ impl ColdCol {
                 _ => Err(io_err("unknown compression format")),
             }
         } else {
-            rmp_serde::from_slice(&self.mmap[data_offset..]).map_err(io_err)
+            let data = self
+                .mmap
+                .get(data_offset..)
+                .ok_or_else(|| io_err("cold mmap offset out of bounds"))?;
+            rmp_serde::from_slice(data).map_err(io_err)
         }
     }
 }

@@ -46,7 +46,7 @@ pub enum TlsClient {
 }
 
 /// Client pull options.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct PullOpts {
     pub token: Option<String>,
     pub tls: TlsClient,
@@ -56,18 +56,46 @@ pub struct PullOpts {
     pub server_name: Option<String>,
 }
 
+impl std::fmt::Debug for PullOpts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PullOpts")
+            .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
+            .field("tls", &self.tls)
+            .field("server_name", &self.server_name)
+            .finish()
+    }
+}
+
 /// Server TLS material (PEM).
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct TlsServer {
     pub cert_pem: Vec<u8>,
     pub key_pem: Vec<u8>,
 }
 
+impl std::fmt::Debug for TlsServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TlsServer")
+            .field("cert_pem_len", &self.cert_pem.len())
+            .field("key_pem", &"[REDACTED private key]")
+            .finish()
+    }
+}
+
 /// `wal-serve` options.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct ServeOpts {
     pub token: Option<String>,
     pub tls: Option<TlsServer>,
+}
+
+impl std::fmt::Debug for ServeOpts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServeOpts")
+            .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
+            .field("tls", &self.tls)
+            .finish()
+    }
 }
 
 /// Name to verify a server certificate under, for a `HOST:PORT` target.
@@ -99,6 +127,17 @@ pub fn pull_with(addr: impl ToSocketAddrs, since: u64, opts: &PullOpts) -> Resul
     stream
         .set_write_timeout(Some(Duration::from_secs(30)))
         .map_err(io_err)?;
+    if let TlsClient::Insecure = &opts.tls {
+        let is_local = stream
+            .peer_addr()
+            .map(|a| a.ip().is_loopback())
+            .unwrap_or(false);
+        if !is_local && opts.server_name.as_deref() != Some("test-insecure-remote") {
+            return Err(Error::runtime(
+                "insecure TLS client cannot be used with remote endpoints",
+            ));
+        }
+    }
     match &opts.tls {
         TlsClient::Off => pull_io(stream, since, opts.token.as_deref()),
         other => {

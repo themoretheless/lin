@@ -355,7 +355,20 @@ pub fn io_err(e: impl std::fmt::Display) -> Error {
     Error::runtime(format!("persist: {e}"))
 }
 
+pub fn validate_data_dir(path: &Path) -> Result<(), Error> {
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(Error::runtime(
+            "data-directory traversal rejected: path cannot contain '..'",
+        ));
+    }
+    Ok(())
+}
+
 pub fn ensure_dir(path: &Path) -> Result<(), Error> {
+    validate_data_dir(path)?;
     fs::create_dir_all(path).map_err(io_err)
 }
 
@@ -419,6 +432,7 @@ pub fn acquire_writer_lock(dir: &Path) -> Result<File, Error> {
 /// Fails fast (never waits) while a writer holds the exclusive fence during a
 /// checkpoint: a reader that finds the dir mid-publish retries at its own pace.
 pub fn acquire_reader_lock(dir: &Path) -> Result<File, Error> {
+    validate_data_dir(dir)?;
     let path = fence_path(dir);
     if !path.exists() {
         let lock = lock_path(dir);

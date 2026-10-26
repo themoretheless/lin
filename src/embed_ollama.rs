@@ -36,6 +36,21 @@ impl OllamaEmbedder {
         if base.is_empty() {
             return Err(Error::runtime("ollama base_url is empty"));
         }
+        if base.starts_with("http://") {
+            let host_part = base
+                .strip_prefix("http://")
+                .unwrap_or("")
+                .split(&[':', '/'][..])
+                .next()
+                .unwrap_or("");
+            if host_part != "127.0.0.1"
+                && host_part != "localhost"
+                && host_part != "[::1]"
+                && host_part != "::1"
+            {
+                return Err(Error::runtime("remote HTTP requires TLS (https://)"));
+            }
+        }
         Ok(Self {
             id,
             dim,

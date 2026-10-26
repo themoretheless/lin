@@ -1654,7 +1654,7 @@ impl Db {
             if let Some(agg) = &prepared.agg_plan {
                 let t0 = Instant::now();
                 let now = now_ms();
-                let rows = self.execute_agg_plan(agg, now);
+                let rows = self.execute_agg_plan(agg, now)?;
                 let ms = t0.elapsed().as_secs_f64() * 1000.0;
                 let n = rows.len();
                 return Ok(Handle {
@@ -1876,7 +1876,7 @@ impl Db {
             if let Some(agg) = &prepared.agg_plan {
                 let t0 = Instant::now();
                 let now = now_ms();
-                let rows = self.execute_agg_plan(agg, now);
+                let rows = self.execute_agg_plan(agg, now)?;
                 let ms = t0.elapsed().as_secs_f64() * 1000.0;
                 let n = rows.len();
                 return Ok(Handle {
@@ -2671,7 +2671,7 @@ impl Db {
             }
 
             // Zero-copy aggregates: sum/avg/min/max/count directly over columnar or borrowed rows.
-            if let Some(rows) = self.try_agg(q, bindings, now) {
+            if let Some(rows) = self.try_agg(q, bindings, now)? {
                 return Ok(rows);
             }
 
@@ -2864,7 +2864,7 @@ impl Db {
                         continue;
                     }
                     rows = match by {
-                        Some(by) => agg_count(&rows, by),
+                        Some(by) => agg_count(&rows, by, self.quotas.max_aggregate_bytes)?,
                         None => vec![hits_row(rows.len() as i64)],
                     };
                     primary = String::new();
@@ -2878,25 +2878,25 @@ impl Db {
                         primary = String::new();
                         continue;
                     }
-                    rows = agg_sum(&rows, field, by.as_ref());
+                    rows = agg_sum(&rows, field, by.as_ref(), self.quotas.max_aggregate_bytes)?;
                     primary = String::new();
                 }
                 Step::Min { field, by } => {
                     implicit_take = false;
                     saw_agg = true;
-                    rows = agg_min(&rows, field, by.as_ref());
+                    rows = agg_min(&rows, field, by.as_ref(), self.quotas.max_aggregate_bytes)?;
                     primary = String::new();
                 }
                 Step::Max { field, by } => {
                     implicit_take = false;
                     saw_agg = true;
-                    rows = agg_max(&rows, field, by.as_ref());
+                    rows = agg_max(&rows, field, by.as_ref(), self.quotas.max_aggregate_bytes)?;
                     primary = String::new();
                 }
                 Step::Avg { field, by } => {
                     implicit_take = false;
                     saw_agg = true;
-                    rows = agg_avg(&rows, field, by.as_ref());
+                    rows = agg_avg(&rows, field, by.as_ref(), self.quotas.max_aggregate_bytes)?;
                     primary = String::new();
                 }
                 Step::Sort { field, desc } => {
@@ -3214,13 +3214,13 @@ impl Db {
         })
     }
 
-    pub(crate) fn execute_agg_plan(&self, plan: &AggPlan, now: i64) -> Vec<Row> {
+    pub(crate) fn execute_agg_plan(&self, plan: &AggPlan, now: i64) -> Result<Vec<Row>, Error> {
         // Prepared COUNT must share index/columnar paths with ordinary execution.
         if let AggKind::Count { by: None } = &plan.kind
             && let Some(pred) = &plan.filter
             && let Some(rows) = self.execute_filter_count(&plan.collection, pred, None, now)
         {
-            return rows;
+            return Ok(rows);
         }
         // 1. SoA paths for orders
         if plan.collection == "orders" && self.store.orders_soa_ready() {
@@ -3230,7 +3230,7 @@ impl Db {
                         let total: f64 = self.store.orders_total().iter().sum();
                         let mut row = crate::store::acquire_row();
                         row.insert("total".into(), Cell::Float(total));
-                        return vec![row];
+                        return Ok(vec![row]);
                     }
                     if let Some(by_field) = by
                         && by_field.leaf() == Some("user_id")
@@ -3244,7 +3244,7 @@ impl Db {
                             }
                             let mut entries: Vec<(Arc<str>, f64)> = map.into_iter().collect();
                             entries.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
-                            return entries
+                            return Ok(entries
                                 .into_iter()
                                 .map(|(uid, tot)| {
                                     let mut row = crate::store::acquire_row();
@@ -3252,7 +3252,7 @@ impl Db {
                                     row.insert("total".into(), Cell::Float(tot));
                                     row
                                 })
-                                .collect();
+                                .collect());
                         } else if let Some(Pred::Cmp {
                             field: filt_field,
                             op: CmpOp::Gt,
@@ -3276,7 +3276,7 @@ impl Db {
                                 }
                                 let mut entries: Vec<(Arc<str>, f64)> = map.into_iter().collect();
                                 entries.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
-                                return entries
+                                return Ok(entries
                                     .into_iter()
                                     .map(|(uid, tot)| {
                                         let mut row = crate::store::acquire_row();
@@ -3284,7 +3284,7 @@ impl Db {
                                         row.insert("total".into(), Cell::Float(tot));
                                         row
                                     })
-                                    .collect();
+                                    .collect());
                             }
                         }
                     }
@@ -3300,7 +3300,7 @@ impl Db {
                     };
                     let mut row = crate::store::acquire_row();
                     row.insert("total".into(), Cell::Float(avg));
-                    return vec![row];
+                    return Ok(vec![row]);
                 }
                 _ => {}
             }
@@ -3320,7 +3320,7 @@ impl Db {
                 }
                 let mut entries: Vec<(Arc<str>, i64)> = map.into_iter().collect();
                 entries.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
-                return entries
+                return Ok(entries
                     .into_iter()
                     .map(|(w, count)| {
                         let mut row = crate::store::acquire_row();
@@ -3328,7 +3328,7 @@ impl Db {
                         row.insert("hits".into(), Cell::Int(count));
                         row
                     })
-                    .collect();
+                    .collect());
             }
         }
 
@@ -3344,17 +3344,31 @@ impl Db {
                             n += 1;
                         }
                     }
-                    return vec![hits_row(n)];
+                    return Ok(vec![hits_row(n)]);
                 };
                 let bk = by.as_str();
                 let mut map: FxHashMap<Cell, i64> = FxHashMap::default();
+                let mut state_bytes = 0usize;
                 for r in col {
                     if filter.is_none_or(|p| eval_pred(p, r, now)) {
                         let cell = r.get(&bk).map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
+                        if !map.contains_key(&cell) {
+                            let key_size = match &cell {
+                                Cell::Text(s) => s.len() + 32,
+                                _ => 16,
+                            };
+                            state_bytes = state_bytes.saturating_add(key_size + 64);
+                            if state_bytes > self.quotas.max_aggregate_bytes {
+                                return Err(Error::runtime(format!(
+                                    "aggregate state bytes {state_bytes} exceeds max_aggregate_bytes quota {}",
+                                    self.quotas.max_aggregate_bytes
+                                )));
+                            }
+                        }
                         *map.entry(cell).or_insert(0) += 1;
                     }
                 }
-                count_cell_map_to_rows(&bk, map)
+                Ok(count_cell_map_to_rows(&bk, map))
             }
             AggKind::Sum { field, by } => {
                 let fk = field.as_str();
@@ -3367,20 +3381,34 @@ impl Db {
                     }
                     let mut row = crate::store::acquire_row();
                     row.insert(fk, Cell::Float(total));
-                    return vec![row];
+                    return Ok(vec![row]);
                 };
                 let bk = by.as_str();
                 let mut map: FxHashMap<Cell, f64> = FxHashMap::default();
+                let mut state_bytes = 0usize;
                 for r in col {
                     if filter.is_none_or(|p| eval_pred(p, r, now)) {
                         let cell = r.get(&bk).map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
+                        if !map.contains_key(&cell) {
+                            let key_size = match &cell {
+                                Cell::Text(s) => s.len() + 32,
+                                _ => 16,
+                            };
+                            state_bytes = state_bytes.saturating_add(key_size + 64);
+                            if state_bytes > self.quotas.max_aggregate_bytes {
+                                return Err(Error::runtime(format!(
+                                    "aggregate state bytes {state_bytes} exceeds max_aggregate_bytes quota {}",
+                                    self.quotas.max_aggregate_bytes
+                                )));
+                            }
+                        }
                         let n = r.get(&fk).and_then(Cell::as_f64).unwrap_or(0.0);
                         *map.entry(cell).or_insert(0.0) += n;
                     }
                 }
                 let mut entries: Vec<(Cell, f64)> = map.into_iter().collect();
                 entries.sort_unstable_by(|(a, _), (b, _)| cmp_sort(a, b));
-                entries
+                Ok(entries
                     .into_iter()
                     .map(|(cell, n)| {
                         let mut row = crate::store::acquire_row();
@@ -3388,7 +3416,7 @@ impl Db {
                         row.insert(fk.clone(), Cell::Float(n));
                         row
                     })
-                    .collect()
+                    .collect())
             }
             AggKind::Avg { field, by } => {
                 let fk = field.as_str();
@@ -3410,13 +3438,27 @@ impl Db {
                     };
                     let mut row = crate::store::acquire_row();
                     row.insert(fk, Cell::Float(avg));
-                    return vec![row];
+                    return Ok(vec![row]);
                 };
                 let bk = by.as_str();
                 let mut map: FxHashMap<Cell, (f64, usize)> = FxHashMap::default();
+                let mut state_bytes = 0usize;
                 for r in col {
                     if filter.is_none_or(|p| eval_pred(p, r, now)) {
                         let cell = r.get(&bk).map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
+                        if !map.contains_key(&cell) {
+                            let key_size = match &cell {
+                                Cell::Text(s) => s.len() + 32,
+                                _ => 16,
+                            };
+                            state_bytes = state_bytes.saturating_add(key_size + 64);
+                            if state_bytes > self.quotas.max_aggregate_bytes {
+                                return Err(Error::runtime(format!(
+                                    "aggregate state bytes {state_bytes} exceeds max_aggregate_bytes quota {}",
+                                    self.quotas.max_aggregate_bytes
+                                )));
+                            }
+                        }
                         let entry = map.entry(cell).or_insert((0.0, 0));
                         if let Some(v) = r.get(&fk).and_then(Cell::as_f64) {
                             entry.0 += v;
@@ -3426,7 +3468,7 @@ impl Db {
                 }
                 let mut entries: Vec<(Cell, (f64, usize))> = map.into_iter().collect();
                 entries.sort_unstable_by(|(a, _), (b, _)| cmp_sort(a, b));
-                entries
+                Ok(entries
                     .into_iter()
                     .map(|(gcell, (sum, count))| {
                         let avg = if count == 0 {
@@ -3439,7 +3481,7 @@ impl Db {
                         row.insert(fk.clone(), Cell::Float(avg));
                         row
                     })
-                    .collect()
+                    .collect())
             }
             AggKind::Min { field, by } => {
                 let fk = field.as_str();
@@ -3463,13 +3505,27 @@ impl Db {
                     }
                     let mut row = crate::store::acquire_row();
                     row.insert(fk, best.unwrap_or(Cell::Null));
-                    return vec![row];
+                    return Ok(vec![row]);
                 };
                 let bk = by.as_str();
                 let mut map: FxHashMap<Cell, Option<Cell>> = FxHashMap::default();
+                let mut state_bytes = 0usize;
                 for r in col {
                     if filter.is_none_or(|p| eval_pred(p, r, now)) {
                         let cell = r.get(&bk).map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
+                        if !map.contains_key(&cell) {
+                            let key_size = match &cell {
+                                Cell::Text(s) => s.len() + 32,
+                                _ => 16,
+                            };
+                            state_bytes = state_bytes.saturating_add(key_size + 64);
+                            if state_bytes > self.quotas.max_aggregate_bytes {
+                                return Err(Error::runtime(format!(
+                                    "aggregate state bytes {state_bytes} exceeds max_aggregate_bytes quota {}",
+                                    self.quotas.max_aggregate_bytes
+                                )));
+                            }
+                        }
                         let f_val = r.get(&fk).filter(|c| !matches!(c, Cell::Null));
                         let entry = map.entry(cell).or_insert(None);
                         if let Some(c) = f_val {
@@ -3488,7 +3544,7 @@ impl Db {
                 }
                 let mut entries: Vec<(Cell, Option<Cell>)> = map.into_iter().collect();
                 entries.sort_unstable_by(|(a, _), (b, _)| cmp_sort(a, b));
-                entries
+                Ok(entries
                     .into_iter()
                     .map(|(gcell, val)| {
                         let mut row = crate::store::acquire_row();
@@ -3496,7 +3552,7 @@ impl Db {
                         row.insert(fk.clone(), val.unwrap_or(Cell::Null));
                         row
                     })
-                    .collect()
+                    .collect())
             }
             AggKind::Max { field, by } => {
                 let fk = field.as_str();
@@ -3520,13 +3576,27 @@ impl Db {
                     }
                     let mut row = crate::store::acquire_row();
                     row.insert(fk, best.unwrap_or(Cell::Null));
-                    return vec![row];
+                    return Ok(vec![row]);
                 };
                 let bk = by.as_str();
                 let mut map: FxHashMap<Cell, Option<Cell>> = FxHashMap::default();
+                let mut state_bytes = 0usize;
                 for r in col {
                     if filter.is_none_or(|p| eval_pred(p, r, now)) {
                         let cell = r.get(&bk).map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
+                        if !map.contains_key(&cell) {
+                            let key_size = match &cell {
+                                Cell::Text(s) => s.len() + 32,
+                                _ => 16,
+                            };
+                            state_bytes = state_bytes.saturating_add(key_size + 64);
+                            if state_bytes > self.quotas.max_aggregate_bytes {
+                                return Err(Error::runtime(format!(
+                                    "aggregate state bytes {state_bytes} exceeds max_aggregate_bytes quota {}",
+                                    self.quotas.max_aggregate_bytes
+                                )));
+                            }
+                        }
                         let f_val = r.get(&fk).filter(|c| !matches!(c, Cell::Null));
                         let entry = map.entry(cell).or_insert(None);
                         if let Some(c) = f_val {
@@ -3545,7 +3615,7 @@ impl Db {
                 }
                 let mut entries: Vec<(Cell, Option<Cell>)> = map.into_iter().collect();
                 entries.sort_unstable_by(|(a, _), (b, _)| cmp_sort(a, b));
-                entries
+                Ok(entries
                     .into_iter()
                     .map(|(gcell, val)| {
                         let mut row = crate::store::acquire_row();
@@ -3553,7 +3623,7 @@ impl Db {
                         row.insert(fk.clone(), val.unwrap_or(Cell::Null));
                         row
                     })
-                    .collect()
+                    .collect())
             }
         }
     }
@@ -3563,14 +3633,14 @@ impl Db {
         q: &Query,
         bindings: &BTreeMap<String, Vec<Row>>,
         now: i64,
-    ) -> Option<Vec<Row>> {
+    ) -> Result<Option<Vec<Row>>, Error> {
         if let Source::Collection(name) = &q.source
             && bindings.get(name).is_none()
             && let Some(plan) = Self::try_extract_agg_plan(q, &self.catalog)
         {
-            Some(self.execute_agg_plan(&plan, now))
+            Ok(Some(self.execute_agg_plan(&plan, now)?))
         } else {
-            None
+            Ok(None)
         }
     }
 
@@ -4967,6 +5037,13 @@ impl Db {
                     });
                 }
             }
+            if seen.len() > self.quotas.max_graph_expansion {
+                return Err(Error::runtime(format!(
+                    "graph expansion count {} exceeds max_graph_expansion quota {}",
+                    seen.len(),
+                    self.quotas.max_graph_expansion
+                )));
+            }
             if reached.len() >= 300 {
                 break;
             }
@@ -5071,6 +5148,13 @@ impl Db {
                     }
                 }
             }
+            if seen_nodes.len() > self.quotas.max_graph_expansion {
+                return Err(Error::runtime(format!(
+                    "graph expansion count {} exceeds max_graph_expansion quota {}",
+                    seen_nodes.len(),
+                    self.quotas.max_graph_expansion
+                )));
+            }
             frontier = next;
             if frontier.is_empty() {
                 break;
@@ -5144,7 +5228,15 @@ impl Db {
                 Option<(String, String, String)>,
             );
             let mut stack: Vec<GraphSearchFrame> = vec![(start_key, 0, BTreeSet::new(), None)];
+            let mut expansions = 0;
             while let Some((at, depth, path, last_edge)) = stack.pop() {
+                expansions += 1;
+                if expansions > self.quotas.max_graph_expansion {
+                    return Err(Error::runtime(format!(
+                        "graph expansion count {} exceeds max_graph_expansion quota {}",
+                        expansions, self.quotas.max_graph_expansion
+                    )));
+                }
                 if depth > 0
                     && depth >= hop.min_depth
                     && depth <= hop.max_depth
@@ -7499,16 +7591,29 @@ pub(crate) fn eval_window(
     result_rows
 }
 
-fn agg_count(rows: &[Row], by: &Field) -> Vec<Row> {
+fn agg_count(rows: &[Row], by: &Field, max_bytes: usize) -> Result<Vec<Row>, Error> {
     let k = by.as_str();
     let mut map: FxHashMap<Cell, i64> = FxHashMap::default();
+    let mut state_bytes = 0usize;
     for r in rows {
         let cell = r.get(&k).map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
+        if !map.contains_key(&cell) {
+            let key_size = match &cell {
+                Cell::Text(s) => s.len() + 32,
+                _ => 16,
+            };
+            state_bytes = state_bytes.saturating_add(key_size + 64);
+            if state_bytes > max_bytes {
+                return Err(Error::runtime(format!(
+                    "aggregate state bytes {state_bytes} exceeds max_aggregate_bytes quota {max_bytes}"
+                )));
+            }
+        }
         *map.entry(cell).or_insert(0) += 1;
     }
     let mut entries: Vec<(Cell, i64)> = map.into_iter().collect();
     entries.sort_unstable_by(|(a, _), (b, _)| cmp_sort(a, b));
-    entries
+    Ok(entries
         .into_iter()
         .map(|(cell, n)| {
             let mut row = crate::store::acquire_row();
@@ -7516,7 +7621,7 @@ fn agg_count(rows: &[Row], by: &Field) -> Vec<Row> {
             row.insert("hits".into(), Cell::Int(n));
             row
         })
-        .collect()
+        .collect())
 }
 
 fn count_cell_map_to_rows(by: &str, map: FxHashMap<Cell, i64>) -> Vec<Row> {
@@ -7574,7 +7679,12 @@ fn eq_value_for_field<'a>(pred: &'a Pred, field: &str) -> Option<&'a str> {
     }
 }
 
-fn agg_sum(rows: &[Row], field: &Field, by: Option<&Field>) -> Vec<Row> {
+fn agg_sum(
+    rows: &[Row],
+    field: &Field,
+    by: Option<&Field>,
+    max_bytes: usize,
+) -> Result<Vec<Row>, Error> {
     let fk = field.as_str();
     let Some(by) = by else {
         let total: f64 = rows
@@ -7583,18 +7693,31 @@ fn agg_sum(rows: &[Row], field: &Field, by: Option<&Field>) -> Vec<Row> {
             .sum();
         let mut row = crate::store::acquire_row();
         row.insert(fk, Cell::Float(total));
-        return vec![row];
+        return Ok(vec![row]);
     };
     let bk = by.as_str();
     let mut map: FxHashMap<Cell, f64> = FxHashMap::default();
+    let mut state_bytes = 0usize;
     for r in rows {
         let cell = r.get(&bk).map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
+        if !map.contains_key(&cell) {
+            let key_size = match &cell {
+                Cell::Text(s) => s.len() + 32,
+                _ => 16,
+            };
+            state_bytes = state_bytes.saturating_add(key_size + 64);
+            if state_bytes > max_bytes {
+                return Err(Error::runtime(format!(
+                    "aggregate state bytes {state_bytes} exceeds max_aggregate_bytes quota {max_bytes}"
+                )));
+            }
+        }
         let n = r.get(&fk).and_then(Cell::as_f64).unwrap_or(0.0);
         *map.entry(cell).or_insert(0.0) += n;
     }
     let mut entries: Vec<(Cell, f64)> = map.into_iter().collect();
     entries.sort_unstable_by(|(a, _), (b, _)| cmp_sort(a, b));
-    entries
+    Ok(entries
         .into_iter()
         .map(|(cell, n)| {
             let mut row = crate::store::acquire_row();
@@ -7602,10 +7725,15 @@ fn agg_sum(rows: &[Row], field: &Field, by: Option<&Field>) -> Vec<Row> {
             row.insert(fk.clone(), Cell::Float(n));
             row
         })
-        .collect()
+        .collect())
 }
 
-fn agg_min(rows: &[Row], field: &Field, by: Option<&Field>) -> Vec<Row> {
+fn agg_min(
+    rows: &[Row],
+    field: &Field,
+    by: Option<&Field>,
+    max_bytes: usize,
+) -> Result<Vec<Row>, Error> {
     let fk = field.as_str();
     let Some(by) = by else {
         let mut best: Option<Cell> = None;
@@ -7625,12 +7753,25 @@ fn agg_min(rows: &[Row], field: &Field, by: Option<&Field>) -> Vec<Row> {
         }
         let mut row = crate::store::acquire_row();
         row.insert(fk, best.unwrap_or(Cell::Null));
-        return vec![row];
+        return Ok(vec![row]);
     };
     let bk = by.as_str();
     let mut map: FxHashMap<Cell, Option<Cell>> = FxHashMap::default();
+    let mut state_bytes = 0usize;
     for r in rows {
         let cell = r.get(&bk).map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
+        if !map.contains_key(&cell) {
+            let key_size = match &cell {
+                Cell::Text(s) => s.len() + 32,
+                _ => 16,
+            };
+            state_bytes = state_bytes.saturating_add(key_size + 64);
+            if state_bytes > max_bytes {
+                return Err(Error::runtime(format!(
+                    "aggregate state bytes {state_bytes} exceeds max_aggregate_bytes quota {max_bytes}"
+                )));
+            }
+        }
         let f_val = r.get(&fk).filter(|c| !matches!(c, Cell::Null));
         let entry = map.entry(cell).or_insert(None);
         if let Some(c) = f_val {
@@ -7648,7 +7789,7 @@ fn agg_min(rows: &[Row], field: &Field, by: Option<&Field>) -> Vec<Row> {
     }
     let mut entries: Vec<(Cell, Option<Cell>)> = map.into_iter().collect();
     entries.sort_unstable_by(|(a, _), (b, _)| cmp_sort(a, b));
-    entries
+    Ok(entries
         .into_iter()
         .map(|(gcell, val)| {
             let mut row = crate::store::acquire_row();
@@ -7656,10 +7797,15 @@ fn agg_min(rows: &[Row], field: &Field, by: Option<&Field>) -> Vec<Row> {
             row.insert(fk.clone(), val.unwrap_or(Cell::Null));
             row
         })
-        .collect()
+        .collect())
 }
 
-fn agg_max(rows: &[Row], field: &Field, by: Option<&Field>) -> Vec<Row> {
+fn agg_max(
+    rows: &[Row],
+    field: &Field,
+    by: Option<&Field>,
+    max_bytes: usize,
+) -> Result<Vec<Row>, Error> {
     let fk = field.as_str();
     let Some(by) = by else {
         let mut best: Option<Cell> = None;
@@ -7679,12 +7825,25 @@ fn agg_max(rows: &[Row], field: &Field, by: Option<&Field>) -> Vec<Row> {
         }
         let mut row = crate::store::acquire_row();
         row.insert(fk, best.unwrap_or(Cell::Null));
-        return vec![row];
+        return Ok(vec![row]);
     };
     let bk = by.as_str();
     let mut map: FxHashMap<Cell, Option<Cell>> = FxHashMap::default();
+    let mut state_bytes = 0usize;
     for r in rows {
         let cell = r.get(&bk).map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
+        if !map.contains_key(&cell) {
+            let key_size = match &cell {
+                Cell::Text(s) => s.len() + 32,
+                _ => 16,
+            };
+            state_bytes = state_bytes.saturating_add(key_size + 64);
+            if state_bytes > max_bytes {
+                return Err(Error::runtime(format!(
+                    "aggregate state bytes {state_bytes} exceeds max_aggregate_bytes quota {max_bytes}"
+                )));
+            }
+        }
         let f_val = r.get(&fk).filter(|c| !matches!(c, Cell::Null));
         let entry = map.entry(cell).or_insert(None);
         if let Some(c) = f_val {
@@ -7702,7 +7861,7 @@ fn agg_max(rows: &[Row], field: &Field, by: Option<&Field>) -> Vec<Row> {
     }
     let mut entries: Vec<(Cell, Option<Cell>)> = map.into_iter().collect();
     entries.sort_unstable_by(|(a, _), (b, _)| cmp_sort(a, b));
-    entries
+    Ok(entries
         .into_iter()
         .map(|(gcell, val)| {
             let mut row = crate::store::acquire_row();
@@ -7710,10 +7869,15 @@ fn agg_max(rows: &[Row], field: &Field, by: Option<&Field>) -> Vec<Row> {
             row.insert(fk.clone(), val.unwrap_or(Cell::Null));
             row
         })
-        .collect()
+        .collect())
 }
 
-fn agg_avg(rows: &[Row], field: &Field, by: Option<&Field>) -> Vec<Row> {
+fn agg_avg(
+    rows: &[Row],
+    field: &Field,
+    by: Option<&Field>,
+    max_bytes: usize,
+) -> Result<Vec<Row>, Error> {
     let fk = field.as_str();
     let Some(by) = by else {
         let mut sum = 0.0f64;
@@ -7731,12 +7895,25 @@ fn agg_avg(rows: &[Row], field: &Field, by: Option<&Field>) -> Vec<Row> {
         };
         let mut row = crate::store::acquire_row();
         row.insert(fk, Cell::Float(avg));
-        return vec![row];
+        return Ok(vec![row]);
     };
     let bk = by.as_str();
     let mut map: FxHashMap<Cell, (f64, usize)> = FxHashMap::default();
+    let mut state_bytes = 0usize;
     for r in rows {
         let cell = r.get(&bk).map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
+        if !map.contains_key(&cell) {
+            let key_size = match &cell {
+                Cell::Text(s) => s.len() + 32,
+                _ => 16,
+            };
+            state_bytes = state_bytes.saturating_add(key_size + 64);
+            if state_bytes > max_bytes {
+                return Err(Error::runtime(format!(
+                    "aggregate state bytes {state_bytes} exceeds max_aggregate_bytes quota {max_bytes}"
+                )));
+            }
+        }
         let v_opt = r.get(&fk).and_then(Cell::as_f64);
         let entry = map.entry(cell).or_insert((0.0, 0));
         if let Some(v) = v_opt {
@@ -7746,7 +7923,7 @@ fn agg_avg(rows: &[Row], field: &Field, by: Option<&Field>) -> Vec<Row> {
     }
     let mut entries: Vec<(Cell, (f64, usize))> = map.into_iter().collect();
     entries.sort_unstable_by(|(a, _), (b, _)| cmp_sort(a, b));
-    entries
+    Ok(entries
         .into_iter()
         .map(|(gcell, (sum, count))| {
             let avg = if count == 0 {
@@ -7759,7 +7936,7 @@ fn agg_avg(rows: &[Row], field: &Field, by: Option<&Field>) -> Vec<Row> {
             row.insert(fk.clone(), Cell::Float(avg));
             row
         })
-        .collect()
+        .collect())
 }
 
 pub(crate) fn cell_key(c: &Cell) -> Option<String> {

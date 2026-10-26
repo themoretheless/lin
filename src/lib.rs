@@ -48,7 +48,7 @@ mod ast;
 mod batch;
 mod catalog;
 mod check;
-mod cold;
+pub mod cold;
 pub mod crc;
 mod cursor;
 mod embed;
