@@ -1,0 +1,32 @@
+   Compiling lin v0.4.0 (/Users/themoretheless/.codex/worktrees/lin-wal-persistent-qualification/lin)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.16s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running tests/partial_index_mutation.rs (target/debug/build/lin/87cc1dc4951bea6a/out/partial_index_mutation-87cc1dc4951bea6a)
+
+running 3 tests
+test failed_transfer_rolls_back_partial_membership_and_rows ... ok
+test leaving_partial_predicate_releases_unique_key ... FAILED
+test leaving_partial_predicate_with_changed_key_removes_old_entry ... FAILED
+
+failures:
+
+---- leaving_partial_predicate_releases_unique_key stdout ----
+
+thread 'leaving_partial_predicate_releases_unique_key' (75820028) panicked at tests/partial_index_mutation.rs:29:5:
+row no longer belongs to the partial index
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- leaving_partial_predicate_with_changed_key_removes_old_entry stdout ----
+
+thread 'leaving_partial_predicate_with_changed_key_removes_old_entry' (75820029) panicked at tests/partial_index_mutation.rs:41:5:
+assertion failed: members(&db).is_empty()
+
+
+failures:
+    leaving_partial_predicate_releases_unique_key
+    leaving_partial_predicate_with_changed_key_removes_old_entry
+
+test result: FAILED. 1 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `--test partial_index_mutation`
