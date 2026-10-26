@@ -1355,6 +1355,18 @@ fn append_sparse_rows_serial(
     rows: &[Option<std::sync::Arc<[f32]>>],
     buf: &mut Vec<u8>,
 ) -> Result<(), Error> {
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("neon") {
+        // Runtime feature check covers all NEON loads; helper only loads full eight-value chunks.
+        return unsafe { append_sparse_rows_neon(rows, buf) };
+    }
+    append_sparse_rows_scalar(rows, buf)
+}
+
+fn append_sparse_rows_scalar(
+    rows: &[Option<std::sync::Arc<[f32]>>],
+    buf: &mut Vec<u8>,
+) -> Result<(), Error> {
     for row in rows {
         let Some(emb) = row else {
             buf.extend_from_slice(&0u32.to_le_bytes());
@@ -1388,6 +1400,68 @@ fn append_sparse_rows_serial(
                     buf.extend_from_slice(&entry);
                     count += 1;
                 }
+            }
+        }
+        buf[count_offset..count_offset + 4].copy_from_slice(&count.to_le_bytes());
+    }
+    Ok(())
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn presence_mask8(values: &[f32]) -> u32 {
+    assert_eq!(values.len(), 8);
+    use std::arch::aarch64::*;
+    unsafe {
+        let a = vreinterpretq_u32_f32(vld1q_f32(values.as_ptr()));
+        let b = vreinterpretq_u32_f32(vld1q_f32(values.as_ptr().add(4)));
+        if vmaxvq_u32(vorrq_u32(a, b)) == 0 {
+            return 0;
+        }
+        let weights = vld1q_u32([1u32, 2, 4, 8].as_ptr());
+        let zero = vdupq_n_u32(0);
+        let lo = vaddvq_u32(vandq_u32(vmvnq_u32(vceqq_u32(a, zero)), weights));
+        let hi = vaddvq_u32(vandq_u32(vmvnq_u32(vceqq_u32(b, zero)), weights));
+        lo | (hi << 4)
+    }
+}
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn append_sparse_rows_neon(
+    rows: &[Option<std::sync::Arc<[f32]>>],
+    buf: &mut Vec<u8>,
+) -> Result<(), Error> {
+    for row in rows {
+        let Some(emb) = row else {
+            buf.extend_from_slice(&0u32.to_le_bytes());
+            continue;
+        };
+        let dim = u32::try_from(emb.len())
+            .ok()
+            .and_then(|n| n.checked_add(1))
+            .ok_or_else(|| io_err("sparse vector dimension overflow"))?;
+        buf.extend_from_slice(&dim.to_le_bytes());
+        let count_offset = buf.len();
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        let mut count = 0u32;
+        for (block, values) in emb.chunks(8).enumerate() {
+            let mut mask = if values.len() == 8 {
+                unsafe { presence_mask8(values) }
+            } else {
+                values
+                    .iter()
+                    .enumerate()
+                    .fold(0u32, |m, (i, x)| m | (u32::from(x.to_bits() != 0) << i))
+            };
+            while mask != 0 {
+                let offset = mask.trailing_zeros() as usize;
+                let index = (block * 8 + offset) as u32;
+                let mut entry = [0u8; 8];
+                entry[..4].copy_from_slice(&index.to_le_bytes());
+                entry[4..].copy_from_slice(&values[offset].to_bits().to_le_bytes());
+                buf.extend_from_slice(&entry);
+                count += 1;
+                mask &= mask - 1;
             }
         }
         buf[count_offset..count_offset + 4].copy_from_slice(&count.to_le_bytes());
@@ -4569,5 +4643,60 @@ mod persistent_encoder_queue_tests {
         assert!(!exited.load(Ordering::SeqCst));
         drop(other);
         assert!(exited.load(Ordering::SeqCst));
+    }
+}
+
+#[cfg(test)]
+mod neon_sparse_writer_tests {
+    use super::*;
+    use std::sync::Arc;
+    #[test]
+    fn exact_scalar_bytes_lengths_bits_and_unaligned_mask() {
+        let mut state = 0x0badf00d12345678u64;
+        let special = [
+            0u32, 0x80000000, 0x7f800000, 0xff800000, 0x7fc01234, 0xffc03456, 1, 0x80000001,
+        ];
+        for offset in 0..4 {
+            for len in 0..=1024 {
+                let mut values = Vec::new();
+                for i in 0..len + offset {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    values.push(f32::from_bits(if i % 3 == 0 {
+                        state as u32
+                    } else {
+                        special[i % special.len()]
+                    }));
+                }
+                #[cfg(target_arch = "aarch64")]
+                if len >= 8 && std::arch::is_aarch64_feature_detected!("neon") {
+                    let slice = &values[offset..offset + 8];
+                    let expected = slice
+                        .iter()
+                        .enumerate()
+                        .fold(0u32, |m, (i, x)| m | (u32::from(x.to_bits() != 0) << i));
+                    assert_eq!(unsafe { presence_mask8(slice) }, expected);
+                }
+                let rows = vec![
+                    None,
+                    Some(Arc::from([])),
+                    Some(Arc::from(&values[offset..])),
+                ];
+                let mut scalar = Vec::new();
+                let mut actual = Vec::new();
+                append_sparse_rows_scalar(&rows, &mut scalar).unwrap();
+                append_sparse_rows_serial(&rows, &mut actual).unwrap();
+                assert_eq!(scalar, actual);
+            }
+        }
+        for dim in [4095, 4096, 4097] {
+            let rows = vec![Some(Arc::from(vec![-0.0f32; dim]))];
+            let mut scalar = Vec::new();
+            let mut actual = Vec::new();
+            append_sparse_rows_scalar(&rows, &mut scalar).unwrap();
+            append_sparse_rows_serial(&rows, &mut actual).unwrap();
+            assert_eq!(scalar, actual);
+        }
     }
 }

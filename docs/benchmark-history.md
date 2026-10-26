@@ -8,6 +8,12 @@
 
 ## Обновление 2026-10-26
 
+- [NEON sparse writer — принято с ограниченным эффектом1k](../benches/results/2026-10-26-neon-sparse-writer-engine/report.md): conventional Full1k +5,79% /+7,10%; interleaved +4,62% /+4,33%, 6/6 обе серии, выше A/A1,32% /2,89%.10k первый interleaved gain ниже A/A, дополнительное ускорение10k не заявлено. Workspace, bit/tail/unaligned oracle, byte-equal WAL и process-exit replay прошли; Full1k всё ещё проигрывает SQLite.
+
+- [NEON sparse writer CPU +density crossover](../benches/results/2026-10-26-neon-sparse-writer-cpu/report.md): новый SIMD-mask, default1k +50–51%, serial10k ~35%; плотный guard вне sparse-dispatch содержит проигрыш и сохранён.383/192 nnz spread/cluster +17–53%, все6/6 в двух сериях; это компонентные результаты.
+
+- [Текущий профиль1k](../benches/results/2026-10-26-current-1k-profile/report.md): frozen f8fb0db,6 процессов,144 timed ops +preflights. Durable encode ~0,418мс включает sparse writer~0,291мс и classifier~0,093мс; sync~0,441мс. Embedding generation~0,203мс; вложенные spans/логирование не позволяют складывать медианы или объявлять ускорение.
+
 - [Accepted core — свежая available-peer matrix](../benches/results/2026-10-26-persistent-peer-refresh/report.md): frozen b7195e2, 1k/10k/100k, три процесса ×12 samples. Read108/108 агрегированных побед и324/324 process comparisons, minimum1,723×; native15/15 агрегированных и44/45 process comparisons, minimum1,070×. Native100k process2 проигрывает DuckDB:144/102мс, не исключён. Новые ARM-контейнеры, sentinel/cleanup/source hashes проверены. API-контракты не равны raw CPU/disk durability; MSSQL/Kusto отсутствуют, durable1k SQLite gap остаётся.
 
 - [Shared persistent WAL encoder — принято](../benches/results/2026-10-26-wal-persistent-engine/report.md): Full durable10k +18,92% /+20,89% в conventional и +19,17% /+20,09% в interleaved; 6/6 в обеих сериях. Границы4096/16384 прошли два A/A/B повтора. Candidate10k обгоняет SQLite в12/12 процессов (1,233–1,245×); durable1k gap остаётся. Byte-equal WAL, process-exit replay1/3/4 commits, worker/queue/lifecycle tests; sync и формат сохранены. Это принятие новой persistent-политики, а не ранее отклонённого scoped-прототипа.
