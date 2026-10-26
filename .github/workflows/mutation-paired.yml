@@ -14,8 +14,12 @@ jobs:
         with:
           toolchain: "1.96.0"
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       - name: Verify paired gate contract
-        run: python3 scripts/test-check-mutation-paired.py
+        run: |
+          python3 scripts/test-check-mutation-paired.py
+          python3 scripts/test-cargo-bench-artifact.py
       - name: Prepare fresh owned experiment directory
         run: |
           python3 - <<'PY'
