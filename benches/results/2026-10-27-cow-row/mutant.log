@@ -1,0 +1,26 @@
+   Compiling lin v0.4.0 (/Users/themoretheless/.codex/worktrees/lin-wal-persistent-qualification/lin)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.74s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/lib.rs (target/debug/build/lin/9b69f1e840b117a4/out/lin-9b69f1e840b117a4)
+
+running 1 test
+test store::cow_row_oracle::cloned_rows_do_not_alias_mutations_and_serde_stays_map_shaped ... FAILED
+
+failures:
+
+---- store::cow_row_oracle::cloned_rows_do_not_alias_mutations_and_serde_stays_map_shaped stdout ----
+
+thread 'store::cow_row_oracle::cloned_rows_do_not_alias_mutations_and_serde_stays_map_shaped' (76736896) panicked at src/store.rs:4096:59:
+assertion `left == right` failed
+  left: 0
+ right: 3
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    store::cow_row_oracle::cloned_rows_do_not_alias_mutations_and_serde_stays_map_shaped
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 103 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--lib`

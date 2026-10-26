@@ -1,0 +1,3 @@
+# COW Row full-operation allocation diagnostic
+
+Three processes per binary,12fresh-fixture operations each,72exact row/index validations. Native wing UPDATE71->23 allocations (2910 fewer requested bytes),title85->37 (2910),DELETE71->41 (1794),UPDATE+explicit rollback158->50 (6402). Same differences at1k/10k/100k. Setup/readback excluded,Handle/undo/drop/restore included. Counting System allocator; not peak RSS. Source/binary hashes retained,production sources restored. COW initial construction overhead and downstream API compatibility still unqualified. No fresh-input engine speed or peer claim from allocation counts.

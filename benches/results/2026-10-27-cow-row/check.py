@@ -8,3 +8,5 @@ try:
 finally:
  for n,b in before.items():Path(f'src/{n}.rs').write_bytes(b)
 print('Check exit',r.returncode,'production source restored')
+
+assert r.returncode == 0
