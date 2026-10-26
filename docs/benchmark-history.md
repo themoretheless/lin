@@ -8,6 +8,10 @@
 
 ## Обновление 2026-10-26
 
+- [Prepared GROUP BY fixed-text COUNT — принято](../benches/results/2026-10-26-ci-grouped-count/report.md): frozenf19f41a4,10k equality≈533–536→0,864мкс, range≈684–690→1,432–1,438мкс; target12/12 positive pairs каждый,48/48 target comparisons противSQLite/DuckDB. Остальные read controls/A/A/RSS сохранены без отбрасывания минусов. Exact group quota, Unicode/empty key, rollback/readonly и10k expected counts проверены; полного восьми-peer gate нет.
+
+- [Native x86 MSSQL CI — функциональная квалификация](../benches/results/2026-10-26-mssql-native-ci/report.md): frozen8b0e9717, реальный SQL Server2022, шесть наборов read/native1k/10k/100k; данные, source hashes, sentinel и cleanup проверены. Сравнительные метрики хранятся только в зашифрованном артефакте и локальном приватном отчёте; зелёный CI не означает performance-победу. Kusto по-прежнему требует настоящего endpoint.
+
 - [Small WAL overlap с O(1) hint — принято](../benches/results/2026-10-26-small-neon-hint-engine/report.md): frozen8b0e9717, durable1k +10,98% /+11,74% conventional и+13,28% /+10,15% interleaved,12/12 положительных пар в каждом протоколе. Entry683+9,80/+11,79%; первоначальные отрицательные guard682 сохранены, дополнительные повторы их не воспроизвели. Native acceleration не заявлена. SQLite durable1k всё ещё быстрее:1,365–1,369мс противLin1,638–1,733мс. Полные gates, mixed-vector raw-bit replay,12 byte-equal WAL scenarios и идентичность финальных release binaries прошли.
 
 

@@ -48,7 +48,12 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: native-mssql-${{ github.run_id }}
-          path: |
-            ${{ runner.temp }}/lin-mssql-results.tar.gz.age
-            /tmp/lin-mssql-peer-build.log
+          path: ${{ runner.temp }}/lin-mssql-results.tar.gz.age
+          if-no-files-found: warn
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-mssql-build-${{ github.run_id }}
+          path: /tmp/lin-mssql-peer-build.log
           if-no-files-found: warn

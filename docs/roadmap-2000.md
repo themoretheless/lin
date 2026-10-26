@@ -8,7 +8,7 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 
 План содержит ровно **2000 пунктов в 50 областях**. Стабильные ID, зависимости, приоритеты и критерии приёмки сохранены. Проверенный исходный срез этой актуализации: `7cd747eafefaa226fbd3de5f552b043523f17b20`. Это план работ; реализация всех пунктов этой актуализацией не выполнялась.
 
-**Исправление учёта:** исторический `done` у LIN-0001–LIN-0004 был снят при актуализации. Затем LIN-0003 закрыт новой [full-engine квалификацией shared persistent encoder](../benches/results/2026-10-26-wal-persistent-engine/report.md): durable10k быстрее SQLite в12/12 процессов, с двумя conventional и двумя interleaved повторами. LIN-0004 затем закрыт [свежей read matrix b7195e2](../benches/results/2026-10-26-persistent-peer-refresh/report.md):108/108 агрегированных и324/324 within-process побед на available peers. LIN-0001 и LIN-0002 остаются `qualification`; MSSQL/Kusto не измерены. Остальные исторические статусы не переаттестованы. Для них перед исполнением нужен аудит evidence; число `done` не является числом проверенных сегодня возможностей.
+**Исправление учёта:** исторический `done` у LIN-0001–LIN-0004 был снят при актуализации. Затем LIN-0003 закрыт новой [full-engine квалификацией shared persistent encoder](../benches/results/2026-10-26-wal-persistent-engine/report.md): durable10k быстрее SQLite в12/12 процессов, с двумя conventional и двумя interleaved повторами. LIN-0004 затем закрыт [свежей read matrix b7195e2](../benches/results/2026-10-26-persistent-peer-refresh/report.md):108/108 агрегированных и324/324 within-process побед на available peers. LIN-0001 и LIN-0002 остаются `qualification`. LIN-0005 закрыт: [реальный выделенный MSSQL endpoint на native x86 CI](../benches/results/2026-10-26-mssql-native-ci/report.md) прошёл функциональную квалификацию; метрики доступны в приватном зашифрованном отчёте. Kusto ещё не измерен. Остальные исторические статусы не переаттестованы. Для них перед исполнением нужен аудит evidence; число `done` не является числом проверенных сегодня возможностей.
 
 Последняя [полная квалификация WAL overlap](../benches/results/2026-10-26-wal-overlap-port/report.md) относится к прототипу на замороженном `e7abf40`, а не к текущему main. Прототип не принят: interleaved durable 1k показал −8,713%, лишь 1/6 положительных пар; A/A имел медианную абсолютную разницу 12,233%. Эти данные не доказывают причину регрессии, но не дают принять ускорение. CPU microbench не заменяет commit latency. Сохранённые кандидатные исходники не являются производственной реализацией.
 
@@ -18,7 +18,7 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 2. **LIN-0001–LIN-0004:** получить свежую baseline-матрицу main; отдельно native и Full durable, чтение и запись, cold/warm, 1k/10k/100k. Прежние победы сохраняются в истории, но не переносятся на новые бинарники.
 3. **LIN-0081–LIN-0084:** обновить профиль на измеренном проигрыше; выбрать одну гипотезу по доле времени. Повторно не внедрять отвергнутый scoped-thread WAL overlap без изменения механизма и нового основания.
 4. **D02–D06, D43:** проверить WAL/replay/checkpoint/rollback и последний подтверждённый commit независимыми oracle и fault injection. При воспроизведённой потере данных исправление опережает performance-очередь.
-5. **LIN-0007–LIN-0008, затем LIN-0005–LIN-0006:** сопоставить контракты всех восьми peers; MSSQL/Kusto требуют доступных endpoints. Отсутствие сервера не считать победой.
+5. **LIN-0007–LIN-0008, затем LIN-0005–LIN-0006:** сопоставить контракты всех восьми peers; MSSQL endpoint доступен через native x86 CI, для Kusto нужен реальный тестовый кластер. Отсутствие сервера не считать победой.
 6. **D10–D28:** индексы, planner, execution, агрегации, join/window, FTS и ANN — выбирать задачи по свежим профилям и потребностям, с проверкой selectivity/skew и цены обновлений.
 7. **D09, D29–D36, D45:** память, GPU, async, concurrency, replication и лимиты — bounded ресурсы, отмена, конкурентные сценарии, восстановление после ошибок.
 8. **D37–D50:** API, CLI, наблюдаемость, CI, schema/import/export, поставка и документация — пользовательский сценарий и end-to-end приёмка каждого добавления.
@@ -113,7 +113,7 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 18. **LIN-0886: Проверить implicit snippet indexing** — P1, done, G-CORRECT.
 19. **LIN-0029: Сохранять источник измеряемого бинарника** — P1, done, G-PERF.
 20. **LIN-0030: Проверять source drift после прогона** — P1, done, G-PERF.
-21. **LIN-0005: Получить тестовый endpoint MSSQL** — P1, blocked_external, G-OPS.
+21. **LIN-0005: Получить тестовый endpoint MSSQL** — P1, done, G-OPS.
 22. **LIN-0006: Получить тестовый endpoint Kusto** — P1, blocked_external, G-OPS.
 23. **LIN-0007: Сопоставить transaction boundaries peers** — P1, done, G-PERF.
 24. **LIN-0008: Сопоставить индексные ограничения peers** — P1, done, G-PERF.
@@ -146,7 +146,7 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 18 | LIN-0886 | [D23](#d23) | Проверить implicit snippet indexing | CORRECTNESS | done | S | G-CORRECT |
 | 19 | LIN-0029 | [D01](#d01) | Сохранять источник измеряемого бинарника | PERF | done | M | G-PERF |
 | 20 | LIN-0030 | [D01](#d01) | Проверять source drift после прогона | PERF | done | M | G-PERF |
-| 21 | LIN-0005 | [D01](#d01) | Получить тестовый endpoint MSSQL | OPS | blocked_external | M | G-OPS |
+| 21 | LIN-0005 | [D01](#d01) | Получить тестовый endpoint MSSQL | OPS | done | M | G-OPS |
 | 22 | LIN-0006 | [D01](#d01) | Получить тестовый endpoint Kusto | OPS | blocked_external | M | G-OPS |
 | 23 | LIN-0007 | [D01](#d01) | Сопоставить transaction boundaries peers | PERF | done | M | G-PERF |
 | 24 | LIN-0008 | [D01](#d01) | Сопоставить индексные ограничения peers | PERF | done | M | G-PERF |
