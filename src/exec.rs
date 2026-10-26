@@ -3253,6 +3253,30 @@ impl Db {
         {
             return Ok(rows);
         }
+        // Grouped prepared COUNT can also be index-only when equality fixes
+        // the sole text group. Other grouped forms retain the quota-bounded
+        // generic path below rather than using an unbounded grouping helper.
+        if let AggKind::Count { by: Some(by) } = &plan.kind
+            && let Some(pred) = &plan.filter
+            && let Some(value) = eq_value_for_field(pred, &by.as_str())
+            && let Some(uses) = crate::index::pick_index(&self.catalog, &plan.collection, pred)
+            && crate::index::index_covers_pred(pred, &uses)
+            && let Some(n) = self.store.index_seek_count(&plan.collection, &uses, now)
+        {
+            if n == 0 {
+                return Ok(Vec::new());
+            }
+            // Match the generic Cell::Text key accounting, including its
+            // per-group overhead, before constructing the nonempty result.
+            let state_bytes = value.len().saturating_add(32).saturating_add(64);
+            if state_bytes > self.quotas.max_aggregate_bytes {
+                return Err(Error::runtime(format!(
+                    "aggregate state bytes {state_bytes} exceeds max_aggregate_bytes quota {}",
+                    self.quotas.max_aggregate_bytes
+                )));
+            }
+            return Ok(vec![count_row(&by.as_str(), value, n as i64)]);
+        }
         // 1. SoA paths for orders
         if plan.collection == "orders" && self.store.orders_soa_ready() {
             match &plan.kind {

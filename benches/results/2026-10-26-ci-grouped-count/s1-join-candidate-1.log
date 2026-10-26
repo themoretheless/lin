@@ -1,0 +1,49 @@
+skip postgres: LIN_BENCH_SKIP_PG is set
+skip mysql: LIN_BENCH_SKIP_MYSQL is set
+lin compare: N=10000 warm reads (fixture), bulk insert (schema outside timing)
+engines: Lin | SQLite(rusqlite bundled) | DuckDB(bundled) | HashMap(point get only) | Postgres(skipped) | MySQL(skipped)
+airbug dash: http://127.0.0.1:8790/
+Lin reads: prepare once / run many; filters use count (fair vs SQL COUNT(*));
+substring: Lin `title ~ "wal" | count` vs SQL LIKE '%wal%' COUNT(*);
+materialize: Lin `wing==rag | {id,title} | take all` vs SQL SELECT id,title;
+join: 10000 orders ⋈ 1000 users (Lin run_batch SoA / cursor vs SQL INNER JOIN);
+append_log: Lin `append facts` vs SQL INSERT INTO logs (append-only shape)
+airbug dash: http://127.0.0.1:8790/#/bench
+bench: compare/join_inner/lin — validating and calibrating
+bench: compare/join_inner/lin — measuring 24 samples
+bench: compare/join_inner/lin_cursor — validating and calibrating
+bench: compare/join_inner/lin_cursor — measuring 24 samples
+bench: compare/join_inner/lin_cursor_projected — validating and calibrating
+bench: compare/join_inner/lin_cursor_projected — measuring 24 samples
+bench: compare/join_inner/sqlite — validating and calibrating
+bench: compare/join_inner/sqlite — measuring 24 samples
+bench: compare/join_inner/duckdb — validating and calibrating
+bench: compare/join_inner/duckdb — measuring 24 samples
+# bench 1792994426513035000-5650
+
+Status: Complete
+
+| Case | Metric | Median | Unit | Scope / statistic | Observations | Processes |
+|---|---|---:|---|---|---:|---:|
+| compare/join_inner/lin [candidate] | wall | 151854.1875 | ns | current thread wall clock; scheduler included / batch_total | 24 | 1 |
+| compare/join_inner/lin_cursor [candidate] | wall | 1113188.0000 | ns | current thread wall clock; scheduler included / batch_total | 24 | 1 |
+| compare/join_inner/lin_cursor_projected [candidate] | wall | 302541.7500 | ns | current thread wall clock; scheduler included / batch_total | 24 | 1 |
+| compare/join_inner/sqlite [candidate] | wall | 2262104.0000 | ns | current thread wall clock; scheduler included / batch_total | 24 | 1 |
+| compare/join_inner/duckdb [candidate] | wall | 1340208.0000 | ns | current thread wall clock; scheduler included / batch_total | 24 | 1 |
+
+# Useful work throughput
+
+| Case | Median batch throughput | Unit |
+|---|---:|---|
+| compare/join_inner/lin [candidate] | 65867919.9188 | rows/s |
+| compare/join_inner/lin_cursor [candidate] | 8983208.5897 | rows/s |
+| compare/join_inner/lin_cursor_projected [candidate] | 33053289.6921 | rows/s |
+| compare/join_inner/sqlite [candidate] | 4420669.2894 | rows/s |
+| compare/join_inner/duckdb [candidate] | 7461545.6817 | rows/s |
+
+Derived from positive wall batches and declared units per operation; zero/unavailable durations omitted.
+
+Medians above summarize observations, not pooled operation-latency percentiles. Comparisons aggregate within each process first.
+
+- Raw batches are not independent process replications. Batch averages are not individual-operation latency. CPU frequency and background load are uncontrolled.
+

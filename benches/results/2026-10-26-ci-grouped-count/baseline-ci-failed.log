@@ -1,0 +1,937 @@
+bench	Run compare benches	﻿2026-10-26T05:18:07.6797784Z ##[group]Run set -euo pipefail
+bench	Run compare benches	2026-10-26T05:18:07.6798144Z ^[[36;1mset -euo pipefail^[[0m
+bench	Run compare benches	2026-10-26T05:18:07.6798419Z ^[[36;1mrm -rf .airbug-bench/ci^[[0m
+bench	Run compare benches	2026-10-26T05:18:07.6798701Z ^[[36;1mcargo bench --bench compare -- \^[[0m
+bench	Run compare benches	2026-10-26T05:18:07.6798996Z ^[[36;1m  --profile quick \^[[0m
+bench	Run compare benches	2026-10-26T05:18:07.6799259Z ^[[36;1m  --exclude 'compare/durable*' \^[[0m
+bench	Run compare benches	2026-10-26T05:18:07.6799549Z ^[[36;1m  --exclude 'compare/cold*' \^[[0m
+bench	Run compare benches	2026-10-26T05:18:07.6799828Z ^[[36;1m  --exclude 'compare/wal*' \^[[0m
+bench	Run compare benches	2026-10-26T05:18:07.6800115Z ^[[36;1m  --exclude 'compare/hot_reopen*' \^[[0m
+bench	Run compare benches	2026-10-26T05:18:07.6800411Z ^[[36;1m  --exclude 'compare/*1row*' \^[[0m
+bench	Run compare benches	2026-10-26T05:18:07.6800696Z ^[[36;1m  --output .airbug-bench/ci \^[[0m
+bench	Run compare benches	2026-10-26T05:18:07.6800974Z ^[[36;1m  | tee bench-report.md^[[0m
+bench	Run compare benches	2026-10-26T05:18:07.6801219Z ^[[36;1m{^[[0m
+bench	Run compare benches	2026-10-26T05:18:07.6801453Z ^[[36;1m  echo "## Lin compare benches (quick)"^[[0m
+bench	Run compare benches	2026-10-26T05:18:07.6801740Z ^[[36;1m  echo^[[0m
+bench	Run compare benches	2026-10-26T05:18:07.6802367Z ^[[36;1m  echo "Engines: Lin / SQLite / DuckDB / HashMap (Postgres & MySQL skipped without servers)."^[[0m
+bench	Run compare benches	2026-10-26T05:18:07.6803153Z ^[[36;1m  echo "Excluded: compare/durable*, compare/cold*, compare/wal*, compare/hot_reopen*, compare/*1row*."^[[0m
+bench	Run compare benches	2026-10-26T05:18:07.6803647Z ^[[36;1m  echo^[[0m
+bench	Run compare benches	2026-10-26T05:18:07.6803950Z ^[[36;1m  echo "Local dash (after hub serve): http://127.0.0.1:8790/"^[[0m
+bench	Run compare benches	2026-10-26T05:18:07.6804309Z ^[[36;1m  echo^[[0m
+bench	Run compare benches	2026-10-26T05:18:07.6804526Z ^[[36;1m  cat bench-report.md^[[0m
+bench	Run compare benches	2026-10-26T05:18:07.6804789Z ^[[36;1m} >> "$GITHUB_STEP_SUMMARY"^[[0m
+bench	Run compare benches	2026-10-26T05:18:07.6805129Z ^[[36;1mcp bench-report.md .airbug-bench/ci/bench-report.md^[[0m
+bench	Run compare benches	2026-10-26T05:18:07.6805518Z ^[[36;1mexport BENCH_RUN_JSON=.airbug-bench/ci/run.json^[[0m
+bench	Run compare benches	2026-10-26T05:18:07.6805868Z ^[[36;1mpython3 scripts/check-bench-budget.py^[[0m
+bench	Run compare benches	2026-10-26T05:18:07.6806262Z ^[[36;1m# exit 2 = hard regress (>3×); exit 0 includes soft WARN (>1.5×)^[[0m
+bench	Run compare benches	2026-10-26T05:18:07.6867924Z shell: /usr/bin/bash -e {0}
+bench	Run compare benches	2026-10-26T05:18:07.6868189Z env:
+bench	Run compare benches	2026-10-26T05:18:07.6868402Z   CARGO_HOME: /home/runner/.cargo
+bench	Run compare benches	2026-10-26T05:18:07.6868680Z   CARGO_INCREMENTAL: 0
+bench	Run compare benches	2026-10-26T05:18:07.6868909Z   CARGO_TERM_COLOR: always
+bench	Run compare benches	2026-10-26T05:18:07.6869338Z   CACHE_ON_FAILURE: false
+bench	Run compare benches	2026-10-26T05:18:07.6869566Z ##[endgroup]
+bench	Run compare benches	2026-10-26T05:18:07.7380225Z ^[[1m^[[92m    Updating^[[0m crates.io index
+bench	Run compare benches	2026-10-26T05:18:07.7384604Z ^[[1m^[[92m    Updating^[[0m git repository `https://github.com/themoretheless/airbug`
+bench	Run compare benches	2026-10-26T05:18:09.1971334Z ^[[1m^[[92m Downloading^[[0m crates ...
+bench	Run compare benches	2026-10-26T05:18:09.2926619Z ^[[1m^[[92m  Downloaded^[[0m adler2 v2.0.1
+bench	Run compare benches	2026-10-26T05:18:09.2976562Z ^[[1m^[[92m  Downloaded^[[0m ahash v0.8.12
+bench	Run compare benches	2026-10-26T05:18:09.3009649Z ^[[1m^[[92m  Downloaded^[[0m cfg_aliases v0.2.2
+bench	Run compare benches	2026-10-26T05:18:09.3024582Z ^[[1m^[[92m  Downloaded^[[0m arrow-arith v58.4.0
+bench	Run compare benches	2026-10-26T05:18:09.3049278Z ^[[1m^[[92m  Downloaded^[[0m arrayvec v0.7.8
+bench	Run compare benches	2026-10-26T05:18:09.3079066Z ^[[1m^[[92m  Downloaded^[[0m frunk_core v0.5.0
+bench	Run compare benches	2026-10-26T05:18:09.3104634Z ^[[1m^[[92m  Downloaded^[[0m autocfg v1.5.1
+bench	Run compare benches	2026-10-26T05:18:09.3130806Z ^[[1m^[[92m  Downloaded^[[0m allocator-api2 v0.2.21
+bench	Run compare benches	2026-10-26T05:18:09.3169753Z ^[[1m^[[92m  Downloaded^[[0m base64 v0.21.7
+bench	Run compare benches	2026-10-26T05:18:09.3227366Z ^[[1m^[[92m  Downloaded^[[0m byteorder v1.5.0
+bench	Run compare benches	2026-10-26T05:18:09.3252981Z ^[[1m^[[92m  Downloaded^[[0m half v2.7.1
+bench	Run compare benches	2026-10-26T05:18:09.3301591Z ^[[1m^[[92m  Downloaded^[[0m itoa v1.0.18
+bench	Run compare benches	2026-10-26T05:18:09.3324200Z ^[[1m^[[92m  Downloaded^[[0m arrow-data v58.4.0
+bench	Run compare benches	2026-10-26T05:18:09.3377437Z ^[[1m^[[92m  Downloaded^[[0m phf v0.13.1
+bench	Run compare benches	2026-10-26T05:18:09.3396391Z ^[[1m^[[92m  Downloaded^[[0m bumpalo v3.20.3
+bench	Run compare benches	2026-10-26T05:18:09.3441549Z ^[[1m^[[92m  Downloaded^[[0m getrandom v0.3.4
+bench	Run compare benches	2026-10-26T05:18:09.3496307Z ^[[1m^[[92m  Downloaded^[[0m glob v0.3.4
+bench	Run compare benches	2026-10-26T05:18:09.3525165Z ^[[1m^[[92m  Downloaded^[[0m getrandom v0.4.3
+bench	Run compare benches	2026-10-26T05:18:09.3588582Z ^[[1m^[[92m  Downloaded^[[0m lru v0.12.5
+bench	Run compare benches	2026-10-26T05:18:09.3609209Z ^[[1m^[[92m  Downloaded^[[0m fallible-iterator v0.3.0
+bench	Run compare benches	2026-10-26T05:18:09.3639149Z ^[[1m^[[92m  Downloaded^[[0m miniz_oxide v0.9.1
+bench	Run compare benches	2026-10-26T05:18:09.3687081Z ^[[1m^[[92m  Downloaded^[[0m pem v3.0.6
+bench	Run compare benches	2026-10-26T05:18:09.3723367Z ^[[1m^[[92m  Downloaded^[[0m heck v0.5.0
+bench	Run compare benches	2026-10-26T05:18:09.3755594Z ^[[1m^[[92m  Downloaded^[[0m proc-macro-error-attr2 v2.0.0
+bench	Run compare benches	2026-10-26T05:18:09.3790103Z ^[[1m^[[92m  Downloaded^[[0m openssl-macros v0.1.1
+bench	Run compare benches	2026-10-26T05:18:09.3819789Z ^[[1m^[[92m  Downloaded^[[0m fnv v1.0.7
+bench	Run compare benches	2026-10-26T05:18:09.3852729Z ^[[1m^[[92m  Downloaded^[[0m sha1 v0.10.7
+bench	Run compare benches	2026-10-26T05:18:09.3907247Z ^[[1m^[[92m  Downloaded^[[0m rustls-pemfile v2.2.0
+bench	Run compare benches	2026-10-26T05:18:09.3970315Z ^[[1m^[[92m  Downloaded^[[0m socket2 v0.6.5
+bench	Run compare benches	2026-10-26T05:18:09.4027516Z ^[[1m^[[92m  Downloaded^[[0m strum v0.27.2
+bench	Run compare benches	2026-10-26T05:18:09.4045732Z ^[[1m^[[92m  Downloaded^[[0m subtle v2.6.1
+bench	Run compare benches	2026-10-26T05:18:09.4092590Z ^[[1m^[[92m  Downloaded^[[0m typenum v1.20.1
+bench	Run compare benches	2026-10-26T05:18:09.4180743Z ^[[1m^[[92m  Downloaded^[[0m twox-hash v1.6.3
+bench	Run compare benches	2026-10-26T05:18:09.4243421Z ^[[1m^[[92m  Downloaded^[[0m zlib-rs v0.6.7
+bench	Run compare benches	2026-10-26T05:18:09.4339091Z ^[[1m^[[92m  Downloaded^[[0m ureq v3.4.1
+bench	Run compare benches	2026-10-26T05:18:09.4434218Z ^[[1m^[[92m  Downloaded^[[0m version_check v0.9.5
+bench	Run compare benches	2026-10-26T05:18:09.4462907Z ^[[1m^[[92m  Downloaded^[[0m zstd v0.13.3
+bench	Run compare benches	2026-10-26T05:18:09.4527910Z ^[[1m^[[92m  Downloaded^[[0m zmij v1.0.23
+bench	Run compare benches	2026-10-26T05:18:09.4570006Z ^[[1m^[[92m  Downloaded^[[0m serde v1.0.229
+bench	Run compare benches	2026-10-26T05:18:09.4628758Z ^[[1m^[[92m  Downloaded^[[0m zerofrom v0.1.8
+bench	Run compare benches	2026-10-26T05:18:09.4651753Z ^[[1m^[[92m  Downloaded^[[0m zerovec v0.11.8
+bench	Run compare benches	2026-10-26T05:18:09.4727668Z ^[[1m^[[92m  Downloaded^[[0m thiserror-impl v2.0.20
+bench	Run compare benches	2026-10-26T05:18:09.4747999Z ^[[1m^[[92m  Downloaded^[[0m zerocopy v0.8.57
+bench	Run compare benches	2026-10-26T05:18:09.4980048Z ^[[1m^[[92m  Downloaded^[[0m zstd-safe v7.3.0
+bench	Run compare benches	2026-10-26T05:18:09.4997009Z ^[[1m^[[92m  Downloaded^[[0m zeroize v1.9.0
+bench	Run compare benches	2026-10-26T05:18:09.5016026Z ^[[1m^[[92m  Downloaded^[[0m winnow v1.0.4
+bench	Run compare benches	2026-10-26T05:18:09.5126973Z ^[[1m^[[92m  Downloaded^[[0m icu_properties_data v2.3.0
+bench	Run compare benches	2026-10-26T05:18:09.5246753Z ^[[1m^[[92m  Downloaded^[[0m unicode-width v0.2.2
+bench	Run compare benches	2026-10-26T05:18:09.5307271Z ^[[1m^[[92m  Downloaded^[[0m vcpkg v0.2.15
+bench	Run compare benches	2026-10-26T05:18:09.5866913Z ^[[1m^[[92m  Downloaded^[[0m zerocopy-derive v0.8.57
+bench	Run compare benches	2026-10-26T05:18:09.5968229Z ^[[1m^[[92m  Downloaded^[[0m wyz v0.5.1
+bench	Run compare benches	2026-10-26T05:18:09.5982582Z ^[[1m^[[92m  Downloaded^[[0m openssl v0.10.81
+bench	Run compare benches	2026-10-26T05:18:09.6084701Z ^[[1m^[[92m  Downloaded^[[0m regex-syntax v0.8.11
+bench	Run compare benches	2026-10-26T05:18:09.6157845Z ^[[1m^[[92m  Downloaded^[[0m tokio-macros v2.7.2
+bench	Run compare benches	2026-10-26T05:18:09.6170384Z ^[[1m^[[92m  Downloaded^[[0m lexical-parse-float v1.0.6
+bench	Run compare benches	2026-10-26T05:18:09.6227502Z ^[[1m^[[92m  Downloaded^[[0m unicode-normalization v0.1.25
+bench	Run compare benches	2026-10-26T05:18:09.6266632Z ^[[1m^[[92m  Downloaded^[[0m regex v1.13.1
+bench	Run compare benches	2026-10-26T05:18:09.6324004Z ^[[1m^[[92m  Downloaded^[[0m mysql_common v0.32.4
+bench	Run compare benches	2026-10-26T05:18:09.6406294Z ^[[1m^[[92m  Downloaded^[[0m libm v0.2.16
+bench	Run compare benches	2026-10-26T05:18:09.6519962Z ^[[1m^[[92m  Downloaded^[[0m indexmap v2.14.2
+bench	Run compare benches	2026-10-26T05:18:09.6565064Z ^[[1m^[[92m  Downloaded^[[0m idna v1.1.0
+bench	Run compare benches	2026-10-26T05:18:09.6608247Z ^[[1m^[[92m  Downloaded^[[0m num-bigint v0.4.8
+bench	Run compare benches	2026-10-26T05:18:09.6661487Z ^[[1m^[[92m  Downloaded^[[0m icu_normalizer v2.3.0
+bench	Run compare benches	2026-10-26T05:18:09.6759087Z ^[[1m^[[92m  Downloaded^[[0m icu_properties v2.3.0
+bench	Run compare benches	2026-10-26T05:18:09.6794974Z ^[[1m^[[92m  Downloaded^[[0m writeable v0.6.4
+bench	Run compare benches	2026-10-26T05:18:09.6819336Z ^[[1m^[[92m  Downloaded^[[0m ureq-proto v0.6.2
+bench	Run compare benches	2026-10-26T05:18:09.6862951Z ^[[1m^[[92m  Downloaded^[[0m regex-automata v0.4.18
+bench	Run compare benches	2026-10-26T05:18:09.7008928Z ^[[1m^[[92m  Downloaded^[[0m untrusted v0.9.0
+bench	Run compare benches	2026-10-26T05:18:09.7027594Z ^[[1m^[[92m  Downloaded^[[0m thiserror v2.0.20
+bench	Run compare benches	2026-10-26T05:18:09.7095231Z ^[[1m^[[92m  Downloaded^[[0m rand v0.10.2
+bench	Run compare benches	2026-10-26T05:18:09.7134950Z ^[[1m^[[92m  Downloaded^[[0m memchr v2.8.3
+bench	Run compare benches	2026-10-26T05:18:09.7193153Z ^[[1m^[[92m  Downloaded^[[0m yoke-derive v0.8.2
+bench	Run compare benches	2026-10-26T05:18:09.7206204Z ^[[1m^[[92m  Downloaded^[[0m url v2.5.8
+bench	Run compare benches	2026-10-26T05:18:09.7233372Z ^[[1m^[[92m  Downloaded^[[0m toml_parser v1.1.3+spec-1.1.0
+bench	Run compare benches	2026-10-26T05:18:09.7257574Z ^[[1m^[[92m  Downloaded^[[0m libz-sys v1.1.29
+bench	Run compare benches	2026-10-26T05:18:09.7491988Z ^[[1m^[[92m  Downloaded^[[0m tokio v1.53.1
+bench	Run compare benches	2026-10-26T05:18:09.7953601Z ^[[1m^[[92m  Downloaded^[[0m strum_macros v0.27.2
+bench	Run compare benches	2026-10-26T05:18:09.7980724Z ^[[1m^[[92m  Downloaded^[[0m static_assertions v1.1.0
+bench	Run compare benches	2026-10-26T05:18:09.7997002Z ^[[1m^[[92m  Downloaded^[[0m rand v0.9.5
+bench	Run compare benches	2026-10-26T05:18:09.8038224Z ^[[1m^[[92m  Downloaded^[[0m openssl-sys v0.9.117
+bench	Run compare benches	2026-10-26T05:18:09.8097702Z ^[[1m^[[92m  Downloaded^[[0m mysql v25.0.1
+bench	Run compare benches	2026-10-26T05:18:09.8138827Z ^[[1m^[[92m  Downloaded^[[0m libc v0.2.189
+bench	Run compare benches	2026-10-26T05:18:09.8575672Z ^[[1m^[[92m  Downloaded^[[0m mio v1.2.3
+bench	Run compare benches	2026-10-26T05:18:09.8640208Z ^[[1m^[[92m  Downloaded^[[0m lexical-write-float v1.0.6
+bench	Run compare benches	2026-10-26T05:18:09.8674657Z ^[[1m^[[92m  Downloaded^[[0m lexical-util v1.0.7
+bench	Run compare benches	2026-10-26T05:18:09.8719770Z ^[[1m^[[92m  Downloaded^[[0m icu_normalizer_data v2.3.0
+bench	Run compare benches	2026-10-26T05:18:09.8742318Z ^[[1m^[[92m  Downloaded^[[0m rcgen v0.13.2
+bench	Run compare benches	2026-10-26T05:18:09.8772020Z ^[[1m^[[92m  Downloaded^[[0m rand v0.8.8
+bench	Run compare benches	2026-10-26T05:18:09.8809064Z ^[[1m^[[92m  Downloaded^[[0m minimal-lexical v0.2.1
+bench	Run compare benches	2026-10-26T05:18:09.8856677Z ^[[1m^[[92m  Downloaded^[[0m icu_locale_core v2.3.0
+bench	Run compare benches	2026-10-26T05:18:09.8929207Z ^[[1m^[[92m  Downloaded^[[0m zip v6.0.0
+bench	Run compare benches	2026-10-26T05:18:09.8982099Z ^[[1m^[[92m  Downloaded^[[0m yasna v0.5.2
+bench	Run compare benches	2026-10-26T05:18:09.9009445Z ^[[1m^[[92m  Downloaded^[[0m whoami v2.1.3
+bench	Run compare benches	2026-10-26T05:18:09.9032497Z ^[[1m^[[92m  Downloaded^[[0m webpki-roots v1.0.9
+bench	Run compare benches	2026-10-26T05:18:09.9064517Z ^[[1m^[[92m  Downloaded^[[0m unicode-ident v1.0.24
+bench	Run compare benches	2026-10-26T05:18:09.9094194Z ^[[1m^[[92m  Downloaded^[[0m zstd-sys v2.1.0+zstd.1.5.7
+bench	Run compare benches	2026-10-26T05:18:09.9265011Z ^[[1m^[[92m  Downloaded^[[0m toml_edit v0.25.15+spec-1.1.0
+bench	Run compare benches	2026-10-26T05:18:09.9304238Z ^[[1m^[[92m  Downloaded^[[0m strsim v0.11.1
+bench	Run compare benches	2026-10-26T05:18:09.9318443Z ^[[1m^[[92m  Downloaded^[[0m socket2 v0.5.10
+bench	Run compare benches	2026-10-26T05:18:09.9337545Z ^[[1m^[[92m  Downloaded^[[0m nom v7.1.3
+bench	Run compare benches	2026-10-26T05:18:09.9389301Z ^[[1m^[[92m  Downloaded^[[0m log v0.4.34
+bench	Run compare benches	2026-10-26T05:18:09.9415119Z ^[[1m^[[92m  Downloaded^[[0m zopfli v0.8.3
+bench	Run compare benches	2026-10-26T05:18:09.9439226Z ^[[1m^[[92m  Downloaded^[[0m zerovec-derive v0.11.6
+bench	Run compare benches	2026-10-26T05:18:09.9457848Z ^[[1m^[[92m  Downloaded^[[0m zerotrie v0.2.5
+bench	Run compare benches	2026-10-26T05:18:09.9498617Z ^[[1m^[[92m  Downloaded^[[0m zerofrom-derive v0.1.7
+bench	Run compare benches	2026-10-26T05:18:09.9510550Z ^[[1m^[[92m  Downloaded^[[0m yoke v0.8.3
+bench	Run compare benches	2026-10-26T05:18:09.9529677Z ^[[1m^[[92m  Downloaded^[[0m xattr v1.6.1
+bench	Run compare benches	2026-10-26T05:18:09.9549740Z ^[[1m^[[92m  Downloaded^[[0m utf8-zero v0.8.1
+bench	Run compare benches	2026-10-26T05:18:09.9565168Z ^[[1m^[[92m  Downloaded^[[0m unicode-bidi v0.3.18
+bench	Run compare benches	2026-10-26T05:18:09.9590441Z ^[[1m^[[92m  Downloaded^[[0m time-core v0.1.9
+bench	Run compare benches	2026-10-26T05:18:09.9602766Z ^[[1m^[[92m  Downloaded^[[0m lexical-write-integer v1.0.6
+bench	Run compare benches	2026-10-26T05:18:09.9630635Z ^[[1m^[[92m  Downloaded^[[0m icu_provider v2.3.1
+bench	Run compare benches	2026-10-26T05:18:09.9657716Z ^[[1m^[[92m  Downloaded^[[0m hashbrown v0.17.1
+bench	Run compare benches	2026-10-26T05:18:09.9711861Z ^[[1m^[[92m  Downloaded^[[0m hashbrown v0.14.5
+bench	Run compare benches	2026-10-26T05:18:09.9760649Z ^[[1m^[[92m  Downloaded^[[0m uuid v1.26.1
+bench	Run compare benches	2026-10-26T05:18:09.9790671Z ^[[1m^[[92m  Downloaded^[[0m utf8_iter v1.0.4
+bench	Run compare benches	2026-10-26T05:18:09.9802175Z ^[[1m^[[92m  Downloaded^[[0m unicode-properties v0.1.4
+bench	Run compare benches	2026-10-26T05:18:09.9822105Z ^[[1m^[[92m  Downloaded^[[0m toml_datetime v1.1.1+spec-1.1.0
+bench	Run compare benches	2026-10-26T05:18:09.9835778Z ^[[1m^[[92m  Downloaded^[[0m tokio-util v0.7.19
+bench	Run compare benches	2026-10-26T05:18:09.9915475Z ^[[1m^[[92m  Downloaded^[[0m tinyvec v1.13.2
+bench	Run compare benches	2026-10-26T05:18:09.9951993Z ^[[1m^[[92m  Downloaded^[[0m thiserror v1.0.69
+bench	Run compare benches	2026-10-26T05:18:10.0011951Z ^[[1m^[[92m  Downloaded^[[0m sha2 v0.11.0
+bench	Run compare benches	2026-10-26T05:18:10.0051100Z ^[[1m^[[92m  Downloaded^[[0m scopeguard v1.2.0
+bench	Run compare benches	2026-10-26T05:18:10.0064533Z ^[[1m^[[92m  Downloaded^[[0m ring v0.17.14
+bench	Run compare benches	2026-10-26T05:18:10.0484237Z ^[[1m^[[92m  Downloaded^[[0m proc-macro2 v1.0.107
+bench	Run compare benches	2026-10-26T05:18:10.0514853Z ^[[1m^[[92m  Downloaded^[[0m postgres-protocol v0.6.12
+bench	Run compare benches	2026-10-26T05:18:10.0536509Z ^[[1m^[[92m  Downloaded^[[0m once_cell v1.21.4
+bench	Run compare benches	2026-10-26T05:18:10.0562463Z ^[[1m^[[92m  Downloaded^[[0m md-5 v0.11.0
+bench	Run compare benches	2026-10-26T05:18:10.0582985Z ^[[1m^[[92m  Downloaded^[[0m litemap v0.8.3
+bench	Run compare benches	2026-10-26T05:18:10.0607205Z ^[[1m^[[92m  Downloaded^[[0m hashbrown v0.15.5
+bench	Run compare benches	2026-10-26T05:18:10.0658330Z ^[[1m^[[92m  Downloaded^[[0m thiserror-impl v1.0.69
+bench	Run compare benches	2026-10-26T05:18:10.0672708Z ^[[1m^[[92m  Downloaded^[[0m syn v2.0.119
+bench	Run compare benches	2026-10-26T05:18:10.0777451Z ^[[1m^[[92m  Downloaded^[[0m smallvec v1.16.1
+bench	Run compare benches	2026-10-26T05:18:10.0791875Z ^[[1m^[[92m  Downloaded^[[0m ryu v1.0.23
+bench	Run compare benches	2026-10-26T05:18:10.0825527Z ^[[1m^[[92m  Downloaded^[[0m parking_lot_core v0.9.12
+bench	Run compare benches	2026-10-26T05:18:10.0849067Z ^[[1m^[[92m  Downloaded^[[0m num-traits v0.2.19
+bench	Run compare benches	2026-10-26T05:18:10.0876378Z ^[[1m^[[92m  Downloaded^[[0m lock_api v0.4.14
+bench	Run compare benches	2026-10-26T05:18:10.0890157Z ^[[1m^[[92m  Downloaded^[[0m lexical-parse-integer v1.0.6
+bench	Run compare benches	2026-10-26T05:18:10.0911109Z ^[[1m^[[92m  Downloaded^[[0m iana-time-zone v0.1.65
+bench	Run compare benches	2026-10-26T05:18:10.0940737Z ^[[1m^[[92m  Downloaded^[[0m hybrid-array v0.4.15
+bench	Run compare benches	2026-10-26T05:18:10.0964032Z ^[[1m^[[92m  Downloaded^[[0m http v1.5.0
+bench	Run compare benches	2026-10-26T05:18:10.1001250Z ^[[1m^[[92m  Downloaded^[[0m unicode-segmentation v1.13.3
+bench	Run compare benches	2026-10-26T05:18:10.1033116Z ^[[1m^[[92m  Downloaded^[[0m tokio-stream v0.1.19
+bench	Run compare benches	2026-10-26T05:18:10.1089127Z ^[[1m^[[92m  Downloaded^[[0m tinyvec_macros v0.1.1
+bench	Run compare benches	2026-10-26T05:18:10.1098503Z ^[[1m^[[92m  Downloaded^[[0m tinystr v0.8.4
+bench	Run compare benches	2026-10-26T05:18:10.1119744Z ^[[1m^[[92m  Downloaded^[[0m time-macros v0.2.32
+bench	Run compare benches	2026-10-26T05:18:10.1145636Z ^[[1m^[[92m  Downloaded^[[0m tar v0.4.46
+bench	Run compare benches	2026-10-26T05:18:10.1181005Z ^[[1m^[[92m  Downloaded^[[0m syn v3.0.5
+bench	Run compare benches	2026-10-26T05:18:10.1290259Z ^[[1m^[[92m  Downloaded^[[0m rustls v0.23.44
+bench	Run compare benches	2026-10-26T05:18:10.1411773Z ^[[1m^[[92m  Downloaded^[[0m linux-raw-sys v0.4.15
+bench	Run compare benches	2026-10-26T05:18:10.1862454Z ^[[1m^[[92m  Downloaded^[[0m rustix v1.1.4
+bench	Run compare benches	2026-10-26T05:18:10.2149061Z ^[[1m^[[92m  Downloaded^[[0m rand_core v0.10.1
+bench	Run compare benches	2026-10-26T05:18:10.2165914Z ^[[1m^[[92m  Downloaded^[[0m rand_core v0.9.5
+bench	Run compare benches	2026-10-26T05:18:10.2179679Z ^[[1m^[[92m  Downloaded^[[0m rand_core v0.6.4
+bench	Run compare benches	2026-10-26T05:18:10.2194292Z ^[[1m^[[92m  Downloaded^[[0m rand_chacha v0.3.1
+bench	Run compare benches	2026-10-26T05:18:10.2206363Z ^[[1m^[[92m  Downloaded^[[0m proc-macro-error2 v2.0.1
+bench	Run compare benches	2026-10-26T05:18:10.2242976Z ^[[1m^[[92m  Downloaded^[[0m ppv-lite86 v0.2.21
+bench	Run compare benches	2026-10-26T05:18:10.2257763Z ^[[1m^[[92m  Downloaded^[[0m postgres v0.19.14
+bench	Run compare benches	2026-10-26T05:18:10.2282513Z ^[[1m^[[92m  Downloaded^[[0m pin-project-lite v0.2.17
+bench	Run compare benches	2026-10-26T05:18:10.2346445Z ^[[1m^[[92m  Downloaded^[[0m parking_lot v0.12.5
+bench	Run compare benches	2026-10-26T05:18:10.2372067Z ^[[1m^[[92m  Downloaded^[[0m num-complex v0.4.6
+bench	Run compare benches	2026-10-26T05:18:10.2387224Z ^[[1m^[[92m  Downloaded^[[0m lazy_static v1.5.0
+bench	Run compare benches	2026-10-26T05:18:10.2406404Z ^[[1m^[[92m  Downloaded^[[0m icu_collections v2.3.0
+bench	Run compare benches	2026-10-26T05:18:10.2475939Z ^[[1m^[[92m  Downloaded^[[0m tiny-keccak v2.0.2
+bench	Run compare benches	2026-10-26T05:18:10.2501211Z ^[[1m^[[92m  Downloaded^[[0m time v0.3.55
+bench	Run compare benches	2026-10-26T05:18:10.2651059Z ^[[1m^[[92m  Downloaded^[[0m termcolor v1.4.1
+bench	Run compare benches	2026-10-26T05:18:10.2667530Z ^[[1m^[[92m  Downloaded^[[0m tap v1.0.1
+bench	Run compare benches	2026-10-26T05:18:10.2677437Z ^[[1m^[[92m  Downloaded^[[0m synstructure v0.13.2
+bench	Run compare benches	2026-10-26T05:18:10.2688650Z ^[[1m^[[92m  Downloaded^[[0m subprocess v0.2.15
+bench	Run compare benches	2026-10-26T05:18:10.2723717Z ^[[1m^[[92m  Downloaded^[[0m rustix v0.38.44
+bench	Run compare benches	2026-10-26T05:18:10.2991212Z ^[[1m^[[92m  Downloaded^[[0m rand_chacha v0.9.0
+bench	Run compare benches	2026-10-26T05:18:10.3004077Z ^[[1m^[[92m  Downloaded^[[0m radium v0.7.0
+bench	Run compare benches	2026-10-26T05:18:10.3014696Z ^[[1m^[[92m  Downloaded^[[0m quote v1.0.47
+bench	Run compare benches	2026-10-26T05:18:10.3043603Z ^[[1m^[[92m  Downloaded^[[0m proc-macro-crate v3.5.0
+bench	Run compare benches	2026-10-26T05:18:10.3057198Z ^[[1m^[[92m  Downloaded^[[0m powerfmt v0.2.0
+bench	Run compare benches	2026-10-26T05:18:10.3069792Z ^[[1m^[[92m  Downloaded^[[0m pkg-config v0.3.34
+bench	Run compare benches	2026-10-26T05:18:10.3085503Z ^[[1m^[[92m  Downloaded^[[0m num-conv v0.2.2
+bench	Run compare benches	2026-10-26T05:18:10.3095679Z ^[[1m^[[92m  Downloaded^[[0m native-tls v0.2.18
+bench	Run compare benches	2026-10-26T05:18:10.3111118Z ^[[1m^[[92m  Downloaded^[[0m tokio-postgres v0.7.18
+bench	Run compare benches	2026-10-26T05:18:10.3167548Z ^[[1m^[[92m  Downloaded^[[0m serde_json v1.0.151
+bench	Run compare benches	2026-10-26T05:18:10.3242642Z ^[[1m^[[92m  Downloaded^[[0m num-integer v0.1.47
+bench	Run compare benches	2026-10-26T05:18:10.3259769Z ^[[1m^[[92m  Downloaded^[[0m lexical-core v1.0.6
+bench	Run compare benches	2026-10-26T05:18:10.3285469Z ^[[1m^[[92m  Downloaded^[[0m jobserver v0.1.35
+bench	Run compare benches	2026-10-26T05:18:10.3317459Z ^[[1m^[[92m  Downloaded^[[0m idna_adapter v1.2.2
+bench	Run compare benches	2026-10-26T05:18:10.3334382Z ^[[1m^[[92m  Downloaded^[[0m hashlink v0.9.1
+bench	Run compare benches	2026-10-26T05:18:10.3362225Z ^[[1m^[[92m  Downloaded^[[0m bitvec v1.1.1
+bench	Run compare benches	2026-10-26T05:18:10.3577274Z ^[[1m^[[92m  Downloaded^[[0m stringprep v0.1.5
+bench	Run compare benches	2026-10-26T05:18:10.3592491Z ^[[1m^[[92m  Downloaded^[[0m stable_deref_trait v1.2.1
+bench	Run compare benches	2026-10-26T05:18:10.3602541Z ^[[1m^[[92m  Downloaded^[[0m simd-adler32 v0.3.10
+bench	Run compare benches	2026-10-26T05:18:10.3622152Z ^[[1m^[[92m  Downloaded^[[0m rust_decimal v1.43.0
+bench	Run compare benches	2026-10-26T05:18:10.3725123Z ^[[1m^[[92m  Downloaded^[[0m rusqlite v0.32.1
+bench	Run compare benches	2026-10-26T05:18:10.3821384Z ^[[1m^[[92m  Downloaded^[[0m chrono v0.4.45
+bench	Run compare benches	2026-10-26T05:18:10.3923811Z ^[[1m^[[92m  Downloaded^[[0m bindgen v0.73.2
+bench	Run compare benches	2026-10-26T05:18:10.3993479Z ^[[1m^[[92m  Downloaded^[[0m linux-raw-sys v0.12.1
+bench	Run compare benches	2026-10-26T05:18:10.4623840Z ^[[1m^[[92m  Downloaded^[[0m bigdecimal v0.4.10
+bench	Run compare benches	2026-10-26T05:18:10.4673537Z ^[[1m^[[92m  Downloaded^[[0m slab v0.4.12
+bench	Run compare benches	2026-10-26T05:18:10.4687486Z ^[[1m^[[92m  Downloaded^[[0m serde_derive v1.0.229
+bench	Run compare benches	2026-10-26T05:18:10.4719291Z ^[[1m^[[92m  Downloaded^[[0m serde_core v1.0.229
+bench	Run compare benches	2026-10-26T05:18:10.4749673Z ^[[1m^[[92m  Downloaded^[[0m rustls-pki-types v1.15.1
+bench	Run compare benches	2026-10-26T05:18:10.4776663Z ^[[1m^[[92m  Downloaded^[[0m postgres-types v0.2.14
+bench	Run compare benches	2026-10-26T05:18:10.4805541Z ^[[1m^[[92m  Downloaded^[[0m phf_shared v0.13.1
+bench	Run compare benches	2026-10-26T05:18:10.4815308Z ^[[1m^[[92m  Downloaded^[[0m percent-encoding v2.3.2
+bench	Run compare benches	2026-10-26T05:18:10.4824421Z ^[[1m^[[92m  Downloaded^[[0m openssl-probe v0.2.1
+bench	Run compare benches	2026-10-26T05:18:10.4836561Z ^[[1m^[[92m  Downloaded^[[0m mysql-common-derive v0.31.2
+bench	Run compare benches	2026-10-26T05:18:10.4858964Z ^[[1m^[[92m  Downloaded^[[0m ident_case v1.0.1
+bench	Run compare benches	2026-10-26T05:18:10.4867681Z ^[[1m^[[92m  Downloaded^[[0m httparse v1.10.1
+bench	Run compare benches	2026-10-26T05:18:10.4893633Z ^[[1m^[[92m  Downloaded^[[0m futures-util v0.3.34
+bench	Run compare benches	2026-10-26T05:18:10.5034323Z ^[[1m^[[92m  Downloaded^[[0m crossterm v0.28.1
+bench	Run compare benches	2026-10-26T05:18:10.5105633Z ^[[1m^[[92m  Downloaded^[[0m borsh v1.8.1
+bench	Run compare benches	2026-10-26T05:18:10.5182257Z ^[[1m^[[92m  Downloaded^[[0m arrow-cast v58.4.0
+bench	Run compare benches	2026-10-26T05:18:10.5217319Z ^[[1m^[[92m  Downloaded^[[0m siphasher v1.0.3
+bench	Run compare benches	2026-10-26T05:18:10.5233005Z ^[[1m^[[92m  Downloaded^[[0m shlex v2.0.1
+bench	Run compare benches	2026-10-26T05:18:10.5246903Z ^[[1m^[[92m  Downloaded^[[0m sha2 v0.10.9
+bench	Run compare benches	2026-10-26T05:18:10.5273019Z ^[[1m^[[92m  Downloaded^[[0m saturating v0.1.0
+bench	Run compare benches	2026-10-26T05:18:10.5281203Z ^[[1m^[[92m  Downloaded^[[0m rustls-webpki v0.103.15
+bench	Run compare benches	2026-10-26T05:18:10.5314962Z ^[[1m^[[92m  Downloaded^[[0m rmp v0.8.15
+bench	Run compare benches	2026-10-26T05:18:10.5357262Z ^[[1m^[[92m  Downloaded^[[0m memmap2 v0.9.11
+bench	Run compare benches	2026-10-26T05:18:10.5376464Z ^[[1m^[[92m  Downloaded^[[0m crossbeam-queue v0.3.14
+bench	Run compare benches	2026-10-26T05:18:10.5390092Z ^[[1m^[[92m  Downloaded^[[0m comfy-table v7.1.4
+bench	Run compare benches	2026-10-26T05:18:10.5465872Z ^[[1m^[[92m  Downloaded^[[0m cc v1.4.5
+bench	Run compare benches	2026-10-26T05:18:10.5515595Z ^[[1m^[[92m  Downloaded^[[0m arrow-ord v58.4.0
+bench	Run compare benches	2026-10-26T05:18:10.5537435Z ^[[1m^[[92m  Downloaded^[[0m arrow-buffer v58.4.0
+bench	Run compare benches	2026-10-26T05:18:10.5577607Z ^[[1m^[[92m  Downloaded^[[0m rmp-serde v1.3.1
+bench	Run compare benches	2026-10-26T05:18:10.5596461Z ^[[1m^[[92m  Downloaded^[[0m potential_utf v0.1.6
+bench	Run compare benches	2026-10-26T05:18:10.5607652Z ^[[1m^[[92m  Downloaded^[[0m io-enum v1.2.1
+bench	Run compare benches	2026-10-26T05:18:10.5626620Z ^[[1m^[[92m  Downloaded^[[0m flate2 v1.1.10
+bench	Run compare benches	2026-10-26T05:18:10.5677746Z ^[[1m^[[92m  Downloaded^[[0m crc32fast v1.5.1
+bench	Run compare benches	2026-10-26T05:18:10.5698640Z ^[[1m^[[92m  Downloaded^[[0m base64 v0.23.1
+bench	Run compare benches	2026-10-26T05:18:10.5738553Z ^[[1m^[[92m  Downloaded^[[0m rustc-hash v2.1.3
+bench	Run compare benches	2026-10-26T05:18:10.5751706Z ^[[1m^[[92m  Downloaded^[[0m frunk v0.4.4
+bench	Run compare benches	2026-10-26T05:18:10.5781342Z ^[[1m^[[92m  Downloaded^[[0m cexpr v0.6.0
+bench	Run compare benches	2026-10-26T05:18:10.5800585Z ^[[1m^[[92m  Downloaded^[[0m bytes v1.12.1
+bench	Run compare benches	2026-10-26T05:18:10.5837294Z ^[[1m^[[92m  Downloaded^[[0m filetime v0.2.29
+bench	Run compare benches	2026-10-26T05:18:10.5854136Z ^[[1m^[[92m  Downloaded^[[0m crossbeam-deque v0.8.8
+bench	Run compare benches	2026-10-26T05:18:10.5869685Z ^[[1m^[[92m  Downloaded^[[0m cpufeatures v0.2.17
+bench	Run compare benches	2026-10-26T05:18:10.5883649Z ^[[1m^[[92m  Downloaded^[[0m cmov v0.5.4
+bench	Run compare benches	2026-10-26T05:18:10.5902265Z ^[[1m^[[92m  Downloaded^[[0m chacha20 v0.10.2
+bench	Run compare benches	2026-10-26T05:18:10.5926890Z ^[[1m^[[92m  Downloaded^[[0m bitflags v2.13.2
+bench	Run compare benches	2026-10-26T05:18:10.5974385Z ^[[1m^[[92m  Downloaded^[[0m async-trait v0.1.92
+bench	Run compare benches	2026-10-26T05:18:10.6011792Z ^[[1m^[[92m  Downloaded^[[0m arrow-row v58.4.0
+bench	Run compare benches	2026-10-26T05:18:10.6028845Z ^[[1m^[[92m  Downloaded^[[0m digest v0.10.7
+bench	Run compare benches	2026-10-26T05:18:10.6046947Z ^[[1m^[[92m  Downloaded^[[0m clang-sys v1.9.1
+bench	Run compare benches	2026-10-26T05:18:10.6070575Z ^[[1m^[[92m  Downloaded^[[0m arrow-string v58.4.0
+bench	Run compare benches	2026-10-26T05:18:10.6088105Z ^[[1m^[[92m  Downloaded^[[0m hashlink v0.10.0
+bench	Run compare benches	2026-10-26T05:18:10.6106166Z ^[[1m^[[92m  Downloaded^[[0m foldhash v0.1.5
+bench	Run compare benches	2026-10-26T05:18:10.6118939Z ^[[1m^[[92m  Downloaded^[[0m find-msvc-tools v0.1.12
+bench	Run compare benches	2026-10-26T05:18:10.6136071Z ^[[1m^[[92m  Downloaded^[[0m ctutils v0.4.2
+bench	Run compare benches	2026-10-26T05:18:10.6157036Z ^[[1m^[[92m  Downloaded^[[0m crossbeam-epoch v0.9.21
+bench	Run compare benches	2026-10-26T05:18:10.6182069Z ^[[1m^[[92m  Downloaded^[[0m cmake v0.1.58
+bench	Run compare benches	2026-10-26T05:18:10.6196478Z ^[[1m^[[92m  Downloaded^[[0m btoi v0.4.3
+bench	Run compare benches	2026-10-26T05:18:10.6209833Z ^[[1m^[[92m  Downloaded^[[0m borsh-derive v1.8.1
+bench	Run compare benches	2026-10-26T05:18:10.6242655Z ^[[1m^[[92m  Downloaded^[[0m futures-channel v0.3.34
+bench	Run compare benches	2026-10-26T05:18:10.6262562Z ^[[1m^[[92m  Downloaded^[[0m foreign-types v0.3.2
+bench	Run compare benches	2026-10-26T05:18:10.6271094Z ^[[1m^[[92m  Downloaded^[[0m fallible-iterator v0.2.0
+bench	Run compare benches	2026-10-26T05:18:10.6283042Z ^[[1m^[[92m  Downloaded^[[0m errno v0.3.14
+bench	Run compare benches	2026-10-26T05:18:10.6299022Z ^[[1m^[[92m  Downloaded^[[0m cpufeatures v0.3.1
+bench	Run compare benches	2026-10-26T05:18:10.6313792Z ^[[1m^[[92m  Downloaded^[[0m hmac v0.13.0
+bench	Run compare benches	2026-10-26T05:18:10.6335716Z ^[[1m^[[92m  Downloaded^[[0m getrandom v0.2.17
+bench	Run compare benches	2026-10-26T05:18:10.6365616Z ^[[1m^[[92m  Downloaded^[[0m generic-array v0.14.7
+bench	Run compare benches	2026-10-26T05:18:10.6380002Z ^[[1m^[[92m  Downloaded^[[0m frunk_proc_macro_helpers v0.1.5
+bench	Run compare benches	2026-10-26T05:18:10.6387439Z ^[[1m^[[92m  Downloaded^[[0m deranged v0.5.8
+bench	Run compare benches	2026-10-26T05:18:10.6401663Z ^[[1m^[[92m  Downloaded^[[0m darling_macro v0.20.11
+bench	Run compare benches	2026-10-26T05:18:10.6420684Z ^[[1m^[[92m  Downloaded^[[0m futures-core v0.3.34
+bench	Run compare benches	2026-10-26T05:18:10.6435479Z ^[[1m^[[92m  Downloaded^[[0m form_urlencoded v1.2.2
+bench	Run compare benches	2026-10-26T05:18:10.6443805Z ^[[1m^[[92m  Downloaded^[[0m crunchy v0.2.4
+bench	Run compare benches	2026-10-26T05:18:10.6452495Z ^[[1m^[[92m  Downloaded^[[0m cast v0.3.0
+bench	Run compare benches	2026-10-26T05:18:10.6464094Z ^[[1m^[[92m  Downloaded^[[0m futures-task v0.3.34
+bench	Run compare benches	2026-10-26T05:18:10.6476526Z ^[[1m^[[92m  Downloaded^[[0m funty v2.0.0
+bench	Run compare benches	2026-10-26T05:18:10.6484869Z ^[[1m^[[92m  Downloaded^[[0m frunk_proc_macros v0.1.5
+bench	Run compare benches	2026-10-26T05:18:10.6491825Z ^[[1m^[[92m  Downloaded^[[0m const-random-macro v0.1.16
+bench	Run compare benches	2026-10-26T05:18:10.6500468Z ^[[1m^[[92m  Downloaded^[[0m cfg-if v1.0.4
+bench	Run compare benches	2026-10-26T05:18:10.6513492Z ^[[1m^[[92m  Downloaded^[[0m block-buffer v0.12.1
+bench	Run compare benches	2026-10-26T05:18:10.6526109Z ^[[1m^[[92m  Downloaded^[[0m block-buffer v0.10.4
+bench	Run compare benches	2026-10-26T05:18:10.6537525Z ^[[1m^[[92m  Downloaded^[[0m frunk_derives v0.4.4
+bench	Run compare benches	2026-10-26T05:18:10.6545730Z ^[[1m^[[92m  Downloaded^[[0m frunk_core v0.4.4
+bench	Run compare benches	2026-10-26T05:18:10.6561111Z ^[[1m^[[92m  Downloaded^[[0m equivalent v1.0.2
+bench	Run compare benches	2026-10-26T05:18:10.6571582Z ^[[1m^[[92m  Downloaded^[[0m displaydoc v0.2.7
+bench	Run compare benches	2026-10-26T05:18:10.6594003Z ^[[1m^[[92m  Downloaded^[[0m digest v0.11.3
+bench	Run compare benches	2026-10-26T05:18:10.6617054Z ^[[1m^[[92m  Downloaded^[[0m derive_utils v0.15.1
+bench	Run compare benches	2026-10-26T05:18:10.6632815Z ^[[1m^[[92m  Downloaded^[[0m darling_core v0.20.11
+bench	Run compare benches	2026-10-26T05:18:10.6685770Z ^[[1m^[[92m  Downloaded^[[0m crypto-common v0.1.7
+bench	Run compare benches	2026-10-26T05:18:10.6695096Z ^[[1m^[[92m  Downloaded^[[0m crossbeam-utils v0.8.23
+bench	Run compare benches	2026-10-26T05:18:10.6722949Z ^[[1m^[[92m  Downloaded^[[0m crossbeam-channel v0.5.17
+bench	Run compare benches	2026-10-26T05:18:10.6763548Z ^[[1m^[[92m  Downloaded^[[0m arrow-select v58.4.0
+bench	Run compare benches	2026-10-26T05:18:10.6792215Z ^[[1m^[[92m  Downloaded^[[0m fallible-streaming-iterator v0.1.9
+bench	Run compare benches	2026-10-26T05:18:10.6801600Z ^[[1m^[[92m  Downloaded^[[0m crossbeam v0.8.5
+bench	Run compare benches	2026-10-26T05:18:10.6814217Z ^[[1m^[[92m  Downloaded^[[0m const-oid v0.10.2
+bench	Run compare benches	2026-10-26T05:18:10.6838356Z ^[[1m^[[92m  Downloaded^[[0m libloading v0.8.9
+bench	Run compare benches	2026-10-26T05:18:10.6862070Z ^[[1m^[[92m  Downloaded^[[0m duckdb v1.10505.0
+bench	Run compare benches	2026-10-26T05:18:10.6941231Z ^[[1m^[[92m  Downloaded^[[0m const-random v0.1.18
+bench	Run compare benches	2026-10-26T05:18:10.6952693Z ^[[1m^[[92m  Downloaded^[[0m arrow-array v58.4.0
+bench	Run compare benches	2026-10-26T05:18:10.7031921Z ^[[1m^[[92m  Downloaded^[[0m futures-sink v0.3.34
+bench	Run compare benches	2026-10-26T05:18:10.7040954Z ^[[1m^[[92m  Downloaded^[[0m foreign-types-shared v0.1.1
+bench	Run compare benches	2026-10-26T05:18:10.7048178Z ^[[1m^[[92m  Downloaded^[[0m darling v0.20.11
+bench	Run compare benches	2026-10-26T05:18:10.7098849Z ^[[1m^[[92m  Downloaded^[[0m crypto-common v0.2.2
+bench	Run compare benches	2026-10-26T05:18:10.7110726Z ^[[1m^[[92m  Downloaded^[[0m atoi v2.0.0
+bench	Run compare benches	2026-10-26T05:18:10.7125775Z ^[[1m^[[92m  Downloaded^[[0m arrow v58.4.0
+bench	Run compare benches	2026-10-26T05:18:10.7185280Z ^[[1m^[[92m  Downloaded^[[0m bufstream v0.1.4
+bench	Run compare benches	2026-10-26T05:18:10.7194326Z ^[[1m^[[92m  Downloaded^[[0m base64 v0.22.1
+bench	Run compare benches	2026-10-26T05:18:10.7232512Z ^[[1m^[[92m  Downloaded^[[0m arrow-schema v58.4.0
+bench	Run compare benches	2026-10-26T05:18:10.7260858Z ^[[1m^[[92m  Downloaded^[[0m aho-corasick v1.1.5
+bench	Run compare benches	2026-10-26T05:18:10.7314065Z ^[[1m^[[92m  Downloaded^[[0m libsqlite3-sys v0.30.1
+bench	Run compare benches	2026-10-26T05:18:10.7908488Z ^[[1m^[[92m  Downloaded^[[0m libduckdb-sys v1.10505.0
+bench	Run compare benches	2026-10-26T05:18:10.8955607Z ^[[1m^[[92m   Compiling^[[0m proc-macro2 v1.0.107
+bench	Run compare benches	2026-10-26T05:18:10.8956493Z ^[[1m^[[92m   Compiling^[[0m unicode-ident v1.0.24
+bench	Run compare benches	2026-10-26T05:18:10.8957024Z ^[[1m^[[92m   Compiling^[[0m quote v1.0.47
+bench	Run compare benches	2026-10-26T05:18:10.8957431Z ^[[1m^[[92m   Compiling^[[0m libc v0.2.189
+bench	Run compare benches	2026-10-26T05:18:10.9590715Z ^[[1m^[[92m   Compiling^[[0m cfg-if v1.0.4
+bench	Run compare benches	2026-10-26T05:18:11.0009023Z ^[[1m^[[92m   Compiling^[[0m shlex v2.0.1
+bench	Run compare benches	2026-10-26T05:18:11.0823256Z ^[[1m^[[92m   Compiling^[[0m find-msvc-tools v0.1.12
+bench	Run compare benches	2026-10-26T05:18:11.2713924Z ^[[1m^[[92m   Compiling^[[0m autocfg v1.5.1
+bench	Run compare benches	2026-10-26T05:18:11.8093592Z ^[[1m^[[92m   Compiling^[[0m syn v2.0.119
+bench	Run compare benches	2026-10-26T05:18:11.8401625Z ^[[1m^[[92m   Compiling^[[0m syn v3.0.5
+bench	Run compare benches	2026-10-26T05:18:12.1293680Z ^[[1m^[[92m   Compiling^[[0m jobserver v0.1.35
+bench	Run compare benches	2026-10-26T05:18:12.3414276Z ^[[1m^[[92m   Compiling^[[0m libm v0.2.16
+bench	Run compare benches	2026-10-26T05:18:12.5633513Z ^[[1m^[[92m   Compiling^[[0m cc v1.4.5
+bench	Run compare benches	2026-10-26T05:18:12.5833546Z ^[[1m^[[92m   Compiling^[[0m num-traits v0.2.19
+bench	Run compare benches	2026-10-26T05:18:14.2794104Z ^[[1m^[[92m   Compiling^[[0m pkg-config v0.3.34
+bench	Run compare benches	2026-10-26T05:18:15.0013622Z ^[[1m^[[92m   Compiling^[[0m version_check v0.9.5
+bench	Run compare benches	2026-10-26T05:18:15.2423583Z ^[[1m^[[92m   Compiling^[[0m zerocopy v0.8.57
+bench	Run compare benches	2026-10-26T05:18:15.4827189Z ^[[1m^[[92m   Compiling^[[0m bytes v1.12.1
+bench	Run compare benches	2026-10-26T05:18:15.7464014Z ^[[1m^[[92m   Compiling^[[0m vcpkg v0.2.15
+bench	Run compare benches	2026-10-26T05:18:16.3393534Z ^[[1m^[[92m   Compiling^[[0m typenum v1.20.1
+bench	Run compare benches	2026-10-26T05:18:16.3953718Z ^[[1m^[[92m   Compiling^[[0m bitflags v2.13.2
+bench	Run compare benches	2026-10-26T05:18:16.7414304Z ^[[1m^[[92m   Compiling^[[0m ring v0.17.14
+bench	Run compare benches	2026-10-26T05:18:16.8264326Z ^[[1m^[[92m   Compiling^[[0m smallvec v1.16.1
+bench	Run compare benches	2026-10-26T05:18:16.9193603Z ^[[1m^[[92m   Compiling^[[0m zerocopy-derive v0.8.57
+bench	Run compare benches	2026-10-26T05:18:17.0383643Z ^[[1m^[[92m   Compiling^[[0m synstructure v0.13.2
+bench	Run compare benches	2026-10-26T05:18:17.1034023Z ^[[1m^[[92m   Compiling^[[0m once_cell v1.21.4
+bench	Run compare benches	2026-10-26T05:18:17.2813544Z ^[[1m^[[92m   Compiling^[[0m memchr v2.8.3
+bench	Run compare benches	2026-10-26T05:18:17.2877694Z ^[[1m^[[92m   Compiling^[[0m crc32fast v1.5.1
+bench	Run compare benches	2026-10-26T05:18:17.4223670Z ^[[1m^[[92m   Compiling^[[0m num-integer v0.1.47
+bench	Run compare benches	2026-10-26T05:18:17.6063605Z ^[[1m^[[92m   Compiling^[[0m zerofrom-derive v0.1.7
+bench	Run compare benches	2026-10-26T05:18:17.9704542Z ^[[1m^[[92m   Compiling^[[0m zmij v1.0.23
+bench	Run compare benches	2026-10-26T05:18:18.1074307Z ^[[1m^[[92m   Compiling^[[0m getrandom v0.3.4
+bench	Run compare benches	2026-10-26T05:18:18.2998504Z ^[[1m^[[92m   Compiling^[[0m num-bigint v0.4.8
+bench	Run compare benches	2026-10-26T05:18:18.6464310Z ^[[1m^[[92m   Compiling^[[0m yoke-derive v0.8.2
+bench	Run compare benches	2026-10-26T05:18:18.8739604Z ^[[1m^[[92m   Compiling^[[0m zerofrom v0.1.8
+bench	Run compare benches	2026-10-26T05:18:19.0010207Z ^[[1m^[[92m   Compiling^[[0m ahash v0.8.12
+bench	Run compare benches	2026-10-26T05:18:19.0964096Z ^[[1m^[[92m   Compiling^[[0m stable_deref_trait v1.2.1
+bench	Run compare benches	2026-10-26T05:18:19.3053647Z ^[[1m^[[92m   Compiling^[[0m serde_derive v1.0.229
+bench	Run compare benches	2026-10-26T05:18:19.6448513Z ^[[1m^[[92m   Compiling^[[0m yoke v0.8.3
+bench	Run compare benches	2026-10-26T05:18:19.7906056Z ^[[1m^[[92m   Compiling^[[0m equivalent v1.0.2
+bench	Run compare benches	2026-10-26T05:18:20.4433649Z ^[[1m^[[92m   Compiling^[[0m serde_json v1.0.151
+bench	Run compare benches	2026-10-26T05:18:20.5293575Z ^[[1m^[[92m   Compiling^[[0m hashbrown v0.17.1
+bench	Run compare benches	2026-10-26T05:18:21.1235050Z ^[[1m^[[92m   Compiling^[[0m indexmap v2.14.2
+bench	Run compare benches	2026-10-26T05:18:21.7893649Z ^[[1m^[[92m   Compiling^[[0m zerovec-derive v0.11.6
+bench	Run compare benches	2026-10-26T05:18:22.4193853Z ^[[1m^[[92m   Compiling^[[0m getrandom v0.2.17
+bench	Run compare benches	2026-10-26T05:18:22.7798926Z ^[[1m^[[92m   Compiling^[[0m hybrid-array v0.4.15
+bench	Run compare benches	2026-10-26T05:18:22.8473981Z ^[[1m^[[92m   Compiling^[[0m zerovec v0.11.8
+bench	Run compare benches	2026-10-26T05:18:22.9892995Z ^[[1m^[[92m   Compiling^[[0m half v2.7.1
+bench	Run compare benches	2026-10-26T05:18:23.3665191Z ^[[1m^[[92m   Compiling^[[0m displaydoc v0.2.7
+bench	Run compare benches	2026-10-26T05:18:23.4241871Z ^[[1m^[[92m   Compiling^[[0m serde_core v1.0.229
+bench	Run compare benches	2026-10-26T05:18:23.5424056Z ^[[1m^[[92m   Compiling^[[0m arrow-buffer v58.4.0
+bench	Run compare benches	2026-10-26T05:18:23.5957012Z ^[[1m^[[92m   Compiling^[[0m arrow-schema v58.4.0
+bench	Run compare benches	2026-10-26T05:18:23.6124495Z ^[[1m^[[92m   Compiling^[[0m iana-time-zone v0.1.65
+bench	Run compare benches	2026-10-26T05:18:23.9483496Z ^[[1m^[[92m   Compiling^[[0m cmov v0.5.4
+bench	Run compare benches	2026-10-26T05:18:24.0913437Z ^[[1m^[[92m   Compiling^[[0m base64 v0.22.1
+bench	Run compare benches	2026-10-26T05:18:24.1384207Z ^[[1m^[[92m   Compiling^[[0m parking_lot_core v0.9.12
+bench	Run compare benches	2026-10-26T05:18:24.2597830Z ^[[1m^[[92m   Compiling^[[0m ctutils v0.4.2
+bench	Run compare benches	2026-10-26T05:18:24.4534124Z ^[[1m^[[92m   Compiling^[[0m arrow-data v58.4.0
+bench	Run compare benches	2026-10-26T05:18:24.5459996Z ^[[1m^[[92m   Compiling^[[0m chrono v0.4.45
+bench	Run compare benches	2026-10-26T05:18:28.7302772Z ^[[1m^[[92m   Compiling^[[0m block-buffer v0.12.1
+bench	Run compare benches	2026-10-26T05:18:28.7744397Z ^[[1m^[[92m   Compiling^[[0m crypto-common v0.2.2
+bench	Run compare benches	2026-10-26T05:18:28.8753711Z ^[[1m^[[92m   Compiling^[[0m aho-corasick v1.1.5
+bench	Run compare benches	2026-10-26T05:18:30.7601285Z ^[[1m^[[92m   Compiling^[[0m num-complex v0.4.6
+bench	Run compare benches	2026-10-26T05:18:31.2374724Z ^[[1m^[[92m   Compiling^[[0m generic-array v0.14.7
+bench	Run compare benches	2026-10-26T05:18:31.3165350Z ^[[1m^[[92m   Compiling^[[0m log v0.4.34
+bench	Run compare benches	2026-10-26T05:18:31.4354856Z ^[[1m^[[92m   Compiling^[[0m regex-syntax v0.8.11
+bench	Run compare benches	2026-10-26T05:18:31.5323818Z ^[[1m^[[92m   Compiling^[[0m serde v1.0.229
+bench	Run compare benches	2026-10-26T05:18:31.6516966Z ^[[1m^[[92m   Compiling^[[0m glob v0.3.4
+bench	Run compare benches	2026-10-26T05:18:31.9519604Z ^[[1m^[[92m   Compiling^[[0m scopeguard v1.2.0
+bench	Run compare benches	2026-10-26T05:18:32.0034509Z ^[[1m^[[92m   Compiling^[[0m zeroize v1.9.0
+bench	Run compare benches	2026-10-26T05:18:32.8737945Z ^[[1m^[[92m   Compiling^[[0m const-oid v0.10.2
+bench	Run compare benches	2026-10-26T05:18:33.1103710Z ^[[1m^[[92m   Compiling^[[0m digest v0.11.3
+bench	Run compare benches	2026-10-26T05:18:33.2681661Z ^[[1m^[[92m   Compiling^[[0m regex-automata v0.4.18
+bench	Run compare benches	2026-10-26T05:18:35.3284484Z ^[[1m^[[92m   Compiling^[[0m arrow-array v58.4.0
+bench	Run compare benches	2026-10-26T05:18:35.6753350Z ^[[1m^[[92m   Compiling^[[0m rustls-pki-types v1.15.1
+bench	Run compare benches	2026-10-26T05:18:36.0743718Z ^[[1m^[[92m   Compiling^[[0m lock_api v0.4.14
+bench	Run compare benches	2026-10-26T05:18:36.2813662Z ^[[1m^[[92m   Compiling^[[0m clang-sys v1.9.1
+bench	Run compare benches	2026-10-26T05:18:36.7503726Z ^[[1m^[[92m   Compiling^[[0m tinystr v0.8.4
+bench	Run compare benches	2026-10-26T05:18:37.0334191Z ^[[1m^[[92m   Compiling^[[0m writeable v0.6.4
+bench	Run compare benches	2026-10-26T05:18:37.2733735Z ^[[1m^[[92m   Compiling^[[0m pin-project-lite v0.2.17
+bench	Run compare benches	2026-10-26T05:18:37.3373867Z ^[[1m^[[92m   Compiling^[[0m crossbeam-utils v0.8.23
+bench	Run compare benches	2026-10-26T05:18:37.4973703Z ^[[1m^[[92m   Compiling^[[0m futures-core v0.3.34
+bench	Run compare benches	2026-10-26T05:18:37.5923663Z ^[[1m^[[92m   Compiling^[[0m httparse v1.10.1
+bench	Run compare benches	2026-10-26T05:18:37.7924166Z ^[[1m^[[92m   Compiling^[[0m untrusted v0.9.0
+bench	Run compare benches	2026-10-26T05:18:37.8503638Z ^[[1m^[[92m   Compiling^[[0m litemap v0.8.3
+bench	Run compare benches	2026-10-26T05:18:38.0253865Z ^[[1m^[[92m   Compiling^[[0m lexical-util v1.0.7
+bench	Run compare benches	2026-10-26T05:18:38.6443578Z ^[[1m^[[92m   Compiling^[[0m cpufeatures v0.3.1
+bench	Run compare benches	2026-10-26T05:18:38.6823540Z ^[[1m^[[92m   Compiling^[[0m winnow v1.0.4
+bench	Run compare benches	2026-10-26T05:18:39.8713701Z ^[[1m^[[92m   Compiling^[[0m simd-adler32 v0.3.10
+bench	Run compare benches	2026-10-26T05:18:39.9623637Z ^[[1m^[[92m   Compiling^[[0m rustix v1.1.4
+bench	Run compare benches	2026-10-26T05:18:40.0743855Z ^[[1m^[[92m   Compiling^[[0m itoa v1.0.18
+bench	Run compare benches	2026-10-26T05:18:40.1735044Z ^[[1m^[[92m   Compiling^[[0m futures-sink v0.3.34
+bench	Run compare benches	2026-10-26T05:18:40.2303975Z ^[[1m^[[92m   Compiling^[[0m toml_parser v1.1.3+spec-1.1.0
+bench	Run compare benches	2026-10-26T05:18:40.2652780Z ^[[1m^[[92m   Compiling^[[0m icu_locale_core v2.3.0
+bench	Run compare benches	2026-10-26T05:18:42.8993808Z ^[[1m^[[92m   Compiling^[[0m parking_lot v0.12.5
+bench	Run compare benches	2026-10-26T05:18:44.3053579Z ^[[1m^[[92m   Compiling^[[0m regex v1.13.1
+bench	Run compare benches	2026-10-26T05:18:44.5045841Z ^[[1m^[[92m   Compiling^[[0m zerotrie v0.2.5
+bench	Run compare benches	2026-10-26T05:18:45.0013723Z ^[[1m^[[92m   Compiling^[[0m potential_utf v0.1.6
+bench	Run compare benches	2026-10-26T05:18:45.8534249Z ^[[1m^[[92m   Compiling^[[0m tokio-macros v2.7.2
+bench	Run compare benches	2026-10-26T05:18:46.3503854Z ^[[1m^[[92m   Compiling^[[0m openssl-sys v0.9.117
+bench	Run compare benches	2026-10-26T05:18:46.6903932Z ^[[1m^[[92m   Compiling^[[0m zstd-sys v2.1.0+zstd.1.5.7
+bench	Run compare benches	2026-10-26T05:18:46.9024460Z ^[[1m^[[92m   Compiling^[[0m mio v1.2.3
+bench	Run compare benches	2026-10-26T05:18:46.9025510Z ^[[1m^[[92m   Compiling^[[0m socket2 v0.6.5
+bench	Run compare benches	2026-10-26T05:18:47.6603449Z ^[[1m^[[92m   Compiling^[[0m adler2 v2.0.1
+bench	Run compare benches	2026-10-26T05:18:47.7213661Z ^[[1m^[[92m   Compiling^[[0m icu_properties_data v2.3.0
+bench	Run compare benches	2026-10-26T05:18:47.8043945Z ^[[1m^[[92m   Compiling^[[0m rand_core v0.10.1
+bench	Run compare benches	2026-10-26T05:18:47.8933748Z ^[[1m^[[92m   Compiling^[[0m toml_datetime v1.1.1+spec-1.1.0
+bench	Run compare benches	2026-10-26T05:18:47.9043738Z ^[[1m^[[92m   Compiling^[[0m tinyvec_macros v0.1.1
+bench	Run compare benches	2026-10-26T05:18:47.9305930Z ^[[1m^[[92m   Compiling^[[0m getrandom v0.4.3
+bench	Run compare benches	2026-10-26T05:18:48.0394072Z ^[[1m^[[92m   Compiling^[[0m rustls v0.23.44
+bench	Run compare benches	2026-10-26T05:18:48.0533330Z ^[[1m^[[92m   Compiling^[[0m rustix v0.38.44
+bench	Run compare benches	2026-10-26T05:18:48.1093679Z ^[[1m^[[92m   Compiling^[[0m minimal-lexical v0.2.1
+bench	Run compare benches	2026-10-26T05:18:48.7883502Z ^[[1m^[[92m   Compiling^[[0m icu_normalizer_data v2.3.0
+bench	Run compare benches	2026-10-26T05:18:48.8683710Z ^[[1m^[[92m   Compiling^[[0m thiserror v1.0.69
+bench	Run compare benches	2026-10-26T05:18:49.0133683Z ^[[1m^[[92m   Compiling^[[0m utf8_iter v1.0.4
+bench	Run compare benches	2026-10-26T05:18:49.1053466Z ^[[1m^[[92m   Compiling^[[0m linux-raw-sys v0.12.1
+bench	Run compare benches	2026-10-26T05:18:51.1503518Z ^[[1m^[[92m   Compiling^[[0m icu_collections v2.3.0
+bench	Run compare benches	2026-10-26T05:18:51.8621251Z ^[[1m^[[92m   Compiling^[[0m http v1.5.0
+bench	Run compare benches	2026-10-26T05:18:52.6812990Z ^[[1m^[[92m   Compiling^[[0m nom v7.1.3
+bench	Run compare benches	2026-10-26T05:18:52.7634639Z ^[[1m^[[92m   Compiling^[[0m toml_edit v0.25.15+spec-1.1.0
+bench	Run compare benches	2026-10-26T05:18:53.5575011Z ^[[1m^[[92m   Compiling^[[0m tinyvec v1.13.2
+bench	Run compare benches	2026-10-26T05:18:54.0163650Z ^[[1m^[[92m   Compiling^[[0m miniz_oxide v0.9.1
+bench	Run compare benches	2026-10-26T05:18:54.2581720Z ^[[1m^[[92m   Compiling^[[0m tokio v1.53.1
+bench	Run compare benches	2026-10-26T05:18:56.6318412Z ^[[1m^[[92m   Compiling^[[0m icu_provider v2.3.1
+bench	Run compare benches	2026-10-26T05:18:57.7663820Z ^[[1m^[[92m   Compiling^[[0m rustls-webpki v0.103.15
+bench	Run compare benches	2026-10-26T05:18:58.6833701Z ^[[1m^[[92m   Compiling^[[0m libloading v0.8.9
+bench	Run compare benches	2026-10-26T05:18:58.8053643Z ^[[1m^[[92m   Compiling^[[0m ident_case v1.0.1
+bench	Run compare benches	2026-10-26T05:18:58.8643526Z ^[[1m^[[92m   Compiling^[[0m heck v0.5.0
+bench	Run compare benches	2026-10-26T05:18:59.0203715Z ^[[1m^[[92m   Compiling^[[0m linux-raw-sys v0.4.15
+bench	Run compare benches	2026-10-26T05:18:59.3093680Z ^[[1m^[[92m   Compiling^[[0m fnv v1.0.7
+bench	Run compare benches	2026-10-26T05:18:59.4973697Z ^[[1m^[[92m   Compiling^[[0m bumpalo v3.20.3
+bench	Run compare benches	2026-10-26T05:18:59.6854029Z ^[[1m^[[92m   Compiling^[[0m strsim v0.11.1
+bench	Run compare benches	2026-10-26T05:19:00.1104172Z ^[[1m^[[92m   Compiling^[[0m frunk_core v0.5.0
+bench	Run compare benches	2026-10-26T05:19:00.3293656Z ^[[1m^[[92m   Compiling^[[0m zlib-rs v0.6.7
+bench	Run compare benches	2026-10-26T05:19:01.7886608Z ^[[1m^[[92m   Compiling^[[0m subtle v2.6.1
+bench	Run compare benches	2026-10-26T05:19:01.8440035Z ^[[1m^[[92m   Compiling^[[0m bindgen v0.73.2
+bench	Run compare benches	2026-10-26T05:19:01.9166413Z ^[[1m^[[92m   Compiling^[[0m byteorder v1.5.0
+bench	Run compare benches	2026-10-26T05:19:02.0541552Z ^[[1m^[[92m   Compiling^[[0m base64 v0.23.1
+bench	Run compare benches	2026-10-26T05:19:02.2976994Z ^[[1m^[[92m   Compiling^[[0m ureq-proto v0.6.2
+bench	Run compare benches	2026-10-26T05:19:03.1024098Z ^[[1m^[[92m   Compiling^[[0m flate2 v1.1.10
+bench	Run compare benches	2026-10-26T05:19:03.4231372Z ^[[1m^[[92m   Compiling^[[0m frunk_proc_macro_helpers v0.1.5
+bench	Run compare benches	2026-10-26T05:19:07.1872787Z ^[[1m^[[92m   Compiling^[[0m darling_core v0.20.11
+bench	Run compare benches	2026-10-26T05:19:07.8973799Z ^[[1m^[[92m   Compiling^[[0m zopfli v0.8.3
+bench	Run compare benches	2026-10-26T05:19:09.8923675Z ^[[1m^[[92m   Compiling^[[0m tokio-util v0.7.19
+bench	Run compare benches	2026-10-26T05:19:10.5437023Z ^[[1m^[[92m   Compiling^[[0m cexpr v0.6.0
+bench	Run compare benches	2026-10-26T05:19:10.8094992Z ^[[1m^[[92m   Compiling^[[0m unicode-normalization v0.1.25
+bench	Run compare benches	2026-10-26T05:19:11.1873528Z ^[[1m^[[92m   Compiling^[[0m proc-macro-crate v3.5.0
+bench	Run compare benches	2026-10-26T05:19:11.6004291Z ^[[1m^[[92m   Compiling^[[0m xattr v1.6.1
+bench	Run compare benches	2026-10-26T05:19:11.8053512Z ^[[1m^[[92m   Compiling^[[0m chacha20 v0.10.2
+bench	Run compare benches	2026-10-26T05:19:11.9233943Z ^[[1m^[[92m   Compiling^[[0m block-buffer v0.10.4
+bench	Run compare benches	2026-10-26T05:19:12.0133841Z ^[[1m^[[92m   Compiling^[[0m crypto-common v0.1.7
+bench	Run compare benches	2026-10-26T05:19:12.0483574Z ^[[1m^[[92m   Compiling^[[0m sha2 v0.11.0
+bench	Run compare benches	2026-10-26T05:19:12.0943629Z ^[[1m^[[92m   Compiling^[[0m arrow-select v58.4.0
+bench	Run compare benches	2026-10-26T05:19:12.3230824Z ^[[1m^[[92m   Compiling^[[0m lexical-write-integer v1.0.6
+bench	Run compare benches	2026-10-26T05:19:12.5862801Z ^[[1m^[[92m   Compiling^[[0m lexical-parse-integer v1.0.6
+bench	Run compare benches	2026-10-26T05:19:12.9033511Z ^[[1m^[[92m   Compiling^[[0m webpki-roots v1.0.9
+bench	Run compare benches	2026-10-26T05:19:13.0373551Z ^[[1m^[[92m   Compiling^[[0m ppv-lite86 v0.2.21
+bench	Run compare benches	2026-10-26T05:19:13.5183414Z ^[[1m^[[92m   Compiling^[[0m rand_core v0.6.4
+bench	Run compare benches	2026-10-26T05:19:13.8043718Z ^[[1m^[[92m   Compiling^[[0m thiserror-impl v1.0.69
+bench	Run compare benches	2026-10-26T05:19:14.8213582Z ^[[1m^[[92m   Compiling^[[0m libz-sys v1.1.29
+bench	Run compare benches	2026-10-26T05:19:14.9382088Z ^[[1m^[[92m   Compiling^[[0m filetime v0.2.29
+bench	Run compare benches	2026-10-26T05:19:15.0023659Z ^[[1m^[[92m   Compiling^[[0m time-core v0.1.9
+bench	Run compare benches	2026-10-26T05:19:15.0524119Z ^[[1m^[[92m   Compiling^[[0m percent-encoding v2.3.2
+bench	Run compare benches	2026-10-26T05:19:15.1633856Z ^[[1m^[[92m   Compiling^[[0m foldhash v0.1.5
+bench	Run compare benches	2026-10-26T05:19:15.2543713Z ^[[1m^[[92m   Compiling^[[0m rustc-hash v2.1.3
+bench	Run compare benches	2026-10-26T05:19:15.3194045Z ^[[1m^[[92m   Compiling^[[0m crossbeam-epoch v0.9.21
+bench	Run compare benches	2026-10-26T05:19:15.4433586Z ^[[1m^[[92m   Compiling^[[0m radium v0.7.0
+bench	Run compare benches	2026-10-26T05:19:15.4803993Z ^[[1m^[[92m   Compiling^[[0m deranged v0.5.8
+bench	Run compare benches	2026-10-26T05:19:15.5590716Z ^[[1m^[[92m   Compiling^[[0m futures-task v0.3.34
+bench	Run compare benches	2026-10-26T05:19:15.6663714Z ^[[1m^[[92m   Compiling^[[0m unicode-bidi v0.3.18
+bench	Run compare benches	2026-10-26T05:19:16.7203537Z ^[[1m^[[92m   Compiling^[[0m powerfmt v0.2.0
+bench	Run compare benches	2026-10-26T05:19:16.9130532Z ^[[1m^[[92m   Compiling^[[0m allocator-api2 v0.2.21
+bench	Run compare benches	2026-10-26T05:19:16.9673717Z ^[[1m^[[92m   Compiling^[[0m unicode-properties v0.1.4
+bench	Run compare benches	2026-10-26T05:19:17.1573425Z ^[[1m^[[92m   Compiling^[[0m num-conv v0.2.2
+bench	Run compare benches	2026-10-26T05:19:17.2583881Z ^[[1m^[[92m   Compiling^[[0m utf8-zero v0.8.1
+bench	Run compare benches	2026-10-26T05:19:17.2640492Z ^[[1m^[[92m   Compiling^[[0m zstd-safe v7.3.0
+bench	Run compare benches	2026-10-26T05:19:17.3524070Z ^[[1m^[[92m   Compiling^[[0m slab v0.4.12
+bench	Run compare benches	2026-10-26T05:19:17.3577789Z ^[[1m^[[92m   Compiling^[[0m ureq v3.4.1
+bench	Run compare benches	2026-10-26T05:19:17.5013658Z ^[[1m^[[92m   Compiling^[[0m futures-util v0.3.34
+bench	Run compare benches	2026-10-26T05:19:18.9403746Z ^[[1m^[[92m   Compiling^[[0m time v0.3.55
+bench	Run compare benches	2026-10-26T05:19:19.9483920Z ^[[1m^[[92m   Compiling^[[0m hashbrown v0.15.5
+bench	Run compare benches	2026-10-26T05:19:20.6764068Z ^[[1m^[[92m   Compiling^[[0m stringprep v0.1.5
+bench	Run compare benches	2026-10-26T05:19:23.1626024Z ^[[1m^[[92m   Compiling^[[0m tar v0.4.46
+bench	Run compare benches	2026-10-26T05:19:25.0245478Z ^[[1m^[[92m   Compiling^[[0m rand_chacha v0.3.1
+bench	Run compare benches	2026-10-26T05:19:25.6953790Z ^[[1m^[[92m   Compiling^[[0m lexical-parse-float v1.0.6
+bench	Run compare benches	2026-10-26T05:19:26.1183788Z ^[[1m^[[92m   Compiling^[[0m lexical-write-float v1.0.6
+bench	Run compare benches	2026-10-26T05:19:26.3657587Z ^[[1m^[[92m   Compiling^[[0m digest v0.10.7
+bench	Run compare benches	2026-10-26T05:19:26.5343694Z ^[[1m^[[92m   Compiling^[[0m rand v0.10.2
+bench	Run compare benches	2026-10-26T05:19:27.3749810Z ^[[1m^[[92m   Compiling^[[0m icu_normalizer v2.3.0
+bench	Run compare benches	2026-10-26T05:19:27.7203670Z ^[[1m^[[92m   Compiling^[[0m icu_properties v2.3.0
+bench	Run compare benches	2026-10-26T05:19:28.9344077Z ^[[1m^[[92m   Compiling^[[0m darling_macro v0.20.11
+bench	Run compare benches	2026-10-26T05:19:29.1573716Z ^[[1m^[[92m   Compiling^[[0m crossterm v0.28.1
+bench	Run compare benches	2026-10-26T05:19:29.5873579Z ^[[1m^[[92m   Compiling^[[0m zip v6.0.0
+bench	Run compare benches	2026-10-26T05:19:30.5613608Z ^[[1m^[[92m   Compiling^[[0m md-5 v0.11.0
+bench	Run compare benches	2026-10-26T05:19:30.6103467Z ^[[1m^[[92m   Compiling^[[0m hmac v0.13.0
+bench	Run compare benches	2026-10-26T05:19:30.7243587Z ^[[1m^[[92m   Compiling^[[0m cmake v0.1.58
+bench	Run compare benches	2026-10-26T05:19:30.7844156Z ^[[1m^[[92m   Compiling^[[0m subprocess v0.2.15
+bench	Run compare benches	2026-10-26T05:19:31.0473573Z ^[[1m^[[92m   Compiling^[[0m proc-macro-error-attr2 v2.0.0
+bench	Run compare benches	2026-10-26T05:19:31.2533753Z ^[[1m^[[92m   Compiling^[[0m bigdecimal v0.4.10
+bench	Run compare benches	2026-10-26T05:19:31.3863752Z ^[[1m^[[92m   Compiling^[[0m cpufeatures v0.2.17
+bench	Run compare benches	2026-10-26T05:19:31.4233653Z ^[[1m^[[92m   Compiling^[[0m tap v1.0.1
+bench	Run compare benches	2026-10-26T05:19:31.4843873Z ^[[1m^[[92m   Compiling^[[0m fallible-iterator v0.2.0
+bench	Run compare benches	2026-10-26T05:19:31.5680097Z ^[[1m^[[92m   Compiling^[[0m crossbeam-deque v0.8.8
+bench	Run compare benches	2026-10-26T05:19:31.6843660Z ^[[1m^[[92m   Compiling^[[0m unicode-width v0.2.2
+bench	Run compare benches	2026-10-26T05:19:31.8713298Z ^[[1m^[[92m   Compiling^[[0m foreign-types-shared v0.1.1
+bench	Run compare benches	2026-10-26T05:19:31.8770744Z ^[[1m^[[92m   Compiling^[[0m rust_decimal v1.43.0
+bench	Run compare benches	2026-10-26T05:19:31.8998621Z ^[[1m^[[92m   Compiling^[[0m siphasher v1.0.3
+bench	Run compare benches	2026-10-26T05:19:32.0216181Z ^[[1m^[[92m   Compiling^[[0m openssl v0.10.81
+bench	Run compare benches	2026-10-26T05:19:32.0217412Z ^[[1m^[[92m   Compiling^[[0m unicode-segmentation v1.13.3
+bench	Run compare benches	2026-10-26T05:19:32.1394092Z ^[[1m^[[92m   Compiling^[[0m phf_shared v0.13.1
+bench	Run compare benches	2026-10-26T05:19:32.3814292Z ^[[1m^[[92m   Compiling^[[0m comfy-table v7.1.4
+bench	Run compare benches	2026-10-26T05:19:32.6193710Z ^[[1m^[[92m   Compiling^[[0m foreign-types v0.3.2
+bench	Run compare benches	2026-10-26T05:19:32.6683503Z ^[[1m^[[92m   Compiling^[[0m postgres-protocol v0.6.12
+bench	Run compare benches	2026-10-26T05:19:34.0283399Z ^[[1m^[[92m   Compiling^[[0m wyz v0.5.1
+bench	Run compare benches	2026-10-26T05:19:34.1943702Z ^[[1m^[[92m   Compiling^[[0m mysql_common v0.32.4
+bench	Run compare benches	2026-10-26T05:19:34.4016894Z ^[[1m^[[92m   Compiling^[[0m proc-macro-error2 v2.0.1
+bench	Run compare benches	2026-10-26T05:19:34.6013834Z ^[[1m^[[92m   Compiling^[[0m libduckdb-sys v1.10505.0
+bench	Run compare benches	2026-10-26T05:19:35.0863449Z ^[[1m^[[92m   Compiling^[[0m darling v0.20.11
+bench	Run compare benches	2026-10-26T05:19:35.9673766Z ^[[1m^[[92m   Compiling^[[0m idna_adapter v1.2.2
+bench	Run compare benches	2026-10-26T05:19:36.0393682Z ^[[1m^[[92m   Compiling^[[0m lexical-core v1.0.6
+bench	Run compare benches	2026-10-26T05:19:36.1233587Z ^[[1m^[[92m   Compiling^[[0m rand v0.8.8
+bench	Run compare benches	2026-10-26T05:19:36.9643849Z ^[[1m^[[92m   Compiling^[[0m arrow-ord v58.4.0
+bench	Run compare benches	2026-10-26T05:19:39.9239769Z ^[[1m^[[92m   Compiling^[[0m frunk_derives v0.4.4
+bench	Run compare benches	2026-10-26T05:19:40.2483777Z ^[[1m^[[92m   Compiling^[[0m frunk_proc_macros v0.1.5
+bench	Run compare benches	2026-10-26T05:19:40.8849580Z ^[[1m^[[92m   Compiling^[[0m openssl-macros v0.1.1
+bench	Run compare benches	2026-10-26T05:19:41.0438662Z ^[[1m^[[92m   Compiling^[[0m libsqlite3-sys v0.30.1
+bench	Run compare benches	2026-10-26T05:19:41.2414016Z ^[[1m^[[92m   Compiling^[[0m rmp v0.8.15
+bench	Run compare benches	2026-10-26T05:19:41.6073594Z ^[[1m^[[92m   Compiling^[[0m atoi v2.0.0
+bench	Run compare benches	2026-10-26T05:19:41.6854968Z ^[[1m^[[92m   Compiling^[[0m termcolor v1.4.1
+bench	Run compare benches	2026-10-26T05:19:41.9038075Z ^[[1m^[[92m   Compiling^[[0m funty v2.0.0
+bench	Run compare benches	2026-10-26T05:19:42.8224089Z ^[[1m^[[92m   Compiling^[[0m arrayvec v0.7.8
+bench	Run compare benches	2026-10-26T05:19:43.0214757Z ^[[1m^[[92m   Compiling^[[0m ryu v1.0.23
+bench	Run compare benches	2026-10-26T05:19:43.2873651Z ^[[1m^[[92m   Compiling^[[0m thiserror v2.0.20
+bench	Run compare benches	2026-10-26T05:19:43.5593964Z ^[[1m^[[92m   Compiling^[[0m frunk_core v0.4.4
+bench	Run compare benches	2026-10-26T05:19:45.3573337Z ^[[1m^[[92m   Compiling^[[0m native-tls v0.2.18
+bench	Run compare benches	2026-10-26T05:19:45.4583625Z ^[[1m^[[92m   Compiling^[[0m frunk v0.4.4
+bench	Run compare benches	2026-10-26T05:19:54.8163431Z ^[[1m^[[92m   Compiling^[[0m zstd v0.13.3
+bench	Run compare benches	2026-10-26T05:19:55.2243730Z ^[[1m^[[92m   Compiling^[[0m arrow-cast v58.4.0
+bench	Run compare benches	2026-10-26T05:19:59.2553679Z ^[[1m^[[92m   Compiling^[[0m bitvec v1.1.1
+bench	Run compare benches	2026-10-26T05:20:02.0364101Z ^[[1m^[[92m   Compiling^[[0m mysql-common-derive v0.31.2
+bench	Run compare benches	2026-10-26T05:20:03.1193820Z ^[[1m^[[92m   Compiling^[[0m rmp-serde v1.3.1
+bench	Run compare benches	2026-10-26T05:20:15.5544330Z ^[[1m^[[92m   Compiling^[[0m idna v1.1.0
+bench	Run compare benches	2026-10-26T05:20:58.3793731Z ^[[1m^[[92m   Compiling^[[0m postgres-types v0.2.14
+bench	Run compare benches	2026-10-26T05:20:59.2953511Z ^[[1m^[[92m   Compiling^[[0m phf v0.13.1
+bench	Run compare benches	2026-10-26T05:20:59.4183488Z ^[[1m^[[92m   Compiling^[[0m sha2 v0.10.9
+bench	Run compare benches	2026-10-26T05:21:01.1831445Z ^[[1m^[[92m   Compiling^[[0m sha1 v0.10.7
+bench	Run compare benches	2026-10-26T05:21:01.6113677Z ^[[1m^[[92m   Compiling^[[0m form_urlencoded v1.2.2
+bench	Run compare benches	2026-10-26T05:21:01.8054407Z ^[[1m^[[92m   Compiling^[[0m arrow-string v58.4.0
+bench	Run compare benches	2026-10-26T05:21:09.6774097Z ^[[1m^[[92m   Compiling^[[0m tokio-stream v0.1.19
+bench	Run compare benches	2026-10-26T05:21:10.0843635Z ^[[1m^[[92m   Compiling^[[0m strum_macros v0.27.2
+bench	Run compare benches	2026-10-26T05:21:11.8034335Z ^[[1m^[[92m   Compiling^[[0m crossbeam-channel v0.5.17
+bench	Run compare benches	2026-10-26T05:21:12.0393704Z ^[[1m^[[92m   Compiling^[[0m crossbeam-queue v0.3.14
+bench	Run compare benches	2026-10-26T05:21:12.1653831Z ^[[1m^[[92m   Compiling^[[0m rustls-pemfile v2.2.0
+bench	Run compare benches	2026-10-26T05:21:12.3743730Z ^[[1m^[[92m   Compiling^[[0m futures-channel v0.3.34
+bench	Run compare benches	2026-10-26T05:21:12.5094127Z ^[[1m^[[92m   Compiling^[[0m arrow-arith v58.4.0
+bench	Run compare benches	2026-10-26T05:21:12.5713959Z ^[[1m^[[92m   Compiling^[[0m arrow-row v58.4.0
+bench	Run compare benches	2026-10-26T05:21:21.3943555Z ^[[1m^[[92m   Compiling^[[0m pem v3.0.6
+bench	Run compare benches	2026-10-26T05:21:22.0779911Z ^[[1m^[[92m   Compiling^[[0m hashbrown v0.14.5
+bench	Run compare benches	2026-10-26T05:21:22.7384342Z ^[[1m^[[92m   Compiling^[[0m lin-derive v0.4.0 (/home/runner/work/lin/lin/lin-derive)
+bench	Run compare benches	2026-10-26T05:21:22.9983695Z ^[[1m^[[92m   Compiling^[[0m thiserror-impl v2.0.20
+bench	Run compare benches	2026-10-26T05:21:24.1195845Z ^[[1m^[[92m   Compiling^[[0m async-trait v0.1.92
+bench	Run compare benches	2026-10-26T05:21:24.8443585Z ^[[1m^[[92m   Compiling^[[0m btoi v0.4.3
+bench	Run compare benches	2026-10-26T05:21:24.9184039Z ^[[1m^[[92m   Compiling^[[0m derive_utils v0.15.1
+bench	Run compare benches	2026-10-26T05:21:25.1343921Z ^[[1m^[[92m   Compiling^[[0m memmap2 v0.9.11
+bench	Run compare benches	2026-10-26T05:21:25.3883529Z ^[[1m^[[92m   Compiling^[[0m whoami v2.1.3
+bench	Run compare benches	2026-10-26T05:21:26.2800931Z ^[[1m^[[92m   Compiling^[[0m saturating v0.1.0
+bench	Run compare benches	2026-10-26T05:21:26.4373686Z ^[[1m^[[92m   Compiling^[[0m lazy_static v1.5.0
+bench	Run compare benches	2026-10-26T05:21:26.4773782Z ^[[1m^[[92m   Compiling^[[0m uuid v1.26.1
+bench	Run compare benches	2026-10-26T05:21:26.4847485Z ^[[1m^[[92m   Compiling^[[0m openssl-probe v0.2.1
+bench	Run compare benches	2026-10-26T05:21:26.6673590Z ^[[1m^[[92m   Compiling^[[0m static_assertions v1.1.0
+bench	Run compare benches	2026-10-26T05:21:26.7063608Z ^[[1m^[[92m   Compiling^[[0m base64 v0.21.7
+bench	Run compare benches	2026-10-26T05:21:26.9953811Z ^[[1m^[[92m   Compiling^[[0m fallible-streaming-iterator v0.1.9
+bench	Run compare benches	2026-10-26T05:21:27.0976126Z ^[[1m^[[92m   Compiling^[[0m mysql v25.0.1
+bench	Run compare benches	2026-10-26T05:21:27.1849214Z ^[[1m^[[92m   Compiling^[[0m fallible-iterator v0.3.0
+bench	Run compare benches	2026-10-26T05:21:27.5368656Z ^[[1m^[[92m   Compiling^[[0m twox-hash v1.6.3
+bench	Run compare benches	2026-10-26T05:21:28.5223900Z ^[[1m^[[92m   Compiling^[[0m lin v0.4.0 (/home/runner/work/lin/lin)
+bench	Run compare benches	2026-10-26T05:21:44.3011229Z ^[[1m^[[92m   Compiling^[[0m tokio-postgres v0.7.18
+bench	Run compare benches	2026-10-26T05:21:50.0683987Z ^[[1m^[[92m   Compiling^[[0m io-enum v1.2.1
+bench	Run compare benches	2026-10-26T05:21:50.4344038Z ^[[1m^[[92m   Compiling^[[0m hashlink v0.9.1
+bench	Run compare benches	2026-10-26T05:21:50.7082963Z ^[[1m^[[92m   Compiling^[[0m arrow v58.4.0
+bench	Run compare benches	2026-10-26T05:21:50.8514169Z ^[[1m^[[92m   Compiling^[[0m crossbeam v0.8.5
+bench	Run compare benches	2026-10-26T05:21:50.8913508Z ^[[1m^[[92m   Compiling^[[0m strum v0.27.2
+bench	Run compare benches	2026-10-26T05:21:51.1573694Z ^[[1m^[[92m   Compiling^[[0m url v2.5.8
+bench	Run compare benches	2026-10-26T05:21:52.6991130Z ^[[1m^[[92m   Compiling^[[0m yasna v0.5.2
+bench	Run compare benches	2026-10-26T05:21:54.0033617Z ^[[1m^[[92m   Compiling^[[0m hashlink v0.10.0
+bench	Run compare benches	2026-10-26T05:21:54.2631372Z ^[[1m^[[92m   Compiling^[[0m lru v0.12.5
+bench	Run compare benches	2026-10-26T05:21:54.3104384Z ^[[1m^[[92m   Compiling^[[0m airbug-macros v0.6.0 (https://github.com/themoretheless/airbug?branch=release#75b1321b)
+bench	Run compare benches	2026-10-26T05:21:54.3944337Z ^[[1m^[[92m   Compiling^[[0m airbug-bench-macros v0.6.0 (https://github.com/themoretheless/airbug?branch=release#75b1321b)
+bench	Run compare benches	2026-10-26T05:21:54.5723998Z ^[[1m^[[92m   Compiling^[[0m socket2 v0.5.10
+bench	Run compare benches	2026-10-26T05:21:54.9673953Z ^[[1m^[[92m   Compiling^[[0m bufstream v0.1.4
+bench	Run compare benches	2026-10-26T05:21:55.0373524Z ^[[1m^[[92m   Compiling^[[0m cast v0.3.0
+bench	Run compare benches	2026-10-26T05:21:55.3294807Z ^[[1m^[[92m   Compiling^[[0m airbug v0.6.0 (https://github.com/themoretheless/airbug?branch=release#75b1321b)
+bench	Run compare benches	2026-10-26T05:21:57.6064635Z ^[[1m^[[92m   Compiling^[[0m airbug-bench v0.6.0 (https://github.com/themoretheless/airbug?branch=release#75b1321b)
+bench	Run compare benches	2026-10-26T05:22:01.3824108Z ^[[1m^[[92m   Compiling^[[0m rcgen v0.13.2
+bench	Run compare benches	2026-10-26T05:22:08.5863633Z ^[[1m^[[92m   Compiling^[[0m rusqlite v0.32.1
+bench	Run compare benches	2026-10-26T05:22:11.0233777Z ^[[1m^[[92m   Compiling^[[0m postgres v0.19.14
+bench	Run compare benches	2026-10-26T05:32:39.2435651Z ^[[1m^[[92m   Compiling^[[0m duckdb v1.10505.0
+bench	Run compare benches	2026-10-26T05:32:50.1513304Z ^[[1m^[[92m    Finished^[[0m `bench` profile [optimized] target(s) in 14m 42s
+bench	Run compare benches	2026-10-26T05:32:50.2341357Z ^[[1m^[[92m     Running^[[0m benches/compare.rs (target/release/deps/compare-0f624f91cce63f72)
+bench	Run compare benches	2026-10-26T05:32:50.2404559Z skip postgres: no reachable server
+bench	Run compare benches	2026-10-26T05:32:50.2407079Z   tried: ***127.0.0.1:55432/lin (error connecting to server); postgresql://postgres@127.0.0.1:5432/postgres (error connecting to server)
+bench	Run compare benches	2026-10-26T05:32:50.2408106Z   set LIN_BENCH_PG_URL or:
+bench	Run compare benches	2026-10-26T05:32:50.2408639Z   docker compose -f docker-compose.bench.yml up -d postgres
+bench	Run compare benches	2026-10-26T05:32:50.2409480Z   # brew postgresql@17 via Sources/ppduster macos-stack-postgres; start service for :5432
+bench	Run compare benches	2026-10-26T05:32:50.2410219Z skip mysql: no reachable server
+bench	Run compare benches	2026-10-26T05:32:50.2412062Z   tried: ***127.0.0.1:53306/lin (DriverError { Could not connect to address `127.0.0.1:53306': Connection refused (os error 111) }); ***127.0.0.1:33306/dbill_smoke (DriverError { Could not connect to address `127.0.0.1:33306': Connection refused (os error 111) })
+bench	Run compare benches	2026-10-26T05:32:50.2413934Z   set LIN_BENCH_MYSQL_URL or:
+bench	Run compare benches	2026-10-26T05:32:50.2414502Z   docker compose -f docker-compose.bench.yml up -d mysql
+bench	Run compare benches	2026-10-26T05:32:50.2415380Z   # or sibling dbill: docker compose -f ../dbill/docker-compose.yml up -d mysql
+bench	Run compare benches	2026-10-26T05:32:50.2416263Z lin compare: N=10000 warm reads (fixture), bulk insert (schema outside timing)
+bench	Run compare benches	2026-10-26T05:32:50.2417431Z engines: Lin | SQLite(rusqlite bundled) | DuckDB(bundled) | HashMap(point get only) | Postgres(skipped) | MySQL(skipped)
+bench	Run compare benches	2026-10-26T05:32:50.2418380Z airbug dash: http://127.0.0.1:8790/
+bench	Run compare benches	2026-10-26T05:32:50.2419041Z Lin reads: prepare once / run many; filters use count (fair vs SQL COUNT(*));
+bench	Run compare benches	2026-10-26T05:32:50.2419867Z substring: Lin `title ~ "wal" | count` vs SQL LIKE '%wal%' COUNT(*);
+bench	Run compare benches	2026-10-26T05:32:50.2420691Z materialize: Lin `wing==rag | {id,title} | take all` vs SQL SELECT id,title;
+bench	Run compare benches	2026-10-26T05:32:50.2421823Z join: 10000 orders ⋈ 1000 users (Lin run_batch SoA / cursor vs SQL INNER JOIN);
+bench	Run compare benches	2026-10-26T05:32:50.2422991Z append_log: Lin `append facts` vs SQL INSERT INTO logs (append-only shape)
+bench	Run compare benches	2026-10-26T05:32:50.2423796Z airbug dash: http://127.0.0.1:8790/#/bench
+bench	Run compare benches	2026-10-26T05:32:50.2425617Z bench: compare/point_get/lin — validating and calibrating
+bench	Run compare benches	2026-10-26T05:32:50.3451757Z bench: compare/point_get/lin — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:32:50.3578917Z bench: compare/point_get/sqlite — validating and calibrating
+bench	Run compare benches	2026-10-26T05:32:50.4192780Z bench: compare/point_get/sqlite — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:32:50.4304848Z bench: compare/point_get/duckdb — validating and calibrating
+bench	Run compare benches	2026-10-26T05:32:54.1230862Z bench: compare/point_get/duckdb — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:32:54.1333242Z bench: compare/point_get/hashmap — validating and calibrating
+bench	Run compare benches	2026-10-26T05:32:54.1516282Z bench: compare/point_get/hashmap — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:32:54.1613440Z bench: compare/filter_eq/lin — validating and calibrating
+bench	Run compare benches	2026-10-26T05:32:54.1738962Z bench: compare/filter_eq/lin — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:32:54.1813573Z bench: compare/filter_eq/sqlite — validating and calibrating
+bench	Run compare benches	2026-10-26T05:32:54.1947264Z bench: compare/filter_eq/sqlite — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:32:54.2045757Z bench: compare/filter_eq/duckdb — validating and calibrating
+bench	Run compare benches	2026-10-26T05:32:54.2177167Z bench: compare/filter_eq/duckdb — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:32:54.2272088Z bench: compare/filter_range/lin — validating and calibrating
+bench	Run compare benches	2026-10-26T05:32:54.2384950Z bench: compare/filter_range/lin — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:32:54.2476796Z bench: compare/filter_range/sqlite — validating and calibrating
+bench	Run compare benches	2026-10-26T05:32:54.2609001Z bench: compare/filter_range/sqlite — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:32:54.2708193Z bench: compare/filter_range/duckdb — validating and calibrating
+bench	Run compare benches	2026-10-26T05:32:54.2831453Z bench: compare/filter_range/duckdb — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:32:54.2912207Z bench: compare/text_substr/lin — validating and calibrating
+bench	Run compare benches	2026-10-26T05:32:54.3050801Z bench: compare/text_substr/lin — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:32:54.3172683Z bench: compare/fts_lex_selective/lin — validating and calibrating
+bench	Run compare benches	2026-10-26T05:32:54.3312576Z bench: compare/fts_lex_selective/lin — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:32:54.3424701Z bench: compare/fts_lex_common/lin — validating and calibrating
+bench	Run compare benches	2026-10-26T05:32:54.3550418Z bench: compare/fts_lex_common/lin — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:32:54.3633627Z bench: compare/fts_lex_miss/lin — validating and calibrating
+bench	Run compare benches	2026-10-26T05:32:54.3774269Z bench: compare/fts_lex_miss/lin — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:32:54.3887593Z bench: compare/fts_hybrid_common/lin — validating and calibrating
+bench	Run compare benches	2026-10-26T05:32:54.4113986Z bench: compare/fts_hybrid_common/lin — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:32:54.4712003Z bench: compare/text_substr/sqlite — validating and calibrating
+bench	Run compare benches	2026-10-26T05:32:54.4837834Z bench: compare/text_substr/sqlite — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:32:54.4933388Z bench: compare/text_substr/duckdb — validating and calibrating
+bench	Run compare benches	2026-10-26T05:32:54.5079839Z bench: compare/text_substr/duckdb — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:32:54.5207907Z bench: compare/materialize/lin — validating and calibrating
+bench	Run compare benches	2026-10-26T05:32:54.5335660Z bench: compare/materialize/lin — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:32:54.5417126Z bench: compare/materialize/sqlite — validating and calibrating
+bench	Run compare benches	2026-10-26T05:32:54.5540134Z bench: compare/materialize/sqlite — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:32:54.5662599Z bench: compare/materialize/duckdb — validating and calibrating
+bench	Run compare benches	2026-10-26T05:32:54.5791892Z bench: compare/materialize/duckdb — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:32:54.5896291Z bench: compare/join_inner/lin — validating and calibrating
+bench	Run compare benches	2026-10-26T05:32:54.6494460Z bench: compare/join_inner/lin — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:32:54.6578209Z bench: compare/join_inner/lin_cursor — validating and calibrating
+bench	Run compare benches	2026-10-26T05:32:54.6699518Z bench: compare/join_inner/lin_cursor — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:32:54.6860799Z bench: compare/join_inner/lin_cursor_projected — validating and calibrating
+bench	Run compare benches	2026-10-26T05:32:54.7001025Z bench: compare/join_inner/lin_cursor_projected — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:32:54.7133821Z bench: compare/join_phase/lin_cursor_open — validating and calibrating
+bench	Run compare benches	2026-10-26T05:32:54.7262188Z bench: compare/join_phase/lin_cursor_open — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:32:54.7365092Z bench: compare/join_phase/lin_cursor_scan_project — validating and calibrating
+bench	Run compare benches	2026-10-26T05:32:54.7516235Z bench: compare/join_phase/lin_cursor_scan_project — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:32:54.7716299Z bench: compare/join_phase/lin_cursor_scan_projected_row — validating and calibrating
+bench	Run compare benches	2026-10-26T05:32:54.7840348Z bench: compare/join_phase/lin_cursor_scan_projected_row — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:32:54.7950660Z bench: compare/join_inner/sqlite — validating and calibrating
+bench	Run compare benches	2026-10-26T05:32:54.8463217Z bench: compare/join_inner/sqlite — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:32:54.8803858Z bench: compare/join_inner/duckdb — validating and calibrating
+bench	Run compare benches	2026-10-26T05:32:58.0660739Z bench: compare/join_inner/duckdb — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:32:58.0890552Z bench: compare/join_filter/lin — validating and calibrating
+bench	Run compare benches	2026-10-26T05:32:58.1018688Z bench: compare/join_filter/lin — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:32:58.1110772Z bench: compare/join_filter/lin_cursor — validating and calibrating
+bench	Run compare benches	2026-10-26T05:32:58.1223010Z bench: compare/join_filter/lin_cursor — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:32:58.1305271Z bench: compare/join_filter/sqlite — validating and calibrating
+bench	Run compare benches	2026-10-26T05:32:58.1451656Z bench: compare/join_filter/sqlite — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:32:58.1649332Z bench: compare/join_filter/duckdb — validating and calibrating
+bench	Run compare benches	2026-10-26T05:32:58.1780223Z bench: compare/join_filter/duckdb — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:32:58.1947914Z bench: compare/agg_sum/lin — validating and calibrating
+bench	Run compare benches	2026-10-26T05:32:58.2082795Z bench: compare/agg_sum/lin — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:32:58.2181578Z bench: compare/agg_sum/sqlite — validating and calibrating
+bench	Run compare benches	2026-10-26T05:32:58.2315860Z bench: compare/agg_sum/sqlite — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:32:58.2439257Z bench: compare/agg_sum/duckdb — validating and calibrating
+bench	Run compare benches	2026-10-26T05:32:58.2568607Z bench: compare/agg_sum/duckdb — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:32:58.2630899Z bench: compare/agg_sum_by/lin — validating and calibrating
+bench	Run compare benches	2026-10-26T05:32:58.2757720Z bench: compare/agg_sum_by/lin — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:32:58.2828054Z bench: compare/agg_sum_by/sqlite — validating and calibrating
+bench	Run compare benches	2026-10-26T05:32:58.2968961Z bench: compare/agg_sum_by/sqlite — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:32:58.3155346Z bench: compare/agg_sum_by/duckdb — validating and calibrating
+bench	Run compare benches	2026-10-26T05:32:58.3276680Z bench: compare/agg_sum_by/duckdb — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:32:58.3358965Z bench: compare/agg_count_by/lin — validating and calibrating
+bench	Run compare benches	2026-10-26T05:32:58.3500293Z bench: compare/agg_count_by/lin — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:32:58.3607087Z bench: compare/agg_count_by/sqlite — validating and calibrating
+bench	Run compare benches	2026-10-26T05:32:58.3763013Z bench: compare/agg_count_by/sqlite — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:32:58.3923038Z bench: compare/agg_count_by/duckdb — validating and calibrating
+bench	Run compare benches	2026-10-26T05:32:58.4043196Z bench: compare/agg_count_by/duckdb — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:32:58.4106736Z bench: compare/insert_bulk_1k/lin — validating and calibrating
+bench	Run compare benches	2026-10-26T05:32:58.4383851Z bench: compare/insert_bulk_1k/lin — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:32:58.4937677Z bench: compare/insert_bulk_1k/sqlite — validating and calibrating
+bench	Run compare benches	2026-10-26T05:32:58.5097871Z bench: compare/insert_bulk_1k/sqlite — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:32:58.5297924Z bench: compare/insert_bulk_1k/duckdb — validating and calibrating
+bench	Run compare benches	2026-10-26T05:32:59.2667008Z bench: compare/insert_bulk_1k/duckdb — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:33:02.3252954Z bench: compare/insert_bulk_10k/lin — validating and calibrating
+bench	Run compare benches	2026-10-26T05:33:02.5765264Z bench: compare/insert_bulk_10k/lin — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:33:03.2868507Z bench: compare/insert_bulk_10k/sqlite — validating and calibrating
+bench	Run compare benches	2026-10-26T05:33:03.3684362Z bench: compare/insert_bulk_10k/sqlite — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:33:03.5876980Z bench: compare/insert_bulk_10k/duckdb — validating and calibrating
+bench	Run compare benches	2026-10-26T05:33:11.1102920Z bench: compare/insert_bulk_10k/duckdb — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:33:40.9453683Z bench: compare/insert_native_1k/duckdb_appender — validating and calibrating
+bench	Run compare benches	2026-10-26T05:33:40.9831954Z bench: compare/insert_native_1k/duckdb_appender — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:33:41.0870754Z bench: compare/insert_native_10k/duckdb_appender — validating and calibrating
+bench	Run compare benches	2026-10-26T05:33:41.2067932Z bench: compare/insert_native_10k/duckdb_appender — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:33:41.5336723Z bench: compare/insert_phase_10k/lin_full — validating and calibrating
+bench	Run compare benches	2026-10-26T05:33:41.6912825Z bench: compare/insert_phase_10k/lin_full — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:33:42.3163645Z bench: compare/insert_phase_10k/lin_no_embed — validating and calibrating
+bench	Run compare benches	2026-10-26T05:33:42.4241063Z bench: compare/insert_phase_10k/lin_no_embed — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:33:42.8498955Z bench: compare/insert_phase_10k/lin_no_embed_no_scalar_index — validating and calibrating
+bench	Run compare benches	2026-10-26T05:33:42.9485716Z bench: compare/insert_phase_10k/lin_no_embed_no_scalar_index — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:33:43.3428851Z bench: compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts — validating and calibrating
+bench	Run compare benches	2026-10-26T05:33:43.4355838Z bench: compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:33:43.8058677Z bench: compare/append_log_1k/lin — validating and calibrating
+bench	Run compare benches	2026-10-26T05:33:43.8367461Z bench: compare/append_log_1k/lin — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:33:43.9010332Z bench: compare/append_log_1k/sqlite — validating and calibrating
+bench	Run compare benches	2026-10-26T05:33:43.9150615Z bench: compare/append_log_1k/sqlite — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:33:43.9297852Z bench: compare/append_log_1k/duckdb — validating and calibrating
+bench	Run compare benches	2026-10-26T05:33:43.9616320Z bench: compare/append_log_1k/duckdb — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:33:44.0305496Z bench: compare/append_log_10k/lin — validating and calibrating
+bench	Run compare benches	2026-10-26T05:33:44.0751496Z bench: compare/append_log_10k/lin — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:33:44.2368170Z bench: compare/append_log_10k/sqlite — validating and calibrating
+bench	Run compare benches	2026-10-26T05:33:44.2668810Z bench: compare/append_log_10k/sqlite — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:33:44.3471170Z bench: compare/append_log_10k/duckdb — validating and calibrating
+bench	Run compare benches	2026-10-26T05:33:44.3887257Z bench: compare/append_log_10k/duckdb — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:33:44.5411320Z bench: compare/group_commit_16/lin_sequential_full — validating and calibrating
+bench	Run compare benches	2026-10-26T05:33:44.5597067Z bench: compare/group_commit_16/lin_sequential_full — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:33:44.5958982Z bench: compare/group_commit_16/lin_grouped_full — validating and calibrating
+bench	Run compare benches	2026-10-26T05:33:44.6177275Z bench: compare/group_commit_16/lin_grouped_full — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:33:44.6682083Z bench: compare/reopen_phase_5k/rebuild_row_maps — validating and calibrating
+bench	Run compare benches	2026-10-26T05:33:44.7115774Z bench: compare/reopen_phase_5k/rebuild_row_maps — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:33:44.7243423Z bench: compare/reopen_phase_5k/rebuild_scalar_indexes — validating and calibrating
+bench	Run compare benches	2026-10-26T05:33:44.7360281Z bench: compare/reopen_phase_5k/rebuild_scalar_indexes — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:33:44.7446287Z bench: compare/reopen_phase_5k/rebuild_fts — validating and calibrating
+bench	Run compare benches	2026-10-26T05:33:44.7578714Z bench: compare/reopen_phase_5k/rebuild_fts — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:33:44.7713207Z bench: compare/plan_dnf_6/lin — validating and calibrating
+bench	Run compare benches	2026-10-26T05:33:44.7856430Z bench: compare/plan_dnf_6/lin — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:33:44.7985173Z bench: compare/plan_dnf_10/lin — validating and calibrating
+bench	Run compare benches	2026-10-26T05:33:44.8121191Z bench: compare/plan_dnf_10/lin — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:33:44.8265450Z bench: compare/plan_dnf_14/lin — validating and calibrating
+bench	Run compare benches	2026-10-26T05:33:44.8380347Z bench: compare/plan_dnf_14/lin — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:33:44.8456978Z bench: compare/graph_depth_1/lin — validating and calibrating
+bench	Run compare benches	2026-10-26T05:33:44.9068331Z bench: compare/graph_depth_1/lin — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:33:44.9150433Z bench: compare/graph_depth_2/lin — validating and calibrating
+bench	Run compare benches	2026-10-26T05:33:44.9285077Z bench: compare/graph_depth_2/lin — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:33:44.9384298Z bench: compare/graph_depth_3/lin — validating and calibrating
+bench	Run compare benches	2026-10-26T05:33:44.9516188Z bench: compare/graph_depth_3/lin — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:33:44.9634716Z bench: compare/reader_snapshot/lin — validating and calibrating
+bench	Run compare benches	2026-10-26T05:33:45.0793089Z bench: compare/reader_snapshot/lin — measuring 8 samples
+bench	Run compare benches	2026-10-26T05:33:45.1939420Z # bench 1792992770242473753-10116
+bench	Run compare benches	2026-10-26T05:33:45.1939787Z 
+bench	Run compare benches	2026-10-26T05:33:45.1939931Z Status: Complete
+bench	Run compare benches	2026-10-26T05:33:45.1940143Z 
+bench	Run compare benches	2026-10-26T05:33:45.1940448Z | Case | Metric | Median | Unit | Scope / statistic | Observations | Processes |
+bench	Run compare benches	2026-10-26T05:33:45.1941021Z |---|---|---:|---|---|---:|---:|
+bench	Run compare benches	2026-10-26T05:33:45.1941785Z | compare/point_get/lin [candidate] | wall | 193.8480 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.1943248Z | compare/point_get/sqlite [candidate] | wall | 657.1272 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.1944422Z | compare/point_get/duckdb [candidate] | wall | 318360.2500 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.1945594Z | compare/point_get/hashmap [candidate] | wall | 18.3854 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.1946751Z | compare/filter_eq/lin [candidate] | wall | 927335.0000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.1947923Z | compare/filter_eq/sqlite [candidate] | wall | 152542.8750 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.1949117Z | compare/filter_eq/duckdb [candidate] | wall | 299647.8750 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.1950584Z | compare/filter_range/lin [candidate] | wall | 1134296.5000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.1951815Z | compare/filter_range/sqlite [candidate] | wall | 151170.1875 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.1953264Z | compare/filter_range/duckdb [candidate] | wall | 497212.7500 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.1954489Z | compare/text_substr/lin [candidate] | wall | 47347.7344 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.1955744Z | compare/fts_lex_selective/lin [candidate] | wall | 1348.8008 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.1957011Z | compare/fts_lex_common/lin [candidate] | wall | 254898.2500 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.1958288Z | compare/fts_lex_miss/lin [candidate] | wall | 684.4585 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.1959550Z | compare/fts_hybrid_common/lin [candidate] | wall | 7445439.0000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.1960847Z | compare/text_substr/sqlite [candidate] | wall | 587388.5000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.1962287Z | compare/text_substr/duckdb [candidate] | wall | 393281.3750 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.1963561Z | compare/materialize/lin [candidate] | wall | 984447.0000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.1964869Z | compare/materialize/sqlite [candidate] | wall | 1513570.0000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.1966380Z | compare/materialize/duckdb [candidate] | wall | 1256474.5000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.1967677Z | compare/join_inner/lin [candidate] | wall | 517287.7500 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.1968983Z | compare/join_inner/lin_cursor [candidate] | wall | 1999035.0000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.1970449Z | compare/join_inner/lin_cursor_projected [candidate] | wall | 820125.5000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.1971957Z | compare/join_phase/lin_cursor_open [candidate] | wall | 19776.3594 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.1973522Z | compare/join_phase/lin_cursor_scan_project [candidate] | wall | 2478104.5000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.1975036Z | compare/join_phase/lin_cursor_scan_projected_row [candidate] | wall | 1365428.0000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.1976482Z | compare/join_inner/sqlite [candidate] | wall | 4245006.5000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.1977798Z | compare/join_inner/duckdb [candidate] | wall | 2861720.5000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.1979124Z | compare/join_filter/lin [candidate] | wall | 286394.3750 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.1980493Z | compare/join_filter/lin_cursor [candidate] | wall | 1013847.0000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.1981879Z | compare/join_filter/sqlite [candidate] | wall | 2416544.5000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.1983673Z | compare/join_filter/duckdb [candidate] | wall | 2004565.5000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.1984965Z | compare/agg_sum/lin [candidate] | wall | 9603.6211 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.1986248Z | compare/agg_sum/sqlite [candidate] | wall | 377856.2500 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.1987545Z | compare/agg_sum/duckdb [candidate] | wall | 194645.7500 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.1988859Z | compare/agg_sum_by/lin [candidate] | wall | 434696.2500 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.1990185Z | compare/agg_sum_by/sqlite [candidate] | wall | 2323997.5000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.1991619Z | compare/agg_sum_by/duckdb [candidate] | wall | 1074635.0000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.1993165Z | compare/agg_count_by/lin [candidate] | wall | 166272.8125 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.1994572Z | compare/agg_count_by/sqlite [candidate] | wall | 496129.6250 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.1995993Z | compare/agg_count_by/duckdb [candidate] | wall | 801275.5000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.1997404Z | compare/insert_bulk_1k/lin [candidate] | wall | 1757754.5000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.1998818Z | compare/insert_bulk_1k/sqlite [candidate] | wall | 1629956.5000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.2000426Z | compare/insert_bulk_1k/duckdb [candidate] | wall | 369143755.0000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.2001899Z | compare/insert_bulk_10k/lin [candidate] | wall | 33275550.5000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.2003499Z | compare/insert_bulk_10k/sqlite [candidate] | wall | 20063600.5000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.2005000Z | compare/insert_bulk_10k/duckdb [candidate] | wall | 3716071510.5000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.2006567Z | compare/insert_native_1k/duckdb_appender [candidate] | wall | 3064618.5000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.2008182Z | compare/insert_native_10k/duckdb_appender [candidate] | wall | 22379858.0000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.2009753Z | compare/insert_phase_10k/lin_full [candidate] | wall | 33156352.5000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.2011295Z | compare/insert_phase_10k/lin_no_embed [candidate] | wall | 11927092.0000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.2013098Z | compare/insert_phase_10k/lin_no_embed_no_scalar_index [candidate] | wall | 8647937.5000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.2014745Z | compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts [candidate] | wall | 6144566.0000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.2016178Z | compare/append_log_1k/lin [candidate] | wall | 246343.3750 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.2017475Z | compare/append_log_1k/sqlite [candidate] | wall | 843892.5000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.2019055Z | compare/append_log_1k/duckdb [candidate] | wall | 1615279.5000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.2020521Z | compare/append_log_10k/lin [candidate] | wall | 2907064.5000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.2021983Z | compare/append_log_10k/sqlite [candidate] | wall | 9855821.5000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.2023783Z | compare/append_log_10k/duckdb [candidate] | wall | 11655505.0000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.2025377Z | compare/group_commit_16/lin_sequential_full [candidate] | wall | 3262428.0000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.2027031Z | compare/group_commit_16/lin_grouped_full [candidate] | wall | 347941.8750 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.2028660Z | compare/reopen_phase_5k/rebuild_row_maps [candidate] | wall | 1588228.5000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.2030329Z | compare/reopen_phase_5k/rebuild_scalar_indexes [candidate] | wall | 1052704.5000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.2031969Z | compare/reopen_phase_5k/rebuild_fts [candidate] | wall | 1659878.0000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.2033624Z | compare/plan_dnf_6/lin [candidate] | wall | 187352.1250 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.2035019Z | compare/plan_dnf_10/lin [candidate] | wall | 875824.5000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.2036623Z | compare/plan_dnf_14/lin [candidate] | wall | 922206.0000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.2038061Z | compare/graph_depth_1/lin [candidate] | wall | 253525.6250 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.2039477Z | compare/graph_depth_2/lin [candidate] | wall | 305718.0000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.2040903Z | compare/graph_depth_3/lin [candidate] | wall | 367984.0000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.2042544Z | compare/reader_snapshot/lin [candidate] | wall | 13469169.5000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+bench	Run compare benches	2026-10-26T05:33:45.2043384Z 
+bench	Run compare benches	2026-10-26T05:33:45.2043541Z # Useful work throughput
+bench	Run compare benches	2026-10-26T05:33:45.2043790Z 
+bench	Run compare benches	2026-10-26T05:33:45.2043966Z | Case | Median batch throughput | Unit |
+bench	Run compare benches	2026-10-26T05:33:45.2044436Z |---|---:|---|
+bench	Run compare benches	2026-10-26T05:33:45.2044891Z | compare/join_inner/lin [candidate] | 19331603.2252 | rows/s |
+bench	Run compare benches	2026-10-26T05:33:45.2045587Z | compare/join_inner/lin_cursor [candidate] | 5002414.3612 | rows/s |
+bench	Run compare benches	2026-10-26T05:33:45.2046386Z | compare/join_inner/lin_cursor_projected [candidate] | 12193264.5826 | rows/s |
+bench	Run compare benches	2026-10-26T05:33:45.2047268Z | compare/join_phase/lin_cursor_scan_project [candidate] | 4035348.8369 | rows/s |
+bench	Run compare benches	2026-10-26T05:33:45.2048186Z | compare/join_phase/lin_cursor_scan_projected_row [candidate] | 7323722.8877 | rows/s |
+bench	Run compare benches	2026-10-26T05:33:45.2049021Z | compare/join_inner/sqlite [candidate] | 2355709.6458 | rows/s |
+bench	Run compare benches	2026-10-26T05:33:45.2049708Z | compare/join_inner/duckdb [candidate] | 3494482.5664 | rows/s |
+bench	Run compare benches	2026-10-26T05:33:45.2050390Z | compare/join_filter/lin [candidate] | 17458662.4665 | rows/s |
+bench	Run compare benches	2026-10-26T05:33:45.2051102Z | compare/join_filter/lin_cursor [candidate] | 4931719.9804 | rows/s |
+bench	Run compare benches	2026-10-26T05:33:45.2051815Z | compare/join_filter/sqlite [candidate] | 2069076.6742 | rows/s |
+bench	Run compare benches	2026-10-26T05:33:45.2052595Z | compare/join_filter/duckdb [candidate] | 2494306.9401 | rows/s |
+bench	Run compare benches	2026-10-26T05:33:45.2053375Z | compare/agg_sum/lin [candidate] | 1041277592.3968 | rows/s |
+bench	Run compare benches	2026-10-26T05:33:45.2053952Z | compare/agg_sum/sqlite [candidate] | 26465224.1075 | rows/s |
+bench	Run compare benches	2026-10-26T05:33:45.2054542Z | compare/agg_sum/duckdb [candidate] | 51461387.0286 | rows/s |
+bench	Run compare benches	2026-10-26T05:33:45.2055121Z | compare/agg_sum_by/lin [candidate] | 23004575.7368 | rows/s |
+bench	Run compare benches	2026-10-26T05:33:45.2055714Z | compare/agg_sum_by/sqlite [candidate] | 4302954.7231 | rows/s |
+bench	Run compare benches	2026-10-26T05:33:45.2056312Z | compare/agg_sum_by/duckdb [candidate] | 9306192.3208 | rows/s |
+bench	Run compare benches	2026-10-26T05:33:45.2056895Z | compare/agg_count_by/lin [candidate] | 60142136.0654 | rows/s |
+bench	Run compare benches	2026-10-26T05:33:45.2057499Z | compare/agg_count_by/sqlite [candidate] | 20156025.5850 | rows/s |
+bench	Run compare benches	2026-10-26T05:33:45.2058148Z | compare/agg_count_by/duckdb [candidate] | 12684360.5651 | rows/s |
+bench	Run compare benches	2026-10-26T05:33:45.2058785Z | compare/insert_bulk_1k/lin [candidate] | 568907.6836 | rows/s |
+bench	Run compare benches	2026-10-26T05:33:45.2059417Z | compare/insert_bulk_1k/sqlite [candidate] | 613513.6882 | rows/s |
+bench	Run compare benches	2026-10-26T05:33:45.2060038Z | compare/insert_bulk_1k/duckdb [candidate] | 2708.9738 | rows/s |
+bench	Run compare benches	2026-10-26T05:33:45.2060646Z | compare/insert_bulk_10k/lin [candidate] | 300520.9649 | rows/s |
+bench	Run compare benches	2026-10-26T05:33:45.2061275Z | compare/insert_bulk_10k/sqlite [candidate] | 498415.0330 | rows/s |
+bench	Run compare benches	2026-10-26T05:33:45.2061913Z | compare/insert_bulk_10k/duckdb [candidate] | 2691.0397 | rows/s |
+bench	Run compare benches	2026-10-26T05:33:45.2062895Z | compare/insert_native_1k/duckdb_appender [candidate] | 326370.7376 | rows/s |
+bench	Run compare benches	2026-10-26T05:33:45.2063779Z | compare/insert_native_10k/duckdb_appender [candidate] | 446830.4171 | rows/s |
+bench	Run compare benches	2026-10-26T05:33:45.2064591Z | compare/insert_phase_10k/lin_full [candidate] | 301601.6826 | rows/s |
+bench	Run compare benches	2026-10-26T05:33:45.2065315Z | compare/insert_phase_10k/lin_no_embed [candidate] | 838436.4127 | rows/s |
+bench	Run compare benches	2026-10-26T05:33:45.2066338Z | compare/insert_phase_10k/lin_no_embed_no_scalar_index [candidate] | 1156388.5303 | rows/s |
+bench	Run compare benches	2026-10-26T05:33:45.2067882Z | compare/insert_phase_10k/lin_no_embed_no_scalar_no_fts [candidate] | 1627454.8896 | rows/s |
+bench	Run compare benches	2026-10-26T05:33:45.2068396Z | compare/append_log_1k/lin [candidate] | 4059376.9611 | rows/s |
+bench	Run compare benches	2026-10-26T05:33:45.2068802Z | compare/append_log_1k/sqlite [candidate] | 1184985.0556 | rows/s |
+bench	Run compare benches	2026-10-26T05:33:45.2069245Z | compare/append_log_1k/duckdb [candidate] | 619598.1062 | rows/s |
+bench	Run compare benches	2026-10-26T05:33:45.2069653Z | compare/append_log_10k/lin [candidate] | 3439994.0576 | rows/s |
+bench	Run compare benches	2026-10-26T05:33:45.2070063Z | compare/append_log_10k/sqlite [candidate] | 1014629.5463 | rows/s |
+bench	Run compare benches	2026-10-26T05:33:45.2070475Z | compare/append_log_10k/duckdb [candidate] | 858072.5077 | rows/s |
+bench	Run compare benches	2026-10-26T05:33:45.2070944Z | compare/group_commit_16/lin_sequential_full [candidate] | 4904.3501 | commits/s |
+bench	Run compare benches	2026-10-26T05:33:45.2071462Z | compare/group_commit_16/lin_grouped_full [candidate] | 45990.5367 | statements/s |
+bench	Run compare benches	2026-10-26T05:33:45.2072005Z | compare/reopen_phase_5k/rebuild_row_maps [candidate] | 3148163.4653 | rows/s |
+bench	Run compare benches	2026-10-26T05:33:45.2072893Z | compare/reopen_phase_5k/rebuild_scalar_indexes [candidate] | 4749742.2264 | rows/s |
+bench	Run compare benches	2026-10-26T05:33:45.2073403Z | compare/reopen_phase_5k/rebuild_fts [candidate] | 3012366.7604 | rows/s |
+bench	Run compare benches	2026-10-26T05:33:45.2073684Z 
+bench	Run compare benches	2026-10-26T05:33:45.2073988Z Derived from positive wall batches and declared units per operation; zero/unavailable durations omitted.
+bench	Run compare benches	2026-10-26T05:33:45.2074386Z 
+bench	Run compare benches	2026-10-26T05:33:45.2074787Z Medians above summarize observations, not pooled operation-latency percentiles. Comparisons aggregate within each process first.
+bench	Run compare benches	2026-10-26T05:33:45.2075281Z 
+bench	Run compare benches	2026-10-26T05:33:45.2075885Z - Raw batches are not independent process replications. Batch averages are not individual-operation latency. CPU frequency and background load are uncontrolled.
+bench	Run compare benches	2026-10-26T05:33:45.2076708Z 
+bench	Run compare benches	2026-10-26T05:33:45.3160552Z ### Bench budget (Lin vs baseline)
+bench	Run compare benches	2026-10-26T05:33:45.3161008Z 
+bench	Run compare benches	2026-10-26T05:33:45.3161638Z - `compare/point_get/lin`: 193.8 ns/op vs baseline 260.0 → ok 0.75×
+bench	Run compare benches	2026-10-26T05:33:45.3163111Z - `compare/filter_eq/lin`: 927335.0 ns/op vs baseline 1040.0 → FAIL 891.67×
+bench	Run compare benches	2026-10-26T05:33:45.3164087Z - `compare/join_inner/lin`: 517287.8 ns/op vs baseline 153500.0 → FAIL 3.37×
+bench	Run compare benches	2026-10-26T05:33:45.3216600Z ##[error]Process completed with exit code 2.
