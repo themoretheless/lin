@@ -60,7 +60,7 @@ if python3 "$ROOT/scripts/check-bench-budget.py"; then
 else
   code=$?
   if [[ $code -eq 2 ]]; then
-    echo "bench budget: hard fail (>3× baseline)"
+    echo "bench budget: required peer loss/missing or compatible-platform hard limit"
     exit 2
   fi
   echo "bench budget: check failed (parse/IO)"

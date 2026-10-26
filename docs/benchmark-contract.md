@@ -331,3 +331,21 @@ or upload them as public artifacts without the required approval.
 Run 40273448770 was cancelled before artifact upload after checking these terms.
 Its job log was retained privately and the public log removed. This is not a
 completed SQL Server qualification.
+
+
+## CI warm-read gate platform scope
+
+The legacy absolute limits in `benches/ci-baseline.json` were measured on macOS
+ARM64. Their original values remain unchanged; warn>1.5x/fail>3x applies only
+when run OS and architecture match. Other platforms retain the numbers as
+historical information. This metadata is not a hardware fingerprint.
+
+Every platform additionally requires Lin to beat both same-run SQLite and
+DuckDB on point_get/filter_eq/join_inner. Missing comparisons, ties/losses,
+incomplete runs, unavailable/nonpositive/nonfinite wall values and invalid
+operation counts cannot produce a passing gate. Calibrated batch totals are
+normalized per operation. This is a declared gate-contract change, not a
+performance optimization or a claim about the full eight-peer matrix.
+
+See the [frozen Linux CI evidence](../benches/results/2026-10-26-linux-ci-refresh/report.md)
+for original raw samples, the old failing report and new evaluator output.

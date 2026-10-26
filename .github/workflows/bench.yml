@@ -16,6 +16,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Verify benchmark gate contract
+        run: python3 scripts/test-check-bench-budget.py
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:
@@ -50,7 +53,7 @@ jobs:
           cp bench-report.md .airbug-bench/ci/bench-report.md
           export BENCH_RUN_JSON=.airbug-bench/ci/run.json
           python3 scripts/check-bench-budget.py
-          # exit 2 = hard regress (>3×); exit 0 includes soft WARN (>1.5×)
+          # exit 2 = required peer loss/missing or compatible-platform >3x legacy limit
       - name: Run fresh-fixture mutation benches
         run: |
           cargo bench --bench compare -- \

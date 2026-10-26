@@ -8,6 +8,12 @@
 
 ## Обновление 2026-10-26
 
+- [Post-small-worker профиль1k](../benches/results/2026-10-26-post-small-worker-1k-profile/report.md): frozena5e28e36; диагностические перекрывающиеся spans, raw counts/preflights сохранены; нового ускорения не доказывает.
+- [Scoped hashing CPU — отклонено](../benches/results/2026-10-26-parallel-hashing-cpu/report.md): default1k −17,9/−74,3%, cold scoped lifetime включён; default path не менялся.
+- [Persistent owned-text hashing retest — отклонено](../benches/results/2026-10-26-persistent-hashing-cpu/report.md): default1k −8,4/−6,2%, повторяет механизм старого отказа; новые bounded-input/A-A/cold/fallback проверки не дают принять регрессию.
+- [NEON classifier CPU feasibility](../benches/results/2026-10-26-neon-sparse-count-cpu/report.md): default1k≈+28%, exact bytes/codec. [Full-engine integration не принята](../benches/results/2026-10-26-neon-sparse-count-engine/report.md): matched1k +2,64/+1,17% при A/A6,58/1,95%;10k≈−1% в обоих повторах, production восстановлен. Все положительные и отрицательные серии сохранены.
+- [Linux CI и контракт gate](../benches/results/2026-10-26-linux-ci-refresh/report.md): frozena5e, compute Linux/macOS/Windows прошёл; grouped COUNT1,335мкс. Raw Linux benchmark complete, исходный ARM-absolute gate отказал наjoin, который быстрее SQLite/DuckDB в том же запуске. Новый явно платформенный+same-run-peer gate не меняет измерения или старые лимиты и не является ускорением.
+
 - [Prepared GROUP BY fixed-text COUNT — принято](../benches/results/2026-10-26-ci-grouped-count/report.md): frozenf19f41a4,10k equality≈533–536→0,864мкс, range≈684–690→1,432–1,438мкс; target12/12 positive pairs каждый,48/48 target comparisons противSQLite/DuckDB. Остальные read controls/A/A/RSS сохранены без отбрасывания минусов. Exact group quota, Unicode/empty key, rollback/readonly и10k expected counts проверены; полного восьми-peer gate нет.
 
 - [Native x86 MSSQL CI — функциональная квалификация](../benches/results/2026-10-26-mssql-native-ci/report.md): frozen8b0e9717, реальный SQL Server2022, шесть наборов read/native1k/10k/100k; данные, source hashes, sentinel и cleanup проверены. Сравнительные метрики хранятся только в зашифрованном артефакте и локальном приватном отчёте; зелёный CI не означает performance-победу. Kusto по-прежнему требует настоящего endpoint.
@@ -773,7 +779,7 @@ cargo bench --bench compare -- --profile thorough --tag phase
 
 ### CI
 
-Workflow [`.github/workflows/bench.yml`](../.github/workflows/bench.yml) на `push`/`pull_request` → `main`: `--profile quick`, без Docker. В отчёте Lin / SQLite / DuckDB / HashMap; Postgres и MySQL пропускаются без серверов. FTS query cases включены; диагностические `*phase*` и шумные durable/cold/wal/reopen cases исключены. После прогона `scripts/check-bench-budget.py` сравнивает Lin median с [`benches/ci-baseline.json`](../benches/ci-baseline.json): **warn** при >1.5×, **fail** при >3× на `point_get` / `filter_eq` / `join_inner`. Иначе job падает только при ошибке compile/harness.
+Исторический контракт CI до обновления 2026-10-26 (актуальная проверка описана выше и в benchmark-contract.md). Workflow [`.github/workflows/bench.yml`](../.github/workflows/bench.yml) на `push`/`pull_request` → `main`: `--profile quick`, без Docker. В отчёте Lin / SQLite / DuckDB / HashMap; Postgres и MySQL пропускаются без серверов. FTS query cases включены; диагностические `*phase*` и шумные durable/cold/wal/reopen cases исключены. После прогона `scripts/check-bench-budget.py` сравнивает Lin median с [`benches/ci-baseline.json`](../benches/ci-baseline.json): **warn** при >1.5×, **fail** при >3× на `point_get` / `filter_eq` / `join_inner`. Иначе job падает только при ошибке compile/harness.
 
 Где смотреть: **Actions → bench → Job summary** (markdown-таблица) и artifact **`bench-report`** (`run.json` + `report.html` + `bench-report.md`). Локально: `./scripts/ci-bench.sh` сразу печатает (и при живом hub открывает) **airbug dash** `http://127.0.0.1:8790/`, затем гоняет бенчи в `.airbug-bench/ci/` (hub: `cargo run -p airbug-hub -- serve --root <lin>`).
 
