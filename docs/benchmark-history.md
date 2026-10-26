@@ -8,6 +8,12 @@
 
 ## Обновление 2026-10-26
 
+
+- [Sparse mask cache — отклонено](../benches/results/2026-10-26-sparse-mask-cache-cpu/report.md): default1k CPU −30,91% /−30,44%; half-density выигрыш не компенсирует регрессии default/zero/dense. Начальный ошибочный dense writer сохранён отдельно; production не менялся.
+- [Small NEON overlap — CPU feasibility](../benches/results/2026-10-26-small-neon-overlap-cpu/report.md): default1k warm +43,48% /+44,83%, cold +39,60% /+40,47%; без полного frame/I/O/sync, не peer-победа.
+- [Small overlap256Ki — отклонено](../benches/results/2026-10-26-small-neon-overlap-engine/report.md): durable1k +12,24% /+11,46%, но entry512 +6,25% /−5,20%; политика не принята.
+- [Small overlap512Ki — не принят](../benches/results/2026-10-26-small-neon-floor-engine/report.md): durable1k +12,91% /+11,90% и entry683 +10,73% /+11,80%; serial guard682 −1,16% /−3,17% и шумные conventional controls. Все проигрыши сохранены; новый O(1) hint требует отдельной квалификации текущего main.
+
 - [NEON sparse writer — принято с ограниченным эффектом1k](../benches/results/2026-10-26-neon-sparse-writer-engine/report.md): conventional Full1k +5,79% /+7,10%; interleaved +4,62% /+4,33%, 6/6 обе серии, выше A/A1,32% /2,89%.10k первый interleaved gain ниже A/A, дополнительное ускорение10k не заявлено. Workspace, bit/tail/unaligned oracle, byte-equal WAL и process-exit replay прошли; Full1k всё ещё проигрывает SQLite.
 
 - [NEON sparse writer CPU +density crossover](../benches/results/2026-10-26-neon-sparse-writer-cpu/report.md): новый SIMD-mask, default1k +50–51%, serial10k ~35%; плотный guard вне sparse-dispatch содержит проигрыш и сохранён.383/192 nnz spread/cluster +17–53%, все6/6 в двух сериях; это компонентные результаты.
