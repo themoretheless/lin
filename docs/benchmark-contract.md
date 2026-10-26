@@ -7,6 +7,10 @@ This is not a claim of superiority for every workload or data size.
 
 ## Native Rust comparison
 
+Benchmark/example dev dependencies (`airbug 0.6`) require Rust 1.96 or newer;
+benchmark/compute CI pins Rust 1.96.0. The library package MSRV remains a separate
+contract in Cargo.toml. Do not infer benchmark MSRV from the library field.
+
 `cargo bench --bench compare` remains the primary comparison for Lin, SQLite,
 DuckDB, PostgreSQL and MySQL. Read queries use warm fixtures and prepared APIs.
 Single-row update/delete now prepare queries outside timing, validate affected
@@ -274,3 +278,25 @@ To ensure fair comparisons across peers (LIN-0008), the benchmark contracts enfo
 - **SQL Server**: Clustered B-tree on primary key, nonclustered B-tree on secondary keys.
 - **Kusto**: Inverted indexing of all columns with column-store partitioning.
 - **pandas**: In-memory Hash index on index labels.
+
+## Native SQL Server CI qualification
+
+`.github/workflows/mssql-bench.yml` is manually dispatched on a dedicated Linux
+x86-64 GitHub runner. `scripts/bench-mssql-native-ci.py` asserts the host and image
+architectures, starts an owned SQL Server 2022 Developer container for nonproduction
+testing with the documented EULA flag, generates temporary credentials, records
+server settings/image digest/source and binary hashes, then runs read/native
+1k/10k/100k comparisons with three processes and 12 samples. The script preserves
+sentinel objects and removes only its owned container. It does not use ARM
+emulation. Mere workflow creation is not a live peer result.
+
+```sh
+gh workflow run mssql-bench.yml --ref main
+```
+
+Raw reports are uploaded even on failure. Read/native API and server durability
+differences above still apply; hosted-runner data must not be pooled with the
+Apple-Silicon matrix or presented as a cloud-production latency guarantee.
+
+SQL Server platform/container setup follows
+[Microsoft's official quickstart](https://learn.microsoft.com/en-us/sql/linux/install-upgrade/quickstart-install-docker?view=sql-server-linux-ver16).
