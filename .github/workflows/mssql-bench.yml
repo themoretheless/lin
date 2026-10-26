@@ -29,14 +29,26 @@ jobs:
         run: python -m pip install -r scripts/bench-peers-requirements.lock
       - name: Build frozen Lin peer worker
         run: cargo build --locked --release -p lin-peer-worker > /tmp/lin-mssql-peer-build.log 2>&1
+      - name: Install artifact encryption
+        run: sudo apt-get update -qq && sudo apt-get install -y age
       - name: Qualify real SQL Server on native x86
-        run: python scripts/bench-mssql-native-ci.py --output .airbug-bench/mssql-ci
-      - name: Upload raw qualification artifacts
+        run: python scripts/bench-mssql-native-ci.py --output "$RUNNER_TEMP/lin-mssql-private"
+      - name: Encrypt internal qualification results
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -d "$RUNNER_TEMP/lin-mssql-private" ]; then
+            tar -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/lin-mssql-private.tar.gz" lin-mssql-private
+            age -R .github/benchmark-recipients/mssql.age -o "$RUNNER_TEMP/lin-mssql-results.tar.gz.age" "$RUNNER_TEMP/lin-mssql-private.tar.gz"
+            rm "$RUNNER_TEMP/lin-mssql-private.tar.gz"
+          fi
+      - name: Upload encrypted qualification artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: native-mssql-${{ github.run_id }}
           path: |
-            .airbug-bench/mssql-ci/
+            ${{ runner.temp }}/lin-mssql-results.tar.gz.age
             /tmp/lin-mssql-peer-build.log
           if-no-files-found: warn

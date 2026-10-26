@@ -310,3 +310,24 @@ Kusto benchmark wins.
 For a lightweight peer binary without root benchmark-only DuckDB/Airbug build
 dependencies, use `cargo build --locked --release -p lin-peer-worker`; its source
 is shared with the compatibility `peer_bench` example.
+
+
+## Private SQL Server qualification artifacts
+
+SQL Server 2022 Developer license section 5 requires Microsoft's prior written
+approval before third-party disclosure of benchmark results:
+[Microsoft license terms](https://www.microsoft.com/content/dam/microsoft/usetm/documents/sql-server/sql-server-2022-developer-express-evaluation/retail-packaged/SQLServer2022_SQLServer2022DeveloperExpressEvaluation_English.pdf).
+The manual native-x86 CI therefore uploads only an age-encrypted results archive.
+The recipient is `.github/benchmark-recipients/mssql.age`; its private identity
+must remain outside Git. Losing that identity makes the archive unrecoverable.
+
+The job status reports functional completeness and cleanup, independently of
+wins or losses. Raw timings, comparisons and child exit codes remain inside the
+encrypted archive; a green job does not establish a performance win. An incomplete
+benchmark still fails the job. Decrypt locally with `age -d -i /private/identity.txt
+-o results.tar.gz downloaded-results.tar.gz.age`. Never commit decrypted results
+or upload them as public artifacts without the required approval.
+
+Run 40273448770 was cancelled before artifact upload after checking these terms.
+Its job log was retained privately and the public log removed. This is not a
+completed SQL Server qualification.

@@ -95,8 +95,9 @@ def main():
                     record['fixture_objects_remaining'] = left
                     assert not left
                 save()
-                assert result.returncode in (0, 2, 3), 'benchmark worker failed before normal report'
-                print(mode, rows, 'exit', result.returncode, flush=True)
+                assert result.returncode in (0, 3), 'benchmark report incomplete'
+                # Public job logs must not reveal relative performance.
+                print('Completed one validated workload; results remain private.', flush=True)
         assert all(sha(path) == digest for path, digest in sources.items())
         assert sha(args.binary) == meta['binary_sha256']
         meta['source_unchanged'] = True
@@ -122,7 +123,8 @@ def main():
             meta['cleanup'] = dict(stop_exit=stop.returncode, remove_exit=remove.returncode)
             save()
             assert stop.returncode == remove.returncode == 0
-    return 0 if all(run['exit_code'] == 0 for run in meta['runs']) else 2
+    # A completed report can contain losses. Job status is not a win indicator.
+    return 0
 
 
 if __name__ == '__main__':
