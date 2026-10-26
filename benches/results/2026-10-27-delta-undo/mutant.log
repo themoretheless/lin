@@ -1,0 +1,26 @@
+   Compiling lin v0.4.0 (/Users/themoretheless/.codex/worktrees/lin-wal-persistent-qualification/lin)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.78s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/lib.rs (target/debug/build/lin/9b69f1e840b117a4/out/lin-9b69f1e840b117a4)
+
+running 1 test
+test exec::delta_undo_oracle::restores_changed_added_removed_names_and_repeated_edits ... FAILED
+
+failures:
+
+---- exec::delta_undo_oracle::restores_changed_added_removed_names_and_repeated_edits stdout ----
+
+thread 'exec::delta_undo_oracle::restores_changed_added_removed_names_and_repeated_edits' (76621122) panicked at src/exec.rs:9159:243:
+assertion `left == right` failed
+  left: {"added": Null, "added2": Bool(false), "body": Text("new"), "float": Float(0.0), "hash": Text("newhash"), "wide_0": Int(100), "wide_1": Int(101), "wide_2": Int(102), "wide_3": Int(103), "wide_4": Int(104), "wide_5": Int(105), "wide_6": Int(106), "wide_7": Int(107), "длинное_имя_поля_без_усечения": Bool(true)}
+ right: {"added": Null, "body": Text("new"), "float": Float(0.0), "hash": Text("newhash"), "wide_0": Int(100), "wide_1": Int(101), "wide_2": Int(102), "wide_3": Int(103), "wide_4": Int(104), "wide_5": Int(105), "wide_6": Int(106), "wide_7": Int(107), "длинное_имя_поля_без_усечения": Bool(true)}
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    exec::delta_undo_oracle::restores_changed_added_removed_names_and_repeated_edits
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 103 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--lib`
