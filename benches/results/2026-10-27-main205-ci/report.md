@@ -20,3 +20,5 @@ Across all same-case Lin/SQLite/DuckDB measurements in ci/:26wins,2losses. The d
 Materialize happens to win against DuckDB in this process (981.328us/1210.169us); the previous frozene05ac CI process lost (798.322us/767.982us). Different runners/sessions are not alternating controls, so neither the change of sign nor the absolute differences establish a causal performance change or close that scenario universally.
 
 Next: await frozen borrowed-row A/A/B Linux candidate run40390146614; preserve the allocation savings separately from latency. Reproduce native insertion losses on the Linux contract before claiming the older ARM peer matrix applies here. Full durable SQLite1k and real Kusto qualification remain open; this artifact measures neither. MSSQL comparative data remains private and is not in this artifact.
+
+[Compute run40391600501](https://github.com/themoretheless/lin/actions/runs/40391600501) completed successfully on the same main20591dd4: Linux/macOS/Windows jobs all passed. Full step statuses retained in compute-status.json. Compile/WGSL validation does not prove physical GPU execution or all-eight-peer performance.
