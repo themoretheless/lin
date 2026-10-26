@@ -1,5 +1,13 @@
 # Полная история бенчмарков Lin
 
+## Дополнение: завершённый CI e05ac74b и dictionary CPU gates
+
+- [Текущий CI: все результаты, включая проигрыши](../benches/results/2026-10-26-current-ci-complete/report.md): run40381280504 завершён успешно; raw read/mutation артефакты и SHA256 сохранены. Три gate-сценария выигрывают у SQLite/DuckDB, но mutation update/delete1row1k/10k/100k проигрывают SQLite, materialize проигрывает DuckDB. Один процесс ×8 samples — основание для воспроизведения и профиля, не causal A/B qualification.
+- [Dictionary NEON v5](../benches/results/2026-10-26-neon-dictionary-choice-cpu/report.md): target CPU ускоряется, но unsampled high-cardinality majority регрессирует >80%; отклонено. Нулевые tiny-case таймеры сохранены и не квалифицируются.
+- [Dictionary bounded fallback v6](../benches/results/2026-10-26-bounded-dictionary-choice-cpu/report.md): cap двух дорогих escape ограничивает худший fallback; метаданные/маршрутизация ещё регрессируют, tiny-case теперь измерен пакетами256операций.
+- [Dictionary early probe v7](../benches/results/2026-10-26-early-probe-dictionary-choice-cpu/report.md): default1k CPU +20,35/+21,19%,12/12process wins, vectorsection238992→112542bytes. Скрытые выбросы row998 проходят bit-oracle; fallback всё ещё около1% медленнее, tiny-case −17,76/−15,17%. Это не actual-frame/Full-commit/peer qualification; production writer не включён.
+
+
 Собрано 2026-10-05. Срез репозитория: `386300e0ba6d69ef87647425acc034c5c5a1b8bd`. Это описание сохранённых измерений и экспериментов проекта и данного диалога; новые измерения при сборке документа не запускались.
 
 Охват: **136 серий**, **158 исходных Markdown-отчётов**, **1514 файлов run.json** (включая три локальных .airbug-bench), **111 уникальных case ID** в сохранённых Airbug-прогонах и **474 сообщений диалога о замерах**. Статусы run.json: complete: 1485, failed: 1, incomplete: 28.
