@@ -461,7 +461,9 @@ impl LiveIndex {
         if let Some(ref pred) = self.def.pred
             && !crate::exec::eval_pred(pred, row, crate::store::now_ms())
         {
-            return Ok(()); // Skip indexing for non-matching rows
+            // An update can move an indexed row out of the partial predicate.
+            self.remove_at(idx);
+            return Ok(());
         }
 
         let key = self.key_of(row);
