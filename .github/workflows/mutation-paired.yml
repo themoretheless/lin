@@ -25,30 +25,30 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
           import shutil,json,hashlib
-          src=Path('benches/results/2026-10-27-fts-tail-pop-linux-gate')
-          dst=Path('benches/results/ci-fts-tail-pop')
+          src=Path('benches/results/2026-10-27-patch-undo-linux-gate')
+          dst=Path('benches/results/ci-patch-undo')
           dst.mkdir()
           meta=json.loads((src/'input-provenance.json').read_text())
           assert all(hashlib.sha256(Path(f).read_bytes()).hexdigest()==h for f,h in meta['before_sha256'].items())
-          for name in ['build.py','test.py','run.py','summarize.py','sensitivity.py','oracle.rs','candidate-fts.rs','candidate-store.rs','before-fts.rs','before-store.rs']:
+          for name in ['build.py','test.py','run.py','summarize.py','sensitivity.py','oracle.rs','candidate-exec.rs','candidate-store.rs','before-exec.rs','before-store.rs']:
               shutil.copy2(src/name,dst/name)
           PY
       - name: Check candidate and contract regressions
         run: |
-          python3 benches/results/ci-fts-tail-pop/test.py
-          python3 benches/results/ci-fts-tail-pop/sensitivity.py
+          python3 benches/results/ci-patch-undo/test.py
+          python3 benches/results/ci-patch-undo/sensitivity.py
       - name: Build frozen baseline and candidate
-        run: python3 benches/results/ci-fts-tail-pop/build.py
+        run: python3 benches/results/ci-patch-undo/build.py
       - name: Run two six-round A-A-B series
-        run: python3 benches/results/ci-fts-tail-pop/run.py
+        run: python3 benches/results/ci-patch-undo/run.py
       - name: Summarize every comparison and evaluate target
         run: |
-          python3 benches/results/ci-fts-tail-pop/summarize.py
-          python3 scripts/check-mutation-paired.py benches/results/ci-fts-tail-pop delete
+          python3 benches/results/ci-patch-undo/summarize.py
+          python3 scripts/check-mutation-paired.py benches/results/ci-patch-undo update
       - name: Preserve raw results including failure
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: mutation-paired
-          path: benches/results/ci-fts-tail-pop/
+          path: benches/results/ci-patch-undo/
           if-no-files-found: error
