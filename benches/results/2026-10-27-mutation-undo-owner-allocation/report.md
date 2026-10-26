@@ -1,0 +1,7 @@
+# Move original update row into undo: allocation gate
+
+Candidate combines the previous borrowed-row/FTS prototype with ownership transfer into RowUndo::Update. The original stored Row is moved into the journal and borrowed from its just-pushed entry during derived maintenance; Undo variants without a row journal borrow the local original. Pack rows, journal byte accounting, affected counts, writer format and durability policy remain unchanged. This is a saved prototype; production source restored after each build/test.
+
+Three independent processes per binary, wing/title/delete at1k/10k/100k,54 validated operations. Wing71→41 allocations,4940→3194 requested bytes; title83→53 allocations,6142→4396bytes. Every update saves30 allocations/1746bytes versus baseline, ten allocations/582bytes more than the previous prototype. Delete remains68 allocations/4975bytes. Handle drop included; setup/validation excluded. Realloc counts as an allocation request; requested bytes are not peak or retained memory, and allocation counts do not prove latency.
+
+All measured operations independently validate affected count, generation, exact changed field/hash, row existence/count and indexed rag count. Full fixture/source/binary manifests and raw JSONL are retained. No wall-time performance claim or SQLite superiority follows from these counts. The ongoing Linux run40394312683 measures the earlier candidate (20 fewer allocations), not this revised prototype.

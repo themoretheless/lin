@@ -1,5 +1,18 @@
 # Полная история бенчмарков Lin
 
+## Undo ownership prototype — allocation evidence only
+
+- [Owned original Row in undo](../benches/results/2026-10-27-mutation-undo-owner/report.md):278 focused/contract tests pass, original source restored. Previous borrowed-row candidate plus move into journal removes a third Row clone.
+- [Allocation gate](../benches/results/2026-10-27-mutation-undo-owner-allocation/report.md):54 validated operations, update71→41 /83→53 allocations,1746 requested bytes saved at1k/10k/100k, delete unchanged. No latency/peer win follows from allocation counts. Ongoing Linux40394312683 measures the previous candidate only.
+
+
+Собрано 2026-10-05. Срез репозитория: `386300e0ba6d69ef87647425acc034c5c5a1b8bd`. Это описание сохранённых измерений и экспериментов проекта и данного диалога; новые измерения при сборке документа не запускались.
+
+Охват: **136 серий**, **158 исходных Markdown-отчётов**, **1514 файлов run.json** (включая три локальных .airbug-bench), **111 уникальных case ID** в сохранённых Airbug-прогонах и **474 сообщений диалога о замерах**. Статусы run.json: complete: 1485, failed: 1, incomplete: 28.
+
+Включены принятые и отклонённые оптимизации, контрольные и повторные прогоны, профили этапов и аллокаций, peer API matrix, ранние версии 0.4.0 и локальные CI/smoke-прогоны. Планы и предварительные сообщения диалога помечены как исторические сообщения, а не самостоятельное доказательство выигрыша. Результаты разных коммитов, машинных состояний, контрактов, native/durable и размеров не объединяются в общий рейтинг. Отсутствующий peer не считается победой.
+
+
 ## Mutation allocation evidence and noisy local gate
 
 - [Allocation counter](../benches/results/2026-10-26-mutation-allocation-gate/report.md):54 validated operations, three processes per binary, wing/title/delete at1k/10k/100k. Update saves20 allocations and1164 requested bytes; delete unchanged. No latency/RSS claim. Immutable-body fixture failure retained.
