@@ -1,5 +1,11 @@
 # Полная история бенчмарков Lin
 
+## Mutation allocation evidence and noisy local gate
+
+- [Allocation counter](../benches/results/2026-10-26-mutation-allocation-gate/report.md):54 validated operations, three processes per binary, wing/title/delete at1k/10k/100k. Update saves20 allocations and1164 requested bytes; delete unchanged. No latency/RSS claim. Immutable-body fixture failure retained.
+- [Local mutation A/A/B](../benches/results/2026-10-26-mutation-borrowed-row-engine/report.md): explicitly stopped after three complete rounds and partial fourth; large unchanged-control deviations, no speed acceptance. Candidate remains a saved snapshot, production source unchanged. Linux branch CI repeats the same protocol in a fresh owned directory and retains failures.
+
+
 ## Mutation profile and ownership candidate
 
 - [Mutation phase profile](../benches/results/2026-10-26-mutation-phase-profile/report.md):18 completed instrumented runs; derived maintenance dominates delete, update includes repeated Row clones. Nested medians and preflights retained; profile is not an A/B speed claim.

@@ -1,0 +1,1 @@
+First summary assertion assumed12cases. Actual unchanged glob also selects8 transaction controls:20cases/160wall observations per completed run. Corrected summary assertion after inspecting exact IDs; no benchmark restarted or samples removed.

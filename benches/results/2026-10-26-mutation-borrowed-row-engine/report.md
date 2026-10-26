@@ -1,0 +1,9 @@
+# Borrow original update row and FTS row: local qualification not accepted
+
+Frozen baseline4938fd6a (production Rust identical to e05ac74b). Candidate keeps all native/durable Pack payloads and transaction accounting. It clones the replacement row from a borrowed original, then uses mem::replace to retain the original stored row for undo/derived maintenance; this removes one full Row clone. FTS sync borrows collections and FTS as disjoint fields, removing another Row clone.
+
+Focused tests:233 passed,2 ignored across lib/exec/persist/transaction/delete-readback/HNSW; two added contract regressions pass against baseline and candidate and both fail against rejected native payload elision. This includes rollback, derived structures, durable reopen and follower-related existing tests, not physical power-loss proof. Exact test counts/logs are retained. Original source restored after build and tests; candidate is not enabled.
+
+Paired performance run was explicitly terminated after three complete rounds and a partial fourth: two consecutive six-round series, rotated baseline A/control A/candidate B, six native mutation cases (update/delete at1k/10k/100k) and transaction commit/rollback1k/10k controls, each with same-run SQLite (20cases),8 samples with fresh fixtures and exact readback outside timing. Binaries pinned by SHA256. run.log/status.json and per-run raw directories record authoritative progress. No speed claim until complete inspection, A/A and unchanged delete/SQLite controls; full durable mutation performance remains separate.
+
+Local A/A and unchanged SQLite controls varied by tens of percent; all losses/partial raw artifacts retained. This run does not qualify a speedup and is not resumed by overwriting its directories. termination.json records explicit signals and the corrected process-header parsing attempt. A fresh Linux runner is a separate experiment.

@@ -1,0 +1,1 @@
+Initial fixture attempted mutation of immutable docs.body and correctly failed compile before counting that operation. First wing output retained. Revised fixture uses mutable title to exercise changed FTS fields; no failed data overwritten.
