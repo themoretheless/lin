@@ -7,3 +7,5 @@ After: remove_at(idx) before returning for a nonmatching replacement. The append
 Four targeted regressions pass: unchanged-key exit and unique-key transfer; exit combined with key change; failed transfer rollback (rows/generation/index memberships); WAL export/apply plus checkpoint/reopen, including rejection of a later conflicting entrant. Wider validation passed278 tests with2 existing ignored; exact command, frozen source hashes, before/after logs retained. These are correctness results, not a measured latency improvement or physical power-loss proof.
 
 The independent borrowed-row performance candidate remains a saved experiment. Linux A/A/B run40390146614 tests its frozen snapshot, which does not include this separate partial-index fix. Do not carry that future result to a combined binary without requalification.
+
+A clean branch based directly on main was validated separately:276 passed,2 ignored. The two mutation_contract regressions from the experimental ancestry are not included in this narrow branch; main-validation.log records the exact production-based suite.
