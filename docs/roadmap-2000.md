@@ -378,16 +378,16 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 266 | LIN-0182 | [D05](#d05) | Проверить snapshot edge consistency | CORRECTNESS | qualification | S | G-CORRECT |
 | 267 | LIN-0183 | [D05](#d05) | Проверить snapshot derived indexes policy | CORRECTNESS | qualification | S | G-CORRECT |
 | 268 | LIN-0184 | [D05](#d05) | Проверить snapshot embedding identity | CORRECTNESS | qualification | S | G-CORRECT |
-| 269 | LIN-0205 | [D06](#d06) | Проверить rollback embeddings | CORRECTNESS | qualification | S | G-CORRECT |
-| 270 | LIN-0206 | [D06](#d06) | Проверить rollback graph edges | CORRECTNESS | qualification | S | G-CORRECT |
-| 271 | LIN-0207 | [D06](#d06) | Проверить rollback generated IDs | CORRECTNESS | qualification | S | G-CORRECT |
-| 272 | LIN-0208 | [D06](#d06) | Проверить rollback catalog changes | CORRECTNESS | qualification | S | G-CORRECT |
-| 273 | LIN-0209 | [D06](#d06) | Проверить mixed insert/update/delete rollback | CORRECTNESS | qualification | S | G-CORRECT |
-| 274 | LIN-0210 | [D06](#d06) | Проверить group commit failure atomicity | CORRECTNESS | qualification | S | G-CORRECT |
+| 269 | LIN-0205 | [D06](#d06) | Проверить rollback embeddings | CORRECTNESS | done | S | G-CORRECT |
+| 270 | LIN-0206 | [D06](#d06) | Проверить rollback graph edges | CORRECTNESS | done | S | G-CORRECT |
+| 271 | LIN-0207 | [D06](#d06) | Проверить rollback generated IDs | CORRECTNESS | done | S | G-CORRECT |
+| 272 | LIN-0208 | [D06](#d06) | Проверить rollback catalog changes | CORRECTNESS | done | S | G-CORRECT |
+| 273 | LIN-0209 | [D06](#d06) | Проверить mixed insert/update/delete rollback | CORRECTNESS | done | S | G-CORRECT |
+| 274 | LIN-0210 | [D06](#d06) | Проверить group commit failure atomicity | CORRECTNESS | done | S | G-CORRECT |
 | 275 | LIN-0211 | [D06](#d06) | Проверить commit после validation failure | CORRECTNESS | qualification | S | G-CORRECT |
 | 276 | LIN-0212 | [D06](#d06) | Проверить rollback после allocator failure | CORRECTNESS | qualification | S | G-CORRECT |
-| 277 | LIN-0213 | [D06](#d06) | Ограничить transaction journal bytes | CORRECTNESS | qualification | M | G-CORRECT |
-| 278 | LIN-0214 | [D06](#d06) | Ограничить transaction mutation count | CORRECTNESS | qualification | M | G-CORRECT |
+| 277 | LIN-0213 | [D06](#d06) | Ограничить transaction journal bytes | CORRECTNESS | done | M | G-CORRECT |
+| 278 | LIN-0214 | [D06](#d06) | Ограничить transaction mutation count | CORRECTNESS | done | M | G-CORRECT |
 | 279 | LIN-0215 | [D06](#d06) | Измерить rollback work amplification | PERF | candidate | M | G-PERF |
 | 280 | LIN-0216 | [D06](#d06) | Измерить journal clone elimination | PERF | candidate | M | G-PERF |
 | 281 | LIN-0217 | [D06](#d06) | Подготовить explicit transaction API | CORRECTNESS | done | M | G-CORRECT |
@@ -1394,15 +1394,15 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 1282 | LIN-1742 | [D44](#d44) | Добавить benchmark source hash checks | OPS | candidate | M | G-OPS |
 | 1283 | LIN-1743 | [D44](#d44) | Добавить dependency lock drift checks | OPS | candidate | M | G-OPS |
 | 1284 | LIN-1744 | [D44](#d44) | Добавить baseline approval metadata | OPS | candidate | M | G-OPS |
-| 1285 | LIN-1765 | [D45](#d45) | Ограничить regex automaton size | CORRECTNESS | qualification | M | G-CORRECT |
+| 1285 | LIN-1765 | [D45](#d45) | Ограничить regex automaton size | CORRECTNESS | done | M | G-CORRECT |
 | 1286 | LIN-1766 | [D45](#d45) | Ограничить graph expansion count | CORRECTNESS | qualification | M | G-CORRECT |
-| 1287 | LIN-1767 | [D45](#d45) | Ограничить Cartesian join expansion | CORRECTNESS | qualification | M | G-CORRECT |
+| 1287 | LIN-1767 | [D45](#d45) | Ограничить Cartesian join expansion | CORRECTNESS | done | M | G-CORRECT |
 | 1288 | LIN-1768 | [D45](#d45) | Ограничить aggregate state bytes | CORRECTNESS | qualification | M | G-CORRECT |
-| 1289 | LIN-1769 | [D45](#d45) | Проверить archive path traversal rejection | CORRECTNESS | qualification | S | G-CORRECT |
-| 1290 | LIN-1770 | [D45](#d45) | Проверить backup symlink policy | CORRECTNESS | qualification | S | G-CORRECT |
+| 1289 | LIN-1769 | [D45](#d45) | Проверить archive path traversal rejection | CORRECTNESS | done | S | G-CORRECT |
+| 1290 | LIN-1770 | [D45](#d45) | Проверить backup symlink policy | CORRECTNESS | done | S | G-CORRECT |
 | 1291 | LIN-1771 | [D45](#d45) | Проверить data-directory traversal policy | CORRECTNESS | qualification | S | G-CORRECT |
-| 1292 | LIN-1772 | [D45](#d45) | Проверить temp-file permission policy | CORRECTNESS | qualification | S | G-CORRECT |
-| 1293 | LIN-1773 | [D45](#d45) | Проверить replication token comparison | CORRECTNESS | qualification | S | G-CORRECT |
+| 1292 | LIN-1772 | [D45](#d45) | Проверить temp-file permission policy | CORRECTNESS | done | S | G-CORRECT |
+| 1293 | LIN-1773 | [D45](#d45) | Проверить replication token comparison | CORRECTNESS | done | S | G-CORRECT |
 | 1294 | LIN-1774 | [D45](#d45) | Проверить secret lifetime in diagnostics | CORRECTNESS | qualification | S | G-CORRECT |
 | 1295 | LIN-1775 | [D45](#d45) | Проверить HTTP remote TLS requirement | CORRECTNESS | qualification | S | G-CORRECT |
 | 1296 | LIN-1776 | [D45](#d45) | Проверить accidental insecure endpoint reuse | CORRECTNESS | qualification | S | G-CORRECT |
@@ -1410,7 +1410,7 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 1298 | LIN-1778 | [D45](#d45) | Спроектировать collection-level capabilities | FEATURE | candidate | L | G-FEATURE |
 | 1299 | LIN-1779 | [D45](#d45) | Спроектировать extension trust boundaries | FEATURE | candidate | L | G-FEATURE |
 | 1300 | LIN-1780 | [D45](#d45) | Спроектировать untrusted model isolation | FEATURE | candidate | L | G-FEATURE |
-| 1301 | LIN-1781 | [D45](#d45) | Проверить compressed payload bomb rejection | CORRECTNESS | qualification | S | G-CORRECT |
+| 1301 | LIN-1781 | [D45](#d45) | Проверить compressed payload bomb rejection | CORRECTNESS | done | S | G-CORRECT |
 | 1302 | LIN-1782 | [D45](#d45) | Проверить nested format recursion limits | CORRECTNESS | qualification | S | G-CORRECT |
 | 1303 | LIN-1783 | [D45](#d45) | Проверить pathological UTF-8 scan cost | CORRECTNESS | qualification | S | G-CORRECT |
 | 1304 | LIN-1784 | [D45](#d45) | Проверить adversarial hash collision handling | CORRECTNESS | qualification | S | G-CORRECT |

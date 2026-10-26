@@ -65,7 +65,7 @@ pub mod gpu;
 mod graph;
 mod index;
 mod parse;
-mod persist;
+pub mod persist;
 mod plan;
 mod store;
 mod window;

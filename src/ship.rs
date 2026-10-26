@@ -171,14 +171,17 @@ fn read_hello<R: Read>(r: &mut R) -> Result<(String, u64), Error> {
     Ok((token, u64::from_le_bytes(since_buf)))
 }
 
-fn token_eq(a: &str, b: &str) -> bool {
-    if a.len() != b.len() {
-        return false;
+pub fn token_eq(a: &str, b: &str) -> bool {
+    let a_bytes = a.as_bytes();
+    let b_bytes = b.as_bytes();
+    let len = a_bytes.len().max(b_bytes.len());
+    let mut diff = a_bytes.len() ^ b_bytes.len();
+    for i in 0..len {
+        let x = a_bytes.get(i).copied().unwrap_or(0);
+        let y = b_bytes.get(i).copied().unwrap_or(0);
+        diff |= (x ^ y) as usize;
     }
-    a.bytes()
-        .zip(b.bytes())
-        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
-        == 0
+    diff == 0
 }
 
 fn client_config(tls: &TlsClient) -> Result<Arc<ClientConfig>, Error> {

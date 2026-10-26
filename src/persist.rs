@@ -165,6 +165,68 @@ pub enum Pack {
     },
 }
 
+impl Pack {
+    pub fn byte_size(&self) -> usize {
+        match self {
+            Pack::Insert {
+                collection,
+                row,
+                edges,
+            } => collection.len() + crate::store::row_byte_size(row) + edges.len() * 64,
+            Pack::InsertBulk {
+                collection,
+                rows,
+                edges,
+            } => {
+                collection.len()
+                    + rows.iter().map(crate::store::row_byte_size).sum::<usize>()
+                    + edges.len() * 64
+            }
+            Pack::InsertCols {
+                collection,
+                fields,
+                cols,
+                edges,
+                ..
+            } => {
+                collection.len()
+                    + fields.iter().map(|f| f.len()).sum::<usize>()
+                    + cols
+                        .iter()
+                        .map(|c| match c {
+                            ColData::Text(v) => v.iter().map(|s| s.len()).sum(),
+                            ColData::Int(v) => v.len() * 8,
+                            ColData::Float(v) => v.len() * 8,
+                            ColData::Bool(v) => v.len(),
+                            ColData::Time(v) => v.len() * 8,
+                            ColData::Vec(v) => v.len() * 32,
+                            ColData::Null => 0,
+                        })
+                        .sum::<usize>()
+                    + edges.len() * 64
+            }
+            Pack::AppendFact { row } => crate::store::row_byte_size(row),
+            Pack::AppendFactsBulk { s, p, o } => {
+                s.iter().map(|x| x.len()).sum::<usize>()
+                    + p.iter().map(|x| x.len()).sum::<usize>()
+                    + o.iter().map(|x| x.len()).sum::<usize>()
+            }
+            Pack::AppendEdge { rel, from, to } => rel.len() + from.len() + to.len(),
+            Pack::AppendEdgesBulk { rel, from, to } => {
+                rel.iter().map(|x| x.len()).sum::<usize>()
+                    + from.iter().map(|x| x.len()).sum::<usize>()
+                    + to.iter().map(|x| x.len()).sum::<usize>()
+            }
+            Pack::Update { collection, rows } | Pack::Delete { collection, rows } => {
+                collection.len() + rows.iter().map(crate::store::row_byte_size).sum::<usize>()
+            }
+            Pack::DeleteEdge { rel, from, to } => rel.len() + from.len() + to.len(),
+            Pack::Batch { packs } => packs.iter().map(|p| p.byte_size()).sum(),
+            _ => 128,
+        }
+    }
+}
+
 /// Parallel column payload for [`Pack::InsertCols`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "t", content = "v")]
@@ -496,6 +558,11 @@ pub fn write_snapshot_ref_to_file(path: &Path, snap: &SnapshotRef<'_>) -> Result
             .truncate(true)
             .open(&tmp)
             .map_err(io_err)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
+        }
         let mut writer = std::io::BufWriter::with_capacity(128 * 1024, file);
         writer.write_all(&SNAPSHOT_MAGIC).map_err(io_err)?;
         rmp_serde::encode::write_named(&mut writer, snap).map_err(io_err)?;
@@ -544,6 +611,17 @@ pub fn write_snapshot_ref(dir: &Path, snap: &SnapshotRef<'_>) -> Result<(), Erro
 
 /// Portable backup: always self-contained MessagePack (`LIN\x04`).
 pub fn write_backup(path: &Path, snap: &Snapshot) -> Result<(), Error> {
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(Error::runtime(
+            "path traversal rejected: backup path cannot contain '..'",
+        ));
+    }
+    if path.is_symlink() {
+        return Err(Error::runtime("backup symlink policy: symlinks rejected"));
+    }
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -570,6 +648,17 @@ pub fn write_backup(path: &Path, snap: &Snapshot) -> Result<(), Error> {
 }
 
 pub fn read_backup(path: &Path) -> Result<Snapshot, Error> {
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(Error::runtime(
+            "path traversal rejected: backup path cannot contain '..'",
+        ));
+    }
+    if path.is_symlink() {
+        return Err(Error::runtime("backup symlink policy: symlinks rejected"));
+    }
     let file = fs::File::open(path).map_err(io_err)?;
     let meta = file.metadata().map_err(io_err)?;
     let len = meta.len();
@@ -673,9 +762,13 @@ fn decode_snapshot_bytes(bytes: &[u8]) -> Option<Snapshot> {
                     use flate2::read::GzDecoder;
                     use std::io::Read;
 
-                    let mut decoder = GzDecoder::new(compressed_data);
+                    let decoder = GzDecoder::new(compressed_data);
                     let mut result = Vec::new();
-                    decoder.read_to_end(&mut result).ok()?;
+                    let mut limited = decoder.take(256 * 1024 * 1024 + 1);
+                    limited.read_to_end(&mut result).ok()?;
+                    if result.len() > 256 * 1024 * 1024 {
+                        return None;
+                    }
                     return rmp_serde::from_slice(&result).ok();
                 }
                 #[cfg(not(feature = "compress-flate"))]
@@ -687,7 +780,8 @@ fn decode_snapshot_bytes(bytes: &[u8]) -> Option<Snapshot> {
             0x02 => {
                 #[cfg(feature = "compress-lz4")]
                 {
-                    let decompressed = lz4::block::decompress(compressed_data, None).ok()?;
+                    let decompressed =
+                        lz4::block::decompress(compressed_data, Some(256 * 1024 * 1024)).ok()?;
                     return rmp_serde::from_slice(&decompressed).ok();
                 }
                 #[cfg(not(feature = "compress-lz4"))]
@@ -719,7 +813,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), Error> {
 /// step removes the temp file, and the `cold`/`fts` prunes sweep whatever a
 /// killed process left behind — safe because prune only runs under the
 /// exclusive fence, when no live writer can hold a temp open.
-pub(crate) fn write_through_tmp(path: &Path, tmp: &Path, bytes: &[u8]) -> Result<(), Error> {
+pub fn write_through_tmp(path: &Path, tmp: &Path, bytes: &[u8]) -> Result<(), Error> {
     let result = (|| -> Result<(), Error> {
         let mut file = OpenOptions::new()
             .create(true)
@@ -727,6 +821,11 @@ pub(crate) fn write_through_tmp(path: &Path, tmp: &Path, bytes: &[u8]) -> Result
             .truncate(true)
             .open(tmp)
             .map_err(io_err)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(tmp, fs::Permissions::from_mode(0o600));
+        }
         file.write_all(bytes).map_err(io_err)?;
         durable_sync(&file)
             .or_else(|_| file.sync_all())

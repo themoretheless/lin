@@ -709,6 +709,8 @@ pub struct Transaction<'a> {
     cat_backup: Option<Catalog>,
     packs: Vec<Pack>,
     schema_changed: bool,
+    mutation_count: usize,
+    journal_bytes: usize,
 }
 
 impl<'a> Transaction<'a> {
@@ -791,7 +793,24 @@ impl<'a> Transaction<'a> {
             self.ensure_undo(prep);
         }
         let (handle, pack) = self.db.run_prepared_in_tx(prep, &mut self.undo)?;
+        if prep.writes {
+            self.mutation_count = self.mutation_count.saturating_add(handle.done.n);
+            if self.mutation_count > self.db.quotas.max_tx_mutations {
+                return Err(Error::runtime(format!(
+                    "transaction mutation count {} exceeds max_tx_mutations quota {}",
+                    self.mutation_count, self.db.quotas.max_tx_mutations
+                )));
+            }
+        }
         if let Some(p) = pack {
+            let pack_bytes = p.byte_size();
+            self.journal_bytes = self.journal_bytes.saturating_add(pack_bytes);
+            if self.journal_bytes > self.db.quotas.max_journal_bytes {
+                return Err(Error::runtime(format!(
+                    "transaction journal bytes {} exceeds max_journal_bytes quota {}",
+                    self.journal_bytes, self.db.quotas.max_journal_bytes
+                )));
+            }
             self.packs.push(p);
         }
         Ok(handle)
@@ -866,6 +885,12 @@ pub struct Quotas {
     pub max_ast_bytes: usize,
     pub max_output_bytes: usize,
     pub max_execution_work: usize,
+    pub max_regex_bytes: usize,
+    pub max_graph_expansion: usize,
+    pub max_join_expansion: usize,
+    pub max_aggregate_bytes: usize,
+    pub max_journal_bytes: usize,
+    pub max_tx_mutations: usize,
 }
 
 impl Default for Quotas {
@@ -879,6 +904,12 @@ impl Default for Quotas {
             max_ast_bytes: 8 * 1024 * 1024,
             max_output_bytes: 256 * 1024 * 1024,
             max_execution_work: 50_000_000,
+            max_regex_bytes: 10 * 1024 * 1024,
+            max_graph_expansion: 100_000,
+            max_join_expansion: 1_000_000,
+            max_aggregate_bytes: 64 * 1024 * 1024,
+            max_journal_bytes: 128 * 1024 * 1024,
+            max_tx_mutations: 100_000,
         }
     }
 }
@@ -1954,6 +1985,8 @@ impl Db {
         }
         if let Some(cat) = cat_backup {
             self.catalog = cat;
+            self.plan_cache.clear();
+            self.query_cache.clear();
         }
     }
 
@@ -1990,6 +2023,8 @@ impl Db {
             cat_backup: None,
             packs: Vec::new(),
             schema_changed: false,
+            mutation_count: 0,
+            journal_bytes: 0,
         })
     }
 
@@ -2804,7 +2839,7 @@ impl Db {
                         rows = self.gpu_join_rows(&primary, rows, collection, on, *left)?;
                         continue;
                     }
-                    rows = self.join_rows(&primary, rows, collection, on, *left);
+                    rows = self.join_rows(&primary, rows, collection, on, *left)?;
                 }
                 Step::Hop { rel, depth } => {
                     rows = self.hop(&primary, &rows, rel, depth.unwrap_or(1))?;
@@ -4750,7 +4785,7 @@ impl Db {
         right_col: &str,
         on: &str,
         left_join: bool,
-    ) -> Vec<Row> {
+    ) -> Result<Vec<Row>, Error> {
         let to_field = self
             .catalog
             .find_fk(left_col, on, right_col)
@@ -4758,7 +4793,7 @@ impl Db {
             .unwrap_or("id");
 
         if left.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         // FK → unique id: hash-build right once, then probe (tight map, no by_id indirection).
@@ -4781,8 +4816,15 @@ impl Db {
                         None if left_join => out.push(l),
                         None => {}
                     }
+                    if out.len() > self.quotas.max_join_expansion {
+                        return Err(Error::runtime(format!(
+                            "Cartesian join expansion {} exceeds max_join_expansion quota {}",
+                            out.len(),
+                            self.quotas.max_join_expansion
+                        )));
+                    }
                 }
-                return out;
+                return Ok(out);
             }
 
             // Asymmetric hash join: if left is smaller, only index keys needed by left
@@ -4827,7 +4869,7 @@ impl Db {
                     None => {}
                 }
             }
-            return out;
+            return Ok(out);
         }
 
         // Non-id join key: hash probe without cloning the right collection.
@@ -4837,7 +4879,7 @@ impl Db {
             .filter_map(|l| l.get(on).and_then(cell_key))
             .collect();
         if needed_keys.is_empty() {
-            return if left_join { left } else { Vec::new() };
+            return Ok(if left_join { left } else { Vec::new() });
         }
 
         let mut idx: FxHashMap<String, Vec<&Row>> = FxHashMap::default();
@@ -4861,12 +4903,19 @@ impl Db {
                         l.clone()
                     };
                     out.push(merge_join_row(base, r, right_col));
+                    if out.len() > self.quotas.max_join_expansion {
+                        return Err(Error::runtime(format!(
+                            "Cartesian join expansion {} exceeds max_join_expansion quota {}",
+                            out.len(),
+                            self.quotas.max_join_expansion
+                        )));
+                    }
                 }
             } else if left_join {
                 out.push(l);
             }
         }
-        out
+        Ok(out)
     }
 
     fn hop(&self, primary: &str, rows: &[Row], rel: &str, depth: i64) -> Result<Vec<Row>, Error> {
@@ -6631,6 +6680,7 @@ pub(crate) fn eval_pred(pred: &Pred, row: &Row, now: i64) -> bool {
                 let mut cache_guard = cache.lock().unwrap();
                 let re = cache_guard.entry(key).or_insert_with(|| {
                     let mut b = regex::RegexBuilder::new(pattern);
+                    b.size_limit(10 * 1024 * 1024);
                     if flags.contains('i') {
                         b.case_insensitive(true);
                     }

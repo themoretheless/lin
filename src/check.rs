@@ -826,6 +826,7 @@ pub fn validate_regex(pattern: &str, flags: &str) -> Result<(), Error> {
         }
     }
     let mut b = regex::RegexBuilder::new(pattern);
+    b.size_limit(10 * 1024 * 1024);
     if flags.contains('i') {
         b.case_insensitive(true);
     }
