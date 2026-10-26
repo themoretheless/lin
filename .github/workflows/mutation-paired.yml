@@ -25,8 +25,8 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
           import shutil,json,hashlib
-          src=Path('benches/results/2026-10-27-fts-swap-delete-linux-gate')
-          dst=Path('benches/results/ci-fts-swap-delete')
+          src=Path('benches/results/2026-10-27-fts-tail-pop-linux-gate')
+          dst=Path('benches/results/ci-fts-tail-pop')
           dst.mkdir()
           meta=json.loads((src/'input-provenance.json').read_text())
           assert all(hashlib.sha256(Path(f).read_bytes()).hexdigest()==h for f,h in meta['before_sha256'].items())
@@ -35,20 +35,20 @@ jobs:
           PY
       - name: Check candidate and contract regressions
         run: |
-          python3 benches/results/ci-fts-swap-delete/test.py
-          python3 benches/results/ci-fts-swap-delete/sensitivity.py
+          python3 benches/results/ci-fts-tail-pop/test.py
+          python3 benches/results/ci-fts-tail-pop/sensitivity.py
       - name: Build frozen baseline and candidate
-        run: python3 benches/results/ci-fts-swap-delete/build.py
+        run: python3 benches/results/ci-fts-tail-pop/build.py
       - name: Run two six-round A-A-B series
-        run: python3 benches/results/ci-fts-swap-delete/run.py
+        run: python3 benches/results/ci-fts-tail-pop/run.py
       - name: Summarize every comparison and evaluate target
         run: |
-          python3 benches/results/ci-fts-swap-delete/summarize.py
-          python3 scripts/check-mutation-paired.py benches/results/ci-fts-swap-delete delete
+          python3 benches/results/ci-fts-tail-pop/summarize.py
+          python3 scripts/check-mutation-paired.py benches/results/ci-fts-tail-pop delete
       - name: Preserve raw results including failure
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: mutation-paired
-          path: benches/results/ci-fts-swap-delete/
+          path: benches/results/ci-fts-tail-pop/
           if-no-files-found: error
