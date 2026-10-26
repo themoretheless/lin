@@ -1,5 +1,10 @@
 # Полная история бенчмарков Lin
 
+## Borrowed-row Linux gate: not accepted
+
+- [Frozen6ac970ef A/A/B](../benches/results/2026-10-27-mutation-borrowed-linux/report.md):36process runs,5760timed operations; independent raw recomputation of240case-pairs. Update1k+6.005/+7.037%,10k+4.298/+1.972%,100k+3.797/+4.213%, but predeclared target/control gate fails. SQLite candidate comparisons0/120wins. No production enablement; all raw/control losses retained.
+
+
 ## Undo ownership prototype — allocation evidence only
 
 - [Owned original Row in undo](../benches/results/2026-10-27-mutation-undo-owner/report.md):278 focused/contract tests pass, original source restored. Previous borrowed-row candidate plus move into journal removes a third Row clone.
