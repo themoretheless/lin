@@ -1,0 +1,46 @@
+skip postgres: LIN_BENCH_SKIP_PG is set
+skip mysql: LIN_BENCH_SKIP_MYSQL is set
+lin compare: N=10000 warm reads (fixture), bulk insert (schema outside timing)
+engines: Lin | SQLite(rusqlite bundled) | DuckDB(bundled) | HashMap(point get only) | Postgres(skipped) | MySQL(skipped)
+airbug dash: http://127.0.0.1:8790/
+Lin reads: prepare once / run many; filters use count (fair vs SQL COUNT(*));
+substring: Lin `title ~ "wal" | count` vs SQL LIKE '%wal%' COUNT(*);
+materialize: Lin `wing==rag | {id,title} | take all` vs SQL SELECT id,title;
+join: 10000 orders ⋈ 1000 users (Lin run_batch SoA / cursor vs SQL INNER JOIN);
+append_log: Lin `append facts` vs SQL INSERT INTO logs (append-only shape)
+airbug dash: http://127.0.0.1:8790/#/bench
+bench: compare/delete_1row_1k/lin — validating and calibrating
+MUTATION_PHASE {"kind":"delete","phases":[["lookup",2709],["delete_derived",7584],["pack_result_clone",250],["exec_program",12708]],"rows":1000,"total_ns":13583}
+MUTATION_PHASE {"kind":"delete","phases":[["lookup",667],["delete_derived",4000],["pack_result_clone",166],["exec_program",6083]],"rows":1000,"total_ns":6625}
+bench: compare/delete_1row_1k/lin — measuring 8 samples
+MUTATION_PHASE {"kind":"delete","phases":[["lookup",917],["delete_derived",5666],["pack_result_clone",167],["exec_program",8333]],"rows":1000,"total_ns":8792}
+MUTATION_PHASE {"kind":"delete","phases":[["lookup",459],["delete_derived",4625],["pack_result_clone",167],["exec_program",6167]],"rows":1000,"total_ns":6542}
+MUTATION_PHASE {"kind":"delete","phases":[["lookup",333],["delete_derived",2750],["pack_result_clone",167],["exec_program",4000]],"rows":1000,"total_ns":4416}
+MUTATION_PHASE {"kind":"delete","phases":[["lookup",375],["delete_derived",2750],["pack_result_clone",208],["exec_program",4083]],"rows":1000,"total_ns":4542}
+MUTATION_PHASE {"kind":"delete","phases":[["lookup",166],["delete_derived",2250],["pack_result_clone",167],["exec_program",3333]],"rows":1000,"total_ns":3750}
+MUTATION_PHASE {"kind":"delete","phases":[["lookup",208],["delete_derived",2583],["pack_result_clone",167],["exec_program",4042]],"rows":1000,"total_ns":4417}
+MUTATION_PHASE {"kind":"delete","phases":[["lookup",708],["delete_derived",4916],["pack_result_clone",167],["exec_program",7334]],"rows":1000,"total_ns":8250}
+MUTATION_PHASE {"kind":"delete","phases":[["lookup",208],["delete_derived",2667],["pack_result_clone",125],["exec_program",3916]],"rows":1000,"total_ns":4500}
+MUTATION_PHASE {"kind":"delete","phases":[["lookup",1167],["delete_derived",7625],["pack_result_clone",208],["exec_program",11542]],"rows":1000,"total_ns":12583}
+# bench 1793043361156854000-89676
+
+Status: Complete
+
+| Case | Metric | Median | Unit | Scope / statistic | Observations | Processes |
+|---|---|---:|---|---|---:|---:|
+| compare/delete_1row_1k/lin [candidate] | wall | 108938.0000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+
+# Useful work throughput
+
+| Case | Median batch throughput | Unit |
+|---|---:|---|
+| compare/delete_1row_1k/lin [candidate] | 9179.8561 | stmts/s |
+
+Derived from positive wall batches and declared units per operation; zero/unavailable durations omitted.
+
+Medians above summarize observations, not pooled operation-latency percentiles. Comparisons aggregate within each process first.
+
+- Raw batches are not independent process replications. Batch averages are not individual-operation latency. CPU frequency and background load are uncontrolled.
+
+- compare/delete_1row_1k/lin: some samples below half the requested duration; iteration cap or workload drift may limit precision
+

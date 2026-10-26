@@ -1,0 +1,62 @@
+   Compiling lin v0.4.0 (/Users/themoretheless/.codex/worktrees/lin-wal-persistent-qualification/lin)
+error[E0502]: cannot borrow `self.store` as mutable because it is also borrowed as immutable
+    --> src/exec.rs:5922:13
+     |
+5895 |             let before = &self.store.collection(collection)[i];
+     |                           ---------- immutable borrow occurs here
+...
+5922 |             self.store.collection_mut(collection)[i] = updated.clone();
+     |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ mutable borrow occurs here
+5923 |             self.store.index_insert_row(collection, i, &updated)?;
+5924 |             self.store.fts_sync_at(collection, i, &before);
+     |                                                   ------- immutable borrow later used here
+
+error[E0502]: cannot borrow `self.store` as mutable because it is also borrowed as immutable
+    --> src/exec.rs:5923:13
+     |
+5895 |             let before = &self.store.collection(collection)[i];
+     |                           ---------- immutable borrow occurs here
+...
+5923 |             self.store.index_insert_row(collection, i, &updated)?;
+     |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ mutable borrow occurs here
+5924 |             self.store.fts_sync_at(collection, i, &before);
+     |                                                   ------- immutable borrow later used here
+
+error[E0502]: cannot borrow `self.store` as mutable because it is also borrowed as immutable
+    --> src/exec.rs:5924:13
+     |
+5895 |             let before = &self.store.collection(collection)[i];
+     |                           ---------- immutable borrow occurs here
+...
+5924 |             self.store.fts_sync_at(collection, i, &before);
+     |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ mutable borrow occurs here
+...
+5933 |                 .row_maps_sync_updated(collection, i, &before, &updated);
+     |                                                       ------- immutable borrow later used here
+
+error[E0502]: cannot borrow `self.store.hnsw` as mutable because it is also borrowed as immutable
+    --> src/exec.rs:5925:33
+     |
+5895 |             let before = &self.store.collection(collection)[i];
+     |                           ---------- immutable borrow occurs here
+...
+5925 |             if let Some(hnsw) = self.store.hnsw.get_mut(collection) {
+     |                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ mutable borrow occurs here
+...
+5933 |                 .row_maps_sync_updated(collection, i, &before, &updated);
+     |                                                       ------- immutable borrow later used here
+
+error[E0502]: cannot borrow `self.store` as mutable because it is also borrowed as immutable
+    --> src/exec.rs:5932:13
+     |
+5895 |               let before = &self.store.collection(collection)[i];
+     |                             ---------- immutable borrow occurs here
+...
+5932 | /             self.store
+5933 | |                 .row_maps_sync_updated(collection, i, &before, &updated);
+     | |__________________---------------------_________________________________^ mutable borrow occurs here
+     |                    |
+     |                    immutable borrow later used by call
+
+For more information about this error, try `rustc --explain E0502`.
+error: could not compile `lin` (lib) due to 5 previous errors

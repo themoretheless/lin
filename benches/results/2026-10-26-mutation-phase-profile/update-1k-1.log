@@ -1,0 +1,46 @@
+skip postgres: LIN_BENCH_SKIP_PG is set
+skip mysql: LIN_BENCH_SKIP_MYSQL is set
+lin compare: N=10000 warm reads (fixture), bulk insert (schema outside timing)
+engines: Lin | SQLite(rusqlite bundled) | DuckDB(bundled) | HashMap(point get only) | Postgres(skipped) | MySQL(skipped)
+airbug dash: http://127.0.0.1:8790/
+Lin reads: prepare once / run many; filters use count (fair vs SQL COUNT(*));
+substring: Lin `title ~ "wal" | count` vs SQL LIKE '%wal%' COUNT(*);
+materialize: Lin `wing==rag | {id,title} | take all` vs SQL SELECT id,title;
+join: 10000 orders ⋈ 1000 users (Lin run_batch SoA / cursor vs SQL INNER JOIN);
+append_log: Lin `append facts` vs SQL INSERT INTO logs (append-only shape)
+airbug dash: http://127.0.0.1:8790/#/bench
+bench: compare/update_1row_1k/lin — validating and calibrating
+MUTATION_PHASE {"kind":"update","phases":[["lookup",50208],["before_clone",542],["updated_clone",333],["store_clone",625],["indexes",875],["fts",1042],["row_maps",917],["pack_result_clone",459],["exec_program",70542]],"rows":1000,"total_ns":71458}
+MUTATION_PHASE {"kind":"update","phases":[["lookup",333],["before_clone",417],["updated_clone",250],["store_clone",416],["indexes",667],["fts",792],["row_maps",459],["pack_result_clone",333],["exec_program",5625]],"rows":1000,"total_ns":6250}
+bench: compare/update_1row_1k/lin — measuring 8 samples
+MUTATION_PHASE {"kind":"update","phases":[["lookup",250],["before_clone",291],["updated_clone",208],["store_clone",417],["indexes",417],["fts",625],["row_maps",333],["pack_result_clone",250],["exec_program",4041]],"rows":1000,"total_ns":4708}
+MUTATION_PHASE {"kind":"update","phases":[["lookup",166],["before_clone",250],["updated_clone",167],["store_clone",333],["indexes",375],["fts",500],["row_maps",250],["pack_result_clone",208],["exec_program",3333]],"rows":1000,"total_ns":3792}
+MUTATION_PHASE {"kind":"update","phases":[["lookup",167],["before_clone",209],["updated_clone",167],["store_clone",291],["indexes",292],["fts",459],["row_maps",250],["pack_result_clone",250],["exec_program",4917]],"rows":1000,"total_ns":5417}
+MUTATION_PHASE {"kind":"update","phases":[["lookup",250],["before_clone",208],["updated_clone",167],["store_clone",291],["indexes",417],["fts",542],["row_maps",334],["pack_result_clone",167],["exec_program",3667]],"rows":1000,"total_ns":4166}
+MUTATION_PHASE {"kind":"update","phases":[["lookup",375],["before_clone",500],["updated_clone",333],["store_clone",416],["indexes",833],["fts",833],["row_maps",792],["pack_result_clone",375],["exec_program",6333]],"rows":1000,"total_ns":7125}
+MUTATION_PHASE {"kind":"update","phases":[["lookup",250],["before_clone",333],["updated_clone",208],["store_clone",375],["indexes",458],["fts",583],["row_maps",417],["pack_result_clone",334],["exec_program",4416]],"rows":1000,"total_ns":4958}
+MUTATION_PHASE {"kind":"update","phases":[["lookup",209],["before_clone",291],["updated_clone",250],["store_clone",333],["indexes",375],["fts",458],["row_maps",291],["pack_result_clone",208],["exec_program",3625]],"rows":1000,"total_ns":4084}
+MUTATION_PHASE {"kind":"update","phases":[["lookup",125],["before_clone",167],["updated_clone",166],["store_clone",250],["indexes",209],["fts",375],["row_maps",250],["pack_result_clone",208],["exec_program",2584]],"rows":1000,"total_ns":2958}
+MUTATION_PHASE {"kind":"update","phases":[["lookup",166],["before_clone",166],["updated_clone",125],["store_clone",292],["indexes",291],["fts",375],["row_maps",208],["pack_result_clone",208],["exec_program",2709]],"rows":1000,"total_ns":3000}
+# bench 1793043361097970000-89675
+
+Status: Complete
+
+| Case | Metric | Median | Unit | Scope / statistic | Observations | Processes |
+|---|---|---:|---|---|---:|---:|
+| compare/update_1row_1k/lin [candidate] | wall | 202146.0000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+
+# Useful work throughput
+
+| Case | Median batch throughput | Unit |
+|---|---:|---|
+| compare/update_1row_1k/lin [candidate] | 4947.4771 | stmts/s |
+
+Derived from positive wall batches and declared units per operation; zero/unavailable durations omitted.
+
+Medians above summarize observations, not pooled operation-latency percentiles. Comparisons aggregate within each process first.
+
+- Raw batches are not independent process replications. Batch averages are not individual-operation latency. CPU frequency and background load are uncontrolled.
+
+- compare/update_1row_1k/lin: some samples below half the requested duration; iteration cap or workload drift may limit precision
+

@@ -1,5 +1,11 @@
 # Полная история бенчмарков Lin
 
+## Mutation profile and ownership candidate
+
+- [Mutation phase profile](../benches/results/2026-10-26-mutation-phase-profile/report.md):18 completed instrumented runs; derived maintenance dominates delete, update includes repeated Row clones. Nested medians and preflights retained; profile is not an A/B speed claim.
+- [Native payload elision rejected](../benches/results/2026-10-26-mutation-row-copy-engine/report.md): would weaken transaction journal quota and empty-final-query Done.n; two regressions catch it. Revised borrowed-row candidate retains all Pack data and is under full-engine A/A/B qualification.
+
+
 ## Дополнение: завершённый CI e05ac74b и dictionary CPU gates
 
 - [Текущий CI: все результаты, включая проигрыши](../benches/results/2026-10-26-current-ci-complete/report.md): run40381280504 завершён успешно; raw read/mutation артефакты и SHA256 сохранены. Три gate-сценария выигрывают у SQLite/DuckDB, но mutation update/delete1row1k/10k/100k проигрывают SQLite, materialize проигрывает DuckDB. Один процесс ×8 samples — основание для воспроизведения и профиля, не causal A/B qualification.
