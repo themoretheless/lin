@@ -1,0 +1,15 @@
+   Compiling lin v0.4.0 (/Users/themoretheless/Documents/Sources/lin)
+error[E0599]: no method named `into_inner` found for enum `TrySendError<T>` in the current scope
+   --> examples/wal_persistent_worker_gate.rs:193:40
+    |
+193 |   Ok(())=>true,Err(error)=>{drop(error.into_inner());false}
+    |                                        ^^^^^^^^^^ method not found in `TrySendError<Job>`
+
+error[E0599]: no method named `into_inner` found for enum `TrySendError<T>` in the current scope
+   --> examples/wal_persistent_worker_gate.rs:212:108
+    |
+212 | ...lone(),reply}).unwrap_err();drop(error.into_inner());assert_eq!(Arc::strong_count(&rows),1);
+    |                                           ^^^^^^^^^^ method not found in `TrySendError<Job>`
+
+For more information about this error, try `rustc --explain E0599`.
+error: could not compile `lin` (example "wal_persistent_worker_gate") due to 2 previous errors
