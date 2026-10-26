@@ -1,0 +1,68 @@
+   Compiling lin v0.4.0 (/Users/themoretheless/.codex/worktrees/lin-wal-persistent-qualification/lin)
+error[E0433]: cannot find type `Cell` in this scope
+    --> src/fts.rs:1263:30
+     |
+1263 |             ("title".into(), Cell::text_arc(format!("SHARED word{} ЁЖ", i % 5))),
+     |                              ^^^^ use of undeclared type `Cell`
+     |
+help: consider importing one of these items
+     |
+1260 +     use crate::Cell;
+     |
+1260 +     use std::cell::Cell;
+     |
+
+error[E0433]: cannot find type `Cell` in this scope
+    --> src/fts.rs:1264:29
+     |
+1264 |             ("body".into(), Cell::text_arc(format!("body{} shared", i % 7))),
+     |                             ^^^^ use of undeclared type `Cell`
+     |
+help: consider importing one of these items
+     |
+1260 +     use crate::Cell;
+     |
+1260 +     use std::cell::Cell;
+     |
+
+error[E0433]: cannot find type `Cell` in this scope
+    --> src/fts.rs:1265:32
+     |
+1265 |             ("snippet".into(), Cell::text_arc(if i % 3 == 0 {"needle shared"} else {""})),
+     |                                ^^^^ use of undeclared type `Cell`
+     |
+help: consider importing one of these items
+     |
+1260 +     use crate::Cell;
+     |
+1260 +     use std::cell::Cell;
+     |
+
+error[E0433]: cannot find type `Cell` in this scope
+    --> src/fts.rs:1281:58
+     |
+1281 |             if large == 1 {rows[0].insert("body".into(), Cell::text_arc("X".repeat(100_000)));}
+     |                                                          ^^^^ use of undeclared type `Cell`
+     |
+help: consider importing one of these items
+     |
+1260 +     use crate::Cell;
+     |
+1260 +     use std::cell::Cell;
+     |
+
+error[E0433]: cannot find type `Cell` in this scope
+    --> src/fts.rs:1282:58
+     |
+1282 | ...   if large == 2 {rows[0].insert("body".into(), Cell::text_arc((0..2500).map(|i|format!("token{i}")).collect::<Vec<_>>().join("...
+     |                                                    ^^^^ use of undeclared type `Cell`
+     |
+help: consider importing one of these items
+     |
+1260 +     use crate::Cell;
+     |
+1260 +     use std::cell::Cell;
+     |
+
+For more information about this error, try `rustc --explain E0433`.
+error: could not compile `lin` (lib test) due to 5 previous errors
