@@ -498,8 +498,16 @@ fn to_query_source(stmts: &[Stmt]) -> Result<String, Error> {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static PREENCODE_TEST_MODE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    static PREENCODE_TEST_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 struct PackCtx<'a> {
     track_written: bool,
+    allow_preencode: bool,
+    prepared_encoding: Option<crate::persist::PreparedEncoding>,
     snap: BTreeMap<(String, String), String>,
     written: BTreeSet<(String, String)>,
     undo: &'a mut Undo,
@@ -1690,13 +1698,14 @@ impl Db {
             None
         };
 
-        let (rows, message, pack) = match self.exec_program(&prepared.stmts, &mut undo) {
-            Ok(v) => v,
-            Err(e) => {
-                self.rollback(undo, cat_backup);
-                return Err(e);
-            }
-        };
+        let ((rows, message, pack), prepared_encoding) =
+            match self.exec_program(&prepared.stmts, &mut undo, true) {
+                Ok(v) => v,
+                Err(e) => {
+                    self.rollback(undo, cat_backup);
+                    return Err(e);
+                }
+            };
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
         let n = if rows.is_empty() {
             match prepared.stmts.last() {
@@ -1729,7 +1738,10 @@ impl Db {
                 if prepared.schema {
                     p.catalog_hash = crate::store::catalog_hash(&self.catalog);
                 }
-                if let Err(e) = self.store.durable_commit(p, pack) {
+                if let Err(e) = self
+                    .store
+                    .durable_commit_prepared(p, pack, prepared_encoding)
+                {
                     self.rollback(undo, cat_backup);
                     return Err(e);
                 }
@@ -2046,7 +2058,7 @@ impl Db {
         undo: &mut Undo,
     ) -> Result<(Handle, Option<Pack>), Error> {
         let t0 = Instant::now();
-        let (rows, message, pack) = self.exec_program(&prepared.stmts, undo)?;
+        let ((rows, message, pack), _) = self.exec_program(&prepared.stmts, undo, false)?;
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
         let n = if rows.is_empty() {
             match prepared.stmts.last() {
@@ -2276,7 +2288,12 @@ impl ReadDb {
 }
 
 impl Db {
-    fn exec_program(&mut self, stmts: &[Stmt], undo: &mut Undo) -> Result<StmtOut, Error> {
+    fn exec_program(
+        &mut self,
+        stmts: &[Stmt],
+        undo: &mut Undo,
+        allow_preencode: bool,
+    ) -> Result<(StmtOut, Option<crate::persist::PreparedEncoding>), Error> {
         // Materialize only mutated collections before snapshotting CAS hashes.
         for stmt in stmts {
             if let Stmt::Update { collection, .. } | Stmt::Delete { collection, .. } = stmt {
@@ -2292,6 +2309,8 @@ impl Db {
         });
         let mut ctx = PackCtx {
             track_written: need_snap,
+            allow_preencode: allow_preencode && stmts.len() == 1 && self.is_durable(),
+            prepared_encoding: None,
             snap: if need_snap {
                 self.hash_snapshot()
             } else {
@@ -2318,7 +2337,10 @@ impl Db {
                 packs.push(p);
             }
         }
-        Ok((last_rows, last_msg, fold_packs(packs)))
+        Ok((
+            (last_rows, last_msg, fold_packs(packs)),
+            ctx.prepared_encoding,
+        ))
     }
 
     fn hash_snapshot(&self) -> BTreeMap<(String, String), String> {
@@ -2446,15 +2468,24 @@ impl Db {
                 edges,
             } => {
                 let start = self.store.collection(collection).len();
-                let (rows, new_edges) = self.insert_bulk(collection, records, edges.as_slice())?;
+                let (rows, new_edges, staged) =
+                    self.insert_bulk(collection, records, edges.as_slice(), ctx.allow_preencode)?;
                 let inserted = &self.store.collection(collection)[start..];
                 mark_written(ctx, collection, inserted);
                 let pack = if self.is_durable() {
-                    Some(crate::persist::rows_to_insert_cols(
-                        collection.clone(),
-                        inserted,
-                        new_edges,
-                    ))
+                    let pack = if let Some(staged) = staged {
+                        ctx.prepared_encoding = Some(staged.encoding);
+                        staged.pack.unwrap_or_else(|| {
+                            crate::persist::rows_to_insert_cols(
+                                collection.clone(),
+                                inserted,
+                                new_edges,
+                            )
+                        })
+                    } else {
+                        crate::persist::rows_to_insert_cols(collection.clone(), inserted, new_edges)
+                    };
+                    Some(pack)
                 } else {
                     Some(Pack::Batch { packs: Vec::new() })
                 };
@@ -5583,7 +5614,8 @@ impl Db {
         collection: &str,
         records: &[Record],
         edges: &[InsertEdge],
-    ) -> Result<(Vec<Row>, Vec<Edge>), Error> {
+        allow_preencode: bool,
+    ) -> Result<(Vec<Row>, Vec<Edge>, Option<crate::persist::PreparedInsert>), Error> {
         let now = now_ms();
         let n = records.len();
         let mut built: Vec<Row> = if n >= 4096 {
@@ -5677,23 +5709,91 @@ impl Db {
         }
 
         let start = self.store.collection(collection).len();
-        self.store.collection_mut(collection).reserve(n);
-        self.store.row_maps_reserve(collection, n);
-        self.store.index_insert_slab(collection, start, &built)?;
-        self.store.fts_insert_slab(collection, start, &built);
-        self.store.hnsw_insert_slab(collection, start, &built);
-        self.store.row_maps_register_slab(collection, start, &built);
+        let staged = if allow_preencode
+            && (4096..=16384).contains(&n)
+            && edges.is_empty()
+            && self.persist.is_some()
+            && {
+                let floats = built
+                    .iter()
+                    .filter_map(|row| row.get("embedding").and_then(Cell::as_vec))
+                    .fold(0usize, |total, vector| total.saturating_add(vector.len()));
+                (2 * 1024 * 1024..=16 * 1024 * 1024).contains(&floats)
+            } {
+            let generation = self.store.r#gen.wrapping_add(1);
+            let next_id = self.store.next_id;
+            let bytes = self
+                .persist
+                .as_mut()
+                .map(|p| std::mem::take(&mut p.encode_buf))
+                .unwrap_or_default();
+            #[cfg(test)]
+            let mode = PREENCODE_TEST_MODE.with(|mode| mode.get());
+            #[cfg(not(test))]
+            let mode = 0u8;
+            #[cfg(test)]
+            PREENCODE_TEST_ATTEMPTS.with(|attempts| attempts.set(attempts.get() + 1));
+            let shared = std::sync::Arc::new(std::mem::take(&mut built));
+            let task = crate::persist::start_insert_encoding(
+                self.persist.as_mut().unwrap(),
+                generation,
+                next_id,
+                collection,
+                shared.clone(),
+                bytes,
+                mode,
+            );
+            let maintenance = self.maintain_insert_slab(collection, start, &shared);
+            let staged = match task {
+                Ok(reply) => reply.recv().unwrap_or_else(|_| {
+                    crate::persist::prepare_insert_columns(
+                        generation,
+                        next_id,
+                        collection,
+                        &shared,
+                        Vec::new(),
+                    )
+                }),
+                Err(job) => {
+                    if let Err(error) = maintenance {
+                        return Err(error);
+                    }
+                    job.encode()
+                }
+            };
+            built = std::sync::Arc::try_unwrap(shared).expect("encoder retained input after reply");
+            maintenance?;
+            Some(staged)
+        } else {
+            self.maintain_insert_slab(collection, start, &built)?;
+            None
+        };
         let want_rows = built.len() <= 128;
         if want_rows {
             self.store
                 .collection_mut(collection)
                 .extend(built.iter().cloned());
-            Ok((built, new_edges))
+            Ok((built, new_edges, staged))
         } else {
             // Large bulk: move into store, elide Handle.rows (done.n from pack).
             self.store.collection_mut(collection).extend(built);
-            Ok((Vec::new(), new_edges))
+            Ok((Vec::new(), new_edges, staged))
         }
+    }
+
+    fn maintain_insert_slab(
+        &mut self,
+        collection: &str,
+        start: usize,
+        built: &[Row],
+    ) -> Result<(), Error> {
+        self.store.collection_mut(collection).reserve(built.len());
+        self.store.row_maps_reserve(collection, built.len());
+        self.store.index_insert_slab(collection, start, built)?;
+        self.store.fts_insert_slab(collection, start, built);
+        self.store.hnsw_insert_slab(collection, start, built);
+        self.store.row_maps_register_slab(collection, start, built);
+        Ok(())
     }
 
     fn mutation_positions(&self, collection: &str, pred: Option<&Pred>, now: i64) -> Vec<usize> {
@@ -6424,7 +6524,7 @@ mod record_tests {
                 })
                 .collect::<Vec<_>>();
             let mut db = Db::empty();
-            db.insert_bulk("docs", &records, &[]).unwrap();
+            db.insert_bulk("docs", &records, &[], false).unwrap();
             let rows = db.store.collection("docs");
             assert_eq!(rows.len(), n);
             for (i, row) in rows.iter().enumerate() {
@@ -6551,7 +6651,7 @@ mod record_tests {
                 .map(|_| reference.store.alloc_id())
                 .collect::<Vec<_>>();
             let before = now_ms();
-            let (returned, edges) = db.insert_bulk("docs", &records, &[]).unwrap();
+            let (returned, edges, _) = db.insert_bulk("docs", &records, &[], false).unwrap();
             let after = now_ms();
             assert!(returned.is_empty());
             assert!(edges.is_empty());
@@ -6595,7 +6695,7 @@ mod record_tests {
                 .clone();
             records[2048].fields.push((field.into(), value));
             let mut db = Db::empty().without_embedder();
-            let error = db.insert_bulk("docs", &records, &[]).unwrap_err();
+            let error = db.insert_bulk("docs", &records, &[], false).err().unwrap();
             assert!(error.to_string().contains(&format!("duplicate {field}")));
             assert!(db.store.collection("docs").is_empty());
         }
@@ -8715,5 +8815,171 @@ mod grouping_tests {
         for row in &win {
             assert_eq!(row["rn"], Cell::Int(1));
         }
+    }
+}
+
+#[cfg(test)]
+mod preencoded_insert_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    struct Temp(std::path::PathBuf);
+    impl Drop for Temp {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+    struct Mode(u8);
+    impl Mode {
+        fn new(mode: u8) -> Self {
+            PREENCODE_TEST_ATTEMPTS.with(|x| x.set(0));
+            Self(PREENCODE_TEST_MODE.with(|x| x.replace(mode)))
+        }
+    }
+    impl Drop for Mode {
+        fn drop(&mut self) {
+            PREENCODE_TEST_MODE.with(|x| x.set(self.0));
+        }
+    }
+    fn open() -> (Temp, Db) {
+        let p = std::env::temp_dir().join(format!(
+            "lin-preencoded-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let db = Db::open(&p).unwrap();
+        (Temp(p), db)
+    }
+    fn source(n: usize) -> String {
+        format!("insert docs [{}]",(0..n).map(|i|format!(r#"{{id:"i{i}",uri:"bench://{i}",title:"title {i}",body:"body {i}",wing:"rag",ts:timestamp(1700000000000)}}"#)).collect::<Vec<_>>().join(","))
+    }
+    #[test]
+    fn shared_worker_survives_encoder_panic_and_one_database_closing() {
+        let (_first, mut first) = open();
+        let (_second, mut second) = open();
+        first.run("index docs [wing, ts]").unwrap();
+        second.run("index docs [wing, ts]").unwrap();
+        {
+            let _mode = Mode::new(2);
+            first.quotas.max_rows = 0;
+            assert!(
+                first
+                    .run(&source(4096))
+                    .unwrap_err()
+                    .to_string()
+                    .contains("quota:")
+            );
+        }
+        second.run(&source(4096)).unwrap();
+        assert!(std::sync::Arc::ptr_eq(
+            first.persist.as_ref().unwrap().encoder.as_ref().unwrap(),
+            second.persist.as_ref().unwrap().encoder.as_ref().unwrap()
+        ));
+        drop(first);
+        let next = source(4096)
+            .replace("id:\"i", "id:\"j")
+            .replace("bench://", "repeat://");
+        second.run(&next).unwrap();
+        assert_eq!(second.store.collection("docs").len(), 8192);
+        let read = Db::open_read(&_second.0).unwrap();
+        assert_eq!(
+            read.run("docs | take 9000").unwrap().rows,
+            second.run("docs | take 9000").unwrap().rows
+        );
+        drop(read);
+        drop(second);
+    }
+    #[test]
+    fn worker_spawn_fallback_matches_normal_values_and_readonly_replay() {
+        for mode in [0, 1, 4, 5] {
+            let (_dir, mut db) = open();
+            db.run("index docs [wing, ts]").unwrap();
+            let _mode = Mode::new(mode);
+            let src = source(4096);
+            assert_eq!(db.run(&src).unwrap().done.n, 4096);
+            assert_eq!(PREENCODE_TEST_ATTEMPTS.with(|x| x.get()), 1);
+            let mut expected = Db::empty();
+            expected.run("index docs [wing, ts]").unwrap();
+            expected.run(&src).unwrap();
+            let query = "docs | {id, uri, title, body, wing, ts, hash, embedding} | take 5000";
+            let a = db.run(query).unwrap().rows;
+            let b = expected.run(query).unwrap().rows;
+            assert_eq!(a.len(), 4096);
+            assert_eq!(a, b);
+            let read = Db::open_read(&_dir.0).unwrap();
+            assert_eq!(read.run(query).unwrap().rows, a);
+            drop(read);
+            drop(db);
+        }
+    }
+    #[test]
+    fn encoded_errors_defer_until_quota_and_index_checks() {
+        for mode in [2, 3] {
+            let (_dir, mut db) = open();
+            db.run("index docs [wing, ts]").unwrap();
+            let _mode = Mode::new(mode);
+            db.quotas.max_rows = 0;
+            let error = db.run(&source(4096)).err().unwrap();
+            assert!(error.to_string().contains("quota:"), "{error}");
+            assert!(db.store.collection("docs").is_empty());
+            assert!(db.store.row_index("docs", "i0").is_none());
+            drop(db);
+            let (_dir, mut db) = open();
+            db.run("index docs unique [wing]").unwrap();
+            let _mode = Mode::new(mode);
+            let error = db.run(&source(4096)).err().unwrap();
+            assert!(error.to_string().contains("unique index"), "{error}");
+            assert!(db.store.collection("docs").is_empty());
+            drop(db);
+        }
+        let (_dir, mut db) = open();
+        db.run("index docs [wing, ts]").unwrap();
+        let _mode = Mode::new(3);
+        let before = std::fs::read(_dir.0.join("log")).unwrap();
+        let error = db.run(&source(4096)).err().unwrap();
+        assert!(error.to_string().contains("injected WAL encoder failure"));
+        assert!(db.store.collection("docs").is_empty());
+        assert_eq!(std::fs::read(_dir.0.join("log")).unwrap(), before);
+        drop(db);
+    }
+    #[test]
+    fn noneligible_native_small_and_explicit_transactions_stay_serial() {
+        let _mode = Mode::new(3);
+        let mut memory = Db::empty();
+        memory.run(&source(4096)).unwrap();
+        assert_eq!(PREENCODE_TEST_ATTEMPTS.with(|x| x.get()), 0);
+        let (_dir, mut db) = open();
+        db.run(&source(127)).unwrap();
+        assert_eq!(PREENCODE_TEST_ATTEMPTS.with(|x| x.get()), 0);
+        drop(db);
+        let (_dir, mut db) = open();
+        db.run(&source(4095)).unwrap();
+        assert_eq!(PREENCODE_TEST_ATTEMPTS.with(|x| x.get()), 0);
+        drop(db);
+        let (_dir, db) = open();
+        let mut db = db.without_embedder();
+        db.run(&source(4096)).unwrap();
+        assert_eq!(PREENCODE_TEST_ATTEMPTS.with(|x| x.get()), 0);
+        drop(db);
+        let (_dir, mut db) = open();
+        db.run(&source(16385)).unwrap();
+        assert_eq!(PREENCODE_TEST_ATTEMPTS.with(|x| x.get()), 0);
+        drop(db);
+        let (_dir, mut db) = open();
+        let prep = db.prepare(&source(4096)).unwrap();
+        {
+            let mut tx = db.transaction().unwrap();
+            tx.run_prepared(&prep).unwrap();
+            tx.commit().unwrap();
+        }
+        assert_eq!(PREENCODE_TEST_ATTEMPTS.with(|x| x.get()), 0);
+        drop(db);
+        let (_dir, mut db) = open();
+        let mut statements = crate::parse::parse_program(&source(4096)).unwrap();
+        statements.extend(crate::parse::parse_program("docs | count").unwrap());
+        let prepared = db.prepare_stmts(statements).unwrap();
+        db.run_prepared(&prepared).unwrap();
+        assert_eq!(PREENCODE_TEST_ATTEMPTS.with(|x| x.get()), 0);
+        drop(db);
     }
 }

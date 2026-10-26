@@ -768,7 +768,7 @@
       "area": "D01",
       "title": "Закрыть durable 10k SQLite gap",
       "kind": "PERF",
-      "status": "qualification",
+      "status": "done",
       "effort": "M",
       "source_paths": [
         "benches/compare.rs",
@@ -781,7 +781,8 @@
         "LIN-0082",
         "LIN-0084"
       ],
-      "review_note": "Исторический done не подтверждает текущий main. Требуется свежий matched-contract baseline; WAL overlap port 2026-10-26 не принят."
+      "review_note": "2026-10-26: shared persistent encoder принят; Full durable10k candidate быстрее SQLite в12/12 process comparisons, два conventional и два interleaved повтора; 1k и прочие peers отдельно.",
+      "completion_evidence": "benches/results/2026-10-26-wal-persistent-engine/report.md"
     },
     {
       "id": "LIN-0004",
@@ -34738,5 +34739,5 @@
   ],
   "review_date": "2026-10-26",
   "review_commit": "7cd747eafefaa226fbd3de5f552b043523f17b20",
-  "review_scope": "2000 пунктов сохранены; пересмотрены benchmark closure claims LIN-0001..0004. Остальные исторические статусы не переаттестованы."
+  "review_scope": "Пересмотрены LIN-0001..0004: LIN-0003 закрыт новой full-engine квалификацией 2026-10-26; LIN-0001/0002/0004 требуют свежего закрытия. Прочие исторические статусы не переаттестованы."
 }

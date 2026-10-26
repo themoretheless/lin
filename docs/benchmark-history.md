@@ -8,6 +8,8 @@
 
 ## Обновление 2026-10-26
 
+- [Shared persistent WAL encoder — принято](../benches/results/2026-10-26-wal-persistent-engine/report.md): Full durable10k +18,92% /+20,89% в conventional и +19,17% /+20,09% в interleaved; 6/6 в обеих сериях. Границы4096/16384 прошли два A/A/B повтора. Candidate10k обгоняет SQLite в12/12 процессов (1,233–1,245×); durable1k gap остаётся. Byte-equal WAL, process-exit replay1/3/4 commits, worker/queue/lifecycle tests; sync и формат сохранены. Это принятие новой persistent-политики, а не ранее отклонённого scoped-прототипа.
+
 - [Persistent WAL worker — CPU feasibility](../benches/results/2026-10-26-wal-persistent-worker-cpu/report.md): постоянный bounded worker с Arc-владением, 2592 CPU операции и точные bytes/rows/ID-set проверки. 10k +39,71% /+38,94%, 6/6 в обеих сериях; 1k +26,56% /+33,27%, но три сильных проигрыша сохранены. Cold/shutdown измерены отдельно; полный commit и peer superiority не доказаны, production не менялся.
 
 - [WAL overlap — full-engine port не принят](../benches/results/2026-10-26-wal-overlap-port/report.md): перенос на e7abf40 в отдельном worktree, workspace прошёл. Две conventional серии плюс A/A и interleaved A/B: target 1k −8,71% при A/A абсолютном различии 12,23%; исходные противоречивые серии и высокая нагрузка сохранены. Scoped-политика не внедряется, primary source не менялся.

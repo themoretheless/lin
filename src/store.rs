@@ -867,6 +867,7 @@ impl Store {
             catalog_hash: live_hash,
             writes_since_snapshot: 0,
             encode_buf: Vec::with_capacity(64 * 1024),
+            encoder: None,
             sync: opts.sync,
             cold: opts.cold,
             log_bytes: persist::log_len(dir).unwrap_or(0),
@@ -1109,6 +1110,15 @@ impl Store {
     /// Flush one committed pack to the log (data sync). Head is updated durably
     /// on checkpoint/close only (soft head skipped on the hot path).
     pub fn durable_commit(&self, persist: &mut Persist, pack: Pack) -> Result<(), Error> {
+        self.durable_commit_prepared(persist, pack, None)
+    }
+
+    pub(crate) fn durable_commit_prepared(
+        &self,
+        persist: &mut Persist,
+        pack: Pack,
+        prepared: Option<crate::persist::PreparedEncoding>,
+    ) -> Result<(), Error> {
         let rec = LogRecord {
             r#gen: self.r#gen + 1,
             next_id: self.next_id,
@@ -1122,7 +1132,18 @@ impl Store {
                 log_bytes,
                 ..
             } = persist;
-            persist::append_record(log, &rec, encode_buf, sync, log_bytes)?;
+            match prepared {
+                Some(persist::PreparedEncoding::Ready(encoded)) => {
+                    persist::append_prepared_record(
+                        log, &rec, encoded, encode_buf, sync, log_bytes,
+                    )?;
+                }
+                Some(persist::PreparedEncoding::Failed(error)) => return Err(error),
+                Some(persist::PreparedEncoding::Panicked(payload)) => {
+                    std::panic::resume_unwind(payload)
+                }
+                None => persist::append_record(log, &rec, encode_buf, sync, log_bytes)?,
+            }
         }
         persist.writes_since_snapshot += 1;
         Ok(())

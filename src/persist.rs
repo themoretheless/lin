@@ -344,6 +344,7 @@ pub struct Persist {
     pub writes_since_snapshot: u32,
     /// Reused WAL encode buffer (avoids per-commit alloc).
     pub(crate) encode_buf: Vec<u8>,
+    pub(crate) encoder: Option<std::sync::Arc<EncoderWorker>>,
     pub sync: SyncMode,
     /// Spill large collections to mmap cold files on checkpoint.
     pub cold: bool,
@@ -1430,6 +1431,205 @@ fn append_sparse_rows_parallel(
     })
 }
 
+// A shared lease avoids a worker per open database. Last lease joins the worker.
+#[derive(Debug)]
+pub(crate) struct EncoderWorker {
+    sender: Option<std::sync::mpsc::SyncSender<EncodeJob>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+impl Drop for EncoderWorker {
+    fn drop(&mut self) {
+        drop(self.sender.take());
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+fn acquire_encoder() -> Option<std::sync::Arc<EncoderWorker>> {
+    static SHARED: std::sync::Mutex<std::sync::Weak<EncoderWorker>> =
+        std::sync::Mutex::new(std::sync::Weak::new());
+    let mut shared = SHARED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(worker) = shared.upgrade() {
+        return Some(worker);
+    }
+    let (sender, receiver) = std::sync::mpsc::sync_channel::<EncodeJob>(1);
+    let handle = std::thread::Builder::new()
+        .name("lin-wal-encoder".into())
+        .spawn(move || {
+            while let Ok(job) = receiver.recv() {
+                job.run();
+            }
+        })
+        .ok()?;
+    let worker = std::sync::Arc::new(EncoderWorker {
+        sender: Some(sender),
+        handle: Some(handle),
+    });
+    *shared = std::sync::Arc::downgrade(&worker);
+    Some(worker)
+}
+pub(crate) struct EncodeJob {
+    generation: u64,
+    next_id: u64,
+    collection: String,
+    rows: std::sync::Arc<Vec<Row>>,
+    bytes: Vec<u8>,
+    mode: u8,
+    reply: std::sync::mpsc::SyncSender<PreparedInsert>,
+}
+impl EncodeJob {
+    pub(crate) fn encode(self) -> PreparedInsert {
+        let Self {
+            generation,
+            next_id,
+            collection,
+            rows,
+            bytes,
+            mode,
+            reply: _,
+        } = self;
+        let staged = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if mode == 2 {
+                panic!("injected WAL encoder panic");
+            }
+            let mut staged = prepare_insert_columns(generation, next_id, &collection, &rows, bytes);
+            if mode == 3 {
+                staged.encoding =
+                    PreparedEncoding::Failed(Error::runtime("injected WAL encoder failure"));
+            }
+            staged
+        }));
+        // Drop the worker input before reply; the caller recovers its Vec without copying.
+        drop(rows);
+        staged.unwrap_or_else(|payload| PreparedInsert {
+            pack: None,
+            encoding: PreparedEncoding::Panicked(payload),
+        })
+    }
+    fn run(self) {
+        let reply = self.reply.clone();
+        let staged = self.encode();
+        let _ = reply.send(staged);
+    }
+}
+pub(crate) fn start_insert_encoding(
+    persist: &mut Persist,
+    generation: u64,
+    next_id: u64,
+    collection: &str,
+    rows: std::sync::Arc<Vec<Row>>,
+    bytes: Vec<u8>,
+    mode: u8,
+) -> Result<std::sync::mpsc::Receiver<PreparedInsert>, EncodeJob> {
+    let (reply, receiver) = std::sync::mpsc::sync_channel(1);
+    let job = EncodeJob {
+        generation,
+        next_id,
+        collection: collection.to_owned(),
+        rows,
+        bytes,
+        mode,
+        reply,
+    };
+    if mode == 1 || mode == 5 {
+        return Err(job);
+    }
+    if mode == 4 {
+        drop(job);
+        return Ok(receiver);
+    }
+    if persist.encoder.is_none() {
+        persist.encoder = acquire_encoder();
+    }
+    let Some(worker) = persist.encoder.as_ref() else {
+        return Err(job);
+    };
+    match worker.sender.as_ref().unwrap().try_send(job) {
+        Ok(()) => Ok(receiver),
+        Err(
+            std::sync::mpsc::TrySendError::Full(job)
+            | std::sync::mpsc::TrySendError::Disconnected(job),
+        ) => Err(job),
+    }
+}
+
+pub(crate) struct EncodedColumns {
+    generation: u64,
+    next_id: u64,
+    collection: String,
+    fields: Vec<String>,
+    rows: u32,
+    magic: [u8; 4],
+    bytes: Vec<u8>,
+}
+
+pub(crate) enum PreparedEncoding {
+    Ready(EncodedColumns),
+    Failed(Error),
+    Panicked(Box<dyn std::any::Any + Send>),
+}
+
+pub(crate) struct PreparedInsert {
+    pub(crate) pack: Option<Pack>,
+    pub(crate) encoding: PreparedEncoding,
+}
+
+pub(crate) fn prepare_insert_columns(
+    generation: u64,
+    next_id: u64,
+    collection: &str,
+    rows: &[Row],
+    mut bytes: Vec<u8>,
+) -> PreparedInsert {
+    let pack = rows_to_insert_cols(collection, rows, Vec::new());
+    let encoding = match &pack {
+        Pack::InsertCols {
+            fields, cols, n, ..
+        } => {
+            match encode_insert_cols_v2(
+                generation, next_id, collection, fields, cols, *n, &mut bytes,
+            ) {
+                Ok(magic) => PreparedEncoding::Ready(EncodedColumns {
+                    generation,
+                    next_id,
+                    collection: collection.to_owned(),
+                    fields: fields.clone(),
+                    rows: *n,
+                    magic,
+                    bytes,
+                }),
+                Err(error) => PreparedEncoding::Failed(error),
+            }
+        }
+        _ => unreachable!("column pack builder"),
+    };
+    PreparedInsert {
+        pack: Some(pack),
+        encoding,
+    }
+}
+
+pub(crate) fn append_prepared_record(
+    log: &mut File,
+    rec: &LogRecord,
+    prepared: EncodedColumns,
+    buf: &mut Vec<u8>,
+    sync: SyncMode,
+    log_bytes: &mut u64,
+) -> Result<(), Error> {
+    let valid = rec.r#gen == prepared.generation
+        && rec.next_id == prepared.next_id
+        && matches!(&rec.pack, Pack::InsertCols { collection, fields, cols, n, edges }
+            if collection == &prepared.collection && fields == &prepared.fields
+                && fields.len() == cols.len() && *n == prepared.rows && edges.is_empty());
+    *buf = prepared.bytes;
+    if valid {
+        write_frame(log, &prepared.magic, buf, sync, log_bytes)
+    } else {
+        append_record(log, rec, buf, sync, log_bytes)
+    }
+}
+
 fn append_insert_cols_v2(
     log: &mut File,
     rec_gen: u64,
@@ -1462,6 +1662,23 @@ fn append_insert_cols_v2(
             sync,
             log_bytes,
         );
+    }
+    let magic = encode_insert_cols_v2(rec_gen, next_id, collection, fields, cols, n, buf)?;
+    write_frame(log, &magic, buf, sync, log_bytes)
+}
+
+/// Encode the existing typed-column payload without touching a file.
+fn encode_insert_cols_v2(
+    rec_gen: u64,
+    next_id: u64,
+    collection: &str,
+    fields: &[String],
+    cols: &[ColData],
+    n: u32,
+    buf: &mut Vec<u8>,
+) -> Result<[u8; 4], Error> {
+    if fields.len() != cols.len() {
+        return Err(io_err("typed column field count mismatch"));
     }
     let mut est_per_row = 32usize;
     for col in cols {
@@ -1602,17 +1819,11 @@ fn append_insert_cols_v2(
             ColData::Null => buf.push(0),
         }
     }
-    write_frame(
-        log,
-        if sparse_codec {
-            &LOG_MAGIC_SPARSE
-        } else {
-            &LOG_MAGIC_V2
-        },
-        buf,
-        sync,
-        log_bytes,
-    )
+    Ok(if sparse_codec {
+        LOG_MAGIC_SPARSE
+    } else {
+        LOG_MAGIC_V2
+    })
 }
 
 /// Replay complete records with `gen > min_gen`. Returns the byte offset of
@@ -3823,5 +4034,540 @@ mod wal_preallocation_tests {
         assert_eq!(std::fs::read(log_path(&path)).unwrap(), before);
         assert_eq!(before, b"prefixsuffix");
         std::fs::remove_dir_all(path).unwrap();
+    }
+}
+
+#[cfg(test)]
+fn append_insert_cols_v2_reference(
+    log: &mut File,
+    rec_gen: u64,
+    next_id: u64,
+    collection: &str,
+    fields: &[String],
+    cols: &[ColData],
+    n: u32,
+    edges: &[Edge],
+    buf: &mut Vec<u8>,
+    sync: SyncMode,
+    log_bytes: &mut u64,
+) -> Result<(), Error> {
+    // Fallback to msgpack if edges present (rare in bulk benches) or column mismatch.
+    if !edges.is_empty() || fields.len() != cols.len() {
+        return append_record_v1(
+            log,
+            &LogRecord {
+                r#gen: rec_gen,
+                next_id,
+                pack: Pack::InsertCols {
+                    collection: collection.to_string(),
+                    fields: fields.to_vec(),
+                    cols: cols.to_vec(),
+                    n,
+                    edges: edges.to_vec(),
+                },
+            },
+            buf,
+            sync,
+            log_bytes,
+        );
+    }
+    let mut est_per_row = 32usize;
+    for col in cols {
+        match col {
+            ColData::Vec(v) => {
+                let dim = v
+                    .first()
+                    .and_then(|opt| opt.as_ref())
+                    .map_or(0, |vec| vec.len());
+                est_per_row = est_per_row.saturating_add(8 + dim * 4);
+            }
+            ColData::Text(_) => est_per_row = est_per_row.saturating_add(16),
+            ColData::Int(_) | ColData::Float(_) | ColData::Time(_) => {
+                est_per_row = est_per_row.saturating_add(8)
+            }
+            ColData::Bool(_) => est_per_row = est_per_row.saturating_add(1),
+            ColData::Null => {}
+        }
+    }
+    buf.clear();
+    buf.reserve(64 + fields.len() * 16 + (n as usize) * est_per_row);
+    buf.push(V2_INSERT_COLS);
+    buf.extend_from_slice(&rec_gen.to_le_bytes());
+    buf.extend_from_slice(&next_id.to_le_bytes());
+    put_str(buf, collection);
+    buf.extend_from_slice(&n.to_le_bytes());
+    buf.extend_from_slice(&(fields.len() as u32).to_le_bytes());
+    let mut sparse_codec = false;
+    let mut sparse_decoded_bytes = 0usize;
+    for (f, c) in fields.iter().zip(cols.iter()) {
+        put_str(buf, f);
+        match c {
+            ColData::Text(v) => {
+                buf.push(1);
+                for s in v {
+                    put_str(buf, s);
+                }
+            }
+            ColData::Int(v) => {
+                buf.push(2);
+                for x in v {
+                    buf.extend_from_slice(&x.to_le_bytes());
+                }
+            }
+            ColData::Float(v) => {
+                buf.push(3);
+                for x in v {
+                    buf.extend_from_slice(&x.to_le_bytes());
+                }
+            }
+            ColData::Bool(v) => {
+                buf.push(4);
+                for x in v {
+                    buf.push(u8::from(*x));
+                }
+            }
+            ColData::Time(v) => {
+                buf.push(5);
+                for x in v {
+                    buf.extend_from_slice(&x.to_le_bytes());
+                }
+            }
+            ColData::Vec(v) if use_sparse_vectors(v) => {
+                if v.len() != n as usize {
+                    return Err(io_err("sparse vector column length mismatch"));
+                }
+                let storage = v
+                    .len()
+                    .checked_mul(std::mem::size_of::<Option<Vec<f32>>>())
+                    .ok_or_else(|| io_err("sparse vector size overflow"))?;
+                sparse_decoded_bytes = sparse_decoded_bytes
+                    .checked_add(storage)
+                    .ok_or_else(|| io_err("sparse vector size overflow"))?;
+                sparse_codec = true;
+                buf.push(7);
+                if v.len() >= 4096
+                    && v.iter()
+                        .flatten()
+                        .fold(0usize, |n, emb| n.saturating_add(emb.len()))
+                        >= 2 * 1024 * 1024
+                {
+                    for emb in v.iter().flatten() {
+                        let bytes = emb
+                            .len()
+                            .checked_mul(4)
+                            .ok_or_else(|| io_err("sparse vector size overflow"))?;
+                        sparse_decoded_bytes = sparse_decoded_bytes
+                            .checked_add(bytes)
+                            .filter(|&bytes| bytes <= MAX_SPARSE_DECODED_BYTES)
+                            .ok_or_else(|| io_err("sparse vectors exceed decoded 64MiB budget"))?;
+                    }
+                    append_sparse_rows_parallel(v, buf)?;
+                    continue;
+                }
+                for emb in v.iter().flatten() {
+                    let bytes = emb
+                        .len()
+                        .checked_mul(4)
+                        .ok_or_else(|| io_err("sparse vector size overflow"))?;
+                    sparse_decoded_bytes = sparse_decoded_bytes
+                        .checked_add(bytes)
+                        .filter(|&bytes| bytes <= MAX_SPARSE_DECODED_BYTES)
+                        .ok_or_else(|| io_err("sparse vectors exceed decoded 64MiB budget"))?;
+                }
+                append_sparse_rows_serial(v, buf)?;
+                if sparse_decoded_bytes > MAX_SPARSE_DECODED_BYTES {
+                    return Err(io_err("sparse vectors exceed decoded 64MiB budget"));
+                }
+            }
+            ColData::Vec(v) => {
+                buf.push(6);
+                for row in v {
+                    match row {
+                        Some(emb) if !emb.is_empty() => {
+                            buf.extend_from_slice(&(emb.len() as u32).to_le_bytes());
+                            #[cfg(target_endian = "little")]
+                            {
+                                // Safety: [f32] on little-endian has the exact IEEE 754 LE byte representation.
+                                let bytes = unsafe {
+                                    std::slice::from_raw_parts(
+                                        emb.as_ptr() as *const u8,
+                                        emb.len() * std::mem::size_of::<f32>(),
+                                    )
+                                };
+                                buf.extend_from_slice(bytes);
+                            }
+                            #[cfg(not(target_endian = "little"))]
+                            {
+                                for x in emb.iter() {
+                                    buf.extend_from_slice(&x.to_le_bytes());
+                                }
+                            }
+                        }
+                        _ => buf.extend_from_slice(&0u32.to_le_bytes()),
+                    }
+                }
+            }
+            ColData::Null => buf.push(0),
+        }
+    }
+    write_frame(
+        log,
+        if sparse_codec {
+            &LOG_MAGIC_SPARSE
+        } else {
+            &LOG_MAGIC_V2
+        },
+        buf,
+        sync,
+        log_bytes,
+    )
+}
+
+#[cfg(test)]
+mod pure_column_encoder_tests {
+    use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    };
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    fn framed(
+        reference: bool,
+        fields: &[String],
+        cols: &[ColData],
+        n: u32,
+        edges: &[Edge],
+    ) -> (Result<Vec<u8>, String>, u64, Vec<u8>) {
+        let path = std::env::temp_dir().join(format!(
+            "lin-pure-column-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        let mut buf = vec![1, 2, 3];
+        let mut log_bytes = 0;
+        let result = if reference {
+            append_insert_cols_v2_reference(
+                &mut file,
+                9,
+                42,
+                "docs",
+                fields,
+                cols,
+                n,
+                edges,
+                &mut buf,
+                SyncMode::Normal,
+                &mut log_bytes,
+            )
+        } else {
+            append_insert_cols_v2(
+                &mut file,
+                9,
+                42,
+                "docs",
+                fields,
+                cols,
+                n,
+                edges,
+                &mut buf,
+                SyncMode::Normal,
+                &mut log_bytes,
+            )
+        };
+        let disk = std::fs::read(&path).unwrap();
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+        (
+            result.map(|_| disk.clone()).map_err(|e| e.to_string()),
+            log_bytes,
+            disk,
+        )
+    }
+    fn compare(fields: &[String], cols: &[ColData], n: u32, edges: &[Edge]) {
+        let old = framed(true, fields, cols, n, edges);
+        let new = framed(false, fields, cols, n, edges);
+        assert_eq!(old, new);
+        if edges.is_empty() && fields.len() == cols.len() {
+            let mut buf = vec![4, 5, 6];
+            let pure = encode_insert_cols_v2(9, 42, "docs", fields, cols, n, &mut buf);
+            match (&old.0, pure) {
+                (Ok(frame), Ok(magic)) => {
+                    assert_eq!(frame[8], magic[3]);
+                    assert_eq!(&frame[9..frame.len() - 4], buf);
+                }
+                (Err(a), Err(b)) => {
+                    assert_eq!(*a, b.to_string());
+                    assert!(old.2.is_empty());
+                    assert_eq!(old.1, 0);
+                }
+                _ => panic!("pure/writer result mismatch"),
+            }
+        }
+    }
+    #[test]
+    fn pure_payload_matches_original_frames_and_fallbacks() {
+        let fields = ["body", "int", "float", "bool", "time", "vector", "null"].map(str::to_owned);
+        let cols = vec![
+            ColData::Text(
+                (0..6)
+                    .map(|i| Arc::from(format!("row {i} ЁЖ 😀")))
+                    .collect(),
+            ),
+            ColData::Int(vec![0, -1, i64::MIN, i64::MAX, 7, 8]),
+            ColData::Float(vec![
+                0.0,
+                -0.0,
+                f64::from_bits(0x7ff8000000000001),
+                f64::INFINITY,
+                -1.25,
+                3.5,
+            ]),
+            ColData::Bool(vec![false, true, false, true, false, true]),
+            ColData::Time(vec![0, 1, -1, i64::MIN, i64::MAX, 123]),
+            ColData::Vec(vec![
+                None,
+                Some(Arc::from([])),
+                Some(Arc::from([0.0; 35])),
+                Some(Arc::from([-0.0, f32::from_bits(0x7fc00001), f32::INFINITY])),
+                Some(Arc::from([1.0, 0.0, -1.0])),
+                Some(Arc::from([0.0, 2.0])),
+            ]),
+            ColData::Null,
+        ];
+        compare(&fields, &cols, 6, &[]);
+        compare(&[], &[], 0, &[]);
+        compare(
+            &["embedding".into()],
+            &[ColData::Vec(vec![Some(Arc::from(vec![1.0; 768])); 64])],
+            64,
+            &[],
+        );
+        compare(
+            &["embedding".into()],
+            &[ColData::Vec(vec![Some(Arc::from(vec![0.0; 768])); 4097])],
+            4097,
+            &[],
+        );
+        compare(&fields[..1], &cols[..2], 6, &[]);
+        compare(
+            &fields,
+            &cols,
+            6,
+            &[Edge {
+                rel: "links".into(),
+                from: "a".into(),
+                to: "b".into(),
+            }],
+        );
+        let mut buf = vec![7, 8, 9];
+        assert!(
+            encode_insert_cols_v2(9, 42, "docs", &fields[..1], &cols[..2], 6, &mut buf).is_err()
+        );
+        assert_eq!(buf, [7, 8, 9]);
+    }
+    #[test]
+    fn pure_payload_keeps_sparse_budget_failure_before_file_write() {
+        let rows = vec![Some(Arc::<[f32]>::from(vec![0.0; 4096])); 4097];
+        compare(&["embedding".into()], &[ColData::Vec(rows)], 4097, &[]);
+    }
+}
+
+#[cfg(test)]
+mod prepared_metadata_tests {
+    use super::*;
+    use crate::store::Cell;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    #[test]
+    fn stale_prepared_metadata_falls_back_to_actual_record() {
+        let rows = (0..3)
+            .map(|i| Row::from([("body".into(), Cell::Text(format!("body {i}").into()))]))
+            .collect::<Vec<_>>();
+        for generation in [8, 9] {
+            for next_id in [41, 42] {
+                for collection in ["other", "docs"] {
+                    for rename in [false, true] {
+                        for count in [2, 3] {
+                            let mut staged_rows = rows[..count].to_vec();
+                            if rename {
+                                for row in &mut staged_rows {
+                                    let value = row.remove("body").unwrap();
+                                    row.insert("renamed".into(), value);
+                                }
+                            }
+                            let staged = prepare_insert_columns(
+                                generation,
+                                next_id,
+                                collection,
+                                &staged_rows,
+                                Vec::new(),
+                            );
+                            let PreparedEncoding::Ready(encoded) = staged.encoding else {
+                                panic!("prepared bytes")
+                            };
+                            let rec = LogRecord {
+                                r#gen: 9,
+                                next_id: 42,
+                                pack: rows_to_insert_cols("docs", &rows[..2], Vec::new()),
+                            };
+                            let mut results = Vec::new();
+                            for prepared in [None, Some(encoded)] {
+                                let path = std::env::temp_dir().join(format!(
+                                    "lin-prepared-meta-{}-{}",
+                                    std::process::id(),
+                                    SEQUENCE.fetch_add(1, Ordering::Relaxed)
+                                ));
+                                let mut file = OpenOptions::new()
+                                    .read(true)
+                                    .write(true)
+                                    .create_new(true)
+                                    .open(&path)
+                                    .unwrap();
+                                let mut buf = vec![7, 8, 9];
+                                let mut bytes = 0;
+                                if let Some(encoded) = prepared {
+                                    append_prepared_record(
+                                        &mut file,
+                                        &rec,
+                                        encoded,
+                                        &mut buf,
+                                        SyncMode::Normal,
+                                        &mut bytes,
+                                    )
+                                    .unwrap();
+                                } else {
+                                    append_record(
+                                        &mut file,
+                                        &rec,
+                                        &mut buf,
+                                        SyncMode::Normal,
+                                        &mut bytes,
+                                    )
+                                    .unwrap();
+                                }
+                                let disk = std::fs::read(&path).unwrap();
+                                assert_eq!(bytes, disk.len() as u64);
+                                drop(file);
+                                std::fs::remove_file(path).unwrap();
+                                results.push(disk);
+                            }
+                            assert_eq!(results[0], results[1]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod persistent_encoder_queue_tests {
+    use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc,
+    };
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn actual_full_and_disconnected_queues_return_job_and_preserve_encoding() {
+        for full in [false, true] {
+            let path = std::env::temp_dir().join(format!(
+                "lin-encoder-queue-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let (store, mut persist) = crate::store::Store::open_with(
+                &path,
+                &crate::catalog::fixture(),
+                OpenMemOpts::default(),
+            )
+            .unwrap();
+            let (sender, receiver) = mpsc::sync_channel::<EncodeJob>(1);
+            persist.encoder = Some(Arc::new(EncoderWorker {
+                sender: Some(sender.clone()),
+                handle: None,
+            }));
+            let mut row = Row::new();
+            row.insert("id".into(), crate::Cell::text_arc("queue-row"));
+            let rows = Arc::new(vec![row]);
+            let receiver = if full {
+                let (reply, _response) = mpsc::sync_channel(1);
+                assert!(
+                    sender
+                        .try_send(EncodeJob {
+                            generation: 1,
+                            next_id: 2,
+                            collection: "docs".into(),
+                            rows: rows.clone(),
+                            bytes: Vec::new(),
+                            mode: 0,
+                            reply
+                        })
+                        .is_ok()
+                );
+                Some(receiver)
+            } else {
+                drop(receiver);
+                None
+            };
+            let rejected = match start_insert_encoding(
+                &mut persist,
+                1,
+                2,
+                "docs",
+                rows.clone(),
+                Vec::new(),
+                0,
+            ) {
+                Err(job) => job,
+                Ok(_) => panic!("unavailable queue accepted job"),
+            };
+            let staged = rejected.encode();
+            drop(receiver);
+            assert_eq!(Arc::strong_count(&rows), 1);
+            let expected = prepare_insert_columns(1, 2, "docs", &rows, Vec::new());
+            let (PreparedEncoding::Ready(actual), PreparedEncoding::Ready(expected)) =
+                (staged.encoding, expected.encoding)
+            else {
+                panic!("encoding failed")
+            };
+            assert_eq!(actual.magic, expected.magic);
+            assert_eq!(actual.bytes, expected.bytes);
+            assert_eq!(Arc::try_unwrap(rows).unwrap().len(), 1);
+            drop(sender);
+            drop(persist);
+            drop(store);
+            std::fs::remove_dir_all(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn last_worker_lease_disconnects_and_joins_thread() {
+        let (sender, receiver) = mpsc::sync_channel::<EncodeJob>(1);
+        let exited = Arc::new(AtomicBool::new(false));
+        let done = exited.clone();
+        let handle = std::thread::spawn(move || {
+            while let Ok(job) = receiver.recv() {
+                job.run();
+            }
+            done.store(true, Ordering::SeqCst);
+        });
+        let worker = Arc::new(EncoderWorker {
+            sender: Some(sender),
+            handle: Some(handle),
+        });
+        let other = worker.clone();
+        drop(worker);
+        assert!(!exited.load(Ordering::SeqCst));
+        drop(other);
+        assert!(exited.load(Ordering::SeqCst));
     }
 }
