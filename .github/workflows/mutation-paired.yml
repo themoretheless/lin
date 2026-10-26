@@ -25,30 +25,30 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
           import shutil,json,hashlib
-          src=Path('benches/results/2026-10-27-mutation-undo-owner-linux-gate')
-          dst=Path('benches/results/ci-mutation-undo-owner')
+          src=Path('benches/results/2026-10-27-fts-swap-delete-linux-gate')
+          dst=Path('benches/results/ci-fts-swap-delete')
           dst.mkdir()
           meta=json.loads((src/'input-provenance.json').read_text())
           assert all(hashlib.sha256(Path(f).read_bytes()).hexdigest()==h for f,h in meta['before_sha256'].items())
-          for name in ['build.py','test.py','run.py','summarize.py','contracts.py','mutation_contract.rs','candidate-exec.rs','candidate-store.rs','before-exec.rs','before-store.rs']:
+          for name in ['build.py','test.py','run.py','summarize.py','sensitivity.py','oracle.rs','candidate-fts.rs','candidate-store.rs','before-fts.rs','before-store.rs']:
               shutil.copy2(src/name,dst/name)
           PY
       - name: Check candidate and contract regressions
         run: |
-          python3 benches/results/ci-mutation-undo-owner/test.py
-          python3 benches/results/ci-mutation-undo-owner/contracts.py
+          python3 benches/results/ci-fts-swap-delete/test.py
+          python3 benches/results/ci-fts-swap-delete/sensitivity.py
       - name: Build frozen baseline and candidate
-        run: python3 benches/results/ci-mutation-undo-owner/build.py
+        run: python3 benches/results/ci-fts-swap-delete/build.py
       - name: Run two six-round A-A-B series
-        run: python3 benches/results/ci-mutation-undo-owner/run.py
+        run: python3 benches/results/ci-fts-swap-delete/run.py
       - name: Summarize every comparison and evaluate target
         run: |
-          python3 benches/results/ci-mutation-undo-owner/summarize.py
-          python3 scripts/check-mutation-paired.py benches/results/ci-mutation-undo-owner
+          python3 benches/results/ci-fts-swap-delete/summarize.py
+          python3 scripts/check-mutation-paired.py benches/results/ci-fts-swap-delete delete
       - name: Preserve raw results including failure
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: mutation-paired
-          path: benches/results/ci-mutation-undo-owner/
+          path: benches/results/ci-fts-swap-delete/
           if-no-files-found: error

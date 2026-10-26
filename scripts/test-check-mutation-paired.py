@@ -6,9 +6,9 @@ class Gate(unittest.TestCase):
  def fixture(self):
   names=[f'compare/{kind}_1row_{size}/{peer}'for kind in ['update','delete']for size in ['1k','10k','100k']for peer in ['lin','sqlite']]+[f'compare/tx_{kind}_1row_{size}/{peer}'for kind in ['commit','rollback']for size in ['1k','10k']for peer in ['lin','sqlite']]
   return {name:{series:dict(pairs=6,gain_percent=10 if '/update_'in name and name.endswith('/lin')else 0,aa_absolute_percent=1,positive_pairs=6,sqlite_wins=0)for series in ['series1','series2']}for name in names}
- def run_gate(self,data,status_count=36):
+ def run_gate(self,data,status_count=36,target=None):
   with tempfile.TemporaryDirectory()as directory:
-   p=Path(directory);(p/'summary.json').write_text(json.dumps(data));(p/'status.json').write_text(json.dumps([dict(exit_code=0)]*status_count));result=subprocess.run(['python3',str(ROOT/'scripts/check-mutation-paired.py'),str(p)],capture_output=True,text=True);q=json.loads((p/'qualification.json').read_text())if(p/'qualification.json').exists()else None
+   p=Path(directory);(p/'summary.json').write_text(json.dumps(data));(p/'status.json').write_text(json.dumps([dict(exit_code=0)]*status_count));result=subprocess.run(['python3',str(ROOT/'scripts/check-mutation-paired.py'),str(p)]+([]if target is None else[target]),capture_output=True,text=True);q=json.loads((p/'qualification.json').read_text())if(p/'qualification.json').exists()else None
    return result.returncode,q
  def test_complete_gain_is_scoped(self):
   code,q=self.run_gate(self.fixture());self.assertEqual(code,0);self.assertFalse(q['full_objective_achieved'])
@@ -21,4 +21,14 @@ class Gate(unittest.TestCase):
  def test_incomplete_runs_invalid(self):self.assertNotEqual(self.run_gate(self.fixture(),35)[0],0)
  def test_partial_series_invalid(self):
   data=self.fixture();data['compare/update_1row_1k/lin']['series1']['pairs']=5;self.assertNotEqual(self.run_gate(data)[0],0)
+ def delete_fixture(self):
+  data=self.fixture()
+  for case,series in data.items():
+   for q in series.values():q['gain_percent']=10 if case.startswith('compare/delete_1row_') and case.endswith('/lin') else 0
+  return data
+ def test_delete_target_is_explicit(self):
+  data=self.delete_fixture();self.assertEqual(self.run_gate(data,target='delete')[0],0);self.assertEqual(self.run_gate(data)[0],3)
+ def test_delete_target_keeps_update_control(self):
+  data=self.delete_fixture();data['compare/update_1row_1k/lin']['series1']['gain_percent']=-10;self.assertEqual(self.run_gate(data,target='delete')[0],3)
+ def test_invalid_target_rejected(self):self.assertNotEqual(self.run_gate(self.fixture(),target='insert')[0],0)
 if __name__=='__main__':unittest.main()
