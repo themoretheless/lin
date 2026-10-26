@@ -1,0 +1,359 @@
+    Checking lin v0.4.0 (/Users/themoretheless/.codex/worktrees/lin-wal-persistent-qualification/lin)
+error[E0308]: mismatched types
+    --> src/check.rs:679:72
+     |
+ 679 |                     if !all_present || crate::exec::eval_pred(&g.pred, &literal_row, 0) {
+     |                                        ----------------------          ^^^^^^^^^^^^ expected `&Row`, found `&BTreeMap<String, Cell>`
+     |                                        |
+     |                                        arguments to this function are incorrect
+     |
+     = note: expected reference `&Row`
+                found reference `&BTreeMap<std::string::String, store::Cell>`
+note: function defined here
+    --> src/exec.rs:6876:15
+     |
+6876 | pub(crate) fn eval_pred(pred: &Pred, row: &Row, now: i64) -> bool {
+     |               ^^^^^^^^^              ---------
+
+error[E0308]: mismatched types
+    --> src/exec.rs:6376:5
+     |
+6354 | pub(crate) fn emit_join_row(left: &Row, right: Option<&[Cell]>, plan: &[JoinFieldPlan]) -> Row {
+     |                                                                                            --- expected `Row` because of return type
+...
+6376 |     out
+     |     ^^^ expected `Row`, found `BTreeMap<String, Cell>`
+     |
+     = note: expected struct `Row`
+                found struct `BTreeMap<std::string::String, store::Cell>`
+help: call `Into::into` on this expression to convert `BTreeMap<std::string::String, store::Cell>` into `Row`
+     |
+6376 |     out.into()
+     |        +++++++
+
+error[E0308]: mismatched types
+    --> src/exec.rs:6398:5
+     |
+6385 | ) -> Row {
+     |      --- expected `Row` because of return type
+...
+6398 |     out
+     |     ^^^ expected `Row`, found `BTreeMap<String, Cell>`
+     |
+     = note: expected struct `Row`
+                found struct `BTreeMap<std::string::String, store::Cell>`
+help: call `Into::into` on this expression to convert `BTreeMap<std::string::String, store::Cell>` into `Row`
+     |
+6398 |     out.into()
+     |        +++++++
+
+error[E0308]: mismatched types
+    --> src/exec.rs:6444:5
+     |
+6440 | fn meta_row(kind: &str, name: &str) -> Row {
+     |                                        --- expected `Row` because of return type
+...
+6444 |     r
+     |     ^ expected `Row`, found `BTreeMap<_, Cell>`
+     |
+     = note: expected struct `Row`
+                found struct `BTreeMap<_, store::Cell>`
+help: call `Into::into` on this expression to convert `BTreeMap<_, store::Cell>` into `Row`
+     |
+6444 |     r.into()
+     |      +++++++
+
+error[E0308]: mismatched types
+    --> src/exec.rs:6452:5
+     |
+6447 | fn edge_row(rel: &str, from: &str, to: &str) -> Row {
+     |                                                 --- expected `Row` because of return type
+...
+6452 |     r
+     |     ^ expected `Row`, found `BTreeMap<_, Cell>`
+     |
+     = note: expected struct `Row`
+                found struct `BTreeMap<_, store::Cell>`
+help: call `Into::into` on this expression to convert `BTreeMap<_, store::Cell>` into `Row`
+     |
+6452 |     r.into()
+     |      +++++++
+
+error[E0308]: mismatched types
+    --> src/exec.rs:6533:5
+     |
+6528 | fn record_row(record: &Record, now: i64) -> Row {
+     |                                             --- expected `Row` because of return type
+...
+6533 |     row
+     |     ^^^ expected `Row`, found `BTreeMap<String, Cell>`
+     |
+     = note: expected struct `Row`
+                found struct `BTreeMap<std::string::String, store::Cell>`
+help: call `Into::into` on this expression to convert `BTreeMap<std::string::String, store::Cell>` into `Row`
+     |
+6533 |     row.into()
+     |        +++++++
+
+error[E0308]: mismatched types
+  --> src/store.rs:91:5
+   |
+90 | pub fn acquire_row() -> Row {
+   |                         --- expected `Row` because of return type
+91 |     TLS_ROW_POOL.with(|p| p.borrow_mut().acquire())
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `Row`, found `BTreeMap<String, Cell>`
+   |
+   = note: expected struct `Row`
+              found struct `BTreeMap<std::string::String, store::Cell>`
+help: call `Into::into` on this expression to convert `BTreeMap<std::string::String, store::Cell>` into `Row`
+   |
+91 |     TLS_ROW_POOL.with(|p| p.borrow_mut().acquire()).into()
+   |                                                    +++++++
+
+error[E0308]: mismatched types
+  --> src/store.rs:97:50
+   |
+97 |     TLS_ROW_POOL.with(|p| p.borrow_mut().release(row));
+   |                                          ------- ^^^ expected `BTreeMap<String, Cell>`, found `Row`
+   |                                          |
+   |                                          arguments to this method are incorrect
+   |
+   = note: expected struct `BTreeMap<std::string::String, store::Cell>`
+              found struct `Row`
+note: method defined here
+  --> src/store.rs:67:12
+   |
+67 |     pub fn release(&mut self, mut row: BTreeMap<String, Cell>) {
+   |            ^^^^^^^            -------------------------------
+
+error[E0308]: mismatched types
+    --> src/store.rs:1687:24
+     |
+1687 |             facts.push(row);
+     |                   ---- ^^^ expected `Row`, found `BTreeMap<_, Cell>`
+     |                   |
+     |                   arguments to this method are incorrect
+     |
+     = note: expected struct `Row`
+                found struct `BTreeMap<_, store::Cell>`
+note: method defined here
+    --> /Users/themoretheless/.rustup/toolchains/nightly-aarch64-apple-darwin/lib/rustlib/src/rust/library/alloc/src/vec/mod.rs:959:12
+     |
+ 959 |     pub fn push(&mut self, value: T) {
+     |            ^^^^
+help: call `Into::into` on this expression to convert `BTreeMap<_, store::Cell>` into `Row`
+     |
+1687 |             facts.push(row.into());
+     |                           +++++++
+
+error[E0308]: mismatched types
+    --> src/store.rs:1908:14
+     |
+1908 |         Some(row)
+     |         ---- ^^^ expected `Row`, found `BTreeMap<String, Cell>`
+     |         |
+     |         arguments to this enum variant are incorrect
+     |
+     = note: expected struct `Row`
+                found struct `BTreeMap<std::string::String, store::Cell>`
+help: the type constructed contains `BTreeMap<std::string::String, store::Cell>` due to the type of the argument passed
+    --> src/store.rs:1908:9
+     |
+1908 |         Some(row)
+     |         ^^^^^---^
+     |              |
+     |              this argument influences the type of `Some`
+note: tuple variant defined here
+    --> /Users/themoretheless/.rustup/toolchains/nightly-aarch64-apple-darwin/lib/rustlib/src/rust/library/core/src/option.rs:606:5
+     |
+ 606 |     Some(#[stable(feature = "rust1", since = "1.0.0")] T),
+     |     ^^^^
+help: call `Into::into` on this expression to convert `BTreeMap<std::string::String, store::Cell>` into `Row`
+     |
+1908 |         Some(row.into())
+     |                 +++++++
+
+error[E0308]: mismatched types
+    --> src/store.rs:2062:28
+     |
+2062 |                 facts.push(built.clone());
+     |                       ---- ^^^^^^^^^^^^^ expected `Row`, found `BTreeMap<_, Cell>`
+     |                       |
+     |                       arguments to this method are incorrect
+     |
+     = note: expected struct `Row`
+                found struct `BTreeMap<_, store::Cell>`
+note: method defined here
+    --> /Users/themoretheless/.rustup/toolchains/nightly-aarch64-apple-darwin/lib/rustlib/src/rust/library/alloc/src/vec/mod.rs:959:12
+     |
+ 959 |     pub fn push(&mut self, value: T) {
+     |            ^^^^
+help: call `Into::into` on this expression to convert `BTreeMap<_, store::Cell>` into `Row`
+     |
+2062 |                 facts.push(built.clone().into());
+     |                                         +++++++
+
+error[E0308]: mismatched types
+    --> src/store.rs:2069:10
+     |
+2069 |         (built, true)
+     |          ^^^^^ expected `Row`, found `BTreeMap<_, Cell>`
+     |
+     = note: expected struct `Row`
+                found struct `BTreeMap<_, store::Cell>`
+help: call `Into::into` on this expression to convert `BTreeMap<_, store::Cell>` into `Row`
+     |
+2069 |         (built.into(), true)
+     |               +++++++
+
+error[E0308]: mismatched types
+    --> src/store.rs:2118:27
+     |
+2101 |                     rows.push(self.collections["facts"][idx].clone());
+     |                     ----      -------------------------------------- this argument has type `Row`...
+     |                     |
+     |                     ... which causes `rows` to have type `Vec<Row>`
+...
+2118 |                 rows.push(row);
+     |                      ---- ^^^ expected `Row`, found `BTreeMap<_, Cell>`
+     |                      |
+     |                      arguments to this method are incorrect
+     |
+     = note: expected struct `Row`
+                found struct `BTreeMap<_, store::Cell>`
+note: method defined here
+    --> /Users/themoretheless/.rustup/toolchains/nightly-aarch64-apple-darwin/lib/rustlib/src/rust/library/alloc/src/vec/mod.rs:959:12
+     |
+ 959 |     pub fn push(&mut self, value: T) {
+     |            ^^^^
+help: call `Into::into` on this expression to convert `BTreeMap<_, store::Cell>` into `Row`
+     |
+2118 |                 rows.push(row.into());
+     |                              +++++++
+
+error[E0308]: mismatched types
+    --> src/store.rs:3441:22
+     |
+3427 |                 out.push(row_id_title(&self.docs_id[i], &self.docs_title[i]));
+     |                 ---      --------------------------------------------------- this argument has type `Row`...
+     |                 |
+     |                 ... which causes `out` to have type `Vec<Row>`
+...
+3441 |             out.push(row);
+     |                 ---- ^^^ expected `Row`, found `BTreeMap<String, Cell>`
+     |                 |
+     |                 arguments to this method are incorrect
+     |
+     = note: expected struct `Row`
+                found struct `BTreeMap<std::string::String, store::Cell>`
+note: method defined here
+    --> /Users/themoretheless/.rustup/toolchains/nightly-aarch64-apple-darwin/lib/rustlib/src/rust/library/alloc/src/vec/mod.rs:959:12
+     |
+ 959 |     pub fn push(&mut self, value: T) {
+     |            ^^^^
+help: call `Into::into` on this expression to convert `BTreeMap<std::string::String, store::Cell>` into `Row`
+     |
+3441 |             out.push(row.into());
+     |                         +++++++
+
+error[E0308]: mismatched types
+    --> src/store.rs:3480:22
+     |
+3466 |                 out.push(row_id_title(&self.docs_id[i], &self.docs_title[i]));
+     |                 ---      --------------------------------------------------- this argument has type `Row`...
+     |                 |
+     |                 ... which causes `out` to have type `Vec<Row>`
+...
+3480 |             out.push(row);
+     |                 ---- ^^^ expected `Row`, found `BTreeMap<String, Cell>`
+     |                 |
+     |                 arguments to this method are incorrect
+     |
+     = note: expected struct `Row`
+                found struct `BTreeMap<std::string::String, store::Cell>`
+note: method defined here
+    --> /Users/themoretheless/.rustup/toolchains/nightly-aarch64-apple-darwin/lib/rustlib/src/rust/library/alloc/src/vec/mod.rs:959:12
+     |
+ 959 |     pub fn push(&mut self, value: T) {
+     |            ^^^^
+help: call `Into::into` on this expression to convert `BTreeMap<std::string::String, store::Cell>` into `Row`
+     |
+3480 |             out.push(row.into());
+     |                         +++++++
+
+error[E0308]: mismatched types
+    --> src/store.rs:3495:5
+     |
+3491 | fn row_id_title(id: &Arc<str>, title: &Arc<str>) -> Row {
+     |                                                     --- expected `Row` because of return type
+...
+3495 |     row
+     |     ^^^ expected `Row`, found `BTreeMap<String, Cell>`
+     |
+     = note: expected struct `Row`
+                found struct `BTreeMap<std::string::String, store::Cell>`
+help: call `Into::into` on this expression to convert `BTreeMap<std::string::String, store::Cell>` into `Row`
+     |
+3495 |     row.into()
+     |        +++++++
+
+error[E0308]: mismatched types
+    --> src/store.rs:3726:5
+     |
+3714 | fn doc_row(d: DocSeed<'_>) -> Row {
+     |                               --- expected `Row` because of return type
+...
+3726 |     r
+     |     ^ expected `Row`, found `BTreeMap<_, Cell>`
+     |
+     = note: expected struct `Row`
+                found struct `BTreeMap<_, store::Cell>`
+help: call `Into::into` on this expression to convert `BTreeMap<_, store::Cell>` into `Row`
+     |
+3726 |     r.into()
+     |      +++++++
+
+error[E0308]: mismatched types
+    --> src/store.rs:3733:5
+     |
+3729 | fn user_row(id: &str, email: &str) -> Row {
+     |                                       --- expected `Row` because of return type
+...
+3733 |     r
+     |     ^ expected `Row`, found `BTreeMap<_, Cell>`
+     |
+     = note: expected struct `Row`
+                found struct `BTreeMap<_, store::Cell>`
+help: call `Into::into` on this expression to convert `BTreeMap<_, store::Cell>` into `Row`
+     |
+3733 |     r.into()
+     |      +++++++
+
+error[E0308]: mismatched types
+    --> src/store.rs:3742:5
+     |
+3736 | fn order_row(id: &str, user_id: &str, total: f64, ts: i64) -> Row {
+     |                                                               --- expected `Row` because of return type
+...
+3742 |     r
+     |     ^ expected `Row`, found `BTreeMap<_, Cell>`
+     |
+     = note: expected struct `Row`
+                found struct `BTreeMap<_, store::Cell>`
+help: call `Into::into` on this expression to convert `BTreeMap<_, store::Cell>` into `Row`
+     |
+3742 |     r.into()
+     |      +++++++
+
+error[E0502]: cannot borrow `*row` as mutable because it is also borrowed as immutable
+    --> src/exec.rs:5501:13
+     |
+5496 |             let text = embed::row_embed_text(row);
+     |                                              --- immutable borrow occurs here
+...
+5501 |             row.insert("embedding".into(), Cell::Vec(emb.embed(&text)));
+     |             ^^^ mutable borrow occurs here                     ----- immutable borrow later used here
+
+Some errors have detailed explanations: E0308, E0502.
+For more information about an error, try `rustc --explain E0308`.
+error: could not compile `lin` (lib) due to 20 previous errors

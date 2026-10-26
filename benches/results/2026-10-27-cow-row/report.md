@@ -1,0 +1,9 @@
+# Arc copy-on-write Row prototype
+
+Independent main205 experiment; production source unchanged. Experimental Row wraps Arc<BTreeMap<String,Cell>>, Clone shares immutable map; DerefMut/iter_mut use Arc::make_mut. Owned iteration uses Arc::unwrap_or_clone. Serde transparent; Row::from array,FromIterator,Extend and borrowed/owned iteration implemented. Internal map construction sites in Store/exec/check adjusted. Reembed computes embedding before mutating map to preserve borrow rules. Existing RowPool public map methods preserved via explicit boundary conversion.
+
+Library cargo check passes. 263 focused tests pass,2existing ignored, including transaction rollback,WAL/reopen,partial unique indexes,mutation contracts and query/exec. Dedicated COW oracle verifies clone isolation under insert/remove/entry/mutable iteration, owned iteration and exact JSON/MessagePack bytes against BTreeMap. Initial20compiler errors and correction logs retained. Sources restored byte-for-byte after every check/test.
+
+Not production-ready: public Row was a BTreeMap type alias and is now a newtype in this prototype. Exact-type assignments, downstream trait implementations,derive bindings,CLI/examples,all features and direct mutation APIs require explicit compatibility review. These tests do not establish all historical reader compatibility or a safe public API migration. Initial row creation adds Arc allocation and pointer indirection; shared mutation deep-copies map. Need full lifecycle,bulk/native/durable,read/lookup/streaming,RSS,multirow and fresh-input paired benchmarks,including output/undo/Pack ownership and Drop costs. No speed or peer-win claim yet.
+
+No prior rejected optimization included. This is a different architectural hypothesis intended to remove repeated full-row cloning rather than shave isolated lookup nanoseconds. Preserve original benchmark contracts and all losses when evaluating it.
