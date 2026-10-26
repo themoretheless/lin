@@ -1,0 +1,68 @@
+   Compiling lin v0.4.0 (/Users/themoretheless/.codex/worktrees/lin-wal-persistent-qualification/lin)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.38s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running tests/persist.rs (target/debug/build/lin/fb1a24fa108a4f44/out/persist-fb1a24fa108a4f44)
+
+running 42 tests
+
+running 1 test
+
+running 1 test
+test crash_exit_keeps_full_commit ... ok
+test crash_exit_keeps_entire_group_commit ... ok
+test bulk_insert_survives_reopen ... ok
+test absolute_timestamps_survive_bulk_wal_checkpoint_and_reopen ... ok
+test append_idempotent_after_reopen ... ok
+test delete_survives_reopen ... ok
+test embedding_survives_durable_reopen ... ok
+test cold_checkpoint_reopen ... ok
+test memory_snapshot_restore ... ok
+test durable_fts_blob_survives_checkpoint_reopen ... ok
+test cas_after_reopen ... ok
+test checkpoint_compacts_log ... ok
+test catalog_filter_survives_checkpoint_reopen ... ok
+test backup_export_import_roundtrip ... ok
+test index_survives_reopen ... ok
+test insert_survives_reopen ... ok
+test quotas_reject_excess_rows ... ok
+test reader_snapshot_is_frozen_and_read_only ... ok
+test shared_readers_across_threads ... ok
+test cold_backup_self_contained ... ok
+test insert_with_edge_survives ... ok
+test open_read_loads_durable_without_writer ... ok
+test open_read_does_not_see_commits_after_open ... ok
+test follower_rejects_wal_gap ... ok
+test large_bulk_insert_survives_reopen ... ok
+test durable_follower_hot_standby ... ok
+test large_insert_wal_contains_rows_elided_from_handle ... ok
+test new_col_survives_reopen ... ok
+test multi_stmt_one_gen_and_atomic_durable ... ok
+test store_open_api_and_snapshot ... ok
+
+running 1 test
+test owned_survives_checkpoint_reopen ... ok
+test wal_export_apply_roundtrip ... ok
+test sync_normal_survives_checkpoint ... ok
+test writer_lock_rejects_second_open ... ok
+test wal_update_after_snapshot_replays_against_row_maps ... ok
+test ship_tcp_follower_sync ... ok
+test ship_tls_token_roundtrip ... ok
+test partial_index_predicate_survives_wal_and_checkpoint_reopen ... ok
+test truncated_last_record_ignored ... ok
+test test_checkpoint_pause_budget_lin_0163 ... ok
+test last_acknowledged_prefix_recovers_after_torn_trailing_frame_and_continues_writing ... ok
+test large_sparse_embedding_insert_is_one_durable_frame_and_replays_exactly ... ok
+
+test result: ok. 42 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.00s
+
+     Running tests/snapshot_tests.rs (target/debug/build/lin/1197b06d603236ff/out/snapshot_tests-1197b06d603236ff)
+
+running 4 tests
+test test_snapshot_generation_isolation_lin_1322 ... ok
+test test_readdb_visibility_contract_lin_1321 ... ok
+test test_snapshot_index_consistency_lin_1323 ... ok
+test test_snapshot_fts_consistency_lin_1324 ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

@@ -548,6 +548,7 @@ pub fn read_snapshot(dir: &Path) -> Result<Option<Snapshot>, Error> {
     }
     if len >= 16 * 1024 {
         let mmap = unsafe { memmap2::MmapOptions::new().map(&file) }.map_err(io_err)?;
+        #[cfg(unix)]
         let _ = mmap.advise(memmap2::Advice::Sequential);
         decode_snapshot_bytes(&mmap)
             .map(Some)
@@ -682,6 +683,7 @@ pub fn read_backup(path: &Path) -> Result<Snapshot, Error> {
     }
     if len >= 16 * 1024 {
         let mmap = unsafe { memmap2::MmapOptions::new().map(&file) }.map_err(io_err)?;
+        #[cfg(unix)]
         let _ = mmap.advise(memmap2::Advice::Sequential);
         decode_snapshot_bytes(&mmap).ok_or_else(|| io_err("corrupt backup"))
     } else {

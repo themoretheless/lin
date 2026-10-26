@@ -60,6 +60,7 @@ jobs:
             | tee mutation-report.md
           cat mutation-report.md >> "$GITHUB_STEP_SUMMARY"
       - name: Upload bench report
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: bench-report
