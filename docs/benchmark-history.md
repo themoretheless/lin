@@ -8,6 +8,8 @@
 
 ## Обновление 2026-10-26
 
+- [Small WAL overlap с O(1) hint — принято](../benches/results/2026-10-26-small-neon-hint-engine/report.md): frozen8b0e9717, durable1k +10,98% /+11,74% conventional и+13,28% /+10,15% interleaved,12/12 положительных пар в каждом протоколе. Entry683+9,80/+11,79%; первоначальные отрицательные guard682 сохранены, дополнительные повторы их не воспроизвели. Native acceleration не заявлена. SQLite durable1k всё ещё быстрее:1,365–1,369мс противLin1,638–1,733мс. Полные gates, mixed-vector raw-bit replay,12 byte-equal WAL scenarios и идентичность финальных release binaries прошли.
+
 
 - [Sparse mask cache — отклонено](../benches/results/2026-10-26-sparse-mask-cache-cpu/report.md): default1k CPU −30,91% /−30,44%; half-density выигрыш не компенсирует регрессии default/zero/dense. Начальный ошибочный dense writer сохранён отдельно; production не менялся.
 - [Small NEON overlap — CPU feasibility](../benches/results/2026-10-26-small-neon-overlap-cpu/report.md): default1k warm +43,48% /+44,83%, cold +39,60% /+40,47%; без полного frame/I/O/sync, не peer-победа.

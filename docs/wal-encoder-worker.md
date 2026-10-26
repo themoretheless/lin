@@ -8,8 +8,12 @@ This does not establish the full eight-peer benchmark objective.
 
 For a single ordinary durable insert, eligible finalized row batches can overlap
 column packing/payload encoding with existing index/FTS/HNSW/row-map maintenance.
-The initial policy is 4096..=16384 rows, no edges, and 2Mi..=16Mi embedding float
-values. Explicit transactions, multi-statement programs, native stores and other
+The large-batch policy is 4096..=16384 rows, no edges, and 2Mi..=16Mi embedding
+float values. The [qualified small-batch extension](../benches/results/2026-10-26-small-neon-hint-engine/report.md)
+also permits512..4095 rows: first finalized embedding length times row count
+must be at least512Ki floats, then the exact total must be512Ki..=16Mi floats.
+The first-vector hint is conservative: mixed dimensions may stay serial; it
+never replaces the exact worker budget.512Ki floats is2MiB of raw f32 values. Explicit transactions, multi-statement programs, native stores and other
 batch/vector sizes retain sequential encoding. These bounds are a dispatch
 policy, not universal performance guarantees.
 

@@ -5710,15 +5710,28 @@ impl Db {
 
         let start = self.store.collection(collection).len();
         let staged = if allow_preencode
-            && (4096..=16384).contains(&n)
+            && (512..=16384).contains(&n)
             && edges.is_empty()
             && self.persist.is_some()
+            // A conservative O(1) hint avoids scanning every small serial slab.
+            // Mixed dimensions may stay serial; the exact budget below remains
+            // authoritative before any worker is started.
+            && (n >= 4096
+                || built
+                    .first()
+                    .and_then(|row| row.get("embedding").and_then(Cell::as_vec))
+                    .is_some_and(|vector| vector.len().saturating_mul(n) >= 512 * 1024))
             && {
                 let floats = built
                     .iter()
                     .filter_map(|row| row.get("embedding").and_then(Cell::as_vec))
                     .fold(0usize, |total, vector| total.saturating_add(vector.len()));
-                (2 * 1024 * 1024..=16 * 1024 * 1024).contains(&floats)
+                let minimum = if n < 4096 {
+                    512 * 1024
+                } else {
+                    2 * 1024 * 1024
+                };
+                (minimum..=16 * 1024 * 1024).contains(&floats)
             } {
             let generation = self.store.r#gen.wrapping_add(1);
             let next_id = self.store.next_id;
@@ -8891,23 +8904,95 @@ mod preencoded_insert_tests {
     }
     #[test]
     fn worker_spawn_fallback_matches_normal_values_and_readonly_replay() {
-        for mode in [0, 1, 4, 5] {
-            let (_dir, mut db) = open();
-            db.run("index docs [wing, ts]").unwrap();
-            let _mode = Mode::new(mode);
-            let src = source(4096);
-            assert_eq!(db.run(&src).unwrap().done.n, 4096);
-            assert_eq!(PREENCODE_TEST_ATTEMPTS.with(|x| x.get()), 1);
-            let mut expected = Db::empty();
-            expected.run("index docs [wing, ts]").unwrap();
-            expected.run(&src).unwrap();
-            let query = "docs | {id, uri, title, body, wing, ts, hash, embedding} | take 5000";
-            let a = db.run(query).unwrap().rows;
-            let b = expected.run(query).unwrap().rows;
-            assert_eq!(a.len(), 4096);
-            assert_eq!(a, b);
+        for n in [683, 1000, 4096] {
+            for mode in [0, 1, 4, 5] {
+                let (_dir, mut db) = open();
+                db.run("index docs [wing, ts]").unwrap();
+                let _mode = Mode::new(mode);
+                let src = source(n);
+                assert_eq!(db.run(&src).unwrap().done.n, n);
+                assert_eq!(PREENCODE_TEST_ATTEMPTS.with(|x| x.get()), 1);
+                let mut expected = Db::empty();
+                expected.run("index docs [wing, ts]").unwrap();
+                expected.run(&src).unwrap();
+                let query = "docs | {id, uri, title, body, wing, ts, hash, embedding} | take 5000";
+                let a = db.run(query).unwrap().rows;
+                let b = expected.run(query).unwrap().rows;
+                assert_eq!(a.len(), n);
+                assert_eq!(a, b);
+                let read = Db::open_read(&_dir.0).unwrap();
+                assert_eq!(read.run(query).unwrap().rows, a);
+                drop(read);
+                drop(db);
+            }
+        }
+    }
+    #[test]
+    fn exact_small_float_budget_can_start_at_512_rows() {
+        let (_dir, db) = open();
+        let mut db = db.with_embedder(std::sync::Arc::new(crate::embed::HashingEmbedder::new(
+            "test/1024",
+            1024,
+        )));
+        let _mode = Mode::new(0);
+        db.run(&source(512)).unwrap();
+        assert_eq!(PREENCODE_TEST_ATTEMPTS.with(|x| x.get()), 1);
+        drop(db);
+    }
+    #[test]
+    fn small_work_hint_is_conservative_for_mixed_vector_dimensions() {
+        struct SkewEmbedder {
+            first: usize,
+            rest: usize,
+        }
+        fn vector(n: usize) -> Arc<[f32]> {
+            let mut values = vec![0.0; n];
+            values[0] = 1.0;
+            values[1] = -0.0;
+            values[2] = f32::from_bits(1);
+            values.into()
+        }
+        impl crate::embed::Embedder for SkewEmbedder {
+            fn id(&self) -> &str {
+                "test/skew"
+            }
+            fn dim(&self) -> usize {
+                self.rest
+            }
+            fn embed(&self, _: &str) -> Arc<[f32]> {
+                vector(self.rest)
+            }
+            fn embed_batch(&self, texts: &[&str]) -> Vec<Arc<[f32]>> {
+                let first = vector(self.first);
+                let rest = vector(self.rest);
+                (0..texts.len())
+                    .map(|i| if i == 0 { first.clone() } else { rest.clone() })
+                    .collect()
+            }
+        }
+        // Hint true but actual total below budget; hint false despite a large
+        // total; and a genuinely eligible uniform batch. The hint is routing
+        // only and never replaces the exact total used by the worker guard.
+        for (first, rest, attempts) in [(1024, 8, 0), (8, 1024, 0), (1024, 1024, 1)] {
+            let (_dir, db) = open();
+            let mut db = db.with_embedder(Arc::new(SkewEmbedder { first, rest }));
+            let _mode = Mode::new(0);
+            db.run(&source(683)).unwrap();
+            assert_eq!(PREENCODE_TEST_ATTEMPTS.with(|x| x.get()), attempts);
+            let verify = |rows: &[Row]| {
+                assert_eq!(rows.len(), 683);
+                for (i, row) in rows.iter().enumerate() {
+                    let values = row["embedding"].as_vec().unwrap();
+                    assert_eq!(values.len(), if i == 0 { first } else { rest });
+                    assert_eq!(values[0].to_bits(), 1.0f32.to_bits());
+                    assert_eq!(values[1].to_bits(), (-0.0f32).to_bits());
+                    assert_eq!(values[2].to_bits(), 1);
+                    assert!(values[3..].iter().all(|v| v.to_bits() == 0));
+                }
+            };
+            verify(db.store.collection("docs"));
             let read = Db::open_read(&_dir.0).unwrap();
-            assert_eq!(read.run(query).unwrap().rows, a);
+            verify(&read.run("docs | take 1000").unwrap().rows);
             drop(read);
             drop(db);
         }
@@ -8919,7 +9004,7 @@ mod preencoded_insert_tests {
             db.run("index docs [wing, ts]").unwrap();
             let _mode = Mode::new(mode);
             db.quotas.max_rows = 0;
-            let error = db.run(&source(4096)).err().unwrap();
+            let error = db.run(&source(683)).err().unwrap();
             assert!(error.to_string().contains("quota:"), "{error}");
             assert!(db.store.collection("docs").is_empty());
             assert!(db.store.row_index("docs", "i0").is_none());
@@ -8927,7 +9012,7 @@ mod preencoded_insert_tests {
             let (_dir, mut db) = open();
             db.run("index docs unique [wing]").unwrap();
             let _mode = Mode::new(mode);
-            let error = db.run(&source(4096)).err().unwrap();
+            let error = db.run(&source(683)).err().unwrap();
             assert!(error.to_string().contains("unique index"), "{error}");
             assert!(db.store.collection("docs").is_empty());
             drop(db);
@@ -8936,7 +9021,7 @@ mod preencoded_insert_tests {
         db.run("index docs [wing, ts]").unwrap();
         let _mode = Mode::new(3);
         let before = std::fs::read(_dir.0.join("log")).unwrap();
-        let error = db.run(&source(4096)).err().unwrap();
+        let error = db.run(&source(683)).err().unwrap();
         assert!(error.to_string().contains("injected WAL encoder failure"));
         assert!(db.store.collection("docs").is_empty());
         assert_eq!(std::fs::read(_dir.0.join("log")).unwrap(), before);
@@ -8953,11 +9038,32 @@ mod preencoded_insert_tests {
         assert_eq!(PREENCODE_TEST_ATTEMPTS.with(|x| x.get()), 0);
         drop(db);
         let (_dir, mut db) = open();
-        db.run(&source(4095)).unwrap();
+        db.run(&source(511)).unwrap();
+        assert_eq!(PREENCODE_TEST_ATTEMPTS.with(|x| x.get()), 0);
+        drop(db);
+        for n in [512, 682] {
+            let (_dir, mut db) = open();
+            db.run(&source(n)).unwrap();
+            assert_eq!(PREENCODE_TEST_ATTEMPTS.with(|x| x.get()), 0);
+            drop(db);
+        }
+        let (_dir, db) = open();
+        let mut db = db.with_embedder(std::sync::Arc::new(crate::embed::HashingEmbedder::new(
+            "test/2048",
+            2048,
+        )));
+        db.run(&source(511)).unwrap();
         assert_eq!(PREENCODE_TEST_ATTEMPTS.with(|x| x.get()), 0);
         drop(db);
         let (_dir, db) = open();
         let mut db = db.without_embedder();
+        db.run(&source(4096)).unwrap();
+        assert_eq!(PREENCODE_TEST_ATTEMPTS.with(|x| x.get()), 0);
+        drop(db);
+        let (_dir, db) = open();
+        let mut db = db.with_embedder(std::sync::Arc::new(crate::embed::HashingEmbedder::new(
+            "test/64", 64,
+        )));
         db.run(&source(4096)).unwrap();
         assert_eq!(PREENCODE_TEST_ATTEMPTS.with(|x| x.get()), 0);
         drop(db);

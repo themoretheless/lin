@@ -1,0 +1,1 @@
+The frozen worker only accepts512/682/683/1k/10k.511 failed its input assertion before preflight/timing. No measured observations from this failed draft. Corrected follow-up uses512 and682 with exactly the same frozen worker binaries.
