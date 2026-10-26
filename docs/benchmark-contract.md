@@ -300,3 +300,13 @@ Apple-Silicon matrix or presented as a cloud-production latency guarantee.
 
 SQL Server platform/container setup follows
 [Microsoft's official quickstart](https://learn.microsoft.com/en-us/sql/linux/install-upgrade/quickstart-install-docker?view=sql-server-linux-ver16).
+
+Kusto performance qualification requires a real test cluster. Microsoft's
+[emulator overview](https://learn.microsoft.com/en-us/azure/data-explorer/kusto-emulator-overview)
+explicitly excludes emulator benchmarking and describes a different performance
+profile from the service. Separate emulator functional tests cannot count as
+Kusto benchmark wins.
+
+For a lightweight peer binary without root benchmark-only DuckDB/Airbug build
+dependencies, use `cargo build --locked --release -p lin-peer-worker`; its source
+is shared with the compatibility `peer_bench` example.

@@ -1,0 +1,63 @@
+{
+  "rows": 1000,
+  "repeats": 1,
+  "samples": 2,
+  "host": "macOS-26.7.2-arm64-arm-64bit-Mach-O",
+  "engines": [
+    "lin"
+  ],
+  "cases": [
+    "insert_native"
+  ],
+  "observations": [
+    {
+      "case": "insert_native/lin",
+      "repetition": 0,
+      "iterations": 1,
+      "samples_ns": [
+        1118417.0,
+        769333.0
+      ],
+      "validated_rows": 1000
+    }
+  ],
+  "errors": [],
+  "versions": {
+    "lin": "0.4.0"
+  },
+  "medians_ns": {
+    "insert_native/lin": 943875.0
+  },
+  "python": "3.14.9 (main, Oct 21 2026, 06:02:15) [Clang 21.0.0 (clang-2100.3.34.2)]",
+  "clients": {
+    "pandas": "3.0.6",
+    "duckdb": "1.5.6",
+    "pymongo": "4.18.2",
+    "psycopg": "3.3.6",
+    "PyMySQL": "1.2.3",
+    "python-tds": "1.17.1"
+  },
+  "lin_binary_info": {
+    "path": "target/release/lin-peer-worker",
+    "size_bytes": 5652720,
+    "mtime": 1792991567.5480683,
+    "sha256": "4398aeccfd873cf4efe0773fb60757f4d4327e533935a44f4278731e7d6e7570"
+  },
+  "git_commit": "9658d7c89ef997ad709e1b978503d5d8415759ba",
+  "git_status_before": "M .github/workflows/mssql-bench.yml\n M Cargo.lock\n M Cargo.toml\n M docs/benchmark-contract.md\n M examples/peer_bench.rs\n M scripts/bench-mssql-native-ci.py\n M src/store.rs\n?? benches/results/2026-10-26-mssql-native-ci/\n?? benches/results/2026-10-26-small-neon-floor-engine/\n?? benches/results/2026-10-26-small-neon-overlap-cpu/\n?? benches/results/2026-10-26-small-neon-overlap-engine/\n?? benches/results/2026-10-26-sparse-mask-cache-cpu/\n?? tools/",
+  "native_contracts": {
+    "lin": {
+      "schema": "id/uri/wing/title/ts/body; unique id and uri; wing+ts index",
+      "fixture": "fresh per sample; schema/index/prepare/validation/drop excluded",
+      "durability": "native memory API comparison; no disk durability equivalence",
+      "api": "Rust prepared run; default embedding and FTS",
+      "storage": "Db::empty",
+      "statement_rows_limit": 10000,
+      "statements": 1,
+      "execution_path": "prepared run"
+    }
+  },
+  "status": "complete",
+  "git_status_after": "M .github/workflows/mssql-bench.yml\n M Cargo.lock\n M Cargo.toml\n M docs/benchmark-contract.md\n M examples/peer_bench.rs\n M scripts/bench-mssql-native-ci.py\n M src/store.rs\n?? benches/results/2026-10-26-mssql-native-ci/\n?? benches/results/2026-10-26-small-neon-floor-engine/\n?? benches/results/2026-10-26-small-neon-overlap-cpu/\n?? benches/results/2026-10-26-small-neon-overlap-engine/\n?? benches/results/2026-10-26-sparse-mask-cache-cpu/\n?? tools/",
+  "source_drift": false
+}

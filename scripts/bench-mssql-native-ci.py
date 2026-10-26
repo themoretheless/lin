@@ -17,14 +17,14 @@ import uuid
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, required=True)
-    parser.add_argument('--binary', type=Path, default=Path('target/release/examples/peer_bench'))
+    parser.add_argument('--binary', type=Path, default=Path('target/release/lin-peer-worker'))
     parser.add_argument('--image', default='mcr.microsoft.com/mssql/server:2022-latest')
     args = parser.parse_args()
     assert sys.platform == 'linux' and platform.machine() == 'x86_64', 'native Linux x86-64 required'
     args.output.mkdir(parents=True, exist_ok=False)
     sha = lambda path: hashlib.sha256(Path(path).read_bytes()).hexdigest()
     capture = lambda command: subprocess.check_output(command, text=True).strip()
-    tracked = capture(['git', 'ls-files', 'src', 'lin-derive', 'Cargo.toml', 'Cargo.lock', 'examples/peer_bench.rs', 'scripts/bench-peers.py', 'scripts/bench-mssql-native-ci.py']).splitlines()
+    tracked = capture(['git', 'ls-files', 'src', 'lin-derive', 'tools/peer-worker', 'Cargo.toml', 'Cargo.lock', 'examples/peer_bench.rs', 'scripts/bench-peers.py', 'scripts/bench-mssql-native-ci.py']).splitlines()
     sources = {path: sha(path) for path in tracked}
     owner = 'lin-mssql-native-ci-' + uuid.uuid4().hex
     database = 'lin_ci_' + uuid.uuid4().hex

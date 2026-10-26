@@ -1732,10 +1732,13 @@ impl Store {
             self.ensure_facts_rows();
         }
         self.promote_cold(name);
-        if let Some(v) = self.collections.get_mut(name) {
-            return v;
+        // Keep the existing-key path allocation-free without an early returned
+        // mutable borrow that older borrow checkers extend into the entry path.
+        if self.collections.contains_key(name) {
+            self.collections.get_mut(name).expect("existing collection")
+        } else {
+            self.collections.entry(name.to_string()).or_default()
         }
-        self.collections.entry(name.to_string()).or_default()
     }
 
     pub fn find_doc_key(&self, key: &str) -> Option<&Row> {

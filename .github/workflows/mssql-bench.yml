@@ -28,7 +28,7 @@ jobs:
       - name: Install pinned peer clients
         run: python -m pip install -r scripts/bench-peers-requirements.lock
       - name: Build frozen Lin peer worker
-        run: cargo build --locked --release --example peer_bench > /tmp/lin-mssql-peer-build.log 2>&1
+        run: cargo build --locked --release -p lin-peer-worker > /tmp/lin-mssql-peer-build.log 2>&1
       - name: Qualify real SQL Server on native x86
         run: python scripts/bench-mssql-native-ci.py --output .airbug-bench/mssql-ci
       - name: Upload raw qualification artifacts

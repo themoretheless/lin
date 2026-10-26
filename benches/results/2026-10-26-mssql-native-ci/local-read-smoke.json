@@ -1,0 +1,111 @@
+{
+  "rows": 1000,
+  "repeats": 1,
+  "samples": 2,
+  "host": "macOS-26.7.2-arm64-arm-64bit-Mach-O",
+  "engines": [
+    "lin"
+  ],
+  "cases": [
+    "point_get",
+    "filter_eq",
+    "text_substr",
+    "materialize",
+    "join_inner",
+    "join_filter"
+  ],
+  "observations": [
+    {
+      "case": "point_get/lin",
+      "repetition": 0,
+      "iterations": 5988,
+      "samples_ns": [
+        116.85871743486975,
+        125.4313627254509
+      ],
+      "validated_rows": 1
+    },
+    {
+      "case": "filter_eq/lin",
+      "repetition": 0,
+      "iterations": 1264,
+      "samples_ns": [
+        802.4794303797469,
+        702.5648734177215
+      ],
+      "validated_rows": 1
+    },
+    {
+      "case": "text_substr/lin",
+      "repetition": 0,
+      "iterations": 827,
+      "samples_ns": [
+        1777.1064087061668,
+        1768.5912938331319
+      ],
+      "validated_rows": 1
+    },
+    {
+      "case": "materialize/lin",
+      "repetition": 0,
+      "iterations": 24,
+      "samples_ns": [
+        34906.25,
+        37005.208333333336
+      ],
+      "validated_rows": 500
+    },
+    {
+      "case": "join_inner/lin",
+      "repetition": 0,
+      "iterations": 7,
+      "samples_ns": [
+        144035.7142857143,
+        142184.57142857142
+      ],
+      "validated_rows": 1000
+    },
+    {
+      "case": "join_filter/lin",
+      "repetition": 0,
+      "iterations": 14,
+      "samples_ns": [
+        67482.14285714286,
+        66973.21428571429
+      ],
+      "validated_rows": 495
+    }
+  ],
+  "errors": [],
+  "versions": {
+    "lin": "0.4.0"
+  },
+  "medians_ns": {
+    "point_get/lin": 121.14504008016033,
+    "filter_eq/lin": 752.5221518987341,
+    "text_substr/lin": 1772.8488512696495,
+    "materialize/lin": 35955.72916666667,
+    "join_inner/lin": 143110.14285714284,
+    "join_filter/lin": 67227.67857142858
+  },
+  "python": "3.14.9 (main, Oct 21 2026, 06:02:15) [Clang 21.0.0 (clang-2100.3.34.2)]",
+  "clients": {
+    "pandas": "3.0.6",
+    "duckdb": "1.5.6",
+    "pymongo": "4.18.2",
+    "psycopg": "3.3.6",
+    "PyMySQL": "1.2.3",
+    "python-tds": "1.17.1"
+  },
+  "lin_binary_info": {
+    "path": "target/release/lin-peer-worker",
+    "size_bytes": 5652720,
+    "mtime": 1792991567.5480683,
+    "sha256": "4398aeccfd873cf4efe0773fb60757f4d4327e533935a44f4278731e7d6e7570"
+  },
+  "git_commit": "9658d7c89ef997ad709e1b978503d5d8415759ba",
+  "git_status_before": "M .github/workflows/mssql-bench.yml\n M Cargo.lock\n M Cargo.toml\n M docs/benchmark-contract.md\n M examples/peer_bench.rs\n M scripts/bench-mssql-native-ci.py\n M src/store.rs\n?? benches/results/2026-10-26-mssql-native-ci/\n?? benches/results/2026-10-26-small-neon-floor-engine/\n?? benches/results/2026-10-26-small-neon-overlap-cpu/\n?? benches/results/2026-10-26-small-neon-overlap-engine/\n?? benches/results/2026-10-26-sparse-mask-cache-cpu/\n?? tools/",
+  "status": "complete",
+  "git_status_after": "M .github/workflows/mssql-bench.yml\n M Cargo.lock\n M Cargo.toml\n M docs/benchmark-contract.md\n M examples/peer_bench.rs\n M scripts/bench-mssql-native-ci.py\n M src/store.rs\n?? benches/results/2026-10-26-mssql-native-ci/\n?? benches/results/2026-10-26-small-neon-floor-engine/\n?? benches/results/2026-10-26-small-neon-overlap-cpu/\n?? benches/results/2026-10-26-small-neon-overlap-engine/\n?? benches/results/2026-10-26-sparse-mask-cache-cpu/\n?? tools/",
+  "source_drift": false
+}
