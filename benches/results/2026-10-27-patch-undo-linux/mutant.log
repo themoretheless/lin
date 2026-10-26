@@ -1,0 +1,33 @@
+[1m[92m   Compiling[0m lin v0.4.0 (/home/runner/work/lin/lin)
+[1m[92m    Finished[0m `test` profile [unoptimized + debuginfo] target(s) in 9.39s
+[1m[92m     Running[0m unittests src/lib.rs (target/debug/deps/lin-7c12a0aeca3ae7ee)
+
+running 2 tests
+test exec::patch_undo_oracle::absent_hash_is_removed_and_nan_payload_preserved ... FAILED
+test exec::patch_undo_oracle::restores_patch_added_fields_hash_and_repeated_updates ... FAILED
+
+failures:
+
+---- exec::patch_undo_oracle::absent_hash_is_removed_and_nan_payload_preserved stdout ----
+
+thread 'exec::patch_undo_oracle::absent_hash_is_removed_and_nan_payload_preserved' (3364) panicked at src/exec.rs:9163:150:
+assertion `left == right` failed
+  left: {"body": Null, "nan": Float(NaN)}
+ right: {"nan": Float(NaN)}
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- exec::patch_undo_oracle::restores_patch_added_fields_hash_and_repeated_updates stdout ----
+
+thread 'exec::patch_undo_oracle::restores_patch_added_fields_hash_and_repeated_updates' (3365) panicked at src/exec.rs:9158:98:
+assertion `left == right` failed
+  left: {"added": Null, "added2": Null, "body": Text("new"), "float": Float(0.0), "hash": Text("newhash"), "wide_0": Int(100), "wide_1": Int(101), "wide_2": Int(102), "wide_3": Int(103), "wide_4": Int(104), "wide_5": Int(105), "wide_6": Int(106), "wide_7": Int(107), "длинное_имя_поля_без_усечения": Bool(true)}
+ right: {"added": Null, "body": Text("new"), "float": Float(0.0), "hash": Text("newhash"), "wide_0": Int(100), "wide_1": Int(101), "wide_2": Int(102), "wide_3": Int(103), "wide_4": Int(104), "wide_5": Int(105), "wide_6": Int(106), "wide_7": Int(107), "длинное_имя_поля_без_усечения": Bool(true)}
+
+
+failures:
+    exec::patch_undo_oracle::absent_hash_is_removed_and_nan_payload_preserved
+    exec::patch_undo_oracle::restores_patch_added_fields_hash_and_repeated_updates
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 103 filtered out; finished in 0.00s
+
+[1m[91merror[0m: test failed, to rerun pass `--lib`
