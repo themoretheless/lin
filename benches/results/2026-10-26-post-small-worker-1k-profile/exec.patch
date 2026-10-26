@@ -1,0 +1,87 @@
+--- a/src/exec.rs
++++ b/src/exec.rs
+@@ -5498,6 +5498,7 @@
+             return;
+         }
+ 
++        let phase_timer=Instant::now();
+         let mut row_idxs = Vec::with_capacity(rows.len());
+         let mut texts = Vec::with_capacity(rows.len());
+         for (i, row) in rows.iter().enumerate() {
+@@ -5514,15 +5515,20 @@
+             return;
+         }
+         let refs = texts.iter().map(|text| text.as_ref()).collect::<Vec<_>>();
++        let text_ns=phase_timer.elapsed().as_nanos();
++        let phase_timer=Instant::now();
+         let mut vectors = emb.embed_batch(&refs);
+         if vectors.len() != row_idxs.len() {
+             // Keep third-party embedders with a broken batch implementation
+             // from silently leaving a partially embedded slab.
+             vectors = refs.iter().map(|text| emb.embed(text)).collect();
+         }
++        let generate_ns=phase_timer.elapsed().as_nanos();
++        let phase_timer=Instant::now();
+         for (i, vector) in row_idxs.into_iter().zip(vectors) {
+             rows[i].insert("embedding".into(), Cell::Vec(vector));
+         }
++        if rows.len()==1000 {eprintln!("EMBED_PHASE rows=1000 text_ns={} generate_ns={} attach_ns={}",text_ns,generate_ns,phase_timer.elapsed().as_nanos());}
+     }
+ 
+     #[allow(dead_code)]
+@@ -5618,6 +5624,7 @@
+     ) -> Result<(Vec<Row>, Vec<Edge>, Option<crate::persist::PreparedInsert>), Error> {
+         let now = now_ms();
+         let n = records.len();
++        let phase_timer=Instant::now();
+         let mut built: Vec<Row> = if n >= 4096 {
+             std::thread::scope(|scope| {
+                 let (left, right) = records.split_at(n / 2);
+@@ -5636,6 +5643,8 @@
+             append_batch_shape_rows(&mut rows, records, now);
+             rows
+         };
++        let build_ns=phase_timer.elapsed().as_nanos();
++        let phase_timer=Instant::now();
+         let mut batch_ids: rustc_hash::FxHashSet<&str> = rustc_hash::FxHashSet::default();
+         batch_ids.reserve(n);
+         let mut batch_uris: rustc_hash::FxHashSet<&str> = rustc_hash::FxHashSet::default();
+@@ -5682,7 +5691,10 @@
+         }
+         drop(batch_ids);
+         drop(batch_uris);
++        let checks_ns=phase_timer.elapsed().as_nanos();
++        let phase_timer=Instant::now();
+         self.maybe_embed_rows(collection, &mut built);
++        let embed_ns=phase_timer.elapsed().as_nanos();
+ 
+         let mut new_edges = Vec::with_capacity(edges.len());
+         if let Some(first) = built.first() {
+@@ -5768,6 +5780,7 @@
+             self.maintain_insert_slab(collection, start, &built)?;
+             None
+         };
++        if n==1000 {eprintln!("ROW_PHASE rows={} build_ns={} checks_ns={} embed_ns={}",n,build_ns,checks_ns,embed_ns);}
+         let want_rows = built.len() <= 128;
+         if want_rows {
+             self.store
+@@ -5789,10 +5802,19 @@
+     ) -> Result<(), Error> {
+         self.store.collection_mut(collection).reserve(built.len());
+         self.store.row_maps_reserve(collection, built.len());
++        let phase_timer=Instant::now();
+         self.store.index_insert_slab(collection, start, built)?;
++        let index_ns=phase_timer.elapsed().as_nanos();
++        let phase_timer=Instant::now();
+         self.store.fts_insert_slab(collection, start, built);
++        let fts_ns=phase_timer.elapsed().as_nanos();
++        let phase_timer=Instant::now();
+         self.store.hnsw_insert_slab(collection, start, built);
++        let hnsw_ns=phase_timer.elapsed().as_nanos();
++        let phase_timer=Instant::now();
+         self.store.row_maps_register_slab(collection, start, built);
++        let maps_ns=phase_timer.elapsed().as_nanos();
++        if built.len()==1000 {eprintln!("MAINT_PHASE rows=1000 index_ns={} fts_ns={} hnsw_ns={} maps_ns={}",index_ns,fts_ns,hnsw_ns,maps_ns);}
+         Ok(())
+     }
+ 

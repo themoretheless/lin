@@ -1,0 +1,118 @@
+skip postgres: no reachable server
+  tried: postgresql://lin:lin@127.0.0.1:55432/lin (error connecting to server); postgresql://postgres@127.0.0.1:5432/postgres (error connecting to server)
+  set LIN_BENCH_PG_URL or:
+  docker compose -f docker-compose.bench.yml up -d postgres
+  # brew postgresql@17 via Sources/ppduster macos-stack-postgres; start service for :5432
+skip mysql: LIN_BENCH_SKIP_MYSQL is set
+lin compare: N=10000 warm reads (fixture), bulk insert (schema outside timing)
+engines: Lin | SQLite(rusqlite bundled) | DuckDB(bundled) | HashMap(point get only) | Postgres(skipped) | MySQL(skipped)
+airbug dash: http://127.0.0.1:8790/
+Lin reads: prepare once / run many; filters use count (fair vs SQL COUNT(*));
+substring: Lin `title ~ "wal" | count` vs SQL LIKE '%wal%' COUNT(*);
+materialize: Lin `wing==rag | {id,title} | take all` vs SQL SELECT id,title;
+join: 10000 orders ⋈ 1000 users (Lin run_batch SoA / cursor vs SQL INNER JOIN);
+append_log: Lin `append facts` vs SQL INSERT INTO logs (append-only shape)
+airbug dash: http://127.0.0.1:8790/#/bench
+bench: compare/insert_bulk_1k/lin — validating and calibrating
+EMBED_PHASE rows=1000 text_ns=203125 generate_ns=411417 attach_ns=25833
+MAINT_PHASE rows=1000 index_ns=204125 fts_ns=200958 hnsw_ns=0 maps_ns=56291
+ROW_PHASE rows=1000 build_ns=248041 checks_ns=200584 embed_ns=703875
+EMBED_PHASE rows=1000 text_ns=524083 generate_ns=309250 attach_ns=26750
+MAINT_PHASE rows=1000 index_ns=118292 fts_ns=150666 hnsw_ns=42 maps_ns=34000
+ROW_PHASE rows=1000 build_ns=184041 checks_ns=129583 embed_ns=911791
+bench: compare/insert_bulk_1k/lin — measuring 24 samples
+EMBED_PHASE rows=1000 text_ns=56375 generate_ns=184083 attach_ns=25875
+MAINT_PHASE rows=1000 index_ns=108625 fts_ns=149875 hnsw_ns=42 maps_ns=34875
+ROW_PHASE rows=1000 build_ns=144625 checks_ns=101125 embed_ns=315375
+EMBED_PHASE rows=1000 text_ns=55125 generate_ns=179041 attach_ns=24458
+MAINT_PHASE rows=1000 index_ns=99042 fts_ns=137875 hnsw_ns=0 maps_ns=32416
+ROW_PHASE rows=1000 build_ns=147084 checks_ns=105084 embed_ns=303458
+EMBED_PHASE rows=1000 text_ns=54917 generate_ns=172958 attach_ns=24083
+MAINT_PHASE rows=1000 index_ns=89125 fts_ns=135792 hnsw_ns=0 maps_ns=31625
+ROW_PHASE rows=1000 build_ns=145459 checks_ns=92792 embed_ns=283250
+EMBED_PHASE rows=1000 text_ns=59167 generate_ns=177958 attach_ns=25917
+MAINT_PHASE rows=1000 index_ns=114208 fts_ns=147375 hnsw_ns=41 maps_ns=35000
+ROW_PHASE rows=1000 build_ns=146583 checks_ns=98583 embed_ns=310584
+EMBED_PHASE rows=1000 text_ns=57333 generate_ns=183250 attach_ns=23875
+MAINT_PHASE rows=1000 index_ns=91917 fts_ns=138750 hnsw_ns=41 maps_ns=32667
+ROW_PHASE rows=1000 build_ns=143792 checks_ns=96583 embed_ns=304792
+EMBED_PHASE rows=1000 text_ns=56708 generate_ns=174000 attach_ns=25500
+MAINT_PHASE rows=1000 index_ns=91625 fts_ns=133042 hnsw_ns=41 maps_ns=32334
+ROW_PHASE rows=1000 build_ns=144833 checks_ns=92750 embed_ns=291375
+EMBED_PHASE rows=1000 text_ns=58000 generate_ns=176625 attach_ns=25209
+MAINT_PHASE rows=1000 index_ns=93417 fts_ns=157291 hnsw_ns=0 maps_ns=35375
+ROW_PHASE rows=1000 build_ns=147625 checks_ns=94833 embed_ns=293333
+EMBED_PHASE rows=1000 text_ns=61292 generate_ns=196250 attach_ns=24917
+MAINT_PHASE rows=1000 index_ns=105667 fts_ns=141458 hnsw_ns=42 maps_ns=33625
+ROW_PHASE rows=1000 build_ns=146708 checks_ns=105250 embed_ns=332083
+EMBED_PHASE rows=1000 text_ns=61459 generate_ns=196667 attach_ns=24833
+MAINT_PHASE rows=1000 index_ns=92042 fts_ns=142375 hnsw_ns=0 maps_ns=33458
+ROW_PHASE rows=1000 build_ns=147292 checks_ns=100334 embed_ns=331834
+EMBED_PHASE rows=1000 text_ns=58292 generate_ns=193625 attach_ns=24250
+MAINT_PHASE rows=1000 index_ns=93792 fts_ns=139042 hnsw_ns=0 maps_ns=33042
+ROW_PHASE rows=1000 build_ns=145375 checks_ns=95334 embed_ns=318084
+EMBED_PHASE rows=1000 text_ns=59334 generate_ns=189875 attach_ns=24709
+MAINT_PHASE rows=1000 index_ns=95417 fts_ns=140708 hnsw_ns=42 maps_ns=33333
+ROW_PHASE rows=1000 build_ns=150542 checks_ns=98209 embed_ns=310250
+EMBED_PHASE rows=1000 text_ns=55875 generate_ns=202583 attach_ns=24458
+MAINT_PHASE rows=1000 index_ns=99000 fts_ns=142166 hnsw_ns=42 maps_ns=33167
+ROW_PHASE rows=1000 build_ns=145791 checks_ns=99583 embed_ns=337084
+EMBED_PHASE rows=1000 text_ns=58458 generate_ns=198083 attach_ns=23667
+MAINT_PHASE rows=1000 index_ns=93917 fts_ns=136000 hnsw_ns=0 maps_ns=32417
+ROW_PHASE rows=1000 build_ns=147208 checks_ns=98333 embed_ns=316916
+EMBED_PHASE rows=1000 text_ns=57792 generate_ns=188416 attach_ns=23750
+MAINT_PHASE rows=1000 index_ns=88500 fts_ns=133958 hnsw_ns=0 maps_ns=32459
+ROW_PHASE rows=1000 build_ns=145625 checks_ns=92042 embed_ns=297000
+EMBED_PHASE rows=1000 text_ns=56916 generate_ns=240167 attach_ns=24833
+MAINT_PHASE rows=1000 index_ns=95083 fts_ns=138417 hnsw_ns=0 maps_ns=33208
+ROW_PHASE rows=1000 build_ns=147083 checks_ns=96125 embed_ns=372875
+EMBED_PHASE rows=1000 text_ns=56875 generate_ns=197292 attach_ns=24167
+MAINT_PHASE rows=1000 index_ns=93792 fts_ns=133375 hnsw_ns=41 maps_ns=32500
+ROW_PHASE rows=1000 build_ns=144542 checks_ns=96042 embed_ns=316125
+EMBED_PHASE rows=1000 text_ns=53000 generate_ns=189292 attach_ns=23958
+MAINT_PHASE rows=1000 index_ns=88666 fts_ns=132834 hnsw_ns=0 maps_ns=31708
+ROW_PHASE rows=1000 build_ns=143792 checks_ns=94625 embed_ns=294791
+EMBED_PHASE rows=1000 text_ns=55250 generate_ns=184875 attach_ns=23666
+MAINT_PHASE rows=1000 index_ns=88334 fts_ns=153167 hnsw_ns=0 maps_ns=54750
+ROW_PHASE rows=1000 build_ns=145209 checks_ns=93834 embed_ns=293583
+EMBED_PHASE rows=1000 text_ns=56500 generate_ns=202000 attach_ns=24458
+MAINT_PHASE rows=1000 index_ns=93083 fts_ns=138958 hnsw_ns=42 maps_ns=32125
+ROW_PHASE rows=1000 build_ns=147208 checks_ns=94917 embed_ns=316000
+EMBED_PHASE rows=1000 text_ns=57041 generate_ns=185458 attach_ns=23417
+MAINT_PHASE rows=1000 index_ns=89291 fts_ns=132709 hnsw_ns=41 maps_ns=31542
+ROW_PHASE rows=1000 build_ns=144500 checks_ns=92833 embed_ns=291292
+EMBED_PHASE rows=1000 text_ns=60750 generate_ns=194375 attach_ns=23042
+MAINT_PHASE rows=1000 index_ns=89458 fts_ns=132125 hnsw_ns=0 maps_ns=32250
+ROW_PHASE rows=1000 build_ns=143542 checks_ns=94459 embed_ns=307416
+EMBED_PHASE rows=1000 text_ns=61000 generate_ns=210583 attach_ns=24833
+MAINT_PHASE rows=1000 index_ns=102625 fts_ns=141458 hnsw_ns=42 maps_ns=34042
+ROW_PHASE rows=1000 build_ns=147125 checks_ns=102417 embed_ns=343000
+EMBED_PHASE rows=1000 text_ns=60250 generate_ns=211166 attach_ns=27208
+MAINT_PHASE rows=1000 index_ns=102875 fts_ns=140792 hnsw_ns=0 maps_ns=34042
+ROW_PHASE rows=1000 build_ns=149083 checks_ns=129708 embed_ns=339250
+EMBED_PHASE rows=1000 text_ns=59167 generate_ns=214417 attach_ns=24583
+MAINT_PHASE rows=1000 index_ns=121833 fts_ns=134500 hnsw_ns=41 maps_ns=32667
+ROW_PHASE rows=1000 build_ns=145709 checks_ns=101208 embed_ns=330666
+EMBED_PHASE rows=1000 text_ns=60625 generate_ns=226667 attach_ns=24333
+MAINT_PHASE rows=1000 index_ns=98834 fts_ns=141500 hnsw_ns=125 maps_ns=34250
+ROW_PHASE rows=1000 build_ns=157708 checks_ns=110583 embed_ns=357125
+# bench 1792995562865388000-33196
+
+Status: Complete
+
+| Case | Metric | Median | Unit | Scope / statistic | Observations | Processes |
+|---|---|---:|---|---|---:|---:|
+| compare/insert_bulk_1k/lin [candidate] | wall | 868041.5000 | ns | current thread wall clock; scheduler included / batch_total | 24 | 1 |
+
+# Useful work throughput
+
+| Case | Median batch throughput | Unit |
+|---|---:|---|
+| compare/insert_bulk_1k/lin [candidate] | 1152021.3722 | rows/s |
+
+Derived from positive wall batches and declared units per operation; zero/unavailable durations omitted.
+
+Medians above summarize observations, not pooled operation-latency percentiles. Comparisons aggregate within each process first.
+
+- Raw batches are not independent process replications. Batch averages are not individual-operation latency. CPU frequency and background load are uncontrolled.
+

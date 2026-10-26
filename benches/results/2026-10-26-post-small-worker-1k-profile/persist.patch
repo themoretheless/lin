@@ -1,0 +1,80 @@
+--- a/src/persist.rs
++++ b/src/persist.rs
+@@ -1194,17 +1194,24 @@
+     else {
+         return Err(io_err("log record exceeds 16MiB"));
+     };
++    let phase_timer=std::time::Instant::now();
+     let codec = magic[3];
+     let mut checksum = crate::crc::Hasher::new();
+     checksum.update(&[codec]);
+     checksum.update(payload);
+     let checksum = checksum.finalize().to_le_bytes();
+ 
++    let checksum_ns=phase_timer.elapsed().as_nanos();
++    let phase_timer=std::time::Instant::now();
+     write_frame_bytes(log, codec, payload, checksum, len as u32).map_err(io_err)?;
++    let write_ns=phase_timer.elapsed().as_nanos();
++    let phase_timer=std::time::Instant::now();
+ 
+     if sync == SyncMode::Full {
+         durable_sync(log).map_err(io_err)?;
+     }
++    let sync_ns=phase_timer.elapsed().as_nanos();
++    if payload.len()>300000 && payload.len()<400000 {eprintln!("IO_PHASE payload_bytes={} checksum_ns={} write_ns={} sync_ns={}",payload.len(),checksum_ns,write_ns,sync_ns);}
+     *log_bytes += 8 + len as u64;
+     Ok(())
+ }
+@@ -1275,7 +1282,9 @@
+     write_frame(log, &LOG_MAGIC_V2, buf, sync, log_bytes)
+ }
+ 
+-fn use_sparse_vectors(rows: &[Option<std::sync::Arc<[f32]>>]) -> bool {
++fn use_sparse_vectors(rows: &[Option<std::sync::Arc<[f32]>>]) -> bool {let timer=std::time::Instant::now(); let value=use_sparse_vectors_profile_impl(rows); if rows.len()==1000 {eprintln!("WAL_PHASE rows=1000 phase=use_sparse_vectors ns={}",timer.elapsed().as_nanos());} value}
++
++fn use_sparse_vectors_profile_impl(rows: &[Option<std::sync::Arc<[f32]>>]) -> bool {
+     let dense = rows
+         .iter()
+         .map(|row| 4usize.saturating_add(row.as_ref().map_or(0, |v| v.len().saturating_mul(4))))
+@@ -1352,6 +1361,11 @@
+ }
+ 
+ fn append_sparse_rows_serial(
++    rows: &[Option<std::sync::Arc<[f32]>>],
++    buf: &mut Vec<u8>,
++) -> Result<(), Error> {let timer=std::time::Instant::now(); let value=append_sparse_rows_serial_profile_impl(rows, buf); if rows.len()==1000 {eprintln!("WAL_PHASE rows=1000 phase=append_sparse_rows_serial ns={}",timer.elapsed().as_nanos());} value}
++
++fn append_sparse_rows_serial_profile_impl(
+     rows: &[Option<std::sync::Arc<[f32]>>],
+     buf: &mut Vec<u8>,
+ ) -> Result<(), Error> {
+@@ -1669,6 +1683,16 @@
+ 
+ /// Encode the existing typed-column payload without touching a file.
+ fn encode_insert_cols_v2(
++    rec_gen: u64,
++    next_id: u64,
++    collection: &str,
++    fields: &[String],
++    cols: &[ColData],
++    n: u32,
++    buf: &mut Vec<u8>,
++) -> Result<[u8; 4], Error> {let timer=std::time::Instant::now(); let value=encode_insert_cols_v2_profile_impl(rec_gen, next_id, collection, fields, cols, n, buf); if n==1000 {eprintln!("WAL_PHASE rows=1000 phase=encode_insert_cols_v2 ns={}",timer.elapsed().as_nanos());} value}
++
++fn encode_insert_cols_v2_profile_impl(
+     rec_gen: u64,
+     next_id: u64,
+     collection: &str,
+@@ -2524,6 +2548,12 @@
+     collection: impl Into<String>,
+     rows: &[crate::store::Row],
+     edges: Vec<Edge>,
++) -> Pack {let timer=std::time::Instant::now(); let value=rows_to_insert_cols_profile_impl(collection, rows, edges); if rows.len()==1000 {eprintln!("WAL_PHASE rows=1000 phase=rows_to_insert_cols ns={}",timer.elapsed().as_nanos());} value}
++
++pub fn rows_to_insert_cols_profile_impl(
++    collection: impl Into<String>,
++    rows: &[crate::store::Row],
++    edges: Vec<Edge>,
+ ) -> Pack {
+     use crate::store::Cell;
+     use std::collections::BTreeSet;

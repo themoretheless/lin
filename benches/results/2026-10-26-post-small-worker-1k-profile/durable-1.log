@@ -1,0 +1,307 @@
+skip postgres: no reachable server
+  tried: postgresql://lin:lin@127.0.0.1:55432/lin (error connecting to server); postgresql://postgres@127.0.0.1:5432/postgres (error connecting to server)
+  set LIN_BENCH_PG_URL or:
+  docker compose -f docker-compose.bench.yml up -d postgres
+  # brew postgresql@17 via Sources/ppduster macos-stack-postgres; start service for :5432
+skip mysql: LIN_BENCH_SKIP_MYSQL is set
+lin compare: N=10000 warm reads (fixture), bulk insert (schema outside timing)
+engines: Lin | SQLite(rusqlite bundled) | DuckDB(bundled) | HashMap(point get only) | Postgres(skipped) | MySQL(skipped)
+airbug dash: http://127.0.0.1:8790/
+Lin reads: prepare once / run many; filters use count (fair vs SQL COUNT(*));
+substring: Lin `title ~ "wal" | count` vs SQL LIKE '%wal%' COUNT(*);
+materialize: Lin `wing==rag | {id,title} | take all` vs SQL SELECT id,title;
+join: 10000 orders ⋈ 1000 users (Lin run_batch SoA / cursor vs SQL INNER JOIN);
+append_log: Lin `append facts` vs SQL INSERT INTO logs (append-only shape)
+airbug dash: http://127.0.0.1:8790/#/bench
+bench: compare/durable_insert_1k/lin — validating and calibrating
+EMBED_PHASE rows=1000 text_ns=64125 generate_ns=362334 attach_ns=51667
+WAL_PHASE rows=1000 phase=rows_to_insert_cols ns=210792
+MAINT_PHASE rows=1000 index_ns=130875 fts_ns=153500 hnsw_ns=83 maps_ns=50209
+WAL_PHASE rows=1000 phase=use_sparse_vectors ns=153875
+WAL_PHASE rows=1000 phase=append_sparse_rows_serial ns=222000
+WAL_PHASE rows=1000 phase=encode_insert_cols_v2 ns=483333
+ENCODER_PHASE rows=1000 submit_ns=34333 maintenance_total_ns=400042 wait_ns=426541
+ROW_PHASE rows=1000 build_ns=181209 checks_ns=154792 embed_ns=562166
+IO_PHASE payload_bytes=336968 checksum_ns=32584 write_ns=61709 sync_ns=361000
+COMMIT_PHASE rows=1000 drop_pack_ns=67750
+EMBED_PHASE rows=1000 text_ns=60917 generate_ns=239833 attach_ns=28459
+WAL_PHASE rows=1000 phase=rows_to_insert_cols ns=210416
+MAINT_PHASE rows=1000 index_ns=133917 fts_ns=148417 hnsw_ns=0 maps_ns=41583
+WAL_PHASE rows=1000 phase=use_sparse_vectors ns=109291
+WAL_PHASE rows=1000 phase=append_sparse_rows_serial ns=207292
+WAL_PHASE rows=1000 phase=encode_insert_cols_v2 ns=386416
+ENCODER_PHASE rows=1000 submit_ns=26875 maintenance_total_ns=362209 wait_ns=378500
+ROW_PHASE rows=1000 build_ns=149416 checks_ns=113792 embed_ns=403667
+IO_PHASE payload_bytes=336968 checksum_ns=32583 write_ns=34083 sync_ns=306833
+COMMIT_PHASE rows=1000 drop_pack_ns=87000
+bench: compare/durable_insert_1k/lin — measuring 24 samples
+EMBED_PHASE rows=1000 text_ns=60792 generate_ns=272667 attach_ns=25291
+WAL_PHASE rows=1000 phase=rows_to_insert_cols ns=102125
+WAL_PHASE rows=1000 phase=use_sparse_vectors ns=203083
+MAINT_PHASE rows=1000 index_ns=125000 fts_ns=298834 hnsw_ns=83 maps_ns=39084
+WAL_PHASE rows=1000 phase=append_sparse_rows_serial ns=240041
+WAL_PHASE rows=1000 phase=encode_insert_cols_v2 ns=520541
+ENCODER_PHASE rows=1000 submit_ns=22000 maintenance_total_ns=518041 wait_ns=183375
+ROW_PHASE rows=1000 build_ns=160000 checks_ns=110875 embed_ns=394958
+IO_PHASE payload_bytes=336968 checksum_ns=32791 write_ns=31292 sync_ns=417750
+COMMIT_PHASE rows=1000 drop_pack_ns=62708
+EMBED_PHASE rows=1000 text_ns=59750 generate_ns=199958 attach_ns=24625
+WAL_PHASE rows=1000 phase=rows_to_insert_cols ns=155042
+WAL_PHASE rows=1000 phase=use_sparse_vectors ns=93250
+MAINT_PHASE rows=1000 index_ns=135541 fts_ns=147417 hnsw_ns=41 maps_ns=38709
+WAL_PHASE rows=1000 phase=append_sparse_rows_serial ns=211667
+WAL_PHASE rows=1000 phase=encode_insert_cols_v2 ns=358417
+ENCODER_PHASE rows=1000 submit_ns=23167 maintenance_total_ns=351875 wait_ns=213583
+ROW_PHASE rows=1000 build_ns=269625 checks_ns=121042 embed_ns=329042
+IO_PHASE payload_bytes=336968 checksum_ns=32583 write_ns=32750 sync_ns=504208
+COMMIT_PHASE rows=1000 drop_pack_ns=36042
+EMBED_PHASE rows=1000 text_ns=60541 generate_ns=205500 attach_ns=25333
+WAL_PHASE rows=1000 phase=rows_to_insert_cols ns=94166
+WAL_PHASE rows=1000 phase=use_sparse_vectors ns=93083
+MAINT_PHASE rows=1000 index_ns=120417 fts_ns=144000 hnsw_ns=0 maps_ns=35000
+WAL_PHASE rows=1000 phase=append_sparse_rows_serial ns=208375
+WAL_PHASE rows=1000 phase=encode_insert_cols_v2 ns=355667
+ENCODER_PHASE rows=1000 submit_ns=23459 maintenance_total_ns=340709 wait_ns=158792
+ROW_PHASE rows=1000 build_ns=163542 checks_ns=137875 embed_ns=355541
+IO_PHASE payload_bytes=336968 checksum_ns=32667 write_ns=33583 sync_ns=381250
+COMMIT_PHASE rows=1000 drop_pack_ns=23500
+EMBED_PHASE rows=1000 text_ns=65083 generate_ns=211958 attach_ns=27166
+WAL_PHASE rows=1000 phase=rows_to_insert_cols ns=153333
+MAINT_PHASE rows=1000 index_ns=102250 fts_ns=150916 hnsw_ns=0 maps_ns=40542
+WAL_PHASE rows=1000 phase=use_sparse_vectors ns=114791
+WAL_PHASE rows=1000 phase=append_sparse_rows_serial ns=196625
+WAL_PHASE rows=1000 phase=encode_insert_cols_v2 ns=364041
+ENCODER_PHASE rows=1000 submit_ns=25875 maintenance_total_ns=327333 wait_ns=251167
+ROW_PHASE rows=1000 build_ns=158000 checks_ns=118500 embed_ns=363625
+IO_PHASE payload_bytes=336968 checksum_ns=32625 write_ns=41417 sync_ns=487792
+COMMIT_PHASE rows=1000 drop_pack_ns=34291
+EMBED_PHASE rows=1000 text_ns=55958 generate_ns=186959 attach_ns=25250
+WAL_PHASE rows=1000 phase=rows_to_insert_cols ns=77750
+WAL_PHASE rows=1000 phase=use_sparse_vectors ns=90833
+MAINT_PHASE rows=1000 index_ns=101042 fts_ns=142666 hnsw_ns=125 maps_ns=33584
+WAL_PHASE rows=1000 phase=append_sparse_rows_serial ns=196666
+WAL_PHASE rows=1000 phase=encode_insert_cols_v2 ns=320750
+ENCODER_PHASE rows=1000 submit_ns=22917 maintenance_total_ns=295917 wait_ns=143416
+ROW_PHASE rows=1000 build_ns=148917 checks_ns=109625 embed_ns=314042
+IO_PHASE payload_bytes=336968 checksum_ns=32042 write_ns=38125 sync_ns=2736458
+COMMIT_PHASE rows=1000 drop_pack_ns=27500
+EMBED_PHASE rows=1000 text_ns=59750 generate_ns=196833 attach_ns=24208
+WAL_PHASE rows=1000 phase=rows_to_insert_cols ns=94000
+WAL_PHASE rows=1000 phase=use_sparse_vectors ns=93083
+MAINT_PHASE rows=1000 index_ns=103458 fts_ns=143916 hnsw_ns=42 maps_ns=34042
+WAL_PHASE rows=1000 phase=append_sparse_rows_serial ns=183042
+WAL_PHASE rows=1000 phase=encode_insert_cols_v2 ns=310791
+ENCODER_PHASE rows=1000 submit_ns=22375 maintenance_total_ns=298959 wait_ns=149209
+ROW_PHASE rows=1000 build_ns=161250 checks_ns=110292 embed_ns=333667
+IO_PHASE payload_bytes=336968 checksum_ns=32667 write_ns=43291 sync_ns=478875
+COMMIT_PHASE rows=1000 drop_pack_ns=23792
+EMBED_PHASE rows=1000 text_ns=61833 generate_ns=202250 attach_ns=24542
+WAL_PHASE rows=1000 phase=rows_to_insert_cols ns=174250
+MAINT_PHASE rows=1000 index_ns=107458 fts_ns=145625 hnsw_ns=0 maps_ns=37292
+WAL_PHASE rows=1000 phase=use_sparse_vectors ns=101292
+WAL_PHASE rows=1000 phase=append_sparse_rows_serial ns=193042
+WAL_PHASE rows=1000 phase=encode_insert_cols_v2 ns=342625
+ENCODER_PHASE rows=1000 submit_ns=26916 maintenance_total_ns=315042 wait_ns=260500
+ROW_PHASE rows=1000 build_ns=151208 checks_ns=108708 embed_ns=347417
+IO_PHASE payload_bytes=336968 checksum_ns=32583 write_ns=50792 sync_ns=505541
+COMMIT_PHASE rows=1000 drop_pack_ns=38541
+EMBED_PHASE rows=1000 text_ns=58792 generate_ns=413250 attach_ns=28709
+WAL_PHASE rows=1000 phase=rows_to_insert_cols ns=120084
+WAL_PHASE rows=1000 phase=use_sparse_vectors ns=98916
+MAINT_PHASE rows=1000 index_ns=109458 fts_ns=181500 hnsw_ns=41 maps_ns=35167
+WAL_PHASE rows=1000 phase=append_sparse_rows_serial ns=210417
+WAL_PHASE rows=1000 phase=encode_insert_cols_v2 ns=354750
+ENCODER_PHASE rows=1000 submit_ns=30667 maintenance_total_ns=356959 wait_ns=190000
+ROW_PHASE rows=1000 build_ns=181500 checks_ns=112959 embed_ns=569667
+IO_PHASE payload_bytes=336968 checksum_ns=32625 write_ns=61833 sync_ns=366167
+COMMIT_PHASE rows=1000 drop_pack_ns=86666
+EMBED_PHASE rows=1000 text_ns=60750 generate_ns=195584 attach_ns=24208
+WAL_PHASE rows=1000 phase=rows_to_insert_cols ns=141083
+MAINT_PHASE rows=1000 index_ns=102792 fts_ns=141875 hnsw_ns=42 maps_ns=39083
+WAL_PHASE rows=1000 phase=use_sparse_vectors ns=93375
+WAL_PHASE rows=1000 phase=append_sparse_rows_serial ns=180917
+WAL_PHASE rows=1000 phase=encode_insert_cols_v2 ns=341167
+ENCODER_PHASE rows=1000 submit_ns=22458 maintenance_total_ns=307708 wait_ns=238791
+ROW_PHASE rows=1000 build_ns=149583 checks_ns=109917 embed_ns=333125
+IO_PHASE payload_bytes=336968 checksum_ns=32209 write_ns=37250 sync_ns=382500
+COMMIT_PHASE rows=1000 drop_pack_ns=49667
+EMBED_PHASE rows=1000 text_ns=54417 generate_ns=194250 attach_ns=23333
+WAL_PHASE rows=1000 phase=rows_to_insert_cols ns=74833
+WAL_PHASE rows=1000 phase=use_sparse_vectors ns=91000
+MAINT_PHASE rows=1000 index_ns=97209 fts_ns=140750 hnsw_ns=167 maps_ns=33375
+WAL_PHASE rows=1000 phase=append_sparse_rows_serial ns=182833
+WAL_PHASE rows=1000 phase=encode_insert_cols_v2 ns=311500
+ENCODER_PHASE rows=1000 submit_ns=20250 maintenance_total_ns=288625 wait_ns=144542
+ROW_PHASE rows=1000 build_ns=145750 checks_ns=101583 embed_ns=313708
+IO_PHASE payload_bytes=336968 checksum_ns=32625 write_ns=40625 sync_ns=363292
+COMMIT_PHASE rows=1000 drop_pack_ns=21334
+EMBED_PHASE rows=1000 text_ns=61333 generate_ns=212000 attach_ns=26125
+WAL_PHASE rows=1000 phase=rows_to_insert_cols ns=92250
+WAL_PHASE rows=1000 phase=use_sparse_vectors ns=97333
+MAINT_PHASE rows=1000 index_ns=101708 fts_ns=138916 hnsw_ns=0 maps_ns=34625
+WAL_PHASE rows=1000 phase=append_sparse_rows_serial ns=179625
+WAL_PHASE rows=1000 phase=encode_insert_cols_v2 ns=310792
+ENCODER_PHASE rows=1000 submit_ns=22417 maintenance_total_ns=293000 wait_ns=151500
+ROW_PHASE rows=1000 build_ns=151708 checks_ns=108083 embed_ns=350917
+IO_PHASE payload_bytes=336968 checksum_ns=32583 write_ns=40333 sync_ns=371542
+COMMIT_PHASE rows=1000 drop_pack_ns=22959
+EMBED_PHASE rows=1000 text_ns=59708 generate_ns=220500 attach_ns=24958
+WAL_PHASE rows=1000 phase=rows_to_insert_cols ns=160208
+MAINT_PHASE rows=1000 index_ns=104792 fts_ns=145500 hnsw_ns=0 maps_ns=38084
+WAL_PHASE rows=1000 phase=use_sparse_vectors ns=104667
+WAL_PHASE rows=1000 phase=append_sparse_rows_serial ns=184792
+WAL_PHASE rows=1000 phase=encode_insert_cols_v2 ns=330792
+ENCODER_PHASE rows=1000 submit_ns=27333 maintenance_total_ns=308250 wait_ns=282208
+ROW_PHASE rows=1000 build_ns=152167 checks_ns=104000 embed_ns=367333
+IO_PHASE payload_bytes=336968 checksum_ns=32125 write_ns=37834 sync_ns=388083
+COMMIT_PHASE rows=1000 drop_pack_ns=36583
+EMBED_PHASE rows=1000 text_ns=56916 generate_ns=214959 attach_ns=24208
+WAL_PHASE rows=1000 phase=rows_to_insert_cols ns=152542
+MAINT_PHASE rows=1000 index_ns=97292 fts_ns=138833 hnsw_ns=0 maps_ns=37417
+WAL_PHASE rows=1000 phase=use_sparse_vectors ns=99292
+WAL_PHASE rows=1000 phase=append_sparse_rows_serial ns=183292
+WAL_PHASE rows=1000 phase=encode_insert_cols_v2 ns=333125
+ENCODER_PHASE rows=1000 submit_ns=26000 maintenance_total_ns=305375 wait_ns=233500
+ROW_PHASE rows=1000 build_ns=145375 checks_ns=109791 embed_ns=348375
+IO_PHASE payload_bytes=336968 checksum_ns=32667 write_ns=39583 sync_ns=370625
+COMMIT_PHASE rows=1000 drop_pack_ns=39334
+EMBED_PHASE rows=1000 text_ns=59458 generate_ns=220583 attach_ns=24083
+WAL_PHASE rows=1000 phase=rows_to_insert_cols ns=160375
+MAINT_PHASE rows=1000 index_ns=99875 fts_ns=137791 hnsw_ns=42 maps_ns=40875
+WAL_PHASE rows=1000 phase=use_sparse_vectors ns=101708
+WAL_PHASE rows=1000 phase=append_sparse_rows_serial ns=193833
+WAL_PHASE rows=1000 phase=encode_insert_cols_v2 ns=336792
+ENCODER_PHASE rows=1000 submit_ns=25750 maintenance_total_ns=298791 wait_ns=257167
+ROW_PHASE rows=1000 build_ns=143792 checks_ns=110333 embed_ns=354208
+IO_PHASE payload_bytes=336968 checksum_ns=32708 write_ns=35500 sync_ns=399958
+COMMIT_PHASE rows=1000 drop_pack_ns=44459
+EMBED_PHASE rows=1000 text_ns=58667 generate_ns=221750 attach_ns=24584
+WAL_PHASE rows=1000 phase=rows_to_insert_cols ns=80791
+WAL_PHASE rows=1000 phase=use_sparse_vectors ns=94042
+MAINT_PHASE rows=1000 index_ns=102750 fts_ns=142000 hnsw_ns=83 maps_ns=33958
+WAL_PHASE rows=1000 phase=append_sparse_rows_serial ns=205541
+WAL_PHASE rows=1000 phase=encode_insert_cols_v2 ns=337125
+ENCODER_PHASE rows=1000 submit_ns=19875 maintenance_total_ns=295042 wait_ns=174041
+ROW_PHASE rows=1000 build_ns=150792 checks_ns=105667 embed_ns=346542
+IO_PHASE payload_bytes=336968 checksum_ns=32000 write_ns=37291 sync_ns=450708
+COMMIT_PHASE rows=1000 drop_pack_ns=22875
+EMBED_PHASE rows=1000 text_ns=60542 generate_ns=228542 attach_ns=24958
+WAL_PHASE rows=1000 phase=rows_to_insert_cols ns=85584
+WAL_PHASE rows=1000 phase=use_sparse_vectors ns=95416
+MAINT_PHASE rows=1000 index_ns=103292 fts_ns=142833 hnsw_ns=208 maps_ns=34000
+WAL_PHASE rows=1000 phase=append_sparse_rows_serial ns=189292
+WAL_PHASE rows=1000 phase=encode_insert_cols_v2 ns=321917
+ENCODER_PHASE rows=1000 submit_ns=23500 maintenance_total_ns=301833 wait_ns=147834
+ROW_PHASE rows=1000 build_ns=147958 checks_ns=110917 embed_ns=354542
+IO_PHASE payload_bytes=336968 checksum_ns=32708 write_ns=31542 sync_ns=638584
+COMMIT_PHASE rows=1000 drop_pack_ns=24208
+EMBED_PHASE rows=1000 text_ns=61833 generate_ns=305458 attach_ns=28625
+WAL_PHASE rows=1000 phase=rows_to_insert_cols ns=127125
+MAINT_PHASE rows=1000 index_ns=98541 fts_ns=143250 hnsw_ns=0 maps_ns=37667
+WAL_PHASE rows=1000 phase=use_sparse_vectors ns=106875
+WAL_PHASE rows=1000 phase=append_sparse_rows_serial ns=190209
+WAL_PHASE rows=1000 phase=encode_insert_cols_v2 ns=360708
+ENCODER_PHASE rows=1000 submit_ns=29458 maintenance_total_ns=303500 wait_ns=240583
+ROW_PHASE rows=1000 build_ns=153625 checks_ns=107458 embed_ns=449500
+IO_PHASE payload_bytes=336968 checksum_ns=32625 write_ns=44208 sync_ns=334041
+COMMIT_PHASE rows=1000 drop_pack_ns=37459
+EMBED_PHASE rows=1000 text_ns=59458 generate_ns=235250 attach_ns=24875
+WAL_PHASE rows=1000 phase=rows_to_insert_cols ns=165750
+MAINT_PHASE rows=1000 index_ns=96917 fts_ns=139667 hnsw_ns=42 maps_ns=37416
+WAL_PHASE rows=1000 phase=use_sparse_vectors ns=99500
+WAL_PHASE rows=1000 phase=append_sparse_rows_serial ns=195625
+WAL_PHASE rows=1000 phase=encode_insert_cols_v2 ns=334416
+ENCODER_PHASE rows=1000 submit_ns=24958 maintenance_total_ns=294375 wait_ns=262125
+ROW_PHASE rows=1000 build_ns=184208 checks_ns=112375 embed_ns=369583
+IO_PHASE payload_bytes=336968 checksum_ns=32125 write_ns=49917 sync_ns=343625
+COMMIT_PHASE rows=1000 drop_pack_ns=45125
+EMBED_PHASE rows=1000 text_ns=57583 generate_ns=247334 attach_ns=26417
+WAL_PHASE rows=1000 phase=rows_to_insert_cols ns=134834
+WAL_PHASE rows=1000 phase=use_sparse_vectors ns=99541
+MAINT_PHASE rows=1000 index_ns=133333 fts_ns=148959 hnsw_ns=0 maps_ns=38583
+WAL_PHASE rows=1000 phase=append_sparse_rows_serial ns=198292
+WAL_PHASE rows=1000 phase=encode_insert_cols_v2 ns=342875
+ENCODER_PHASE rows=1000 submit_ns=43667 maintenance_total_ns=369042 wait_ns=164875
+ROW_PHASE rows=1000 build_ns=148625 checks_ns=102084 embed_ns=401042
+IO_PHASE payload_bytes=336968 checksum_ns=32500 write_ns=37209 sync_ns=357459
+COMMIT_PHASE rows=1000 drop_pack_ns=51584
+EMBED_PHASE rows=1000 text_ns=60875 generate_ns=243375 attach_ns=24791
+WAL_PHASE rows=1000 phase=rows_to_insert_cols ns=173083
+MAINT_PHASE rows=1000 index_ns=97292 fts_ns=142083 hnsw_ns=0 maps_ns=37459
+WAL_PHASE rows=1000 phase=use_sparse_vectors ns=116417
+WAL_PHASE rows=1000 phase=append_sparse_rows_serial ns=169917
+WAL_PHASE rows=1000 phase=encode_insert_cols_v2 ns=327500
+ENCODER_PHASE rows=1000 submit_ns=31250 maintenance_total_ns=299958 wait_ns=255875
+ROW_PHASE rows=1000 build_ns=148834 checks_ns=112209 embed_ns=390583
+IO_PHASE payload_bytes=336968 checksum_ns=32084 write_ns=40625 sync_ns=447708
+COMMIT_PHASE rows=1000 drop_pack_ns=35125
+EMBED_PHASE rows=1000 text_ns=61250 generate_ns=227291 attach_ns=25500
+WAL_PHASE rows=1000 phase=rows_to_insert_cols ns=89250
+WAL_PHASE rows=1000 phase=use_sparse_vectors ns=96791
+MAINT_PHASE rows=1000 index_ns=111375 fts_ns=143000 hnsw_ns=0 maps_ns=35000
+WAL_PHASE rows=1000 phase=append_sparse_rows_serial ns=198250
+WAL_PHASE rows=1000 phase=encode_insert_cols_v2 ns=334750
+ENCODER_PHASE rows=1000 submit_ns=28583 maintenance_total_ns=309375 wait_ns=169958
+ROW_PHASE rows=1000 build_ns=149333 checks_ns=107000 embed_ns=357417
+IO_PHASE payload_bytes=336968 checksum_ns=32541 write_ns=34083 sync_ns=504083
+COMMIT_PHASE rows=1000 drop_pack_ns=24334
+EMBED_PHASE rows=1000 text_ns=57625 generate_ns=247083 attach_ns=24833
+WAL_PHASE rows=1000 phase=rows_to_insert_cols ns=170417
+MAINT_PHASE rows=1000 index_ns=96125 fts_ns=144167 hnsw_ns=0 maps_ns=39625
+WAL_PHASE rows=1000 phase=use_sparse_vectors ns=110583
+WAL_PHASE rows=1000 phase=append_sparse_rows_serial ns=204916
+WAL_PHASE rows=1000 phase=encode_insert_cols_v2 ns=366750
+ENCODER_PHASE rows=1000 submit_ns=26625 maintenance_total_ns=300208 wait_ns=306958
+ROW_PHASE rows=1000 build_ns=150125 checks_ns=108958 embed_ns=385791
+IO_PHASE payload_bytes=336968 checksum_ns=33500 write_ns=38834 sync_ns=501459
+COMMIT_PHASE rows=1000 drop_pack_ns=32916
+EMBED_PHASE rows=1000 text_ns=58417 generate_ns=232791 attach_ns=24417
+WAL_PHASE rows=1000 phase=rows_to_insert_cols ns=183625
+MAINT_PHASE rows=1000 index_ns=100334 fts_ns=141166 hnsw_ns=42 maps_ns=37125
+WAL_PHASE rows=1000 phase=use_sparse_vectors ns=103041
+WAL_PHASE rows=1000 phase=append_sparse_rows_serial ns=204125
+WAL_PHASE rows=1000 phase=encode_insert_cols_v2 ns=350375
+ENCODER_PHASE rows=1000 submit_ns=28875 maintenance_total_ns=299250 wait_ns=286209
+ROW_PHASE rows=1000 build_ns=145041 checks_ns=109042 embed_ns=370041
+IO_PHASE payload_bytes=336968 checksum_ns=32125 write_ns=39333 sync_ns=373750
+COMMIT_PHASE rows=1000 drop_pack_ns=44042
+EMBED_PHASE rows=1000 text_ns=59542 generate_ns=251584 attach_ns=25834
+WAL_PHASE rows=1000 phase=rows_to_insert_cols ns=92792
+WAL_PHASE rows=1000 phase=use_sparse_vectors ns=101208
+MAINT_PHASE rows=1000 index_ns=127750 fts_ns=144000 hnsw_ns=42 maps_ns=38167
+WAL_PHASE rows=1000 phase=append_sparse_rows_serial ns=187542
+WAL_PHASE rows=1000 phase=encode_insert_cols_v2 ns=333000
+ENCODER_PHASE rows=1000 submit_ns=24041 maintenance_total_ns=340958 wait_ns=134250
+ROW_PHASE rows=1000 build_ns=146334 checks_ns=106417 embed_ns=379917
+IO_PHASE payload_bytes=336968 checksum_ns=32583 write_ns=34917 sync_ns=942583
+COMMIT_PHASE rows=1000 drop_pack_ns=53125
+EMBED_PHASE rows=1000 text_ns=62625 generate_ns=239125 attach_ns=26708
+WAL_PHASE rows=1000 phase=rows_to_insert_cols ns=81708
+WAL_PHASE rows=1000 phase=use_sparse_vectors ns=95042
+MAINT_PHASE rows=1000 index_ns=102875 fts_ns=145958 hnsw_ns=42 maps_ns=35125
+WAL_PHASE rows=1000 phase=append_sparse_rows_serial ns=198500
+WAL_PHASE rows=1000 phase=encode_insert_cols_v2 ns=329959
+ENCODER_PHASE rows=1000 submit_ns=27583 maintenance_total_ns=302000 wait_ns=171334
+ROW_PHASE rows=1000 build_ns=150916 checks_ns=111875 embed_ns=378875
+IO_PHASE payload_bytes=336968 checksum_ns=32667 write_ns=36459 sync_ns=493084
+COMMIT_PHASE rows=1000 drop_pack_ns=24500
+# bench 1792995562970842000-33209
+
+Status: Complete
+
+| Case | Metric | Median | Unit | Scope / statistic | Observations | Processes |
+|---|---|---:|---|---|---:|---:|
+| compare/durable_insert_1k/lin [candidate] | wall | 1813062.5000 | ns | current thread wall clock; scheduler included / batch_total | 24 | 1 |
+
+# Useful work throughput
+
+| Case | Median batch throughput | Unit |
+|---|---:|---|
+| compare/durable_insert_1k/lin [candidate] | 551553.1706 | rows/s |
+
+Derived from positive wall batches and declared units per operation; zero/unavailable durations omitted.
+
+Medians above summarize observations, not pooled operation-latency percentiles. Comparisons aggregate within each process first.
+
+- Raw batches are not independent process replications. Batch averages are not individual-operation latency. CPU frequency and background load are uncontrolled.
+

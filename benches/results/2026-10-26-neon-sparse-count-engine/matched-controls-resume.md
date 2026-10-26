@@ -1,0 +1,1 @@
+The initial driver completed and saved series1/1k/block1 (72 observations +3 preflights, all three workers exit0), then its progress-print statement failed because the loop variable shadowed Python round(). Original source/log retained. Resume fixes the variable name, loads the saved summary, and skips the already completed block. No timed values are replaced or removed.
