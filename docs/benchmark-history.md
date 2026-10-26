@@ -8,6 +8,8 @@
 
 ## Обновление 2026-10-26
 
+- [Accepted core — свежая available-peer matrix](../benches/results/2026-10-26-persistent-peer-refresh/report.md): frozen b7195e2, 1k/10k/100k, три процесса ×12 samples. Read108/108 агрегированных побед и324/324 process comparisons, minimum1,723×; native15/15 агрегированных и44/45 process comparisons, minimum1,070×. Native100k process2 проигрывает DuckDB:144/102мс, не исключён. Новые ARM-контейнеры, sentinel/cleanup/source hashes проверены. API-контракты не равны raw CPU/disk durability; MSSQL/Kusto отсутствуют, durable1k SQLite gap остаётся.
+
 - [Shared persistent WAL encoder — принято](../benches/results/2026-10-26-wal-persistent-engine/report.md): Full durable10k +18,92% /+20,89% в conventional и +19,17% /+20,09% в interleaved; 6/6 в обеих сериях. Границы4096/16384 прошли два A/A/B повтора. Candidate10k обгоняет SQLite в12/12 процессов (1,233–1,245×); durable1k gap остаётся. Byte-equal WAL, process-exit replay1/3/4 commits, worker/queue/lifecycle tests; sync и формат сохранены. Это принятие новой persistent-политики, а не ранее отклонённого scoped-прототипа.
 
 - [Persistent WAL worker — CPU feasibility](../benches/results/2026-10-26-wal-persistent-worker-cpu/report.md): постоянный bounded worker с Arc-владением, 2592 CPU операции и точные bytes/rows/ID-set проверки. 10k +39,71% /+38,94%, 6/6 в обеих сериях; 1k +26,56% /+33,27%, но три сильных проигрыша сохранены. Cold/shutdown измерены отдельно; полный commit и peer superiority не доказаны, production не менялся.

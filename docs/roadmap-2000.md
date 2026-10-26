@@ -8,7 +8,7 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 
 План содержит ровно **2000 пунктов в 50 областях**. Стабильные ID, зависимости, приоритеты и критерии приёмки сохранены. Проверенный исходный срез этой актуализации: `7cd747eafefaa226fbd3de5f552b043523f17b20`. Это план работ; реализация всех пунктов этой актуализацией не выполнялась.
 
-**Исправление учёта:** исторический `done` у LIN-0001–LIN-0004 был снят при актуализации. Затем LIN-0003 закрыт новой [full-engine квалификацией shared persistent encoder](../benches/results/2026-10-26-wal-persistent-engine/report.md): durable10k быстрее SQLite в12/12 процессов, с двумя conventional и двумя interleaved повторами. LIN-0001, LIN-0002 и LIN-0004 остаются `qualification`. Остальные исторические статусы не переаттестованы. Для них перед исполнением нужен аудит evidence; число `done` не является числом проверенных сегодня возможностей.
+**Исправление учёта:** исторический `done` у LIN-0001–LIN-0004 был снят при актуализации. Затем LIN-0003 закрыт новой [full-engine квалификацией shared persistent encoder](../benches/results/2026-10-26-wal-persistent-engine/report.md): durable10k быстрее SQLite в12/12 процессов, с двумя conventional и двумя interleaved повторами. LIN-0004 затем закрыт [свежей read matrix b7195e2](../benches/results/2026-10-26-persistent-peer-refresh/report.md):108/108 агрегированных и324/324 within-process побед на available peers. LIN-0001 и LIN-0002 остаются `qualification`; MSSQL/Kusto не измерены. Остальные исторические статусы не переаттестованы. Для них перед исполнением нужен аудит evidence; число `done` не является числом проверенных сегодня возможностей.
 
 Последняя [полная квалификация WAL overlap](../benches/results/2026-10-26-wal-overlap-port/report.md) относится к прототипу на замороженном `e7abf40`, а не к текущему main. Прототип не принят: interleaved durable 1k показал −8,713%, лишь 1/6 положительных пар; A/A имел медианную абсолютную разницу 12,233%. Эти данные не доказывают причину регрессии, но не дают принять ускорение. CPU microbench не заменяет commit latency. Сохранённые кандидатные исходники не являются производственной реализацией.
 
@@ -96,7 +96,7 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 1. **LIN-0001: Закрыть native 1k SQLite gap** — P1, qualification, G-PERF.
 2. **LIN-0002: Закрыть durable 1k SQLite gap** — P1, qualification, G-PERF.
 3. **LIN-0003: Закрыть durable 10k SQLite gap** — P1, done, G-PERF.
-4. **LIN-0004: Обновить матрицу чтения текущего main** — P1, qualification, G-PERF.
+4. **LIN-0004: Обновить матрицу чтения текущего main** — P1, done, G-PERF.
 5. **LIN-0081: Профилировать текущий WAL encode** — P1, done, G-PERF.
 6. **LIN-0082: Профилировать текущий WAL pack** — P1, done, G-PERF.
 7. **LIN-0084: Профилировать текущий Full-sync** — P1, done, G-PERF.
@@ -129,7 +129,7 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 1 | LIN-0001 | [D01](#d01) | Закрыть native 1k SQLite gap | PERF | qualification | M | G-PERF |
 | 2 | LIN-0002 | [D01](#d01) | Закрыть durable 1k SQLite gap | PERF | qualification | M | G-PERF |
 | 3 | LIN-0003 | [D01](#d01) | Закрыть durable 10k SQLite gap | PERF | done | M | G-PERF |
-| 4 | LIN-0004 | [D01](#d01) | Обновить матрицу чтения текущего main | PERF | qualification | M | G-PERF |
+| 4 | LIN-0004 | [D01](#d01) | Обновить матрицу чтения текущего main | PERF | done | M | G-PERF |
 | 5 | LIN-0081 | [D03](#d03) | Профилировать текущий WAL encode | PERF | done | M | G-PERF |
 | 6 | LIN-0082 | [D03](#d03) | Профилировать текущий WAL pack | PERF | done | M | G-PERF |
 | 7 | LIN-0084 | [D03](#d03) | Профилировать текущий Full-sync | PERF | done | M | G-PERF |

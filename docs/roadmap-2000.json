@@ -791,7 +791,7 @@
       "area": "D01",
       "title": "Обновить матрицу чтения текущего main",
       "kind": "PERF",
-      "status": "qualification",
+      "status": "done",
       "effort": "M",
       "source_paths": [
         "benches/compare.rs",
@@ -802,7 +802,8 @@
       "depends_on": [
         "LIN-0029"
       ],
-      "review_note": "Исторический done не подтверждает текущий main. Требуется свежий matched-contract baseline; WAL overlap port 2026-10-26 не принят."
+      "review_note": "2026-10-26: read matrix accepted core b7195e2, 108/108 aggregate и324/324 within-process comparisons против шести available peers; 1k/10k/100k, 3 processes ×12 samples. MSSQL/Kusto отдельно не измерены.",
+      "completion_evidence": "benches/results/2026-10-26-persistent-peer-refresh/report.md"
     },
     {
       "id": "LIN-0081",
@@ -34739,5 +34740,5 @@
   ],
   "review_date": "2026-10-26",
   "review_commit": "7cd747eafefaa226fbd3de5f552b043523f17b20",
-  "review_scope": "Пересмотрены LIN-0001..0004: LIN-0003 закрыт новой full-engine квалификацией 2026-10-26; LIN-0001/0002/0004 требуют свежего закрытия. Прочие исторические статусы не переаттестованы."
+  "review_scope": "LIN-0003 закрыт full-engine durable10k квалификацией, LIN-0004 — свежей available-peer read matrix b7195e2. LIN-0001/0002 и два Microsoft peers требуют дальнейшего закрытия; прочие исторические статусы не переаттестованы."
 }
