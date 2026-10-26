@@ -1,0 +1,22 @@
+   Compiling lin v0.4.0 (/Users/themoretheless/.codex/worktrees/lin-wal-persistent-qualification/lin)
+error: expected one of `...`, `..=`, `..`, `=>`, `if`, or `|`, found `i`
+  --> examples/row_key_layout_gate.rs:41:116
+   |
+41 | ...g_inline_capacity_{i}"),"mixed32"if i%2==0=>format!("long_field_name_exceeding_inline_capacity_{i}"),"unicode9"=>format!("поле_{i...
+   |                                        ^ expected one of `...`, `..=`, `..`, `=>`, `if`, or `|`
+   |
+help: there is a keyword `if` with a similar name
+   |
+41 |   for i in 0..n {let key=match shape{"long9"=>format!("long_field_name_exceeding_inline_capacity_{i}"),"mixed32"if if%2==0=>format!("long_field_name_exceeding_inline_capacity_{i}"),"unicode9"=>format!("поле_{i}"),_=>format!("field_{i}")};let v=if i%2==0{Cell::Int(i)}else{Cell::text_arc("some payload shared across row copies")};a.insert(key.clone(),v.clone());b.insert(Key::new(&key),v);}
+   |                                                                                                                     +
+
+warning: unused import: `Db`
+ --> examples/row_key_layout_gate.rs:3:11
+  |
+3 | use lin::{Db, Cell};
+  |           ^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `lin` (example "row_key_layout_gate") generated 1 warning
+error: could not compile `lin` (example "row_key_layout_gate") due to 1 previous error; 1 warning emitted
