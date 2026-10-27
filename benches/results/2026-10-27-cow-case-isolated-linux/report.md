@@ -1,0 +1,9 @@
+# COW case-isolated Linux qualification
+
+Run40431125318, frozen head5a85750ad2edb91a6ffae7cc04e2fca1651ce026. Same main205+writer-lock baseline and same COW-inplace source as run40428404395, with each case now isolated in a fresh process. No selective-index or Eq/Hash follow-up source. Rotated case/role ordering;12rounds,20cases,3roles =720successful real processes and5760observations. Independent verifier recomputes240 triple comparisons, series statistics,120 peer comparisons and the final gate directly from every raw observation. All artifacts and losers retained.
+
+UPDATE gains (series1/series2):1k +67.579/+65.406%,10k +50.141/+49.171%,100k +38.605/+38.491%. All six series have6/6positive pairs and exceed A/A. These results support the scoped UPDATE mechanism; they do not qualify the whole candidate. Gate remains false because SQLite tx_commit10k series2 is-4.495% versus A/A4.317%. Do not round that failure into a pass. Other unchanged controls pass their bounds.
+
+Candidate/SQLite wins:UPDATE1k11/12,10k0/12,100k1/12;DELETE all sizes0/12;tx_commit1k11/12,10k1/12;rollback1k8/12,10k0/12. Overall32/120. Peer comparisons use nearby separate processes, not within-process samples. They are not directly comparable to the prior multi-case-process protocol's53/120; no causal attribution to process isolation or runner conditions is established.
+
+The candidate is not accepted. This is neither Full-durable nor all-eight-peer qualification. Main now includes writer-lock and take-all corrections; this frozen experiment predates take-all. Eq/Hash API follow-up and source integration need final qualification. The selective patch-index mechanism was rejected separately after incremental warm slowdown. Next source hypothesis: move the existing unchanged-key reverse check before repeated unique-key lookup, with independent uniqueness/partial-index/rollback controls. No unchanged rerun seeking a green result is planned.
