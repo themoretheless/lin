@@ -1,0 +1,9 @@
+# Current COW MSSQL refresh: private native-x86 qualification
+
+Run [40603880905](https://github.com/themoretheless/lin/actions/runs/40603880905) uses frozen commit75f8f6b7f7f03dc22a64cb963264f33e69f7da9d, the restored lazy COW core with transaction/schema corrections. This replaces stale-source evidence only after completion; it does not qualify current COW for production. The full native/durable/read source gate already failed controls and remains failed.
+
+Existing native-mssql-bench workflow on Ubuntu24.04 x86_64, Rust1.96.0 and pinned Python clients. A fresh real SQL Server2022Developer amd64 container is owned by this run; actual image digest/version/configuration are captured privately. No emulation or alternate service. Read and native-insert modes at1000/10000/100000 rows,12samples/3fresh repeats, full-value/column/multiplicity validation, sentinel preservation and no remaining fixture objects. Owned container is stopped/removed in finally.
+
+Relative-performance outcomes, ratios, wins/losses, child statuses and raw logs stay private. CI uploads age-encrypted artifacts only, using the existing recipient; matching0600local identity was verified without printing it. Public job status reports functional completion, never peer superiority: child exit0and3both permit complete reports. No new key or public decryption material is created.
+
+Upon completion: preserve run metadata, download encrypted artifact, decrypt only into an ignored0700local directory using the existing identity, verify frozen source hashes, worker binary provenance, complete six mode/size reports and oracles, sentinel and cleanup. Keep comparative findings private. Reopen/clean-read validation is not power-loss durability evidence. Native bulk insertion and Python/TDScall contracts do not replace the Rust single-DML or Full-sync source gates. Full eight-peer goal remains open; Kusto evidence is still missing.
