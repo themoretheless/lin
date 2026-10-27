@@ -1776,16 +1776,17 @@ impl Db {
                 return Err(e);
             }
             if let Some(p) = self.persist.as_mut() {
-                // Schema packs only — avoid hashing the catalog on every append.
-                if prepared.schema {
-                    p.catalog_hash = crate::store::catalog_hash(&self.catalog);
-                }
                 if let Err(e) = self
                     .store
                     .durable_commit_prepared(p, pack, prepared_encoding)
                 {
                     self.rollback(undo, cat_backup);
                     return Err(e);
+                }
+                // Publish schema metadata only after WAL append succeeds. A rejected
+                // record rolls back the catalog and must retain its committed hash.
+                if prepared.schema {
+                    p.catalog_hash = crate::store::catalog_hash(&self.catalog);
                 }
             }
             self.store.r#gen += 1;

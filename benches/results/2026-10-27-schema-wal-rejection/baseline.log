@@ -1,0 +1,12 @@
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+   Compiling lin v0.4.0 (/Users/themoretheless/.codex/worktrees/lin-wal-persistent-qualification/lin)
+    Finished `release` profile [optimized] target(s) in 12.09s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running `target/release/examples/schema_wal_rejection_probe`
+{"close_ok":true,"generation_unchanged":true,"reopen_error":"runtime error: catalog_hash mismatch: store=h:7a6d5174e4a649b5 catalog=h:604f14baecd449f9","reopen_ok":false,"wal_rejected":true}
+
+thread 'main' (80984806) panicked at examples/schema_wal_rejection_probe.rs:9:218:
+reopen after rejected schema: Some("runtime error: catalog_hash mismatch: store=h:7a6d5174e4a649b5 catalog=h:604f14baecd449f9")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

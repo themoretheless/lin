@@ -1,0 +1,9 @@
+# Rejected autocommit schema WAL must retain committed catalog hash
+
+A real release executable reproduced a recovery failure on core `e6310f880e5821f89337023f1b2e7219ee6575ea`. With an explicitly raised 64 MiB query limit, a 17 MiB collection identifier creates a schema Pack that exceeds the unchanged 16 MiB WAL limit. The operation correctly returns an error and retains the committed generation. However, autocommit had already assigned the tentative catalog hash into Persist. Rollback restores the old catalog but leaves that hash. Ordinary close successfully writes a snapshot/HEAD with the inconsistent hash, and reopen rejects it with `catalog_hash mismatch`.
+
+`baseline.log` and `baseline-status.json` retain the actual runtime failure (exit 101), source hashes and successful source restoration. This is a rejection/recovery defect; the fixture does not prove loss of the existing row bytes or simulate hardware power loss.
+
+The correction publishes the schema hash only after `durable_commit_prepared` succeeds, matching the interactive transaction ordering. WAL encoding, size limits, sync policy and generation policy stay unchanged. The initial focused release test passed. The final regression also verifies a subsequent write, next generation, and a second close/reopen.
+
+The complete default-feature release library/integration command exited 0. All 28 reported test-result lines are successful; the log reports 431 passes including nested child-process results and 2 ignored tests. Raw output is retained in `full-tests.log`; `candidate-status.json` pins the validated core and regression hashes. The ongoing positive-zero performance run remains frozen at its original source and does not qualify this newer source automatically. No performance improvement is claimed for this correction.
