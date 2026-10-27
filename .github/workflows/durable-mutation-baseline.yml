@@ -1,0 +1,54 @@
+name: durable-mutation-baseline
+on:
+  push:
+    branches: [codex/durable-mutation-coverage-ci]
+permissions:
+  contents: read
+jobs:
+  profile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Verify and stage frozen inputs
+        run: |
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          import json,hashlib,shutil
+          src=Path('benches/results/2026-10-27-durable-mutation-baseline');dst=Path('benches/results/ci-durable-mutation-baseline')
+          m=json.loads((src/'input-provenance.json').read_text())
+          for f,h in m['source_sha256'].items():assert hashlib.sha256(Path(f).read_bytes()).hexdigest()==h,f
+          for f,h in m['build_inputs_sha256'].items():assert hashlib.sha256(Path(f).read_bytes()).hexdigest()==h,f
+          assert hashlib.sha256(Path('benches/compare.rs').read_bytes()).hexdigest()==m['compare_sha256']
+          dst.mkdir()
+          for n,h in m['files_sha256'].items():
+              assert hashlib.sha256((src/n).read_bytes()).hexdigest()==h,n
+              shutil.copy2(src/n,dst/n)
+          shutil.copy2(src/'input-provenance.json',dst/'input-provenance.json')
+          PYCODE
+      - name: Synthetic analysis sensitivity checks
+        run: python3 benches/results/ci-durable-mutation-baseline/test-protocol.py
+      - name: Build production-source benchmark and restore source
+        run: python3 benches/results/ci-durable-mutation-baseline/build.py
+      - name: Validate all 24 durable cases after reopen
+        run: python3 benches/results/ci-durable-mutation-baseline/smoke.py
+      - name: Run 576 isolated processes
+        run: python3 benches/results/ci-durable-mutation-baseline/run.py
+      - name: Analyze complete baseline
+        id: analyze
+        run: python3 benches/results/ci-durable-mutation-baseline/analyze.py
+      - name: Independent raw audit
+        if: always() && steps.analyze.outcome == 'success'
+        run: python3 benches/results/ci-durable-mutation-baseline/verify.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: durable-mutation-baseline
+          path: benches/results/ci-durable-mutation-baseline/
+          if-no-files-found: error
