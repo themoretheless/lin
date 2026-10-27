@@ -25,20 +25,20 @@
 
 ## Что проверено относительно каждого peer
 
-[API read refresh](../benches/results/2026-10-26-persistent-peer-refresh/report.md) относится к `b7195e23aa706f56d312c3d9e121638e285cfa5f`: 1k/10k/100k, три процесса, подготовленные запросы и полный readback. Минимумы ниже — среди сохранённых сравнений чтения этого прогона.
+[Свежий API read/native refresh](../benches/results/2026-10-27-corrected-peer-refresh/report.md) относится к `bab12daae6aa5150b2ce1746b688144cb89ab959`: 1k/10k/100k, три процесса, подготовленные запросы и полный readback. Минимумы ниже — среди сохранённых сравнений чтения этого прогона.
 
 | Peer | Сравнения чтения | Положительные процессы | Минимальное отношение peer/Lin | Незакрытая часть |
 |---|---:|---:|---:|---|
-| duckdb | 18/18 | 54/54 | 1.723× | Повтор на итоговом бинарнике; расширение согласованных сценариев |
-| sqlite | 18/18 | 54/54 | 2.974× | Durable/native mutation gaps и повтор на итоговом бинарнике |
-| postgres | 18/18 | 54/54 | 2.622× | Повтор на итоговом бинарнике; расширение согласованных сценариев |
-| mysql | 18/18 | 54/54 | 10.348× | Повтор на итоговом бинарнике; расширение согласованных сценариев |
-| mongo | 18/18 | 54/54 | 6.318× | Повтор на итоговом бинарнике; расширение согласованных сценариев |
-| pandas | 18/18 | 54/54 | 2.302× | Только in-memory read API; durable-транзакции неприменимы |
+| duckdb | 18/18 | 54/54 | 1.761× | Повтор на итоговом бинарнике; расширение согласованных сценариев |
+| sqlite | 18/18 | 54/54 | 3.026× | Durable/native mutation gaps и повтор на итоговом бинарнике |
+| postgres | 18/18 | 54/54 | 2.692× | Повтор на итоговом бинарнике; расширение согласованных сценариев |
+| mysql | 18/18 | 54/54 | 10.131× | Повтор на итоговом бинарнике; расширение согласованных сценариев |
+| mongo | 18/18 | 54/54 | 7.602× | Повтор на итоговом бинарнике; расширение согласованных сценариев |
+| pandas | 18/18 | 54/54 | 2.255× | Только in-memory read API; durable-транзакции неприменимы |
 | MSSQL | Отдельный реальный native x86 CI | Функциональная квалификация завершена | Публично не раскрывается | Метрики приватны; green CI не означает победу |
 | Kusto | Отсутствуют в выбранных завершённых измерениях | Не квалифицирован | — | Нужен реальный разрешённый endpoint и замер |
 
-[MSSQL qualification](../benches/results/2026-10-26-mssql-native-ci/report.md) относится к frozen `8b0e9717`, не к текущим исходникам; comparative evidence остаётся приватным. Сравнение API включает Python bindings у embedded peers и driver/network у серверов, а не только CPU движков. Native insertion в API refresh использует разные объявленные durability-контракты и tmpfs у серверов: 15/15 агрегированных побед, 44/45 процессных; один проигрыш DuckDB на 100k сохранён. Это не замена Full durable gate.
+[MSSQL qualification](../benches/results/2026-10-26-mssql-native-ci/report.md) относится к frozen `8b0e9717`, не к текущим исходникам; comparative evidence остаётся приватным. Сравнение API включает Python bindings у embedded peers и driver/network у серверов, а не только CPU движков. Native insertion в API refresh использует разные объявленные durability-контракты и tmpfs у серверов: 15/15 агрегированных побед,45/45 процессных в свежем прогоне. В [предыдущем source-scoped прогоне](../benches/results/2026-10-26-persistent-peer-refresh/report.md) был проигрыш DuckDB на100k:он сохранён и не объявляется устранённым причинным A/B-изменением. Это не замена Full durable gate.
 
 ## Текущие независимые проверки
 
@@ -48,6 +48,7 @@
 - [Bounded Linux KEEP_SIZE](../benches/results/2026-10-27-linux-wal-keep-size-tx-fixed/report.md): исправленный независимый CRC32C-эталон и прежние replay/follower/checkpoint checks; локально 417 passed /2 ignored; [Linux:421 passed /2 ignored, независимый аудит](../benches/results/2026-10-27-linux-wal-keep-size-tx-fixed-linux/report.md).
 - [Normal checkpoint concentration diagnostic](../benches/results/2026-10-27-normal-tx-checkpoint-diagnostic/report.md): на macOS,6 свежих процессов,6000 наблюдений;31 checkpoint на1000 транзакций Lin,92–95% суммарного времени в этих транзакциях. Политики32 commit/1000 WAL pages не менялись. Изолированные sync/serialization этапы и Linux-скорость этим не измерены.
 - [Normal checkpoint stage diagnostic](../benches/results/2026-10-27-normal-checkpoint-stages/report.md):15 свежих процессов,15000 транзакций,93 автоматических checkpoint-кадра; составные этапы snapshot ≈33%,HEAD ≈31%,compact ≈25%,FTS ≈6%. macOS,три повтора; исходный/A/A/выключенный/включённый наблюдатель сохранены. Изолированная цена syscalls и ускорение кандидата не доказаны.
+- [Schema crash/HEAD recovery](../benches/results/2026-10-27-schema-crash-head/report.md):каталог HEAD сверяется на соответствующем поколении;порядок публикации и sync не менялись. [Linux:430 passed /2 ignored,10 целевых регрессий](../benches/results/2026-10-27-schema-crash-head-linux/report.md). Данная более новая store-реализация не входит в frozen WAL timing input.
 - [Full-engine WAL reserve protocol](../benches/results/2026-10-27-linux-wal-reserve-engine/protocol.md): 61 case, 2196 processes, 17568 observations; baseline/control/candidate. [Run 40530861048](https://github.com/themoretheless/lin/actions/runs/40530861048) сначала проверяет Linux-корректность, затем измеряет. Подготовка и 122 локальных smoke-проверки не являются измеренным ускорением.
 - [Незавершённый lazy COW](../benches/results/2026-10-27-cow-lazy-sharing-engine-linux-incomplete/report.md): отменённый run; 1207 status-файлов из 1332 требуемых процессов, итоговый gate не выполнялся. Принятого ускорения нет; публичный Row нового типа не включён в production.
 

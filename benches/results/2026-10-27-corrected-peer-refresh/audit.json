@@ -1,0 +1,1774 @@
+{
+  "source_commit": "bab12daae6aa5150b2ce1746b688144cb89ab959",
+  "versions": {
+    "lin": "0.4.0",
+    "sqlite": "3.54.1",
+    "duckdb": "1.5.6",
+    "postgres": "160015",
+    "mysql": "8.4.11",
+    "mongo": "8.0.34",
+    "pandas": "3.0.6"
+  },
+  "summary": {
+    "read": {
+      "comparisons": 108,
+      "wins": 108,
+      "samples": 4536,
+      "process_comparisons": 324,
+      "positive_processes": 324,
+      "minimum_speedup": 1.7607498451621766
+    },
+    "native": {
+      "comparisons": 15,
+      "wins": 15,
+      "samples": 648,
+      "process_comparisons": 45,
+      "positive_processes": 45,
+      "minimum_speedup": 1.0900243884361782
+    }
+  },
+  "results": [
+    {
+      "mode": "read",
+      "comparisons": [
+        {
+          "rows": 1000,
+          "case": "point_get",
+          "peer": "duckdb",
+          "lin_ns": 117.4104,
+          "peer_ns": 39923.01904761905,
+          "speedup": 340.0296655800427,
+          "process_speedups": [
+            352.5894429895536,
+            338.36049149771713,
+            342.8698065254481
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 1000,
+          "case": "point_get",
+          "peer": "mongo",
+          "lin_ns": 117.4104,
+          "peer_ns": 439903.625,
+          "speedup": 3746.717709845125,
+          "process_speedups": [
+            3889.1510466097516,
+            3959.101586071993,
+            3572.42440003422
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 1000,
+          "case": "point_get",
+          "peer": "mysql",
+          "lin_ns": 117.4104,
+          "peer_ns": 329546.5882352941,
+          "speedup": 2806.79214307501,
+          "process_speedups": [
+            3004.6788508318805,
+            2677.774811910274,
+            2806.79214307501
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 1000,
+          "case": "point_get",
+          "peer": "pandas",
+          "lin_ns": 117.4104,
+          "peer_ns": 4524.5,
+          "speedup": 38.53576855201924,
+          "process_speedups": [
+            43.80103791362975,
+            38.3466000393255,
+            37.55110812159741
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 1000,
+          "case": "point_get",
+          "peer": "postgres",
+          "lin_ns": 117.4104,
+          "peer_ns": 314041.6923076923,
+          "speedup": 2674.7348813026133,
+          "process_speedups": [
+            2781.5735084600938,
+            2561.7799607519887,
+            2674.7348813026133
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 1000,
+          "case": "point_get",
+          "peer": "sqlite",
+          "lin_ns": 117.4104,
+          "peer_ns": 918.5543054305431,
+          "speedup": 7.8234492466642065,
+          "process_speedups": [
+            8.007645052175228,
+            7.8689086707902005,
+            7.8234492466642065
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 1000,
+          "case": "filter_eq",
+          "peer": "duckdb",
+          "lin_ns": 653.057262791066,
+          "peer_ns": 138239.2727272727,
+          "speedup": 211.6801704898884,
+          "process_speedups": [
+            210.2938345395097,
+            211.6801704898884,
+            291.44189728013225
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 1000,
+          "case": "filter_eq",
+          "peer": "mongo",
+          "lin_ns": 653.057262791066,
+          "peer_ns": 499284.77777777775,
+          "speedup": 764.5344539067089,
+          "process_speedups": [
+            762.629248961669,
+            829.6036479014435,
+            745.9166085939692
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 1000,
+          "case": "filter_eq",
+          "peer": "mysql",
+          "lin_ns": 653.057262791066,
+          "peer_ns": 356778.8461538461,
+          "speedup": 546.3209223476489,
+          "process_speedups": [
+            549.1810537311816,
+            525.747099222305,
+            566.1302653506024
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 1000,
+          "case": "filter_eq",
+          "peer": "pandas",
+          "lin_ns": 653.057262791066,
+          "peer_ns": 57441.21428571429,
+          "speedup": 87.95739295543457,
+          "process_speedups": [
+            88.41787266564684,
+            88.6772012534961,
+            83.65148056380839
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 1000,
+          "case": "filter_eq",
+          "peer": "postgres",
+          "lin_ns": 653.057262791066,
+          "peer_ns": 331834.73333333334,
+          "speedup": 508.1250178814686,
+          "process_speedups": [
+            510.7851838223147,
+            497.84220341897156,
+            536.1423765945009
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 1000,
+          "case": "filter_eq",
+          "peer": "sqlite",
+          "lin_ns": 653.057262791066,
+          "peer_ns": 7572.40490797546,
+          "speedup": 11.59531535659242,
+          "process_speedups": [
+            11.770007064006357,
+            11.521712400540656,
+            11.312947718929598
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 1000,
+          "case": "text_substr",
+          "peer": "duckdb",
+          "lin_ns": 2138.5163246268658,
+          "peer_ns": 61890.915730337074,
+          "speedup": 28.941053672403445,
+          "process_speedups": [
+            27.78464512664838,
+            29.833825769709545,
+            45.802617780074165
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 1000,
+          "case": "text_substr",
+          "peer": "mongo",
+          "lin_ns": 2138.5163246268658,
+          "peer_ns": 742256.0,
+          "speedup": 347.0892372680442,
+          "process_speedups": [
+            360.40487785250116,
+            343.8945716675816,
+            347.0892372680442
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 1000,
+          "case": "text_substr",
+          "peer": "mysql",
+          "lin_ns": 2138.5163246268658,
+          "peer_ns": 401796.875,
+          "speedup": 187.88581147263704,
+          "process_speedups": [
+            193.33706927252476,
+            193.6817030756588,
+            186.34682498496227
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 1000,
+          "case": "text_substr",
+          "peer": "pandas",
+          "lin_ns": 2138.5163246268658,
+          "peer_ns": 74883.77192982455,
+          "speedup": 35.016694082468824,
+          "process_speedups": [
+            35.37731983515885,
+            35.34066594440495,
+            35.016694082468824
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 1000,
+          "case": "text_substr",
+          "peer": "postgres",
+          "lin_ns": 2138.5163246268658,
+          "peer_ns": 354500.0,
+          "speedup": 165.7691343842578,
+          "process_speedups": [
+            150.4423209420753,
+            170.88277189891295,
+            227.1833147486013
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 1000,
+          "case": "text_substr",
+          "peer": "sqlite",
+          "lin_ns": 2138.5163246268658,
+          "peer_ns": 32345.34935897436,
+          "speedup": 15.125135584185015,
+          "process_speedups": [
+            15.02489800858558,
+            15.260004384380977,
+            15.125135584185015
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 1000,
+          "case": "materialize",
+          "peer": "duckdb",
+          "lin_ns": 39445.95045045045,
+          "peer_ns": 298532.5625,
+          "speedup": 7.568142207018133,
+          "process_speedups": [
+            7.179053747526337,
+            7.712489727159459,
+            7.584810584696747
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 1000,
+          "case": "materialize",
+          "peer": "mongo",
+          "lin_ns": 39445.95045045045,
+          "peer_ns": 1652583.5,
+          "speedup": 41.894883533757735,
+          "process_speedups": [
+            41.5963096181665,
+            41.682269551877,
+            41.894883533757735
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 1000,
+          "case": "materialize",
+          "peer": "mysql",
+          "lin_ns": 39445.95045045045,
+          "peer_ns": 1239901.125,
+          "speedup": 31.432912905913792,
+          "process_speedups": [
+            49.90566575717258,
+            30.51464429018232,
+            31.432912905913792
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 1000,
+          "case": "materialize",
+          "peer": "pandas",
+          "lin_ns": 39445.95045045045,
+          "peer_ns": 372283.0,
+          "speedup": 9.437800224072145,
+          "process_speedups": [
+            9.088767178729343,
+            9.45773082954035,
+            9.437800224072145
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 1000,
+          "case": "materialize",
+          "peer": "postgres",
+          "lin_ns": 39445.95045045045,
+          "peer_ns": 433848.5,
+          "speedup": 10.99855612669223,
+          "process_speedups": [
+            9.921292528128957,
+            11.208332087370001,
+            13.969831414506709
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 1000,
+          "case": "materialize",
+          "peer": "sqlite",
+          "lin_ns": 39445.95045045045,
+          "peer_ns": 169163.1666666667,
+          "speedup": 4.288479925947251,
+          "process_speedups": [
+            4.075131069694838,
+            4.221564350191981,
+            4.353460825230007
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 1000,
+          "case": "join_inner",
+          "peer": "duckdb",
+          "lin_ns": 129638.71052631579,
+          "peer_ns": 369397.42307692306,
+          "speedup": 2.849437653130142,
+          "process_speedups": [
+            2.7067751046068746,
+            2.8973155234677823,
+            3.0813840123696
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 1000,
+          "case": "join_inner",
+          "peer": "mongo",
+          "lin_ns": 129638.71052631579,
+          "peer_ns": 13405021.0,
+          "speedup": 103.4029183534564,
+          "process_speedups": [
+            101.7789977764521,
+            109.21709804564856,
+            101.36793590933183
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 1000,
+          "case": "join_inner",
+          "peer": "mysql",
+          "lin_ns": 129638.71052631579,
+          "peer_ns": 2317729.25,
+          "speedup": 17.878373215765027,
+          "process_speedups": [
+            17.597597212430177,
+            18.075423896980432,
+            17.9030398449456
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 1000,
+          "case": "join_inner",
+          "peer": "pandas",
+          "lin_ns": 129638.71052631579,
+          "peer_ns": 718441.0,
+          "speedup": 5.541870920215311,
+          "process_speedups": [
+            5.543707178625016,
+            5.52215863874895,
+            5.541870920215311
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 1000,
+          "case": "join_inner",
+          "peer": "postgres",
+          "lin_ns": 129638.71052631579,
+          "peer_ns": 661488.1428571428,
+          "speedup": 5.102551083481081,
+          "process_speedups": [
+            5.009580779868758,
+            5.1882870457674395,
+            5.364829536715838
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 1000,
+          "case": "join_inner",
+          "peer": "sqlite",
+          "lin_ns": 129638.71052631579,
+          "peer_ns": 392236.125,
+          "speedup": 3.02560958380081,
+          "process_speedups": [
+            2.9780930364987257,
+            3.0746364333675342,
+            3.0794049224386293
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 1000,
+          "case": "join_filter",
+          "peer": "duckdb",
+          "lin_ns": 64833.32692307692,
+          "peer_ns": 255363.4166666667,
+          "speedup": 3.9387677416222804,
+          "process_speedups": [
+            3.7788597793008547,
+            4.001190303581629,
+            4.2627647745136885
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 1000,
+          "case": "join_filter",
+          "peer": "mongo",
+          "lin_ns": 64833.32692307692,
+          "peer_ns": 8313687.5,
+          "speedup": 128.2316964832605,
+          "process_speedups": [
+            124.9616158141258,
+            133.6545689843004,
+            112.78407798932945
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 1000,
+          "case": "join_filter",
+          "peer": "mysql",
+          "lin_ns": 64833.32692307692,
+          "peer_ns": 1440173.6666666665,
+          "speedup": 22.21347777471601,
+          "process_speedups": [
+            36.79249347693773,
+            22.47749357161129,
+            22.21347777471601
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 1000,
+          "case": "join_filter",
+          "peer": "pandas",
+          "lin_ns": 64833.32692307692,
+          "peer_ns": 626708.3571428572,
+          "speedup": 9.666453765151225,
+          "process_speedups": [
+            9.419946197495113,
+            9.807199156282548,
+            10.411794088569714
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 1000,
+          "case": "join_filter",
+          "peer": "postgres",
+          "lin_ns": 64833.32692307692,
+          "peer_ns": 497055.5555555555,
+          "speedup": 7.66666742469192,
+          "process_speedups": [
+            7.424822228690889,
+            7.788170659645917,
+            7.906251103050336
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 1000,
+          "case": "join_filter",
+          "peer": "sqlite",
+          "lin_ns": 64833.32692307692,
+          "peer_ns": 202809.0416666667,
+          "speedup": 3.1281603349970672,
+          "process_speedups": [
+            3.0483880406114654,
+            3.1606391238202987,
+            3.1650600815760415
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 10000,
+          "case": "point_get",
+          "peer": "duckdb",
+          "lin_ns": 115.11670000000001,
+          "peer_ns": 40549.3275862069,
+          "speedup": 352.24539607378335,
+          "process_speedups": [
+            344.8437150549263,
+            357.4994707132282,
+            350.9080822746188
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 10000,
+          "case": "point_get",
+          "peer": "mongo",
+          "lin_ns": 115.11670000000001,
+          "peer_ns": 420078.6666666667,
+          "speedup": 3649.1548721138347,
+          "process_speedups": [
+            3572.4757141948,
+            3533.316168137976,
+            3942.2402440306228
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 10000,
+          "case": "point_get",
+          "peer": "mysql",
+          "lin_ns": 115.11670000000001,
+          "peer_ns": 272333.28571428574,
+          "speedup": 2365.7148416718487,
+          "process_speedups": [
+            2267.699987917817,
+            2917.649584266984,
+            2365.7148416718487
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 10000,
+          "case": "point_get",
+          "peer": "pandas",
+          "lin_ns": 115.11670000000001,
+          "peer_ns": 4442.357512953367,
+          "speedup": 38.59003526815282,
+          "process_speedups": [
+            37.77914849789257,
+            38.57091012737626,
+            39.598696404217634
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 10000,
+          "case": "point_get",
+          "peer": "postgres",
+          "lin_ns": 115.11670000000001,
+          "peer_ns": 244930.14705882352,
+          "speedup": 2127.6682449968034,
+          "process_speedups": [
+            2082.9598631727895,
+            2038.4340796381,
+            2172.433048631621
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 10000,
+          "case": "point_get",
+          "peer": "sqlite",
+          "lin_ns": 115.11670000000001,
+          "peer_ns": 928.6147021546261,
+          "speedup": 8.066724481805212,
+          "process_speedups": [
+            7.897812380028401,
+            8.04105336039491,
+            8.066724481805212
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 10000,
+          "case": "filter_eq",
+          "peer": "duckdb",
+          "lin_ns": 667.0584978655282,
+          "peer_ns": 186141.2037037037,
+          "speedup": 279.0477961068232,
+          "process_speedups": [
+            280.29675301516005,
+            274.53711683561187,
+            279.0477961068232
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 10000,
+          "case": "filter_eq",
+          "peer": "mongo",
+          "lin_ns": 667.0584978655282,
+          "peer_ns": 906029.2,
+          "speedup": 1358.2454955586902,
+          "process_speedups": [
+            1358.6469988905108,
+            1309.271331167196,
+            1549.9702099716408
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 10000,
+          "case": "filter_eq",
+          "peer": "mysql",
+          "lin_ns": 667.0584978655282,
+          "peer_ns": 591285.7142857143,
+          "speedup": 886.407588206621,
+          "process_speedups": [
+            873.1473670072993,
+            909.1149678834685,
+            886.407588206621
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 10000,
+          "case": "filter_eq",
+          "peer": "pandas",
+          "lin_ns": 667.0584978655282,
+          "peer_ns": 267843.0333333333,
+          "speedup": 401.52855287862263,
+          "process_speedups": [
+            401.6472464817518,
+            407.77263047205975,
+            399.40587547547017
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 10000,
+          "case": "filter_eq",
+          "peer": "postgres",
+          "lin_ns": 667.0584978655282,
+          "peer_ns": 465145.8181818182,
+          "speedup": 697.308886207438,
+          "process_speedups": [
+            697.5150137757133,
+            655.5734906835186,
+            705.1636423269501
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 10000,
+          "case": "filter_eq",
+          "peer": "sqlite",
+          "lin_ns": 667.0584978655282,
+          "peer_ns": 67661.9,
+          "speedup": 101.43323294209783,
+          "process_speedups": [
+            99.07550960103988,
+            100.60842381098125,
+            101.43323294209783
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 10000,
+          "case": "text_substr",
+          "peer": "duckdb",
+          "lin_ns": 18541.10090361446,
+          "peer_ns": 99181.12244897959,
+          "speedup": 5.349257466672052,
+          "process_speedups": [
+            5.2172916987390625,
+            5.349257466672052,
+            5.54823451101808
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 10000,
+          "case": "text_substr",
+          "peer": "mongo",
+          "lin_ns": 18541.10090361446,
+          "peer_ns": 3102458.5,
+          "speedup": 167.32871020594018,
+          "process_speedups": [
+            161.3656185276505,
+            167.32871020594018,
+            187.06158570807435
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 10000,
+          "case": "text_substr",
+          "peer": "mysql",
+          "lin_ns": 18541.10090361446,
+          "peer_ns": 1260125.0,
+          "speedup": 67.96387153873626,
+          "process_speedups": [
+            64.08936338370884,
+            67.96387153873626,
+            72.01622084420082
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 10000,
+          "case": "text_substr",
+          "peer": "pandas",
+          "lin_ns": 18541.10090361446,
+          "peer_ns": 482872.95,
+          "speedup": 26.043380730745458,
+          "process_speedups": [
+            25.499260156509973,
+            26.043380730745458,
+            26.763966366973193
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 10000,
+          "case": "text_substr",
+          "peer": "postgres",
+          "lin_ns": 18541.10090361446,
+          "peer_ns": 733034.6666666667,
+          "speedup": 39.53566028669671,
+          "process_speedups": [
+            38.42925616757396,
+            39.53415911729592,
+            41.242988833944324
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 10000,
+          "case": "text_substr",
+          "peer": "sqlite",
+          "lin_ns": 18541.10090361446,
+          "peer_ns": 324044.43333333335,
+          "speedup": 17.47708698733003,
+          "process_speedups": [
+            16.90192544490709,
+            17.022243445738816,
+            18.234527490712075
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 10000,
+          "case": "materialize",
+          "peer": "duckdb",
+          "lin_ns": 377835.0833333334,
+          "peer_ns": 1244708.25,
+          "speedup": 3.294316237176669,
+          "process_speedups": [
+            3.2276374293167565,
+            3.3034143423685065,
+            3.3358297348060817
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 10000,
+          "case": "materialize",
+          "peer": "mongo",
+          "lin_ns": 377835.0833333334,
+          "peer_ns": 5511208.5,
+          "speedup": 14.586280478189225,
+          "process_speedups": [
+            14.311681772842077,
+            14.061911490926045,
+            14.777200106715716
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 10000,
+          "case": "materialize",
+          "peer": "mysql",
+          "lin_ns": 377835.0833333334,
+          "peer_ns": 10255917.0,
+          "speedup": 27.143898098398747,
+          "process_speedups": [
+            26.194885221302734,
+            27.143898098398747,
+            27.9582427836178
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 10000,
+          "case": "materialize",
+          "peer": "pandas",
+          "lin_ns": 377835.0833333334,
+          "peer_ns": 1976541.75,
+          "speedup": 5.231228748168568,
+          "process_speedups": [
+            4.845453712523403,
+            5.28148744789669,
+            5.299700230725814
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 10000,
+          "case": "materialize",
+          "peer": "postgres",
+          "lin_ns": 377835.0833333334,
+          "peer_ns": 1858645.6666666665,
+          "speedup": 4.919198212800513,
+          "process_speedups": [
+            4.81963088263513,
+            4.535846657966515,
+            5.063186831602331
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 10000,
+          "case": "materialize",
+          "peer": "sqlite",
+          "lin_ns": 377835.0833333334,
+          "peer_ns": 1846145.75,
+          "speedup": 4.886115216493263,
+          "process_speedups": [
+            4.787217504723742,
+            4.8386963801005765,
+            5.168651721997515
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 10000,
+          "case": "join_inner",
+          "peer": "duckdb",
+          "lin_ns": 1338472.1666666665,
+          "peer_ns": 2627125.0,
+          "speedup": 1.96277895456175,
+          "process_speedups": [
+            1.9500312109590627,
+            2.0231527810162033,
+            1.9230879501860716
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 10000,
+          "case": "join_inner",
+          "peer": "mongo",
+          "lin_ns": 1338472.1666666665,
+          "peer_ns": 121065312.5,
+          "speedup": 90.45037731453263,
+          "process_speedups": [
+            90.45037731453263,
+            88.48721674359328,
+            90.71113865375365
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 10000,
+          "case": "join_inner",
+          "peer": "mysql",
+          "lin_ns": 1338472.1666666665,
+          "peer_ns": 20618875.0,
+          "speedup": 15.404784285764629,
+          "process_speedups": [
+            15.240324384780509,
+            15.500161186917062,
+            15.268939142079086
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 10000,
+          "case": "join_inner",
+          "peer": "pandas",
+          "lin_ns": 1338472.1666666665,
+          "peer_ns": 3892562.5,
+          "speedup": 2.9082132575786352,
+          "process_speedups": [
+            2.920727526023764,
+            2.9262191162296123,
+            2.84275496264724
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 10000,
+          "case": "join_inner",
+          "peer": "postgres",
+          "lin_ns": 1338472.1666666665,
+          "peer_ns": 3925520.5,
+          "speedup": 2.9328368551556236,
+          "process_speedups": [
+            3.008093929982108,
+            2.9509951679006377,
+            2.8305695190300644
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 10000,
+          "case": "join_inner",
+          "peer": "sqlite",
+          "lin_ns": 1338472.1666666665,
+          "peer_ns": 4451333.5,
+          "speedup": 3.3256825288235983,
+          "process_speedups": [
+            3.3256825288235983,
+            3.3245660513665687,
+            3.367211068319567
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 10000,
+          "case": "join_filter",
+          "peer": "duckdb",
+          "lin_ns": 654351.1428571428,
+          "peer_ns": 1405604.1666666665,
+          "speedup": 2.1480885026490073,
+          "process_speedups": [
+            2.2066695202586253,
+            2.1480885026490073,
+            2.1406418575505524
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 10000,
+          "case": "join_filter",
+          "peer": "mongo",
+          "lin_ns": 654351.1428571428,
+          "peer_ns": 63193292.0,
+          "speedup": 96.57397666346903,
+          "process_speedups": [
+            97.06643715049044,
+            95.1553637212698,
+            98.22968009634373
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 10000,
+          "case": "join_filter",
+          "peer": "mysql",
+          "lin_ns": 654351.1428571428,
+          "peer_ns": 11159124.5,
+          "speedup": 17.053725086006683,
+          "process_speedups": [
+            16.947821763827033,
+            17.053725086006683,
+            17.316404401599314
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 10000,
+          "case": "join_filter",
+          "peer": "pandas",
+          "lin_ns": 654351.1428571428,
+          "peer_ns": 2242916.75,
+          "speedup": 3.4276959312802346,
+          "process_speedups": [
+            3.4451748098145814,
+            3.468273532908718,
+            3.413594190497866
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 10000,
+          "case": "join_filter",
+          "peer": "postgres",
+          "lin_ns": 654351.1428571428,
+          "peer_ns": 2270812.5,
+          "speedup": 3.470327093928162,
+          "process_speedups": [
+            3.4880233619068,
+            3.440669470170887,
+            3.5564108271325447
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 10000,
+          "case": "join_filter",
+          "peer": "sqlite",
+          "lin_ns": 654351.1428571428,
+          "peer_ns": 2343635.25,
+          "speedup": 3.581617111214643,
+          "process_speedups": [
+            3.5489359447113142,
+            3.581617111214643,
+            3.605379017580464
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 100000,
+          "case": "point_get",
+          "peer": "duckdb",
+          "lin_ns": 115.96455,
+          "peer_ns": 40325.78879310345,
+          "speedup": 347.74238155628984,
+          "process_speedups": [
+            363.2098090546677,
+            333.0980155177581,
+            342.3968481689955
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 100000,
+          "case": "point_get",
+          "peer": "mongo",
+          "lin_ns": 115.96455,
+          "peer_ns": 485000.0,
+          "speedup": 4182.312611914589,
+          "process_speedups": [
+            5071.911660197889,
+            4114.737773618872,
+            4118.021651454043
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 100000,
+          "case": "point_get",
+          "peer": "mysql",
+          "lin_ns": 115.96455,
+          "peer_ns": 346360.5769230769,
+          "speedup": 2986.7798126503044,
+          "process_speedups": [
+            2967.82981300119,
+            2986.7798126503044,
+            3182.6765507894775
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 100000,
+          "case": "point_get",
+          "peer": "pandas",
+          "lin_ns": 115.96455,
+          "peer_ns": 4440.587037037038,
+          "speedup": 38.29262509134936,
+          "process_speedups": [
+            37.67294739877544,
+            38.29262509134936,
+            38.67848025616969
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 100000,
+          "case": "point_get",
+          "peer": "postgres",
+          "lin_ns": 115.96455,
+          "peer_ns": 249565.46428571426,
+          "speedup": 2152.0841005782736,
+          "process_speedups": [
+            2125.756879037626,
+            2152.0841005782736,
+            2152.991871339918
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 100000,
+          "case": "point_get",
+          "peer": "sqlite",
+          "lin_ns": 115.96455,
+          "peer_ns": 971.9165,
+          "speedup": 8.381151826139972,
+          "process_speedups": [
+            8.273236467195556,
+            8.381151826139972,
+            8.713796060475742
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 100000,
+          "case": "filter_eq",
+          "peer": "duckdb",
+          "lin_ns": 863.8213160658033,
+          "peer_ns": 428420.85,
+          "speedup": 495.96003482665174,
+          "process_speedups": [
+            500.5190726171028,
+            505.81121235999717,
+            493.53246523021386
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 100000,
+          "case": "filter_eq",
+          "peer": "mongo",
+          "lin_ns": 863.8213160658033,
+          "peer_ns": 5168812.5,
+          "speedup": 5983.659356243827,
+          "process_speedups": [
+            6038.663242070709,
+            5901.401153577675,
+            6054.252080532833
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 100000,
+          "case": "filter_eq",
+          "peer": "mysql",
+          "lin_ns": 863.8213160658033,
+          "peer_ns": 3468604.5,
+          "speedup": 4015.4189709018156,
+          "process_speedups": [
+            4111.863739866843,
+            3923.286090765452,
+            4015.4189709018156
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 100000,
+          "case": "filter_eq",
+          "peer": "pandas",
+          "lin_ns": 863.8213160658033,
+          "peer_ns": 2264364.75,
+          "speedup": 2621.3346532276446,
+          "process_speedups": [
+            2597.433503567796,
+            2611.8592226280234,
+            2730.0929673056953
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 100000,
+          "case": "filter_eq",
+          "peer": "postgres",
+          "lin_ns": 863.8213160658033,
+          "peer_ns": 2405749.5,
+          "speedup": 2785.008259528452,
+          "process_speedups": [
+            2850.8793418028886,
+            2774.941192185471,
+            2750.0863961303717
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 100000,
+          "case": "filter_eq",
+          "peer": "sqlite",
+          "lin_ns": 863.8213160658033,
+          "peer_ns": 672901.7857142857,
+          "speedup": 778.9826127224511,
+          "process_speedups": [
+            778.4729793804421,
+            783.4996034552687,
+            778.9826127224511
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 100000,
+          "case": "text_substr",
+          "peer": "duckdb",
+          "lin_ns": 204750.0,
+          "peer_ns": 475908.3,
+          "speedup": 2.3243384615384617,
+          "process_speedups": [
+            2.3151710625690947,
+            2.3984534617338946,
+            2.303886691086691
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 100000,
+          "case": "text_substr",
+          "peer": "mongo",
+          "lin_ns": 204750.0,
+          "peer_ns": 27114834.0,
+          "speedup": 132.4289816849817,
+          "process_speedups": [
+            133.34977129631994,
+            132.3970991009566,
+            132.4289816849817
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 100000,
+          "case": "text_substr",
+          "peer": "mysql",
+          "lin_ns": 204750.0,
+          "peer_ns": 9835208.0,
+          "speedup": 48.03520390720391,
+          "process_speedups": [
+            47.84574876283532,
+            47.841245355719174,
+            48.14072283272283
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 100000,
+          "case": "text_substr",
+          "peer": "pandas",
+          "lin_ns": 204750.0,
+          "peer_ns": 4847083.5,
+          "speedup": 23.67317948717949,
+          "process_speedups": [
+            23.5798103480358,
+            21.872655038252827,
+            23.75539194139194
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 100000,
+          "case": "text_substr",
+          "peer": "postgres",
+          "lin_ns": 204750.0,
+          "peer_ns": 5174604.5,
+          "speedup": 25.272793650793652,
+          "process_speedups": [
+            25.17311549018964,
+            24.905728718943273,
+            25.953296703296704
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 100000,
+          "case": "text_substr",
+          "peer": "sqlite",
+          "lin_ns": 204750.0,
+          "peer_ns": 3489270.5,
+          "speedup": 17.041614163614163,
+          "process_speedups": [
+            17.69296424536299,
+            16.881884218660208,
+            17.041614163614163
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 100000,
+          "case": "materialize",
+          "peer": "duckdb",
+          "lin_ns": 5701562.0,
+          "peer_ns": 12589209.0,
+          "speedup": 2.2080280807259483,
+          "process_speedups": [
+            2.234793289979132,
+            2.2971550335984285,
+            1.9137930287495162
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 100000,
+          "case": "materialize",
+          "peer": "mongo",
+          "lin_ns": 5701562.0,
+          "peer_ns": 43341708.5,
+          "speedup": 7.601725369293537,
+          "process_speedups": [
+            7.601725369293537,
+            8.007879397312236,
+            6.557319232297309
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 100000,
+          "case": "materialize",
+          "peer": "mysql",
+          "lin_ns": 5701562.0,
+          "peer_ns": 84143833.5,
+          "speedup": 14.758031834083361,
+          "process_speedups": [
+            14.758031834083361,
+            15.255196289215624,
+            12.834056574151484
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 100000,
+          "case": "materialize",
+          "peer": "pandas",
+          "lin_ns": 5701562.0,
+          "peer_ns": 17892958.0,
+          "speedup": 3.138255446489927,
+          "process_speedups": [
+            3.0461790119970633,
+            3.2737510344276175,
+            2.772491730382066
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 100000,
+          "case": "materialize",
+          "peer": "postgres",
+          "lin_ns": 5701562.0,
+          "peer_ns": 17802250.0,
+          "speedup": 3.1223461219925346,
+          "process_speedups": [
+            2.6083787214801837,
+            3.2849004397152144,
+            2.7062718512383164
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 100000,
+          "case": "materialize",
+          "peer": "sqlite",
+          "lin_ns": 5701562.0,
+          "peer_ns": 20152166.5,
+          "speedup": 3.5344992302109492,
+          "process_speedups": [
+            3.488185167503221,
+            3.687102821419051,
+            3.214001043303162
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 100000,
+          "case": "join_inner",
+          "peer": "duckdb",
+          "lin_ns": 16577000.5,
+          "peer_ns": 29772125.0,
+          "speedup": 1.7959898716296714,
+          "process_speedups": [
+            1.7959898716296714,
+            1.9123291962812785,
+            1.7611761209973782
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 100000,
+          "case": "join_inner",
+          "peer": "mongo",
+          "lin_ns": 16577000.5,
+          "peer_ns": 1126935937.5,
+          "speedup": 67.98189681541,
+          "process_speedups": [
+            67.19677036868039,
+            69.49852376620774,
+            68.3598889628635
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 100000,
+          "case": "join_inner",
+          "peer": "mysql",
+          "lin_ns": 16577000.5,
+          "peer_ns": 167935187.5,
+          "speedup": 10.130613647505168,
+          "process_speedups": [
+            10.133573320456858,
+            10.345339757327208,
+            10.106798015474485
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 100000,
+          "case": "join_inner",
+          "peer": "pandas",
+          "lin_ns": 16577000.5,
+          "peer_ns": 37379125.0,
+          "speedup": 2.2548786796501576,
+          "process_speedups": [
+            2.230474898037193,
+            2.3278138480751145,
+            2.249577780536153
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 100000,
+          "case": "join_inner",
+          "peer": "postgres",
+          "lin_ns": 16577000.5,
+          "peer_ns": 47305979.0,
+          "speedup": 2.8537116229199606,
+          "process_speedups": [
+            2.4469269033321197,
+            2.9273561616379644,
+            2.8470029527151817
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 100000,
+          "case": "join_inner",
+          "peer": "sqlite",
+          "lin_ns": 16577000.5,
+          "peer_ns": 52311041.5,
+          "speedup": 3.155639737116495,
+          "process_speedups": [
+            3.1517689524109023,
+            3.227559673763895,
+            3.1482212768518414
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 100000,
+          "case": "join_filter",
+          "peer": "duckdb",
+          "lin_ns": 8219083.5,
+          "peer_ns": 14471750.0,
+          "speedup": 1.7607498451621766,
+          "process_speedups": [
+            1.7189911531051518,
+            1.8030977902946355,
+            1.7607498451621766
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 100000,
+          "case": "join_filter",
+          "peer": "mongo",
+          "lin_ns": 8219083.5,
+          "peer_ns": 573059999.5,
+          "speedup": 69.72310227776613,
+          "process_speedups": [
+            67.40695503161483,
+            72.04449991862842,
+            72.3073725920901
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 100000,
+          "case": "join_filter",
+          "peer": "mysql",
+          "lin_ns": 8219083.5,
+          "peer_ns": 90482604.5,
+          "speedup": 11.008843565100658,
+          "process_speedups": [
+            10.74113914746382,
+            11.324296550630383,
+            11.008843565100658
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 100000,
+          "case": "join_filter",
+          "peer": "pandas",
+          "lin_ns": 8219083.5,
+          "peer_ns": 19782042.0,
+          "speedup": 2.4068428067435987,
+          "process_speedups": [
+            2.287630089945533,
+            2.4966840056143567,
+            2.4068428067435987
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 100000,
+          "case": "join_filter",
+          "peer": "postgres",
+          "lin_ns": 8219083.5,
+          "peer_ns": 22125979.5,
+          "speedup": 2.692025150979425,
+          "process_speedups": [
+            2.5702843158864894,
+            2.7816548523333533,
+            3.07265597192193
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 100000,
+          "case": "join_filter",
+          "peer": "sqlite",
+          "lin_ns": 8219083.5,
+          "peer_ns": 26343521.0,
+          "speedup": 3.205165271772698,
+          "process_speedups": [
+            3.1193607609749314,
+            3.2433157592912116,
+            3.2501140181870642
+          ],
+          "positive_processes": 3
+        }
+      ],
+      "wins": 108,
+      "samples": 4536,
+      "process_comparisons": 324,
+      "positive_processes": 324,
+      "minimum_speedup": 1.7607498451621766
+    },
+    {
+      "mode": "native",
+      "comparisons": [
+        {
+          "rows": 1000,
+          "case": "insert_native",
+          "peer": "duckdb",
+          "lin_ns": 764104.0,
+          "peer_ns": 1201937.0,
+          "speedup": 1.573001842681101,
+          "process_speedups": [
+            1.5788566613312875,
+            1.6010032665710427,
+            1.4302051761771126
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 1000,
+          "case": "insert_native",
+          "peer": "mongo",
+          "lin_ns": 764104.0,
+          "peer_ns": 4940542.0,
+          "speedup": 6.465797849507397,
+          "process_speedups": [
+            6.417835710171352,
+            6.508658507218913,
+            6.162197692547553
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 1000,
+          "case": "insert_native",
+          "peer": "mysql",
+          "lin_ns": 764104.0,
+          "peer_ns": 8465375.0,
+          "speedup": 11.078825657240376,
+          "process_speedups": [
+            11.147209828832196,
+            11.078825657240376,
+            10.367971312753353
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 1000,
+          "case": "insert_native",
+          "peer": "postgres",
+          "lin_ns": 764104.0,
+          "peer_ns": 4758437.0,
+          "speedup": 6.227472961795777,
+          "process_speedups": [
+            6.161026862330801,
+            6.227472961795777,
+            6.137616463985033
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 1000,
+          "case": "insert_native",
+          "peer": "sqlite",
+          "lin_ns": 764104.0,
+          "peer_ns": 1040979.5,
+          "speedup": 1.362353161349764,
+          "process_speedups": [
+            1.341480459311112,
+            1.362353161349764,
+            1.328214530714063
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 10000,
+          "case": "insert_native",
+          "peer": "duckdb",
+          "lin_ns": 7864792.0,
+          "peer_ns": 9726000.5,
+          "speedup": 1.236650695911602,
+          "process_speedups": [
+            1.2316627064008814,
+            1.2474870004918537,
+            1.2446459973454975
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 10000,
+          "case": "insert_native",
+          "peer": "mongo",
+          "lin_ns": 7864792.0,
+          "peer_ns": 47392917.0,
+          "speedup": 6.025959364214591,
+          "process_speedups": [
+            6.04993488702562,
+            5.942675321299115,
+            6.0649189198147155
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 10000,
+          "case": "insert_native",
+          "peer": "mysql",
+          "lin_ns": 7864792.0,
+          "peer_ns": 81892937.5,
+          "speedup": 10.412600549385159,
+          "process_speedups": [
+            10.458485488236688,
+            10.289781271774611,
+            10.448082901660493
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 10000,
+          "case": "insert_native",
+          "peer": "postgres",
+          "lin_ns": 7864792.0,
+          "peer_ns": 27618625.0,
+          "speedup": 3.5116790119814993,
+          "process_speedups": [
+            3.4926464043804337,
+            3.4702578629221366,
+            3.57143325151081
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 10000,
+          "case": "insert_native",
+          "peer": "sqlite",
+          "lin_ns": 7864792.0,
+          "peer_ns": 12751229.5,
+          "speedup": 1.6213053695507778,
+          "process_speedups": [
+            1.6166299757196376,
+            1.602181659452623,
+            1.6683446010731264
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 100000,
+          "case": "insert_native",
+          "peer": "duckdb",
+          "lin_ns": 92759125.0,
+          "peer_ns": 101109708.5,
+          "speedup": 1.0900243884361782,
+          "process_speedups": [
+            1.1076739437933034,
+            1.0840548838702992,
+            1.0909036765924647
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 100000,
+          "case": "insert_native",
+          "peer": "mongo",
+          "lin_ns": 92759125.0,
+          "peer_ns": 579128520.5,
+          "speedup": 6.243359028020154,
+          "process_speedups": [
+            6.301140695221946,
+            6.265183763727289,
+            6.243359028020154
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 100000,
+          "case": "insert_native",
+          "peer": "mysql",
+          "lin_ns": 92759125.0,
+          "peer_ns": 859256792.0,
+          "speedup": 9.26331282232341,
+          "process_speedups": [
+            9.480739317269029,
+            9.190956325129765,
+            9.371018754219598
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 100000,
+          "case": "insert_native",
+          "peer": "postgres",
+          "lin_ns": 92759125.0,
+          "peer_ns": 283307271.0,
+          "speedup": 3.0542253497971226,
+          "process_speedups": [
+            3.1620061555854644,
+            3.037498923889355,
+            3.0405301526938726
+          ],
+          "positive_processes": 3
+        },
+        {
+          "rows": 100000,
+          "case": "insert_native",
+          "peer": "sqlite",
+          "lin_ns": 92759125.0,
+          "peer_ns": 144587229.0,
+          "speedup": 1.5587386038839846,
+          "process_speedups": [
+            1.584118473206666,
+            1.550202191936132,
+            1.5844409269707966
+          ],
+          "positive_processes": 3
+        }
+      ],
+      "wins": 15,
+      "samples": 648,
+      "process_comparisons": 45,
+      "positive_processes": 45,
+      "minimum_speedup": 1.0900243884361782
+    }
+  ]
+}

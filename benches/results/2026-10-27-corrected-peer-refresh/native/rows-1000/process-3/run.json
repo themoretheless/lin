@@ -1,0 +1,233 @@
+{
+  "rows": 1000,
+  "repeats": 1,
+  "samples": 12,
+  "host": "macOS-26.7.2-arm64-arm-64bit-Mach-O",
+  "engines": [
+    "duckdb",
+    "postgres",
+    "mysql",
+    "mongo",
+    "lin",
+    "sqlite"
+  ],
+  "cases": [
+    "insert_native"
+  ],
+  "observations": [
+    {
+      "case": "insert_native/duckdb",
+      "repetition": 0,
+      "iterations": 1,
+      "samples_ns": [
+        1445875,
+        1146334,
+        1104042,
+        1150500,
+        1185875,
+        1128084,
+        1126375,
+        1174208,
+        1154625,
+        1147000,
+        1142375,
+        1137125
+      ],
+      "validated_rows": 1000
+    },
+    {
+      "case": "insert_native/postgres",
+      "repetition": 0,
+      "iterations": 1,
+      "samples_ns": [
+        13649875,
+        4912959,
+        4807791,
+        5085250,
+        4485375,
+        4455667,
+        5234125,
+        5960625,
+        5363375,
+        4928709,
+        4588167,
+        4844041
+      ],
+      "validated_rows": 1000
+    },
+    {
+      "case": "insert_native/mysql",
+      "repetition": 0,
+      "iterations": 1,
+      "samples_ns": [
+        9407833,
+        8585708,
+        8088459,
+        8703416,
+        8408458,
+        8228709,
+        8133417,
+        8461333,
+        8319834,
+        8177792,
+        8059250,
+        8305208
+      ],
+      "validated_rows": 1000
+    },
+    {
+      "case": "insert_native/mongo",
+      "repetition": 0,
+      "iterations": 1,
+      "samples_ns": [
+        5094458,
+        4943584,
+        4839292,
+        5053708,
+        4825209,
+        4960333,
+        4856916,
+        4854958,
+        4963458,
+        4826167,
+        5619459,
+        4937500
+      ],
+      "validated_rows": 1000
+    },
+    {
+      "case": "insert_native/lin",
+      "repetition": 0,
+      "iterations": 1,
+      "samples_ns": [
+        1112416.0,
+        1407500.0,
+        803000.0,
+        819917.0,
+        1279667.0,
+        800500.0,
+        784125.0,
+        784583.0,
+        756584.0,
+        935334.0,
+        793833.0,
+        759958.0
+      ],
+      "validated_rows": 1000
+    },
+    {
+      "case": "insert_native/sqlite",
+      "repetition": 0,
+      "iterations": 1,
+      "samples_ns": [
+        1068917,
+        1160417,
+        1073667,
+        1027750,
+        1036750,
+        1082584,
+        1084750,
+        1060875,
+        1055708,
+        1043584,
+        1394916,
+        1045833
+      ],
+      "validated_rows": 1000
+    }
+  ],
+  "errors": [],
+  "versions": {
+    "duckdb": "1.5.6",
+    "postgres": "160015",
+    "mysql": "8.4.11",
+    "mongo": "8.0.34",
+    "lin": "0.4.0",
+    "sqlite": "3.54.1"
+  },
+  "medians_ns": {
+    "insert_native/duckdb": 1146667.0,
+    "insert_native/postgres": 4920834.0,
+    "insert_native/mysql": 8312521.0,
+    "insert_native/mongo": 4940542.0,
+    "insert_native/lin": 801750.0,
+    "insert_native/sqlite": 1064896.0
+  },
+  "python": "3.14.10 (main, Oct 25 2026, 17:12:00) [Clang 21.0.0 (clang-2100.3.34.2)]",
+  "clients": {
+    "pandas": "3.0.6",
+    "duckdb": "1.5.6",
+    "pymongo": "4.18.2",
+    "psycopg": "3.3.6",
+    "PyMySQL": "1.2.3",
+    "python-tds": "1.17.1"
+  },
+  "lin_binary_info": {
+    "path": "/tmp/lin-corrected-peer-current",
+    "size_bytes": 5651136,
+    "mtime": 1793117595.6769934,
+    "sha256": "299d695804c69012ad729241df99df9d9fb3f868c7c304d73228972eba77d33b"
+  },
+  "git_commit": "bab12daae6aa5150b2ce1746b688144cb89ab959",
+  "git_status_before": "?? benches/results/2026-10-27-corrected-peer-refresh/\n?? benches/results/2026-10-27-cow-lazy-sharing-engine-linux-incomplete/cow-lazy-sharing-engine/\n?? benches/results/2026-10-27-linux-wal-keep-size-functional-linux/\n?? benches/results/2026-10-27-linux-wal-reserve-engine/local-smoke/\n?? benches/results/2026-10-27-unsorted16-untraced-isolated/build.log\n?? benches/results/2026-10-27-unsorted16-untraced-isolated/provenance.json",
+  "native_contracts": {
+    "duckdb": {
+      "schema": "id/uri/wing/title/ts/body; unique id and uri; wing+ts index",
+      "fixture": "fresh per sample; schema/index/prepare/validation/drop excluded",
+      "durability": "native memory API comparison; no disk durability equivalence",
+      "api": "DuckDB prepared INSERT SELECT from registered pandas DataFrame plus commit",
+      "storage": ":memory:",
+      "atomicity": "one transaction per sample"
+    },
+    "postgres": {
+      "schema": "id/uri/wing/title/ts/body; unique id and uri; wing+ts index",
+      "fixture": "fresh per sample; schema/index/prepare/validation/drop excluded",
+      "durability": "native memory API comparison; no disk durability equivalence",
+      "api": "Psycopg COPY CSV block plus transaction commit",
+      "storage": "configured dedicated server",
+      "atomicity": "one transaction per sample",
+      "synchronous_commit": "on"
+    },
+    "mysql": {
+      "schema": "id/uri/wing/title/ts/body; unique id and uri; wing+ts index",
+      "fixture": "fresh per sample; schema/index/prepare/validation/drop excluded",
+      "durability": "native memory API comparison; no disk durability equivalence",
+      "api": "PyMySQL executemany multi-row INSERT plus transaction commit",
+      "storage": "configured dedicated server",
+      "atomicity": "one transaction per sample",
+      "innodb_flush_log_at_trx_commit": 1,
+      "sync_binlog": 1
+    },
+    "mongo": {
+      "schema": "id/uri/wing/title/ts/body; unique id and uri; wing+ts index",
+      "fixture": "fresh per sample; schema/index/prepare/validation/drop excluded",
+      "durability": "native memory API comparison; no disk durability equivalence",
+      "api": "PyMongo ordered insert_many; id maps to native _id",
+      "write_concern": {
+        "j": false,
+        "w": 1
+      }
+    },
+    "lin": {
+      "schema": "id/uri/wing/title/ts/body; unique id and uri; wing+ts index",
+      "fixture": "fresh per sample; schema/index/prepare/validation/drop excluded",
+      "durability": "native memory API comparison; no disk durability equivalence",
+      "api": "Rust prepared run; default embedding and FTS",
+      "storage": "Db::empty",
+      "statement_rows_limit": 10000,
+      "statements": 1,
+      "execution_path": "prepared run"
+    },
+    "sqlite": {
+      "schema": "id/uri/wing/title/ts/body; unique id and uri; wing+ts index",
+      "fixture": "fresh per sample; schema/index/prepare/validation/drop excluded",
+      "durability": "native memory API comparison; no disk durability equivalence",
+      "api": "Python sqlite3 executemany plus transaction commit",
+      "storage": ":memory:",
+      "atomicity": "one transaction per sample"
+    }
+  },
+  "status": "complete",
+  "git_status_after": "?? benches/results/2026-10-27-corrected-peer-refresh/\n?? benches/results/2026-10-27-cow-lazy-sharing-engine-linux-incomplete/cow-lazy-sharing-engine/\n?? benches/results/2026-10-27-linux-wal-keep-size-functional-linux/\n?? benches/results/2026-10-27-linux-wal-reserve-engine/local-smoke/\n?? benches/results/2026-10-27-unsorted16-untraced-isolated/build.log\n?? benches/results/2026-10-27-unsorted16-untraced-isolated/provenance.json",
+  "source_drift": false
+}
