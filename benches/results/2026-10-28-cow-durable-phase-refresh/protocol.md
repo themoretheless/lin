@@ -1,0 +1,7 @@
+# Current lazy COW durable caller-thread phase refresh
+
+Source core: restored lazy COW at9a38e37d3, with committed transaction/schema corrections and the public next-version Row type. No new performance candidate. Regenerates exact-count hooks from current source; old production profile does not qualify this core. Diagnostic scope: exec, quota, encode, CRC, write, sync, checkpoint, rollback plus encoded payload bytes. Profile module and four instrumented files installed only during test/build, restored finally. Benchmark is the frozen67-case COW compare.rs, adding only configure/start/finish/flush, including scalar Full/Normal.
+
+Plan: ten Lin cases (Full UPDATE/DELETE/commit/rollback at1k/10k and scalar Full/Normal), six rotated rounds/four roles (original, same-binary control, instrumentation-disabled, traced)=240 fresh processes, eight single-operation observations each. Observer overhead kept separate from A/A and production timing. All caller-thread trace frames retained, including validation/calibration; do not pair them arbitrarily to measured wall observations. Checkpoint is an inclusive phase; no nested double counting. No durability weakening or peer-superiority claim. This is a new source-scoped diagnostic, not a rerun of either rejected optimization.
+
+Prerequisites: full release library/integration suite on instrumented current source, two separate release binaries with exact source hashes, fresh full-value/reopen smokes and trace call-count checks. Actual measurement remains pending.
