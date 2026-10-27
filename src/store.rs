@@ -2428,16 +2428,28 @@ impl Store {
     /// Reverse in-place row mutations from a `Rows` undo journal. Positions never
     /// shift during an update, so each entry restores one row plus its own index /
     /// FTS / map slots — no whole-store clone, no per-collection rebuild.
-    pub(crate) fn restore_row_owned(&mut self, collection: &str, idx: usize, row: Row) {
+    pub(crate) fn restore_row_delta_owned(
+        &mut self,
+        collection: &str,
+        idx: usize,
+        apply: impl FnOnce(&mut Row),
+    ) {
         let Some(slot) = self.collections.get_mut(collection).and_then(|rows| rows.get_mut(idx)) else { return; };
-        // Retain one read-only view for map/index maintenance; move both stored rows.
-        let restored = row.clone();
-        let current = std::mem::replace(slot, row);
-        self.index_remove_row(collection, idx, &current);
-        self.fts_remove_row(collection, idx, &current);
-        let _ = self.index_insert_row(collection, idx, &restored);
-        self.fts_insert_row(collection, idx, &restored);
-        self.row_maps_sync_updated(collection, idx, &current, &restored);
+        let mut restored = std::mem::take(slot);
+        // Only identity fields are needed from the old row by row_maps_sync_updated.
+        // Avoid sharing the entire map before mutation: unique COW storage can mutate
+        // in place, while outstanding Handles still force Arc::make_mut to detach.
+        let identity_before: Row = ["id", "uri"].into_iter()
+            .filter_map(|key| restored.get(key).map(|cell| (key.to_owned(), cell.clone())))
+            .collect();
+        self.index_remove_row(collection, idx, &restored);
+        self.fts_remove_row(collection, idx, &restored);
+        apply(&mut restored);
+        let after = restored.clone();
+        self.collections.get_mut(collection).unwrap()[idx] = restored;
+        let _ = self.index_insert_row(collection, idx, &after);
+        self.fts_insert_row(collection, idx, &after);
+        self.row_maps_sync_updated(collection, idx, &identity_before, &after);
     }
 
     pub fn restore_rows(&mut self, journal: &[(String, usize, Row)]) {

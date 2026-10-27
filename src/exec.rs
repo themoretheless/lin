@@ -2016,10 +2016,7 @@ impl Db {
                 for event in events.into_iter().rev() {
                     match event {
                         RowUndo::Update(collection, idx, row) => {
-                            if let Some(mut restored) = self.store.collection(&collection).get(idx).cloned() {
-                                row.apply(&mut restored);
-                                self.store.restore_row_owned(&collection, idx, restored);
-                            }
+                            self.store.restore_row_delta_owned(&collection, idx, |restored| row.apply(restored));
                         }
                         RowUndo::Delete(collection, positions, rows) => {
                             self.store.restore_rows_at(&collection, &positions, &rows)
@@ -2031,10 +2028,7 @@ impl Db {
                 for event in events.into_iter().rev() {
                     match event {
                         RowUndo::Update(collection, idx, row) => {
-                            if let Some(mut restored) = self.store.collection(&collection).get(idx).cloned() {
-                                row.apply(&mut restored);
-                                self.store.restore_row_owned(&collection, idx, restored);
-                            }
+                            self.store.restore_row_delta_owned(&collection, idx, |restored| row.apply(restored));
                         }
                         RowUndo::Delete(collection, positions, rows) => {
                             self.store.restore_rows_at(&collection, &positions, &rows)
