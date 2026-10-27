@@ -1,0 +1,62 @@
+name: linux-wal-reserve-engine
+on:
+  push:
+    branches: [codex/linux-wal-reserve-engine-ci]
+permissions:
+  contents: read
+jobs:
+  benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Verify and stage frozen sources and protocol
+        run: |
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          import json,hashlib,shutil
+          src=Path('benches/results/2026-10-27-linux-wal-reserve-engine');dst=Path('benches/results/ci-linux-wal-reserve-engine')
+          m=json.loads((src/'input-provenance.json').read_text())
+          for section in ['source_sha256','build_inputs_sha256']:
+              for name,digest in m[section].items():assert hashlib.sha256(Path(name).read_bytes()).hexdigest()==digest,name
+          dst.mkdir()
+          for name,digest in m['files_sha256'].items():
+              assert hashlib.sha256((src/name).read_bytes()).hexdigest()==digest,name
+              shutil.copy2(src/name,dst/name)
+          shutil.copy2(src/'input-provenance.json',dst/'input-provenance.json')
+          PYCODE
+      - name: Validate analysis and unchanged gate against synthetic raw records
+        run: python3 benches/results/ci-linux-wal-reserve-engine/test-protocol.py
+      - name: Full candidate release tests including actual Linux filesystem and subprocess recovery
+        run: python3 benches/results/ci-linux-wal-reserve-engine/test.py
+      - name: Reject missing KEEP_SIZE and verify functional evidence
+        run: |
+          python3 benches/results/ci-linux-wal-reserve-engine/check-mutant.py
+          python3 benches/results/ci-linux-wal-reserve-engine/verify-functional.py
+      - name: Build separate uninstrumented baseline and candidate binaries and restore source
+        run: python3 benches/results/ci-linux-wal-reserve-engine/build.py
+      - name: Run all 122 correctness smoke checks
+        run: python3 benches/results/ci-linux-wal-reserve-engine/smoke.py
+      - name: Run 2196 paired isolated processes with resources
+        run: python3 benches/results/ci-linux-wal-reserve-engine/run.py
+      - name: Summarize complete raw data
+        id: summarize
+        run: python3 benches/results/ci-linux-wal-reserve-engine/summarize.py
+      - name: Independently audit raw data and frozen thresholds
+        if: always() && steps.summarize.outcome == 'success'
+        run: python3 benches/results/ci-linux-wal-reserve-engine/verify.py
+      - name: Enforce full source gate
+        if: always() && steps.summarize.outcome == 'success'
+        run: python3 benches/results/ci-linux-wal-reserve-engine/qualify.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: linux-wal-reserve-engine
+          path: benches/results/ci-linux-wal-reserve-engine/
+          if-no-files-found: error
