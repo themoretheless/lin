@@ -899,9 +899,10 @@ impl<'a> Transaction<'a> {
         }
         let undo = std::mem::replace(&mut self.undo, Undo::None);
         let cat = self.cat_backup.take();
+        // Uncommitted packs are discarded before undo so they do not force Row detachment.
+        self.packs.clear();
         self.db.rollback(undo, cat);
         self.db.store.r#gen = self.base_generation;
-        self.packs.clear();
         self.committed = true;
         Ok(())
     }
@@ -917,9 +918,10 @@ impl Drop for Transaction<'_> {
         if !self.committed {
             let undo = std::mem::replace(&mut self.undo, Undo::None);
             let cat = self.cat_backup.take();
+            // Uncommitted packs are discarded before undo so they do not force Row detachment.
+            self.packs.clear();
             self.db.rollback(undo, cat);
             self.db.store.r#gen = self.base_generation;
-            self.packs.clear();
         }
     }
 }
@@ -2016,10 +2018,7 @@ impl Db {
                 for event in events.into_iter().rev() {
                     match event {
                         RowUndo::Update(collection, idx, row) => {
-                            if let Some(mut restored) = self.store.collection(&collection).get(idx).cloned() {
-                                row.apply(&mut restored);
-                                self.store.restore_row_owned(&collection, idx, restored);
-                            }
+                            self.store.restore_row_delta_owned(&collection, idx, |restored| row.apply(restored));
                         }
                         RowUndo::Delete(collection, positions, rows) => {
                             self.store.restore_rows_at(&collection, &positions, &rows)
@@ -2031,10 +2030,7 @@ impl Db {
                 for event in events.into_iter().rev() {
                     match event {
                         RowUndo::Update(collection, idx, row) => {
-                            if let Some(mut restored) = self.store.collection(&collection).get(idx).cloned() {
-                                row.apply(&mut restored);
-                                self.store.restore_row_owned(&collection, idx, restored);
-                            }
+                            self.store.restore_row_delta_owned(&collection, idx, |restored| row.apply(restored));
                         }
                         RowUndo::Delete(collection, positions, rows) => {
                             self.store.restore_rows_at(&collection, &positions, &rows)
