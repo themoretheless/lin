@@ -15,6 +15,8 @@ subprocess.run([sys.executable, str(p / 'verify.py')], check=True)
 summary = json.loads((p / 'summary.json').read_text())
 q = json.loads((p / 'qualification.json').read_text())
 provenance = json.loads((p / 'provenance.json').read_text())
+layout_path = p / 'layout-policy.json'
+layout_note = (json.loads(layout_path.read_text())['description'] if layout_path.exists() else 'BitSet/posting type sizes grow 32 to 40 bytes in the inline-cache component model; lifecycle RSS must be assessed separately.')
 lines = [
     '# Exact-cardinality full-engine qualification', '',
     f"Source gate: **{'PASS' if q['source_candidate_qualified'] else 'FAIL'}**. "
@@ -81,6 +83,6 @@ for case, series in summary.items():
                      f"{rss['candidate']:.0f} | {delta:+.3f} | {maximum} |")
 lines += ['', 'PostgreSQL, MySQL, MSSQL, MongoDB, Kusto and pandas '
           'are outside this run. RSS records cover the full process lifecycle and do not establish '
-          'a bound on retained index memory. BitSet/posting type sizes grow 32 to 40 bytes in the component model; lifecycle RSS must be assessed separately. No production source is accepted by this report alone.', '']
+          'a bound on retained index memory. ' + layout_note + ' No production source is accepted by this report alone.', '']
 (p / 'report.md').write_text('\n'.join(lines))
 print(p / 'report.md')
