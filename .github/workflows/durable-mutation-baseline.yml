@@ -1,4 +1,4 @@
-name: durable-mutation-baseline
+name: durable-mutation-phase-engine
 on:
   push:
     branches: [codex/durable-mutation-coverage-ci]
@@ -21,7 +21,7 @@ jobs:
           python3 - <<'PYCODE'
           from pathlib import Path
           import json,hashlib,shutil
-          src=Path('benches/results/2026-10-27-durable-mutation-baseline');dst=Path('benches/results/ci-durable-mutation-baseline')
+          src=Path('benches/results/2026-10-27-durable-mutation-phase-engine');dst=Path('benches/results/ci-durable-mutation-phase-engine')
           m=json.loads((src/'input-provenance.json').read_text())
           for f,h in m['source_sha256'].items():assert hashlib.sha256(Path(f).read_bytes()).hexdigest()==h,f
           for f,h in m['build_inputs_sha256'].items():assert hashlib.sha256(Path(f).read_bytes()).hexdigest()==h,f
@@ -33,22 +33,26 @@ jobs:
           shutil.copy2(src/'input-provenance.json',dst/'input-provenance.json')
           PYCODE
       - name: Synthetic analysis sensitivity checks
-        run: python3 benches/results/ci-durable-mutation-baseline/test-protocol.py
-      - name: Build production-source benchmark and restore source
-        run: python3 benches/results/ci-durable-mutation-baseline/build.py
-      - name: Validate all 24 durable cases after reopen
-        run: python3 benches/results/ci-durable-mutation-baseline/smoke.py
+        run: python3 benches/results/ci-durable-mutation-phase-engine/test-protocol.py
+      - name: Functional release tests and restore source
+        run: python3 benches/results/ci-durable-mutation-phase-engine/test.py
+      - name: Build original and instrumented binaries and restore source
+        run: python3 benches/results/ci-durable-mutation-phase-engine/build.py
+      - name: Validate 72 durable smoke cases after reopen
+        run: python3 benches/results/ci-durable-mutation-phase-engine/smoke.py
+      - name: Independent local smoke and phase audit
+        run: python3 benches/results/ci-durable-mutation-phase-engine/verify-local.py
       - name: Run 576 isolated processes
-        run: python3 benches/results/ci-durable-mutation-baseline/run.py
-      - name: Analyze complete baseline
+        run: python3 benches/results/ci-durable-mutation-phase-engine/run.py
+      - name: Analyze complete caller-thread diagnostic
         id: analyze
-        run: python3 benches/results/ci-durable-mutation-baseline/analyze.py
+        run: python3 benches/results/ci-durable-mutation-phase-engine/analyze.py
       - name: Independent raw audit
         if: always() && steps.analyze.outcome == 'success'
-        run: python3 benches/results/ci-durable-mutation-baseline/verify.py
+        run: python3 benches/results/ci-durable-mutation-phase-engine/verify.py
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: durable-mutation-baseline
-          path: benches/results/ci-durable-mutation-baseline/
+          name: durable-mutation-phase-engine
+          path: benches/results/ci-durable-mutation-phase-engine/
           if-no-files-found: error
