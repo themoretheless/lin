@@ -814,8 +814,26 @@ impl Store {
         let phase = Instant::now();
         let mut log = persist::open_log(dir)?;
         let min_gen = store.r#gen;
+        // HEAD is refreshed on open/checkpoint, not every schema commit. Check
+        // its catalog at its own generation rather than against a later WAL
+        // schema. A newer self-consistent snapshot also supersedes stale HEAD.
+        let replay_head = persist::read_head(dir)?;
+        let snapshot_live_hash = catalog_hash(&fts_cat);
+        let mut expected_head_hash = replay_head
+            .as_ref()
+            .filter(|head| head.r#gen == min_gen)
+            .map(|_| snapshot_live_hash.clone());
+        let snapshot_supersedes_head = replay_head
+            .as_ref()
+            .is_some_and(|head| head.r#gen < min_gen)
+            && snap_catalog_hash.as_ref() == Some(&snapshot_live_hash);
         let end = persist::replay_log(&mut log, min_gen, start, |rec| {
             store.apply_record(&rec);
+            if replay_head.as_ref().is_some_and(|head| head.r#gen == rec.r#gen) {
+                let mut at_head = cat.clone();
+                store.merge_extras_into(&mut at_head);
+                expected_head_hash = Some(catalog_hash(&at_head));
+            }
             Ok(())
         })?;
         persist::truncate_log(&mut log, end)?;
@@ -826,12 +844,14 @@ impl Store {
         store.merge_extras_into(&mut live);
         let live_hash = catalog_hash(&live);
 
-        if let Some(head) = persist::read_head(dir)?
-            && head.catalog_hash != live_hash
+        if let Some(head) = replay_head
+            && !snapshot_supersedes_head
+            && head.catalog_hash != expected_head_hash.as_deref().unwrap_or(&live_hash)
         {
             return Err(Error::runtime(format!(
                 "catalog_hash mismatch: store={} catalog={}",
-                head.catalog_hash, live_hash
+                head.catalog_hash,
+                expected_head_hash.as_deref().unwrap_or(&live_hash)
             )));
         }
         if let Some(snap_hash) = snap_catalog_hash

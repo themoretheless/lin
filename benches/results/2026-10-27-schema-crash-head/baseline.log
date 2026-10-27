@@ -1,0 +1,49 @@
+   Compiling lin v0.4.0 (/Users/themoretheless/.codex/worktrees/lin-wal-persistent-qualification/lin)
+    Finished `release` profile [optimized] target(s) in 11.53s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running tests/schema_crash_head_probe.rs (target/release/build/lin/d505de6a92a42e4c/out/schema_crash_head_probe-d505de6a92a42e4c)
+
+running 5 tests
+test schema_crash_writer_child ... ok
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+SCHEMA_HEAD_PROBE {"prior_checkpoint":false,"reopen_error":"runtime error: catalog_hash mismatch: store=h:604f14baecd449f9 catalog=h:2abf1507b2b55633","transaction":false}
+
+thread 'autocommit_schema_crash_without_snapshot' (80477454) panicked at tests/schema_crash_head_probe.rs:38:19:
+committed schema and rows must reopen after process exit: Error { message: "catalog_hash mismatch: store=h:604f14baecd449f9 catalog=h:2abf1507b2b55633", pos: None, phase: Runtime }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+SCHEMA_HEAD_PROBE {"prior_checkpoint":false,"reopen_error":"runtime error: catalog_hash mismatch: store=h:604f14baecd449f9 catalog=h:2abf1507b2b55633","transaction":true}
+
+thread 'transaction_schema_crash_without_snapshot' (80477457) panicked at tests/schema_crash_head_probe.rs:38:19:
+committed schema and rows must reopen after process exit: Error { message: "catalog_hash mismatch: store=h:604f14baecd449f9 catalog=h:2abf1507b2b55633", pos: None, phase: Runtime }
+test autocommit_schema_crash_without_snapshot ... FAILED
+test transaction_schema_crash_without_snapshot ... FAILED
+SCHEMA_HEAD_PROBE {"prior_checkpoint":true,"reopen_error":"runtime error: catalog_hash mismatch: store=h:604f14baecd449f9 catalog=h:2abf1507b2b55633","transaction":false}
+
+thread 'autocommit_schema_crash_after_checkpoint' (80477453) panicked at tests/schema_crash_head_probe.rs:38:19:
+committed schema and rows must reopen after process exit: Error { message: "catalog_hash mismatch: store=h:604f14baecd449f9 catalog=h:2abf1507b2b55633", pos: None, phase: Runtime }
+SCHEMA_HEAD_PROBE {"prior_checkpoint":true,"reopen_error":"runtime error: catalog_hash mismatch: store=h:604f14baecd449f9 catalog=h:2abf1507b2b55633","transaction":true}
+
+thread 'transaction_schema_crash_after_checkpoint' (80477456) panicked at tests/schema_crash_head_probe.rs:38:19:
+committed schema and rows must reopen after process exit: Error { message: "catalog_hash mismatch: store=h:604f14baecd449f9 catalog=h:2abf1507b2b55633", pos: None, phase: Runtime }
+test autocommit_schema_crash_after_checkpoint ... FAILED
+test transaction_schema_crash_after_checkpoint ... FAILED
+
+failures:
+
+failures:
+    autocommit_schema_crash_after_checkpoint
+    autocommit_schema_crash_without_snapshot
+    transaction_schema_crash_after_checkpoint
+    transaction_schema_crash_without_snapshot
+
+test result: FAILED. 1 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+error: test failed, to rerun pass `--test schema_crash_head_probe`
