@@ -10,8 +10,12 @@ Migration: replace implicit BTreeMap-to-Row assignments with map.into(); use Row
 
 Acceptance still requires full correctness/API/lifetime tests, error/rollback/alias isolation, memory lifecycle/quota checks and fresh paired native/durable/read matrices with unchanged-peer controls. Previous eager COW had failed controls; the previous lazy Linux run was incomplete. No old timing result qualifies this port.
 
-Local qualification of this port:443 default debug library/integration tests passed,2ignored. This includes the retained prototype model/isolation/ownership oracles and current transaction/crash regressions. These results establish bounded correctness coverage; no fresh performance result is claimed.
+Local qualification of this port:443 default debug library/integration tests passed,2ignored. This includes the retained prototype model/isolation/ownership oracles and current transaction/crash regressions. These results establish bounded correctness coverage; performance evidence is recorded separately below.
 
-`cargo check --all-targets` passed on this port in the dev profile. Release performance qualification remains pending.
+`cargo check --all-targets` passed on this port in the dev profile. Full-engine release performance qualification remains pending.
 
 Fresh-row lifecycle measurement on the exact COW core: [18-process allocator diagnostic](../benches/results/2026-10-28-cow-vnext-lifecycle/report.md). Fresh full-row materialization retains the same allocation count as BTreeMap and adds8bytes per output Row;100k output holds800000additional requested bytes. The extra live-byte delta disappears after result/Db Drop in these fixtures. These are allocator layout requests, not RSS or latency.
+
+Fresh paired warm performance: [raw-backed report](../benches/results/2026-10-28-cow-vnext-warm/report.md). On release macOS ARM64, all six UPDATE windows passed with median gains of 57.624–61.046% against corrected BTreeMap. The overall diagnostic failed: rollback at 10k rows in series 1 had only five positive pairs out of six. The losing pair and all samples are retained; its cause is unproven. These observations do not prove peer superiority or full-engine acceptance.
+
+The separate [Linux full-engine run](https://github.com/themoretheless/lin/actions/runs/40588890401) uses frozen source `00c8aa9a3e08a994ae58c8f4ef7b34649663d092`, 67 cases and 2412 isolated processes. Its terminal result and independent raw-data audit must be recorded before claiming qualification.
