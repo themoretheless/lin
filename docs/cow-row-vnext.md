@@ -13,3 +13,5 @@ Acceptance still requires full correctness/API/lifetime tests, error/rollback/al
 Local qualification of this port:443 default debug library/integration tests passed,2ignored. This includes the retained prototype model/isolation/ownership oracles and current transaction/crash regressions. These results establish bounded correctness coverage; no fresh performance result is claimed.
 
 `cargo check --all-targets` passed on this port in the dev profile. Release performance qualification remains pending.
+
+Fresh-row lifecycle measurement on the exact COW core: [18-process allocator diagnostic](../benches/results/2026-10-28-cow-vnext-lifecycle/report.md). Fresh full-row materialization retains the same allocation count as BTreeMap and adds8bytes per output Row;100k output holds800000additional requested bytes. The extra live-byte delta disappears after result/Db Drop in these fixtures. These are allocator layout requests, not RSS or latency.

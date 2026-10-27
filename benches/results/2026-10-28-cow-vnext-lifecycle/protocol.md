@@ -1,0 +1,5 @@
+# Fresh lazy COW lifecycle allocator diagnostic
+
+Exact COW core from00c8aa9a3 vs corrected BTreeMap6812cc5ca. System-delegating counting allocator, release binaries, continuous counters through fixture creation, full result retention, result Drop and Db Drop. alloc/zeroed calls and requested bytes separated from realloc calls/new sizes and dealloc calls/bytes; live requested bytes are not physical allocator/RSS memory. No timing measurement.
+
+3fresh processes per role/size,18total. Indexed docs with body/hash/embedding at1k/10k/100k. Explicit takeN, same declared1GiB output quota in both binaries; this does not establish default-quota success. Full9-cell result equality against Store plus independently supplied id/uri/body and exact row order/count checked. Fresh rows have not been UPDATE-promoted: do not transfer eager-COW materialization savings to this candidate. Global/cache retention after Db Drop remains reported and is not automatically a leak. Full engine/peer qualification stays separate.
