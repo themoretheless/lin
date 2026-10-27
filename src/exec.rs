@@ -5987,11 +5987,7 @@ impl Db {
                 if let Some(slot) = live.get_mut(key.as_str()) { *slot=value.clone(); }
                 else { live.insert(key.clone(),value.clone()); }
             }
-            // Two-cell scalar rows have cheap map clones; avoid allocating an Arc
-            // solely to share that small map across the result and WAL pack.
-            if live.len() > 2 {
-                live.ensure_shared();
-            }
+            live.ensure_shared();
             let updated = live.clone();
             self.store.index_insert_row(collection, i, &updated)?;
             if let Some(before) = fts_before {
