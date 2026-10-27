@@ -207,3 +207,57 @@ fn checkpoint_failure_after_wal_publication_keeps_transaction_committed() {
         follower.store.collection("docs")
     );
 }
+
+#[test]
+fn crash_writer_child() {
+    let Some(path) = std::env::var_os("LIN_TX_CRASH_FIXTURE") else {
+        return;
+    };
+    let mut db = Db::open(path).unwrap();
+    db.run(r#"insert docs [{id:"a",uri:"u:a",body:"a",wing:"rag"},{id:"b",uri:"u:b",body:"b",wing:"rag"}]"#).unwrap();
+    let a = update(&db, "a");
+    let b = update(&db, "b");
+    let mut tx = db.transaction().unwrap();
+    tx.run(&a).unwrap();
+    tx.run(&b).unwrap();
+    if std::env::var_os("LIN_TX_CRASH_COMMIT").is_some() {
+        tx.commit().unwrap();
+    }
+    // Skip Transaction/Db Drop, checkpoint and all Rust destructors.
+    std::process::exit(0);
+}
+
+#[test]
+fn abrupt_process_exit_recovers_all_or_none_of_interactive_transaction() {
+    for committed in [false, true] {
+        let root = Scratch::new();
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", "crash_writer_child", "--nocapture"])
+            .env("LIN_TX_CRASH_FIXTURE", &root.0)
+            .env_remove("LIN_TX_CRASH_COMMIT");
+        if committed {
+            command.env("LIN_TX_CRASH_COMMIT", "1");
+        }
+        assert!(command.status().unwrap().success());
+        let recovered = Db::open(&root.0).unwrap();
+        assert_eq!(recovered.store.r#gen, if committed { 2 } else { 1 });
+        for id in ["a", "b"] {
+            assert_eq!(
+                recovered.store.get_by_id("docs", id).unwrap()["wing"].text(),
+                Some(if committed { "sys" } else { "rag" })
+            );
+        }
+        let frames = recovered.export_wal_since(0).unwrap();
+        assert_eq!(
+            gens(&recovered.export_wal_since(1).unwrap()),
+            if committed { vec![2] } else { vec![] }
+        );
+        let mut follower = Db::empty();
+        follower.apply_wal(&frames).unwrap();
+        assert_eq!(
+            follower.store.collection("docs"),
+            recovered.store.collection("docs")
+        );
+    }
+}

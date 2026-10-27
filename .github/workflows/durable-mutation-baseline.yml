@@ -1,11 +1,11 @@
-name: linux-wal-keep-size-functional
+name: transaction-wal-generation-functional
 on:
   push:
     branches: [codex/durable-mutation-coverage-ci]
 permissions:
   contents: read
 jobs:
-  profile:
+  transaction-wal:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -16,30 +16,21 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-      - name: Verify and stage exact functional prototype
+      - name: Verify fixed sources and run full release suite including subprocess crash recovery
         run: |
+          mkdir -p benches/results/ci-tx-wal-generation
           python3 - <<'PYCODE'
           from pathlib import Path
-          import json,hashlib,shutil
-          src=Path('benches/results/2026-10-27-linux-wal-keep-size');dst=Path('benches/results/ci-linux-wal-keep-size')
-          m=json.loads((src/'input-provenance.json').read_text())
-          for f,h in m['source_sha256'].items():assert hashlib.sha256(Path(f).read_bytes()).hexdigest()==h,f
-          for f,h in m['build_inputs_sha256'].items():assert hashlib.sha256(Path(f).read_bytes()).hexdigest()==h,f
-          dst.mkdir()
-          for n,h in m['files_sha256'].items():
-              assert hashlib.sha256((src/n).read_bytes()).hexdigest()==h,n
-              shutil.copy2(src/n,dst/n)
-          shutil.copy2(src/'input-provenance.json',dst/'input-provenance.json')
+          import json,hashlib
+          manifest=json.loads(Path('benches/results/2026-10-27-tx-wal-generation/candidate-source.json').read_text())
+          for name,digest in manifest.items():
+              assert hashlib.sha256(Path(name).read_bytes()).hexdigest()==digest,name
           PYCODE
-      - name: Full release default suite including actual Linux reserve and replay oracles
-        run: python3 benches/results/ci-linux-wal-keep-size/test.py
-      - name: Reject missing KEEP_SIZE at runtime and restore source
-        run: python3 benches/results/ci-linux-wal-keep-size/check-mutant.py
-      - name: Independently verify actual kernel events and restored sources
-        run: python3 benches/results/ci-linux-wal-keep-size/verify.py
+          set -o pipefail
+          cargo test --release --lib --tests -- --nocapture 2>&1 | tee benches/results/ci-tx-wal-generation/tests.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: linux-wal-keep-size-functional
-          path: benches/results/ci-linux-wal-keep-size/
+          name: transaction-wal-generation-linux
+          path: benches/results/ci-tx-wal-generation/
           if-no-files-found: error

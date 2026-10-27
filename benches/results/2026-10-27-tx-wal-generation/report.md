@@ -23,4 +23,10 @@ GPU SearchCache uses vector Arc identity rather than the generation; this change
 - Rollback, uncommitted Drop, empty commit and in-memory multi-write commit have explicit generation assertions.
 - Real filesystem failure at owned FENCE path forces checkpoint failure after the 32nd WAL write. Commit returns an error, memory retains the mutation, exported WAL applies to follower, and normal reopen matches.
 
-This repairs correctness before durable mutation timing. It does not establish latency improvement or superiority over any peer. Linux full integration and abrupt-process recovery remain further qualification; no prototype performance result is promoted.
+This repairs correctness before durable mutation timing. It does not establish latency improvement or superiority over any peer. Linux full integration remains further qualification; no prototype performance result is promoted.
+
+## Subprocess recovery follow-up
+
+Eight regression tests pass locally (crash-regressions.log). An actual child process exits with process::exit without destructors before or after a two-operation commit. Reopen must recover respectively generation 1 with both original values, or generation 2 with both changed values; the recovered full WAL also reconstructs identical rows on a fresh follower.
+
+The initial crash oracle incorrectly assumed codec 1 for the seed insertion, which uses supported codec 2. crash-oracle-codec-failure.log retains that test failure. Generation frame inspection now targets only the newly committed transaction; full initial and transaction bytes are still exported and applied to a fresh follower. This is process-exit recovery, not a power-loss/filesystem durability proof.
