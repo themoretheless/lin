@@ -1,7 +1,30 @@
-# Reusable-text hashing batch integration: correctness-qualified, performance pending
+# Integrated reusable-text embedding: full-engine gate failed
 
-Prototype based on production-main source. Adds Embedder::embed_rows with default implementation preserving existing batch overrides and wrong-length fallback. Hashing override reuses joined text and borrows scratch once for eligible batch. No eligible rows return before scratch access/resize. Public Row alias, hashing identity, exact vector bits, catalog checks, existing vectors, FTS/indexes, payload and Full durability preserved. This adds a default public trait method; broader downstream method-name collision/all-features/GPU/API qualification remains open.
+Candidate and correctness scope described in correctness-before-timing-report.md. Final source snapshots preserve exact Row alias, existing vectors, custom batch overrides/fallback and default embeddings/indexes/FTS/Full mode. Default tests410passed,2existingignored. Both source-restored release binaries built before timing.
 
-Final default cargo test --lib --tests:410passed,2existingignored. Includes actual Unicode/vertical tab and125field combinations plus long normalization fallback at8/9/128/768/1536dimensions, exact vector bits, existing vector preservation, custom backend batch-override count/results, wrong-length fallback, and no scratch resize on all-ineligible rows. Initial tests without the resource guard are retained separately. Full library/integration suite includes the experimental mutation_contract target; this is not all-features qualification.
+Two series x6 rounds x3 roles =36 fresh processes;8 existing native/Full durable insertion cases,8 samples each =2304 observations. Cases share each role process; every callback has a fresh fixture and existing full readback/drop policy. Rotate A/A/B roles. All raw data, CPU load telemetry, hashes and errors retained. Local macOS host activity uncontrolled; these are same-run API comparisons, not isolated engine CPU evidence.
 
-Both existing compare benchmark binaries built and all production sources restored. Source and binary hashes retained in provenance.json; candidate snapshots retained. Planned two-six-round A/A/B comparison uses all8 real native/Full-durable insertion cases at1k/10k against SQLite, fresh fixtures per callback, existing readback and drop policy. Cases share a process within each role; allocator/cache carryover is not isolated across cases. No timing result, regression acceptance, peer win, or production rollout is claimed yet. Component qualification is separate ../2026-10-27-embedding-reused-batch-calibrated/.
+| Case | Series | Gain % | Absolute A/A % | Positive | Pass | SQLite wins |
+|---|---|---:|---:|---:|---|---:|
+| compare/durable_insert_10k/lin | series1 | 1.870 | 1.552 | 5/6 | False | 6 |
+| compare/durable_insert_10k/lin | series2 | 0.785 | 1.274 | 5/6 | False | 6 |
+| compare/durable_insert_10k/sqlite | series1 | -0.502 | 1.424 | 1/6 | True |  |
+| compare/durable_insert_10k/sqlite | series2 | -0.827 | 0.895 | 1/6 | True |  |
+| compare/durable_insert_1k/lin | series1 | 3.548 | 6.331 | 3/6 | False | 0 |
+| compare/durable_insert_1k/lin | series2 | -0.968 | 8.378 | 3/6 | False | 0 |
+| compare/durable_insert_1k/sqlite | series1 | 3.751 | 3.467 | 5/6 | True |  |
+| compare/durable_insert_1k/sqlite | series2 | -7.290 | 7.220 | 1/6 | False |  |
+| compare/insert_bulk_10k/lin | series1 | 2.634 | 2.648 | 4/6 | False | 6 |
+| compare/insert_bulk_10k/lin | series2 | 1.675 | 1.325 | 6/6 | True | 6 |
+| compare/insert_bulk_10k/sqlite | series1 | -1.032 | 0.748 | 2/6 | True |  |
+| compare/insert_bulk_10k/sqlite | series2 | 1.228 | 1.111 | 4/6 | True |  |
+| compare/insert_bulk_1k/lin | series1 | 0.742 | 0.798 | 3/6 | False | 6 |
+| compare/insert_bulk_1k/lin | series2 | 0.236 | 0.579 | 3/6 | False | 6 |
+| compare/insert_bulk_1k/sqlite | series1 | -0.475 | 0.918 | 3/6 | True |  |
+| compare/insert_bulk_1k/sqlite | series2 | 0.378 | 0.960 | 4/6 | True |  |
+
+Decision: do not promote. Strong component gains do not survive the declared full-engine acceptance gate. All Lin target groups except native10k series2 fail consistency/noise requirements. SQLite durable1k series2 control fails: −7.290% versus A/A7.220% (retain exact boundary, do not round to pass). No unchanged rerun to remove this failure. No cause of noise inferred.
+
+Observed candidate SQLite wins36/48: native1k12/12, native10k12/12, durable10k12/12, durable1k0/12. These are local nearby same-process API medians with differing engine contracts; baseline may also win. They neither prove causal improvement nor supersede Linux results or qualify all peers. Full durable1k gap remains. No production source change, no API rollout, no full-eight-peer completion.
+
+The frozen Linux mutation run40448137140 is a different candidate and host; do not attribute its outcome to this embedding experiment. Component result remains valid only in its measured scope. Additional trait API, cold/lifecycle/all-features/GPU/platform validation remains unshipped/unqualified.
