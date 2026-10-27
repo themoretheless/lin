@@ -298,7 +298,18 @@ impl PostingList {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.count() == 0
+        match self {
+            PostingList::Standard(vec) => vec.is_empty(),
+            PostingList::Bitmap(set) => {
+                // Dense postings usually have members in their first word.
+                // Keep the original vectorized count for sparse/empty fallback.
+                if set.bits.first().is_some_and(|word| *word != 0) {
+                    false
+                } else {
+                    set.count() == 0
+                }
+            },
+        }
     }
 
     pub fn is_bitmap(&self) -> bool {
@@ -633,7 +644,7 @@ impl LiveIndex {
             && let Some(vec) = self.forward.get_mut(&old)
         {
             vec.remove(idx);
-            if vec.count() == 0 {
+            if vec.is_empty() {
                 self.forward.remove(&old);
             }
         }
@@ -659,7 +670,7 @@ impl LiveIndex {
             && let Some(vec) = self.forward.get_mut(&key)
         {
             vec.remove(idx);
-            if vec.count() == 0 {
+            if vec.is_empty() {
                 self.forward.remove(&key);
             }
         }
@@ -1698,3 +1709,6 @@ mod bitmap_sample_once_tests {
         }
     }
 }
+
+#[cfg(test)]
+include!("cow_index_tests.rs");

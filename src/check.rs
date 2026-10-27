@@ -655,7 +655,7 @@ fn check_record(
         check_value_as(value, info.ty, cat)?;
     }
     if is_update {
-        let mut literal_row = BTreeMap::new();
+        let mut literal_row = crate::store::Row::new();
         for (k, v) in &record.fields {
             if let Value::String(s) = v {
                 literal_row.insert(k.clone(), crate::store::Cell::Text(s.clone()));

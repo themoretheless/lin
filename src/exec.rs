@@ -2016,7 +2016,10 @@ impl Db {
                 for event in events.into_iter().rev() {
                     match event {
                         RowUndo::Update(collection, idx, row) => {
-                            self.store.restore_rows(&[(collection, idx, row)])
+                            if let Some(mut restored) = self.store.collection(&collection).get(idx).cloned() {
+                                row.apply(&mut restored);
+                                self.store.restore_row_owned(&collection, idx, restored);
+                            }
                         }
                         RowUndo::Delete(collection, positions, rows) => {
                             self.store.restore_rows_at(&collection, &positions, &rows)
@@ -2028,7 +2031,10 @@ impl Db {
                 for event in events.into_iter().rev() {
                     match event {
                         RowUndo::Update(collection, idx, row) => {
-                            self.store.restore_rows(&[(collection, idx, row)])
+                            if let Some(mut restored) = self.store.collection(&collection).get(idx).cloned() {
+                                row.apply(&mut restored);
+                                self.store.restore_row_owned(&collection, idx, restored);
+                            }
                         }
                         RowUndo::Delete(collection, positions, rows) => {
                             self.store.restore_rows_at(&collection, &positions, &rows)
@@ -5543,7 +5549,8 @@ impl Db {
                 row.insert("embedding".into(), Cell::Null);
                 continue;
             }
-            row.insert("embedding".into(), Cell::Vec(emb.embed(&text)));
+            let embedding = emb.embed(&text);
+            row.insert("embedding".into(), Cell::Vec(embedding));
             n += 1;
         }
         self.store.rebuild_row_maps();
@@ -5628,6 +5635,18 @@ impl Db {
         }
 
         Ok(results)
+    }
+
+    fn check_patch_fks(&self, collection: &str, before: &Row, patch: &Row) -> Result<(), Error> {
+        for fk in &self.catalog.fks {
+            if fk.from_col != collection { continue; }
+            let Some(val) = patch.get(&fk.from_field).or_else(||before.get(&fk.from_field)).and_then(Cell::text) else { continue; };
+            if val.is_empty() { continue; }
+            if !self.fk_target_exists(&fk.to_col,&fk.to_field,val) {
+                return Err(Error::runtime(format!("fk: {collection}.{} → {}.{} missing {val}",fk.from_field,fk.to_col,fk.to_field)));
+            }
+        }
+        Ok(())
     }
 
     fn check_row_fks(&self, collection: &str, row: &Row) -> Result<(), Error> {
@@ -5935,47 +5954,50 @@ impl Db {
             }
         }
         let patch = record_row(record, now);
+        let mut effective_patch = patch.clone();
+        if patch.contains_key("body")
+            && let Some(body) = row_text(&patch, "body")
+        {
+            effective_patch.insert("hash".into(), Cell::Text(cached_content_hash(body)));
+        }
         let mut out = Vec::new();
         for i in idxs {
-            let before = self.store.collection(collection)[i].clone();
+            let before = &self.store.collection(collection)[i];
             for (k, _) in &patch {
                 for g in &self.catalog.guards {
-                    if g.collection == collection
-                        && &g.field == k
-                        && eval_pred(&g.pred, &before, now)
-                    {
+                    if g.collection == collection && &g.field == k && eval_pred(&g.pred, before, now) {
                         return Err(Error::runtime(format!("immutable field: {collection}.{k}")));
                     }
                 }
             }
-            let mut updated = before.clone();
-            // Apply patch with zero-copy Arc clones where possible
-            for (k, v) in &patch {
-                updated.insert(k.clone(), v.clone());
-            }
-            if patch.contains_key("body")
-                && let Some(body) = row_text(&updated, "body").map(str::to_string)
-            {
-                // Use precomputed hash from cache to avoid repeated FNV-1a computations
-                updated.insert("hash".into(), Cell::Text(cached_content_hash(&body)));
-            }
-            self.check_row_fks(collection, &updated)?;
+            self.check_patch_fks(collection, before, &effective_patch)?;
+            let had_embedding = before.contains_key("embedding");
+            let identity_before: Option<Row> = if effective_patch.contains_key("id") || effective_patch.contains_key("uri") {
+                Some(before.iter().filter(|(k,_)| k.as_str()=="id" || k.as_str()=="uri").map(|(k,v)|(k.clone(),v.clone())).collect())
+            } else { None };
+            let fts_before: Option<Row> = self.store.fts.get(collection).and_then(|fts| {
+                let touched = effective_patch.contains_key("snippet") || fts.fields.iter().any(|field|effective_patch.contains_key(field));
+                touched.then(||fts.fields.iter().map(String::as_str).chain(std::iter::once("snippet")).filter_map(|field|before.get(field).map(|value|(field.to_owned(),value.clone()))).collect())
+            });
             if let Undo::Rows(events) | Undo::Mixed { events, .. } = ctx.undo {
-                events.push(RowUndo::Update(collection.to_string(), i, before.clone()));
+                events.push(RowUndo::Update(collection.to_string(), i, RowDelta::capture(before, &effective_patch, false)));
             }
-            // Clone before storing - we need both versions for sync operations
-            self.store.collection_mut(collection)[i] = updated.clone();
+            let live = &mut self.store.collection_mut(collection)[i];
+            for (key,value) in &effective_patch {
+                if let Some(slot) = live.get_mut(key.as_str()) { *slot=value.clone(); }
+                else { live.insert(key.clone(),value.clone()); }
+            }
+            live.ensure_shared();
+            let updated = live.clone();
             self.store.index_insert_row(collection, i, &updated)?;
-            self.store.fts_sync_at(collection, i, &before);
-            if let Some(hnsw) = self.store.hnsw.get_mut(collection) {
-                if let Some(Cell::Vec(v)) = updated.get("embedding") {
-                    hnsw.insert(i, v.clone());
-                } else if before.contains_key("embedding") {
-                    hnsw.remove(i);
-                }
+            if let Some(before) = fts_before {
+                if let Some(fts) = self.store.fts.get_mut(collection) { fts.sync_row(i, &before, &updated); }
             }
-            self.store
-                .row_maps_sync_updated(collection, i, &before, &updated);
+            if let Some(hnsw) = self.store.hnsw.get_mut(collection) {
+                if let Some(Cell::Vec(v)) = updated.get("embedding") { hnsw.insert(i,v.clone()); }
+                else if had_embedding { hnsw.remove(i); }
+            }
+            self.store.row_maps_sync_updated(collection,i,identity_before.as_ref().unwrap_or(&updated),&updated);
             out.push(updated);
         }
         mark_written(ctx, collection, &out);
@@ -6205,8 +6227,33 @@ pub(crate) enum Undo {
     },
 }
 
+pub(crate) struct RowDelta(smallvec::SmallVec<[(String, Option<Cell>); 1]>);
+impl RowDelta {
+    fn capture(before: &Row, patch: &Row, derived_hash: bool) -> Self {
+        let mut edits = smallvec::SmallVec::new();
+        for key in patch.keys() {
+            edits.push((key.clone(), before.get(key).cloned()));
+        }
+        if derived_hash && !patch.contains_key("hash") {
+            edits.push(("hash".to_owned(), before.get("hash").cloned()));
+        }
+        Self(edits)
+    }
+    fn apply(self, row: &mut Row) {
+        for (key, value) in self.0 {
+            match value {
+                Some(value) => {
+                    if let Some(slot) = row.get_mut(key.as_str()) { *slot = value; }
+                    else { row.insert(key, value); }
+                }
+                None => { row.remove(key.as_str()); }
+            }
+        }
+    }
+}
+
 pub(crate) enum RowUndo {
-    Update(String, usize, Row),
+    Update(String, usize, RowDelta),
     Delete(String, Vec<usize>, Vec<Row>),
 }
 
@@ -6397,7 +6444,7 @@ pub(crate) fn build_right_probe_owned(
 }
 
 pub(crate) fn emit_join_row(left: &Row, right: Option<&[Cell]>, plan: &[JoinFieldPlan]) -> Row {
-    let mut out = BTreeMap::new();
+    let mut out = Row::new();
     for p in plan {
         match p {
             JoinFieldPlan::Left(k) => {
@@ -6428,7 +6475,7 @@ pub(crate) fn project_join_fields(
     right_col: &str,
     fields: &[String],
 ) -> Row {
-    let mut out = BTreeMap::new();
+    let mut out = Row::new();
     for f in fields {
         let cell = if let Some(rest) = f.strip_prefix(right_col).and_then(|s| s.strip_prefix('.')) {
             right
@@ -6483,14 +6530,14 @@ fn fold_packs(packs: Vec<Pack>) -> Option<Pack> {
 }
 
 fn meta_row(kind: &str, name: &str) -> Row {
-    let mut r = BTreeMap::new();
+    let mut r = Row::new();
     r.insert("kind".into(), Cell::text_arc(kind));
     r.insert("name".into(), Cell::text_arc(name));
     r
 }
 
 fn edge_row(rel: &str, from: &str, to: &str) -> Row {
-    let mut r = BTreeMap::new();
+    let mut r = Row::new();
     r.insert("rel".into(), Cell::text_arc(rel));
     r.insert("from".into(), Cell::text_arc(from));
     r.insert("to".into(), Cell::text_arc(to));
@@ -6571,7 +6618,7 @@ fn append_batch_shape_rows(rows: &mut Vec<Row>, records: &[Record], now: i64) {
 }
 
 fn record_row(record: &Record, now: i64) -> Row {
-    let mut row = BTreeMap::new();
+    let mut row = Row::new();
     for (k, v) in &record.fields {
         row.insert(k.clone(), value_cell(v, now));
     }
@@ -8472,7 +8519,7 @@ impl Db {
                 .map(|row| row.get(&fk).and_then(Cell::as_f64).unwrap_or(0.0))
                 .collect();
             let sums = gpu.group_sums(&vec![0u32; rows.len()], &values, 1)?;
-            let mut row = BTreeMap::new();
+            let mut row = Row::new();
             row.insert(fk, Cell::Float(sums[0]));
             return Ok(Some(vec![row]));
         };
