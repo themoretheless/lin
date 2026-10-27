@@ -25,30 +25,31 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
           import shutil,json,hashlib
-          src=Path('benches/results/2026-10-27-cow-inplace-lock-fixed-gate')
-          dst=Path('benches/results/ci-cow-inplace-lock-fixed')
+          src=Path('benches/results/2026-10-27-cow-case-isolated-gate')
+          dst=Path('benches/results/ci-cow-case-isolated')
           dst.mkdir()
           meta=json.loads((src/'input-provenance.json').read_text())
           assert all(hashlib.sha256(Path(f).read_bytes()).hexdigest()==h for f,h in meta['before_sha256'].items())
-          for name in ['build.py','test.py','run.py','summarize.py','sensitivity.py','oracle.rs','candidate-exec.rs','candidate-store.rs','before-exec.rs','before-store.rs','candidate-check.rs','before-check.rs']:
+          for name in ['build.py','test.py','run.py','summarize.py','sensitivity.py','oracle.rs','candidate-exec.rs','candidate-store.rs','before-exec.rs','before-store.rs','candidate-check.rs','before-check.rs','protocol.md','test-protocol.py']:
               shutil.copy2(src/name,dst/name)
           PY
       - name: Check candidate and contract regressions
         run: |
-          python3 benches/results/ci-cow-inplace-lock-fixed/test.py
-          python3 benches/results/ci-cow-inplace-lock-fixed/sensitivity.py
+          python3 benches/results/ci-cow-case-isolated/test-protocol.py
+          python3 benches/results/ci-cow-case-isolated/test.py
+          python3 benches/results/ci-cow-case-isolated/sensitivity.py
       - name: Build frozen baseline and candidate
-        run: python3 benches/results/ci-cow-inplace-lock-fixed/build.py
-      - name: Run two six-round A-A-B series
-        run: python3 benches/results/ci-cow-inplace-lock-fixed/run.py
+        run: python3 benches/results/ci-cow-case-isolated/build.py
+      - name: Run two case-isolated six-round A-A-B series
+        run: python3 benches/results/ci-cow-case-isolated/run.py
       - name: Summarize every comparison and evaluate target
         run: |
-          python3 benches/results/ci-cow-inplace-lock-fixed/summarize.py
-          python3 scripts/check-mutation-paired.py benches/results/ci-cow-inplace-lock-fixed update
+          python3 benches/results/ci-cow-case-isolated/summarize.py
+          python3 scripts/check-mutation-paired.py benches/results/ci-cow-case-isolated update
       - name: Preserve raw results including failure
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: mutation-paired
-          path: benches/results/ci-cow-inplace-lock-fixed/
+          path: benches/results/ci-cow-case-isolated/
           if-no-files-found: error
