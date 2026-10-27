@@ -1,4 +1,4 @@
-name: tcache-runtime-intervention
+name: unsorted16-untraced-isolated
 on:
   push:
     branches: [codex/map-mutation-profile-ci]
@@ -6,8 +6,8 @@ permissions:
   contents: read
 jobs:
   profile:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -16,44 +16,42 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-      - name: Prepare exact failed-candidate profile inputs
+      - name: Verify and stage frozen inputs
         run: |
-          python3 - <<'PY'
+          python3 - <<'PYCODE'
           from pathlib import Path
           import json,hashlib,shutil
-          src=Path('benches/results/2026-10-27-linux-tcache-intervention')
-          dst=Path('benches/results/ci-tcache-intervention')
-          meta=json.loads((src/'input-provenance.json').read_text())
-          assert all(hashlib.sha256(Path(f).read_bytes()).hexdigest()==h for f,h in meta['source_sha256'].items())
-          assert hashlib.sha256(Path('benches/compare.rs').read_bytes()).hexdigest()==meta['compare_sha256']
-          assert all(hashlib.sha256(Path(f).read_bytes()).hexdigest()==h for f,h in meta['build_inputs_sha256'].items())
-          assert all(hashlib.sha256((src/n).read_bytes()).hexdigest()==h for n,h in meta['diagnostic_files_sha256'].items())
+          src=Path('benches/results/2026-10-27-unsorted16-untraced-isolated');dst=Path('benches/results/ci-unsorted16-untraced')
+          m=json.loads((src/'input-provenance.json').read_text())
+          for f,h in m['source_sha256'].items():assert hashlib.sha256(Path(f).read_bytes()).hexdigest()==h,f
+          for f,h in m['build_inputs_sha256'].items():assert hashlib.sha256(Path(f).read_bytes()).hexdigest()==h,f
+          assert hashlib.sha256(Path('benches/compare.rs').read_bytes()).hexdigest()==m['compare_sha256']
           dst.mkdir()
-          for name in ['allocation.rs','probe.rs','build.py','run.py','analyze.py','protocol.md','documentation.json','input-provenance.json']+[f'map-source-{n}.rs'for n in ['exec','store','check','index']]:
-              shutil.copy2(src/name,dst/name)
-          assert all(hashlib.sha256((dst/f'map-source-{n}.rs').read_bytes()).hexdigest()==h for n,h in meta['candidate_sha256'].items())
-          PY
-      - name: Build diagnostic and restore every source file
-        run: python3 benches/results/ci-tcache-intervention/build.py
-      - name: Collect six rotated inherited-control count32 unsorted16 rounds
-        run: python3 benches/results/ci-tcache-intervention/run.py
-      - name: Verify raw phase records and summarize diagnostics
-        run: |
-          python3 benches/results/ci-tcache-intervention/analyze.py
-          python3 - <<'PY'
-          from pathlib import Path
-          import json,hashlib
-          p=Path('benches/results/ci-tcache-intervention')
-          meta=json.loads((p/'input-provenance.json').read_text())
-          assert all(hashlib.sha256(Path(f).read_bytes()).hexdigest()==h for f,h in meta['source_sha256'].items())
-          assert hashlib.sha256(Path('benches/compare.rs').read_bytes()).hexdigest()==meta['compare_sha256']
-          s=json.loads((p/'summary.json').read_text())
-          assert s['diagnostic_only'] and s['wall_observations']==576 and s['phase_records']==792
-          PY
-      - name: Preserve all diagnostic results including failures
+          for n,h in m['files_sha256'].items():
+              assert hashlib.sha256((src/n).read_bytes()).hexdigest()==h,n
+              shutil.copy2(src/n,dst/n)
+          shutil.copy2(src/'input-provenance.json',dst/'input-provenance.json')
+          PYCODE
+      - name: Check analysis protocol with synthetic raw records
+        run: python3 benches/results/ci-unsorted16-untraced/test-protocol.py
+      - name: Functional tests under candidate runtime and restore sources
+        run: python3 benches/results/ci-unsorted16-untraced/test.py
+      - name: Build one uninstrumented binary and restore sources
+        run: python3 benches/results/ci-unsorted16-untraced/build.py
+      - name: Run 1008 isolated processes with resource records
+        run: python3 benches/results/ci-unsorted16-untraced/run.py
+      - name: Summarize complete data
+        id: summarize
+        run: python3 benches/results/ci-unsorted16-untraced/summarize.py
+      - name: Independent raw audit
+        if: always() && steps.summarize.outcome == 'success'
+        run: python3 benches/results/ci-unsorted16-untraced/verify.py
+      - name: Enforce unchanged gate
+        if: always() && steps.summarize.outcome == 'success'
+        run: python3 benches/results/ci-unsorted16-untraced/qualify.py
+      - uses: actions/upload-artifact@v4
         if: always()
-        uses: actions/upload-artifact@v4
         with:
-          name: tcache-runtime-intervention
-          path: benches/results/ci-tcache-intervention/
+          name: unsorted16-untraced-isolated
+          path: benches/results/ci-unsorted16-untraced/
           if-no-files-found: error
