@@ -81,6 +81,10 @@ rollback = json.loads((root / 'benches/results/2026-10-28-incremental-rollback-e
 assert rollback['audit_complete'] and rollback['processes'] == 2412 and rollback['observations'] == 19296
 assert not rollback['source_candidate_qualified'] and rollback['failed_target_windows'] == 0 and rollback['failed_control_windows'] == 14
 assert rollback['candidate_peer_counts']['sqlite_wal'] == dict(wins=8, comparisons=96)
+direct_linux = json.loads((root / 'benches/results/2026-10-28-wal-direct-batch-full-engine-linux/independent-audit.json').read_text())
+assert direct_linux['audit_complete'] and direct_linux['processes'] == 2268 and direct_linux['observations'] == 18144
+assert not direct_linux['source_candidate_qualified'] and direct_linux['failed_target_windows'] == 2 and direct_linux['failed_control_windows'] == 8
+assert direct_linux['cpu_component_gate_passes'] and direct_linux['candidate_peer_counts']['sqlite_wal'] == dict(wins=11, comparisons=96)
 batch = json.loads((root / 'benches/results/2026-10-28-wal-direct-batch/cpu-summary.json').read_text())
 assert batch['cpu_gate_passes'] and not batch['full_engine_qualified'] and not batch['full_objective_achieved']
 assert alloc['allocation_audit_passed'] and alloc['processes'] == 6 and alloc['windows'] == 216 and not alloc['latency_qualified'] and not alloc['peak_rss_qualified']
@@ -103,8 +107,16 @@ lines += [
     '- [UPDATE/DELETE-only версия](../benches/results/2026-10-28-wal-direct-msgpack/decision.md):CPU gate passed,437tests/2ignored; полный timing не запускался, потому что интерактивный commit использует Batch с canonical fallback.',
     '- [Direct Batch](../benches/results/2026-10-28-wal-direct-batch/report.md):CPU gate passed,12процессов/396блоков/1584000кодирований;single-UPDATE Batch51.618%/51.333%,mixed Batch50.055%/50.904%,все контроли прошли.439tests/2ignored;negative-zero mutant caught. Это сериализация, не commit latency.',
     '- [Старый reader](../benches/results/2026-10-28-wal-direct-batch-legacy-reader/report.md):5фаз,полные строки/поколения,IEEE-биты;повреждённый frame и подмена ожидаемых строк обнаружены.',
-    '- [Frozen full-engine protocol](../benches/results/2026-10-28-wal-direct-batch-full-engine/protocol.md),[run40577759103](https://github.com/themoretheless/lin/actions/runs/40577759103):source696b692a7,63сценария/2268процессов/18144наблюдения.126локальных smoke прошли. Итоговый Linux gate пока не аттестован этой сводкой; live состояние читается в run.',
-    '- Замороженный генератор run40577759103 содержит старый заголовок и описательный CPU-флаг false. Это ошибка метаданных, не latency-порогов. scripts/audit-wal-direct-batch-engine.py проверяет фактический CPU gate отдельно по точному candidate hash и сохраняет исходные JSON без изменения. Сам аудит полного Linux raw ещё предстоит выполнить после завершения job.',
+    '- [Frozen full-engine protocol](../benches/results/2026-10-28-wal-direct-batch-full-engine/protocol.md),[run40577759103](https://github.com/themoretheless/lin/actions/runs/40577759103):source696b692a7,63сценария/2268процессов/18144наблюдения.126локальных smoke прошли. [Полный Linux gate rejected](../benches/results/2026-10-28-wal-direct-batch-full-engine-linux/report.md):2/12target и8/114control окон провалены; SQLite FULL WAL11/96. Raw/source audit прошёл; принятого ускорения нет.',
+    '- Замороженный генератор run40577759103 содержит старый заголовок и описательный CPU-флаг false. Это ошибка метаданных, не latency-порогов. scripts/audit-wal-direct-batch-engine.py проверяет фактический CPU gate отдельно по точному candidate hash и сохраняет исходные JSON без изменения. Независимый аудит полного Linux raw выполнен и прошёл; gate всё равно false.',
+]
+lines += [
+    '', '## COW следующей версии API — разрешённое развитие', '',
+    'Пользователь явно выбрал развитие COW и отдельного публичного Row для следующей версии API. [Миграция и scope](cow-row-vnext.md). Это разрешение на API-переход, не отмена correctness/performance gate.',
+    '- [Порт актуальных исправлений](../benches/results/2026-10-28-cow-vnext-port/report.md):443debugtests/2ignored;all-targets dev check прошёл. Ни одна старая метрика не переносится автоматически.',
+    '- [Свежий warm COW vs BTreeMap](../benches/results/2026-10-28-cow-vnext-warm/report.md):36процессов/3456наблюдений;UPDATE57.624–61.046%,все6окон6/6aboveA/A. Общий diagnostic gate false:rollback10k/series1 имел5/6;пара сохранена.',
+    '- [Owned undo rejected](../benches/results/2026-10-28-cow-owned-undo-warm/report.md) и [Pack-before-undo rejected](../benches/results/2026-10-28-cow-pack-before-undo-warm/report.md):обе гипотезы измерены и отклонены,исходники восстановлены. Held-result regression сохранён; полная квалификация COW по native/durable/read/peer контрактам ещё требуется.',
+    '- [Владение Pack](../benches/results/2026-10-28-cow-rollback-owners/report.md):runtimecounts подтверждают дополнительного владельца Row;это не доказательство причины замедления или выигрыша latency.',
 ]
 output = root / 'docs/benchmark-goal-status-2026-10-27.md'
 output.write_text('\n'.join(lines) + '\n')

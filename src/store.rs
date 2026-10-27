@@ -2428,29 +2428,16 @@ impl Store {
     /// Reverse in-place row mutations from a `Rows` undo journal. Positions never
     /// shift during an update, so each entry restores one row plus its own index /
     /// FTS / map slots — no whole-store clone, no per-collection rebuild.
-    pub(crate) fn restore_row_delta_owned(
-        &mut self,
-        collection: &str,
-        idx: usize,
-        apply: impl FnOnce(&mut Row),
-    ) {
+    pub(crate) fn restore_row_owned(&mut self, collection: &str, idx: usize, row: Row) {
         let Some(slot) = self.collections.get_mut(collection).and_then(|rows| rows.get_mut(idx)) else { return; };
-        let mut restored = std::mem::take(slot);
-        // Only identity fields are needed from the old row by row_maps_sync_updated.
-        // Avoid sharing the entire map before mutation: unique COW storage can mutate
-        // in place, while outstanding Handles still force Arc::make_mut to detach.
-        let before_id = restored.get("id").cloned();
-        let before_uri = restored.get("uri").cloned();
-        self.index_remove_row(collection, idx, &restored);
-        self.fts_remove_row(collection, idx, &restored);
-        apply(&mut restored);
-        let identity_changed = before_id.as_ref().and_then(Cell::text) != row_text(&restored, "id")
-            || before_uri.as_ref().and_then(Cell::text) != row_text(&restored, "uri");
-        let after = restored.clone();
-        self.collections.get_mut(collection).unwrap()[idx] = restored;
-        let _ = self.index_insert_row(collection, idx, &after);
-        self.fts_insert_row(collection, idx, &after);
-        self.row_maps_sync_updated_with_identity(collection, idx, &after, identity_changed);
+        // Retain one read-only view for map/index maintenance; move both stored rows.
+        let restored = row.clone();
+        let current = std::mem::replace(slot, row);
+        self.index_remove_row(collection, idx, &current);
+        self.fts_remove_row(collection, idx, &current);
+        let _ = self.index_insert_row(collection, idx, &restored);
+        self.fts_insert_row(collection, idx, &restored);
+        self.row_maps_sync_updated(collection, idx, &current, &restored);
     }
 
     pub fn restore_rows(&mut self, journal: &[(String, usize, Row)]) {
@@ -2923,16 +2910,12 @@ impl Store {
         before: &Row,
         after: &Row,
     ) {
-        let identity_moved = row_text(before, "id") != row_text(after, "id")
-            || row_text(before, "uri") != row_text(after, "uri");
-        self.row_maps_sync_updated_with_identity(collection, idx, after, identity_moved);
-    }
-
-    fn row_maps_sync_updated_with_identity(
-        &mut self, collection: &str, idx: usize, after: &Row, identity_moved: bool,
-    ) {
-        if collection == "docs" { self.docs_title_packed.take(); }
+        if collection == "docs" {
+            self.docs_title_packed.take();
+        }
         let id = row_text(after, "id");
+        let identity_moved =
+            row_text(before, "id") != id || row_text(before, "uri") != row_text(after, "uri");
         let stale_slot = id.is_some_and(|key| self.row_index(collection, key) != Some(idx));
         if identity_moved || stale_slot {
             self.rebuild_row_maps_collection(collection);
