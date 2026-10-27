@@ -1,0 +1,39 @@
+skip postgres: LIN_BENCH_SKIP_PG is set
+skip mysql: LIN_BENCH_SKIP_MYSQL is set
+lin compare: N=10000 warm reads (fixture), bulk insert (schema outside timing)
+engines: Lin | SQLite(rusqlite bundled) | DuckDB(bundled) | HashMap(point get only) | Postgres(skipped) | MySQL(skipped)
+airbug dash: http://127.0.0.1:8790/
+Lin reads: prepare once / run many; filters use count (fair vs SQL COUNT(*));
+substring: Lin `title ~ "wal" | count` vs SQL LIKE '%wal%' COUNT(*);
+materialize: Lin `wing==rag | {id,title} | take all` vs SQL SELECT id,title;
+join: 10000 orders ⋈ 1000 users (Lin run_batch SoA / cursor vs SQL INNER JOIN);
+append_log: Lin `append facts` vs SQL INSERT INTO logs (append-only shape)
+airbug dash: http://127.0.0.1:8790/#/bench
+bench: compare/update_1row_1k/lin — validating and calibrating
+bench: compare/update_1row_1k/lin — measuring 1 samples
+# bench 1793079276546525000-80860
+
+Status: Complete
+
+| Case | Metric | Median | Unit | Scope / statistic | Observations | Processes |
+|---|---|---:|---|---|---:|---:|
+| compare/update_1row_1k/lin [candidate] | wall | 7958.0000 | ns | current thread wall clock; scheduler included / batch_total | 1 | 1 |
+
+# Useful work throughput
+
+| Case | Median batch throughput | Unit |
+|---|---:|---|
+| compare/update_1row_1k/lin [candidate] | 125659.7135 | stmts/s |
+
+Derived from positive wall batches and declared units per operation; zero/unavailable durations omitted.
+
+Medians above summarize observations, not pooled operation-latency percentiles. Comparisons aggregate within each process first.
+
+- Raw batches are not independent process replications. Batch averages are not individual-operation latency. CPU frequency and background load are uncontrolled.
+
+- compare/update_1row_1k/lin: some samples below half the requested duration; iteration cap or workload drift may limit precision
+
+PHASE {"allocation_trace":{"columns":["op","size","align","new_size","service_ns","failed"],"count":0,"enabled":false,"events":[],"fields":9,"overflow":false},"diagnostic_only":true,"handle_drop_ns":208,"kind":"update","prepared_ns":33333,"rows":1000,"stages_ns":[458,20417,0,42,750,0,666,0,0,0,0,0,0,0,84,32667,33292,125,167,125,208,333,125,500,42]}
+PHASE {"allocation_trace":{"columns":["op","size","align","new_size","service_ns","failed"],"count":0,"enabled":false,"events":[],"fields":9,"overflow":false},"diagnostic_only":true,"handle_drop_ns":167,"kind":"update","prepared_ns":3250,"rows":1000,"stages_ns":[334,2667,0,42,375,0,541,0,0,0,0,0,0,0,0,2875,3208,42,84,83,250,292,42,250,0]}
+PHASE {"allocation_trace":{"columns":["op","size","align","new_size","service_ns","failed"],"count":0,"enabled":false,"events":[],"fields":9,"overflow":false},"diagnostic_only":true,"handle_drop_ns":208,"kind":"update","prepared_ns":4542,"rows":1000,"stages_ns":[542,3667,0,41,750,0,667,0,0,0,0,0,0,0,83,4041,4542,83,167,167,250,333,125,500,41]}
+PHASE {"allocation_trace":{"columns":["op","size","align","new_size","service_ns","failed"],"count":0,"enabled":false,"events":[],"fields":9,"overflow":false},"diagnostic_only":true,"handle_drop_ns":166,"kind":"update","prepared_ns":4375,"rows":1000,"stages_ns":[208,3875,0,0,417,0,375,0,0,0,0,0,0,0,0,4042,4334,83,84,125,167,208,83,250,42]}

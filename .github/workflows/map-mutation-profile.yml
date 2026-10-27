@@ -1,4 +1,4 @@
-name: map-row-copy-diagnostic
+name: row-clone-alloc-trace
 on:
   push:
     branches: [codex/map-mutation-profile-ci]
@@ -21,39 +21,39 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
           import json,hashlib,shutil
-          src=Path('benches/results/2026-10-27-linux-row-copy-diagnostic')
-          dst=Path('benches/results/ci-row-copy-diagnostic')
+          src=Path('benches/results/2026-10-27-linux-row-clone-alloc-trace')
+          dst=Path('benches/results/ci-row-clone-alloc-trace')
           meta=json.loads((src/'input-provenance.json').read_text())
           assert all(hashlib.sha256(Path(f).read_bytes()).hexdigest()==h for f,h in meta['source_sha256'].items())
           assert hashlib.sha256(Path('benches/compare.rs').read_bytes()).hexdigest()==meta['compare_sha256']
           assert all(hashlib.sha256(Path(f).read_bytes()).hexdigest()==h for f,h in meta['build_inputs_sha256'].items())
           assert all(hashlib.sha256((src/n).read_bytes()).hexdigest()==h for n,h in meta['diagnostic_files_sha256'].items())
           dst.mkdir()
-          for name in ['copy.rs','probe.rs','build.py','run.py','analyze.py','protocol.md','input-provenance.json']+[f'map-source-{n}.rs'for n in ['exec','store','check','index']]:
+          for name in ['allocation.rs','probe.rs','build.py','run.py','analyze.py','protocol.md','input-provenance.json']+[f'map-source-{n}.rs'for n in ['exec','store','check','index']]:
               shutil.copy2(src/name,dst/name)
           assert all(hashlib.sha256((dst/f'map-source-{n}.rs').read_bytes()).hexdigest()==h for n,h in meta['candidate_sha256'].items())
           PY
       - name: Build diagnostic and restore every source file
-        run: python3 benches/results/ci-row-copy-diagnostic/build.py
-      - name: Collect two six-round A-A-B series and staged decomposition
-        run: python3 benches/results/ci-row-copy-diagnostic/run.py
+        run: python3 benches/results/ci-row-clone-alloc-trace/build.py
+      - name: Collect six rotated trace-off control-off trace-on rounds
+        run: python3 benches/results/ci-row-clone-alloc-trace/run.py
       - name: Verify raw phase records and summarize diagnostics
         run: |
-          python3 benches/results/ci-row-copy-diagnostic/analyze.py
+          python3 benches/results/ci-row-clone-alloc-trace/analyze.py
           python3 - <<'PY'
           from pathlib import Path
           import json,hashlib
-          p=Path('benches/results/ci-row-copy-diagnostic')
+          p=Path('benches/results/ci-row-clone-alloc-trace')
           meta=json.loads((p/'input-provenance.json').read_text())
           assert all(hashlib.sha256(Path(f).read_bytes()).hexdigest()==h for f,h in meta['source_sha256'].items())
           assert hashlib.sha256(Path('benches/compare.rs').read_bytes()).hexdigest()==meta['compare_sha256']
           s=json.loads((p/'summary.json').read_text())
-          assert s['diagnostic_only'] and s['wall_observations']==936 and s['phase_records']==1287
+          assert s['diagnostic_only'] and s['wall_observations']==432 and s['phase_records']==594
           PY
       - name: Preserve all diagnostic results including failures
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: map-row-copy-diagnostic
-          path: benches/results/ci-row-copy-diagnostic/
+          name: row-clone-alloc-trace
+          path: benches/results/ci-row-clone-alloc-trace/
           if-no-files-found: error
