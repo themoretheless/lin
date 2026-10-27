@@ -1,0 +1,9 @@
+# COW vNext full-engine qualification
+
+Baseline is exact corrected BTreeMap core6812cc5ca; candidate is current lazy COW4-file port with prior failed rollback hypotheses reverted. No direct MessagePack writer changes are combined. Next-API Row newtype migration explicitly authorized. Inline Row descriptor32vs24bytes can change memory/quota estimates; no guard or configured quota is weakened. Full fields,FTS,indexes,embedding,undo/Pack/Drop and Full synchronization retained.
+
+Retain all67cases of the prior broad matrix. Primary targets are native prepared UPDATE1k/10k/100k, chosen from the original COW hypothesis and the fresh57–61%warm UPDATE result. Other64cases remain controls: native DELETE/transactions/bulk/read,Full durable UPDATE/DELETE/commit/rollback,scalarFull/Normal,SQLite and DuckDB. Two6-pair series,3roles,8observations:2412fresh processes/19296observations. Every targetwindow requires6/6positive pairs and median gain>median absolute A/A; every controlwindow requires gain>=-max(2%,A/A). Same thresholds; no case removed.
+
+Warm overall gate failed one rollback window; preserve that failure and do not relabel it as pass. This full fresh-fixture test evaluates the primary UPDATE hypothesis with rollback and all other cases retained as controls, not a repeat of the unchanged warm test or a relaxation of its gate. No adoption until all full-engine targets/controls and subsequent lifecycle/peer requirements pass.
+
+Before timing: full release444tests/2ignored,Eq runtime mutant,source/asset hashes,synthetic analysis sensitivity,two uninstrumented binaries,134correctness smokes. Capture process RSS including fixture/oracle/reopen/teardown; this is not isolated heap. Complete raw recomputation and artifact preservation required. Full eight-peer objective remains false.
