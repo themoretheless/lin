@@ -29,7 +29,7 @@ jobs:
           assert all(hashlib.sha256(Path(f).read_bytes()).hexdigest()==h for f,h in meta['build_inputs_sha256'].items())
           assert all(hashlib.sha256((src/n).read_bytes()).hexdigest()==h for n,h in meta['diagnostic_files_sha256'].items())
           dst.mkdir()
-          for name in ['probe.rs','build.py','run.py','analyze.py','input-provenance.json']+[f'map-source-{n}.rs'for n in ['exec','store','check','index']]:
+          for name in ['copy.rs','probe.rs','build.py','run.py','analyze.py','protocol.md','input-provenance.json']+[f'map-source-{n}.rs'for n in ['exec','store','check','index']]:
               shutil.copy2(src/name,dst/name)
           assert all(hashlib.sha256((dst/f'map-source-{n}.rs').read_bytes()).hexdigest()==h for n,h in meta['candidate_sha256'].items())
           PY
