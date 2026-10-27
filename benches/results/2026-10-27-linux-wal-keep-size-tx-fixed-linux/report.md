@@ -1,0 +1,9 @@
+# Bounded Linux KEEP_SIZE: completed functional qualification
+
+[Run40530054164](https://github.com/themoretheless/lin/actions/runs/40530054164), head08efc6e7f526ccefd62050f4b9266351c95fbde5, native Ubuntu24.04 x86_64 and Rust1.96.0, completed successfully. **421 default release tests passed,2 ignored**. The runtime missing-KEEP_SIZE mutant failed as intended, and full original sources were restored. Independent audit reconstructs a temporary source snapshot from immutable Git objects, verifies all core hashes, and runs the retained verifier without changing current sources.
+
+Real Linux observations: reserve and growth succeeded while a six-byte file retained logical EOF6 (physical allocation2101248 bytes). Full1000-row Db seed/rollback/commit/follower/checkpoint/reopen cycle passed. Opening, compacting and closing leave logical/allocated0. First small commit after checkpoint has logical4115 bytes and allocated1048576 bytes. Full frame bytes match the independent bitwise CRC32C reference; replay/export/truncate/append checks pass. These are measured kernel/functional facts, not latency results or proof on every filesystem.
+
+The first uncorrected run40526134457 remains failed historical evidence: IEEE checksum reference mismatch and genuine transaction-generation gaps. This revision fixes the reference and uses the already-corrected transaction source, retaining all rollback/follower assertions. No performance thresholds or placement policy were relaxed.
+
+The complete downloaded artifact, actual events, run metadata and independent audit are retained. No source optimization is accepted by this functional result. Full-engine performance run40530861048 uses the same frozen persistence prototype and transaction core; later aborted-transaction execution changes need their own final-source qualification.
