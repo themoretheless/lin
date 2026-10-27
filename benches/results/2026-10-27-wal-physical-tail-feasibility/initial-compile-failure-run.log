@@ -1,0 +1,16 @@
+   Compiling lin v0.4.0 (/Users/themoretheless/.codex/worktrees/lin-wal-persistent-qualification/lin)
+error[E0308]: mismatched types
+ --> examples/wal_physical_tail_probe.rs:5:74
+  |
+5 | ...Map::from([("id".into(),Cell::Text(format!("r{generation}"))),("embedding".into(),Cell::Vec(vec![0.0;768].into()))]);persist::appe...
+  |                                       ^^^^^^^^^^^^^^^^^^^^^^^^ expected `Arc<str>`, found `String`
+  |
+  = note: expected struct `Arc<str>`
+             found struct `std::string::String`
+help: call `Into::into` on this expression to convert `std::string::String` into `Arc<str>`
+  |
+5 |  for generation in [1,2]{let row=BTreeMap::from([("id".into(),Cell::Text(format!("r{generation}").into())),("embedding".into(),Cell::Vec(vec![0.0;768].into()))]);persist::append_record(&mut f,&LogRecord{r#gen:generation,next_id:generation+1,pack:Pack::Update{collection:"docs".into(),rows:vec![row]}},&mut buf,SyncMode::Full,&mut count).unwrap();if generation==1{first_end=count as usize;}}
+  |                                                                                                  +++++++
+
+For more information about this error, try `rustc --explain E0308`.
+error: could not compile `lin` (example "wal_physical_tail_probe") due to 1 previous error
