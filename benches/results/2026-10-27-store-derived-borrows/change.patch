@@ -1,0 +1,65 @@
+--- a/src/store.rs
++++ b/src/store.rs
+@@ -2852,11 +2852,17 @@
+             .collections
+             .get(collection)
+             .and_then(|c| c.get(row_idx))
+-            .cloned()
+         else {
+             return Ok(());
+         };
+-        self.index_insert_row(collection, row_idx, &row)
++        for idx in self.indexes.values_mut() {
++            if idx.def.collection == collection
++                && let Err(e) = idx.insert_at(row_idx, row)
++            {
++                return Err(Error::runtime(e));
++            }
++        }
++        Ok(())
+     }
+ 
+     pub fn index_insert_row(
+@@ -3071,12 +3077,11 @@
+             .collections
+             .get(collection)
+             .and_then(|c| c.get(row_idx))
+-            .cloned()
+         else {
+             return;
+         };
+         if let Some(fts) = self.fts.get_mut(collection) {
+-            fts.insert_row(row_idx, &row);
++            fts.insert_row(row_idx, row);
+         }
+     }
+ 
+@@ -3123,11 +3128,12 @@
+             .collections
+             .get(collection)
+             .and_then(|c| c.get(row_idx))
+-            .cloned()
+         else {
+             return;
+         };
+-        self.fts_remove_row(collection, row_idx, &row);
++        if let Some(fts) = self.fts.get_mut(collection) {
++            fts.remove_row(row_idx, row);
++        }
+     }
+ 
+     /// Drop one row's postings, given the row itself: only that row's tokens are
+@@ -3156,12 +3162,11 @@
+             .collections
+             .get(collection)
+             .and_then(|c| c.get(row_idx))
+-            .cloned()
+         else {
+             return;
+         };
+         if let Some(fts) = self.fts.get_mut(collection) {
+-            fts.sync_row(row_idx, before, &row);
++            fts.sync_row(row_idx, before, row);
+         }
+     }
+ 
