@@ -652,13 +652,11 @@ impl LiveIndex {
         // Use BitSet for boolean fields (≤2 distinct values)
         match self.forward.entry(key) {
             std::collections::btree_map::Entry::Vacant(v) => {
-                self.reverse.insert(idx, v.key().clone());
                 let mut posting = PostingList::new(is_bitmap, 1 << 16);
                 posting.insert(idx);
                 v.insert(posting);
             }
             std::collections::btree_map::Entry::Occupied(mut o) => {
-                self.reverse.insert(idx, o.key().clone());
                 o.get_mut().insert(idx);
             }
         }

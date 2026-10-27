@@ -1,0 +1,7 @@
+# Single reverse-map write during index key replacement
+
+Baseline: restored lazy COW c7dda505f. Candidate changes only LiveIndex::insert_key in src/index.rs: the first reverse.insert(idx,key.clone()) already records the new key and yields the previous key for forward cleanup. Remove redundant reverse.insert from both forward entry branches. Unique constraint check remains before mutation, unchanged-key return remains, old postings cleanup and new postings insertion remain. No WAL/sync/quota/API changes.
+
+Hypothesis: save one hash-table write and composite-key clone for each changed index key. This is not yet a measured engine speedup. Full release correctness suite and paired same-harness measurements required. Retain all failures and controls; no production adoption from component data alone.
+
+Frozen warm CPU probe: index widths 1,2,3,8, each with changed-key target and unchanged-key control. 1000 rows; eight samples of 20000 insert_at calls per case per fresh process. Fixture/index setup and exhaustive forward/reverse key-membership checks outside timing; no counting allocator. Two six-pair series, baseline/control same binary, roles rotated; all 36 processes and 2304 sample observations retained. Each changed-key target requires 6/6 positive pairs and median gain above median absolute A/A; unchanged-key controls require gain >= -max(2%, A/A). This measures warm index maintenance only, not complete UPDATE, WAL, RSS or peer superiority.
