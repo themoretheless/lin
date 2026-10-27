@@ -1,0 +1,80 @@
+skip postgres: LIN_BENCH_SKIP_PG is set
+skip mysql: LIN_BENCH_SKIP_MYSQL is set
+lin compare: N=10000 warm reads (fixture), bulk insert (schema outside timing)
+engines: Lin | SQLite(rusqlite bundled) | DuckDB(bundled) | HashMap(point get only) | Postgres(skipped) | MySQL(skipped)
+airbug dash: http://127.0.0.1:8790/
+Lin reads: prepare once / run many; filters use count (fair vs SQL COUNT(*));
+substring: Lin `title ~ "wal" | count` vs SQL LIKE '%wal%' COUNT(*);
+materialize: Lin `wing==rag | {id,title} | take all` vs SQL SELECT id,title;
+join: 10000 orders ⋈ 1000 users (Lin run_batch SoA / cursor vs SQL INNER JOIN);
+append_log: Lin `append facts` vs SQL INSERT INTO logs (append-only shape)
+airbug dash: http://127.0.0.1:8790/#/bench
+bench: compare/update_1row_1k/lin — validating and calibrating
+bench: compare/update_1row_1k/lin — measuring 8 samples
+bench: compare/update_1row_10k/lin — validating and calibrating
+bench: compare/update_1row_10k/lin — measuring 8 samples
+bench: compare/update_1row_100k/lin — validating and calibrating
+bench: compare/update_1row_100k/lin — measuring 8 samples
+# bench 1793066373270337000-63611
+
+Status: Complete
+
+| Case | Metric | Median | Unit | Scope / statistic | Observations | Processes |
+|---|---|---:|---|---|---:|---:|
+| compare/update_1row_1k/lin [candidate] | wall | 4208.5000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+| compare/update_1row_10k/lin [candidate] | wall | 8229.5000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+| compare/update_1row_100k/lin [candidate] | wall | 12958.0000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+
+# Useful work throughput
+
+| Case | Median batch throughput | Unit |
+|---|---:|---|
+| compare/update_1row_1k/lin [candidate] | 242271.6021 | stmts/s |
+| compare/update_1row_10k/lin [candidate] | 121514.8193 | stmts/s |
+| compare/update_1row_100k/lin [candidate] | 77179.5852 | stmts/s |
+
+Derived from positive wall batches and declared units per operation; zero/unavailable durations omitted.
+
+Medians above summarize observations, not pooled operation-latency percentiles. Comparisons aggregate within each process first.
+
+- Raw batches are not independent process replications. Batch averages are not individual-operation latency. CPU frequency and background load are uncontrolled.
+
+- compare/update_1row_1k/lin: some samples below half the requested duration; iteration cap or workload drift may limit precision
+
+- compare/update_1row_10k/lin: some samples below half the requested duration; iteration cap or workload drift may limit precision
+
+- compare/update_1row_100k/lin: some samples below half the requested duration; iteration cap or workload drift may limit precision
+
+PHASE {"diagnostic_only":true,"handle_drop_ns":42,"kind":"update","prepared_ns":6958,"rows":1000,"stages_ns":[1125,5917,0,83,917,0,792,0,0,0,0,0,0,0,42,6209,6875,166,167,125,375,42,83,625,125]}
+PHASE {"diagnostic_only":true,"handle_drop_ns":41,"kind":"update","prepared_ns":2792,"rows":1000,"stages_ns":[292,2209,0,84,417,0,417,0,0,0,0,0,0,0,42,2458,2792,125,42,84,125,41,83,208,42]}
+PHASE {"diagnostic_only":true,"handle_drop_ns":42,"kind":"update","prepared_ns":3875,"rows":1000,"stages_ns":[333,3042,0,42,584,0,709,0,0,0,0,0,0,0,0,3291,3792,125,84,166,208,41,83,375,41]}
+PHASE {"diagnostic_only":true,"handle_drop_ns":42,"kind":"update","prepared_ns":2625,"rows":1000,"stages_ns":[208,2000,0,42,375,0,375,0,0,0,0,0,0,0,42,2250,2583,83,125,125,83,42,83,167,41]}
+PHASE {"diagnostic_only":true,"handle_drop_ns":42,"kind":"update","prepared_ns":4083,"rows":1000,"stages_ns":[333,3208,0,0,666,0,583,0,0,0,0,0,0,0,41,3583,4042,167,167,167,208,41,83,459,83]}
+PHASE {"diagnostic_only":true,"handle_drop_ns":41,"kind":"update","prepared_ns":2875,"rows":1000,"stages_ns":[334,2292,0,42,417,0,500,0,0,0,0,0,0,0,0,2459,2833,84,125,84,125,41,83,250,41]}
+PHASE {"diagnostic_only":true,"handle_drop_ns":0,"kind":"update","prepared_ns":2000,"rows":1000,"stages_ns":[125,1583,0,41,333,0,292,0,0,0,0,0,0,0,41,1750,2000,83,42,83,84,0,83,166,0]}
+PHASE {"diagnostic_only":true,"handle_drop_ns":42,"kind":"update","prepared_ns":6791,"rows":1000,"stages_ns":[833,5291,0,41,1666,0,666,0,0,0,0,0,0,0,42,5958,6709,167,208,167,292,0,166,1250,167]}
+PHASE {"diagnostic_only":true,"handle_drop_ns":42,"kind":"update","prepared_ns":3000,"rows":1000,"stages_ns":[250,2291,0,42,542,0,416,0,0,0,0,0,0,0,0,2584,2916,84,125,125,83,42,83,333,42]}
+PHASE {"diagnostic_only":true,"handle_drop_ns":41,"kind":"update","prepared_ns":2209,"rows":1000,"stages_ns":[167,1667,0,0,417,0,250,0,0,0,0,0,0,0,0,1916,2125,83,41,41,83,41,83,250,42]}
+PHASE {"diagnostic_only":true,"handle_drop_ns":42,"kind":"update","prepared_ns":2208,"rows":1000,"stages_ns":[209,1792,0,84,375,0,250,0,0,0,0,0,0,0,0,1959,2166,83,83,125,41,42,84,208,0]}
+PHASE {"diagnostic_only":true,"handle_drop_ns":42,"kind":"update","prepared_ns":7125,"rows":10000,"stages_ns":[1000,5709,0,125,1167,0,1084,0,0,0,0,0,0,0,42,6209,7084,208,167,208,333,42,83,917,167]}
+PHASE {"diagnostic_only":true,"handle_drop_ns":42,"kind":"update","prepared_ns":5000,"rows":10000,"stages_ns":[792,4167,0,125,708,0,708,0,0,0,0,0,0,0,0,4542,4959,83,125,125,291,42,84,542,167]}
+PHASE {"diagnostic_only":true,"handle_drop_ns":0,"kind":"update","prepared_ns":6250,"rows":10000,"stages_ns":[791,4875,0,125,1000,0,958,0,0,0,0,0,0,0,42,5334,6208,83,250,167,250,84,166,625,125]}
+PHASE {"diagnostic_only":true,"handle_drop_ns":0,"kind":"update","prepared_ns":7042,"rows":10000,"stages_ns":[875,5708,0,125,1292,0,958,0,0,0,0,0,0,0,41,6083,7000,125,250,125,292,83,125,958,125]}
+PHASE {"diagnostic_only":true,"handle_drop_ns":41,"kind":"update","prepared_ns":7125,"rows":10000,"stages_ns":[1000,5875,0,125,1292,0,1208,0,0,0,0,0,0,0,42,6250,7042,250,208,250,292,83,125,917,166]}
+PHASE {"diagnostic_only":true,"handle_drop_ns":42,"kind":"update","prepared_ns":8458,"rows":10000,"stages_ns":[1084,6625,0,125,1625,0,1250,0,0,0,0,0,0,0,42,7375,8458,167,459,208,209,83,125,1166,250]}
+PHASE {"diagnostic_only":true,"handle_drop_ns":0,"kind":"update","prepared_ns":6209,"rows":10000,"stages_ns":[792,4875,0,125,1083,0,750,0,0,0,0,0,0,0,41,5333,6042,208,209,167,250,42,125,708,250]}
+PHASE {"diagnostic_only":true,"handle_drop_ns":0,"kind":"update","prepared_ns":5500,"rows":10000,"stages_ns":[959,4542,0,83,917,0,750,0,0,0,0,0,0,0,42,4958,5500,208,167,83,208,42,208,583,166]}
+PHASE {"diagnostic_only":true,"handle_drop_ns":42,"kind":"update","prepared_ns":5416,"rows":10000,"stages_ns":[791,4083,0,41,667,0,666,0,0,0,0,0,0,0,0,4416,5292,167,167,84,250,42,83,542,209]}
+PHASE {"diagnostic_only":true,"handle_drop_ns":42,"kind":"update","prepared_ns":6875,"rows":10000,"stages_ns":[875,5541,0,0,875,0,833,0,0,0,0,0,0,0,0,6333,6834,542,167,84,292,250,125,541,42]}
+PHASE {"diagnostic_only":true,"handle_drop_ns":0,"kind":"update","prepared_ns":6375,"rows":10000,"stages_ns":[875,5042,0,83,1000,0,834,0,0,0,0,0,0,0,42,5458,6375,167,291,167,375,41,83,708,250]}
+PHASE {"diagnostic_only":true,"handle_drop_ns":0,"kind":"update","prepared_ns":8833,"rows":100000,"stages_ns":[958,6583,0,42,1916,0,1042,0,0,0,0,0,0,0,0,7875,8708,333,166,125,375,83,167,1584,167]}
+PHASE {"diagnostic_only":true,"handle_drop_ns":0,"kind":"update","prepared_ns":10416,"rows":100000,"stages_ns":[875,8292,0,125,2375,0,1708,0,0,0,0,0,0,0,167,9334,10334,333,292,125,500,42,209,1958,416]}
+PHASE {"diagnostic_only":true,"handle_drop_ns":0,"kind":"update","prepared_ns":15541,"rows":100000,"stages_ns":[1125,13083,0,83,2208,0,7042,0,0,0,0,0,0,0,250,14333,15375,375,166,208,375,41,167,1875,250]}
+PHASE {"diagnostic_only":true,"handle_drop_ns":42,"kind":"update","prepared_ns":10417,"rows":100000,"stages_ns":[917,8000,0,250,2542,0,1209,0,0,0,0,0,0,0,125,9125,10333,333,333,208,500,42,125,2125,250]}
+PHASE {"diagnostic_only":true,"handle_drop_ns":0,"kind":"update","prepared_ns":10125,"rows":100000,"stages_ns":[1000,8417,0,208,2333,0,1459,0,0,0,0,0,0,0,41,9166,10083,125,250,125,542,41,167,1916,458]}
+PHASE {"diagnostic_only":true,"handle_drop_ns":0,"kind":"update","prepared_ns":9500,"rows":100000,"stages_ns":[1375,7292,0,42,2125,0,1084,0,0,0,0,0,0,0,42,8333,9458,375,125,83,417,83,83,1667,125]}
+PHASE {"diagnostic_only":true,"handle_drop_ns":41,"kind":"update","prepared_ns":10792,"rows":100000,"stages_ns":[1125,8375,0,250,2584,0,1291,0,0,0,0,0,0,0,291,9583,10625,208,250,167,500,84,209,1959,333]}
+PHASE {"diagnostic_only":true,"handle_drop_ns":83,"kind":"update","prepared_ns":10500,"rows":100000,"stages_ns":[1000,8209,0,125,2958,0,1167,0,0,0,0,0,0,0,41,9041,10333,250,167,125,709,42,167,2458,250]}
+PHASE {"diagnostic_only":true,"handle_drop_ns":41,"kind":"update","prepared_ns":10334,"rows":100000,"stages_ns":[1125,8041,0,125,2667,0,1208,0,0,0,0,0,0,0,84,9292,10250,208,167,208,375,83,333,1958,208]}
+PHASE {"diagnostic_only":true,"handle_drop_ns":250,"kind":"update","prepared_ns":10666,"rows":100000,"stages_ns":[1375,8208,0,125,2583,0,1375,0,0,0,0,0,0,0,166,9458,10375,291,250,125,333,125,208,2083,83]}
+PHASE {"diagnostic_only":true,"handle_drop_ns":41,"kind":"update","prepared_ns":10625,"rows":100000,"stages_ns":[1042,8500,0,125,2917,0,1333,0,0,0,0,0,0,0,42,9334,10583,209,250,166,500,42,125,2417,209]}
