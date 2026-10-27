@@ -1,0 +1,21 @@
+profile	Build diagnostic and restore every source file	﻿2026-10-27T05:20:02.9065282Z ##[group]Run python3 benches/results/ci-row-copy-diagnostic/build.py
+profile	Build diagnostic and restore every source file	2026-10-27T05:20:02.9066370Z ^[[36;1mpython3 benches/results/ci-row-copy-diagnostic/build.py^[[0m
+profile	Build diagnostic and restore every source file	2026-10-27T05:20:02.9125666Z shell: /usr/bin/bash -e {0}
+profile	Build diagnostic and restore every source file	2026-10-27T05:20:02.9125940Z env:
+profile	Build diagnostic and restore every source file	2026-10-27T05:20:02.9126149Z   CARGO_HOME: /home/runner/.cargo
+profile	Build diagnostic and restore every source file	2026-10-27T05:20:02.9126619Z   CARGO_INCREMENTAL: 0
+profile	Build diagnostic and restore every source file	2026-10-27T05:20:02.9126844Z   CARGO_TERM_COLOR: always
+profile	Build diagnostic and restore every source file	2026-10-27T05:20:02.9127079Z   CACHE_ON_FAILURE: true
+profile	Build diagnostic and restore every source file	2026-10-27T05:20:02.9127298Z ##[endgroup]
+profile	Build diagnostic and restore every source file	2026-10-27T05:20:03.3178673Z Traceback (most recent call last):
+profile	Build diagnostic and restore every source file	2026-10-27T05:20:03.3179487Z   File "/home/runner/work/lin/lin/benches/results/ci-row-copy-diagnostic/build.py", line 11, in <module>
+profile	Build diagnostic and restore every source file	2026-10-27T05:20:03.3180141Z     with Path('src/lib.rs').open('a')as f:f.write('\n'+(p/'copy.rs').read_text())
+profile	Build diagnostic and restore every source file	2026-10-27T05:20:03.3180598Z                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^
+profile	Build diagnostic and restore every source file	2026-10-27T05:20:03.3181004Z   File "/usr/lib/python3.12/pathlib.py", line 1029, in read_text
+profile	Build diagnostic and restore every source file	2026-10-27T05:20:03.3187582Z     with self.open(mode='r', encoding=encoding, errors=errors) as f:
+profile	Build diagnostic and restore every source file	2026-10-27T05:20:03.3188294Z          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+profile	Build diagnostic and restore every source file	2026-10-27T05:20:03.3188912Z   File "/usr/lib/python3.12/pathlib.py", line 1015, in open
+profile	Build diagnostic and restore every source file	2026-10-27T05:20:03.3190032Z     return io.open(self, mode, buffering, encoding, errors, newline)
+profile	Build diagnostic and restore every source file	2026-10-27T05:20:03.3190696Z            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+profile	Build diagnostic and restore every source file	2026-10-27T05:20:03.3191712Z FileNotFoundError: [Errno 2] No such file or directory: '/home/runner/work/lin/lin/benches/results/ci-row-copy-diagnostic/copy.rs'
+profile	Build diagnostic and restore every source file	2026-10-27T05:20:03.3330926Z ##[error]Process completed with exit code 1.
