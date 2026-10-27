@@ -1,0 +1,37 @@
+   Compiling lin v0.4.0 (/Users/themoretheless/.codex/worktrees/lin-wal-persistent-qualification/lin)
+warning: field `lock_owner_pid` is never read
+   --> src/persist.rs:343:16
+    |
+338 | pub struct Persist {
+    |            ------- field in this struct
+...
+343 |     pub(crate) lock_owner_pid: u32,
+    |                ^^^^^^^^^^^^^^
+    |
+    = note: `Persist` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `lin` (lib test) generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.65s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/lib.rs (target/debug/build/lin/9b69f1e840b117a4/out/lin-9b69f1e840b117a4)
+
+running 1 test
+test persist::writer_lock_inheritance_tests::fork_child_cannot_unlock_parent_and_cannot_extend_closed_writer_lock ... FAILED
+
+failures:
+
+---- persist::writer_lock_inheritance_tests::fork_child_cannot_unlock_parent_and_cannot_extend_closed_writer_lock stdout ----
+
+thread 'persist::writer_lock_inheritance_tests::fork_child_cannot_unlock_parent_and_cannot_extend_closed_writer_lock' (76919765) panicked at src/persist.rs:436:9:
+child released its parent's live writer lock
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    persist::writer_lock_inheritance_tests::fork_child_cannot_unlock_parent_and_cannot_extend_closed_writer_lock
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 103 filtered out; finished in 0.03s
+
+error: test failed, to rerun pass `--lib`

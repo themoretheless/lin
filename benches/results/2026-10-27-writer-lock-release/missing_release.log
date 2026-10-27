@@ -1,0 +1,24 @@
+   Compiling lin v0.4.0 (/Users/themoretheless/.codex/worktrees/lin-wal-persistent-qualification/lin)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.69s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/lib.rs (target/debug/build/lin/9b69f1e840b117a4/out/lin-9b69f1e840b117a4)
+
+running 1 test
+test persist::writer_lock_inheritance_tests::fork_child_cannot_unlock_parent_and_cannot_extend_closed_writer_lock ... FAILED
+
+failures:
+
+---- persist::writer_lock_inheritance_tests::fork_child_cannot_unlock_parent_and_cannot_extend_closed_writer_lock stdout ----
+
+thread 'persist::writer_lock_inheritance_tests::fork_child_cannot_unlock_parent_and_cannot_extend_closed_writer_lock' (76919449) panicked at src/persist.rs:440:9:
+inherited descriptor kept closed writer locked
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    persist::writer_lock_inheritance_tests::fork_child_cannot_unlock_parent_and_cannot_extend_closed_writer_lock
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 103 filtered out; finished in 0.03s
+
+error: test failed, to rerun pass `--lib`
