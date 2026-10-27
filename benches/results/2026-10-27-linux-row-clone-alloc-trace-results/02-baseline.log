@@ -1,0 +1,80 @@
+skip postgres: LIN_BENCH_SKIP_PG is set
+skip mysql: LIN_BENCH_SKIP_MYSQL is set
+lin compare: N=10000 warm reads (fixture), bulk insert (schema outside timing)
+engines: Lin | SQLite(rusqlite bundled) | DuckDB(bundled) | HashMap(point get only) | Postgres(skipped) | MySQL(skipped)
+airbug dash: http://127.0.0.1:8790/
+Lin reads: prepare once / run many; filters use count (fair vs SQL COUNT(*));
+substring: Lin `title ~ "wal" | count` vs SQL LIKE '%wal%' COUNT(*);
+materialize: Lin `wing==rag | {id,title} | take all` vs SQL SELECT id,title;
+join: 10000 orders ⋈ 1000 users (Lin run_batch SoA / cursor vs SQL INNER JOIN);
+append_log: Lin `append facts` vs SQL INSERT INTO logs (append-only shape)
+airbug dash: http://127.0.0.1:8790/#/bench
+bench: compare/update_1row_1k/lin — validating and calibrating
+bench: compare/update_1row_1k/lin — measuring 8 samples
+bench: compare/update_1row_10k/lin — validating and calibrating
+bench: compare/update_1row_10k/lin — measuring 8 samples
+bench: compare/update_1row_100k/lin — validating and calibrating
+bench: compare/update_1row_100k/lin — measuring 8 samples
+# bench 1793079512656580907-2631
+
+Status: Complete
+
+| Case | Metric | Median | Unit | Scope / statistic | Observations | Processes |
+|---|---|---:|---|---|---:|---:|
+| compare/update_1row_1k/lin [candidate] | wall | 18640.0000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+| compare/update_1row_10k/lin [candidate] | wall | 34244.0000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+| compare/update_1row_100k/lin [candidate] | wall | 57823.5000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+
+# Useful work throughput
+
+| Case | Median batch throughput | Unit |
+|---|---:|---|
+| compare/update_1row_1k/lin [candidate] | 53648.1652 | stmts/s |
+| compare/update_1row_10k/lin [candidate] | 29206.8227 | stmts/s |
+| compare/update_1row_100k/lin [candidate] | 17294.3714 | stmts/s |
+
+Derived from positive wall batches and declared units per operation; zero/unavailable durations omitted.
+
+Medians above summarize observations, not pooled operation-latency percentiles. Comparisons aggregate within each process first.
+
+- Raw batches are not independent process replications. Batch averages are not individual-operation latency. CPU frequency and background load are uncontrolled.
+
+- compare/update_1row_1k/lin: some samples below half the requested duration; iteration cap or workload drift may limit precision
+
+- compare/update_1row_10k/lin: some samples below half the requested duration; iteration cap or workload drift may limit precision
+
+- compare/update_1row_100k/lin: some samples below half the requested duration; iteration cap or workload drift may limit precision
+
+PHASE {"allocation_trace":{"columns":["op","size","align","new_size","service_ns","failed"],"count":0,"enabled":false,"events":[],"fields":9,"overflow":false},"diagnostic_only":true,"handle_drop_ns":541,"kind":"update","prepared_ns":10479,"rows":1000,"stages_ns":[1383,7875,0,150,1684,0,951,0,0,0,0,0,0,0,131,8797,10239,180,361,301,321,901,140,1182,190]}
+PHASE {"allocation_trace":{"columns":["op","size","align","new_size","service_ns","failed"],"count":0,"enabled":false,"events":[],"fields":9,"overflow":false},"diagnostic_only":true,"handle_drop_ns":351,"kind":"update","prepared_ns":13636,"rows":1000,"stages_ns":[632,11923,0,60,1363,0,811,0,0,0,0,0,0,0,120,12473,13476,161,250,290,311,6803,171,902,150]}
+PHASE {"allocation_trace":{"columns":["op","size","align","new_size","service_ns","failed"],"count":0,"enabled":false,"events":[],"fields":9,"overflow":false},"diagnostic_only":true,"handle_drop_ns":370,"kind":"update","prepared_ns":12713,"rows":1000,"stages_ns":[601,10990,0,60,1312,0,772,0,0,0,0,0,0,0,70,11622,12553,161,281,301,310,5951,200,862,140]}
+PHASE {"allocation_trace":{"columns":["op","size","align","new_size","service_ns","failed"],"count":0,"enabled":false,"events":[],"fields":9,"overflow":false},"diagnostic_only":true,"handle_drop_ns":351,"kind":"update","prepared_ns":13044,"rows":1000,"stages_ns":[641,11281,0,70,1433,0,712,0,0,0,0,0,0,0,120,11902,12894,220,231,241,260,6221,260,892,130]}
+PHASE {"allocation_trace":{"columns":["op","size","align","new_size","service_ns","failed"],"count":0,"enabled":false,"events":[],"fields":9,"overflow":false},"diagnostic_only":true,"handle_drop_ns":311,"kind":"update","prepared_ns":12754,"rows":1000,"stages_ns":[531,11181,0,60,1302,0,761,0,0,0,0,0,0,0,70,11722,12613,170,240,231,220,6432,201,831,140]}
+PHASE {"allocation_trace":{"columns":["op","size","align","new_size","service_ns","failed"],"count":0,"enabled":false,"events":[],"fields":9,"overflow":false},"diagnostic_only":true,"handle_drop_ns":280,"kind":"update","prepared_ns":13125,"rows":1000,"stages_ns":[550,11462,0,50,1202,0,781,0,0,0,0,0,0,0,71,12042,12965,160,210,261,240,6772,160,792,120]}
+PHASE {"allocation_trace":{"columns":["op","size","align","new_size","service_ns","failed"],"count":0,"enabled":false,"events":[],"fields":9,"overflow":false},"diagnostic_only":true,"handle_drop_ns":291,"kind":"update","prepared_ns":12924,"rows":1000,"stages_ns":[521,11361,0,50,1302,0,812,0,0,0,0,0,0,0,70,11912,12784,160,191,230,250,6573,210,841,161]}
+PHASE {"allocation_trace":{"columns":["op","size","align","new_size","service_ns","failed"],"count":0,"enabled":false,"events":[],"fields":9,"overflow":false},"diagnostic_only":true,"handle_drop_ns":371,"kind":"update","prepared_ns":13495,"rows":1000,"stages_ns":[571,11822,0,51,1343,0,771,0,0,0,0,0,0,0,70,12412,13335,150,211,240,250,6963,210,872,121]}
+PHASE {"allocation_trace":{"columns":["op","size","align","new_size","service_ns","failed"],"count":0,"enabled":false,"events":[],"fields":9,"overflow":false},"diagnostic_only":true,"handle_drop_ns":351,"kind":"update","prepared_ns":13275,"rows":1000,"stages_ns":[601,11702,0,50,1202,0,781,0,0,0,0,0,0,0,100,12223,13124,191,210,251,241,6953,171,771,130]}
+PHASE {"allocation_trace":{"columns":["op","size","align","new_size","service_ns","failed"],"count":0,"enabled":false,"events":[],"fields":9,"overflow":false},"diagnostic_only":true,"handle_drop_ns":350,"kind":"update","prepared_ns":14036,"rows":1000,"stages_ns":[591,12483,0,60,1413,0,751,0,0,0,0,0,0,0,80,13005,13866,170,241,250,270,7514,220,942,141]}
+PHASE {"allocation_trace":{"columns":["op","size","align","new_size","service_ns","failed"],"count":0,"enabled":false,"events":[],"fields":9,"overflow":false},"diagnostic_only":true,"handle_drop_ns":301,"kind":"update","prepared_ns":14377,"rows":1000,"stages_ns":[591,12623,0,71,1232,0,852,0,0,0,0,0,0,0,131,13215,14217,150,241,280,300,7664,161,801,121]}
+PHASE {"allocation_trace":{"columns":["op","size","align","new_size","service_ns","failed"],"count":0,"enabled":false,"events":[],"fields":9,"overflow":false},"diagnostic_only":true,"handle_drop_ns":491,"kind":"update","prepared_ns":12473,"rows":10000,"stages_ns":[1413,9317,0,140,2444,0,1243,0,0,0,0,0,0,0,131,10439,12183,211,400,310,291,1052,200,1784,260]}
+PHASE {"allocation_trace":{"columns":["op","size","align","new_size","service_ns","failed"],"count":0,"enabled":false,"events":[],"fields":9,"overflow":false},"diagnostic_only":true,"handle_drop_ns":552,"kind":"update","prepared_ns":25838,"rows":10000,"stages_ns":[1533,22953,0,170,2194,0,1162,0,0,0,0,0,0,0,130,24035,25588,180,371,391,311,14878,241,1573,181]}
+PHASE {"allocation_trace":{"columns":["op","size","align","new_size","service_ns","failed"],"count":0,"enabled":false,"events":[],"fields":9,"overflow":false},"diagnostic_only":true,"handle_drop_ns":492,"kind":"update","prepared_ns":24426,"rows":10000,"stages_ns":[1423,21340,0,140,2084,0,1122,0,0,0,0,0,0,0,81,22322,24175,161,310,250,310,13676,230,1483,210]}
+PHASE {"allocation_trace":{"columns":["op","size","align","new_size","service_ns","failed"],"count":0,"enabled":false,"events":[],"fields":9,"overflow":false},"diagnostic_only":true,"handle_drop_ns":391,"kind":"update","prepared_ns":26670,"rows":10000,"stages_ns":[1804,23274,0,130,2204,0,1183,0,0,0,0,0,0,0,120,24516,26399,170,471,291,310,14847,171,1673,191]}
+PHASE {"allocation_trace":{"columns":["op","size","align","new_size","service_ns","failed"],"count":0,"enabled":false,"events":[],"fields":9,"overflow":false},"diagnostic_only":true,"handle_drop_ns":721,"kind":"update","prepared_ns":34845,"rows":10000,"stages_ns":[1542,31549,0,401,2785,0,1493,0,0,0,0,0,0,0,210,32661,34564,241,481,481,491,21270,300,1984,230]}
+PHASE {"allocation_trace":{"columns":["op","size","align","new_size","service_ns","failed"],"count":0,"enabled":false,"events":[],"fields":9,"overflow":false},"diagnostic_only":true,"handle_drop_ns":341,"kind":"update","prepared_ns":26429,"rows":10000,"stages_ns":[1373,23374,0,80,2235,0,1313,0,0,0,0,0,0,0,111,24516,25968,180,431,291,341,15178,220,1644,190]}
+PHASE {"allocation_trace":{"columns":["op","size","align","new_size","service_ns","failed"],"count":0,"enabled":false,"events":[],"fields":9,"overflow":false},"diagnostic_only":true,"handle_drop_ns":450,"kind":"update","prepared_ns":25838,"rows":10000,"stages_ns":[1312,23032,0,130,2184,0,1172,0,0,0,0,0,0,0,140,24095,25598,260,401,311,291,15048,160,1684,261]}
+PHASE {"allocation_trace":{"columns":["op","size","align","new_size","service_ns","failed"],"count":0,"enabled":false,"events":[],"fields":9,"overflow":false},"diagnostic_only":true,"handle_drop_ns":401,"kind":"update","prepared_ns":25659,"rows":10000,"stages_ns":[1553,22742,0,180,2084,0,1313,0,0,0,0,0,0,0,80,23835,25397,201,370,261,261,14707,180,1553,180]}
+PHASE {"allocation_trace":{"columns":["op","size","align","new_size","service_ns","failed"],"count":0,"enabled":false,"events":[],"fields":9,"overflow":false},"diagnostic_only":true,"handle_drop_ns":441,"kind":"update","prepared_ns":25667,"rows":10000,"stages_ns":[1362,22983,0,150,2304,0,1263,0,0,0,0,0,0,0,130,23955,25397,170,290,270,291,15108,251,1673,171]}
+PHASE {"allocation_trace":{"columns":["op","size","align","new_size","service_ns","failed"],"count":0,"enabled":false,"events":[],"fields":9,"overflow":false},"diagnostic_only":true,"handle_drop_ns":521,"kind":"update","prepared_ns":27712,"rows":10000,"stages_ns":[1283,24616,0,151,2465,0,1342,0,0,0,0,0,0,0,160,25768,27451,151,440,291,390,16250,230,1804,180]}
+PHASE {"allocation_trace":{"columns":["op","size","align","new_size","service_ns","failed"],"count":0,"enabled":false,"events":[],"fields":9,"overflow":false},"diagnostic_only":true,"handle_drop_ns":511,"kind":"update","prepared_ns":27801,"rows":10000,"stages_ns":[1463,24336,0,140,2174,0,1523,0,0,0,0,0,0,0,200,25839,27531,180,420,270,260,15800,241,1593,191]}
+PHASE {"allocation_trace":{"columns":["op","size","align","new_size","service_ns","failed"],"count":0,"enabled":false,"events":[],"fields":9,"overflow":false},"diagnostic_only":true,"handle_drop_ns":551,"kind":"update","prepared_ns":23213,"rows":100000,"stages_ns":[2405,16231,0,281,5150,0,1824,0,0,0,0,0,0,0,801,19477,22733,470,662,310,370,1653,671,3757,431]}
+PHASE {"allocation_trace":{"columns":["op","size","align","new_size","service_ns","failed"],"count":0,"enabled":false,"events":[],"fields":9,"overflow":false},"diagnostic_only":true,"handle_drop_ns":611,"kind":"update","prepared_ns":42589,"rows":100000,"stages_ns":[1672,38462,0,130,3617,0,2004,0,0,0,0,0,0,0,270,39955,42309,431,371,251,291,27331,431,2445,320]}
+PHASE {"allocation_trace":{"columns":["op","size","align","new_size","service_ns","failed"],"count":0,"enabled":false,"events":[],"fields":9,"overflow":false},"diagnostic_only":true,"handle_drop_ns":561,"kind":"update","prepared_ns":51126,"rows":100000,"stages_ns":[1974,45335,0,131,3817,0,1984,0,0,0,0,0,0,0,361,48370,50775,380,721,280,501,33002,310,2966,311]}
+PHASE {"allocation_trace":{"columns":["op","size","align","new_size","service_ns","failed"],"count":0,"enabled":false,"events":[],"fields":9,"overflow":false},"diagnostic_only":true,"handle_drop_ns":451,"kind":"update","prepared_ns":42039,"rows":100000,"stages_ns":[1672,37931,0,140,3076,0,1714,0,0,0,0,0,0,0,480,39664,41789,271,451,270,301,27832,290,2415,310]}
+PHASE {"allocation_trace":{"columns":["op","size","align","new_size","service_ns","failed"],"count":0,"enabled":false,"events":[],"fields":9,"overflow":false},"diagnostic_only":true,"handle_drop_ns":541,"kind":"update","prepared_ns":49162,"rows":100000,"stages_ns":[1733,44143,0,141,4087,0,1944,0,0,0,0,0,0,0,331,46757,48921,310,531,321,320,32450,572,2885,381]}
+PHASE {"allocation_trace":{"columns":["op","size","align","new_size","service_ns","failed"],"count":0,"enabled":false,"events":[],"fields":9,"overflow":false},"diagnostic_only":true,"handle_drop_ns":581,"kind":"update","prepared_ns":45465,"rows":100000,"stages_ns":[2334,39354,0,261,4228,0,1974,0,0,0,0,0,0,0,401,42409,44934,301,602,260,430,26470,360,3397,491]}
+PHASE {"allocation_trace":{"columns":["op","size","align","new_size","service_ns","failed"],"count":0,"enabled":false,"events":[],"fields":9,"overflow":false},"diagnostic_only":true,"handle_drop_ns":581,"kind":"update","prepared_ns":46437,"rows":100000,"stages_ns":[1523,42069,0,130,3396,0,1472,0,0,0,0,0,0,0,260,44353,46176,250,441,271,351,31910,280,2635,311]}
+PHASE {"allocation_trace":{"columns":["op","size","align","new_size","service_ns","failed"],"count":0,"enabled":false,"events":[],"fields":9,"overflow":false},"diagnostic_only":true,"handle_drop_ns":521,"kind":"update","prepared_ns":52097,"rows":100000,"stages_ns":[1814,46326,0,120,4237,0,2003,0,0,0,0,0,0,0,190,49583,51836,290,552,250,561,33062,301,3326,652]}
+PHASE {"allocation_trace":{"columns":["op","size","align","new_size","service_ns","failed"],"count":0,"enabled":false,"events":[],"fields":9,"overflow":false},"diagnostic_only":true,"handle_drop_ns":601,"kind":"update","prepared_ns":48701,"rows":100000,"stages_ns":[2084,43241,0,80,4458,0,1683,0,0,0,0,0,0,0,310,45695,48440,420,460,250,350,30748,401,3487,451]}
+PHASE {"allocation_trace":{"columns":["op","size","align","new_size","service_ns","failed"],"count":0,"enabled":false,"events":[],"fields":9,"overflow":false},"diagnostic_only":true,"handle_drop_ns":492,"kind":"update","prepared_ns":52308,"rows":100000,"stages_ns":[1723,47088,0,140,3837,0,1834,0,0,0,0,0,0,0,240,49874,51957,361,591,311,411,35667,390,2856,481]}
+PHASE {"allocation_trace":{"columns":["op","size","align","new_size","service_ns","failed"],"count":0,"enabled":false,"events":[],"fields":9,"overflow":false},"diagnostic_only":true,"handle_drop_ns":692,"kind":"update","prepared_ns":53931,"rows":100000,"stages_ns":[2424,46157,0,70,4539,0,1923,0,0,0,0,0,0,0,761,49784,53540,380,742,290,411,32201,361,3546,460]}
