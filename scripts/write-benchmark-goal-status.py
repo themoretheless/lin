@@ -124,6 +124,21 @@ lines += [
     '- [Владение Pack](../benches/results/2026-10-28-cow-rollback-owners/report.md):runtimecounts подтверждают дополнительного владельца Row;это не доказательство причины замедления или выигрыша latency.',
     '- [Полная COW-квалификация](../benches/results/2026-10-28-cow-vnext-full-engine/protocol.md),[run40588890401](https://github.com/themoretheless/lin/actions/runs/40588890401):source00c8aa9a3,67cases/2412processes/19296observations;3nativeUPDATEtargets,64контроля.444release tests/2ignored,134localsmokes и synthetic sensitivity прошли. [Полный независимо аттестованный результат](../benches/results/2026-10-28-cow-vnext-full-engine-linux/audited-report.md):все6nativeUPDATEокон прошли,выигрыш15.599–21.570%;11контрольных окон провалены,включая3скалярныхWALLin. Sourcegate false;SQLiteFULLWAL3/96,SQLiteDELETE96/96,native/readSQLite67/228,DuckDB36/36. Полный архив15183файлов проверен поSHA256. Не включено в production; повтор неизменённого кандидата не оправдан.',
 ]
+small = read('benches/results/2026-10-28-cow-small-row-inline/independent-audit.json')
+index = read('benches/results/2026-10-28-index-single-reverse-write/independent-audit.json')
+assert small['audit_complete'] and small['processes'] == 144 and small['observations'] == 1152
+assert small['failed_target_windows'] == 4 and small['failed_control_windows'] == 0
+assert index['audit_complete'] and index['processes'] == 36 and index['observations'] == 2304
+assert index['failed_target_windows'] == 5 and index['failed_control_windows'] == 0
+phase_smokes = read('benches/results/2026-10-28-cow-durable-phase-refresh/smoke-status.json')
+phase_tests = read('benches/results/2026-10-28-cow-durable-phase-refresh/test-status.json')
+assert len(phase_smokes) == 30 and all(row['exit_code'] == 0 for row in phase_smokes)
+assert phase_tests['exit_code'] == 0 and phase_tests['passed'] == 445 and phase_tests['source_restored']
+lines += [
+    '- [Двухполевой inline rejected](../benches/results/2026-10-28-cow-small-row-inline/report.md):144процесса/1152наблюдения;4/4скалярныхWALtarget окна провалены,контроли прошли. A/A9–31%;устойчивое ускорение не установлено. Прежний COW восстановлен.',
+    '- [Однократная reverse-map запись rejected](../benches/results/2026-10-28-index-single-reverse-write/report.md):36процессов/2304warmCPU наблюдения;5/8target окон смены ключа провалены,всеunchanged-key контроли прошли. Медианы3–26% не прошли frozen gate. Прежний индекс восстановлен;этот probe не измеряет полный UPDATE/WAL.',
+    '- [Профиль текущего COW](../benches/results/2026-10-28-cow-durable-phase-refresh/local-qualification.md):445release tests/2ignored инструментированного кода и30локальных full-value/reopen/phase-count smokes прошли;исходники восстановлены. [Linux run40602697359](https://github.com/themoretheless/lin/actions/runs/40602697359),source75f8f6b7f:240процессов/1920wall наблюдений с original/control/disabled/traced. Эта сводка пока не содержит завершённого Linux raw/source аудита;старые проценты фаз не переносятся на текущий COW.',
+]
 output = root / 'docs/benchmark-goal-status-2026-10-27.md'
 output.write_text('\n'.join(lines) + '\n')
 # Never expose endpoint values or credentials in the status artifact.
