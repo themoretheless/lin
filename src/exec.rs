@@ -714,6 +714,7 @@ pub struct Transaction<'a> {
     db: &'a mut Db,
     base_generation: u64,
     committed: bool,
+    aborted: bool,
     undo: Undo,
     cat_backup: Option<Catalog>,
     packs: Vec<Pack>,
@@ -724,13 +725,26 @@ pub struct Transaction<'a> {
 
 impl<'a> Transaction<'a> {
     /// Execute a source string statement within this transaction.
+    /// A failed run aborts the transaction; only rollback or Drop may follow.
     pub fn run(&mut self, src: &str) -> Result<Handle, Error> {
-        let prepared = self.db.prepare(src)?;
+        if self.aborted {
+            return Err(Error::runtime("transaction aborted: rollback required"));
+        }
+        let prepared = match self.db.prepare(src) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.aborted = true;
+                return Err(error);
+            }
+        };
         self.run_prepared(&prepared)
     }
 
     /// Prepare a query using the database catalog.
     pub fn prepare(&mut self, src: &str) -> Result<Prepared, Error> {
+        if self.aborted {
+            return Err(Error::runtime("transaction aborted: rollback required"));
+        }
         self.db.prepare(src)
     }
 
@@ -789,7 +803,19 @@ impl<'a> Transaction<'a> {
 
     /// Execute a pre-compiled query within this transaction.
     /// The returned generation is the last committed generation until commit.
+    /// Execution or quota errors abort the transaction and prevent commit.
     pub fn run_prepared(&mut self, prep: &Prepared) -> Result<Handle, Error> {
+        if self.aborted {
+            return Err(Error::runtime("transaction aborted: rollback required"));
+        }
+        let result = self.run_prepared_inner(prep);
+        if result.is_err() {
+            self.aborted = true;
+        }
+        result
+    }
+
+    fn run_prepared_inner(&mut self, prep: &Prepared) -> Result<Handle, Error> {
         if self.committed {
             return Err(Error::runtime("transaction already committed"));
         }
@@ -841,6 +867,9 @@ impl<'a> Transaction<'a> {
     /// If checkpoint maintenance fails after WAL publication, the error is
     /// returned but the transaction remains committed.
     pub fn commit(mut self) -> Result<(), Error> {
+        if self.aborted {
+            return Err(Error::runtime("transaction aborted: cannot commit"));
+        }
         if self.committed {
             return Ok(());
         }
@@ -2046,6 +2075,7 @@ impl Db {
             db: self,
             base_generation,
             committed: false,
+            aborted: false,
             undo: Undo::None,
             cat_backup: None,
             packs: Vec::new(),

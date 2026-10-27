@@ -1,0 +1,51 @@
+   Compiling lin v0.4.0 (/Users/themoretheless/.codex/worktrees/lin-wal-persistent-qualification/lin)
+    Finished `release` profile [optimized] target(s) in 10.94s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running tests/transaction_tests.rs (target/release/build/lin/637697eee04a5fd0/out/transaction_tests-637697eee04a5fd0)
+
+running 11 tests
+test test_transaction_auto_rollback_on_drop ... ok
+test test_transaction_commit_persists_changes ... ok
+test test_group_commit_failure_atomicity_lin_0210 ... ok
+test test_rollback_catalog_changes_lin_0208 ... ok
+test test_transaction_fn_helper_success_and_error ... ok
+test test_rollback_generated_ids_lin_0207 ... ok
+test test_rollback_graph_edges_lin_0206 ... ok
+test test_transaction_rollback_discards_changes ... ok
+test test_rollback_embeddings_lin_0205 ... ok
+test test_mixed_insert_update_delete_rollback_lin_0209 ... ok
+test test_transaction_durable_commit_survives_reopen ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+
+     Running tests/tx_quota_abort.rs (target/release/build/lin/a26396e0eeb10b47/out/tx_quota_abort-a26396e0eeb10b47)
+
+running 2 tests
+TX_QUOTA_PROBE {"commit_error":"runtime error: transaction aborted: cannot commit","generation":1,"journal":false,"run_error":"runtime error: transaction mutation count 1 exceeds max_tx_mutations quota 0","wal_after_rejected_write_bytes":0,"wing":"rag"}
+TX_QUOTA_PROBE {"commit_error":"runtime error: transaction aborted: cannot commit","generation":1,"journal":true,"run_error":"runtime error: transaction journal bytes 3495 exceeds max_journal_bytes quota 0","wal_after_rejected_write_bytes":0,"wing":"rag"}
+test mutation_quota_rejection_prevents_later_commit ... ok
+test journal_quota_rejection_prevents_later_commit ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/tx_wal_generation.rs (target/release/build/lin/c7c8c928293dbebe/out/tx_wal_generation-c7c8c928293dbebe)
+
+running 8 tests
+test crash_writer_child ... ok
+test in_memory_multi_write_commit_advances_generation_once ... ok
+
+running 1 test
+GEN_PROBE {"base":1,"case":"multi_commit","current":2,"follower_error":null,"wal_generations":[2]}
+GEN_PROBE {"after_rollback":1,"base":1,"case":"rollback","current":2,"follower_error":null,"wal_generations":[2]}
+test dropped_and_read_only_transactions_preserve_committed_generation ... ok
+test multi_statement_commit_is_one_contiguous_atomic_frame ... ok
+test rollback_keeps_next_wal_generation_contiguous ... ok
+
+running 1 test
+test every_truncated_commit_frame_leaves_follower_unchanged ... ok
+test abrupt_process_exit_recovers_all_or_none_of_interactive_transaction ... ok
+test checkpoint_failure_after_wal_publication_keeps_transaction_committed ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.24s
+

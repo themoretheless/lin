@@ -1,0 +1,33 @@
+use lin::{Db, Quotas};
+use std::sync::atomic::{AtomicU64, Ordering};
+static SEQ: AtomicU64 = AtomicU64::new(0);
+struct Scratch(std::path::PathBuf);
+impl Scratch {
+    fn new() -> Self {
+        let path = std::env::temp_dir().join(format!("lin-tx-quota-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
+        std::fs::create_dir(&path).unwrap(); Self(path)
+    }
+}
+impl Drop for Scratch { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
+fn rejected_write_cannot_commit(journal: bool) {
+    let root = Scratch::new();
+    let mut db = Db::open(&root.0).unwrap();
+    db.run(r#"insert docs {id:"a",uri:"u:a",body:"original",wing:"rag"}"#).unwrap();
+    let base = db.store.r#gen;
+    let original = db.store.collection("docs").to_vec();
+    let hash = db.store.get_by_id("docs", "a").unwrap()["hash"].text().unwrap().to_owned();
+    let mut quotas = Quotas::default();
+    if journal { quotas.max_journal_bytes = 0; } else { quotas.max_tx_mutations = 0; }
+    let mut db = db.with_quotas(quotas);
+    let mut tx = db.transaction().unwrap();
+    let error = tx.run(&format!(r#"update docs[id=="a"] cas "{hash}" {{wing:"sys"}}"#)).unwrap_err();
+    assert!(error.to_string().contains(if journal { "max_journal_bytes" } else { "max_tx_mutations" }));
+    let result = tx.commit();
+    eprintln!("TX_QUOTA_PROBE {}", serde_json::json!({"journal":journal,"run_error":error.to_string(),"commit_error":result.as_ref().err().map(|e|e.to_string()),"generation":db.store.r#gen,"wing":db.store.get_by_id("docs","a").unwrap()["wing"].text(),"wal_after_rejected_write_bytes":db.export_wal_since(base).unwrap().len()}));
+    assert!(result.is_err(), "a failed transaction must refuse commit");
+    assert_eq!(db.store.r#gen, base);
+    assert_eq!(db.store.collection("docs"), original);
+    assert!(db.export_wal_since(base).unwrap().is_empty());
+}
+#[test] fn mutation_quota_rejection_prevents_later_commit() { rejected_write_cannot_commit(false); }
+#[test] fn journal_quota_rejection_prevents_later_commit() { rejected_write_cannot_commit(true); }
