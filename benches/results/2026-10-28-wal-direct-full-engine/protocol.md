@@ -1,0 +1,9 @@
+# Direct MessagePack mutation writer: full-engine qualification
+
+Candidate changes only src/persist.rs: direct MessagePack UPDATE/DELETE serialization, exact positive-zero vector compaction, canonical Batch/other-Pack fallback. Baseline includes schema-WAL rejection correctness fix. Public Row alias, full rows, format codec1, CRC, canonical 16MiB quota, generation publication and Full sync remain unchanged. No incremental rollback prototype is combined with this candidate.
+
+Retain all 63 cases and unchanged thresholds of the previous wal-zero-full-engine experiment: six Full durable UPDATE/DELETE/commit targets at 1k/10k; all other 57 cases are controls including SQLite DELETE/WAL, native mutation/transaction, bulk insertion, read and Full/Normal scalar cases. Two series of six pairs, three roles, eight observations: 2268 processes,18144 observations. Each target needs 6/6 positive pairs and median gain above median absolute A/A in both series. Every control must have gain >= -max(2%,A/A) in each series. Fresh fixtures, complete readback, lifecycle/drop and synchronization policies are unchanged. No allocator tuning or preload.
+
+The exact helper passed CPU gates (12 fresh processes), 437 release tests/2 ignored, runtime negative-zero mutant and standalone production-reader compatibility. These are prerequisites, not full-engine acceptance. Batch falls back unchanged and therefore transactional commit may receive no encoding gain. The complete gate must still retain this target.
+
+Before timing: synthetic verifier sensitivity, full suite, runtime mutant, functional audit, separate uninstrumented baseline/candidate builds, 126 correctness smokes. Independent raw recomputation is mandatory. Preserve all failures and raw records. Full eight-peer objective remains false; no automatic production adoption.
