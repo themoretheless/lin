@@ -69,6 +69,29 @@ lines += [
     'Состояние выполнения CI проверяется по самим run: этот документ фиксирует объём и ссылки, а не предсказывает окончательный статус. Для принятия WAL-кандидата нужны все целевые пары и все контроли; затем требуется повтор затронутых контрактов на итоговом исправленном бинарнике. Полная цель по всем восьми peers **не достигнута**.', '',
     '## Воспроизведение сводки', '',
     '`python3 scripts/write-benchmark-goal-status.py` читает сохранённые JSON и проверяет количества/источники. Он не запускает СУБД и не заменяет независимый raw audit исходных экспериментов.']
+# Keep newer experiments separate from the historical production baseline above.
+zero = json.loads((root / 'benches/results/2026-10-27-wal-zero-full-engine-linux/independent-audit.json').read_text())
+warm = json.loads((root / 'benches/results/2026-10-27-incremental-owned-rollback/summary.json').read_text())
+alloc = json.loads((root / 'benches/results/2026-10-27-incremental-rollback-allocation/summary.json').read_text())
+assert zero['audit_complete'] and zero['processes'] == 2268 and zero['observations'] == 18144
+assert not zero['source_candidate_qualified'] and zero['failed_target_windows'] == 9 and zero['failed_control_windows'] == 12
+assert zero['candidate_peer_counts']['sqlite_wal'] == dict(wins=18, comparisons=96)
+assert warm['diagnostic_gate_passes'] and not warm['full_engine_qualified'] and warm['processes'] == 36 and warm['observations'] == 3456
+assert alloc['allocation_audit_passed'] and alloc['processes'] == 6 and alloc['windows'] == 216 and not alloc['latency_qualified'] and not alloc['peak_rss_qualified']
+lines += [
+    '', '## Дополнительные эксперименты: после исходной сводки', '',
+    'Перечисленные ниже новые данные не переаттестуют старые бинарники и не означают, что прототипы включены в main.', '',
+    '- [Positive-zero WAL, полный Linux gate: rejected](../benches/results/2026-10-27-wal-zero-full-engine-linux/report.md):2268 процессов/18144 наблюдения, независимый raw/source audit прошёл. Провалены9/12 целевых и12/114 контрольных окон; ни одна цель не прошла обе серии. SQLite FULL WAL18/96, FULL DELETE95/96; принятое ускорение отсутствует.',
+    '- [Outlined positive-zero CPU: rejected](../benches/results/2026-10-27-wal-positive-zero-outlined/report.md):1296000 кодирований; UPDATE/DELETE выигрывают около21–22%, NoVec проигрывает около4% в обеих сериях. Дорогой новый full-engine прогон этой версии не запускался.',
+    '- [Single-buffer canonical WAL: stable win not established](../benches/results/2026-10-27-wal-single-buffer/report.md):433 passed/2 ignored;3456 операций encode+CRC+write+sync с точным frame readback. Для обычного вектора Full −1.129%/−3.142%; все четыре целевых окна не прошли. Это macOS component evidence, не Linux DB transaction.',
+    '- [Physical WAL padding: несовместимость torn-tail recovery](../benches/results/2026-10-27-wal-physical-tail-feasibility/report.md):один и тот же оборванный frame с обычным EOF восстанавливается, с хвостом нулей возвращает corruption. Полный padded WAL читается. Простой set_len не принят; corruption policy не ослаблялась.',
+    '- [Schema WAL rejection correctness repair](../benches/results/2026-10-27-schema-wal-rejection/report.md):до исправления отклонённая schema-запись оставляла неверный Persist.catalog_hash и мешала reopen после успешного close. Hash публикуется после успешного append;431 passed/2 ignored. Это исправление корректности, не latency-ускорение.',
+    '- [Clone-free owned rollback: gate failed](../benches/results/2026-10-27-clone-free-owned-rollback/report.md):медианы rollback +22–25%, UPDATE-контроли прошли, но одна10k-пара −12.760% и критерий6/6 не выполнен. Потерянная пара сохранена; одинаковый прогон не повторялся ради pass.',
+    '- [Incremental owned rollback: локальный warm gate passed](../benches/results/2026-10-27-incremental-owned-rollback/report.md):434 passed/2 ignored;36 процессов/3456 наблюдений. Rollback +42–47%, все6целевых окон6/6 выше A/A, UPDATE-контроли прошли. Точный Row=BTreeMap, полный payload, sync и квоты сохранены; это ещё не whole-engine/peer acceptance.',
+    '- [Allocation requests](../benches/results/2026-10-27-incremental-rollback-allocation/report.md):6 процессов/216 окон; UPDATE+rollback154–158→72 allocations,9922–11130→5356 запрошенных байт. UPDATE-пара141 allocations/9848байт совпадает точно. Не RSS, не retained heap и не дополнительное измерение latency.',
+    '- [Fallback и wrong-order mutant](../benches/results/2026-10-27-incremental-rollback-fallback/report.md):3положительных теста; неверный порядок rebuild ловится2тестами. [FTS fold stress](../benches/results/2026-10-27-incremental-rollback-fts-fold/report.md):1200rollback,400unique failures,110Mixed undo,12000сравнений с перестроенным FTS; полные итоговые строки совпали.',
+    '- [Frozen Linux protocol](../benches/results/2026-10-27-incremental-rollback-engine/protocol.md), [run40564997553](https://github.com/themoretheless/lin/actions/runs/40564997553):67сценариев,2412процессов/19296наблюдений;5rollback targets и62контроля, включая native100k,read,durable,SQLite/DuckDB и scalarFull/Normal.134локальных smoke прошли. Итоговый source gate проверяется по завершённому артефакту; статус live run этот генератор не запрашивает. Полная цель по восьми peers остаётся открытой.',
+]
 output = root / 'docs/benchmark-goal-status-2026-10-27.md'
 output.write_text('\n'.join(lines) + '\n')
 # Never expose endpoint values or credentials in the status artifact.
