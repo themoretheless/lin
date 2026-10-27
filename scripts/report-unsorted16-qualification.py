@@ -48,6 +48,22 @@ for case, series in summary.items():
     for label, s in series.items():
         ratio = statistics.median(r['candidate_ns'] / r['candidate_sqlite_ns'] for r in s['processes'])
         lines.append(f"| {case} | {label} | {ratio:.4f} | {s['sqlite_wins']} |")
+lines += ['', '## Whole-process peak RSS', '',
+          'KiB from GNU time for the complete fixture lifecycle. '
+          'The delta compares medians; the maximum preserves isolated high-water observations. '
+          'These are process peaks, not retained-cache measurements or per-operation allocation counts.', '',
+          '| Case | Series | Baseline median KiB | Control median KiB | Candidate median KiB | Candidate delta % | Candidate max KiB |',
+          '|---|---|---:|---:|---:|---:|---:|']
+records = json.loads((p / 'process-status.json').read_text())
+for case, series in summary.items():
+    for label, s in series.items():
+        rss = s['peak_rss_kib']
+        rounds = range(1, 7) if label == 'series1' else range(7, 13)
+        maximum = max(r['peak_rss_kib'] for r in records
+                      if r['case'] == case and r['mode'] == 'candidate' and r['round'] in rounds)
+        delta = 100 * (rss['candidate'] / rss['baseline'] - 1)
+        lines.append(f"| {case} | {label} | {rss['baseline']:.0f} | {rss['control']:.0f} | "
+                     f"{rss['candidate']:.0f} | {delta:+.3f} | {maximum} |")
 lines += ['', 'Read workloads and DuckDB, PostgreSQL, MySQL, MSSQL, MongoDB, Kusto and pandas '
           'are outside this run. RSS records cover the full process lifecycle and do not establish '
           'a bound on retained allocator caches. No production setting is accepted by this report alone.', '']
