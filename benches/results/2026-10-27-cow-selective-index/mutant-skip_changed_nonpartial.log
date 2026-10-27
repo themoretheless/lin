@@ -1,0 +1,43 @@
+   Compiling lin v0.4.0 (/Users/themoretheless/.codex/worktrees/lin-wal-persistent-qualification/lin)
+warning: unused import: `super::*`
+    --> src/store.rs:4126:6
+     |
+4126 |  use super::*;
+     |      ^^^^^^^^
+     |
+     = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `patch`
+    --> src/store.rs:2935:65
+     |
+2935 |         &mut self, collection: &str, row_idx: usize, row: &Row, patch: &Row,
+     |                                                                 ^^^^^ help: if this is intentional, prefix it with an underscore: `_patch`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `lin` (lib test) generated 2 warnings (run `cargo fix --lib -p lin --tests` to apply 2 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.70s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/lib.rs (target/debug/build/lin/9b69f1e840b117a4/out/lin-9b69f1e840b117a4)
+
+running 1 test
+test store::selective_index_oracle::changed_unique_composite_partial_and_rollback_match_full_rebuild ... FAILED
+
+failures:
+
+---- store::selective_index_oracle::changed_unique_composite_partial_and_rollback_match_full_rebuild stdout ----
+
+thread 'store::selective_index_oracle::changed_unique_composite_partial_and_rollback_match_full_rebuild' (76995271) panicked at src/store.rs:4156:4:
+assertion `left == right` failed: forward docs[wing,ts]
+  left: {IndexKey([Text("rag"), Time(1)]): [0], IndexKey([Text("sys"), Time(2)]): [1]}
+ right: {IndexKey([Text("sys"), Time(1)]): [0], IndexKey([Text("sys"), Time(2)]): [1]}
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    store::selective_index_oracle::changed_unique_composite_partial_and_rollback_match_full_rebuild
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 106 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `--lib`
