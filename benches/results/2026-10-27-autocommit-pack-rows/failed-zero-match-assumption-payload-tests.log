@@ -1,0 +1,39 @@
+   Compiling lin v0.4.0 (/Users/themoretheless/.codex/worktrees/lin-wal-persistent-qualification/lin)
+warning: unused import: `super::*`
+    --> src/store.rs:4080:6
+     |
+4080 |  use super::*;
+     |      ^^^^^^^^
+     |
+     = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `super::*`
+    --> src/store.rs:4116:6
+     |
+4116 |  use super::*;
+     |      ^^^^^^^^
+
+warning: `lin` (lib test) generated 2 warnings (run `cargo fix --lib -p lin --tests` to apply 2 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.86s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/lib.rs (target/debug/build/lin/9b69f1e840b117a4/out/lin-9b69f1e840b117a4)
+
+running 1 test
+test store::autocommit_payload_oracle::full_outputs_and_replay_preserve_payloads ... FAILED
+
+failures:
+
+---- store::autocommit_payload_oracle::full_outputs_and_replay_preserve_payloads stdout ----
+
+thread 'store::autocommit_payload_oracle::full_outputs_and_replay_preserve_payloads' (77444310) panicked at src/store.rs:4128:80:
+called `Result::unwrap()` on an `Err` value: Error { message: "update: no matching row", pos: None, phase: Runtime }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    store::autocommit_payload_oracle::full_outputs_and_replay_preserve_payloads
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 109 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `--lib`
