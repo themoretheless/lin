@@ -2762,9 +2762,11 @@ impl Db {
         let scan_limit: Option<usize> = if !gpu_filter && simple_scan && first_filter.is_none() {
             let mut skip_n = 0usize;
             let mut take_n: Option<usize> = None;
+            let mut explicit_take_all = false;
             for s in &q.steps {
                 match s {
                     Step::Skip { n } => skip_n = skip_n.saturating_add((*n).max(0) as usize),
+                    Step::Take { n: None } => explicit_take_all = true,
                     Step::Take { n: Some(n) } => {
                         take_n = Some((*n).max(0) as usize);
                         break;
@@ -2774,7 +2776,7 @@ impl Db {
             }
             if let Some(t) = take_n {
                 Some(skip_n.saturating_add(t))
-            } else if allow_implicit_take {
+            } else if allow_implicit_take && !explicit_take_all {
                 Some(skip_n.saturating_add(50))
             } else {
                 None
