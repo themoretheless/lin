@@ -340,6 +340,7 @@ pub struct Persist {
     pub log: File,
     /// Advisory exclusive flock on `LOCK` — released when Persist drops.
     pub lock: File,
+    pub(crate) lock_owner_pid: u32,
     pub catalog_hash: String,
     pub writes_since_snapshot: u32,
     /// Reused WAL encode buffer (avoids per-commit alloc).
@@ -350,6 +351,97 @@ pub struct Persist {
     pub cold: bool,
     /// Cached `log` file length (avoids metadata() on every commit).
     pub log_bytes: u64,
+}
+
+impl Persist {
+    fn release_writer_lock(&self) {
+        // flock belongs to the open file description, which fork inherits.
+        // Closing our File alone leaves the lock held by a child until exec/exit.
+        // Only the process that acquired it may explicitly release it: a child
+        // dropping its inherited copy must not unlock the parent's writer.
+        #[cfg(unix)]
+        if std::process::id() == self.lock_owner_pid {
+            use std::os::fd::AsRawFd;
+            unsafe {
+                libc::flock(self.lock.as_raw_fd(), libc::LOCK_UN);
+            }
+        }
+    }
+}
+
+impl Drop for Persist {
+    fn drop(&mut self) {
+        self.release_writer_lock();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod writer_lock_inheritance_tests {
+    use super::*;
+
+    #[test]
+    fn fork_child_cannot_unlock_parent_and_cannot_extend_closed_writer_lock() {
+        let dir = std::env::temp_dir().join(format!(
+            "lin-lock-inheritance-unit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let (_, persist) =
+            crate::Store::open_with(&dir, &crate::catalog::fixture(), OpenMemOpts::default())
+                .unwrap();
+        let mut ready = [0; 2];
+        let mut finish = [0; 2];
+        assert_eq!(unsafe { libc::pipe(ready.as_mut_ptr()) }, 0);
+        assert_eq!(unsafe { libc::pipe(finish.as_mut_ptr()) }, 0);
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0);
+        if child == 0 {
+            // Exercise the exact Drop unlock path without dropping heap objects
+            // or running the engine in a forked multithreaded test process.
+            persist.release_writer_lock();
+            unsafe {
+                libc::close(ready[0]);
+                libc::close(finish[1]);
+                let mut byte = 1u8;
+                libc::write(ready[1], (&byte as *const u8).cast(), 1);
+                libc::read(finish[0], (&mut byte as *mut u8).cast(), 1);
+                libc::_exit(0);
+            }
+        }
+        unsafe {
+            libc::close(ready[1]);
+            libc::close(finish[0]);
+        }
+        let mut byte = 0u8;
+        let received = unsafe { libc::read(ready[0], (&mut byte as *mut u8).cast(), 1) };
+        let parent_still_locked = acquire_writer_lock(&dir).is_err();
+        drop(persist);
+        let reopened = acquire_writer_lock(&dir);
+        unsafe {
+            libc::write(finish[1], (&byte as *const u8).cast(), 1);
+            libc::close(finish[1]);
+            libc::close(ready[0]);
+        }
+        let mut status = 0;
+        let reaped = unsafe { libc::waitpid(child, &mut status, 0) };
+        let reopened_ok = reopened.is_ok();
+        drop(reopened);
+        fs::remove_dir_all(dir).unwrap();
+        assert_eq!(received, 1);
+        assert_eq!(reaped, child);
+        assert_eq!(status, 0);
+        assert!(
+            parent_still_locked,
+            "child released its parent's live writer lock"
+        );
+        assert!(
+            reopened_ok,
+            "inherited descriptor kept closed writer locked"
+        );
+    }
 }
 
 pub fn io_err(e: impl std::fmt::Display) -> Error {

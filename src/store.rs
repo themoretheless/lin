@@ -864,6 +864,7 @@ impl Store {
             dir: dir.to_path_buf(),
             log,
             lock,
+            lock_owner_pid: std::process::id(),
             catalog_hash: live_hash,
             writes_since_snapshot: 0,
             encode_buf: Vec::with_capacity(64 * 1024),
