@@ -1,0 +1,149 @@
+skip postgres: LIN_BENCH_SKIP_PG is set
+skip mysql: LIN_BENCH_SKIP_MYSQL is set
+lin compare: N=10000 warm reads (fixture), bulk insert (schema outside timing)
+engines: Lin | SQLite(rusqlite bundled) | DuckDB(bundled) | HashMap(point get only) | Postgres(skipped) | MySQL(skipped)
+airbug dash: http://127.0.0.1:8790/
+Lin reads: prepare once / run many; filters use count (fair vs SQL COUNT(*));
+substring: Lin `title ~ "wal" | count` vs SQL LIKE '%wal%' COUNT(*);
+materialize: Lin `wing==rag | {id,title} | take all` vs SQL SELECT id,title;
+join: 10000 orders ⋈ 1000 users (Lin run_batch SoA / cursor vs SQL INNER JOIN);
+append_log: Lin `append facts` vs SQL INSERT INTO logs (append-only shape)
+airbug dash: http://127.0.0.1:8790/#/bench
+bench: compare/update_1row_1k/lin — validating and calibrating
+bench: compare/update_1row_1k/lin — measuring 8 samples
+bench: compare/update_1row_1k/sqlite — validating and calibrating
+bench: compare/update_1row_1k/sqlite — measuring 8 samples
+bench: compare/delete_1row_1k/lin — validating and calibrating
+bench: compare/delete_1row_1k/lin — measuring 8 samples
+bench: compare/delete_1row_1k/sqlite — validating and calibrating
+bench: compare/delete_1row_1k/sqlite — measuring 8 samples
+bench: compare/update_1row_10k/lin — validating and calibrating
+bench: compare/update_1row_10k/lin — measuring 8 samples
+bench: compare/update_1row_10k/sqlite — validating and calibrating
+bench: compare/update_1row_10k/sqlite — measuring 8 samples
+bench: compare/delete_1row_10k/lin — validating and calibrating
+bench: compare/delete_1row_10k/lin — measuring 8 samples
+bench: compare/delete_1row_10k/sqlite — validating and calibrating
+bench: compare/delete_1row_10k/sqlite — measuring 8 samples
+bench: compare/update_1row_100k/lin — validating and calibrating
+bench: compare/update_1row_100k/lin — measuring 8 samples
+bench: compare/update_1row_100k/sqlite — validating and calibrating
+bench: compare/update_1row_100k/sqlite — measuring 8 samples
+bench: compare/delete_1row_100k/lin — validating and calibrating
+bench: compare/delete_1row_100k/lin — measuring 8 samples
+bench: compare/delete_1row_100k/sqlite — validating and calibrating
+bench: compare/delete_1row_100k/sqlite — measuring 8 samples
+bench: compare/tx_commit_1row_1k/lin — validating and calibrating
+bench: compare/tx_commit_1row_1k/lin — measuring 8 samples
+bench: compare/tx_commit_1row_1k/sqlite — validating and calibrating
+bench: compare/tx_commit_1row_1k/sqlite — measuring 8 samples
+bench: compare/tx_rollback_1row_1k/lin — validating and calibrating
+bench: compare/tx_rollback_1row_1k/lin — measuring 8 samples
+bench: compare/tx_rollback_1row_1k/sqlite — validating and calibrating
+bench: compare/tx_rollback_1row_1k/sqlite — measuring 8 samples
+bench: compare/tx_commit_1row_10k/lin — validating and calibrating
+bench: compare/tx_commit_1row_10k/lin — measuring 8 samples
+bench: compare/tx_commit_1row_10k/sqlite — validating and calibrating
+bench: compare/tx_commit_1row_10k/sqlite — measuring 8 samples
+bench: compare/tx_rollback_1row_10k/lin — validating and calibrating
+bench: compare/tx_rollback_1row_10k/lin — measuring 8 samples
+bench: compare/tx_rollback_1row_10k/sqlite — validating and calibrating
+bench: compare/tx_rollback_1row_10k/sqlite — measuring 8 samples
+# bench 1793058864683086203-3505
+
+Status: Complete
+
+| Case | Metric | Median | Unit | Scope / statistic | Observations | Processes |
+|---|---|---:|---|---|---:|---:|
+| compare/update_1row_1k/lin [candidate] | wall | 6585.0000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+| compare/update_1row_1k/sqlite [candidate] | wall | 3851.0000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+| compare/delete_1row_1k/lin [candidate] | wall | 12324.0000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+| compare/delete_1row_1k/sqlite [candidate] | wall | 3806.0000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+| compare/update_1row_10k/lin [candidate] | wall | 21923.0000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+| compare/update_1row_10k/sqlite [candidate] | wall | 13365.5000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+| compare/delete_1row_10k/lin [candidate] | wall | 31091.5000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+| compare/delete_1row_10k/sqlite [candidate] | wall | 13590.5000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+| compare/update_1row_100k/lin [candidate] | wall | 45944.5000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+| compare/update_1row_100k/sqlite [candidate] | wall | 31547.5000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+| compare/delete_1row_100k/lin [candidate] | wall | 57892.0000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+| compare/delete_1row_100k/sqlite [candidate] | wall | 29439.5000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+| compare/tx_commit_1row_1k/lin [candidate] | wall | 10055.5000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+| compare/tx_commit_1row_1k/sqlite [candidate] | wall | 4562.0000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+| compare/tx_rollback_1row_1k/lin [candidate] | wall | 23996.5000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+| compare/tx_rollback_1row_1k/sqlite [candidate] | wall | 7266.5000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+| compare/tx_commit_1row_10k/lin [candidate] | wall | 28959.0000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+| compare/tx_commit_1row_10k/sqlite [candidate] | wall | 17161.5000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+| compare/tx_rollback_1row_10k/lin [candidate] | wall | 38318.5000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+| compare/tx_rollback_1row_10k/sqlite [candidate] | wall | 19144.5000 | ns | current thread wall clock; scheduler included / batch_total | 8 | 1 |
+
+# Useful work throughput
+
+| Case | Median batch throughput | Unit |
+|---|---:|---|
+| compare/update_1row_1k/lin [candidate] | 152053.9405 | stmts/s |
+| compare/update_1row_1k/sqlite [candidate] | 259676.7520 | stmts/s |
+| compare/delete_1row_1k/lin [candidate] | 81146.3463 | stmts/s |
+| compare/delete_1row_1k/sqlite [candidate] | 262808.3510 | stmts/s |
+| compare/update_1row_10k/lin [candidate] | 45614.3470 | stmts/s |
+| compare/update_1row_10k/sqlite [candidate] | 74820.0258 | stmts/s |
+| compare/delete_1row_10k/lin [candidate] | 32163.2339 | stmts/s |
+| compare/delete_1row_10k/sqlite [candidate] | 73580.9775 | stmts/s |
+| compare/update_1row_100k/lin [candidate] | 21765.8697 | stmts/s |
+| compare/update_1row_100k/sqlite [candidate] | 31699.0533 | stmts/s |
+| compare/delete_1row_100k/lin [candidate] | 17275.8994 | stmts/s |
+| compare/delete_1row_100k/sqlite [candidate] | 33980.9539 | stmts/s |
+| compare/tx_commit_1row_1k/lin [candidate] | 99449.5978 | tx/s |
+| compare/tx_commit_1row_1k/sqlite [candidate] | 219215.0075 | tx/s |
+| compare/tx_rollback_1row_1k/lin [candidate] | 41686.7913 | tx/s |
+| compare/tx_rollback_1row_1k/sqlite [candidate] | 137698.1568 | tx/s |
+| compare/tx_commit_1row_10k/lin [candidate] | 34531.5802 | tx/s |
+| compare/tx_commit_1row_10k/sqlite [candidate] | 58273.5975 | tx/s |
+| compare/tx_rollback_1row_10k/lin [candidate] | 26099.2386 | tx/s |
+| compare/tx_rollback_1row_10k/sqlite [candidate] | 52266.5663 | tx/s |
+
+Derived from positive wall batches and declared units per operation; zero/unavailable durations omitted.
+
+Medians above summarize observations, not pooled operation-latency percentiles. Comparisons aggregate within each process first.
+
+- Raw batches are not independent process replications. Batch averages are not individual-operation latency. CPU frequency and background load are uncontrolled.
+
+- compare/update_1row_1k/lin: some samples below half the requested duration; iteration cap or workload drift may limit precision
+
+- compare/update_1row_1k/sqlite: some samples below half the requested duration; iteration cap or workload drift may limit precision
+
+- compare/delete_1row_1k/lin: some samples below half the requested duration; iteration cap or workload drift may limit precision
+
+- compare/delete_1row_1k/sqlite: some samples below half the requested duration; iteration cap or workload drift may limit precision
+
+- compare/update_1row_10k/lin: some samples below half the requested duration; iteration cap or workload drift may limit precision
+
+- compare/update_1row_10k/sqlite: some samples below half the requested duration; iteration cap or workload drift may limit precision
+
+- compare/delete_1row_10k/lin: some samples below half the requested duration; iteration cap or workload drift may limit precision
+
+- compare/delete_1row_10k/sqlite: some samples below half the requested duration; iteration cap or workload drift may limit precision
+
+- compare/update_1row_100k/lin: some samples below half the requested duration; iteration cap or workload drift may limit precision
+
+- compare/update_1row_100k/sqlite: some samples below half the requested duration; iteration cap or workload drift may limit precision
+
+- compare/delete_1row_100k/lin: some samples below half the requested duration; iteration cap or workload drift may limit precision
+
+- compare/delete_1row_100k/sqlite: some samples below half the requested duration; iteration cap or workload drift may limit precision
+
+- compare/tx_commit_1row_1k/lin: some samples below half the requested duration; iteration cap or workload drift may limit precision
+
+- compare/tx_commit_1row_1k/sqlite: some samples below half the requested duration; iteration cap or workload drift may limit precision
+
+- compare/tx_rollback_1row_1k/lin: some samples below half the requested duration; iteration cap or workload drift may limit precision
+
+- compare/tx_rollback_1row_1k/sqlite: some samples below half the requested duration; iteration cap or workload drift may limit precision
+
+- compare/tx_commit_1row_10k/lin: some samples below half the requested duration; iteration cap or workload drift may limit precision
+
+- compare/tx_commit_1row_10k/sqlite: some samples below half the requested duration; iteration cap or workload drift may limit precision
+
+- compare/tx_rollback_1row_10k/lin: some samples below half the requested duration; iteration cap or workload drift may limit precision
+
+- compare/tx_rollback_1row_10k/sqlite: some samples below half the requested duration; iteration cap or workload drift may limit precision
+
