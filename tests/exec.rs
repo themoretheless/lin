@@ -2224,3 +2224,31 @@ fn prepared_count_fastpaths_follow_mutations_and_catalog_filters() {
     check(&mut db, &visible, 0);
     check(&mut db, &all, 1);
 }
+
+#[test]
+fn explicit_take_all_does_not_prefetch_only_implicit_fifty_rows() {
+    let mut db = Db::empty();
+    for i in 0..73 {
+        db.run(&format!(
+            r#"insert docs {{id:"take-{i}",uri:"take://{i}",title:"row {i}",layer:"wiki"}}"#
+        ))
+        .unwrap();
+    }
+    for (query, start, count) in [
+        ("docs", 0, 50),
+        ("docs | take all", 0, 73),
+        ("docs | skip 10 | take all", 10, 63),
+        ("docs | take all | skip 10", 10, 63),
+        ("docs | { id, title } | take all", 0, 73),
+        ("docs | take all | take 7", 0, 7),
+        ("docs | take 7 | take all", 0, 7),
+        ("docs | take 0 | take all", 0, 0),
+    ] {
+        let result = db.run(query).unwrap();
+        assert_eq!(result.rows.len(), count, "{query}");
+        let expected: Vec<String> = (start..start + count)
+            .map(|i| format!("take-{i}"))
+            .collect();
+        assert_eq!(ids(&result), expected, "{query}");
+    }
+}

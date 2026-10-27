@@ -27,7 +27,14 @@ jobs:
         run: cargo check --locked --features gpu --lib --bin lin --examples
       - name: Validate all shipped WGSL with baseline capabilities
         run: cargo test --locked --features gpu --test shaders
+      - name: Validate writer lock inheritance and persistence
+        if: runner.os != 'Windows'
+        run: |
+          cargo test --locked --lib writer_lock_inheritance_tests
+          cargo test --locked --test persist
       - name: Verify CPU feature isolation
         run: cargo check --locked --no-default-features --lib --bin lin
       - name: Verify explicit CLI error without compute feature
         run: cargo test --locked --no-default-features --test compute_cli
+      - name: Verify scan limits and query semantics
+        run: cargo test --locked --test exec --test query --test optimizer_tests --test semantics_tests --test security_tests
