@@ -1,11 +1,11 @@
-name: mutation-stage-profile
+name: mutation-paired
 on:
   push:
     branches: [codex/mutation-borrowed-row-ci]
 permissions:
   contents: read
 jobs:
-  profile:
+  paired:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -16,25 +16,39 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-      - name: Prepare isolated diagnostic output
+      - name: Verify paired gate contract
+        run: |
+          python3 scripts/test-check-mutation-paired.py
+          python3 scripts/test-cargo-bench-artifact.py
+      - name: Prepare fresh owned experiment directory
         run: |
           python3 - <<'PY'
           from pathlib import Path
-          import shutil
-          src=Path('benches/results/2026-10-27-linux-fresh-phase-input')
-          dst=Path('benches/results/ci-fresh-phase')
+          import shutil,json,hashlib
+          src=Path('benches/results/2026-10-27-cow-inplace-linux-gate')
+          dst=Path('benches/results/ci-cow-inplace')
           dst.mkdir()
-          for name in ['build.py','run.py','probe.rs','report.md','cow-source-exec.rs','cow-source-store.rs','cow-source-check.rs']:
+          meta=json.loads((src/'input-provenance.json').read_text())
+          assert all(hashlib.sha256(Path(f).read_bytes()).hexdigest()==h for f,h in meta['before_sha256'].items())
+          for name in ['build.py','test.py','run.py','summarize.py','sensitivity.py','oracle.rs','candidate-exec.rs','candidate-store.rs','before-exec.rs','before-store.rs','candidate-check.rs','before-check.rs']:
               shutil.copy2(src/name,dst/name)
           PY
-      - name: Build instrumented frozen variants
-        run: python3 benches/results/ci-fresh-phase/build.py
-      - name: Profile existing fresh-fixture UPDATE path
-        run: python3 benches/results/ci-fresh-phase/run.py
-      - name: Preserve diagnostics including failure
+      - name: Check candidate and contract regressions
+        run: |
+          python3 benches/results/ci-cow-inplace/test.py
+          python3 benches/results/ci-cow-inplace/sensitivity.py
+      - name: Build frozen baseline and candidate
+        run: python3 benches/results/ci-cow-inplace/build.py
+      - name: Run two six-round A-A-B series
+        run: python3 benches/results/ci-cow-inplace/run.py
+      - name: Summarize every comparison and evaluate target
+        run: |
+          python3 benches/results/ci-cow-inplace/summarize.py
+          python3 scripts/check-mutation-paired.py benches/results/ci-cow-inplace update
+      - name: Preserve raw results including failure
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: mutation-stage-profile
-          path: benches/results/ci-fresh-phase/
+          name: mutation-paired
+          path: benches/results/ci-cow-inplace/
           if-no-files-found: error
