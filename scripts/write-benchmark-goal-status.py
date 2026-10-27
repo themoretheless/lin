@@ -110,6 +110,11 @@ lines += [
     '- [Frozen full-engine protocol](../benches/results/2026-10-28-wal-direct-batch-full-engine/protocol.md),[run40577759103](https://github.com/themoretheless/lin/actions/runs/40577759103):source696b692a7,63сценария/2268процессов/18144наблюдения.126локальных smoke прошли. [Полный Linux gate rejected](../benches/results/2026-10-28-wal-direct-batch-full-engine-linux/report.md):2/12target и8/114control окон провалены; SQLite FULL WAL11/96. Raw/source audit прошёл; принятого ускорения нет.',
     '- Замороженный генератор run40577759103 содержит старый заголовок и описательный CPU-флаг false. Это ошибка метаданных, не latency-порогов. scripts/audit-wal-direct-batch-engine.py проверяет фактический CPU gate отдельно по точному candidate hash и сохраняет исходные JSON без изменения. Независимый аудит полного Linux raw выполнен и прошёл; gate всё равно false.',
 ]
+cow = read('benches/results/2026-10-28-cow-vnext-full-engine-linux/independent-audit.json')
+assert cow['audit_complete'] and cow['processes'] == 2412 and cow['observations'] == 19296
+assert cow['failed_target_windows'] == 0 and cow['failed_control_windows'] == 11
+assert cow['source_candidate_qualified'] is False
+assert cow['candidate_peer_counts']['sqlite_wal'] == {'wins': 3, 'comparisons': 96}
 lines += [
     '', '## COW следующей версии API — разрешённое развитие', '',
     'Пользователь явно выбрал развитие COW и отдельного публичного Row для следующей версии API. [Миграция и scope](cow-row-vnext.md). Это разрешение на API-переход, не отмена correctness/performance gate.',
@@ -117,7 +122,7 @@ lines += [
     '- [Свежий warm COW vs BTreeMap](../benches/results/2026-10-28-cow-vnext-warm/report.md):36процессов/3456наблюдений;UPDATE57.624–61.046%,все6окон6/6aboveA/A. Общий diagnostic gate false:rollback10k/series1 имел5/6;пара сохранена.',
     '- [Owned undo rejected](../benches/results/2026-10-28-cow-owned-undo-warm/report.md) и [Pack-before-undo rejected](../benches/results/2026-10-28-cow-pack-before-undo-warm/report.md):обе гипотезы измерены и отклонены,исходники восстановлены. Held-result regression сохранён; полная квалификация COW по native/durable/read/peer контрактам ещё требуется.',
     '- [Владение Pack](../benches/results/2026-10-28-cow-rollback-owners/report.md):runtimecounts подтверждают дополнительного владельца Row;это не доказательство причины замедления или выигрыша latency.',
-    '- [Полная COW-квалификация](../benches/results/2026-10-28-cow-vnext-full-engine/protocol.md),[run40588890401](https://github.com/themoretheless/lin/actions/runs/40588890401):source00c8aa9a3,67cases/2412processes/19296observations;3nativeUPDATEtargets,64контроля.444release tests/2ignored,134localsmokes и synthetic sensitivity прошли. Итоговый raw/source gate ещё не аттестован этой сводкой. Аудитор scripts/audit-cow-vnext-engine.py подготовлен; его sensitivity не равна аудиту реального результата.',
+    '- [Полная COW-квалификация](../benches/results/2026-10-28-cow-vnext-full-engine/protocol.md),[run40588890401](https://github.com/themoretheless/lin/actions/runs/40588890401):source00c8aa9a3,67cases/2412processes/19296observations;3nativeUPDATEtargets,64контроля.444release tests/2ignored,134localsmokes и synthetic sensitivity прошли. [Полный независимо аттестованный результат](../benches/results/2026-10-28-cow-vnext-full-engine-linux/audited-report.md):все6nativeUPDATEокон прошли,выигрыш15.599–21.570%;11контрольных окон провалены,включая3скалярныхWALLin. Sourcegate false;SQLiteFULLWAL3/96,SQLiteDELETE96/96,native/readSQLite67/228,DuckDB36/36. Полный архив15183файлов проверен поSHA256. Не включено в production; повтор неизменённого кандидата не оправдан.',
 ]
 output = root / 'docs/benchmark-goal-status-2026-10-27.md'
 output.write_text('\n'.join(lines) + '\n')
