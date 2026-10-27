@@ -1,0 +1,7 @@
+# Integrated COW fresh-fixture phase diagnostic
+
+Current main047 plus COW-inplace, take-all and Eq/Hash. No selective-index or reverse-first reorder. Instrument actual benches/compare.rs setup_lin_write and update/delete entry points with25 inclusive stages. Three processes per operation kind, three sizes1k/10k/100k,8fresh samples per case; retain framework validation/calibration phase records too. Exactly6processes and144wall observations; phase-record count may exceed timed observation count. Logs are dumped at process exit, not during a phase span.
+
+Diagnostic only: instrumentation and begin/end bookkeeping affect wall time. No acceptance, peer-win or throughput claim comes from these numbers. Stages are inclusive; do not sum nested medians. key_of/insert_key are inside index_insert, and tail/index/FTS movement are inside store_delete. Only per-record disjoint-child subtraction estimates UPDATE unattributed time. Physical GPU and all-features qualification are outside this diagnostic.
+
+The benchmark fixture creates a non-unique docs[wing,ts] index; catalog fixture starts with no scalar indexes. Identifier/URI maps are separate. Unique-check reorder is not an applicable optimization for this fixture and was not advanced. Dense posting lists already promote to bitmap at32entries; no new promotion is proposed. Source inspection identifies count()==0 after bit removal as a candidate full-word scan; is_empty already exists in BitSet and must be measured and tested before any speed claim.

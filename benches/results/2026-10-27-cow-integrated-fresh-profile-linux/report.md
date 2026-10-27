@@ -1,0 +1,7 @@
+# Integrated COW Linux fresh phase profile
+
+Run40436906070, frozen72c21ac4bccc482a5524201e0044f27f1a29b8ea, completed success. Source is main047 plus COW-inplace and Eq/Hash/take-all integration, without rejected index skips or reverse-first reorder. Six processes,198phase records (including validation/calibration),144wall observations. Recomputed summary exactly matches the uploaded result; all saved PHASE records equal raw logs.
+
+Diagnostic only. Instrumentation/wrapper bookkeeping affects wall time; spans are inclusive and nested medians must not be added. Median-of-process-medians UPDATE1k/10k/100k prepared7.684/13.235/25.458us, index_insert1.473/2.955/6.412us, its insert_key child1.002/2.204/4.950us, row_maps0.952/1.764/2.034us. DELETE prepared17.362/32.842/63.018us; FTS tail movement8.475/15.980/32.601us is nested under tail movement and store_delete. These are not uninstrumented performance or peer-win claims.
+
+The actual fixture has one non-unique docs[wing,ts] index with two initial keys, not scalar unique ID/URI indexes. Dense scalar postings already promote to bitmap; count()==0 after removal scans every bitmap word. A bounded first-word emptiness probe is being checked independently. The naive all-word short-circuit helper has sparse/empty CPU regressions and is not accepted. Remaining DELETE FTS movement requires its own source/data-structure audit; no cause is inferred from a function label alone.
