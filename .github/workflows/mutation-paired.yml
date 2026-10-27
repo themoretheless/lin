@@ -20,41 +20,38 @@ jobs:
         run: |
           python3 scripts/test-check-mutation-paired.py
           python3 scripts/test-cargo-bench-artifact.py
-      - name: Prepare frozen integrated COW prefix candidate
+      - name: Prepare API-preserving static autocommit candidate
         run: |
           python3 - <<'PY'
           from pathlib import Path
           import shutil,json,hashlib
-          src=Path('benches/results/2026-10-27-cow-bitmap-prefix-isolated-gate')
-          dst=Path('benches/results/ci-cow-bitmap-prefix-isolated')
-          dst.mkdir()
+          src=Path('benches/results/2026-10-27-autocommit-pack-static-isolated')
+          dst=Path('benches/results/ci-autocommit-pack-static-isolated')
           meta=json.loads((src/'input-provenance.json').read_text())
           assert all(hashlib.sha256(Path(f).read_bytes()).hexdigest()==h for f,h in meta['before_sha256'].items())
-          for name in ['build.py','test.py','run.py','summarize.py','sensitivity.py','hash-undo-sensitivity.py','oracle.rs','index-oracle.rs','candidate-exec.rs','candidate-store.rs','candidate-index.rs','before-exec.rs','before-store.rs','before-index.rs','candidate-check.rs','before-check.rs','protocol.md','test-protocol.py']:
-              shutil.copy2(src/name,dst/name)
+          shutil.copytree(src,dst)
           PY
-      - name: Check candidate, protocol and sensitivity
+      - name: Check candidate, protocol and output sensitivity
         run: |
-          python3 benches/results/ci-cow-bitmap-prefix-isolated/test-protocol.py
-          python3 benches/results/ci-cow-bitmap-prefix-isolated/test.py
-          python3 benches/results/ci-cow-bitmap-prefix-isolated/sensitivity.py
-          python3 benches/results/ci-cow-bitmap-prefix-isolated/hash-undo-sensitivity.py
+          python3 benches/results/ci-autocommit-pack-static-isolated/test-protocol.py
+          python3 benches/results/ci-autocommit-pack-static-isolated/test.py
+          python3 benches/results/ci-autocommit-pack-static-isolated/test-mutant.py
       - name: Build frozen baseline and candidate
-        run: python3 benches/results/ci-cow-bitmap-prefix-isolated/build.py
+        run: python3 benches/results/ci-autocommit-pack-static-isolated/build.py
       - name: Run two case-isolated six-round A-A-B series
-        run: python3 benches/results/ci-cow-bitmap-prefix-isolated/run.py
+        run: python3 benches/results/ci-autocommit-pack-static-isolated/run.py
       - name: Summarize all comparisons and evaluate unchanged gate
         id: qualify
         run: |
-          python3 benches/results/ci-cow-bitmap-prefix-isolated/summarize.py
-          python3 scripts/check-mutation-paired.py benches/results/ci-cow-bitmap-prefix-isolated update
+          python3 benches/results/ci-autocommit-pack-static-isolated/summarize.py
+          python3 scripts/check-mutation-paired.py benches/results/ci-autocommit-pack-static-isolated update
       - name: Independently audit complete raw results
         if: ${{ always() && steps.qualify.outcome != 'skipped' }}
-        run: python3 scripts/verify-case-isolated-mutation.py benches/results/ci-cow-bitmap-prefix-isolated
+        run: python3 scripts/verify-case-isolated-mutation.py benches/results/ci-autocommit-pack-static-isolated
       - name: Preserve raw results including failures
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: mutation-paired
-          path: benches/results/ci-cow-bitmap-prefix-isolated/
+          path: benches/results/ci-autocommit-pack-static-isolated/
           if-no-files-found: error
