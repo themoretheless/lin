@@ -1,0 +1,18 @@
+# Prepared durable-mutation phase diagnostic: local functional qualification
+
+Purpose: explain the production-source SQLite FULL WAL gap measured by40503479687, not claim a new optimization. Production047 Rust source and exact Row API are restored after every build/test. No source is promoted. No Linux phase timing or performance acceptance is claimed by this local archive.
+
+Actual UPDATE/DELETE persistence uses caller-thread append_record_v1 -> write_frame -> write_frame_bytes -> durable_sync (Linux fdatasync). No persistent encoder queue is involved in this mutation path; insertion encoding is a different path. Instrument only the actual caller path, with disjoint leaf clocks for exec_program,quota,MessagePack encode,CRC,frame write,sync and rollback. A checkpoint clock is also recorded as an inclusive parent if checkpoint occurs; it must not be added to nested write/sync clocks. These fixture smoke operations show no checkpoint (seed writes remain below the32-write threshold).
+
+The diagnostic module records payload bytes, per-phase elapsed nanoseconds/call counts and whole benchmark-work invocation elapsed time into a preallocated per-thread event buffer. JSON is flushed only after run_suite returns. Benchmark start/finish and phase bookkeeping still perturb measured work. Original binary has no diagnostic module/hooks; disabled and traced labels share the same instrumented binary with collection disabled/enabled. Later Linux timing must add a second original/control label using exactly the original executable to establish A/A, and rotate all labels. No allocator tuning, sync weakening, payload omission, schema/index/FTS/embedding change or producer/consumer queue is introduced.
+
+Local correctness qualification:
+
+- Two binaries built from pinned original/instrumented source, with all four replaced source files, temporary module and compare.rs restored.
+- 72 isolated one-observation smoke processes:24 durable cases for original, instrumentation-disabled, and traced labels. Each case preserves clean-reopen full-value validation.
+-32 trace records from8 traced Lin processes. They include all work invocations (fresh validation/calibration and measurement), not just measured wall observations. SQLite traced processes contain no Lin frames. Do not label these records as32 measured samples or pair them arbitrarily with benchmark observations.
+- Every UPDATE/DELETE/commit invocation has one exec_program,encode,CRC,write and sync call; rollback has one exec_program and rollback, no encode/write/sync or payload. All observed leaf elapsed sums are bounded by whole invocation time. Disabled/original processes create no trace file.
+-407 release-profile/default-feature library and integration tests pass,2 existing ignored. This is not all-features/platform qualification.
+-Independent verify-local.py rechecks coordinates, raw wall records, phase names/calls/payload conditions, source hashes/restoration and test logs. No instrumented phase result is asserted as an uninstrumented improvement.
+
+Next: Linux native production-source diagnostic with original/control/disabled/traced labels, actual GNUtime resource records, repeated process order, both SQLite FULL DELETE/WAL controls and retained observation overhead. Report same-invocation phase distributions separately from all benchmark wall observations. Use the result to choose one new hypothesis; final source must pass uninstrumented native/read/durable controls. Original COW broad source gate40502052753 failed and remains rejected in its separate archive; this diagnostic is not a rerun of that source.
