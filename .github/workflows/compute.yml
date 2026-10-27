@@ -31,3 +31,5 @@ jobs:
         run: cargo check --locked --no-default-features --lib --bin lin
       - name: Verify explicit CLI error without compute feature
         run: cargo test --locked --no-default-features --test compute_cli
+      - name: Verify scan limits and query semantics
+        run: cargo test --locked --test exec --test query --test optimizer_tests --test semantics_tests --test security_tests
