@@ -74,6 +74,12 @@ def main():
                   failed_control_windows=sum(not row['target'] for row in failures),
                   failed_windows=failures, candidate_peer_counts=peer_counts,
                   scope='Frozen Linux bounded positive-zero full-engine experiment only; does not establish the full eight-peer objective')
+    raw_report = (artifact / 'report.md').read_text()
+    historical_heading = '# Bounded Linux WAL reservation: full-engine paired gate'
+    assert raw_report.startswith(historical_heading + '\n'), 'Unexpected frozen report format'
+    audited_report = raw_report.replace(historical_heading, '# Positive-zero MessagePack WAL: full-engine paired gate', 1)
+    audited_report += '\nThis display heading corrects a retained generator label. The original CI report and raw data remain unchanged in `wal-zero-full-engine/report.md`. CPU component acceptance remains false; this report evaluates the separate end-to-end I/O hypothesis.\n'
+    (parent / 'audited-report.md').write_text(audited_report)
     (parent / 'independent-audit.log').write_text('\n'.join(logs))
     (parent / 'independent-audit.json').write_text(json.dumps(result, indent=2) + '\n')
     print(json.dumps({key: value for key, value in result.items() if key != 'failed_windows'}, indent=2))
