@@ -1,0 +1,28 @@
+   Compiling lin v0.4.0 (/Users/themoretheless/.codex/worktrees/lin-wal-persistent-qualification/lin)
+    Finished `release` profile [optimized] target(s) in 0.73s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running tests/tx_wal_generation_probe.rs (target/release/build/lin/488868f628ea08b4/out/tx_wal_generation_probe-488868f628ea08b4)
+
+running 2 tests
+GEN_PROBE {"after_rollback":2,"base":1,"case":"rollback","current":3,"follower_error":"runtime error: apply_wal: gap — need gen 2, got 3 (follower at 1)","wal_generations":[3]}
+
+thread 'rollback_keeps_next_wal_generation_contiguous' (80281685) panicked at tests/tx_wal_generation_probe.rs:16:2:
+follower must accept next committed generation after rollback: Err(Error { message: "apply_wal: gap — need gen 2, got 3 (follower at 1)", pos: None, phase: Runtime })
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+GEN_PROBE {"base":1,"case":"multi_commit","current":3,"follower_error":"runtime error: apply_wal: gap — need gen 2, got 4 (follower at 1)","wal_generations":[4,4]}
+
+thread 'multi_statement_commit_is_one_contiguous_atomic_frame' (80281684) panicked at tests/tx_wal_generation_probe.rs:24:2:
+follower must accept transaction commit: Err(Error { message: "apply_wal: gap — need gen 2, got 4 (follower at 1)", pos: None, phase: Runtime })
+test rollback_keeps_next_wal_generation_contiguous ... FAILED
+test multi_statement_commit_is_one_contiguous_atomic_frame ... FAILED
+
+failures:
+
+failures:
+    multi_statement_commit_is_one_contiguous_atomic_frame
+    rollback_keeps_next_wal_generation_contiguous
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+error: test failed, to rerun pass `--test tx_wal_generation_probe`

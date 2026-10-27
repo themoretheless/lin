@@ -1,0 +1,20 @@
+   Compiling lin v0.4.0 (/Users/themoretheless/.codex/worktrees/lin-wal-persistent-qualification/lin)
+error: expected identifier, found reserved keyword `gen`
+ --> tests/tx_wal_generation_probe.rs:7:97
+  |
+7 | ...et mut db=Db::open(&root.0).unwrap();let gen=db.run(r#"insert docs [{id:"a",uri:"u:a",body:"a",wing:"rag"},{id:"b",uri:"u:b",body:...
+  |                                             ^^^ expected identifier, found reserved keyword
+  |
+help: escape `gen` to use it as an identifier
+  |
+7 | fn seeded()->(Scratch,Db,u64){let root=Scratch::new();let mut db=Db::open(&root.0).unwrap();let r#gen=db.run(r#"insert docs [{id:"a",uri:"u:a",body:"a",wing:"rag"},{id:"b",uri:"u:b",body:"b",wing:"rag"}]"#).unwrap().done.r#gen;(root,db,gen)}
+  |                                                                                                 ++
+
+error: expected expression, found reserved keyword `gen`
+ --> tests/tx_wal_generation_probe.rs:7:235
+  |
+7 | ...ody:"b",wing:"rag"}]"#).unwrap().done.r#gen;(root,db,gen)}
+  |                                                         ^^^ expected expression
+
+error: could not compile `lin` (test "tx_wal_generation_probe") due to 2 previous errors
+warning: build failed, waiting for other jobs to finish...

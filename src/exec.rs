@@ -712,6 +712,7 @@ pub struct ReadDb {
 /// are automatically rolled back.
 pub struct Transaction<'a> {
     db: &'a mut Db,
+    base_generation: u64,
     committed: bool,
     undo: Undo,
     cat_backup: Option<Catalog>,
@@ -787,6 +788,7 @@ impl<'a> Transaction<'a> {
     }
 
     /// Execute a pre-compiled query within this transaction.
+    /// The returned generation is the last committed generation until commit.
     pub fn run_prepared(&mut self, prep: &Prepared) -> Result<Handle, Error> {
         if self.committed {
             return Err(Error::runtime("transaction already committed"));
@@ -834,21 +836,30 @@ impl<'a> Transaction<'a> {
         self.run(src)?.scalar()
     }
 
-    /// Commit the transaction, making all mutations permanent and writing to WAL if durable.
+    /// Commit all mutations as one WAL frame and advance the generation once.
+    ///
+    /// If checkpoint maintenance fails after WAL publication, the error is
+    /// returned but the transaction remains committed.
     pub fn commit(mut self) -> Result<(), Error> {
         if self.committed {
             return Ok(());
         }
-        if let Some(p) = self.db.persist.as_mut() {
-            if self.schema_changed {
-                p.catalog_hash = crate::store::catalog_hash(&self.db.catalog);
-            }
-            for pack in self.packs.drain(..) {
+        let pack = fold_packs(std::mem::take(&mut self.packs));
+        if let Some(pack) = pack {
+            if let Some(p) = self.db.persist.as_mut() {
                 self.db.store.durable_commit(p, pack)?;
+                if self.schema_changed {
+                    p.catalog_hash = crate::store::catalog_hash(&self.db.catalog);
+                }
             }
+            self.db.store.r#gen += 1;
+        }
+        // WAL publication is the commit point. A later maintenance failure must
+        // not make Drop undo data already visible to recovery and followers.
+        self.committed = true;
+        if let Some(p) = self.db.persist.as_mut() {
             self.db.store.maybe_checkpoint(p)?;
         }
-        self.committed = true;
         Ok(())
     }
 
@@ -860,6 +871,7 @@ impl<'a> Transaction<'a> {
         let undo = std::mem::replace(&mut self.undo, Undo::None);
         let cat = self.cat_backup.take();
         self.db.rollback(undo, cat);
+        self.db.store.r#gen = self.base_generation;
         self.packs.clear();
         self.committed = true;
         Ok(())
@@ -877,6 +889,7 @@ impl Drop for Transaction<'_> {
             let undo = std::mem::replace(&mut self.undo, Undo::None);
             let cat = self.cat_backup.take();
             self.db.rollback(undo, cat);
+            self.db.store.r#gen = self.base_generation;
             self.packs.clear();
         }
     }
@@ -2028,8 +2041,10 @@ impl Db {
     /// All mutations executed through [`Transaction`] remain isolated until [`Transaction::commit`].
     /// If dropped without commit, all changes are automatically rolled back.
     pub fn transaction(&mut self) -> Result<Transaction<'_>, Error> {
+        let base_generation = self.store.r#gen;
         Ok(Transaction {
             db: self,
+            base_generation,
             committed: false,
             undo: Undo::None,
             cat_backup: None,
@@ -2073,9 +2088,6 @@ impl Db {
         } else {
             rows.len()
         };
-        if pack.is_some() {
-            self.store.r#gen += 1;
-        }
         let handle = Handle {
             plan: prepared.plan.clone(),
             done: Done {

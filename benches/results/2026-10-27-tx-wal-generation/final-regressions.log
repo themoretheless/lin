@@ -1,0 +1,18 @@
+   Compiling lin v0.4.0 (/Users/themoretheless/.codex/worktrees/lin-wal-persistent-qualification/lin)
+    Finished `release` profile [optimized] target(s) in 0.74s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running tests/tx_wal_generation.rs (target/release/build/lin/c7c8c928293dbebe/out/tx_wal_generation-c7c8c928293dbebe)
+
+running 6 tests
+test in_memory_multi_write_commit_advances_generation_once ... ok
+GEN_PROBE {"after_rollback":1,"base":1,"case":"rollback","current":2,"follower_error":null,"wal_generations":[2]}
+GEN_PROBE {"base":1,"case":"multi_commit","current":2,"follower_error":null,"wal_generations":[2]}
+test dropped_and_read_only_transactions_preserve_committed_generation ... ok
+test rollback_keeps_next_wal_generation_contiguous ... ok
+test multi_statement_commit_is_one_contiguous_atomic_frame ... ok
+test every_truncated_commit_frame_leaves_follower_unchanged ... ok
+test checkpoint_failure_after_wal_publication_keeps_transaction_committed ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+
