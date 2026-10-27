@@ -1,0 +1,59 @@
+name: map-mutation-profile
+on:
+  push:
+    branches: [codex/map-mutation-profile-ci]
+permissions:
+  contents: read
+jobs:
+  profile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Prepare exact failed-candidate profile inputs
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import json,hashlib,shutil
+          src=Path('benches/results/2026-10-27-map-output-fresh-profile')
+          dst=Path('benches/results/ci-map-output-fresh-profile')
+          meta=json.loads((src/'linux-input-provenance.json').read_text())
+          assert all(hashlib.sha256(Path(f).read_bytes()).hexdigest()==h for f,h in meta['source_sha256'].items())
+          assert hashlib.sha256(Path('benches/compare.rs').read_bytes()).hexdigest()==meta['compare_sha256']
+          dst.mkdir()
+          for name in ['probe.rs','build.py','run.py','analyze.py','linux-input-provenance.json']+[f'map-source-{n}.rs'for n in ['exec','store','check','index']]:
+              shutil.copy2(src/name,dst/name)
+          assert all(hashlib.sha256((dst/f'map-source-{n}.rs').read_bytes()).hexdigest()==h for n,h in meta['candidate_sha256'].items())
+          PY
+      - name: Build diagnostic and restore every source file
+        run: python3 benches/results/ci-map-output-fresh-profile/build.py
+      - name: Collect three fresh UPDATE and DELETE process profiles
+        run: python3 benches/results/ci-map-output-fresh-profile/run.py
+      - name: Verify raw phase records and summarize diagnostics
+        run: |
+          python3 benches/results/ci-map-output-fresh-profile/analyze.py
+          python3 - <<'PY'
+          from pathlib import Path
+          import json,hashlib
+          p=Path('benches/results/ci-map-output-fresh-profile')
+          meta=json.loads((p/'linux-input-provenance.json').read_text())
+          assert all(hashlib.sha256(Path(f).read_bytes()).hexdigest()==h for f,h in meta['source_sha256'].items())
+          assert hashlib.sha256(Path('benches/compare.rs').read_bytes()).hexdigest()==meta['compare_sha256']
+          s=json.loads((p/'summary.json').read_text())
+          assert s['diagnostic_only'] and s['wall_observations']==144 and s['phase_records']==198
+          assert all(v['inclusive_stages_ns']['program']>0 for v in s['cases'].values())
+          assert all(v['inclusive_stages_ns']['updated_row_clone']>0 for case,v in s['cases'].items()if case.startswith('update/'))
+          PY
+      - name: Preserve all diagnostic results including failures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: map-mutation-profile
+          path: benches/results/ci-map-output-fresh-profile/
+          if-no-files-found: error
