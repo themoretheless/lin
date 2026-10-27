@@ -30,3 +30,7 @@ This repairs correctness before durable mutation timing. It does not establish l
 Eight regression tests pass locally (crash-regressions.log). An actual child process exits with process::exit without destructors before or after a two-operation commit. Reopen must recover respectively generation 1 with both original values, or generation 2 with both changed values; the recovered full WAL also reconstructs identical rows on a fresh follower.
 
 The initial crash oracle incorrectly assumed codec 1 for the seed insertion, which uses supported codec 2. crash-oracle-codec-failure.log retains that test failure. Generation frame inspection now targets only the newly committed transaction; full initial and transaction bytes are still exported and applied to a fresh follower. This is process-exit recovery, not a power-loss/filesystem durability proof.
+
+## Completed Linux qualification
+
+[Run40529581051](../2026-10-27-tx-wal-generation-linux/report.md) completed successfully at frozen046226580:415 default release tests passed,2 ignored; all eight WAL/transaction regressions and both generation probes passed. Independent audit validates exact historical source hashes. This does not qualify later aborted-transaction exec changes or WAL-reserve latency.
