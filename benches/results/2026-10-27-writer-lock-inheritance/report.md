@@ -1,0 +1,7 @@
+# Deterministic writer-lock inheritance reproduction
+
+Unix macOS ARM64,main205 baseline and frozen COW in-place candidate. Three independent processes per variant. Open durable Db,insert checked data,fork child retaining inherited descriptors,close parent Db,attempt reopen before child exit,release child via pipe,waitpid,then reopen and exact-readback. Child performs only async-signal-safe libc close/read/_exit. No sleeps or probabilistic scheduling needed. Parent releases/reaps child and removes owned temp directory before asserting expected correctness.
+
+All6runs: Db::close succeeds; immediate reopen fails "data dir locked by another writer"; reopen after child exits succeeds with exact data. Process exits101 on the correctness assertion. Failure is independently reproducible on baseline,so it is not introduced by COW. This proves the inherited-descriptor lock lifetime problem; it does not uniquely prove that fork inheritance caused CI40427160286without child-lifetime telemetry there.
+
+Current Persist relies on File drop to release flock; inherited references keep the same open-file description alive. Next fix should explicitly release writer lock at the correct ownership lifecycle boundary while preserving exclusion for active writers and failure paths. Do not weaken writer exclusion,serialize/skip the failing test,add sleeps or rerun acceptance unchanged. Candidate performance remains unmeasured on Linux. Production source restored after builds.
