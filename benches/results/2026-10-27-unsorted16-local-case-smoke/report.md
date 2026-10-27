@@ -1,0 +1,5 @@
+# Local case-selection and readback smoke
+
+2026-10-27, macOS ARM64. The normal uninstrumented Map/static-output candidate binary compiled successfully; all four source files were restored (build provenance records both source sets). Each of the frozen 28 Lin/SQLite filters was then executed in a separate process with one sample, one operation and no warmup. All exited successfully, selected exactly one case, produced exactly one wall observation, and passed their existing checked readback. Native insert keeps destruction inside timing; Full-durable insert and prepared mutations retain their original outside-timing lifecycle.
+
+This is a case-selection/functional smoke only. It does not exercise glibc, does not test unsorted_limit=16, and is excluded from Linux timing acceptance. Raw wall observations are preserved for traceability; they are not paired performance evidence. Linux run 40460186460 remains the authoritative independent runtime qualification. No production configuration changed.
