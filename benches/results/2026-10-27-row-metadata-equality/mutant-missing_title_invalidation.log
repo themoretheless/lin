@@ -1,0 +1,48 @@
+   Compiling lin v0.4.0 (/Users/themoretheless/.codex/worktrees/lin-wal-persistent-qualification/lin)
+warning: unused import: `super::*`
+    --> src/store.rs:4091:6
+     |
+4091 |  use super::*;
+     |      ^^^^^^^^
+     |
+     = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `super::*`
+    --> src/store.rs:4127:6
+     |
+4127 |  use super::*;
+     |      ^^^^^^^^
+
+warning: `lin` (lib test) generated 2 warnings (run `cargo fix --lib -p lin --tests` to apply 2 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.66s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/lib.rs (target/debug/build/lin/9b69f1e840b117a4/out/lin-9b69f1e840b117a4)
+
+running 2 tests
+test store::metadata_equality_oracle::unchanged_titles_keep_packed_bytes_but_changed_title_invalidates ... FAILED
+test store::metadata_equality_oracle::metadata_matches_full_rebuild_with_stale_maps_raw_changes_and_numeric_bits ... FAILED
+
+failures:
+
+---- store::metadata_equality_oracle::unchanged_titles_keep_packed_bytes_but_changed_title_invalidates stdout ----
+
+thread 'store::metadata_equality_oracle::unchanged_titles_keep_packed_bytes_but_changed_title_invalidates' (77582487) panicked at src/store.rs:4178:178:
+assertion failed: store.docs_title_packed.get().is_none()
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- store::metadata_equality_oracle::metadata_matches_full_rebuild_with_stale_maps_raw_changes_and_numeric_bits stdout ----
+
+thread 'store::metadata_equality_oracle::metadata_matches_full_rebuild_with_stale_maps_raw_changes_and_numeric_bits' (77582486) panicked at src/store.rs:4171:20:
+assertion `left == right` failed
+  left: 0
+ right: 1
+
+
+failures:
+    store::metadata_equality_oracle::metadata_matches_full_rebuild_with_stale_maps_raw_changes_and_numeric_bits
+    store::metadata_equality_oracle::unchanged_titles_keep_packed_bytes_but_changed_title_invalidates
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 109 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `--lib`
