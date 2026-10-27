@@ -1,0 +1,136 @@
+   Compiling lin v0.4.0 (/Users/themoretheless/.codex/worktrees/lin-wal-persistent-qualification/lin)
+warning: unused import: `super::*`
+    --> src/store.rs:4111:6
+     |
+4111 |  use super::*;
+     |      ^^^^^^^^
+     |
+     = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `lin` (lib test) generated 1 warning (run `cargo fix --lib -p lin --tests` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.79s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/lib.rs (target/debug/build/lin/9b69f1e840b117a4/out/lin-9b69f1e840b117a4)
+
+running 105 tests
+test crc::tests::test_crc32c_standard_vector ... ok
+test crc::tests::test_crc32c_detects_bit_flips ... ok
+test crc::tests::test_crc32c_various_lengths_and_alignments ... ok
+test embed::tests::hashing_batch_matches_single_embedding ... ok
+test embed::tests::test_sq8_quantization_and_dot_product ... ok
+test embed::tests::test_hnsw_empty_and_single ... ok
+test catalog::tests::nested_union_queries_still_reach_the_borrow_check ... ok
+test embed::tests::embedding_text_preserves_empty_fields_and_separators ... ok
+test catalog::tests::rewrite_only_allocates_when_a_filter_applies ... ok
+test embed::tests::single_embedding_field_borrows_the_row_text ... ok
+test embed::tests::bigram_table_matches_slice_hash_for_every_byte_pair ... ok
+test exec::grouping_tests::mixed_numeric_and_text_grouping_preserves_cell_identity_across_operators ... ok
+test embed::tests::test_hnsw_remove_and_move_id ... ok
+test embed::tests::hashing_embedding_matches_original_dense_modulo_bits ... ok
+test embed::tests::sparse_normalization_preserves_dense_bits_at_exact_sum_boundary ... ok
+test exec::record_tests::bulk_worker_spawn_failure_preserves_tail_and_timestamp ... ok
+test cache::tests::test_data_structures_and_lin_integration ... ok
+test embed::tests::test_hnsw_recall_against_exhaustive ... ok
+test exec::record_tests::batch_shape_matches_reference_and_keeps_source_records ... ok
+test exec::record_tests::lexical_lowercase_preserves_ascii_unicode_context_and_field_phrases ... ok
+test embed::tests::test_hnsw_sq8_recall_and_conversion ... ok
+test exec::record_tests::prepared_insert_keeps_last_duplicate_and_dynamic_time ... ok
+test exec::record_tests::prepared_literal_storage_is_shared_and_outlives_source_and_plan ... ok
+test exec::record_tests::parallel_bulk_checks_duplicate_keys_across_worker_boundary ... ok
+test exec::record_tests::row_build_preserves_last_duplicate_and_execution_time ... ok
+test fts::pending_order_tests::ascii_lowering_and_unicode_fallback_match_original_character_mapping ... ok
+test fts::pending_order_tests::fts_matches_cow_and_ping_pong_union ... ok
+test fts::pending_order_tests::implicit_snippet_indexing_and_two_cursor_token_diff ... ok
+test fts::pending_order_tests::fused_merge_matches_two_pass_on_all_small_sets ... ok
+test fts::pending_order_tests::out_of_order_pending_edits_match_live_positions ... ok
+test exec::record_tests::wide_and_empty_shape_batches_use_reference_semantics ... ok
+test fts::tests::borrowed_tokens_deduplicate_and_normalize_across_fields_and_edits ... ok
+test fts::tests::appended_slabs_match_general_insert_after_tail_recycling ... ok
+test cache::tests::test_lru_eviction_and_ttl ... ok
+test fts::tests::optimization_measurement ... ignored, manual paired performance measurement
+test fts::tests::multi_term_candidates_match_scan_with_pending_edits ... ok
+test fts::tests::posting_codec_roundtrips_and_rejects_truncation ... ok
+test fts::tests::snippet_mutations_match_rebuilt_index ... ok
+test fts::tests::slab_normalization_scratch_matches_individual_rows ... ok
+test fts::tests::repeated_term_removal_and_reinsertion_matches_current_rows ... ok
+test index::storage_tests::index_optimization_measurement ... ignored, manual paired performance measurement
+test index::storage_tests::index_part_small_text_semantics_and_zero_alloc ... ok
+test index::storage_tests::inline_and_spilled_keys_keep_lexicographic_order_and_reverse_updates ... ok
+test index::storage_tests::test_bitmap_auto_detection ... ok
+test index::storage_tests::test_high_cardinality_no_bitmap ... ok
+test index::storage_tests::test_low_cardinality_detection ... ok
+test fts::tests::sync_token_sets_match_rebuild ... ok
+test index::storage_tests::unchanged_and_conflicting_keys_preserve_index_state ... ok
+test parse::absolute_timestamp_tests::timestamp_literals_preserve_signed_milliseconds_and_name_syntax ... ok
+test persist::dictionary_wal_tests::dictionary_materialization_keeps_empty_separate_from_null ... ok
+test persist::dictionary_wal_tests::dictionary_mixed_vector_columns_share_budget_and_preserve_bits ... ok
+test persist::dictionary_wal_tests::dictionary_mutated_payloads_never_panic ... ok
+test persist::dictionary_wal_tests::dictionary_budget_covers_metadata_vectors_and_mixed_dense_columns ... ok
+test fts::pending_order_tests::descending_and_random_edits_survive_folding_and_codec ... ok
+test fts::tests::prune_drops_stale_blobs_and_half_written_temps ... ok
+test persist::dictionary_wal_tests::dictionary_reader_does_not_enable_new_writer_codec ... ok
+test exec::record_tests::parallel_bulk_rows_preserve_order_generated_ids_and_shared_now ... ok
+test persist::dictionary_wal_tests::dictionary_roundtrip_bits_widths_none_empty_and_raw_escape ... ok
+test exec::record_tests::bulk_short_body_hash_preserves_values_at_batch_and_byte_boundaries ... ok
+test persist::persistent_encoder_queue_tests::last_worker_lease_disconnects_and_joins_thread ... ok
+test persist::dictionary_wal_tests::dictionary_rejects_bad_tables_indices_counts_ordinals_and_trailing_bytes ... ok
+test exec::preencoded_insert_tests::exact_small_float_budget_can_start_at_512_rows ... ok
+test persist::persistent_encoder_queue_tests::actual_full_and_disconnected_queues_return_job_and_preserve_encoding ... ok
+test persist::shared_vector_wire_tests::shared_vector_columns_keep_legacy_messagepack_and_share_row_storage ... ok
+test cache::tests::test_durable_persistence_across_restart ... ok
+test persist::wal_integrity_tests::column_field_union_keeps_later_extra_and_replaced_fields ... ok
+test persist::wal_integrity_tests::checksum_detects_bit_flips_in_both_codecs ... ok
+test persist::neon_sparse_writer_tests::exact_scalar_bytes_lengths_bits_and_unaligned_mask ... ok
+test persist::pure_column_encoder_tests::pure_payload_keeps_sparse_budget_failure_before_file_write ... ok
+test persist::wal_integrity_tests::every_truncated_checksummed_tail_is_ignored_but_complete_corruption_fails ... ok
+test persist::wal_integrity_tests::parallel_sparse_columns_keep_shared_decoded_budget_before_writing ... ok
+test persist::wal_integrity_tests::shared_text_columns_preserve_legacy_bytes_and_row_values ... ok
+test persist::wal_integrity_tests::row_major_column_pack_keeps_type_coercions_and_exact_wire_bytes ... ok
+test persist::dictionary_wal_tests::dictionary_torn_tails_and_complete_corruption_follow_replay_contract ... ok
+test persist::wal_integrity_tests::parallel_sparse_classifier_preserves_exact_counts_and_selection ... ok
+test persist::wal_integrity_tests::sparse_vector_decoder_rejects_dimensions_indices_and_trailing_bytes ... ok
+test persist::wal_integrity_tests::wal_hardware_crc32c_and_legacy_crc32_both_replay_cleanly ... ok
+test persist::wal_integrity_tests::parallel_sparse_rows_preserve_serial_bytes_and_worker_fallback ... ok
+test index::bitmap_sample_once_tests::sample_once_matches_per_row_reference ... ok
+test ship::tests::tls_server_name_only_comes_from_a_dns_host ... ok
+test persist::pure_column_encoder_tests::pure_payload_matches_original_frames_and_fallbacks ... ok
+test persist::wal_integrity_tests::sparse_vectors_preserve_bits_presence_and_checksum ... ok
+test store::borrowed_delete_tests::cell_equality_and_hash_contract_across_all_variants ... ok
+test store::borrowed_delete_tests::nonparallel_columns_keep_the_rebuild_fallback ... ok
+test store::borrowed_delete_tests::doc_slab_registration_matches_single_rows_with_missing_and_nontext_fields ... ok
+test persist::wal_preallocation_tests::reservation_preserves_contents_length_position_and_read_only_open ... ok
+test store::borrowed_delete_tests::sso_inline_str_and_cell_small_text_semantics ... ok
+test store::borrowed_delete_tests::borrowed_moves_match_rebuilt_rows_maps_columns_indexes_and_fts ... ok
+test store::cow_row_oracle::cloned_rows_do_not_alias_mutations_and_serde_stays_map_shaped ... ok
+test store::empty_index_slab_tests::empty_index_slab_preserves_empty_and_populated_indexes ... ok
+test store::inplace_patch_engine_oracle::held_row_isolated_and_body_hash_fts_maps_restore_on_rollback ... FAILED
+test window::tests::window_lead_lag_basic ... ok
+test window::tests::window_rank_basic ... ok
+test persist::dictionary_wal_tests::dictionary_legacy_sparse_empty_vector_survives_reopen_and_checkpoint ... ok
+test persist::dictionary_wal_tests::dictionary_reopen_fixture_and_old_reader_rejection ... ok
+test ship::tests::pull_roundtrip_ephemeral ... ok
+test ship::tests::pull_rejects_bad_token ... ok
+test ship::tests::pull_verifies_a_named_server_certificate ... ok
+test persist::prepared_metadata_tests::stale_prepared_metadata_falls_back_to_actual_record ... ok
+test exec::preencoded_insert_tests::small_work_hint_is_conservative_for_mixed_vector_dimensions ... ok
+test exec::preencoded_insert_tests::encoded_errors_defer_until_quota_and_index_checks ... ok
+test cache::tests::test_multi_node_cluster_sharding_gossip_raft_and_pubsub ... ok
+test exec::preencoded_insert_tests::shared_worker_survives_encoder_panic_and_one_database_closing ... ok
+test exec::preencoded_insert_tests::noneligible_native_small_and_explicit_transactions_stay_serial ... ok
+test exec::preencoded_insert_tests::worker_spawn_fallback_matches_normal_values_and_readonly_replay ... ok
+
+failures:
+
+---- store::inplace_patch_engine_oracle::held_row_isolated_and_body_hash_fts_maps_restore_on_rollback stdout ----
+
+thread 'store::inplace_patch_engine_oracle::held_row_isolated_and_body_hash_fts_maps_restore_on_rollback' (76873062) panicked at src/store.rs:4117:125:
+called `Result::unwrap()` on an `Err` value: Error { message: "immutable field: docs.body", pos: None, phase: Compile }
+
+
+failures:
+    store::inplace_patch_engine_oracle::held_row_isolated_and_body_hash_fts_maps_restore_on_rollback
+
+test result: FAILED. 102 passed; 1 failed; 2 ignored; 0 measured; 0 filtered out; finished in 3.52s
+
+error: test failed, to rerun pass `--lib`
