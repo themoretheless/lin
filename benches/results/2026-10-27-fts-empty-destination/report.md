@@ -1,0 +1,9 @@
+# FTS move into a known empty destination: correctness-only prototype
+
+Based on current main047, not the COW/bitmap candidate. Store.delete_rows_at first swap-removes the doomed row and removes its FTS membership, then moves the former tail into the vacated slot. That establishes an empty destination for each token. Generic FtsIndex::move_row and Store.fts_move_row are unchanged; only Store.move_deleted_tail calls the specialized method.
+
+The specialized add preserves cancellation, append and fold paths but omits base.binary_search(to). Proof: after remove_row(to) the logical live set `(base union adds) minus dels` excludes to. If cancelling dels[to] failed, to is not in dels, hence cannot be in base (nor adds); the base membership search must fail. A pending fold preserves the same live set. No tokenization, index work, readback, disk format or row payload is omitted.
+
+Stateful oracle:3field configurations x900operations =2700steps combining swap-delete/append, updates, explicit and automatic folds, Unicode, nulls and explicit/implicit snippet. After each step, complete base/adds/dels maps equal the original generic method; periodic and final effective postings equal a fresh full rebuild. Both missing-destination-add and missing-source-remove mutants fail by assertions. Full default library/integration tests: 408 passed, 2 existing ignored, including the experimental mutation_contract target. An initial oracle argument compile failure is retained separately; corrected fixture passes.
+
+This is not a performance result or production change. No timing comparison has run for this FTS prototype, it is not included in active bitmap CI40443994876, and production files were restored after every check. Its performance applicability must be measured after the current mutation hypothesis completes. No peer win or eight-engine completion is claimed.

@@ -1,0 +1,46 @@
+   Compiling lin v0.4.0 (/Users/themoretheless/.codex/worktrees/lin-wal-persistent-qualification/lin)
+warning: unused variable: `to`
+   --> src/fts.rs:262:62
+    |
+262 |     pub(crate) fn move_to_empty_slot(&mut self, from: usize, to: usize, row: &Row) {
+    |                                                              ^^ help: if this is intentional, prefix it with an underscore: `_to`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `note_add_to_empty_slot` is never used
+   --> src/fts.rs:152:8
+    |
+ 43 | impl FtsIndex {
+    | ------------- method in this implementation
+...
+152 |     fn note_add_to_empty_slot(&mut self, tok: &str, row_idx: usize) {
+    |        ^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `lin` (lib test) generated 2 warnings (run `cargo fix --lib -p lin --tests` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.60s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/lib.rs (target/debug/build/lin/9b69f1e840b117a4/out/lin-9b69f1e840b117a4)
+
+running 1 test
+test fts::empty_destination_oracle::empty_destination_matches_generic_state_and_full_rebuild_through_folds ... FAILED
+
+failures:
+
+---- fts::empty_destination_oracle::empty_destination_matches_generic_state_and_full_rebuild_through_folds stdout ----
+
+thread 'fts::empty_destination_oracle::empty_destination_matches_generic_state_and_full_rebuild_through_folds' (77371523) panicked at src/fts.rs:1281:50:
+assertion `left == right` failed
+  left: {"common": [529], "body": [529], "école": [529], "τ": [529], "shared": [529]}
+ right: {"common": [476, 529], "body": [476, 529], "term9": [476], "école": [476, 529], "2": [476], "τ": [476, 529], "shared": [476, 529]}
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    fts::empty_destination_oracle::empty_destination_matches_generic_state_and_full_rebuild_through_folds
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 104 filtered out; finished in 0.02s
+
+error: test failed, to rerun pass `--lib`
