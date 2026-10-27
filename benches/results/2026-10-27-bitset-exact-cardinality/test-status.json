@@ -1,0 +1,32 @@
+{
+  "runs": [
+    {
+      "role": "baseline",
+      "exit_code": 0,
+      "command": [
+        "cargo",
+        "test",
+        "--lib",
+        "exact_cardinality_stateful_model"
+      ]
+    },
+    {
+      "role": "candidate",
+      "exit_code": 0,
+      "command": [
+        "cargo",
+        "test",
+        "--lib",
+        "--test",
+        "exec",
+        "--test",
+        "partial_index_mutation",
+        "--test",
+        "prepared_grouped_count",
+        "--test",
+        "transaction_tests"
+      ]
+    }
+  ],
+  "source_restored": true
+}
