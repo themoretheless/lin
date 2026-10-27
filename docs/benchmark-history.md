@@ -1,5 +1,9 @@
 # Полная история бенчмарков Lin
 
+## Сводка цели на 2026-10-27
+
+[Текущие измеренные разрывы и границы квалификации](benchmark-goal-status-2026-10-27.md): отдельная сводка SQLite FULL DELETE/WAL, шести available read peers, приватного MSSQL, отсутствующего Kusto-замера, исправлений транзакций и текущего WAL-эксперимента. Исторические числа каталога ниже относятся к исходной дате сборки, а не ко всем последующим экспериментам.
+
 ## Borrowed-row Linux gate: not accepted
 
 - [Frozen6ac970ef A/A/B](../benches/results/2026-10-27-mutation-borrowed-linux/report.md):36process runs,5760timed operations; independent raw recomputation of240case-pairs. Update1k+6.005/+7.037%,10k+4.298/+1.972%,100k+3.797/+4.213%, but predeclared target/control gate fails. SQLite candidate comparisons0/120wins. No production enablement; all raw/control losses retained.
