@@ -1,0 +1,18 @@
+    Checking lin v0.4.0 (/Users/themoretheless/.codex/worktrees/lin-wal-persistent-qualification/lin)
+error[E0277]: the trait bound `BTreeMap<std::string::String, lin::Cell>: From<Row>` is not satisfied
+    --> examples/row_api_compat_probe.rs:3:50
+     |
+   3 | fn main(){let _:BTreeMap<String,Cell>=Row::new().into();}
+     |                                                  ^^^^ the trait `From<Row>` is not implemented for `BTreeMap<std::string::String, lin::Cell>`
+     |
+help: the trait `From<Row>` is not implemented for `BTreeMap<std::string::String, lin::Cell>`
+      but trait `From<[(std::string::String, lin::Cell); _]>` is implemented for it
+    --> /Users/themoretheless/.rustup/toolchains/nightly-aarch64-apple-darwin/lib/rustlib/src/rust/library/alloc/src/collections/btree/map.rs:2671:1
+     |
+2671 | impl<K: Ord, V, const N: usize> From<[(K, V); N]> for BTreeMap<K, V> {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     = help: for that trait implementation, expected `[(std::string::String, lin::Cell); _]`, found `Row`
+     = note: required for `Row` to implement `Into<BTreeMap<std::string::String, lin::Cell>>`
+
+For more information about this error, try `rustc --explain E0277`.
+error: could not compile `lin` (example "row_api_compat_probe") due to 1 previous error

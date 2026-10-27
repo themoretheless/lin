@@ -1,0 +1,23 @@
+    Checking lin v0.4.0 (/Users/themoretheless/.codex/worktrees/lin-wal-persistent-qualification/lin)
+error[E0507]: cannot move out of dereference of `Row`
+    --> examples/row_api_compat_probe.rs:2:48
+     |
+   2 | fn main(){let row=Row::new();let _:Vec<String>=row.into_keys().collect();}
+     |                                                ^^^ ----------- value moved due to this method call
+     |                                                |
+     |                                                move occurs because value has type `BTreeMap<std::string::String, lin::Cell>`, which does not implement the `Copy` trait
+     |
+note: `std::collections::BTreeMap::<K, V, A>::into_keys` takes ownership of the receiver `self`, which moves value
+    --> /Users/themoretheless/.rustup/toolchains/nightly-aarch64-apple-darwin/lib/rustlib/src/rust/library/alloc/src/collections/btree/map.rs:1689:22
+     |
+ 707 | impl<K, V, A: AllocatorClone> BTreeMap<K, V, A> {
+...
+1689 |     pub fn into_keys(self) -> IntoKeys<K, V, A> {
+     |                      ^^^^
+help: you can `clone` the value and consume it, but this might not be your desired behavior
+     |
+   2 | fn main(){let row=Row::new();let _:Vec<String>=<BTreeMap<std::string::String, lin::Cell> as Clone>::clone(&row).into_keys().collect();}
+     |                                                ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++   +
+
+For more information about this error, try `rustc --explain E0507`.
+error: could not compile `lin` (example "row_api_compat_probe") due to 1 previous error
