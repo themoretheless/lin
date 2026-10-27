@@ -1,0 +1,3 @@
+# COW vNext warm diagnostic
+
+Frozen current COW candidate vs exact corrected BTreeMap baseline6812cc5ca; same probe for both, no counting allocator. Two six-pair series,baseline/control/candidate rotation,36fresh processes/3456observations. Sizes1k/10k/100k;16samples of512alternating prepared UPDATEs plus one UPDATE/explicit rollback. Complete row,indexed count and committed generation readback outside timing; Handle/undo/Pack/drop inside. All fields and embeddings retained. Both UPDATE and rollback are targets, each window needs6/6positive pairs above median absolute A/A. Full engine/native/durable/read/peer qualification remains separate and required. Preserve all losses.

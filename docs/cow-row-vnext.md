@@ -11,3 +11,5 @@ Migration: replace implicit BTreeMap-to-Row assignments with map.into(); use Row
 Acceptance still requires full correctness/API/lifetime tests, error/rollback/alias isolation, memory lifecycle/quota checks and fresh paired native/durable/read matrices with unchanged-peer controls. Previous eager COW had failed controls; the previous lazy Linux run was incomplete. No old timing result qualifies this port.
 
 Local qualification of this port:443 default debug library/integration tests passed,2ignored. This includes the retained prototype model/isolation/ownership oracles and current transaction/crash regressions. These results establish bounded correctness coverage; no fresh performance result is claimed.
+
+`cargo check --all-targets` passed on this port in the dev profile. Release performance qualification remains pending.
