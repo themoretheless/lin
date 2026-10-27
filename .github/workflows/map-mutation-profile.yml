@@ -1,4 +1,4 @@
-name: store-derived-borrows-engine
+name: cow-broad-engine
 on:
   push:
     branches: [codex/map-mutation-profile-ci]
@@ -21,7 +21,7 @@ jobs:
           python3 - <<'PYCODE'
           from pathlib import Path
           import json,hashlib,shutil
-          src=Path('benches/results/2026-10-27-store-derived-borrows-engine');dst=Path('benches/results/ci-store-derived-borrows-engine')
+          src=Path('benches/results/2026-10-27-cow-broad-engine');dst=Path('benches/results/ci-cow-broad-engine')
           m=json.loads((src/'input-provenance.json').read_text())
           for f,h in m['source_sha256'].items():assert hashlib.sha256(Path(f).read_bytes()).hexdigest()==h,f
           for f,h in m['build_inputs_sha256'].items():assert hashlib.sha256(Path(f).read_bytes()).hexdigest()==h,f
@@ -33,25 +33,25 @@ jobs:
           shutil.copy2(src/'input-provenance.json',dst/'input-provenance.json')
           PYCODE
       - name: Check analysis protocol with synthetic raw records
-        run: python3 benches/results/ci-store-derived-borrows-engine/test-protocol.py
+        run: python3 benches/results/ci-cow-broad-engine/test-protocol.py
       - name: Functional tests for candidate source and restore sources
-        run: python3 benches/results/ci-store-derived-borrows-engine/test.py
+        run: python3 benches/results/ci-cow-broad-engine/test.py
       - name: Build baseline and candidate binaries and restore sources
-        run: python3 benches/results/ci-store-derived-borrows-engine/build.py
+        run: python3 benches/results/ci-cow-broad-engine/build.py
       - name: Run 1332 isolated processes with resource records
-        run: python3 benches/results/ci-store-derived-borrows-engine/run.py
+        run: python3 benches/results/ci-cow-broad-engine/run.py
       - name: Summarize complete data
         id: summarize
-        run: python3 benches/results/ci-store-derived-borrows-engine/summarize.py
+        run: python3 benches/results/ci-cow-broad-engine/summarize.py
       - name: Independent raw audit
         if: always() && steps.summarize.outcome == 'success'
-        run: python3 benches/results/ci-store-derived-borrows-engine/verify.py
+        run: python3 benches/results/ci-cow-broad-engine/verify.py
       - name: Enforce unchanged gate
         if: always() && steps.summarize.outcome == 'success'
-        run: python3 benches/results/ci-store-derived-borrows-engine/qualify.py
+        run: python3 benches/results/ci-cow-broad-engine/qualify.py
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: store-derived-borrows-engine
-          path: benches/results/ci-store-derived-borrows-engine/
+          name: cow-broad-engine
+          path: benches/results/ci-cow-broad-engine/
           if-no-files-found: error
