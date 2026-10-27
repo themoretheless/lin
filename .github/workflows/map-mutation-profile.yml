@@ -1,4 +1,4 @@
-name: row-clone-alloc-trace
+name: tcache-runtime-intervention
 on:
   push:
     branches: [codex/map-mutation-profile-ci]
@@ -21,39 +21,39 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
           import json,hashlib,shutil
-          src=Path('benches/results/2026-10-27-linux-row-clone-alloc-trace')
-          dst=Path('benches/results/ci-row-clone-alloc-trace')
+          src=Path('benches/results/2026-10-27-linux-tcache-intervention')
+          dst=Path('benches/results/ci-tcache-intervention')
           meta=json.loads((src/'input-provenance.json').read_text())
           assert all(hashlib.sha256(Path(f).read_bytes()).hexdigest()==h for f,h in meta['source_sha256'].items())
           assert hashlib.sha256(Path('benches/compare.rs').read_bytes()).hexdigest()==meta['compare_sha256']
           assert all(hashlib.sha256(Path(f).read_bytes()).hexdigest()==h for f,h in meta['build_inputs_sha256'].items())
           assert all(hashlib.sha256((src/n).read_bytes()).hexdigest()==h for n,h in meta['diagnostic_files_sha256'].items())
           dst.mkdir()
-          for name in ['allocation.rs','probe.rs','build.py','run.py','analyze.py','protocol.md','input-provenance.json']+[f'map-source-{n}.rs'for n in ['exec','store','check','index']]:
+          for name in ['allocation.rs','probe.rs','build.py','run.py','analyze.py','protocol.md','documentation.json','input-provenance.json']+[f'map-source-{n}.rs'for n in ['exec','store','check','index']]:
               shutil.copy2(src/name,dst/name)
           assert all(hashlib.sha256((dst/f'map-source-{n}.rs').read_bytes()).hexdigest()==h for n,h in meta['candidate_sha256'].items())
           PY
       - name: Build diagnostic and restore every source file
-        run: python3 benches/results/ci-row-clone-alloc-trace/build.py
-      - name: Collect six rotated trace-off control-off trace-on rounds
-        run: python3 benches/results/ci-row-clone-alloc-trace/run.py
+        run: python3 benches/results/ci-tcache-intervention/build.py
+      - name: Collect six rotated inherited-control count32 unsorted16 rounds
+        run: python3 benches/results/ci-tcache-intervention/run.py
       - name: Verify raw phase records and summarize diagnostics
         run: |
-          python3 benches/results/ci-row-clone-alloc-trace/analyze.py
+          python3 benches/results/ci-tcache-intervention/analyze.py
           python3 - <<'PY'
           from pathlib import Path
           import json,hashlib
-          p=Path('benches/results/ci-row-clone-alloc-trace')
+          p=Path('benches/results/ci-tcache-intervention')
           meta=json.loads((p/'input-provenance.json').read_text())
           assert all(hashlib.sha256(Path(f).read_bytes()).hexdigest()==h for f,h in meta['source_sha256'].items())
           assert hashlib.sha256(Path('benches/compare.rs').read_bytes()).hexdigest()==meta['compare_sha256']
           s=json.loads((p/'summary.json').read_text())
-          assert s['diagnostic_only'] and s['wall_observations']==432 and s['phase_records']==594
+          assert s['diagnostic_only'] and s['wall_observations']==576 and s['phase_records']==792
           PY
       - name: Preserve all diagnostic results including failures
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: row-clone-alloc-trace
-          path: benches/results/ci-row-clone-alloc-trace/
+          name: tcache-runtime-intervention
+          path: benches/results/ci-tcache-intervention/
           if-no-files-found: error
