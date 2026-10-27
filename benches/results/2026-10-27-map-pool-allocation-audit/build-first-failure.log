@@ -1,0 +1,115 @@
+   Compiling lin v0.4.0 (/Users/themoretheless/.codex/worktrees/lin-wal-persistent-qualification/lin)
+error[E0603]: module `store` is private
+  --> examples/map_pool_allocation_audit.rs:36:29
+   |
+36 |   let row=fill(&source,lin::store::acquire_row());lin::store::release_row(black_box(row));
+   |                             ^^^^^  ----------- function `acquire_row` is not publicly re-exported
+   |                             |
+   |                             private module
+   |
+note: the module `store` is defined here
+  --> src/lib.rs:70:1
+   |
+70 | mod store;
+   | ^^^^^^^^^
+
+error[E0603]: module `store` is private
+  --> examples/map_pool_allocation_audit.rs:36:56
+   |
+36 |   let row=fill(&source,lin::store::acquire_row());lin::store::release_row(black_box(row));
+   |                                                        ^^^^^  ----------- function `release_row` is not publicly re-exported
+   |                                                        |
+   |                                                        private module
+   |
+note: the module `store` is defined here
+  --> src/lib.rs:70:1
+   |
+70 | mod store;
+   | ^^^^^^^^^
+
+error[E0603]: module `store` is private
+  --> examples/map_pool_allocation_audit.rs:38:20
+   |
+38 |  let mut pool=lin::store::RowPool::new();
+   |                    ^^^^^  ------- struct `RowPool` is not publicly re-exported
+   |                    |
+   |                    private module
+   |
+note: the module `store` is defined here
+  --> src/lib.rs:70:1
+   |
+70 | mod store;
+   | ^^^^^^^^^
+
+error[E0603]: module `store` is private
+  --> examples/map_pool_allocation_audit.rs:40:30
+   |
+40 |  let check=fill(&source,lin::store::acquire_row());assert_eq!(check,source);lin::store::release_row(check);
+   |                              ^^^^^  ----------- function `acquire_row` is not publicly re-exported
+   |                              |
+   |                              private module
+   |
+note: the module `store` is defined here
+  --> src/lib.rs:70:1
+   |
+70 | mod store;
+   | ^^^^^^^^^
+
+error[E0603]: module `store` is private
+  --> examples/map_pool_allocation_audit.rs:40:82
+   |
+40 |  let check=fill(&source,lin::store::acquire_row());assert_eq!(check,source);lin::store::release_row(check);
+   |                                                                                  ^^^^^  ----------- function `release_row` is not publicly re-exported
+   |                                                                                  |
+   |                                                                                  private module
+   |
+note: the module `store` is defined here
+  --> src/lib.rs:70:1
+   |
+70 | mod store;
+   | ^^^^^^^^^
+
+error[E0603]: module `store` is private
+  --> examples/map_pool_allocation_audit.rs:47:78
+   |
+47 | ...,||{let row=fill(&source,lin::store::acquire_row());lin::store::release_row(black_box(row));}),
+   |                                  ^^^^^  ----------- function `acquire_row` is not publicly re-exported
+   |                                  |
+   |                                  private module
+   |
+note: the module `store` is defined here
+  --> src/lib.rs:70:1
+   |
+70 | mod store;
+   | ^^^^^^^^^
+
+error[E0603]: module `store` is private
+  --> examples/map_pool_allocation_audit.rs:47:105
+   |
+47 | ...n::store::acquire_row());lin::store::release_row(black_box(row));}),
+   |                                  ^^^^^  ----------- function `release_row` is not publicly re-exported
+   |                                  |
+   |                                  private module
+   |
+note: the module `store` is defined here
+  --> src/lib.rs:70:1
+   |
+70 | mod store;
+   | ^^^^^^^^^
+
+error[E0603]: module `store` is private
+  --> examples/map_pool_allocation_audit.rs:51:50
+   |
+51 |  assert!(pool.acquire().is_empty());assert!(lin::store::acquire_row().is_empty());
+   |                                                  ^^^^^  ----------- function `acquire_row` is not publicly re-exported
+   |                                                  |
+   |                                                  private module
+   |
+note: the module `store` is defined here
+  --> src/lib.rs:70:1
+   |
+70 | mod store;
+   | ^^^^^^^^^
+
+For more information about this error, try `rustc --explain E0603`.
+error: could not compile `lin` (example "map_pool_allocation_audit") due to 8 previous errors
