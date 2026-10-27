@@ -1,0 +1,37 @@
+name: transaction-quota-abort-functional
+on:
+  push:
+    branches: [codex/transaction-quota-abort-ci]
+permissions:
+  contents: read
+jobs:
+  transaction-abort:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Verify frozen correction and regression sources
+        run: |
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          import json,hashlib
+          manifest=json.loads(Path('benches/results/2026-10-27-tx-quota-abort/candidate-source.json').read_text())
+          for name,digest in manifest.items():assert hashlib.sha256(Path(name).read_bytes()).hexdigest()==digest,name
+          PYCODE
+      - name: Full release suite including aborted transactions and WAL crash recovery
+        run: |
+          mkdir -p benches/results/ci-transaction-quota-abort
+          set -o pipefail
+          cargo test --release --lib --tests -- --nocapture 2>&1 | tee benches/results/ci-transaction-quota-abort/tests.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: transaction-quota-abort-linux
+          path: benches/results/ci-transaction-quota-abort/
+          if-no-files-found: error
