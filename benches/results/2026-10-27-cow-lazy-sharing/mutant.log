@@ -1,0 +1,26 @@
+   Compiling lin v0.4.0 (/Users/themoretheless/.codex/worktrees/lin-wal-persistent-qualification/lin)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.29s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/lib.rs (target/debug/build/lin/9b69f1e840b117a4/out/lin-9b69f1e840b117a4)
+
+running 1 test
+test store::lazy_row_oracle::representation_preserves_eq_hash_wire_debug_and_snapshot_isolation ... FAILED
+
+failures:
+
+---- store::lazy_row_oracle::representation_preserves_eq_hash_wire_debug_and_snapshot_isolation stdout ----
+
+thread 'store::lazy_row_oracle::representation_preserves_eq_hash_wire_debug_and_snapshot_isolation' (79893150) panicked at src/store.rs:4138:116:
+assertion `left == right` failed
+  left: Row({"a": Float(-0.0), "b": Vec([1.0, 2.0, 3.0])})
+ right: Row({"a": Float(-0.0), "b": Vec([1.0, 2.0, 3.0])})
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    store::lazy_row_oracle::representation_preserves_eq_hash_wire_debug_and_snapshot_isolation
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 106 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--lib`
