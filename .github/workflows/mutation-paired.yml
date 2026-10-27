@@ -5,7 +5,7 @@ on:
 permissions:
   contents: read
 jobs:
-  profile:
+  paired:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -16,29 +16,45 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-      - name: Prepare frozen integrated COW phase diagnostic
+      - name: Verify paired gate contract
+        run: |
+          python3 scripts/test-check-mutation-paired.py
+          python3 scripts/test-cargo-bench-artifact.py
+      - name: Prepare frozen integrated COW prefix candidate
         run: |
           python3 - <<'PY'
           from pathlib import Path
           import shutil,json,hashlib
-          src=Path('benches/results/2026-10-27-cow-integrated-fresh-profile')
-          dst=Path('benches/results/ci-cow-integrated-fresh-profile')
+          src=Path('benches/results/2026-10-27-cow-bitmap-prefix-isolated-gate')
+          dst=Path('benches/results/ci-cow-bitmap-prefix-isolated')
           dst.mkdir()
           meta=json.loads((src/'input-provenance.json').read_text())
           assert all(hashlib.sha256(Path(f).read_bytes()).hexdigest()==h for f,h in meta['before_sha256'].items())
-          for name in ['build.py','run.py','probe.rs','analyze.py','protocol.md','input-provenance.json','cow-source-store.rs','cow-source-exec.rs','cow-source-check.rs']:
+          for name in ['build.py','test.py','run.py','summarize.py','sensitivity.py','hash-undo-sensitivity.py','oracle.rs','index-oracle.rs','candidate-exec.rs','candidate-store.rs','candidate-index.rs','before-exec.rs','before-store.rs','before-index.rs','candidate-check.rs','before-check.rs','protocol.md','test-protocol.py']:
               shutil.copy2(src/name,dst/name)
           PY
-      - name: Build phase diagnostic and restore production source
-        run: python3 benches/results/ci-cow-integrated-fresh-profile/build.py
-      - name: Profile real fresh UPDATE and DELETE fixtures
-        run: python3 benches/results/ci-cow-integrated-fresh-profile/run.py
-      - name: Verify raw phase records and summarize inclusive spans
-        run: python3 benches/results/ci-cow-integrated-fresh-profile/analyze.py
-      - name: Preserve diagnostic including failures
+      - name: Check candidate, protocol and sensitivity
+        run: |
+          python3 benches/results/ci-cow-bitmap-prefix-isolated/test-protocol.py
+          python3 benches/results/ci-cow-bitmap-prefix-isolated/test.py
+          python3 benches/results/ci-cow-bitmap-prefix-isolated/sensitivity.py
+          python3 benches/results/ci-cow-bitmap-prefix-isolated/hash-undo-sensitivity.py
+      - name: Build frozen baseline and candidate
+        run: python3 benches/results/ci-cow-bitmap-prefix-isolated/build.py
+      - name: Run two case-isolated six-round A-A-B series
+        run: python3 benches/results/ci-cow-bitmap-prefix-isolated/run.py
+      - name: Summarize all comparisons and evaluate unchanged gate
+        id: qualify
+        run: |
+          python3 benches/results/ci-cow-bitmap-prefix-isolated/summarize.py
+          python3 scripts/check-mutation-paired.py benches/results/ci-cow-bitmap-prefix-isolated update
+      - name: Independently audit complete raw results
+        if: ${{ always() && steps.qualify.outcome != 'skipped' }}
+        run: python3 scripts/verify-case-isolated-mutation.py benches/results/ci-cow-bitmap-prefix-isolated
+      - name: Preserve raw results including failures
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: mutation-paired
-          path: benches/results/ci-cow-integrated-fresh-profile/
+          path: benches/results/ci-cow-bitmap-prefix-isolated/
           if-no-files-found: error
