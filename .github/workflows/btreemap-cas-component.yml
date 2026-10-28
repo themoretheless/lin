@@ -1,0 +1,64 @@
+name: btreemap-cas-component
+on:
+  push:
+    branches: [codex/btreemap-cas-component-ci]
+permissions:
+  contents: read
+jobs:
+  benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Verify frozen BTreeMap source and stage component protocol
+        run: |
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          import json,hashlib,shutil
+          src=Path('benches/results/2026-10-28-btreemap-single-stmt-cas');dst=Path('benches/results/ci-btreemap-single-stmt-cas')
+          m=json.loads((src/'input-provenance.json').read_text())
+          for section in ['source_sha256','build_inputs_sha256']:
+              for name,digest in m[section].items():assert hashlib.sha256(Path(name).read_bytes()).hexdigest()==digest,name
+          dst.mkdir()
+          for name,digest in m['files_sha256'].items():
+              assert hashlib.sha256((src/name).read_bytes()).hexdigest()==digest,name
+              shutil.copy2(src/name,dst/name)
+          shutil.copy2(src/'input-provenance.json',dst/'input-provenance.json')
+          PYCODE
+      - name: Full release suite including exact BTreeMap API contract
+        run: python3 benches/results/ci-btreemap-single-stmt-cas/test.py
+      - name: Reject incorrect multi-statement CAS bypass and restore source
+        run: python3 benches/results/ci-btreemap-single-stmt-cas/check-mutant.py
+      - name: Build separate ordinary baseline and candidate binaries
+        run: python3 benches/results/ci-btreemap-single-stmt-cas/build.py
+      - name: Validate synthetic analysis and corruption sensitivity
+        run: python3 benches/results/ci-btreemap-single-stmt-cas/test-protocol.py
+      - name: Check all eight fresh correctness and reopen smokes
+        run: python3 benches/results/ci-btreemap-single-stmt-cas/smoke.py
+      - name: Run 144 paired isolated scalar WAL and native UPDATE processes
+        run: python3 benches/results/ci-btreemap-single-stmt-cas/run.py
+      - name: Summarize complete raw component matrix
+        run: python3 benches/results/ci-btreemap-single-stmt-cas/analyze.py
+      - name: Independently audit raw data and source compatibility
+        run: python3 benches/results/ci-btreemap-single-stmt-cas/audit.py > benches/results/ci-btreemap-single-stmt-cas/independent-audit.json
+      - name: Enforce frozen component gate
+        run: |
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          import json
+          q=json.loads(Path('benches/results/ci-btreemap-single-stmt-cas/qualification.json').read_text())
+          assert q['measurement_complete'] and q['component_gate_passes'],'Component failed; retain all raw data'
+          assert q['full_engine_qualified'] is False and q['full_objective_achieved'] is False
+          PYCODE
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: btreemap-cas-component
+          path: benches/results/ci-btreemap-single-stmt-cas/
+          if-no-files-found: error

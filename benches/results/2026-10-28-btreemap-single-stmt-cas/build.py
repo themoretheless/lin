@@ -8,6 +8,7 @@ files=[Path('src/exec.rs'),Path('benches/compare.rs')];before={f:f.read_bytes() 
 manifest=json.loads((p/'input-provenance.json').read_text());tests=json.loads((p/'test-status.json').read_text());assert tests['exit_code']==0 and tests['source_sha256']==manifest['source_sha256']
 assert all(h(Path(f).read_bytes())==v for f,v in manifest['source_sha256'].items())
 m=dict(source_commit=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),source_sha256=manifest['source_sha256'],compare_sha256=h((p/'compare.rs').read_bytes()),binaries={},instrumentation=False)
+m['original_compare_sha256']=h(before[Path('benches/compare.rs')])
 try:
  Path('benches/compare.rs').write_bytes((p/'compare.rs').read_bytes())
  for role in ['baseline','candidate']:
