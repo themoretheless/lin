@@ -162,6 +162,10 @@ assert not bulk_template['component_gate_passes'] and bulk_template['failed_targ
 cmp_coverage = read('benches/results/2026-10-28-index-single-cmp-coverage-component-linux/frozen-audit.json')
 assert cmp_coverage['audit_complete'] and cmp_coverage['processes'] == 288 and cmp_coverage['observations'] == 2304
 assert not cmp_coverage['component_gate_passes'] and cmp_coverage['failed_target_windows'] == 1 and cmp_coverage['failed_control_windows'] == 1
+delete_keys = read('benches/results/2026-10-28-delete-key-wal-component-linux/frozen-audit.json')
+assert delete_keys['audit_complete'] and delete_keys['processes'] == 288 and delete_keys['observations'] == 2304
+assert not delete_keys['component_gate_passes'] and delete_keys['failed_target_windows'] == 2 and delete_keys['failed_control_windows'] == 1
+assert delete_keys['production_golden_cases'] == 8 and delete_keys['quota_bypass_runtime_rejected']
 mssql = read('benches/results/2026-10-28-mssql-current-cow/functional-status.json')
 assert mssql['functional_raw_audit_complete'] and mssql['frozen_source_hashes_verified'] and mssql['owned_container_cleanup_verified']
 assert mssql['comparative_metrics_public'] is False and mssql['full_objective_achieved'] is False
@@ -172,6 +176,7 @@ lines += [
     '- [SoA text reuse component rejected](../benches/results/2026-10-28-cow-soa-text-reuse-component-linux/decision.md):run40615737232,324процесса/2592наблюдения;5/6target окон UPDATE и2DELETEcontrol окна провалены. UPDATE100k+11.524% прошёл одну серию,+9.432% во второй не прошёл4/6. Снижение3000→0аллокаций в отдельном методе не аттестует UPDATE.453release tests/2ignored,18Linuxsmoke и независимый raw/source audit прошли;этот код исключён из текущего кандидата.',
     '- [Bulk owned-map template rejected](../benches/results/2026-10-28-cow-bulk-map-template-component-linux/decision.md):run40616712983,288процессов/2304наблюдения;все4INSERTtarget окна и2UPDATEcontrol окна провалены. Медианы INSERT от-1.500%до+0.724%;код не принят и исключён из текущего кандидата.449release tests/2ignored,16Linuxsmoke и независимый raw/source audit прошли.',
     '- [Single-Cmp DNF bypass rejected](../benches/results/2026-10-28-index-single-cmp-coverage-component-linux/decision.md):run40617087906,288процессов/2304наблюдения;filter_eq+6.279%/+6.621%,но вторая серия5/6иDuckDBcontrol-4.107%провалены.451release tests/2ignored,16Linuxsmoke и независимый raw/source audit прошли. Код исключён из текущего DELETE-кандидата;неизменённого перезапуска нет.',
+    '- [DELETE WAL key projection rejected](../benches/results/2026-10-28-delete-key-wal-component-linux/decision.md):run40619276900,288процессов/2304наблюдения;Full DELETE+9.401–20.520%,но2/4target окна5/6иrollbackcontrol-2.358%провалены.453release tests/2ignored,16Linuxsmoke,8точных golden-byte проверок иcanonical-limit mutant прошли;raw/source audit завершён. Уменьшениебайтов не заменяет gate;код исключён из текущего индексного кандидата.',
     '- [MSSQL private refresh](../benches/results/2026-10-28-mssql-current-cow/report.md),[run40603880905](https://github.com/themoretheless/lin/actions/runs/40603880905):замороженный предшествующий COW source75f8f6b7f;native-x86 стенд завершён,локальный raw/source audit и cleanup прошли. В репозитории только encrypted archive и функциональный статус;относительные исходы приватны. Это не публичное доказательство выигрыша и не квалификация нового CAS-кандидата.',
 ]
 output = root / 'docs/benchmark-goal-status-2026-10-27.md'
