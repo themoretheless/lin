@@ -85,10 +85,19 @@ impl Embedder for HashingEmbedder {
             && texts.len().saturating_mul(self.dim) >= 4096 * 768
             && std::thread::available_parallelism().is_ok_and(|n| n.get() > 1)
         {
-            self.embed_batch_parallel(texts, false)
-        } else {
-            self.embed_batch_serial(texts)
+            return self.embed_batch_parallel(texts, false);
         }
+        EMBED_SCRATCH.with(|cell| {
+            let mut guard = cell.borrow_mut();
+            let (scratch, lower) = &mut *guard;
+            scratch.ensure_dim(self.dim);
+            let mut out = Vec::with_capacity(texts.len());
+            for text in texts {
+                self.fill(scratch, crate::fts::lowercased(text, lower));
+                out.push(scratch.finish());
+            }
+            out
+        })
     }
 }
 
