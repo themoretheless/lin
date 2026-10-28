@@ -2350,7 +2350,9 @@ impl Db {
             }
         }
         let mut bindings: BTreeMap<String, Vec<Row>> = BTreeMap::new();
-        let need_snap = stmts.iter().any(|s| {
+        // A single UPDATE/DELETE validates every target before applying writes.
+        // Pack-start conflict tracking is needed only across multiple statements.
+        let need_snap = stmts.len() > 1 && stmts.iter().any(|s| {
             matches!(
                 s,
                 Stmt::Update { cas_each: true, .. } | Stmt::Delete { cas_each: true, .. }
