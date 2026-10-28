@@ -1,0 +1,25 @@
+   Compiling lin v0.4.0 (/Users/themoretheless/.codex/worktrees/cow-row-vnext/lin)
+error: expected identifier, found reserved keyword `gen`
+  --> tests/delete_key_wal.rs:13:1280
+   |
+13 | ...b.store.collection("docs")).unwrap();let gen=db.store.r#gen;drop(db);let mut db=Db::open(&dbpath).unwrap();assert_eq!(db.store.r#...
+   |                                             ^^^ expected identifier, found reserved keyword
+   |
+help: escape `gen` to use it as an identifier
+   |
+13 | #[test]fn real_delete_retains_output_rollback_indexes_and_reopen(){let t=Temp::new();let dbpath=t.0.join("db");let mut db=Db::open(&dbpath).unwrap();db.run(r#"insert docs [{id:"a",uri:"u:a",body:"retained alpha",wing:"rag"},{id:"b",uri:"u:b",body:"retained beta",wing:"rag"}]"#).unwrap();db.run("index docs [wing]").unwrap();let held=db.run(r#"docs|id=="a""#).unwrap();let original=rmp_serde::to_vec_named(&held.rows).unwrap();let before=rmp_serde::to_vec_named(db.store.collection("docs")).unwrap();let generation=db.store.r#gen;{let mut tx=db.transaction().unwrap();let result=tx.run(r#"delete docs[id=="a"] cas each"#).unwrap();assert_eq!(rmp_serde::to_vec_named(&result.rows).unwrap(),original);tx.rollback().unwrap();}assert_eq!(db.store.r#gen,generation);assert_eq!(rmp_serde::to_vec_named(db.store.collection("docs")).unwrap(),before);let result=db.run(r#"delete docs[id=="a"] cas each"#).unwrap();assert_eq!(rmp_serde::to_vec_named(&result.rows).unwrap(),original);assert_eq!(rmp_serde::to_vec_named(&held.rows).unwrap(),original);assert_eq!(db.run(r#"docs|wing=="rag"|count"#).unwrap().rows[0]["hits"].as_int(),Some(1));assert!(db.run(r#"docs|search lex "alpha""#).unwrap().rows.is_empty());let expected=rmp_serde::to_vec_named(db.store.collection("docs")).unwrap();let r#gen=db.store.r#gen;drop(db);let mut db=Db::open(&dbpath).unwrap();assert_eq!(db.store.r#gen,gen);assert_eq!(rmp_serde::to_vec_named(db.store.collection("docs")).unwrap(),expected);assert!(db.store.get_by_id("docs","a").is_none());assert!(db.store.get_by_uri("u:a").is_none());assert_eq!(db.run(r#"docs|wing=="rag"|count"#).unwrap().rows[0]["hits"].as_int(),Some(1));}
+   |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                ++
+
+error: expected expression, found reserved keyword `gen`
+  --> tests/delete_key_wal.rs:13:1372
+   |
+13 | ...Db::open(&dbpath).unwrap();assert_eq!(db.store.r#gen,gen);assert_eq!(rmp_serde::to_vec_named(db.store.collection("docs")).unwrap(...
+   |                                                         ^^^ expected expression
+   |
+  ::: /Users/themoretheless/.rustup/toolchains/nightly-aarch64-apple-darwin/lib/rustlib/src/rust/library/core/src/macros/mod.rs:44:18
+   |
+44 |     ($left:expr, $right:expr $(,)?) => {{
+   |                  ----------- while parsing argument for this `expr` macro fragment
+
+error: could not compile `lin` (test "delete_key_wal") due to 2 previous errors
+warning: build failed, waiting for other jobs to finish...
