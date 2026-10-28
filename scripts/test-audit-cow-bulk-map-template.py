@@ -3,7 +3,7 @@ from pathlib import Path
 import importlib.util,json,tempfile,shutil,subprocess
 root=Path(__file__).resolve().parents[1];spec=importlib.util.spec_from_file_location('soa_audit',root/'scripts/audit-cow-bulk-map-template.py');a=importlib.util.module_from_spec(spec);spec.loader.exec_module(a)
 with tempfile.TemporaryDirectory(prefix='lin-bulk-independent-synthetic-')as td:
- p=Path(td);shutil.copy2(root/a.INPUT/'analyze.py',p/'analyze.py');(p/'provenance.json').write_text(json.dumps(dict(binaries={role:dict(sha256=role)for role in ['baseline','candidate']})));records=[]
+ p=Path(td);(p/'analyze.py').write_bytes(a.git(a.INPUT+'/analyze.py'));(p/'provenance.json').write_text(json.dumps(dict(binaries={role:dict(sha256=role)for role in ['baseline','candidate']})));records=[]
  for repeat in range(1,13):
   for mode in ['baseline','control','candidate']:
    for case in a.CASES:
