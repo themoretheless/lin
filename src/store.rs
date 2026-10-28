@@ -2450,9 +2450,10 @@ impl Store {
         let restored = row.clone();
         let current = std::mem::replace(slot, row);
         self.index_remove_row(collection, idx, &current);
-        self.fts_remove_row(collection, idx, &current);
         let _ = self.index_insert_row(collection, idx, &restored);
-        self.fts_insert_row(collection, idx, &restored);
+        if let Some(fts) = self.fts.get_mut(collection) {
+            fts.sync_row(idx, &current, &restored);
+        }
         self.row_maps_sync_updated(collection, idx, &current, &restored);
     }
 
