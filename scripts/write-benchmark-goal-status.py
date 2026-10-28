@@ -193,6 +193,11 @@ assert hashing['audit_complete'] and hashing['processes'] == 324 and hashing['ob
 assert not hashing['component_gate_passes'] and hashing['failed_target_windows'] == 2 and hashing['failed_control_windows'] == 1
 assert hashing['parallel_host_eligible'] and hashing['serial_body_preserved'] and hashing['worker_order_runtime_mutant_rejected']
 lines += ['- [Parallel hashing batch rejected](../benches/results/2026-10-28-hashing-batch-parallel-component-linux/report.md): run40626189213,324процесса/2592наблюдения. Bulk INSERT10k: -33.890%/-32.935%,обе серии0/6positive;Normal UPDATE control серии2 -4.876% также провален.452release tests/2ignored,18Linuxsmoke,order mutant и независимый raw/source audit прошли. Все2064файла сохранены сSHA256;embed.rs восстановлен кa7d4b02c3. CPU/RSS измерены для всего свежего процесса,не одной операции;неизменённого перезапуска и production adoption нет.']
+serial_bulk = read('benches/results/2026-10-28-bulk-serial-row-build-component-linux/frozen-audit.json')
+assert serial_bulk['audit_complete'] and serial_bulk['processes'] == 324 and serial_bulk['observations'] == 2592
+assert not serial_bulk['component_gate_passes'] and serial_bulk['failed_target_windows'] == 2 and serial_bulk['failed_control_windows'] == 2
+assert serial_bulk['serial_row_build_only'] and serial_bulk['dropped_tail_runtime_mutant_rejected']
+lines += ['- [Serial bulk row construction rejected](../benches/results/2026-10-28-bulk-serial-row-build-component-linux/report.md): run40629229553,324процесса/2592наблюдения. INSERT10k: -0.281%/-5.336%,3/6и0/6positive;INSERT1kcontrol-2.525% иfilter_eqcontrol-3.895%также провалены.449release tests/2ignored,18Linuxsmoke,tail-loss mutant и независимый raw/source audit прошли. Все2067файлов сохранены сSHA256;exec.rs восстановлен кa7d4b02c3. Уменьшение whole-process system CPU не заменяет latency gate;неизменённого перезапуска и adoption нет.']
 output = root / 'docs/benchmark-goal-status-2026-10-27.md'
 output.write_text('\n'.join(lines) + '\n')
 # Never expose endpoint values or credentials in the status artifact.
