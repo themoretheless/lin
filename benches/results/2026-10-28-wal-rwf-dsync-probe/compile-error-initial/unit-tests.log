@@ -1,0 +1,14 @@
+   Compiling lin v0.4.0 (/Users/themoretheless/.codex/worktrees/lin-wal-persistent-qualification/lin)
+error[E0277]: `?` couldn't convert the error: `ErrorKind: StdError` is not satisfied
+  --> examples/wal_rwf_dsync_probe.rs:48:204
+   |
+48 | ...?;Ok(args.get(i+1).ok_or(io::ErrorKind::InvalidInput)?.as_str())};
+   |                       ----------------------------------^ the trait `StdError` is not implemented for `ErrorKind`
+   |                       |
+   |                       this has type `Result<_, ErrorKind>`
+   |
+   = note: the question mark operation (`?`) implicitly performs a conversion on the error value using the `From` trait
+   = note: required for `Box<dyn StdError>` to implement `From<ErrorKind>`
+
+For more information about this error, try `rustc --explain E0277`.
+error: could not compile `lin` (example "wal_rwf_dsync_probe" test) due to 1 previous error
