@@ -6589,7 +6589,7 @@ fn append_batch_shape_rows(rows: &mut Vec<Row>, records: &[Record], now: i64) {
         .fields
         .iter()
         .map(|(key, _)| (key.clone(), Cell::Null))
-        .collect::<Row>();
+        .collect::<BTreeMap<String, Cell>>();
     let slots = template
         .keys()
         .map(|key| {
@@ -6615,7 +6615,7 @@ fn append_batch_shape_rows(rows: &mut Vec<Row>, records: &[Record], now: i64) {
         for (cell, &source) in row.values_mut().zip(&slots) {
             *cell = value_cell(&record.fields[source].1, now);
         }
-        rows.push(row);
+        rows.push(Row::from(row));
     }
 }
 
