@@ -198,6 +198,11 @@ assert serial_bulk['audit_complete'] and serial_bulk['processes'] == 324 and ser
 assert not serial_bulk['component_gate_passes'] and serial_bulk['failed_target_windows'] == 2 and serial_bulk['failed_control_windows'] == 2
 assert serial_bulk['serial_row_build_only'] and serial_bulk['dropped_tail_runtime_mutant_rejected']
 lines += ['- [Serial bulk row construction rejected](../benches/results/2026-10-28-bulk-serial-row-build-component-linux/report.md): run40629229553,324процесса/2592наблюдения. INSERT10k: -0.281%/-5.336%,3/6и0/6positive;INSERT1kcontrol-2.525% иfilter_eqcontrol-3.895%также провалены.449release tests/2ignored,18Linuxsmoke,tail-loss mutant и независимый raw/source audit прошли. Все2067файлов сохранены сSHA256;exec.rs восстановлен кa7d4b02c3. Уменьшение whole-process system CPU не заменяет latency gate;неизменённого перезапуска и adoption нет.']
+embed_phases = read('benches/results/2026-10-28-bulk-embedding-phases-linux/frozen-audit.json')
+assert embed_phases['audit_complete'] and embed_phases['processes'] == 48 and embed_phases['wall_observations'] == 384
+assert not embed_phases['performance_qualified'] and embed_phases['source_overlays_match_reversible_ledger']
+assert embed_phases['instrumented_release_tests'] == 449 and embed_phases['correctness_smokes'] == 6
+lines += ['- [Embedding subphase audit complete](../benches/results/2026-10-28-bulk-embedding-phases-linux/interpretation.md): run40631973188,sourcea7d4b02c3,48процессов/384wall observations/132trace invocations. На10k vector allocation/copy15.304% instrumented INSERT wall,feature hashing7.343%. Traced/disabled1.1548/1.1811на10k/1k:накладные расходы существенны,точные доли обычного бинарника не установлены.449release tests/2ignored,6Linuxsmokes и независимый raw/source audit прошли;318файлов сохранены сSHA256. Это выбор следующей гипотезы,не оптимизация или peer qualification.']
 output = root / 'docs/benchmark-goal-status-2026-10-27.md'
 output.write_text('\n'.join(lines) + '\n')
 # Never expose endpoint values or credentials in the status artifact.
