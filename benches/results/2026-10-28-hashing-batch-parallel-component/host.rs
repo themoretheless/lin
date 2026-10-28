@@ -1,0 +1,1 @@
+fn main(){let cpus=std::thread::available_parallelism().unwrap().get();assert!(cpus>1,"paired parallel target requires at least two available CPUs");println!("{{\"rust_available_parallelism\":{cpus},\"target_rows\":10000,\"target_dim\":768,\"parallel_target_enabled\":true}}");}

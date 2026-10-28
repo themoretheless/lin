@@ -1,0 +1,62 @@
+name: hashing-batch-parallel-component
+on:
+  push:
+    branches: [codex/hashing-batch-parallel-ci]
+permissions:
+  contents: read
+jobs:
+  component:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Verify frozen source and component assets
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import json,hashlib
+          p=Path('benches/results/2026-10-28-hashing-batch-parallel-component')
+          for name,digest in json.loads((p/'frozen-inputs.json').read_text()).items():assert hashlib.sha256(Path(name).read_bytes()).hexdigest()==digest,name
+          PY
+      - name: Validate synthetic matrix and failure sensitivity
+        run: python3 benches/results/2026-10-28-hashing-batch-parallel-component/test-protocol.py
+      - name: Require two Rust-visible CPUs for the parallel target
+        run: |
+          rustc benches/results/2026-10-28-hashing-batch-parallel-component/host.rs -o /tmp/lin-hashing-host
+          /tmp/lin-hashing-host > benches/results/2026-10-28-hashing-batch-parallel-component/host.json
+      - name: Full release suite
+        run: python3 benches/results/2026-10-28-hashing-batch-parallel-component/test.py
+      - name: Reject reversed worker output and restore source
+        run: python3 benches/results/2026-10-28-hashing-batch-parallel-component/check-mutant.py
+      - name: Build ordinary paired binaries
+        run: python3 benches/results/2026-10-28-hashing-batch-parallel-component/build.py
+      - name: Validate all 18 fresh correctness smokes
+        run: python3 benches/results/2026-10-28-hashing-batch-parallel-component/smoke.py
+      - name: Record kernel and filesystem
+        run: |
+          uname -a > benches/results/2026-10-28-hashing-batch-parallel-component/linux-environment.txt
+          findmnt -T /tmp -o TARGET,SOURCE,FSTYPE,OPTIONS >> benches/results/2026-10-28-hashing-batch-parallel-component/linux-environment.txt
+      - name: Run 324 isolated paired processes
+        run: python3 benches/results/2026-10-28-hashing-batch-parallel-component/run.py
+      - name: Recompute complete raw matrix
+        run: python3 benches/results/2026-10-28-hashing-batch-parallel-component/analyze.py
+      - name: Enforce frozen component gate
+        run: |
+          python3 - <<'PY'
+          import json
+          q=json.load(open('benches/results/2026-10-28-hashing-batch-parallel-component/qualification.json'))
+          assert q['measurement_complete'] and q['component_gate_passes'],'Component failed: retain all raw observations'
+          assert not q['full_engine_qualified'] and not q['full_objective_achieved']
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hashing-batch-parallel-component
+          path: benches/results/2026-10-28-hashing-batch-parallel-component/
+          if-no-files-found: error
