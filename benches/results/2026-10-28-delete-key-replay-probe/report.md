@@ -1,0 +1,20 @@
+# DELETE replay-key representation diagnostic
+
+No production code changes. Eight standalone fixture cases encode the existing canonical Pack::Delete format twice: full selectors and identity projection. The three selectors reference two distinct rows (one repeated selector). Every prefix retains full rows with768float embeddings. Both WAL streams replay through the current reader; serialized surviving rows/IEEE bits,generation,next_id,CRC rejection and selected docs lookup/SoA observations match.
+
+|Case|Full DELETE frame bytes|Projected frame bytes|Survivors|
+|---|---:|---:|---:|
+|id_uri|12200|215|6|
+|uri_only|12131|146|6|
+|stale_id_uri_fallback|12218|233|6|
+|facts_tuple|12258|273|6|
+|facts_missing_part|12198|213|6|
+|custom_id|12202|217|6|
+|custom_no_identity|12058|12058|8|
+|nested_batch|12238|253|6|
+
+Projection retains both id and uri when present,plus s/p/o for facts. URI fallback is explicitly tested with a stale id. Arbitrary non-facts rows without text id/uri retain the full original selector; that control keeps identical frame length and deletes nothing. Nested Batch is covered. No new WAL opcode is used.
+
+This is a bounded current-reader replay diagnostic,not DB DELETE or a production codec. It does not verify old-reader compatibility,output/rollback ownership,index/FTS semantics across a real transaction,quota/canonical16MiB rejection behavior,crash/power-loss recovery or performance. Those are required before any candidate integration. No byte reduction is reported as latency improvement. Original unmodified production source hashes and compiled probe hash are recorded;all temporary example sources were removed.
+
+Complete encoded streams and expected surviving-row bytes are preserved in fixtures.tar.gz with every archive member verified. Source reference remains the current frozen COW+CAS plus separate single-Cmp experiment;that index change is unrelated to the replay representation.
