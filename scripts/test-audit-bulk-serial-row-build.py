@@ -40,4 +40,39 @@ with tempfile.TemporaryDirectory(prefix='lin-serial-bulk-independent-synthetic-'
  q=json.loads(f.read_text())
  for o in q['observations']:o['value']=200
  f.write_text(json.dumps(q));subprocess.run(['python3',str(p/'analyze.py')],capture_output=True,check=True);result=a.matrix(p);assert not result['component_gate_passes']and result['failed_target_windows']==1
-print('SYNTHETIC ONLY: independent 324-process audit passed; seven raw corruptions and zero-CPU host metadata rejected; losing target retained and gate failed')
+ # End-to-end synthetic artifact: metadata/logs below are fixtures, never measurements.
+ raw=p/'bulk-serial-row-build-component';raw.mkdir()
+ for child in list(p.iterdir()):
+  if child!=raw:shutil.move(str(child),str(raw/child.name))
+ frozen=a.git(a.INPUT+'/frozen-inputs.json');(raw/'frozen-inputs.json').write_bytes(frozen)
+ for name in json.loads(frozen):
+  if name.startswith(a.INPUT+'/'):
+   dest=raw/name[len(a.INPUT)+1:];dest.parent.mkdir(parents=True,exist_ok=True);dest.write_bytes(a.git(name))
+ manifest=json.loads((raw/'input.json').read_text())
+ (p/'run-metadata.json').write_text(json.dumps(dict(head_sha=a.HEAD,status='completed',conclusion='failure')))
+ (raw/'test-status.json').write_text(json.dumps(dict(exit_code=0,source_sha256=manifest['source_sha256'])))
+ (raw/'release-tests.log').write_text('SYNTHETIC ONLY\ntest result: ok. 449 passed; 0 failed; 2 ignored;\n')
+ prov=dict(source_commit=a.HEAD,source_restored=True,instrumentation=False,source_sha256=manifest['source_sha256'],compare_sha256=a.sha(a.git(a.INPUT+'/compare.rs')),binaries={role:dict(sha256=role,exec_sha256=a.sha((raw/f'{role}-exec.rs').read_bytes()))for role in ['baseline','candidate']})
+ (raw/'provenance.json').write_text(json.dumps(prov));smokes=[]
+ for role in ['baseline','candidate']:
+  for case in a.CASES:
+   smokes.append(dict(role=role,case=case,exit=0));f=raw/'smoke'/(role+'-'+case.replace('/','_'))/'run.json';f.parent.mkdir(parents=True);f.write_text(json.dumps(dict(status='complete',cases=[dict(id=case)],observations=[dict(synthetic=True)])))
+ (raw/'smoke-status.json').write_text(json.dumps(smokes));(raw/'host.json').write_text(json.dumps(dict(rust_available_parallelism=1,candidate_serial_row_build=True)))
+ original=a.git('src/exec.rs');mutant=original.replace(b'        append_batch_shape_rows(&mut built, records, now);',b'        append_batch_shape_rows(&mut built, &records[..records.len()/2], now);')
+ (raw/'mutant-exec.rs').write_bytes(mutant);(raw/'mutant-status.json').write_text(json.dumps(dict(runtime_mutant_rejected=True,all_sources_restored=True,exit=101,original_source_sha256=manifest['source_sha256'],mutant_sha256=a.sha(mutant))))
+ (raw/'mutant-runtime.log').write_text('SYNTHETIC ONLY\npanicked\ntest result: FAILED. 0 passed; 1 failed;\n');(raw/'linux-environment.txt').write_text('SYNTHETIC ONLY FSTYPE\n')
+ result=a.audit(p);assert result['audit_complete']and not result['component_gate_passes']and result['serial_row_build_only']
+ def reject_full(name,f,change):
+  original=f.read_bytes();change(f)
+  try:a.audit(p)
+  except(AssertionError,FileNotFoundError):pass
+  else:raise RuntimeError(name+' accepted in complete artifact')
+  f.write_bytes(original)
+ reject_full('wrong source revision',p/'run-metadata.json',lambda f:alter(f,lambda q:q.update(head_sha='wrong')))
+ reject_full('changed frozen asset',raw/'run.py',lambda f:f.write_bytes(f.read_bytes()+b'\n# unexpected'))
+ reject_full('missing release coverage',raw/'release-tests.log',lambda f:f.write_text('test result: ok. 448 passed; 0 failed; 2 ignored;'))
+ reject_full('unrestored mutation',raw/'mutant-status.json',lambda f:alter(f,lambda q:q.update(all_sources_restored=False)))
+ reject_full('invalid mutant source',raw/'mutant-exec.rs',lambda f:f.write_bytes(original))
+ reject_full('incomplete correctness smokes',raw/'smoke-status.json',lambda f:alter(f,lambda q:q.pop()))
+ assert a.audit(p)['audit_complete']
+print('SYNTHETIC ONLY: independent 324-process and full-artifact audits passed; seven matrix and six provenance corruptions rejected; losing target retained and gate failed')
