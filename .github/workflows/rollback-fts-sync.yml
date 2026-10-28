@@ -1,0 +1,58 @@
+name: rollback-fts-sync
+on:
+  push:
+    branches: [codex/rollback-fts-sync-ci]
+permissions:
+  contents: read
+jobs:
+  component:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Verify frozen source and component assets
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import json,hashlib
+          p=Path('benches/results/2026-10-28-rollback-fts-sync')
+          for name,digest in json.loads((p/'frozen-inputs.json').read_text()).items():assert hashlib.sha256(Path(name).read_bytes()).hexdigest()==digest,name
+          PY
+      - name: Validate synthetic matrix and failure sensitivity
+        run: python3 benches/results/2026-10-28-rollback-fts-sync/test-protocol.py
+      - name: Full release suite
+        run: python3 benches/results/2026-10-28-rollback-fts-sync/test.py
+      - name: Reject missing FTS restoration and restore source
+        run: python3 benches/results/2026-10-28-rollback-fts-sync/check-mutant.py
+      - name: Build ordinary paired binaries
+        run: python3 benches/results/2026-10-28-rollback-fts-sync/build.py
+      - name: Validate all 16 fresh correctness smokes
+        run: python3 benches/results/2026-10-28-rollback-fts-sync/smoke.py
+      - name: Record kernel and filesystem
+        run: |
+          uname -a > benches/results/2026-10-28-rollback-fts-sync/linux-environment.txt
+          findmnt -T /tmp -o TARGET,SOURCE,FSTYPE,OPTIONS >> benches/results/2026-10-28-rollback-fts-sync/linux-environment.txt
+      - name: Run 288 isolated paired processes
+        run: python3 benches/results/2026-10-28-rollback-fts-sync/run.py
+      - name: Recompute complete raw matrix
+        run: python3 benches/results/2026-10-28-rollback-fts-sync/analyze.py
+      - name: Enforce frozen component gate
+        run: |
+          python3 - <<'PY'
+          import json
+          q=json.load(open('benches/results/2026-10-28-rollback-fts-sync/qualification.json'))
+          assert q['measurement_complete'] and q['component_gate_passes'],'Component failed: retain all raw observations'
+          assert not q['full_engine_qualified'] and not q['full_objective_achieved']
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rollback-fts-sync
+          path: benches/results/2026-10-28-rollback-fts-sync/
+          if-no-files-found: error
