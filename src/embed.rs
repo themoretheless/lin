@@ -81,12 +81,6 @@ impl Embedder for HashingEmbedder {
     }
 
     fn embed_batch(&self, texts: &[&str]) -> Vec<Arc<[f32]>> {
-        if texts.len() >= 4096
-            && texts.len().saturating_mul(self.dim) >= 4096 * 768
-            && std::thread::available_parallelism().is_ok_and(|n| n.get() > 1)
-        {
-            return self.embed_batch_parallel(texts, false);
-        }
         EMBED_SCRATCH.with(|cell| {
             let mut guard = cell.borrow_mut();
             let (scratch, lower) = &mut *guard;
@@ -95,48 +89,6 @@ impl Embedder for HashingEmbedder {
             for text in texts {
                 self.fill(scratch, crate::fts::lowercased(text, lower));
                 out.push(scratch.finish());
-            }
-            out
-        })
-    }
-}
-
-impl HashingEmbedder {
-    fn embed_batch_serial_into(&self, texts: &[&str], out: &mut Vec<Arc<[f32]>>) {
-        EMBED_SCRATCH.with(|cell| {
-            let mut guard = cell.borrow_mut();
-            let (scratch, lower) = &mut *guard;
-            scratch.ensure_dim(self.dim);
-            for text in texts {
-                self.fill(scratch, crate::fts::lowercased(text, lower));
-                out.push(scratch.finish());
-            }
-        });
-    }
-
-    fn embed_batch_serial(&self, texts: &[&str]) -> Vec<Arc<[f32]>> {
-        let mut out = Vec::with_capacity(texts.len());
-        self.embed_batch_serial_into(texts, &mut out);
-        out
-    }
-
-    fn embed_batch_parallel(&self, texts: &[&str], fail_spawn: bool) -> Vec<Arc<[f32]>> {
-        std::thread::scope(|scope| {
-            let (left, right) = texts.split_at(texts.len() / 2);
-            let worker = if fail_spawn {
-                Err(std::io::Error::other("simulated hashing worker spawn failure"))
-            } else {
-                std::thread::Builder::new()
-                    .spawn_scoped(scope, || self.embed_batch_serial(right))
-            };
-            let mut out = Vec::with_capacity(texts.len());
-            match worker {
-                Ok(worker) => {
-                    self.embed_batch_serial_into(left, &mut out);
-                    out.extend(worker.join().expect("hashing batch worker panicked"));
-                }
-                // No partial slab has been assigned; serial fallback preserves order.
-                Err(_) => self.embed_batch_serial_into(texts, &mut out),
             }
             out
         })
@@ -1600,46 +1552,5 @@ mod tests {
         sq8_index.move_id(49, 20);
         let res_sq8_49 = sq8_index.search(&items[49].1, 5, 32);
         assert_eq!(res_sq8_49[0].1, 20);
-    }
-}
-
-#[cfg(test)]
-mod parallel_hashing_batch_tests {
-    use super::*;
-    fn corpus(n: usize) -> Vec<String> {
-        let samples = ["", "body", "body 123", "WAL database Straße", "Σίσυφος", "a\u{000b}b", "emoji 🦀 café", "repeated repeated repeated", "İSTANBUL", "line\nend"];
-        (0..n).map(|i| if i % samples.len() == 0 { String::new() } else { format!("{} {}",samples[i % samples.len()],i) }).collect()
-    }
-    fn assert_bits(a: &[Arc<[f32]>], b: &[Arc<[f32]>]) {
-        assert_eq!(a.len(),b.len());
-        for (a,b) in a.iter().zip(b) {assert_eq!(a.len(),b.len());assert!(a.iter().zip(b.iter()).all(|(a,b)|a.to_bits()==b.to_bits()));}
-    }
-    #[test]
-    fn parallel_vectors_match_serial_and_single_bits_in_input_order() {
-        let source=corpus(4097);let refs=source.iter().map(String::as_str).collect::<Vec<_>>();
-        for dim in [8,31,768,1024] {
-            let embedder=HashingEmbedder::new(format!("hash/{dim}"),dim);
-            let serial=embedder.embed_batch_serial(&refs);let parallel=embedder.embed_batch_parallel(&refs,false);assert_bits(&serial,&parallel);
-            for (text,vector) in refs.iter().zip(&parallel) {assert_bits(std::slice::from_ref(vector),&[embedder.embed(text)]);}
-            assert_bits(&embedder.embed_batch(&refs),&serial);
-        }
-    }
-    #[test]
-    fn failed_spawn_falls_back_without_partial_or_duplicate_output() {
-        for n in [0,1,4095,4096,4097] {
-            let source=corpus(n);let refs=source.iter().map(String::as_str).collect::<Vec<_>>();let embedder=HashingEmbedder::new("hash/768",768);
-            let expected=embedder.embed_batch_serial(&refs);let actual=embedder.embed_batch_parallel(&refs,true);assert_bits(&expected,&actual);
-        }
-    }
-    #[test]
-    fn alternating_dimensions_and_concurrent_batches_preserve_scratch_isolation() {
-        let source=corpus(4101);let refs=source.iter().map(String::as_str).collect::<Vec<_>>();
-        std::thread::scope(|scope| {
-            let handles=[17,768,1001].into_iter().map(|dim| {
-                let refs=&refs;scope.spawn(move||{let e=HashingEmbedder::new("hash",dim);let serial=e.embed_batch_serial(refs);for _ in 0..2 {assert_bits(&serial,&e.embed_batch_parallel(refs,false));}})
-            }).collect::<Vec<_>>();
-            for h in handles {h.join().unwrap();}
-        });
-        let e=HashingEmbedder::new("hash/768",768);assert_bits(&e.embed_batch_serial(&refs),&e.embed_batch(&refs));
     }
 }

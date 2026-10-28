@@ -188,6 +188,11 @@ lines += [
     '- [Allocation-free atomic coverage rejected](../benches/results/2026-10-28-index-allocation-free-coverage-component-linux/decision.md):run40620340816,288процессов/2304наблюдения;filter_eq+10.676%/+9.739%,обе серии6/6aboveA/A. Ноpoint_get-5.130%во всех6парах одной серии иDuckDBcontrol-2.805%провалены.452release tests/2ignored,16Linuxsmoke,numericprecisionmutant иraw/source audit прошли;индекс восстановлен кa7d4b02c3.',
     '- [MSSQL private refresh](../benches/results/2026-10-28-mssql-current-cow/report.md),[run40603880905](https://github.com/themoretheless/lin/actions/runs/40603880905):замороженный предшествующий COW source75f8f6b7f;native-x86 стенд завершён,локальный raw/source audit и cleanup прошли. В репозитории только encrypted archive и функциональный статус;относительные исходы приватны. Это не публичное доказательство выигрыша и не квалификация нового CAS-кандидата.',
 ]
+hashing = read('benches/results/2026-10-28-hashing-batch-parallel-component-linux/frozen-audit.json')
+assert hashing['audit_complete'] and hashing['processes'] == 324 and hashing['observations'] == 2592
+assert not hashing['component_gate_passes'] and hashing['failed_target_windows'] == 2 and hashing['failed_control_windows'] == 1
+assert hashing['parallel_host_eligible'] and hashing['serial_body_preserved'] and hashing['worker_order_runtime_mutant_rejected']
+lines += ['- [Parallel hashing batch rejected](../benches/results/2026-10-28-hashing-batch-parallel-component-linux/report.md): run40626189213,324процесса/2592наблюдения. Bulk INSERT10k: -33.890%/-32.935%,обе серии0/6positive;Normal UPDATE control серии2 -4.876% также провален.452release tests/2ignored,18Linuxsmoke,order mutant и независимый raw/source audit прошли. Все2064файла сохранены сSHA256;embed.rs восстановлен кa7d4b02c3. CPU/RSS измерены для всего свежего процесса,не одной операции;неизменённого перезапуска и production adoption нет.']
 output = root / 'docs/benchmark-goal-status-2026-10-27.md'
 output.write_text('\n'.join(lines) + '\n')
 # Never expose endpoint values or credentials in the status artifact.
