@@ -137,7 +137,23 @@ assert phase_tests['exit_code'] == 0 and phase_tests['passed'] == 445 and phase_
 lines += [
     '- [Двухполевой inline rejected](../benches/results/2026-10-28-cow-small-row-inline/report.md):144процесса/1152наблюдения;4/4скалярныхWALtarget окна провалены,контроли прошли. A/A9–31%;устойчивое ускорение не установлено. Прежний COW восстановлен.',
     '- [Однократная reverse-map запись rejected](../benches/results/2026-10-28-index-single-reverse-write/report.md):36процессов/2304warmCPU наблюдения;5/8target окон смены ключа провалены,всеunchanged-key контроли прошли. Медианы3–26% не прошли frozen gate. Прежний индекс восстановлен;этот probe не измеряет полный UPDATE/WAL.',
-    '- [Профиль текущего COW](../benches/results/2026-10-28-cow-durable-phase-refresh/local-qualification.md):445release tests/2ignored инструментированного кода и30локальных full-value/reopen/phase-count smokes прошли;исходники восстановлены. [Linux run40602697359](https://github.com/themoretheless/lin/actions/runs/40602697359),source75f8f6b7f:240процессов/1920wall наблюдений с original/control/disabled/traced. Эта сводка пока не содержит завершённого Linux raw/source аудита;старые проценты фаз не переносятся на текущий COW.',
+    '- [Профиль текущего COW](../benches/results/2026-10-28-cow-durable-phase-refresh/local-qualification.md):445release tests/2ignored инструментированного кода и30локальных full-value/reopen/phase-count smokes прошли;исходники восстановлены. [Linux run40602697359](https://github.com/themoretheless/lin/actions/runs/40602697359),source75f8f6b7f:240процессов/1920wall наблюдений с original/control/disabled/traced. [Завершённый raw/source audit](../benches/results/2026-10-28-cow-durable-phase-refresh-linux/audited-report.md) прошёл;векторный Full sync80.986–87.031%,скалярный Normal exec97.923%. Это фазы инструментария на source75f8,не аттестация нового кандидата или точные доли другого бинарника.',
+]
+phase_audit = read('benches/results/2026-10-28-cow-durable-phase-refresh-linux/frozen-audit.json')
+assert phase_audit['audit_complete'] and phase_audit['processes'] == 240 and phase_audit['observations'] == 1920
+cas = read('benches/results/2026-10-28-single-stmt-cas-snapshot/independent-audit.json')
+assert cas['audit_complete'] and cas['component_gate_passes'] and cas['processes'] == 144 and cas['observations'] == 1152
+assert cas['failed_target_windows'] == cas['failed_control_windows'] == 0
+full_prerequisites = read('benches/results/2026-10-28-cow-cas-full-engine/local-prerequisite-status.json')
+assert full_prerequisites['release_tests_passed'] == 449 and full_prerequisites['correctness_smokes_passed'] == 134
+assert full_prerequisites['cow_eq_mutant_runtime_rejected'] and full_prerequisites['multi_statement_cas_mutant_runtime_rejected']
+mssql = read('benches/results/2026-10-28-mssql-current-cow/functional-status.json')
+assert mssql['functional_raw_audit_complete'] and mssql['frozen_source_hashes_verified'] and mssql['owned_container_cleanup_verified']
+assert mssql['comparative_metrics_public'] is False and mssql['full_objective_achieved'] is False
+lines += [
+    '- [Однооператорный CAS snapshot component gate passed](../benches/results/2026-10-28-single-stmt-cas-snapshot/report.md):source2633067cb,144процесса/1152наблюдения;Full31.932–35.768%,Normal91.371–91.663%,все4target окна6/6aboveA/A. Контроли прошли порог;native100k медианы были отрицательны в пределахA/A,поэтому нулевая регрессия не доказана.449release tests/2ignored;неверный multi-statement bypass пойман runtime-тестом. Полная матрица ещё нужна.',
+    '- [Полная совместная COW+CAS квалификация](../benches/results/2026-10-28-cow-cas-full-engine/protocol.md),[run40607797376](https://github.com/themoretheless/lin/actions/runs/40607797376):source36666994a,все67сценариев,2412процессов/19296наблюдений;5targets/62controls.449release tests,оба runtime-mutant и134локальных smoke прошли. Linux raw/source gate пока не аттестован этой сводкой;пороговые критерии сохранены. Это новый кандидат,его победы не переносятся с предыдущих запусков.',
+    '- [MSSQL private refresh](../benches/results/2026-10-28-mssql-current-cow/report.md),[run40603880905](https://github.com/themoretheless/lin/actions/runs/40603880905):замороженный предшествующий COW source75f8f6b7f;native-x86 стенд завершён,локальный raw/source audit и cleanup прошли. В репозитории только encrypted archive и функциональный статус;относительные исходы приватны. Это не публичное доказательство выигрыша и не квалификация нового CAS-кандидата.',
 ]
 output = root / 'docs/benchmark-goal-status-2026-10-27.md'
 output.write_text('\n'.join(lines) + '\n')
