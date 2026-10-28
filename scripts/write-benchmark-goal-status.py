@@ -170,6 +170,10 @@ noalloc_coverage = read('benches/results/2026-10-28-index-allocation-free-covera
 assert noalloc_coverage['audit_complete'] and noalloc_coverage['processes'] == 288 and noalloc_coverage['observations'] == 2304
 assert not noalloc_coverage['component_gate_passes'] and noalloc_coverage['failed_target_windows'] == 0 and noalloc_coverage['failed_control_windows'] == 2
 assert noalloc_coverage['allocation_shim_excluded'] and noalloc_coverage['numeric_precision_runtime_mutant_rejected']
+bulk_phases = read('benches/results/2026-10-28-cow-bulk-phases-linux/frozen-audit.json')
+assert bulk_phases['audit_complete'] and bulk_phases['processes'] == 48 and bulk_phases['wall_observations'] == 384
+assert not bulk_phases['performance_qualified'] and bulk_phases['source_overlays_only_clock_hooks']
+lines += ['- [Native bulk phase audit complete](../benches/results/2026-10-28-cow-bulk-phases-linux/interpretation.md): run40622638028, sourcea7d4b02c3, 48 процессов /384 wall observations /132 trace invocations. Embedding32.286-40.666%, indexes12.186-21.203%, FTS14.218-15.464%. Это профиль текущего COW, а не доказательство причины регрессии против BTreeMap. 449 release tests/2 ignored, 6 Linux smokes и независимый raw/source audit прошли; новой оптимизации не аттестует.']
 mssql = read('benches/results/2026-10-28-mssql-current-cow/functional-status.json')
 assert mssql['functional_raw_audit_complete'] and mssql['frozen_source_hashes_verified'] and mssql['owned_container_cleanup_verified']
 assert mssql['comparative_metrics_public'] is False and mssql['full_objective_achieved'] is False
