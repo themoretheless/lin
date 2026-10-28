@@ -1,0 +1,35 @@
+   Compiling lin v0.4.0 (/Users/themoretheless/.codex/worktrees/cow-row-vnext/lin)
+warning: unused import: `super::*`
+  --> src/cow_row_tests.rs:16:6
+   |
+16 |  use super::*;
+   |      ^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `lin` (lib test) generated 1 warning (run `cargo fix --lib -p lin --tests` to apply 1 suggestion)
+    Finished `release` profile [optimized] target(s) in 14.93s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/lib.rs (/tmp/lin-cow-vnext-target/release/build/lin/ccc7a04ff4c2448e/out/lin-ccc7a04ff4c2448e)
+
+running 1 test
+test store::rollback_hnsw_oracle::rollback_restores_hnsw_after_delete ... FAILED
+
+failures:
+
+---- store::rollback_hnsw_oracle::rollback_restores_hnsw_after_delete stdout ----
+
+thread 'store::rollback_hnsw_oracle::rollback_restores_hnsw_after_delete' (95600263) panicked at src/cow_row_tests.rs:102:9:
+assertion `left == right` failed
+  left: []
+ right: [(1.0, 0)]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    store::rollback_hnsw_oracle::rollback_restores_hnsw_after_delete
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 110 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--lib`

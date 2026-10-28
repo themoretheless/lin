@@ -1585,6 +1585,22 @@ impl Store {
     }
 
     pub fn append_rollback(&mut self, mark: AppendMark) {
+        // Appended vector nodes must not outlive the rows truncated below.
+        // Mixed undo restores swap-moved rows before reaching this append mark.
+        for (name, hnsw) in &mut self.hnsw {
+            let start = if name == "facts" {
+                mark.facts_len
+            } else {
+                mark.col_lens.get(name).copied().unwrap_or(0)
+            };
+            let mut end = self.collections.get(name).map_or(0, Vec::len);
+            if name == "facts" {
+                end = end.max(self.facts_s.len());
+            }
+            for id in start..end {
+                hnsw.remove(id);
+            }
+        }
         self.next_id = mark.next_id;
         self.edges.truncate(mark.edge_len);
         self.facts_s.truncate(mark.facts_len);
@@ -2492,6 +2508,7 @@ impl Store {
             }
             let _ = self.index_insert_row(collection, p, doomed);
             self.fts_insert_row(collection, p, doomed);
+            self.hnsw_insert_slab(collection, p, std::slice::from_ref(doomed));
             self.swap_maps_register(collection, p, doomed);
             // The slab's columns follow the rows array: the value at `p` moves to the
             // tail and the restored row takes `p`, which one swap-push expresses.

@@ -1,0 +1,52 @@
+[
+  {
+    "log": "before.log",
+    "exit": 101,
+    "classification": "fixture error: title-only document has no hash; not runtime bug evidence"
+  },
+  {
+    "log": "before-corrected-fixture.log",
+    "exit": 101,
+    "classification": "fixture error: null is not a supported literal; not runtime bug evidence"
+  },
+  {
+    "log": "before-delete.log",
+    "exit": 101,
+    "classification": "runtime regression: restored row missing in HNSW"
+  },
+  {
+    "log": "before-public-search.log",
+    "exit": 101,
+    "classification": "runtime regression: public vector search missing restored target"
+  },
+  {
+    "log": "before-two-regressions.log",
+    "exit": 101,
+    "classification": "two runtime regressions: missing restored and stale appended HNSW nodes"
+  },
+  {
+    "log": "after-two-regressions.log",
+    "exit": 0,
+    "classification": "two HNSW regressions pass after store changes"
+  },
+  {
+    "log": "after-mixed-regressions.log",
+    "exit": 101,
+    "classification": "runtime regression: unordered mixed rollback loses original rows after DELETE then INSERT"
+  },
+  {
+    "log": "after-ordered-mixed-regressions.log",
+    "exit": 0,
+    "classification": "three HNSW/mixed regressions pass after ordered append undo"
+  },
+  {
+    "log": "after-transaction-tests.log",
+    "exit": 0,
+    "classification": "13 transaction tests pass before adding generated-ID assertions"
+  },
+  {
+    "log": "full-release.log",
+    "exit": 0,
+    "classification": "final sources: 454 passed, 2 ignored"
+  }
+]

@@ -788,16 +788,14 @@ impl<'a> Transaction<'a> {
                     }
                 }
             }
-            Undo::Rows(events) => {
+            Undo::Rows(events) | Undo::Mixed { events, .. } => {
                 if prep.append_only && !prep.schema {
-                    let ev = std::mem::take(events);
-                    self.undo = Undo::Mixed {
-                        append: self.db.store.append_mark(),
-                        events: ev,
-                    };
+                    // An append after row edits must be undone at this exact point
+                    // in the reverse journal, before earlier swap-deletes restore slots.
+                    events.push(RowUndo::Append(self.db.store.append_mark()));
                 }
             }
-            Undo::Mixed { .. } | Undo::Full(_) => {}
+            Undo::Full(_) => {}
         }
     }
 
@@ -2015,6 +2013,7 @@ impl Db {
             Undo::Rows(events) => {
                 for event in events.into_iter().rev() {
                     match event {
+                        RowUndo::Append(mark) => self.store.append_rollback(mark),
                         RowUndo::Update(collection, idx, row) => {
                             if let Some(mut restored) = self.store.collection(&collection).get(idx).cloned() {
                                 row.apply(&mut restored);
@@ -2030,6 +2029,7 @@ impl Db {
             Undo::Mixed { append, events } => {
                 for event in events.into_iter().rev() {
                     match event {
+                        RowUndo::Append(mark) => self.store.append_rollback(mark),
                         RowUndo::Update(collection, idx, row) => {
                             if let Some(mut restored) = self.store.collection(&collection).get(idx).cloned() {
                                 row.apply(&mut restored);
@@ -6255,6 +6255,7 @@ impl RowDelta {
 }
 
 pub(crate) enum RowUndo {
+    Append(crate::store::AppendMark),
     Update(String, usize, RowDelta),
     Delete(String, Vec<usize>, Vec<Row>),
 }

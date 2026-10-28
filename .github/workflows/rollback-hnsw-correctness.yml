@@ -1,0 +1,28 @@
+name: rollback-hnsw-correctness
+on:
+  push:
+    branches: [codex/rollback-hnsw-correctness-ci]
+permissions:
+  contents: read
+jobs:
+  correctness:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Full release suite and three runtime negatives
+        run: python3 benches/results/2026-10-28-rollback-hnsw-correctness/ci.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rollback-hnsw-correctness
+          path: benches/results/2026-10-28-rollback-hnsw-correctness/linux/
+          if-no-files-found: error
