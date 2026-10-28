@@ -1109,6 +1109,13 @@ fn pick_conjunct(cat: &Catalog, collection: &str, pred: &Pred) -> Option<IndexUs
 
 /// True when every atomic predicate is enforced by the index seek(s) (no residual filter).
 pub fn index_covers_pred(pred: &Pred, uses: &[IndexUse]) -> bool {
+    // An atomic comparison has exactly one DNF branch. Reuse the same
+    // coverage/precision checks without cloning that branch and its literal.
+    if let [use_] = uses
+        && matches!(pred, Pred::Cmp { .. })
+    {
+        return index_covers_conjunct(pred, use_);
+    }
     let Some(branches) = dnf(pred) else {
         return false;
     };
@@ -1712,3 +1719,45 @@ mod bitmap_sample_once_tests {
 
 #[cfg(test)]
 include!("cow_index_tests.rs");
+
+#[cfg(test)]
+mod single_cmp_coverage_tests {
+    use super::*;
+    use crate::ast::Field;
+    fn reference(pred: &Pred, uses: &[IndexUse]) -> bool {
+        let Some(branches) = dnf(pred) else { return false; };
+        branches.len() == uses.len() && branches.iter().zip(uses).all(|(branch,use_)| index_covers_conjunct(branch,use_))
+    }
+    #[test]
+    fn atomic_coverage_matches_dnf_with_ranges_partial_indexes_and_precision_edges() {
+        let values = [Value::String("rag".into()), Value::Int(7), Value::Int((1i64<<53)-1), Value::Int(1i64<<53), Value::Float(f64::INFINITY), Value::Float(1.25)];
+        let ops = [CmpOp::Eq,CmpOp::Ne,CmpOp::Gt,CmpOp::Ge,CmpOp::Lt,CmpOp::Le];
+        let mut comparisons = 0;
+        for value in values {
+            for op in ops {
+                let pred=Pred::Cmp {field:Field::name("key"),op,value:value.clone()};
+                for partial in [false,true] {
+                    for matching in [false,true] {
+                        let field=if matching {"key"}else{"other"};
+                        let use_=IndexUse { def:IndexDef{collection:"docs".into(),unique:false,fields:vec![field.into()],pred:partial.then(||pred.clone()),bitmap_card_field:None},eqs:if matches!(op,CmpOp::Eq){vec![(field.into(),value.clone())]}else{vec![]},range:if matches!(op,CmpOp::Gt|CmpOp::Ge|CmpOp::Lt|CmpOp::Le){Some((field.into(),op,value.clone()))}else{None}};
+                        for uses in [vec![],vec![use_.clone()],vec![use_.clone(),use_]] {
+                            assert_eq!(index_covers_pred(&pred,&uses),reference(&pred,&uses));comparisons+=1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(comparisons,432);
+    }
+    #[test]
+    fn boolean_predicates_keep_dnf_branch_alignment() {
+        let a=Pred::Cmp{field:Field::name("key"),op:CmpOp::Eq,value:Value::Int(1)};
+        let b=Pred::Cmp{field:Field::name("key"),op:CmpOp::Eq,value:Value::Int(2)};
+        let make=|n|IndexUse{def:IndexDef{collection:"docs".into(),unique:false,fields:vec!["key".into()],pred:None,bitmap_card_field:None},eqs:vec![("key".into(),Value::Int(n))],range:None};
+        for pred in [Pred::And(Box::new(a.clone()),Box::new(b.clone())),Pred::Or(Box::new(a),Box::new(b))] {
+            for uses in [vec![],vec![make(1)],vec![make(1),make(2)],vec![make(2),make(1)]] {
+                assert_eq!(index_covers_pred(&pred,&uses),reference(&pred,&uses));
+            }
+        }
+    }
+}
