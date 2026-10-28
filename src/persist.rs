@@ -1198,80 +1198,6 @@ pub fn append_record(
     }
 }
 
-// A wire-only view: execution results and undo keep the complete rows.
-// Canonical original size is checked before this view is ever serialized.
-fn delete_key_field(collection: &str, key: &str) -> bool {
-    matches!(key, "id" | "uri") || (collection == "facts" && matches!(key, "s" | "p" | "o"))
-}
-fn delete_key_eligible(collection: &str, row: &Row) -> bool {
-    collection == "facts" || ["id", "uri"].iter().any(|key| row.get(*key).and_then(crate::store::Cell::text).is_some())
-}
-fn has_compact_delete(pack: &Pack, depth: usize) -> bool {
-    if depth > 16 { return false; }
-    match pack {
-        Pack::Delete { collection, rows } => rows.iter().any(|row| delete_key_eligible(collection, row) && row.keys().any(|key| !delete_key_field(collection, key))),
-        Pack::Batch { packs } => packs.iter().any(|pack| has_compact_delete(pack, depth + 1)),
-        _ => false,
-    }
-}
-struct DeleteRowsView<'a> { collection: &'a str, rows: &'a [Row] }
-impl Serialize for DeleteRowsView<'_> {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::{SerializeMap, SerializeSeq};
-        struct Keys<'a>(&'a str, &'a Row);
-        impl Serialize for Keys<'_> {
-            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-                if !delete_key_eligible(self.0, self.1) { return self.1.serialize(serializer); }
-                let count = self.1.keys().filter(|key| delete_key_field(self.0, key)).count();
-                let mut map = serializer.serialize_map(Some(count))?;
-                for (key, value) in self.1 { if delete_key_field(self.0, key) { map.serialize_entry(key, value)?; } }
-                map.end()
-            }
-        }
-        let mut seq = serializer.serialize_seq(Some(self.rows.len()))?;
-        for row in self.rows { seq.serialize_element(&Keys(self.collection, row))?; }
-        seq.end()
-    }
-}
-struct DeletePackView<'a>(&'a Pack, usize);
-impl Serialize for DeletePackView<'_> {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::{SerializeSeq, SerializeStruct};
-        if self.1 > 16 { return self.0.serialize(serializer); }
-        match self.0 {
-            Pack::Delete { collection, rows } => {
-                let mut map = serializer.serialize_struct("Pack", 3)?;
-                map.serialize_field("type", "delete")?;
-                map.serialize_field("collection", collection)?;
-                map.serialize_field("rows", &DeleteRowsView { collection, rows })?;
-                map.end()
-            }
-            Pack::Batch { packs } => {
-                struct Packs<'a>(&'a [Pack], usize);
-                impl Serialize for Packs<'_> {
-                    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-                        let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
-                        for pack in self.0 { seq.serialize_element(&DeletePackView(pack, self.1))?; }
-                        seq.end()
-                    }
-                }
-                let mut map = serializer.serialize_struct("Pack", 2)?;
-                map.serialize_field("type", "batch")?;
-                map.serialize_field("packs", &Packs(packs, self.1 + 1))?;
-                map.end()
-            }
-            _ => self.0.serialize(serializer),
-        }
-    }
-}
-#[derive(Serialize)]
-struct DeleteRecordView<'a> {
-    #[serde(rename = "gen")]
-    generation: u64,
-    next_id: u64,
-    pack: DeletePackView<'a>,
-}
-
 fn append_record_v1(
     log: &mut File,
     rec: &LogRecord,
@@ -1283,13 +1209,6 @@ fn append_record_v1(
     rmp_serde::encode::write_named(buf, rec).map_err(io_err)?;
     if buf.len() > MAX_RECORD as usize {
         return Err(io_err("log record exceeds 16MiB"));
-    }
-    if sync == SyncMode::Full && has_compact_delete(&rec.pack, 0) {
-        let canonical_len = buf.len();
-        buf.clear();
-        let view = DeleteRecordView { generation: rec.r#gen, next_id: rec.next_id, pack: DeletePackView(&rec.pack, 0) };
-        rmp_serde::encode::write_named(buf, &view).map_err(io_err)?;
-        debug_assert!(buf.len() <= canonical_len);
     }
     write_frame(log, &LOG_MAGIC_V1, buf, sync, log_bytes)
 }
