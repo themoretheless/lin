@@ -118,4 +118,6 @@
 
 ## Новые предпосылки корректности rollback
 
-[Регрессии и исправление](../benches/results/2026-10-28-rollback-hnsw-correctness/report.md): восстановлена регистрация удалённых строк в HNSW и удаление узлов отменённых вставок. Смешанный DELETE→INSERT rollback терял исходные строки из-за неверного порядка; append marks теперь входят в хронологический undo journal. Локально 454 release tests прошли, 2 ignored; Linux проверка подготовлена. Это новая версия экспериментального COW+CAS runtime, без переноса прежних speedup claims или production adoption. Цель восьми peers и SQLite FULL WAL gap открыты.
+[Регрессии и исправление](../benches/results/2026-10-28-rollback-hnsw-correctness/report.md): восстановлена регистрация удалённых строк в HNSW и удаление узлов отменённых вставок. Смешанный DELETE→INSERT rollback терял исходные строки из-за неверного порядка; append marks теперь входят в хронологический undo journal. Локально 454 release tests прошли, 2 ignored; Linux подтверждение приведено ниже. Это новая версия экспериментального COW+CAS runtime, без переноса прежних speedup claims или production adoption. Цель восьми peers и SQLite FULL WAL gap открыты.
+
+[Linux rollback correctness завершён](../benches/results/2026-10-28-rollback-hnsw-correctness-linux/report.md): run40648113616, frozen21dcd7d81, Rust1.96 x86_64.454release tests/2ignored и3независимо скомпилированных runtime negatives прошли. Независимый raw/source audit и8коррупций доказательств прошли; архив полностью проверен SHA256. Это корректность, не ускорение или принятие полного исходника.
