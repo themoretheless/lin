@@ -113,3 +113,5 @@
 ## Ограничение исторического point_get и новый контракт
 
 [Аудит и функциональная проверка](../benches/results/2026-10-28-point-values-contract/report.md): исторический Rust point_get материализует id/title в Lin, но SQL peers выполняют COUNT(*); read smoke этого случая не проверял значения. Старые наблюдения сохранены, однако point_get peer ratios не доказывают равную работу. Отдельный point_values возвращает одинаковые owned id/title для Lin/SQLite/DuckDB: 6 сценариев прошли full-value validator, 3 runtime подмены title отвергнуты. Это локальная функциональная проверка, без новой квалификации скорости и без покрытия остальных peers.
+
+[Локальный point_values baseline](../benches/results/2026-10-28-point-values-local-baseline/report.md): 3 свежих процесса, 216 наблюдений, одинаковые owned id/title. В обоих hit/miss Lin численно быстрее SQLite и DuckDB во всех трёх процессах. macOS ARM64, короткие samples с cap 8, без A/A: это диагностические отношения, не Linux/production qualification и не закрытие durable WAL gap. Независимый аудит контракта прошёл; семь намеренно повреждённых пакетов, включая пересчитанные SHA256, отвергнуты.
