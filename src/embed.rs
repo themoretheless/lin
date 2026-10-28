@@ -235,10 +235,25 @@ impl Scratch {
         } else {
             l2_normalize(&mut self.v);
         }
-        let out = Arc::from(&self.v[..]);
-        for &i in &self.touched {
-            self.v[i as usize] = 0.0;
-            self.seen[i as usize] = false;
+        let out;
+        if self.touched.len() * 5 < self.v.len() {
+            let mut output = Arc::<[f32]>::new_uninit_slice(self.v.len());
+            let slots = Arc::get_mut(&mut output).expect("new output is uniquely owned");
+            slots.fill(std::mem::MaybeUninit::new(0.0));
+            for &i in &self.touched {
+                slots[i as usize].write(self.v[i as usize]);
+                self.v[i as usize] = 0.0;
+                self.seen[i as usize] = false;
+            }
+            // SAFETY: every element was initialized to valid f32 zero above;
+            // touched elements were then overwritten with initialized f32 values.
+            out = unsafe { output.assume_init() };
+        } else {
+            out = Arc::from(&self.v[..]);
+            for &i in &self.touched {
+                self.v[i as usize] = 0.0;
+                self.seen[i as usize] = false;
+            }
         }
         self.touched.clear();
         out
@@ -1306,6 +1321,34 @@ mod tests {
             );
             assert!(scratch.v.iter().all(|x| *x == 0.0));
             assert!(scratch.touched.is_empty());
+        }
+    }
+
+    #[test]
+    fn sparse_arc_output_preserves_dense_bits_thresholds_and_held_results() {
+        for dim in [0usize, 8, 9, 31, 32, 768, 1024] {
+            let mut scratch = Scratch::new(dim);
+            let mut held: Vec<(Arc<[f32]>, Vec<u32>)> = Vec::new();
+            for count in [0, 1.min(dim), dim / 5, (dim / 5 + 1).min(dim), dim] {
+                for large in [false, true] {
+                    for i in (0..count).rev() {
+                        scratch.bump_slot(i, if large { 8192.0 + i as f32 } else { (i + 1) as f32 * 0.25 });
+                    }
+                    let mut expected = scratch.v.clone();
+                    l2_normalize(&mut expected);
+                    let expected = expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+                    let actual = scratch.finish();
+                    assert_eq!(actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), expected, "dim={dim}, count={count}, large={large}");
+                    assert_eq!(actual.len(), dim);
+                    assert!(scratch.v.iter().all(|v| v.to_bits() == 0));
+                    assert!(scratch.seen.iter().all(|v| !v));
+                    assert!(scratch.touched.is_empty());
+                    held.push((actual, expected));
+                    for (vector, bits) in &held {
+                        assert_eq!(vector.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), *bits);
+                    }
+                }
+            }
         }
     }
 
