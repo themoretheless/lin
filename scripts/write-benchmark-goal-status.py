@@ -203,6 +203,11 @@ assert embed_phases['audit_complete'] and embed_phases['processes'] == 48 and em
 assert not embed_phases['performance_qualified'] and embed_phases['source_overlays_match_reversible_ledger']
 assert embed_phases['instrumented_release_tests'] == 449 and embed_phases['correctness_smokes'] == 6
 lines += ['- [Embedding subphase audit complete](../benches/results/2026-10-28-bulk-embedding-phases-linux/interpretation.md): run40631973188,sourcea7d4b02c3,48процессов/384wall observations/132trace invocations. На10k vector allocation/copy15.304% instrumented INSERT wall,feature hashing7.343%. Traced/disabled1.1548/1.1811на10k/1k:накладные расходы существенны,точные доли обычного бинарника не установлены.449release tests/2ignored,6Linuxsmokes и независимый raw/source audit прошли;318файлов сохранены сSHA256. Это выбор следующей гипотезы,не оптимизация или peer qualification.']
+sparse_output = read('benches/results/2026-10-28-hashing-sparse-output-component-linux/frozen-audit.json')
+assert sparse_output['audit_complete'] and sparse_output['processes'] == 324 and sparse_output['observations'] == 2592
+assert not sparse_output['component_gate_passes'] and sparse_output['failed_target_windows'] == 1 and sparse_output['failed_control_windows'] == 0
+assert sparse_output['sparse_output_only'] and sparse_output['missing_coordinate_runtime_mutant_rejected'] and sparse_output['release_tests'] == 450
+lines += ['- [Sparse hashing output component not accepted](../benches/results/2026-10-28-hashing-sparse-output-component-linux/report.md): run40634605768,324процесса/2592наблюдения. INSERT10k+7.790%/+8.054%;series1только5/6positive,series2 6/6,все16controlокон прошли. Проигравшая пара-0.038685%сохранена,порог6/6не ослаблялся.450release tests/2ignored,18Linuxsmokes,missing-coordinate mutant и независимый raw/source audit прошли.2067файлов сохранены сSHA256;embed.rs восстановлен кa7d4b02c3. Нет adoption/неизменённого перезапуска/полной peer qualification.']
 output = root / 'docs/benchmark-goal-status-2026-10-27.md'
 output.write_text('\n'.join(lines) + '\n')
 # Never expose endpoint values or credentials in the status artifact.
