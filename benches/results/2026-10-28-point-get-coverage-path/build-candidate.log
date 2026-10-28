@@ -1,0 +1,929 @@
+   Compiling lin v0.4.0 (/Users/themoretheless/.codex/worktrees/cow-row-vnext/lin)
+warning: constant `N` is never used
+  --> benches/compare.rs:36:7
+   |
+36 | const N: usize = 10_000;
+   |       ^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `INSERT_1K` is never used
+  --> benches/compare.rs:37:7
+   |
+37 | const INSERT_1K: usize = 1_000;
+   |       ^^^^^^^^^
+
+warning: constant `INSERT_10K` is never used
+  --> benches/compare.rs:38:7
+   |
+38 | const INSERT_10K: usize = 10_000;
+   |       ^^^^^^^^^^
+
+warning: constant `JOIN_USERS` is never used
+  --> benches/compare.rs:41:7
+   |
+41 | const JOIN_USERS: usize = 1_000;
+   |       ^^^^^^^^^^
+
+warning: constant `JOIN_ORDERS` is never used
+  --> benches/compare.rs:42:7
+   |
+42 | const JOIN_ORDERS: usize = 10_000;
+   |       ^^^^^^^^^^^
+
+warning: constant `JOIN_FILTER_N` is never used
+  --> benches/compare.rs:43:7
+   |
+43 | const JOIN_FILTER_N: usize = JOIN_ORDERS / 2;
+   |       ^^^^^^^^^^^^^
+
+warning: constant `JOIN_INNER_SQL` is never used
+  --> benches/compare.rs:44:7
+   |
+44 | const JOIN_INNER_SQL: &str =
+   |       ^^^^^^^^^^^^^^
+
+warning: constant `JOIN_FILTER_SQL` is never used
+  --> benches/compare.rs:46:7
+   |
+46 | const JOIN_FILTER_SQL: &str = "SELECT o.id, u.email, o.total FROM orders o INNER JOIN users u ON o.user_id = u.id WHERE o.total > 100";
+   |       ^^^^^^^^^^^^^^^
+
+warning: constant `PG_CANDIDATES` is never used
+  --> benches/compare.rs:49:7
+   |
+49 | const PG_CANDIDATES: &[&str] = &[
+   |       ^^^^^^^^^^^^^
+
+warning: constant `MYSQL_CANDIDATES` is never used
+  --> benches/compare.rs:53:7
+   |
+53 | const MYSQL_CANDIDATES: &[&str] = &[
+   |       ^^^^^^^^^^^^^^^^
+
+warning: function `range_cutoff_ms` is never used
+   --> benches/compare.rs:158:4
+    |
+158 | fn range_cutoff_ms() -> i64 {
+    |    ^^^^^^^^^^^^^^^
+
+warning: function `env_url` is never used
+   --> benches/compare.rs:166:4
+    |
+166 | fn env_url(env_key: &str) -> Option<String> {
+    |    ^^^^^^^
+
+warning: function `try_pg_client` is never used
+   --> benches/compare.rs:177:4
+    |
+177 | fn try_pg_client(url: &str) -> Result<postgres::Client, String> {
+    |    ^^^^^^^^^^^^^
+
+warning: struct `PgBenchClient` is never constructed
+   --> benches/compare.rs:182:8
+    |
+182 | struct PgBenchClient {
+    |        ^^^^^^^^^^^^^
+
+warning: associated function `new` is never used
+   --> benches/compare.rs:188:8
+    |
+187 | impl PgBenchClient {
+    | ------------------ associated function in this implementation
+188 |     fn new(mut client: postgres::Client) -> Result<Self, postgres::Error> {
+    |        ^^^
+
+warning: function `try_mysql_conn` is never used
+   --> benches/compare.rs:229:4
+    |
+229 | fn try_mysql_conn(url: &str) -> Result<mysql::Conn, String> {
+    |    ^^^^^^^^^^^^^^
+
+warning: function `connect_pg` is never used
+   --> benches/compare.rs:234:4
+    |
+234 | fn connect_pg() -> Option<(String, postgres::Client)> {
+    |    ^^^^^^^^^^
+
+warning: function `connect_mysql` is never used
+   --> benches/compare.rs:259:4
+    |
+259 | fn connect_mysql() -> Option<(String, mysql::Conn)> {
+    |    ^^^^^^^^^^^^^
+
+warning: multiple fields are never read
+   --> benches/compare.rs:289:5
+    |
+284 | struct LinWarm {
+    |        ------- fields in this struct
+...
+289 |     text_substr: lin::Prepared,
+    |     ^^^^^^^^^^^
+290 |     fts_selective: lin::Prepared,
+    |     ^^^^^^^^^^^^^
+291 |     fts_common: lin::Prepared,
+    |     ^^^^^^^^^^
+292 |     fts_miss: lin::Prepared,
+    |     ^^^^^^^^
+293 |     fts_hybrid: lin::Prepared,
+    |     ^^^^^^^^^^
+294 |     materialize: lin::Prepared,
+    |     ^^^^^^^^^^^
+295 |     count_by_wing: lin::Prepared,
+    |     ^^^^^^^^^^^^^
+
+warning: struct `SqlWarm` is never constructed
+   --> benches/compare.rs:382:8
+    |
+382 | struct SqlWarm {
+    |        ^^^^^^^
+
+warning: function `seed_sqlite` is never used
+   --> benches/compare.rs:387:4
+    |
+387 | fn seed_sqlite(n: usize) -> SqlWarm {
+    |    ^^^^^^^^^^^
+
+warning: struct `DuckWarm` is never constructed
+   --> benches/compare.rs:426:8
+    |
+426 | struct DuckWarm {
+    |        ^^^^^^^^
+
+warning: function `seed_duck` is never used
+   --> benches/compare.rs:431:4
+    |
+431 | fn seed_duck(n: usize) -> DuckWarm {
+    |    ^^^^^^^^^
+
+warning: struct `MapWarm` is never constructed
+   --> benches/compare.rs:461:8
+    |
+461 | struct MapWarm {
+    |        ^^^^^^^
+
+warning: function `seed_map` is never used
+   --> benches/compare.rs:466:4
+    |
+466 | fn seed_map(n: usize) -> MapWarm {
+    |    ^^^^^^^^
+
+warning: struct `PgWarm` is never constructed
+   --> benches/compare.rs:476:8
+    |
+476 | struct PgWarm {
+    |        ^^^^^^
+
+warning: function `seed_pg` is never used
+   --> benches/compare.rs:486:4
+    |
+486 | fn seed_pg(n: usize, client: postgres::Client) -> PgWarm {
+    |    ^^^^^^^
+
+warning: struct `MysqlBenchConn` is never constructed
+   --> benches/compare.rs:540:8
+    |
+540 | struct MysqlBenchConn {
+    |        ^^^^^^^^^^^^^^
+
+warning: associated items `new`, `owned_sql`, `push_identifier`, `query_drop`, and `prep` are never used
+   --> benches/compare.rs:546:8
+    |
+545 | impl MysqlBenchConn {
+    | ------------------- associated items in this implementation
+546 |     fn new(conn: mysql::Conn) -> Self {
+    |        ^^^
+...
+560 |     fn owned_sql(&self, sql: &str) -> String {
+    |        ^^^^^^^^^
+...
+600 |     fn push_identifier(&self, out: &mut String, token: &str) {
+    |        ^^^^^^^^^^^^^^^
+...
+615 |     fn query_drop(&mut self, sql: impl AsRef<str>) -> mysql::Result<()> {
+    |        ^^^^^^^^^^
+...
+620 |     fn prep(&mut self, sql: impl AsRef<str>) -> mysql::Result<mysql::Statement> {
+    |        ^^^^
+
+warning: struct `MysqlWarm` is never constructed
+   --> benches/compare.rs:648:8
+    |
+648 | struct MysqlWarm {
+    |        ^^^^^^^^^
+
+warning: function `seed_mysql` is never used
+   --> benches/compare.rs:658:4
+    |
+658 | fn seed_mysql(n: usize, conn: mysql::Conn) -> MysqlWarm {
+    |    ^^^^^^^^^^
+
+warning: struct `JoinUser` is never constructed
+   --> benches/compare.rs:710:8
+    |
+710 | struct JoinUser {
+    |        ^^^^^^^^
+
+warning: struct `JoinOrder` is never constructed
+   --> benches/compare.rs:715:8
+    |
+715 | struct JoinOrder {
+    |        ^^^^^^^^^
+
+warning: function `join_data` is never used
+   --> benches/compare.rs:721:4
+    |
+721 | fn join_data() -> (Vec<JoinUser>, Vec<JoinOrder>) {
+    |    ^^^^^^^^^
+
+warning: function `lin_insert_users` is never used
+   --> benches/compare.rs:738:4
+    |
+738 | fn lin_insert_users(rows: &[JoinUser]) -> String {
+    |    ^^^^^^^^^^^^^^^^
+
+warning: function `lin_insert_orders` is never used
+   --> benches/compare.rs:754:4
+    |
+754 | fn lin_insert_orders(rows: &[JoinOrder]) -> String {
+    |    ^^^^^^^^^^^^^^^^^
+
+warning: struct `JoinLin` is never constructed
+   --> benches/compare.rs:771:8
+    |
+771 | struct JoinLin {
+    |        ^^^^^^^
+
+warning: function `seed_join_lin` is never used
+   --> benches/compare.rs:782:4
+    |
+782 | fn seed_join_lin() -> JoinLin {
+    |    ^^^^^^^^^^^^^
+
+warning: function `consume_join_cursor` is never used
+   --> benches/compare.rs:843:4
+    |
+843 | fn consume_join_cursor(db: &lin::Db, q: &LinQueryable) -> usize {
+    |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `consume_projected_cursor` is never used
+   --> benches/compare.rs:852:4
+    |
+852 | fn consume_projected_cursor(db: &lin::Db, q: &LinQueryable) -> usize {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `JoinSql` is never constructed
+   --> benches/compare.rs:862:8
+    |
+862 | struct JoinSql {
+    |        ^^^^^^^
+
+warning: function `seed_join_sqlite` is never used
+   --> benches/compare.rs:866:4
+    |
+866 | fn seed_join_sqlite() -> JoinSql {
+    |    ^^^^^^^^^^^^^^^^
+
+warning: function `sqlite_join_n` is never used
+   --> benches/compare.rs:900:4
+    |
+900 | fn sqlite_join_n(conn: &rusqlite::Connection, sql: &str) -> usize {
+    |    ^^^^^^^^^^^^^
+
+warning: struct `JoinDuck` is never constructed
+   --> benches/compare.rs:914:8
+    |
+914 | struct JoinDuck {
+    |        ^^^^^^^^
+
+warning: function `seed_join_duck` is never used
+   --> benches/compare.rs:918:4
+    |
+918 | fn seed_join_duck() -> JoinDuck {
+    |    ^^^^^^^^^^^^^^
+
+warning: function `duck_join_n` is never used
+   --> benches/compare.rs:950:4
+    |
+950 | fn duck_join_n(conn: &duckdb::Connection, sql: &str) -> usize {
+    |    ^^^^^^^^^^^
+
+warning: struct `JoinPg` is never constructed
+   --> benches/compare.rs:964:8
+    |
+964 | struct JoinPg {
+    |        ^^^^^^
+
+warning: function `seed_join_pg` is never used
+   --> benches/compare.rs:970:4
+    |
+970 | fn seed_join_pg(client: postgres::Client) -> JoinPg {
+    |    ^^^^^^^^^^^^
+
+warning: function `pg_join_n` is never used
+    --> benches/compare.rs:1011:4
+     |
+1011 | fn pg_join_n(client: &mut postgres::Client, stmt: &postgres::Statement) -> usize {
+     |    ^^^^^^^^^
+
+warning: struct `JoinMysql` is never constructed
+    --> benches/compare.rs:1024:8
+     |
+1024 | struct JoinMysql {
+     |        ^^^^^^^^^
+
+warning: function `seed_join_mysql` is never used
+    --> benches/compare.rs:1030:4
+     |
+1030 | fn seed_join_mysql(conn: mysql::Conn) -> JoinMysql {
+     |    ^^^^^^^^^^^^^^^
+
+warning: function `mysql_join_n` is never used
+    --> benches/compare.rs:1072:4
+     |
+1072 | fn mysql_join_n(conn: &mut mysql::Conn, stmt: &mysql::Statement) -> usize {
+     |    ^^^^^^^^^^^^
+
+warning: struct `LinInsert` is never constructed
+    --> benches/compare.rs:1081:8
+     |
+1081 | struct LinInsert {
+     |        ^^^^^^^^^
+
+warning: function `setup_lin_insert_variant` is never used
+    --> benches/compare.rs:1086:4
+     |
+1086 | fn setup_lin_insert_variant(n: usize, embed: bool, scalar_index: bool, fts: bool) -> LinInsert {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `setup_lin_insert` is never used
+    --> benches/compare.rs:1111:4
+     |
+1111 | fn setup_lin_insert(n: usize) -> LinInsert {
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `empty_sqlite` is never used
+    --> benches/compare.rs:1115:4
+     |
+1115 | fn empty_sqlite() -> rusqlite::Connection {
+     |    ^^^^^^^^^^^^
+
+warning: function `empty_duck` is never used
+    --> benches/compare.rs:1132:4
+     |
+1132 | fn empty_duck() -> duckdb::Connection {
+     |    ^^^^^^^^^^
+
+warning: function `empty_pg` is never used
+    --> benches/compare.rs:1150:4
+     |
+1150 | fn empty_pg(url: String) -> PgBenchClient {
+     |    ^^^^^^^^
+
+warning: function `empty_mysql` is never used
+    --> benches/compare.rs:1170:4
+     |
+1170 | fn empty_mysql(url: String) -> MysqlBenchConn {
+     |    ^^^^^^^^^^^
+
+warning: function `fill_lin` is never used
+    --> benches/compare.rs:1189:4
+     |
+1189 | fn fill_lin(ins: &mut LinInsert) -> usize {
+     |    ^^^^^^^^
+
+warning: function `validate_lin_insert` is never used
+    --> benches/compare.rs:1193:4
+     |
+1193 | fn validate_lin_insert(ins: &LinInsert, n: usize) {
+     |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `validate_lin_rows` is never used
+    --> benches/compare.rs:1197:4
+     |
+1197 | fn validate_lin_rows(db: &lin::Db, n: usize) {
+     |    ^^^^^^^^^^^^^^^^^
+
+warning: struct `LinRebuildWarm` is never constructed
+    --> benches/compare.rs:1213:8
+     |
+1213 | struct LinRebuildWarm {
+     |        ^^^^^^^^^^^^^^
+
+warning: function `seed_lin_rebuild` is never used
+    --> benches/compare.rs:1217:4
+     |
+1217 | fn seed_lin_rebuild(n: usize) -> LinRebuildWarm {
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `fill_sqlite` is never used
+    --> benches/compare.rs:1236:4
+     |
+1236 | fn fill_sqlite(conn: &rusqlite::Connection, n: usize) {
+     |    ^^^^^^^^^^^
+
+warning: function `validate_sqlite_docs` is never used
+    --> benches/compare.rs:1240:4
+     |
+1240 | fn validate_sqlite_docs(conn: &rusqlite::Connection, expected: &[Doc]) -> airbug_bench::Result<()> {
+     |    ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `fill_sqlite_rows` is never used
+    --> benches/compare.rs:1276:4
+     |
+1276 | fn fill_sqlite_rows(conn: &rusqlite::Connection, rows: &[Doc]) {
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `fill_duck_appender` is never used
+    --> benches/compare.rs:1292:4
+     |
+1292 | fn fill_duck_appender(conn: &duckdb::Connection, rows: &[Doc]) {
+     |    ^^^^^^^^^^^^^^^^^^
+
+warning: function `fill_duck_rows` is never used
+    --> benches/compare.rs:1302:4
+     |
+1302 | fn fill_duck_rows(conn: &duckdb::Connection, rows: &[Doc]) {
+     |    ^^^^^^^^^^^^^^
+
+warning: function `fill_pg_rows` is never used
+    --> benches/compare.rs:1312:4
+     |
+1312 | fn fill_pg_rows(client: &mut postgres::Client, rows: &[Doc]) {
+     |    ^^^^^^^^^^^^
+
+warning: function `fill_pg_copy` is never used
+    --> benches/compare.rs:1326:4
+     |
+1326 | fn fill_pg_copy(client: &mut postgres::Client, rows: &[Doc]) -> u64 {
+     |    ^^^^^^^^^^^^
+
+warning: function `validate_pg_docs` is never used
+    --> benches/compare.rs:1356:4
+     |
+1356 | fn validate_pg_docs(
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `fill_mysql_rows` is never used
+    --> benches/compare.rs:1400:4
+     |
+1400 | fn fill_mysql_rows(conn: &mut MysqlBenchConn, rows: &[Doc]) {
+     |    ^^^^^^^^^^^^^^^
+
+warning: function `validate_mysql_docs` is never used
+    --> benches/compare.rs:1414:4
+     |
+1414 | fn validate_mysql_docs(
+     |    ^^^^^^^^^^^^^^^^^^^
+
+warning: struct `MysqlNativeInsert` is never constructed
+    --> benches/compare.rs:1442:8
+     |
+1442 | struct MysqlNativeInsert {
+     |        ^^^^^^^^^^^^^^^^^
+
+warning: function `setup_mysql_native` is never used
+    --> benches/compare.rs:1449:4
+     |
+1449 | fn setup_mysql_native(url: String, n: usize) -> MysqlNativeInsert {
+     |    ^^^^^^^^^^^^^^^^^^
+
+warning: function `fill_mysql_native` is never used
+    --> benches/compare.rs:1471:4
+     |
+1471 | fn fill_mysql_native(input: &mut MysqlNativeInsert) -> usize {
+     |    ^^^^^^^^^^^^^^^^^
+
+warning: function `lin_append_log_src` is never used
+    --> benches/compare.rs:1495:4
+     |
+1495 | fn lin_append_log_src(n: usize) -> String {
+     |    ^^^^^^^^^^^^^^^^^^
+
+warning: struct `LinAppendLog` is never constructed
+    --> benches/compare.rs:1509:8
+     |
+1509 | struct LinAppendLog {
+     |        ^^^^^^^^^^^^
+
+warning: function `setup_lin_append_log` is never used
+    --> benches/compare.rs:1514:4
+     |
+1514 | fn setup_lin_append_log(n: usize) -> LinAppendLog {
+     |    ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `fill_lin_append_log` is never used
+    --> benches/compare.rs:1522:4
+     |
+1522 | fn fill_lin_append_log(ins: &mut LinAppendLog) {
+     |    ^^^^^^^^^^^^^^^^^^^
+
+warning: struct `TmpKeep` is never constructed
+    --> benches/compare.rs:1527:8
+     |
+1527 | struct TmpKeep(std::path::PathBuf);
+     |        ^^^^^^^
+
+warning: function `fresh_tmp` is never used
+    --> benches/compare.rs:1535:4
+     |
+1535 | fn fresh_tmp(label: &str) -> TmpKeep {
+     |    ^^^^^^^^^
+
+warning: struct `LinDurableAppend` is never constructed
+    --> benches/compare.rs:1549:8
+     |
+1549 | struct LinDurableAppend {
+     |        ^^^^^^^^^^^^^^^^
+
+warning: function `setup_lin_durable_append` is never used
+    --> benches/compare.rs:1555:4
+     |
+1555 | fn setup_lin_durable_append(n: usize) -> LinDurableAppend {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `setup_lin_durable_append_sync` is never used
+    --> benches/compare.rs:1559:4
+     |
+1559 | fn setup_lin_durable_append_sync(n: usize, sync: lin::SyncMode) -> LinDurableAppend {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `fill_lin_durable_append` is never used
+    --> benches/compare.rs:1573:4
+     |
+1573 | fn fill_lin_durable_append(ins: &mut LinDurableAppend) -> lin::Handle {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `LinDurableInsert` is never constructed
+    --> benches/compare.rs:1578:8
+     |
+1578 | struct LinDurableInsert {
+     |        ^^^^^^^^^^^^^^^^
+
+warning: function `setup_lin_durable_insert` is never used
+    --> benches/compare.rs:1584:4
+     |
+1584 | fn setup_lin_durable_insert(n: usize) -> LinDurableInsert {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `fill_lin_durable_insert` is never used
+    --> benches/compare.rs:1598:4
+     |
+1598 | fn fill_lin_durable_insert(ins: &mut LinDurableInsert) -> lin::Handle {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GROUP_COMMITS` is never used
+    --> benches/compare.rs:1602:7
+     |
+1602 | const GROUP_COMMITS: usize = 16;
+     |       ^^^^^^^^^^^^^
+
+warning: struct `LinGroupCommit` is never constructed
+    --> benches/compare.rs:1604:8
+     |
+1604 | struct LinGroupCommit {
+     |        ^^^^^^^^^^^^^^
+
+warning: function `setup_lin_group_commit` is never used
+    --> benches/compare.rs:1611:4
+     |
+1611 | fn setup_lin_group_commit() -> LinGroupCommit {
+     |    ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `fill_lin_sequential_commits` is never used
+    --> benches/compare.rs:1636:4
+     |
+1636 | fn fill_lin_sequential_commits(group: &mut LinGroupCommit) {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `fill_lin_group_commit` is never used
+    --> benches/compare.rs:1642:4
+     |
+1642 | fn fill_lin_group_commit(group: &mut LinGroupCommit) -> lin::Handle {
+     |    ^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `LinColdReopen` is never constructed
+    --> benches/compare.rs:1649:8
+     |
+1649 | struct LinColdReopen {
+     |        ^^^^^^^^^^^^^
+
+warning: function `setup_lin_cold_reopen` is never used
+    --> benches/compare.rs:1653:4
+     |
+1653 | fn setup_lin_cold_reopen(n: usize) -> LinColdReopen {
+     |    ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `setup_lin_hot_reopen` is never used
+    --> benches/compare.rs:1669:4
+     |
+1669 | fn setup_lin_hot_reopen(n: usize) -> LinColdReopen {
+     |    ^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `LinWalShip` is never constructed
+    --> benches/compare.rs:1678:8
+     |
+1678 | struct LinWalShip {
+     |        ^^^^^^^^^^
+
+warning: function `setup_lin_wal_ship` is never used
+    --> benches/compare.rs:1682:4
+     |
+1682 | fn setup_lin_wal_ship(n: usize) -> LinWalShip {
+     |    ^^^^^^^^^^^^^^^^^^
+
+warning: struct `SqliteDurable` is never constructed
+    --> benches/compare.rs:1692:8
+     |
+1692 | struct SqliteDurable {
+     |        ^^^^^^^^^^^^^
+
+warning: function `setup_sqlite_durable` is never used
+    --> benches/compare.rs:1699:4
+     |
+1699 | fn setup_sqlite_durable(kind: &'static str, n: usize) -> SqliteDurable {
+     |    ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `fill_sqlite_durable` is never used
+    --> benches/compare.rs:1742:4
+     |
+1742 | fn fill_sqlite_durable(s: &mut SqliteDurable) {
+     |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `empty_sqlite_logs` is never used
+    --> benches/compare.rs:1749:4
+     |
+1749 | fn empty_sqlite_logs() -> rusqlite::Connection {
+     |    ^^^^^^^^^^^^^^^^^
+
+warning: function `empty_duck_logs` is never used
+    --> benches/compare.rs:1762:4
+     |
+1762 | fn empty_duck_logs() -> duckdb::Connection {
+     |    ^^^^^^^^^^^^^^^
+
+warning: function `empty_pg_logs` is never used
+    --> benches/compare.rs:1775:4
+     |
+1775 | fn empty_pg_logs(url: String) -> PgBenchClient {
+     |    ^^^^^^^^^^^^^
+
+warning: function `empty_mysql_logs` is never used
+    --> benches/compare.rs:1791:4
+     |
+1791 | fn empty_mysql_logs(url: String) -> MysqlBenchConn {
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `fill_sqlite_logs` is never used
+    --> benches/compare.rs:1806:4
+     |
+1806 | fn fill_sqlite_logs(conn: &rusqlite::Connection, n: usize) {
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `fill_duck_logs` is never used
+    --> benches/compare.rs:1828:4
+     |
+1828 | fn fill_duck_logs(conn: &duckdb::Connection, n: usize) {
+     |    ^^^^^^^^^^^^^^
+
+warning: function `fill_pg_logs` is never used
+    --> benches/compare.rs:1845:4
+     |
+1845 | fn fill_pg_logs(client: &mut postgres::Client, n: usize) {
+     |    ^^^^^^^^^^^^
+
+warning: function `fill_mysql_logs` is never used
+    --> benches/compare.rs:1868:4
+     |
+1868 | fn fill_mysql_logs(conn: &mut MysqlBenchConn, n: usize) {
+     |    ^^^^^^^^^^^^^^^
+
+warning: function `unused_original_benchmark_main` is never used
+    --> benches/compare.rs:1892:4
+     |
+1892 | fn unused_original_benchmark_main() -> airbug_bench::Result<()> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GRAPH_N` is never used
+    --> benches/compare.rs:3361:7
+     |
+3361 | const GRAPH_N: usize = 5_000;
+     |       ^^^^^^^
+
+warning: struct `LinWrite` is never constructed
+    --> benches/compare.rs:3363:8
+     |
+3363 | struct LinWrite {
+     |        ^^^^^^^^
+
+warning: function `setup_lin_write` is never used
+    --> benches/compare.rs:3373:4
+     |
+3373 | fn setup_lin_write(n: usize) -> LinWrite {
+     |    ^^^^^^^^^^^^^^^
+
+warning: function `setup_lin_write_db` is never used
+    --> benches/compare.rs:3377:4
+     |
+3377 | fn setup_lin_write_db(n: usize, mut db: lin::Db) -> LinWrite {
+     |    ^^^^^^^^^^^^^^^^^^
+
+warning: function `write_update_lin` is never used
+    --> benches/compare.rs:3423:4
+     |
+3423 | fn write_update_lin(s: &mut LinWrite) -> usize {
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `write_delete_lin` is never used
+    --> benches/compare.rs:3427:4
+     |
+3427 | fn write_delete_lin(s: &mut LinWrite) -> usize {
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `setup_sqlite_write` is never used
+    --> benches/compare.rs:3431:4
+     |
+3431 | fn setup_sqlite_write(n: usize) -> SqlWarm {
+     |    ^^^^^^^^^^^^^^^^^^
+
+warning: function `write_update_sqlite` is never used
+    --> benches/compare.rs:3442:4
+     |
+3442 | fn write_update_sqlite(s: &mut SqlWarm) -> usize {
+     |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `write_delete_sqlite` is never used
+    --> benches/compare.rs:3453:4
+     |
+3453 | fn write_delete_sqlite(s: &mut SqlWarm) -> usize {
+     |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `tx_update_commit_lin` is never used
+    --> benches/compare.rs:3464:4
+     |
+3464 | fn tx_update_commit_lin(s: &mut LinWrite) -> usize {
+     |    ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `tx_update_commit_sqlite` is never used
+    --> benches/compare.rs:3471:4
+     |
+3471 | fn tx_update_commit_sqlite(s: &mut SqlWarm) -> usize {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `tx_update_rollback_lin` is never used
+    --> benches/compare.rs:3484:4
+     |
+3484 | fn tx_update_rollback_lin(s: &mut LinWrite) -> usize {
+     |    ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `tx_update_rollback_sqlite` is never used
+    --> benches/compare.rs:3491:4
+     |
+3491 | fn tx_update_rollback_sqlite(s: &mut SqlWarm) -> usize {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `LinPlan` is never constructed
+    --> benches/compare.rs:3504:8
+     |
+3504 | struct LinPlan {
+     |        ^^^^^^^
+
+warning: function `setup_lin_plan` is never used
+    --> benches/compare.rs:3510:4
+     |
+3510 | fn setup_lin_plan(groups: usize) -> LinPlan {
+     |    ^^^^^^^^^^^^^^
+
+warning: struct `LinGraph` is never constructed
+    --> benches/compare.rs:3521:8
+     |
+3521 | struct LinGraph {
+     |        ^^^^^^^^
+
+warning: function `setup_lin_graph` is never used
+    --> benches/compare.rs:3527:4
+     |
+3527 | fn setup_lin_graph(n: usize) -> LinGraph {
+     |    ^^^^^^^^^^^^^^^
+
+warning: function `run_suite` is never used
+    --> benches/compare.rs:3559:4
+     |
+3559 | fn run_suite(mut suite: Suite<'_>, args: &[String]) -> airbug_bench::Result<()> {
+     |    ^^^^^^^^^
+
+warning: enum `DurableOp` is never used
+    --> benches/compare.rs:3761:6
+     |
+3761 | enum DurableOp { Update, Delete, Commit, Rollback }
+     |      ^^^^^^^^^
+
+warning: method `name` is never used
+    --> benches/compare.rs:3763:8
+     |
+3762 | impl DurableOp {
+     | -------------- method in this implementation
+3763 |     fn name(self) -> &'static str { match self { Self::Update => "update", Self::Delete => "delete", Self::Commit => "commit", Sel...
+     |        ^^^^
+
+warning: struct `DurableLinWrite` is never constructed
+    --> benches/compare.rs:3765:8
+     |
+3765 | struct DurableLinWrite {
+     |        ^^^^^^^^^^^^^^^
+
+warning: function `durable_json_row` is never used
+    --> benches/compare.rs:3770:4
+     |
+3770 | fn durable_json_row(row: &lin::Row) -> serde_json::Value {
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `durable_expected_lin` is never used
+    --> benches/compare.rs:3779:4
+     |
+3779 | fn durable_expected_lin(db: &lin::Db, op: DurableOp, id: &str) -> Vec<serde_json::Value> {
+     |    ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `setup_durable_lin_write` is never used
+    --> benches/compare.rs:3792:4
+     |
+3792 | fn setup_durable_lin_write(n: usize, op: DurableOp) -> DurableLinWrite {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `run_durable_lin_write` is never used
+    --> benches/compare.rs:3799:4
+     |
+3799 | fn run_durable_lin_write(s: &mut DurableLinWrite, op: DurableOp) -> usize {
+     |    ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `verify_durable_lin_write` is never used
+    --> benches/compare.rs:3803:4
+     |
+3803 | fn verify_durable_lin_write(s: &DurableLinWrite, affected: &usize) -> airbug_bench::Result<()> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `DurableSqliteWrite` is never constructed
+    --> benches/compare.rs:3813:8
+     |
+3813 | struct DurableSqliteWrite {
+     |        ^^^^^^^^^^^^^^^^^^
+
+warning: function `setup_durable_sqlite_write` is never used
+    --> benches/compare.rs:3818:4
+     |
+3818 | fn setup_durable_sqlite_write(n: usize, op: DurableOp, journal: &str) -> DurableSqliteWrite {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `run_durable_sqlite_write` is never used
+    --> benches/compare.rs:3840:4
+     |
+3840 | fn run_durable_sqlite_write(s: &mut DurableSqliteWrite, op: DurableOp) -> usize {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `verify_durable_sqlite_write` is never used
+    --> benches/compare.rs:3844:4
+     |
+3844 | fn verify_durable_sqlite_write(s: &DurableSqliteWrite, affected: &usize) -> airbug_bench::Result<()> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `register_durable_mutations` is never used
+    --> benches/compare.rs:3854:4
+     |
+3854 | fn register_durable_mutations(suite: &mut Suite) {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `WalScalarControl` is never constructed
+    --> benches/compare.rs:3869:8
+     |
+3869 | struct WalScalarControl {
+     |        ^^^^^^^^^^^^^^^^
+
+warning: function `setup_wal_scalar_control` is never used
+    --> benches/compare.rs:3875:4
+     |
+3875 | fn setup_wal_scalar_control(sync: lin::SyncMode) -> WalScalarControl {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `run_wal_scalar_control` is never used
+    --> benches/compare.rs:3886:4
+     |
+3886 | fn run_wal_scalar_control(state: &mut WalScalarControl) -> usize {
+     |    ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `verify_wal_scalar_control` is never used
+    --> benches/compare.rs:3889:4
+     |
+3889 | fn verify_wal_scalar_control(state: &WalScalarControl, affected: &usize) -> airbug_bench::Result<()> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `register_wal_scalar_controls` is never used
+    --> benches/compare.rs:3903:4
+     |
+3903 | fn register_wal_scalar_controls(suite: &mut Suite) {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `lin` (bench "compare") generated 148 warnings
+    Finished `bench` profile [optimized] target(s) in 15.02s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+  Executable benches/compare.rs (/tmp/lin-cow-vnext-target/release/build/lin/fab930e739517390/out/compare-fab930e739517390)
