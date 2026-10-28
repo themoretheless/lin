@@ -11,7 +11,9 @@
 //! - Same N, same columns (id/uri/wing/title/ts/body).
 //! - Lin point_get / filter / insert use **prepare once, run many** (like SQL prepared).
 //! - Filter benches: Lin `count by …` vs SQL `COUNT(*)` (same shape: return a count).
-//! - Point get / equality / range / LIKE-style substring are comparable.
+//! - Legacy point_get mixes Lin id/title rows, SQL COUNT(*) and HashMap title length.
+//!   It is an asymmetric workload; use point_values for matching owned id/title results.
+//! - Equality / range / LIKE-style substring use their declared count contracts.
 //! - Join: inner `orders ⋈ users` (FK `orders.user_id → users.id`) — Lin `run_batch`
 //!   (SoA + [`RecordBatch`]), Lin lazy cursor, SQL `INNER JOIN`. Filter+join: `total > 100`.
 //!   Row-API `run` still materializes `Vec<Row>` from the same path.

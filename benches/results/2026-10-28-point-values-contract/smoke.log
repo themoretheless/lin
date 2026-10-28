@@ -1,0 +1,42 @@
+airbug dash: http://127.0.0.1:8790/#/bench
+bench: point_values/miss/lin — validating and calibrating
+bench: point_values/miss/lin — measuring 1 samples
+bench: point_values/miss/sqlite — validating and calibrating
+bench: point_values/miss/sqlite — measuring 1 samples
+bench: point_values/miss/duckdb — validating and calibrating
+bench: point_values/miss/duckdb — measuring 1 samples
+bench: point_values/hit/lin — validating and calibrating
+bench: point_values/hit/lin — measuring 1 samples
+bench: point_values/hit/sqlite — validating and calibrating
+bench: point_values/hit/sqlite — measuring 1 samples
+bench: point_values/hit/duckdb — validating and calibrating
+bench: point_values/hit/duckdb — measuring 1 samples
+# bench 1793169629733285000-48601
+
+Status: Complete
+
+| Case | Metric | Median | Unit | Scope / statistic | Observations | Processes |
+|---|---|---:|---|---|---:|---:|
+| point_values/miss/lin [candidate] | wall | 500.0000 | ns | current thread wall clock; scheduler included / batch_total | 1 | 1 |
+| point_values/miss/sqlite [candidate] | wall | 2333.0000 | ns | current thread wall clock; scheduler included / batch_total | 1 | 1 |
+| point_values/miss/duckdb [candidate] | wall | 123500.0000 | ns | current thread wall clock; scheduler included / batch_total | 1 | 1 |
+| point_values/hit/lin [candidate] | wall | 6083.0000 | ns | current thread wall clock; scheduler included / batch_total | 1 | 1 |
+| point_values/hit/sqlite [candidate] | wall | 4333.0000 | ns | current thread wall clock; scheduler included / batch_total | 1 | 1 |
+| point_values/hit/duckdb [candidate] | wall | 199250.0000 | ns | current thread wall clock; scheduler included / batch_total | 1 | 1 |
+
+Medians above summarize observations, not pooled operation-latency percentiles. Comparisons aggregate within each process first.
+
+- Raw batches are not independent process replications. Batch averages are not individual-operation latency. CPU frequency and background load are uncontrolled.
+
+- point_values/miss/lin: some samples below half the requested duration; iteration cap or workload drift may limit precision
+
+- point_values/miss/sqlite: some samples below half the requested duration; iteration cap or workload drift may limit precision
+
+- point_values/miss/duckdb: some samples below half the requested duration; iteration cap or workload drift may limit precision
+
+- point_values/hit/lin: some samples below half the requested duration; iteration cap or workload drift may limit precision
+
+- point_values/hit/sqlite: some samples below half the requested duration; iteration cap or workload drift may limit precision
+
+- point_values/hit/duckdb: some samples below half the requested duration; iteration cap or workload drift may limit precision
+

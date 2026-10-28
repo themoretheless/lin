@@ -1,0 +1,46 @@
+{
+  "audit_complete": true,
+  "source_reference": "d021bf29a21f1b91a626153063c6f1fa3df1aa98",
+  "source_path": "benches/results/2026-10-28-hashing-fixed-array-output-component/compare.rs",
+  "source_sha256": "59b8acb6b9157d6b5fde56332fb35b0f2e0ea4728eb7f6a6b8c0c53c14b58508",
+  "legacy_point_payloads_equivalent": false,
+  "lin_payload": "id/title Row materialization, timed closure returns done.n",
+  "sql_payload": "COUNT(*) scalar for SQLite/DuckDB/Postgres/MySQL",
+  "hashmap_payload": "title byte length",
+  "read_smoke_scope": "successful execution; does not compare point id/title values",
+  "does_not_invalidate_same_case_source_pair_timings": true,
+  "historical_observations_preserved": true,
+  "performance_qualified": false,
+  "evidence": {
+    "lin": {
+      "line": 1954,
+      "source": ".bench_fixture(\"point_get/lin\", lin.clone(), |s| {\n            black_box(s.point_get.run(&mut s.db).expect(\"lin get\").done.n)\n        })\n        ",
+      "full_result_value_validation_registered": false
+    },
+    "sqlite": {
+      "line": 1961,
+      "source": ".bench_fixture(\"point_get/sqlite\", sql.clone(), |s| {\n            let mut stmt = s\n                .conn\n                .prepare_cached(\"SELECT COUNT(*) FROM docs WHERE id = ?1\")\n                .expect(\"sqlite prep\");\n            let n: i64 = stmt\n                .query_row(rusqlite::params![s.probe_id], |r| r.get(0))\n                .expect(\"sqlite get\");\n            black_box(n)\n        })\n        ",
+      "full_result_value_validation_registered": false
+    },
+    "duckdb": {
+      "line": 1975,
+      "source": ".bench_fixture(\"point_get/duckdb\", duck.clone(), |s| {\n            let mut stmt = s\n                .conn\n                .prepare_cached(\"SELECT COUNT(*) FROM docs WHERE id = ?\")\n                .expect(\"duck prep\");\n            let n: i64 = stmt\n                .query_row(duckdb::params![s.probe_id], |r| r.get(0))\n                .expect(\"duck get\");\n            black_box(n)\n        })\n        ",
+      "full_result_value_validation_registered": false
+    },
+    "hashmap": {
+      "line": 1989,
+      "source": ".bench_fixture(\"point_get/hashmap\", map, |s| {\n            black_box(s.by_id.get(&s.probe_id).map(|d| d.title.len()).unwrap_or(0))\n        })\n        ",
+      "full_result_value_validation_registered": false
+    },
+    "postgres": {
+      "line": 1997,
+      "source": ".bench_fixture(\"point_get/postgres\", pg, |s| {\n                let n: i64 = s\n                    .client\n                    .query_one(&s.point_get, &[&s.probe_id])\n                    .expect(\"pg get\")\n                    .get(0);\n                black_box(n)\n            })\n            ",
+      "full_result_value_validation_registered": false
+    },
+    "mysql": {
+      "line": 2011,
+      "source": ".bench_fixture(\"point_get/mysql\", mysql, |s| {\n                let n: i64 = s\n                    .conn\n                    .exec_first(&s.point_get, (&s.probe_id,))\n                    .expect(\"mysql get\")\n                    .expect(\"mysql get row\");\n                black_box(n)\n            })\n            ",
+      "full_result_value_validation_registered": false
+    }
+  }
+}
