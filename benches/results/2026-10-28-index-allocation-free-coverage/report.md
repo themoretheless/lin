@@ -2,7 +2,7 @@
 
 Candidate884ebeb81 is isolated from the pending DELETE-WAL contender andallprevious rejected optimizations. Baseline isa7d4b02c3COW+CAS. Only index.rs changes runtime behavior. SingleCmp+singleIndexUse checks partial predicates andnumeric precision directly;compound/other predicates keep the unchanged original bounded DNF. Single-segment field names borrow;dotted fields join once. The original conjunct/DNF helper remains unchanged as the regression oracle.
 
-Three focused release tests pass:720atomic combinations,AND/OR branch alignment,anddotted/Unicode/compound partial predicates. Full release correctness andpaired timings remain pending.
+Three focused release tests pass:720atomic combinations,AND/OR branch alignment,anddotted/Unicode/compound partial predicates. The full release library/integration suite passed452tests,2ignored. Paired timings remain pending.
 
 A System-delegating counter measures only1000coverage calls per fresh process.24processes cover4shapes×2source roles×3repeats;all repeats match. Shape construction,counter reads andJSON are outside the measured counter interval.
 

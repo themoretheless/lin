@@ -1,0 +1,9 @@
+# Allocation-free atomic coverage paired component
+
+Candidate884ebeb81 versus COW+CAS baselinea7d4b02c3. Only index.rs changes runtime behavior. Pending DELETE-WAL andprevious rejected SoA/bulk/DNF-bypass candidates are excluded. This is a distinct candidate:singleCmp coverage avoids both DNF andatom-vector allocations andborrows leaf field names,while unchanged original DNF/conjunct code remains the reference for compound predicates.
+
+Same frozen compare.rs,ordinary uninstrumented release binaries,logical data/schema/embedding payload,validation,sync andsetup/teardown contracts. No allocation-counter shim is present in these builds. Target:Lin filter_eq. Seven controls:Lin filter_range,point_get,text_substr,UPDATE1k,scalar Full UPDATE,andSQLite/DuckDB filter_eq. Two six-pair series,rotating cases/roles,same baseline/control executable,eight observations,max_iterations1,zero warmup. All288fresh processes/2304observations retained. Both target windows need6/6positive pairs andmedian gain above median absolute A/A;eachcontrol needs gain>=-max(2%,A/A). No trimming,threshold relaxation or unchanged retries for a pass.
+
+452local release tests/2ignored passed,including720atomic reference combinations anddotted/Unicode/partial-AND/OR coverage. A separate24-process System allocator diagnostic recorded leaf6000→0,dotted7000→1000,partial6000→0andunchangedcompound19000allocations per1000calls. This is allocation evidence only,not latency/RSS/peer qualification. Instrumented binaries are excluded from timings.
+
+Linux reruns the full suite,numeric-precision-bypass runtime mutant and16fresh correctness smokes before timing. Record actual kernel/filesystem environment without tuning it. Component success cannot qualify the whole source orthe eight-peer objective;allfailed pairs andsource/build/test/smoke metadata must remain available.
