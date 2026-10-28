@@ -5708,24 +5708,8 @@ impl Db {
     ) -> Result<(Vec<Row>, Vec<Edge>, Option<crate::persist::PreparedInsert>), Error> {
         let now = now_ms();
         let n = records.len();
-        let mut built: Vec<Row> = if n >= 4096 {
-            std::thread::scope(|scope| {
-                let (left, right) = records.split_at(n / 2);
-                let worker = std::thread::Builder::new().spawn_scoped(scope, || {
-                    let mut rows = Vec::with_capacity(right.len());
-                    append_batch_shape_rows(&mut rows, right, now);
-                    rows
-                });
-                let mut rows = Vec::with_capacity(n);
-                append_batch_shape_rows(&mut rows, left, now);
-                append_bulk_worker_rows(&mut rows, right, now, worker);
-                rows
-            })
-        } else {
-            let mut rows = Vec::with_capacity(n);
-            append_batch_shape_rows(&mut rows, records, now);
-            rows
-        };
+        let mut built = Vec::with_capacity(n);
+        append_batch_shape_rows(&mut built, records, now);
         let mut batch_ids: rustc_hash::FxHashSet<&str> = rustc_hash::FxHashSet::default();
         batch_ids.reserve(n);
         let mut batch_uris: rustc_hash::FxHashSet<&str> = rustc_hash::FxHashSet::default();
@@ -6561,6 +6545,7 @@ fn match_frontier_keys(row: &Row, bind: Option<&str>) -> Vec<String> {
     keys
 }
 
+#[cfg(test)]
 fn append_bulk_worker_rows(
     rows: &mut Vec<Row>,
     records: &[Record],
