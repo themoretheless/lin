@@ -153,6 +153,9 @@ assert not full_audit['source_candidate_qualified'] and full_audit['failed_targe
 rwf = read('benches/results/2026-10-28-wal-rwf-dsync-probe-linux/frozen-audit.json')
 assert rwf['audit_complete'] and rwf['processes'] == 432 and rwf['observations'] == 3456
 assert not rwf['io_gate_passes'] and rwf['failed_full_windows'] == 16 and rwf['failed_control_windows'] == 1
+soa = read('benches/results/2026-10-28-cow-soa-text-reuse-component-linux/frozen-audit.json')
+assert soa['audit_complete'] and soa['processes'] == 324 and soa['observations'] == 2592
+assert not soa['component_gate_passes'] and soa['failed_target_windows'] == 5 and soa['failed_control_windows'] == 2
 mssql = read('benches/results/2026-10-28-mssql-current-cow/functional-status.json')
 assert mssql['functional_raw_audit_complete'] and mssql['frozen_source_hashes_verified'] and mssql['owned_container_cleanup_verified']
 assert mssql['comparative_metrics_public'] is False and mssql['full_objective_achieved'] is False
@@ -160,6 +163,7 @@ lines += [
     '- [Однооператорный CAS snapshot component gate passed](../benches/results/2026-10-28-single-stmt-cas-snapshot/report.md):source2633067cb,144процесса/1152наблюдения;Full31.932–35.768%,Normal91.371–91.663%,все4target окна6/6aboveA/A. Контроли прошли порог;native100k медианы были отрицательны в пределахA/A,поэтому нулевая регрессия не доказана.449release tests/2ignored;неверный multi-statement bypass пойман runtime-тестом. Полная матрица ещё нужна.',
     '- [Совместный COW+CAS full-source gate failed](../benches/results/2026-10-28-cow-cas-full-engine-linux/decision.md),[run40607797376](https://github.com/themoretheless/lin/actions/runs/40607797376):source36666994a,все2412процессов/19296наблюдений проверены независимым аудитом. Все10target окон прошли6/6aboveA/A: native UPDATE13.941–20.267%,scalar Full52.036–52.999%,Normal94.651–94.680%. Семь control окон провалены: Lin bulk INSERT10k в обеих сериях,filter_eq,durable UPDATE1k и три неизменённых SQLite окна. Peer wins: SQLite DELETE96/96,WAL3/96,native/read49/228,DuckDB36/36. Кандидат не принят;производственная и полная восьми-peer квалификация отсутствуют.',
     '- [RWF_DSYNC I/O probe rejected](../benches/results/2026-10-28-wal-rwf-dsync-probe-linux/report.md):run40614973547,432процесса/3456наблюдений;все16Fulltarget окон и1Normalcontrol провалены. Медианы Full от-1.435%до+3.112%,устойчивого ускорения нет.24Linuxsmoke и4error-path теста прошли,raw/source audit выполнен. Производственный код и WAL не менялись;интеграция не выполняется.',
+    '- [SoA text reuse component rejected](../benches/results/2026-10-28-cow-soa-text-reuse-component-linux/decision.md):run40615737232,324процесса/2592наблюдения;5/6target окон UPDATE и2DELETEcontrol окна провалены. UPDATE100k+11.524% прошёл одну серию,+9.432% во второй не прошёл4/6. Снижение3000→0аллокаций в отдельном методе не аттестует UPDATE.453release tests/2ignored,18Linuxsmoke и независимый raw/source audit прошли;этот код исключён из текущего кандидата.',
     '- [MSSQL private refresh](../benches/results/2026-10-28-mssql-current-cow/report.md),[run40603880905](https://github.com/themoretheless/lin/actions/runs/40603880905):замороженный предшествующий COW source75f8f6b7f;native-x86 стенд завершён,локальный raw/source audit и cleanup прошли. В репозитории только encrypted archive и функциональный статус;относительные исходы приватны. Это не публичное доказательство выигрыша и не квалификация нового CAS-кандидата.',
 ]
 output = root / 'docs/benchmark-goal-status-2026-10-27.md'
