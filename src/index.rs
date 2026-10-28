@@ -1109,11 +1109,6 @@ fn pick_conjunct(cat: &Catalog, collection: &str, pred: &Pred) -> Option<IndexUs
 
 /// True when every atomic predicate is enforced by the index seek(s) (no residual filter).
 pub fn index_covers_pred(pred: &Pred, uses: &[IndexUse]) -> bool {
-    if let [use_] = uses
-        && matches!(pred, Pred::Cmp { .. })
-    {
-        return index_covers_single_cmp(pred, use_);
-    }
     let Some(branches) = dnf(pred) else {
         return false;
     };
@@ -1124,37 +1119,6 @@ pub fn index_covers_pred(pred: &Pred, uses: &[IndexUse]) -> bool {
         .iter()
         .zip(uses.iter())
         .all(|(branch, use_)| index_covers_conjunct(branch, use_))
-}
-
-// Equivalent to the single-atom DNF path, without allocating its temporary
-// branch/atom vectors or joining a one-segment field name.
-fn index_covers_single_cmp(pred: &Pred, use_: &IndexUse) -> bool {
-    fn contains_atom(partial: &Pred, atom: &Pred) -> bool {
-        match partial {
-            Pred::And(a, b) => contains_atom(a, atom) || contains_atom(b, atom),
-            other => other == atom,
-        }
-    }
-    if use_.def.pred.as_ref().is_some_and(|partial| contains_atom(partial, pred)) {
-        return true;
-    }
-    let Pred::Cmp { field, op, value } = pred else { return false; };
-    let field: std::borrow::Cow<'_, str> = match field.leaf() {
-        Some(name) => std::borrow::Cow::Borrowed(name),
-        None => std::borrow::Cow::Owned(field.as_str()),
-    };
-    match op {
-        CmpOp::Eq => {
-            if matches!(value, Value::Int(n) if n.unsigned_abs() >= (1 << 53))
-                || matches!(value, Value::Float(n) if !n.is_finite() || n.abs() >= (1u64 << 53) as f64)
-            { return false; }
-            use_.eqs.iter().any(|(f, v)| f == field.as_ref() && v == value)
-        }
-        CmpOp::Gt | CmpOp::Lt | CmpOp::Ge | CmpOp::Le => {
-            use_.range.as_ref().is_some_and(|(f, range_op, range_value)| f == field.as_ref() && range_op == op && range_value == value)
-        }
-        _ => false,
-    }
 }
 
 fn index_covers_conjunct(pred: &Pred, use_: &IndexUse) -> bool {
@@ -1748,56 +1712,3 @@ mod bitmap_sample_once_tests {
 
 #[cfg(test)]
 include!("cow_index_tests.rs");
-
-#[cfg(test)]
-mod allocation_free_cmp_coverage_tests {
-    use super::*;
-    use crate::ast::Field;
-    fn reference(pred: &Pred, uses: &[IndexUse]) -> bool {
-        let Some(branches) = dnf(pred) else { return false; };
-        branches.len() == uses.len() && branches.iter().zip(uses).all(|(branch,use_)| index_covers_conjunct(branch,use_))
-    }
-    #[test]
-    fn atomic_coverage_matches_dnf_with_ranges_partial_indexes_and_precision_edges() {
-        let values = [Value::String("rag".into()), Value::Int(7), Value::Int((1i64<<53)-1), Value::Int(1i64<<53), Value::Float(f64::INFINITY), Value::Float(1.25), Value::Int(i64::MIN), Value::Float(f64::NAN), Value::Float(-0.0), Value::Float((1u64<<53) as f64)];
-        let ops = [CmpOp::Eq,CmpOp::Ne,CmpOp::Gt,CmpOp::Ge,CmpOp::Lt,CmpOp::Le];
-        let mut comparisons = 0;
-        for value in values {
-            for op in ops {
-                let pred=Pred::Cmp {field:Field::name("key"),op,value:value.clone()};
-                for partial in [false,true] {
-                    for matching in [false,true] {
-                        let field=if matching {"key"}else{"other"};
-                        let use_=IndexUse { def:IndexDef{collection:"docs".into(),unique:false,fields:vec![field.into()],pred:partial.then(||pred.clone()),bitmap_card_field:None},eqs:if matches!(op,CmpOp::Eq){vec![(field.into(),value.clone())]}else{vec![]},range:if matches!(op,CmpOp::Gt|CmpOp::Ge|CmpOp::Lt|CmpOp::Le){Some((field.into(),op,value.clone()))}else{None}};
-                        for uses in [vec![],vec![use_.clone()],vec![use_.clone(),use_]] {
-                            assert_eq!(index_covers_pred(&pred,&uses),reference(&pred,&uses));comparisons+=1;
-                        }
-                    }
-                }
-            }
-        }
-        assert_eq!(comparisons,720);
-    }
-    #[test]
-    fn boolean_predicates_keep_dnf_branch_alignment() {
-        let a=Pred::Cmp{field:Field::name("key"),op:CmpOp::Eq,value:Value::Int(1)};
-        let b=Pred::Cmp{field:Field::name("key"),op:CmpOp::Eq,value:Value::Int(2)};
-        let make=|n|IndexUse{def:IndexDef{collection:"docs".into(),unique:false,fields:vec!["key".into()],pred:None,bitmap_card_field:None},eqs:vec![("key".into(),Value::Int(n))],range:None};
-        for pred in [Pred::And(Box::new(a.clone()),Box::new(b.clone())),Pred::Or(Box::new(a),Box::new(b))] {
-            for uses in [vec![],vec![make(1)],vec![make(1),make(2)],vec![make(2),make(1)]] {
-                assert_eq!(index_covers_pred(&pred,&uses),reference(&pred,&uses));
-            }
-        }
-    }
-    #[test]
-    fn dotted_unicode_and_compound_partial_predicates_match_original_reference() {
-        for name in ["key", "nested.key", "ключ"] {
-            let pred=Pred::Cmp{field:Field::path(name),op:CmpOp::Eq,value:Value::String("rag".into())};
-            let other=Pred::Cmp{field:Field::name("other"),op:CmpOp::Eq,value:Value::Int(7)};
-            for partial in [None,Some(pred.clone()),Some(Pred::And(Box::new(pred.clone()),Box::new(other.clone()))),Some(Pred::Or(Box::new(pred.clone()),Box::new(other.clone())))] {
-                let uses=vec![IndexUse{def:IndexDef{collection:"docs".into(),unique:false,fields:vec![name.into()],pred:partial,bitmap_card_field:None},eqs:vec![(name.into(),Value::String("rag".into()))],range:None}];
-                assert_eq!(index_covers_pred(&pred,&uses),reference(&pred,&uses));
-            }
-        }
-    }
-}
