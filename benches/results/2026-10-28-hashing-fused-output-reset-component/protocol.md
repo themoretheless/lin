@@ -1,0 +1,9 @@
+# Fused sparse output copy and scratch reset
+
+Changed hypothesis following the rejected sparse-output candidate2c8515692: copy each normalized touched coordinate and reset its scratch value/seen bit in the same traversal. Dense output keeps original full copy before reset. Every output coordinate initialized, full Arc<[f32]> representation retained, touched list cleared only after copy/reset completes. Feature hashing, normalization, dimensions, custom batch behavior, ownership, row/transaction/error/sync semantics unchanged. Safety argument remains full initialization before assume_init; no raw pointer or uninitialized read.
+
+The previous candidate showed INSERT10k medians+7.790%/+8.054%, but missed6/6in one series; it was not accepted, its losing pair retained and source restored. This is a changed mechanism, not an unchanged retry. No incremental gain over that candidate may be claimed without direct paired measurements against it.
+
+Required correctness: dense-bit oracle, sparse/dense occupancy threshold, zero/odd dimensions, large normalization fallback, reset of both values and seen flags, held output independence; full450release tests/2ignored. Separate runtime mutants for missing copied coordinate and stale scratch reset must fail; all sources restored.
+
+Planned timing: baseline a7d4b02c3; INSERT10k target and8unchanged controls (INSERT1k,point_get,filter_eq,UPDATE1k,scalar Full/Normal UPDATE,SQLite INSERT10k,DuckDB filter_eq). Two6-pair series, baseline/control same binary,8observations/fresh process,max_iterations1,zero warmup,rotated cases/roles:324processes/2592observations. Target6/6positive and median gain above median absolute A/A eachseries; controls gain>=-max(2%,A/A). Preserve every loss; no relaxed thresholds or unchanged rerun. CPU/RSS whole-process only. Complete engine/source and original eight-peer objective remain required even on component success.
