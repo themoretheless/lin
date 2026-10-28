@@ -1,0 +1,7 @@
+# Bulk embedding phase diagnosis
+
+Profile the restored COW+CAS baseline a7d4b02c3, not an optimization candidate. Temporary module and four exact source patches split embedding into text collection, reference collection, lowercase, feature hashing, normalization, Arc vector allocation/copy, scratch reset and row installation. No text/features/dimensions/outputs are reduced or moved to prepare. Normalization/copy/reset remain in original order; lowercase output is bound before the unchanged fill call. Reversing patches.json restores all original source bytes.
+
+Use original/control same ordinary binary and disabled/traced same instrumented binary. Six rotated rounds for bulk INSERT1k/10k:48fresh processes /384wall observations. Trace includes validation/calibration invocations and is not aligned1:1with measured samples. Calls per invocation must equal [0,1,1,N,N,N,N,N,1], all phases nonnegative and their sum <= outer PreparedRun wall. Clock/TLS overhead per row may be material; record disabled/original and traced/disabled ratios, never hide this overhead or treat phase shares as exact values in another binary. No allocation/RSS/WAL measurement or peer superiority claim.
+
+Full449release tests/2ignored and six fresh full-value/phase-count smokes required before diagnostic use. Every checkout source/benchmark restored after overlays. Keep all raw observations and freeze source/assets before Linux dispatch. Original eight-peer performance objective remains open.

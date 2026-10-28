@@ -1,0 +1,48 @@
+name: bulk-embedding-phases
+on:
+  push:
+    branches: [codex/bulk-embedding-phases-ci]
+permissions:
+  contents: read
+jobs:
+  diagnostic:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Verify frozen profiling assets
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib,json
+          p=Path('benches/results/2026-10-28-bulk-embedding-phases')
+          for name,digest in json.loads((p/'frozen-inputs.json').read_text()).items():assert hashlib.sha256(Path(name).read_bytes()).hexdigest()==digest,name
+          PY
+      - name: Validate synthetic complete matrix and phase errors
+        run: python3 benches/results/2026-10-28-bulk-embedding-phases/test-protocol.py
+      - name: Full instrumented release suite and source restoration
+        run: python3 benches/results/2026-10-28-bulk-embedding-phases/test.py
+      - name: Build original and instrumented binaries from frozen COW CAS source
+        run: python3 benches/results/2026-10-28-bulk-embedding-phases/build.py
+      - name: Six fresh full-value and active-phase-count smokes
+        run: python3 benches/results/2026-10-28-bulk-embedding-phases/smoke.py
+      - name: Record kernel and filesystem
+        run: |
+          uname -a > benches/results/2026-10-28-bulk-embedding-phases/linux-environment.txt
+          findmnt -T /tmp -o TARGET,SOURCE,FSTYPE,OPTIONS >> benches/results/2026-10-28-bulk-embedding-phases/linux-environment.txt
+      - name: Run 48 fresh observer-calibrated processes
+        run: python3 benches/results/2026-10-28-bulk-embedding-phases/run.py
+      - name: Validate raw scopes and summarize caller wall phases
+        run: python3 benches/results/2026-10-28-bulk-embedding-phases/analyze.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bulk-embedding-phases
+          path: benches/results/2026-10-28-bulk-embedding-phases/
+          if-no-files-found: error
