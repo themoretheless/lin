@@ -1,0 +1,9 @@
+# Full DELETE key-projection component
+
+Candidate882409c15 versus COW+CAS baselinea7d4b02c3; only persist.rs differs. Rejected SoA/bulk-template and pending single-Cmp changes are excluded. The original full logical rows,embedding dimensions,query fixtures,validation andsync policy remain unchanged. DELETE physical bytes intentionally change within the existing format,after the same original canonical16MiBcheck. Normal remains byte-identical. No claim of byte-identical Full encoding.
+
+Targets: existing durable DELETE1k/10k Lin. Six controls: Lin durable UPDATE1k,commit10k,rollback1k,scalar Full/Normal UPDATE,andSQLite WAL DELETE1k. Two six-pair series with rotating cases/roles,same baseline/control executable,eight observations,max_iterations1,zero warmup. All288fresh processes/2304observations retained. Both windows per target require6/6positive pairs andmedian gain above median absolute A/A. Controls require gain>=-max(2%,A/A). No trimming,threshold relaxation or unchanged retries for a pass.
+
+453local release tests/2ignored passed. Canonical-limit bypass mutant rejected at runtime andevery source restored. Eight production-generated Full streams exactly match the existing golden frames andpass frozen production04749994Db replay withcomplete surviving-row bits,generation/next_id,CRC andidempotency checks. Linux reruns full tests,quota mutant,all16fresh benchmark correctness smokes andthe8exact golden-byte cases before timing. Linux does not independently build the old reader;golden bytes are tied to its retained local qualification.
+
+The standalone old-reader proof is bounded andnot power-loss qualification. Capture the actual Linux filesystem/mount/kernel environment;do not tune it. Complete source/peer acceptance remains false even if this component passes. Preserve all failed pairs andraw/build/test/golden/provenance assets. Do not infer a speedup from byte reduction or from these correctness checks.
