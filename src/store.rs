@@ -2923,11 +2923,18 @@ impl Store {
         }
         // Identity keys already address this slot. Re-inserting them would
         // allocate fresh id/uri strings for every non-identity field update.
-        let text = |field: &str| {
-            after
-                .get(field)
-                .and_then(Cell::text_shared)
-                .unwrap_or_default()
+        // SmallText comparison is bounded by the inline capacity. Shared text
+        // only needs pointer identity; avoid scanning potentially large strings.
+        let sync_text = |slot: &mut Arc<str>, field: &str| {
+            let value = after.get(field);
+            let unchanged = match value {
+                Some(Cell::SmallText(text)) => slot.as_ref() == text.as_str(),
+                Some(Cell::Text(text)) => Arc::ptr_eq(slot, text),
+                _ => slot.is_empty(),
+            };
+            if !unchanged {
+                *slot = value.and_then(Cell::text_shared).unwrap_or_default();
+            }
         };
         match collection {
             "docs"
@@ -2935,15 +2942,15 @@ impl Store {
                     && idx < self.docs_layer.len()
                     && idx < self.docs_wing.len() =>
             {
-                self.docs_title[idx] = text("title");
-                self.docs_layer[idx] = text("layer");
-                self.docs_wing[idx] = text("wing");
+                sync_text(&mut self.docs_title[idx], "title");
+                sync_text(&mut self.docs_layer[idx], "layer");
+                sync_text(&mut self.docs_wing[idx], "wing");
             }
             "orders" if idx < self.orders_user_id.len() && idx < self.orders_total.len() => {
-                self.orders_user_id[idx] = text("user_id");
+                sync_text(&mut self.orders_user_id[idx], "user_id");
                 self.orders_total[idx] = after.get("total").and_then(Cell::as_f64).unwrap_or(0.0);
             }
-            "users" if idx < self.users_email.len() => self.users_email[idx] = text("email"),
+            "users" if idx < self.users_email.len() => sync_text(&mut self.users_email[idx], "email"),
             "docs" | "orders" | "users" => self.rebuild_row_maps_collection(collection),
             _ => {}
         }
