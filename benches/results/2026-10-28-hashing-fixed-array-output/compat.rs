@@ -1,0 +1,2 @@
+use std::sync::Arc;
+fn main(){let mut output=Arc::new([0.0f32;768]);Arc::get_mut(&mut output).unwrap()[42]=0.25;let pointer=output.as_ref().as_ptr();let output:Arc<[f32]>=output;assert_eq!(pointer,output.as_ref().as_ptr());assert_eq!(output.len(),768);assert_eq!(output[42].to_bits(),0.25f32.to_bits());assert_eq!(output[0].to_bits(),0);let held=output.clone();assert_eq!(held.as_ref(),output.as_ref());}

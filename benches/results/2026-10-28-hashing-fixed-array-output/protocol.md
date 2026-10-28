@@ -1,0 +1,9 @@
+# Fixed-array Arc output hypothesis
+
+The calibrated bulk profile identifies vector allocation/copy as a material subphase with substantial observer overhead. Prior sparse uninitialized-slice candidate2c8515692 missed one target pair; fused reset candidated1e98047d did not establish speedup. Neither was adopted. This changed mechanism specializes allocation for the builtin default dimension768: create safe Arc<[f32;768]> initialized to zeros, write already-normalized touched coordinates, then safely coerce to unchanged Arc<[f32]>. Allocation layout is known at compile time. Other dimensions and dense occupancy use original Arc::from; scratch reset remains separate. No unsafe/MaybeUninit in this candidate, no fewer coordinates/features or changed normalization.
+
+Require original dense-bit oracle, occupancy/dimension/large-normalization/reset/held-output coverage,full450release tests/2ignored,missing-coordinate runtime mutant and exact source restoration. Standalone API operations must compile/run below project MSRV1.88; this does not qualify full crate MSRV.
+
+Planned component: baseline a7d4b02c3; INSERT10k target and8unchanged controls INSERT1k/point_get/filter_eq/UPDATE1k/scalar Full/Normal UPDATE/SQLite INSERT10k/DuckDB filter_eq. Two6-pair series,baseline/control same binary,rotating roles/cases,8observations/fresh process,max_iterations1,zero warmup:324processes/2592observations. Target eachseries6/6positive and median gain above median absolute A/A;controls gain>=-max(2%,A/A). Preserve every raw loss;no unchanged rerun/threshold relaxation. CPU/RSS whole-process separately; no cross-run incremental superiority claim.
+
+No performance qualification yet. Full source/engine and original eight-peer objective remain required even if component passes. Production main unchanged.
