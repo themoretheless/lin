@@ -156,6 +156,9 @@ assert not rwf['io_gate_passes'] and rwf['failed_full_windows'] == 16 and rwf['f
 soa = read('benches/results/2026-10-28-cow-soa-text-reuse-component-linux/frozen-audit.json')
 assert soa['audit_complete'] and soa['processes'] == 324 and soa['observations'] == 2592
 assert not soa['component_gate_passes'] and soa['failed_target_windows'] == 5 and soa['failed_control_windows'] == 2
+bulk_template = read('benches/results/2026-10-28-cow-bulk-map-template-component-linux/frozen-audit.json')
+assert bulk_template['audit_complete'] and bulk_template['processes'] == 288 and bulk_template['observations'] == 2304
+assert not bulk_template['component_gate_passes'] and bulk_template['failed_target_windows'] == 4 and bulk_template['failed_control_windows'] == 2
 mssql = read('benches/results/2026-10-28-mssql-current-cow/functional-status.json')
 assert mssql['functional_raw_audit_complete'] and mssql['frozen_source_hashes_verified'] and mssql['owned_container_cleanup_verified']
 assert mssql['comparative_metrics_public'] is False and mssql['full_objective_achieved'] is False
@@ -164,6 +167,7 @@ lines += [
     '- [Совместный COW+CAS full-source gate failed](../benches/results/2026-10-28-cow-cas-full-engine-linux/decision.md),[run40607797376](https://github.com/themoretheless/lin/actions/runs/40607797376):source36666994a,все2412процессов/19296наблюдений проверены независимым аудитом. Все10target окон прошли6/6aboveA/A: native UPDATE13.941–20.267%,scalar Full52.036–52.999%,Normal94.651–94.680%. Семь control окон провалены: Lin bulk INSERT10k в обеих сериях,filter_eq,durable UPDATE1k и три неизменённых SQLite окна. Peer wins: SQLite DELETE96/96,WAL3/96,native/read49/228,DuckDB36/36. Кандидат не принят;производственная и полная восьми-peer квалификация отсутствуют.',
     '- [RWF_DSYNC I/O probe rejected](../benches/results/2026-10-28-wal-rwf-dsync-probe-linux/report.md):run40614973547,432процесса/3456наблюдений;все16Fulltarget окон и1Normalcontrol провалены. Медианы Full от-1.435%до+3.112%,устойчивого ускорения нет.24Linuxsmoke и4error-path теста прошли,raw/source audit выполнен. Производственный код и WAL не менялись;интеграция не выполняется.',
     '- [SoA text reuse component rejected](../benches/results/2026-10-28-cow-soa-text-reuse-component-linux/decision.md):run40615737232,324процесса/2592наблюдения;5/6target окон UPDATE и2DELETEcontrol окна провалены. UPDATE100k+11.524% прошёл одну серию,+9.432% во второй не прошёл4/6. Снижение3000→0аллокаций в отдельном методе не аттестует UPDATE.453release tests/2ignored,18Linuxsmoke и независимый raw/source audit прошли;этот код исключён из текущего кандидата.',
+    '- [Bulk owned-map template rejected](../benches/results/2026-10-28-cow-bulk-map-template-component-linux/decision.md):run40616712983,288процессов/2304наблюдения;все4INSERTtarget окна и2UPDATEcontrol окна провалены. Медианы INSERT от-1.500%до+0.724%;код не принят и исключён из текущего кандидата.449release tests/2ignored,16Linuxsmoke и независимый raw/source audit прошли.',
     '- [MSSQL private refresh](../benches/results/2026-10-28-mssql-current-cow/report.md),[run40603880905](https://github.com/themoretheless/lin/actions/runs/40603880905):замороженный предшествующий COW source75f8f6b7f;native-x86 стенд завершён,локальный raw/source audit и cleanup прошли. В репозитории только encrypted archive и функциональный статус;относительные исходы приватны. Это не публичное доказательство выигрыша и не квалификация нового CAS-кандидата.',
 ]
 output = root / 'docs/benchmark-goal-status-2026-10-27.md'
