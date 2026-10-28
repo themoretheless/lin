@@ -213,6 +213,11 @@ assert fused_output['audit_complete'] and fused_output['processes'] == 324 and f
 assert not fused_output['component_gate_passes'] and fused_output['failed_target_windows'] == 2 and fused_output['failed_control_windows'] == 1
 assert fused_output['fused_output_reset_only'] and fused_output['three_runtime_mutants_rejected'] and fused_output['release_tests'] == 450
 lines += ['- [Fused output/reset rejected](../benches/results/2026-10-28-hashing-fused-output-reset-component-linux/report.md): run40637176096,324процесса/2592наблюдения. INSERT10k+0.821%/+0.084%нижеA/A1.009%/2.037%,4/6и3/6positive;DuckDBfilter_eqcontrol-3.678%также провален.450release tests/2ignored,18Linuxsmokes,3runtime mutants и независимый raw/source audit прошли.2071файл сохранён сSHA256;embed.rs восстановлен кa7d4b02c3. Нет прямого сравнения с предыдущим sparse-output кандидатом;нет надёжного ускорения/adoption/неизменённого перезапуска.']
+fixed_output = read('benches/results/2026-10-28-hashing-fixed-array-output-component-linux/frozen-audit.json')
+assert fixed_output['audit_complete'] and fixed_output['processes'] == 324 and fixed_output['observations'] == 2592
+assert not fixed_output['component_gate_passes'] and fixed_output['failed_target_windows'] == 2 and fixed_output['failed_control_windows'] == 1
+assert fixed_output['fixed_array_output_only'] and fixed_output['missing_coordinate_runtime_mutant_rejected'] and fixed_output['release_tests'] == 450
+lines += ['- [Safe fixed-array output rejected](../benches/results/2026-10-28-hashing-fixed-array-output-component-linux/report.md): run40640126706,324процесса/2592наблюдения. INSERT10k-1.343%/-1.566%,0/6и1/6positive;scalar Full UPDATE control серии2 -11.261%также провален.450release tests/2ignored,18Linuxsmokes,missing-coordinate mutant и независимый raw/source audit прошли.2067файлов сохранены сSHA256;embed.rs восстановлен кa7d4b02c3. Нет надёжного ускорения/adoption/неизменённого перезапуска;полная восьми-peer цель открыта.']
 output = root / 'docs/benchmark-goal-status-2026-10-27.md'
 output.write_text('\n'.join(lines) + '\n')
 # Never expose endpoint values or credentials in the status artifact.
