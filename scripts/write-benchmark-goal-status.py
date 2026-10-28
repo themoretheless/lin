@@ -147,12 +147,15 @@ assert cas['failed_target_windows'] == cas['failed_control_windows'] == 0
 full_prerequisites = read('benches/results/2026-10-28-cow-cas-full-engine/local-prerequisite-status.json')
 assert full_prerequisites['release_tests_passed'] == 449 and full_prerequisites['correctness_smokes_passed'] == 134
 assert full_prerequisites['cow_eq_mutant_runtime_rejected'] and full_prerequisites['multi_statement_cas_mutant_runtime_rejected']
+full_audit = read('benches/results/2026-10-28-cow-cas-full-engine-linux/independent-audit.json')
+assert full_audit['audit_complete'] and full_audit['processes'] == 2412 and full_audit['observations'] == 19296
+assert not full_audit['source_candidate_qualified'] and full_audit['failed_target_windows'] == 0 and full_audit['failed_control_windows'] == 7
 mssql = read('benches/results/2026-10-28-mssql-current-cow/functional-status.json')
 assert mssql['functional_raw_audit_complete'] and mssql['frozen_source_hashes_verified'] and mssql['owned_container_cleanup_verified']
 assert mssql['comparative_metrics_public'] is False and mssql['full_objective_achieved'] is False
 lines += [
     '- [Однооператорный CAS snapshot component gate passed](../benches/results/2026-10-28-single-stmt-cas-snapshot/report.md):source2633067cb,144процесса/1152наблюдения;Full31.932–35.768%,Normal91.371–91.663%,все4target окна6/6aboveA/A. Контроли прошли порог;native100k медианы были отрицательны в пределахA/A,поэтому нулевая регрессия не доказана.449release tests/2ignored;неверный multi-statement bypass пойман runtime-тестом. Полная матрица ещё нужна.',
-    '- [Полная совместная COW+CAS квалификация](../benches/results/2026-10-28-cow-cas-full-engine/protocol.md),[run40607797376](https://github.com/themoretheless/lin/actions/runs/40607797376):source36666994a,все67сценариев,2412процессов/19296наблюдений;5targets/62controls.449release tests,оба runtime-mutant и134локальных smoke прошли. Linux raw/source gate пока не аттестован этой сводкой;пороговые критерии сохранены. Это новый кандидат,его победы не переносятся с предыдущих запусков.',
+    '- [Совместный COW+CAS full-source gate failed](../benches/results/2026-10-28-cow-cas-full-engine-linux/decision.md),[run40607797376](https://github.com/themoretheless/lin/actions/runs/40607797376):source36666994a,все2412процессов/19296наблюдений проверены независимым аудитом. Все10target окон прошли6/6aboveA/A: native UPDATE13.941–20.267%,scalar Full52.036–52.999%,Normal94.651–94.680%. Семь control окон провалены: Lin bulk INSERT10k в обеих сериях,filter_eq,durable UPDATE1k и три неизменённых SQLite окна. Peer wins: SQLite DELETE96/96,WAL3/96,native/read49/228,DuckDB36/36. Кандидат не принят;производственная и полная восьми-peer квалификация отсутствуют.',
     '- [MSSQL private refresh](../benches/results/2026-10-28-mssql-current-cow/report.md),[run40603880905](https://github.com/themoretheless/lin/actions/runs/40603880905):замороженный предшествующий COW source75f8f6b7f;native-x86 стенд завершён,локальный raw/source audit и cleanup прошли. В репозитории только encrypted archive и функциональный статус;относительные исходы приватны. Это не публичное доказательство выигрыша и не квалификация нового CAS-кандидата.',
 ]
 output = root / 'docs/benchmark-goal-status-2026-10-27.md'
