@@ -218,6 +218,10 @@ assert fixed_output['audit_complete'] and fixed_output['processes'] == 324 and f
 assert not fixed_output['component_gate_passes'] and fixed_output['failed_target_windows'] == 2 and fixed_output['failed_control_windows'] == 1
 assert fixed_output['fixed_array_output_only'] and fixed_output['missing_coordinate_runtime_mutant_rejected'] and fixed_output['release_tests'] == 450
 lines += ['- [Safe fixed-array output rejected](../benches/results/2026-10-28-hashing-fixed-array-output-component-linux/report.md): run40640126706,324процесса/2592наблюдения. INSERT10k-1.343%/-1.566%,0/6и1/6positive;scalar Full UPDATE control серии2 -11.261%также провален.450release tests/2ignored,18Linuxsmokes,missing-coordinate mutant и независимый raw/source audit прошли.2067файлов сохранены сSHA256;embed.rs восстановлен кa7d4b02c3. Нет надёжного ускорения/adoption/неизменённого перезапуска;полная восьми-peer цель открыта.']
+coverage_codegen = read('benches/results/2026-10-28-index-coverage-codegen/summary.json')
+assert coverage_codegen['diagnostic_complete'] and coverage_codegen['same_direct_caller_symbols'] and not coverage_codegen['performance_qualified']
+assert [r['definition_count']for r in coverage_codegen['roles']] == [1,1] and [r['direct_call_count']for r in coverage_codegen['roles']] == [18,18]
+lines += ['- [Local index coverage codegen diagnosis](../benches/results/2026-10-28-index-coverage-codegen/report.md): a7d4b02c3/884ebeb81,macOS ARM64 nightly1.101 optimized library IR. Обе версии сохраняют отдельную index_covers_pred и18прямых вызовов от тех же caller symbols. Это не подтверждает гипотезу о полном встраивании проверки;не исключает partial inlining и не объясняет историческую Linux point_get регрессию. Исходники восстановлены,полный IR сохранён сSHA256;нет timing/RSS/peer qualification.']
 output = root / 'docs/benchmark-goal-status-2026-10-27.md'
 output.write_text('\n'.join(lines) + '\n')
 # Never expose endpoint values or credentials in the status artifact.
