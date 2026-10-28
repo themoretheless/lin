@@ -54,9 +54,9 @@ with tempfile.TemporaryDirectory(prefix='lin-fts-independent-synthetic-')as td:
  smokes=[]
  for role in ['baseline','candidate']:
   for case in a.CASES:
-   smokes.append(dict(role=role,case=case,exit=0));dest=raw/'smoke'/(role+'-'+case.replace('/','_'))/'run.json';dest.parent.mkdir(parents=True,exist_ok=True)
+   smokes.append(dict(role=role,case=case,exit=0));dest=raw/'qualification-smoke'/(role+'-'+case.replace('/','_'))/'run.json';dest.parent.mkdir(parents=True,exist_ok=True)
    dest.write_text(json.dumps(dict(status='complete',cases=[dict(id=case)],observations=[dict(case=case,availability=dict(state='available'))])))
- (raw/'smoke-status.json').write_text(json.dumps(smokes))
+ (raw/'qualification-smoke-status.json').write_text(json.dumps(smokes))
  original=(raw/'candidate-store.rs').read_text();needle='            fts.sync_row(idx, &current, &restored);'
  (raw/'mutant-store.rs').write_text(original.replace(needle,'            let _ = fts; // deliberately omit rollback FTS synchronization'))
  (raw/'mutant-status.json').write_text(json.dumps(dict(runtime_exit=101,compiled_runtime_rejected=True,source_restored=True,source_sha256=a.sha(original.encode()))))
@@ -68,7 +68,7 @@ with tempfile.TemporaryDirectory(prefix='lin-fts-independent-synthetic-')as td:
  reject(check,'wrong head',p/'run-metadata.json',lambda f:alter(f,lambda q:q.update(headSha='bad')))
  reject(check,'changed frozen asset',raw/'run.py',lambda f:f.write_text(f.read_text()+'\n'))
  reject(check,'wrong source provenance',raw/'provenance.json',lambda f:alter(f,lambda q:q.update(source_commit='bad')))
- reject(check,'missing smoke',raw/'smoke-status.json',lambda f:alter(f,lambda q:q.pop()))
+ reject(check,'missing smoke',raw/'qualification-smoke-status.json',lambda f:alter(f,lambda q:q.pop()))
  reject(check,'wrong test count',raw/'test-status.json',lambda f:alter(f,lambda q:q.update(release_passed=453)))
  reject(check,'mutant compile only',raw/'mutant-runtime.log',lambda f:f.write_text('compile failure'))
  reject(check,'unrestored source',raw/'mutant-status.json',lambda f:alter(f,lambda q:q.update(source_restored=False)))

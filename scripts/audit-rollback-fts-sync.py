@@ -3,7 +3,7 @@
 from pathlib import Path
 import json,subprocess,hashlib,statistics,math,itertools,argparse,re
 ROOT=Path(__file__).resolve().parents[1]
-HEAD='2cc359505ce47a68280c254fbf9a77b015be9a5d'
+HEAD='f9e5db28e99895d2c1181b9cbd2d72a90a64d44a'
 INPUT='benches/results/2026-10-28-rollback-fts-sync'
 CASES=['compare/durable_rollback_1row_1k/lin','compare/durable_rollback_1row_10k/lin','compare/durable_update_1row_1k/lin','compare/durable_commit_1row_10k/lin','compare/durable_delete_1row_1k/lin','compare/wal_scalar_full_update/lin','compare/wal_scalar_normal_update/lin','compare/durable_rollback_1row_1k/sqlite_wal']
 def sha(data):return hashlib.sha256(data).hexdigest()
@@ -70,9 +70,9 @@ def audit(parent):
   assert prov['binaries'][role]['store_sha256']==sha((raw/f'{role}-store.rs').read_bytes())
   assert 'Finished `bench` profile' in(raw/f'build-{role}.log').read_text()
  assert prov['binaries']['baseline']['sha256']!=prov['binaries']['candidate']['sha256']
- smokes=json.loads((raw/'smoke-status.json').read_text());assert len(smokes)==16 and {(s['role'],s['case'])for s in smokes}==set(itertools.product(['baseline','candidate'],CASES)) and all(s['exit']==0 for s in smokes)
+ smokes=json.loads((raw/'qualification-smoke-status.json').read_text());assert len(smokes)==16 and {(s['role'],s['case'])for s in smokes}==set(itertools.product(['baseline','candidate'],CASES)) and all(s['exit']==0 for s in smokes)
  for s in smokes:
-  q=json.loads((raw/'smoke'/(s['role']+'-'+s['case'].replace('/','_'))/'run.json').read_text());assert q['status']=='complete' and len(q['cases'])==1 and q['cases'][0]['id']==s['case'] and len(q['observations'])==1
+  q=json.loads((raw/'qualification-smoke'/(s['role']+'-'+s['case'].replace('/','_'))/'run.json').read_text());assert q['status']=='complete' and len(q['cases'])==1 and q['cases'][0]['id']==s['case'] and len(q['observations'])==1
   assert q['observations'][0]['availability']['state']=='available' and q['observations'][0]['case']==s['case']
  mutant=json.loads((raw/'mutant-status.json').read_text());assert mutant['runtime_exit']==101 and mutant['compiled_runtime_rejected'] and mutant['source_restored'] and mutant['source_sha256']==manifest['source_sha256']['src/store.rs']
  needle='            fts.sync_row(idx, &current, &restored);';assert candidate.count(needle)==1
