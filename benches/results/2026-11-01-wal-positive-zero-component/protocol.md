@@ -1,0 +1,11 @@
+# Full WAL positive-zero component qualification
+
+Candidate62e14c7eb versus rollback-corrected baseline21dcd7d81. Only persist.rs and its new private positive_zero module change. The rejected FTS candidate is excluded. Baseline compilation removes the new private module and restores the original persist.rs; candidate compilation restores both, with every role source hash recorded. Every overlay is restored in finally. No runtime instrumentation.
+
+Targets: existing Full durable UPDATE1k/10k, DELETE1k/10k and commit10k Lin. Seven controls: Lin rollback10k, scalar Full/Normal UPDATE, native UPDATE1k, native bulk INSERT10k, filter_eq, and SQLite WAL UPDATE10k. Same expanded compare.rs as the retained previous component; logical rows, embeddings, dimensions, result validators and Full durability remain unchanged. Only physical Full UPDATE/DELETE/Batch encoding intentionally changes; Normal remains canonical. Canonical16MiBpayload/envelope rejection remains before writing.
+
+Two series of six pairs, rotated cases and baseline/control/candidate order. Control uses the exact baseline executable. Eight observations, max_iterations1, zero warmup. All432fresh processes/3456observations retained. Each of10target windows requires6/6positive pairs and median gain above median absolute A/A. Each of14control windows requires gain>=-max(2%,A/A). No trimming, relaxed threshold or unchanged retry for a pass. A component pass cannot qualify the full source or eight-peer goal.
+
+Before timing Linux must pass457release tests/2ignored, both compiled runtime negatives (negative-zero normalization and canonical-quota bypass), all24fresh correctness smokes and all32golden files across8reader scenarios. Golden files were decoded and replayed by independently compiled frozen production04749994source locally; Linux reproduces their exact bytes and verifies current replay rather than claiming to rebuild that reader. Power-loss and general client compatibility are not inferred. Kernel/filesystem are recorded without tuning.
+
+Fresh smokes/status use qualification-smoke/qualification-smoke-status.json. Local generated outputs are retained separately and are not committed into those CI output paths. No timing data is pre-populated. Source, build, failure, smoke, golden and all timing artifacts must remain available regardless of gate outcome.
