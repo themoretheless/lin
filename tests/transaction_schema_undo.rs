@@ -57,12 +57,14 @@ fn schema_after_rows_rollback_restores_rows_metadata_and_constraints() {
 }
 
 #[test]
-fn repeated_schema_snapshots_preserve_journal_order_and_abort_state() {
+fn repeated_schema_changes_preserve_journal_order_and_abort_state() {
     for prefix in [
-        "",
-        r#"insert docs {id:"c",title:"appended"}"#,
-        r#"update docs[id=="a"] cas each {title:"updated"}"#,
-        r#"delete docs[id=="b"] cas each"#,
+        &[][..],
+        &[r#"insert docs {id:"c",title:"appended"}"#][..],
+        &[r#"update docs[id=="a"] cas each {title:"updated"}"#][..],
+        &[r#"delete docs[id=="b"] cas each"#][..],
+        &[r#"insert docs {id:"c",title:"appended"}"#, r#"delete docs[id=="b"] cas each"#][..],
+        &[r#"delete docs[id=="b"] cas each"#, r#"insert docs {id:"c",title:"appended"}"#][..],
     ] {
         for finish in 0..3 {
             let mut db = seed();
@@ -73,7 +75,7 @@ fn repeated_schema_snapshots_preserve_journal_order_and_abort_state() {
             let collection_names = db.store.extra_collections.keys().cloned().collect::<Vec<_>>();
             {
                 let mut tx = db.transaction().unwrap();
-                if !prefix.is_empty() { tx.run(prefix).unwrap(); }
+                for source in prefix { tx.run(source).unwrap(); }
                 tx.run("col schema_alpha { id: text, title: text }").unwrap();
                 tx.run(r#"insert schema_alpha {id:"x",title:"alpha"}"#).unwrap();
                 tx.run("index docs unique [title]").unwrap();
@@ -90,7 +92,7 @@ fn repeated_schema_snapshots_preserve_journal_order_and_abort_state() {
                     }
                 }
             }
-            assert_eq!(rmp_serde::to_vec_named(db.store.collection("docs")).unwrap(), before, "{prefix}, {finish}");
+            assert_eq!(rmp_serde::to_vec_named(db.store.collection("docs")).unwrap(), before, "{prefix:?}, {finish}");
             assert_eq!(db.store.r#gen, generation);
             assert_eq!(db.store.next_id, next_id);
             assert_eq!(db.store.indexes.keys().cloned().collect::<Vec<_>>(), index_names);

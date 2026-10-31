@@ -748,6 +748,12 @@ impl<'a> Transaction<'a> {
         self.db.prepare(src)
     }
 
+    fn checkpoint_undo(&mut self) {
+        let snapshot = self.db.store.mem_backup();
+        let prefix = std::mem::replace(&mut self.undo, Undo::None);
+        self.undo = Undo::Checkpoint(Box::new(UndoCheckpoint { snapshot, prefix }));
+    }
+
     fn ensure_undo(&mut self, prep: &Prepared) {
         match &mut self.undo {
             Undo::None => {
@@ -784,14 +790,8 @@ impl<'a> Transaction<'a> {
                             events: Vec::new(),
                         };
                     } else {
-                        // Keep the original append boundary: this snapshot is taken
-                        // after earlier appends, not at transaction entry.
-                        let append = mark.clone();
-                        let snapshot = Box::new(self.db.store.mem_backup());
-                        self.undo = Undo::Mixed {
-                            append,
-                            events: vec![RowUndo::Snapshot(snapshot)],
-                        };
+                        // Preserve earlier appends and snapshot the transaction tail.
+                        self.checkpoint_undo();
                     }
                 }
             }
@@ -804,12 +804,11 @@ impl<'a> Transaction<'a> {
                     matches!(stmt, Stmt::Update { .. } | Stmt::Delete { .. }
                         | Stmt::Query(_) | Stmt::Let { .. })
                 }) {
-                    // Schema and other non-row mutations need a snapshot at this
-                    // exact journal position, before older row edits are undone.
-                    events.push(RowUndo::Snapshot(Box::new(self.db.store.mem_backup())));
+                    // One checkpoint covers all later mutations, including schema.
+                    self.checkpoint_undo();
                 }
             }
-            Undo::Full(_) => {}
+            Undo::Full(_) | Undo::Checkpoint(_) => {}
         }
     }
 
@@ -2024,11 +2023,15 @@ impl Db {
             Undo::None => {}
             Undo::Append(mark) => self.store.append_rollback(mark),
             Undo::Full(b) => self.store.mem_restore(b),
+            Undo::Checkpoint(checkpoint) => {
+                let UndoCheckpoint { snapshot, prefix } = *checkpoint;
+                self.store.mem_restore(snapshot);
+                self.rollback(prefix, None);
+            }
             Undo::Rows(events) => {
                 for event in events.into_iter().rev() {
                     match event {
                         RowUndo::Append(mark) => self.store.append_rollback(mark),
-                        RowUndo::Snapshot(snapshot) => self.store.mem_restore(*snapshot),
                         RowUndo::Update(collection, idx, row) => {
                             if let Some(mut restored) = self.store.collection(&collection).get(idx).cloned() {
                                 row.apply(&mut restored);
@@ -2045,7 +2048,6 @@ impl Db {
                 for event in events.into_iter().rev() {
                     match event {
                         RowUndo::Append(mark) => self.store.append_rollback(mark),
-                        RowUndo::Snapshot(snapshot) => self.store.mem_restore(*snapshot),
                         RowUndo::Update(collection, idx, row) => {
                             if let Some(mut restored) = self.store.collection(&collection).get(idx).cloned() {
                                 row.apply(&mut restored);
@@ -6238,11 +6240,17 @@ pub(crate) enum Undo {
     None,
     Append(crate::store::AppendMark),
     Full(crate::store::MemBackup),
+    Checkpoint(Box<UndoCheckpoint>),
     Rows(Vec<RowUndo>),
     Mixed {
         append: crate::store::AppendMark,
         events: Vec<RowUndo>,
     },
+}
+
+pub(crate) struct UndoCheckpoint {
+    snapshot: crate::store::MemBackup,
+    prefix: Undo,
 }
 
 pub(crate) struct RowDelta(smallvec::SmallVec<[(String, Option<Cell>); 1]>);
@@ -6272,7 +6280,6 @@ impl RowDelta {
 
 pub(crate) enum RowUndo {
     Append(crate::store::AppendMark),
-    Snapshot(Box<crate::store::MemBackup>),
     Update(String, usize, RowDelta),
     Delete(String, Vec<usize>, Vec<Row>),
 }

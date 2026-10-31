@@ -2,9 +2,9 @@ from pathlib import Path
 import subprocess,json,hashlib
 p=Path(__file__).resolve().parent;source=Path('src/exec.rs');original=source.read_bytes();text=original.decode();checks=[]
 cases=[
- ('lost-initial-append-boundary','let append = mark.clone();','let append = self.db.store.append_mark();',1,'generated_ids_are_reusable_after_schema_snapshot_rollback'),
- ('missing-ordered-snapshot','events.push(RowUndo::Snapshot(Box::new(self.db.store.mem_backup())));','();',1,'schema_after_rows_rollback_restores_rows_metadata_and_constraints'),
- ('forward-undo-journal','for event in events.into_iter().rev() {','for event in events.into_iter() {',2,'repeated_schema_snapshots_preserve_journal_order_and_abort_state'),
+ ('lost-prefix-journal','let prefix = std::mem::replace(&mut self.undo, Undo::None);','let _discarded = std::mem::replace(&mut self.undo, Undo::None); let prefix = Undo::None;',1,'generated_ids_are_reusable_after_schema_snapshot_rollback'),
+ ('missing-checkpoint','self.checkpoint_undo();','();',2,'schema_after_rows_rollback_restores_rows_metadata_and_constraints'),
+ ('reversed-checkpoint-order','self.store.mem_restore(snapshot);\n                self.rollback(prefix, None);','self.rollback(prefix, None);\n                self.store.mem_restore(snapshot);',1,'repeated_schema_changes_preserve_journal_order_and_abort_state'),
 ]
 try:
  for label,old,new,count,test in cases:
