@@ -224,14 +224,50 @@ assert [r['definition_count']for r in coverage_codegen['roles']] == [1,1] and [r
 lines += ['- [Local index coverage codegen diagnosis](../benches/results/2026-10-28-index-coverage-codegen/report.md): a7d4b02c3/884ebeb81,macOS ARM64 nightly1.101 optimized library IR. Обе версии сохраняют отдельную index_covers_pred и18прямых вызовов от тех же caller symbols. Это не подтверждает гипотезу о полном встраивании проверки;не исключает partial inlining и не объясняет историческую Linux point_get регрессию. Исходники восстановлены,полный IR сохранён сSHA256;нет timing/RSS/peer qualification.']
 point_contract = read('benches/results/2026-10-28-point-values-contract/verification.json')
 assert point_contract['audit_complete'] and point_contract['full_value_cases'] == 6 and point_contract['runtime_mutants_rejected'] == 3 and not point_contract['performance_qualified']
-lines += ['', '## Ограничение исторического point_get и новый контракт', '', '[Аудит и функциональная проверка](../benches/results/2026-10-28-point-values-contract/report.md): исторический Rust point_get материализует id/title в Lin, но SQL peers выполняют COUNT(*); read smoke этого случая не проверял значения. Старые наблюдения сохранены, однако point_get peer ratios не доказывают равную работу. Отдельный point_values возвращает одинаковые owned id/title для Lin/SQLite/DuckDB: 6 сценариев прошли full-value validator, 3 runtime подмены title отвергнуты. Это локальная функциональная проверка, без новой квалификации скорости и без покрытия остальных peers.']
+lines += [
+    (
+        ''
+    ),
+    (
+        '## Ограничение исторического point_get и новый контракт'
+    ),
+    (
+        ''
+    ),
+    (
+        '[Аудит и функциональная проверка](../benches/results/2026-10-28-point-values-contract/report.md): '
+        'исторический Rust point_get материализует id/title в Lin, но SQL peers выполняют COUNT(*); read '
+        'smoke этого случая не проверял значения. Старые наблюдения сохранены, однако point_get peer ratios '
+        'не доказывают равную работу. Отдельный point_values возвращает одинаковые owned id/title для '
+        'Lin/SQLite/DuckDB: 6 сценариев прошли full-value validator, 3 runtime подмены title отвергнуты. Это '
+        'локальная функциональная проверка, без новой квалификации скорости и без покрытия остальных peers.'
+    ),
+]
 point_local = read('benches/results/2026-10-28-point-values-local-baseline/summary.json')
 assert point_local['measurement_complete'] and point_local['observations'] == 216 and point_local['processes'] == 3 and not point_local['performance_qualified']
 assert len(point_local['comparisons']) == 4 and all(c['numerical_wins'] == 3 for c in point_local['comparisons'])
 lines += ['', '[Локальный point_values baseline](../benches/results/2026-10-28-point-values-local-baseline/report.md): 3 свежих процесса, 216 наблюдений, одинаковые owned id/title. В обоих hit/miss Lin численно быстрее SQLite и DuckDB во всех трёх процессах. macOS ARM64, короткие samples с cap 8, без A/A: это диагностические отношения, не Linux/production qualification и не закрытие durable WAL gap. Независимый аудит контракта прошёл; семь намеренно повреждённых пакетов, включая пересчитанные SHA256, отвергнуты.']
 rollback_correctness = read('benches/results/2026-10-28-rollback-hnsw-correctness/test-status.json')
 assert rollback_correctness['release_exit'] == 0 and rollback_correctness['release_passed'] == 454 and rollback_correctness['release_ignored'] == 2 and not rollback_correctness['performance_qualified']
-lines += ['', '## Новые предпосылки корректности rollback', '', '[Регрессии и исправление](../benches/results/2026-10-28-rollback-hnsw-correctness/report.md): восстановлена регистрация удалённых строк в HNSW и удаление узлов отменённых вставок. Смешанный DELETE→INSERT rollback терял исходные строки из-за неверного порядка; append marks теперь входят в хронологический undo journal. Локально 454 release tests прошли, 2 ignored; Linux подтверждение приведено ниже. Это новая версия экспериментального COW+CAS runtime, без переноса прежних speedup claims или production adoption. Цель восьми peers и SQLite FULL WAL gap открыты.']
+lines += [
+    (
+        ''
+    ),
+    (
+        '## Новые предпосылки корректности rollback'
+    ),
+    (
+        ''
+    ),
+    (
+        '[Регрессии и исправление](../benches/results/2026-10-28-rollback-hnsw-correctness/report.md): '
+        'восстановлена регистрация удалённых строк в HNSW и удаление узлов отменённых вставок. Смешанный '
+        'DELETE→INSERT rollback терял исходные строки из-за неверного порядка; append marks теперь входят в '
+        'хронологический undo journal. Локально 454 release tests прошли, 2 ignored; Linux подтверждение '
+        'приведено ниже. Это новая версия экспериментального COW+CAS runtime, без переноса прежних speedup '
+        'claims или production adoption. Цель восьми peers и SQLite FULL WAL gap открыты.'
+    ),
+]
 rollback_linux = read('benches/results/2026-10-28-rollback-hnsw-correctness-linux/audit.json')
 assert rollback_linux['audit_complete'] and rollback_linux['release_passed'] == 454 and rollback_linux['runtime_negatives_rejected'] == 3 and not rollback_linux['performance_qualified']
 lines += ['', '[Linux rollback correctness завершён](../benches/results/2026-10-28-rollback-hnsw-correctness-linux/report.md): run40648113616, frozen21dcd7d81, Rust1.96 x86_64.454release tests/2ignored и3независимо скомпилированных runtime negatives прошли. Независимый raw/source audit и8коррупций доказательств прошли; архив полностью проверен SHA256. Это корректность, не ускорение или принятие полного исходника.']
@@ -239,7 +275,42 @@ fts_attempt = read('benches/results/2026-10-28-rollback-fts-sync-linux-attempt1/
 assert fts_attempt['failure_cause_verified'] and fts_attempt['timed_processes'] == 0 and not fts_attempt['matrix_complete']
 zero_probe = read('benches/results/2026-10-28-positive-zero-msgpack-probe/legacy-status.json')
 assert zero_probe['legacy_cell_cases_verified'] == 28 and zero_probe['current_sources_unchanged'] and not zero_probe['performance_qualified'] and not zero_probe['legacy_wal_replay_qualified']
-lines += ['', '[FTS attempt1 остановлен до таймингов](../benches/results/2026-10-28-rollback-fts-sync-linux-attempt1/report.md): run40649504291 прошёл454release tests/2ignored, runtime negative и сборки; свежие smokes не начались из-за коллизии с сохранённой локальной папкой. Матрица0процессов/0наблюдений. Новое пространство выходов прошло16локальных проверок; исправленный frozen run40652603678 запущен без изменения runtime2e5146fce или критериев. Ускорение ещё не подтверждено.', '', '[Positive-zero MessagePack probe](../benches/results/2026-10-28-positive-zero-msgpack-probe/report.md): текущий и frozen production04749994Cell-декодеры прошли28битовых случаев. Только +0.0 кодируетсяinteger0; негативная подмена -0.0 отвергнута. Конструированный sparse Cell768/704zeros:3852→1036байт. Runtime/WAL не изменены; полные legacy frames/replay, canonical quota, durability и timing не квалифицированы. Это отдельная гипотеза для Full WAL, не выигрыш benchmark.']
+lines += [
+    (
+        ''
+    ),
+    (
+        '[FTS attempt1 остановлен до '
+        'таймингов](../benches/results/2026-10-28-rollback-fts-sync-linux-attempt1/report.md): run40649504291'
+        ' прошёл454release tests/2ignored, runtime negative и сборки; свежие smokes не начались из-за '
+        'коллизии с сохранённой локальной папкой. Матрица0процессов/0наблюдений. Новое пространство выходов '
+        'прошло16локальных проверок; исправленный frozen run40652603678 завершён без изменения '
+        'runtime2e5146fce или критериев; отклонённый результат приведён ниже.'
+    ),
+    (
+        ''
+    ),
+    (
+        '[Positive-zero MessagePack '
+        'probe](../benches/results/2026-10-28-positive-zero-msgpack-probe/report.md): текущий и frozen '
+        'production04749994Cell-декодеры прошли28битовых случаев. Только +0.0 кодируетсяinteger0; негативная '
+        'подмена -0.0 отвергнута. Конструированный sparse Cell768/704zeros:3852→1036байт. Runtime/WAL не '
+        'изменены; полные legacy frames/replay, canonical quota, durability и timing не квалифицированы. Это '
+        'отдельная гипотеза для Full WAL, не выигрыш benchmark.'
+    ),
+]
+fts_completed = read('benches/results/2026-10-28-rollback-fts-sync-linux/frozen-audit.json')
+assert fts_completed['audit_complete'] and fts_completed['processes'] == 288 and fts_completed['observations'] == 2304 and not fts_completed['component_gate_passes']
+assert fts_completed['failed_target_windows'] == 1 and fts_completed['failed_control_windows'] == 1
+lines += ['', (
+    '[FTS rollback кандидат отклонён](../benches/results/2026-10-28-rollback-fts-sync-linux/report.md): '
+    'run40652603678,288процессов/2304наблюдения,454release tests/2ignored,16fresh Linuxsmokes иruntime '
+    'negative; независимый raw/source audit прошёл. '
+    'Rollback1k+12.269%/+19.156%,5/6и6/6;10k+14.666%/+14.753%,6/6оба. Первый1k target иUPDATE1k control '
+    'series2(-5.151%,A/A3.329%,2/6) провалены. Все1645raw файлов сохранены сSHA256. store.rs восстановлен'
+    ' к21dcd7d81, три исправления корректности rollback сохранены. Нет принятия кандидата, неизменённого '
+    'перезапуска или победы над восемью peers.'
+)]
 output = root / 'docs/benchmark-goal-status-2026-10-27.md'
 output.write_text('\n'.join(lines) + '\n')
 # Never expose endpoint values or credentials in the status artifact.
