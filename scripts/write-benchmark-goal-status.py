@@ -311,6 +311,20 @@ lines += ['', (
     ' к21dcd7d81, три исправления корректности rollback сохранены. Нет принятия кандидата, неизменённого '
     'перезапуска или победы над восемью peers.'
 )]
+zero_full = read('benches/results/2026-11-01-wal-positive-zero/test-status.json')
+zero_legacy = read('benches/results/2026-11-01-wal-positive-zero/legacy-status.json')
+zero_mutants = read('benches/results/2026-11-01-wal-positive-zero/mutant-status.json')
+assert zero_full['release_passed'] == 457 and zero_full['release_ignored'] == 2 and not zero_full['performance_qualified']
+assert zero_legacy['legacy_cases_verified'] == 8 and zero_legacy['current_sources_unchanged'] and zero_legacy['legacy_sources_unchanged']
+assert len(zero_mutants['checks']) == 2 and zero_mutants['all_sources_restored'] and all(c['compiled_runtime_rejected'] for c in zero_mutants['checks'])
+lines += ['', (
+    '[Full WAL positive-zero prototype](../benches/results/2026-11-01-wal-positive-zero/report.md): '
+    'core62e14c7eb на исправленной базе21dcd7d81; FTS-кандидат не включён. '
+    'Локально457release tests/2ignored,8реальных production04749994reader cases и2runtime negatives прошли. '
+    'Normal bytes, IEEE bits, canonical payload/envelope quota и старый reader проверены;32golden файла сохранены. '
+    'Это корректность прототипа, без Linux timing acceptance или production adoption. '
+    'Нужны новые paired Full UPDATE/DELETE/commit измерения с контролями; цель восьми peers открыта.'
+)]
 output = root / 'docs/benchmark-goal-status-2026-10-27.md'
 output.write_text('\n'.join(lines) + '\n')
 # Never expose endpoint values or credentials in the status artifact.
