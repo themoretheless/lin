@@ -13,6 +13,16 @@ def main():
     markdown = (root / "docs/roadmap-2000.md").read_text()
     items = data["items"]
     assert data["task_count"] == len(items) == 2000
+    status_counts = dict(sorted(collections.Counter(item["status"] for item in items).items()))
+    priority_counts = dict(sorted(collections.Counter(item["priority"] for item in items).items()))
+    assert data["status_counts"] == status_counts, "Stale JSON status counts"
+    assert data["priority_counts"] == priority_counts, "Stale JSON priority counts"
+    totals = "Итоговые количества: " + ", ".join(
+        f"{key}: {value}" for key, value in priority_counts.items()
+    ) + "; статусы: " + ", ".join(
+        f"{key}: {value}" for key, value in status_counts.items()
+    ) + "."
+    assert totals in markdown, "Stale Markdown summary counts"
     ids = {item["id"] for item in items}
     assert ids == {f"LIN-{number:04}" for number in range(1, 2001)}
     assert [item["rank"] for item in items] == list(range(1, 2001))
