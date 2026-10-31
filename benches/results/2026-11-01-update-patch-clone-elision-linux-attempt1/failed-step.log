@@ -1,0 +1,21 @@
+component	Build ordinary paired binaries	﻿2026-10-31T22:57:38.8310917Z ##[group]Run python3 benches/results/2026-11-01-update-patch-clone-elision/build.py
+component	Build ordinary paired binaries	2026-10-31T22:57:38.8311567Z ^[[36;1mpython3 benches/results/2026-11-01-update-patch-clone-elision/build.py^[[0m
+component	Build ordinary paired binaries	2026-10-31T22:57:38.8330961Z shell: /usr/bin/bash -e {0}
+component	Build ordinary paired binaries	2026-10-31T22:57:38.8331219Z env:
+component	Build ordinary paired binaries	2026-10-31T22:57:38.8331423Z   CARGO_HOME: /home/runner/.cargo
+component	Build ordinary paired binaries	2026-10-31T22:57:38.8331699Z   CARGO_INCREMENTAL: 0
+component	Build ordinary paired binaries	2026-10-31T22:57:38.8331922Z   CARGO_TERM_COLOR: always
+component	Build ordinary paired binaries	2026-10-31T22:57:38.8332151Z   CACHE_ON_FAILURE: true
+component	Build ordinary paired binaries	2026-10-31T22:57:38.8332368Z ##[endgroup]
+component	Build ordinary paired binaries	2026-10-31T22:57:38.8754200Z fatal: path 'src/exec.rs' exists on disk, but not in '21dcd7d81354aa2f59038aa6cb142c86cd1cd1f5'
+component	Build ordinary paired binaries	2026-10-31T22:57:38.9329374Z Traceback (most recent call last):
+component	Build ordinary paired binaries	2026-10-31T22:57:38.9330708Z   File "/home/runner/work/lin/lin/benches/results/2026-11-01-update-patch-clone-elision/build.py", line 15, in <module>
+component	Build ordinary paired binaries	2026-10-31T22:57:38.9332788Z     f.write_bytes(subprocess.check_output(['git','show',m['baseline_reference']+':'+str(f)])if role=='baseline'else before[f])
+component	Build ordinary paired binaries	2026-10-31T22:57:38.9334211Z                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+component	Build ordinary paired binaries	2026-10-31T22:57:38.9335277Z   File "/usr/lib/python3.12/subprocess.py", line 466, in check_output
+component	Build ordinary paired binaries	2026-10-31T22:57:38.9336291Z     return run(*popenargs, stdout=PIPE, timeout=timeout, check=True,
+component	Build ordinary paired binaries	2026-10-31T22:57:38.9337118Z            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+component	Build ordinary paired binaries	2026-10-31T22:57:38.9338279Z   File "/usr/lib/python3.12/subprocess.py", line 571, in run
+component	Build ordinary paired binaries	2026-10-31T22:57:38.9348639Z     raise CalledProcessError(retcode, process.args,
+component	Build ordinary paired binaries	2026-10-31T22:57:38.9349428Z subprocess.CalledProcessError: Command '['git', 'show', '21dcd7d81354aa2f59038aa6cb142c86cd1cd1f5:src/exec.rs']' returned non-zero exit status 128.
+component	Build ordinary paired binaries	2026-10-31T22:57:38.9477353Z ##[error]Process completed with exit code 1.

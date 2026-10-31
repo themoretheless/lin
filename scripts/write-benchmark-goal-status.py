@@ -348,6 +348,39 @@ lines += ['', (
     'пропускать незатронутые индексы в них нечего. Timing matrix не запускалась, '
     'ускорение не установлено. Кандидат сохранён отдельно и исключён из следующей оптимизации.'
 )]
+schema_probe = read('benches/results/2026-11-01-transaction-schema-undo-probe/status.json')
+schema_local = read('benches/results/2026-11-01-transaction-schema-undo-fix/local-test-status.json')
+assert schema_probe['runtime_reproduced'] and schema_probe['source_restored'] and len(schema_probe['outcomes']) == 6
+assert all(not o['passes'] for o in schema_probe['outcomes'])
+assert schema_local['exit_code'] == 0 and schema_local['release_passed'] == 458 and schema_local['release_ignored'] == 2
+lines += ['', (
+    '[Schema rollback: corrected locally](../benches/results/2026-11-01-transaction-schema-undo-fix/report.md): '
+    'на точной базе21dcd7d81 воспроизведены три дефекта в6случаях: оставшаяся вставка, '
+    'Store-схема и UNIQUE constraint после rollback. Core79a4cb837 сохраняет ранний undo prefix '
+    'и один checkpoint для последующей части транзакции. Все458release tests/2ignored прошли; '
+    'три новых теста покрывают27сценариев, включая смешанные префиксы, отказ commit и повторное использование ID. '
+    'Этот локальный результат не аттестует Linux или скорость. '
+    '[Linux qualification](https://github.com/themoretheless/lin/actions/runs/41250934914) проверяет '
+    'тот же исходник и три отдельно скомпилированных runtime negatives.'
+)]
+patch_attempt = read('benches/results/2026-11-01-update-patch-clone-elision-linux-attempt1/functional-audit.json')
+assert patch_attempt['audit_complete'] and patch_attempt['infrastructure_failure'] and patch_attempt['timing_processes'] == patch_attempt['timing_observations'] == 0
+lines += ['', (
+    '[UPDATE patch clone elision: infrastructure attempt](../benches/results/2026-11-01-update-patch-clone-elision-linux-attempt1/report.md): '
+    'run41249170021 прошёл455tests/2ignored и оба runtime negatives, но depth=1 checkout '
+    'не загрузил исходник baseline для сборки бинарников. Измерений0; все26raw файлов и логи сохранены. '
+    '[Исправленный запуск](https://github.com/themoretheless/lin/actions/runs/41251433614) использует '
+    'fetch-depth:0; runtime, scenarios и thresholds совпадают с первой попыткой. '
+    'Ожидаются полные504процесса/4032наблюдения. Победы по скорости этим результатом не установлены.'
+)]
+kusto_now = read('benches/results/2026-11-01-kusto-availability/status.json')
+assert kusto_now['github_secret_metadata_verified'] and kusto_now['github_secret_list_complete'] and kusto_now['no_secret_values_recorded']
+assert not any(kusto_now['local_environment_present'].values()) and not any(kusto_now['github_required_secret_names_present'].values())
+lines += ['', (
+    f"[Kusto availability](../benches/results/2026-11-01-kusto-availability/status.json), проверка {kusto_now['observed_at_utc']}: "
+    'URL/DATABASE/TOKEN отсутствовали в локальной среде и полном списке repository-secret names. '
+    'Значения секретов не сохранялись. Реальный Kusto-прогон остаётся открыт.'
+)]
 output = root / 'docs/benchmark-goal-status-2026-10-27.md'
 output.write_text('\n'.join(lines) + '\n')
 # Never expose endpoint values or credentials in the status artifact.

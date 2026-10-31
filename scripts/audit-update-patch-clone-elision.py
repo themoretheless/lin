@@ -3,7 +3,7 @@
 from pathlib import Path
 import json,subprocess,hashlib,statistics,math,itertools,argparse,re
 ROOT=Path(__file__).resolve().parents[1]
-HEAD='f38e3178c003a234acbad6b8baff44d316407916'
+HEAD='0ffe738f4959eee769cf6e261066be426a961dee'
 INPUT='benches/results/2026-11-01-update-patch-clone-elision'
 CASES=['compare/update_1row_1k/lin', 'compare/update_1row_10k/lin', 'compare/update_1row_100k/lin', 'compare/durable_update_1row_1k/lin', 'compare/durable_update_1row_10k/lin', 'compare/durable_delete_1row_10k/lin', 'compare/durable_commit_1row_10k/lin', 'compare/durable_rollback_1row_10k/lin', 'compare/wal_scalar_full_update/lin', 'compare/wal_scalar_normal_update/lin', 'compare/insert_bulk_10k/lin', 'compare/filter_eq/lin', 'compare/filter_eq/duckdb', 'compare/update_1row_1k/sqlite']
 def sha(data):return hashlib.sha256(data).hexdigest()
@@ -46,6 +46,16 @@ def audit(parent):
  for name,h in frozen.items():
   assert sha(git(name))==h,name
   if name.startswith(INPUT+'/'):assert sha((raw/name[len(INPUT)+1:]).read_bytes())==h,name
+ retry=json.loads(git(INPUT+'/infrastructure-retry.json'));old=retry['original_frozen_head']
+ assert old=='f38e3178c003a234acbad6b8baff44d316407916'and retry['original_run_id']==41249170021
+ assert retry['timing_processes_before_retry']==retry['timing_observations_before_retry']==0 and retry['runtime_sources_unchanged']and retry['thresholds_unchanged']
+ assert source_map(old)==source_map(HEAD)and source_map(old,'tests')==source_map(HEAD,'tests')
+ for name in ['Cargo.toml','Cargo.lock',*[INPUT+'/'+n for n in ['compare.rs','run.py','analyze.py','build.py','smoke.py','test.py','test-protocol.py','check-mutants.py','input.json','performance-plan.json']]]:
+  assert git(name,old)==git(name),name
+ previous='benches/results/2026-11-01-update-patch-clone-elision-linux-attempt1/'
+ first=json.loads(git(previous+'functional-audit.json'));assert first['audit_complete']and first['infrastructure_failure']and first['timing_processes']==first['timing_observations']==0
+ assert sha(git(previous+'raw.tar.gz'))==retry['original_attempt_archive_sha256']
+ assert 'fetch-depth: 0'in git('.github/workflows/update-patch-clone-elision-component.yml').decode()
  manifest=json.loads(git(INPUT+'/input.json'));baseline=source_map(manifest['baseline_reference']);candidate=source_map(manifest['candidate_reference'])
  assert manifest['candidate_reference']==subprocess.check_output(['git','rev-parse','ed3098197'],cwd=ROOT,text=True).strip()
  assert candidate==source_map(HEAD)==manifest['source_sha256']
