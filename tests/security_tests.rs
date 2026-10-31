@@ -353,7 +353,7 @@ fn test_secret_lifetime_in_diagnostics_lin_1774() {
 #[test]
 #[cfg(feature = "embed-ollama")]
 fn test_http_remote_tls_requirement_lin_1775() {
-    use lin::embed_ollama::OllamaEmbedder;
+    use lin::OllamaEmbedder;
     // Local endpoints allowed with http
     assert!(OllamaEmbedder::new("http://localhost:11434", "nomic-embed-text/768").is_ok());
     assert!(OllamaEmbedder::new("http://127.0.0.1:11434", "nomic-embed-text/768").is_ok());
