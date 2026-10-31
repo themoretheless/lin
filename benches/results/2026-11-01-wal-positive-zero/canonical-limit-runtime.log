@@ -1,0 +1,41 @@
+   Compiling lin v0.4.0 (/Users/themoretheless/.codex/worktrees/cow-row-vnext/lin)
+warning: unused import: `super::*`
+  --> src/cow_row_tests.rs:16:6
+   |
+16 |  use super::*;
+   |      ^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `extra`
+    --> src/persist.rs:1212:13
+     |
+1212 |         let extra = positive_zero::encode(buf, rec).map_err(io_err)?;
+     |             ^^^^^ help: if this is intentional, prefix it with an underscore: `_extra`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `lin` (lib test) generated 2 warnings (run `cargo fix --lib -p lin --tests` to apply 2 suggestions)
+    Finished `release` profile [optimized] target(s) in 39.07s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/lib.rs (/tmp/lin-cow-vnext-target/release/build/lin/ccc7a04ff4c2448e/out/lin-ccc7a04ff4c2448e)
+
+running 1 test
+test persist::positive_zero::tests::positive_zero_canonical_payload_and_envelope_limits_reject_before_write ... FAILED
+
+failures:
+
+---- persist::positive_zero::tests::positive_zero_canonical_payload_and_envelope_limits_reject_before_write stdout ----
+
+thread 'persist::positive_zero::tests::positive_zero_canonical_payload_and_envelope_limits_reject_before_write' (483160) panicked at src/persist/positive_zero.rs:308:10:
+called `Result::unwrap_err()` on an `Ok` value: ()
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    persist::positive_zero::tests::positive_zero_canonical_payload_and_envelope_limits_reject_before_write
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 115 filtered out; finished in 0.08s
+
+error: test failed, to rerun pass `--lib`

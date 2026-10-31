@@ -1,0 +1,35 @@
+   Compiling lin v0.4.0 (/Users/themoretheless/.codex/worktrees/cow-row-vnext/lin)
+warning: unused import: `super::*`
+  --> src/cow_row_tests.rs:16:6
+   |
+16 |  use super::*;
+   |      ^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `lin` (lib test) generated 1 warning (run `cargo fix --lib -p lin --tests` to apply 1 suggestion)
+    Finished `release` profile [optimized] target(s) in 50.27s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/lib.rs (/tmp/lin-cow-vnext-target/release/build/lin/ccc7a04ff4c2448e/out/lin-ccc7a04ff4c2448e)
+
+running 1 test
+test persist::positive_zero::tests::positive_zero_record_shapes_preserve_canonical_bits_and_size ... FAILED
+
+failures:
+
+---- persist::positive_zero::tests::positive_zero_record_shapes_preserve_canonical_bits_and_size stdout ----
+
+thread 'persist::positive_zero::tests::positive_zero_record_shapes_preserve_canonical_bits_and_size' (476998) panicked at src/persist/positive_zero.rs:239:21:
+assertion `left == right` failed
+  left: [131, 163, 103, 101, 110, 41, 167, 110, 101, 120, 116, 95, 105, 100, 99, 164, 112, 97, 99, 107, 131, 164, 116, 121, 112, 101, 166, 117, 112, 100, 97, 116, 101, 170, 99, 111, 108, 108, 101, 99, 116, 105, 111, 110, 164, 100, 111, 99, 115, 164, 114, 111, 119, 115, 145, 136, 169, 101, 109, 98, 101, 100, 100, 105, 110, 103, 130, 161, 116, 163, 86, 101, 99, 161, 118, 145, 202, 0, 0, 0, 0, 164, 102, 108, 97, 103, 130, 161, 116, 164, 66, 111, 111, 108, 161, 118, 195, 162, 105, 100, 130, 161, 116, 164, 84, 101, 120, 116, 161, 118, 161, 100, 167, 105, 110, 116, 101, 103, 101, 114, 130, 161, 116, 163, 73, 110, 116, 161, 118, 208, 214, 173, 110, 101, 103, 97, 116, 105, 118, 101, 95, 122, 101, 114, 111, 130, 161, 116, 165, 70, 108, 111, 97, 116, 161, 118, 203, 128, 0, 0, 0, 0, 0, 0, 0, 164, 110, 117, 108, 108, 129, 161, 116, 164, 78, 117, 108, 108, 164, 116, 105, 109, 101, 130, 161, 116, 164, 84, 105, 109, 101, 161, 118, 206, 0, 18, 214, 135, 165, 116, 105, 116, 108, 101, 130, 161, 116, 164, 84, 101, 120, 116, 161, 118, 180, 208, 129, 208, 150, 32, 240, 159, 166, 148, 32, 92, 34, 32, 85, 110, 105, 99, 111, 100, 101]
+ right: [131, 163, 103, 101, 110, 41, 167, 110, 101, 120, 116, 95, 105, 100, 99, 164, 112, 97, 99, 107, 131, 164, 116, 121, 112, 101, 166, 117, 112, 100, 97, 116, 101, 170, 99, 111, 108, 108, 101, 99, 116, 105, 111, 110, 164, 100, 111, 99, 115, 164, 114, 111, 119, 115, 145, 136, 169, 101, 109, 98, 101, 100, 100, 105, 110, 103, 130, 161, 116, 163, 86, 101, 99, 161, 118, 145, 202, 128, 0, 0, 0, 164, 102, 108, 97, 103, 130, 161, 116, 164, 66, 111, 111, 108, 161, 118, 195, 162, 105, 100, 130, 161, 116, 164, 84, 101, 120, 116, 161, 118, 161, 100, 167, 105, 110, 116, 101, 103, 101, 114, 130, 161, 116, 163, 73, 110, 116, 161, 118, 208, 214, 173, 110, 101, 103, 97, 116, 105, 118, 101, 95, 122, 101, 114, 111, 130, 161, 116, 165, 70, 108, 111, 97, 116, 161, 118, 203, 128, 0, 0, 0, 0, 0, 0, 0, 164, 110, 117, 108, 108, 129, 161, 116, 164, 78, 117, 108, 108, 164, 116, 105, 109, 101, 130, 161, 116, 164, 84, 105, 109, 101, 161, 118, 206, 0, 18, 214, 135, 165, 116, 105, 116, 108, 101, 130, 161, 116, 164, 84, 101, 120, 116, 161, 118, 180, 208, 129, 208, 150, 32, 240, 159, 166, 148, 32, 92, 34, 32, 85, 110, 105, 99, 111, 100, 101]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    persist::positive_zero::tests::positive_zero_record_shapes_preserve_canonical_bits_and_size
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 115 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--lib`
