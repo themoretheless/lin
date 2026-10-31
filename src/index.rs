@@ -561,6 +561,7 @@ impl LiveIndex {
 
         // Pre-compute all keys in a single pass
         let keys: Vec<_> = keyed_rows.iter().map(|(_, r)| self.key_of(r)).collect();
+        self.reverse.reserve(keyed_rows.len());
 
         let bitmap_sample = self.def.bitmap_card_field.as_ref().map(|field| {
             let mut distinct = rustc_hash::FxHashSet::default();
@@ -1565,6 +1566,7 @@ impl LiveIndex {
 
         // Pre-compute all keys in a single pass
         let keys: Vec<_> = keyed_rows.iter().map(|(_, r)| self.key_of(r)).collect();
+        self.reverse.reserve(keyed_rows.len());
 
         // Bulk insert using pre-computed keys
         for ((orig_idx, row), key) in keyed_rows.iter().zip(keys.into_iter()) {

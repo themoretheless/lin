@@ -1260,13 +1260,12 @@ fn write_frame_bytes(
             log.write_all(&scratch)
         })
     } else {
-        let mut hdr = [0u8; 8];
+        let mut hdr = [0u8; 9];
         hdr[..4].copy_from_slice(&LOG_MAGIC_CHECKSUM);
-        hdr[4..].copy_from_slice(&len.to_le_bytes());
-        let codec = [codec_byte];
+        hdr[4..8].copy_from_slice(&len.to_le_bytes());
+        hdr[8] = codec_byte;
         let slices = [
             IoSlice::new(&hdr),
-            IoSlice::new(&codec),
             IoSlice::new(payload),
             IoSlice::new(&checksum),
         ];
@@ -1355,8 +1354,11 @@ fn append_facts_v2(
     log_bytes: &mut u64,
 ) -> Result<(), Error> {
     let n = s.len().min(p.len()).min(o.len());
+    let str_bytes = s.iter().map(|x| x.len()).sum::<usize>()
+        + p.iter().map(|x| x.len()).sum::<usize>()
+        + o.iter().map(|x| x.len()).sum::<usize>();
     buf.clear();
-    buf.reserve(1 + 8 + 8 + 4 + n * 24);
+    buf.reserve(1 + 8 + 8 + 4 + n * 12 + str_bytes);
     buf.push(V2_FACTS_BULK);
     buf.extend_from_slice(&rec_gen.to_le_bytes());
     buf.extend_from_slice(&next_id.to_le_bytes());

@@ -2373,20 +2373,20 @@ impl Db {
                 let mut bulk_p = Vec::with_capacity(n);
                 let mut bulk_o = Vec::with_capacity(n);
                 for record in records {
-                    let mut s = String::new();
-                    let mut p = String::new();
-                    let mut o = String::new();
+                    let mut s = None;
+                    let mut p = None;
+                    let mut o = None;
                     for (k, v) in &record.fields {
                         match k.as_str() {
-                            "s" => s = value_text(v, now),
-                            "p" => p = value_text(v, now),
-                            "o" => o = value_text(v, now),
+                            "s" => s = Some(value_to_string(v, now)),
+                            "p" => p = Some(value_to_string(v, now)),
+                            "o" => o = Some(value_to_string(v, now)),
                             _ => {}
                         }
                     }
-                    bulk_s.push(s);
-                    bulk_p.push(p);
-                    bulk_o.push(o);
+                    bulk_s.push(s.unwrap_or_default());
+                    bulk_p.push(p.unwrap_or_default());
+                    bulk_o.push(o.unwrap_or_default());
                 }
                 let want_rows = n <= 128;
                 let (rows, changed_n) = self
@@ -5644,19 +5644,44 @@ impl Db {
     ) -> Result<(Vec<Row>, Vec<Edge>, Option<crate::persist::PreparedInsert>), Error> {
         let now = now_ms();
         let n = records.len();
-        let mut built: Vec<Row> = if n >= 4096 {
-            std::thread::scope(|scope| {
-                let (left, right) = records.split_at(n / 2);
-                let worker = std::thread::Builder::new().spawn_scoped(scope, || {
-                    let mut rows = Vec::with_capacity(right.len());
-                    append_batch_shape_rows(&mut rows, right, now);
+        let mut built: Vec<Row> = if n >= 2048 {
+            let threads = std::thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(1)
+                .min(8)
+                .min((n + 511) / 512);
+            if threads > 1 {
+                let chunk_size = (n + threads - 1) / threads;
+                std::thread::scope(|scope| {
+                    let mut handles = Vec::with_capacity(threads);
+                    for chunk in records.chunks(chunk_size) {
+                        handles.push(scope.spawn(move || {
+                            let mut rows = Vec::with_capacity(chunk.len());
+                            append_batch_shape_rows(&mut rows, chunk, now);
+                            for row in &mut rows {
+                                if row.get("hash").and_then(Cell::text).is_none()
+                                    && let Some(body) = row.get("body").and_then(Cell::text_shared)
+                                {
+                                    row.insert(
+                                        "hash".into(),
+                                        Cell::Text(content_hash_arc(body.as_ref())),
+                                    );
+                                }
+                            }
+                            rows
+                        }));
+                    }
+                    let mut rows = Vec::with_capacity(n);
+                    for handle in handles {
+                        rows.extend(handle.join().expect("row construction worker panicked"));
+                    }
                     rows
-                });
+                })
+            } else {
                 let mut rows = Vec::with_capacity(n);
-                append_batch_shape_rows(&mut rows, left, now);
-                append_bulk_worker_rows(&mut rows, right, now, worker);
+                append_batch_shape_rows(&mut rows, records, now);
                 rows
-            })
+            }
         } else {
             let mut rows = Vec::with_capacity(n);
             append_batch_shape_rows(&mut rows, records, now);
@@ -6469,6 +6494,7 @@ fn match_frontier_keys(row: &Row, bind: Option<&str>) -> Vec<String> {
     keys
 }
 
+#[allow(dead_code)]
 fn append_bulk_worker_rows(
     rows: &mut Vec<Row>,
     records: &[Record],
@@ -6849,6 +6875,19 @@ fn value_cell(v: &Value, now: i64) -> Cell {
         Value::NowMinus(d) => Cell::Time(now - d.as_millis()),
         Value::Duration(d) => Cell::Int(d.as_millis()),
         Value::Name(n) => Cell::text_arc(n.as_str()),
+    }
+}
+
+#[inline]
+fn value_to_string(v: &Value, now: i64) -> String {
+    match v {
+        Value::String(s) => s.as_ref().to_owned(),
+        Value::Int(n) => n.to_string(),
+        Value::Float(f) => f.to_string(),
+        Value::Bool(b) => if *b { "true".into() } else { "false".into() },
+        Value::Timestamp(t) => t.to_string(),
+        Value::Name(s) => s.clone(),
+        _ => value_text(v, now),
     }
 }
 

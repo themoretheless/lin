@@ -81,6 +81,35 @@ impl Embedder for HashingEmbedder {
     }
 
     fn embed_batch(&self, texts: &[&str]) -> Vec<Arc<[f32]>> {
+        let n = texts.len();
+        if n < 512 {
+            return self.embed_batch_serial(texts);
+        }
+        let threads = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(1)
+            .min(8)
+            .min((n + 255) / 256);
+        if threads <= 1 {
+            return self.embed_batch_serial(texts);
+        }
+        let chunk_size = (n + threads - 1) / threads;
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(threads);
+            for chunk in texts.chunks(chunk_size) {
+                handles.push(scope.spawn(move || self.embed_batch_serial(chunk)));
+            }
+            let mut out = Vec::with_capacity(n);
+            for handle in handles {
+                out.extend(handle.join().expect("embedding worker panicked"));
+            }
+            out
+        })
+    }
+}
+
+impl HashingEmbedder {
+    fn embed_batch_serial(&self, texts: &[&str]) -> Vec<Arc<[f32]>> {
         EMBED_SCRATCH.with(|cell| {
             let mut guard = cell.borrow_mut();
             let (scratch, lower) = &mut *guard;
@@ -93,9 +122,6 @@ impl Embedder for HashingEmbedder {
             out
         })
     }
-}
-
-impl HashingEmbedder {
     /// Add every feature of `lower` (unigrams, char trigrams, string bigrams)
     /// into the accumulator.
     fn fill(&self, s: &mut Scratch, lower: &str) {
