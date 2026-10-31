@@ -1,0 +1,35 @@
+name: transaction-schema-undo-correctness
+on:
+  push:
+    branches: [codex/transaction-schema-undo-ci]
+permissions:
+  contents: read
+jobs:
+  correctness:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Verify frozen runtime, tests and qualification scripts
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import json,hashlib
+          p=Path('benches/results/2026-11-01-transaction-schema-undo-fix')
+          for name,digest in json.loads((p/'frozen-inputs.json').read_text()).items():
+              assert hashlib.sha256(Path(name).read_bytes()).hexdigest()==digest,name
+          PY
+      - name: Full release suite and three compiled runtime negatives
+        run: python3 benches/results/2026-11-01-transaction-schema-undo-fix/qualify.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: transaction-schema-undo-correctness
+          path: benches/results/2026-11-01-transaction-schema-undo-fix/
+          if-no-files-found: error

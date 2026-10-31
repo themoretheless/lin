@@ -1,0 +1,19 @@
+   Compiling lin v0.4.0 (/Users/themoretheless/.codex/worktrees/cow-row-vnext/lin)
+    Finished `release` profile [optimized] target(s) in 4.13s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running tests/transaction_schema_undo.rs (/tmp/lin-cow-vnext-target/release/build/lin/304f2390917f6641/out/transaction_schema_undo-304f2390917f6641)
+
+running 3 tests
+{"case":"append_then_schema","explicit":false,"generation_restored":true,"next_id_restored":true,"passes":true,"rows_after":2,"rows_restored":true}
+{"case":"update_then_schema","catalog_restored":true,"explicit":false,"passes":true,"rows_restored":true,"store_schema_restored":true}
+{"case":"delete_then_unique_index","duplicate_insert_succeeds":true,"error":null,"explicit":false,"ghost_unique_index_absent":true,"passes":true}
+{"case":"append_then_schema","explicit":true,"generation_restored":true,"next_id_restored":true,"passes":true,"rows_after":2,"rows_restored":true}
+{"case":"update_then_schema","catalog_restored":true,"explicit":true,"passes":true,"rows_restored":true,"store_schema_restored":true}
+{"case":"delete_then_unique_index","duplicate_insert_succeeds":true,"error":null,"explicit":true,"ghost_unique_index_absent":true,"passes":true}
+test schema_after_rows_rollback_restores_rows_metadata_and_constraints ... ok
+test repeated_schema_snapshots_preserve_journal_order_and_abort_state ... ok
+test generated_ids_are_reusable_after_schema_snapshot_rollback ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+

@@ -784,7 +784,14 @@ impl<'a> Transaction<'a> {
                             events: Vec::new(),
                         };
                     } else {
-                        self.undo = Undo::Full(self.db.store.mem_backup());
+                        // Keep the original append boundary: this snapshot is taken
+                        // after earlier appends, not at transaction entry.
+                        let append = mark.clone();
+                        let snapshot = Box::new(self.db.store.mem_backup());
+                        self.undo = Undo::Mixed {
+                            append,
+                            events: vec![RowUndo::Snapshot(snapshot)],
+                        };
                     }
                 }
             }
@@ -793,6 +800,13 @@ impl<'a> Transaction<'a> {
                     // An append after row edits must be undone at this exact point
                     // in the reverse journal, before earlier swap-deletes restore slots.
                     events.push(RowUndo::Append(self.db.store.append_mark()));
+                } else if !prep.stmts.iter().all(|stmt| {
+                    matches!(stmt, Stmt::Update { .. } | Stmt::Delete { .. }
+                        | Stmt::Query(_) | Stmt::Let { .. })
+                }) {
+                    // Schema and other non-row mutations need a snapshot at this
+                    // exact journal position, before older row edits are undone.
+                    events.push(RowUndo::Snapshot(Box::new(self.db.store.mem_backup())));
                 }
             }
             Undo::Full(_) => {}
@@ -2014,6 +2028,7 @@ impl Db {
                 for event in events.into_iter().rev() {
                     match event {
                         RowUndo::Append(mark) => self.store.append_rollback(mark),
+                        RowUndo::Snapshot(snapshot) => self.store.mem_restore(*snapshot),
                         RowUndo::Update(collection, idx, row) => {
                             if let Some(mut restored) = self.store.collection(&collection).get(idx).cloned() {
                                 row.apply(&mut restored);
@@ -2030,6 +2045,7 @@ impl Db {
                 for event in events.into_iter().rev() {
                     match event {
                         RowUndo::Append(mark) => self.store.append_rollback(mark),
+                        RowUndo::Snapshot(snapshot) => self.store.mem_restore(*snapshot),
                         RowUndo::Update(collection, idx, row) => {
                             if let Some(mut restored) = self.store.collection(&collection).get(idx).cloned() {
                                 row.apply(&mut restored);
@@ -5955,20 +5971,17 @@ impl Db {
                 }
             }
         }
-        let mut effective_patch = record_row(record, now);
-        let explicit_hash = effective_patch.contains_key("hash");
-        if let Some(body) = row_text(&effective_patch, "body") {
-            let hash = cached_content_hash(body);
-            effective_patch.insert("hash".into(), Cell::Text(hash));
+        let patch = record_row(record, now);
+        let mut effective_patch = patch.clone();
+        if patch.contains_key("body")
+            && let Some(body) = row_text(&patch, "body")
+        {
+            effective_patch.insert("hash".into(), Cell::Text(cached_content_hash(body)));
         }
         let mut out = Vec::new();
         for i in idxs {
             let before = &self.store.collection(collection)[i];
-            for (k, _) in &effective_patch {
-                // Guards apply to explicitly assigned fields, not the hash derived from body.
-                if k == "hash" && !explicit_hash {
-                    continue;
-                }
+            for (k, _) in &patch {
                 for g in &self.catalog.guards {
                     if g.collection == collection && &g.field == k && eval_pred(&g.pred, before, now) {
                         return Err(Error::runtime(format!("immutable field: {collection}.{k}")));
@@ -6259,6 +6272,7 @@ impl RowDelta {
 
 pub(crate) enum RowUndo {
     Append(crate::store::AppendMark),
+    Snapshot(Box<crate::store::MemBackup>),
     Update(String, usize, RowDelta),
     Delete(String, Vec<usize>, Vec<Row>),
 }
