@@ -9,5 +9,6 @@ try:
   assert status[name]==0,name
 finally:
  status['sources_restored']=all(hashlib.sha256(Path(n).read_bytes()).hexdigest()==h for n,h in m['source_sha256'].items())
+ status['tests_unchanged']=all(hashlib.sha256(Path(n).read_bytes()).hexdigest()==h for n,h in m['tests_sha256'].items())
  (p/'qualification-status.json').write_text(json.dumps(status,indent=2)+'\n')
-assert status['sources_restored']
+assert status['sources_restored']and status['tests_unchanged']
