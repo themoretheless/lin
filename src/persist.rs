@@ -1164,8 +1164,6 @@ pub fn append_compressed_batch(
     }
 }
 
-mod positive_zero;
-
 pub fn append_record(
     log: &mut File,
     rec: &LogRecord,
@@ -1208,20 +1206,9 @@ fn append_record_v1(
     log_bytes: &mut u64,
 ) -> Result<(), Error> {
     buf.clear();
-    if sync == SyncMode::Full {
-        let extra = positive_zero::encode(buf, rec).map_err(io_err)?;
-        // Preserve the original canonical payload and envelope quota, even when
-        // positive-zero encoding makes the physical payload much smaller.
-        if buf.len().checked_add(extra).and_then(|n| n.checked_add(5))
-            .filter(|&n| n <= MAX_RECORD as usize).is_none()
-        {
-            return Err(io_err("log record exceeds 16MiB"));
-        }
-    } else {
-        rmp_serde::encode::write_named(buf, rec).map_err(io_err)?;
-        if buf.len() > MAX_RECORD as usize {
-            return Err(io_err("log record exceeds 16MiB"));
-        }
+    rmp_serde::encode::write_named(buf, rec).map_err(io_err)?;
+    if buf.len() > MAX_RECORD as usize {
+        return Err(io_err("log record exceeds 16MiB"));
     }
     write_frame(log, &LOG_MAGIC_V1, buf, sync, log_bytes)
 }

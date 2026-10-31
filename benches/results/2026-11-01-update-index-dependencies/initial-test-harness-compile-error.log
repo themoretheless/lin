@@ -1,0 +1,46 @@
+   Compiling lin v0.4.0 (/Users/themoretheless/.codex/worktrees/cow-row-vnext/lin)
+warning: unused import: `super::*`
+  --> src/cow_row_tests.rs:16:6
+   |
+16 |  use super::*;
+   |      ^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+error[E0599]: no method named `clone` found for struct `store::Store` in the current scope
+    --> src/store.rs:4216:42
+     |
+ 681 | pub struct Store {
+     | ---------------- method `clone` not found for this struct
+...
+4216 |             let mut selective = db.store.clone();
+     |                                          ^^^^^
+     |
+     = help: items from traits can only be used if the trait is implemented and in scope
+     = note: the following trait defines an item `clone`, perhaps you need to implement it:
+             candidate #1: `Clone`
+help: there is a method `clone_mem` with a similar name
+     |
+4216 |             let mut selective = db.store.clone_mem();
+     |                                               ++++
+
+error[E0599]: no method named `clone` found for struct `store::Store` in the current scope
+    --> src/store.rs:4217:37
+     |
+ 681 | pub struct Store {
+     | ---------------- method `clone` not found for this struct
+...
+4217 |             let mut full = db.store.clone();
+     |                                     ^^^^^
+     |
+     = help: items from traits can only be used if the trait is implemented and in scope
+     = note: the following trait defines an item `clone`, perhaps you need to implement it:
+             candidate #1: `Clone`
+help: there is a method `clone_mem` with a similar name
+     |
+4217 |             let mut full = db.store.clone_mem();
+     |                                          ++++
+
+For more information about this error, try `rustc --explain E0599`.
+warning: `lin` (lib test) generated 1 warning
+error: could not compile `lin` (lib test) due to 2 previous errors; 1 warning emitted

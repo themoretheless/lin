@@ -5991,7 +5991,7 @@ impl Db {
             }
             live.ensure_shared();
             let updated = live.clone();
-            self.store.index_insert_row(collection, i, &updated)?;
+            self.store.index_patch_row(collection, i, &updated, &effective_patch)?;
             if let Some(before) = fts_before {
                 if let Some(fts) = self.store.fts.get_mut(collection) { fts.sync_row(i, &before, &updated); }
             }
