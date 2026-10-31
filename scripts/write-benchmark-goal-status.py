@@ -323,7 +323,18 @@ lines += ['', (
     'Локально457release tests/2ignored,8реальных production04749994reader cases и2runtime negatives прошли. '
     'Normal bytes, IEEE bits, canonical payload/envelope quota и старый reader проверены;32golden файла сохранены. '
     'Это корректность прототипа, без Linux timing acceptance или production adoption. '
-    'Нужны новые paired Full UPDATE/DELETE/commit измерения с контролями; цель восьми peers открыта.'
+    'Результат нового Linux прогона приведён ниже; цель восьми peers открыта.'
+)]
+zero_linux = read('benches/results/2026-11-01-wal-positive-zero-component-linux/frozen-audit.json')
+assert zero_linux['audit_complete'] and zero_linux['processes'] == 432 and zero_linux['observations'] == 3456
+assert not zero_linux['component_gate_passes'] and zero_linux['failed_target_windows'] == 0 and zero_linux['failed_control_windows'] == 2
+lines += ['', (
+    '[Full WAL positive-zero Linux: rejected](../benches/results/2026-11-01-wal-positive-zero-component-linux/report.md): '
+    '432 процесса/3456 наблюдений, независимый аудит пройден. Все10 целевых окон проходят: '
+    'ускорение11.556–20.562%,6/6 побед в каждом. UPDATE в памяти замедлился на3.214% и2.323%; '
+    'два контрольных окна провалены. Этот контроль использует Db::empty(), новый WAL-кодек не выполняется; '
+    'причина регрессии не установлена. Все2385raw файлов сохранены сSHA256. '
+    'Нет production adoption, отмены критерия или неизменённого перезапуска. Цель восьми peers открыта.'
 )]
 output = root / 'docs/benchmark-goal-status-2026-10-27.md'
 output.write_text('\n'.join(lines) + '\n')
