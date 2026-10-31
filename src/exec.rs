@@ -5955,17 +5955,20 @@ impl Db {
                 }
             }
         }
-        let patch = record_row(record, now);
-        let mut effective_patch = patch.clone();
-        if patch.contains_key("body")
-            && let Some(body) = row_text(&patch, "body")
-        {
-            effective_patch.insert("hash".into(), Cell::Text(cached_content_hash(body)));
+        let mut effective_patch = record_row(record, now);
+        let explicit_hash = effective_patch.contains_key("hash");
+        if let Some(body) = row_text(&effective_patch, "body") {
+            let hash = cached_content_hash(body);
+            effective_patch.insert("hash".into(), Cell::Text(hash));
         }
         let mut out = Vec::new();
         for i in idxs {
             let before = &self.store.collection(collection)[i];
-            for (k, _) in &patch {
+            for (k, _) in &effective_patch {
+                // Guards apply to explicitly assigned fields, not the hash derived from body.
+                if k == "hash" && !explicit_hash {
+                    continue;
+                }
                 for g in &self.catalog.guards {
                     if g.collection == collection && &g.field == k && eval_pred(&g.pred, before, now) {
                         return Err(Error::runtime(format!("immutable field: {collection}.{k}")));
@@ -5991,7 +5994,7 @@ impl Db {
             }
             live.ensure_shared();
             let updated = live.clone();
-            self.store.index_patch_row(collection, i, &updated, &effective_patch)?;
+            self.store.index_insert_row(collection, i, &updated)?;
             if let Some(before) = fts_before {
                 if let Some(fts) = self.store.fts.get_mut(collection) { fts.sync_row(i, &before, &updated); }
             }

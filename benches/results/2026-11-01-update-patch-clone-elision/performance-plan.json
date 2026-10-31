@@ -1,0 +1,39 @@
+{
+  "target_cases": [
+    "compare/update_1row_1k/lin",
+    "compare/update_1row_10k/lin",
+    "compare/update_1row_100k/lin"
+  ],
+  "cases": [
+    "compare/update_1row_1k/lin",
+    "compare/update_1row_10k/lin",
+    "compare/update_1row_100k/lin",
+    "compare/durable_update_1row_1k/lin",
+    "compare/durable_update_1row_10k/lin",
+    "compare/durable_delete_1row_10k/lin",
+    "compare/durable_commit_1row_10k/lin",
+    "compare/durable_rollback_1row_10k/lin",
+    "compare/wal_scalar_full_update/lin",
+    "compare/wal_scalar_normal_update/lin",
+    "compare/insert_bulk_10k/lin",
+    "compare/filter_eq/lin",
+    "compare/filter_eq/duckdb",
+    "compare/update_1row_1k/sqlite"
+  ],
+  "series": 2,
+  "pairs_per_series": 6,
+  "roles": [
+    "baseline",
+    "control",
+    "candidate"
+  ],
+  "control_uses_same_baseline_binary": true,
+  "observations_per_process": 8,
+  "processes": 504,
+  "observations": 4032,
+  "target_gate": "all six paired gains positive and median gain greater than median absolute baseline/control A/A",
+  "control_gate": "median gain >= -max(2%, median absolute A/A)",
+  "trim_observations": false,
+  "allow_unchanged_retry": false,
+  "qualification_scope": "component only; no full-source or peer acceptance"
+}

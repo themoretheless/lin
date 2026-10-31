@@ -2994,27 +2994,6 @@ impl Store {
         Ok(())
     }
 
-    /// UPDATE only needs to rebuild keys that the effective patch can change.
-    /// Partial predicates are always reevaluated, including time-dependent ones.
-    pub(crate) fn index_patch_row(
-        &mut self,
-        collection: &str,
-        row_idx: usize,
-        row: &Row,
-        patch: &Row,
-    ) -> Result<(), Error> {
-        for idx in self.indexes.values_mut() {
-            if idx.def.collection == collection
-                && (idx.def.pred.is_some()
-                    || idx.def.fields.iter().any(|field| patch.contains_key(field)))
-                && let Err(e) = idx.insert_at(row_idx, row)
-            {
-                return Err(Error::runtime(e));
-            }
-        }
-        Ok(())
-    }
-
     /// Batch secondary-index inserts for a freshly appended slab `[start, start+rows.len())`.
     pub fn index_insert_slab(
         &mut self,
@@ -4182,49 +4161,3 @@ mod empty_index_slab_tests {
 
 #[cfg(test)]
 include!("cow_row_tests.rs");
-
-#[cfg(test)]
-mod index_patch_tests {
-    use super::*;
-
-    #[test]
-    fn selective_index_patch_matches_full_reindex() {
-        let mut db = crate::Db::empty();
-        for source in [
-            "index docs [wing, ts]",
-            "index docs unique [uri]",
-            "index docs [title] where wing == \"rag\"",
-            "index docs [hash]",
-            "index docs [snippet]",
-        ] {
-            db.run(source).unwrap();
-        }
-        db.run(r#"insert docs {id:"a",uri:"u://a",title:"a",wing:"rag",ts:timestamp(1),body:"before"}"#).unwrap();
-        let before = db.store.collection("docs")[0].clone();
-        for entries in [
-            vec![("unindexed", Cell::Int(9))],
-            vec![("title", Cell::from_text("changed"))],
-            vec![("uri", Cell::from_text("u://changed"))],
-            vec![("wing", Cell::from_text("sys"))],
-            vec![("hash", Cell::from_text("h:changed"))],
-            vec![("snippet", Cell::Null)],
-            vec![("snippet", Cell::Int(7))],
-            vec![("ts", Cell::Time(8)), ("wing", Cell::from_text("sys"))],
-        ] {
-            let patch: Row = entries.into_iter().map(|(k,v)|(k.to_owned(),v)).collect();
-            let mut updated = before.clone();
-            updated.extend(patch.clone());
-            let mut selective = db.store.clone_mem();
-            let mut full = db.store.clone_mem();
-            selective.index_patch_row("docs", 0, &updated, &patch).unwrap();
-            full.index_insert_row("docs", 0, &updated).unwrap();
-            assert!(full.indexes.len() >= 5);
-            assert_eq!(selective.indexes.len(), full.indexes.len());
-            for (name, expected) in &full.indexes {
-                let actual = &selective.indexes[name];
-                assert_eq!(actual.forward, expected.forward, "{name}: {patch:?}");
-                assert_eq!(actual.reverse, expected.reverse, "{name}: {patch:?}");
-            }
-        }
-    }
-}

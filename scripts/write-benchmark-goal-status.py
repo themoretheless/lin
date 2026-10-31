@@ -336,6 +336,18 @@ lines += ['', (
     'причина регрессии не установлена. Все2385raw файлов сохранены сSHA256. '
     'Нет production adoption, отмены критерия или неизменённого перезапуска. Цель восьми peers открыта.'
 )]
+index_patch = read('benches/results/2026-11-01-update-index-dependencies/local-test-status.json')
+index_patch_mutants = read('benches/results/2026-11-01-update-index-dependencies/mutant-status.json')
+assert index_patch['release_passed'] == 455 and index_patch['release_ignored'] == 2
+assert index_patch_mutants['source_restored'] and len(index_patch_mutants['checks']) == 2
+assert all(c['compiled_runtime_rejected'] for c in index_patch_mutants['checks'])
+lines += ['', (
+    '[Selective UPDATE index maintenance: not dispatched](../benches/results/2026-11-01-update-index-dependencies/report.md): '
+    '455 release tests/2 ignored и два отдельно скомпилированных runtime mutants прошли. '
+    'Но текущие UPDATE targets меняют wing в единственном индексе [wing, ts]; '
+    'пропускать незатронутые индексы в них нечего. Timing matrix не запускалась, '
+    'ускорение не установлено. Кандидат сохранён отдельно и исключён из следующей оптимизации.'
+)]
 output = root / 'docs/benchmark-goal-status-2026-10-27.md'
 output.write_text('\n'.join(lines) + '\n')
 # Never expose endpoint values or credentials in the status artifact.

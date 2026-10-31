@@ -1,0 +1,12 @@
+   Compiling lin v0.4.0 (/Users/themoretheless/.codex/worktrees/cow-row-vnext/lin)
+error[E0502]: cannot borrow `effective_patch` as mutable because it is also borrowed as immutable
+    --> src/exec.rs:5962:13
+     |
+5960 |         if let Some(body) = row_text(&effective_patch, "body")
+     |                                      ---------------- immutable borrow occurs here
+5961 |         {
+5962 |             effective_patch.insert("hash".into(), Cell::Text(cached_content_hash(body)));
+     |             ^^^^^^^^^^^^^^^ mutable borrow occurs here                           ---- immutable borrow later used here
+
+For more information about this error, try `rustc --explain E0502`.
+error: could not compile `lin` (lib) due to 1 previous error

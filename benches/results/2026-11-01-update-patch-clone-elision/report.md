@@ -1,0 +1,11 @@
+# UPDATE patch clone elision: qualification pending
+
+The new runtime differs from corrected baseline 21dcd7d81 only in exec.rs UPDATE patch construction. The rejected positive-zero WAL codec and selective index-maintenance candidate are excluded. A single effective patch replaces the original patch plus a cloned map. Body hash is computed before mutating the map to obey borrowing rules. Guard iteration excludes only a hash that was absent from the explicitly assigned fields, preserving the original field order and explicit hash guard behavior.
+
+The new regression test exercises automatic body hash with an indexed hash field, explicit hash guard rejection (with and without body), byte-identical row and generation after rejection, and an unrelated update. The initial borrow-check failure is preserved as a compiler error, not runtime evidence. Full correctness tests are in progress; no timing result or peer win is established.
+
+The performance plan is frozen before timing: three native UPDATE targets at 1k/10k/100k and eleven controls, two six-pair series with baseline/control sharing one executable. Every target requires six positive pairs and median gain above median absolute A/A; controls require gain >= -max(2%, A/A). No observations may be discarded and there is no unchanged retry. The 504-process / 4032-observation matrix and all 28 fresh smoke runs must complete before interpretation. Synthetic analyzer tests detect missing, negative and unavailable observations, losing target/control, binary substitution and duplicate coordinates; these are not real timings.
+
+The first full-suite attempt reached the new guard test but its body+explicit-hash patch used layer raw, which triggers the independent static body immutability rule before the intended runtime hash guard. That failed log is retained separately. The fixture now assigns layer other, leaving the existing wiki row to trigger the runtime hash guard; default catalog guards remain intact. This fixture correction does not change runtime source.
+
+Corrected local full-release run passed 455 tests, with two ignored. Both source and test manifests match the compiled input. The two compiled runtime negatives and paired timing matrix are required in the independent Linux job before component acceptance. No local timing or peer win is claimed.
