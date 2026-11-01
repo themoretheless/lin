@@ -97,18 +97,20 @@ impl FtsIndex {
     /// base list already references (a swap-move or an undo restore) is
     /// registered through the delta set.
     pub fn insert_row(&mut self, row_idx: usize, row: &Row) {
-        for tok in row_tokens(row, &self.fields) {
-            self.note_add(&tok, row_idx);
-        }
+        collect_row_tokens(row, &self.fields);
+        with_collected_tokens(|tok| {
+            self.note_add(tok, row_idx);
+        });
     }
 
     /// Drop one row's postings, given the row that produced them: only its own
     /// tokens are visited, so the cost is per-row rather than per-vocabulary.
     /// Callers must invoke it while `row` still sits at `row_idx`.
     pub fn remove_row(&mut self, row_idx: usize, row: &Row) {
-        for tok in row_tokens(row, &self.fields) {
-            self.note_del(&tok, row_idx);
-        }
+        collect_row_tokens(row, &self.fields);
+        with_collected_tokens(|tok| {
+            self.note_del(tok, row_idx);
+        });
     }
 
     /// Record that `tok` matches `row_idx` from now on.
@@ -226,10 +228,11 @@ impl FtsIndex {
     /// own and does not change, so it is computed once instead of per edit —
     /// which is what a swap-move needs, since it moves one row between slots.
     pub fn move_row(&mut self, from: usize, to: usize, row: &Row) {
-        for tok in row_tokens(row, &self.fields) {
-            self.note_del(&tok, from);
-            self.note_add(&tok, to);
-        }
+        collect_row_tokens(row, &self.fields);
+        with_collected_tokens(|tok| {
+            self.note_del(tok, from);
+            self.note_add(tok, to);
+        });
     }
 
     /// Re-point one row's postings after an in-place update: only tokens that
@@ -593,6 +596,54 @@ fn add_posting(postings: &mut FxHashMap<String, Vec<usize>>, tok: &str, row_idx:
     } else {
         postings.insert(tok.to_owned(), vec![row_idx]);
     }
+}
+
+thread_local! {
+    static LOWER_SCRATCH: std::cell::RefCell<String> = std::cell::RefCell::new(String::with_capacity(512));
+    static SCRATCH: std::cell::RefCell<String> = std::cell::RefCell::new(String::with_capacity(512));
+    static TOKENS: std::cell::RefCell<Vec<std::ops::Range<usize>>> = std::cell::RefCell::new(Vec::with_capacity(64));
+}
+
+fn collect_row_tokens(row: &Row, fields: &[String]) {
+    LOWER_SCRATCH.with(|lsc| {
+        SCRATCH.with(|sc| {
+            TOKENS.with(|tk| {
+                let mut lower_scratch = lsc.borrow_mut();
+                let mut scratch = sc.borrow_mut();
+                let mut tokens = tk.borrow_mut();
+                scratch.clear();
+                tokens.clear();
+
+                for text in fts_texts(row, fields) {
+                    if !scratch.is_empty() {
+                        scratch.push(' ');
+                    }
+                    let lowered = lowercased(text, &mut lower_scratch);
+                    scratch.push_str(lowered);
+                }
+                let base_ptr = scratch.as_ptr() as usize;
+                for word in scratch.split_whitespace() {
+                    let word_offset = (word.as_ptr() as usize) - base_ptr;
+                    tokens.push(word_offset..word_offset + word.len());
+                }
+
+                tokens.sort_unstable_by(|a, b| scratch[a.clone()].cmp(&scratch[b.clone()]));
+                tokens.dedup_by(|a, b| scratch[a.clone()] == scratch[b.clone()]);
+            });
+        });
+    });
+}
+
+fn with_collected_tokens(mut f: impl FnMut(&str)) {
+    SCRATCH.with(|sc| {
+        TOKENS.with(|tk| {
+            let scratch = sc.borrow();
+            let tokens = tk.borrow();
+            for r in tokens.iter() {
+                f(&scratch[r.clone()]);
+            }
+        });
+    });
 }
 
 fn row_tokens<'a>(row: &'a Row, fields: &[String]) -> Vec<std::borrow::Cow<'a, str>> {

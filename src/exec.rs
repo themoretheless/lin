@@ -2506,14 +2506,15 @@ impl Db {
                     record,
                     ctx,
                 )?;
-                Ok((
-                    rows.clone(),
-                    None,
+                let pack = if self.is_durable() {
                     Some(Pack::Update {
                         collection: collection.clone(),
-                        rows,
-                    }),
-                ))
+                        rows: rows.clone(),
+                    })
+                } else {
+                    Some(Pack::Batch { packs: Vec::new() })
+                };
+                Ok((rows, None, pack))
             }
             Stmt::Delete {
                 collection,
@@ -2522,14 +2523,15 @@ impl Db {
                 cas_each,
             } => {
                 let rows = self.delete_rows(collection, pred, cas.as_deref(), *cas_each, ctx)?;
-                Ok((
-                    rows.clone(),
-                    None,
+                let pack = if self.is_durable() {
                     Some(Pack::Delete {
                         collection: collection.clone(),
-                        rows,
-                    }),
-                ))
+                        rows: rows.clone(),
+                    })
+                } else {
+                    Some(Pack::Batch { packs: Vec::new() })
+                };
+                Ok((rows, None, pack))
             }
             Stmt::DeleteEdge { rel, from, to } => {
                 let row = self.delete_edge(rel, from, to)?;

@@ -257,6 +257,23 @@ impl PostingList {
     }
 
     #[inline]
+    pub fn replace(&mut self, from: usize, to: usize) {
+        match self {
+            PostingList::Standard(vec) => {
+                if let Some(p) = vec.iter().position(|&x| x == from) {
+                    vec[p] = to;
+                } else {
+                    vec.push(to);
+                }
+            }
+            PostingList::Bitmap(set) => {
+                set.remove(from);
+                set.insert(to);
+            }
+        }
+    }
+
+    #[inline]
     pub fn remove(&mut self, pos: usize) {
         match self {
             PostingList::Standard(vec) => {
@@ -656,12 +673,12 @@ impl LiveIndex {
     }
 
     pub fn remove_at(&mut self, idx: usize) {
-        if let Some(key) = self.reverse.remove(&idx)
-            && let Some(vec) = self.forward.get_mut(&key)
-        {
-            vec.remove(idx);
-            if vec.count() == 0 {
-                self.forward.remove(&key);
+        if let Some(key) = self.reverse.remove(&idx) {
+            if let std::collections::btree_map::Entry::Occupied(mut entry) = self.forward.entry(key) {
+                entry.get_mut().remove(idx);
+                if entry.get().count() == 0 {
+                    entry.remove();
+                }
             }
         }
     }
@@ -669,8 +686,7 @@ impl LiveIndex {
     pub fn move_at(&mut self, from: usize, to: usize) {
         if let Some(key) = self.reverse.remove(&from) {
             if let Some(vec) = self.forward.get_mut(&key) {
-                vec.remove(from);
-                vec.insert(to);
+                vec.replace(from, to);
             }
             self.reverse.insert(to, key);
         }

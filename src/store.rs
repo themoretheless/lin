@@ -2206,7 +2206,6 @@ impl Store {
                 _ => break,
             };
 
-            // Zero-copy: steal row with swap_remove instead of cloning
             let doomed = self.collections.get_mut(collection).unwrap().swap_remove(p);
 
             self.index_remove_row(collection, p, &doomed);
@@ -2257,10 +2256,9 @@ impl Store {
         let spo = (collection == "facts").then(|| spo_key(row)).flatten();
         // Keep the original remove/register semantics for duplicate identities.
         if let Some(id) = id {
-            self.by_id
-                .entry(collection.to_string())
-                .or_default()
-                .insert(id, to);
+            if let Some(map) = self.by_id.get_mut(collection) {
+                map.insert(id, to);
+            }
         }
         if let Some(uri) = uri {
             self.docs_by_uri.insert(uri, to);
@@ -3375,9 +3373,62 @@ impl Store {
         }
 
         let n = self.docs_id.len();
-        let mut out = Vec::with_capacity(idxs.len());
+        let total_idxs = idxs.len();
         let id_title = fields.len() == 2 && fields[0] == "id" && fields[1] == "title";
 
+        if total_idxs >= 4096 {
+            let threads = std::thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(1)
+                .min(8)
+                .min((total_idxs + 1023) / 1024);
+            if threads > 1 {
+                let chunk_size = (total_idxs + threads - 1) / threads;
+                let docs_id = &self.docs_id;
+                let docs_title = &self.docs_title;
+                let docs_layer = &self.docs_layer;
+                let docs_wing = &self.docs_wing;
+
+                let chunks_out: Vec<Vec<Row>> = std::thread::scope(|scope| {
+                    let mut handles = Vec::with_capacity(threads);
+                    for chunk in idxs.chunks(chunk_size) {
+                        handles.push(scope.spawn(move || {
+                            let mut out = Vec::with_capacity(chunk.len());
+                            for &i in chunk {
+                                if i >= n {
+                                    continue;
+                                }
+                                if id_title {
+                                    out.push(row_id_title(&docs_id[i], &docs_title[i]));
+                                    continue;
+                                }
+                                let mut row = BTreeMap::new();
+                                for f in fields {
+                                    let cell = match f.as_str() {
+                                        "id" => Cell::Text(Arc::clone(&docs_id[i])),
+                                        "title" => Cell::Text(Arc::clone(&docs_title[i])),
+                                        "layer" => Cell::Text(Arc::clone(&docs_layer[i])),
+                                        "wing" => Cell::Text(Arc::clone(&docs_wing[i])),
+                                        _ => Cell::Null,
+                                    };
+                                    row.insert(f.clone(), cell);
+                                }
+                                out.push(row);
+                            }
+                            out
+                        }));
+                    }
+                    handles.into_iter().map(|h| h.join().unwrap()).collect()
+                });
+                let mut out = Vec::with_capacity(total_idxs);
+                for chunk in chunks_out {
+                    out.extend(chunk);
+                }
+                return Some(out);
+            }
+        }
+
+        let mut out = Vec::with_capacity(total_idxs);
         for &i in idxs {
             if i >= n {
                 continue;
@@ -3412,9 +3463,67 @@ impl Store {
             return None;
         }
         let n = self.docs_id.len();
+        let id_title = fields.len() == 2 && fields[0] == "id" && fields[1] == "title";
+
+        if n >= 4096 {
+            let threads = std::thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(1)
+                .min(8)
+                .min((n + 1023) / 1024);
+            if threads > 1 {
+                let chunk_size = (n + threads - 1) / threads;
+                let docs_id = &self.docs_id;
+                let docs_title = &self.docs_title;
+                let docs_layer = &self.docs_layer;
+                let docs_wing = &self.docs_wing;
+
+                let chunks_out: Vec<Vec<Row>> = std::thread::scope(|scope| {
+                    let mut handles = Vec::with_capacity(threads);
+                    for (chunk_idx, range) in (0..n).collect::<Vec<_>>().chunks(chunk_size).enumerate() {
+                        let start = chunk_idx * chunk_size;
+                        let end = (start + range.len()).min(n);
+                        handles.push(scope.spawn(move || {
+                            let mut out = Vec::with_capacity(end - start);
+                            let finder = title_contains.map(|needle| memchr::memmem::Finder::new(needle.as_bytes()));
+                            for i in start..end {
+                                if let Some(f) = &finder
+                                    && f.find(docs_title[i].as_bytes()).is_none()
+                                {
+                                    continue;
+                                }
+                                if id_title {
+                                    out.push(row_id_title(&docs_id[i], &docs_title[i]));
+                                    continue;
+                                }
+                                let mut row = BTreeMap::new();
+                                for f in fields {
+                                    let cell = match f.as_str() {
+                                        "id" => Cell::Text(Arc::clone(&docs_id[i])),
+                                        "title" => Cell::Text(Arc::clone(&docs_title[i])),
+                                        "layer" => Cell::Text(Arc::clone(&docs_layer[i])),
+                                        "wing" => Cell::Text(Arc::clone(&docs_wing[i])),
+                                        _ => Cell::Null,
+                                    };
+                                    row.insert(f.clone(), cell);
+                                }
+                                out.push(row);
+                            }
+                            out
+                        }));
+                    }
+                    handles.into_iter().map(|h| h.join().unwrap()).collect()
+                });
+                let mut out = Vec::with_capacity(chunks_out.iter().map(Vec::len).sum());
+                for chunk in chunks_out {
+                    out.extend(chunk);
+                }
+                return Some(out);
+            }
+        }
+
         let mut out = Vec::new();
         let finder = title_contains.map(|n| memchr::memmem::Finder::new(n.as_bytes()));
-        let id_title = fields.len() == 2 && fields[0] == "id" && fields[1] == "title";
         for i in 0..n {
             if let Some(f) = &finder
                 && f.find(self.docs_title[i].as_bytes()).is_none()
@@ -3448,10 +3557,10 @@ fn docs_hot_field(f: &str) -> bool {
 
 #[inline]
 fn row_id_title(id: &Arc<str>, title: &Arc<str>) -> Row {
-    let mut row = BTreeMap::new();
-    row.insert(String::from("id"), Cell::Text(Arc::clone(id)));
-    row.insert(String::from("title"), Cell::Text(Arc::clone(title)));
-    row
+    BTreeMap::from([
+        (String::from("id"), Cell::Text(Arc::clone(id))),
+        (String::from("title"), Cell::Text(Arc::clone(title))),
+    ])
 }
 
 fn spo_key(row: &Row) -> Option<(Arc<str>, Arc<str>, Arc<str>)> {
@@ -3491,16 +3600,11 @@ pub struct MemBackup {
 
 /// Move `v[p]` on top of the tail and drop the tail, keeping the vec dense. A
 /// no-op when `v` isn't parallel to the rows (the caller's length guard rebuilds).
-fn swap_pop_at<T: Clone>(v: &mut Vec<T>, p: usize, len: usize) {
-    if v.len() != len {
-        return;
+#[inline]
+fn swap_pop_at<T>(v: &mut Vec<T>, p: usize, len: usize) {
+    if v.len() == len && p < len {
+        v.swap_remove(p);
     }
-    let last = len - 1;
-    if p < last {
-        let moved = v[last].clone();
-        v[p] = moved;
-    }
-    v.truncate(last);
 }
 
 /// Inverse of [`swap_pop_at`]: `value` takes slot `p` and whatever was there moves
