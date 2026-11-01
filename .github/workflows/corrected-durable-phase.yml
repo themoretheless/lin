@@ -1,0 +1,56 @@
+name: corrected-durable-phase
+on:
+  push:
+    branches: [codex/corrected-durable-phase-ci]
+permissions:
+  contents: read
+jobs:
+  diagnostic:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_TARGET_DIR: target/corrected-durable-phase
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Verify and stage frozen current sources and diagnostic protocol
+        run: |
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          import json,hashlib,shutil
+          src=Path('benches/results/2026-11-01-corrected-durable-phase');dst=Path('benches/results/ci-corrected-durable-phase')
+          m=json.loads((src/'input-provenance.json').read_text())
+          for section in ['source_sha256','build_inputs_sha256']:
+              for name,digest in m[section].items():assert hashlib.sha256(Path(name).read_bytes()).hexdigest()==digest,name
+          dst.mkdir()
+          for name,digest in m['files_sha256'].items():
+              assert hashlib.sha256((src/name).read_bytes()).hexdigest()==digest,name
+              shutil.copy2(src/name,dst/name)
+          shutil.copy2(src/'input-provenance.json',dst/'input-provenance.json')
+          PYCODE
+      - name: Validate synthetic matrix and corruption rejection
+        run: python3 benches/results/ci-corrected-durable-phase/test-protocol.py
+      - name: Full release suite on instrumented current source
+        run: python3 benches/results/ci-corrected-durable-phase/test.py
+      - name: Build ordinary and instrumented binaries and restore source
+        run: python3 benches/results/ci-corrected-durable-phase/build.py
+      - name: Check 30 full-value reopen and phase-count smokes
+        run: python3 benches/results/ci-corrected-durable-phase/smoke.py
+      - name: Measure 240 isolated original-control-disabled-traced processes
+        run: python3 benches/results/ci-corrected-durable-phase/run.py
+      - name: Analyze complete raw measurements and observer overhead
+        run: python3 benches/results/ci-corrected-durable-phase/analyze.py
+      - name: Audit raw measurements and exact source provenance
+        run: python3 benches/results/ci-corrected-durable-phase/verify.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: corrected-durable-phase
+          path: benches/results/ci-corrected-durable-phase/
+          if-no-files-found: error
