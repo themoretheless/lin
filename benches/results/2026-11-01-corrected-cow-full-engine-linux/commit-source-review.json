@@ -1,0 +1,23 @@
+{
+  "source_head": "e7a792220216437b7687b5386da367529a23be1e",
+  "source_sha256": {
+    "src/exec.rs": "d91437c248dd7d7d9edbbe807f979936a3e666c9ad56a6ea1dd7c6a9b655bd42",
+    "src/store.rs": "bfe5e20992c6965c64d24e2f4d37c7fdb1b2174758c1f194ca5df3151e719b90",
+    "src/persist.rs": "85c21b50cd9982bb30a831823f97927e1fce681a62e23f9df1c40afddb0d8dcc",
+    "benches/results/2026-11-01-corrected-cow-full-engine/compare.rs": "59b8acb6b9157d6b5fde56332fb35b0f2e0ea4728eb7f6a6b8c0c53c14b58508"
+  },
+  "observed": [
+    "The timed explicit commit uses transaction(), run_prepared(), commit().",
+    "fold_packs moves a single Pack without cloning it.",
+    "durable_commit_prepared constructs one LogRecord and append_record dispatches ordinary UPDATE to named MessagePack encoding.",
+    "write_frame calculates CRC32C, writes the envelope, and performs one Full durable_sync.",
+    "Small frame assembly uses a reusable thread-local Vec.",
+    "maybe_checkpoint runs after publication; SNAPSHOT_EVERY is 32 committed writes."
+  ],
+  "unproven": [
+    "The phase dominating the current corrected-source latency gap.",
+    "Checkpoint frequency as an explanation for the capped benchmark gap.",
+    "Any speedup from changing encoding, frame assembly, or checkpoint policy."
+  ],
+  "decision": "Do not repeat rejected rollback candidate or weaken durability. Next diagnostic must separate execution, encoding, write, sync, and maintenance on the current corrected source; earlier-source phase percentages are not transferable."
+}
