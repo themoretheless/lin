@@ -1,0 +1,81 @@
+name: crossed-control-diagnostic
+on:
+  push:
+    branches: [codex/crossed-control-diagnostic-ci]
+permissions:
+  contents: read
+  actions: read
+jobs:
+  benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
+      - name: Verify crossed diagnostic frozen inputs
+        run: python3 -c "from pathlib import Path;import json,hashlib;m=json.loads(Path('benches/results/2026-11-02-crossed-control-diagnostic/frozen.json').read_text());assert all(hashlib.sha256(Path(f).read_bytes()).hexdigest()==h for f,h in m.items())"
+      - name: Reject synthetic crossed-identity and raw corruptions
+        run: python3 benches/results/2026-11-02-crossed-control-diagnostic/test-protocol.py
+      - name: Verify frozen runner and current source
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib,json
+          p=Path('benches/results/2026-11-01-corrected-cow-full-engine')
+          for name,digest in json.loads((p/'frozen-runner.json').read_text()).items():
+              assert hashlib.sha256(Path(name).read_bytes()).hexdigest()==digest,name
+          PY
+          python3 benches/results/2026-11-01-corrected-cow-full-engine/build.py --verify-inputs
+      - name: Verify actual role-balance properties
+        run: python3 scripts/test-benchmark-role-balance.py
+      - name: Reject synthetic prerequisite provenance corruptions
+        run: python3 benches/results/2026-11-01-corrected-cow-full-engine/test-prerequisite-audit.py
+      - name: Fetch and audit exact prerequisite artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import json,subprocess
+          p=Path('benches/results/2026-11-01-corrected-cow-full-engine')
+          m=json.loads((p/'source-inputs.json').read_text())
+          for role,name in [('baseline','btreemap-correctness-vnext'),('candidate','corrected-update-patch-correctness')]:
+              root=p/'correctness-artifacts'/role;root.mkdir(parents=True)
+              metadata=subprocess.check_output(['gh','run','view',str(m['correctness_runs'][role]),'--json','databaseId,headSha,status,conclusion,url'])
+              (root/'run.json').write_bytes(metadata)
+              info=json.loads(metadata);assert info['status']=='completed' and info['conclusion']=='success',role
+              subprocess.run(['gh','run','download',str(m['correctness_runs'][role]),'--name',name,'--dir',str(root/'artifact')],check=True)
+          PY
+          python3 benches/results/2026-11-01-corrected-cow-full-engine/audit-prerequisites.py
+      - name: Reject synthetic corruption and losing source gates
+        run: python3 benches/results/2026-11-01-corrected-cow-full-engine/test-protocol.py
+      - name: Build exact source roles in separate target directories
+        run: python3 benches/results/2026-11-01-corrected-cow-full-engine/build.py
+      - name: All 134 functional smoke checks
+        run: python3 benches/results/2026-11-01-corrected-cow-full-engine/smoke.py
+      - name: All 216 crossed diagnostic processes
+        run: python3 benches/results/2026-11-02-crossed-control-diagnostic/run.py
+      - name: Reconstruct 1728 observations and all null contrasts
+        run: python3 benches/results/2026-11-02-crossed-control-diagnostic/analyze.py
+      - name: Independent source command identity and numerical audit
+        run: python3 benches/results/2026-11-02-crossed-control-diagnostic/verify.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: crossed-control-diagnostic
+          path: |
+            benches/results/2026-11-02-crossed-control-diagnostic/
+            benches/results/2026-11-01-corrected-cow-full-engine/
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: crossed-control-exact-linux-executables
+          path: |
+            /tmp/lin-corrected-full-engine-baseline
+            /tmp/lin-corrected-full-engine-candidate
+          if-no-files-found: warn
