@@ -1,0 +1,19 @@
+{
+  "source_head": "eb614b07976ac46d1a0146a8ebf81c1a4d53cf16",
+  "observed_current_profile": {
+    "rollback_1k_exec_percent": 52.72091702722656,
+    "rollback_1k_restore_percent": 33.531768746842225,
+    "rollback_10k_exec_percent": 55.561718964208936,
+    "rollback_10k_restore_percent": 31.70669809792483,
+    "quota_phase_ns": 0,
+    "wal_encode_write_sync_ns": 0
+  },
+  "source_review": {
+    "current_restore": "exec.rs clones live Row then applies RowDelta before restore_row_owned",
+    "duplicate_candidate_found": "705dbd035e4a3b67066ff9b42cafa051951926bd already implemented owned extraction, identity projection and in-place delta application",
+    "decision": "Do not repeat owned-row extraction or inline token storage unchanged. Both prior candidates are preserved with rejected qualification."
+  },
+  "next_diagnostic": "Split current update execution into mutation-position resolution, CAS and guards/FKs, patch/undo construction, live mutation/index maintenance, and FTS/maps/output; split restoration into delta application, indexes, FTS and maps. Keep observer overhead controls and full-value oracles.",
+  "optimization_implemented": false,
+  "full_objective_achieved": false
+}
