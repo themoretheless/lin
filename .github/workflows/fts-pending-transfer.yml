@@ -1,0 +1,50 @@
+name: fts-pending-transfer
+on:
+  push:
+    branches: [codex/fts-pending-transfer-ci]
+permissions:
+  contents: read
+jobs:
+  benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_TARGET_DIR: target/fts-pending-transfer
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Verify frozen inputs
+        run: python3 -c "from pathlib import Path;import json,hashlib; m=json.loads(Path('benches/results/2026-11-01-fts-pending-transfer/frozen.json').read_text());assert all(hashlib.sha256(Path(f).read_bytes()).hexdigest()==h for f,h in m.items())"
+      - name: Full release tests
+        run: python3 benches/results/2026-11-01-fts-pending-transfer/test.py
+      - name: Compiled missing publication negative
+        run: python3 benches/results/2026-11-01-fts-pending-transfer/check-mutant.py
+      - name: Build ordinary short binaries
+        run: python3 benches/results/2026-11-01-fts-pending-transfer/build.py
+      - name: Build ordinary long binaries
+        run: python3 benches/results/2026-11-01-fts-pending-transfer/build-long.py
+      - name: Synthetic matrix and corruption checks
+        run: python3 benches/results/2026-11-01-fts-pending-transfer/test-protocol.py
+      - name: All 42 fresh functional smokes
+        run: python3 benches/results/2026-11-01-fts-pending-transfer/run.py --smoke
+      - name: All 756 fresh paired processes
+        run: python3 benches/results/2026-11-01-fts-pending-transfer/run.py
+      - name: Analyze complete matrix
+        run: python3 benches/results/2026-11-01-fts-pending-transfer/analyze.py
+      - name: Independent raw source and command audit
+        run: python3 benches/results/2026-11-01-fts-pending-transfer/verify.py
+      - name: Enforce unchanged component gate
+        run: python3 benches/results/2026-11-01-fts-pending-transfer/qualify.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fts-pending-transfer
+          path: benches/results/2026-11-01-fts-pending-transfer/
