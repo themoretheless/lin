@@ -373,7 +373,7 @@ lines += ['', (
     'не загрузил исходник baseline для сборки бинарников. Измерений0; все26raw файлов и логи сохранены. '
     '[Исправленный запуск](https://github.com/themoretheless/lin/actions/runs/41251433614) использует '
     'fetch-depth:0; runtime, scenarios и thresholds совпадают с первой попыткой. '
-    'Ожидаются полные504процесса/4032наблюдения. Победы по скорости этим результатом не установлены.'
+    'Полный результат приведён ниже. Первая инфраструктурная попытка не даёт измерений скорости.'
 )]
 kusto_now = read('benches/results/2026-11-01-kusto-availability/status.json')
 assert kusto_now['github_secret_metadata_verified'] and kusto_now['github_secret_list_complete'] and kusto_now['no_secret_values_recorded']
@@ -382,6 +382,19 @@ lines += ['', (
     f"[Kusto availability](../benches/results/2026-11-01-kusto-availability/status.json), проверка {kusto_now['observed_at_utc']}: "
     'URL/DATABASE/TOKEN отсутствовали в локальной среде и полном списке repository-secret names. '
     'Значения секретов не сохранялись. Реальный Kusto-прогон остаётся открыт.'
+)]
+patch_linux = read('benches/results/2026-11-01-update-patch-clone-elision-linux/frozen-audit.json')
+assert patch_linux['audit_complete'] and patch_linux['processes'] == 504 and patch_linux['observations'] == 4032
+assert not patch_linux['component_gate_passes'] and patch_linux['failed_target_windows'] == 0 and patch_linux['failed_control_windows'] == 1
+lines += ['', (
+    '[UPDATE patch clone elision: overall rejected](../benches/results/2026-11-01-update-patch-clone-elision-linux/report.md): '
+    '504процесса/4032наблюдения, независимый аудит пройден. Все6native UPDATE target windows '
+    'дают32.295–46.902% ускорения и6/6побед, выше A/A. Все18Lin control windows проходят допуск. '
+    'DuckDB filter_eq series1 провален: -11.684%, A/A8.412%,2/6. Причина не установлена; '
+    'измерения сохранены, порог не отменён, неизменённого перезапуска нет. '
+    'Все2695raw файлов архивированы сSHA256. Это относительное сравнение версий каждого engine, '
+    'не победа Lin над DuckDB. Следующая интеграция должна включать исправление schema rollback '
+    'и пройти новые полные проверки; production adoption и цель восьми peers остаются открыты.'
 )]
 output = root / 'docs/benchmark-goal-status-2026-10-27.md'
 output.write_text('\n'.join(lines) + '\n')
