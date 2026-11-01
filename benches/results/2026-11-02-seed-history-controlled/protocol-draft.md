@@ -1,0 +1,11 @@
+# Seed transaction history: draft controlled diagnostic
+
+Purpose: investigate whether the transaction history used to populate a durable fixture contributes to the remaining Lin / SQLite WAL gap. This is a counterfactual diagnostic, not adoption of a faster-looking fixture and not reinterpretation of original frozen results.
+
+Use the exact columnar Batch prototype runtime, retaining fdatasync, with one executable for every mode. Selected case callbacks use the same run_durable_lin_write/run_durable_sqlite_write bodies and complete close/reopen oracles. Only setup selects separate 500-row Lin commits versus all identical insert programs in one transaction. SQLite retains its original single seed transaction under both mode labels as an A/A control. A shared executable removes separate-build differences between modes; it does not isolate all possible setup effects such as generation, allocation layout, metadata or cache state.
+
+The first draft harness still uses original per-process FIXTURE_NOW and is only being compiled. Before timing, replace this with one fixed fixture timestamp anchor in this diagnostic alone; verify actual full seed values agree between modes after typed f32 normalization. Preserve the initial draft build/provenance separately. Existing component benchmarks keep their original timestamp behavior and frozen source.
+
+Planned coverage: 1k/10k, UPDATE/DELETE/COMMIT/ROLLBACK. Before any timing require all 32 selected benchmark smokes and eight Linux setup traces (two sizes, two modes, two engines for UPDATE), verifying that Lin seed WAL history actually differs while SQLite history stays unchanged. Mutation-only traces and all values remain retained. Do not claim that transaction grouping isolates a single physical sync cost.
+
+Planned measurement: 12 rounds, rotated eight workloads and five roles per workload: Lin chunked baseline, identical Lin chunked A/A, Lin grouped, SQLite chunked-label baseline, SQLite grouped-label control. Eight ordinary wall observations per fresh process, max iterations one, no warmup. 480 fresh processes / 3840 observations. Descriptive paired gains, absolute A/A and full raw values; no production acceptance gate or unchanged retry. Freeze inputs/order/analyzers before running. Linux timing and Kusto/eight-peer completion remain unproven.
