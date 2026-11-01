@@ -23,6 +23,8 @@ jobs:
           cache-on-failure: true
       - name: Frozen inputs
         run: python3 -c "from pathlib import Path;import json,hashlib;m=json.loads(Path('benches/results/2026-11-02-seed-history-controlled/frozen.json').read_text());assert all(hashlib.sha256(Path(f).read_bytes()).hexdigest()==h for f,h in m.items())"
+      - name: Independent role-balance property tests
+        run: python3 scripts/test-benchmark-role-balance.py
       - name: Full runtime release suite
         run: python3 benches/results/2026-11-01-columnar-batch-wal/test.py
       - name: Compiled lost-child negative
@@ -41,9 +43,9 @@ jobs:
         run: python3 benches/results/2026-11-02-seed-history-controlled/test-analysis.py
       - name: Independent verifier synthetic proof and corruptions
         run: python3 benches/results/2026-11-02-seed-history-controlled/test-verifier.py
-      - name: All 480 fresh diagnostic processes
+      - name: All 576 fresh diagnostic processes
         run: python3 benches/results/2026-11-02-seed-history-controlled/run.py
-      - name: Analyze all 3840 observations
+      - name: Analyze all 4608 observations
         run: python3 benches/results/2026-11-02-seed-history-controlled/analyze.py
       - name: Independent raw source trace command and numerical audit
         run: python3 benches/results/2026-11-02-seed-history-controlled/verify.py

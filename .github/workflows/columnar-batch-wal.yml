@@ -23,6 +23,8 @@ jobs:
           cache-on-failure: true
       - name: Verify frozen inputs
         run: python3 -c "from pathlib import Path;import json,hashlib;m=json.loads(Path('benches/results/2026-11-01-columnar-batch-wal/frozen-benchmark.json').read_text());assert all(hashlib.sha256(Path(f).read_bytes()).hexdigest()==h for f,h in m.items())"
+      - name: Independent role-balance property tests
+        run: python3 scripts/test-benchmark-role-balance.py
       - name: Full release suite with fixed column oracle
         run: python3 benches/results/2026-11-01-columnar-batch-wal/test.py
       - name: Compiled lost-child negative

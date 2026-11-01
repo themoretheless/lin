@@ -42,3 +42,14 @@ def orders_from_records(records,case_ids,role_ids,case_key,round_key='round',rol
     orders={case:[tuple(by_round[rnd])for rnd in range(1,rounds+1)]for case,by_round in grouped.items()}
     validate_orders(orders,role_ids)
     return orders
+
+def schedule(cases,role_ids,rounds=12):
+    """Construct and validate the exact list that the runner will execute."""
+    case_ids=[c['id']for c in cases];assert len(case_ids)==len(set(case_ids))and rounds%6==0
+    indices={case:i for i,case in enumerate(case_ids)};plan=[]
+    for rnd in range(1,rounds+1):
+        rotation=rnd%len(cases)
+        for c in cases[rotation:]+cases[:rotation]:
+            for role in role_order(rnd,indices[c['id']],role_ids):plan.append(dict(round=rnd,workload=c['id'],role=role))
+    orders_from_records(plan,case_ids,role_ids,'workload',rounds=rounds)
+    return plan

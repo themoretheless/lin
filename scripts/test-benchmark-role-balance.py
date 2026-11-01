@@ -1,4 +1,4 @@
-from benchmark_role_balance import role_order,validate_orders
+from benchmark_role_balance import role_order,validate_orders,schedule,orders_from_records
 checks=[]
 for n in [3,6]:
  roles=tuple(f'role-{i}'for i in range(n))
@@ -8,6 +8,7 @@ for n in [3,6]:
    original=list(range(count));rotation=rnd%count
    for original_index in original[rotation:]+original[:rotation]:emitted[original_index].append(role_order(rnd,original_index,roles))
   assert validate_orders(emitted,roles);checks.append((n,count))
+  plan=schedule([dict(id=str(j))for j in range(count)],roles);assert len(plan)==count*12*n;orders_from_records(plan,[str(j)for j in range(count)],roles,'workload')
 # The actual previous cancellation bug must be rejected, not merely reproduced.
 roles=('baseline','control','candidate');bad={j:[]for j in range(24)}
 for rnd in range(1,13):
