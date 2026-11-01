@@ -396,6 +396,19 @@ lines += ['', (
     'не победа Lin над DuckDB. Следующая интеграция должна включать исправление schema rollback '
     'и пройти новые полные проверки; production adoption и цель восьми peers остаются открыты.'
 )]
+corrected_qa = read('benches/results/2026-11-01-corrected-cow-full-engine/correctness-prerequisites.json')
+assert corrected_qa['baseline']['qualification_passed'] and corrected_qa['candidate']['qualification_passed']
+assert corrected_qa['baseline']['release_passed'] == 441 and corrected_qa['candidate']['release_passed'] == 458
+lines += ['', (
+    '[Corrected full-source prerequisites](../benches/results/2026-11-01-corrected-cow-full-engine/correctness-prerequisites.json): '
+    'Linux Rust1.96 x86_64: BTreeMap e3136c0a4 — 441 tests/2ignored и6compiled negatives; '
+    'COW+CAS+UPDATE clone elision625bc7180 — 458 tests/2ignored и5compiled negatives. '
+    'Обе версии покрывают30schema rollback scenarios; исходные артефакты проверены независимо. '
+    'Cargo dependencies иfull-value point harness совпадают побайтно. '
+    'Новая полная матрица67случаев/2412процессов запущена в '
+    '[CI41306613457](https://github.com/themoretheless/lin/actions/runs/41306613457); '
+    'на момент фиксации запуска результата скорости ещё нет. Старые отклонённые матрицы остаются отклонёнными.'
+)]
 output = root / 'docs/benchmark-goal-status-2026-10-27.md'
 output.write_text('\n'.join(lines) + '\n')
 # Never expose endpoint values or credentials in the status artifact.
