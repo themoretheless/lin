@@ -126,3 +126,54 @@ fn partial_transfer_survives_wal_replay_and_checkpoint() {
     drop(reopened);
     std::fs::remove_dir_all(path).unwrap();
 }
+
+#[test]
+fn rollback_upsert_restores_partial_and_unique_index_entries() {
+    for finish in 0..3 {
+        let mut db = seeded();
+        db.run("index docs unique [uri]").unwrap();
+        let before = db.store.collection("docs").to_vec();
+        let generation = db.stats().r#gen;
+        let expected = db.store.indexes.iter().map(|(name, index)| {
+            let forward = index.forward.iter().map(|(key, posting)| {
+                let mut ids = posting.to_indices();
+                ids.sort_unstable();
+                (key.clone(), ids)
+            }).collect::<Vec<_>>();
+            (name.clone(), index.reverse.clone(), forward)
+        }).collect::<Vec<_>>();
+        {
+            let mut tx = db.transaction().unwrap();
+            for query in [
+                r#"update docs[id == "a"] cas each { wing: "sys", title: "left" }"#,
+                r#"update docs[id == "b"] cas each { wing: "rag" }"#,
+                r#"update docs[id == "b"] cas each { title: "moved", uri: "partial://moved" }"#,
+                r#"update docs[id == "b"] cas each { wing: "sys" }"#,
+                r#"update docs[id == "c"] cas each { wing: "rag" }"#,
+            ] {
+                tx.run(query).unwrap();
+            }
+            match finish {
+                0 => tx.rollback().unwrap(),
+                1 => drop(tx),
+                _ => {
+                    assert!(tx.run(r#"update docs[id == "a"] cas each { uri: "partial://c" }"#).is_err());
+                    assert!(tx.commit().is_err());
+                }
+            }
+        }
+        assert_eq!(db.store.collection("docs"), before.as_slice());
+        assert_eq!(db.stats().r#gen, generation);
+        for (name, reverse, forward) in expected {
+            let index = &db.store.indexes[&name];
+            assert_eq!(index.reverse, reverse);
+            let actual = index.forward.iter().map(|(key, posting)| {
+                let mut ids = posting.to_indices();
+                ids.sort_unstable();
+                (key.clone(), ids)
+            }).collect::<Vec<_>>();
+            assert_eq!(actual, forward);
+        }
+        assert_eq!(members(&db), [0]);
+    }
+}

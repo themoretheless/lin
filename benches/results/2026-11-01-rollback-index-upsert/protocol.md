@@ -1,0 +1,9 @@
+# Owned UPDATE rollback: index upsert candidate
+
+Baseline is the corrected COW+CAS+UPDATE runtime625bc7180, whose complete Linux source gate remains rejected in eight external controls. The new candidate only removes the explicit index_remove_row call before index_insert_row in Store::restore_row_owned. LiveIndex::insert_at already replaces an existing reverse/forward key and removes membership when a partial predicate no longer matches. FTS remove/insert, row delta reconstruction, maps, WAL, sync and production API remain unchanged.
+
+Hypothesis: avoid deleting then recreating the same reverse slot when restoring an UPDATE. This is distinct from the previously rejected insert_key reverse-map-write implementation; insert_key itself is unchanged. Existing schema/ordered undo/HNSW tests remain. The added regression checks forward and reverse membership after five partial-unique/key changes with explicit rollback, Drop and aborted commit. No speedup is claimed before measurement.
+
+Run all default release tests in an isolated target, then baseline/candidate differential index-state cases and a separately compiled missing-index-upsert negative. Only after functional checks pass, freeze a paired component protocol targeting native and Full durable rollback1k/10k/100k as supported by the unchanged harness, with native UPDATE and commit/DELETE/read controls. Retain failed windows and all raw observations; no old result is overwritten or waived. The measured current Full WAL gaps remain a separate peer target.
+
+Before any timing, the case list was expanded to include SQLite WAL rollback10k alongside1k, so both durable target sizes have actual peer comparisons. Final matrix:14cases,5targets/9controls,504fresh processes/4032observations,28functional smokes. Thresholds remain unchanged; no observation existed when adding this control.

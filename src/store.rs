@@ -2449,7 +2449,7 @@ impl Store {
         // Retain one read-only view for map/index maintenance; move both stored rows.
         let restored = row.clone();
         let current = std::mem::replace(slot, row);
-        self.index_remove_row(collection, idx, &current);
+        // insert_at replaces the existing slot key, including partial-index removal.
         self.fts_remove_row(collection, idx, &current);
         let _ = self.index_insert_row(collection, idx, &restored);
         self.fts_insert_row(collection, idx, &restored);
