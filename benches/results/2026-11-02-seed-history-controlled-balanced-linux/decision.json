@@ -1,0 +1,329 @@
+{
+  "run_id": 41353571356,
+  "source_commit": "c73b1af46b4b9957d97a2b1dfb9958bc47546f65",
+  "processes": 576,
+  "observations": 4608,
+  "balanced_role_order": true,
+  "source_frozen_hashes_verified": 93,
+  "six_positive_above_aa_windows": 0,
+  "total_windows": 16,
+  "null_control_outside_band": [
+    {
+      "case": "10k-delete",
+      "series": "series2",
+      "gain_percent": -4.866629129211364,
+      "aa_percent": 4.146429975080318
+    }
+  ],
+  "aggregates": {
+    "1k-update": {
+      "lin_group_gain_percent": -1.3910939028164315,
+      "lin_null_gain_percent": 0.7411733564903822,
+      "chunked_lin_over_sqlite": 1.0458948185120733,
+      "grouped_lin_over_sqlite": 1.0769523338026832,
+      "grouped_peer_wins": 0
+    },
+    "1k-delete": {
+      "lin_group_gain_percent": 0.4358519499306157,
+      "lin_null_gain_percent": -1.4164197673549817,
+      "chunked_lin_over_sqlite": 1.0995180633859007,
+      "grouped_lin_over_sqlite": 1.0889923125878829,
+      "grouped_peer_wins": 1
+    },
+    "1k-commit": {
+      "lin_group_gain_percent": -2.3859830440697727,
+      "lin_null_gain_percent": 0.7922747123506713,
+      "chunked_lin_over_sqlite": 1.0687770188394743,
+      "grouped_lin_over_sqlite": 1.0828426942231446,
+      "grouped_peer_wins": 2
+    },
+    "1k-rollback": {
+      "lin_group_gain_percent": 7.473557604534614,
+      "lin_null_gain_percent": 4.1920007213157024,
+      "chunked_lin_over_sqlite": 1.8481336966834774,
+      "grouped_lin_over_sqlite": 1.6845185191240983,
+      "grouped_peer_wins": 0
+    },
+    "10k-update": {
+      "lin_group_gain_percent": 0.8651412516002321,
+      "lin_null_gain_percent": 0.09852676351982947,
+      "chunked_lin_over_sqlite": 1.5971356493595077,
+      "grouped_lin_over_sqlite": 1.5757363370524273,
+      "grouped_peer_wins": 0
+    },
+    "10k-delete": {
+      "lin_group_gain_percent": 2.1861654090941984,
+      "lin_null_gain_percent": -0.09729542904221011,
+      "chunked_lin_over_sqlite": 1.6275612439760625,
+      "grouped_lin_over_sqlite": 1.6122636612327117,
+      "grouped_peer_wins": 0
+    },
+    "10k-commit": {
+      "lin_group_gain_percent": 0.3448281559147004,
+      "lin_null_gain_percent": -0.10341020219311603,
+      "chunked_lin_over_sqlite": 1.6007786203516068,
+      "grouped_lin_over_sqlite": 1.5831058111525769,
+      "grouped_peer_wins": 0
+    },
+    "10k-rollback": {
+      "lin_group_gain_percent": -4.2561878024753526,
+      "lin_null_gain_percent": -0.4657777847077216,
+      "chunked_lin_over_sqlite": 2.744687461154306,
+      "grouped_lin_over_sqlite": 2.773841034933963,
+      "grouped_peer_wins": 0
+    }
+  },
+  "setup_histories": [
+    {
+      "rows": 1000,
+      "mode": "chunked",
+      "engine": "lin",
+      "command": [
+        "strace",
+        "-f",
+        "-yy",
+        "-s",
+        "160",
+        "-o",
+        "/home/runner/work/lin/lin/benches/results/2026-11-02-seed-history-controlled/setup-traces/1000-chunked-lin.strace",
+        "-e",
+        "trace=openat,close,write,writev,pwrite64,pwritev,fsync,fdatasync,lseek,ftruncate,fcntl",
+        "/home/runner/work/lin/lin/target/seed-history-controlled/seed-history-controlled",
+        "--seed-history-case",
+        "1000",
+        "update",
+        "lin",
+        "chunked"
+      ],
+      "exit_code": 0,
+      "full_values_reopen": true,
+      "setup_wal_sync_calls": 4,
+      "setup_wal_write_calls": 3,
+      "setup_successful_wal_write_bytes": 337212,
+      "mutation_syncs": [
+        "fdatasync"
+      ],
+      "trace_sha256": "5849058fd00d789032291340194a3ce03d050302b41eef7016c5c10678d63949"
+    },
+    {
+      "rows": 1000,
+      "mode": "chunked",
+      "engine": "sqlite_wal",
+      "command": [
+        "strace",
+        "-f",
+        "-yy",
+        "-s",
+        "160",
+        "-o",
+        "/home/runner/work/lin/lin/benches/results/2026-11-02-seed-history-controlled/setup-traces/1000-chunked-sqlite_wal.strace",
+        "-e",
+        "trace=openat,close,write,writev,pwrite64,pwritev,fsync,fdatasync,lseek,ftruncate,fcntl",
+        "/home/runner/work/lin/lin/target/seed-history-controlled/seed-history-controlled",
+        "--seed-history-case",
+        "1000",
+        "update",
+        "sqlite_wal",
+        "chunked"
+      ],
+      "exit_code": 0,
+      "full_values_reopen": true,
+      "setup_wal_sync_calls": 2,
+      "setup_wal_write_calls": 69,
+      "setup_successful_wal_write_bytes": 140112,
+      "mutation_syncs": [
+        "fsync"
+      ],
+      "trace_sha256": "032b436c21d6afbe441a4e93c801fbb387011e0caf5da8413d04f3b5289a621e"
+    },
+    {
+      "rows": 1000,
+      "mode": "grouped",
+      "engine": "lin",
+      "command": [
+        "strace",
+        "-f",
+        "-yy",
+        "-s",
+        "160",
+        "-o",
+        "/home/runner/work/lin/lin/benches/results/2026-11-02-seed-history-controlled/setup-traces/1000-grouped-lin.strace",
+        "-e",
+        "trace=openat,close,write,writev,pwrite64,pwritev,fsync,fdatasync,lseek,ftruncate,fcntl",
+        "/home/runner/work/lin/lin/target/seed-history-controlled/seed-history-controlled",
+        "--seed-history-case",
+        "1000",
+        "update",
+        "lin",
+        "grouped"
+      ],
+      "exit_code": 0,
+      "full_values_reopen": true,
+      "setup_wal_sync_calls": 3,
+      "setup_wal_write_calls": 2,
+      "setup_successful_wal_write_bytes": 337083,
+      "mutation_syncs": [
+        "fdatasync"
+      ],
+      "trace_sha256": "614463c55f593e32dc6aaa44f02c4c843185a54ff4559f9f76cc8c422c03eb84"
+    },
+    {
+      "rows": 1000,
+      "mode": "grouped",
+      "engine": "sqlite_wal",
+      "command": [
+        "strace",
+        "-f",
+        "-yy",
+        "-s",
+        "160",
+        "-o",
+        "/home/runner/work/lin/lin/benches/results/2026-11-02-seed-history-controlled/setup-traces/1000-grouped-sqlite_wal.strace",
+        "-e",
+        "trace=openat,close,write,writev,pwrite64,pwritev,fsync,fdatasync,lseek,ftruncate,fcntl",
+        "/home/runner/work/lin/lin/target/seed-history-controlled/seed-history-controlled",
+        "--seed-history-case",
+        "1000",
+        "update",
+        "sqlite_wal",
+        "grouped"
+      ],
+      "exit_code": 0,
+      "full_values_reopen": true,
+      "setup_wal_sync_calls": 2,
+      "setup_wal_write_calls": 69,
+      "setup_successful_wal_write_bytes": 140112,
+      "mutation_syncs": [
+        "fsync"
+      ],
+      "trace_sha256": "33cfa772f4f6f6cf858242814b272fe1bcbf7ef205fb8f0b5fe83c43710cdc8c"
+    },
+    {
+      "rows": 10000,
+      "mode": "chunked",
+      "engine": "lin",
+      "command": [
+        "strace",
+        "-f",
+        "-yy",
+        "-s",
+        "160",
+        "-o",
+        "/home/runner/work/lin/lin/benches/results/2026-11-02-seed-history-controlled/setup-traces/10000-chunked-lin.strace",
+        "-e",
+        "trace=openat,close,write,writev,pwrite64,pwritev,fsync,fdatasync,lseek,ftruncate,fcntl",
+        "/home/runner/work/lin/lin/target/seed-history-controlled/seed-history-controlled",
+        "--seed-history-case",
+        "10000",
+        "update",
+        "lin",
+        "chunked"
+      ],
+      "exit_code": 0,
+      "full_values_reopen": true,
+      "setup_wal_sync_calls": 22,
+      "setup_wal_write_calls": 21,
+      "setup_successful_wal_write_bytes": 3560906,
+      "mutation_syncs": [
+        "fdatasync"
+      ],
+      "trace_sha256": "63204905dee5cb412792625bf6fabb5be333484431514a18ca895a3a53e0d0b6"
+    },
+    {
+      "rows": 10000,
+      "mode": "chunked",
+      "engine": "sqlite_wal",
+      "command": [
+        "strace",
+        "-f",
+        "-yy",
+        "-s",
+        "160",
+        "-o",
+        "/home/runner/work/lin/lin/benches/results/2026-11-02-seed-history-controlled/setup-traces/10000-chunked-sqlite_wal.strace",
+        "-e",
+        "trace=openat,close,write,writev,pwrite64,pwritev,fsync,fdatasync,lseek,ftruncate,fcntl",
+        "/home/runner/work/lin/lin/target/seed-history-controlled/seed-history-controlled",
+        "--seed-history-case",
+        "10000",
+        "update",
+        "sqlite_wal",
+        "chunked"
+      ],
+      "exit_code": 0,
+      "full_values_reopen": true,
+      "setup_wal_sync_calls": 2,
+      "setup_wal_write_calls": 595,
+      "setup_successful_wal_write_bytes": 1223672,
+      "mutation_syncs": [
+        "fsync"
+      ],
+      "trace_sha256": "2bf7d03d64e7911f973cfb580110c1aae5c39b9eba2c366476f060b9ed23225c"
+    },
+    {
+      "rows": 10000,
+      "mode": "grouped",
+      "engine": "lin",
+      "command": [
+        "strace",
+        "-f",
+        "-yy",
+        "-s",
+        "160",
+        "-o",
+        "/home/runner/work/lin/lin/benches/results/2026-11-02-seed-history-controlled/setup-traces/10000-grouped-lin.strace",
+        "-e",
+        "trace=openat,close,write,writev,pwrite64,pwritev,fsync,fdatasync,lseek,ftruncate,fcntl",
+        "/home/runner/work/lin/lin/target/seed-history-controlled/seed-history-controlled",
+        "--seed-history-case",
+        "10000",
+        "update",
+        "lin",
+        "grouped"
+      ],
+      "exit_code": 0,
+      "full_values_reopen": true,
+      "setup_wal_sync_calls": 3,
+      "setup_wal_write_calls": 2,
+      "setup_successful_wal_write_bytes": 3558455,
+      "mutation_syncs": [
+        "fdatasync"
+      ],
+      "trace_sha256": "d5ba5848b66248b9fffdf0eceefddaebbaef7598a1eebf5b4bb02e12ec10737f"
+    },
+    {
+      "rows": 10000,
+      "mode": "grouped",
+      "engine": "sqlite_wal",
+      "command": [
+        "strace",
+        "-f",
+        "-yy",
+        "-s",
+        "160",
+        "-o",
+        "/home/runner/work/lin/lin/benches/results/2026-11-02-seed-history-controlled/setup-traces/10000-grouped-sqlite_wal.strace",
+        "-e",
+        "trace=openat,close,write,writev,pwrite64,pwritev,fsync,fdatasync,lseek,ftruncate,fcntl",
+        "/home/runner/work/lin/lin/target/seed-history-controlled/seed-history-controlled",
+        "--seed-history-case",
+        "10000",
+        "update",
+        "sqlite_wal",
+        "grouped"
+      ],
+      "exit_code": 0,
+      "full_values_reopen": true,
+      "setup_wal_sync_calls": 2,
+      "setup_wal_write_calls": 595,
+      "setup_successful_wal_write_bytes": 1223672,
+      "mutation_syncs": [
+        "fsync"
+      ],
+      "trace_sha256": "aa1070a3558d6fa081d6e36c949466adc41ea613788963d82a23b033acbb093f"
+    }
+  ],
+  "conclusion": "Changed seed transaction history does not establish a stable latency improvement or close SQLite gap; generation/allocation/cache effects are not isolated.",
+  "runtime_adopted": false,
+  "full_objective_achieved": false
+}
