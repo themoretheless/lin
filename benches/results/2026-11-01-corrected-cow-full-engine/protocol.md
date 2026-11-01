@@ -1,0 +1,13 @@
+# Corrected COW full-source comparison: preparation only
+
+Compare frozen BTreeMap reference e3136c0a47ef9081a351571b7f65160a80a1c805 with corrected COW + CAS + UPDATE clone-elision candidate 625bc7180b37027d661afb87009464617c34de36. Both include chronological append/HNSW/schema rollback corrections and the same 30 schema scenarios. The reference retains the exact public BTreeMap Row contract and whole-row UPDATE implementation. Cargo.toml, Cargo.lock and point_values.rs are byte-identical. source-inputs.json records every Rust source and the six differing/added files.
+
+Linux correctness prerequisites are runs 41305269650 (reference, 441 tests/two ignored, six separately compiled negative mutations, full-value point oracle) and 41305258726 (candidate, 458 tests/two ignored, five separately compiled negative mutations). Neither is assumed successful before inspecting terminal output and raw artifacts.
+
+Retain all 67 cases of the earlier full-engine matrix: two six-pair series; three rotated roles; eight fresh single-operation observations; no warmup; 2412 processes and 19296 observations. Baseline and A/A control use the same executable. The candidate uses its separately compiled executable, including external peer cases; external control losses remain binding. No fixed-peer worker substitution or calibration-based threshold relaxation is introduced. The five target cases remain native UPDATE 1k/10k/100k and scalar WAL Full/Normal UPDATE. Each target requires six positive pairs and median gain above absolute A/A; controls require gain >= -max(2%, absolute A/A). All raw observations, failures and RSS are retained. A failed source matrix is not retried unchanged.
+
+Each role must build in its own target directory and retain source manifests, compiler identity and executable hashes. No shared worktree build cache may substitute source. Restore candidate source after building; verify both binaries with all 134 functional smoke cases before any matrix timing. No rejected WAL codec, selective index or FTS optimization is included.
+
+This matrix is a source-adoption check, not the complete eight-peer proof. Full-value point_values Linux comparisons and refreshed PostgreSQL/MySQL/MongoDB/pandas comparisons remain required. Historical count-only point_get peer results do not establish full-value performance. MSSQL results retain the existing private disclosure boundary. Kusto requires an actual configured backend. The old failed matrices remain failed, and no old gain is transferred or multiplied.
+
+No measurement has started for these frozen sources. Runner, raw verifier and synthetic corruption checks must be completed and reviewed before dispatch.
