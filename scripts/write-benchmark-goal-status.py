@@ -442,6 +442,20 @@ lines += ['', (
     'Функциональный успех не означает публично подтверждённое превосходство. '
     'Kusto иполная source acceptance остаются открыты.'
 )]
+corrected_full = read('benches/results/2026-11-01-corrected-cow-full-engine-linux/independent-audit.json')
+assert corrected_full['audit_complete'] and corrected_full['processes']==2412 and corrected_full['observations']==19296
+assert not corrected_full['source_candidate_qualified'] and len(corrected_full['failed_windows'])==8
+lines += ['', (
+    '[Corrected COW + CAS + UPDATE full-source matrix: rejected](../benches/results/2026-11-01-corrected-cow-full-engine-linux/decision.md): '
+    'run41306613457 завершён,2412processes/19296observations пересчитаны независимо. '
+    'Все10target windows проходят: native UPDATE51.106–56.538%,scalar Full63.096/63.684%, '
+    'Normal97.623/97.757%, каждый6/6positive выше A/A. Все Lin controls проходят допуск. '
+    'Провалены8external control windows:5SQLite и3DuckDB; причина не установлена, '
+    'общий gate остаётся отклонённым без waiver илинеизменённого retry. '
+    'Все15243raw файла архивированы. Текущий SQLite FULL WAL: UPDATE0/24,DELETE0/24,COMMIT0/24, '
+    'ROLLBACK1/24; эти пробелы не закрыты победами в отдельном API-прогоне. '
+    'Production adoption иполная цель восьми peers остаются открыты.'
+)]
 output = root / 'docs/benchmark-goal-status-2026-10-27.md'
 output.write_text('\n'.join(lines) + '\n')
 # Never expose endpoint values or credentials in the status artifact.
