@@ -70,12 +70,7 @@ fn docs(n: usize) -> Vec<Doc> {
     let mixed_case = std::env::var_os("LIN_BENCH_MIXED_CASE").is_some();
     // All engines and fresh fixtures in this process share a timestamp anchor.
     static FIXTURE_NOW: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
-    let now = *FIXTURE_NOW.get_or_init(|| {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64
-    });
+    let now = *FIXTURE_NOW.get_or_init(|| 1_790_000_000_000i64);
     (0..n)
         .map(|i| {
             let wal = i % 10 == 0;
