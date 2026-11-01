@@ -1,0 +1,104 @@
+{
+  "source_run": 41306613457,
+  "cause_established": false,
+  "rejected_explanation": "Eager initialization of all Lin row fixtures before external cases",
+  "evidence": {
+    "fixture_initialization": "Fixture::new stores a FnOnce; get initializes an OnceCell lazily",
+    "selection": "Suite executes only entries matching the selection",
+    "fixture_source_sha256": "b41878598b2eb2d769d77a0c0037f7c9015af9e017fec759ba7d59cdc2d04a18",
+    "suite_source_sha256": "5b28b904dd01b6e2da747afe7363bbb57929122c35f0caa7734e5fe701a1d8bc",
+    "airbug_git_revision": "75b1321b"
+  },
+  "failed_windows": [
+    {
+      "case": "compare/durable_update_1row_1k/sqlite_delete",
+      "series": "series1",
+      "gain_percent": -3.3533811447183592,
+      "aa_absolute_percent": 1.4079352065979767,
+      "peak_rss_kib": {
+        "baseline": 13422.0,
+        "control": 13440.0,
+        "candidate": 13538.0
+      }
+    },
+    {
+      "case": "compare/delete_1row_1k/sqlite",
+      "series": "series1",
+      "gain_percent": -2.7086892410903562,
+      "aa_absolute_percent": 1.2870945547166168,
+      "peak_rss_kib": {
+        "baseline": 13254.0,
+        "control": 13234.0,
+        "candidate": 13260.0
+      }
+    },
+    {
+      "case": "compare/delete_1row_10k/sqlite",
+      "series": "series2",
+      "gain_percent": -4.761204082591669,
+      "aa_absolute_percent": 2.72728001043282,
+      "peak_rss_kib": {
+        "baseline": 17094.0,
+        "control": 17164.0,
+        "candidate": 17196.0
+      }
+    },
+    {
+      "case": "compare/tx_commit_1row_10k/sqlite",
+      "series": "series1",
+      "gain_percent": -6.772875398673073,
+      "aa_absolute_percent": 3.2612658161070005,
+      "peak_rss_kib": {
+        "baseline": 17230.0,
+        "control": 17188.0,
+        "candidate": 17274.0
+      }
+    },
+    {
+      "case": "compare/tx_rollback_1row_10k/sqlite",
+      "series": "series1",
+      "gain_percent": -5.635881212060467,
+      "aa_absolute_percent": 4.339212015891625,
+      "peak_rss_kib": {
+        "baseline": 17222.0,
+        "control": 17190.0,
+        "candidate": 17188.0
+      }
+    },
+    {
+      "case": "compare/filter_range/duckdb",
+      "series": "series2",
+      "gain_percent": -4.495975226546101,
+      "aa_absolute_percent": 3.2990190715856462,
+      "peak_rss_kib": {
+        "baseline": 49876.0,
+        "control": 49922.0,
+        "candidate": 50100.0
+      }
+    },
+    {
+      "case": "compare/agg_count_by/duckdb",
+      "series": "series1",
+      "gain_percent": -19.420481757820895,
+      "aa_absolute_percent": 13.632082257535455,
+      "peak_rss_kib": {
+        "baseline": 50224.0,
+        "control": 49606.0,
+        "candidate": 50110.0
+      }
+    },
+    {
+      "case": "compare/agg_count_by/duckdb",
+      "series": "series2",
+      "gain_percent": -38.90239078743576,
+      "aa_absolute_percent": 2.8155153046337533,
+      "peak_rss_kib": {
+        "baseline": 49840.0,
+        "control": 50280.0,
+        "candidate": 49824.0
+      }
+    }
+  ],
+  "source_gate_remains_rejected": true,
+  "new_timings": 0
+}
