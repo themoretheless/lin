@@ -461,6 +461,7 @@ for slug, label, processes, observations in [
     ('rollback-index-upsert', 'Rollback index upsert', 504, 4032),
     ('fts-inline-tokens', 'FTS inline tokens', 756, 6048),
     ('fts-pending-transfer', 'FTS singleton pending transfer', 756, 6048),
+    ('linux-full-fsync', 'Linux Full fsync', 720, 5760),
 ]:
     directory = 'benches/results/2026-11-01-' + slug + '-linux/'
     qualification = read(directory + 'qualification.json')
