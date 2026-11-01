@@ -1515,6 +1515,22 @@ impl Store {
     }
 
     pub fn append_rollback(&mut self, mark: AppendMark) {
+        // Appended vector nodes must not outlive the rows truncated below.
+        // Mixed undo restores swap-moved rows before reaching this append mark.
+        for (name, hnsw) in &mut self.hnsw {
+            let start = if name == "facts" {
+                mark.facts_len
+            } else {
+                mark.col_lens.get(name).copied().unwrap_or(0)
+            };
+            let mut end = self.collections.get(name).map_or(0, Vec::len);
+            if name == "facts" {
+                end = end.max(self.facts_s.len());
+            }
+            for id in start..end {
+                hnsw.remove(id);
+            }
+        }
         self.next_id = mark.next_id;
         self.edges.truncate(mark.edge_len);
         self.facts_s.truncate(mark.facts_len);
@@ -2410,6 +2426,7 @@ impl Store {
             }
             let _ = self.index_insert_row(collection, p, doomed);
             self.fts_insert_row(collection, p, doomed);
+            self.hnsw_insert_slab(collection, p, std::slice::from_ref(doomed));
             self.swap_maps_register(collection, p, doomed);
             // The slab's columns follow the rows array: the value at `p` moves to the
             // tail and the restored row takes `p`, which one swap-push expresses.
@@ -4057,5 +4074,83 @@ mod empty_index_slab_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod rollback_hnsw_oracle {
+    use super::*;
+    #[test]
+    fn mixed_rollback_restores_hnsw_slots_after_multiple_swap_deletes() {
+        for mode in ["rows", "append-first", "append-last"] {
+            let mut db = crate::Db::empty();
+            for i in 0..8 {
+                db.run(&format!(r#"insert docs {{id:"d{i}",title:"vector document number {i}"}}"#)).unwrap();
+            }
+            db.build_hnsw("docs").unwrap();
+            let before = db.store.collection("docs").to_vec();
+            let Cell::Vec(probe) = &before[2]["embedding"] else { panic!("embedding missing") };
+            {
+                let mut tx = db.transaction().unwrap();
+                if mode == "append-first" {
+                    tx.run(r#"insert docs {id:"temporary",title:"temporary document"}"#).unwrap();
+                }
+                tx.run(r#"delete docs[id=="d2"] cas """#).unwrap();
+                tx.run(r#"delete docs[id=="d5"] cas """#).unwrap();
+                if mode == "append-last" {
+                    tx.run(r#"insert docs {id:"temporary",title:"temporary document"}"#).unwrap();
+                }
+                tx.rollback().unwrap();
+            }
+            assert_eq!(db.store.collection("docs"), before, "{mode}");
+            let mut ids = db.store.hnsw["docs"].search(probe, 100, 128).into_iter().map(|(_,id)| id).collect::<Vec<_>>();
+            ids.sort_unstable();
+            assert_eq!(ids, (0..8).collect::<Vec<_>>(), "{mode}");
+            for (_, id) in db.store.hnsw["docs"].search(probe, 100, 128) {
+                let Cell::Vec(vector) = &db.store.collection("docs")[id]["embedding"] else { panic!("embedding missing") };
+                let found = db.store.hnsw["docs"].search(vector, 1, 128);
+                assert_eq!(found[0].1, id, "{mode}");
+            }
+        }
+    }
+
+    #[test]
+    fn append_rollback_removes_hnsw_nodes_at_truncated_slots() {
+        let mut db = crate::Db::empty();
+        db.run(r#"insert docs [{id:"a",title:"first document"},{id:"b",title:"second document"}]"#).unwrap();
+        db.build_hnsw("docs").unwrap();
+        for _ in 0..3 {
+            let probe;
+            {
+                let mut tx = db.transaction().unwrap();
+                let inserted = tx.run(r#"insert docs {id:"temporary",title:"temporary document"}"#).unwrap();
+                let Cell::Vec(vector) = &inserted.rows[0]["embedding"] else { panic!("embedding missing") };
+                probe = vector.clone();
+                tx.rollback().unwrap();
+            }
+            let mut actual = db.store.hnsw["docs"].search(&probe, 20, 64).into_iter().map(|(_,id)| id).collect::<Vec<_>>();
+            actual.sort_unstable();
+            assert_eq!(actual, vec![0,1]);
+        }
+    }
+
+    #[test]
+    fn rollback_restores_hnsw_after_delete() {
+        let mut db = crate::Db::empty();
+        db.run(r#"insert docs {id:"d",title:"old vector document"}"#).unwrap();
+        db.build_hnsw("docs").unwrap();
+        let before = db.store.get_by_id("docs", "d").unwrap().clone();
+        let Cell::Vec(vector) = &before["embedding"] else { panic!("embedding missing") };
+        let expected = db.store.hnsw["docs"].search(vector, 5, 64);
+        assert_eq!(expected.len(), 1);
+        let query = format!(r#"delete docs[id=="d"] cas "{}""#, before.get("hash").and_then(Cell::text).unwrap_or(""));
+        {
+            let mut tx = db.transaction().unwrap();
+            tx.run(&query).unwrap();
+            assert!(tx.db().store.hnsw["docs"].search(vector, 5, 64).is_empty());
+            tx.rollback().unwrap();
+        }
+        assert_eq!(db.store.get_by_id("docs", "d").unwrap(), &before);
+        assert_eq!(db.store.hnsw["docs"].search(vector, 5, 64), expected);
     }
 }

@@ -316,3 +316,79 @@ fn test_group_commit_failure_atomicity_lin_0210() {
     assert_eq!(db.run(r#"docs | id == "gc1""#).unwrap().rows.len(), 0);
     assert_eq!(db.run(r#"docs | id == "gc2""#).unwrap().rows.len(), 0);
 }
+
+#[test]
+fn rollback_delete_restores_public_vector_search_with_live_neighbors() {
+    for mode in ["explicit", "drop", "aborted", "mixed"] {
+        let mut db = Db::empty();
+        db.run(r#"insert docs [{id:"other",title:"gardening plants tomatoes"},{id:"target",title:"quantum qubit entanglement"},{id:"tail",title:"cooking soup carrots"}]"#).unwrap();
+        db.build_hnsw("docs").unwrap();
+        let search = r#"docs | search vec "quantum qubit entanglement" | take 3 | {id}"#;
+        let before = db.run(search).unwrap();
+        assert_eq!(before.rows[0]["id"].text(), Some("target"));
+        let original = db.run("docs | sort id").unwrap().rows;
+        let generation = db.run("docs | count").unwrap().done.r#gen;
+        {
+            let mut tx = db.transaction().unwrap();
+            if mode == "mixed" {
+                tx.run(r#"insert docs {id:"temporary",title:"temporary title"}"#).unwrap();
+            }
+            let removed = tx.run(r#"delete docs[id=="target"] cas """#).unwrap();
+            assert_eq!(removed.done.n, 1);
+            if mode == "aborted" {
+                assert!(tx.run(r#"delete docs[id=="other"] cas "wrong""#).is_err());
+                assert!(tx.commit().is_err());
+            } else if mode == "explicit" || mode == "mixed" {
+                tx.rollback().unwrap();
+            }
+        }
+        assert_eq!(db.run("docs | sort id").unwrap().rows, original, "{mode}");
+        let after = db.run(search).unwrap();
+        assert_eq!(after.done.r#gen, generation, "{mode}");
+        assert_eq!(after.rows, before.rows, "{mode}");
+    }
+}
+
+#[test]
+fn rollback_interleaved_append_delete_preserves_rows_and_keys() {
+    for pattern in ["DI", "IDI", "DIDI", "IIDII", "IDID", "DIID", "DIDID", "DDII"] {
+        for mode in ["explicit", "drop", "aborted"] {
+            let mut db = Db::empty();
+            for i in 0..8 {
+                db.run(&format!(r#"insert users {{id:"u{i}",email:"original{i}@test"}}"#)).unwrap();
+            }
+            let before = db.run("users | sort id").unwrap();
+            let next_id = db.store.next_id;
+            {
+                let mut tx = db.transaction().unwrap();
+                let mut deleted = 0;
+                for (step, op) in pattern.chars().enumerate() {
+                    if op == 'D' {
+                        tx.run(&format!(r#"delete users[id=="u{deleted}"] cas """#)).unwrap();
+                        deleted += 1;
+                    } else if step % 2 == 0 {
+                        tx.run(r#"insert users {email:"generated@test"}"#).unwrap();
+                    } else {
+                        tx.run(&format!(r#"insert users {{id:"temp{step}",email:"temporary@test"}}"#)).unwrap();
+                    }
+                }
+                if mode == "aborted" {
+                    assert!(tx.run(r#"delete users[id=="u7"] cas "wrong""#).is_err());
+                    assert!(tx.commit().is_err());
+                } else if mode == "explicit" {
+                    tx.rollback().unwrap();
+                }
+            }
+            let after = db.run("users | sort id").unwrap();
+            assert_eq!(after.rows, before.rows, "{pattern}/{mode}");
+            assert_eq!(after.done.r#gen, before.done.r#gen, "{pattern}/{mode}");
+            assert_eq!(db.store.next_id, next_id, "{pattern}/{mode}");
+            for i in 0..8 {
+                assert_eq!(db.store.get_by_id("users", &format!("u{i}")).unwrap()["email"].text(), Some(format!("original{i}@test").as_str()), "{pattern}/{mode}");
+            }
+            for step in 0..pattern.len() {
+                assert!(db.store.get_by_id("users", &format!("temp{step}")).is_none(), "{pattern}/{mode}");
+            }
+        }
+    }
+}

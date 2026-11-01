@@ -748,6 +748,12 @@ impl<'a> Transaction<'a> {
         self.db.prepare(src)
     }
 
+    fn checkpoint_undo(&mut self) {
+        let snapshot = self.db.store.mem_backup();
+        let prefix = std::mem::replace(&mut self.undo, Undo::None);
+        self.undo = Undo::Checkpoint(Box::new(UndoCheckpoint { snapshot, prefix }));
+    }
+
     fn ensure_undo(&mut self, prep: &Prepared) {
         match &mut self.undo {
             Undo::None => {
@@ -784,20 +790,25 @@ impl<'a> Transaction<'a> {
                             events: Vec::new(),
                         };
                     } else {
-                        self.undo = Undo::Full(self.db.store.mem_backup());
+                        // Preserve earlier appends and snapshot the transaction tail.
+                        self.checkpoint_undo();
                     }
                 }
             }
-            Undo::Rows(events) => {
+            Undo::Rows(events) | Undo::Mixed { events, .. } => {
                 if prep.append_only && !prep.schema {
-                    let ev = std::mem::take(events);
-                    self.undo = Undo::Mixed {
-                        append: self.db.store.append_mark(),
-                        events: ev,
-                    };
+                    // An append after row edits must be undone at this exact point
+                    // in the reverse journal, before earlier swap-deletes restore slots.
+                    events.push(RowUndo::Append(self.db.store.append_mark()));
+                } else if !prep.stmts.iter().all(|stmt| {
+                    matches!(stmt, Stmt::Update { .. } | Stmt::Delete { .. }
+                        | Stmt::Query(_) | Stmt::Let { .. })
+                }) {
+                    // One checkpoint covers all later mutations, including schema.
+                    self.checkpoint_undo();
                 }
             }
-            Undo::Mixed { .. } | Undo::Full(_) => {}
+            Undo::Full(_) | Undo::Checkpoint(_) => {}
         }
     }
 
@@ -2012,9 +2023,15 @@ impl Db {
             Undo::None => {}
             Undo::Append(mark) => self.store.append_rollback(mark),
             Undo::Full(b) => self.store.mem_restore(b),
+            Undo::Checkpoint(checkpoint) => {
+                let UndoCheckpoint { snapshot, prefix } = *checkpoint;
+                self.store.mem_restore(snapshot);
+                self.rollback(prefix, None);
+            }
             Undo::Rows(events) => {
                 for event in events.into_iter().rev() {
                     match event {
+                        RowUndo::Append(mark) => self.store.append_rollback(mark),
                         RowUndo::Update(collection, idx, row) => {
                             self.store.restore_rows(&[(collection, idx, row)])
                         }
@@ -2027,6 +2044,7 @@ impl Db {
             Undo::Mixed { append, events } => {
                 for event in events.into_iter().rev() {
                     match event {
+                        RowUndo::Append(mark) => self.store.append_rollback(mark),
                         RowUndo::Update(collection, idx, row) => {
                             self.store.restore_rows(&[(collection, idx, row)])
                         }
@@ -6198,6 +6216,7 @@ pub(crate) enum Undo {
     None,
     Append(crate::store::AppendMark),
     Full(crate::store::MemBackup),
+    Checkpoint(Box<UndoCheckpoint>),
     Rows(Vec<RowUndo>),
     Mixed {
         append: crate::store::AppendMark,
@@ -6205,7 +6224,13 @@ pub(crate) enum Undo {
     },
 }
 
+pub(crate) struct UndoCheckpoint {
+    snapshot: crate::store::MemBackup,
+    prefix: Undo,
+}
+
 pub(crate) enum RowUndo {
+    Append(crate::store::AppendMark),
     Update(String, usize, Row),
     Delete(String, Vec<usize>, Vec<Row>),
 }
