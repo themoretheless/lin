@@ -1,0 +1,7 @@
+# Seed transaction history counterfactual: functional prototype
+
+The original retained traces show different WAL histories before the identical timed mutation: at 10k rows Lin issued 22 WAL syncs and wrote 3560906 bytes, SQLite 2 WAL syncs and 1223672 bytes. This observation does not establish a latency cause. Existing frozen benchmark results remain unchanged.
+
+This harness retains the exact previously qualified corrected runtime 625bc7180, including original Linux fdatasync. The current fsync candidate is explicitly excluded by a serial source overlay restored in finally. Both setup modes are in the same executable. Chunked mode calls db.run for each 500-row insert, exactly as before. Grouped mode executes the same insert programs in one interactive transaction, commits it, then prepares the same mutation and constructs the same full-row oracle. Index setup is unchanged. SQLite retains its existing single seed transaction in both modes and serves as a functional control.
+
+32 fresh functional cases cover two sizes, four mutations, two engines and two setup modes. Every case closes and reopens its store and compares all rows/values against its own precomputed expected state. This does not yet establish equality of seed metadata across modes or a timing effect. No production source change is retained by the build. No performance acceptance follows from this prototype. A future Linux diagnostic must verify the changed setup history with syscalls and use an independently frozen timing protocol before drawing latency conclusions.
