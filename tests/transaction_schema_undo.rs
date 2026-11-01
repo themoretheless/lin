@@ -62,6 +62,7 @@ fn repeated_schema_changes_preserve_journal_order_and_abort_state() {
         &[][..],
         &[r#"insert docs {id:"c",title:"appended"}"#][..],
         &[r#"update docs[id=="a"] cas each {title:"updated"}"#][..],
+        &[r#"update docs[id=="a"] cas each {body:"prefix body",layer:"wiki"}"#][..],
         &[r#"delete docs[id=="b"] cas each"#][..],
         &[r#"insert docs {id:"c",title:"appended"}"#, r#"delete docs[id=="b"] cas each"#][..],
         &[r#"delete docs[id=="b"] cas each"#, r#"insert docs {id:"c",title:"appended"}"#][..],
@@ -106,6 +107,7 @@ fn repeated_schema_changes_preserve_journal_order_and_abort_state() {
             assert!(db.store.get_by_id("docs", "a").is_some());
             assert!(db.store.get_by_id("docs", "b").is_some());
             assert!(db.store.get_by_id("docs", "c").is_none());
+            assert!(db.run(r#"docs | search lex "prefix body" | take all"#).unwrap().rows.is_empty());
             db.run(r#"insert docs {id:"duplicate",title:"same"}"#).unwrap();
         }
     }

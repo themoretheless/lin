@@ -8,6 +8,8 @@ jobs:
   correctness:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    env:
+      CARGO_TARGET_DIR: target/ci-btreemap-correctness
     steps:
       - uses: actions/checkout@v4
         with:
