@@ -1,0 +1,7 @@
+# Current SQLite WAL gap: absolute scale
+
+Derived from all retained candidate observations of run41306613457, without new timings. At1k/10k, Full UPDATE/DELETE/COMMIT Lin medians are365–560us versus SQLite293–333us; differences of per-engine process medians are56–229us. Rollback Lin medians are24–36us versus SQLite20–27us; differences are4–11us. These are contextual scale estimates, not statistical confidence intervals or causal phase attribution.
+
+The durable and in-memory Lin transaction cases call the same tx_update_rollback_lin helper, using tx.run_prepared followed by rollback. The durable helper only selects a persistent Full store and adds untimed complete-value reopen validation. A claim that durable rollback reparses a textual query while native rollback uses prepared statements is not supported by the harness. Oracle rows are serialized before timing to avoid retaining shared Row owners.
+
+Rollback does not commit a WAL frame, so changing the durability barrier cannot close its entire gap. The currently running index-upsert component tests one concrete undo operation reduction on this smaller4–11us gap. Full committed mutation gaps require separate current-source phase evidence before attributing them to encoding, frame writes, sync or checkpoint work. Earlier source profiles remain source-scoped. No synchronization, quota, CRC or recovery rule is changed by this analysis.
