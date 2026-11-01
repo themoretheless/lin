@@ -409,6 +409,17 @@ lines += ['', (
     '[CI41306613457](https://github.com/themoretheless/lin/actions/runs/41306613457); '
     'на момент фиксации запуска результата скорости ещё нет. Старые отклонённые матрицы остаются отклонёнными.'
 )]
+point_current = read('benches/results/2026-11-01-corrected-point-values-local/summary.json')
+assert point_current['measurement_complete'] and point_current['observations'] == 216 and not point_current['performance_qualified']
+lines += ['', (
+    '[Current corrected COW full-value point lookup](../benches/results/2026-11-01-corrected-point-values-local/report.md): '
+    'macOS ARM64,3fresh processes/216observations, runtime625bc7180. '
+    'Hit Lin/SQLite0.461–0.609, Lin/DuckDB0.01295–0.01446; '
+    'miss Lin/SQLite0.265–0.308, Lin/DuckDB0.00451–0.00526. '
+    'Все4peer/scenario combinations дают3/3numerical wins; каждый engine возвращает полные owned id/title. '
+    'Нет A/A, Linux qualification или принятия полного engine; короткие capped samples ограничивают точность. '
+    'Старые локальные цифры не используются как baseline относительного ускорения.'
+)]
 output = root / 'docs/benchmark-goal-status-2026-10-27.md'
 output.write_text('\n'.join(lines) + '\n')
 # Never expose endpoint values or credentials in the status artifact.
