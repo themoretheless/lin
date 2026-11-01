@@ -26,6 +26,8 @@ jobs:
               assert hashlib.sha256(Path(name).read_bytes()).hexdigest()==digest,name
           PY
           python3 benches/results/2026-11-01-corrected-cow-full-engine/build.py --verify-inputs
+      - name: Reject synthetic prerequisite provenance corruptions
+        run: python3 benches/results/2026-11-01-corrected-cow-full-engine/test-prerequisite-audit.py
       - name: Fetch and audit exact prerequisite artifacts
         env:
           GH_TOKEN: ${{ github.token }}
