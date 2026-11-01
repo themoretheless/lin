@@ -1,0 +1,9 @@
+# Rollback FTS field-impact prototype
+
+Based on correctness-aligned COW source 625bc7180. Runtime changes only the row-undo FTS maintenance decision: inspect field names already recorded in RowDelta before consuming it. Restore FTS postings only when a declared FTS field or the implicitly indexed snippet occurs in the journal. The row restoration, secondary-index and row-map paths remain unchanged. Both Rows and Mixed undo variants use this decision.
+
+This is distinct from rejected owned-row undo, index-upsert and FTS sync-row prototypes. It does not move stored rows out temporarily, alter index replacement or compare/tokenize full before/after text to decide whether unrelated edits need FTS maintenance. When an indexed field is touched it retains the existing remove/insert path, including its pending-edit folding semantics.
+
+Two new focused release tests passed locally. They verify full row bytes, generation, held result ownership, unchanged borrowed base postings for wing/layer edits, implicit/declared snippet, explicit/Drop rollback, mixed append/update journals and independently rebuilt postings after 300 sequential text edits. Initial failed compilation/test-fixture attempts are preserved: test module placement, missing mandatory CAS, and an invalid immutable-body update. Those attempts do not qualify runtime correctness.
+
+Local full release suite passed: 460 tests, 2 ignored. Both compiled mutants failed their named runtime assertions: always skipping FTS restoration and always restoring FTS. All source bytes were restored and both focused tests passed again. Independent functional audit verified counts, source hashes, exact mutant bytes and commands. Fresh balanced performance measurements are still required. No Linux performance result, source adoption, main merge or eight-peer superiority claim.

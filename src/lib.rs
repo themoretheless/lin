@@ -194,3 +194,6 @@ pub fn explain_as(src: &str, graph: Option<GraphFmt>) -> Result<String, Error> {
 pub fn run(src: &str) -> Result<Handle, Error> {
     DEFAULT_DB.with_borrow_mut(|db| db.run(src))
 }
+
+#[cfg(test)]
+mod rollback_fts_field_impact_tests;

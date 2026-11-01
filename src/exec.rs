@@ -2033,9 +2033,11 @@ impl Db {
                     match event {
                         RowUndo::Append(mark) => self.store.append_rollback(mark),
                         RowUndo::Update(collection, idx, row) => {
+                            let restore_fts = self.store.fts.get(&collection)
+                                .is_some_and(|fts| row.affects_fts(&fts.fields));
                             if let Some(mut restored) = self.store.collection(&collection).get(idx).cloned() {
                                 row.apply(&mut restored);
-                                self.store.restore_row_owned(&collection, idx, restored);
+                                self.store.restore_row_owned(&collection, idx, restored, restore_fts);
                             }
                         }
                         RowUndo::Delete(collection, positions, rows) => {
@@ -2049,9 +2051,11 @@ impl Db {
                     match event {
                         RowUndo::Append(mark) => self.store.append_rollback(mark),
                         RowUndo::Update(collection, idx, row) => {
+                            let restore_fts = self.store.fts.get(&collection)
+                                .is_some_and(|fts| row.affects_fts(&fts.fields));
                             if let Some(mut restored) = self.store.collection(&collection).get(idx).cloned() {
                                 row.apply(&mut restored);
-                                self.store.restore_row_owned(&collection, idx, restored);
+                                self.store.restore_row_owned(&collection, idx, restored, restore_fts);
                             }
                         }
                         RowUndo::Delete(collection, positions, rows) => {
@@ -6258,6 +6262,9 @@ pub(crate) struct UndoCheckpoint {
 
 pub(crate) struct RowDelta(smallvec::SmallVec<[(String, Option<Cell>); 1]>);
 impl RowDelta {
+    fn affects_fts(&self, fields: &[String]) -> bool {
+        self.0.iter().any(|(key, _)| key == "snippet" || fields.contains(key))
+    }
     fn capture(before: &Row, patch: &Row, derived_hash: bool) -> Self {
         let mut edits = smallvec::SmallVec::new();
         for key in patch.keys() {

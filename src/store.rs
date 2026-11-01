@@ -2444,15 +2444,19 @@ impl Store {
     /// Reverse in-place row mutations from a `Rows` undo journal. Positions never
     /// shift during an update, so each entry restores one row plus its own index /
     /// FTS / map slots — no whole-store clone, no per-collection rebuild.
-    pub(crate) fn restore_row_owned(&mut self, collection: &str, idx: usize, row: Row) {
+    pub(crate) fn restore_row_owned(&mut self, collection: &str, idx: usize, row: Row, restore_fts: bool) {
         let Some(slot) = self.collections.get_mut(collection).and_then(|rows| rows.get_mut(idx)) else { return; };
         // Retain one read-only view for map/index maintenance; move both stored rows.
         let restored = row.clone();
         let current = std::mem::replace(slot, row);
         self.index_remove_row(collection, idx, &current);
-        self.fts_remove_row(collection, idx, &current);
+        if restore_fts {
+            self.fts_remove_row(collection, idx, &current);
+        }
         let _ = self.index_insert_row(collection, idx, &restored);
-        self.fts_insert_row(collection, idx, &restored);
+        if restore_fts {
+            self.fts_insert_row(collection, idx, &restored);
+        }
         self.row_maps_sync_updated(collection, idx, &current, &restored);
     }
 
