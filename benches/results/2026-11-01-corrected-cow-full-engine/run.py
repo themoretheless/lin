@@ -1,14 +1,18 @@
 from pathlib import Path
+import sys
+sys.path.insert(0,str(Path.cwd()/'scripts'))
+from benchmark_role_balance import schedule,orders_from_records
 import subprocess,json,hashlib,os,time,re,math
 from runtime import capture,env_for
 p=Path(__file__).resolve().parent;meta=json.loads((p/'provenance.json').read_text());capture(p);CASES=json.loads((p/'cases.json').read_text());assert len(CASES)==len(set(CASES))==67;processes=[]
 assert not (p/'process-status.json').exists(),'Existing timed attempt must be preserved, not rerun'
 smokes=json.loads((p/'local-smoke-status.json').read_text());assert len(smokes['runs'])==134 and all(r['exit_code']==0 for r in smokes['runs'])
 assert {(r['role'],r['case'])for r in smokes['runs']}=={(role,c)for role in ['baseline','candidate']for c in CASES}
+planned=schedule([dict(id=c)for c in CASES],['baseline','control','candidate'])
 for round in range(1,13):
  cases=CASES[round%67:]+CASES[:round%67]
  for case_index,case in enumerate(cases):
-  modes=['baseline','control','candidate'];shift=(round+case_index)%3;modes=modes[shift:]+modes[:shift]
+  modes=[r['role']for r in planned if r['round']==round and r['workload']==case]
   for mode in modes:
    binary=Path(meta['binaries']['baseline'if mode=='control'else mode]['path']);assert hashlib.sha256(binary.read_bytes()).hexdigest()==meta['binaries']['baseline'if mode=='control'else mode]['sha256']
    group=f'{round:02}-{mode}';name=case.replace('/','_');dest=p/group/name;(p/group).mkdir(exist_ok=True);env=env_for(mode);load=os.getloadavg();started=time.time();resource=p/group/(name+'-resource.txt')

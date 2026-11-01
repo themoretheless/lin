@@ -1,10 +1,16 @@
 from pathlib import Path
+import sys
+sys.path.insert(0,str(Path.cwd()/'scripts'))
+from benchmark_role_balance import schedule,orders_from_records
 import json,math,re,statistics as st
 p=Path(__file__).resolve().parent
 load=lambda n:json.loads((p/n).read_text())
 cases=load('cases.json');records=load('process-status.json');assert len(cases)==len(set(cases))==67
 expected={(i,m,c)for i in range(1,13)for m in ['baseline','control','candidate']for c in cases}
 assert len(records)==2412 and {(r['round'],r['mode'],r['case'])for r in records}==expected
+planned=schedule([dict(id=c)for c in cases],['baseline','control','candidate'])
+assert [(r['round'],r['mode'],r['case'])for r in records]==[(r['round'],r['role'],r['workload'])for r in planned]
+orders_from_records(records,cases,['baseline','control','candidate'],'case',role_key='mode')
 med={};rss={};count=0
 for r in records:
  assert r['exit_code']==0

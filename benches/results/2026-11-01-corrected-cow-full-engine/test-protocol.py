@@ -1,4 +1,7 @@
 from pathlib import Path
+import sys
+sys.path.insert(0,str(Path.cwd()/'scripts'))
+from benchmark_role_balance import schedule,orders_from_records
 import tempfile,json,shutil,subprocess,hashlib
 src=Path(__file__).resolve().parent
 with tempfile.TemporaryDirectory(prefix='lin-wal-reserve-protocol-')as tmp:
@@ -25,10 +28,11 @@ with tempfile.TemporaryDirectory(prefix='lin-wal-reserve-protocol-')as tmp:
   binary=p/(role+'-binary');binary.write_bytes(role.encode());binaries[role]=dict(path=str(binary),sha256=digest(binary),cargo_target_dir='target/corrected-full-engine-'+role,source_sha256=frozen[role]['source_sha256'])
  for record in records:record['binary_sha256']=binaries['baseline'if record['mode']=='control'else record['mode']]['sha256']
  by_key={(r['round'],r['mode'],r['case']):r for r in records};ordered=[]
+ planned=schedule([dict(id=c)for c in cases],['baseline','control','candidate'])
  for round in range(1,13):
   rotated=cases[round%67:]+cases[:round%67]
   for index,c in enumerate(rotated):
-   roles=['baseline','control','candidate'];shift=(round+index)%3;roles=roles[shift:]+roles[:shift]
+   roles=[r['role']for r in planned if r['round']==round and r['workload']==c]
    for role in roles:
     r=by_key[round,role,c];base=p/f'{round:02}-{role}';name=c.replace('/','_')
     binary=binaries['baseline'if role=='control'else role]['path']
@@ -45,6 +49,14 @@ with tempfile.TemporaryDirectory(prefix='lin-wal-reserve-protocol-')as tmp:
    smokes.append(dict(role=role,case=c,exit_code=0))
  write('local-smoke-status.json',dict(correctness_smoke_only=True,performance_qualified=False,runs=smokes))
  run('summarize.py');run('verify.py');run('qualify.py')
+ # Full historical cancellation schedule must fail even with complete data.
+ old=[]
+ for rnd in range(1,13):
+  for index,c in enumerate(cases[rnd%67:]+cases[:rnd%67]):
+   roles=['baseline','control','candidate'];shift=(rnd+index)%3
+   old.extend(by_key[rnd,role,c]for role in roles[shift:]+roles[:shift])
+ write('process-status.json',old);run('verify.py',False);run('summarize.py',False)
+ write('process-status.json',records)
  original_meta=(p/'provenance.json').read_text()
  bad=json.loads(original_meta);bad['frozen_commits']['baseline']='0'*40;write('provenance.json',bad);run('verify.py',False);(p/'provenance.json').write_text(original_meta)
  bad=json.loads(original_meta);bad['binaries']['candidate']['cargo_target_dir']='target/corrected-full-engine-baseline';write('provenance.json',bad);run('verify.py',False);(p/'provenance.json').write_text(original_meta)
@@ -61,4 +73,4 @@ with tempfile.TemporaryDirectory(prefix='lin-wal-reserve-protocol-')as tmp:
  for i in range(1,7):
   target=p/f'{i:02}-candidate'/control.replace('/','_')/'run.json';row=json.loads(target.read_text());row['observations']=d['observations'];target.write_text(json.dumps(row))
  run('summarize.py');run('verify.py');run('qualify.py',False)
- print('PASS: complete67-case matrix accepted; summary/RSS/missing-row/NaN corruption rejected; losing target pair and regressing control rejected by gate')
+ print('PASS: balanced67-case matrix accepted; complete historical order rejected; summary/RSS/missing-row/NaN corruption rejected; losing target pair and regressing control rejected by gate')

@@ -1,4 +1,7 @@
 from pathlib import Path
+import sys
+sys.path.insert(0,str(Path.cwd()/'scripts'))
+from benchmark_role_balance import schedule,orders_from_records
 import json,hashlib,math,re
 p=Path(__file__).resolve().parent;load=lambda n:json.loads((p/n).read_text())
 def digest(f):return hashlib.sha256(Path(f).read_bytes()).hexdigest()
@@ -7,13 +10,10 @@ def middle(xs):
 cases=load('cases.json');records=load('process-status.json');summary=load('summary.json');peers=load('peer-comparisons.json');q=load('qualification.json');meta=load('provenance.json');env=load('environment.json')
 assert len(cases)==len(set(cases))==67
 assert len(records)==2412 and {(r['round'],r['mode'],r['case'])for r in records}=={(i,m,c)for i in range(1,13)for m in ['baseline','control','candidate']for c in cases}
-expected_order=[]
-for round in range(1,13):
- rotated=cases[round%67:]+cases[:round%67]
- for index,case in enumerate(rotated):
-  roles=['baseline','control','candidate'];shift=(round+index)%3;roles=roles[shift:]+roles[:shift]
-  expected_order.extend((round,role,case)for role in roles)
-assert [(r['round'],r['mode'],r['case'])for r in records]==expected_order,'Case/role rotation changed'
+planned=schedule([dict(id=c)for c in cases],['baseline','control','candidate'])
+expected_order=[(r['round'],r['role'],r['workload'])for r in planned]
+assert [(r['round'],r['mode'],r['case'])for r in records]==expected_order,'Case/role schedule changed'
+orders_from_records(records,cases,['baseline','control','candidate'],'case',role_key='mode')
 assert meta['source_restored']and meta['instrumentation']is False and meta['source_sha256']
 assert all(digest(f)==h for f,h in meta['source_sha256'].items())
 assert digest('benches/compare.rs')==meta['original_compare_sha256']
