@@ -10,9 +10,9 @@ def scope(text):
  calls=[]
  for line in lines[start[0]+1:end[0]]:
   assert '<unfinished ...>'not in line and ' resumed>'not in line,'split syscall needs explicit reconstruction'
-  m=re.search(r'\b([a-z][a-z0-9_]*)\((.*)\)\s+= (-?\d+)(?:\s|$)',line)
+  m=re.search(r'\b([a-z][a-z0-9_]*)\((.*)\)\s+= (-?(?:0x[0-9a-f]+|\d+))(?=<|\s|$)',line)
   assert m,('unrecognized scoped trace',line)
-  call,args,result=m.groups();result=int(result);assert result>=0,('failed scoped syscall',line)
+  call,args,result=m.groups();result=int(result,0);assert result>=0,('failed scoped syscall',line)
   fd=re.match(r'(\d+)<([^>]+)>',args)
   calls.append(dict(call=call,result=result,fd=int(fd[1])if fd else None,path=fd[2]if fd else None,raw=line))
  return calls
