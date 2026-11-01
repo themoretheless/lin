@@ -10,6 +10,6 @@ for fixture in fixtures['cases']:
  for f,info in fixture['files'].items():
   b=(directory/f).read_bytes();assert len(b)==info['bytes']and sha(b)==info['sha256']
  cmd=[m['binary'],str(directory)];r=subprocess.run(cmd,capture_output=True,text=True);(root/f'{n}.stdout').write_text(r.stdout);(root/f'{n}.stderr').write_text(r.stderr);assert r.returncode==0,r.stderr[-2000:]
- data=json.loads(r.stdout);assert data['legacy_full_values_verified']and data['rows']==n and data['duplicate_apply_noop']and data['crc_corruption_rejected']and data['generation_verified']==int((directory/'expected-generation.txt').read_text())and not data['performance_qualified']
+ data=json.loads(r.stdout);assert data['legacy_full_values_verified']and data['embedding_f32_bits_verified']and data['rows']==n and data['duplicate_apply_noop']and data['crc_corruption_rejected']and data['generation_verified']==int((directory/'expected-generation.txt').read_text())and not data['performance_qualified']
  results.append(dict(command=cmd,exit_code=r.returncode,**data))
 (root/'status.json').write_text(json.dumps(dict(complete=True,legacy_reference=m['legacy_reference'],cases=results,full_objective_achieved=False,performance_qualification=False),indent=2)+'\n');print('PASS actual production reader: all 1000 and 10000 rows, generation, duplicate apply and CRC')

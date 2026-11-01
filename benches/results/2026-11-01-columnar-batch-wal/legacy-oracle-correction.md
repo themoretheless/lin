@@ -1,0 +1,7 @@
+# Production-reader oracle correction
+
+The first reader run stopped at the JSON equality assertion on the 1k fixture. The stored embedding is f32. A JSON decimal emitted from its exact f64 widening was parsed by serde_json with a one-f64-ULP difference: 0.13768568634986877 versus 0.13768568634986875. Both map to the same f32 bit pattern. That original failure, original driver, old runtime/binary hashes and raw outputs are retained in legacy-attempt1.tar.gz and its manifest; it is not accepted as a successful run.
+
+The revised driver compares every actual embedding value to the expected declared f32 value by to_bits, then normalizes only the expected typed embedding numbers for the complete JSON object comparison. Every other field and object remains compared. The actual old runtime source is unchanged at 04749994b9ca7a090476b95401f0f7166d8b870a, verified from Git blobs in an isolated target. Both 1k and 10k real WAL fixtures pass full values, generation, duplicate replay and CRC rejection. A separate runtime negative flips exactly one expected embedding f32 bit while leaving WAL bytes unchanged; the real reader rejects it at the bit comparison.
+
+This corrects the oracle's intermediate numeric representation, not WAL data, runtime behavior, fixtures or performance criteria. It does not prove compatibility for every possible typed-column input. Binary payloads are not archived; their hashes were verified live. No performance measurement or adoption follows from these functional checks.
