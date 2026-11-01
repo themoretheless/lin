@@ -10,4 +10,4 @@ Each role must build in its own target directory and retain source manifests, co
 
 This matrix is a source-adoption check, not the complete eight-peer proof. Full-value point_values Linux comparisons and refreshed PostgreSQL/MySQL/MongoDB/pandas comparisons remain required. Historical count-only point_get peer results do not establish full-value performance. MSSQL results retain the existing private disclosure boundary. Kusto requires an actual configured backend. The old failed matrices remain failed, and no old gain is transferred or multiplied.
 
-No measurement has started for these frozen sources. Runner, raw verifier and synthetic corruption checks must be completed and reviewed before dispatch.
+No measurement has started for these frozen sources. The numerical verifier and synthetic complete-matrix/corruption checks now pass. Correctness prerequisite artifact auditing and the CI dispatch workflow remain to be completed before dispatch. Synthetic timings prove verifier behavior only, not engine performance.

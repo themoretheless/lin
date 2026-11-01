@@ -2,6 +2,9 @@ from pathlib import Path
 import subprocess,json,hashlib,os,time,re,math
 from runtime import capture,env_for
 p=Path(__file__).resolve().parent;meta=json.loads((p/'provenance.json').read_text());capture(p);CASES=json.loads((p/'cases.json').read_text());assert len(CASES)==len(set(CASES))==67;processes=[]
+assert not (p/'process-status.json').exists(),'Existing timed attempt must be preserved, not rerun'
+smokes=json.loads((p/'local-smoke-status.json').read_text());assert len(smokes['runs'])==134 and all(r['exit_code']==0 for r in smokes['runs'])
+assert {(r['role'],r['case'])for r in smokes['runs']}=={(role,c)for role in ['baseline','candidate']for c in CASES}
 for round in range(1,13):
  cases=CASES[round%67:]+CASES[:round%67]
  for case_index,case in enumerate(cases):
