@@ -1,0 +1,61 @@
+{
+  "complete": true,
+  "cases": [
+    {
+      "rows": 1000,
+      "command": [
+        "/private/tmp/lin-wal-syscall-diagnostic-target-20261101/columnar-batch-candidate",
+        "--seed-history-case",
+        "1000",
+        "update",
+        "lin",
+        "grouped"
+      ],
+      "exit_code": 0,
+      "full_values_reopen": true,
+      "files": {
+        "expected.json": {
+          "bytes": 3731401,
+          "sha256": "2d67734b1c8486fb2ead5b370e3bbae9f3f892423701a8da9c9eb82d3dd8e609"
+        },
+        "expected-generation.txt": {
+          "bytes": 1,
+          "sha256": "d4735e3a265e16eee03f59718b9b5d03019c07d8b6c51f90da3a666eec13ab35"
+        },
+        "log.wal": {
+          "bytes": 337083,
+          "sha256": "cca391f2df3e59ca007d35eb7f7af809588a6898550f606356973d0a0ef7a472"
+        }
+      }
+    },
+    {
+      "rows": 10000,
+      "command": [
+        "/private/tmp/lin-wal-syscall-diagnostic-target-20261101/columnar-batch-candidate",
+        "--seed-history-case",
+        "10000",
+        "update",
+        "lin",
+        "grouped"
+      ],
+      "exit_code": 0,
+      "full_values_reopen": true,
+      "files": {
+        "expected.json": {
+          "bytes": 37642137,
+          "sha256": "0d1010a04dc4c8c74dfb2828dcbe383770be613c6fa4f9678a87d457b59a13f1"
+        },
+        "expected-generation.txt": {
+          "bytes": 1,
+          "sha256": "d4735e3a265e16eee03f59718b9b5d03019c07d8b6c51f90da3a666eec13ab35"
+        },
+        "log.wal": {
+          "bytes": 3558455,
+          "sha256": "e234a357328d0e98be5b63b397662f6a99340a8ab24e9b39e401751d75f83da7"
+        }
+      }
+    }
+  ],
+  "legacy_reader_pending": true,
+  "performance_qualified": false
+}
