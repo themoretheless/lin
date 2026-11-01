@@ -1,0 +1,32 @@
+name: wal-frame-boundary
+on:
+  push:
+    branches: [codex/wal-frame-boundary-ci]
+permissions:
+  contents: read
+jobs:
+  diagnostic:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
+      - name: Verify frozen diagnostic
+        run: |
+          python3 - <<'PYCODE'
+          import json,hashlib
+          from pathlib import Path
+          p=Path('benches/results/2026-11-01-wal-frame-boundary')
+          for f,h in json.loads((p/'frozen.json').read_text()).items():assert hashlib.sha256(Path(f).read_bytes()).hexdigest()==h,f
+          PYCODE
+      - name: Measure fixed sizes and offsets
+        run: python3 benches/results/2026-11-01-wal-frame-boundary/run.py
+      - name: Audit all measurements and stored file bytes
+        run: python3 benches/results/2026-11-01-wal-frame-boundary/analyze.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: wal-frame-boundary
+          path: benches/results/2026-11-01-wal-frame-boundary/
