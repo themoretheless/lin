@@ -5,6 +5,7 @@ sys.path.insert(0,str(Path.cwd()/'scripts'))
 from cargo_bench_artifact import bench_executable
 status=json.loads((p/'test-status.json').read_text());assert status['passed']==458 and status['persist_sha256']==sha(before)
 base=(p/'baseline-persist.rs').read_bytes();candidate=(p/'candidate-persist.rs').read_bytes();assert before==candidate and base.replace(b'libc::fdatasync(file.as_raw_fd())',b'libc::fsync(file.as_raw_fd())')==candidate
+assert base==subprocess.check_output(['git','show','625bc7180:src/persist.rs'])
 other={str(f):sha(f.read_bytes())for f in Path('src').rglob('*.rs')if f!=source};assert all(sha(subprocess.check_output(['git','show','625bc7180:'+f]))==h for f,h in other.items())
 result=dict(binaries={},source_restored=False,baseline_persist_sha256=sha(base),candidate_persist_sha256=sha(candidate),harness_sha256=sha((p/'compare.rs').read_bytes()),other_source_sha256=other)
 try:
