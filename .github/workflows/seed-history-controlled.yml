@@ -1,0 +1,60 @@
+name: seed-history-controlled
+on:
+  push:
+    branches: [codex/seed-history-controlled-ci]
+permissions:
+  contents: read
+jobs:
+  diagnostic:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_TARGET_DIR: target/seed-history-controlled
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.96.0'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Frozen inputs
+        run: python3 -c "from pathlib import Path;import json,hashlib;m=json.loads(Path('benches/results/2026-11-02-seed-history-controlled/frozen.json').read_text());assert all(hashlib.sha256(Path(f).read_bytes()).hexdigest()==h for f,h in m.items())"
+      - name: Full runtime release suite
+        run: python3 benches/results/2026-11-01-columnar-batch-wal/test.py
+      - name: Compiled lost-child negative
+        run: python3 benches/results/2026-11-01-columnar-batch-wal/check-mutant.py
+      - name: Build shared diagnostic executable
+        run: python3 benches/results/2026-11-02-seed-history-controlled/build.py
+      - name: Actual fixed seed values and f32 bits match
+        run: python3 benches/results/2026-11-02-seed-history-controlled/compare-seeds.py
+      - name: All 32 full-value functional smokes
+        run: python3 benches/results/2026-11-02-seed-history-controlled/smoke.py
+      - name: Install syscall observer
+        run: sudo apt-get update && sudo apt-get install -y strace
+      - name: Observe all eight Linux setup histories
+        run: python3 benches/results/2026-11-02-seed-history-controlled/trace-setup.py
+      - name: Synthetic matrix math and corruptions
+        run: python3 benches/results/2026-11-02-seed-history-controlled/test-analysis.py
+      - name: Independent verifier synthetic proof and corruptions
+        run: python3 benches/results/2026-11-02-seed-history-controlled/test-verifier.py
+      - name: All 480 fresh diagnostic processes
+        run: python3 benches/results/2026-11-02-seed-history-controlled/run.py
+      - name: Analyze all 3840 observations
+        run: python3 benches/results/2026-11-02-seed-history-controlled/analyze.py
+      - name: Independent raw source trace command and numerical audit
+        run: python3 benches/results/2026-11-02-seed-history-controlled/verify.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: seed-history-controlled
+          path: |
+            benches/results/2026-11-02-seed-history-controlled/
+            benches/results/2026-11-01-columnar-batch-wal/full-release.log
+            benches/results/2026-11-01-columnar-batch-wal/test-status.json
+            benches/results/2026-11-01-columnar-batch-wal/mutant-status.json
+            benches/results/2026-11-01-columnar-batch-wal/lost-child-mutant.rs
+            benches/results/2026-11-01-columnar-batch-wal/lost-child-runtime.log

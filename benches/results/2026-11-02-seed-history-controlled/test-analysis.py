@@ -14,7 +14,7 @@ with tempfile.TemporaryDirectory(prefix='lin-history-math-')as td:
  status=root/'process-status.json';status.write_text(json.dumps(records))
  def run(ok):
   r=subprocess.run(['python3',str(p/'analyze.py'),str(d)],capture_output=True,text=True);assert(r.returncode==0)==ok,r.stderr[-2000:]
- run(True);summary=json.loads((root/'summary.json').read_text());assert all(r['lin_group_gain_percent']==19.999999999999996 and r['lin_absolute_aa_percent']==0 and r['lin_positive_pairs']==6 and r['six_positive_above_aa']and r['chunked_lin_over_sqlite']==1 and r['grouped_lin_over_sqlite']==0.8 for series in summary.values()for r in series.values());checks.append('exact-20-percent-gain-and-0.8-ratio')
+ run(True);summary=json.loads((root/'summary.json').read_text());assert all(abs(r['lin_group_gain_percent']-20)<1e-10 and r['lin_absolute_aa_percent']==0 and r['lin_positive_pairs']==6 and r['six_positive_above_aa']and r['chunked_lin_over_sqlite']==1 and r['grouped_lin_over_sqlite']==0.8 for series in summary.values()for r in series.values());checks.append('exact-20-percent-gain-and-0.8-ratio')
  status.write_text(json.dumps(records[:-1]));run(False);status.write_text(json.dumps(records));checks.append('missing-process-rejected')
  x=list(records);x[0],x[1]=x[1],x[0];status.write_text(json.dumps(x));run(False);status.write_text(json.dumps(records));checks.append('wrong-order-rejected')
  f=root/records[0]['output']/'run.json';original=f.read_text();x=json.loads(original);x['observations'][0]['value']=float('nan');f.write_text(json.dumps(x));run(False);f.write_text(original);checks.append('nan-rejected')

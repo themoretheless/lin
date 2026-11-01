@@ -1,0 +1,11 @@
+# Controlled seed transaction history — frozen diagnostic protocol
+
+Purpose: investigate whether the transaction history used to populate a durable fixture contributes to the remaining Lin / SQLite WAL gap. This is a counterfactual diagnostic, not adoption of a faster-looking fixture and not reinterpretation of original frozen results.
+
+Use the exact columnar Batch prototype runtime, retaining fdatasync, with one executable for every mode. Selected case callbacks use the same run_durable_lin_write/run_durable_sqlite_write bodies and complete close/reopen oracles. Only setup selects separate 500-row Lin commits versus all identical insert programs in one transaction. SQLite retains its original single seed transaction under both mode labels as an A/A control. A shared executable removes separate-build differences between modes; it does not isolate all possible setup effects such as generation, allocation layout, metadata or cache state.
+
+The initial draft build used original per-process FIXTURE_NOW; its source, build log and provenance are retained separately and do not qualify any timing. The revised diagnostic fixes the anchor at 1790000000000 milliseconds. Before timing verify actual full seed values agree between modes. Existing component benchmarks keep their original timestamp behavior and frozen source.
+
+Coverage: 1k/10k, UPDATE/DELETE/COMMIT/ROLLBACK. Before any timing require all 32 selected benchmark smokes and eight Linux setup traces (two sizes, two modes, two engines for UPDATE), verifying that Lin seed WAL history actually differs while SQLite history stays unchanged. Mutation-only traces and all values remain retained. Do not claim that transaction grouping isolates a single physical sync cost.
+
+Measurement: 12 rounds, rotated eight workloads and five roles per workload: Lin chunked baseline, identical Lin chunked A/A, Lin grouped, SQLite chunked-label baseline, SQLite grouped-label control. Eight ordinary wall observations per fresh process, max iterations one, no warmup. 480 fresh processes / 3840 observations. Descriptive paired gains, absolute A/A and full raw values; no production acceptance gate or unchanged retry. Inputs, order and analyzers are frozen in frozen.json before Linux timing. Linux timing and Kusto/eight-peer completion remain unproven.
