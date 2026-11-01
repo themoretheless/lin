@@ -462,6 +462,7 @@ for slug, label, processes, observations in [
     ('fts-inline-tokens', 'FTS inline tokens', 756, 6048),
     ('fts-pending-transfer', 'FTS singleton pending transfer', 756, 6048),
     ('linux-full-fsync', 'Linux Full fsync', 720, 5760),
+    ('columnar-batch-wal', 'Compatible column Batch WAL', 864, 6912),
 ]:
     directory = 'benches/results/2026-11-01-' + slug + '-linux/'
     qualification = read(directory + 'qualification.json')
@@ -481,6 +482,7 @@ for slug, label, processes, observations in [
         'Полная матрица сохранена; принятия или неизменённого перезапуска нет. '
         'Это компонентные сравнения Lin с исходной версией, а не победы над внешними БД.'
     )]
+lines += ['', '[Проверка порядка ролей](../benches/results/2026-11-01-columnar-batch-wal-linux/decision.md): в завершённой 24-case матрице роли оставались в одном порядке для каждого случая все 12 раундов. Наблюдаемые 78.780–82.589% выигрыша групповых вставок не являются аттестацией с уравновешенным порядком. Исходный gate провален, кандидат не принят; требуется новый заранее зафиксированный сбалансированный план. Другие исторические планы этим аудитом не аттестованы.']
 output = root / 'docs/benchmark-goal-status-2026-10-27.md'
 output.write_text('\n'.join(lines) + '\n')
 # Never expose endpoint values or credentials in the status artifact.
