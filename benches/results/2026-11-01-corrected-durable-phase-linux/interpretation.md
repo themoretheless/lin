@@ -1,0 +1,7 @@
+# Interpretation and next falsifiable diagnostic
+
+The full 240-process matrix and 1920 wall observations completed. Local raw numerical recomputation matches the CI report byte for byte. Sync accounts for 79.903-83.578 percent in document Full mutations and 93.955 percent in scalar Full, within traced invocations. Rollback has no WAL encode/write/sync and spends 52.721-55.562 percent in execution and 31.707-33.532 percent in restoration. These are diagnostic shares, not the measured cause of the SQLite difference. Scalar Normal disabled/original ratio is 1.234; instrumentation layout overhead is material there. Traces include calibration and validation and cannot be aligned to individual wall observations.
+
+Observed document payload is 4112 bytes; checksum frame overhead in write_frame_bytes is 13 bytes, total 4125. A 4125-byte contiguous write spans at least two 4096-byte pages; actual file offsets, filesystem block size and dirty-page behavior have not been measured here. Smaller frames can also straddle two pages. Do not claim that the 4096 boundary explains the gap.
+
+Next diagnostic: preserve the existing write_all plus fdatasync Full contract, compare controlled frame sizes around the boundary at declared offsets on one Linux filesystem, record actual block size and offsets, rotate controls and retain all losing/null outcomes. This would test an I/O hypothesis only; it does not qualify a codec, file-format change, whole-engine optimization or peer superiority. The previous zero codec and RWF_DSYNC candidates remain rejected.
