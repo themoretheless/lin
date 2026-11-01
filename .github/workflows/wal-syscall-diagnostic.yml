@@ -1,0 +1,38 @@
+name: wal-syscall-diagnostic
+on:
+  push:
+    branches: [codex/wal-syscall-diagnostic-ci]
+permissions:
+  contents: read
+jobs:
+  diagnostic:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_TARGET_DIR: target/wal-syscall-diagnostic
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.96.0'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Frozen inputs
+        run: python3 -c "from pathlib import Path; import json,hashlib; m=json.loads(Path('benches/results/2026-11-01-wal-syscall-diagnostic/frozen.json').read_text()); assert all(hashlib.sha256(Path(f).read_bytes()).hexdigest()==h for f,h in m.items())"
+      - name: Install syscall observer
+        run: sudo apt-get update && sudo apt-get install -y strace
+      - name: Build exact qualified runtime with diagnostic harness
+        run: python3 benches/results/2026-11-01-wal-syscall-diagnostic/build.py
+      - name: Sixteen ordinary full-value probes
+        run: python3 benches/results/2026-11-01-wal-syscall-diagnostic/run.py --functional
+      - name: Sixteen traced full-value probes
+        run: python3 benches/results/2026-11-01-wal-syscall-diagnostic/run.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: wal-syscall-diagnostic
+          path: benches/results/2026-11-01-wal-syscall-diagnostic/
