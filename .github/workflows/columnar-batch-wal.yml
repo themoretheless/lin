@@ -1,0 +1,62 @@
+name: columnar-batch-wal
+on:
+  push:
+    branches: [codex/columnar-batch-wal-ci]
+permissions:
+  contents: read
+jobs:
+  benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_TARGET_DIR: target/columnar-batch-wal
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.96.0'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Verify frozen inputs
+        run: python3 -c "from pathlib import Path;import json,hashlib;m=json.loads(Path('benches/results/2026-11-01-columnar-batch-wal/frozen-benchmark.json').read_text());assert all(hashlib.sha256(Path(f).read_bytes()).hexdigest()==h for f,h in m.items())"
+      - name: Full release suite with fixed column oracle
+        run: python3 benches/results/2026-11-01-columnar-batch-wal/test.py
+      - name: Compiled lost-child negative
+        run: python3 benches/results/2026-11-01-columnar-batch-wal/check-mutant.py
+      - name: Build candidate functional probe
+        run: python3 benches/results/2026-11-01-columnar-batch-wal/build-candidate.py
+      - name: All 32 grouped-history value probes
+        run: python3 benches/results/2026-11-01-columnar-batch-wal/functional.py
+      - name: Generate actual grouped WAL fixtures
+        run: python3 benches/results/2026-11-01-columnar-batch-wal/generate-fixtures.py
+      - name: Build exact production reader in isolated target
+        run: python3 benches/results/2026-11-01-columnar-batch-wal/build-legacy.py
+      - name: Production reader full values and f32 bits
+        run: python3 benches/results/2026-11-01-columnar-batch-wal/verify-legacy.py
+      - name: Actual reader rejects one-bit f32 oracle corruption
+        run: python3 benches/results/2026-11-01-columnar-batch-wal/check-legacy-oracle.py
+      - name: Build ordinary benchmark pair
+        run: python3 benches/results/2026-11-01-columnar-batch-wal/build-benchmark-pair.py
+      - name: Synthetic matrix and corruption tests
+        run: python3 benches/results/2026-11-01-columnar-batch-wal/test-protocol.py
+      - name: Forty-eight fresh functional smokes
+        run: python3 benches/results/2026-11-01-columnar-batch-wal/benchmark-run.py --smoke
+      - name: Independent verifier synthetic corruptions
+        run: python3 benches/results/2026-11-01-columnar-batch-wal/test-verifier.py
+      - name: All 864 fresh paired processes
+        run: python3 benches/results/2026-11-01-columnar-batch-wal/benchmark-run.py
+      - name: Analyze complete matrix
+        run: python3 benches/results/2026-11-01-columnar-batch-wal/analyze.py
+      - name: Independent source raw command and numerical audit
+        run: python3 benches/results/2026-11-01-columnar-batch-wal/verify-benchmark.py
+      - name: Enforce unchanged component criteria
+        run: python3 benches/results/2026-11-01-columnar-batch-wal/qualify.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: columnar-batch-wal
+          path: benches/results/2026-11-01-columnar-batch-wal/

@@ -5,7 +5,9 @@ assert before==(p/'candidate-persist.rs').read_bytes()and (p/'baseline-persist.r
 status=json.loads((p/'test-status.json').read_text());negative=json.loads((p/'mutant-status.json').read_text());assert status['passed']==460 and status['persist_sha256']==sha(before)and negative['source_restored']and negative['runtime_assertion_caught']
 sys.path.insert(0,str(Path.cwd()/'scripts'))
 from cargo_bench_artifact import bench_executable
-result=dict(binaries={},harness_sha256=sha((p/'benchmark-compare.rs').read_bytes()),source_restored=False)
+other={str(f):sha(f.read_bytes())for f in Path('src').rglob('*.rs')if f!=source}
+assert all(sha(subprocess.check_output(['git','show','625bc7180:'+f]))==h for f,h in other.items())
+result=dict(binaries={},other_source_sha256=other,harness_sha256=sha((p/'benchmark-compare.rs').read_bytes()),source_restored=False)
 try:
  bench.write_bytes((p/'benchmark-compare.rs').read_bytes())
  for role in ['baseline','candidate']:
@@ -15,4 +17,4 @@ try:
   exe=Path(bench_executable((p/f'build-benchmark-{role}.log').read_text(),'compare')).resolve();assert exe.is_relative_to(target);dest=target/('columnar-batch-benchmark-'+role);shutil.copy2(exe,dest);result['binaries'][role]=dict(path=str(dest),sha256=sha(dest.read_bytes()),persist_sha256=sha(data))
 finally:
  source.write_bytes(before);bench.write_bytes(old_bench);result['source_restored']=source.read_bytes()==before and bench.read_bytes()==old_bench;(p/'benchmark-provenance.json').write_text(json.dumps(result,indent=2)+'\n')
-assert result['source_restored']
+assert result['source_restored']and other=={str(f):sha(f.read_bytes())for f in Path('src').rglob('*.rs')if f!=source}
