@@ -1,0 +1,9 @@
+# Inline FTS token candidate
+
+Only row_tokens storage changes: Vec to SmallVec with eight inline Cow entries and unbounded ordinary heap spill. Token normalization, sorting, deduplication, posting edits, snapshot format, WAL, public Row and transaction rules stay unchanged. No small-string allocation or measured allocation-count claim.
+
+Before timing: existing FTS suite, explicit 0/1/7/8/9/17/64 token regression (including Unicode, cross-field duplication and posting updates), complete release suite, compiled spill/normalization negative, ordinary baseline and candidate binaries, and full-value smoke checks. Current initial FTS build predates the new regression; it is not evidence that the regression passed.
+
+Performance is not measured. Qualification must cover short and spilling long documents, rollback and INSERT targets, forward UPDATE/DELETE/COMMIT, token search and existing external controls. Freeze source, harness, order, sample counts and acceptance criteria before dispatch. No unchanged retry or acceptance of a partial matrix. Whole-engine and eight-peer objectives remain open.
+
+Frozen component matrix: 21 cases, three short-document native rollback targets (1k/10k/100k), thirteen short controls including INSERT, UPDATE, DELETE, COMMIT, durable/scalar writes, FTS queries and DuckDB filter; five long-document write/rollback controls. Two six-pair series, rotated cases and baseline/control/candidate roles, eight observations per process: 756 processes / 6048 observations. First require all 42 fresh matrix functional smokes. Each target window must have 6/6 positive pairs and median gain above absolute A/A. Each control must stay above minus max(2 percent, absolute A/A). Any failed window rejects the component. No full-engine or eight-peer qualification from this component alone.
