@@ -1194,8 +1194,72 @@ pub fn append_record(
             sync,
             log_bytes,
         ),
+        Pack::Batch { packs } => {
+            if let Some(Pack::InsertCols { collection, fields, cols, n, edges }) =
+                coalesce_insert_columns(packs)
+            {
+                append_insert_cols_v2(log, rec.r#gen, rec.next_id, &collection,
+                    &fields, &cols, n, &edges, buf, sync, log_bytes)
+            } else {
+                append_record_v1(log, rec, buf, sync, log_bytes)
+            }
+        }
         _ => append_record_v1(log, rec, buf, sync, log_bytes),
     }
+}
+
+// Only homogeneous append-only column packs can share one existing column record.
+// Keep the caller's original Batch intact for quota/accounting and undo semantics.
+fn coalesce_insert_columns(packs: &[Pack]) -> Option<Pack> {
+    if packs.len() < 2 { return None; }
+    let Pack::InsertCols { collection, fields, cols, .. } = &packs[0] else { return None; };
+    if fields.len() != cols.len()
+        || fields.iter().enumerate().any(|(i, f)| fields[..i].contains(f))
+    { return None; }
+    let mut total = 0u32;
+    for pack in packs {
+        let Pack::InsertCols { collection: name, fields: names, cols: values, n, edges } = pack
+            else { return None; };
+        if name != collection || names != fields || values.len() != cols.len()
+            || !edges.is_empty() || *n == 0 { return None; }
+        total = total.checked_add(*n)?;
+        for (expected, value) in cols.iter().zip(values) {
+            if std::mem::discriminant(expected) != std::mem::discriminant(value) { return None; }
+            let len = match value {
+                ColData::Text(v) => v.len(),
+                ColData::Int(v) | ColData::Time(v) => v.len(),
+                ColData::Float(v) => v.len(),
+                ColData::Bool(v) => v.len(),
+                ColData::Vec(v) => {
+                    // Existing column wire treats an empty vector as null. Batch MessagePack
+                    // can distinguish it, so retain the original path for this shape.
+                    if v.iter().flatten().any(|e| e.is_empty()) { return None; }
+                    v.len()
+                }
+                ColData::Null => *n as usize,
+            };
+            if len != *n as usize { return None; }
+        }
+    }
+    // Prototype: copy scalar slots and Arc owners, never the text/vector payloads.
+    // All shapes are validated before any allocation or output-file write.
+    let mut merged = cols.clone();
+    for pack in &packs[1..] {
+        let Pack::InsertCols { cols: values, .. } = pack else { unreachable!() };
+        for (dst, src) in merged.iter_mut().zip(values) {
+            match (dst, src) {
+                (ColData::Text(a), ColData::Text(b)) => a.extend_from_slice(b),
+                (ColData::Int(a), ColData::Int(b)) | (ColData::Time(a), ColData::Time(b)) => a.extend_from_slice(b),
+                (ColData::Float(a), ColData::Float(b)) => a.extend_from_slice(b),
+                (ColData::Bool(a), ColData::Bool(b)) => a.extend_from_slice(b),
+                (ColData::Vec(a), ColData::Vec(b)) => a.extend_from_slice(b),
+                (ColData::Null, ColData::Null) => {},
+                _ => unreachable!("validated column variants"),
+            }
+        }
+    }
+    Some(Pack::InsertCols { collection: collection.clone(), fields: fields.clone(),
+        cols: merged, n: total, edges: Vec::new() })
 }
 
 fn append_record_v1(
@@ -1324,7 +1388,7 @@ pub(crate) fn durable_sync(file: &File) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::io::AsRawFd;
-        let rc = unsafe { libc::fsync(file.as_raw_fd()) };
+        let rc = unsafe { libc::fdatasync(file.as_raw_fd()) };
         if rc == 0 {
             Ok(())
         } else {
@@ -3194,6 +3258,78 @@ mod wal_integrity_tests {
                     original.get(field).cloned().unwrap_or(Cell::Int(0))
                 );
             }
+        }
+    }
+
+    #[test]
+    fn column_batch_preserves_order_bits_and_existing_wire_replay() {
+        let part = |start: i64, n: u32| Pack::InsertCols {
+            collection: "docs".into(),
+            fields: ["text", "int", "float", "bool", "time", "vec", "null"].map(str::to_owned).to_vec(),
+            cols: vec![
+                ColData::Text((0..n).map(|i| format!("row-{}-世界\0", start + i as i64).into()).collect()),
+                ColData::Int((0..n).map(|i| start + i as i64).collect()),
+                ColData::Float((0..n).map(|i| if i == 0 { -0.0 } else { f64::from_bits(0x7ff8000000001234) }).collect()),
+                ColData::Bool((0..n).map(|i| i % 2 == 0).collect()),
+                ColData::Time((0..n).map(|i| -100 + start + i as i64).collect()),
+                ColData::Vec((0..n).map(|i| if i == 0 { Some(std::sync::Arc::from([-0.0f32, f32::from_bits(0x7fc01234), 1.0])) } else { None }).collect()),
+                ColData::Null,
+            ], n, edges: Vec::new(),
+        };
+        let packs = vec![part(10, 2), part(20, 1)];
+        let merged = coalesce_insert_columns(&packs).expect("compatible columns");
+        let Pack::InsertCols { cols, n, .. } = &merged else { unreachable!() };
+        assert_eq!(*n, 3);
+        let ColData::Int(ids) = &cols[1] else { unreachable!() };
+        assert_eq!(ids, &[10, 11, 20]);
+        let expected = rmp_serde::to_vec_named(&merged).unwrap();
+        let rec = LogRecord { r#gen: 17, next_id: 42, pack: Pack::Batch { packs } };
+        let original = rmp_serde::to_vec_named(&rec).unwrap();
+        with_log(|file| {
+            append_record(file, &rec, &mut Vec::new(), SyncMode::Normal, &mut 0).unwrap();
+            file.seek(SeekFrom::Start(0)).unwrap();
+            let mut raw = Vec::new(); file.read_to_end(&mut raw).unwrap();
+            assert!([LOG_MAGIC_V2[3], LOG_MAGIC_SPARSE[3]].contains(&raw[8]));
+            let mut replayed = Vec::new();
+            replay_log(file, 0, 0, |r| { replayed.push(r); Ok(()) }).unwrap();
+            assert_eq!(replayed.len(), 1);
+            assert_eq!((replayed[0].r#gen, replayed[0].next_id), (17, 42));
+            assert_eq!(rmp_serde::to_vec_named(&replayed[0].pack).unwrap(), expected);
+        });
+        assert_eq!(rmp_serde::to_vec_named(&rec).unwrap(), original, "quota input unchanged");
+    }
+
+    #[test]
+    fn column_batch_rejects_incompatible_shapes_without_mutation() {
+        let base = Pack::InsertCols { collection: "docs".into(), fields: vec!["x".into()],
+            cols: vec![ColData::Int(vec![1])], n: 1, edges: Vec::new() };
+        assert!(coalesce_insert_columns(&[base.clone(), base.clone()]).is_some());
+        let mut bad = Vec::new();
+        for mode in 0..8 {
+            let mut other = base.clone();
+            if let Pack::InsertCols { collection, fields, cols, n, edges } = &mut other {
+                match mode {
+                    0 => *collection = "other".into(),
+                    1 => fields[0] = "y".into(),
+                    2 => *n = 0,
+                    3 => *n = 2,
+                    4 => cols[0] = ColData::Time(vec![1]),
+                    5 => edges.push(Edge { rel: "link".into(), from: "a".into(), to: "b".into() }),
+                    6 => cols.clear(),
+                    _ => { fields.push("x".into()); cols.push(ColData::Int(vec![2])); },
+                }
+            }
+            bad.push(vec![base.clone(), other]);
+        }
+        bad.push(vec![base.clone(), Pack::Batch { packs: vec![base.clone()] }]);
+        bad.push(vec![base.clone()]);
+        let empty_vector = Pack::InsertCols { collection: "docs".into(), fields: vec!["v".into()],
+            cols: vec![ColData::Vec(vec![Some(std::sync::Arc::from([]))])], n: 1, edges: Vec::new() };
+        bad.push(vec![empty_vector.clone(), empty_vector]);
+        for packs in bad {
+            let before = rmp_serde::to_vec_named(&packs).unwrap();
+            assert!(coalesce_insert_columns(&packs).is_none());
+            assert_eq!(rmp_serde::to_vec_named(&packs).unwrap(), before);
         }
     }
 
