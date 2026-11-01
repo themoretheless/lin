@@ -3297,10 +3297,54 @@ impl Db {
                         if plan.filter.is_none() {
                             let uids = self.store.orders_user_id();
                             let totals = self.store.orders_total();
-                            let mut map: FxHashMap<Arc<str>, f64> = FxHashMap::default();
-                            for (uid, &tot) in uids.iter().zip(totals) {
-                                *map.entry(Arc::clone(uid)).or_insert(0.0) += tot;
-                            }
+                            let total_len = totals.len();
+                            let map = if total_len >= 8192 {
+                                let threads = std::thread::available_parallelism()
+                                    .map(|p| p.get())
+                                    .unwrap_or(1)
+                                    .min(8)
+                                    .min((total_len + 1023) / 1024);
+                                if threads > 1 {
+                                    let chunk_size = (total_len + threads - 1) / threads;
+                                    let thread_maps: Vec<FxHashMap<Arc<str>, f64>> = std::thread::scope(|scope| {
+                                        let mut handles = Vec::with_capacity(threads);
+                                        for chunk_idx in 0..threads {
+                                            let c_start = chunk_idx * chunk_size;
+                                            if c_start >= total_len {
+                                                break;
+                                            }
+                                            let c_end = (c_start + chunk_size).min(total_len);
+                                            handles.push(scope.spawn(move || {
+                                                let mut local_map: FxHashMap<Arc<str>, f64> = FxHashMap::default();
+                                                for i in c_start..c_end {
+                                                    *local_map.entry(Arc::clone(&uids[i])).or_insert(0.0) += totals[i];
+                                                }
+                                                local_map
+                                            }));
+                                        }
+                                        handles.into_iter().map(|h| h.join().unwrap()).collect()
+                                    });
+                                    let mut combined: FxHashMap<Arc<str>, f64> = FxHashMap::default();
+                                    for t_map in thread_maps {
+                                        for (k, v) in t_map {
+                                            *combined.entry(k).or_insert(0.0) += v;
+                                        }
+                                    }
+                                    combined
+                                } else {
+                                    let mut map: FxHashMap<Arc<str>, f64> = FxHashMap::default();
+                                    for (uid, &tot) in uids.iter().zip(totals) {
+                                        *map.entry(Arc::clone(uid)).or_insert(0.0) += tot;
+                                    }
+                                    map
+                                }
+                            } else {
+                                let mut map: FxHashMap<Arc<str>, f64> = FxHashMap::default();
+                                for (uid, &tot) in uids.iter().zip(totals) {
+                                    *map.entry(Arc::clone(uid)).or_insert(0.0) += tot;
+                                }
+                                map
+                            };
                             let mut entries: Vec<(Arc<str>, f64)> = map.into_iter().collect();
                             entries.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
                             return Ok(entries
@@ -3373,10 +3417,55 @@ impl Db {
                 && by_field.leaf() == Some("wing")
                 && plan.filter.is_none()
             {
-                let mut map: FxHashMap<Arc<str>, i64> = FxHashMap::default();
-                for w in self.store.docs_wing() {
-                    *map.entry(Arc::clone(w)).or_insert(0) += 1;
-                }
+                let wings = self.store.docs_wing();
+                let total_len = wings.len();
+                let map = if total_len >= 8192 {
+                    let threads = std::thread::available_parallelism()
+                        .map(|p| p.get())
+                        .unwrap_or(1)
+                        .min(8)
+                        .min((total_len + 1023) / 1024);
+                    if threads > 1 {
+                        let chunk_size = (total_len + threads - 1) / threads;
+                        let thread_maps: Vec<FxHashMap<Arc<str>, i64>> = std::thread::scope(|scope| {
+                            let mut handles = Vec::with_capacity(threads);
+                            for chunk_idx in 0..threads {
+                                let c_start = chunk_idx * chunk_size;
+                                if c_start >= total_len {
+                                    break;
+                                }
+                                let c_end = (c_start + chunk_size).min(total_len);
+                                handles.push(scope.spawn(move || {
+                                    let mut local_map: FxHashMap<Arc<str>, i64> = FxHashMap::default();
+                                    for i in c_start..c_end {
+                                        *local_map.entry(Arc::clone(&wings[i])).or_insert(0) += 1;
+                                    }
+                                    local_map
+                                }));
+                            }
+                            handles.into_iter().map(|h| h.join().unwrap()).collect()
+                        });
+                        let mut combined: FxHashMap<Arc<str>, i64> = FxHashMap::default();
+                        for t_map in thread_maps {
+                            for (k, v) in t_map {
+                                *combined.entry(k).or_insert(0) += v;
+                            }
+                        }
+                        combined
+                    } else {
+                        let mut map: FxHashMap<Arc<str>, i64> = FxHashMap::default();
+                        for w in wings {
+                            *map.entry(Arc::clone(w)).or_insert(0) += 1;
+                        }
+                        map
+                    }
+                } else {
+                    let mut map: FxHashMap<Arc<str>, i64> = FxHashMap::default();
+                    for w in wings {
+                        *map.entry(Arc::clone(w)).or_insert(0) += 1;
+                    }
+                    map
+                };
                 let mut entries: Vec<(Arc<str>, i64)> = map.into_iter().collect();
                 entries.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
                 return Ok(entries
@@ -4381,6 +4470,64 @@ impl Db {
             JoinLeftSource::Scan { len } => *len,
         };
         let names_arc: Arc<[String]> = names.clone().into();
+
+        if left_len >= 8192 {
+            let threads = std::thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(1)
+                .min(8)
+                .min((left_len + 1023) / 1024);
+            if threads > 1 {
+                let chunk_size = (left_len + threads - 1) / threads;
+                let thread_batches: Vec<RecordBatch> = std::thread::scope(|scope| {
+                    let mut handles = Vec::with_capacity(threads);
+                    for chunk_idx in 0..threads {
+                        let c_start = chunk_idx * chunk_size;
+                        if c_start >= left_len {
+                            break;
+                        }
+                        let c_end = (c_start + chunk_size).min(left_len);
+                        let source_ref = &source;
+                        let names_ref = &names;
+                        let names_arc_clone = names_arc.clone();
+                        handles.push(scope.spawn(move || {
+                            let mut local_batch = RecordBatch::with_capacity(names_arc_clone, c_end - c_start);
+                            for pos in c_start..c_end {
+                                let idx = match source_ref {
+                                    JoinLeftSource::Idxs(idxs) => idxs[pos],
+                                    JoinLeftSource::Scan { .. } => pos,
+                                };
+                                let Some(row) = self.store.get_by_idx(name, idx) else {
+                                    continue;
+                                };
+                                if need_filter
+                                    && let Some(pred) = filter
+                                    && !eval_pred(pred, row, now)
+                                {
+                                    continue;
+                                }
+                                push_project_batch_row(&mut local_batch, row, names_ref);
+                            }
+                            local_batch
+                        }));
+                    }
+                    handles.into_iter().map(|h| h.join().unwrap()).collect()
+                });
+                let mut batch = RecordBatch::empty(names_arc);
+                let total_rows: usize = thread_batches.iter().map(|b| b.n()).sum();
+                for col_i in 0..batch.cols.len() {
+                    batch.cols[col_i].reserve(total_rows);
+                }
+                for mut thread_batch in thread_batches {
+                    for (col_i, col) in thread_batch.cols.drain(..).enumerate() {
+                        batch.cols[col_i].extend(col);
+                    }
+                }
+                finish_batch(&mut batch, skip_n, explicit_take);
+                return Some(batch);
+            }
+        }
+
         let mut batch = RecordBatch::with_capacity(names_arc, left_len);
         let mut pos = 0usize;
         loop {
@@ -4631,7 +4778,7 @@ impl Db {
         };
 
         let names_arc: Arc<[String]> = names.to_vec().into();
-        let mut batch = RecordBatch::with_capacity(names_arc, n);
+        let mut batch = RecordBatch::with_capacity(names_arc.clone(), n);
 
         // Specialized: { id, users.email, total } — hottest bench / OLAP shape.
         let fast_id_email_total = plan.len() == 3
@@ -4642,6 +4789,139 @@ impl Db {
                     || right_fields.first().is_some_and(|f| f == "email")
             )
             && matches!(plan[2], JoinFieldPlan::Left(ref k) if k == "total");
+
+        let left_len = match &source {
+            JoinLeftSource::Idxs(idxs) => idxs.len(),
+            JoinLeftSource::Scan { len } => *len,
+        };
+
+        if left_len >= 8192 {
+            let threads = std::thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(1)
+                .min(8)
+                .min((left_len + 1023) / 1024);
+            if threads > 1 {
+                let chunk_size = (left_len + threads - 1) / threads;
+                let thread_batches: Vec<RecordBatch> = std::thread::scope(|scope| {
+                    let mut handles = Vec::with_capacity(threads);
+                    for chunk_idx in 0..threads {
+                        let c_start = chunk_idx * chunk_size;
+                        if c_start >= left_len {
+                            break;
+                        }
+                        let c_end = (c_start + chunk_size).min(left_len);
+                        let source_ref = &source;
+                        let probe_ref = &probe;
+                        let plan_ref = &plan;
+                        let names_arc_clone = names_arc.clone();
+                        let right_fields_ref = &right_fields;
+                        handles.push(scope.spawn(move || {
+                            let mut local_batch = RecordBatch::with_capacity(names_arc_clone, c_end - c_start);
+                            if fast_id_email_total {
+                                for pos in c_start..c_end {
+                                    let idx = match source_ref {
+                                        JoinLeftSource::Idxs(idxs) => idxs[pos],
+                                        JoinLeftSource::Scan { .. } => pos,
+                                    };
+                                    if idx >= n {
+                                        continue;
+                                    }
+                                    if let Some(min) = total_gt {
+                                        if orders_total[idx] <= min {
+                                            continue;
+                                        }
+                                    } else if need_row_filter && let Some(pred) = filter {
+                                        let Some(left_row) = self.store.get_by_idx("orders", idx) else {
+                                            continue;
+                                        };
+                                        if !eval_pred(pred, left_row, now) {
+                                            continue;
+                                        }
+                                    }
+                                    let uid = orders_uid[idx].as_ref();
+                                    let Some(ui) = probe_ref.get(uid).copied() else {
+                                        if left_join {
+                                            local_batch.cols[0].push(Cell::Text(Arc::clone(&orders_id[idx])));
+                                            local_batch.cols[1].push(Cell::Null);
+                                            local_batch.cols[2].push(Cell::Float(orders_total[idx]));
+                                        }
+                                        continue;
+                                    };
+                                    local_batch.cols[0].push(Cell::Text(Arc::clone(&orders_id[idx])));
+                                    local_batch.cols[1].push(Cell::Text(Arc::clone(&users_email[ui])));
+                                    local_batch.cols[2].push(Cell::Float(orders_total[idx]));
+                                }
+                            } else {
+                                for pos in c_start..c_end {
+                                    let idx = match source_ref {
+                                        JoinLeftSource::Idxs(idxs) => idxs[pos],
+                                        JoinLeftSource::Scan { .. } => pos,
+                                    };
+                                    if idx >= n {
+                                        continue;
+                                    }
+                                    if let Some(min) = total_gt {
+                                        if orders_total[idx] <= min {
+                                            continue;
+                                        }
+                                    } else if need_row_filter && let Some(pred) = filter {
+                                        let Some(left_row) = self.store.get_by_idx("orders", idx) else {
+                                            continue;
+                                        };
+                                        if !eval_pred(pred, left_row, now) {
+                                            continue;
+                                        }
+                                    }
+                                    let uid = orders_uid[idx].as_ref();
+                                    let right_i = probe_ref.get(uid).copied();
+                                    if right_i.is_none() && !left_join {
+                                        continue;
+                                    }
+                                    for (col_i, p) in plan_ref.iter().enumerate() {
+                                        let cell = match p {
+                                            JoinFieldPlan::Left(k) => match k.as_str() {
+                                                "id" => Cell::Text(Arc::clone(&orders_id[idx])),
+                                                "user_id" => Cell::Text(Arc::clone(&orders_uid[idx])),
+                                                "total" => Cell::Float(orders_total[idx]),
+                                                _ => self
+                                                    .store
+                                                    .get_by_idx("orders", idx)
+                                                    .and_then(|r| r.get(k).cloned())
+                                                    .unwrap_or(Cell::Null),
+                                            },
+                                            JoinFieldPlan::Right { out: _, idx: r_idx } => match right_i {
+                                                Some(ui) => match right_fields_ref.get(*r_idx).map(String::as_str) {
+                                                    Some("id") => Cell::Text(Arc::clone(&users_id[ui])),
+                                                    Some("email") => Cell::Text(Arc::clone(&users_email[ui])),
+                                                    _ => Cell::Null,
+                                                },
+                                                None => Cell::Null,
+                                            },
+                                        };
+                                        local_batch.cols[col_i].push(cell);
+                                    }
+                                }
+                            }
+                            local_batch
+                        }));
+                    }
+                    handles.into_iter().map(|h| h.join().unwrap()).collect()
+                });
+                let mut batch = RecordBatch::empty(names_arc);
+                let total_rows: usize = thread_batches.iter().map(|b| b.n()).sum();
+                for col_i in 0..batch.cols.len() {
+                    batch.cols[col_i].reserve(total_rows);
+                }
+                for mut thread_batch in thread_batches {
+                    for (col_i, col) in thread_batch.cols.drain(..).enumerate() {
+                        batch.cols[col_i].extend(col);
+                    }
+                }
+                finish_batch(&mut batch, skip_n, explicit_take);
+                return Some(batch);
+            }
+        }
 
         let mut pos = 0usize;
         if fast_id_email_total {
