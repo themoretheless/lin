@@ -7,6 +7,13 @@ def middle(xs):
 cases=load('cases.json');records=load('process-status.json');summary=load('summary.json');peers=load('peer-comparisons.json');q=load('qualification.json');meta=load('provenance.json');env=load('environment.json')
 assert len(cases)==len(set(cases))==67
 assert len(records)==2412 and {(r['round'],r['mode'],r['case'])for r in records}=={(i,m,c)for i in range(1,13)for m in ['baseline','control','candidate']for c in cases}
+expected_order=[]
+for round in range(1,13):
+ rotated=cases[round%67:]+cases[:round%67]
+ for index,case in enumerate(rotated):
+  roles=['baseline','control','candidate'];shift=(round+index)%3;roles=roles[shift:]+roles[:shift]
+  expected_order.extend((round,role,case)for role in roles)
+assert [(r['round'],r['mode'],r['case'])for r in records]==expected_order,'Case/role rotation changed'
 assert meta['source_restored']and meta['instrumentation']is False and meta['source_sha256']
 assert all(digest(f)==h for f,h in meta['source_sha256'].items())
 assert digest('benches/compare.rs')==meta['original_compare_sha256']
@@ -28,10 +35,17 @@ for r in smokes['runs']:
  d=json.loads((p/'local-smoke'/r['role']/r['case'].replace('/','_')/'run.json').read_text())
  assert d['status']=='complete'and len(d['cases'])==1 and d['cases'][0]['id']==r['case']and len(d['observations'])==1
  o=d['observations'][0];assert o['case']==r['case']and o['metric']=='wall'and o['operations']==1 and math.isfinite(float(o['value']))and float(o['value'])>0
-med={};rss={};total=0
+med={};rss={};total=0;run_ids=set()
 for r in records:
  assert r['exit_code']==0 and r['binary_sha256']==meta['binaries']['baseline'if r['mode']=='control'else r['mode']]['sha256']and r['glibc_tunables']==env['allocator_environment']['GLIBC_TUNABLES']
  name=r['case'].replace('/','_');base=p/f'{r["round"]:02}-{r["mode"]}';d=json.loads((base/name/'run.json').read_text());assert d['status']=='complete'and len(d['cases'])==1 and d['cases'][0]['id']==r['case']and len(d['observations'])==8
+ assert d['schema']==1 and d['environment']==dict(arch='x86_64',os='linux')
+ assert d['provenance']['samples']=='8'and d['provenance']['warmup_ns']=='0'
+ assert d['id']not in run_ids;run_ids.add(d['id'])
+ binary=meta['binaries']['baseline'if r['mode']=='control'else r['mode']]['path']
+ expected_command=['/usr/bin/time','-v','-o',str(base/(name+'-resource.txt')),'--',binary,'--filter',r['case'],'--samples','8','--max-iterations','1','--warmup-ms','0','--sample-ms','1','--output',str(base/name)]
+ assert r['command']==expected_command,'Measurement command differs from frozen protocol'
+
  vs=[]
  for o in d['observations']:
   assert o['case']==r['case']and o['operations']==1 and o['metric']=='wall'
