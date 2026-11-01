@@ -1,0 +1,50 @@
+name: linux-full-fsync
+on:
+  push:
+    branches: [codex/linux-full-fsync-ci]
+permissions:
+  contents: read
+jobs:
+  benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_TARGET_DIR: target/linux-full-fsync
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.96.0'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Verify frozen inputs
+        run: python3 -c "from pathlib import Path;import json,hashlib;m=json.loads(Path('benches/results/2026-11-01-linux-full-fsync/frozen.json').read_text());assert all(hashlib.sha256(Path(f).read_bytes()).hexdigest()==h for f,h in m.items())"
+      - name: Install syscall observer
+        run: sudo apt-get update && sudo apt-get install -y strace
+      - name: Full candidate release suite
+        run: python3 benches/results/2026-11-01-linux-full-fsync/test.py
+      - name: Build ordinary pair and missing barrier mutant
+        run: python3 benches/results/2026-11-01-linux-full-fsync/build.py
+      - name: Verify actual barriers and compiled negative
+        run: python3 benches/results/2026-11-01-linux-full-fsync/check-barrier.py
+      - name: Synthetic matrix and corruptions
+        run: python3 benches/results/2026-11-01-linux-full-fsync/test-protocol.py
+      - name: Forty fresh functional smokes
+        run: python3 benches/results/2026-11-01-linux-full-fsync/run.py --smoke
+      - name: All 720 fresh paired processes
+        run: python3 benches/results/2026-11-01-linux-full-fsync/run.py
+      - name: Analyze complete matrix
+        run: python3 benches/results/2026-11-01-linux-full-fsync/analyze.py
+      - name: Independent raw and source audit
+        run: python3 benches/results/2026-11-01-linux-full-fsync/verify.py
+      - name: Enforce unchanged component criteria
+        run: python3 benches/results/2026-11-01-linux-full-fsync/qualify.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: linux-full-fsync
+          path: benches/results/2026-11-01-linux-full-fsync/

@@ -1324,7 +1324,7 @@ pub(crate) fn durable_sync(file: &File) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::io::AsRawFd;
-        let rc = unsafe { libc::fdatasync(file.as_raw_fd()) };
+        let rc = unsafe { libc::fsync(file.as_raw_fd()) };
         if rc == 0 {
             Ok(())
         } else {
