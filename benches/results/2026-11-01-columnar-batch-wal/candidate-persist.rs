@@ -3282,7 +3282,22 @@ mod wal_integrity_tests {
         assert_eq!(*n, 3);
         let ColData::Int(ids) = &cols[1] else { unreachable!() };
         assert_eq!(ids, &[10, 11, 20]);
-        let expected = rmp_serde::to_vec_named(&merged).unwrap();
+        let fixed_expected = Pack::InsertCols {
+            collection: "docs".into(),
+            fields: ["text", "int", "float", "bool", "time", "vec", "null"].map(str::to_owned).to_vec(),
+            cols: vec![
+                ColData::Text(["row-10-世界\0", "row-11-世界\0", "row-20-世界\0"].map(Into::into).to_vec()),
+                ColData::Int(vec![10, 11, 20]),
+                ColData::Float(vec![-0.0, f64::from_bits(0x7ff8000000001234), -0.0]),
+                ColData::Bool(vec![true, false, true]),
+                ColData::Time(vec![-90, -89, -80]),
+                ColData::Vec(vec![Some(std::sync::Arc::from([-0.0f32, f32::from_bits(0x7fc01234), 1.0])), None,
+                    Some(std::sync::Arc::from([-0.0f32, f32::from_bits(0x7fc01234), 1.0]))]),
+                ColData::Null,
+            ], n: 3, edges: Vec::new(),
+        };
+        let expected = rmp_serde::to_vec_named(&fixed_expected).unwrap();
+        assert_eq!(rmp_serde::to_vec_named(&merged).unwrap(), expected, "independent fixed column oracle");
         let rec = LogRecord { r#gen: 17, next_id: 42, pack: Pack::Batch { packs } };
         let original = rmp_serde::to_vec_named(&rec).unwrap();
         with_log(|file| {
