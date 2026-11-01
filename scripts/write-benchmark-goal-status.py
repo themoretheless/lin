@@ -353,15 +353,17 @@ schema_local = read('benches/results/2026-11-01-transaction-schema-undo-fix/loca
 assert schema_probe['runtime_reproduced'] and schema_probe['source_restored'] and len(schema_probe['outcomes']) == 6
 assert all(not o['passes'] for o in schema_probe['outcomes'])
 assert schema_local['exit_code'] == 0 and schema_local['release_passed'] == 458 and schema_local['release_ignored'] == 2
+schema_linux = read('benches/results/2026-11-01-transaction-schema-undo-linux/frozen-audit.json')
+assert schema_linux['audit_complete'] and schema_linux['release_passed'] == 458 and schema_linux['runtime_negatives_rejected'] == 3
 lines += ['', (
-    '[Schema rollback: corrected locally](../benches/results/2026-11-01-transaction-schema-undo-fix/report.md): '
+    '[Schema rollback: Linux qualification passed](../benches/results/2026-11-01-transaction-schema-undo-linux/report.md): '
     'на точной базе21dcd7d81 воспроизведены три дефекта в6случаях: оставшаяся вставка, '
     'Store-схема и UNIQUE constraint после rollback. Core79a4cb837 сохраняет ранний undo prefix '
     'и один checkpoint для последующей части транзакции. Все458release tests/2ignored прошли; '
     'три новых теста покрывают27сценариев, включая смешанные префиксы, отказ commit и повторное использование ID. '
-    'Этот локальный результат не аттестует Linux или скорость. '
-    '[Linux qualification](https://github.com/themoretheless/lin/actions/runs/41250934914) проверяет '
-    'тот же исходник и три отдельно скомпилированных runtime negatives.'
+    '[Linux qualification](https://github.com/themoretheless/lin/actions/runs/41250934914) и независимый аудит '
+    'подтвердили458tests/2ignored, три отдельно скомпилированных runtime negatives, '
+    'исходники и восстановление после проверок. Измерений скорости и принятия всего engine здесь нет.'
 )]
 patch_attempt = read('benches/results/2026-11-01-update-patch-clone-elision-linux-attempt1/functional-audit.json')
 assert patch_attempt['audit_complete'] and patch_attempt['infrastructure_failure'] and patch_attempt['timing_processes'] == patch_attempt['timing_observations'] == 0

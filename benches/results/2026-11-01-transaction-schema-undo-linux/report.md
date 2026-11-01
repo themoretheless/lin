@@ -1,0 +1,9 @@
+# Transaction schema rollback: Linux qualification passed
+
+Run 41250934914 completed successfully on frozen source 18119ab943334a8b82d9753fe88b9ef40da4540b (runtime core79a4cb837). The independent auditor verified every frozen asset, complete runtime/test source manifests, unchanged dependencies, all 458 release tests / two ignored, and the exact source and failed-runtime assertions of three separately compiled negatives. Compiler: Rust1.96.0, Linux x86_64. Only exec.rs differs from corrected baseline21dcd7d81.
+
+The negatives lose the prefix journal, omit checkpoint promotion, or reverse checkpoint/prefix restoration. Each compiled and failed the intended regression test with exit101; source and tests were restored afterward. The three positive regression tests exercise27 cases covering explicit rollback, Drop, failed commit, repeated schema changes, both mixed append/delete prefix orders, metadata/constraint restoration, row lookup, generation, next_id and reuse of generated IDs.
+
+The auditor also verified six separately reproduced failures on exact baseline21dcd7d81 (macOS ARM64), retained in ../2026-11-01-transaction-schema-undo-probe/. The corrected algorithm retains the earlier undo prefix and one terminal checkpoint, restores the checkpoint before earlier events, and preserves ordinary RowUndo representation. This structurally bounds undo snapshots after promotion; memory usage was not measured.
+
+All raw files are archived with per-member SHA256 and verified extraction hashes. Initial local implementation logs remain labeled separately. This qualifies the exercised default-feature correctness scope; there is no timing, all-feature, universal-schema, power-loss or whole-eight-peer acceptance claim. The independent UPDATE clone-elision performance job is separate and remains based on the earlier runtime.
