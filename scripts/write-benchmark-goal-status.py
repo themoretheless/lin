@@ -456,6 +456,30 @@ lines += ['', (
     'ROLLBACK1/24; эти пробелы не закрыты победами в отдельном API-прогоне. '
     'Production adoption иполная цель восьми peers остаются открыты.'
 )]
+# Each component decision below comes from its complete frozen Linux matrix.
+for slug, label, processes, observations in [
+    ('rollback-index-upsert', 'Rollback index upsert', 504, 4032),
+    ('fts-inline-tokens', 'FTS inline tokens', 756, 6048),
+    ('fts-pending-transfer', 'FTS singleton pending transfer', 756, 6048),
+]:
+    directory = 'benches/results/2026-11-01-' + slug + '-linux/'
+    qualification = read(directory + 'qualification.json')
+    summary = read(directory + 'summary.json')
+    windows = [r for case in summary.values() for r in case.values()]
+    targets = [r for r in windows if r['target']]
+    controls = [r for r in windows if not r['target']]
+    assert qualification['measurement_complete'] and not qualification['component_gate_passes']
+    assert qualification['processes'] == processes and qualification['observations'] == observations
+    target_pass = sum(r['passes'] for r in targets)
+    failed_controls = sum(not r['passes'] for r in controls)
+    lines += ['', (
+        f'[{label}: rejected](../{directory}report.md): '
+        f'{processes} свежих процессов / {observations} наблюдений. '
+        f'Прошли {target_pass}/{len(targets)} целевых окон; '
+        f'провалены {failed_controls} контрольных окон. '
+        'Полная матрица сохранена; принятия или неизменённого перезапуска нет. '
+        'Это компонентные сравнения Lin с исходной версией, а не победы над внешними БД.'
+    )]
 output = root / 'docs/benchmark-goal-status-2026-10-27.md'
 output.write_text('\n'.join(lines) + '\n')
 # Never expose endpoint values or credentials in the status artifact.
