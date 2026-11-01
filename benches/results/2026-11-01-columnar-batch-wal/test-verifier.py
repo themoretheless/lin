@@ -1,4 +1,7 @@
 from pathlib import Path
+import sys
+sys.path.insert(0,str(Path.cwd()/'scripts'))
+from benchmark_role_balance import schedule,orders_from_records
 import json,hashlib,subprocess,tempfile,shutil
 p=Path(__file__).resolve().parent;sha=lambda b:hashlib.sha256(b).hexdigest();cases=json.loads((p/'benchmark-cases.json').read_text())
 with tempfile.TemporaryDirectory(prefix='lin-column-batch-verifier-')as td:
@@ -10,7 +13,7 @@ with tempfile.TemporaryDirectory(prefix='lin-column-batch-verifier-')as td:
   root=d/folder;root.mkdir();rows=[]
   for rnd in range(1,2 if smoke else 13):
    for i,c in enumerate(cases[rnd%24:]+cases[:rnd%24]):
-    roles=['baseline','candidate']if smoke else['baseline','control','candidate'];shift=(rnd+i)%len(roles)
+    roles=['baseline','candidate']if smoke else[x['role']for x in schedule(cases,['baseline','control','candidate'])if x['round']==rnd and x['workload']==c['id']];shift=0
     for role in roles[shift:]+roles[:shift]:
      name=f'{len(rows):04}';out=root/name;out.mkdir();b=m['binaries']['baseline'if role=='control'else role];samples=1 if smoke else 8;cmd=[b['path'],'--filter',c['id'],'--samples',str(samples),'--max-iterations','1','--warmup-ms','0','--sample-ms','1','--output',str(out)]
      data=dict(id=folder+name,status='complete',synthetic=True,cases=[dict(id=c['id'])],observations=[dict(case=c['id'],metric='wall',operations=1,availability=dict(state='available'),value=80 if role=='candidate'else 100)for _ in range(samples)])

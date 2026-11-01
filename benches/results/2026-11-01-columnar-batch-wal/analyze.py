@@ -1,11 +1,12 @@
 from pathlib import Path
+import sys
+sys.path.insert(0,str(Path.cwd()/'scripts'))
+from benchmark_role_balance import schedule,orders_from_records
 import json,math,statistics as st,hashlib,sys
 p=Path(sys.argv[1]).resolve()if len(sys.argv)>1 else Path(__file__).resolve().parent;root=p/'benchmark-measurement';cases=json.loads((p/'benchmark-cases.json').read_text());rows=json.loads((root/'process-status.json').read_text());assert len(cases)==24 and len(rows)==864
-expected=[]
-for repeat in range(1,13):
- for i,c in enumerate(cases[repeat%24:]+cases[:repeat%24]):
-  roles=['baseline','control','candidate'];shift=(repeat+i)%3;roles=roles[shift:]+roles[:shift];expected.extend((repeat,role,c['id'])for role in roles)
+plan=schedule(cases,['baseline','control','candidate']);expected=[(x['round'],x['role'],x['workload'])for x in plan]
 assert [(r['round'],r['role'],r['id'])for r in rows]==expected
+orders_from_records(rows,[c['id']for c in cases],['baseline','control','candidate'],'id')
 provenance=json.loads((p/'benchmark-provenance.json').read_text())
 med={};run_ids=set();total=0
 for r in rows:

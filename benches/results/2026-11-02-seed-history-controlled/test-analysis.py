@@ -1,4 +1,7 @@
 from pathlib import Path
+import sys
+sys.path.insert(0,str(Path.cwd()/'scripts'))
+from benchmark_role_balance import role_order,orders_from_records
 import tempfile,json,subprocess,shutil
 p=Path(__file__).resolve().parent;cases=json.loads((p/'cases.json').read_text());roles=json.loads((p/'roles.json').read_text());checks=[]
 with tempfile.TemporaryDirectory(prefix='lin-history-math-')as td:
@@ -7,8 +10,9 @@ with tempfile.TemporaryDirectory(prefix='lin-history-math-')as td:
  records=[]
  for rnd in range(1,13):
   for i,c in enumerate(cases[rnd%8:]+cases[:rnd%8]):
-   shift=(rnd+i)%5
-   for r in roles[shift:]+roles[:shift]:
+   original_index=next(j for j,x in enumerate(cases)if x['id']==c['id'])
+   for role_id in role_order(rnd,original_index,[x['id']for x in roles]):
+    r=next(x for x in roles if x['id']==role_id)
     name=f'{len(records):04}';out=root/name;out.mkdir();case=f"compare/seed_history_{r['mode']}_{c['operation']}_{c['size']}/{r['engine']}";v=80 if r['id']=='lin_grouped'else 100
     (out/'run.json').write_text(json.dumps(dict(id=name,status='complete',synthetic=True,cases=[dict(id=case)],observations=[dict(case=case,metric='wall',operations=1,availability=dict(state='available'),value=v)for _ in range(8)])));records.append(dict(round=rnd,workload=c['id'],role=r['id'],case=case,exit_code=0,output=name))
  status=root/'process-status.json';status.write_text(json.dumps(records))
@@ -25,4 +29,10 @@ with tempfile.TemporaryDirectory(prefix='lin-history-math-')as td:
    for o in x['observations']:o['value']=110
    f.write_text(json.dumps(x))
  run(True);summary=json.loads((root/'summary.json').read_text());assert all(r['lin_group_gain_percent']<0 and r['lin_positive_pairs']==0 and not r['six_positive_above_aa']for series in summary.values()for r in series.values());assert json.loads((root/'diagnostic-status.json').read_text())['performance_qualification']is False;checks.append('valid-regression-retained-without-adoption')
-(p/'test-analysis-status.json').write_text(json.dumps(dict(passed=True,synthetic=True,real_timings=False,processes=480,observations=3840,checks=checks),indent=2)+'\n');print('PASS history matrix math and five failure/regression checks')
+ for row in records:
+  if row['role']=='lin_null':
+   f=root/row['output']/'run.json';x=json.loads(f.read_text())
+   for o in x['observations']:o['value']=110
+   f.write_text(json.dumps(x))
+ run(True);summary=json.loads((root/'summary.json').read_text());assert all(not r['lin_null_band_passes']for series in summary.values()for r in series.values());checks.append('null-control-drift-reported-not-discarded')
+(p/'test-analysis-status.json').write_text(json.dumps(dict(passed=True,synthetic=True,real_timings=False,processes=576,observations=4608,checks=checks),indent=2)+'\n');print('PASS history matrix math and five failure/regression checks')

@@ -1,4 +1,7 @@
 from pathlib import Path
+import sys
+sys.path.insert(0,str(Path.cwd()/'scripts'))
+from benchmark_role_balance import role_order,orders_from_records
 import json,hashlib,math,re,struct,runpy
 p=Path(__file__).resolve().parent;q=p.parent/'2026-11-01-columnar-batch-wal';read=lambda f:json.loads((p/f).read_text());sha=lambda b:hashlib.sha256(b).hexdigest();frozen=read('frozen.json');assert all(sha(Path(f).read_bytes())==h for f,h in frozen.items())
 m=read('provenance.json');assert m['source_restored']and m['single_binary_for_all_modes']and sha(Path(m['binary']).read_bytes())==m['binary_sha256']and sha((p/'compare.rs').read_bytes())==m['harness_sha256']and sha(Path('src/persist.rs').read_bytes())==m['candidate_persist_sha256'];assert all(sha(Path(f).read_bytes())==h for f,h in m['other_source_sha256'].items())
@@ -25,8 +28,9 @@ for r in traces['cases']:
 cases=read('cases.json');roles=read('roles.json');records=read('measurement/process-status.json');expected=[]
 for rnd in range(1,13):
  for i,c in enumerate(cases[rnd%8:]+cases[:rnd%8]):
-  shift=(rnd+i)%5;expected.extend((rnd,c['id'],r['id'])for r in roles[shift:]+roles[:shift])
-assert len(records)==480 and [(r['round'],r['workload'],r['role'])for r in records]==expected
+  original_index=next(j for j,x in enumerate(cases)if x['id']==c['id']);expected.extend((rnd,c['id'],role_id)for role_id in role_order(rnd,original_index,[x['id']for x in roles]))
+assert len(records)==576 and [(r['round'],r['workload'],r['role'])for r in records]==expected
+orders_from_records(records,[c['id']for c in cases],[x['id']for x in roles],'workload')
 ids=set();med={}
 def median(values):
  v=sorted(values);n=len(v);return v[n//2]if n%2 else(v[n//2-1]+v[n//2])/2
@@ -45,10 +49,11 @@ for c in cases:
  for series,start in [('series1',1),('series2',7)]:
   pairs=[]
   for rnd in range(start,start+6):
-   a,b,g,s,t=[med[rnd,c['id'],role]for role in ['lin_baseline','lin_control','lin_grouped','sqlite_baseline','sqlite_control']];pairs.append(dict(round=rnd,lin_chunked_ns=a,lin_control_ns=b,lin_grouped_ns=g,sqlite_baseline_ns=s,sqlite_control_ns=t,lin_group_gain_percent=100*(1-g/a),lin_aa_percent=100*(1-b/a),sqlite_aa_percent=100*(1-t/s),chunked_lin_over_sqlite=a/s,grouped_lin_over_sqlite=g/s))
+   a,b,z,g,s,t=[med[rnd,c['id'],role]for role in ['lin_baseline','lin_control','lin_null','lin_grouped','sqlite_baseline','sqlite_control']];pairs.append(dict(round=rnd,lin_chunked_ns=a,lin_control_ns=b,lin_null_ns=z,lin_grouped_ns=g,sqlite_baseline_ns=s,sqlite_control_ns=t,lin_group_gain_percent=100*(1-g/a),lin_aa_percent=100*(1-b/a),lin_null_gain_percent=100*(1-z/a),sqlite_aa_percent=100*(1-t/s),chunked_lin_over_sqlite=a/s,grouped_lin_over_sqlite=g/s))
   r=summary[c['id']][series];assert r['pairs']==pairs;gain=median([x['lin_group_gain_percent']for x in pairs]);noise=median([abs(x['lin_aa_percent'])for x in pairs]);positive=sum(x['lin_group_gain_percent']>0 for x in pairs)
+  null_gain=median([x['lin_null_gain_percent']for x in pairs]);assert r['lin_null_gain_percent']==null_gain and r['lin_null_band_passes']==(null_gain>=-max(2,noise))
   assert r['lin_group_gain_percent']==gain and r['lin_absolute_aa_percent']==noise and r['lin_positive_pairs']==positive and r['six_positive_above_aa']==(positive==6 and gain>noise)
   for field,key in [('sqlite_aa_gain_percent','sqlite_aa_percent'),('chunked_lin_over_sqlite','chunked_lin_over_sqlite'),('grouped_lin_over_sqlite','grouped_lin_over_sqlite')]:assert r[field]==median([x[key]for x in pairs])
   assert r['sqlite_absolute_aa_percent']==median([abs(x['sqlite_aa_percent'])for x in pairs])
-status=read('measurement/diagnostic-status.json');assert status['complete']and status['processes']==480 and status['observations']==3840 and not status['performance_qualification']and not status['full_objective_achieved']
-(p/'independent-audit.json').write_text(json.dumps(dict(complete=True,processes=480,observations=3840,same_binary_verified=True,seed_values_and_f32_bits_verified=True,linux_setup_history_verified=True,performance_qualification=False,full_objective_achieved=False),indent=2)+'\n');print('PASS raw source, seed equivalence, setup traces, commands, observations and numerical reconstruction')
+status=read('measurement/diagnostic-status.json');assert status['complete']and status['processes']==576 and status['observations']==4608 and not status['performance_qualification']and not status['full_objective_achieved']
+(p/'independent-audit.json').write_text(json.dumps(dict(complete=True,processes=576,observations=4608,same_binary_verified=True,seed_values_and_f32_bits_verified=True,linux_setup_history_verified=True,performance_qualification=False,full_objective_achieved=False),indent=2)+'\n');print('PASS raw source, seed equivalence, setup traces, commands, observations and numerical reconstruction')

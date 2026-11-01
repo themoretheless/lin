@@ -1,4 +1,7 @@
 from pathlib import Path
+import sys
+sys.path.insert(0,str(Path.cwd()/'scripts'))
+from benchmark_role_balance import schedule,orders_from_records
 import json,hashlib,re,math,runpy
 p=Path(__file__).resolve().parent;sha=lambda b:hashlib.sha256(b).hexdigest();read=lambda f:json.loads((p/f).read_text())
 frozen=read('frozen-benchmark.json');assert all(sha(Path(f).read_bytes())==h for f,h in frozen.items())
@@ -13,12 +16,9 @@ functional=read('functional/status.json');assert functional['complete']and len(f
 legacy=read('legacy-results/status.json');oracle=read('legacy-oracle-negative/status.json');assert legacy['complete']and len(legacy['cases'])==2 and oracle['runtime_negative_caught']and oracle['wal_unchanged']
 assert all(r['legacy_full_values_verified']and r['embedding_f32_bits_verified']and r['duplicate_apply_noop']and r['crc_corruption_rejected']for r in legacy['cases'])
 lm=read('legacy-provenance.json');assert lm['legacy_reference']=='04749994b9ca7a090476b95401f0f7166d8b870a'and lm['sources_verified']and sha(Path(lm['binary']).read_bytes())==lm['binary_sha256']
-assert read('benchmark-smoke/status.json')['complete'];cases=read('benchmark-cases.json');rows=read('benchmark-measurement/process-status.json');expected=[]
-for rnd in range(1,13):
- for i,c in enumerate(cases[rnd%24:]+cases[:rnd%24]):
-  roles=['baseline','control','candidate'];s=(rnd+i)%3
-  expected.extend((rnd,role,c['id'])for role in roles[s:]+roles[:s])
+assert read('benchmark-smoke/status.json')['complete'];cases=read('benchmark-cases.json');rows=read('benchmark-measurement/process-status.json');plan=schedule(cases,['baseline','control','candidate']);expected=[(x['round'],x['role'],x['workload'])for x in plan]
 assert [(r['round'],r['role'],r['id'])for r in rows]==expected and len(rows)==864
+orders_from_records(rows,[c['id']for c in cases],['baseline','control','candidate'],'id')
 medians={};ids=set()
 def median(values):
  v=sorted(values);n=len(v);return v[n//2]if n%2 else(v[n//2-1]+v[n//2])/2

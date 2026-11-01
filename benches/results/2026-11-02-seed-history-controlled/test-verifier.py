@@ -1,4 +1,7 @@
 from pathlib import Path
+import sys
+sys.path.insert(0,str(Path.cwd()/'scripts'))
+from benchmark_role_balance import role_order,orders_from_records
 import tempfile,json,subprocess,hashlib,shutil
 p=Path(__file__).resolve().parent;q=p.parent/'2026-11-01-columnar-batch-wal';sha=lambda b:hashlib.sha256(b).hexdigest();cases=json.loads((p/'cases.json').read_text());roles=json.loads((p/'roles.json').read_text())
 with tempfile.TemporaryDirectory(prefix='lin-history-verifier-')as td:
@@ -21,8 +24,9 @@ with tempfile.TemporaryDirectory(prefix='lin-history-verifier-')as td:
  root=d/'measurement';root.mkdir();records=[]
  for rnd in range(1,13):
   for i,c in enumerate(cases[rnd%8:]+cases[:rnd%8]):
-   shift=(rnd+i)%5
-   for role in roles[shift:]+roles[:shift]:
+   original_index=next(j for j,x in enumerate(cases)if x['id']==c['id'])
+   for role_id in role_order(rnd,original_index,[x['id']for x in roles]):
+    role=next(x for x in roles if x['id']==role_id)
     name=f'{len(records):04}';out=root/name;out.mkdir();case=f"compare/seed_history_{role['mode']}_{c['operation']}_{c['size']}/{role['engine']}";cmd=[m['binary'],'--filter',case,'--samples','8','--max-iterations','1','--warmup-ms','0','--sample-ms','1','--output',str(out)]
     data=dict(id='synthetic-'+name,status='complete',synthetic=True,cases=[dict(id=case)],observations=[dict(case=case,metric='wall',operations=1,availability=dict(state='available'),value=80 if role['id']=='lin_grouped'else 100)for _ in range(8)])
     (out/'run.json').write_text(json.dumps(data));records.append(dict(round=rnd,workload=c['id'],role=role['id'],case=case,command=cmd,exit_code=0,binary_sha256=m['binary_sha256'],output=name))

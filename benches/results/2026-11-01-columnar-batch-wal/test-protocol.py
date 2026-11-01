@@ -1,4 +1,7 @@
 from pathlib import Path
+import sys
+sys.path.insert(0,str(Path.cwd()/'scripts'))
+from benchmark_role_balance import schedule,orders_from_records
 import json,subprocess,tempfile,shutil
 p=Path(__file__).resolve().parent;cases=json.loads((p/'benchmark-cases.json').read_text())
 with tempfile.TemporaryDirectory(prefix='lin-fts-matrix-')as td:
@@ -7,7 +10,7 @@ with tempfile.TemporaryDirectory(prefix='lin-fts-matrix-')as td:
  rows=[]
  for repeat in range(1,13):
   for i,c in enumerate(cases[repeat%24:]+cases[:repeat%24]):
-   roles=['baseline','control','candidate'];shift=(repeat+i)%3;roles=roles[shift:]+roles[:shift]
+   original_index=next(j for j,x in enumerate(cases)if x['id']==c['id']);roles=[x['role']for x in schedule(cases,['baseline','control','candidate'])if x['round']==repeat and x['workload']==c['id']]
    for role in roles:
     name=f'{len(rows):04}';out=root/name;out.mkdir();v=80 if role=='candidate'else 100
     data=dict(id=name,status='complete',cases=[dict(id=c['id'])],observations=[dict(case=c['id'],metric='wall',operations=1,availability=dict(state='available'),value=v)for _ in range(8)])
