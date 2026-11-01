@@ -1,0 +1,39 @@
+name: corrected-update-patch-correctness
+on:
+  push:
+    branches: [codex/corrected-update-patch-ci]
+permissions:
+  contents: read
+jobs:
+  correctness:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_TARGET_DIR: target/ci-corrected-update-patch
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Verify frozen runtime, tests and qualification scripts
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import json,hashlib
+          p=Path('benches/results/2026-11-01-corrected-update-patch')
+          for name,digest in json.loads((p/'frozen-inputs.json').read_text()).items():
+              assert hashlib.sha256(Path(name).read_bytes()).hexdigest()==digest,name
+          PY
+      - name: Full release suite and five compiled runtime negatives
+        run: python3 benches/results/2026-11-01-corrected-update-patch/qualify.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: corrected-update-patch-correctness
+          path: benches/results/2026-11-01-corrected-update-patch/
+          if-no-files-found: error
