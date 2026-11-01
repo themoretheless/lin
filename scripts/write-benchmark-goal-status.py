@@ -420,6 +420,28 @@ lines += ['', (
     'Нет A/A, Linux qualification или принятия полного engine; короткие capped samples ограничивают точность. '
     'Старые локальные цифры не используются как baseline относительного ускорения.'
 )]
+current_peers = read('benches/results/2026-11-01-corrected-cow-peer-refresh-local/audit.json')
+current_mssql = read('benches/results/2026-11-01-mssql-corrected-cow/functional-status.json')
+assert current_peers['summary']['read']['comparisons'] == 108 and current_peers['summary']['native']['comparisons'] == 15
+assert current_mssql['functional_raw_audit_complete'] and current_mssql['comparative_results_private']
+lines += ['', (
+    '[Current corrected COW available-peer refresh](../benches/results/2026-11-01-corrected-cow-peer-refresh-local/report.md): '
+    'macOS ARM64 + native ARM server containers/kernel6.8.0-117; '
+    '108/108read aggregate wins и324/324process comparisons; '
+    '15/15native insert aggregate wins и45/45process comparisons. '
+    'Минимальные aggregate ratios1.762× read и1.109× native insert, оба против DuckDB100k. '
+    'Все5184samples, полные values/columns/multiplicity, sentinels иочистка проверены; '
+    '76raw файлов сохранены сSHA256. Контракт prepared Rust vs Python/driver/network, '
+    'не Full durable equivalence и не причинный A/B относительно старых замеров. '
+    'Linux peer attempt41307182337 остановился до timings: MongoDB startup guard на kernel7.0.0-1017; '
+    'точный образ воспроизведён отдельной диагностикой, обход guard не применялся.'
+), '', (
+    '[Current MSSQL private raw audit](../benches/results/2026-11-01-mssql-corrected-cow/functional-status.json): '
+    'run41307276190, corrected runtime625bc7180,6reports/1512samples проверены независимо. '
+    'В репозитории только encrypted artifact ифункциональный статус; comparative outcomes приватны. '
+    'Функциональный успех не означает публично подтверждённое превосходство. '
+    'Kusto иполная source acceptance остаются открыты.'
+)]
 output = root / 'docs/benchmark-goal-status-2026-10-27.md'
 output.write_text('\n'.join(lines) + '\n')
 # Never expose endpoint values or credentials in the status artifact.
