@@ -908,11 +908,12 @@ impl<'a> Transaction<'a> {
         if self.committed {
             return Err(Error::runtime("transaction already committed"));
         }
+        // Discard unpublished output owners before editing live COW rows.
+        self.packs.clear();
         let undo = std::mem::replace(&mut self.undo, Undo::None);
         let cat = self.cat_backup.take();
         self.db.rollback(undo, cat);
         self.db.store.r#gen = self.base_generation;
-        self.packs.clear();
         self.committed = true;
         Ok(())
     }
@@ -926,11 +927,11 @@ impl<'a> Transaction<'a> {
 impl Drop for Transaction<'_> {
     fn drop(&mut self) {
         if !self.committed {
+            self.packs.clear();
             let undo = std::mem::replace(&mut self.undo, Undo::None);
             let cat = self.cat_backup.take();
             self.db.rollback(undo, cat);
             self.db.store.r#gen = self.base_generation;
-            self.packs.clear();
         }
     }
 }
@@ -2082,10 +2083,7 @@ impl Db {
                     match event {
                         RowUndo::Append(mark) => self.store.append_rollback(mark),
                         RowUndo::Update(collection, idx, row) => {
-                            if let Some(mut restored) = self.store.collection(&collection).get(idx).cloned() {
-                                row.apply(&mut restored);
-                                self.store.restore_row_owned(&collection, idx, restored);
-                            }
+                            self.store.restore_row_delta(&collection, idx, row);
                         }
                         RowUndo::Delete(collection, positions, rows) => {
                             self.store.restore_rows_at(&collection, &positions, &rows)
@@ -2098,10 +2096,7 @@ impl Db {
                     match event {
                         RowUndo::Append(mark) => self.store.append_rollback(mark),
                         RowUndo::Update(collection, idx, row) => {
-                            if let Some(mut restored) = self.store.collection(&collection).get(idx).cloned() {
-                                row.apply(&mut restored);
-                                self.store.restore_row_owned(&collection, idx, restored);
-                            }
+                            self.store.restore_row_delta(&collection, idx, row);
                         }
                         RowUndo::Delete(collection, positions, rows) => {
                             self.store.restore_rows_at(&collection, &positions, &rows)
@@ -6317,7 +6312,10 @@ impl RowDelta {
         }
         Self(edits)
     }
-    fn apply(self, row: &mut Row) {
+    pub(crate) fn touches_identity(&self) -> bool {
+        self.0.iter().any(|(key, _)| key == "id" || key == "uri")
+    }
+    pub(crate) fn apply(self, row: &mut Row) {
         for (key, value) in self.0 {
             match value {
                 Some(value) => {
@@ -9282,5 +9280,92 @@ mod preencoded_insert_tests {
         db.run_prepared(&prepared).unwrap();
         assert_eq!(PREENCODE_TEST_ATTEMPTS.with(|x| x.get()), 0);
         drop(db);
+    }
+}
+
+#[cfg(test)]
+mod rollback_row_ownership_tests {
+    use super::*;
+
+    fn map_address(row: &Row) -> usize {
+        (std::ops::Deref::deref(row) as *const BTreeMap<crate::RowKey, Cell>) as usize
+    }
+
+    #[test]
+    fn rollback_reuses_unheld_map_and_preserves_held_versions() {
+        for explicit in [false, true] {
+            for retain_result in [false, true] {
+                let mut db = Db::empty();
+                db.run(r#"insert docs {id:"d",uri:"fixture://d",title:"oldtoken",wing:"rag",body:"body"}"#).unwrap();
+                db.run("index docs [wing]").unwrap();
+                let before = db.store.get_by_id("docs", "d").unwrap().clone();
+                let generation = db.r#gen();
+                let current_address;
+                let held;
+                {
+                    let mut tx = db.transaction().unwrap();
+                    tx.execute(r#"update docs[id == "d"] cas each {title:"middle",wing:"sys"}"#).unwrap();
+                    let result = tx.run(r#"update docs[id == "d"] cas each {title:"newtoken",wing:"raw"}"#).unwrap();
+                    held = retain_result.then(|| result.rows[0].clone());
+                    drop(result);
+                    current_address = map_address(tx.db().store.get_by_id("docs", "d").unwrap());
+                    if explicit { tx.rollback().unwrap(); } else { drop(tx); }
+                }
+                let restored = db.store.get_by_id("docs", "d").unwrap();
+                assert_eq!(restored, &before);
+                assert_eq!(db.r#gen(), generation);
+                if let Some(held) = held {
+                    assert_eq!(held["title"].text(), Some("newtoken"));
+                    assert_eq!(held["wing"].text(), Some("raw"));
+                    assert_ne!(map_address(restored), current_address);
+                } else {
+                    assert_eq!(map_address(restored), current_address,
+                        "unpublished Packs and undo must not force a map clone");
+                }
+                let fts = &db.store.fts["docs"];
+                assert_eq!(fts.matches("oldtoken"), Some(vec![0]));
+                for token in ["middle", "newtoken"] {
+                    assert!(fts.matches(token).unwrap_or_default().is_empty());
+                }
+                assert_eq!(db.run(r#"docs | wing == "rag" | count"#).unwrap().scalar().unwrap(), Cell::Int(1));
+                assert_eq!(db.run(r#"docs | wing == "raw" | count"#).unwrap().scalar().unwrap(), Cell::Int(0));
+            }
+        }
+    }
+
+    #[test]
+    fn owned_delta_installs_row_before_identity_and_empty_map_rebuild() {
+        for populated_maps in [false, true] {
+            let mut store = crate::Store::empty("test/8");
+            let original = Row::from([
+                ("id".into(), Cell::text_arc("old-id")),
+                ("uri".into(), Cell::text_arc("old-uri")),
+                ("title".into(), Cell::text_arc("oldtoken")),
+                ("wing".into(), Cell::Null),
+            ]);
+            let patch = Row::from([
+                ("id".into(), Cell::text_arc("new-id")),
+                ("uri".into(), Cell::text_arc("new-uri")),
+                ("title".into(), Cell::text_arc("newtoken")),
+                ("extra".into(), Cell::Int(7)),
+            ]);
+            let delta = RowDelta::capture(&original, &patch, false);
+            let mut current = original.clone();
+            current.extend(patch);
+            current.ensure_shared();
+            store.collection_mut("docs").push(current);
+            if populated_maps { store.rebuild_row_maps(); }
+            let fts = crate::fts::FtsIndex::build(store.collection("docs"), &["title".into()]);
+            store.fts.insert("docs".into(), fts);
+            store.restore_row_delta("docs", 0, delta);
+            assert_eq!(store.get_by_id("docs", "old-id"), Some(&original));
+            assert!(store.get_by_id("docs", "new-id").is_none());
+            assert_eq!(store.get_by_uri("old-uri"), Some(&original));
+            assert!(store.get_by_uri("new-uri").is_none());
+            assert_eq!(store.docs_title_contains_count("oldtoken"), 1);
+            assert_eq!(store.docs_title_contains_count("newtoken"), 0);
+            assert_eq!(store.fts["docs"].matches("oldtoken"), Some(vec![0]));
+            assert!(store.fts["docs"].matches("newtoken").unwrap_or_default().is_empty());
+        }
     }
 }

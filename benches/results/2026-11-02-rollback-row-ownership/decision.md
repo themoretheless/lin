@@ -1,0 +1,7 @@
+# COW row ownership: correctness passed, performance unmeasured
+
+Default465passed/2ignored and extent-feature485passed/4ignored. Three compiled mutants fail the named ownership or identity-install assertions: retaining unpublished Pack owners, cloning the live Row, and rebuilding maps before installing the restored Row. Every source byte is restored and all full logs independently recounted. The separate byte-identical public ownership oracle passes on candidate and fails on unchanged baseline60e64559e at unheld map reuse; selected dependency versions match root Cargo.lock. Held results preserve their mutated versions, and explicit rollback/Drop restore exact rows, generation, FTS/index membership and identity/empty-map fallbacks.
+
+This source only changes unpublished owner lifetime and ownership of RowDelta application. The baseline full scalar and FTS remove/reinsert algorithms are retained. No previously rejected incremental index/FTS candidate is adopted. The initial duplicate discovery was stopped during dependency build, before tests or timings, and retained separately.
+
+No latency or peer benchmark has run on this candidate. Pointer identity proves avoided map replacement in the tested unheld case; it does not establish elapsed-time or RSS improvement. Full source and external-peer numerical gates remain binding. Main is unchanged. Next: frozen source pair, unchanged real operation timers, functional smokes, balanced raw comparisons and complete original control gates.

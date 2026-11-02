@@ -1,0 +1,85 @@
+   Compiling proc-macro2 v1.0.107
+   Compiling quote v1.0.47
+   Compiling unicode-ident v1.0.24
+   Compiling libc v0.2.189
+   Compiling shlex v2.0.1
+   Compiling find-msvc-tools v0.1.12
+   Compiling cc v1.4.5
+   Compiling cfg-if v1.0.4
+   Compiling serde_core v1.0.229
+   Compiling ring v0.17.14
+   Compiling autocfg v1.5.1
+   Compiling num-traits v0.2.19
+   Compiling zeroize v1.9.0
+   Compiling memchr v2.8.3
+   Compiling pin-project-lite v0.2.17
+   Compiling rustls-pki-types v1.15.1
+   Compiling getrandom v0.2.17
+   Compiling syn v3.0.5
+   Compiling untrusted v0.9.0
+   Compiling serde v1.0.229
+   Compiling zmij v1.0.23
+   Compiling futures-core v0.3.34
+   Compiling serde_derive v1.0.229
+   Compiling tokio v1.53.1
+   Compiling aho-corasick v1.1.5
+   Compiling crc32fast v1.5.1
+   Compiling rustls v0.23.44
+   Compiling regex-syntax v0.8.11
+   Compiling futures-sink v0.3.34
+   Compiling bytes v1.12.1
+   Compiling serde_json v1.0.151
+   Compiling tokio-util v0.7.19
+   Compiling rmp v0.8.15
+   Compiling regex-automata v0.4.18
+   Compiling rustls-webpki v0.103.15
+   Compiling syn v2.0.119
+   Compiling once_cell v1.21.4
+   Compiling itoa v1.0.18
+   Compiling slab v0.4.12
+   Compiling subtle v2.6.1
+   Compiling futures-task v0.3.34
+   Compiling futures-util v0.3.34
+   Compiling lin-derive v0.4.0 (/tmp/lin-index-stream-baseline-20261102/lin-derive)
+   Compiling rmp-serde v1.3.1
+   Compiling regex v1.13.1
+   Compiling tokio-stream v0.1.19
+   Compiling rustls-pemfile v2.2.0
+   Compiling memmap2 v0.9.11
+   Compiling rustc-hash v2.1.3
+   Compiling smallvec v1.16.1
+   Compiling lin v0.4.0 (/tmp/lin-index-stream-baseline-20261102)
+   Compiling lin-rollback-row-ownership-oracle v0.0.0 (/Users/themoretheless/.codex/worktrees/lin-rollback-fts-delta/lin/benches/results/2026-11-02-rollback-row-ownership/baseline-public-oracle)
+warning: unused dependency `lin`
+ --> Cargo.toml:8:1
+  |
+8 | lin = { path = "/tmp/lin-index-stream-baseline-20261102" }
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `cargo::unused_dependencies` is set to `warn` by default
+help: consider removing the dependency on `lin`
+help: to still use for development builds, move to `dev-dependencies`
+warning: `lin-rollback-row-ownership-oracle` (manifest) generated 1 warning
+    Finished `release` profile [optimized] target(s) in 1m 09s
+     Running unittests src/lib.rs (/tmp/lin-rollback-ownership-baseline-oracle-target-20261102/release/build/lin-rollback-row-ownership-oracle/68f549f1086ecbf5/out/lin_rollback_row_ownership_oracle-68f549f1086ecbf5)
+
+running 1 test
+test tests::rollback_reuses_unheld_map_and_preserves_held_versions ... FAILED
+
+failures:
+
+---- tests::rollback_reuses_unheld_map_and_preserves_held_versions stdout ----
+
+thread 'tests::rollback_reuses_unheld_map_and_preserves_held_versions' (11187458) panicked at src/lib.rs:37:21:
+assertion `left == right` failed: unpublished Packs and undo must not force a map clone
+  left: 4388005360
+ right: 4388023376
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    tests::rollback_reuses_unheld_map_and_preserves_held_versions
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--lib`
