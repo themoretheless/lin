@@ -3,10 +3,15 @@
 from pathlib import Path
 import collections
 import json
+import subprocess
 
 root = Path(__file__).resolve().parents[1]
 def read(relative):
-    return json.loads((root / relative).read_text())
+    path = root / relative
+    # Sparse worktrees can omit retained artifacts; use their exact committed blobs.
+    data = path.read_bytes() if path.is_file() else subprocess.check_output(
+        ['git', 'show', 'HEAD:' + relative], cwd=root)
+    return json.loads(data)
 base = 'benches/results/2026-10-27-durable-mutation-baseline-linux'
 summary = read(base + '/summary.json')
 qualification = read(base + '/qualification.json')
@@ -70,22 +75,22 @@ lines += [
     '## Воспроизведение сводки', '',
     '`python3 scripts/write-benchmark-goal-status.py` читает сохранённые JSON и проверяет количества/источники. Он не запускает СУБД и не заменяет независимый raw audit исходных экспериментов.']
 # Keep newer experiments separate from the historical production baseline above.
-zero = json.loads((root / 'benches/results/2026-10-27-wal-zero-full-engine-linux/independent-audit.json').read_text())
-warm = json.loads((root / 'benches/results/2026-10-27-incremental-owned-rollback/summary.json').read_text())
-alloc = json.loads((root / 'benches/results/2026-10-27-incremental-rollback-allocation/summary.json').read_text())
+zero = read('benches/results/2026-10-27-wal-zero-full-engine-linux/independent-audit.json')
+warm = read('benches/results/2026-10-27-incremental-owned-rollback/summary.json')
+alloc = read('benches/results/2026-10-27-incremental-rollback-allocation/summary.json')
 assert zero['audit_complete'] and zero['processes'] == 2268 and zero['observations'] == 18144
 assert not zero['source_candidate_qualified'] and zero['failed_target_windows'] == 9 and zero['failed_control_windows'] == 12
 assert zero['candidate_peer_counts']['sqlite_wal'] == dict(wins=18, comparisons=96)
 assert warm['diagnostic_gate_passes'] and not warm['full_engine_qualified'] and warm['processes'] == 36 and warm['observations'] == 3456
-rollback = json.loads((root / 'benches/results/2026-10-28-incremental-rollback-engine-linux/independent-audit.json').read_text())
+rollback = read('benches/results/2026-10-28-incremental-rollback-engine-linux/independent-audit.json')
 assert rollback['audit_complete'] and rollback['processes'] == 2412 and rollback['observations'] == 19296
 assert not rollback['source_candidate_qualified'] and rollback['failed_target_windows'] == 0 and rollback['failed_control_windows'] == 14
 assert rollback['candidate_peer_counts']['sqlite_wal'] == dict(wins=8, comparisons=96)
-direct_linux = json.loads((root / 'benches/results/2026-10-28-wal-direct-batch-full-engine-linux/independent-audit.json').read_text())
+direct_linux = read('benches/results/2026-10-28-wal-direct-batch-full-engine-linux/independent-audit.json')
 assert direct_linux['audit_complete'] and direct_linux['processes'] == 2268 and direct_linux['observations'] == 18144
 assert not direct_linux['source_candidate_qualified'] and direct_linux['failed_target_windows'] == 2 and direct_linux['failed_control_windows'] == 8
 assert direct_linux['cpu_component_gate_passes'] and direct_linux['candidate_peer_counts']['sqlite_wal'] == dict(wins=11, comparisons=96)
-batch = json.loads((root / 'benches/results/2026-10-28-wal-direct-batch/cpu-summary.json').read_text())
+batch = read('benches/results/2026-10-28-wal-direct-batch/cpu-summary.json')
 assert batch['cpu_gate_passes'] and not batch['full_engine_qualified'] and not batch['full_objective_achieved']
 assert alloc['allocation_audit_passed'] and alloc['processes'] == 6 and alloc['windows'] == 216 and not alloc['latency_qualified'] and not alloc['peak_rss_qualified']
 lines += [
