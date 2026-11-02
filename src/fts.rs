@@ -451,17 +451,17 @@ fn fts_texts<'a: 'b, 'b>(row: &'a Row, fields: &'b [String]) -> impl Iterator<It
 
 /// `text` lowercased, borrowed from `text` itself when lowering is a no-op.
 ///
-/// Uses SIMD-optimized ASCII handling via make_ascii_lowercase() which rustc
-/// compiles to SSE4/AVX2 instructions on x86_64 targets.
+/// Classifies ASCII case and non-ASCII bytes in one pass. Unicode keeps the
+/// existing per-character lowercase mapping.
 #[inline]
 pub(crate) fn lowercased<'a>(text: &'a str, scratch: &'a mut String) -> &'a str {
-    if text.is_ascii() {
-        // Fast path: check if already lowercase using byte-level SIMD detection
-        // The .any() iterator is auto-vectorized by rustc for contiguous memory
-        if !text.bytes().any(|b| b.is_ascii_uppercase()) {
-            return text;
-        }
-
+    let class = text.bytes().fold(0u8, |flags, byte| {
+        flags | (byte >> 7) | (u8::from(byte.is_ascii_uppercase()) << 1)
+    });
+    if class == 0 {
+        return text;
+    }
+    if class == 2 {
         scratch.clear();
         // make_ascii_lowercase() uses single-instruction conversion on modern CPUs:
         // x86_64: AND with 0xDF to preserve case + OR with 0x20 unconditionally
@@ -1035,6 +1035,25 @@ mod pending_order_tests {
         }
         let lower = "already lower 123";
         assert_eq!(lowercased(lower, &mut scratch).as_ptr(), lower.as_ptr());
+    }
+
+    #[test]
+    fn classified_lowering_matches_character_mapping_and_scan_boundaries() {
+        let mut scratch = String::new();
+        for n in 0..=257 {
+            for marker in ["A", "Z", "@", "[", "İ", "Σ", "Ё", "é", "🦔"] {
+                for position in [0, n / 2, n] {
+                    let input = format!("{}{}{}", "x".repeat(position), marker, "y".repeat(n - position));
+                    let expected: String = input.chars().flat_map(char::to_lowercase).collect();
+                    assert_eq!(lowercased(&input, &mut scratch), expected);
+                }
+            }
+        }
+        for character in (0..=0x10ffff).filter_map(char::from_u32) {
+            let input = character.to_string();
+            let expected: String = character.to_lowercase().collect();
+            assert_eq!(lowercased(&input, &mut scratch), expected, "U+{:04X}", character as u32);
+        }
     }
 
     #[test]
