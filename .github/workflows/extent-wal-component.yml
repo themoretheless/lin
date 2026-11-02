@@ -1,0 +1,47 @@
+name: extent-wal-component
+on:
+  push:
+    branches: [codex/extent-wal-component-ci]
+permissions:
+  contents: read
+jobs:
+  component:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.96.0'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> target/cow-shared-key-linux'
+          cache-on-failure: true
+      - name: Verify role balance
+        run: python3 scripts/test-benchmark-role-balance.py
+      - name: Reject corrupted measurement fixtures
+        run: python3 benches/results/2026-11-02-extent-wal-component/test-audit.py
+      - name: Full feature and default correctness; build single executable
+        run: python3 benches/results/2026-11-02-extent-wal-component/build.py
+      - name: First balanced series
+        run: python3 benches/results/2026-11-02-extent-wal-component/run.py 1
+      - name: Audit first series and SQLite FULL WAL observations
+        run: python3 benches/results/2026-11-02-extent-wal-component/verify.py 1
+      - name: Second balanced series
+        run: python3 benches/results/2026-11-02-extent-wal-component/run.py 2
+      - name: Audit second series and SQLite FULL WAL observations
+        run: python3 benches/results/2026-11-02-extent-wal-component/verify.py 2
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: extent-wal-component
+          path: benches/results/2026-11-02-extent-wal-component/
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: extent-wal-exact-linux-executable
+          path: /tmp/lin-extent-component-current
