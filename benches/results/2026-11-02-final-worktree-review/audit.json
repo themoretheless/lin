@@ -1,0 +1,123 @@
+{
+  "2026-11-02-cow-extent-full-engine-linux": {
+    "members_verified": 15244,
+    "decision": {
+      "source_gate_passes": false,
+      "protocol": "invariant external executable",
+      "earlier_failures_reclassified": false,
+      "adopted": false,
+      "full_objective_achieved": false,
+      "unchanged_retry": false
+    }
+  },
+  "2026-11-02-cow-extent-public-peers-linux": {
+    "members_verified": 15349,
+    "decision": {
+      "available_peer_gate_passes": false,
+      "upstream_source_gate_passes": false,
+      "adopted": false,
+      "full_objective_achieved": false,
+      "unchanged_retry": false
+    }
+  },
+  "update_clone_elision": {
+    "run": 41251433614,
+    "processes": 504,
+    "observations": 4032,
+    "passed_target_windows": 6,
+    "failed_windows": [
+      {
+        "case": "compare/filter_eq/duckdb",
+        "series": "series1",
+        "gain_percent": -11.683974195247082,
+        "aa_absolute_percent": 8.411600074677317,
+        "positive_pairs": 2,
+        "target": false
+      }
+    ],
+    "source_verified": true,
+    "frozen_inputs_verified": true,
+    "both_role_sources_verified": true,
+    "smokes": 28,
+    "historical_release_passed": 455,
+    "historical_compiled_negatives": 2,
+    "synthetic_protocol_rerun_passed": true
+  },
+  "batch_shape": {
+    "processes": 48,
+    "observations": 4608,
+    "source_matches_measured_candidate": true,
+    "series": [
+      {
+        "compare/insert_bulk_1k/lin": {
+          "gain_percent": 6.044891304870919,
+          "positive_pairs": 6
+        },
+        "compare/insert_bulk_1k/sqlite": {
+          "gain_percent": -1.1777090853576855,
+          "positive_pairs": 2
+        },
+        "compare/insert_bulk_10k/lin": {
+          "gain_percent": 5.111643115011681,
+          "positive_pairs": 6
+        },
+        "compare/insert_bulk_10k/sqlite": {
+          "gain_percent": -0.8976858206735614,
+          "positive_pairs": 2
+        },
+        "compare/durable_insert_1k/lin": {
+          "gain_percent": 21.256373035498594,
+          "positive_pairs": 4
+        },
+        "compare/durable_insert_1k/sqlite": {
+          "gain_percent": 2.360109774175063,
+          "positive_pairs": 4
+        },
+        "compare/durable_insert_10k/lin": {
+          "gain_percent": 3.1380219348594003,
+          "positive_pairs": 4
+        },
+        "compare/durable_insert_10k/sqlite": {
+          "gain_percent": 0.9195696788162462,
+          "positive_pairs": 4
+        }
+      },
+      {
+        "compare/insert_bulk_1k/lin": {
+          "gain_percent": 7.196016450395746,
+          "positive_pairs": 6
+        },
+        "compare/insert_bulk_1k/sqlite": {
+          "gain_percent": -1.0736973591736012,
+          "positive_pairs": 2
+        },
+        "compare/insert_bulk_10k/lin": {
+          "gain_percent": 3.5629726730078057,
+          "positive_pairs": 6
+        },
+        "compare/insert_bulk_10k/sqlite": {
+          "gain_percent": -0.8402403949818452,
+          "positive_pairs": 2
+        },
+        "compare/durable_insert_1k/lin": {
+          "gain_percent": 1.6140500649968343,
+          "positive_pairs": 3
+        },
+        "compare/durable_insert_1k/sqlite": {
+          "gain_percent": -1.6767035385062714,
+          "positive_pairs": 2
+        },
+        "compare/durable_insert_10k/lin": {
+          "gain_percent": 0.9861706692085186,
+          "positive_pairs": 6
+        },
+        "compare/durable_insert_10k/sqlite": {
+          "gain_percent": -0.7687408350418296,
+          "positive_pairs": 3
+        }
+      }
+    ],
+    "historical_workspace_exit": 0,
+    "decision": "retain: repeated native gain, durable 1k inconclusive; no current-main qualification"
+  }
+}
