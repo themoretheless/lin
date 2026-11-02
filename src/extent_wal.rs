@@ -25,6 +25,24 @@ fn validate_frames(frames:&[u8])->Result<(),Error> {
         Ok(())
     })?;Ok(())
 }
+fn read_extent_header<R:Read+Seek>(reader:&mut R,length:u64)->Result<(u64,u64,u64),Error> {
+    reader.seek(SeekFrom::Start(0)).map_err(io_err)?;let mut h=[0u8;HEADER_BYTES];reader.read_exact(&mut h).map_err(io_err)?;
+        if h[..8]!=FRAME_PREFIX||h[8]!=127||&h[9..17]!=MAGIC||h[41..60].iter().any(|b|*b!=0)||crate::crc::hardware_crc32c(&h[..60])!=u32::from_le_bytes(h[60..64].try_into().unwrap()) {return Err(io_err("corrupt extent header"));}
+        let physical=u64::from_le_bytes(h[17..25].try_into().unwrap());let logical=u64::from_le_bytes(h[25..33].try_into().unwrap());let sequence=u64::from_le_bytes(h[33..41].try_into().unwrap());
+        if physical!=length||!(DATA_START*2..=MAX_EXTENT).contains(&physical)||physical%4096!=0||logical>physical-DATA_START {return Err(io_err("invalid extent lengths"));}
+    Ok((physical,logical,sequence))
+}
+fn read_extent_region<R:Read+Seek>(reader:&mut R,logical:u64)->Result<Vec<u8>,Error> {
+    let mut bytes=vec![0;logical as usize];reader.seek(SeekFrom::Start(DATA_START)).map_err(io_err)?;reader.read_exact(&mut bytes).map_err(io_err)?;Ok(bytes)
+}
+fn replay_extent_region<R:Read+Seek>(reader:&mut R,logical:u64,min_generation:u64,mut apply:impl FnMut(crate::persist::LogRecord)->Result<(),Error>)->Result<usize,Error>{
+    let frames=read_extent_region(reader,logical)?;let mut applied=0;
+    for_each_wal_frame_raw(&frames,|raw,record|{
+        if raw[..4]!=*b"LIN\x06" {return Err(io_err("extent requires checksummed WAL frames"));}
+        if record.r#gen>min_generation{apply(record)?;applied+=1;}Ok(())
+    })?;Ok(applied)
+}
+
 #[cfg(test)]
 fn crash_checkpoint(stage: &str) {
     if std::env::var("LIN_EXTENT_TEST_CRASH_STAGE").ok().as_deref() != Some(stage) { return; }
@@ -61,21 +79,20 @@ impl ExtentWal {
         Self::from_file(file)
     }
     fn from_file(mut file:File)->Result<Self,Error> {
-        let length=file.metadata().map_err(io_err)?.len();file.seek(SeekFrom::Start(0)).map_err(io_err)?;let mut h=[0u8;HEADER_BYTES];file.read_exact(&mut h).map_err(io_err)?;
-        if h[..8]!=FRAME_PREFIX||h[8]!=127||&h[9..17]!=MAGIC||h[41..60].iter().any(|b|*b!=0)||crate::crc::hardware_crc32c(&h[..60])!=u32::from_le_bytes(h[60..64].try_into().unwrap()) {return Err(io_err("corrupt extent header"));}
-        let physical=u64::from_le_bytes(h[17..25].try_into().unwrap());let logical=u64::from_le_bytes(h[25..33].try_into().unwrap());let sequence=u64::from_le_bytes(h[33..41].try_into().unwrap());
-        if physical!=length||!(DATA_START*2..=MAX_EXTENT).contains(&physical)||physical%4096!=0||logical>physical-DATA_START {return Err(io_err("invalid extent lengths"));}
+        let length=file.metadata().map_err(io_err)?.len();
+        let (physical,logical,sequence)=read_extent_header(&mut file,length)?;
         let mut result=Self{file,physical,logical,sequence,poisoned:false};result.read_frames()?;Ok(result)
     }
     /// Caller must hold the directory's shared FENCE against checkpoint/reset.
     /// Uses a read-only descriptor and never acquires the writer's file lock.
     pub(crate) fn replay_read_only(path:&Path,min_generation:u64,apply:impl FnMut(crate::persist::LogRecord)->Result<(),Error>)->Result<usize,Error> {
-        let file=OpenOptions::new().read(true).open(path).map_err(io_err)?;
-        let mut view=Self::from_file(file)?;view.replay_records(min_generation,apply)
+        let mut file=OpenOptions::new().read(true).open(path).map_err(io_err)?;
+        let length=file.metadata().map_err(io_err)?.len();let (_,logical,_)=read_extent_header(&mut file,length)?;
+        replay_extent_region(&mut file,logical,min_generation,apply)
     }
     pub fn read_frames(&mut self)->Result<Vec<u8>,Error> {
         if self.poisoned {return Err(io_err("extent handle poisoned"));}
-        let mut bytes=vec![0;self.logical as usize];self.file.seek(SeekFrom::Start(DATA_START)).map_err(io_err)?;self.file.read_exact(&mut bytes).map_err(io_err)?;validate_frames(&bytes)?;Ok(bytes)
+        let bytes=read_extent_region(&mut self.file,self.logical)?;validate_frames(&bytes)?;Ok(bytes)
     }
     /// Publish existing frame bytes, then the checksummed boundary, then one sync.
     /// This is not an atomic-write guarantee: interrupted writes may fail recovery.
@@ -100,10 +117,8 @@ impl ExtentWal {
     }
     /// Replay committed records newer than a durable snapshot generation.
     pub fn replay_records(&mut self, min_generation:u64, mut apply:impl FnMut(crate::persist::LogRecord)->Result<(),Error>)->Result<usize,Error> {
-        let frames=self.read_frames()?;let mut applied=0;
-        crate::persist::for_each_wal_frame(&frames,|record| {
-            if record.r#gen>min_generation {apply(record)?;applied+=1;}Ok(())
-        })?;Ok(applied)
+        if self.poisoned{return Err(io_err("extent handle poisoned"));}
+        replay_extent_region(&mut self.file,self.logical,min_generation,&mut apply)
     }
     /// Publish an empty logical log only after the caller's snapshot is durable.
     /// Existing physical allocation is retained; this does not publish a snapshot.
@@ -148,6 +163,17 @@ mod tests {
         }
     }
     impl Drop for Temp {fn drop(&mut self){let _=std::fs::remove_dir_all(&self.0);}}
+    #[test]
+    fn replay_reads_header_and_logical_region_once_and_checks_snapshot_covered_crc(){
+        struct Counted {inner:std::io::Cursor<Vec<u8>>,bytes:usize}
+        impl Read for Counted {fn read(&mut self,out:&mut[u8])->std::io::Result<usize>{let n=self.inner.read(out)?;self.bytes+=n;Ok(n)}}
+        impl Seek for Counted {fn seek(&mut self,pos:SeekFrom)->std::io::Result<u64>{self.inner.seek(pos)}}
+        let tmp=Temp::new();let frame=tmp.frame();let mut image=vec![0;8192];image[..HEADER_BYTES].copy_from_slice(&header(8192,frame.len()as u64,1));image[DATA_START as usize..DATA_START as usize+frame.len()].copy_from_slice(&frame);
+        let mut reader=Counted{inner:std::io::Cursor::new(image.clone()),bytes:0};let (_,logical,_)=read_extent_header(&mut reader,8192).unwrap();let mut generations=Vec::new();
+        assert_eq!(replay_extent_region(&mut reader,logical,0,|r|{generations.push(r.r#gen);Ok(())}).unwrap(),1);assert_eq!(generations,vec![1]);assert_eq!(reader.bytes,HEADER_BYTES+frame.len());
+        image[DATA_START as usize+frame.len()-1]^=1;let mut reader=Counted{inner:std::io::Cursor::new(image),bytes:0};let (_,logical,_)=read_extent_header(&mut reader,8192).unwrap();
+        assert!(replay_extent_region(&mut reader,logical,u64::MAX,|_|panic!("covered corrupt frame applied")).is_err());
+    }
     #[test]
     fn prepared_columns_match_legacy_for_valid_and_stale_metadata(){
         let tmp=Temp::new();let rows=vec![Row::from([("id".into(),Cell::from("prepared")),("count".into(),Cell::Int(7))])];
