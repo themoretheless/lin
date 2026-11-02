@@ -1,0 +1,47 @@
+name: cow-shared-keys-linux
+on:
+  push:
+    branches: [codex/cow-shared-keys-linux-ci]
+permissions:
+  contents: read
+jobs:
+  component:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.96.0'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> target/cow-shared-key-linux'
+          cache-on-failure: true
+      - name: Check role balance
+        run: python3 scripts/test-benchmark-role-balance.py
+      - name: Full correctness and identical-harness builds
+        run: python3 benches/results/2026-11-02-cow-shared-keys-linux-component/build.py
+      - name: First balanced series
+        run: python3 benches/results/2026-11-02-cow-shared-keys-linux-component/run.py 1
+      - name: Audit first series
+        run: python3 benches/results/2026-11-02-cow-shared-keys-linux-component/verify.py 1
+      - name: Second balanced series
+        run: python3 benches/results/2026-11-02-cow-shared-keys-linux-component/run.py 2
+      - name: Audit second series
+        run: python3 benches/results/2026-11-02-cow-shared-keys-linux-component/verify.py 2
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cow-shared-keys-linux-component
+          path: benches/results/2026-11-02-cow-shared-keys-linux-component/
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cow-shared-keys-exact-linux-executables
+          path: |
+            /tmp/lin-shared-key-base
+            /tmp/lin-shared-key-cand
