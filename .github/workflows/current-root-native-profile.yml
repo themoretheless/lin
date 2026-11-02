@@ -16,14 +16,32 @@ jobs:
         with:
           python-version: '3.13'
       - name: Install software CPU sampling tools
-        run: sudo apt-get update -qq && sudo apt-get install -y linux-tools-generic
+        run: sudo apt-get update -qq && sudo apt-get install -y linux-tools-generic age
       - name: Enable sampling in this dedicated ephemeral runner
         run: sudo sysctl -w kernel.perf_event_paranoid=-1
+      - name: Verify credential-safe child environment and upload guards
+        run: python3 benches/results/2026-11-02-current-root-native-profile/test-safety.py
       - name: Profile the exact previously audited Linux executable
+        id: profile
         run: python3 benches/results/2026-11-02-current-root-native-profile/profile.py
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: ${{ success() && steps.profile.outcome == 'success' }}
         with:
           name: current-root-native-profile
           path: benches/results/2026-11-02-current-root-native-profile/
           if-no-files-found: error
+      - name: Encrypt diagnostic failure evidence
+        if: failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          tar -czf "$RUNNER_TEMP/root-profile-failure.tar.gz" benches/results/2026-11-02-current-root-native-profile
+          age -R .github/benchmark-recipients/mssql.age -o "$RUNNER_TEMP/root-profile-failure.tar.gz.age" "$RUNNER_TEMP/root-profile-failure.tar.gz"
+          rm "$RUNNER_TEMP/root-profile-failure.tar.gz"
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: current-root-native-profile-private-failure
+          path: ${{ runner.temp }}/root-profile-failure.tar.gz.age
+          if-no-files-found: warn

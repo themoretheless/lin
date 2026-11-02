@@ -1,0 +1,29 @@
+name: current-root-native-profile
+on:
+  push:
+    branches: [codex/current-root-native-profile-ci]
+permissions:
+  contents: read
+jobs:
+  profile:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install software CPU sampling tools
+        run: sudo apt-get update -qq && sudo apt-get install -y linux-tools-generic
+      - name: Enable sampling in this dedicated ephemeral runner
+        run: sudo sysctl -w kernel.perf_event_paranoid=-1
+      - name: Profile the exact previously audited Linux executable
+        run: python3 benches/results/2026-11-02-current-root-native-profile/profile.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: current-root-native-profile
+          path: benches/results/2026-11-02-current-root-native-profile/
+          if-no-files-found: error
