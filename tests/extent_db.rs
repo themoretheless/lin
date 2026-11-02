@@ -41,7 +41,17 @@ fn existing_legacy_log_is_never_converted(){
 #[test]
 #[ignore="subprocess helper used by acknowledged_writes_replay_without_drop_checkpoint"]
 fn extent_db_child(){
-    let path=std::env::var_os("LIN_EXTENT_DB_CHILD_PATH").expect("child-only path");let mut db=Db::open_extent(PathBuf::from(path),65536).unwrap().without_embedder();db.run(INSERT).unwrap();db.run(r#"update docs[id=="one"] cas each {title:"acknowledged"}"#).unwrap();assert_eq!(db.r#gen(),2);std::process::exit(86);
+    let path=std::env::var_os("LIN_EXTENT_DB_CHILD_PATH").expect("child-only path");
+    if let Some(ready)=std::env::var_os("LIN_EXTENT_DB_READ_READY") {
+        let reader=Db::open_extent_read(PathBuf::from(&path)).unwrap();let query=r#"docs | id == "one" | {title}"#;
+        let before=reader.run(query).unwrap().rows[0]["title"].text().unwrap().to_owned();
+        let ready=PathBuf::from(ready);let pending=ready.with_extension("pending");fs::write(&pending,b"ready").unwrap();fs::rename(pending,ready).unwrap();
+        let release=PathBuf::from(std::env::var_os("LIN_EXTENT_DB_READ_RELEASE").expect("reader release"));
+        let deadline=std::time::Instant::now()+std::time::Duration::from_secs(15);
+        while !release.exists(){assert!(std::time::Instant::now()<deadline,"reader child timeout");std::thread::sleep(std::time::Duration::from_millis(5));}
+        assert_eq!(reader.run(query).unwrap().rows[0]["title"].text(),Some(before.as_str()));std::process::exit(87);
+    }
+    let mut db=Db::open_extent(PathBuf::from(path),65536).unwrap().without_embedder();db.run(INSERT).unwrap();db.run(r#"update docs[id=="one"] cas each {title:"acknowledged"}"#).unwrap();assert_eq!(db.r#gen(),2);std::process::exit(86);
 }
 #[test]
 fn acknowledged_writes_replay_without_drop_checkpoint(){
@@ -60,4 +70,35 @@ fn extent_columnar_bulk_ships_every_row_and_survives_checkpoint(){
     for row in db.store.collection("docs") {let id=row["id"].text().unwrap();assert_eq!(rmp_serde::to_vec_named(row).unwrap(),rmp_serde::to_vec_named(memory.store.get_by_id("docs",id).unwrap()).unwrap());}
     db.checkpoint().unwrap();assert_eq!(db.stats().log_bytes,0);drop(db);
     let reopened=Db::open_extent(&dir,2*1024*1024).unwrap();assert_eq!(reopened.store.collection("docs").len(),4096);assert_eq!(reopened.store.get_by_id("docs","bulk-4095").unwrap()["title"].text(),Some("row 4095"));
+}
+
+#[test]
+fn extent_read_only_is_stable_beside_writer_and_does_not_modify_files(){
+    let t=Temp::new();let dir=t.path("read");let mut writer=Db::open_extent(&dir,65536).unwrap().without_embedder();writer.run(INSERT).unwrap();
+    let log=lin::persist::log_path(&dir);let head=lin::persist::head_path(&dir);let before_log=fs::read(&log).unwrap();let before_head=fs::read(&head).unwrap();
+    let reader=Db::open_extent_read(&dir).unwrap();let query=r#"docs | id == "one" | {title}"#;assert_eq!(reader.run(query).unwrap().rows[0]["title"].text(),Some("before"));
+    assert!(reader.run(r#"insert docs {id:"forbidden"}"#).is_err());assert_eq!(fs::read(&log).unwrap(),before_log);assert_eq!(fs::read(&head).unwrap(),before_head);
+    writer.run(r#"update docs[id=="one"] cas each {title:"later"}"#).unwrap();assert_eq!(reader.run(query).unwrap().rows[0]["title"].text(),Some("before"));
+    let fresh=Db::open_extent_read(&dir).unwrap();assert_eq!(fresh.run(query).unwrap().rows[0]["title"].text(),Some("later"));drop(fresh);drop(reader);writer.checkpoint().unwrap();
+    let after=Db::open_extent_read(&dir).unwrap();assert_eq!(after.run(query).unwrap().rows[0]["title"].text(),Some("later"));drop(after);
+}
+#[test]
+fn extent_read_only_rejects_corruption_without_rewriting_it(){
+    let t=Temp::new();let dir=t.path("corrupt-read");let mut db=Db::open_extent(&dir,65536).unwrap().without_embedder();db.run(INSERT).unwrap();drop(db);
+    let path=lin::persist::log_path(&dir);let mut bytes=fs::read(&path).unwrap();bytes[30]^=1;fs::write(&path,&bytes).unwrap();let head=fs::read(lin::persist::head_path(&dir)).unwrap();
+    assert!(Db::open_extent_read(&dir).is_err());assert_eq!(fs::read(path).unwrap(),bytes);assert_eq!(fs::read(lin::persist::head_path(&dir)).unwrap(),head);
+}
+#[cfg(unix)]
+#[test]
+fn separate_reader_process_holds_fence_and_exit_releases_checkpoint(){
+    struct Guard(std::process::Child);impl Drop for Guard{fn drop(&mut self){let _=self.0.kill();let _=self.0.wait();}}
+    let t=Temp::new();let dir=t.path("reader-process");let mut writer=Db::open_extent(&dir,65536).unwrap().without_embedder();writer.run(INSERT).unwrap();let ready=t.path("ready");let release=t.path("release");
+    let mut child=Guard(std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","extent_db_child","--ignored","--nocapture"]).env("LIN_EXTENT_DB_CHILD_PATH",&dir).env("LIN_EXTENT_DB_READ_READY",&ready).env("LIN_EXTENT_DB_READ_RELEASE",&release).stdout(std::process::Stdio::null()).spawn().unwrap());
+    let deadline=std::time::Instant::now()+std::time::Duration::from_secs(15);
+    while !ready.exists(){assert!(child.0.try_wait().unwrap().is_none(),"reader exited before ready");assert!(std::time::Instant::now()<deadline,"reader ready timeout");std::thread::sleep(std::time::Duration::from_millis(5));}
+    use std::os::fd::AsRawFd;
+    let fence=fs::OpenOptions::new().read(true).write(true).open(lin::persist::fence_path(&dir)).unwrap();
+    let denied=unsafe{libc::flock(fence.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)};let error=std::io::Error::last_os_error();assert_eq!(denied,-1,"checkpoint fence unexpectedly available");assert_eq!(error.kind(),std::io::ErrorKind::WouldBlock);
+    writer.run(r#"update docs[id=="one"] cas each {title:"new process value"}"#).unwrap();fs::write(release,b"release").unwrap();assert_eq!(child.0.wait().unwrap().code(),Some(87));
+    assert_eq!(unsafe{libc::flock(fence.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0);drop(fence);writer.checkpoint().unwrap();assert_eq!(writer.stats().log_bytes,0);
 }

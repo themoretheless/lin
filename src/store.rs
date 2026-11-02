@@ -1031,6 +1031,11 @@ impl Store {
         path: impl AsRef<Path>,
         cat: &Catalog,
     ) -> Result<(Self, std::fs::File, StoreOpenPhases), Error> {
+        Self::open_read_with_profiled_layout(path,cat,false)
+    }
+    pub(crate) fn open_read_with_profiled_layout(path:impl AsRef<Path>,cat:&Catalog,extent_read:bool)->Result<(Self,std::fs::File,StoreOpenPhases),Error>{
+        #[cfg(not(feature="experimental-extent-wal"))]
+        if extent_read{return Err(Error::runtime("extent feature disabled"));}
         let mut phases = StoreOpenPhases::default();
         let phase = Instant::now();
         let dir = path.as_ref();
@@ -1068,13 +1073,14 @@ impl Store {
         store.try_load_fts(dir, &fts_cat);
         let mut fts_ms = fts_t0.elapsed().as_secs_f64() * 1000.0;
         let phase = Instant::now();
-        let mut log = persist::open_log_read(dir)?;
         let min_gen = store.r#gen;
-        if let Some(log) = log.as_mut() {
-            let _ = persist::replay_log(log, min_gen, start, |rec| {
-                store.apply_record(&rec);
-                Ok(())
-            })?;
+        #[cfg(feature="experimental-extent-wal")]
+        if extent_read {
+            crate::extent_wal::ExtentWal::replay_read_only(&persist::log_path(dir),min_gen,|rec|{store.apply_record(&rec);Ok(())})?;
+        }
+        if !extent_read {
+            let mut log=persist::open_log_read(dir)?;
+            if let Some(log)=log.as_mut(){persist::replay_log(log,min_gen,start,|rec|{store.apply_record(&rec);Ok(())})?;}
         }
         phases.wal_ms = phase.elapsed().as_secs_f64() * 1000.0;
         let mut live = cat.clone();

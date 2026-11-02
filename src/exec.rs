@@ -1261,9 +1261,15 @@ impl Db {
     /// for readers. For in-process concurrent reads beside a writer, prefer
     /// [`Self::reader`].
     pub fn open_read(path: impl AsRef<Path>) -> Result<ReadDb, Error> {
+        Self::open_read_layout(path,false)
+    }
+    /// Read an experimental extent database under a shared checkpoint fence.
+    #[cfg(feature="experimental-extent-wal")]
+    pub fn open_extent_read(path:impl AsRef<Path>)->Result<ReadDb,Error>{Self::open_read_layout(path,true)}
+    fn open_read_layout(path:impl AsRef<Path>,extent_read:bool)->Result<ReadDb,Error>{
         let t0 = Instant::now();
         let catalog = crate::catalog::fixture();
-        let (store, lock, store_phases) = Store::open_read_with_profiled(path, &catalog)?;
+        let (store, lock, store_phases) = Store::open_read_with_profiled_layout(path, &catalog,extent_read)?;
         let mut catalog = catalog;
         store.merge_extras_into(&mut catalog);
         let embedder = Self::default_embedder(&catalog);

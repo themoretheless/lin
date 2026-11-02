@@ -67,6 +67,12 @@ impl ExtentWal {
         if physical!=length||!(DATA_START*2..=MAX_EXTENT).contains(&physical)||physical%4096!=0||logical>physical-DATA_START {return Err(io_err("invalid extent lengths"));}
         let mut result=Self{file,physical,logical,sequence,poisoned:false};result.read_frames()?;Ok(result)
     }
+    /// Caller must hold the directory's shared FENCE against checkpoint/reset.
+    /// Uses a read-only descriptor and never acquires the writer's file lock.
+    pub(crate) fn replay_read_only(path:&Path,min_generation:u64,apply:impl FnMut(crate::persist::LogRecord)->Result<(),Error>)->Result<usize,Error> {
+        let file=OpenOptions::new().read(true).open(path).map_err(io_err)?;
+        let mut view=Self::from_file(file)?;view.replay_records(min_generation,apply)
+    }
     pub fn read_frames(&mut self)->Result<Vec<u8>,Error> {
         if self.poisoned {return Err(io_err("extent handle poisoned"));}
         let mut bytes=vec![0;self.logical as usize];self.file.seek(SeekFrom::Start(DATA_START)).map_err(io_err)?;self.file.read_exact(&mut bytes).map_err(io_err)?;validate_frames(&bytes)?;Ok(bytes)
