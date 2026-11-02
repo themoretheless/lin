@@ -15,7 +15,7 @@ bench=root/'benches/compare.rs';oldbench=bench.read_bytes();sources={}
 for role in ['baseline','candidate']:
  sources[role]={n:subprocess.check_output(['git','show',m[role]+':'+n],cwd=root)for n in m['roles'][role]};assert {n:sha(b)for n,b in sources[role].items()}==m['roles'][role]
 assert sources['baseline'].keys()==sources['candidate'].keys()
-target=Path('/tmp/lin-rollback-fts-delta-target-20261102');env=dict(os.environ,CARGO_TARGET_DIR=str(target),CARGO_BUILD_JOBS='2');metadata=dict(binaries={},compiler=q['compiler'],features=m['features'],compiled_compare_sha256=m['harness_sha256'],original_compare_sha256=sha(oldbench),instrumentation=False,source_restored=False,commands=[],source_sha256=m['roles']['candidate'],peer_binary_source='baseline')
+target=Path('/tmp/lin-rollback-fts-delta-target-20261102').resolve();env=dict(os.environ,CARGO_TARGET_DIR=str(target),CARGO_BUILD_JOBS='2');metadata=dict(binaries={},compiler=q['compiler'],features=m['features'],compiled_compare_sha256=m['harness_sha256'],original_compare_sha256=sha(oldbench),instrumentation=False,source_restored=False,commands=[],source_sha256=m['roles']['candidate'],peer_binary_source='baseline')
 try:
  bench.write_bytes((p/'compare.rs').read_bytes())
  for role in ['baseline','candidate']:
