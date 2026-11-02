@@ -61,9 +61,12 @@ fn write_with_crash_split(file:&mut File, bytes:&[u8], stage:&str)->Result<(),Er
     Ok(())
 }
 impl ExtentWal {
+    pub(crate) fn validate_capacity(physical:u64)->Result<(),Error> {
+        if !(DATA_START*2..=MAX_EXTENT).contains(&physical)||physical%4096!=0 {return Err(io_err("invalid extent capacity"));}Ok(())
+    }
     /// Create a new file; never overwrite an existing database or WAL.
     pub fn create(path:&Path, physical:u64)->Result<Self,Error> {
-        if !(DATA_START*2..=MAX_EXTENT).contains(&physical)||physical%4096!=0 {return Err(io_err("invalid extent capacity"));}
+        Self::validate_capacity(physical)?;
         let mut file=OpenOptions::new().read(true).write(true).create_new(true).open(path).map_err(io_err)?;
         file.try_lock().map_err(io_err)?;
         let zeros=[0u8;64*1024];let mut remaining=physical;

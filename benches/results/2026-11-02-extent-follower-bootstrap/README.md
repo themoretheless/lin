@@ -1,0 +1,7 @@
+# Bootstrap an experimental extent follower
+
+Adds explicit bootstrap_extent_follower(backup, new_directory, capacity). Backup decoding and extent capacity validation precede directory creation. create_dir refuses every pre-existing target, including empty directories; the parent directory must exist. A writer lock protects initialization. A new fully written extent is created and synced first, then the imported snapshot (logical log offset reset to zero) and head are published through the existing durable writers. The extent and lock are released before ordinary explicit follower reopen. A racing writer can make reopen return locked; the completed target is retained, never overwritten.
+
+Ten integration tests passed, one child helper ignored. New checks restore custom collection schema and rows from backup, apply post-backup WAL, compare complete primary/follower row bytes, enforce follower mutation refusal, checkpoint, open read-only and reopen as a follower. Preservation checks retain existing legacy log/head/snapshot bytes, leave pre-existing empty directories untouched, and reject undecodable backups and invalid capacities before target creation.
+
+Failed initialization after directory creation is retained for inspection; there is no implicit cleanup or retry that overwrites it. Real power-loss/bootstrap crash qualification, automatic extent growth and standalone path-based export remain separate requirements. This source is not adopted; the running Linux performance experiment remains pinned to 20a408f6c and excludes these later changes.

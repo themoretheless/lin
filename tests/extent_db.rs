@@ -102,3 +102,26 @@ fn separate_reader_process_holds_fence_and_exit_releases_checkpoint(){
     writer.run(r#"update docs[id=="one"] cas each {title:"new process value"}"#).unwrap();fs::write(release,b"release").unwrap();assert_eq!(child.0.wait().unwrap().code(),Some(87));
     assert_eq!(unsafe{libc::flock(fence.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0);drop(fence);writer.checkpoint().unwrap();assert_eq!(writer.stats().log_bytes,0);
 }
+
+#[test]
+fn bootstrap_extent_follower_restores_schema_then_applies_new_wal(){
+    let t=Temp::new();let mut primary=Db::open_extent(t.path("primary-bootstrap"),65536).unwrap().without_embedder();
+    primary.run("col bootstrap_custom {id:text,value:i64}").unwrap();primary.run(r#"insert bootstrap_custom {id:"c",value:7}"#).unwrap();primary.run(INSERT).unwrap();let covered=primary.r#gen();
+    let backup=t.path("bootstrap.backup");primary.export_backup(&backup).unwrap();primary.run(r#"update bootstrap_custom[id=="c"] cas each {value:9}"#).unwrap();primary.run(r#"update docs[id=="one"] cas each {title:"after backup"}"#).unwrap();let frames=primary.export_wal_since(covered).unwrap();
+    let dir=t.path("bootstrapped");let mut follower=Db::bootstrap_extent_follower(&backup,&dir,65536).unwrap();assert!(follower.is_follower());assert_eq!(follower.r#gen(),covered);
+    assert_eq!(follower.run("bootstrap_custom | {value}").unwrap().rows[0]["value"].as_int(),Some(7));assert_eq!(follower.apply_wal(&frames).unwrap(),2);assert_eq!(follower.r#gen(),primary.r#gen());
+    for collection in ["docs","bootstrap_custom"]{assert_eq!(rmp_serde::to_vec_named(follower.store.collection(collection)).unwrap(),rmp_serde::to_vec_named(primary.store.collection(collection)).unwrap());}
+    assert!(follower.run(r#"insert bootstrap_custom {id:"forbidden",value:0}"#).is_err());follower.checkpoint().unwrap();drop(follower);
+    let reader=Db::open_extent_read(&dir).unwrap();assert_eq!(reader.run("bootstrap_custom | {value}").unwrap().rows[0]["value"].as_int(),Some(9));assert_eq!(reader.run(r#"docs | id=="one" | {title}"#).unwrap().rows[0]["title"].text(),Some("after backup"));drop(reader);
+    let reopened=Db::open_extent_follower(&dir,65536).unwrap();assert_eq!(reopened.r#gen(),primary.r#gen());assert_eq!(std::fs::metadata(lin::persist::log_path(&dir)).unwrap().len(),65536);
+}
+#[test]
+fn bootstrap_extent_refuses_existing_targets_and_invalid_input_before_creation(){
+    let t=Temp::new();let mut source=Db::open_extent(t.path("source"),65536).unwrap().without_embedder();source.run(INSERT).unwrap();let backup=t.path("backup");source.export_backup(&backup).unwrap();
+    let legacy=t.path("legacy-target");let mut db=Db::open(&legacy).unwrap().without_embedder();db.run(INSERT).unwrap();drop(db);
+    let paths=[lin::persist::log_path(&legacy),lin::persist::head_path(&legacy),lin::persist::snapshot_path(&legacy)];let before=paths.iter().map(|p|fs::read(p).unwrap()).collect::<Vec<_>>();
+    assert!(Db::bootstrap_extent_follower(&backup,&legacy,65536).is_err());assert_eq!(paths.iter().map(|p|fs::read(p).unwrap()).collect::<Vec<_>>(),before);
+    let empty=t.path("already-empty");fs::create_dir(&empty).unwrap();assert!(Db::bootstrap_extent_follower(&backup,&empty,65536).is_err());assert_eq!(fs::read_dir(empty).unwrap().count(),0);
+    let invalid=t.path("invalid-backup");fs::write(&invalid,b"not a backup").unwrap();let target=t.path("invalid-target");assert!(Db::bootstrap_extent_follower(&invalid,&target,65536).is_err());assert!(!target.exists());
+    let target=t.path("invalid-capacity-target");assert!(Db::bootstrap_extent_follower(&backup,&target,8193).is_err());assert!(!target.exists());
+}

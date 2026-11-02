@@ -1254,6 +1254,24 @@ impl Db {
         Self::open_follower(dir)
     }
 
+    /// Bootstrap an experimental extent follower into a new directory only.
+    /// Existing targets (including empty directories) are never overwritten.
+    #[cfg(feature="experimental-extent-wal")]
+    pub fn bootstrap_extent_follower(backup:impl AsRef<Path>,data_dir:impl AsRef<Path>,capacity:u64)->Result<Self,Error>{
+        let mut snapshot=crate::persist::read_backup(backup.as_ref())?;
+        crate::extent_wal::ExtentWal::validate_capacity(capacity)?;
+        let dir=data_dir.as_ref();std::fs::create_dir(dir).map_err(crate::persist::io_err)?;
+        let lock=crate::persist::acquire_writer_lock(dir)?;
+        let extent=crate::extent_wal::ExtentWal::create(&crate::persist::log_path(dir),capacity)?;
+        snapshot.log_offset=0;
+        crate::persist::write_snapshot(dir,&snapshot)?;
+        crate::persist::write_head(dir,&crate::persist::Head{r#gen:snapshot.r#gen,catalog_hash:snapshot.catalog_hash.clone(),embed_id:snapshot.embed_id.clone()})?;
+        drop(extent);drop(lock);
+        // A racing cooperating writer may acquire the lock here; reopen then fails
+        // safely, retaining the fully initialized target rather than overwriting it.
+        Self::open_extent_follower(dir,capacity)
+    }
+
     /// Open a durable data dir as a read-only snapshot (no log truncate / no head write).
     ///
     /// Uses a **shared FENCE** lock: compatible with a live writer. May see a
