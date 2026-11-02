@@ -856,6 +856,13 @@ impl Store {
         cat: &Catalog,
         opts: OpenMemOpts,
     ) -> Result<(Self, Persist, StoreOpenPhases), Error> {
+        Self::open_with_profiled_layout(path,cat,opts,None)
+    }
+    pub(crate) fn open_with_profiled_layout(
+        path:impl AsRef<Path>,cat:&Catalog,opts:OpenMemOpts,extent_capacity:Option<u64>,
+    )->Result<(Self,Persist,StoreOpenPhases),Error> {
+        #[cfg(not(feature="experimental-extent-wal"))]
+        if extent_capacity.is_some(){return Err(Error::runtime("extent feature disabled"));}
         let mut phases = StoreOpenPhases::default();
         let phase = Instant::now();
         let dir = path.as_ref();
@@ -904,6 +911,12 @@ impl Store {
         let mut fts_ms = fts_t0.elapsed().as_secs_f64() * 1000.0;
 
         let phase = Instant::now();
+        #[cfg(feature="experimental-extent-wal")]
+        let mut extent=if let Some(capacity)=extent_capacity {
+            if opts.sync!=persist::SyncMode::Full {return Err(Error::runtime("experimental extent requires Full sync"));}
+            let path=persist::log_path(dir);
+            Some(if path.exists(){crate::extent_wal::ExtentWal::open(&path)?}else{crate::extent_wal::ExtentWal::create(&path,capacity)?})
+        }else{None};
         let mut log = persist::open_log(dir)?;
         let min_gen = store.r#gen;
         // HEAD is refreshed on open/checkpoint, not every schema commit. Check
@@ -919,7 +932,7 @@ impl Store {
             .as_ref()
             .is_some_and(|head| head.r#gen < min_gen)
             && snap_catalog_hash.as_ref() == Some(&snapshot_live_hash);
-        let end = persist::replay_log(&mut log, min_gen, start, |rec| {
+        let mut apply_record=|rec:LogRecord| {
             store.apply_record(&rec);
             if replay_head.as_ref().is_some_and(|head| head.r#gen == rec.r#gen) {
                 let mut at_head = cat.clone();
@@ -927,8 +940,15 @@ impl Store {
                 expected_head_hash = Some(catalog_hash(&at_head));
             }
             Ok(())
-        })?;
-        persist::truncate_log(&mut log, end)?;
+        };
+        #[cfg(feature="experimental-extent-wal")]
+        let extent_replayed=if let Some(wal)=extent.as_mut(){wal.replay_records(min_gen,&mut apply_record)?;true}else{false};
+        #[cfg(not(feature="experimental-extent-wal"))]
+        let extent_replayed=false;
+        if !extent_replayed {
+            let end=persist::replay_log(&mut log,min_gen,start,&mut apply_record)?;
+            persist::truncate_log(&mut log,end)?;
+        }
         phases.wal_ms = phase.elapsed().as_secs_f64() * 1000.0;
 
         let phase = Instant::now();
@@ -983,7 +1003,16 @@ impl Store {
             encoder: None,
             sync: opts.sync,
             cold: opts.cold,
-            log_bytes: persist::log_len(dir).unwrap_or(0),
+            log_bytes: {
+                #[cfg(feature="experimental-extent-wal")]
+                if let Some(wal)=extent.as_ref(){wal.logical_bytes()}else{persist::log_len(dir).unwrap_or(0)}
+                #[cfg(not(feature="experimental-extent-wal"))]
+                {persist::log_len(dir).unwrap_or(0)}
+            },
+            #[cfg(feature="experimental-extent-wal")]
+            extent,
+            #[cfg(feature="experimental-extent-wal")]
+            extent_frame_buf:Vec::new(),
         };
         Ok((store, persist, phases))
     }
@@ -1238,6 +1267,18 @@ impl Store {
             pack,
         };
         let sync = persist.sync;
+        #[cfg(feature="experimental-extent-wal")]
+        if let Some(wal)=persist.extent.as_mut() {
+            if sync!=persist::SyncMode::Full{return Err(Error::runtime("experimental extent requires Full sync"));}
+            match prepared {
+                Some(persist::PreparedEncoding::Failed(error))=>return Err(error),
+                Some(persist::PreparedEncoding::Panicked(payload))=>std::panic::resume_unwind(payload),
+                _=>{}
+            }
+            wal.append_record(&rec,&mut persist.encode_buf,&mut persist.extent_frame_buf)?;
+            persist.log_bytes=wal.logical_bytes();persist.writes_since_snapshot+=1;return Ok(());
+        }
+
         {
             let Persist {
                 log,
@@ -1279,6 +1320,10 @@ impl Store {
         let _fence = persist::acquire_fence_exclusive(&persist.dir)?;
         // Ensure log content is fully durable before publishing snapshot/head.
         // Normal mode: this is the durability point for prior commits.
+        #[cfg(feature="experimental-extent-wal")]
+        if let Some(wal)=persist.extent.as_ref(){wal.flush_for_checkpoint()?;}
+        else {persist::durable_sync(&persist.log).or_else(|_|persist.log.sync_all()).map_err(persist::io_err)?;}
+        #[cfg(not(feature="experimental-extent-wal"))]
         persist::durable_sync(&persist.log)
             .or_else(|_| persist.log.sync_all())
             .map_err(persist::io_err)?;
@@ -1321,6 +1366,10 @@ impl Store {
         persist::write_snapshot_ref(&persist.dir, &snap_ref)?;
         persist::write_head(&persist.dir, &head)?;
         self.write_fts_files(&persist.dir)?;
+        #[cfg(feature="experimental-extent-wal")]
+        if let Some(wal)=persist.extent.as_mut(){wal.clear_after_durable_snapshot()?;}
+        else{persist::compact_log(&mut persist.log)?;}
+        #[cfg(not(feature="experimental-extent-wal"))]
         persist::compact_log(&mut persist.log)?;
         persist.writes_since_snapshot = 0;
         persist.log_bytes = 0;

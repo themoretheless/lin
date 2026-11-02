@@ -2,18 +2,22 @@
 //! Not wired into Db, migration, snapshots, checkpointing or replication.
 use std::{fs::{File, OpenOptions}, io::{Read, Seek, SeekFrom, Write}, path::Path};
 use crate::{Error, persist::{durable_sync, for_each_wal_frame_raw, io_err}};
-const MAGIC: &[u8;8] = b"LINEXT01";
+const MAGIC: &[u8;8] = b"LINEXT02";
+// A complete legacy checksum-envelope header, with a reserved unsupported codec.
+// Older checksummed WAL readers must reject it rather than truncate as JSON tail.
+const FRAME_PREFIX:[u8;8]=[b'L',b'I',b'N',6,56,0,0,0];
 const DATA_START: u64 = 4096;
 const HEADER_BYTES: usize = 64;
 const MAX_EXTENT: u64 = 256 * 1024 * 1024;
 
 /// A bounded, fully written extent. Appends always use Full durability.
 /// Any write/sync error poisons the handle; reopening must revalidate the file.
+#[derive(Debug)]
 pub struct ExtentWal { file: File, physical: u64, logical: u64, sequence: u64, poisoned: bool }
 fn header(physical:u64, logical:u64, sequence:u64)->[u8;HEADER_BYTES] {
-    let mut h=[0;HEADER_BYTES];h[..8].copy_from_slice(MAGIC);
-    h[8..16].copy_from_slice(&physical.to_le_bytes());h[16..24].copy_from_slice(&logical.to_le_bytes());h[24..32].copy_from_slice(&sequence.to_le_bytes());
-    let crc=crate::crc::hardware_crc32c(&h[..32]);h[32..36].copy_from_slice(&crc.to_le_bytes());h
+    let mut h=[0;HEADER_BYTES];h[..8].copy_from_slice(&FRAME_PREFIX);h[8]=127;h[9..17].copy_from_slice(MAGIC);
+    h[17..25].copy_from_slice(&physical.to_le_bytes());h[25..33].copy_from_slice(&logical.to_le_bytes());h[33..41].copy_from_slice(&sequence.to_le_bytes());
+    let crc=crate::crc::hardware_crc32c(&h[..60]);h[60..64].copy_from_slice(&crc.to_le_bytes());h
 }
 fn validate_frames(frames:&[u8])->Result<(),Error> {
     for_each_wal_frame_raw(frames,|raw,_| {
@@ -32,7 +36,7 @@ fn crash_checkpoint(stage: &str) {
 #[cfg(test)]
 fn write_with_crash_split(file:&mut File, bytes:&[u8], stage:&str)->Result<(),Error> {
     if std::env::var("LIN_EXTENT_TEST_CRASH_STAGE").ok().as_deref()==Some(stage) {
-        let middle=if stage=="mid_header" {20}else{bytes.len()/2};
+        let middle=if stage=="mid_header" {29}else{bytes.len()/2};
         file.write_all(&bytes[..middle]).map_err(io_err)?;crash_checkpoint(stage);
         file.write_all(&bytes[middle..]).map_err(io_err)?;
     } else { file.write_all(bytes).map_err(io_err)?; }
@@ -52,11 +56,14 @@ impl ExtentWal {
     /// Strictly validate the envelope and every committed frame before use.
     /// Invalid headers do not fall back to an older length or scan the padding.
     pub fn open(path:&Path)->Result<Self,Error> {
-        let mut file=OpenOptions::new().read(true).write(true).open(path).map_err(io_err)?;
+        let file=OpenOptions::new().read(true).write(true).open(path).map_err(io_err)?;
         file.try_lock().map_err(io_err)?;
-        let length=file.metadata().map_err(io_err)?.len();let mut h=[0u8;HEADER_BYTES];file.read_exact(&mut h).map_err(io_err)?;
-        if &h[..8]!=MAGIC||h[36..].iter().any(|b|*b!=0)||crate::crc::hardware_crc32c(&h[..32])!=u32::from_le_bytes(h[32..36].try_into().unwrap()) {return Err(io_err("corrupt extent header"));}
-        let physical=u64::from_le_bytes(h[8..16].try_into().unwrap());let logical=u64::from_le_bytes(h[16..24].try_into().unwrap());let sequence=u64::from_le_bytes(h[24..32].try_into().unwrap());
+        Self::from_file(file)
+    }
+    fn from_file(mut file:File)->Result<Self,Error> {
+        let length=file.metadata().map_err(io_err)?.len();file.seek(SeekFrom::Start(0)).map_err(io_err)?;let mut h=[0u8;HEADER_BYTES];file.read_exact(&mut h).map_err(io_err)?;
+        if h[..8]!=FRAME_PREFIX||h[8]!=127||&h[9..17]!=MAGIC||h[41..60].iter().any(|b|*b!=0)||crate::crc::hardware_crc32c(&h[..60])!=u32::from_le_bytes(h[60..64].try_into().unwrap()) {return Err(io_err("corrupt extent header"));}
+        let physical=u64::from_le_bytes(h[17..25].try_into().unwrap());let logical=u64::from_le_bytes(h[25..33].try_into().unwrap());let sequence=u64::from_le_bytes(h[33..41].try_into().unwrap());
         if physical!=length||!(DATA_START*2..=MAX_EXTENT).contains(&physical)||physical%4096!=0||logical>physical-DATA_START {return Err(io_err("invalid extent lengths"));}
         let mut result=Self{file,physical,logical,sequence,poisoned:false};result.read_frames()?;Ok(result)
     }
@@ -104,6 +111,14 @@ impl ExtentWal {
     /// Encode a record with the existing codecs and append its exact frame bytes.
     pub fn append_record(&mut self, record:&crate::persist::LogRecord, payload:&mut Vec<u8>, frame:&mut Vec<u8>)->Result<(),Error> {
         crate::persist::encode_extent_frame(record,payload,frame)?;self.append_frames(frame)
+    }
+    pub(crate) fn flush_for_checkpoint(&self)->Result<(),Error> {
+        if self.poisoned {return Err(io_err("extent handle poisoned"));}durable_sync(&self.file).map_err(io_err)
+    }
+    pub(crate) fn export_since(&self,min_generation:u64)->Result<Vec<u8>,Error> {
+        if self.poisoned{return Err(io_err("extent handle poisoned"));}
+        let mut reader=Self::from_file(self.file.try_clone().map_err(io_err)?)?;let frames=reader.read_frames()?;let mut out=Vec::new();
+        for_each_wal_frame_raw(&frames,|raw,record|{if record.r#gen>min_generation{out.extend_from_slice(raw);}Ok(())})?;Ok(out)
     }
     pub fn logical_bytes(&self)->u64 {self.logical}
     pub fn physical_bytes(&self)->u64 {self.physical}
@@ -200,7 +215,7 @@ mod ownership_tests {
         // Inject a real write error with a read-only replacement descriptor.
         wal.file=OpenOptions::new().read(true).open(&path).unwrap();
         assert!(wal.append_frames(&frame).is_err());assert!(wal.poisoned);
-        assert!(wal.append_frames(&[]).is_err());assert!(wal.read_frames().is_err());drop(wal);
+        assert!(wal.append_frames(&[]).is_err());assert!(wal.read_frames().is_err());assert!(wal.export_since(0).is_err());drop(wal);
         let mut clean=ExtentWal::open(&path).unwrap();assert_eq!(clean.logical_bytes(),0);assert!(clean.read_frames().unwrap().is_empty());drop(clean);
         let bytes=std::fs::read(&path).unwrap();assert!(crate::persist::for_each_wal_frame(&bytes,|_|Ok(())).is_err());
         std::fs::remove_file(path).unwrap();

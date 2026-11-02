@@ -1167,9 +1167,22 @@ impl Db {
     }
 
     pub fn open_with(path: impl AsRef<Path>, opts: OpenOpts) -> Result<Self, Error> {
+        Self::open_with_layout(path,opts,None)
+    }
+    /// Experimental Full-sync fixed-extent WAL. Requires the explicit extent API on reopen.
+    /// Refuses existing legacy logs; automatic conversion is not performed.
+    #[cfg(feature="experimental-extent-wal")]
+    pub fn open_extent(path:impl AsRef<Path>,capacity:u64)->Result<Self,Error>{
+        Self::open_with_layout(path,OpenOpts::default(),Some(capacity))
+    }
+    #[cfg(feature="experimental-extent-wal")]
+    pub fn open_extent_follower(path:impl AsRef<Path>,capacity:u64)->Result<Self,Error>{
+        let mut db=Self::open_extent(path,capacity)?;db.follower=true;Ok(db)
+    }
+    fn open_with_layout(path:impl AsRef<Path>,opts:OpenOpts,extent_capacity:Option<u64>)->Result<Self,Error>{
         let t0 = Instant::now();
         let catalog = crate::catalog::fixture();
-        let (store, persist, store_phases) = Store::open_with_profiled(path, &catalog, opts)?;
+        let (store, persist, store_phases) = Store::open_with_profiled_layout(path, &catalog, opts,extent_capacity)?;
         let mut catalog = catalog;
         store.merge_extras_into(&mut catalog);
         let embedder = Self::default_embedder(&catalog);
@@ -1342,6 +1355,8 @@ impl Db {
         let Some(p) = self.persist.as_ref() else {
             return Ok(Vec::new());
         };
+        #[cfg(feature="experimental-extent-wal")]
+        if let Some(wal)=p.extent.as_ref(){return wal.export_since(since);}
         crate::persist::export_wal_since(&p.dir, since)
     }
 
@@ -1391,6 +1406,12 @@ impl Db {
                 for (raw, _) in &to_apply {
                     raw_buf.extend_from_slice(raw);
                 }
+                #[cfg(feature="experimental-extent-wal")]
+                if let Some(wal)=p.extent.as_mut(){
+                    if p.sync!=SyncMode::Full{return Err(Error::runtime("experimental extent requires Full sync"));}
+                    wal.append_frames(&raw_buf)?;p.log_bytes=wal.logical_bytes();
+                }else{crate::persist::append_raw_frames(&mut p.log,&raw_buf,p.sync,&mut p.log_bytes)?;}
+                #[cfg(not(feature="experimental-extent-wal"))]
                 crate::persist::append_raw_frames(&mut p.log, &raw_buf, p.sync, &mut p.log_bytes)?;
                 p.writes_since_snapshot += to_apply.len() as u32;
             }
@@ -1482,7 +1503,11 @@ impl Db {
         let log_offset = self
             .persist
             .as_ref()
-            .and_then(|p| p.log.metadata().ok().map(|m| m.len()))
+            .and_then(|p| {
+                #[cfg(feature="experimental-extent-wal")]
+                if let Some(wal)=p.extent.as_ref(){return Some(wal.logical_bytes());}
+                p.log.metadata().ok().map(|m|m.len())
+            })
             .unwrap_or(0);
         let snap = self.store.capture_snapshot_at(hash, log_offset);
         crate::persist::write_backup(path.as_ref(), &snap)

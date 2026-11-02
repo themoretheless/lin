@@ -338,6 +338,10 @@ pub struct OpenMemOpts {
 pub struct Persist {
     pub dir: PathBuf,
     pub log: File,
+    #[cfg(feature = "experimental-extent-wal")]
+    pub(crate) extent: Option<crate::extent_wal::ExtentWal>,
+    #[cfg(feature = "experimental-extent-wal")]
+    pub(crate) extent_frame_buf: Vec<u8>,
     /// Advisory exclusive flock on `LOCK` — released when Persist drops.
     pub lock: File,
     pub(crate) lock_owner_pid: u32,
