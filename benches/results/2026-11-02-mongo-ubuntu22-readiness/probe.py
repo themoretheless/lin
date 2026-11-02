@@ -8,6 +8,13 @@ def kernel_affected(release):
     if not match or 'rc'in release:raise ValueError('Unrecognized or prerelease kernel')
     return (6,19,0)<=tuple(map(int,match.groups()))<(7,0,14)
 
+def database_name(owner):
+    token=owner.rsplit('-',1)[-1]
+    assert re.fullmatch(r'[0-9a-f]{32}',token),'Expected owned UUID suffix'
+    name='lin_ready_'+token
+    assert len(name.encode())<=63
+    return name
+
 def main():
     status=dict(image=IMAGE,host=platform.platform(),kernel_release=platform.release(),benchmark_timings=0,ready=False,attempts=[],cleanup_verified=False)
     cid=None;owner='lin-mongo-ubuntu22-'+uuid.uuid4().hex
@@ -18,13 +25,14 @@ def main():
         status['docker_version']=json.loads(subprocess.check_output(['docker','version','--format','{{json .}}'],text=True))
         (p/'cpuinfo.txt').write_text(Path('/proc/cpuinfo').read_text())
         from pymongo import MongoClient
+        from pymongo.errors import ConnectionFailure
         subprocess.run(['docker','pull',IMAGE],check=True)
         cid=subprocess.check_output(['docker','run','-d','--name',owner,'--label','lin.benchmark.owner='+owner,'-p','127.0.0.1:27029:27017','--tmpfs','/data/db:rw,size=2g',IMAGE,'--bind_ip_all','--wiredTigerCacheSizeGB','0.25'],text=True).strip()
         for i in range(30):
             client=MongoClient('mongodb://127.0.0.1:27029',serverSelectionTimeoutMS=1000)
             try:
-                client.admin.command('ping')
-                db=client['lin_readiness_'+owner.replace('-','_')]
+                client.admin.command('ping');status['ping_verified']=True
+                db=client[database_name(owner)]
                 try:
                     result=db.docs.insert_one({'_id':'probe','text':'ready','n':17})
                     assert result.inserted_id=='probe'
@@ -34,11 +42,14 @@ def main():
                     status['server_version']=client.admin.command('buildInfo')['version']
                     status['ready']=True;status['crud_verified']=True;break
                 finally:client.drop_database(db.name)
-            except Exception as e:status['attempts'].append(dict(attempt=i,error=str(e)))
+            except ConnectionFailure as e:status['attempts'].append(dict(attempt=i,error=str(e)))
             finally:client.close()
             state=json.loads(subprocess.check_output(['docker','inspect',cid],text=True))[0]['State']
             if not state['Running']:break
             time.sleep(1)
+    except Exception as error:
+        status['error_type']=type(error).__name__;status['error']=str(error)
+        raise
     finally:
         if cid:
             inspect=json.loads(subprocess.check_output(['docker','inspect',cid],text=True))[0]

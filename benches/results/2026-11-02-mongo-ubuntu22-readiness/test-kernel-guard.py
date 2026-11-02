@@ -8,4 +8,12 @@ for release in ['unknown','7.0.14-rc1']:
     try:module.kernel_affected(release)
     except ValueError:pass
     else:raise AssertionError(release)
-print(json.dumps(dict(kernel_boundaries=8,unknown_or_prerelease_rejected=2,docker_started=False,benchmark_timings=0)))
+for token in ['0'*32,'a'*32,'0123456789abcdef'*2]:
+    owner='lin-mongo-ubuntu22-'+token
+    assert len(owner.replace('-','_'))+len('lin_readiness_')==65
+    assert module.database_name(owner)=='lin_ready_'+token and len(module.database_name(owner))==42
+for owner in ['bad-owner','lin-mongo-ubuntu22-'+'f'*33]:
+    try:module.database_name(owner)
+    except AssertionError:pass
+    else:raise AssertionError(owner)
+print(json.dumps(dict(kernel_boundaries=8,unknown_or_prerelease_rejected=2,database_name_fixtures=3,invalid_owner_rejected=2,docker_started=False,benchmark_timings=0)))
