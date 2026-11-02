@@ -520,7 +520,8 @@ impl Row {
     pub fn new() -> Self { Self(RowStorage::Inline(BTreeMap::new())) }
     pub fn insert(&mut self, key:String, value:Cell)->Option<Cell>{std::ops::DerefMut::deref_mut(self).insert(RowKey::from(key),value)}
     pub(crate) fn insert_key(&mut self,key:RowKey,value:Cell)->Option<Cell>{std::ops::DerefMut::deref_mut(self).insert(key,value)}
-    pub(crate) fn insert_str(&mut self,key:&str,value:Cell)->Option<Cell>{std::ops::DerefMut::deref_mut(self).insert(RowKey::from(key),value)}
+    /// Insert a borrowed field name without allocating a temporary String.
+    pub fn insert_str(&mut self,key:&str,value:Cell)->Option<Cell>{std::ops::DerefMut::deref_mut(self).insert(RowKey::from(key),value)}
     pub fn get<Q:AsRef<str>+?Sized>(&self,key:&Q)->Option<&Cell>{self.as_map().get(key.as_ref())}
     pub fn get_mut<Q:AsRef<str>+?Sized>(&mut self,key:&Q)->Option<&mut Cell>{std::ops::DerefMut::deref_mut(self).get_mut(key.as_ref())}
     pub fn get_key_value<Q:AsRef<str>+?Sized>(&self,key:&Q)->Option<(&RowKey,&Cell)>{self.as_map().get_key_value(key.as_ref())}

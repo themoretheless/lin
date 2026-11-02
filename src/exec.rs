@@ -5566,11 +5566,11 @@ impl Db {
         for row in rows.iter_mut() {
             let text = embed::row_embed_text(row);
             if text.is_empty() {
-                row.insert("embedding".into(), Cell::Null);
+                row.insert_str("embedding", Cell::Null);
                 continue;
             }
             let embedding = emb.embed(&text);
-            row.insert("embedding".into(), Cell::Vec(embedding));
+            row.insert_str("embedding", Cell::Vec(embedding));
             n += 1;
         }
         self.store.rebuild_row_maps();
@@ -5617,7 +5617,7 @@ impl Db {
             vectors = refs.iter().map(|text| emb.embed(text)).collect();
         }
         for (i, vector) in row_idxs.into_iter().zip(vectors) {
-            rows[i].insert("embedding".into(), Cell::Vec(vector));
+            rows[i].insert_str("embedding", Cell::Vec(vector));
         }
     }
 
@@ -5756,14 +5756,14 @@ impl Db {
 
         for row in &mut built {
             if row.get("id").and_then(Cell::text).is_none() {
-                row.insert("id".into(), Cell::text_arc(self.store.alloc_id()));
+                row.insert_str("id", Cell::text_arc(self.store.alloc_id()));
             }
             if row.get("hash").and_then(Cell::text).is_none()
                 && let Some(body) = row.get("body").and_then(Cell::text_shared)
             {
                 // Large short-body batches bypass the cache; small batches retain reuse.
-                row.insert(
-                    "hash".into(),
+                row.insert_str(
+                    "hash",
                     Cell::Text(if n >= 4096 && body.len() <= 64 {
                         content_hash_arc(body.as_ref())
                     } else {
@@ -5977,7 +5977,7 @@ impl Db {
         let explicit_hash = effective_patch.contains_key("hash");
         if let Some(body) = row_text(&effective_patch, "body") {
             let hash = cached_content_hash(body);
-            effective_patch.insert("hash".into(), Cell::Text(hash));
+            effective_patch.insert_str("hash", Cell::Text(hash));
         }
         let mut out = Vec::new();
         for i in idxs {

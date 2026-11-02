@@ -44,3 +44,22 @@ fn cloned_template_eliminates_each_field_name_allocation() {
         }
     }
 }
+
+#[test]
+fn borrowed_field_insertion_eliminates_temporary_string_allocation() {
+    for name in ["id", "hash", "embedding", "a custom metadata field name longer than inline capacity"] {
+        let (owned, old) = measured(|| {
+            let mut row = Row::new();
+            row.insert(black_box(name).to_owned(), Cell::Int(42));
+            row
+        });
+        let (borrowed, new) = measured(|| {
+            let mut row = Row::new();
+            row.insert_str(black_box(name), Cell::Int(42));
+            row
+        });
+        assert_eq!(owned, borrowed);
+        assert_eq!(old.checked_sub(new), Some(1), "name={name}, owned={old}, borrowed={new}");
+        println!("insert {name}: owned={old}, borrowed={new}");
+    }
+}
