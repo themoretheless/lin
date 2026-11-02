@@ -36,7 +36,7 @@ class SourceIntegrityTests(unittest.TestCase):
         self.binary.unlink()
         with self.assertRaises(FileNotFoundError):snapshot(self.root,self.binary)
     def test_build_harness_and_driver_changes_drift(self):
-        for name in ['Cargo.lock','build.rs','rust-toolchain.toml','.cargo/config.toml','examples/peer_bench.rs','benches/compare.rs','scripts/bench-peers.py']:
+        for name in ['Cargo.lock','build.rs','rust-toolchain.toml','.cargo/config.toml','examples/peer_bench.rs','benches/compare.rs','scripts/bench-peers.py','lin-derive/Cargo.toml','lin-derive/src/lib.rs']:
             f=self.root/name;f.parent.mkdir(parents=True,exist_ok=True);f.write_text('input')
             self.assertNotEqual(self.before,snapshot(self.root,self.binary),name)
             f.unlink()

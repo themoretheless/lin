@@ -7,14 +7,15 @@ def snapshot(root: Path, binary: Path) -> dict:
     root = root.resolve()
     files = set()
     for directory, suffixes in [('src', {'.rs'}), ('examples', {'.rs'}),
-                                 ('benches', {'.rs'}), ('scripts', {'.py', '.sh'})]:
+                                 ('benches', {'.rs'}), ('scripts', {'.py', '.sh'}),
+                                 ('lin-derive/src', {'.rs'})]:
         base = root / directory
         if directory == 'benches':
             candidates = base.glob('*.rs')
         else:
             candidates = base.rglob('*')
         files.update(f for f in candidates if f.is_file() and f.suffix in suffixes)
-    for name in ['Cargo.toml', 'Cargo.lock', 'build.rs', 'rust-toolchain', 'rust-toolchain.toml']:
+    for name in ['Cargo.toml', 'Cargo.lock', 'build.rs', 'rust-toolchain', 'rust-toolchain.toml', 'lin-derive/Cargo.toml']:
         f = root / name
         if f.is_file():
             files.add(f)
