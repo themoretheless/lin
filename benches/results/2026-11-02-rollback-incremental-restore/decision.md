@@ -1,0 +1,3 @@
+# Historical duplicate: stopped before measurements
+
+The attempted combined incremental scalar/FTS restore is equivalent to the already rejected Linux full-source experiment40564997553 (frozen95cba5c519d935e76ae027d4bd22f1ce7d61bd6c), with FTS-only evidence additionally rejected in40652603678. No unchanged retry is justified. Its fresh root focused-test invocation was interrupted during libduckdb dependency compilation (exit130); no test result or performance observation exists. The draft qualifier was not executed. Candidate source and logs retained; production source was restored to60e64559e before starting the separate COW row-ownership proposal. Neither optimization is accepted by this file.

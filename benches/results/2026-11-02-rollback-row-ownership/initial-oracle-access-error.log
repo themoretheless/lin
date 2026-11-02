@@ -1,0 +1,77 @@
+    Updating crates.io index
+     Locking 62 packages to highest Rust 1.101.0-nightly compatible versions
+ Downloading crates ...
+  Downloaded rustls-webpki v0.103.16
+  Downloaded crc32fast v1.5.4
+  Downloaded tokio-util v0.7.20
+  Downloaded cc v1.11.0
+   Compiling proc-macro2 v1.0.107
+   Compiling quote v1.0.47
+   Compiling unicode-ident v1.0.27
+   Compiling libc v0.2.191
+   Compiling shlex v2.0.1
+   Compiling find-msvc-tools v0.1.15
+   Compiling cc v1.11.0
+   Compiling ring v0.17.14
+   Compiling cfg-if v1.0.5
+   Compiling serde_core v1.0.229
+   Compiling autocfg v1.5.1
+   Compiling num-traits v0.2.19
+   Compiling memchr v2.8.3
+   Compiling pin-project-lite v0.2.17
+   Compiling zeroize v1.9.1
+   Compiling rustls-pki-types v1.15.1
+   Compiling getrandom v0.2.17
+   Compiling syn v3.0.9
+   Compiling zmij v1.0.23
+   Compiling untrusted v0.9.0
+   Compiling futures-core v0.3.34
+   Compiling serde v1.0.229
+   Compiling serde_derive v1.0.229
+   Compiling tokio v1.54.1
+   Compiling aho-corasick v1.1.5
+   Compiling futures-sink v0.3.34
+   Compiling regex-syntax v0.8.11
+   Compiling bytes v1.12.1
+   Compiling serde_json v1.0.154
+   Compiling crc32fast v1.5.4
+   Compiling rustls v0.23.46
+   Compiling regex-automata v0.4.18
+   Compiling tokio-util v0.7.20
+   Compiling rmp v0.8.15
+   Compiling rustls-webpki v0.103.16
+   Compiling syn v2.0.119
+   Compiling itoa v1.0.18
+   Compiling slab v0.4.12
+   Compiling futures-task v0.3.34
+   Compiling subtle v2.6.1
+   Compiling once_cell v1.21.4
+   Compiling lin-derive v0.4.0 (/Users/themoretheless/.codex/worktrees/lin-rollback-fts-delta/lin/lin-derive)
+   Compiling futures-util v0.3.34
+   Compiling rmp-serde v1.3.1
+   Compiling tokio-stream v0.1.19
+   Compiling regex v1.13.1
+   Compiling rustls-pemfile v2.2.0
+   Compiling memmap2 v0.9.12
+   Compiling smallvec v1.16.4
+   Compiling rustc-hash v2.1.3
+   Compiling lin v0.4.0 (/Users/themoretheless/.codex/worktrees/lin-rollback-fts-delta/lin)
+   Compiling lin-rollback-row-ownership-oracle v0.0.0 (/Users/themoretheless/.codex/worktrees/lin-rollback-fts-delta/lin/benches/results/2026-11-02-rollback-row-ownership/public-oracle)
+error[E0616]: field `fts` of struct `Store` is private
+  --> src/lib.rs:40:37
+   |
+40 |                 let fts = &db.store.fts["docs"];
+   |                                     ^^^ private field
+
+For more information about this error, try `rustc --explain E0616`.
+error: could not compile `lin-rollback-row-ownership-oracle` (lib test) due to 1 previous error
+warning: unused dependency `lin`
+ --> Cargo.toml:8:1
+  |
+8 | lin = { path = "../../../.." }
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `cargo::unused_dependencies` is set to `warn` by default
+help: consider removing the dependency on `lin`
+help: to still use for development builds, move to `dev-dependencies`
+warning: `lin-rollback-row-ownership-oracle` (manifest) generated 1 warning
