@@ -1,0 +1,7 @@
+# Next source-based hypothesis: batch-local default field keys
+
+The exact current profile attributes about30% of the selected transaction call stacks to embedding,17-20%toFTS,12-14%to secondary indexes and10-11%to row maps. These are CPU sample proportions in a conservative transaction-ancestor subset, not whole insertion latency percentages. Parser preparation is outside the insertion timer. No speedup is proved.
+
+Current RowKey owns Arc<str>. insert_bulk creates a new owned id/hash key for each applicable row through insert_str; maybe_embed_rows similarly creates embedding keys per row. The actual workload retains embedding and hash defaults. A candidate may allocate each needed default key once per batch and clone the owned Arc handle into rows, retaining the existing one-row path, every field/value, hash, embedding, quota, transaction and serialization operation. No global interner, cache table, startup work or data-specific shortcut is needed.
+
+First prove simultaneous rows share default key backing without aliasing values and still match all existing semantics. Then run full default/extent correctness and the same real root-worker native1k/10k/100k balanced comparisons. This is an allocation hypothesis; the sampled profile does not isolate its exact cost. Old negative normalization, modulus, rollback and index experiments remain rejected. Component gains cannot qualify full source or the eight-peer objective.
