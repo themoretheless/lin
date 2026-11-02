@@ -1,0 +1,7 @@
+# Single reverse-map write during index key replacement
+
+Candidate replaces the intermediate reverse.insert in LiveIndex::insert_key with a borrowed old-key lookup and old-posting removal. The final entry branch still installs the canonical forward-map key exactly once. Keep unique checks before mutation, same-key no-op behavior, posting representation/membership and ordering. No bulk insertion, FTS, Row, WAL, default features or APIs change. The already-live full matrix remains frozen at451fd7a25 and excludes this candidate.
+
+Differential test calls the verbatim pre-change insert_key as a test-only oracle: arities1/2/3/5, unique/nonunique, bitmap/plain, null/bool/int/float/NaN/negative-zero/text keys, large positions, removals/moves and exact reverse canonical Debug representations. Existing index tests remain binding.
+
+Explicit ignored component fixture contains both implementations in one lib-test executable. At1k/10k/100k rows, alternate a two-column [wing,ts] key at one position and restore it:2000 helper calls per sample,8 samples per fresh process. All forward/reverse state is checked against the original fixture after every sample, outside timing. Two6-round balanced series with base/control same reference function and candidate, all roles same ELF:108 processes /864 observations. Function-pointer dispatch and cfg(test) build are part of this diagnostic. No database transaction, SQLite operation or public peer is measured; no whole-DB speedup or production adoption can follow from it alone. Retain losses and AA controls, no unchanged rerun.
