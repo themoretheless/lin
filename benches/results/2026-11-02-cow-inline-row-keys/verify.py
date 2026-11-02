@@ -10,6 +10,15 @@ assert len(cases)==12 and len(set(cases))==12 and len(records)==216 and len(smok
 assert m['source_restored'] and m['exit_code']==0 and m['performance_qualified']==False
 assert sha((p/'compare.rs').read_bytes())==m['harness_sha256']
 assert m['harness_change']=='durable_json_row owned String boundary only; timed workload unchanged'
+
+original=(root/'benches/results/2026-11-02-rollback-fts-field-impact-bench/compare.rs').read_bytes()
+assert sha(original)==m['original_harness_sha256']
+assert original.count(b'(k.clone(),value)')==1
+assert original.replace(b'(k.clone(),value)',b'(k.to_string(),value)')==(p/'compare.rs').read_bytes()
+prior=json.loads((root/'benches/results/2026-11-02-cow-package-codegen1-local/provenance.json').read_text())
+assert m['rustc']==prior['rustc'] and m['baseline']==prior['baseline']
+for name,h in m['build_sha256'].items():assert sha((root/name).read_bytes())==h
+
 assert status==dict(processes=216,observations=1728,smokes=24,measurement_complete=True,source_restored=True,performance_qualification=False,adopted=False)
 plan=schedule([dict(id=c)for c in cases],['baseline','control','candidate'],rounds=6)
 assert [(r['round'],r['role'],r['case'])for r in records]==[(r['round'],r['role'],r['workload'])for r in plan]
