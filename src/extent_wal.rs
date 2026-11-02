@@ -21,6 +21,23 @@ fn validate_frames(frames:&[u8])->Result<(),Error> {
         Ok(())
     })?;Ok(())
 }
+#[cfg(test)]
+fn crash_checkpoint(stage: &str) {
+    if std::env::var("LIN_EXTENT_TEST_CRASH_STAGE").ok().as_deref() != Some(stage) { return; }
+    let ready=std::env::var_os("LIN_EXTENT_TEST_CRASH_READY").expect("crash ready path");
+    let mut signal=OpenOptions::new().write(true).create_new(true).open(ready).unwrap();
+    signal.write_all(stage.as_bytes()).unwrap();signal.sync_all().unwrap();
+    loop { std::thread::park(); }
+}
+#[cfg(test)]
+fn write_with_crash_split(file:&mut File, bytes:&[u8], stage:&str)->Result<(),Error> {
+    if std::env::var("LIN_EXTENT_TEST_CRASH_STAGE").ok().as_deref()==Some(stage) {
+        let middle=if stage=="mid_header" {20}else{bytes.len()/2};
+        file.write_all(&bytes[..middle]).map_err(io_err)?;crash_checkpoint(stage);
+        file.write_all(&bytes[middle..]).map_err(io_err)?;
+    } else { file.write_all(bytes).map_err(io_err)?; }
+    Ok(())
+}
 impl ExtentWal {
     /// Create a new file; never overwrite an existing database or WAL.
     pub fn create(path:&Path, physical:u64)->Result<Self,Error> {
@@ -55,9 +72,17 @@ impl ExtentWal {
         let logical=self.logical.checked_add(frames.len()as u64).filter(|n|*n<=self.physical-DATA_START).ok_or_else(||io_err("extent full"))?;
         let sequence=self.sequence.checked_add(1).ok_or_else(||io_err("extent sequence exhausted"))?;
         self.poisoned=true;
-        self.file.seek(SeekFrom::Start(DATA_START+self.logical)).map_err(io_err)?;self.file.write_all(frames).map_err(io_err)?;
-        self.file.seek(SeekFrom::Start(0)).map_err(io_err)?;self.file.write_all(&header(self.physical,logical,sequence)).map_err(io_err)?;
+        self.file.seek(SeekFrom::Start(DATA_START+self.logical)).map_err(io_err)?;
+        #[cfg(test)] write_with_crash_split(&mut self.file,frames,"mid_payload")?;
+        #[cfg(not(test))] self.file.write_all(frames).map_err(io_err)?;
+        #[cfg(test)] crash_checkpoint("before_header");
+        self.file.seek(SeekFrom::Start(0)).map_err(io_err)?;
+        let published=header(self.physical,logical,sequence);
+        #[cfg(test)] write_with_crash_split(&mut self.file,&published,"mid_header")?;
+        #[cfg(not(test))] self.file.write_all(&published).map_err(io_err)?;
+        #[cfg(test)] crash_checkpoint("after_header");
         durable_sync(&self.file).map_err(io_err)?;
+        #[cfg(test)] crash_checkpoint("after_sync");
         self.logical=logical;self.sequence=sequence;self.poisoned=false;Ok(())
     }
     pub fn logical_bytes(&self)->u64 {self.logical}
@@ -68,11 +93,11 @@ impl ExtentWal {
 mod tests {
     use super::*;
     use crate::{Row,Cell,persist::{LogRecord,Pack,SyncMode,append_record}};
-    struct Temp(std::path::PathBuf);
+    pub(super) struct Temp(std::path::PathBuf);
     impl Temp {
-        fn new()->Self {static SEQUENCE:std::sync::atomic::AtomicU64=std::sync::atomic::AtomicU64::new(0);let nonce=SEQUENCE.fetch_add(1,std::sync::atomic::Ordering::Relaxed);let path=std::env::temp_dir().join(format!("lin-extent-test-{}-{}-{}",std::process::id(),nonce,std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));std::fs::create_dir(&path).unwrap();Self(path)}
-        fn path(&self,name:&str)->std::path::PathBuf{self.0.join(name)}
-        fn frame(&self)->Vec<u8>{
+        pub(super) fn new()->Self {static SEQUENCE:std::sync::atomic::AtomicU64=std::sync::atomic::AtomicU64::new(0);let nonce=SEQUENCE.fetch_add(1,std::sync::atomic::Ordering::Relaxed);let path=std::env::temp_dir().join(format!("lin-extent-test-{}-{}-{}",std::process::id(),nonce,std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));std::fs::create_dir(&path).unwrap();Self(path)}
+        pub(super) fn path(&self,name:&str)->std::path::PathBuf{self.0.join(name)}
+        pub(super) fn frame(&self)->Vec<u8>{
             let path=self.path("encoded-frame");let mut file=OpenOptions::new().create_new(true).read(true).write(true).open(&path).unwrap();
             let rec=LogRecord{r#gen:1,next_id:2,pack:Pack::InsertBulk{collection:"docs".into(),rows:vec![Row::from([("id".into(),Cell::from("one")),("body".into(),Cell::from("complete durable payload"))])],edges:vec![]}};
             append_record(&mut file,&rec,&mut Vec::new(),SyncMode::Normal,&mut 0).unwrap();drop(file);std::fs::read(path).unwrap()
@@ -145,5 +170,52 @@ mod ownership_tests {
         let mut clean=ExtentWal::open(&path).unwrap();assert_eq!(clean.logical_bytes(),0);assert!(clean.read_frames().unwrap().is_empty());drop(clean);
         let bytes=std::fs::read(&path).unwrap();assert!(crate::persist::for_each_wal_frame(&bytes,|_|Ok(())).is_err());
         std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[cfg(all(test,unix))]
+mod crash_tests {
+    use super::*;
+    use std::process::{Command,Child,Stdio};
+    use std::os::unix::process::ExitStatusExt;
+    struct ChildGuard(Child);
+    impl Drop for ChildGuard {fn drop(&mut self){let _=self.0.kill();let _=self.0.wait();}}
+    #[test]
+    #[ignore = "child helper invoked by sigkill_recovery_at_each_publication_stage"]
+    fn child() {
+        let path=std::env::var_os("LIN_EXTENT_TEST_CRASH_PATH").expect("child path");
+        let frames=std::fs::read(std::env::var_os("LIN_EXTENT_TEST_FRAME_PATH").expect("frame path")).unwrap();
+        let mut wal=ExtentWal::open(Path::new(&path)).unwrap();wal.append_frames(&frames).unwrap();
+        panic!("child failed to stop at crash checkpoint");
+    }
+    #[test]
+    fn sigkill_recovery_at_each_publication_stage() {
+        for stage in ["mid_payload","before_header","mid_header","after_header","after_sync"] {
+            let tmp=super::tests::Temp::new();let path=tmp.path("extent");let frame=tmp.frame();let frame_path=tmp.path("frame.raw");std::fs::write(&frame_path,&frame).unwrap();
+            let mut wal=ExtentWal::create(&path,8192).unwrap();wal.append_frames(&frame).unwrap();drop(wal);
+            let ready=tmp.path("ready");
+            let stderr=OpenOptions::new().write(true).create_new(true).open(tmp.path("child.stderr")).unwrap();
+            let mut child=ChildGuard(Command::new(std::env::current_exe().unwrap())
+                .args(["--exact","extent_wal::crash_tests::child","--ignored","--nocapture"])
+                .env("LIN_EXTENT_TEST_CRASH_PATH",&path).env("LIN_EXTENT_TEST_FRAME_PATH",&frame_path)
+                .env("LIN_EXTENT_TEST_CRASH_STAGE",stage).env("LIN_EXTENT_TEST_CRASH_READY",&ready)
+                .stdout(Stdio::null()).stderr(stderr).spawn().unwrap());
+            let deadline=std::time::Instant::now()+std::time::Duration::from_secs(15);
+            loop {
+                if std::fs::read_to_string(&ready).ok().as_deref()==Some(stage){break;}
+                assert!(child.0.try_wait().unwrap().is_none(),"child exited before {stage}");
+                assert!(std::time::Instant::now()<deadline,"checkpoint timeout {stage}");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            child.0.kill().unwrap();let status=child.0.wait().unwrap();assert_eq!(status.signal(),Some(9));
+            assert_eq!(std::fs::read_to_string(&ready).unwrap(),stage);
+            if stage=="mid_header" {assert!(ExtentWal::open(&path).is_err(),"accepted torn published header");}
+            else {
+                let mut reopened=ExtentWal::open(&path).unwrap();
+                let copies=if ["mid_payload","before_header"].contains(&stage){1}else{2};
+                assert_eq!(reopened.read_frames().unwrap(),frame.repeat(copies),"recovery after {stage}");
+            }
+            println!("SIGKILL stage={stage}: expected strict recovery outcome verified");
+        }
     }
 }
