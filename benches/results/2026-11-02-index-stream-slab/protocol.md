@@ -1,0 +1,9 @@
+# Streaming secondary-index slab insertion
+
+Baseline b88ebea2e retains the previous qualified worker behavior; the only runtime candidate change is src/index.rs::LiveIndex::insert_slab_batch. Instead of collecting matching row references and all IndexKeys into temporary vectors, compute each matching key immediately before insertion in the same row order. Preserve one captured predicate timestamp, the first-100-row bitmap sample over all input rows, dynamic cardinality threshold based on current forward-map length, unique errors and partial-prefix mutation behavior.
+
+The existing independent per-row bitmap reference compares errors, reverse maps, posting representation and members across empty inputs, sample boundaries, boolean placement, partial and unique indexes, and forward-map population around 10000. Full default regression and the unchanged worker 100k quota/data/embedding test are prerequisites to exploratory timing.
+
+Local measurement uses baseline/control same executable and separately built candidate, identical release/default features and compiler, 3 row counts (1k,10k,100k), 6 fully balanced rounds and 8 samples per fresh process: 54 processes and 432 observations. All six fields in every returned row are checked, totaling 1998000 row readbacks. Existing public worker timers, statements, transaction boundary, limits, FTS and embeddings remain unchanged. Setup/validation remain outside its operation timer.
+
+This local component discovery is not a Linux peer comparison, full 67-case acceptance, SQL durability comparison or adoption. A gain requires subsequent Linux qualification and peer comparisons with all controls/losses preserved. Do not run timing concurrently with our builds. Keep original results and any startup failures; no unchanged acceptance rerun or numerical waiver.
