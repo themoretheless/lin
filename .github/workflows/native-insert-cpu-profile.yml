@@ -1,0 +1,34 @@
+name: native-insert-cpu-profile
+on:
+  push:
+    branches: [codex/native-insert-cpu-profile-ci]
+permissions:
+  contents: read
+jobs:
+  profile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.96.0'
+      - name: Install userspace perf and allow own-process sampling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y linux-tools-generic
+          sudo sysctl -w kernel.perf_event_paranoid=1
+      - name: Profile unchanged worker native insertion with frame pointers
+        run: python3 benches/results/2026-11-02-native-insert-cpu-profile/run.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-insert-cpu-profile
+          path: benches/results/2026-11-02-native-insert-cpu-profile/
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-profile-exact-linux-executable
+          path: /tmp/lin-native-insert-profile
