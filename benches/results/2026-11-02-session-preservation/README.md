@@ -1,0 +1,7 @@
+# Session preservation, 2026-11-02
+
+All untracked files from eleven worktrees are preserved as authenticated age-encrypted tar snapshots:160293files,1728603071plaintext bytes. Every archive member SHA was checked and every full encrypted stream was decrypted and matched to the original archive SHA without emitting plaintext. Ciphertext is split into ordered <=40MiBparts; concatenate parts before age decryption. Existing user-owned identity remains in its ignored private vault and was not committed. Encrypted per-file manifests accompany each worktree. Originals remain untouched, including private MSSQL and quarantined profile credentials.
+
+branches.json binds every local branch to its original SHA and a remote preservation namespace. Detached worktree heads also have preservation refs. The detached batch-shape modification was committed separately as WIP, without adopting it. No stash exists. No branches, worktrees, tags or source data were deleted.
+
+Three completed correctness fixes and completed main CI evidence have merged into the delivery branch; production main has not yet advanced. A separate profile evidence branch has26add/add conflicts in uniform-field-list logs/report. conflict-proposal.json contains both blob identities and a concrete proposal to retain both complete datasets under separate directories. No conflict was resolved without user direction; runtime checks and the main push wait for that decision. Unfinished/rejected COW/extent experiments stay on their preservation refs.
