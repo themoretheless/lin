@@ -1,6 +1,6 @@
 # Benchmark objective: current evidence, 2026-11-02
 
-Objective remains open: outperform DuckDB, SQLite, PostgreSQL, MySQL, MSSQL, MongoDB, Kusto and pandas under the declared benchmarks. No universal engine superiority or production adoption follows from this report. Main is unchanged. Current qualified-correctness runtime is `60e64559ec0e5a21efd490d6da5a744e3ac8d0e2` (COW Arc keys plus explicit experimental extent WAL); public Row vnext migration is authorized, but this source has not passed the complete performance acceptance gate.
+Objective remains open: outperform DuckDB, SQLite, PostgreSQL, MySQL, MSSQL, MongoDB, Kusto and pandas under the declared benchmarks. No universal engine superiority or production adoption follows from this report. Main is unchanged. Current runtime with verified correctness is `60e64559ec0e5a21efd490d6da5a744e3ac8d0e2` (COW Arc keys plus explicit experimental extent WAL); public Row vnext migration is authorized, but this source has not passed the complete performance acceptance gate.
 
 ## Exact current six-peer matrix
 
@@ -27,11 +27,12 @@ Absolute matched SQLite FULL WAL comparisons: **63/96 wins**, comprising1k UPDAT
 
 ## Missing qualification and active experiments
 
-- MSSQL: prior private encrypted qualification belongs to runtime625bc7180, not current60e64559e. It does not qualify the current source. No private outcomes, ratios, keys or plaintext are published here.
+- MSSQL: prior private encrypted qualification belongs to runtime625bc7180. [Current-source private qualification41423609660](https://github.com/themoretheless/lin/actions/runs/41423609660) is running from frozen c56375ce2, actual runtime60e64559e, root example default+extent. No private outcomes, ratios, keys or plaintext are published here; functional completion is not a numerical win indicator.
 - Kusto: real endpoint/database/token remain unavailable at the last checked inventory. No benchmark exists; no emulator substituted.
 - FTS classification fold was rejected by its Linux component and reverted. It is absent from both current matrices.
 - Constant768 token/trigram modulus: full local default463/2 and feature483/4 suites pass; local108-process native insertion discovery has no reliable gain. [Linux same-root-worker discovery41417236076](https://github.com/themoretheless/lin/actions/runs/41417236076) completed:100k-2.404%/+1.227%, only1/6and3/6positive. Rejected; original embedding source restored. All108processes/864samples retained.
-- COW rollback ownership is a separate unqualified proposal. It moves the stored Row before applying its inverse delta and discards unpublished Pack owners first. It preserves the baseline full scalar/FTS remove/reinsert maintenance. Pointer identity/held-result correctness evidence is not a latency or peer win.
+- COW rollback ownership408f02f70 was rejected after all720local processes/5760observations were independently audited: only1/10target windows passed and3control windows failed. Full465/485tests and3compiled negatives passed, but avoided map replacement did not establish operational improvement. Runtime restored to60e64559e; [all results and decision](../benches/results/2026-11-02-rollback-row-ownership-bench/decision.md) retained. No unchanged Linux timing retry.
+- [Exact current-root native CPU profile41425364783](https://github.com/themoretheless/lin/actions/runs/41425364783) is running on the already audited public ELF4a4c3918e, with no rebuild or source instrumentation. Whole-process profiling includes work outside insertion timers; it is diagnostic, not a new acceptance run.
 - Extent growth and broader power-loss/directory qualification remain open. SIGKILL and checksum tests do not establish physical power-loss guarantees.
 
 Next acceptance still requires the unchanged full source gate, all original public process comparisons, current-source private MSSQL qualification and a real Kusto run. Improvements, component results and green correctness checks do not redefine this scope.
