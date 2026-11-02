@@ -1,0 +1,72 @@
+name: cow-extent-mssql-private
+on:
+  push:
+    branches: [codex/cow-extent-mssql-private-ci]
+permissions:
+  contents: read
+concurrency:
+  group: cow-extent-mssql-private-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  private-qualification:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: 2
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.96.0'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Verify frozen runtime and all workflow inputs
+        run: python3 benches/results/2026-11-02-cow-extent-mssql-private/verify-inputs.py
+      - name: Audit exact upstream current-source Linux correctness
+        run: python3 benches/results/2026-11-02-cow-extent-mssql-private/audit-prerequisite.py
+      - name: Install unchanged pinned peer bindings
+        run: python -m pip install -r scripts/bench-peers-requirements.lock
+      - name: Build exact current root example with extent feature
+        run: python3 benches/results/2026-11-02-cow-extent-mssql-private/build.py
+      - name: Install existing artifact encryption
+        run: sudo apt-get update -qq && sudo apt-get install -y age
+      - name: Validate real MSSQL privately without exposing numerical outcomes
+        run: python3 benches/results/2026-11-02-cow-extent-mssql-private/run.py
+      - name: Encrypt every private artifact
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -d "$RUNNER_TEMP/lin-cow-extent-mssql-private" ]; then
+            umask 077
+            tar -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/lin-cow-extent-mssql-private.tar.gz" lin-cow-extent-mssql-private
+            age -R .github/benchmark-recipients/mssql.age -o "$RUNNER_TEMP/lin-cow-extent-mssql-private.tar.gz.age" "$RUNNER_TEMP/lin-cow-extent-mssql-private.tar.gz"
+            rm "$RUNNER_TEMP/lin-cow-extent-mssql-private.tar.gz"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cow-extent-mssql-private-${{ github.run_id }}
+          path: ${{ runner.temp }}/lin-cow-extent-mssql-private.tar.gz.age
+          if-no-files-found: warn
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cow-extent-mssql-build-diagnostics
+          path: |
+            benches/results/2026-11-02-cow-extent-mssql-private/build.log
+            benches/results/2026-11-02-cow-extent-mssql-private/build-provenance.json
+          if-no-files-found: warn
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cow-extent-mssql-exact-linux-worker
+          path: /tmp/lin-cow-extent-mssql-peer
+          if-no-files-found: warn
