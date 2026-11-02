@@ -61,10 +61,12 @@ class BenchmarkContractTests(unittest.TestCase):
     def run_gate(self, observations, require_wins=True):
         with tempfile.TemporaryDirectory() as directory:
             args = SimpleNamespace(cases=["point_get"], engines=["lin", "sqlite"],
-                repeats=2, output=Path(directory), require_wins=require_wins)
+                repeats=2, output=Path(directory), require_wins=require_wins,
+                lin_binary=str(Path(__file__).resolve()))
             run = {"observations": observations, "errors": [], "medians_ns": {},
                 "rows": 41, "repeats": 2, "host": "test", "cases": args.cases,
-                "engines": args.engines, "versions": {}}
+                "engines": args.engines, "versions": {},
+                "source_identity_before": bench.source_snapshot(bench.ROOT, Path(args.lin_binary))}
             result = bench.finish(args, run)
             return result, run
 

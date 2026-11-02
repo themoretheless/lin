@@ -1,0 +1,75 @@
+..FF...........FF
+======================================================================
+FAIL: test_gate_aggregates_processes_before_comparing (__main__.BenchmarkContractTests.test_gate_aggregates_processes_before_comparing)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/themoretheless/.codex/worktrees/lin-peer-integrity-v2/lin/scripts/test-bench-peers.py", line 80, in test_gate_aggregates_processes_before_comparing
+    self.assertEqual(result, 3, "a measured loss must fail the wins gate")
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 2 != 3 : a measured loss must fail the wins gate
+
+======================================================================
+FAIL: test_independent_process_repetitions_produce_a_complete_report (__main__.BenchmarkContractTests.test_independent_process_repetitions_produce_a_complete_report)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/themoretheless/.codex/worktrees/lin-peer-integrity-v2/lin/scripts/test-bench-peers.py", line 121, in test_independent_process_repetitions_produce_a_complete_report
+    self.assertEqual(completed.returncode, 0, completed.stderr)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 1 != 0 : Traceback (most recent call last):
+  File "/Users/themoretheless/.codex/worktrees/lin-peer-integrity-v2/lin/scripts/bench-peers.py", line 918, in <module>
+    raise SystemExit(main())
+                     ~~~~^^
+  File "/Users/themoretheless/.codex/worktrees/lin-peer-integrity-v2/lin/scripts/bench-peers.py", line 778, in main
+    source_identity_before = source_snapshot(ROOT, lin_binary_path)
+  File "/Users/themoretheless/.codex/worktrees/lin-peer-integrity-v2/lin/scripts/benchmark_source_integrity.py", line 30, in snapshot
+    binary_bytes = binary.read_bytes()
+  File "/opt/homebrew/Cellar/python@3.14/3.14.10/Frameworks/Python.framework/Versions/3.14/lib/python3.14/pathlib/__init__.py", line 777, in read_bytes
+    with self.open(mode='rb', buffering=0) as f:
+         ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.10/Frameworks/Python.framework/Versions/3.14/lib/python3.14/pathlib/__init__.py", line 771, in open
+    return io.open(self, mode, buffering, encoding, errors, newline)
+           ~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+FileNotFoundError: [Errno 2] No such file or directory: '/Users/themoretheless/.codex/worktrees/lin-peer-integrity-v2/lin/target/release/examples/peer_bench'
+
+
+======================================================================
+FAIL: test_tied_times_are_not_a_win (__main__.BenchmarkContractTests.test_tied_times_are_not_a_win)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/themoretheless/.codex/worktrees/lin-peer-integrity-v2/lin/scripts/test-bench-peers.py", line 85, in test_tied_times_are_not_a_win
+    self.assertEqual(run["status"], "complete")
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 'incomplete' != 'complete'
+- incomplete
+? --
++ complete
+
+
+======================================================================
+FAIL: test_unsupported_native_peer_is_incomplete (__main__.BenchmarkContractTests.test_unsupported_native_peer_is_incomplete)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/themoretheless/.codex/worktrees/lin-peer-integrity-v2/lin/scripts/test-bench-peers.py", line 134, in test_unsupported_native_peer_is_incomplete
+    self.assertEqual(completed.returncode, 2, completed.stderr)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 1 != 2 : Traceback (most recent call last):
+  File "/Users/themoretheless/.codex/worktrees/lin-peer-integrity-v2/lin/scripts/bench-peers.py", line 918, in <module>
+    raise SystemExit(main())
+                     ~~~~^^
+  File "/Users/themoretheless/.codex/worktrees/lin-peer-integrity-v2/lin/scripts/bench-peers.py", line 778, in main
+    source_identity_before = source_snapshot(ROOT, lin_binary_path)
+  File "/Users/themoretheless/.codex/worktrees/lin-peer-integrity-v2/lin/scripts/benchmark_source_integrity.py", line 30, in snapshot
+    binary_bytes = binary.read_bytes()
+  File "/opt/homebrew/Cellar/python@3.14/3.14.10/Frameworks/Python.framework/Versions/3.14/lib/python3.14/pathlib/__init__.py", line 777, in read_bytes
+    with self.open(mode='rb', buffering=0) as f:
+         ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.10/Frameworks/Python.framework/Versions/3.14/lib/python3.14/pathlib/__init__.py", line 771, in open
+    return io.open(self, mode, buffering, encoding, errors, newline)
+           ~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+FileNotFoundError: [Errno 2] No such file or directory: '/Users/themoretheless/.codex/worktrees/lin-peer-integrity-v2/lin/target/release/examples/peer_bench'
+
+
+----------------------------------------------------------------------
+Ran 17 tests in 3.719s
+
+FAILED (failures=4)

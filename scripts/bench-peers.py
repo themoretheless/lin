@@ -20,6 +20,8 @@ import urllib.parse
 import uuid
 from pathlib import Path
 
+from benchmark_source_integrity import snapshot as source_snapshot
+
 ROOT = Path(__file__).resolve().parents[1]
 ENGINES = ["lin", "sqlite", "duckdb", "postgres", "mysql", "mongo", "mssql", "kusto", "pandas"]
 KUSTO_STREAM_MAX_BYTES = 4 * 1024 * 1024
@@ -773,6 +775,7 @@ def main():
             "mtime": lin_binary_path.stat().st_mtime,
             "sha256": hashlib.sha256(lin_binary_path.read_bytes()).hexdigest(),
         }
+    source_identity_before = source_snapshot(ROOT, lin_binary_path if 'lin' in args.engines else None)
     git_commit = None
     git_status_before = None
     try:
@@ -787,7 +790,8 @@ def main():
            "python": sys.version, "clients": client_versions(),
            "lin_binary_info": lin_binary_info,
            "git_commit": git_commit,
-           "git_status_before": git_status_before}
+           "git_status_before": git_status_before,
+           "source_identity_before": source_identity_before}
     if args.repeats > 1:
         for repetition in range(args.repeats):
             order = args.engines[repetition % len(args.engines):] + args.engines[:repetition % len(args.engines)]
@@ -884,9 +888,20 @@ def finish(args, run):
     try:
         git_status_after = subprocess.check_output(["git", "status", "--porcelain"], cwd=ROOT, text=True).strip()
         run["git_status_after"] = git_status_after
-        run["source_drift"] = (git_status_after != run.get("git_status_before", ""))
-    except Exception:
-        run["source_drift"] = False
+        run["git_status_changed"] = (git_status_after != run.get("git_status_before", ""))
+    except Exception as error:
+        run["git_status_error"] = str(error)
+    try:
+        run["source_identity_after"] = source_snapshot(ROOT, Path(args.lin_binary) if 'lin' in args.engines else None)
+        run["source_drift"] = run["source_identity_after"] != run["source_identity_before"]
+        if run["source_drift"]:
+            run["errors"].append({"reason": "runtime/build/harness/binary content changed"})
+    except Exception as error:
+        run["source_drift"] = True
+        run["errors"].append({"reason": "source integrity verification failed", "detail": str(error)})
+    if run["source_drift"]:
+        complete = False
+        run["status"] = "incomplete"
     (args.output / "run.json").write_text(json.dumps(run, indent=2) + "\n")
     (args.output / "report.md").write_text(report(run))
     if not complete:
