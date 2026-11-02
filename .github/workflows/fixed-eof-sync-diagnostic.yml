@@ -1,0 +1,33 @@
+name: fixed-eof-sync-diagnostic
+on:
+  push:
+    branches: [codex/fixed-eof-sync-diagnostic-ci]
+permissions:
+  contents: read
+jobs:
+  diagnostic:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.96.0'
+      - name: Validate balanced process order
+        run: python3 scripts/test-benchmark-role-balance.py
+      - name: Reject corrupted audit fixtures
+        run: python3 benches/results/2026-11-02-fixed-eof-sync-diagnostic/test-audit.py
+      - name: Execute physical layout diagnostic
+        run: python3 benches/results/2026-11-02-fixed-eof-sync-diagnostic/run.py
+      - name: Independently audit all observations
+        run: python3 benches/results/2026-11-02-fixed-eof-sync-diagnostic/audit.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fixed-eof-sync-diagnostic
+          path: benches/results/2026-11-02-fixed-eof-sync-diagnostic/
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fixed-eof-exact-linux-executable
+          path: /tmp/lin-fixed-eof-sync-linux
