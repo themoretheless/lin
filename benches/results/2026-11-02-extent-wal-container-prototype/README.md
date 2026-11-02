@@ -19,3 +19,5 @@ Focused release follow-up: 6 passed, 0 failed (extent_wal tests and ownership te
 Process-crash harness is being added. Test-only hooks stop a child at mid-payload, before boundary publication, mid-header, after-header and after-sync. The parent sends SIGKILL, waits for actual signal 9 termination, then checks strict reopen outcomes. This tests process death on a running OS; it does not simulate power loss or a disk cache losing unsynced data. The hooks compile out of non-test builds.
 
 The first actual SIGKILL run passed all five interruption stages: 7 focused tests passed and the child helper was intentionally ignored by the parent harness. Readiness polling was then strengthened to wait for the complete stage marker rather than file existence, avoiding a test-only create/write race. A final full feature suite is running after that change.
+
+Final full feature run after readiness fix passed: 470 tests, zero failures, three ignored (including the child-only crash helper). Five actual SIGKILL stages ran within the passing parent test. No power-loss or database throughput qualification.
