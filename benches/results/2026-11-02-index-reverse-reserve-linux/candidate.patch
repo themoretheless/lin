@@ -1,0 +1,15 @@
+diff --git a/src/index.rs b/src/index.rs
+index 9d3a9985b..3eb2534fd 100644
+--- a/src/index.rs
++++ b/src/index.rs
+@@ -570,6 +570,10 @@ impl LiveIndex {
+             return Ok(());
+         }
+ 
++        // Each fresh slab position adds at most one reverse entry. Reserve once
++        // before insertion rather than growing the hash table between rows.
++        self.reverse.reserve(keyed_rows.len());
++
+         // Pre-compute all keys in a single pass
+         let keys: Vec<_> = keyed_rows.iter().map(|(_, r)| self.key_of(r)).collect();
+ 
