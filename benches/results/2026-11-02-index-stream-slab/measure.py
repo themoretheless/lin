@@ -5,7 +5,13 @@ base=Path('/tmp/lin-index-stream-baseline-target-20261102/release/lin-peer-worke
 assert not(p/'measure-status.json').exists()and not(p/'raw').exists(),'preserve prior attempt'
 for f in [base,cand]:assert f.is_file()
 assert subprocess.check_output(['git','diff','--name-only','b88ebea2e','--','src'],cwd=root,text=True).splitlines()==['src/index.rs']
-source={str(f.relative_to(root)):sha(f.read_bytes())for f in(root/'src').rglob('*')if f.is_file()};binaries={str(f):sha(f.read_bytes())for f in[base,cand]}
+baseline_tree=Path('/tmp/lin-index-stream-baseline-20261102')
+assert subprocess.check_output(['git','rev-parse','HEAD'],cwd=baseline_tree,text=True).strip()==subprocess.check_output(['git','rev-parse','b88ebea2e'],cwd=root,text=True).strip()
+assert not subprocess.check_output(['git','diff','--name-only','HEAD'],cwd=baseline_tree,text=True).strip()
+input_files=[f for folder in ['src','lin-derive/src','tools/peer-worker/src']for f in(root/folder).rglob('*')if f.is_file()]+[root/n for n in ['Cargo.toml','Cargo.lock','lin-derive/Cargo.toml','tools/peer-worker/Cargo.toml','examples/peer_bench.rs']]
+for f in input_files:
+ if str(f.relative_to(root))!='src/index.rs':assert f.read_bytes()==(baseline_tree/f.relative_to(root)).read_bytes(),str(f)
+source={str(f.relative_to(root)):sha(f.read_bytes())for f in input_files};binaries={str(f):sha(f.read_bytes())for f in[base,cand]}
 sys.path.insert(0,str(root/'scripts'));from benchmark_role_balance import role_order,validate_orders
 cases=[1000,10000,100000];orders={str(n):[role_order(r,ci,['base','cont','cand'])for r in range(1,7)]for ci,n in enumerate(cases)};validate_orders(orders,['base','cont','cand'])
 (p/'raw').mkdir();observations=[];commands=[]
@@ -18,7 +24,7 @@ for rnd in range(1,7):
    d=json.loads(response.stdout);assert len(d['samples_ns'])==8 and all(type(x)in(int,float)and math.isfinite(x)and x>0 for x in d['samples_ns']);assert len(d['result'])==n and d['statements']==(n+9999)//10000 and d['statement_rows_limit']==10000
    for i,row in enumerate(d['result']):assert row==[f'd-{i}',f'bench://{i}','rag'if i%2==0 else'sys',f'doc {i} wal note'if i%10==0 else f'doc {i} plain',1700000000000,f'body {i}']
    observations.append(dict(round=rnd,rows=n,role=role,median_ns=statistics.median(d['samples_ns']),samples_ns=d['samples_ns']));commands.append(dict(round=rnd,rows=n,role=role,command=command,request=request))
-assert source=={str(f.relative_to(root)):sha(f.read_bytes())for f in(root/'src').rglob('*')if f.is_file()}
+assert source=={str(f.relative_to(root)):sha(f.read_bytes())for f in input_files}
 assert binaries=={str(f):sha(f.read_bytes())for f in[base,cand]}
 summary={}
 for n in cases:

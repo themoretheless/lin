@@ -549,12 +549,29 @@ impl LiveIndex {
         }
     }
 
-    /// Insert a fresh slab in row order without staging row references or keys.
+    /// Batch-only insert for slab operations: compute all keys first, then bulk insert
+    /// to reduce per-row HashMap overhead and key cloning.
     pub fn insert_slab_batch(&mut self, start: usize, rows: &[Row]) -> Result<(), String> {
         let now = crate::store::now_ms();
-        if rows.is_empty() {
+        // Partial index check: only insert matching rows
+        let keyed_rows: Vec<(usize, &Row)> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| {
+                self.def
+                    .pred
+                    .as_ref()
+                    .is_none_or(|pred| crate::exec::eval_pred(pred, row, now))
+            })
+            .map(|(i, row)| (start + i, row))
+            .collect();
+
+        if keyed_rows.is_empty() {
             return Ok(());
         }
+
+        // Pre-compute all keys in a single pass
+        let keys: Vec<_> = keyed_rows.iter().map(|(_, r)| self.key_of(r)).collect();
 
         let bitmap_sample = self.def.bitmap_card_field.as_ref().map(|field| {
             let mut distinct = rustc_hash::FxHashSet::default();
@@ -569,12 +586,8 @@ impl LiveIndex {
             (false, distinct.len())
         });
 
-        for (offset, row) in rows.iter().enumerate() {
-            if self.def.pred.as_ref().is_some_and(|pred| !crate::exec::eval_pred(pred, row, now)) {
-                continue;
-            }
-            let orig_idx = start + offset;
-            let key = self.key_of(row);
+        // Bulk insert using pre-computed keys
+        for ((orig_idx, row), key) in keyed_rows.iter().zip(keys.into_iter()) {
             use std::collections::btree_map::Entry;
 
             // Auto-detect bitmap index based on field cardinality
@@ -592,17 +605,17 @@ impl LiveIndex {
 
             match self.forward.entry(key) {
                 Entry::Vacant(v) => {
-                    self.reverse.insert(orig_idx, v.key().clone());
+                    self.reverse.insert(*orig_idx, v.key().clone());
                     let mut posting = PostingList::new(is_bitmap, 1 << 16);
-                    posting.push(orig_idx);
+                    posting.push(*orig_idx);
                     v.insert(posting);
                 }
                 Entry::Occupied(mut o) => {
                     if self.def.unique {
                         return Err(format!("unique index {}: duplicate key", self.def.label()));
                     }
-                    self.reverse.insert(orig_idx, o.key().clone());
-                    o.get_mut().push(orig_idx);
+                    self.reverse.insert(*orig_idx, o.key().clone());
+                    o.get_mut().push(*orig_idx);
                 }
             }
         }
