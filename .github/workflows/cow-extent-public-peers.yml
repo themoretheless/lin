@@ -29,37 +29,38 @@ jobs:
         run: |
           python3 benches/results/2026-11-02-cow-extent-public-peers/verify-inputs.py
           python3 benches/results/2026-11-02-cow-extent-public-peers/test-manifest.py
+          python3 benches/results/2026-11-02-cow-extent-public-peers/test-workflow-paths.py
       - name: Audit exact upstream current-source Linux correctness
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 benches/results/2026-11-02-cow-extent-public-peers/audit-prerequisite.py
       - name: Verify kernel and exact Mongo readiness prerequisite
-        run: python3 benches/results/2026-11-02-corrected-cow-extent-public-peers/check-host.py
+        run: python3 benches/results/2026-11-02-cow-extent-public-peers/check-host.py
       - name: Install pinned bindings and verify harness contracts
         run: |
           python3 -m pip install -r scripts/bench-peers-requirements.lock
-          python3 -m pip freeze > benches/results/2026-11-02-corrected-cow-extent-public-peers/python-packages.txt
+          python3 -m pip freeze > benches/results/2026-11-02-cow-extent-public-peers/python-packages.txt
           python3 scripts/test_benchmark_source_integrity.py
-          python3 scripts/test-bench-peers.py > benches/results/2026-11-02-corrected-cow-extent-public-peers/harness-tests.log 2>&1
+          python3 scripts/test-bench-peers.py > benches/results/2026-11-02-cow-extent-public-peers/harness-tests.log 2>&1
       - name: Fetch exact previously recorded server images
         run: |
           python3 - <<'PY'
           from pathlib import Path
           import json,subprocess
-          m=json.loads(Path('benches/results/2026-11-02-corrected-cow-extent-public-peers/input.json').read_text())
+          m=json.loads(Path('benches/results/2026-11-02-cow-extent-public-peers/input.json').read_text())
           for ref in m['images'].values():subprocess.run(['docker','pull',ref],check=True)
           PY
       - name: Build exact current worker with default plus extent feature
-        run: python3 benches/results/2026-11-02-corrected-cow-extent-public-peers/build.py
+        run: python3 benches/results/2026-11-02-cow-extent-public-peers/build.py
       - name: Complete read and native insertion matrices
-        run: python3 benches/results/2026-11-02-corrected-cow-extent-public-peers/run.py
+        run: python3 benches/results/2026-11-02-cow-extent-public-peers/run.py
       - name: Verify owned containers absent
         if: always()
         run: |
           python3 - <<'PY'
           from pathlib import Path
           import json,subprocess
-          p=Path('benches/results/2026-11-02-corrected-cow-extent-public-peers');f=p/'environment.json'
+          p=Path('benches/results/2026-11-02-cow-extent-public-peers');f=p/'environment.json'
           if f.exists():
               m=json.loads(f.read_text());checks=[]
               for value in m['containers'].values():
@@ -69,15 +70,15 @@ jobs:
           PY
       - name: Audit all observations values and original processes
         run: |
-          python3 benches/results/2026-11-02-corrected-cow-extent-public-peers/audit.py
-          python3 benches/results/2026-11-02-corrected-cow-extent-public-peers/verify-processes.py
-          python3 benches/results/2026-11-02-corrected-cow-extent-public-peers/write-report.py
+          python3 benches/results/2026-11-02-cow-extent-public-peers/audit.py
+          python3 benches/results/2026-11-02-cow-extent-public-peers/verify-processes.py
+          python3 benches/results/2026-11-02-cow-extent-public-peers/write-report.py
       - name: Enforce unchanged available-peer process win gate
         run: |
           python3 - <<'PY'
           from pathlib import Path
           import json
-          a=json.loads(Path('benches/results/2026-11-02-corrected-cow-extent-public-peers/audit.json').read_text())
+          a=json.loads(Path('benches/results/2026-11-02-cow-extent-public-peers/audit.json').read_text())
           for s in a['summary'].values():
               assert s['wins']==s['comparisons'] and s['positive_processes']==s['process_comparisons'],'Available-peer gate failed; retain all losses'
           PY
@@ -88,7 +89,7 @@ jobs:
         if: always()
         with:
           name: cow-extent-public-peers
-          path: benches/results/2026-11-02-corrected-cow-extent-public-peers/
+          path: benches/results/2026-11-02-cow-extent-public-peers/
           if-no-files-found: error
       - uses: actions/upload-artifact@v4
         if: always()
