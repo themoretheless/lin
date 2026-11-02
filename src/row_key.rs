@@ -1,28 +1,25 @@
-//! Owned row field names. Small names clone without heap allocation.
+//! Shared row field names. Cloning names never allocates.
 use std::{borrow::Borrow, cmp::Ordering, fmt, hash::{Hash, Hasher}, sync::Arc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Visitor};
-use crate::store::InlineStr;
 
 #[derive(Clone)]
-enum Storage { Inline(InlineStr), Shared(Arc<str>) }
-#[derive(Clone)]
-pub struct RowKey(Storage);
+pub struct RowKey(Arc<str>);
 impl RowKey {
     #[inline]
     pub fn as_str(&self) -> &str {
-        match &self.0 { Storage::Inline(s) => s.as_str(), Storage::Shared(s) => s }
+        &self.0
     }
     pub fn into_string(self) -> String { self.as_str().to_owned() }
 }
 impl From<&str> for RowKey {
     #[inline]
     fn from(s: &str) -> Self {
-        Self(match InlineStr::try_new(s) { Some(s) => Storage::Inline(s), None => Storage::Shared(Arc::from(s)) })
+        Self(Arc::from(s))
     }
 }
 impl From<String> for RowKey { fn from(s: String) -> Self { Self::from(s.as_str()) } }
 impl From<Arc<str>> for RowKey {
-    fn from(s: Arc<str>) -> Self { Self(match InlineStr::try_new(&s) { Some(s) => Storage::Inline(s), None => Storage::Shared(s) }) }
+    fn from(s: Arc<str>) -> Self { Self(s) }
 }
 impl From<RowKey> for String { fn from(s: RowKey) -> Self { s.into_string() } }
 impl AsRef<str> for RowKey { #[inline] fn as_ref(&self) -> &str { self.as_str() } }
@@ -64,11 +61,11 @@ mod tests {
         for text in [String::new(),"a".repeat(22),"a".repeat(23),"ёж".repeat(5),"é".repeat(11),"é".repeat(12),format!("{}é","x".repeat(21))] {
             let key=RowKey::from(text.as_str());let cloned=key.clone();
             assert_eq!(key.as_str(),text);assert_eq!(cloned,key);
-            assert_eq!(matches!(key.0,Storage::Inline(_)),text.len()<=22);
-            if let (Storage::Shared(a),Storage::Shared(b))=(&key.0,&cloned.0){assert!(Arc::ptr_eq(a,b));}
+            assert!(Arc::ptr_eq(&key.0,&cloned.0));
         }
         #[cfg(target_pointer_width="64")]
-        assert_eq!(std::mem::size_of::<RowKey>(),std::mem::size_of::<String>());
+        assert_eq!(std::mem::size_of::<RowKey>(),16);
+        assert!(std::mem::size_of::<RowKey>() < std::mem::size_of::<String>());
     }
     #[test]
     fn mixed_key_storage_preserves_legacy_order_hash_and_wire_bytes() {
