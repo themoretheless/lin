@@ -1,0 +1,63 @@
+{
+  "profiling_only": true,
+  "performance_qualified": false,
+  "not_peer_superiority_evidence": true,
+  "profiled_over_unprofiled": 1.0044269437370377,
+  "measurements": {
+    "unprofiled": {
+      "command": [
+        "/tmp/lin-native-insert-profile"
+      ],
+      "median_ns": 252559568.5,
+      "samples_ns": [
+        466677002.0,
+        272489372.0,
+        247255898.0,
+        249999762.0,
+        250860487.0,
+        254100793.0,
+        253338075.0,
+        249956827.0,
+        248634868.0,
+        251781062.0,
+        256369332.0,
+        257023471.0
+      ],
+      "all_six_fields_verified_rows": 100000,
+      "statements": 10
+    },
+    "profiled": {
+      "command": [
+        "/usr/lib/linux-tools/7.0.0-1017-azure/perf",
+        "record",
+        "-e",
+        "cpu-clock:u",
+        "-F",
+        "499",
+        "--call-graph",
+        "fp",
+        "-o",
+        "/home/runner/work/lin/lin/benches/results/2026-11-02-native-insert-cpu-profile/perf.data",
+        "--",
+        "/tmp/lin-native-insert-profile"
+      ],
+      "median_ns": 253677635.5,
+      "samples_ns": [
+        467967956.0,
+        280115182.0,
+        256293618.0,
+        254979119.0,
+        249647175.0,
+        249362856.0,
+        256645707.0,
+        250338946.0,
+        252376152.0,
+        250861352.0,
+        248950055.0,
+        256239166.0
+      ],
+      "all_six_fields_verified_rows": 100000,
+      "statements": 10
+    }
+  }
+}

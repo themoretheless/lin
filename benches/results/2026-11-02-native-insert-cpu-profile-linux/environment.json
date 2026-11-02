@@ -1,0 +1,37 @@
+{
+  "platform": "Linux-7.0.0-1017-azure-x86_64-with-glibc2.39",
+  "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)\nbinary: rustc\ncommit-hash: ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96\ncommit-date: 2026-05-25\nhost: x86_64-unknown-linux-gnu\nrelease: 1.96.0\nLLVM version: 22.1.2\n",
+  "perf_path": "/usr/lib/linux-tools/7.0.0-1017-azure/perf",
+  "perf_version": "perf version 7.0.14\n",
+  "runtime_reference": "60e64559ec0e5a21efd490d6da5a744e3ac8d0e2",
+  "performance_qualified": false,
+  "profiling_only": true,
+  "perf_readiness_exit": 0,
+  "build_env": {
+    "CARGO_BUILD_JOBS": "2",
+    "CARGO_TARGET_DIR": "/home/runner/work/lin/lin/target/native-insert-profile",
+    "RUSTFLAGS": "-C force-frame-pointers=yes -C debuginfo=1"
+  },
+  "commands": [
+    [
+      "cargo",
+      "test",
+      "--release",
+      "-p",
+      "lin-peer-worker"
+    ],
+    [
+      "cargo",
+      "build",
+      "--release",
+      "-p",
+      "lin-peer-worker",
+      "--message-format=json-render-diagnostics"
+    ]
+  ],
+  "binary": {
+    "path": "/tmp/lin-native-insert-profile",
+    "sha256": "12b19c68cc16943727258b581d7aff61b76306803224dd0aebac9d7b97546547"
+  },
+  "source_unchanged": true
+}
