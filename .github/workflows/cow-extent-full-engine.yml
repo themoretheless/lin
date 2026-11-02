@@ -1,0 +1,82 @@
+name: cow-extent-full-engine
+on:
+  push:
+    branches: [codex/cow-extent-full-engine-ci]
+permissions:
+  contents: read
+  actions: read
+jobs:
+  benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_TARGET_DIR: target/shared-peer-full-engine
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.96.0'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> target/shared-peer-full-engine'
+          cache-on-failure: true
+      - name: Verify frozen source pair and harness operation boundaries
+        run: |
+          python3 benches/results/2026-11-02-cow-extent-full-engine/verify-inputs.py
+          python3 benches/results/2026-11-02-cow-extent-full-engine/build.py --verify-inputs
+          python3 benches/results/2026-11-02-cow-extent-full-engine/audit-harness.py
+          python3 scripts/test-benchmark-role-balance.py
+          python3 benches/results/2026-11-02-cow-extent-full-engine/test-protocol.py
+      - name: Fetch exact historical baseline correctness and audit all negatives
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import json,subprocess
+          p=Path('benches/results/2026-11-02-cow-extent-full-engine')
+          m=json.loads((p/'source-inputs.json').read_text())
+          dest=p/'correctness-artifacts/baseline';assert not dest.exists();dest.mkdir(parents=True)
+          run=str(m['correctness_runs']['baseline'])
+          (dest/'run.json').write_bytes(subprocess.check_output(['gh','run','view',run,'--json','databaseId,headSha,status,conclusion,url']))
+          subprocess.run(['gh','run','download',run,'--name','btreemap-correctness-vnext','--dir',str(dest/'artifact')],check=True)
+          PY
+          python3 benches/results/2026-11-02-cow-extent-full-engine/audit-baseline.py
+      - name: Full current-source default and feature suites and five compiled negatives
+        run: python3 benches/results/2026-11-02-cow-extent-full-engine/candidate-correctness.py
+      - name: Independently audit current source tests and compiled negative sources
+        run: python3 benches/results/2026-11-02-cow-extent-full-engine/audit-candidate.py --linux
+      - name: Build exact pair and immutable baseline peer executable
+        run: python3 benches/results/2026-11-02-cow-extent-full-engine/build.py
+      - name: All 134 assigned functional smokes
+        run: python3 benches/results/2026-11-02-cow-extent-full-engine/smoke.py
+      - name: All 2412 balanced fresh processes
+        run: python3 benches/results/2026-11-02-cow-extent-full-engine/run.py
+      - name: Summarize complete 19296 observations
+        id: summarize
+        run: python3 benches/results/2026-11-02-cow-extent-full-engine/summarize.py
+      - name: Independent complete raw audit
+        if: always() && steps.summarize.outcome == 'success'
+        run: |
+          python3 benches/results/2026-11-02-cow-extent-full-engine/verify-inputs.py
+          python3 benches/results/2026-11-02-cow-extent-full-engine/verify.py
+      - name: Enforce unchanged full-source numerical thresholds
+        if: always() && steps.summarize.outcome == 'success'
+        run: python3 benches/results/2026-11-02-cow-extent-full-engine/qualify.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cow-extent-full-engine
+          path: benches/results/2026-11-02-cow-extent-full-engine/
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cow-extent-full-engine-exact-linux-executables
+          path: |
+            /tmp/lin-cow-extent-full-engine-baseline
+            /tmp/lin-cow-extent-full-engine-candidate
+            /tmp/lin-cow-extent-full-engine-external

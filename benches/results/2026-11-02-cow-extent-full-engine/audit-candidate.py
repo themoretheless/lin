@@ -1,0 +1,19 @@
+from pathlib import Path
+import ast,hashlib,json,re,sys
+p=Path(__file__).resolve().parent;root=p.parents[2];sha=lambda b:hashlib.sha256(b).hexdigest();m=json.loads((p/'source-inputs.json').read_text());s=json.loads((p/'candidate-correctness.json').read_text())
+assert s['complete']and s['sources_and_tests_restored']and s['source_commit']==m['candidate']['commit']and s['compiled_negative_checks']==5 and s['compiled_negatives_exit_code']==0
+if '--linux' in sys.argv:assert 'release: 1.96.0'in s['compiler']and'host: x86_64-unknown-linux-gnu'in s['compiler']
+for n,h in m['runtime_and_tests_sha256'].items():assert sha((root/n).read_bytes())==h,n
+for mode,passed,ignored in [('default',463,2),('feature',483,4)]:
+ log=(p/(mode+'-tests.log')).read_bytes();counts=[tuple(map(int,c))for c in re.findall(r'test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored;',log.decode())];actual=dict(passed=sum(c[0]for c in counts),failed=sum(c[1]for c in counts),ignored=sum(c[2]for c in counts));assert actual==dict(passed=passed,failed=0,ignored=ignored)==s['suites'][mode]['counts'];assert sha(log)==s['suites'][mode]['log_sha256'] and s['suites'][mode]['exit_code']==0
+ assert s['suites'][mode]['command']==['cargo','test','--release',*(['--features','experimental-extent-wal']if mode=='feature'else[])]
+ log=log.decode()
+ for name in ['empty_probe_tracks_dense_sparse_and_last_bit_across_promotion_and_growth','cloned_rows_do_not_alias_mutations_and_serde_stays_map_shaped','held_row_isolated_and_body_hash_fts_maps_restore_on_rollback','actual_update_promotes_only_touched_row_and_keeps_held_result','deterministic_map_model_across_promotions_and_held_clones','representation_preserves_eq_hash_wire_debug_and_snapshot_isolation']:assert re.search(r'test [^\n]*'+re.escape(name)+r' \.\.\. ok',log),name
+feature_log=(p/'feature-tests.log').read_text()
+for name in ['sigkill_recovery_at_each_publication_stage','every_header_and_committed_frame_byte_corruption_is_rejected','prepared_columns_match_legacy_for_valid_and_stale_metadata','replay_reads_header_and_logical_region_once_and_checks_snapshot_covered_crc','capacity_failure_and_normal_mode_refusal_restore_memory_and_wal','acknowledged_writes_replay_without_drop_checkpoint','extent_columnar_bulk_ships_every_row_and_survives_checkpoint','extent_read_only_rejects_corruption_without_rewriting_it','separate_reader_process_holds_fence_and_exit_releases_checkpoint','bootstrap_extent_follower_restores_schema_then_applies_new_wal','bootstrap_extent_refuses_existing_targets_and_invalid_input_before_creation']:
+ assert re.search(r'test [^\n]*'+re.escape(name)+r' \.\.\. ok',feature_log),name
+mutants=json.loads((p/'mutant-status.json').read_text());tree=ast.parse((p/'check-mutants.py').read_text());cases=next(ast.literal_eval(n.value)for n in tree.body if isinstance(n,ast.Assign)and any(isinstance(t,ast.Name)and t.id=='cases'for t in n.targets));assert len(cases)==len(mutants['checks'])==5 and mutants['source_restored'];source=(root/'src/exec.rs').read_text()
+for case,check in zip(cases,mutants['checks']):
+ label,old,new,count,target,test=case;assert source.count(old)==count;expected=source.replace(old,new).encode();assert(p/(label+'-mutant.rs')).read_bytes()==expected;assert check==dict(label=label,exit_code=101,test=test,mutant_sha256=sha(expected),compiled_runtime_rejected=True)
+ log=(p/(label+'-runtime.log')).read_text();assert 'Finished `release` profile'in log and 'running 1 test'in log and 'test result: FAILED. 0 passed; 1 failed;'in log and 'test '+test+' ... FAILED'in log
+(p/'candidate-correctness-audit.json').write_text(json.dumps(dict(default_passed=463,feature_passed=483,compiled_negative_checks=5,all_sources_and_tests_restored=True,exact_mutant_sources_verified=True,performance_qualified=False),indent=2)+'\n');print('PASS independent current-source correctness audit')
