@@ -1,0 +1,7 @@
+# Reserve secondary-index reverse map before slab insertion
+
+Baseline b88ebea2e; candidate changes only LiveIndex::insert_slab_batch to reserve exactly the number of already-filtered rows in its reverse hash map before computing the existing key vector. Preserve the full pre-existing algorithm, row order, predicate timestamp, partial filtering, bitmap sampling, unique errors and insertion semantics. The previous streaming-key experiment is excluded. Row identity/URI maps already reserve batch capacity and are unchanged.
+
+Two Linux series, each 6 balanced rounds x 3 sizes (1k/10k/100k) x 3 roles (same baseline ELF for base/control, one candidate ELF), 8 samples per process. Total 108 processes, 864 observations and 3996000 six-field row readbacks. All existing worker timers, public transaction boundaries, bounded 10k statements, default embeddings and FTS remain intact. Build/test before measurement; no build overlap. Keep every loss/control variation; no numerical waiver, unchanged retry or adoption follows from green correctness/artifact steps.
+
+Standalone package builds avoid unrelated comparison dev-dependencies; local independent bitmap reference and complete default regression remain correctness prerequisites. Worker 100k test runs in Linux before the two series. This is component discovery with no external engine; any benefit still requires full controls and actual peers, including unresolved DuckDB100k, SQLite rollback10k, MSSQL and Kusto. No whole-objective completion is claimed.
