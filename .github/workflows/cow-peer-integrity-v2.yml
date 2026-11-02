@@ -36,6 +36,8 @@ jobs:
           assert {str(f):hashlib.sha256(f.read_bytes()).hexdigest()for f in Path('src').rglob('*.rs')}==m['restore_source_sha256']
           PY
           python3 benches/results/2026-11-02-corrected-cow-peer-integrity-v2/source-overlay.py --verify-inputs
+      - name: Verify source manifests before services or compilation
+        run: python3 benches/results/2026-11-02-corrected-cow-peer-integrity-v2/test-source-manifest.py
       - name: Verify kernel and exact Mongo readiness prerequisite
         run: python3 benches/results/2026-11-02-corrected-cow-peer-integrity-v2/check-host.py
       - name: Install exact corrected runtime source

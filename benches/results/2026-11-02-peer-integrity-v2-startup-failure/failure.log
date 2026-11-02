@@ -1,0 +1,31 @@
+peers	Complete read and native insertion matrices	﻿2026-11-02T04:09:51.1512859Z ##[group]Run python3 benches/results/2026-11-02-corrected-cow-peer-integrity-v2/run.py
+peers	Complete read and native insertion matrices	2026-11-02T04:09:51.1513539Z ^[[36;1mpython3 benches/results/2026-11-02-corrected-cow-peer-integrity-v2/run.py^[[0m
+peers	Complete read and native insertion matrices	2026-11-02T04:09:51.1574226Z shell: /usr/bin/bash -e {0}
+peers	Complete read and native insertion matrices	2026-11-02T04:09:51.1574471Z env:
+peers	Complete read and native insertion matrices	2026-11-02T04:09:51.1574657Z   CARGO_BUILD_JOBS: 2
+peers	Complete read and native insertion matrices	2026-11-02T04:09:51.1574884Z   CARGO_HOME: /home/runner/.cargo
+peers	Complete read and native insertion matrices	2026-11-02T04:09:51.1575132Z   CARGO_INCREMENTAL: 0
+peers	Complete read and native insertion matrices	2026-11-02T04:09:51.1575348Z   CARGO_TERM_COLOR: always
+peers	Complete read and native insertion matrices	2026-11-02T04:09:51.1575642Z   pythonLocation: /opt/hostedtoolcache/Python/3.13.17/x64
+peers	Complete read and native insertion matrices	2026-11-02T04:09:51.1576068Z   PKG_CONFIG_PATH: /opt/hostedtoolcache/Python/3.13.17/x64/lib/pkgconfig
+peers	Complete read and native insertion matrices	2026-11-02T04:09:51.1576512Z   Python_ROOT_DIR: /opt/hostedtoolcache/Python/3.13.17/x64
+peers	Complete read and native insertion matrices	2026-11-02T04:09:51.1576897Z   Python2_ROOT_DIR: /opt/hostedtoolcache/Python/3.13.17/x64
+peers	Complete read and native insertion matrices	2026-11-02T04:09:51.1577274Z   Python3_ROOT_DIR: /opt/hostedtoolcache/Python/3.13.17/x64
+peers	Complete read and native insertion matrices	2026-11-02T04:09:51.1577677Z   LD_LIBRARY_PATH: /opt/hostedtoolcache/Python/3.13.17/x64/lib
+peers	Complete read and native insertion matrices	2026-11-02T04:09:51.1578048Z   CACHE_ON_FAILURE: true
+peers	Complete read and native insertion matrices	2026-11-02T04:09:51.1578283Z ##[endgroup]
+peers	Complete read and native insertion matrices	2026-11-02T04:09:51.5368165Z Traceback (most recent call last):
+peers	Complete read and native insertion matrices	2026-11-02T04:09:51.5383889Z   File "/home/runner/work/lin/lin/benches/results/2026-11-02-corrected-cow-peer-integrity-v2/run.py", line 9, in <module>
+peers	Complete read and native insertion matrices	2026-11-02T04:09:51.5385894Z     source.update({str(f):sha(f) for f in [Path('Cargo.toml'),Path('Cargo.lock'),Path('examples/peer_bench.rs'),Path('scripts/bench-peers.py','scripts/benchmark_source_integrity.py','scripts/test_benchmark_source_integrity.py')]})
+peers	Complete read and native insertion matrices	2026-11-02T04:09:51.5387541Z                           ~~~^^^
+peers	Complete read and native insertion matrices	2026-11-02T04:09:51.5388463Z   File "/home/runner/work/lin/lin/benches/results/2026-11-02-corrected-cow-peer-integrity-v2/run.py", line 7, in sha
+peers	Complete read and native insertion matrices	2026-11-02T04:09:51.5389485Z     def sha(p):return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+peers	Complete read and native insertion matrices	2026-11-02T04:09:51.5390064Z                                      ~~~~~~~~~~~~~~~~~~^^
+peers	Complete read and native insertion matrices	2026-11-02T04:09:51.5390916Z   File "/opt/hostedtoolcache/Python/3.13.17/x64/lib/python3.13/pathlib/_abc.py", line 625, in read_bytes
+peers	Complete read and native insertion matrices	2026-11-02T04:09:51.5391685Z     with self.open(mode='rb') as f:
+peers	Complete read and native insertion matrices	2026-11-02T04:09:51.5392067Z          ~~~~~~~~~^^^^^^^^^^^
+peers	Complete read and native insertion matrices	2026-11-02T04:09:51.5393020Z   File "/opt/hostedtoolcache/Python/3.13.17/x64/lib/python3.13/pathlib/_local.py", line 537, in open
+peers	Complete read and native insertion matrices	2026-11-02T04:09:51.5393914Z     return io.open(self, mode, buffering, encoding, errors, newline)
+peers	Complete read and native insertion matrices	2026-11-02T04:09:51.5394505Z            ~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+peers	Complete read and native insertion matrices	2026-11-02T04:09:51.5395636Z NotADirectoryError: [Errno 20] Not a directory: 'scripts/bench-peers.py/scripts/benchmark_source_integrity.py/scripts/test_benchmark_source_integrity.py'
+peers	Complete read and native insertion matrices	2026-11-02T04:09:51.5701629Z ##[error]Process completed with exit code 1.

@@ -6,7 +6,7 @@ r=Path(__file__).resolve().parent;owner='cow-corrected-peer-ubuntu22-20261102';c
 def capture(cmd):return subprocess.check_output(cmd,text=True).strip()
 def sha(p):return hashlib.sha256(Path(p).read_bytes()).hexdigest()
 source={str(f):sha(f) for f in Path('src').rglob('*.rs')}
-source.update({str(f):sha(f) for f in [Path('Cargo.toml'),Path('Cargo.lock'),Path('examples/peer_bench.rs'),Path('scripts/bench-peers.py','scripts/benchmark_source_integrity.py','scripts/test_benchmark_source_integrity.py')]})
+source.update({str(f):sha(f) for f in [Path('Cargo.toml'),Path('Cargo.lock'),Path('examples/peer_bench.rs'),Path('scripts/bench-peers.py'),Path('scripts/benchmark_source_integrity.py'),Path('scripts/test_benchmark_source_integrity.py')]})
 build=json.loads((r/'build-provenance.json').read_text());assert build['source_unchanged']and build['source_sha256']==source
 assert sha(build['binary']['path'])==build['binary']['sha256']
 shutil.copy2(build['binary']['path'],'/tmp/lin-cow-corrected-peer-current')
