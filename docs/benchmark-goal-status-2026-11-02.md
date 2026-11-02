@@ -30,7 +30,7 @@ Absolute matched SQLite FULL WAL comparisons: **63/96 wins**, comprising1k UPDAT
 - MSSQL: prior private encrypted qualification belongs to runtime625bc7180, not current60e64559e. It does not qualify the current source. No private outcomes, ratios, keys or plaintext are published here.
 - Kusto: real endpoint/database/token remain unavailable at the last checked inventory. No benchmark exists; no emulator substituted.
 - FTS classification fold was rejected by its Linux component and reverted. It is absent from both current matrices.
-- Constant768 token/trigram modulus: full local default463/2 and feature483/4 suites pass; local108-process native insertion discovery has no reliable gain. [Linux same-root-worker discovery41417236076](https://github.com/themoretheless/lin/actions/runs/41417236076) is separate and unfinished at this report's creation. No adoption.
+- Constant768 token/trigram modulus: full local default463/2 and feature483/4 suites pass; local108-process native insertion discovery has no reliable gain. [Linux same-root-worker discovery41417236076](https://github.com/themoretheless/lin/actions/runs/41417236076) completed:100k-2.404%/+1.227%, only1/6and3/6positive. Rejected; original embedding source restored. All108processes/864samples retained.
 - COW rollback ownership is a separate unqualified proposal. It moves the stored Row before applying its inverse delta and discards unpublished Pack owners first. It preserves the baseline full scalar/FTS remove/reinsert maintenance. Pointer identity/held-result correctness evidence is not a latency or peer win.
 - Extent growth and broader power-loss/directory qualification remain open. SIGKILL and checksum tests do not establish physical power-loss guarantees.
 

@@ -99,28 +99,16 @@ impl HashingEmbedder {
     /// Add every feature of `lower` (unigrams, char trigrams, string bigrams)
     /// into the accumulator.
     fn fill(&self, s: &mut Scratch, lower: &str) {
-        if self.dim == 768 {
-            Self::fill_tokens::<768>(s, lower);
-        } else {
-            Self::fill_tokens::<0>(s, lower);
-        }
-        self.fill_bigrams(s, lower);
-    }
-
-    fn fill_tokens<const DIM: usize>(s: &mut Scratch, lower: &str) {
         // The ASCII splitter excludes vertical tab; Unicode splitting includes it.
         if lower.is_ascii() && !lower.as_bytes().contains(&0x0b) {
             for token in lower.split_ascii_whitespace() {
-                s.bump_token::<DIM>(token);
+                s.bump_token(token);
             }
         } else {
             for token in lower.split_whitespace() {
-                s.bump_token::<DIM>(token);
+                s.bump_token(token);
             }
         }
-    }
-
-    fn fill_bigrams(&self, s: &mut Scratch, lower: &str) {
         // Character bigrams over the whole string catch short queries.
         let bytes = lower.as_bytes();
         if self.dim == 768 {
@@ -188,31 +176,23 @@ impl Scratch {
     }
 
     #[inline]
-    fn bump_token<const DIM: usize>(&mut self, token: &str) {
-        self.bump_modulo::<DIM>(token, 1.0);
+    fn bump_token(&mut self, token: &str) {
+        self.bump(token, 1.0);
         let bytes = token.as_bytes();
         if bytes.len() >= 3 {
             for window in bytes.windows(3) {
-                self.bump_modulo::<DIM>(window, 0.5);
+                self.bump(window, 0.5);
             }
         } else {
-            self.bump_modulo::<DIM>(bytes, 0.5);
+            self.bump(bytes, 0.5);
         }
     }
 
     #[inline]
     fn bump(&mut self, key: impl Hash, w: f32) {
-        self.bump_modulo::<0>(key, w);
-    }
-
-    // DIM=0 keeps the generic dimension path. Dispatch once per text so the
-    // default dimension uses constant division for token and trigram hashes.
-    #[inline]
-    fn bump_modulo<const DIM: usize>(&mut self, key: impl Hash, w: f32) {
         let mut h = FxHasher::default();
         key.hash(&mut h);
-        let dim = if DIM == 0 { self.v.len() } else { DIM };
-        let i = (h.finish() as usize) % dim;
+        let i = (h.finish() as usize) % self.v.len();
         self.bump_slot(i, w);
     }
 
@@ -1347,7 +1327,7 @@ mod tests {
             let i = (h.finish() as usize) % expected.len();
             expected[i] += weight;
         }
-        for dim in [8, 9, 31, 32, 128, 384, 768, 1024, 1536] {
+        for dim in [8, 9, 32, 384, 768, 1024, 1536] {
             let embedder = HashingEmbedder::new("test", dim);
             let mut texts = [
                 "",
@@ -1358,10 +1338,6 @@ mod tests {
             ]
             .map(String::from)
             .to_vec();
-            // Exercise large counts, long UTF-8 tokens, and both whitespace
-            // paths while alternating dimensions through the shared scratch.
-            texts.push("wal ".repeat(4096));
-            texts.push("ёж🦔abc".repeat(2048));
             texts.extend((0u8..=127).map(|c| format!("ab{}cd", char::from(c))));
             texts.extend(
                 [
