@@ -1,0 +1,35 @@
+name: mongo-ubuntu22-readiness
+on:
+  push:
+    branches: [codex/mongo-ubuntu22-readiness-ci]
+permissions:
+  contents: read
+jobs:
+  mongo:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Verify frozen readiness probe and kernel boundary controls
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import json,hashlib
+          p=Path('benches/results/2026-11-02-mongo-ubuntu22-readiness')
+          for name,digest in json.loads((p/'frozen.json').read_text()).items():
+              assert hashlib.sha256(Path(name).read_bytes()).hexdigest()==digest,name
+          PY
+          python3 benches/results/2026-11-02-mongo-ubuntu22-readiness/test-kernel-guard.py
+      - name: Install exact diagnostic bindings
+        run: python3 -m pip install pymongo==4.18.2 dnspython==2.8.0
+      - name: Probe exact image on changed runner without benchmark timings
+        run: python3 benches/results/2026-11-02-mongo-ubuntu22-readiness/probe.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mongo-ubuntu22-readiness
+          path: benches/results/2026-11-02-mongo-ubuntu22-readiness/
+          if-no-files-found: error

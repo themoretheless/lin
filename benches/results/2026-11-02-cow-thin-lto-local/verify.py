@@ -1,5 +1,5 @@
 from pathlib import Path
-import hashlib,json,math,statistics,sys
+import hashlib,json,math,statistics,subprocess,sys
 p=Path(__file__).resolve().parent;root=p.parents[2]
 sys.path.insert(0,str(root/'scripts'))
 from benchmark_role_balance import schedule,orders_from_records
@@ -8,6 +8,17 @@ m=json.loads((p/'provenance.json').read_text());status=json.loads((p/'status.jso
 records=json.loads((p/'process-status.json').read_text());smokes=json.loads((p/'smoke-status.json').read_text());reported=json.loads((p/'summary.json').read_text())
 assert len(cases)==12 and len(set(cases))==12 and len(records)==216 and len(smokes)==24
 assert m['source_restored']and m['runtime_changes']==False and m['performance_qualification']==False
+
+assert m['candidate_command']==['cargo','bench','--bench','compare','--no-run','--color','never','--verbose','--config','profile.release.lto="thin"']
+log=(p/'build.log').read_text()
+commands=[line for line in log.splitlines()if '--crate-name compare 'in line]
+assert commands and all('-C lto=thin'in line and '-C codegen-units=1'not in line for line in commands)
+assert m['peer_binary']['source_commit']==m['source_commit']
+assert m['peer_binary']['compiled_compare_sha256']==m['harness_sha256']
+for name,h in m['source_sha256'].items():
+ assert sha(subprocess.check_output(['git','show',m['source_commit']+':'+name],cwd=root))==h
+for name,h in m['build_sha256'].items():assert sha((root/name).read_bytes())==h
+
 assert status==dict(processes=216,observations=1728,smokes=24,measurement_complete=True,source_restored=True,invariant_peer_assignments=18,performance_qualification=False,adopted=False)
 plan=schedule([dict(id=c)for c in cases],['baseline','control','candidate'],rounds=6)
 assert [(r['round'],r['role'],r['case'])for r in records]==[(r['round'],r['role'],r['workload'])for r in plan]
