@@ -1,0 +1,48 @@
+name: fts-fold-linux-component
+on:
+  push:
+    branches: [codex/fts-fold-linux-component-ci]
+permissions:
+  contents: read
+jobs:
+  component:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.96.0'
+      - name: Verify exact source delta and protocol paths
+        run: python3 benches/results/2026-11-02-fts-fold-linux-component/audit-inputs.py
+      - name: Build and test standalone workers with immutable inputs
+        run: python3 benches/results/2026-11-02-fts-fold-linux-component/build.py
+      - name: First balanced series
+        env:
+          SERIES: series1
+        run: python3 benches/results/2026-11-02-fts-fold-linux-component/measure.py
+      - name: Independently audit first series
+        run: python3 benches/results/2026-11-02-fts-fold-linux-component/verify.py series1
+      - name: Second balanced series
+        env:
+          SERIES: series2
+        run: python3 benches/results/2026-11-02-fts-fold-linux-component/measure.py
+      - name: Independently audit second series
+        run: python3 benches/results/2026-11-02-fts-fold-linux-component/verify.py series2
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fts-fold-linux-component
+          path: benches/results/2026-11-02-fts-fold-linux-component/
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fts-fold-exact-linux-executables
+          path: /tmp/lin-fts-fold-base
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fts-fold-candidate-exact-linux-executable
+          path: /tmp/lin-fts-fold-cand
