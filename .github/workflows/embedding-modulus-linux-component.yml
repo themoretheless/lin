@@ -1,0 +1,50 @@
+name: embedding-modulus-linux-component
+on:
+  push:
+    branches: [codex/embedding-modulus-linux-component-ci]
+permissions:
+  contents: read
+jobs:
+  component:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.96.0'
+      - name: Verify exact source delta and protocol paths
+        run: python3 benches/results/2026-11-02-embedding-modulus-linux-component/audit-inputs.py
+      - name: Full candidate default and extent correctness
+        run: python3 benches/results/2026-11-02-embedding-modulus-linux-component/correctness.py
+      - name: Build exact root example workers with immutable inputs
+        run: python3 benches/results/2026-11-02-embedding-modulus-linux-component/build.py
+      - name: First balanced series
+        env:
+          SERIES: series1
+        run: python3 benches/results/2026-11-02-embedding-modulus-linux-component/measure.py
+      - name: Independently audit first series
+        run: python3 benches/results/2026-11-02-embedding-modulus-linux-component/verify.py series1
+      - name: Second balanced series
+        env:
+          SERIES: series2
+        run: python3 benches/results/2026-11-02-embedding-modulus-linux-component/measure.py
+      - name: Independently audit second series
+        run: python3 benches/results/2026-11-02-embedding-modulus-linux-component/verify.py series2
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: embedding-modulus-linux-component
+          path: benches/results/2026-11-02-embedding-modulus-linux-component/
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: embedding-modulus-exact-linux-executables
+          path: /tmp/lin-embedding-modulus-base
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: embedding-modulus-candidate-exact-linux-executable
+          path: /tmp/lin-embedding-modulus-cand
