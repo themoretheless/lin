@@ -1216,9 +1216,21 @@ pub(crate) fn encode_extent_frame(rec: &LogRecord, buf: &mut Vec<u8>, frame: &mu
         Pack::InsertCols {collection,fields,cols,n,edges} if edges.is_empty() && fields.len()==cols.len() => encode_insert_cols_v2(rec.r#gen,rec.next_id,collection,fields,cols,*n,buf)?,
         _ => {buf.clear();rmp_serde::encode::write_named(&mut *buf,rec).map_err(io_err)?;LOG_MAGIC_V1}
     };
-    let len=buf.len().checked_add(5).filter(|n|*n<=MAX_RECORD as usize).ok_or_else(||io_err("log record exceeds 16MiB"))?;
-    let mut checksum=crate::crc::Hasher::new();checksum.update(&[magic[3]]);checksum.update(buf);
-    frame.clear();frame.reserve(8+len);frame.extend_from_slice(&LOG_MAGIC_CHECKSUM);frame.extend_from_slice(&(len as u32).to_le_bytes());frame.push(magic[3]);frame.extend_from_slice(buf);frame.extend_from_slice(&checksum.finalize().to_le_bytes());Ok(())
+    frame_extent_payload(&magic,buf,frame)
+}
+#[cfg(feature = "experimental-extent-wal")]
+fn frame_extent_payload(magic:&[u8;4],payload:&[u8],frame:&mut Vec<u8>)->Result<(),Error> {
+    let len=payload.len().checked_add(5).filter(|n|*n<=MAX_RECORD as usize).ok_or_else(||io_err("log record exceeds 16MiB"))?;
+    let mut checksum=crate::crc::Hasher::new();checksum.update(&[magic[3]]);checksum.update(payload);
+    frame.clear();frame.reserve(8+len);frame.extend_from_slice(&LOG_MAGIC_CHECKSUM);frame.extend_from_slice(&(len as u32).to_le_bytes());frame.push(magic[3]);frame.extend_from_slice(payload);frame.extend_from_slice(&checksum.finalize().to_le_bytes());Ok(())
+}
+#[cfg(feature = "experimental-extent-wal")]
+pub(crate) fn encode_extent_prepared_frame(rec:&LogRecord,prepared:EncodedColumns,buf:&mut Vec<u8>,frame:&mut Vec<u8>)->Result<(),Error> {
+    let valid=rec.r#gen==prepared.generation && rec.next_id==prepared.next_id
+        && matches!(&rec.pack,Pack::InsertCols{collection,fields,cols,n,edges}
+            if collection==&prepared.collection && fields==&prepared.fields && fields.len()==cols.len() && *n==prepared.rows && edges.is_empty());
+    *buf=prepared.bytes;
+    if valid {frame_extent_payload(&prepared.magic,buf,frame)}else{encode_extent_frame(rec,buf,frame)}
 }
 
 fn append_record_v1(

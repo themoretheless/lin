@@ -112,6 +112,9 @@ impl ExtentWal {
     pub fn append_record(&mut self, record:&crate::persist::LogRecord, payload:&mut Vec<u8>, frame:&mut Vec<u8>)->Result<(),Error> {
         crate::persist::encode_extent_frame(record,payload,frame)?;self.append_frames(frame)
     }
+    pub(crate) fn append_prepared_record(&mut self,record:&crate::persist::LogRecord,prepared:crate::persist::EncodedColumns,payload:&mut Vec<u8>,frame:&mut Vec<u8>)->Result<(),Error> {
+        crate::persist::encode_extent_prepared_frame(record,prepared,payload,frame)?;self.append_frames(frame)
+    }
     pub(crate) fn flush_for_checkpoint(&self)->Result<(),Error> {
         if self.poisoned {return Err(io_err("extent handle poisoned"));}durable_sync(&self.file).map_err(io_err)
     }
@@ -139,6 +142,22 @@ mod tests {
         }
     }
     impl Drop for Temp {fn drop(&mut self){let _=std::fs::remove_dir_all(&self.0);}}
+    #[test]
+    fn prepared_columns_match_legacy_for_valid_and_stale_metadata(){
+        let tmp=Temp::new();let rows=vec![Row::from([("id".into(),Cell::from("prepared")),("count".into(),Cell::Int(7))])];
+        for variant in 0..5 {
+            let mut staged=crate::persist::prepare_insert_columns(5,10,"docs",&rows,Vec::new());
+            let other=crate::persist::prepare_insert_columns(5,10,"docs",&rows,Vec::new());
+            let mut record=LogRecord{r#gen:5,next_id:10,pack:staged.pack.take().unwrap()};
+            match variant {1=>record.r#gen+=1,2=>record.next_id+=1,3=>{if let Pack::InsertCols{collection,..}=&mut record.pack{*collection="other".into();}},4=>{if let Pack::InsertCols{fields,..}=&mut record.pack{fields[0].push_str("_renamed");}},_=>{}}
+            let crate::persist::PreparedEncoding::Ready(encoded)=staged.encoding else{panic!("expected encoded columns")};
+            let crate::persist::PreparedEncoding::Ready(reference)=other.encoding else{panic!("expected reference columns")};
+            let legacy_path=tmp.path(&format!("prepared-legacy-{variant}"));let mut legacy=OpenOptions::new().write(true).create_new(true).open(&legacy_path).unwrap();
+            crate::persist::append_prepared_record(&mut legacy,&record,reference,&mut Vec::new(),SyncMode::Normal,&mut 0).unwrap();drop(legacy);
+            let path=tmp.path(&format!("prepared-extent-{variant}"));let mut wal=ExtentWal::create(&path,8192).unwrap();
+            wal.append_prepared_record(&record,encoded,&mut Vec::new(),&mut Vec::new()).unwrap();assert_eq!(wal.read_frames().unwrap(),std::fs::read(legacy_path).unwrap());
+        }
+    }
     #[test]
     fn codec_byte_parity_replay_snapshot_boundary_and_clear_reuse(){
         let tmp=Temp::new();let path=tmp.path("extent");let rows=vec![Row::from([("id".into(),Cell::from("one")),("count".into(),Cell::Int(7))])];

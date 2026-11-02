@@ -1,0 +1,34 @@
+   Compiling lin v0.4.0 (/Users/themoretheless/.codex/worktrees/cow-row-vnext/lin)
+warning: unused import: `super::*`
+  --> src/cow_row_tests.rs:16:6
+   |
+16 |  use super::*;
+   |      ^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `lin` (lib test) generated 1 warning (run `cargo fix --lib -p lin --tests` to apply 1 suggestion)
+    Finished `release` profile [optimized] target(s) in 59.83s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/lib.rs (/tmp/lin-corrected-update-patch-target-20261101/release/build/lin/a8e61dccf3c48089/out/lin-a8e61dccf3c48089)
+
+running 10 tests
+test extent_wal::crash_tests::child ... ignored, child helper invoked by sigkill_recovery_at_each_publication_stage
+test extent_wal::ownership_tests::competing_writer_is_rejected_and_failed_write_poisons_handle ... ok
+test extent_wal::tests::invalid_frames_and_capacity_errors_leave_published_bytes_unchanged ... ok
+test extent_wal::tests::exact_existing_frames_survive_reopen_and_repeated_append ... ok
+test extent_wal::tests::unpublished_tail_is_excluded_but_published_torn_frame_is_rejected ... ok
+SIGKILL stage=mid_payload: expected strict recovery outcome verified
+test extent_wal::tests::codec_byte_parity_replay_snapshot_boundary_and_clear_reuse ... ok
+SIGKILL stage=before_header: expected strict recovery outcome verified
+test extent_wal::tests::prepared_columns_match_legacy_for_valid_and_stale_metadata ... ok
+SIGKILL stage=mid_header: expected strict recovery outcome verified
+test extent_wal::tests::every_interrupted_header_prefix_has_only_old_new_or_error_outcomes ... ok
+SIGKILL stage=after_header: expected strict recovery outcome verified
+SIGKILL stage=after_sync: expected strict recovery outcome verified
+test extent_wal::crash_tests::sigkill_recovery_at_each_publication_stage ... ok
+test extent_wal::tests::every_header_and_committed_frame_byte_corruption_is_rejected ... ok
+
+test result: ok. 9 passed; 0 failed; 1 ignored; 0 measured; 116 filtered out; finished in 0.13s
+

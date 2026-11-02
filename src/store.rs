@@ -1273,9 +1273,9 @@ impl Store {
             match prepared {
                 Some(persist::PreparedEncoding::Failed(error))=>return Err(error),
                 Some(persist::PreparedEncoding::Panicked(payload))=>std::panic::resume_unwind(payload),
-                _=>{}
+                Some(persist::PreparedEncoding::Ready(encoded))=>wal.append_prepared_record(&rec,encoded,&mut persist.encode_buf,&mut persist.extent_frame_buf)?,
+                None=>wal.append_record(&rec,&mut persist.encode_buf,&mut persist.extent_frame_buf)?,
             }
-            wal.append_record(&rec,&mut persist.encode_buf,&mut persist.extent_frame_buf)?;
             persist.log_bytes=wal.logical_bytes();persist.writes_since_snapshot+=1;return Ok(());
         }
 
