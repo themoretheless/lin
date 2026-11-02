@@ -595,17 +595,6 @@ pub struct Edge {
 }
 
 type FactKey = (Arc<str>, Arc<str>, Arc<str>);
-type StoreRowSnap = (
-    Option<Arc<str>>,
-    Option<Arc<str>>,
-    Arc<str>,
-    Arc<str>,
-    Arc<str>,
-    Arc<str>,
-    Option<(Arc<str>, Arc<str>, Arc<str>)>,
-    Arc<str>,
-    f64,
-);
 
 #[derive(Debug)]
 pub struct Store {
@@ -826,7 +815,8 @@ impl Store {
         store.merge_extras_into(&mut live);
         let live_hash = catalog_hash(&live);
 
-        if let Some(head) = persist::read_head(dir)?
+        let head_disk = persist::read_head(dir)?;
+        if let Some(ref head) = head_disk
             && head.catalog_hash != live_hash
         {
             return Err(Error::runtime(format!(
@@ -845,14 +835,24 @@ impl Store {
             )));
         }
 
-        persist::write_head(
-            dir,
-            &Head {
-                r#gen: store.r#gen,
-                catalog_hash: live_hash.clone(),
-                embed_id: store.embed_id.clone(),
-            },
-        )?;
+        let head_needs_write = match &head_disk {
+            Some(head) => {
+                head.r#gen != store.r#gen
+                    || head.catalog_hash != live_hash
+                    || head.embed_id != store.embed_id
+            }
+            None => true,
+        };
+        if head_needs_write {
+            persist::write_head(
+                dir,
+                &Head {
+                    r#gen: store.r#gen,
+                    catalog_hash: live_hash.clone(),
+                    embed_id: store.embed_id.clone(),
+                },
+            )?;
+        }
         phases.metadata_ms = phase.elapsed().as_secs_f64() * 1000.0;
 
         let fts_t1 = Instant::now();
@@ -1009,6 +1009,8 @@ impl Store {
             if crate::cold::cold_path(dir, name).exists() {
                 // Lazy: mmap only; rows page-in on first collection() access.
                 let col = cold::map_cold(dir, name)?;
+                let nrows = col.row_count();
+                store.col_counts.insert(name.clone(), nrows);
                 store.collections.insert(name.clone(), Vec::new());
                 store.cold.insert(name.clone(), col);
             }
@@ -1191,13 +1193,31 @@ impl Store {
             catalog_hash: persist.catalog_hash.clone(),
             embed_id: self.embed_id.clone(),
         };
+        let stubbed_collections;
+        let collections_ref = if !cold_names.is_empty() {
+            stubbed_collections = self
+                .collections
+                .iter()
+                .map(|(k, v)| {
+                    if cold_names.contains(k) {
+                        (k.clone(), Vec::new())
+                    } else {
+                        (k.clone(), v.clone())
+                    }
+                })
+                .collect::<BTreeMap<_, _>>();
+            &stubbed_collections
+        } else {
+            &self.collections
+        };
+
         let snap_ref = SnapshotRef {
             r#gen: self.r#gen,
             embed_id: &self.embed_id,
             next_id: self.next_id,
             catalog_hash: &persist.catalog_hash,
             log_offset: 0,
-            collections: &self.collections,
+            collections: collections_ref,
             edges: &self.edges,
             extra_collections: &self.extra_collections,
             extra_rels: &self.extra_rels,
@@ -1708,8 +1728,10 @@ impl Store {
         for name in self.collections.keys() {
             let len = if name == "facts" && self.facts_rows_stale {
                 self.facts_s.len()
+            } else if let Some(c) = self.cold.get(name) {
+                c.row_count()
             } else {
-                self.collection(name).len()
+                self.collections.get(name).map(|v| v.len()).unwrap_or(0)
             };
             self.col_counts.insert(name.clone(), len);
         }
@@ -2466,76 +2488,31 @@ impl Store {
             self.users_id.reserve(n);
             self.users_email.reserve(n);
         }
-        // Snapshot first so we can mutate maps without overlapping borrows.
-        let snaps: Vec<StoreRowSnap> = rows
-            .iter()
-            .map(|row| {
-                (
-                    row.get("id").and_then(Cell::text_shared),
-                    row.get("uri").and_then(Cell::text_shared),
-                    row.get("id")
-                        .and_then(Cell::text_shared)
-                        .unwrap_or_default(),
-                    row.get("title")
-                        .and_then(Cell::text_shared)
-                        .unwrap_or_default(),
-                    row.get("layer")
-                        .and_then(Cell::text_shared)
-                        .unwrap_or_default(),
-                    row.get("wing")
-                        .and_then(Cell::text_shared)
-                        .unwrap_or_default(),
-                    if collection == "facts" {
-                        spo_key(row)
-                    } else {
-                        None
-                    },
-                    if collection == "orders" {
-                        row.get("user_id")
-                            .and_then(Cell::text_shared)
-                            .unwrap_or_default()
-                    } else if collection == "users" {
-                        row.get("email")
-                            .and_then(Cell::text_shared)
-                            .unwrap_or_default()
-                    } else {
-                        Arc::<str>::from("")
-                    },
-                    if collection == "orders" {
-                        row.get("total").and_then(Cell::as_f64).unwrap_or(0.0)
-                    } else {
-                        0.0
-                    },
-                )
-            })
-            .collect();
-        for (i, (id, uri, did, title, layer, wing, spo, extra, total)) in
-            snaps.into_iter().enumerate()
-        {
-            if let Some(id) = id {
-                self.by_id
-                    .get_mut(collection)
-                    .expect("by_id entry")
-                    .insert(id, i);
-            }
-            if let Some(spo) = spo {
-                self.facts_by_spo.insert(spo, i);
+        let by_id_map = self.by_id.get_mut(collection).expect("by_id entry");
+        for (i, row) in rows.iter().enumerate() {
+            let id = row.get("id").and_then(Cell::text_shared);
+            if let Some(ref id_val) = id {
+                by_id_map.insert(Arc::clone(id_val), i);
             }
             if collection == "docs" {
-                if let Some(uri) = uri {
+                if let Some(uri) = row.get("uri").and_then(Cell::text_shared) {
                     self.docs_by_uri.insert(uri, i);
                 }
-                self.docs_id.push(did);
-                self.docs_title.push(title);
-                self.docs_layer.push(layer);
-                self.docs_wing.push(wing);
+                self.docs_id.push(id.unwrap_or_default());
+                self.docs_title.push(row.get("title").and_then(Cell::text_shared).unwrap_or_default());
+                self.docs_layer.push(row.get("layer").and_then(Cell::text_shared).unwrap_or_default());
+                self.docs_wing.push(row.get("wing").and_then(Cell::text_shared).unwrap_or_default());
             } else if collection == "orders" {
-                self.orders_id.push(did);
-                self.orders_user_id.push(extra);
-                self.orders_total.push(total);
+                self.orders_id.push(id.unwrap_or_default());
+                self.orders_user_id.push(row.get("user_id").and_then(Cell::text_shared).unwrap_or_default());
+                self.orders_total.push(row.get("total").and_then(Cell::as_f64).unwrap_or(0.0));
             } else if collection == "users" {
-                self.users_id.push(did);
-                self.users_email.push(extra);
+                self.users_id.push(id.unwrap_or_default());
+                self.users_email.push(row.get("email").and_then(Cell::text_shared).unwrap_or_default());
+            } else if collection == "facts" {
+                if let Some(spo) = spo_key(row) {
+                    self.facts_by_spo.insert(spo, i);
+                }
             }
         }
     }
@@ -2972,7 +2949,7 @@ impl Store {
             if fields.is_empty() {
                 continue;
             }
-            let nrows = self.collection(cname).len() as u64;
+            let nrows = self.get_col_count(cname) as u64;
             match crate::fts::read_fts(dir, cname) {
                 Ok((generation, file_rows, idx))
                     if generation == self.r#gen && file_rows == nrows && idx.fields == fields =>

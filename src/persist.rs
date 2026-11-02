@@ -2519,9 +2519,14 @@ fn decode_column_record_mode(
 }
 
 pub fn truncate_log(log: &mut File, end: u64) -> Result<(), Error> {
-    log.set_len(end).map_err(io_err)?;
-    log.seek(SeekFrom::End(0)).map_err(io_err)?;
-    log.sync_all().map_err(io_err)?;
+    let current_len = log.metadata().map_err(io_err)?.len();
+    if current_len != end {
+        log.set_len(end).map_err(io_err)?;
+        log.seek(SeekFrom::End(0)).map_err(io_err)?;
+        log.sync_all().map_err(io_err)?;
+    } else {
+        log.seek(SeekFrom::End(0)).map_err(io_err)?;
+    }
     Ok(())
 }
 

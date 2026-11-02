@@ -5926,12 +5926,12 @@ impl Db {
     ) -> Result<(Vec<Row>, Vec<Edge>, Option<crate::persist::PreparedInsert>), Error> {
         let now = now_ms();
         let n = records.len();
-        let mut built: Vec<Row> = if n >= 2048 {
+        let mut built: Vec<Row> = if n >= 512 {
             let threads = std::thread::available_parallelism()
                 .map(|p| p.get())
                 .unwrap_or(1)
                 .min(8)
-                .min((n + 511) / 512);
+                .min((n + 255) / 256);
             if threads > 1 {
                 let chunk_size = (n + threads - 1) / threads;
                 std::thread::scope(|scope| {
@@ -5989,7 +5989,7 @@ impl Db {
                 // Large short-body batches bypass the cache; small batches retain reuse.
                 row.insert(
                     "hash".into(),
-                    Cell::Text(if n >= 4096 && body.len() <= 64 {
+                    Cell::Text(if n >= 512 && body.len() <= 64 {
                         content_hash_arc(body.as_ref())
                     } else {
                         cached_content_hash(body.as_ref())

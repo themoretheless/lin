@@ -24,6 +24,7 @@ pub const COLD_MIN_ROWS: usize = 32;
 /// Memory-map of a MessagePack-encoded `Vec<Row>` with lazy materialize.
 pub struct ColdCol {
     mmap: Mmap,
+    row_count: usize,
     hot: OnceLock<Vec<Row>>,
 }
 
@@ -155,10 +156,31 @@ impl ColdCol {
 
     /// Create a new ColdCol
     pub fn new(mmap: Mmap) -> Self {
+        let row_count = peek_rmp_array_len(&mmap).unwrap_or(0);
         Self {
             mmap,
+            row_count,
             hot: OnceLock::new(),
         }
+    }
+
+    pub fn with_count(mmap: Mmap, row_count: usize) -> Self {
+        Self {
+            mmap,
+            row_count,
+            hot: OnceLock::new(),
+        }
+    }
+
+    #[inline]
+    pub fn row_count(&self) -> usize {
+        if self.row_count > 0 {
+            return self.row_count;
+        }
+        if let Some(rows) = self.hot.get() {
+            return rows.len();
+        }
+        self.rows().map(|r| r.len()).unwrap_or(0)
     }
 
     pub fn into_rows(mut self) -> Result<Vec<Row>, Error> {
@@ -311,7 +333,30 @@ pub fn write_cold(data: &Path, name: &str, rows: &[Row]) -> Result<(), Error> {
     crate::persist::write_through_tmp(&path, &tmp, &body)
 }
 
+pub(crate) fn peek_rmp_array_len(bytes: &[u8]) -> Option<usize> {
+    let offset = if bytes.len() >= 4 && bytes[0..4] == COLD_MAGIC {
+        4
+    } else {
+        0
+    };
+    let payload = bytes.get(offset..)?;
+    let first = *payload.first()?;
+    if (0x90..=0x9f).contains(&first) {
+        Some((first & 0x0f) as usize)
+    } else if first == 0xdc && payload.len() >= 3 {
+        Some(u16::from_be_bytes([payload[1], payload[2]]) as usize)
+    } else if first == 0xdd && payload.len() >= 5 {
+        Some(u32::from_be_bytes([payload[1], payload[2], payload[3], payload[4]]) as usize)
+    } else {
+        None
+    }
+}
+
 pub fn map_cold(data: &Path, name: &str) -> Result<ColdCol, Error> {
+    map_cold_with_count(data, name, 0)
+}
+
+pub fn map_cold_with_count(data: &Path, name: &str, count: usize) -> Result<ColdCol, Error> {
     let path = cold_path(data, name);
     let file = File::open(&path).map_err(io_err)?;
     let mmap = unsafe { Mmap::map(&file) }.map_err(io_err)?;
@@ -325,7 +370,12 @@ pub fn map_cold(data: &Path, name: &str) -> Result<ColdCol, Error> {
     if !valid {
         return Err(io_err(format!("bad cold file: {}", path.display())));
     }
-    Ok(ColdCol::new(mmap))
+    let row_count = if count > 0 {
+        count
+    } else {
+        peek_rmp_array_len(&mmap).unwrap_or(0)
+    };
+    Ok(ColdCol::with_count(mmap, row_count))
 }
 
 /// Drop stale cold files not listed in `keep`.
