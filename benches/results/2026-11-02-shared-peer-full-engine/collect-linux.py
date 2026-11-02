@@ -1,6 +1,6 @@
 """Archive the complete new-protocol result without reclassifying earlier runs."""
 from pathlib import Path
-import hashlib,importlib.util,json,shutil,subprocess,tarfile,tempfile
+import hashlib,json,shutil,subprocess,tarfile,tempfile
 p=Path(__file__).resolve().parent;repo=p.parents[2]
 run='41371921811';expected='e108fac78f6766470505e19fb169190114659d19'
 sha=lambda b:hashlib.sha256(b).hexdigest()
@@ -33,15 +33,15 @@ for role,info in roles.items():
  verified[role]=dict(path=str(f),bytes=len(b),sha256=sha(b),elf64_x86_64=True)
 assert verified['baseline']['sha256']==verified['shared_peer']['sha256']!=verified['candidate']['sha256']
 # Independently bind every recorded assignment to the frozen dispatch rule.
-spec=importlib.util.spec_from_file_location('frozen_shared_assignment',raw/'assignment.py');module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+dispatch={};exec(compile((raw/'assignment.py').read_text(),str(raw/'assignment.py'),'exec'),dispatch)
 records=json.loads((raw/'process-status.json').read_text());external=0
 for r in records:
- role,info=module.binary_for(provenance,r['mode'],r['case'])
+ role,info=dispatch['binary_for'](provenance,r['mode'],r['case'])
  assert r['binary_role']==role and r['binary_sha256']==info['sha256']and r['command'][5]==info['path']and r['exit_code']==0
  external+=role=='shared_peer'
 assert len(records)==2412 and external==1368
 out=repo/'benches/results/2026-11-02-shared-peer-full-engine-linux';out.mkdir(exist_ok=False)
-files=sorted(f for f in raw.rglob('*')if f.is_file()and '__pycache__'not in f.parts)
+files=sorted(f for f in raw.rglob('*')if f.is_file())
 manifest={str(f.relative_to(raw)):dict(bytes=f.stat().st_size,sha256=sha(f.read_bytes()))for f in files}
 archive=out/'raw.tar.gz'
 with tarfile.open(archive,'w:gz')as tar:
