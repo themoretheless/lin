@@ -1,6 +1,6 @@
 # Rejected combined FTS normalization scan
 
-Exploratory local same-binary diagnostic: 7 datasets, 6 balanced rounds, 3 roles (baseline, identical baseline control, candidate), 126 fresh processes, 200000 calls each. All cases matched original per-character lowercase mapping before and after timing. Both functions compiled into one ELF-independent local native executable by rustc -O (actual compiler/host and binary SHA are in summary.json). The compiler was free to optimize both extracted functions; no whole-database or Linux peer result is inferred.
+Exploratory local same-binary diagnostic: 7 datasets, 6 balanced rounds, 3 roles (baseline, identical baseline control, candidate), 126 fresh processes, 200000 calls each. All cases matched original per-character lowercase mapping before and after timing. Both functions compiled into one local native executable by rustc -O (actual compiler/host and binary SHA are in summary.json). The compiler was free to optimize both extracted functions; no whole-database or Linux peer result is inferred.
 
 The candidate checks non-ASCII or uppercase in one iterator predicate before falling back to original ASCII conversion / Unicode mapping. Long already-lowercase strings regressed by median 33.42% (0/6 positive; baseline/control variation 5.88%). Late-uppercase strings regressed by 38.43% (1/6 positive; variation 13.51%). Short lowercase cases had high 26–27% control variation and do not establish a gain. Raw observations and every negative pair remain in raw.json.
 
