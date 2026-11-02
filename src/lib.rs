@@ -66,6 +66,8 @@ mod graph;
 mod index;
 mod parse;
 pub mod persist;
+#[cfg(feature = "experimental-extent-wal")]
+pub mod extent_wal;
 mod plan;
 mod store;
 mod row_key;

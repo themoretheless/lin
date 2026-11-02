@@ -16,6 +16,8 @@ name = "lin"
 path = "src/main.rs"
 
 [features]
+# Isolated storage experiment; not selected by Db/OpenOpts.
+experimental-extent-wal = []
 default = ["derive", "async"]
 derive = ["dep:lin-derive"]
 async = ["dep:tokio", "dep:futures-util", "dep:tokio-stream"]
