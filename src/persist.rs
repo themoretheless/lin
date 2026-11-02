@@ -1198,6 +1198,25 @@ pub fn append_record(
     }
 }
 
+/// Encode an existing WAL frame for the experimental extent transport.
+/// The payload codecs and checksum envelope remain identical to append_record.
+#[cfg(feature = "experimental-extent-wal")]
+pub(crate) fn encode_extent_frame(rec: &LogRecord, buf: &mut Vec<u8>, frame: &mut Vec<u8>) -> Result<(), Error> {
+    let magic = match &rec.pack {
+        Pack::AppendFactsBulk { s, p, o } => {
+            let n=s.len().min(p.len()).min(o.len());buf.clear();
+            buf.push(V2_FACTS_BULK);buf.extend_from_slice(&rec.r#gen.to_le_bytes());buf.extend_from_slice(&rec.next_id.to_le_bytes());buf.extend_from_slice(&(n as u32).to_le_bytes());
+            for i in 0..n {put_str(buf,&s[i]);put_str(buf,&p[i]);put_str(buf,&o[i]);}
+            LOG_MAGIC_V2
+        }
+        Pack::InsertCols {collection,fields,cols,n,edges} if edges.is_empty() && fields.len()==cols.len() => encode_insert_cols_v2(rec.r#gen,rec.next_id,collection,fields,cols,*n,buf)?,
+        _ => {buf.clear();rmp_serde::encode::write_named(&mut *buf,rec).map_err(io_err)?;LOG_MAGIC_V1}
+    };
+    let len=buf.len().checked_add(5).filter(|n|*n<=MAX_RECORD as usize).ok_or_else(||io_err("log record exceeds 16MiB"))?;
+    let mut checksum=crate::crc::Hasher::new();checksum.update(&[magic[3]]);checksum.update(buf);
+    frame.clear();frame.reserve(8+len);frame.extend_from_slice(&LOG_MAGIC_CHECKSUM);frame.extend_from_slice(&(len as u32).to_le_bytes());frame.push(magic[3]);frame.extend_from_slice(buf);frame.extend_from_slice(&checksum.finalize().to_le_bytes());Ok(())
+}
+
 fn append_record_v1(
     log: &mut File,
     rec: &LogRecord,

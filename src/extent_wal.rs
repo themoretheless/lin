@@ -85,6 +85,26 @@ impl ExtentWal {
         #[cfg(test)] crash_checkpoint("after_sync");
         self.logical=logical;self.sequence=sequence;self.poisoned=false;Ok(())
     }
+    /// Replay committed records newer than a durable snapshot generation.
+    pub fn replay_records(&mut self, min_generation:u64, mut apply:impl FnMut(crate::persist::LogRecord)->Result<(),Error>)->Result<usize,Error> {
+        let frames=self.read_frames()?;let mut applied=0;
+        crate::persist::for_each_wal_frame(&frames,|record| {
+            if record.r#gen>min_generation {apply(record)?;applied+=1;}Ok(())
+        })?;Ok(applied)
+    }
+    /// Publish an empty logical log only after the caller's snapshot is durable.
+    /// Existing physical allocation is retained; this does not publish a snapshot.
+    pub fn clear_after_durable_snapshot(&mut self)->Result<(),Error> {
+        if self.poisoned {return Err(io_err("extent handle poisoned"));}
+        let sequence=self.sequence.checked_add(1).ok_or_else(||io_err("extent sequence exhausted"))?;
+        self.poisoned=true;self.file.seek(SeekFrom::Start(0)).map_err(io_err)?;
+        self.file.write_all(&header(self.physical,0,sequence)).map_err(io_err)?;durable_sync(&self.file).map_err(io_err)?;
+        self.logical=0;self.sequence=sequence;self.poisoned=false;Ok(())
+    }
+    /// Encode a record with the existing codecs and append its exact frame bytes.
+    pub fn append_record(&mut self, record:&crate::persist::LogRecord, payload:&mut Vec<u8>, frame:&mut Vec<u8>)->Result<(),Error> {
+        crate::persist::encode_extent_frame(record,payload,frame)?;self.append_frames(frame)
+    }
     pub fn logical_bytes(&self)->u64 {self.logical}
     pub fn physical_bytes(&self)->u64 {self.physical}
 }
@@ -104,6 +124,20 @@ mod tests {
         }
     }
     impl Drop for Temp {fn drop(&mut self){let _=std::fs::remove_dir_all(&self.0);}}
+    #[test]
+    fn codec_byte_parity_replay_snapshot_boundary_and_clear_reuse(){
+        let tmp=Temp::new();let path=tmp.path("extent");let rows=vec![Row::from([("id".into(),Cell::from("one")),("count".into(),Cell::Int(7))])];
+        let packs=vec![Pack::InsertBulk{collection:"docs".into(),rows:rows.clone(),edges:vec![]},Pack::AppendFactsBulk{s:vec!["one".into()],p:vec!["rel".into()],o:vec!["two".into()]},crate::persist::rows_to_insert_cols("docs",&rows,vec![])];
+        let mut wal=ExtentWal::create(&path,8192).unwrap();let mut payload=Vec::new();let mut frame=Vec::new();let mut expected=Vec::new();
+        for (index,pack) in packs.into_iter().enumerate(){
+            let record=LogRecord{r#gen:index as u64+1,next_id:8,pack};let file_path=tmp.path(&format!("legacy-{index}"));
+            let mut file=OpenOptions::new().create_new(true).write(true).open(&file_path).unwrap();append_record(&mut file,&record,&mut Vec::new(),SyncMode::Normal,&mut 0).unwrap();drop(file);
+            wal.append_record(&record,&mut payload,&mut frame).unwrap();let legacy=std::fs::read(file_path).unwrap();assert_eq!(frame,legacy);expected.extend_from_slice(&legacy);
+        }
+        assert_eq!(wal.read_frames().unwrap(),expected);let mut generations=Vec::new();assert_eq!(wal.replay_records(1,|r|{generations.push(r.r#gen);Ok(())}).unwrap(),2);assert_eq!(generations,vec![2,3]);
+        wal.clear_after_durable_snapshot().unwrap();assert_eq!(wal.logical_bytes(),0);assert_eq!(wal.physical_bytes(),8192);assert!(wal.read_frames().unwrap().is_empty());drop(wal);
+        let mut wal=ExtentWal::open(&path).unwrap();assert!(wal.read_frames().unwrap().is_empty());wal.append_frames(&frame).unwrap();assert_eq!(wal.read_frames().unwrap(),frame);assert_eq!(std::fs::metadata(path).unwrap().len(),8192);
+    }
     #[test]
     fn exact_existing_frames_survive_reopen_and_repeated_append(){
         let tmp=Temp::new();let path=tmp.path("extent");let frame=tmp.frame();let mut wal=ExtentWal::create(&path,8192).unwrap();
