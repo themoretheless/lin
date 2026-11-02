@@ -7,3 +7,5 @@ No framing, CRC, snapshot-generation or physical-length constraints are removed.
 Focused release suite passed: 10 tests, zero failures, one ignored child helper. The counting Read+Seek fixture verifies exactly HEADER_BYTES + logical WAL bytes are read, with no padding or second region read. Corrupt CRC in a snapshot-covered record remains an error. Every header/frame byte corruption, stale prepared metadata and all five actual SIGKILL stages pass again.
 
 Full feature/default follow-ups remain pending. No measured open-latency or throughput gain is claimed. Linux run 41391257035 is pinned to earlier 20a408f6c and excludes this later source change. Experimental format growth, standalone export/bootstrap, power-loss qualification and the complete all-peer goal remain open.
+
+Full follow-ups passed: experimental feature 481 tests / zero failures / four ignored; default mode 463 tests / zero failures / two ignored. Counting-I/O, snapshot-covered CRC rejection, cross-process FENCE, prepared-payload parity and all five SIGKILL checkpoints are included. No measured replay/open-latency improvement is claimed.
