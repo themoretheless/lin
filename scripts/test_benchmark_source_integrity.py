@@ -36,7 +36,7 @@ class SourceIntegrityTests(unittest.TestCase):
         self.binary.unlink()
         with self.assertRaises(FileNotFoundError):snapshot(self.root,self.binary)
     def test_build_harness_and_driver_changes_drift(self):
-        for name in ['Cargo.lock','build.rs','rust-toolchain.toml','.cargo/config.toml','examples/peer_bench.rs','benches/compare.rs','scripts/bench-peers.py','lin-derive/Cargo.toml','lin-derive/src/lib.rs']:
+        for name in ['Cargo.lock','build.rs','rust-toolchain.toml','.cargo/config.toml','examples/peer_bench.rs','benches/compare.rs','scripts/bench-peers.py','lin-derive/Cargo.toml','lin-derive/src/lib.rs','tools/peer-worker/src/main.rs','tools/peer-worker/Cargo.toml','tools/peer-worker/Cargo.lock','tools/peer-worker/build.rs']:
             f=self.root/name;f.parent.mkdir(parents=True,exist_ok=True);f.write_text('input')
             self.assertNotEqual(self.before,snapshot(self.root,self.binary),name)
             f.unlink()
@@ -48,7 +48,7 @@ class SourceIntegrityTests(unittest.TestCase):
         module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
         module.ROOT=self.root
         out=self.root/'reports';out.mkdir()
-        args=SimpleNamespace(cases=[],engines=[],repeats=1,output=out,require_wins=False,lin_binary=str(self.binary))
+        args=SimpleNamespace(cases=[],engines=['lin'],repeats=1,output=out,require_wins=False,lin_binary=str(self.binary))
         def run():return dict(observations=[],errors=[],medians_ns={},source_identity_before=self.before,git_status_before='before')
         with patch.object(module,'report',return_value='report'),patch.object(module.subprocess,'check_output',return_value='after'):
             clean=run();self.assertEqual(module.finish(args,clean),0)
@@ -59,4 +59,6 @@ class SourceIntegrityTests(unittest.TestCase):
             self.binary.unlink()
             missing=run();self.assertEqual(module.finish(args,missing),2)
             self.assertTrue(missing['source_drift']);self.assertTrue(missing['errors'])
+    def test_peer_only_snapshot_explicitly_has_no_lin_binary(self):
+        self.assertIsNone(snapshot(self.root,None)['binary'])
 if __name__=='__main__':unittest.main()

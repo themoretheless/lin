@@ -775,7 +775,7 @@ def main():
             "mtime": lin_binary_path.stat().st_mtime,
             "sha256": hashlib.sha256(lin_binary_path.read_bytes()).hexdigest(),
         }
-    source_identity_before = source_snapshot(ROOT, lin_binary_path)
+    source_identity_before = source_snapshot(ROOT, lin_binary_path if 'lin' in args.engines else None)
     git_commit = None
     git_status_before = None
     try:
@@ -892,7 +892,7 @@ def finish(args, run):
     except Exception as error:
         run["git_status_error"] = str(error)
     try:
-        run["source_identity_after"] = source_snapshot(ROOT, Path(args.lin_binary))
+        run["source_identity_after"] = source_snapshot(ROOT, Path(args.lin_binary) if 'lin' in args.engines else None)
         run["source_drift"] = run["source_identity_after"] != run["source_identity_before"]
         if run["source_drift"]:
             run["errors"].append({"reason": "runtime/build/harness/binary content changed"})
