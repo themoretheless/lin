@@ -1,0 +1,88 @@
+name: shared-peer-full-engine
+on:
+  push:
+    branches: [codex/shared-peer-full-engine-ci]
+permissions:
+  contents: read
+  actions: read
+jobs:
+  benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_TARGET_DIR: target/shared-peer-full-engine
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.96.0'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> target/shared-peer-full-engine'
+          cache-on-failure: true
+      - name: Verify frozen protocol and source pair
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib,json
+          p=Path('benches/results/2026-11-02-shared-peer-full-engine')
+          for name,digest in json.loads((p/'frozen.json').read_text()).items():
+              assert hashlib.sha256(Path(name).read_bytes()).hexdigest()==digest,name
+          PY
+          python3 benches/results/2026-11-02-shared-peer-full-engine/build.py --verify-inputs
+      - name: Verify per-case role balance
+        run: python3 scripts/test-benchmark-role-balance.py
+      - name: Reject synthetic prerequisite corruptions
+        run: python3 benches/results/2026-11-02-shared-peer-full-engine/test-prerequisite-audit.py
+      - name: Fetch and audit actual frozen correctness artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import json,subprocess
+          p=Path('benches/results/2026-11-02-shared-peer-full-engine')
+          m=json.loads((p/'source-inputs.json').read_text())
+          for role,name in [('baseline','btreemap-correctness-vnext'),('candidate','corrected-update-patch-correctness')]:
+              root=p/'correctness-artifacts'/role;root.mkdir(parents=True)
+              metadata=subprocess.check_output(['gh','run','view',str(m['correctness_runs'][role]),'--json','databaseId,headSha,status,conclusion,url'])
+              (root/'run.json').write_bytes(metadata)
+              info=json.loads(metadata);assert info['status']=='completed' and info['conclusion']=='success',role
+              subprocess.run(['gh','run','download',str(m['correctness_runs'][role]),'--name',name,'--dir',str(root/'artifact')],check=True)
+          PY
+          python3 benches/results/2026-11-02-shared-peer-full-engine/audit-prerequisites.py
+      - name: Reject corrupt peer assignment order and numerical gates
+        run: python3 benches/results/2026-11-02-shared-peer-full-engine/test-protocol.py
+      - name: Build serial source pair and immutable external executable
+        run: python3 benches/results/2026-11-02-shared-peer-full-engine/build.py
+      - name: All 134 actual assigned functional smokes
+        run: python3 benches/results/2026-11-02-shared-peer-full-engine/smoke.py
+      - name: All 2412 fresh paired processes
+        run: python3 benches/results/2026-11-02-shared-peer-full-engine/run.py
+      - name: Summarize complete 19296 observations
+        id: summarize
+        run: python3 benches/results/2026-11-02-shared-peer-full-engine/summarize.py
+      - name: Independently verify all raw data and 1368 invariant peer assignments
+        if: always() && steps.summarize.outcome == 'success'
+        run: python3 benches/results/2026-11-02-shared-peer-full-engine/verify.py
+      - name: Enforce original numerical thresholds
+        if: always() && steps.summarize.outcome == 'success'
+        run: python3 benches/results/2026-11-02-shared-peer-full-engine/qualify.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: shared-peer-full-engine
+          path: benches/results/2026-11-02-shared-peer-full-engine/
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: shared-peer-full-engine-exact-linux-executables
+          path: |
+            /tmp/lin-shared-peer-full-engine-baseline
+            /tmp/lin-shared-peer-full-engine-candidate
+            /tmp/lin-shared-peer-full-engine-external
+          if-no-files-found: warn

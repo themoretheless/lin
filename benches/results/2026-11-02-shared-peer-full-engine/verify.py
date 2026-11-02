@@ -1,0 +1,86 @@
+from pathlib import Path
+import sys
+sys.path.insert(0,str(Path.cwd()/'scripts'))
+from benchmark_role_balance import schedule,orders_from_records
+import json,hashlib,math,re
+from assignment import binary_for,validate
+p=Path(__file__).resolve().parent;load=lambda n:json.loads((p/n).read_text())
+def digest(f):return hashlib.sha256(Path(f).read_bytes()).hexdigest()
+def middle(xs):
+ v=sorted(xs);return(v[(len(v)-1)//2]+v[len(v)//2])/2
+cases=load('cases.json');records=load('process-status.json');summary=load('summary.json');peers=load('peer-comparisons.json');q=load('qualification.json');meta=load('provenance.json');env=load('environment.json')
+assert len(cases)==len(set(cases))==67
+assert len(records)==2412 and {(r['round'],r['mode'],r['case'])for r in records}=={(i,m,c)for i in range(1,13)for m in ['baseline','control','candidate']for c in cases}
+planned=schedule([dict(id=c)for c in cases],['baseline','control','candidate'])
+expected_order=[(r['round'],r['role'],r['workload'])for r in planned]
+assert [(r['round'],r['mode'],r['case'])for r in records]==expected_order,'Case/role schedule changed'
+orders_from_records(records,cases,['baseline','control','candidate'],'case',role_key='mode')
+assert meta['source_restored']and meta['instrumentation']is False and meta['source_sha256']
+validate(meta)
+assert digest(meta['peer_binary']['path'])==meta['peer_binary']['sha256']
+assert all(digest(f)==h for f,h in meta['source_sha256'].items())
+assert digest('benches/compare.rs')==meta['original_compare_sha256']
+assert digest(p/'compare.rs')==meta['compiled_compare_sha256']
+frozen=load('source-inputs.json');assert frozen['peer_binary_source']=='baseline'
+assert meta['frozen_commits']=={r:frozen[r]['commit']for r in ['baseline','candidate']}
+for role in ['baseline','candidate']:
+ assert meta['binaries'][role]['source_sha256']==frozen[role]['source_sha256']
+ assert digest(meta['binaries'][role]['path'])==meta['binaries'][role]['sha256']
+ assert meta['binaries'][role]['cargo_target_dir']==meta['cargo_target_dir']
+assert meta['source_sha256']==frozen['restore_source_sha256']
+assert meta['assignment_protocol']==frozen['assignment_protocol']
+assert env['runtime_unchanged_all_roles']
+status=load('status.json');assert len(status)==36 and {s['run']for s in status}=={f'{i:02}-{m}'for i in range(1,13)for m in ['baseline','control','candidate']}and all(s['exit_code']==0 and s['subprocesses']==67 for s in status)
+smokes=load('local-smoke-status.json')
+assert smokes['correctness_smoke_only']and not smokes['performance_qualified']
+assert len(smokes['runs'])==134 and {(r['role'],r['case'])for r in smokes['runs']}=={(role,c)for role in ['baseline','candidate']for c in cases}
+assert all(r['exit_code']==0 for r in smokes['runs'])
+for r in smokes['runs']:
+ assigned,info=binary_for(meta,r['role'],r['case']);assert r['binary_role']==assigned and r['binary_sha256']==info['sha256']
+ d=json.loads((p/'local-smoke'/r['role']/r['case'].replace('/','_')/'run.json').read_text())
+ assert d['status']=='complete'and len(d['cases'])==1 and d['cases'][0]['id']==r['case']and len(d['observations'])==1
+ o=d['observations'][0];assert o['case']==r['case']and o['metric']=='wall'and o['operations']==1 and math.isfinite(float(o['value']))and float(o['value'])>0
+med={};rss={};total=0;run_ids=set()
+for r in records:
+ assigned,info=binary_for(meta,r['mode'],r['case']);assert r['binary_role']==assigned
+ assert r['exit_code']==0 and r['binary_sha256']==info['sha256']and r['glibc_tunables']==env['allocator_environment']['GLIBC_TUNABLES']
+ name=r['case'].replace('/','_');base=p/f'{r["round"]:02}-{r["mode"]}';d=json.loads((base/name/'run.json').read_text());assert d['status']=='complete'and len(d['cases'])==1 and d['cases'][0]['id']==r['case']and len(d['observations'])==8
+ assert d['schema']==1 and d['environment']==dict(arch='x86_64',os='linux')
+ assert d['provenance']['samples']=='8'and d['provenance']['warmup_ns']=='0'
+ assert d['id']not in run_ids;run_ids.add(d['id'])
+ binary=info['path']
+ expected_command=['/usr/bin/time','-v','-o',str(base/(name+'-resource.txt')),'--',binary,'--filter',r['case'],'--samples','8','--max-iterations','1','--warmup-ms','0','--sample-ms','1','--output',str(base/name)]
+ assert r['command']==expected_command,'Measurement command differs from frozen protocol'
+
+ vs=[]
+ for o in d['observations']:
+  assert o['case']==r['case']and o['operations']==1 and o['metric']=='wall'
+  value=float(o['value']);assert math.isfinite(value)and value>0;vs.append(value);total+=1
+ k=r['round'],r['mode'],r['case'];med[k]=middle(vs)
+ value=int(re.search(r'Maximum resident set size \(kbytes\):\s*(\d+)',(base/(name+'-resource.txt')).read_text())[1]);assert value==r['peak_rss_kib']>0;rss[k]=value
+assert total==19296 and set(summary)==set(cases)
+targets={f'compare/update_1row_{size}/lin'for size in ['1k','10k','100k']}|{'compare/wal_scalar_full_update/lin','compare/wal_scalar_normal_update/lin'};assert len(targets)==5 and targets<=set(cases)
+accepted=True;peer_expected=[]
+for c in cases:
+ assert set(summary[c])=={'series1','series2'}
+ for label,start in [('series1',1),('series2',7)]:
+  rounds=range(start,start+6);rows=[]
+  for i in rounds:
+   a=med[i,'baseline',c];b=med[i,'control',c];d=med[i,'candidate',c];rows.append(dict(round=i,baseline_ns=a,control_ns=b,candidate_ns=d,gain_percent=100*(1-d/a),aa_percent=100*(1-b/a)))
+  gain=middle(r['gain_percent']for r in rows);aa=middle(abs(r['aa_percent'])for r in rows);positive=sum(r['gain_percent']>0 for r in rows)
+  passed=(positive==6 and gain>aa)if c in targets else gain>=-max(2,aa);accepted &=passed
+  wanted=dict(target=c in targets,gain_percent=gain,aa_absolute_percent=aa,positive_pairs=positive,passes=passed,process_pairs=rows,peak_rss_kib={m:middle(rss[i,m,c]for i in rounds)for m in ['baseline','control','candidate']})
+  assert summary[c][label]==wanted,(c,label)
+  if c.endswith('/lin'):
+   for peer in ['sqlite','sqlite_delete','sqlite_wal','duckdb']:
+    peer_case=c[:-3]+peer
+    if peer_case not in cases:continue
+    ratios=[med[i,'candidate',c]/med[i,'candidate',peer_case]for i in rounds]
+    peer_expected.append(dict(case=c,peer=peer,series=label,pairs=6,median_ratio=middle(ratios),lin_wins=sum(r<1 for r in ratios),process_ratios=ratios))
+assert peers==peer_expected and len(peers)==76
+assert q['measurement_complete']and q['source_candidate_qualified']==accepted and q['full_objective_achieved']is False
+assert q['target_cases']==5 and q['control_cases']==62 and q['processes']==2412 and q['observations']==total
+assert q['comparisons']==sum(r['pairs']for r in peers)and q['candidate_peer_wins']==sum(r['lin_wins']for r in peers)
+external=sum(r['binary_role']=='shared_peer'for r in records);assert external==1368
+(p/'independent-audit.json').write_text(json.dumps(dict(audit_complete=True,processes=2412,observations=19296,invariant_peer_assignments=external,shared_peer_hash=meta['peer_binary']['sha256'],source_candidate_qualified=accepted,full_objective_achieved=False),indent=2)+'\n')
+print('Independent shared-peer raw audit PASS:2412 processes/19296 observations; source gate:',accepted)
