@@ -2033,11 +2033,9 @@ impl Db {
                     match event {
                         RowUndo::Append(mark) => self.store.append_rollback(mark),
                         RowUndo::Update(collection, idx, row) => {
-                            let restore_fts = self.store.fts.get(&collection)
-                                .is_some_and(|fts| row.affects_fts(&fts.fields));
                             if let Some(mut restored) = self.store.collection(&collection).get(idx).cloned() {
                                 row.apply(&mut restored);
-                                self.store.restore_row_owned(&collection, idx, restored, restore_fts);
+                                self.store.restore_row_owned(&collection, idx, restored);
                             }
                         }
                         RowUndo::Delete(collection, positions, rows) => {
@@ -2051,11 +2049,9 @@ impl Db {
                     match event {
                         RowUndo::Append(mark) => self.store.append_rollback(mark),
                         RowUndo::Update(collection, idx, row) => {
-                            let restore_fts = self.store.fts.get(&collection)
-                                .is_some_and(|fts| row.affects_fts(&fts.fields));
                             if let Some(mut restored) = self.store.collection(&collection).get(idx).cloned() {
                                 row.apply(&mut restored);
-                                self.store.restore_row_owned(&collection, idx, restored, restore_fts);
+                                self.store.restore_row_owned(&collection, idx, restored);
                             }
                         }
                         RowUndo::Delete(collection, positions, rows) => {
@@ -4867,7 +4863,7 @@ impl Db {
                     None => {
                         let mut row = crate::store::acquire_row();
                         for (k, v) in r {
-                            row.insert(k.clone(), v.clone_for_borrow());
+                            row.insert_key(k.clone(), v.clone_for_borrow());
                         }
                         row
                     }
@@ -4920,7 +4916,7 @@ impl Db {
                     None => {
                         let mut r = crate::store::acquire_row();
                         for (k, v) in row {
-                            r.insert(k.clone(), v.clone_for_borrow());
+                            r.insert_key(k.clone(), v.clone_for_borrow());
                         }
                         r
                     }
@@ -6012,7 +6008,7 @@ impl Db {
             let live = &mut self.store.collection_mut(collection)[i];
             for (key,value) in &effective_patch {
                 if let Some(slot) = live.get_mut(key.as_str()) { *slot=value.clone(); }
-                else { live.insert(key.clone(),value.clone()); }
+                else { live.insert_key(key.clone(),value.clone()); }
             }
             live.ensure_shared();
             let updated = live.clone();
@@ -6260,18 +6256,15 @@ pub(crate) struct UndoCheckpoint {
     prefix: Undo,
 }
 
-pub(crate) struct RowDelta(smallvec::SmallVec<[(String, Option<Cell>); 1]>);
+pub(crate) struct RowDelta(smallvec::SmallVec<[(crate::RowKey, Option<Cell>); 1]>);
 impl RowDelta {
-    fn affects_fts(&self, fields: &[String]) -> bool {
-        self.0.iter().any(|(key, _)| key == "snippet" || fields.contains(key))
-    }
     fn capture(before: &Row, patch: &Row, derived_hash: bool) -> Self {
         let mut edits = smallvec::SmallVec::new();
         for key in patch.keys() {
             edits.push((key.clone(), before.get(key).cloned()));
         }
         if derived_hash && !patch.contains_key("hash") {
-            edits.push(("hash".to_owned(), before.get("hash").cloned()));
+            edits.push((crate::RowKey::from("hash"), before.get("hash").cloned()));
         }
         Self(edits)
     }
@@ -6280,7 +6273,7 @@ impl RowDelta {
             match value {
                 Some(value) => {
                     if let Some(slot) = row.get_mut(key.as_str()) { *slot = value; }
-                    else { row.insert(key, value); }
+                    else { row.insert_key(key, value); }
                 }
                 None => { row.remove(key.as_str()); }
             }
@@ -6398,7 +6391,7 @@ fn rows_to_rough_batch(rows: &[Row]) -> RecordBatch {
     if rows.is_empty() {
         return RecordBatch::empty(Arc::<[String]>::from(Vec::<String>::new()));
     }
-    let names: Vec<String> = rows[0].keys().cloned().collect();
+    let names: Vec<String> = rows[0].keys().map(ToString::to_string).collect();
     let names_arc: Arc<[String]> = names.clone().into();
     let mut batch = RecordBatch::with_capacity(names_arc, rows.len());
     for row in rows {
@@ -6623,7 +6616,7 @@ fn append_batch_shape_rows(rows: &mut Vec<Row>, records: &[Record], now: i64) {
     let template = first
         .fields
         .iter()
-        .map(|(key, _)| (key.clone(), Cell::Null))
+        .map(|(key, _)| (crate::RowKey::from(key.as_str()), Cell::Null))
         .collect::<Row>();
     let slots = template
         .keys()
@@ -6657,7 +6650,7 @@ fn append_batch_shape_rows(rows: &mut Vec<Row>, records: &[Record], now: i64) {
 fn record_row(record: &Record, now: i64) -> Row {
     let mut row = Row::new();
     for (k, v) in &record.fields {
-        row.insert(k.clone(), value_cell(v, now));
+        row.insert_str(k.as_str(), value_cell(v, now));
     }
     row
 }

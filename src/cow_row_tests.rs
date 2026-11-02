@@ -2,7 +2,7 @@
  use super::*;
  #[test] fn cloned_rows_do_not_alias_mutations_and_serde_stays_map_shaped(){
   let original=Row::from([("name".into(),Cell::text_arc("ёж")),("float".into(),Cell::Float(-0.0)),("long_payload".into(),Cell::text_arc("shared long payload shared long payload"))]);
-  let map:BTreeMap<String,Cell>=original.iter().map(|(k,v)|(k.clone(),v.clone())).collect();
+  let map:BTreeMap<String,Cell>=original.iter().map(|(k,v)|(k.to_string(),v.clone())).collect();
   assert_eq!(serde_json::to_vec(&original).unwrap(),serde_json::to_vec(&map).unwrap());
   assert_eq!(rmp_serde::to_vec(&original).unwrap(),rmp_serde::to_vec(&map).unwrap());
   let mut changed=original.clone();changed.insert("name".into(),Cell::text_arc("new"));changed.remove("float");changed.entry("added".into()).or_insert(Cell::Int(4));
@@ -41,7 +41,7 @@ mod lazy_row_oracle {
     fn representation_preserves_eq_hash_wire_debug_and_snapshot_isolation() {
         fn traits<T:Send+Sync+Eq+Hash+std::panic::UnwindSafe+std::panic::RefUnwindSafe>(){} traits::<Row>();
         let mut inline=Row::from([("a".into(),Cell::Float(-0.0)),("b".into(),Cell::Vec(vec![1.,2.,3.].into()))]);
-        let map:BTreeMap<String,Cell>=inline.iter().map(|(k,v)|(k.clone(),v.clone())).collect();
+        let map:BTreeMap<String,Cell>=inline.iter().map(|(k,v)|(k.to_string(),v.clone())).collect();
         assert!(matches!(inline.0,RowStorage::Inline(_)));let debug=format!("{inline:?}");let json=serde_json::to_vec(&map).unwrap();let packed=rmp_serde::to_vec_named(&map).unwrap();
         inline.ensure_shared();assert!(matches!(inline.0,RowStorage::Shared(_)));assert_eq!(hash(&inline),hash(&map));assert_eq!(format!("{inline:?}"),debug);
         assert_eq!(serde_json::to_vec(&inline).unwrap(),json);assert_eq!(rmp_serde::to_vec_named(&inline).unwrap(),packed);
@@ -62,8 +62,8 @@ mod lazy_row_oracle {
                 5=>{row.entry(key.clone()).or_insert(Cell::Bool(true));model.entry(key).or_insert(Cell::Bool(true));}
                 _=>{for(k,v)in row.iter_mut(){*v=Cell::Int(k.len()as i64)}for(k,v)in model.iter_mut(){*v=Cell::Int(k.len()as i64)}}
             }
-            assert_eq!(row.as_map(),&model);assert_eq!(hash(&row),hash(&model));
-            for(held,want)in &snapshots{assert_eq!(held.as_map(),want);assert_eq!(hash(held),hash(want));}
+            assert_eq!(row.clone().into_iter().collect::<BTreeMap<String,Cell>>(),model);assert_eq!(hash(&row),hash(&model));
+            for(held,want)in &snapshots{assert_eq!(&held.clone().into_iter().collect::<BTreeMap<String,Cell>>(),want);assert_eq!(hash(held),hash(want));}
             if snapshots.len()>16 {snapshots.remove(0);}
         }
         let owned:BTreeMap<String,Cell>=row.into();assert_eq!(owned,model);

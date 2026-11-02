@@ -11,6 +11,7 @@ use crate::catalog::Catalog;
 use crate::cold;
 use crate::error::Error;
 use crate::index::LiveIndex;
+use crate::RowKey;
 use crate::persist::{
     self, ColSnap, Head, IndexSnap, LogRecord, OpenMemOpts, Pack, Persist, RelSnap, Snapshot,
     SnapshotRef,
@@ -48,7 +49,7 @@ pub fn init_row_pool(capacity: usize) {
 /// Object pool for frequently allocated BTreeMap rows — reduces allocations in hot paths
 pub struct RowPool {
     /// Pre-allocated BTreeMap instances ready for reuse
-    cache: Vec<BTreeMap<String, Cell>>,
+    cache: Vec<BTreeMap<RowKey, Cell>>,
 }
 
 impl RowPool {
@@ -59,12 +60,12 @@ impl RowPool {
     }
 
     #[inline]
-    pub fn acquire(&mut self) -> BTreeMap<String, Cell> {
+    pub fn acquire(&mut self) -> BTreeMap<RowKey, Cell> {
         self.cache.pop().unwrap_or_else(BTreeMap::new)
     }
 
     #[inline]
-    pub fn release(&mut self, mut row: BTreeMap<String, Cell>) {
+    pub fn release(&mut self, mut row: BTreeMap<RowKey, Cell>) {
         // Clear Arc references but keep capacity (Arc is zero-copy drop)
         row.clear();
         if self.cache.len() < 256 {
@@ -510,17 +511,27 @@ impl From<Arc<str>> for Cell {
 
 #[derive(Clone)]
 enum RowStorage {
-    Inline(BTreeMap<String, Cell>),
-    Shared(Arc<BTreeMap<String, Cell>>),
+    Inline(BTreeMap<RowKey, Cell>),
+    Shared(Arc<BTreeMap<RowKey, Cell>>),
 }
 #[derive(Clone)]
 pub struct Row(RowStorage);
 impl Row {
     pub fn new() -> Self { Self(RowStorage::Inline(BTreeMap::new())) }
-    fn as_map(&self) -> &BTreeMap<String, Cell> {
+    pub fn insert(&mut self, key:String, value:Cell)->Option<Cell>{std::ops::DerefMut::deref_mut(self).insert(RowKey::from(key),value)}
+    pub(crate) fn insert_key(&mut self,key:RowKey,value:Cell)->Option<Cell>{std::ops::DerefMut::deref_mut(self).insert(key,value)}
+    pub(crate) fn insert_str(&mut self,key:&str,value:Cell)->Option<Cell>{std::ops::DerefMut::deref_mut(self).insert(RowKey::from(key),value)}
+    pub fn get<Q:AsRef<str>+?Sized>(&self,key:&Q)->Option<&Cell>{self.as_map().get(key.as_ref())}
+    pub fn get_mut<Q:AsRef<str>+?Sized>(&mut self,key:&Q)->Option<&mut Cell>{std::ops::DerefMut::deref_mut(self).get_mut(key.as_ref())}
+    pub fn get_key_value<Q:AsRef<str>+?Sized>(&self,key:&Q)->Option<(&RowKey,&Cell)>{self.as_map().get_key_value(key.as_ref())}
+    pub fn contains_key<Q:AsRef<str>+?Sized>(&self,key:&Q)->bool{self.as_map().contains_key(key.as_ref())}
+    pub fn remove<Q:AsRef<str>+?Sized>(&mut self,key:&Q)->Option<Cell>{std::ops::DerefMut::deref_mut(self).remove(key.as_ref())}
+    pub fn entry(&mut self,key:String)->std::collections::btree_map::Entry<'_,RowKey,Cell>{std::ops::DerefMut::deref_mut(self).entry(RowKey::from(key))}
+
+    fn as_map(&self) -> &BTreeMap<RowKey, Cell> {
         match &self.0 { RowStorage::Inline(map) => map, RowStorage::Shared(map) => map }
     }
-    fn into_map(self) -> BTreeMap<String, Cell> {
+    fn into_map(self) -> BTreeMap<RowKey, Cell> {
         match self.0 { RowStorage::Inline(map) => map, RowStorage::Shared(map) => Arc::unwrap_or_clone(map) }
     }
     pub(crate) fn ensure_shared(&mut self) {
@@ -528,8 +539,8 @@ impl Row {
         let RowStorage::Inline(map) = std::mem::replace(&mut self.0, RowStorage::Inline(BTreeMap::new())) else { unreachable!() };
         self.0 = RowStorage::Shared(Arc::new(map));
     }
-    pub fn into_keys(self) -> std::collections::btree_map::IntoKeys<String, Cell> { self.into_map().into_keys() }
-    pub fn into_values(self) -> std::collections::btree_map::IntoValues<String, Cell> { self.into_map().into_values() }
+    pub fn into_keys(self) -> impl DoubleEndedIterator<Item=String> + ExactSizeIterator + std::iter::FusedIterator { self.into_map().into_keys().map(RowKey::into_string) }
+    pub fn into_values(self) -> std::collections::btree_map::IntoValues<RowKey, Cell> { self.into_map().into_values() }
 }
 impl Default for Row { fn default() -> Self { Self::new() } }
 impl std::fmt::Debug for Row {
@@ -544,42 +555,52 @@ impl Serialize for Row {
     fn serialize<S:serde::Serializer>(&self, serializer:S) -> Result<S::Ok,S::Error> { self.as_map().serialize(serializer) }
 }
 impl<'de> Deserialize<'de> for Row {
-    fn deserialize<D:serde::Deserializer<'de>>(deserializer:D) -> Result<Self,D::Error> { BTreeMap::<String,Cell>::deserialize(deserializer).map(Self::from) }
+    fn deserialize<D:serde::Deserializer<'de>>(deserializer:D) -> Result<Self,D::Error> { BTreeMap::<RowKey,Cell>::deserialize(deserializer).map(|map|Self(RowStorage::Inline(map))) }
 }
 impl std::ops::Deref for Row {
-    type Target=BTreeMap<String,Cell>;
+    type Target=BTreeMap<RowKey,Cell>;
     fn deref(&self) -> &Self::Target { self.as_map() }
 }
 impl std::ops::DerefMut for Row {
     fn deref_mut(&mut self) -> &mut Self::Target { match &mut self.0 { RowStorage::Inline(map) => map, RowStorage::Shared(map) => Arc::make_mut(map) } }
 }
 impl FromIterator<(String,Cell)> for Row {
-    fn from_iter<T:IntoIterator<Item=(String,Cell)>>(iter:T) -> Self { Self::from(iter.into_iter().collect::<BTreeMap<_,_>>()) }
+    fn from_iter<T:IntoIterator<Item=(String,Cell)>>(iter:T) -> Self { Self(RowStorage::Inline(iter.into_iter().map(|(k,v)|(RowKey::from(k),v)).collect())) }
 }
 impl<const N:usize> From<[(String,Cell);N]> for Row {
     fn from(value:[(String,Cell);N]) -> Self { value.into_iter().collect() }
 }
-impl From<BTreeMap<String,Cell>> for Row { fn from(map:BTreeMap<String,Cell>) -> Self { Self(RowStorage::Inline(map)) } }
-impl From<Row> for BTreeMap<String,Cell> { fn from(row:Row) -> Self { row.into_map() } }
+impl From<BTreeMap<RowKey,Cell>> for Row { fn from(map:BTreeMap<RowKey,Cell>) -> Self { Self(RowStorage::Inline(map)) } }
+impl From<BTreeMap<String,Cell>> for Row { fn from(map:BTreeMap<String,Cell>) -> Self { map.into_iter().collect() } }
+impl From<Row> for BTreeMap<String,Cell> { fn from(row:Row) -> Self { row.into_iter().collect() } }
 impl Extend<(String,Cell)> for Row {
-    fn extend<T:IntoIterator<Item=(String,Cell)>>(&mut self, iter:T) { std::ops::DerefMut::deref_mut(self).extend(iter); }
+    fn extend<T:IntoIterator<Item=(String,Cell)>>(&mut self, iter:T) { std::ops::DerefMut::deref_mut(self).extend(iter.into_iter().map(|(k,v)|(RowKey::from(k),v))); }
 }
 impl IntoIterator for Row {
     type Item=(String,Cell);
-    type IntoIter=std::collections::btree_map::IntoIter<String,Cell>;
-    fn into_iter(self) -> Self::IntoIter { self.into_map().into_iter() }
+    type IntoIter=std::iter::Map<std::collections::btree_map::IntoIter<RowKey,Cell>,fn((RowKey,Cell))->(String,Cell)>;
+    fn into_iter(self) -> Self::IntoIter { self.into_map().into_iter().map(|(k,v)|(k.into_string(),v)) }
 }
 impl<'a> IntoIterator for &'a Row {
-    type Item=(&'a String,&'a Cell);
-    type IntoIter=std::collections::btree_map::Iter<'a,String,Cell>;
+    type Item=(&'a RowKey,&'a Cell);
+    type IntoIter=std::collections::btree_map::Iter<'a,RowKey,Cell>;
     fn into_iter(self) -> Self::IntoIter { self.as_map().iter() }
 }
 impl<'a> IntoIterator for &'a mut Row {
-    type Item=(&'a String,&'a mut Cell);
-    type IntoIter=std::collections::btree_map::IterMut<'a,String,Cell>;
+    type Item=(&'a RowKey,&'a mut Cell);
+    type IntoIter=std::collections::btree_map::IterMut<'a,RowKey,Cell>;
     fn into_iter(self) -> Self::IntoIter { std::ops::DerefMut::deref_mut(self).iter_mut() }
 }
 
+impl FromIterator<(RowKey,Cell)> for Row {
+    fn from_iter<T:IntoIterator<Item=(RowKey,Cell)>>(iter:T)->Self{Self(RowStorage::Inline(iter.into_iter().collect()))}
+}
+impl<Q:AsRef<str>+?Sized> std::ops::Index<&Q> for Row {
+    type Output=Cell; fn index(&self,key:&Q)->&Cell{self.get(key).expect("no entry found for key")}
+}
+impl<Q:AsRef<str>+?Sized> std::ops::IndexMut<&Q> for Row {
+    fn index_mut(&mut self,key:&Q)->&mut Cell{self.get_mut(key).expect("no entry found for key")}
+}
 /// Estimated in-memory byte size of a row (keys + values + container overhead).
 #[inline]
 pub fn row_byte_size(row: &Row) -> usize {
@@ -2444,19 +2465,15 @@ impl Store {
     /// Reverse in-place row mutations from a `Rows` undo journal. Positions never
     /// shift during an update, so each entry restores one row plus its own index /
     /// FTS / map slots — no whole-store clone, no per-collection rebuild.
-    pub(crate) fn restore_row_owned(&mut self, collection: &str, idx: usize, row: Row, restore_fts: bool) {
+    pub(crate) fn restore_row_owned(&mut self, collection: &str, idx: usize, row: Row) {
         let Some(slot) = self.collections.get_mut(collection).and_then(|rows| rows.get_mut(idx)) else { return; };
         // Retain one read-only view for map/index maintenance; move both stored rows.
         let restored = row.clone();
         let current = std::mem::replace(slot, row);
         self.index_remove_row(collection, idx, &current);
-        if restore_fts {
-            self.fts_remove_row(collection, idx, &current);
-        }
+        self.fts_remove_row(collection, idx, &current);
         let _ = self.index_insert_row(collection, idx, &restored);
-        if restore_fts {
-            self.fts_insert_row(collection, idx, &restored);
-        }
+        self.fts_insert_row(collection, idx, &restored);
         self.row_maps_sync_updated(collection, idx, &current, &restored);
     }
 
@@ -3589,7 +3606,7 @@ pub fn project_fields(row: &Row, fields: &[String]) -> Row {
     let mut out = acquire_row();
     for f in fields {
         if let Some((k, v)) = row.get_key_value(f) {
-            out.insert(k.clone(), v.clone_for_borrow());
+            out.insert_key(k.clone(), v.clone_for_borrow());
         } else {
             out.insert(f.clone(), Cell::Null);
         }

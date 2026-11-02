@@ -1,16 +1,16 @@
 use lin::{Cell,Row};
-use std::collections::{BTreeMap,btree_map::{IntoKeys,IntoValues}};
+use std::collections::BTreeMap;
 use std::iter::FusedIterator;
 fn row() -> Row {
  Row::from([("z".into(),Cell::Int(2)),("a".into(),Cell::Text("owned".into())),("v".into(),Cell::Vec(vec![1.,2.,3.].into()))])
 }
-fn exact_keys(_: &IntoKeys<String,Cell>) {}
-fn exact_values(_: &IntoValues<String,Cell>) {}
+fn exact_keys<I: DoubleEndedIterator<Item=String> + ExactSizeIterator + FusedIterator>(_: &I) {}
+fn exact_values<I: DoubleEndedIterator<Item=Cell> + ExactSizeIterator + FusedIterator>(_: &I) {}
 fn iterator_contract<T:DoubleEndedIterator+ExactSizeIterator+FusedIterator>(_:&T) {}
 #[test]
 fn owning_map_unique_and_shared_are_isolated() {
  for shared in [false,true] {
-  let r=row();let held=shared.then(||r.clone());let expected:BTreeMap<String,Cell>=r.iter().map(|(k,v)|(k.clone(),v.clone())).collect();
+  let r=row();let held=shared.then(||r.clone());let expected:BTreeMap<String,Cell>=r.iter().map(|(k,v)|(k.to_string(),v.clone())).collect();
   let mut map:BTreeMap<String,Cell>=r.into();assert_eq!(map,expected);
   map.insert("a".into(),Cell::Text("changed".into()));map.remove("z");
   if let Some(held)=held {assert_eq!(held.get("a").and_then(Cell::text),Some("owned"));assert_eq!(held.get("z"),Some(&Cell::Int(2)));}
