@@ -1,0 +1,75 @@
+--- previous-shared-compare.rs
++++ combined-compare.rs
+@@ -1559,7 +1559,7 @@
+ fn setup_lin_durable_append_sync(n: usize, sync: lin::SyncMode) -> LinDurableAppend {
+     let dir = fresh_tmp("append");
+     let mut db =
+-        lin::Db::open_with(&dir.0, lin::OpenOpts { sync, cold: false }).expect("lin durable open");
++        open_combined_db(&dir.0, sync);
+     let prepared = db
+         .prepare(&lin_append_log_src(n))
+         .expect("lin prepare durable append");
+@@ -3773,7 +3773,7 @@
+             Some(text) => serde_json::Value::String(text.to_owned()),
+             None => serde_json::to_value(v).unwrap(),
+         };
+-        (k.clone(),value)
++        (k.to_string(),value)
+     }).collect())
+ }
+ fn durable_expected_lin(db: &lin::Db, op: DurableOp, id: &str) -> Vec<serde_json::Value> {
+@@ -3791,7 +3791,7 @@
+ }
+ fn setup_durable_lin_write(n: usize, op: DurableOp) -> DurableLinWrite {
+     let dir = fresh_tmp("durable-mutation-lin");
+-    let db = lin::Db::open_with(&dir.0, lin::OpenOpts { sync: lin::SyncMode::Full, cold: false }).unwrap();
++    let db = open_combined_db(&dir.0, lin::SyncMode::Full);
+     let write = setup_lin_write_db(n, db);
+     let expected = durable_expected_lin(&write.db, op, &write.probe_id);
+     DurableLinWrite { write: std::cell::RefCell::new(Some(write)), expected, dir }
+@@ -3803,7 +3803,7 @@
+ fn verify_durable_lin_write(s: &DurableLinWrite, affected: &usize) -> airbug_bench::Result<()> {
+     assert_eq!(*affected, 1);
+     drop(s.write.borrow_mut().take().unwrap());
+-    let db = lin::Db::open_with(&s.dir.0, lin::OpenOpts { sync: lin::SyncMode::Full, cold: false }).unwrap();
++    let db = open_combined_db(&s.dir.0, lin::SyncMode::Full);
+     let mut actual: Vec<serde_json::Value> = db.store.collection("docs").iter().map(durable_json_row).collect();
+     actual.sort_by_key(|v| v["id"].to_string());
+     assert_eq!(actual, s.expected, "full Lin values after reopen");
+@@ -3874,7 +3874,7 @@
+ }
+ fn setup_wal_scalar_control(sync: lin::SyncMode) -> WalScalarControl {
+     let dir = fresh_tmp("wal-scalar-control");
+-    let mut db = lin::Db::open_with(&dir.0, lin::OpenOpts {sync,cold:false}).unwrap();
++    let mut db = open_combined_db(&dir.0, sync);
+     db.run("col wal_scalar_control {id: text, value: i64}").unwrap();
+     let rows=(0..1000).map(|i|format!(r#"{{id:"s-{i}",value:{i}}}"#)).collect::<Vec<_>>().join(",");
+     db.run(&format!("insert wal_scalar_control [{rows}]")).unwrap();
+@@ -3889,7 +3889,7 @@
+ fn verify_wal_scalar_control(state: &WalScalarControl, affected: &usize) -> airbug_bench::Result<()> {
+     assert_eq!(*affected,1);
+     drop(state.db.borrow_mut().take().unwrap());
+-    let db=lin::Db::open_with(&state.dir.0,lin::OpenOpts {sync:state.sync,cold:false}).unwrap();
++    let db=open_combined_db(&state.dir.0, state.sync);
+     let rows=db.store.collection("wal_scalar_control");assert_eq!(rows.len(),1000);
+     let mut seen=std::collections::BTreeSet::new();
+     for row in rows {
+@@ -3906,3 +3906,18 @@
+             .tag("write").tag("lin").tag("scalar-control").parameter("rows",1000usize).work_units("stmts",1);
+     }
+ }
++
++// Explicit storage API selection belongs to setup/reopen, never operation timing.
++fn open_combined_db(path: &std::path::Path, sync: lin::SyncMode) -> lin::Db {
++    #[cfg(feature = "experimental-extent-wal")]
++    if matches!(sync, lin::SyncMode::Full) {
++        let db = lin::Db::open_extent(path, 16 * 1024 * 1024).unwrap();
++        assert!(db.is_durable());
++        assert!(!db.stats().sync_normal);
++        assert_eq!(std::fs::metadata(lin::persist::log_path(path)).unwrap().len(), 16 * 1024 * 1024);
++        return db;
++    }
++    let db = lin::Db::open_with(path, lin::OpenOpts { sync, cold: false }).unwrap();
++    assert!(db.is_durable());
++    db
++}
