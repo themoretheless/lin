@@ -1,0 +1,7 @@
+# Combined row shape/shared reverse keys: prospective frozen gate
+
+Candidate bcf2f27f9db14967daebfad63d6bd0ba63d31b37 versus b9f10bc776b05eb5235237e9a900c2ef6aaed1fd. Runtime closure differs exactly at src/exec.rs and src/index.rs. The two components touch different pipeline stages; historical separate gains cannot be summed and all previous refusals remain binding. This run evaluates the new combined source without relaxing criteria.
+
+Two series of six paired rounds, all six baseline/control/candidate permutations. Native1k/10k/100k targets require6/6positive pairs and median gain above independent A/A in every size/series. Read controls point_get/join_filter allow max(2%,A/A) regression. Warm108processes/324cases/6048samples. Separate108 native-only processes include preparation/startup/serialization/teardown in wall and Linux wait4 RSS; tolerance max(2%,A/A) wall, max(5%,A/A) RSS. Total216processes/6156operations/108wall/108RSS. All windows AND; resource phase continues after numeric warm rejection; retain all losses, no unchanged numerical retry.
+
+CI default workspace must pass before timing. Force clean/recompile lin and worker for each ordinary ELF; assert build log entries and source/harness/helper hashes. Save binaries, compiler/host metadata and all exact values/digests. No measured speedup yet. Component pass would still leave high-cardinality/unique/partial/bitmap mutation controls, nondefault features, FULL WAL and fresh peer qualification open. The eight-peer objective remains unfinished.
