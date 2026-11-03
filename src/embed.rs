@@ -38,6 +38,66 @@ pub trait Embedder: Send + Sync {
 pub struct HashingEmbedder {
     id: String,
     dim: usize,
+    pool: Arc<OnceLock<Option<HashingPool>>>,
+}
+
+#[derive(Debug)]
+struct HashingJob {
+    texts: Vec<String>,
+    reply: std::sync::mpsc::SyncSender<Vec<Arc<[f32]>>>,
+}
+
+#[derive(Debug)]
+struct HashingWorker {
+    sender: Option<std::sync::mpsc::SyncSender<HashingJob>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+#[derive(Debug)]
+struct HashingPool {
+    workers: Vec<HashingWorker>,
+}
+
+impl HashingPool {
+    fn new(dim: usize, workers: usize) -> Option<Self> {
+        let mut pool = Self {
+            workers: Vec::with_capacity(workers),
+        };
+        for i in 0..workers {
+            let (sender, receiver) = std::sync::mpsc::sync_channel::<HashingJob>(1);
+            let handle = std::thread::Builder::new()
+                .name(format!("lin-hash-{i}"))
+                .spawn(move || {
+                    // Workers only call the serial kernel, never their own pool.
+                    let embedder = HashingEmbedder::new("hash-worker", dim);
+                    while let Ok(job) = receiver.recv() {
+                        let refs = job.texts.iter().map(String::as_str).collect::<Vec<_>>();
+                        let vectors = embedder.embed_batch_serial(&refs);
+                        let _ = job.reply.send(vectors);
+                    }
+                })
+                .ok()?;
+            pool.workers.push(HashingWorker {
+                sender: Some(sender),
+                handle: Some(handle),
+            });
+        }
+        Some(pool)
+    }
+}
+
+impl Drop for HashingPool {
+    fn drop(&mut self) {
+        // Close every queue before joining, including partial startup failure.
+        for worker in &mut self.workers {
+            drop(worker.sender.take());
+        }
+        for worker in &mut self.workers {
+            if let Some(handle) = worker.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
 }
 
 impl HashingEmbedder {
@@ -46,7 +106,11 @@ impl HashingEmbedder {
         if dim == 768 {
             bigram_slots();
         }
-        Self { id: id.into(), dim }
+        Self {
+            id: id.into(),
+            dim,
+            pool: Arc::new(OnceLock::new()),
+        }
     }
 
     /// Parse `name/dim` (e.g. `nomic-embed-text/768`); default dim 768.
@@ -93,6 +157,11 @@ impl Embedder for HashingEmbedder {
         if threads <= 1 {
             return self.embed_batch_serial(texts);
         }
+        if n >= 4096 {
+            return self
+                .embed_batch_pooled(texts, threads)
+                .unwrap_or_else(|| self.embed_batch_serial(texts));
+        }
         let chunk_size = (n + threads - 1) / threads;
         std::thread::scope(|scope| {
             let mut handles = Vec::with_capacity(threads);
@@ -109,6 +178,50 @@ impl Embedder for HashingEmbedder {
 }
 
 impl HashingEmbedder {
+    fn embed_batch_pooled(&self, texts: &[&str], threads: usize) -> Option<Vec<Arc<[f32]>>> {
+        if texts.is_empty() {
+            return Some(Vec::new());
+        }
+        let pool = self
+            .pool
+            .get_or_init(|| HashingPool::new(self.dim, threads.saturating_sub(1)))
+            .as_ref()?;
+        let active = pool.workers.len().min(threads.saturating_sub(1));
+        if active == 0 {
+            return None;
+        }
+        let chunk_size = texts.len().div_ceil(active + 1);
+        let (first, rest) = texts.split_at(chunk_size.min(texts.len()));
+        let mut replies = Vec::with_capacity(active);
+        for (worker, chunk) in pool
+            .workers
+            .iter()
+            .take(active)
+            .zip(rest.chunks(chunk_size))
+        {
+            let (reply, receiver) = std::sync::mpsc::sync_channel(1);
+            let job = HashingJob {
+                texts: chunk.iter().map(|text| (*text).to_owned()).collect(),
+                reply,
+            };
+            let sent = worker
+                .sender
+                .as_ref()
+                .is_some_and(|sender| sender.send(job).is_ok());
+            replies.push((chunk, sent.then_some(receiver)));
+        }
+        // Borrow the caller's first chunk directly. Only queued chunks own text.
+        let mut out = Vec::with_capacity(texts.len());
+        out.extend(self.embed_batch_serial(first));
+        for (chunk, reply) in replies {
+            match reply.and_then(|receiver| receiver.recv().ok()) {
+                Some(vectors) => out.extend(vectors),
+                None => out.extend(self.embed_batch_serial(chunk)),
+            }
+        }
+        Some(out)
+    }
+
     fn embed_batch_serial(&self, texts: &[&str]) -> Vec<Arc<[f32]>> {
         EMBED_SCRATCH.with(|cell| {
             let mut guard = cell.borrow_mut();
@@ -1397,6 +1510,91 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn pooled_batches_match_serial_bits_across_boundaries_and_clones() {
+        for dim in [32, 768] {
+            let embedder = HashingEmbedder::new("pooled-test", dim);
+            let owned = (0..8193)
+                .map(|i| match i % 4 {
+                    0 => format!("document {i} WAL note"),
+                    1 => format!("ЁЖ {i} İ unicode"),
+                    2 => format!("vertical\u{b}tab {i}"),
+                    _ => String::new(),
+                })
+                .collect::<Vec<_>>();
+            for n in [4095, 4096, 4097, 8193] {
+                let refs = owned[..n].iter().map(String::as_str).collect::<Vec<_>>();
+                let got = embedder.embed_batch(&refs);
+                if n == 4095 {
+                    assert!(
+                        embedder.pool.get().is_none(),
+                        "small batches must not start the pool"
+                    );
+                }
+                let expected = embedder.embed_batch_serial(&refs);
+                assert_eq!(got.len(), n);
+                for (a, b) in got.iter().zip(&expected) {
+                    assert!(
+                        a.iter()
+                            .zip(b.iter())
+                            .all(|(a, b)| a.to_bits() == b.to_bits())
+                    );
+                }
+            }
+            let clone = embedder.clone();
+            assert!(Arc::ptr_eq(&clone.pool, &embedder.pool));
+            drop(embedder);
+            let refs = owned.iter().map(String::as_str).collect::<Vec<_>>();
+            assert_eq!(clone.embed_batch(&refs), clone.embed_batch_serial(&refs));
+        }
+    }
+
+    #[test]
+    fn pooled_concurrent_requests_keep_their_own_order_and_values() {
+        let embedder = HashingEmbedder::new("concurrent", 32);
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for caller in 0..4 {
+                let embedder = &embedder;
+                handles.push(scope.spawn(move || {
+                    let texts = (0..4097)
+                        .map(|i| format!("caller {caller} document {i}"))
+                        .collect::<Vec<_>>();
+                    let refs = texts.iter().map(String::as_str).collect::<Vec<_>>();
+                    let got = embedder.embed_batch_pooled(&refs, 4).unwrap();
+                    assert_eq!(got, embedder.embed_batch_serial(&refs));
+                }));
+            }
+            for handle in handles {
+                handle.join().unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn pooled_closed_queue_falls_back_without_losing_a_chunk() {
+        let embedder = HashingEmbedder::new("closed-worker", 32);
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        drop(receiver);
+        embedder
+            .pool
+            .set(Some(HashingPool {
+                workers: vec![HashingWorker {
+                    sender: Some(sender),
+                    handle: None,
+                }],
+            }))
+            .unwrap();
+        let texts = (0..4097)
+            .map(|i| format!("fallback document {i}"))
+            .collect::<Vec<_>>();
+        let refs = texts.iter().map(String::as_str).collect::<Vec<_>>();
+        assert_eq!(
+            embedder.embed_batch_pooled(&refs, 2).unwrap(),
+            embedder.embed_batch_serial(&refs)
+        );
     }
 
     #[test]

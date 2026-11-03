@@ -1,0 +1,9 @@
+# Owned lazy hashing-embedding worker pool — candidate
+
+A materially different implementation from rejected caller participation and modulo specialization. No modulo, codec, model, quota, sync or public Row changes. At batch sizes >=4096 and parallelism >1, the model lazily creates at most seven owned workers plus caller participation. Cloned models share the same pool. Each worker reuses its TLS scratch across chunks. Bounded channels own queued String copies; no borrowed row/text crosses a thread lifetime. Queues close before all threads are joined when the last model clone drops, including partial startup failure.
+
+Smaller batches keep the old serial/scoped-thread path and do not initialize the pool. Failed pool startup uses the serial kernel; a closed/dead queue or missing reply recomputes that chunk serially and preserves output order. Custom Embedder implementations are untouched. Worker-side engines call only the serial kernel and do not initialize nested pools.
+
+Tradeoffs: retained worker stacks/TLS between large batches, extra owned text copies for queued chunks, bounded blocking queues under concurrent callers, and shutdown work at model destruction. Startup, whole-worker lifecycle and peak RSS must be measured alongside prepared insertion; timing a drop outside an operation alone is not sufficient qualification.
+
+Focused tests: 14 passed, including bit-exact serial equivalence at 4095/4096/4097/8193 rows for dimensions32/768; clone lifetime/sharing, concurrent requests with distinct input/order, and closed-queue fallback. Full default workspace: 417 passed, zero failed, three ignored. Ordinary default-feature release worker built successfully; exact binary and source hashes are in build-status.json. No performance/adoption claim: prospective Linux native 10k/100k targets, 1k/read controls, cold lifecycle, RSS and nondefault-dimension performance are still required. SQLite durable1k and the full eight-peer objective remain open.
