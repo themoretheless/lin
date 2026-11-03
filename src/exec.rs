@@ -3532,35 +3532,42 @@ impl Db {
                     return Ok(vec![row]);
                 };
                 let bk = by.as_str();
-                let mut map: FxHashMap<Cell, f64> = FxHashMap::default();
+                let mut map: FxHashMap<&Cell, f64> = FxHashMap::default();
                 let mut state_bytes = 0usize;
                 for r in col {
                     if filter.is_none_or(|p| eval_pred(p, r, now)) {
-                        let cell = r.get(&bk).map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
-                        if !map.contains_key(&cell) {
-                            let key_size = match &cell {
-                                Cell::Text(s) => s.len() + 32,
-                                _ => 16,
-                            };
-                            state_bytes = state_bytes.saturating_add(key_size + 64);
-                            if state_bytes > self.quotas.max_aggregate_bytes {
-                                return Err(Error::runtime(format!(
-                                    "aggregate state bytes {state_bytes} exceeds max_aggregate_bytes quota {}",
-                                    self.quotas.max_aggregate_bytes
-                                )));
+                        // Borrow group keys while the input collection is stable. Own only
+                        // the distinct keys when constructing the result rows below.
+                        let cell = r.get(&bk).unwrap_or(&Cell::Null);
+                        let n = r.get(&fk).and_then(Cell::as_f64).unwrap_or(0.0);
+                        match map.entry(cell) {
+                            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                                *entry.get_mut() += n;
+                            }
+                            std::collections::hash_map::Entry::Vacant(entry) => {
+                                let key_size = match entry.key() {
+                                    Cell::Text(s) => s.len() + 32,
+                                    _ => 16,
+                                };
+                                state_bytes = state_bytes.saturating_add(key_size + 64);
+                                if state_bytes > self.quotas.max_aggregate_bytes {
+                                    return Err(Error::runtime(format!(
+                                        "aggregate state bytes {state_bytes} exceeds max_aggregate_bytes quota {}",
+                                        self.quotas.max_aggregate_bytes
+                                    )));
+                                }
+                                entry.insert(0.0 + n);
                             }
                         }
-                        let n = r.get(&fk).and_then(Cell::as_f64).unwrap_or(0.0);
-                        *map.entry(cell).or_insert(0.0) += n;
                     }
                 }
-                let mut entries: Vec<(Cell, f64)> = map.into_iter().collect();
+                let mut entries: Vec<(&Cell, f64)> = map.into_iter().collect();
                 entries.sort_unstable_by(|(a, _), (b, _)| cmp_sort(a, b));
                 Ok(entries
                     .into_iter()
                     .map(|(cell, n)| {
                         let mut row = crate::store::acquire_row();
-                        row.insert(bk.clone(), cell);
+                        row.insert(bk.clone(), cell.clone_for_borrow());
                         row.insert(fk.clone(), Cell::Float(n));
                         row
                     })

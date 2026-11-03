@@ -1,0 +1,17 @@
+{
+  "baseline_runtime": "0dab1a9a4f0f4f1e736d2e54f2e34a1e0f133d2d",
+  "candidate_scope": "prepared grouped SUM: borrowed Cell keys plus a single entry lookup, preserving quota, source order and result ownership",
+  "sizes": [1000, 10000, 100000],
+  "series": 2,
+  "pairs_per_series": 6,
+  "roles": ["baseline", "control", "candidate"],
+  "samples": 24,
+  "iterations": 4,
+  "warmups": "unchanged root worker: one initial validation and three warm calls",
+  "targets": ["sum_by", "sum_by_filtered"],
+  "controls": ["sum", "count_by", "point_get", "join_filter"],
+  "target_gate": "each series/size/case: six positive pairs, median gain greater than median absolute baseline/control variation",
+  "control_gate": "each series/size/case: median gain >= -max(2%, median absolute baseline/control variation)",
+  "adoption": "requires all target/control windows plus correctness; local discovery is not external-peer superiority or full source qualification",
+  "retry": "no unchanged numerical retry"
+}
