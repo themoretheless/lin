@@ -1,0 +1,9 @@
+# Aggregate source lifecycle/resource qualification: pending
+
+Current runtime is exactly b9f10bc776b05eb5235237e9a900c2ef6aaed1fd (equivalent f37 Rust runtime), compared with correctness-aligned a28aa758b. Production main 0dab is not a valid aggregate correctness oracle: quota/source-order/large-integer counterexamples remain. No merge is performed while qualification gaps remain.
+
+This new workload addresses seed/query lifecycle and RSS, not a retry of rejected embedding candidates. 108 fresh native Linux processes: two series of six triples, all baseline/control/candidate permutations at 1k/10k/100k. Whole process includes startup, docs/users/orders insertion through unchanged worker seed(), automatic embedding and indexes, first scalar SUM plus its validation/calibration, full orders projection, serialization and teardown. Every scalar total and every id/user_id/total row is checked outside measurement. The unchanged query worker warms/calibrates before reported per-query samples; these are NOT isolated cold-first-query measurements. No isolated orders-write or arbitrary mutation-cost claim is allowed.
+
+Full-worker wall tolerance max(2%,independent median absolute A/A), peak RSS max(5%,A/A). Every window must pass, all results retained on failure, no unchanged numerical retry. Build cleans lin/worker packages, requires actual compilation, saves exact ELF/source/manifests/harness/workflow hashes. Default workspace correctness before timing. This resource probe cannot establish peer victories, FULL WAL safety, isolated first-query performance, universal write costs or full eight-peer success.
+
+Prior Rayon pool implementation already used borrowed text and a reusable bounded global pool; it is not an untried optimization. Owned-text and arena worker variants were also rejected. They will not be repeated unchanged.
