@@ -23,7 +23,7 @@ for name, digest in m['source_sha256'].items():
     assert sha(subprocess.check_output(['git', 'show', m['head']+':'+name])) == digest
 refs = {'baseline': 'b9f10bc776b05eb5235237e9a900c2ef6aaed1fd', 'candidate': 'd8871eb36b119b9960989bf4a5feea9877168cc5'}
 assert m['head'] == refs[args.source_role]
-harness_head = '065f9afd015b36b015f54656942bd8e20e7dbf6f'
+harness_head = 'd3b9a4945aaff3485059d57727476d96dc251031'
 coarse_patch = args.source_role+'.patch'
 patch_sources = {
     coarse_patch: (harness_head, 'benches/results/2026-11-03-shape-same-host-profile/'+coarse_patch),
@@ -47,7 +47,13 @@ assert m['builds']['ordinary']['source_sha256'] == m['source_sha256']
 assert m['builds']['diagnostic']['source_sha256'] == m['instrumented_source_sha256']
 assert set(m['instrumented_source_sha256']) == set(m['source_sha256'])
 assert [k for k in m['source_sha256'] if m['source_sha256'][k] != m['instrumented_source_sha256'][k]] == ['src/exec.rs']
+assert m['builds']['ordinary']['sha256'] != m['builds']['diagnostic']['sha256']
 for role in ['ordinary', 'diagnostic']:
+    clean = (p/f'clean-{role}.log').read_text()
+    assert 'error:' not in clean.lower()
+    log = re.sub(r'\x1b\[[0-9;]*m', '', (p/f'build-{role}.log').read_text())
+    assert re.search(r'Compiling lin v[0-9]', log), 'Library was not recompiled'
+    assert re.search(r'Compiling lin-peer-worker v[0-9]', log), 'Worker was not recompiled'
     binary = (p/f'{role}-worker').read_bytes()
     assert binary[:4] == b'\x7fELF' and binary[4] == 2 and binary[5] == 1
     assert int.from_bytes(binary[18:20], 'little') == 62  # ELF x86_64
