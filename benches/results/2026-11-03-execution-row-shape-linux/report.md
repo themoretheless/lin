@@ -1,0 +1,9 @@
+# Execution-local row shape: frozen prospective Linux gate
+
+Runtime 3d7fc7f09 versus b9f10bc776b05eb5235237e9a900c2ef6aaed1fd; complete runtime closure differs only at src/exec.rs. No work moves to prepare. Construct/verify one bounded descriptor inside each INSERT execution before worker spawning. Public Row and Prepared API remain unchanged. This new source is not a retry of the rejected persistent prepare-cache candidate.
+
+Default workspace must pass in CI before timing. Force cargo clean --release for lin and worker before each ordinary binary build; require both package compilation entries in logs to avoid shared-target stale binary reuse. Preserve exact source/binary hashes and host metadata. Ordinary stderr is checked by the independent audit. Local focused test build is pending; no speedup or qualification is claimed.
+
+Freeze two series, six paired rounds and all six baseline/control/candidate permutations. Native targets: 1k/10k/100k, each series requires six positive pairs and median paired gain above independent A/A noise. Controls point_get and join_filter: regression tolerance max(2%, A/A). Warm phase108 processes/324 cases/6048 samples. Separately108 native-only processes with one operation, full readback then digest, whole-worker wall including preparation/serialization/teardown and Linux wait4 peak RSS. Twelve resource windows: wall max(2%, A/A), RSS max(5%, A/A). Total216 processes/6156 operation samples/108 lifecycle-wall/108 RSS; all gates AND. Resource phase runs even when warm numerical gate fails. Preserve every failure and loss; no unchanged numerical retry.
+
+Both synthetic gate-analysis checks and actual subprocess wait4 preflight must pass. A component pass would still leave FULL WAL, mixed-layout/nondefault-model performance and all eight-peer comparisons open. No universal superiority or adoption follows from this gate alone.
