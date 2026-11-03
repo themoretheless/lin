@@ -3286,7 +3286,7 @@ impl Db {
             match &plan.kind {
                 AggKind::Sum { field, by } if field.leaf() == Some("total") => {
                     if by.is_none() && plan.filter.is_none() {
-                        let total = self.store.orders_sum();
+                        let total = self.store.orders_numeric_summary().0;
                         let mut row = crate::store::acquire_row();
                         row.insert("total".into(), Cell::Float(total));
                         return Ok(vec![row]);
@@ -3300,7 +3300,7 @@ impl Db {
                             self.store.orders_user_id(),
                             self.store.orders_total(),
                             self.store.orders_total_numeric(),
-                            self.store.orders_numeric_safe(),
+                            self.store.orders_numeric_summary().1,
                             "total",
                             "user_id",
                             plan.filter.as_ref(),

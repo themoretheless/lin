@@ -642,8 +642,7 @@ pub struct Store {
     orders_user_id: Vec<Arc<str>>,
     orders_total: Vec<f64>,
     orders_total_numeric: Vec<bool>,
-    orders_sum: OnceLock<f64>,
-    orders_numeric_safe: OnceLock<bool>,
+    orders_numeric_summary: OnceLock<(f64, bool)>,
     users_id: Vec<Arc<str>>,
     users_email: Vec<Arc<str>>,
     /// Columnar facts (append hot path). `collections["facts"]` may lag until
@@ -714,8 +713,7 @@ impl Store {
             orders_user_id: Vec::new(),
             orders_total: Vec::new(),
             orders_total_numeric: Vec::new(),
-            orders_sum: OnceLock::new(),
-            orders_numeric_safe: OnceLock::new(),
+            orders_numeric_summary: OnceLock::new(),
             users_id: Vec::new(),
             users_email: Vec::new(),
             facts_s: Vec::new(),
@@ -1000,8 +998,7 @@ impl Store {
             orders_user_id: Vec::new(),
             orders_total: Vec::new(),
             orders_total_numeric: Vec::new(),
-            orders_sum: OnceLock::new(),
-            orders_numeric_safe: OnceLock::new(),
+            orders_numeric_summary: OnceLock::new(),
             users_id: Vec::new(),
             users_email: Vec::new(),
             facts_s: Vec::new(),
@@ -2320,8 +2317,7 @@ impl Store {
                 swap_pop_at(&mut self.orders_user_id, p, len);
                 swap_pop_at(&mut self.orders_total, p, len);
                 swap_pop_at(&mut self.orders_total_numeric, p, len);
-                self.orders_sum.take();
-                self.orders_numeric_safe.take();
+                self.orders_numeric_summary.take();
             }
             "users" => {
                 swap_pop_at(&mut self.users_id, p, len);
@@ -2474,8 +2470,7 @@ impl Store {
             self.orders_user_id.clear();
             self.orders_total.clear();
             self.orders_total_numeric.clear();
-            self.orders_sum.take();
-            self.orders_numeric_safe.take();
+            self.orders_numeric_summary.take();
         }
         if collection == "users" {
             self.users_id.clear();
@@ -2604,8 +2599,7 @@ impl Store {
                 .and_then(Cell::text_shared)
                 .unwrap_or_default();
             let total = row.get("total").and_then(Cell::as_f64).unwrap_or(0.0);
-            self.orders_sum.take();
-            self.orders_numeric_safe.take();
+            self.orders_numeric_summary.take();
             if idx == self.orders_id.len() {
                 self.orders_id.push(id);
                 self.orders_user_id.push(uid);
@@ -2686,8 +2680,7 @@ impl Store {
                 .and_then(Cell::text_shared)
                 .unwrap_or_default();
             let total = row.get("total").and_then(Cell::as_f64).unwrap_or(0.0);
-            self.orders_sum.take();
-            self.orders_numeric_safe.take();
+            self.orders_numeric_summary.take();
             let did = id.clone().unwrap_or_default();
             if idx == self.orders_id.len() {
                 self.orders_id.push(did);
@@ -2842,8 +2835,7 @@ impl Store {
                 self.orders_user_id[idx] = text("user_id");
                 self.orders_total[idx] = after.get("total").and_then(Cell::as_f64).unwrap_or(0.0);
                 self.orders_total_numeric[idx] = matches!(after.get("total"), Some(Cell::Int(_) | Cell::Float(_)));
-                self.orders_sum.take();
-                self.orders_numeric_safe.take();
+                self.orders_numeric_summary.take();
             }
             "users" if idx < self.users_email.len() => self.users_email[idx] = text("email"),
             "docs" | "orders" | "users" => self.rebuild_row_maps_collection(collection),
@@ -3365,19 +3357,14 @@ impl Store {
     pub(crate) fn orders_total_numeric(&self) -> &[bool] {
         &self.orders_total_numeric
     }
-    pub(crate) fn orders_sum(&self) -> f64 {
-        *self.orders_sum.get_or_init(|| self.orders_total.iter().sum())
-    }
-    pub(crate) fn orders_numeric_safe(&self) -> bool {
-        *self.orders_numeric_safe.get_or_init(|| {
-            self.orders_total.iter().zip(&self.orders_total_numeric).all(|(&value, &numeric)| {
+    pub(crate) fn orders_numeric_summary(&self) -> (f64, bool) {
+        *self.orders_numeric_summary.get_or_init(|| {
+            let sum = self.orders_total.iter().sum();
+            let safe = self.orders_total.iter().zip(&self.orders_total_numeric).all(|(&value, &numeric)| {
                 numeric && value.is_finite() && value.abs() < 9_007_199_254_740_992.0
-            })
+            });
+            (sum, safe)
         })
-    }
-    #[cfg(test)]
-    fn orders_numeric_summary(&self) -> (f64, bool) {
-        (self.orders_sum(), self.orders_numeric_safe())
     }
     pub fn docs_wing(&self) -> &[Arc<str>] {
         &self.docs_wing
@@ -4171,23 +4158,6 @@ mod empty_index_slab_tests {
 #[cfg(test)]
 mod orders_numeric_tag_tests {
     use super::*;
-
-    #[test]
-    fn sum_and_numeric_safety_caches_are_independently_lazy() {
-        let mut store = Store::empty("test");
-        let row = Row::from([
-            ("id".into(), Cell::text_arc("o")),
-            ("user_id".into(), Cell::text_arc("u")),
-            ("total".into(), Cell::Int(7)),
-        ]);
-        store.collections.insert("orders".into(), vec![row]);
-        store.rebuild_row_maps();
-        assert_eq!(store.orders_sum(), 7.0);
-        assert!(store.orders_numeric_safe.get().is_none());
-        store.orders_sum.take();
-        assert!(store.orders_numeric_safe());
-        assert!(store.orders_sum.get().is_none());
-    }
 
     #[test]
     fn numeric_tags_follow_rebuild_update_register_and_swap_remove() {
