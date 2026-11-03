@@ -1,0 +1,7 @@
+# Worker-local chunk output allocation: complete Linux gate
+
+Correct baseline b9f10bc776b05eb5235237e9a900c2ef6aaed1fd. Only embed.rs differs: each existing worker allocates all output Arcs for its chunk before feature generation, preserving parallel cold allocation. No caller preallocation, persistent arena, custom allocator, different model/dimension/features/hash/normalization, public API change or work moved outside timing. Previous caller-allocation implementations remain rejected and their gains do not qualify this new implementation.
+
+Frozen two-series/six-pair native INSERT targets at 1k/10k/100k. Every target requires 6/6 positive pairs and median gain above median absolute independent A/A. Point_get/join_filter controls tolerate -max(2%,A/A). Full worker lifecycle and RSS controls tolerate max(2%,A/A) and max(5%,A/A). All 216 processes / 6156 operation samples / 108 lifecycle wall / 108 RSS observations required. Resource measurement continues after warm numerical rejection. Final all-window AND; no unchanged numerical retry.
+
+Locked ordinary default-feature release binaries, explicit package clean and actual compilation, full runtime/manifests/harness/workflow/helper SHA closure, exact ELF files retained. Workspace correctness before timing. All exact result values/digests independently checked. No peer or FULL WAL qualification from this component gate; complete eight-peer objective remains open.
