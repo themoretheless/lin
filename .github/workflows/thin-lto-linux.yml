@@ -1,0 +1,46 @@
+name: thin-lto-linux
+on:
+  push:
+    branches: [codex/current-candidate-public-peers-20261103]
+    paths:
+      - '.github/workflows/thin-lto-linux.yml'
+      - 'benches/results/2026-11-03-thin-lto-linux/*.py'
+      - 'benches/results/2026-11-03-thin-lto-linux/input.json'
+      - 'benches/results/2026-11-03-thin-lto-linux/plan.json'
+jobs:
+  qualify:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_NET_RETRY: 5
+      CARGO_HTTP_MULTIPLEXING: 'false'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch frozen baseline
+        run: git fetch --no-tags --depth=1 origin b9f10bc776b05eb5235237e9a900c2ef6aaed1fd
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.96.0'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Validate frozen gate analysis
+        run: python3 benches/results/2026-11-03-thin-lto-linux/test-protocol.py
+      - name: Verify native lifecycle syscall and standard resource module
+        run: python3 scripts/bench-native-lifecycle.py --preflight
+      - name: Release workspace correctness before timing
+        run: cargo test --locked --release --workspace > /tmp/lin-thin-lto-workspace.txt 2>&1
+      - name: Build exact ordinary workers and measure frozen paired gate
+        run: python3 benches/results/2026-11-03-thin-lto-linux/build.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: thin-lto-linux
+          path: |
+            /tmp/lin-thin-lto-linux/
+            /tmp/lin-thin-lto-workspace.txt
+          if-no-files-found: error
