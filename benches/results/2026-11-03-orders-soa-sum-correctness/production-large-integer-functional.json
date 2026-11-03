@@ -1,0 +1,77 @@
+{
+  "runtime": "0dab1a9a4f0f4f1e736d2e54f2e34a1e0f133d2d",
+  "binary_sha256": "150952c29a26ee5e38d958a72d60a35679d647724a174d24a7ef18009dc207c4",
+  "scope": "functional only; incidental worker timings retained but not interpreted",
+  "records": [
+    {
+      "request": {
+        "rows": 21
+      },
+      "response": {
+        "ready": true,
+        "version": "0.4.0"
+      }
+    },
+    {
+      "request": {
+        "source": "update orders[id == \"o-0\"] cas each {total:9007199254740993}",
+        "fields": [
+          "user_id",
+          "total"
+        ],
+        "samples": 1,
+        "iterations": 1
+      },
+      "response": {
+        "result": [
+          [
+            "u-0",
+            9007199254740993
+          ]
+        ],
+        "samples_ns": [
+          7208.0
+        ]
+      }
+    },
+    {
+      "request": {
+        "source": "orders | total > 9007199254740992 | sum total by user_id",
+        "fields": [
+          "user_id",
+          "total"
+        ],
+        "samples": 1,
+        "iterations": 1
+      },
+      "response": {
+        "result": [],
+        "samples_ns": [
+          83.0
+        ]
+      }
+    },
+    {
+      "request": {
+        "source": "orders | total > 9007199254740992 | {user_id,total} | sum total by user_id",
+        "fields": [
+          "user_id",
+          "total"
+        ],
+        "samples": 1,
+        "iterations": 1
+      },
+      "response": {
+        "result": [
+          [
+            "u-0",
+            9007199254740992.0
+          ]
+        ],
+        "samples_ns": [
+          1959.0
+        ]
+      }
+    }
+  ]
+}
