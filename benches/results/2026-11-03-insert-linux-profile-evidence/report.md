@@ -1,0 +1,9 @@
+# Verified Linux INSERT attribution
+
+Run https://github.com/themoretheless/lin/actions/runs/41590218518 completed successfully on Ubuntu 22.04 x86_64 / Rust 1.96. Exact original source is db4f9d1385f6f929b93485076566639f86a277f1 (f37 runtime equivalent). Offline audit independently verified all source hashes against Git, two exact ELF hashes/architectures, six original processes, 18 samples, full expected six-field values, raw phase observations, medians and residual totals. Complete artifacts including ELF files are in raw.tar.gz, every file SHA is retained.
+
+Ordinary median wall: 1k 2.234435 ms, 10k 22.369882 ms, 100k 296.515420 ms. Diagnostic median wall: 2.346399 / 22.876812 / 313.010668 ms. These are separate unpaired diagnostic runs, not an adoption benchmark.
+
+For the thirty 10k chunks of the 100k diagnostic samples, median microseconds: build 5229.5, validate 1769.5, embed 16875 (text 1478.5, vectors 14450, attach 873), maintain 9651.5 (index 2847.5, FTS 4115.5, maps 2253, reserve 159; HNSW absent in fixture). The sum of residual wall minus non-overlapping coarse phases is 3248.762 us over all three 100k samples; this includes unmeasured work and diagnostic-output overhead, not pure transaction time.
+
+Embedding generation/allocation is the principal measured 100k cost. Source inspection confirms append undo keeps collection lengths, memory insert uses an empty marker pack, and it does not clone the whole Store or encode a durable column payload. The next hypothesis is to let the calling thread generate one embedding chunk rather than leave it idle while creating every worker. This preserves vector semantics and parallelism while reducing child-thread allocation/teardown. No speedup is inferred until separate paired qualification. The all-peer objective remains open, including DuckDB insertion losses and Kusto access.

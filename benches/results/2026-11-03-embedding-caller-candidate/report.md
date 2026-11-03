@@ -1,0 +1,7 @@
+# Caller participation in parallel default embeddings — candidate
+
+Linux insertion profile 41590218518 identified vector generation/allocation as the principal 100k cost: median 14.45 ms per 10k chunk. Original HashingEmbedder creates up to P child threads and leaves its caller waiting; the candidate creates up to P-1 children and computes the first chunk on the caller. Chunk boundaries, overall parallelism, input order, vector representation, dimensions, feature extraction and normalization remain unchanged. Custom Embedder batch overrides and small/serial batches are untouched.
+
+The hypothesis is reduced thread setup/teardown and less allocation on short-lived worker threads, particularly on the two-core Linux runner. No speedup has been measured or qualified for this candidate. The prior ASCII-FTS and grouped-index rejections remain binding and are not included in runtime.
+
+Focused embed tests: 12 passed, including exact vector-bit/order equivalence at dimensions 8/32/768 and sizes 0/1/511/512/513/1025 with ASCII, Unicode, vertical tab and empty text. Full default workspace passed: 415 passed, 0 failed, 3 ignored. Required next step is a prospective Linux baseline/control/candidate gate at 1k/10k/100k with default features and full exact readbacks. Target and control losses must be retained. Existing public-peer, FULL WAL, write/RSS/cold-query and Kusto gaps remain open; no main adoption is asserted.
