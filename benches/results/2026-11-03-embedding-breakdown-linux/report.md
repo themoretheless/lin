@@ -1,0 +1,7 @@
+# Hashing vector cost breakdown: diagnostic protocol
+
+Frozen runtime b9f10bc776b05eb5235237e9a900c2ef6aaed1fd, ordinary default release profile. Measure lowercasing, feature accumulation (token/unigram/trigram/bigram hashing and scratch updates), and finish (normalization, dense Arc allocation/copy and scratch cleanup) separately inside each serial worker chunk. Each text adds three Instant measurements; this changes execution overhead and compiler layout. Per-worker accumulated durations overlap across threads and must not be summed into a wall-time fraction. No speedup or causal optimization claim is allowed.
+
+Six fresh processes (ordinary and diagnostic at 1k/10k/100k), three operations each. Exact six-field readback is checked and retained. All embeddings, FTS, indexes and normal transaction behavior remain enabled. Hashes include runtime/manifests, diagnostic patch and executable; each build cleans lin and worker packages and requires actual compilation. Original source is restored before any timing and on failure. All results and binaries are uploaded on failure too. This is not a retry of any rejected optimization and cannot pass the eight-peer objective.
+
+Local preflight passed: patch applies exactly, Python parses, instrumented release embedding tests 11/11 pass, and embed.rs restored byte-for-byte. Linux results are pending. Previous numerical failures remain binding.

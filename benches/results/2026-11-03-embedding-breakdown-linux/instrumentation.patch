@@ -1,0 +1,27 @@
+--- a/src/embed.rs
++++ b/src/embed.rs
+@@ -115,10 +115,22 @@
+             let (scratch, lower) = &mut *guard;
+             scratch.ensure_dim(self.dim);
+             let mut out = Vec::with_capacity(texts.len());
++            let mut lower_ns = 0u128;
++            let mut fill_ns = 0u128;
++            let mut finish_ns = 0u128;
+             for text in texts {
+-                self.fill(scratch, crate::fts::lowercased(text, lower));
++                let start = std::time::Instant::now();
++                let text = crate::fts::lowercased(text, lower);
++                lower_ns += start.elapsed().as_nanos();
++                let start = std::time::Instant::now();
++                self.fill(scratch, text);
++                fill_ns += start.elapsed().as_nanos();
++                let start = std::time::Instant::now();
+                 out.push(scratch.finish());
+-            }
++                finish_ns += start.elapsed().as_nanos();
++            }
++            eprintln!("EMBED_DETAIL rows={} lower_ns={} fill_ns={} finish_ns={}",
++                texts.len(), lower_ns, fill_ns, finish_ns);
+             out
+         })
+     }
