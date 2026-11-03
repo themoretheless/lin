@@ -1,0 +1,27 @@
+{
+  "sizes": [
+    1000,
+    10000,
+    100000
+  ],
+  "series": 2,
+  "pairs_per_series": 6,
+  "native_samples": 8,
+  "read_samples": 24,
+  "target": "insert_native at 100000 rows",
+  "controls": [
+    "insert_native at 1000 and 10000 rows",
+    "point_get at all sizes",
+    "join_filter at all sizes"
+  ],
+  "point_get_iterations": 512,
+  "join_filter_iterations": 4,
+  "ordering": "six role permutations, repeated in the second series; native target before seeding read-control fixtures",
+  "target_gate": "each 100k series: 6/6 positive pairs and median gain > median absolute baseline/control variation",
+  "control_gate": "each size/series/case: median gain >= -max(2%,median absolute baseline/control variation)",
+  "retry": "no unchanged numerical retry",
+  "component_scope": "native warm matrix plus independent cold worker wall/RSS matrix; further nondefault-model and full-peer qualification remain open",
+  "cold_resource_processes": 108,
+  "cold_cycle_tolerance_percent": 2,
+  "peak_rss_tolerance_percent": 5
+}
