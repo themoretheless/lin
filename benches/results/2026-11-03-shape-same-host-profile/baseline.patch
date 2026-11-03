@@ -1,0 +1,46 @@
+--- a/src/exec.rs
++++ b/src/exec.rs
+@@ -5847,6 +5847,7 @@
+         edges: &[InsertEdge],
+         allow_preencode: bool,
+     ) -> Result<(Vec<Row>, Vec<Edge>, Option<crate::persist::PreparedInsert>), Error> {
++        let profile_start = std::time::Instant::now();
+         let now = now_ms();
+         let n = records.len();
+         let mut built: Vec<Row> = if n >= 512 {
+@@ -5892,6 +5893,8 @@
+             append_batch_shape_rows(&mut rows, records, now);
+             rows
+         };
++        eprintln!("INSERT_PHASE build rows={} us={}", n, profile_start.elapsed().as_micros());
++        let profile_validate = std::time::Instant::now();
+         let mut batch_ids: rustc_hash::FxHashSet<&str> = rustc_hash::FxHashSet::default();
+         batch_ids.reserve(n);
+         let mut batch_uris: rustc_hash::FxHashSet<&str> = rustc_hash::FxHashSet::default();
+@@ -5938,7 +5941,10 @@
+         }
+         drop(batch_ids);
+         drop(batch_uris);
++        eprintln!("INSERT_PHASE validate rows={} us={}", n, profile_validate.elapsed().as_micros());
++        let profile_embed = std::time::Instant::now();
+         self.maybe_embed_rows(collection, &mut built);
++        eprintln!("INSERT_PHASE embed rows={} us={}", n, profile_embed.elapsed().as_micros());
+ 
+         let mut new_edges = Vec::with_capacity(edges.len());
+         if let Some(first) = built.first() {
+@@ -5964,6 +5970,7 @@
+             }
+         }
+ 
++        let profile_maintain = std::time::Instant::now();
+         let start = self.store.collection(collection).len();
+         let staged = if allow_preencode
+             && (512..=16384).contains(&n)
+@@ -6037,6 +6044,7 @@
+             self.maintain_insert_slab(collection, start, &built)?;
+             None
+         };
++        eprintln!("INSERT_PHASE maintain rows={} us={}", n, profile_maintain.elapsed().as_micros());
+         let want_rows = built.len() <= 128;
+         if want_rows {
+             self.store

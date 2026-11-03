@@ -1,0 +1,5 @@
+# Same-host shape diagnostic: prospective attribution
+
+Frozen baseline b9f10bc776b05eb5235237e9a900c2ef6aaed1fd and rejected candidate d8871eb36b119b9960989bf4a5feea9877168cc5. Run both on one Ubuntu22.04 x86_64 runner with Rust1.96; full ordinary and instrumented source/binary closures, host CPU/affinity/load and exact result values retained. Both patch sequences were applied to exact frozen source in temporary directories before submission. Runtime branch remains baseline.
+
+Baseline profile runs first, then candidate, each ordinary/diagnostic 1k/10k/100k with three samples. Twelve processes / thirty-six observations are diagnostic reconnaissance. Builds occur between source profiles and order is not randomized: host drift, allocation and compiler effects remain possible. Do not calculate a qualified source gain, retry the rejected numerical gate or claim peer superiority. Investigate whether the earlier vector-phase difference survives sharing a runner; all previous numerical failures remain binding. If differences remain unresolved, use a properly paired phase experiment before causal attribution.

@@ -1,0 +1,48 @@
+name: shape-same-host-profile
+on:
+  push:
+    branches: [codex/current-candidate-public-peers-20261103]
+    paths:
+      - '.github/workflows/shape-same-host-profile.yml'
+      - 'benches/results/2026-11-03-shape-same-host-profile/*.py'
+      - 'benches/results/2026-11-03-shape-same-host-profile/*.patch'
+jobs:
+  profile:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_NET_RETRY: 5
+      CARGO_HTTP_MULTIPLEXING: 'false'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.96.0'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - uses: Swatinem/rust-cache@v2
+      - name: Fetch both frozen sources
+        run: |
+          git fetch --no-tags --depth=1 origin b9f10bc776b05eb5235237e9a900c2ef6aaed1fd d8871eb36b119b9960989bf4a5feea9877168cc5
+          git worktree add --detach /tmp/lin-shape-baseline b9f10bc776b05eb5235237e9a900c2ef6aaed1fd
+          git worktree add --detach /tmp/lin-shape-candidate d8871eb36b119b9960989bf4a5feea9877168cc5
+          ln -s "$GITHUB_WORKSPACE/target" /tmp/lin-shape-baseline/target
+          ln -s "$GITHUB_WORKSPACE/target" /tmp/lin-shape-candidate/target
+      - name: Baseline diagnostic
+        env:
+          LIN_PROFILE_SOURCE: /tmp/lin-shape-baseline
+          LIN_PROFILE_REF: b9f10bc776b05eb5235237e9a900c2ef6aaed1fd
+        run: python3 benches/results/2026-11-03-shape-same-host-profile/profile.py /tmp/lin-shape-same-host/baseline
+      - name: Candidate diagnostic
+        env:
+          LIN_PROFILE_SOURCE: /tmp/lin-shape-candidate
+          LIN_PROFILE_REF: d8871eb36b119b9960989bf4a5feea9877168cc5
+        run: python3 benches/results/2026-11-03-shape-same-host-profile/profile.py /tmp/lin-shape-same-host/candidate
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: shape-same-host-profile
+          path: /tmp/lin-shape-same-host/
+          if-no-files-found: error
