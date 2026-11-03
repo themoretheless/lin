@@ -1,0 +1,5 @@
+# MSSQL current production source — private qualification
+
+[Run 41556485455](https://github.com/themoretheless/lin/actions/runs/41556485455), exact production runtime `0dab1a9a4f0f4f1e736d2e54f2e34a1e0f133d2d`, native Linux x86_64, ordinary default worker package. Complete six read cases plus native insertion at 1k/10k/100k, three independent processes, twelve samples. Independently audited 18 processes / 1512 observations and 21 matched workload comparisons; source/build identity, original processes, cached median reconstruction, sentinel preservation and owned-container cleanup verified.
+
+Results and independent numerical audit are encrypted to the existing user recipient. No timings, ratios or win indicators are published. Successful job status means functional completeness; it does not establish a numerical win. The mutable image tag was resolved and its actual image ID/digests recorded inside the encrypted metadata; these observations are not pooled with previous image/runtime runs. The newer grouped-SUM repairs are not this runtime and inherit no qualification from this run. Kusto remains unmeasured, and the eight-engine objective remains open.

@@ -1,0 +1,9 @@
+# Frozen Linux source qualification — pending
+
+Runtime source frozen in `f37a85ff297b3771f6305c3561b9e1b507555999`. [Run41563263817](https://github.com/themoretheless/lin/actions/runs/41563263817) is the first numerical qualification of this source; no numerical result is claimed yet. Local default workspace414passed/3ignored, including scalar summary invalidation across writes, explicit rollback and Drop.
+
+Three ordinary source builds: correctness-aligned baseline `a28aa758b`, candidate, original production `0dab1a9a4`. Baseline/control share exactly one binary. Planned144processes/1008case-observations/21888samples,1k/10k/100k, two six-pair series. Four changed aggregation paths are prospective targets; point_get, join_filter and docs native INSERT remain controls. Original per-window positive-pair/A-A rules remain in plan.json. Earlier failed source windows stay failed; source changes and prospective target expansion are explicit.
+
+Scalar numeric facts and sum are cached per orders mutation epoch; grouping still charges its quota each time and preserves row-order floating addition. Large/ineligible numeric comparisons and non-text/missing group keys use the generic semantics. Extra state is one numeric tag per orders row and a constant-sized summary. First-read scans, cold-query latency, orders-write latency and RSS remain unqualified. The warm source matrix is not the six-peer matrix, FULL WAL qualification or the eight-engine objective.
+
+Default Linux workspace tests precede all timing. The frozen runtime/derive/worker/protocol/test inputs are checked, all source builds precede timing, and exact Linux executables plus every raw record are uploaded on numerical failure. Documentation/result-only pushes do not trigger another unchanged numerical run. Production main remains unchanged until appropriate validation and delivery.
