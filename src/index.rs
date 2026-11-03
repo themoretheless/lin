@@ -201,46 +201,13 @@ impl Hash for IndexPart {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct IndexKey(pub smallvec::SmallVec<[IndexPart; 2]>);
 
-/// One canonical immutable reverse key per posting list.
-#[derive(Debug, Clone, PartialEq)]
-pub struct IndexEntry {
-    reverse_key: Arc<IndexKey>,
-    posting: PostingList,
-}
-
-impl IndexEntry {
-    fn new(reverse_key: Arc<IndexKey>, posting: PostingList) -> Self {
-        Self {
-            reverse_key,
-            posting,
-        }
-    }
-}
-
-impl std::ops::Deref for IndexEntry {
-    type Target = PostingList;
-    fn deref(&self) -> &Self::Target {
-        &self.posting
-    }
-}
-impl std::ops::DerefMut for IndexEntry {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.posting
-    }
-}
-impl PartialEq<PostingList> for IndexEntry {
-    fn eq(&self, other: &PostingList) -> bool {
-        self.posting == *other
-    }
-}
-
 /// Live secondary index: BTree over composite keys → row indices in the collection vec.
 #[derive(Debug, Clone)]
 pub struct LiveIndex {
     pub def: IndexDef,
     /// Either Vec<usize> (standard) or BitSet (for low-cardinality columns)
-    pub forward: BTreeMap<IndexKey, IndexEntry>,
-    pub reverse: FxHashMap<usize, Arc<IndexKey>>,
+    pub forward: BTreeMap<IndexKey, PostingList>,
+    pub reverse: FxHashMap<usize, IndexKey>,
 
     /// Bloom filter for fast negative lookups during seek operations
     #[cfg(feature = "parallel")]
@@ -541,17 +508,16 @@ impl LiveIndex {
 
         match self.forward.entry(key) {
             Entry::Vacant(v) => {
-                let reverse_key = Arc::new(v.key().clone());
-                self.reverse.insert(idx, reverse_key.clone());
+                self.reverse.insert(idx, v.key().clone());
                 let mut posting = PostingList::new(is_bitmap, 1 << 16);
                 posting.push(idx);
-                v.insert(IndexEntry::new(reverse_key, posting));
+                v.insert(posting);
             }
             Entry::Occupied(mut o) => {
                 if self.def.unique {
                     return Err(format!("unique index {}: duplicate key", self.def.label()));
                 }
-                self.reverse.insert(idx, o.get().reverse_key.clone());
+                self.reverse.insert(idx, o.key().clone());
                 o.get_mut().push(idx);
             }
         }
@@ -646,17 +612,16 @@ impl LiveIndex {
 
             match self.forward.entry(key) {
                 Entry::Vacant(v) => {
-                    let reverse_key = Arc::new(v.key().clone());
-                    self.reverse.insert(*orig_idx, reverse_key.clone());
+                    self.reverse.insert(*orig_idx, v.key().clone());
                     let mut posting = PostingList::new(is_bitmap, 1 << 16);
                     posting.push(*orig_idx);
-                    v.insert(IndexEntry::new(reverse_key, posting));
+                    v.insert(posting);
                 }
                 Entry::Occupied(mut o) => {
                     if self.def.unique {
                         return Err(format!("unique index {}: duplicate key", self.def.label()));
                     }
-                    self.reverse.insert(*orig_idx, o.get().reverse_key.clone());
+                    self.reverse.insert(*orig_idx, o.key().clone());
                     o.get_mut().push(*orig_idx);
                 }
             }
@@ -671,7 +636,7 @@ impl LiveIndex {
         {
             return Err(format!("unique index {}: duplicate key", self.def.label()));
         }
-        if self.reverse.get(&idx).map(AsRef::as_ref) == Some(&key) {
+        if self.reverse.get(&idx) == Some(&key) {
             return Ok(());
         }
 
@@ -682,26 +647,25 @@ impl LiveIndex {
                 .is_some_and(|cell| matches!(cell, IndexPart::Bool(_)))
         });
 
-        if let Some(old) = self.reverse.remove(&idx)
-            && let Some(vec) = self.forward.get_mut(old.as_ref())
+        if let Some(old) = self.reverse.insert(idx, key.clone())
+            && let Some(vec) = self.forward.get_mut(&old)
         {
             vec.remove(idx);
             if vec.count() == 0 {
-                self.forward.remove(old.as_ref());
+                self.forward.remove(&old);
             }
         }
 
         // Use BitSet for boolean fields (≤2 distinct values)
         match self.forward.entry(key) {
             std::collections::btree_map::Entry::Vacant(v) => {
-                let reverse_key = Arc::new(v.key().clone());
-                self.reverse.insert(idx, reverse_key.clone());
+                self.reverse.insert(idx, v.key().clone());
                 let mut posting = PostingList::new(is_bitmap, 1 << 16);
                 posting.insert(idx);
-                v.insert(IndexEntry::new(reverse_key, posting));
+                v.insert(posting);
             }
             std::collections::btree_map::Entry::Occupied(mut o) => {
-                self.reverse.insert(idx, o.get().reverse_key.clone());
+                self.reverse.insert(idx, o.key().clone());
                 o.get_mut().insert(idx);
             }
         }
@@ -709,19 +673,19 @@ impl LiveIndex {
     }
 
     pub fn remove_at(&mut self, idx: usize) {
-        if let Some(key) = self.reverse.remove(&idx)
-            && let Some(entry) = self.forward.get_mut(key.as_ref())
-        {
-            entry.remove(idx);
-            if entry.count() == 0 {
-                self.forward.remove(key.as_ref());
+        if let Some(key) = self.reverse.remove(&idx) {
+            if let std::collections::btree_map::Entry::Occupied(mut entry) = self.forward.entry(key) {
+                entry.get_mut().remove(idx);
+                if entry.get().count() == 0 {
+                    entry.remove();
+                }
             }
         }
     }
 
     pub fn move_at(&mut self, from: usize, to: usize) {
         if let Some(key) = self.reverse.remove(&from) {
-            if let Some(vec) = self.forward.get_mut(key.as_ref()) {
+            if let Some(vec) = self.forward.get_mut(&key) {
                 vec.replace(from, to);
             }
             self.reverse.insert(to, key);
@@ -828,7 +792,7 @@ impl LiveIndex {
         }
 
         for (_, list) in self.forward.range((start, end)) {
-            match &list.posting {
+            match list {
                 PostingList::Standard(vec) => {
                     for &pos in vec {
                         f(pos);
@@ -1489,7 +1453,7 @@ mod storage_tests {
                 .insert_at(0, &Row::from([("key".into(), Cell::Int(3))]))
                 .unwrap();
             assert_eq!(
-                index.forward[index.reverse[&0].as_ref()],
+                index.forward[&index.reverse[&0]],
                 PostingList::Standard(vec![0])
             );
             index.remove_at(0);
@@ -1588,7 +1552,7 @@ mod storage_tests {
             assert_eq!(index.forward.len(), 1);
             assert_eq!(index.reverse.len(), 1);
             assert_eq!(
-                index.forward.get(&index.key_of(&row)).map(|entry| &entry.posting),
+                index.forward.get(&index.key_of(&row)),
                 Some(&PostingList::Standard(vec![8]))
             );
         }
@@ -1630,17 +1594,16 @@ impl LiveIndex {
 
             match self.forward.entry(key) {
                 Entry::Vacant(v) => {
-                    let reverse_key = Arc::new(v.key().clone());
-                    self.reverse.insert(*orig_idx, reverse_key.clone());
+                    self.reverse.insert(*orig_idx, v.key().clone());
                     let mut posting = PostingList::new(is_bitmap, 1 << 16);
                     posting.push(*orig_idx);
-                    v.insert(IndexEntry::new(reverse_key, posting));
+                    v.insert(posting);
                 }
                 Entry::Occupied(mut o) => {
                     if self.def.unique {
                         return Err(format!("unique index {}: duplicate key", self.def.label()));
                     }
-                    self.reverse.insert(*orig_idx, o.get().reverse_key.clone());
+                    self.reverse.insert(*orig_idx, o.key().clone());
                     o.get_mut().push(*orig_idx);
                 }
             }
@@ -1690,7 +1653,7 @@ mod bitmap_sample_once_tests {
             .map(|(k, v)| {
                 (
                     k.clone(),
-                    matches!(&v.posting, PostingList::Bitmap(_)),
+                    matches!(v, PostingList::Bitmap(_)),
                     v.to_indices(),
                 )
             })
@@ -1701,7 +1664,7 @@ mod bitmap_sample_once_tests {
             .map(|(k, v)| {
                 (
                     k.clone(),
-                    matches!(&v.posting, PostingList::Bitmap(_)),
+                    matches!(v, PostingList::Bitmap(_)),
                     v.to_indices(),
                 )
             })
@@ -1751,58 +1714,5 @@ mod bitmap_sample_once_tests {
         for population in [9_999, 10_000, 10_001] {
             compare(&rows, false, false, population);
         }
-    }
-}
-
-#[cfg(test)]
-mod shared_reverse_key_tests {
-    use super::*;
-
-    #[test]
-    fn equal_keys_share_storage_and_release_after_last_posting() {
-        let def = IndexDef {
-            collection: "docs".into(),
-            unique: false,
-            fields: vec!["wing".into(), "ts".into()],
-            pred: None,
-            bitmap_card_field: None,
-        };
-        let row = |wing: &str| {
-            Row::from([
-                ("wing".into(), Cell::text_arc(wing)),
-                ("ts".into(), Cell::Time(123)),
-            ])
-        };
-        let rows = vec![row("rag"), row("rag"), row("sys")];
-        let mut index = LiveIndex::new(def);
-        index.insert_slab_batch(0, &rows).unwrap();
-        assert!(Arc::ptr_eq(&index.reverse[&0], &index.reverse[&1]));
-        assert!(Arc::ptr_eq(
-            &index.reverse[&0],
-            &index.forward[&index.key_of(&rows[0])].reverse_key
-        ));
-        assert!(!Arc::ptr_eq(&index.reverse[&0], &index.reverse[&2]));
-        let weak = Arc::downgrade(&index.reverse[&0]);
-        {
-            let mut cloned = index.clone();
-            cloned.remove_at(0);
-            assert_eq!(
-                index.forward[&index.key_of(&rows[0])].to_indices(),
-                vec![0, 1]
-            );
-            assert_eq!(
-                cloned.forward[&cloned.key_of(&rows[0])].to_indices(),
-                vec![1]
-            );
-        }
-        index.remove_at(0);
-        index.move_at(1, 7);
-        assert_eq!(index.forward[&index.key_of(&rows[0])].to_indices(), vec![7]);
-        assert!(Arc::ptr_eq(&weak.upgrade().unwrap(), &index.reverse[&7]));
-        index.remove_at(7);
-        assert!(weak.upgrade().is_none());
-        assert!(!index.forward.contains_key(&index.key_of(&rows[0])));
-        assert_eq!(index.reverse.len(), 1);
-        assert_eq!(index.forward[&index.key_of(&rows[2])].to_indices(), vec![2]);
     }
 }
