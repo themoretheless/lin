@@ -1,0 +1,7 @@
+# Embedding parts: frozen prospective source/resource gate
+
+Runtime7d239c114ea453f7501e627f8c33fd6b9eec9363 versus baseline b9f10bc776b05eb5235237e9a900c2ef6aaed1fd. Only src/embed.rs and src/exec.rs differ. Reuse one joined-text buffer per native worker chunk; retain exact three-part text semantics, arbitrary dimensions, ordered vector bits, existing embeddings, custom batch overrides and wrong-length fallback. Assembly remains inside INSERT execution. No numerical result yet; focused contract tests passed and full workspace must pass in CI before timing.
+
+Two series of six pairs, all six baseline/control/candidate permutations. Native targets1k/10k/100k each require6/6 positive pairs and median gain above independent A/A. Point_get/join_filter tolerate max(2%,A/A) regression. Warm108 processes/324 cases/6048 samples. Separate108 native-only processes include startup/preparation/serialization/teardown in wall and Linux wait4 RSS. Wall tolerance max(2%,A/A),RSS max(5%,A/A). Total216 processes/6156 operation samples/108 wall/108 RSS. Resource phase runs even after numeric warm failure. All windows must pass; retain every loss; no unchanged numerical retry.
+
+Force package clean and actual lin/worker compilation before copying each ordinary ELF. Freeze runtime/harness/helper hashes; retain host, build logs and full readbacks/digests. Component success would not prove fresh peer superiority, FULL WAL or broader long-text/nondefault-model performance. Full eight-peer objective remains open.
