@@ -1,0 +1,53 @@
+--- a/src/exec.rs
++++ b/src/exec.rs
+@@ -5729,6 +5729,7 @@
+             return;
+         }
+ 
++        let timer = std::time::Instant::now();
+         let mut row_idxs = Vec::with_capacity(rows.len());
+         let mut texts = Vec::with_capacity(rows.len());
+         for (i, row) in rows.iter().enumerate() {
+@@ -5745,7 +5746,11 @@
+             return;
+         }
+         let refs = texts.iter().map(|text| text.as_ref()).collect::<Vec<_>>();
++        eprintln!("DETAIL text rows={} us={}", rows.len(), timer.elapsed().as_micros());
++        let timer = std::time::Instant::now();
+         let mut vectors = emb.embed_batch(&refs);
++        eprintln!("DETAIL vectors rows={} us={}", rows.len(), timer.elapsed().as_micros());
++        let timer = std::time::Instant::now();
+         if vectors.len() != row_idxs.len() {
+             // Keep third-party embedders with a broken batch implementation
+             // from silently leaving a partially embedded slab.
+@@ -5754,6 +5759,7 @@
+         for (i, vector) in row_idxs.into_iter().zip(vectors) {
+             rows[i].insert("embedding".into(), Cell::Vec(vector));
+         }
++        eprintln!("DETAIL attach rows={} us={}", rows.len(), timer.elapsed().as_micros());
+     }
+ 
+     #[allow(dead_code)]
+@@ -6056,12 +6062,22 @@
+         start: usize,
+         built: &[Row],
+     ) -> Result<(), Error> {
++        let mut timer = std::time::Instant::now();
+         self.store.collection_mut(collection).reserve(built.len());
+         self.store.row_maps_reserve(collection, built.len());
++        eprintln!("DETAIL reserve rows={} us={}", built.len(), timer.elapsed().as_micros());
++        timer = std::time::Instant::now();
+         self.store.index_insert_slab(collection, start, built)?;
++        eprintln!("DETAIL index rows={} us={}", built.len(), timer.elapsed().as_micros());
++        timer = std::time::Instant::now();
+         self.store.fts_insert_slab(collection, start, built);
++        eprintln!("DETAIL fts rows={} us={}", built.len(), timer.elapsed().as_micros());
++        timer = std::time::Instant::now();
+         self.store.hnsw_insert_slab(collection, start, built);
++        eprintln!("DETAIL hnsw rows={} us={}", built.len(), timer.elapsed().as_micros());
++        timer = std::time::Instant::now();
+         self.store.row_maps_register_slab(collection, start, built);
++        eprintln!("DETAIL maps rows={} us={}", built.len(), timer.elapsed().as_micros());
+         Ok(())
+     }
+ 

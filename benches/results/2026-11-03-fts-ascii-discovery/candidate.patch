@@ -1,0 +1,54 @@
+diff --git a/src/fts.rs b/src/fts.rs
+index 197e07dc2..cd664543c 100644
+--- a/src/fts.rs
++++ b/src/fts.rs
+@@ -71,8 +71,17 @@ impl FtsIndex {
+     fn append_row_with_scratch(&mut self, row_idx: usize, row: &Row, scratch: &mut String) {
+         for text in fts_texts(row, &self.fields) {
+             let lowered = lowercased(text, scratch);
+-            for tok in lowered.split_whitespace() {
+-                add_posting(&mut self.postings, tok, row_idx);
++            // ASCII splitting avoids Unicode decoding for ordinary documents.
++            // Rust's ASCII whitespace excludes vertical tab; retain Unicode
++            // splitting for that byte as well as for non-ASCII text.
++            if lowered.is_ascii() && !lowered.as_bytes().contains(&0x0b) {
++                for tok in lowered.split_ascii_whitespace() {
++                    add_posting(&mut self.postings, tok, row_idx);
++                }
++            } else {
++                for tok in lowered.split_whitespace() {
++                    add_posting(&mut self.postings, tok, row_idx);
++                }
+             }
+         }
+     }
+@@ -834,6 +843,29 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn append_ascii_whitespace_matches_general_index() {
++        let fields = vec!["title".into(), "body".into()];
++        let mut texts = (0u8..=127)
++            .map(|byte| format!("LEFT{}RIGHT", char::from(byte)))
++            .collect::<Vec<_>>();
++        texts.extend(["A\u{b}B", "ЁЖ\u{2003}İ", "A\u{85}B", "A\u{a0}B", " repeated repeated "]
++            .into_iter().map(str::to_owned));
++        let rows = texts.iter().map(|text| Row::from([
++            ("title".into(), Cell::text_arc(text.as_str())),
++            ("body".into(), Cell::text_arc("RIGHT repeated")),
++        ])).collect::<Vec<_>>();
++        let mut append = FtsIndex::empty(&fields);
++        let mut general = FtsIndex::empty(&fields);
++        append.append_slab(19, &rows);
++        for (i, row) in rows.iter().enumerate() {
++            general.insert_row(19 + i, row);
++        }
++        general.fold_all();
++        assert_eq!(append.postings, general.postings);
++        assert!(append.adds.is_empty() && append.dels.is_empty());
++    }
++
+     #[test]
+     fn slab_normalization_scratch_matches_individual_rows() {
+         let fields = vec!["title".into(), "body".into()];

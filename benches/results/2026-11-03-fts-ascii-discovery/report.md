@@ -1,0 +1,7 @@
+# Rejected ASCII FTS append candidate
+
+Baseline 3401bc17de5651db425c88defa59ab9b03c5f6e4, local macOS ARM64 discovery only. Candidate specializes fresh FTS append whitespace tokenization for ASCII, retaining Unicode/vertical-tab fallback. `candidate.patch` preserves the exact source and independent index-equivalence regression. Final focused tests: 10 passed, 1 ignored. Two earlier test-compilation mistakes and the passing test log remain inside raw evidence.
+
+Prospective input required 4/4 positive pairs at each size and median gain above median absolute A/A. All sizes failed. Median paired gains: 1k -1.6206%, 10k -2.8666%, 100k -3.1854%; A/A medians 3.9821%, 5.8091%, 2.2091%. A 100k A/A pair reached 46.3251%; no causal slowdown or qualified speedup is inferred on this noisy host. There were other unrelated build processes on the machine. No unchanged numeric retry will seek a better outcome.
+
+36 original processes / 288 samples are preserved with all exact six-field readbacks and baseline/control/candidate binary hashes. The default worker validates embeddings and each fixture. This is not a full-engine Linux or peer qualification. Both candidate and baseline ordinary executables remain in /tmp at the paths frozen in input.json. Source was restored byte-for-byte after rejection; no ASCII optimization is retained in runtime. All eight named peers remain in scope; DuckDB native INSERT losses and unmeasured Kusto are still open.
