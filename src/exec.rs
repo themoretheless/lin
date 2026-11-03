@@ -5858,28 +5858,20 @@ impl Db {
             if threads > 1 {
                 let chunk_size = (n + threads - 1) / threads;
                 std::thread::scope(|scope| {
-                    let mut handles = Vec::with_capacity(threads);
-                    for chunk in records.chunks(chunk_size) {
-                        handles.push(scope.spawn(move || {
-                            let mut rows = Vec::with_capacity(chunk.len());
-                            append_batch_shape_rows(&mut rows, chunk, now);
-                            for row in &mut rows {
-                                if row.get("hash").and_then(Cell::text).is_none()
-                                    && let Some(body) = row.get("body").and_then(Cell::text_shared)
-                                {
-                                    row.insert(
-                                        "hash".into(),
-                                        Cell::Text(content_hash_arc(body.as_ref())),
-                                    );
-                                }
-                            }
-                            rows
-                        }));
+                    let mut chunks = records.chunks(chunk_size);
+                    let caller = chunks.next_back().expect("nonempty parallel bulk");
+                    let mut handles = Vec::with_capacity(threads - 1);
+                    for chunk in chunks {
+                        let worker = std::thread::Builder::new()
+                            .spawn_scoped(scope, move || build_bulk_chunk(chunk, now));
+                        handles.push((chunk, worker));
                     }
+                    let caller_rows = build_bulk_chunk(caller, now);
                     let mut rows = Vec::with_capacity(n);
-                    for handle in handles {
-                        rows.extend(handle.join().expect("row construction worker panicked"));
+                    for (chunk, worker) in handles {
+                        append_bulk_worker_rows(&mut rows, chunk, now, worker);
                     }
+                    rows.extend(caller_rows);
                     rows
                 })
             } else {
@@ -6699,7 +6691,19 @@ fn match_frontier_keys(row: &Row, bind: Option<&str>) -> Vec<String> {
     keys
 }
 
-#[allow(dead_code)]
+fn build_bulk_chunk(records: &[Record], now: i64) -> Vec<Row> {
+    let mut rows = Vec::with_capacity(records.len());
+    append_batch_shape_rows(&mut rows, records, now);
+    for row in &mut rows {
+        if row.get("hash").and_then(Cell::text).is_none()
+            && let Some(body) = row.get("body").and_then(Cell::text_shared)
+        {
+            row.insert("hash".into(), Cell::Text(content_hash_arc(body.as_ref())));
+        }
+    }
+    rows
+}
+
 fn append_bulk_worker_rows(
     rows: &mut Vec<Row>,
     records: &[Record],
@@ -6711,7 +6715,7 @@ fn append_bulk_worker_rows(
         Err(_) => {
             // Parallelism is optional: keep inserts available when the OS
             // cannot allocate an additional worker thread.
-            rows.extend(records.iter().map(|record| record_row(record, now)));
+            rows.extend(build_bulk_chunk(records, now));
         }
     }
 }
@@ -6769,6 +6773,54 @@ fn record_row(record: &Record, now: i64) -> Row {
 #[cfg(test)]
 mod record_tests {
     use super::*;
+
+    #[test]
+    fn bulk_worker_fallback_preserves_body_hash_and_reference_cells() {
+        let records = (0..513)
+            .map(|i| Record {
+                fields: vec![
+                    ("id".into(), Value::String(format!("row-{i}").into())),
+                    (
+                        "body".into(),
+                        Value::String("ЁЖ body".repeat(i % 5 + 1).into()),
+                    ),
+                    ("ts".into(), Value::Now),
+                    (
+                        "hash".into(),
+                        if i % 2 == 0 {
+                            Value::String("caller".into())
+                        } else {
+                            Value::Int(7)
+                        },
+                    ),
+                ],
+            })
+            .collect::<Vec<_>>();
+        let mut actual = Vec::new();
+        append_bulk_worker_rows(
+            &mut actual,
+            &records,
+            123,
+            Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "injected creation failure",
+            )),
+        );
+        let expected = records
+            .iter()
+            .map(|record| {
+                let mut row = record_row(record, 123);
+                if row.get("hash").and_then(Cell::text).is_none() {
+                    let body = row.get("body").and_then(Cell::text).unwrap();
+                    let hash = content_hash_arc(body);
+                    row.insert("hash".into(), Cell::Text(hash));
+                }
+                row
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+        assert_eq!(actual, build_bulk_chunk(&records, 123));
+    }
 
     #[test]
     fn bulk_short_body_hash_preserves_values_at_batch_and_byte_boundaries() {
@@ -6900,7 +6952,7 @@ mod record_tests {
 
     #[test]
     fn parallel_bulk_rows_preserve_order_generated_ids_and_shared_now() {
-        for n in [4095, 4096, 4101] {
+        for n in [511, 512, 513, 1027, 4095, 4096, 4101] {
             let records = (0..n)
                 .map(|i| Record {
                     fields: vec![
