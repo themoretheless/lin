@@ -597,6 +597,63 @@ pub struct Edge {
 type FactKey = (Arc<str>, Arc<str>, Arc<str>);
 
 #[derive(Debug)]
+// Independent immutable-epoch facts. Concurrent readers may compute the same
+// fact, but publish identical bits; mutation requires exclusive Store access.
+struct OrdersNumericCache {
+    #[cfg(target_has_atomic = "64")]
+    sum_bits: std::sync::atomic::AtomicU64,
+    #[cfg(not(target_has_atomic = "64"))]
+    sum: OnceLock<f64>,
+    flags: std::sync::atomic::AtomicU8,
+}
+impl OrdersNumericCache {
+    const SUM_READY: u8 = 1;
+    const SAFE_READY: u8 = 2;
+    const SAFE_VALUE: u8 = 4;
+    fn new() -> Self {
+        Self {
+            #[cfg(target_has_atomic = "64")]
+            sum_bits: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(not(target_has_atomic = "64"))]
+            sum: OnceLock::new(),
+            flags: std::sync::atomic::AtomicU8::new(0),
+        }
+    }
+    fn invalidate(&mut self) {
+        *self.flags.get_mut() = 0;
+        #[cfg(not(target_has_atomic = "64"))]
+        self.sum.take();
+    }
+    fn sum(&self, values: &[f64]) -> f64 {
+        #[cfg(target_has_atomic = "64")]
+        {
+            use std::sync::atomic::Ordering;
+            if self.flags.load(Ordering::Acquire) & Self::SUM_READY != 0 {
+                return f64::from_bits(self.sum_bits.load(Ordering::Relaxed));
+            }
+            let sum: f64 = values.iter().sum();
+            self.sum_bits.store(sum.to_bits(), Ordering::Relaxed);
+            self.flags.fetch_or(Self::SUM_READY, Ordering::Release);
+            sum
+        }
+        #[cfg(not(target_has_atomic = "64"))]
+        { *self.sum.get_or_init(|| values.iter().sum()) }
+    }
+    fn safe(&self, values: &[f64], numeric: &[bool]) -> bool {
+        use std::sync::atomic::Ordering;
+        let flags = self.flags.load(Ordering::Acquire);
+        if flags & Self::SAFE_READY != 0 {
+            return flags & Self::SAFE_VALUE != 0;
+        }
+        let safe = values.iter().zip(numeric).all(|(&value, &numeric)| {
+            numeric && value.is_finite() && value.abs() < 9_007_199_254_740_992.0
+        });
+        self.flags.fetch_or(Self::SAFE_READY | if safe { Self::SAFE_VALUE } else { 0 }, Ordering::Release);
+        safe
+    }
+}
+
+#[derive(Debug)]
 pub struct Store {
     pub r#gen: u64,
     pub embed_id: String,
@@ -642,7 +699,7 @@ pub struct Store {
     orders_user_id: Vec<Arc<str>>,
     orders_total: Vec<f64>,
     orders_total_numeric: Vec<bool>,
-    orders_numeric_summary: OnceLock<(f64, bool)>,
+    orders_numeric_summary: OrdersNumericCache,
     users_id: Vec<Arc<str>>,
     users_email: Vec<Arc<str>>,
     /// Columnar facts (append hot path). `collections["facts"]` may lag until
@@ -713,7 +770,7 @@ impl Store {
             orders_user_id: Vec::new(),
             orders_total: Vec::new(),
             orders_total_numeric: Vec::new(),
-            orders_numeric_summary: OnceLock::new(),
+            orders_numeric_summary: OrdersNumericCache::new(),
             users_id: Vec::new(),
             users_email: Vec::new(),
             facts_s: Vec::new(),
@@ -998,7 +1055,7 @@ impl Store {
             orders_user_id: Vec::new(),
             orders_total: Vec::new(),
             orders_total_numeric: Vec::new(),
-            orders_numeric_summary: OnceLock::new(),
+            orders_numeric_summary: OrdersNumericCache::new(),
             users_id: Vec::new(),
             users_email: Vec::new(),
             facts_s: Vec::new(),
@@ -2317,7 +2374,7 @@ impl Store {
                 swap_pop_at(&mut self.orders_user_id, p, len);
                 swap_pop_at(&mut self.orders_total, p, len);
                 swap_pop_at(&mut self.orders_total_numeric, p, len);
-                self.orders_numeric_summary.take();
+                self.orders_numeric_summary.invalidate();
             }
             "users" => {
                 swap_pop_at(&mut self.users_id, p, len);
@@ -2470,7 +2527,7 @@ impl Store {
             self.orders_user_id.clear();
             self.orders_total.clear();
             self.orders_total_numeric.clear();
-            self.orders_numeric_summary.take();
+            self.orders_numeric_summary.invalidate();
         }
         if collection == "users" {
             self.users_id.clear();
@@ -2599,7 +2656,7 @@ impl Store {
                 .and_then(Cell::text_shared)
                 .unwrap_or_default();
             let total = row.get("total").and_then(Cell::as_f64).unwrap_or(0.0);
-            self.orders_numeric_summary.take();
+            self.orders_numeric_summary.invalidate();
             if idx == self.orders_id.len() {
                 self.orders_id.push(id);
                 self.orders_user_id.push(uid);
@@ -2680,7 +2737,7 @@ impl Store {
                 .and_then(Cell::text_shared)
                 .unwrap_or_default();
             let total = row.get("total").and_then(Cell::as_f64).unwrap_or(0.0);
-            self.orders_numeric_summary.take();
+            self.orders_numeric_summary.invalidate();
             let did = id.clone().unwrap_or_default();
             if idx == self.orders_id.len() {
                 self.orders_id.push(did);
@@ -2835,7 +2892,7 @@ impl Store {
                 self.orders_user_id[idx] = text("user_id");
                 self.orders_total[idx] = after.get("total").and_then(Cell::as_f64).unwrap_or(0.0);
                 self.orders_total_numeric[idx] = matches!(after.get("total"), Some(Cell::Int(_) | Cell::Float(_)));
-                self.orders_numeric_summary.take();
+                self.orders_numeric_summary.invalidate();
             }
             "users" if idx < self.users_email.len() => self.users_email[idx] = text("email"),
             "docs" | "orders" | "users" => self.rebuild_row_maps_collection(collection),
@@ -3357,14 +3414,15 @@ impl Store {
     pub(crate) fn orders_total_numeric(&self) -> &[bool] {
         &self.orders_total_numeric
     }
-    pub(crate) fn orders_numeric_summary(&self) -> (f64, bool) {
-        *self.orders_numeric_summary.get_or_init(|| {
-            let sum = self.orders_total.iter().sum();
-            let safe = self.orders_total.iter().zip(&self.orders_total_numeric).all(|(&value, &numeric)| {
-                numeric && value.is_finite() && value.abs() < 9_007_199_254_740_992.0
-            });
-            (sum, safe)
-        })
+    pub(crate) fn orders_sum(&self) -> f64 {
+        self.orders_numeric_summary.sum(&self.orders_total)
+    }
+    pub(crate) fn orders_numeric_safe(&self) -> bool {
+        self.orders_numeric_summary.safe(&self.orders_total, &self.orders_total_numeric)
+    }
+    #[cfg(test)]
+    fn orders_numeric_summary(&self) -> (f64, bool) {
+        (self.orders_sum(), self.orders_numeric_safe())
     }
     pub fn docs_wing(&self) -> &[Arc<str>] {
         &self.docs_wing
@@ -4158,6 +4216,33 @@ mod empty_index_slab_tests {
 #[cfg(test)]
 mod orders_numeric_tag_tests {
     use super::*;
+
+    #[test]
+    fn atomic_summary_facts_are_independent_concurrent_and_invalidated() {
+        use std::sync::atomic::Ordering;
+        let mut cache = OrdersNumericCache::new();
+        assert_eq!(cache.sum(&[1.0, 2.0]), 3.0);
+        #[cfg(target_has_atomic = "64")]
+        assert_eq!(cache.flags.load(Ordering::Relaxed), OrdersNumericCache::SUM_READY);
+        cache.invalidate();
+        assert!(cache.safe(&[1.0, 2.0], &[true, true]));
+        assert_eq!(cache.flags.load(Ordering::Relaxed), OrdersNumericCache::SAFE_READY | OrdersNumericCache::SAFE_VALUE);
+        cache.invalidate();
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let cache = &cache;
+                scope.spawn(move || {
+                    for _ in 0..128 {
+                        assert_eq!(cache.sum(&[1e16, -1e16, 1.0]).to_bits(), 1.0f64.to_bits());
+                        assert!(!cache.safe(&[1e16, -1e16, 1.0], &[true, true, true]));
+                    }
+                });
+            }
+        });
+        cache.invalidate();
+        assert_eq!(cache.sum(&[]).to_bits(), (-0.0f64).to_bits());
+        assert!(cache.safe(&[], &[]));
+    }
 
     #[test]
     fn numeric_tags_follow_rebuild_update_register_and_swap_remove() {
