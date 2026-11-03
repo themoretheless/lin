@@ -1,0 +1,76 @@
+diff --git a/src/index.rs b/src/index.rs
+index b7cd9f0b1..366490e5c 100644
+--- a/src/index.rs
++++ b/src/index.rs
+@@ -593,6 +593,31 @@ impl LiveIndex {
+             (false, distinct.len())
+         });
+ 
++        // Repeated non-unique keys need one forward-tree lookup per group.
++        // Bound the temporary dictionary and fall back before any mutation if
++        // this slab has many distinct keys. Bitmap sampling and unique error
++        // order retain the original per-row path below.
++        if keys.len() >= 512 && !self.def.unique && self.def.bitmap_card_field.is_none() {
++            let mut groups: FxHashMap<&IndexKey, Vec<usize>> = FxHashMap::default();
++            for ((pos, _), key) in keyed_rows.iter().zip(&keys) {
++                groups.entry(key).or_default().push(*pos);
++                if groups.len() > 16 {
++                    break;
++                }
++            }
++            if groups.len() <= 16 {
++                for (key, positions) in groups {
++                    let posting = self.forward.entry(key.clone())
++                        .or_insert_with(|| PostingList::new(false, 0));
++                    for pos in positions {
++                        self.reverse.insert(pos, key.clone());
++                        posting.push(pos);
++                    }
++                }
++                return Ok(());
++            }
++        }
++
+         // Bulk insert using pre-computed keys
+         for ((orig_idx, row), key) in keyed_rows.iter().zip(keys.into_iter()) {
+             use std::collections::btree_map::Entry;
+@@ -1671,6 +1696,39 @@ mod bitmap_sample_once_tests {
+             .collect();
+         assert_eq!(a, b);
+     }
++    #[test]
++    fn repeated_slab_groups_match_original_forward_and_reverse() {
++        for cardinality in [1, 2, 16, 17, 513] {
++            for unique in [false, true] {
++                for partial in [false, true] {
++                    let def = IndexDef {
++                        collection: "docs".into(), unique,
++                        fields: vec!["key".into(), "other".into()],
++                        pred: partial.then(|| Pred::Cmp {
++                            field: crate::ast::Field { parts: vec!["keep".into()] },
++                            op: CmpOp::Eq, value: Value::Bool(true),
++                        }),
++                        bitmap_card_field: None,
++                    };
++                    let rows = (0..1600).map(|i| Row::from([
++                        ("key".into(), Cell::text_arc(format!("key-{}", i % cardinality))),
++                        ("other".into(), Cell::Int(3)),
++                        ("keep".into(), Cell::Bool(i % 3 != 0)),
++                    ])).collect::<Vec<_>>();
++                    let mut actual = LiveIndex::new(def);
++                    let mut expected = actual.clone();
++                    // Include an existing key and then a second slab.
++                    for (start, slab) in [(0, &rows[..1]), (20, rows.as_slice()), (2000, rows.as_slice())] {
++                        assert_eq!(actual.insert_slab_batch(start, slab),
++                                   expected.insert_slab_batch_reference(start, slab));
++                        assert_eq!(actual.reverse, expected.reverse);
++                        assert_eq!(actual.forward, expected.forward);
++                    }
++                }
++            }
++        }
++    }
++
+     #[test]
+     fn sample_once_matches_per_row_reference() {
+         for n in [0, 1, 2, 99, 100, 101, 128] {
