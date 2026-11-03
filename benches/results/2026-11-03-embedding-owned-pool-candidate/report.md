@@ -1,3 +1,5 @@
+Final outcome: rejected by run41601208956; both 100k target windows and four controls failed. Resource phase stopped at a Python module-shadowing error and provides no RSS qualification. Runtime restored. See ../2026-11-03-embedding-owned-pool-linux-evidence/report.md. The preflight description below is historical.
+
 # Owned lazy hashing-embedding worker pool — candidate
 
 A materially different implementation from rejected caller participation and modulo specialization. No modulo, codec, model, quota, sync or public Row changes. At batch sizes >=4096 and parallelism >1, the model lazily creates at most seven owned workers plus caller participation. Cloned models share the same pool. Each worker reuses its TLS scratch across chunks. Bounded channels own queued String copies; no borrowed row/text crosses a thread lifetime. Queues close before all threads are joined when the last model clone drops, including partial startup failure.

@@ -1,0 +1,11 @@
+# Owned hashing pool: rejected warm gate; RSS harness failure retained
+
+Run https://github.com/themoretheless/lin/actions/runs/41601208956. Full Linux default workspace:417 passed, zero failed, three ignored. Independent warm audit checked expected run HEAD f4995dad5a7e6c6de7d4a7b3b403f9e846ea9ea6, complete source/protocol and exact x86_64 ELF closures, all108 original warm workers /324 case observations /6048 operation samples, exact read values/native canonical expected digests, medians and frozen decisions. Both exact binaries and every artifact file are archived with per-member SHA256.
+
+Neither100k target series passes: -2.0302% paired median gain vs A/A2.9693%,1/6 positive; +1.3712% vs A/A3.3043%,3/6 positive. Four of16 controls also fail: native1k series2 -2.2213%; join1k series1 -3.4175%, series2 -4.5620%; join100k series1 -5.9442%. All six failed windows remain binding. Their existence does not alone establish causal regression in unchanged read code. The runtime is rejected independently of any later infrastructure failure; no warm timing retry is authorized.
+
+The resource phase then failed before any lifecycle/RSS record was saved. The script basename resource.py shadows Python's standard resource extension, which os.wait4 imports to construct struct_rusage; re-executing the local script hit FileExistsError. The attempted first baseline cold input/stdout and traceback remain archived. No RSS or complete-worker-cycle qualification is claimed, and the planned216-process/6156-operation combined result did not complete. The audited dataset above is only the completed108-process warm matrix.
+
+A corrected, non-shadowing generic helper is scripts/bench-native-lifecycle.py. Its --preflight invokes a real child and verifies os.wait4 returns the standard resource.struct_rusage before any benchmark. That check passed locally. The original frozen failed protocol is preserved unchanged; the correction does not rerun or rescue its warm numerical failure.
+
+src/embed.rs is restored byte-for-byte to b9f10bc776b05eb5235237e9a900c2ef6aaed1fd (f37 runtime). Candidate source/tests remain in f4b3404a8. Full eight-peer objective remains open, including durable1k SQLite, native DuckDB10k/100k losses, other source/peer/resource qualification and real Kusto access. No adoption or universal superiority claim follows.
