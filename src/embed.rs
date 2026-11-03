@@ -94,17 +94,40 @@ impl Embedder for HashingEmbedder {
             return self.embed_batch_serial(texts);
         }
         let chunk_size = (n + threads - 1) / threads;
+        // Allocate output ownership on the caller, then initialize every slot
+        // in the workers. Allocation remains part of this batch operation.
+        let mut output = (0..n)
+            .map(|_| Arc::<[f32]>::new_uninit_slice(self.dim))
+            .collect::<Vec<_>>();
         std::thread::scope(|scope| {
             let mut handles = Vec::with_capacity(threads);
-            for chunk in texts.chunks(chunk_size) {
-                handles.push(scope.spawn(move || self.embed_batch_serial(chunk)));
+            for (chunk, outputs) in texts.chunks(chunk_size).zip(output.chunks_mut(chunk_size)) {
+                handles.push(scope.spawn(move || {
+                    EMBED_SCRATCH.with(|cell| {
+                        let mut guard = cell.borrow_mut();
+                        let (scratch, lower) = &mut *guard;
+                        scratch.ensure_dim(self.dim);
+                        for (text, output) in chunk.iter().zip(outputs) {
+                            self.fill(scratch, crate::fts::lowercased(text, lower));
+                            let output = Arc::get_mut(output).expect("unique batch output");
+                            scratch.finish_preallocated(output);
+                        }
+                    });
+                }));
             }
-            let mut out = Vec::with_capacity(n);
             for handle in handles {
-                out.extend(handle.join().expect("embedding worker panicked"));
+                handle.join().expect("embedding worker panicked");
             }
-            out
-        })
+        });
+        output
+            .into_iter()
+            .map(|output| {
+                // SAFETY: workers initialized every slot of every unique Arc, with
+                // disjoint equally sized text/output chunks. A worker panic leaves
+                // the scope by unwinding before any assume_init is reached.
+                unsafe { output.assume_init() }
+            })
+            .collect()
     }
 }
 
@@ -268,6 +291,41 @@ impl Scratch {
         }
         self.touched.clear();
         out
+    }
+
+    fn finish_preallocated(&mut self, output: &mut [std::mem::MaybeUninit<f32>]) {
+        assert_eq!(output.len(), self.v.len());
+        if self.touched.len() * 5 < self.v.len() {
+            let mut s = 0f32;
+            for &i in &self.touched {
+                let x = self.v[i as usize];
+                s += x * x;
+            }
+            if s >= 1_048_576.0 || !s.is_finite() {
+                self.touched.sort_unstable();
+                s = 0.0;
+                for &i in &self.touched {
+                    let x = self.v[i as usize];
+                    s += x * x;
+                }
+            }
+            if s > 1e-12 {
+                let inv = s.sqrt().recip();
+                for &i in &self.touched {
+                    self.v[i as usize] *= inv;
+                }
+            }
+        } else {
+            l2_normalize(&mut self.v);
+        }
+        for (dest, &value) in output.iter_mut().zip(&self.v) {
+            dest.write(value);
+        }
+        for &i in &self.touched {
+            self.v[i as usize] = 0.0;
+            self.seen[i as usize] = false;
+        }
+        self.touched.clear();
     }
 }
 
@@ -1257,6 +1315,51 @@ pub(crate) fn row_embed_text(row: &crate::store::Row) -> std::borrow::Cow<'_, st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preallocated_batch_preserves_every_vector_bit_and_independent_ownership() {
+        let inputs = [
+            "",
+            "Alpha beta 123",
+            "Ёж Café Καλημέρα",
+            "a\x0bb",
+            "\u{2003}a b",
+            "same text",
+        ];
+        for dim in [8, 9, 128, 768, 769, 1536] {
+            let embedder = HashingEmbedder::new("preallocated-test", dim);
+            let dense = "all words many tokens 0123456789 abcdefghijklmnopqrstuvwxyz ".repeat(80);
+            for n in [0, 1, 511, 512, 513, 1025] {
+                let texts = (0..n)
+                    .map(|i| {
+                        if i % 13 == 0 {
+                            dense.as_str()
+                        } else {
+                            inputs[i % inputs.len()]
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let expected = texts
+                    .iter()
+                    .map(|text| embedder.embed(text))
+                    .collect::<Vec<_>>();
+                let mut actual = embedder.embed_batch(&texts);
+                assert_eq!(actual.len(), expected.len());
+                for (a, b) in actual.iter().zip(&expected) {
+                    assert_eq!(
+                        a.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                        b.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
+                    );
+                    assert_eq!(Arc::strong_count(a), 1);
+                }
+                if actual.len() > 1 {
+                    let second = actual[1].to_vec();
+                    Arc::get_mut(&mut actual[0]).unwrap()[0] = 42.0;
+                    assert_eq!(actual[1].as_ref(), second.as_slice());
+                }
+            }
+        }
+    }
 
     #[test]
     fn single_embedding_field_borrows_the_row_text() {
