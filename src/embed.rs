@@ -24,18 +24,6 @@ pub trait Embedder: Send + Sync {
         texts.iter().map(|text| self.embed(text)).collect()
     }
 
-    /// Embed three optional text parts in order. Missing parts are omitted;
-    /// spaces separate present parts after the first nonempty part, including
-    /// present empty trailing parts. The default preserves `embed_batch` overrides.
-    fn embed_batch_parts(&self, texts: &[[Option<&str>; 3]]) -> Vec<Arc<[f32]>> {
-        let joined = texts
-            .iter()
-            .map(|parts| embed_parts_text(*parts))
-            .collect::<Vec<_>>();
-        let refs = joined.iter().map(|text| text.as_ref()).collect::<Vec<_>>();
-        self.embed_batch(&refs)
-    }
-
     /// Return owned vectors while preserving existing batch overrides.
     fn embed_batch_owned(&self, texts: &[&str]) -> Vec<Vec<f32>> {
         self.embed_batch(texts)
@@ -118,52 +106,9 @@ impl Embedder for HashingEmbedder {
             out
         })
     }
-
-    fn embed_batch_parts(&self, texts: &[[Option<&str>; 3]]) -> Vec<Arc<[f32]>> {
-        let n = texts.len();
-        if n < 512 {
-            return self.embed_parts_serial(texts);
-        }
-        let threads = std::thread::available_parallelism()
-            .map(|p| p.get())
-            .unwrap_or(1)
-            .min(8)
-            .min((n + 255) / 256);
-        if threads <= 1 {
-            return self.embed_parts_serial(texts);
-        }
-        let chunk_size = (n + threads - 1) / threads;
-        std::thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(threads);
-            for chunk in texts.chunks(chunk_size) {
-                handles.push(scope.spawn(move || self.embed_parts_serial(chunk)));
-            }
-            let mut out = Vec::with_capacity(n);
-            for handle in handles {
-                out.extend(handle.join().expect("embedding worker panicked"));
-            }
-            out
-        })
-    }
 }
 
 impl HashingEmbedder {
-    fn embed_parts_serial(&self, texts: &[[Option<&str>; 3]]) -> Vec<Arc<[f32]>> {
-        EMBED_SCRATCH.with(|cell| {
-            let mut guard = cell.borrow_mut();
-            let (scratch, lower) = &mut *guard;
-            scratch.ensure_dim(self.dim);
-            let mut joined = String::with_capacity(256);
-            let mut out = Vec::with_capacity(texts.len());
-            for parts in texts {
-                let text = write_embed_parts(*parts, &mut joined);
-                self.fill(scratch, crate::fts::lowercased(text, lower));
-                out.push(scratch.finish());
-            }
-            out
-        })
-    }
-
     fn embed_batch_serial(&self, texts: &[&str]) -> Vec<Arc<[f32]>> {
         EMBED_SCRATCH.with(|cell| {
             let mut guard = cell.borrow_mut();
@@ -1286,30 +1231,8 @@ impl HnswIndexSq8 {
 }
 
 /// Text blob used for embedding a row (title / body / snippet).
-fn write_embed_parts<'a>(texts: [Option<&'a str>; 3], scratch: &'a mut String) -> &'a str {
-    if texts.iter().flatten().all(|text| text.is_empty()) {
-        return "";
-    }
-    if let Some(first) = texts.iter().position(|t| t.is_some_and(|s| !s.is_empty()))
-        && texts[first + 1..].iter().all(Option::is_none)
-    {
-        return texts[first].unwrap();
-    }
-    scratch.clear();
-    for text in texts.into_iter().flatten() {
-        if !scratch.is_empty() {
-            scratch.push(' ');
-        }
-        scratch.push_str(text);
-    }
-    scratch.as_str()
-}
-
 pub(crate) fn row_embed_text(row: &crate::store::Row) -> std::borrow::Cow<'_, str> {
-    embed_parts_text(["title", "body", "snippet"].map(|k| crate::store::row_text(row, k)))
-}
-
-pub(crate) fn embed_parts_text<'a>(texts: [Option<&'a str>; 3]) -> std::borrow::Cow<'a, str> {
+    let texts = ["title", "body", "snippet"].map(|k| crate::store::row_text(row, k));
     let bytes = texts.iter().flatten().map(|t| t.len()).sum::<usize>();
     if bytes == 0 {
         return std::borrow::Cow::Borrowed("");
@@ -1334,78 +1257,6 @@ pub(crate) fn embed_parts_text<'a>(texts: [Option<&'a str>; 3]) -> std::borrow::
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parts_batch_preserves_reference_bits_at_worker_boundaries() {
-        let fields = [None, Some(""), Some("ЁЖ WAL\tplain")];
-        let mut combinations = Vec::new();
-        for a in fields {
-            for b in fields {
-                for c in fields {
-                    combinations.push([a, b, c]);
-                }
-            }
-        }
-        for dim in [8, 768, 769] {
-            let embedder = HashingEmbedder::new("parts-test", dim);
-            for n in [0, 1, 511, 512, 513, 1025] {
-                let parts = (0..n)
-                    .map(|i| combinations[i % combinations.len()])
-                    .collect::<Vec<_>>();
-                let expected = parts
-                    .iter()
-                    .map(|p| {
-                        let mut text = String::new();
-                        for field in p.iter().flatten() {
-                            if !text.is_empty() {
-                                text.push(' ');
-                            }
-                            text.push_str(field);
-                        }
-                        embedder.embed(&text)
-                    })
-                    .collect::<Vec<_>>();
-                let actual = embedder.embed_batch_parts(&parts);
-                assert_eq!(actual.len(), n);
-                for (a, b) in actual.iter().zip(&expected) {
-                    assert_eq!(
-                        a.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-                        b.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn parts_default_preserves_third_party_batch_override_and_text() {
-        struct Custom;
-        impl Embedder for Custom {
-            fn id(&self) -> &str {
-                "custom"
-            }
-            fn dim(&self) -> usize {
-                1
-            }
-            fn embed(&self, _: &str) -> Arc<[f32]> {
-                panic!("batch override must be retained")
-            }
-            fn embed_batch(&self, texts: &[&str]) -> Vec<Arc<[f32]>> {
-                assert_eq!(texts, &["a ", "b", "", "a  c"]);
-                texts.iter().map(|t| Arc::from([t.len() as f32])).collect()
-            }
-        }
-        let result = Custom.embed_batch_parts(&[
-            [Some("a"), Some(""), None],
-            [Some(""), Some("b"), None],
-            [None, None, Some("")],
-            [Some("a"), Some(""), Some("c")],
-        ]);
-        assert_eq!(
-            result.iter().map(|v| v[0]).collect::<Vec<_>>(),
-            [2.0, 1.0, 0.0, 4.0]
-        );
-    }
 
     #[test]
     fn single_embedding_field_borrows_the_row_text() {
