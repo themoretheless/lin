@@ -1,0 +1,32 @@
+name: insert-linux-phase-profile
+on:
+  push:
+    branches: [codex/current-candidate-public-peers-20261103]
+    paths:
+      - '.github/workflows/insert-linux-phase-profile.yml'
+      - 'benches/results/2026-11-03-insert-linux-profile/profile.py'
+jobs:
+  profile:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_NET_RETRY: 5
+      CARGO_HTTP_MULTIPLEXING: 'false'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.96.0'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - uses: Swatinem/rust-cache@v2
+      - name: Profile exact insertion workload with full readback
+        run: python3 benches/results/2026-11-03-insert-linux-profile/profile.py /tmp/lin-insert-linux-profile
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: insert-linux-phase-profile
+          path: /tmp/lin-insert-linux-profile/
+          if-no-files-found: error
