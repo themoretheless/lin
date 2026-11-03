@@ -38,9 +38,8 @@ save()
 original = (root/'src/exec.rs').read_bytes()
 try:
     ordinary = build('ordinary')
-    patches = [root/f'benches/results/{slug}/instrumentation.patch' for slug in
-               ['2026-11-03-insert-phase-discovery', '2026-11-03-insert-detailed-discovery']]
-    metadata['patches'] = {str(p.relative_to(root)): sha(p) for p in patches}
+    patches = [Path(__file__).resolve().parent/'instrumentation.patch', root/'benches/results/2026-11-03-insert-detailed-discovery/instrumentation.patch']
+    metadata['patches'] = {p.name if p.parent == Path(__file__).resolve().parent else str(p.relative_to(root)): sha(p) for p in patches}
     for patch in patches:
         subprocess.run(['git', 'apply', '--check', str(patch)], cwd=root, check=True)
         subprocess.run(['git', 'apply', str(patch)], cwd=root, check=True)
