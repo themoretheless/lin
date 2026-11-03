@@ -1,0 +1,7 @@
+# Caller-built final row chunk: prospective frozen qualification
+
+Candidate e3b5e04c7cde545244c2a83cba52bc001ca5be13 versus baseline b9f10bc776b05eb5235237e9a900c2ef6aaed1fd. Only src/exec.rs differs. Keep dynamic parallelism and512-row threshold, let caller build last chunk, join preceding blocks in order; Builder creation errors fall back to exact same chunk builder. No shape/embedding/index/model/format/sync changes. Focused11 tests passed; full CI workspace required before timing. No performance result yet.
+
+Two series of six paired rounds/all six role permutations. Native1k/10k/100k each require6/6positive pairs and median gain above independent A/A. Point_get/join_filter controls allow max(2%,A/A) regression. Warm108processes/324cases/6048samples. Separate108 native-only processes measure complete process wall and Linux wait4 peak RSS, allowing max(2%,A/A) wall/max(5%,A/A) RSS regression. Total216processes/6156operations/108wall/108RSS; all windows must pass. Resource phase continues after numeric warm refusal; retain every loss and forbid unchanged numerical retries.
+
+Force clean/actual compilation of lin/worker for both ordinary ELF binaries. Freeze runtime/harness/helper hashes; retain build/host/binary provenance and all exact values/digests. Source success would not complete FULL WAL, mutation/nondefault controls or fresh named-peer qualification. Full eight-peer objective remains unfinished.
