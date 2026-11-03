@@ -1,0 +1,9 @@
+# Worker-local chunk output allocation: unqualified candidate
+
+Based on correct runtime b9f10bc776b05eb5235237e9a900c2ef6aaed1fd. Unlike rejected caller-allocation candidates c022e34178a459bf0c9efb6a51f4423947b35d92 and 330afdb211bd5ead8d5df9ecdff04f2fcf29a169, output allocation occurs entirely inside each existing worker. Each worker allocates all independent output Arcs for its chunk first, then computes and fully initializes every vector. This preserves parallel allocation on cold calls while separating chunk allocation from feature generation. This may improve allocator/cache behavior or may add costs; no performance benefit is established.
+
+Parallel threshold, worker count, chunk sizes, input order, exact normalization/hash/features/dimension, output Arc/Cell/Row API, FTS/index maintenance and sync stay the same. Small/serial paths remain baseline. Every allocation remains inside the operation timer. Additional chunk output pointer vectors and final ordered merge are included. Scoped panic unwinds before uninitialized Arc conversion; each unique Arc is fully initialized with all dense slots before assume_init. No persistent pool, arena/cache, alternate allocator or deferred validation work.
+
+Existing focused tests cover bitwise scalar equivalence across six dimensions and batch sizes 0/1/511/512/513/1025, Unicode/dense/empty/whitespace inputs, unique ownership and mutation independence. Focused/full release tests and a new frozen complete source/read/lifecycle/RSS gate are required. Prior warm gains do not qualify this source; prior lifecycle refusals remain binding. No unchanged numerical retry, peer claim or main merge.
+
+Release correctness completed: 12 focused embedding tests and 415 full workspace tests passed; zero failed, 3 ignored. Performance gate remains pending.
