@@ -1,3 +1,5 @@
+Final outcome: rejected by Linux run 41591451842. Only 2/6 target windows and 8/12 control windows passed. Implementation restored to the baseline; original source and all evidence remain preserved. See ../2026-11-03-embedding-caller-linux-evidence/report.md for the complete independent reconstruction. The preflight description below is historical.
+
 # Caller participation in parallel default embeddings — candidate
 
 Linux insertion profile 41590218518 identified vector generation/allocation as the principal 100k cost: median 14.45 ms per 10k chunk. Original HashingEmbedder creates up to P child threads and leaves its caller waiting; the candidate creates up to P-1 children and computes the first chunk on the caller. Chunk boundaries, overall parallelism, input order, vector representation, dimensions, feature extraction and normalization remain unchanged. Custom Embedder batch overrides and small/serial batches are untouched.

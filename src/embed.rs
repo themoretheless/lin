@@ -95,15 +95,11 @@ impl Embedder for HashingEmbedder {
         }
         let chunk_size = (n + threads - 1) / threads;
         std::thread::scope(|scope| {
-            let (first, rest) = texts.split_at(chunk_size.min(n));
-            let mut handles = Vec::with_capacity(threads - 1);
-            for chunk in rest.chunks(chunk_size) {
+            let mut handles = Vec::with_capacity(threads);
+            for chunk in texts.chunks(chunk_size) {
                 handles.push(scope.spawn(move || self.embed_batch_serial(chunk)));
             }
-            // Keep one chunk on the caller instead of leaving it idle while
-            // every chunk allocates dense vectors on a new child thread.
             let mut out = Vec::with_capacity(n);
-            out.extend(self.embed_batch_serial(first));
             for handle in handles {
                 out.extend(handle.join().expect("embedding worker panicked"));
             }
@@ -1399,31 +1395,6 @@ mod tests {
                     expected.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
                     "dim={dim}, text={text:?}"
                 );
-            }
-        }
-    }
-
-    #[test]
-    fn parallel_hashing_batches_preserve_order_and_exact_vector_bits() {
-        for dim in [8, 32, 768] {
-            let embedder = HashingEmbedder::new("parallel-test", dim);
-            let owned = (0..1025).map(|i| match i % 4 {
-                0 => format!("document {i} WAL note"),
-                1 => format!("ЁЖ {i} İ unicode"),
-                2 => format!("vertical\u{b}tab {i}"),
-                _ => String::new(),
-            }).collect::<Vec<_>>();
-            for n in [0, 1, 511, 512, 513, 1025] {
-                let refs = owned[..n].iter().map(String::as_str).collect::<Vec<_>>();
-                let batch = embedder.embed_batch(&refs);
-                assert_eq!(batch.len(), n);
-                for (text, vector) in refs.iter().zip(batch) {
-                    let single = embedder.embed(text);
-                    assert_eq!(vector.len(), dim);
-                    assert!(vector.iter().zip(single.iter())
-                        .all(|(a, b)| a.to_bits() == b.to_bits()),
-                        "dim={dim}, n={n}, text={text:?}");
-                }
             }
         }
     }
