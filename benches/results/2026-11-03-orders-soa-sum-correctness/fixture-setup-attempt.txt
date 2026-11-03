@@ -1,0 +1,38 @@
+   Compiling lin v0.4.0 (/Users/themoretheless/.codex/worktrees/lin-peer-refresh-20261103/lin)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 10.26s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running tests/grouped_sum_soa.rs (/Users/themoretheless/Documents/Sources/lin/target/debug/build/lin/0a5ff5bc36b33cbe/out/grouped_sum_soa-0a5ff5bc36b33cbe)
+
+running 3 tests
+test orders_soa_grouped_sum_enforces_the_generic_quota ... FAILED
+test orders_soa_grouped_sum_keeps_missing_and_mixed_key_identities ... FAILED
+test orders_soa_grouped_sum_preserves_source_order_float_bits ... FAILED
+
+failures:
+
+---- orders_soa_grouped_sum_enforces_the_generic_quota stdout ----
+
+thread 'orders_soa_grouped_sum_enforces_the_generic_quota' (18462299) panicked at tests/grouped_sum_soa.rs:14:14:
+called `Result::unwrap()` on an `Err` value: Error { message: "fk: orders.user_id → users.id missing u1", pos: None, phase: Runtime }
+
+---- orders_soa_grouped_sum_keeps_missing_and_mixed_key_identities stdout ----
+
+thread 'orders_soa_grouped_sum_keeps_missing_and_mixed_key_identities' (18462300) panicked at tests/grouped_sum_soa.rs:70:6:
+called `Result::unwrap()` on an `Err` value: Error { message: "type mismatch: expected id, found i64", pos: None, phase: Compile }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- orders_soa_grouped_sum_preserves_source_order_float_bits stdout ----
+
+thread 'orders_soa_grouped_sum_preserves_source_order_float_bits' (18462301) panicked at tests/grouped_sum_soa.rs:41:14:
+called `Result::unwrap()` on an `Err` value: Error { message: "fk: orders.user_id → users.id missing u1", pos: None, phase: Runtime }
+
+
+failures:
+    orders_soa_grouped_sum_enforces_the_generic_quota
+    orders_soa_grouped_sum_keeps_missing_and_mixed_key_identities
+    orders_soa_grouped_sum_preserves_source_order_float_bits
+
+test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `--test grouped_sum_soa`

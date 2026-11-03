@@ -3292,106 +3292,21 @@ impl Db {
                         return Ok(vec![row]);
                     }
                     if let Some(by_field) = by
-                        && by_field.leaf() == Some("user_id")
+                        && by_field.as_str() == "user_id"
+                        && field.as_str() == "total"
                     {
-                        if plan.filter.is_none() {
-                            let uids = self.store.orders_user_id();
-                            let totals = self.store.orders_total();
-                            let total_len = totals.len();
-                            let map = if total_len >= 8192 {
-                                let threads = std::thread::available_parallelism()
-                                    .map(|p| p.get())
-                                    .unwrap_or(1)
-                                    .min(8)
-                                    .min((total_len + 1023) / 1024);
-                                if threads > 1 {
-                                    let chunk_size = (total_len + threads - 1) / threads;
-                                    let thread_maps: Vec<FxHashMap<Arc<str>, f64>> = std::thread::scope(|scope| {
-                                        let mut handles = Vec::with_capacity(threads);
-                                        for chunk_idx in 0..threads {
-                                            let c_start = chunk_idx * chunk_size;
-                                            if c_start >= total_len {
-                                                break;
-                                            }
-                                            let c_end = (c_start + chunk_size).min(total_len);
-                                            handles.push(scope.spawn(move || {
-                                                let mut local_map: FxHashMap<Arc<str>, f64> = FxHashMap::default();
-                                                for i in c_start..c_end {
-                                                    *local_map.entry(Arc::clone(&uids[i])).or_insert(0.0) += totals[i];
-                                                }
-                                                local_map
-                                            }));
-                                        }
-                                        handles.into_iter().map(|h| h.join().unwrap()).collect()
-                                    });
-                                    let mut combined: FxHashMap<Arc<str>, f64> = FxHashMap::default();
-                                    for t_map in thread_maps {
-                                        for (k, v) in t_map {
-                                            *combined.entry(k).or_insert(0.0) += v;
-                                        }
-                                    }
-                                    combined
-                                } else {
-                                    let mut map: FxHashMap<Arc<str>, f64> = FxHashMap::default();
-                                    for (uid, &tot) in uids.iter().zip(totals) {
-                                        *map.entry(Arc::clone(uid)).or_insert(0.0) += tot;
-                                    }
-                                    map
-                                }
-                            } else {
-                                let mut map: FxHashMap<Arc<str>, f64> = FxHashMap::default();
-                                for (uid, &tot) in uids.iter().zip(totals) {
-                                    *map.entry(Arc::clone(uid)).or_insert(0.0) += tot;
-                                }
-                                map
-                            };
-                            let mut entries: Vec<(Arc<str>, f64)> = map.into_iter().collect();
-                            entries.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
-                            return Ok(entries
-                                .into_iter()
-                                .map(|(uid, tot)| {
-                                    let mut row = crate::store::acquire_row();
-                                    row.insert("user_id".into(), Cell::Text(uid));
-                                    row.insert("total".into(), Cell::Float(tot));
-                                    row
-                                })
-                                .collect());
-                        } else if let Some(Pred::Cmp {
-                            field: filt_field,
-                            op: CmpOp::Gt,
-                            value,
-                        }) = &plan.filter
-                            && filt_field.leaf() == Some("total")
-                        {
-                            let thresh = match value {
-                                Value::Float(f) => Some(*f),
-                                Value::Int(n) => Some(*n as f64),
-                                _ => None,
-                            };
-                            if let Some(threshold) = thresh {
-                                let uids = self.store.orders_user_id();
-                                let totals = self.store.orders_total();
-                                let mut map: FxHashMap<Arc<str>, f64> = FxHashMap::default();
-                                for (uid, &tot) in uids.iter().zip(totals) {
-                                    if tot > threshold {
-                                        *map.entry(Arc::clone(uid)).or_insert(0.0) += tot;
-                                    }
-                                }
-                                let mut entries: Vec<(Arc<str>, f64)> = map.into_iter().collect();
-                                entries.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
-                                return Ok(entries
-                                    .into_iter()
-                                    .map(|(uid, tot)| {
-                                        let mut row = crate::store::acquire_row();
-                                        row.insert("user_id".into(), Cell::Text(uid));
-                                        row.insert("total".into(), Cell::Float(tot));
-                                        row
-                                    })
-                                    .collect());
-                            }
-                        }
+                        return agg_sum_column(
+                            self.store.collection("orders"),
+                            self.store.orders_total(),
+                            "total",
+                            "user_id",
+                            plan.filter.as_ref(),
+                            now,
+                            self.quotas.max_aggregate_bytes,
+                        );
                     }
                 }
+
                 AggKind::Avg { field, by }
                     if field.leaf() == Some("total") && by.is_none() && plan.filter.is_none() =>
                 {
@@ -3532,42 +3447,35 @@ impl Db {
                     return Ok(vec![row]);
                 };
                 let bk = by.as_str();
-                let mut map: FxHashMap<&Cell, f64> = FxHashMap::default();
+                let mut map: FxHashMap<Cell, f64> = FxHashMap::default();
                 let mut state_bytes = 0usize;
                 for r in col {
                     if filter.is_none_or(|p| eval_pred(p, r, now)) {
-                        // Borrow group keys while the input collection is stable. Own only
-                        // the distinct keys when constructing the result rows below.
-                        let cell = r.get(&bk).unwrap_or(&Cell::Null);
-                        let n = r.get(&fk).and_then(Cell::as_f64).unwrap_or(0.0);
-                        match map.entry(cell) {
-                            std::collections::hash_map::Entry::Occupied(mut entry) => {
-                                *entry.get_mut() += n;
-                            }
-                            std::collections::hash_map::Entry::Vacant(entry) => {
-                                let key_size = match entry.key() {
-                                    Cell::Text(s) => s.len() + 32,
-                                    _ => 16,
-                                };
-                                state_bytes = state_bytes.saturating_add(key_size + 64);
-                                if state_bytes > self.quotas.max_aggregate_bytes {
-                                    return Err(Error::runtime(format!(
-                                        "aggregate state bytes {state_bytes} exceeds max_aggregate_bytes quota {}",
-                                        self.quotas.max_aggregate_bytes
-                                    )));
-                                }
-                                entry.insert(0.0 + n);
+                        let cell = r.get(&bk).map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
+                        if !map.contains_key(&cell) {
+                            let key_size = match &cell {
+                                Cell::Text(s) => s.len() + 32,
+                                _ => 16,
+                            };
+                            state_bytes = state_bytes.saturating_add(key_size + 64);
+                            if state_bytes > self.quotas.max_aggregate_bytes {
+                                return Err(Error::runtime(format!(
+                                    "aggregate state bytes {state_bytes} exceeds max_aggregate_bytes quota {}",
+                                    self.quotas.max_aggregate_bytes
+                                )));
                             }
                         }
+                        let n = r.get(&fk).and_then(Cell::as_f64).unwrap_or(0.0);
+                        *map.entry(cell).or_insert(0.0) += n;
                     }
                 }
-                let mut entries: Vec<(&Cell, f64)> = map.into_iter().collect();
+                let mut entries: Vec<(Cell, f64)> = map.into_iter().collect();
                 entries.sort_unstable_by(|(a, _), (b, _)| cmp_sort(a, b));
                 Ok(entries
                     .into_iter()
                     .map(|(cell, n)| {
                         let mut row = crate::store::acquire_row();
-                        row.insert(bk.clone(), cell.clone_for_borrow());
+                        row.insert(bk.clone(), cell);
                         row.insert(fk.clone(), Cell::Float(n));
                         row
                     })
@@ -8144,6 +8052,57 @@ fn eq_value_for_field<'a>(pred: &'a Pred, field: &str) -> Option<&'a str> {
         Pred::And(a, b) => eq_value_for_field(a, field).or_else(|| eq_value_for_field(b, field)),
         _ => None,
     }
+}
+
+// Group directly over the numeric column, but retain the generic path's
+// source-order additions, Cell key identity and per-distinct-key quota.
+fn agg_sum_column(
+    rows: &[Row],
+    values: &[f64],
+    field: &str,
+    by: &str,
+    filter: Option<&Pred>,
+    now: i64,
+    max_bytes: usize,
+) -> Result<Vec<Row>, Error> {
+    debug_assert_eq!(rows.len(), values.len());
+    let mut map: FxHashMap<&Cell, f64> = FxHashMap::default();
+    let mut state_bytes = 0usize;
+    for (row, &value) in rows.iter().zip(values) {
+        if filter.is_some_and(|pred| !eval_pred(pred, row, now)) {
+            continue;
+        }
+        let key = row.get(by).unwrap_or(&Cell::Null);
+        match map.entry(key) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                *entry.get_mut() += value;
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let key_size = match entry.key() {
+                    Cell::Text(s) => s.len() + 32,
+                    _ => 16,
+                };
+                state_bytes = state_bytes.saturating_add(key_size + 64);
+                if state_bytes > max_bytes {
+                    return Err(Error::runtime(format!(
+                        "aggregate state bytes {state_bytes} exceeds max_aggregate_bytes quota {max_bytes}"
+                    )));
+                }
+                entry.insert(0.0 + value);
+            }
+        }
+    }
+    let mut entries: Vec<(&Cell, f64)> = map.into_iter().collect();
+    entries.sort_unstable_by(|(a, _), (b, _)| cmp_sort(a, b));
+    Ok(entries
+        .into_iter()
+        .map(|(key, sum)| {
+            let mut row = crate::store::acquire_row();
+            row.insert(by.to_owned(), key.clone_for_borrow());
+            row.insert(field.to_owned(), Cell::Float(sum));
+            row
+        })
+        .collect())
 }
 
 fn agg_sum(
