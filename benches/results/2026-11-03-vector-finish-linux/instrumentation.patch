@@ -1,0 +1,62 @@
+--- a/src/embed.rs
++++ b/src/embed.rs
+@@ -114,11 +114,14 @@
+             let mut guard = cell.borrow_mut();
+             let (scratch, lower) = &mut *guard;
+             scratch.ensure_dim(self.dim);
++            scratch.diagnostic_ns = [0; 3];
+             let mut out = Vec::with_capacity(texts.len());
+             for text in texts {
+                 self.fill(scratch, crate::fts::lowercased(text, lower));
+                 out.push(scratch.finish());
+             }
++            eprintln!("FINISH_DETAIL rows={} normalize_ns={} arc_ns={} cleanup_ns={}",
++                texts.len(), scratch.diagnostic_ns[0], scratch.diagnostic_ns[1], scratch.diagnostic_ns[2]);
+             out
+         })
+     }
+@@ -182,6 +185,7 @@
+     v: Vec<f32>,
+     seen: Vec<bool>,
+     touched: Vec<u32>,
++    diagnostic_ns: [u128; 3],
+ }
+ 
+ impl Scratch {
+@@ -190,6 +194,7 @@
+             v: vec![0f32; dim],
+             seen: vec![false; dim],
+             touched: Vec::with_capacity(dim / 4),
++            diagnostic_ns: [0; 3],
+         }
+     }
+ 
+@@ -238,6 +243,7 @@
+     /// of 1/16 in f32, so visitation order cannot change the result. Larger
+     /// sums retain the original ascending-slot order.
+     fn finish(&mut self) -> Arc<[f32]> {
++        let normalize_start = std::time::Instant::now();
+         if self.touched.len() * 5 < self.v.len() {
+             let mut s = 0f32;
+             for &i in &self.touched {
+@@ -261,12 +267,20 @@
+         } else {
+             l2_normalize(&mut self.v);
+         }
++        let normalize_ns = normalize_start.elapsed().as_nanos();
++        let arc_start = std::time::Instant::now();
+         let out = Arc::from(&self.v[..]);
++        let arc_ns = arc_start.elapsed().as_nanos();
++        let cleanup_start = std::time::Instant::now();
+         for &i in &self.touched {
+             self.v[i as usize] = 0.0;
+             self.seen[i as usize] = false;
+         }
+         self.touched.clear();
++        let cleanup_ns = cleanup_start.elapsed().as_nanos();
++        self.diagnostic_ns[0] += normalize_ns;
++        self.diagnostic_ns[1] += arc_ns;
++        self.diagnostic_ns[2] += cleanup_ns;
+         out
+     }
+ }
