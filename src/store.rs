@@ -643,6 +643,7 @@ pub struct Store {
     orders_total: Vec<f64>,
     orders_total_numeric: Vec<bool>,
     orders_numeric_summary: OnceLock<(f64, bool)>,
+    orders_numeric_unsafe_count: usize,
     users_id: Vec<Arc<str>>,
     users_email: Vec<Arc<str>>,
     /// Columnar facts (append hot path). `collections["facts"]` may lag until
@@ -714,6 +715,7 @@ impl Store {
             orders_total: Vec::new(),
             orders_total_numeric: Vec::new(),
             orders_numeric_summary: OnceLock::new(),
+            orders_numeric_unsafe_count: 0,
             users_id: Vec::new(),
             users_email: Vec::new(),
             facts_s: Vec::new(),
@@ -999,6 +1001,7 @@ impl Store {
             orders_total: Vec::new(),
             orders_total_numeric: Vec::new(),
             orders_numeric_summary: OnceLock::new(),
+            orders_numeric_unsafe_count: 0,
             users_id: Vec::new(),
             users_email: Vec::new(),
             facts_s: Vec::new(),
@@ -2315,6 +2318,9 @@ impl Store {
             "orders" => {
                 swap_pop_at(&mut self.orders_id, p, len);
                 swap_pop_at(&mut self.orders_user_id, p, len);
+                if self.orders_total.len() == len && self.orders_total_numeric.len() == len && p < len {
+                    self.orders_numeric_unsafe_count -= orders_numeric_unsafe(self.orders_total[p], self.orders_total_numeric[p]);
+                }
                 swap_pop_at(&mut self.orders_total, p, len);
                 swap_pop_at(&mut self.orders_total_numeric, p, len);
                 self.orders_numeric_summary.take();
@@ -2470,6 +2476,7 @@ impl Store {
             self.orders_user_id.clear();
             self.orders_total.clear();
             self.orders_total_numeric.clear();
+            self.orders_numeric_unsafe_count = 0;
             self.orders_numeric_summary.take();
         }
         if collection == "users" {
@@ -2518,6 +2525,7 @@ impl Store {
                 self.orders_user_id.push(row.get("user_id").and_then(Cell::text_shared).unwrap_or_default());
                 self.orders_total.push(row.get("total").and_then(Cell::as_f64).unwrap_or(0.0));
                 self.orders_total_numeric.push(matches!(row.get("total"), Some(Cell::Int(_) | Cell::Float(_))));
+                self.orders_numeric_unsafe_count += orders_numeric_unsafe(*self.orders_total.last().unwrap(), *self.orders_total_numeric.last().unwrap());
             } else if collection == "users" {
                 self.users_id.push(id.unwrap_or_default());
                 self.users_email.push(row.get("email").and_then(Cell::text_shared).unwrap_or_default());
@@ -2605,11 +2613,14 @@ impl Store {
                 self.orders_user_id.push(uid);
                 self.orders_total.push(total);
                 self.orders_total_numeric.push(matches!(row.get("total"), Some(Cell::Int(_) | Cell::Float(_))));
+                self.orders_numeric_unsafe_count += orders_numeric_unsafe(*self.orders_total.last().unwrap(), *self.orders_total_numeric.last().unwrap());
             } else if idx < self.orders_id.len() {
                 self.orders_id[idx] = id;
                 self.orders_user_id[idx] = uid;
+                self.orders_numeric_unsafe_count -= orders_numeric_unsafe(self.orders_total[idx], self.orders_total_numeric[idx]);
                 self.orders_total[idx] = total;
                 self.orders_total_numeric[idx] = matches!(row.get("total"), Some(Cell::Int(_) | Cell::Float(_)));
+                self.orders_numeric_unsafe_count += orders_numeric_unsafe(total, self.orders_total_numeric[idx]);
             } else {
                 self.rebuild_row_maps_collection("orders");
             }
@@ -2687,11 +2698,14 @@ impl Store {
                 self.orders_user_id.push(uid);
                 self.orders_total.push(total);
                 self.orders_total_numeric.push(matches!(row.get("total"), Some(Cell::Int(_) | Cell::Float(_))));
+                self.orders_numeric_unsafe_count += orders_numeric_unsafe(*self.orders_total.last().unwrap(), *self.orders_total_numeric.last().unwrap());
             } else if idx < self.orders_id.len() {
                 self.orders_id[idx] = did;
                 self.orders_user_id[idx] = uid;
+                self.orders_numeric_unsafe_count -= orders_numeric_unsafe(self.orders_total[idx], self.orders_total_numeric[idx]);
                 self.orders_total[idx] = total;
                 self.orders_total_numeric[idx] = matches!(row.get("total"), Some(Cell::Int(_) | Cell::Float(_)));
+                self.orders_numeric_unsafe_count += orders_numeric_unsafe(total, self.orders_total_numeric[idx]);
             } else {
                 self.rebuild_row_maps_collection("orders");
             }
@@ -2833,8 +2847,10 @@ impl Store {
             }
             "orders" if idx < self.orders_user_id.len() && idx < self.orders_total.len() && idx < self.orders_total_numeric.len() => {
                 self.orders_user_id[idx] = text("user_id");
+                self.orders_numeric_unsafe_count -= orders_numeric_unsafe(self.orders_total[idx], self.orders_total_numeric[idx]);
                 self.orders_total[idx] = after.get("total").and_then(Cell::as_f64).unwrap_or(0.0);
                 self.orders_total_numeric[idx] = matches!(after.get("total"), Some(Cell::Int(_) | Cell::Float(_)));
+                self.orders_numeric_unsafe_count += orders_numeric_unsafe(self.orders_total[idx], self.orders_total_numeric[idx]);
                 self.orders_numeric_summary.take();
             }
             "users" if idx < self.users_email.len() => self.users_email[idx] = text("email"),
@@ -3360,9 +3376,7 @@ impl Store {
     pub(crate) fn orders_numeric_summary(&self) -> (f64, bool) {
         *self.orders_numeric_summary.get_or_init(|| {
             let sum = self.orders_total.iter().sum();
-            let safe = self.orders_total.iter().zip(&self.orders_total_numeric).all(|(&value, &numeric)| {
-                numeric && value.is_finite() && value.abs() < 9_007_199_254_740_992.0
-            });
+            let safe = self.orders_numeric_unsafe_count == 0;
             (sum, safe)
         })
     }
@@ -3606,6 +3620,11 @@ pub struct MemBackup {
     extra_filters: BTreeMap<String, String>,
     extra_owned: BTreeMap<String, Vec<(String, String)>>,
     hnsw: BTreeMap<String, crate::embed::HnswIndex>,
+}
+
+/// Same eligibility predicate as the orders aggregate fast path, maintained per mutation.
+fn orders_numeric_unsafe(value: f64, numeric: bool) -> usize {
+    usize::from(!(numeric && value.is_finite() && value.abs() < 9_007_199_254_740_992.0))
 }
 
 /// Move `v[p]` on top of the tail and drop the tail, keeping the vec dense. A
@@ -4158,6 +4177,53 @@ mod empty_index_slab_tests {
 #[cfg(test)]
 mod orders_numeric_tag_tests {
     use super::*;
+
+    #[test]
+    fn numeric_safety_count_tracks_all_mutation_paths_and_boundaries() {
+        fn check(store: &Store) {
+            let expected = store.orders_total.iter().zip(&store.orders_total_numeric)
+                .filter(|(v,n)| !(**n && v.is_finite() && v.abs() < 9_007_199_254_740_992.0)).count();
+            assert_eq!(store.orders_numeric_unsafe_count, expected);
+            let (sum,safe) = store.orders_numeric_summary();
+            assert_eq!(sum.to_bits(), store.orders_total.iter().sum::<f64>().to_bits());
+            assert_eq!(safe, expected == 0);
+        }
+        let mut store = Store::empty("test");
+        let values = [Cell::Int(1), Cell::Float(-0.0), Cell::Float(f64::NAN),
+            Cell::Float(f64::INFINITY), Cell::Float(f64::NEG_INFINITY),
+            Cell::Int(9_007_199_254_740_992), Cell::Float(-9_007_199_254_740_992.0),
+            Cell::Time(2), Cell::Null, Cell::Bool(true), Cell::text_arc("3")];
+        for (i,total) in values.into_iter().enumerate() {
+            let row = Row::from([("id".into(),Cell::text_arc(format!("o{i}"))),
+                ("user_id".into(),Cell::text_arc("u")),("total".into(),total)]);
+            store.collections.entry("orders".into()).or_default().push(row.clone());
+            store.row_maps_register_row("orders",i,&row);
+            check(&store);
+        }
+        store.rebuild_row_maps_collection("orders"); check(&store);
+        for i in 0..store.orders_total.len() {
+            let before = store.collections["orders"][i].clone();
+            let mut after = before.clone(); after.insert("total".into(),Cell::Float(i as f64));
+            store.collections.get_mut("orders").unwrap()[i] = after.clone();
+            store.row_maps_sync_updated("orders",i,&before,&after); check(&store);
+        }
+        assert_eq!(store.orders_numeric_unsafe_count,0);
+        for i in 0..store.orders_total.len() {
+            store.collections.get_mut("orders").unwrap()[i].insert("total".into(),Cell::Null);
+            store.row_maps_register("orders",i); check(&store);
+            let mut row = store.collections["orders"][i].clone();
+            row.insert("total".into(),Cell::Int(i as i64));
+            store.collections.get_mut("orders").unwrap()[i] = row.clone();
+            store.row_maps_register_row("orders",i,&row); check(&store);
+        }
+        store.collections.get_mut("orders").unwrap()[0].insert("total".into(),Cell::Null);
+        store.row_maps_register("orders",0); check(&store);
+        store.delete_rows_at("orders",&[0,3,5]); check(&store);
+        assert_eq!(store.orders_numeric_unsafe_count,0);
+        let all = (0..store.orders_total.len()).collect::<Vec<_>>();
+        store.delete_rows_at("orders",&all); check(&store);
+        assert_eq!(store.orders_numeric_summary().0.to_bits(),(-0.0f64).to_bits());
+    }
 
     #[test]
     fn numeric_tags_follow_rebuild_update_register_and_swap_remove() {
