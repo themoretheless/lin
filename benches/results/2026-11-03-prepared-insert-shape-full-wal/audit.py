@@ -8,6 +8,10 @@ args = parser.parse_args()
 p = Path(__file__).resolve().parent
 s = json.loads((p/'input.json').read_text())
 r = args.raw
+host = json.loads((r/'host-start.json').read_text())
+assert type(host['logical_cpus']) is int and host['logical_cpus'] > 0
+assert len(host['load_average']) == 3 and all(math.isfinite(x) and x >= 0 for x in host['load_average'])
+assert host['load_average'][0] <= host['logical_cpus'] * 0.75
 statuses = json.loads((r/'process-status.json').read_text())
 assert len(statuses) == 36
 assert {(x['round'], x['role']) for x in statuses} == {
@@ -25,6 +29,7 @@ values = {}
 count = 0
 for row in statuses:
     i, role = row['round'], row['role']
+    assert len(row['load_average_after']) == 3 and all(math.isfinite(x) and x >= 0 for x in row['load_average_after'])
     info = s['binaries']['baseline' if role == 'control' else role]
     assert row['exit'] == 0 and row['binary_sha256'] == info['sha256']
     d = json.loads((r/f'{i:02}-{role}/run.json').read_text())

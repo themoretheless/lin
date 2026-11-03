@@ -5,7 +5,12 @@ import hashlib, itertools, json, math, os, statistics as st, subprocess, sys
 assets = Path(__file__).resolve().parent
 spec = json.loads((assets/'input.json').read_text())
 out = Path(sys.argv[1]).resolve()
+# Refuse before creating an output directory or starting any measured process.
+logical_cpus = os.cpu_count() or 1
+initial_load = os.getloadavg()
+assert initial_load[0] <= logical_cpus * 0.75, ('Host busy; no timings executed', initial_load, logical_cpus)
 out.mkdir(exist_ok=False)
+(out/'host-start.json').write_text(json.dumps({'logical_cpus': logical_cpus, 'load_average': initial_load})+'\n')
 sha = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
 def verify():
     for role, info in spec['binaries'].items():
@@ -27,7 +32,7 @@ for round in range(1, 13):
         with (out/f'{round:02}-{role}.log').open('w') as log:
             proc = subprocess.run(cmd, env=dict(os.environ, LIN_BENCH_SKIP_PG='1', LIN_BENCH_SKIP_MYSQL='1'),
                                   stdout=log, stderr=subprocess.STDOUT)
-        record = dict(round=round, role=role, exit=proc.returncode, binary_sha256=sha(Path(info['path'])), command=cmd)
+        record = dict(round=round, role=role, exit=proc.returncode, binary_sha256=sha(Path(info['path'])), command=cmd, load_average_after=list(os.getloadavg()))
         records.append(record)
         (out/'process-status.json').write_text(json.dumps(records, indent=2)+'\n')
         assert proc.returncode == 0
