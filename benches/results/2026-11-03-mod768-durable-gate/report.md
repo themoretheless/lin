@@ -1,0 +1,7 @@
+# Exact modulo768: prospective durable FULL WAL gate
+
+Candidate runtime f94e04f39, baseline 75265476b. Full runtime/benchmark source closures differ only at src/embed.rs; benchmark fixtures are identical. Exact ordinary release binaries and compiler match their preserved build receipts; no diagnostic timers or caller-participation patch is present.
+
+Before timing: frozen 2 series ×6 baseline/A-A-control/candidate process triples; all six role permutations per series; 24 fresh observations for each of four FULL WAL cases, no warmup, one operation per observation. Total 36 processes / 3456 measured observations. 1k Lin is the target: each series needs 6/6 positive pairs and gain above median absolute baseline/control variation. 10k Lin and both unchanged SQLite sizes are controls, each requiring gain >= -max(2%, A/A). All original cases validate exact data/commit state before calibration and after measurement, with explicit Full sync and SQLite pragma readback. Setup, fixture and output destruction are outside timing.
+
+Every process, error, sample, paired result and candidate-vs-SQLite comparison will be retained. No unchanged numerical retry. Native insertion, full read/nondefault-dimension/RSS controls and other peers remain unqualified by this gate. Passing this intermediate component gate alone does not fulfill the all-eight-peer objective or imply SQLite 1k superiority. Execution is pending at protocol creation.
