@@ -616,6 +616,57 @@ pub(crate) struct AggPlan {
     pub kind: AggKind,
 }
 
+/// Key layout of an immutable single INSERT AST; values remain runtime work.
+#[derive(Debug)]
+struct PreparedInsertShape {
+    template: Row,
+    slots: Vec<usize>,
+}
+
+impl PreparedInsertShape {
+    fn compile(records: &[Record]) -> Option<Self> {
+        let first = records.first()?;
+        if records.len() < 128 || first.fields.is_empty() || first.fields.len() > 32 {
+            return None;
+        }
+        // Bound auxiliary prepared metadata independently of literal sizes.
+        if first
+            .fields
+            .iter()
+            .fold(0usize, |n, (key, _)| n.saturating_add(key.len()))
+            > 4096
+        {
+            return None;
+        }
+        if !records.iter().skip(1).all(|record| {
+            record.fields.len() == first.fields.len()
+                && record
+                    .fields
+                    .iter()
+                    .map(|(key, _)| key.as_str())
+                    .eq(first.fields.iter().map(|(key, _)| key.as_str()))
+        }) {
+            return None;
+        }
+        let template = first
+            .fields
+            .iter()
+            .map(|(key, _)| (key.clone(), Cell::Null))
+            .collect::<Row>();
+        let slots = template
+            .keys()
+            .map(|key| {
+                first
+                    .fields
+                    .iter()
+                    .rposition(|(name, _)| name == key)
+                    .unwrap()
+            })
+            .collect();
+        Some(Self { template, slots })
+    }
+}
+
 /// Compiled statement: parse + typecheck + plan once, run many times.
 #[derive(Debug, Clone)]
 pub struct Prepared {
@@ -630,6 +681,7 @@ pub struct Prepared {
     schema: bool,
     pub(crate) point_get: Option<PointGetPlan>,
     pub(crate) agg_plan: Option<AggPlan>,
+    insert_shape: Option<Arc<PreparedInsertShape>>,
 }
 
 impl Prepared {
@@ -1552,6 +1604,10 @@ impl Db {
         } else {
             None
         };
+        let insert_shape = match stmts.as_slice() {
+            [Stmt::Insert { records, .. }] => PreparedInsertShape::compile(records).map(Arc::new),
+            _ => None,
+        };
         Ok(Prepared {
             src: String::new(),
             stmts,
@@ -1561,6 +1617,7 @@ impl Db {
             schema,
             point_get,
             agg_plan,
+            insert_shape,
         })
     }
 
@@ -1698,14 +1755,18 @@ impl Db {
             None
         };
 
-        let ((rows, message, pack), prepared_encoding) =
-            match self.exec_program(&prepared.stmts, &mut undo, true) {
-                Ok(v) => v,
-                Err(e) => {
-                    self.rollback(undo, cat_backup);
-                    return Err(e);
-                }
-            };
+        let ((rows, message, pack), prepared_encoding) = match self.exec_program(
+            &prepared.stmts,
+            &mut undo,
+            true,
+            prepared.insert_shape.as_deref(),
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                self.rollback(undo, cat_backup);
+                return Err(e);
+            }
+        };
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
         let n = if rows.is_empty() {
             match prepared.stmts.last() {
@@ -2058,7 +2119,12 @@ impl Db {
         undo: &mut Undo,
     ) -> Result<(Handle, Option<Pack>), Error> {
         let t0 = Instant::now();
-        let ((rows, message, pack), _) = self.exec_program(&prepared.stmts, undo, false)?;
+        let ((rows, message, pack), _) = self.exec_program(
+            &prepared.stmts,
+            undo,
+            false,
+            prepared.insert_shape.as_deref(),
+        )?;
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
         let n = if rows.is_empty() {
             match prepared.stmts.last() {
@@ -2293,6 +2359,7 @@ impl Db {
         stmts: &[Stmt],
         undo: &mut Undo,
         allow_preencode: bool,
+        insert_shape: Option<&PreparedInsertShape>,
     ) -> Result<(StmtOut, Option<crate::persist::PreparedEncoding>), Error> {
         // Materialize only mutated collections before snapshotting CAS hashes.
         for stmt in stmts {
@@ -2330,7 +2397,7 @@ impl Db {
                 bindings.insert(name.clone(), rows);
                 continue;
             }
-            let (rows, message, pack) = self.exec_stmt(stmt, &bindings, &mut ctx)?;
+            let (rows, message, pack) = self.exec_stmt(stmt, &bindings, &mut ctx, insert_shape)?;
             last_rows = rows;
             last_msg = message;
             if let Some(p) = pack {
@@ -2363,6 +2430,7 @@ impl Db {
         stmt: &Stmt,
         bindings: &BTreeMap<String, Vec<Row>>,
         ctx: &mut PackCtx,
+        insert_shape: Option<&PreparedInsertShape>,
     ) -> Result<StmtOut, Error> {
         match stmt {
             Stmt::Query(q) => Ok((self.exec_query(q, bindings)?, None, None)),
@@ -2468,8 +2536,13 @@ impl Db {
                 edges,
             } => {
                 let start = self.store.collection(collection).len();
-                let (rows, new_edges, staged) =
-                    self.insert_bulk(collection, records, edges.as_slice(), ctx.allow_preencode)?;
+                let (rows, new_edges, staged) = self.insert_bulk(
+                    collection,
+                    records,
+                    edges.as_slice(),
+                    ctx.allow_preencode,
+                    insert_shape,
+                )?;
                 let inserted = &self.store.collection(collection)[start..];
                 mark_written(ctx, collection, inserted);
                 let pack = if self.is_durable() {
@@ -5846,6 +5919,7 @@ impl Db {
         records: &[Record],
         edges: &[InsertEdge],
         allow_preencode: bool,
+        insert_shape: Option<&PreparedInsertShape>,
     ) -> Result<(Vec<Row>, Vec<Edge>, Option<crate::persist::PreparedInsert>), Error> {
         let now = now_ms();
         let n = records.len();
@@ -5862,7 +5936,7 @@ impl Db {
                     for chunk in records.chunks(chunk_size) {
                         handles.push(scope.spawn(move || {
                             let mut rows = Vec::with_capacity(chunk.len());
-                            append_batch_shape_rows(&mut rows, chunk, now);
+                            append_insert_rows(&mut rows, chunk, now, insert_shape);
                             for row in &mut rows {
                                 if row.get("hash").and_then(Cell::text).is_none()
                                     && let Some(body) = row.get("body").and_then(Cell::text_shared)
@@ -5884,12 +5958,12 @@ impl Db {
                 })
             } else {
                 let mut rows = Vec::with_capacity(n);
-                append_batch_shape_rows(&mut rows, records, now);
+                append_insert_rows(&mut rows, records, now, insert_shape);
                 rows
             }
         } else {
             let mut rows = Vec::with_capacity(n);
-            append_batch_shape_rows(&mut rows, records, now);
+            append_insert_rows(&mut rows, records, now, insert_shape);
             rows
         };
         let mut batch_ids: rustc_hash::FxHashSet<&str> = rustc_hash::FxHashSet::default();
@@ -6716,6 +6790,26 @@ fn append_bulk_worker_rows(
     }
 }
 
+fn append_insert_rows(
+    rows: &mut Vec<Row>,
+    records: &[Record],
+    now: i64,
+    shape: Option<&PreparedInsertShape>,
+) {
+    let Some(shape) = shape else {
+        return append_batch_shape_rows(rows, records, now);
+    };
+    // Prepared.stmts is private and immutable: slots were verified once against
+    // this same INSERT's complete field sequence, including duplicate keys.
+    for record in records {
+        let mut row = shape.template.clone();
+        for (cell, &source) in row.values_mut().zip(&shape.slots) {
+            *cell = value_cell(&record.fields[source].1, now);
+        }
+        rows.push(row);
+    }
+}
+
 fn append_batch_shape_rows(rows: &mut Vec<Row>, records: &[Record], now: i64) {
     let Some(first) = records.first() else {
         return;
@@ -6794,7 +6888,7 @@ mod record_tests {
                 })
                 .collect::<Vec<_>>();
             let mut db = Db::empty();
-            db.insert_bulk("docs", &records, &[], false).unwrap();
+            db.insert_bulk("docs", &records, &[], false, None).unwrap();
             let rows = db.store.collection("docs");
             assert_eq!(rows.len(), n);
             for (i, row) in rows.iter().enumerate() {
@@ -6921,7 +7015,7 @@ mod record_tests {
                 .map(|_| reference.store.alloc_id())
                 .collect::<Vec<_>>();
             let before = now_ms();
-            let (returned, edges, _) = db.insert_bulk("docs", &records, &[], false).unwrap();
+            let (returned, edges, _) = db.insert_bulk("docs", &records, &[], false, None).unwrap();
             let after = now_ms();
             assert!(returned.is_empty());
             assert!(edges.is_empty());
@@ -6965,10 +7059,135 @@ mod record_tests {
                 .clone();
             records[2048].fields.push((field.into(), value));
             let mut db = Db::empty().without_embedder();
-            let error = db.insert_bulk("docs", &records, &[], false).err().unwrap();
+            let error = db
+                .insert_bulk("docs", &records, &[], false, None)
+                .err()
+                .unwrap();
             assert!(error.to_string().contains(&format!("duplicate {field}")));
             assert!(db.store.collection("docs").is_empty());
         }
+    }
+
+    #[test]
+    fn compiled_insert_shape_preserves_last_duplicate_and_runtime_time() {
+        let records = (0..129)
+            .map(|i| Record {
+                fields: vec![
+                    ("z".into(), Value::String(format!("ЁЖ-{i}").into())),
+                    ("a".into(), Value::Int(-1)),
+                    ("ts".into(), Value::Now),
+                    ("a".into(), Value::Int(i as i64)),
+                ],
+            })
+            .collect::<Vec<_>>();
+        let before = records.clone();
+        let shape = PreparedInsertShape::compile(&records).unwrap();
+        for now in [123, 456] {
+            let mut rows = Vec::new();
+            // Exercise a short final morsel with the same verified layout.
+            for chunk in records.chunks(64) {
+                append_insert_rows(&mut rows, chunk, now, Some(&shape));
+            }
+            assert_eq!(
+                rows,
+                records
+                    .iter()
+                    .map(|r| record_row(r, now))
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(rows[128]["a"], Cell::Int(128));
+            assert_eq!(rows[128]["ts"], Cell::Time(now));
+        }
+        assert_eq!(records, before);
+    }
+
+    #[test]
+    fn compiled_insert_shape_falls_back_for_reordered_and_oversized_keys() {
+        let record = Record {
+            fields: vec![("z".into(), Value::Int(1)), ("a".into(), Value::Int(2))],
+        };
+        let mut reordered = vec![record; 129];
+        reordered.last_mut().unwrap().fields.swap(0, 1);
+        let long_key = vec![
+            Record {
+                fields: vec![("x".repeat(4097), Value::Int(7))]
+            };
+            129
+        ];
+        let wide = vec![
+            Record {
+                fields: (0..33).map(|i| (format!("f{i}"), Value::Int(i))).collect()
+            };
+            129
+        ];
+        for records in [reordered, long_key, wide] {
+            let shape = PreparedInsertShape::compile(&records);
+            assert!(shape.is_none());
+            let mut rows = Vec::new();
+            append_insert_rows(&mut rows, &records, 99, shape.as_ref());
+            assert_eq!(
+                rows,
+                records
+                    .iter()
+                    .map(|r| record_row(r, 99))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_insert_shape_is_shared_and_single_statement_only() {
+        let records = |prefix: &str| {
+            (0..129)
+                .map(|i| Record {
+                    fields: vec![
+                        ("id".into(), Value::String(format!("{prefix}-{i}").into())),
+                        (
+                            "uri".into(),
+                            Value::String(format!("{prefix}://{i}").into()),
+                        ),
+                        (
+                            "title".into(),
+                            Value::String(format!("document {i}").into()),
+                        ),
+                    ],
+                })
+                .collect::<Vec<_>>()
+        };
+        let insert = |records| Stmt::Insert {
+            collection: "docs".into(),
+            records,
+            edges: Vec::new(),
+        };
+        let mut db = Db::empty();
+        let prepared = db.prepare_stmt(insert(records("single"))).unwrap();
+        let clone = prepared.clone();
+        assert!(Arc::ptr_eq(
+            prepared.insert_shape.as_ref().unwrap(),
+            clone.insert_shape.as_ref().unwrap()
+        ));
+        assert_eq!(prepared.run(&mut db).unwrap().done.n, 129);
+        let mut other = Db::empty();
+        assert_eq!(clone.run(&mut other).unwrap().done.n, 129);
+        for i in 0..129 {
+            let row = other
+                .store
+                .get_by_id("docs", &format!("single-{i}"))
+                .unwrap();
+            assert_eq!(
+                row_text(row, "title"),
+                Some(format!("document {i}").as_str())
+            );
+            assert!(row.get("embedding").and_then(Cell::as_vec).is_some());
+        }
+        let mut multi_db = Db::empty();
+        let multi = multi_db
+            .prepare_stmts(vec![insert(records("left")), insert(records("right"))])
+            .unwrap();
+        assert!(multi.insert_shape.is_none());
+        multi.run(&mut multi_db).unwrap();
+        assert_eq!(multi_db.store.collection("docs").len(), 258);
+        assert!(multi_db.store.get_by_uri("right://128").is_some());
     }
 
     #[test]
