@@ -49,7 +49,7 @@ for role in ['ordinary', 'diagnostic']:
     assert binary[:4] == b'\x7fELF' and binary[4] == 2 and binary[5] == 1
     assert int.from_bytes(binary[18:20], 'little') == 62  # ELF x86_64
     assert sha(binary) == m['builds'][role]['sha256']
-    build_log=(p/f'build-{role}.log').read_text()
+    build_log=re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', (p/f'build-{role}.log').read_text())
     assert re.search(r'Compiling lin v',build_log) and re.search(r'Compiling lin-peer-worker v',build_log)
     assert (p/f'clean-{role}.log').exists()
 assert len(m['runs']) == 6

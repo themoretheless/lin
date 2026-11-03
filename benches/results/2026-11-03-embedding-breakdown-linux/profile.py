@@ -26,9 +26,9 @@ def save():
     (out/'provenance.json').write_text(json.dumps(metadata, indent=2)+'\n')
 def build(role):
     with (out/f'clean-{role}.log').open('w') as log:
-        subprocess.run(['cargo', 'clean', '--release', '-p', 'lin', '-p', 'lin-peer-worker'], cwd=root, stdout=log, stderr=subprocess.STDOUT, check=True)
+        subprocess.run(['cargo', '--color', 'never', 'clean', '--release', '-p', 'lin', '-p', 'lin-peer-worker'], cwd=root, stdout=log, stderr=subprocess.STDOUT, check=True)
     with (out/f'build-{role}.log').open('w') as log:
-        subprocess.run(['cargo', 'build', '--locked', '--release', '--verbose', '-p', 'lin-peer-worker'],
+        subprocess.run(['cargo', '--color', 'never', 'build', '--locked', '--release', '--verbose', '-p', 'lin-peer-worker'],
                        cwd=root, stdout=log, stderr=subprocess.STDOUT, check=True)
     log_text = (out/f'build-{role}.log').read_text()
     assert re.search(r'Compiling lin v', log_text) and re.search(r'Compiling lin-peer-worker v', log_text)
