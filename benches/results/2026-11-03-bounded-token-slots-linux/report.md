@@ -1,0 +1,7 @@
+# Bounded token feature slots — prospective Linux gate
+
+Candidate66f8ab874ebb3f1b4897ffb002b0a3f93514af3c versus frozen b9f10bc776b05eb5235237e9a900c2ef6aaed1fd. Runtime closure differs only in src/embed.rs. Keep exact feature order/weights, dimension-specific cache reset,64 alphabetic words3..32bytes maximum and all existing fallback paths. No numerical result yet;12 embedder tests passed, workspace pending locally and required in CI before timing.
+
+Reuse frozen two-series/six-pair permutations: native1k/10k/100k each require6/6 positive pairs and median gain above independent A/A. Point_get/join_filter control tolerance max(2%,A/A). Warm108 processes/324 cases/6048 operation samples. Separate108 native-only processes include preparation, startup, serialization, teardown in process wall and Linux wait4 RSS; wall tolerance max(2%,A/A),RSS max(5%,A/A). Combined216 processes/6156 operation samples,108 wall and108 RSS. Resource phase continues after numeric warm refusal; every target/control/resource window must pass. Preserve all losses; no unchanged numerical retry.
+
+Force clean/recompile both lin and worker packages before each ordinary binary; assert compile log entries and frozen source/helper hashes. Archive complete raw values/digests and ordinary ELF binaries. This qualification does not cover FULL WAL or fresh peer superiority; complete eight-peer objective remains open. High-cardinality, Unicode, long-word and nondefault-dimension performance would require additional controls before adoption even if this gate passes.
