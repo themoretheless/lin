@@ -1,0 +1,9 @@
+# FULL WAL benchmark cases: functional qualification only
+
+New root cases: compare/durable_insert_wal_{1k,10k}/{lin,sqlite}. Legacy durable_insert cases retain SQLite FULL+DELETE. Ordinary release smoke completed all four cases, one sample per case. This is not an A/A, peer-superiority or performance-adoption gate. Complete raw output and diagnostic logs are archived; receipt.json pins the benchmark source SHA. The first debug invocation stopped at the existing optimized-build guard before any timing; no guard or synchronization setting was weakened.
+
+Lin explicitly uses SyncMode::Full with default embeddings, FTS, identity maps and wing/ts index. Its prepared statement/fixture creation is outside timing. Outside timing, both the live data and normal close/reopen values are checked, including presence of generated vectors. Normal close may checkpoint; this validation is not a crash-recovery oracle. RefCell allows the immutable harness validator to close/reopen the fixture outside timing; the operation borrows it once.
+
+SQLite explicitly switches to WAL and synchronous=FULL; actual pragma values are asserted at setup and validation. Six-field fixture data and prepared-statement cache setup are outside timing. Timing includes one transaction, all row insertions and commit. Afterward, autocommit state and all exact values are checked on the writer and an independent read-only connection while the writer is alive. Existing DELETE cases are unchanged.
+
+Temp files are on the local default filesystem; no claim is made about equivalent checkpoint triggers or identical engine internals. Lin retains additional default embedding work. Single smoke timings cannot establish a speed ratio. Prospective repeated paired FULL WAL qualification remains required after the embedding candidate's independent Linux gate resolves. All eight named peers and Kusto access remain in scope.

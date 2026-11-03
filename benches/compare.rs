@@ -1588,6 +1588,31 @@ fn fill_lin_durable_insert(ins: &mut LinDurableInsert) -> lin::Handle {
     ins.prepared.run(&mut ins.db).expect("lin durable insert")
 }
 
+struct LinFullWalInsert {
+    _dir: TmpKeep,
+    db: std::cell::RefCell<lin::Db>,
+    prepared: lin::Prepared,
+}
+
+fn setup_lin_durable_insert_full(n: usize) -> LinFullWalInsert {
+    let ins = setup_lin_durable_insert(n);
+    LinFullWalInsert {
+        _dir: ins._dir,
+        db: std::cell::RefCell::new(ins.db.with_sync_mode(lin::SyncMode::Full)),
+        prepared: ins.prepared,
+    }
+}
+
+fn validate_lin_durable_insert_reopen(ins: &LinFullWalInsert, n: usize) {
+    let mut db = ins.db.borrow_mut();
+    validate_lin_rows(&db, n);
+    // Normal close/reopen validation is outside timing. This is not a crash test:
+    // closing Lin may checkpoint the committed WAL before reopening.
+    drop(std::mem::replace(&mut *db, lin::Db::empty()));
+    *db = lin::Db::open(&ins._dir.0).expect("lin durable validation reopen");
+    validate_lin_rows(&db, n);
+}
+
 const GROUP_COMMITS: usize = 16;
 
 struct LinGroupCommit {
@@ -1733,6 +1758,59 @@ fn fill_sqlite_durable(s: &mut SqliteDurable) {
         "logs" => fill_sqlite_logs(&s.conn, s.n),
         _ => fill_sqlite(&s.conn, s.n),
     }
+}
+
+const SQLITE_FULL_WAL_INSERT: &str =
+    "INSERT INTO docs (id, uri, wing, title, ts, body) VALUES (?1,?2,?3,?4,?5,?6)";
+
+struct SqliteFullWalInsert {
+    durable: SqliteDurable,
+    rows: Vec<Doc>,
+}
+
+fn setup_sqlite_durable_wal(n: usize) -> SqliteFullWalInsert {
+    let s = setup_sqlite_durable("docs", n);
+    let journal: String = s.conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))
+        .expect("sqlite enable WAL");
+    assert_eq!(journal.to_ascii_lowercase(), "wal");
+    s.conn.execute_batch("PRAGMA synchronous=FULL;")
+        .expect("sqlite WAL full sync");
+    assert_sqlite_full_wal(&s.conn);
+    drop(s.conn.prepare_cached(SQLITE_FULL_WAL_INSERT).expect("sqlite WAL prepare outside timing"));
+    SqliteFullWalInsert { durable: s, rows: docs(n) }
+}
+
+fn fill_sqlite_durable_wal(s: &mut SqliteFullWalInsert) {
+    let tx = s.durable.conn.unchecked_transaction().expect("sqlite WAL transaction");
+    {
+        let mut stmt = tx.prepare_cached(SQLITE_FULL_WAL_INSERT).expect("sqlite WAL cached insert");
+        for d in &s.rows {
+            stmt.execute(rusqlite::params![d.id, d.uri, d.wing, d.title, d.ts, d.body])
+                .expect("sqlite WAL insert");
+        }
+    }
+    tx.commit().expect("sqlite WAL full commit");
+}
+
+fn assert_sqlite_full_wal(conn: &rusqlite::Connection) {
+    let journal: String = conn.query_row("PRAGMA journal_mode", [], |r| r.get(0))
+        .expect("sqlite WAL mode readback");
+    let sync: i64 = conn.query_row("PRAGMA synchronous", [], |r| r.get(0))
+        .expect("sqlite sync readback");
+    assert_eq!(journal.to_ascii_lowercase(), "wal");
+    assert_eq!(sync, 2, "SQLite must retain synchronous=FULL");
+}
+
+fn validate_sqlite_durable_wal(ins: &SqliteFullWalInsert) -> airbug_bench::Result<()> {
+    let s = &ins.durable;
+    assert_sqlite_full_wal(&s.conn);
+    assert!(s.conn.is_autocommit(), "SQLite INSERT transaction must have committed");
+    validate_sqlite_docs(&s.conn, &docs(s.n))?;
+    // A separate reader must see the committed WAL while the writer is alive.
+    let reader = rusqlite::Connection::open_with_flags(
+        s._dir.0.join("db.sqlite"), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ).expect("sqlite WAL independent readback connection");
+    validate_sqlite_docs(&reader, &docs(s.n))
 }
 
 fn empty_sqlite_logs() -> rusqlite::Connection {
@@ -2963,6 +3041,36 @@ fn main() -> airbug_bench::Result<()> {
             .tag("sqlite")
             .parameter("rows", n)
             .work_units("rows", n as u64);
+    }
+
+    // Separate names retain the historical FULL+DELETE comparison above.
+    // These cases explicitly exercise SQLite FULL WAL. Lin additionally keeps
+    // default embeddings/FTS; this is not a claim of identical engine internals.
+    for (label, n) in [("1k", INSERT_1K), ("10k", INSERT_10K)] {
+        suite
+            .bench_checked(
+                &format!("durable_insert_wal_{label}/lin"),
+                move || setup_lin_durable_insert_full(n),
+                move |ins| ins.prepared.run(&mut ins.db.borrow_mut()).expect("lin full-sync insert"),
+                move |ins, handle| {
+                    assert_eq!(handle.done.n, n);
+                    validate_lin_durable_insert_reopen(ins, n);
+                    Ok(())
+                },
+                DropPolicy::OutsideTiming,
+            )
+            .tag("durable").tag("insert").tag("lin_full_sync")
+            .parameter("rows", n).work_units("rows", n as u64);
+        suite
+            .bench_checked(
+                &format!("durable_insert_wal_{label}/sqlite"),
+                move || setup_sqlite_durable_wal(n),
+                move |s| fill_sqlite_durable_wal(s),
+                move |s, _| validate_sqlite_durable_wal(s),
+                DropPolicy::OutsideTiming,
+            )
+            .tag("durable").tag("insert").tag("sqlite_full_wal")
+            .parameter("rows", n).work_units("rows", n as u64);
     }
 
     // SyncMode::Normal (flush on checkpoint only) vs Full — same 1k append.
