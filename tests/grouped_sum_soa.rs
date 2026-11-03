@@ -63,3 +63,30 @@ fn orders_soa_grouped_sum_preserves_source_order_float_bits() {
     assert_eq!(sum.to_bits(), 1.0f64.to_bits());
     assert_eq!(actual, reference);
 }
+
+#[test]
+fn orders_soa_filter_retains_integer_precision_above_two_to_fifty_three() {
+    let mut db = Db::empty();
+    db.run(r#"insert users [{id:"u1",email:"u1@bench.local"}]"#)
+        .unwrap();
+    db.run(
+        r#"insert orders [
+        {id:"a",user_id:"u1",total:9007199254740993},
+        {id:"b",user_id:"u1",total:9007199254740992}
+    ]"#,
+    )
+    .unwrap();
+    assert!(db.store.orders_soa_ready());
+    let actual = db
+        .prepare("orders | total > 9007199254740992 | sum total by user_id")
+        .unwrap()
+        .run(&mut db)
+        .unwrap()
+        .rows;
+    let reference = db
+        .run("orders | total > 9007199254740992 | {user_id,total} | sum total by user_id")
+        .unwrap()
+        .rows;
+    assert_eq!(reference.len(), 1);
+    assert_eq!(actual, reference);
+}

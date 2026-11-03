@@ -3295,9 +3295,11 @@ impl Db {
                         && by_field.as_str() == "user_id"
                         && field.as_str() == "total"
                     {
-                        return agg_sum_column(
+                        return agg_sum_orders_column(
                             self.store.collection("orders"),
+                            self.store.orders_user_id(),
                             self.store.orders_total(),
+                            self.store.orders_total_numeric(),
                             "total",
                             "user_id",
                             plan.filter.as_ref(),
@@ -8054,6 +8056,100 @@ fn eq_value_for_field<'a>(pred: &'a Pred, field: &str) -> Option<&'a str> {
     }
 }
 
+// Borrow the cached text IDs; inspect the original key only when a new group
+// is admitted. Keep source-order addition and use generic comparisons whenever
+// the numeric column cannot represent the predicate's original Cell semantics.
+fn agg_sum_orders_column(
+    rows: &[Row],
+    ids: &[Arc<str>],
+    values: &[f64],
+    numeric: &[bool],
+    field: &str,
+    by: &str,
+    filter: Option<&Pred>,
+    now: i64,
+    max_bytes: usize,
+) -> Result<Vec<Row>, Error> {
+    debug_assert_eq!(rows.len(), ids.len());
+    debug_assert_eq!(rows.len(), values.len());
+    debug_assert_eq!(rows.len(), numeric.len());
+    let comparison = match filter {
+        Some(Pred::Cmp { field, op, value }) => Some((field.as_str(), *op, value)),
+        _ => None,
+    };
+    // Below 2^53, integer-to-f64 conversion is exact. Outside this range,
+    // cmp_cell retains the original integer/float comparison rules.
+    let numeric_comparison = comparison.as_ref().and_then(|(name, op, value)| {
+        if name != field {
+            return None;
+        }
+        let right = match value {
+            Value::Int(n) => *n as f64,
+            Value::Float(n) => *n,
+            _ => return None,
+        };
+        (right.is_finite() && right.abs() < 9_007_199_254_740_992.0).then_some((*op, right))
+    });
+    let mut map: FxHashMap<&str, (&Cell, f64)> = FxHashMap::default();
+    let mut state_bytes = 0usize;
+    for (i, (id, &value)) in ids.iter().zip(values).enumerate() {
+        let row = &rows[i];
+        let keep = if let Some((op, right)) = numeric_comparison
+            && numeric[i]
+            && value.is_finite()
+            && value.abs() < 9_007_199_254_740_992.0
+        {
+            match op {
+                CmpOp::Eq => value == right,
+                CmpOp::Ne => value != right,
+                CmpOp::Gt => value > right,
+                CmpOp::Ge => value >= right,
+                CmpOp::Lt => value < right,
+                CmpOp::Le => value <= right,
+            }
+        } else if let Some((name, op, right)) = &comparison {
+            cmp_cell(row.get(name).unwrap_or(&Cell::Null), right, *op, now)
+        } else {
+            filter.is_none_or(|pred| eval_pred(pred, row, now))
+        };
+        if !keep {
+            continue;
+        }
+        // Non-text/missing keys are represented by an empty cached ID. They
+        // must retain full Cell identity rather than collapse into empty text.
+        if id.is_empty() && row.get(by).and_then(Cell::text).is_none() {
+            return agg_sum_column(rows, values, field, by, filter, now, max_bytes);
+        }
+        match map.entry(id.as_ref()) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.get_mut().1 += value;
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let key = row.get(by).unwrap_or(&Cell::Null);
+                let key_size = match key {
+                    Cell::Text(s) => s.len() + 32,
+                    _ => 16,
+                };
+                state_bytes = state_bytes.saturating_add(key_size + 64);
+                if state_bytes > max_bytes {
+                    return Err(Error::runtime(format!(
+                        "aggregate state bytes {state_bytes} exceeds max_aggregate_bytes quota {max_bytes}"
+                    )));
+                }
+                entry.insert((key, 0.0 + value));
+            }
+        }
+    }
+    let mut entries: Vec<(&str, (&Cell, f64))> = map.into_iter().collect();
+    entries.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+    Ok(entries.into_iter().map(|(_, (key, sum))| {
+        let mut row = crate::store::acquire_row();
+        row.insert(by.to_owned(), key.clone_for_borrow());
+        row.insert(field.to_owned(), Cell::Float(sum));
+        row
+    }).collect())
+}
+
 // Group directly over the numeric column, but retain the generic path's
 // source-order additions, Cell key identity and per-distinct-key quota.
 fn agg_sum_column(
@@ -9400,5 +9496,34 @@ mod preencoded_insert_tests {
         db.run_prepared(&prepared).unwrap();
         assert_eq!(PREENCODE_TEST_ATTEMPTS.with(|x| x.get()), 0);
         drop(db);
+    }
+}
+
+#[cfg(test)]
+mod orders_sum_column_parity_tests {
+    use super::*;
+
+    #[test]
+    fn numeric_tags_and_missing_key_fallback_preserve_generic_semantics() {
+        let rows=vec![
+            Row::from([("user_id".into(),Cell::text_arc("u1")),("total".into(),Cell::Time(7))]),
+            Row::from([("user_id".into(),Cell::text_arc("u2")),("total".into(),Cell::Float(2.0))]),
+        ];
+        let pred=Pred::Cmp {field:Field::name("total"),op:CmpOp::Gt,value:Value::Int(1)};
+        let ids=[Arc::from("u1"),Arc::from("u2")];
+        let actual=agg_sum_orders_column(&rows,&ids,&[7.0,2.0],&[false,true],"total","user_id",Some(&pred),0,4096).unwrap();
+        let expected=agg_sum_column(&rows,&[7.0,2.0],"total","user_id",Some(&pred),0,4096).unwrap();
+        assert_eq!(actual,expected);
+        assert_eq!(actual.len(),1);
+        let rows=vec![
+            Row::from([("user_id".into(),Cell::Int(1)),("total".into(),Cell::Int(2))]),
+            Row::from([("total".into(),Cell::Int(3))]),
+            Row::from([("user_id".into(),Cell::text_arc("")),("total".into(),Cell::Int(4))]),
+        ];
+        let ids=[Arc::from(""),Arc::from(""),Arc::from("")];
+        let actual=agg_sum_orders_column(&rows,&ids,&[2.0,3.0,4.0],&[true,true,true],"total","user_id",None,0,4096).unwrap();
+        let expected=agg_sum_column(&rows,&[2.0,3.0,4.0],"total","user_id",None,0,4096).unwrap();
+        assert_eq!(actual,expected);
+        assert_eq!(actual.len(),3);
     }
 }

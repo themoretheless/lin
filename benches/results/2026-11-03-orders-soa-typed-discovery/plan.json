@@ -1,0 +1,41 @@
+{
+  "baseline_runtime": "a28aa758b",
+  "candidate_scope": "typed numeric eligibility cache and borrowed cached text group IDs; exact quota, source-order additions, generic fallback for unsafe numeric comparisons and non-text keys",
+  "sizes": [
+    1000,
+    10000,
+    100000
+  ],
+  "series": 2,
+  "pairs_per_series": 6,
+  "roles": [
+    "baseline",
+    "control",
+    "candidate",
+    "production"
+  ],
+  "samples": 24,
+  "iterations": 4,
+  "warmups": "unchanged root worker: one initial validation and three warm calls",
+  "targets": [
+    "sum_by",
+    "sum_by_filtered"
+  ],
+  "controls": [
+    "sum",
+    "count_by",
+    "point_get",
+    "join_filter",
+    "insert_native"
+  ],
+  "target_gate": "each series/size/case: six positive pairs, median gain greater than median absolute baseline/control variation",
+  "control_gate": "each series/size/case: median gain >= -max(2%, median absolute baseline/control variation)",
+  "adoption": "all frozen local target/control gates required for a local gain claim; production-relative comparisons reported separately; full-source and peer qualification remain open",
+  "retry": "no unchanged numerical retry",
+  "classification": "new actual-path optimization against the correctness-aligned source; former experiments retained separately",
+  "correctness_baseline": "production baseline fails quota and nonassociative sum parity tests; matched integer timing fixtures independently validate in both roles",
+  "production_runtime": "0dab1a9a4f0f4f1e736d2e54f2e34a1e0f133d2d",
+  "point_get_iterations": 512,
+  "native_control_samples": 8,
+  "result_storage": "read results retained; native final six-field readback validated in full then retained by canonical digest and row count"
+}

@@ -641,6 +641,7 @@ pub struct Store {
     orders_id: Vec<Arc<str>>,
     orders_user_id: Vec<Arc<str>>,
     orders_total: Vec<f64>,
+    orders_total_numeric: Vec<bool>,
     users_id: Vec<Arc<str>>,
     users_email: Vec<Arc<str>>,
     /// Columnar facts (append hot path). `collections["facts"]` may lag until
@@ -710,6 +711,7 @@ impl Store {
             orders_id: Vec::new(),
             orders_user_id: Vec::new(),
             orders_total: Vec::new(),
+            orders_total_numeric: Vec::new(),
             users_id: Vec::new(),
             users_email: Vec::new(),
             facts_s: Vec::new(),
@@ -993,6 +995,7 @@ impl Store {
             orders_id: Vec::new(),
             orders_user_id: Vec::new(),
             orders_total: Vec::new(),
+            orders_total_numeric: Vec::new(),
             users_id: Vec::new(),
             users_email: Vec::new(),
             facts_s: Vec::new(),
@@ -2310,6 +2313,7 @@ impl Store {
                 swap_pop_at(&mut self.orders_id, p, len);
                 swap_pop_at(&mut self.orders_user_id, p, len);
                 swap_pop_at(&mut self.orders_total, p, len);
+                swap_pop_at(&mut self.orders_total_numeric, p, len);
             }
             "users" => {
                 swap_pop_at(&mut self.users_id, p, len);
@@ -2461,6 +2465,7 @@ impl Store {
             self.orders_id.clear();
             self.orders_user_id.clear();
             self.orders_total.clear();
+            self.orders_total_numeric.clear();
         }
         if collection == "users" {
             self.users_id.clear();
@@ -2483,6 +2488,7 @@ impl Store {
             self.orders_id.reserve(n);
             self.orders_user_id.reserve(n);
             self.orders_total.reserve(n);
+            self.orders_total_numeric.reserve(n);
         }
         if collection == "users" {
             self.users_id.reserve(n);
@@ -2506,6 +2512,7 @@ impl Store {
                 self.orders_id.push(id.unwrap_or_default());
                 self.orders_user_id.push(row.get("user_id").and_then(Cell::text_shared).unwrap_or_default());
                 self.orders_total.push(row.get("total").and_then(Cell::as_f64).unwrap_or(0.0));
+                self.orders_total_numeric.push(matches!(row.get("total"), Some(Cell::Int(_) | Cell::Float(_))));
             } else if collection == "users" {
                 self.users_id.push(id.unwrap_or_default());
                 self.users_email.push(row.get("email").and_then(Cell::text_shared).unwrap_or_default());
@@ -2591,10 +2598,12 @@ impl Store {
                 self.orders_id.push(id);
                 self.orders_user_id.push(uid);
                 self.orders_total.push(total);
+                self.orders_total_numeric.push(matches!(row.get("total"), Some(Cell::Int(_) | Cell::Float(_))));
             } else if idx < self.orders_id.len() {
                 self.orders_id[idx] = id;
                 self.orders_user_id[idx] = uid;
                 self.orders_total[idx] = total;
+                self.orders_total_numeric[idx] = matches!(row.get("total"), Some(Cell::Int(_) | Cell::Float(_)));
             } else {
                 self.rebuild_row_maps_collection("orders");
             }
@@ -2670,10 +2679,12 @@ impl Store {
                 self.orders_id.push(did);
                 self.orders_user_id.push(uid);
                 self.orders_total.push(total);
+                self.orders_total_numeric.push(matches!(row.get("total"), Some(Cell::Int(_) | Cell::Float(_))));
             } else if idx < self.orders_id.len() {
                 self.orders_id[idx] = did;
                 self.orders_user_id[idx] = uid;
                 self.orders_total[idx] = total;
+                self.orders_total_numeric[idx] = matches!(row.get("total"), Some(Cell::Int(_) | Cell::Float(_)));
             } else {
                 self.rebuild_row_maps_collection("orders");
             }
@@ -2766,6 +2777,7 @@ impl Store {
             self.orders_id.reserve(additional);
             self.orders_user_id.reserve(additional);
             self.orders_total.reserve(additional);
+            self.orders_total_numeric.reserve(additional);
         }
         if collection == "users" {
             self.users_id.reserve(additional);
@@ -2812,9 +2824,10 @@ impl Store {
                 self.docs_layer[idx] = text("layer");
                 self.docs_wing[idx] = text("wing");
             }
-            "orders" if idx < self.orders_user_id.len() && idx < self.orders_total.len() => {
+            "orders" if idx < self.orders_user_id.len() && idx < self.orders_total.len() && idx < self.orders_total_numeric.len() => {
                 self.orders_user_id[idx] = text("user_id");
                 self.orders_total[idx] = after.get("total").and_then(Cell::as_f64).unwrap_or(0.0);
+                self.orders_total_numeric[idx] = matches!(after.get("total"), Some(Cell::Int(_) | Cell::Float(_)));
             }
             "users" if idx < self.users_email.len() => self.users_email[idx] = text("email"),
             "docs" | "orders" | "users" => self.rebuild_row_maps_collection(collection),
@@ -3315,7 +3328,7 @@ impl Store {
     /// True when orders SoA matches `collections["orders"]` length.
     pub fn orders_soa_ready(&self) -> bool {
         let n = self.collection("orders").len();
-        self.orders_id.len() == n && self.orders_user_id.len() == n && self.orders_total.len() == n
+        self.orders_id.len() == n && self.orders_user_id.len() == n && self.orders_total.len() == n && self.orders_total_numeric.len() == n
     }
 
     /// True when users SoA matches `collections["users"]` length.
@@ -3332,6 +3345,9 @@ impl Store {
     }
     pub fn orders_total(&self) -> &[f64] {
         &self.orders_total
+    }
+    pub(crate) fn orders_total_numeric(&self) -> &[bool] {
+        &self.orders_total_numeric
     }
     pub fn docs_wing(&self) -> &[Arc<str>] {
         &self.docs_wing
@@ -3925,6 +3941,7 @@ mod borrowed_delete_tests {
                 assert_eq!(store.orders_id, expected.orders_id);
                 assert_eq!(store.orders_user_id, expected.orders_user_id);
                 assert_eq!(store.orders_total, expected.orders_total);
+                assert_eq!(store.orders_total_numeric, expected.orders_total_numeric);
                 assert_eq!(store.users_id, expected.users_id);
                 assert_eq!(store.users_email, expected.users_email);
                 assert_eq!(store.facts_s, expected.facts_s);
@@ -4118,5 +4135,35 @@ mod empty_index_slab_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod orders_numeric_tag_tests {
+    use super::*;
+
+    #[test]
+    fn numeric_tags_follow_rebuild_update_register_and_swap_remove() {
+        let cells = [Cell::Int(1), Cell::Float(0.0), Cell::Time(2), Cell::Null, Cell::Bool(true)];
+        let rows = cells.into_iter().enumerate().map(|(i,total)| Row::from([
+            ("id".into(),Cell::text_arc(format!("o{i}"))),
+            ("user_id".into(),Cell::text_arc("u1")),("total".into(),total)
+        ])).collect::<Vec<_>>();
+        let mut store=Store::empty("test");
+        store.collections.insert("orders".into(),rows);
+        store.rebuild_row_maps();
+        assert!(store.orders_soa_ready());
+        assert_eq!(store.orders_total_numeric,[true,true,false,false,false]);
+        let before=store.collections["orders"][0].clone();
+        let mut after=before.clone();after.insert("total".into(),Cell::Time(7));
+        store.collections.get_mut("orders").unwrap()[0]=after.clone();
+        store.row_maps_sync_updated("orders",0,&before,&after);
+        assert_eq!(store.orders_total_numeric,[false,true,false,false,false]);
+        store.collections.get_mut("orders").unwrap()[0].insert("total".into(),Cell::Float(3.0));
+        store.row_maps_register("orders",0);
+        assert_eq!(store.orders_total_numeric,[true,true,false,false,false]);
+        store.delete_rows_at("orders",&[0,3]);
+        assert!(store.orders_soa_ready());
+        assert_eq!(store.orders_total_numeric,[false,true,false]);
     }
 }
