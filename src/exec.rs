@@ -5849,6 +5849,8 @@ impl Db {
     ) -> Result<(Vec<Row>, Vec<Edge>, Option<crate::persist::PreparedInsert>), Error> {
         let now = now_ms();
         let n = records.len();
+        let compiled_shape = BulkRowShape::compile(records);
+        let shape = compiled_shape.as_ref();
         let mut built: Vec<Row> = if n >= 512 {
             let threads = std::thread::available_parallelism()
                 .map(|p| p.get())
@@ -5859,10 +5861,15 @@ impl Db {
                 let chunk_size = (n + threads - 1) / threads;
                 std::thread::scope(|scope| {
                     let mut handles = Vec::with_capacity(threads);
-                    for chunk in records.chunks(chunk_size) {
+                    for (chunk_idx, chunk) in records.chunks(chunk_size).enumerate() {
                         handles.push(scope.spawn(move || {
                             let mut rows = Vec::with_capacity(chunk.len());
-                            append_batch_shape_rows(&mut rows, chunk, now);
+                            if let Some(shape) = shape {
+                                let start = chunk_idx * chunk_size;
+                                shape.append_range(&mut rows, start..start + chunk.len(), now);
+                            } else {
+                                append_batch_shape_rows(&mut rows, chunk, now);
+                            }
                             for row in &mut rows {
                                 if row.get("hash").and_then(Cell::text).is_none()
                                     && let Some(body) = row.get("body").and_then(Cell::text_shared)
@@ -5884,7 +5891,11 @@ impl Db {
                 })
             } else {
                 let mut rows = Vec::with_capacity(n);
-                append_batch_shape_rows(&mut rows, records, now);
+                if let Some(shape) = shape {
+                    shape.append_range(&mut rows, 0..n, now);
+                } else {
+                    append_batch_shape_rows(&mut rows, records, now);
+                }
                 rows
             }
         } else {
@@ -6716,6 +6727,71 @@ fn append_bulk_worker_rows(
     }
 }
 
+/// One execution-local layout shared by row workers; tied to its verified records.
+#[derive(Debug)]
+struct BulkRowShape<'a> {
+    records: &'a [Record],
+    template: Row,
+    slots: Vec<usize>,
+}
+
+impl<'a> BulkRowShape<'a> {
+    fn compile(records: &'a [Record]) -> Option<Self> {
+        let first = records.first()?;
+        if records.len() < 512 || first.fields.is_empty() || first.fields.len() > 32 {
+            return None;
+        }
+        // Bound temporary metadata independently of literal values.
+        if first
+            .fields
+            .iter()
+            .fold(0usize, |n, (key, _)| n.saturating_add(key.len()))
+            > 4096
+        {
+            return None;
+        }
+        if !records.iter().skip(1).all(|record| {
+            record.fields.len() == first.fields.len()
+                && record
+                    .fields
+                    .iter()
+                    .map(|(key, _)| key.as_str())
+                    .eq(first.fields.iter().map(|(key, _)| key.as_str()))
+        }) {
+            return None;
+        }
+        let template = first
+            .fields
+            .iter()
+            .map(|(key, _)| (key.clone(), Cell::Null))
+            .collect::<Row>();
+        let slots = template
+            .keys()
+            .map(|key| {
+                first
+                    .fields
+                    .iter()
+                    .rposition(|(name, _)| name == key)
+                    .unwrap()
+            })
+            .collect();
+        Some(Self {
+            records,
+            template,
+            slots,
+        })
+    }
+    fn append_range(&self, rows: &mut Vec<Row>, range: std::ops::Range<usize>, now: i64) {
+        for record in &self.records[range] {
+            let mut row = self.template.clone();
+            for (cell, &source) in row.values_mut().zip(&self.slots) {
+                *cell = value_cell(&record.fields[source].1, now);
+            }
+            rows.push(row);
+        }
+    }
+}
+
 fn append_batch_shape_rows(rows: &mut Vec<Row>, records: &[Record], now: i64) {
     let Some(first) = records.first() else {
         return;
@@ -6769,6 +6845,90 @@ fn record_row(record: &Record, now: i64) -> Row {
 #[cfg(test)]
 mod record_tests {
     use super::*;
+
+    #[test]
+    fn execution_shape_matches_reference_across_workers_and_timestamps() {
+        let records = (0..513)
+            .map(|i| Record {
+                fields: vec![
+                    ("z".into(), Value::String(format!("ЁЖ-{i}").into())),
+                    ("a".into(), Value::Int(-1)),
+                    ("ts".into(), Value::Now),
+                    ("a".into(), Value::Int(i)),
+                ],
+            })
+            .collect::<Vec<_>>();
+        let original = records.clone();
+        let shape = BulkRowShape::compile(&records).unwrap();
+        for now in [123, 456] {
+            let actual = std::thread::scope(|scope| {
+                let handles = (0..records.len())
+                    .step_by(128)
+                    .map(|start| {
+                        let shape = &shape;
+                        scope.spawn(move || {
+                            let mut rows = Vec::new();
+                            shape.append_range(
+                                &mut rows,
+                                start..(start + 128).min(shape.records.len()),
+                                now,
+                            );
+                            rows
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                handles
+                    .into_iter()
+                    .flat_map(|h| h.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(
+                actual,
+                records
+                    .iter()
+                    .map(|r| record_row(r, now))
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(actual[512]["a"], Cell::Int(512));
+            assert_eq!(actual[512]["ts"], Cell::Time(now));
+        }
+        assert_eq!(records, original);
+    }
+
+    #[test]
+    fn execution_shape_rejects_small_mixed_wide_and_long_key_inputs() {
+        let record = Record {
+            fields: vec![("z".into(), Value::Int(1)), ("a".into(), Value::Int(2))],
+        };
+        let small = vec![record.clone(); 511];
+        let mut mixed = vec![record; 512];
+        mixed[511].fields.swap(0, 1);
+        let long = vec![
+            Record {
+                fields: vec![("x".repeat(4097), Value::Int(1))]
+            };
+            512
+        ];
+        let wide = vec![
+            Record {
+                fields: (0..33).map(|i| (format!("f{i}"), Value::Int(i))).collect()
+            };
+            512
+        ];
+        let empty = vec![Record { fields: vec![] }; 512];
+        for records in [small, mixed, long, wide, empty] {
+            assert!(BulkRowShape::compile(&records).is_none());
+            let mut rows = Vec::new();
+            append_batch_shape_rows(&mut rows, &records, 99);
+            assert_eq!(
+                rows,
+                records
+                    .iter()
+                    .map(|r| record_row(r, 99))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
 
     #[test]
     fn bulk_short_body_hash_preserves_values_at_batch_and_byte_boundaries() {
