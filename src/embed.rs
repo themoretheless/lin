@@ -182,7 +182,6 @@ struct Scratch {
     v: Vec<f32>,
     seen: Vec<bool>,
     touched: Vec<u32>,
-    token_slots: FxHashMap<String, Vec<usize>>,
 }
 
 impl Scratch {
@@ -191,7 +190,6 @@ impl Scratch {
             v: vec![0f32; dim],
             seen: vec![false; dim],
             touched: Vec::with_capacity(dim / 4),
-            token_slots: FxHashMap::default(),
         }
     }
 
@@ -200,49 +198,11 @@ impl Scratch {
             self.v = vec![0f32; dim];
             self.seen = vec![false; dim];
             self.touched.clear();
-            self.token_slots.clear();
         }
     }
 
     #[inline]
     fn bump_token(&mut self, token: &str) {
-        // Cache only bounded alphabetic words; numeric identifiers and large
-        // tokens retain the reference path. Positions are dimension-specific.
-        let eligible =
-            (3..=32).contains(&token.len()) && token.as_bytes().iter().all(u8::is_ascii_alphabetic);
-        if eligible {
-            if let Some(slots) = self.token_slots.get(token) {
-                for (feature, &slot) in slots.iter().enumerate() {
-                    Self::bump_parts(
-                        &mut self.v,
-                        &mut self.seen,
-                        &mut self.touched,
-                        slot,
-                        if feature == 0 { 1.0 } else { 0.5 },
-                    );
-                }
-                return;
-            }
-            if self.token_slots.len() < 64 {
-                let slot = |key: &[u8], string: bool| {
-                    let mut h = FxHasher::default();
-                    if string {
-                        token.hash(&mut h);
-                    } else {
-                        key.hash(&mut h);
-                    }
-                    (h.finish() as usize) % self.v.len()
-                };
-                let mut slots = Vec::with_capacity(token.len() - 1);
-                slots.push(slot(token.as_bytes(), true));
-                slots.extend(token.as_bytes().windows(3).map(|w| slot(w, false)));
-                for (feature, &slot) in slots.iter().enumerate() {
-                    self.bump_slot(slot, if feature == 0 { 1.0 } else { 0.5 });
-                }
-                self.token_slots.insert(token.to_owned(), slots);
-                return;
-            }
-        }
         self.bump(token, 1.0);
         let bytes = token.as_bytes();
         if bytes.len() >= 3 {
@@ -264,17 +224,12 @@ impl Scratch {
 
     #[inline]
     fn bump_slot(&mut self, i: usize, w: f32) {
-        Self::bump_parts(&mut self.v, &mut self.seen, &mut self.touched, i, w);
-    }
-
-    #[inline]
-    fn bump_parts(v: &mut [f32], seen: &mut [bool], touched: &mut Vec<u32>, i: usize, w: f32) {
         let i = i as u32;
-        if !seen[i as usize] {
-            seen[i as usize] = true;
-            touched.push(i);
+        if !self.seen[i as usize] {
+            self.seen[i as usize] = true;
+            self.touched.push(i);
         }
-        v[i as usize] += w;
+        self.v[i as usize] += w;
     }
 
     /// L2-normalize and hand out the vector. Untouched slots are exact `0.0`, so
@@ -1302,52 +1257,6 @@ pub(crate) fn row_embed_text(row: &crate::store::Row) -> std::borrow::Cow<'_, st
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn bounded_token_slots_match_uncached_features_and_dimension_changes() {
-        let mut cached = Scratch::new(768);
-        for dim in [768, 8, 769, 384, 768] {
-            cached.ensure_dim(dim);
-            assert!(cached.token_slots.is_empty());
-            let mut reference = Scratch::new(dim);
-            let mut words = (0..80)
-                .map(|i| format!("word{}{}", (b'a' + i / 26) as char, (b'a' + i % 26) as char))
-                .collect::<Vec<_>>();
-            words.extend(["a".repeat(32), "b".repeat(33), "ЁЖ".into(), "abc123".into()]);
-            for _ in 0..3 {
-                for word in &words {
-                    cached.bump_token(word);
-                    reference.bump(word.as_str(), 1.0);
-                    for feature in word.as_bytes().windows(3) {
-                        reference.bump(feature, 0.5);
-                    }
-                }
-            }
-            assert_eq!(cached.token_slots.len(), 64);
-            assert!(
-                cached
-                    .token_slots
-                    .iter()
-                    .all(|(word, slots)| word.len() <= 32 && slots.len() <= 31)
-            );
-            assert_eq!(
-                cached.v.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                reference.v.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
-            );
-            assert_eq!(
-                cached
-                    .finish()
-                    .iter()
-                    .map(|v| v.to_bits())
-                    .collect::<Vec<_>>(),
-                reference
-                    .finish()
-                    .iter()
-                    .map(|v| v.to_bits())
-                    .collect::<Vec<_>>()
-            );
-        }
-    }
 
     #[test]
     fn single_embedding_field_borrows_the_row_text() {
