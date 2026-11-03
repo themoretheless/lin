@@ -1,3 +1,5 @@
+Final result: rejected by the frozen FULL WAL gate; both target windows and two controls failed. Source restored to baseline. Full evidence: ../2026-11-03-mod768-durable-gate/outcome.md. The preflight description below is historical.
+
 # Exact default-dimension modulo specialization — candidate
 
 Different from the rejected caller-participation candidate: thread counts/chunking and all encoder paths remain unchanged. Scratch feature hashing keeps the same FxHasher output and exact modulo mapping. At v.len()==768, spelling the divisor as a constant lets code generation avoid variable integer division; every other dimension keeps its original modulo. No model weights, dimension, output bits, API or storage codec change is intended.

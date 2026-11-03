@@ -218,14 +218,7 @@ impl Scratch {
     fn bump(&mut self, key: impl Hash, w: f32) {
         let mut h = FxHasher::default();
         key.hash(&mut h);
-        let hash = h.finish() as usize;
-        // The default model uses 768 slots. A constant divisor lets codegen
-        // avoid integer division without changing the exact hash-to-slot map.
-        let i = if self.v.len() == 768 {
-            hash % 768
-        } else {
-            hash % self.v.len()
-        };
+        let i = (h.finish() as usize) % self.v.len();
         self.bump_slot(i, w);
     }
 
@@ -1360,7 +1353,7 @@ mod tests {
             let i = (h.finish() as usize) % expected.len();
             expected[i] += weight;
         }
-        for dim in [8, 9, 32, 384, 767, 768, 769, 1024, 1536] {
+        for dim in [8, 9, 32, 384, 768, 1024, 1536] {
             let embedder = HashingEmbedder::new("test", dim);
             let mut texts = [
                 "",
