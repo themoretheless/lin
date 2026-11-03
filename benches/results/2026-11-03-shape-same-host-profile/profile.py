@@ -28,6 +28,9 @@ metadata = {'status': 'building', 'head': subprocess.check_output(
 def save():
     (out/'provenance.json').write_text(json.dumps(metadata, indent=2)+'\n')
 def build(role):
+    # Shared target outputs can be stale across worktree symlinks.
+    with (out/f'clean-{role}.log').open('w') as log:
+        subprocess.run(['cargo', 'clean', '--release', '-p', 'lin', '-p', 'lin-peer-worker'], cwd=root, stdout=log, stderr=subprocess.STDOUT, check=True)
     with (out/f'build-{role}.log').open('w') as log:
         subprocess.run(['cargo', 'build', '--locked', '--release', '-p', 'lin-peer-worker'],
                        cwd=root, stdout=log, stderr=subprocess.STDOUT, check=True)
@@ -72,6 +75,8 @@ for n in [1000, 10000, 100000]:
         (out/f'{role}-{n}.json').write_text(proc.stdout)
         item = {'rows': n, 'role': role, 'wall_samples_ns': data['samples_ns'],
                 'binary_sha256': sha(binary), 'exact_values_passed': True}
+        if role == 'ordinary':
+            assert not proc.stderr, 'Ordinary worker contains diagnostics or unexpected stderr'
         if role == 'diagnostic':
             lines = proc.stderr.splitlines()
             grouped = {}
