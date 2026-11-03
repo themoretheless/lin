@@ -1,0 +1,85 @@
+name: current-candidate-public-peers
+on:
+  push:
+    branches: [codex/current-candidate-public-peers-20261103]
+    paths:
+      - '.github/workflows/current-candidate-public-peers.yml'
+      - 'benches/results/2026-11-03-current-candidate-public-peers/input.json'
+      - 'benches/results/2026-11-03-current-candidate-public-peers/*.py'
+      - 'benches/results/2026-11-03-current-candidate-public-peers/read/measure.py'
+      - 'benches/results/2026-11-03-current-candidate-public-peers/native/measure.py'
+permissions:
+  contents: read
+  actions: read
+jobs:
+  peers:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch exact source-gate runtime for independent prerequisite audit
+        run: git fetch --no-tags --depth=1 origin f37a85ff297b3771f6305c3561b9e1b507555999
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.96.0'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Verify complete upstream source matrix and default correctness
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 benches/results/2026-11-03-current-candidate-public-peers/audit-prerequisite.py
+      - name: Validate frozen protocol and pinned adapters
+        run: |
+          python3 -m pip install -r scripts/bench-peers-requirements.lock
+          python3 benches/results/2026-11-03-current-candidate-public-peers/test-protocol.py
+          python3 scripts/test-bench-peers.py > /tmp/lin-current-public-peer-harness-tests.txt 2>&1
+      - name: Build exact ordinary default worker without overlays
+        run: python3 benches/results/2026-11-03-current-candidate-public-peers/build.py
+      - name: Verify host before starting MongoDB
+        run: python3 benches/results/2026-11-03-current-candidate-public-peers/check-host.py
+      - name: Fetch pinned server images
+        run: |
+          python3 - <<'PY'
+          import json,subprocess
+          from pathlib import Path
+          m=json.loads(Path('benches/results/2026-11-03-current-candidate-public-peers/input.json').read_text())
+          for image in m['images'].values():subprocess.run(['docker','pull',image],check=True)
+          PY
+      - name: Complete six-peer read and native insertion matrices
+        run: python3 benches/results/2026-11-03-current-candidate-public-peers/run.py
+      - name: Verify all owned containers absent
+        if: always()
+        run: python3 benches/results/2026-11-03-current-candidate-public-peers/cleanup.py
+      - name: Audit every original process and observation
+        run: |
+          python3 benches/results/2026-11-03-current-candidate-public-peers/audit.py
+          python3 benches/results/2026-11-03-current-candidate-public-peers/verify-processes.py
+      - name: Enforce all original peer process wins
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          d=json.loads(Path('/tmp/lin-current-candidate-public-peers-20261103/audit.json').read_text())
+          assert all(s['wins']==s['comparisons'] and s['positive_processes']==s['process_comparisons'] for s in d['summary'].values()),'Peer gate failed; retain all losses'
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: current-candidate-public-peers
+          path: |
+            /tmp/lin-current-candidate-public-peers-20261103/
+            /tmp/lin-current-public-peer-prerequisite-20261103/audited-prerequisite.json
+            /tmp/lin-current-public-peer-harness-tests.txt
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: current-candidate-public-peer-exact-linux-executable
+          path: /tmp/lin-current-candidate-public-peer-built-20261103
+          if-no-files-found: warn
