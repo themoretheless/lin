@@ -3286,7 +3286,7 @@ impl Db {
             match &plan.kind {
                 AggKind::Sum { field, by } if field.leaf() == Some("total") => {
                     if by.is_none() && plan.filter.is_none() {
-                        let total: f64 = self.store.orders_total().iter().sum();
+                        let total = self.store.orders_numeric_summary().0;
                         let mut row = crate::store::acquire_row();
                         row.insert("total".into(), Cell::Float(total));
                         return Ok(vec![row]);
@@ -3300,6 +3300,7 @@ impl Db {
                             self.store.orders_user_id(),
                             self.store.orders_total(),
                             self.store.orders_total_numeric(),
+                            self.store.orders_numeric_summary().1,
                             "total",
                             "user_id",
                             plan.filter.as_ref(),
@@ -3412,28 +3413,33 @@ impl Db {
                     return Ok(vec![hits_row(n)]);
                 };
                 let bk = by.as_str();
-                let mut map: FxHashMap<Cell, i64> = FxHashMap::default();
+                let mut map: FxHashMap<&Cell, i64> = FxHashMap::default();
                 let mut state_bytes = 0usize;
                 for r in col {
                     if filter.is_none_or(|p| eval_pred(p, r, now)) {
-                        let cell = r.get(&bk).map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
-                        if !map.contains_key(&cell) {
-                            let key_size = match &cell {
-                                Cell::Text(s) => s.len() + 32,
-                                _ => 16,
-                            };
-                            state_bytes = state_bytes.saturating_add(key_size + 64);
-                            if state_bytes > self.quotas.max_aggregate_bytes {
-                                return Err(Error::runtime(format!(
-                                    "aggregate state bytes {state_bytes} exceeds max_aggregate_bytes quota {}",
-                                    self.quotas.max_aggregate_bytes
-                                )));
+                        let cell = r.get(&bk).unwrap_or(&Cell::Null);
+                        match map.entry(cell) {
+                            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                                *entry.get_mut() += 1;
+                            }
+                            std::collections::hash_map::Entry::Vacant(entry) => {
+                                let key_size = match entry.key() {
+                                    Cell::Text(s) => s.len() + 32,
+                                    _ => 16,
+                                };
+                                state_bytes = state_bytes.saturating_add(key_size + 64);
+                                if state_bytes > self.quotas.max_aggregate_bytes {
+                                    return Err(Error::runtime(format!(
+                                        "aggregate state bytes {state_bytes} exceeds max_aggregate_bytes quota {}",
+                                        self.quotas.max_aggregate_bytes
+                                    )));
+                                }
+                                entry.insert(1);
                             }
                         }
-                        *map.entry(cell).or_insert(0) += 1;
                     }
                 }
-                Ok(count_cell_map_to_rows(&bk, map))
+                Ok(count_cell_map_to_rows(&bk, map.into_iter().map(|(key, count)| (key.clone_for_borrow(), count))))
             }
             AggKind::Sum { field, by } => {
                 let fk = field.as_str();
@@ -8001,7 +8007,7 @@ fn agg_count(rows: &[Row], by: &Field, max_bytes: usize) -> Result<Vec<Row>, Err
         .collect())
 }
 
-fn count_cell_map_to_rows(by: &str, map: FxHashMap<Cell, i64>) -> Vec<Row> {
+fn count_cell_map_to_rows(by: &str, map: impl IntoIterator<Item = (Cell, i64)>) -> Vec<Row> {
     let mut entries: Vec<(Cell, i64)> = map.into_iter().collect();
     entries.sort_unstable_by(|(a, _), (b, _)| cmp_sort(a, b));
     entries
@@ -8064,6 +8070,7 @@ fn agg_sum_orders_column(
     ids: &[Arc<str>],
     values: &[f64],
     numeric: &[bool],
+    all_numeric_safe: bool,
     field: &str,
     by: &str,
     filter: Option<&Pred>,
@@ -8095,9 +8102,9 @@ fn agg_sum_orders_column(
     for (i, (id, &value)) in ids.iter().zip(values).enumerate() {
         let row = &rows[i];
         let keep = if let Some((op, right)) = numeric_comparison
-            && numeric[i]
-            && value.is_finite()
-            && value.abs() < 9_007_199_254_740_992.0
+            && (all_numeric_safe || (numeric[i]
+                && value.is_finite()
+                && value.abs() < 9_007_199_254_740_992.0))
         {
             match op {
                 CmpOp::Eq => value == right,
@@ -9511,7 +9518,7 @@ mod orders_sum_column_parity_tests {
         ];
         let pred=Pred::Cmp {field:Field::name("total"),op:CmpOp::Gt,value:Value::Int(1)};
         let ids=[Arc::from("u1"),Arc::from("u2")];
-        let actual=agg_sum_orders_column(&rows,&ids,&[7.0,2.0],&[false,true],"total","user_id",Some(&pred),0,4096).unwrap();
+        let actual=agg_sum_orders_column(&rows,&ids,&[7.0,2.0],&[false,true],false,"total","user_id",Some(&pred),0,4096).unwrap();
         let expected=agg_sum_column(&rows,&[7.0,2.0],"total","user_id",Some(&pred),0,4096).unwrap();
         assert_eq!(actual,expected);
         assert_eq!(actual.len(),1);
@@ -9521,7 +9528,7 @@ mod orders_sum_column_parity_tests {
             Row::from([("user_id".into(),Cell::text_arc("")),("total".into(),Cell::Int(4))]),
         ];
         let ids=[Arc::from(""),Arc::from(""),Arc::from("")];
-        let actual=agg_sum_orders_column(&rows,&ids,&[2.0,3.0,4.0],&[true,true,true],"total","user_id",None,0,4096).unwrap();
+        let actual=agg_sum_orders_column(&rows,&ids,&[2.0,3.0,4.0],&[true,true,true],true,"total","user_id",None,0,4096).unwrap();
         let expected=agg_sum_column(&rows,&[2.0,3.0,4.0],"total","user_id",None,0,4096).unwrap();
         assert_eq!(actual,expected);
         assert_eq!(actual.len(),3);

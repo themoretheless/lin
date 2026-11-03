@@ -1,0 +1,57 @@
+name: current-main-aggregate-discovery
+on:
+  push:
+    branches: [codex/current-main-peer-refresh-20261103]
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'lin-derive/**'
+      - 'tools/peer-worker/**'
+      - '.github/workflows/current-main-aggregate-discovery.yml'
+      - 'benches/results/2026-11-03-orders-soa-summary-linux/build-and-run.py'
+      - 'benches/results/2026-11-03-orders-soa-summary-linux/run.py'
+      - 'benches/results/2026-11-03-orders-soa-summary-linux/plan.json'
+      - 'benches/results/2026-11-03-orders-soa-summary-linux/input.json'
+permissions:
+  contents: read
+jobs:
+  aggregate:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Fetch the two exact runtime snapshots without unrelated branch history
+        run: git fetch --no-tags --depth=1 origin a28aa758b774e216f14a6348fb1cf9dca2eb42bc 0dab1a9a4f0f4f1e736d2e54f2e34a1e0f133d2d
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.96.0'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Complete default workspace correctness including SUM quota and ordering regressions
+        run: cargo test --locked --workspace > /tmp/lin-summary-workspace-tests.txt 2>&1
+      - name: Build three ordinary source snapshots and measure the frozen matrix
+        run: python3 benches/results/2026-11-03-orders-soa-summary-linux/build-and-run.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: current-main-aggregate-discovery
+          path: |
+            /tmp/lin-orders-soa-summary-linux-20261103/
+            /tmp/lin-summary-workspace-tests.txt
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: current-main-aggregate-exact-linux-binaries
+          path: /tmp/lin-summary-*-worker-20261103
+          if-no-files-found: warn

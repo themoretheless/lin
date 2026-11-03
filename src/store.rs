@@ -642,6 +642,7 @@ pub struct Store {
     orders_user_id: Vec<Arc<str>>,
     orders_total: Vec<f64>,
     orders_total_numeric: Vec<bool>,
+    orders_numeric_summary: OnceLock<(f64, bool)>,
     users_id: Vec<Arc<str>>,
     users_email: Vec<Arc<str>>,
     /// Columnar facts (append hot path). `collections["facts"]` may lag until
@@ -712,6 +713,7 @@ impl Store {
             orders_user_id: Vec::new(),
             orders_total: Vec::new(),
             orders_total_numeric: Vec::new(),
+            orders_numeric_summary: OnceLock::new(),
             users_id: Vec::new(),
             users_email: Vec::new(),
             facts_s: Vec::new(),
@@ -996,6 +998,7 @@ impl Store {
             orders_user_id: Vec::new(),
             orders_total: Vec::new(),
             orders_total_numeric: Vec::new(),
+            orders_numeric_summary: OnceLock::new(),
             users_id: Vec::new(),
             users_email: Vec::new(),
             facts_s: Vec::new(),
@@ -2314,6 +2317,7 @@ impl Store {
                 swap_pop_at(&mut self.orders_user_id, p, len);
                 swap_pop_at(&mut self.orders_total, p, len);
                 swap_pop_at(&mut self.orders_total_numeric, p, len);
+                self.orders_numeric_summary.take();
             }
             "users" => {
                 swap_pop_at(&mut self.users_id, p, len);
@@ -2466,6 +2470,7 @@ impl Store {
             self.orders_user_id.clear();
             self.orders_total.clear();
             self.orders_total_numeric.clear();
+            self.orders_numeric_summary.take();
         }
         if collection == "users" {
             self.users_id.clear();
@@ -2594,6 +2599,7 @@ impl Store {
                 .and_then(Cell::text_shared)
                 .unwrap_or_default();
             let total = row.get("total").and_then(Cell::as_f64).unwrap_or(0.0);
+            self.orders_numeric_summary.take();
             if idx == self.orders_id.len() {
                 self.orders_id.push(id);
                 self.orders_user_id.push(uid);
@@ -2674,6 +2680,7 @@ impl Store {
                 .and_then(Cell::text_shared)
                 .unwrap_or_default();
             let total = row.get("total").and_then(Cell::as_f64).unwrap_or(0.0);
+            self.orders_numeric_summary.take();
             let did = id.clone().unwrap_or_default();
             if idx == self.orders_id.len() {
                 self.orders_id.push(did);
@@ -2828,6 +2835,7 @@ impl Store {
                 self.orders_user_id[idx] = text("user_id");
                 self.orders_total[idx] = after.get("total").and_then(Cell::as_f64).unwrap_or(0.0);
                 self.orders_total_numeric[idx] = matches!(after.get("total"), Some(Cell::Int(_) | Cell::Float(_)));
+                self.orders_numeric_summary.take();
             }
             "users" if idx < self.users_email.len() => self.users_email[idx] = text("email"),
             "docs" | "orders" | "users" => self.rebuild_row_maps_collection(collection),
@@ -3348,6 +3356,15 @@ impl Store {
     }
     pub(crate) fn orders_total_numeric(&self) -> &[bool] {
         &self.orders_total_numeric
+    }
+    pub(crate) fn orders_numeric_summary(&self) -> (f64, bool) {
+        *self.orders_numeric_summary.get_or_init(|| {
+            let sum = self.orders_total.iter().sum();
+            let safe = self.orders_total.iter().zip(&self.orders_total_numeric).all(|(&value, &numeric)| {
+                numeric && value.is_finite() && value.abs() < 9_007_199_254_740_992.0
+            });
+            (sum, safe)
+        })
     }
     pub fn docs_wing(&self) -> &[Arc<str>] {
         &self.docs_wing
@@ -4154,16 +4171,20 @@ mod orders_numeric_tag_tests {
         store.rebuild_row_maps();
         assert!(store.orders_soa_ready());
         assert_eq!(store.orders_total_numeric,[true,true,false,false,false]);
+        assert_eq!(store.orders_numeric_summary(),(3.0,false));
         let before=store.collections["orders"][0].clone();
         let mut after=before.clone();after.insert("total".into(),Cell::Time(7));
         store.collections.get_mut("orders").unwrap()[0]=after.clone();
         store.row_maps_sync_updated("orders",0,&before,&after);
         assert_eq!(store.orders_total_numeric,[false,true,false,false,false]);
+        assert_eq!(store.orders_numeric_summary(),(9.0,false));
         store.collections.get_mut("orders").unwrap()[0].insert("total".into(),Cell::Float(3.0));
         store.row_maps_register("orders",0);
         assert_eq!(store.orders_total_numeric,[true,true,false,false,false]);
+        assert_eq!(store.orders_numeric_summary(),(5.0,false));
         store.delete_rows_at("orders",&[0,3]);
         assert!(store.orders_soa_ready());
         assert_eq!(store.orders_total_numeric,[false,true,false]);
+        assert_eq!(store.orders_numeric_summary(),(2.0,false));
     }
 }
