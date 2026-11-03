@@ -1,0 +1,45 @@
+--- a/src/persist.rs
++++ b/src/persist.rs
+@@ -1287,17 +1287,23 @@
+     else {
+         return Err(io_err("log record exceeds 16MiB"));
+     };
++    let phase = std::time::Instant::now();
+     let codec = magic[3];
+     let mut checksum = crate::crc::Hasher::new();
+     checksum.update(&[codec]);
+     checksum.update(payload);
+     let checksum = checksum.finalize().to_le_bytes();
+ 
++    if payload.len() > 65536 { eprintln!("DURABLE checksum bytes={} us={}", payload.len(), phase.elapsed().as_micros()); }
++    let phase = std::time::Instant::now();
+     write_frame_bytes(log, codec, payload, checksum, len as u32).map_err(io_err)?;
++    if payload.len() > 65536 { eprintln!("DURABLE write bytes={} us={}", payload.len(), phase.elapsed().as_micros()); }
++    let phase = std::time::Instant::now();
+ 
+     if sync == SyncMode::Full {
+         durable_sync(log).map_err(io_err)?;
+     }
++    if payload.len() > 65536 { eprintln!("DURABLE sync bytes={} us={}", payload.len(), phase.elapsed().as_micros()); }
+     *log_bytes += 8 + len as u64;
+     Ok(())
+ }
+@@ -1751,7 +1757,10 @@
+     rows: &[Row],
+     mut bytes: Vec<u8>,
+ ) -> PreparedInsert {
++    let phase = std::time::Instant::now();
+     let pack = rows_to_insert_cols(collection, rows, Vec::new());
++    eprintln!("DURABLE transpose rows={} us={}", rows.len(), phase.elapsed().as_micros());
++    let phase = std::time::Instant::now();
+     let encoding = match &pack {
+         Pack::InsertCols {
+             fields, cols, n, ..
+@@ -1773,6 +1782,7 @@
+         }
+         _ => unreachable!("column pack builder"),
+     };
++    eprintln!("DURABLE encode rows={} us={}", rows.len(), phase.elapsed().as_micros());
+     PreparedInsert {
+         pack: Some(pack),
+         encoding,
