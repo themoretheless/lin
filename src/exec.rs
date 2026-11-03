@@ -5735,21 +5735,23 @@ impl Db {
             if row.get("embedding").and_then(Cell::as_vec).is_some() {
                 continue;
             }
-            let text = embed::row_embed_text(row);
-            if !text.is_empty() {
+            let parts = ["title", "body", "snippet"].map(|key| row_text(row, key));
+            if parts.iter().flatten().any(|text| !text.is_empty()) {
                 row_idxs.push(i);
-                texts.push(text);
+                texts.push(parts);
             }
         }
         if texts.is_empty() {
             return;
         }
-        let refs = texts.iter().map(|text| text.as_ref()).collect::<Vec<_>>();
-        let mut vectors = emb.embed_batch(&refs);
+        let mut vectors = emb.embed_batch_parts(&texts);
         if vectors.len() != row_idxs.len() {
             // Keep third-party embedders with a broken batch implementation
             // from silently leaving a partially embedded slab.
-            vectors = refs.iter().map(|text| emb.embed(text)).collect();
+            vectors = texts
+                .iter()
+                .map(|parts| emb.embed(&embed::embed_parts_text(*parts)))
+                .collect();
         }
         for (i, vector) in row_idxs.into_iter().zip(vectors) {
             rows[i].insert("embedding".into(), Cell::Vec(vector));
@@ -6769,6 +6771,48 @@ fn record_row(record: &Record, now: i64) -> Row {
 #[cfg(test)]
 mod record_tests {
     use super::*;
+
+    #[test]
+    fn parts_embedding_retains_broken_batch_fallback_and_explicit_vectors() {
+        struct Broken;
+        impl crate::embed::Embedder for Broken {
+            fn id(&self) -> &str {
+                "broken"
+            }
+            fn dim(&self) -> usize {
+                1
+            }
+            fn embed(&self, text: &str) -> Arc<[f32]> {
+                Arc::from([text.len() as f32])
+            }
+            fn embed_batch(&self, texts: &[&str]) -> Vec<Arc<[f32]>> {
+                assert_eq!(texts, &["a ", "b"]);
+                Vec::new()
+            }
+        }
+        let db = Db::empty().with_embedder(Arc::new(Broken));
+        let explicit: Arc<[f32]> = Arc::from([42.0]);
+        let mut rows = vec![
+            Row::from([
+                ("title".into(), Cell::text_arc("a")),
+                ("body".into(), Cell::text_arc("")),
+            ]),
+            Row::from([("body".into(), Cell::text_arc("b"))]),
+            Row::from([("title".into(), Cell::text_arc(""))]),
+            Row::from([
+                ("title".into(), Cell::text_arc("keep")),
+                ("embedding".into(), Cell::Vec(explicit.clone())),
+            ]),
+        ];
+        db.maybe_embed_rows("docs", &mut rows);
+        assert_eq!(rows[0]["embedding"].as_vec().unwrap(), &[2.0]);
+        assert_eq!(rows[1]["embedding"].as_vec().unwrap(), &[1.0]);
+        assert!(!rows[2].contains_key("embedding"));
+        match &rows[3]["embedding"] {
+            Cell::Vec(v) => assert!(Arc::ptr_eq(v, &explicit)),
+            _ => panic!("explicit vector changed"),
+        }
+    }
 
     #[test]
     fn bulk_short_body_hash_preserves_values_at_batch_and_byte_boundaries() {
