@@ -1,0 +1,39 @@
+name: prepared-shape-phase-profile
+on:
+  push:
+    branches: [codex/current-candidate-public-peers-20261103]
+    paths:
+      - '.github/workflows/prepared-shape-phase-profile.yml'
+      - 'benches/results/2026-11-03-prepared-shape-phase-profile/profile.py'
+jobs:
+  profile:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_NET_RETRY: 5
+      CARGO_HTTP_MULTIPLEXING: 'false'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.96.0'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - uses: Swatinem/rust-cache@v2
+      - name: Fetch exact rejected candidate source
+        run: |
+          git fetch --no-tags --depth=1 origin d8871eb36b119b9960989bf4a5feea9877168cc5
+          git worktree add --detach /tmp/lin-prepared-shape-profile-source d8871eb36b119b9960989bf4a5feea9877168cc5
+          ln -s "$GITHUB_WORKSPACE/target" /tmp/lin-prepared-shape-profile-source/target
+      - name: Profile exact insertion workload with full readback
+        env:
+          LIN_PROFILE_SOURCE: /tmp/lin-prepared-shape-profile-source
+        run: python3 benches/results/2026-11-03-prepared-shape-phase-profile/profile.py /tmp/lin-insert-linux-profile
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: prepared-shape-phase-profile
+          path: /tmp/lin-insert-linux-profile/
+          if-no-files-found: error
