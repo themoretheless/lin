@@ -1981,10 +1981,10 @@ impl Db {
                 for event in events.into_iter().rev() {
                     match event {
                         RowUndo::Update(collection, idx, row) => {
-                            self.store.restore_rows(&[(collection, idx, row)])
+                            self.store.restore_row_owned(&collection, idx, row);
                         }
                         RowUndo::Delete(collection, positions, rows) => {
-                            self.store.restore_rows_at(&collection, &positions, &rows)
+                            self.store.restore_rows_at(&collection, &positions, &rows);
                         }
                     }
                 }
@@ -1993,10 +1993,10 @@ impl Db {
                 for event in events.into_iter().rev() {
                     match event {
                         RowUndo::Update(collection, idx, row) => {
-                            self.store.restore_rows(&[(collection, idx, row)])
+                            self.store.restore_row_owned(&collection, idx, row);
                         }
                         RowUndo::Delete(collection, positions, rows) => {
-                            self.store.restore_rows_at(&collection, &positions, &rows)
+                            self.store.restore_rows_at(&collection, &positions, &rows);
                         }
                     }
                 }
@@ -6059,7 +6059,7 @@ impl Db {
     ) -> Result<(Vec<Row>, Vec<Edge>, Option<crate::persist::PreparedInsert>), Error> {
         let now = now_ms();
         let n = records.len();
-        let mut built: Vec<Row> = if n >= 512 {
+        let mut built: Vec<Row> = if n >= 2048 {
             let threads = std::thread::available_parallelism()
                 .map(|p| p.get())
                 .unwrap_or(1)

@@ -2206,6 +2206,41 @@ impl Store {
             return;
         }
 
+        if dead.len() == 1 {
+            let p = dead[0];
+            if p >= old_n {
+                return;
+            }
+            self.update_col_count(collection, -1);
+            let last = match self.collections.get(collection) {
+                Some(rows) if p < rows.len() => rows.len() - 1,
+                _ => return,
+            };
+            let doomed = self.collections.get_mut(collection).unwrap().swap_remove(p);
+            self.index_remove_row(collection, p, &doomed);
+            self.fts_remove_row(collection, p, &doomed);
+            if let Some(hnsw) = self.hnsw.get_mut(collection) {
+                hnsw.remove(p);
+            }
+            self.row_maps_drop_keys(collection, &doomed);
+            if p != last {
+                self.move_deleted_tail(collection, last, p);
+            } else {
+                self.swap_pop_columns(collection, p, last + 1);
+            }
+            let new_n = old_n - 1;
+            let soa_len = match collection {
+                "docs" => self.docs_id.len(),
+                "orders" => self.orders_id.len(),
+                "users" => self.users_id.len(),
+                _ => new_n,
+            };
+            if soa_len != new_n {
+                self.rebuild_row_maps_collection(collection);
+            }
+            return;
+        }
+
         let mut dead: Vec<usize> = dead.iter().copied().filter(|&d| d < old_n).collect();
         dead.sort_unstable();
         dead.dedup();
@@ -2367,13 +2402,72 @@ impl Store {
             if !live {
                 continue;
             }
-            let current = self.collection(collection)[*idx].clone();
             self.index_remove_at(collection, *idx);
             self.fts_remove_at(collection, *idx);
-            self.collection_mut(collection)[*idx] = row.clone();
+            let old_row =
+                std::mem::replace(&mut self.collection_mut(collection)[*idx], row.clone());
             let _ = self.index_insert_at(collection, *idx);
             self.fts_insert_at(collection, *idx);
-            self.row_maps_sync_updated(collection, *idx, &current, row);
+            self.row_maps_sync_updated(collection, *idx, &old_row, row);
+        }
+    }
+
+    pub fn restore_row_owned(&mut self, collection: &str, idx: usize, row: Row) {
+        let live = self
+            .collections
+            .get(collection)
+            .is_some_and(|rows| idx < rows.len());
+        if !live {
+            return;
+        }
+        self.index_remove_at(collection, idx);
+        self.fts_remove_at(collection, idx);
+        let old_row = std::mem::replace(&mut self.collection_mut(collection)[idx], row);
+        let _ = self.index_insert_at(collection, idx);
+        self.fts_insert_at(collection, idx);
+
+        let (before_id, before_uri) = (
+            row_text(&old_row, "id").map(|s| s.to_string()),
+            row_text(&old_row, "uri").map(|s| s.to_string()),
+        );
+        let cur = &self.collections[collection][idx];
+        let after_id = row_text(cur, "id").map(|s| s.to_string());
+        let after_uri = row_text(cur, "uri").map(|s| s.to_string());
+        let title = cur.get("title").and_then(Cell::text_shared).unwrap_or_default();
+        let layer = cur.get("layer").and_then(Cell::text_shared).unwrap_or_default();
+        let wing = cur.get("wing").and_then(Cell::text_shared).unwrap_or_default();
+        let user_id = cur.get("user_id").and_then(Cell::text_shared).unwrap_or_default();
+        let total = cur.get("total").and_then(Cell::as_f64).unwrap_or(0.0);
+        let email = cur.get("email").and_then(Cell::text_shared).unwrap_or_default();
+
+        if collection == "docs" {
+            self.docs_title_packed.take();
+        }
+        let identity_moved = before_id != after_id || before_uri != after_uri;
+        let stale_slot = after_id
+            .as_deref()
+            .is_some_and(|key| self.row_index(collection, key) != Some(idx));
+        if identity_moved || stale_slot {
+            self.rebuild_row_maps_collection(collection);
+            return;
+        }
+        match collection {
+            "docs"
+                if idx < self.docs_title.len()
+                    && idx < self.docs_layer.len()
+                    && idx < self.docs_wing.len() =>
+            {
+                self.docs_title[idx] = title;
+                self.docs_layer[idx] = layer;
+                self.docs_wing[idx] = wing;
+            }
+            "orders" if idx < self.orders_user_id.len() && idx < self.orders_total.len() => {
+                self.orders_user_id[idx] = user_id;
+                self.orders_total[idx] = total;
+            }
+            "users" if idx < self.users_email.len() => self.users_email[idx] = email,
+            "docs" | "orders" | "users" => self.rebuild_row_maps_collection(collection),
+            _ => {}
         }
     }
 
@@ -3379,7 +3473,7 @@ impl Store {
         let total_idxs = idxs.len();
         let id_title = fields.len() == 2 && fields[0] == "id" && fields[1] == "title";
 
-        if total_idxs >= 4096 {
+        if total_idxs >= 16384 {
             let threads = std::thread::available_parallelism()
                 .map(|p| p.get())
                 .unwrap_or(1)
@@ -3560,10 +3654,10 @@ fn docs_hot_field(f: &str) -> bool {
 
 #[inline]
 fn row_id_title(id: &Arc<str>, title: &Arc<str>) -> Row {
-    BTreeMap::from([
-        (String::from("id"), Cell::Text(Arc::clone(id))),
-        (String::from("title"), Cell::Text(Arc::clone(title))),
-    ])
+    let mut row = acquire_row();
+    row.insert(String::from("id"), Cell::Text(Arc::clone(id)));
+    row.insert(String::from("title"), Cell::Text(Arc::clone(title)));
+    row
 }
 
 fn spo_key(row: &Row) -> Option<(Arc<str>, Arc<str>, Arc<str>)> {
