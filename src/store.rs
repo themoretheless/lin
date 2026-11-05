@@ -611,8 +611,8 @@ pub struct Store {
     pub indexes: BTreeMap<String, LiveIndex>,
     /// collection → FTS postings (fields with catalog `fts`).
     pub(crate) fts: BTreeMap<String, crate::fts::FtsIndex>,
-    /// collection → HNSW vector index
-    pub(crate) hnsw: BTreeMap<String, crate::embed::HnswIndex>,
+    /// collection → HNSW vector index (f32 or SQ8)
+    pub(crate) hnsw: BTreeMap<String, crate::embed::VectorIndex>,
     /// collection → id → row index (O(1) Get / IndexSeek fetch).
     pub(crate) by_id: BTreeMap<String, FxHashMap<Arc<str>, usize>>,
     /// docs uri → row index.
@@ -3081,7 +3081,7 @@ impl Store {
     }
 
     pub fn build_hnsw(&mut self, collection: &str, m: usize, ef: usize) {
-        let mut index = crate::embed::HnswIndex::new(m, ef);
+        let mut index = crate::embed::VectorIndex::new_f32(m, ef);
         if let Some(rows) = self.collections.get(collection) {
             for (i, row) in rows.iter().enumerate() {
                 if let Some(Cell::Vec(v)) = row.get("embedding") {
@@ -3090,6 +3090,32 @@ impl Store {
             }
         }
         self.hnsw.insert(collection.to_string(), index);
+    }
+
+    pub fn build_hnsw_sq8(&mut self, collection: &str, m: usize, ef: usize) {
+        let mut index = crate::embed::VectorIndex::new_sq8(m, ef);
+        if let Some(rows) = self.collections.get(collection) {
+            for (i, row) in rows.iter().enumerate() {
+                if let Some(Cell::Vec(v)) = row.get("embedding") {
+                    index.insert(i, v.clone());
+                }
+            }
+        }
+        self.hnsw.insert(collection.to_string(), index);
+    }
+
+    pub fn quantize_hnsw(&mut self, collection: &str) -> bool {
+        if let Some(idx) = self.hnsw.get_mut(collection) {
+            *idx = idx.to_sq8();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Resident memory in bytes of the HNSW index for `collection`, if built.
+    pub fn hnsw_resident_memory(&self, collection: &str) -> Option<usize> {
+        self.hnsw.get(collection).map(|idx| idx.resident_memory())
     }
 
     /// Drop the postings of the row currently at `row_idx`.
@@ -3572,7 +3598,7 @@ pub struct MemBackup {
     extra_indexes: BTreeMap<String, IndexSnap>,
     extra_filters: BTreeMap<String, String>,
     extra_owned: BTreeMap<String, Vec<(String, String)>>,
-    hnsw: BTreeMap<String, crate::embed::HnswIndex>,
+    hnsw: BTreeMap<String, crate::embed::VectorIndex>,
 }
 
 /// Move `v[p]` on top of the tail and drop the tail, keeping the vec dense. A

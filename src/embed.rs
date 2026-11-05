@@ -1230,6 +1230,106 @@ impl HnswIndexSq8 {
     }
 }
 
+/// Unified vector index supporting standard uncompressed `f32` (HnswIndex)
+/// or memory-optimized 8-bit scalar quantization (HnswIndexSq8).
+#[derive(Clone, Debug)]
+pub enum VectorIndex {
+    F32(HnswIndex),
+    Sq8(HnswIndexSq8),
+}
+
+impl Default for VectorIndex {
+    fn default() -> Self {
+        Self::F32(HnswIndex::default())
+    }
+}
+
+impl VectorIndex {
+    pub fn new_f32(m: usize, ef: usize) -> Self {
+        Self::F32(HnswIndex::new(m, ef))
+    }
+
+    pub fn new_sq8(m: usize, ef: usize) -> Self {
+        Self::Sq8(HnswIndexSq8::new(m, ef))
+    }
+
+    pub fn is_sq8(&self) -> bool {
+        matches!(self, Self::Sq8(_))
+    }
+
+    pub fn to_sq8(&self) -> Self {
+        match self {
+            Self::F32(idx) => Self::Sq8(idx.to_sq8()),
+            Self::Sq8(idx) => Self::Sq8(idx.clone()),
+        }
+    }
+
+    pub fn into_sq8(self) -> Self {
+        match self {
+            Self::F32(idx) => Self::Sq8(idx.into_sq8()),
+            Self::Sq8(idx) => Self::Sq8(idx),
+        }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        match self {
+            Self::F32(idx) => idx.len(),
+            Self::Sq8(idx) => idx.len(),
+        }
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::F32(idx) => idx.is_empty(),
+            Self::Sq8(idx) => idx.is_empty(),
+        }
+    }
+
+    pub fn resident_memory(&self) -> usize {
+        match self {
+            Self::F32(idx) => idx.resident_memory(),
+            Self::Sq8(idx) => idx.resident_memory(),
+        }
+    }
+
+    pub fn insert(&mut self, id: usize, vector: Arc<[f32]>) {
+        match self {
+            Self::F32(idx) => idx.insert(id, vector),
+            Self::Sq8(idx) => idx.insert_f32(id, &vector),
+        }
+    }
+
+    pub fn remove(&mut self, id: usize) {
+        match self {
+            Self::F32(idx) => idx.remove(id),
+            Self::Sq8(idx) => idx.remove(id),
+        }
+    }
+
+    pub fn move_id(&mut self, from: usize, to: usize) {
+        match self {
+            Self::F32(idx) => idx.move_id(from, to),
+            Self::Sq8(idx) => idx.move_id(from, to),
+        }
+    }
+
+    pub fn clear(&mut self) {
+        match self {
+            Self::F32(idx) => idx.clear(),
+            Self::Sq8(idx) => idx.clear(),
+        }
+    }
+
+    pub fn search(&self, query: &[f32], k: usize, ef_search: usize) -> Vec<(f64, usize)> {
+        match self {
+            Self::F32(idx) => idx.search(query, k, ef_search),
+            Self::Sq8(idx) => idx.search(query, k, ef_search),
+        }
+    }
+}
+
 /// Text blob used for embedding a row (title / body / snippet).
 pub(crate) fn row_embed_text(row: &crate::store::Row) -> std::borrow::Cow<'_, str> {
     let texts = ["title", "body", "snippet"].map(|k| crate::store::row_text(row, k));

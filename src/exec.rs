@@ -2023,6 +2023,22 @@ impl Db {
         Ok(())
     }
 
+    /// Build or rebuild a compact SQ8-quantized HNSW vector index for a collection (75% less RAM).
+    pub fn build_hnsw_sq8(&mut self, collection: &str) -> Result<(), Error> {
+        self.store.build_hnsw_sq8(collection, 16, 64);
+        Ok(())
+    }
+
+    /// Quantize an existing collection's HNSW vector index to SQ8 in-place.
+    pub fn quantize_hnsw(&mut self, collection: &str) -> Result<bool, Error> {
+        Ok(self.store.quantize_hnsw(collection))
+    }
+
+    /// Resident memory in bytes of the HNSW index for `collection`, if built.
+    pub fn hnsw_resident_memory(&self, collection: &str) -> Option<usize> {
+        self.store.hnsw_resident_memory(collection)
+    }
+
     /// Begin an interactive ACID transaction.
     ///
     /// All mutations executed through [`Transaction`] remain isolated until [`Transaction::commit`].

@@ -217,3 +217,64 @@ fn test_hnsw_resident_memory_lin_1044() {
     let populated_mem = index.resident_memory();
     assert!(populated_mem > initial_mem);
 }
+
+#[test]
+fn test_hnsw_sq8_build_and_search() {
+    let embedder = Arc::new(HashingEmbedder::new("test/64", 64));
+    let mut db = Db::empty().with_embedder(embedder);
+
+    for i in 0..50 {
+        let text = format!("document category {} specific detail item {}", i / 5, i);
+        db.run(&format!(
+            r#"insert docs [{{ id: "doc_{i}", title: "{text}", body: "{text}" }}]"#
+        ))
+        .unwrap();
+    }
+
+    // Build SQ8 index directly
+    db.build_hnsw_sq8("docs").unwrap();
+
+    let query_text = "document category 8 specific detail item 42";
+    let res = db
+        .run(&format!(r#"docs | search vec "{query_text}" | take 5"#))
+        .unwrap();
+    assert!(!res.rows.is_empty());
+    assert_eq!(res.rows[0]["id"].text().unwrap(), "doc_42");
+}
+
+#[test]
+fn test_hnsw_quantize_inplace_memory_reduction() {
+    let embedder = Arc::new(HashingEmbedder::new("test/64", 64));
+    let mut db = Db::empty().with_embedder(embedder);
+
+    for i in 0..100 {
+        let text = format!("document category {} specific detail item {}", i / 10, i);
+        db.run(&format!(
+            r#"insert docs [{{ id: "doc_{i}", title: "{text}", body: "{text}" }}]"#
+        ))
+        .unwrap();
+    }
+
+    // Build standard f32 HNSW
+    db.build_hnsw("docs").unwrap();
+    let mem_f32 = db.hnsw_resident_memory("docs").unwrap();
+
+    // Quantize in-place to SQ8
+    let ok = db.quantize_hnsw("docs").unwrap();
+    assert!(ok);
+    let mem_sq8 = db.hnsw_resident_memory("docs").unwrap();
+
+    // Quantized memory must be significantly less than f32
+    assert!(
+        mem_sq8 < mem_f32,
+        "SQ8 memory {mem_sq8} should be strictly less than f32 {mem_f32}"
+    );
+
+    // Search continues to work accurately on quantized index
+    let query_text = "document category 4 specific detail item 42";
+    let res = db
+        .run(&format!(r#"docs | search vec "{query_text}" | take 5"#))
+        .unwrap();
+    assert!(!res.rows.is_empty());
+    assert_eq!(res.rows[0]["id"].text().unwrap(), "doc_42");
+}
