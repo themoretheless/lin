@@ -4675,7 +4675,6 @@ impl Db {
 
         let (right_fields, plan) = plan_join_fields(right_col, &names);
         let rights = self.store.collection(right_col);
-        let probe = build_right_probe(rights, &right_fields);
 
         let (source, need_filter) = {
             if let Some(pred) = filter {
@@ -4706,8 +4705,58 @@ impl Db {
             JoinLeftSource::Idxs(i) => i.len(),
             JoinLeftSource::Scan { len } => *len,
         };
+
+        // Cost-based join probe strategy:
+        // 1. If right table has all IDs indexed in by_id and left_len < rights.len(),
+        //    skip hash map allocation entirely and resolve directly in O(1) via by_id.
+        // 2. If left_len >= rights.len(), build dense probe once for fast slice borrowing.
+        // 3. If by_id is partial and left is significantly smaller, build an asymmetric probe.
+        let store_has_all_ids = self
+            .store
+            .by_id
+            .get(right_col)
+            .map_or(false, |m| m.len() == rights.len());
+
+        let use_direct_lookup = store_has_all_ids && left_len < rights.len();
+        let probe = if use_direct_lookup {
+            None
+        } else if store_has_all_ids || left_len * 4 >= rights.len() {
+            Some(build_right_probe(rights, &right_fields))
+        } else {
+            // Asymmetric probe: only hash keys needed by left rows
+            let mut needed: FxHashSet<&str> = FxHashSet::default();
+            for i in 0..left_len {
+                let idx = match &source {
+                    JoinLeftSource::Idxs(idxs) => idxs[i],
+                    JoinLeftSource::Scan { .. } => i,
+                };
+                if let Some(row) = self.store.get_by_idx(left_name, idx) {
+                    if !need_filter || filter.map_or(true, |p| eval_pred(p, row, now)) {
+                        if let Some(k) = row.get(on).and_then(Cell::text) {
+                            needed.insert(k);
+                        }
+                    }
+                }
+            }
+            let mut p = FxHashMap::default();
+            p.reserve(needed.len());
+            for r in rights {
+                if let Some(id) = r.get("id").and_then(Cell::text) {
+                    if needed.contains(id) {
+                        let cells = right_fields
+                            .iter()
+                            .map(|f| r.get(f).cloned().unwrap_or(Cell::Null))
+                            .collect();
+                        p.insert(id, cells);
+                    }
+                }
+            }
+            Some(p)
+        };
+
         let names_arc: Arc<[String]> = names.clone().into();
         let mut batch = RecordBatch::with_capacity(names_arc, left_len);
+        let mut cell_buf: smallvec::SmallVec<[Cell; 8]> = smallvec::SmallVec::new();
         let mut pos = 0usize;
         loop {
             let idx = match &source {
@@ -4738,14 +4787,34 @@ impl Db {
                 continue;
             }
 
-            let right_cells = left_row
-                .get(on)
-                .and_then(Cell::text)
-                .and_then(|k| probe.get(k).map(|v| v.as_slice()));
-            if right_cells.is_none() && !left_join {
-                continue;
+            if let Some(ref probe_map) = probe {
+                let right_cells = left_row
+                    .get(on)
+                    .and_then(Cell::text)
+                    .and_then(|k| probe_map.get(k).map(|v| v.as_slice()));
+                if right_cells.is_none() && !left_join {
+                    continue;
+                }
+                push_join_batch_row(&mut batch, left_row, right_cells, &plan);
+            } else {
+                // Direct O(1) store lookup without intermediate hash map
+                let right_row = left_row
+                    .get(on)
+                    .and_then(Cell::text)
+                    .and_then(|k| self.store.get_by_id(right_col, k));
+                if right_row.is_none() && !left_join {
+                    continue;
+                }
+                if let Some(r) = right_row {
+                    cell_buf.clear();
+                    for f in &right_fields {
+                        cell_buf.push(r.get(f).cloned().unwrap_or(Cell::Null));
+                    }
+                    push_join_batch_row(&mut batch, left_row, Some(&cell_buf), &plan);
+                } else {
+                    push_join_batch_row(&mut batch, left_row, None, &plan);
+                }
             }
-            push_join_batch_row(&mut batch, left_row, right_cells, &plan);
         }
 
         finish_batch(&mut batch, skip_n, explicit_take);
