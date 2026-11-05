@@ -314,6 +314,50 @@ pub struct SnapshotRef<'a> {
     pub cold_collections: &'a [String],
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SnapshotHeader {
+    pub r#gen: u64,
+    pub embed_id: String,
+    pub next_id: u64,
+    pub catalog_hash: String,
+    pub log_offset: u64,
+    pub edges: Vec<Edge>,
+    #[serde(default)]
+    pub extra_collections: std::collections::BTreeMap<String, ColSnap>,
+    #[serde(default)]
+    pub extra_rels: std::collections::BTreeMap<String, RelSnap>,
+    #[serde(default)]
+    pub extra_indexes: std::collections::BTreeMap<String, IndexSnap>,
+    #[serde(default)]
+    pub extra_filters: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub extra_owned: std::collections::BTreeMap<String, Vec<(String, String)>>,
+    #[serde(default)]
+    pub cold_collections: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SnapshotHeaderRef<'a> {
+    pub r#gen: u64,
+    pub embed_id: &'a str,
+    pub next_id: u64,
+    pub catalog_hash: &'a str,
+    pub log_offset: u64,
+    pub edges: &'a [Edge],
+    #[serde(default)]
+    pub extra_collections: &'a std::collections::BTreeMap<String, ColSnap>,
+    #[serde(default)]
+    pub extra_rels: &'a std::collections::BTreeMap<String, RelSnap>,
+    #[serde(default)]
+    pub extra_indexes: &'a std::collections::BTreeMap<String, IndexSnap>,
+    #[serde(default)]
+    pub extra_filters: &'a std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub extra_owned: &'a std::collections::BTreeMap<String, Vec<(String, String)>>,
+    #[serde(default)]
+    pub cold_collections: &'a [String],
+}
+
 /// When to durability-flush the WAL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SyncMode {
@@ -656,6 +700,120 @@ pub fn read_snapshot(dir: &Path) -> Result<Option<Snapshot>, Error> {
     }
 }
 
+/// Encode a snapshot ref to a writer using the chunked parallel snapshot format (`0x03` + `LIN\x04`).
+pub fn encode_snapshot_ref_to_writer<W: std::io::Write>(
+    writer: &mut W,
+    snap: &SnapshotRef<'_>,
+) -> Result<(), Error> {
+    writer.write_all(&[0x03]).map_err(io_err)?;
+    writer.write_all(&SNAPSHOT_MAGIC).map_err(io_err)?;
+
+    let header = SnapshotHeaderRef {
+        r#gen: snap.r#gen,
+        embed_id: snap.embed_id,
+        next_id: snap.next_id,
+        catalog_hash: snap.catalog_hash,
+        log_offset: snap.log_offset,
+        edges: snap.edges,
+        extra_collections: snap.extra_collections,
+        extra_rels: snap.extra_rels,
+        extra_indexes: snap.extra_indexes,
+        extra_filters: snap.extra_filters,
+        extra_owned: snap.extra_owned,
+        cold_collections: snap.cold_collections,
+    };
+    let header_bytes = rmp_serde::encode::to_vec_named(&header).map_err(io_err)?;
+    writer
+        .write_all(&(header_bytes.len() as u32).to_le_bytes())
+        .map_err(io_err)?;
+    writer.write_all(&header_bytes).map_err(io_err)?;
+
+    const CHUNK_ROWS: usize = 2048;
+    struct ChunkDef<'a> {
+        name: &'a str,
+        rows: &'a [Row],
+    }
+    let mut chunk_defs = Vec::new();
+    for (name, rows) in snap.collections {
+        if rows.is_empty() {
+            chunk_defs.push(ChunkDef {
+                name: name.as_str(),
+                rows: &[],
+            });
+        } else {
+            for chunk in rows.chunks(CHUNK_ROWS) {
+                chunk_defs.push(ChunkDef {
+                    name: name.as_str(),
+                    rows: chunk,
+                });
+            }
+        }
+    }
+
+    let encoded_chunks: Vec<Result<Vec<u8>, Error>> = if chunk_defs.len() > 1 {
+        #[cfg(feature = "parallel")]
+        {
+            use rayon::prelude::*;
+            chunk_defs
+                .par_iter()
+                .map(|c| {
+                    if c.rows.is_empty() {
+                        Ok(Vec::new())
+                    } else {
+                        rmp_serde::encode::to_vec_named(c.rows).map_err(io_err)
+                    }
+                })
+                .collect()
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            std::thread::scope(|s| {
+                let mut handles = Vec::with_capacity(chunk_defs.len());
+                for c in &chunk_defs {
+                    handles.push(s.spawn(move || {
+                        if c.rows.is_empty() {
+                            Ok(Vec::new())
+                        } else {
+                            rmp_serde::encode::to_vec_named(c.rows).map_err(io_err)
+                        }
+                    }));
+                }
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            })
+        }
+    } else {
+        chunk_defs
+            .iter()
+            .map(|c| {
+                if c.rows.is_empty() {
+                    Ok(Vec::new())
+                } else {
+                    rmp_serde::encode::to_vec_named(c.rows).map_err(io_err)
+                }
+            })
+            .collect()
+    };
+
+    writer
+        .write_all(&(chunk_defs.len() as u32).to_le_bytes())
+        .map_err(io_err)?;
+    for (c, encoded) in chunk_defs.iter().zip(encoded_chunks) {
+        let data = encoded?;
+        let name_bytes = c.name.as_bytes();
+        writer
+            .write_all(&(name_bytes.len() as u16).to_le_bytes())
+            .map_err(io_err)?;
+        writer.write_all(name_bytes).map_err(io_err)?;
+        writer
+            .write_all(&(data.len() as u32).to_le_bytes())
+            .map_err(io_err)?;
+        if !data.is_empty() {
+            writer.write_all(&data).map_err(io_err)?;
+        }
+    }
+    Ok(())
+}
+
 /// Write snapshot directly to a file via a temporary file without intermediate full-image in-memory buffering.
 pub fn write_snapshot_ref_to_file(path: &Path, snap: &SnapshotRef<'_>) -> Result<(), Error> {
     let tmp = path.with_extension("bin.tmp");
@@ -672,8 +830,7 @@ pub fn write_snapshot_ref_to_file(path: &Path, snap: &SnapshotRef<'_>) -> Result
             let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
         }
         let mut writer = std::io::BufWriter::with_capacity(128 * 1024, file);
-        writer.write_all(&SNAPSHOT_MAGIC).map_err(io_err)?;
-        rmp_serde::encode::write_named(&mut writer, snap).map_err(io_err)?;
+        encode_snapshot_ref_to_writer(&mut writer, snap)?;
         writer.flush().map_err(io_err)?;
         let file = writer.into_inner().map_err(io_err)?;
         durable_sync(&file)
@@ -809,17 +966,28 @@ pub fn expand_cold_into(dir: &Path, snap: &mut Snapshot) -> Result<(), Error> {
 #[allow(dead_code)]
 pub fn encode_snapshot_ref_bytes(snap: &SnapshotRef<'_>) -> Result<Vec<u8>, Error> {
     let mut out = Vec::with_capacity(64 * 1024);
-    out.extend_from_slice(&SNAPSHOT_MAGIC);
-    rmp_serde::encode::write_named(&mut out, snap).map_err(io_err)?;
+    encode_snapshot_ref_to_writer(&mut out, snap)?;
     Ok(out)
 }
 
 #[allow(dead_code)]
 fn encode_snapshot_bytes(snap: &Snapshot) -> Result<Vec<u8>, Error> {
-    let mut out = Vec::with_capacity(64 * 1024);
-    out.extend_from_slice(&SNAPSHOT_MAGIC);
-    rmp_serde::encode::write_named(&mut out, snap).map_err(io_err)?;
-    Ok(out)
+    let snap_ref = SnapshotRef {
+        r#gen: snap.r#gen,
+        embed_id: &snap.embed_id,
+        next_id: snap.next_id,
+        catalog_hash: &snap.catalog_hash,
+        log_offset: snap.log_offset,
+        collections: &snap.collections,
+        edges: &snap.edges,
+        extra_collections: &snap.extra_collections,
+        extra_rels: &snap.extra_rels,
+        extra_indexes: &snap.extra_indexes,
+        extra_filters: &snap.extra_filters,
+        extra_owned: &snap.extra_owned,
+        cold_collections: &snap.cold_collections,
+    };
+    encode_snapshot_ref_bytes(&snap_ref)
 }
 
 /// Encode snapshot with optional compression (feature-gated)
@@ -899,6 +1067,7 @@ fn decode_snapshot_bytes(bytes: &[u8]) -> Option<Snapshot> {
                     return None;
                 }
             }
+            0x03 => return decode_chunked_snapshot(compressed_data),
             _ => return None,
         }
     }
@@ -908,6 +1077,156 @@ fn decode_snapshot_bytes(bytes: &[u8]) -> Option<Snapshot> {
         return rmp_serde::from_slice(&bytes[4..]).ok();
     }
     serde_json::from_slice(bytes).ok()
+}
+
+fn decode_chunked_snapshot(data: &[u8]) -> Option<Snapshot> {
+    if data.len() < 8 {
+        return None;
+    }
+    let header_len = u32::from_le_bytes(data[0..4].try_into().ok()?) as usize;
+    if data.len() < 4 + header_len + 4 {
+        return None;
+    }
+    let header_bytes = &data[4..4 + header_len];
+    let header: SnapshotHeader = rmp_serde::from_slice(header_bytes).ok()?;
+
+    let mut offset = 4 + header_len;
+    let chunk_count = u32::from_le_bytes(data[offset..offset + 4].try_into().ok()?) as usize;
+    offset += 4;
+
+    struct ChunkSlice<'a> {
+        name: &'a str,
+        data: &'a [u8],
+    }
+    let mut chunk_slices = Vec::with_capacity(chunk_count);
+    for _ in 0..chunk_count {
+        if data.len() < offset + 2 {
+            return None;
+        }
+        let name_len = u16::from_le_bytes(data[offset..offset + 2].try_into().ok()?) as usize;
+        offset += 2;
+        if data.len() < offset + name_len + 4 {
+            return None;
+        }
+        let name = std::str::from_utf8(&data[offset..offset + name_len]).ok()?;
+        offset += name_len;
+        let data_len = u32::from_le_bytes(data[offset..offset + 4].try_into().ok()?) as usize;
+        offset += 4;
+        if data.len() < offset + data_len {
+            return None;
+        }
+        let chunk_data = &data[offset..offset + data_len];
+        offset += data_len;
+        chunk_slices.push(ChunkSlice {
+            name,
+            data: chunk_data,
+        });
+    }
+
+    let decoded_chunks: Vec<Result<(String, Vec<Row>), ()>> = if chunk_slices.len() > 1 {
+        #[cfg(feature = "parallel")]
+        {
+            use rayon::prelude::*;
+            chunk_slices
+                .par_iter()
+                .map(|c| {
+                    if c.data.is_empty() {
+                        Ok((c.name.to_string(), Vec::new()))
+                    } else {
+                        let rows: Vec<Row> = rmp_serde::from_slice(c.data).map_err(|_| ())?;
+                        Ok((c.name.to_string(), rows))
+                    }
+                })
+                .collect()
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            let num_workers = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+                .min(chunk_slices.len());
+            if num_workers > 1 {
+                let chunk_size = (chunk_slices.len() + num_workers - 1) / num_workers;
+                let chunk_blocks: Vec<&[ChunkSlice]> = chunk_slices.chunks(chunk_size).collect();
+                std::thread::scope(|s| {
+                    let mut handles = Vec::with_capacity(chunk_blocks.len());
+                    for block in chunk_blocks {
+                        handles.push(s.spawn(move || {
+                            let mut res = Vec::with_capacity(block.len());
+                            for c in block {
+                                if c.data.is_empty() {
+                                    res.push(Ok((c.name.to_string(), Vec::new())));
+                                } else {
+                                    let r: Result<Vec<Row>, _> = rmp_serde::from_slice(c.data);
+                                    match r {
+                                        Ok(rows) => res.push(Ok((c.name.to_string(), rows))),
+                                        Err(_) => res.push(Err(())),
+                                    }
+                                }
+                            }
+                            res
+                        }));
+                    }
+                    let mut all = Vec::with_capacity(chunk_slices.len());
+                    for h in handles {
+                        if let Ok(block_res) = h.join() {
+                            all.extend(block_res);
+                        } else {
+                            all.push(Err(()));
+                        }
+                    }
+                    all
+                })
+            } else {
+                chunk_slices
+                    .iter()
+                    .map(|c| {
+                        if c.data.is_empty() {
+                            Ok((c.name.to_string(), Vec::new()))
+                        } else {
+                            let rows: Vec<Row> = rmp_serde::from_slice(c.data).map_err(|_| ())?;
+                            Ok((c.name.to_string(), rows))
+                        }
+                    })
+                    .collect()
+            }
+        }
+    } else {
+        chunk_slices
+            .iter()
+            .map(|c| {
+                if c.data.is_empty() {
+                    Ok((c.name.to_string(), Vec::new()))
+                } else {
+                    let rows: Vec<Row> = rmp_serde::from_slice(c.data).map_err(|_| ())?;
+                    Ok((c.name.to_string(), rows))
+                }
+            })
+            .collect()
+    };
+
+    let mut collections: std::collections::BTreeMap<String, Vec<Row>> =
+        std::collections::BTreeMap::new();
+    for res in decoded_chunks {
+        let (name, rows) = res.ok()?;
+        collections.entry(name).or_default().extend(rows);
+    }
+
+    Some(Snapshot {
+        r#gen: header.r#gen,
+        embed_id: header.embed_id,
+        next_id: header.next_id,
+        catalog_hash: header.catalog_hash,
+        log_offset: header.log_offset,
+        collections,
+        edges: header.edges,
+        extra_collections: header.extra_collections,
+        extra_rels: header.extra_rels,
+        extra_indexes: header.extra_indexes,
+        extra_filters: header.extra_filters,
+        extra_owned: header.extra_owned,
+        cold_collections: header.cold_collections,
+    })
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), Error> {
@@ -4799,5 +5118,79 @@ mod neon_sparse_writer_tests {
             append_sparse_rows_serial(&rows, &mut actual).unwrap();
             assert_eq!(scalar, actual);
         }
+    }
+
+    #[test]
+    fn chunked_parallel_snapshot_roundtrip_and_legacy_compatibility() {
+        use std::collections::BTreeMap;
+        let mut collections = BTreeMap::new();
+        // Collection 1: 5000 rows (spans 3 chunks: 2048, 2048, 904)
+        let mut docs = Vec::new();
+        for i in 0..5000 {
+            let mut r = crate::store::Row::new();
+            r.insert("id".into(), crate::store::Cell::text_arc(format!("doc-{}", i)));
+            r.insert("num".into(), crate::store::Cell::Int(i as i64));
+            docs.push(r);
+        }
+        collections.insert("docs".to_string(), docs);
+
+        // Collection 2: 10 rows
+        let mut users = Vec::new();
+        for i in 0..10 {
+            let mut r = crate::store::Row::new();
+            r.insert("id".into(), crate::store::Cell::text_arc(format!("u-{}", i)));
+            users.push(r);
+        }
+        collections.insert("users".to_string(), users);
+
+        // Collection 3: empty
+        collections.insert("empty".to_string(), Vec::new());
+
+        let snap = Snapshot {
+            r#gen: 42,
+            embed_id: "test-embed".to_string(),
+            next_id: 1000,
+            catalog_hash: "cat-hash-123".to_string(),
+            log_offset: 9999,
+            collections: collections.clone(),
+            edges: Vec::new(),
+            extra_collections: BTreeMap::new(),
+            extra_rels: BTreeMap::new(),
+            extra_indexes: BTreeMap::new(),
+            extra_filters: BTreeMap::new(),
+            extra_owned: BTreeMap::new(),
+            cold_collections: Vec::new(),
+        };
+
+        // 1. Encode with new chunked format
+        let bytes = encode_snapshot_bytes(&snap).expect("encode chunked");
+        assert!(bytes.len() >= 5);
+        assert_eq!(bytes[0], 0x03);
+        assert_eq!(&bytes[1..5], &SNAPSHOT_MAGIC);
+
+        // 2. Decode with new reader
+        let decoded = decode_snapshot_bytes(&bytes).expect("decode chunked");
+        assert_eq!(decoded.r#gen, 42);
+        assert_eq!(decoded.embed_id, "test-embed");
+        assert_eq!(decoded.next_id, 1000);
+        assert_eq!(decoded.catalog_hash, "cat-hash-123");
+        assert_eq!(decoded.log_offset, 9999);
+        assert_eq!(decoded.collections.len(), 3);
+        assert_eq!(decoded.collections["docs"].len(), 5000);
+        assert_eq!(decoded.collections["users"].len(), 10);
+        assert_eq!(decoded.collections["empty"].len(), 0);
+        assert_eq!(
+            decoded.collections["docs"][42].get("id"),
+            collections["docs"][42].get("id")
+        );
+
+        // 3. Test legacy compatibility: encode old monolithic msgpack directly with SNAPSHOT_MAGIC
+        let mut legacy_bytes = Vec::new();
+        legacy_bytes.extend_from_slice(&SNAPSHOT_MAGIC);
+        rmp_serde::encode::write_named(&mut legacy_bytes, &snap).expect("legacy encode");
+        let decoded_legacy = decode_snapshot_bytes(&legacy_bytes).expect("decode legacy");
+        assert_eq!(decoded_legacy.r#gen, 42);
+        assert_eq!(decoded_legacy.collections["docs"].len(), 5000);
+        assert_eq!(decoded_legacy.collections["users"].len(), 10);
     }
 }
