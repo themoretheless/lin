@@ -294,6 +294,50 @@ fn test_aggregate_state_bytes_limit_lin_1768() {
 }
 
 #[test]
+fn test_spill_to_disk_aggregation_under_tight_quota() {
+    let mut db = Db::empty()
+        .with_quotas(Quotas {
+            max_aggregate_bytes: 100,
+            ..Default::default()
+        })
+        .with_spill(true);
+
+    for u in 0..5 {
+        db.run(&format!(
+            r#"insert users {{ id: "u_{u}", email: "u_{u}@test.com" }}"#
+        ))
+        .unwrap();
+    }
+
+    for i in 0..50 {
+        db.run(&format!(
+            r#"insert orders {{ id: "o{i}", user_id: "u_{}", total: {} }}"#,
+            i % 5,
+            (i * 10) as f64
+        ))
+        .unwrap();
+    }
+
+    let res = db.run("orders | count by user_id").unwrap();
+    assert_eq!(res.rows.len(), 5);
+    for row in &res.rows {
+        assert_eq!(row.get("hits").unwrap().as_i64(), Some(10));
+    }
+
+    let res_sum = db.run("orders | sum total by user_id").unwrap();
+    assert_eq!(res_sum.rows.len(), 5);
+
+    let res_min = db.run("orders | min total by user_id").unwrap();
+    assert_eq!(res_min.rows.len(), 5);
+
+    let res_max = db.run("orders | max total by user_id").unwrap();
+    assert_eq!(res_max.rows.len(), 5);
+
+    let res_avg = db.run("orders | avg total by user_id").unwrap();
+    assert_eq!(res_avg.rows.len(), 5);
+}
+
+#[test]
 fn test_data_directory_traversal_policy_lin_1771() {
     let traversal_path = "data/../../etc/lin_db";
     let err = match Db::open(traversal_path) {

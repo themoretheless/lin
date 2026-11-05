@@ -899,6 +899,7 @@ pub struct Quotas {
     pub max_aggregate_bytes: usize,
     pub max_journal_bytes: usize,
     pub max_tx_mutations: usize,
+    pub spill_enabled: bool,
 }
 
 impl Default for Quotas {
@@ -918,6 +919,7 @@ impl Default for Quotas {
             max_aggregate_bytes: 64 * 1024 * 1024,
             max_journal_bytes: 128 * 1024 * 1024,
             max_tx_mutations: 100_000,
+            spill_enabled: false,
         }
     }
 }
@@ -1028,6 +1030,12 @@ impl Db {
 
     pub fn with_quotas(mut self, quotas: Quotas) -> Self {
         self.quotas = quotas;
+        self
+    }
+
+    /// Enable or disable spill-to-disk for out-of-core aggregations when memory quota is exceeded.
+    pub fn with_spill(mut self, enabled: bool) -> Self {
+        self.quotas.spill_enabled = enabled;
         self
     }
 
@@ -2915,7 +2923,7 @@ impl Db {
                         continue;
                     }
                     rows = match by {
-                        Some(by) => agg_count(&rows, by, self.quotas.max_aggregate_bytes)?,
+                        Some(by) => agg_count(&rows, by, self.quotas.max_aggregate_bytes, self.quotas.spill_enabled)?,
                         None => vec![hits_row(rows.len() as i64)],
                     };
                     primary = String::new();
@@ -2929,25 +2937,25 @@ impl Db {
                         primary = String::new();
                         continue;
                     }
-                    rows = agg_sum(&rows, field, by.as_ref(), self.quotas.max_aggregate_bytes)?;
+                    rows = agg_sum(&rows, field, by.as_ref(), self.quotas.max_aggregate_bytes, self.quotas.spill_enabled)?;
                     primary = String::new();
                 }
                 Step::Min { field, by } => {
                     implicit_take = false;
                     saw_agg = true;
-                    rows = agg_min(&rows, field, by.as_ref(), self.quotas.max_aggregate_bytes)?;
+                    rows = agg_min(&rows, field, by.as_ref(), self.quotas.max_aggregate_bytes, self.quotas.spill_enabled)?;
                     primary = String::new();
                 }
                 Step::Max { field, by } => {
                     implicit_take = false;
                     saw_agg = true;
-                    rows = agg_max(&rows, field, by.as_ref(), self.quotas.max_aggregate_bytes)?;
+                    rows = agg_max(&rows, field, by.as_ref(), self.quotas.max_aggregate_bytes, self.quotas.spill_enabled)?;
                     primary = String::new();
                 }
                 Step::Avg { field, by } => {
                     implicit_take = false;
                     saw_agg = true;
-                    rows = agg_avg(&rows, field, by.as_ref(), self.quotas.max_aggregate_bytes)?;
+                    rows = agg_avg(&rows, field, by.as_ref(), self.quotas.max_aggregate_bytes, self.quotas.spill_enabled)?;
                     primary = String::new();
                 }
                 Step::Sort { field, desc } => {
@@ -3523,6 +3531,14 @@ impl Db {
                             };
                             state_bytes = state_bytes.saturating_add(key_size + 64);
                             if state_bytes > self.quotas.max_aggregate_bytes {
+                                if self.quotas.spill_enabled {
+                                    let filtered: Vec<Row> = col
+                                        .iter()
+                                        .filter(|r| filter.is_none_or(|p| eval_pred(p, r, now)))
+                                        .cloned()
+                                        .collect();
+                                    return spill_agg_count(&filtered, by);
+                                }
                                 return Err(Error::runtime(format!(
                                     "aggregate state bytes {state_bytes} exceeds max_aggregate_bytes quota {}",
                                     self.quotas.max_aggregate_bytes
@@ -3560,6 +3576,14 @@ impl Db {
                             };
                             state_bytes = state_bytes.saturating_add(key_size + 64);
                             if state_bytes > self.quotas.max_aggregate_bytes {
+                                if self.quotas.spill_enabled {
+                                    let filtered: Vec<Row> = col
+                                        .iter()
+                                        .filter(|r| filter.is_none_or(|p| eval_pred(p, r, now)))
+                                        .cloned()
+                                        .collect();
+                                    return spill_agg_sum(&filtered, field, Some(by));
+                                }
                                 return Err(Error::runtime(format!(
                                     "aggregate state bytes {state_bytes} exceeds max_aggregate_bytes quota {}",
                                     self.quotas.max_aggregate_bytes
@@ -3617,6 +3641,14 @@ impl Db {
                             };
                             state_bytes = state_bytes.saturating_add(key_size + 64);
                             if state_bytes > self.quotas.max_aggregate_bytes {
+                                if self.quotas.spill_enabled {
+                                    let filtered: Vec<Row> = col
+                                        .iter()
+                                        .filter(|r| filter.is_none_or(|p| eval_pred(p, r, now)))
+                                        .cloned()
+                                        .collect();
+                                    return spill_agg_avg(&filtered, field, Some(by));
+                                }
                                 return Err(Error::runtime(format!(
                                     "aggregate state bytes {state_bytes} exceeds max_aggregate_bytes quota {}",
                                     self.quotas.max_aggregate_bytes
@@ -3684,6 +3716,14 @@ impl Db {
                             };
                             state_bytes = state_bytes.saturating_add(key_size + 64);
                             if state_bytes > self.quotas.max_aggregate_bytes {
+                                if self.quotas.spill_enabled {
+                                    let filtered: Vec<Row> = col
+                                        .iter()
+                                        .filter(|r| filter.is_none_or(|p| eval_pred(p, r, now)))
+                                        .cloned()
+                                        .collect();
+                                    return spill_agg_min_max(&filtered, field, Some(by), false);
+                                }
                                 return Err(Error::runtime(format!(
                                     "aggregate state bytes {state_bytes} exceeds max_aggregate_bytes quota {}",
                                     self.quotas.max_aggregate_bytes
@@ -3755,6 +3795,14 @@ impl Db {
                             };
                             state_bytes = state_bytes.saturating_add(key_size + 64);
                             if state_bytes > self.quotas.max_aggregate_bytes {
+                                if self.quotas.spill_enabled {
+                                    let filtered: Vec<Row> = col
+                                        .iter()
+                                        .filter(|r| filter.is_none_or(|p| eval_pred(p, r, now)))
+                                        .cloned()
+                                        .collect();
+                                    return spill_agg_min_max(&filtered, field, Some(by), true);
+                                }
                                 return Err(Error::runtime(format!(
                                     "aggregate state bytes {state_bytes} exceeds max_aggregate_bytes quota {}",
                                     self.quotas.max_aggregate_bytes
@@ -8136,7 +8184,288 @@ pub(crate) fn eval_window(
     result_rows
 }
 
-fn agg_count(rows: &[Row], by: &Field, max_bytes: usize) -> Result<Vec<Row>, Error> {
+static SPILL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn cell_hash(cell: &Cell) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = rustc_hash::FxHasher::default();
+    cell.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn spill_agg_count(rows: &[Row], by: &Field) -> Result<Vec<Row>, Error> {
+    let k = by.as_str();
+    let num_partitions = 16usize;
+    let temp_dir = std::env::temp_dir();
+    let run_id = SPILL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut partition_paths = Vec::with_capacity(num_partitions);
+    let mut partition_files = Vec::with_capacity(num_partitions);
+
+    for p in 0..num_partitions {
+        let path = temp_dir.join(format!("lin_spill_count_{}_{}.bin", run_id, p));
+        let file = std::fs::File::create(&path).map_err(|e| Error::runtime(e.to_string()))?;
+        partition_paths.push(path);
+        partition_files.push(std::io::BufWriter::new(file));
+    }
+
+    for r in rows {
+        let cell = r.get(&k).map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
+        let part_idx = (cell_hash(&cell) as usize) % num_partitions;
+        rmp_serde::encode::write_named(&mut partition_files[part_idx], &cell)
+            .map_err(|e| Error::runtime(e.to_string()))?;
+    }
+
+    for mut writer in partition_files {
+        use std::io::Write;
+        writer.flush().map_err(|e| Error::runtime(e.to_string()))?;
+    }
+
+    let mut final_map: FxHashMap<Cell, i64> = FxHashMap::default();
+    for path in partition_paths {
+        if let Ok(file) = std::fs::File::open(&path) {
+            let mut reader = std::io::BufReader::new(file);
+            while let Ok(cell) = rmp_serde::from_read::<_, Cell>(&mut reader) {
+                *final_map.entry(cell).or_insert(0) += 1;
+            }
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    let mut entries: Vec<(Cell, i64)> = final_map.into_iter().collect();
+    entries.sort_unstable_by(|(a, _), (b, _)| cmp_sort(a, b));
+    Ok(entries
+        .into_iter()
+        .map(|(cell, n)| {
+            let mut row = crate::store::acquire_row();
+            row.insert(k.to_string(), cell);
+            row.insert("hits".into(), Cell::Int(n));
+            row
+        })
+        .collect())
+}
+
+fn spill_agg_sum(rows: &[Row], field: &Field, by: Option<&Field>) -> Result<Vec<Row>, Error> {
+    let fk = field.as_str();
+    let num_partitions = 16usize;
+    let temp_dir = std::env::temp_dir();
+    let run_id = SPILL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut partition_paths = Vec::with_capacity(num_partitions);
+    let mut partition_files = Vec::with_capacity(num_partitions);
+
+    for p in 0..num_partitions {
+        let path = temp_dir.join(format!("lin_spill_sum_{}_{}.bin", run_id, p));
+        let file = std::fs::File::create(&path).map_err(|e| Error::runtime(e.to_string()))?;
+        partition_paths.push(path);
+        partition_files.push(std::io::BufWriter::new(file));
+    }
+
+    let bk = by.map(|b| b.as_str());
+
+    for r in rows {
+        let cell = bk
+            .as_ref()
+            .and_then(|k| r.get(k).map(Cell::clone_for_borrow))
+            .unwrap_or(Cell::Null);
+        let n = r.get(&fk).and_then(Cell::as_f64).unwrap_or(0.0);
+        let part_idx = (cell_hash(&cell) as usize) % num_partitions;
+        rmp_serde::encode::write_named(&mut partition_files[part_idx], &(cell, n))
+            .map_err(|e| Error::runtime(e.to_string()))?;
+    }
+
+    for mut writer in partition_files {
+        use std::io::Write;
+        writer.flush().map_err(|e| Error::runtime(e.to_string()))?;
+    }
+
+    let mut final_map: FxHashMap<Cell, f64> = FxHashMap::default();
+    for path in partition_paths {
+        if let Ok(file) = std::fs::File::open(&path) {
+            let mut reader = std::io::BufReader::new(file);
+            while let Ok((cell, n)) = rmp_serde::from_read::<_, (Cell, f64)>(&mut reader) {
+                *final_map.entry(cell).or_insert(0.0) += n;
+            }
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    let mut entries: Vec<(Cell, f64)> = final_map.into_iter().collect();
+    entries.sort_unstable_by(|(a, _), (b, _)| cmp_sort(a, b));
+    let group_col = bk.as_deref().unwrap_or("");
+    Ok(entries
+        .into_iter()
+        .map(|(cell, n)| {
+            let mut row = crate::store::acquire_row();
+            if by.is_some() {
+                row.insert(group_col.to_string(), cell);
+            }
+            row.insert(fk.clone(), Cell::Float(n));
+            row
+        })
+        .collect())
+}
+
+fn spill_agg_min_max(
+    rows: &[Row],
+    field: &Field,
+    by: Option<&Field>,
+    is_max: bool,
+) -> Result<Vec<Row>, Error> {
+    let fk = field.as_str();
+    let num_partitions = 16usize;
+    let temp_dir = std::env::temp_dir();
+    let run_id = SPILL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut partition_paths = Vec::with_capacity(num_partitions);
+    let mut partition_files = Vec::with_capacity(num_partitions);
+
+    for p in 0..num_partitions {
+        let path = temp_dir.join(format!("lin_spill_minmax_{}_{}.bin", run_id, p));
+        let file = std::fs::File::create(&path).map_err(|e| Error::runtime(e.to_string()))?;
+        partition_paths.push(path);
+        partition_files.push(std::io::BufWriter::new(file));
+    }
+
+    let bk = by.map(|b| b.as_str());
+
+    for r in rows {
+        let cell = bk
+            .as_ref()
+            .and_then(|k| r.get(k).map(Cell::clone_for_borrow))
+            .unwrap_or(Cell::Null);
+        let f_val = r
+            .get(&fk)
+            .filter(|c| !matches!(c, Cell::Null))
+            .map(Cell::clone_for_borrow);
+        let part_idx = (cell_hash(&cell) as usize) % num_partitions;
+        rmp_serde::encode::write_named(&mut partition_files[part_idx], &(cell, f_val))
+            .map_err(|e| Error::runtime(e.to_string()))?;
+    }
+
+    for mut writer in partition_files {
+        use std::io::Write;
+        writer.flush().map_err(|e| Error::runtime(e.to_string()))?;
+    }
+
+    let mut final_map: FxHashMap<Cell, Option<Cell>> = FxHashMap::default();
+    for path in partition_paths {
+        if let Ok(file) = std::fs::File::open(&path) {
+            let mut reader = std::io::BufReader::new(file);
+            while let Ok((cell, val)) =
+                rmp_serde::from_read::<_, (Cell, Option<Cell>)>(&mut reader)
+            {
+                if let Some(c) = val {
+                    let entry = final_map.entry(cell).or_insert(None);
+                    *entry = Some(match entry.take() {
+                        None => c,
+                        Some(prev) => {
+                            let is_better = if is_max {
+                                cmp_sort(&c, &prev).is_gt()
+                            } else {
+                                cmp_sort(&c, &prev).is_lt()
+                            };
+                            if is_better {
+                                c
+                            } else {
+                                prev
+                            }
+                        }
+                    });
+                } else {
+                    final_map.entry(cell).or_insert(None);
+                }
+            }
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    let mut entries: Vec<(Cell, Option<Cell>)> = final_map.into_iter().collect();
+    entries.sort_unstable_by(|(a, _), (b, _)| cmp_sort(a, b));
+    let group_col = bk.as_deref().unwrap_or("");
+    Ok(entries
+        .into_iter()
+        .map(|(gcell, val)| {
+            let mut row = crate::store::acquire_row();
+            if by.is_some() {
+                row.insert(group_col.to_string(), gcell);
+            }
+            row.insert(fk.clone(), val.unwrap_or(Cell::Null));
+            row
+        })
+        .collect())
+}
+
+fn spill_agg_avg(rows: &[Row], field: &Field, by: Option<&Field>) -> Result<Vec<Row>, Error> {
+    let fk = field.as_str();
+    let num_partitions = 16usize;
+    let temp_dir = std::env::temp_dir();
+    let run_id = SPILL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut partition_paths = Vec::with_capacity(num_partitions);
+    let mut partition_files = Vec::with_capacity(num_partitions);
+
+    for p in 0..num_partitions {
+        let path = temp_dir.join(format!("lin_spill_avg_{}_{}.bin", run_id, p));
+        let file = std::fs::File::create(&path).map_err(|e| Error::runtime(e.to_string()))?;
+        partition_paths.push(path);
+        partition_files.push(std::io::BufWriter::new(file));
+    }
+
+    let bk = by.map(|b| b.as_str());
+
+    for r in rows {
+        let cell = bk
+            .as_ref()
+            .and_then(|k| r.get(k).map(Cell::clone_for_borrow))
+            .unwrap_or(Cell::Null);
+        let v_opt = r.get(&fk).and_then(Cell::as_f64);
+        let part_idx = (cell_hash(&cell) as usize) % num_partitions;
+        rmp_serde::encode::write_named(&mut partition_files[part_idx], &(cell, v_opt))
+            .map_err(|e| Error::runtime(e.to_string()))?;
+    }
+
+    for mut writer in partition_files {
+        use std::io::Write;
+        writer.flush().map_err(|e| Error::runtime(e.to_string()))?;
+    }
+
+    let mut final_map: FxHashMap<Cell, (f64, usize)> = FxHashMap::default();
+    for path in partition_paths {
+        if let Ok(file) = std::fs::File::open(&path) {
+            let mut reader = std::io::BufReader::new(file);
+            while let Ok((cell, v_opt)) =
+                rmp_serde::from_read::<_, (Cell, Option<f64>)>(&mut reader)
+            {
+                let entry = final_map.entry(cell).or_insert((0.0, 0));
+                if let Some(v) = v_opt {
+                    entry.0 += v;
+                    entry.1 += 1;
+                }
+            }
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    let mut entries: Vec<(Cell, (f64, usize))> = final_map.into_iter().collect();
+    entries.sort_unstable_by(|(a, _), (b, _)| cmp_sort(a, b));
+    let group_col = bk.as_deref().unwrap_or("");
+    Ok(entries
+        .into_iter()
+        .map(|(cell, (sum, count))| {
+            let mut row = crate::store::acquire_row();
+            if by.is_some() {
+                row.insert(group_col.to_string(), cell);
+            }
+            let avg = if count > 0 { sum / count as f64 } else { 0.0 };
+            row.insert(fk.clone(), Cell::Float(avg));
+            row
+        })
+        .collect())
+}
+
+fn agg_count(
+    rows: &[Row],
+    by: &Field,
+    max_bytes: usize,
+    spill: bool,
+) -> Result<Vec<Row>, Error> {
     let k = by.as_str();
     let mut map: FxHashMap<Cell, i64> = FxHashMap::default();
     let mut state_bytes = 0usize;
@@ -8149,6 +8478,9 @@ fn agg_count(rows: &[Row], by: &Field, max_bytes: usize) -> Result<Vec<Row>, Err
             };
             state_bytes = state_bytes.saturating_add(key_size + 64);
             if state_bytes > max_bytes {
+                if spill {
+                    return spill_agg_count(rows, by);
+                }
                 return Err(Error::runtime(format!(
                     "aggregate state bytes {state_bytes} exceeds max_aggregate_bytes quota {max_bytes}"
                 )));
@@ -8229,6 +8561,7 @@ fn agg_sum(
     field: &Field,
     by: Option<&Field>,
     max_bytes: usize,
+    spill: bool,
 ) -> Result<Vec<Row>, Error> {
     let fk = field.as_str();
     let Some(by) = by else {
@@ -8252,6 +8585,9 @@ fn agg_sum(
             };
             state_bytes = state_bytes.saturating_add(key_size + 64);
             if state_bytes > max_bytes {
+                if spill {
+                    return spill_agg_sum(rows, field, Some(by));
+                }
                 return Err(Error::runtime(format!(
                     "aggregate state bytes {state_bytes} exceeds max_aggregate_bytes quota {max_bytes}"
                 )));
@@ -8278,6 +8614,7 @@ fn agg_min(
     field: &Field,
     by: Option<&Field>,
     max_bytes: usize,
+    spill: bool,
 ) -> Result<Vec<Row>, Error> {
     let fk = field.as_str();
     let Some(by) = by else {
@@ -8312,6 +8649,9 @@ fn agg_min(
             };
             state_bytes = state_bytes.saturating_add(key_size + 64);
             if state_bytes > max_bytes {
+                if spill {
+                    return spill_agg_min_max(rows, field, Some(by), false);
+                }
                 return Err(Error::runtime(format!(
                     "aggregate state bytes {state_bytes} exceeds max_aggregate_bytes quota {max_bytes}"
                 )));
@@ -8350,6 +8690,7 @@ fn agg_max(
     field: &Field,
     by: Option<&Field>,
     max_bytes: usize,
+    spill: bool,
 ) -> Result<Vec<Row>, Error> {
     let fk = field.as_str();
     let Some(by) = by else {
@@ -8384,6 +8725,9 @@ fn agg_max(
             };
             state_bytes = state_bytes.saturating_add(key_size + 64);
             if state_bytes > max_bytes {
+                if spill {
+                    return spill_agg_min_max(rows, field, Some(by), true);
+                }
                 return Err(Error::runtime(format!(
                     "aggregate state bytes {state_bytes} exceeds max_aggregate_bytes quota {max_bytes}"
                 )));
@@ -8422,6 +8766,7 @@ fn agg_avg(
     field: &Field,
     by: Option<&Field>,
     max_bytes: usize,
+    spill: bool,
 ) -> Result<Vec<Row>, Error> {
     let fk = field.as_str();
     let Some(by) = by else {
@@ -8454,6 +8799,9 @@ fn agg_avg(
             };
             state_bytes = state_bytes.saturating_add(key_size + 64);
             if state_bytes > max_bytes {
+                if spill {
+                    return spill_agg_avg(rows, field, Some(by));
+                }
                 return Err(Error::runtime(format!(
                     "aggregate state bytes {state_bytes} exceeds max_aggregate_bytes quota {max_bytes}"
                 )));
