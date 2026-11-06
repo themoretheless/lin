@@ -668,12 +668,12 @@ impl LiveIndex {
                 .is_some_and(|cell| matches!(cell, IndexPart::Bool(_)))
         });
 
-        if let Some(old) = self.reverse.insert(idx, key.clone())
-            && let Some(vec) = self.forward.get_mut(&old)
-        {
-            vec.remove(idx);
-            if vec.count() == 0 {
-                self.forward.remove(&old);
+        if let Some(old) = self.reverse.remove(&idx) {
+            if let Some(vec) = self.forward.get_mut(&old) {
+                vec.remove(idx);
+                if vec.count() == 0 {
+                    self.forward.remove(&old);
+                }
             }
         }
 
@@ -695,11 +695,13 @@ impl LiveIndex {
 
     pub fn remove_at(&mut self, idx: usize) {
         if let Some(key) = self.reverse.remove(&idx) {
-            if let std::collections::btree_map::Entry::Occupied(mut entry) = self.forward.entry(key) {
-                entry.get_mut().remove(idx);
-                if entry.get().is_empty() {
-                    entry.remove();
-                }
+            let mut empty = false;
+            if let Some(vec) = self.forward.get_mut(&key) {
+                vec.remove(idx);
+                empty = vec.is_empty();
+            }
+            if empty {
+                self.forward.remove(&key);
             }
         }
     }

@@ -7,9 +7,11 @@
 //! updates postings incrementally.
 
 use rustc_hash::FxHashMap;
+use smallvec::{SmallVec, smallvec};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::error::Error;
 use crate::persist::io_err;
@@ -35,9 +37,9 @@ const FOLD_AFTER: usize = 256;
 #[derive(Debug, Clone, Default)]
 pub struct FtsIndex {
     pub fields: Vec<String>,
-    postings: FxHashMap<String, Vec<usize>>,
-    dels: FxHashMap<String, Vec<usize>>,
-    adds: FxHashMap<String, Vec<usize>>,
+    postings: FxHashMap<Arc<str>, Vec<usize>>,
+    dels: FxHashMap<Arc<str>, SmallVec<[usize; 2]>>,
+    adds: FxHashMap<Arc<str>, SmallVec<[usize; 2]>>,
 }
 
 impl FtsIndex {
@@ -124,7 +126,7 @@ impl FtsIndex {
     /// (it folded away in between), so the add still has to be registered.
     fn note_add(&mut self, tok: &str, row_idx: usize) {
         if cancel(&mut self.dels, tok, row_idx) {
-            push_pending(&mut self.adds, tok, row_idx);
+            push_pending(&mut self.adds, &self.postings, tok, row_idx);
             self.fold_if_pending(tok);
             return;
         }
@@ -140,11 +142,11 @@ impl FtsIndex {
                 }
             }
             None => {
-                self.postings.insert(tok.to_owned(), vec![row_idx]);
+                self.postings.insert(Arc::from(tok), vec![row_idx]);
                 return;
             }
         }
-        push_pending(&mut self.adds, tok, row_idx);
+        push_pending(&mut self.adds, &self.postings, tok, row_idx);
         self.fold_if_pending(tok);
     }
 
@@ -159,13 +161,13 @@ impl FtsIndex {
         // An addition can overlap the base after a removal was cancelled.
         // Cancelling it alone would expose the old base posting again.
         cancel(&mut self.adds, tok, row_idx);
-        push_pending(&mut self.dels, tok, row_idx);
+        push_pending(&mut self.dels, &self.postings, tok, row_idx);
         self.fold_if_pending(tok);
     }
 
     fn fold_if_pending(&mut self, tok: &str) {
         let pending =
-            self.dels.get(tok).map_or(0, Vec::len) + self.adds.get(tok).map_or(0, Vec::len);
+            self.dels.get(tok).map_or(0, |v| v.len()) + self.adds.get(tok).map_or(0, |v| v.len());
         if pending > FOLD_AFTER {
             self.fold_term(tok);
         }
@@ -184,21 +186,21 @@ impl FtsIndex {
         if dels.is_empty() && adds.is_empty() {
             return;
         }
-        let Some(base) = self.postings.remove(tok) else {
+        let Some((key, base)) = self.postings.remove_entry(tok) else {
             if !adds.is_empty() {
-                self.postings.insert(tok.to_owned(), adds);
+                self.postings.insert(Arc::from(tok), adds.into_vec());
             }
             return;
         };
         let list = merge_edits(&base, &dels, &adds);
         if !list.is_empty() {
-            self.postings.insert(tok.to_owned(), list);
+            self.postings.insert(key, list);
         }
     }
 
     /// Fold every term; call before serializing so the file format stays base-only.
     pub fn fold_all(&mut self) {
-        let terms: Vec<String> = self.dels.keys().chain(self.adds.keys()).cloned().collect();
+        let terms: Vec<Arc<str>> = self.dels.keys().chain(self.adds.keys()).cloned().collect();
         for tok in terms {
             self.fold_term(&tok);
         }
@@ -206,8 +208,8 @@ impl FtsIndex {
 
     /// Positions where `tok` currently matches, borrowed when no pending edits exist.
     pub fn matches_cow<'a>(&'a self, tok: &str) -> Option<std::borrow::Cow<'a, [usize]>> {
-        let dels = self.dels.get(tok).map(Vec::as_slice).unwrap_or(&[]);
-        let adds = self.adds.get(tok).map(Vec::as_slice).unwrap_or(&[]);
+        let dels = self.dels.get(tok).map(|v| v.as_slice()).unwrap_or(&[]);
+        let adds = self.adds.get(tok).map(|v| v.as_slice()).unwrap_or(&[]);
         if dels.is_empty() && adds.is_empty() {
             return self
                 .postings
@@ -286,7 +288,7 @@ impl FtsIndex {
                     let mut matched_terms: Vec<&str> = Vec::new();
                     for k in self.postings.keys().chain(self.adds.keys()) {
                         if k.starts_with(prefix) {
-                            matched_terms.push(k.as_str());
+                            matched_terms.push(k.as_ref());
                         }
                     }
                     matched_terms.sort_unstable();
@@ -335,7 +337,7 @@ impl FtsIndex {
     }
 
     pub fn encode(&self, generation: u64, nrows: u64) -> Vec<u8> {
-        let mut terms: Vec<(&String, &Vec<usize>)> = self.postings.iter().collect();
+        let mut terms: Vec<(&Arc<str>, &Vec<usize>)> = self.postings.iter().collect();
         terms.sort_by(|a, b| a.0.cmp(b.0));
         let mut out = Vec::with_capacity(64 + terms.len() * 16);
         out.extend_from_slice(&FTS_MAGIC);
@@ -379,7 +381,7 @@ impl FtsIndex {
         let nterms = read_u32(bytes, &mut i)? as usize;
         let mut postings = FxHashMap::with_capacity_and_hasher(nterms, Default::default());
         for _ in 0..nterms {
-            let tok = read_str(bytes, &mut i)?;
+            let tok = Arc::from(read_str(bytes, &mut i)?);
             let n = read_u32(bytes, &mut i)? as usize;
             let mut list = Vec::with_capacity(n);
             for _ in 0..n {
@@ -550,19 +552,29 @@ fn union_sorted(a: &[usize], b: &[usize]) -> Vec<usize> {
 }
 
 /// Insert into a sorted, unique pending list; merges rely on this invariant.
-fn push_pending(map: &mut FxHashMap<String, Vec<usize>>, tok: &str, row_idx: usize) {
+fn push_pending(
+    map: &mut FxHashMap<Arc<str>, SmallVec<[usize; 2]>>,
+    postings: &FxHashMap<Arc<str>, Vec<usize>>,
+    tok: &str,
+    row_idx: usize,
+) {
     if let Some(list) = map.get_mut(tok) {
         if let Err(pos) = list.binary_search(&row_idx) {
             list.insert(pos, row_idx);
         }
     } else {
-        map.insert(tok.to_owned(), vec![row_idx]);
+        let key = if let Some((k, _)) = postings.get_key_value(tok) {
+            Arc::clone(k)
+        } else {
+            Arc::from(tok)
+        };
+        map.insert(key, smallvec![row_idx]);
     }
 }
 
 /// Drop `row_idx` from a term's pending list, reporting whether it was there.
 /// A cancelled entry means the base list already holds the right answer.
-fn cancel(map: &mut FxHashMap<String, Vec<usize>>, tok: &str, row_idx: usize) -> bool {
+fn cancel(map: &mut FxHashMap<Arc<str>, SmallVec<[usize; 2]>>, tok: &str, row_idx: usize) -> bool {
     let Some(list) = map.get_mut(tok) else {
         return false;
     };
@@ -579,7 +591,7 @@ fn cancel(map: &mut FxHashMap<String, Vec<usize>>, tok: &str, row_idx: usize) ->
 
 /// Add `row_idx` to a token's sorted list, allocating a posting list only when
 /// the token is new.
-fn add_posting(postings: &mut FxHashMap<String, Vec<usize>>, tok: &str, row_idx: usize) {
+fn add_posting(postings: &mut FxHashMap<Arc<str>, Vec<usize>>, tok: &str, row_idx: usize) {
     if let Some(list) = postings.get_mut(tok) {
         if let Some(&last) = list.last() {
             if last == row_idx {
@@ -594,7 +606,7 @@ fn add_posting(postings: &mut FxHashMap<String, Vec<usize>>, tok: &str, row_idx:
             list.insert(pos, row_idx);
         }
     } else {
-        postings.insert(tok.to_owned(), vec![row_idx]);
+        postings.insert(Arc::from(tok), vec![row_idx]);
     }
 }
 

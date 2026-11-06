@@ -601,6 +601,24 @@ pub(crate) struct PointGetPlan {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) struct PointDeletePlan {
+    pub collection: String,
+    pub field: String,
+    pub key: String,
+    pub cas: Option<String>,
+    pub append_only: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PointUpdatePlan {
+    pub collection: String,
+    pub field: String,
+    pub key: String,
+    pub cas: Option<String>,
+    pub record: Record,
+}
+
+#[derive(Debug, Clone)]
 pub(crate) enum AggKind {
     Count { by: Option<Field> },
     Sum { field: Field, by: Option<Field> },
@@ -630,6 +648,8 @@ pub struct Prepared {
     schema: bool,
     pub(crate) point_get: Option<PointGetPlan>,
     pub(crate) agg_plan: Option<AggPlan>,
+    pub(crate) point_delete: Option<PointDeletePlan>,
+    pub(crate) point_update: Option<PointUpdatePlan>,
 }
 
 impl Prepared {
@@ -1560,6 +1580,16 @@ impl Db {
         } else {
             None
         };
+        let point_delete = if stmts.len() == 1 {
+            Self::try_extract_point_delete(&stmts[0], &self.catalog)
+        } else {
+            None
+        };
+        let point_update = if stmts.len() == 1 {
+            Self::try_extract_point_update(&stmts[0])
+        } else {
+            None
+        };
         Ok(Prepared {
             src: String::new(),
             stmts,
@@ -1569,6 +1599,8 @@ impl Db {
             schema,
             point_get,
             agg_plan,
+            point_delete,
+            point_update,
         })
     }
 
@@ -1650,6 +1682,134 @@ impl Db {
                 done: Done {
                     r#gen: self.store.r#gen,
                     n,
+                },
+                message: None,
+                ms: 0.0,
+            });
+        }
+        if let Some(pd) = &prepared.point_delete {
+            if !pd.append_only && pd.cas.is_none() {
+                return Err(Error::runtime("delete requires cas"));
+            }
+            let idx = match self.store.point_index(&pd.collection, &pd.field, &pd.key) {
+                Some(i) => i,
+                None => return Err(Error::runtime("delete: no matching row")),
+            };
+            if !pd.append_only {
+                let rows = self.store.collection(&pd.collection);
+                let got = row_text(&rows[idx], "hash").unwrap_or("");
+                let cas = pd.cas.as_deref().unwrap_or("");
+                if got != cas {
+                    return Err(Error::runtime(format!(
+                        "cas mismatch: expected {cas:?}, found {got:?}"
+                    )));
+                }
+            }
+            let out = self.store.delete_rows_at(&pd.collection, &[idx]);
+            if let Some(p) = self.persist.as_mut() {
+                let pack = Pack::Delete {
+                    collection: pd.collection.clone(),
+                    rows: out.clone(),
+                };
+                if let Err(e) = self.store.durable_commit(p, pack) {
+                    return Err(e);
+                }
+            }
+            self.store.r#gen += 1;
+            if let Some(p) = self.persist.as_mut() {
+                self.store.maybe_checkpoint(p)?;
+            }
+            return Ok(Handle {
+                plan: Arc::clone(&prepared.plan),
+                rows: out,
+                done: Done {
+                    r#gen: self.store.r#gen,
+                    n: 1,
+                },
+                message: None,
+                ms: 0.0,
+            });
+        }
+        if let Some(pu) = &prepared.point_update {
+            if pu.cas.is_none() {
+                return Err(Error::runtime("update requires cas"));
+            }
+            let idx = match self.store.point_index(&pu.collection, &pu.field, &pu.key) {
+                Some(i) => i,
+                None => return Err(Error::runtime("update: no matching row")),
+            };
+            let rows = self.store.collection(&pu.collection);
+            let got = row_text(&rows[idx], "hash").unwrap_or("");
+            let cas = pu.cas.as_deref().unwrap_or("");
+            if got != cas {
+                return Err(Error::runtime(format!(
+                    "cas mismatch: expected {cas:?}, found {got:?}"
+                )));
+            }
+            let now = now_ms();
+            let before_ref = &rows[idx];
+            if !self.catalog.guards.is_empty() {
+                for (k, _) in &pu.record.fields {
+                    for g in &self.catalog.guards {
+                        if g.collection == pu.collection
+                            && &g.field == k
+                            && eval_pred(&g.pred, before_ref, now)
+                        {
+                            return Err(Error::runtime(format!("immutable field: {}.{k}", pu.collection)));
+                        }
+                    }
+                }
+            }
+            let before = before_ref.clone();
+            let mut updated = before.clone();
+            for (k, v) in &pu.record.fields {
+                updated.insert(k.clone(), value_cell(v, now));
+            }
+            let has_body = pu.record.fields.iter().any(|(k, _)| k == "body");
+            if has_body
+                && let Some(body) = row_text(&updated, "body").map(str::to_string)
+            {
+                updated.insert("hash".into(), Cell::Text(cached_content_hash(&body)));
+            }
+            self.check_row_fks(&pu.collection, &updated)?;
+            if let Some(rows) = self.store.collections.get_mut(&pu.collection) {
+                rows[idx] = updated.clone();
+            }
+            if let Err(e) = self.store.index_insert_row(&pu.collection, idx, &updated) {
+                if let Some(rows) = self.store.collections.get_mut(&pu.collection) {
+                    rows[idx] = before;
+                }
+                return Err(e);
+            }
+            self.store.fts_sync_at(&pu.collection, idx, &before);
+            if let Some(hnsw) = self.store.hnsw.get_mut(&pu.collection) {
+                if let Some(Cell::Vec(v)) = updated.get("embedding") {
+                    hnsw.insert(idx, v.clone());
+                } else if before.contains_key("embedding") {
+                    hnsw.remove(idx);
+                }
+            }
+            self.store
+                .row_maps_sync_updated(&pu.collection, idx, &before, &updated);
+            if let Some(p) = self.persist.as_mut() {
+                let pack = Pack::Update {
+                    collection: pu.collection.clone(),
+                    rows: vec![updated.clone()],
+                };
+                if let Err(e) = self.store.durable_commit(p, pack) {
+                    return Err(e);
+                }
+            }
+            self.store.r#gen += 1;
+            if let Some(p) = self.persist.as_mut() {
+                self.store.maybe_checkpoint(p)?;
+            }
+            return Ok(Handle {
+                plan: Arc::clone(&prepared.plan),
+                rows: vec![updated],
+                done: Done {
+                    r#gen: self.store.r#gen,
+                    n: 1,
                 },
                 message: None,
                 ms: 0.0,
@@ -3176,6 +3336,60 @@ impl Db {
             is_simple_eq: simple_eq,
             pred: if simple_eq { None } else { Some(pred.clone()) },
             is_docs_id_title,
+        })
+    }
+
+    pub(crate) fn try_extract_point_delete(stmt: &Stmt, catalog: &Catalog) -> Option<PointDeletePlan> {
+        let Stmt::Delete {
+            collection,
+            pred,
+            cas,
+            cas_each: false,
+        } = stmt else {
+            return None;
+        };
+        let (field, key) = point_key(pred)?;
+        if field != "id" && (field != "uri" || collection != "docs") {
+            return None;
+        }
+        if !matches!(pred, Pred::Cmp { .. }) {
+            return None;
+        }
+        let append_only = catalog
+            .collection(collection)
+            .is_some_and(|c| c.append_only);
+        Some(PointDeletePlan {
+            collection: collection.clone(),
+            field: field.to_string(),
+            key: key.to_string(),
+            cas: cas.clone(),
+            append_only,
+        })
+    }
+
+    pub(crate) fn try_extract_point_update(stmt: &Stmt) -> Option<PointUpdatePlan> {
+        let Stmt::Update {
+            collection,
+            pred: Some(pred),
+            cas,
+            cas_each: false,
+            record,
+        } = stmt else {
+            return None;
+        };
+        let (field, key) = point_key(pred)?;
+        if field != "id" && (field != "uri" || collection != "docs") {
+            return None;
+        }
+        if !matches!(pred, Pred::Cmp { .. }) {
+            return None;
+        }
+        Some(PointUpdatePlan {
+            collection: collection.clone(),
+            field: field.to_string(),
+            key: key.to_string(),
+            cas: cas.clone(),
+            record: record.clone(),
         })
     }
 
@@ -10000,5 +10214,14 @@ mod preencoded_insert_tests {
         db.run_prepared(&prepared).unwrap();
         assert_eq!(PREENCODE_TEST_ATTEMPTS.with(|x| x.get()), 0);
         drop(db);
+    }
+
+    #[test]
+    fn test_point_delete_and_update_extracted() {
+        let mut db = Db::empty();
+        let prep = db.prepare(r#"delete docs[id == "d-20"] cas "h:123""#).unwrap();
+        assert!(prep.point_delete.is_some());
+        let prep_up = db.prepare(r#"update docs[id == "d-20"] cas "h:123" { wing: "sys" }"#).unwrap();
+        assert!(prep_up.point_update.is_some());
     }
 }

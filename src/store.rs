@@ -1731,12 +1731,15 @@ impl Store {
     /// Update cached count after single-row insert/delete
     #[inline]
     fn update_col_count(&mut self, collection: &str, delta: isize) {
-        let current = *self
-            .col_counts
-            .get(collection)
-            .unwrap_or(&self.collections.get(collection).map_or(0, Vec::len));
-        if let Some(new_count) = current.checked_add_signed(delta) {
-            self.col_counts.insert(collection.to_string(), new_count);
+        if let Some(count) = self.col_counts.get_mut(collection) {
+            if let Some(new_count) = count.checked_add_signed(delta) {
+                *count = new_count;
+            }
+        } else {
+            let current = self.collections.get(collection).map_or(0, Vec::len);
+            if let Some(new_count) = current.checked_add_signed(delta) {
+                self.col_counts.insert(collection.to_string(), new_count);
+            }
         }
     }
 
@@ -2220,7 +2223,10 @@ impl Store {
     /// Swap-remove rows and update only the removed/moved index, FTS and map slots.
     /// Returns the removed rows in ascending order of their original requested positions.
     pub fn delete_rows_at(&mut self, collection: &str, dead: &[usize]) -> Vec<Row> {
-        let old_n = self.collection_mut(collection).len();
+        let old_n = match self.collections.get(collection) {
+            Some(rows) => rows.len(),
+            None => return Vec::new(),
+        };
         if old_n == 0 || dead.is_empty() {
             return Vec::new();
         }
@@ -2231,11 +2237,8 @@ impl Store {
                 return Vec::new();
             }
             self.update_col_count(collection, -1);
-            let last = match self.collections.get(collection) {
-                Some(rows) if p < rows.len() => rows.len() - 1,
-                _ => return Vec::new(),
-            };
             let doomed = self.collections.get_mut(collection).unwrap().swap_remove(p);
+            let last = old_n - 1;
             self.index_remove_row(collection, p, &doomed);
             self.fts_remove_row(collection, p, &doomed);
             if let Some(hnsw) = self.hnsw.get_mut(collection) {
@@ -2329,19 +2332,29 @@ impl Store {
         if let Some(hnsw) = self.hnsw.get_mut(collection) {
             hnsw.move_id(from, to);
         }
-        let id = row.get("id").and_then(Cell::text_shared);
-        let uri = (collection == "docs")
-            .then(|| row.get("uri").and_then(Cell::text_shared))
-            .flatten();
+        let id_str = row_text(row, "id");
+        let uri_str = if collection == "docs" {
+            row_text(row, "uri")
+        } else {
+            None
+        };
         let spo = (collection == "facts").then(|| spo_key(row)).flatten();
         // Keep the original remove/register semantics for duplicate identities.
-        if let Some(id) = id {
+        if let Some(id_s) = id_str {
             if let Some(map) = self.by_id.get_mut(collection) {
-                map.insert(id, to);
+                if let Some(slot) = map.get_mut(id_s) {
+                    *slot = to;
+                } else if let Some(id) = row.get("id").and_then(Cell::text_shared) {
+                    map.insert(id, to);
+                }
             }
         }
-        if let Some(uri) = uri {
-            self.docs_by_uri.insert(uri, to);
+        if let Some(u_s) = uri_str {
+            if let Some(slot) = self.docs_by_uri.get_mut(u_s) {
+                *slot = to;
+            } else if let Some(uri) = row.get("uri").and_then(Cell::text_shared) {
+                self.docs_by_uri.insert(uri, to);
+            }
         }
         if let Some(spo) = spo {
             self.facts_by_spo.insert(spo, to);
