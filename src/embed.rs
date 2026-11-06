@@ -294,55 +294,87 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f64 {
         return 0.0;
     }
     let n = a.len();
-    let chunks = n / 4;
-    let mut dot0 = 0.0f64;
-    let mut dot1 = 0.0f64;
-    let mut dot2 = 0.0f64;
-    let mut dot3 = 0.0f64;
+    let chunks = n / 8;
+    let mut dot0 = 0.0f32;
+    let mut dot1 = 0.0f32;
+    let mut dot2 = 0.0f32;
+    let mut dot3 = 0.0f32;
+    let mut dot4 = 0.0f32;
+    let mut dot5 = 0.0f32;
+    let mut dot6 = 0.0f32;
+    let mut dot7 = 0.0f32;
 
-    let mut na0 = 0.0f64;
-    let mut na1 = 0.0f64;
-    let mut na2 = 0.0f64;
-    let mut na3 = 0.0f64;
+    let mut na0 = 0.0f32;
+    let mut na1 = 0.0f32;
+    let mut na2 = 0.0f32;
+    let mut na3 = 0.0f32;
+    let mut na4 = 0.0f32;
+    let mut na5 = 0.0f32;
+    let mut na6 = 0.0f32;
+    let mut na7 = 0.0f32;
 
-    let mut nb0 = 0.0f64;
-    let mut nb1 = 0.0f64;
-    let mut nb2 = 0.0f64;
-    let mut nb3 = 0.0f64;
+    let mut nb0 = 0.0f32;
+    let mut nb1 = 0.0f32;
+    let mut nb2 = 0.0f32;
+    let mut nb3 = 0.0f32;
+    let mut nb4 = 0.0f32;
+    let mut nb5 = 0.0f32;
+    let mut nb6 = 0.0f32;
+    let mut nb7 = 0.0f32;
 
     for c in 0..chunks {
-        let base = c * 4;
-        let a0 = a[base] as f64;
-        let a1 = a[base + 1] as f64;
-        let a2 = a[base + 2] as f64;
-        let a3 = a[base + 3] as f64;
+        let base = c * 8;
+        let a0 = a[base];
+        let a1 = a[base + 1];
+        let a2 = a[base + 2];
+        let a3 = a[base + 3];
+        let a4 = a[base + 4];
+        let a5 = a[base + 5];
+        let a6 = a[base + 6];
+        let a7 = a[base + 7];
 
-        let b0 = b[base] as f64;
-        let b1 = b[base + 1] as f64;
-        let b2 = b[base + 2] as f64;
-        let b3 = b[base + 3] as f64;
+        let b0 = b[base];
+        let b1 = b[base + 1];
+        let b2 = b[base + 2];
+        let b3 = b[base + 3];
+        let b4 = b[base + 4];
+        let b5 = b[base + 5];
+        let b6 = b[base + 6];
+        let b7 = b[base + 7];
 
         dot0 += a0 * b0;
         dot1 += a1 * b1;
         dot2 += a2 * b2;
         dot3 += a3 * b3;
+        dot4 += a4 * b4;
+        dot5 += a5 * b5;
+        dot6 += a6 * b6;
+        dot7 += a7 * b7;
 
         na0 += a0 * a0;
         na1 += a1 * a1;
         na2 += a2 * a2;
         na3 += a3 * a3;
+        na4 += a4 * a4;
+        na5 += a5 * a5;
+        na6 += a6 * a6;
+        na7 += a7 * a7;
 
         nb0 += b0 * b0;
         nb1 += b1 * b1;
         nb2 += b2 * b2;
         nb3 += b3 * b3;
+        nb4 += b4 * b4;
+        nb5 += b5 * b5;
+        nb6 += b6 * b6;
+        nb7 += b7 * b7;
     }
 
-    let mut dot = (dot0 + dot1) + (dot2 + dot3);
-    let mut na = (na0 + na1) + (na2 + na3);
-    let mut nb = (nb0 + nb1) + (nb2 + nb3);
+    let mut dot = ((dot0 + dot1) + (dot2 + dot3)) as f64 + ((dot4 + dot5) + (dot6 + dot7)) as f64;
+    let mut na = ((na0 + na1) + (na2 + na3)) as f64 + ((na4 + na5) + (na6 + na7)) as f64;
+    let mut nb = ((nb0 + nb1) + (nb2 + nb3)) as f64 + ((nb4 + nb5) + (nb6 + nb7)) as f64;
 
-    for i in (chunks * 4)..n {
+    for i in (chunks * 8)..n {
         let x = a[i] as f64;
         let y = b[i] as f64;
         dot += x * y;
@@ -354,6 +386,96 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f64 {
         return 0.0;
     }
     let denom = na.sqrt() * nb.sqrt();
+    if denom <= 1e-18 || !denom.is_finite() {
+        return 0.0;
+    }
+    let sim = dot / denom;
+    if sim.is_nan() {
+        0.0
+    } else {
+        sim.clamp(-1.0, 1.0)
+    }
+}
+
+/// Fast cosine similarity when the query vector norm `q_norm = sqrt(sum(qv[i]^2))` is precomputed.
+#[inline]
+pub fn cosine_with_q_norm(qv: &[f32], q_norm: f64, v: &[f32]) -> f64 {
+    if qv.len() != v.len() || qv.is_empty() || q_norm <= 1e-18 {
+        return 0.0;
+    }
+    let n = qv.len();
+    let chunks = n / 8;
+    let mut dot0 = 0.0f32;
+    let mut dot1 = 0.0f32;
+    let mut dot2 = 0.0f32;
+    let mut dot3 = 0.0f32;
+    let mut dot4 = 0.0f32;
+    let mut dot5 = 0.0f32;
+    let mut dot6 = 0.0f32;
+    let mut dot7 = 0.0f32;
+
+    let mut nb0 = 0.0f32;
+    let mut nb1 = 0.0f32;
+    let mut nb2 = 0.0f32;
+    let mut nb3 = 0.0f32;
+    let mut nb4 = 0.0f32;
+    let mut nb5 = 0.0f32;
+    let mut nb6 = 0.0f32;
+    let mut nb7 = 0.0f32;
+
+    for c in 0..chunks {
+        let base = c * 8;
+        let a0 = qv[base];
+        let a1 = qv[base + 1];
+        let a2 = qv[base + 2];
+        let a3 = qv[base + 3];
+        let a4 = qv[base + 4];
+        let a5 = qv[base + 5];
+        let a6 = qv[base + 6];
+        let a7 = qv[base + 7];
+
+        let b0 = v[base];
+        let b1 = v[base + 1];
+        let b2 = v[base + 2];
+        let b3 = v[base + 3];
+        let b4 = v[base + 4];
+        let b5 = v[base + 5];
+        let b6 = v[base + 6];
+        let b7 = v[base + 7];
+
+        dot0 += a0 * b0;
+        dot1 += a1 * b1;
+        dot2 += a2 * b2;
+        dot3 += a3 * b3;
+        dot4 += a4 * b4;
+        dot5 += a5 * b5;
+        dot6 += a6 * b6;
+        dot7 += a7 * b7;
+
+        nb0 += b0 * b0;
+        nb1 += b1 * b1;
+        nb2 += b2 * b2;
+        nb3 += b3 * b3;
+        nb4 += b4 * b4;
+        nb5 += b5 * b5;
+        nb6 += b6 * b6;
+        nb7 += b7 * b7;
+    }
+
+    let mut dot = ((dot0 + dot1) + (dot2 + dot3)) as f64 + ((dot4 + dot5) + (dot6 + dot7)) as f64;
+    let mut nb = ((nb0 + nb1) + (nb2 + nb3)) as f64 + ((nb4 + nb5) + (nb6 + nb7)) as f64;
+
+    for i in (chunks * 8)..n {
+        let x = qv[i] as f64;
+        let y = v[i] as f64;
+        dot += x * y;
+        nb += y * y;
+    }
+
+    if !dot.is_finite() || !nb.is_finite() || nb <= 1e-18 {
+        return 0.0;
+    }
+    let denom = q_norm * nb.sqrt();
     if denom <= 1e-18 || !denom.is_finite() {
         return 0.0;
     }

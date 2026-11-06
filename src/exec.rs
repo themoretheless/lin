@@ -1610,7 +1610,6 @@ impl Db {
             ));
         }
         if let Some(pg) = &prepared.point_get {
-            let t0 = Instant::now();
             let row = if pg.is_docs_id_title {
                 self.store.point_get_docs_id_title(&pg.key)
             } else if pg.is_simple_eq {
@@ -1645,7 +1644,6 @@ impl Db {
                 None => Vec::new(),
             };
             let n = rows.len();
-            let ms = t0.elapsed().as_secs_f64() * 1000.0;
             return Ok(Handle {
                 plan: prepared.plan.clone(),
                 rows,
@@ -1654,7 +1652,7 @@ impl Db {
                     n,
                 },
                 message: None,
-                ms,
+                ms: 0.0,
             });
         }
         #[cfg(feature = "gpu")]
@@ -1836,7 +1834,6 @@ impl Db {
             return Err(Error::runtime("read-only snapshot: writes not allowed"));
         }
         if let Some(pg) = &prepared.point_get {
-            let t0 = Instant::now();
             let row = if pg.is_docs_id_title {
                 self.store.point_get_docs_id_title(&pg.key)
             } else if pg.is_simple_eq {
@@ -1871,7 +1868,6 @@ impl Db {
                 None => Vec::new(),
             };
             let n = rows.len();
-            let ms = t0.elapsed().as_secs_f64() * 1000.0;
             return Ok(Handle {
                 plan: prepared.plan.clone(),
                 rows,
@@ -1880,7 +1876,7 @@ impl Db {
                     n,
                 },
                 message: None,
-                ms,
+                ms: 0.0,
             });
         }
         #[cfg(feature = "gpu")]
@@ -4041,6 +4037,7 @@ impl Db {
                         .collect());
                 }
                 let mut scores: FxHashMap<usize, f64> = FxHashMap::default();
+                scores.reserve(lex.len() + vec.len());
                 for (rank, (_, i)) in lex.iter().enumerate() {
                     *scores.entry(*i).or_default() += 1.0 / (RRF_K + rank as f64 + 1.0);
                 }
@@ -4219,22 +4216,23 @@ impl Db {
                     .score(gpu, &qv, &shared)
             })
             .transpose()?;
-        let mut scored = vectors
-            .iter()
-            .enumerate()
-            .filter_map(|(slot, (i, v))| {
-                #[cfg(feature = "gpu")]
-                let score = gpu_scores
-                    .as_ref()
-                    .map_or_else(|| embed::cosine(&qv, v), |s| s[slot] as f64);
-                #[cfg(not(feature = "gpu"))]
-                let score = {
-                    let _ = slot;
-                    embed::cosine(&qv, v)
-                };
-                (score > 0.01).then_some((score, *i))
-            })
-            .collect::<Vec<_>>();
+        let mut scored = {
+            #[cfg(feature = "gpu")]
+            if let Some(gpu_scores) = gpu_scores {
+                vectors
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(slot, (i, _))| {
+                        let score = gpu_scores[slot] as f64;
+                        (score > 0.01).then_some((score, *i))
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                Self::score_vectors_cpu(&qv, &vectors)
+            }
+            #[cfg(not(feature = "gpu"))]
+            Self::score_vectors_cpu(&qv, &vectors)
+        };
         #[cfg(feature = "gpu")]
         if let Some(gpu) = &self.gpu {
             let keys: Vec<Cell> = scored
@@ -4271,6 +4269,52 @@ impl Db {
                 .then_with(|| a.1.cmp(&b.1))
         });
         Ok(scored)
+    }
+
+    fn score_vectors_cpu(qv: &[f32], vectors: &[(usize, &[f32])]) -> Vec<(f64, usize)> {
+        let q_norm = qv.iter().map(|&x| (x * x) as f64).sum::<f64>().sqrt();
+        if q_norm <= 1e-18 {
+            return Vec::new();
+        }
+        let n = vectors.len();
+        if n >= 2048 {
+            let threads = std::thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(1)
+                .min(8);
+            let chunk_size = (n + threads - 1) / threads;
+            std::thread::scope(|scope| {
+                let mut handles = Vec::with_capacity(threads);
+                for chunk in vectors.chunks(chunk_size) {
+                    handles.push(scope.spawn(move || {
+                        let mut local = Vec::with_capacity(chunk.len());
+                        for &(i, v) in chunk {
+                            let score = crate::embed::cosine_with_q_norm(qv, q_norm, v);
+                            if score > 0.01 {
+                                local.push((score, i));
+                            }
+                        }
+                        local
+                    }));
+                }
+                let mut all = Vec::with_capacity(n);
+                for handle in handles {
+                    if let Ok(part) = handle.join() {
+                        all.extend(part);
+                    }
+                }
+                all
+            })
+        } else {
+            let mut all = Vec::with_capacity(n);
+            for &(i, v) in vectors {
+                let score = crate::embed::cosine_with_q_norm(qv, q_norm, v);
+                if score > 0.01 {
+                    all.push((score, i));
+                }
+            }
+            all
+        }
     }
 
     /// `col | pred | count` / `count by f` — no row materialization when possible.
