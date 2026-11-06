@@ -6280,6 +6280,9 @@ impl Db {
             && let Some((field, key)) = point_key(pred)
             && (field == "id" || (field == "uri" && collection == "docs"))
         {
+            if matches!(pred, Pred::Cmp { .. }) {
+                return self.store.point_index(collection, field, key).into_iter().collect();
+            }
             return self
                 .store
                 .point_index(collection, field, key)
@@ -6416,16 +6419,15 @@ impl Db {
             }
         }
         idxs.sort_unstable();
-        let out: Vec<Row> = idxs.iter().map(|&i| rows[i].clone()).collect();
+        let out = self.store.delete_rows_at(collection, &idxs);
 
         if let Undo::Rows(events) | Undo::Mixed { events, .. } = ctx.undo {
             events.push(RowUndo::Delete(
                 collection.to_string(),
-                idxs.clone(),
+                idxs,
                 out.clone(),
             ));
         }
-        self.store.delete_rows_at(collection, &idxs);
         mark_written(ctx, collection, &out);
         Ok(out)
     }

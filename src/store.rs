@@ -2200,21 +2200,22 @@ impl Store {
     }
 
     /// Swap-remove rows and update only the removed/moved index, FTS and map slots.
-    pub fn delete_rows_at(&mut self, collection: &str, dead: &[usize]) {
+    /// Returns the removed rows in ascending order of their original requested positions.
+    pub fn delete_rows_at(&mut self, collection: &str, dead: &[usize]) -> Vec<Row> {
         let old_n = self.collection_mut(collection).len();
         if old_n == 0 || dead.is_empty() {
-            return;
+            return Vec::new();
         }
 
         if dead.len() == 1 {
             let p = dead[0];
             if p >= old_n {
-                return;
+                return Vec::new();
             }
             self.update_col_count(collection, -1);
             let last = match self.collections.get(collection) {
                 Some(rows) if p < rows.len() => rows.len() - 1,
-                _ => return,
+                _ => return Vec::new(),
             };
             let doomed = self.collections.get_mut(collection).unwrap().swap_remove(p);
             self.index_remove_row(collection, p, &doomed);
@@ -2238,14 +2239,14 @@ impl Store {
             if soa_len != new_n {
                 self.rebuild_row_maps_collection(collection);
             }
-            return;
+            return vec![doomed];
         }
 
         let mut dead: Vec<usize> = dead.iter().copied().filter(|&d| d < old_n).collect();
         dead.sort_unstable();
         dead.dedup();
         if dead.is_empty() {
-            return;
+            return Vec::new();
         }
 
         // Cache-friendly count update (decrement by number of deleted rows)
@@ -2257,6 +2258,7 @@ impl Store {
         // postings and columnar arrays are rebuilt from the rows on restore), so row
         // order is not a contract — `sort` is the explicit remedy when one is needed.
 
+        let mut removed = Vec::with_capacity(dead.len());
         for &p in dead.iter().rev() {
             let last = match self.collections.get(collection) {
                 Some(rows) if p < rows.len() => rows.len() - 1,
@@ -2273,9 +2275,10 @@ impl Store {
             self.row_maps_drop_keys(collection, &doomed);
             if p != last {
                 self.move_deleted_tail(collection, last, p);
-                continue;
+            } else {
+                self.swap_pop_columns(collection, p, last + 1);
             }
-            self.swap_pop_columns(collection, p, last + 1);
+            removed.push(doomed);
         }
 
         let new_n = old_n - dead.len();
@@ -2288,6 +2291,8 @@ impl Store {
         if soa_len != new_n {
             self.rebuild_row_maps_collection(collection);
         }
+        removed.reverse();
+        removed
     }
 
     /// The collection already contains the moved row at `to`. Read it in place
