@@ -1079,16 +1079,16 @@ fn next_lazy_join_soa(store: &Store, join: &mut LazyJoinSoa) -> Option<Result<Ro
             *t = t.saturating_sub(1);
         }
 
-        let mut row = Row::new();
-        row.insert("id".into(), Cell::Text(Arc::clone(order_id)));
+        let mut row = crate::store::acquire_row();
+        row.insert(join.fields[0].clone(), Cell::Text(Arc::clone(order_id)));
+        row.insert(join.fields[2].clone(), Cell::Float(total));
         row.insert(
-            "users.email".into(),
+            join.fields[1].clone(),
             match right {
                 Some(ui) => Cell::Text(Arc::clone(unsafe { users_email.get_unchecked(ui) })),
                 None => Cell::Null,
             },
         );
-        row.insert("total".into(), Cell::Float(total));
         return Some(Ok(row));
     }
 }

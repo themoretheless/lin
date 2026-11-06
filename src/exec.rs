@@ -7098,6 +7098,17 @@ pub(crate) fn plan_join_fields(
             plan.push(JoinFieldPlan::Left(f.clone()));
         }
     }
+    plan.sort_by(|a, b| {
+        let ka = match a {
+            JoinFieldPlan::Left(k) => k.as_str(),
+            JoinFieldPlan::Right { out, .. } => out.as_str(),
+        };
+        let kb = match b {
+            JoinFieldPlan::Left(k) => k.as_str(),
+            JoinFieldPlan::Right { out, .. } => out.as_str(),
+        };
+        ka.cmp(kb)
+    });
     (right_fields, plan)
 }
 
@@ -7141,7 +7152,7 @@ pub(crate) fn build_right_probe_owned(
 }
 
 pub(crate) fn emit_join_row(left: &Row, right: Option<&[Cell]>, plan: &[JoinFieldPlan]) -> Row {
-    let mut out = BTreeMap::new();
+    let mut out = crate::store::acquire_row();
     for p in plan {
         match p {
             JoinFieldPlan::Left(k) => {
