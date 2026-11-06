@@ -2396,21 +2396,66 @@ impl Db {
                 let mut bulk_s = Vec::with_capacity(n);
                 let mut bulk_p = Vec::with_capacity(n);
                 let mut bulk_o = Vec::with_capacity(n);
-                for record in records {
-                    let mut s = None;
-                    let mut p = None;
-                    let mut o = None;
-                    for (k, v) in &record.fields {
-                        match k.as_str() {
-                            "s" => s = Some(value_to_string(v, now)),
-                            "p" => p = Some(value_to_string(v, now)),
-                            "o" => o = Some(value_to_string(v, now)),
-                            _ => {}
+                let is_standard_spo = records.first().map_or(false, |r| {
+                    r.fields.len() == 3
+                        && r.fields[0].0 == "s"
+                        && r.fields[1].0 == "p"
+                        && r.fields[2].0 == "o"
+                });
+                if is_standard_spo {
+                    let mut last_p_val: Option<&Value> = None;
+                    let mut last_p_str = String::new();
+                    for record in records {
+                        if record.fields.len() == 3
+                            && record.fields[0].0 == "s"
+                            && record.fields[1].0 == "p"
+                            && record.fields[2].0 == "o"
+                        {
+                            bulk_s.push(value_to_string(&record.fields[0].1, now));
+                            let pv = &record.fields[1].1;
+                            if last_p_val == Some(pv) {
+                                bulk_p.push(last_p_str.clone());
+                            } else {
+                                let ps = value_to_string(pv, now);
+                                last_p_str = ps.clone();
+                                last_p_val = Some(pv);
+                                bulk_p.push(ps);
+                            }
+                            bulk_o.push(value_to_string(&record.fields[2].1, now));
+                        } else {
+                            let mut s = None;
+                            let mut p = None;
+                            let mut o = None;
+                            for (k, v) in &record.fields {
+                                match k.as_str() {
+                                    "s" => s = Some(value_to_string(v, now)),
+                                    "p" => p = Some(value_to_string(v, now)),
+                                    "o" => o = Some(value_to_string(v, now)),
+                                    _ => {}
+                                }
+                            }
+                            bulk_s.push(s.unwrap_or_default());
+                            bulk_p.push(p.unwrap_or_default());
+                            bulk_o.push(o.unwrap_or_default());
                         }
                     }
-                    bulk_s.push(s.unwrap_or_default());
-                    bulk_p.push(p.unwrap_or_default());
-                    bulk_o.push(o.unwrap_or_default());
+                } else {
+                    for record in records {
+                        let mut s = None;
+                        let mut p = None;
+                        let mut o = None;
+                        for (k, v) in &record.fields {
+                            match k.as_str() {
+                                "s" => s = Some(value_to_string(v, now)),
+                                "p" => p = Some(value_to_string(v, now)),
+                                "o" => o = Some(value_to_string(v, now)),
+                                _ => {}
+                            }
+                        }
+                        bulk_s.push(s.unwrap_or_default());
+                        bulk_p.push(p.unwrap_or_default());
+                        bulk_o.push(o.unwrap_or_default());
+                    }
                 }
                 let want_rows = n <= 128;
                 let (rows, changed_n) = self
@@ -2506,6 +2551,36 @@ impl Db {
                                 new_edges,
                             )
                         })
+                    } else if ctx.allow_preencode
+                        && edges.is_empty()
+                        && new_edges.is_empty()
+                        && let Some(persist) = self.persist.as_mut()
+                        && let Some((magic, fields)) = crate::persist::encode_insert_rows_direct(
+                            self.store.r#gen.wrapping_add(1),
+                            self.store.next_id,
+                            collection,
+                            inserted,
+                            &mut persist.encode_buf,
+                        )
+                    {
+                        let n = inserted.len() as u32;
+                        let generation = self.store.r#gen.wrapping_add(1);
+                        let next_id = self.store.next_id;
+                        ctx.prepared_encoding = Some(crate::persist::PreparedEncoding::Direct {
+                            generation,
+                            next_id,
+                            collection: collection.clone(),
+                            fields: fields.clone(),
+                            rows: n,
+                            magic,
+                        });
+                        Pack::InsertCols {
+                            collection: collection.clone(),
+                            fields,
+                            cols: Vec::new(),
+                            n,
+                            edges: Vec::new(),
+                        }
                     } else {
                         crate::persist::rows_to_insert_cols(collection.clone(), inserted, new_edges)
                     };
@@ -6111,9 +6186,13 @@ impl Db {
 
         let store_empty = self.store.collection(collection).is_empty();
         let has_fks = self.catalog.fks.iter().any(|fk| fk.from_col == collection);
+        let is_docs = collection == "docs";
+        let needs_id = records
+            .first()
+            .map_or(true, |r| !r.fields.iter().any(|(k, _)| k == "id"));
 
         for row in &mut built {
-            if row.get("id").and_then(Cell::text).is_none() {
+            if needs_id && row.get("id").and_then(Cell::text).is_none() {
                 row.insert("id".into(), Cell::text_arc(self.store.alloc_id()));
             }
             if row.get("hash").and_then(Cell::text).is_none()
@@ -6135,7 +6214,7 @@ impl Db {
             {
                 return Err(Error::runtime(format!("duplicate id: {id}")));
             }
-            if collection == "docs"
+            if is_docs
                 && let Some(uri) = row.get("uri").and_then(Cell::text)
                 && (!batch_uris.insert(uri)
                     || (!store_empty && self.store.get_by_uri(uri).is_some()))
@@ -6275,7 +6354,12 @@ impl Db {
         Ok(())
     }
 
-    fn mutation_positions(&self, collection: &str, pred: Option<&Pred>, now: i64) -> Vec<usize> {
+    fn mutation_positions(
+        &self,
+        collection: &str,
+        pred: Option<&Pred>,
+        now: i64,
+    ) -> smallvec::SmallVec<[usize; 2]> {
         if let Some(pred) = pred
             && let Some((field, key)) = point_key(pred)
             && (field == "id" || (field == "uri" && collection == "docs"))
@@ -6334,26 +6418,29 @@ impl Db {
                 }
             }
         }
-        let patch = record_row(record, now);
-        let mut out = Vec::new();
+        let has_body = record.fields.iter().any(|(k, _)| k == "body");
+        let has_guards = !self.catalog.guards.is_empty();
+        let mut out = Vec::with_capacity(idxs.len());
         for i in idxs {
             let before = self.store.collection(collection)[i].clone();
-            for (k, _) in &patch {
-                for g in &self.catalog.guards {
-                    if g.collection == collection
-                        && &g.field == k
-                        && eval_pred(&g.pred, &before, now)
-                    {
-                        return Err(Error::runtime(format!("immutable field: {collection}.{k}")));
+            if has_guards {
+                for (k, _) in &record.fields {
+                    for g in &self.catalog.guards {
+                        if g.collection == collection
+                            && &g.field == k
+                            && eval_pred(&g.pred, &before, now)
+                        {
+                            return Err(Error::runtime(format!("immutable field: {collection}.{k}")));
+                        }
                     }
                 }
             }
             let mut updated = before.clone();
             // Apply patch with zero-copy Arc clones where possible
-            for (k, v) in &patch {
-                updated.insert(k.clone(), v.clone());
+            for (k, v) in &record.fields {
+                updated.insert(k.clone(), value_cell(v, now));
             }
-            if patch.contains_key("body")
+            if has_body
                 && let Some(body) = row_text(&updated, "body").map(str::to_string)
             {
                 // Use precomputed hash from cache to avoid repeated FNV-1a computations
@@ -6424,7 +6511,7 @@ impl Db {
         if let Undo::Rows(events) | Undo::Mixed { events, .. } = ctx.undo {
             events.push(RowUndo::Delete(
                 collection.to_string(),
-                idxs,
+                idxs.to_vec(),
                 out.clone(),
             ));
         }
@@ -6952,13 +7039,13 @@ fn append_batch_shape_rows(rows: &mut Vec<Row>, records: &[Record], now: i64) {
         })
         .collect::<Vec<_>>();
     for record in records {
-        if record.fields.len() != first.fields.len()
-            || !record
+        let same_shape = record.fields.len() == first.fields.len()
+            && record
                 .fields
                 .iter()
-                .map(|(key, _)| key.as_str())
-                .eq(first.fields.iter().map(|(key, _)| key.as_str()))
-        {
+                .zip(&first.fields)
+                .all(|(a, b)| a.0 == b.0);
+        if !same_shape {
             rows.push(record_row(record, now));
             continue;
         }

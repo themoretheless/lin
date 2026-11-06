@@ -1136,6 +1136,24 @@ impl Store {
                 ..
             } = persist;
             match prepared {
+                Some(persist::PreparedEncoding::Direct {
+                    generation,
+                    next_id,
+                    collection,
+                    fields,
+                    rows,
+                    magic,
+                }) => {
+                    let valid = rec.r#gen == generation
+                        && rec.next_id == next_id
+                        && matches!(&rec.pack, Pack::InsertCols { collection: c, fields: f, n, edges, .. }
+                            if c == &collection && f == &fields && *n == rows && edges.is_empty());
+                    if valid {
+                        persist::write_frame(log, &magic, encode_buf, sync, log_bytes)?;
+                    } else {
+                        persist::append_record(log, &rec, encode_buf, sync, log_bytes)?;
+                    }
+                }
                 Some(persist::PreparedEncoding::Ready(encoded)) => {
                     persist::append_prepared_record(
                         log, &rec, encoded, encode_buf, sync, log_bytes,
@@ -2427,53 +2445,11 @@ impl Store {
         }
         self.index_remove_at(collection, idx);
         self.fts_remove_at(collection, idx);
-        let old_row = std::mem::replace(&mut self.collection_mut(collection)[idx], row);
-        let _ = self.index_insert_at(collection, idx);
-        self.fts_insert_at(collection, idx);
-
-        let (before_id, before_uri) = (
-            row_text(&old_row, "id").map(|s| s.to_string()),
-            row_text(&old_row, "uri").map(|s| s.to_string()),
-        );
-        let cur = &self.collections[collection][idx];
-        let after_id = row_text(cur, "id").map(|s| s.to_string());
-        let after_uri = row_text(cur, "uri").map(|s| s.to_string());
-        let title = cur.get("title").and_then(Cell::text_shared).unwrap_or_default();
-        let layer = cur.get("layer").and_then(Cell::text_shared).unwrap_or_default();
-        let wing = cur.get("wing").and_then(Cell::text_shared).unwrap_or_default();
-        let user_id = cur.get("user_id").and_then(Cell::text_shared).unwrap_or_default();
-        let total = cur.get("total").and_then(Cell::as_f64).unwrap_or(0.0);
-        let email = cur.get("email").and_then(Cell::text_shared).unwrap_or_default();
-
-        if collection == "docs" {
-            self.docs_title_packed.take();
-        }
-        let identity_moved = before_id != after_id || before_uri != after_uri;
-        let stale_slot = after_id
-            .as_deref()
-            .is_some_and(|key| self.row_index(collection, key) != Some(idx));
-        if identity_moved || stale_slot {
-            self.rebuild_row_maps_collection(collection);
-            return;
-        }
-        match collection {
-            "docs"
-                if idx < self.docs_title.len()
-                    && idx < self.docs_layer.len()
-                    && idx < self.docs_wing.len() =>
-            {
-                self.docs_title[idx] = title;
-                self.docs_layer[idx] = layer;
-                self.docs_wing[idx] = wing;
-            }
-            "orders" if idx < self.orders_user_id.len() && idx < self.orders_total.len() => {
-                self.orders_user_id[idx] = user_id;
-                self.orders_total[idx] = total;
-            }
-            "users" if idx < self.users_email.len() => self.users_email[idx] = email,
-            "docs" | "orders" | "users" => self.rebuild_row_maps_collection(collection),
-            _ => {}
-        }
+        let _ = self.index_insert_row(collection, idx, &row);
+        self.fts_insert_row(collection, idx, &row);
+        let old_row = std::mem::take(&mut self.collection_mut(collection)[idx]);
+        self.row_maps_sync_updated(collection, idx, &old_row, &row);
+        self.collections.get_mut(collection).unwrap()[idx] = row;
     }
 
     /// Inverse of [`Self::delete_rows_at`]: drop each removed row back into its old
@@ -2814,7 +2790,11 @@ impl Store {
                     return;
                 }
             }
-            let by_id = self.by_id.entry(collection.to_owned()).or_default();
+            let by_id = if let Some(m) = self.by_id.get_mut(collection) {
+                m
+            } else {
+                self.by_id.entry(collection.to_string()).or_default()
+            };
             for (i, row) in rows.iter().enumerate() {
                 let idx = start + i;
                 let mut texts: [Option<Arc<str>>; 5] = std::array::from_fn(|_| None);
@@ -2959,30 +2939,13 @@ impl Store {
         if rows.is_empty() {
             return Ok(());
         }
-        let labels: Vec<String> = self
-            .indexes
-            .iter()
-            .filter(|(_, idx)| idx.def.collection == collection)
-            .map(|(k, _)| k.clone())
-            .collect();
-        if labels.is_empty() {
-            return Ok(());
-        }
-
-        // Batch-only path for slab insertions to reduce per-row overhead
-        for label in &labels {
-            let Some(idx) = self.indexes.get_mut(label) else {
-                continue;
-            };
-
-            // Use batch insert when multiple rows
-            if rows.len() > 1 {
-                if let Err(e) = idx.insert_slab_batch(start, rows) {
-                    return Err(Error::runtime(e));
-                }
-            } else {
-                // Fall back to single insert for edge case
-                if let Err(e) = idx.insert_at_new(start, &rows[0]) {
+        for idx in self.indexes.values_mut() {
+            if idx.def.collection == collection {
+                if rows.len() > 1 {
+                    if let Err(e) = idx.insert_slab_batch(start, rows) {
+                        return Err(Error::runtime(e));
+                    }
+                } else if let Err(e) = idx.insert_at_new(start, &rows[0]) {
                     return Err(Error::runtime(e));
                 }
             }
@@ -2990,18 +2953,13 @@ impl Store {
         Ok(())
     }
 
-    /// Drop a position from every index of `collection`. The row at that position
-    /// must still be the indexed version — keys are recomputed from it.
+    /// Drop a position from every index of `collection`.
     pub fn index_remove_at(&mut self, collection: &str, row_idx: usize) {
-        let Some(row) = self
-            .collections
-            .get(collection)
-            .and_then(|c| c.get(row_idx))
-            .cloned()
-        else {
-            return;
-        };
-        self.index_remove_row(collection, row_idx, &row);
+        for idx in self.indexes.values_mut() {
+            if idx.def.collection == collection {
+                idx.remove_at(row_idx);
+            }
+        }
     }
 
     /// Drop one row's index entries, given the row itself.
@@ -3141,6 +3099,9 @@ impl Store {
     }
 
     pub fn fts_insert_at(&mut self, collection: &str, row_idx: usize) {
+        if !self.fts.contains_key(collection) {
+            return;
+        }
         let Some(row) = self
             .collections
             .get(collection)
@@ -3219,6 +3180,9 @@ impl Store {
 
     /// Drop the postings of the row currently at `row_idx`.
     pub fn fts_remove_at(&mut self, collection: &str, row_idx: usize) {
+        if !self.fts.contains_key(collection) {
+            return;
+        }
         let Some(row) = self
             .collections
             .get(collection)

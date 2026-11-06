@@ -31,6 +31,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::Error;
 use crate::store::{Edge, Row};
+use crate::Cell;
 
 pub const HEAD_NAME: &str = "head";
 pub const LOG_NAME: &str = "log";
@@ -728,7 +729,7 @@ pub fn encode_snapshot_ref_to_writer<W: std::io::Write>(
         .map_err(io_err)?;
     writer.write_all(&header_bytes).map_err(io_err)?;
 
-    const CHUNK_ROWS: usize = 2048;
+    const CHUNK_ROWS: usize = 512;
     struct ChunkDef<'a> {
         name: &'a str,
         rows: &'a [Row],
@@ -1123,7 +1124,7 @@ fn decode_chunked_snapshot(data: &[u8]) -> Option<Snapshot> {
         });
     }
 
-    let decoded_chunks: Vec<Result<(String, Vec<Row>), ()>> = if chunk_slices.len() > 1 {
+    let decoded_chunks: Vec<Result<(&str, Vec<Row>), ()>> = if chunk_slices.len() > 1 {
         #[cfg(feature = "parallel")]
         {
             use rayon::prelude::*;
@@ -1131,10 +1132,10 @@ fn decode_chunked_snapshot(data: &[u8]) -> Option<Snapshot> {
                 .par_iter()
                 .map(|c| {
                     if c.data.is_empty() {
-                        Ok((c.name.to_string(), Vec::new()))
+                        Ok((c.name, Vec::new()))
                     } else {
                         let rows: Vec<Row> = rmp_serde::from_slice(c.data).map_err(|_| ())?;
-                        Ok((c.name.to_string(), rows))
+                        Ok((c.name, rows))
                     }
                 })
                 .collect()
@@ -1155,11 +1156,11 @@ fn decode_chunked_snapshot(data: &[u8]) -> Option<Snapshot> {
                             let mut res = Vec::with_capacity(block.len());
                             for c in block {
                                 if c.data.is_empty() {
-                                    res.push(Ok((c.name.to_string(), Vec::new())));
+                                    res.push(Ok((c.name, Vec::new())));
                                 } else {
                                     let r: Result<Vec<Row>, _> = rmp_serde::from_slice(c.data);
                                     match r {
-                                        Ok(rows) => res.push(Ok((c.name.to_string(), rows))),
+                                        Ok(rows) => res.push(Ok((c.name, rows))),
                                         Err(_) => res.push(Err(())),
                                     }
                                 }
@@ -1182,10 +1183,10 @@ fn decode_chunked_snapshot(data: &[u8]) -> Option<Snapshot> {
                     .iter()
                     .map(|c| {
                         if c.data.is_empty() {
-                            Ok((c.name.to_string(), Vec::new()))
+                            Ok((c.name, Vec::new()))
                         } else {
                             let rows: Vec<Row> = rmp_serde::from_slice(c.data).map_err(|_| ())?;
-                            Ok((c.name.to_string(), rows))
+                            Ok((c.name, rows))
                         }
                     })
                     .collect()
@@ -1196,10 +1197,10 @@ fn decode_chunked_snapshot(data: &[u8]) -> Option<Snapshot> {
             .iter()
             .map(|c| {
                 if c.data.is_empty() {
-                    Ok((c.name.to_string(), Vec::new()))
+                    Ok((c.name, Vec::new()))
                 } else {
                     let rows: Vec<Row> = rmp_serde::from_slice(c.data).map_err(|_| ())?;
-                    Ok((c.name.to_string(), rows))
+                    Ok((c.name, rows))
                 }
             })
             .collect()
@@ -1209,7 +1210,13 @@ fn decode_chunked_snapshot(data: &[u8]) -> Option<Snapshot> {
         std::collections::BTreeMap::new();
     for res in decoded_chunks {
         let (name, rows) = res.ok()?;
-        collections.entry(name).or_default().extend(rows);
+        if let Some(vec) = collections.get_mut(name) {
+            vec.extend(rows);
+        } else {
+            let mut vec = Vec::with_capacity(rows.len());
+            vec.extend(rows);
+            collections.insert(name.to_string(), vec);
+        }
     }
 
     Some(Snapshot {
@@ -1562,7 +1569,7 @@ fn write_frame_bytes(
     checksum: [u8; 4],
     len: u32,
 ) -> io::Result<()> {
-    const INLINE_MAX: usize = 1024 * 1024;
+    const INLINE_MAX: usize = 4096;
     if payload.len() >= 64 * 1024 {
         reserve_wal_space(log, payload.len().saturating_add(13), false);
     }
@@ -1592,7 +1599,7 @@ fn write_frame_bytes(
     }
 }
 
-fn write_frame(
+pub(crate) fn write_frame(
     log: &mut File,
     magic: &[u8; 4],
     payload: &[u8],
@@ -1673,11 +1680,8 @@ fn append_facts_v2(
     log_bytes: &mut u64,
 ) -> Result<(), Error> {
     let n = s.len().min(p.len()).min(o.len());
-    let str_bytes = s.iter().map(|x| x.len()).sum::<usize>()
-        + p.iter().map(|x| x.len()).sum::<usize>()
-        + o.iter().map(|x| x.len()).sum::<usize>();
     buf.clear();
-    buf.reserve(1 + 8 + 8 + 4 + n * 12 + str_bytes);
+    buf.reserve(64 + n * 48);
     buf.push(V2_FACTS_BULK);
     buf.extend_from_slice(&rec_gen.to_le_bytes());
     buf.extend_from_slice(&next_id.to_le_bytes());
@@ -2054,6 +2058,14 @@ pub(crate) struct EncodedColumns {
 
 pub(crate) enum PreparedEncoding {
     Ready(EncodedColumns),
+    Direct {
+        generation: u64,
+        next_id: u64,
+        collection: String,
+        fields: Vec<String>,
+        rows: u32,
+        magic: [u8; 4],
+    },
     Failed(Error),
     Panicked(Box<dyn std::any::Any + Send>),
 }
@@ -2313,6 +2325,114 @@ fn encode_insert_cols_v2(
     } else {
         LOG_MAGIC_V2
     })
+}
+
+pub(crate) fn encode_insert_rows_direct(
+    rec_gen: u64,
+    next_id: u64,
+    collection: &str,
+    rows: &[Row],
+    buf: &mut Vec<u8>,
+) -> Option<([u8; 4], Vec<String>)> {
+    if rows.is_empty() {
+        return None;
+    }
+    let first = &rows[0];
+    let num_fields = first.len();
+    if num_fields == 0 {
+        return None;
+    }
+    for r in &rows[1..] {
+        if r.len() != num_fields || !r.keys().eq(first.keys()) {
+            return None;
+        }
+    }
+
+    #[derive(Copy, Clone)]
+    enum DirectColType {
+        Text,
+        Int,
+        Float,
+        Bool,
+        Time,
+    }
+    let mut col_types = smallvec::SmallVec::<[DirectColType; 8]>::with_capacity(num_fields);
+    for val in first.values() {
+        let t = match val {
+            Cell::Text(_) => DirectColType::Text,
+            Cell::Int(_) => DirectColType::Int,
+            Cell::Float(_) => DirectColType::Float,
+            Cell::Bool(_) => DirectColType::Bool,
+            Cell::Time(_) => DirectColType::Time,
+            _ => return None,
+        };
+        col_types.push(t);
+    }
+
+    let fields: Vec<String> = first.keys().cloned().collect();
+    let n = rows.len() as u32;
+
+    buf.clear();
+    buf.reserve(64 + fields.len() * 16 + (rows.len() * num_fields * 32));
+    buf.push(V2_INSERT_COLS);
+    buf.extend_from_slice(&rec_gen.to_le_bytes());
+    buf.extend_from_slice(&next_id.to_le_bytes());
+    put_str(buf, collection);
+    buf.extend_from_slice(&n.to_le_bytes());
+    buf.extend_from_slice(&(num_fields as u32).to_le_bytes());
+
+    for (fi, f) in fields.iter().enumerate() {
+        put_str(buf, f);
+        match col_types[fi] {
+            DirectColType::Text => {
+                buf.push(1);
+                for r in rows {
+                    match r.get(f) {
+                        Some(Cell::Text(s)) => put_str(buf, s),
+                        _ => return None,
+                    }
+                }
+            }
+            DirectColType::Int => {
+                buf.push(2);
+                for r in rows {
+                    match r.get(f) {
+                        Some(Cell::Int(x)) => buf.extend_from_slice(&x.to_le_bytes()),
+                        _ => return None,
+                    }
+                }
+            }
+            DirectColType::Float => {
+                buf.push(3);
+                for r in rows {
+                    match r.get(f) {
+                        Some(Cell::Float(x)) => buf.extend_from_slice(&x.to_le_bytes()),
+                        _ => return None,
+                    }
+                }
+            }
+            DirectColType::Bool => {
+                buf.push(4);
+                for r in rows {
+                    match r.get(f) {
+                        Some(Cell::Bool(x)) => buf.push(u8::from(*x)),
+                        _ => return None,
+                    }
+                }
+            }
+            DirectColType::Time => {
+                buf.push(5);
+                for r in rows {
+                    match r.get(f) {
+                        Some(Cell::Time(x)) => buf.extend_from_slice(&x.to_le_bytes()),
+                        _ => return None,
+                    }
+                }
+            }
+        }
+    }
+
+    Some((LOG_MAGIC_V2, fields))
 }
 
 /// Replay complete records with `gen > min_gen`. Returns the byte offset of
@@ -3032,22 +3152,21 @@ pub fn rows_to_insert_cols(
             edges,
         };
     }
-    // Prefer key order of first row (hot docs path), then any extras.
-    let mut field_set = BTreeSet::new();
-    let mut uniform = true;
-    for k in rows[0].keys() {
-        field_set.insert(k.as_str());
-    }
-    for r in rows.iter().skip(1) {
-        if r.len() == rows[0].len() && r.keys().eq(rows[0].keys()) {
-            continue;
+    let first_row = &rows[0];
+    let uniform = rows[1..]
+        .iter()
+        .all(|r| r.len() == first_row.len() && r.keys().eq(first_row.keys()));
+    let fields: Vec<String> = if uniform {
+        first_row.keys().cloned().collect()
+    } else {
+        let mut field_set = BTreeSet::new();
+        for r in rows {
+            for k in r.keys() {
+                field_set.insert(k.as_str());
+            }
         }
-        uniform = false;
-        for k in r.keys() {
-            field_set.insert(k.as_str());
-        }
-    }
-    let fields: Vec<String> = field_set.into_iter().map(str::to_owned).collect();
+        field_set.into_iter().map(str::to_owned).collect()
+    };
     if uniform && !rows.is_empty() && rows[0].values().all(|cell| !matches!(cell, Cell::Null)) {
         let mut cols = rows[0]
             .values()

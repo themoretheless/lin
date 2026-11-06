@@ -314,8 +314,12 @@ impl PostingList {
         self.count()
     }
 
+    #[inline]
     pub fn is_empty(&self) -> bool {
-        self.count() == 0
+        match self {
+            PostingList::Standard(vec) => vec.is_empty(),
+            PostingList::Bitmap(set) => set.is_empty(),
+        }
     }
 
     pub fn is_bitmap(&self) -> bool {
@@ -557,28 +561,51 @@ impl LiveIndex {
 
     /// Batch-only insert for slab operations: compute all keys first, then bulk insert
     /// to reduce per-row HashMap overhead and key cloning.
-    pub fn insert_slab_batch(&mut self, start: usize, rows: &[Row]) -> Result<(), String> {
-        let now = crate::store::now_ms();
-        // Partial index check: only insert matching rows
-        let keyed_rows: Vec<(usize, &Row)> = rows
-            .iter()
-            .enumerate()
-            .filter(|(_, row)| {
-                self.def
-                    .pred
-                    .as_ref()
-                    .is_none_or(|pred| crate::exec::eval_pred(pred, row, now))
-            })
-            .map(|(i, row)| (start + i, row))
-            .collect();
+    #[inline]
+    fn insert_one_slab_key(
+        &mut self,
+        orig_idx: usize,
+        row: &Row,
+        key: IndexKey,
+        bitmap_sample: Option<(bool, usize)>,
+    ) -> Result<(), String> {
+        use std::collections::btree_map::Entry;
 
-        if keyed_rows.is_empty() {
+        // Auto-detect bitmap index based on field cardinality
+        // If bitmap_card_field is set, estimate cardinality from sample
+        let is_bitmap = self
+            .def
+            .bitmap_card_field
+            .as_ref()
+            .zip(bitmap_sample)
+            .is_some_and(|(field, (sample_has_bool, count))| {
+                matches!(row.get(field), Some(Cell::Bool(_)))
+                    || sample_has_bool
+                    || (count > 0 && count <= if self.forward.len() > 10_000 { 32 } else { 16 })
+            });
+
+        match self.forward.entry(key) {
+            Entry::Vacant(v) => {
+                self.reverse.insert(orig_idx, v.key().clone());
+                let mut posting = PostingList::new(is_bitmap, 1 << 16);
+                posting.push(orig_idx);
+                v.insert(posting);
+            }
+            Entry::Occupied(mut o) => {
+                if self.def.unique {
+                    return Err(format!("unique index {}: duplicate key", self.def.label()));
+                }
+                self.reverse.insert(orig_idx, o.key().clone());
+                o.get_mut().push(orig_idx);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn insert_slab_batch(&mut self, start: usize, rows: &[Row]) -> Result<(), String> {
+        if rows.is_empty() {
             return Ok(());
         }
-
-        // Pre-compute all keys in a single pass
-        let keys: Vec<_> = keyed_rows.iter().map(|(_, r)| self.key_of(r)).collect();
-        self.reverse.reserve(keyed_rows.len());
 
         let bitmap_sample = self.def.bitmap_card_field.as_ref().map(|field| {
             let mut distinct = rustc_hash::FxHashSet::default();
@@ -593,37 +620,31 @@ impl LiveIndex {
             (false, distinct.len())
         });
 
-        // Bulk insert using pre-computed keys
-        for ((orig_idx, row), key) in keyed_rows.iter().zip(keys.into_iter()) {
-            use std::collections::btree_map::Entry;
+        if let Some(pred) = &self.def.pred {
+            let now = crate::store::now_ms();
+            let keyed_rows: Vec<(usize, &Row)> = rows
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| crate::exec::eval_pred(pred, row, now))
+                .map(|(i, row)| (start + i, row))
+                .collect();
 
-            // Auto-detect bitmap index based on field cardinality
-            // If bitmap_card_field is set, estimate cardinality from sample
-            let is_bitmap = self
-                .def
-                .bitmap_card_field
-                .as_ref()
-                .zip(bitmap_sample)
-                .is_some_and(|(field, (sample_has_bool, count))| {
-                    matches!(row.get(field), Some(Cell::Bool(_)))
-                        || sample_has_bool
-                        || (count > 0 && count <= if self.forward.len() > 10_000 { 32 } else { 16 })
-                });
+            if keyed_rows.is_empty() {
+                return Ok(());
+            }
 
-            match self.forward.entry(key) {
-                Entry::Vacant(v) => {
-                    self.reverse.insert(*orig_idx, v.key().clone());
-                    let mut posting = PostingList::new(is_bitmap, 1 << 16);
-                    posting.push(*orig_idx);
-                    v.insert(posting);
-                }
-                Entry::Occupied(mut o) => {
-                    if self.def.unique {
-                        return Err(format!("unique index {}: duplicate key", self.def.label()));
-                    }
-                    self.reverse.insert(*orig_idx, o.key().clone());
-                    o.get_mut().push(*orig_idx);
-                }
+            let keys: Vec<_> = keyed_rows.iter().map(|(_, r)| self.key_of(r)).collect();
+            self.reverse.reserve(keyed_rows.len());
+
+            for ((orig_idx, row), key) in keyed_rows.iter().zip(keys.into_iter()) {
+                self.insert_one_slab_key(*orig_idx, row, key, bitmap_sample)?;
+            }
+        } else {
+            self.reverse.reserve(rows.len());
+            for (i, row) in rows.iter().enumerate() {
+                let orig_idx = start + i;
+                let key = self.key_of(row);
+                self.insert_one_slab_key(orig_idx, row, key, bitmap_sample)?;
             }
         }
         Ok(())
@@ -676,7 +697,7 @@ impl LiveIndex {
         if let Some(key) = self.reverse.remove(&idx) {
             if let std::collections::btree_map::Entry::Occupied(mut entry) = self.forward.entry(key) {
                 entry.get_mut().remove(idx);
-                if entry.get().count() == 0 {
+                if entry.get().is_empty() {
                     entry.remove();
                 }
             }

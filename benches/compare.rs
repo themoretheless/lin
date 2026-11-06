@@ -3014,13 +3014,13 @@ fn main() -> airbug_bench::Result<()> {
             "cold_reopen_5k/lin",
             move || setup_lin_cold_reopen(COLD_N),
             move |s| {
-                let _ = black_box(lin::Db::open_with(
+                lin::Db::open_with(
                     &s.dir.0,
                     lin::OpenOpts {
                         sync: lin::SyncMode::Full,
                         cold: true,
                     },
-                ));
+                )
             },
             DropPolicy::OutsideTiming,
         )
@@ -3034,9 +3034,7 @@ fn main() -> airbug_bench::Result<()> {
         .bench_with_input(
             "hot_reopen_5k/lin",
             move || setup_lin_hot_reopen(COLD_N),
-            move |s| {
-                let _ = black_box(lin::Db::open(&s.dir.0));
-            },
+            move |s| lin::Db::open(&s.dir.0),
             DropPolicy::OutsideTiming,
         )
         .tag("cold")
