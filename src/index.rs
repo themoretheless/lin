@@ -260,15 +260,22 @@ impl PostingList {
     pub fn replace(&mut self, from: usize, to: usize) {
         match self {
             PostingList::Standard(vec) => {
-                if let Some(p) = vec.iter().position(|&x| x == from) {
+                if let Some(last_elem) = vec.last_mut()
+                    && *last_elem == from
+                {
+                    *last_elem = to;
+                } else if let Some(first_elem) = vec.first_mut()
+                    && *first_elem == from
+                {
+                    *first_elem = to;
+                } else if let Some(p) = vec.iter().position(|&x| x == from) {
                     vec[p] = to;
                 } else {
                     vec.push(to);
                 }
             }
             PostingList::Bitmap(set) => {
-                set.remove(from);
-                set.insert(to);
+                set.replace(from, to);
             }
         }
     }
@@ -277,7 +284,15 @@ impl PostingList {
     pub fn remove(&mut self, pos: usize) {
         match self {
             PostingList::Standard(vec) => {
-                if let Some(p) = vec.iter().position(|&x| x == pos) {
+                if let Some(last_elem) = vec.last()
+                    && *last_elem == pos
+                {
+                    vec.pop();
+                } else if let Some(first_elem) = vec.first()
+                    && *first_elem == pos
+                {
+                    vec.swap_remove(0);
+                } else if let Some(p) = vec.iter().position(|&x| x == pos) {
                     vec.swap_remove(p);
                 }
             }
@@ -438,6 +453,17 @@ impl LiveIndex {
             reverse: FxHashMap::default(),
             #[cfg(feature = "parallel")]
             bloom_filter: None,
+        }
+    }
+
+    /// Read-only snapshot clone: elides the write-only reverse map.
+    pub fn clone_for_read(&self) -> Self {
+        Self {
+            def: self.def.clone(),
+            forward: self.forward.clone(),
+            reverse: FxHashMap::default(),
+            #[cfg(feature = "parallel")]
+            bloom_filter: self.bloom_filter.clone(),
         }
     }
 
@@ -641,6 +667,40 @@ impl LiveIndex {
             }
         } else {
             self.reverse.reserve(rows.len());
+            let first = &rows[0];
+            let uniform = rows[1..].iter().all(|r| r.len() == first.len());
+            if uniform && first.len() <= 32 && self.def.fields.len() <= 8 {
+                let mut slot_to_part = [None; 32];
+                let mut all_found = true;
+                for (part_idx, field) in self.def.fields.iter().enumerate() {
+                    if let Some(pos) = first.keys().position(|k| k == field) {
+                        if pos < 32 {
+                            slot_to_part[pos] = Some(part_idx);
+                        } else {
+                            all_found = false;
+                            break;
+                        }
+                    } else {
+                        all_found = false;
+                        break;
+                    }
+                }
+                if all_found {
+                    let num_parts = self.def.fields.len();
+                    for (i, row) in rows.iter().enumerate() {
+                        let orig_idx = start + i;
+                        let mut parts = smallvec::smallvec![IndexPart::Null; num_parts];
+                        for (pos, val) in row.values().enumerate() {
+                            if let Some(&Some(part_idx)) = slot_to_part.get(pos) {
+                                parts[part_idx] = cell_part(val);
+                            }
+                        }
+                        let key = IndexKey(parts);
+                        self.insert_one_slab_key(orig_idx, row, key, bitmap_sample)?;
+                    }
+                    return Ok(());
+                }
+            }
             for (i, row) in rows.iter().enumerate() {
                 let orig_idx = start + i;
                 let key = self.key_of(row);
@@ -695,13 +755,11 @@ impl LiveIndex {
 
     pub fn remove_at(&mut self, idx: usize) {
         if let Some(key) = self.reverse.remove(&idx) {
-            let mut empty = false;
-            if let Some(vec) = self.forward.get_mut(&key) {
-                vec.remove(idx);
-                empty = vec.is_empty();
-            }
-            if empty {
-                self.forward.remove(&key);
+            if let std::collections::btree_map::Entry::Occupied(mut entry) = self.forward.entry(key) {
+                entry.get_mut().remove(idx);
+                if entry.get().is_empty() {
+                    entry.remove_entry();
+                }
             }
         }
     }
@@ -712,6 +770,54 @@ impl LiveIndex {
                 vec.replace(from, to);
             }
             self.reverse.insert(to, key);
+        }
+    }
+
+    pub fn swap_remove_at(&mut self, p: usize, last: usize) {
+        let key_tail = self.reverse.remove(&last);
+        if let Some(kt) = key_tail {
+            if let Some(kd_slot) = self.reverse.get_mut(&p) {
+                if *kd_slot == kt {
+                    let should_remove = if let Some(list) = self.forward.get_mut(&kt) {
+                        list.remove(last);
+                        list.is_empty()
+                    } else {
+                        false
+                    };
+                    if should_remove {
+                        self.forward.remove(&kt);
+                    }
+                } else {
+                    let kd = std::mem::replace(kd_slot, kt.clone());
+                    let should_remove = if let Some(list) = self.forward.get_mut(&kd) {
+                        list.remove(p);
+                        list.is_empty()
+                    } else {
+                        false
+                    };
+                    if should_remove {
+                        self.forward.remove(&kd);
+                    }
+                    if let Some(list) = self.forward.get_mut(&kt) {
+                        list.replace(last, p);
+                    }
+                }
+            } else {
+                if let Some(list) = self.forward.get_mut(&kt) {
+                    list.replace(last, p);
+                }
+                self.reverse.insert(p, kt);
+            }
+        } else if let Some(kd) = self.reverse.remove(&p) {
+            let should_remove = if let Some(list) = self.forward.get_mut(&kd) {
+                list.remove(p);
+                list.is_empty()
+            } else {
+                false
+            };
+            if should_remove {
+                self.forward.remove(&kd);
+            }
         }
     }
 
@@ -907,13 +1013,20 @@ fn numeric_part(n: f64, integer: Option<i64>) -> IndexPart {
     IndexPart::Num(ordered, integer.map(i128::from).unwrap_or(i128::MIN + 1))
 }
 
+#[inline(always)]
 fn cell_part(c: &Cell) -> IndexPart {
     match c {
         Cell::Null => IndexPart::Null,
         Cell::Bool(b) => IndexPart::Bool(*b),
         Cell::Int(n) => numeric_part(*n as f64, Some(*n)),
         Cell::Time(n) => IndexPart::Time(*n),
-        Cell::Text(s) => IndexPart::Text(Arc::clone(s)),
+        Cell::Text(s) => {
+            if let Some(inline) = crate::store::InlineStr::try_new(s.as_ref()) {
+                IndexPart::SmallText(inline)
+            } else {
+                IndexPart::Text(Arc::clone(s))
+            }
+        }
         Cell::SmallText(s) => IndexPart::SmallText(*s),
         Cell::Float(n) => numeric_part(*n, None),
         Cell::Vec(_) => IndexPart::Null,
@@ -951,6 +1064,7 @@ fn value_part(v: &Value, now: i64) -> IndexPart {
 pub struct BitSet {
     bits: Vec<u64>,
     capacity: usize,
+    count: usize,
 }
 
 impl BitSet {
@@ -959,6 +1073,7 @@ impl BitSet {
         Self {
             bits: vec![0u64; num_words],
             capacity,
+            count: 0,
         }
     }
 
@@ -973,7 +1088,11 @@ impl BitSet {
         } else if pos >= self.capacity {
             self.capacity = self.bits.len() * 64;
         }
-        self.bits[word_idx] |= 1u64 << bit_idx;
+        let mask = 1u64 << bit_idx;
+        if (self.bits[word_idx] & mask) == 0 {
+            self.bits[word_idx] |= mask;
+            self.count += 1;
+        }
     }
 
     #[inline]
@@ -983,7 +1102,17 @@ impl BitSet {
             return;
         }
         let bit_idx = pos & 63;
-        self.bits[word_idx] &= !(1u64 << bit_idx);
+        let mask = 1u64 << bit_idx;
+        if (self.bits[word_idx] & mask) != 0 {
+            self.bits[word_idx] &= !mask;
+            self.count -= 1;
+        }
+    }
+
+    #[inline]
+    pub fn replace(&mut self, from: usize, to: usize) {
+        self.remove(from);
+        self.insert(to);
     }
 
     #[inline]
@@ -998,11 +1127,14 @@ impl BitSet {
 
     #[inline]
     pub fn count(&self) -> usize {
-        self.bits.iter().map(|w| w.count_ones() as usize).sum()
+        self.count
     }
 
     /// Append set positions directly into destination vector without intermediate allocations
     pub fn extend_into(&self, out: &mut Vec<usize>) {
+        if self.count == 0 {
+            return;
+        }
         for (word_idx, &word) in self.bits.iter().enumerate() {
             if word == 0 {
                 continue;
@@ -1022,6 +1154,9 @@ impl BitSet {
 
     /// Invoke closure for each set position without allocating vectors
     pub fn for_each(&self, mut f: impl FnMut(usize)) {
+        if self.count == 0 {
+            return;
+        }
         for (word_idx, &word) in self.bits.iter().enumerate() {
             if word == 0 {
                 continue;
@@ -1041,7 +1176,7 @@ impl BitSet {
 
     /// Convert to Vec<usize> of set positions
     pub fn to_indices(&self) -> Vec<usize> {
-        let mut out = Vec::with_capacity(self.count());
+        let mut out = Vec::with_capacity(self.count);
         self.extend_into(&mut out);
         out
     }
@@ -1056,6 +1191,7 @@ impl BitSet {
                 *a = 0;
             }
         }
+        self.count = self.bits.iter().map(|w| w.count_ones() as usize).sum();
     }
 
     /// Bitwise OR (union) - modifies self
@@ -1069,11 +1205,13 @@ impl BitSet {
         for (a, b) in self.bits.iter_mut().zip(other.bits.iter()) {
             *a |= b;
         }
+        self.count = self.bits.iter().map(|w| w.count_ones() as usize).sum();
     }
 
     /// Check if any bits are set
+    #[inline]
     pub fn is_empty(&self) -> bool {
-        self.bits.iter().all(|&w| w == 0)
+        self.count == 0
     }
 
     /// Check if all bits would be within capacity
@@ -1084,22 +1222,40 @@ impl BitSet {
 
 /// Pick one seek per DNF branch. `or` → union of seeks when every branch is indexable.
 pub fn pick_index(cat: &Catalog, collection: &str, pred: &Pred) -> Option<Vec<IndexUse>> {
-    let branches = dnf(pred)?;
-    let mut uses = Vec::with_capacity(branches.len());
-    for branch in &branches {
-        uses.push(pick_conjunct(cat, collection, branch)?);
-    }
-    Some(uses)
+    pick_index_with_coverage(cat, collection, pred).map(|(u, _)| u)
 }
 
-fn pick_conjunct(cat: &Catalog, collection: &str, pred: &Pred) -> Option<IndexUse> {
-    let atoms = flatten_and(pred);
+/// Pick one seek per DNF branch, also returning whether every atomic predicate is covered
+/// by the chosen index seek(s) in a single pass without re-evaluating DNF.
+pub fn pick_index_with_coverage(
+    cat: &Catalog,
+    collection: &str,
+    pred: &Pred,
+) -> Option<(Vec<IndexUse>, bool)> {
+    if !cat.has_indexes_on(collection) {
+        return None;
+    }
+    let indexes = cat.indexes_on(collection);
+    let branches = dnf_atoms(pred)?;
+    let mut uses = Vec::with_capacity(branches.len());
+    let mut all_covered = true;
+    for branch in &branches {
+        let u = pick_conjunct_atoms(&indexes, branch)?;
+        if all_covered && !index_covers_atoms(branch, &u) {
+            all_covered = false;
+        }
+        uses.push(u);
+    }
+    Some((uses, all_covered))
+}
+
+fn pick_conjunct_atoms(indexes: &[&IndexDef], atoms: &[std::borrow::Cow<'_, Pred>]) -> Option<IndexUse> {
     let mut best: Option<IndexUse> = None;
     let mut best_n = 0usize;
-    for def in cat.indexes_on(collection) {
+    for def in indexes {
         if let Some(ref index_pred) = def.pred {
             let req = flatten_and(index_pred);
-            if !req.iter().all(|r| atoms.contains(r)) {
+            if !req.iter().all(|r| atoms.iter().any(|a| a.as_ref() == *r)) {
                 continue;
             }
         }
@@ -1107,12 +1263,12 @@ fn pick_conjunct(cat: &Catalog, collection: &str, pred: &Pred) -> Option<IndexUs
         let mut range = None;
         let mut n = 0usize;
         for field in &def.fields {
-            if let Some(v) = find_eq(&atoms, field) {
+            if let Some(v) = find_eq_atoms(atoms, field) {
                 eqs.push((field.clone(), v.clone()));
                 n += 1;
                 continue;
             }
-            if let Some((op, v)) = find_range(&atoms, field) {
+            if let Some((op, v)) = find_range_atoms(atoms, field) {
                 range = Some((field.clone(), op, v.clone()));
                 n += 1;
             }
@@ -1127,7 +1283,7 @@ fn pick_conjunct(cat: &Catalog, collection: &str, pred: &Pred) -> Option<IndexUs
         if n > best_n {
             best_n = n;
             best = Some(IndexUse {
-                def: def.clone(),
+                def: (*def).clone(),
                 eqs,
                 range,
             });
@@ -1137,8 +1293,9 @@ fn pick_conjunct(cat: &Catalog, collection: &str, pred: &Pred) -> Option<IndexUs
 }
 
 /// True when every atomic predicate is enforced by the index seek(s) (no residual filter).
+#[allow(dead_code)]
 pub fn index_covers_pred(pred: &Pred, uses: &[IndexUse]) -> bool {
-    let Some(branches) = dnf(pred) else {
+    let Some(branches) = dnf_atoms(pred) else {
         return false;
     };
     if branches.len() != uses.len() {
@@ -1147,12 +1304,13 @@ pub fn index_covers_pred(pred: &Pred, uses: &[IndexUse]) -> bool {
     branches
         .iter()
         .zip(uses.iter())
-        .all(|(branch, use_)| index_covers_conjunct(branch, use_))
+        .all(|(branch, use_)| index_covers_atoms(branch, use_))
 }
 
-fn index_covers_conjunct(pred: &Pred, use_: &IndexUse) -> bool {
+fn index_covers_atoms(atoms: &[std::borrow::Cow<'_, Pred>], use_: &IndexUse) -> bool {
     let pred_atoms = use_.def.pred.as_ref().map(flatten_and).unwrap_or_default();
-    for atom in flatten_and(pred) {
+    for atom in atoms {
+        let atom = atom.as_ref();
         if pred_atoms.contains(&atom) {
             continue;
         }
@@ -1193,10 +1351,32 @@ fn index_covers_conjunct(pred: &Pred, use_: &IndexUse) -> bool {
     true
 }
 
-/// Disjunctive normal form: list of AND-trees (no top-level `or` inside a branch).
-fn dnf(pred: &Pred) -> Option<Vec<Pred>> {
+fn dnf_branch_count(pred: &Pred, limit: usize) -> usize {
+    match pred {
+        Pred::In { values, .. } => values.len().max(1),
+        Pred::Or(a, b) => {
+            let left = dnf_branch_count(a, limit);
+            if left > limit {
+                return left;
+            }
+            left.saturating_add(dnf_branch_count(b, limit))
+        }
+        Pred::And(a, b) => {
+            let left = dnf_branch_count(a, limit);
+            if left > limit {
+                return left;
+            }
+            left.saturating_mul(dnf_branch_count(b, limit))
+        }
+        _ => 1,
+    }
+}
+
+/// Disjunctive normal form: list of atomic conjuncts per branch.
+fn dnf_atoms(pred: &Pred) -> Option<Vec<Vec<std::borrow::Cow<'_, Pred>>>> {
     // Bound both input size and expansion. Falling back to a scan keeps the
     // original predicate as a residual filter and preserves query semantics.
+    const MAX_BRANCHES: usize = 256;
     let mut pending = vec![pred];
     let mut nodes = 0;
     while let Some(p) = pending.pop() {
@@ -1214,10 +1394,13 @@ fn dnf(pred: &Pred) -> Option<Vec<Pred>> {
             _ => {}
         }
     }
-    dnf_bounded(pred)
+    if dnf_branch_count(pred, MAX_BRANCHES) > MAX_BRANCHES {
+        return None;
+    }
+    dnf_atoms_bounded(pred)
 }
 
-fn dnf_bounded(pred: &Pred) -> Option<Vec<Pred>> {
+fn dnf_atoms_bounded(pred: &Pred) -> Option<Vec<Vec<std::borrow::Cow<'_, Pred>>>> {
     const MAX_BRANCHES: usize = 256;
     match pred {
         Pred::In { field, values } => {
@@ -1227,17 +1410,19 @@ fn dnf_bounded(pred: &Pred) -> Option<Vec<Pred>> {
             Some(
                 values
                     .iter()
-                    .map(|v| Pred::Cmp {
-                        field: field.clone(),
-                        op: CmpOp::Eq,
-                        value: v.clone(),
+                    .map(|v| {
+                        vec![std::borrow::Cow::Owned(Pred::Cmp {
+                            field: field.clone(),
+                            op: CmpOp::Eq,
+                            value: v.clone(),
+                        })]
                     })
                     .collect(),
             )
         }
         Pred::Or(a, b) => {
-            let mut out = dnf_bounded(a)?;
-            let right = dnf_bounded(b)?;
+            let mut out = dnf_atoms_bounded(a)?;
+            let right = dnf_atoms_bounded(b)?;
             if out.len().checked_add(right.len())? > MAX_BRANCHES {
                 return None;
             }
@@ -1245,8 +1430,8 @@ fn dnf_bounded(pred: &Pred) -> Option<Vec<Pred>> {
             Some(out)
         }
         Pred::And(a, b) => {
-            let left = dnf_bounded(a)?;
-            let right = dnf_bounded(b)?;
+            let left = dnf_atoms_bounded(a)?;
+            let right = dnf_atoms_bounded(b)?;
             let len = left.len().checked_mul(right.len())?;
             if len > MAX_BRANCHES {
                 return None;
@@ -1254,12 +1439,15 @@ fn dnf_bounded(pred: &Pred) -> Option<Vec<Pred>> {
             let mut out = Vec::with_capacity(len);
             for l in &left {
                 for r in &right {
-                    out.push(Pred::And(Box::new(l.clone()), Box::new(r.clone())));
+                    let mut b = Vec::with_capacity(l.len() + r.len());
+                    b.extend_from_slice(l);
+                    b.extend_from_slice(r);
+                    out.push(b);
                 }
             }
             Some(out)
         }
-        other => Some(vec![other.clone()]),
+        other => Some(vec![vec![std::borrow::Cow::Borrowed(other)]]),
     }
 }
 
@@ -1279,13 +1467,13 @@ fn flatten_and_into<'a>(pred: &'a Pred, out: &mut Vec<&'a Pred>) {
     }
 }
 
-fn find_eq<'a>(atoms: &[&'a Pred], field: &str) -> Option<&'a Value> {
+fn find_eq_atoms<'a>(atoms: &'a [std::borrow::Cow<'_, Pred>], field: &str) -> Option<&'a Value> {
     for a in atoms {
         if let Pred::Cmp {
             field: f,
             op: CmpOp::Eq,
             value,
-        } = a
+        } = a.as_ref()
             && f.as_str() == field
         {
             return Some(value);
@@ -1294,13 +1482,13 @@ fn find_eq<'a>(atoms: &[&'a Pred], field: &str) -> Option<&'a Value> {
     None
 }
 
-fn find_range<'a>(atoms: &[&'a Pred], field: &str) -> Option<(CmpOp, &'a Value)> {
+fn find_range_atoms<'a>(atoms: &'a [std::borrow::Cow<'_, Pred>], field: &str) -> Option<(CmpOp, &'a Value)> {
     for a in atoms {
         if let Pred::Cmp {
             field: f,
             op,
             value,
-        } = a
+        } = a.as_ref()
             && f.as_str() == field
             && matches!(op, CmpOp::Gt | CmpOp::Lt | CmpOp::Ge | CmpOp::Le)
         {

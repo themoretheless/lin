@@ -251,6 +251,23 @@ fn test_decompression_bomb_rejection_lin_1781() {
 }
 
 #[test]
+fn test_zstd_decompression_bomb_rejection() {
+    let mut bomb_data = Vec::new();
+    bomb_data.push(0x04); // Zstd compressor flag
+    bomb_data.extend_from_slice(b"LIN\x04"); // SNAPSHOT_MAGIC
+    bomb_data.extend_from_slice(&[0x28, 0xb5, 0x2f, 0xfd]); // Zstd magic
+    bomb_data.extend_from_slice(&[0x00; 100]); // truncated/invalid or huge payload
+
+    let temp_file = std::env::temp_dir().join(format!("lin-zstd-bomb-{}.bin", std::process::id()));
+    std::fs::write(&temp_file, &bomb_data).unwrap();
+
+    let res = Db::import_backup(&temp_file);
+    assert!(res.is_err(), "zstd decompression bomb must be rejected");
+
+    let _ = std::fs::remove_file(&temp_file);
+}
+
+#[test]
 fn test_graph_expansion_count_limit_lin_1766() {
     let mut db = Db::empty().with_quotas(Quotas {
         max_graph_expansion: 2,

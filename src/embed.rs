@@ -31,6 +31,14 @@ pub trait Embedder: Send + Sync {
             .map(|v| v.as_ref().to_vec())
             .collect()
     }
+
+    /// Embed a sequence of rows. Default implementation extracts row text
+    /// and delegates to `embed_batch`.
+    fn embed_rows(&self, rows: &[&crate::store::Row]) -> Vec<Arc<[f32]>> {
+        let texts = rows.iter().map(|r| row_embed_text(r)).collect::<Vec<_>>();
+        let refs = texts.iter().map(|t| t.as_ref()).collect::<Vec<_>>();
+        self.embed_batch(&refs)
+    }
 }
 
 /// Local hashing embedder (unigram + char trigrams → L2-normalized bag).
@@ -73,7 +81,7 @@ impl Embedder for HashingEmbedder {
     fn embed(&self, text: &str) -> Arc<[f32]> {
         EMBED_SCRATCH.with(|cell| {
             let mut guard = cell.borrow_mut();
-            let (scratch, lower) = &mut *guard;
+            let (scratch, lower, _) = &mut *guard;
             scratch.ensure_dim(self.dim);
             self.fill(scratch, crate::fts::lowercased(text, lower));
             scratch.finish()
@@ -82,14 +90,14 @@ impl Embedder for HashingEmbedder {
 
     fn embed_batch(&self, texts: &[&str]) -> Vec<Arc<[f32]>> {
         let n = texts.len();
-        if n < 512 {
+        if n < 4096 {
             return self.embed_batch_serial(texts);
         }
         let threads = std::thread::available_parallelism()
             .map(|p| p.get())
             .unwrap_or(1)
             .min(8)
-            .min((n + 255) / 256);
+            .min((n + 511) / 512);
         if threads <= 1 {
             return self.embed_batch_serial(texts);
         }
@@ -106,18 +114,70 @@ impl Embedder for HashingEmbedder {
             out
         })
     }
+
+    fn embed_rows(&self, rows: &[&crate::store::Row]) -> Vec<Arc<[f32]>> {
+        let n = rows.len();
+        if n < 4096 {
+            return self.embed_rows_serial(rows);
+        }
+        let threads = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(1)
+            .min(8)
+            .min((n + 511) / 512);
+        if threads <= 1 {
+            return self.embed_rows_serial(rows);
+        }
+        let chunk_size = (n + threads - 1) / threads;
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(threads);
+            for chunk in rows.chunks(chunk_size) {
+                handles.push(scope.spawn(move || self.embed_rows_serial(chunk)));
+            }
+            let mut out = Vec::with_capacity(n);
+            for handle in handles {
+                out.extend(handle.join().expect("embedding worker panicked"));
+            }
+            out
+        })
+    }
 }
 
 impl HashingEmbedder {
     fn embed_batch_serial(&self, texts: &[&str]) -> Vec<Arc<[f32]>> {
         EMBED_SCRATCH.with(|cell| {
             let mut guard = cell.borrow_mut();
-            let (scratch, lower) = &mut *guard;
+            let (scratch, lower, _) = &mut *guard;
             scratch.ensure_dim(self.dim);
             let mut out = Vec::with_capacity(texts.len());
             for text in texts {
                 self.fill(scratch, crate::fts::lowercased(text, lower));
                 out.push(scratch.finish());
+            }
+            out
+        })
+    }
+
+    fn embed_rows_serial(&self, rows: &[&crate::store::Row]) -> Vec<Arc<[f32]>> {
+        EMBED_SCRATCH.with(|cell| {
+            let mut guard = cell.borrow_mut();
+            let (scratch, lower, text_buf) = &mut *guard;
+            scratch.ensure_dim(self.dim);
+            let mut out = Vec::with_capacity(rows.len());
+            for row in rows {
+                match prepare_row_embed_text(row, text_buf) {
+                    RowEmbedText::Empty => {
+                        out.push(scratch.finish());
+                    }
+                    RowEmbedText::Borrowed(text) => {
+                        self.fill(scratch, crate::fts::lowercased(text, lower));
+                        out.push(scratch.finish());
+                    }
+                    RowEmbedText::Appended => {
+                        self.fill(scratch, crate::fts::lowercased(text_buf, lower));
+                        out.push(scratch.finish());
+                    }
+                }
             }
             out
         })
@@ -170,8 +230,9 @@ fn bigram_slots() -> &'static [u16] {
 }
 
 thread_local! {
-    static EMBED_SCRATCH: std::cell::RefCell<(Scratch, String)> = std::cell::RefCell::new((
+    static EMBED_SCRATCH: std::cell::RefCell<(Scratch, String, String)> = std::cell::RefCell::new((
         Scratch::new(768),
+        String::with_capacity(256),
         String::with_capacity(256),
     ));
 }
@@ -218,7 +279,14 @@ impl Scratch {
     fn bump(&mut self, key: impl Hash, w: f32) {
         let mut h = FxHasher::default();
         key.hash(&mut h);
-        let i = (h.finish() as usize) % self.v.len();
+        let dim = self.v.len();
+        let i = if dim == 768 {
+            (h.finish() as usize) % 768
+        } else if dim.is_power_of_two() {
+            (h.finish() as usize) & (dim - 1)
+        } else {
+            (h.finish() as usize) % dim
+        };
         self.bump_slot(i, w);
     }
 
@@ -1452,28 +1520,47 @@ impl VectorIndex {
     }
 }
 
-/// Text blob used for embedding a row (title / body / snippet).
-pub(crate) fn row_embed_text(row: &crate::store::Row) -> std::borrow::Cow<'_, str> {
+pub(crate) enum RowEmbedText<'a> {
+    Empty,
+    Borrowed(&'a str),
+    Appended,
+}
+
+/// Append or extract the text blob used for embedding a row (title / body / snippet).
+/// Reuses `buf` if multiple fields are present.
+pub(crate) fn prepare_row_embed_text<'a>(
+    row: &'a crate::store::Row,
+    buf: &mut String,
+) -> RowEmbedText<'a> {
     let texts = ["title", "body", "snippet"].map(|k| crate::store::row_text(row, k));
     let bytes = texts.iter().flatten().map(|t| t.len()).sum::<usize>();
     if bytes == 0 {
-        return std::borrow::Cow::Borrowed("");
+        return RowEmbedText::Empty;
     }
-    // Leading empty fields contribute no separator. Any present field after
-    // the first nonempty one does, including an empty trailing field.
     if let Some(first) = texts.iter().position(|t| t.is_some_and(|s| !s.is_empty()))
         && texts[first + 1..].iter().all(Option::is_none)
     {
-        return std::borrow::Cow::Borrowed(texts[first].unwrap());
+        return RowEmbedText::Borrowed(texts[first].unwrap());
     }
-    let mut blob = String::with_capacity(bytes + 2);
+    buf.clear();
+    buf.reserve(bytes + 2);
     for text in texts.into_iter().flatten() {
-        if !blob.is_empty() {
-            blob.push(' ');
+        if !buf.is_empty() {
+            buf.push(' ');
         }
-        blob.push_str(text);
+        buf.push_str(text);
     }
-    std::borrow::Cow::Owned(blob)
+    RowEmbedText::Appended
+}
+
+/// Text blob used for embedding a row (title / body / snippet).
+pub(crate) fn row_embed_text(row: &crate::store::Row) -> std::borrow::Cow<'_, str> {
+    let mut buf = String::new();
+    match prepare_row_embed_text(row, &mut buf) {
+        RowEmbedText::Empty => std::borrow::Cow::Borrowed(""),
+        RowEmbedText::Borrowed(s) => std::borrow::Cow::Borrowed(s),
+        RowEmbedText::Appended => std::borrow::Cow::Owned(buf),
+    }
 }
 
 #[cfg(test)]

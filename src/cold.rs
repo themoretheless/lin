@@ -78,26 +78,49 @@ pub fn choose_codec_bytes(
 
     let entropy = calculate_entropy(encoded);
 
-    let want_flate = match strategy {
-        CompressionStrategy::Maximum => true,
-        CompressionStrategy::Speed => false,
-        CompressionStrategy::Adaptive => entropy < 3.0,
-    };
+    // High entropy (> 7.8) means data is essentially incompressible
+    if entropy > 7.8 {
+        return (false, CompressionCodec::None);
+    }
 
-    if want_flate {
-        #[cfg(feature = "compress-flate")]
-        return (true, CompressionCodec::Flate);
-        #[cfg(all(not(feature = "compress-flate"), feature = "compress-lz4"))]
-        return (true, CompressionCodec::Lz4);
-        #[cfg(not(any(feature = "compress-flate", feature = "compress-lz4")))]
-        return (false, CompressionCodec::None);
-    } else {
-        #[cfg(feature = "compress-lz4")]
-        return (true, CompressionCodec::Lz4);
-        #[cfg(all(not(feature = "compress-lz4"), feature = "compress-flate"))]
-        return (true, CompressionCodec::Flate);
-        #[cfg(not(any(feature = "compress-flate", feature = "compress-lz4")))]
-        return (false, CompressionCodec::None);
+    #[cfg(feature = "compress-zstd")]
+    {
+        match strategy {
+            CompressionStrategy::Maximum | CompressionStrategy::Adaptive => {
+                return (true, CompressionCodec::Zstd);
+            }
+            CompressionStrategy::Speed => {
+                #[cfg(feature = "compress-lz4")]
+                return (true, CompressionCodec::Lz4);
+                #[cfg(not(feature = "compress-lz4"))]
+                return (true, CompressionCodec::Zstd);
+            }
+        }
+    }
+
+    #[cfg(not(feature = "compress-zstd"))]
+    {
+        let want_flate = match strategy {
+            CompressionStrategy::Maximum => true,
+            CompressionStrategy::Speed => false,
+            CompressionStrategy::Adaptive => entropy < 3.0,
+        };
+
+        if want_flate {
+            #[cfg(feature = "compress-flate")]
+            return (true, CompressionCodec::Flate);
+            #[cfg(all(not(feature = "compress-flate"), feature = "compress-lz4"))]
+            return (true, CompressionCodec::Lz4);
+            #[cfg(not(any(feature = "compress-flate", feature = "compress-lz4")))]
+            return (false, CompressionCodec::None);
+        } else {
+            #[cfg(feature = "compress-lz4")]
+            return (true, CompressionCodec::Lz4);
+            #[cfg(all(not(feature = "compress-lz4"), feature = "compress-flate"))]
+            return (true, CompressionCodec::Flate);
+            #[cfg(not(any(feature = "compress-flate", feature = "compress-lz4")))]
+            return (false, CompressionCodec::None);
+        }
     }
 }
 
@@ -116,6 +139,7 @@ pub enum CompressionCodec {
     None,
     Flate, // gzip (maximum compression)
     Lz4,   // lz4 (fast decompression)
+    Zstd,  // zstd (high compression + ultra-fast decompression)
 }
 
 impl std::fmt::Display for CompressionCodec {
@@ -124,6 +148,7 @@ impl std::fmt::Display for CompressionCodec {
             CompressionCodec::None => write!(f, "none"),
             CompressionCodec::Flate => write!(f, "flate"),
             CompressionCodec::Lz4 => write!(f, "lz4"),
+            CompressionCodec::Zstd => write!(f, "zstd"),
         }
     }
 }
@@ -246,6 +271,28 @@ impl ColdCol {
                     #[cfg(not(feature = "compress-lz4"))]
                     Err(io_err("lz4 compression not enabled"))
                 }
+                0x03 => {
+                    #[cfg(feature = "compress-zstd")]
+                    {
+                        use std::io::Read;
+                        let compressed_data = self
+                            .mmap
+                            .get(data_offset..)
+                            .ok_or_else(|| io_err("cold mmap offset out of bounds"))?;
+                        let decoder = zstd::Decoder::new(compressed_data).map_err(io_err)?;
+                        let mut limited = decoder.take(256 * 1024 * 1024 + 1);
+                        let mut result = Vec::new();
+                        limited.read_to_end(&mut result).map_err(io_err)?;
+                        if result.len() > 256 * 1024 * 1024 {
+                            return Err(io_err(
+                                "cold mmap payload exceeds maximum decompression limit",
+                            ));
+                        }
+                        rmp_serde::from_slice(&result).map_err(io_err)
+                    }
+                    #[cfg(not(feature = "compress-zstd"))]
+                    Err(io_err("zstd compression not enabled"))
+                }
                 _ => Err(io_err("unknown compression format")),
             }
         } else {
@@ -259,7 +306,7 @@ impl ColdCol {
 }
 
 /// Write `rows` as a cold file (atomic replace) with optional compression
-#[cfg(any(feature = "compress-flate", feature = "compress-lz4"))]
+#[cfg(any(feature = "compress-flate", feature = "compress-lz4", feature = "compress-zstd"))]
 pub fn write_cold(data: &Path, name: &str, rows: &[Row]) -> Result<(), Error> {
     let dir = cold_dir(data);
     fs::create_dir_all(&dir).map_err(io_err)?;
@@ -305,6 +352,17 @@ pub fn write_cold(data: &Path, name: &str, rows: &[Row]) -> Result<(), Error> {
                 #[cfg(not(feature = "compress-lz4"))]
                 return Err(io_err("lz4 compression not enabled"));
             }
+            CompressionCodec::Zstd => {
+                #[cfg(feature = "compress-zstd")]
+                {
+                    body.push(0x03); // Flag for Zstd
+                    body.extend_from_slice(&COLD_MAGIC);
+                    let compressed = zstd::encode_all(&encoded[..], 3).map_err(io_err)?;
+                    body.extend_from_slice(&compressed);
+                }
+                #[cfg(not(feature = "compress-zstd"))]
+                return Err(io_err("zstd compression not enabled"));
+            }
             CompressionCodec::None => {
                 body.extend_from_slice(&COLD_MAGIC);
                 body.extend_from_slice(&encoded);
@@ -319,7 +377,7 @@ pub fn write_cold(data: &Path, name: &str, rows: &[Row]) -> Result<(), Error> {
 }
 
 /// Write `rows` as a cold file without compression (for non-compression builds)
-#[cfg(not(any(feature = "compress-flate", feature = "compress-lz4")))]
+#[cfg(not(any(feature = "compress-flate", feature = "compress-lz4", feature = "compress-zstd")))]
 pub fn write_cold(data: &Path, name: &str, rows: &[Row]) -> Result<(), Error> {
     let dir = cold_dir(data);
     fs::create_dir_all(&dir).map_err(io_err)?;
@@ -381,4 +439,36 @@ pub fn map_cold_with_count(data: &Path, name: &str, count: usize) -> Result<Cold
 /// Drop stale cold files not listed in `keep`.
 pub fn prune_cold(data: &Path, keep: &[String]) -> Result<(), Error> {
     crate::persist::prune_bins(&cold_dir(data), keep)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cold_compression_and_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("lin-cold-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+
+        let mut rows = Vec::new();
+        for i in 0..500 {
+            let mut r = Row::new();
+            r.insert("id".into(), crate::store::Cell::text_arc(format!("doc-{}", i)));
+            r.insert(
+                "title".into(),
+                crate::store::Cell::text_arc("Repetitive title for compression testing"),
+            );
+            rows.push(r);
+        }
+
+        write_cold(&dir, "test_col", &rows).expect("write cold");
+
+        let mapped = map_cold(&dir, "test_col").expect("map cold");
+        let decoded = mapped.rows().expect("decode cold");
+        assert_eq!(decoded.len(), 500);
+        assert_eq!(decoded[0].get("id"), rows[0].get("id"));
+        assert_eq!(decoded[499].get("title"), rows[499].get("title"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

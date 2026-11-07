@@ -613,9 +613,8 @@ fn build_left_source(
     now: i64,
 ) -> (RowSource, bool) {
     if let Some(pred) = filter {
-        if let Some(uses) = crate::index::pick_index(catalog, name, pred) {
+        if let Some((uses, covered)) = crate::index::pick_index_with_coverage(catalog, name, pred) {
             if let Some(idxs) = store.index_seek(name, &uses, now) {
-                let covered = crate::index::index_covers_pred(pred, &uses);
                 return (RowSource::Idxs(idxs), !covered);
             }
         }

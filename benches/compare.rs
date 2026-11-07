@@ -33,7 +33,12 @@ use lin::Queryable as LinQueryable;
 use lin::query::pred;
 use mysql::prelude::Queryable;
 
-const N: usize = 10_000;
+fn bench_n() -> usize {
+    std::env::var("LIN_BENCH_N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10_000)
+}
 const INSERT_1K: usize = 1_000;
 const INSERT_10K: usize = 10_000;
 /// Probe row index inside the seeded set (wing=rag, title contains "wal").
@@ -131,7 +136,8 @@ fn lin_insert_src(rows: &[Doc]) -> String {
 fn validate_lin_fixture_timestamps(db: &lin::Db, fixtures: &[Doc]) {
     let rows = db.store.collection("docs");
     assert_eq!(rows.len(), fixtures.len());
-    for (row, fixture) in rows.iter().zip(fixtures) {
+    let step = if fixtures.len() >= 100_000 { 100 } else { 1 };
+    for (row, fixture) in rows.iter().step_by(step).zip(fixtures.iter().step_by(step)) {
         assert_eq!(
             row.get("id").and_then(lin::Cell::text),
             Some(fixture.id.as_str())
@@ -297,9 +303,24 @@ struct LinWarm {
 
 fn seed_lin(n: usize) -> LinWarm {
     let rows = docs(n);
-    let mut db = lin::Db::empty();
+    let mut db = if n >= 1_000_000 {
+        lin::Db::empty().with_quotas(lin::Quotas {
+            max_output_bytes: 4 * 1024 * 1024 * 1024,
+            max_execution_work: 500_000_000,
+            ..Default::default()
+        })
+    } else {
+        lin::Db::empty()
+    };
     db.run("index docs [wing, ts]").expect("lin index");
-    for chunk in rows.chunks(500) {
+    let chunk_size = if n >= 1_000_000 {
+        10_000
+    } else if n >= 100_000 {
+        5_000
+    } else {
+        500
+    };
+    for chunk in rows.chunks(chunk_size) {
         db.run(&lin_insert_src(chunk)).expect("lin seed");
     }
     validate_lin_fixture_timestamps(&db, &rows);
@@ -388,6 +409,7 @@ fn seed_sqlite(n: usize) -> SqlWarm {
          CREATE INDEX docs_wing_ts ON docs(wing, ts);",
     )
     .expect("sqlite schema");
+    conn.execute_batch("BEGIN TRANSACTION;").expect("sqlite begin");
     {
         let mut stmt = conn
             .prepare("INSERT INTO docs (id, uri, wing, title, ts, body) VALUES (?1,?2,?3,?4,?5,?6)")
@@ -399,6 +421,7 @@ fn seed_sqlite(n: usize) -> SqlWarm {
             .expect("sqlite seed");
         }
     }
+    conn.execute_batch("COMMIT;").expect("sqlite commit");
     {
         let _ = conn.prepare_cached("SELECT COUNT(*) FROM docs WHERE id = ?1");
         let _ = conn.prepare_cached("SELECT COUNT(*) FROM docs WHERE wing = 'rag'");
@@ -432,6 +455,7 @@ fn seed_duck(n: usize) -> DuckWarm {
          CREATE INDEX docs_wing_ts ON docs(wing, ts);",
     )
     .expect("duckdb schema");
+    conn.execute_batch("BEGIN TRANSACTION;").expect("duck begin");
     {
         let mut stmt = conn
             .prepare("INSERT INTO docs (id, uri, wing, title, ts, body) VALUES (?,?,?,?,?,?)")
@@ -441,6 +465,7 @@ fn seed_duck(n: usize) -> DuckWarm {
                 .expect("duck seed");
         }
     }
+    conn.execute_batch("COMMIT;").expect("duck commit");
     DuckWarm {
         probe_id: rows[PROBE].id.clone(),
         conn,
@@ -1895,6 +1920,8 @@ fn main() -> airbug_bench::Result<()> {
         engines.push_str(" | MySQL(skipped)");
     }
 
+    #[allow(non_snake_case)]
+    let N = bench_n();
     eprintln!(
         "lin compare: N={N} warm reads (fixture), bulk insert (schema outside timing)\n\
          engines: {engines}\n\
@@ -1909,11 +1936,11 @@ fn main() -> airbug_bench::Result<()> {
     let mut suite = Suite::new("compare");
     suite.config(Config::profile("quick")?);
 
-    let lin = Fixture::new(|| seed_lin(N));
+    let lin = Fixture::new(move || seed_lin(N));
     let lin_rebuild = Fixture::new(|| seed_lin_rebuild(5_000));
-    let sql = Fixture::new(|| seed_sqlite(N));
-    let duck = Fixture::new(|| seed_duck(N));
-    let map = Fixture::new(|| seed_map(N));
+    let sql = Fixture::new(move || seed_sqlite(N));
+    let duck = Fixture::new(move || seed_duck(N));
+    let map = Fixture::new(move || seed_map(N));
     let (pg_fix, pg_url) = match pg {
         Some((url, client)) => (Some(Fixture::new(move || seed_pg(N, client))), Some(url)),
         None => (None, None),
@@ -3103,7 +3130,7 @@ fn main() -> airbug_bench::Result<()> {
 
     // Prepared single-row writes, sampled read-back validation outside timing.
     // Setup and fixture destruction are excluded by bench_checked's input lifecycle.
-    for (label, n) in [("1k", 1_000usize), ("10k", N), ("100k", 100_000)] {
+    for (label, n) in [("1k", 1_000usize), ("10k", 10_000), ("100k", 100_000), ("1m", 1_000_000)] {
         suite
             .bench_checked(
                 &format!("update_1row_{label}/lin"),
@@ -3194,7 +3221,7 @@ fn main() -> airbug_bench::Result<()> {
             .work_units("stmts", 1);
     }
 
-    for (label, n) in [("1k", 1_000usize), ("10k", N)] {
+    for (label, n) in [("1k", 1_000usize), ("10k", 10_000)] {
         suite
             .bench_checked(
                 &format!("tx_commit_1row_{label}/lin"),
@@ -3317,7 +3344,7 @@ fn main() -> airbug_bench::Result<()> {
             .parameter("depth", depth);
     }
 
-    let lin_snapshot = Fixture::new(|| seed_lin(N));
+    let lin_snapshot = Fixture::new(move || seed_lin(N));
     suite
         .bench_fixture("reader_snapshot/lin", lin_snapshot, |s| {
             black_box(
@@ -3354,7 +3381,14 @@ fn setup_lin_write(n: usize) -> LinWrite {
     let rows = docs(n);
     let mut db = lin::Db::empty();
     db.run("index docs [wing, ts]").expect("lin index");
-    for chunk in rows.chunks(500) {
+    let chunk_size = if n >= 1_000_000 {
+        10_000
+    } else if n >= 100_000 {
+        5_000
+    } else {
+        500
+    };
+    for chunk in rows.chunks(chunk_size) {
         db.run(&lin_insert_src(chunk)).expect("lin seed");
     }
     validate_lin_fixture_timestamps(&db, &rows);

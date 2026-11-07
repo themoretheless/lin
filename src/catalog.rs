@@ -154,6 +154,11 @@ impl Catalog {
         self.rels.get(name)
     }
 
+    #[inline]
+    pub fn has_indexes_on(&self, collection: &str) -> bool {
+        self.indexes.values().any(|i| i.collection == collection)
+    }
+
     pub fn indexes_on(&self, collection: &str) -> Vec<&IndexDef> {
         self.indexes
             .values()

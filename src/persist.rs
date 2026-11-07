@@ -26,6 +26,7 @@ use std::cell::RefCell;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, IoSlice, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -107,9 +108,9 @@ pub enum Pack {
     },
     /// Columnar facts — far denser than N× `{s,p,o}` Cell maps.
     AppendFactsBulk {
-        s: Vec<String>,
-        p: Vec<String>,
-        o: Vec<String>,
+        s: Vec<std::sync::Arc<str>>,
+        p: Vec<std::sync::Arc<str>>,
+        o: Vec<std::sync::Arc<str>>,
     },
     AppendEdge {
         rel: String,
@@ -751,48 +752,39 @@ pub fn encode_snapshot_ref_to_writer<W: std::io::Write>(
         }
     }
 
+    let encode_chunk = |rows: &[Row]| -> Result<Vec<u8>, Error> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let raw = rmp_serde::encode::to_vec_named(rows).map_err(io_err)?;
+        #[cfg(feature = "compress-zstd")]
+        {
+            zstd::encode_all(&raw[..], 1).map_err(io_err)
+        }
+        #[cfg(not(feature = "compress-zstd"))]
+        {
+            Ok(raw)
+        }
+    };
+
     let encoded_chunks: Vec<Result<Vec<u8>, Error>> = if chunk_defs.len() > 1 {
         #[cfg(feature = "parallel")]
         {
             use rayon::prelude::*;
-            chunk_defs
-                .par_iter()
-                .map(|c| {
-                    if c.rows.is_empty() {
-                        Ok(Vec::new())
-                    } else {
-                        rmp_serde::encode::to_vec_named(c.rows).map_err(io_err)
-                    }
-                })
-                .collect()
+            chunk_defs.par_iter().map(|c| encode_chunk(c.rows)).collect()
         }
         #[cfg(not(feature = "parallel"))]
         {
             std::thread::scope(|s| {
                 let mut handles = Vec::with_capacity(chunk_defs.len());
                 for c in &chunk_defs {
-                    handles.push(s.spawn(move || {
-                        if c.rows.is_empty() {
-                            Ok(Vec::new())
-                        } else {
-                            rmp_serde::encode::to_vec_named(c.rows).map_err(io_err)
-                        }
-                    }));
+                    handles.push(s.spawn(move || encode_chunk(c.rows)));
                 }
                 handles.into_iter().map(|h| h.join().unwrap()).collect()
             })
         }
     } else {
-        chunk_defs
-            .iter()
-            .map(|c| {
-                if c.rows.is_empty() {
-                    Ok(Vec::new())
-                } else {
-                    rmp_serde::encode::to_vec_named(c.rows).map_err(io_err)
-                }
-            })
-            .collect()
+        chunk_defs.iter().map(|c| encode_chunk(c.rows)).collect()
     };
 
     writer
@@ -992,13 +984,23 @@ fn encode_snapshot_bytes(snap: &Snapshot) -> Result<Vec<u8>, Error> {
 }
 
 /// Encode snapshot with optional compression (feature-gated)
-#[cfg(any(feature = "compress-flate", feature = "compress-lz4"))]
+#[cfg(any(feature = "compress-flate", feature = "compress-lz4", feature = "compress-zstd"))]
 #[allow(dead_code)]
 pub fn encode_snapshot_compressed(snap: &Snapshot) -> Result<Vec<u8>, Error> {
     let mut body = Vec::new();
     rmp_serde::encode::write_named(&mut body, snap).map_err(io_err)?;
 
-    #[cfg(feature = "compress-flate")]
+    #[cfg(feature = "compress-zstd")]
+    {
+        let compressed = zstd::encode_all(&body[..], 3).map_err(io_err)?;
+        let mut out = Vec::with_capacity(5 + compressed.len());
+        out.push(0x04); // Zstd flag
+        out.extend_from_slice(&SNAPSHOT_MAGIC);
+        out.extend_from_slice(&compressed);
+        return Ok(out);
+    }
+
+    #[cfg(all(not(feature = "compress-zstd"), feature = "compress-flate"))]
     {
         use flate2::Compression;
         use flate2::write::GzEncoder;
@@ -1016,7 +1018,7 @@ pub fn encode_snapshot_compressed(snap: &Snapshot) -> Result<Vec<u8>, Error> {
         Ok(out)
     }
 
-    #[cfg(all(not(feature = "compress-flate"), feature = "compress-lz4"))]
+    #[cfg(all(not(feature = "compress-zstd"), not(feature = "compress-flate"), feature = "compress-lz4"))]
     {
         use lz4::block::{CompressionMode, compress};
 
@@ -1069,6 +1071,25 @@ fn decode_snapshot_bytes(bytes: &[u8]) -> Option<Snapshot> {
                 }
             }
             0x03 => return decode_chunked_snapshot(compressed_data),
+            0x04 => {
+                #[cfg(feature = "compress-zstd")]
+                {
+                    use std::io::Read;
+                    let decoder = zstd::Decoder::new(compressed_data).ok()?;
+                    let mut limited = decoder.take(256 * 1024 * 1024 + 1);
+                    let mut result = Vec::new();
+                    limited.read_to_end(&mut result).ok()?;
+                    if result.len() > 256 * 1024 * 1024 {
+                        return None;
+                    }
+                    return rmp_serde::from_slice(&result).ok();
+                }
+                #[cfg(not(feature = "compress-zstd"))]
+                {
+                    let _ = compressed_data;
+                    return None;
+                }
+            }
             _ => return None,
         }
     }
@@ -1078,6 +1099,40 @@ fn decode_snapshot_bytes(bytes: &[u8]) -> Option<Snapshot> {
         return rmp_serde::from_slice(&bytes[4..]).ok();
     }
     serde_json::from_slice(bytes).ok()
+}
+
+struct ChunkSlice<'a> {
+    name: &'a str,
+    data: &'a [u8],
+}
+
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
+
+fn decode_snapshot_chunk<'a>(c: &ChunkSlice<'a>) -> Result<(&'a str, Vec<Row>), ()> {
+    if c.data.is_empty() {
+        return Ok((c.name, Vec::new()));
+    }
+    if c.data.len() >= 4 && c.data[0..4] == ZSTD_MAGIC {
+        #[cfg(feature = "compress-zstd")]
+        {
+            use std::io::Read;
+            let decoder = zstd::Decoder::new(c.data).map_err(|_| ())?;
+            let mut limited = decoder.take(256 * 1024 * 1024 + 1);
+            let mut decompressed = Vec::new();
+            limited.read_to_end(&mut decompressed).map_err(|_| ())?;
+            if decompressed.len() > 256 * 1024 * 1024 {
+                return Err(());
+            }
+            let rows: Vec<Row> = rmp_serde::from_slice(&decompressed).map_err(|_| ())?;
+            return Ok((c.name, rows));
+        }
+        #[cfg(not(feature = "compress-zstd"))]
+        {
+            return Err(());
+        }
+    }
+    let rows: Vec<Row> = rmp_serde::from_slice(c.data).map_err(|_| ())?;
+    Ok((c.name, rows))
 }
 
 fn decode_chunked_snapshot(data: &[u8]) -> Option<Snapshot> {
@@ -1095,10 +1150,6 @@ fn decode_chunked_snapshot(data: &[u8]) -> Option<Snapshot> {
     let chunk_count = u32::from_le_bytes(data[offset..offset + 4].try_into().ok()?) as usize;
     offset += 4;
 
-    struct ChunkSlice<'a> {
-        name: &'a str,
-        data: &'a [u8],
-    }
     let mut chunk_slices = Vec::with_capacity(chunk_count);
     for _ in 0..chunk_count {
         if data.len() < offset + 2 {
@@ -1128,17 +1179,7 @@ fn decode_chunked_snapshot(data: &[u8]) -> Option<Snapshot> {
         #[cfg(feature = "parallel")]
         {
             use rayon::prelude::*;
-            chunk_slices
-                .par_iter()
-                .map(|c| {
-                    if c.data.is_empty() {
-                        Ok((c.name, Vec::new()))
-                    } else {
-                        let rows: Vec<Row> = rmp_serde::from_slice(c.data).map_err(|_| ())?;
-                        Ok((c.name, rows))
-                    }
-                })
-                .collect()
+            chunk_slices.par_iter().map(decode_snapshot_chunk).collect()
         }
         #[cfg(not(feature = "parallel"))]
         {
@@ -1155,15 +1196,7 @@ fn decode_chunked_snapshot(data: &[u8]) -> Option<Snapshot> {
                         handles.push(s.spawn(move || {
                             let mut res = Vec::with_capacity(block.len());
                             for c in block {
-                                if c.data.is_empty() {
-                                    res.push(Ok((c.name, Vec::new())));
-                                } else {
-                                    let r: Result<Vec<Row>, _> = rmp_serde::from_slice(c.data);
-                                    match r {
-                                        Ok(rows) => res.push(Ok((c.name, rows))),
-                                        Err(_) => res.push(Err(())),
-                                    }
-                                }
+                                res.push(decode_snapshot_chunk(c));
                             }
                             res
                         }));
@@ -1179,31 +1212,11 @@ fn decode_chunked_snapshot(data: &[u8]) -> Option<Snapshot> {
                     all
                 })
             } else {
-                chunk_slices
-                    .iter()
-                    .map(|c| {
-                        if c.data.is_empty() {
-                            Ok((c.name, Vec::new()))
-                        } else {
-                            let rows: Vec<Row> = rmp_serde::from_slice(c.data).map_err(|_| ())?;
-                            Ok((c.name, rows))
-                        }
-                    })
-                    .collect()
+                chunk_slices.iter().map(decode_snapshot_chunk).collect()
             }
         }
     } else {
-        chunk_slices
-            .iter()
-            .map(|c| {
-                if c.data.is_empty() {
-                    Ok((c.name, Vec::new()))
-                } else {
-                    let rows: Vec<Row> = rmp_serde::from_slice(c.data).map_err(|_| ())?;
-                    Ok((c.name, rows))
-                }
-            })
-            .collect()
+        chunk_slices.iter().map(decode_snapshot_chunk).collect()
     };
 
     let mut collections: std::collections::BTreeMap<String, Vec<Row>> =
@@ -1662,6 +1675,7 @@ pub(crate) fn durable_sync(file: &File) -> io::Result<()> {
     }
 }
 
+#[inline(always)]
 fn put_str(buf: &mut Vec<u8>, s: &str) {
     let b = s.as_bytes();
     buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
@@ -1672,16 +1686,16 @@ fn append_facts_v2(
     log: &mut File,
     rec_gen: u64,
     next_id: u64,
-    s: &[String],
-    p: &[String],
-    o: &[String],
+    s: &[std::sync::Arc<str>],
+    p: &[std::sync::Arc<str>],
+    o: &[std::sync::Arc<str>],
     buf: &mut Vec<u8>,
     sync: SyncMode,
     log_bytes: &mut u64,
 ) -> Result<(), Error> {
     let n = s.len().min(p.len()).min(o.len());
     buf.clear();
-    buf.reserve(64 + n * 48);
+    buf.reserve(25 + n * 48);
     buf.push(V2_FACTS_BULK);
     buf.extend_from_slice(&rec_gen.to_le_bytes());
     buf.extend_from_slice(&next_id.to_le_bytes());
@@ -1692,6 +1706,40 @@ fn append_facts_v2(
         put_str(buf, &o[i]);
     }
     write_frame(log, &LOG_MAGIC_V2, buf, sync, log_bytes)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn count_non_zero8(values: &[f32]) -> usize {
+    use std::arch::aarch64::*;
+    unsafe {
+        let a = vreinterpretq_u32_f32(vld1q_f32(values.as_ptr()));
+        let b = vreinterpretq_u32_f32(vld1q_f32(values.as_ptr().add(4)));
+        let zero = vdupq_n_u32(0);
+        let a_nz = vshrq_n_u32(vmvnq_u32(vceqq_u32(a, zero)), 31);
+        let b_nz = vshrq_n_u32(vmvnq_u32(vceqq_u32(b, zero)), 31);
+        vaddvq_u32(vaddq_u32(a_nz, b_nz)) as usize
+    }
+}
+
+#[inline]
+fn count_non_zero_floats(values: &[f32]) -> usize {
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("neon") {
+        let mut count = 0usize;
+        let chunks = values.chunks_exact(8);
+        let remainder = chunks.remainder();
+        for chunk in chunks {
+            count += unsafe { count_non_zero8(chunk) };
+        }
+        for &x in remainder {
+            if x.to_bits() != 0 {
+                count += 1;
+            }
+        }
+        return count;
+    }
+    values.iter().filter(|x| x.to_bits() != 0).count()
 }
 
 fn use_sparse_vectors(rows: &[Option<std::sync::Arc<[f32]>>]) -> bool {
@@ -1711,32 +1759,38 @@ fn use_sparse_vectors(rows: &[Option<std::sync::Arc<[f32]>>]) -> bool {
     if rows.len() >= 4096 && dense >= 8 * 1024 * 1024 {
         return sparse_bytes_parallel(rows) < dense;
     }
-    let sparse = rows
-        .iter()
-        .map(|row| {
-            row.as_ref().map_or(4, |v| {
-                8usize.saturating_add(
-                    v.iter()
-                        .filter(|value| value.to_bits() != 0)
-                        .count()
-                        .saturating_mul(8),
-                )
-            })
-        })
-        .fold(0usize, usize::saturating_add);
-    sparse < dense
+    let mut sparse_so_far = 0usize;
+    let mut dense_so_far = 0usize;
+    let n = rows.len();
+    for (i, row) in rows.iter().enumerate() {
+        let (d, s) = match row.as_ref() {
+            None => (4, 4),
+            Some(v) => {
+                let d = 4usize.saturating_add(v.len().saturating_mul(4));
+                let s = 8usize.saturating_add(count_non_zero_floats(v).saturating_mul(8));
+                (d, s)
+            }
+        };
+        sparse_so_far = sparse_so_far.saturating_add(s);
+        dense_so_far = dense_so_far.saturating_add(d);
+        if sparse_so_far > dense_so_far {
+            let deficit = sparse_so_far - dense_so_far;
+            let remaining_rows = n - 1 - i;
+            let dense_remaining = dense.saturating_sub(dense_so_far);
+            let max_future_savings = dense_remaining.saturating_sub(remaining_rows.saturating_mul(4));
+            if remaining_rows > 0 && deficit >= max_future_savings {
+                return false;
+            }
+        }
+    }
+    sparse_so_far < dense
 }
 
 fn sparse_bytes_serial(rows: &[Option<std::sync::Arc<[f32]>>]) -> usize {
     rows.iter()
         .map(|row| {
             row.as_ref().map_or(4, |v| {
-                8usize.saturating_add(
-                    v.iter()
-                        .filter(|value| value.to_bits() != 0)
-                        .count()
-                        .saturating_mul(8),
-                )
+                8usize.saturating_add(count_non_zero_floats(v).saturating_mul(8))
             })
         })
         .fold(0usize, usize::saturating_add)
@@ -1938,12 +1992,12 @@ impl Drop for EncoderWorker {
         }
     }
 }
-fn acquire_encoder() -> Option<std::sync::Arc<EncoderWorker>> {
-    static SHARED: std::sync::Mutex<std::sync::Weak<EncoderWorker>> =
-        std::sync::Mutex::new(std::sync::Weak::new());
+pub(crate) fn acquire_encoder() -> Option<std::sync::Arc<EncoderWorker>> {
+    static SHARED: std::sync::Mutex<Option<std::sync::Arc<EncoderWorker>>> =
+        std::sync::Mutex::new(None);
     let mut shared = SHARED.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(worker) = shared.upgrade() {
-        return Some(worker);
+    if let Some(worker) = shared.as_ref() {
+        return Some(std::sync::Arc::clone(worker));
     }
     let (sender, receiver) = std::sync::mpsc::sync_channel::<EncodeJob>(1);
     let handle = std::thread::Builder::new()
@@ -1958,7 +2012,7 @@ fn acquire_encoder() -> Option<std::sync::Arc<EncoderWorker>> {
         sender: Some(sender),
         handle: Some(handle),
     });
-    *shared = std::sync::Arc::downgrade(&worker);
+    *shared = Some(std::sync::Arc::clone(&worker));
     Some(worker)
 }
 pub(crate) struct EncodeJob {
@@ -2342,11 +2396,6 @@ pub(crate) fn encode_insert_rows_direct(
     if num_fields == 0 {
         return None;
     }
-    for r in &rows[1..] {
-        if r.len() != num_fields || !r.keys().eq(first.keys()) {
-            return None;
-        }
-    }
 
     #[derive(Copy, Clone)]
     enum DirectColType {
@@ -2369,6 +2418,14 @@ pub(crate) fn encode_insert_rows_direct(
         col_types.push(t);
     }
 
+    let mut cells: Vec<&Cell> = Vec::with_capacity(rows.len() * num_fields);
+    for r in rows {
+        if r.len() != num_fields || !r.keys().eq(first.keys()) {
+            return None;
+        }
+        cells.extend(r.values());
+    }
+
     let fields: Vec<String> = first.keys().cloned().collect();
     let n = rows.len() as u32;
 
@@ -2386,45 +2443,45 @@ pub(crate) fn encode_insert_rows_direct(
         match col_types[fi] {
             DirectColType::Text => {
                 buf.push(1);
-                for r in rows {
-                    match r.get(f) {
-                        Some(Cell::Text(s)) => put_str(buf, s),
+                for ri in 0..rows.len() {
+                    match cells[ri * num_fields + fi] {
+                        Cell::Text(s) => put_str(buf, s),
                         _ => return None,
                     }
                 }
             }
             DirectColType::Int => {
                 buf.push(2);
-                for r in rows {
-                    match r.get(f) {
-                        Some(Cell::Int(x)) => buf.extend_from_slice(&x.to_le_bytes()),
+                for ri in 0..rows.len() {
+                    match cells[ri * num_fields + fi] {
+                        Cell::Int(x) => buf.extend_from_slice(&x.to_le_bytes()),
                         _ => return None,
                     }
                 }
             }
             DirectColType::Float => {
                 buf.push(3);
-                for r in rows {
-                    match r.get(f) {
-                        Some(Cell::Float(x)) => buf.extend_from_slice(&x.to_le_bytes()),
+                for ri in 0..rows.len() {
+                    match cells[ri * num_fields + fi] {
+                        Cell::Float(x) => buf.extend_from_slice(&x.to_le_bytes()),
                         _ => return None,
                     }
                 }
             }
             DirectColType::Bool => {
                 buf.push(4);
-                for r in rows {
-                    match r.get(f) {
-                        Some(Cell::Bool(x)) => buf.push(u8::from(*x)),
+                for ri in 0..rows.len() {
+                    match cells[ri * num_fields + fi] {
+                        Cell::Bool(x) => buf.push(u8::from(*x)),
                         _ => return None,
                     }
                 }
             }
             DirectColType::Time => {
                 buf.push(5);
-                for r in rows {
-                    match r.get(f) {
-                        Some(Cell::Time(x)) => buf.extend_from_slice(&x.to_le_bytes()),
+                for ri in 0..rows.len() {
+                    match cells[ri * num_fields + fi] {
+                        Cell::Time(x) => buf.extend_from_slice(&x.to_le_bytes()),
                         _ => return None,
                     }
                 }
@@ -2748,13 +2805,18 @@ fn decode_column_record_mode(
     let record = match kind {
         V2_FACTS_BULK => {
             let n = take_u32(buf, &mut i)? as usize;
-            let mut s = Vec::with_capacity(n);
-            let mut p = Vec::with_capacity(n);
-            let mut o = Vec::with_capacity(n);
+            let mut s: Vec<Arc<str>> = Vec::with_capacity(n);
+            let mut p: Vec<Arc<str>> = Vec::with_capacity(n);
+            let mut o: Vec<Arc<str>> = Vec::with_capacity(n);
             for _ in 0..n {
-                s.push(take_str(buf, &mut i)?);
-                p.push(take_str(buf, &mut i)?);
-                o.push(take_str(buf, &mut i)?);
+                s.push(Arc::from(take_str(buf, &mut i)?));
+                let p_str = take_str(buf, &mut i)?;
+                if let Some(prev) = p.last().filter(|prev| prev.as_ref() == p_str) {
+                    p.push(Arc::clone(prev));
+                } else {
+                    p.push(Arc::from(p_str));
+                }
+                o.push(Arc::from(take_str(buf, &mut i)?));
             }
             Ok(LogRecord {
                 r#gen: rec_gen,
@@ -3798,9 +3860,9 @@ mod wal_integrity_tests {
         for pack in [
             Pack::Batch { packs: Vec::new() },
             Pack::AppendFactsBulk {
-                s: vec!["subject".into()],
-                p: vec!["predicate".into()],
-                o: vec!["object".into()],
+                s: vec![Arc::from("subject")],
+                p: vec![Arc::from("predicate")],
+                o: vec![Arc::from("object")],
             },
         ] {
             with_log(|file| {
@@ -3867,9 +3929,9 @@ mod wal_integrity_tests {
     fn wal_hardware_crc32c_and_legacy_crc32_both_replay_cleanly() {
         with_log(|file| {
             let pack = Pack::AppendFactsBulk {
-                s: vec!["s".into()],
-                p: vec!["p".into()],
-                o: vec!["o".into()],
+                s: vec![Arc::from("s")],
+                p: vec![Arc::from("p")],
+                o: vec![Arc::from("o")],
             };
             let hw_frame = frame(file, pack);
             assert_eq!(&hw_frame[..4], &LOG_MAGIC_CHECKSUM);
@@ -5311,5 +5373,64 @@ mod neon_sparse_writer_tests {
         assert_eq!(decoded_legacy.r#gen, 42);
         assert_eq!(decoded_legacy.collections["docs"].len(), 5000);
         assert_eq!(decoded_legacy.collections["users"].len(), 10);
+    }
+
+    #[test]
+    #[cfg(feature = "compress-zstd")]
+    fn zstd_compressed_snapshot_roundtrip() {
+        use std::collections::BTreeMap;
+        let mut collections = BTreeMap::new();
+        let mut docs = Vec::new();
+        for i in 0..1000 {
+            let mut r = crate::store::Row::new();
+            r.insert("id".into(), crate::store::Cell::text_arc(format!("doc-{}", i)));
+            r.insert(
+                "content".into(),
+                crate::store::Cell::text_arc(
+                    "highly compressible repetitive content text data for zstd test",
+                ),
+            );
+            docs.push(r);
+        }
+        collections.insert("docs".to_string(), docs);
+
+        let snap = Snapshot {
+            r#gen: 99,
+            embed_id: "embed-zstd".to_string(),
+            next_id: 2000,
+            catalog_hash: "cat-zstd".to_string(),
+            log_offset: 12345,
+            collections: collections.clone(),
+            edges: Vec::new(),
+            extra_collections: BTreeMap::new(),
+            extra_rels: BTreeMap::new(),
+            extra_indexes: BTreeMap::new(),
+            extra_filters: BTreeMap::new(),
+            extra_owned: BTreeMap::new(),
+            cold_collections: Vec::new(),
+        };
+
+        // Monolithic Zstd snapshot (format 0x04)
+        let compressed_monolithic =
+            encode_snapshot_compressed(&snap).expect("encode monolithic zstd");
+        assert_eq!(compressed_monolithic[0], 0x04);
+        assert_eq!(&compressed_monolithic[1..5], &SNAPSHOT_MAGIC);
+        let decoded_mono =
+            decode_snapshot_bytes(&compressed_monolithic).expect("decode monolithic zstd");
+        assert_eq!(decoded_mono.r#gen, 99);
+        assert_eq!(decoded_mono.collections["docs"].len(), 1000);
+
+        // Chunked parallel Zstd snapshot (format 0x03 with Zstd chunks)
+        let chunked_bytes = encode_snapshot_bytes(&snap).expect("encode chunked zstd");
+        assert_eq!(chunked_bytes[0], 0x03);
+        assert!(
+            chunked_bytes.len() < 1000 * 30,
+            "Zstd chunk compression must significantly reduce size: got {} bytes",
+            chunked_bytes.len()
+        );
+        let decoded_chunked =
+            decode_snapshot_bytes(&chunked_bytes).expect("decode chunked zstd");
+        assert_eq!(decoded_chunked.r#gen, 99);
+        assert_eq!(decoded_chunked.collections["docs"].len(), 1000);
     }
 }

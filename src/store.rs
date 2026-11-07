@@ -596,6 +596,189 @@ pub struct Edge {
 
 type FactKey = (Arc<str>, Arc<str>, Arc<str>);
 
+/// In-memory dictionary-encoded column for low-cardinality string columns (e.g. `wing`, `layer`).
+///
+/// Stores unique `Arc<str>` values in a compact dictionary vector and per-row `u8` indices.
+/// Achieves an 8x memory reduction on 64-bit platforms (1 byte per row vs 8-16 bytes per Arc<str>),
+/// eliminates cache thrashing, and allows ultra-fast aggregation directly over the index byte slice.
+/// If unique values exceed 255, automatically spills to a flat vector of `Arc<str>`.
+#[derive(Debug, Clone, Default, Eq)]
+pub struct DictColumn {
+    dict: Vec<Arc<str>>,
+    indices: Vec<u8>,
+    spilled: Option<Vec<Arc<str>>>,
+}
+
+impl PartialEq for DictColumn {
+    fn eq(&self, other: &Self) -> bool {
+        if self.len() != other.len() {
+            return false;
+        }
+        for i in 0..self.len() {
+            if self.get_ref(i) != other.get_ref(i) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+impl DictColumn {
+    pub const fn new() -> Self {
+        Self {
+            dict: Vec::new(),
+            indices: Vec::new(),
+            spilled: None,
+        }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        if let Some(spilled) = &self.spilled {
+            spilled.len()
+        } else {
+            self.indices.len()
+        }
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[inline]
+    pub fn reserve(&mut self, additional: usize) {
+        if let Some(spilled) = &mut self.spilled {
+            spilled.reserve(additional);
+        } else {
+            self.indices.reserve(additional);
+        }
+    }
+
+    #[inline]
+    pub fn clear(&mut self) {
+        self.dict.clear();
+        self.indices.clear();
+        self.spilled = None;
+    }
+
+    #[inline]
+    pub fn push(&mut self, val: Arc<str>) {
+        if let Some(spilled) = &mut self.spilled {
+            spilled.push(val);
+            return;
+        }
+
+        // Fast path: linear scan of small dictionary (< 16 items)
+        if let Some(pos) = self.dict.iter().position(|x| Arc::ptr_eq(x, &val) || **x == *val) {
+            self.indices.push(pos as u8);
+            return;
+        }
+
+        if self.dict.len() < 255 {
+            let pos = self.dict.len() as u8;
+            self.dict.push(val);
+            self.indices.push(pos);
+        } else {
+            // Dictionary capacity exceeded: spill to flat vector
+            let mut spilled = Vec::with_capacity(self.indices.len() + 1);
+            for &idx in &self.indices {
+                spilled.push(Arc::clone(&self.dict[idx as usize]));
+            }
+            spilled.push(val);
+            self.spilled = Some(spilled);
+            self.dict.clear();
+            self.indices.clear();
+        }
+    }
+
+    #[inline]
+    pub fn get_ref(&self, i: usize) -> &Arc<str> {
+        if let Some(spilled) = &self.spilled {
+            &spilled[i]
+        } else {
+            let idx = self.indices[i] as usize;
+            &self.dict[idx]
+        }
+    }
+
+    #[inline]
+    pub fn get(&self, i: usize) -> Arc<str> {
+        Arc::clone(self.get_ref(i))
+    }
+
+    #[inline]
+    pub fn set(&mut self, i: usize, val: Arc<str>) {
+        if let Some(spilled) = &mut self.spilled {
+            spilled[i] = val;
+            return;
+        }
+
+        if let Some(pos) = self.dict.iter().position(|x| Arc::ptr_eq(x, &val) || **x == *val) {
+            self.indices[i] = pos as u8;
+            return;
+        }
+
+        if self.dict.len() < 255 {
+            let pos = self.dict.len() as u8;
+            self.dict.push(val);
+            self.indices[i] = pos;
+        } else {
+            let mut spilled = Vec::with_capacity(self.indices.len());
+            for &idx in &self.indices {
+                spilled.push(Arc::clone(&self.dict[idx as usize]));
+            }
+            spilled[i] = val;
+            self.spilled = Some(spilled);
+            self.dict.clear();
+            self.indices.clear();
+        }
+    }
+
+    #[inline]
+    pub fn swap_remove(&mut self, i: usize) -> Arc<str> {
+        if let Some(spilled) = &mut self.spilled {
+            spilled.swap_remove(i)
+        } else {
+            let idx = self.indices.swap_remove(i) as usize;
+            Arc::clone(&self.dict[idx])
+        }
+    }
+
+    #[inline]
+    pub fn swap_pop_at(&mut self, p: usize, len: usize) {
+        if self.len() == len && p < len {
+            self.swap_remove(p);
+        }
+    }
+
+    #[inline]
+    pub fn as_indices(&self) -> Option<(&[u8], &[Arc<str>])> {
+        if self.spilled.is_none() {
+            Some((&self.indices, &self.dict))
+        } else {
+            None
+        }
+    }
+
+    pub fn to_vec(&self) -> Vec<Arc<str>> {
+        if let Some(spilled) = &self.spilled {
+            spilled.clone()
+        } else {
+            self.indices.iter().map(|&idx| Arc::clone(&self.dict[idx as usize])).collect()
+        }
+    }
+}
+
+impl std::ops::Index<usize> for DictColumn {
+    type Output = Arc<str>;
+
+    #[inline]
+    fn index(&self, i: usize) -> &Self::Output {
+        self.get_ref(i)
+    }
+}
+
 #[derive(Debug)]
 pub struct Store {
     pub r#gen: u64,
@@ -635,8 +818,8 @@ pub struct Store {
     docs_id: Vec<Arc<str>>,
     docs_title: Vec<Arc<str>>,
     docs_title_packed: OnceLock<(Vec<u8>, Vec<usize>)>,
-    docs_layer: Vec<Arc<str>>,
-    docs_wing: Vec<Arc<str>>,
+    docs_layer: DictColumn,
+    docs_wing: DictColumn,
     /// SoA for orders / users — FK join + OLAP project without per-row maps.
     orders_id: Vec<Arc<str>>,
     orders_user_id: Vec<Arc<str>>,
@@ -658,7 +841,7 @@ pub struct Store {
 #[derive(Debug, Clone)]
 pub struct AppendMark {
     next_id: u64,
-    col_lens: BTreeMap<String, usize>,
+    col_lens: smallvec::SmallVec<[(String, usize); 4]>,
     edge_len: usize,
     facts_len: usize,
 }
@@ -705,8 +888,8 @@ impl Store {
             docs_id: Vec::new(),
             docs_title: Vec::new(),
             docs_title_packed: OnceLock::new(),
-            docs_layer: Vec::new(),
-            docs_wing: Vec::new(),
+            docs_layer: DictColumn::new(),
+            docs_wing: DictColumn::new(),
             orders_id: Vec::new(),
             orders_user_id: Vec::new(),
             orders_total: Vec::new(),
@@ -720,13 +903,96 @@ impl Store {
         }
     }
 
+fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
+    let n = rows.len();
+    if n < 2048 {
+        return rows.to_vec();
+    }
+    let max_threads = if n >= 8192 { 8 } else { 4 };
+    let threads = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(1)
+        .min(max_threads)
+        .min((n + 511) / 512);
+    if threads <= 1 {
+        return rows.to_vec();
+    }
+    let chunk_size = (n + threads - 1) / threads;
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(threads - 1);
+        let mut all_chunks = rows.chunks(chunk_size);
+        for _ in 0..threads - 1 {
+            if let Some(chunk) = all_chunks.next() {
+                handles.push(scope.spawn(move || chunk.to_vec()));
+            }
+        }
+        let my_chunk = all_chunks.next().unwrap_or(&[]);
+        let my_work = my_chunk.to_vec();
+        let mut out = Vec::with_capacity(n);
+        for handle in handles {
+            out.extend(handle.join().expect("row clone worker panicked"));
+        }
+        out.extend(my_work);
+        out
+    })
+}
+
     /// Deep-copy the memory image (no durable handle). Used for read snapshots.
     pub fn clone_mem(&mut self) -> Self {
-        let mut s = Self::empty(self.embed_id.clone());
-        s.mem_restore(self.mem_backup());
-        s.fts = self.fts.clone();
-        s.hnsw = self.hnsw.clone();
-        s
+        self.ensure_facts_rows();
+        let cold_names: Vec<String> = self.cold.keys().cloned().collect();
+        for name in cold_names {
+            self.promote_cold(&name);
+        }
+        let docs_title_packed = OnceLock::new();
+        if let Some(val) = self.docs_title_packed.get() {
+            let _ = docs_title_packed.set(val.clone());
+        }
+        let mut collections = BTreeMap::new();
+        for (name, rows) in &self.collections {
+            collections.insert(name.clone(), Self::clone_rows_parallel(rows));
+        }
+        Self {
+            r#gen: self.r#gen,
+            embed_id: self.embed_id.clone(),
+            next_id: self.next_id,
+            collections,
+            edges: self.edges.clone(),
+            extra_collections: self.extra_collections.clone(),
+            extra_rels: self.extra_rels.clone(),
+            extra_indexes: self.extra_indexes.clone(),
+            extra_filters: self.extra_filters.clone(),
+            extra_owned: self.extra_owned.clone(),
+            indexes: self
+                .indexes
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone_for_read()))
+                .collect(),
+            fts: self.fts.clone(),
+            hnsw: self.hnsw.clone(),
+            by_id: self.by_id.clone(),
+            docs_by_uri: self.docs_by_uri.clone(),
+            facts_by_spo: self.facts_by_spo.clone(),
+            edge_keys: self.edge_keys.clone(),
+            edges_out: self.edges_out.clone(),
+            edges_in: self.edges_in.clone(),
+            col_counts: self.col_counts.clone(),
+            docs_id: self.docs_id.clone(),
+            docs_title: self.docs_title.clone(),
+            docs_title_packed,
+            docs_layer: self.docs_layer.clone(),
+            docs_wing: self.docs_wing.clone(),
+            orders_id: self.orders_id.clone(),
+            orders_user_id: self.orders_user_id.clone(),
+            orders_total: self.orders_total.clone(),
+            users_id: self.users_id.clone(),
+            users_email: self.users_email.clone(),
+            facts_s: self.facts_s.clone(),
+            facts_p: self.facts_p.clone(),
+            facts_o: self.facts_o.clone(),
+            facts_rows_stale: false,
+            cold: BTreeMap::new(),
+        }
     }
 
     /// Load snapshot+log into memory (no writer lock / no Persist).
@@ -868,7 +1134,7 @@ impl Store {
             catalog_hash: live_hash,
             writes_since_snapshot: 0,
             encode_buf: Vec::with_capacity(64 * 1024),
-            encoder: None,
+            encoder: persist::acquire_encoder(),
             sync: opts.sync,
             cold: opts.cold,
             log_bytes: persist::log_len(dir).unwrap_or(0),
@@ -988,8 +1254,8 @@ impl Store {
             docs_id: Vec::new(),
             docs_title: Vec::new(),
             docs_title_packed: OnceLock::new(),
-            docs_layer: Vec::new(),
-            docs_wing: Vec::new(),
+            docs_layer: DictColumn::new(),
+            docs_wing: DictColumn::new(),
             orders_id: Vec::new(),
             orders_user_id: Vec::new(),
             orders_total: Vec::new(),
@@ -1520,9 +1786,9 @@ impl Store {
 
     /// Mark lengths for append-only rollback (insert/append packs).
     pub fn append_mark(&self) -> AppendMark {
-        let mut col_lens = BTreeMap::new();
+        let mut col_lens = smallvec::SmallVec::new();
         for (name, rows) in &self.collections {
-            col_lens.insert(name.clone(), rows.len());
+            col_lens.push((name.clone(), rows.len()));
         }
         AppendMark {
             next_id: self.next_id,
@@ -1544,7 +1810,12 @@ impl Store {
             if name == "facts" {
                 continue;
             }
-            let len = mark.col_lens.get(name).copied().unwrap_or(0);
+            let len = mark
+                .col_lens
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, l)| *l)
+                .unwrap_or(0);
             rows.truncate(len);
         }
         // Drop collections created after the mark (schema col during append-only is rare;
@@ -1916,29 +2187,25 @@ impl Store {
         self.docs_by_uri.clear();
         self.facts_by_spo.clear();
         self.edge_keys.clear();
-        let names: Vec<String> = self.collections.keys().cloned().collect();
-        for name in names {
-            self.rebuild_row_maps_collection(&name);
+        let names: smallvec::SmallVec<[String; 4]> = self.collections.keys().cloned().collect();
+        for name in &names {
+            self.rebuild_row_maps_collection(name);
         }
         self.rebuild_edge_keys();
         // Keep columnar facts aligned with materialized rows.
         self.facts_s.clear();
         self.facts_p.clear();
         self.facts_o.clear();
-        let spo_triples: Vec<(Arc<str>, Arc<str>, Arc<str>)> = self
-            .collection("facts")
-            .iter()
-            .map(|row| {
-                spo_key(row).unwrap_or_else(|| (Arc::from(""), Arc::from(""), Arc::from("")))
-            })
-            .collect();
-        self.facts_s.reserve(spo_triples.len());
-        self.facts_p.reserve(spo_triples.len());
-        self.facts_o.reserve(spo_triples.len());
-        for (s, p, o) in spo_triples {
-            self.facts_s.push(s);
-            self.facts_p.push(p);
-            self.facts_o.push(o);
+        if let Some(facts) = self.collections.get("facts") && !facts.is_empty() {
+            self.facts_s.reserve(facts.len());
+            self.facts_p.reserve(facts.len());
+            self.facts_o.reserve(facts.len());
+            for row in facts {
+                let (s, p, o) = spo_key(row).unwrap_or_else(|| (Arc::from(""), Arc::from(""), Arc::from("")));
+                self.facts_s.push(s);
+                self.facts_p.push(p);
+                self.facts_o.push(o);
+            }
         }
         self.facts_rows_stale = false;
         self.refresh_col_counts();
@@ -2076,9 +2343,9 @@ impl Store {
     /// [`Self::ensure_facts_rows`]) — keeps durable_append sync off the alloc path.
     pub fn append_facts_spo_bulk(
         &mut self,
-        s: &[String],
-        p: &[String],
-        o: &[String],
+        s: &[Arc<str>],
+        p: &[Arc<str>],
+        o: &[Arc<str>],
         want_rows: bool,
     ) -> (Vec<Row>, usize) {
         let n = s.len().min(p.len()).min(o.len());
@@ -2093,35 +2360,38 @@ impl Store {
         };
         let mut changed = 0usize;
         for i in 0..n {
-            let sa: Arc<str> = Arc::from(s[i].as_str());
-            let pa: Arc<str> = Arc::from(p[i].as_str());
-            let oa: Arc<str> = Arc::from(o[i].as_str());
-            let key = (Arc::clone(&sa), Arc::clone(&pa), Arc::clone(&oa));
-            if let Some(&idx) = self.facts_by_spo.get(&key) {
-                if want_rows {
-                    self.ensure_facts_rows();
-                    rows.push(self.collections["facts"][idx].clone());
+            let key = (Arc::clone(&s[i]), Arc::clone(&p[i]), Arc::clone(&o[i]));
+            match self.facts_by_spo.entry(key) {
+                std::collections::hash_map::Entry::Occupied(_) => {
+                    if want_rows {
+                        let mut row = BTreeMap::new();
+                        row.insert("s".into(), Cell::Text(Arc::clone(&s[i])));
+                        row.insert("p".into(), Cell::Text(Arc::clone(&p[i])));
+                        row.insert("o".into(), Cell::Text(Arc::clone(&o[i])));
+                        rows.push(row);
+                    }
                 }
-                continue;
-            }
-            let idx = self.facts_s.len();
-            self.facts_by_spo.insert(key, idx);
-            self.facts_s.push(sa);
-            self.facts_p.push(pa);
-            self.facts_o.push(oa);
-            self.facts_rows_stale = true;
-            changed += 1;
-            if want_rows {
-                // Build only the returned row; full vec sync via ensure later.
-                let mut row = BTreeMap::new();
-                row.insert("s".into(), Cell::Text(Arc::clone(&self.facts_s[idx])));
-                row.insert("p".into(), Cell::Text(Arc::clone(&self.facts_p[idx])));
-                row.insert("o".into(), Cell::Text(Arc::clone(&self.facts_o[idx])));
-                rows.push(row);
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    let idx = self.facts_s.len();
+                    e.insert(idx);
+                    self.facts_s.push(Arc::clone(&s[i]));
+                    self.facts_p.push(Arc::clone(&p[i]));
+                    self.facts_o.push(Arc::clone(&o[i]));
+                    self.facts_rows_stale = true;
+                    changed += 1;
+                    if want_rows {
+                        // Build only the returned row; full vec sync via ensure later.
+                        let mut row = BTreeMap::new();
+                        row.insert("s".into(), Cell::Text(Arc::clone(&self.facts_s[idx])));
+                        row.insert("p".into(), Cell::Text(Arc::clone(&self.facts_p[idx])));
+                        row.insert("o".into(), Cell::Text(Arc::clone(&self.facts_o[idx])));
+                        rows.push(row);
+                    }
+                }
             }
         }
         if changed > 0 {
-            self.col_counts.insert("facts".into(), self.facts_s.len());
+            self.update_col_count("facts", changed as isize);
         }
         if want_rows && changed > 0 {
             self.ensure_facts_rows();
@@ -2239,15 +2509,21 @@ impl Store {
             self.update_col_count(collection, -1);
             let doomed = self.collections.get_mut(collection).unwrap().swap_remove(p);
             let last = old_n - 1;
-            self.index_remove_row(collection, p, &doomed);
-            self.fts_remove_row(collection, p, &doomed);
-            if let Some(hnsw) = self.hnsw.get_mut(collection) {
-                hnsw.remove(p);
-            }
-            self.row_maps_drop_keys(collection, &doomed);
+            let has_hnsw = !self.hnsw.is_empty();
             if p != last {
-                self.move_deleted_tail(collection, last, p);
+                self.index_swap_remove(collection, p, last);
+                if has_hnsw && let Some(hnsw) = self.hnsw.get_mut(collection) {
+                    hnsw.remove(p);
+                    hnsw.move_id(last, p);
+                }
+                self.move_deleted_tail(collection, last, p, Some(&doomed));
             } else {
+                self.index_remove_row(collection, p, &doomed);
+                if has_hnsw && let Some(hnsw) = self.hnsw.get_mut(collection) {
+                    hnsw.remove(p);
+                }
+                self.fts_remove_row(collection, p, &doomed);
+                self.row_maps_drop_keys(collection, &doomed);
                 self.swap_pop_columns(collection, p, last + 1);
             }
             let new_n = old_n - 1;
@@ -2279,6 +2555,7 @@ impl Store {
         // postings and columnar arrays are rebuilt from the rows on restore), so row
         // order is not a contract — `sort` is the explicit remedy when one is needed.
 
+        let has_hnsw = !self.hnsw.is_empty();
         let mut removed = Vec::with_capacity(dead.len());
         for &p in dead.iter().rev() {
             let last = match self.collections.get(collection) {
@@ -2288,15 +2565,20 @@ impl Store {
 
             let doomed = self.collections.get_mut(collection).unwrap().swap_remove(p);
 
-            self.index_remove_row(collection, p, &doomed);
-            self.fts_remove_row(collection, p, &doomed);
-            if let Some(hnsw) = self.hnsw.get_mut(collection) {
-                hnsw.remove(p);
-            }
-            self.row_maps_drop_keys(collection, &doomed);
             if p != last {
-                self.move_deleted_tail(collection, last, p);
+                self.index_swap_remove(collection, p, last);
+                if has_hnsw && let Some(hnsw) = self.hnsw.get_mut(collection) {
+                    hnsw.remove(p);
+                    hnsw.move_id(last, p);
+                }
+                self.move_deleted_tail(collection, last, p, Some(&doomed));
             } else {
+                self.index_remove_row(collection, p, &doomed);
+                if has_hnsw && let Some(hnsw) = self.hnsw.get_mut(collection) {
+                    hnsw.remove(p);
+                }
+                self.fts_remove_row(collection, p, &doomed);
+                self.row_maps_drop_keys(collection, &doomed);
                 self.swap_pop_columns(collection, p, last + 1);
             }
             removed.push(doomed);
@@ -2319,20 +2601,24 @@ impl Store {
     /// The collection already contains the moved row at `to`. Read it in place
     /// while editing disjoint derived indexes; retain only identity keys for
     /// the column/map step, avoiding a complete Row clone.
-    fn move_deleted_tail(&mut self, collection: &str, from: usize, to: usize) {
+    fn move_deleted_tail(&mut self, collection: &str, from: usize, to: usize, doomed: Option<&Row>) {
         let row = &self.collections[collection][to];
-        for index in self.indexes.values_mut() {
-            if index.def.collection == collection {
-                index.move_at(from, to);
+        if !self.fts.is_empty() {
+            if let Some(fts) = self.fts.get_mut(collection) {
+                if let Some(doomed) = doomed {
+                    fts.swap_remove_row(to, doomed, from, row);
+                } else {
+                    fts.move_row(from, to, row);
+                }
             }
         }
-        if let Some(fts) = self.fts.get_mut(collection) {
-            fts.move_row(from, to, row);
-        }
-        if let Some(hnsw) = self.hnsw.get_mut(collection) {
-            hnsw.move_id(from, to);
-        }
-        let id_str = row_text(row, "id");
+        let is_docs = collection == "docs";
+        let (dead_id_fast, tail_id_fast) = if is_docs && to < self.docs_id.len() && from < self.docs_id.len() {
+            (Some(&self.docs_id[to]), Some(&self.docs_id[from]))
+        } else {
+            (None, None)
+        };
+        let id_str = if tail_id_fast.is_none() { row_text(row, "id") } else { None };
         let uri_str = if collection == "docs" {
             row_text(row, "uri")
         } else {
@@ -2340,8 +2626,21 @@ impl Store {
         };
         let spo = (collection == "facts").then(|| spo_key(row)).flatten();
         // Keep the original remove/register semantics for duplicate identities.
-        if let Some(id_s) = id_str {
-            if let Some(map) = self.by_id.get_mut(collection) {
+        if let Some(map) = self.by_id.get_mut(collection) {
+            if let Some(dead_id) = dead_id_fast {
+                map.remove(dead_id.as_ref());
+            } else if let Some(doomed) = doomed
+                && let Some(dead_id) = row_text(doomed, "id")
+            {
+                map.remove(dead_id);
+            }
+            if let Some(tail_id) = tail_id_fast {
+                if let Some(slot) = map.get_mut(tail_id.as_ref()) {
+                    *slot = to;
+                } else {
+                    map.insert(Arc::clone(tail_id), to);
+                }
+            } else if let Some(id_s) = id_str {
                 if let Some(slot) = map.get_mut(id_s) {
                     *slot = to;
                 } else if let Some(id) = row.get("id").and_then(Cell::text_shared) {
@@ -2349,15 +2648,29 @@ impl Store {
                 }
             }
         }
-        if let Some(u_s) = uri_str {
-            if let Some(slot) = self.docs_by_uri.get_mut(u_s) {
-                *slot = to;
-            } else if let Some(uri) = row.get("uri").and_then(Cell::text_shared) {
-                self.docs_by_uri.insert(uri, to);
+        if collection == "docs" {
+            if let Some(doomed) = doomed
+                && let Some(dead_uri) = row_text(doomed, "uri")
+            {
+                self.docs_by_uri.remove(dead_uri);
+            }
+            if let Some(u_s) = uri_str {
+                if let Some(slot) = self.docs_by_uri.get_mut(u_s) {
+                    *slot = to;
+                } else if let Some(uri) = row.get("uri").and_then(Cell::text_shared) {
+                    self.docs_by_uri.insert(uri, to);
+                }
             }
         }
-        if let Some(spo) = spo {
-            self.facts_by_spo.insert(spo, to);
+        if collection == "facts" {
+            if let Some(doomed) = doomed
+                && let Some(dead_spo) = spo_key(doomed)
+            {
+                self.facts_by_spo.remove(&dead_spo);
+            }
+            if let Some(spo) = spo {
+                self.facts_by_spo.insert(spo, to);
+            }
         }
         // These arrays are known parallel; swap-pop already transfers every
         // mirrored value, so registering the row again would duplicate the work.
@@ -2374,8 +2687,8 @@ impl Store {
             "docs" => {
                 swap_pop_at(&mut self.docs_id, p, len);
                 swap_pop_at(&mut self.docs_title, p, len);
-                swap_pop_at(&mut self.docs_layer, p, len);
-                swap_pop_at(&mut self.docs_wing, p, len);
+                self.docs_layer.swap_pop_at(p, len);
+                self.docs_wing.swap_pop_at(p, len);
             }
             "orders" => {
                 swap_pop_at(&mut self.orders_id, p, len);
@@ -2438,13 +2751,14 @@ impl Store {
             if !live {
                 continue;
             }
-            self.index_remove_at(collection, *idx);
-            self.fts_remove_at(collection, *idx);
             let old_row =
-                std::mem::replace(&mut self.collection_mut(collection)[*idx], row.clone());
-            let _ = self.index_insert_at(collection, *idx);
-            self.fts_insert_at(collection, *idx);
+                std::mem::replace(&mut self.collections.get_mut(collection).unwrap()[*idx], row.clone());
+            if let Some(fts) = self.fts.get_mut(collection) {
+                fts.sync_row(*idx, &old_row, row);
+            }
             self.row_maps_sync_updated(collection, *idx, &old_row, row);
+            self.index_remove_at(collection, *idx);
+            let _ = self.index_insert_at(collection, *idx);
         }
     }
 
@@ -2456,12 +2770,13 @@ impl Store {
         if !live {
             return;
         }
-        self.index_remove_at(collection, idx);
-        self.fts_remove_at(collection, idx);
-        let _ = self.index_insert_row(collection, idx, &row);
-        self.fts_insert_row(collection, idx, &row);
-        let old_row = std::mem::take(&mut self.collection_mut(collection)[idx]);
+        let old_row = std::mem::replace(&mut self.collections.get_mut(collection).unwrap()[idx], Row::new());
+        if let Some(fts) = self.fts.get_mut(collection) {
+            fts.sync_row(idx, &old_row, &row);
+        }
         self.row_maps_sync_updated(collection, idx, &old_row, &row);
+        self.index_remove_at(collection, idx);
+        let _ = self.index_insert_row(collection, idx, &row);
         self.collections.get_mut(collection).unwrap()[idx] = row;
     }
 
@@ -2561,46 +2876,115 @@ impl Store {
             return;
         };
         let n = rows.len();
+        if n == 0 {
+            return;
+        }
+
+        let by_id_map = self.by_id.get_mut(collection).expect("by_id entry");
+        by_id_map.reserve(n);
+
         if collection == "docs" {
+            self.docs_by_uri.reserve(n);
             self.docs_id.reserve(n);
             self.docs_title.reserve(n);
             self.docs_layer.reserve(n);
             self.docs_wing.reserve(n);
+            for (i, row) in rows.iter().enumerate() {
+                let mut id = None;
+                let mut uri = None;
+                let mut title = None;
+                let mut layer = None;
+                let mut wing = None;
+                for (k, v) in row {
+                    match k.as_str() {
+                        "id" => id = v.text_shared(),
+                        "uri" => uri = v.text_shared(),
+                        "title" => title = v.text_shared(),
+                        "layer" => layer = v.text_shared(),
+                        "wing" => wing = v.text_shared(),
+                        _ => {}
+                    }
+                }
+                if let Some(ref id_val) = id {
+                    by_id_map.insert(Arc::clone(id_val), i);
+                }
+                if let Some(ref uri_val) = uri {
+                    self.docs_by_uri.insert(Arc::clone(uri_val), i);
+                }
+                self.docs_id.push(id.unwrap_or_default());
+                self.docs_title.push(title.unwrap_or_default());
+                self.docs_layer.push(layer.unwrap_or_default());
+                self.docs_wing.push(intern_wing(wing.unwrap_or_default()));
+            }
+            return;
         }
+
         if collection == "orders" {
             self.orders_id.reserve(n);
             self.orders_user_id.reserve(n);
             self.orders_total.reserve(n);
+            for (i, row) in rows.iter().enumerate() {
+                let mut id = None;
+                let mut uid = None;
+                let mut total = 0.0;
+                for (k, v) in row {
+                    match k.as_str() {
+                        "id" => id = v.text_shared(),
+                        "user_id" => uid = v.text_shared(),
+                        "total" => total = v.as_f64().unwrap_or(0.0),
+                        _ => {}
+                    }
+                }
+                if let Some(ref id_val) = id {
+                    by_id_map.insert(Arc::clone(id_val), i);
+                }
+                self.orders_id.push(id.unwrap_or_default());
+                self.orders_user_id.push(uid.unwrap_or_default());
+                self.orders_total.push(total);
+            }
+            return;
         }
+
         if collection == "users" {
             self.users_id.reserve(n);
             self.users_email.reserve(n);
+            for (i, row) in rows.iter().enumerate() {
+                let mut id = None;
+                let mut email = None;
+                for (k, v) in row {
+                    match k.as_str() {
+                        "id" => id = v.text_shared(),
+                        "email" => email = v.text_shared(),
+                        _ => {}
+                    }
+                }
+                if let Some(ref id_val) = id {
+                    by_id_map.insert(Arc::clone(id_val), i);
+                }
+                self.users_id.push(id.unwrap_or_default());
+                self.users_email.push(email.unwrap_or_default());
+            }
+            return;
         }
-        let by_id_map = self.by_id.get_mut(collection).expect("by_id entry");
+
+        if collection == "facts" {
+            self.facts_by_spo.reserve(n);
+            for (i, row) in rows.iter().enumerate() {
+                let id = row.get("id").and_then(Cell::text_shared);
+                if let Some(ref id_val) = id {
+                    by_id_map.insert(Arc::clone(id_val), i);
+                }
+                if let Some(spo) = spo_key(row) {
+                    self.facts_by_spo.insert(spo, i);
+                }
+            }
+            return;
+        }
+
         for (i, row) in rows.iter().enumerate() {
             let id = row.get("id").and_then(Cell::text_shared);
             if let Some(ref id_val) = id {
                 by_id_map.insert(Arc::clone(id_val), i);
-            }
-            if collection == "docs" {
-                if let Some(uri) = row.get("uri").and_then(Cell::text_shared) {
-                    self.docs_by_uri.insert(uri, i);
-                }
-                self.docs_id.push(id.unwrap_or_default());
-                self.docs_title.push(row.get("title").and_then(Cell::text_shared).unwrap_or_default());
-                self.docs_layer.push(row.get("layer").and_then(Cell::text_shared).unwrap_or_default());
-                self.docs_wing.push(row.get("wing").and_then(Cell::text_shared).unwrap_or_default());
-            } else if collection == "orders" {
-                self.orders_id.push(id.unwrap_or_default());
-                self.orders_user_id.push(row.get("user_id").and_then(Cell::text_shared).unwrap_or_default());
-                self.orders_total.push(row.get("total").and_then(Cell::as_f64).unwrap_or(0.0));
-            } else if collection == "users" {
-                self.users_id.push(id.unwrap_or_default());
-                self.users_email.push(row.get("email").and_then(Cell::text_shared).unwrap_or_default());
-            } else if collection == "facts" {
-                if let Some(spo) = spo_key(row) {
-                    self.facts_by_spo.insert(spo, i);
-                }
             }
         }
     }
@@ -2635,7 +3019,7 @@ impl Store {
             let did = id.unwrap_or_default();
             let title = title.unwrap_or_default();
             let layer = layer.unwrap_or_default();
-            let wing = wing.unwrap_or_default();
+            let wing = intern_wing(wing.unwrap_or_default());
             if let Some(uri) = uri {
                 self.docs_by_uri.insert(uri, idx);
             }
@@ -2647,8 +3031,8 @@ impl Store {
             } else if idx < self.docs_id.len() {
                 self.docs_id[idx] = did;
                 self.docs_title[idx] = title;
-                self.docs_layer[idx] = layer;
-                self.docs_wing[idx] = wing;
+                self.docs_layer.set(idx, layer);
+                self.docs_wing.set(idx, wing);
             } else {
                 self.rebuild_row_maps_collection("docs");
             }
@@ -2725,10 +3109,11 @@ impl Store {
                 .get("layer")
                 .and_then(Cell::text_shared)
                 .unwrap_or_default();
-            let wing = row
-                .get("wing")
-                .and_then(Cell::text_shared)
-                .unwrap_or_default();
+            let wing = intern_wing(
+                row.get("wing")
+                    .and_then(Cell::text_shared)
+                    .unwrap_or_default(),
+            );
             let did = id.clone().unwrap_or_default();
             if let Some(uri) = uri {
                 self.docs_by_uri.insert(uri, idx);
@@ -2741,8 +3126,8 @@ impl Store {
             } else if idx < self.docs_id.len() {
                 self.docs_id[idx] = did;
                 self.docs_title[idx] = title;
-                self.docs_layer[idx] = layer;
-                self.docs_wing[idx] = wing;
+                self.docs_layer.set(idx, layer);
+                self.docs_wing.set(idx, wing);
             } else {
                 self.rebuild_row_maps_collection("docs");
             }
@@ -2808,6 +3193,47 @@ impl Store {
             } else {
                 self.by_id.entry(collection.to_string()).or_default()
             };
+            let first = &rows[0];
+            let id_pos = first.keys().position(|k| k == "id");
+            let uri_pos = first.keys().position(|k| k == "uri");
+            let title_pos = first.keys().position(|k| k == "title");
+            let layer_pos = first.keys().position(|k| k == "layer");
+            let wing_pos = first.keys().position(|k| k == "wing");
+            let uniform = rows[1..].iter().all(|r| r.len() == first.len());
+            if uniform && first.len() <= 32 {
+                for (i, row) in rows.iter().enumerate() {
+                    let idx = start + i;
+                    let mut cells: [&Cell; 32] = [&Cell::Null; 32];
+                    for (p, val) in row.values().enumerate().take(32) {
+                        cells[p] = val;
+                    }
+                    let id_arc: Arc<str> = id_pos
+                        .and_then(|p| cells[p].text_shared())
+                        .unwrap_or_default();
+                    let uri_arc: Option<Arc<str>> = uri_pos.and_then(|p| cells[p].text_shared());
+                    let title_arc: Arc<str> = title_pos
+                        .and_then(|p| cells[p].text_shared())
+                        .unwrap_or_default();
+                    let layer_arc: Arc<str> = layer_pos
+                        .and_then(|p| cells[p].text_shared())
+                        .unwrap_or_default();
+                    let wing_arc: Arc<str> = wing_pos
+                        .and_then(|p| cells[p].text_shared())
+                        .unwrap_or_default();
+
+                    if !id_arc.is_empty() {
+                        by_id.insert(Arc::clone(&id_arc), idx);
+                    }
+                    if let Some(uri) = uri_arc {
+                        self.docs_by_uri.insert(uri, idx);
+                    }
+                    self.docs_id.push(id_arc);
+                    self.docs_title.push(title_arc);
+                    self.docs_layer.push(layer_arc);
+                    self.docs_wing.push(intern_wing(wing_arc));
+                }
+                return;
+            }
             for (i, row) in rows.iter().enumerate() {
                 let idx = start + i;
                 let mut texts: [Option<Arc<str>>; 5] = std::array::from_fn(|_| None);
@@ -2832,7 +3258,7 @@ impl Store {
                 self.docs_id.push(id.unwrap_or_default());
                 self.docs_title.push(title.unwrap_or_default());
                 self.docs_layer.push(layer.unwrap_or_default());
-                self.docs_wing.push(wing.unwrap_or_default());
+                self.docs_wing.push(intern_wing(wing.unwrap_or_default()));
             }
             return;
         }
@@ -2901,8 +3327,8 @@ impl Store {
                     && idx < self.docs_wing.len() =>
             {
                 self.docs_title[idx] = text("title");
-                self.docs_layer[idx] = text("layer");
-                self.docs_wing[idx] = text("wing");
+                self.docs_layer.set(idx, text("layer"));
+                self.docs_wing.set(idx, text("wing"));
             }
             "orders" if idx < self.orders_user_id.len() && idx < self.orders_total.len() => {
                 self.orders_user_id[idx] = text("user_id");
@@ -2966,8 +3392,23 @@ impl Store {
         Ok(())
     }
 
+    /// Swap-remove one row's index entries, moving `last` into `p`.
+    pub fn index_swap_remove(&mut self, collection: &str, p: usize, last: usize) {
+        if self.indexes.is_empty() {
+            return;
+        }
+        for idx in self.indexes.values_mut() {
+            if idx.def.collection == collection {
+                idx.swap_remove_at(p, last);
+            }
+        }
+    }
+
     /// Drop a position from every index of `collection`.
     pub fn index_remove_at(&mut self, collection: &str, row_idx: usize) {
+        if self.indexes.is_empty() {
+            return;
+        }
         for idx in self.indexes.values_mut() {
             if idx.def.collection == collection {
                 idx.remove_at(row_idx);
@@ -2977,6 +3418,9 @@ impl Store {
 
     /// Drop one row's index entries, given the row itself.
     pub fn index_remove_row(&mut self, collection: &str, row_idx: usize, _row: &Row) {
+        if self.indexes.is_empty() {
+            return;
+        }
         for idx in self.indexes.values_mut() {
             if idx.def.collection == collection {
                 idx.remove_at(row_idx);
@@ -2986,8 +3430,11 @@ impl Store {
 
     pub fn rebuild_indexes(&mut self) {
         self.indexes.clear();
-        let snaps = self.extra_indexes.clone();
-        for (label, snap) in snaps {
+        let labels: smallvec::SmallVec<[String; 4]> = self.extra_indexes.keys().cloned().collect();
+        for label in labels {
+            let Some(snap) = self.extra_indexes.get(&label) else {
+                continue;
+            };
             let pred = snap
                 .pred_src
                 .as_deref()
@@ -3000,8 +3447,10 @@ impl Store {
                 bitmap_card_field: None,
             };
             let mut live = LiveIndex::new(def);
-            for (i, row) in self.collection(&snap.collection).iter().enumerate() {
-                let _ = live.insert_at(i, row);
+            let rows = self.collection(&snap.collection);
+            live.reverse.reserve(rows.len());
+            for (i, row) in rows.iter().enumerate() {
+                let _ = live.insert_at_new(i, row);
             }
 
             // Build bloom filter for fast negative lookups
@@ -3374,21 +3823,85 @@ impl Store {
             offsets.push(bytes.len());
             (bytes, offsets)
         });
-        let finder = memchr::memmem::Finder::new(needle.as_bytes());
-        let mut cursor = 0;
-        let mut count = 0;
-        while let Some(relative) = finder.find(&bytes[cursor..]) {
-            let pos = cursor + relative;
-            let row = offsets.partition_point(|&offset| offset <= pos) - 1;
-            if pos + needle.len() <= offsets[row + 1] {
-                count += 1;
-                cursor = offsets[row + 1];
-            } else {
-                // Cross-row candidates must not hide overlapping real matches.
-                cursor = pos + 1;
-            }
+
+        let total_rows = self.docs_title.len();
+        if total_rows == 0 {
+            return 0;
         }
-        count
+
+        let threads = if total_rows >= 8192 {
+            std::thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(1)
+                .min(8)
+                .min((total_rows + 1023) / 1024)
+        } else {
+            1
+        };
+
+        if threads > 1 {
+            let chunk_rows = (total_rows + threads - 1) / threads;
+            let counts: Vec<i64> = std::thread::scope(|scope| {
+                let mut handles = Vec::with_capacity(threads);
+                for t in 0..threads {
+                    let r_start = t * chunk_rows;
+                    if r_start >= total_rows {
+                        break;
+                    }
+                    let r_end = (r_start + chunk_rows).min(total_rows);
+                    let byte_start = offsets[r_start];
+                    let byte_end = offsets[r_end];
+                    let chunk_bytes = &bytes[byte_start..byte_end];
+                    let chunk_offsets = &offsets[r_start..=r_end];
+
+                    handles.push(scope.spawn(move || {
+                        let finder = memchr::memmem::Finder::new(needle.as_bytes());
+                        let mut cursor = 0;
+                        let mut local_count = 0i64;
+                        let mut row = 0usize;
+                        let needle_len = needle.len();
+
+                        while let Some(relative) = finder.find(&chunk_bytes[cursor..]) {
+                            let pos = cursor + relative;
+                            let abs_pos = byte_start + pos;
+                            while chunk_offsets[row + 1] <= abs_pos {
+                                row += 1;
+                            }
+                            if abs_pos + needle_len <= chunk_offsets[row + 1] {
+                                local_count += 1;
+                                cursor = chunk_offsets[row + 1] - byte_start;
+                                row += 1;
+                            } else {
+                                cursor = pos + 1;
+                            }
+                        }
+                        local_count
+                    }));
+                }
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            counts.into_iter().sum()
+        } else {
+            let finder = memchr::memmem::Finder::new(needle.as_bytes());
+            let mut cursor = 0;
+            let mut count = 0i64;
+            let mut row = 0usize;
+            let needle_len = needle.len();
+            while let Some(relative) = finder.find(&bytes[cursor..]) {
+                let pos = cursor + relative;
+                while offsets[row + 1] <= pos {
+                    row += 1;
+                }
+                if pos + needle_len <= offsets[row + 1] {
+                    count += 1;
+                    cursor = offsets[row + 1];
+                    row += 1;
+                } else {
+                    cursor = pos + 1;
+                }
+            }
+            count
+        }
     }
 
     /// Count `docs.title ~ needle` grouped by layer using columnar titles (no row maps).
@@ -3397,7 +3910,7 @@ impl Store {
         let mut map: BTreeMap<Arc<str>, i64> = BTreeMap::new();
         let n = self.docs_title.len().min(self.docs_layer.len());
         let titles = &self.docs_title[..n];
-        let layers = &self.docs_layer[..n];
+        let layers = &self.docs_layer;
         for i in 0..n {
             if finder.find(titles[i].as_bytes()).is_none() {
                 continue;
@@ -3435,8 +3948,11 @@ impl Store {
     pub fn orders_total(&self) -> &[f64] {
         &self.orders_total
     }
-    pub fn docs_wing(&self) -> &[Arc<str>] {
+    pub fn docs_wing(&self) -> &DictColumn {
         &self.docs_wing
+    }
+    pub fn docs_layer(&self) -> &DictColumn {
+        &self.docs_layer
     }
     pub fn users_id(&self) -> &[Arc<str>] {
         &self.users_id
@@ -3459,50 +3975,71 @@ impl Store {
             let threads = std::thread::available_parallelism()
                 .map(|p| p.get())
                 .unwrap_or(1)
-                .min(8)
                 .min((total_idxs + 1023) / 1024);
             if threads > 1 {
-                let chunk_size = (total_idxs + threads - 1) / threads;
                 let docs_id = &self.docs_id;
                 let docs_title = &self.docs_title;
                 let docs_layer = &self.docs_layer;
                 let docs_wing = &self.docs_wing;
 
-                let chunks_out: Vec<Vec<Row>> = std::thread::scope(|scope| {
+                let mut out_buffer: Vec<std::mem::MaybeUninit<Row>> = Vec::with_capacity(total_idxs);
+                unsafe { out_buffer.set_len(total_idxs); }
+                let out_ptr = out_buffer.as_mut_ptr() as usize;
+
+                let next_chunk = std::sync::atomic::AtomicUsize::new(0);
+                let chunk_size = 4096;
+
+                std::thread::scope(|scope| {
                     let mut handles = Vec::with_capacity(threads);
-                    for chunk in idxs.chunks(chunk_size) {
-                        handles.push(scope.spawn(move || {
-                            let mut out = Vec::with_capacity(chunk.len());
-                            for &i in chunk {
-                                if i >= n {
-                                    continue;
+                    for _ in 0..threads {
+                        handles.push(scope.spawn(|| {
+                            let k_id = String::from("id");
+                            let k_title = String::from("title");
+                            loop {
+                                let start = next_chunk.fetch_add(chunk_size, std::sync::atomic::Ordering::Relaxed);
+                                if start >= total_idxs {
+                                    break;
                                 }
-                                if id_title {
-                                    out.push(row_id_title(&docs_id[i], &docs_title[i]));
-                                    continue;
+                                let end = (start + chunk_size).min(total_idxs);
+                                for offset in start..end {
+                                    let i = idxs[offset];
+                                    let slot = unsafe { &mut *(out_ptr as *mut std::mem::MaybeUninit<Row>).add(offset) };
+                                    if i >= n {
+                                        slot.write(acquire_row());
+                                        continue;
+                                    }
+                                    if id_title {
+                                        let mut row = BTreeMap::new();
+                                        row.insert(k_id.clone(), Cell::Text(Arc::clone(&docs_id[i])));
+                                        row.insert(k_title.clone(), Cell::Text(Arc::clone(&docs_title[i])));
+                                        slot.write(row);
+                                        continue;
+                                    }
+                                    let mut row = BTreeMap::new();
+                                    for f in fields {
+                                        let cell = match f.as_str() {
+                                            "id" => Cell::Text(Arc::clone(&docs_id[i])),
+                                            "title" => Cell::Text(Arc::clone(&docs_title[i])),
+                                            "layer" => Cell::Text(Arc::clone(&docs_layer[i])),
+                                            "wing" => Cell::Text(Arc::clone(&docs_wing[i])),
+                                            _ => Cell::Null,
+                                        };
+                                        row.insert(f.clone(), cell);
+                                    }
+                                    slot.write(row);
                                 }
-                                let mut row = BTreeMap::new();
-                                for f in fields {
-                                    let cell = match f.as_str() {
-                                        "id" => Cell::Text(Arc::clone(&docs_id[i])),
-                                        "title" => Cell::Text(Arc::clone(&docs_title[i])),
-                                        "layer" => Cell::Text(Arc::clone(&docs_layer[i])),
-                                        "wing" => Cell::Text(Arc::clone(&docs_wing[i])),
-                                        _ => Cell::Null,
-                                    };
-                                    row.insert(f.clone(), cell);
-                                }
-                                out.push(row);
                             }
-                            out
                         }));
                     }
-                    handles.into_iter().map(|h| h.join().unwrap()).collect()
+                    for h in handles {
+                        h.join().unwrap();
+                    }
                 });
-                let mut out = Vec::with_capacity(total_idxs);
-                for chunk in chunks_out {
-                    out.extend(chunk);
-                }
+
+                let out = unsafe {
+                    let mut b = std::mem::ManuallyDrop::new(out_buffer);
+                    Vec::from_raw_parts(b.as_mut_ptr() as *mut Row, total_idxs, total_idxs)
+                };
                 return Some(out);
             }
         }
@@ -3630,13 +4167,28 @@ impl Store {
     }
 }
 
+#[inline]
+pub(crate) fn intern_wing(wing: Arc<str>) -> Arc<str> {
+    static WING_RAG: std::sync::LazyLock<Arc<str>> = std::sync::LazyLock::new(|| Arc::from("rag"));
+    static WING_SYS: std::sync::LazyLock<Arc<str>> = std::sync::LazyLock::new(|| Arc::from("sys"));
+    static WING_CORE: std::sync::LazyLock<Arc<str>> = std::sync::LazyLock::new(|| Arc::from("core"));
+    static WING_TEST: std::sync::LazyLock<Arc<str>> = std::sync::LazyLock::new(|| Arc::from("test"));
+    match wing.as_ref() {
+        "rag" => Arc::clone(&WING_RAG),
+        "sys" => Arc::clone(&WING_SYS),
+        "core" => Arc::clone(&WING_CORE),
+        "test" => Arc::clone(&WING_TEST),
+        _ => wing,
+    }
+}
+
 fn docs_hot_field(f: &str) -> bool {
     matches!(f, "id" | "title" | "layer" | "wing")
 }
 
 #[inline]
 fn row_id_title(id: &Arc<str>, title: &Arc<str>) -> Row {
-    let mut row = acquire_row();
+    let mut row = BTreeMap::new();
     row.insert(String::from("id"), Cell::Text(Arc::clone(id)));
     row.insert(String::from("title"), Cell::Text(Arc::clone(title)));
     row

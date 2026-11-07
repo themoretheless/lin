@@ -2558,41 +2558,43 @@ impl Db {
                         && r.fields[1].0 == "p"
                         && r.fields[2].0 == "o"
                 });
+                static EMPTY_ARC: std::sync::LazyLock<Arc<str>> =
+                    std::sync::LazyLock::new(|| Arc::from(""));
                 if is_standard_spo {
                     let mut last_p_val: Option<&Value> = None;
-                    let mut last_p_str = String::new();
+                    let mut last_p_arc: Option<Arc<str>> = None;
                     for record in records {
                         if record.fields.len() == 3
                             && record.fields[0].0 == "s"
                             && record.fields[1].0 == "p"
                             && record.fields[2].0 == "o"
                         {
-                            bulk_s.push(value_to_string(&record.fields[0].1, now));
+                            bulk_s.push(value_to_arc_str(&record.fields[0].1, now));
                             let pv = &record.fields[1].1;
-                            if last_p_val == Some(pv) {
-                                bulk_p.push(last_p_str.clone());
+                            if last_p_val == Some(pv) && let Some(pa) = &last_p_arc {
+                                bulk_p.push(Arc::clone(pa));
                             } else {
-                                let ps = value_to_string(pv, now);
-                                last_p_str = ps.clone();
+                                let pa = value_to_arc_str(pv, now);
+                                last_p_arc = Some(Arc::clone(&pa));
                                 last_p_val = Some(pv);
-                                bulk_p.push(ps);
+                                bulk_p.push(pa);
                             }
-                            bulk_o.push(value_to_string(&record.fields[2].1, now));
+                            bulk_o.push(value_to_arc_str(&record.fields[2].1, now));
                         } else {
                             let mut s = None;
                             let mut p = None;
                             let mut o = None;
                             for (k, v) in &record.fields {
                                 match k.as_str() {
-                                    "s" => s = Some(value_to_string(v, now)),
-                                    "p" => p = Some(value_to_string(v, now)),
-                                    "o" => o = Some(value_to_string(v, now)),
+                                    "s" => s = Some(value_to_arc_str(v, now)),
+                                    "p" => p = Some(value_to_arc_str(v, now)),
+                                    "o" => o = Some(value_to_arc_str(v, now)),
                                     _ => {}
                                 }
                             }
-                            bulk_s.push(s.unwrap_or_default());
-                            bulk_p.push(p.unwrap_or_default());
-                            bulk_o.push(o.unwrap_or_default());
+                            bulk_s.push(s.unwrap_or_else(|| Arc::clone(&EMPTY_ARC)));
+                            bulk_p.push(p.unwrap_or_else(|| Arc::clone(&EMPTY_ARC)));
+                            bulk_o.push(o.unwrap_or_else(|| Arc::clone(&EMPTY_ARC)));
                         }
                     }
                 } else {
@@ -2602,15 +2604,15 @@ impl Db {
                         let mut o = None;
                         for (k, v) in &record.fields {
                             match k.as_str() {
-                                "s" => s = Some(value_to_string(v, now)),
-                                "p" => p = Some(value_to_string(v, now)),
-                                "o" => o = Some(value_to_string(v, now)),
+                                "s" => s = Some(value_to_arc_str(v, now)),
+                                "p" => p = Some(value_to_arc_str(v, now)),
+                                "o" => o = Some(value_to_arc_str(v, now)),
                                 _ => {}
                             }
                         }
-                        bulk_s.push(s.unwrap_or_default());
-                        bulk_p.push(p.unwrap_or_default());
-                        bulk_o.push(o.unwrap_or_default());
+                        bulk_s.push(s.unwrap_or_else(|| Arc::clone(&EMPTY_ARC)));
+                        bulk_p.push(p.unwrap_or_else(|| Arc::clone(&EMPTY_ARC)));
+                        bulk_o.push(o.unwrap_or_else(|| Arc::clone(&EMPTY_ARC)));
                     }
                 }
                 let want_rows = n <= 128;
@@ -3053,10 +3055,9 @@ impl Db {
                 if let Some(bound) = bindings.get(name) {
                     bound.clone()
                 } else if let Some(pred) = first_filter
-                    && let Some(uses) = crate::index::pick_index(&self.catalog, name, pred)
+                    && let Some((uses, covered)) = crate::index::pick_index_with_coverage(&self.catalog, name, pred)
                     && let Some(idxs) = self.store.index_seek(name, &uses, now)
                 {
-                    let covered = crate::index::index_covers_pred(pred, &uses);
                     self.fetch_idxs_filtered(name, &idxs, pred, now, project_fields_step, covered)
                 } else if let Some(pred) = first_filter {
                     let col_len = self.store.collection(name).len();
@@ -3558,6 +3559,51 @@ impl Db {
         })
     }
 
+    fn count_arc_slice_low_cardinality<'a>(
+        slice: &'a [Arc<str>],
+    ) -> (Option<(Arc<str>, i64)>, Option<(Arc<str>, i64)>, Option<FxHashMap<Arc<str>, i64>>) {
+        let mut slot0_ptr: *const u8 = std::ptr::null();
+        let mut slot0_arc: Option<&'a Arc<str>> = None;
+        let mut slot0_cnt: i64 = 0;
+
+        let mut slot1_ptr: *const u8 = std::ptr::null();
+        let mut slot1_arc: Option<&'a Arc<str>> = None;
+        let mut slot1_cnt: i64 = 0;
+
+        let mut overflow: Option<FxHashMap<Arc<str>, i64>> = None;
+
+        for w_arc in slice {
+            let w_ptr = Arc::as_ptr(w_arc) as *const u8;
+            if w_ptr == slot0_ptr {
+                slot0_cnt += 1;
+            } else if w_ptr == slot1_ptr {
+                slot1_cnt += 1;
+            } else if slot0_ptr.is_null() {
+                slot0_ptr = w_ptr;
+                slot0_arc = Some(w_arc);
+                slot0_cnt = 1;
+            } else if slot1_ptr.is_null() {
+                slot1_ptr = w_ptr;
+                slot1_arc = Some(w_arc);
+                slot1_cnt = 1;
+            } else {
+                let w = w_arc.as_ref();
+                if slot0_arc.map_or(false, |a| a.as_ref() == w) {
+                    slot0_cnt += 1;
+                } else if slot1_arc.map_or(false, |a| a.as_ref() == w) {
+                    slot1_cnt += 1;
+                } else {
+                    let map = overflow.get_or_insert_with(FxHashMap::default);
+                    *map.entry(Arc::clone(w_arc)).or_insert(0) += 1;
+                }
+            }
+        }
+
+        let s0 = slot0_arc.map(|arc| (Arc::clone(arc), slot0_cnt));
+        let s1 = slot1_arc.map(|arc| (Arc::clone(arc), slot1_cnt));
+        (s0, s1, overflow)
+    }
+
     pub(crate) fn execute_agg_plan(&self, plan: &AggPlan, now: i64) -> Result<Vec<Row>, Error> {
         // Prepared COUNT must share index/columnar paths with ordinary execution.
         if let AggKind::Count { by: None } = &plan.kind
@@ -3572,8 +3618,8 @@ impl Db {
         if let AggKind::Count { by: Some(by) } = &plan.kind
             && let Some(pred) = &plan.filter
             && let Some(value) = eq_value_for_field(pred, &by.as_str())
-            && let Some(uses) = crate::index::pick_index(&self.catalog, &plan.collection, pred)
-            && crate::index::index_covers_pred(pred, &uses)
+            && let Some((uses, covered)) = crate::index::pick_index_with_coverage(&self.catalog, &plan.collection, pred)
+            && covered
             && let Some(n) = self.store.index_seek_count(&plan.collection, &uses, now)
         {
             if n == 0 {
@@ -3727,65 +3773,90 @@ impl Db {
                 && plan.filter.is_none()
             {
                 let wings = self.store.docs_wing();
-                let total_len = wings.len();
-                let map = if total_len >= 8192 {
-                    let threads = std::thread::available_parallelism()
-                        .map(|p| p.get())
-                        .unwrap_or(1)
-                        .min(8)
-                        .min((total_len + 1023) / 1024);
-                    if threads > 1 {
-                        let chunk_size = (total_len + threads - 1) / threads;
-                        let thread_maps: Vec<FxHashMap<Arc<str>, i64>> = std::thread::scope(|scope| {
-                            let mut handles = Vec::with_capacity(threads);
-                            for chunk_idx in 0..threads {
-                                let c_start = chunk_idx * chunk_size;
-                                if c_start >= total_len {
-                                    break;
+                if let Some((indices, dict)) = wings.as_indices() {
+                    let total_len = indices.len();
+                    let map = if total_len >= 32768 {
+                        let threads = std::thread::available_parallelism()
+                            .map(|p| p.get())
+                            .unwrap_or(1)
+                            .min(8)
+                            .min((total_len + 16383) / 16384);
+                        if threads > 1 {
+                            let chunk_size = (total_len + threads - 1) / threads;
+                            let thread_counts = std::thread::scope(|scope| {
+                                let mut handles = Vec::with_capacity(threads);
+                                for chunk in indices.chunks(chunk_size) {
+                                    handles.push(scope.spawn(move || {
+                                        let mut local = [0i64; 256];
+                                        for &b in chunk {
+                                            local[b as usize] += 1;
+                                        }
+                                        local
+                                    }));
                                 }
-                                let c_end = (c_start + chunk_size).min(total_len);
-                                handles.push(scope.spawn(move || {
-                                    let mut local_map: FxHashMap<Arc<str>, i64> = FxHashMap::default();
-                                    for i in c_start..c_end {
-                                        *local_map.entry(Arc::clone(&wings[i])).or_insert(0) += 1;
-                                    }
-                                    local_map
-                                }));
+                                handles.into_iter().map(|h| h.join().unwrap()).collect::<Vec<_>>()
+                            });
+                            let mut combined = [0i64; 256];
+                            for local in thread_counts {
+                                for i in 0..dict.len() {
+                                    combined[i] += local[i];
+                                }
                             }
-                            handles.into_iter().map(|h| h.join().unwrap()).collect()
-                        });
-                        let mut combined: FxHashMap<Arc<str>, i64> = FxHashMap::default();
-                        for t_map in thread_maps {
-                            for (k, v) in t_map {
-                                *combined.entry(k).or_insert(0) += v;
+                            combined
+                        } else {
+                            let mut counts = [0i64; 256];
+                            for &b in indices {
+                                counts[b as usize] += 1;
                             }
+                            counts
                         }
-                        combined
                     } else {
-                        let mut map: FxHashMap<Arc<str>, i64> = FxHashMap::default();
-                        for w in wings {
-                            *map.entry(Arc::clone(w)).or_insert(0) += 1;
+                        let mut counts = [0i64; 256];
+                        for &b in indices {
+                            counts[b as usize] += 1;
                         }
-                        map
+                        counts
+                    };
+
+                    let mut entries: Vec<(Arc<str>, i64)> = Vec::with_capacity(dict.len());
+                    for (idx, arc) in dict.iter().enumerate() {
+                        let c = map[idx];
+                        if c > 0 {
+                            entries.push((Arc::clone(arc), c));
+                        }
                     }
+                    entries.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+                    return Ok(entries
+                        .into_iter()
+                        .map(|(w, count)| {
+                            let mut row = crate::store::acquire_row();
+                            row.insert("wing".into(), Cell::Text(w));
+                            row.insert("hits".into(), Cell::Int(count));
+                            row
+                        })
+                        .collect());
                 } else {
-                    let mut map: FxHashMap<Arc<str>, i64> = FxHashMap::default();
-                    for w in wings {
-                        *map.entry(Arc::clone(w)).or_insert(0) += 1;
+                    let wings_vec = wings.to_vec();
+                    let (s0, s1, overflow) = Self::count_arc_slice_low_cardinality(&wings_vec);
+                    let mut combined: FxHashMap<Arc<str>, i64> = overflow.unwrap_or_default();
+                    if let Some((k, v)) = s0 {
+                        *combined.entry(k).or_insert(0) += v;
                     }
-                    map
-                };
-                let mut entries: Vec<(Arc<str>, i64)> = map.into_iter().collect();
-                entries.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
-                return Ok(entries
-                    .into_iter()
-                    .map(|(w, count)| {
-                        let mut row = crate::store::acquire_row();
-                        row.insert("wing".into(), Cell::Text(w));
-                        row.insert("hits".into(), Cell::Int(count));
-                        row
-                    })
-                    .collect());
+                    if let Some((k, v)) = s1 {
+                        *combined.entry(k).or_insert(0) += v;
+                    }
+                    let mut entries: Vec<(Arc<str>, i64)> = combined.into_iter().collect();
+                    entries.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+                    return Ok(entries
+                        .into_iter()
+                        .map(|(w, count)| {
+                            let mut row = crate::store::acquire_row();
+                            row.insert("wing".into(), Cell::Text(w));
+                            row.insert("hits".into(), Cell::Int(count));
+                            row
+                        })
+                        .collect());
+                }
             }
         }
 
@@ -4596,8 +4667,8 @@ impl Db {
 
         let Some(by_field) = by else {
             // Full count scan (no early termination) for standard COUNT queries
-            if let Some(uses) = crate::index::pick_index(&self.catalog, name, pred)
-                && crate::index::index_covers_pred(pred, &uses)
+            if let Some((uses, covered)) = crate::index::pick_index_with_coverage(&self.catalog, name, pred)
+                && covered
             {
                 let n = self.store.index_seek_count(name, &uses, now)?;
                 return Some(vec![hits_row(n as i64)]);
@@ -4614,8 +4685,8 @@ impl Db {
         let by_key = by_field.as_str();
 
         // Index-covered + group key fixed by equality → pure seek_count.
-        if let Some(uses) = crate::index::pick_index(&self.catalog, name, pred)
-            && crate::index::index_covers_pred(pred, &uses)
+        if let Some((uses, covered)) = crate::index::pick_index_with_coverage(&self.catalog, name, pred)
+            && covered
         {
             if let Some(v) = eq_value_for_field(pred, &by_key) {
                 let n = self.store.index_seek_count(name, &uses, now)?;
@@ -4723,10 +4794,9 @@ impl Db {
             {
                 self.store
                     .scan_docs_hot_project(&names, Some(needle.as_str()))?
-            } else if let Some(uses) = crate::index::pick_index(&self.catalog, name, pred)
+            } else if let Some((uses, covered)) = crate::index::pick_index_with_coverage(&self.catalog, name, pred)
                 && let Some(idxs) = self.store.index_seek(name, &uses, now)
             {
-                let covered = crate::index::index_covers_pred(pred, &uses);
                 if name == "docs" && covered {
                     if let Some(rows) = self.store.project_docs_hot(&idxs, &names) {
                         rows
@@ -4839,10 +4909,9 @@ impl Db {
 
         let (source, need_filter) = {
             if let Some(pred) = filter {
-                if let Some(uses) = crate::index::pick_index(&self.catalog, name, pred)
+                if let Some((uses, covered)) = crate::index::pick_index_with_coverage(&self.catalog, name, pred)
                     && let Some(idxs) = self.store.index_seek(name, &uses, now)
                 {
-                    let covered = crate::index::index_covers_pred(pred, &uses);
                     (JoinLeftSource::Idxs(idxs), !covered)
                 } else {
                     (
@@ -5059,10 +5128,9 @@ impl Db {
 
         let (source, need_filter) = {
             if let Some(pred) = filter {
-                if let Some(uses) = crate::index::pick_index(&self.catalog, left_name, pred)
+                if let Some((uses, covered)) = crate::index::pick_index_with_coverage(&self.catalog, left_name, pred)
                     && let Some(idxs) = self.store.index_seek(left_name, &uses, now)
                 {
-                    let covered = crate::index::index_covers_pred(pred, &uses);
                     (JoinLeftSource::Idxs(idxs), !covered)
                 } else {
                     (
@@ -5231,10 +5299,9 @@ impl Db {
         let (source, need_row_filter) = if total_gt.is_some() {
             (JoinLeftSource::Scan { len: n }, false)
         } else if let Some(pred) = filter {
-            if let Some(uses) = crate::index::pick_index(&self.catalog, "orders", pred)
+            if let Some((uses, covered)) = crate::index::pick_index_with_coverage(&self.catalog, "orders", pred)
                 && let Some(idxs) = self.store.index_seek("orders", &uses, now)
             {
-                let covered = crate::index::index_covers_pred(pred, &uses);
                 (JoinLeftSource::Idxs(idxs), !covered)
             } else {
                 (JoinLeftSource::Scan { len: n }, true)
@@ -6273,29 +6340,56 @@ impl Db {
         }
 
         let mut row_idxs = Vec::with_capacity(rows.len());
-        let mut texts = Vec::with_capacity(rows.len());
-        for (i, row) in rows.iter().enumerate() {
-            if row.get("embedding").and_then(Cell::as_vec).is_some() {
-                continue;
-            }
-            let text = embed::row_embed_text(row);
-            if !text.is_empty() {
-                row_idxs.push(i);
-                texts.push(text);
+        let mut row_ptrs = Vec::with_capacity(rows.len());
+        let first_needs = rows.first().is_some_and(|r| {
+            r.get("embedding").and_then(Cell::as_vec).is_none()
+                && (r.get("title")
+                    .or_else(|| r.get("body"))
+                    .or_else(|| r.get("snippet"))
+                    .and_then(Cell::text)
+                    .is_some_and(|s| !s.is_empty()))
+        });
+        if rows.len() >= 64
+            && first_needs
+            && rows.iter().all(|r| r.get("embedding").and_then(Cell::as_vec).is_none())
+        {
+            row_idxs.extend(0..rows.len());
+            row_ptrs.extend(rows.iter());
+        } else {
+            for (i, row) in rows.iter().enumerate() {
+                if row.get("embedding").and_then(Cell::as_vec).is_some() {
+                    continue;
+                }
+                let has_text = row
+                    .get("title")
+                    .or_else(|| row.get("body"))
+                    .or_else(|| row.get("snippet"))
+                    .and_then(Cell::text)
+                    .is_some_and(|s| !s.is_empty());
+                if has_text {
+                    row_idxs.push(i);
+                    row_ptrs.push(row);
+                }
             }
         }
-        if texts.is_empty() {
+        if row_ptrs.is_empty() {
             return;
         }
-        let refs = texts.iter().map(|text| text.as_ref()).collect::<Vec<_>>();
-        let mut vectors = emb.embed_batch(&refs);
+        let mut vectors = emb.embed_rows(&row_ptrs);
         if vectors.len() != row_idxs.len() {
             // Keep third-party embedders with a broken batch implementation
             // from silently leaving a partially embedded slab.
-            vectors = refs.iter().map(|text| emb.embed(text)).collect();
+            vectors = row_ptrs
+                .iter()
+                .map(|r| emb.embed(&embed::row_embed_text(r)))
+                .collect();
         }
         for (i, vector) in row_idxs.into_iter().zip(vectors) {
-            rows[i].insert("embedding".into(), Cell::Vec(vector));
+            if let Some(cell) = rows[i].get_mut("embedding") {
+                *cell = Cell::Vec(vector);
+            } else {
+                rows[i].insert("embedding".into(), Cell::Vec(vector));
+            }
         }
     }
 
@@ -6392,48 +6486,75 @@ impl Db {
     ) -> Result<(Vec<Row>, Vec<Edge>, Option<crate::persist::PreparedInsert>), Error> {
         let now = now_ms();
         let n = records.len();
-        let mut built: Vec<Row> = if n >= 2048 {
+        let needs_embed = self.embedder.is_some()
+            && self
+                .catalog
+                .collection(collection)
+                .is_some_and(|c| c.has_vec());
+        let (mut built, all_uniform) = if n >= 2048 {
             let threads = std::thread::available_parallelism()
                 .map(|p| p.get())
                 .unwrap_or(1)
-                .min(8)
+                .min(4)
                 .min((n + 255) / 256);
             if threads > 1 {
                 let chunk_size = (n + threads - 1) / threads;
+                let chunks: Vec<&[Record]> = records.chunks(chunk_size).collect();
+                let first_chunk = chunks[0];
+                let other_chunks = &chunks[1..];
                 std::thread::scope(|scope| {
-                    let mut handles = Vec::with_capacity(threads);
-                    for chunk in records.chunks(chunk_size) {
+                    let mut handles = Vec::with_capacity(other_chunks.len());
+                    for chunk in other_chunks {
                         handles.push(scope.spawn(move || {
                             let mut rows = Vec::with_capacity(chunk.len());
-                            append_batch_shape_rows(&mut rows, chunk, now);
-                            for row in &mut rows {
-                                if row.get("hash").and_then(Cell::text).is_none()
-                                    && let Some(body) = row.get("body").and_then(Cell::text_shared)
-                                {
-                                    row.insert(
-                                        "hash".into(),
-                                        Cell::Text(content_hash_arc(body.as_ref())),
-                                    );
+                            let uniform = append_batch_shape_rows(&mut rows, chunk, now, needs_embed);
+                            if !uniform {
+                                for row in &mut rows {
+                                    if row.get("hash").and_then(Cell::text).is_none()
+                                        && let Some(body) = row.get("body").and_then(Cell::text_shared)
+                                    {
+                                        row.insert(
+                                            "hash".into(),
+                                            Cell::Text(content_hash_arc(body.as_ref())),
+                                        );
+                                    }
                                 }
                             }
-                            rows
+                            (rows, uniform)
                         }));
                     }
-                    let mut rows = Vec::with_capacity(n);
-                    for handle in handles {
-                        rows.extend(handle.join().expect("row construction worker panicked"));
+                    let mut main_rows = Vec::with_capacity(first_chunk.len());
+                    let mut all_uniform = append_batch_shape_rows(&mut main_rows, first_chunk, now, needs_embed);
+                    if !all_uniform {
+                        for row in &mut main_rows {
+                            if row.get("hash").and_then(Cell::text).is_none()
+                                && let Some(body) = row.get("body").and_then(Cell::text_shared)
+                            {
+                                row.insert(
+                                    "hash".into(),
+                                    Cell::Text(content_hash_arc(body.as_ref())),
+                                );
+                            }
+                        }
                     }
-                    rows
+                    let mut rows = Vec::with_capacity(n);
+                    rows.extend(main_rows);
+                    for handle in handles {
+                        let (chunk_rows, uniform) = handle.join().expect("row construction worker panicked");
+                        all_uniform = all_uniform && uniform;
+                        rows.extend(chunk_rows);
+                    }
+                    (rows, all_uniform)
                 })
             } else {
                 let mut rows = Vec::with_capacity(n);
-                append_batch_shape_rows(&mut rows, records, now);
-                rows
+                let uniform = append_batch_shape_rows(&mut rows, records, now, needs_embed);
+                (rows, uniform)
             }
         } else {
             let mut rows = Vec::with_capacity(n);
-            append_batch_shape_rows(&mut rows, records, now);
-            rows
+            let uniform = append_batch_shape_rows(&mut rows, records, now, needs_embed);
+            (rows, uniform)
         };
         let mut batch_ids: rustc_hash::FxHashSet<&str> = rustc_hash::FxHashSet::default();
         batch_ids.reserve(n);
@@ -6449,38 +6570,71 @@ impl Db {
             .first()
             .map_or(true, |r| !r.fields.iter().any(|(k, _)| k == "id"));
 
-        for row in &mut built {
-            if needs_id && row.get("id").and_then(Cell::text).is_none() {
-                row.insert("id".into(), Cell::text_arc(self.store.alloc_id()));
+        let first_record = records.first();
+        let id_rec_pos = first_record.and_then(|r| r.fields.iter().position(|(k, _)| k == "id"));
+        let uri_rec_pos = if is_docs {
+            first_record.and_then(|r| r.fields.iter().position(|(k, _)| k == "uri"))
+        } else {
+            None
+        };
+
+        if all_uniform && !needs_id && !has_fks && id_rec_pos.is_some() && (!is_docs || uri_rec_pos.is_some()) {
+            let id_pos = id_rec_pos.unwrap();
+            let uri_pos_opt = uri_rec_pos;
+            for record in records {
+                if let Some((_, Value::String(id_arc))) = record.fields.get(id_pos) {
+                    let id = id_arc.as_ref();
+                    if !batch_ids.insert(id)
+                        || (!store_empty && self.store.get_by_id(collection, id).is_some())
+                    {
+                        return Err(Error::runtime(format!("duplicate id: {id}")));
+                    }
+                }
+                if let Some(u_pos) = uri_pos_opt
+                    && let Some((_, Value::String(uri_arc))) = record.fields.get(u_pos)
+                {
+                    let uri = uri_arc.as_ref();
+                    if !batch_uris.insert(uri)
+                        || (!store_empty && self.store.get_by_uri(uri).is_some())
+                    {
+                        return Err(Error::runtime(format!("duplicate uri: {uri}")));
+                    }
+                }
             }
-            if row.get("hash").and_then(Cell::text).is_none()
-                && let Some(body) = row.get("body").and_then(Cell::text_shared)
-            {
-                // Large short-body batches bypass the cache; small batches retain reuse.
-                row.insert(
-                    "hash".into(),
-                    Cell::Text(if n >= 512 && body.len() <= 64 {
-                        content_hash_arc(body.as_ref())
-                    } else {
-                        cached_content_hash(body.as_ref())
-                    }),
-                );
-            }
-            if let Some(id) = row.get("id").and_then(Cell::text)
-                && (!batch_ids.insert(id)
-                    || (!store_empty && self.store.get_by_id(collection, id).is_some()))
-            {
-                return Err(Error::runtime(format!("duplicate id: {id}")));
-            }
-            if is_docs
-                && let Some(uri) = row.get("uri").and_then(Cell::text)
-                && (!batch_uris.insert(uri)
-                    || (!store_empty && self.store.get_by_uri(uri).is_some()))
-            {
-                return Err(Error::runtime(format!("duplicate uri: {uri}")));
-            }
-            if has_fks {
-                self.check_row_fks(collection, row)?;
+        } else {
+            for row in &mut built {
+                if needs_id && row.get("id").and_then(Cell::text).is_none() {
+                    row.insert("id".into(), Cell::text_arc(self.store.alloc_id()));
+                }
+                if row.get("hash").and_then(Cell::text).is_none()
+                    && let Some(body) = row.get("body").and_then(Cell::text_shared)
+                {
+                    // Large short-body batches bypass the cache; small batches retain reuse.
+                    row.insert(
+                        "hash".into(),
+                        Cell::Text(if n >= 512 && body.len() <= 64 {
+                            content_hash_arc(body.as_ref())
+                        } else {
+                            cached_content_hash(body.as_ref())
+                        }),
+                    );
+                }
+                if let Some(id) = row.get("id").and_then(Cell::text)
+                    && (!batch_ids.insert(id)
+                        || (!store_empty && self.store.get_by_id(collection, id).is_some()))
+                {
+                    return Err(Error::runtime(format!("duplicate id: {id}")));
+                }
+                if is_docs
+                    && let Some(uri) = row.get("uri").and_then(Cell::text)
+                    && (!batch_uris.insert(uri)
+                        || (!store_empty && self.store.get_by_uri(uri).is_some()))
+                {
+                    return Err(Error::runtime(format!("duplicate uri: {uri}")));
+                }
+                if has_fks {
+                    self.check_row_fks(collection, row)?;
+                }
             }
         }
         drop(batch_ids);
@@ -7098,17 +7252,6 @@ pub(crate) fn plan_join_fields(
             plan.push(JoinFieldPlan::Left(f.clone()));
         }
     }
-    plan.sort_by(|a, b| {
-        let ka = match a {
-            JoinFieldPlan::Left(k) => k.as_str(),
-            JoinFieldPlan::Right { out, .. } => out.as_str(),
-        };
-        let kb = match b {
-            JoinFieldPlan::Left(k) => k.as_str(),
-            JoinFieldPlan::Right { out, .. } => out.as_str(),
-        };
-        ka.cmp(kb)
-    });
     (right_fields, plan)
 }
 
@@ -7284,29 +7427,57 @@ fn append_bulk_worker_rows(
     }
 }
 
-fn append_batch_shape_rows(rows: &mut Vec<Row>, records: &[Record], now: i64) {
+fn append_batch_shape_rows(rows: &mut Vec<Row>, records: &[Record], now: i64, needs_embed: bool) -> bool {
     let Some(first) = records.first() else {
-        return;
+        return false;
     };
     if records.len() < 128 || first.fields.is_empty() || first.fields.len() > 32 {
         rows.extend(records.iter().map(|record| record_row(record, now)));
-        return;
+        return false;
     }
-    let template = first
+    let body_idx = first.fields.iter().position(|(k, _)| k == "body");
+    let has_hash = first.fields.iter().any(|(k, _)| k == "hash");
+    let needs_hash = !has_hash && body_idx.is_some();
+
+    let mut template = first
         .fields
         .iter()
         .map(|(key, _)| (key.clone(), Cell::Null))
         .collect::<Row>();
+    if needs_hash {
+        template.insert("hash".into(), Cell::Null);
+    }
+    if needs_embed {
+        template.insert("embedding".into(), Cell::Null);
+    }
+
+    #[derive(Clone, Copy)]
+    enum ShapeSlot {
+        Source(usize),
+        Hash(usize),
+        Embed,
+    }
+
+    let n = records.len();
     let slots = template
         .keys()
         .map(|key| {
-            first
-                .fields
-                .iter()
-                .rposition(|(field, _)| field == key)
-                .unwrap()
+            if key == "hash" && needs_hash {
+                ShapeSlot::Hash(body_idx.unwrap())
+            } else if key == "embedding" && needs_embed {
+                ShapeSlot::Embed
+            } else {
+                ShapeSlot::Source(
+                    first
+                        .fields
+                        .iter()
+                        .rposition(|(field, _)| field == key)
+                        .unwrap(),
+                )
+            }
         })
         .collect::<Vec<_>>();
+    let mut all_same = true;
     for record in records {
         let same_shape = record.fields.len() == first.fields.len()
             && record
@@ -7315,15 +7486,31 @@ fn append_batch_shape_rows(rows: &mut Vec<Row>, records: &[Record], now: i64) {
                 .zip(&first.fields)
                 .all(|(a, b)| a.0 == b.0);
         if !same_shape {
+            all_same = false;
             rows.push(record_row(record, now));
             continue;
         }
         let mut row = template.clone();
-        for (cell, &source) in row.values_mut().zip(&slots) {
-            *cell = value_cell(&record.fields[source].1, now);
+        for (cell, slot) in row.values_mut().zip(&slots) {
+            match slot {
+                ShapeSlot::Source(src) => {
+                    *cell = value_cell(&record.fields[*src].1, now);
+                }
+                ShapeSlot::Hash(b_src) => {
+                    if let Value::String(body) = &record.fields[*b_src].1 {
+                        *cell = Cell::Text(if n >= 512 && body.len() <= 64 {
+                            crate::store::content_hash_arc(body.as_ref())
+                        } else {
+                            cached_content_hash(body.as_ref())
+                        });
+                    }
+                }
+                ShapeSlot::Embed => {}
+            }
         }
         rows.push(row);
     }
+    all_same
 }
 
 fn record_row(record: &Record, now: i64) -> Row {
@@ -7398,7 +7585,7 @@ mod record_tests {
             let before = records.clone();
             for now in [123, 456] {
                 let mut actual = vec![Row::from([("prefix".into(), Cell::Int(9))])];
-                append_batch_shape_rows(&mut actual, &records, now);
+                append_batch_shape_rows(&mut actual, &records, now, false);
                 assert_eq!(actual.len(), n + 1);
                 assert_eq!(actual[0]["prefix"], Cell::Int(9));
                 let expected = records
@@ -7421,7 +7608,7 @@ mod record_tests {
             };
             let records = vec![record; 129];
             let mut actual = Vec::new();
-            append_batch_shape_rows(&mut actual, &records, 55);
+            append_batch_shape_rows(&mut actual, &records, 55, false);
             assert_eq!(
                 actual,
                 records
@@ -7637,6 +7824,7 @@ mod record_tests {
     }
 }
 
+#[inline(always)]
 fn value_cell(v: &Value, now: i64) -> Cell {
     match v {
         Value::String(s) => Cell::Text(std::sync::Arc::clone(s)),
@@ -7652,15 +7840,25 @@ fn value_cell(v: &Value, now: i64) -> Cell {
 }
 
 #[inline]
-fn value_to_string(v: &Value, now: i64) -> String {
+fn value_to_arc_str(v: &Value, now: i64) -> Arc<str> {
     match v {
-        Value::String(s) => s.as_ref().to_owned(),
-        Value::Int(n) => n.to_string(),
-        Value::Float(f) => f.to_string(),
-        Value::Bool(b) => if *b { "true".into() } else { "false".into() },
-        Value::Timestamp(t) => t.to_string(),
-        Value::Name(s) => s.clone(),
-        _ => value_text(v, now),
+        Value::String(s) => Arc::clone(s),
+        Value::Name(s) => Arc::from(s.as_str()),
+        Value::Int(n) => Arc::from(n.to_string()),
+        Value::Float(f) => Arc::from(f.to_string()),
+        Value::Bool(b) => {
+            if *b {
+                static TRUE_ARC: std::sync::LazyLock<Arc<str>> =
+                    std::sync::LazyLock::new(|| Arc::from("true"));
+                Arc::clone(&TRUE_ARC)
+            } else {
+                static FALSE_ARC: std::sync::LazyLock<Arc<str>> =
+                    std::sync::LazyLock::new(|| Arc::from("false"));
+                Arc::clone(&FALSE_ARC)
+            }
+        }
+        Value::Timestamp(t) => Arc::from(t.to_string()),
+        _ => Arc::from(value_text(v, now)),
     }
 }
 
