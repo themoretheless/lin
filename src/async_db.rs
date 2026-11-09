@@ -81,17 +81,22 @@ impl AsyncDb {
     }
 
     pub async fn to_vec(&self, q: Queryable) -> Result<Vec<Row>, Error> {
-        Ok(self.run_stmt(q.stmt()).await?.rows)
+        Ok(self.run_stmt(q.stmt()).await?.into_rows())
     }
 
     pub async fn to_vec_typed<T: FromRow + Send + 'static>(
         &self,
         q: Queryable,
     ) -> Result<Vec<T>, Error> {
-        let rows = self.to_vec(q).await?;
-        spawn_blocking(move || row::map_rows(&rows))
-            .await
-            .map_err(|e| Error::runtime(format!("async join: {e}")))?
+        let stmt = q.stmt();
+        let db = Arc::clone(&self.inner);
+        spawn_blocking(move || {
+            let mut g = db.blocking_lock();
+            let rows = g.run_stmt(stmt)?.into_rows();
+            row::map_rows(&rows)
+        })
+        .await
+        .map_err(|e| Error::runtime(format!("async join: {e}")))?
     }
 
     async fn snapshot(&self) -> ReadDb {
@@ -167,17 +172,21 @@ impl AsyncReadDb {
     }
 
     pub async fn to_vec(&self, q: Queryable) -> Result<Vec<Row>, Error> {
-        Ok(self.run_stmt(q.stmt()).await?.rows)
+        Ok(self.run_stmt(q.stmt()).await?.into_rows())
     }
 
     pub async fn to_vec_typed<T: FromRow + Send + 'static>(
         &self,
         q: Queryable,
     ) -> Result<Vec<T>, Error> {
-        let rows = self.to_vec(q).await?;
-        spawn_blocking(move || row::map_rows(&rows))
-            .await
-            .map_err(|e| Error::runtime(format!("async join: {e}")))?
+        let stmt = q.stmt();
+        let db = self.inner.clone();
+        spawn_blocking(move || {
+            let rows = db.run_stmt(stmt)?.into_rows();
+            row::map_rows(&rows)
+        })
+        .await
+        .map_err(|e| Error::runtime(format!("async join: {e}")))?
     }
 
     pub async fn stream(
@@ -303,7 +312,7 @@ fn spawn_cursor_or_run(
             CursorJob::Stmt(other) => {
                 match read.run_stmt(other) {
                     Ok(h) => {
-                        for row in h.rows {
+                        for row in h.into_rows() {
                             if !send(Ok(row)) {
                                 return;
                             }
@@ -321,7 +330,7 @@ fn spawn_cursor_or_run(
                     other => {
                         match read.run_stmt(other) {
                             Ok(h) => {
-                                for row in h.rows {
+                                for row in h.into_rows() {
                                     if !send(Ok(row)) {
                                         return;
                                     }
@@ -337,7 +346,7 @@ fn spawn_cursor_or_run(
                 Ok(_) => {
                     match read.run(&src) {
                         Ok(h) => {
-                            for row in h.rows {
+                            for row in h.into_rows() {
                                 if !send(Ok(row)) {
                                     return;
                                 }

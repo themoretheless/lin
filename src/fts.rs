@@ -37,7 +37,7 @@ const FOLD_AFTER: usize = 256;
 #[derive(Debug, Clone, Default)]
 pub struct FtsIndex {
     pub fields: Vec<String>,
-    postings: FxHashMap<Arc<str>, Vec<usize>>,
+    postings: FxHashMap<Arc<str>, SmallVec<[usize; 2]>>,
     dels: FxHashMap<Arc<str>, SmallVec<[usize; 2]>>,
     adds: FxHashMap<Arc<str>, SmallVec<[usize; 2]>>,
 }
@@ -72,9 +72,7 @@ impl FtsIndex {
                                     list.push(i);
                                 }
                             } else {
-                                let mut list = Vec::with_capacity(8);
-                                list.push(i);
-                                idx.postings.insert(Arc::from(tok), list);
+                                idx.postings.insert(Arc::from(tok), smallvec![i]);
                             }
                         }
                     }
@@ -198,7 +196,7 @@ impl FtsIndex {
                 }
             }
             None => {
-                self.postings.insert(Arc::from(tok), vec![row_idx]);
+                self.postings.insert(Arc::from(tok), smallvec![row_idx]);
                 return;
             }
         }
@@ -216,6 +214,28 @@ impl FtsIndex {
     /// the whole edit. A removal of a position the base does not hold is a
     /// no-op under `(postings ∪ adds) \ dels`.
     fn note_del(&mut self, tok: &str, row_idx: usize) {
+        if self.postings.len() <= 64
+            && (self.adds.is_empty() || !self.adds.contains_key(tok))
+            && (self.dels.is_empty() || !self.dels.contains_key(tok))
+            && let Some(list) = self.postings.get_mut(tok)
+        {
+            if list.last() == Some(&row_idx) {
+                list.pop();
+                if list.is_empty() {
+                    self.postings.remove(tok);
+                }
+                return;
+            }
+            if list.len() <= 32 {
+                if let Ok(pos) = list.binary_search(&row_idx) {
+                    list.remove(pos);
+                    if list.is_empty() {
+                        self.postings.remove(tok);
+                    }
+                }
+                return;
+            }
+        }
         // An addition can overlap the base after a removal was cancelled.
         // Cancelling it alone would expose the old base posting again.
         if !self.adds.is_empty() {
@@ -225,6 +245,63 @@ impl FtsIndex {
         if len > FOLD_AFTER / 2 {
             self.fold_if_pending(tok);
         }
+    }
+
+    #[inline]
+    fn note_del_tail(&mut self, tok: &str, last: usize) {
+        if self.postings.len() <= 64
+            && (self.adds.is_empty() || !self.adds.contains_key(tok))
+            && let Some(list) = self.postings.get_mut(tok)
+            && list.last() == Some(&last)
+        {
+            list.pop();
+            if list.is_empty() && (self.dels.is_empty() || !self.dels.contains_key(tok)) {
+                self.postings.remove(tok);
+            }
+            return;
+        }
+        self.note_del(tok, last);
+    }
+
+    #[inline]
+    fn note_move_from_tail(&mut self, tok: &str, p: usize, last: usize) {
+        if self.postings.len() > 64 {
+            if !self.dels.is_empty() {
+                cancel(&mut self.dels, tok, p);
+            }
+            let len_a = push_pending(&mut self.adds, &self.postings, tok, p);
+            if !self.adds.is_empty() {
+                cancel(&mut self.adds, tok, last);
+            }
+            let len_d = push_pending(&mut self.dels, &self.postings, tok, last);
+            if len_a + len_d > FOLD_AFTER {
+                self.fold_if_pending(tok);
+            }
+            return;
+        }
+        if (self.adds.is_empty() || !self.adds.contains_key(tok))
+            && (self.dels.is_empty() || !self.dels.contains_key(tok))
+            && let Some(list) = self.postings.get_mut(tok)
+            && list.last() == Some(&last)
+        {
+            list.pop();
+            if list.len() <= 32 {
+                if let Err(pos) = list.binary_search(&p) {
+                    list.insert(pos, p);
+                }
+                return;
+            }
+            if list.binary_search(&p).is_ok() {
+                return;
+            }
+            let len = push_pending(&mut self.adds, &self.postings, tok, p);
+            if len > FOLD_AFTER / 2 {
+                self.fold_if_pending(tok);
+            }
+            return;
+        }
+        self.note_add(tok, p);
+        self.note_del(tok, last);
     }
 
     fn fold_if_pending(&mut self, tok: &str) {
@@ -250,13 +327,13 @@ impl FtsIndex {
         }
         let Some((key, base)) = self.postings.remove_entry(tok) else {
             if !adds.is_empty() {
-                self.postings.insert(Arc::from(tok), adds.into_vec());
+                self.postings.insert(Arc::from(tok), adds);
             }
             return;
         };
         let list = merge_edits(&base, &dels, &adds);
         if !list.is_empty() {
-            self.postings.insert(key, list);
+            self.postings.insert(key, SmallVec::from_vec(list));
         }
     }
 
@@ -278,7 +355,7 @@ impl FtsIndex {
                 .get(tok)
                 .map(|list| std::borrow::Cow::Borrowed(list.as_slice()));
         }
-        let base = self.postings.get(tok).map(Vec::as_slice).unwrap_or(&[]);
+        let base = self.postings.get(tok).map(|v| v.as_slice()).unwrap_or(&[]);
         Some(std::borrow::Cow::Owned(merge_edits(base, dels, adds)))
     }
 
@@ -306,73 +383,42 @@ impl FtsIndex {
     /// is dropped. Tokens common to both `doomed` and `tail` remain present at
     /// slot `p` without any edit.
     pub fn swap_remove_row(&mut self, p: usize, doomed: &Row, last: usize, tail: &Row) {
-        LOWER_SCRATCH.with(|lsc_a| {
-            SCRATCH.with(|sc_a| {
-                TOKENS.with(|tk_a| {
-                    LOWER_SCRATCH_B.with(|lsc_b| {
-                        SCRATCH_B.with(|sc_b| {
-                            TOKENS_B.with(|tk_b| {
-                                let mut scratch_a = sc_a.borrow_mut();
-                                let mut lower_a = lsc_a.borrow_mut();
-                                let mut tokens_a = tk_a.borrow_mut();
+        FTS_SCRATCH.with(|pair_cell| {
+            let mut pair = pair_cell.borrow_mut();
+            let FtsScratchPair { a, b } = &mut *pair;
+            a.collect(doomed, &self.fields);
+            b.collect(tail, &self.fields);
 
-                                let mut scratch_b = sc_b.borrow_mut();
-                                let mut lower_b = lsc_b.borrow_mut();
-                                let mut tokens_b = tk_b.borrow_mut();
-
-                                collect_tokens_into_buffers(
-                                    doomed,
-                                    &self.fields,
-                                    &mut scratch_a,
-                                    &mut lower_a,
-                                    &mut tokens_a,
-                                );
-                                collect_tokens_into_buffers(
-                                    tail,
-                                    &self.fields,
-                                    &mut scratch_b,
-                                    &mut lower_b,
-                                    &mut tokens_b,
-                                );
-
-                                let (mut d_pos, mut t_pos) = (0, 0);
-                                while d_pos < tokens_a.len() && t_pos < tokens_b.len() {
-                                    let d_str = &scratch_a[tokens_a[d_pos].clone()];
-                                    let t_str = &scratch_b[tokens_b[t_pos].clone()];
-                                    match d_str.cmp(t_str) {
-                                        std::cmp::Ordering::Less => {
-                                            self.note_del(d_str, p);
-                                            d_pos += 1;
-                                        }
-                                        std::cmp::Ordering::Greater => {
-                                            self.note_add(t_str, p);
-                                            t_pos += 1;
-                                        }
-                                        std::cmp::Ordering::Equal => {
-                                            d_pos += 1;
-                                            t_pos += 1;
-                                        }
-                                    }
-                                }
-                                while d_pos < tokens_a.len() {
-                                    let d_str = &scratch_a[tokens_a[d_pos].clone()];
-                                    self.note_del(d_str, p);
-                                    d_pos += 1;
-                                }
-                                while t_pos < tokens_b.len() {
-                                    let t_str = &scratch_b[tokens_b[t_pos].clone()];
-                                    self.note_add(t_str, p);
-                                    t_pos += 1;
-                                }
-                                for r in tokens_b.iter() {
-                                    let t_str = &scratch_b[r.clone()];
-                                    self.note_del(t_str, last);
-                                }
-                            });
-                        });
-                    });
-                });
-            });
+            let (mut d_pos, mut t_pos) = (0, 0);
+            while d_pos < a.tokens.len() && t_pos < b.tokens.len() {
+                let d_str = &a.scratch[a.tokens[d_pos].clone()];
+                let t_str = &b.scratch[b.tokens[t_pos].clone()];
+                match d_str.cmp(t_str) {
+                    std::cmp::Ordering::Less => {
+                        self.note_del(d_str, p);
+                        d_pos += 1;
+                    }
+                    std::cmp::Ordering::Greater => {
+                        self.note_move_from_tail(t_str, p, last);
+                        t_pos += 1;
+                    }
+                    std::cmp::Ordering::Equal => {
+                        self.note_del_tail(t_str, last);
+                        d_pos += 1;
+                        t_pos += 1;
+                    }
+                }
+            }
+            while d_pos < a.tokens.len() {
+                let d_str = &a.scratch[a.tokens[d_pos].clone()];
+                self.note_del(d_str, p);
+                d_pos += 1;
+            }
+            while t_pos < b.tokens.len() {
+                let t_str = &b.scratch[b.tokens[t_pos].clone()];
+                self.note_move_from_tail(t_str, p, last);
+                t_pos += 1;
+            }
         });
     }
 
@@ -388,69 +434,41 @@ impl FtsIndex {
         {
             return;
         }
-        LOWER_SCRATCH.with(|lsc_a| {
-            SCRATCH.with(|sc_a| {
-                TOKENS.with(|tk_a| {
-                    LOWER_SCRATCH_B.with(|lsc_b| {
-                        SCRATCH_B.with(|sc_b| {
-                            TOKENS_B.with(|tk_b| {
-                                let mut scratch_a = sc_a.borrow_mut();
-                                let mut lower_a = lsc_a.borrow_mut();
-                                let mut tokens_a = tk_a.borrow_mut();
+        FTS_SCRATCH.with(|pair_cell| {
+            let mut pair = pair_cell.borrow_mut();
+            let FtsScratchPair { a, b } = &mut *pair;
+            a.collect(before, &self.fields);
+            b.collect(after, &self.fields);
 
-                                let mut scratch_b = sc_b.borrow_mut();
-                                let mut lower_b = lsc_b.borrow_mut();
-                                let mut tokens_b = tk_b.borrow_mut();
-
-                                collect_tokens_into_buffers(
-                                    before,
-                                    &self.fields,
-                                    &mut scratch_a,
-                                    &mut lower_a,
-                                    &mut tokens_a,
-                                );
-                                collect_tokens_into_buffers(
-                                    after,
-                                    &self.fields,
-                                    &mut scratch_b,
-                                    &mut lower_b,
-                                    &mut tokens_b,
-                                );
-
-                                let (mut old_pos, mut new_pos) = (0, 0);
-                                while old_pos < tokens_a.len() && new_pos < tokens_b.len() {
-                                    let old_str = &scratch_a[tokens_a[old_pos].clone()];
-                                    let new_str = &scratch_b[tokens_b[new_pos].clone()];
-                                    match old_str.cmp(new_str) {
-                                        std::cmp::Ordering::Less => {
-                                            self.note_del(old_str, row_idx);
-                                            old_pos += 1;
-                                        }
-                                        std::cmp::Ordering::Greater => {
-                                            self.note_add(new_str, row_idx);
-                                            new_pos += 1;
-                                        }
-                                        std::cmp::Ordering::Equal => {
-                                            old_pos += 1;
-                                            new_pos += 1;
-                                        }
-                                    }
-                                }
-                                while old_pos < tokens_a.len() {
-                                    let old_str = &scratch_a[tokens_a[old_pos].clone()];
-                                    self.note_del(old_str, row_idx);
-                                    old_pos += 1;
-                                }
-                                while new_pos < tokens_b.len() {
-                                    let new_str = &scratch_b[tokens_b[new_pos].clone()];
-                                    self.note_add(new_str, row_idx);
-                                    new_pos += 1;
-                                }
-                            });
-                        });
-                    });
-                });
-            });
+            let (mut old_pos, mut new_pos) = (0, 0);
+            while old_pos < a.tokens.len() && new_pos < b.tokens.len() {
+                let old_str = &a.scratch[a.tokens[old_pos].clone()];
+                let new_str = &b.scratch[b.tokens[new_pos].clone()];
+                match old_str.cmp(new_str) {
+                    std::cmp::Ordering::Less => {
+                        self.note_del(old_str, row_idx);
+                        old_pos += 1;
+                    }
+                    std::cmp::Ordering::Greater => {
+                        self.note_add(new_str, row_idx);
+                        new_pos += 1;
+                    }
+                    std::cmp::Ordering::Equal => {
+                        old_pos += 1;
+                        new_pos += 1;
+                    }
+                }
+            }
+            while old_pos < a.tokens.len() {
+                let old_str = &a.scratch[a.tokens[old_pos].clone()];
+                self.note_del(old_str, row_idx);
+                old_pos += 1;
+            }
+            while new_pos < b.tokens.len() {
+                let new_str = &b.scratch[b.tokens[new_pos].clone()];
+                self.note_add(new_str, row_idx);
+                new_pos += 1;
+            }
         });
     }
 
@@ -503,6 +521,7 @@ impl FtsIndex {
             return matched_lists.pop().unwrap().into_owned();
         }
 
+        matched_lists.sort_unstable_by_key(|l| l.len());
         let mut buf_a = matched_lists[0].to_vec();
         let mut buf_b = Vec::new();
 
@@ -515,7 +534,7 @@ impl FtsIndex {
     }
 
     pub fn encode(&self, generation: u64, nrows: u64) -> Vec<u8> {
-        let mut terms: Vec<(&Arc<str>, &Vec<usize>)> = self.postings.iter().collect();
+        let mut terms: Vec<(&Arc<str>, &SmallVec<[usize; 2]>)> = self.postings.iter().collect();
         terms.sort_by(|a, b| a.0.cmp(b.0));
         let mut out = Vec::with_capacity(64 + terms.len() * 16);
         out.extend_from_slice(&FTS_MAGIC);
@@ -561,7 +580,7 @@ impl FtsIndex {
         for _ in 0..nterms {
             let tok = Arc::from(read_str(bytes, &mut i)?);
             let n = read_u32(bytes, &mut i)? as usize;
-            let mut list = Vec::with_capacity(n);
+            let mut list = SmallVec::with_capacity(n);
             for _ in 0..n {
                 list.push(read_u32(bytes, &mut i)? as usize);
             }
@@ -732,7 +751,7 @@ fn union_sorted(a: &[usize], b: &[usize]) -> Vec<usize> {
 /// Insert into a sorted, unique pending list; merges rely on this invariant.
 fn push_pending(
     map: &mut FxHashMap<Arc<str>, SmallVec<[usize; 2]>>,
-    postings: &FxHashMap<Arc<str>, Vec<usize>>,
+    postings: &FxHashMap<Arc<str>, SmallVec<[usize; 2]>>,
     tok: &str,
     row_idx: usize,
 ) -> usize {
@@ -744,7 +763,9 @@ fn push_pending(
         }
         list.len()
     } else {
-        let key = if let Some((k, _)) = postings.get_key_value(tok) {
+        let key = if postings.len() <= 64
+            && let Some((k, _)) = postings.get_key_value(tok)
+        {
             Arc::clone(k)
         } else {
             Arc::from(tok)
@@ -773,7 +794,11 @@ fn cancel(map: &mut FxHashMap<Arc<str>, SmallVec<[usize; 2]>>, tok: &str, row_id
 
 /// Add `row_idx` to a token's sorted list, allocating a posting list only when
 /// the token is new.
-fn add_posting(postings: &mut FxHashMap<Arc<str>, Vec<usize>>, tok: &str, row_idx: usize) {
+fn add_posting(
+    postings: &mut FxHashMap<Arc<str>, SmallVec<[usize; 2]>>,
+    tok: &str,
+    row_idx: usize,
+) {
     if let Some(list) = postings.get_mut(tok) {
         if let Some(&last) = list.last() {
             if last == row_idx {
@@ -788,20 +813,46 @@ fn add_posting(postings: &mut FxHashMap<Arc<str>, Vec<usize>>, tok: &str, row_id
             list.insert(pos, row_idx);
         }
     } else {
-        let mut list = Vec::with_capacity(8);
-        list.push(row_idx);
-        postings.insert(Arc::from(tok), list);
+        postings.insert(Arc::from(tok), smallvec![row_idx]);
     }
 }
 
-thread_local! {
-    static LOWER_SCRATCH: std::cell::RefCell<String> = std::cell::RefCell::new(String::with_capacity(512));
-    static SCRATCH: std::cell::RefCell<String> = std::cell::RefCell::new(String::with_capacity(512));
-    static TOKENS: std::cell::RefCell<Vec<std::ops::Range<usize>>> = std::cell::RefCell::new(Vec::with_capacity(64));
+struct FtsTokenBuf {
+    lower: String,
+    scratch: String,
+    tokens: Vec<std::ops::Range<usize>>,
+}
 
-    static LOWER_SCRATCH_B: std::cell::RefCell<String> = std::cell::RefCell::new(String::with_capacity(512));
-    static SCRATCH_B: std::cell::RefCell<String> = std::cell::RefCell::new(String::with_capacity(512));
-    static TOKENS_B: std::cell::RefCell<Vec<std::ops::Range<usize>>> = std::cell::RefCell::new(Vec::with_capacity(64));
+impl FtsTokenBuf {
+    fn new() -> Self {
+        Self {
+            lower: String::with_capacity(512),
+            scratch: String::with_capacity(512),
+            tokens: Vec::with_capacity(64),
+        }
+    }
+
+    fn collect(&mut self, row: &Row, fields: &[String]) {
+        collect_tokens_into_buffers(
+            row,
+            fields,
+            &mut self.scratch,
+            &mut self.lower,
+            &mut self.tokens,
+        );
+    }
+}
+
+struct FtsScratchPair {
+    a: FtsTokenBuf,
+    b: FtsTokenBuf,
+}
+
+thread_local! {
+    static FTS_SCRATCH: std::cell::RefCell<FtsScratchPair> = std::cell::RefCell::new(FtsScratchPair {
+        a: FtsTokenBuf::new(),
+        b: FtsTokenBuf::new(),
+    });
 }
 
 fn collect_tokens_into_buffers(
@@ -832,30 +883,17 @@ fn collect_tokens_into_buffers(
 }
 
 fn collect_row_tokens(row: &Row, fields: &[String]) {
-    LOWER_SCRATCH.with(|lsc| {
-        SCRATCH.with(|sc| {
-            TOKENS.with(|tk| {
-                collect_tokens_into_buffers(
-                    row,
-                    fields,
-                    &mut sc.borrow_mut(),
-                    &mut lsc.borrow_mut(),
-                    &mut tk.borrow_mut(),
-                );
-            });
-        });
+    FTS_SCRATCH.with(|pair_cell| {
+        pair_cell.borrow_mut().a.collect(row, fields);
     });
 }
 
 fn with_collected_tokens(mut f: impl FnMut(&str)) {
-    SCRATCH.with(|sc| {
-        TOKENS.with(|tk| {
-            let scratch = sc.borrow();
-            let tokens = tk.borrow();
-            for r in tokens.iter() {
-                f(&scratch[r.clone()]);
-            }
-        });
+    FTS_SCRATCH.with(|pair_cell| {
+        let pair = pair_cell.borrow();
+        for r in &pair.a.tokens {
+            f(&pair.a.scratch[r.clone()]);
+        }
     });
 }
 

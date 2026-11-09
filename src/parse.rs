@@ -169,7 +169,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn peek_after_skip(&self) -> Option<char> {
+    fn skip_offset(&self) -> usize {
         let mut i = self.pos;
         let bytes = self.src.as_bytes();
         loop {
@@ -185,19 +185,19 @@ impl<'a> Parser<'a> {
             }
             break;
         }
-        self.src[i..].chars().next()
+        i
+    }
+
+    fn peek_after_skip(&self) -> Option<char> {
+        self.src[self.skip_offset()..].chars().next()
     }
 
     fn starts_ident(&self) -> bool {
         matches!(self.peek(), Some(c) if is_ident_start(c))
     }
 
-    fn peek_ident(&self) -> Option<String> {
-        let mut i = self.pos;
-        while i < self.src.len() && self.src.as_bytes()[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        let rest = &self.src[i..];
+    fn peek_ident(&self) -> Option<&'a str> {
+        let rest = &self.src[self.skip_offset()..];
         let mut chars = rest.chars();
         let first = chars.next()?;
         if !is_ident_start(first) {
@@ -210,10 +210,10 @@ impl<'a> Parser<'a> {
             }
             n += c.len_utf8();
         }
-        Some(rest[..n].to_string())
+        Some(&rest[..n])
     }
 
-    fn eat_ident(&mut self) -> Option<String> {
+    fn eat_ident_str(&mut self) -> Option<&'a str> {
         self.skip();
         if !self.starts_ident() {
             return None;
@@ -223,24 +223,59 @@ impl<'a> Parser<'a> {
         while matches!(self.peek(), Some(c) if is_ident_continue(c)) {
             self.bump();
         }
-        Some(self.src[start..self.pos].to_string())
+        Some(&self.src[start..self.pos])
+    }
+
+    fn expect_ident_str(&mut self) -> Result<&'a str, Error> {
+        self.eat_ident_str()
+            .ok_or_else(|| self.err("expected identifier"))
     }
 
     fn expect_ident(&mut self) -> Result<String, Error> {
-        self.eat_ident()
-            .ok_or_else(|| self.err("expected identifier"))
+        self.expect_ident_str().map(str::to_owned)
     }
 
     fn eat_kw(&mut self, kw: &str) -> bool {
         let save = self.pos;
-        self.skip();
-        if let Some(id) = self.eat_ident()
-            && id == kw
-        {
+        if self.eat_ident_str() == Some(kw) {
             return true;
         }
         self.pos = save;
         false
+    }
+
+    fn parse_delimited<T>(
+        &mut self,
+        open: char,
+        close: char,
+        sep_err: &'static str,
+        empty_err: Option<&'static str>,
+        mut parse_item: impl FnMut(&mut Self) -> Result<T, Error>,
+    ) -> Result<Vec<T>, Error> {
+        self.expect_char(open)?;
+        let mut items = Vec::new();
+        loop {
+            self.skip();
+            if self.peek() == Some(close) {
+                break;
+            }
+            items.push(parse_item(self)?);
+            let comma = self.eat_char(',');
+            self.skip();
+            if self.peek() == Some(close) {
+                break;
+            }
+            if !comma {
+                return Err(self.err(sep_err));
+            }
+        }
+        self.expect_char(close)?;
+        if items.is_empty()
+            && let Some(err) = empty_err
+        {
+            return Err(self.err(err));
+        }
+        Ok(items)
     }
 
     fn expect_kw(&mut self, kw: &str) -> Result<(), Error> {
@@ -454,7 +489,7 @@ impl<'a> Parser<'a> {
 
     fn looks_like_mutation(&self) -> bool {
         matches!(
-            self.peek_ident().as_deref(),
+            self.peek_ident(),
             Some(
                 "update"
                     | "insert"
@@ -564,23 +599,11 @@ impl<'a> Parser<'a> {
             });
         }
         if self.eat_kw("hop") {
-            let rel = self.expect_ident()?;
-            let depth = if self.eat_kw("depth") {
-                self.expect_char('=')?;
-                Some(self.expect_int()?)
-            } else {
-                None
-            };
+            let (rel, depth) = self.parse_rel_depth()?;
             return Ok(Step::Hop { rel, depth });
         }
         if self.eat_kw("graph") {
-            let rel = self.expect_ident()?;
-            let depth = if self.eat_kw("depth") {
-                self.expect_char('=')?;
-                Some(self.expect_int()?)
-            } else {
-                None
-            };
+            let (rel, depth) = self.parse_rel_depth()?;
             return Ok(Step::Graph { rel, depth });
         }
         if self.eat_kw("match") {
@@ -606,39 +629,19 @@ impl<'a> Parser<'a> {
             return Ok(Step::Count { by });
         }
         if self.eat_kw("sum") {
-            let field = self.parse_field()?;
-            let by = if self.eat_kw("by") {
-                Some(self.parse_field()?)
-            } else {
-                None
-            };
+            let (field, by) = self.parse_agg_field_by()?;
             return Ok(Step::Sum { field, by });
         }
         if self.eat_kw("min") {
-            let field = self.parse_field()?;
-            let by = if self.eat_kw("by") {
-                Some(self.parse_field()?)
-            } else {
-                None
-            };
+            let (field, by) = self.parse_agg_field_by()?;
             return Ok(Step::Min { field, by });
         }
         if self.eat_kw("max") {
-            let field = self.parse_field()?;
-            let by = if self.eat_kw("by") {
-                Some(self.parse_field()?)
-            } else {
-                None
-            };
+            let (field, by) = self.parse_agg_field_by()?;
             return Ok(Step::Max { field, by });
         }
         if self.eat_kw("avg") {
-            let field = self.parse_field()?;
-            let by = if self.eat_kw("by") {
-                Some(self.parse_field()?)
-            } else {
-                None
-            };
+            let (field, by) = self.parse_agg_field_by()?;
             return Ok(Step::Avg { field, by });
         }
         if self.eat_kw("sort") {
@@ -697,125 +700,126 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn parse_rel_depth(&mut self) -> Result<(String, Option<i64>), Error> {
+        let rel = self.expect_ident()?;
+        let depth = if self.eat_kw("depth") {
+            self.expect_char('=')?;
+            Some(self.expect_int()?)
+        } else {
+            None
+        };
+        Ok((rel, depth))
+    }
+
+    fn parse_agg_field_by(&mut self) -> Result<(Field, Option<Field>), Error> {
+        let field = self.parse_field()?;
+        let by = if self.eat_kw("by") {
+            Some(self.parse_field()?)
+        } else {
+            None
+        };
+        Ok((field, by))
+    }
+
+    fn parse_window_field_arg(&mut self) -> Result<Field, Error> {
+        if self.eat_char('(') {
+            let field = self.parse_field()?;
+            self.expect_char(')')?;
+            Ok(field)
+        } else {
+            self.parse_field()
+        }
+    }
+
+    fn parse_window_offset_field(&mut self) -> Result<(usize, Field), Error> {
+        let offset = if self.eat_char('(') {
+            let off = self.expect_int()? as usize;
+            self.expect_char(')')?;
+            off
+        } else if self.peek().is_some_and(|c| c.is_ascii_digit()) {
+            self.expect_int()? as usize
+        } else {
+            1
+        };
+        let f = self.parse_field()?;
+        Ok((offset, f))
+    }
+
     fn parse_window_step(&mut self) -> Result<Step, Error> {
-        let func_name = self.expect_ident()?;
-        let (func, field) = match func_name.to_lowercase().as_str() {
-            "row_number" => (crate::window::WindowFunction::RowNumber, None),
-            "rank" => (crate::window::WindowFunction::Rank, None),
-            "dense_rank" => (crate::window::WindowFunction::DenseRank, None),
-            "lead" => {
-                let offset = if self.eat_char('(') {
-                    let off = self.expect_int()? as usize;
-                    self.expect_char(')')?;
-                    off
-                } else if self.peek().is_some_and(|c| c.is_ascii_digit()) {
-                    self.expect_int()? as usize
-                } else {
-                    1
-                };
-                let f = self.parse_field()?;
-                (crate::window::WindowFunction::Lead { offset }, Some(f))
-            }
-            "lag" => {
-                let offset = if self.eat_char('(') {
-                    let off = self.expect_int()? as usize;
-                    self.expect_char(')')?;
-                    off
-                } else if self.peek().is_some_and(|c| c.is_ascii_digit()) {
-                    self.expect_int()? as usize
-                } else {
-                    1
-                };
-                let f = self.parse_field()?;
-                (crate::window::WindowFunction::Lag { offset }, Some(f))
-            }
-            "first_value" | "first" => {
-                let f = if self.eat_char('(') {
-                    let field = self.parse_field()?;
-                    self.expect_char(')')?;
-                    field
-                } else {
-                    self.parse_field()?
-                };
-                (crate::window::WindowFunction::FirstValue, Some(f))
-            }
-            "last_value" | "last" => {
-                let f = if self.eat_char('(') {
-                    let field = self.parse_field()?;
-                    self.expect_char(')')?;
-                    field
-                } else {
-                    self.parse_field()?
-                };
-                (crate::window::WindowFunction::LastValue, Some(f))
-            }
-            "sum" => {
-                let f = if self.eat_char('(') {
-                    let field = self.parse_field()?;
-                    self.expect_char(')')?;
-                    field
-                } else {
-                    self.parse_field()?
-                };
-                (crate::window::WindowFunction::Sum, Some(f))
-            }
-            "avg" => {
-                let f = if self.eat_char('(') {
-                    let field = self.parse_field()?;
-                    self.expect_char(')')?;
-                    field
-                } else {
-                    self.parse_field()?
-                };
-                (crate::window::WindowFunction::Avg, Some(f))
-            }
-            "min" => {
-                let f = if self.eat_char('(') {
-                    let field = self.parse_field()?;
-                    self.expect_char(')')?;
-                    field
-                } else {
-                    self.parse_field()?
-                };
-                (crate::window::WindowFunction::Min, Some(f))
-            }
-            "max" => {
-                let f = if self.eat_char('(') {
-                    let field = self.parse_field()?;
-                    self.expect_char(')')?;
-                    field
-                } else {
-                    self.parse_field()?
-                };
-                (crate::window::WindowFunction::Max, Some(f))
-            }
-            "count" => {
-                let f = if self.eat_char('(') {
-                    let inner = if self.eat_char('*') {
-                        None
-                    } else {
-                        Some(self.parse_field()?)
-                    };
-                    self.expect_char(')')?;
-                    inner
-                } else if let Some(ident) = self.peek_ident() {
-                    if ["by", "partition", "sort", "order", "rows", "as"]
-                        .contains(&ident.to_lowercase().as_str())
-                    {
-                        None
-                    } else {
-                        Some(self.parse_field()?)
-                    }
-                } else {
+        let func_name = self.expect_ident_str()?;
+        let (func, field) = if func_name.eq_ignore_ascii_case("row_number") {
+            (crate::window::WindowFunction::RowNumber, None)
+        } else if func_name.eq_ignore_ascii_case("rank") {
+            (crate::window::WindowFunction::Rank, None)
+        } else if func_name.eq_ignore_ascii_case("dense_rank") {
+            (crate::window::WindowFunction::DenseRank, None)
+        } else if func_name.eq_ignore_ascii_case("lead") {
+            let (offset, f) = self.parse_window_offset_field()?;
+            (crate::window::WindowFunction::Lead { offset }, Some(f))
+        } else if func_name.eq_ignore_ascii_case("lag") {
+            let (offset, f) = self.parse_window_offset_field()?;
+            (crate::window::WindowFunction::Lag { offset }, Some(f))
+        } else if func_name.eq_ignore_ascii_case("first_value")
+            || func_name.eq_ignore_ascii_case("first")
+        {
+            (
+                crate::window::WindowFunction::FirstValue,
+                Some(self.parse_window_field_arg()?),
+            )
+        } else if func_name.eq_ignore_ascii_case("last_value")
+            || func_name.eq_ignore_ascii_case("last")
+        {
+            (
+                crate::window::WindowFunction::LastValue,
+                Some(self.parse_window_field_arg()?),
+            )
+        } else if func_name.eq_ignore_ascii_case("sum") {
+            (
+                crate::window::WindowFunction::Sum,
+                Some(self.parse_window_field_arg()?),
+            )
+        } else if func_name.eq_ignore_ascii_case("avg") {
+            (
+                crate::window::WindowFunction::Avg,
+                Some(self.parse_window_field_arg()?),
+            )
+        } else if func_name.eq_ignore_ascii_case("min") {
+            (
+                crate::window::WindowFunction::Min,
+                Some(self.parse_window_field_arg()?),
+            )
+        } else if func_name.eq_ignore_ascii_case("max") {
+            (
+                crate::window::WindowFunction::Max,
+                Some(self.parse_window_field_arg()?),
+            )
+        } else if func_name.eq_ignore_ascii_case("count") {
+            let f = if self.eat_char('(') {
+                let inner = if self.eat_char('*') {
                     None
+                } else {
+                    Some(self.parse_field()?)
                 };
-                (crate::window::WindowFunction::Count, f)
-            }
-            other => {
-                return Err(self.err(format!(
-                    "unknown window function `{other}`; supported: row_number, rank, dense_rank, lead, lag, first_value, last_value, sum, avg, min, max, count"
-                )));
-            }
+                self.expect_char(')')?;
+                inner
+            } else if let Some(ident) = self.peek_ident() {
+                if ["by", "partition", "sort", "order", "rows", "as"]
+                    .iter()
+                    .any(|kw| ident.eq_ignore_ascii_case(kw))
+                {
+                    None
+                } else {
+                    Some(self.parse_field()?)
+                }
+            } else {
+                None
+            };
+            (crate::window::WindowFunction::Count, f)
+        } else {
+            return Err(self.err(format!(
+                "unknown window function `{}`; supported: row_number, rank, dense_rank, lead, lag, first_value, last_value, sum, avg, min, max, count",
+                func_name.to_ascii_lowercase()
+            )));
         };
 
         let by = if self.eat_kw("by") || self.eat_kw("partition") {
@@ -1001,10 +1005,7 @@ impl<'a> Parser<'a> {
     fn starts_pred(&self) -> bool {
         match self.peek_after_skip() {
             Some('(') | Some('!') => true,
-            Some(_) => matches!(
-                self.peek_ident().as_deref(),
-                Some(id) if !is_step_keyword(id)
-            ),
+            Some(_) => matches!(self.peek_ident(), Some(id) if !is_step_keyword(id)),
             None => false,
         }
     }
@@ -1101,27 +1102,13 @@ impl<'a> Parser<'a> {
             return Ok(Pred::IsNull { field, negated });
         }
         if self.eat_kw("in") {
-            self.expect_char('[')?;
-            let mut values = Vec::new();
-            loop {
-                self.skip();
-                if self.peek() == Some(']') {
-                    break;
-                }
-                values.push(self.parse_value()?);
-                let comma = self.eat_char(',');
-                self.skip();
-                if self.peek() == Some(']') {
-                    break;
-                }
-                if !comma {
-                    return Err(self.err("expected `,` or `]` in `in` list"));
-                }
-            }
-            self.expect_char(']')?;
-            if values.is_empty() {
-                return Err(self.err("empty `in` list"));
-            }
+            let values = self.parse_delimited(
+                '[',
+                ']',
+                "expected `,` or `]` in `in` list",
+                Some("empty `in` list"),
+                Self::parse_value,
+            )?;
             return Ok(Pred::In { field, values });
         }
         if self.eat_kw("has_ci") {
@@ -1388,58 +1375,31 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_record(&mut self) -> Result<Record, Error> {
-        self.expect_char('{')?;
-        let mut fields = Vec::new();
-        loop {
-            self.skip();
-            if self.peek() == Some('}') {
-                break;
-            }
-            let name = self.expect_ident()?;
-            self.expect_char(':')?;
-            let value = self.parse_value()?;
-            fields.push((name, value));
-            let comma = self.eat_char(',');
-            self.skip();
-            if self.peek() == Some('}') {
-                break;
-            }
-            if !comma {
-                return Err(self.err("expected `,` or `}` in record"));
-            }
-        }
-        self.expect_char('}')?;
-        if fields.is_empty() {
-            return Err(self.err("record is empty"));
-        }
+        let fields = self.parse_delimited(
+            '{',
+            '}',
+            "expected `,` or `}` in record",
+            Some("record is empty"),
+            |p| {
+                let name = p.expect_ident()?;
+                p.expect_char(':')?;
+                let value = p.parse_value()?;
+                Ok((name, value))
+            },
+        )?;
         Ok(Record { fields })
     }
 
     fn parse_record_list(&mut self) -> Result<Vec<Record>, Error> {
         self.skip();
         if self.peek() == Some('[') {
-            self.expect_char('[')?;
-            let mut recs = Vec::new();
-            loop {
-                self.skip();
-                if self.peek() == Some(']') {
-                    break;
-                }
-                recs.push(self.parse_record()?);
-                let comma = self.eat_char(',');
-                self.skip();
-                if self.peek() == Some(']') {
-                    break;
-                }
-                if !comma {
-                    return Err(self.err("expected `,` or `]` in list"));
-                }
-            }
-            self.expect_char(']')?;
-            if recs.is_empty() {
-                return Err(self.err("empty list"));
-            }
-            return Ok(recs);
+            return self.parse_delimited(
+                '[',
+                ']',
+                "expected `,` or `]` in list",
+                Some("empty list"),
+                Self::parse_record,
+            );
         }
         Ok(vec![self.parse_record()?])
     }
@@ -1465,28 +1425,13 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_edge_list(&mut self) -> Result<Vec<EdgeLit>, Error> {
-        self.expect_char('[')?;
-        let mut edges = Vec::new();
-        loop {
-            self.skip();
-            if self.peek() == Some(']') {
-                break;
-            }
-            edges.push(self.parse_edge_lit()?);
-            let comma = self.eat_char(',');
-            self.skip();
-            if self.peek() == Some(']') {
-                break;
-            }
-            if !comma {
-                return Err(self.err("expected `,` or `]` in list"));
-            }
-        }
-        self.expect_char(']')?;
-        if edges.is_empty() {
-            return Err(self.err("empty list"));
-        }
-        Ok(edges)
+        self.parse_delimited(
+            '[',
+            ']',
+            "expected `,` or `]` in list",
+            Some("empty list"),
+            Self::parse_edge_lit,
+        )
     }
 
     fn parse_append(&mut self) -> Result<Stmt, Error> {
@@ -1570,27 +1515,13 @@ impl<'a> Parser<'a> {
     fn parse_index(&mut self) -> Result<Decl, Error> {
         let collection = self.expect_ident()?;
         let unique = self.eat_kw("unique");
-        self.expect_char('[')?;
-        let mut fields = Vec::new();
-        loop {
-            self.skip();
-            if self.peek() == Some(']') {
-                break;
-            }
-            fields.push(self.expect_ident()?);
-            let comma = self.eat_char(',');
-            self.skip();
-            if self.peek() == Some(']') {
-                break;
-            }
-            if !comma {
-                return Err(self.err("expected `,` or `]` in index"));
-            }
-        }
-        self.expect_char(']')?;
-        if fields.is_empty() {
-            return Err(self.err("empty index"));
-        }
+        let fields = self.parse_delimited(
+            '[',
+            ']',
+            "expected `,` or `]` in index",
+            Some("empty index"),
+            Self::expect_ident,
+        )?;
 
         // Check for optional WHERE clause (partial index)
         let pred = if self.eat_kw("where") {

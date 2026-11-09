@@ -224,6 +224,69 @@ impl FromRow for Row {
     }
 }
 
+impl<A: FromCell> FromRow for (A,) {
+    fn from_row(row: &Row) -> Result<Self, Error> {
+        let mut it = row.values();
+        let a = it
+            .next()
+            .ok_or_else(|| Error::runtime("expected at least 1 column in row"))?;
+        Ok((A::from_cell(a)?,))
+    }
+}
+
+impl<A: FromCell, B: FromCell> FromRow for (A, B) {
+    fn from_row(row: &Row) -> Result<Self, Error> {
+        let mut it = row.values();
+        let a = it
+            .next()
+            .ok_or_else(|| Error::runtime("expected at least 2 columns in row"))?;
+        let b = it
+            .next()
+            .ok_or_else(|| Error::runtime("expected at least 2 columns in row"))?;
+        Ok((A::from_cell(a)?, B::from_cell(b)?))
+    }
+}
+
+impl<A: FromCell, B: FromCell, C: FromCell> FromRow for (A, B, C) {
+    fn from_row(row: &Row) -> Result<Self, Error> {
+        let mut it = row.values();
+        let a = it
+            .next()
+            .ok_or_else(|| Error::runtime("expected at least 3 columns in row"))?;
+        let b = it
+            .next()
+            .ok_or_else(|| Error::runtime("expected at least 3 columns in row"))?;
+        let c = it
+            .next()
+            .ok_or_else(|| Error::runtime("expected at least 3 columns in row"))?;
+        Ok((A::from_cell(a)?, B::from_cell(b)?, C::from_cell(c)?))
+    }
+}
+
+impl<A: FromCell, B: FromCell, C: FromCell, D: FromCell> FromRow for (A, B, C, D) {
+    fn from_row(row: &Row) -> Result<Self, Error> {
+        let mut it = row.values();
+        let a = it
+            .next()
+            .ok_or_else(|| Error::runtime("expected at least 4 columns in row"))?;
+        let b = it
+            .next()
+            .ok_or_else(|| Error::runtime("expected at least 4 columns in row"))?;
+        let c = it
+            .next()
+            .ok_or_else(|| Error::runtime("expected at least 4 columns in row"))?;
+        let d = it
+            .next()
+            .ok_or_else(|| Error::runtime("expected at least 4 columns in row"))?;
+        Ok((
+            A::from_cell(a)?,
+            B::from_cell(b)?,
+            C::from_cell(c)?,
+            D::from_cell(d)?,
+        ))
+    }
+}
+
 /// Typed collection row: column list + optional default collection name.
 pub trait LinRow: FromRow {
     /// Default collection for `db.from_typed::<Self>()`, if any.

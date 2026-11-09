@@ -83,12 +83,12 @@ impl RecordBatch {
         let end = end.min(self.n());
         let n = end - start;
 
-        if n >= 4096 {
+        if n >= 65536 {
             let threads = std::thread::available_parallelism()
                 .map(|p| p.get())
                 .unwrap_or(1)
                 .min(8)
-                .min((n + 1023) / 1024);
+                .min((n + 8191) / 8192);
             if threads > 1 {
                 let chunk_size = (n + threads - 1) / threads;
                 let chunks: Vec<Vec<Row>> = std::thread::scope(|scope| {

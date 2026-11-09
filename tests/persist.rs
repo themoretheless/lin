@@ -1331,7 +1331,7 @@ fn partial_index_predicate_survives_wal_and_checkpoint_reopen() {
             "partial index predicate should survive WAL replay"
         );
         // Querying raw layer by wing=="rag" must NOT mistakenly use the wiki-only partial index
-        let rows = db.run(r#"docs | wing == "rag" | take all"#).unwrap().rows;
+        let rows = db.run(r#"docs | wing == "rag" | take all"#).unwrap().into_rows();
         assert_eq!(rows.len(), 2);
         db.checkpoint().unwrap();
     }
@@ -1349,16 +1349,16 @@ fn partial_index_predicate_survives_wal_and_checkpoint_reopen() {
             "partial index predicate should survive checkpoint"
         );
         // Also verify point lookups and index lookups work against cold (mmap) collections
-        let by_id = db.run(r#"docs | id == "d1" | { title }"#).unwrap().rows;
+        let by_id = db.run(r#"docs | id == "d1" | { title }"#).unwrap().into_rows();
         assert_eq!(by_id.len(), 1);
         assert_eq!(by_id[0]["title"].text(), Some("One"));
-        let by_uri = db.run(r#"docs | uri == "p://2" | { title }"#).unwrap().rows;
+        let by_uri = db.run(r#"docs | uri == "p://2" | { title }"#).unwrap().into_rows();
         assert_eq!(by_uri.len(), 1);
         assert_eq!(by_uri[0]["title"].text(), Some("Two"));
         let wiki_rag = db
             .run(r#"docs | layer == "wiki" and wing == "rag" | take all"#)
             .unwrap()
-            .rows;
+            .into_rows();
         assert_eq!(wiki_rag.len(), 1);
         assert_eq!(wiki_rag[0]["id"].text(), Some("d1"));
     }

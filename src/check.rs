@@ -655,18 +655,6 @@ fn check_record(
         check_value_as(value, info.ty, cat)?;
     }
     if is_update {
-        let mut literal_row = BTreeMap::new();
-        for (k, v) in &record.fields {
-            if let Value::String(s) = v {
-                literal_row.insert(k.clone(), crate::store::Cell::Text(s.clone()));
-            } else if let Value::Int(n) = v {
-                literal_row.insert(k.clone(), crate::store::Cell::Int(*n));
-            } else if let Value::Float(n) = v {
-                literal_row.insert(k.clone(), crate::store::Cell::Float(*n));
-            } else if let Value::Bool(b) = v {
-                literal_row.insert(k.clone(), crate::store::Cell::Bool(*b));
-            }
-        }
         for (name, _) in &record.fields {
             for g in &cat.guards {
                 if g.collection == collection && &g.field == name {
@@ -675,8 +663,8 @@ fn check_record(
                     let all_present = !pred_fields.is_empty()
                         && pred_fields
                             .iter()
-                            .all(|f| literal_row.contains_key(&f.as_str()));
-                    if !all_present || crate::exec::eval_pred(&g.pred, &literal_row, 0) {
+                            .all(|f| record_literal_val(record, f).is_some());
+                    if !all_present || eval_record_pred(&g.pred, record) {
                         return Err(Error::new(format!("immutable field: {collection}.{name}")));
                     }
                 }
@@ -687,6 +675,123 @@ fn check_record(
         return Err(Error::new(format!("immutable field: {collection}.body")));
     }
     Ok(())
+}
+
+fn record_literal_val<'a>(record: &'a Record, field: &Field) -> Option<&'a Value> {
+    let key = field.as_cow_str();
+    record
+        .fields
+        .iter()
+        .rfind(|(k, _)| k.as_str() == key.as_ref())
+        .map(|(_, v)| v)
+        .filter(|v| {
+            matches!(
+                v,
+                Value::String(_) | Value::Int(_) | Value::Float(_) | Value::Bool(_)
+            )
+        })
+}
+
+fn record_val_eq(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::String(a), Value::String(b)) => a == b,
+        (Value::String(a), Value::Name(b)) => a.as_ref() == b.as_str(),
+        (Value::Bool(a), Value::Bool(b)) => a == b,
+        (Value::Int(a), Value::Int(b)) => a == b,
+        (Value::Float(a), Value::Float(b)) => !a.is_nan() && !b.is_nan() && a == b,
+        (Value::Int(a), Value::Float(b)) | (Value::Float(b), Value::Int(a)) => {
+            b.is_finite() && b.fract() == 0.0 && (*a as f64) == *b
+        }
+        (Value::Int(a), Value::Duration(d)) => *a == d.as_millis(),
+        (Value::Float(a), Value::Duration(d)) => {
+            a.is_finite() && a.fract() == 0.0 && (d.as_millis() as f64) == *a
+        }
+        _ => false,
+    }
+}
+
+fn record_val_cmp(left: &Value, right: &Value) -> Option<std::cmp::Ordering> {
+    match (left, right) {
+        (Value::Int(a), Value::Int(b)) => Some(a.cmp(b)),
+        (Value::Int(a), Value::Duration(d)) => Some(a.cmp(&d.as_millis())),
+        (Value::Float(a), Value::Float(b)) => a.partial_cmp(b),
+        (Value::Int(a), Value::Float(b)) => (*a as f64).partial_cmp(b),
+        (Value::Float(a), Value::Int(b)) => a.partial_cmp(&(*b as f64)),
+        (Value::Float(a), Value::Duration(d)) => a.partial_cmp(&(d.as_millis() as f64)),
+        (Value::String(a), Value::String(b)) => Some(a.as_ref().cmp(b.as_ref())),
+        (Value::String(a), Value::Name(b)) => Some(a.as_ref().cmp(b.as_str())),
+        _ => None,
+    }
+}
+
+fn eval_record_pred(pred: &Pred, record: &Record) -> bool {
+    match pred {
+        Pred::And(a, b) => eval_record_pred(a, record) && eval_record_pred(b, record),
+        Pred::Or(a, b) => eval_record_pred(a, record) || eval_record_pred(b, record),
+        Pred::Not(inner) => !eval_record_pred(inner, record),
+        Pred::IsNull { field, negated } => {
+            let is_null = record_literal_val(record, field).is_none();
+            if *negated { !is_null } else { is_null }
+        }
+        Pred::In { field, values } => record_literal_val(record, field)
+            .is_some_and(|l| values.iter().any(|v| record_val_eq(l, v))),
+        Pred::Cmp { field, op, value } => {
+            let Some(left) = record_literal_val(record, field) else {
+                return matches!(op, CmpOp::Ne);
+            };
+            match op {
+                CmpOp::Eq => record_val_eq(left, value),
+                CmpOp::Ne => !record_val_eq(left, value),
+                CmpOp::Gt | CmpOp::Lt | CmpOp::Ge | CmpOp::Le => {
+                    let Some(ord) = record_val_cmp(left, value) else {
+                        return false;
+                    };
+                    match op {
+                        CmpOp::Gt => ord == std::cmp::Ordering::Greater,
+                        CmpOp::Lt => ord == std::cmp::Ordering::Less,
+                        CmpOp::Ge => ord != std::cmp::Ordering::Less,
+                        CmpOp::Le => ord != std::cmp::Ordering::Greater,
+                        _ => false,
+                    }
+                }
+            }
+        }
+        Pred::Contains { field, needle } => matches!(
+            record_literal_val(record, field),
+            Some(Value::String(s)) if s.contains(needle.as_str())
+        ),
+        Pred::Has { field, ci, needle } => {
+            let Some(Value::String(s)) = record_literal_val(record, field) else {
+                return false;
+            };
+            if needle.is_empty() {
+                return false;
+            }
+            s.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .any(|w| {
+                    if *ci {
+                        w.eq_ignore_ascii_case(needle) || w.to_lowercase() == needle.to_lowercase()
+                    } else {
+                        w == needle
+                    }
+                })
+        }
+        Pred::Regex {
+            field,
+            pattern,
+            flags,
+        } => {
+            let Some(Value::String(s)) = record_literal_val(record, field) else {
+                return false;
+            };
+            let mut b = regex::RegexBuilder::new(pattern);
+            b.size_limit(10 * 1024 * 1024);
+            if flags.contains('i') {
+                b.case_insensitive(true);
+            }
+            b.build().is_ok_and(|re| re.is_match(s))
+        }
+    }
 }
 
 fn check_value_as(value: &Value, expected: Type, cat: &Catalog) -> Result<(), Error> {
@@ -836,9 +941,10 @@ pub fn validate_regex(pattern: &str, flags: &str) -> Result<(), Error> {
 }
 
 fn require_field(scope: &Scope, field: &Field) -> Result<Type, Error> {
+    let key = field.as_cow_str();
     scope
-        .ty_of(&field.as_str())
-        .ok_or_else(|| Error::new(format!("unknown field: {}", field.as_str())))
+        .ty_of(&key)
+        .ok_or_else(|| Error::new(format!("unknown field: {key}")))
 }
 
 #[derive(Debug, Clone, Default)]

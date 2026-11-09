@@ -403,12 +403,12 @@ fn search_lex_top_k_matches_full_ranking_prefix_and_skip() {
     let all = db
         .run(r#"docs | search lex "wal" | take all"#)
         .unwrap()
-        .rows;
-    let top = db.run(r#"docs | search lex "wal" | take 17"#).unwrap().rows;
+        .into_rows();
+    let top = db.run(r#"docs | search lex "wal" | take 17"#).unwrap().into_rows();
     let skipped = db
         .run(r#"docs | search lex "wal" | skip 11 | take 13"#)
         .unwrap()
-        .rows;
+        .into_rows();
 
     let ids = |rows: &[lin::Row]| {
         rows.iter()
@@ -995,7 +995,7 @@ fn bounded_dnf_falls_back_without_changing_results() {
     let expected = db
         .run(r#"docs | (wing == "rag" or wing == "sys") | { id } | sort id | take all"#)
         .unwrap()
-        .rows;
+        .into_rows();
     let prepared = db.prepare(&query).unwrap();
     assert!(!format!("{:?}", prepared.plan).contains("IndexSeek"));
     assert_eq!(prepared.run(&mut db).unwrap().rows, expected);
@@ -1527,18 +1527,18 @@ fn filters_after_aggregation_and_skip_apply_to_stage_output() {
         insert stage_rows [ { group: "a", n: 1 }, { group: "a", n: 2 }, { group: "b", n: 3 } ]"#,
     )
     .unwrap();
-    let first = db.run("stage_rows | take 1").unwrap().rows;
+    let first = db.run("stage_rows | take 1").unwrap().into_rows();
     let id = text(&first[0], "id");
     let skipped = db
         .run(&format!("stage_rows | skip 3 | id == \"{id}\" | take all"))
         .unwrap()
-        .rows;
+        .into_rows();
     assert!(
         skipped.is_empty(),
         "late point filter must not restore skipped rows"
     );
     let q = "stage_rows | count by group | hits > 1 | { group } | take all";
-    let rows = db.run(q).unwrap().rows;
+    let rows = db.run(q).unwrap().into_rows();
     assert_eq!(rows.len(), 1);
     assert_eq!(text(&rows[0], "group"), "a");
     assert_eq!(db.run_batch(q).unwrap().to_rows(), rows);
@@ -1546,12 +1546,12 @@ fn filters_after_aggregation_and_skip_apply_to_stage_output() {
     let rows = db
         .run("stage_rows | skip 1 | n < 2 | take all")
         .unwrap()
-        .rows;
+        .into_rows();
     assert!(rows.is_empty(), "skip must happen before filtering");
     let rows = db
         .run("stage_rows | sort n desc | take 1 | n < 3 | take all")
         .unwrap()
-        .rows;
+        .into_rows();
     assert!(rows.is_empty(), "take must happen before filtering");
 }
 
@@ -1623,7 +1623,7 @@ fn filter_project_shortcuts_preserve_multiple_filters_and_windows() {
             vec![2, 3],
         ),
     ] {
-        let rows = db.run(q).unwrap().rows;
+        let rows = db.run(q).unwrap().into_rows();
         let values: Vec<_> = rows.iter().map(|r| r["n"].as_int().unwrap()).collect();
         assert_eq!(values, expected, "{q}");
         let rows = db.run_batch(q).unwrap().to_rows();
@@ -1655,7 +1655,7 @@ fn absolute_timestamps_compare_identically_in_scans_and_indexes() {
     let read = |db: &mut Db, pred: &str| {
         db.run(&format!("stamps | {pred} | {{ id }} | take all"))
             .unwrap()
-            .rows
+            .into_rows()
             .into_iter()
             .map(|row| row["id"].text().unwrap().to_string())
             .collect::<std::collections::BTreeSet<_>>()
@@ -1707,7 +1707,7 @@ fn hybrid_bounded_results_match_full_ranking() {
         let all = db
             .run(&format!(r#"docs | search "{query}" | {{id}} | take all"#))
             .unwrap()
-            .rows;
+            .into_rows();
         for skip in [0, 1, 17, 210, 211, 250] {
             for take in [0, 1, 7, 50, 210, 211, 300] {
                 let got = db
@@ -1715,7 +1715,7 @@ fn hybrid_bounded_results_match_full_ranking() {
                         r#"docs | search "{query}" | {{id}} | skip {skip} | take {take}"#
                     ))
                     .unwrap()
-                    .rows;
+                    .into_rows();
                 let want = all
                     .iter()
                     .skip(skip)
@@ -1728,7 +1728,7 @@ fn hybrid_bounded_results_match_full_ranking() {
         let default = db
             .run(&format!(r#"docs | search "{query}" | {{id}}"#))
             .unwrap()
-            .rows;
+            .into_rows();
         assert_eq!(default, all.iter().take(50).cloned().collect::<Vec<_>>());
     }
 }
@@ -1794,7 +1794,7 @@ fn new_aggregations_sum_min_max_avg_and_group_type_preservation() {
     let grouped_avg = db
         .run("items | avg val by grp | grp > 15 | take all")
         .unwrap()
-        .rows;
+        .into_rows();
     assert_eq!(grouped_avg.len(), 1);
     assert_eq!(grouped_avg[0].get("grp"), Some(&lin::Cell::Int(20)));
     assert_eq!(grouped_avg[0].get("val"), Some(&lin::Cell::Float(50.0)));
@@ -1802,7 +1802,7 @@ fn new_aggregations_sum_min_max_avg_and_group_type_preservation() {
     let grouped_min = db
         .run("items | min val by grp | sort grp | take all")
         .unwrap()
-        .rows;
+        .into_rows();
     assert_eq!(grouped_min.len(), 2);
     assert_eq!(grouped_min[0].get("grp"), Some(&lin::Cell::Int(10)));
     assert_eq!(grouped_min[0].get("val"), Some(&lin::Cell::Float(10.0)));
@@ -1810,7 +1810,7 @@ fn new_aggregations_sum_min_max_avg_and_group_type_preservation() {
     let grouped_max = db
         .run("items | max val by grp | sort grp | take all")
         .unwrap()
-        .rows;
+        .into_rows();
     assert_eq!(grouped_max.len(), 2);
     assert_eq!(grouped_max[0].get("val"), Some(&lin::Cell::Float(30.0)));
 }

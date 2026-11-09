@@ -73,17 +73,31 @@ pub struct Query {
 }
 
 impl Query {
+    pub fn needs_simplify(&self) -> bool {
+        self.steps.iter().any(|step| match step {
+            Step::Filter(pred) => pred.needs_simplify(),
+            Step::Union(rhs) => rhs.needs_simplify(),
+            _ => false,
+        })
+    }
+
     pub fn simplify_predicates(&mut self) {
         for step in &mut self.steps {
-            if let Step::Filter(pred) = step {
-                let p = std::mem::replace(
-                    pred,
-                    Pred::IsNull {
-                        field: Field { parts: vec![] },
-                        negated: false,
-                    },
-                );
-                *pred = p.simplify();
+            match step {
+                Step::Filter(pred) if pred.needs_simplify() => {
+                    let p = std::mem::replace(
+                        pred,
+                        Pred::IsNull {
+                            field: Field { parts: vec![] },
+                            negated: false,
+                        },
+                    );
+                    *pred = p.simplify();
+                }
+                Step::Union(rhs) if rhs.needs_simplify() => {
+                    rhs.simplify_predicates();
+                }
+                _ => {}
             }
         }
     }
@@ -112,21 +126,36 @@ pub struct MatchHop {
 
 impl MatchHop {
     pub fn label(&self) -> String {
-        let star = if self.min_depth == 1 && self.max_depth == 1 {
-            String::new()
-        } else if self.min_depth == self.max_depth {
-            format!("*{}", self.min_depth)
-        } else {
-            format!("*{}..{}", self.min_depth, self.max_depth)
-        };
-        let mid = match &self.edge {
-            Some(e) => format!("[{e}:{}{star}]", self.rel),
-            None => format!("{}{star}", self.rel),
-        };
+        self.to_string()
+    }
+}
+
+impl std::fmt::Display for MatchHop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.reverse {
-            format!("<-{mid}- {}", self.bind)
+            f.write_str("<-")?;
         } else {
-            format!("-{mid}-> {}", self.bind)
+            f.write_str("-")?;
+        }
+        if let Some(e) = &self.edge {
+            write!(f, "[{e}:{}", self.rel)?;
+        } else {
+            f.write_str(&self.rel)?;
+        }
+        if !(self.min_depth == 1 && self.max_depth == 1) {
+            if self.min_depth == self.max_depth {
+                write!(f, "*{}", self.min_depth)?;
+            } else {
+                write!(f, "*{}..{}", self.min_depth, self.max_depth)?;
+            }
+        }
+        if self.edge.is_some() {
+            f.write_str("]")?;
+        }
+        if self.reverse {
+            write!(f, "- {}", self.bind)
+        } else {
+            write!(f, "-> {}", self.bind)
         }
     }
 }
@@ -289,6 +318,26 @@ impl Pred {
         }
     }
 
+    pub fn needs_simplify(&self) -> bool {
+        match self {
+            Pred::Not(inner) => {
+                matches!(
+                    **inner,
+                    Pred::Not(_) | Pred::IsNull { .. } | Pred::Cmp { .. }
+                ) || inner.needs_simplify()
+            }
+            Pred::And(a, b) | Pred::Or(a, b) => a.needs_simplify() || b.needs_simplify(),
+            Pred::In { values, .. } => {
+                values.len() == 1
+                    || values
+                        .iter()
+                        .enumerate()
+                        .any(|(i, v)| values[..i].contains(v))
+            }
+            _ => false,
+        }
+    }
+
     pub fn simplify(self) -> Pred {
         match self {
             Pred::Not(inner) => {
@@ -332,8 +381,21 @@ impl Pred {
                         value: values.pop().unwrap(),
                     }
                 } else {
-                    let mut seen = std::collections::HashSet::new();
-                    values.retain(|v| seen.insert(v.clone()));
+                    if values.len() <= 16 {
+                        let mut write = 0;
+                        for read in 0..values.len() {
+                            if !values[..write].contains(&values[read]) {
+                                if write != read {
+                                    values.swap(write, read);
+                                }
+                                write += 1;
+                            }
+                        }
+                        values.truncate(write);
+                    } else {
+                        let mut seen = rustc_hash::FxHashSet::default();
+                        values.retain(|v| seen.insert(v.clone()));
+                    }
                     if values.len() == 1 {
                         Pred::Cmp {
                             field,
@@ -368,6 +430,47 @@ impl std::ops::BitOr for Pred {
     type Output = Pred;
     fn bitor(self, rhs: Pred) -> Pred {
         self.or(rhs)
+    }
+}
+
+impl std::fmt::Display for Pred {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Pred::And(a, b) => write!(f, "{a} and {b}"),
+            Pred::Or(a, b) => write!(f, "{a} or {b}"),
+            Pred::Not(inner) => write!(f, "not ({inner})"),
+            Pred::Cmp { field, op, value } => write!(f, "{field} {} {value}", op.as_str()),
+            Pred::IsNull { field, negated } => {
+                if *negated {
+                    write!(f, "{field} is not null")
+                } else {
+                    write!(f, "{field} is null")
+                }
+            }
+            Pred::In { field, values } => {
+                write!(f, "{field} in [")?;
+                for (i, v) in values.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{v}")?;
+                }
+                f.write_str("]")
+            }
+            Pred::Has { field, ci, needle } => {
+                if *ci {
+                    write!(f, "{field} has ci {needle:?}")
+                } else {
+                    write!(f, "{field} has {needle:?}")
+                }
+            }
+            Pred::Contains { field, needle } => write!(f, "{field} ~ {needle:?}"),
+            Pred::Regex {
+                field,
+                pattern,
+                flags,
+            } => write!(f, "{field} ~ /{pattern}/{flags}"),
+        }
     }
 }
 
@@ -421,12 +524,32 @@ impl Field {
         self.parts.join(".")
     }
 
+    /// Borrow a single-segment field name or join dotted parts on demand.
+    pub fn as_cow_str(&self) -> std::borrow::Cow<'_, str> {
+        match self.parts.as_slice() {
+            [p] => std::borrow::Cow::Borrowed(p.as_str()),
+            _ => std::borrow::Cow::Owned(self.parts.join(".")),
+        }
+    }
+
     /// Single-segment field name without allocating (hot path for filters/projects).
     pub fn leaf(&self) -> Option<&str> {
         match self.parts.as_slice() {
             [p] => Some(p.as_str()),
             _ => None,
         }
+    }
+}
+
+impl std::fmt::Display for Field {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (i, p) in self.parts.iter().enumerate() {
+            if i > 0 {
+                f.write_str(".")?;
+            }
+            f.write_str(p)?;
+        }
+        Ok(())
     }
 }
 
@@ -458,6 +581,22 @@ impl std::hash::Hash for Value {
             Value::Bool(b) => b.hash(state),
             Value::NowMinus(d) | Value::Duration(d) => d.hash(state),
             Value::Now => {}
+        }
+    }
+}
+
+impl std::fmt::Display for Value {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Value::String(s) => write!(f, "{s:?}"),
+            Value::Int(n) => write!(f, "{n}"),
+            Value::Float(n) => write!(f, "{n}"),
+            Value::Bool(b) => write!(f, "{b}"),
+            Value::Timestamp(millis) => write!(f, "timestamp({millis})"),
+            Value::Now => f.write_str("now"),
+            Value::NowMinus(d) => write!(f, "now - {d}"),
+            Value::Duration(d) => write!(f, "{d}"),
+            Value::Name(n) => f.write_str(n),
         }
     }
 }
@@ -502,7 +641,7 @@ impl DurUnit {
 
 impl Duration {
     pub fn display(self) -> String {
-        format!("{}{}", self.n, self.unit.as_char())
+        self.to_string()
     }
 
     pub fn as_millis(self) -> i64 {
@@ -514,6 +653,12 @@ impl Duration {
             DurUnit::Minute => n.saturating_mul(60_000),
             DurUnit::Second => n.saturating_mul(1_000),
         }
+    }
+}
+
+impl std::fmt::Display for Duration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}{}", self.n, self.unit.as_char())
     }
 }
 
@@ -550,7 +695,13 @@ pub struct EmbedTarget {
 
 impl EmbedTarget {
     pub fn display(&self) -> String {
-        format!("{}/{}/{}", self.provider, self.model, self.dim)
+        self.to_string()
+    }
+}
+
+impl std::fmt::Display for EmbedTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}/{}", self.provider, self.model, self.dim)
     }
 }
 

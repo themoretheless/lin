@@ -61,7 +61,6 @@ fn short_label(node: &Node) -> String {
         }
         NodeKind::Scan { collection, .. } => format!("Scan {collection}"),
         NodeKind::Filter { pred } => format!("Filter {}", clip(pred, 28)),
-        NodeKind::Project { .. } => "Project".into(),
         NodeKind::Join { left, .. } => {
             format!("Join {}", if *left { "left" } else { "inner" })
         }
@@ -84,7 +83,6 @@ fn short_label(node: &Node) -> String {
             };
             format!("Search {m} {}", clip(query, 16))
         }
-        NodeKind::Rrf { .. } => "RRF".into(),
         NodeKind::Agg { op, .. } => format!("Agg {op}"),
         NodeKind::Sort { field, desc } => {
             format!("Sort {field} {}", if *desc { "desc" } else { "asc" })
@@ -111,8 +109,15 @@ fn short_label(node: &Node) -> String {
                 format!("InsertPack {collection}")
             }
         }
-        NodeKind::Cas { .. } => "CAS".into(),
-        NodeKind::BatchCAS { .. } => "BatchCAS".into(),
+        NodeKind::Cas { .. }
+        | NodeKind::BatchCAS { .. }
+        | NodeKind::Schema { .. }
+        | NodeKind::Project { .. }
+        | NodeKind::Rrf { .. }
+        | NodeKind::Union
+        | NodeKind::Seq
+        | NodeKind::Split
+        | NodeKind::Exchange => node.kind.short_name().into(),
         NodeKind::IndexSeek { collection, fields } => {
             format!("index={collection}[{}]", fields.join(","))
         }
@@ -125,15 +130,10 @@ fn short_label(node: &Node) -> String {
             fields.join(","),
             clip(query, 16)
         ),
-        NodeKind::Schema { .. } => "Schema".into(),
         NodeKind::Reembed { collection, .. } => format!("Reembed {collection}"),
         NodeKind::Delete { collection } => format!("Delete {collection}"),
         NodeKind::DeleteEdge { rel, .. } => format!("DeleteEdge {rel}"),
-        NodeKind::Union => "Union".into(),
         NodeKind::Let { name } => format!("Let {name}"),
-        NodeKind::Seq => "Seq".into(),
-        NodeKind::Split => "Split".into(),
-        NodeKind::Exchange => "Exchange".into(),
     }
 }
 

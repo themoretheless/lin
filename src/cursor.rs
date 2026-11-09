@@ -99,7 +99,7 @@ impl CursorDb<'_> {
     fn run_query(&self, q: &Query) -> Result<Vec<Row>, Error> {
         match self {
             CursorDb::Writer(db) => db.run_query_readonly(q),
-            CursorDb::Reader(db) => Ok(db.run_stmt(Stmt::Query(q.clone()))?.rows),
+            CursorDb::Reader(db) => Ok(db.run_stmt(Stmt::Query(q.clone()))?.into_rows()),
         }
     }
 
@@ -189,8 +189,8 @@ struct LazyJoinSoa {
     left_join: bool,
     /// When set, filter `orders.total > min` without row maps.
     total_gt: Option<f64>,
-    /// user_id → index into users SoA columns.
-    probe: FxHashMap<Arc<str>, usize>,
+    /// Fallback user_id → index into users SoA columns when `store.by_id["users"]` is not aligned.
+    probe: Option<FxHashMap<Arc<str>, usize>>,
     skip_left: usize,
     take_left: Option<usize>,
     fields: Arc<[String]>,
@@ -1066,7 +1066,11 @@ fn next_lazy_join_soa(store: &Store, join: &mut LazyJoinSoa) -> Option<Result<Ro
         {
             continue;
         }
-        let right = join.probe.get(uid).copied();
+        let right = join
+            .probe
+            .as_ref()
+            .or_else(|| store.by_id.get("users"))
+            .and_then(|m| m.get(uid).copied());
         if right.is_none() && !join.left_join {
             continue;
         }
@@ -1145,7 +1149,11 @@ fn next_lazy_join_soa_projected(
         {
             continue;
         }
-        let right = join.probe.get(uid).copied();
+        let right = join
+            .probe
+            .as_ref()
+            .or_else(|| store.by_id.get("users"))
+            .and_then(|m| m.get(uid).copied());
         if right.is_none() && !join.left_join {
             continue;
         }
@@ -1277,11 +1285,20 @@ fn try_lazy_join_soa(db: &CursorDb<'_>, q: &Query) -> Result<Option<LazyJoinSoa>
     let source = RowSource::Scan { len: n };
 
     let users_id = store.users_id();
-    let mut probe: FxHashMap<Arc<str>, usize> = FxHashMap::default();
-    probe.reserve(users_id.len());
-    for (i, id) in users_id.iter().enumerate() {
-        probe.insert(Arc::clone(id), i);
-    }
+    let probe = if store
+        .by_id
+        .get("users")
+        .is_some_and(|m| m.len() == users_id.len())
+    {
+        None
+    } else {
+        let mut map: FxHashMap<Arc<str>, usize> = FxHashMap::default();
+        map.reserve(users_id.len());
+        for (i, id) in users_id.iter().enumerate() {
+            map.insert(Arc::clone(id), i);
+        }
+        Some(map)
+    };
 
     Ok(Some(LazyJoinSoa {
         source,

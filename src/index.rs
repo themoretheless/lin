@@ -26,7 +26,7 @@ struct BloomFilter {
 #[cfg(feature = "parallel")]
 impl BloomFilter {
     fn new(capacity: usize) -> Self {
-        let num_bits = 8 * 1024 * 1024; // 1M bits = 128KB
+        let num_bits = (capacity.max(64) * 10).next_power_of_two().max(512);
         let num_hashes = 7;
 
         Self {
@@ -49,12 +49,13 @@ impl BloomFilter {
 
         let base_hash = self.hash(item);
         let delta = base_hash.wrapping_mul(0x9e3779b97f4a7c15).rotate_left(17) | 1;
+        let total_bits = self.bits.len() * 64;
 
         for i in 0..self.num_hashes {
             let h = base_hash.wrapping_add((i as u64).wrapping_mul(delta));
-            let bit_pos = (h as usize) % (self.bits.len() * 64);
-            let mask = 1u64 << (bit_pos % 64);
-            self.bits[bit_pos / 64] |= mask;
+            let bit_pos = (h as usize) & (total_bits - 1);
+            let mask = 1u64 << (bit_pos & 63);
+            self.bits[bit_pos >> 6] |= mask;
         }
     }
 
@@ -65,48 +66,18 @@ impl BloomFilter {
 
         let base_hash = self.hash(item);
         let delta = base_hash.wrapping_mul(0x9e3779b97f4a7c15).rotate_left(17) | 1;
+        let total_bits = self.bits.len() * 64;
 
         for i in 0..self.num_hashes {
             let h = base_hash.wrapping_add((i as u64).wrapping_mul(delta));
-            let bit_pos = (h as usize) % (self.bits.len() * 64);
-            let mask = 1u64 << (bit_pos % 64);
+            let bit_pos = (h as usize) & (total_bits - 1);
+            let mask = 1u64 << (bit_pos & 63);
 
-            if self.bits[bit_pos / 64] & mask == 0 {
+            if self.bits[bit_pos >> 6] & mask == 0 {
                 return false;
             }
         }
         true
-    }
-}
-
-/// Composite bloom filter for multi-key index checks
-#[cfg(feature = "parallel")]
-#[allow(dead_code)]
-pub struct MultiBloomFilter {
-    filters: Vec<BloomFilter>,
-}
-
-#[cfg(feature = "parallel")]
-#[allow(dead_code)]
-impl MultiBloomFilter {
-    pub fn new(num_filters: usize, capacity: usize) -> Self {
-        Self {
-            filters: (0..num_filters)
-                .map(|_| BloomFilter::new(capacity))
-                .collect(),
-        }
-    }
-
-    pub fn add_keys(&mut self, keys: &[IndexKey]) {
-        for key in keys {
-            for filter in &mut self.filters {
-                filter.add(key);
-            }
-        }
-    }
-
-    pub fn check_all(&self, target: &IndexKey) -> bool {
-        self.filters.iter().all(|f| f.contains(target))
     }
 }
 
@@ -208,6 +179,7 @@ pub struct LiveIndex {
     /// Either Vec<usize> (standard) or BitSet (for low-cardinality columns)
     pub forward: BTreeMap<IndexKey, PostingList>,
     pub reverse: FxHashMap<usize, IndexKey>,
+    pub use_reverse: bool,
 
     /// Bloom filter for fast negative lookups during seek operations
     #[cfg(feature = "parallel")]
@@ -221,10 +193,10 @@ pub struct IndexUse {
     pub range: Option<(String, CmpOp, Value)>,
 }
 
-/// Posting list - either Vec<usize> (standard) or BitSet (for low-cardinality columns)
+/// Posting list - either SmallVec<[usize; 2]> (standard) or BitSet (for low-cardinality columns)
 #[derive(Debug, Clone, PartialEq)]
 pub enum PostingList {
-    Standard(Vec<usize>),
+    Standard(smallvec::SmallVec<[usize; 2]>),
     Bitmap(BitSet),
 }
 
@@ -233,7 +205,7 @@ impl PostingList {
         if is_bitmap {
             PostingList::Bitmap(BitSet::new(capacity))
         } else {
-            PostingList::Standard(Vec::new())
+            PostingList::Standard(smallvec::SmallVec::new())
         }
     }
 
@@ -242,12 +214,17 @@ impl PostingList {
         match self {
             PostingList::Standard(vec) => {
                 if vec.len() >= 32 {
-                    let mut set = BitSet::new(pos + 1);
-                    for &p in vec.iter() {
-                        set.insert(p);
+                    let max_pos = vec.iter().copied().max().unwrap_or(0).max(pos);
+                    if max_pos <= vec.len().saturating_mul(64) {
+                        let mut set = BitSet::new(max_pos + 1);
+                        for &p in vec.iter() {
+                            set.insert(p);
+                        }
+                        set.insert(pos);
+                        *self = PostingList::Bitmap(set);
+                    } else {
+                        vec.push(pos);
                     }
-                    set.insert(pos);
-                    *self = PostingList::Bitmap(set);
                 } else {
                     vec.push(pos);
                 }
@@ -369,7 +346,7 @@ impl PostingList {
 
     pub fn to_indices(&self) -> Vec<usize> {
         match self {
-            PostingList::Standard(vec) => vec.clone(),
+            PostingList::Standard(vec) => vec.to_vec(),
             PostingList::Bitmap(set) => set.to_indices(),
         }
     }
@@ -384,7 +361,7 @@ impl PostingList {
                 a.dedup();
                 b.sort_unstable();
                 b.dedup();
-                let mut result = Vec::with_capacity(a.len().min(b.len()));
+                let mut result = smallvec::SmallVec::with_capacity(a.len().min(b.len()));
                 let (mut i, mut j) = (0, 0);
                 while i < a.len() && j < b.len() {
                     match a[i].cmp(&b[j]) {
@@ -406,7 +383,7 @@ impl PostingList {
                 a.dedup();
                 b.sort_unstable();
                 b.dedup();
-                let mut result = Vec::with_capacity(a.len().min(b.len()));
+                let mut result = smallvec::SmallVec::with_capacity(a.len().min(b.len()));
                 let (mut i, mut j) = (0, 0);
                 while i < a.len() && j < b.len() {
                     match a[i].cmp(&b[j]) {
@@ -439,7 +416,7 @@ impl PostingList {
                 a.extend(other.to_indices());
                 a.sort_unstable();
                 a.dedup();
-                *this = PostingList::Standard(a);
+                *this = PostingList::Standard(smallvec::SmallVec::from_vec(a));
             }
         }
     }
@@ -451,6 +428,7 @@ impl LiveIndex {
             def,
             forward: BTreeMap::new(),
             reverse: FxHashMap::default(),
+            use_reverse: true,
             #[cfg(feature = "parallel")]
             bloom_filter: None,
         }
@@ -462,6 +440,7 @@ impl LiveIndex {
             def: self.def.clone(),
             forward: self.forward.clone(),
             reverse: FxHashMap::default(),
+            use_reverse: false,
             #[cfg(feature = "parallel")]
             bloom_filter: self.bloom_filter.clone(),
         }
@@ -475,12 +454,55 @@ impl LiveIndex {
             return;
         }
 
-        self.bloom_filter = Some(BloomFilter::new(num_keys));
-
-        // Add all keys to bloom filter for fast negative lookups
+        let mut bf = BloomFilter::new(num_keys);
         for key in self.forward.keys() {
-            self.bloom_filter.as_mut().unwrap().add(key);
+            bf.add(key);
         }
+        self.bloom_filter = Some(bf);
+    }
+
+    #[inline]
+    fn insert_forward_entry(
+        &mut self,
+        idx: usize,
+        key: IndexKey,
+        is_bitmap: bool,
+        check_unique_occupied: bool,
+        use_push: bool,
+    ) -> Result<(), String> {
+        use std::collections::btree_map::Entry;
+        match self.forward.entry(key) {
+            Entry::Vacant(v) => {
+                #[cfg(feature = "parallel")]
+                if let Some(ref mut bf) = self.bloom_filter {
+                    bf.add(v.key());
+                }
+                if self.use_reverse {
+                    self.reverse.insert(idx, v.key().clone());
+                }
+                let mut posting = PostingList::new(is_bitmap, 64);
+                if use_push {
+                    posting.push(idx);
+                } else {
+                    posting.insert(idx);
+                }
+                v.insert(posting);
+            }
+            Entry::Occupied(mut o) => {
+                if check_unique_occupied && self.def.unique {
+                    return Err(format!("unique index {}: duplicate key", self.def.label()));
+                }
+                if self.use_reverse {
+                    self.reverse.insert(idx, o.key().clone());
+                }
+                if use_push {
+                    o.get_mut().push(idx);
+                } else {
+                    o.get_mut().insert(idx);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Check if target key might exist using bloom filter (fast path before BTree lookup)
@@ -493,6 +515,16 @@ impl LiveIndex {
 
         // Fallback: always assume present when no filter or feature not enabled
         true
+    }
+
+    #[inline]
+    pub fn single_cell_key(cell: &Cell) -> IndexKey {
+        IndexKey(smallvec::smallvec![cell_part(cell)])
+    }
+
+    #[inline]
+    pub fn two_cell_key(c0: &Cell, c1: &Cell) -> IndexKey {
+        IndexKey(smallvec::smallvec![cell_part(c0), cell_part(c1)])
     }
 
     pub fn key_of(&self, row: &Row) -> IndexKey {
@@ -527,7 +559,6 @@ impl LiveIndex {
         }
 
         let key = self.key_of(row);
-        use std::collections::btree_map::Entry;
 
         // Check if this is a bitmap index (for boolean fields)
         let is_bitmap = self
@@ -536,22 +567,7 @@ impl LiveIndex {
             .as_ref()
             .is_some_and(|field| matches!(row.get(field), Some(Cell::Bool(_))));
 
-        match self.forward.entry(key) {
-            Entry::Vacant(v) => {
-                self.reverse.insert(idx, v.key().clone());
-                let mut posting = PostingList::new(is_bitmap, 1 << 16);
-                posting.push(idx);
-                v.insert(posting);
-            }
-            Entry::Occupied(mut o) => {
-                if self.def.unique {
-                    return Err(format!("unique index {}: duplicate key", self.def.label()));
-                }
-                self.reverse.insert(idx, o.key().clone());
-                o.get_mut().push(idx);
-            }
-        }
-        Ok(())
+        self.insert_forward_entry(idx, key, is_bitmap, true, true)
     }
 
     /// Determine if this index should use bitmap encoding based on cardinality estimation
@@ -595,8 +611,6 @@ impl LiveIndex {
         key: IndexKey,
         bitmap_sample: Option<(bool, usize)>,
     ) -> Result<(), String> {
-        use std::collections::btree_map::Entry;
-
         // Auto-detect bitmap index based on field cardinality
         // If bitmap_card_field is set, estimate cardinality from sample
         let is_bitmap = self
@@ -610,22 +624,13 @@ impl LiveIndex {
                     || (count > 0 && count <= if self.forward.len() > 10_000 { 32 } else { 16 })
             });
 
-        match self.forward.entry(key) {
-            Entry::Vacant(v) => {
-                self.reverse.insert(orig_idx, v.key().clone());
-                let mut posting = PostingList::new(is_bitmap, 1 << 16);
-                posting.push(orig_idx);
-                v.insert(posting);
-            }
-            Entry::Occupied(mut o) => {
-                if self.def.unique {
-                    return Err(format!("unique index {}: duplicate key", self.def.label()));
-                }
-                self.reverse.insert(orig_idx, o.key().clone());
-                o.get_mut().push(orig_idx);
-            }
-        }
-        Ok(())
+        self.insert_forward_entry(orig_idx, key, is_bitmap, true, true)
+    }
+
+    pub fn insert_slab_batch_no_reverse(&mut self, start: usize, rows: &[Row]) -> Result<(), String> {
+        self.use_reverse = false;
+        self.reverse.clear();
+        self.insert_slab_batch(start, rows)
     }
 
     pub fn insert_slab_batch(&mut self, start: usize, rows: &[Row]) -> Result<(), String> {
@@ -660,13 +665,17 @@ impl LiveIndex {
             }
 
             let keys: Vec<_> = keyed_rows.iter().map(|(_, r)| self.key_of(r)).collect();
-            self.reverse.reserve(keyed_rows.len());
+            if self.use_reverse {
+                self.reverse.reserve(keyed_rows.len());
+            }
 
             for ((orig_idx, row), key) in keyed_rows.iter().zip(keys.into_iter()) {
                 self.insert_one_slab_key(*orig_idx, row, key, bitmap_sample)?;
             }
         } else {
-            self.reverse.reserve(rows.len());
+            if self.use_reverse {
+                self.reverse.reserve(rows.len());
+            }
             let first = &rows[0];
             let uniform = rows[1..].iter().all(|r| r.len() == first.len());
             if uniform && first.len() <= 32 && self.def.fields.len() <= 8 {
@@ -717,7 +726,7 @@ impl LiveIndex {
         {
             return Err(format!("unique index {}: duplicate key", self.def.label()));
         }
-        if self.reverse.get(&idx) == Some(&key) {
+        if self.use_reverse && self.reverse.get(&idx) == Some(&key) {
             return Ok(());
         }
 
@@ -728,7 +737,9 @@ impl LiveIndex {
                 .is_some_and(|cell| matches!(cell, IndexPart::Bool(_)))
         });
 
-        if let Some(old) = self.reverse.remove(&idx) {
+        if self.use_reverse
+            && let Some(old) = self.reverse.remove(&idx)
+        {
             if let Some(vec) = self.forward.get_mut(&old) {
                 vec.remove(idx);
                 if vec.count() == 0 {
@@ -738,19 +749,159 @@ impl LiveIndex {
         }
 
         // Use BitSet for boolean fields (≤2 distinct values)
-        match self.forward.entry(key) {
-            std::collections::btree_map::Entry::Vacant(v) => {
-                self.reverse.insert(idx, v.key().clone());
-                let mut posting = PostingList::new(is_bitmap, 1 << 16);
-                posting.insert(idx);
-                v.insert(posting);
-            }
-            std::collections::btree_map::Entry::Occupied(mut o) => {
-                self.reverse.insert(idx, o.key().clone());
-                o.get_mut().insert(idx);
+        self.insert_forward_entry(idx, key, is_bitmap, false, false)
+    }
+
+    pub fn update_row(&mut self, idx: usize, before: &Row, after: &Row) -> Result<(), String> {
+        if self.use_reverse {
+            return self.insert_at(idx, after);
+        }
+        let now = crate::store::now_ms();
+        let old_key = self
+            .def
+            .pred
+            .as_ref()
+            .is_none_or(|pred| crate::exec::eval_pred(pred, before, now))
+            .then(|| self.key_of(before));
+        let new_key = self
+            .def
+            .pred
+            .as_ref()
+            .is_none_or(|pred| crate::exec::eval_pred(pred, after, now))
+            .then(|| self.key_of(after));
+        self.update_keys(idx, old_key, new_key)
+    }
+
+    pub fn update_keys(
+        &mut self,
+        idx: usize,
+        old_key: Option<IndexKey>,
+        new_key: Option<IndexKey>,
+    ) -> Result<(), String> {
+        if old_key == new_key {
+            return Ok(());
+        }
+        if let Some(ref nk) = new_key
+            && self.def.unique
+            && let Some(ids) = self.forward.get(nk)
+            && ids.has_other_than(idx)
+        {
+            return Err(format!("unique index {}: duplicate key", self.def.label()));
+        }
+        if let Some(ok) = old_key {
+            if let std::collections::btree_map::Entry::Occupied(mut entry) = self.forward.entry(ok) {
+                entry.get_mut().remove(idx);
+                if entry.get().is_empty() {
+                    entry.remove_entry();
+                }
             }
         }
+        if let Some(nk) = new_key {
+            let is_bitmap = self.def.bitmap_card_field.as_ref().is_some_and(|_field| {
+                nk.0.first()
+                    .is_some_and(|cell| matches!(cell, IndexPart::Bool(_)))
+            });
+            self.insert_forward_entry(idx, nk, is_bitmap, false, false)?;
+        } else if self.use_reverse {
+            self.reverse.remove(&idx);
+        }
         Ok(())
+    }
+
+    pub fn remove_row(&mut self, idx: usize, doomed: &Row) {
+        if self.use_reverse {
+            self.remove_at(idx);
+            return;
+        }
+        let now = crate::store::now_ms();
+        if self
+            .def
+            .pred
+            .as_ref()
+            .is_some_and(|pred| !crate::exec::eval_pred(pred, doomed, now))
+        {
+            return;
+        }
+        let kd = self.key_of(doomed);
+        if let std::collections::btree_map::Entry::Occupied(mut entry) = self.forward.entry(kd) {
+            entry.get_mut().remove(idx);
+            if entry.get().is_empty() {
+                entry.remove_entry();
+            }
+        }
+    }
+
+    pub fn swap_remove_keys(&mut self, p: usize, kd: &IndexKey, last: usize, kt: &IndexKey) {
+        if self.use_reverse {
+            self.swap_remove_at(p, last);
+            return;
+        }
+        if kd == kt {
+            let should_remove = if let Some(list) = self.forward.get_mut(kt) {
+                list.remove(last);
+                list.is_empty()
+            } else {
+                false
+            };
+            if should_remove {
+                self.forward.remove(kt);
+            }
+        } else {
+            if let Some(list) = self.forward.get_mut(kt) {
+                list.replace(last, p);
+            }
+            let should_remove = if let Some(list) = self.forward.get_mut(kd) {
+                list.remove(p);
+                list.is_empty()
+            } else {
+                false
+            };
+            if should_remove {
+                self.forward.remove(kd);
+            }
+        }
+    }
+
+    pub fn swap_remove_rows(&mut self, p: usize, doomed: &Row, last: usize, tail: &Row) {
+        if self.use_reverse {
+            self.swap_remove_at(p, last);
+            return;
+        }
+        let (d_in, t_in) = if let Some(pred) = &self.def.pred {
+            let now = crate::store::now_ms();
+            (
+                crate::exec::eval_pred(pred, doomed, now),
+                crate::exec::eval_pred(pred, tail, now),
+            )
+        } else {
+            (true, true)
+        };
+        match (d_in, t_in) {
+            (true, true) => {
+                let kd = self.key_of(doomed);
+                let kt = self.key_of(tail);
+                self.swap_remove_keys(p, &kd, last, &kt);
+            }
+            (false, true) => {
+                let kt = self.key_of(tail);
+                if let Some(list) = self.forward.get_mut(&kt) {
+                    list.replace(last, p);
+                }
+            }
+            (true, false) => {
+                let kd = self.key_of(doomed);
+                let should_remove = if let Some(list) = self.forward.get_mut(&kd) {
+                    list.remove(p);
+                    list.is_empty()
+                } else {
+                    false
+                };
+                if should_remove {
+                    self.forward.remove(&kd);
+                }
+            }
+            (false, false) => {}
+        }
     }
 
     pub fn remove_at(&mut self, idx: usize) {
@@ -788,7 +939,10 @@ impl LiveIndex {
                         self.forward.remove(&kt);
                     }
                 } else {
-                    let kd = std::mem::replace(kd_slot, kt.clone());
+                    if let Some(list) = self.forward.get_mut(&kt) {
+                        list.replace(last, p);
+                    }
+                    let kd = std::mem::replace(kd_slot, kt);
                     let should_remove = if let Some(list) = self.forward.get_mut(&kd) {
                         list.remove(p);
                         list.is_empty()
@@ -797,9 +951,6 @@ impl LiveIndex {
                     };
                     if should_remove {
                         self.forward.remove(&kd);
-                    }
-                    if let Some(list) = self.forward.get_mut(&kt) {
-                        list.replace(last, p);
                     }
                 }
             } else {
@@ -1135,6 +1286,7 @@ impl BitSet {
         if self.count == 0 {
             return;
         }
+        out.reserve(self.count);
         for (word_idx, &word) in self.bits.iter().enumerate() {
             if word == 0 {
                 continue;
@@ -1327,10 +1479,11 @@ fn index_covers_atoms(atoms: &[std::borrow::Cow<'_, Pred>], use_: &IndexUse) -> 
                 {
                     return false;
                 }
+                let f_cow = field.as_cow_str();
                 if !use_
                     .eqs
                     .iter()
-                    .any(|(f, v)| f == &field.as_str() && v == value)
+                    .any(|(f, v)| f.as_str() == f_cow.as_ref() && v == value)
                 {
                     return false;
                 }
@@ -1341,7 +1494,7 @@ fn index_covers_atoms(atoms: &[std::borrow::Cow<'_, Pred>], use_: &IndexUse) -> 
                 let Some((rf, rop, rv)) = &use_.range else {
                     return false;
                 };
-                if rf != &field.as_str() || rop != op || rv != value {
+                if rf.as_str() != field.as_cow_str().as_ref() || rop != op || rv != value {
                     return false;
                 }
             }
@@ -1474,7 +1627,7 @@ fn find_eq_atoms<'a>(atoms: &'a [std::borrow::Cow<'_, Pred>], field: &str) -> Op
             op: CmpOp::Eq,
             value,
         } = a.as_ref()
-            && f.as_str() == field
+            && f.as_cow_str().as_ref() == field
         {
             return Some(value);
         }
@@ -1489,7 +1642,7 @@ fn find_range_atoms<'a>(atoms: &'a [std::borrow::Cow<'_, Pred>], field: &str) ->
             op,
             value,
         } = a.as_ref()
-            && f.as_str() == field
+            && f.as_cow_str().as_ref() == field
             && matches!(op, CmpOp::Gt | CmpOp::Lt | CmpOp::Ge | CmpOp::Le)
         {
             return Some((*op, value));
@@ -1558,6 +1711,7 @@ mod storage_tests {
             def: index_def,
             forward: BTreeMap::new(),
             reverse: FxHashMap::default(),
+            use_reverse: true,
             #[cfg(feature = "parallel")]
             bloom_filter: None,
         };
@@ -1585,6 +1739,7 @@ mod storage_tests {
             def: index_def,
             forward: BTreeMap::new(),
             reverse: FxHashMap::default(),
+            use_reverse: true,
             #[cfg(feature = "parallel")]
             bloom_filter: None,
         };
@@ -1613,6 +1768,7 @@ mod storage_tests {
             def: index_def,
             forward: BTreeMap::new(),
             reverse: FxHashMap::default(),
+            use_reverse: true,
             #[cfg(feature = "parallel")]
             bloom_filter: None,
         };
@@ -1665,7 +1821,7 @@ mod storage_tests {
                 .unwrap();
             assert_eq!(
                 index.forward[&index.reverse[&0]],
-                PostingList::Standard(vec![0])
+                PostingList::Standard(smallvec::smallvec![0])
             );
             index.remove_at(0);
             assert!(!index.reverse.contains_key(&0));
@@ -1764,7 +1920,7 @@ mod storage_tests {
             assert_eq!(index.reverse.len(), 1);
             assert_eq!(
                 index.forward.get(&index.key_of(&row)),
-                Some(&PostingList::Standard(vec![8]))
+                Some(&PostingList::Standard(smallvec::smallvec![8]))
             );
         }
     }
@@ -1806,7 +1962,7 @@ impl LiveIndex {
             match self.forward.entry(key) {
                 Entry::Vacant(v) => {
                     self.reverse.insert(*orig_idx, v.key().clone());
-                    let mut posting = PostingList::new(is_bitmap, 1 << 16);
+                    let mut posting = PostingList::new(is_bitmap, 64);
                     posting.push(*orig_idx);
                     v.insert(posting);
                 }

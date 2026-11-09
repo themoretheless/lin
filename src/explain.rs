@@ -418,37 +418,5 @@ fn est_rows(node: &Node, sizes: &CollectionSizes) -> f64 {
 }
 
 fn short_name(kind: &NodeKind) -> &'static str {
-    match kind {
-        NodeKind::Reduce { .. } => "Reduce",
-        NodeKind::Scan { .. } => "Scan",
-        NodeKind::Filter { .. } => "Filter",
-        NodeKind::Project { .. } => "Project",
-        NodeKind::Join { .. } => "Join",
-        NodeKind::Hop { .. } => "Hop",
-        NodeKind::Graph { .. } => "Graph",
-        NodeKind::Match { .. } => "Match",
-        NodeKind::Search { .. } => "Search",
-        NodeKind::Rrf { .. } => "RRF",
-        NodeKind::Agg { .. } => "Agg",
-        NodeKind::Sort { .. } => "Sort",
-        NodeKind::Window { .. } => "Window",
-        NodeKind::Skip { .. } => "Skip",
-        NodeKind::Take { .. } => "Take",
-        NodeKind::Get { .. } => "Get",
-        NodeKind::Append { .. } => "Append",
-        NodeKind::InsertPack { .. } => "InsertPack",
-        NodeKind::Cas { .. } => "CAS",
-        NodeKind::BatchCAS { .. } => "BatchCAS",
-        NodeKind::IndexSeek { .. } => "IndexSeek",
-        NodeKind::FtsSeek { .. } => "FtsSeek",
-        NodeKind::Schema { .. } => "Schema",
-        NodeKind::Reembed { .. } => "Reembed",
-        NodeKind::Delete { .. } => "Delete",
-        NodeKind::DeleteEdge { .. } => "DeleteEdge",
-        NodeKind::Union => "Union",
-        NodeKind::Let { .. } => "Let",
-        NodeKind::Seq => "Seq",
-        NodeKind::Split => "Split",
-        NodeKind::Exchange => "Exchange",
-    }
+    kind.short_name()
 }

@@ -182,6 +182,44 @@ pub enum NodeKind {
     Exchange,
 }
 
+impl NodeKind {
+    pub const fn short_name(&self) -> &'static str {
+        match self {
+            NodeKind::Reduce { .. } => "Reduce",
+            NodeKind::Scan { .. } => "Scan",
+            NodeKind::Filter { .. } => "Filter",
+            NodeKind::Project { .. } => "Project",
+            NodeKind::Join { .. } => "Join",
+            NodeKind::Hop { .. } => "Hop",
+            NodeKind::Graph { .. } => "Graph",
+            NodeKind::Match { .. } => "Match",
+            NodeKind::Search { .. } => "Search",
+            NodeKind::Rrf { .. } => "RRF",
+            NodeKind::Agg { .. } => "Agg",
+            NodeKind::Sort { .. } => "Sort",
+            NodeKind::Window { .. } => "Window",
+            NodeKind::Skip { .. } => "Skip",
+            NodeKind::Take { .. } => "Take",
+            NodeKind::Get { .. } => "Get",
+            NodeKind::Append { .. } => "Append",
+            NodeKind::InsertPack { .. } => "InsertPack",
+            NodeKind::Cas { .. } => "CAS",
+            NodeKind::BatchCAS { .. } => "BatchCAS",
+            NodeKind::IndexSeek { .. } => "IndexSeek",
+            NodeKind::FtsSeek { .. } => "FtsSeek",
+            NodeKind::Schema { .. } => "Schema",
+            NodeKind::Reembed { .. } => "Reembed",
+            NodeKind::Delete { .. } => "Delete",
+            NodeKind::DeleteEdge { .. } => "DeleteEdge",
+            NodeKind::Union => "Union",
+            NodeKind::Let { .. } => "Let",
+            NodeKind::Seq => "Seq",
+            NodeKind::Split => "Split",
+            NodeKind::Exchange => "Exchange",
+        }
+    }
+}
+
 pub fn plan_program(stmts: &[Stmt], cat: &Catalog) -> Result<Plan, Error> {
     if stmts.len() == 1 {
         return plan(&stmts[0], cat);
@@ -478,14 +516,20 @@ pub fn plan(stmt: &Stmt, cat: &Catalog) -> Result<Plan, Error> {
 }
 
 fn plan_pipeline(q: &Query, cat: &Catalog, implicit_take: bool) -> Result<Node, Error> {
-    let mut q = q.clone();
-    q.simplify_predicates();
-    plan_query_inner(&q, cat, implicit_take)
+    if q.needs_simplify() {
+        let mut q = q.clone();
+        q.simplify_predicates();
+        plan_query_inner(&q, cat, implicit_take)
+    } else {
+        plan_query_inner(q, cat, implicit_take)
+    }
 }
 
 fn plan_query(q: &Query, cat: &Catalog, explain: ExplainKind) -> Result<Plan, Error> {
     let mut q = crate::catalog::with_catalog_filter(q, cat);
-    q.to_mut().simplify_predicates();
+    if q.needs_simplify() {
+        q.to_mut().simplify_predicates();
+    }
     let cur = plan_query_inner(&q, cat, true)?;
     let root = reduce(cat, vec![Effect::Read], cur);
     Ok(Plan { root, explain })
@@ -844,7 +888,13 @@ fn plan_query_inner(q: &Query, cat: &Catalog, allow_implicit_take: bool) -> Resu
 }
 
 fn apply_filter(cur: Node, pred: &Pred, cat: &Catalog) -> Node {
-    let (point, rest) = extract_point(pred);
+    let col_name = match &cur.kind {
+        NodeKind::Scan { collection, .. }
+        | NodeKind::Get { collection, .. }
+        | NodeKind::IndexSeek { collection, .. } => collection.as_str(),
+        _ => "",
+    };
+    let (point, rest) = extract_point(pred, cat, col_name);
     let mut out = cur;
     if let Some((field, value)) = point.as_ref()
         && let NodeKind::Scan { collection, .. } = &out.kind
@@ -852,7 +902,7 @@ fn apply_filter(cur: Node, pred: &Pred, cat: &Catalog) -> Node {
         out = node(
             NodeKind::Get {
                 collection: collection.clone(),
-                key: format!("{field}={}", fmt_value(value)),
+                key: format!("{field}={value}"),
             },
             Backend::Idb,
             Effect::Read,
@@ -874,7 +924,7 @@ fn apply_filter(cur: Node, pred: &Pred, cat: &Catalog) -> Node {
     if let Some(rest) = rest.as_ref()
         && let NodeKind::Filter { pred: existing } = &out.kind
     {
-        let merged = format!("{existing} and {}", fmt_pred(rest));
+        let merged = format!("{existing} and {rest}");
         out.kind = NodeKind::Filter { pred: merged };
         return out;
     } else if let Some(rest) = rest {
@@ -882,20 +932,19 @@ fn apply_filter(cur: Node, pred: &Pred, cat: &Catalog) -> Node {
     } else if point.is_none()
         && let NodeKind::Filter { pred: existing } = &out.kind
     {
-        let merged = format!("{existing} and {}", fmt_pred(pred));
+        let merged = format!("{existing} and {pred}");
         out.kind = NodeKind::Filter { pred: merged };
         return out;
     } else if point.is_none() {
         out = filter_node(out, pred);
     }
-    let _ = cat;
     out
 }
 
 fn filter_node(inner: Node, pred: &Pred) -> Node {
     node(
         NodeKind::Filter {
-            pred: fmt_pred(pred),
+            pred: pred.to_string(),
         },
         Backend::Native,
         Effect::Read,
@@ -903,20 +952,24 @@ fn filter_node(inner: Node, pred: &Pred) -> Node {
     )
 }
 
-fn extract_point(pred: &Pred) -> (Option<(String, Value)>, Option<Pred>) {
+fn extract_point(pred: &Pred, cat: &Catalog, collection: &str) -> (Option<(String, Value)>, Option<Pred>) {
     match pred {
         Pred::Cmp {
             field,
             op: CmpOp::Eq,
             value,
         } if field.parts.len() == 1
-            && matches!(field.parts[0].as_str(), "id" | "uri")
+            && (matches!(field.parts[0].as_str(), "id" | "uri")
+                || cat
+                    .collection(collection)
+                    .and_then(|c| c.field(&field.parts[0]))
+                    .is_some_and(|f| f.unique))
             && matches!(value, Value::String(_)) =>
         {
-            (Some((field.as_str(), value.clone())), None)
+            (Some((field.parts[0].clone(), value.clone())), None)
         }
         Pred::And(a, b) => {
-            let (pa, ra) = extract_point(a);
+            let (pa, ra) = extract_point(a, cat, collection);
             if pa.is_some() {
                 let rest = Some(match ra {
                     Some(r) => r.and((**b).clone()),
@@ -924,7 +977,7 @@ fn extract_point(pred: &Pred) -> (Option<(String, Value)>, Option<Pred>) {
                 });
                 return (pa, rest);
             }
-            let (pb, rb) = extract_point(b);
+            let (pb, rb) = extract_point(b, cat, collection);
             if pb.is_some() {
                 let rest = Some(match rb {
                     Some(r) => (**a).clone().and(r),
@@ -1065,7 +1118,7 @@ fn collect_pred_fields(pred: &Pred, needed: &mut Vec<String>) {
     let mut fields = Vec::new();
     pred.walk_fields(&mut fields);
     for f in fields {
-        push_field(needed, &f.as_str());
+        push_field(needed, &f.as_cow_str());
     }
 }
 
@@ -1077,13 +1130,13 @@ fn push_field(out: &mut Vec<String>, name: &str) {
 
 fn point_or_scan(collection: &str, pred: Option<&Pred>, cat: &Catalog) -> Node {
     if let Some(p) = pred
-        && let (point, rest) = extract_point(p)
+        && let (point, rest) = extract_point(p, cat, collection)
         && let Some((field, value)) = point
     {
         let mut n = node(
             NodeKind::Get {
                 collection: collection.to_string(),
-                key: format!("{field}={}", fmt_value(&value)),
+                key: format!("{field}={value}"),
             },
             Backend::Idb,
             Effect::Read,
@@ -1240,52 +1293,9 @@ fn decl_detail(d: &Decl) -> String {
 }
 
 pub fn fmt_pred(pred: &Pred) -> String {
-    match pred {
-        Pred::And(a, b) => format!("{} and {}", fmt_pred(a), fmt_pred(b)),
-        Pred::Or(a, b) => format!("{} or {}", fmt_pred(a), fmt_pred(b)),
-        Pred::Not(inner) => format!("not ({})", fmt_pred(inner)),
-        Pred::Cmp { field, op, value } => {
-            format!("{} {} {}", field.as_str(), op.as_str(), fmt_value(value))
-        }
-        Pred::IsNull { field, negated } => {
-            if *negated {
-                format!("{} is not null", field.as_str())
-            } else {
-                format!("{} is null", field.as_str())
-            }
-        }
-        Pred::In { field, values } => {
-            let vals: Vec<String> = values.iter().map(fmt_value).collect();
-            format!("{} in [{}]", field.as_str(), vals.join(", "))
-        }
-        Pred::Has { field, ci, needle } => {
-            if *ci {
-                format!("{} has ci {:?}", field.as_str(), needle)
-            } else {
-                format!("{} has {:?}", field.as_str(), needle)
-            }
-        }
-        Pred::Contains { field, needle } => {
-            format!("{} ~ {:?}", field.as_str(), needle)
-        }
-        Pred::Regex {
-            field,
-            pattern,
-            flags,
-        } => format!("{} ~ /{pattern}/{flags}", field.as_str()),
-    }
+    pred.to_string()
 }
 
 pub fn fmt_value(v: &Value) -> String {
-    match v {
-        Value::String(s) => format!("{s:?}"),
-        Value::Int(n) => n.to_string(),
-        Value::Float(n) => n.to_string(),
-        Value::Bool(b) => b.to_string(),
-        Value::Timestamp(millis) => format!("timestamp({millis})"),
-        Value::Now => "now".into(),
-        Value::NowMinus(d) => format!("now - {}", d.display()),
-        Value::Duration(d) => d.display(),
-        Value::Name(n) => n.clone(),
-    }
+    v.to_string()
 }

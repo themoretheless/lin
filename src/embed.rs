@@ -9,7 +9,7 @@ use std::collections::BinaryHeap;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, OnceLock};
 
-use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
+use rustc_hash::{FxHashMap, FxHasher};
 
 /// Text → dense vector. Must be `Send + Sync` for [`crate::exec::ReadDb`] sharing.
 pub trait Embedder: Send + Sync {
@@ -38,6 +38,16 @@ pub trait Embedder: Send + Sync {
         let texts = rows.iter().map(|r| row_embed_text(r)).collect::<Vec<_>>();
         let refs = texts.iter().map(|t| t.as_ref()).collect::<Vec<_>>();
         self.embed_batch(&refs)
+    }
+
+    /// Embed a contiguous mutable slice of rows in-place when all rows need embedding.
+    fn embed_rows_in_place(&self, _rows: &mut [crate::store::Row]) -> bool {
+        false
+    }
+
+    /// If this embedder is a local `HashingEmbedder`, returns `Some(dim)`.
+    fn hashing_dim(&self) -> Option<usize> {
+        None
     }
 }
 
@@ -102,12 +112,15 @@ impl Embedder for HashingEmbedder {
             return self.embed_batch_serial(texts);
         }
         let chunk_size = (n + threads - 1) / threads;
+        let chunks: Vec<&[&str]> = texts.chunks(chunk_size).collect();
+        let (first, rest) = chunks.split_first().unwrap();
         std::thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(threads);
-            for chunk in texts.chunks(chunk_size) {
+            let mut handles = Vec::with_capacity(rest.len());
+            for &chunk in rest {
                 handles.push(scope.spawn(move || self.embed_batch_serial(chunk)));
             }
             let mut out = Vec::with_capacity(n);
+            out.extend(self.embed_batch_serial(first));
             for handle in handles {
                 out.extend(handle.join().expect("embedding worker panicked"));
             }
@@ -129,18 +142,163 @@ impl Embedder for HashingEmbedder {
             return self.embed_rows_serial(rows);
         }
         let chunk_size = (n + threads - 1) / threads;
+        let chunks: Vec<&[&crate::store::Row]> = rows.chunks(chunk_size).collect();
+        let (first, rest) = chunks.split_first().unwrap();
         std::thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(threads);
-            for chunk in rows.chunks(chunk_size) {
+            let mut handles = Vec::with_capacity(rest.len());
+            for &chunk in rest {
                 handles.push(scope.spawn(move || self.embed_rows_serial(chunk)));
             }
             let mut out = Vec::with_capacity(n);
+            out.extend(self.embed_rows_serial(first));
             for handle in handles {
                 out.extend(handle.join().expect("embedding worker panicked"));
             }
             out
         })
     }
+
+    fn embed_rows_in_place(&self, rows: &mut [crate::store::Row]) -> bool {
+        let n = rows.len();
+        if n < 256 {
+            self.embed_rows_slice_in_place(rows);
+            return true;
+        }
+        if !embed_rows_in_place_pooled(self.dim, rows) {
+            self.embed_rows_slice_in_place(rows);
+        }
+        true
+    }
+
+    fn hashing_dim(&self) -> Option<usize> {
+        Some(self.dim)
+    }
+}
+
+#[inline]
+pub(crate) fn embed_texts_hashing(dim: usize, texts: [Option<&str>; 3]) -> Arc<[f32]> {
+    EMBED_SCRATCH.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        let (scratch, lower, text_buf) = &mut *guard;
+        scratch.ensure_dim(dim);
+        let dummy = HashingEmbedder {
+            id: String::new(),
+            dim,
+        };
+        let bytes = texts.iter().flatten().map(|t| t.len()).sum::<usize>();
+        if bytes == 0 {
+            return scratch.finish();
+        }
+        if let Some(first) = texts.iter().position(|t| t.is_some_and(|s| !s.is_empty()))
+            && texts[first + 1..].iter().all(Option::is_none)
+        {
+            dummy.fill(scratch, crate::fts::lowercased(texts[first].unwrap(), lower));
+            return scratch.finish();
+        }
+        text_buf.clear();
+        text_buf.reserve(bytes + 2);
+        for text in texts.into_iter().flatten() {
+            if !text_buf.is_empty() {
+                text_buf.push(' ');
+            }
+            text_buf.push_str(text);
+        }
+        dummy.fill(scratch, crate::fts::lowercased(text_buf, lower));
+        scratch.finish()
+    })
+}
+
+struct EmbedInPlaceJob {
+    dim: usize,
+    ptr: usize,
+    len: usize,
+}
+
+struct EmbedPool {
+    workers: Vec<std::sync::mpsc::SyncSender<EmbedInPlaceJob>>,
+    done_rx: std::sync::mpsc::Receiver<()>,
+}
+
+fn embed_rows_in_place_pooled(dim: usize, rows: &mut [crate::store::Row]) -> bool {
+    static POOL: OnceLock<std::sync::Mutex<Option<EmbedPool>>> = OnceLock::new();
+    let mutex = POOL.get_or_init(|| {
+        let threads = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(1)
+            .min(4);
+        if threads <= 1 {
+            return std::sync::Mutex::new(None);
+        }
+        let num_workers = threads - 1;
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel::<()>(num_workers);
+        let mut workers = Vec::with_capacity(num_workers);
+        for idx in 0..num_workers {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<EmbedInPlaceJob>(1);
+            let done = done_tx.clone();
+            if std::thread::Builder::new()
+                .name(format!("lin-embed-{idx}"))
+                .spawn(move || {
+                    let mut dummy = HashingEmbedder {
+                        id: String::new(),
+                        dim: 768,
+                    };
+                    while let Ok(job) = rx.recv() {
+                        dummy.dim = job.dim;
+                        let slice = unsafe {
+                            std::slice::from_raw_parts_mut(
+                                job.ptr as *mut crate::store::Row,
+                                job.len,
+                            )
+                        };
+                        dummy.embed_rows_slice_in_place(slice);
+                        let _ = done.send(());
+                    }
+                })
+                .is_ok()
+            {
+                workers.push(tx);
+            }
+        }
+        if workers.is_empty() {
+            std::sync::Mutex::new(None)
+        } else {
+            std::sync::Mutex::new(Some(EmbedPool { workers, done_rx }))
+        }
+    });
+
+    let Ok(guard) = mutex.try_lock() else {
+        return false;
+    };
+    let Some(pool) = guard.as_ref() else {
+        return false;
+    };
+    let total_ways = pool.workers.len() + 1;
+    let n = rows.len();
+    let chunk_size = (n + total_ways - 1) / total_ways;
+    let mut chunks = rows.chunks_mut(chunk_size);
+    let Some(first_chunk) = chunks.next() else {
+        return true;
+    };
+    let mut dispatched = 0usize;
+    for (worker, chunk) in pool.workers.iter().zip(chunks) {
+        let job = EmbedInPlaceJob {
+            dim,
+            ptr: chunk.as_mut_ptr() as usize,
+            len: chunk.len(),
+        };
+        if worker.send(job).is_ok() {
+            dispatched += 1;
+        }
+    }
+    let dummy = HashingEmbedder {
+        id: String::new(),
+        dim,
+    };
+    dummy.embed_rows_slice_in_place(first_chunk);
+    for _ in 0..dispatched {
+        let _ = pool.done_rx.recv();
+    }
+    true
 }
 
 impl HashingEmbedder {
@@ -156,6 +314,32 @@ impl HashingEmbedder {
             }
             out
         })
+    }
+
+    fn embed_rows_slice_in_place(&self, rows: &mut [crate::store::Row]) {
+        EMBED_SCRATCH.with(|cell| {
+            let mut guard = cell.borrow_mut();
+            let (scratch, lower, text_buf) = &mut *guard;
+            scratch.ensure_dim(self.dim);
+            for row in rows {
+                let vec = match prepare_row_embed_text(row, text_buf) {
+                    RowEmbedText::Empty => scratch.finish(),
+                    RowEmbedText::Borrowed(text) => {
+                        self.fill(scratch, crate::fts::lowercased(text, lower));
+                        scratch.finish()
+                    }
+                    RowEmbedText::Appended => {
+                        self.fill(scratch, crate::fts::lowercased(text_buf, lower));
+                        scratch.finish()
+                    }
+                };
+                if let Some(cell) = row.get_mut("embedding") {
+                    *cell = crate::store::Cell::Vec(vec);
+                } else {
+                    row.insert("embedding".into(), crate::store::Cell::Vec(vec));
+                }
+            }
+        });
     }
 
     fn embed_rows_serial(&self, rows: &[&crate::store::Row]) -> Vec<Arc<[f32]>> {
@@ -624,18 +808,83 @@ impl Ord for MinSimNode {
     }
 }
 
-#[allow(dead_code)]
+/// Scalar element trait for HNSW vector storage (`f32` or quantized `i8`).
+pub trait HnswScalar: Copy + Sized + 'static {
+    fn sim(a: &[Self], b: &[Self]) -> f64;
+}
+
+impl HnswScalar for f32 {
+    #[inline]
+    fn sim(a: &[Self], b: &[Self]) -> f64 {
+        cosine(a, b)
+    }
+}
+
+impl HnswScalar for i8 {
+    #[inline]
+    fn sim(a: &[Self], b: &[Self]) -> f64 {
+        dot_sq8(a, b)
+    }
+}
+
+struct HnswSearchScratch {
+    visited_gen: Vec<u32>,
+    cur_gen: u32,
+    candidates: BinaryHeap<MaxSimNode>,
+    w: BinaryHeap<MinSimNode>,
+}
+
+impl HnswSearchScratch {
+    fn new() -> Self {
+        Self {
+            visited_gen: Vec::new(),
+            cur_gen: 0,
+            candidates: BinaryHeap::new(),
+            w: BinaryHeap::new(),
+        }
+    }
+
+    #[inline]
+    fn prepare(&mut self, node_count: usize) {
+        if self.visited_gen.len() < node_count {
+            self.visited_gen.resize(node_count.next_power_of_two().max(64), 0);
+        }
+        self.cur_gen = self.cur_gen.wrapping_add(1);
+        if self.cur_gen == 0 {
+            self.visited_gen.fill(0);
+            self.cur_gen = 1;
+        }
+        self.candidates.clear();
+        self.w.clear();
+    }
+
+    #[inline]
+    fn visit(&mut self, idx: usize) -> bool {
+        if self.visited_gen[idx] == self.cur_gen {
+            false
+        } else {
+            self.visited_gen[idx] = self.cur_gen;
+            true
+        }
+    }
+}
+
+thread_local! {
+    static HNSW_SCRATCH: std::cell::RefCell<HnswSearchScratch> =
+        std::cell::RefCell::new(HnswSearchScratch::new());
+}
+
 #[derive(Clone, Debug)]
-struct HnswNode {
+struct HnswNode<T> {
     id: usize,
-    vector: Arc<[f32]>,
+    vector: Arc<[T]>,
     neighbors: Vec<Vec<usize>>,
 }
 
-/// Hierarchical Navigable Small World (HNSW) index for approximate nearest neighbor search.
+/// Generic Hierarchical Navigable Small World (HNSW) graph.
 #[derive(Clone, Debug)]
-pub struct HnswIndex {
-    nodes: Vec<HnswNode>,
+pub struct HnswGraph<T> {
+    nodes: Vec<HnswNode<T>>,
     id_to_idx: FxHashMap<usize, usize>,
     enter_point: Option<usize>,
     max_level: usize,
@@ -645,13 +894,22 @@ pub struct HnswIndex {
     ml: f64,
 }
 
-impl Default for HnswIndex {
+/// Hierarchical Navigable Small World (HNSW) index for approximate nearest neighbor search.
+pub type HnswIndex = HnswGraph<f32>;
+
+/// Hierarchical Navigable Small World (HNSW) index with 8-bit Scalar Quantization (SQ8).
+///
+/// Reduces vector memory consumption by 75% (1 byte per dimension vs 4 bytes for `f32`)
+/// while retaining > 98% ANN recall with integer dot product acceleration.
+pub type HnswIndexSq8 = HnswGraph<i8>;
+
+impl<T: HnswScalar> Default for HnswGraph<T> {
     fn default() -> Self {
         Self::new(16, 64)
     }
 }
 
-impl HnswIndex {
+impl<T: HnswScalar> HnswGraph<T> {
     pub fn new(m: usize, ef_construction: usize) -> Self {
         let m = m.max(4);
         let m0 = m * 2;
@@ -682,9 +940,9 @@ impl HnswIndex {
     /// Estimated resident memory in bytes (nodes, vectors, adjacency graph, and lookup map).
     pub fn resident_memory(&self) -> usize {
         let mut total = std::mem::size_of::<Self>();
-        total += self.nodes.capacity() * std::mem::size_of::<HnswNode>();
+        total += self.nodes.capacity() * std::mem::size_of::<HnswNode<T>>();
         for node in &self.nodes {
-            total += node.vector.len() * 4;
+            total += node.vector.len() * std::mem::size_of::<T>();
             for level in &node.neighbors {
                 total += level.capacity() * std::mem::size_of::<usize>();
             }
@@ -719,7 +977,7 @@ impl HnswIndex {
         self.max_level = 0;
     }
 
-    pub fn build(items: impl IntoIterator<Item = (usize, Arc<[f32]>)>) -> Self {
+    pub fn build(items: impl IntoIterator<Item = (usize, Arc<[T]>)>) -> Self {
         let mut index = Self::default();
         for (id, vec) in items {
             index.insert(id, vec);
@@ -736,7 +994,7 @@ impl HnswIndex {
         (-r.ln() * self.ml).floor() as usize
     }
 
-    pub fn insert(&mut self, id: usize, vector: Arc<[f32]>) {
+    pub fn insert(&mut self, id: usize, vector: Arc<[T]>) {
         if let Some(&existing_idx) = self.id_to_idx.get(&id) {
             self.nodes[existing_idx].vector = vector;
             return;
@@ -763,12 +1021,12 @@ impl HnswIndex {
 
         // 1. Greedy search from max_level down to node_level + 1
         for level in (node_level + 1..=curr_max_level).rev() {
-            let mut curr_sim = cosine(&vector, &self.nodes[curr].vector);
+            let mut curr_sim = T::sim(&vector, &self.nodes[curr].vector);
             loop {
                 let mut changed = false;
                 if level < self.nodes[curr].neighbors.len() {
                     for &nbr in &self.nodes[curr].neighbors[level] {
-                        let sim = cosine(&vector, &self.nodes[nbr].vector);
+                        let sim = T::sim(&vector, &self.nodes[nbr].vector);
                         if sim > curr_sim {
                             curr_sim = sim;
                             curr = nbr;
@@ -813,52 +1071,56 @@ impl HnswIndex {
 
     fn search_layer(
         &self,
-        query: &[f32],
+        query: &[T],
         entry_points: &[usize],
         ef: usize,
         level: usize,
     ) -> Vec<MaxSimNode> {
-        let mut visited = FxHashSet::default();
-        let mut candidates = BinaryHeap::<MaxSimNode>::new();
-        let mut w = BinaryHeap::<MinSimNode>::new();
+        HNSW_SCRATCH.with(|cell| {
+            let mut scratch = cell.borrow_mut();
+            scratch.prepare(self.nodes.len());
 
-        for &ep in entry_points {
-            if visited.insert(ep) {
-                let sim = cosine(query, &self.nodes[ep].vector);
-                candidates.push(MaxSimNode { sim, idx: ep });
-                w.push(MinSimNode { sim, idx: ep });
-            }
-        }
-
-        while let Some(c) = candidates.pop() {
-            let worst_in_w = w.peek().map(|d| d.sim).unwrap_or(f64::NEG_INFINITY);
-            if c.sim < worst_in_w && w.len() >= ef {
-                break;
+            for &ep in entry_points {
+                if scratch.visit(ep) {
+                    let sim = T::sim(query, &self.nodes[ep].vector);
+                    scratch.candidates.push(MaxSimNode { sim, idx: ep });
+                    scratch.w.push(MinSimNode { sim, idx: ep });
+                }
             }
 
-            if level < self.nodes[c.idx].neighbors.len() {
-                for &nbr in &self.nodes[c.idx].neighbors[level] {
-                    if visited.insert(nbr) {
-                        let sim = cosine(query, &self.nodes[nbr].vector);
-                        let worst_in_w = w.peek().map(|x| x.sim).unwrap_or(f64::NEG_INFINITY);
-                        if sim > worst_in_w || w.len() < ef {
-                            candidates.push(MaxSimNode { sim, idx: nbr });
-                            w.push(MinSimNode { sim, idx: nbr });
-                            if w.len() > ef {
-                                w.pop();
+            while let Some(c) = scratch.candidates.pop() {
+                let worst_in_w = scratch.w.peek().map(|d| d.sim).unwrap_or(f64::NEG_INFINITY);
+                if c.sim < worst_in_w && scratch.w.len() >= ef {
+                    break;
+                }
+
+                if level < self.nodes[c.idx].neighbors.len() {
+                    for &nbr in &self.nodes[c.idx].neighbors[level] {
+                        if scratch.visit(nbr) {
+                            let sim = T::sim(query, &self.nodes[nbr].vector);
+                            let worst_in_w =
+                                scratch.w.peek().map(|x| x.sim).unwrap_or(f64::NEG_INFINITY);
+                            if sim > worst_in_w || scratch.w.len() < ef {
+                                scratch.candidates.push(MaxSimNode { sim, idx: nbr });
+                                scratch.w.push(MinSimNode { sim, idx: nbr });
+                                if scratch.w.len() > ef {
+                                    scratch.w.pop();
+                                }
                             }
                         }
                     }
                 }
             }
-        }
 
-        w.into_iter()
-            .map(|n| MaxSimNode {
-                sim: n.sim,
-                idx: n.idx,
-            })
-            .collect()
+            scratch
+                .w
+                .drain()
+                .map(|n| MaxSimNode {
+                    sim: n.sim,
+                    idx: n.idx,
+                })
+                .collect()
+        })
     }
 
     fn select_neighbors(&self, candidates: &[MaxSimNode], max_conn: usize) -> Vec<usize> {
@@ -874,7 +1136,7 @@ impl HnswIndex {
         let mut scored: Vec<MaxSimNode> = nbrs
             .iter()
             .map(|&nbr| MaxSimNode {
-                sim: cosine(&node_vec, &self.nodes[nbr].vector),
+                sim: T::sim(&node_vec, &self.nodes[nbr].vector),
                 idx: nbr,
             })
             .collect();
@@ -883,9 +1145,7 @@ impl HnswIndex {
         self.nodes[node_idx].neighbors[level] = scored.into_iter().map(|d| d.idx).collect();
     }
 
-    /// Search for the `k` approximate nearest neighbors to `query`.
-    /// Returns pairs of `(cosine_similarity, external_id)` sorted descending by similarity.
-    pub fn search(&self, query: &[f32], k: usize, ef_search: usize) -> Vec<(f64, usize)> {
+    fn search_raw(&self, query: &[T], k: usize, ef_search: usize) -> Vec<(f64, usize)> {
         if k == 0 || self.nodes.is_empty() {
             return Vec::new();
         }
@@ -895,7 +1155,7 @@ impl HnswIndex {
                 .nodes
                 .iter()
                 .filter(|n| n.id != usize::MAX)
-                .map(|n| (cosine(query, &n.vector), n.id))
+                .map(|n| (T::sim(query, &n.vector), n.id))
                 .filter(|(s, _)| *s > 0.0)
                 .collect();
             if scored.len() > k {
@@ -920,12 +1180,12 @@ impl HnswIndex {
         };
 
         for level in (1..=self.max_level).rev() {
-            let mut curr_sim = cosine(query, &self.nodes[curr].vector);
+            let mut curr_sim = T::sim(query, &self.nodes[curr].vector);
             loop {
                 let mut changed = false;
                 if level < self.nodes[curr].neighbors.len() {
                     for &nbr in &self.nodes[curr].neighbors[level] {
-                        let sim = cosine(query, &self.nodes[nbr].vector);
+                        let sim = T::sim(query, &self.nodes[nbr].vector);
                         if sim > curr_sim {
                             curr_sim = sim;
                             curr = nbr;
@@ -965,6 +1225,14 @@ impl HnswIndex {
 
         results
     }
+}
+
+impl HnswGraph<f32> {
+    /// Search for the `k` approximate nearest neighbors to `query`.
+    /// Returns pairs of `(cosine_similarity, external_id)` sorted descending by similarity.
+    pub fn search(&self, query: &[f32], k: usize, ef_search: usize) -> Vec<(f64, usize)> {
+        self.search_raw(query, k, ef_search)
+    }
 
     /// Convert this `f32` HNSW index into a compact SQ8-quantized HNSW index.
     ///
@@ -973,13 +1241,13 @@ impl HnswIndex {
         let nodes = self
             .nodes
             .iter()
-            .map(|n| HnswNodeSq8 {
+            .map(|n| HnswNode {
                 id: n.id,
                 vector: quantize_sq8(&n.vector),
                 neighbors: n.neighbors.clone(),
             })
             .collect();
-        HnswIndexSq8 {
+        HnswGraph {
             nodes,
             id_to_idx: self.id_to_idx.clone(),
             enter_point: self.enter_point,
@@ -992,9 +1260,27 @@ impl HnswIndex {
     }
 
     /// Convert this `f32` HNSW index into a compact SQ8-quantized HNSW index,
-    /// consuming `self`.
+    /// consuming `self` without cloning the graph adjacency lists.
     pub fn into_sq8(self) -> HnswIndexSq8 {
-        self.to_sq8()
+        let nodes = self
+            .nodes
+            .into_iter()
+            .map(|n| HnswNode {
+                id: n.id,
+                vector: quantize_sq8(&n.vector),
+                neighbors: n.neighbors,
+            })
+            .collect();
+        HnswGraph {
+            nodes,
+            id_to_idx: self.id_to_idx,
+            enter_point: self.enter_point,
+            max_level: self.max_level,
+            m: self.m,
+            m0: self.m0,
+            ef_construction: self.ef_construction,
+            ml: self.ml,
+        }
     }
 }
 
@@ -1054,112 +1340,7 @@ pub fn dot_sq8(a: &[i8], b: &[i8]) -> f64 {
     sim.clamp(-1.0, 1.0)
 }
 
-#[allow(dead_code)]
-#[derive(Clone, Debug)]
-struct HnswNodeSq8 {
-    id: usize,
-    vector: Arc<[i8]>,
-    neighbors: Vec<Vec<usize>>,
-}
-
-/// Hierarchical Navigable Small World (HNSW) index with 8-bit Scalar Quantization (SQ8).
-///
-/// Reduces vector memory consumption by 75% (1 byte per dimension vs 4 bytes for `f32`)
-/// while retaining > 98% ANN recall with integer dot product acceleration.
-#[derive(Clone, Debug)]
-pub struct HnswIndexSq8 {
-    nodes: Vec<HnswNodeSq8>,
-    id_to_idx: FxHashMap<usize, usize>,
-    enter_point: Option<usize>,
-    max_level: usize,
-    m: usize,
-    m0: usize,
-    ef_construction: usize,
-    ml: f64,
-}
-
-impl Default for HnswIndexSq8 {
-    fn default() -> Self {
-        Self::new(16, 64)
-    }
-}
-
-impl HnswIndexSq8 {
-    pub fn new(m: usize, ef_construction: usize) -> Self {
-        let m = m.max(4);
-        let m0 = m * 2;
-        let ef_construction = ef_construction.max(m);
-        let ml = 1.0 / (m as f64).ln();
-        Self {
-            nodes: Vec::new(),
-            id_to_idx: FxHashMap::default(),
-            enter_point: None,
-            max_level: 0,
-            m,
-            m0,
-            ef_construction,
-            ml,
-        }
-    }
-
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.id_to_idx.len()
-    }
-
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.id_to_idx.is_empty()
-    }
-
-    /// Estimated resident memory in bytes (nodes, quantized vectors, adjacency graph, and lookup map).
-    pub fn resident_memory(&self) -> usize {
-        let mut total = std::mem::size_of::<Self>();
-        total += self.nodes.capacity() * std::mem::size_of::<HnswNodeSq8>();
-        for node in &self.nodes {
-            total += node.vector.len();
-            for level in &node.neighbors {
-                total += level.capacity() * std::mem::size_of::<usize>();
-            }
-        }
-        total += self.id_to_idx.capacity() * (std::mem::size_of::<usize>() * 2 + 8);
-        total
-    }
-
-    pub fn remove(&mut self, id: usize) {
-        if let Some(node_idx) = self.id_to_idx.remove(&id) {
-            self.nodes[node_idx].id = usize::MAX;
-            if self.enter_point == Some(node_idx) {
-                self.enter_point = self.id_to_idx.values().next().copied();
-            }
-        }
-    }
-
-    pub fn move_id(&mut self, from: usize, to: usize) {
-        if from == to {
-            return;
-        }
-        if let Some(node_idx) = self.id_to_idx.remove(&from) {
-            self.nodes[node_idx].id = to;
-            self.id_to_idx.insert(to, node_idx);
-        }
-    }
-
-    pub fn clear(&mut self) {
-        self.nodes.clear();
-        self.id_to_idx.clear();
-        self.enter_point = None;
-        self.max_level = 0;
-    }
-
-    pub fn build(items: impl IntoIterator<Item = (usize, Arc<[i8]>)>) -> Self {
-        let mut index = Self::default();
-        for (id, vec) in items {
-            index.insert(id, vec);
-        }
-        index
-    }
-
+impl HnswGraph<i8> {
     pub fn build_f32(items: impl IntoIterator<Item = (usize, Arc<[f32]>)>) -> Self {
         let mut index = Self::default();
         for (id, vec) in items {
@@ -1168,165 +1349,8 @@ impl HnswIndexSq8 {
         index
     }
 
-    fn random_level(&self, id: usize) -> usize {
-        let mut h = FxHasher::default();
-        id.hash(&mut h);
-        let raw = h.finish() & 0x000f_ffff_ffff_ffff;
-        let r = ((raw as f64) + 1.0) / ((0x0010_0000_0000_0000u64) as f64);
-        let r = r.clamp(1e-9, 1.0);
-        (-r.ln() * self.ml).floor() as usize
-    }
-
-    pub fn insert(&mut self, id: usize, vector: Arc<[i8]>) {
-        if let Some(&existing_idx) = self.id_to_idx.get(&id) {
-            self.nodes[existing_idx].vector = vector;
-            return;
-        }
-
-        let node_level = self.random_level(id);
-        let new_idx = self.nodes.len();
-        self.id_to_idx.insert(id, new_idx);
-
-        let new_node = HnswNodeSq8 {
-            id,
-            vector: Arc::clone(&vector),
-            neighbors: vec![Vec::new(); node_level + 1],
-        };
-        self.nodes.push(new_node);
-
-        let Some(mut curr) = self.enter_point else {
-            self.enter_point = Some(new_idx);
-            self.max_level = node_level;
-            return;
-        };
-
-        let curr_max_level = self.max_level;
-
-        // 1. Greedy search from max_level down to node_level + 1
-        for level in (node_level + 1..=curr_max_level).rev() {
-            let mut curr_sim = dot_sq8(&vector, &self.nodes[curr].vector);
-            loop {
-                let mut changed = false;
-                if level < self.nodes[curr].neighbors.len() {
-                    for &nbr in &self.nodes[curr].neighbors[level] {
-                        let sim = dot_sq8(&vector, &self.nodes[nbr].vector);
-                        if sim > curr_sim {
-                            curr_sim = sim;
-                            curr = nbr;
-                            changed = true;
-                        }
-                    }
-                }
-                if !changed {
-                    break;
-                }
-            }
-        }
-
-        // 2. Search layer and connect from min(curr_max_level, node_level) down to 0
-        let top_connect_level = curr_max_level.min(node_level);
-        let mut entry_points = vec![curr];
-
-        for level in (0..=top_connect_level).rev() {
-            let candidates =
-                self.search_layer_sq8(&vector, &entry_points, self.ef_construction, level);
-            let max_conn = if level == 0 { self.m0 } else { self.m };
-            let neighbors = self.select_neighbors(&candidates, max_conn);
-
-            self.nodes[new_idx].neighbors[level] = neighbors.clone();
-
-            for &nbr in &neighbors {
-                if level < self.nodes[nbr].neighbors.len() {
-                    self.nodes[nbr].neighbors[level].push(new_idx);
-                    if self.nodes[nbr].neighbors[level].len() > max_conn {
-                        self.prune_neighbors(nbr, level, max_conn);
-                    }
-                }
-            }
-
-            entry_points = candidates.into_iter().map(|n| n.idx).collect();
-        }
-
-        if node_level > self.max_level {
-            self.max_level = node_level;
-            self.enter_point = Some(new_idx);
-        }
-    }
-
     pub fn insert_f32(&mut self, id: usize, vector: &[f32]) {
         self.insert(id, quantize_sq8(vector));
-    }
-
-    fn search_layer_sq8(
-        &self,
-        query: &[i8],
-        entry_points: &[usize],
-        ef: usize,
-        level: usize,
-    ) -> Vec<MaxSimNode> {
-        let mut visited = FxHashSet::default();
-        let mut candidates = BinaryHeap::<MaxSimNode>::new();
-        let mut w = BinaryHeap::<MinSimNode>::new();
-
-        for &ep in entry_points {
-            if visited.insert(ep) {
-                let sim = dot_sq8(query, &self.nodes[ep].vector);
-                candidates.push(MaxSimNode { sim, idx: ep });
-                w.push(MinSimNode { sim, idx: ep });
-            }
-        }
-
-        while let Some(c) = candidates.pop() {
-            let worst_in_w = w.peek().map(|d| d.sim).unwrap_or(f64::NEG_INFINITY);
-            if c.sim < worst_in_w && w.len() >= ef {
-                break;
-            }
-
-            if level < self.nodes[c.idx].neighbors.len() {
-                for &nbr in &self.nodes[c.idx].neighbors[level] {
-                    if visited.insert(nbr) {
-                        let sim = dot_sq8(query, &self.nodes[nbr].vector);
-                        let worst_in_w = w.peek().map(|x| x.sim).unwrap_or(f64::NEG_INFINITY);
-                        if sim > worst_in_w || w.len() < ef {
-                            candidates.push(MaxSimNode { sim, idx: nbr });
-                            w.push(MinSimNode { sim, idx: nbr });
-                            if w.len() > ef {
-                                w.pop();
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        w.into_iter()
-            .map(|n| MaxSimNode {
-                sim: n.sim,
-                idx: n.idx,
-            })
-            .collect()
-    }
-
-    fn select_neighbors(&self, candidates: &[MaxSimNode], max_conn: usize) -> Vec<usize> {
-        let mut sorted = candidates.to_vec();
-        sorted.sort_by(|a, b| b.sim.partial_cmp(&a.sim).unwrap_or(Ordering::Equal));
-        sorted.truncate(max_conn);
-        sorted.into_iter().map(|n| n.idx).collect()
-    }
-
-    fn prune_neighbors(&mut self, node_idx: usize, level: usize, max_conn: usize) {
-        let node_vec = Arc::clone(&self.nodes[node_idx].vector);
-        let nbrs = &self.nodes[node_idx].neighbors[level];
-        let mut scored: Vec<MaxSimNode> = nbrs
-            .iter()
-            .map(|&nbr| MaxSimNode {
-                sim: dot_sq8(&node_vec, &self.nodes[nbr].vector),
-                idx: nbr,
-            })
-            .collect();
-        scored.sort_by(|a, b| b.sim.partial_cmp(&a.sim).unwrap_or(Ordering::Equal));
-        scored.truncate(max_conn);
-        self.nodes[node_idx].neighbors[level] = scored.into_iter().map(|d| d.idx).collect();
     }
 
     /// Search for `k` approximate nearest neighbors with a raw `f32` query vector.
@@ -1339,84 +1363,7 @@ impl HnswIndexSq8 {
 
     /// Search for `k` approximate nearest neighbors with an already quantized `i8` query vector.
     pub fn search_sq8(&self, query: &[i8], k: usize, ef_search: usize) -> Vec<(f64, usize)> {
-        if k == 0 || self.nodes.is_empty() {
-            return Vec::new();
-        }
-
-        if self.id_to_idx.len() <= k.max(32) {
-            let mut scored: Vec<(f64, usize)> = self
-                .nodes
-                .iter()
-                .filter(|n| n.id != usize::MAX)
-                .map(|n| (dot_sq8(query, &n.vector), n.id))
-                .filter(|(s, _)| *s > 0.0)
-                .collect();
-            if scored.len() > k {
-                scored.select_nth_unstable_by(k - 1, |a, b| {
-                    b.0.partial_cmp(&a.0)
-                        .unwrap_or(Ordering::Equal)
-                        .then_with(|| a.1.cmp(&b.1))
-                });
-                scored.truncate(k);
-            }
-            scored.sort_by(|a, b| {
-                b.0.partial_cmp(&a.0)
-                    .unwrap_or(Ordering::Equal)
-                    .then_with(|| a.1.cmp(&b.1))
-            });
-            return scored;
-        }
-
-        let mut curr = match self.enter_point {
-            Some(ep) => ep,
-            None => return Vec::new(),
-        };
-
-        for level in (1..=self.max_level).rev() {
-            let mut curr_sim = dot_sq8(query, &self.nodes[curr].vector);
-            loop {
-                let mut changed = false;
-                if level < self.nodes[curr].neighbors.len() {
-                    for &nbr in &self.nodes[curr].neighbors[level] {
-                        let sim = dot_sq8(query, &self.nodes[nbr].vector);
-                        if sim > curr_sim {
-                            curr_sim = sim;
-                            curr = nbr;
-                            changed = true;
-                        }
-                    }
-                }
-                if !changed {
-                    break;
-                }
-            }
-        }
-
-        let ef = ef_search.max(k).max(16);
-        let candidates = self.search_layer_sq8(query, &[curr], ef, 0);
-
-        let mut results: Vec<(f64, usize)> = candidates
-            .into_iter()
-            .map(|n| (n.sim, self.nodes[n.idx].id))
-            .filter(|(s, id)| *s > 0.0 && *id != usize::MAX)
-            .collect();
-
-        if results.len() > k {
-            results.select_nth_unstable_by(k - 1, |a, b| {
-                b.0.partial_cmp(&a.0)
-                    .unwrap_or(Ordering::Equal)
-                    .then_with(|| a.1.cmp(&b.1))
-            });
-            results.truncate(k);
-        }
-
-        results.sort_by(|a, b| {
-            b.0.partial_cmp(&a.0)
-                .unwrap_or(Ordering::Equal)
-                .then_with(|| a.1.cmp(&b.1))
-        });
-
-        results
+        self.search_raw(query, k, ef_search)
     }
 }
 

@@ -1163,29 +1163,55 @@ fn encode_text(text: &str, fold: bool, words: bool) -> Vec<u32> {
     if !words {
         return text.bytes().map(u32::from).collect();
     }
+    if text.is_ascii() {
+        let bytes = text.as_bytes();
+        let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+        let mut encoded = Vec::with_capacity(bytes.len());
+        for (i, &b) in bytes.iter().enumerate() {
+            let token = is_word(b);
+            let start = token && (i == 0 || !is_word(bytes[i - 1]));
+            let end = token && (i + 1 == bytes.len() || !is_word(bytes[i + 1]));
+            let folded = if fold { b.to_ascii_lowercase() } else { b };
+            let mut word_bits = folded as u32;
+            if token {
+                word_bits |= 1024;
+            }
+            if start {
+                word_bits |= 256;
+            }
+            if end {
+                word_bits |= 512;
+            }
+            encoded.push(word_bits);
+        }
+        return encoded;
+    }
     let chars: Vec<char> = text.chars().collect();
     let word = |c: char| c.is_alphanumeric() || c == '_';
-    let mut encoded = Vec::new();
+    let mut encoded = Vec::with_capacity(text.len());
     for (i, &c) in chars.iter().enumerate() {
         let token = word(c);
         let start = token && (i == 0 || !word(chars[i - 1]));
         let end = token && (i + 1 == chars.len() || !word(chars[i + 1]));
-        let string = if fold {
-            c.to_lowercase().collect::<String>()
-        } else {
-            c.to_string()
-        };
         let from = encoded.len();
-        encoded.extend(
-            string
-                .bytes()
-                .map(|b| b as u32 | if token { 1024 } else { 0 }),
-        );
-        if start {
+        let flag = if token { 1024 } else { 0 };
+        let mut buf = [0u8; 4];
+        if fold {
+            for lc in c.to_lowercase() {
+                for &b in lc.encode_utf8(&mut buf).as_bytes() {
+                    encoded.push(b as u32 | flag);
+                }
+            }
+        } else {
+            for &b in c.encode_utf8(&mut buf).as_bytes() {
+                encoded.push(b as u32 | flag);
+            }
+        }
+        if start && from < encoded.len() {
             encoded[from] |= 256;
         }
-        if end {
-            *encoded.last_mut().expect("encoded char") |= 512;
+        if end && let Some(last) = encoded.last_mut() {
+            *last |= 512;
         }
     }
     encoded
@@ -1613,7 +1639,7 @@ impl GpuCompute {
                 Cell::Bool(b) => (2, *b as u64, None),
                 Cell::Vec(_) => (3, 0, Some(cell.compact())),
                 _ => {
-                    let v = cell.as_f64().expect("numeric cell");
+                    let v = cell.as_f64().unwrap_or(0.0);
                     if v.is_nan() {
                         (5, 0, None)
                     } else {

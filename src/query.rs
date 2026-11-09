@@ -720,11 +720,11 @@ impl Queryable {
     }
 
     pub fn to_vec(&self, db: &mut Db) -> Result<Vec<Row>, Error> {
-        Ok(self.run(db)?.rows)
+        Ok(self.run(db)?.into_rows())
     }
 
     pub fn to_vec_read(&self, db: &ReadDb) -> Result<Vec<Row>, Error> {
-        Ok(self.run_read(db)?.rows)
+        Ok(self.run_read(db)?.into_rows())
     }
 
     pub fn to_vec_typed<T: FromRow>(&self, db: &mut Db) -> Result<Vec<T>, Error> {
@@ -1248,7 +1248,7 @@ impl<'a, T> BoundQueryable<'a, T> {
     }
 
     pub fn to_vec(self) -> Result<Vec<Row>, Error> {
-        Ok(self.run()?.rows)
+        Ok(self.run()?.into_rows())
     }
 
     pub fn to_vec_typed<U: FromRow>(self) -> Result<Vec<U>, Error> {

@@ -937,33 +937,14 @@ pub fn read_backup(path: &Path) -> Result<Snapshot, Error> {
     }
 }
 
-/// Expand cold file refs into inlined collections (for backup / portable copy).
-/// Expand cold file refs into inlined collections (for tools / dir copy).
-#[allow(dead_code)]
-pub fn expand_cold_into(dir: &Path, snap: &mut Snapshot) -> Result<(), Error> {
-    for name in snap.cold_collections.clone() {
-        let need = snap
-            .collections
-            .get(&name)
-            .map(|c| c.is_empty())
-            .unwrap_or(true);
-        if need {
-            let col = crate::cold::map_cold(dir, &name)?;
-            snap.collections.insert(name, col.into_rows()?);
-        }
-    }
-    snap.cold_collections.clear();
-    Ok(())
-}
-
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn encode_snapshot_ref_bytes(snap: &SnapshotRef<'_>) -> Result<Vec<u8>, Error> {
     let mut out = Vec::with_capacity(64 * 1024);
     encode_snapshot_ref_to_writer(&mut out, snap)?;
     Ok(out)
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn encode_snapshot_bytes(snap: &Snapshot) -> Result<Vec<u8>, Error> {
     let snap_ref = SnapshotRef {
         r#gen: snap.r#gen,
@@ -984,8 +965,10 @@ fn encode_snapshot_bytes(snap: &Snapshot) -> Result<Vec<u8>, Error> {
 }
 
 /// Encode snapshot with optional compression (feature-gated)
-#[cfg(any(feature = "compress-flate", feature = "compress-lz4", feature = "compress-zstd"))]
-#[allow(dead_code)]
+#[cfg(all(
+    test,
+    any(feature = "compress-flate", feature = "compress-lz4", feature = "compress-zstd")
+))]
 pub fn encode_snapshot_compressed(snap: &Snapshot) -> Result<Vec<u8>, Error> {
     let mut body = Vec::new();
     rmp_serde::encode::write_named(&mut body, snap).map_err(io_err)?;
@@ -1391,8 +1374,7 @@ pub fn open_log_read(dir: &Path) -> Result<Option<File>, Error> {
 }
 
 /// Append multiple records atomically with parallel encoding — feature-gated optimization
-#[cfg(feature = "parallel")]
-#[allow(dead_code)]
+#[cfg(all(test, feature = "parallel"))]
 pub fn append_batch_records(
     log: &mut File,
     records: &[LogRecord],
@@ -1441,66 +1423,6 @@ pub fn append_batch_records(
     }
 
     Ok(())
-}
-
-/// Compressed batch write for large payloads — compresses records into a single WAL frame
-#[cfg(any(feature = "compress-wal", feature = "parallel"))]
-#[allow(dead_code)]
-pub fn append_compressed_batch(
-    log: &mut File,
-    records: &[LogRecord],
-    sync: SyncMode,
-    log_bytes: &mut u64,
-) -> Result<(), Error> {
-    #[cfg(feature = "compress-wal")]
-    {
-        use flate2::Compression;
-        use flate2::write::GzEncoder;
-        use std::io::Write;
-
-        for rec in records {
-            let mut raw = Vec::new();
-            rmp_serde::encode::write_named(&mut raw, rec).map_err(io_err)?;
-            let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-            encoder.write_all(&raw).map_err(io_err)?;
-            let compressed = encoder.finish().map_err(io_err)?;
-
-            // Codec 4 = Gzip-compressed MessagePack LogRecord
-            let codec = [4u8];
-            let len = 1 + compressed.len() + 4;
-            if len > MAX_RECORD as usize {
-                return Err(io_err("compressed record exceeds max size"));
-            }
-            let mut checksum = crate::crc::Hasher::new();
-            checksum.update(&codec);
-            checksum.update(&compressed);
-            let crc = checksum.finalize().to_le_bytes();
-
-            let mut hdr = [0u8; 8];
-            hdr[..4].copy_from_slice(&LOG_MAGIC_CHECKSUM);
-            hdr[4..].copy_from_slice(&(len as u32).to_le_bytes());
-            let slices = [
-                IoSlice::new(&hdr),
-                IoSlice::new(&codec),
-                IoSlice::new(&compressed),
-                IoSlice::new(&crc),
-            ];
-            write_all_vectored(log, &slices).map_err(io_err)?;
-            *log_bytes += 8 + len as u64;
-        }
-
-        if sync == SyncMode::Full {
-            durable_sync(log).map_err(io_err)?;
-        }
-
-        Ok(())
-    }
-
-    #[cfg(not(feature = "compress-wal"))]
-    {
-        // Fallback to normal batch if compression not enabled
-        append_batch_records(log, records, sync, log_bytes)
-    }
 }
 
 pub fn append_record(
@@ -1612,10 +1534,19 @@ fn write_frame_bytes(
     }
 }
 
-pub(crate) fn write_frame(
+pub(crate) fn compute_frame_checksum(magic: &[u8; 4], payload: &[u8]) -> [u8; 4] {
+    let codec = magic[3];
+    let mut checksum = crate::crc::Hasher::new();
+    checksum.update(&[codec]);
+    checksum.update(payload);
+    checksum.finalize().to_le_bytes()
+}
+
+pub(crate) fn write_frame_precomputed(
     log: &mut File,
     magic: &[u8; 4],
     payload: &[u8],
+    checksum: [u8; 4],
     sync: SyncMode,
     log_bytes: &mut u64,
 ) -> Result<(), Error> {
@@ -1627,11 +1558,6 @@ pub(crate) fn write_frame(
         return Err(io_err("log record exceeds 16MiB"));
     };
     let codec = magic[3];
-    let mut checksum = crate::crc::Hasher::new();
-    checksum.update(&[codec]);
-    checksum.update(payload);
-    let checksum = checksum.finalize().to_le_bytes();
-
     write_frame_bytes(log, codec, payload, checksum, len as u32).map_err(io_err)?;
 
     if sync == SyncMode::Full {
@@ -1639,6 +1565,17 @@ pub(crate) fn write_frame(
     }
     *log_bytes += 8 + len as u64;
     Ok(())
+}
+
+pub(crate) fn write_frame(
+    log: &mut File,
+    magic: &[u8; 4],
+    payload: &[u8],
+    sync: SyncMode,
+    log_bytes: &mut u64,
+) -> Result<(), Error> {
+    let checksum = compute_frame_checksum(magic, payload);
+    write_frame_precomputed(log, magic, payload, checksum, sync, log_bytes)
 }
 
 /// Durability flush after a WAL append.
@@ -1824,23 +1761,30 @@ fn sparse_bytes_parallel(rows: &[Option<std::sync::Arc<[f32]>>]) -> usize {
     })
 }
 
-fn append_sparse_rows_serial(
-    rows: &[Option<std::sync::Arc<[f32]>>],
+fn append_sparse_iter_serial<'a>(
+    iter: impl Iterator<Item = Option<&'a [f32]>>,
     buf: &mut Vec<u8>,
 ) -> Result<(), Error> {
     #[cfg(target_arch = "aarch64")]
     if std::arch::is_aarch64_feature_detected!("neon") {
         // Runtime feature check covers all NEON loads; helper only loads full eight-value chunks.
-        return unsafe { append_sparse_rows_neon(rows, buf) };
+        return unsafe { append_sparse_iter_neon(iter, buf) };
     }
-    append_sparse_rows_scalar(rows, buf)
+    append_sparse_iter_scalar(iter, buf)
 }
 
-fn append_sparse_rows_scalar(
+fn append_sparse_rows_serial(
     rows: &[Option<std::sync::Arc<[f32]>>],
     buf: &mut Vec<u8>,
 ) -> Result<(), Error> {
-    for row in rows {
+    append_sparse_iter_serial(rows.iter().map(|r| r.as_deref()), buf)
+}
+
+fn append_sparse_iter_scalar<'a>(
+    iter: impl Iterator<Item = Option<&'a [f32]>>,
+    buf: &mut Vec<u8>,
+) -> Result<(), Error> {
+    for row in iter {
         let Some(emb) = row else {
             buf.extend_from_slice(&0u32.to_le_bytes());
             continue;
@@ -1880,6 +1824,14 @@ fn append_sparse_rows_scalar(
     Ok(())
 }
 
+#[cfg(test)]
+fn append_sparse_rows_scalar(
+    rows: &[Option<std::sync::Arc<[f32]>>],
+    buf: &mut Vec<u8>,
+) -> Result<(), Error> {
+    append_sparse_iter_scalar(rows.iter().map(|r| r.as_deref()), buf)
+}
+
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 unsafe fn presence_mask8(values: &[f32]) -> u32 {
@@ -1900,11 +1852,11 @@ unsafe fn presence_mask8(values: &[f32]) -> u32 {
 }
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn append_sparse_rows_neon(
-    rows: &[Option<std::sync::Arc<[f32]>>],
+unsafe fn append_sparse_iter_neon<'a>(
+    iter: impl Iterator<Item = Option<&'a [f32]>>,
     buf: &mut Vec<u8>,
 ) -> Result<(), Error> {
-    for row in rows {
+    for row in iter {
         let Some(emb) = row else {
             buf.extend_from_slice(&0u32.to_le_bytes());
             continue;
@@ -2020,7 +1972,9 @@ pub(crate) struct EncodeJob {
     next_id: u64,
     collection: String,
     rows: std::sync::Arc<Vec<Row>>,
+    uniform_keys: bool,
     bytes: Vec<u8>,
+    #[allow(dead_code)]
     mode: u8,
     reply: std::sync::mpsc::SyncSender<PreparedInsert>,
 }
@@ -2031,15 +1985,29 @@ impl EncodeJob {
             next_id,
             collection,
             rows,
+            uniform_keys,
             bytes,
+            #[cfg(test)]
             mode,
+            #[cfg(not(test))]
+                mode: _,
             reply: _,
         } = self;
         let staged = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            #[cfg(test)]
             if mode == 2 {
                 panic!("injected WAL encoder panic");
             }
-            let mut staged = prepare_insert_columns(generation, next_id, &collection, &rows, bytes);
+            #[allow(unused_mut)]
+            let mut staged = prepare_insert_columns_ext(
+                generation,
+                next_id,
+                &collection,
+                &rows,
+                uniform_keys,
+                bytes,
+            );
+            #[cfg(test)]
             if mode == 3 {
                 staged.encoding =
                     PreparedEncoding::Failed(Error::runtime("injected WAL encoder failure"));
@@ -2065,6 +2033,7 @@ pub(crate) fn start_insert_encoding(
     next_id: u64,
     collection: &str,
     rows: std::sync::Arc<Vec<Row>>,
+    uniform_keys: bool,
     bytes: Vec<u8>,
     mode: u8,
 ) -> Result<std::sync::mpsc::Receiver<PreparedInsert>, EncodeJob> {
@@ -2074,16 +2043,20 @@ pub(crate) fn start_insert_encoding(
         next_id,
         collection: collection.to_owned(),
         rows,
+        uniform_keys,
         bytes,
         mode,
         reply,
     };
-    if mode == 1 || mode == 5 {
-        return Err(job);
-    }
-    if mode == 4 {
-        drop(job);
-        return Ok(receiver);
+    #[cfg(test)]
+    {
+        if mode == 1 || mode == 5 {
+            return Err(job);
+        }
+        if mode == 4 {
+            drop(job);
+            return Ok(receiver);
+        }
     }
     if persist.encoder.is_none() {
         persist.encoder = acquire_encoder();
@@ -2091,7 +2064,10 @@ pub(crate) fn start_insert_encoding(
     let Some(worker) = persist.encoder.as_ref() else {
         return Err(job);
     };
-    match worker.sender.as_ref().unwrap().try_send(job) {
+    let Some(sender) = worker.sender.as_ref() else {
+        return Err(job);
+    };
+    match sender.try_send(job) {
         Ok(()) => Ok(receiver),
         Err(
             std::sync::mpsc::TrySendError::Full(job)
@@ -2107,6 +2083,7 @@ pub(crate) struct EncodedColumns {
     fields: Vec<String>,
     rows: u32,
     magic: [u8; 4],
+    checksum: [u8; 4],
     bytes: Vec<u8>,
 }
 
@@ -2129,30 +2106,80 @@ pub(crate) struct PreparedInsert {
     pub(crate) encoding: PreparedEncoding,
 }
 
+#[cfg(test)]
 pub(crate) fn prepare_insert_columns(
     generation: u64,
     next_id: u64,
     collection: &str,
     rows: &[Row],
+    bytes: Vec<u8>,
+) -> PreparedInsert {
+    prepare_insert_columns_ext(generation, next_id, collection, rows, false, bytes)
+}
+
+pub(crate) fn prepare_insert_columns_ext(
+    generation: u64,
+    next_id: u64,
+    collection: &str,
+    rows: &[Row],
+    uniform_keys: bool,
     mut bytes: Vec<u8>,
 ) -> PreparedInsert {
-    let pack = rows_to_insert_cols(collection, rows, Vec::new());
-    let encoding = match &pack {
+    if rows.len() < 4096
+        && let Some((magic, fields)) = encode_insert_rows_direct_ext(
+            generation,
+            next_id,
+            collection,
+            rows,
+            uniform_keys,
+            &mut bytes,
+        )
+    {
+        let n = rows.len() as u32;
+        let checksum = compute_frame_checksum(&magic, &bytes);
+        let pack = Pack::InsertCols {
+            collection: collection.to_owned(),
+            fields: fields.clone(),
+            cols: Vec::new(),
+            n,
+            edges: Vec::new(),
+        };
+        return PreparedInsert {
+            pack: Some(pack),
+            encoding: PreparedEncoding::Ready(EncodedColumns {
+                generation,
+                next_id,
+                collection: collection.to_owned(),
+                fields,
+                rows: n,
+                magic,
+                checksum,
+                bytes,
+            }),
+        };
+    }
+    let mut pack = rows_to_insert_cols(collection, rows, Vec::new());
+    let encoding = match &mut pack {
         Pack::InsertCols {
             fields, cols, n, ..
         } => {
             match encode_insert_cols_v2(
                 generation, next_id, collection, fields, cols, *n, &mut bytes,
             ) {
-                Ok(magic) => PreparedEncoding::Ready(EncodedColumns {
-                    generation,
-                    next_id,
-                    collection: collection.to_owned(),
-                    fields: fields.clone(),
-                    rows: *n,
-                    magic,
-                    bytes,
-                }),
+                Ok(magic) => {
+                    cols.clear();
+                    let checksum = compute_frame_checksum(&magic, &bytes);
+                    PreparedEncoding::Ready(EncodedColumns {
+                        generation,
+                        next_id,
+                        collection: collection.to_owned(),
+                        fields: fields.clone(),
+                        rows: *n,
+                        magic,
+                        checksum,
+                        bytes,
+                    })
+                }
                 Err(error) => PreparedEncoding::Failed(error),
             }
         }
@@ -2176,10 +2203,18 @@ pub(crate) fn append_prepared_record(
         && rec.next_id == prepared.next_id
         && matches!(&rec.pack, Pack::InsertCols { collection, fields, cols, n, edges }
             if collection == &prepared.collection && fields == &prepared.fields
-                && fields.len() == cols.len() && *n == prepared.rows && edges.is_empty());
+                && (cols.is_empty() || fields.len() == cols.len())
+                && *n == prepared.rows && edges.is_empty());
     *buf = prepared.bytes;
     if valid {
-        write_frame(log, &prepared.magic, buf, sync, log_bytes)
+        write_frame_precomputed(
+            log,
+            &prepared.magic,
+            buf,
+            prepared.checksum,
+            sync,
+            log_bytes,
+        )
     } else {
         append_record(log, rec, buf, sync, log_bytes)
     }
@@ -2296,78 +2331,156 @@ fn encode_insert_cols_v2(
                     buf.extend_from_slice(&x.to_le_bytes());
                 }
             }
-            ColData::Vec(v) if use_sparse_vectors(v) => {
-                if v.len() != n as usize {
-                    return Err(io_err("sparse vector column length mismatch"));
+            ColData::Vec(v) => {
+                let mut dense = 0usize;
+                let mut has_empty = false;
+                for row in v {
+                    match row.as_ref() {
+                        None => dense = dense.saturating_add(4),
+                        Some(emb) => {
+                            if emb.is_empty() {
+                                has_empty = true;
+                            }
+                            dense = dense.saturating_add(
+                                4usize.saturating_add(emb.len().saturating_mul(4)),
+                            );
+                        }
+                    }
                 }
-                let storage = v
-                    .len()
-                    .checked_mul(std::mem::size_of::<Option<Vec<f32>>>())
-                    .ok_or_else(|| io_err("sparse vector size overflow"))?;
-                sparse_decoded_bytes = sparse_decoded_bytes
-                    .checked_add(storage)
-                    .ok_or_else(|| io_err("sparse vector size overflow"))?;
-                sparse_codec = true;
-                buf.push(7);
-                if v.len() >= 4096
-                    && v.iter()
-                        .flatten()
-                        .fold(0usize, |n, emb| n.saturating_add(emb.len()))
-                        >= 2 * 1024 * 1024
-                {
-                    for emb in v.iter().flatten() {
-                        let bytes = emb
+                let try_sparse = has_empty
+                    || (dense >= SPARSE_VECTOR_THRESHOLD
+                        && if v.len() >= 4096 {
+                            use_sparse_vectors(v)
+                        } else if let Some(Some(first)) = v.first()
+                            && 8usize.saturating_add(count_non_zero_floats(first).saturating_mul(8))
+                                > 4usize.saturating_add(first.len().saturating_mul(4))
+                        {
+                            use_sparse_vectors(v)
+                        } else {
+                            true
+                        });
+                let mut wrote_sparse = false;
+                if try_sparse {
+                    if v.len() >= 4096 {
+                        if v.len() != n as usize {
+                            return Err(io_err("sparse vector column length mismatch"));
+                        }
+                        let storage = v
                             .len()
-                            .checked_mul(4)
+                            .checked_mul(std::mem::size_of::<Option<Vec<f32>>>())
                             .ok_or_else(|| io_err("sparse vector size overflow"))?;
                         sparse_decoded_bytes = sparse_decoded_bytes
-                            .checked_add(bytes)
-                            .filter(|&bytes| bytes <= MAX_SPARSE_DECODED_BYTES)
-                            .ok_or_else(|| io_err("sparse vectors exceed decoded 64MiB budget"))?;
-                    }
-                    append_sparse_rows_parallel(v, buf)?;
-                    continue;
-                }
-                for emb in v.iter().flatten() {
-                    let bytes = emb
-                        .len()
-                        .checked_mul(4)
-                        .ok_or_else(|| io_err("sparse vector size overflow"))?;
-                    sparse_decoded_bytes = sparse_decoded_bytes
-                        .checked_add(bytes)
-                        .filter(|&bytes| bytes <= MAX_SPARSE_DECODED_BYTES)
-                        .ok_or_else(|| io_err("sparse vectors exceed decoded 64MiB budget"))?;
-                }
-                append_sparse_rows_serial(v, buf)?;
-                if sparse_decoded_bytes > MAX_SPARSE_DECODED_BYTES {
-                    return Err(io_err("sparse vectors exceed decoded 64MiB budget"));
-                }
-            }
-            ColData::Vec(v) => {
-                buf.push(6);
-                for row in v {
-                    match row {
-                        Some(emb) if !emb.is_empty() => {
-                            buf.extend_from_slice(&(emb.len() as u32).to_le_bytes());
-                            #[cfg(target_endian = "little")]
-                            {
-                                // Safety: [f32] on little-endian has the exact IEEE 754 LE byte representation.
-                                let bytes = unsafe {
-                                    std::slice::from_raw_parts(
-                                        emb.as_ptr() as *const u8,
-                                        emb.len() * std::mem::size_of::<f32>(),
-                                    )
-                                };
-                                buf.extend_from_slice(bytes);
+                            .checked_add(storage)
+                            .ok_or_else(|| io_err("sparse vector size overflow"))?;
+                        sparse_codec = true;
+                        buf.push(7);
+                        if v.iter()
+                            .flatten()
+                            .fold(0usize, |n, emb| n.saturating_add(emb.len()))
+                            >= 2 * 1024 * 1024
+                        {
+                            for emb in v.iter().flatten() {
+                                let bytes = emb
+                                    .len()
+                                    .checked_mul(4)
+                                    .ok_or_else(|| io_err("sparse vector size overflow"))?;
+                                sparse_decoded_bytes = sparse_decoded_bytes
+                                    .checked_add(bytes)
+                                    .filter(|&bytes| bytes <= MAX_SPARSE_DECODED_BYTES)
+                                    .ok_or_else(|| {
+                                        io_err("sparse vectors exceed decoded 64MiB budget")
+                                    })?;
                             }
-                            #[cfg(not(target_endian = "little"))]
-                            {
-                                for x in emb.iter() {
-                                    buf.extend_from_slice(&x.to_le_bytes());
+                            append_sparse_rows_parallel(v, buf)?;
+                        } else {
+                            for emb in v.iter().flatten() {
+                                let bytes = emb
+                                    .len()
+                                    .checked_mul(4)
+                                    .ok_or_else(|| io_err("sparse vector size overflow"))?;
+                                sparse_decoded_bytes = sparse_decoded_bytes
+                                    .checked_add(bytes)
+                                    .filter(|&bytes| bytes <= MAX_SPARSE_DECODED_BYTES)
+                                    .ok_or_else(|| {
+                                        io_err("sparse vectors exceed decoded 64MiB budget")
+                                    })?;
+                            }
+                            append_sparse_rows_serial(v, buf)?;
+                        }
+                        if sparse_decoded_bytes > MAX_SPARSE_DECODED_BYTES {
+                            return Err(io_err("sparse vectors exceed decoded 64MiB budget"));
+                        }
+                        wrote_sparse = true;
+                    } else {
+                        let mark = buf.len();
+                        buf.push(7);
+                        let payload_start = buf.len();
+                        if let Err(e) = append_sparse_rows_serial(v, buf) {
+                            buf.truncate(mark);
+                            return Err(e);
+                        }
+                        let sparse_bytes = buf.len() - payload_start;
+                        if !has_empty && sparse_bytes >= dense {
+                            buf.truncate(mark);
+                        } else {
+                            if v.len() != n as usize {
+                                buf.truncate(mark);
+                                return Err(io_err("sparse vector column length mismatch"));
+                            }
+                            let storage = v
+                                .len()
+                                .checked_mul(std::mem::size_of::<Option<Vec<f32>>>())
+                                .ok_or_else(|| io_err("sparse vector size overflow"))?;
+                            let mut next_decoded = sparse_decoded_bytes
+                                .checked_add(storage)
+                                .ok_or_else(|| io_err("sparse vector size overflow"))?;
+                            for emb in v.iter().flatten() {
+                                let bytes = emb
+                                    .len()
+                                    .checked_mul(4)
+                                    .ok_or_else(|| io_err("sparse vector size overflow"))?;
+                                next_decoded = next_decoded
+                                    .checked_add(bytes)
+                                    .filter(|&bytes| bytes <= MAX_SPARSE_DECODED_BYTES)
+                                    .ok_or_else(|| {
+                                        io_err("sparse vectors exceed decoded 64MiB budget")
+                                    })?;
+                            }
+                            if next_decoded > MAX_SPARSE_DECODED_BYTES {
+                                return Err(io_err("sparse vectors exceed decoded 64MiB budget"));
+                            }
+                            sparse_decoded_bytes = next_decoded;
+                            sparse_codec = true;
+                            wrote_sparse = true;
+                        }
+                    }
+                }
+                if !wrote_sparse {
+                    buf.push(6);
+                    for row in v {
+                        match row {
+                            Some(emb) if !emb.is_empty() => {
+                                buf.extend_from_slice(&(emb.len() as u32).to_le_bytes());
+                                #[cfg(target_endian = "little")]
+                                {
+                                    // Safety: [f32] on little-endian has the exact IEEE 754 LE byte representation.
+                                    let bytes = unsafe {
+                                        std::slice::from_raw_parts(
+                                            emb.as_ptr() as *const u8,
+                                            emb.len() * std::mem::size_of::<f32>(),
+                                        )
+                                    };
+                                    buf.extend_from_slice(bytes);
+                                }
+                                #[cfg(not(target_endian = "little"))]
+                                {
+                                    for x in emb.iter() {
+                                        buf.extend_from_slice(&x.to_le_bytes());
+                                    }
                                 }
                             }
+                            _ => buf.extend_from_slice(&0u32.to_le_bytes()),
                         }
-                        _ => buf.extend_from_slice(&0u32.to_le_bytes()),
                     }
                 }
             }
@@ -2381,11 +2494,36 @@ fn encode_insert_cols_v2(
     })
 }
 
+fn append_sparse_cells_serial(
+    cells: &[&Cell],
+    num_fields: usize,
+    fi: usize,
+    num_rows: usize,
+    buf: &mut Vec<u8>,
+) -> Result<(), Error> {
+    let iter = (0..num_rows).map(|ri| match cells[ri * num_fields + fi] {
+        Cell::Vec(emb) => Some(emb.as_ref()),
+        _ => None,
+    });
+    append_sparse_iter_serial(iter, buf)
+}
+
 pub(crate) fn encode_insert_rows_direct(
     rec_gen: u64,
     next_id: u64,
     collection: &str,
     rows: &[Row],
+    buf: &mut Vec<u8>,
+) -> Option<([u8; 4], Vec<String>)> {
+    encode_insert_rows_direct_ext(rec_gen, next_id, collection, rows, false, buf)
+}
+
+pub(crate) fn encode_insert_rows_direct_ext(
+    rec_gen: u64,
+    next_id: u64,
+    collection: &str,
+    rows: &[Row],
+    uniform_keys: bool,
     buf: &mut Vec<u8>,
 ) -> Option<([u8; 4], Vec<String>)> {
     if rows.is_empty() {
@@ -2404,26 +2542,44 @@ pub(crate) fn encode_insert_rows_direct(
         Float,
         Bool,
         Time,
+        Vec,
     }
     let mut col_types = smallvec::SmallVec::<[DirectColType; 8]>::with_capacity(num_fields);
+    let mut has_vec = false;
     for val in first.values() {
         let t = match val {
-            Cell::Text(_) => DirectColType::Text,
+            Cell::Text(_) | Cell::SmallText(_) => DirectColType::Text,
             Cell::Int(_) => DirectColType::Int,
             Cell::Float(_) => DirectColType::Float,
             Cell::Bool(_) => DirectColType::Bool,
             Cell::Time(_) => DirectColType::Time,
+            Cell::Vec(_) => {
+                has_vec = true;
+                DirectColType::Vec
+            }
             _ => return None,
         };
         col_types.push(t);
     }
+    if has_vec && rows.len() >= 4096 {
+        return None;
+    }
 
     let mut cells: Vec<&Cell> = Vec::with_capacity(rows.len() * num_fields);
-    for r in rows {
-        if r.len() != num_fields || !r.keys().eq(first.keys()) {
-            return None;
+    if uniform_keys {
+        for r in rows {
+            if r.len() != num_fields {
+                return None;
+            }
+            cells.extend(r.values());
         }
-        cells.extend(r.values());
+    } else {
+        for r in rows {
+            if r.len() != num_fields || !r.keys().eq(first.keys()) {
+                return None;
+            }
+            cells.extend(r.values());
+        }
     }
 
     let fields: Vec<String> = first.keys().cloned().collect();
@@ -2438,15 +2594,19 @@ pub(crate) fn encode_insert_rows_direct(
     buf.extend_from_slice(&n.to_le_bytes());
     buf.extend_from_slice(&(num_fields as u32).to_le_bytes());
 
+    let mut sparse_codec = false;
+    let mut sparse_decoded_bytes = 0usize;
+
     for (fi, f) in fields.iter().enumerate() {
         put_str(buf, f);
         match col_types[fi] {
             DirectColType::Text => {
                 buf.push(1);
                 for ri in 0..rows.len() {
-                    match cells[ri * num_fields + fi] {
-                        Cell::Text(s) => put_str(buf, s),
-                        _ => return None,
+                    if let Some(s) = cells[ri * num_fields + fi].text() {
+                        put_str(buf, s);
+                    } else {
+                        return None;
                     }
                 }
             }
@@ -2486,10 +2646,108 @@ pub(crate) fn encode_insert_rows_direct(
                     }
                 }
             }
+            DirectColType::Vec => {
+                let mut dense = 0usize;
+                let mut has_empty = false;
+                let mut first_emb: Option<&[f32]> = None;
+                for ri in 0..rows.len() {
+                    match cells[ri * num_fields + fi] {
+                        Cell::Vec(emb) => {
+                            if ri == 0 {
+                                first_emb = Some(emb.as_ref());
+                            }
+                            if emb.is_empty() {
+                                has_empty = true;
+                            }
+                            dense = dense.saturating_add(
+                                4usize.saturating_add(emb.len().saturating_mul(4)),
+                            );
+                        }
+                        _ => return None,
+                    }
+                }
+                let try_sparse = if has_empty {
+                    true
+                } else if dense < SPARSE_VECTOR_THRESHOLD {
+                    false
+                } else if let Some(first_v) = first_emb
+                    && 8usize.saturating_add(count_non_zero_floats(first_v).saturating_mul(8))
+                        > 4usize.saturating_add(first_v.len().saturating_mul(4))
+                {
+                    return None;
+                } else {
+                    true
+                };
+                let mut wrote_sparse = false;
+                if try_sparse {
+                    let mark = buf.len();
+                    buf.push(7);
+                    let payload_start = buf.len();
+                    if append_sparse_cells_serial(&cells, num_fields, fi, rows.len(), buf).is_err()
+                    {
+                        buf.truncate(mark);
+                        return None;
+                    }
+                    let sparse_bytes = buf.len() - payload_start;
+                    if !has_empty && sparse_bytes >= dense {
+                        buf.truncate(mark);
+                    } else {
+                        let storage = rows
+                            .len()
+                            .checked_mul(std::mem::size_of::<Option<Vec<f32>>>())?;
+                        let mut next_decoded = sparse_decoded_bytes.checked_add(storage)?;
+                        for ri in 0..rows.len() {
+                            if let Cell::Vec(emb) = cells[ri * num_fields + fi] {
+                                let bytes = emb.len().checked_mul(4)?;
+                                next_decoded = next_decoded
+                                    .checked_add(bytes)
+                                    .filter(|&b| b <= MAX_SPARSE_DECODED_BYTES)?;
+                            }
+                        }
+                        sparse_decoded_bytes = next_decoded;
+                        sparse_codec = true;
+                        wrote_sparse = true;
+                    }
+                }
+                if !wrote_sparse {
+                    buf.push(6);
+                    for ri in 0..rows.len() {
+                        match cells[ri * num_fields + fi] {
+                            Cell::Vec(emb) if !emb.is_empty() => {
+                                buf.extend_from_slice(&(emb.len() as u32).to_le_bytes());
+                                #[cfg(target_endian = "little")]
+                                {
+                                    let bytes = unsafe {
+                                        std::slice::from_raw_parts(
+                                            emb.as_ptr() as *const u8,
+                                            emb.len() * std::mem::size_of::<f32>(),
+                                        )
+                                    };
+                                    buf.extend_from_slice(bytes);
+                                }
+                                #[cfg(not(target_endian = "little"))]
+                                {
+                                    for x in emb.iter() {
+                                        buf.extend_from_slice(&x.to_le_bytes());
+                                    }
+                                }
+                            }
+                            _ => buf.extend_from_slice(&0u32.to_le_bytes()),
+                        }
+                    }
+                }
+            }
         }
     }
 
-    Some((LOG_MAGIC_V2, fields))
+    Some((
+        if sparse_codec {
+            LOG_MAGIC_SPARSE
+        } else {
+            LOG_MAGIC_V2
+        },
+        fields,
+    ))
 }
 
 /// Replay complete records with `gen > min_gen`. Returns the byte offset of
@@ -3160,39 +3418,6 @@ pub fn append_raw_frames(
     }
     *log_bytes += frames.len() as u64;
     Ok(())
-}
-
-/// Check if a content hash already exists in the collection (deduplication helper)
-#[cfg(feature = "parallel")]
-#[allow(dead_code)]
-pub fn check_content_exists(
-    collection_name: &str,
-    body_hash: &str,
-    store: &crate::store::Store,
-) -> bool {
-    let collection = store.collection(collection_name);
-    let hash_field = "hash";
-
-    // Parallel search across collection rows
-    #[cfg(feature = "parallel")]
-    {
-        use rayon::prelude::*;
-
-        collection.par_iter().any(|row| {
-            row.get(hash_field)
-                .and_then(|cell| cell.text())
-                .is_some_and(|h| h == body_hash)
-        })
-    }
-
-    #[cfg(not(feature = "parallel"))]
-    {
-        collection.iter().any(|row| {
-            row.get(hash_field)
-                .and_then(|cell| cell.text())
-                .is_some_and(|h| h == body_hash)
-        })
-    }
 }
 
 /// Build columnar insert pack in one pass (field set from first row + union).
@@ -4807,78 +5032,156 @@ fn append_insert_cols_v2_reference(
                     buf.extend_from_slice(&x.to_le_bytes());
                 }
             }
-            ColData::Vec(v) if use_sparse_vectors(v) => {
-                if v.len() != n as usize {
-                    return Err(io_err("sparse vector column length mismatch"));
+            ColData::Vec(v) => {
+                let mut dense = 0usize;
+                let mut has_empty = false;
+                for row in v {
+                    match row.as_ref() {
+                        None => dense = dense.saturating_add(4),
+                        Some(emb) => {
+                            if emb.is_empty() {
+                                has_empty = true;
+                            }
+                            dense = dense.saturating_add(
+                                4usize.saturating_add(emb.len().saturating_mul(4)),
+                            );
+                        }
+                    }
                 }
-                let storage = v
-                    .len()
-                    .checked_mul(std::mem::size_of::<Option<Vec<f32>>>())
-                    .ok_or_else(|| io_err("sparse vector size overflow"))?;
-                sparse_decoded_bytes = sparse_decoded_bytes
-                    .checked_add(storage)
-                    .ok_or_else(|| io_err("sparse vector size overflow"))?;
-                sparse_codec = true;
-                buf.push(7);
-                if v.len() >= 4096
-                    && v.iter()
-                        .flatten()
-                        .fold(0usize, |n, emb| n.saturating_add(emb.len()))
-                        >= 2 * 1024 * 1024
-                {
-                    for emb in v.iter().flatten() {
-                        let bytes = emb
+                let try_sparse = has_empty
+                    || (dense >= SPARSE_VECTOR_THRESHOLD
+                        && if v.len() >= 4096 {
+                            use_sparse_vectors(v)
+                        } else if let Some(Some(first)) = v.first()
+                            && 8usize.saturating_add(count_non_zero_floats(first).saturating_mul(8))
+                                > 4usize.saturating_add(first.len().saturating_mul(4))
+                        {
+                            use_sparse_vectors(v)
+                        } else {
+                            true
+                        });
+                let mut wrote_sparse = false;
+                if try_sparse {
+                    if v.len() >= 4096 {
+                        if v.len() != n as usize {
+                            return Err(io_err("sparse vector column length mismatch"));
+                        }
+                        let storage = v
                             .len()
-                            .checked_mul(4)
+                            .checked_mul(std::mem::size_of::<Option<Vec<f32>>>())
                             .ok_or_else(|| io_err("sparse vector size overflow"))?;
                         sparse_decoded_bytes = sparse_decoded_bytes
-                            .checked_add(bytes)
-                            .filter(|&bytes| bytes <= MAX_SPARSE_DECODED_BYTES)
-                            .ok_or_else(|| io_err("sparse vectors exceed decoded 64MiB budget"))?;
-                    }
-                    append_sparse_rows_parallel(v, buf)?;
-                    continue;
-                }
-                for emb in v.iter().flatten() {
-                    let bytes = emb
-                        .len()
-                        .checked_mul(4)
-                        .ok_or_else(|| io_err("sparse vector size overflow"))?;
-                    sparse_decoded_bytes = sparse_decoded_bytes
-                        .checked_add(bytes)
-                        .filter(|&bytes| bytes <= MAX_SPARSE_DECODED_BYTES)
-                        .ok_or_else(|| io_err("sparse vectors exceed decoded 64MiB budget"))?;
-                }
-                append_sparse_rows_serial(v, buf)?;
-                if sparse_decoded_bytes > MAX_SPARSE_DECODED_BYTES {
-                    return Err(io_err("sparse vectors exceed decoded 64MiB budget"));
-                }
-            }
-            ColData::Vec(v) => {
-                buf.push(6);
-                for row in v {
-                    match row {
-                        Some(emb) if !emb.is_empty() => {
-                            buf.extend_from_slice(&(emb.len() as u32).to_le_bytes());
-                            #[cfg(target_endian = "little")]
-                            {
-                                // Safety: [f32] on little-endian has the exact IEEE 754 LE byte representation.
-                                let bytes = unsafe {
-                                    std::slice::from_raw_parts(
-                                        emb.as_ptr() as *const u8,
-                                        emb.len() * std::mem::size_of::<f32>(),
-                                    )
-                                };
-                                buf.extend_from_slice(bytes);
+                            .checked_add(storage)
+                            .ok_or_else(|| io_err("sparse vector size overflow"))?;
+                        sparse_codec = true;
+                        buf.push(7);
+                        if v.iter()
+                            .flatten()
+                            .fold(0usize, |n, emb| n.saturating_add(emb.len()))
+                            >= 2 * 1024 * 1024
+                        {
+                            for emb in v.iter().flatten() {
+                                let bytes = emb
+                                    .len()
+                                    .checked_mul(4)
+                                    .ok_or_else(|| io_err("sparse vector size overflow"))?;
+                                sparse_decoded_bytes = sparse_decoded_bytes
+                                    .checked_add(bytes)
+                                    .filter(|&bytes| bytes <= MAX_SPARSE_DECODED_BYTES)
+                                    .ok_or_else(|| {
+                                        io_err("sparse vectors exceed decoded 64MiB budget")
+                                    })?;
                             }
-                            #[cfg(not(target_endian = "little"))]
-                            {
-                                for x in emb.iter() {
-                                    buf.extend_from_slice(&x.to_le_bytes());
+                            append_sparse_rows_parallel(v, buf)?;
+                        } else {
+                            for emb in v.iter().flatten() {
+                                let bytes = emb
+                                    .len()
+                                    .checked_mul(4)
+                                    .ok_or_else(|| io_err("sparse vector size overflow"))?;
+                                sparse_decoded_bytes = sparse_decoded_bytes
+                                    .checked_add(bytes)
+                                    .filter(|&bytes| bytes <= MAX_SPARSE_DECODED_BYTES)
+                                    .ok_or_else(|| {
+                                        io_err("sparse vectors exceed decoded 64MiB budget")
+                                    })?;
+                            }
+                            append_sparse_rows_serial(v, buf)?;
+                        }
+                        if sparse_decoded_bytes > MAX_SPARSE_DECODED_BYTES {
+                            return Err(io_err("sparse vectors exceed decoded 64MiB budget"));
+                        }
+                        wrote_sparse = true;
+                    } else {
+                        let mark = buf.len();
+                        buf.push(7);
+                        let payload_start = buf.len();
+                        if let Err(e) = append_sparse_rows_serial(v, buf) {
+                            buf.truncate(mark);
+                            return Err(e);
+                        }
+                        let sparse_bytes = buf.len() - payload_start;
+                        if !has_empty && sparse_bytes >= dense {
+                            buf.truncate(mark);
+                        } else {
+                            if v.len() != n as usize {
+                                buf.truncate(mark);
+                                return Err(io_err("sparse vector column length mismatch"));
+                            }
+                            let storage = v
+                                .len()
+                                .checked_mul(std::mem::size_of::<Option<Vec<f32>>>())
+                                .ok_or_else(|| io_err("sparse vector size overflow"))?;
+                            let mut next_decoded = sparse_decoded_bytes
+                                .checked_add(storage)
+                                .ok_or_else(|| io_err("sparse vector size overflow"))?;
+                            for emb in v.iter().flatten() {
+                                let bytes = emb
+                                    .len()
+                                    .checked_mul(4)
+                                    .ok_or_else(|| io_err("sparse vector size overflow"))?;
+                                next_decoded = next_decoded
+                                    .checked_add(bytes)
+                                    .filter(|&bytes| bytes <= MAX_SPARSE_DECODED_BYTES)
+                                    .ok_or_else(|| {
+                                        io_err("sparse vectors exceed decoded 64MiB budget")
+                                    })?;
+                            }
+                            if next_decoded > MAX_SPARSE_DECODED_BYTES {
+                                return Err(io_err("sparse vectors exceed decoded 64MiB budget"));
+                            }
+                            sparse_decoded_bytes = next_decoded;
+                            sparse_codec = true;
+                            wrote_sparse = true;
+                        }
+                    }
+                }
+                if !wrote_sparse {
+                    buf.push(6);
+                    for row in v {
+                        match row {
+                            Some(emb) if !emb.is_empty() => {
+                                buf.extend_from_slice(&(emb.len() as u32).to_le_bytes());
+                                #[cfg(target_endian = "little")]
+                                {
+                                    // Safety: [f32] on little-endian has the exact IEEE 754 LE byte representation.
+                                    let bytes = unsafe {
+                                        std::slice::from_raw_parts(
+                                            emb.as_ptr() as *const u8,
+                                            emb.len() * std::mem::size_of::<f32>(),
+                                        )
+                                    };
+                                    buf.extend_from_slice(bytes);
+                                }
+                                #[cfg(not(target_endian = "little"))]
+                                {
+                                    for x in emb.iter() {
+                                        buf.extend_from_slice(&x.to_le_bytes());
+                                    }
                                 }
                             }
+                            _ => buf.extend_from_slice(&0u32.to_le_bytes()),
                         }
-                        _ => buf.extend_from_slice(&0u32.to_le_bytes()),
                     }
                 }
             }
@@ -5182,6 +5485,7 @@ mod persistent_encoder_queue_tests {
                             next_id: 2,
                             collection: "docs".into(),
                             rows: rows.clone(),
+                            uniform_keys: false,
                             bytes: Vec::new(),
                             mode: 0,
                             reply
@@ -5199,6 +5503,7 @@ mod persistent_encoder_queue_tests {
                 2,
                 "docs",
                 rows.clone(),
+                false,
                 Vec::new(),
                 0,
             ) {

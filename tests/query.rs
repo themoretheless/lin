@@ -633,7 +633,7 @@ fn fallback_batch_preserves_projection_schema_and_order_even_when_empty() {
         "docs | title ~ \"no-such-token-batch\" | sort ts | { title, id } | take all",
         "docs | title ~ \"wal\" | sort ts | { title, id } | take all",
     ] {
-        let rows = db.run(q).unwrap().rows;
+        let rows = db.run(q).unwrap().into_rows();
         let batch = db.run_batch(q).unwrap();
         assert_eq!(batch.names.as_ref(), &["title", "id"]);
         assert_eq!(batch.to_rows(), rows);
@@ -813,7 +813,7 @@ fn test_predicate_simplification_and_scan_projection() {
     let rows = db
         .run(r#"docs | id in ["d-wal"] | { id, title } | take 1"#)
         .unwrap()
-        .rows;
+        .into_rows();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["id"].text(), Some("d-wal"));
 
@@ -821,15 +821,15 @@ fn test_predicate_simplification_and_scan_projection() {
     let rows_not = db
         .run(r#"orders | not (total > 50.0) | { id } | take all"#)
         .unwrap()
-        .rows;
+        .into_rows();
     let rows_le = db
         .run(r#"orders | total <= 50.0 | { id } | take all"#)
         .unwrap()
-        .rows;
+        .into_rows();
     assert_eq!(rows_not, rows_le);
 
     // 3. Fast scan limit + scan_projected: without filter, scanning projected columns with limit
-    let rows_proj = db.run(r#"docs | { id, title } | take 2"#).unwrap().rows;
+    let rows_proj = db.run(r#"docs | { id, title } | take 2"#).unwrap().into_rows();
     assert_eq!(rows_proj.len(), 2);
     assert!(rows_proj[0].get("id").is_some());
     assert!(rows_proj[0].get("title").is_some());

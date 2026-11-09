@@ -68,25 +68,62 @@ impl Embedder for OnnxEmbedder {
             Ok(g) => g,
             Err(_) => return Arc::from(vec![0f32; self.dim]),
         };
-        match guard.embed(vec![text.to_string()], None) {
+        match guard.embed(vec![text], None) {
             Ok(mut batches) => {
                 let v = batches.pop().unwrap_or_default();
-                if v.len() == self.dim {
-                    Arc::from(v)
-                } else {
-                    let mut out = vec![0f32; self.dim];
-                    let n = v.len().min(self.dim);
-                    out[..n].copy_from_slice(&v[..n]);
-                    Arc::from(out)
-                }
+                normalize_onnx_dim(v, self.dim)
             }
             Err(_) => Arc::from(vec![0f32; self.dim]),
         }
+    }
+
+    fn embed_batch(&self, texts: &[&str]) -> Vec<Arc<[f32]>> {
+        if texts.is_empty() {
+            return Vec::new();
+        }
+        let mut guard = match self.inner.lock() {
+            Ok(g) => g,
+            Err(_) => return vec![Arc::from(vec![0f32; self.dim]); texts.len()],
+        };
+        match guard.embed(texts.to_vec(), None) {
+            Ok(batches) => batches
+                .into_iter()
+                .map(|v| normalize_onnx_dim(v, self.dim))
+                .collect(),
+            Err(_) => vec![Arc::from(vec![0f32; self.dim]); texts.len()],
+        }
+    }
+}
+
+#[inline]
+fn normalize_onnx_dim(v: Vec<f32>, dim: usize) -> Arc<[f32]> {
+    if v.len() == dim {
+        Arc::from(v)
+    } else {
+        let mut out = vec![0f32; dim];
+        let n = v.len().min(dim);
+        out[..n].copy_from_slice(&v[..n]);
+        Arc::from(out)
     }
 }
 
 fn model_dim_hint(model: &EmbeddingModel) -> usize {
     // Best-effort; catalog embed_id `/dim` wins when present.
-    let _ = model;
-    384
+    match model {
+        EmbeddingModel::BGELargeENV15
+        | EmbeddingModel::BGELargeENV15Q
+        | EmbeddingModel::BGELargeZHV15
+        | EmbeddingModel::MxbaiEmbedLargeV1
+        | EmbeddingModel::MxbaiEmbedLargeV1Q
+        | EmbeddingModel::MultilingualE5Large
+        | EmbeddingModel::GTEBaseENV15 => 1024,
+        EmbeddingModel::BGEBaseENV15
+        | EmbeddingModel::BGEBaseENV15Q
+        | EmbeddingModel::NomicEmbedTextV1
+        | EmbeddingModel::NomicEmbedTextV15
+        | EmbeddingModel::NomicEmbedTextV15Q
+        | EmbeddingModel::ParaphraseMLMpnetBaseV2
+        | EmbeddingModel::MultilingualE5Base => 768,
+        _ => 384,
+    }
 }

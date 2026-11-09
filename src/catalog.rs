@@ -552,6 +552,134 @@ pub fn fixture() -> Catalog {
     }
 }
 
+struct Fnv1aWriter(u64);
+
+impl Fnv1aWriter {
+    #[inline]
+    const fn new() -> Self {
+        Self(0xcbf29ce484222325)
+    }
+
+    #[inline]
+    fn write_bytes(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 ^= u64::from(b);
+            self.0 = self.0.wrapping_mul(0x100000001b3);
+        }
+    }
+
+    #[inline]
+    fn write_byte(&mut self, b: u8) {
+        self.0 ^= u64::from(b);
+        self.0 = self.0.wrapping_mul(0x100000001b3);
+    }
+}
+
+impl std::fmt::Write for Fnv1aWriter {
+    #[inline]
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        self.write_bytes(s.as_bytes());
+        Ok(())
+    }
+}
+
+pub fn catalog_hash(cat: &Catalog) -> String {
+    use std::fmt::Write;
+    let mut h = Fnv1aWriter::new();
+    h.write_bytes(cat.embed_id.as_bytes());
+    h.write_byte(b'|');
+    for (n, c) in &cat.collections {
+        h.write_bytes(n.as_bytes());
+        h.write_byte(b':');
+        h.write_byte(if c.append_only { b'A' } else { b'M' });
+        h.write_byte(b'{');
+        for (f, info) in &c.fields {
+            h.write_bytes(f.as_bytes());
+            h.write_byte(b':');
+            h.write_bytes(info.ty.name().as_bytes());
+            if info.fts {
+                h.write_bytes(b"+fts");
+            }
+            if info.unique {
+                h.write_bytes(b"+uniq");
+            }
+            h.write_byte(b',');
+        }
+        h.write_byte(b'}');
+        if let Some(src) = &c.filter_src {
+            h.write_byte(b'?');
+            h.write_bytes(src.as_bytes());
+        }
+        h.write_byte(b';');
+    }
+    h.write_byte(b'|');
+    for (n, r) in &cat.rels {
+        h.write_bytes(n.as_bytes());
+        if r.stub {
+            h.write_bytes(b":stub");
+        }
+        if let Some(of) = &r.reverse_of {
+            h.write_byte(b'=');
+            h.write_bytes(of.as_bytes());
+        }
+        h.write_byte(b';');
+    }
+    h.write_byte(b'|');
+    for (n, idx) in &cat.indexes {
+        h.write_bytes(n.as_bytes());
+        h.write_byte(b':');
+        if idx.unique {
+            h.write_byte(b'U');
+        }
+        h.write_byte(b'[');
+        for (i, f) in idx.fields.iter().enumerate() {
+            if i > 0 {
+                h.write_byte(b',');
+            }
+            h.write_bytes(f.as_bytes());
+        }
+        h.write_byte(b']');
+        if let Some(pred) = &idx.pred {
+            h.write_byte(b'?');
+            let _ = write!(&mut h, "{pred}");
+        }
+        h.write_byte(b';');
+    }
+    h.write_byte(b'|');
+    for (n, fields) in &cat.owned {
+        h.write_bytes(n.as_bytes());
+        h.write_byte(b'{');
+        for (f, info) in fields {
+            h.write_bytes(f.as_bytes());
+            h.write_byte(b':');
+            h.write_bytes(info.ty.name().as_bytes());
+            h.write_byte(b',');
+        }
+        h.write_bytes(b"};");
+    }
+    h.write_byte(b'|');
+    for fk in &cat.fks {
+        h.write_bytes(fk.from_col.as_bytes());
+        h.write_byte(b'.');
+        h.write_bytes(fk.from_field.as_bytes());
+        h.write_bytes(b"->");
+        h.write_bytes(fk.to_col.as_bytes());
+        h.write_byte(b'.');
+        h.write_bytes(fk.to_field.as_bytes());
+        h.write_byte(b';');
+    }
+    h.write_byte(b'|');
+    for g in &cat.guards {
+        h.write_bytes(g.collection.as_bytes());
+        h.write_byte(b'.');
+        h.write_bytes(g.field.as_bytes());
+        h.write_byte(b'?');
+        let _ = write!(&mut h, "{}", g.pred);
+        h.write_byte(b';');
+    }
+    format!("h:{:016x}", h.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

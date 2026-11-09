@@ -41,7 +41,10 @@ unsafe fn crc32c_aarch64(mut crc: u32, data: &[u8]) -> u32 {
     use core::arch::aarch64::*;
     let mut chunks = data.chunks_exact(8);
     for chunk in &mut chunks {
-        let val = u64::from_le_bytes(chunk.try_into().unwrap());
+        let &[b0, b1, b2, b3, b4, b5, b6, b7] = chunk else {
+            unreachable!()
+        };
+        let val = u64::from_le_bytes([b0, b1, b2, b3, b4, b5, b6, b7]);
         crc = __crc32cd(crc, val);
     }
     let rem = chunks.remainder();
@@ -58,7 +61,10 @@ unsafe fn crc32c_x86_64(mut crc: u32, data: &[u8]) -> u32 {
     let mut chunks = data.chunks_exact(8);
     let mut crc64 = crc as u64;
     for chunk in &mut chunks {
-        let val = u64::from_le_bytes(chunk.try_into().unwrap());
+        let &[b0, b1, b2, b3, b4, b5, b6, b7] = chunk else {
+            unreachable!()
+        };
+        let val = u64::from_le_bytes([b0, b1, b2, b3, b4, b5, b6, b7]);
         crc64 = _mm_crc32_u64(crc64, val);
     }
     crc = crc64 as u32;

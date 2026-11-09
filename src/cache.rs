@@ -9,7 +9,6 @@
 //! 5. **Custom Binary TCP Protocol** (`LINC\x01` + `u32` LE length + MessagePack payload) and interactive CLI client (`lin cache cli`).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,7 +17,6 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rustc_hash::FxHashMap;
-use serde::{Deserialize, Serialize};
 
 use crate::error::Error;
 use crate::exec::{Db, OpenOpts, SyncMode};
@@ -43,583 +41,13 @@ fn unix_ms() -> u64 {
         .as_millis() as u64
 }
 
-// ============================================================================
-// 1. Wire Protocol & Data Types (Custom Binary TCP Protocol)
-// ============================================================================
+#[path = "cache/cluster.rs"]
+mod cluster;
+#[path = "cache/protocol.rs"]
+mod protocol;
 
-/// Value stored in the distributed cache.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum CacheValue {
-    String(Vec<u8>),
-    Int(i64),
-    Hash(BTreeMap<String, Vec<u8>>),
-    List(VecDeque<Vec<u8>>),
-    Set(BTreeSet<String>),
-}
-
-impl CacheValue {
-    pub fn type_name(&self) -> &'static str {
-        match self {
-            CacheValue::String(_) | CacheValue::Int(_) => "string",
-            CacheValue::Hash(_) => "hash",
-            CacheValue::List(_) => "list",
-            CacheValue::Set(_) => "set",
-        }
-    }
-
-    pub fn estimated_bytes(&self) -> usize {
-        match self {
-            CacheValue::String(b) => 24 + b.len(),
-            CacheValue::Int(_) => 32,
-            CacheValue::Hash(m) => {
-                32 + m.iter().map(|(k, v)| k.len() + v.len() + 16).sum::<usize>()
-            }
-            CacheValue::List(l) => 32 + l.iter().map(|v| v.len() + 8).sum::<usize>(),
-            CacheValue::Set(s) => 32 + s.iter().map(|v| v.len() + 8).sum::<usize>(),
-        }
-    }
-
-    pub fn as_str_lossy(&self) -> String {
-        match self {
-            CacheValue::String(b) => String::from_utf8_lossy(b).into_owned(),
-            CacheValue::Int(n) => n.to_string(),
-            CacheValue::Hash(m) => serde_json::to_string(
-                &m.iter()
-                    .map(|(k, v)| (k.clone(), String::from_utf8_lossy(v).into_owned()))
-                    .collect::<BTreeMap<_, _>>(),
-            )
-            .unwrap_or_default(),
-            CacheValue::List(l) => serde_json::to_string(
-                &l.iter()
-                    .map(|v| String::from_utf8_lossy(v).into_owned())
-                    .collect::<Vec<_>>(),
-            )
-            .unwrap_or_default(),
-            CacheValue::Set(s) => serde_json::to_string(s).unwrap_or_default(),
-        }
-    }
-}
-
-/// Entry in the cache with TTL and LRU metadata.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CacheEntry {
-    pub value: CacheValue,
-    /// Optional absolute expiration timestamp in Unix ms.
-    pub expires_at_ms: Option<u64>,
-    /// Monotonic counter or timestamp of last access for LRU.
-    pub last_access_seq: u64,
-    /// Generation/version in the cluster.
-    pub version: u64,
-}
-
-impl CacheEntry {
-    pub fn is_expired(&self, now: u64) -> bool {
-        self.expires_at_ms.is_some_and(|exp| now >= exp)
-    }
-}
-
-/// Client and inter-node Commands over the custom binary protocol.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum CacheRequest {
-    // --- Basic & String Operations ---
-    Ping(Option<String>),
-    Get {
-        key: String,
-    },
-    Set {
-        key: String,
-        value: Vec<u8>,
-        ttl_ms: Option<u64>,
-    },
-    Del {
-        keys: Vec<String>,
-    },
-    Exists {
-        key: String,
-    },
-    IncrBy {
-        key: String,
-        delta: i64,
-    },
-    Expire {
-        key: String,
-        ttl_ms: u64,
-    },
-    Persist {
-        key: String,
-    },
-    Ttl {
-        key: String,
-    },
-    Keys {
-        prefix: String,
-    },
-    FlushAll,
-
-    // --- Hash Operations ---
-    HSet {
-        key: String,
-        field: String,
-        value: Vec<u8>,
-    },
-    HGet {
-        key: String,
-        field: String,
-    },
-    HDel {
-        key: String,
-        fields: Vec<String>,
-    },
-    HGetAll {
-        key: String,
-    },
-
-    // --- List Operations ---
-    LPush {
-        key: String,
-        values: Vec<Vec<u8>>,
-    },
-    RPush {
-        key: String,
-        values: Vec<Vec<u8>>,
-    },
-    LPop {
-        key: String,
-    },
-    RPop {
-        key: String,
-    },
-    LRange {
-        key: String,
-        start: isize,
-        stop: isize,
-    },
-
-    // --- Set Operations ---
-    SAdd {
-        key: String,
-        members: Vec<String>,
-    },
-    SRem {
-        key: String,
-        members: Vec<String>,
-    },
-    SMembers {
-        key: String,
-    },
-    SIsMember {
-        key: String,
-        member: String,
-    },
-
-    // --- Pub/Sub Operations ---
-    Publish {
-        channel: String,
-        message: Vec<u8>,
-    },
-    Subscribe {
-        channels: Vec<String>,
-    },
-
-    // --- Native Lin Pipe Query Integration ---
-    /// Execute a native Lin query or mutation on the underlying `lin::Db`!
-    LinQuery {
-        query: String,
-    },
-
-    // --- Cluster, Sharding, Gossip & Raft Introspection ---
-    ClusterInfo,
-    ClusterNodes,
-    ClusterMeet {
-        node_id: String,
-        addr: String,
-    },
-    ClusterKeySlot {
-        key: String,
-    },
-    RaftStatus,
-    RaftTriggerElection,
-
-    // --- Internal Inter-Node RPCs (Sharding, Gossip, Raft) ---
-    /// Direct execution on owning shard without re-routing loop.
-    InternalShardExec {
-        inner: Box<CacheRequest>,
-    },
-    /// Gossip membership + Pub/Sub + anti-entropy digest exchange.
-    GossipSync {
-        sender_id: String,
-        sender_addr: String,
-        members: Vec<NodeMember>,
-        pubsub_events: Vec<PubSubEvent>,
-    },
-    /// Raft RequestVote RPC.
-    RaftRequestVote {
-        term: u64,
-        candidate_id: String,
-        last_log_index: u64,
-        last_log_term: u64,
-    },
-    /// Raft AppendEntries / Heartbeat RPC (includes optional Lin WAL frames).
-    RaftAppendEntries {
-        term: u64,
-        leader_id: String,
-        leader_addr: String,
-        prev_log_index: u64,
-        prev_log_term: u64,
-        entries: Vec<RaftLogEntry>,
-        leader_commit: u64,
-    },
-}
-
-/// Binary Response returned by `CacheNode`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum CacheResponse {
-    Pong(String),
-    Ok,
-    Nil,
-    Int(i64),
-    Bulk(Vec<u8>),
-    Array(Vec<CacheResponse>),
-    Map(BTreeMap<String, Vec<u8>>),
-    Text(String),
-    Error(String),
-    /// Pushed to subscribed clients during `SUBSCRIBE`.
-    PubSubMessage {
-        channel: String,
-        payload: Vec<u8>,
-        origin_node: String,
-    },
-    /// Gossip reply.
-    GossipAck {
-        node_id: String,
-        members: Vec<NodeMember>,
-    },
-    /// Raft RequestVote reply.
-    RaftVoteReply {
-        term: u64,
-        vote_granted: bool,
-    },
-    /// Raft AppendEntries reply.
-    RaftAppendReply {
-        term: u64,
-        success: bool,
-        match_index: u64,
-    },
-}
-
-impl CacheResponse {
-    /// Format human-readable output for `lin cache cli`.
-    pub fn format_cli(&self) -> String {
-        match self {
-            CacheResponse::Pong(s) => format!("PONG ({s})"),
-            CacheResponse::Ok => "OK".to_string(),
-            CacheResponse::Nil => "(nil)".to_string(),
-            CacheResponse::Int(n) => format!("(integer) {n}"),
-            CacheResponse::Bulk(b) => match std::str::from_utf8(b) {
-                Ok(s) => format!("{s:?}"),
-                Err(_) => format!("(bytes {:?})", b),
-            },
-            CacheResponse::Text(s) => s.clone(),
-            CacheResponse::Error(e) => format!("(error) {e}"),
-            CacheResponse::Array(items) => {
-                if items.is_empty() {
-                    return "(empty array)".to_string();
-                }
-                let mut out = String::new();
-                for (i, item) in items.iter().enumerate() {
-                    if i > 0 {
-                        out.push('\n');
-                    }
-                    out.push_str(&format!("{}) {}", i + 1, item.format_cli()));
-                }
-                out
-            }
-            CacheResponse::Map(map) => {
-                if map.is_empty() {
-                    return "(empty map)".to_string();
-                }
-                let mut out = String::new();
-                for (i, (k, v)) in map.iter().enumerate() {
-                    if i > 0 {
-                        out.push('\n');
-                    }
-                    let val_str = String::from_utf8_lossy(v);
-                    out.push_str(&format!("{k}: {val_str:?}"));
-                }
-                out
-            }
-            CacheResponse::PubSubMessage {
-                channel,
-                payload,
-                origin_node,
-            } => {
-                let msg = String::from_utf8_lossy(payload);
-                format!("[pubsub ch={channel} from={origin_node}] {msg}")
-            }
-            other => format!("{other:?}"),
-        }
-    }
-}
-
-/// Write a framed binary message (`LINC` + `u8` ver + `u32` LE len + MessagePack).
-pub fn write_frame<W: Write, T: Serialize>(w: &mut W, msg: &T) -> Result<(), Error> {
-    let payload = rmp_serde::to_vec_named(msg).map_err(cache_err)?;
-    if payload.len() as u64 > MAX_FRAME_LEN as u64 {
-        return Err(cache_err(format!(
-            "frame payload {} exceeds max {}",
-            payload.len(),
-            MAX_FRAME_LEN
-        )));
-    }
-    let len = payload.len() as u32;
-    let mut header = [0u8; 9];
-    header[0..4].copy_from_slice(&CACHE_MAGIC);
-    header[4] = CACHE_VERSION;
-    header[5..9].copy_from_slice(&len.to_le_bytes());
-    w.write_all(&header).map_err(cache_err)?;
-    w.write_all(&payload).map_err(cache_err)?;
-    w.flush().map_err(cache_err)?;
-    Ok(())
-}
-
-/// Read a framed binary message (`LINC` + `u8` ver + `u32` LE len + MessagePack).
-pub fn read_frame<R: Read, T: for<'de> Deserialize<'de>>(r: &mut R) -> Result<T, Error> {
-    let mut header = [0u8; 9];
-    r.read_exact(&mut header).map_err(cache_err)?;
-    if header[0..4] != CACHE_MAGIC {
-        return Err(cache_err("invalid protocol magic (expected LINC)"));
-    }
-    if header[4] != CACHE_VERSION {
-        return Err(cache_err(format!(
-            "unsupported protocol version {}",
-            header[4]
-        )));
-    }
-    let len = u32::from_le_bytes([header[5], header[6], header[7], header[8]]);
-    if len > MAX_FRAME_LEN {
-        return Err(cache_err(format!("frame length {len} exceeds maximum")));
-    }
-    let mut buf = vec![0u8; len as usize];
-    r.read_exact(&mut buf).map_err(cache_err)?;
-    rmp_serde::from_slice(&buf).map_err(cache_err)
-}
-
-// ============================================================================
-// 2. Consistent Hashing Ring (Sharding + Replication)
-// ============================================================================
-
-/// Consistent hash ring using `crc32fast` and virtual nodes.
-#[derive(Debug, Clone)]
-pub struct ConsistentHashRing {
-    /// Virtual node hash -> physical `node_id`.
-    ring: BTreeMap<u32, String>,
-    /// Physical `node_id` -> network address (`host:port`).
-    nodes: BTreeMap<String, String>,
-    /// Number of virtual nodes per physical node.
-    vnodes: usize,
-    /// Replication factor (how many distinct physical nodes own a key).
-    replication_factor: usize,
-}
-
-impl Default for ConsistentHashRing {
-    fn default() -> Self {
-        Self::new(DEFAULT_VNODES, 2)
-    }
-}
-
-impl ConsistentHashRing {
-    pub fn new(vnodes: usize, replication_factor: usize) -> Self {
-        Self {
-            ring: BTreeMap::new(),
-            nodes: BTreeMap::new(),
-            vnodes: vnodes.max(1),
-            replication_factor: replication_factor.max(1),
-        }
-    }
-
-    pub fn hash_key(key: &str) -> u32 {
-        // Support Redis-style hash tags `{user:123}:profile` -> hashes `user:123`
-        if let Some(start) = key.find('{')
-            && let Some(end) = key[start + 1..].find('}')
-            && end > 0
-        {
-            let tag = &key[start + 1..start + 1 + end];
-            return crc32fast::hash(tag.as_bytes());
-        }
-        crc32fast::hash(key.as_bytes())
-    }
-
-    pub fn add_node(&mut self, node_id: impl Into<String>, addr: impl Into<String>) {
-        let node_id = node_id.into();
-        let addr = addr.into();
-        self.nodes.insert(node_id.clone(), addr);
-        for v in 0..self.vnodes {
-            let vkey = format!("{node_id}#vn{v}");
-            let h = crc32fast::hash(vkey.as_bytes());
-            self.ring.insert(h, node_id.clone());
-        }
-    }
-
-    pub fn remove_node(&mut self, node_id: &str) {
-        if self.nodes.remove(node_id).is_some() {
-            self.ring.retain(|_, nid| nid != node_id);
-        }
-    }
-
-    pub fn node_addr(&self, node_id: &str) -> Option<&str> {
-        self.nodes.get(node_id).map(String::as_str)
-    }
-
-    pub fn nodes(&self) -> &BTreeMap<String, String> {
-        &self.nodes
-    }
-
-    /// Return the primary owner `(node_id, addr)` for `key`.
-    pub fn primary_for_key(&self, key: &str) -> Option<(String, String)> {
-        let replicas = self.replicas_for_key(key);
-        replicas.into_iter().next()
-    }
-
-    /// Return up to `replication_factor` distinct physical nodes `(node_id, addr)` clockwise on the ring.
-    pub fn replicas_for_key(&self, key: &str) -> Vec<(String, String)> {
-        if self.ring.is_empty() {
-            return Vec::new();
-        }
-        let h = Self::hash_key(key);
-        let target = self.replication_factor.min(self.nodes.len());
-        let mut out = Vec::with_capacity(target);
-        let mut seen = BTreeSet::new();
-
-        for (_, nid) in self.ring.range(h..).chain(self.ring.iter()) {
-            if seen.insert(nid.clone()) {
-                if let Some(addr) = self.nodes.get(nid) {
-                    out.push((nid.clone(), addr.clone()));
-                }
-                if out.len() >= target {
-                    break;
-                }
-            }
-        }
-        out
-    }
-}
-
-// ============================================================================
-// 3. Gossip Membership & Pub/Sub State
-// ============================================================================
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum NodeRole {
-    Leader,
-    Follower,
-    Candidate,
-}
-
-impl NodeRole {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            NodeRole::Leader => "leader",
-            NodeRole::Follower => "follower",
-            NodeRole::Candidate => "candidate",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NodeMember {
-    pub node_id: String,
-    pub addr: String,
-    pub heartbeat: u64,
-    pub last_seen_ms: u64,
-    pub alive: bool,
-    pub role: NodeRole,
-    pub term: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PubSubEvent {
-    pub id: u64,
-    pub channel: String,
-    pub payload: Vec<u8>,
-    pub origin_node: String,
-}
-
-// ============================================================================
-// 4. Raft Consensus & Replicated Log
-// ============================================================================
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum RaftCommand {
-    Set {
-        key: String,
-        value: CacheValue,
-        expires_at_ms: Option<u64>,
-    },
-    Del {
-        keys: Vec<String>,
-    },
-    FlushAll,
-    LinMutation {
-        query: String,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RaftLogEntry {
-    pub index: u64,
-    pub term: u64,
-    pub command: RaftCommand,
-}
-
-#[derive(Debug, Clone)]
-pub struct RaftState {
-    pub current_term: u64,
-    pub voted_for: Option<String>,
-    pub role: NodeRole,
-    pub leader_id: Option<String>,
-    pub leader_addr: Option<String>,
-    pub log: Vec<RaftLogEntry>,
-    pub commit_index: u64,
-    pub last_applied: u64,
-    pub last_leader_contact_ms: u64,
-}
-
-impl Default for RaftState {
-    fn default() -> Self {
-        Self {
-            current_term: 1,
-            voted_for: None,
-            role: NodeRole::Leader, // Single node starts as leader; multi-node adjusts on gossip/election
-            leader_id: None,
-            leader_addr: None,
-            log: Vec::new(),
-            commit_index: 0,
-            last_applied: 0,
-            last_leader_contact_ms: unix_ms(),
-        }
-    }
-}
-
-impl RaftState {
-    pub fn last_log_index(&self) -> u64 {
-        self.log.last().map(|e| e.index).unwrap_or(0)
-    }
-
-    pub fn last_log_term(&self) -> u64 {
-        self.log.last().map(|e| e.term).unwrap_or(0)
-    }
-
-    pub fn term_at(&self, index: u64) -> u64 {
-        if index == 0 {
-            return 0;
-        }
-        self.log
-            .iter()
-            .find(|e| e.index == index)
-            .map(|e| e.term)
-            .unwrap_or(0)
-    }
-}
+pub use cluster::*;
+pub use protocol::*;
 
 // ============================================================================
 // 5. Storage Engine: In-Memory Cache + LRU + TTL + Lin Db Persistence
@@ -819,41 +247,62 @@ impl EngineState {
 
     fn evict_expired_and_lru(&mut self, max_entries: usize, max_bytes: usize) {
         let now = unix_ms();
-        // 1. Collect expired keys first
-        let expired: Vec<String> = self
-            .entries
-            .iter()
-            .filter(|(_, e)| e.is_expired(now))
-            .map(|(k, _)| k.clone())
-            .collect();
-        for k in expired {
-            if let Some(removed) = self.entries.remove(&k) {
-                self.used_bytes = self
-                    .used_bytes
-                    .saturating_sub(k.len() + removed.value.estimated_bytes());
-                self.expired_cleaned += 1;
-                self.delete_entry_from_lin(&k);
+        // 1. Collect expired keys first (fast-path check avoids Vec allocation when none are expired)
+        if self.entries.values().any(|e| e.is_expired(now)) {
+            let expired: Vec<String> = self
+                .entries
+                .iter()
+                .filter(|(_, e)| e.is_expired(now))
+                .map(|(k, _)| k.clone())
+                .collect();
+            for k in expired {
+                if let Some(removed) = self.entries.remove(&k) {
+                    self.used_bytes = self
+                        .used_bytes
+                        .saturating_sub(k.len() + removed.value.estimated_bytes());
+                    self.expired_cleaned += 1;
+                    self.delete_entry_from_lin(&k);
+                }
             }
         }
 
         // 2. Evict LRU if over capacity
-        while (self.entries.len() > max_entries || self.used_bytes > max_bytes)
+        if (self.entries.len() > max_entries || self.used_bytes > max_bytes)
             && !self.entries.is_empty()
         {
-            let Some(oldest_key) = self
-                .entries
-                .iter()
-                .min_by_key(|(_, e)| e.last_access_seq)
-                .map(|(k, _)| k.clone())
-            else {
-                break;
-            };
-            if let Some(removed) = self.entries.remove(&oldest_key) {
-                self.used_bytes = self
-                    .used_bytes
-                    .saturating_sub(oldest_key.len() + removed.value.estimated_bytes());
-                self.evictions += 1;
-                self.delete_entry_from_lin(&oldest_key);
+            if self.entries.len() == max_entries + 1 && self.used_bytes <= max_bytes {
+                if let Some(oldest_key) = self
+                    .entries
+                    .iter()
+                    .min_by_key(|(_, e)| e.last_access_seq)
+                    .map(|(k, _)| k.clone())
+                    && let Some(removed) = self.entries.remove(&oldest_key)
+                {
+                    self.used_bytes = self
+                        .used_bytes
+                        .saturating_sub(oldest_key.len() + removed.value.estimated_bytes());
+                    self.evictions += 1;
+                    self.delete_entry_from_lin(&oldest_key);
+                }
+            } else {
+                let mut candidates: Vec<(u64, String)> = self
+                    .entries
+                    .iter()
+                    .map(|(k, e)| (e.last_access_seq, k.clone()))
+                    .collect();
+                candidates.sort_unstable_by_key(|(seq, _)| *seq);
+                for (_, oldest_key) in candidates {
+                    if self.entries.len() <= max_entries && self.used_bytes <= max_bytes {
+                        break;
+                    }
+                    if let Some(removed) = self.entries.remove(&oldest_key) {
+                        self.used_bytes = self
+                            .used_bytes
+                            .saturating_sub(oldest_key.len() + removed.value.estimated_bytes());
+                        self.evictions += 1;
+                        self.delete_entry_from_lin(&oldest_key);
+                    }
+                }
             }
         }
     }

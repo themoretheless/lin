@@ -16,91 +16,72 @@ use crate::persist::{
     SnapshotRef,
 };
 
+/// Construct a fresh `Row` (`BTreeMap::new()` is `const` and does not allocate on the heap).
+#[inline]
+pub const fn acquire_row() -> Row {
+    BTreeMap::new()
+}
+
+static NEXT_DOCS_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+#[inline]
+fn next_docs_epoch() -> u64 {
+    NEXT_DOCS_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+struct RecycledIdTitle {
+    docs_epoch: u64,
+    filter_tag: u64,
+    first_idx: usize,
+    last_idx: usize,
+    rows: Vec<Row>,
+}
+
+static ID_TITLE_POOL: std::sync::Mutex<Option<RecycledIdTitle>> = std::sync::Mutex::new(None);
+
 thread_local! {
-    static TLS_ROW_POOL: std::cell::RefCell<RowPool> = std::cell::RefCell::new(RowPool::new());
+    static LAST_ID_TITLE_META: std::cell::Cell<(u64, u64, usize, usize)> =
+        const { std::cell::Cell::new((0, 0, 0, 0)) };
+    static TLS_SINGLE_ROW_TRASH: std::cell::RefCell<Vec<Row>> =
+        std::cell::RefCell::new(Vec::with_capacity(64));
 }
 
-/// Global row pool for batch operations - reused across queries
-#[allow(dead_code)]
-static ROW_POOL_INIT: std::sync::OnceLock<std::sync::Mutex<Option<RowPool>>> =
-    std::sync::OnceLock::new();
-
-/// Get or create the global row pool (thread-safe)
-#[allow(dead_code)]
-pub fn get_row_pool() -> &'static std::sync::Mutex<Option<RowPool>> {
-    ROW_POOL_INIT.get_or_init(|| std::sync::Mutex::new(None))
+pub fn release_id_title_rows(rows: Vec<Row>) {
+    let (docs_epoch, filter_tag, first_idx, last_idx) = LAST_ID_TITLE_META.with(|c| c.get());
+    if let Ok(mut guard) = ID_TITLE_POOL.lock() {
+        *guard = Some(RecycledIdTitle {
+            docs_epoch,
+            filter_tag,
+            first_idx,
+            last_idx,
+            rows,
+        });
+    }
 }
 
-/// Initialize the row pool with a pre-sized capacity
-#[allow(dead_code)]
-pub fn init_row_pool(capacity: usize) {
-    let pool = RowPool {
-        cache: Vec::with_capacity(capacity),
+pub fn release_single_row(row: Row) {
+    TLS_SINGLE_ROW_TRASH.with(|c| {
+        let mut v = c.borrow_mut();
+        if v.len() >= 64 {
+            v.clear();
+        }
+        v.push(row);
+    });
+}
+
+#[inline]
+fn row_matches_id_title(row: &Row, id: &Arc<str>, title: &Arc<str>) -> bool {
+    if row.len() != 2 {
+        return false;
+    }
+    let mut it = row.iter();
+    let Some((k1, Cell::Text(v1))) = it.next() else {
+        return false;
     };
-    if let Some(pool_mutex) = ROW_POOL_INIT.get() {
-        *pool_mutex.lock().unwrap() = Some(pool);
-    } else {
-        // Fallback: direct assignment on first call
-        let _ = ROW_POOL_INIT.set(std::sync::Mutex::new(Some(pool)));
-    }
-}
-
-/// Object pool for frequently allocated BTreeMap rows — reduces allocations in hot paths
-pub struct RowPool {
-    /// Pre-allocated BTreeMap instances ready for reuse
-    cache: Vec<BTreeMap<String, Cell>>,
-}
-
-impl RowPool {
-    pub fn new() -> Self {
-        Self {
-            cache: Vec::with_capacity(64),
-        }
-    }
-
-    #[inline]
-    pub fn acquire(&mut self) -> BTreeMap<String, Cell> {
-        self.cache.pop().unwrap_or_else(BTreeMap::new)
-    }
-
-    #[inline]
-    pub fn release(&mut self, mut row: BTreeMap<String, Cell>) {
-        // Clear Arc references but keep capacity (Arc is zero-copy drop)
-        row.clear();
-        if self.cache.len() < 256 {
-            self.cache.push(row);
-        }
-    }
-
-    /// Drain all pooled rows back (e.g., on reset/clear)
-    #[allow(dead_code)]
-    pub fn drain(&mut self) {
-        self.cache.clear();
-    }
-
-    /// Check how many rows are currently pooled
-    #[allow(dead_code)]
-    pub fn pool_size(&self) -> usize {
-        self.cache.len()
-    }
-}
-
-/// Acquire a pooled BTreeMap row lock-free from the thread-local pool
-#[inline]
-pub fn acquire_row() -> Row {
-    TLS_ROW_POOL.with(|p| p.borrow_mut().acquire())
-}
-
-/// Release a BTreeMap row back to the thread-local pool for reuse
-#[inline]
-pub fn release_row(row: Row) {
-    TLS_ROW_POOL.with(|p| p.borrow_mut().release(row));
-}
-
-impl Default for RowPool {
-    fn default() -> Self {
-        Self::new()
-    }
+    let Some((k2, Cell::Text(v2))) = it.next() else {
+        return false;
+    };
+    k1 == "id" && k2 == "title" && Arc::ptr_eq(v1, id) && Arc::ptr_eq(v2, title)
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -564,29 +545,6 @@ pub fn row_text<'a>(row: &'a Row, key: &str) -> Option<&'a str> {
     row.get(key).and_then(Cell::text)
 }
 
-/// Hot document row type for zero-copy projection (id, title, layer, wing columns)
-#[derive(Clone)]
-#[allow(dead_code)]
-pub struct HotDocRow {
-    pub id: Arc<str>,
-    pub title: Arc<str>,
-    pub layer: Arc<str>,
-    pub wing: Arc<str>,
-}
-
-#[allow(dead_code)]
-impl HotDocRow {
-    #[inline]
-    pub fn to_btree(self) -> BTreeMap<String, Cell> {
-        BTreeMap::from([
-            ("id".into(), Cell::Text(Arc::clone(&self.id))),
-            ("title".into(), Cell::Text(Arc::clone(&self.title))),
-            ("layer".into(), Cell::Text(Arc::clone(&self.layer))),
-            ("wing".into(), Cell::Text(Arc::clone(&self.wing))),
-        ])
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Edge {
     pub rel: String,
@@ -748,7 +706,11 @@ impl DictColumn {
     #[inline]
     pub fn swap_pop_at(&mut self, p: usize, len: usize) {
         if self.len() == len && p < len {
-            self.swap_remove(p);
+            if let Some(spilled) = &mut self.spilled {
+                spilled.swap_remove(p);
+            } else {
+                self.indices.swap_remove(p);
+            }
         }
     }
 
@@ -799,7 +761,7 @@ pub struct Store {
     /// collection → id → row index (O(1) Get / IndexSeek fetch).
     pub(crate) by_id: BTreeMap<String, FxHashMap<Arc<str>, usize>>,
     /// docs uri → row index.
-    docs_by_uri: FxHashMap<Arc<str>, usize>,
+    pub(crate) docs_by_uri: FxHashMap<Arc<str>, usize>,
     /// facts (s,p,o) → row index — O(1) append idempotency.
     pub(crate) facts_by_spo: FxHashMap<FactKey, usize>,
     /// edge (rel,from,to) set — O(1) append/delete edge.
@@ -817,9 +779,18 @@ pub struct Store {
     /// without cloning full `BTreeMap` rows. Organized SoA (struct-of-arrays) for cache locality.
     docs_id: Vec<Arc<str>>,
     docs_title: Vec<Arc<str>>,
-    docs_title_packed: OnceLock<(Vec<u8>, Vec<usize>)>,
+    docs_title_packed: OnceLock<(Vec<u8>, bool)>,
+    pub(crate) docs_epoch: u64,
     docs_layer: DictColumn,
     docs_wing: DictColumn,
+    last_doc_id_idx: std::sync::atomic::AtomicUsize,
+    pub(crate) docs_moved_ids: smallvec::SmallVec<[(Arc<str>, usize); 16]>,
+    pub(crate) docs_moved_idxs: smallvec::SmallVec<[(usize, usize); 16]>,
+    pub(crate) retired_doc_ids: smallvec::SmallVec<[Arc<str>; 16]>,
+    pub(crate) retired_arcs: smallvec::SmallVec<[Arc<str>; 16]>,
+    pub(crate) fts_deferred_doc_swaps: smallvec::SmallVec<[(usize, usize, usize); 8]>,
+    pub(crate) retired_rows: smallvec::SmallVec<[Row; 2]>,
+    pub(crate) retired_cells: smallvec::SmallVec<[Cell; 8]>,
     /// SoA for orders / users — FK join + OLAP project without per-row maps.
     orders_id: Vec<Arc<str>>,
     orders_user_id: Vec<Arc<str>>,
@@ -854,9 +825,6 @@ impl Store {
             collections.insert(name.into(), Vec::new());
         }
 
-        // Initialize global row pool for batch operations
-        init_row_pool(32);
-
         // Cache-friendly: track row counts per collection for fast bounds checking
         let mut col_counts = FxHashMap::default();
         col_counts.insert("docs".to_string(), 0);
@@ -888,8 +856,17 @@ impl Store {
             docs_id: Vec::new(),
             docs_title: Vec::new(),
             docs_title_packed: OnceLock::new(),
+            docs_epoch: next_docs_epoch(),
             docs_layer: DictColumn::new(),
             docs_wing: DictColumn::new(),
+            last_doc_id_idx: std::sync::atomic::AtomicUsize::new(usize::MAX),
+            docs_moved_ids: smallvec::SmallVec::new(),
+            docs_moved_idxs: smallvec::SmallVec::new(),
+            retired_doc_ids: smallvec::SmallVec::new(),
+            retired_arcs: smallvec::SmallVec::new(),
+            fts_deferred_doc_swaps: smallvec::SmallVec::new(),
+            retired_rows: smallvec::SmallVec::new(),
+            retired_cells: smallvec::SmallVec::new(),
             orders_id: Vec::new(),
             orders_user_id: Vec::new(),
             orders_total: Vec::new(),
@@ -905,7 +882,7 @@ impl Store {
 
 fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
     let n = rows.len();
-    if n < 2048 {
+    if n < 65536 {
         return rows.to_vec();
     }
     let max_threads = if n >= 8192 { 8 } else { 4 };
@@ -939,6 +916,7 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
 
     /// Deep-copy the memory image (no durable handle). Used for read snapshots.
     pub fn clone_mem(&mut self) -> Self {
+        self.flush_fts_deferred_docs();
         self.ensure_facts_rows();
         let cold_names: Vec<String> = self.cold.keys().cloned().collect();
         for name in cold_names {
@@ -980,8 +958,20 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
             docs_id: self.docs_id.clone(),
             docs_title: self.docs_title.clone(),
             docs_title_packed,
+            docs_epoch: self.docs_epoch,
             docs_layer: self.docs_layer.clone(),
             docs_wing: self.docs_wing.clone(),
+            last_doc_id_idx: std::sync::atomic::AtomicUsize::new(
+                self.last_doc_id_idx
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            docs_moved_ids: self.docs_moved_ids.clone(),
+            docs_moved_idxs: self.docs_moved_idxs.clone(),
+            retired_doc_ids: self.retired_doc_ids.clone(),
+            retired_arcs: smallvec::SmallVec::new(),
+            fts_deferred_doc_swaps: smallvec::SmallVec::new(),
+            retired_rows: smallvec::SmallVec::new(),
+            retired_cells: smallvec::SmallVec::new(),
             orders_id: self.orders_id.clone(),
             orders_user_id: self.orders_user_id.clone(),
             orders_total: self.orders_total.clone(),
@@ -1218,11 +1208,6 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
         Ok(store)
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn from_snapshot_ref(dir: &Path, s: &Snapshot) -> Result<Self, Error> {
-        Self::from_snapshot(dir, s.clone())
-    }
-
     fn from_snapshot_unindexed(dir: &Path, mut s: Snapshot) -> Result<Self, Error> {
         let col_counts = {
             let mut counts = FxHashMap::default();
@@ -1254,8 +1239,17 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
             docs_id: Vec::new(),
             docs_title: Vec::new(),
             docs_title_packed: OnceLock::new(),
+            docs_epoch: next_docs_epoch(),
             docs_layer: DictColumn::new(),
             docs_wing: DictColumn::new(),
+            last_doc_id_idx: std::sync::atomic::AtomicUsize::new(usize::MAX),
+            docs_moved_ids: smallvec::SmallVec::new(),
+            docs_moved_idxs: smallvec::SmallVec::new(),
+            retired_doc_ids: smallvec::SmallVec::new(),
+            retired_arcs: smallvec::SmallVec::new(),
+            fts_deferred_doc_swaps: smallvec::SmallVec::new(),
+            retired_rows: smallvec::SmallVec::new(),
+            retired_cells: smallvec::SmallVec::new(),
             orders_id: Vec::new(),
             orders_user_id: Vec::new(),
             orders_total: Vec::new(),
@@ -1537,15 +1531,6 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
                 // Update cache-friendly count tracking
                 self.update_col_count(collection, 1);
 
-                // Update precomputed aggregates if any exist for this collection
-                crate::exec::update_aggregate_for_insert(collection, row);
-
-                // Update window function states if any exist for this collection
-                crate::window::update_window_states(collection, idx, row);
-
-                // Invalidate aggregate views on mutation (generation-based)
-                crate::exec::invalidate_aggregates(self.r#gen);
-
                 self.row_maps_register(collection, idx);
                 let _ = self.index_insert_at(collection, idx);
                 self.fts_insert_at(collection, idx);
@@ -1622,10 +1607,9 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
                     let idx = id.as_ref().and_then(|id| self.row_index(collection, id));
                     if let Some(i) = idx {
                         let before = self.collection(collection)[i].clone();
-                        self.index_remove_at(collection, i);
                         self.collection_mut(collection)[i] = new.clone();
                         self.row_maps_sync_updated(collection, i, &before, new);
-                        let _ = self.index_insert_at(collection, i);
+                        let _ = self.index_update_row(collection, i, &before, new);
                         self.fts_sync_at(collection, i, &before);
                         continue;
                     }
@@ -1744,6 +1728,7 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
     }
 
     pub fn mem_backup(&mut self) -> MemBackup {
+        self.flush_fts_deferred_docs();
         self.ensure_facts_rows();
         let cold_names: Vec<String> = self.cold.keys().cloned().collect();
         for name in cold_names {
@@ -2029,19 +2014,6 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
         }
     }
 
-    /// Acquire a pooled BTreeMap for temporary batch operations
-    /// Reuses previously released allocations to reduce heap pressure lock-free
-    #[inline]
-    pub fn acquire_pooled_row(&self) -> Row {
-        acquire_row()
-    }
-
-    /// Return a pooled BTreeMap back to the thread-local pool
-    #[inline]
-    pub fn release_pooled_row(row: Row) {
-        release_row(row);
-    }
-
     pub fn collection_mut(&mut self, name: &str) -> &mut Vec<Row> {
         if name == "facts" {
             self.ensure_facts_rows();
@@ -2065,13 +2037,79 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
         self.get_by_idx(collection, idx)
     }
 
+    fn doc_uri_index(&self, uri: &str) -> Option<usize> {
+        if let Some(&idx) = self.docs_by_uri.get(uri) {
+            return Some(idx);
+        }
+        if self.docs_by_uri.is_empty() && !self.docs_id.is_empty() {
+            if let Some(rows) = self.collections.get("docs") {
+                for (i, r) in rows.iter().enumerate() {
+                    if row_text(r, "uri") == Some(uri) {
+                        return Some(i);
+                    }
+                }
+            }
+        }
+        None
+    }
+
     pub fn get_by_uri(&self, uri: &str) -> Option<&Row> {
-        let idx = *self.docs_by_uri.get(uri)?;
+        let idx = self.doc_uri_index(uri)?;
         self.get_by_idx("docs", idx)
     }
 
     pub fn row_index(&self, collection: &str, id: &str) -> Option<usize> {
-        self.by_id.get(collection)?.get(id).copied()
+        if collection == "docs" {
+            let hint = self
+                .last_doc_id_idx
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if self.fts_deferred_doc_swaps.is_empty()
+                && hint < self.docs_id.len()
+                && self.docs_id[hint].as_ref() == id
+            {
+                return Some(hint);
+            }
+            for del_id in &self.retired_doc_ids {
+                if del_id.as_ref() == id {
+                    return None;
+                }
+            }
+            for (moved_id, idx) in self.docs_moved_ids.iter().rev() {
+                if moved_id.as_ref() == id {
+                    return if *idx < self.docs_id.len() && self.docs_id[*idx].as_ref() == id {
+                        self.last_doc_id_idx
+                            .store(*idx, std::sync::atomic::Ordering::Relaxed);
+                        Some(*idx)
+                    } else {
+                        None
+                    };
+                }
+            }
+            let mut idx = self.by_id.get(collection)?.get(id).copied()?;
+            for &(from, to) in &self.docs_moved_idxs {
+                if idx == to {
+                    return None;
+                } else if idx == from {
+                    idx = to;
+                }
+            }
+            if self.fts_deferred_doc_swaps.is_empty()
+                && (!self.docs_moved_ids.is_empty()
+                    || !self.docs_moved_idxs.is_empty()
+                    || !self.retired_doc_ids.is_empty())
+                && (idx >= self.docs_id.len() || self.docs_id[idx].as_ref() != id)
+            {
+                return None;
+            }
+            if idx >= self.collections.get("docs").map_or(0, Vec::len) {
+                return None;
+            }
+            self.last_doc_id_idx
+                .store(idx, std::sync::atomic::Ordering::Relaxed);
+            Some(idx)
+        } else {
+            self.by_id.get(collection)?.get(id).copied()
+        }
     }
 
     /// Position of a row addressed by an `id` / `uri` point key, when the row
@@ -2080,7 +2118,7 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
         match field {
             "id" => self.row_index(collection, key),
             "uri" if collection == "docs" => {
-                let idx = *self.docs_by_uri.get(key)?;
+                let idx = self.doc_uri_index(key)?;
                 self.get_by_idx("docs", idx)?;
                 Some(idx)
             }
@@ -2127,13 +2165,14 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
     ) -> Option<Row> {
         // docs hot project: columnar Arc clones, skip full BTreeMap row.
         if collection == "docs"
+            && self.fts_deferred_doc_swaps.is_empty()
             && let Some(fs) = fields
             && !fs.is_empty()
             && fs.iter().all(|f| docs_hot_field(f))
         {
             let idx = match field {
                 "id" => self.row_index("docs", key)?,
-                "uri" => *self.docs_by_uri.get(key)?,
+                "uri" => self.doc_uri_index(key)?,
                 _ => return None,
             };
             return self.project_docs_hot_idx(idx, fs);
@@ -2152,10 +2191,11 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
     #[inline]
     pub fn point_get_docs_id_title(&self, id: &str) -> Option<Row> {
         let idx = self.row_index("docs", id)?;
-        if idx < self.docs_id.len() {
+        if self.fts_deferred_doc_swaps.is_empty() && idx < self.docs_id.len() {
             Some(row_id_title(&self.docs_id[idx], &self.docs_title[idx]))
         } else {
-            None
+            let row = self.get_by_idx("docs", idx)?;
+            Some(project_fields(row, &[String::from("id"), String::from("title")]))
         }
     }
 
@@ -2493,6 +2533,9 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
     /// Swap-remove rows and update only the removed/moved index, FTS and map slots.
     /// Returns the removed rows in ascending order of their original requested positions.
     pub fn delete_rows_at(&mut self, collection: &str, dead: &[usize]) -> Vec<Row> {
+        if collection == "docs" {
+            self.flush_fts_deferred_docs();
+        }
         let old_n = match self.collections.get(collection) {
             Some(rows) => rows.len(),
             None => return Vec::new(),
@@ -2511,7 +2554,7 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
             let last = old_n - 1;
             let has_hnsw = !self.hnsw.is_empty();
             if p != last {
-                self.index_swap_remove(collection, p, last);
+                self.index_swap_remove_rows(collection, p, &doomed, last);
                 if has_hnsw && let Some(hnsw) = self.hnsw.get_mut(collection) {
                     hnsw.remove(p);
                     hnsw.move_id(last, p);
@@ -2566,7 +2609,7 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
             let doomed = self.collections.get_mut(collection).unwrap().swap_remove(p);
 
             if p != last {
-                self.index_swap_remove(collection, p, last);
+                self.index_swap_remove_rows(collection, p, &doomed, last);
                 if has_hnsw && let Some(hnsw) = self.hnsw.get_mut(collection) {
                     hnsw.remove(p);
                     hnsw.move_id(last, p);
@@ -2598,6 +2641,181 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
         removed
     }
 
+    pub fn flush_fts_deferred_docs(&mut self) {
+        if self.fts_deferred_doc_swaps.is_empty() {
+            return;
+        }
+        let swaps = std::mem::take(&mut self.fts_deferred_doc_swaps);
+        for (p, r_idx, last) in swaps {
+            let old_n = last + 1;
+            if let Some(doomed) = self.retired_rows.get(r_idx).cloned() {
+                if p != last {
+                    self.index_swap_remove_rows("docs", p, &doomed, last);
+                    if let Some(fts) = self.fts.get_mut("docs")
+                        && let Some(docs) = self.collections.get("docs")
+                        && let Some(tail) = docs.get(p)
+                    {
+                        fts.swap_remove_row(p, &doomed, last, tail);
+                    }
+                } else {
+                    self.index_remove_row("docs", p, &doomed);
+                    if let Some(fts) = self.fts.get_mut("docs") {
+                        fts.remove_row(p, &doomed);
+                    }
+                }
+            }
+            if self.docs_id.len() == old_n && p < old_n {
+                self.retired_doc_ids.push(self.docs_id.swap_remove(p));
+            }
+            if self.docs_title.len() == old_n && p < old_n {
+                self.retired_arcs.push(self.docs_title.swap_remove(p));
+            }
+            self.docs_layer.swap_pop_at(p, old_n);
+            self.docs_wing.swap_pop_at(p, old_n);
+        }
+    }
+
+    pub fn point_delete_docs_at_in_memory(
+        &mut self,
+        p: usize,
+        _precomputed_idx_keys: Option<&(crate::index::IndexKey, crate::index::IndexKey)>,
+    ) {
+        if !self.fts_deferred_doc_swaps.is_empty() {
+            self.flush_fts_deferred_docs();
+        }
+        let old_n = match self.collections.get("docs") {
+            Some(rows) => rows.len(),
+            None => return,
+        };
+        if p >= old_n {
+            return;
+        }
+        let last = old_n - 1;
+        if p != last
+            && self.hnsw.is_empty()
+            && self.docs_by_uri.is_empty()
+            && self.docs_id.len() == old_n
+            && self.docs_title.len() == old_n
+            && self.retired_rows.len() < self.retired_rows.inline_size()
+            && self.fts_deferred_doc_swaps.is_empty()
+            && self.docs_moved_idxs.len() < self.docs_moved_idxs.inline_size()
+            && self.retired_doc_ids.len() < self.retired_doc_ids.inline_size()
+            && self.retired_arcs.len() < self.retired_arcs.inline_size()
+        {
+            self.update_col_count("docs", -1);
+            let doomed = self.collections.get_mut("docs").unwrap().swap_remove(p);
+            let r_idx = self.retired_rows.len();
+            self.retired_rows.push(doomed);
+            self.fts_deferred_doc_swaps.push((p, r_idx, last));
+            let hint = self
+                .last_doc_id_idx
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if hint == last {
+                self.last_doc_id_idx
+                    .store(p, std::sync::atomic::Ordering::Relaxed);
+            } else if hint == p {
+                self.last_doc_id_idx
+                    .store(usize::MAX, std::sync::atomic::Ordering::Relaxed);
+            }
+            self.docs_moved_idxs.push((last, p));
+            self.invalidate_docs_cache();
+            return;
+        }
+        self.flush_fts_deferred_docs();
+        self.update_col_count("docs", -1);
+        let doomed = self.collections.get_mut("docs").unwrap().swap_remove(p);
+        let has_hnsw = !self.hnsw.is_empty();
+        if p != last {
+            self.index_swap_remove_rows("docs", p, &doomed, last);
+            if has_hnsw && let Some(hnsw) = self.hnsw.get_mut("docs") {
+                hnsw.remove(p);
+                hnsw.move_id(last, p);
+            }
+            if !self.fts.is_empty()
+                && let Some(fts) = self.fts.get_mut("docs")
+            {
+                let row = &self.collections["docs"][p];
+                fts.swap_remove_row(p, &doomed, last, row);
+            }
+            let hint = self
+                .last_doc_id_idx
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if hint == last {
+                self.last_doc_id_idx
+                    .store(p, std::sync::atomic::Ordering::Relaxed);
+            } else if hint == p {
+                self.last_doc_id_idx
+                    .store(usize::MAX, std::sync::atomic::Ordering::Relaxed);
+            }
+            if p < self.docs_id.len() && last < self.docs_id.len() && self.docs_moved_ids.len() < 16 {
+                self.docs_moved_ids.push((Arc::clone(&self.docs_id[last]), p));
+            } else {
+                let row = &self.collections["docs"][p];
+                let (dead_id_fast, tail_id_fast) = if p < self.docs_id.len() && last < self.docs_id.len() {
+                    (Some(&self.docs_id[p]), Some(&self.docs_id[last]))
+                } else {
+                    (None, None)
+                };
+                if let Some(map) = self.by_id.get_mut("docs") {
+                    if let Some(dead_id) = dead_id_fast {
+                        map.remove(dead_id.as_ref());
+                    } else if let Some(dead_id) = row_text(&doomed, "id") {
+                        map.remove(dead_id);
+                    }
+                    if let Some(tail_id) = tail_id_fast {
+                        if let Some(slot) = map.get_mut(tail_id.as_ref()) {
+                            *slot = p;
+                        } else {
+                            map.insert(Arc::clone(tail_id), p);
+                        }
+                    } else if let Some(id_s) = row_text(row, "id") {
+                        if let Some(slot) = map.get_mut(id_s) {
+                            *slot = p;
+                        } else if let Some(id) = row.get("id").and_then(Cell::text_shared) {
+                            map.insert(id, p);
+                        }
+                    }
+                }
+            }
+            if !self.docs_by_uri.is_empty() {
+                if let Some(dead_uri) = row_text(&doomed, "uri") {
+                    self.docs_by_uri.remove(dead_uri);
+                }
+                let row = &self.collections["docs"][p];
+                if let Some(u_s) = row_text(row, "uri") {
+                    if let Some(slot) = self.docs_by_uri.get_mut(u_s) {
+                        *slot = p;
+                    } else if let Some(uri) = row.get("uri").and_then(Cell::text_shared) {
+                        self.docs_by_uri.insert(uri, p);
+                    }
+                }
+            }
+            self.swap_pop_columns("docs", p, last + 1);
+        } else {
+            self.index_remove_row("docs", p, &doomed);
+            if has_hnsw && let Some(hnsw) = self.hnsw.get_mut("docs") {
+                hnsw.remove(p);
+            }
+            self.fts_remove_row("docs", p, &doomed);
+            self.last_doc_id_idx
+                .store(usize::MAX, std::sync::atomic::Ordering::Relaxed);
+            if p < self.docs_id.len() && self.docs_moved_ids.len() < 16 {
+                self.docs_moved_ids
+                    .push((Arc::clone(&self.docs_id[p]), usize::MAX));
+            } else {
+                self.row_maps_drop_keys("docs", &doomed);
+            }
+            self.swap_pop_columns("docs", p, last + 1);
+        }
+        let new_n = old_n - 1;
+        if self.docs_id.len() != new_n {
+            self.rebuild_row_maps_collection("docs");
+        }
+        if self.retired_rows.len() < self.retired_rows.inline_size() {
+            self.retired_rows.push(doomed);
+        }
+    }
+
     /// The collection already contains the moved row at `to`. Read it in place
     /// while editing disjoint derived indexes; retain only identity keys for
     /// the column/map step, avoiding a complete Row clone.
@@ -2613,13 +2831,26 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
             }
         }
         let is_docs = collection == "docs";
+        if is_docs {
+            let hint = self
+                .last_doc_id_idx
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if hint == from {
+                self.last_doc_id_idx
+                    .store(to, std::sync::atomic::Ordering::Relaxed);
+            } else if hint == to {
+                self.last_doc_id_idx
+                    .store(usize::MAX, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         let (dead_id_fast, tail_id_fast) = if is_docs && to < self.docs_id.len() && from < self.docs_id.len() {
             (Some(&self.docs_id[to]), Some(&self.docs_id[from]))
         } else {
             (None, None)
         };
         let id_str = if tail_id_fast.is_none() { row_text(row, "id") } else { None };
-        let uri_str = if collection == "docs" {
+        let has_uri_map = is_docs && !self.docs_by_uri.is_empty();
+        let uri_str = if has_uri_map {
             row_text(row, "uri")
         } else {
             None
@@ -2648,7 +2879,7 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
                 }
             }
         }
-        if collection == "docs" {
+        if has_uri_map {
             if let Some(doomed) = doomed
                 && let Some(dead_uri) = row_text(doomed, "uri")
             {
@@ -2677,11 +2908,17 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
         self.swap_pop_columns(collection, to, from + 1);
     }
 
+    #[inline]
+    fn invalidate_docs_cache(&mut self) {
+        self.docs_title_packed.take();
+        self.docs_epoch = next_docs_epoch();
+    }
+
     /// Mirror [`swap_pop_at`] across the collection's columnar arrays, skipping
     /// columns that aren't parallel to the rows (the caller's length guard rebuilds).
     fn swap_pop_columns(&mut self, collection: &str, p: usize, len: usize) {
         if collection == "docs" {
-            self.docs_title_packed.take();
+            self.invalidate_docs_cache();
         }
         match collection {
             "docs" => {
@@ -2710,12 +2947,17 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
 
     /// Drop a row's `key → position` entries after its slot is vacated.
     fn row_maps_drop_keys(&mut self, collection: &str, row: &Row) {
+        if collection == "docs" {
+            self.last_doc_id_idx
+                .store(usize::MAX, std::sync::atomic::Ordering::Relaxed);
+        }
         if let Some(id) = row_text(row, "id")
             && let Some(map) = self.by_id.get_mut(collection)
         {
             map.remove(id);
         }
         if collection == "docs"
+            && !self.docs_by_uri.is_empty()
             && let Some(uri) = row_text(row, "uri")
         {
             self.docs_by_uri.remove(uri);
@@ -2757,8 +2999,7 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
                 fts.sync_row(*idx, &old_row, row);
             }
             self.row_maps_sync_updated(collection, *idx, &old_row, row);
-            self.index_remove_at(collection, *idx);
-            let _ = self.index_insert_at(collection, *idx);
+            let _ = self.index_update_row(collection, *idx, &old_row, row);
         }
     }
 
@@ -2775,8 +3016,7 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
             fts.sync_row(idx, &old_row, &row);
         }
         self.row_maps_sync_updated(collection, idx, &old_row, &row);
-        self.index_remove_at(collection, idx);
-        let _ = self.index_insert_row(collection, idx, &row);
+        let _ = self.index_update_row(collection, idx, &old_row, &row);
         self.collections.get_mut(collection).unwrap()[idx] = row;
     }
 
@@ -2847,7 +3087,7 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
 
     pub fn rebuild_row_maps_collection(&mut self, collection: &str) {
         if collection == "docs" {
-            self.docs_title_packed.take();
+            self.invalidate_docs_cache();
         }
         self.by_id
             .entry(collection.to_string())
@@ -2859,6 +3099,10 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
             self.docs_title.clear();
             self.docs_layer.clear();
             self.docs_wing.clear();
+            self.docs_moved_ids.clear();
+            self.docs_moved_idxs.clear();
+            self.retired_doc_ids.clear();
+            self.fts_deferred_doc_swaps.clear();
         }
         if collection == "orders" {
             self.orders_id.clear();
@@ -2990,111 +3234,33 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
     }
 
     pub fn row_maps_register(&mut self, collection: &str, idx: usize) {
-        if collection == "docs" {
-            self.docs_title_packed.take();
-        }
-        let snaps = self
+        let Some(row) = self
             .collections
             .get(collection)
             .and_then(|c| c.get(idx))
-            .map(|row| {
-                (
-                    row.get("id").and_then(Cell::text_shared),
-                    row.get("uri").and_then(Cell::text_shared),
-                    row.get("title").and_then(Cell::text_shared),
-                    row.get("layer").and_then(Cell::text_shared),
-                    row.get("wing").and_then(Cell::text_shared),
-                )
-            });
-        let Some((id, uri, title, layer, wing)) = snaps else {
+            .cloned()
+        else {
             return;
         };
-        if let Some(ref id) = id {
-            self.by_id
-                .entry(collection.to_string())
-                .or_default()
-                .insert(Arc::clone(id), idx);
-        }
-        if collection == "docs" {
-            let did = id.unwrap_or_default();
-            let title = title.unwrap_or_default();
-            let layer = layer.unwrap_or_default();
-            let wing = intern_wing(wing.unwrap_or_default());
-            if let Some(uri) = uri {
-                self.docs_by_uri.insert(uri, idx);
-            }
-            if idx == self.docs_id.len() {
-                self.docs_id.push(did);
-                self.docs_title.push(title);
-                self.docs_layer.push(layer);
-                self.docs_wing.push(wing);
-            } else if idx < self.docs_id.len() {
-                self.docs_id[idx] = did;
-                self.docs_title[idx] = title;
-                self.docs_layer.set(idx, layer);
-                self.docs_wing.set(idx, wing);
-            } else {
-                self.rebuild_row_maps_collection("docs");
-            }
-        }
-        if collection == "orders" || collection == "users" {
-            self.row_maps_register_soa(collection, idx);
-        }
-    }
-
-    fn row_maps_register_soa(&mut self, collection: &str, idx: usize) {
-        if collection == "docs" {
-            self.docs_title_packed.take();
-        }
-        let Some(row) = self.collections.get(collection).and_then(|c| c.get(idx)) else {
-            return;
-        };
-        let id = row
-            .get("id")
-            .and_then(Cell::text_shared)
-            .unwrap_or_default();
-        if collection == "orders" {
-            let uid = row
-                .get("user_id")
-                .and_then(Cell::text_shared)
-                .unwrap_or_default();
-            let total = row.get("total").and_then(Cell::as_f64).unwrap_or(0.0);
-            if idx == self.orders_id.len() {
-                self.orders_id.push(id);
-                self.orders_user_id.push(uid);
-                self.orders_total.push(total);
-            } else if idx < self.orders_id.len() {
-                self.orders_id[idx] = id;
-                self.orders_user_id[idx] = uid;
-                self.orders_total[idx] = total;
-            } else {
-                self.rebuild_row_maps_collection("orders");
-            }
-        } else if collection == "users" {
-            let email = row
-                .get("email")
-                .and_then(Cell::text_shared)
-                .unwrap_or_default();
-            if idx == self.users_id.len() {
-                self.users_id.push(id);
-                self.users_email.push(email);
-            } else if idx < self.users_id.len() {
-                self.users_id[idx] = id;
-                self.users_email[idx] = email;
-            } else {
-                self.rebuild_row_maps_collection("users");
-            }
-        }
+        self.row_maps_register_row(collection, idx, &row);
     }
 
     /// Register maps/columns from an already-built row (avoids re-fetch).
     pub fn row_maps_register_row(&mut self, collection: &str, idx: usize, row: &Row) {
         if collection == "docs" {
-            self.docs_title_packed.take();
+            self.invalidate_docs_cache();
         }
         let id = row.get("id").and_then(Cell::text_shared);
         let uri = row.get("uri").and_then(Cell::text_shared);
         if let Some(ref id) = id {
+            if collection == "docs" {
+                if !self.docs_moved_ids.is_empty() {
+                    self.docs_moved_ids.retain(|(k, _)| k != id);
+                }
+                if !self.retired_doc_ids.is_empty() {
+                    self.retired_doc_ids.retain(|k| k != id);
+                }
+            }
             self.by_id
                 .entry(collection.to_string())
                 .or_default()
@@ -3172,7 +3338,7 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
     /// Append-only slab: register `[start, start+rows.len())` from the given rows.
     pub fn row_maps_register_slab(&mut self, collection: &str, start: usize, rows: &[Row]) {
         if collection == "docs" {
-            self.docs_title_packed.take();
+            self.invalidate_docs_cache();
         }
         if rows.is_empty() {
             return;
@@ -3274,7 +3440,9 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
             .or_default()
             .reserve(additional);
         if collection == "docs" {
-            self.docs_by_uri.reserve(additional);
+            if !self.docs_by_uri.is_empty() || additional < 512 {
+                self.docs_by_uri.reserve(additional);
+            }
             self.docs_id.reserve(additional);
             self.docs_title.reserve(additional);
             self.docs_layer.reserve(additional);
@@ -3302,7 +3470,7 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
         after: &Row,
     ) {
         if collection == "docs" {
-            self.docs_title_packed.take();
+            self.invalidate_docs_cache();
         }
         let id = row_text(after, "id");
         let identity_moved =
@@ -3337,6 +3505,13 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
             "users" if idx < self.users_email.len() => self.users_email[idx] = text("email"),
             "docs" | "orders" | "users" => self.rebuild_row_maps_collection(collection),
             _ => {}
+        }
+    }
+
+    #[inline]
+    pub fn sync_docs_wing_only(&mut self, idx: usize, wing: Arc<str>) {
+        if idx < self.docs_wing.len() {
+            self.docs_wing.set(idx, intern_wing(wing));
         }
     }
 
@@ -3392,6 +3567,287 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
         Ok(())
     }
 
+    pub fn maintain_insert_slab(
+        &mut self,
+        collection: &str,
+        start: usize,
+        built: &[Row],
+    ) -> Result<(), Error> {
+        if collection == "docs" {
+            self.flush_fts_deferred_docs();
+        }
+        self.collection_mut(collection).reserve(built.len());
+        self.row_maps_reserve(collection, built.len());
+        let has_unique = self
+            .indexes
+            .values()
+            .any(|idx| idx.def.collection == collection && idx.def.unique);
+        if collection == "docs"
+            && built.len() >= 512
+            && !has_unique
+            && self.docs_id.len() == start
+            && self.fts.contains_key(collection)
+        {
+            self.invalidate_docs_cache();
+            let indexes = &mut self.indexes;
+            let fts_opt = self.fts.get_mut(collection);
+            let hnsw_opt = self.hnsw.get_mut(collection);
+            let by_id = self.by_id.entry(collection.to_string()).or_default();
+            let docs_by_uri = &mut self.docs_by_uri;
+            let docs_id = &mut self.docs_id;
+            let docs_title = &mut self.docs_title;
+            let docs_layer = &mut self.docs_layer;
+            let docs_wing = &mut self.docs_wing;
+
+            struct FtsJob {
+                fts_ptr: usize,
+                start: usize,
+                rows_ptr: usize,
+                rows_len: usize,
+            }
+            struct IdxJob {
+                indexes_ptr: usize,
+                start: usize,
+                rows_ptr: usize,
+                rows_len: usize,
+            }
+            struct MaintPool {
+                fts_tx: std::sync::mpsc::SyncSender<FtsJob>,
+                fts_done: std::sync::mpsc::Receiver<()>,
+                idx_tx: std::sync::mpsc::SyncSender<IdxJob>,
+                idx_done: std::sync::mpsc::Receiver<Result<(), Error>>,
+            }
+            static MAINT_POOL: std::sync::OnceLock<std::sync::Mutex<Option<MaintPool>>> =
+                std::sync::OnceLock::new();
+            let pool_mutex = MAINT_POOL.get_or_init(|| {
+                let (fts_tx, fts_rx) = std::sync::mpsc::sync_channel::<FtsJob>(1);
+                let (fts_done_tx, fts_done) = std::sync::mpsc::sync_channel::<()>(1);
+                let (idx_tx, idx_rx) = std::sync::mpsc::sync_channel::<IdxJob>(1);
+                let (idx_done_tx, idx_done) =
+                    std::sync::mpsc::sync_channel::<Result<(), Error>>(1);
+                let ok1 = std::thread::Builder::new()
+                    .name("lin-maint-fts".into())
+                    .spawn(move || {
+                        while let Ok(job) = fts_rx.recv() {
+                            let fts = unsafe { &mut *(job.fts_ptr as *mut crate::fts::FtsIndex) };
+                            let rows = unsafe {
+                                std::slice::from_raw_parts(
+                                    job.rows_ptr as *const Row,
+                                    job.rows_len,
+                                )
+                            };
+                            fts.append_slab(job.start, rows);
+                            let _ = fts_done_tx.send(());
+                        }
+                    })
+                    .is_ok();
+                let ok2 = std::thread::Builder::new()
+                    .name("lin-maint-idx".into())
+                    .spawn(move || {
+                        while let Ok(job) = idx_rx.recv() {
+                            let idxs = unsafe {
+                                &mut *(job.indexes_ptr as *mut BTreeMap<String, LiveIndex>)
+                            };
+                            let rows = unsafe {
+                                std::slice::from_raw_parts(
+                                    job.rows_ptr as *const Row,
+                                    job.rows_len,
+                                )
+                            };
+                            let mut res = Ok(());
+                            for idx in idxs.values_mut() {
+                                if idx.def.collection == "docs" {
+                                    if let Err(e) =
+                                        idx.insert_slab_batch_no_reverse(job.start, rows)
+                                    {
+                                        res = Err(Error::runtime(e));
+                                        break;
+                                    }
+                                }
+                            }
+                            let _ = idx_done_tx.send(res);
+                        }
+                    })
+                    .is_ok();
+                if ok1 && ok2 {
+                    std::sync::Mutex::new(Some(MaintPool {
+                        fts_tx,
+                        fts_done,
+                        idx_tx,
+                        idx_done,
+                    }))
+                } else {
+                    std::sync::Mutex::new(None)
+                }
+            });
+
+            let mut fts_opt = fts_opt;
+            let pool_guard = pool_mutex.try_lock().ok();
+            struct MaintDrainGuard<'a> {
+                fts_done: Option<&'a std::sync::mpsc::Receiver<()>>,
+                idx_done: Option<&'a std::sync::mpsc::Receiver<Result<(), Error>>>,
+                last_idx_res: Option<Result<(), Error>>,
+            }
+            impl Drop for MaintDrainGuard<'_> {
+                fn drop(&mut self) {
+                    if let Some(rx) = self.fts_done.take() {
+                        let _ = rx.recv();
+                    }
+                    if let Some(rx) = self.idx_done.take() {
+                        self.last_idx_res = rx.recv().ok();
+                    }
+                }
+            }
+            let mut maint_guard = MaintDrainGuard {
+                fts_done: None,
+                idx_done: None,
+                last_idx_res: None,
+            };
+            if let Some(ref guard) = pool_guard
+                && let Some(ref pool) = **guard
+            {
+                if let Some(fts) = fts_opt.as_deref_mut() {
+                    if pool
+                        .fts_tx
+                        .send(FtsJob {
+                            fts_ptr: fts as *mut crate::fts::FtsIndex as usize,
+                            start,
+                            rows_ptr: built.as_ptr() as usize,
+                            rows_len: built.len(),
+                        })
+                        .is_ok()
+                    {
+                        maint_guard.fts_done = Some(&pool.fts_done);
+                    }
+                }
+                if pool
+                    .idx_tx
+                    .send(IdxJob {
+                        indexes_ptr: indexes as *mut BTreeMap<String, LiveIndex> as usize,
+                        start,
+                        rows_ptr: built.as_ptr() as usize,
+                        rows_len: built.len(),
+                    })
+                    .is_ok()
+                {
+                    maint_guard.idx_done = Some(&pool.idx_done);
+                }
+            }
+
+            if let Some(hnsw) = hnsw_opt {
+                for (i, row) in built.iter().enumerate() {
+                    if let Some(Cell::Vec(v)) = row.get("embedding") {
+                        hnsw.insert(start + i, v.clone());
+                    }
+                }
+            }
+
+            let keep_uri = !docs_by_uri.is_empty();
+            let first = &built[0];
+            let id_pos = first.keys().position(|k| k == "id");
+            let uri_pos = if keep_uri {
+                first.keys().position(|k| k == "uri")
+            } else {
+                None
+            };
+            let title_pos = first.keys().position(|k| k == "title");
+            let layer_pos = first.keys().position(|k| k == "layer");
+            let wing_pos = first.keys().position(|k| k == "wing");
+            let uniform = built[1..].iter().all(|r| r.len() == first.len());
+            if uniform && first.len() <= 32 {
+                for (i, row) in built.iter().enumerate() {
+                    let idx = start + i;
+                    let mut cells: [&Cell; 32] = [&Cell::Null; 32];
+                    for (p, val) in row.values().enumerate().take(32) {
+                        cells[p] = val;
+                    }
+                    let id_arc: Arc<str> = id_pos
+                        .and_then(|p| cells[p].text_shared())
+                        .unwrap_or_default();
+                    let uri_arc: Option<Arc<str>> = uri_pos.and_then(|p| cells[p].text_shared());
+                    let title_arc: Arc<str> = title_pos
+                        .and_then(|p| cells[p].text_shared())
+                        .unwrap_or_default();
+                    let layer_arc: Arc<str> = layer_pos
+                        .and_then(|p| cells[p].text_shared())
+                        .unwrap_or_default();
+                    let wing_arc: Arc<str> = wing_pos
+                        .and_then(|p| cells[p].text_shared())
+                        .unwrap_or_default();
+
+                    if !id_arc.is_empty() {
+                        by_id.insert(Arc::clone(&id_arc), idx);
+                    }
+                    if let Some(uri) = uri_arc {
+                        docs_by_uri.insert(uri, idx);
+                    }
+                    docs_id.push(id_arc);
+                    docs_title.push(title_arc);
+                    docs_layer.push(layer_arc);
+                    docs_wing.push(intern_wing(wing_arc));
+                }
+            } else {
+                for (i, row) in built.iter().enumerate() {
+                    let idx = start + i;
+                    let mut texts: [Option<Arc<str>>; 5] = std::array::from_fn(|_| None);
+                    for (field, value) in row {
+                        let slot = match field.as_str() {
+                            "id" => 0,
+                            "uri" if keep_uri => 1,
+                            "title" => 2,
+                            "layer" => 3,
+                            "wing" => 4,
+                            _ => continue,
+                        };
+                        texts[slot] = value.text_shared();
+                    }
+                    let [id, uri, title, layer, wing] = texts;
+                    if let Some(ref id) = id {
+                        by_id.insert(Arc::clone(id), idx);
+                    }
+                    if let Some(uri) = uri {
+                        docs_by_uri.insert(uri, idx);
+                    }
+                    docs_id.push(id.unwrap_or_default());
+                    docs_title.push(title.unwrap_or_default());
+                    docs_layer.push(layer.unwrap_or_default());
+                    docs_wing.push(intern_wing(wing.unwrap_or_default()));
+                }
+            }
+
+            if maint_guard.fts_done.is_none() {
+                if let Some(fts) = fts_opt {
+                    fts.append_slab(start, built);
+                }
+            }
+            let mut idx_res = Ok(());
+            if maint_guard.idx_done.is_none() {
+                for idx in indexes.values_mut() {
+                    if idx.def.collection == collection {
+                        if let Err(e) = idx.insert_slab_batch_no_reverse(start, built) {
+                            idx_res = Err(Error::runtime(e));
+                            break;
+                        }
+                    }
+                }
+            }
+            if let Some(rx) = maint_guard.fts_done.take() {
+                let _ = rx.recv();
+            }
+            if let Some(rx) = maint_guard.idx_done.take() {
+                if let Ok(r) = rx.recv() {
+                    idx_res = r;
+                }
+            }
+            return idx_res;
+        }
+        self.index_insert_slab(collection, start, built)?;
+        self.fts_insert_slab(collection, start, built);
+        self.hnsw_insert_slab(collection, start, built);
+        self.row_maps_register_slab(collection, start, built);
+        Ok(())
+    }
+
     /// Swap-remove one row's index entries, moving `last` into `p`.
     pub fn index_swap_remove(&mut self, collection: &str, p: usize, last: usize) {
         if self.indexes.is_empty() {
@@ -3404,26 +3860,70 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
         }
     }
 
+    /// Swap-remove one row's index entries given `doomed` and the moved `tail` row now at `p`.
+    pub fn index_swap_remove_rows(&mut self, collection: &str, p: usize, doomed: &Row, last: usize) {
+        if self.indexes.is_empty() {
+            return;
+        }
+        let Some(tail) = self.collections.get(collection).and_then(|c| c.get(p)) else {
+            return;
+        };
+        for idx in self.indexes.values_mut() {
+            if idx.def.collection == collection {
+                idx.swap_remove_rows(p, doomed, last, tail);
+            }
+        }
+    }
+
+    /// Update one row's index entries given `before` and `after`.
+    pub fn index_update_row(
+        &mut self,
+        collection: &str,
+        row_idx: usize,
+        before: &Row,
+        after: &Row,
+    ) -> Result<(), Error> {
+        if self.indexes.is_empty() {
+            return Ok(());
+        }
+        for idx in self.indexes.values_mut() {
+            if idx.def.collection == collection
+                && let Err(e) = idx.update_row(row_idx, before, after)
+            {
+                return Err(Error::runtime(e));
+            }
+        }
+        Ok(())
+    }
+
     /// Drop a position from every index of `collection`.
     pub fn index_remove_at(&mut self, collection: &str, row_idx: usize) {
         if self.indexes.is_empty() {
             return;
         }
+        let row = self
+            .collections
+            .get(collection)
+            .and_then(|c| c.get(row_idx));
         for idx in self.indexes.values_mut() {
             if idx.def.collection == collection {
-                idx.remove_at(row_idx);
+                if let Some(r) = row {
+                    idx.remove_row(row_idx, r);
+                } else {
+                    idx.remove_at(row_idx);
+                }
             }
         }
     }
 
     /// Drop one row's index entries, given the row itself.
-    pub fn index_remove_row(&mut self, collection: &str, row_idx: usize, _row: &Row) {
+    pub fn index_remove_row(&mut self, collection: &str, row_idx: usize, row: &Row) {
         if self.indexes.is_empty() {
             return;
         }
         for idx in self.indexes.values_mut() {
             if idx.def.collection == collection {
-                idx.remove_at(row_idx);
+                idx.remove_row(row_idx, row);
             }
         }
     }
@@ -3481,6 +3981,7 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
     }
 
     fn write_fts_files(&mut self, dir: &Path) -> Result<(), Error> {
+        self.flush_fts_deferred_docs();
         let mut keep = Vec::new();
         let rows_per_collection: Vec<(String, u64)> = self
             .fts
@@ -3561,6 +4062,9 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
     }
 
     pub fn fts_insert_at(&mut self, collection: &str, row_idx: usize) {
+        if collection == "docs" {
+            self.flush_fts_deferred_docs();
+        }
         if !self.fts.contains_key(collection) {
             return;
         }
@@ -3579,12 +4083,18 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
 
     /// Register one row's postings at `row_idx`, given the row itself.
     pub fn fts_insert_row(&mut self, collection: &str, row_idx: usize, row: &Row) {
+        if collection == "docs" {
+            self.flush_fts_deferred_docs();
+        }
         if let Some(fts) = self.fts.get_mut(collection) {
             fts.insert_row(row_idx, row);
         }
     }
 
     pub fn fts_insert_slab(&mut self, collection: &str, start: usize, rows: &[Row]) {
+        if collection == "docs" {
+            self.flush_fts_deferred_docs();
+        }
         let Some(fts) = self.fts.get_mut(collection) else {
             return;
         };
@@ -3659,6 +4169,9 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
     /// Drop one row's postings, given the row itself: only that row's tokens are
     /// visited, so the cost is per-row rather than per-vocabulary.
     pub fn fts_remove_row(&mut self, collection: &str, row_idx: usize, row: &Row) {
+        if collection == "docs" {
+            self.flush_fts_deferred_docs();
+        }
         if let Some(fts) = self.fts.get_mut(collection) {
             fts.remove_row(row_idx, row);
         }
@@ -3667,6 +4180,9 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
     /// Re-point a row's postings between slots after a swap-move, tokenizing it
     /// once rather than once per edit.
     pub fn fts_move_row(&mut self, collection: &str, from: usize, to: usize, row: &Row) {
+        if collection == "docs" {
+            self.flush_fts_deferred_docs();
+        }
         if let Some(fts) = self.fts.get_mut(collection) {
             fts.move_row(from, to, row);
         }
@@ -3678,6 +4194,9 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
     /// Re-point a single row's postings after an in-place field update, given
     /// the row as it was before the write.
     pub fn fts_sync_at(&mut self, collection: &str, row_idx: usize, before: &Row) {
+        if collection == "docs" {
+            self.flush_fts_deferred_docs();
+        }
         let Some(row) = self
             .collections
             .get(collection)
@@ -3811,96 +4330,202 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
         if needle.is_empty() {
             return self.docs_title.len() as i64;
         }
-        // A derived physical column, not a result cache: every needle scans the
-        // bytes. Mutation invalidates it and the next scan rebuilds it once.
-        let (bytes, offsets) = self.docs_title_packed.get_or_init(|| {
-            let mut bytes = Vec::with_capacity(self.docs_title.iter().map(|s| s.len()).sum());
-            let mut offsets = Vec::with_capacity(self.docs_title.len() + 1);
-            for title in &self.docs_title {
-                offsets.push(bytes.len());
-                bytes.extend_from_slice(title.as_bytes());
-            }
-            offsets.push(bytes.len());
-            (bytes, offsets)
-        });
-
         let total_rows = self.docs_title.len();
         if total_rows == 0 {
             return 0;
+        }
+        // A derived physical column, not a result cache: every needle scans the
+        // bytes. Mutation invalidates it and the next scan rebuilds it once.
+        // Each title is terminated by a 0x00 byte so matching rows advance to
+        // the next '\0' in the same cache line without reading an offsets array.
+        let (bytes, has_nul) = self.docs_title_packed.get_or_init(|| {
+            let total_bytes: usize = self.docs_title.iter().map(|s| s.len() + 1).sum();
+            let mut bytes = Vec::with_capacity(total_bytes);
+            let mut has_nul = false;
+            for title in &self.docs_title {
+                let b = title.as_bytes();
+                if memchr::memchr(0, b).is_some() {
+                    has_nul = true;
+                }
+                bytes.extend_from_slice(b);
+                bytes.push(0);
+            }
+            (bytes, has_nul)
+        });
+
+        let needle_bytes = needle.as_bytes();
+        if *has_nul || memchr::memchr(0, needle_bytes).is_some() {
+            let finder = memchr::memmem::Finder::new(needle_bytes);
+            return self
+                .docs_title
+                .iter()
+                .filter(|t| finder.find(t.as_bytes()).is_some())
+                .count() as i64;
+        }
+
+        #[inline]
+        fn scan_nul_chunk(chunk: &[u8], finder: &memchr::memmem::Finder<'_>) -> i64 {
+            let mut cursor = 0usize;
+            let mut count = 0i64;
+            let len = chunk.len();
+            while cursor < len {
+                let Some(rel) = finder.find(&chunk[cursor..]) else {
+                    break;
+                };
+                let match_pos = cursor + rel;
+                count += 1;
+                if let Some(nul_rel) = memchr::memchr(0, &chunk[match_pos..]) {
+                    cursor = match_pos + nul_rel + 1;
+                } else {
+                    break;
+                }
+            }
+            count
         }
 
         let threads = if total_rows >= 8192 {
             std::thread::available_parallelism()
                 .map(|p| p.get())
                 .unwrap_or(1)
-                .min(8)
+                .min(12)
                 .min((total_rows + 1023) / 1024)
         } else {
             1
         };
 
-        if threads > 1 {
-            let chunk_rows = (total_rows + threads - 1) / threads;
-            let counts: Vec<i64> = std::thread::scope(|scope| {
-                let mut handles = Vec::with_capacity(threads);
-                for t in 0..threads {
-                    let r_start = t * chunk_rows;
-                    if r_start >= total_rows {
-                        break;
-                    }
-                    let r_end = (r_start + chunk_rows).min(total_rows);
-                    let byte_start = offsets[r_start];
-                    let byte_end = offsets[r_end];
-                    let chunk_bytes = &bytes[byte_start..byte_end];
-                    let chunk_offsets = &offsets[r_start..=r_end];
-
-                    handles.push(scope.spawn(move || {
-                        let finder = memchr::memmem::Finder::new(needle.as_bytes());
-                        let mut cursor = 0;
-                        let mut local_count = 0i64;
-                        let mut row = 0usize;
-                        let needle_len = needle.len();
-
-                        while let Some(relative) = finder.find(&chunk_bytes[cursor..]) {
-                            let pos = cursor + relative;
-                            let abs_pos = byte_start + pos;
-                            while chunk_offsets[row + 1] <= abs_pos {
-                                row += 1;
-                            }
-                            if abs_pos + needle_len <= chunk_offsets[row + 1] {
-                                local_count += 1;
-                                cursor = chunk_offsets[row + 1] - byte_start;
-                                row += 1;
-                            } else {
-                                cursor = pos + 1;
-                            }
-                        }
-                        local_count
-                    }));
-                }
-                handles.into_iter().map(|h| h.join().unwrap()).collect()
-            });
-            counts.into_iter().sum()
-        } else {
-            let finder = memchr::memmem::Finder::new(needle.as_bytes());
-            let mut cursor = 0;
-            let mut count = 0i64;
-            let mut row = 0usize;
-            let needle_len = needle.len();
-            while let Some(relative) = finder.find(&bytes[cursor..]) {
-                let pos = cursor + relative;
-                while offsets[row + 1] <= pos {
-                    row += 1;
-                }
-                if pos + needle_len <= offsets[row + 1] {
-                    count += 1;
-                    cursor = offsets[row + 1];
-                    row += 1;
+        if threads > 1 && bytes.len() >= threads * 4096 {
+            let mut bounds = Vec::with_capacity(threads + 1);
+            bounds.push(0usize);
+            for t in 1..threads {
+                let approx = (bytes.len() * t) / threads;
+                let prev = *bounds.last().unwrap();
+                if approx <= prev {
+                    bounds.push(prev);
+                } else if let Some(rel) = memchr::memchr(0, &bytes[approx..]) {
+                    bounds.push(approx + rel + 1);
                 } else {
-                    cursor = pos + 1;
+                    bounds.push(bytes.len());
                 }
             }
-            count
+            bounds.push(bytes.len());
+
+            struct ScanJob {
+                ptr: usize,
+                len: usize,
+                needle_ptr: usize,
+                needle_len: usize,
+            }
+            struct ScanPool {
+                txs: Vec<std::sync::mpsc::SyncSender<ScanJob>>,
+                rxs: Vec<std::sync::mpsc::Receiver<i64>>,
+            }
+            static TITLE_SCAN_POOL: OnceLock<std::sync::Mutex<ScanPool>> = OnceLock::new();
+            let pool_mtx = TITLE_SCAN_POOL.get_or_init(|| {
+                let max_workers = 11;
+                let mut txs = Vec::with_capacity(max_workers);
+                let mut rxs = Vec::with_capacity(max_workers);
+                for i in 0..max_workers {
+                    let (job_tx, job_rx) = std::sync::mpsc::sync_channel::<ScanJob>(1);
+                    let (res_tx, res_rx) = std::sync::mpsc::sync_channel::<i64>(1);
+                    let _ = std::thread::Builder::new()
+                        .name(format!("lin-title-scan-{i}"))
+                        .spawn(move || {
+                            while let Ok(job) = job_rx.recv() {
+                                let chunk = unsafe {
+                                    std::slice::from_raw_parts(job.ptr as *const u8, job.len)
+                                };
+                                let ndl = unsafe {
+                                    std::slice::from_raw_parts(
+                                        job.needle_ptr as *const u8,
+                                        job.needle_len,
+                                    )
+                                };
+                                let finder = memchr::memmem::Finder::new(ndl);
+                                let c = scan_nul_chunk(chunk, &finder);
+                                let _ = res_tx.send(c);
+                            }
+                        });
+                    txs.push(job_tx);
+                    rxs.push(res_rx);
+                }
+                std::sync::Mutex::new(ScanPool { txs, rxs })
+            });
+
+            if let Ok(pool) = pool_mtx.try_lock() {
+                let workers = (threads - 1).min(pool.txs.len());
+                struct ScanDrainGuard<'a> {
+                    rxs: &'a [std::sync::mpsc::Receiver<i64>],
+                    dispatched: [bool; 11],
+                }
+                impl Drop for ScanDrainGuard<'_> {
+                    fn drop(&mut self) {
+                        for (w, sent) in self.dispatched.iter_mut().enumerate() {
+                            if *sent {
+                                *sent = false;
+                                let _ = self.rxs[w].recv();
+                            }
+                        }
+                    }
+                }
+                let mut scan_guard = ScanDrainGuard {
+                    rxs: &pool.rxs,
+                    dispatched: [false; 11],
+                };
+                for w in 0..workers {
+                    let b_start = bounds[w];
+                    let b_end = bounds[w + 1];
+                    if b_start < b_end {
+                        let slice = &bytes[b_start..b_end];
+                        if pool.txs[w]
+                            .send(ScanJob {
+                                ptr: slice.as_ptr() as usize,
+                                len: slice.len(),
+                                needle_ptr: needle_bytes.as_ptr() as usize,
+                                needle_len: needle_bytes.len(),
+                            })
+                            .is_ok()
+                        {
+                            scan_guard.dispatched[w] = true;
+                        }
+                    }
+                }
+                let finder = memchr::memmem::Finder::new(needle_bytes);
+                let my_start = bounds[workers];
+                let my_end = bounds[threads];
+                let mut total = if my_start < my_end {
+                    scan_nul_chunk(&bytes[my_start..my_end], &finder)
+                } else {
+                    0
+                };
+                for w in 0..workers {
+                    if scan_guard.dispatched[w] {
+                        scan_guard.dispatched[w] = false;
+                        if let Ok(c) = scan_guard.rxs[w].recv() {
+                            total += c;
+                        }
+                    }
+                }
+                return total;
+            }
+
+            let finder = memchr::memmem::Finder::new(needle_bytes);
+            std::thread::scope(|scope| {
+                let mut handles = Vec::with_capacity(threads);
+                for t in 0..threads {
+                    let b_start = bounds[t];
+                    let b_end = bounds[t + 1];
+                    if b_start >= b_end {
+                        continue;
+                    }
+                    let chunk = &bytes[b_start..b_end];
+                    let f_ref = &finder;
+                    handles.push(scope.spawn(move || scan_nul_chunk(chunk, f_ref)));
+                }
+                handles.into_iter().map(|h| h.join().unwrap()).sum()
+            })
+        } else {
+            let finder = memchr::memmem::Finder::new(needle_bytes);
+            scan_nul_chunk(bytes, &finder)
         }
     }
 
@@ -3961,6 +4586,143 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
         &self.users_email
     }
 
+    /// Fast projection over `docs` when filtering by `wing == target` or `layer == target`.
+    pub fn project_docs_dict_eq(
+        &self,
+        filter_field: &str,
+        target: &str,
+        fields: &[String],
+        limit: Option<usize>,
+    ) -> Option<Vec<Row>> {
+        if fields.is_empty() || !fields.iter().all(|f| docs_hot_field(f)) {
+            return None;
+        }
+        let n = self.docs_id.len();
+        if n != self.collections.get("docs").map_or(0, Vec::len) {
+            return None;
+        }
+        let (dict, field_tag) = match filter_field {
+            "wing" if self.docs_wing.len() == n => (&self.docs_wing, 1u64 << 32),
+            "layer" if self.docs_layer.len() == n => (&self.docs_layer, 2u64 << 32),
+            _ => return None,
+        };
+        let (codes, dict_vals) = dict.as_indices()?;
+        let Some(code) = dict_vals.iter().position(|v| **v == *target).map(|p| p as u8) else {
+            return Some(Vec::new());
+        };
+        if limit == Some(0) {
+            return Some(Vec::new());
+        }
+        let filter_tag = field_tag | (code as u64);
+        let id_title = fields.len() == 2 && fields[0] == "id" && fields[1] == "title";
+
+        let recycled = if id_title && limit.is_none() && n >= 1024 {
+            ID_TITLE_POOL.lock().ok().and_then(|mut g| g.take())
+        } else {
+            None
+        };
+
+        if let Some(ref rec) = recycled
+            && rec.docs_epoch == self.docs_epoch
+            && rec.filter_tag == filter_tag
+            && !rec.rows.is_empty()
+            && rec.first_idx < n
+            && rec.last_idx < n
+            && row_matches_id_title(
+                &rec.rows[0],
+                &self.docs_id[rec.first_idx],
+                &self.docs_title[rec.first_idx],
+            )
+            && row_matches_id_title(
+                rec.rows.last().unwrap(),
+                &self.docs_id[rec.last_idx],
+                &self.docs_title[rec.last_idx],
+            )
+        {
+            LAST_ID_TITLE_META.with(|c| {
+                c.set((self.docs_epoch, filter_tag, rec.first_idx, rec.last_idx));
+            });
+            return Some(recycled.unwrap().rows);
+        }
+
+        let max_take = limit.unwrap_or(usize::MAX);
+        let mut idxs = Vec::with_capacity(limit.unwrap_or(codes.len() / 2 + 16).min(codes.len()));
+        for (i, &c) in codes.iter().enumerate() {
+            if c == code {
+                idxs.push(i);
+                if idxs.len() >= max_take {
+                    break;
+                }
+            }
+        }
+        if idxs.is_empty() {
+            return Some(Vec::new());
+        }
+        if id_title && limit.is_none() && idxs.len() >= 1024 {
+            let first_idx = idxs[0];
+            let last_idx = *idxs.last().unwrap();
+            LAST_ID_TITLE_META.with(|c| {
+                c.set((self.docs_epoch, filter_tag, first_idx, last_idx));
+            });
+            if let Some(mut rec) = recycled
+                && rec.rows.len() == idxs.len()
+            {
+                let total_idxs = idxs.len();
+                let docs_id = &self.docs_id;
+                let docs_title = &self.docs_title;
+                let rows_ptr = rec.rows.as_mut_ptr() as usize;
+                let threads = std::thread::available_parallelism()
+                    .map(|p| p.get())
+                    .unwrap_or(1)
+                    .min((total_idxs + 1023) / 1024);
+                let next_chunk = std::sync::atomic::AtomicUsize::new(0);
+                let chunk_size = 4096;
+                std::thread::scope(|scope| {
+                    for _ in 0..threads {
+                        scope.spawn(|| loop {
+                            let start = next_chunk
+                                .fetch_add(chunk_size, std::sync::atomic::Ordering::Relaxed);
+                            if start >= total_idxs {
+                                break;
+                            }
+                            let end = (start + chunk_size).min(total_idxs);
+                            for offset in start..end {
+                                let i = idxs[offset];
+                                let row = unsafe { &mut *(rows_ptr as *mut Row).add(offset) };
+                                if row.len() == 2 {
+                                    let mut it = row.iter_mut();
+                                    if let (Some((k1, v1)), Some((k2, v2))) = (it.next(), it.next())
+                                        && k1 == "id"
+                                        && k2 == "title"
+                                    {
+                                        let same_id = match v1 {
+                                            Cell::Text(a) => Arc::ptr_eq(a, &docs_id[i]),
+                                            _ => false,
+                                        };
+                                        if !same_id {
+                                            *v1 = Cell::Text(Arc::clone(&docs_id[i]));
+                                        }
+                                        let same_title = match v2 {
+                                            Cell::Text(a) => Arc::ptr_eq(a, &docs_title[i]),
+                                            _ => false,
+                                        };
+                                        if !same_title {
+                                            *v2 = Cell::Text(Arc::clone(&docs_title[i]));
+                                        }
+                                        continue;
+                                    }
+                                }
+                                *row = row_id_title(&docs_id[i], &docs_title[i]);
+                            }
+                        });
+                    }
+                });
+                return Some(rec.rows);
+            }
+        }
+        self.project_docs_hot(&idxs, fields)
+    }
+
     /// Returns None if any requested field is outside the hot set.
     pub fn project_docs_hot(&self, idxs: &[usize], fields: &[String]) -> Option<Vec<Row>> {
         if fields.is_empty() || !fields.iter().all(|f| docs_hot_field(f)) {
@@ -3968,6 +4730,9 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
         }
 
         let n = self.docs_id.len();
+        if n != self.collections.get("docs").map_or(0, Vec::len) {
+            return None;
+        }
         let total_idxs = idxs.len();
         let id_title = fields.len() == 2 && fields[0] == "id" && fields[1] == "title";
 
@@ -4081,12 +4846,12 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
         let n = self.docs_id.len();
         let id_title = fields.len() == 2 && fields[0] == "id" && fields[1] == "title";
 
-        if n >= 4096 {
+        if n >= 65536 {
             let threads = std::thread::available_parallelism()
                 .map(|p| p.get())
                 .unwrap_or(1)
                 .min(8)
-                .min((n + 1023) / 1024);
+                .min((n + 8191) / 8192);
             if threads > 1 {
                 let chunk_size = (n + threads - 1) / threads;
                 let docs_id = &self.docs_id;
@@ -4096,9 +4861,12 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
 
                 let chunks_out: Vec<Vec<Row>> = std::thread::scope(|scope| {
                     let mut handles = Vec::with_capacity(threads);
-                    for (chunk_idx, range) in (0..n).collect::<Vec<_>>().chunks(chunk_size).enumerate() {
+                    for chunk_idx in 0..threads {
                         let start = chunk_idx * chunk_size;
-                        let end = (start + range.len()).min(n);
+                        if start >= n {
+                            break;
+                        }
+                        let end = (start + chunk_size).min(n);
                         handles.push(scope.spawn(move || {
                             let mut out = Vec::with_capacity(end - start);
                             let finder = title_contains.map(|needle| memchr::memmem::Finder::new(needle.as_bytes()));
@@ -4267,107 +5035,13 @@ fn same_row_key(collection: &str, a: &Row, b: &Row) -> bool {
     }
 }
 
-pub fn catalog_hash(cat: &Catalog) -> String {
-    let mut buf = String::new();
-    buf.push_str(&cat.embed_id);
-    buf.push('|');
-    for (n, c) in &cat.collections {
-        buf.push_str(n);
-        buf.push(':');
-        buf.push(if c.append_only { 'A' } else { 'M' });
-        buf.push('{');
-        for (f, info) in &c.fields {
-            buf.push_str(f);
-            buf.push(':');
-            buf.push_str(info.ty.name());
-            if info.fts {
-                buf.push_str("+fts");
-            }
-            if info.unique {
-                buf.push_str("+uniq");
-            }
-            buf.push(',');
-        }
-        buf.push('}');
-        if let Some(src) = &c.filter_src {
-            buf.push('?');
-            buf.push_str(src);
-        }
-        buf.push(';');
-    }
-    buf.push('|');
-    for (n, r) in &cat.rels {
-        buf.push_str(n);
-        if r.stub {
-            buf.push_str(":stub");
-        }
-        if let Some(of) = &r.reverse_of {
-            buf.push('=');
-            buf.push_str(of);
-        }
-        buf.push(';');
-    }
-    buf.push('|');
-    for (n, idx) in &cat.indexes {
-        buf.push_str(n);
-        buf.push(':');
-        if idx.unique {
-            buf.push('U');
-        }
-        buf.push('[');
-        buf.push_str(&idx.fields.join(","));
-        buf.push(']');
-        if let Some(pred) = &idx.pred {
-            buf.push('?');
-            buf.push_str(&crate::plan::fmt_pred(pred));
-        }
-        buf.push(';');
-    }
-    buf.push('|');
-    for (n, fields) in &cat.owned {
-        buf.push_str(n);
-        buf.push('{');
-        for (f, info) in fields {
-            buf.push_str(f);
-            buf.push(':');
-            buf.push_str(info.ty.name());
-            buf.push(',');
-        }
-        buf.push_str("};");
-    }
-    buf.push('|');
-    for fk in &cat.fks {
-        buf.push_str(&fk.from_col);
-        buf.push('.');
-        buf.push_str(&fk.from_field);
-        buf.push_str("->");
-        buf.push_str(&fk.to_col);
-        buf.push('.');
-        buf.push_str(&fk.to_field);
-        buf.push(';');
-    }
-    buf.push('|');
-    for g in &cat.guards {
-        buf.push_str(&g.collection);
-        buf.push('.');
-        buf.push_str(&g.field);
-        buf.push('?');
-        buf.push_str(&crate::plan::fmt_pred(&g.pred));
-        buf.push(';');
-    }
-    format!("h:{:016x}", fnv1a64(buf.as_bytes()))
-}
+pub use crate::catalog::catalog_hash;
 
 pub fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
-}
-
-#[allow(dead_code)]
-pub fn content_hash(body: &str) -> String {
-    content_hash_arc(body).as_ref().to_owned()
 }
 
 pub fn content_hash_arc(body: &str) -> Arc<str> {
@@ -4381,7 +5055,7 @@ pub fn content_hash_arc(body: &str) -> Arc<str> {
         buf[2 + i] = HEX[((h >> shift) & 0xf) as usize];
     }
     // SAFETY: buf is always ASCII hex.
-    Arc::from(std::str::from_utf8(&buf).unwrap())
+    Arc::from(unsafe { std::str::from_utf8_unchecked(&buf) })
 }
 
 pub fn fnv1a64(bytes: &[u8]) -> u64 {
