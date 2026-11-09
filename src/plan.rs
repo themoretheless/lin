@@ -894,9 +894,9 @@ fn apply_filter(cur: Node, pred: &Pred, cat: &Catalog) -> Node {
         | NodeKind::IndexSeek { collection, .. } => collection.as_str(),
         _ => "",
     };
-    let (point, rest) = extract_point(pred, cat, col_name);
+    let extracted = extract_point(pred, cat, col_name);
     let mut out = cur;
-    if let Some((field, value)) = point.as_ref()
+    if let Some(((field, value), _)) = extracted.as_ref()
         && let NodeKind::Scan { collection, .. } = &out.kind
     {
         out = node(
@@ -921,21 +921,21 @@ fn apply_filter(cur: Node, pred: &Pred, cat: &Catalog) -> Node {
             vec![],
         );
     }
-    if let Some(rest) = rest.as_ref()
-        && let NodeKind::Filter { pred: existing } = &out.kind
-    {
-        let merged = format!("{existing} and {rest}");
-        out.kind = NodeKind::Filter { pred: merged };
-        return out;
-    } else if let Some(rest) = rest {
-        out = filter_node(out, &rest);
-    } else if point.is_none()
-        && let NodeKind::Filter { pred: existing } = &out.kind
-    {
+    if let Some((_, rest)) = extracted {
+        if let Some(rest) = rest.as_ref()
+            && let NodeKind::Filter { pred: existing } = &out.kind
+        {
+            let merged = format!("{existing} and {rest}");
+            out.kind = NodeKind::Filter { pred: merged };
+            return out;
+        } else if let Some(rest) = rest {
+            out = filter_node(out, &rest);
+        }
+    } else if let NodeKind::Filter { pred: existing } = &out.kind {
         let merged = format!("{existing} and {pred}");
         out.kind = NodeKind::Filter { pred: merged };
         return out;
-    } else if point.is_none() {
+    } else {
         out = filter_node(out, pred);
     }
     out
@@ -952,7 +952,11 @@ fn filter_node(inner: Node, pred: &Pred) -> Node {
     )
 }
 
-fn extract_point(pred: &Pred, cat: &Catalog, collection: &str) -> (Option<(String, Value)>, Option<Pred>) {
+fn extract_point(
+    pred: &Pred,
+    cat: &Catalog,
+    collection: &str,
+) -> Option<((String, Value), Option<Pred>)> {
     match pred {
         Pred::Cmp {
             field,
@@ -966,28 +970,26 @@ fn extract_point(pred: &Pred, cat: &Catalog, collection: &str) -> (Option<(Strin
                     .is_some_and(|f| f.unique))
             && matches!(value, Value::String(_)) =>
         {
-            (Some((field.parts[0].clone(), value.clone())), None)
+            Some(((field.parts[0].clone(), value.clone()), None))
         }
         Pred::And(a, b) => {
-            let (pa, ra) = extract_point(a, cat, collection);
-            if pa.is_some() {
+            if let Some((pa, ra)) = extract_point(a, cat, collection) {
                 let rest = Some(match ra {
                     Some(r) => r.and((**b).clone()),
                     None => (**b).clone(),
                 });
-                return (pa, rest);
+                return Some((pa, rest));
             }
-            let (pb, rb) = extract_point(b, cat, collection);
-            if pb.is_some() {
+            if let Some((pb, rb)) = extract_point(b, cat, collection) {
                 let rest = Some(match rb {
                     Some(r) => (**a).clone().and(r),
                     None => (**a).clone(),
                 });
-                return (pb, rest);
+                return Some((pb, rest));
             }
-            (None, Some(pred.clone()))
+            None
         }
-        _ => (None, Some(pred.clone())),
+        _ => None,
     }
 }
 
@@ -1130,8 +1132,7 @@ fn push_field(out: &mut Vec<String>, name: &str) {
 
 fn point_or_scan(collection: &str, pred: Option<&Pred>, cat: &Catalog) -> Node {
     if let Some(p) = pred
-        && let (point, rest) = extract_point(p, cat, collection)
-        && let Some((field, value)) = point
+        && let Some(((field, value), rest)) = extract_point(p, cat, collection)
     {
         let mut n = node(
             NodeKind::Get {

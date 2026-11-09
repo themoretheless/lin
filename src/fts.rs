@@ -55,31 +55,18 @@ impl FtsIndex {
     pub fn build(rows: &[Row], fields: &[String]) -> Self {
         let mut idx = Self::empty(fields);
         idx.postings.reserve(rows.len());
-        let mut scratch = String::with_capacity(256);
-        let has_snippet = fields.iter().any(|f| f == "snippet");
-        let mut target_fields: Vec<&str> = fields.iter().map(|f| f.as_str()).collect();
-        if !has_snippet {
-            target_fields.push("snippet");
-        }
-        for (i, row) in rows.iter().enumerate() {
-            for &f in &target_fields {
-                if let Some(v) = row.get(f) {
-                    if let Some(text) = v.text() {
-                        let lowered = lowercased(text, &mut scratch);
-                        for tok in lowered.split_whitespace() {
-                            if let Some(list) = idx.postings.get_mut(tok) {
-                                if list.last() != Some(&i) {
-                                    list.push(i);
-                                }
-                            } else {
-                                idx.postings.insert(Arc::from(tok), smallvec![i]);
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        idx.append_slab(0, rows);
         idx
+    }
+
+    pub fn rebuild_in_place(&mut self, rows: &[Row], fields: &[String]) {
+        self.fields.clear();
+        self.fields.extend_from_slice(fields);
+        self.postings.clear();
+        self.dels.clear();
+        self.adds.clear();
+        self.postings.reserve(rows.len());
+        self.append_slab(0, rows);
     }
 
     /// Post a row whose position is new at the tail of the collection: written
@@ -113,17 +100,17 @@ impl FtsIndex {
                 if !has_snippet {
                     target_fields.push("snippet");
                 }
-                let mut slots: SmallVec<[usize; 4]> = SmallVec::new();
-                for (pos, (k, _)) in first.iter().enumerate() {
+                let mut slot_mask: u32 = 0;
+                for (pos, (k, _)) in first.iter().enumerate().take(32) {
                     if target_fields.contains(&k.as_str()) {
-                        slots.push(pos);
+                        slot_mask |= 1u32 << pos;
                     }
                 }
                 let mut scratch = String::with_capacity(256);
                 for (i, row) in rows.iter().enumerate() {
                     let row_idx = start + i;
-                    for (pos, val) in row.values().enumerate() {
-                        if slots.contains(&pos) {
+                    for (pos, val) in row.values().enumerate().take(32) {
+                        if (slot_mask & (1u32 << pos)) != 0 {
                             if let Some(text) = val.text() {
                                 let lowered = lowercased(text, &mut scratch);
                                 for tok in lowered.split_whitespace() {

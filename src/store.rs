@@ -2101,7 +2101,12 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
             {
                 return None;
             }
-            if idx >= self.collections.get("docs").map_or(0, Vec::len) {
+            let docs_len = self
+                .collections
+                .get("docs")
+                .map_or(0, Vec::len)
+                .max(self.docs_id.len());
+            if idx >= docs_len {
                 return None;
             }
             self.last_doc_id_idx
@@ -2223,7 +2228,7 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
 
     pub fn rebuild_row_maps(&mut self) {
         self.ensure_facts_rows();
-        self.by_id.clear();
+        self.by_id.retain(|k, _| self.collections.contains_key(k));
         self.docs_by_uri.clear();
         self.facts_by_spo.clear();
         self.edge_keys.clear();
@@ -2293,6 +2298,9 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
                 }
                 return;
             }
+            if self.edges.len() > 16 {
+                return;
+            }
         }
         for e in &self.edges {
             if e.rel == rel {
@@ -2302,6 +2310,48 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
                     }
                 } else if e.from == node {
                     f(e.to.as_str());
+                }
+            }
+        }
+    }
+
+    /// Invoke closure for each outgoing or incoming neighbor `Arc<str>` key without string allocations.
+    #[inline]
+    pub fn for_each_neighbor_arc(
+        &self,
+        rel: &Arc<str>,
+        node: &Arc<str>,
+        reverse: bool,
+        mut f: impl FnMut(&Arc<str>),
+    ) {
+        let synced = self.edge_keys.len() == self.edges.len();
+        if synced {
+            let key = (Arc::clone(rel), Arc::clone(node));
+            let map = if reverse {
+                &self.edges_in
+            } else {
+                &self.edges_out
+            };
+            if let Some(list) = map.get(&key) {
+                for dst in list {
+                    f(dst);
+                }
+                return;
+            }
+            if self.edges.len() > 16 {
+                return;
+            }
+        }
+        for e in &self.edges {
+            if e.rel == rel.as_ref() {
+                if reverse {
+                    if e.to == node.as_ref() {
+                        let dst_arc = Arc::<str>::from(e.from.as_str());
+                        f(&dst_arc);
+                    }
+                } else if e.from == node.as_ref() {
+                    let dst_arc = Arc::<str>::from(e.to.as_str());
+                    f(&dst_arc);
                 }
             }
         }
@@ -3133,6 +3183,46 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
             self.docs_title.reserve(n);
             self.docs_layer.reserve(n);
             self.docs_wing.reserve(n);
+            let first = &rows[0];
+            let id_pos = first.keys().position(|k| k == "id");
+            let uri_pos = first.keys().position(|k| k == "uri");
+            let title_pos = first.keys().position(|k| k == "title");
+            let layer_pos = first.keys().position(|k| k == "layer");
+            let wing_pos = first.keys().position(|k| k == "wing");
+            let uniform = rows[1..].iter().all(|r| r.len() == first.len());
+            if uniform && first.len() <= 32 {
+                for (i, row) in rows.iter().enumerate() {
+                    let mut cells: [&Cell; 32] = [&Cell::Null; 32];
+                    for (p, val) in row.values().enumerate().take(32) {
+                        cells[p] = val;
+                    }
+                    let id_arc: Arc<str> = id_pos
+                        .and_then(|p| cells[p].text_shared())
+                        .unwrap_or_default();
+                    let uri_arc: Option<Arc<str>> = uri_pos.and_then(|p| cells[p].text_shared());
+                    let title_arc: Arc<str> = title_pos
+                        .and_then(|p| cells[p].text_shared())
+                        .unwrap_or_default();
+                    let layer_arc: Arc<str> = layer_pos
+                        .and_then(|p| cells[p].text_shared())
+                        .unwrap_or_default();
+                    let wing_arc: Arc<str> = wing_pos
+                        .and_then(|p| cells[p].text_shared())
+                        .unwrap_or_default();
+
+                    if !id_arc.is_empty() {
+                        by_id_map.insert(Arc::clone(&id_arc), i);
+                    }
+                    if let Some(uri) = uri_arc {
+                        self.docs_by_uri.insert(uri, i);
+                    }
+                    self.docs_id.push(id_arc);
+                    self.docs_title.push(title_arc);
+                    self.docs_layer.push(layer_arc);
+                    self.docs_wing.push(intern_wing(wing_arc));
+                }
+                return;
+            }
             for (i, row) in rows.iter().enumerate() {
                 let mut id = None;
                 let mut uri = None;
@@ -3167,6 +3257,35 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
             self.orders_id.reserve(n);
             self.orders_user_id.reserve(n);
             self.orders_total.reserve(n);
+            let first = &rows[0];
+            let id_pos = first.keys().position(|k| k == "id");
+            let uid_pos = first.keys().position(|k| k == "user_id");
+            let total_pos = first.keys().position(|k| k == "total");
+            let uniform = rows[1..].iter().all(|r| r.len() == first.len());
+            if uniform && first.len() <= 32 {
+                for (i, row) in rows.iter().enumerate() {
+                    let mut cells: [&Cell; 32] = [&Cell::Null; 32];
+                    for (p, val) in row.values().enumerate().take(32) {
+                        cells[p] = val;
+                    }
+                    let id_arc: Arc<str> = id_pos
+                        .and_then(|p| cells[p].text_shared())
+                        .unwrap_or_default();
+                    let uid_arc: Arc<str> = uid_pos
+                        .and_then(|p| cells[p].text_shared())
+                        .unwrap_or_default();
+                    let total = total_pos
+                        .and_then(|p| cells[p].as_f64())
+                        .unwrap_or(0.0);
+                    if !id_arc.is_empty() {
+                        by_id_map.insert(Arc::clone(&id_arc), i);
+                    }
+                    self.orders_id.push(id_arc);
+                    self.orders_user_id.push(uid_arc);
+                    self.orders_total.push(total);
+                }
+                return;
+            }
             for (i, row) in rows.iter().enumerate() {
                 let mut id = None;
                 let mut uid = None;
@@ -3192,6 +3311,30 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
         if collection == "users" {
             self.users_id.reserve(n);
             self.users_email.reserve(n);
+            let first = &rows[0];
+            let id_pos = first.keys().position(|k| k == "id");
+            let email_pos = first.keys().position(|k| k == "email");
+            let uniform = rows[1..].iter().all(|r| r.len() == first.len());
+            if uniform && first.len() <= 32 {
+                for (i, row) in rows.iter().enumerate() {
+                    let mut cells: [&Cell; 32] = [&Cell::Null; 32];
+                    for (p, val) in row.values().enumerate().take(32) {
+                        cells[p] = val;
+                    }
+                    let id_arc: Arc<str> = id_pos
+                        .and_then(|p| cells[p].text_shared())
+                        .unwrap_or_default();
+                    let email_arc: Arc<str> = email_pos
+                        .and_then(|p| cells[p].text_shared())
+                        .unwrap_or_default();
+                    if !id_arc.is_empty() {
+                        by_id_map.insert(Arc::clone(&id_arc), i);
+                    }
+                    self.users_id.push(id_arc);
+                    self.users_email.push(email_arc);
+                }
+                return;
+            }
             for (i, row) in rows.iter().enumerate() {
                 let mut id = None;
                 let mut email = None;
@@ -3948,9 +4091,12 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
             };
             let mut live = LiveIndex::new(def);
             let rows = self.collection(&snap.collection);
-            live.reverse.reserve(rows.len());
-            for (i, row) in rows.iter().enumerate() {
-                let _ = live.insert_at_new(i, row);
+            if rows.len() > 1 && live.def.pred.is_none() {
+                let _ = live.insert_slab_batch_no_reverse(0, rows);
+            } else {
+                for (i, row) in rows.iter().enumerate() {
+                    let _ = live.insert_at_new(i, row);
+                }
             }
 
             // Build bloom filter for fast negative lookups
@@ -4000,8 +4146,14 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
 
     /// Rebuild FTS postings from catalog `fts` fields (memory / missing durable blob).
     pub fn rebuild_fts(&mut self, catalog: &crate::catalog::Catalog) {
-        self.fts.clear();
-        for (cname, cdef) in &catalog.collections {
+        self.fts
+            .retain(|k, _| catalog.collections.contains_key(k));
+        let names: smallvec::SmallVec<[String; 4]> =
+            catalog.collections.keys().cloned().collect();
+        for cname in names {
+            let Some(cdef) = catalog.collections.get(&cname) else {
+                continue;
+            };
             let fields: Vec<String> = cdef
                 .fields
                 .iter()
@@ -4009,11 +4161,18 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
                 .map(|(n, _)| n.clone())
                 .collect();
             if fields.is_empty() {
+                self.fts.remove(&cname);
                 continue;
             }
-            let rows = self.collection(cname);
-            self.fts
-                .insert(cname.clone(), crate::fts::FtsIndex::build(rows, &fields));
+            let mut existing = self.fts.remove(&cname);
+            let rows = self.collection(&cname);
+            let idx = if let Some(mut fts) = existing.take() {
+                fts.rebuild_in_place(rows, &fields);
+                fts
+            } else {
+                crate::fts::FtsIndex::build(rows, &fields)
+            };
+            self.fts.insert(cname, idx);
         }
     }
 

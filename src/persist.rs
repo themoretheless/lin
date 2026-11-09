@@ -756,7 +756,17 @@ pub fn encode_snapshot_ref_to_writer<W: std::io::Write>(
         if rows.is_empty() {
             return Ok(Vec::new());
         }
-        let raw = rmp_serde::encode::to_vec_named(rows).map_err(io_err)?;
+        let mut col_buf = Vec::new();
+        let raw = if let Some((magic, _)) = encode_insert_rows_direct(0, 0, "", rows, &mut col_buf)
+        {
+            let mut framed = Vec::with_capacity(8 + col_buf.len());
+            framed.extend_from_slice(b"LCOL");
+            framed.extend_from_slice(&magic);
+            framed.extend_from_slice(&col_buf);
+            framed
+        } else {
+            rmp_serde::encode::to_vec_named(rows).map_err(io_err)?
+        };
         #[cfg(feature = "compress-zstd")]
         {
             zstd::encode_all(&raw[..], 1).map_err(io_err)
@@ -1091,6 +1101,21 @@ struct ChunkSlice<'a> {
 
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
 
+fn decode_snapshot_payload(payload: &[u8]) -> Result<Vec<Row>, ()> {
+    if payload.len() >= 8 && &payload[0..4] == b"LCOL" {
+        let allow_sparse = payload[4..8] == LOG_MAGIC_SPARSE;
+        let rec = decode_column_record(&payload[8..], allow_sparse)?;
+        if let Pack::InsertCols {
+            fields, cols, n, ..
+        } = rec.pack
+        {
+            return Ok(cols_to_rows(&fields, &cols, n as usize));
+        }
+        return Err(());
+    }
+    rmp_serde::from_slice(payload).map_err(|_| ())
+}
+
 fn decode_snapshot_chunk<'a>(c: &ChunkSlice<'a>) -> Result<(&'a str, Vec<Row>), ()> {
     if c.data.is_empty() {
         return Ok((c.name, Vec::new()));
@@ -1106,7 +1131,7 @@ fn decode_snapshot_chunk<'a>(c: &ChunkSlice<'a>) -> Result<(&'a str, Vec<Row>), 
             if decompressed.len() > 256 * 1024 * 1024 {
                 return Err(());
             }
-            let rows: Vec<Row> = rmp_serde::from_slice(&decompressed).map_err(|_| ())?;
+            let rows = decode_snapshot_payload(&decompressed)?;
             return Ok((c.name, rows));
         }
         #[cfg(not(feature = "compress-zstd"))]
@@ -1114,7 +1139,7 @@ fn decode_snapshot_chunk<'a>(c: &ChunkSlice<'a>) -> Result<(&'a str, Vec<Row>), 
             return Err(());
         }
     }
-    let rows: Vec<Row> = rmp_serde::from_slice(c.data).map_err(|_| ())?;
+    let rows = decode_snapshot_payload(c.data)?;
     Ok((c.name, rows))
 }
 
@@ -3625,13 +3650,41 @@ pub fn rows_to_insert_cols(
 pub fn cols_to_rows(fields: &[String], cols: &[ColData], n: usize) -> Vec<crate::store::Row> {
     use crate::store::Cell;
     let mut rows = Vec::with_capacity(n);
+    if n >= 2 && fields.windows(2).all(|w| w[0] < w[1]) {
+        let template: crate::store::Row = fields
+            .iter()
+            .map(|f| (f.clone(), Cell::Null))
+            .collect();
+        for i in 0..n {
+            let mut row = template.clone();
+            for (fi, slot) in row.values_mut().enumerate() {
+                *slot = match cols.get(fi) {
+                    Some(ColData::Text(v)) => v
+                        .get(i)
+                        .map(|s| Cell::Text(std::sync::Arc::clone(s)))
+                        .unwrap_or_else(|| Cell::text_arc("")),
+                    Some(ColData::Int(v)) => Cell::Int(v.get(i).copied().unwrap_or(0)),
+                    Some(ColData::Float(v)) => Cell::Float(v.get(i).copied().unwrap_or(0.0)),
+                    Some(ColData::Bool(v)) => Cell::Bool(v.get(i).copied().unwrap_or(false)),
+                    Some(ColData::Time(v)) => Cell::Time(v.get(i).copied().unwrap_or(0)),
+                    Some(ColData::Vec(v)) => match v.get(i).and_then(|o| o.as_ref()) {
+                        Some(emb) => Cell::vec_arc(std::sync::Arc::clone(emb)),
+                        _ => Cell::Null,
+                    },
+                    Some(ColData::Null) | None => Cell::Null,
+                };
+            }
+            rows.push(row);
+        }
+        return rows;
+    }
     for i in 0..n {
         let mut row = crate::store::Row::new();
         for (fi, f) in fields.iter().enumerate() {
             let cell = match cols.get(fi) {
                 Some(ColData::Text(v)) => v
                     .get(i)
-                    .map(|s| Cell::text_arc((*s).clone())) // Zero-copy: deref Arc to str, then Into<Arc<str>> reuses
+                    .map(|s| Cell::Text(std::sync::Arc::clone(s)))
                     .unwrap_or_else(|| Cell::text_arc("")),
                 Some(ColData::Int(v)) => Cell::Int(v.get(i).copied().unwrap_or(0)),
                 Some(ColData::Float(v)) => Cell::Float(v.get(i).copied().unwrap_or(0.0)),

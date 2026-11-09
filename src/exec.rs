@@ -230,7 +230,7 @@ pub(crate) struct AggPlan {
 #[derive(Debug, Clone)]
 pub struct Prepared {
     pub src: String,
-    stmts: Vec<Stmt>,
+    stmts: Arc<[Stmt]>,
     pub plan: Arc<Plan>,
     /// True if any statement may mutate catalog or store.
     writes: bool,
@@ -238,10 +238,10 @@ pub struct Prepared {
     append_only: bool,
     /// Schema (col/rel/index) — clears plan cache after success.
     schema: bool,
-    pub(crate) point_get: Option<PointGetPlan>,
-    pub(crate) agg_plan: Option<AggPlan>,
-    pub(crate) point_delete: Option<PointDeletePlan>,
-    pub(crate) point_update: Option<PointUpdatePlan>,
+    pub(crate) point_get: Option<Arc<PointGetPlan>>,
+    pub(crate) agg_plan: Option<Arc<AggPlan>>,
+    pub(crate) point_delete: Option<Arc<PointDeletePlan>>,
+    pub(crate) point_update: Option<Arc<PointUpdatePlan>>,
 }
 
 impl Prepared {
@@ -303,6 +303,8 @@ pub struct Db {
     follower: bool,
     /// Active embedder (`search vec` / hybrid / auto-embed on insert).
     embedder: Option<Arc<dyn Embedder>>,
+    /// Cached read-only snapshot keyed by `(gen, docs_epoch, collections_len, edges_len, facts_len)`.
+    reader_cache: Option<((u64, u64, usize, usize, usize), ReadDb)>,
     #[cfg(feature = "gpu")]
     gpu: Option<Arc<crate::gpu::GpuCompute>>,
     #[cfg(feature = "gpu")]
@@ -315,6 +317,7 @@ pub struct Db {
 #[derive(Clone)]
 pub struct ReadDb {
     inner: Arc<Db>,
+    plan_cache: Arc<std::sync::Mutex<FxHashMap<String, Prepared>>>,
 }
 
 /// Interactive ACID transaction handle.
@@ -617,6 +620,7 @@ impl Db {
             pulled_wal: Vec::new(),
             follower: false,
             embedder: Some(embedder),
+            reader_cache: None,
             #[cfg(feature = "gpu")]
             gpu: None,
             #[cfg(feature = "gpu")]
@@ -642,12 +646,14 @@ impl Db {
 
     pub fn with_quotas(mut self, quotas: Quotas) -> Self {
         self.quotas = quotas;
+        self.reader_cache = None;
         self
     }
 
     /// Enable or disable spill-to-disk for out-of-core aggregations when memory quota is exceeded.
     pub fn with_spill(mut self, enabled: bool) -> Self {
         self.quotas.spill_enabled = enabled;
+        self.reader_cache = None;
         self
     }
 
@@ -656,6 +662,7 @@ impl Db {
     pub fn with_gpu(mut self, gpu: Arc<crate::gpu::GpuCompute>) -> Self {
         self.gpu = Some(gpu);
         self.gpu_cache = Default::default();
+        self.reader_cache = None;
         self
     }
 
@@ -664,6 +671,7 @@ impl Db {
     pub fn enable_gpu(&mut self, gpu: Arc<crate::gpu::GpuCompute>) {
         self.gpu = Some(gpu);
         self.gpu_cache = Default::default();
+        self.reader_cache = None;
     }
 
     /// Release cached GPU data and return search to the CPU backend.
@@ -671,6 +679,7 @@ impl Db {
     pub fn disable_gpu(&mut self) {
         self.gpu = None;
         self.gpu_cache = Default::default();
+        self.reader_cache = None;
     }
 
     /// The attached backend, for custom compute pipelines and native resources.
@@ -702,6 +711,7 @@ impl Db {
         self.embedder = Some(embedder);
         self.plan_cache.clear();
         self.query_cache.clear();
+        self.reader_cache = None;
         self
     }
 
@@ -714,6 +724,7 @@ impl Db {
         }
         self.plan_cache.clear();
         self.query_cache.clear();
+        self.reader_cache = None;
         self
     }
 
@@ -755,6 +766,7 @@ impl Db {
             pulled_wal: Vec::new(),
             follower: false,
             embedder: Some(embedder),
+            reader_cache: None,
             #[cfg(feature = "gpu")]
             gpu: None,
             #[cfg(feature = "gpu")]
@@ -836,6 +848,7 @@ impl Db {
             pulled_wal: Vec::new(),
             follower: false,
             embedder: Some(embedder),
+            reader_cache: None,
             #[cfg(feature = "gpu")]
             gpu: None,
             #[cfg(feature = "gpu")]
@@ -844,6 +857,7 @@ impl Db {
         inner.reopen.total_ms = t0.elapsed().as_secs_f64() * 1000.0;
         Ok(ReadDb {
             inner: Arc::new(inner),
+            plan_cache: Arc::new(std::sync::Mutex::new(FxHashMap::default())),
         })
     }
 
@@ -880,7 +894,20 @@ impl Db {
 
     /// Freeze a consistent in-memory snapshot at the current `gen` for concurrent readers.
     pub fn reader(&mut self) -> ReadDb {
-        ReadDb {
+        let cache_key = (
+            self.store.r#gen,
+            self.store.docs_epoch,
+            self.store.collections.len(),
+            self.store.edges.len(),
+            self.store.facts_len(),
+        );
+        if self.store.fts_deferred_doc_swaps.is_empty()
+            && let Some((k, cached)) = &self.reader_cache
+            && *k == cache_key
+        {
+            return cached.clone();
+        }
+        let rdb = ReadDb {
             inner: Arc::new(Self {
                 catalog: self.catalog.clone(),
                 store: self.store.clone_mem(),
@@ -896,12 +923,16 @@ impl Db {
                 pulled_wal: Vec::new(),
                 follower: false,
                 embedder: self.embedder.clone(),
+                reader_cache: None,
                 #[cfg(feature = "gpu")]
                 gpu: self.gpu.clone(),
                 #[cfg(feature = "gpu")]
                 gpu_cache: Default::default(),
             }),
-        }
+            plan_cache: Arc::new(std::sync::Mutex::new(FxHashMap::default())),
+        };
+        self.reader_cache = Some((cache_key, rdb.clone()));
+        rdb
     }
 
     /// Ship WAL frames with `gen > since` (follower / network).
@@ -964,21 +995,28 @@ impl Db {
         }
 
         let n = to_apply.len();
+        let mut saw_schema = false;
         for (_, rec) in &to_apply {
+            if pack_has_schema(&rec.pack) {
+                saw_schema = true;
+            }
             self.store.apply_pack(&rec.pack);
             self.store.next_id = rec.next_id;
             self.store.r#gen = rec.r#gen;
         }
-        self.store.rebuild_indexes();
-        self.store.rebuild_row_maps();
-        self.store.merge_extras_into(&mut self.catalog);
-        self.store.ensure_fts(&self.catalog);
+        if saw_schema {
+            self.store.merge_extras_into(&mut self.catalog);
+            self.store.ensure_fts(&self.catalog);
+        }
         if let Some(p) = self.persist.as_mut() {
-            p.catalog_hash = crate::store::catalog_hash(&self.catalog);
+            if saw_schema {
+                p.catalog_hash = crate::store::catalog_hash(&self.catalog);
+            }
             self.store.maybe_checkpoint(p)?;
         }
         self.plan_cache.clear();
         self.query_cache.clear();
+        self.reader_cache = None;
         Ok(n)
     }
 
@@ -1159,7 +1197,7 @@ impl Db {
             && let Stmt::Query(q) = &stmts[0]
             && !writes
         {
-            Self::try_extract_point_get(q, plan_cat)
+            Self::try_extract_point_get(q, plan_cat).map(Arc::new)
         } else {
             None
         };
@@ -1168,23 +1206,23 @@ impl Db {
             && !writes
             && point_get.is_none()
         {
-            Self::try_extract_agg_plan(q, plan_cat)
+            Self::try_extract_agg_plan(q, plan_cat).map(Arc::new)
         } else {
             None
         };
         let point_delete = if stmts.len() == 1 {
-            Self::try_extract_point_delete(&stmts[0], &self.catalog, &self.store)
+            Self::try_extract_point_delete(&stmts[0], &self.catalog, &self.store).map(Arc::new)
         } else {
             None
         };
         let point_update = if stmts.len() == 1 {
-            Self::try_extract_point_update(&stmts[0])
+            Self::try_extract_point_update(&stmts[0]).map(Arc::new)
         } else {
             None
         };
         Ok(Prepared {
             src: String::new(),
-            stmts,
+            stmts: Arc::from(stmts),
             plan,
             writes,
             append_only,
@@ -1743,7 +1781,7 @@ impl Db {
             }
         }
         let h = self.run_prepared(prepared)?;
-        Ok(match prepared.stmts.as_slice() {
+        Ok(match &prepared.stmts[..] {
             [Stmt::Query(q)] => rows_to_query_batch(&h.rows, q),
             _ => rows_to_rough_batch(&h.rows),
         })
@@ -2398,7 +2436,19 @@ impl ReadDb {
     }
 
     pub fn prepare(&self, src: &str) -> Result<Prepared, Error> {
-        self.inner.prepare_uncached(src)
+        if let Ok(guard) = self.plan_cache.lock()
+            && let Some(p) = guard.get(src)
+        {
+            return Ok(p.clone());
+        }
+        let prepared = self.inner.prepare_uncached(src)?;
+        if let Ok(mut guard) = self.plan_cache.lock() {
+            if guard.len() >= 1024 {
+                guard.clear();
+            }
+            guard.insert(src.to_string(), prepared.clone());
+        }
+        Ok(prepared)
     }
 
     pub fn prepare_stmt(&self, stmt: Stmt) -> Result<Prepared, Error> {
@@ -2410,7 +2460,8 @@ impl ReadDb {
     }
 
     pub fn run(&self, src: &str) -> Result<Handle, Error> {
-        self.inner.run_readonly(src)
+        let prepared = self.prepare(src)?;
+        self.inner.run_prepared_readonly(&prepared)
     }
 
     pub fn scalar(&self, src: &str) -> Result<crate::store::Cell, Error> {
@@ -2455,7 +2506,7 @@ impl ReadDb {
             }
         }
         let h = self.run_prepared(prepared)?;
-        Ok(match prepared.stmts.as_slice() {
+        Ok(match &prepared.stmts[..] {
             [Stmt::Query(q)] => rows_to_query_batch(&h.rows, q),
             _ => rows_to_rough_batch(&h.rows),
         })
@@ -3103,6 +3154,45 @@ impl Db {
                 if let Some(bound) = bindings.get(name) {
                     bound.clone()
                 } else if let Some(pred) = first_filter
+                    && let Some((field, key)) = point_key(pred)
+                    && (field == "id" || (field == "uri" && name == "docs"))
+                {
+                    if let Some(idx) = self.store.point_index(name, field, key) {
+                        let simple_eq = matches!(
+                            pred,
+                            Pred::Cmp {
+                                op: CmpOp::Eq,
+                                value: Value::String(_),
+                                ..
+                            }
+                        );
+                        if simple_eq
+                            && project_fields_step.is_none()
+                            && matches!(
+                                q.steps.get(1),
+                                Some(Step::Graph { .. } | Step::Hop { .. })
+                            )
+                        {
+                            static ID_URI_FIELDS: std::sync::LazyLock<[String; 2]> =
+                                std::sync::LazyLock::new(|| ["id".to_string(), "uri".to_string()]);
+                            self.store
+                                .project_by_key(name, field, key, Some(&*ID_URI_FIELDS))
+                                .into_iter()
+                                .collect()
+                        } else {
+                            self.fetch_idxs_filtered(
+                                name,
+                                std::slice::from_ref(&idx),
+                                pred,
+                                now,
+                                project_fields_step,
+                                simple_eq,
+                            )
+                        }
+                    } else {
+                        Vec::new()
+                    }
+                } else if let Some(pred) = first_filter
                     && let Some((uses, covered)) = crate::index::pick_index_with_coverage(&self.catalog, name, pred)
                     && let Some(idxs) = self.store.index_seek(name, &uses, now)
                 {
@@ -3325,8 +3415,24 @@ impl Db {
         q: &Query,
         cat: &crate::catalog::Catalog,
     ) -> Option<PointGetPlan> {
+        if !matches!(q.source, Source::Collection(_)) {
+            return None;
+        }
+        if !matches!(q.steps.first(), Some(Step::Filter(_))) {
+            return None;
+        }
+        if q.steps.iter().any(|s| {
+            !matches!(
+                s,
+                Step::Filter(_) | Step::Project(_) | Step::Take { .. } | Step::Skip { .. }
+            )
+        }) {
+            return None;
+        }
         let mut q = crate::catalog::with_catalog_filter(q, cat);
-        q.to_mut().simplify_predicates();
+        if q.needs_simplify() {
+            q.to_mut().simplify_predicates();
+        }
         let q = &*q;
         let name = match &q.source {
             Source::Collection(n) => n.clone(),
@@ -3581,8 +3687,13 @@ impl Db {
         q: &Query,
         cat: &crate::catalog::Catalog,
     ) -> Option<AggPlan> {
+        if !matches!(q.source, Source::Collection(_)) {
+            return None;
+        }
         let mut q = crate::catalog::with_catalog_filter(q, cat);
-        q.to_mut().simplify_predicates();
+        if q.needs_simplify() {
+            q.to_mut().simplify_predicates();
+        }
         let q = &*q;
         let name = match &q.source {
             Source::Collection(n) => n.clone(),
@@ -5723,67 +5834,51 @@ impl Db {
         if self.gpu.is_some() {
             return self.gpu_walk_rows("docs", rows, edge_rel, reverse, depth, true);
         }
-        let mut frontier: BTreeSet<String> = BTreeSet::new();
+        let mut frontier: Vec<Arc<str>> = Vec::with_capacity(rows.len() * 2);
+        let mut seen_nodes: FxHashSet<Arc<str>> = FxHashSet::default();
         for r in rows {
-            if let Some(id) = row_text(r, "id") {
-                frontier.insert(id.to_string());
+            if let Some(id) = r.get("id").and_then(Cell::text_shared) {
+                if seen_nodes.insert(Arc::clone(&id)) {
+                    frontier.push(id);
+                }
             }
-            if let Some(uri) = row_text(r, "uri") {
-                frontier.insert(uri.to_string());
+            if let Some(uri) = r.get("uri").and_then(Cell::text_shared) {
+                if seen_nodes.insert(Arc::clone(&uri)) {
+                    frontier.push(uri);
+                }
             }
         }
-        let mut seen_nodes = frontier.clone();
-        let mut seen_edges: BTreeSet<(String, String, String)> = BTreeSet::new();
+        let rel_arc: Arc<str> = Arc::from(edge_rel);
+        let mut seen_edges: FxHashSet<(Arc<str>, Arc<str>)> = FxHashSet::default();
         let mut out = Vec::new();
         let depth = depth.clamp(1, 3);
         for _ in 0..depth {
-            let mut next = BTreeSet::new();
-            let gpu_mask = self.graph_frontier_mask(edge_rel, reverse, &frontier)?;
-            if let Some(mask) = &gpu_mask {
-                for (edge_index, e) in self.store.edges.iter().enumerate() {
-                    if e.rel != edge_rel || !mask[edge_index] {
-                        continue;
-                    }
-                    let dst = if reverse {
-                        e.from.as_str()
-                    } else {
-                        e.to.as_str()
-                    };
-                    let key = (e.rel.clone(), e.from.clone(), e.to.clone());
-                    if seen_edges.insert(key) {
-                        out.push(edge_row(&e.rel, &e.from, &e.to));
-                        if out.len() >= 300 {
-                            return Ok(out);
+            let mut next: Vec<Arc<str>> = Vec::new();
+            let mut hit_cap = false;
+            for src in &frontier {
+                self.store
+                    .for_each_neighbor_arc(&rel_arc, src, reverse, |dst| {
+                        if hit_cap {
+                            return;
                         }
-                    }
-                    if seen_nodes.insert(dst.to_string()) {
-                        next.insert(dst.to_string());
-                    }
-                }
-            } else {
-                for (edge_index, e) in self.store.edges.iter().enumerate() {
-                    if e.rel != edge_rel {
-                        continue;
-                    }
-                    let (src, dst) = if reverse {
-                        (e.to.as_str(), e.from.as_str())
-                    } else {
-                        (e.from.as_str(), e.to.as_str())
-                    };
-                    if !frontier.contains(src) {
-                        continue;
-                    }
-                    let _ = edge_index;
-                    let key = (e.rel.clone(), e.from.clone(), e.to.clone());
-                    if seen_edges.insert(key) {
-                        out.push(edge_row(&e.rel, &e.from, &e.to));
-                        if out.len() >= 300 {
-                            return Ok(out);
+                        let (from_arc, to_arc) = if reverse {
+                            (Arc::clone(dst), Arc::clone(src))
+                        } else {
+                            (Arc::clone(src), Arc::clone(dst))
+                        };
+                        if seen_edges.insert((Arc::clone(&from_arc), Arc::clone(&to_arc))) {
+                            out.push(edge_row_arc(&rel_arc, &from_arc, &to_arc));
+                            if out.len() >= 300 {
+                                hit_cap = true;
+                                return;
+                            }
                         }
-                    }
-                    if seen_nodes.insert(dst.to_string()) {
-                        next.insert(dst.to_string());
-                    }
+                        if seen_nodes.insert(Arc::clone(dst)) {
+                            next.push(Arc::clone(dst));
+                        }
+                    });
+                if hit_cap {
+                    return Ok(out);
                 }
             }
             if seen_nodes.len() > self.quotas.max_graph_expansion {
@@ -7029,6 +7124,18 @@ fn stmt_schema(s: &Stmt) -> bool {
     matches!(s, Stmt::Decl(_))
 }
 
+fn pack_has_schema(pack: &Pack) -> bool {
+    match pack {
+        Pack::SchemaCol { .. }
+        | Pack::SchemaRel { .. }
+        | Pack::SchemaIndex { .. }
+        | Pack::SchemaFilter { .. }
+        | Pack::SchemaOwned { .. } => true,
+        Pack::Batch { packs } => packs.iter().any(pack_has_schema),
+        _ => false,
+    }
+}
+
 pub(crate) fn field_names(fields: &[Field]) -> Vec<String> {
     fields.iter().map(|f| f.as_str()).collect()
 }
@@ -7071,6 +7178,14 @@ fn edge_row(rel: &str, from: &str, to: &str) -> Row {
     r.insert("rel".into(), Cell::text_arc(rel));
     r.insert("from".into(), Cell::text_arc(from));
     r.insert("to".into(), Cell::text_arc(to));
+    r
+}
+
+fn edge_row_arc(rel: &Arc<str>, from: &Arc<str>, to: &Arc<str>) -> Row {
+    let mut r = BTreeMap::new();
+    r.insert("from".into(), Cell::Text(Arc::clone(from)));
+    r.insert("rel".into(), Cell::Text(Arc::clone(rel)));
+    r.insert("to".into(), Cell::Text(Arc::clone(to)));
     r
 }
 
