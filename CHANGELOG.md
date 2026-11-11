@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.5.0] — 2026-11-11
 
 ### Added
 
@@ -9,6 +9,17 @@
   missing or stale blobs still rebuild.
 - **Ship:** protocol `LIN\x06` + shared token; optional rustls (`--tls-cert` /
   `--tls-key` / `--tls-ca`); one live sink. Loopback plaintext remains the local recipe.
+- **Distributed cache & Raft cluster (`lin::cache`):** binary protocol (`LINC`),
+  in-memory sharded cache store, Raft consensus node, cluster client/server, and
+  consistent hashing ring.
+- **Hardware GPU compute (`feature = "gpu"`):** `wgpu` compute kernels for vector
+  cosine scoring, aggregate scans, and regex DFA matching (`src/gpu.rs`, `src/gpu_regex.rs`).
+- **Storage & WAL compression:** opt-in `compress-zstd`, `compress-lz4`, `compress-flate`,
+  `compress-wal`, chunked parallel snapshot codec (`LIN\x07`), and in-memory dictionary
+  columns + bitmap indexes for low-cardinality fields.
+- **Vector indexing:** HNSW with SQ8 scalar quantization (`VectorIndex`).
+- **Out-of-core execution:** spill-to-disk aggregation fallback under tight memory quotas
+  and cost-based adaptive hash join strategy.
 - `.filter(|u| u.coin.gt(300))` on `from_typed` (closure → `Pred`).
   `.filter("coin > 300")` / `p!(coin > 300)` on untyped `from`.
 - Dapper/ADO verbs: `Db::execute` (`n`+`gen`), `Db::scalar` / `Queryable::scalar`,
@@ -37,7 +48,9 @@
 
 ### Fixed
 
-- **Partial index persistence:** preserved `pred_src` in `Pack::SchemaIndex` and checkpoint `IndexSnap`.
+- **Writer lock inheritance:** release writer `flock` in the owning process before inherited descriptors close across forked children.
+- **Partial index membership & uniqueness:** release partial-index membership and unique keys when updated rows leave the predicate; preserve `pred_src` in `Pack::SchemaIndex` and checkpoint `IndexSnap`.
+- **Explicit unlimited `take`:** honor explicit unlimited `take` in source scan prefetch.
 - **Cold storage lookup:** point/index lookups now read through `store.collection()` supporting `ColdCol` mmap storage.
 - **Transaction rollback:** `facts` rollback restored for materialized rows and `facts_by_spo` index maps on batch abort.
 - **Collection counts:** fixed double-decrement of `col_counts` on delete.
@@ -46,14 +59,15 @@
 
 ### Performance
 
+- **Morsel-driven CPU parallelism:** parallelized columnar joins, scans, grouped aggregations, 100k bulk inserts, and vector cosine scoring.
+- **Point DML & interactive transactions:** fast-path point deletes/updates, zero-copy row deletion, and zero-alloc FTS pending edits.
 - **Graph adjacency index:** added `edges_out` and `edges_in` in `Store` for $O(1)$ neighbor lookup during `hop`, `graph`, and `match`.
 - **PK join cursor fast path:** joins on primary key (`to_field == "id"`) use $O(1)$ point lookup (`get_by_id`) instead of constructing a hash table across the entire right collection.
 - **Top-K partial sorting:** `sort | take K` uses `select_nth_unstable_by` instead of sorting all rows.
-
 - FTS lex `take` uses borrowed `(score, row_idx)` top-k instead of cloning and
   fully sorting all candidate rows.
-- Reopen no longer builds row maps and scalar indexes twice around WAL replay.
-- Profile-backed `#[inline]` and bounds-check removal in the aligned SoA cursor loop.
+- Reopen no longer builds row maps and scalar indexes twice around WAL replay; eliminated redundant reopen `fsync`s.
+- Profile-backed `#[inline]` and bounds-check removal in the aligned SoA cursor loop; thin LTO (`codegen-units = 1`) enabled for release and bench profiles.
 
 ## [0.4.0] — 2026-09-16
 

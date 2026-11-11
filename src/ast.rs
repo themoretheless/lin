@@ -566,6 +566,8 @@ pub enum Value {
     Now,
     Duration(Duration),
     Name(String),
+    /// Named query/DML parameter (`$name`), bound at execution time via `run_with`.
+    Param(std::sync::Arc<str>),
 }
 
 impl Eq for Value {}
@@ -574,7 +576,7 @@ impl std::hash::Hash for Value {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         std::mem::discriminant(self).hash(state);
         match self {
-            Value::String(s) => s.hash(state),
+            Value::String(s) | Value::Param(s) => s.hash(state),
             Value::Name(s) => s.hash(state),
             Value::Int(n) | Value::Timestamp(n) => n.hash(state),
             Value::Float(f) => f.to_bits().hash(state),
@@ -597,6 +599,7 @@ impl std::fmt::Display for Value {
             Value::NowMinus(d) => write!(f, "now - {d}"),
             Value::Duration(d) => write!(f, "{d}"),
             Value::Name(n) => f.write_str(n),
+            Value::Param(p) => write!(f, "${p}"),
         }
     }
 }
@@ -931,7 +934,7 @@ impl Value {
     pub fn estimate_bytes(&self) -> usize {
         let mut bytes = std::mem::size_of::<Self>();
         match self {
-            Value::String(s) => bytes += s.len(),
+            Value::String(s) | Value::Param(s) => bytes += s.len(),
             Value::Name(s) => bytes += s.len(),
             _ => {}
         }

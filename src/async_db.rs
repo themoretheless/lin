@@ -53,7 +53,14 @@ impl AsyncDb {
     }
 
     pub async fn execute(&self, src: impl Into<String>) -> Result<crate::exec::Done, Error> {
-        Ok(self.run(src).await?.done)
+        let src = src.into();
+        let db = Arc::clone(&self.inner);
+        spawn_blocking(move || {
+            let mut g = db.blocking_lock();
+            g.execute(&src)
+        })
+        .await
+        .map_err(|e| Error::runtime(format!("async join: {e}")))?
     }
 
     pub async fn scalar(&self, src: impl Into<String>) -> Result<crate::store::Cell, Error> {
@@ -81,18 +88,29 @@ impl AsyncDb {
     }
 
     pub async fn to_vec(&self, q: Queryable) -> Result<Vec<Row>, Error> {
-        Ok(self.run_stmt(q.stmt()).await?.into_rows())
+        q.ensure()?;
+        let query = q.into_query();
+        let db = Arc::clone(&self.inner);
+        spawn_blocking(move || {
+            let mut g = db.blocking_lock();
+            let prep = g.prepare_query(&query)?;
+            Ok(g.run_prepared(&prep)?.into_rows())
+        })
+        .await
+        .map_err(|e| Error::runtime(format!("async join: {e}")))?
     }
 
     pub async fn to_vec_typed<T: FromRow + Send + 'static>(
         &self,
         q: Queryable,
     ) -> Result<Vec<T>, Error> {
-        let stmt = q.stmt();
+        q.ensure()?;
+        let query = q.into_query();
         let db = Arc::clone(&self.inner);
         spawn_blocking(move || {
             let mut g = db.blocking_lock();
-            let rows = g.run_stmt(stmt)?.into_rows();
+            let prep = g.prepare_query(&query)?;
+            let rows = g.run_prepared(&prep)?.into_rows();
             row::map_rows(&rows)
         })
         .await
@@ -123,16 +141,18 @@ impl AsyncDb {
         &self,
         q: Queryable,
     ) -> impl Stream<Item = Result<Row, Error>> + Send {
+        let checked = q.ensure().map(|()| q.into_query());
         let read = self.snapshot().await;
-        spawn_cursor_or_run(read, CursorJob::Query(q.into_query()))
+        spawn_cursor_or_run(read, CursorJob::Query(checked))
     }
 
     pub async fn stream_typed<T: FromRow + Send + 'static>(
         &self,
         q: Queryable,
     ) -> impl Stream<Item = Result<T, Error>> + Send {
+        let checked = q.ensure().map(|()| q.into_query());
         let read = self.snapshot().await;
-        typed_map_stream(spawn_cursor_or_run(read, CursorJob::Query(q.into_query())))
+        typed_map_stream(spawn_cursor_or_run(read, CursorJob::Query(checked)))
     }
 
     pub async fn reader(&self) -> AsyncReadDb {
@@ -172,6 +192,7 @@ impl AsyncReadDb {
     }
 
     pub async fn to_vec(&self, q: Queryable) -> Result<Vec<Row>, Error> {
+        q.ensure()?;
         Ok(self.run_stmt(q.stmt()).await?.into_rows())
     }
 
@@ -179,6 +200,7 @@ impl AsyncReadDb {
         &self,
         q: Queryable,
     ) -> Result<Vec<T>, Error> {
+        q.ensure()?;
         let stmt = q.stmt();
         let db = self.inner.clone();
         spawn_blocking(move || {
@@ -204,16 +226,18 @@ impl AsyncReadDb {
         &self,
         q: Queryable,
     ) -> impl Stream<Item = Result<Row, Error>> + Send {
-        spawn_cursor_or_run(self.inner.clone(), CursorJob::Query(q.into_query()))
+        let checked = q.ensure().map(|()| q.into_query());
+        spawn_cursor_or_run(self.inner.clone(), CursorJob::Query(checked))
     }
 
     pub async fn stream_typed<T: FromRow + Send + 'static>(
         &self,
         q: Queryable,
     ) -> impl Stream<Item = Result<T, Error>> + Send {
+        let checked = q.ensure().map(|()| q.into_query());
         typed_map_stream(spawn_cursor_or_run(
             self.inner.clone(),
-            CursorJob::Query(q.into_query()),
+            CursorJob::Query(checked),
         ))
     }
 }
@@ -296,31 +320,42 @@ impl Queryable {
 enum CursorJob {
     Src(String),
     Stmt(Stmt),
-    Query(Query),
+    Query(Result<Query, Error>),
 }
+
+const STREAM_CHUNK_SIZE: usize = 64;
 
 fn spawn_cursor_or_run(
     read: ReadDb,
     job: CursorJob,
 ) -> impl Stream<Item = Result<Row, Error>> + Send {
-    let (tx, rx) = mpsc::channel::<Result<Row, Error>>(64);
+    use futures_util::StreamExt;
+
+    let (tx, rx) = mpsc::channel::<Vec<Result<Row, Error>>>(8);
     spawn_blocking(move || {
-        let send = |item: Result<Row, Error>| tx.blocking_send(item).is_ok();
+        let send_rows = |rows: Vec<Row>| {
+            for chunk in rows.chunks(STREAM_CHUNK_SIZE) {
+                let batch: Vec<Result<Row, Error>> = chunk.iter().cloned().map(Ok).collect();
+                if tx.blocking_send(batch).is_err() {
+                    return;
+                }
+            }
+        };
+        let send_err = |e: Error| {
+            let _ = tx.blocking_send(vec![Err(e)]);
+        };
+
         let q = match job {
-            CursorJob::Query(q) => q,
+            CursorJob::Query(Ok(q)) => q,
+            CursorJob::Query(Err(e)) => {
+                send_err(e);
+                return;
+            }
             CursorJob::Stmt(Stmt::Query(q)) => q,
             CursorJob::Stmt(other) => {
                 match read.run_stmt(other) {
-                    Ok(h) => {
-                        for row in h.into_rows() {
-                            if !send(Ok(row)) {
-                                return;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        let _ = send(Err(e));
-                    }
+                    Ok(h) => send_rows(h.into_rows()),
+                    Err(e) => send_err(e),
                 }
                 return;
             }
@@ -329,37 +364,21 @@ fn spawn_cursor_or_run(
                     Stmt::Query(q) => q,
                     other => {
                         match read.run_stmt(other) {
-                            Ok(h) => {
-                                for row in h.into_rows() {
-                                    if !send(Ok(row)) {
-                                        return;
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                let _ = send(Err(e));
-                            }
+                            Ok(h) => send_rows(h.into_rows()),
+                            Err(e) => send_err(e),
                         }
                         return;
                     }
                 },
                 Ok(_) => {
                     match read.run(&src) {
-                        Ok(h) => {
-                            for row in h.into_rows() {
-                                if !send(Ok(row)) {
-                                    return;
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            let _ = send(Err(e));
-                        }
+                        Ok(h) => send_rows(h.into_rows()),
+                        Err(e) => send_err(e),
                     }
                     return;
                 }
                 Err(e) => {
-                    let _ = send(Err(e));
+                    send_err(e);
                     return;
                 }
             },
@@ -368,18 +387,27 @@ fn spawn_cursor_or_run(
         let mut cur = match read.cursor(&q) {
             Ok(c) => c,
             Err(e) => {
-                let _ = send(Err(e));
+                send_err(e);
                 return;
             }
         };
+        let mut chunk = Vec::with_capacity(STREAM_CHUNK_SIZE);
         for item in cur.by_ref() {
-            if !send(item) {
-                break;
+            let is_err = item.is_err();
+            chunk.push(item);
+            if chunk.len() >= STREAM_CHUNK_SIZE || is_err {
+                let batch = std::mem::replace(&mut chunk, Vec::with_capacity(STREAM_CHUNK_SIZE));
+                if tx.blocking_send(batch).is_err() || is_err {
+                    return;
+                }
             }
+        }
+        if !chunk.is_empty() {
+            let _ = tx.blocking_send(chunk);
         }
     });
 
-    ReceiverStream::new(rx)
+    ReceiverStream::new(rx).flat_map(futures_util::stream::iter)
 }
 
 fn typed_map_stream<S, T>(rows: S) -> impl Stream<Item = Result<T, Error>> + Send

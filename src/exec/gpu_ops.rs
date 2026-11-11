@@ -1,6 +1,5 @@
 #[cfg(feature = "gpu")]
-use std::collections::BTreeMap;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 #[cfg(feature = "gpu")]
@@ -21,8 +20,11 @@ use super::agg::{cell_key, hits_row};
 use super::eval::{cmp_sort, eval_pred, field_cell, value_cell};
 use super::eval::LexQuery;
 #[cfg(feature = "gpu")]
-use super::{edge_row, merge_join_row};
-use super::{Db, field_names, push_project_batch_row, rows_to_rough_batch};
+use super::graph_ops::edge_row;
+#[cfg(feature = "gpu")]
+use super::join::merge_join_row;
+use super::join::{push_project_batch_row, rows_to_rough_batch};
+use super::{Db, field_names};
 #[cfg(feature = "gpu")]
 use crate::store::row_text;
 
@@ -431,61 +433,6 @@ impl Db {
             false
         }
     }
-    pub(crate) fn graph_frontier_mask(
-        &self,
-        relation: &str,
-        reverse: bool,
-        frontier: &BTreeSet<String>,
-    ) -> Result<Option<Vec<bool>>, Error> {
-        #[cfg(feature = "gpu")]
-        {
-            let Some(gpu) = &self.gpu else {
-                return Ok(None);
-            };
-            let mut dictionary: FxHashMap<&str, u32> = FxHashMap::default();
-            let mut keys: BTreeSet<&str> = frontier.iter().map(String::as_str).collect();
-            for edge in &self.store.edges {
-                if edge.rel == relation {
-                    keys.insert(if reverse {
-                        edge.to.as_str()
-                    } else {
-                        edge.from.as_str()
-                    });
-                }
-            }
-            for key in keys {
-                let id = u32::try_from(dictionary.len() + 1)
-                    .map_err(|_| Error::runtime("GPU graph has too many keys"))?;
-                dictionary.insert(key, id);
-            }
-            let ids: Vec<u32> = frontier
-                .iter()
-                .map(|key| dictionary[key.as_str()])
-                .collect();
-            let sources: Vec<u32> = self
-                .store
-                .edges
-                .iter()
-                .map(|edge| {
-                    if edge.rel != relation {
-                        return 0;
-                    }
-                    let key = if reverse {
-                        edge.to.as_str()
-                    } else {
-                        edge.from.as_str()
-                    };
-                    dictionary.get(key).copied().unwrap_or(0)
-                })
-                .collect();
-            Ok(Some(gpu.graph_edge_mask(&sources, &ids)?))
-        }
-        #[cfg(not(feature = "gpu"))]
-        {
-            let _ = (relation, reverse, frontier);
-            Ok(None)
-        }
-    }
 }
 
 impl Db {
@@ -611,7 +558,7 @@ impl Db {
         }
         Ok(reached
             .into_iter()
-            .filter_map(|i| self.resolve_node(primary, &keys[i]))
+            .filter_map(|i| self.resolve_node_ref(primary, &keys[i]).cloned())
             .take(300)
             .collect())
     }

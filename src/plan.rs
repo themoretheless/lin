@@ -968,7 +968,7 @@ fn extract_point(
                     .collection(collection)
                     .and_then(|c| c.field(&field.parts[0]))
                     .is_some_and(|f| f.unique))
-            && matches!(value, Value::String(_)) =>
+            && matches!(value, Value::String(_) | Value::Param(_)) =>
         {
             Some(((field.parts[0].clone(), value.clone()), None))
         }

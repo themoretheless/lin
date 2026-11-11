@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::io::{Read, Write};
+use std::io::{IoSlice, Read, Write};
 
 use serde::{Deserialize, Serialize};
 
@@ -337,8 +337,30 @@ pub fn write_frame<W: Write, T: Serialize>(w: &mut W, msg: &T) -> Result<(), Err
     header[0..4].copy_from_slice(&CACHE_MAGIC);
     header[4] = CACHE_VERSION;
     header[5..9].copy_from_slice(&len.to_le_bytes());
-    w.write_all(&header).map_err(cache_err)?;
-    w.write_all(&payload).map_err(cache_err)?;
+
+    let mut head_done = 0usize;
+    let mut body_done = 0usize;
+    while head_done < 9 || body_done < payload.len() {
+        let n = if head_done < 9 {
+            let slices = [
+                IoSlice::new(&header[head_done..]),
+                IoSlice::new(&payload[body_done..]),
+            ];
+            w.write_vectored(&slices).map_err(cache_err)?
+        } else {
+            w.write(&payload[body_done..]).map_err(cache_err)?
+        };
+        if n == 0 {
+            return Err(cache_err("write zero bytes"));
+        }
+        let head_rem = 9 - head_done;
+        if n <= head_rem {
+            head_done += n;
+        } else {
+            head_done = 9;
+            body_done += n - head_rem;
+        }
+    }
     w.flush().map_err(cache_err)?;
     Ok(())
 }

@@ -1,6 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
 
 use super::protocol::CacheValue;
 use super::{DEFAULT_VNODES, unix_ms};
@@ -49,9 +50,18 @@ impl ConsistentHashRing {
     pub fn add_node(&mut self, node_id: impl Into<String>, addr: impl Into<String>) {
         let node_id = node_id.into();
         let addr = addr.into();
+        if let Some(existing) = self.nodes.get_mut(&node_id) {
+            if *existing != addr {
+                *existing = addr;
+            }
+            return;
+        }
         self.nodes.insert(node_id.clone(), addr);
+        let mut vkey = String::with_capacity(node_id.len() + 8);
         for v in 0..self.vnodes {
-            let vkey = format!("{node_id}#vn{v}");
+            vkey.clear();
+            use std::fmt::Write;
+            let _ = write!(&mut vkey, "{node_id}#vn{v}");
             let h = crc32fast::hash(vkey.as_bytes());
             self.ring.insert(h, node_id.clone());
         }
@@ -73,8 +83,13 @@ impl ConsistentHashRing {
 
     /// Return the primary owner `(node_id, addr)` for `key`.
     pub fn primary_for_key(&self, key: &str) -> Option<(String, String)> {
-        let replicas = self.replicas_for_key(key);
-        replicas.into_iter().next()
+        if self.ring.is_empty() {
+            return None;
+        }
+        let h = Self::hash_key(key);
+        let (_, nid) = self.ring.range(h..).next().or_else(|| self.ring.first_key_value())?;
+        let addr = self.nodes.get(nid)?;
+        Some((nid.clone(), addr.clone()))
     }
 
     /// Return up to `replication_factor` distinct physical nodes `(node_id, addr)` clockwise on the ring.
@@ -85,11 +100,13 @@ impl ConsistentHashRing {
         let h = Self::hash_key(key);
         let target = self.replication_factor.min(self.nodes.len());
         let mut out = Vec::with_capacity(target);
-        let mut seen = BTreeSet::new();
+        let mut seen: SmallVec<[&str; 4]> = SmallVec::new();
 
         for (_, nid) in self.ring.range(h..).chain(self.ring.iter()) {
-            if seen.insert(nid.clone()) {
-                if let Some(addr) = self.nodes.get(nid) {
+            let s = nid.as_str();
+            if !seen.contains(&s) {
+                seen.push(s);
+                if let Some(addr) = self.nodes.get(s) {
                     out.push((nid.clone(), addr.clone()));
                 }
                 if out.len() >= target {
@@ -160,6 +177,8 @@ pub struct RaftLogEntry {
     pub command: RaftCommand,
 }
 
+pub(crate) const RAFT_LOG_MAX_RETAINED: usize = 4096;
+
 #[derive(Debug, Clone)]
 pub struct RaftState {
     pub current_term: u64,
@@ -171,6 +190,8 @@ pub struct RaftState {
     pub commit_index: u64,
     pub last_applied: u64,
     pub last_leader_contact_ms: u64,
+    pub(crate) base_index: u64,
+    pub(crate) base_term: u64,
 }
 
 impl Default for RaftState {
@@ -185,27 +206,58 @@ impl Default for RaftState {
             commit_index: 0,
             last_applied: 0,
             last_leader_contact_ms: unix_ms(),
+            base_index: 0,
+            base_term: 0,
         }
     }
 }
 
 impl RaftState {
     pub fn last_log_index(&self) -> u64 {
-        self.log.last().map(|e| e.index).unwrap_or(0)
+        self.log.last().map(|e| e.index).unwrap_or(self.base_index)
     }
 
     pub fn last_log_term(&self) -> u64 {
-        self.log.last().map(|e| e.term).unwrap_or(0)
+        self.log.last().map(|e| e.term).unwrap_or(self.base_term)
     }
 
     pub fn term_at(&self, index: u64) -> u64 {
         if index == 0 {
             return 0;
         }
+        if index == self.base_index {
+            return self.base_term;
+        }
+        if let Ok(pos) = self.log.binary_search_by_key(&index, |e| e.index) {
+            return self.log[pos].term;
+        }
         self.log
             .iter()
             .find(|e| e.index == index)
             .map(|e| e.term)
             .unwrap_or(0)
+    }
+
+    pub(crate) fn maybe_compact(&mut self) {
+        if self.log.len() <= RAFT_LOG_MAX_RETAINED * 2 {
+            return;
+        }
+        let target_drop = self.log.len() - RAFT_LOG_MAX_RETAINED;
+        // Only compact entries that have already been committed and applied.
+        let safe_idx = self.commit_index.min(self.last_applied);
+        let mut drop_count = 0usize;
+        for entry in self.log.iter().take(target_drop) {
+            if entry.index <= safe_idx {
+                drop_count += 1;
+            } else {
+                break;
+            }
+        }
+        if drop_count > 0 {
+            let last_dropped = &self.log[drop_count - 1];
+            self.base_index = last_dropped.index;
+            self.base_term = last_dropped.term;
+            self.log.drain(0..drop_count);
+        }
     }
 }

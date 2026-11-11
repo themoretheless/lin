@@ -2163,7 +2163,7 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 
 ### D02. Формат WAL и checksum
 
-Модули: [src/persist.rs](../src/persist.rs), [src/crc.rs](../src/crc.rs), [tests/persist.rs](../tests/persist.rs). 40 пунктов: `LIN-0041`–`LIN-0080`.
+Модули: [src/persist/mod.rs](../src/persist/mod.rs), [src/crc.rs](../src/crc.rs), [tests/persist.rs](../tests/persist.rs). 40 пунктов: `LIN-0041`–`LIN-0080`.
 
 Контекст: [D01](#d01).
 
@@ -2171,7 +2171,7 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 
 ### D03. Durable I/O и sync
 
-Модули: [src/persist.rs](../src/persist.rs), [src/ship.rs](../src/ship.rs), [tests/persist.rs](../tests/persist.rs). 40 пунктов: `LIN-0081`–`LIN-0120`.
+Модули: [src/persist/mod.rs](../src/persist/mod.rs), [src/ship.rs](../src/ship.rs), [tests/persist.rs](../tests/persist.rs). 40 пунктов: `LIN-0081`–`LIN-0120`.
 
 Контекст: [D01](#d01), [D02](#d02).
 
@@ -2179,7 +2179,7 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 
 ### D04. Replay и восстановление
 
-Модули: [src/persist.rs](../src/persist.rs), [src/store.rs](../src/store.rs), [tests/persist.rs](../tests/persist.rs). 40 пунктов: `LIN-0121`–`LIN-0160`.
+Модули: [src/persist/mod.rs](../src/persist/mod.rs), [src/store/mod.rs](../src/store/mod.rs), [tests/persist.rs](../tests/persist.rs). 40 пунктов: `LIN-0121`–`LIN-0160`.
 
 Контекст: [D02](#d02), [D03](#d03).
 
@@ -2187,7 +2187,7 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 
 ### D05. Snapshot и checkpoint
 
-Модули: [src/persist.rs](../src/persist.rs), [src/store.rs](../src/store.rs), [src/cold.rs](../src/cold.rs). 40 пунктов: `LIN-0161`–`LIN-0200`.
+Модули: [src/persist/mod.rs](../src/persist/mod.rs), [src/store/mod.rs](../src/store/mod.rs), [src/cold.rs](../src/cold.rs). 40 пунктов: `LIN-0161`–`LIN-0200`.
 
 Контекст: [D02](#d02), [D03](#d03), [D04](#d04).
 
@@ -2195,7 +2195,7 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 
 ### D06. Транзакции и atomicity
 
-Модули: [src/exec.rs](../src/exec.rs), [src/store.rs](../src/store.rs), [tests/exec.rs](../tests/exec.rs). 40 пунктов: `LIN-0201`–`LIN-0240`.
+Модули: [src/exec/mod.rs](../src/exec/mod.rs), [src/store/mod.rs](../src/store/mod.rs), [tests/exec.rs](../tests/exec.rs). 40 пунктов: `LIN-0201`–`LIN-0240`.
 
 Контекст: [D02](#d02), [D04](#d04).
 
@@ -2203,7 +2203,7 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 
 ### D07. Mutations и bulk ingestion
 
-Модули: [src/exec.rs](../src/exec.rs), [src/store.rs](../src/store.rs), [tests/exec.rs](../tests/exec.rs). 40 пунктов: `LIN-0241`–`LIN-0280`.
+Модули: [src/exec/mod.rs](../src/exec/mod.rs), [src/store/mod.rs](../src/store/mod.rs), [tests/exec.rs](../tests/exec.rs). 40 пунктов: `LIN-0241`–`LIN-0280`.
 
 Контекст: [D06](#d06), [D08](#d08), [D10](#d10).
 
@@ -2211,7 +2211,7 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 
 ### D08. Cell и строковое представление
 
-Модули: [src/store.rs](../src/store.rs), [src/row.rs](../src/row.rs), [src/ast.rs](../src/ast.rs). 40 пунктов: `LIN-0281`–`LIN-0320`.
+Модули: [src/store/mod.rs](../src/store/mod.rs), [src/row.rs](../src/row.rs), [src/ast.rs](../src/ast.rs). 40 пунктов: `LIN-0281`–`LIN-0320`.
 
 Контекст: [D01](#d01).
 
@@ -2227,7 +2227,7 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 
 ### D10. Scalar indexes
 
-Модули: [src/index.rs](../src/index.rs), [src/store.rs](../src/store.rs), [tests/query.rs](../tests/query.rs). 40 пунктов: `LIN-0361`–`LIN-0400`.
+Модули: [src/index.rs](../src/index.rs), [src/store/mod.rs](../src/store/mod.rs), [tests/query.rs](../tests/query.rs). 40 пунктов: `LIN-0361`–`LIN-0400`.
 
 Контекст: [D08](#d08), [D11](#d11).
 
@@ -2275,7 +2275,7 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 
 ### D16. Execution pipeline
 
-Модули: [src/exec.rs](../src/exec.rs), [src/row.rs](../src/row.rs), [src/batch.rs](../src/batch.rs). 40 пунктов: `LIN-0601`–`LIN-0640`.
+Модули: [src/exec/mod.rs](../src/exec/mod.rs), [src/row.rs](../src/row.rs), [src/batch.rs](../src/batch.rs). 40 пунктов: `LIN-0601`–`LIN-0640`.
 
 Контекст: [D13](#d13), [D14](#d14).
 
@@ -2299,7 +2299,7 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 
 ### D19. Aggregations и GROUP BY
 
-Модули: [src/exec.rs](../src/exec.rs), [src/store.rs](../src/store.rs), [tests/query.rs](../tests/query.rs). 40 пунктов: `LIN-0721`–`LIN-0760`.
+Модули: [src/exec/mod.rs](../src/exec/mod.rs), [src/store/mod.rs](../src/store/mod.rs), [tests/query.rs](../tests/query.rs). 40 пунктов: `LIN-0721`–`LIN-0760`.
 
 Контекст: [D08](#d08), [D13](#d13).
 
@@ -2307,7 +2307,7 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 
 ### D20. Sorting и Top-K
 
-Модули: [src/exec.rs](../src/exec.rs), [src/cursor.rs](../src/cursor.rs), [src/store.rs](../src/store.rs). 40 пунктов: `LIN-0761`–`LIN-0800`.
+Модули: [src/exec/mod.rs](../src/exec/mod.rs), [src/cursor.rs](../src/cursor.rs), [src/store/mod.rs](../src/store/mod.rs). 40 пунктов: `LIN-0761`–`LIN-0800`.
 
 Контекст: [D08](#d08), [D13](#d13).
 
@@ -2315,7 +2315,7 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 
 ### D21. Joins и relational composition
 
-Модули: [src/exec.rs](../src/exec.rs), [src/cursor.rs](../src/cursor.rs), [src/batch.rs](../src/batch.rs). 40 пунктов: `LIN-0801`–`LIN-0840`.
+Модули: [src/exec/mod.rs](../src/exec/mod.rs), [src/cursor.rs](../src/cursor.rs), [src/batch.rs](../src/batch.rs). 40 пунктов: `LIN-0801`–`LIN-0840`.
 
 Контекст: [D08](#d08), [D14](#d14).
 
@@ -2323,7 +2323,7 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 
 ### D22. Window functions
 
-Модули: [src/window.rs](../src/window.rs), [src/exec.rs](../src/exec.rs), [tests/query.rs](../tests/query.rs). 40 пунктов: `LIN-0841`–`LIN-0880`.
+Модули: [src/window.rs](../src/window.rs), [src/exec/mod.rs](../src/exec/mod.rs), [tests/query.rs](../tests/query.rs). 40 пунктов: `LIN-0841`–`LIN-0880`.
 
 Контекст: [D08](#d08), [D19](#d19), [D20](#d20).
 
@@ -2339,7 +2339,7 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 
 ### D24. FTS query и scoring
 
-Модули: [src/fts.rs](../src/fts.rs), [src/exec.rs](../src/exec.rs), [src/cursor.rs](../src/cursor.rs). 40 пунктов: `LIN-0921`–`LIN-0960`.
+Модули: [src/fts.rs](../src/fts.rs), [src/exec/mod.rs](../src/exec/mod.rs), [src/cursor.rs](../src/cursor.rs). 40 пунктов: `LIN-0921`–`LIN-0960`.
 
 Контекст: [D23](#d23).
 
@@ -2347,7 +2347,7 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 
 ### D25. FTS mutation и compaction
 
-Модули: [src/fts.rs](../src/fts.rs), [src/store.rs](../src/store.rs), [tests/delete_readback.rs](../tests/delete_readback.rs). 40 пунктов: `LIN-0961`–`LIN-1000`.
+Модули: [src/fts.rs](../src/fts.rs), [src/store/mod.rs](../src/store/mod.rs), [tests/delete_readback.rs](../tests/delete_readback.rs). 40 пунктов: `LIN-0961`–`LIN-1000`.
 
 Контекст: [D06](#d06), [D23](#d23).
 
@@ -2355,7 +2355,7 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 
 ### D26. Hashing embeddings
 
-Модули: [src/embed.rs](../src/embed.rs), [src/exec.rs](../src/exec.rs), [tests/embed.rs](../tests/embed.rs). 40 пунктов: `LIN-1001`–`LIN-1040`.
+Модули: [src/embed.rs](../src/embed.rs), [src/exec/mod.rs](../src/exec/mod.rs), [tests/embed.rs](../tests/embed.rs). 40 пунктов: `LIN-1001`–`LIN-1040`.
 
 Контекст: [D08](#d08), [D13](#d13).
 
@@ -2363,7 +2363,7 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 
 ### D27. ANN и HNSW
 
-Модули: [src/embed.rs](../src/embed.rs), [src/store.rs](../src/store.rs), [src/exec.rs](../src/exec.rs). 40 пунктов: `LIN-1041`–`LIN-1080`.
+Модули: [src/embed.rs](../src/embed.rs), [src/store/mod.rs](../src/store/mod.rs), [src/exec/mod.rs](../src/exec/mod.rs). 40 пунктов: `LIN-1041`–`LIN-1080`.
 
 Контекст: [D26](#d26), [D28](#d28).
 
@@ -2371,7 +2371,7 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 
 ### D28. Vector search semantics
 
-Модули: [src/embed.rs](../src/embed.rs), [src/exec.rs](../src/exec.rs), [src/cursor.rs](../src/cursor.rs). 40 пунктов: `LIN-1081`–`LIN-1120`.
+Модули: [src/embed.rs](../src/embed.rs), [src/exec/mod.rs](../src/exec/mod.rs), [src/cursor.rs](../src/cursor.rs). 40 пунктов: `LIN-1081`–`LIN-1120`.
 
 Контекст: [D26](#d26).
 
@@ -2395,7 +2395,7 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 
 ### D31. Graph queries
 
-Модули: [src/graph.rs](../src/graph.rs), [src/store.rs](../src/store.rs), [src/cursor.rs](../src/cursor.rs). 40 пунктов: `LIN-1201`–`LIN-1240`.
+Модули: [src/graph.rs](../src/graph.rs), [src/store/mod.rs](../src/store/mod.rs), [src/cursor.rs](../src/cursor.rs). 40 пунктов: `LIN-1201`–`LIN-1240`.
 
 Контекст: [D08](#d08), [D06](#d06).
 
@@ -2403,7 +2403,7 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 
 ### D32. Cold storage и mmap
 
-Модули: [src/cold.rs](../src/cold.rs), [src/store.rs](../src/store.rs), [src/persist.rs](../src/persist.rs). 40 пунктов: `LIN-1241`–`LIN-1280`.
+Модули: [src/cold.rs](../src/cold.rs), [src/store/mod.rs](../src/store/mod.rs), [src/persist/mod.rs](../src/persist/mod.rs). 40 пунктов: `LIN-1241`–`LIN-1280`.
 
 Контекст: [D04](#d04), [D05](#d05).
 
@@ -2419,7 +2419,7 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 
 ### D34. Concurrency и read snapshots
 
-Модули: [src/exec.rs](../src/exec.rs), [src/store.rs](../src/store.rs), [src/async_db.rs](../src/async_db.rs). 40 пунктов: `LIN-1321`–`LIN-1360`.
+Модули: [src/exec/mod.rs](../src/exec/mod.rs), [src/store/mod.rs](../src/store/mod.rs), [src/async_db.rs](../src/async_db.rs). 40 пунктов: `LIN-1321`–`LIN-1360`.
 
 Контекст: [D06](#d06).
 
@@ -2435,7 +2435,7 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 
 ### D36. Followers и catch-up
 
-Модули: [src/ship.rs](../src/ship.rs), [src/persist.rs](../src/persist.rs), [src/main.rs](../src/main.rs). 40 пунктов: `LIN-1401`–`LIN-1440`.
+Модули: [src/ship.rs](../src/ship.rs), [src/persist/mod.rs](../src/persist/mod.rs), [src/main.rs](../src/main.rs). 40 пунктов: `LIN-1401`–`LIN-1440`.
 
 Контекст: [D35](#d35).
 
@@ -2443,7 +2443,7 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 
 ### D37. Public Rust API
 
-Модули: [src/lib.rs](../src/lib.rs), [src/query.rs](../src/query.rs), [src/exec.rs](../src/exec.rs). 40 пунктов: `LIN-1441`–`LIN-1480`.
+Модули: [src/lib.rs](../src/lib.rs), [src/query.rs](../src/query.rs), [src/exec/mod.rs](../src/exec/mod.rs). 40 пунктов: `LIN-1441`–`LIN-1480`.
 
 Контекст: [D13](#d13).
 
@@ -2475,7 +2475,7 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 
 ### D41. Observability
 
-Модули: [src/exec.rs](../src/exec.rs), [src/persist.rs](../src/persist.rs), [src/explain.rs](../src/explain.rs). 40 пунктов: `LIN-1601`–`LIN-1640`.
+Модули: [src/exec/mod.rs](../src/exec/mod.rs), [src/persist/mod.rs](../src/persist/mod.rs), [src/explain.rs](../src/explain.rs). 40 пунктов: `LIN-1601`–`LIN-1640`.
 
 Контекст: [D40](#d40).
 
@@ -2491,7 +2491,7 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 
 ### D43. Crash и fault injection
 
-Модули: [src/persist.rs](../src/persist.rs), [src/ship.rs](../src/ship.rs), [tests/persist.rs](../tests/persist.rs). 40 пунктов: `LIN-1681`–`LIN-1720`.
+Модули: [src/persist/mod.rs](../src/persist/mod.rs), [src/ship.rs](../src/ship.rs), [tests/persist.rs](../tests/persist.rs). 40 пунктов: `LIN-1681`–`LIN-1720`.
 
 Контекст: [D02](#d02), [D03](#d03), [D04](#d04).
 
@@ -2507,7 +2507,7 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 
 ### D45. Безопасность и resource limits
 
-Модули: [src/exec.rs](../src/exec.rs), [src/persist.rs](../src/persist.rs), [src/ship.rs](../src/ship.rs). 40 пунктов: `LIN-1761`–`LIN-1800`.
+Модули: [src/exec/mod.rs](../src/exec/mod.rs), [src/persist/mod.rs](../src/persist/mod.rs), [src/ship.rs](../src/ship.rs). 40 пунктов: `LIN-1761`–`LIN-1800`.
 
 Контекст: [D40](#d40).
 
@@ -2515,7 +2515,7 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 
 ### D46. Catalog и schema evolution
 
-Модули: [src/catalog.rs](../src/catalog.rs), [src/check.rs](../src/check.rs), [src/exec.rs](../src/exec.rs). 40 пунктов: `LIN-1801`–`LIN-1840`.
+Модули: [src/catalog.rs](../src/catalog.rs), [src/check.rs](../src/check.rs), [src/exec/mod.rs](../src/exec/mod.rs). 40 пунктов: `LIN-1801`–`LIN-1840`.
 
 Контекст: [D06](#d06).
 
@@ -2531,7 +2531,7 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 
 ### D48. Operations и lifecycle
 
-Модули: [src/main.rs](../src/main.rs), [src/persist.rs](../src/persist.rs), [src/ship.rs](../src/ship.rs). 40 пунктов: `LIN-1881`–`LIN-1920`.
+Модули: [src/main.rs](../src/main.rs), [src/persist/mod.rs](../src/persist/mod.rs), [src/ship.rs](../src/ship.rs). 40 пунктов: `LIN-1881`–`LIN-1920`.
 
 Контекст: [D03](#d03), [D04](#d04), [D05](#d05).
 

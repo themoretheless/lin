@@ -82,6 +82,7 @@ impl RecordBatch {
         }
         let end = end.min(self.n());
         let n = end - start;
+        let sorted_names = self.names.windows(2).all(|w| w[0] < w[1]);
 
         if n >= 65536 {
             let threads = std::thread::available_parallelism()
@@ -91,6 +92,13 @@ impl RecordBatch {
                 .min((n + 8191) / 8192);
             if threads > 1 {
                 let chunk_size = (n + threads - 1) / threads;
+                let template: Option<Row> = sorted_names.then(|| {
+                    self.names
+                        .iter()
+                        .map(|k| (k.clone(), Cell::Null))
+                        .collect()
+                });
+                let template_ref = template.as_ref();
                 let chunks: Vec<Vec<Row>> = std::thread::scope(|scope| {
                     let mut handles = Vec::with_capacity(threads);
                     for chunk_idx in 0..threads {
@@ -101,12 +109,22 @@ impl RecordBatch {
                         let c_end = (c_start + chunk_size).min(end);
                         handles.push(scope.spawn(move || {
                             let mut chunk_out = Vec::with_capacity(c_end - c_start);
-                            for i in c_start..c_end {
-                                let mut row = crate::store::acquire_row();
-                                for (name, col) in self.names.iter().zip(self.cols.iter()) {
-                                    row.insert(name.clone(), col[i].clone_for_borrow());
+                            if let Some(tpl) = template_ref {
+                                for i in c_start..c_end {
+                                    let mut row = tpl.clone();
+                                    for (slot, col) in row.values_mut().zip(self.cols.iter()) {
+                                        *slot = col[i].clone_for_borrow();
+                                    }
+                                    chunk_out.push(row);
                                 }
-                                chunk_out.push(row);
+                            } else {
+                                for i in c_start..c_end {
+                                    let mut row = crate::store::acquire_row();
+                                    for (name, col) in self.names.iter().zip(self.cols.iter()) {
+                                        row.insert(name.clone(), col[i].clone_for_borrow());
+                                    }
+                                    chunk_out.push(row);
+                                }
                             }
                             chunk_out
                         }));
@@ -121,12 +139,25 @@ impl RecordBatch {
             }
         }
 
-        // Pre-allocate based on expected size
         let mut out = Vec::with_capacity(n);
+        if n >= 2 && sorted_names {
+            let template: Row = self
+                .names
+                .iter()
+                .map(|k| (k.clone(), Cell::Null))
+                .collect();
+            for i in start..end {
+                let mut row = template.clone();
+                for (slot, col) in row.values_mut().zip(self.cols.iter()) {
+                    *slot = col[i].clone_for_borrow();
+                }
+                out.push(row);
+            }
+            return out;
+        }
 
         for i in start..end {
             let mut row = crate::store::acquire_row();
-            // Use clone_for_borrow() to preserve Arc references instead of full clone
             for (name, col) in self.names.iter().zip(self.cols.iter()) {
                 row.insert(name.clone(), col[i].clone_for_borrow());
             }
@@ -145,6 +176,23 @@ impl RecordBatch {
         self.cols = (0..self.names.len()).map(|_| Vec::new()).collect();
         let mut col_iters: Vec<_> = cols.into_iter().map(|col| col.into_iter()).collect();
         let mut out = Vec::with_capacity(n);
+        if n >= 2 && self.names.windows(2).all(|w| w[0] < w[1]) {
+            let template: Row = self
+                .names
+                .iter()
+                .map(|k| (k.clone(), Cell::Null))
+                .collect();
+            for _ in 0..n {
+                let mut row = template.clone();
+                for (slot, iter) in row.values_mut().zip(col_iters.iter_mut()) {
+                    if let Some(cell) = iter.next() {
+                        *slot = cell;
+                    }
+                }
+                out.push(row);
+            }
+            return out;
+        }
         for _ in 0..n {
             let mut row = crate::store::acquire_row();
             for (name, iter) in self.names.iter().zip(col_iters.iter_mut()) {

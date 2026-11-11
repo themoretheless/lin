@@ -87,9 +87,10 @@ pub enum IndexPart {
     Null,
     Bool(bool),
     Int(i64),
-    /// Ordered f64 bucket, with an exact integer tie-breaker. The tie-breaker
-    /// preserves distinct large integer keys for unique indexes.
-    Num(u64, i128),
+    /// Ordered f64 bucket, with a compact exact integer delta (`integer - (n as i128)`).
+    /// Keeps `size_of::<IndexPart>() == 24` (8-byte aligned) while preserving exact
+    /// distinctness and ordering across all 64-bit integers and floats.
+    Num(u64, i32),
     Time(i64),
     Text(Arc<str>),
     /// Small String Optimization: inline storage for strings <= 22 bytes.
@@ -186,7 +187,7 @@ pub struct LiveIndex {
     bloom_filter: Option<BloomFilter>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct IndexUse {
     pub def: IndexDef,
     pub eqs: Vec<(String, Value)>,
@@ -330,6 +331,29 @@ impl PostingList {
         match self {
             PostingList::Standard(vec) => out.extend_from_slice(vec),
             PostingList::Bitmap(set) => set.extend_into(out),
+        }
+    }
+
+    #[inline]
+    pub fn for_each_ordered(&self, desc: bool, mut f: impl FnMut(usize) -> bool) -> bool {
+        match self {
+            PostingList::Standard(vec) => {
+                if desc {
+                    for &pos in vec.iter().rev() {
+                        if !f(pos) {
+                            return false;
+                        }
+                    }
+                } else {
+                    for &pos in vec.iter() {
+                        if !f(pos) {
+                            return false;
+                        }
+                    }
+                }
+                true
+            }
+            PostingList::Bitmap(set) => set.for_each_ordered(desc, f),
         }
     }
 
@@ -739,12 +763,11 @@ impl LiveIndex {
 
         if self.use_reverse
             && let Some(old) = self.reverse.remove(&idx)
+            && let std::collections::btree_map::Entry::Occupied(mut entry) = self.forward.entry(old)
         {
-            if let Some(vec) = self.forward.get_mut(&old) {
-                vec.remove(idx);
-                if vec.count() == 0 {
-                    self.forward.remove(&old);
-                }
+            entry.get_mut().remove(idx);
+            if entry.get().is_empty() {
+                entry.remove_entry();
             }
         }
 
@@ -837,27 +860,25 @@ impl LiveIndex {
             return;
         }
         if kd == kt {
-            let should_remove = if let Some(list) = self.forward.get_mut(kt) {
-                list.remove(last);
-                list.is_empty()
-            } else {
-                false
-            };
-            if should_remove {
-                self.forward.remove(kt);
+            if let std::collections::btree_map::Entry::Occupied(mut entry) =
+                self.forward.entry(kt.clone())
+            {
+                entry.get_mut().remove(last);
+                if entry.get().is_empty() {
+                    entry.remove_entry();
+                }
             }
         } else {
             if let Some(list) = self.forward.get_mut(kt) {
                 list.replace(last, p);
             }
-            let should_remove = if let Some(list) = self.forward.get_mut(kd) {
-                list.remove(p);
-                list.is_empty()
-            } else {
-                false
-            };
-            if should_remove {
-                self.forward.remove(kd);
+            if let std::collections::btree_map::Entry::Occupied(mut entry) =
+                self.forward.entry(kd.clone())
+            {
+                entry.get_mut().remove(p);
+                if entry.get().is_empty() {
+                    entry.remove_entry();
+                }
             }
         }
     }
@@ -890,14 +911,13 @@ impl LiveIndex {
             }
             (true, false) => {
                 let kd = self.key_of(doomed);
-                let should_remove = if let Some(list) = self.forward.get_mut(&kd) {
-                    list.remove(p);
-                    list.is_empty()
-                } else {
-                    false
-                };
-                if should_remove {
-                    self.forward.remove(&kd);
+                if let std::collections::btree_map::Entry::Occupied(mut entry) =
+                    self.forward.entry(kd)
+                {
+                    entry.get_mut().remove(p);
+                    if entry.get().is_empty() {
+                        entry.remove_entry();
+                    }
                 }
             }
             (false, false) => {}
@@ -929,28 +949,26 @@ impl LiveIndex {
         if let Some(kt) = key_tail {
             if let Some(kd_slot) = self.reverse.get_mut(&p) {
                 if *kd_slot == kt {
-                    let should_remove = if let Some(list) = self.forward.get_mut(&kt) {
-                        list.remove(last);
-                        list.is_empty()
-                    } else {
-                        false
-                    };
-                    if should_remove {
-                        self.forward.remove(&kt);
+                    if let std::collections::btree_map::Entry::Occupied(mut entry) =
+                        self.forward.entry(kt)
+                    {
+                        entry.get_mut().remove(last);
+                        if entry.get().is_empty() {
+                            entry.remove_entry();
+                        }
                     }
                 } else {
                     if let Some(list) = self.forward.get_mut(&kt) {
                         list.replace(last, p);
                     }
                     let kd = std::mem::replace(kd_slot, kt);
-                    let should_remove = if let Some(list) = self.forward.get_mut(&kd) {
-                        list.remove(p);
-                        list.is_empty()
-                    } else {
-                        false
-                    };
-                    if should_remove {
-                        self.forward.remove(&kd);
+                    if let std::collections::btree_map::Entry::Occupied(mut entry) =
+                        self.forward.entry(kd)
+                    {
+                        entry.get_mut().remove(p);
+                        if entry.get().is_empty() {
+                            entry.remove_entry();
+                        }
                     }
                 }
             } else {
@@ -959,15 +977,12 @@ impl LiveIndex {
                 }
                 self.reverse.insert(p, kt);
             }
-        } else if let Some(kd) = self.reverse.remove(&p) {
-            let should_remove = if let Some(list) = self.forward.get_mut(&kd) {
-                list.remove(p);
-                list.is_empty()
-            } else {
-                false
-            };
-            if should_remove {
-                self.forward.remove(&kd);
+        } else if let Some(kd) = self.reverse.remove(&p)
+            && let std::collections::btree_map::Entry::Occupied(mut entry) = self.forward.entry(kd)
+        {
+            entry.get_mut().remove(p);
+            if entry.get().is_empty() {
+                entry.remove_entry();
             }
         }
     }
@@ -1002,7 +1017,7 @@ impl LiveIndex {
                     hi[pos + 1..].fill(IndexPart::Min);
                     // Null has no numeric value and must not enter a covered range.
                     lo[pos] = match p {
-                        IndexPart::Num(_, _) => IndexPart::Num(0, i128::MIN),
+                        IndexPart::Num(_, _) => IndexPart::Num(0, i32::MIN),
                         IndexPart::Time(_) => IndexPart::Time(i64::MIN),
                         _ => lo[pos].clone(),
                     };
@@ -1010,7 +1025,7 @@ impl LiveIndex {
                 CmpOp::Le => {
                     hi[pos] = numeric_high(&p);
                     lo[pos] = match p {
-                        IndexPart::Num(_, _) => IndexPart::Num(0, i128::MIN),
+                        IndexPart::Num(_, _) => IndexPart::Num(0, i32::MIN),
                         IndexPart::Time(_) => IndexPart::Time(i64::MIN),
                         _ => lo[pos].clone(),
                     };
@@ -1110,6 +1125,33 @@ impl LiveIndex {
         out
     }
 
+    /// Iterate matching row indices in index key order (`desc = false` ascending, `desc = true` descending),
+    /// stopping early as soon as `f(row_idx)` returns `false`.
+    pub fn seek_ordered_limit(&self, use_: &IndexUse, now: i64, desc: bool, mut f: impl FnMut(usize) -> bool) {
+        let (start, end) = self.bounds(use_, now);
+        #[cfg(feature = "parallel")]
+        if let (Bound::Included(lo), Bound::Included(hi)) = (&start, &end)
+            && lo == hi
+            && let Some(ref filter) = self.bloom_filter
+            && !filter.contains(lo)
+        {
+            return;
+        }
+        if desc {
+            for (_, list) in self.forward.range((start, end)).rev() {
+                if !list.for_each_ordered(true, &mut f) {
+                    break;
+                }
+            }
+        } else {
+            for (_, list) in self.forward.range((start, end)) {
+                if !list.for_each_ordered(false, &mut f) {
+                    break;
+                }
+            }
+        }
+    }
+
     /// Parallel bulk seek across multiple index uses - each use is independent
     #[cfg(feature = "parallel")]
     pub fn seek_idxs_parallel(&self, uses: &[crate::index::IndexUse], now: i64) -> Vec<Vec<usize>> {
@@ -1135,14 +1177,14 @@ impl LiveIndex {
 
 fn numeric_low(p: &IndexPart) -> IndexPart {
     match p {
-        IndexPart::Num(bits, _) => IndexPart::Num(*bits, i128::MIN),
+        IndexPart::Num(bits, _) => IndexPart::Num(*bits, i32::MIN),
         _ => p.clone(),
     }
 }
 
 fn numeric_high(p: &IndexPart) -> IndexPart {
     match p {
-        IndexPart::Num(bits, _) => IndexPart::Num(*bits, i128::MAX),
+        IndexPart::Num(bits, _) => IndexPart::Num(*bits, i32::MAX),
         _ => p.clone(),
     }
 }
@@ -1158,10 +1200,13 @@ fn numeric_part(n: f64, integer: Option<i64>) -> IndexPart {
     } else {
         bits ^ (1 << 63)
     };
-    let integer = integer.or_else(|| {
-        (n.fract() == 0.0 && n >= i64::MIN as f64 && n < -(i64::MIN as f64)).then_some(n as i64)
-    });
-    IndexPart::Num(ordered, integer.map(i128::from).unwrap_or(i128::MIN + 1))
+    let tie = if let Some(orig) = integer {
+        let approx = n as i128;
+        (i128::from(orig) - approx).clamp(i128::from(i32::MIN) + 2, i128::from(i32::MAX) - 1) as i32
+    } else {
+        0
+    };
+    IndexPart::Num(ordered, tie)
 }
 
 #[inline(always)]
@@ -1207,6 +1252,7 @@ fn value_part(v: &Value, now: i64) -> IndexPart {
         Value::Now => IndexPart::Time(now),
         Value::NowMinus(d) => IndexPart::Time(now - d.as_millis()),
         Value::Duration(d) => numeric_part(d.as_millis() as f64, Some(d.as_millis())),
+        Value::Param(_) => IndexPart::Null,
     }
 }
 
@@ -1326,6 +1372,47 @@ impl BitSet {
         }
     }
 
+    /// Invoke closure in ascending or descending position order, stopping early when `f` returns `false`.
+    pub fn for_each_ordered(&self, desc: bool, mut f: impl FnMut(usize) -> bool) -> bool {
+        if self.count == 0 {
+            return true;
+        }
+        if desc {
+            for (word_idx, &word) in self.bits.iter().enumerate().rev() {
+                if word == 0 {
+                    continue;
+                }
+                let base_pos = word_idx << 6;
+                let mut w = word;
+                while w != 0 {
+                    let bit_idx = 63 - (w.leading_zeros() as usize);
+                    let pos = base_pos + bit_idx;
+                    if pos < self.capacity && !f(pos) {
+                        return false;
+                    }
+                    w &= !(1u64 << bit_idx);
+                }
+            }
+        } else {
+            for (word_idx, &word) in self.bits.iter().enumerate() {
+                if word == 0 {
+                    continue;
+                }
+                let base_pos = word_idx << 6;
+                let mut w = word;
+                while w != 0 {
+                    let bit_idx = w.trailing_zeros() as usize;
+                    let pos = base_pos + bit_idx;
+                    if pos < self.capacity && !f(pos) {
+                        return false;
+                    }
+                    w &= w - 1;
+                }
+            }
+        }
+        true
+    }
+
     /// Convert to Vec<usize> of set positions
     pub fn to_indices(&self) -> Vec<usize> {
         let mut out = Vec::with_capacity(self.count);
@@ -1388,17 +1475,134 @@ pub fn pick_index_with_coverage(
         return None;
     }
     let indexes = cat.indexes_on(collection);
-    let branches = dnf_atoms(pred)?;
-    let mut uses = Vec::with_capacity(branches.len());
-    let mut all_covered = true;
+    let top_conjuncts = flatten_and(pred);
+    let mut indexable = Vec::with_capacity(top_conjuncts.len());
+    let mut has_unindexed = false;
+    for c in top_conjuncts {
+        if pred_mentions_indexed_field(c, &indexes) {
+            indexable.push(c);
+        } else {
+            has_unindexed = true;
+        }
+    }
+    if indexable.is_empty() {
+        return None;
+    }
+
+    let branches = if indexable.len() == 1 {
+        dnf_atoms(indexable[0])?
+    } else {
+        dnf_atoms_conjuncts(&indexable)?
+    };
+
+    let mut uses: Vec<IndexUse> = Vec::with_capacity(branches.len());
+    let mut all_covered = !has_unindexed;
     for branch in &branches {
         let u = pick_conjunct_atoms(&indexes, branch)?;
         if all_covered && !index_covers_atoms(branch, &u) {
             all_covered = false;
         }
-        uses.push(u);
+        if !uses.contains(&u) {
+            uses.push(u);
+        }
     }
     Some((uses, all_covered))
+}
+
+fn pred_mentions_indexed_field(pred: &Pred, indexes: &[&IndexDef]) -> bool {
+    let field_indexed = |name: &str| {
+        indexes.iter().any(|def| {
+            def.fields.iter().any(|f| f == name)
+                || def
+                    .pred
+                    .as_ref()
+                    .is_some_and(|ip| pred_mentions_field_name(ip, name))
+        })
+    };
+    match pred {
+        Pred::Cmp {
+            field,
+            op: CmpOp::Eq | CmpOp::Gt | CmpOp::Lt | CmpOp::Ge | CmpOp::Le,
+            ..
+        } => field_indexed(field.as_cow_str().as_ref()),
+        Pred::In { field, .. } => field_indexed(field.as_cow_str().as_ref()),
+        Pred::Cmp { field, op: CmpOp::Ne, .. }
+        | Pred::IsNull { field, .. }
+        | Pred::Has { field, .. }
+        | Pred::Contains { field, .. }
+        | Pred::Regex { field, .. } => {
+            let name = field.as_cow_str();
+            indexes.iter().any(|def| {
+                def.pred
+                    .as_ref()
+                    .is_some_and(|ip| pred_mentions_field_name(ip, name.as_ref()))
+            })
+        }
+        Pred::Not(inner) => pred_mentions_indexed_field(inner, indexes),
+        Pred::And(a, b) | Pred::Or(a, b) => {
+            pred_mentions_indexed_field(a, indexes) || pred_mentions_indexed_field(b, indexes)
+        }
+    }
+}
+
+fn pred_mentions_field_name(pred: &Pred, target: &str) -> bool {
+    match pred {
+        Pred::Cmp { field, .. }
+        | Pred::IsNull { field, .. }
+        | Pred::In { field, .. }
+        | Pred::Has { field, .. }
+        | Pred::Contains { field, .. }
+        | Pred::Regex { field, .. } => field.as_cow_str().as_ref() == target,
+        Pred::And(a, b) | Pred::Or(a, b) => {
+            pred_mentions_field_name(a, target) || pred_mentions_field_name(b, target)
+        }
+        Pred::Not(inner) => pred_mentions_field_name(inner, target),
+    }
+}
+
+fn dnf_atoms_conjuncts<'a>(
+    conjuncts: &[&'a Pred],
+) -> Option<Vec<Vec<std::borrow::Cow<'a, Pred>>>> {
+    const MAX_BRANCHES: usize = 256;
+    let mut nodes = 0usize;
+    let mut pending: Vec<&Pred> = conjuncts.to_vec();
+    while let Some(p) = pending.pop() {
+        nodes += 1;
+        if nodes > 1024 {
+            return None;
+        }
+        match p {
+            Pred::And(a, b) | Pred::Or(a, b) => pending.extend([a.as_ref(), b.as_ref()]),
+            Pred::Not(inner) => pending.push(inner.as_ref()),
+            _ => {}
+        }
+    }
+    let mut est = 1usize;
+    for c in conjuncts {
+        est = est.saturating_mul(dnf_branch_count(c, MAX_BRANCHES));
+        if est > MAX_BRANCHES {
+            return None;
+        }
+    }
+    let mut acc = dnf_atoms_bounded(conjuncts[0])?;
+    for &c in &conjuncts[1..] {
+        let right = dnf_atoms_bounded(c)?;
+        let len = acc.len().checked_mul(right.len())?;
+        if len > MAX_BRANCHES {
+            return None;
+        }
+        let mut next = Vec::with_capacity(len);
+        for l in &acc {
+            for r in &right {
+                let mut b = Vec::with_capacity(l.len() + r.len());
+                b.extend_from_slice(l);
+                b.extend_from_slice(r);
+                next.push(b);
+            }
+        }
+        acc = next;
+    }
+    Some(acc)
 }
 
 fn pick_conjunct_atoms(indexes: &[&IndexDef], atoms: &[std::borrow::Cow<'_, Pred>]) -> Option<IndexUse> {
@@ -1660,8 +1864,8 @@ mod storage_tests {
     fn index_part_small_text_semantics_and_zero_alloc() {
         use std::collections::hash_map::DefaultHasher;
 
-        // Size check: IndexPart doesn't blow up
-        assert_eq!(std::mem::size_of::<IndexPart>(), 32);
+        // Size check: IndexPart shrinks to 24 bytes (align 8)
+        assert_eq!(std::mem::size_of::<IndexPart>(), 24);
 
         let inline = crate::store::InlineStr::try_new("user_101").unwrap();
         let p_small = IndexPart::SmallText(inline);

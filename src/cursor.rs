@@ -10,7 +10,9 @@
 //!
 //! graph / match / sort / union / hop depth>1 / multi-join → **buffered**.
 
+use std::cell::RefCell;
 use std::collections::{BTreeSet, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use crate::ast::{Pred, Query, SearchMode, Source, Step, Stmt};
@@ -21,7 +23,12 @@ use crate::exec::{
 };
 use crate::query::Queryable;
 use crate::store::{Cell, Row, Store, now_ms, project_fields, row_text};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
+use smallvec::{SmallVec, smallvec};
+
+thread_local! {
+    static CURSOR_VALIDATED_QUERIES: RefCell<FxHashSet<u64>> = RefCell::new(FxHashSet::default());
+}
 
 /// Sync pull cursor over query results.
 pub struct QueryCursor<'a> {
@@ -36,7 +43,7 @@ pub struct QueryCursor<'a> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProjectedRow {
     fields: Arc<[String]>,
-    cells: Vec<Cell>,
+    cells: SmallVec<[Cell; 4]>,
 }
 
 impl ProjectedRow {
@@ -65,7 +72,12 @@ impl ProjectedRow {
     }
 
     fn from_row(row: Row) -> Self {
-        let (fields, cells): (Vec<_>, Vec<_>) = row.into_iter().unzip();
+        let mut fields = Vec::with_capacity(row.len());
+        let mut cells = SmallVec::with_capacity(row.len());
+        for (f, c) in row {
+            fields.push(f);
+            cells.push(c);
+        }
         Self {
             fields: fields.into(),
             cells,
@@ -79,21 +91,16 @@ enum CursorDb<'a> {
 }
 
 impl CursorDb<'_> {
-    #[cfg(feature = "gpu")]
     fn inner(&self) -> &Db {
         match self {
             Self::Writer(db) => db,
             Self::Reader(db) => db.as_db(),
         }
     }
+
     fn store_catalog(&self) -> (&Store, &crate::catalog::Catalog) {
-        match self {
-            CursorDb::Writer(db) => (&db.store, &db.catalog),
-            CursorDb::Reader(db) => {
-                let inner = db.as_db();
-                (&inner.store, &inner.catalog)
-            }
-        }
+        let inner = self.inner();
+        (&inner.store, &inner.catalog)
     }
 
     fn run_query(&self, q: &Query) -> Result<Vec<Row>, Error> {
@@ -103,17 +110,15 @@ impl CursorDb<'_> {
         }
     }
 
-    fn search_fts(
+    fn search_fts_indices(
         &self,
         collection: &str,
         mode: SearchMode,
         query: &str,
         rank_limit: Option<usize>,
-    ) -> Result<Vec<Row>, Error> {
-        match self {
-            CursorDb::Writer(db) => db.search_fts(collection, mode, query, rank_limit),
-            CursorDb::Reader(db) => db.as_db().search_fts(collection, mode, query, rank_limit),
-        }
+    ) -> Result<Vec<usize>, Error> {
+        self.inner()
+            .search_fts_indices_ranked(collection, mode, query, rank_limit)
     }
 
     fn vector_search_indices(
@@ -122,22 +127,39 @@ impl CursorDb<'_> {
         query: &str,
         rank_limit: Option<usize>,
     ) -> Result<Vec<(f64, usize)>, Error> {
-        match self {
-            CursorDb::Writer(db) => db.vector_search_indices(rows, query, rank_limit),
-            CursorDb::Reader(db) => db.as_db().vector_search_indices(rows, query, rank_limit),
-        }
+        self.inner().vector_search_indices(rows, query, rank_limit)
     }
 
     fn prepare_query(&self, q: &Query) -> Result<(), Error> {
-        let stmt = Stmt::Query(q.clone());
-        match self {
-            CursorDb::Writer(db) => {
-                db.prepare_stmt(stmt)?;
-            }
-            CursorDb::Reader(db) => {
-                db.prepare_stmt(stmt)?;
-            }
+        let inner = self.inner();
+        let max_ast_bytes = inner.quotas.max_ast_bytes;
+        let mut hasher = FxHasher::default();
+        inner.catalog.hash_u64().hash(&mut hasher);
+        max_ast_bytes.hash(&mut hasher);
+        q.hash(&mut hasher);
+        let key = hasher.finish();
+
+        let hit = CURSOR_VALIDATED_QUERIES.with(|cache| cache.borrow().contains(&key));
+        if hit {
+            return Ok(());
         }
+
+        let ast_bytes = q.estimate_bytes() + 2 * std::mem::size_of::<Stmt>();
+        if ast_bytes > max_ast_bytes {
+            return Err(Error::new(format!(
+                "prepared AST size {} exceeds max_ast_bytes quota {}",
+                ast_bytes, max_ast_bytes
+            )));
+        }
+        crate::check::check_query_only(q, &inner.catalog)?;
+
+        CURSOR_VALIDATED_QUERIES.with(|cache| {
+            let mut set = cache.borrow_mut();
+            if set.len() >= 2048 {
+                set.clear();
+            }
+            set.insert(key);
+        });
         Ok(())
     }
 }
@@ -365,7 +387,7 @@ fn next_lazy_projected(
     let idx = next_lazy_match_idx(store, lazy)?;
     let row = store.get_by_idx(&lazy.collection, idx)?;
     let fields = lazy.project.as_ref().expect("projected state checked");
-    let mut cells = Vec::with_capacity(fields.len());
+    let mut cells = SmallVec::with_capacity(fields.len());
     for field in fields.iter() {
         cells.push(
             row.get(field)
@@ -770,21 +792,8 @@ fn try_lazy_search(db: &CursorDb<'_>, q: &Query) -> Result<Option<LazyCursor>, E
         return Ok(None);
     }
 
-    let rank_limit = if mode == SearchMode::Lex {
-        take_left.map(|n| n.saturating_add(skip_n))
-    } else {
-        None
-    };
-    let ranked = db.search_fts(name, mode, query, rank_limit)?;
-    let mut idxs = Vec::with_capacity(ranked.len());
-    for r in &ranked {
-        let Some(id) = row_text(r, "id") else {
-            continue;
-        };
-        if let Some(i) = store.row_index(name, id) {
-            idxs.push(i);
-        }
-    }
+    let rank_limit = take_left.map(|n| n.saturating_add(skip_n));
+    let idxs = db.search_fts_indices(name, mode, query, rank_limit)?;
 
     Ok(Some(LazyCursor {
         collection: name.clone(),
@@ -866,9 +875,16 @@ fn try_lazy_hop(db: &CursorDb<'_>, q: &Query) -> Result<Option<LazyCursor>, Erro
         _ => (rel, false),
     };
 
-    let mut frontier: BTreeSet<String> = BTreeSet::new();
+    let out_collection = if name == "docs" || store.collections.contains_key("docs") {
+        // hop resolves via find_doc_key → docs first
+        "docs"
+    } else {
+        name.as_str()
+    };
+
     #[cfg(feature = "gpu")]
-    let gpu_seeded = if db.inner().gpu().is_some() {
+    if db.inner().gpu().is_some() {
+        let mut frontier: BTreeSet<String> = BTreeSet::new();
         collect_gpu_seed_keys(
             db.inner(),
             name,
@@ -878,53 +894,66 @@ fn try_lazy_hop(db: &CursorDb<'_>, q: &Query) -> Result<Option<LazyCursor>, Erro
             now,
             &mut frontier,
         )?;
-        true
-    } else {
-        false
-    };
-    #[cfg(not(feature = "gpu"))]
-    let gpu_seeded = false;
-    if !gpu_seeded {
-        collect_seed_keys(
-            store,
-            name,
-            &source,
-            filter,
-            need_filter,
+        let reached: BTreeSet<String> = db
+            .inner()
+            .gpu_hop_keys(&frontier, edge_rel, reverse)?
+            .into_iter()
+            .collect();
+        let mut idxs = Vec::new();
+        for key in reached {
+            if out_collection != name
+                && store.find_doc_key(&key).is_none()
+                && store.row_index(name, &key).is_some()
+            {
+                return Ok(None);
+            }
+            if let Some(i) = neighbor_idx(store, name, out_collection, &key) {
+                idxs.push(i);
+            }
+            if idxs.len() >= 300 {
+                break;
+            }
+        }
+        let take_left = match take_n {
+            Some(Some(n)) => Some(n.max(0) as usize),
+            Some(None) => None,
+            None => Some(50),
+        };
+        return Ok(Some(LazyCursor {
+            collection: out_collection.to_string(),
+            source: RowSource::Idxs(idxs),
+            pos: 0,
+            pred: None,
+            need_filter: false,
+            project: project.map(Into::into),
+            skip_left: skip_n,
+            take_left,
             now,
-            &mut frontier,
-        );
+        }));
     }
 
-    #[cfg(feature = "gpu")]
-    let gpu_reached = if db.inner().gpu().is_some() {
-        Some(db.inner().gpu_hop_keys(&frontier, edge_rel, reverse)?)
-    } else {
-        None
-    };
-    #[cfg(not(feature = "gpu"))]
-    let gpu_reached: Option<Vec<String>> = None;
-    let reached: BTreeSet<String> = if let Some(keys) = gpu_reached {
-        keys.into_iter().collect()
-    } else {
-        let mut seen = frontier.clone();
-        let mut reached = BTreeSet::new();
-        for src in &frontier {
-            store.for_each_neighbor(edge_rel, src, reverse, |dst| {
-                if seen.insert(dst.to_string()) {
-                    reached.insert(dst.to_string());
-                }
-            });
-        }
-        reached
-    };
+    let mut frontier: Vec<Arc<str>> = Vec::new();
+    let mut seen: FxHashSet<Arc<str>> = FxHashSet::default();
+    collect_seed_keys_arc(
+        store,
+        name,
+        &source,
+        filter,
+        need_filter,
+        now,
+        &mut frontier,
+        &mut seen,
+    );
+    let rel_arc: Arc<str> = Arc::from(edge_rel);
+    let mut reached: BTreeSet<Arc<str>> = BTreeSet::new();
+    for src in &frontier {
+        store.for_each_neighbor_arc(&rel_arc, src, reverse, |dst| {
+            if seen.insert(Arc::clone(dst)) {
+                reached.insert(Arc::clone(dst));
+            }
+        });
+    }
 
-    let out_collection = if name == "docs" || store.collections.contains_key("docs") {
-        // hop resolves via find_doc_key → docs first
-        "docs"
-    } else {
-        name.as_str()
-    };
     let mut idxs = Vec::new();
     for key in reached {
         // A lazy source indexes one collection. Eager hop can resolve a mix
@@ -973,23 +1002,38 @@ fn neighbor_idx(store: &Store, primary: &str, out_collection: &str, key: &str) -
     None
 }
 
-fn collect_seed_keys(
+fn collect_seed_keys_arc(
     store: &Store,
     collection: &str,
     source: &RowSource,
     pred: Option<&Pred>,
     need_filter: bool,
     now: i64,
-    out: &mut BTreeSet<String>,
+    out: &mut Vec<Arc<str>>,
+    seen: &mut FxHashSet<Arc<str>>,
 ) {
     let rows = store.collection(collection);
-    let push = |row: &Row, out: &mut BTreeSet<String>| {
-        if let Some(id) = row_text(row, "id") {
-            out.insert(id.to_string());
+    let mut push_cell = |c: Option<&Cell>| {
+        match c {
+            Some(Cell::Text(a)) if !a.is_empty() => {
+                if seen.insert(Arc::clone(a)) {
+                    out.push(Arc::clone(a));
+                }
+            }
+            Some(other) => {
+                if let Some(s) = other.text().filter(|s| !s.is_empty()) {
+                    let a: Arc<str> = Arc::from(s);
+                    if seen.insert(Arc::clone(&a)) {
+                        out.push(a);
+                    }
+                }
+            }
+            None => {}
         }
-        if let Some(uri) = row_text(row, "uri") {
-            out.insert(uri.to_string());
-        }
+    };
+    let mut push = |row: &Row| {
+        push_cell(row.get("id"));
+        push_cell(row.get("uri"));
     };
     match source {
         RowSource::Idxs(idxs) => {
@@ -1003,7 +1047,7 @@ fn collect_seed_keys(
                 {
                     continue;
                 }
-                push(row, out);
+                push(row);
             }
         }
         RowSource::Scan { len } => {
@@ -1016,7 +1060,7 @@ fn collect_seed_keys(
                 {
                     continue;
                 }
-                push(row, out);
+                push(row);
             }
         }
     }
@@ -1165,7 +1209,7 @@ fn next_lazy_join_soa_projected(
             *t = t.saturating_sub(1);
         }
 
-        let cells = vec![
+        let cells = smallvec![
             Cell::Text(Arc::clone(order_id)),
             match right {
                 Some(ui) => {

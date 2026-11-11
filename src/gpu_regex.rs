@@ -2,8 +2,149 @@ use super::GpuCompute;
 use crate::Error;
 use regex_automata::{
     nfa::thompson::{Config, NFA, State, WhichCaptures},
-    util::syntax,
+    util::{look::Look, syntax},
 };
+use rustc_hash::FxHashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+
+struct CompiledGpuRegex {
+    nfa: NFA,
+    program: Vec<u32>,
+    looks: Vec<Look>,
+    states: usize,
+}
+
+enum CachedGpuRegex {
+    Invalid,
+    Valid(Arc<CompiledGpuRegex>),
+}
+
+const MAX_GPU_REGEX_CACHE: usize = 256;
+
+fn gpu_regex_cache() -> &'static Mutex<FxHashMap<(String, bool), CachedGpuRegex>> {
+    static CACHE: OnceLock<Mutex<FxHashMap<(String, bool), CachedGpuRegex>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(FxHashMap::default()))
+}
+
+fn compile_or_get_gpu_regex(
+    pattern: &str,
+    case_insensitive: bool,
+) -> Result<Option<Arc<CompiledGpuRegex>>, Error> {
+    let key = (pattern.to_string(), case_insensitive);
+    if let Ok(guard) = gpu_regex_cache().lock()
+        && let Some(cached) = guard.get(&key)
+    {
+        return Ok(match cached {
+            CachedGpuRegex::Invalid => None,
+            CachedGpuRegex::Valid(c) => Some(Arc::clone(c)),
+        });
+    }
+    let mut builder = regex::RegexBuilder::new(pattern);
+    builder.case_insensitive(case_insensitive);
+    if builder.build().is_err() {
+        if let Ok(mut guard) = gpu_regex_cache().lock() {
+            if guard.len() >= MAX_GPU_REGEX_CACHE {
+                guard.clear();
+            }
+            guard.insert(key, CachedGpuRegex::Invalid);
+        }
+        return Ok(None);
+    }
+    let nfa = NFA::compiler()
+        .configure(Config::new().which_captures(WhichCaptures::None))
+        .syntax(syntax::Config::new().case_insensitive(case_insensitive))
+        .build(pattern)
+        .map_err(|e| Error::runtime(format!("GPU regex compilation: {e}")))?;
+    let states = nfa.states().len();
+    let state_words = states
+        .checked_mul(4)
+        .and_then(|n| n.checked_add(2))
+        .ok_or_else(|| Error::runtime("GPU regex state range overflow"))?;
+    let mut program = vec![0u32; state_words];
+    program[0] = states as u32;
+    program[1] = nfa.start_unanchored().as_usize() as u32;
+    let mut looks = Vec::new();
+    let mut transitions = Vec::new();
+    for (i, state) in nfa.states().iter().enumerate() {
+        transitions.clear();
+        let (kind, look) = match state {
+            State::ByteRange { trans } => {
+                transitions.push([
+                    trans.start as u32,
+                    trans.end as u32,
+                    trans.next.as_usize() as u32,
+                ]);
+                (0, 0)
+            }
+            State::Sparse(sparse) => {
+                transitions.extend(
+                    sparse
+                        .transitions
+                        .iter()
+                        .map(|t| [t.start as u32, t.end as u32, t.next.as_usize() as u32]),
+                );
+                (0, 0)
+            }
+            State::Dense(dense) => {
+                transitions.extend(
+                    dense
+                        .transitions
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, id)| id.as_usize() != 0)
+                        .map(|(b, id)| [b as u32, b as u32, id.as_usize() as u32]),
+                );
+                (0, 0)
+            }
+            State::Look { look, next } => {
+                if !looks.contains(look) {
+                    looks.push(*look);
+                }
+                transitions.push([0, 0, next.as_usize() as u32]);
+                (2, *look as u32)
+            }
+            State::Union { alternates } => {
+                transitions.extend(alternates.iter().map(|id| [0, 0, id.as_usize() as u32]));
+                (1, 0)
+            }
+            State::BinaryUnion { alt1, alt2 } => {
+                transitions.extend([
+                    [0, 0, alt1.as_usize() as u32],
+                    [0, 0, alt2.as_usize() as u32],
+                ]);
+                (1, 0)
+            }
+            State::Capture { next, .. } => {
+                transitions.push([0, 0, next.as_usize() as u32]);
+                (1, 0)
+            }
+            State::Match { .. } => (3, 0),
+            State::Fail => (4, 0),
+        };
+        let header = 2 + i * 4;
+        let transition_offset = program.len() as u32;
+        program[header..header + 4].copy_from_slice(&[
+            kind,
+            transition_offset,
+            transitions.len() as u32,
+            look,
+        ]);
+        program.extend(transitions.iter().copied().flatten());
+    }
+    let compiled = Arc::new(CompiledGpuRegex {
+        nfa,
+        program,
+        looks,
+        states,
+    });
+    if let Ok(mut guard) = gpu_regex_cache().lock() {
+        if guard.len() >= MAX_GPU_REGEX_CACHE {
+            guard.clear();
+        }
+        guard.insert(key, CachedGpuRegex::Valid(Arc::clone(&compiled)));
+    }
+    Ok(Some(compiled))
+}
 
 impl GpuCompute {
     /// NFA transitions run on GPU; assertion metadata uses the same look matcher
@@ -14,29 +155,18 @@ impl GpuCompute {
         pattern: &str,
         flags: &str,
     ) -> Result<Vec<bool>, Error> {
-        let mut builder = regex::RegexBuilder::new(pattern);
-        builder.case_insensitive(flags.contains('i'));
-        if builder.build().is_err() {
+        let Some(compiled) = compile_or_get_gpu_regex(pattern, flags.contains('i'))? else {
             return Ok(vec![false; texts.len()]);
-        }
+        };
         if texts.is_empty() {
             return Ok(Vec::new());
         }
-        let nfa = NFA::compiler()
-            .configure(Config::new().which_captures(WhichCaptures::None))
-            .syntax(syntax::Config::new().case_insensitive(flags.contains('i')))
-            .build(pattern)
-            .map_err(|e| Error::runtime(format!("GPU regex compilation: {e}")))?;
-        let states = nfa.states().len();
+        let states = compiled.states;
         let limits = self.device().limits();
         let max_words = (limits.max_storage_buffer_binding_size as usize)
             .min(limits.max_buffer_size as usize)
             / 4;
-        let state_words = states
-            .checked_mul(4)
-            .and_then(|n| n.checked_add(2))
-            .ok_or_else(|| Error::runtime("GPU regex state range overflow"))?;
-        if state_words > max_words {
+        if compiled.program.len() > max_words {
             return Err(Error::runtime("GPU regex program exceeds buffer limits"));
         }
         let scratch_words = states
@@ -48,87 +178,19 @@ impl GpuCompute {
         if row_limit == 0 {
             return Err(Error::runtime("GPU limits cannot hold regex scratch"));
         }
-        let mut program = vec![0u32; state_words];
-        program[0] = states as u32;
-        program[1] = nfa.start_unanchored().as_usize() as u32;
-        let mut looks = Vec::new();
-        for (i, state) in nfa.states().iter().enumerate() {
-            let mut transitions = Vec::new();
-            let (kind, look) = match state {
-                State::ByteRange { trans } => {
-                    transitions.push([
-                        trans.start as u32,
-                        trans.end as u32,
-                        trans.next.as_usize() as u32,
-                    ]);
-                    (0, 0)
-                }
-                State::Sparse(sparse) => {
-                    transitions.extend(
-                        sparse
-                            .transitions
-                            .iter()
-                            .map(|t| [t.start as u32, t.end as u32, t.next.as_usize() as u32]),
-                    );
-                    (0, 0)
-                }
-                State::Dense(dense) => {
-                    transitions.extend(
-                        dense
-                            .transitions
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, id)| id.as_usize() != 0)
-                            .map(|(b, id)| [b as u32, b as u32, id.as_usize() as u32]),
-                    );
-                    (0, 0)
-                }
-                State::Look { look, next } => {
-                    if !looks.contains(look) {
-                        looks.push(*look);
-                    }
-                    transitions.push([0, 0, next.as_usize() as u32]);
-                    (2, *look as u32)
-                }
-                State::Union { alternates } => {
-                    transitions.extend(alternates.iter().map(|id| [0, 0, id.as_usize() as u32]));
-                    (1, 0)
-                }
-                State::BinaryUnion { alt1, alt2 } => {
-                    transitions.extend([
-                        [0, 0, alt1.as_usize() as u32],
-                        [0, 0, alt2.as_usize() as u32],
-                    ]);
-                    (1, 0)
-                }
-                State::Capture { next, .. } => {
-                    transitions.push([0, 0, next.as_usize() as u32]);
-                    (1, 0)
-                }
-                State::Match { .. } => (3, 0),
-                State::Fail => (4, 0),
-            };
-            if transitions.len() > max_words.saturating_sub(program.len()) / 3 {
-                return Err(Error::runtime("GPU regex program exceeds buffer limits"));
-            }
-            let header = 2 + i * 4;
-            let transition_offset = program.len() as u32;
-            program[header..header + 4].copy_from_slice(&[
-                kind,
-                transition_offset,
-                transitions.len() as u32,
-                look,
-            ]);
-            program.extend(transitions.into_iter().flatten());
-        }
         let kernel =
             self.builtin_kernel(|k| &mut k.regex, include_str!("shaders/regex.wgsl"), "main")?;
-        let program = self.storage_buffer(bytemuck::cast_slice(&program))?;
+        let program = self.storage_buffer(bytemuck::cast_slice(&compiled.program))?;
+        let looks = &compiled.looks;
+        let nfa = &compiled.nfa;
         let mut result = Vec::with_capacity(texts.len());
         let mut position = 0;
+        let mut records = Vec::new();
+        let mut data = Vec::new();
+        let mut input = Vec::new();
         while position < texts.len() {
-            let mut records = Vec::new();
-            let mut data = Vec::new();
+            records.clear();
+            data.clear();
             while position < texts.len() && records.len() / 4 < row_limit {
                 let text = texts[position];
                 let bytes = text.unwrap_or("").as_bytes();
@@ -149,18 +211,27 @@ impl GpuCompute {
                     text.is_some() as u32,
                     0,
                 ]);
-                for at in 0..=bytes.len() {
-                    let mut assertions = if text.is_some_and(|t| t.is_char_boundary(at)) {
-                        1u32 << 31
-                    } else {
-                        0
-                    };
-                    for &look in &looks {
-                        if nfa.look_matcher().matches(look, bytes, at) {
-                            assertions |= look as u32;
-                        }
+                if looks.is_empty() && text.is_some_and(|t| t.is_ascii()) {
+                    const BOUNDARY: u32 = 1u32 << 31;
+                    data.reserve((bytes.len() + 1) * 2);
+                    for &b in bytes {
+                        data.extend([b as u32, BOUNDARY]);
                     }
-                    data.extend([bytes.get(at).copied().unwrap_or(0) as u32, assertions]);
+                    data.extend([0, BOUNDARY]);
+                } else {
+                    for at in 0..=bytes.len() {
+                        let mut assertions = if text.is_some_and(|t| t.is_char_boundary(at)) {
+                            1u32 << 31
+                        } else {
+                            0
+                        };
+                        for &look in looks {
+                            if nfa.look_matcher().matches(look, bytes, at) {
+                                assertions |= look as u32;
+                            }
+                        }
+                        data.extend([bytes.get(at).copied().unwrap_or(0) as u32, assertions]);
+                    }
                 }
                 position += 1;
             }
@@ -169,13 +240,15 @@ impl GpuCompute {
             for record in records.chunks_exact_mut(4) {
                 record[0] += prefix as u32;
             }
-            let mut input = vec![count as u32];
-            input.extend(records);
-            input.extend(data);
-            let input = self.storage_buffer(bytemuck::cast_slice(&input))?;
+            input.clear();
+            input.reserve(1 + records.len() + data.len());
+            input.push(count as u32);
+            input.extend_from_slice(&records);
+            input.extend_from_slice(&data);
+            let input_buf = self.storage_buffer(bytemuck::cast_slice(&input))?;
             let scratch = self.zeroed_storage_buffer((count * scratch_words * 4) as u64)?;
             let output = self.zeroed_storage_buffer((count * 4) as u64)?;
-            let buffers = [&program, &input, &scratch, &output];
+            let buffers = [&program, &input_buf, &scratch, &output];
             let group = self.checked(|device, _| {
                 let entries: Vec<_> = buffers
                     .iter()

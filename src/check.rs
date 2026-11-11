@@ -9,6 +9,10 @@ pub fn check(stmt: &Stmt, cat: &Catalog) -> Result<(), Error> {
     check_in(stmt, cat, &Bindings::new())
 }
 
+pub(crate) fn check_query_only(q: &Query, cat: &Catalog) -> Result<(), Error> {
+    check_query(q, cat, &Bindings::new()).map(|_| ())
+}
+
 /// Typecheck a program against the live catalog.
 ///
 /// Declarations are staged into a private copy, returned here so the caller can
@@ -116,8 +120,8 @@ fn check_in(stmt: &Stmt, cat: &Catalog, env: &Bindings) -> Result<(), Error> {
                     "{collection} is append-only; cannot update"
                 )));
             }
-            let scope = scope_of(collection, cat)?;
             if let Some(p) = pred {
+                let scope = Scope::from_col(collection, col);
                 check_pred(p, &scope, cat)?;
             }
             check_record(record, collection, cat, true)?;
@@ -149,7 +153,7 @@ fn check_in(stmt: &Stmt, cat: &Catalog, env: &Bindings) -> Result<(), Error> {
             if !col.append_only && cas.is_none() && !*cas_each {
                 return Err(Error::new("delete requires cas"));
             }
-            let scope = scope_of(collection, cat)?;
+            let scope = Scope::from_col(collection, col);
             check_pred(pred, &scope, cat)?;
         }
         Stmt::DeleteEdge { rel, from, to } => {
@@ -240,7 +244,7 @@ fn check_decl(d: &Decl, cat: &Catalog) -> Result<(), Error> {
             pred,
         } => {
             let scope = scope_of(collection, cat)?;
-            if scope.ty_of(field).is_none() {
+            if scope.ty_of(field, cat).is_none() {
                 return Err(Error::new(format!("unknown field: {collection}.{field}")));
             }
             check_pred(pred, &scope, cat)?;
@@ -328,17 +332,17 @@ fn check_query(q: &Query, cat: &Catalog, env: &Bindings) -> Result<Scope, Error>
             Step::Project(fields) => {
                 let mut next = BTreeMap::new();
                 for f in fields {
-                    let ty = require_field(&scope, f)?;
+                    let ty = require_field(&scope, f, cat)?;
                     next.insert(f.as_str(), ty);
                 }
-                scope.fields = next;
+                scope.replace_fields(next);
             }
             Step::Join { collection, on, .. } => {
                 if cat.collection(collection).is_none() {
                     return Err(Error::new(format!("unknown collection: {collection}")));
                 }
-                if scope.ty_of(on).is_none()
-                    && scope.ty_of(&format!("{}.{on}", scope.primary)).is_none()
+                if scope.ty_of(on, cat).is_none()
+                    && scope.ty_of(&format!("{}.{on}", scope.primary), cat).is_none()
                 {
                     return Err(Error::new(format!("unknown field: {on}")));
                 }
@@ -465,14 +469,14 @@ fn check_query(q: &Query, cat: &Catalog, env: &Bindings) -> Result<Scope, Error>
             Step::Count { by } => {
                 scope = match by {
                     Some(by) => {
-                        let by_ty = require_field(&scope, by)?;
+                        let by_ty = require_field(&scope, by, cat)?;
                         Scope::agg(&scope.primary, &by.as_str(), by_ty, Type::I64, "hits")
                     }
                     None => Scope::agg_total(&scope.primary, Type::I64, "hits"),
                 };
             }
             Step::Sum { field, by } => {
-                let ty = require_field(&scope, field)?;
+                let ty = require_field(&scope, field, cat)?;
                 if !ty.is_numeric() {
                     return Err(Error::new(format!(
                         "sum requires numeric field, found {}",
@@ -481,7 +485,7 @@ fn check_query(q: &Query, cat: &Catalog, env: &Bindings) -> Result<Scope, Error>
                 }
                 scope = match by {
                     Some(by) => {
-                        let by_ty = require_field(&scope, by)?;
+                        let by_ty = require_field(&scope, by, cat)?;
                         Scope::agg(
                             &scope.primary,
                             &by.as_str(),
@@ -494,17 +498,17 @@ fn check_query(q: &Query, cat: &Catalog, env: &Bindings) -> Result<Scope, Error>
                 };
             }
             Step::Min { field, by } | Step::Max { field, by } => {
-                let ty = require_field(&scope, field)?;
+                let ty = require_field(&scope, field, cat)?;
                 scope = match by {
                     Some(by) => {
-                        let by_ty = require_field(&scope, by)?;
+                        let by_ty = require_field(&scope, by, cat)?;
                         Scope::agg(&scope.primary, &by.as_str(), by_ty, ty, &field.as_str())
                     }
                     None => Scope::agg_total(&scope.primary, ty, &field.as_str()),
                 };
             }
             Step::Avg { field, by } => {
-                let ty = require_field(&scope, field)?;
+                let ty = require_field(&scope, field, cat)?;
                 if !ty.is_numeric() {
                     return Err(Error::new(format!(
                         "avg requires numeric field, found {}",
@@ -513,7 +517,7 @@ fn check_query(q: &Query, cat: &Catalog, env: &Bindings) -> Result<Scope, Error>
                 }
                 scope = match by {
                     Some(by) => {
-                        let by_ty = require_field(&scope, by)?;
+                        let by_ty = require_field(&scope, by, cat)?;
                         Scope::agg(
                             &scope.primary,
                             &by.as_str(),
@@ -526,7 +530,7 @@ fn check_query(q: &Query, cat: &Catalog, env: &Bindings) -> Result<Scope, Error>
                 };
             }
             Step::Sort { field, .. } => {
-                require_field(&scope, field)?;
+                require_field(&scope, field, cat)?;
             }
             Step::Window {
                 func,
@@ -537,10 +541,10 @@ fn check_query(q: &Query, cat: &Catalog, env: &Bindings) -> Result<Scope, Error>
                 as_field,
             } => {
                 for b in by {
-                    require_field(&scope, b)?;
+                    require_field(&scope, b, cat)?;
                 }
                 for s in order {
-                    require_field(&scope, &s.field)?;
+                    require_field(&scope, &s.field, cat)?;
                 }
                 let out_ty = match func {
                     crate::window::WindowFunction::RowNumber
@@ -553,7 +557,7 @@ fn check_query(q: &Query, cat: &Catalog, env: &Bindings) -> Result<Scope, Error>
                         let f = field.as_ref().ok_or_else(|| {
                             Error::new(format!("{func} requires a field argument"))
                         })?;
-                        let ty = require_field(&scope, f)?;
+                        let ty = require_field(&scope, f, cat)?;
                         if !ty.is_numeric() {
                             return Err(Error::new(format!(
                                 "{func} requires numeric field, found {}",
@@ -566,7 +570,7 @@ fn check_query(q: &Query, cat: &Catalog, env: &Bindings) -> Result<Scope, Error>
                         let f = field.as_ref().ok_or_else(|| {
                             Error::new(format!("{func} requires a field argument"))
                         })?;
-                        let ty = require_field(&scope, f)?;
+                        let ty = require_field(&scope, f, cat)?;
                         if !ty.is_numeric() {
                             return Err(Error::new(format!(
                                 "avg requires numeric field, found {}",
@@ -582,10 +586,10 @@ fn check_query(q: &Query, cat: &Catalog, env: &Bindings) -> Result<Scope, Error>
                         let f = field.as_ref().ok_or_else(|| {
                             Error::new(format!("{func} requires a field argument"))
                         })?;
-                        require_field(&scope, f)?
+                        require_field(&scope, f, cat)?
                     }
                 };
-                scope.fields.insert(as_field.clone(), out_ty);
+                scope.insert_field(as_field.clone(), out_ty, cat);
             }
             Step::Skip { n } => {
                 if *n < 0 {
@@ -601,28 +605,27 @@ fn check_query(q: &Query, cat: &Catalog, env: &Bindings) -> Result<Scope, Error>
             }
             Step::Union(rhs) => {
                 let right = check_query(rhs, cat, env)?;
-                check_union_cols(&scope, &right)?;
+                check_union_cols(&scope, &right, cat)?;
             }
         }
     }
     Ok(scope)
 }
 
-fn check_union_cols(left: &Scope, right: &Scope) -> Result<(), Error> {
-    let l: Vec<&String> = left.fields.keys().collect();
-    let r: Vec<&String> = right.fields.keys().collect();
+fn check_union_cols(left: &Scope, right: &Scope, cat: &Catalog) -> Result<(), Error> {
+    let lf = left.materialized_fields(cat);
+    let rf = right.materialized_fields(cat);
+    let l: Vec<&str> = lf.iter().map(|(k, _)| *k).collect();
+    let r: Vec<&str> = rf.iter().map(|(k, _)| *k).collect();
     if l != r {
         return Err(Error::new(format!(
             "union columns mismatch: [{}] vs [{}]",
-            l.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "),
-            r.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+            l.join(", "),
+            r.join(", ")
         )));
     }
-    for (name, lty) in &left.fields {
-        if let Some(rty) = right.fields.get(name)
-            && !types_ok(*rty, *lty)
-            && !types_ok(*lty, *rty)
-        {
+    for (&(name, lty), &(_, rty)) in lf.iter().zip(rf.iter()) {
+        if !types_ok(rty, lty) && !types_ok(lty, rty) {
             return Err(Error::new(format!(
                 "union type mismatch: {name} {} vs {}",
                 lty.name(),
@@ -795,6 +798,9 @@ fn eval_record_pred(pred: &Pred, record: &Record) -> bool {
 }
 
 fn check_value_as(value: &Value, expected: Type, cat: &Catalog) -> Result<(), Error> {
+    if matches!(value, Value::Param(_)) {
+        return Ok(());
+    }
     let got = value_type(value, cat)?;
     if types_ok(got, expected) {
         Ok(())
@@ -815,6 +821,7 @@ fn value_type(value: &Value, cat: &Catalog) -> Result<Type, Error> {
         Value::Bool(_) => Ok(Type::Bool),
         Value::Timestamp(_) | Value::Now | Value::NowMinus(_) => Ok(Type::Time),
         Value::Duration(_) => Ok(Type::Dur),
+        Value::Param(_) => Ok(Type::Var),
         Value::Name(n) => {
             if cat.rel(n).is_some() {
                 Ok(Type::Rel)
@@ -827,6 +834,8 @@ fn value_type(value: &Value, cat: &Catalog) -> Result<Type, Error> {
 
 fn types_ok(got: Type, expected: Type) -> bool {
     got == expected
+        || got == Type::Var
+        || expected == Type::Var
         || matches!(
             (got, expected),
             (Type::Text, Type::Id | Type::Uri | Type::Rel | Type::Var)
@@ -847,10 +856,10 @@ fn check_pred(pred: &Pred, scope: &Scope, cat: &Catalog) -> Result<(), Error> {
             check_pred(inner, scope, cat)?;
         }
         Pred::IsNull { field, .. } => {
-            require_field(scope, field)?;
+            require_field(scope, field, cat)?;
         }
         Pred::In { field, values } => {
-            let lty = require_field(scope, field)?;
+            let lty = require_field(scope, field, cat)?;
             if values.is_empty() {
                 return Err(Error::new("empty `in` list"));
             }
@@ -866,7 +875,7 @@ fn check_pred(pred: &Pred, scope: &Scope, cat: &Catalog) -> Result<(), Error> {
             }
         }
         Pred::Cmp { field, op, value } => {
-            let lty = require_field(scope, field)?;
+            let lty = require_field(scope, field, cat)?;
             let rty = value_type(value, cat)?;
             match op {
                 CmpOp::Eq | CmpOp::Ne => {
@@ -880,12 +889,14 @@ fn check_pred(pred: &Pred, scope: &Scope, cat: &Catalog) -> Result<(), Error> {
                     }
                 }
                 CmpOp::Gt | CmpOp::Lt | CmpOp::Ge | CmpOp::Le => {
-                    let ok = matches!(
-                        (lty, rty),
-                        (Type::Time, Type::Time)
-                            | (Type::Dur, Type::Dur)
-                            | (Type::I64 | Type::F64, Type::I64 | Type::F64)
-                    );
+                    let ok = rty == Type::Var
+                        || lty == Type::Var
+                        || matches!(
+                            (lty, rty),
+                            (Type::Time, Type::Time)
+                                | (Type::Dur, Type::Dur)
+                                | (Type::I64 | Type::F64, Type::I64 | Type::F64)
+                        );
                     if !ok {
                         return Err(Error::new(format!(
                             "type mismatch: {} {} {}",
@@ -898,7 +909,7 @@ fn check_pred(pred: &Pred, scope: &Scope, cat: &Catalog) -> Result<(), Error> {
             }
         }
         Pred::Has { field, .. } => {
-            let ty = require_field(scope, field)?;
+            let ty = require_field(scope, field, cat)?;
             if !ty.is_textish() {
                 return Err(Error::new(format!(
                     "has requires text, found {} ({})",
@@ -908,7 +919,7 @@ fn check_pred(pred: &Pred, scope: &Scope, cat: &Catalog) -> Result<(), Error> {
             }
         }
         Pred::Contains { field, .. } | Pred::Regex { field, .. } => {
-            let ty = require_field(scope, field)?;
+            let ty = require_field(scope, field, cat)?;
             if !ty.is_textish() {
                 return Err(Error::new(format!(
                     "`~` requires text, found {} ({})",
@@ -940,10 +951,10 @@ pub fn validate_regex(pattern: &str, flags: &str) -> Result<(), Error> {
     Ok(())
 }
 
-fn require_field(scope: &Scope, field: &Field) -> Result<Type, Error> {
+fn require_field(scope: &Scope, field: &Field, cat: &Catalog) -> Result<Type, Error> {
     let key = field.as_cow_str();
     scope
-        .ty_of(&key)
+        .ty_of(&key, cat)
         .ok_or_else(|| Error::new(format!("unknown field: {key}")))
 }
 
@@ -975,12 +986,59 @@ impl Bindings {
 #[derive(Debug, Clone)]
 pub struct Scope {
     pub primary: String,
+    /// When `true`, `primary` names a catalog collection whose unprojected fields are
+    /// resolved directly from `cat.collection(&self.primary)` without allocating/cloning
+    /// a `BTreeMap` of every field name.
+    base_from_catalog: bool,
     fields: BTreeMap<String, Type>,
 }
 
 impl Scope {
-    fn ty_of(&self, name: &str) -> Option<Type> {
-        self.fields.get(name).copied()
+    #[inline]
+    fn from_col(collection: &str, _col: &catalog::Collection) -> Self {
+        Self {
+            primary: collection.to_string(),
+            base_from_catalog: true,
+            fields: BTreeMap::new(),
+        }
+    }
+
+    #[inline]
+    fn ty_of(&self, name: &str, cat: &Catalog) -> Option<Type> {
+        if let Some(&ty) = self.fields.get(name) {
+            return Some(ty);
+        }
+        if self.base_from_catalog
+            && let Some(col) = cat.collection(&self.primary)
+        {
+            return col.field(name).map(|info| info.ty);
+        }
+        None
+    }
+
+    fn replace_fields(&mut self, next: BTreeMap<String, Type>) {
+        self.base_from_catalog = false;
+        self.fields = next;
+    }
+
+    fn insert_field(&mut self, name: String, ty: Type, _cat: &Catalog) {
+        self.fields.insert(name, ty);
+    }
+
+    fn materialized_fields<'a>(&'a self, cat: &'a Catalog) -> Vec<(&'a str, Type)> {
+        if !self.base_from_catalog {
+            return self.fields.iter().map(|(k, &v)| (k.as_str(), v)).collect();
+        }
+        let mut merged: BTreeMap<&'a str, Type> = BTreeMap::new();
+        if let Some(col) = cat.collection(&self.primary) {
+            for (k, info) in &col.fields {
+                merged.insert(k.as_str(), info.ty);
+            }
+        }
+        for (k, &v) in &self.fields {
+            merged.insert(k.as_str(), v);
+        }
+        merged.into_iter().collect()
     }
 
     fn add_join(&mut self, collection: &str, cat: &Catalog) -> Result<(), Error> {
@@ -1015,6 +1073,7 @@ impl Scope {
         fields.insert(metric.to_string(), metric_ty);
         Self {
             primary: primary.to_string(),
+            base_from_catalog: false,
             fields,
         }
     }
@@ -1024,6 +1083,7 @@ impl Scope {
         fields.insert(metric.to_string(), metric_ty);
         Self {
             primary: primary.to_string(),
+            base_from_catalog: false,
             fields,
         }
     }
@@ -1035,6 +1095,7 @@ impl Scope {
         fields.insert("to".into(), Type::Text);
         Self {
             primary: "edges".into(),
+            base_from_catalog: false,
             fields,
         }
     }
@@ -1044,14 +1105,7 @@ fn scope_of(collection: &str, cat: &Catalog) -> Result<Scope, Error> {
     let col = cat
         .collection(collection)
         .ok_or_else(|| Error::new(format!("unknown collection: {collection}")))?;
-    let mut fields = BTreeMap::new();
-    for (name, info) in &col.fields {
-        fields.insert(name.clone(), info.ty);
-    }
-    Ok(Scope {
-        primary: collection.to_string(),
-        fields,
-    })
+    Ok(Scope::from_col(collection, col))
 }
 
 pub fn collection_of(source: &Source) -> &str {

@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use crate::ast::{Decl, Pred, Query, Source, Step, TypeExpr};
 use crate::error::Error;
@@ -143,9 +144,31 @@ pub struct Catalog {
     pub indexes: BTreeMap<String, IndexDef>,
     pub owned: BTreeMap<String, Vec<(String, FieldInfo)>>,
     pub embed_id: String,
+    cached_hash_u64: u64,
+    cached_hash_hex: Arc<str>,
 }
 
 impl Catalog {
+    #[inline]
+    pub fn hash_u64(&self) -> u64 {
+        self.cached_hash_u64
+    }
+
+    #[inline]
+    pub fn hash_str(&self) -> &str {
+        &self.cached_hash_hex
+    }
+
+    pub fn set_embed_id(&mut self, embed_id: impl Into<String>) {
+        self.embed_id = embed_id.into();
+        self.refresh_hash();
+    }
+
+    pub fn refresh_hash(&mut self) {
+        let u = compute_catalog_hash_u64(self);
+        self.cached_hash_u64 = u;
+        self.cached_hash_hex = Arc::from(format!("h:{u:016x}"));
+    }
     pub fn collection(&self, name: &str) -> Option<&Collection> {
         self.collections.get(name)
     }
@@ -358,6 +381,7 @@ impl Catalog {
                 self.indexes.insert(label, def);
             }
         }
+        self.refresh_hash();
         Ok(())
     }
 }
@@ -528,7 +552,7 @@ pub fn fixture() -> Catalog {
         },
     );
 
-    Catalog {
+    let mut cat = Catalog {
         collections,
         rels,
         fks: vec![Fk {
@@ -549,7 +573,11 @@ pub fn fixture() -> Catalog {
         indexes: BTreeMap::new(),
         owned: BTreeMap::new(),
         embed_id: "nomic-embed-text/768".into(),
-    }
+        cached_hash_u64: 0,
+        cached_hash_hex: Arc::from(""),
+    };
+    cat.refresh_hash();
+    cat
 }
 
 struct Fnv1aWriter(u64);
@@ -583,7 +611,7 @@ impl std::fmt::Write for Fnv1aWriter {
     }
 }
 
-pub fn catalog_hash(cat: &Catalog) -> String {
+fn compute_catalog_hash_u64(cat: &Catalog) -> u64 {
     use std::fmt::Write;
     let mut h = Fnv1aWriter::new();
     h.write_bytes(cat.embed_id.as_bytes());
@@ -677,7 +705,15 @@ pub fn catalog_hash(cat: &Catalog) -> String {
         let _ = write!(&mut h, "{}", g.pred);
         h.write_byte(b';');
     }
-    format!("h:{:016x}", h.0)
+    h.0
+}
+
+pub fn catalog_hash(cat: &Catalog) -> String {
+    if !cat.cached_hash_hex.is_empty() {
+        cat.cached_hash_hex.to_string()
+    } else {
+        format!("h:{:016x}", compute_catalog_hash_u64(cat))
+    }
 }
 
 #[cfg(test)]

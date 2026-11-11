@@ -217,11 +217,16 @@ impl ColdCol {
 
     fn decode(&self) -> Result<Vec<Row>, Error> {
         // Detect if compressed by checking for flag byte + magic vs plain magic
-        let (data_offset, is_compressed): (usize, bool) = if self.mmap.len() >= 5
+        let (data_offset, is_compressed): (usize, bool) = if self.mmap.len() >= 9
+            && self.mmap[0] != COLD_MAGIC[0]
+            && self.mmap[1..5] == COLD_COUNT_MAGIC
+        {
+            (9, true)
+        } else if self.mmap.len() >= 5
             && self.mmap[0] != COLD_MAGIC[0]
             && self.mmap[1..5] == COLD_MAGIC
         {
-            // Compressed format: flag at 0, magic at 1-4
+            // Legacy compressed format: flag at 0, magic at 1-4
             (5, true)
         } else if self.mmap.len() >= 4 && self.mmap[0..4] == COLD_MAGIC {
             // Uncompressed format: magic at 0-3
@@ -308,6 +313,16 @@ impl ColdCol {
 /// Write `rows` as a cold file (atomic replace) with optional compression
 #[cfg(any(feature = "compress-flate", feature = "compress-lz4", feature = "compress-zstd"))]
 pub fn write_cold(data: &Path, name: &str, rows: &[Row]) -> Result<(), Error> {
+    write_cold_ext(data, name, rows, true)
+}
+
+#[cfg(any(feature = "compress-flate", feature = "compress-lz4", feature = "compress-zstd"))]
+pub(crate) fn write_cold_ext(
+    data: &Path,
+    name: &str,
+    rows: &[Row],
+    sync_parent: bool,
+) -> Result<(), Error> {
     let dir = cold_dir(data);
     fs::create_dir_all(&dir).map_err(io_err)?;
     let path = cold_path(data, name);
@@ -320,6 +335,7 @@ pub fn write_cold(data: &Path, name: &str, rows: &[Row]) -> Result<(), Error> {
     let mut body = Vec::new();
 
     if is_compressed {
+        let count_bytes = (rows.len() as u32).to_le_bytes();
         match codec {
             CompressionCodec::Flate => {
                 #[cfg(feature = "compress-flate")]
@@ -329,7 +345,8 @@ pub fn write_cold(data: &Path, name: &str, rows: &[Row]) -> Result<(), Error> {
                     use std::io::Write;
 
                     body.push(0x01); // Flag for Flate
-                    body.extend_from_slice(&COLD_MAGIC);
+                    body.extend_from_slice(&COLD_COUNT_MAGIC);
+                    body.extend_from_slice(&count_bytes);
                     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
                     encoder.write_all(&encoded).map_err(io_err)?;
                     let compressed = encoder.finish().map_err(io_err)?;
@@ -344,7 +361,8 @@ pub fn write_cold(data: &Path, name: &str, rows: &[Row]) -> Result<(), Error> {
                     use lz4::block::{CompressionMode, compress};
 
                     body.push(0x02); // Flag for Lz4
-                    body.extend_from_slice(&COLD_MAGIC);
+                    body.extend_from_slice(&COLD_COUNT_MAGIC);
+                    body.extend_from_slice(&count_bytes);
                     let compressed =
                         compress(&encoded, Some(CompressionMode::DEFAULT), true).map_err(io_err)?;
                     body.extend_from_slice(&compressed);
@@ -356,7 +374,8 @@ pub fn write_cold(data: &Path, name: &str, rows: &[Row]) -> Result<(), Error> {
                 #[cfg(feature = "compress-zstd")]
                 {
                     body.push(0x03); // Flag for Zstd
-                    body.extend_from_slice(&COLD_MAGIC);
+                    body.extend_from_slice(&COLD_COUNT_MAGIC);
+                    body.extend_from_slice(&count_bytes);
                     let compressed = zstd::encode_all(&encoded[..], 3).map_err(io_err)?;
                     body.extend_from_slice(&compressed);
                 }
@@ -373,12 +392,26 @@ pub fn write_cold(data: &Path, name: &str, rows: &[Row]) -> Result<(), Error> {
         body.extend_from_slice(&encoded);
     }
 
-    crate::persist::write_through_tmp(&path, &tmp, &body)
+    crate::persist::write_through_tmp(&path, &tmp, &body)?;
+    if sync_parent {
+        crate::persist::sync_dir_checked(&dir)?;
+    }
+    Ok(())
 }
 
 /// Write `rows` as a cold file without compression (for non-compression builds)
 #[cfg(not(any(feature = "compress-flate", feature = "compress-lz4", feature = "compress-zstd")))]
 pub fn write_cold(data: &Path, name: &str, rows: &[Row]) -> Result<(), Error> {
+    write_cold_ext(data, name, rows, true)
+}
+
+#[cfg(not(any(feature = "compress-flate", feature = "compress-lz4", feature = "compress-zstd")))]
+pub(crate) fn write_cold_ext(
+    data: &Path,
+    name: &str,
+    rows: &[Row],
+    sync_parent: bool,
+) -> Result<(), Error> {
     let dir = cold_dir(data);
     fs::create_dir_all(&dir).map_err(io_err)?;
     let path = cold_path(data, name);
@@ -388,10 +421,19 @@ pub fn write_cold(data: &Path, name: &str, rows: &[Row]) -> Result<(), Error> {
     body.extend_from_slice(&COLD_MAGIC);
     rmp_serde::encode::write_named(&mut body, rows).map_err(io_err)?;
 
-    crate::persist::write_through_tmp(&path, &tmp, &body)
+    crate::persist::write_through_tmp(&path, &tmp, &body)?;
+    if sync_parent {
+        crate::persist::sync_dir_checked(&dir)?;
+    }
+    Ok(())
 }
 
+const COLD_COUNT_MAGIC: [u8; 4] = *b"LIN\x07";
+
 pub(crate) fn peek_rmp_array_len(bytes: &[u8]) -> Option<usize> {
+    if bytes.len() >= 9 && bytes[1..5] == COLD_COUNT_MAGIC {
+        return Some(u32::from_le_bytes([bytes[5], bytes[6], bytes[7], bytes[8]]) as usize);
+    }
     let offset = if bytes.len() >= 4 && bytes[0..4] == COLD_MAGIC {
         4
     } else {
@@ -422,9 +464,10 @@ pub fn map_cold_with_count(data: &Path, name: &str, count: usize) -> Result<Cold
     #[cfg(unix)]
     let _ = mmap.advise(memmap2::Advice::Sequential);
 
-    // Check both compressed (magic at offset 1) and uncompressed (magic at offset 0)
-    let valid =
-        mmap.len() >= 5 && mmap[1..5] == COLD_MAGIC || mmap.len() >= 4 && mmap[0..4] == COLD_MAGIC;
+    // Check compressed v2 (magic at 1..5 = COLD_COUNT_MAGIC + 4B count), compressed v1 (magic at 1..5), or uncompressed (magic at 0..4)
+    let valid = (mmap.len() >= 9 && mmap[1..5] == COLD_COUNT_MAGIC)
+        || (mmap.len() >= 5 && mmap[1..5] == COLD_MAGIC)
+        || (mmap.len() >= 4 && mmap[0..4] == COLD_MAGIC);
     if !valid {
         return Err(io_err(format!("bad cold file: {}", path.display())));
     }

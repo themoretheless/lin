@@ -283,12 +283,12 @@ fn executor_resident_cache_tracks_mutations_rollback_and_snapshot() {
     assert_eq!(db.gpu_cache_stats().unwrap().uploads, 1);
     assert_eq!(db.gpu_cache_stats().unwrap().hits, 1);
     let snapshot = db.reader();
-    let snapshot_rows = snapshot.run(q).unwrap().rows;
+    let snapshot_rows = snapshot.run(q).unwrap().into_rows();
     std::thread::scope(|scope| {
         let handles: Vec<_> = (0..4)
             .map(|_| {
                 let read = snapshot.clone();
-                scope.spawn(move || read.run(q).unwrap().rows)
+                scope.spawn(move || read.run(q).unwrap().into_rows())
             })
             .collect();
         for handle in handles {
@@ -1198,7 +1198,7 @@ fn executor_sum_matches_cpu_groups_batches_and_snapshots() {
         "sum_rows | sum value by key | count",
         "sum_rows | sum value by key | sum value by key",
     ] {
-        let expected = cpu.run(q).unwrap().rows;
+        let expected = cpu.run(q).unwrap().into_rows();
         assert_rows(&db.run(q).unwrap().rows, &expected, q);
         assert_rows(&db.run_batch(q).unwrap().to_rows(), &expected, q);
         assert_rows(&db.reader().run(q).unwrap().rows, &expected, q);
@@ -1272,7 +1272,7 @@ fn graph_hop_and_match_preserve_cpu_order_cycles_reverse_and_limits() {
         "match -[e:wikilink]-> b | { e.rel, e.from, e.to, b.title } | take all",
     ] {
         let q = format!("docs | uri == \"gpu://g0\" | {suffix}");
-        let expected = cpu.run(&q).unwrap().rows;
+        let expected = cpu.run(&q).unwrap().into_rows();
         let before = gpu.graph_dispatches();
         assert_eq!(db.run(&q).unwrap().rows, expected, "{q}");
         assert!(
@@ -1301,7 +1301,7 @@ fn graph_hop_and_match_preserve_cpu_order_cycles_reverse_and_limits() {
         "match -wikilink-> b",
     ] {
         let q = format!("docs | uri == \"gpu://g0\" | {suffix} | take all");
-        let expected = cpu.run(&q).unwrap().rows;
+        let expected = cpu.run(&q).unwrap().into_rows();
         assert_eq!(expected.len(), 300);
         assert_eq!(db.run(&q).unwrap().rows, expected, "cutoff {q}");
     }

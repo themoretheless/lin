@@ -32,6 +32,234 @@ pub(crate) fn value_cell(v: &Value, now: i64) -> Cell {
         Value::NowMinus(d) => Cell::Time(now - d.as_millis()),
         Value::Duration(d) => Cell::Int(d.as_millis()),
         Value::Name(n) => Cell::text_arc(n.as_str()),
+        Value::Param(_) => Cell::Null,
+    }
+}
+
+#[inline]
+pub(crate) fn lookup_param<'a>(params: &'a [(&str, Cell)], name: &str) -> Option<&'a Cell> {
+    params.iter().rfind(|(k, _)| *k == name).map(|(_, v)| v)
+}
+
+#[inline]
+pub(crate) fn value_needs_now(v: &Value) -> bool {
+    matches!(v, Value::Now | Value::NowMinus(_))
+}
+
+pub(crate) fn pred_needs_now(pred: &Pred) -> bool {
+    match pred {
+        Pred::And(a, b) | Pred::Or(a, b) => pred_needs_now(a) || pred_needs_now(b),
+        Pred::Not(inner) => pred_needs_now(inner),
+        Pred::Cmp { value, .. } => value_needs_now(value),
+        Pred::In { values, .. } => values.iter().any(value_needs_now),
+        _ => false,
+    }
+}
+
+pub(crate) fn pred_has_param(pred: &Pred) -> bool {
+    match pred {
+        Pred::And(a, b) | Pred::Or(a, b) => pred_has_param(a) || pred_has_param(b),
+        Pred::Not(inner) => pred_has_param(inner),
+        Pred::Cmp { value, .. } => matches!(value, Value::Param(_)),
+        Pred::In { values, .. } => values.iter().any(|v| matches!(v, Value::Param(_))),
+        _ => false,
+    }
+}
+
+pub(crate) fn record_has_param(record: &crate::ast::Record) -> bool {
+    record
+        .fields
+        .iter()
+        .any(|(_, v)| matches!(v, Value::Param(_)))
+}
+
+pub(crate) fn record_needs_now(record: &crate::ast::Record) -> bool {
+    record.fields.iter().any(|(_, v)| value_needs_now(v))
+}
+
+fn cell_to_ast_value(c: &Cell) -> Value {
+    match c {
+        Cell::Null => Value::Param(Arc::from("")),
+        Cell::Bool(b) => Value::Bool(*b),
+        Cell::Int(n) => Value::Int(*n),
+        Cell::Float(f) => Value::Float(*f),
+        Cell::Time(t) => Value::Timestamp(*t),
+        Cell::Text(s) => Value::String(Arc::clone(s)),
+        Cell::SmallText(s) => Value::String(Arc::from(s.as_str())),
+        Cell::Vec(_) => Value::Param(Arc::from("")),
+    }
+}
+
+pub(crate) fn bind_pred_params(pred: &Pred, params: &[(&str, Cell)]) -> Pred {
+    match pred {
+        Pred::And(a, b) => Pred::And(
+            Box::new(bind_pred_params(a, params)),
+            Box::new(bind_pred_params(b, params)),
+        ),
+        Pred::Or(a, b) => Pred::Or(
+            Box::new(bind_pred_params(a, params)),
+            Box::new(bind_pred_params(b, params)),
+        ),
+        Pred::Not(inner) => Pred::Not(Box::new(bind_pred_params(inner, params))),
+        Pred::Cmp { field, op, value } => {
+            if let Value::Param(name) = value {
+                let bound = lookup_param(params, name)
+                    .map(cell_to_ast_value)
+                    .unwrap_or_else(|| Value::Param(Arc::from("")));
+                Pred::Cmp {
+                    field: field.clone(),
+                    op: *op,
+                    value: bound,
+                }
+            } else {
+                pred.clone()
+            }
+        }
+        Pred::In { field, values } => {
+            if values.iter().any(|v| matches!(v, Value::Param(_))) {
+                let bound_vals = values
+                    .iter()
+                    .map(|v| match v {
+                        Value::Param(name) => lookup_param(params, name)
+                            .map(cell_to_ast_value)
+                            .unwrap_or_else(|| Value::Param(Arc::from(""))),
+                        other => other.clone(),
+                    })
+                    .collect();
+                Pred::In {
+                    field: field.clone(),
+                    values: bound_vals,
+                }
+            } else {
+                pred.clone()
+            }
+        }
+        _ => pred.clone(),
+    }
+}
+
+pub(crate) fn bind_record_params(
+    record: &crate::ast::Record,
+    params: &[(&str, Cell)],
+) -> crate::ast::Record {
+    crate::ast::Record {
+        fields: record
+            .fields
+            .iter()
+            .map(|(k, v)| {
+                let nv = match v {
+                    Value::Param(name) => lookup_param(params, name)
+                        .map(cell_to_ast_value)
+                        .unwrap_or_else(|| Value::Param(Arc::from(""))),
+                    other => other.clone(),
+                };
+                (k.clone(), nv)
+            })
+            .collect(),
+    }
+}
+
+pub(crate) fn bind_stmt_params(
+    stmt: &crate::ast::Stmt,
+    params: &[(&str, Cell)],
+) -> crate::ast::Stmt {
+    use crate::ast::{EdgeTarget, InsertEdge, Query, Step, Stmt};
+    let bind_val = |v: &Value| -> Value {
+        match v {
+            Value::Param(name) => lookup_param(params, name)
+                .map(cell_to_ast_value)
+                .unwrap_or_else(|| Value::Param(Arc::from(""))),
+            other => other.clone(),
+        }
+    };
+    let bind_query = |q: &Query| -> Query {
+        Query {
+            explain: q.explain,
+            ignore_filter: q.ignore_filter,
+            source: q.source.clone(),
+            steps: q
+                .steps
+                .iter()
+                .map(|step| match step {
+                    Step::Filter(p) => Step::Filter(bind_pred_params(p, params)),
+                    other => other.clone(),
+                })
+                .collect(),
+        }
+    };
+    match stmt {
+        Stmt::Query(q) => Stmt::Query(bind_query(q)),
+        Stmt::Let { name, query } => Stmt::Let {
+            name: name.clone(),
+            query: bind_query(query),
+        },
+        Stmt::Insert {
+            collection,
+            records,
+            edges,
+        } => Stmt::Insert {
+            collection: collection.clone(),
+            records: records
+                .iter()
+                .map(|r| bind_record_params(r, params))
+                .collect(),
+            edges: edges
+                .iter()
+                .map(|e| InsertEdge {
+                    rel: e.rel.clone(),
+                    target: match &e.target {
+                        EdgeTarget::Page(p) => EdgeTarget::Page(p.clone()),
+                        EdgeTarget::Value(v) => EdgeTarget::Value(bind_val(v)),
+                    },
+                })
+                .collect(),
+        },
+        Stmt::AppendFacts { records } => Stmt::AppendFacts {
+            records: records
+                .iter()
+                .map(|r| bind_record_params(r, params))
+                .collect(),
+        },
+        Stmt::AppendEdges { edges } => Stmt::AppendEdges {
+            edges: edges
+                .iter()
+                .map(|e| crate::ast::EdgeLit {
+                    rel: e.rel.clone(),
+                    from: bind_val(&e.from),
+                    to: bind_val(&e.to),
+                })
+                .collect(),
+        },
+        Stmt::Update {
+            collection,
+            pred,
+            cas,
+            cas_each,
+            record,
+        } => Stmt::Update {
+            collection: collection.clone(),
+            pred: pred.as_ref().map(|p| bind_pred_params(p, params)),
+            cas: cas.clone(),
+            cas_each: *cas_each,
+            record: bind_record_params(record, params),
+        },
+        Stmt::Delete {
+            collection,
+            pred,
+            cas,
+            cas_each,
+        } => Stmt::Delete {
+            collection: collection.clone(),
+            pred: bind_pred_params(pred, params),
+            cas: cas.clone(),
+            cas_each: *cas_each,
+        },
+        Stmt::DeleteEdge { rel, from, to } => Stmt::DeleteEdge {
+            rel: rel.clone(),
+            from: bind_val(from),
+            to: bind_val(to),
+        },
+        other => other.clone(),
     }
 }
 
@@ -528,44 +756,51 @@ pub(crate) fn eval_window(
         return rows;
     }
 
-    let by_keys: Vec<String> = by.iter().map(|b| b.as_str()).collect();
-    let order_keys: Vec<(String, bool)> =
-        order.iter().map(|s| (s.field.as_str(), s.desc)).collect();
-    let target_field: Option<String> = field.map(|f| f.as_str());
+    let total_len = rows.len();
+    let by_keys: Vec<std::borrow::Cow<'_, str>> = by.iter().map(|b| b.as_cow_str()).collect();
+    let order_keys: Vec<(std::borrow::Cow<'_, str>, bool)> =
+        order.iter().map(|s| (s.field.as_cow_str(), s.desc)).collect();
+    let target_field: Option<std::borrow::Cow<'_, str>> = field.map(|f| f.as_cow_str());
     let tf: &str = target_field.as_deref().unwrap_or_default();
 
-    let mut partition_keys: Vec<Vec<Cell>> = Vec::new();
-    let mut partitions: FxHashMap<Vec<Cell>, Vec<Row>> = FxHashMap::default();
-    let mut key_buf: Vec<Cell> = Vec::with_capacity(by_keys.len());
+    let partition_vec: Vec<Vec<Row>> = if by_keys.is_empty() {
+        vec![rows]
+    } else {
+        let mut partition_keys: Vec<Vec<Cell>> = Vec::new();
+        let mut partitions: FxHashMap<Vec<Cell>, Vec<Row>> = FxHashMap::default();
+        let mut key_buf: Vec<Cell> = Vec::with_capacity(by_keys.len());
 
-    for row in rows {
-        key_buf.clear();
-        for bk in &by_keys {
-            key_buf.push(
-                row.get(bk.as_str())
-                    .map(Cell::clone_for_borrow)
-                    .unwrap_or(Cell::Null),
-            );
+        for row in rows {
+            key_buf.clear();
+            for bk in &by_keys {
+                key_buf.push(
+                    row.get(bk.as_ref())
+                        .map(Cell::clone_for_borrow)
+                        .unwrap_or(Cell::Null),
+                );
+            }
+            if let Some(part) = partitions.get_mut(&key_buf) {
+                part.push(row);
+            } else {
+                let key = key_buf.clone();
+                partition_keys.push(key.clone());
+                partitions.insert(key, vec![row]);
+            }
         }
-        if let Some(part) = partitions.get_mut(&key_buf) {
-            part.push(row);
-        } else {
-            let key = key_buf.clone();
-            partition_keys.push(key.clone());
-            partitions.insert(key, vec![row]);
-        }
-    }
+        partition_keys
+            .into_iter()
+            .map(|pkey| partitions.remove(&pkey).unwrap_or_default())
+            .collect()
+    };
 
-    let mut result_rows = Vec::new();
+    let mut result_rows = Vec::with_capacity(total_len);
 
-    for pkey in partition_keys {
-        let mut part = partitions.remove(&pkey).unwrap_or_default();
-
+    for mut part in partition_vec {
         if !order_keys.is_empty() {
             part.sort_by(|a, b| {
                 for (ok, desc) in &order_keys {
-                    let av = a.get(ok.as_str()).unwrap_or(&Cell::Null);
-                    let bv = b.get(ok.as_str()).unwrap_or(&Cell::Null);
+                    let av = a.get(ok.as_ref()).unwrap_or(&Cell::Null);
+                    let bv = b.get(ok.as_ref()).unwrap_or(&Cell::Null);
                     let ord = cmp_sort(av, bv);
                     let ord = if *desc { ord.reverse() } else { ord };
                     if ord != std::cmp::Ordering::Equal {
@@ -587,8 +822,8 @@ pub(crate) fn eval_window(
                 for i in 0..n {
                     if i > 0 && !order_keys.is_empty() {
                         let all_equal = order_keys.iter().all(|(ok, _)| {
-                            let prev = part[i - 1].get(ok.as_str()).unwrap_or(&Cell::Null);
-                            let curr = part[i].get(ok.as_str()).unwrap_or(&Cell::Null);
+                            let prev = part[i - 1].get(ok.as_ref()).unwrap_or(&Cell::Null);
+                            let curr = part[i].get(ok.as_ref()).unwrap_or(&Cell::Null);
                             cmp_sort(prev, curr) == std::cmp::Ordering::Equal
                         });
                         if !all_equal {
@@ -605,8 +840,8 @@ pub(crate) fn eval_window(
                 for i in 0..n {
                     if i > 0 && !order_keys.is_empty() {
                         let all_equal = order_keys.iter().all(|(ok, _)| {
-                            let prev = part[i - 1].get(ok.as_str()).unwrap_or(&Cell::Null);
-                            let curr = part[i].get(ok.as_str()).unwrap_or(&Cell::Null);
+                            let prev = part[i - 1].get(ok.as_ref()).unwrap_or(&Cell::Null);
+                            let curr = part[i].get(ok.as_ref()).unwrap_or(&Cell::Null);
                             cmp_sort(prev, curr) == std::cmp::Ordering::Equal
                         });
                         if !all_equal {

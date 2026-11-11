@@ -201,8 +201,7 @@ impl FtsIndex {
     /// the whole edit. A removal of a position the base does not hold is a
     /// no-op under `(postings ∪ adds) \ dels`.
     fn note_del(&mut self, tok: &str, row_idx: usize) {
-        if self.postings.len() <= 64
-            && (self.adds.is_empty() || !self.adds.contains_key(tok))
+        if (self.adds.is_empty() || !self.adds.contains_key(tok))
             && (self.dels.is_empty() || !self.dels.contains_key(tok))
             && let Some(list) = self.postings.get_mut(tok)
         {
@@ -236,8 +235,7 @@ impl FtsIndex {
 
     #[inline]
     fn note_del_tail(&mut self, tok: &str, last: usize) {
-        if self.postings.len() <= 64
-            && (self.adds.is_empty() || !self.adds.contains_key(tok))
+        if (self.adds.is_empty() || !self.adds.contains_key(tok))
             && let Some(list) = self.postings.get_mut(tok)
             && list.last() == Some(&last)
         {
@@ -252,20 +250,6 @@ impl FtsIndex {
 
     #[inline]
     fn note_move_from_tail(&mut self, tok: &str, p: usize, last: usize) {
-        if self.postings.len() > 64 {
-            if !self.dels.is_empty() {
-                cancel(&mut self.dels, tok, p);
-            }
-            let len_a = push_pending(&mut self.adds, &self.postings, tok, p);
-            if !self.adds.is_empty() {
-                cancel(&mut self.adds, tok, last);
-            }
-            let len_d = push_pending(&mut self.dels, &self.postings, tok, last);
-            if len_a + len_d > FOLD_AFTER {
-                self.fold_if_pending(tok);
-            }
-            return;
-        }
         if (self.adds.is_empty() || !self.adds.contains_key(tok))
             && (self.dels.is_empty() || !self.dels.contains_key(tok))
             && let Some(list) = self.postings.get_mut(tok)
@@ -565,7 +549,7 @@ impl FtsIndex {
         let nterms = read_u32(bytes, &mut i)? as usize;
         let mut postings = FxHashMap::with_capacity_and_hasher(nterms, Default::default());
         for _ in 0..nterms {
-            let tok = Arc::from(read_str(bytes, &mut i)?);
+            let tok = read_arc_str(bytes, &mut i)?;
             let n = read_u32(bytes, &mut i)? as usize;
             let mut list = SmallVec::with_capacity(n);
             for _ in 0..n {
@@ -606,7 +590,7 @@ fn read_u64(b: &[u8], i: &mut usize) -> Result<u64, Error> {
     Ok(v)
 }
 
-fn read_str(b: &[u8], i: &mut usize) -> Result<String, Error> {
+fn read_str_ref<'a>(b: &'a [u8], i: &mut usize) -> Result<&'a str, Error> {
     let n = read_u32(b, i)? as usize;
     let end = i.saturating_add(n);
     if end > b.len() {
@@ -614,7 +598,15 @@ fn read_str(b: &[u8], i: &mut usize) -> Result<String, Error> {
     }
     let s = std::str::from_utf8(&b[*i..end]).map_err(io_err)?;
     *i = end;
-    Ok(s.to_string())
+    Ok(s)
+}
+
+fn read_str(b: &[u8], i: &mut usize) -> Result<String, Error> {
+    Ok(read_str_ref(b, i)?.to_string())
+}
+
+fn read_arc_str(b: &[u8], i: &mut usize) -> Result<Arc<str>, Error> {
+    Ok(Arc::from(read_str_ref(b, i)?))
 }
 
 #[allow(dead_code)]
@@ -750,9 +742,7 @@ fn push_pending(
         }
         list.len()
     } else {
-        let key = if postings.len() <= 64
-            && let Some((k, _)) = postings.get_key_value(tok)
-        {
+        let key = if let Some((k, _)) = postings.get_key_value(tok) {
             Arc::clone(k)
         } else {
             Arc::from(tok)
@@ -921,6 +911,7 @@ pub fn fts_path(data: &Path, name: &str) -> PathBuf {
 
 /// Persist a collection's postings. Pending edits are folded first, so the file
 /// stays a plain base list and the on-disk format is unchanged.
+#[allow(dead_code)]
 pub fn write_fts(
     data: &Path,
     name: &str,
@@ -928,19 +919,35 @@ pub fn write_fts(
     generation: u64,
     nrows: u64,
 ) -> Result<(), Error> {
+    write_fts_ext(data, name, idx, generation, nrows, true)
+}
+
+pub(crate) fn write_fts_ext(
+    data: &Path,
+    name: &str,
+    idx: &mut FtsIndex,
+    generation: u64,
+    nrows: u64,
+    sync_parent: bool,
+) -> Result<(), Error> {
     let dir = fts_dir(data);
     fs::create_dir_all(&dir).map_err(io_err)?;
     let path = fts_path(data, name);
     let tmp = path.with_extension("bin.tmp");
     idx.fold_all();
     let body = idx.encode(generation, nrows);
-    crate::persist::write_through_tmp(&path, &tmp, &body)
+    crate::persist::write_through_tmp(&path, &tmp, &body)?;
+    if sync_parent {
+        crate::persist::sync_dir_checked(&dir)?;
+    }
+    Ok(())
 }
 
 pub fn read_fts(data: &Path, name: &str) -> Result<(u64, u64, FtsIndex), Error> {
     let path = fts_path(data, name);
     let mut f = File::open(&path).map_err(io_err)?;
-    let mut buf = Vec::new();
+    let cap = f.metadata().map(|m| m.len() as usize).unwrap_or(0);
+    let mut buf = Vec::with_capacity(cap);
     f.read_to_end(&mut buf).map_err(io_err)?;
     FtsIndex::decode(&buf)
 }

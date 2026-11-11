@@ -176,12 +176,22 @@ fn write_hello<W: Write>(w: &mut W, token: &str, since: u64) -> Result<(), Error
     if token.len() > MAX_TOKEN {
         return Err(Error::runtime("wal ship: token too long"));
     }
-    let mut buf = Vec::with_capacity(4 + 2 + token.len() + 8);
-    buf.extend_from_slice(&PROTO_MAGIC);
-    buf.extend_from_slice(&(token.len() as u16).to_le_bytes());
-    buf.extend_from_slice(token.as_bytes());
-    buf.extend_from_slice(&since.to_le_bytes());
-    w.write_all(&buf).map_err(io_err)?;
+    let total = 4 + 2 + token.len() + 8;
+    if total <= 64 {
+        let mut buf = [0u8; 64];
+        buf[0..4].copy_from_slice(&PROTO_MAGIC);
+        buf[4..6].copy_from_slice(&(token.len() as u16).to_le_bytes());
+        buf[6..6 + token.len()].copy_from_slice(token.as_bytes());
+        buf[6 + token.len()..total].copy_from_slice(&since.to_le_bytes());
+        w.write_all(&buf[..total]).map_err(io_err)?;
+    } else {
+        let mut buf = Vec::with_capacity(total);
+        buf.extend_from_slice(&PROTO_MAGIC);
+        buf.extend_from_slice(&(token.len() as u16).to_le_bytes());
+        buf.extend_from_slice(token.as_bytes());
+        buf.extend_from_slice(&since.to_le_bytes());
+        w.write_all(&buf).map_err(io_err)?;
+    }
     w.flush().map_err(io_err)?;
     Ok(())
 }
@@ -228,11 +238,16 @@ fn client_config(tls: &TlsClient) -> Result<Arc<ClientConfig>, Error> {
     match tls {
         TlsClient::Off => Err(Error::runtime("wal ship: tls off")),
         TlsClient::Insecure => {
-            let cfg = ClientConfig::builder()
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(NoVerify))
-                .with_no_client_auth();
-            Ok(Arc::new(cfg))
+            static INSECURE_CFG: std::sync::OnceLock<Arc<ClientConfig>> =
+                std::sync::OnceLock::new();
+            Ok(Arc::clone(INSECURE_CFG.get_or_init(|| {
+                Arc::new(
+                    ClientConfig::builder()
+                        .dangerous()
+                        .with_custom_certificate_verifier(Arc::new(NoVerify))
+                        .with_no_client_auth(),
+                )
+            })))
         }
         TlsClient::CaPem(pem) => {
             let mut roots = RootCertStore::empty();
@@ -271,7 +286,10 @@ fn server_config(tls: &TlsServer) -> Result<Arc<ServerConfig>, Error> {
 }
 
 fn install_crypto() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    static CRYPTO_INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    CRYPTO_INIT.get_or_init(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
 }
 
 #[derive(Debug)]
@@ -429,11 +447,33 @@ fn handle_io<S: Read + Write>(
             frames.len()
         )));
     }
-    stream
-        .write_all(&(frames.len() as u64).to_le_bytes())
-        .map_err(io_err)?;
-    if !frames.is_empty() {
-        stream.write_all(&frames).map_err(io_err)?;
+    let len_bytes = (frames.len() as u64).to_le_bytes();
+    if frames.is_empty() {
+        stream.write_all(&len_bytes).map_err(io_err)?;
+    } else {
+        let mut head_done = 0usize;
+        let mut body_done = 0usize;
+        while head_done < 8 || body_done < frames.len() {
+            let n = if head_done < 8 {
+                let slices = [
+                    std::io::IoSlice::new(&len_bytes[head_done..]),
+                    std::io::IoSlice::new(&frames[body_done..]),
+                ];
+                stream.write_vectored(&slices).map_err(io_err)?
+            } else {
+                stream.write(&frames[body_done..]).map_err(io_err)?
+            };
+            if n == 0 {
+                return Err(Error::runtime("wal ship: write zero"));
+            }
+            let head_rem = 8 - head_done;
+            if n <= head_rem {
+                head_done += n;
+            } else {
+                head_done = 8;
+                body_done += n - head_rem;
+            }
+        }
     }
     stream.flush().map_err(io_err)?;
     Ok(())

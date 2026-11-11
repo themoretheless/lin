@@ -182,13 +182,13 @@ impl ToCell for bool {
 
 impl ToCell for [f32] {
     fn to_cell(&self) -> Cell {
-        Cell::vec_arc(self.to_vec())
+        Cell::Vec(std::sync::Arc::from(self))
     }
 }
 
 impl ToCell for Vec<f32> {
     fn to_cell(&self) -> Cell {
-        Cell::vec_arc(self.clone())
+        Cell::Vec(std::sync::Arc::from(self.as_slice()))
     }
 }
 

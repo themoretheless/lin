@@ -132,49 +132,58 @@ impl<'a> Parser<'a> {
         &self.src[self.pos..]
     }
 
+    #[inline]
     fn peek(&self) -> Option<char> {
-        self.rest().chars().next()
+        let b = *self.src.as_bytes().get(self.pos)?;
+        if b < 0x80 {
+            Some(b as char)
+        } else {
+            self.rest().chars().next()
+        }
     }
 
+    #[inline]
     fn bump(&mut self) -> Option<char> {
-        let mut cs = self.rest().chars();
-        let c = cs.next()?;
-        self.pos += c.len_utf8();
-        Some(c)
+        let b = *self.src.as_bytes().get(self.pos)?;
+        if b < 0x80 {
+            self.pos += 1;
+            Some(b as char)
+        } else {
+            let mut cs = self.rest().chars();
+            let c = cs.next()?;
+            self.pos += c.len_utf8();
+            Some(c)
+        }
     }
 
     fn err(&self, msg: impl Into<String>) -> Error {
         Error::at(self.pos, msg)
     }
 
+    #[inline]
     fn skip(&mut self) {
-        loop {
-            self.skip_ws();
-            if self.rest().starts_with("--") {
-                while let Some(c) = self.peek() {
-                    self.bump();
-                    if c == '\n' {
-                        break;
-                    }
-                }
-                continue;
-            }
-            break;
-        }
-    }
-
-    fn skip_ws(&mut self) {
-        while self.peek().is_some_and(|c| c.is_whitespace()) {
-            self.bump();
-        }
+        self.pos = self.skip_offset();
     }
 
     fn skip_offset(&self) -> usize {
         let mut i = self.pos;
         let bytes = self.src.as_bytes();
         loop {
-            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-                i += 1;
+            while i < bytes.len() {
+                let b = bytes[i];
+                if b.is_ascii_whitespace() {
+                    i += 1;
+                } else if b >= 0x80 {
+                    if let Some(c) = self.src[i..].chars().next()
+                        && c.is_whitespace()
+                    {
+                        i += c.len_utf8();
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                }
             }
             if i + 1 < bytes.len() && bytes[i] == b'-' && bytes[i + 1] == b'-' {
                 i += 2;
@@ -322,7 +331,65 @@ impl<'a> Parser<'a> {
             return Err(self.err("expected string"));
         }
         self.bump();
-        let mut out = String::new();
+        let start = self.pos;
+        let bytes = self.src.as_bytes();
+        let mut i = start;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'"' => {
+                    self.pos = i + 1;
+                    return Ok(self.src[start..i].to_owned());
+                }
+                b'\\' => break,
+                _ => i += 1,
+            }
+        }
+        let mut out = String::with_capacity((i - start) + 16);
+        out.push_str(&self.src[start..i]);
+        self.pos = i;
+        loop {
+            match self.bump() {
+                None => return Err(self.err("unterminated string")),
+                Some('"') => return Ok(out),
+                Some('\\') => match self.bump() {
+                    Some('n') => out.push('\n'),
+                    Some('t') => out.push('\t'),
+                    Some('\\') => out.push('\\'),
+                    Some('"') => out.push('"'),
+                    Some(c) => out.push(c),
+                    None => return Err(self.err("unterminated string")),
+                },
+                Some(c) => out.push(c),
+            }
+        }
+    }
+
+    fn expect_string_arc(&mut self) -> Result<std::sync::Arc<str>, Error> {
+        self.skip();
+        if self.peek() != Some('"') {
+            return Err(self.err("expected string"));
+        }
+        self.bump();
+        let start = self.pos;
+        let bytes = self.src.as_bytes();
+        let mut i = start;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'"' => {
+                    self.pos = i + 1;
+                    return Ok(std::sync::Arc::from(&self.src[start..i]));
+                }
+                b'\\' => break,
+                _ => i += 1,
+            }
+        }
+        Ok(std::sync::Arc::from(self.expect_string_escaped_tail(start, i)?))
+    }
+
+    fn expect_string_escaped_tail(&mut self, start: usize, esc_pos: usize) -> Result<String, Error> {
+        let mut out = String::with_capacity((esc_pos - start) + 16);
+        out.push_str(&self.src[start..esc_pos]);
+        self.pos = esc_pos;
         loop {
             match self.bump() {
                 None => return Err(self.err("unterminated string")),
@@ -359,86 +426,64 @@ impl<'a> Parser<'a> {
 
     fn parse_stmt_inner(&mut self) -> Result<Stmt, Error> {
         self.skip();
-        if self.eat_kw("let") {
-            return self.parse_let();
-        }
-        if self.eat_kw("delete") {
-            return self.parse_delete();
-        }
-        if self.eat_kw("append") {
-            return self.parse_append();
-        }
-        if self.eat_kw("insert") {
-            return self.parse_insert();
-        }
-        if self.eat_kw("update") {
-            return self.parse_update();
-        }
-        if self.eat_kw("reembed") {
-            return self.parse_reembed();
-        }
-        if self.eat_kw("index") {
-            return Ok(Stmt::Decl(self.parse_index()?));
-        }
-        if self.eat_kw("owned") {
-            return Ok(Stmt::Decl(self.parse_owned()?));
-        }
-        if self.eat_kw("col") {
-            return Ok(Stmt::Decl(self.parse_col()?));
-        }
-        if self.eat_kw("rel") {
-            return Ok(Stmt::Decl(self.parse_rel()?));
-        }
-        if self.eat_kw("fk") {
-            return Ok(Stmt::Decl(self.parse_fk()?));
-        }
-        if self.eat_kw("guard") {
-            return Ok(Stmt::Decl(self.parse_guard()?));
-        }
-        if self.eat_kw("filter") {
-            return Ok(Stmt::Decl(self.parse_filter()?));
-        }
-        if self.eat_kw("unfilter") {
-            let collection = self.expect_ident()?;
-            return Ok(Stmt::Decl(Decl::Filter {
-                collection,
-                pred: None,
-                src: String::new(),
-            }));
-        }
-        if self.eat_kw("idb") {
-            return self.parse_idb();
-        }
-        if self.eat_kw("pull") {
-            self.expect_kw("idb")?;
-            self.expect_kw("since")?;
-            let since = self.expect_int()?;
-            let take = if self.eat_kw("take") {
-                Some(self.expect_int()?)
-            } else {
-                None
-            };
-            return Ok(Stmt::IdbPull { since, take });
-        }
-        if self.eat_kw("push") {
-            self.expect_kw("idb")?;
-            return Ok(Stmt::IdbPush);
-        }
-        if self.eat_kw("pin") {
-            let name = self.expect_string()?;
-            return Ok(Stmt::Pin { name });
-        }
-        if self.eat_kw("unpin") {
-            let name = self.expect_string()?;
-            return Ok(Stmt::Unpin { name });
-        }
-        if self.eat_kw("snapshot") {
-            let name = self.expect_string()?;
-            return Ok(Stmt::Snapshot { name });
-        }
-        if self.eat_kw("restore") {
-            let name = self.expect_string()?;
-            return Ok(Stmt::Restore { name });
+        let save = self.pos;
+        if let Some(kw) = self.eat_ident_str() {
+            match kw {
+                "let" => return self.parse_let(),
+                "delete" => return self.parse_delete(),
+                "append" => return self.parse_append(),
+                "insert" => return self.parse_insert(),
+                "update" => return self.parse_update(),
+                "reembed" => return self.parse_reembed(),
+                "index" => return Ok(Stmt::Decl(self.parse_index()?)),
+                "owned" => return Ok(Stmt::Decl(self.parse_owned()?)),
+                "col" => return Ok(Stmt::Decl(self.parse_col()?)),
+                "rel" => return Ok(Stmt::Decl(self.parse_rel()?)),
+                "fk" => return Ok(Stmt::Decl(self.parse_fk()?)),
+                "guard" => return Ok(Stmt::Decl(self.parse_guard()?)),
+                "filter" => return Ok(Stmt::Decl(self.parse_filter()?)),
+                "unfilter" => {
+                    let collection = self.expect_ident()?;
+                    return Ok(Stmt::Decl(Decl::Filter {
+                        collection,
+                        pred: None,
+                        src: String::new(),
+                    }));
+                }
+                "idb" => return self.parse_idb(),
+                "pull" => {
+                    self.expect_kw("idb")?;
+                    self.expect_kw("since")?;
+                    let since = self.expect_int()?;
+                    let take = if self.eat_kw("take") {
+                        Some(self.expect_int()?)
+                    } else {
+                        None
+                    };
+                    return Ok(Stmt::IdbPull { since, take });
+                }
+                "push" => {
+                    self.expect_kw("idb")?;
+                    return Ok(Stmt::IdbPush);
+                }
+                "pin" => {
+                    let name = self.expect_string()?;
+                    return Ok(Stmt::Pin { name });
+                }
+                "unpin" => {
+                    let name = self.expect_string()?;
+                    return Ok(Stmt::Unpin { name });
+                }
+                "snapshot" => {
+                    let name = self.expect_string()?;
+                    return Ok(Stmt::Snapshot { name });
+                }
+                "restore" => {
+                    let name = self.expect_string()?;
+                    return Ok(Stmt::Restore { name });
+                }
+                _ => self.pos = save,
+            }
         }
         Ok(Stmt::Query(self.parse_query()?))
     }
@@ -1229,38 +1274,63 @@ impl<'a> Parser<'a> {
 
     fn parse_value(&mut self) -> Result<Value, Error> {
         self.skip();
-        let saved = self.pos;
-        if self.eat_kw("timestamp") && self.eat_char('(') {
-            let millis = self.expect_int()?;
-            self.expect_char(')')?;
-            return Ok(Value::Timestamp(millis));
+        let Some(&b) = self.src.as_bytes().get(self.pos) else {
+            return Err(self.err("expected value"));
+        };
+        if b == b'"' {
+            return Ok(Value::String(self.expect_string_arc()?));
         }
-        // Bare `timestamp` retains its existing name semantics.
-        self.pos = saved;
-        if self.eat_kw("now") {
-            if self.eat_char('-') {
-                let dur = self.expect_duration()?;
-                return Ok(Value::NowMinus(dur));
+        if b.is_ascii_digit()
+            || (b == b'-'
+                && self
+                    .src
+                    .as_bytes()
+                    .get(self.pos + 1)
+                    .is_some_and(u8::is_ascii_digit))
+        {
+            if let Some(v) = self.try_number()? {
+                return Ok(v);
             }
-            return Ok(Value::Now);
         }
-        if self.eat_kw("ago") {
-            return self.parse_ago();
+        if b == b'$' {
+            self.pos += 1;
+            if !self.starts_ident() {
+                return Err(self.err("expected parameter name after `$`"));
+            }
+            let start = self.pos;
+            let bytes = self.src.as_bytes();
+            let mut end = start + 1;
+            while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+                end += 1;
+            }
+            self.pos = end;
+            return Ok(Value::Param(std::sync::Arc::from(&self.src[start..end])));
         }
-        if self.eat_kw("true") {
-            return Ok(Value::Bool(true));
-        }
-        if self.eat_kw("false") {
-            return Ok(Value::Bool(false));
-        }
-        if self.peek() == Some('"') {
-            return Ok(Value::String(self.expect_string()?.into()));
-        }
-        if let Some(v) = self.try_number()? {
-            return Ok(v);
-        }
-        if self.starts_ident() {
-            return Ok(Value::Name(self.expect_ident()?));
+        if is_ident_start(b as char) {
+            let saved = self.pos;
+            let ident = self.expect_ident_str()?;
+            match ident {
+                "true" => return Ok(Value::Bool(true)),
+                "false" => return Ok(Value::Bool(false)),
+                "now" => {
+                    if self.eat_char('-') {
+                        let dur = self.expect_duration()?;
+                        return Ok(Value::NowMinus(dur));
+                    }
+                    return Ok(Value::Now);
+                }
+                "ago" => return self.parse_ago(),
+                "timestamp" => {
+                    if self.eat_char('(') {
+                        let millis = self.expect_int()?;
+                        self.expect_char(')')?;
+                        return Ok(Value::Timestamp(millis));
+                    }
+                    self.pos = saved;
+                    return Ok(Value::Name(self.expect_ident()?));
+                }
+                _ => return Ok(Value::Name(ident.to_owned())),
+            }
         }
         Err(self.err("expected value"))
     }

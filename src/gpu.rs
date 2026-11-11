@@ -190,7 +190,6 @@ pub(crate) struct BuiltinKernels {
     pub(crate) sort: Option<ComputeKernel>,
     pub(crate) sum: Option<ComputeKernel>,
     pub(crate) rrf: Option<ComputeKernel>,
-    pub(crate) graph: Option<ComputeKernel>,
     pub(crate) weights: Option<ComputeKernel>,
     pub(crate) walk: Option<ComputeKernel>,
     pub(crate) match_dfs: Option<ComputeKernel>,
@@ -1632,12 +1631,16 @@ impl GpuCompute {
         let mut keys = Vec::with_capacity(cells.len() * 5);
         let mut text = Vec::new();
         for cell in cells {
-            let (kind, value, string) = match cell {
+            let mut compact_buf: Option<String> = None;
+            let (kind, value, str_ref) = match cell {
                 Cell::Null => (0u32, 0u64, None),
-                Cell::Text(s) => (1, 0, Some(s.to_string())),
-                Cell::SmallText(s) => (1, 0, Some(s.as_str().to_string())),
+                Cell::Text(s) => (1, 0, Some(s.as_ref())),
+                Cell::SmallText(s) => (1, 0, Some(s.as_str())),
                 Cell::Bool(b) => (2, *b as u64, None),
-                Cell::Vec(_) => (3, 0, Some(cell.compact())),
+                Cell::Vec(_) => {
+                    let s = compact_buf.insert(cell.compact());
+                    (3, 0, Some(s.as_str()))
+                }
                 _ => {
                     let v = cell.as_f64().unwrap_or(0.0);
                     if v.is_nan() {
@@ -1654,12 +1657,12 @@ impl GpuCompute {
                 }
             };
             let offset = text.len();
-            let length = string.as_ref().map_or(0, String::len);
+            let length = str_ref.map_or(0, str::len);
             if length > max_words.saturating_sub(offset) {
                 return Err(Error::runtime("GPU sort text exceeds buffer limits"));
             }
-            if let Some(string) = string {
-                text.extend(string.bytes().map(u32::from));
+            if let Some(s) = str_ref {
+                text.extend(s.bytes().map(u32::from));
             }
             keys.extend([
                 kind,
@@ -1858,63 +1861,6 @@ impl GpuCompute {
     pub fn graph_dispatches(&self) -> u64 {
         self.graph_dispatches
             .load(std::sync::atomic::Ordering::Relaxed)
-    }
-    pub(crate) fn graph_edge_mask(
-        &self,
-        sources: &[u32],
-        frontier: &[u32],
-    ) -> Result<Vec<bool>, Error> {
-        if sources.is_empty() || frontier.is_empty() {
-            return Ok(vec![false; sources.len()]);
-        }
-        let mut frontier = frontier.to_vec();
-        frontier.sort_unstable();
-        frontier.dedup();
-        let limits = self.device().limits();
-        let max_words = (limits.max_storage_buffer_binding_size as usize)
-            .min(limits.max_buffer_size as usize)
-            / 4;
-        if max_words == 0 {
-            return Err(Error::runtime("GPU limits cannot hold graph input"));
-        }
-        let chunk = max_words.min(limits.max_compute_workgroups_per_dimension as usize * 64);
-        if chunk == 0 {
-            return Err(Error::runtime("GPU limits cannot dispatch graph input"));
-        }
-        let kernel =
-            self.builtin_kernel(|k| &mut k.graph, include_str!("shaders/graph.wgsl"), "main")?;
-        let mut result = vec![false; sources.len()];
-        for frontier_chunk in frontier.chunks(max_words) {
-            let frontier_buffer = self.storage_buffer(bytemuck::cast_slice(frontier_chunk))?;
-            for (tile, keys) in sources.chunks(chunk).enumerate() {
-                let source = self.storage_buffer(bytemuck::cast_slice(keys))?;
-                let output = self.zeroed_storage_buffer((keys.len() * 4) as u64)?;
-                let buffers = [&source, &frontier_buffer, &output];
-                let group = self.checked(|device, _| {
-                    let entries: Vec<_> = buffers
-                        .iter()
-                        .enumerate()
-                        .map(|(i, b)| wgpu::BindGroupEntry {
-                            binding: i as u32,
-                            resource: b.as_entire_binding(),
-                        })
-                        .collect();
-                    device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some("graph frontier"),
-                        layout: &kernel.bind_group_layout(0),
-                        entries: &entries,
-                    })
-                })?;
-                self.dispatch(&kernel, &[&group], [keys.len().div_ceil(64) as u32, 1, 1])?;
-                self.graph_dispatches
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let bytes = self.read_buffer(&output)?;
-                for (i, &matched) in bytemuck::cast_slice::<u8, u32>(&bytes).iter().enumerate() {
-                    result[tile * chunk + i] |= matched != 0;
-                }
-            }
-        }
-        Ok(result)
     }
 }
 

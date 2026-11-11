@@ -1,745 +1,38 @@
+//! In-memory multi-model storage engine (`Store`): row collections, secondary/FTS/HNSW index hooks, and MVCC snapshots.
+
+pub mod checkpoint;
+pub mod columnar;
+pub mod edges;
+pub mod value;
+
+#[allow(unused_imports)]
+pub use crate::catalog::catalog_hash;
+pub(crate) use checkpoint::StoreOpenPhases;
+pub use columnar::DictColumn;
+pub use edges::Edge;
+pub(crate) use value::intern_wing;
+#[allow(unused_imports)]
+pub use value::{
+    Cell, InlineStr, Row, RowExt, acquire_row, compact_row, content_hash_arc, fnv1a64, now_ms,
+    project_fields, release_id_title_rows, row_byte_size, row_text,
+};
+
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use rustc_hash::{FxHashMap, FxHashSet};
-use serde::{Deserialize, Serialize};
 
-use crate::ast::{Decl, TypeExpr};
 use crate::catalog::Catalog;
-use crate::cold;
 use crate::error::Error;
 use crate::index::LiveIndex;
-use crate::persist::{
-    self, ColSnap, Head, IndexSnap, LogRecord, OpenMemOpts, Pack, Persist, RelSnap, Snapshot,
-    SnapshotRef,
+use crate::persist::{self, ColSnap, IndexSnap, Pack, RelSnap};
+
+use columnar::{swap_pop_at, swap_push_at};
+use edges::FactKey;
+use value::{
+    DocSeed, doc_row, docs_hot_field, next_docs_epoch, order_row, row_id_title, spo_key, user_row,
 };
-
-/// Construct a fresh `Row` (`BTreeMap::new()` is `const` and does not allocate on the heap).
-#[inline]
-pub const fn acquire_row() -> Row {
-    BTreeMap::new()
-}
-
-static NEXT_DOCS_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-
-#[inline]
-fn next_docs_epoch() -> u64 {
-    NEXT_DOCS_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-}
-
-struct RecycledIdTitle {
-    docs_epoch: u64,
-    filter_tag: u64,
-    first_idx: usize,
-    last_idx: usize,
-    rows: Vec<Row>,
-}
-
-static ID_TITLE_POOL: std::sync::Mutex<Option<RecycledIdTitle>> = std::sync::Mutex::new(None);
-
-thread_local! {
-    static LAST_ID_TITLE_META: std::cell::Cell<(u64, u64, usize, usize)> =
-        const { std::cell::Cell::new((0, 0, 0, 0)) };
-    static TLS_SINGLE_ROW_TRASH: std::cell::RefCell<Vec<Row>> =
-        std::cell::RefCell::new(Vec::with_capacity(64));
-}
-
-pub fn release_id_title_rows(rows: Vec<Row>) {
-    let (docs_epoch, filter_tag, first_idx, last_idx) = LAST_ID_TITLE_META.with(|c| c.get());
-    if let Ok(mut guard) = ID_TITLE_POOL.lock() {
-        *guard = Some(RecycledIdTitle {
-            docs_epoch,
-            filter_tag,
-            first_idx,
-            last_idx,
-            rows,
-        });
-    }
-}
-
-pub fn release_single_row(row: Row) {
-    TLS_SINGLE_ROW_TRASH.with(|c| {
-        let mut v = c.borrow_mut();
-        if v.len() >= 64 {
-            v.clear();
-        }
-        v.push(row);
-    });
-}
-
-#[inline]
-fn row_matches_id_title(row: &Row, id: &Arc<str>, title: &Arc<str>) -> bool {
-    if row.len() != 2 {
-        return false;
-    }
-    let mut it = row.iter();
-    let Some((k1, Cell::Text(v1))) = it.next() else {
-        return false;
-    };
-    let Some((k2, Cell::Text(v2))) = it.next() else {
-        return false;
-    };
-    k1 == "id" && k2 == "title" && Arc::ptr_eq(v1, id) && Arc::ptr_eq(v2, title)
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct StoreOpenPhases {
-    pub setup_ms: f64,
-    pub snapshot_ms: f64,
-    pub wal_ms: f64,
-    pub metadata_ms: f64,
-    pub indexes_ms: f64,
-    pub row_maps_ms: f64,
-    pub fts_ms: f64,
-}
-
-/// Compact inline string storage for strings up to 22 bytes.
-///
-/// Stores strings inline without heap allocation or atomic refcounts.
-/// Combined with `Cell`'s 1-byte enum tag, keeps `size_of::<Cell>()` at exactly 24 bytes.
-#[derive(Copy, Clone, Eq)]
-pub struct InlineStr {
-    len: u8,
-    buf: [u8; 22],
-}
-
-impl InlineStr {
-    pub const MAX_LEN: usize = 22;
-
-    #[inline]
-    pub fn try_new(s: &str) -> Option<Self> {
-        let b = s.as_bytes();
-        if b.len() > Self::MAX_LEN {
-            return None;
-        }
-        let mut buf = [0u8; 22];
-        buf[..b.len()].copy_from_slice(b);
-        Some(Self {
-            len: b.len() as u8,
-            buf,
-        })
-    }
-
-    #[inline]
-    pub fn new_truncate(s: &str) -> Self {
-        let b = s.as_bytes();
-        let len = b.len().min(Self::MAX_LEN);
-        let mut buf = [0u8; 22];
-        buf[..len].copy_from_slice(&b[..len]);
-        Self {
-            len: len as u8,
-            buf,
-        }
-    }
-
-    #[inline]
-    pub fn as_str(&self) -> &str {
-        let slice = &self.buf[..self.len as usize];
-        // SAFETY: Only constructed from valid UTF-8 strings
-        unsafe { std::str::from_utf8_unchecked(slice) }
-    }
-
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.len as usize
-    }
-
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-}
-
-impl std::ops::Deref for InlineStr {
-    type Target = str;
-    #[inline]
-    fn deref(&self) -> &str {
-        self.as_str()
-    }
-}
-
-impl std::fmt::Debug for InlineStr {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Debug::fmt(self.as_str(), f)
-    }
-}
-
-impl std::fmt::Display for InlineStr {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(self.as_str(), f)
-    }
-}
-
-impl PartialEq for InlineStr {
-    #[inline]
-    fn eq(&self, other: &Self) -> bool {
-        self.as_str() == other.as_str()
-    }
-}
-
-impl PartialEq<str> for InlineStr {
-    #[inline]
-    fn eq(&self, other: &str) -> bool {
-        self.as_str() == other
-    }
-}
-
-impl PartialEq<&str> for InlineStr {
-    #[inline]
-    fn eq(&self, other: &&str) -> bool {
-        self.as_str() == *other
-    }
-}
-
-impl Ord for InlineStr {
-    #[inline]
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.as_str().cmp(other.as_str())
-    }
-}
-
-impl PartialOrd for InlineStr {
-    #[inline]
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl std::hash::Hash for InlineStr {
-    #[inline]
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.as_str().hash(state);
-    }
-}
-
-impl Serialize for InlineStr {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(self.as_str())
-    }
-}
-
-impl<'de> Deserialize<'de> for InlineStr {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        struct Visitor;
-        impl<'de> serde::de::Visitor<'de> for Visitor {
-            type Value = InlineStr;
-            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter.write_str("a string up to 22 bytes")
-            }
-            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                InlineStr::try_new(v).ok_or_else(|| E::custom("string too long for InlineStr"))
-            }
-        }
-        deserializer.deserialize_str(Visitor)
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "t", content = "v")]
-pub enum Cell {
-    Null,
-    /// Arc so projecting / cloning rows does not deep-copy large strings.
-    Text(Arc<str>),
-    /// Small String Optimization: inline storage for strings <= 22 bytes without heap allocation.
-    SmallText(InlineStr),
-    Int(i64),
-    Float(f64),
-    Bool(bool),
-    Time(i64),
-    /// Dense embedding (L2-normalized by the active embedder).
-    Vec(Arc<[f32]>),
-}
-
-impl PartialEq for Cell {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Cell::Null, Cell::Null) => true,
-            (Cell::Text(a), Cell::Text(b)) => a == b,
-            (Cell::SmallText(a), Cell::SmallText(b)) => a == b,
-            (Cell::Text(a), Cell::SmallText(b)) => a.as_ref() == b.as_str(),
-            (Cell::SmallText(a), Cell::Text(b)) => a.as_str() == b.as_ref(),
-            (Cell::Int(a), Cell::Int(b)) => a == b,
-            (Cell::Float(a), Cell::Float(b)) => a.to_bits() == b.to_bits(),
-            (Cell::Bool(a), Cell::Bool(b)) => a == b,
-            (Cell::Time(a), Cell::Time(b)) => a == b,
-            (Cell::Vec(a), Cell::Vec(b)) => a == b,
-            _ => false,
-        }
-    }
-}
-
-impl Eq for Cell {}
-
-impl std::hash::Hash for Cell {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        match self {
-            Cell::Null => 0u8.hash(state),
-            Cell::Text(s) => {
-                1u8.hash(state);
-                s.as_ref().hash(state);
-            }
-            Cell::SmallText(s) => {
-                1u8.hash(state);
-                s.as_str().hash(state);
-            }
-            Cell::Int(n) => {
-                2u8.hash(state);
-                n.hash(state);
-            }
-            Cell::Float(f) => {
-                3u8.hash(state);
-                f.to_bits().hash(state);
-            }
-            Cell::Bool(b) => {
-                4u8.hash(state);
-                b.hash(state);
-            }
-            Cell::Time(t) => {
-                5u8.hash(state);
-                t.hash(state);
-            }
-            Cell::Vec(v) => {
-                6u8.hash(state);
-                for x in v.as_ref() {
-                    x.to_bits().hash(state);
-                }
-            }
-        }
-    }
-}
-
-impl Cell {
-    pub fn text_arc(s: impl Into<Arc<str>>) -> Self {
-        Cell::Text(s.into())
-    }
-
-    /// Construct a text cell with Small String Optimization (SSO).
-    ///
-    /// Strings up to 22 bytes are stored inline without heap allocations or atomic refcounts.
-    /// Longer strings are stored in `Arc<str>`.
-    pub fn from_text(s: impl AsRef<str>) -> Self {
-        let s = s.as_ref();
-        if let Some(inline) = InlineStr::try_new(s) {
-            Cell::SmallText(inline)
-        } else {
-            Cell::Text(Arc::from(s))
-        }
-    }
-
-    /// Construct an inline text cell if `s` fits within 22 bytes.
-    #[inline]
-    pub fn inline(s: &str) -> Option<Self> {
-        InlineStr::try_new(s).map(Cell::SmallText)
-    }
-
-    pub fn vec_arc(v: impl Into<Arc<[f32]>>) -> Self {
-        Cell::Vec(v.into())
-    }
-
-    pub fn text(&self) -> Option<&str> {
-        match self {
-            Cell::Text(s) => Some(s.as_ref()),
-            Cell::SmallText(s) => Some(s.as_str()),
-            _ => None,
-        }
-    }
-
-    pub fn text_shared(&self) -> Option<Arc<str>> {
-        match self {
-            Cell::Text(s) => Some(Arc::clone(s)),
-            Cell::SmallText(s) => Some(Arc::from(s.as_str())),
-            _ => None,
-        }
-    }
-
-    /// Zero-copy clone for borrow scenarios: just clone the Arc reference, don't copy data.
-    /// For `SmallText`, this copies the 23-byte inline struct without any atomic refcounts.
-    #[inline]
-    pub fn clone_for_borrow(&self) -> Self {
-        match self {
-            Cell::Text(s) => Cell::Text(Arc::clone(s)),
-            Cell::SmallText(s) => Cell::SmallText(*s),
-            Cell::Vec(v) => Cell::Vec(Arc::clone(v)),
-            // Other types are Copy, use standard clone
-            Cell::Int(n) => Cell::Int(*n),
-            Cell::Float(f) => Cell::Float(*f),
-            Cell::Bool(b) => Cell::Bool(*b),
-            Cell::Time(t) => Cell::Time(*t),
-            Cell::Null => Cell::Null,
-        }
-    }
-
-    pub fn as_vec(&self) -> Option<&[f32]> {
-        match self {
-            Cell::Vec(v) => Some(v.as_ref()),
-            _ => None,
-        }
-    }
-
-    pub fn as_f64(&self) -> Option<f64> {
-        match self {
-            Cell::Int(n) => Some(*n as f64),
-            Cell::Float(n) => Some(*n),
-            Cell::Time(n) => Some(*n as f64),
-            _ => None,
-        }
-    }
-
-    pub fn as_int(&self) -> Option<i64> {
-        match self {
-            Cell::Int(n) => Some(*n),
-            _ => None,
-        }
-    }
-
-    #[inline]
-    pub fn as_i64(&self) -> Option<i64> {
-        self.as_int()
-    }
-
-    pub fn as_bool(&self) -> Option<bool> {
-        match self {
-            Cell::Bool(b) => Some(*b),
-            _ => None,
-        }
-    }
-
-    pub fn as_time(&self) -> Option<i64> {
-        match self {
-            Cell::Time(ms) => Some(*ms),
-            _ => None,
-        }
-    }
-
-    pub fn is_null(&self) -> bool {
-        matches!(self, Cell::Null)
-    }
-
-    pub fn compact_into(&self, out: &mut String) {
-        use std::fmt::Write;
-        match self {
-            Cell::Null => out.push_str("null"),
-            Cell::Text(s) => {
-                let _ = write!(out, "{:?}", s.as_ref());
-            }
-            Cell::SmallText(s) => {
-                let _ = write!(out, "{:?}", s.as_str());
-            }
-            Cell::Int(n) => {
-                let _ = write!(out, "{n}");
-            }
-            Cell::Float(n) => {
-                let _ = write!(out, "{n}");
-            }
-            Cell::Bool(b) => {
-                out.push_str(if *b { "true" } else { "false" });
-            }
-            Cell::Time(ms) => {
-                out.push_str(&fmt_iso_millis(*ms));
-            }
-            Cell::Vec(v) => {
-                let _ = write!(out, "vec[{}]", v.len());
-            }
-        }
-    }
-
-    pub fn compact(&self) -> String {
-        let mut out = String::with_capacity(16);
-        self.compact_into(&mut out);
-        out
-    }
-}
-
-impl From<&str> for Cell {
-    #[inline]
-    fn from(s: &str) -> Self {
-        Cell::from_text(s)
-    }
-}
-
-impl From<String> for Cell {
-    #[inline]
-    fn from(s: String) -> Self {
-        Cell::from_text(s)
-    }
-}
-
-impl From<InlineStr> for Cell {
-    #[inline]
-    fn from(s: InlineStr) -> Self {
-        Cell::SmallText(s)
-    }
-}
-
-impl From<Arc<str>> for Cell {
-    #[inline]
-    fn from(s: Arc<str>) -> Self {
-        Cell::Text(s)
-    }
-}
-
-pub type Row = BTreeMap<String, Cell>;
-
-/// Estimated in-memory byte size of a row (keys + values + container overhead).
-#[inline]
-pub fn row_byte_size(row: &Row) -> usize {
-    let mut total = std::mem::size_of::<Row>() + row.len() * 32;
-    for (k, v) in row {
-        total += k.len();
-        total += match v {
-            Cell::Null | Cell::Int(_) | Cell::Float(_) | Cell::Bool(_) | Cell::Time(_) => {
-                std::mem::size_of::<Cell>()
-            }
-            Cell::SmallText(_) => std::mem::size_of::<Cell>(),
-            Cell::Text(s) => std::mem::size_of::<Cell>() + s.len(),
-            Cell::Vec(vec) => std::mem::size_of::<Cell>() + vec.len() * 4,
-        };
-    }
-    total
-}
-
-/// Ergonomics for `match row.cell("col") { Cell::Text(s) => …, Cell::Null => … }`.
-pub trait RowExt {
-    /// Column value, or [`Cell::Null`] if the key is missing.
-    fn cell(&self, key: &str) -> &Cell;
-}
-
-impl RowExt for Row {
-    fn cell(&self, key: &str) -> &Cell {
-        static NULL: Cell = Cell::Null;
-        self.get(key).unwrap_or(&NULL)
-    }
-}
-
-pub fn compact_row(row: &Row) -> String {
-    let mut out = String::with_capacity(64);
-    out.push('{');
-    let mut first = true;
-    for (k, v) in row {
-        if !matches!(v, Cell::Null) {
-            if !first {
-                out.push_str(", ");
-            }
-            first = false;
-            out.push_str(k);
-            out.push_str(": ");
-            v.compact_into(&mut out);
-        }
-    }
-    out.push('}');
-    out
-}
-
-pub fn row_text<'a>(row: &'a Row, key: &str) -> Option<&'a str> {
-    row.get(key).and_then(Cell::text)
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Edge {
-    pub rel: String,
-    pub from: String,
-    pub to: String,
-}
-
-type FactKey = (Arc<str>, Arc<str>, Arc<str>);
-
-/// In-memory dictionary-encoded column for low-cardinality string columns (e.g. `wing`, `layer`).
-///
-/// Stores unique `Arc<str>` values in a compact dictionary vector and per-row `u8` indices.
-/// Achieves an 8x memory reduction on 64-bit platforms (1 byte per row vs 8-16 bytes per Arc<str>),
-/// eliminates cache thrashing, and allows ultra-fast aggregation directly over the index byte slice.
-/// If unique values exceed 255, automatically spills to a flat vector of `Arc<str>`.
-#[derive(Debug, Clone, Default, Eq)]
-pub struct DictColumn {
-    dict: Vec<Arc<str>>,
-    indices: Vec<u8>,
-    spilled: Option<Vec<Arc<str>>>,
-}
-
-impl PartialEq for DictColumn {
-    fn eq(&self, other: &Self) -> bool {
-        if self.len() != other.len() {
-            return false;
-        }
-        for i in 0..self.len() {
-            if self.get_ref(i) != other.get_ref(i) {
-                return false;
-            }
-        }
-        true
-    }
-}
-
-impl DictColumn {
-    pub const fn new() -> Self {
-        Self {
-            dict: Vec::new(),
-            indices: Vec::new(),
-            spilled: None,
-        }
-    }
-
-    #[inline]
-    pub fn len(&self) -> usize {
-        if let Some(spilled) = &self.spilled {
-            spilled.len()
-        } else {
-            self.indices.len()
-        }
-    }
-
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    #[inline]
-    pub fn reserve(&mut self, additional: usize) {
-        if let Some(spilled) = &mut self.spilled {
-            spilled.reserve(additional);
-        } else {
-            self.indices.reserve(additional);
-        }
-    }
-
-    #[inline]
-    pub fn clear(&mut self) {
-        self.dict.clear();
-        self.indices.clear();
-        self.spilled = None;
-    }
-
-    #[inline]
-    pub fn push(&mut self, val: Arc<str>) {
-        if let Some(spilled) = &mut self.spilled {
-            spilled.push(val);
-            return;
-        }
-
-        // Fast path: linear scan of small dictionary (< 16 items)
-        if let Some(pos) = self.dict.iter().position(|x| Arc::ptr_eq(x, &val) || **x == *val) {
-            self.indices.push(pos as u8);
-            return;
-        }
-
-        if self.dict.len() < 255 {
-            let pos = self.dict.len() as u8;
-            self.dict.push(val);
-            self.indices.push(pos);
-        } else {
-            // Dictionary capacity exceeded: spill to flat vector
-            let mut spilled = Vec::with_capacity(self.indices.len() + 1);
-            for &idx in &self.indices {
-                spilled.push(Arc::clone(&self.dict[idx as usize]));
-            }
-            spilled.push(val);
-            self.spilled = Some(spilled);
-            self.dict.clear();
-            self.indices.clear();
-        }
-    }
-
-    #[inline]
-    pub fn get_ref(&self, i: usize) -> &Arc<str> {
-        if let Some(spilled) = &self.spilled {
-            &spilled[i]
-        } else {
-            let idx = self.indices[i] as usize;
-            &self.dict[idx]
-        }
-    }
-
-    #[inline]
-    pub fn get(&self, i: usize) -> Arc<str> {
-        Arc::clone(self.get_ref(i))
-    }
-
-    #[inline]
-    pub fn set(&mut self, i: usize, val: Arc<str>) {
-        if let Some(spilled) = &mut self.spilled {
-            spilled[i] = val;
-            return;
-        }
-
-        if let Some(pos) = self.dict.iter().position(|x| Arc::ptr_eq(x, &val) || **x == *val) {
-            self.indices[i] = pos as u8;
-            return;
-        }
-
-        if self.dict.len() < 255 {
-            let pos = self.dict.len() as u8;
-            self.dict.push(val);
-            self.indices[i] = pos;
-        } else {
-            let mut spilled = Vec::with_capacity(self.indices.len());
-            for &idx in &self.indices {
-                spilled.push(Arc::clone(&self.dict[idx as usize]));
-            }
-            spilled[i] = val;
-            self.spilled = Some(spilled);
-            self.dict.clear();
-            self.indices.clear();
-        }
-    }
-
-    #[inline]
-    pub fn swap_remove(&mut self, i: usize) -> Arc<str> {
-        if let Some(spilled) = &mut self.spilled {
-            spilled.swap_remove(i)
-        } else {
-            let idx = self.indices.swap_remove(i) as usize;
-            Arc::clone(&self.dict[idx])
-        }
-    }
-
-    #[inline]
-    pub fn swap_pop_at(&mut self, p: usize, len: usize) {
-        if self.len() == len && p < len {
-            if let Some(spilled) = &mut self.spilled {
-                spilled.swap_remove(p);
-            } else {
-                self.indices.swap_remove(p);
-            }
-        }
-    }
-
-    #[inline]
-    pub fn as_indices(&self) -> Option<(&[u8], &[Arc<str>])> {
-        if self.spilled.is_none() {
-            Some((&self.indices, &self.dict))
-        } else {
-            None
-        }
-    }
-
-    pub fn to_vec(&self) -> Vec<Arc<str>> {
-        if let Some(spilled) = &self.spilled {
-            spilled.clone()
-        } else {
-            self.indices.iter().map(|&idx| Arc::clone(&self.dict[idx as usize])).collect()
-        }
-    }
-}
-
-impl std::ops::Index<usize> for DictColumn {
-    type Output = Arc<str>;
-
-    #[inline]
-    fn index(&self, i: usize) -> &Self::Output {
-        self.get_ref(i)
-    }
-}
 
 #[derive(Debug)]
 pub struct Store {
@@ -766,10 +59,10 @@ pub struct Store {
     pub(crate) facts_by_spo: FxHashMap<FactKey, usize>,
     /// edge (rel,from,to) set — O(1) append/delete edge.
     pub(crate) edge_keys: FxHashSet<(Arc<str>, Arc<str>, Arc<str>)>,
-    /// (rel, from) → target node keys (outgoing adjacency index).
-    pub(crate) edges_out: FxHashMap<(Arc<str>, Arc<str>), Vec<Arc<str>>>,
-    /// (rel, to) → source node keys (incoming adjacency index).
-    pub(crate) edges_in: FxHashMap<(Arc<str>, Arc<str>), Vec<Arc<str>>>,
+    /// rel → from → target node keys (zero-alloc outgoing adjacency index).
+    pub(crate) edges_out: edges::AdjacencyMap,
+    /// rel → to → source node keys (zero-alloc incoming adjacency index).
+    pub(crate) edges_in: edges::AdjacencyMap,
 
     // Hot collection metadata — always accessed during scans
     /// Count of rows per collection for quick bounds checking
@@ -805,17 +98,43 @@ pub struct Store {
     /// When true, columnar facts are ahead of `collections["facts"]`.
     facts_rows_stale: bool,
     /// mmap cold collections not yet promoted into `collections`.
-    cold: BTreeMap<String, crate::cold::ColdCol>,
+    pub(crate) cold: BTreeMap<String, crate::cold::ColdCol>,
+}
+
+/// Compact collection key for zero-allocation `AppendMark` snapshots.
+#[derive(Debug, Clone)]
+enum AppendColKey {
+    Inline(InlineStr),
+    Heap(Arc<str>),
+}
+
+impl AppendColKey {
+    #[inline]
+    fn from_name(s: &str) -> Self {
+        match InlineStr::try_new(s) {
+            Some(inl) => Self::Inline(inl),
+            None => Self::Heap(Arc::from(s)),
+        }
+    }
+
+    #[inline]
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Inline(inl) => inl.as_str(),
+            Self::Heap(arc) => arc.as_ref(),
+        }
+    }
 }
 
 /// Cheap undo for append-only packs (insert / append) — no full store clone.
 #[derive(Debug, Clone)]
 pub struct AppendMark {
     next_id: u64,
-    col_lens: smallvec::SmallVec<[(String, usize); 4]>,
+    col_lens: smallvec::SmallVec<[(AppendColKey, usize); 6]>,
     edge_len: usize,
     facts_len: usize,
 }
+
 
 impl Store {
     pub fn empty(embed_id: impl Into<String>) -> Self {
@@ -880,7 +199,7 @@ impl Store {
         }
     }
 
-fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
+    fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
     let n = rows.len();
     if n < 65536 {
         return rows.to_vec();
@@ -985,539 +304,6 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
         }
     }
 
-    /// Load snapshot+log into memory (no writer lock / no Persist).
-    /// Does not truncate the log or rewrite head — safe alongside a writer
-    /// only if the caller coordinates; prefer [`crate::exec::Db::reader`] for
-    /// in-process shared snapshots.
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
-        let cat = crate::catalog::fixture();
-        Ok(Self::open_with(path, &cat, OpenMemOpts::default())?.0)
-    }
-
-    /// Open durable data dir: memory image + exclusive Persist for writes.
-    pub fn open_with(
-        path: impl AsRef<Path>,
-        cat: &Catalog,
-        opts: OpenMemOpts,
-    ) -> Result<(Self, Persist), Error> {
-        let (store, persist, _) = Self::open_with_profiled(path, cat, opts)?;
-        Ok((store, persist))
-    }
-
-    pub(crate) fn open_with_profiled(
-        path: impl AsRef<Path>,
-        cat: &Catalog,
-        opts: OpenMemOpts,
-    ) -> Result<(Self, Persist, StoreOpenPhases), Error> {
-        let mut phases = StoreOpenPhases::default();
-        let phase = Instant::now();
-        let dir = path.as_ref();
-        persist::ensure_dir(dir)?;
-        let lock = persist::acquire_writer_lock(dir)?;
-        let fixture_hash = catalog_hash(cat);
-        phases.setup_ms = phase.elapsed().as_secs_f64() * 1000.0;
-
-        let phase = Instant::now();
-        let snap = persist::read_snapshot(dir)?;
-        let start = snap.as_ref().map(|s| s.log_offset).unwrap_or(0);
-        let snap_catalog_hash = snap.as_ref().map(|s| s.catalog_hash.clone());
-        let snap_has_extras = snap
-            .as_ref()
-            .map(|s| {
-                !s.extra_collections.is_empty()
-                    || !s.extra_rels.is_empty()
-                    || !s.extra_indexes.is_empty()
-                    || !s.extra_filters.is_empty()
-                    || !s.extra_owned.is_empty()
-            })
-            .unwrap_or(false);
-
-        let mut store = match snap {
-            Some(s) => Self::from_snapshot_unindexed(dir, s)?,
-            None => {
-                let embed = persist::read_head(dir)?
-                    .map(|h| h.embed_id)
-                    .unwrap_or_else(|| cat.embed_id.clone());
-                Self::empty(embed)
-            }
-        };
-        phases.snapshot_ms = phase.elapsed().as_secs_f64() * 1000.0;
-
-        let phase = Instant::now();
-        store.rebuild_indexes();
-        phases.indexes_ms = phase.elapsed().as_secs_f64() * 1000.0;
-        let phase = Instant::now();
-        store.rebuild_row_maps();
-        phases.row_maps_ms = phase.elapsed().as_secs_f64() * 1000.0;
-
-        let mut fts_cat = cat.clone();
-        store.merge_extras_into(&mut fts_cat);
-        let fts_t0 = Instant::now();
-        store.try_load_fts(dir, &fts_cat);
-        let mut fts_ms = fts_t0.elapsed().as_secs_f64() * 1000.0;
-
-        let phase = Instant::now();
-        let mut log = persist::open_log(dir)?;
-        let min_gen = store.r#gen;
-        let end = persist::replay_log(&mut log, min_gen, start, |rec| {
-            store.apply_record(&rec);
-            Ok(())
-        })?;
-        persist::truncate_log(&mut log, end)?;
-        phases.wal_ms = phase.elapsed().as_secs_f64() * 1000.0;
-
-        let phase = Instant::now();
-        let mut live = cat.clone();
-        store.merge_extras_into(&mut live);
-        let live_hash = catalog_hash(&live);
-
-        let head_disk = persist::read_head(dir)?;
-        if let Some(ref head) = head_disk
-            && head.catalog_hash != live_hash
-        {
-            return Err(Error::runtime(format!(
-                "catalog_hash mismatch: store={} catalog={}",
-                head.catalog_hash, live_hash
-            )));
-        }
-        if let Some(snap_hash) = snap_catalog_hash
-            && snap_hash != live_hash
-            && !snap_has_extras
-            && snap_hash != fixture_hash
-        {
-            return Err(Error::runtime(format!(
-                "catalog_hash mismatch: snapshot={} catalog={}",
-                snap_hash, live_hash
-            )));
-        }
-
-        let head_needs_write = match &head_disk {
-            Some(head) => {
-                head.r#gen != store.r#gen
-                    || head.catalog_hash != live_hash
-                    || head.embed_id != store.embed_id
-            }
-            None => true,
-        };
-        if head_needs_write {
-            persist::write_head(
-                dir,
-                &Head {
-                    r#gen: store.r#gen,
-                    catalog_hash: live_hash.clone(),
-                    embed_id: store.embed_id.clone(),
-                },
-            )?;
-        }
-        phases.metadata_ms = phase.elapsed().as_secs_f64() * 1000.0;
-
-        let fts_t1 = Instant::now();
-        store.ensure_fts(&live);
-        fts_ms += fts_t1.elapsed().as_secs_f64() * 1000.0;
-        phases.fts_ms = fts_ms;
-
-        let persist = Persist {
-            dir: dir.to_path_buf(),
-            log,
-            lock,
-            lock_owner_pid: std::process::id(),
-            catalog_hash: live_hash,
-            writes_since_snapshot: 0,
-            encode_buf: Vec::with_capacity(64 * 1024),
-            encoder: persist::acquire_encoder(),
-            sync: opts.sync,
-            cold: opts.cold,
-            log_bytes: persist::log_len(dir).unwrap_or(0),
-        };
-        Ok((store, persist, phases))
-    }
-
-    /// Read-only open: replay into memory, do not truncate log or write head.
-    /// Returns `(store, shared_lock)`.
-    pub fn open_read_with(
-        path: impl AsRef<Path>,
-        cat: &Catalog,
-    ) -> Result<(Self, std::fs::File), Error> {
-        let (store, lock, _) = Self::open_read_with_profiled(path, cat)?;
-        Ok((store, lock))
-    }
-
-    pub(crate) fn open_read_with_profiled(
-        path: impl AsRef<Path>,
-        cat: &Catalog,
-    ) -> Result<(Self, std::fs::File, StoreOpenPhases), Error> {
-        let mut phases = StoreOpenPhases::default();
-        let phase = Instant::now();
-        let dir = path.as_ref();
-        persist::validate_data_dir(dir)?;
-        if !dir.exists() {
-            return Err(Error::runtime(format!(
-                "data dir not found: {}",
-                dir.display()
-            )));
-        }
-        let lock = persist::acquire_reader_lock(dir)?;
-        phases.setup_ms = phase.elapsed().as_secs_f64() * 1000.0;
-        let phase = Instant::now();
-        let snap = persist::read_snapshot(dir)?;
-        let start = snap.as_ref().map(|s| s.log_offset).unwrap_or(0);
-        let mut store = match snap {
-            Some(s) => Self::from_snapshot_unindexed(dir, s)?,
-            None => {
-                let embed = persist::read_head(dir)?
-                    .map(|h| h.embed_id)
-                    .unwrap_or_else(|| cat.embed_id.clone());
-                Self::empty(embed)
-            }
-        };
-        phases.snapshot_ms = phase.elapsed().as_secs_f64() * 1000.0;
-        let phase = Instant::now();
-        store.rebuild_indexes();
-        phases.indexes_ms = phase.elapsed().as_secs_f64() * 1000.0;
-        let phase = Instant::now();
-        store.rebuild_row_maps();
-        phases.row_maps_ms = phase.elapsed().as_secs_f64() * 1000.0;
-        let mut fts_cat = cat.clone();
-        store.merge_extras_into(&mut fts_cat);
-        let fts_t0 = Instant::now();
-        store.try_load_fts(dir, &fts_cat);
-        let mut fts_ms = fts_t0.elapsed().as_secs_f64() * 1000.0;
-        let phase = Instant::now();
-        let mut log = persist::open_log_read(dir)?;
-        let min_gen = store.r#gen;
-        if let Some(log) = log.as_mut() {
-            let _ = persist::replay_log(log, min_gen, start, |rec| {
-                store.apply_record(&rec);
-                Ok(())
-            })?;
-        }
-        phases.wal_ms = phase.elapsed().as_secs_f64() * 1000.0;
-        let mut live = cat.clone();
-        store.merge_extras_into(&mut live);
-        let fts_t1 = Instant::now();
-        store.ensure_fts(&live);
-        fts_ms += fts_t1.elapsed().as_secs_f64() * 1000.0;
-        phases.fts_ms = fts_ms;
-        Ok((store, lock, phases))
-    }
-
-    pub(crate) fn from_snapshot(dir: &Path, s: Snapshot) -> Result<Self, Error> {
-        let mut store = Self::from_snapshot_unindexed(dir, s)?;
-        store.rebuild_indexes();
-        store.rebuild_row_maps();
-        Ok(store)
-    }
-
-    fn from_snapshot_unindexed(dir: &Path, mut s: Snapshot) -> Result<Self, Error> {
-        let col_counts = {
-            let mut counts = FxHashMap::default();
-            for (name, rows) in &s.collections {
-                counts.insert(name.clone(), rows.len());
-            }
-            counts
-        };
-        let mut store = Self {
-            r#gen: s.r#gen,
-            embed_id: std::mem::take(&mut s.embed_id),
-            next_id: s.next_id,
-            collections: std::mem::take(&mut s.collections),
-            edges: std::mem::take(&mut s.edges),
-            extra_collections: std::mem::take(&mut s.extra_collections),
-            extra_rels: std::mem::take(&mut s.extra_rels),
-            extra_indexes: std::mem::take(&mut s.extra_indexes),
-            extra_filters: std::mem::take(&mut s.extra_filters),
-            extra_owned: std::mem::take(&mut s.extra_owned),
-            indexes: BTreeMap::new(),
-            fts: BTreeMap::new(),
-            hnsw: BTreeMap::new(),
-            by_id: BTreeMap::new(),
-            docs_by_uri: FxHashMap::default(),
-            facts_by_spo: FxHashMap::default(),
-            edge_keys: FxHashSet::default(),
-            edges_out: FxHashMap::default(),
-            edges_in: FxHashMap::default(),
-            docs_id: Vec::new(),
-            docs_title: Vec::new(),
-            docs_title_packed: OnceLock::new(),
-            docs_epoch: next_docs_epoch(),
-            docs_layer: DictColumn::new(),
-            docs_wing: DictColumn::new(),
-            last_doc_id_idx: std::sync::atomic::AtomicUsize::new(usize::MAX),
-            docs_moved_ids: smallvec::SmallVec::new(),
-            docs_moved_idxs: smallvec::SmallVec::new(),
-            retired_doc_ids: smallvec::SmallVec::new(),
-            retired_arcs: smallvec::SmallVec::new(),
-            fts_deferred_doc_swaps: smallvec::SmallVec::new(),
-            retired_rows: smallvec::SmallVec::new(),
-            retired_cells: smallvec::SmallVec::new(),
-            orders_id: Vec::new(),
-            orders_user_id: Vec::new(),
-            orders_total: Vec::new(),
-            users_id: Vec::new(),
-            users_email: Vec::new(),
-            facts_s: Vec::new(),
-            facts_p: Vec::new(),
-            facts_o: Vec::new(),
-            facts_rows_stale: false,
-            col_counts,
-            cold: BTreeMap::new(),
-        };
-        for name in store.extra_collections.keys() {
-            store.collections.entry(name.clone()).or_default();
-        }
-        for name in &s.cold_collections {
-            if crate::cold::cold_path(dir, name).exists() {
-                // Lazy: mmap only; rows page-in on first collection() access.
-                let col = cold::map_cold(dir, name)?;
-                let nrows = col.row_count();
-                store.col_counts.insert(name.clone(), nrows);
-                store.collections.insert(name.clone(), Vec::new());
-                store.cold.insert(name.clone(), col);
-            }
-        }
-        Ok(store)
-    }
-
-    /// Capture current memory image (for backup / checkpoint payload).
-    pub fn capture_snapshot(&mut self, catalog_hash: impl Into<String>) -> Snapshot {
-        self.capture_snapshot_at(catalog_hash, 0)
-    }
-
-    pub fn capture_snapshot_at(
-        &mut self,
-        catalog_hash: impl Into<String>,
-        log_offset: u64,
-    ) -> Snapshot {
-        self.ensure_facts_rows();
-        let cold_names: Vec<String> = self.cold.keys().cloned().collect();
-        for name in cold_names {
-            self.promote_cold(&name);
-        }
-        Snapshot {
-            r#gen: self.r#gen,
-            embed_id: self.embed_id.clone(),
-            next_id: self.next_id,
-            catalog_hash: catalog_hash.into(),
-            log_offset,
-            collections: self.collections.clone(),
-            edges: self.edges.clone(),
-            extra_collections: self.extra_collections.clone(),
-            extra_rels: self.extra_rels.clone(),
-            extra_indexes: self.extra_indexes.clone(),
-            extra_filters: self.extra_filters.clone(),
-            extra_owned: self.extra_owned.clone(),
-            cold_collections: Vec::new(),
-        }
-    }
-
-    pub fn merge_extras_into(&self, cat: &mut Catalog) {
-        for (name, fields) in &self.extra_owned {
-            let fields = fields
-                .iter()
-                .map(|(n, t)| (n.clone(), TypeExpr::Named(t.clone())))
-                .collect();
-            let _ = cat.apply_decl(&Decl::Owned {
-                name: name.clone(),
-                fields,
-            });
-        }
-        for c in self.extra_collections.values() {
-            let fields = c
-                .fields
-                .iter()
-                .map(|(n, t)| (n.clone(), TypeExpr::Named(t.clone())))
-                .collect();
-            let _ = cat.apply_decl(&Decl::Col {
-                name: c.name.clone(),
-                append: c.append_only,
-                fields,
-            });
-        }
-        for r in self.extra_rels.values() {
-            let decl = if let Some(of) = &r.reverse_of {
-                Decl::RelReverse {
-                    name: r.name.clone(),
-                    of: of.clone(),
-                }
-            } else {
-                Decl::Rel {
-                    name: r.name.clone(),
-                    stub: r.stub,
-                }
-            };
-            let _ = cat.apply_decl(&decl);
-        }
-        for idx in self.extra_indexes.values() {
-            let pred = idx
-                .pred_src
-                .as_deref()
-                .and_then(|src| crate::parse::parse_pred_src(src).ok());
-            let _ = cat.apply_decl(&Decl::Index {
-                collection: idx.collection.clone(),
-                unique: idx.unique,
-                fields: idx.fields.clone(),
-                pred,
-            });
-        }
-        for (collection, src) in &self.extra_filters {
-            if let Ok(pred) = crate::parse::parse_pred_src(src) {
-                let _ = cat.apply_decl(&Decl::Filter {
-                    collection: collection.clone(),
-                    pred: Some(pred),
-                    src: src.clone(),
-                });
-            }
-        }
-    }
-
-    /// Flush one committed pack to the log (data sync). Head is updated durably
-    /// on checkpoint/close only (soft head skipped on the hot path).
-    pub fn durable_commit(&self, persist: &mut Persist, pack: Pack) -> Result<(), Error> {
-        self.durable_commit_prepared(persist, pack, None)
-    }
-
-    pub(crate) fn durable_commit_prepared(
-        &self,
-        persist: &mut Persist,
-        pack: Pack,
-        prepared: Option<crate::persist::PreparedEncoding>,
-    ) -> Result<(), Error> {
-        let rec = LogRecord {
-            r#gen: self.r#gen + 1,
-            next_id: self.next_id,
-            pack,
-        };
-        let sync = persist.sync;
-        {
-            let Persist {
-                log,
-                encode_buf,
-                log_bytes,
-                ..
-            } = persist;
-            match prepared {
-                Some(persist::PreparedEncoding::Direct {
-                    generation,
-                    next_id,
-                    collection,
-                    fields,
-                    rows,
-                    magic,
-                }) => {
-                    let valid = rec.r#gen == generation
-                        && rec.next_id == next_id
-                        && matches!(&rec.pack, Pack::InsertCols { collection: c, fields: f, n, edges, .. }
-                            if c == &collection && f == &fields && *n == rows && edges.is_empty());
-                    if valid {
-                        persist::write_frame(log, &magic, encode_buf, sync, log_bytes)?;
-                    } else {
-                        persist::append_record(log, &rec, encode_buf, sync, log_bytes)?;
-                    }
-                }
-                Some(persist::PreparedEncoding::Ready(encoded)) => {
-                    persist::append_prepared_record(
-                        log, &rec, encoded, encode_buf, sync, log_bytes,
-                    )?;
-                }
-                Some(persist::PreparedEncoding::Failed(error)) => return Err(error),
-                Some(persist::PreparedEncoding::Panicked(payload)) => {
-                    std::panic::resume_unwind(payload)
-                }
-                None => persist::append_record(log, &rec, encode_buf, sync, log_bytes)?,
-            }
-        }
-        persist.writes_since_snapshot += 1;
-        Ok(())
-    }
-
-    pub fn maybe_checkpoint(&mut self, persist: &mut Persist) -> Result<(), Error> {
-        if persist.writes_since_snapshot >= persist::SNAPSHOT_EVERY {
-            self.write_snapshot(persist)?;
-        }
-        Ok(())
-    }
-
-    /// Force a durable checkpoint (snapshot + head fsync).
-    pub fn checkpoint(&mut self, persist: &mut Persist) -> Result<(), Error> {
-        self.write_snapshot(persist)
-    }
-
-    pub fn write_snapshot(&mut self, persist: &mut Persist) -> Result<(), Error> {
-        // Exclude open_read processes while publishing snapshot + compacting log.
-        let _fence = persist::acquire_fence_exclusive(&persist.dir)?;
-        // Ensure log content is fully durable before publishing snapshot/head.
-        // Normal mode: this is the durability point for prior commits.
-        persist::durable_sync(&persist.log)
-            .or_else(|_| persist.log.sync_all())
-            .map_err(persist::io_err)?;
-        self.ensure_facts_rows();
-        let cold_names_to_promote: Vec<String> = self.cold.keys().cloned().collect();
-        for name in cold_names_to_promote {
-            self.promote_cold(&name);
-        }
-        let mut cold_names = Vec::new();
-        if persist.cold {
-            // Cold bins are a decode cache; snapshot stays self-contained (rows kept).
-            for (name, rows) in &self.collections {
-                if rows.len() >= cold::COLD_MIN_ROWS {
-                    cold::write_cold(&persist.dir, name, rows)?;
-                    cold_names.push(name.clone());
-                }
-            }
-            cold::prune_cold(&persist.dir, &cold_names)?;
-        }
-        let head = Head {
-            r#gen: self.r#gen,
-            catalog_hash: persist.catalog_hash.clone(),
-            embed_id: self.embed_id.clone(),
-        };
-        let stubbed_collections;
-        let collections_ref = if !cold_names.is_empty() {
-            stubbed_collections = self
-                .collections
-                .iter()
-                .map(|(k, v)| {
-                    if cold_names.contains(k) {
-                        (k.clone(), Vec::new())
-                    } else {
-                        (k.clone(), v.clone())
-                    }
-                })
-                .collect::<BTreeMap<_, _>>();
-            &stubbed_collections
-        } else {
-            &self.collections
-        };
-
-        let snap_ref = SnapshotRef {
-            r#gen: self.r#gen,
-            embed_id: &self.embed_id,
-            next_id: self.next_id,
-            catalog_hash: &persist.catalog_hash,
-            log_offset: 0,
-            collections: collections_ref,
-            edges: &self.edges,
-            extra_collections: &self.extra_collections,
-            extra_rels: &self.extra_rels,
-            extra_indexes: &self.extra_indexes,
-            extra_filters: &self.extra_filters,
-            extra_owned: &self.extra_owned,
-            cold_collections: &cold_names,
-        };
-        persist::write_snapshot_ref(&persist.dir, &snap_ref)?;
-        persist::write_head(&persist.dir, &head)?;
-        self.write_fts_files(&persist.dir)?;
-        persist::compact_log(&mut persist.log)?;
-        persist.writes_since_snapshot = 0;
-        persist.log_bytes = 0;
-        Ok(())
-    }
-
-    fn apply_record(&mut self, rec: &LogRecord) {
-        self.apply_pack(&rec.pack);
-        self.next_id = rec.next_id;
-        self.r#gen = rec.r#gen;
-    }
 
     pub fn apply_pack(&mut self, pack: &Pack) {
         match pack {
@@ -1526,6 +312,10 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
                 row,
                 edges,
             } => {
+                let emb = row.get("embedding").and_then(|c| match c {
+                    Cell::Vec(v) => Some(Arc::clone(v)),
+                    _ => None,
+                });
                 self.collection_mut(collection).push(row.clone());
                 let idx = self.collection(collection).len() - 1;
                 // Update cache-friendly count tracking
@@ -1534,6 +324,11 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
                 self.row_maps_register(collection, idx);
                 let _ = self.index_insert_at(collection, idx);
                 self.fts_insert_at(collection, idx);
+                if let Some(v) = emb
+                    && let Some(hnsw) = self.hnsw.get_mut(collection)
+                {
+                    hnsw.insert(idx, v);
+                }
                 for e in edges {
                     let _ = self.append_edge_parts(&e.rel, &e.from, &e.to);
                 }
@@ -1574,7 +369,7 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
                 self.fts_insert_slab(collection, start, &rows);
                 self.hnsw_insert_slab(collection, start, &rows);
                 self.row_maps_register_slab(collection, start, &rows);
-                self.collection_mut(collection).extend(rows.iter().cloned());
+                self.collection_mut(collection).extend(rows);
                 // Update cache-friendly count tracking
                 self.update_col_count(collection, n as isize);
                 for e in edges {
@@ -1605,12 +400,26 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
                 for new in rows {
                     let id = row_text(new, "id").map(str::to_string);
                     let idx = id.as_ref().and_then(|id| self.row_index(collection, id));
+                    let new_emb = new.get("embedding").and_then(|c| match c {
+                        Cell::Vec(v) => Some(Arc::clone(v)),
+                        _ => None,
+                    });
                     if let Some(i) = idx {
                         let before = self.collection(collection)[i].clone();
+                        let emb_changed = before.get("embedding") != new.get("embedding");
                         self.collection_mut(collection)[i] = new.clone();
                         self.row_maps_sync_updated(collection, i, &before, new);
                         let _ = self.index_update_row(collection, i, &before, new);
                         self.fts_sync_at(collection, i, &before);
+                        if emb_changed
+                            && let Some(hnsw) = self.hnsw.get_mut(collection)
+                        {
+                            if let Some(v) = new_emb {
+                                hnsw.insert(i, v);
+                            } else {
+                                hnsw.remove(i);
+                            }
+                        }
                         continue;
                     }
                     self.collection_mut(collection).push(new.clone());
@@ -1619,6 +428,11 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
                     self.row_maps_register(collection, i);
                     let _ = self.index_insert_at(collection, i);
                     self.fts_insert_at(collection, i);
+                    if let Some(v) = new_emb
+                        && let Some(hnsw) = self.hnsw.get_mut(collection)
+                    {
+                        hnsw.insert(i, v);
+                    }
                 }
                 // Update cache-friendly count tracking
                 self.update_col_count(collection, new_rows as isize);
@@ -1773,7 +587,7 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
     pub fn append_mark(&self) -> AppendMark {
         let mut col_lens = smallvec::SmallVec::new();
         for (name, rows) in &self.collections {
-            col_lens.push((name.clone(), rows.len()));
+            col_lens.push((AppendColKey::from_name(name), rows.len()));
         }
         AppendMark {
             next_id: self.next_id,
@@ -1785,30 +599,221 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
 
     pub fn append_rollback(&mut self, mark: AppendMark) {
         self.next_id = mark.next_id;
-        self.edges.truncate(mark.edge_len);
-        self.facts_s.truncate(mark.facts_len);
-        self.facts_p.truncate(mark.facts_len);
-        self.facts_o.truncate(mark.facts_len);
-        self.facts_rows_stale = true;
-        self.ensure_facts_rows();
-        for (name, rows) in self.collections.iter_mut() {
+
+        // 1. O(delta) edge rollback
+        if self.edges.len() > mark.edge_len {
+            if self.edge_keys.len() == self.edges.len() {
+                for idx in (mark.edge_len..self.edges.len()).rev() {
+                    let e = &self.edges[idx];
+                    let rel_arc = Arc::<str>::from(e.rel.as_str());
+                    let from_arc = Arc::<str>::from(e.from.as_str());
+                    let to_arc = Arc::<str>::from(e.to.as_str());
+                    self.edge_keys.remove(&(rel_arc, from_arc, to_arc));
+                    if let Some(by_node) = self.edges_out.get_mut(e.rel.as_str())
+                        && let Some(list) = by_node.get_mut(e.from.as_str())
+                    {
+                        if list.last().is_some_and(|x| x.as_ref() == e.to) {
+                            list.pop();
+                        } else {
+                            list.retain(|x| x.as_ref() != e.to);
+                        }
+                    }
+                    if let Some(by_node) = self.edges_in.get_mut(e.rel.as_str())
+                        && let Some(list) = by_node.get_mut(e.to.as_str())
+                    {
+                        if list.last().is_some_and(|x| x.as_ref() == e.from) {
+                            list.pop();
+                        } else {
+                            list.retain(|x| x.as_ref() != e.from);
+                        }
+                    }
+                }
+                self.edges.truncate(mark.edge_len);
+            } else {
+                self.edges.truncate(mark.edge_len);
+                self.rebuild_edge_keys();
+            }
+        }
+
+        // 2. O(delta) facts rollback
+        if self.facts_s.len() > mark.facts_len {
+            for idx in (mark.facts_len..self.facts_s.len()).rev() {
+                let key = (
+                    Arc::clone(&self.facts_s[idx]),
+                    Arc::clone(&self.facts_p[idx]),
+                    Arc::clone(&self.facts_o[idx]),
+                );
+                if self.facts_by_spo.get(&key) == Some(&idx) {
+                    self.facts_by_spo.remove(&key);
+                }
+            }
+            self.facts_s.truncate(mark.facts_len);
+            self.facts_p.truncate(mark.facts_len);
+            self.facts_o.truncate(mark.facts_len);
+            if !self.facts_rows_stale
+                && let Some(f_rows) = self.collections.get_mut("facts")
+            {
+                f_rows.truncate(mark.facts_len);
+            }
+            if let Some(c) = self.col_counts.get_mut("facts") {
+                *c = mark.facts_len;
+            } else {
+                self.col_counts.insert("facts".to_string(), mark.facts_len);
+            }
+        } else if let Some(f_rows) = self.collections.get_mut("facts")
+            && f_rows.len() > mark.facts_len
+        {
+            f_rows.truncate(mark.facts_len);
+            if let Some(c) = self.col_counts.get_mut("facts") {
+                *c = mark.facts_len;
+            } else {
+                self.col_counts.insert("facts".to_string(), mark.facts_len);
+            }
+        }
+
+        // 3. O(delta) collection row/index/map/FTS/HNSW rollback — collect only mutated collections
+        let mut dirty: smallvec::SmallVec<[(AppendColKey, usize, usize); 2]> =
+            smallvec::SmallVec::new();
+        for (name, rows) in &self.collections {
             if name == "facts" {
                 continue;
             }
-            let len = mark
+            let cur_len = rows.len();
+            if cur_len == 0 {
+                continue;
+            }
+            let prev_len = mark
                 .col_lens
                 .iter()
-                .find(|(n, _)| n == name)
+                .find(|(n, _)| n.as_str() == name.as_str())
                 .map(|(_, l)| *l)
                 .unwrap_or(0);
-            rows.truncate(len);
+            if cur_len > prev_len {
+                dirty.push((AppendColKey::from_name(name), prev_len, cur_len));
+            }
         }
-        // Drop collections created after the mark (schema col during append-only is rare;
-        // full backup covers schema). Keep extras as-is for append-only path.
-        self.rebuild_indexes();
-        self.rebuild_row_maps();
-        self.rebuild_all_fts_inplace();
-        self.refresh_col_counts();
+
+        for (name_key, prev_len, cur_len) in dirty {
+            let name = name_key.as_str();
+            let delta = cur_len - prev_len;
+            if name == "docs" {
+                self.flush_fts_deferred_docs();
+                self.invalidate_docs_cache();
+                self.last_doc_id_idx
+                    .store(usize::MAX, std::sync::atomic::Ordering::Relaxed);
+            }
+            let can_incremental = !(prev_len > 0 && delta > prev_len && cur_len > 1024)
+                && match name {
+                    "docs" => {
+                        self.docs_id.len() == cur_len
+                            && self.docs_moved_ids.is_empty()
+                            && self.docs_moved_idxs.is_empty()
+                    }
+                    "orders" => self.orders_id.len() == cur_len,
+                    "users" => self.users_id.len() == cur_len,
+                    _ => true,
+                };
+
+            if can_incremental {
+                let has_indexes = self.indexes.values().any(|i| i.def.collection == name);
+                let has_fts = self.fts.contains_key(name);
+                let has_hnsw = self.hnsw.contains_key(name);
+                let is_docs = name == "docs";
+                let soa_ids: Option<&[Arc<str>]> = match name {
+                    "orders" => Some(&self.orders_id),
+                    "users" => Some(&self.users_id),
+                    "docs" => Some(&self.docs_id),
+                    _ => None,
+                };
+
+                if !has_indexes && !has_fts && !has_hnsw && !is_docs && let Some(ids) = soa_ids {
+                    if let Some(by_id) = self.by_id.get_mut(name) {
+                        for (offset, id_arc) in ids[prev_len..cur_len].iter().enumerate().rev() {
+                            let idx = prev_len + offset;
+                            let id = id_arc.as_ref();
+                            if !id.is_empty() && by_id.get(id) == Some(&idx) {
+                                by_id.remove(id);
+                            }
+                        }
+                    }
+                    if let Some(rows) = self.collections.get_mut(name) {
+                        rows.truncate(prev_len);
+                    }
+                } else {
+                    for idx in (prev_len..cur_len).rev() {
+                        let Some(row) = self
+                            .collections
+                            .get_mut(name)
+                            .and_then(|rows| rows.pop())
+                        else {
+                            break;
+                        };
+                        if let Some(id) = row_text(&row, "id")
+                            && let Some(by_id) = self.by_id.get_mut(name)
+                            && by_id.get(id) == Some(&idx)
+                        {
+                            by_id.remove(id);
+                        }
+                        if is_docs
+                            && let Some(uri) = row_text(&row, "uri")
+                            && self.docs_by_uri.get(uri) == Some(&idx)
+                        {
+                            self.docs_by_uri.remove(uri);
+                        }
+                        if has_indexes {
+                            self.index_remove_row(name, idx, &row);
+                        }
+                        if has_fts && let Some(fts) = self.fts.get_mut(name) {
+                            fts.remove_row(idx, &row);
+                        }
+                        if has_hnsw && let Some(hnsw) = self.hnsw.get_mut(name) {
+                            hnsw.remove(idx);
+                        }
+                    }
+                }
+
+                match name {
+                    "docs" => {
+                        self.docs_id.truncate(prev_len);
+                        self.docs_title.truncate(prev_len);
+                        self.docs_layer.truncate(prev_len);
+                        self.docs_wing.truncate(prev_len);
+                    }
+                    "orders" => {
+                        self.orders_id.truncate(prev_len);
+                        self.orders_user_id.truncate(prev_len);
+                        self.orders_total.truncate(prev_len);
+                    }
+                    "users" => {
+                        self.users_id.truncate(prev_len);
+                        self.users_email.truncate(prev_len);
+                    }
+                    _ => {}
+                }
+                if let Some(c) = self.col_counts.get_mut(name) {
+                    *c = prev_len;
+                } else {
+                    self.col_counts.insert(name.to_string(), prev_len);
+                }
+            } else {
+                if let Some(rows) = self.collections.get_mut(name) {
+                    rows.truncate(prev_len);
+                }
+                if let Some(c) = self.col_counts.get_mut(name) {
+                    *c = prev_len;
+                } else {
+                    self.col_counts.insert(name.to_string(), prev_len);
+                }
+                self.rebuild_row_maps_collection(name);
+                self.rebuild_indexes_collection(name);
+                self.rebuild_fts_inplace(name);
+                if let Some(hnsw) = self.hnsw.get_mut(name) {
+                    for idx in (prev_len..cur_len).rev() {
+                        hnsw.remove(idx);
+                    }
+                }
+            }
+        }
     }
 
     fn rebuild_all_fts_inplace(&mut self) {
@@ -1942,15 +947,6 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
         self.facts_rows_stale = false;
     }
 
-    /// Promote a cold mmap collection into `collections` (idempotent).
-    pub fn promote_cold(&mut self, name: &str) {
-        let Some(col) = self.cold.remove(name) else {
-            return;
-        };
-        if let Ok(rows) = col.into_rows() {
-            self.collections.insert(name.to_string(), rows);
-        }
-    }
 
     /// True when rows live in `collections` (not cold-only), so position-keyed
     /// journals can be replayed against it.
@@ -1986,7 +982,7 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
 
     /// Update cached count after single-row insert/delete
     #[inline]
-    fn update_col_count(&mut self, collection: &str, delta: isize) {
+    pub(crate) fn update_col_count(&mut self, collection: &str, delta: isize) {
         if let Some(count) = self.col_counts.get_mut(collection) {
             if let Some(new_count) = count.checked_add_signed(delta) {
                 *count = new_count;
@@ -2256,300 +1252,6 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
         self.refresh_col_counts();
     }
 
-    fn rebuild_edge_keys(&mut self) {
-        self.edge_keys.clear();
-        self.edges_out.clear();
-        self.edges_in.clear();
-        self.edge_keys.reserve(self.edges.len());
-        for e in &self.edges {
-            let rel_arc = Arc::<str>::from(e.rel.as_str());
-            let from_arc = Arc::<str>::from(e.from.as_str());
-            let to_arc = Arc::<str>::from(e.to.as_str());
-            self.edge_keys.insert((
-                Arc::clone(&rel_arc),
-                Arc::clone(&from_arc),
-                Arc::clone(&to_arc),
-            ));
-            self.edges_out
-                .entry((Arc::clone(&rel_arc), Arc::clone(&from_arc)))
-                .or_default()
-                .push(Arc::clone(&to_arc));
-            self.edges_in
-                .entry((rel_arc, to_arc))
-                .or_default()
-                .push(from_arc);
-        }
-    }
-
-    /// Invoke closure for each outgoing or incoming neighbor key without allocating vectors.
-    #[inline]
-    pub fn for_each_neighbor(&self, rel: &str, node: &str, reverse: bool, mut f: impl FnMut(&str)) {
-        let synced = self.edge_keys.len() == self.edges.len();
-        if synced {
-            let key = (Arc::<str>::from(rel), Arc::<str>::from(node));
-            let map = if reverse {
-                &self.edges_in
-            } else {
-                &self.edges_out
-            };
-            if let Some(list) = map.get(&key) {
-                for dst in list {
-                    f(dst.as_ref());
-                }
-                return;
-            }
-            if self.edges.len() > 16 {
-                return;
-            }
-        }
-        for e in &self.edges {
-            if e.rel == rel {
-                if reverse {
-                    if e.to == node {
-                        f(e.from.as_str());
-                    }
-                } else if e.from == node {
-                    f(e.to.as_str());
-                }
-            }
-        }
-    }
-
-    /// Invoke closure for each outgoing or incoming neighbor `Arc<str>` key without string allocations.
-    #[inline]
-    pub fn for_each_neighbor_arc(
-        &self,
-        rel: &Arc<str>,
-        node: &Arc<str>,
-        reverse: bool,
-        mut f: impl FnMut(&Arc<str>),
-    ) {
-        let synced = self.edge_keys.len() == self.edges.len();
-        if synced {
-            let key = (Arc::clone(rel), Arc::clone(node));
-            let map = if reverse {
-                &self.edges_in
-            } else {
-                &self.edges_out
-            };
-            if let Some(list) = map.get(&key) {
-                for dst in list {
-                    f(dst);
-                }
-                return;
-            }
-            if self.edges.len() > 16 {
-                return;
-            }
-        }
-        for e in &self.edges {
-            if e.rel == rel.as_ref() {
-                if reverse {
-                    if e.to == node.as_ref() {
-                        let dst_arc = Arc::<str>::from(e.from.as_str());
-                        f(&dst_arc);
-                    }
-                } else if e.from == node.as_ref() {
-                    let dst_arc = Arc::<str>::from(e.to.as_str());
-                    f(&dst_arc);
-                }
-            }
-        }
-    }
-
-    /// Outgoing or incoming neighbor keys for `(rel, node)` in $O(1)$ lookup.
-    #[inline]
-    pub fn edge_neighbors(&self, rel: &str, node: &str, reverse: bool) -> Vec<Arc<str>> {
-        let synced = self.edge_keys.len() == self.edges.len();
-        if !synced {
-            return self
-                .edges
-                .iter()
-                .filter_map(|e| {
-                    if e.rel != rel {
-                        return None;
-                    }
-                    if reverse {
-                        (e.to == node).then(|| Arc::<str>::from(e.from.as_str()))
-                    } else {
-                        (e.from == node).then(|| Arc::<str>::from(e.to.as_str()))
-                    }
-                })
-                .collect();
-        }
-        let key = (Arc::<str>::from(rel), Arc::<str>::from(node));
-        let map = if reverse {
-            &self.edges_in
-        } else {
-            &self.edges_out
-        };
-        map.get(&key).cloned().unwrap_or_default()
-    }
-
-    /// Idempotent fact insert. Returns `(row, changed)`.
-    pub fn append_fact_row(&mut self, row: &Row) -> (Row, bool) {
-        let Some(key) = spo_key(row) else {
-            self.ensure_facts_rows();
-            self.collection_mut("facts").push(row.clone());
-            self.update_col_count("facts", 1);
-            // Zero-copy: just clone when necessary (only for caller return)
-            let row = self.collection("facts").last().unwrap().clone();
-            return (row, true);
-        };
-        if let Some(&idx) = self.facts_by_spo.get(&key) {
-            self.ensure_facts_rows();
-            // Zero-copy borrow when fact already exists
-            return (self.collection("facts")[idx].clone(), false);
-        }
-        let sa = Arc::clone(&key.0);
-        let pa = Arc::clone(&key.1);
-        let oa = Arc::clone(&key.2);
-        let idx = self.facts_s.len();
-        self.facts_by_spo.insert(key, idx);
-        self.facts_s.push(Arc::clone(&sa));
-        self.facts_p.push(Arc::clone(&pa));
-        self.facts_o.push(Arc::clone(&oa));
-        let mut built = BTreeMap::new();
-        built.insert("s".into(), Cell::Text(sa));
-        built.insert("p".into(), Cell::Text(pa));
-        built.insert("o".into(), Cell::Text(oa));
-        if self.facts_rows_stale {
-            self.ensure_facts_rows();
-        } else {
-            let facts = self.collections.entry("facts".into()).or_default();
-            if facts.len() == idx {
-                facts.push(built.clone());
-            } else {
-                self.facts_rows_stale = true;
-                self.ensure_facts_rows();
-            }
-        }
-        self.update_col_count("facts", 1);
-        (built, true)
-    }
-
-    /// Bulk append facts from columnar s/p/o.
-    /// When `want_rows` is false, skips `BTreeMap` row builds (materialize later via
-    /// [`Self::ensure_facts_rows`]) — keeps durable_append sync off the alloc path.
-    pub fn append_facts_spo_bulk(
-        &mut self,
-        s: &[Arc<str>],
-        p: &[Arc<str>],
-        o: &[Arc<str>],
-        want_rows: bool,
-    ) -> (Vec<Row>, usize) {
-        let n = s.len().min(p.len()).min(o.len());
-        self.facts_by_spo.reserve(n);
-        self.facts_s.reserve(n);
-        self.facts_p.reserve(n);
-        self.facts_o.reserve(n);
-        let mut rows = if want_rows {
-            Vec::with_capacity(n)
-        } else {
-            Vec::new()
-        };
-        let mut changed = 0usize;
-        for i in 0..n {
-            let key = (Arc::clone(&s[i]), Arc::clone(&p[i]), Arc::clone(&o[i]));
-            match self.facts_by_spo.entry(key) {
-                std::collections::hash_map::Entry::Occupied(_) => {
-                    if want_rows {
-                        let mut row = BTreeMap::new();
-                        row.insert("s".into(), Cell::Text(Arc::clone(&s[i])));
-                        row.insert("p".into(), Cell::Text(Arc::clone(&p[i])));
-                        row.insert("o".into(), Cell::Text(Arc::clone(&o[i])));
-                        rows.push(row);
-                    }
-                }
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    let idx = self.facts_s.len();
-                    e.insert(idx);
-                    self.facts_s.push(Arc::clone(&s[i]));
-                    self.facts_p.push(Arc::clone(&p[i]));
-                    self.facts_o.push(Arc::clone(&o[i]));
-                    self.facts_rows_stale = true;
-                    changed += 1;
-                    if want_rows {
-                        // Build only the returned row; full vec sync via ensure later.
-                        let mut row = BTreeMap::new();
-                        row.insert("s".into(), Cell::Text(Arc::clone(&self.facts_s[idx])));
-                        row.insert("p".into(), Cell::Text(Arc::clone(&self.facts_p[idx])));
-                        row.insert("o".into(), Cell::Text(Arc::clone(&self.facts_o[idx])));
-                        rows.push(row);
-                    }
-                }
-            }
-        }
-        if changed > 0 {
-            self.update_col_count("facts", changed as isize);
-        }
-        if want_rows && changed > 0 {
-            self.ensure_facts_rows();
-        }
-        (rows, changed)
-    }
-
-    pub fn append_edge_parts(&mut self, rel: &str, from: &str, to: &str) -> bool {
-        let rel_arc = Arc::<str>::from(rel);
-        let from_arc = Arc::<str>::from(from);
-        let to_arc = Arc::<str>::from(to);
-        let key = (
-            Arc::clone(&rel_arc),
-            Arc::clone(&from_arc),
-            Arc::clone(&to_arc),
-        );
-        if !self.edge_keys.insert(key) {
-            return false;
-        }
-        self.edges_out
-            .entry((Arc::clone(&rel_arc), Arc::clone(&from_arc)))
-            .or_default()
-            .push(Arc::clone(&to_arc));
-        self.edges_in
-            .entry((rel_arc, to_arc))
-            .or_default()
-            .push(from_arc);
-        self.edges.push(Edge {
-            rel: rel.to_owned(),
-            from: from.to_owned(),
-            to: to.to_owned(),
-        });
-        true
-    }
-
-    pub fn has_edge(&self, rel: &str, from: &str, to: &str) -> bool {
-        self.edge_keys.contains(&(
-            Arc::<str>::from(rel),
-            Arc::<str>::from(from),
-            Arc::<str>::from(to),
-        ))
-    }
-
-    pub fn remove_edge(&mut self, rel: &str, from: &str, to: &str) -> bool {
-        let rel_arc = Arc::<str>::from(rel);
-        let from_arc = Arc::<str>::from(from);
-        let to_arc = Arc::<str>::from(to);
-        let key = (
-            Arc::clone(&rel_arc),
-            Arc::clone(&from_arc),
-            Arc::clone(&to_arc),
-        );
-        if !self.edge_keys.remove(&key) {
-            return false;
-        }
-        if let Some(list) = self
-            .edges_out
-            .get_mut(&(Arc::clone(&rel_arc), Arc::clone(&from_arc)))
-        {
-            list.retain(|x| x.as_ref() != to);
-        }
-        if let Some(list) = self.edges_in.get_mut(&(rel_arc, to_arc)) {
-            list.retain(|x| x.as_ref() != from);
-        }
-        self.edges
-            .retain(|e| !(e.rel == rel && e.from == from && e.to == to));
-        true
-    }
 
     /// Physical positions in `collection` whose row key matches any of `rows`.
     /// Resolves each target through the id/uri maps for an O(D) path, mirroring
@@ -3394,7 +2096,11 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
             self.invalidate_docs_cache();
         }
         let id = row.get("id").and_then(Cell::text_shared);
-        let uri = row.get("uri").and_then(Cell::text_shared);
+        let uri = if collection == "docs" {
+            row.get("uri").and_then(Cell::text_shared)
+        } else {
+            None
+        };
         if let Some(ref id) = id {
             if collection == "docs" {
                 if !self.docs_moved_ids.is_empty() {
@@ -3404,10 +2110,14 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
                     self.retired_doc_ids.retain(|k| k != id);
                 }
             }
-            self.by_id
-                .entry(collection.to_string())
-                .or_default()
-                .insert(Arc::clone(id), idx);
+            if let Some(map) = self.by_id.get_mut(collection) {
+                map.insert(Arc::clone(id), idx);
+            } else {
+                self.by_id
+                    .entry(collection.to_string())
+                    .or_default()
+                    .insert(Arc::clone(id), idx);
+            }
         }
         if collection == "docs" {
             let title = row
@@ -3571,6 +2281,51 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
             }
             return;
         }
+        if collection == "orders" && self.orders_id.len() == start {
+            let by_id = self.by_id.entry(collection.to_string()).or_default();
+            for (i, row) in rows.iter().enumerate() {
+                let idx = start + i;
+                let id = row.get("id").and_then(Cell::text_shared).unwrap_or_default();
+                let uid = row
+                    .get("user_id")
+                    .and_then(Cell::text_shared)
+                    .unwrap_or_default();
+                let total = row.get("total").and_then(Cell::as_f64).unwrap_or(0.0);
+                if !id.is_empty() {
+                    by_id.insert(Arc::clone(&id), idx);
+                }
+                self.orders_id.push(id);
+                self.orders_user_id.push(uid);
+                self.orders_total.push(total);
+            }
+            return;
+        }
+        if collection == "users" && self.users_id.len() == start {
+            let by_id = self.by_id.entry(collection.to_string()).or_default();
+            for (i, row) in rows.iter().enumerate() {
+                let idx = start + i;
+                let id = row.get("id").and_then(Cell::text_shared).unwrap_or_default();
+                let email = row
+                    .get("email")
+                    .and_then(Cell::text_shared)
+                    .unwrap_or_default();
+                if !id.is_empty() {
+                    by_id.insert(Arc::clone(&id), idx);
+                }
+                self.users_id.push(id);
+                self.users_email.push(email);
+            }
+            return;
+        }
+        if !matches!(collection, "docs" | "orders" | "users" | "facts") {
+            let by_id = self.by_id.entry(collection.to_string()).or_default();
+            for (i, row) in rows.iter().enumerate() {
+                if let Some(id) = row.get("id").and_then(Cell::text_shared) {
+                    by_id.insert(id, start + i);
+                }
+            }
+            return;
+        }
         for (i, row) in rows.iter().enumerate() {
             self.row_maps_register_row(collection, start + i, row);
         }
@@ -3613,7 +2368,11 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
         after: &Row,
     ) {
         if collection == "docs" {
-            self.invalidate_docs_cache();
+            if before.get("title") != after.get("title") {
+                self.invalidate_docs_cache();
+            } else {
+                self.docs_epoch = next_docs_epoch();
+            }
         }
         let id = row_text(after, "id");
         let identity_moved =
@@ -4108,7 +2867,7 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
     }
 
     /// Load checkpointed posting lists when gen/nrows/fields match; ignore stale files.
-    fn try_load_fts(&mut self, dir: &Path, catalog: &crate::catalog::Catalog) {
+    pub(super) fn try_load_fts(&mut self, dir: &Path, catalog: &crate::catalog::Catalog) {
         for cname in catalog.collections.keys() {
             let fields = crate::fts::fts_fields(catalog, cname);
             if fields.is_empty() {
@@ -4126,7 +2885,7 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
         }
     }
 
-    fn write_fts_files(&mut self, dir: &Path) -> Result<(), Error> {
+    pub(super) fn write_fts_files(&mut self, dir: &Path) -> Result<(), Error> {
         self.flush_fts_deferred_docs();
         let mut keep = Vec::new();
         let rows_per_collection: Vec<(String, u64)> = self
@@ -4137,11 +2896,15 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
         let generation = self.r#gen;
         for (name, nrows) in rows_per_collection {
             if let Some(idx) = self.fts.get_mut(&name) {
-                crate::fts::write_fts(dir, &name, idx, generation, nrows)?;
+                crate::fts::write_fts_ext(dir, &name, idx, generation, nrows, false)?;
             }
             keep.push(name);
         }
-        crate::fts::prune_fts(dir, &keep)
+        crate::fts::prune_fts(dir, &keep)?;
+        if !keep.is_empty() {
+            persist::sync_dir_checked(&crate::fts::fts_dir(dir))?;
+        }
+        Ok(())
     }
 
     /// Rebuild FTS postings from catalog `fts` fields (memory / missing durable blob).
@@ -4388,20 +3151,32 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
             .filter(|(_, idx)| idx.def.collection == collection)
             .map(|(k, _)| k.clone())
             .collect();
+        let rows = self.collection(collection).to_vec();
         for label in labels {
-            let Some(snap) = self.extra_indexes.get(&label).cloned() else {
+            let def = if let Some(existing) = self.indexes.get(&label) {
+                existing.def.clone()
+            } else if let Some(snap) = self.extra_indexes.get(&label) {
+                let pred = snap
+                    .pred_src
+                    .as_deref()
+                    .and_then(|src| crate::parse::parse_pred_src(src).ok());
+                crate::catalog::IndexDef {
+                    collection: snap.collection.clone(),
+                    unique: snap.unique,
+                    fields: snap.fields.clone(),
+                    pred,
+                    bitmap_card_field: None,
+                }
+            } else {
                 continue;
             };
-            let def = crate::catalog::IndexDef {
-                collection: snap.collection.clone(),
-                unique: snap.unique,
-                fields: snap.fields.clone(),
-                pred: None,
-                bitmap_card_field: None,
-            };
             let mut live = LiveIndex::new(def);
-            for (i, row) in self.collection(collection).iter().enumerate() {
-                let _ = live.insert_at(i, row);
+            if live.def.pred.is_none() {
+                let _ = live.insert_slab_batch_no_reverse(0, &rows);
+            } else {
+                for (i, row) in rows.iter().enumerate() {
+                    let _ = live.insert_at(i, row);
+                }
             }
             self.indexes.insert(label, live);
         }
@@ -4484,661 +3259,6 @@ fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
         Some(self.index_seek(collection, uses, now)?.len())
     }
 
-    /// Count `docs.title ~ needle` (no group) using columnar titles + memchr.
-    pub fn docs_title_contains_count(&self, needle: &str) -> i64 {
-        if needle.is_empty() {
-            return self.docs_title.len() as i64;
-        }
-        let total_rows = self.docs_title.len();
-        if total_rows == 0 {
-            return 0;
-        }
-        // A derived physical column, not a result cache: every needle scans the
-        // bytes. Mutation invalidates it and the next scan rebuilds it once.
-        // Each title is terminated by a 0x00 byte so matching rows advance to
-        // the next '\0' in the same cache line without reading an offsets array.
-        let (bytes, has_nul) = self.docs_title_packed.get_or_init(|| {
-            let total_bytes: usize = self.docs_title.iter().map(|s| s.len() + 1).sum();
-            let mut bytes = Vec::with_capacity(total_bytes);
-            let mut has_nul = false;
-            for title in &self.docs_title {
-                let b = title.as_bytes();
-                if memchr::memchr(0, b).is_some() {
-                    has_nul = true;
-                }
-                bytes.extend_from_slice(b);
-                bytes.push(0);
-            }
-            (bytes, has_nul)
-        });
-
-        let needle_bytes = needle.as_bytes();
-        if *has_nul || memchr::memchr(0, needle_bytes).is_some() {
-            let finder = memchr::memmem::Finder::new(needle_bytes);
-            return self
-                .docs_title
-                .iter()
-                .filter(|t| finder.find(t.as_bytes()).is_some())
-                .count() as i64;
-        }
-
-        #[inline]
-        fn scan_nul_chunk(chunk: &[u8], finder: &memchr::memmem::Finder<'_>) -> i64 {
-            let mut cursor = 0usize;
-            let mut count = 0i64;
-            let len = chunk.len();
-            while cursor < len {
-                let Some(rel) = finder.find(&chunk[cursor..]) else {
-                    break;
-                };
-                let match_pos = cursor + rel;
-                count += 1;
-                if let Some(nul_rel) = memchr::memchr(0, &chunk[match_pos..]) {
-                    cursor = match_pos + nul_rel + 1;
-                } else {
-                    break;
-                }
-            }
-            count
-        }
-
-        let threads = if total_rows >= 8192 {
-            std::thread::available_parallelism()
-                .map(|p| p.get())
-                .unwrap_or(1)
-                .min(12)
-                .min((total_rows + 1023) / 1024)
-        } else {
-            1
-        };
-
-        if threads > 1 && bytes.len() >= threads * 4096 {
-            let mut bounds = Vec::with_capacity(threads + 1);
-            bounds.push(0usize);
-            for t in 1..threads {
-                let approx = (bytes.len() * t) / threads;
-                let prev = *bounds.last().unwrap();
-                if approx <= prev {
-                    bounds.push(prev);
-                } else if let Some(rel) = memchr::memchr(0, &bytes[approx..]) {
-                    bounds.push(approx + rel + 1);
-                } else {
-                    bounds.push(bytes.len());
-                }
-            }
-            bounds.push(bytes.len());
-
-            struct ScanJob {
-                ptr: usize,
-                len: usize,
-                needle_ptr: usize,
-                needle_len: usize,
-            }
-            struct ScanPool {
-                txs: Vec<std::sync::mpsc::SyncSender<ScanJob>>,
-                rxs: Vec<std::sync::mpsc::Receiver<i64>>,
-            }
-            static TITLE_SCAN_POOL: OnceLock<std::sync::Mutex<ScanPool>> = OnceLock::new();
-            let pool_mtx = TITLE_SCAN_POOL.get_or_init(|| {
-                let max_workers = 11;
-                let mut txs = Vec::with_capacity(max_workers);
-                let mut rxs = Vec::with_capacity(max_workers);
-                for i in 0..max_workers {
-                    let (job_tx, job_rx) = std::sync::mpsc::sync_channel::<ScanJob>(1);
-                    let (res_tx, res_rx) = std::sync::mpsc::sync_channel::<i64>(1);
-                    let _ = std::thread::Builder::new()
-                        .name(format!("lin-title-scan-{i}"))
-                        .spawn(move || {
-                            while let Ok(job) = job_rx.recv() {
-                                let chunk = unsafe {
-                                    std::slice::from_raw_parts(job.ptr as *const u8, job.len)
-                                };
-                                let ndl = unsafe {
-                                    std::slice::from_raw_parts(
-                                        job.needle_ptr as *const u8,
-                                        job.needle_len,
-                                    )
-                                };
-                                let finder = memchr::memmem::Finder::new(ndl);
-                                let c = scan_nul_chunk(chunk, &finder);
-                                let _ = res_tx.send(c);
-                            }
-                        });
-                    txs.push(job_tx);
-                    rxs.push(res_rx);
-                }
-                std::sync::Mutex::new(ScanPool { txs, rxs })
-            });
-
-            if let Ok(pool) = pool_mtx.try_lock() {
-                let workers = (threads - 1).min(pool.txs.len());
-                struct ScanDrainGuard<'a> {
-                    rxs: &'a [std::sync::mpsc::Receiver<i64>],
-                    dispatched: [bool; 11],
-                }
-                impl Drop for ScanDrainGuard<'_> {
-                    fn drop(&mut self) {
-                        for (w, sent) in self.dispatched.iter_mut().enumerate() {
-                            if *sent {
-                                *sent = false;
-                                let _ = self.rxs[w].recv();
-                            }
-                        }
-                    }
-                }
-                let mut scan_guard = ScanDrainGuard {
-                    rxs: &pool.rxs,
-                    dispatched: [false; 11],
-                };
-                for w in 0..workers {
-                    let b_start = bounds[w];
-                    let b_end = bounds[w + 1];
-                    if b_start < b_end {
-                        let slice = &bytes[b_start..b_end];
-                        if pool.txs[w]
-                            .send(ScanJob {
-                                ptr: slice.as_ptr() as usize,
-                                len: slice.len(),
-                                needle_ptr: needle_bytes.as_ptr() as usize,
-                                needle_len: needle_bytes.len(),
-                            })
-                            .is_ok()
-                        {
-                            scan_guard.dispatched[w] = true;
-                        }
-                    }
-                }
-                let finder = memchr::memmem::Finder::new(needle_bytes);
-                let my_start = bounds[workers];
-                let my_end = bounds[threads];
-                let mut total = if my_start < my_end {
-                    scan_nul_chunk(&bytes[my_start..my_end], &finder)
-                } else {
-                    0
-                };
-                for w in 0..workers {
-                    if scan_guard.dispatched[w] {
-                        scan_guard.dispatched[w] = false;
-                        if let Ok(c) = scan_guard.rxs[w].recv() {
-                            total += c;
-                        }
-                    }
-                }
-                return total;
-            }
-
-            let finder = memchr::memmem::Finder::new(needle_bytes);
-            std::thread::scope(|scope| {
-                let mut handles = Vec::with_capacity(threads);
-                for t in 0..threads {
-                    let b_start = bounds[t];
-                    let b_end = bounds[t + 1];
-                    if b_start >= b_end {
-                        continue;
-                    }
-                    let chunk = &bytes[b_start..b_end];
-                    let f_ref = &finder;
-                    handles.push(scope.spawn(move || scan_nul_chunk(chunk, f_ref)));
-                }
-                handles.into_iter().map(|h| h.join().unwrap()).sum()
-            })
-        } else {
-            let finder = memchr::memmem::Finder::new(needle_bytes);
-            scan_nul_chunk(bytes, &finder)
-        }
-    }
-
-    /// Count `docs.title ~ needle` grouped by layer using columnar titles (no row maps).
-    pub fn docs_title_contains_count_by_layer(&self, needle: &str) -> BTreeMap<Arc<str>, i64> {
-        let finder = memchr::memmem::Finder::new(needle.as_bytes());
-        let mut map: BTreeMap<Arc<str>, i64> = BTreeMap::new();
-        let n = self.docs_title.len().min(self.docs_layer.len());
-        let titles = &self.docs_title[..n];
-        let layers = &self.docs_layer;
-        for i in 0..n {
-            if finder.find(titles[i].as_bytes()).is_none() {
-                continue;
-            }
-            let layer = &layers[i];
-            // Borrow as str so hits reuse the existing key without Arc clone.
-            if let Some(c) = map.get_mut(layer.as_ref()) {
-                *c += 1;
-            } else {
-                map.insert(Arc::clone(layer), 1);
-            }
-        }
-        map
-    }
-
-    /// Project hot docs fields from parallel columns — Arc clone only, no full row clone.
-    /// True when orders SoA matches `collections["orders"]` length.
-    pub fn orders_soa_ready(&self) -> bool {
-        let n = self.collection("orders").len();
-        self.orders_id.len() == n && self.orders_user_id.len() == n && self.orders_total.len() == n
-    }
-
-    /// True when users SoA matches `collections["users"]` length.
-    pub fn users_soa_ready(&self) -> bool {
-        let n = self.collection("users").len();
-        self.users_id.len() == n && self.users_email.len() == n
-    }
-
-    pub fn orders_id(&self) -> &[Arc<str>] {
-        &self.orders_id
-    }
-    pub fn orders_user_id(&self) -> &[Arc<str>] {
-        &self.orders_user_id
-    }
-    pub fn orders_total(&self) -> &[f64] {
-        &self.orders_total
-    }
-    pub fn docs_wing(&self) -> &DictColumn {
-        &self.docs_wing
-    }
-    pub fn docs_layer(&self) -> &DictColumn {
-        &self.docs_layer
-    }
-    pub fn users_id(&self) -> &[Arc<str>] {
-        &self.users_id
-    }
-    pub fn users_email(&self) -> &[Arc<str>] {
-        &self.users_email
-    }
-
-    /// Fast projection over `docs` when filtering by `wing == target` or `layer == target`.
-    pub fn project_docs_dict_eq(
-        &self,
-        filter_field: &str,
-        target: &str,
-        fields: &[String],
-        limit: Option<usize>,
-    ) -> Option<Vec<Row>> {
-        if fields.is_empty() || !fields.iter().all(|f| docs_hot_field(f)) {
-            return None;
-        }
-        let n = self.docs_id.len();
-        if n != self.collections.get("docs").map_or(0, Vec::len) {
-            return None;
-        }
-        let (dict, field_tag) = match filter_field {
-            "wing" if self.docs_wing.len() == n => (&self.docs_wing, 1u64 << 32),
-            "layer" if self.docs_layer.len() == n => (&self.docs_layer, 2u64 << 32),
-            _ => return None,
-        };
-        let (codes, dict_vals) = dict.as_indices()?;
-        let Some(code) = dict_vals.iter().position(|v| **v == *target).map(|p| p as u8) else {
-            return Some(Vec::new());
-        };
-        if limit == Some(0) {
-            return Some(Vec::new());
-        }
-        let filter_tag = field_tag | (code as u64);
-        let id_title = fields.len() == 2 && fields[0] == "id" && fields[1] == "title";
-
-        let recycled = if id_title && limit.is_none() && n >= 1024 {
-            ID_TITLE_POOL.lock().ok().and_then(|mut g| g.take())
-        } else {
-            None
-        };
-
-        if let Some(ref rec) = recycled
-            && rec.docs_epoch == self.docs_epoch
-            && rec.filter_tag == filter_tag
-            && !rec.rows.is_empty()
-            && rec.first_idx < n
-            && rec.last_idx < n
-            && row_matches_id_title(
-                &rec.rows[0],
-                &self.docs_id[rec.first_idx],
-                &self.docs_title[rec.first_idx],
-            )
-            && row_matches_id_title(
-                rec.rows.last().unwrap(),
-                &self.docs_id[rec.last_idx],
-                &self.docs_title[rec.last_idx],
-            )
-        {
-            LAST_ID_TITLE_META.with(|c| {
-                c.set((self.docs_epoch, filter_tag, rec.first_idx, rec.last_idx));
-            });
-            return Some(recycled.unwrap().rows);
-        }
-
-        let max_take = limit.unwrap_or(usize::MAX);
-        let mut idxs = Vec::with_capacity(limit.unwrap_or(codes.len() / 2 + 16).min(codes.len()));
-        for (i, &c) in codes.iter().enumerate() {
-            if c == code {
-                idxs.push(i);
-                if idxs.len() >= max_take {
-                    break;
-                }
-            }
-        }
-        if idxs.is_empty() {
-            return Some(Vec::new());
-        }
-        if id_title && limit.is_none() && idxs.len() >= 1024 {
-            let first_idx = idxs[0];
-            let last_idx = *idxs.last().unwrap();
-            LAST_ID_TITLE_META.with(|c| {
-                c.set((self.docs_epoch, filter_tag, first_idx, last_idx));
-            });
-            if let Some(mut rec) = recycled
-                && rec.rows.len() == idxs.len()
-            {
-                let total_idxs = idxs.len();
-                let docs_id = &self.docs_id;
-                let docs_title = &self.docs_title;
-                let rows_ptr = rec.rows.as_mut_ptr() as usize;
-                let threads = std::thread::available_parallelism()
-                    .map(|p| p.get())
-                    .unwrap_or(1)
-                    .min((total_idxs + 1023) / 1024);
-                let next_chunk = std::sync::atomic::AtomicUsize::new(0);
-                let chunk_size = 4096;
-                std::thread::scope(|scope| {
-                    for _ in 0..threads {
-                        scope.spawn(|| loop {
-                            let start = next_chunk
-                                .fetch_add(chunk_size, std::sync::atomic::Ordering::Relaxed);
-                            if start >= total_idxs {
-                                break;
-                            }
-                            let end = (start + chunk_size).min(total_idxs);
-                            for offset in start..end {
-                                let i = idxs[offset];
-                                let row = unsafe { &mut *(rows_ptr as *mut Row).add(offset) };
-                                if row.len() == 2 {
-                                    let mut it = row.iter_mut();
-                                    if let (Some((k1, v1)), Some((k2, v2))) = (it.next(), it.next())
-                                        && k1 == "id"
-                                        && k2 == "title"
-                                    {
-                                        let same_id = match v1 {
-                                            Cell::Text(a) => Arc::ptr_eq(a, &docs_id[i]),
-                                            _ => false,
-                                        };
-                                        if !same_id {
-                                            *v1 = Cell::Text(Arc::clone(&docs_id[i]));
-                                        }
-                                        let same_title = match v2 {
-                                            Cell::Text(a) => Arc::ptr_eq(a, &docs_title[i]),
-                                            _ => false,
-                                        };
-                                        if !same_title {
-                                            *v2 = Cell::Text(Arc::clone(&docs_title[i]));
-                                        }
-                                        continue;
-                                    }
-                                }
-                                *row = row_id_title(&docs_id[i], &docs_title[i]);
-                            }
-                        });
-                    }
-                });
-                return Some(rec.rows);
-            }
-        }
-        self.project_docs_hot(&idxs, fields)
-    }
-
-    /// Returns None if any requested field is outside the hot set.
-    pub fn project_docs_hot(&self, idxs: &[usize], fields: &[String]) -> Option<Vec<Row>> {
-        if fields.is_empty() || !fields.iter().all(|f| docs_hot_field(f)) {
-            return None;
-        }
-
-        let n = self.docs_id.len();
-        if n != self.collections.get("docs").map_or(0, Vec::len) {
-            return None;
-        }
-        let total_idxs = idxs.len();
-        let id_title = fields.len() == 2 && fields[0] == "id" && fields[1] == "title";
-
-        if total_idxs >= 16384 {
-            let threads = std::thread::available_parallelism()
-                .map(|p| p.get())
-                .unwrap_or(1)
-                .min((total_idxs + 1023) / 1024);
-            if threads > 1 {
-                let docs_id = &self.docs_id;
-                let docs_title = &self.docs_title;
-                let docs_layer = &self.docs_layer;
-                let docs_wing = &self.docs_wing;
-
-                let mut out_buffer: Vec<std::mem::MaybeUninit<Row>> = Vec::with_capacity(total_idxs);
-                unsafe { out_buffer.set_len(total_idxs); }
-                let out_ptr = out_buffer.as_mut_ptr() as usize;
-
-                let next_chunk = std::sync::atomic::AtomicUsize::new(0);
-                let chunk_size = 4096;
-
-                std::thread::scope(|scope| {
-                    let mut handles = Vec::with_capacity(threads);
-                    for _ in 0..threads {
-                        handles.push(scope.spawn(|| {
-                            let k_id = String::from("id");
-                            let k_title = String::from("title");
-                            loop {
-                                let start = next_chunk.fetch_add(chunk_size, std::sync::atomic::Ordering::Relaxed);
-                                if start >= total_idxs {
-                                    break;
-                                }
-                                let end = (start + chunk_size).min(total_idxs);
-                                for offset in start..end {
-                                    let i = idxs[offset];
-                                    let slot = unsafe { &mut *(out_ptr as *mut std::mem::MaybeUninit<Row>).add(offset) };
-                                    if i >= n {
-                                        slot.write(acquire_row());
-                                        continue;
-                                    }
-                                    if id_title {
-                                        let mut row = BTreeMap::new();
-                                        row.insert(k_id.clone(), Cell::Text(Arc::clone(&docs_id[i])));
-                                        row.insert(k_title.clone(), Cell::Text(Arc::clone(&docs_title[i])));
-                                        slot.write(row);
-                                        continue;
-                                    }
-                                    let mut row = BTreeMap::new();
-                                    for f in fields {
-                                        let cell = match f.as_str() {
-                                            "id" => Cell::Text(Arc::clone(&docs_id[i])),
-                                            "title" => Cell::Text(Arc::clone(&docs_title[i])),
-                                            "layer" => Cell::Text(Arc::clone(&docs_layer[i])),
-                                            "wing" => Cell::Text(Arc::clone(&docs_wing[i])),
-                                            _ => Cell::Null,
-                                        };
-                                        row.insert(f.clone(), cell);
-                                    }
-                                    slot.write(row);
-                                }
-                            }
-                        }));
-                    }
-                    for h in handles {
-                        h.join().unwrap();
-                    }
-                });
-
-                let out = unsafe {
-                    let mut b = std::mem::ManuallyDrop::new(out_buffer);
-                    Vec::from_raw_parts(b.as_mut_ptr() as *mut Row, total_idxs, total_idxs)
-                };
-                return Some(out);
-            }
-        }
-
-        let mut out = Vec::with_capacity(total_idxs);
-        for &i in idxs {
-            if i >= n {
-                continue;
-            }
-            if id_title {
-                out.push(row_id_title(&self.docs_id[i], &self.docs_title[i]));
-                continue;
-            }
-            let mut row = BTreeMap::new();
-            for f in fields {
-                let cell = match f.as_str() {
-                    "id" => Cell::Text(Arc::clone(&self.docs_id[i])),
-                    "title" => Cell::Text(Arc::clone(&self.docs_title[i])),
-                    "layer" => Cell::Text(Arc::clone(&self.docs_layer[i])),
-                    "wing" => Cell::Text(Arc::clone(&self.docs_wing[i])),
-                    _ => Cell::Null,
-                };
-                row.insert(f.clone(), cell);
-            }
-            out.push(row);
-        }
-        Some(out)
-    }
-
-    /// Full docs scan projecting only hot columns when filter is title-contains or always-true path.
-    pub fn scan_docs_hot_project(
-        &self,
-        fields: &[String],
-        title_contains: Option<&str>,
-    ) -> Option<Vec<Row>> {
-        if fields.is_empty() || !fields.iter().all(|f| docs_hot_field(f)) {
-            return None;
-        }
-        let n = self.docs_id.len();
-        let id_title = fields.len() == 2 && fields[0] == "id" && fields[1] == "title";
-
-        if n >= 65536 {
-            let threads = std::thread::available_parallelism()
-                .map(|p| p.get())
-                .unwrap_or(1)
-                .min(8)
-                .min((n + 8191) / 8192);
-            if threads > 1 {
-                let chunk_size = (n + threads - 1) / threads;
-                let docs_id = &self.docs_id;
-                let docs_title = &self.docs_title;
-                let docs_layer = &self.docs_layer;
-                let docs_wing = &self.docs_wing;
-
-                let chunks_out: Vec<Vec<Row>> = std::thread::scope(|scope| {
-                    let mut handles = Vec::with_capacity(threads);
-                    for chunk_idx in 0..threads {
-                        let start = chunk_idx * chunk_size;
-                        if start >= n {
-                            break;
-                        }
-                        let end = (start + chunk_size).min(n);
-                        handles.push(scope.spawn(move || {
-                            let mut out = Vec::with_capacity(end - start);
-                            let finder = title_contains.map(|needle| memchr::memmem::Finder::new(needle.as_bytes()));
-                            for i in start..end {
-                                if let Some(f) = &finder
-                                    && f.find(docs_title[i].as_bytes()).is_none()
-                                {
-                                    continue;
-                                }
-                                if id_title {
-                                    out.push(row_id_title(&docs_id[i], &docs_title[i]));
-                                    continue;
-                                }
-                                let mut row = BTreeMap::new();
-                                for f in fields {
-                                    let cell = match f.as_str() {
-                                        "id" => Cell::Text(Arc::clone(&docs_id[i])),
-                                        "title" => Cell::Text(Arc::clone(&docs_title[i])),
-                                        "layer" => Cell::Text(Arc::clone(&docs_layer[i])),
-                                        "wing" => Cell::Text(Arc::clone(&docs_wing[i])),
-                                        _ => Cell::Null,
-                                    };
-                                    row.insert(f.clone(), cell);
-                                }
-                                out.push(row);
-                            }
-                            out
-                        }));
-                    }
-                    handles.into_iter().map(|h| h.join().unwrap()).collect()
-                });
-                let mut out = Vec::with_capacity(chunks_out.iter().map(Vec::len).sum());
-                for chunk in chunks_out {
-                    out.extend(chunk);
-                }
-                return Some(out);
-            }
-        }
-
-        let mut out = Vec::new();
-        let finder = title_contains.map(|n| memchr::memmem::Finder::new(n.as_bytes()));
-        for i in 0..n {
-            if let Some(f) = &finder
-                && f.find(self.docs_title[i].as_bytes()).is_none()
-            {
-                continue;
-            }
-            if id_title {
-                out.push(row_id_title(&self.docs_id[i], &self.docs_title[i]));
-                continue;
-            }
-            let mut row = BTreeMap::new();
-            for f in fields {
-                let cell = match f.as_str() {
-                    "id" => Cell::Text(Arc::clone(&self.docs_id[i])),
-                    "title" => Cell::Text(Arc::clone(&self.docs_title[i])),
-                    "layer" => Cell::Text(Arc::clone(&self.docs_layer[i])),
-                    "wing" => Cell::Text(Arc::clone(&self.docs_wing[i])),
-                    _ => Cell::Null,
-                };
-                row.insert(f.clone(), cell);
-            }
-            out.push(row);
-        }
-        Some(out)
-    }
-}
-
-#[inline]
-pub(crate) fn intern_wing(wing: Arc<str>) -> Arc<str> {
-    static WING_RAG: std::sync::LazyLock<Arc<str>> = std::sync::LazyLock::new(|| Arc::from("rag"));
-    static WING_SYS: std::sync::LazyLock<Arc<str>> = std::sync::LazyLock::new(|| Arc::from("sys"));
-    static WING_CORE: std::sync::LazyLock<Arc<str>> = std::sync::LazyLock::new(|| Arc::from("core"));
-    static WING_TEST: std::sync::LazyLock<Arc<str>> = std::sync::LazyLock::new(|| Arc::from("test"));
-    match wing.as_ref() {
-        "rag" => Arc::clone(&WING_RAG),
-        "sys" => Arc::clone(&WING_SYS),
-        "core" => Arc::clone(&WING_CORE),
-        "test" => Arc::clone(&WING_TEST),
-        _ => wing,
-    }
-}
-
-fn docs_hot_field(f: &str) -> bool {
-    matches!(f, "id" | "title" | "layer" | "wing")
-}
-
-#[inline]
-fn row_id_title(id: &Arc<str>, title: &Arc<str>) -> Row {
-    let mut row = BTreeMap::new();
-    row.insert(String::from("id"), Cell::Text(Arc::clone(id)));
-    row.insert(String::from("title"), Cell::Text(Arc::clone(title)));
-    row
-}
-
-fn spo_key(row: &Row) -> Option<(Arc<str>, Arc<str>, Arc<str>)> {
-    Some((
-        row.get("s").and_then(Cell::text_shared)?,
-        row.get("p").and_then(Cell::text_shared)?,
-        row.get("o").and_then(Cell::text_shared)?,
-    ))
-}
-
-pub fn project_fields(row: &Row, fields: &[String]) -> Row {
-    let mut out = acquire_row();
-    for f in fields {
-        if let Some((k, v)) = row.get_key_value(f) {
-            out.insert(k.clone(), v.clone_for_borrow());
-        } else {
-            out.insert(f.clone(), Cell::Null);
-        }
-    }
-    out
 }
 
 #[derive(Clone)]
@@ -5156,29 +3276,6 @@ pub struct MemBackup {
     hnsw: BTreeMap<String, crate::embed::VectorIndex>,
 }
 
-/// Move `v[p]` on top of the tail and drop the tail, keeping the vec dense. A
-/// no-op when `v` isn't parallel to the rows (the caller's length guard rebuilds).
-#[inline]
-fn swap_pop_at<T>(v: &mut Vec<T>, p: usize, len: usize) {
-    if v.len() == len && p < len {
-        v.swap_remove(p);
-    }
-}
-
-/// Inverse of [`swap_pop_at`]: `value` takes slot `p` and whatever was there moves
-/// to the tail. A no-op when `v` isn't parallel to the rows.
-fn swap_push_at<T: Clone>(v: &mut Vec<T>, p: usize, len: usize, value: T) {
-    if v.len() != len {
-        return;
-    }
-    if p == len {
-        v.push(value);
-    } else {
-        let moved = v[p].clone();
-        v.push(moved);
-        v[p] = value;
-    }
-}
 
 fn same_row_key(collection: &str, a: &Row, b: &Row) -> bool {
     if collection == "facts" {
@@ -5194,106 +3291,6 @@ fn same_row_key(collection: &str, a: &Row, b: &Row) -> bool {
     }
 }
 
-pub use crate::catalog::catalog_hash;
-
-pub fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
-
-pub fn content_hash_arc(body: &str) -> Arc<str> {
-    let h = fnv1a64(body.as_bytes());
-    let mut buf = [0u8; 18];
-    buf[0] = b'h';
-    buf[1] = b':';
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    for i in 0..16 {
-        let shift = (15 - i) * 4;
-        buf[2 + i] = HEX[((h >> shift) & 0xf) as usize];
-    }
-    // SAFETY: buf is always ASCII hex.
-    Arc::from(unsafe { std::str::from_utf8_unchecked(&buf) })
-}
-
-pub fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut h = 0xcbf29ce484222325u64;
-    for b in bytes {
-        h ^= u64::from(*b);
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    h
-}
-
-struct DocSeed<'a> {
-    id: &'a str,
-    uri: &'a str,
-    title: &'a str,
-    wing: &'a str,
-    room: &'a str,
-    layer: &'a str,
-    body: &'a str,
-    snippet: &'a str,
-    ts: i64,
-}
-
-fn doc_row(d: DocSeed<'_>) -> Row {
-    let mut r = BTreeMap::new();
-    r.insert("id".into(), Cell::text_arc(d.id));
-    r.insert("uri".into(), Cell::text_arc(d.uri));
-    r.insert("title".into(), Cell::text_arc(d.title));
-    r.insert("wing".into(), Cell::text_arc(d.wing));
-    r.insert("room".into(), Cell::text_arc(d.room));
-    r.insert("layer".into(), Cell::text_arc(d.layer));
-    r.insert("body".into(), Cell::text_arc(d.body));
-    r.insert("hash".into(), Cell::Text(content_hash_arc(d.body)));
-    r.insert("snippet".into(), Cell::text_arc(d.snippet));
-    r.insert("ts".into(), Cell::Time(d.ts));
-    r
-}
-
-fn user_row(id: &str, email: &str) -> Row {
-    let mut r = BTreeMap::new();
-    r.insert("id".into(), Cell::text_arc(id));
-    r.insert("email".into(), Cell::text_arc(email));
-    r
-}
-
-fn order_row(id: &str, user_id: &str, total: f64, ts: i64) -> Row {
-    let mut r = BTreeMap::new();
-    r.insert("id".into(), Cell::text_arc(id));
-    r.insert("user_id".into(), Cell::text_arc(user_id));
-    r.insert("total".into(), Cell::Float(total));
-    r.insert("ts".into(), Cell::Time(ts));
-    r
-}
-
-fn fmt_iso_millis(ms: i64) -> String {
-    let z = ms.div_euclid(1000);
-    let millis = ms.rem_euclid(1000) as u32;
-    let days = z.div_euclid(86_400);
-    let tod = z.rem_euclid(86_400) as u32;
-    let (y, m, d) = civil_from_days(days);
-    let hh = tod / 3600;
-    let mm = (tod % 3600) / 60;
-    let ss = tod % 60;
-    format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}.{millis:03}Z")
-}
-
-fn civil_from_days(days: i64) -> (i32, u32, u32) {
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u32;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y as i32, m, d)
-}
 
 #[cfg(test)]
 mod borrowed_delete_tests {

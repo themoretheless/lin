@@ -545,6 +545,105 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f64 {
     if a.len() != b.len() || a.is_empty() {
         return 0.0;
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        return unsafe { cosine_neon(a, b) };
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        cosine_scalar(a, b)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn cosine_neon(a: &[f32], b: &[f32]) -> f64 {
+    use std::arch::aarch64::*;
+    let n = a.len();
+    let chunks = n / 16;
+    let ap = a.as_ptr();
+    let bp = b.as_ptr();
+
+    let (mut dot, mut na, mut nb) = unsafe {
+        let mut d0 = vdupq_n_f32(0.0);
+        let mut d1 = vdupq_n_f32(0.0);
+        let mut d2 = vdupq_n_f32(0.0);
+        let mut d3 = vdupq_n_f32(0.0);
+
+        let mut na0 = vdupq_n_f32(0.0);
+        let mut na1 = vdupq_n_f32(0.0);
+        let mut na2 = vdupq_n_f32(0.0);
+        let mut na3 = vdupq_n_f32(0.0);
+
+        let mut nb0 = vdupq_n_f32(0.0);
+        let mut nb1 = vdupq_n_f32(0.0);
+        let mut nb2 = vdupq_n_f32(0.0);
+        let mut nb3 = vdupq_n_f32(0.0);
+
+        for c in 0..chunks {
+            let off = c * 16;
+            let va0 = vld1q_f32(ap.add(off));
+            let va1 = vld1q_f32(ap.add(off + 4));
+            let va2 = vld1q_f32(ap.add(off + 8));
+            let va3 = vld1q_f32(ap.add(off + 12));
+
+            let vb0 = vld1q_f32(bp.add(off));
+            let vb1 = vld1q_f32(bp.add(off + 4));
+            let vb2 = vld1q_f32(bp.add(off + 8));
+            let vb3 = vld1q_f32(bp.add(off + 12));
+
+            d0 = vfmaq_f32(d0, va0, vb0);
+            d1 = vfmaq_f32(d1, va1, vb1);
+            d2 = vfmaq_f32(d2, va2, vb2);
+            d3 = vfmaq_f32(d3, va3, vb3);
+
+            na0 = vfmaq_f32(na0, va0, va0);
+            na1 = vfmaq_f32(na1, va1, va1);
+            na2 = vfmaq_f32(na2, va2, va2);
+            na3 = vfmaq_f32(na3, va3, va3);
+
+            nb0 = vfmaq_f32(nb0, vb0, vb0);
+            nb1 = vfmaq_f32(nb1, vb1, vb1);
+            nb2 = vfmaq_f32(nb2, vb2, vb2);
+            nb3 = vfmaq_f32(nb3, vb3, vb3);
+        }
+
+        let d_sum = vaddq_f32(vaddq_f32(d0, d1), vaddq_f32(d2, d3));
+        let na_sum = vaddq_f32(vaddq_f32(na0, na1), vaddq_f32(na2, na3));
+        let nb_sum = vaddq_f32(vaddq_f32(nb0, nb1), vaddq_f32(nb2, nb3));
+        (
+            vaddvq_f32(d_sum) as f64,
+            vaddvq_f32(na_sum) as f64,
+            vaddvq_f32(nb_sum) as f64,
+        )
+    };
+
+    for i in (chunks * 16)..n {
+        let x = a[i] as f64;
+        let y = b[i] as f64;
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
+    }
+
+    if !dot.is_finite() || !na.is_finite() || !nb.is_finite() || na <= 1e-18 || nb <= 1e-18 {
+        return 0.0;
+    }
+    let denom = na.sqrt() * nb.sqrt();
+    if denom <= 1e-18 || !denom.is_finite() {
+        return 0.0;
+    }
+    let sim = dot / denom;
+    if sim.is_nan() {
+        0.0
+    } else {
+        sim.clamp(-1.0, 1.0)
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+#[inline]
+fn cosine_scalar(a: &[f32], b: &[f32]) -> f64 {
     let n = a.len();
     let chunks = n / 8;
     let mut dot0 = 0.0f32;
@@ -652,9 +751,92 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f64 {
 /// Fast cosine similarity when the query vector norm `q_norm = sqrt(sum(qv[i]^2))` is precomputed.
 #[inline]
 pub fn cosine_with_q_norm(qv: &[f32], q_norm: f64, v: &[f32]) -> f64 {
-    if qv.len() != v.len() || qv.is_empty() || q_norm <= 1e-18 {
+    if qv.len() != v.len() || qv.is_empty() || q_norm <= 1e-18 || !q_norm.is_finite() {
         return 0.0;
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        return unsafe { cosine_with_q_norm_neon(qv, q_norm, v) };
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        cosine_with_q_norm_scalar(qv, q_norm, v)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn cosine_with_q_norm_neon(qv: &[f32], q_norm: f64, v: &[f32]) -> f64 {
+    use std::arch::aarch64::*;
+    let n = qv.len();
+    let chunks = n / 16;
+    let ap = qv.as_ptr();
+    let bp = v.as_ptr();
+
+    let (mut dot, mut nb) = unsafe {
+        let mut d0 = vdupq_n_f32(0.0);
+        let mut d1 = vdupq_n_f32(0.0);
+        let mut d2 = vdupq_n_f32(0.0);
+        let mut d3 = vdupq_n_f32(0.0);
+
+        let mut nb0 = vdupq_n_f32(0.0);
+        let mut nb1 = vdupq_n_f32(0.0);
+        let mut nb2 = vdupq_n_f32(0.0);
+        let mut nb3 = vdupq_n_f32(0.0);
+
+        for c in 0..chunks {
+            let off = c * 16;
+            let va0 = vld1q_f32(ap.add(off));
+            let va1 = vld1q_f32(ap.add(off + 4));
+            let va2 = vld1q_f32(ap.add(off + 8));
+            let va3 = vld1q_f32(ap.add(off + 12));
+
+            let vb0 = vld1q_f32(bp.add(off));
+            let vb1 = vld1q_f32(bp.add(off + 4));
+            let vb2 = vld1q_f32(bp.add(off + 8));
+            let vb3 = vld1q_f32(bp.add(off + 12));
+
+            d0 = vfmaq_f32(d0, va0, vb0);
+            d1 = vfmaq_f32(d1, va1, vb1);
+            d2 = vfmaq_f32(d2, va2, vb2);
+            d3 = vfmaq_f32(d3, va3, vb3);
+
+            nb0 = vfmaq_f32(nb0, vb0, vb0);
+            nb1 = vfmaq_f32(nb1, vb1, vb1);
+            nb2 = vfmaq_f32(nb2, vb2, vb2);
+            nb3 = vfmaq_f32(nb3, vb3, vb3);
+        }
+
+        let d_sum = vaddq_f32(vaddq_f32(d0, d1), vaddq_f32(d2, d3));
+        let nb_sum = vaddq_f32(vaddq_f32(nb0, nb1), vaddq_f32(nb2, nb3));
+        (vaddvq_f32(d_sum) as f64, vaddvq_f32(nb_sum) as f64)
+    };
+
+    for i in (chunks * 16)..n {
+        let x = qv[i] as f64;
+        let y = v[i] as f64;
+        dot += x * y;
+        nb += y * y;
+    }
+
+    if !dot.is_finite() || !nb.is_finite() || nb <= 1e-18 {
+        return 0.0;
+    }
+    let denom = q_norm * nb.sqrt();
+    if denom <= 1e-18 || !denom.is_finite() {
+        return 0.0;
+    }
+    let sim = dot / denom;
+    if sim.is_nan() {
+        0.0
+    } else {
+        sim.clamp(-1.0, 1.0)
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+#[inline]
+fn cosine_with_q_norm_scalar(qv: &[f32], q_norm: f64, v: &[f32]) -> f64 {
     let n = qv.len();
     let chunks = n / 8;
     let mut dot0 = 0.0f32;
@@ -739,6 +921,20 @@ pub fn cosine_with_q_norm(qv: &[f32], q_norm: f64, v: &[f32]) -> f64 {
     }
 }
 
+#[inline]
+pub(crate) fn l2_norm_f64(v: &[f32]) -> f64 {
+    let mut s = 0.0f64;
+    for &x in v {
+        let xd = x as f64;
+        s += xd * xd;
+    }
+    if s.is_finite() && s > 1e-18 {
+        s.sqrt()
+    } else {
+        0.0
+    }
+}
+
 /// Candidate in max-heap: highest similarity at the top (popped first).
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
@@ -810,10 +1006,22 @@ impl Ord for MinSimNode {
 
 /// Scalar element trait for HNSW vector storage (`f32` or quantized `i8`).
 pub trait HnswScalar: Copy + Sized + 'static {
+    type QueryCtx: Copy;
+    fn prepare_query(q: &[Self]) -> Self::QueryCtx;
+    fn sim_ctx(q: &[Self], ctx: Self::QueryCtx, b: &[Self]) -> f64;
     fn sim(a: &[Self], b: &[Self]) -> f64;
 }
 
 impl HnswScalar for f32 {
+    type QueryCtx = f64;
+    #[inline]
+    fn prepare_query(q: &[Self]) -> f64 {
+        l2_norm_f64(q)
+    }
+    #[inline]
+    fn sim_ctx(q: &[Self], q_norm: f64, b: &[Self]) -> f64 {
+        cosine_with_q_norm(q, q_norm, b)
+    }
     #[inline]
     fn sim(a: &[Self], b: &[Self]) -> f64 {
         cosine(a, b)
@@ -821,6 +1029,13 @@ impl HnswScalar for f32 {
 }
 
 impl HnswScalar for i8 {
+    type QueryCtx = ();
+    #[inline]
+    fn prepare_query(_q: &[Self]) {}
+    #[inline]
+    fn sim_ctx(q: &[Self], _ctx: (), b: &[Self]) -> f64 {
+        dot_sq8(q, b)
+    }
     #[inline]
     fn sim(a: &[Self], b: &[Self]) -> f64 {
         dot_sq8(a, b)
@@ -1018,15 +1233,16 @@ impl<T: HnswScalar> HnswGraph<T> {
         };
 
         let curr_max_level = self.max_level;
+        let q_ctx = T::prepare_query(&vector);
 
         // 1. Greedy search from max_level down to node_level + 1
         for level in (node_level + 1..=curr_max_level).rev() {
-            let mut curr_sim = T::sim(&vector, &self.nodes[curr].vector);
+            let mut curr_sim = T::sim_ctx(&vector, q_ctx, &self.nodes[curr].vector);
             loop {
                 let mut changed = false;
                 if level < self.nodes[curr].neighbors.len() {
                     for &nbr in &self.nodes[curr].neighbors[level] {
-                        let sim = T::sim(&vector, &self.nodes[nbr].vector);
+                        let sim = T::sim_ctx(&vector, q_ctx, &self.nodes[nbr].vector);
                         if sim > curr_sim {
                             curr_sim = sim;
                             curr = nbr;
@@ -1045,7 +1261,8 @@ impl<T: HnswScalar> HnswGraph<T> {
         let mut entry_points = vec![curr];
 
         for level in (0..=top_connect_level).rev() {
-            let candidates = self.search_layer(&vector, &entry_points, self.ef_construction, level);
+            let candidates =
+                self.search_layer(&vector, q_ctx, &entry_points, self.ef_construction, level);
             let max_conn = if level == 0 { self.m0 } else { self.m };
             let neighbors = self.select_neighbors(&candidates, max_conn);
 
@@ -1072,6 +1289,7 @@ impl<T: HnswScalar> HnswGraph<T> {
     fn search_layer(
         &self,
         query: &[T],
+        q_ctx: T::QueryCtx,
         entry_points: &[usize],
         ef: usize,
         level: usize,
@@ -1082,7 +1300,7 @@ impl<T: HnswScalar> HnswGraph<T> {
 
             for &ep in entry_points {
                 if scratch.visit(ep) {
-                    let sim = T::sim(query, &self.nodes[ep].vector);
+                    let sim = T::sim_ctx(query, q_ctx, &self.nodes[ep].vector);
                     scratch.candidates.push(MaxSimNode { sim, idx: ep });
                     scratch.w.push(MinSimNode { sim, idx: ep });
                 }
@@ -1097,7 +1315,7 @@ impl<T: HnswScalar> HnswGraph<T> {
                 if level < self.nodes[c.idx].neighbors.len() {
                     for &nbr in &self.nodes[c.idx].neighbors[level] {
                         if scratch.visit(nbr) {
-                            let sim = T::sim(query, &self.nodes[nbr].vector);
+                            let sim = T::sim_ctx(query, q_ctx, &self.nodes[nbr].vector);
                             let worst_in_w =
                                 scratch.w.peek().map(|x| x.sim).unwrap_or(f64::NEG_INFINITY);
                             if sim > worst_in_w || scratch.w.len() < ef {
@@ -1132,11 +1350,12 @@ impl<T: HnswScalar> HnswGraph<T> {
 
     fn prune_neighbors(&mut self, node_idx: usize, level: usize, max_conn: usize) {
         let node_vec = Arc::clone(&self.nodes[node_idx].vector);
+        let q_ctx = T::prepare_query(&node_vec);
         let nbrs = &self.nodes[node_idx].neighbors[level];
         let mut scored: Vec<MaxSimNode> = nbrs
             .iter()
             .map(|&nbr| MaxSimNode {
-                sim: T::sim(&node_vec, &self.nodes[nbr].vector),
+                sim: T::sim_ctx(&node_vec, q_ctx, &self.nodes[nbr].vector),
                 idx: nbr,
             })
             .collect();
@@ -1149,13 +1368,14 @@ impl<T: HnswScalar> HnswGraph<T> {
         if k == 0 || self.nodes.is_empty() {
             return Vec::new();
         }
+        let q_ctx = T::prepare_query(query);
 
         if self.id_to_idx.len() <= k.max(32) {
             let mut scored: Vec<(f64, usize)> = self
                 .nodes
                 .iter()
                 .filter(|n| n.id != usize::MAX)
-                .map(|n| (T::sim(query, &n.vector), n.id))
+                .map(|n| (T::sim_ctx(query, q_ctx, &n.vector), n.id))
                 .filter(|(s, _)| *s > 0.0)
                 .collect();
             if scored.len() > k {
@@ -1180,12 +1400,12 @@ impl<T: HnswScalar> HnswGraph<T> {
         };
 
         for level in (1..=self.max_level).rev() {
-            let mut curr_sim = T::sim(query, &self.nodes[curr].vector);
+            let mut curr_sim = T::sim_ctx(query, q_ctx, &self.nodes[curr].vector);
             loop {
                 let mut changed = false;
                 if level < self.nodes[curr].neighbors.len() {
                     for &nbr in &self.nodes[curr].neighbors[level] {
-                        let sim = T::sim(query, &self.nodes[nbr].vector);
+                        let sim = T::sim_ctx(query, q_ctx, &self.nodes[nbr].vector);
                         if sim > curr_sim {
                             curr_sim = sim;
                             curr = nbr;
@@ -1200,7 +1420,7 @@ impl<T: HnswScalar> HnswGraph<T> {
         }
 
         let ef = ef_search.max(k).max(16);
-        let candidates = self.search_layer(query, &[curr], ef, 0);
+        let candidates = self.search_layer(query, q_ctx, &[curr], ef, 0);
 
         let mut results: Vec<(f64, usize)> = candidates
             .into_iter()
@@ -1304,8 +1524,8 @@ pub fn dequantize_sq8(v: &[i8]) -> Vec<f32> {
 
 /// Dot product / cosine similarity between two SQ8-quantized vectors.
 ///
-/// Uses an 8-way unrolled integer accumulator for high throughput.
-/// Scaled by `(127.0 * 127.0)^-1`.
+/// Uses ARM NEON integer widening multiply-accumulate on aarch64 and an 8-way
+/// unrolled integer accumulator elsewhere. Scaled by `(127.0 * 127.0)^-1`.
 #[inline]
 pub fn dot_sq8(a: &[i8], b: &[i8]) -> f64 {
     let n = a.len().min(b.len());
@@ -1313,6 +1533,47 @@ pub fn dot_sq8(a: &[i8], b: &[i8]) -> f64 {
         return 0.0;
     }
 
+    #[cfg(target_arch = "aarch64")]
+    let total = unsafe { dot_sq8_neon(a, b, n) };
+
+    #[cfg(not(target_arch = "aarch64"))]
+    let total = dot_sq8_scalar(a, b, n);
+
+    const SCALE: f64 = 1.0 / (127.0 * 127.0);
+    let sim = (total as f64) * SCALE;
+    sim.clamp(-1.0, 1.0)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn dot_sq8_neon(a: &[i8], b: &[i8], n: usize) -> i32 {
+    use std::arch::aarch64::*;
+    let chunks = n / 16;
+    let ap = a.as_ptr();
+    let bp = b.as_ptr();
+    let mut total = unsafe {
+        let mut acc0 = vdupq_n_s32(0);
+        let mut acc1 = vdupq_n_s32(0);
+        for c in 0..chunks {
+            let off = c * 16;
+            let va = vld1q_s8(ap.add(off));
+            let vb = vld1q_s8(bp.add(off));
+            let prod_lo = vmull_s8(vget_low_s8(va), vget_low_s8(vb));
+            let prod_hi = vmull_s8(vget_high_s8(va), vget_high_s8(vb));
+            acc0 = vpadalq_s16(acc0, prod_lo);
+            acc1 = vpadalq_s16(acc1, prod_hi);
+        }
+        vaddvq_s32(vaddq_s32(acc0, acc1))
+    };
+    for i in (chunks * 16)..n {
+        total += (a[i] as i32) * (b[i] as i32);
+    }
+    total
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+#[inline]
+fn dot_sq8_scalar(a: &[i8], b: &[i8], n: usize) -> i32 {
     let chunks = n / 8;
     let mut sum0 = 0i32;
     let mut sum1 = 0i32;
@@ -1334,10 +1595,7 @@ pub fn dot_sq8(a: &[i8], b: &[i8]) -> f64 {
     for i in (chunks * 8)..n {
         total += (a[i] as i32) * (b[i] as i32);
     }
-
-    const SCALE: f64 = 1.0 / (127.0 * 127.0);
-    let sim = (total as f64) * SCALE;
-    sim.clamp(-1.0, 1.0)
+    total
 }
 
 impl HnswGraph<i8> {
