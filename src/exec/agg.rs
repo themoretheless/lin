@@ -825,6 +825,44 @@ impl Db {
                         && by_field.leaf() == Some("user_id")
                     {
                         if plan.filter.is_none() {
+                            if let Some(live_idx) = self.store.indexes.values().find(|idx| {
+                                idx.def.collection == "orders"
+                                    && idx.def.pred.is_none()
+                                    && !idx.def.fields.is_empty()
+                                    && idx.def.fields[0] == "user_id"
+                            }) {
+                                let totals = self.store.orders_total();
+                                let mut out = Vec::with_capacity(live_idx.forward.len());
+                                for (key, list) in &live_idx.forward {
+                                    let uid_cell = match key.0.first() {
+                                        Some(crate::index::IndexPart::Text(s)) => {
+                                            Cell::Text(Arc::clone(s))
+                                        }
+                                        Some(crate::index::IndexPart::SmallText(s)) => {
+                                            Cell::text_arc(s.as_str())
+                                        }
+                                        _ => continue,
+                                    };
+                                    let mut sum = 0.0f64;
+                                    match list {
+                                        crate::index::PostingList::Standard(vec) => {
+                                            for &pos in vec {
+                                                sum += totals.get(pos).copied().unwrap_or(0.0);
+                                            }
+                                        }
+                                        crate::index::PostingList::Bitmap(set) => {
+                                            set.for_each(|pos| {
+                                                sum += totals.get(pos).copied().unwrap_or(0.0);
+                                            });
+                                        }
+                                    }
+                                    let mut row = crate::store::acquire_row();
+                                    row.insert("user_id".into(), uid_cell);
+                                    row.insert("total".into(), Cell::Float(sum));
+                                    out.push(row);
+                                }
+                                return Ok(out);
+                            }
                             let uids = self.store.orders_user_id();
                             let totals = self.store.orders_total();
                             let total_len = totals.len();

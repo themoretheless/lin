@@ -56,6 +56,54 @@ pub fn parse_program(src: &str) -> Result<Vec<Stmt>, Error> {
     parse_program_with_limits(src, DEFAULT_MAX_QUERY_BYTES, DEFAULT_MAX_AST_DEPTH)
 }
 
+/// Fast path for interactive transactions: parse a single-row `insert <col> [{ ... }]`
+/// or `insert <col> { ... }` without allocating `Stmt`, `Vec<Record>`, or field `String`s.
+pub(crate) fn try_parse_single_insert(
+    src: &str,
+) -> Option<(&str, smallvec::SmallVec<[(&str, Value); 8]>)> {
+    let mut p = Parser::new_with_limits(src, DEFAULT_MAX_AST_DEPTH);
+    if !p.eat_kw("insert") {
+        return None;
+    }
+    let collection = p.eat_ident_str()?;
+    let bracket = p.eat_char('[');
+    if !p.eat_char('{') {
+        return None;
+    }
+    let mut fields = smallvec::SmallVec::new();
+    loop {
+        p.skip();
+        if p.peek() == Some('}') {
+            break;
+        }
+        let name = p.eat_ident_str()?;
+        if !p.eat_char(':') {
+            return None;
+        }
+        let value = p.parse_value().ok()?;
+        fields.push((name, value));
+        let comma = p.eat_char(',');
+        p.skip();
+        if p.peek() == Some('}') {
+            break;
+        }
+        if !comma {
+            return None;
+        }
+    }
+    if !p.eat_char('}') || fields.is_empty() {
+        return None;
+    }
+    if bracket && !p.eat_char(']') {
+        return None;
+    }
+    p.skip();
+    if !p.eof() {
+        return None;
+    }
+    Some((collection, fields))
+}
+
 pub fn parse_program_with_limits(
     src: &str,
     max_bytes: usize,

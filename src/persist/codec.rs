@@ -1792,12 +1792,83 @@ pub fn rows_to_insert_cols(
 
 pub fn cols_to_rows(fields: &[String], cols: &[ColData], n: usize) -> Vec<crate::store::Row> {
     use crate::store::Cell;
-    let mut rows = Vec::with_capacity(n);
     if n >= 2 && fields.windows(2).all(|w| w[0] < w[1]) {
         let template: crate::store::Row = fields
             .iter()
             .map(|f| (f.clone(), Cell::Null))
             .collect();
+        if n >= 4096 {
+            let threads = std::thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(4)
+                .min(8)
+                .max(1);
+            if threads > 1 {
+                let chunk_size = n.div_ceil(threads);
+                let chunks: Vec<Vec<crate::store::Row>> = std::thread::scope(|s| {
+                    let handles: Vec<_> = (0..threads)
+                        .filter_map(|t| {
+                            let start = t * chunk_size;
+                            if start >= n {
+                                return None;
+                            }
+                            let end = (start + chunk_size).min(n);
+                            let tmpl = template.clone();
+                            Some(s.spawn(move || {
+                                let mut part = Vec::with_capacity(end - start);
+                                for i in start..end {
+                                    let mut row = tmpl.clone();
+                                    for (fi, slot) in row.values_mut().enumerate() {
+                                        *slot = match cols.get(fi) {
+                                            Some(ColData::Text(v)) => v
+                                                .get(i)
+                                                .map(|s| Cell::Text(std::sync::Arc::clone(s)))
+                                                .unwrap_or_else(|| Cell::text_arc("")),
+                                            Some(ColData::Int(v)) => {
+                                                Cell::Int(v.get(i).copied().unwrap_or(0))
+                                            }
+                                            Some(ColData::Float(v)) => {
+                                                Cell::Float(v.get(i).copied().unwrap_or(0.0))
+                                            }
+                                            Some(ColData::Bool(v)) => {
+                                                Cell::Bool(v.get(i).copied().unwrap_or(false))
+                                            }
+                                            Some(ColData::Time(v)) => {
+                                                Cell::Time(v.get(i).copied().unwrap_or(0))
+                                            }
+                                            Some(ColData::Vec(v)) => {
+                                                match v.get(i).and_then(|o| o.as_ref()) {
+                                                    Some(emb) => {
+                                                        Cell::vec_arc(std::sync::Arc::clone(emb))
+                                                    }
+                                                    _ => Cell::Null,
+                                                }
+                                            }
+                                            Some(ColData::Null) | None => Cell::Null,
+                                        };
+                                    }
+                                    part.push(row);
+                                }
+                                part
+                            }))
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .filter_map(|h| h.join().ok())
+                        .collect()
+                });
+                let total_built: usize = chunks.iter().map(Vec::len).sum();
+                if total_built == n {
+                    let mut rows = Vec::with_capacity(n);
+                    for part in chunks {
+                        rows.extend(part);
+                    }
+                    return rows;
+                }
+            }
+        }
+        let mut rows = Vec::with_capacity(n);
         for i in 0..n {
             let mut row = template.clone();
             for (fi, slot) in row.values_mut().enumerate() {
@@ -1821,6 +1892,7 @@ pub fn cols_to_rows(fields: &[String], cols: &[ColData], n: usize) -> Vec<crate:
         }
         return rows;
     }
+    let mut rows = Vec::with_capacity(n);
     for i in 0..n {
         let mut row = crate::store::Row::new();
         for (fi, f) in fields.iter().enumerate() {

@@ -13,8 +13,9 @@ pub use edges::Edge;
 pub(crate) use value::intern_wing;
 #[allow(unused_imports)]
 pub use value::{
-    Cell, InlineStr, Row, RowExt, acquire_row, compact_row, content_hash_arc, fnv1a64, now_ms,
-    project_fields, release_id_title_rows, row_byte_size, row_text,
+    Cell, InlineStr, Row, RowExt, acquire_orders_row, acquire_row, compact_row, content_hash_arc,
+    fnv1a64, now_ms, project_fields, release_id_title_rows, release_orders_row, row_byte_size,
+    row_text,
 };
 
 use std::collections::BTreeMap;
@@ -70,7 +71,7 @@ pub struct Store {
 
     /// Parallel Arc columns for docs — contains scans + projected materialize
     /// without cloning full `BTreeMap` rows. Organized SoA (struct-of-arrays) for cache locality.
-    docs_id: Vec<Arc<str>>,
+    pub(crate) docs_id: Vec<Arc<str>>,
     docs_title: Vec<Arc<str>>,
     docs_title_packed: OnceLock<(Vec<u8>, bool)>,
     pub(crate) docs_epoch: u64,
@@ -85,9 +86,9 @@ pub struct Store {
     pub(crate) retired_rows: smallvec::SmallVec<[Row; 2]>,
     pub(crate) retired_cells: smallvec::SmallVec<[Cell; 8]>,
     /// SoA for orders / users — FK join + OLAP project without per-row maps.
-    orders_id: Vec<Arc<str>>,
-    orders_user_id: Vec<Arc<str>>,
-    orders_total: Vec<f64>,
+    pub(crate) orders_id: Vec<Arc<str>>,
+    pub(crate) orders_user_id: Vec<Arc<str>>,
+    pub(crate) orders_total: Vec<f64>,
     users_id: Vec<Arc<str>>,
     users_email: Vec<Arc<str>>,
     /// Columnar facts (append hot path). `collections["facts"]` may lag until
@@ -737,7 +738,15 @@ impl Store {
                         }
                     }
                     if let Some(rows) = self.collections.get_mut(name) {
-                        rows.truncate(prev_len);
+                        if name == "orders" && cur_len - prev_len <= 64 {
+                            while rows.len() > prev_len {
+                                if let Some(row) = rows.pop() {
+                                    release_orders_row(row);
+                                }
+                            }
+                        } else {
+                            rows.truncate(prev_len);
+                        }
                     }
                 } else {
                     for idx in (prev_len..cur_len).rev() {
@@ -1034,7 +1043,14 @@ impl Store {
     }
 
     fn doc_uri_index(&self, uri: &str) -> Option<usize> {
-        if let Some(&idx) = self.docs_by_uri.get(uri) {
+        if let Some(mut idx) = self.docs_by_uri.get(uri).copied() {
+            for &(from, to) in &self.docs_moved_idxs {
+                if idx == to {
+                    return None;
+                } else if idx == from {
+                    idx = to;
+                }
+            }
             return Some(idx);
         }
         if self.docs_by_uri.is_empty() && !self.docs_id.is_empty() {
@@ -1409,10 +1425,30 @@ impl Store {
                     {
                         fts.swap_remove_row(p, &doomed, last, tail);
                     }
+                    if !self.docs_by_uri.is_empty() {
+                        if let Some(dead_uri) = row_text(&doomed, "uri") {
+                            self.docs_by_uri.remove(dead_uri);
+                        }
+                        if let Some(docs) = self.collections.get("docs")
+                            && let Some(tail) = docs.get(p)
+                            && let Some(u_s) = row_text(tail, "uri")
+                        {
+                            if let Some(slot) = self.docs_by_uri.get_mut(u_s) {
+                                *slot = p;
+                            } else if let Some(uri) = tail.get("uri").and_then(Cell::text_shared) {
+                                self.docs_by_uri.insert(uri, p);
+                            }
+                        }
+                    }
                 } else {
                     self.index_remove_row("docs", p, &doomed);
                     if let Some(fts) = self.fts.get_mut("docs") {
                         fts.remove_row(p, &doomed);
+                    }
+                    if !self.docs_by_uri.is_empty()
+                        && let Some(dead_uri) = row_text(&doomed, "uri")
+                    {
+                        self.docs_by_uri.remove(dead_uri);
                     }
                 }
             }
@@ -1445,7 +1481,6 @@ impl Store {
         let last = old_n - 1;
         if p != last
             && self.hnsw.is_empty()
-            && self.docs_by_uri.is_empty()
             && self.docs_id.len() == old_n
             && self.docs_title.len() == old_n
             && self.retired_rows.len() < self.retired_rows.inline_size()
@@ -2833,6 +2868,51 @@ impl Store {
     pub fn rebuild_indexes(&mut self) {
         self.indexes.clear();
         let labels: smallvec::SmallVec<[String; 4]> = self.extra_indexes.keys().cloned().collect();
+        if labels.len() >= 2 && self.collections.values().map(Vec::len).sum::<usize>() >= 2048 {
+            let built: Vec<Option<(String, LiveIndex)>> = std::thread::scope(|s| {
+                let store_ref = &*self;
+                let handles: Vec<_> = labels
+                    .iter()
+                    .map(|label| {
+                        let label = label.clone();
+                        s.spawn(move || {
+                            let snap = store_ref.extra_indexes.get(&label)?;
+                            let pred = snap
+                                .pred_src
+                                .as_deref()
+                                .and_then(|src| crate::parse::parse_pred_src(src).ok());
+                            let def = crate::catalog::IndexDef {
+                                collection: snap.collection.clone(),
+                                unique: snap.unique,
+                                fields: snap.fields.clone(),
+                                pred,
+                                bitmap_card_field: None,
+                            };
+                            let mut live = LiveIndex::new(def);
+                            let rows = store_ref.collection(&snap.collection);
+                            if rows.len() > 1 && live.def.pred.is_none() {
+                                let _ = live.insert_slab_batch_no_reverse(0, rows);
+                            } else {
+                                for (i, row) in rows.iter().enumerate() {
+                                    let _ = live.insert_at_new(i, row);
+                                }
+                            }
+                            #[cfg(feature = "parallel")]
+                            live.build_bloom_filter();
+                            Some((label, live))
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().ok().flatten())
+                    .collect()
+            });
+            for (label, live) in built.into_iter().flatten() {
+                self.indexes.insert(label, live);
+            }
+            return;
+        }
         for label in labels {
             let Some(snap) = self.extra_indexes.get(&label) else {
                 continue;

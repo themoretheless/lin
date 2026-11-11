@@ -235,18 +235,52 @@ impl PostingList {
     }
 
     #[inline]
+    fn promote_to_bitmap(&mut self) -> Option<&mut BitSet> {
+        if let PostingList::Standard(vec) = self
+            && vec.len() >= 64
+        {
+            let max_pos = vec.iter().copied().max().unwrap_or(0);
+            if max_pos <= vec.len().saturating_mul(64) {
+                let mut set = BitSet::new(max_pos + 1);
+                for &p in vec.iter() {
+                    set.insert(p);
+                }
+                *self = PostingList::Bitmap(set);
+            }
+        }
+        match self {
+            PostingList::Bitmap(set) => Some(set),
+            PostingList::Standard(_) => None,
+        }
+    }
+
+    #[inline]
     pub fn replace(&mut self, from: usize, to: usize) {
+        if let PostingList::Standard(vec) = self {
+            if let Some(last_elem) = vec.last_mut()
+                && *last_elem == from
+            {
+                *last_elem = to;
+                return;
+            }
+            if let Some(first_elem) = vec.first_mut()
+                && *first_elem == from
+            {
+                *first_elem = to;
+                return;
+            }
+            if let Some(p) = vec.iter().take(64).position(|&x| x == from) {
+                vec[p] = to;
+                return;
+            }
+        }
+        if let Some(set) = self.promote_to_bitmap() {
+            set.replace(from, to);
+            return;
+        }
         match self {
             PostingList::Standard(vec) => {
-                if let Some(last_elem) = vec.last_mut()
-                    && *last_elem == from
-                {
-                    *last_elem = to;
-                } else if let Some(first_elem) = vec.first_mut()
-                    && *first_elem == from
-                {
-                    *first_elem = to;
-                } else if let Some(p) = vec.iter().position(|&x| x == from) {
+                if let Some(p) = vec.iter().position(|&x| x == from) {
                     vec[p] = to;
                 } else {
                     vec.push(to);
@@ -260,17 +294,31 @@ impl PostingList {
 
     #[inline]
     pub fn remove(&mut self, pos: usize) {
+        if let PostingList::Standard(vec) = self {
+            if let Some(last_elem) = vec.last()
+                && *last_elem == pos
+            {
+                vec.pop();
+                return;
+            }
+            if let Some(first_elem) = vec.first()
+                && *first_elem == pos
+            {
+                vec.swap_remove(0);
+                return;
+            }
+            if let Some(p) = vec.iter().take(64).position(|&x| x == pos) {
+                vec.swap_remove(p);
+                return;
+            }
+        }
+        if let Some(set) = self.promote_to_bitmap() {
+            set.remove(pos);
+            return;
+        }
         match self {
             PostingList::Standard(vec) => {
-                if let Some(last_elem) = vec.last()
-                    && *last_elem == pos
-                {
-                    vec.pop();
-                } else if let Some(first_elem) = vec.first()
-                    && *first_elem == pos
-                {
-                    vec.swap_remove(0);
-                } else if let Some(p) = vec.iter().position(|&x| x == pos) {
+                if let Some(p) = vec.iter().position(|&x| x == pos) {
                     vec.swap_remove(p);
                 }
             }

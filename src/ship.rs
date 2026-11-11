@@ -117,6 +117,28 @@ pub fn pull(addr: impl ToSocketAddrs, since: u64) -> Result<Vec<u8>, Error> {
     pull_with(addr, since, &PullOpts::default())
 }
 
+/// Async offload for [`pull`]: pulls WAL frames with `gen > since` on Tokio's blocking pool.
+#[cfg(feature = "async")]
+pub async fn pull_async(
+    addr: impl Into<String>,
+    since: u64,
+) -> Result<Vec<u8>, Error> {
+    pull_with_async(addr, since, PullOpts::default()).await
+}
+
+/// Async offload for [`pull_with`]: pulls WAL frames with token / TLS on Tokio's blocking pool.
+#[cfg(feature = "async")]
+pub async fn pull_with_async(
+    addr: impl Into<String>,
+    since: u64,
+    opts: PullOpts,
+) -> Result<Vec<u8>, Error> {
+    let addr = addr.into();
+    tokio::task::spawn_blocking(move || pull_with(addr.as_str(), since, &opts))
+        .await
+        .map_err(|e| Error::runtime(format!("async join: {e}")))?
+}
+
 /// Pull WAL frames with token / TLS.
 pub fn pull_with(addr: impl ToSocketAddrs, since: u64, opts: &PullOpts) -> Result<Vec<u8>, Error> {
     let stream = TcpStream::connect(addr).map_err(io_err)?;

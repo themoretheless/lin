@@ -434,12 +434,12 @@ impl Db {
         };
         let names_arc: Arc<[String]> = names.clone().into();
 
-        if left_len >= 131_072 {
+        if left_len >= 8192 {
             let threads = std::thread::available_parallelism()
                 .map(|p| p.get())
                 .unwrap_or(1)
                 .min(8)
-                .min(left_len.div_ceil(16384));
+                .min(left_len.div_ceil(2048));
             if threads > 1 {
                 let chunk_size = left_len.div_ceil(threads);
                 let thread_batches: Vec<RecordBatch> = std::thread::scope(|scope| {
@@ -831,12 +831,12 @@ impl Db {
             JoinLeftSource::Scan { len } => *len,
         };
 
-        if left_len >= 131_072 {
+        if left_len >= 8192 {
             let threads = std::thread::available_parallelism()
                 .map(|p| p.get())
                 .unwrap_or(1)
                 .min(8)
-                .min(left_len.div_ceil(16384));
+                .min(left_len.div_ceil(2048));
             if threads > 1 {
                 let chunk_size = left_len.div_ceil(threads);
                 let thread_batches: Vec<RecordBatch> = std::thread::scope(|scope| {

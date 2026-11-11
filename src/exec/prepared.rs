@@ -10,7 +10,7 @@ use crate::store::{Cell, Row, Store, now_ms, row_text};
 
 use super::eval::{
     bind_stmt_params, eval_pred, point_key, pred_has_param, pred_needs_now, project,
-    record_has_param,
+    record_has_param, value_cell, value_needs_now,
 };
 use super::{Db, Done, ReadDb, field_names};
 
@@ -47,6 +47,10 @@ pub(crate) struct PointUpdatePlan {
     pub cas: Option<String>,
     pub record: Record,
     pub is_docs_wing_only: bool,
+    pub const_wing: Option<(Cell, Arc<str>)>,
+    pub prepared_gen: u64,
+    pub prepared_docs_epoch: u64,
+    pub prepared_idx: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -315,7 +319,7 @@ impl Db {
         let mut prepared_kd_kt = None;
         if collection == "docs" {
             let docs = store.collection("docs");
-            if docs.len() >= 4096
+            if docs.len() >= 64
                 && let Some(idx) = store.point_index("docs", field, key)
                 && idx < docs.len()
             {
@@ -355,7 +359,10 @@ impl Db {
         })
     }
 
-    pub(crate) fn try_extract_point_update(stmt: &Stmt) -> Option<PointUpdatePlan> {
+    pub(crate) fn try_extract_point_update(
+        stmt: &Stmt,
+        store: &Store,
+    ) -> Option<PointUpdatePlan> {
         let Stmt::Update {
             collection,
             pred: Some(pred),
@@ -378,6 +385,22 @@ impl Db {
         }
         let is_docs_wing_only =
             collection == "docs" && record.fields.len() == 1 && record.fields[0].0 == "wing";
+        let const_wing = if is_docs_wing_only && !value_needs_now(&record.fields[0].1) {
+            let cell = value_cell(&record.fields[0].1, 0);
+            let arc = cell.text_shared().unwrap_or_default();
+            Some((cell, arc))
+        } else {
+            None
+        };
+        let mut prepared_idx = None;
+        if collection == "docs" {
+            let docs = store.collection("docs");
+            if let Some(idx) = store.point_index("docs", field, key)
+                && idx < docs.len()
+            {
+                prepared_idx = Some(idx);
+            }
+        }
         Some(PointUpdatePlan {
             collection: collection.clone(),
             field: field.to_string(),
@@ -385,6 +408,10 @@ impl Db {
             cas: cas.clone(),
             record: record.clone(),
             is_docs_wing_only,
+            const_wing,
+            prepared_gen: store.r#gen,
+            prepared_docs_epoch: store.docs_epoch,
+            prepared_idx,
         })
     }
 

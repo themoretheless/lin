@@ -81,7 +81,7 @@ impl FtsIndex {
     fn append_row_with_scratch(&mut self, row_idx: usize, row: &Row, scratch: &mut String) {
         for text in fts_texts(row, &self.fields) {
             let lowered = lowercased(text, scratch);
-            for tok in lowered.split_whitespace() {
+            for tok in lowered.split_ascii_whitespace() {
                 add_posting(&mut self.postings, tok, row_idx);
             }
         }
@@ -113,7 +113,7 @@ impl FtsIndex {
                         if (slot_mask & (1u32 << pos)) != 0 {
                             if let Some(text) = val.text() {
                                 let lowered = lowercased(text, &mut scratch);
-                                for tok in lowered.split_whitespace() {
+                                for tok in lowered.split_ascii_whitespace() {
                                     add_posting(&mut self.postings, tok, row_idx);
                                 }
                             }

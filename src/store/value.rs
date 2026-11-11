@@ -12,6 +12,36 @@ pub const fn acquire_row() -> Row {
     BTreeMap::new()
 }
 
+thread_local! {
+    static ORDERS_ROW_POOL: std::cell::RefCell<Vec<Row>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[inline]
+pub fn acquire_orders_row() -> Row {
+    ORDERS_ROW_POOL.with(|pool| {
+        if let Some(row) = pool.borrow_mut().pop() {
+            return row;
+        }
+        let mut r = BTreeMap::new();
+        r.insert("id".to_string(), Cell::Null);
+        r.insert("total".to_string(), Cell::Null);
+        r.insert("user_id".to_string(), Cell::Null);
+        r
+    })
+}
+
+#[inline]
+pub fn release_orders_row(row: Row) {
+    if row.len() == 3 {
+        ORDERS_ROW_POOL.with(|pool| {
+            let mut p = pool.borrow_mut();
+            if p.len() < 128 {
+                p.push(row);
+            }
+        });
+    }
+}
+
 static NEXT_DOCS_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 #[inline]

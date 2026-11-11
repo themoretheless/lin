@@ -862,3 +862,67 @@ fn test_predicate_simplification_and_scan_projection() {
         }
     );
 }
+
+#[tokio::test]
+async fn async_concurrent_readers_and_transactions() {
+    let db = AsyncDb::new(Db::fixture());
+
+    // 1. Run multiple read queries concurrently via `run_many_read`
+    let results = db
+        .run_many_read([
+            r#"docs | wing == "rag" | count"#,
+            r#"users | count"#,
+            r#"orders | total > 100.0 | { id, total } | take all"#,
+        ])
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 3);
+    assert_eq!(results[0].scalar().unwrap().as_i64(), Some(2));
+    assert_eq!(results[1].scalar().unwrap().as_i64(), Some(2));
+    assert_eq!(results[2].rows.len(), 1);
+
+    // 2. Concurrent `tokio::join!` across multiple `run_read`, `run_batch`, and `prepare` calls
+    let prep = db
+        .prepare(r#"docs | wing == $w | { id, title } | take all"#)
+        .await
+        .unwrap();
+    let (h1, h2, batch) = tokio::join!(
+        db.run_with(prep.clone(), vec![("w".to_string(), Cell::text_arc("rag"))]),
+        db.run_read(r#"docs | wing == "sys" | { id } | take all"#),
+        db.run_batch(r#"orders | { id, total } | take all"#),
+    );
+    assert_eq!(h1.unwrap().rows.len(), 2);
+    assert_eq!(h2.unwrap().rows.len(), 1);
+    assert_eq!(batch.unwrap().n(), 2);
+
+    // 3. Async transaction commit updates write_epoch and invalidates reader snapshot cache
+    let inserted = db
+        .transaction(|tx| {
+            tx.execute(r#"insert users [{ id: "u3", email: "carol@lin.dev" }]"#)?;
+            tx.execute(r#"insert orders [{ id: "o3", user_id: "u3", total: 250.0 }]"#)?;
+            Ok(2usize)
+        })
+        .await
+        .unwrap();
+    assert_eq!(inserted, 2);
+
+    // Snapshot reader immediately sees committed changes
+    let reader = db.reader().await;
+    let many = reader
+        .run_many([r#"users | count"#, r#"orders | count"#])
+        .await
+        .unwrap();
+    assert_eq!(many[0].scalar().unwrap().as_i64(), Some(3));
+    assert_eq!(many[1].scalar().unwrap().as_i64(), Some(3));
+
+    // Synchronous parallel execution on ReadDb
+    let sync_many = reader
+        .inner()
+        .run_parallel([
+            r#"users | id == "u3" | { email } | take 1"#,
+            r#"orders | id == "o3" | { total } | take 1"#,
+        ])
+        .unwrap();
+    assert_eq!(sync_many[0].rows[0]["email"].text(), Some("carol@lin.dev"));
+    assert_eq!(sync_many[1].rows[0]["total"].as_f64(), Some(250.0));
+}

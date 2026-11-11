@@ -9,6 +9,44 @@ pub fn check(stmt: &Stmt, cat: &Catalog) -> Result<(), Error> {
     check_in(stmt, cat, &Bindings::new())
 }
 
+pub(crate) fn check_single_insert(
+    collection: &str,
+    rec: &Record,
+    cat: &Catalog,
+) -> Result<(), Error> {
+    let col = cat
+        .collection(collection)
+        .ok_or_else(|| Error::new(format!("unknown collection: {collection}")))?;
+    if col.append_only {
+        return Err(Error::new(format!(
+            "{collection} is append-only; use `append`"
+        )));
+    }
+    check_record(rec, collection, cat, false)
+}
+
+pub(crate) fn check_single_insert_borrowed(
+    collection: &str,
+    fields: &[(&str, Value)],
+    cat: &Catalog,
+) -> Result<(), Error> {
+    let col = cat
+        .collection(collection)
+        .ok_or_else(|| Error::new(format!("unknown collection: {collection}")))?;
+    if col.append_only {
+        return Err(Error::new(format!(
+            "{collection} is append-only; use `append`"
+        )));
+    }
+    for (name, value) in fields {
+        let info = col
+            .field(name)
+            .ok_or_else(|| Error::new(format!("unknown field: {name}")))?;
+        check_value_as(value, info.ty, cat)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn check_query_only(q: &Query, cat: &Catalog) -> Result<(), Error> {
     check_query(q, cat, &Bindings::new()).map(|_| ())
 }

@@ -1037,6 +1037,55 @@ impl Db {
             built = Arc::try_unwrap(shared).expect("encoder retained input after reply");
             maintenance?;
             Some(staged)
+        } else if allow_preencode
+            && n >= 512
+            && edges.is_empty()
+            && self.persist.is_some()
+        {
+            let generation = self.store.r#gen.wrapping_add(1);
+            let next_id = self.store.next_id;
+            let mut encode_buf = self
+                .persist
+                .as_mut()
+                .map(|p| std::mem::take(&mut p.encode_buf))
+                .unwrap_or_default();
+            let built_ref: &[Row] = &built;
+            let (maint_res, direct_res) = std::thread::scope(|s| {
+                let enc_handle = s.spawn(move || {
+                    let res = crate::persist::encode_insert_rows_direct(
+                        generation,
+                        next_id,
+                        collection,
+                        built_ref,
+                        &mut encode_buf,
+                    );
+                    (res, encode_buf)
+                });
+                let maint = self.maintain_insert_slab(collection, start, built_ref);
+                let (res, buf) = enc_handle.join().unwrap_or((None, Vec::new()));
+                (maint, (res, buf))
+            });
+            if let Some(p) = self.persist.as_mut() {
+                p.encode_buf = direct_res.1;
+            }
+            maint_res?;
+            direct_res.0.map(|(magic, fields)| crate::persist::PreparedInsert {
+                pack: Some(Pack::InsertCols {
+                    collection: collection.to_string(),
+                    fields: fields.clone(),
+                    cols: Vec::new(),
+                    n: n as u32,
+                    edges: Vec::new(),
+                }),
+                encoding: crate::persist::PreparedEncoding::Direct {
+                    generation,
+                    next_id,
+                    collection: collection.to_string(),
+                    fields,
+                    rows: n as u32,
+                    magic,
+                },
+            })
         } else {
             self.maintain_insert_slab(collection, start, &built)?;
             None

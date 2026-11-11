@@ -932,7 +932,7 @@ impl Db {
             None
         };
         let point_update = if !has_params && stmts.len() == 1 {
-            Self::try_extract_point_update(&stmts[0]).map(Arc::new)
+            Self::try_extract_point_update(&stmts[0], &self.store).map(Arc::new)
         } else {
             None
         };
@@ -1053,7 +1053,7 @@ impl Db {
             }
             if self.persist.is_none()
                 && pd.collection == "docs"
-                && (!want_rows || self.store.collection("docs").len() >= 4096)
+                && (!want_rows || self.store.collection("docs").len() >= 64)
             {
                 self.store.point_delete_docs_at_in_memory(idx, None);
                 self.store.r#gen += 1;
@@ -1095,9 +1095,20 @@ impl Db {
             if pu.cas.is_none() {
                 return Err(Error::runtime("update requires cas"));
             }
-            let idx = match self.store.point_index(&pu.collection, &pu.field, &pu.key) {
-                Some(i) => i,
-                None => return Err(Error::runtime("update: no matching row")),
+            let idx = if pu.collection == "docs"
+                && self.store.docs_epoch == pu.prepared_docs_epoch
+                && self.store.fts_deferred_doc_swaps.is_empty()
+                && let Some(i) = pu.prepared_idx
+                && i < self.store.docs_id.len()
+                && (self.store.r#gen == pu.prepared_gen
+                    || (pu.field == "id" && self.store.docs_id[i].as_ref() == pu.key.as_str()))
+            {
+                i
+            } else {
+                match self.store.point_index(&pu.collection, &pu.field, &pu.key) {
+                    Some(i) => i,
+                    None => return Err(Error::runtime("update: no matching row")),
+                }
             };
             if pu.is_docs_wing_only
                 && self.persist.is_none()
@@ -1129,22 +1140,41 @@ impl Db {
                         "cas mismatch: expected {cas:?}, found {got:?}"
                     )));
                 }
-                let now = if value_needs_now(&pu.record.fields[0].1) {
-                    now_ms()
+                let (new_cell, wing_arc) = if let Some((c, a)) = &pu.const_wing {
+                    (c.clone(), Arc::clone(a))
                 } else {
-                    0
+                    let now = if value_needs_now(&pu.record.fields[0].1) {
+                        now_ms()
+                    } else {
+                        0
+                    };
+                    let cell = value_cell(&pu.record.fields[0].1, now);
+                    let arc = cell.text_shared().unwrap_or_default();
+                    (cell, arc)
                 };
-                let new_cell = value_cell(&pu.record.fields[0].1, now);
-                let wing_arc = new_cell.text_shared().unwrap_or_default();
-                let has_complex_idx = indexes.values().any(|live_idx| {
-                    live_idx.def.collection == pu.collection
-                        && (live_idx.def.pred.is_some()
-                            || !(live_idx.def.fields.len() == 1 && live_idx.def.fields[0] == "wing")
-                                && !(live_idx.def.fields.len() == 2
-                                    && live_idx.def.fields[0] == "wing"
-                                    && live_idx.def.fields[1] == "ts")
-                                && live_idx.def.fields.iter().any(|f| f == "wing"))
-                });
+                let mut has_complex_idx = false;
+                let mut needs_ts = false;
+                for live_idx in indexes.values() {
+                    if live_idx.def.collection == pu.collection {
+                        if live_idx.def.pred.is_none()
+                            && live_idx.def.fields.len() == 1
+                            && live_idx.def.fields[0] == "wing"
+                        {
+                            // simple wing index
+                        } else if live_idx.def.pred.is_none()
+                            && live_idx.def.fields.len() == 2
+                            && live_idx.def.fields[0] == "wing"
+                            && live_idx.def.fields[1] == "ts"
+                        {
+                            needs_ts = true;
+                        } else if live_idx.def.pred.is_some()
+                            || live_idx.def.fields.iter().any(|f| f == "wing")
+                        {
+                            has_complex_idx = true;
+                            break;
+                        }
+                    }
+                }
                 let mut old_keys: smallvec::SmallVec<[crate::index::IndexKey; 4]> =
                     smallvec::SmallVec::new();
                 if has_complex_idx {
@@ -1154,13 +1184,7 @@ impl Db {
                         }
                     }
                 }
-                let ts_cell = if !has_complex_idx
-                    && indexes.values().any(|live_idx| {
-                        live_idx.def.collection == pu.collection
-                            && live_idx.def.fields.len() == 2
-                            && live_idx.def.fields[0] == "wing"
-                            && live_idx.def.fields[1] == "ts"
-                    }) {
+                let ts_cell = if !has_complex_idx && needs_ts {
                     row.get("ts").cloned().unwrap_or(Cell::Null)
                 } else {
                     Cell::Null
@@ -1170,6 +1194,10 @@ impl Db {
                 } else {
                     row.insert("wing".to_string(), new_cell)
                 };
+                let same_wing = prev_cell
+                    .as_ref()
+                    .and_then(Cell::text)
+                    .is_some_and(|s| s == wing_arc.as_ref());
                 if has_complex_idx {
                     let mut key_iter = old_keys.into_iter();
                     for live_idx in indexes.values_mut() {
@@ -1186,7 +1214,7 @@ impl Db {
                             }
                         }
                     }
-                } else {
+                } else if !same_wing {
                     for live_idx in indexes.values_mut() {
                         if live_idx.def.collection == pu.collection {
                             if live_idx.def.fields.len() == 1 && live_idx.def.fields[0] == "wing" {
@@ -1238,7 +1266,9 @@ impl Db {
                 } else {
                     vec![row.clone()]
                 };
-                self.store.sync_docs_wing_only(idx, wing_arc);
+                if !same_wing {
+                    self.store.sync_docs_wing_only(idx, wing_arc);
+                }
                 self.store.r#gen += 1;
                 return Ok(Handle {
                     plan: Arc::clone(&prepared.plan),
@@ -2490,6 +2520,107 @@ impl ReadDb {
     pub fn run_batch(&self, src: &str) -> Result<RecordBatch, Error> {
         let prepared = self.prepare(src)?;
         self.run_prepared_batch(&prepared)
+    }
+
+    /// Execute multiple read-only queries concurrently in parallel across CPU cores
+    /// against this shared zero-copy [`ReadDb`] snapshot.
+    pub fn run_parallel<I, S>(&self, queries: I) -> Result<Vec<Handle>, Error>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let sources: Vec<String> = queries.into_iter().map(|s| s.as_ref().to_string()).collect();
+        match sources.len() {
+            0 => Ok(Vec::new()),
+            1 => Ok(vec![self.run(&sources[0])?]),
+            n => {
+                let threads = std::thread::available_parallelism()
+                    .map(|p| p.get())
+                    .unwrap_or(4)
+                    .min(n)
+                    .max(1);
+                if threads <= 1 {
+                    return sources.iter().map(|q| self.run(q)).collect();
+                }
+                let chunk_size = n.div_ceil(threads);
+                let chunks: Vec<&[String]> = sources.chunks(chunk_size).collect();
+                let results: Vec<Result<Vec<Handle>, Error>> = std::thread::scope(|s| {
+                    let handles: Vec<_> = chunks
+                        .into_iter()
+                        .map(|chunk| {
+                            let db = self;
+                            s.spawn(move || -> Result<Vec<Handle>, Error> {
+                                let mut out = Vec::with_capacity(chunk.len());
+                                for q in chunk {
+                                    out.push(db.run(q)?);
+                                }
+                                Ok(out)
+                            })
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|h| {
+                            h.join()
+                                .unwrap_or_else(|_| Err(Error::runtime("parallel query worker panicked")))
+                        })
+                        .collect()
+                });
+                let mut all = Vec::with_capacity(n);
+                for r in results {
+                    all.extend(r?);
+                }
+                Ok(all)
+            }
+        }
+    }
+
+    /// Execute multiple pre-prepared read-only queries concurrently across CPU cores
+    /// against this shared zero-copy [`ReadDb`] snapshot.
+    pub fn run_prepared_parallel(&self, prepared: &[Prepared]) -> Result<Vec<Handle>, Error> {
+        match prepared.len() {
+            0 => Ok(Vec::new()),
+            1 => Ok(vec![self.run_prepared(&prepared[0])?]),
+            n => {
+                let threads = std::thread::available_parallelism()
+                    .map(|p| p.get())
+                    .unwrap_or(4)
+                    .min(n)
+                    .max(1);
+                if threads <= 1 {
+                    return prepared.iter().map(|p| self.run_prepared(p)).collect();
+                }
+                let chunk_size = n.div_ceil(threads);
+                let chunks: Vec<&[Prepared]> = prepared.chunks(chunk_size).collect();
+                let results: Vec<Result<Vec<Handle>, Error>> = std::thread::scope(|s| {
+                    let handles: Vec<_> = chunks
+                        .into_iter()
+                        .map(|chunk| {
+                            let db = self;
+                            s.spawn(move || -> Result<Vec<Handle>, Error> {
+                                let mut out = Vec::with_capacity(chunk.len());
+                                for p in chunk {
+                                    out.push(db.run_prepared(p)?);
+                                }
+                                Ok(out)
+                            })
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|h| {
+                            h.join()
+                                .unwrap_or_else(|_| Err(Error::runtime("parallel query worker panicked")))
+                        })
+                        .collect()
+                });
+                let mut all = Vec::with_capacity(n);
+                for r in results {
+                    all.extend(r?);
+                }
+                Ok(all)
+            }
+        }
     }
 
     pub fn explain_as(&self, src: &str, graph: Option<GraphFmt>) -> Result<String, Error> {

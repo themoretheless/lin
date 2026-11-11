@@ -139,21 +139,75 @@ impl Db {
         if self.gpu.is_some() {
             return self.gpu_walk_rows("docs", rows, edge_rel, reverse, depth, true);
         }
-        let mut frontier: FxHashSet<Arc<str>> = FxHashSet::default();
+        let mut frontier: Vec<Arc<str>> = Vec::with_capacity(rows.len() * 2);
+        let mut frontier_set: FxHashSet<Arc<str>> = FxHashSet::default();
         for r in rows {
-            if let Some(id) = r.get("id").and_then(Cell::text_shared) {
-                frontier.insert(id);
+            if let Some(id) = r.get("id").and_then(Cell::text_shared)
+                && frontier_set.insert(Arc::clone(&id))
+            {
+                frontier.push(id);
             }
-            if let Some(uri) = r.get("uri").and_then(Cell::text_shared) {
-                frontier.insert(uri);
+            if let Some(uri) = r.get("uri").and_then(Cell::text_shared)
+                && frontier_set.insert(Arc::clone(&uri))
+            {
+                frontier.push(uri);
             }
         }
-        let mut seen_nodes = frontier.clone();
-        let mut seen_edges: FxHashSet<(&str, &str)> = FxHashSet::default();
+        let mut seen_nodes = frontier_set.clone();
+        let mut seen_edges: FxHashSet<(Arc<str>, Arc<str>)> = FxHashSet::default();
         let mut out = Vec::new();
         let depth = depth.clamp(1, 3);
+        let rel_arc: Arc<str> = Arc::from(edge_rel);
+        let synced = self.store.edge_keys.len() == self.store.edges.len();
+
         for _ in 0..depth {
-            let mut next: FxHashSet<Arc<str>> = FxHashSet::default();
+            if frontier.len() <= 2 && synced {
+                let mut next: Vec<Arc<str>> = Vec::new();
+                for src in &frontier {
+                    self.store
+                        .for_each_neighbor_arc(&rel_arc, src, reverse, |dst| {
+                            let (from, to) = if reverse {
+                                (Arc::clone(dst), Arc::clone(src))
+                            } else {
+                                (Arc::clone(src), Arc::clone(dst))
+                            };
+                            if seen_edges.insert((Arc::clone(&from), Arc::clone(&to)))
+                                && out.len() < 300
+                            {
+                                let mut r = BTreeMap::new();
+                                r.insert("rel".into(), Cell::Text(Arc::clone(&rel_arc)));
+                                r.insert("from".into(), Cell::Text(from));
+                                r.insert("to".into(), Cell::Text(to));
+                                out.push(r);
+                            }
+                            if seen_nodes.insert(Arc::clone(dst)) {
+                                next.push(Arc::clone(dst));
+                            }
+                        });
+                    if out.len() >= 300 {
+                        return Ok(out);
+                    }
+                }
+                if seen_nodes.len() > self.quotas.max_graph_expansion {
+                    return Err(Error::runtime(format!(
+                        "graph expansion count {} exceeds max_graph_expansion quota {}",
+                        seen_nodes.len(),
+                        self.quotas.max_graph_expansion
+                    )));
+                }
+                frontier = next;
+                if frontier.is_empty() {
+                    break;
+                }
+                frontier_set.clear();
+                for n in &frontier {
+                    frontier_set.insert(Arc::clone(n));
+                }
+                continue;
+            }
+
+            let mut next: Vec<Arc<str>> = Vec::new();
+            let mut next_set: FxHashSet<Arc<str>> = FxHashSet::default();
             for e in &self.store.edges {
                 if e.rel != edge_rel {
                     continue;
@@ -163,11 +217,17 @@ impl Db {
                 } else {
                     (e.from.as_str(), e.to.as_str())
                 };
-                if !frontier.contains(src) {
+                if !frontier_set.contains(src) {
                     continue;
                 }
-                if seen_edges.insert((e.from.as_str(), e.to.as_str())) {
-                    out.push(edge_row(&e.rel, &e.from, &e.to));
+                let from_arc: Arc<str> = Arc::from(e.from.as_str());
+                let to_arc: Arc<str> = Arc::from(e.to.as_str());
+                if seen_edges.insert((Arc::clone(&from_arc), Arc::clone(&to_arc))) {
+                    let mut r = BTreeMap::new();
+                    r.insert("rel".into(), Cell::Text(Arc::clone(&rel_arc)));
+                    r.insert("from".into(), Cell::Text(from_arc));
+                    r.insert("to".into(), Cell::Text(to_arc));
+                    out.push(r);
                     if out.len() >= 300 {
                         return Ok(out);
                     }
@@ -175,7 +235,9 @@ impl Db {
                 if !seen_nodes.contains(dst) {
                     let dst_arc: Arc<str> = Arc::from(dst);
                     seen_nodes.insert(Arc::clone(&dst_arc));
-                    next.insert(dst_arc);
+                    if next_set.insert(Arc::clone(&dst_arc)) {
+                        next.push(dst_arc);
+                    }
                 }
             }
             if seen_nodes.len() > self.quotas.max_graph_expansion {
@@ -186,6 +248,7 @@ impl Db {
                 )));
             }
             frontier = next;
+            frontier_set = next_set;
             if frontier.is_empty() {
                 break;
             }
