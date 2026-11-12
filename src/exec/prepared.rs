@@ -317,7 +317,7 @@ impl Db {
             .is_some_and(|c| c.append_only);
         let mut prepared_idx = None;
         let mut prepared_kd_kt = None;
-        if collection == "docs" {
+        if collection == "docs" && !store.is_disk_backed("docs") {
             let docs = store.collection("docs");
             if docs.len() >= 64
                 && let Some(idx) = store.point_index("docs", field, key)
@@ -393,7 +393,7 @@ impl Db {
             None
         };
         let mut prepared_idx = None;
-        if collection == "docs" {
+        if collection == "docs" && !store.is_disk_backed("docs") {
             let docs = store.collection("docs");
             if let Some(idx) = store.point_index("docs", field, key)
                 && idx < docs.len()

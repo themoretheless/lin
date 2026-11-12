@@ -673,7 +673,8 @@ fn cold_checkpoint_reopen() {
         rows.push_str("\n]");
         db.run(&rows).unwrap();
         db.checkpoint().unwrap();
-        assert!(dir.join("cold").join("docs.bin").exists());
+        assert!(lin::is_disk_dir(&dir));
+        assert!(dir.join("segments").exists());
         db.close().unwrap();
     }
     let mut db = Db::open_with(
@@ -684,6 +685,19 @@ fn cold_checkpoint_reopen() {
         },
     )
     .unwrap();
+    // Out-of-core reads work without promoting cold table into heap Vec<Row>
+    assert!(db.store.is_disk_backed("docs"));
+    assert_eq!(db.stats().docs, 40);
+    assert_eq!(db.run(r#"docs | count"#).unwrap().scalar_as::<i64>().unwrap(), 40);
+    assert_eq!(
+        db.run(r#"docs | uri == "raw://c/7" | { title }"#)
+            .unwrap()
+            .rows[0]
+            .get("title")
+            .and_then(lin::Cell::text),
+        Some("T7")
+    );
+    assert!(db.store.is_disk_backed("docs"));
     assert_eq!(db.run(r#"docs | take 100"#).unwrap().done.n, 40);
     let _ = fs::remove_dir_all(&dir);
 }
@@ -905,7 +919,8 @@ fn cold_backup_self_contained() {
         rows.push_str("\n]");
         db.run(&rows).unwrap();
         db.checkpoint().unwrap();
-        assert!(dir.join("cold").join("docs.bin").exists());
+        assert!(lin::is_disk_dir(&dir));
+        assert!(dir.join("segments").exists());
         db.export_backup(&bak).unwrap();
         db.close().unwrap();
     }
@@ -1474,5 +1489,142 @@ fn test_checkpoint_pause_budget_lin_0163() {
         "checkpoint pause budget exceeded: {pause:?}"
     );
     assert_eq!(db.stats().writes_since_snapshot, 0);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn unified_db_opens_and_mutates_native_disk_dir() {
+    let dir = tmp();
+    {
+        let mut eng = lin::DiskEngine::open(&dir, true).unwrap();
+        eng.commit_ops(vec![lin::DiskWalOp::EnsureTable {
+            schema: lin::DiskTableSchema {
+                name: "docs".to_string(),
+                columns: vec![
+                    lin::DiskColSchema {
+                        name: "id".to_string(),
+                        kind: lin::DiskColKind::TextZstd,
+                    },
+                    lin::DiskColSchema {
+                        name: "uri".to_string(),
+                        kind: lin::DiskColKind::TextZstd,
+                    },
+                    lin::DiskColSchema {
+                        name: "title".to_string(),
+                        kind: lin::DiskColKind::TextZstd,
+                    },
+                    lin::DiskColSchema {
+                        name: "wing".to_string(),
+                        kind: lin::DiskColKind::TextDict,
+                    },
+                    lin::DiskColSchema {
+                        name: "layer".to_string(),
+                        kind: lin::DiskColKind::TextDict,
+                    },
+                    lin::DiskColSchema {
+                        name: "body".to_string(),
+                        kind: lin::DiskColKind::TextZstd,
+                    },
+                    lin::DiskColSchema {
+                        name: "hash".to_string(),
+                        kind: lin::DiskColKind::TextZstd,
+                    },
+                ],
+                indexed_fields: vec!["uri".to_string(), "wing".to_string()],
+            },
+        }])
+        .unwrap();
+
+        let mut rows = Vec::with_capacity(50);
+        for i in 0..50 {
+            let mut r = lin::Row::new();
+            let body = format!("native disk body {i}");
+            r.insert("id".into(), lin::Cell::from_text(&format!("nd-{i}")));
+            r.insert("uri".into(), lin::Cell::from_text(&format!("raw://nd/{i}")));
+            r.insert("title".into(), lin::Cell::from_text(&format!("Native {i}")));
+            r.insert(
+                "wing".into(),
+                lin::Cell::from_text(if i % 2 == 0 { "even" } else { "odd" }),
+            );
+            r.insert("layer".into(), lin::Cell::from_text("wiki"));
+            r.insert("hash".into(), lin::Cell::from_text(&format!("hash-{i}")));
+            r.insert("body".into(), lin::Cell::from_text(&body));
+            rows.push(r);
+        }
+        eng.write_bulk_segment("docs", &rows).unwrap();
+        eng.save_tombstones_and_manifest().unwrap();
+    }
+
+    // 1. Read-only snapshot directly on pure DiskEngine directory
+    {
+        let rdb = Db::open_read(&dir).unwrap();
+        assert_eq!(rdb.stats().docs, 50);
+        assert_eq!(
+            rdb.run(r#"docs | count"#)
+                .unwrap()
+                .scalar_as::<i64>()
+                .unwrap(),
+            50
+        );
+        assert_eq!(
+            rdb.run(r#"docs | wing == "even" | count"#)
+                .unwrap()
+                .scalar_as::<i64>()
+                .unwrap(),
+            25
+        );
+        let h = rdb
+            .run(r#"docs | id == "nd-12" | { id, title }"#)
+            .unwrap();
+        assert_eq!(h.rows.len(), 1);
+        assert_eq!(
+            h.rows[0].get("title").and_then(lin::Cell::text),
+            Some("Native 12")
+        );
+    }
+
+    // 2. Read-write unified Db directly on pure DiskEngine directory
+    {
+        let mut db = Db::open(&dir).unwrap();
+        assert!(db.is_durable());
+        assert!(db.store.is_disk_backed("docs"));
+
+        // Out-of-core group count + filter project without promoting into heap Vec<Row>
+        let grouped = db.run(r#"docs | count by wing"#).unwrap();
+        assert_eq!(grouped.rows.len(), 2);
+        let proj = db
+            .run(r#"docs | wing == "odd" | { id, title } | take 5"#)
+            .unwrap();
+        assert_eq!(proj.rows.len(), 5);
+        assert!(db.store.is_disk_backed("docs"));
+
+        // Durable write through unified Db -> commits to DiskEngine WAL/segments
+        db.run(r#"insert docs { id: "nd-50", uri: "raw://nd/50", title: "Native 50", wing: "even", layer: "wiki", body: "extra" }"#)
+            .unwrap();
+        db.checkpoint().unwrap();
+        db.close().unwrap();
+    }
+
+    // 3. Reopen and verify durable mutation persisted in DiskEngine
+    {
+        let mut db = Db::open(&dir).unwrap();
+        assert_eq!(
+            db.run(r#"docs | count"#)
+                .unwrap()
+                .scalar_as::<i64>()
+                .unwrap(),
+            51
+        );
+        let h = db
+            .run(r#"docs | id == "nd-50" | { title, wing }"#)
+            .unwrap();
+        assert_eq!(h.rows.len(), 1);
+        assert_eq!(
+            h.rows[0].get("title").and_then(lin::Cell::text),
+            Some("Native 50")
+        );
+        db.close().unwrap();
+    }
+
     let _ = fs::remove_dir_all(&dir);
 }

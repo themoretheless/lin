@@ -161,8 +161,10 @@ impl Db {
             self.store.flush_fts_deferred_docs();
         }
         for stmt in stmts {
-            if let Stmt::Update { collection, .. } | Stmt::Delete { collection, .. } = stmt
-                && self.store.cold.contains_key(collection)
+            if let Stmt::Insert { collection, .. }
+            | Stmt::Update { collection, .. }
+            | Stmt::Delete { collection, .. } = stmt
+                && self.store.is_disk_backed(collection)
             {
                 self.store.collection_mut(collection);
             }
@@ -1090,6 +1092,7 @@ impl Db {
             self.maintain_insert_slab(collection, start, &built)?;
             None
         };
+        self.store.update_col_count(collection, built.len() as isize);
         let want_rows = caller_wants_rows && built.len() <= 128;
         if want_rows {
             self.store

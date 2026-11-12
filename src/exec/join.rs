@@ -272,7 +272,20 @@ impl Db {
         };
 
         let mut rows = {
-            if name == "docs"
+            if self.store.is_disk_backed(name)
+                && let Some(eng) = self.store.disk_engine_read()
+            {
+                let proj_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+                let mut r = eng
+                    .query_filter(name, Some(pred), dict_limit, Some(&proj_refs), now)
+                    .ok()?;
+                for row in &mut r {
+                    for f in &names {
+                        row.entry(f.clone()).or_insert(Cell::Null);
+                    }
+                }
+                r
+            } else if name == "docs"
                 && let Pred::Contains { field, needle } = pred
                 && field.leaf() == Some("title")
             {
@@ -401,6 +414,26 @@ impl Db {
         let names = field_names(fields);
         if names.is_empty() {
             return None;
+        }
+        if self.store.is_disk_backed(name)
+            && let Some(eng) = self.store.disk_engine_read()
+        {
+            let fetch_limit = match explicit_take {
+                Some(Some(n)) => Some(skip_n.saturating_add(n.max(0) as usize)),
+                Some(None) => None,
+                None => Some(skip_n.saturating_add(50)),
+            };
+            let proj_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+            let rows = eng
+                .query_filter(name, filter, fetch_limit, Some(&proj_refs), now)
+                .ok()?;
+            let names_arc: Arc<[String]> = names.clone().into();
+            let mut batch = RecordBatch::with_capacity(names_arc, rows.len());
+            for row in &rows {
+                push_project_batch_row(&mut batch, row, &names);
+            }
+            finish_batch(&mut batch, skip_n, explicit_take);
+            return Some(batch);
         }
 
         let (source, need_filter) = {

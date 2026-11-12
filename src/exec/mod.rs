@@ -420,6 +420,12 @@ impl Db {
         if let Some(p) = self.persist.as_mut() {
             p.sync = sync;
         }
+        if self.store.is_native_disk()
+            && let Some(d) = self.store.disk.as_ref()
+            && let Ok(mut eng) = d.engine.write()
+        {
+            eng.set_sync_full(sync == SyncMode::Full);
+        }
         self
     }
 
@@ -431,7 +437,39 @@ impl Db {
     pub fn open_with(path: impl AsRef<Path>, opts: OpenOpts) -> Result<Self, Error> {
         let t0 = Instant::now();
         let catalog = crate::catalog::fixture();
-        let (store, persist, store_phases) = Store::open_with_profiled(path, &catalog, opts)?;
+        let dir = path.as_ref();
+        if crate::store::checkpoint::is_pure_disk_dir(dir) {
+            let (store, store_phases) =
+                Store::open_native_disk(dir, &catalog, opts.sync == SyncMode::Full)?;
+            let mut catalog = catalog;
+            store.merge_extras_into(&mut catalog);
+            let embedder = Self::default_embedder(&catalog);
+            let mut db = Self {
+                catalog,
+                store,
+                persist: None,
+                reader_lock: None,
+                plan_cache: FxHashMap::default(),
+                query_cache: FxHashMap::default(),
+                seen_dml_hashes: [0; 16],
+                quotas: Quotas::default(),
+                reopen: store_phases.into(),
+                append_rows: 0,
+                append_ms: 0.0,
+                pins: BTreeMap::new(),
+                pulled_wal: Vec::new(),
+                follower: false,
+                embedder: Some(embedder),
+                reader_cache: None,
+                #[cfg(feature = "gpu")]
+                gpu: None,
+                #[cfg(feature = "gpu")]
+                gpu_cache: Default::default(),
+            };
+            db.reopen.total_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            return Ok(db);
+        }
+        let (store, persist, store_phases) = Store::open_with_profiled(dir, &catalog, opts)?;
         let mut catalog = catalog;
         store.merge_extras_into(&mut catalog);
         let embedder = Self::default_embedder(&catalog);
@@ -534,6 +572,13 @@ impl Db {
     pub fn close(&mut self) -> Result<(), Error> {
         if let Some(mut p) = self.persist.take() {
             self.store.checkpoint(&mut p)?;
+        } else if self.store.is_native_disk()
+            && let Some(d) = self.store.disk.as_ref()
+        {
+            d.engine
+                .write()
+                .map_err(|_| Error::runtime("disk engine lock poisoned"))?
+                .checkpoint()?;
         }
         self.reader_lock = None;
         Ok(())
@@ -543,12 +588,19 @@ impl Db {
     pub fn checkpoint(&mut self) -> Result<(), Error> {
         if let Some(p) = self.persist.as_mut() {
             self.store.checkpoint(p)?;
+        } else if self.store.is_native_disk()
+            && let Some(d) = self.store.disk.as_ref()
+        {
+            d.engine
+                .write()
+                .map_err(|_| Error::runtime("disk engine lock poisoned"))?
+                .checkpoint()?;
         }
         Ok(())
     }
 
     pub fn is_durable(&self) -> bool {
-        self.persist.is_some()
+        self.persist.is_some() || self.store.is_native_disk()
     }
 
     /// True when opened via [`Self::open_follower`] / [`Self::bootstrap_follower`].
@@ -715,11 +767,19 @@ impl Db {
                 p.sync == SyncMode::Normal,
                 p.cold,
             ),
+            None if self.store.is_native_disk() => {
+                let wb = self
+                    .store
+                    .disk_engine_read()
+                    .map(|eng| eng.wal_bytes)
+                    .unwrap_or(0);
+                (wb, 0, false, true)
+            }
             None => (0, 0, false, false),
         };
         Stats {
             r#gen: self.store.r#gen,
-            docs: self.store.collection("docs").len(),
+            docs: self.store.get_col_count("docs"),
             facts: self.store.facts_len(),
             edges: self.store.edges.len(),
             next_id: self.store.next_id,
@@ -768,6 +828,14 @@ impl Db {
     pub fn export_backup(&mut self, path: impl AsRef<Path>) -> Result<(), Error> {
         if let Some(p) = self.persist.as_mut() {
             self.store.checkpoint(p)?;
+        } else if self.store.is_native_disk()
+            && self.store.edges.is_empty()
+            && self.store.facts_len() == 0
+        {
+            self.checkpoint()?;
+            if let Some(eng) = self.store.disk_engine_read() {
+                return eng.export_portable_backup_file(path.as_ref());
+            }
         }
         let hash = self.catalog.hash_str().to_string();
         let log_offset = self
@@ -1017,7 +1085,10 @@ impl Db {
             if !pd.append_only && pd.cas.is_none() {
                 return Err(Error::runtime("delete requires cas"));
             }
-            if self.persist.is_none()
+            if self.store.is_disk_backed(&pd.collection) {
+                self.store.promote_disk_col(&pd.collection);
+            }
+            if !self.is_durable()
                 && pd.collection == "docs"
                 && self.store.r#gen == pd.prepared_gen
                 && self.store.docs_epoch == pd.prepared_docs_epoch
@@ -1051,7 +1122,7 @@ impl Db {
                     )));
                 }
             }
-            if self.persist.is_none()
+            if !self.is_durable()
                 && pd.collection == "docs"
                 && (!want_rows || self.store.collection("docs").len() >= 64)
             {
@@ -1075,6 +1146,12 @@ impl Db {
                     rows: out.clone(),
                 };
                 self.store.durable_commit(p, pack)?;
+            } else if self.store.is_native_disk() {
+                let pack = Pack::Delete {
+                    collection: pd.collection.clone(),
+                    rows: out.clone(),
+                };
+                self.store.commit_pack_to_native_disk(&pack)?;
             }
             self.store.r#gen += 1;
             if let Some(p) = self.persist.as_mut() {
@@ -1095,6 +1172,9 @@ impl Db {
             if pu.cas.is_none() {
                 return Err(Error::runtime("update requires cas"));
             }
+            if self.store.is_disk_backed(&pu.collection) {
+                self.store.promote_disk_col(&pu.collection);
+            }
             let idx = if pu.collection == "docs"
                 && self.store.docs_epoch == pu.prepared_docs_epoch
                 && self.store.fts_deferred_doc_swaps.is_empty()
@@ -1111,7 +1191,7 @@ impl Db {
                 }
             };
             if pu.is_docs_wing_only
-                && self.persist.is_none()
+                && !self.is_durable()
                 && !self
                     .catalog
                     .guards
@@ -1346,6 +1426,12 @@ impl Db {
                     rows: vec![updated.clone()],
                 };
                 self.store.durable_commit(p, pack)?;
+            } else if self.store.is_native_disk() {
+                let pack = Pack::Update {
+                    collection: pu.collection.clone(),
+                    rows: vec![updated.clone()],
+                };
+                self.store.commit_pack_to_native_disk(&pack)?;
             }
             self.store.r#gen += 1;
             if let Some(p) = self.persist.as_mut() {
@@ -1476,6 +1562,11 @@ impl Db {
                         self.store
                             .durable_commit_prepared(p, pack, prepared_encoding)
                     {
+                        self.rollback(undo, cat_backup, base_gen);
+                        return Err(e);
+                    }
+                } else if self.store.is_native_disk() {
+                    if let Err(e) = self.store.commit_pack_to_native_disk(&pack) {
                         self.rollback(undo, cat_backup, base_gen);
                         return Err(e);
                     }
@@ -1966,15 +2057,35 @@ impl Db {
                     && let Some((field, key)) = point_key(pred)
                     && (field == "id" || (field == "uri" && name == "docs"))
                 {
-                    if let Some(idx) = self.store.point_index(name, field, key) {
-                        let simple_eq = matches!(
-                            pred,
-                            Pred::Cmp {
-                                op: CmpOp::Eq,
-                                value: Value::String(_),
-                                ..
+                    let simple_eq = matches!(
+                        pred,
+                        Pred::Cmp {
+                            op: CmpOp::Eq,
+                            value: Value::String(_),
+                            ..
+                        }
+                    );
+                    if self.store.is_disk_backed(name) {
+                        let proj_names = project_fields_step.map(field_names);
+                        let want_proj = if simple_eq {
+                            proj_names.as_deref()
+                        } else {
+                            None
+                        };
+                        if let Some(row) = self.store.project_by_key(name, field, key, want_proj) {
+                            if !simple_eq && !eval_pred(pred, &row, now) {
+                                Vec::new()
+                            } else if !simple_eq
+                                && let Some(ref fs) = proj_names
+                            {
+                                vec![project_fields(&row, fs)]
+                            } else {
+                                vec![row]
                             }
-                        );
+                        } else {
+                            Vec::new()
+                        }
+                    } else if let Some(idx) = self.store.point_index(name, field, key) {
                         if simple_eq
                             && project_fields_step.is_none()
                             && matches!(
@@ -2002,13 +2113,14 @@ impl Db {
                         Vec::new()
                     }
                 } else if let Some(pred) = first_filter
+                    && !self.store.is_disk_backed(name)
                     && let Some((uses, covered)) =
                         crate::index::pick_index_with_coverage(&self.catalog, name, pred)
                     && let Some(idxs) = self.store.index_seek(name, &uses, now)
                 {
                     self.fetch_idxs_filtered(name, &idxs, pred, now, project_fields_step, covered)
                 } else if let Some(pred) = first_filter {
-                    let col_len = self.store.collection(name).len();
+                    let col_len = self.store.get_col_count(name);
                     if col_len > self.quotas.max_execution_work {
                         return Err(Error::runtime(format!(
                             "query execution work {} exceeds max_execution_work quota {}",
@@ -2275,6 +2387,25 @@ impl Db {
         project: Option<&[Field]>,
     ) -> Vec<Row> {
         let names = project.map(field_names);
+        if self.store.is_disk_backed(name)
+            && let Some(eng) = self.store.disk_engine_read()
+        {
+            let proj_refs: Option<Vec<&str>> = names
+                .as_ref()
+                .map(|fs| fs.iter().map(String::as_str).collect());
+            if let Ok(mut rows) =
+                eng.query_filter(name, Some(pred), None, proj_refs.as_deref(), now)
+            {
+                if let Some(ref fs) = names {
+                    for row in &mut rows {
+                        for f in fs {
+                            row.entry(f.clone()).or_insert(Cell::Null);
+                        }
+                    }
+                }
+                return rows;
+            }
+        }
         if name == "docs"
             && let Pred::Contains { field, needle } = pred
             && field.leaf() == Some("title")
@@ -2365,6 +2496,25 @@ impl Db {
             return r;
         }
         let names = field_names(fields);
+        if self.store.is_disk_backed(name)
+            && let Some(eng) = self.store.disk_engine_read()
+        {
+            if limit == Some(0) {
+                return Vec::new();
+            }
+            let proj_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+            let mut out = Vec::new();
+            let _ = eng.scan_projected(name, Some(&proj_refs), |r| {
+                out.push(project_fields(r, &names));
+                if let Some(lim) = limit
+                    && out.len() >= lim
+                {
+                    return Ok(false);
+                }
+                Ok(true)
+            });
+            return out;
+        }
         let col = self.store.collection(name);
         let count = match limit {
             Some(lim) => lim.min(col.len()),
@@ -2384,6 +2534,24 @@ impl Db {
                 r.truncate(lim);
             }
             return r;
+        }
+        if self.store.is_disk_backed(name)
+            && let Some(eng) = self.store.disk_engine_read()
+        {
+            if limit == Some(0) {
+                return Vec::new();
+            }
+            let mut out = Vec::new();
+            let _ = eng.scan_projected(name, None, |r| {
+                out.push(r.clone());
+                if let Some(lim) = limit
+                    && out.len() >= lim
+                {
+                    return Ok(false);
+                }
+                Ok(true)
+            });
+            return out;
         }
         let col = self.store.collection(name);
         match limit {
@@ -2406,7 +2574,7 @@ impl Db {
 
 impl Drop for Db {
     fn drop(&mut self) {
-        if self.persist.is_some() {
+        if self.persist.is_some() || self.store.is_native_disk() {
             let _ = self.close();
         }
     }

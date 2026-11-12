@@ -459,16 +459,32 @@ fn test_adversarial_hash_collision_handling_lin_1784() {
 fn test_mmap_bounds_arithmetic_lin_1791() {
     let temp_dir = std::env::temp_dir().join(format!("lin-mmap-bounds-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&temp_dir);
-    let cold_file = temp_dir.join("cold_corrupt.bin");
+    let bm25_file = temp_dir.join("bm25_corrupt.bin");
 
-    // Corrupt cold file with invalid offset / truncated content
-    std::fs::write(&cold_file, b"COLD\x01").unwrap();
-    let file = std::fs::File::open(&cold_file).unwrap();
-    let mmap = unsafe { memmap2::Mmap::map(&file) }.unwrap();
-    let col = lin::cold::ColdCol::new(mmap);
+    // Truncated file is safely rejected
+    std::fs::write(&bm25_file, b"LBM25M03").unwrap();
     assert!(
-        col.rows().is_err(),
-        "out of bounds cold file must be safely rejected"
+        lin::MmapBm25Index::open_if_valid(&bm25_file, 1).is_none(),
+        "truncated mmap bm25 index must be safely rejected"
+    );
+
+    // Crafted 96-byte header with valid generation & CRC32-C but overflowing u64::MAX section offsets
+    let mut header = vec![0u8; 96];
+    header[0..8].copy_from_slice(b"LBM25M03");
+    header[8..16].copy_from_slice(&1u64.to_le_bytes()); // expected_generation
+    header[16..20].copy_from_slice(&10u32.to_le_bytes()); // doc_count
+    header[20..24].copy_from_slice(&5u32.to_le_bytes()); // term_count
+    header[24..28].copy_from_slice(&15u32.to_le_bytes()); // hash_mask (power of 2 - 1)
+    header[32..40].copy_from_slice(&10.0f64.to_bits().to_le_bytes()); // avgdl
+    header[40..48].copy_from_slice(&u64::MAX.to_le_bytes()); // overflow doc_lens_off
+    let mut crc = lin::crc::Hasher::new();
+    crc.update(&header[0..28]);
+    crc.update(&header[32..96]);
+    header[28..32].copy_from_slice(&crc.finalize().to_le_bytes());
+    std::fs::write(&bm25_file, &header).unwrap();
+    assert!(
+        lin::MmapBm25Index::open_if_valid(&bm25_file, 1).is_none(),
+        "overflowing mmap section offset must be safely rejected without panic"
     );
 
     let _ = std::fs::remove_dir_all(&temp_dir);

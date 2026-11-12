@@ -85,6 +85,50 @@ impl Db {
         };
         let rank_limit = limit.map(|n| n.saturating_add(skip_n));
 
+        if mode == SearchMode::Vec
+            && self.store.is_disk_backed(name)
+            && let Some(eng) = self.store.disk_engine_read()
+        {
+            let Some(ref emb) = self.embedder else {
+                return Ok(Some(Vec::new()));
+            };
+            let qv = emb.embed(query);
+            if qv.is_empty() {
+                return Ok(Some(Vec::new()));
+            }
+            let top_k = match rank_limit {
+                Some(0) => return Ok(Some(Vec::new())),
+                Some(k) => k,
+                None => eng.count_table(name).max(1),
+            };
+            let hits = eng.search_vectors_out_of_core(
+                name,
+                "embedding",
+                "id",
+                &qv,
+                top_k,
+                true,
+                None,
+                None,
+                |_| true,
+            )?;
+            let start = skip_n.min(hits.len());
+            let slice = &hits[start..];
+            let end = limit.map_or(slice.len(), |n| n.min(slice.len()));
+            let mut out = Vec::with_capacity(end);
+            if let Some(fields) = proj {
+                let names = field_names(fields);
+                for (_, row) in &slice[..end] {
+                    out.push(project_fields(row, &names));
+                }
+            } else {
+                for (_, row) in &slice[..end] {
+                    out.push(row.clone());
+                }
+            }
+            return Ok(Some(out));
+        }
+
         // Direct projected materialization without intermediate full-Row clones!
         if let Some(fields) = proj {
             let names = field_names(fields);

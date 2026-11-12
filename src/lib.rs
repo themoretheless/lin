@@ -48,10 +48,9 @@ mod ast;
 mod batch;
 mod catalog;
 mod check;
-pub mod cold;
 pub mod crc;
 mod cursor;
-pub mod disk_v2;
+pub mod disk;
 mod embed;
 #[cfg(feature = "embed-ollama")]
 mod embed_ollama;
@@ -87,10 +86,10 @@ pub use ast::{
 };
 pub use batch::RecordBatch;
 pub use cursor::{ProjectedRow, QueryCursor};
-pub use disk_v2::{
-    CompactionReport, DiskColKind, DiskColSchema, DiskEngineV2, DiskManifest, DiskSegment,
+pub use disk::{
+    CompactionReport, DiskColKind, DiskColSchema, DiskEngine, DiskManifest, DiskSegment,
     DiskTableSchema, DiskVecHit, DiskWalOp, HotCacheConfig, HotCacheStats, HotTierCache,
-    MmapBm25Builder, MmapBm25Index, MmapVecCol, MmapVecIvf, SharedDiskEngineV2, is_disk_v2_dir,
+    MmapBm25Builder, MmapBm25Index, MmapVecCol, MmapVecIvf, SharedDiskEngine, is_disk_dir,
 };
 pub use embed::{
     Embedder, HashingEmbedder, HnswIndex, HnswIndexSq8, VectorIndex, cosine, dequantize_sq8,

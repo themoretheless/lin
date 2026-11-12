@@ -1,23 +1,26 @@
-//! Durable store open, WAL replay orchestration, checkpointing, snapshots, and cold promotion.
+//! Durable store open, WAL replay orchestration, checkpointing, snapshots, and DiskEngine tiering.
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Instant;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::ast::{Decl, TypeExpr};
 use crate::catalog::{Catalog, catalog_hash};
-use crate::cold;
+use crate::disk::{
+    DiskColKind, DiskColSchema, DiskEngine, DiskTableSchema, MANIFEST_FILE, SEGMENTS_DIR,
+    TOMBSTONES_FILE, WAL_FILE, infer_schema_from_rows, is_disk_dir,
+};
 use crate::error::Error;
 use crate::persist::{
-    self, Head, LogRecord, OpenMemOpts, Pack, Persist, Snapshot, SnapshotRef,
+    self, ColSnap, Head, IndexSnap, LogRecord, OpenMemOpts, Pack, Persist, Snapshot, SnapshotRef,
 };
 
-use super::Store;
 use super::columnar::DictColumn;
 use super::value::next_docs_epoch;
+use super::{COLD_MIN_ROWS, DiskColLazy, Store, StoreDiskTier};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct StoreOpenPhases {
@@ -30,15 +33,173 @@ pub(crate) struct StoreOpenPhases {
     pub fts_ms: f64,
 }
 
+/// True when `dir` is a standalone `DiskEngine` directory (no legacy `head` or `snapshot` files).
+pub(crate) fn is_pure_disk_dir(dir: &Path) -> bool {
+    is_disk_dir(dir) && !persist::head_path(dir).exists() && !persist::snapshot_path(dir).exists()
+}
+
+fn cleanup_disk_files(dir: &Path) {
+    let _ = std::fs::remove_file(dir.join(MANIFEST_FILE));
+    let _ = std::fs::remove_file(dir.join(WAL_FILE));
+    let _ = std::fs::remove_file(dir.join(TOMBSTONES_FILE));
+    let _ = std::fs::remove_dir_all(dir.join(SEGMENTS_DIR));
+}
+
+fn populate_store_from_native_engine(
+    eng: DiskEngine,
+    cat: &Catalog,
+    writer_lock: Option<Arc<std::fs::File>>,
+) -> Store {
+    let mut store = Store::empty(eng.manifest.embed_id.clone());
+    store.r#gen = eng.manifest.generation;
+
+    let mut tables = BTreeMap::new();
+    let mut max_numeric_id = 0u64;
+
+    for (tname, schema) in &eng.manifest.tables {
+        let nrows = eng.count_table(tname);
+        store.collections.entry(tname.clone()).or_default();
+        store.col_counts.insert(tname.clone(), nrows);
+
+        let fields: Vec<(String, String)> = schema
+            .columns
+            .iter()
+            .map(|c| {
+                let ty = if c.name == "id" {
+                    "id"
+                } else {
+                    match c.kind {
+                        DiskColKind::Int64 => "i64",
+                        DiskColKind::Float64 => "f64",
+                        DiskColKind::Bool => "bool",
+                        DiskColKind::Time64 => "time",
+                        DiskColKind::TextZstd | DiskColKind::TextDict => "var",
+                        DiskColKind::VecF32Sq8 { .. } => "vec",
+                    }
+                };
+                (c.name.clone(), ty.to_string())
+            })
+            .collect();
+
+        let needs_extra_col = match cat.collections.get(tname) {
+            None => true,
+            Some(cdef) => fields
+                .iter()
+                .any(|(fname, _)| !cdef.fields.contains_key(fname)),
+        };
+        if needs_extra_col {
+            store.extra_collections.insert(
+                tname.clone(),
+                ColSnap {
+                    name: tname.clone(),
+                    append_only: false,
+                    fields,
+                },
+            );
+        }
+
+        for idx_field in &schema.indexed_fields {
+            if idx_field == "id" {
+                continue;
+            }
+            let label = format!("{tname}[{idx_field}]");
+            if !cat.indexes.contains_key(&label) {
+                store.extra_indexes.insert(
+                    label,
+                    IndexSnap {
+                        collection: tname.clone(),
+                        unique: false,
+                        fields: vec![idx_field.clone()],
+                        pred_src: None,
+                    },
+                );
+            }
+        }
+
+        let _ = eng.for_each_memtable_row(tname, |_, r| {
+            if let Some(id_str) = r.get("id").and_then(|c| c.text())
+                && let Some(num_s) = id_str.strip_prefix("id-")
+                && let Ok(n) = num_s.parse::<u64>()
+            {
+                max_numeric_id = max_numeric_id.max(n);
+            }
+            Ok(true)
+        });
+
+        tables.insert(
+            tname.clone(),
+            DiskColLazy {
+                row_count: nrows,
+                materialized: OnceLock::new(),
+            },
+        );
+    }
+
+    store.next_id = max_numeric_id
+        .saturating_add(1)
+        .max(eng.manifest.generation.saturating_add(1))
+        .max(1);
+
+    store.disk = Some(StoreDiskTier {
+        engine: Arc::new(RwLock::new(eng)),
+        tables,
+        native_disk: true,
+        writer_lock,
+    });
+    store.rebuild_indexes();
+    store
+}
 
 impl Store {
     /// Load snapshot+log into memory (no writer lock / no Persist).
-    /// Does not truncate the log or rewrite head — safe alongside a writer
-    /// only if the caller coordinates; prefer [`crate::exec::Db::reader`] for
-    /// in-process shared snapshots.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
+        let dir = path.as_ref();
         let cat = crate::catalog::fixture();
-        Ok(Self::open_with(path, &cat, OpenMemOpts::default())?.0)
+        if is_pure_disk_dir(dir) {
+            return Ok(Self::open_native_disk(dir, &cat, false)?.0);
+        }
+        Ok(Self::open_with(dir, &cat, OpenMemOpts::default())?.0)
+    }
+
+    pub(crate) fn open_native_disk(
+        dir: &Path,
+        cat: &Catalog,
+        sync_full: bool,
+    ) -> Result<(Self, StoreOpenPhases), Error> {
+        let mut phases = StoreOpenPhases::default();
+        let t0 = Instant::now();
+        persist::validate_data_dir(dir)?;
+        let lock = persist::acquire_writer_lock(dir)?;
+        phases.setup_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+        let t1 = Instant::now();
+        let eng = DiskEngine::open(dir, sync_full)?;
+        phases.snapshot_ms = t1.elapsed().as_secs_f64() * 1000.0;
+
+        let t2 = Instant::now();
+        let store = populate_store_from_native_engine(eng, cat, Some(Arc::new(lock)));
+        phases.indexes_ms = t2.elapsed().as_secs_f64() * 1000.0;
+        Ok((store, phases))
+    }
+
+    pub(crate) fn open_native_disk_read(
+        dir: &Path,
+        cat: &Catalog,
+    ) -> Result<(Self, std::fs::File, StoreOpenPhases), Error> {
+        let mut phases = StoreOpenPhases::default();
+        let t0 = Instant::now();
+        persist::validate_data_dir(dir)?;
+        let lock = persist::acquire_reader_lock(dir)?;
+        phases.setup_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+        let t1 = Instant::now();
+        let eng = DiskEngine::open_read_only(dir)?;
+        phases.snapshot_ms = t1.elapsed().as_secs_f64() * 1000.0;
+
+        let t2 = Instant::now();
+        let store = populate_store_from_native_engine(eng, cat, None);
+        phases.indexes_ms = t2.elapsed().as_secs_f64() * 1000.0;
+        Ok((store, lock, phases))
     }
 
     /// Open durable data dir: memory image + exclusive Persist for writes.
@@ -188,7 +349,6 @@ impl Store {
     }
 
     /// Read-only open: replay into memory, do not truncate log or write head.
-    /// Returns `(store, shared_lock)`.
     pub fn open_read_with(
         path: impl AsRef<Path>,
         cat: &Catalog,
@@ -201,9 +361,12 @@ impl Store {
         path: impl AsRef<Path>,
         cat: &Catalog,
     ) -> Result<(Self, std::fs::File, StoreOpenPhases), Error> {
+        let dir = path.as_ref();
+        if is_pure_disk_dir(dir) {
+            return Self::open_native_disk_read(dir, cat);
+        }
         let mut phases = StoreOpenPhases::default();
         let phase = Instant::now();
-        let dir = path.as_ref();
         persist::validate_data_dir(dir)?;
         if !dir.exists() {
             return Err(Error::runtime(format!(
@@ -315,19 +478,35 @@ impl Store {
             facts_o: Vec::new(),
             facts_rows_stale: false,
             col_counts,
-            cold: BTreeMap::new(),
+            disk: None,
         };
         for name in store.extra_collections.keys() {
             store.collections.entry(name.clone()).or_default();
         }
-        for name in &s.cold_collections {
-            if crate::cold::cold_path(dir, name).exists() {
-                // Lazy: mmap only; rows page-in on first collection() access.
-                let col = cold::map_cold(dir, name)?;
-                let nrows = col.row_count();
-                store.col_counts.insert(name.clone(), nrows);
-                store.collections.insert(name.clone(), Vec::new());
-                store.cold.insert(name.clone(), col);
+        if !s.cold_collections.is_empty() && is_disk_dir(dir) {
+            let eng = DiskEngine::open_read_only(dir)?;
+            let mut tables = BTreeMap::new();
+            for name in &s.cold_collections {
+                if eng.has_table(name) {
+                    let nrows = eng.count_table(name);
+                    store.col_counts.insert(name.clone(), nrows);
+                    store.collections.insert(name.clone(), Vec::new());
+                    tables.insert(
+                        name.clone(),
+                        DiskColLazy {
+                            row_count: nrows,
+                            materialized: OnceLock::new(),
+                        },
+                    );
+                }
+            }
+            if !tables.is_empty() {
+                store.disk = Some(StoreDiskTier {
+                    engine: Arc::new(RwLock::new(eng)),
+                    tables,
+                    native_disk: false,
+                    writer_lock: None,
+                });
             }
         }
         Ok(store)
@@ -344,9 +523,13 @@ impl Store {
         log_offset: u64,
     ) -> Snapshot {
         self.ensure_facts_rows();
-        let cold_names: Vec<String> = self.cold.keys().cloned().collect();
-        for name in cold_names {
-            self.promote_cold(&name);
+        let disk_names: Vec<String> = self
+            .disk
+            .as_ref()
+            .map(|d| d.tables.keys().cloned().collect())
+            .unwrap_or_default();
+        for name in disk_names {
+            self.promote_disk_col(&name);
         }
         Snapshot {
             r#gen: self.r#gen,
@@ -377,10 +560,39 @@ impl Store {
             });
         }
         for c in self.extra_collections.values() {
+            if let Some(existing) = cat.collections.get_mut(&c.name) {
+                for (fname, tname) in &c.fields {
+                    if !existing.fields.contains_key(fname) {
+                        let clean_t = if tname.starts_with("vec@") {
+                            "vec"
+                        } else {
+                            tname.as_str()
+                        };
+                        if let Some(ty) = crate::catalog::Type::from_name(clean_t) {
+                            existing.fields.insert(
+                                fname.clone(),
+                                crate::catalog::FieldInfo {
+                                    ty,
+                                    fts: ty == crate::catalog::Type::Text,
+                                    unique: fname == "id" || fname == "uri",
+                                },
+                            );
+                        }
+                    }
+                }
+                continue;
+            }
             let fields = c
                 .fields
                 .iter()
-                .map(|(n, t)| (n.clone(), TypeExpr::Named(t.clone())))
+                .map(|(n, t)| {
+                    let clean_t = if t.starts_with("vec@") {
+                        "vec".to_string()
+                    } else {
+                        t.clone()
+                    };
+                    (n.clone(), TypeExpr::Named(clean_t))
+                })
                 .collect();
             let _ = cat.apply_decl(&Decl::Col {
                 name: c.name.clone(),
@@ -509,30 +721,145 @@ impl Store {
     pub fn write_snapshot(&mut self, persist: &mut Persist) -> Result<(), Error> {
         // Exclude open_read processes while publishing snapshot + compacting log.
         let _fence = persist::acquire_fence_exclusive(&persist.dir)?;
-        // Ensure log content is fully durable before publishing snapshot/head.
-        // Normal mode: this is the durability point for prior commits.
         persist::durable_sync(&persist.log)
             .or_else(|_| persist.log.sync_all())
             .map_err(persist::io_err)?;
         self.ensure_facts_rows();
-        let cold_names_to_promote: Vec<String> = self.cold.keys().cloned().collect();
-        for name in cold_names_to_promote {
-            self.promote_cold(&name);
-        }
+
+        // Write FTS files while all modified tables are accurate in `get_col_count`.
+        self.write_fts_files(&persist.dir)?;
+
         let mut cold_names = Vec::new();
-        if persist.cold {
-            // Cold bins are a decode cache; snapshot stays self-contained (rows kept).
+        if !persist.cold {
+            let disk_names: Vec<String> = self
+                .disk
+                .as_ref()
+                .map(|d| d.tables.keys().cloned().collect())
+                .unwrap_or_default();
+            for name in disk_names {
+                self.promote_disk_col(&name);
+            }
+            self.disk = None;
+            if is_disk_dir(&persist.dir) {
+                cleanup_disk_files(&persist.dir);
+            }
+        } else {
+            // Preserve already-unmodified disk-backed tables without re-materializing them!
+            let untouched_disk: FxHashSet<String> = self
+                .disk
+                .as_ref()
+                .map(|d| {
+                    d.tables
+                        .iter()
+                        .filter(|(_, lazy)| lazy.row_count >= COLD_MIN_ROWS)
+                        .map(|(k, _)| k.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            // Promote any tiny (< COLD_MIN_ROWS) disk-backed table back into inline snapshot.
+            let tiny_disk: Vec<String> = self
+                .disk
+                .as_ref()
+                .map(|d| {
+                    d.tables
+                        .iter()
+                        .filter(|(_, lazy)| lazy.row_count < COLD_MIN_ROWS)
+                        .map(|(k, _)| k.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+            for name in tiny_disk {
+                self.promote_disk_col(&name);
+            }
+
+            // Close read-only mmap handles before opening DiskEngine writer to rewrite segments.
+            self.disk = None;
+
             for (name, rows) in &self.collections {
-                if rows.len() >= cold::COLD_MIN_ROWS {
-                    cold::write_cold_ext(&persist.dir, name, rows, false)?;
+                if untouched_disk.contains(name) || rows.len() >= COLD_MIN_ROWS {
                     cold_names.push(name.clone());
                 }
             }
-            cold::prune_cold(&persist.dir, &cold_names)?;
-            if !cold_names.is_empty() {
-                persist::sync_dir_checked(&cold::cold_dir(&persist.dir))?;
+
+            if cold_names.is_empty() {
+                if is_disk_dir(&persist.dir) {
+                    cleanup_disk_files(&persist.dir);
+                }
+            } else {
+                let mut eng = DiskEngine::open(&persist.dir, false)?;
+                eng.manifest.embed_id = self.embed_id.clone();
+
+                // Drop any stale table from DiskEngine that is no longer cold or was promoted & modified in RAM.
+                let existing_tables: Vec<String> = eng.manifest.tables.keys().cloned().collect();
+                for t in existing_tables {
+                    if !untouched_disk.contains(&t) {
+                        eng.drop_table(&t)?;
+                    }
+                }
+
+                // Spill newly hot/modified large collections into columnar mmap segments.
+                for name in &cold_names {
+                    if untouched_disk.contains(name) {
+                        continue;
+                    }
+                    let Some(rows) = self.collections.get(name) else {
+                        continue;
+                    };
+                    if rows.is_empty() {
+                        continue;
+                    }
+                    let mut schema = infer_schema_from_rows(name, rows);
+                    if name == "docs" && !schema.indexed_fields.iter().any(|f| f == "uri") {
+                        schema.indexed_fields.push("uri".to_string());
+                    }
+                    if name == "orders" && !schema.indexed_fields.iter().any(|f| f == "user_id") {
+                        schema.indexed_fields.push("user_id".to_string());
+                    }
+                    for idx_snap in self.extra_indexes.values() {
+                        if idx_snap.collection == *name && idx_snap.fields.len() == 1 {
+                            let f = &idx_snap.fields[0];
+                            if f != "id" && !schema.indexed_fields.contains(f) {
+                                schema.indexed_fields.push(f.clone());
+                            }
+                        }
+                    }
+                    eng.manifest.tables.insert(name.clone(), schema);
+                    for chunk in rows.chunks(65_536) {
+                        eng.write_bulk_segment(name, chunk)?;
+                    }
+                }
+
+                eng.manifest.generation = self.r#gen;
+                eng.save_tombstones_and_manifest()?;
+                persist::sync_dir_checked(&persist.dir.join(SEGMENTS_DIR))?;
+                drop(eng);
+
+                // Re-attach read-only mmap view for any previously untouched disk tables!
+                if !untouched_disk.is_empty() {
+                    let ro = DiskEngine::open_read_only(&persist.dir)?;
+                    let mut tables = BTreeMap::new();
+                    for name in &untouched_disk {
+                        let nrows = ro.count_table(name);
+                        self.col_counts.insert(name.clone(), nrows);
+                        tables.insert(
+                            name.clone(),
+                            DiskColLazy {
+                                row_count: nrows,
+                                materialized: OnceLock::new(),
+                            },
+                        );
+                    }
+                    self.disk = Some(StoreDiskTier {
+                        engine: Arc::new(RwLock::new(ro)),
+                        tables,
+                        native_disk: false,
+                        writer_lock: None,
+                    });
+                }
             }
         }
+
         let head = Head {
             r#gen: self.r#gen,
             catalog_hash: persist.catalog_hash.clone(),
@@ -577,7 +904,6 @@ impl Store {
             false,
         )?;
         persist::write_head_no_dir_sync(&persist.dir, &head)?;
-        self.write_fts_files(&persist.dir)?;
         persist::sync_dir_checked(&persist.dir)?;
         persist::compact_log(&mut persist.log)?;
         persist.writes_since_snapshot = 0;
@@ -592,19 +918,161 @@ impl Store {
         self.r#gen = rec.r#gen;
     }
 
-
-    /// Promote a cold mmap collection into `collections` (idempotent).
-    pub fn promote_cold(&mut self, name: &str) {
-        let Some(col) = self.cold.remove(name) else {
-            return;
-        };
-        if let Ok(rows) = col.into_rows() {
-            let nrows = rows.len();
-            self.collections.insert(name.to_string(), rows);
-            self.col_counts.insert(name.to_string(), nrows);
-            self.rebuild_row_maps_collection(name);
-            self.rebuild_indexes_collection(name);
+    pub(crate) fn commit_pack_to_native_disk(&mut self, pack: &Pack) -> Result<(), Error> {
+        let mut ops = Vec::new();
+        pack_to_disk_wal_ops(pack, &mut ops);
+        if ops.is_empty() {
+            return Ok(());
         }
+        let Some(d) = self.disk.as_mut() else {
+            return Ok(());
+        };
+        if !d.native_disk || d.writer_lock.is_none() {
+            return Ok(());
+        }
+        // Invalidate any stale OnceLock materializations on still-lazy tables.
+        for op in &ops {
+            match op {
+                crate::disk::DiskWalOp::EnsureTable { schema } => {
+                    if let Some(lazy) = d.tables.get_mut(&schema.name) {
+                        lazy.materialized = OnceLock::new();
+                    }
+                }
+                crate::disk::DiskWalOp::UpsertBatch { table, .. }
+                | crate::disk::DiskWalOp::DeleteIds { table, .. }
+                | crate::disk::DiskWalOp::EnsureIndex { table, .. } => {
+                    if let Some(lazy) = d.tables.get_mut(table) {
+                        lazy.materialized = OnceLock::new();
+                    }
+                }
+            }
+        }
+        let mut eng = d
+            .engine
+            .write()
+            .map_err(|_| Error::runtime("disk engine lock poisoned"))?;
+        eng.commit_ops(ops)?;
+        let table_names: Vec<String> = d.tables.keys().cloned().collect();
+        for tname in table_names {
+            let nrows = eng.count_table(&tname);
+            if let Some(lazy) = d.tables.get_mut(&tname) {
+                lazy.row_count = nrows;
+            }
+            self.col_counts.insert(tname, nrows);
+        }
+        Ok(())
     }
+}
 
+fn pack_to_disk_wal_ops(pack: &Pack, out: &mut Vec<crate::disk::DiskWalOp>) {
+    use crate::disk::DiskWalOp;
+    match pack {
+        Pack::Insert {
+            collection, row, ..
+        } => {
+            out.push(DiskWalOp::UpsertBatch {
+                table: collection.clone(),
+                rows: vec![row.clone()],
+            });
+        }
+        Pack::InsertBulk {
+            collection, rows, ..
+        } => {
+            if !rows.is_empty() {
+                out.push(DiskWalOp::UpsertBatch {
+                    table: collection.clone(),
+                    rows: rows.clone(),
+                });
+            }
+        }
+        Pack::InsertCols {
+            collection,
+            fields,
+            cols,
+            n,
+            ..
+        } => {
+            if *n > 0 {
+                let rows = persist::cols_to_rows(fields, cols, *n as usize);
+                out.push(DiskWalOp::UpsertBatch {
+                    table: collection.clone(),
+                    rows,
+                });
+            }
+        }
+        Pack::Update { collection, rows } => {
+            if !rows.is_empty() {
+                out.push(DiskWalOp::UpsertBatch {
+                    table: collection.clone(),
+                    rows: rows.clone(),
+                });
+            }
+        }
+        Pack::Delete { collection, rows } => {
+            let ids: Vec<String> = rows
+                .iter()
+                .filter_map(|r| r.get("id").and_then(|c| c.text()).map(str::to_string))
+                .collect();
+            if !ids.is_empty() {
+                out.push(DiskWalOp::DeleteIds {
+                    table: collection.clone(),
+                    ids,
+                });
+            }
+        }
+        Pack::SchemaCol { name, fields, .. } => {
+            let mut columns = Vec::with_capacity(fields.len() + 1);
+            if !fields.iter().any(|(n, _)| n == "id") {
+                columns.push(DiskColSchema {
+                    name: "id".to_string(),
+                    kind: DiskColKind::TextZstd,
+                });
+            }
+            for (fname, tname) in fields {
+                let kind = match tname.as_str() {
+                    "i64" | "dur" => DiskColKind::Int64,
+                    "f64" => DiskColKind::Float64,
+                    "bool" => DiskColKind::Bool,
+                    "time" => DiskColKind::Time64,
+                    t if t == "vec" || t.starts_with("vec@") => DiskColKind::VecF32Sq8 { dim: 0 },
+                    _ => DiskColKind::TextZstd,
+                };
+                columns.push(DiskColSchema {
+                    name: fname.clone(),
+                    kind,
+                });
+            }
+            out.push(DiskWalOp::EnsureTable {
+                schema: DiskTableSchema {
+                    name: name.clone(),
+                    columns,
+                    indexed_fields: Vec::new(),
+                },
+            });
+        }
+        Pack::SchemaIndex {
+            collection, fields, ..
+        } => {
+            if fields.len() == 1 && fields[0] != "id" {
+                out.push(DiskWalOp::EnsureIndex {
+                    table: collection.clone(),
+                    field: fields[0].clone(),
+                });
+            }
+        }
+        Pack::Batch { packs } => {
+            for p in packs {
+                pack_to_disk_wal_ops(p, out);
+            }
+        }
+        Pack::AppendFact { .. }
+        | Pack::AppendFactsBulk { .. }
+        | Pack::AppendEdge { .. }
+        | Pack::AppendEdgesBulk { .. }
+        | Pack::DeleteEdge { .. }
+        | Pack::Reembed
+        | Pack::SchemaRel { .. }
+        | Pack::SchemaFilter { .. }
+        | Pack::SchemaOwned { .. } => {}
+    }
 }

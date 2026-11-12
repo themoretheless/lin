@@ -319,6 +319,9 @@ impl<'a> Transaction<'a> {
         if !self.db.store.fts_deferred_doc_swaps.is_empty() {
             self.db.store.flush_fts_deferred_docs();
         }
+        if self.db.store.is_disk_backed(collection) {
+            self.db.store.promote_disk_col(collection);
+        }
         let needs_embed = self.db.embedder.is_some()
             && self
                 .db
@@ -335,6 +338,7 @@ impl<'a> Transaction<'a> {
         if collection == "orders"
             && fields.len() == 3
             && !needs_embed
+            && !self.db.store.is_disk_backed("orders")
             && self.db.store.indexes.is_empty()
             && self.db.store.hnsw.is_empty()
         {
@@ -495,6 +499,9 @@ impl<'a> Transaction<'a> {
         }
         if !self.db.store.fts_deferred_doc_swaps.is_empty() {
             self.db.store.flush_fts_deferred_docs();
+        }
+        if self.db.store.is_disk_backed(&collection) {
+            self.db.store.promote_disk_col(&collection);
         }
         let needs_embed = self.db.embedder.is_some()
             && self
@@ -880,6 +887,15 @@ impl<'a> Transaction<'a> {
                     }
                     self.db.store.r#gen = self.base_gen + 1;
                     self.db.store.maybe_checkpoint(p)?;
+                } else if self.db.store.is_native_disk() {
+                    if let Err(e) = self.db.store.commit_pack_to_native_disk(&combined) {
+                        let undo = std::mem::replace(&mut self.undo, Undo::None);
+                        let cat = self.cat_backup.take();
+                        self.db.rollback(undo, cat, self.base_gen);
+                        self.committed = true;
+                        return Err(e);
+                    }
+                    self.db.store.r#gen = self.base_gen + 1;
                 }
             }
         }
@@ -1139,7 +1155,8 @@ impl Db {
         }
         if let Some(pu) = &prepared.point_update
             && pu.is_docs_wing_only
-            && self.persist.is_none()
+            && !self.is_durable()
+            && !self.store.is_disk_backed(&pu.collection)
             && pu.cas.is_some()
             && !self
                 .catalog

@@ -1,0 +1,3669 @@
+//! Disk-backed out-of-core columnar LSM / Segment-Mmap Storage Engine (`DiskEngine`).
+//!
+//! Designed to scale seamlessly from megabytes to **500+ GiB** databases while keeping:
+//! - **`open()` under ~5–15 ms** (pure `mmap` of segment files, zero eager row deserialization).
+//! - **Constant low RAM footprint** (OS page cache manages cold/hot pages; no `Vec<Row>` full-corpus heap resident image).
+//! - **O(1) Point Lookups & Secondary Index Seeks** directly on memory-mapped hash + sorted-key posting tables.
+//! - **Two-Stage Out-of-Core Vector Search**: SIMD (`NEON` / scalar) + `rayon` scan over flat `mmap` `SQ8` (`i8`)
+//!   quantized vectors for 4x SSD/memory-bandwidth reduction, followed by exact `mmap` `f32` cosine reranking
+//!   of the top candidates — zero `VECTOR_SNAPSHOT` heap copies.
+//! - **Append-Only MemTable + WAL + Incremental Segment Flush** (`checkpoint` writes only the new delta segment,
+//!   never rewriting existing multi-gigabyte segments; deletes mark a durable tombstone bitset).
+
+mod cache;
+mod columns;
+mod index;
+mod segment;
+#[cfg(test)]
+mod tests;
+
+use std::cmp::{Ordering, Reverse};
+use std::collections::{BTreeMap, BinaryHeap};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
+
+use rustc_hash::{FxHashMap, FxHashSet};
+use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
+
+pub use cache::{HotCacheConfig, HotCacheStats, HotTierCache};
+pub use columns::{MmapVecCol, MmapVecIvf};
+pub use index::{MmapBm25Builder, MmapBm25Index};
+pub use segment::DiskSegment;
+
+use columns::{DICT_MIN_SEGMENT_ROWS, DICT_NULL_CODE, IVF_MIN_SEGMENT_VECS, MmapCol};
+use index::{encode_index_cell_key, with_text_index_key};
+use segment::write_segment_to_disk;
+
+use crate::embed::{cosine_with_q_norm, dot_sq8, l2_norm_f64, quantize_sq8};
+use crate::error::Error;
+use crate::persist::io_err;
+use crate::store::{Cell, InlineStr, Row};
+
+pub const DISK_DIR_MAGIC: &[u8; 8] = b"LINDISK\x01";
+pub const MANIFEST_FILE: &str = "manifest.json";
+pub const WAL_FILE: &str = "wal.log";
+pub const TOMBSTONES_FILE: &str = "tombstones.bin";
+pub const SEGMENTS_DIR: &str = "segments";
+pub const LOCK_FILE: &str = "LOCK";
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CompactionReport {
+    pub tables_compacted: usize,
+    pub old_segments_removed: usize,
+    pub new_segments_written: usize,
+    pub dead_rows_reclaimed: usize,
+}
+
+/// Column storage type tag on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DiskColKind {
+    Int64,
+    Float64,
+    Bool,
+    Time64,
+    /// Block-compressed UTF-8 strings (`col_<name>.loc` + `.boff` + `.bdat`).
+    TextZstd,
+    /// Adaptive dictionary-encoded UTF-8 strings (`col_<name>.dstr` + `.doff` + `.dord` `u16` ordinals).
+    TextDict,
+    /// Flat aligned `f32` vectors (`col_<name>.vf32`) + pre-quantized `i8` SQ8 vectors (`col_<name>.vsq8`).
+    VecF32Sq8 {
+        dim: u32,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiskColSchema {
+    pub name: String,
+    pub kind: DiskColKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiskTableSchema {
+    pub name: String,
+    pub columns: Vec<DiskColSchema>,
+    pub indexed_fields: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SegmentMeta {
+    pub seg_id: u64,
+    pub table: String,
+    pub row_count: u32,
+    pub columns: Vec<DiskColSchema>,
+    pub indexed_fields: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DiskManifest {
+    pub version: u32,
+    pub generation: u64,
+    pub next_seg_id: u64,
+    pub embed_id: String,
+    pub tables: BTreeMap<String, DiskTableSchema>,
+    pub segments: Vec<SegmentMeta>,
+}
+
+/// Durable WAL entry for uncommitted/unflushed MemTable mutations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DiskWalOp {
+    EnsureTable { schema: DiskTableSchema },
+    EnsureIndex { table: String, field: String },
+    UpsertBatch { table: String, rows: Vec<Row> },
+    DeleteIds { table: String, ids: Vec<String> },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DiskWalFrame {
+    generation: u64,
+    ops: Vec<DiskWalOp>,
+}
+
+#[derive(Serialize)]
+struct DiskWalFrameRef<'a> {
+    generation: u64,
+    ops: &'a [DiskWalOp],
+}
+
+// ============================================================================
+// Mutable Delta MemTable (per collection) + Tombstone Bitsets
+// ============================================================================
+
+#[derive(Default, Clone)]
+struct MemTable {
+    /// Latest uncommitted/unflushed row version per primary key `id`.
+    rows: Vec<Row>,
+    by_id: FxHashMap<String, usize>,
+    /// Deleted row indices inside `rows` (when overwritten/deleted in MemTable).
+    dead_mem: FxHashSet<usize>,
+    /// Secondary index in MemTable: `field -> encoded_key -> Vec<usize>`.
+    sec: FxHashMap<String, FxHashMap<Vec<u8>, Vec<usize>>>,
+    /// IDs explicitly deleted since last segment flush (masks any older segments).
+    deleted_ids: FxHashSet<String>,
+}
+
+impl MemTable {
+    fn rebuild_sec_for_field(&mut self, field: &str) {
+        let mut fmap: FxHashMap<Vec<u8>, Vec<usize>> = FxHashMap::default();
+        let mut kbuf = Vec::with_capacity(64);
+        for (idx, row) in self.rows.iter().enumerate() {
+            if self.dead_mem.contains(&idx) {
+                continue;
+            }
+            if let Some(cell) = row.get(field)
+                && encode_index_cell_key(cell, &mut kbuf)
+            {
+                fmap.entry(kbuf.clone()).or_default().push(idx);
+            }
+        }
+        self.sec.insert(field.to_string(), fmap);
+    }
+
+    fn upsert_row(
+        &mut self,
+        row: Row,
+        indexed_fields: &[String],
+        mut undo: Option<&mut MemTableUndo>,
+    ) {
+        let Some(id) = row.get("id").and_then(Cell::text).map(str::to_string) else {
+            return;
+        };
+        if let Some(u) = undo.as_deref_mut() {
+            if !u.prev_by_id.contains_key(&id) {
+                u.prev_by_id
+                    .insert(id.clone(), self.by_id.get(&id).copied());
+            }
+            if !u.prev_deleted_ids.contains_key(&id) {
+                u.prev_deleted_ids
+                    .insert(id.clone(), self.deleted_ids.contains(&id));
+            }
+        }
+        self.deleted_ids.remove(&id);
+        if let Some(&old_idx) = self.by_id.get(&id)
+            && self.dead_mem.insert(old_idx)
+            && let Some(u) = undo.as_deref_mut()
+            && old_idx < u.prev_rows_len
+        {
+            u.added_dead_mem.push(old_idx);
+        }
+        let new_idx = self.rows.len();
+        let mut kbuf = Vec::with_capacity(64);
+        for field in indexed_fields {
+            if field == "id" {
+                continue;
+            }
+            if let Some(cell) = row.get(field)
+                && encode_index_cell_key(cell, &mut kbuf)
+            {
+                self.sec
+                    .entry(field.clone())
+                    .or_default()
+                    .entry(kbuf.clone())
+                    .or_default()
+                    .push(new_idx);
+            }
+        }
+        self.by_id.insert(id, new_idx);
+        self.rows.push(row);
+    }
+
+    fn delete_id(&mut self, id: &str, mut undo: Option<&mut MemTableUndo>) {
+        if let Some(u) = undo.as_deref_mut() {
+            if !u.prev_by_id.contains_key(id) {
+                u.prev_by_id
+                    .insert(id.to_string(), self.by_id.get(id).copied());
+            }
+            if !u.prev_deleted_ids.contains_key(id) {
+                u.prev_deleted_ids
+                    .insert(id.to_string(), self.deleted_ids.contains(id));
+            }
+        }
+        if let Some(old_idx) = self.by_id.remove(id)
+            && self.dead_mem.insert(old_idx)
+            && let Some(u) = undo.as_deref_mut()
+            && old_idx < u.prev_rows_len
+        {
+            u.added_dead_mem.push(old_idx);
+        }
+        self.deleted_ids.insert(id.to_string());
+    }
+
+    fn live_count(&self) -> usize {
+        self.by_id.len()
+    }
+
+    fn drain_live_rows(&mut self) -> Vec<Row> {
+        let mut out = Vec::with_capacity(self.by_id.len());
+        let mut idxs: Vec<usize> = self.by_id.values().copied().collect();
+        idxs.sort_unstable();
+        let mut taken = std::mem::take(&mut self.rows);
+        for idx in idxs {
+            if !self.dead_mem.contains(&idx)
+                && let Some(r) = taken.get_mut(idx)
+            {
+                out.push(std::mem::take(r));
+            }
+        }
+        self.by_id.clear();
+        self.dead_mem.clear();
+        self.sec.clear();
+        self.deleted_ids.clear();
+        out
+    }
+}
+
+/// Bitset of tombstoned `row_id`s per `seg_id` (`u64` words).
+#[derive(Default, Clone, Serialize, Deserialize)]
+struct SegmentTombstones {
+    /// `seg_id -> bitset words` (`1` = deleted).
+    words_by_seg: BTreeMap<u64, Vec<u64>>,
+    /// Cached count of set bits per segment.
+    dead_counts: BTreeMap<u64, u32>,
+}
+
+impl SegmentTombstones {
+    #[inline]
+    fn is_dead(&self, seg_id: u64, row_id: u32) -> bool {
+        let Some(words) = self.words_by_seg.get(&seg_id) else {
+            return false;
+        };
+        let w = (row_id as usize) >> 6;
+        let b = row_id & 63;
+        w < words.len() && (words[w] & (1u64 << b)) != 0
+    }
+
+    #[inline]
+    fn mark_dead(&mut self, seg_id: u64, row_id: u32, seg_row_count: u32) -> bool {
+        let n_words = ((seg_row_count as usize) + 63) >> 6;
+        let words = self
+            .words_by_seg
+            .entry(seg_id)
+            .or_insert_with(|| vec![0u64; n_words]);
+        let w = (row_id as usize) >> 6;
+        if w >= words.len() {
+            words.resize(w + 1, 0);
+        }
+        let mask = 1u64 << (row_id & 63);
+        if (words[w] & mask) == 0 {
+            words[w] |= mask;
+            *self.dead_counts.entry(seg_id).or_insert(0) += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    #[inline]
+    fn dead_count(&self, seg_id: u64) -> u32 {
+        self.dead_counts.get(&seg_id).copied().unwrap_or(0)
+    }
+
+    #[inline]
+    fn unmark_dead(&mut self, seg_id: u64, row_id: u32) {
+        let Some(words) = self.words_by_seg.get_mut(&seg_id) else {
+            return;
+        };
+        let w = (row_id as usize) >> 6;
+        let mask = 1u64 << (row_id & 63);
+        if w < words.len() && (words[w] & mask) != 0 {
+            words[w] &= !mask;
+            if let Some(cnt) = self.dead_counts.get_mut(&seg_id) {
+                *cnt = cnt.saturating_sub(1);
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct MemTableUndo {
+    existed_before: bool,
+    prev_rows_len: usize,
+    prev_by_id: FxHashMap<String, Option<usize>>,
+    added_dead_mem: Vec<usize>,
+    prev_deleted_ids: FxHashMap<String, bool>,
+}
+
+#[derive(Clone)]
+pub struct DiskSavepoint {
+    saved_tables: Option<BTreeMap<String, DiskTableSchema>>,
+    memtable_undos: FxHashMap<String, MemTableUndo>,
+    added_tombstones: Vec<(u64, u32)>,
+    pending_wal_ops: Vec<DiskWalOp>,
+}
+
+// ============================================================================
+// Out-of-Core DiskEngine + L1 In-Memory HotTierCache
+// ============================================================================
+
+pub struct DiskEngine {
+    dir: PathBuf,
+    pub manifest: DiskManifest,
+    /// `table_name -> ordered Vec<Arc<DiskSegment>>` (oldest first, newest last).
+    segments: BTreeMap<String, Vec<Arc<DiskSegment>>>,
+    memtables: BTreeMap<String, MemTable>,
+    tombstones: SegmentTombstones,
+    hot_cache: Arc<HotTierCache>,
+    active_savepoint: Option<DiskSavepoint>,
+    wal_file: Option<File>,
+    wal_buf: Vec<u8>,
+    pub(crate) wal_bytes: u64,
+    sync_full: bool,
+    read_only: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct DiskVecHit {
+    pub seg_id: u64,
+    pub row_id: u32,
+    pub score: f32,
+}
+
+/// Detect whether `dir` is an initialized `DiskEngine` directory.
+pub fn is_disk_dir(dir: &Path) -> bool {
+    dir.is_dir() && dir.join(MANIFEST_FILE).is_file()
+}
+
+impl DiskEngine {
+    /// Open or create a read-write `DiskEngine` directory in ~2–10 ms (`mmap` only, zero bulk RAM load).
+    pub fn open(dir: impl AsRef<Path>, sync_full: bool) -> Result<Self, Error> {
+        Self::open_with_hot_cache(dir, sync_full, HotCacheConfig::default())
+    }
+
+    pub fn open_with_hot_cache(
+        dir: impl AsRef<Path>,
+        sync_full: bool,
+        hot_cfg: HotCacheConfig,
+    ) -> Result<Self, Error> {
+        let dir = dir.as_ref().to_path_buf();
+        fs::create_dir_all(&dir).map_err(io_err)?;
+        fs::create_dir_all(dir.join(SEGMENTS_DIR)).map_err(io_err)?;
+
+        let manifest_path = dir.join(MANIFEST_FILE);
+        let manifest: DiskManifest = if manifest_path.exists() {
+            let bytes = fs::read(&manifest_path).map_err(io_err)?;
+            serde_json::from_slice(&bytes).map_err(io_err)?
+        } else {
+            let m = DiskManifest {
+                version: 2,
+                generation: 0,
+                next_seg_id: 1,
+                embed_id: "nomic-embed-text/768".into(),
+                tables: BTreeMap::new(),
+                segments: Vec::new(),
+            };
+            let bytes = serde_json::to_vec_pretty(&m).map_err(io_err)?;
+            fs::write(&manifest_path, bytes).map_err(io_err)?;
+            m
+        };
+
+        let tomb_path = dir.join(TOMBSTONES_FILE);
+        let tombstones: SegmentTombstones = if tomb_path.exists() {
+            let bytes = fs::read(&tomb_path).map_err(io_err)?;
+            rmp_serde::from_slice(&bytes).unwrap_or_default()
+        } else {
+            SegmentTombstones::default()
+        };
+
+        let mut segments: BTreeMap<String, Vec<Arc<DiskSegment>>> = BTreeMap::new();
+        for seg_meta in &manifest.segments {
+            let seg_dir = dir
+                .join(SEGMENTS_DIR)
+                .join(format!("seg_{:08}", seg_meta.seg_id));
+            let opened = DiskSegment::open(&seg_dir, seg_meta.clone())?;
+            segments
+                .entry(seg_meta.table.clone())
+                .or_default()
+                .push(Arc::new(opened));
+        }
+
+        let wal_path = dir.join(WAL_FILE);
+        let wal_file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&wal_path)
+            .map_err(io_err)?;
+
+        let mut engine = Self {
+            dir,
+            manifest,
+            segments,
+            memtables: BTreeMap::new(),
+            tombstones,
+            hot_cache: Arc::new(HotTierCache::new(hot_cfg)),
+            active_savepoint: None,
+            wal_file: Some(wal_file),
+            wal_buf: Vec::with_capacity(16 * 1024),
+            wal_bytes: 0,
+            sync_full,
+            read_only: false,
+        };
+        engine.replay_wal()?;
+        Ok(engine)
+    }
+
+    /// Open a read-only `DiskEngine` handle (`mmap` shared OS pages + bounded L1 Hot Cache).
+    pub fn open_read_only(dir: impl AsRef<Path>) -> Result<Self, Error> {
+        Self::open_read_only_with_hot_cache(dir, HotCacheConfig::default())
+    }
+
+    pub fn open_read_only_with_hot_cache(
+        dir: impl AsRef<Path>,
+        hot_cfg: HotCacheConfig,
+    ) -> Result<Self, Error> {
+        let dir = dir.as_ref().to_path_buf();
+        let manifest_path = dir.join(MANIFEST_FILE);
+        if !manifest_path.exists() {
+            return Err(Error::runtime(format!(
+                "disk manifest not found in '{}'",
+                dir.display()
+            )));
+        }
+        let manifest: DiskManifest =
+            serde_json::from_slice(&fs::read(&manifest_path).map_err(io_err)?).map_err(io_err)?;
+        let tomb_path = dir.join(TOMBSTONES_FILE);
+        let tombstones: SegmentTombstones = if tomb_path.exists() {
+            rmp_serde::from_slice(&fs::read(&tomb_path).map_err(io_err)?).unwrap_or_default()
+        } else {
+            SegmentTombstones::default()
+        };
+        let mut segments: BTreeMap<String, Vec<Arc<DiskSegment>>> = BTreeMap::new();
+        for seg_meta in &manifest.segments {
+            let seg_dir = dir
+                .join(SEGMENTS_DIR)
+                .join(format!("seg_{:08}", seg_meta.seg_id));
+            let opened = DiskSegment::open(&seg_dir, seg_meta.clone())?;
+            segments
+                .entry(seg_meta.table.clone())
+                .or_default()
+                .push(Arc::new(opened));
+        }
+        let mut engine = Self {
+            dir: dir.clone(),
+            manifest,
+            segments,
+            memtables: BTreeMap::new(),
+            tombstones,
+            hot_cache: Arc::new(HotTierCache::new(hot_cfg)),
+            active_savepoint: None,
+            wal_file: None,
+            wal_buf: Vec::new(),
+            wal_bytes: 0,
+            sync_full: false,
+            read_only: true,
+        };
+        let wal_path = dir.join(WAL_FILE);
+        if wal_path.exists() {
+            let mut f = File::open(&wal_path).map_err(io_err)?;
+            let _ = engine.replay_wal_from_file(&mut f, false)?;
+        }
+        Ok(engine)
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    /// Capture a zero-I/O point-in-time MVCC view of `self` (`O(#segments + MemTable)` in microseconds).
+    pub fn snapshot_view(&self) -> Self {
+        Self {
+            dir: self.dir.clone(),
+            manifest: self.manifest.clone(),
+            segments: self.segments.clone(),
+            memtables: self.memtables.clone(),
+            tombstones: self.tombstones.clone(),
+            hot_cache: Arc::new(HotTierCache::new(HotCacheConfig {
+                enabled: false,
+                max_bytes: 0,
+                max_rows: 0,
+                max_vec_queries: 0,
+            })),
+            active_savepoint: None,
+            wal_file: None,
+            wal_buf: Vec::new(),
+            wal_bytes: 0,
+            sync_full: false,
+            read_only: true,
+        }
+    }
+
+    pub fn hot_cache_stats(&self) -> HotCacheStats {
+        self.hot_cache.stats()
+    }
+
+    pub fn clear_hot_cache(&self) {
+        self.hot_cache.clear_all();
+    }
+
+    pub fn set_sync_full(&mut self, sync_full: bool) {
+        self.sync_full = sync_full;
+    }
+
+    pub fn flush_wal(&mut self) -> Result<(), Error> {
+        if let Some(f) = self.wal_file.as_mut() {
+            crate::persist::durable_sync(f)
+                .or_else(|_| f.sync_data())
+                .map_err(io_err)?;
+        }
+        Ok(())
+    }
+
+    /// Pre-warm up to `limit` live rows of `table` into the L1 in-memory HotTierCache.
+    pub fn warm_table_into_hot_cache(
+        &self,
+        table: &str,
+        limit: Option<usize>,
+    ) -> Result<usize, Error> {
+        let mut count = 0usize;
+        self.scan_projected(table, None, |row| {
+            if let Some(id) = row.get("id").and_then(Cell::text) {
+                self.hot_cache.put_row(table, id, Arc::new(row.clone()));
+                count += 1;
+            }
+            if let Some(max_n) = limit
+                && count >= max_n
+            {
+                return Ok(false);
+            }
+            Ok(true)
+        })?;
+        Ok(count)
+    }
+
+    fn replay_wal(&mut self) -> Result<(), Error> {
+        let Some(mut f) = self.wal_file.take() else {
+            return Ok(());
+        };
+        let valid_end = self.replay_wal_from_file(&mut f, true)?;
+        f.set_len(valid_end).map_err(io_err)?;
+        f.seek(SeekFrom::End(0)).map_err(io_err)?;
+        self.wal_bytes = valid_end;
+        self.wal_file = Some(f);
+        Ok(())
+    }
+
+    fn replay_wal_from_file(&mut self, f: &mut File, writable: bool) -> Result<u64, Error> {
+        const MAX_WAL_FRAME_BYTES: usize = 256 * 1024 * 1024;
+        f.seek(SeekFrom::Start(0)).map_err(io_err)?;
+        let mut reader = BufReader::new(f);
+        let mut valid_pos = 0u64;
+        let mut header = [0u8; 12]; // b"LWAL" (4B) + len: u32 (4B) + crc32: u32 (4B)
+        let mut payload = Vec::new();
+        loop {
+            match reader.read_exact(&mut header) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(io_err(e)),
+            }
+            if &header[0..4] != b"LWAL" {
+                break;
+            }
+            let payload_len = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
+            if payload_len > MAX_WAL_FRAME_BYTES {
+                break;
+            }
+            let expected_crc = u32::from_le_bytes(header[8..12].try_into().unwrap());
+            payload.resize(payload_len, 0);
+            if reader.read_exact(&mut payload).is_err() {
+                break;
+            }
+            if crate::crc::hardware_crc32c(&payload) != expected_crc
+                && crc32fast::hash(&payload) != expected_crc
+            {
+                break;
+            }
+            let Ok(frame) = rmp_serde::from_slice::<DiskWalFrame>(&payload) else {
+                break;
+            };
+            if frame.generation > self.manifest.generation {
+                for op in frame.ops {
+                    self.apply_op_in_memory(op);
+                }
+                self.manifest.generation = frame.generation;
+            }
+            valid_pos += 12 + (payload_len as u64);
+        }
+        let _ = writable;
+        Ok(valid_pos)
+    }
+
+    fn append_wal_ops(&mut self, generation: u64, ops: &[DiskWalOp]) -> Result<(), Error> {
+        let Some(f) = self.wal_file.as_mut() else {
+            return Ok(());
+        };
+        let frame = DiskWalFrameRef { generation, ops };
+        self.wal_buf.clear();
+        rmp_serde::encode::write(&mut self.wal_buf, &frame).map_err(io_err)?;
+        let crc = crate::crc::hardware_crc32c(&self.wal_buf);
+
+        let mut header = [0u8; 12];
+        header[0..4].copy_from_slice(b"LWAL");
+        header[4..8].copy_from_slice(&(self.wal_buf.len() as u32).to_le_bytes());
+        header[8..12].copy_from_slice(&crc.to_le_bytes());
+
+        f.write_all(&header).map_err(io_err)?;
+        f.write_all(&self.wal_buf).map_err(io_err)?;
+        if self.sync_full {
+            crate::persist::durable_sync(f)
+                .or_else(|_| f.sync_data())
+                .map_err(io_err)?;
+        }
+        self.wal_bytes += 12 + (self.wal_buf.len() as u64);
+        Ok(())
+    }
+
+    fn mark_segment_key_dead(&mut self, table: &str, id: &str) {
+        let Some(segs) = self.segments.get(table) else {
+            return;
+        };
+        let mut newly_dead = SmallVec::<[(u64, u32); 2]>::new();
+        with_text_index_key(id, |kbuf| {
+            for seg in segs {
+                let sid = seg.meta.seg_id;
+                let nrows = seg.meta.row_count;
+                seg.pk_index.for_each_key(kbuf, |rid| {
+                    if self.tombstones.mark_dead(sid, rid, nrows) {
+                        newly_dead.push((sid, rid));
+                    }
+                    true
+                });
+            }
+        });
+        if let Some(sp) = self.active_savepoint.as_mut() {
+            sp.added_tombstones.extend(newly_dead);
+        }
+    }
+
+    #[inline]
+    fn snapshot_tables_for_savepoint(&mut self) {
+        if let Some(sp) = self.active_savepoint.as_mut()
+            && sp.saved_tables.is_none()
+        {
+            sp.saved_tables = Some(self.manifest.tables.clone());
+        }
+    }
+
+    #[inline]
+    fn ensure_memtable_undo(&mut self, table: &str) {
+        if let Some(sp) = self.active_savepoint.as_mut()
+            && !sp.memtable_undos.contains_key(table)
+        {
+            let (existed_before, prev_rows_len) = match self.memtables.get(table) {
+                Some(mt) => (true, mt.rows.len()),
+                None => (false, 0),
+            };
+            sp.memtable_undos.insert(
+                table.to_string(),
+                MemTableUndo {
+                    existed_before,
+                    prev_rows_len,
+                    prev_by_id: FxHashMap::default(),
+                    added_dead_mem: Vec::new(),
+                    prev_deleted_ids: FxHashMap::default(),
+                },
+            );
+        }
+    }
+
+    fn apply_op_in_memory(&mut self, op: DiskWalOp) {
+        match op {
+            DiskWalOp::EnsureTable { schema } => {
+                self.snapshot_tables_for_savepoint();
+                self.manifest
+                    .tables
+                    .entry(schema.name.clone())
+                    .and_modify(|existing| {
+                        for col in &schema.columns {
+                            if !existing.columns.iter().any(|c| c.name == col.name) {
+                                existing.columns.push(col.clone());
+                            }
+                        }
+                        for idx in &schema.indexed_fields {
+                            if !existing.indexed_fields.contains(idx) {
+                                existing.indexed_fields.push(idx.clone());
+                            }
+                        }
+                    })
+                    .or_insert(schema);
+            }
+            DiskWalOp::EnsureIndex { table, field } => {
+                self.ensure_memtable_undo(&table);
+                if self
+                    .manifest
+                    .tables
+                    .get(&table)
+                    .is_some_and(|t| !t.indexed_fields.contains(&field))
+                {
+                    self.snapshot_tables_for_savepoint();
+                    if let Some(t) = self.manifest.tables.get_mut(&table) {
+                        t.indexed_fields.push(field.clone());
+                    }
+                }
+                if let Some(mt) = self.memtables.get_mut(&table) {
+                    mt.rebuild_sec_for_field(&field);
+                }
+            }
+            DiskWalOp::UpsertBatch { table, rows } => {
+                self.ensure_memtable_undo(&table);
+                let needs_schema_mut = match self.manifest.tables.get(&table) {
+                    None => true,
+                    Some(t) => rows.iter().any(|row| {
+                        row.iter().any(|(k, cell)| {
+                            if matches!(cell, Cell::Null) {
+                                return false;
+                            }
+                            match t.columns.iter().find(|c| c.name == *k) {
+                                None => true,
+                                Some(existing) => {
+                                    if let Cell::Vec(v) = cell
+                                        && !v.is_empty()
+                                    {
+                                        !matches!(
+                                            existing.kind,
+                                            DiskColKind::VecF32Sq8 { dim } if dim == v.len() as u32
+                                        )
+                                    } else {
+                                        false
+                                    }
+                                }
+                            }
+                        })
+                    }),
+                };
+                let indexed_fields: SmallVec<[String; 8]> = if needs_schema_mut {
+                    self.snapshot_tables_for_savepoint();
+                    if let Some(t) = self.manifest.tables.get_mut(&table) {
+                        for row in &rows {
+                            for (k, cell) in row {
+                                if matches!(cell, Cell::Null) {
+                                    continue;
+                                }
+                                if let Some(existing) = t.columns.iter_mut().find(|c| c.name == *k)
+                                {
+                                    if let Cell::Vec(v) = cell
+                                        && !v.is_empty()
+                                    {
+                                        existing.kind = DiskColKind::VecF32Sq8 {
+                                            dim: v.len() as u32,
+                                        };
+                                    }
+                                } else {
+                                    let kind = match cell {
+                                        Cell::Int(_) => DiskColKind::Int64,
+                                        Cell::Float(_) => DiskColKind::Float64,
+                                        Cell::Bool(_) => DiskColKind::Bool,
+                                        Cell::Time(_) => DiskColKind::Time64,
+                                        Cell::Vec(v) => DiskColKind::VecF32Sq8 {
+                                            dim: v.len() as u32,
+                                        },
+                                        Cell::Text(_) | Cell::SmallText(_) | Cell::Null => {
+                                            DiskColKind::TextZstd
+                                        }
+                                    };
+                                    t.columns.push(DiskColSchema {
+                                        name: k.clone(),
+                                        kind,
+                                    });
+                                }
+                            }
+                        }
+                        t.indexed_fields.iter().cloned().collect()
+                    } else {
+                        let inferred = infer_schema_from_rows(&table, &rows);
+                        let ixs: SmallVec<[String; 8]> =
+                            inferred.indexed_fields.iter().cloned().collect();
+                        self.manifest.tables.insert(table.clone(), inferred);
+                        ixs
+                    }
+                } else {
+                    self.manifest.tables[&table]
+                        .indexed_fields
+                        .iter()
+                        .cloned()
+                        .collect()
+                };
+                for row in &rows {
+                    if let Some(id) = row.get("id").and_then(Cell::text) {
+                        self.mark_segment_key_dead(&table, id);
+                        self.hot_cache.invalidate_row(&table, id);
+                    }
+                }
+                let mt = self.memtables.entry(table.clone()).or_default();
+                let mut undo = self
+                    .active_savepoint
+                    .as_mut()
+                    .and_then(|sp| sp.memtable_undos.get_mut(&table));
+                for row in rows {
+                    mt.upsert_row(row, &indexed_fields, undo.as_deref_mut());
+                }
+            }
+            DiskWalOp::DeleteIds { table, ids } => {
+                self.ensure_memtable_undo(&table);
+                for id in &ids {
+                    self.mark_segment_key_dead(&table, id);
+                    self.hot_cache.invalidate_row(&table, id);
+                }
+                let mt = self.memtables.entry(table.clone()).or_default();
+                let mut undo = self
+                    .active_savepoint
+                    .as_mut()
+                    .and_then(|sp| sp.memtable_undos.get_mut(&table));
+                for id in ids {
+                    mt.delete_id(&id, undo.as_deref_mut());
+                }
+            }
+        }
+    }
+
+    /// Begin an interactive ACID transaction savepoint.
+    pub fn begin_savepoint(&mut self) -> Result<(), Error> {
+        if self.read_only {
+            return Err(Error::runtime(
+                "cannot begin transaction on read-only DiskEngine",
+            ));
+        }
+        if self.active_savepoint.is_some() {
+            return Err(Error::runtime(
+                "nested DiskEngine savepoints are not supported",
+            ));
+        }
+        self.active_savepoint = Some(DiskSavepoint {
+            saved_tables: None,
+            memtable_undos: FxHashMap::default(),
+            added_tombstones: Vec::new(),
+            pending_wal_ops: Vec::new(),
+        });
+        Ok(())
+    }
+
+    pub fn has_active_savepoint(&self) -> bool {
+        self.active_savepoint.is_some()
+    }
+
+    pub fn commit_savepoint(&mut self) -> Result<u64, Error> {
+        let Some(sp) = self.active_savepoint.take() else {
+            return Ok(self.manifest.generation);
+        };
+        if sp.pending_wal_ops.is_empty() {
+            return Ok(self.manifest.generation);
+        }
+        let next_gen = self.manifest.generation + 1;
+        self.append_wal_ops(next_gen, &sp.pending_wal_ops)?;
+        self.manifest.generation = next_gen;
+
+        let total_mem_rows: usize = self.memtables.values().map(MemTable::live_count).sum();
+        if total_mem_rows >= 32_768 || self.wal_bytes >= 64 * 1024 * 1024 {
+            self.checkpoint()?;
+        }
+        Ok(next_gen)
+    }
+
+    pub fn rollback_savepoint(&mut self) {
+        let Some(sp) = self.active_savepoint.take() else {
+            return;
+        };
+        if let Some(saved_tables) = sp.saved_tables {
+            self.manifest.tables = saved_tables;
+        }
+        for (tbl, undo) in sp.memtable_undos {
+            if !undo.existed_before {
+                self.memtables.remove(&tbl);
+                continue;
+            }
+            let remove_empty = if let Some(mt) = self.memtables.get_mut(&tbl) {
+                mt.rows.truncate(undo.prev_rows_len);
+                mt.dead_mem.retain(|&idx| idx < undo.prev_rows_len);
+                for idx in undo.added_dead_mem {
+                    mt.dead_mem.remove(&idx);
+                }
+                for (id, prev_idx) in undo.prev_by_id {
+                    match prev_idx {
+                        Some(i) => {
+                            mt.by_id.insert(id, i);
+                        }
+                        None => {
+                            mt.by_id.remove(&id);
+                        }
+                    }
+                }
+                for (id, was_del) in undo.prev_deleted_ids {
+                    if was_del {
+                        mt.deleted_ids.insert(id);
+                    } else {
+                        mt.deleted_ids.remove(&id);
+                    }
+                }
+                mt.sec.clear();
+                if let Some(schema) = self.manifest.tables.get(&tbl) {
+                    for field in &schema.indexed_fields {
+                        if field != "id" {
+                            mt.rebuild_sec_for_field(field);
+                        }
+                    }
+                }
+                mt.rows.is_empty() && mt.deleted_ids.is_empty()
+            } else {
+                false
+            };
+            if remove_empty {
+                self.memtables.remove(&tbl);
+            }
+        }
+        for (sid, rid) in sp.added_tombstones {
+            self.tombstones.unmark_dead(sid, rid);
+        }
+        self.hot_cache.clear_all();
+    }
+
+    /// Commit a batch of ACID operations atomically to WAL + MemTable (or stage into active savepoint).
+    pub fn commit_ops(&mut self, ops: Vec<DiskWalOp>) -> Result<u64, Error> {
+        if self.read_only {
+            return Err(Error::runtime("cannot mutate read-only DiskEngine"));
+        }
+        if ops.is_empty() {
+            return Ok(self.manifest.generation);
+        }
+        if self.active_savepoint.is_some() {
+            for op in ops {
+                if let Some(sp) = self.active_savepoint.as_mut() {
+                    sp.pending_wal_ops.push(op.clone());
+                }
+                self.apply_op_in_memory(op);
+            }
+            return Ok(self.manifest.generation + 1);
+        }
+        let next_gen = self.manifest.generation + 1;
+        self.append_wal_ops(next_gen, &ops)?;
+        for op in ops {
+            self.apply_op_in_memory(op);
+        }
+        self.manifest.generation = next_gen;
+
+        let total_mem_rows: usize = self.memtables.values().map(MemTable::live_count).sum();
+        if total_mem_rows >= 32_768 || self.wal_bytes >= 64 * 1024 * 1024 {
+            self.checkpoint()?;
+        }
+        Ok(next_gen)
+    }
+
+    /// Incremental checkpoint: flushes ONLY dirty MemTable rows into new immutable mmap segments
+    /// and persists updated tombstones + manifest, then truncates WAL to 0 bytes.
+    pub fn checkpoint(&mut self) -> Result<(), Error> {
+        if self.read_only {
+            return Ok(());
+        }
+        let mut new_metas = Vec::new();
+        let table_names: Vec<String> = self.memtables.keys().cloned().collect();
+        for tname in table_names {
+            let Some(mt) = self.memtables.get_mut(&tname) else {
+                continue;
+            };
+            let rows = mt.drain_live_rows();
+            if rows.is_empty() {
+                continue;
+            }
+            let schema = self
+                .manifest
+                .tables
+                .get(&tname)
+                .cloned()
+                .unwrap_or_else(|| infer_schema_from_rows(&tname, &rows));
+            self.manifest
+                .tables
+                .entry(tname.clone())
+                .or_insert_with(|| schema.clone());
+
+            let seg_id = self.manifest.next_seg_id;
+            self.manifest.next_seg_id += 1;
+            let meta = write_segment_to_disk(&self.dir, seg_id, &schema, &rows)?;
+            let seg_dir = self.dir.join(SEGMENTS_DIR).join(format!("seg_{seg_id:08}"));
+            let opened = DiskSegment::open(&seg_dir, meta.clone())?;
+            self.segments
+                .entry(tname)
+                .or_default()
+                .push(Arc::new(opened));
+            new_metas.push(meta);
+        }
+
+        self.manifest.segments.extend(new_metas);
+        self.save_tombstones_and_manifest()?;
+
+        if let Some(f) = self.wal_file.as_mut() {
+            f.set_len(0).map_err(io_err)?;
+            f.seek(SeekFrom::Start(0)).map_err(io_err)?;
+            if self.sync_full {
+                crate::persist::durable_sync(f)
+                    .or_else(|_| f.sync_all())
+                    .map_err(io_err)?;
+            }
+        }
+        self.wal_bytes = 0;
+        if self.active_savepoint.is_none() {
+            let _ = self.maybe_merge_small_delta_segments();
+        }
+        Ok(())
+    }
+
+    fn maybe_merge_small_delta_segments(&mut self) -> Result<CompactionReport, Error> {
+        let mut total = CompactionReport::default();
+        if self.read_only || self.active_savepoint.is_some() {
+            return Ok(total);
+        }
+        let table_names: Vec<String> = self.segments.keys().cloned().collect();
+        for tname in table_names {
+            let Some(segs) = self.segments.get(&tname) else {
+                continue;
+            };
+            let small_indices: Vec<usize> = segs
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.meta.row_count < 8_192)
+                .map(|(i, _)| i)
+                .collect();
+            if small_indices.len() < 10 {
+                continue;
+            }
+            let Some(schema) = self.manifest.tables.get(&tname).cloned() else {
+                continue;
+            };
+
+            let mut old_seg_ids: FxHashSet<u64> = FxHashSet::default();
+            let mut dead_reclaimed = 0usize;
+            let mut merged_rows: Vec<Row> = Vec::new();
+            for &idx in &small_indices {
+                let seg = &segs[idx];
+                let sid = seg.meta.seg_id;
+                old_seg_ids.insert(sid);
+                dead_reclaimed += self.tombstones.dead_count(sid) as usize;
+                for rid in 0..seg.meta.row_count {
+                    if self.tombstones.is_dead(sid, rid) {
+                        continue;
+                    }
+                    merged_rows.push(seg.materialize_row(rid)?);
+                }
+            }
+
+            let mut new_segs: Vec<Arc<DiskSegment>> = Vec::new();
+            let mut new_metas: Vec<SegmentMeta> = Vec::new();
+            for chunk in merged_rows.chunks(65_536) {
+                let seg_id = self.manifest.next_seg_id;
+                self.manifest.next_seg_id += 1;
+                let meta = write_segment_to_disk(&self.dir, seg_id, &schema, chunk)?;
+                let seg_dir = self.dir.join(SEGMENTS_DIR).join(format!("seg_{seg_id:08}"));
+                let opened = DiskSegment::open(&seg_dir, meta.clone())?;
+                new_segs.push(Arc::new(opened));
+                new_metas.push(meta);
+            }
+
+            if let Some(cur_segs) = self.segments.get_mut(&tname) {
+                cur_segs.retain(|s| !old_seg_ids.contains(&s.meta.seg_id));
+                cur_segs.extend(new_segs);
+            }
+            self.manifest
+                .segments
+                .retain(|m| !old_seg_ids.contains(&m.seg_id));
+            self.manifest.segments.extend(new_metas.iter().cloned());
+            for &sid in &old_seg_ids {
+                self.tombstones.words_by_seg.remove(&sid);
+                self.tombstones.dead_counts.remove(&sid);
+            }
+            self.manifest.generation += 1;
+            self.hot_cache.clear_all();
+            self.save_tombstones_and_manifest()?;
+            for &sid in &old_seg_ids {
+                let seg_dir = self.dir.join(SEGMENTS_DIR).join(format!("seg_{sid:08}"));
+                let _ = fs::remove_dir_all(&seg_dir);
+            }
+            total.tables_compacted += 1;
+            total.old_segments_removed += old_seg_ids.len();
+            total.new_segments_written += new_metas.len();
+            total.dead_rows_reclaimed += dead_reclaimed;
+        }
+        Ok(total)
+    }
+
+    pub fn compact_table(&mut self, table: &str, force: bool) -> Result<CompactionReport, Error> {
+        if self.read_only {
+            return Err(Error::runtime("cannot compact read-only DiskEngine"));
+        }
+        if self.active_savepoint.is_some() {
+            return Err(Error::runtime(
+                "cannot compact DiskEngine while a transaction savepoint is active",
+            ));
+        }
+        self.checkpoint()?;
+
+        let Some(segs) = self.segments.get(table) else {
+            return Ok(CompactionReport::default());
+        };
+        if segs.is_empty() {
+            return Ok(CompactionReport::default());
+        }
+        let Some(schema) = self.manifest.tables.get(table).cloned() else {
+            return Ok(CompactionReport::default());
+        };
+
+        let mut total_rows = 0usize;
+        let mut dead_rows = 0usize;
+        let mut small_segs = 0usize;
+        let mut missing_ivf = false;
+        let mut missing_sec = false;
+        let mut missing_dict = false;
+
+        for seg in segs.iter() {
+            let rc = seg.meta.row_count as usize;
+            total_rows += rc;
+            dead_rows += self.tombstones.dead_count(seg.meta.seg_id) as usize;
+            if rc < 16_384 {
+                small_segs += 1;
+            }
+            for col in &schema.columns {
+                if let DiskColKind::VecF32Sq8 { dim } = col.kind
+                    && dim > 0
+                    && rc >= IVF_MIN_SEGMENT_VECS
+                    && seg.vec_col(&col.name).is_some_and(|vc| vc.ivf.is_none())
+                {
+                    missing_ivf = true;
+                }
+            }
+            if force && rc >= DICT_MIN_SEGMENT_ROWS {
+                let sample_n = rc.min(128);
+                for (cname, mcol) in &seg.cols {
+                    if cname == "id" || cname == "content" {
+                        continue;
+                    }
+                    if let MmapCol::Text(tc) = mcol {
+                        let mut distinct: FxHashSet<String> = FxHashSet::default();
+                        for r in 0..sample_n {
+                            let _ = tc.with_str(r as u32, |opt| {
+                                if let Some(s) = opt {
+                                    distinct.insert(s.to_string());
+                                }
+                            });
+                        }
+                        if distinct.len() * 2 <= sample_n {
+                            missing_dict = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            for ix in &schema.indexed_fields {
+                if ix != "id" && !seg.sec_indexes.contains_key(ix) {
+                    missing_sec = true;
+                }
+            }
+        }
+
+        let should_compact = if force {
+            dead_rows > 0
+                || segs.len() > 1 && small_segs > 0
+                || missing_ivf
+                || missing_sec
+                || missing_dict
+        } else {
+            (total_rows > 0 && dead_rows * 5 >= total_rows) || small_segs >= 2 || missing_sec
+        };
+
+        if !should_compact {
+            return Ok(CompactionReport::default());
+        }
+
+        const TARGET_SEG_ROWS: usize = 65_536;
+        let old_seg_ids: Vec<u64> = segs.iter().map(|s| s.meta.seg_id).collect();
+        let old_segs_snapshot: Vec<Arc<DiskSegment>> = segs.clone();
+
+        let mut new_segs: Vec<Arc<DiskSegment>> = Vec::new();
+        let mut new_metas: Vec<SegmentMeta> = Vec::new();
+        let mut batch: Vec<Row> = Vec::with_capacity(TARGET_SEG_ROWS.min(total_rows.max(1)));
+
+        for seg in &old_segs_snapshot {
+            let sid = seg.meta.seg_id;
+            for rid in 0..seg.meta.row_count {
+                if self.tombstones.is_dead(sid, rid) {
+                    continue;
+                }
+                batch.push(seg.materialize_row(rid)?);
+                if batch.len() >= TARGET_SEG_ROWS {
+                    let seg_id = self.manifest.next_seg_id;
+                    self.manifest.next_seg_id += 1;
+                    let meta = write_segment_to_disk(&self.dir, seg_id, &schema, &batch)?;
+                    let seg_dir = self.dir.join(SEGMENTS_DIR).join(format!("seg_{seg_id:08}"));
+                    let opened = DiskSegment::open(&seg_dir, meta.clone())?;
+                    new_segs.push(Arc::new(opened));
+                    new_metas.push(meta);
+                    batch.clear();
+                }
+            }
+        }
+        if !batch.is_empty() {
+            let seg_id = self.manifest.next_seg_id;
+            self.manifest.next_seg_id += 1;
+            let meta = write_segment_to_disk(&self.dir, seg_id, &schema, &batch)?;
+            let seg_dir = self.dir.join(SEGMENTS_DIR).join(format!("seg_{seg_id:08}"));
+            let opened = DiskSegment::open(&seg_dir, meta.clone())?;
+            new_segs.push(Arc::new(opened));
+            new_metas.push(meta);
+            batch.clear();
+        }
+
+        let old_id_set: FxHashSet<u64> = old_seg_ids.iter().copied().collect();
+        let new_count = new_metas.len();
+        if new_segs.is_empty() {
+            self.segments.remove(table);
+        } else {
+            self.segments.insert(table.to_string(), new_segs);
+        }
+        self.manifest
+            .segments
+            .retain(|m| !old_id_set.contains(&m.seg_id));
+        self.manifest.segments.extend(new_metas);
+        for &sid in &old_seg_ids {
+            self.tombstones.words_by_seg.remove(&sid);
+            self.tombstones.dead_counts.remove(&sid);
+        }
+        self.manifest.generation += 1;
+        self.hot_cache.clear_all();
+        self.save_tombstones_and_manifest()?;
+
+        drop(old_segs_snapshot);
+        for sid in &old_seg_ids {
+            let seg_dir = self.dir.join(SEGMENTS_DIR).join(format!("seg_{sid:08}"));
+            let _ = fs::remove_dir_all(&seg_dir);
+        }
+
+        Ok(CompactionReport {
+            tables_compacted: 1,
+            old_segments_removed: old_seg_ids.len(),
+            new_segments_written: new_count,
+            dead_rows_reclaimed: dead_rows,
+        })
+    }
+
+    pub fn compact_all(&mut self, force: bool) -> Result<CompactionReport, Error> {
+        self.checkpoint()?;
+        let tables: Vec<String> = self.manifest.tables.keys().cloned().collect();
+        let mut agg = CompactionReport::default();
+        for t in tables {
+            let r = self.compact_table(&t, force)?;
+            agg.tables_compacted += r.tables_compacted;
+            agg.old_segments_removed += r.old_segments_removed;
+            agg.new_segments_written += r.new_segments_written;
+            agg.dead_rows_reclaimed += r.dead_rows_reclaimed;
+        }
+        Ok(agg)
+    }
+
+    pub fn vacuum(&mut self) -> Result<CompactionReport, Error> {
+        self.compact_all(true)
+    }
+
+    pub fn write_bulk_segment(&mut self, table: &str, rows: &[Row]) -> Result<(), Error> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let schema = self
+            .manifest
+            .tables
+            .get(table)
+            .cloned()
+            .unwrap_or_else(|| infer_schema_from_rows(table, rows));
+        self.manifest
+            .tables
+            .entry(table.to_string())
+            .or_insert_with(|| schema.clone());
+
+        let seg_id = self.manifest.next_seg_id;
+        self.manifest.next_seg_id += 1;
+        let meta = write_segment_to_disk(&self.dir, seg_id, &schema, rows)?;
+        let seg_dir = self.dir.join(SEGMENTS_DIR).join(format!("seg_{seg_id:08}"));
+        let opened = DiskSegment::open(&seg_dir, meta.clone())?;
+        self.segments
+            .entry(table.to_string())
+            .or_default()
+            .push(Arc::new(opened));
+        self.manifest.segments.push(meta);
+        self.manifest.generation += 1;
+        Ok(())
+    }
+
+    pub fn save_tombstones_and_manifest(&self) -> Result<(), Error> {
+        let tomb_tmp = self.dir.join("tombstones.bin.tmp");
+        let tomb_bytes = rmp_serde::to_vec(&self.tombstones).map_err(io_err)?;
+        fs::write(&tomb_tmp, tomb_bytes).map_err(io_err)?;
+        fs::rename(&tomb_tmp, self.dir.join(TOMBSTONES_FILE)).map_err(io_err)?;
+
+        let man_tmp = self.dir.join("manifest.json.tmp");
+        let man_bytes = serde_json::to_vec_pretty(&self.manifest).map_err(io_err)?;
+        fs::write(&man_tmp, man_bytes).map_err(io_err)?;
+        fs::rename(&man_tmp, self.dir.join(MANIFEST_FILE)).map_err(io_err)?;
+        Ok(())
+    }
+
+    // ========================================================================
+    // O(1) Point Reads, Counts, Scans & Index Seeks
+    // ========================================================================
+
+    pub fn has_table(&self, table: &str) -> bool {
+        self.manifest.tables.contains_key(table)
+    }
+
+    /// Exact live row count in O(#segments).
+    pub fn count_table(&self, table: &str) -> usize {
+        let mem_live = self.memtables.get(table).map_or(0, MemTable::live_count);
+        let seg_live: usize = self
+            .segments
+            .get(table)
+            .map(|segs| {
+                segs.iter()
+                    .map(|s| {
+                        (s.meta
+                            .row_count
+                            .saturating_sub(self.tombstones.dead_count(s.meta.seg_id)))
+                            as usize
+                    })
+                    .sum()
+            })
+            .unwrap_or(0);
+        mem_live + seg_live
+    }
+
+    pub fn exists_by_id(&self, table: &str, id: &str) -> bool {
+        if let Some(mt) = self.memtables.get(table) {
+            if mt.deleted_ids.contains(id) {
+                return false;
+            }
+            if mt.by_id.contains_key(id) {
+                return true;
+            }
+        }
+        let Some(segs) = self.segments.get(table) else {
+            return false;
+        };
+        with_text_index_key(id, |kbuf| {
+            for seg in segs.iter().rev() {
+                let sid = seg.meta.seg_id;
+                let mut found = false;
+                seg.pk_index.for_each_key(kbuf, |rid| {
+                    if !self.tombstones.is_dead(sid, rid) {
+                        found = true;
+                        return false;
+                    }
+                    true
+                });
+                if found {
+                    return true;
+                }
+            }
+            false
+        })
+    }
+
+    pub fn get_by_id(&self, table: &str, id: &str) -> Result<Option<Row>, Error> {
+        if let Some(mt) = self.memtables.get(table) {
+            if mt.deleted_ids.contains(id) {
+                return Ok(None);
+            }
+            if let Some(&idx) = mt.by_id.get(id) {
+                return Ok(Some(mt.rows[idx].clone()));
+            }
+        }
+        if let Some(cached) = self.hot_cache.get_row(table, id) {
+            return Ok(Some((*cached).clone()));
+        }
+        let Some(segs) = self.segments.get(table) else {
+            return Ok(None);
+        };
+        with_text_index_key(id, |kbuf| {
+            for seg in segs.iter().rev() {
+                let sid = seg.meta.seg_id;
+                let mut live_rid = None;
+                seg.pk_index.for_each_key(kbuf, |rid| {
+                    if !self.tombstones.is_dead(sid, rid) {
+                        live_rid = Some(rid);
+                        return false;
+                    }
+                    true
+                });
+                if let Some(rid) = live_rid {
+                    let row = seg.materialize_row(rid)?;
+                    self.hot_cache.put_row(table, id, Arc::new(row.clone()));
+                    return Ok(Some(row));
+                }
+            }
+            Ok(None)
+        })
+    }
+
+    pub fn get_arc_by_id(&self, table: &str, id: &str) -> Result<Option<Arc<Row>>, Error> {
+        if let Some(mt) = self.memtables.get(table) {
+            if mt.deleted_ids.contains(id) {
+                return Ok(None);
+            }
+            if let Some(&idx) = mt.by_id.get(id) {
+                return Ok(Some(Arc::new(mt.rows[idx].clone())));
+            }
+        }
+        if let Some(cached) = self.hot_cache.get_row(table, id) {
+            return Ok(Some(cached));
+        }
+        let Some(segs) = self.segments.get(table) else {
+            return Ok(None);
+        };
+        with_text_index_key(id, |kbuf| {
+            for seg in segs.iter().rev() {
+                let sid = seg.meta.seg_id;
+                let mut live_rid = None;
+                seg.pk_index.for_each_key(kbuf, |rid| {
+                    if !self.tombstones.is_dead(sid, rid) {
+                        live_rid = Some(rid);
+                        return false;
+                    }
+                    true
+                });
+                if let Some(rid) = live_rid {
+                    let arc = Arc::new(seg.materialize_row(rid)?);
+                    self.hot_cache.put_row(table, id, Arc::clone(&arc));
+                    return Ok(Some(arc));
+                }
+            }
+            Ok(None)
+        })
+    }
+
+    pub fn get_projected_by_id(
+        &self,
+        table: &str,
+        id: &str,
+        fields: &[&str],
+    ) -> Result<Option<Row>, Error> {
+        if let Some(mt) = self.memtables.get(table) {
+            if mt.deleted_ids.contains(id) {
+                return Ok(None);
+            }
+            if let Some(&idx) = mt.by_id.get(id) {
+                let src = &mt.rows[idx];
+                let mut out = Row::new();
+                for &f in fields {
+                    if let Some(c) = src.get(f) {
+                        out.insert(f.to_string(), c.clone());
+                    }
+                }
+                return Ok(Some(out));
+            }
+        }
+        if let Some(cached) = self.hot_cache.get_row(table, id) {
+            let mut out = Row::new();
+            for &f in fields {
+                if let Some(c) = cached.get(f) {
+                    out.insert(f.to_string(), c.clone());
+                }
+            }
+            return Ok(Some(out));
+        }
+        let Some(segs) = self.segments.get(table) else {
+            return Ok(None);
+        };
+        with_text_index_key(id, |kbuf| {
+            for seg in segs.iter().rev() {
+                let sid = seg.meta.seg_id;
+                let mut live_rid = None;
+                seg.pk_index.for_each_key(kbuf, |rid| {
+                    if !self.tombstones.is_dead(sid, rid) {
+                        live_rid = Some(rid);
+                        return false;
+                    }
+                    true
+                });
+                if let Some(rid) = live_rid {
+                    return seg.materialize_projected(rid, fields).map(Some);
+                }
+            }
+            Ok(None)
+        })
+    }
+
+    pub fn count_by_eq(&self, table: &str, field: &str, key: &Cell) -> Result<usize, Error> {
+        if field == "id"
+            && let Some(id_str) = key.text()
+        {
+            return Ok(usize::from(self.exists_by_id(table, id_str)));
+        }
+        let mut kbuf = Vec::with_capacity(64);
+        if !encode_index_cell_key(key, &mut kbuf) {
+            return Ok(0);
+        }
+        let mut total = 0usize;
+        if let Some(mt) = self.memtables.get(table) {
+            if let Some(fmap) = mt.sec.get(field) {
+                if let Some(idxs) = fmap.get(&kbuf) {
+                    for &idx in idxs {
+                        if !mt.dead_mem.contains(&idx) {
+                            total += 1;
+                        }
+                    }
+                }
+            } else {
+                for (idx, row) in mt.rows.iter().enumerate() {
+                    if !mt.dead_mem.contains(&idx) && row.get(field) == Some(key) {
+                        total += 1;
+                    }
+                }
+            }
+        }
+        if let Some(segs) = self.segments.get(table) {
+            for seg in segs {
+                let sid = seg.meta.seg_id;
+                if let Some(sec_idx) = seg.sec_indexes.get(field) {
+                    sec_idx.for_each_key(&kbuf, |rid| {
+                        if !self.tombstones.is_dead(sid, rid) {
+                            total += 1;
+                        }
+                        true
+                    });
+                } else {
+                    for rid in 0..seg.meta.row_count {
+                        if !self.tombstones.is_dead(sid, rid) && seg.get_cell(rid, field)? == *key {
+                            total += 1;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(total)
+    }
+
+    pub fn for_each_by_eq_projected(
+        &self,
+        table: &str,
+        field: &str,
+        key: &Cell,
+        project_fields: Option<&[&str]>,
+        mut visit: impl FnMut(&Row) -> Result<bool, Error>,
+    ) -> Result<(), Error> {
+        if field == "id"
+            && let Some(id_str) = key.text()
+        {
+            let maybe_row = match project_fields {
+                Some(fs) => self.get_projected_by_id(table, id_str, fs)?,
+                None => self.get_by_id(table, id_str)?,
+            };
+            if let Some(r) = maybe_row {
+                let _ = visit(&r)?;
+            }
+            return Ok(());
+        }
+
+        let mut kbuf = Vec::with_capacity(64);
+        if !encode_index_cell_key(key, &mut kbuf) {
+            return Ok(());
+        }
+
+        let cacheable = self.active_savepoint.is_none();
+        let qhash = if cacheable {
+            let mut h = 0xcbf2_9ce4_8422_2325u64;
+            for &b in table.as_bytes() {
+                h ^= u64::from(b);
+                h = h.wrapping_mul(0x100_0000_01b3);
+            }
+            h ^= 0xfe;
+            for &b in field.as_bytes() {
+                h ^= u64::from(b);
+                h = h.wrapping_mul(0x100_0000_01b3);
+            }
+            h ^= 0xfd;
+            for &b in &kbuf {
+                h ^= u64::from(b);
+                h = h.wrapping_mul(0x100_0000_01b3);
+            }
+            h ^= match project_fields {
+                None => 0xaa,
+                Some(fs) => {
+                    let mut ph = 0x55u64;
+                    for &f in fs {
+                        for &b in f.as_bytes() {
+                            ph ^= u64::from(b);
+                            ph = ph.wrapping_mul(0x100_0000_01b3);
+                        }
+                        ph ^= 0xff;
+                    }
+                    ph
+                }
+            };
+            h
+        } else {
+            0
+        };
+
+        if cacheable
+            && let Some(cached) = self
+                .hot_cache
+                .get_sec_query(self.manifest.generation, qhash)
+        {
+            for row in cached.iter() {
+                if !visit(row)? {
+                    return Ok(());
+                }
+            }
+            return Ok(());
+        }
+
+        const MAX_CACHED_POSTING_ROWS: usize = 2_048;
+        let mut collected: Option<Vec<Row>> = cacheable.then(Vec::new);
+
+        if let Some(mt) = self.memtables.get(table) {
+            if let Some(fmap) = mt.sec.get(field) {
+                if let Some(idxs) = fmap.get(&kbuf) {
+                    for &idx in idxs {
+                        if mt.dead_mem.contains(&idx) {
+                            continue;
+                        }
+                        if let Some(buf) = collected.as_mut() {
+                            if buf.len() < MAX_CACHED_POSTING_ROWS {
+                                buf.push(mt.rows[idx].clone());
+                            } else {
+                                collected = None;
+                            }
+                        }
+                        if !visit(&mt.rows[idx])? {
+                            return Ok(());
+                        }
+                    }
+                }
+            } else {
+                for (idx, row) in mt.rows.iter().enumerate() {
+                    if mt.dead_mem.contains(&idx) {
+                        continue;
+                    }
+                    if row.get(field) == Some(key) {
+                        if let Some(buf) = collected.as_mut() {
+                            if buf.len() < MAX_CACHED_POSTING_ROWS {
+                                buf.push(row.clone());
+                            } else {
+                                collected = None;
+                            }
+                        }
+                        if !visit(row)? {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(segs) = self.segments.get(table) {
+            for seg in segs {
+                let sid = seg.meta.seg_id;
+                if let Some(sec_idx) = seg.sec_indexes.get(field) {
+                    let mut matches = Vec::new();
+                    sec_idx.for_each_key(&kbuf, |rid| {
+                        if !self.tombstones.is_dead(sid, rid) {
+                            matches.push(rid);
+                        }
+                        true
+                    });
+                    if matches.len() > 1 {
+                        matches.sort_unstable();
+                    }
+                    match project_fields {
+                        Some(fs) => {
+                            let col_indices: Vec<(&str, usize)> = fs
+                                .iter()
+                                .filter_map(|&f| seg.col_pos.get(f).map(|&p| (f, p)))
+                                .collect();
+                            let mut last_blocks: Vec<Option<(u32, Arc<[u8]>)>> =
+                                vec![None; col_indices.len()];
+                            let mut scratch = Row::new();
+                            for rid in matches {
+                                scratch.clear();
+                                for (ci, &(fname, pos)) in col_indices.iter().enumerate() {
+                                    let cell = match &seg.cols[pos].1 {
+                                        MmapCol::Text(tc) => match tc.get_loc(rid) {
+                                            None => Cell::Null,
+                                            Some((_, _, 0)) => {
+                                                Cell::SmallText(InlineStr::new_truncate(""))
+                                            }
+                                            Some((bidx, in_off, len)) => {
+                                                let block = match &last_blocks[ci] {
+                                                    Some((lb, arc)) if *lb == bidx => {
+                                                        Arc::clone(arc)
+                                                    }
+                                                    _ => {
+                                                        let decoded = tc.decode_block(bidx)?;
+                                                        last_blocks[ci] =
+                                                            Some((bidx, Arc::clone(&decoded)));
+                                                        decoded
+                                                    }
+                                                };
+                                                let s_off = in_off as usize;
+                                                let e_off = s_off + (len as usize);
+                                                if e_off > block.len() {
+                                                    return Err(io_err(
+                                                        "corrupt in-block text slice",
+                                                    ));
+                                                }
+                                                let s = std::str::from_utf8(&block[s_off..e_off])
+                                                    .map_err(io_err)?;
+                                                Cell::from_text(s)
+                                            }
+                                        },
+                                        other => other.get_cell(rid)?,
+                                    };
+                                    if !matches!(cell, Cell::Null) {
+                                        scratch.insert(fname.to_string(), cell);
+                                    }
+                                }
+                                if let Some(buf) = collected.as_mut() {
+                                    if buf.len() < MAX_CACHED_POSTING_ROWS {
+                                        buf.push(scratch.clone());
+                                    } else {
+                                        collected = None;
+                                    }
+                                }
+                                if !visit(&scratch)? {
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        None => {
+                            for rid in matches {
+                                let row = seg.materialize_row(rid)?;
+                                if let Some(buf) = collected.as_mut() {
+                                    if buf.len() < MAX_CACHED_POSTING_ROWS {
+                                        buf.push(row.clone());
+                                    } else {
+                                        collected = None;
+                                    }
+                                }
+                                if !visit(&row)? {
+                                    return Ok(());
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    for rid in 0..seg.meta.row_count {
+                        if self.tombstones.is_dead(sid, rid) {
+                            continue;
+                        }
+                        if seg.get_cell(rid, field)? == *key {
+                            let row = match project_fields {
+                                Some(fs) => seg.materialize_projected(rid, fs)?,
+                                None => seg.materialize_row(rid)?,
+                            };
+                            if let Some(buf) = collected.as_mut() {
+                                if buf.len() < MAX_CACHED_POSTING_ROWS {
+                                    buf.push(row.clone());
+                                } else {
+                                    collected = None;
+                                }
+                            }
+                            if !visit(&row)? {
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(buf) = collected {
+            self.hot_cache
+                .put_sec_query(self.manifest.generation, qhash, Arc::from(buf));
+        }
+        Ok(())
+    }
+
+    pub fn scan_projected(
+        &self,
+        table: &str,
+        project_fields: Option<&[&str]>,
+        mut visit: impl FnMut(&Row) -> Result<bool, Error>,
+    ) -> Result<(), Error> {
+        if let Some(segs) = self.segments.get(table) {
+            for seg in segs {
+                let sid = seg.meta.seg_id;
+                match project_fields {
+                    Some(fs) => {
+                        let col_indices: Vec<(&str, usize)> = fs
+                            .iter()
+                            .filter_map(|&f| seg.col_pos.get(f).map(|&p| (f, p)))
+                            .collect();
+                        let mut scratch = Row::new();
+                        let mut last_blocks: Vec<Option<(u32, Arc<[u8]>)>> =
+                            vec![None; col_indices.len()];
+                        for rid in 0..seg.meta.row_count {
+                            if self.tombstones.is_dead(sid, rid) {
+                                continue;
+                            }
+                            scratch.clear();
+                            for (ci, &(fname, pos)) in col_indices.iter().enumerate() {
+                                let cell = match &seg.cols[pos].1 {
+                                    MmapCol::Text(tc) => match tc.get_loc(rid) {
+                                        None => Cell::Null,
+                                        Some((_, _, 0)) => {
+                                            Cell::SmallText(InlineStr::new_truncate(""))
+                                        }
+                                        Some((bidx, in_off, len)) => {
+                                            let block = match &last_blocks[ci] {
+                                                Some((lb, arc)) if *lb == bidx => Arc::clone(arc),
+                                                _ => {
+                                                    let decoded = tc.decode_block(bidx)?;
+                                                    last_blocks[ci] =
+                                                        Some((bidx, Arc::clone(&decoded)));
+                                                    decoded
+                                                }
+                                            };
+                                            let s_off = in_off as usize;
+                                            let e_off = s_off + (len as usize);
+                                            if e_off > block.len() {
+                                                return Err(io_err("corrupt in-block text slice"));
+                                            }
+                                            let s = std::str::from_utf8(&block[s_off..e_off])
+                                                .map_err(io_err)?;
+                                            Cell::from_text(s)
+                                        }
+                                    },
+                                    other => other.get_cell(rid)?,
+                                };
+                                if !matches!(cell, Cell::Null) {
+                                    scratch.insert(fname.to_string(), cell);
+                                }
+                            }
+                            if !visit(&scratch)? {
+                                return Ok(());
+                            }
+                        }
+                    }
+                    None => {
+                        for rid in 0..seg.meta.row_count {
+                            if self.tombstones.is_dead(sid, rid) {
+                                continue;
+                            }
+                            let row = seg.materialize_row(rid)?;
+                            if !visit(&row)? {
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(mt) = self.memtables.get(table) {
+            let mut idxs: Vec<usize> = mt.by_id.values().copied().collect();
+            idxs.sort_unstable();
+            for idx in idxs {
+                if mt.dead_mem.contains(&idx) {
+                    continue;
+                }
+                match project_fields {
+                    None => {
+                        if !visit(&mt.rows[idx])? {
+                            return Ok(());
+                        }
+                    }
+                    Some(fs) => {
+                        let mut projected = Row::new();
+                        for &f in fs {
+                            if let Some(c) = mt.rows[idx].get(f) {
+                                projected.insert(f.to_string(), c.clone());
+                            }
+                        }
+                        if !visit(&projected)? {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // ========================================================================
+    // Zero-Row Columnar Aggregation, Index Visitors & Direct Segment Access
+    // ========================================================================
+
+    pub fn group_count_str1(
+        &self,
+        table: &str,
+        col: &str,
+    ) -> Result<(u64, Vec<(Option<String>, u64)>), Error> {
+        let mut total_live = 0u64;
+        let mut global_null = 0u64;
+        let mut global_map: FxHashMap<String, u64> = FxHashMap::default();
+
+        if let Some(segs) = self.segments.get(table) {
+            for seg in segs {
+                let sid = seg.meta.seg_id;
+                let has_dead = self.tombstones.dead_count(sid) > 0;
+                let pos = seg.col_pos.get(col).copied();
+                match pos.map(|p| &seg.cols[p].1) {
+                    Some(MmapCol::Dict(dc)) => {
+                        let mut counts = vec![0u64; dc.strings.len()];
+                        let mut null_c = 0u64;
+                        if !has_dead {
+                            total_live += u64::from(seg.meta.row_count);
+                            for rid in 0..seg.meta.row_count {
+                                let code = dc.code_at(rid);
+                                if code == DICT_NULL_CODE {
+                                    null_c += 1;
+                                } else if let Some(slot) = counts.get_mut(code as usize) {
+                                    *slot += 1;
+                                }
+                            }
+                        } else {
+                            for rid in 0..seg.meta.row_count {
+                                if self.tombstones.is_dead(sid, rid) {
+                                    continue;
+                                }
+                                total_live += 1;
+                                let code = dc.code_at(rid);
+                                if code == DICT_NULL_CODE {
+                                    null_c += 1;
+                                } else if let Some(slot) = counts.get_mut(code as usize) {
+                                    *slot += 1;
+                                }
+                            }
+                        }
+                        global_null += null_c;
+                        for (s, c) in dc.strings.iter().zip(counts) {
+                            if c > 0 {
+                                *global_map.entry(s.to_string()).or_insert(0) += c;
+                            }
+                        }
+                    }
+                    _ => {
+                        let mut lb = None;
+                        for rid in 0..seg.meta.row_count {
+                            if has_dead && self.tombstones.is_dead(sid, rid) {
+                                continue;
+                            }
+                            total_live += 1;
+                            match seg.borrow_col_str(pos, rid, &mut lb)? {
+                                None => global_null += 1,
+                                Some(s) => {
+                                    if let Some(slot) = global_map.get_mut(s) {
+                                        *slot += 1;
+                                    } else {
+                                        global_map.insert(s.to_string(), 1);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(mt) = self.memtables.get(table) {
+            for &idx in mt.by_id.values() {
+                if mt.dead_mem.contains(&idx) {
+                    continue;
+                }
+                total_live += 1;
+                match mt.rows[idx].get(col).and_then(Cell::text) {
+                    None => global_null += 1,
+                    Some(s) => {
+                        if let Some(slot) = global_map.get_mut(s) {
+                            *slot += 1;
+                        } else {
+                            global_map.insert(s.to_string(), 1);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut out: Vec<(Option<String>, u64)> = Vec::with_capacity(global_map.len() + 1);
+        if global_null > 0 {
+            out.push((None, global_null));
+        }
+        for (k, v) in global_map {
+            out.push((Some(k), v));
+        }
+        Ok((total_live, out))
+    }
+
+    pub fn group_count_str2(
+        &self,
+        table: &str,
+        col1: &str,
+        col2: &str,
+    ) -> Result<(u64, Vec<((Option<String>, Option<String>), u64)>), Error> {
+        let mut total_live = 0u64;
+        let mut global_map: FxHashMap<(Option<String>, Option<String>), u64> = FxHashMap::default();
+
+        if let Some(segs) = self.segments.get(table) {
+            for seg in segs {
+                let sid = seg.meta.seg_id;
+                let has_dead = self.tombstones.dead_count(sid) > 0;
+                let p1 = seg.col_pos.get(col1).copied();
+                let p2 = seg.col_pos.get(col2).copied();
+                match (p1.map(|p| &seg.cols[p].1), p2.map(|p| &seg.cols[p].1)) {
+                    (Some(MmapCol::Dict(d1)), Some(MmapCol::Dict(d2))) => {
+                        let mut pair_counts: FxHashMap<u32, u64> = FxHashMap::default();
+                        if !has_dead {
+                            total_live += u64::from(seg.meta.row_count);
+                            for rid in 0..seg.meta.row_count {
+                                let k =
+                                    (u32::from(d1.code_at(rid)) << 16) | u32::from(d2.code_at(rid));
+                                *pair_counts.entry(k).or_insert(0) += 1;
+                            }
+                        } else {
+                            for rid in 0..seg.meta.row_count {
+                                if self.tombstones.is_dead(sid, rid) {
+                                    continue;
+                                }
+                                total_live += 1;
+                                let k =
+                                    (u32::from(d1.code_at(rid)) << 16) | u32::from(d2.code_at(rid));
+                                *pair_counts.entry(k).or_insert(0) += 1;
+                            }
+                        }
+                        for (pair_code, cnt) in pair_counts {
+                            let c1 = (pair_code >> 16) as u16;
+                            let c2 = (pair_code & 0xFFFF) as u16;
+                            let s1 = if c1 == DICT_NULL_CODE {
+                                None
+                            } else {
+                                d1.strings.get(c1 as usize).map(|b| b.to_string())
+                            };
+                            let s2 = if c2 == DICT_NULL_CODE {
+                                None
+                            } else {
+                                d2.strings.get(c2 as usize).map(|b| b.to_string())
+                            };
+                            *global_map.entry((s1, s2)).or_insert(0) += cnt;
+                        }
+                    }
+                    _ => {
+                        let mut lb1 = None;
+                        let mut lb2 = None;
+                        for rid in 0..seg.meta.row_count {
+                            if has_dead && self.tombstones.is_dead(sid, rid) {
+                                continue;
+                            }
+                            total_live += 1;
+                            let s1 = seg.borrow_col_str(p1, rid, &mut lb1)?.map(str::to_string);
+                            let s2 = seg.borrow_col_str(p2, rid, &mut lb2)?.map(str::to_string);
+                            *global_map.entry((s1, s2)).or_insert(0) += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(mt) = self.memtables.get(table) {
+            for &idx in mt.by_id.values() {
+                if mt.dead_mem.contains(&idx) {
+                    continue;
+                }
+                total_live += 1;
+                let r = &mt.rows[idx];
+                let s1 = r.get(col1).and_then(Cell::text).map(str::to_string);
+                let s2 = r.get(col2).and_then(Cell::text).map(str::to_string);
+                *global_map.entry((s1, s2)).or_insert(0) += 1;
+            }
+        }
+
+        Ok((total_live, global_map.into_iter().collect()))
+    }
+
+    pub fn group_count_str3(
+        &self,
+        table: &str,
+        col1: &str,
+        col2: &str,
+        col3: &str,
+    ) -> Result<
+        (
+            u64,
+            Vec<((Option<String>, Option<String>, Option<String>), u64)>,
+        ),
+        Error,
+    > {
+        let mut total_live = 0u64;
+        let mut global_map: FxHashMap<(Option<String>, Option<String>, Option<String>), u64> =
+            FxHashMap::default();
+
+        if let Some(segs) = self.segments.get(table) {
+            for seg in segs {
+                let sid = seg.meta.seg_id;
+                let has_dead = self.tombstones.dead_count(sid) > 0;
+                let p1 = seg.col_pos.get(col1).copied();
+                let p2 = seg.col_pos.get(col2).copied();
+                let p3 = seg.col_pos.get(col3).copied();
+                match (
+                    p1.map(|p| &seg.cols[p].1),
+                    p2.map(|p| &seg.cols[p].1),
+                    p3.map(|p| &seg.cols[p].1),
+                ) {
+                    (Some(MmapCol::Dict(d1)), Some(MmapCol::Dict(d2)), Some(MmapCol::Dict(d3))) => {
+                        let mut tri_counts: FxHashMap<u64, u64> = FxHashMap::default();
+                        if !has_dead {
+                            total_live += u64::from(seg.meta.row_count);
+                            for rid in 0..seg.meta.row_count {
+                                let k = (u64::from(d1.code_at(rid)) << 32)
+                                    | (u64::from(d2.code_at(rid)) << 16)
+                                    | u64::from(d3.code_at(rid));
+                                *tri_counts.entry(k).or_insert(0) += 1;
+                            }
+                        } else {
+                            for rid in 0..seg.meta.row_count {
+                                if self.tombstones.is_dead(sid, rid) {
+                                    continue;
+                                }
+                                total_live += 1;
+                                let k = (u64::from(d1.code_at(rid)) << 32)
+                                    | (u64::from(d2.code_at(rid)) << 16)
+                                    | u64::from(d3.code_at(rid));
+                                *tri_counts.entry(k).or_insert(0) += 1;
+                            }
+                        }
+                        for (tc, cnt) in tri_counts {
+                            let c1 = ((tc >> 32) & 0xFFFF) as u16;
+                            let c2 = ((tc >> 16) & 0xFFFF) as u16;
+                            let c3 = (tc & 0xFFFF) as u16;
+                            let s1 = (c1 != DICT_NULL_CODE)
+                                .then(|| d1.strings.get(c1 as usize).map(|b| b.to_string()))
+                                .flatten();
+                            let s2 = (c2 != DICT_NULL_CODE)
+                                .then(|| d2.strings.get(c2 as usize).map(|b| b.to_string()))
+                                .flatten();
+                            let s3 = (c3 != DICT_NULL_CODE)
+                                .then(|| d3.strings.get(c3 as usize).map(|b| b.to_string()))
+                                .flatten();
+                            *global_map.entry((s1, s2, s3)).or_insert(0) += cnt;
+                        }
+                    }
+                    _ => {
+                        let mut lb1 = None;
+                        let mut lb2 = None;
+                        let mut lb3 = None;
+                        for rid in 0..seg.meta.row_count {
+                            if has_dead && self.tombstones.is_dead(sid, rid) {
+                                continue;
+                            }
+                            total_live += 1;
+                            let s1 = seg.borrow_col_str(p1, rid, &mut lb1)?.map(str::to_string);
+                            let s2 = seg.borrow_col_str(p2, rid, &mut lb2)?.map(str::to_string);
+                            let s3 = seg.borrow_col_str(p3, rid, &mut lb3)?.map(str::to_string);
+                            *global_map.entry((s1, s2, s3)).or_insert(0) += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(mt) = self.memtables.get(table) {
+            for &idx in mt.by_id.values() {
+                if mt.dead_mem.contains(&idx) {
+                    continue;
+                }
+                total_live += 1;
+                let r = &mt.rows[idx];
+                let s1 = r.get(col1).and_then(Cell::text).map(str::to_string);
+                let s2 = r.get(col2).and_then(Cell::text).map(str::to_string);
+                let s3 = r.get(col3).and_then(Cell::text).map(str::to_string);
+                *global_map.entry((s1, s2, s3)).or_insert(0) += 1;
+            }
+        }
+
+        Ok((total_live, global_map.into_iter().collect()))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_each_by_eq_str3(
+        &self,
+        table: &str,
+        index_field: &str,
+        key_str: &str,
+        col1: &str,
+        col2: &str,
+        col3: Option<&str>,
+        mut visit: impl FnMut(Option<&str>, Option<&str>, Option<&str>) -> Result<bool, Error>,
+    ) -> Result<(), Error> {
+        with_text_index_key(key_str, |kbuf| {
+            if let Some(mt) = self.memtables.get(table) {
+                if let Some(fmap) = mt.sec.get(index_field) {
+                    if let Some(idxs) = fmap.get(kbuf) {
+                        for &idx in idxs {
+                            if mt.dead_mem.contains(&idx) {
+                                continue;
+                            }
+                            let r = &mt.rows[idx];
+                            let s1 = r.get(col1).and_then(Cell::text);
+                            let s2 = r.get(col2).and_then(Cell::text);
+                            let s3 = col3.and_then(|c| r.get(c).and_then(Cell::text));
+                            if !visit(s1, s2, s3)? {
+                                return Ok(());
+                            }
+                        }
+                    }
+                } else {
+                    for (idx, r) in mt.rows.iter().enumerate() {
+                        if mt.dead_mem.contains(&idx) {
+                            continue;
+                        }
+                        if r.get(index_field).and_then(Cell::text) == Some(key_str) {
+                            let s1 = r.get(col1).and_then(Cell::text);
+                            let s2 = r.get(col2).and_then(Cell::text);
+                            let s3 = col3.and_then(|c| r.get(c).and_then(Cell::text));
+                            if !visit(s1, s2, s3)? {
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some(segs) = self.segments.get(table) {
+                for seg in segs {
+                    let sid = seg.meta.seg_id;
+                    let p1 = seg.col_pos.get(col1).copied();
+                    let p2 = seg.col_pos.get(col2).copied();
+                    let p3 = col3.and_then(|c| seg.col_pos.get(c).copied());
+                    let mut lb1 = None;
+                    let mut lb2 = None;
+                    let mut lb3 = None;
+
+                    if let Some(sec_idx) = seg.sec_indexes.get(index_field) {
+                        let mut matches = SmallVec::<[u32; 32]>::new();
+                        sec_idx.for_each_key(kbuf, |rid| {
+                            if !self.tombstones.is_dead(sid, rid) {
+                                matches.push(rid);
+                            }
+                            true
+                        });
+                        if matches.len() > 1 {
+                            matches.sort_unstable();
+                        }
+                        for rid in matches {
+                            let s1 = seg.borrow_col_str(p1, rid, &mut lb1)?;
+                            let s2 = seg.borrow_col_str(p2, rid, &mut lb2)?;
+                            let s3 = seg.borrow_col_str(p3, rid, &mut lb3)?;
+                            if !visit(s1, s2, s3)? {
+                                return Ok(());
+                            }
+                        }
+                    } else {
+                        let pf = seg.col_pos.get(index_field).copied();
+                        let mut lbf = None;
+                        for rid in 0..seg.meta.row_count {
+                            if self.tombstones.is_dead(sid, rid) {
+                                continue;
+                            }
+                            if seg.borrow_col_str(pf, rid, &mut lbf)? == Some(key_str) {
+                                let s1 = seg.borrow_col_str(p1, rid, &mut lb1)?;
+                                let s2 = seg.borrow_col_str(p2, rid, &mut lb2)?;
+                                let s3 = seg.borrow_col_str(p3, rid, &mut lb3)?;
+                                if !visit(s1, s2, s3)? {
+                                    return Ok(());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
+    pub fn table_segments(&self, table: &str) -> &[Arc<DiskSegment>] {
+        self.segments
+            .get(table)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    pub fn build_bm25_allow_bitset(
+        &self,
+        table: &str,
+        fk_col: &str,
+        bm25: &MmapBm25Index,
+        allow_fk: impl Fn(&str) -> bool,
+    ) -> Result<Option<Vec<u64>>, Error> {
+        let segs = self.table_segments(table);
+        let mt_live = self.memtables.get(table).map_or(0, MemTable::live_count);
+        let seg_live: usize = segs
+            .iter()
+            .map(|s| {
+                (s.meta.row_count as usize)
+                    .saturating_sub(self.tombstones.dead_count(s.meta.seg_id) as usize)
+            })
+            .sum();
+        let total_live = seg_live + mt_live;
+        if total_live != bm25.doc_count as usize {
+            return Ok(None);
+        }
+        if total_live == 0 {
+            return Ok(Some(Vec::new()));
+        }
+
+        let mut cursor = 0u32;
+        for seg in segs {
+            let sid = seg.meta.seg_id;
+            let nrows = seg.meta.row_count;
+            let dead = self.tombstones.dead_count(sid);
+            let live_in_seg = nrows.saturating_sub(dead);
+            if live_in_seg == 0 {
+                continue;
+            }
+            let p_id = seg.col_pos.get("id").copied();
+            let mut lb = None;
+            let first_rid = if dead == 0 {
+                Some(0)
+            } else {
+                (0..nrows).find(|&r| !self.tombstones.is_dead(sid, r))
+            };
+            let last_rid = if dead == 0 {
+                Some(nrows - 1)
+            } else {
+                (0..nrows).rev().find(|&r| !self.tombstones.is_dead(sid, r))
+            };
+            if let Some(frid) = first_rid {
+                let seg_id_str = seg.borrow_col_str(p_id, frid, &mut lb)?;
+                if seg_id_str.is_none() || seg_id_str != bm25.doc_id(cursor) {
+                    return Ok(None);
+                }
+            }
+            if let Some(lrid) = last_rid {
+                let seg_id_str = seg.borrow_col_str(p_id, lrid, &mut lb)?;
+                if seg_id_str.is_none() || seg_id_str != bm25.doc_id(cursor + live_in_seg - 1) {
+                    return Ok(None);
+                }
+            }
+            cursor += live_in_seg;
+        }
+
+        let mut bits = vec![0u64; total_live.div_ceil(64)];
+        let mut doc_idx = 0usize;
+        for seg in segs {
+            let sid = seg.meta.seg_id;
+            let nrows = seg.meta.row_count;
+            let has_dead = self.tombstones.dead_count(sid) > 0;
+            if let Some((pos, seg_dict_bits, sel)) = seg.build_dict_allow_bitset(fk_col, &allow_fk)
+            {
+                if sel == 0.0 {
+                    if !has_dead {
+                        doc_idx += nrows as usize;
+                    } else {
+                        for rid in 0..nrows {
+                            if !self.tombstones.is_dead(sid, rid) {
+                                doc_idx += 1;
+                            }
+                        }
+                    }
+                    continue;
+                }
+                for rid in 0..nrows {
+                    if has_dead && self.tombstones.is_dead(sid, rid) {
+                        continue;
+                    }
+                    if seg.check_dict_bitset(pos, rid, &seg_dict_bits) {
+                        bits[doc_idx >> 6] |= 1u64 << (doc_idx & 63);
+                    }
+                    doc_idx += 1;
+                }
+            } else {
+                let p_fk = seg.col_pos.get(fk_col).copied();
+                let mut lb = None;
+                for rid in 0..nrows {
+                    if has_dead && self.tombstones.is_dead(sid, rid) {
+                        continue;
+                    }
+                    if let Some(fk_val) = seg.borrow_col_str(p_fk, rid, &mut lb)?
+                        && allow_fk(fk_val)
+                    {
+                        bits[doc_idx >> 6] |= 1u64 << (doc_idx & 63);
+                    }
+                    doc_idx += 1;
+                }
+            }
+        }
+
+        if mt_live > 0 {
+            let mut ok_align = true;
+            self.for_each_memtable_row(table, |_, row| {
+                let Some(cid) = row.get("id").and_then(Cell::text) else {
+                    return Ok(true);
+                };
+                if bm25.doc_id(doc_idx as u32) != Some(cid) {
+                    ok_align = false;
+                    return Ok(false);
+                }
+                if let Some(fk_val) = row.get(fk_col).and_then(Cell::text)
+                    && allow_fk(fk_val)
+                {
+                    bits[doc_idx >> 6] |= 1u64 << (doc_idx & 63);
+                }
+                doc_idx += 1;
+                Ok(true)
+            })?;
+            if !ok_align || doc_idx != total_live {
+                return Ok(None);
+            }
+        }
+
+        Ok(Some(bits))
+    }
+
+    #[inline]
+    pub fn is_segment_row_dead(&self, seg_id: u64, row_id: u32) -> bool {
+        self.tombstones.is_dead(seg_id, row_id)
+    }
+
+    pub fn for_each_memtable_row(
+        &self,
+        table: &str,
+        mut visit: impl FnMut(usize, &Row) -> Result<bool, Error>,
+    ) -> Result<(), Error> {
+        if let Some(mt) = self.memtables.get(table) {
+            let mut idxs: Vec<usize> = mt.by_id.values().copied().collect();
+            idxs.sort_unstable();
+            for idx in idxs {
+                if !mt.dead_mem.contains(&idx) && !visit(idx, &mt.rows[idx])? {
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn get_memtable_row(&self, table: &str, idx: usize) -> Option<&Row> {
+        self.memtables.get(table).and_then(|mt| mt.rows.get(idx))
+    }
+
+    pub fn segment_matching_rids(&self, seg: &DiskSegment, field: &str, val: &str) -> Vec<u32> {
+        let sid = seg.meta.seg_id;
+        if let Some(sec) = seg.sec_indexes.get(field) {
+            return with_text_index_key(val, |kbuf| {
+                let mut out = Vec::new();
+                sec.for_each_key(kbuf, |rid| {
+                    if !self.tombstones.is_dead(sid, rid) {
+                        out.push(rid);
+                    }
+                    true
+                });
+                if out.len() > 1 {
+                    out.sort_unstable();
+                }
+                out
+            });
+        }
+        let mut out = Vec::new();
+        let pos = seg.col_pos.get(field).copied();
+        let mut lb = None;
+        for rid in 0..seg.meta.row_count {
+            if !self.tombstones.is_dead(sid, rid)
+                && seg.borrow_col_str(pos, rid, &mut lb).ok().flatten() == Some(val)
+            {
+                out.push(rid);
+            }
+        }
+        out
+    }
+
+    // ========================================================================
+    // Out-of-Core Two-Stage Vector Search (SQ8 Mmap Scan -> Exact f32 Rerank)
+    // ========================================================================
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_vectors_out_of_core<F>(
+        &self,
+        table: &str,
+        vec_field: &str,
+        doc_id_field: &str,
+        query_vec: &[f32],
+        top_k: usize,
+        unfiltered: bool,
+        only_doc_ids: Option<&[&str]>,
+        scope_cache_tag: Option<u64>,
+        allow_doc: F,
+    ) -> Result<Vec<(f32, Row)>, Error>
+    where
+        F: Fn(&str) -> bool + Sync,
+    {
+        if top_k == 0 || query_vec.is_empty() {
+            return Ok(Vec::new());
+        }
+        let q_norm = l2_norm_f64(query_vec);
+        if q_norm <= 1e-18 || !q_norm.is_finite() {
+            return Ok(Vec::new());
+        }
+
+        let cache_key = if !self.has_active_savepoint() {
+            let tag = if unfiltered {
+                Some(0x554e_4649_4c54_4552u64)
+            } else {
+                scope_cache_tag
+            };
+            tag.map(|stag| compute_vec_query_hash(table, vec_field, top_k, stag, query_vec))
+        } else {
+            None
+        };
+        if let Some(qhash) = cache_key
+            && let Some(cached) = self
+                .hot_cache
+                .get_vec_query(self.manifest.generation, qhash)
+        {
+            return Ok(cached.to_vec());
+        }
+
+        #[derive(Clone, Copy)]
+        struct ExactHit {
+            score: f32,
+            seg_idx: usize,
+            row_id: u32,
+        }
+        impl PartialEq for ExactHit {
+            fn eq(&self, other: &Self) -> bool {
+                self.score.total_cmp(&other.score) == Ordering::Equal
+                    && self.seg_idx == other.seg_idx
+                    && self.row_id == other.row_id
+            }
+        }
+        impl Eq for ExactHit {}
+        impl PartialOrd for ExactHit {
+            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+        impl Ord for ExactHit {
+            fn cmp(&self, other: &Self) -> Ordering {
+                self.score
+                    .total_cmp(&other.score)
+                    .then_with(|| other.seg_idx.cmp(&self.seg_idx))
+                    .then_with(|| other.row_id.cmp(&self.row_id))
+            }
+        }
+
+        let empty_segs = Vec::new();
+        let segs = self.segments.get(table).unwrap_or(&empty_segs);
+
+        if let Some(doc_ids) = only_doc_ids
+            && doc_ids.len() <= 4096
+        {
+            if doc_ids.is_empty() {
+                return Ok(Vec::new());
+            }
+            let all_segs_have_sec = segs.iter().all(|s| {
+                s.vec_col(vec_field).is_none() || s.sec_indexes.contains_key(doc_id_field)
+            });
+            if all_segs_have_sec {
+                let mut exact_heap: BinaryHeap<Reverse<ExactHit>> =
+                    BinaryHeap::with_capacity(top_k + 1);
+                let mut kbuf = Vec::with_capacity(64);
+                for &did in doc_ids {
+                    kbuf.clear();
+                    kbuf.push(1);
+                    kbuf.extend_from_slice(did.as_bytes());
+                    for (s_idx, seg) in segs.iter().enumerate() {
+                        let Some(vcol) = seg.vec_col(vec_field) else {
+                            continue;
+                        };
+                        if vcol.dim != query_vec.len() {
+                            continue;
+                        }
+                        let Some(sec_idx) = seg.sec_indexes.get(doc_id_field) else {
+                            continue;
+                        };
+                        let sid = seg.meta.seg_id;
+                        sec_idx.for_each_key(&kbuf, |rid| {
+                            if self.tombstones.is_dead(sid, rid) {
+                                return true;
+                            }
+                            let sim = if let Some(f32_slice) = vcol.f32_slice(rid) {
+                                cosine_with_q_norm(query_vec, q_norm, f32_slice) as f32
+                            } else if let Cell::Vec(v) = vcol.get_cell(rid) {
+                                cosine_with_q_norm(query_vec, q_norm, &v) as f32
+                            } else {
+                                return true;
+                            };
+                            let hit = ExactHit {
+                                score: sim,
+                                seg_idx: s_idx,
+                                row_id: rid,
+                            };
+                            if exact_heap.len() < top_k {
+                                exact_heap.push(Reverse(hit));
+                            } else if exact_heap.peek().is_some_and(|m| hit > m.0) {
+                                exact_heap.pop();
+                                exact_heap.push(Reverse(hit));
+                            }
+                            true
+                        });
+                    }
+                    if let Some(mt) = self.memtables.get(table)
+                        && let Some(fmap) = mt.sec.get(doc_id_field)
+                        && let Some(idxs) = fmap.get(&kbuf)
+                    {
+                        for &idx in idxs {
+                            if mt.dead_mem.contains(&idx) {
+                                continue;
+                            }
+                            let Some(Cell::Vec(v)) = mt.rows[idx].get(vec_field) else {
+                                continue;
+                            };
+                            if v.len() != query_vec.len() {
+                                continue;
+                            }
+                            let sim = cosine_with_q_norm(query_vec, q_norm, v) as f32;
+                            let hit = ExactHit {
+                                score: sim,
+                                seg_idx: usize::MAX,
+                                row_id: idx as u32,
+                            };
+                            if exact_heap.len() < top_k {
+                                exact_heap.push(Reverse(hit));
+                            } else if exact_heap.peek().is_some_and(|m| hit > m.0) {
+                                exact_heap.pop();
+                                exact_heap.push(Reverse(hit));
+                            }
+                        }
+                    }
+                }
+                let mut winners: Vec<ExactHit> = exact_heap.into_iter().map(|r| r.0).collect();
+                winners.sort_by(|a, b| b.cmp(a));
+                let mut out = Vec::with_capacity(winners.len());
+                for w in winners {
+                    let row = if w.seg_idx == usize::MAX {
+                        self.memtables[table].rows[w.row_id as usize].clone()
+                    } else {
+                        self.materialize_segment_winner(table, &segs[w.seg_idx], w.row_id)?
+                    };
+                    out.push((w.score, row));
+                }
+                if let Some(qhash) = cache_key {
+                    self.hot_cache.put_vec_query(
+                        self.manifest.generation,
+                        qhash,
+                        Arc::from(out.as_slice()),
+                    );
+                }
+                return Ok(out);
+            }
+        }
+
+        let q_sq8 = quantize_sq8(query_vec);
+        let oversample = (top_k.saturating_mul(8)).max(256);
+
+        #[derive(Clone, Copy)]
+        struct Cand {
+            approx: i64,
+            seg_idx: usize,
+            row_id: u32,
+        }
+        impl PartialEq for Cand {
+            fn eq(&self, other: &Self) -> bool {
+                self.approx == other.approx
+                    && self.seg_idx == other.seg_idx
+                    && self.row_id == other.row_id
+            }
+        }
+        impl Eq for Cand {}
+        impl PartialOrd for Cand {
+            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+        impl Ord for Cand {
+            fn cmp(&self, other: &Self) -> Ordering {
+                self.approx
+                    .cmp(&other.approx)
+                    .then_with(|| other.seg_idx.cmp(&self.seg_idx))
+                    .then_with(|| other.row_id.cmp(&self.row_id))
+            }
+        }
+
+        #[derive(Clone, Copy)]
+        enum VecWorkUnit {
+            IvfCluster { s_idx: usize, cluster_idx: usize },
+            FlatStripe { s_idx: usize, start: u32, end: u32 },
+        }
+
+        const STRIPE_ROWS: u32 = 4096;
+        let total_seg_rows: usize = segs.iter().map(|s| s.meta.row_count as usize).sum();
+        let use_ivf = total_seg_rows >= 32_768;
+
+        let seg_dict_filters: Vec<Option<(usize, Vec<u64>, f32)>> = if !unfiltered {
+            segs.iter()
+                .map(|seg| seg.build_dict_allow_bitset(doc_id_field, &allow_doc))
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let mut work_units: Vec<VecWorkUnit> = Vec::new();
+        for (s_idx, seg) in segs.iter().enumerate() {
+            let Some(vcol) = seg.vec_col(vec_field) else {
+                continue;
+            };
+            if vcol.dim != query_vec.len() {
+                continue;
+            }
+            if !unfiltered
+                && let Some(Some((_, _, sel))) = seg_dict_filters.get(s_idx)
+                && *sel <= 0.0
+            {
+                continue;
+            }
+            if use_ivf && let Some(ref ivf) = vcol.ivf {
+                let nprobe = if unfiltered {
+                    (ivf.k / 3).clamp(16, 64).min(ivf.k)
+                } else if let Some(Some((_, _, sel))) = seg_dict_filters.get(s_idx) {
+                    if *sel < 0.15 {
+                        (ivf.k * 2 / 3).clamp(32, 160).min(ivf.k)
+                    } else {
+                        (ivf.k / 2).clamp(24, 96).min(ivf.k)
+                    }
+                } else {
+                    (ivf.k / 2).clamp(24, 96).min(ivf.k)
+                };
+                for c in ivf.top_centroids(query_vec, q_norm, nprobe) {
+                    work_units.push(VecWorkUnit::IvfCluster {
+                        s_idx,
+                        cluster_idx: c,
+                    });
+                }
+            } else {
+                let mut start = 0u32;
+                while start < seg.meta.row_count {
+                    let end = (start + STRIPE_ROWS).min(seg.meta.row_count);
+                    work_units.push(VecWorkUnit::FlatStripe { s_idx, start, end });
+                    start = end;
+                }
+            }
+        }
+
+        let eval_unit = |unit: &VecWorkUnit| -> BinaryHeap<Reverse<Cand>> {
+            match *unit {
+                VecWorkUnit::IvfCluster { s_idx, cluster_idx } => {
+                    let seg = &segs[s_idx];
+                    let sid = seg.meta.seg_id;
+                    let Some(vcol) = seg.vec_col(vec_field) else {
+                        return BinaryHeap::new();
+                    };
+                    let Some(ref ivf) = vcol.ivf else {
+                        return BinaryHeap::new();
+                    };
+                    let dict_flt = if !unfiltered {
+                        seg_dict_filters[s_idx].as_ref()
+                    } else {
+                        None
+                    };
+                    let (item_start, item_end) = ivf.cluster_bounds(cluster_idx);
+                    let mut local_heap: BinaryHeap<Reverse<Cand>> =
+                        BinaryHeap::with_capacity(oversample + 1);
+                    let mut min_approx = i64::MIN;
+                    for item_idx in item_start..item_end {
+                        let (rid, sq8) = ivf.item_rid_and_sq8(item_idx);
+                        if self.tombstones.is_dead(sid, rid) {
+                            continue;
+                        }
+                        if let Some((pos, bits, _)) = dict_flt
+                            && !seg.check_dict_bitset(*pos, rid, bits)
+                        {
+                            continue;
+                        }
+                        let dot = (dot_sq8(&q_sq8, sq8) * 1_000_000.0) as i64;
+                        if local_heap.len() >= oversample && dot <= min_approx {
+                            continue;
+                        }
+                        if !unfiltered && dict_flt.is_none() {
+                            let ok_doc = seg
+                                .with_text_field(rid, doc_id_field, |opt| {
+                                    opt.is_none_or(&allow_doc)
+                                })
+                                .unwrap_or(false);
+                            if !ok_doc {
+                                continue;
+                            }
+                        }
+                        let cand = Cand {
+                            approx: dot,
+                            seg_idx: s_idx,
+                            row_id: rid,
+                        };
+                        if local_heap.len() < oversample {
+                            local_heap.push(Reverse(cand));
+                            if local_heap.len() == oversample
+                                && let Some(m) = local_heap.peek()
+                            {
+                                min_approx = m.0.approx;
+                            }
+                        } else if local_heap.peek().is_some_and(|min_c| cand > min_c.0) {
+                            local_heap.pop();
+                            local_heap.push(Reverse(cand));
+                            if let Some(m) = local_heap.peek() {
+                                min_approx = m.0.approx;
+                            }
+                        }
+                    }
+                    local_heap
+                }
+                VecWorkUnit::FlatStripe { s_idx, start, end } => {
+                    let seg = &segs[s_idx];
+                    let sid = seg.meta.seg_id;
+                    let Some(vcol) = seg.vec_col(vec_field) else {
+                        return BinaryHeap::new();
+                    };
+                    if vcol.dim != query_vec.len() {
+                        return BinaryHeap::new();
+                    }
+                    let dict_flt = if !unfiltered {
+                        seg_dict_filters[s_idx].as_ref()
+                    } else {
+                        None
+                    };
+                    let mut local_heap: BinaryHeap<Reverse<Cand>> =
+                        BinaryHeap::with_capacity(oversample + 1);
+                    let mut min_approx = i64::MIN;
+                    for rid in start..end {
+                        if self.tombstones.is_dead(sid, rid) {
+                            continue;
+                        }
+                        if let Some((pos, bits, _)) = dict_flt
+                            && !seg.check_dict_bitset(*pos, rid, bits)
+                        {
+                            continue;
+                        }
+                        let Some(sq8) = vcol.sq8_slice(rid) else {
+                            continue;
+                        };
+                        let dot = (dot_sq8(&q_sq8, sq8) * 1_000_000.0) as i64;
+                        if local_heap.len() >= oversample && dot <= min_approx {
+                            continue;
+                        }
+                        if !unfiltered && dict_flt.is_none() {
+                            let ok_doc = seg
+                                .with_text_field(rid, doc_id_field, |opt| {
+                                    opt.is_none_or(&allow_doc)
+                                })
+                                .unwrap_or(false);
+                            if !ok_doc {
+                                continue;
+                            }
+                        }
+                        let cand = Cand {
+                            approx: dot,
+                            seg_idx: s_idx,
+                            row_id: rid,
+                        };
+                        if local_heap.len() < oversample {
+                            local_heap.push(Reverse(cand));
+                            if local_heap.len() == oversample
+                                && let Some(m) = local_heap.peek()
+                            {
+                                min_approx = m.0.approx;
+                            }
+                        } else if local_heap.peek().is_some_and(|min_c| cand > min_c.0) {
+                            local_heap.pop();
+                            local_heap.push(Reverse(cand));
+                            if let Some(m) = local_heap.peek() {
+                                min_approx = m.0.approx;
+                            }
+                        }
+                    }
+                    local_heap
+                }
+            }
+        };
+
+        #[cfg(feature = "parallel")]
+        let stripe_heaps: Vec<BinaryHeap<Reverse<Cand>>> = {
+            use rayon::prelude::*;
+            work_units.par_iter().map(eval_unit).collect()
+        };
+        #[cfg(not(feature = "parallel"))]
+        let stripe_heaps: Vec<BinaryHeap<Reverse<Cand>>> =
+            work_units.iter().map(eval_unit).collect();
+
+        let mut merged_sq8: BinaryHeap<Reverse<Cand>> = BinaryHeap::with_capacity(oversample + 1);
+        for h in stripe_heaps {
+            for Reverse(c) in h {
+                if merged_sq8.len() < oversample {
+                    merged_sq8.push(Reverse(c));
+                } else if merged_sq8.peek().is_some_and(|min_c| c > min_c.0) {
+                    merged_sq8.pop();
+                    merged_sq8.push(Reverse(c));
+                }
+            }
+        }
+
+        let mut exact_heap: BinaryHeap<Reverse<ExactHit>> = BinaryHeap::with_capacity(top_k + 1);
+        for Reverse(cand) in merged_sq8 {
+            let seg = &segs[cand.seg_idx];
+            let Some(vcol) = seg.vec_col(vec_field) else {
+                continue;
+            };
+            let sim = if let Some(f32_slice) = vcol.f32_slice(cand.row_id) {
+                cosine_with_q_norm(query_vec, q_norm, f32_slice) as f32
+            } else if let Cell::Vec(v) = vcol.get_cell(cand.row_id) {
+                cosine_with_q_norm(query_vec, q_norm, &v) as f32
+            } else {
+                continue;
+            };
+            let hit = ExactHit {
+                score: sim,
+                seg_idx: cand.seg_idx,
+                row_id: cand.row_id,
+            };
+            if exact_heap.len() < top_k {
+                exact_heap.push(Reverse(hit));
+            } else if exact_heap.peek().is_some_and(|m| hit > m.0) {
+                exact_heap.pop();
+                exact_heap.push(Reverse(hit));
+            }
+        }
+
+        if let Some(mt) = self.memtables.get(table) {
+            for &idx in mt.by_id.values() {
+                if mt.dead_mem.contains(&idx) {
+                    continue;
+                }
+                let row = &mt.rows[idx];
+                if !unfiltered
+                    && let Some(doc_id) = row.get(doc_id_field).and_then(Cell::text)
+                    && !allow_doc(doc_id)
+                {
+                    continue;
+                }
+                let Some(Cell::Vec(v)) = row.get(vec_field) else {
+                    continue;
+                };
+                if v.len() != query_vec.len() {
+                    continue;
+                }
+                let sim = cosine_with_q_norm(query_vec, q_norm, v) as f32;
+                let hit = ExactHit {
+                    score: sim,
+                    seg_idx: usize::MAX,
+                    row_id: idx as u32,
+                };
+                if exact_heap.len() < top_k {
+                    exact_heap.push(Reverse(hit));
+                } else if exact_heap.peek().is_some_and(|m| hit > m.0) {
+                    exact_heap.pop();
+                    exact_heap.push(Reverse(hit));
+                }
+            }
+        }
+
+        let mut winners: Vec<ExactHit> = exact_heap.into_iter().map(|r| r.0).collect();
+        winners.sort_by(|a, b| b.cmp(a));
+        let mut out = Vec::with_capacity(winners.len());
+        for w in winners {
+            let row = if w.seg_idx == usize::MAX {
+                self.memtables[table].rows[w.row_id as usize].clone()
+            } else {
+                self.materialize_segment_winner(table, &segs[w.seg_idx], w.row_id)?
+            };
+            out.push((w.score, row));
+        }
+        if let Some(qhash) = cache_key {
+            self.hot_cache.put_vec_query(
+                self.manifest.generation,
+                qhash,
+                Arc::from(out.as_slice()),
+            );
+        }
+        Ok(out)
+    }
+
+    fn materialize_segment_winner(
+        &self,
+        table: &str,
+        seg: &DiskSegment,
+        rid: u32,
+    ) -> Result<Row, Error> {
+        let maybe_id = seg.with_text_field(rid, "id", |opt| opt.map(str::to_string))?;
+        if let Some(ref id_str) = maybe_id
+            && let Some(cached) = self.hot_cache.get_row(table, id_str)
+        {
+            return Ok((*cached).clone());
+        }
+        let row = seg.materialize_row(rid)?;
+        if let Some(id_str) = maybe_id {
+            self.hot_cache
+                .put_row(table, &id_str, Arc::new(row.clone()));
+        }
+        Ok(row)
+    }
+
+    // ========================================================================
+    // Predicate Pushdown, Filtered Queries & Mutations, and Backup / Migration
+    // ========================================================================
+
+    pub fn drop_table(&mut self, table: &str) -> Result<(), Error> {
+        if self.read_only {
+            return Err(Error::runtime(
+                "cannot drop table on read-only DiskEngine",
+            ));
+        }
+        self.manifest.tables.remove(table);
+        self.memtables.remove(table);
+        if let Some(segs) = self.segments.remove(table) {
+            for seg in segs {
+                self.tombstones.words_by_seg.remove(&seg.meta.seg_id);
+                self.tombstones.dead_counts.remove(&seg.meta.seg_id);
+                let seg_dir = self
+                    .dir
+                    .join(SEGMENTS_DIR)
+                    .join(format!("seg_{:08}", seg.meta.seg_id));
+                let _ = fs::remove_dir_all(&seg_dir);
+            }
+        }
+        self.manifest.segments.retain(|m| m.table != table);
+        self.manifest.generation += 1;
+        self.hot_cache.clear_all();
+        self.save_tombstones_and_manifest()?;
+        Ok(())
+    }
+
+    pub fn query_filter(
+        &self,
+        table: &str,
+        pred: Option<&crate::ast::Pred>,
+        limit: Option<usize>,
+        project_fields: Option<&[&str]>,
+        now_ms: i64,
+    ) -> Result<Vec<Row>, Error> {
+        if limit == Some(0) {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        let Some(p) = pred else {
+            self.scan_projected(table, project_fields, |row| {
+                out.push(row.clone());
+                if let Some(lim) = limit
+                    && out.len() >= lim
+                {
+                    return Ok(false);
+                }
+                Ok(true)
+            })?;
+            return Ok(out);
+        };
+
+        if let Some((idx_field, keys)) = self.extract_index_pushdown(table, p, now_ms) {
+            let mut seen_ids: FxHashSet<String> = FxHashSet::default();
+            'key_loop: for key_cell in keys {
+                let mut stop = false;
+                self.for_each_by_eq_projected(table, &idx_field, &key_cell, None, |row| {
+                    if let Some(id) = row.get("id").and_then(Cell::text)
+                        && !seen_ids.insert(id.to_string())
+                    {
+                        return Ok(true);
+                    }
+                    if crate::exec::eval_pred(p, row, now_ms) {
+                        let emitted = match project_fields {
+                            None => row.clone(),
+                            Some(fs) => {
+                                let mut pr = Row::new();
+                                for &f in fs {
+                                    if let Some(c) = row.get(f) {
+                                        pr.insert(f.to_string(), c.clone());
+                                    }
+                                }
+                                pr
+                            }
+                        };
+                        out.push(emitted);
+                        if let Some(lim) = limit
+                            && out.len() >= lim
+                        {
+                            stop = true;
+                            return Ok(false);
+                        }
+                    }
+                    Ok(true)
+                })?;
+                if stop {
+                    break 'key_loop;
+                }
+            }
+            return Ok(out);
+        }
+
+        self.scan_projected(table, None, |row| {
+            if crate::exec::eval_pred(p, row, now_ms) {
+                let emitted = match project_fields {
+                    None => row.clone(),
+                    Some(fs) => {
+                        let mut pr = Row::new();
+                        for &f in fs {
+                            if let Some(c) = row.get(f) {
+                                pr.insert(f.to_string(), c.clone());
+                            }
+                        }
+                        pr
+                    }
+                };
+                out.push(emitted);
+                if let Some(lim) = limit
+                    && out.len() >= lim
+                {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        })?;
+        Ok(out)
+    }
+
+    pub fn update_where(
+        &mut self,
+        table: &str,
+        pred: Option<&crate::ast::Pred>,
+        patch: &[(String, Cell)],
+        now_ms: i64,
+    ) -> Result<usize, Error> {
+        let mut matched = self.query_filter(table, pred, None, None, now_ms)?;
+        if matched.is_empty() {
+            return Ok(0);
+        }
+        for row in &mut matched {
+            for (k, v) in patch {
+                if matches!(v, Cell::Null) {
+                    row.remove(k);
+                } else {
+                    row.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        let n = matched.len();
+        self.commit_ops(vec![DiskWalOp::UpsertBatch {
+            table: table.to_string(),
+            rows: matched,
+        }])?;
+        Ok(n)
+    }
+
+    pub fn delete_where(
+        &mut self,
+        table: &str,
+        pred: &crate::ast::Pred,
+        now_ms: i64,
+    ) -> Result<usize, Error> {
+        let matched = self.query_filter(table, Some(pred), None, Some(&["id"]), now_ms)?;
+        if matched.is_empty() {
+            return Ok(0);
+        }
+        let ids: Vec<String> = matched
+            .into_iter()
+            .filter_map(|r| r.get("id").and_then(Cell::text).map(str::to_string))
+            .collect();
+        let n = ids.len();
+        if n > 0 {
+            self.commit_ops(vec![DiskWalOp::DeleteIds {
+                table: table.to_string(),
+                ids,
+            }])?;
+        }
+        Ok(n)
+    }
+
+    fn extract_index_pushdown(
+        &self,
+        table: &str,
+        pred: &crate::ast::Pred,
+        now_ms: i64,
+    ) -> Option<(String, Vec<Cell>)> {
+        use crate::ast::{CmpOp, Pred};
+        let is_indexed = |fname: &str| -> bool {
+            fname == "id"
+                || self
+                    .manifest
+                    .tables
+                    .get(table)
+                    .is_some_and(|t| t.indexed_fields.iter().any(|f| f == fname))
+        };
+        match pred {
+            Pred::Cmp {
+                field,
+                op: CmpOp::Eq,
+                value,
+            } => {
+                let fname = field.leaf()?;
+                if is_indexed(fname) {
+                    let c = crate::exec::value_cell(value, now_ms);
+                    if !matches!(c, Cell::Null) {
+                        return Some((fname.to_string(), vec![c]));
+                    }
+                }
+                None
+            }
+            Pred::In { field, values } => {
+                let fname = field.leaf()?;
+                if is_indexed(fname) {
+                    let mut cells = Vec::with_capacity(values.len());
+                    for v in values {
+                        let c = crate::exec::value_cell(v, now_ms);
+                        if !matches!(c, Cell::Null) {
+                            cells.push(c);
+                        }
+                    }
+                    return Some((fname.to_string(), cells));
+                }
+                None
+            }
+            Pred::And(a, b) => {
+                let left = self.extract_index_pushdown(table, a, now_ms);
+                let right = self.extract_index_pushdown(table, b, now_ms);
+                match (left, right) {
+                    (Some((fa, ka)), Some((fb, kb))) => {
+                        if fa == "id" {
+                            Some((fa, ka))
+                        } else if fb == "id" {
+                            Some((fb, kb))
+                        } else if ka.len() <= kb.len() {
+                            Some((fa, ka))
+                        } else {
+                            Some((fb, kb))
+                        }
+                    }
+                    (Some(x), None) | (None, Some(x)) => Some(x),
+                    (None, None) => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    pub fn export_portable_backup_file(&self, dst_file: &Path) -> Result<(), Error> {
+        use crate::persist::{ColSnap, IndexSnap, SNAPSHOT_MAGIC};
+        if dst_file
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(Error::runtime(
+                "path traversal rejected: backup path cannot contain '..'",
+            ));
+        }
+        if dst_file.is_symlink() {
+            return Err(Error::runtime("backup symlink policy: symlinks rejected"));
+        }
+        if let Some(parent) = dst_file.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent).map_err(io_err)?;
+        }
+
+        let mut extra_collections: BTreeMap<String, ColSnap> = BTreeMap::new();
+        let mut extra_indexes: BTreeMap<String, IndexSnap> = BTreeMap::new();
+        for (tname, schema) in &self.manifest.tables {
+            let fields = schema
+                .columns
+                .iter()
+                .map(|c| {
+                    let ty = if c.name == "id" {
+                        "id"
+                    } else {
+                        match c.kind {
+                            DiskColKind::Int64 => "i64",
+                            DiskColKind::Float64 => "f64",
+                            DiskColKind::Bool => "bool",
+                            DiskColKind::Time64 => "time",
+                            DiskColKind::TextZstd | DiskColKind::TextDict => "var",
+                            DiskColKind::VecF32Sq8 { .. } => "vec",
+                        }
+                    };
+                    (c.name.clone(), ty.to_string())
+                })
+                .collect();
+            extra_collections.insert(
+                tname.clone(),
+                ColSnap {
+                    name: tname.clone(),
+                    append_only: false,
+                    fields,
+                },
+            );
+            for idx_field in &schema.indexed_fields {
+                extra_indexes.insert(
+                    format!("{tname}[{idx_field}]"),
+                    IndexSnap {
+                        collection: tname.clone(),
+                        unique: false,
+                        fields: vec![idx_field.clone()],
+                        pred_src: None,
+                    },
+                );
+            }
+        }
+
+        #[derive(Serialize)]
+        struct PortableHeader<'a> {
+            r#gen: u64,
+            embed_id: &'a str,
+            next_id: u64,
+            catalog_hash: &'a str,
+            log_offset: u64,
+            edges: &'a [crate::store::Edge],
+            extra_collections: &'a BTreeMap<String, ColSnap>,
+            extra_rels: BTreeMap<String, crate::persist::RelSnap>,
+            extra_indexes: &'a BTreeMap<String, IndexSnap>,
+            extra_filters: BTreeMap<String, String>,
+            extra_owned: BTreeMap<String, Vec<(String, String)>>,
+            cold_collections: &'a [String],
+        }
+
+        let tmp = dst_file.with_extension("lin.tmp");
+        let res = (|| -> Result<(), Error> {
+            let file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp)
+                .map_err(io_err)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
+            }
+            let mut writer = BufWriter::with_capacity(256 * 1024, file);
+            writer.write_all(&[0x03]).map_err(io_err)?;
+            writer.write_all(&SNAPSHOT_MAGIC).map_err(io_err)?;
+
+            let header = PortableHeader {
+                r#gen: self.manifest.generation,
+                embed_id: &self.manifest.embed_id,
+                next_id: 1,
+                catalog_hash: "",
+                log_offset: 0,
+                edges: &[],
+                extra_collections: &extra_collections,
+                extra_rels: BTreeMap::new(),
+                extra_indexes: &extra_indexes,
+                extra_filters: BTreeMap::new(),
+                extra_owned: BTreeMap::new(),
+                cold_collections: &[],
+            };
+            let header_bytes = rmp_serde::encode::to_vec_named(&header).map_err(io_err)?;
+            writer
+                .write_all(&(header_bytes.len() as u32).to_le_bytes())
+                .map_err(io_err)?;
+            writer.write_all(&header_bytes).map_err(io_err)?;
+
+            let count_pos = 1 + 4 + 4 + (header_bytes.len() as u64);
+            writer.write_all(&0u32.to_le_bytes()).map_err(io_err)?;
+
+            let mut chunk_count = 0u32;
+            const CHUNK_ROWS: usize = 512;
+
+            let write_chunk =
+                |w: &mut BufWriter<File>, tname: &str, batch: &[Row]| -> Result<(), Error> {
+                    let data = if batch.is_empty() {
+                        Vec::new()
+                    } else {
+                        let mut col_buf = Vec::new();
+                        let raw = if let Some((magic, _)) =
+                            crate::persist::encode_insert_rows_direct(0, 0, "", batch, &mut col_buf)
+                        {
+                            let mut framed = Vec::with_capacity(8 + col_buf.len());
+                            framed.extend_from_slice(b"LCOL");
+                            framed.extend_from_slice(&magic);
+                            framed.extend_from_slice(&col_buf);
+                            framed
+                        } else {
+                            rmp_serde::encode::to_vec_named(batch).map_err(io_err)?
+                        };
+                        #[cfg(feature = "compress-zstd")]
+                        {
+                            zstd::encode_all(&raw[..], 1).map_err(io_err)?
+                        }
+                        #[cfg(not(feature = "compress-zstd"))]
+                        {
+                            raw
+                        }
+                    };
+                    let nb = tname.as_bytes();
+                    w.write_all(&(nb.len() as u16).to_le_bytes())
+                        .map_err(io_err)?;
+                    w.write_all(nb).map_err(io_err)?;
+                    w.write_all(&(data.len() as u32).to_le_bytes())
+                        .map_err(io_err)?;
+                    if !data.is_empty() {
+                        w.write_all(&data).map_err(io_err)?;
+                    }
+                    Ok(())
+                };
+
+            for tname in self.manifest.tables.keys() {
+                let mut batch = Vec::with_capacity(CHUNK_ROWS);
+                let mut emitted_any = false;
+                self.scan_projected(tname, None, |row| {
+                    batch.push(row.clone());
+                    if batch.len() >= CHUNK_ROWS {
+                        write_chunk(&mut writer, tname, &batch)?;
+                        chunk_count += 1;
+                        emitted_any = true;
+                        batch.clear();
+                    }
+                    Ok(true)
+                })?;
+                if !batch.is_empty() || !emitted_any {
+                    write_chunk(&mut writer, tname, &batch)?;
+                    chunk_count += 1;
+                }
+            }
+
+            writer.flush().map_err(io_err)?;
+            let mut file = writer.into_inner().map_err(io_err)?;
+            file.seek(SeekFrom::Start(count_pos)).map_err(io_err)?;
+            file.write_all(&chunk_count.to_le_bytes()).map_err(io_err)?;
+            file.sync_all().map_err(io_err)?;
+            drop(file);
+            fs::rename(&tmp, dst_file).map_err(io_err)?;
+            Ok(())
+        })();
+        if res.is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
+        res
+    }
+
+    pub fn migrate_from_legacy(
+        src_path: &Path,
+        dst_dir: &Path,
+        rows_per_segment: usize,
+        extra_indexed_fields: &BTreeMap<String, Vec<String>>,
+    ) -> Result<Self, Error> {
+        let snap = if src_path.is_dir() {
+            let mut db = crate::exec::Db::open_follower(src_path)?;
+            db.store.capture_snapshot_at(String::new(), 0)
+        } else {
+            crate::persist::read_backup(src_path)?
+        };
+        Self::from_legacy_snapshot(snap, dst_dir, rows_per_segment, extra_indexed_fields)
+    }
+
+    pub fn from_legacy_snapshot(
+        snap: crate::persist::Snapshot,
+        dst_dir: &Path,
+        rows_per_segment: usize,
+        extra_indexed_fields: &BTreeMap<String, Vec<String>>,
+    ) -> Result<Self, Error> {
+        if dst_dir.exists() {
+            fs::remove_dir_all(dst_dir).map_err(io_err)?;
+        }
+        let mut eng = Self::open(dst_dir, false)?;
+        eng.manifest.embed_id = snap.embed_id.clone();
+        let seg_cap = rows_per_segment.max(1024);
+
+        for (tname, col_snap) in &snap.extra_collections {
+            let mut columns = Vec::new();
+            for (fname, fty) in &col_snap.fields {
+                let kind = match fty.as_str() {
+                    "int" | "i64" | "dur" => DiskColKind::Int64,
+                    "float" | "f64" => DiskColKind::Float64,
+                    "bool" => DiskColKind::Bool,
+                    "time" => DiskColKind::Time64,
+                    "vec" => DiskColKind::VecF32Sq8 { dim: 0 },
+                    _ if tname == "chunks" && fname == "embedding" => {
+                        DiskColKind::VecF32Sq8 { dim: 0 }
+                    }
+                    _ => DiskColKind::TextZstd,
+                };
+                columns.push(DiskColSchema {
+                    name: fname.clone(),
+                    kind,
+                });
+            }
+            let mut indexed_fields = extra_indexed_fields.get(tname).cloned().unwrap_or_default();
+            for idx in snap.extra_indexes.values() {
+                if idx.collection == *tname {
+                    for f in &idx.fields {
+                        if !indexed_fields.contains(f) {
+                            indexed_fields.push(f.clone());
+                        }
+                    }
+                }
+            }
+            eng.manifest.tables.insert(
+                tname.clone(),
+                DiskTableSchema {
+                    name: tname.clone(),
+                    columns,
+                    indexed_fields,
+                },
+            );
+        }
+
+        for (tname, rows) in snap.collections {
+            let inferred = infer_schema_from_rows(&tname, &rows);
+            let entry = eng.manifest.tables.entry(tname.clone()).or_insert_with(|| {
+                let mut s = inferred.clone();
+                if let Some(ixs) = extra_indexed_fields.get(&tname) {
+                    s.indexed_fields = ixs.clone();
+                }
+                s
+            });
+            for col in inferred.columns {
+                if let Some(existing) = entry.columns.iter_mut().find(|c| c.name == col.name) {
+                    if matches!(col.kind, DiskColKind::VecF32Sq8 { .. }) {
+                        existing.kind = col.kind;
+                    }
+                } else {
+                    entry.columns.push(col);
+                }
+            }
+            if let Some(ixs) = extra_indexed_fields.get(&tname) {
+                for ix in ixs {
+                    if !entry.indexed_fields.contains(ix) {
+                        entry.indexed_fields.push(ix.clone());
+                    }
+                }
+            }
+            for chunk in rows.chunks(seg_cap) {
+                eng.write_bulk_segment(&tname, chunk)?;
+            }
+        }
+        eng.manifest.generation = snap.r#gen.max(eng.manifest.generation).max(1);
+        eng.save_tombstones_and_manifest()?;
+        Ok(eng)
+    }
+
+    pub fn to_legacy_snapshot(&self) -> Result<crate::persist::Snapshot, Error> {
+        let tmp = std::env::temp_dir().join(format!(
+            "lin_disk_snap_{}_{}.lin",
+            std::process::id(),
+            self.manifest.generation
+        ));
+        self.export_portable_backup_file(&tmp)?;
+        let res = crate::persist::read_backup(&tmp);
+        let _ = fs::remove_file(&tmp);
+        res
+    }
+}
+
+fn compute_vec_query_hash(
+    table: &str,
+    vec_field: &str,
+    top_k: usize,
+    scope_tag: u64,
+    query_vec: &[f32],
+) -> u64 {
+    let mut h = 0xcbf29ce484222325u64;
+    for &b in table.as_bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    for &b in vec_field.as_bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h ^= top_k as u64;
+    h = h.wrapping_mul(0x100000001b3);
+    h ^= scope_tag;
+    h = h.wrapping_mul(0x100000001b3);
+    for &x in query_vec {
+        h ^= x.to_bits() as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// Thread-safe handle wrapping `DiskEngine` under an `RwLock` for multi-reader concurrency.
+#[derive(Clone)]
+pub struct SharedDiskEngine {
+    inner: Arc<RwLock<DiskEngine>>,
+}
+
+impl SharedDiskEngine {
+    pub fn new(engine: DiskEngine) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(engine)),
+        }
+    }
+
+    pub fn read(&self) -> Result<std::sync::RwLockReadGuard<'_, DiskEngine>, Error> {
+        self.inner
+            .read()
+            .map_err(|_| Error::runtime("DiskEngine RwLock poisoned"))
+    }
+
+    pub fn write(&self) -> Result<std::sync::RwLockWriteGuard<'_, DiskEngine>, Error> {
+        self.inner
+            .write()
+            .map_err(|_| Error::runtime("DiskEngine RwLock poisoned"))
+    }
+}
+
+pub(crate) fn infer_schema_from_rows(table: &str, rows: &[Row]) -> DiskTableSchema {
+    let mut cols: BTreeMap<String, DiskColKind> = BTreeMap::new();
+    for r in rows {
+        for (k, v) in r {
+            if cols.contains_key(k) {
+                continue;
+            }
+            let kind = match v {
+                Cell::Null => continue,
+                Cell::Int(_) => DiskColKind::Int64,
+                Cell::Float(_) => DiskColKind::Float64,
+                Cell::Bool(_) => DiskColKind::Bool,
+                Cell::Time(_) => DiskColKind::Time64,
+                Cell::Text(_) | Cell::SmallText(_) => DiskColKind::TextZstd,
+                Cell::Vec(vec) => DiskColKind::VecF32Sq8 {
+                    dim: vec.len() as u32,
+                },
+            };
+            cols.insert(k.clone(), kind);
+        }
+    }
+    DiskTableSchema {
+        name: table.to_string(),
+        columns: cols
+            .into_iter()
+            .map(|(name, kind)| DiskColSchema { name, kind })
+            .collect(),
+        indexed_fields: Vec::new(),
+    }
+}

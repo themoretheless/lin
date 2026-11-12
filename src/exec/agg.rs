@@ -774,7 +774,162 @@ impl Db {
         (s0, s1, overflow)
     }
 
+    fn execute_disk_agg_plan(&self, plan: &AggPlan, now: i64) -> Result<Option<Vec<Row>>, Error> {
+        let col = &plan.collection;
+        if !self.store.is_disk_backed(col) {
+            return Ok(None);
+        }
+        let Some(eng) = self.store.disk_engine_read() else {
+            return Ok(None);
+        };
+        let max_bytes = self.quotas.max_aggregate_bytes;
+        let spill = self.quotas.spill_enabled;
+
+        // Fast path 1: Ungrouped & unfiltered total count -> O(1) segment + memtable count
+        if let AggKind::Count { by: None } = &plan.kind
+            && plan.filter.is_none()
+        {
+            return Ok(Some(vec![hits_row(eng.count_table(col) as i64)]));
+        }
+
+        // Fast path 2: Equality filter count -> O(1) MmapHashIndex lookup
+        if let AggKind::Count { by } = &plan.kind
+            && let Some(Pred::Cmp {
+                field,
+                op: CmpOp::Eq,
+                value,
+            }) = &plan.filter
+            && let Some(fname) = field.leaf()
+        {
+            let cell = super::eval::value_cell(value, now);
+            if !matches!(cell, Cell::Null) {
+                if by.is_none() {
+                    let n = eng.count_by_eq(col, fname, &cell)?;
+                    return Ok(Some(vec![hits_row(n as i64)]));
+                } else if let Some(by_f) = by
+                    && by_f.leaf() == Some(fname)
+                {
+                    let n = eng.count_by_eq(col, fname, &cell)?;
+                    if n == 0 {
+                        return Ok(Some(Vec::new()));
+                    }
+                    let mut row = crate::store::acquire_row();
+                    row.insert(by_f.as_str(), cell);
+                    row.insert("hits".into(), Cell::Int(n as i64));
+                    return Ok(Some(vec![row]));
+                }
+            }
+        }
+
+        // Fast path 3: Unfiltered single-column text/dict group count -> zero-Row columnar scan
+        if let AggKind::Count { by: Some(by_field) } = &plan.kind
+            && plan.filter.is_none()
+            && let Some(fname) = by_field.leaf()
+            && eng
+                .manifest
+                .tables
+                .get(col)
+                .and_then(|t| t.columns.iter().find(|c| c.name == fname))
+                .is_some_and(|c| {
+                    matches!(
+                        c.kind,
+                        crate::disk::DiskColKind::TextDict
+                            | crate::disk::DiskColKind::TextZstd
+                    )
+                })
+        {
+            let (_, groups) = eng.group_count_str1(col, fname)?;
+            let mut map: FxHashMap<Cell, i64> = FxHashMap::default();
+            let mut state_bytes = 0usize;
+            for (opt_s, cnt) in groups {
+                let cell = match opt_s {
+                    Some(s) => Cell::from_text(&s),
+                    None => Cell::Null,
+                };
+                let key_size = match &cell {
+                    Cell::Text(s) => s.len() + 32,
+                    _ => 16,
+                };
+                state_bytes = state_bytes.saturating_add(key_size + 64);
+                if state_bytes > max_bytes && !spill {
+                    return Err(Error::runtime(format!(
+                        "aggregate state bytes {state_bytes} exceeds max_aggregate_bytes quota {max_bytes}"
+                    )));
+                }
+                *map.entry(cell).or_insert(0) += cnt as i64;
+            }
+            return Ok(Some(count_cell_map_to_rows(&by_field.as_str(), map)));
+        }
+
+        // General out-of-core filtered/projected aggregation without promoting table into Store::collections
+        let mut needed: Vec<String> = Vec::new();
+        match &plan.kind {
+            AggKind::Count { by } => {
+                if let Some(b) = by
+                    && let Some(lf) = b.leaf()
+                {
+                    needed.push(lf.to_string());
+                }
+            }
+            AggKind::Sum { field, by }
+            | AggKind::Avg { field, by }
+            | AggKind::Min { field, by }
+            | AggKind::Max { field, by } => {
+                if let Some(lf) = field.leaf() {
+                    needed.push(lf.to_string());
+                }
+                if let Some(b) = by
+                    && let Some(lf) = b.leaf()
+                    && !needed.iter().any(|x| x == lf)
+                {
+                    needed.push(lf.to_string());
+                }
+            }
+        }
+        let can_project_only = plan.filter.is_none() && {
+            match &plan.kind {
+                AggKind::Count { by: Some(b) } => b.leaf().is_some(),
+                AggKind::Count { by: None } => true,
+                AggKind::Sum { field, by }
+                | AggKind::Avg { field, by }
+                | AggKind::Min { field, by }
+                | AggKind::Max { field, by } => {
+                    field.leaf().is_some() && by.as_ref().is_none_or(|b| b.leaf().is_some())
+                }
+            }
+        };
+        let proj_refs: Vec<&str> = needed.iter().map(String::as_str).collect();
+        let proj_arg = if can_project_only {
+            Some(proj_refs.as_slice())
+        } else {
+            None
+        };
+        let rows = eng.query_filter(col, plan.filter.as_ref(), None, proj_arg, now)?;
+        let res = match &plan.kind {
+            AggKind::Count { by } => match by {
+                None => Ok(vec![hits_row(rows.len() as i64)]),
+                Some(b) => agg_count_filtered(&rows, None, now, b, max_bytes, spill),
+            },
+            AggKind::Sum { field, by } => {
+                agg_sum_filtered(&rows, None, now, field, by.as_ref(), max_bytes, spill)
+            }
+            AggKind::Avg { field, by } => {
+                agg_avg_filtered(&rows, None, now, field, by.as_ref(), max_bytes, spill)
+            }
+            AggKind::Min { field, by } => {
+                agg_extremum_filtered(&rows, None, now, field, by.as_ref(), max_bytes, spill, false)
+            }
+            AggKind::Max { field, by } => {
+                agg_extremum_filtered(&rows, None, now, field, by.as_ref(), max_bytes, spill, true)
+            }
+        }?;
+        Ok(Some(res))
+    }
+
     pub(crate) fn execute_agg_plan(&self, plan: &AggPlan, now: i64) -> Result<Vec<Row>, Error> {
+        if let Some(rows) = self.execute_disk_agg_plan(plan, now)? {
+            return Ok(rows);
+        }
         if let AggKind::Count { by: None } = &plan.kind
             && let Some(pred) = &plan.filter
             && let Some(rows) = self.execute_filter_count_cached(
@@ -946,6 +1101,7 @@ impl Db {
 
         // 2. SoA paths for docs
         if plan.collection == "docs"
+            && !self.store.is_disk_backed("docs")
             && self.store.docs_wing().len() == self.store.collection("docs").len()
         {
             if let AggKind::Count { by: Some(by_field) } = &plan.kind
@@ -1175,7 +1331,55 @@ impl Db {
         now: i64,
         cached_idx: Option<&(Vec<crate::index::IndexUse>, bool)>,
     ) -> Option<Vec<Row>> {
+        if self.store.is_disk_backed(name)
+            && let Some(eng) = self.store.disk_engine_read()
+        {
+            if let Pred::Cmp {
+                field,
+                op: CmpOp::Eq,
+                value,
+            } = pred
+                && let Some(fname) = field.leaf()
+            {
+                let cell = super::eval::value_cell(value, now);
+                if !matches!(cell, Cell::Null) {
+                    if by.is_none()
+                        && let Ok(n) = eng.count_by_eq(name, fname, &cell)
+                    {
+                        return Some(vec![hits_row(n as i64)]);
+                    }
+                    if let Some(by_f) = by
+                        && by_f.leaf() == Some(fname)
+                        && let Ok(n) = eng.count_by_eq(name, fname, &cell)
+                    {
+                        if n == 0 {
+                            return Some(Vec::new());
+                        }
+                        let mut row = crate::store::acquire_row();
+                        row.insert(by_f.as_str(), cell);
+                        row.insert("hits".into(), Cell::Int(n as i64));
+                        return Some(vec![row]);
+                    }
+                }
+            }
+            if let Ok(rows) = eng.query_filter(name, Some(pred), None, None, now) {
+                let Some(by_field) = by else {
+                    return Some(vec![hits_row(rows.len() as i64)]);
+                };
+                let by_key = by_field.as_str();
+                let mut map: FxHashMap<Cell, i64> = FxHashMap::default();
+                for r in &rows {
+                    let cell = r
+                        .get(&by_key)
+                        .map(Cell::clone_for_borrow)
+                        .unwrap_or(Cell::Null);
+                    *map.entry(cell).or_insert(0) += 1;
+                }
+                return Some(count_cell_map_to_rows(&by_key, map));
+            }
+        }
         if name == "docs"
+            && !self.store.is_disk_backed("docs")
             && by.is_none()
             && let Pred::Contains { field, needle } = pred
             && field.leaf() == Some("title")
@@ -1185,6 +1389,7 @@ impl Db {
         }
 
         if name == "docs"
+            && !self.store.is_disk_backed("docs")
             && let Some(by_field) = by
             && let Pred::Contains { field, needle } = pred
             && field.leaf() == Some("title")
