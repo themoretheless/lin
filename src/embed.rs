@@ -192,7 +192,10 @@ pub(crate) fn embed_texts_hashing(dim: usize, texts: [Option<&str>; 3]) -> Arc<[
         if let Some(first) = texts.iter().position(|t| t.is_some_and(|s| !s.is_empty()))
             && texts[first + 1..].iter().all(Option::is_none)
         {
-            dummy.fill(scratch, crate::fts::lowercased(texts[first].unwrap(), lower));
+            dummy.fill(
+                scratch,
+                crate::fts::lowercased(texts[first].unwrap(), lower),
+            );
             return scratch.finish();
         }
         text_buf.clear();
@@ -1062,7 +1065,8 @@ impl HnswSearchScratch {
     #[inline]
     fn prepare(&mut self, node_count: usize) {
         if self.visited_gen.len() < node_count {
-            self.visited_gen.resize(node_count.next_power_of_two().max(64), 0);
+            self.visited_gen
+                .resize(node_count.next_power_of_two().max(64), 0);
         }
         self.cur_gen = self.cur_gen.wrapping_add(1);
         if self.cur_gen == 0 {
@@ -1504,15 +1508,23 @@ impl HnswGraph<f32> {
     }
 }
 
+/// Quantize an L2-normalized `f32` vector into a caller-provided `i8` slice (`out.len() >= v.len()`).
+///
+/// Maps `[-1.0, 1.0]` into `[-127, 127]` without heap allocation.
+#[inline]
+pub fn quantize_sq8_into(v: &[f32], out: &mut [i8]) {
+    let n = v.len().min(out.len());
+    for i in 0..n {
+        out[i] = (v[i] * 127.0).round().clamp(-127.0, 127.0) as i8;
+    }
+}
+
 /// Quantize an L2-normalized `f32` vector into an 8-bit signed integer vector (`i8`).
 ///
 /// Maps `[-1.0, 1.0]` into `[-127, 127]`.
 pub fn quantize_sq8(v: &[f32]) -> Arc<[i8]> {
-    let mut quantized = Vec::with_capacity(v.len());
-    for &x in v {
-        let q = (x * 127.0).round().clamp(-127.0, 127.0) as i8;
-        quantized.push(q);
-    }
+    let mut quantized = vec![0i8; v.len()];
+    quantize_sq8_into(v, &mut quantized);
     quantized.into()
 }
 
