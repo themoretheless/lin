@@ -274,7 +274,8 @@ pub(crate) fn agg_count_filtered(
             if state_bytes > max_bytes {
                 if spill {
                     return spill_agg_count(
-                        rows.iter().filter(|r| filter.is_none_or(|p| eval_pred(p, r, now))),
+                        rows.iter()
+                            .filter(|r| filter.is_none_or(|p| eval_pred(p, r, now))),
                         by,
                     );
                 }
@@ -311,6 +312,113 @@ pub(crate) fn count_arc_map_to_rows(by: &str, map: BTreeMap<std::sync::Arc<str>,
             row
         })
         .collect()
+}
+
+/// `field <range-op> value`, optionally AND-ed with `eq_field == "text"` (either order).
+#[allow(clippy::type_complexity)]
+fn disk_range_count_shape(
+    pred: &Pred,
+) -> Option<(&Field, CmpOp, &Value, Option<(&Field, &str)>)> {
+    fn range(p: &Pred) -> Option<(&Field, CmpOp, &Value)> {
+        match p {
+            Pred::Cmp { field, op, value }
+                if matches!(op, CmpOp::Gt | CmpOp::Ge | CmpOp::Lt | CmpOp::Le) =>
+            {
+                Some((field, *op, value))
+            }
+            _ => None,
+        }
+    }
+    fn text_eq(p: &Pred) -> Option<(&Field, &str)> {
+        match p {
+            Pred::Cmp {
+                field,
+                op: CmpOp::Eq,
+                value: Value::String(s),
+            } => Some((field, s.as_ref())),
+            _ => None,
+        }
+    }
+    if let Some((f, op, v)) = range(pred) {
+        return Some((f, op, v, None));
+    }
+    let Pred::And(a, b) = pred else {
+        return None;
+    };
+    if let (Some((f, op, v)), Some(eq)) = (range(a), text_eq(b)) {
+        return Some((f, op, v, Some(eq)));
+    }
+    if let (Some(eq), Some((f, op, v))) = (text_eq(a), range(b)) {
+        return Some((f, op, v, Some(eq)));
+    }
+    None
+}
+
+fn disk_col_kind(
+    eng: &crate::disk::DiskEngine,
+    table: &str,
+    field: &str,
+) -> Option<crate::disk::DiskColKind> {
+    eng.manifest
+        .tables
+        .get(table)
+        .and_then(|t| t.columns.iter().find(|c| c.name == field))
+        .map(|c| c.kind)
+}
+
+/// Count rows matching `pred` without materializing rows, when `pred` is a range comparison
+/// (optionally AND-ed with a text equality) or a substring match on a leaf column.
+/// Returns the count and the leaf name / value of the equality conjunct, if any.
+fn disk_zero_row_count<'p>(
+    eng: &crate::disk::DiskEngine,
+    table: &str,
+    pred: &'p Pred,
+    now: i64,
+) -> Result<Option<(usize, Option<(&'p str, &'p str)>)>, Error> {
+    if let Pred::Contains { field, needle } = pred
+        && let Some(fname) = field.leaf()
+    {
+        return Ok(eng
+            .count_text_contains(table, fname, needle)?
+            .map(|n| (n, None)));
+    }
+    let Some((cmp_field, op, value, eq)) = disk_range_count_shape(pred) else {
+        return Ok(None);
+    };
+    let Some(cmp_name) = cmp_field.leaf() else {
+        return Ok(None);
+    };
+    let eq_leaf = match eq {
+        None => None,
+        Some((f, s)) => match f.leaf() {
+            Some(l) => Some((l, s)),
+            None => return Ok(None),
+        },
+    };
+    let rhs = super::eval::value_cell(value, now);
+    let Some(kind) = disk_col_kind(eng, table, cmp_name) else {
+        return Ok(None);
+    };
+    if !disk_cmp_rhs_compatible(kind, &rhs) {
+        return Ok(None);
+    }
+    Ok(eng
+        .count_cmp_and_optional_eq(table, cmp_name, op, &rhs, eq_leaf, pred, now)?
+        .map(|n| (n, eq_leaf)))
+}
+
+/// The columnar comparison kernel must agree with `cmp_cell`, which is type-strict:
+/// `Int` cells compare with int/duration values, `Time` cells only with timestamps,
+/// `Float` cells with floats and exactly representable ints.
+fn disk_cmp_rhs_compatible(kind: crate::disk::DiskColKind, rhs: &Cell) -> bool {
+    use crate::disk::DiskColKind;
+    match (kind, rhs) {
+        (DiskColKind::Int64, Cell::Int(_)) => true,
+        (DiskColKind::Time64, Cell::Time(_)) => true,
+        (DiskColKind::Float64, Cell::Float(f)) => !f.is_nan(),
+        (DiskColKind::Float64, Cell::Int(i)) => i.unsigned_abs() <= (1u64 << 53),
+        _ => false,
+    }
 }
 
 pub(crate) fn hits_row(n: i64) -> Row {
@@ -391,7 +499,8 @@ pub(crate) fn agg_sum_filtered(
             if state_bytes > max_bytes {
                 if spill {
                     return spill_agg_sum(
-                        rows.iter().filter(|r| filter.is_none_or(|p| eval_pred(p, r, now))),
+                        rows.iter()
+                            .filter(|r| filter.is_none_or(|p| eval_pred(p, r, now))),
                         field,
                         Some(by),
                     );
@@ -495,7 +604,8 @@ pub(crate) fn agg_extremum_filtered(
             if state_bytes > max_bytes {
                 if spill {
                     return spill_agg_min_max(
-                        rows.iter().filter(|r| filter.is_none_or(|p| eval_pred(p, r, now))),
+                        rows.iter()
+                            .filter(|r| filter.is_none_or(|p| eval_pred(p, r, now))),
                         field,
                         Some(by),
                         is_max,
@@ -591,7 +701,8 @@ pub(crate) fn agg_avg_filtered(
             if state_bytes > max_bytes {
                 if spill {
                     return spill_agg_avg(
-                        rows.iter().filter(|r| filter.is_none_or(|p| eval_pred(p, r, now))),
+                        rows.iter()
+                            .filter(|r| filter.is_none_or(|p| eval_pred(p, r, now))),
                         field,
                         Some(by),
                     );
@@ -634,7 +745,6 @@ pub(crate) fn cell_key(c: &Cell) -> Option<String> {
         _ => None,
     }
 }
-
 
 impl Db {
     pub(crate) fn try_extract_agg_plan(
@@ -821,6 +931,82 @@ impl Db {
             }
         }
 
+        let col_kind = |fname: &str| disk_col_kind(&eng, col, fname);
+
+        // Fast path 2a/2b: range comparison (optionally AND-ed with a text equality) or
+        // substring count -> zone-map block skipping / block-level SIMD `memmem`,
+        // no `Row` materialization.
+        if let AggKind::Count { by } = &plan.kind
+            && let Some(pred) = &plan.filter
+            && let Some((n, eq)) = disk_zero_row_count(&eng, col, pred, now)?
+        {
+            match (by, eq) {
+                (None, _) => return Ok(Some(vec![hits_row(n as i64)])),
+                // Grouping on the equality column yields at most one group.
+                (Some(b), Some((eq_leaf, s))) if b.leaf() == Some(eq_leaf) => {
+                    if n == 0 {
+                        return Ok(Some(Vec::new()));
+                    }
+                    let mut row = crate::store::acquire_row();
+                    row.insert(b.as_str(), Cell::from_text(s));
+                    row.insert("hits".into(), Cell::Int(n as i64));
+                    return Ok(Some(vec![row]));
+                }
+                _ => {}
+            }
+        }
+
+        // Fast path 2c: unfiltered SUM over a fixed-width column (optionally grouped).
+        if let AggKind::Sum { field, by } = &plan.kind
+            && plan.filter.is_none()
+            && let Some(fname) = field.leaf()
+            && matches!(
+                col_kind(fname),
+                Some(crate::disk::DiskColKind::Int64 | crate::disk::DiskColKind::Float64)
+            )
+        {
+            match by {
+                None => {
+                    if let Some(total) = eng.sum_f64_col(col, fname)? {
+                        let mut row = crate::store::acquire_row();
+                        row.insert(field.as_str(), Cell::Float(total));
+                        return Ok(Some(vec![row]));
+                    }
+                }
+                Some(by_field) => {
+                    if let Some(by_name) = by_field.leaf()
+                        && let Some(map) = eng.sum_f64_by_col(col, fname, by_name)?
+                    {
+                        let state_bytes: usize = map
+                            .keys()
+                            .map(|cell| match cell {
+                                Cell::Text(s) => s.len() + 32 + 64,
+                                _ => 16 + 64,
+                            })
+                            .sum();
+                        // Over quota: let the general path decide between spill and error.
+                        if state_bytes <= max_bytes {
+                            let bk = by_field.as_str();
+                            let fk = field.as_str();
+                            let mut entries: Vec<(Cell, f64)> = map.into_iter().collect();
+                            entries.sort_unstable_by(|(a, _), (b, _)| cmp_sort(a, b));
+                            return Ok(Some(
+                                entries
+                                    .into_iter()
+                                    .map(|(cell, n)| {
+                                        let mut row = crate::store::acquire_row();
+                                        row.insert(bk.clone(), cell);
+                                        row.insert(fk.clone(), Cell::Float(n));
+                                        row
+                                    })
+                                    .collect(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
         // Fast path 3: Unfiltered single-column text/dict group count -> zero-Row columnar scan
         if let AggKind::Count { by: Some(by_field) } = &plan.kind
             && plan.filter.is_none()
@@ -833,30 +1019,25 @@ impl Db {
                 .is_some_and(|c| {
                     matches!(
                         c.kind,
-                        crate::disk::DiskColKind::TextDict
-                            | crate::disk::DiskColKind::TextZstd
+                        crate::disk::DiskColKind::TextDict | crate::disk::DiskColKind::TextZstd
                     )
                 })
         {
-            let (_, groups) = eng.group_count_str1(col, fname)?;
-            let mut map: FxHashMap<Cell, i64> = FxHashMap::default();
-            let mut state_bytes = 0usize;
-            for (opt_s, cnt) in groups {
-                let cell = match opt_s {
-                    Some(s) => Cell::from_text(&s),
-                    None => Cell::Null,
-                };
-                let key_size = match &cell {
-                    Cell::Text(s) => s.len() + 32,
-                    _ => 16,
-                };
-                state_bytes = state_bytes.saturating_add(key_size + 64);
-                if state_bytes > max_bytes && !spill {
-                    return Err(Error::runtime(format!(
-                        "aggregate state bytes {state_bytes} exceeds max_aggregate_bytes quota {max_bytes}"
-                    )));
+            let map = eng.group_count_cells1(col, fname)?;
+            if !spill {
+                let mut state_bytes = 0usize;
+                for cell in map.keys() {
+                    let key_size = match cell {
+                        Cell::Text(s) => s.len() + 32,
+                        _ => 16,
+                    };
+                    state_bytes = state_bytes.saturating_add(key_size + 64);
+                    if state_bytes > max_bytes {
+                        return Err(Error::runtime(format!(
+                            "aggregate state bytes {state_bytes} exceeds max_aggregate_bytes quota {max_bytes}"
+                        )));
+                    }
                 }
-                *map.entry(cell).or_insert(0) += cnt as i64;
             }
             return Ok(Some(count_cell_map_to_rows(&by_field.as_str(), map)));
         }
@@ -886,7 +1067,9 @@ impl Db {
                 }
             }
         }
-        let can_project_only = plan.filter.is_none() && {
+        // `query_filter` adds the predicate's own columns to the scan set, so projection is safe
+        // with a filter too (it bails to a full-row scan only for non-leaf predicate fields).
+        let can_project_only = {
             match &plan.kind {
                 AggKind::Count { by: Some(b) } => b.leaf().is_some(),
                 AggKind::Count { by: None } => true,
@@ -916,9 +1099,16 @@ impl Db {
             AggKind::Avg { field, by } => {
                 agg_avg_filtered(&rows, None, now, field, by.as_ref(), max_bytes, spill)
             }
-            AggKind::Min { field, by } => {
-                agg_extremum_filtered(&rows, None, now, field, by.as_ref(), max_bytes, spill, false)
-            }
+            AggKind::Min { field, by } => agg_extremum_filtered(
+                &rows,
+                None,
+                now,
+                field,
+                by.as_ref(),
+                max_bytes,
+                spill,
+                false,
+            ),
             AggKind::Max { field, by } => {
                 agg_extremum_filtered(&rows, None, now, field, by.as_ref(), max_bytes, spill, true)
             }
@@ -946,10 +1136,9 @@ impl Db {
             && let Some(pred) = &plan.filter
             && let Some(value) = eq_value_for_field(pred, &by.as_str())
         {
-            let cached_or_fresh = plan
-                .index_plan
-                .clone()
-                .or_else(|| crate::index::pick_index_with_coverage(&self.catalog, &plan.collection, pred));
+            let cached_or_fresh = plan.index_plan.clone().or_else(|| {
+                crate::index::pick_index_with_coverage(&self.catalog, &plan.collection, pred)
+            });
             if let Some((uses, true)) = cached_or_fresh
                 && let Some(n) = self.store.index_seek_count(&plan.collection, &uses, now)
             {
@@ -1201,7 +1390,11 @@ impl Db {
                             count += 1;
                         }
                     }
-                    let avg = if count == 0 { 0.0 } else { sum / (count as f64) };
+                    let avg = if count == 0 {
+                        0.0
+                    } else {
+                        sum / (count as f64)
+                    };
                     let mut row = crate::store::acquire_row();
                     row.insert(fk, Cell::Float(avg));
                     return Ok(vec![row]);
@@ -1264,9 +1457,16 @@ impl Db {
             AggKind::Avg { field, by } => {
                 agg_avg_filtered(col, filter, now, field, by.as_ref(), max_bytes, spill)
             }
-            AggKind::Min { field, by } => {
-                agg_extremum_filtered(col, filter, now, field, by.as_ref(), max_bytes, spill, false)
-            }
+            AggKind::Min { field, by } => agg_extremum_filtered(
+                col,
+                filter,
+                now,
+                field,
+                by.as_ref(),
+                max_bytes,
+                spill,
+                false,
+            ),
             AggKind::Max { field, by } => {
                 agg_extremum_filtered(col, filter, now, field, by.as_ref(), max_bytes, spill, true)
             }
@@ -1362,7 +1562,20 @@ impl Db {
                     }
                 }
             }
-            if let Ok(rows) = eng.query_filter(name, Some(pred), None, None, now) {
+            if by.is_none()
+                && let Ok(Some((n, _))) = disk_zero_row_count(&eng, name, pred, now)
+            {
+                return Some(vec![hits_row(n as i64)]);
+            }
+            // Only the group column (if any) is needed downstream; `query_filter` adds the
+            // predicate's own columns to the scan set.
+            let by_leaf: Option<[&str; 1]> = by.and_then(Field::leaf).map(|l| [l]);
+            let proj: Option<&[&str]> = match (by, &by_leaf) {
+                (None, _) => Some(&[]),
+                (Some(_), Some(l)) => Some(l.as_slice()),
+                (Some(_), None) => None,
+            };
+            if let Ok(rows) = eng.query_filter(name, Some(pred), None, proj, now) {
                 let Some(by_field) = by else {
                     return Some(vec![hits_row(rows.len() as i64)]);
                 };

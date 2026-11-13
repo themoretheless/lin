@@ -281,7 +281,9 @@ impl Db {
                     .ok()?;
                 for row in &mut r {
                     for f in &names {
-                        row.entry(f.clone()).or_insert(Cell::Null);
+                        if !row.contains_key(f.as_str()) {
+                            row.insert(f.clone(), Cell::Null);
+                        }
                     }
                 }
                 r
@@ -424,10 +426,36 @@ impl Db {
                 None => Some(skip_n.saturating_add(50)),
             };
             let proj_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+            let names_arc: Arc<[String]> = names.clone().into();
+            // Without a usable index the scan streams cells straight into the batch's
+            // columns: no per-row map is built at any point.
+            if fetch_limit != Some(0)
+                && filter.is_none_or(|p| !eng.has_index_pushdown(name, p, now))
+            {
+                let mut batch = RecordBatch::with_capacity(Arc::clone(&names_arc), 1024);
+                let mut remaining = fetch_limit;
+                let streamed = eng
+                    .scan_cells(name, filter, &proj_refs, now, |_, cells| {
+                        for (col, cell) in batch.cols.iter_mut().zip(cells.drain(..)) {
+                            col.push(cell);
+                        }
+                        match remaining.as_mut() {
+                            Some(left) => {
+                                *left -= 1;
+                                *left > 0
+                            }
+                            None => true,
+                        }
+                    })
+                    .ok()?;
+                if streamed {
+                    finish_batch(&mut batch, skip_n, explicit_take);
+                    return Some(batch);
+                }
+            }
             let rows = eng
                 .query_filter(name, filter, fetch_limit, Some(&proj_refs), now)
                 .ok()?;
-            let names_arc: Arc<[String]> = names.clone().into();
             let mut batch = RecordBatch::with_capacity(names_arc, rows.len());
             for row in &rows {
                 push_project_batch_row(&mut batch, row, &names);
@@ -653,6 +681,20 @@ impl Db {
             );
         }
 
+        if self.store.is_disk_backed(left_name) || self.store.is_disk_backed(right_col) {
+            return self.join_disk_batch(
+                left_name,
+                right_col,
+                on,
+                filter,
+                left_join,
+                &names,
+                skip_n,
+                explicit_take,
+                now,
+            );
+        }
+
         let (right_fields, plan) = plan_join_fields(right_col, &names);
         let rights = self.store.collection(right_col);
 
@@ -789,6 +831,162 @@ impl Db {
             }
         }
 
+        finish_batch(&mut batch, skip_n, explicit_take);
+        Some(batch)
+    }
+
+    /// FK join + project where at least one side is disk-backed, without materializing a
+    /// cold collection in memory: a cold left side is read through the filtered, projected
+    /// engine scan, and a cold right side is probed by primary key with only the projected
+    /// columns decoded, once per distinct key.
+    #[allow(clippy::too_many_arguments)]
+    fn join_disk_batch(
+        &self,
+        left_name: &str,
+        right_col: &str,
+        on: &str,
+        filter: Option<&Pred>,
+        left_join: bool,
+        names: &[String],
+        skip_n: usize,
+        explicit_take: Option<Option<i64>>,
+        now: i64,
+    ) -> Option<RecordBatch> {
+        let (right_fields, plan) = plan_join_fields(right_col, names);
+        let eng = self.store.disk_engine_read()?;
+
+        let right_on_disk = self.store.is_disk_backed(right_col);
+        let right_refs: Vec<&str> = right_fields.iter().map(String::as_str).collect();
+        let names_arc: Arc<[String]> = names.to_vec().into();
+
+        let mut left_owned: Option<Vec<Row>> = None;
+        if self.store.is_disk_backed(left_name) {
+            // Join key first, then every projected left column.
+            let mut cols: Vec<&str> = vec![on];
+            for p in &plan {
+                if let JoinFieldPlan::Left(f) = p
+                    && !cols.contains(&f.as_str())
+                {
+                    cols.push(f.as_str());
+                }
+            }
+            // Output column -> index into the streamed left cells, or the right-side slot.
+            let slots: Vec<Result<usize, usize>> = plan
+                .iter()
+                .map(|p| match p {
+                    JoinFieldPlan::Left(f) => {
+                        Ok(cols.iter().position(|c| *c == f.as_str()).unwrap_or(0))
+                    }
+                    JoinFieldPlan::Right { idx, .. } => Err(*idx),
+                })
+                .collect();
+            let mut batch = RecordBatch::with_capacity(Arc::clone(&names_arc), 1024);
+            let mut memo: FxHashMap<String, Option<smallvec::SmallVec<[Cell; 8]>>> =
+                FxHashMap::default();
+            let mut failed = false;
+            let streamed = eng
+                .scan_cells(left_name, filter, &cols, now, |_, cells| {
+                    let right_cells = match cells[0].text() {
+                        None => None,
+                        Some(k) => {
+                            if !memo.contains_key(k) {
+                                let found = if right_on_disk {
+                                    match eng.get_projected_by_id(right_col, k, &right_refs) {
+                                        Ok(r) => r,
+                                        Err(_) => {
+                                            failed = true;
+                                            return false;
+                                        }
+                                    }
+                                } else {
+                                    self.store.get_by_id(right_col, k).cloned()
+                                };
+                                memo.insert(
+                                    k.to_string(),
+                                    found.map(|r| {
+                                        right_fields
+                                            .iter()
+                                            .map(|f| r.get(f).cloned().unwrap_or(Cell::Null))
+                                            .collect()
+                                    }),
+                                );
+                            }
+                            memo.get(k).and_then(|v| v.as_deref())
+                        }
+                    };
+                    if right_cells.is_none() && !left_join {
+                        return true;
+                    }
+                    for (col_i, slot) in slots.iter().enumerate() {
+                        let cell = match slot {
+                            Ok(i) => cells[*i].clone(),
+                            Err(idx) => right_cells
+                                .and_then(|r| r.get(*idx).cloned())
+                                .unwrap_or(Cell::Null),
+                        };
+                        batch.cols[col_i].push(cell);
+                    }
+                    true
+                })
+                .ok()?;
+            if failed {
+                return None;
+            }
+            if streamed {
+                finish_batch(&mut batch, skip_n, explicit_take);
+                return Some(batch);
+            }
+            // Predicate on a nested field: read projected rows through the row scan.
+            left_owned = Some(
+                eng.query_filter(left_name, filter, None, Some(&cols), now)
+                    .ok()?,
+            );
+        }
+        let left_mem: &[Row] = if left_owned.is_none() {
+            self.store.collection(left_name)
+        } else {
+            &[]
+        };
+        let left_rows = left_owned.as_deref().unwrap_or(left_mem);
+        // Rows from the engine scan are already filtered.
+        let row_filter = if left_owned.is_some() { None } else { filter };
+
+        let mut memo: FxHashMap<&str, Option<smallvec::SmallVec<[Cell; 8]>>> = FxHashMap::default();
+
+        let mut batch = RecordBatch::with_capacity(names_arc, left_rows.len());
+        for left_row in left_rows {
+            if let Some(pred) = row_filter
+                && !eval_pred(pred, left_row, now)
+            {
+                continue;
+            }
+            let right_cells = match left_row.get(on).and_then(Cell::text) {
+                None => None,
+                Some(k) => {
+                    if !memo.contains_key(k) {
+                        let found = if right_on_disk {
+                            eng.get_projected_by_id(right_col, k, &right_refs).ok()?
+                        } else {
+                            self.store.get_by_id(right_col, k).cloned()
+                        };
+                        memo.insert(
+                            k,
+                            found.map(|r| {
+                                right_fields
+                                    .iter()
+                                    .map(|f| r.get(f).cloned().unwrap_or(Cell::Null))
+                                    .collect()
+                            }),
+                        );
+                    }
+                    memo.get(k).and_then(|v| v.as_deref())
+                }
+            };
+            if right_cells.is_none() && !left_join {
+                continue;
+            }
+            push_join_batch_row(&mut batch, left_row, right_cells, &plan);
+        }
         finish_batch(&mut batch, skip_n, explicit_take);
         Some(batch)
     }
@@ -977,9 +1175,9 @@ impl Db {
                                                         Some("id") => {
                                                             Cell::Text(Arc::clone(&users_id[ui]))
                                                         }
-                                                        Some("email") => Cell::Text(Arc::clone(
-                                                            &users_email[ui],
-                                                        )),
+                                                        Some("email") => {
+                                                            Cell::Text(Arc::clone(&users_email[ui]))
+                                                        }
                                                         _ => Cell::Null,
                                                     },
                                                     None => Cell::Null,

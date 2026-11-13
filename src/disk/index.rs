@@ -152,12 +152,14 @@ impl MmapHashIndex {
                     && let Some(c_off) = payload_base.checked_add(count_rel)
                     && c_off + 4 <= bytes.len()
                 {
-                    let klen = u32::from_le_bytes(bytes[k_off..k_off + 4].try_into().unwrap()) as usize;
+                    let klen =
+                        u32::from_le_bytes(bytes[k_off..k_off + 4].try_into().unwrap()) as usize;
                     if klen == klen_expected && &bytes[k_off + 4..k_off + 4 + klen] == key_bytes {
-                        let count =
-                            u32::from_le_bytes(bytes[c_off..c_off + 4].try_into().unwrap()) as usize;
+                        let count = u32::from_le_bytes(bytes[c_off..c_off + 4].try_into().unwrap())
+                            as usize;
                         let r_start = c_off + 4;
-                        if let Some(r_end) = count.checked_mul(4).and_then(|n| r_start.checked_add(n))
+                        if let Some(r_end) =
+                            count.checked_mul(4).and_then(|n| r_start.checked_add(n))
                             && r_end <= bytes.len()
                         {
                             if count == 1 {
@@ -546,7 +548,8 @@ impl MmapBm25Index {
         if !avgdl.is_finite() || avgdl <= 0.0 {
             return None;
         }
-        let doc_lens_off = usize::try_from(u64::from_le_bytes(mmap[40..48].try_into().ok()?)).ok()?;
+        let doc_lens_off =
+            usize::try_from(u64::from_le_bytes(mmap[40..48].try_into().ok()?)).ok()?;
         let doc_id_offs_off =
             usize::try_from(u64::from_le_bytes(mmap[48..56].try_into().ok()?)).ok()?;
         let doc_id_bytes_off =

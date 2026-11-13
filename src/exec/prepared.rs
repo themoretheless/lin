@@ -110,7 +110,14 @@ impl Prepared {
             .iter()
             .map(|s| bind_stmt_params(s, params))
             .collect();
-        db.run_bound_stmts(&bound, &self.plan, self.writes, self.append_only, self.schema, true)
+        db.run_bound_stmts(
+            &bound,
+            &self.plan,
+            self.writes,
+            self.append_only,
+            self.schema,
+            true,
+        )
     }
 
     /// Execute with bound `$param` values on a read-only snapshot.
@@ -157,7 +164,14 @@ impl Prepared {
             .map(|s| bind_stmt_params(s, params))
             .collect();
         Ok(db
-            .run_bound_stmts(&bound, &self.plan, self.writes, self.append_only, self.schema, false)?
+            .run_bound_stmts(
+                &bound,
+                &self.plan,
+                self.writes,
+                self.append_only,
+                self.schema,
+                false,
+            )?
             .done)
     }
 
@@ -359,10 +373,7 @@ impl Db {
         })
     }
 
-    pub(crate) fn try_extract_point_update(
-        stmt: &Stmt,
-        store: &Store,
-    ) -> Option<PointUpdatePlan> {
+    pub(crate) fn try_extract_point_update(stmt: &Stmt, store: &Store) -> Option<PointUpdatePlan> {
         let Stmt::Update {
             collection,
             pred: Some(pred),

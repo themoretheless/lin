@@ -19,6 +19,28 @@ fn tmp() -> PathBuf {
     p
 }
 
+/// Query text for cold-vs-hot comparisons: projections get an explicit `take all`, because
+/// the implicit 50-row limit would keep different rows on tiers with different row order.
+fn unlimited(q: &str) -> String {
+    if q.contains('{') && !q.contains("take") {
+        format!("{q} | take all")
+    } else {
+        q.to_string()
+    }
+}
+
+/// Sort key that ignores how a tier represents a value (inline vs shared text).
+fn row_key(row: &lin::Row) -> String {
+    row.iter()
+        .map(|(k, c)| match (c.text(), c.as_f64()) {
+            (Some(t), _) => format!("{k}={t}"),
+            (None, Some(n)) => format!("{k}={n}"),
+            _ => format!("{k}={c:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
 fn text<'a>(row: &'a lin::Row, k: &str) -> &'a str {
     row.get(k).and_then(|c| c.text()).unwrap_or("")
 }
@@ -1531,6 +1553,7 @@ fn unified_db_opens_and_mutates_native_disk_dir() {
                     },
                 ],
                 indexed_fields: vec!["uri".to_string(), "wing".to_string()],
+                cluster_by: None,
             },
         }])
         .unwrap();
@@ -1627,4 +1650,1264 @@ fn unified_db_opens_and_mutates_native_disk_dir() {
     }
 
     let _ = fs::remove_dir_all(&dir);
+}
+
+/// Zero-row disk aggregation fast paths (range count, substring count, columnar SUM)
+/// must return exactly what the in-memory executor returns for the same data.
+#[test]
+fn cold_aggregates_match_in_memory() {
+    fn seed(db: &mut Db, from: usize, to: usize) {
+        for i in 0..5 {
+            if from == 0 {
+                db.run(&format!(
+                    r#"insert users {{ id: "u{i}", email: "user{i}@example.com" }}"#
+                ))
+                .unwrap();
+            }
+        }
+        let mut docs = String::from("insert docs [\n");
+        let mut orders = String::from("insert orders [\n");
+        for i in from..to {
+            if i > from {
+                docs.push(',');
+                orders.push(',');
+            }
+            let wing = ["rag", "ops", "wiki"][i % 3];
+            let title = if i % 4 == 0 { "wal replay" } else { "plain note" };
+            docs.push_str(&format!(
+                r#"{{ id: "d{i}", uri: "raw://agg/{i}", title: "{title} {i}", wing: "{wing}", layer: "wiki", ts: ago {}d }}"#,
+                i % 20 + 1
+            ));
+            orders.push_str(&format!(
+                r#"{{ id: "o{i}", user_id: "u{}", total: {}, ts: ago {}d }}"#,
+                i % 5,
+                (i * 7) % 250,
+                i % 9 + 1
+            ));
+        }
+        docs.push_str("\n]");
+        orders.push_str("\n]");
+        db.run(&docs).unwrap();
+        db.run(&orders).unwrap();
+    }
+
+    const QUERIES: &[&str] = &[
+        r#"docs | ts > ago 7d | count"#,
+        r#"docs | ts <= ago 7d | count"#,
+        r#"docs | wing == "rag" and ts > ago 7d | count"#,
+        r#"docs | ts > ago 7d and wing == "rag" | count"#,
+        r#"docs | wing == "rag" and ts > ago 7d | count by wing"#,
+        r#"docs | wing == "nope" and ts > ago 7d | count by wing"#,
+        r#"docs | ts > ago 7d | count by wing"#,
+        r#"docs | title ~ "wal" | count"#,
+        r#"docs | title ~ "absent" | count"#,
+        r#"docs | wing ~ "ik" | count"#,
+        r#"orders | sum total"#,
+        r#"orders | sum total by user_id"#,
+        r#"orders | total > 100 | count"#,
+        r#"orders | total >= 100.5 | count"#,
+        r#"orders | total < 0 | count"#,
+        r#"orders | total > 100 | count by user_id"#,
+        r#"orders | total > 100 | sum total"#,
+        r#"orders | total > 100 | sum total by user_id"#,
+        r#"orders | total > 100 | max total by user_id"#,
+        r#"orders | total > 100 | { id, total }"#,
+        r#"orders | total > 100 and user_id == "u1" | { id }"#,
+        r#"docs | ts > ago 7d | { id, title }"#,
+        r#"docs | ts > ago 7d and title ~ "wal" | { title, wing }"#,
+        r#"docs | ts > ago 7d | { id } | take 3"#,
+        r#"docs | title ~ "wal" and ts > ago 30d | { id, title }"#,
+        r#"docs | wing ~ "ik" | { id, wing }"#,
+        r#"docs | wing ~ "" | { id }"#,
+        r#"docs | wing in ["rag", "wiki"] and title ~ "note" | { id }"#,
+        r#"docs | wing ~ "zzz" | { id }"#,
+    ];
+
+    fn compare(cold: &mut Db, hot: &mut Db, stage: &str) {
+        for q in QUERIES {
+            let q = &unlimited(q);
+            let c = cold.run(q).map(|h| h.rows.clone());
+            let h = hot.run(q).map(|h| h.rows.clone());
+            match (c, h) {
+                (Ok(mut c), Ok(mut h)) => {
+                    if q.contains("take") {
+                        assert_eq!(c.len(), h.len(), "{stage}: {q}");
+                    } else {
+                        // Row order across storage tiers is not part of this contract.
+                        c.sort_by_key(row_key);
+                        h.sort_by_key(row_key);
+                        assert_eq!(c, h, "{stage}: {q}");
+                    }
+                }
+                (Err(_), Err(_)) => {}
+                (c, h) => panic!("{stage}: {q}: cold {c:?} vs hot {h:?}"),
+            }
+        }
+    }
+
+    let cold_dir = tmp();
+    let hot_dir = tmp();
+    let cold_opts = || lin::OpenOpts {
+        sync: lin::SyncMode::Full,
+        cold: true,
+    };
+    {
+        let mut db = Db::open_with(&cold_dir, cold_opts()).unwrap();
+        seed(&mut db, 0, 60);
+        db.checkpoint().unwrap();
+        db.close().unwrap();
+    }
+    let mut cold = Db::open_with(&cold_dir, cold_opts()).unwrap();
+    let mut hot = Db::open(&hot_dir).unwrap();
+    seed(&mut hot, 0, 60);
+    assert!(cold.store.is_disk_backed("docs"));
+    assert!(cold.store.is_disk_backed("orders"));
+    assert!(!hot.store.is_disk_backed("docs"));
+
+    compare(&mut cold, &mut hot, "segments only");
+    assert!(cold.store.is_disk_backed("docs"));
+    assert!(cold.store.is_disk_backed("orders"));
+
+    // Rows written after the checkpoint live outside the immutable segments.
+    seed(&mut cold, 60, 75);
+    seed(&mut hot, 60, 75);
+    compare(&mut cold, &mut hot, "segments + delta");
+
+    cold.close().unwrap();
+    hot.close().unwrap();
+    let _ = fs::remove_dir_all(&cold_dir);
+    let _ = fs::remove_dir_all(&hot_dir);
+}
+
+/// Zone-map block skipping in the filtered disk scan must not drop or invent rows:
+/// several 4096-row blocks with monotonic values, compared against the in-memory executor.
+#[test]
+fn cold_filter_zone_skipping_matches_in_memory() {
+    const N: usize = 9000;
+    fn seed(db: &mut Db) {
+        for i in 0..5 {
+            db.run(&format!(
+                r#"insert users {{ id: "u{i}", email: "user{i}@example.com" }}"#
+            ))
+            .unwrap();
+        }
+        for chunk in 0..(N / 1000) {
+            let mut orders = String::from("insert orders [\n");
+            for i in (chunk * 1000)..((chunk + 1) * 1000) {
+                if i > chunk * 1000 {
+                    orders.push(',');
+                }
+                orders.push_str(&format!(
+                    r#"{{ id: "o{i}", user_id: "u{}", total: {i}, ts: ago 1d }}"#,
+                    i % 5
+                ));
+            }
+            orders.push_str("\n]");
+            db.run(&orders).unwrap();
+        }
+    }
+    let cold_dir = tmp();
+    let hot_dir = tmp();
+    let cold_opts = || lin::OpenOpts {
+        sync: lin::SyncMode::Full,
+        cold: true,
+    };
+    {
+        let mut db = Db::open_with(&cold_dir, cold_opts()).unwrap();
+        seed(&mut db);
+        db.checkpoint().unwrap();
+        db.close().unwrap();
+    }
+    let mut cold = Db::open_with(&cold_dir, cold_opts()).unwrap();
+    let mut hot = Db::open(&hot_dir).unwrap();
+    seed(&mut hot);
+    assert!(cold.store.is_disk_backed("orders"));
+    for q in [
+        r#"orders | total > 8000 | { id, total }"#,
+        r#"orders | total >= 8191 | { id }"#,
+        r#"orders | total < 4096 | count by user_id"#,
+        r#"orders | total <= 100 | { id, user_id }"#,
+        r#"orders | total > 4000 and total < 4200 | { id, total }"#,
+        r#"orders | total > 4000 and total < 4200 | count by user_id"#,
+        r#"orders | total > 4095 and total < 4097 | { id }"#,
+        r#"orders | total > 100000 | { id }"#,
+        r#"orders | total < 0 | count"#,
+        r#"orders | total > 4000.5 | count"#,
+        r#"orders | total > 4000 or total < 10 | { id }"#,
+        r#"orders | not total > 10 | { id }"#,
+    ] {
+        let mut c = cold.run(&unlimited(q)).unwrap().rows.clone();
+        let mut h = hot.run(&unlimited(q)).unwrap().rows.clone();
+        c.sort_by_key(row_key);
+        h.sort_by_key(row_key);
+        assert_eq!(c.len(), h.len(), "{q}");
+        assert_eq!(c, h, "{q}");
+    }
+    assert!(cold.store.is_disk_backed("orders"));
+
+    // A cluster key can be declared through `Db`, is validated, and survives a reopen
+    // (checked after the reopen further down).
+    assert!(cold.set_cluster_key("orders", Some("no_such_column")).is_err());
+    assert!(cold.set_cluster_key("no_such_table", Some("total")).is_err());
+    assert_eq!(cold.cluster_key("orders"), None);
+    cold.set_cluster_key("orders", Some("total")).unwrap();
+    assert_eq!(cold.cluster_key("orders").as_deref(), Some("total"));
+    assert!(hot.set_cluster_key("orders", Some("total")).is_err(), "no disk tier");
+
+    // The columnar read path (`run_batch`) streams cells into typed columns; it must agree
+    // with the in-memory batch, including limits and offsets.
+    for q in [
+        r#"orders | total > 8000 | { id, total } | take all"#,
+        r#"orders | total > 4000 and total < 4200 | { id, total, user_id } | take all"#,
+        r#"orders | total >= 8191 | { total, id } | take all"#,
+        r#"orders | { id, total } | take all"#,
+        r#"orders | total < 0 | { id } | take all"#,
+        r#"orders | total > 100000 | { id, total } | take all"#,
+    ] {
+        let c = cold.run_batch(q).unwrap();
+        let h = hot.run_batch(q).unwrap();
+        assert_eq!(c.names, h.names, "{q}");
+        let (mut cr, mut hr) = (c.to_rows(), h.to_rows());
+        cr.sort_by_key(row_key);
+        hr.sort_by_key(row_key);
+        assert_eq!(cr.len(), hr.len(), "{q}");
+        assert_eq!(
+            cr.iter().map(row_key).collect::<Vec<_>>(),
+            hr.iter().map(row_key).collect::<Vec<_>>(),
+            "{q}"
+        );
+        if let Some(pos) = c.names.iter().position(|n| n == "total")
+            && c.n() > 0
+        {
+            assert!(c.cols[pos].is_typed(), "{q}: total should be a dense column");
+        }
+    }
+    for (q, want) in [
+        (r#"orders | total > 8000 | { id } | take 7"#, 7),
+        (r#"orders | total > 8000 | { id } | skip 990 | take 100"#, 9),
+        (r#"orders | { id } | skip 5 | take 0"#, 0),
+        (r#"orders | total > 8000 | { id }"#, 50),
+    ] {
+        assert_eq!(cold.run_batch(q).unwrap().n(), want, "{q}");
+        assert_eq!(hot.run_batch(q).unwrap().n(), want, "{q}");
+    }
+    assert!(cold.store.is_disk_backed("orders"));
+    // The key reaches the manifest with the next checkpoint.
+    cold.checkpoint().unwrap();
+    assert_eq!(cold.cluster_key("orders").as_deref(), Some("total"));
+    assert!(cold.store.is_disk_backed("orders"));
+    cold.close().unwrap();
+
+    // Zone maps are persisted with the segment; a damaged file must be ignored (the engine
+    // recomputes the statistics from the column), never trusted.
+    fn zmaps(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+        for e in fs::read_dir(dir).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                zmaps(&p, out);
+            } else if p.extension().is_some_and(|x| x == "zmap") {
+                out.push(p);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    zmaps(&cold_dir, &mut files);
+    assert!(
+        files.iter().any(|p| p.ends_with("col_total.zmap")),
+        "expected a persisted zone map for orders.total, found {files:?}"
+    );
+    for p in &files {
+        let mut bytes = fs::read(p).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        fs::write(p, bytes).unwrap();
+    }
+    let mut cold = Db::open_with(&cold_dir, cold_opts()).unwrap();
+    assert_eq!(cold.cluster_key("orders").as_deref(), Some("total"));
+    for q in [
+        r#"orders | total > 8000 | { id, total }"#,
+        r#"orders | total > 4000 and total < 4200 | count by user_id"#,
+        r#"orders | total < 4096 | count"#,
+    ] {
+        let mut c = cold.run(&unlimited(q)).unwrap().rows.clone();
+        let mut h = hot.run(&unlimited(q)).unwrap().rows.clone();
+        c.sort_by_key(row_key);
+        h.sort_by_key(row_key);
+        assert_eq!(c, h, "corrupt zmap: {q}");
+    }
+    cold.close().unwrap();
+    hot.close().unwrap();
+    let _ = fs::remove_dir_all(&cold_dir);
+    let _ = fs::remove_dir_all(&hot_dir);
+}
+
+/// Point `update` / `delete` on a cold collection must go through the disk overlay:
+/// the collection stays disk-backed, changes are visible to every read path, and they
+/// survive both WAL replay (no checkpoint) and checkpoint + reopen.
+#[test]
+fn cold_point_update_delete_stay_disk_backed() {
+    let dir = tmp();
+    let cold_opts = || lin::OpenOpts {
+        sync: lin::SyncMode::Full,
+        cold: true,
+    };
+    {
+        let mut db = Db::open_with(&dir, cold_opts()).unwrap();
+        let mut rows = String::from("insert docs [\n");
+        for i in 0..64 {
+            if i > 0 {
+                rows.push(',');
+            }
+            let wing = if i % 2 == 0 { "even" } else { "odd" };
+            rows.push_str(&format!(
+                r#"{{ id: "p{i}", uri: "raw://p/{i}", title: "Title {i}", wing: "{wing}", layer: "wiki", body: "body {i}" }}"#
+            ));
+        }
+        rows.push_str("\n]");
+        db.run(&rows).unwrap();
+        db.checkpoint().unwrap();
+        db.close().unwrap();
+    }
+
+    let hash_of = |db: &mut Db, id: &str| -> String {
+        let h = db
+            .run(&format!(r#"docs | id == "{id}" | {{ hash }}"#))
+            .unwrap();
+        text(&h.rows[0], "hash").to_string()
+    };
+    let count = |db: &mut Db, q: &str| -> i64 { db.run(q).unwrap().scalar_as::<i64>().unwrap() };
+
+    {
+        let mut db = Db::open_with(&dir, cold_opts()).unwrap();
+        assert!(db.store.is_disk_backed("docs"));
+        // Warm the query caches so stale cached results would be observable below.
+        assert_eq!(count(&mut db, r#"docs | wing == "even" | count"#), 32);
+        assert_eq!(
+            db.run(r#"docs | wing == "odd" | { id, title }"#).unwrap().rows.len(),
+            32
+        );
+
+        // CAS mismatch is rejected and leaves the row untouched.
+        let err = db
+            .run(r#"update docs[id == "p3"] cas "nope" { title: "bad" }"#)
+            .unwrap_err();
+        assert!(err.to_string().contains("cas mismatch"), "{err}");
+
+        let h3 = hash_of(&mut db, "p3");
+        db.run(&format!(
+            r#"update docs[id == "p3"] cas "{h3}" {{ title: "Changed 3", wing: "even" }}"#
+        ))
+        .unwrap();
+        assert!(db.store.is_disk_backed("docs"), "update promoted docs");
+
+        let h5 = hash_of(&mut db, "p5");
+        db.run(&format!(r#"delete docs[id == "p5"] cas "{h5}""#))
+            .unwrap();
+        assert!(db.store.is_disk_backed("docs"), "delete promoted docs");
+
+        let err = db
+            .run(r#"delete docs[id == "p5"] cas "x""#)
+            .unwrap_err();
+        assert!(err.to_string().contains("no matching row"), "{err}");
+
+        let check = |db: &mut Db, stage: &str| {
+            assert_eq!(count(db, r#"docs | count"#), 63, "{stage}");
+            assert_eq!(count(db, r#"docs | wing == "even" | count"#), 33, "{stage}");
+            assert_eq!(count(db, r#"docs | wing == "odd" | count"#), 30, "{stage}");
+            assert_eq!(count(db, r#"docs | title ~ "Changed" | count"#), 1, "{stage}");
+            let h = db.run(r#"docs | id == "p3" | { title, wing }"#).unwrap();
+            assert_eq!(text(&h.rows[0], "title"), "Changed 3", "{stage}");
+            assert_eq!(text(&h.rows[0], "wing"), "even", "{stage}");
+            assert_eq!(
+                db.run(r#"docs | id == "p5""#).unwrap().rows.len(),
+                0,
+                "{stage}"
+            );
+            assert_eq!(
+                db.run(r#"docs | wing == "odd" | { id, title }"#)
+                    .unwrap()
+                    .rows
+                    .len(),
+                30,
+                "{stage}"
+            );
+            let grouped = db.run(r#"docs | count by wing"#).unwrap();
+            assert_eq!(grouped.rows.len(), 2, "{stage}");
+        };
+        check(&mut db, "live overlay");
+        assert!(db.store.is_disk_backed("docs"));
+
+        // Predicate delete of several rows also stays on disk; then put the counts back
+        // where `check` expects them by deleting nothing else.
+        let err = db
+            .run(r#"delete docs[title ~ "no such title"] cas each"#)
+            .unwrap_err();
+        assert!(err.to_string().contains("no matching row"), "{err}");
+        let err = db
+            .run(r#"delete docs[wing == "odd"] cas "nope""#)
+            .unwrap_err();
+        assert!(err.to_string().contains("cas mismatch"), "{err}");
+        assert_eq!(count(&mut db, r#"docs | wing == "odd" | count"#), 30);
+        assert!(db.store.is_disk_backed("docs"));
+        // No checkpoint: the next open must rebuild the overlay from the WAL.
+        db.close().unwrap();
+
+        let mut db = Db::open_with(&dir, cold_opts()).unwrap();
+        check(&mut db, "wal replay");
+        db.checkpoint().unwrap();
+        db.close().unwrap();
+
+        let mut db = Db::open_with(&dir, cold_opts()).unwrap();
+        check(&mut db, "checkpoint + reopen");
+        assert!(db.store.is_disk_backed("docs"));
+
+        // Predicate update of many rows: stays on disk, refreshes the content hash, and
+        // keeps unrelated fields.
+        let upd = db
+            .run(r#"update docs[wing == "odd"] cas each { room: "inbox", title: "rewritten" }"#)
+            .unwrap();
+        assert_eq!(upd.done.n, 30);
+        assert!(db.store.is_disk_backed("docs"), "predicate update promoted docs");
+        assert_eq!(count(&mut db, r#"docs | room == "inbox" | count"#), 30);
+        assert_eq!(count(&mut db, r#"docs | title ~ "rewritten" | count"#), 30);
+        let h = db.run(r#"docs | id == "p7" | { title, room, uri }"#).unwrap();
+        assert_eq!(text(&h.rows[0], "title"), "rewritten");
+        assert_eq!(text(&h.rows[0], "room"), "inbox");
+        assert_eq!(text(&h.rows[0], "uri"), "raw://p/7");
+        let h9 = hash_of(&mut db, "p11");
+        let err = db
+            .run(r#"update docs[wing == "odd"] cas "stale" { room: "x" }"#)
+            .unwrap_err();
+        assert!(err.to_string().contains("cas mismatch"), "{err}");
+        // Changing a unique key is still allowed, through the in-memory path.
+        db.run(&format!(
+            r#"update docs[id == "p11"] cas "{h9}" {{ uri: "raw://p/renamed" }}"#
+        ))
+        .unwrap();
+        assert_eq!(count(&mut db, r#"docs | uri == "raw://p/renamed" | count"#), 1);
+        db.checkpoint().unwrap();
+        db.close().unwrap();
+        let mut db = Db::open_with(&dir, cold_opts()).unwrap();
+        assert!(db.store.is_disk_backed("docs"));
+        assert_eq!(count(&mut db, r#"docs | room == "inbox" | count"#), 30);
+        assert_eq!(count(&mut db, r#"docs | uri == "raw://p/renamed" | count"#), 1);
+
+        let del = db.run(r#"delete docs[wing == "odd"] cas each"#).unwrap();
+        assert_eq!(del.done.n, 30);
+        assert_eq!(del.rows.len(), 30);
+        assert!(db.store.is_disk_backed("docs"), "predicate delete promoted docs");
+        assert_eq!(count(&mut db, r#"docs | count"#), 33);
+        assert_eq!(count(&mut db, r#"docs | wing == "odd" | count"#), 0);
+        assert_eq!(db.run(r#"docs | count by wing"#).unwrap().rows.len(), 1);
+        db.close().unwrap();
+
+        let mut db = Db::open_with(&dir, cold_opts()).unwrap();
+        assert_eq!(count(&mut db, r#"docs | count"#), 33, "predicate delete replay");
+        assert_eq!(count(&mut db, r#"docs | wing == "odd" | count"#), 0);
+        db.close().unwrap();
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Multi-segment cold table large enough for the per-segment parallel scan (`parallel`
+/// feature): partial results merged in segment order must equal the in-memory executor.
+#[test]
+fn cold_multi_segment_aggregates_match_in_memory() {
+    const N: usize = 70_000;
+    fn seed(db: &mut Db, checkpoint_every: Option<usize>) {
+        for i in 0..5 {
+            db.run(&format!(
+                r#"insert users {{ id: "u{i}", email: "user{i}@example.com" }}"#
+            ))
+            .unwrap();
+        }
+        for chunk in 0..(N / 5000) {
+            let mut orders = String::from("insert orders [\n");
+            for i in (chunk * 5000)..((chunk + 1) * 5000) {
+                if i > chunk * 5000 {
+                    orders.push(',');
+                }
+                orders.push_str(&format!(
+                    r#"{{ id: "o{i}", user_id: "u{}", total: {}, ts: ago 1d }}"#,
+                    i % 5,
+                    (i * 13) % 1000
+                ));
+            }
+            orders.push_str("\n]");
+            db.run(&orders).unwrap();
+            if let Some(every) = checkpoint_every
+                && (chunk + 1) % every == 0
+            {
+                db.checkpoint().unwrap();
+            }
+        }
+    }
+    let cold_dir = tmp();
+    let hot_dir = tmp();
+    let cold_opts = || lin::OpenOpts {
+        sync: lin::SyncMode::Full,
+        cold: true,
+    };
+    {
+        let mut db = Db::open_with(&cold_dir, cold_opts()).unwrap();
+        seed(&mut db, Some(7));
+        db.checkpoint().unwrap();
+        db.close().unwrap();
+    }
+    let mut cold = Db::open_with(&cold_dir, cold_opts()).unwrap();
+    let mut hot = Db::open(&hot_dir).unwrap();
+    seed(&mut hot, None);
+    assert!(cold.store.is_disk_backed("orders"));
+    for q in [
+        r#"orders | count"#,
+        r#"orders | count by user_id"#,
+        r#"orders | sum total"#,
+        r#"orders | sum total by user_id"#,
+        r#"orders | total > 500 | count"#,
+        r#"orders | total > 500 and user_id == "u2" | count"#,
+        r#"orders | total >= 990 | { id, total }"#,
+        // Text equality on a dictionary-encoded column, alone and with a range.
+        r#"orders | total >= 990 and user_id == "u2" | { id, total }"#,
+        r#"orders | user_id == "u4" and total < 3 | { id, user_id }"#,
+        r#"orders | user_id == "nobody" and total > 1 | { id }"#,
+        r#"orders | total > 995 and user_id == "u1" and total < 999 | { id }"#,
+        r#"orders | total > 990 and (user_id == "u1" or user_id == "u3") | { id }"#,
+        // In-lists on a dictionary-encoded column.
+        r#"orders | total > 990 and user_id in ["u1", "u3"] | { id, user_id }"#,
+        r#"orders | user_id in ["u0"] and total < 2 | { id }"#,
+        r#"orders | user_id in ["ghost", "phantom"] and total > 1 | { id }"#,
+        r#"orders | not user_id in ["u1", "u2", "u3", "u4"] and total > 995 | { id }"#,
+    ] {
+        let mut c = cold.run(&unlimited(q)).unwrap().rows.clone();
+        let mut h = hot.run(&unlimited(q)).unwrap().rows.clone();
+        c.sort_by_key(row_key);
+        h.sort_by_key(row_key);
+        assert_eq!(c, h, "{q}");
+    }
+    assert!(cold.store.is_disk_backed("orders"));
+    cold.close().unwrap();
+    hot.close().unwrap();
+    // Several checkpoints must have produced several `orders` segments, otherwise this
+    // test would not cover the multi-segment merge at all.
+    let order_segments = fs::read_dir(cold_dir.join("segments"))
+        .map(|d| {
+            d.flatten()
+                .filter(|e| e.path().join("col_total.val").exists())
+                .count()
+        })
+        .unwrap_or(0);
+    assert!(
+        order_segments > 1,
+        "expected several orders segments, found {order_segments}"
+    );
+    let _ = fs::remove_dir_all(&cold_dir);
+    let _ = fs::remove_dir_all(&hot_dir);
+}
+
+/// Inserts into a cold collection go to the disk overlay: uniqueness and foreign keys are
+/// checked against the disk engine, the collection stays disk-backed, and the rows survive
+/// WAL replay and checkpoint.
+#[test]
+fn cold_insert_stays_disk_backed() {
+    let dir = tmp();
+    let cold_opts = || lin::OpenOpts {
+        sync: lin::SyncMode::Full,
+        cold: true,
+    };
+    {
+        let mut db = Db::open_with(&dir, cold_opts()).unwrap();
+        for i in 0..40 {
+            db.run(&format!(
+                r#"insert users {{ id: "u{i}", email: "user{i}@example.com" }}"#
+            ))
+            .unwrap();
+        }
+        let mut docs = String::from("insert docs [\n");
+        let mut orders = String::from("insert orders [\n");
+        for i in 0..64 {
+            if i > 0 {
+                docs.push(',');
+                orders.push(',');
+            }
+            docs.push_str(&format!(
+                r#"{{ id: "c{i}", uri: "raw://c/{i}", title: "Seed {i}", wing: "seed", layer: "wiki", body: "seed body {i}" }}"#
+            ));
+            orders.push_str(&format!(
+                r#"{{ id: "o{i}", user_id: "u{}", total: {i} }}"#,
+                i % 40
+            ));
+        }
+        docs.push_str("\n]");
+        orders.push_str("\n]");
+        db.run(&docs).unwrap();
+        db.run(&orders).unwrap();
+        db.checkpoint().unwrap();
+        db.close().unwrap();
+    }
+    let count = |db: &mut Db, q: &str| -> i64 { db.run(q).unwrap().scalar_as::<i64>().unwrap() };
+
+    let mut db = Db::open_with(&dir, cold_opts()).unwrap();
+    for c in ["docs", "orders", "users"] {
+        assert!(db.store.is_disk_backed(c), "{c} should start cold");
+    }
+
+    // Single row, explicit id.
+    let ins = db
+        .run(r#"insert docs { id: "n1", uri: "raw://n/1", title: "Fresh zebra", wing: "new", layer: "wiki", body: "fresh body" }"#)
+        .unwrap();
+    assert_eq!(ins.done.n, 1);
+    assert_eq!(text(&ins.rows[0], "id"), "n1");
+    assert!(!text(&ins.rows[0], "hash").is_empty());
+    assert!(db.store.is_disk_backed("docs"), "insert promoted docs");
+
+    // Generated id, then a small batch.
+    let ins = db
+        .run(r#"insert docs { uri: "raw://n/2", title: "Generated", wing: "new", layer: "wiki", body: "gen body" }"#)
+        .unwrap();
+    let gen_id = text(&ins.rows[0], "id").to_string();
+    assert!(!gen_id.is_empty());
+    let ins = db
+        .run(
+            r#"insert docs [
+            { id: "n3", uri: "raw://n/3", title: "Batch a", wing: "new", layer: "wiki", body: "b3" },
+            { id: "n4", uri: "raw://n/4", title: "Batch b", wing: "new", layer: "wiki", body: "b4" }
+        ]"#,
+        )
+        .unwrap();
+    assert_eq!(ins.done.n, 2);
+    assert!(db.store.is_disk_backed("docs"), "batch insert promoted docs");
+
+    // Uniqueness against segments, against the overlay, and inside one batch.
+    for (src, want) in [
+        (
+            r#"insert docs { id: "c7", uri: "raw://n/x", title: "dup", layer: "wiki" }"#,
+            "duplicate id",
+        ),
+        (
+            r#"insert docs { id: "n1", uri: "raw://n/y", title: "dup", layer: "wiki" }"#,
+            "duplicate id",
+        ),
+        (
+            r#"insert docs { id: "z1", uri: "raw://c/9", title: "dup", layer: "wiki" }"#,
+            "duplicate uri",
+        ),
+        (
+            r#"insert docs { id: "z2", uri: "raw://n/3", title: "dup", layer: "wiki" }"#,
+            "duplicate uri",
+        ),
+        (
+            r#"insert docs [
+                { id: "z3", uri: "raw://n/same", title: "dup", layer: "wiki" },
+                { id: "z4", uri: "raw://n/same", title: "dup", layer: "wiki" }
+            ]"#,
+            "duplicate uri",
+        ),
+    ] {
+        let res = db.run(src).map(|h| h.done.n);
+        let Err(err) = res else {
+            panic!("expected `{want}` for {src}, got {res:?}; disk-backed={}", db.store.is_disk_backed("docs"));
+        };
+        assert!(err.to_string().contains(want), "{src}: {err}");
+    }
+    assert!(db.store.is_disk_backed("docs"));
+
+    // Foreign keys are resolved against the cold `users` collection.
+    let err = db
+        .run(r#"insert orders { id: "bad", user_id: "missing", total: 1 }"#)
+        .unwrap_err();
+    assert!(err.to_string().contains("fk"), "{err}");
+    db.run(r#"insert orders { id: "good", user_id: "u3", total: 500 }"#)
+        .unwrap();
+    assert!(db.store.is_disk_backed("orders"), "insert promoted orders");
+    assert!(db.store.is_disk_backed("users"), "fk check promoted users");
+    // Whatever the in-memory executor decides about a repeated `users.email`, the cold
+    // path must decide the same.
+    {
+        let mut hot = Db::fixture();
+        hot.run(r#"insert users { id: "h1", email: "same@example.com" }"#)
+            .unwrap();
+        let hot_dup = hot
+            .run(r#"insert users { id: "h2", email: "same@example.com" }"#)
+            .is_err();
+        let cold_dup = db
+            .run(r#"insert users { id: "u-new", email: "user5@example.com" }"#)
+            .is_err();
+        assert_eq!(cold_dup, hot_dup, "users.email uniqueness differs");
+        if !cold_dup {
+            let h = db.run(r#"users | id == "u-new" | { id }"#).unwrap();
+            assert_eq!(h.rows.len(), 1);
+            db.run(r#"delete users[id == "u-new"] cas each"#).unwrap();
+        }
+    }
+    assert!(db.store.is_disk_backed("users"));
+
+    let check = |db: &mut Db, stage: &str| {
+        assert_eq!(count(db, r#"docs | count"#), 68, "{stage}");
+        assert_eq!(count(db, r#"docs | wing == "new" | count"#), 4, "{stage}");
+        assert_eq!(count(db, r#"docs | title ~ "zebra" | count"#), 1, "{stage}");
+        assert_eq!(count(db, r#"orders | count"#), 65, "{stage}");
+        assert_eq!(count(db, r#"orders | total > 100 | count"#), 1, "{stage}");
+        assert_eq!(count(db, r#"users | count"#), 40, "{stage}");
+        let h = db.run(r#"docs | id == "n4" | { title }"#).unwrap();
+        assert_eq!(text(&h.rows[0], "title"), "Batch b", "{stage}");
+        let h = db
+            .run(&format!(r#"docs | id == "{gen_id}" | {{ title }}"#))
+            .unwrap();
+        assert_eq!(text(&h.rows[0], "title"), "Generated", "{stage}");
+    };
+    check(&mut db, "live overlay");
+    db.close().unwrap();
+
+    let mut db = Db::open_with(&dir, cold_opts()).unwrap();
+    check(&mut db, "wal replay");
+    // A generated id must not be handed out twice after replay.
+    let ins = db
+        .run(r#"insert docs { uri: "raw://n/5", title: "After replay", wing: "late", layer: "wiki" }"#)
+        .unwrap();
+    assert_ne!(text(&ins.rows[0], "id"), gen_id);
+    db.checkpoint().unwrap();
+    db.close().unwrap();
+
+    let mut db = Db::open_with(&dir, cold_opts()).unwrap();
+    assert_eq!(count(&mut db, r#"docs | count"#), 69);
+    assert_eq!(count(&mut db, r#"docs | wing == "new" | count"#), 4);
+    assert_eq!(count(&mut db, r#"orders | count"#), 65);
+    assert!(db.store.is_disk_backed("docs"));
+    db.close().unwrap();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// FK join through `run_batch` with cold sides must match the in-memory join and must not
+/// promote either collection.
+#[test]
+fn cold_join_batch_matches_in_memory() {
+    fn seed(db: &mut Db) {
+        let mut users = String::from("insert users [\n");
+        for i in 0..50 {
+            if i > 0 {
+                users.push(',');
+            }
+            users.push_str(&format!(
+                r#"{{ id: "u{i}", email: "user{i}@example.com" }}"#
+            ));
+        }
+        users.push_str("\n]");
+        db.run(&users).unwrap();
+        let mut orders = String::from("insert orders [\n");
+        for i in 0..400 {
+            if i > 0 {
+                orders.push(',');
+            }
+            orders.push_str(&format!(
+                r#"{{ id: "o{i}", user_id: "u{}", total: {} }}"#,
+                (i * 7) % 50,
+                (i * 13) % 300
+            ));
+        }
+        orders.push_str("\n]");
+        db.run(&orders).unwrap();
+    }
+    let cold_dir = tmp();
+    let hot_dir = tmp();
+    let cold_opts = || lin::OpenOpts {
+        sync: lin::SyncMode::Full,
+        cold: true,
+    };
+    {
+        let mut db = Db::open_with(&cold_dir, cold_opts()).unwrap();
+        seed(&mut db);
+        db.checkpoint().unwrap();
+        db.close().unwrap();
+    }
+    let mut cold = Db::open_with(&cold_dir, cold_opts()).unwrap();
+    let mut hot = Db::open(&hot_dir).unwrap();
+    seed(&mut hot);
+    assert!(cold.store.is_disk_backed("orders"));
+    assert!(cold.store.is_disk_backed("users"));
+
+    const QUERIES: &[&str] = &[
+        r#"orders | join users on user_id | { id, users.email, total } | take all"#,
+        r#"orders | total > 100 | join users on user_id | { id, users.email, total } | take all"#,
+        r#"orders | total > 100 and user_id == "u7" | join users on user_id | { id, users.email } | take all"#,
+        r#"orders | total < 0 | join users on user_id | { id, users.email } | take all"#,
+        r#"orders | join users on user_id | { users.email, id } | skip 10 | take 25"#,
+    ];
+    // The tiers differ in representation (`Int` vs `Float` for `total`, inline vs shared
+    // text), which is not what this test is about: compare values.
+    fn norm(rows: Vec<lin::Row>) -> Vec<String> {
+        let mut out: Vec<String> = rows
+            .iter()
+            .map(|r| {
+                r.iter()
+                    .map(|(k, c)| match (c.text(), c.as_f64()) {
+                        (Some(t), _) => format!("{k}={t}"),
+                        (None, Some(n)) => format!("{k}={n}"),
+                        _ => format!("{k}={c:?}"),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(";")
+            })
+            .collect();
+        out.sort();
+        out
+    }
+    let compare = |cold: &mut Db, hot: &mut Db, stage: &str| {
+        for q in QUERIES {
+            let c = norm(cold.run_batch(q).unwrap().to_rows());
+            let h = norm(hot.run_batch(q).unwrap().to_rows());
+            assert_eq!(c.len(), h.len(), "{stage}: {q}");
+            if !q.contains("skip") {
+                assert_eq!(c, h, "{stage}: {q}");
+            }
+            // The row API takes the same disk path for `join | project`.
+            let cr = norm(cold.run(q).unwrap().rows.clone());
+            assert_eq!(cr.len(), c.len(), "{stage}: run {q}");
+            if !q.contains("skip") {
+                assert_eq!(cr, c, "{stage}: run {q}");
+            }
+        }
+    };
+    compare(&mut cold, &mut hot, "segments");
+    assert!(cold.store.is_disk_backed("orders"), "join promoted orders");
+    assert!(cold.store.is_disk_backed("users"), "join promoted users");
+
+    // Row lookups by id on a cold collection (used by the join paths that do not go
+    // through the batch executor) must find rows, not consult empty in-memory maps.
+    assert!(cold.store.get_by_id("users", "u7").is_some());
+    assert!(cold.store.get_by_id("users", "nobody").is_none());
+    assert_eq!(
+        cold.store
+            .get_by_id("orders", "o12")
+            .and_then(|r| r.get("user_id"))
+            .and_then(|c| c.text()),
+        Some("u34")
+    );
+    for q in [
+        r#"orders | total > 250 | join users on user_id | take all"#,
+        r#"orders | join users on user_id | total > 290 | take all"#,
+    ] {
+        let c = norm(cold.run(q).unwrap().rows.clone());
+        let h = norm(hot.run(q).unwrap().rows.clone());
+        assert!(!h.is_empty(), "{q}");
+        assert_eq!(c, h, "non-projected join: {q}");
+    }
+    assert!(cold.store.is_disk_backed("orders"));
+    assert!(cold.store.is_disk_backed("users"));
+
+    // Overlay rows on both sides, including an order whose user is added later.
+    for db in [&mut cold, &mut hot] {
+        db.run(r#"insert users { id: "u-late", email: "late@example.com" }"#)
+            .unwrap();
+        db.run(r#"insert orders { id: "o-late", user_id: "u-late", total: 250 }"#)
+            .unwrap();
+        db.run(r#"delete orders[id == "o3"] cas each"#).unwrap();
+    }
+    compare(&mut cold, &mut hot, "segments + overlay");
+    assert!(cold.store.is_disk_backed("orders"));
+    assert!(cold.store.is_disk_backed("users"));
+
+    cold.close().unwrap();
+    hot.close().unwrap();
+    let _ = fs::remove_dir_all(&cold_dir);
+    let _ = fs::remove_dir_all(&hot_dir);
+}
+
+/// Concurrent `AsyncDb::execute` calls share WAL syncs (group commit). Every statement must
+/// still succeed or fail on its own, and everything acknowledged must survive a reopen
+/// without a checkpoint.
+#[cfg(feature = "async")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn async_group_commit_is_durable_and_per_statement() {
+    let dir = tmp();
+    let db = Db::open_with(
+        &dir,
+        lin::OpenOpts {
+            sync: lin::SyncMode::Full,
+            cold: false,
+        },
+    )
+    .unwrap();
+    let adb = lin::AsyncDb::new(db);
+    adb.execute(r#"insert docs { id: "seed", uri: "raw://g/seed", title: "seed", layer: "wiki" }"#)
+        .await
+        .unwrap();
+
+    const N: usize = 48;
+    let mut tasks = Vec::new();
+    for i in 0..N {
+        let adb = adb.clone();
+        tasks.push(tokio::spawn(async move {
+            // Every sixth statement collides with the seed row and must fail alone.
+            let src = if i % 6 == 5 {
+                format!(r#"insert docs {{ id: "seed", uri: "raw://g/dup{i}", title: "dup", layer: "wiki" }}"#)
+            } else {
+                format!(r#"insert docs {{ id: "g{i}", uri: "raw://g/{i}", title: "group {i}", layer: "wiki" }}"#)
+            };
+            (i, adb.execute(src).await)
+        }));
+    }
+    let mut ok = 0usize;
+    let mut failed = 0usize;
+    let mut gens = Vec::new();
+    for t in tasks {
+        let (i, res) = t.await.unwrap();
+        match res {
+            Ok(done) => {
+                assert_ne!(i % 6, 5, "duplicate insert {i} was acknowledged");
+                assert_eq!(done.n, 1);
+                gens.push(done.r#gen);
+                ok += 1;
+            }
+            Err(e) => {
+                assert_eq!(i % 6, 5, "insert {i} failed: {e}");
+                assert!(e.to_string().contains("duplicate id"), "{e}");
+                failed += 1;
+            }
+        }
+    }
+    assert_eq!(ok, N - N / 6);
+    assert_eq!(failed, N / 6);
+
+    // Prepared writes join the same commit groups.
+    let mut prepared_tasks = Vec::new();
+    for i in 0..16 {
+        let adb = adb.clone();
+        prepared_tasks.push(tokio::spawn(async move {
+            let p = adb
+                .prepare(format!(
+                    r#"insert docs {{ id: "p{i}", uri: "raw://g/p{i}", title: "prepared {i}", layer: "wiki" }}"#
+                ))
+                .await
+                .unwrap();
+            adb.execute_prepared(p).await
+        }));
+    }
+    for t in prepared_tasks {
+        let done = t.await.unwrap().unwrap();
+        assert_eq!(done.n, 1);
+        gens.push(done.r#gen);
+        ok += 1;
+    }
+    gens.sort_unstable();
+    gens.dedup();
+    assert_eq!(gens.len(), ok, "each committed statement gets its own generation");
+
+    // Drop without close or checkpoint: only the WAL carries the writes.
+    drop(adb);
+    let mut db = Db::open(&dir).unwrap();
+    assert_eq!(
+        db.run(r#"docs | count"#).unwrap().scalar_as::<i64>().unwrap(),
+        (ok + 1) as i64
+    );
+    assert_eq!(db.run(r#"docs | id == "g7""#).unwrap().rows.len(), 1);
+    assert_eq!(db.run(r#"docs | id == "p9""#).unwrap().rows.len(), 1);
+    assert_eq!(db.run(r#"docs | uri == "raw://g/dup5""#).unwrap().rows.len(), 0);
+    db.close().unwrap();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A cluster key survives the collection being promoted into memory and spilled again,
+/// and the re-spilled data still answers queries like the in-memory executor.
+#[test]
+fn cold_cluster_key_survives_promotion_and_respill() {
+    fn orders(from: usize, to: usize) -> String {
+        let mut s = String::from("insert orders [\n");
+        for i in from..to {
+            if i > from {
+                s.push(',');
+            }
+            s.push_str(&format!(
+                r#"{{ id: "o{i}", user_id: "u{}", total: {} }}"#,
+                i % 5,
+                (i * 7919) % 10_000
+            ));
+        }
+        s.push_str("\n]");
+        s
+    }
+    fn seed(db: &mut Db) {
+        for i in 0..5 {
+            db.run(&format!(
+                r#"insert users {{ id: "u{i}", email: "user{i}@example.com" }}"#
+            ))
+            .unwrap();
+        }
+        db.run(&orders(0, 6_000)).unwrap();
+    }
+    let cold_dir = tmp();
+    let hot_dir = tmp();
+    let cold_opts = || lin::OpenOpts {
+        sync: lin::SyncMode::Full,
+        cold: true,
+    };
+    {
+        let mut db = Db::open_with(&cold_dir, cold_opts()).unwrap();
+        seed(&mut db);
+        db.checkpoint().unwrap();
+        db.close().unwrap();
+    }
+    let mut hot = Db::open(&hot_dir).unwrap();
+    seed(&mut hot);
+
+    let mut cold = Db::open_with(&cold_dir, cold_opts()).unwrap();
+    cold.set_cluster_key("orders", Some("total")).unwrap();
+    // A batch above the overlay limit goes through the in-memory path and promotes orders.
+    for db in [&mut cold, &mut hot] {
+        db.run(&orders(6_000, 11_000)).unwrap();
+    }
+    assert!(!cold.store.is_disk_backed("orders"), "large batch should promote");
+    cold.checkpoint().unwrap();
+    // The spilled copy is attached again on the next open; the key is remembered meanwhile.
+    assert_eq!(cold.cluster_key("orders").as_deref(), Some("total"));
+    cold.close().unwrap();
+
+    let mut cold = Db::open_with(&cold_dir, cold_opts()).unwrap();
+    assert!(cold.store.is_disk_backed("orders"));
+    assert_eq!(cold.cluster_key("orders").as_deref(), Some("total"));
+    for q in [
+        r#"orders | count"#,
+        r#"orders | total >= 5000 and total < 5100 | { id, total }"#,
+        r#"orders | total < 50 | count by user_id"#,
+        r#"orders | sum total by user_id"#,
+    ] {
+        let mut c = cold.run(&unlimited(q)).unwrap().rows.clone();
+        let mut h = hot.run(&unlimited(q)).unwrap().rows.clone();
+        c.sort_by_key(row_key);
+        h.sort_by_key(row_key);
+        assert_eq!(c, h, "{q}");
+    }
+    // Clearing the key is persisted too.
+    cold.set_cluster_key("orders", None).unwrap();
+    assert_eq!(cold.cluster_key("orders"), None);
+    cold.checkpoint().unwrap();
+    cold.close().unwrap();
+    let cold = Db::open_with(&cold_dir, cold_opts()).unwrap();
+    assert_eq!(cold.cluster_key("orders"), None);
+    drop(cold);
+    hot.close().unwrap();
+    let _ = fs::remove_dir_all(&cold_dir);
+    let _ = fs::remove_dir_all(&hot_dir);
+}
+
+/// A program of several statements on cold collections is atomic and stays on disk:
+/// all of it is applied and survives replay, or none of it is.
+#[test]
+fn cold_multi_statement_program_is_atomic() {
+    let dir = tmp();
+    let cold_opts = || lin::OpenOpts {
+        sync: lin::SyncMode::Full,
+        cold: true,
+    };
+    {
+        let mut db = Db::open_with(&dir, cold_opts()).unwrap();
+        let mut rows = String::from("insert docs [\n");
+        for i in 0..64 {
+            if i > 0 {
+                rows.push(',');
+            }
+            rows.push_str(&format!(
+                r#"{{ id: "m{i}", uri: "raw://m/{i}", title: "Seed {i}", wing: "seed", layer: "wiki", body: "body {i}" }}"#
+            ));
+        }
+        rows.push_str("\n]");
+        db.run(&rows).unwrap();
+        db.checkpoint().unwrap();
+        db.close().unwrap();
+    }
+    let count = |db: &mut Db, q: &str| -> i64 { db.run(q).unwrap().scalar_as::<i64>().unwrap() };
+    let hash_of = |db: &mut Db, id: &str| -> String {
+        let h = db
+            .run(&format!(r#"docs | id == "{id}" | {{ hash }}"#))
+            .unwrap();
+        text(&h.rows[0], "hash").to_string()
+    };
+
+    let mut db = Db::open_with(&dir, cold_opts()).unwrap();
+    assert!(db.store.is_disk_backed("docs"));
+    // Full-text search must track the overlay: through a rolled-back program, a committed
+    // one, replay and checkpoint.
+    let lex = |db: &mut Db, word: &str| -> usize {
+        db.run(&format!(r#"docs | search lex "{word}" | take all"#))
+            .unwrap()
+            .rows
+            .len()
+    };
+    assert_eq!(lex(&mut db, "seed"), 64);
+    assert_eq!(lex(&mut db, "changed"), 0);
+    let (h1, h2, h3) = (
+        hash_of(&mut db, "m1"),
+        hash_of(&mut db, "m2"),
+        hash_of(&mut db, "m3"),
+    );
+    let gen0 = db.store.r#gen;
+
+    // Third statement fails (stale cas): nothing from the program may remain.
+    let err = db
+        .run(&format!(
+            r#"insert docs {{ id: "new1", uri: "raw://m/new1", title: "New one", wing: "prog", layer: "wiki" }}
+update docs[id == "m1"] cas "{h1}" {{ title: "Changed 1" }}
+delete docs[id == "m2"] cas "stale""#
+        ))
+        .unwrap_err();
+    assert!(err.to_string().contains("cas mismatch"), "{err}");
+    assert_eq!(db.store.r#gen, gen0, "failed program advanced the generation");
+    assert!(db.store.is_disk_backed("docs"), "failed program promoted docs");
+    assert_eq!(count(&mut db, r#"docs | count"#), 64);
+    assert_eq!(db.run(r#"docs | id == "new1""#).unwrap().rows.len(), 0);
+    assert_eq!(count(&mut db, r#"docs | title ~ "Changed" | count"#), 0);
+    assert_eq!(count(&mut db, r#"docs | wing == "prog" | count"#), 0);
+    assert_eq!(hash_of(&mut db, "m1"), h1);
+    assert_eq!(lex(&mut db, "seed"), 64, "fts after rollback");
+    assert_eq!(lex(&mut db, "changed"), 0, "fts after rollback");
+    assert!(db.store.is_disk_backed("docs"), "search promoted docs");
+
+    // A duplicate inside the program (second insert repeats the first id) also rolls back.
+    let err = db
+        .run(
+            r#"insert docs { id: "dup1", uri: "raw://m/dup-a", title: "a", layer: "wiki" }
+insert docs { id: "dup1", uri: "raw://m/dup-b", title: "b", layer: "wiki" }"#,
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("duplicate id"), "{err}");
+    assert_eq!(count(&mut db, r#"docs | count"#), 64);
+    assert_eq!(db.run(r#"docs | id == "dup1""#).unwrap().rows.len(), 0);
+
+    // Success: later statements see earlier ones, one generation for the whole program.
+    let done = db
+        .run(&format!(
+            r#"insert docs {{ id: "new1", uri: "raw://m/new1", title: "New one", wing: "prog", layer: "wiki" }}
+update docs[id == "m1"] cas "{h1}" {{ title: "Changed 1", wing: "prog" }}
+delete docs[id == "m2"] cas "{h2}"
+update docs[id == "m3"] cas "{h3}" {{ wing: "prog" }}"#
+        ))
+        .unwrap();
+    assert_eq!(done.done.r#gen, gen0 + 1);
+    assert!(db.store.is_disk_backed("docs"), "program promoted docs");
+    let check = |db: &mut Db, stage: &str| {
+        assert_eq!(count(db, r#"docs | count"#), 64, "{stage}");
+        assert_eq!(count(db, r#"docs | wing == "prog" | count"#), 3, "{stage}");
+        assert_eq!(count(db, r#"docs | title ~ "Changed" | count"#), 1, "{stage}");
+        assert_eq!(db.run(r#"docs | id == "m2""#).unwrap().rows.len(), 0, "{stage}");
+        assert_eq!(db.run(r#"docs | id == "new1""#).unwrap().rows.len(), 1, "{stage}");
+    };
+    check(&mut db, "live");
+    // "Seed 1" became "Changed 1", "Seed 2" is gone, "New one" has neither word.
+    assert_eq!(lex(&mut db, "seed"), 62, "fts live");
+    assert_eq!(lex(&mut db, "changed"), 1, "fts live");
+    assert!(db.store.is_disk_backed("docs"), "search promoted docs");
+    db.close().unwrap();
+
+    let mut db = Db::open_with(&dir, cold_opts()).unwrap();
+    check(&mut db, "wal replay");
+    assert_eq!(lex(&mut db, "seed"), 62, "fts after replay");
+    assert_eq!(lex(&mut db, "changed"), 1, "fts after replay");
+    db.checkpoint().unwrap();
+    db.close().unwrap();
+    let mut db = Db::open_with(&dir, cold_opts()).unwrap();
+    check(&mut db, "checkpoint + reopen");
+    assert_eq!(lex(&mut db, "seed"), 62, "fts after checkpoint");
+    assert_eq!(lex(&mut db, "changed"), 1, "fts after checkpoint");
+    assert!(db.store.is_disk_backed("docs"));
+    db.close().unwrap();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// `Db::compact_collection` on a clustered cold collection reclaims deleted rows and leaves
+/// the table ordered by its cluster key across all segments, without changing its contents.
+#[test]
+fn cold_compact_collection_orders_by_cluster_key() {
+    const N: usize = 9_000;
+    fn seed(db: &mut Db) {
+        for i in 0..5 {
+            db.run(&format!(
+                r#"insert users {{ id: "u{i}", email: "user{i}@example.com" }}"#
+            ))
+            .unwrap();
+        }
+        for chunk in 0..(N / 1000) {
+            let mut orders = String::from("insert orders [\n");
+            for i in (chunk * 1000)..((chunk + 1) * 1000) {
+                if i > chunk * 1000 {
+                    orders.push(',');
+                }
+                orders.push_str(&format!(
+                    r#"{{ id: "o{i}", user_id: "u{}", total: {} }}"#,
+                    i % 5,
+                    (i * 7919) % 100_000
+                ));
+            }
+            orders.push_str("\n]");
+            db.run(&orders).unwrap();
+        }
+    }
+    let cold_dir = tmp();
+    let hot_dir = tmp();
+    let cold_opts = || lin::OpenOpts {
+        sync: lin::SyncMode::Full,
+        cold: true,
+    };
+    {
+        let mut db = Db::open_with(&cold_dir, cold_opts()).unwrap();
+        seed(&mut db);
+        db.checkpoint().unwrap();
+        db.close().unwrap();
+    }
+    let mut hot = Db::open(&hot_dir).unwrap();
+    seed(&mut hot);
+    let mut cold = Db::open_with(&cold_dir, cold_opts()).unwrap();
+    assert!(hot.compact_collection("orders").is_err(), "nothing on disk to compact");
+
+    // Overlay changes (small inserts, deletes) leave extra segments and tombstones behind.
+    for db in [&mut cold, &mut hot] {
+        db.run(r#"delete orders[total < 1000] cas each"#).unwrap();
+        db.run(r#"insert orders { id: "late-a", user_id: "u1", total: 5 }"#)
+            .unwrap();
+        db.run(r#"insert orders { id: "late-b", user_id: "u2", total: 99999 }"#)
+            .unwrap();
+    }
+    cold.set_cluster_key("orders", Some("total")).unwrap();
+    cold.compact_collection("orders").unwrap();
+    assert!(cold.store.is_disk_backed("orders"));
+    let queries = [
+        r#"orders | count"#,
+        r#"orders | total < 2000 | { id, total }"#,
+        r#"orders | total >= 50000 and total < 50500 | { id, total }"#,
+        r#"orders | sum total by user_id"#,
+        r#"orders | id == "late-b" | { total }"#,
+    ];
+    let compare = |cold: &mut Db, hot: &mut Db, stage: &str| {
+        for q in queries {
+            let mut c = cold.run(&unlimited(q)).unwrap().rows.clone();
+            let mut h = hot.run(&unlimited(q)).unwrap().rows.clone();
+            c.sort_by_key(row_key);
+            h.sort_by_key(row_key);
+            assert_eq!(c, h, "{stage}: {q}");
+        }
+    };
+    compare(&mut cold, &mut hot, "after compaction");
+    cold.close().unwrap();
+
+    // Physical order: one pass over the table sees `total` ascending.
+    {
+        let eng = lin::DiskEngine::open_read_only(&cold_dir).unwrap();
+        let mut prev = f64::NEG_INFINITY;
+        let mut n = 0usize;
+        eng.scan_projected("orders", Some(&["total"]), |row| {
+            let v = row.get("total").and_then(|c| c.as_f64()).unwrap();
+            assert!(prev <= v, "orders not in cluster-key order: {prev} then {v}");
+            prev = v;
+            n += 1;
+            Ok(true)
+        })
+        .unwrap();
+        assert_eq!(n as i64, hot.run(r#"orders | count"#).unwrap().scalar_as::<i64>().unwrap());
+    }
+
+    let mut cold = Db::open_with(&cold_dir, cold_opts()).unwrap();
+    assert_eq!(cold.cluster_key("orders").as_deref(), Some("total"));
+    compare(&mut cold, &mut hot, "after reopen");
+    cold.close().unwrap();
+    hot.close().unwrap();
+    let _ = fs::remove_dir_all(&cold_dir);
+    let _ = fs::remove_dir_all(&hot_dir);
 }

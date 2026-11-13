@@ -619,7 +619,12 @@ pub(crate) fn project(rows: &[Row], fields: &[Field]) -> Vec<Row> {
     result
 }
 
-pub(crate) fn sort_rows_top_k(rows: &mut Vec<Row>, field: &Field, desc: bool, top_k: Option<usize>) {
+pub(crate) fn sort_rows_top_k(
+    rows: &mut Vec<Row>,
+    field: &Field,
+    desc: bool,
+    top_k: Option<usize>,
+) {
     let k = field.as_str();
     let n = rows.len();
     if n <= 1 {
@@ -758,16 +763,20 @@ pub(crate) fn eval_window(
 
     let total_len = rows.len();
     let by_keys: Vec<std::borrow::Cow<'_, str>> = by.iter().map(|b| b.as_cow_str()).collect();
-    let order_keys: Vec<(std::borrow::Cow<'_, str>, bool)> =
-        order.iter().map(|s| (s.field.as_cow_str(), s.desc)).collect();
+    let order_keys: Vec<(std::borrow::Cow<'_, str>, bool)> = order
+        .iter()
+        .map(|s| (s.field.as_cow_str(), s.desc))
+        .collect();
     let target_field: Option<std::borrow::Cow<'_, str>> = field.map(|f| f.as_cow_str());
     let tf: &str = target_field.as_deref().unwrap_or_default();
 
     let partition_vec: Vec<Vec<Row>> = if by_keys.is_empty() {
         vec![rows]
     } else {
-        let mut partition_keys: Vec<Vec<Cell>> = Vec::new();
-        let mut partitions: FxHashMap<Vec<Cell>, Vec<Row>> = FxHashMap::default();
+        // Key -> position of its partition, partitions kept in first-seen order. Each key is
+        // stored once, and rows move straight into their partition.
+        let mut partition_of: FxHashMap<Vec<Cell>, usize> = FxHashMap::default();
+        let mut partitions: Vec<Vec<Row>> = Vec::new();
         let mut key_buf: Vec<Cell> = Vec::with_capacity(by_keys.len());
 
         for row in rows {
@@ -779,56 +788,82 @@ pub(crate) fn eval_window(
                         .unwrap_or(Cell::Null),
                 );
             }
-            if let Some(part) = partitions.get_mut(&key_buf) {
-                part.push(row);
-            } else {
-                let key = key_buf.clone();
-                partition_keys.push(key.clone());
-                partitions.insert(key, vec![row]);
-            }
+            let slot = match partition_of.get(&key_buf) {
+                Some(&slot) => slot,
+                None => {
+                    let slot = partitions.len();
+                    partition_of.insert(std::mem::take(&mut key_buf), slot);
+                    key_buf = Vec::with_capacity(by_keys.len());
+                    partitions.push(Vec::new());
+                    slot
+                }
+            };
+            partitions[slot].push(row);
         }
-        partition_keys
-            .into_iter()
-            .map(|pkey| partitions.remove(&pkey).unwrap_or_default())
-            .collect()
+        partitions
     };
 
     let mut result_rows = Vec::with_capacity(total_len);
 
     for mut part in partition_vec {
-        if !order_keys.is_empty() {
-            part.sort_by(|a, b| {
-                for (ok, desc) in &order_keys {
-                    let av = a.get(ok.as_ref()).unwrap_or(&Cell::Null);
-                    let bv = b.get(ok.as_ref()).unwrap_or(&Cell::Null);
-                    let ord = cmp_sort(av, bv);
-                    let ord = if *desc { ord.reverse() } else { ord };
-                    if ord != std::cmp::Ordering::Equal {
-                        return ord;
+        // For `rank` / `dense_rank`: whether row `i` ties with row `i - 1` on every sort key,
+        // read off the key buffer built for sorting instead of re-probing both rows' maps.
+        let needs_ties = matches!(func, WindowFunction::Rank | WindowFunction::DenseRank);
+        let mut ties: Vec<bool> = Vec::new();
+        if !order_keys.is_empty() && part.len() > 1 {
+            // Look every sort key up once, then sort row indices over the flat key buffer
+            // instead of walking each row's map inside the comparator.
+            let k = order_keys.len();
+            let order: Vec<u32> = {
+                static NULL: Cell = Cell::Null;
+                let mut keys: Vec<&Cell> = Vec::with_capacity(part.len() * k);
+                for row in &part {
+                    for (ok, _) in &order_keys {
+                        keys.push(row.get(ok.as_ref()).unwrap_or(&NULL));
                     }
                 }
-                std::cmp::Ordering::Equal
-            });
+                let mut order: Vec<u32> = (0..part.len() as u32).collect();
+                // Stable, like the row sort it replaces.
+                order.sort_by(|&a, &b| {
+                    let (a, b) = (a as usize * k, b as usize * k);
+                    for (j, (_, desc)) in order_keys.iter().enumerate() {
+                        let ord = cmp_sort(keys[a + j], keys[b + j]);
+                        let ord = if *desc { ord.reverse() } else { ord };
+                        if ord != std::cmp::Ordering::Equal {
+                            return ord;
+                        }
+                    }
+                    std::cmp::Ordering::Equal
+                });
+                if needs_ties {
+                    ties = Vec::with_capacity(order.len());
+                    ties.push(false);
+                    for w in order.windows(2) {
+                        let (a, b) = (w[0] as usize * k, w[1] as usize * k);
+                        ties.push((0..k).all(|j| {
+                            cmp_sort(keys[a + j], keys[b + j]) == std::cmp::Ordering::Equal
+                        }));
+                    }
+                }
+                order
+            };
+            let mut slots: Vec<Option<Row>> = part.into_iter().map(Some).collect();
+            part = order
+                .into_iter()
+                .filter_map(|i| slots[i as usize].take())
+                .collect();
         }
 
         let n = part.len();
         let vals: Vec<Cell> = match func {
-            WindowFunction::RowNumber => {
-                (0..n).map(|i| Cell::Int((i + 1) as i64)).collect()
-            }
+            WindowFunction::RowNumber => (0..n).map(|i| Cell::Int((i + 1) as i64)).collect(),
             WindowFunction::Rank => {
                 let mut ranks = Vec::with_capacity(n);
                 let mut current_rank = 1i64;
                 for i in 0..n {
-                    if i > 0 && !order_keys.is_empty() {
-                        let all_equal = order_keys.iter().all(|(ok, _)| {
-                            let prev = part[i - 1].get(ok.as_ref()).unwrap_or(&Cell::Null);
-                            let curr = part[i].get(ok.as_ref()).unwrap_or(&Cell::Null);
-                            cmp_sort(prev, curr) == std::cmp::Ordering::Equal
-                        });
-                        if !all_equal {
-                            current_rank = (i + 1) as i64;
-                        }
+                    // `ties` is empty when there is nothing to order by: one shared rank.
+                    if i > 0 && ties.get(i).is_some_and(|tied| !tied) {
+                        current_rank = (i + 1) as i64;
                     }
                     ranks.push(Cell::Int(current_rank));
                 }
@@ -838,15 +873,8 @@ pub(crate) fn eval_window(
                 let mut ranks = Vec::with_capacity(n);
                 let mut current_rank = 1i64;
                 for i in 0..n {
-                    if i > 0 && !order_keys.is_empty() {
-                        let all_equal = order_keys.iter().all(|(ok, _)| {
-                            let prev = part[i - 1].get(ok.as_ref()).unwrap_or(&Cell::Null);
-                            let curr = part[i].get(ok.as_ref()).unwrap_or(&Cell::Null);
-                            cmp_sort(prev, curr) == std::cmp::Ordering::Equal
-                        });
-                        if !all_equal {
-                            current_rank += 1;
-                        }
+                    if i > 0 && ties.get(i).is_some_and(|tied| !tied) {
+                        current_rank += 1;
                     }
                     ranks.push(Cell::Int(current_rank));
                 }

@@ -83,7 +83,11 @@ impl DictColumn {
         }
 
         // Fast path: linear scan of small dictionary (< 16 items)
-        if let Some(pos) = self.dict.iter().position(|x| Arc::ptr_eq(x, &val) || **x == *val) {
+        if let Some(pos) = self
+            .dict
+            .iter()
+            .position(|x| Arc::ptr_eq(x, &val) || **x == *val)
+        {
             self.indices.push(pos as u8);
             return;
         }
@@ -127,7 +131,11 @@ impl DictColumn {
             return;
         }
 
-        if let Some(pos) = self.dict.iter().position(|x| Arc::ptr_eq(x, &val) || **x == *val) {
+        if let Some(pos) = self
+            .dict
+            .iter()
+            .position(|x| Arc::ptr_eq(x, &val) || **x == *val)
+        {
             self.indices[i] = pos as u8;
             return;
         }
@@ -191,7 +199,10 @@ impl DictColumn {
         if let Some(spilled) = &self.spilled {
             spilled.clone()
         } else {
-            self.indices.iter().map(|&idx| Arc::clone(&self.dict[idx as usize])).collect()
+            self.indices
+                .iter()
+                .map(|&idx| Arc::clone(&self.dict[idx as usize]))
+                .collect()
         }
     }
 }
@@ -204,7 +215,6 @@ impl std::ops::Index<usize> for DictColumn {
         self.get_ref(i)
     }
 }
-
 
 /// Move `v[p]` on top of the tail and drop the tail, keeping the vec dense. A
 /// no-op when `v` isn't parallel to the rows (the caller's length guard rebuilds).
@@ -229,7 +239,6 @@ pub(super) fn swap_push_at<T: Clone>(v: &mut Vec<T>, p: usize, len: usize, value
         v[p] = value;
     }
 }
-
 
 impl Store {
     /// Count `docs.title ~ needle` (no group) using columnar titles + memchr.
@@ -516,7 +525,11 @@ impl Store {
             _ => return None,
         };
         let (codes, dict_vals) = dict.as_indices()?;
-        let Some(code) = dict_vals.iter().position(|v| **v == *target).map(|p| p as u8) else {
+        let Some(code) = dict_vals
+            .iter()
+            .position(|v| **v == *target)
+            .map(|p| p as u8)
+        else {
             return Some(Vec::new());
         };
         if limit == Some(0) {
@@ -588,40 +601,43 @@ impl Store {
                 let chunk_size = 4096;
                 std::thread::scope(|scope| {
                     for _ in 0..threads {
-                        scope.spawn(|| loop {
-                            let start = next_chunk
-                                .fetch_add(chunk_size, std::sync::atomic::Ordering::Relaxed);
-                            if start >= total_idxs {
-                                break;
-                            }
-                            let end = (start + chunk_size).min(total_idxs);
-                            for offset in start..end {
-                                let i = idxs[offset];
-                                let row = unsafe { &mut *(rows_ptr as *mut Row).add(offset) };
-                                if row.len() == 2 {
-                                    let mut it = row.iter_mut();
-                                    if let (Some((k1, v1)), Some((k2, v2))) = (it.next(), it.next())
-                                        && k1 == "id"
-                                        && k2 == "title"
-                                    {
-                                        let same_id = match v1 {
-                                            Cell::Text(a) => Arc::ptr_eq(a, &docs_id[i]),
-                                            _ => false,
-                                        };
-                                        if !same_id {
-                                            *v1 = Cell::Text(Arc::clone(&docs_id[i]));
-                                        }
-                                        let same_title = match v2 {
-                                            Cell::Text(a) => Arc::ptr_eq(a, &docs_title[i]),
-                                            _ => false,
-                                        };
-                                        if !same_title {
-                                            *v2 = Cell::Text(Arc::clone(&docs_title[i]));
-                                        }
-                                        continue;
-                                    }
+                        scope.spawn(|| {
+                            loop {
+                                let start = next_chunk
+                                    .fetch_add(chunk_size, std::sync::atomic::Ordering::Relaxed);
+                                if start >= total_idxs {
+                                    break;
                                 }
-                                *row = row_id_title(&docs_id[i], &docs_title[i]);
+                                let end = (start + chunk_size).min(total_idxs);
+                                for offset in start..end {
+                                    let i = idxs[offset];
+                                    let row = unsafe { &mut *(rows_ptr as *mut Row).add(offset) };
+                                    if row.len() == 2 {
+                                        let mut it = row.iter_mut();
+                                        if let (Some((k1, v1)), Some((k2, v2))) =
+                                            (it.next(), it.next())
+                                            && k1 == "id"
+                                            && k2 == "title"
+                                        {
+                                            let same_id = match v1 {
+                                                Cell::Text(a) => Arc::ptr_eq(a, &docs_id[i]),
+                                                _ => false,
+                                            };
+                                            if !same_id {
+                                                *v1 = Cell::Text(Arc::clone(&docs_id[i]));
+                                            }
+                                            let same_title = match v2 {
+                                                Cell::Text(a) => Arc::ptr_eq(a, &docs_title[i]),
+                                                _ => false,
+                                            };
+                                            if !same_title {
+                                                *v2 = Cell::Text(Arc::clone(&docs_title[i]));
+                                            }
+                                            continue;
+                                        }
+                                    }
+                                    *row = row_id_title(&docs_id[i], &docs_title[i]);
+                                }
                             }
                         });
                     }
@@ -656,8 +672,11 @@ impl Store {
                 let docs_layer = &self.docs_layer;
                 let docs_wing = &self.docs_wing;
 
-                let mut out_buffer: Vec<std::mem::MaybeUninit<Row>> = Vec::with_capacity(total_idxs);
-                unsafe { out_buffer.set_len(total_idxs); }
+                let mut out_buffer: Vec<std::mem::MaybeUninit<Row>> =
+                    Vec::with_capacity(total_idxs);
+                unsafe {
+                    out_buffer.set_len(total_idxs);
+                }
                 let out_ptr = out_buffer.as_mut_ptr() as usize;
 
                 let next_chunk = std::sync::atomic::AtomicUsize::new(0);
@@ -670,22 +689,32 @@ impl Store {
                             let k_id = String::from("id");
                             let k_title = String::from("title");
                             loop {
-                                let start = next_chunk.fetch_add(chunk_size, std::sync::atomic::Ordering::Relaxed);
+                                let start = next_chunk
+                                    .fetch_add(chunk_size, std::sync::atomic::Ordering::Relaxed);
                                 if start >= total_idxs {
                                     break;
                                 }
                                 let end = (start + chunk_size).min(total_idxs);
                                 for offset in start..end {
                                     let i = idxs[offset];
-                                    let slot = unsafe { &mut *(out_ptr as *mut std::mem::MaybeUninit<Row>).add(offset) };
+                                    let slot = unsafe {
+                                        &mut *(out_ptr as *mut std::mem::MaybeUninit<Row>)
+                                            .add(offset)
+                                    };
                                     if i >= n {
                                         slot.write(acquire_row());
                                         continue;
                                     }
                                     if id_title {
                                         let mut row = BTreeMap::new();
-                                        row.insert(k_id.clone(), Cell::Text(Arc::clone(&docs_id[i])));
-                                        row.insert(k_title.clone(), Cell::Text(Arc::clone(&docs_title[i])));
+                                        row.insert(
+                                            k_id.clone(),
+                                            Cell::Text(Arc::clone(&docs_id[i])),
+                                        );
+                                        row.insert(
+                                            k_title.clone(),
+                                            Cell::Text(Arc::clone(&docs_title[i])),
+                                        );
                                         slot.write(row);
                                         continue;
                                     }
@@ -778,7 +807,8 @@ impl Store {
                         let end = (start + chunk_size).min(n);
                         handles.push(scope.spawn(move || {
                             let mut out = Vec::with_capacity(end - start);
-                            let finder = title_contains.map(|needle| memchr::memmem::Finder::new(needle.as_bytes()));
+                            let finder = title_contains
+                                .map(|needle| memchr::memmem::Finder::new(needle.as_bytes()));
                             for i in start..end {
                                 if let Some(f) = &finder
                                     && f.find(docs_title[i].as_bytes()).is_none()

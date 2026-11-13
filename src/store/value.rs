@@ -12,6 +12,17 @@ pub const fn acquire_row() -> Row {
     BTreeMap::new()
 }
 
+/// Convert an `Arc<str>` into a `Cell`, storing strings up to `InlineStr::MAX_LEN` inline
+/// (`Cell::SmallText`) to avoid per-row atomic refcount increments/decrements.
+#[inline]
+pub fn cell_from_arc_inline(arc: &Arc<str>) -> Cell {
+    if let Some(inline) = InlineStr::try_new(arc.as_ref()) {
+        Cell::SmallText(inline)
+    } else {
+        Cell::Text(Arc::clone(arc))
+    }
+}
+
 thread_local! {
     static ORDERS_ROW_POOL: std::cell::RefCell<Vec<Row>> = const { std::cell::RefCell::new(Vec::new()) };
 }
@@ -31,8 +42,11 @@ pub fn acquire_orders_row() -> Row {
 }
 
 #[inline]
-pub fn release_orders_row(row: Row) {
+pub fn release_orders_row(mut row: Row) {
     if row.len() == 3 {
+        for v in row.values_mut() {
+            *v = Cell::Null;
+        }
         ORDERS_ROW_POOL.with(|pool| {
             let mut p = pool.borrow_mut();
             if p.len() < 128 {
@@ -57,7 +71,8 @@ pub(super) struct RecycledIdTitle {
     pub(super) rows: Vec<Row>,
 }
 
-pub(super) static ID_TITLE_POOL: std::sync::Mutex<Option<RecycledIdTitle>> = std::sync::Mutex::new(None);
+pub(super) static ID_TITLE_POOL: std::sync::Mutex<Option<RecycledIdTitle>> =
+    std::sync::Mutex::new(None);
 
 thread_local! {
     pub(super) static LAST_ID_TITLE_META: std::cell::Cell<(u64, u64, usize, usize)> =
@@ -77,6 +92,13 @@ pub fn release_id_title_rows(rows: Vec<Row>) {
     }
 }
 
+pub(crate) fn take_recycled_id_title_vec() -> Option<Vec<Row>> {
+    ID_TITLE_POOL
+        .lock()
+        .ok()
+        .and_then(|mut guard| guard.take().map(|r| r.rows))
+}
+
 #[inline]
 pub(super) fn row_matches_id_title(row: &Row, id: &Arc<str>, title: &Arc<str>) -> bool {
     if row.len() != 2 {
@@ -91,7 +113,6 @@ pub(super) fn row_matches_id_title(row: &Row, id: &Arc<str>, title: &Arc<str>) -
     };
     k1 == "id" && k2 == "title" && Arc::ptr_eq(v1, id) && Arc::ptr_eq(v2, title)
 }
-
 
 /// Compact inline string storage for strings up to 22 bytes.
 ///
@@ -543,13 +564,14 @@ pub fn row_text<'a>(row: &'a Row, key: &str) -> Option<&'a str> {
     row.get(key).and_then(Cell::text)
 }
 
-
 #[inline]
 pub(crate) fn intern_wing(wing: Arc<str>) -> Arc<str> {
     static WING_RAG: std::sync::LazyLock<Arc<str>> = std::sync::LazyLock::new(|| Arc::from("rag"));
     static WING_SYS: std::sync::LazyLock<Arc<str>> = std::sync::LazyLock::new(|| Arc::from("sys"));
-    static WING_CORE: std::sync::LazyLock<Arc<str>> = std::sync::LazyLock::new(|| Arc::from("core"));
-    static WING_TEST: std::sync::LazyLock<Arc<str>> = std::sync::LazyLock::new(|| Arc::from("test"));
+    static WING_CORE: std::sync::LazyLock<Arc<str>> =
+        std::sync::LazyLock::new(|| Arc::from("core"));
+    static WING_TEST: std::sync::LazyLock<Arc<str>> =
+        std::sync::LazyLock::new(|| Arc::from("test"));
     match wing.as_ref() {
         "rag" => Arc::clone(&WING_RAG),
         "sys" => Arc::clone(&WING_SYS),
@@ -590,7 +612,6 @@ pub fn project_fields(row: &Row, fields: &[String]) -> Row {
     }
     out
 }
-
 
 pub fn now_ms() -> i64 {
     SystemTime::now()
@@ -690,4 +711,3 @@ fn civil_from_days(days: i64) -> (i32, u32, u32) {
     let y = if m <= 2 { y + 1 } else { y };
     (y as i32, m, d)
 }
-

@@ -1,30 +1,213 @@
-# Lin — план 2000 улучшений, исправлений и развития
+# Lin — план развития
 
-Срез: **2026-10-21**, исходный коммит `1a43ca59bdc3a22e89733091b564b2ecb42e210b`. Ровно **2000 самостоятельных пунктов**, 50 областей, без пропущенных диапазонов. Это предлагаемый backlog, **не 2000 доказанных дефектов и не 2000 обещанных ускорений**. Производственный код этим планом не меняется.
+Срез: **2026-11-13**, коммит `ba8f8cac5` (релиз 0.7.0) плюс незакоммиченное рабочее дерево. Единый документ: заменяет `roadmap-2000.md`, `roadmap-2000.json` и `perf-olap-roadmap-2026-11-13.md`.
 
-ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Явные зависимости выполняются раньше зависимой задачи, даже если их rank ниже. Приоритет — инженерная оценка риска/пользы для текущей цели, а не измеренный рейтинг отдачи. Сначала проверить наличие/корректность функции: уже покрытый пункт закрывается как `covered`, а не реализуется повторно. Дизайн и проверки — отдельные результаты, они не объявляются исправлениями без reproducer.
+Открыто **1811** пунктов backlog из исходных 2000 и 10 пунктов OLAP-плана (P1.0, P1.2, P1.4–P4.2). Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
 
-## Актуализация плана — 2026-10-26
+## Что убрано при актуализации
 
-План содержит ровно **2000 пунктов в 50 областях**. Стабильные ID, зависимости, приоритеты и критерии приёмки сохранены. Проверенный исходный срез этой актуализации: `e05ac74b5ac6276f054b5d29a2215ae655441161`. Это план работ; реализация всех пунктов этой актуализацией не выполнялась.
+- **172 пунктов со статусом `done`** в исходном плане. Они не переаттестовывались на текущем коде: удалены по записанному статусу.
+- **8 пунктов, реализованных после среза 2026-10-26** (проверено по коду):
+  - `LIN-0690` Спроектировать dictionary text columns: `DictColumn` / `MmapDictCol`.
+  - `LIN-0742` Спроектировать spillable hash aggregation: `spill_partition_aggregate` в `src/exec/agg.rs`.
+  - `LIN-0935` Спроектировать prefix term queries: `prefix*` в `src/fts.rs`.
+  - `LIN-0853` Спроектировать ROWS frame syntax: `WindowFrame` / `rows between` в `src/window.rs`.
+  - `LIN-0386` Спроектировать partial index predicates: partial index predicate в `src/catalog.rs`.
+  - `LIN-0457` Спроектировать parameter placeholder syntax: `$name` → `Value::Param` в `src/parse.rs`.
+  - `LIN-1253` Спроектировать chunked cold columns: колоночные mmap-сегменты `DiskEngine`.
+  - `LIN-1273` Спроектировать explicit warmup API: `DiskEngine::warm_table_into_hot_cache`.
+- **9 пунктов, закрытых при сверке 2026-11-13 в ходе выполнения плана** (покрыты существующим кодом или сделаны в этой сессии):
+  - `LIN-0758` Добавить aggregate-state memory budget: `Quotas::max_aggregate_bytes`, проверяется во всех агрегатных путях.
+  - `LIN-1446` Спроектировать resource-limit configuration: `Quotas` и `Db::with_quotas`.
+  - `LIN-1462` Добавить explicit durability options: `OpenOpts { sync }`, `Db::with_sync_mode`.
+  - `LIN-1533` Добавить query file execution: `lin run --file`.
+  - `LIN-1537` Добавить dry-run plan command: команда `lin explain` и `lin run --explain`.
+  - `LIN-0692` Спроектировать dense numeric columns: `Column::{Int, Time, Float, Bool}` в `src/batch.rs` (эта сессия).
+  - `LIN-0713` Добавить batch byte-size estimation: `RecordBatch::byte_size`.
+  - `LIN-1311` Спроектировать batched async writes: group commit в `AsyncDb::execute` / `execute_prepared` (эта сессия).
+  - `LIN-1254` Спроектировать lazy field decoding: `DiskEngine::scan_filter_late`, `get_projected_by_id` (эта сессия).
+- Исторические разделы (срезы 2026-10-21, 2026-10-24, 2026-10-26, «Первые 25 пунктов») и зависимости от закрытых задач.
+- Ссылки областей D05 и D32 на удалённый `src/cold.rs` заменены на `src/disk/mod.rs`: legacy cold tier заменён единым `DiskEngine`, пункты про cold-хранение теперь относятся к нему.
 
-**Исправление учёта:** исторический `done` у LIN-0001–LIN-0004 был снят при актуализации. Затем LIN-0003 закрыт новой [full-engine квалификацией shared persistent encoder](../benches/results/2026-10-26-wal-persistent-engine/report.md): durable10k быстрее SQLite в12/12 процессов, с двумя conventional и двумя interleaved повторами. LIN-0004 затем закрыт [свежей read matrix b7195e2](../benches/results/2026-10-26-persistent-peer-refresh/report.md):108/108 агрегированных и324/324 within-process побед на available peers. LIN-0001 и LIN-0002 остаются `qualification`. LIN-0005 закрыт: [реальный выделенный MSSQL endpoint на native x86 CI](../benches/results/2026-10-26-mssql-native-ci/report.md) прошёл функциональную квалификацию; метрики доступны в приватном зашифрованном отчёте. Kusto ещё не измерен. Остальные исторические статусы не переаттестованы. Для них перед исполнением нужен аудит evidence; число `done` не является числом проверенных сегодня возможностей.
+ID `LIN-xxxx` и `Rank` стабильны и не перенумеровывались, поэтому в них есть пропуски. Остальные пункты со статусами `candidate` и `qualification` по коду поштучно не сверялись: перед взятием пункта сначала проверить, не покрыт ли он уже.
 
-Последняя [полная квалификация WAL overlap](../benches/results/2026-10-26-wal-overlap-port/report.md) относится к прототипу на замороженном `e7abf40`, а не к текущему main. Прототип не принят: interleaved durable 1k показал −8,713%, лишь 1/6 положительных пар; A/A имел медианную абсолютную разницу 12,233%. Эти данные не доказывают причину регрессии, но не дают принять ускорение. CPU microbench не заменяет commit latency. Сохранённые кандидатные исходники не являются производственной реализацией.
+## Часть I. Производительность и OLAP-контур
 
-### Исполнимая очередь на текущем срезе
+Пункты ниже сверены с рабочим деревом 2026-11-13. P1.1 и P1.3 реализованы и удалены из плана; P1.0, P1.2, P1.4, P2.1, P2.2, P3.1, P3.2, P3.3, P4.1 и P4.2 реализованы частично, в них оставлена только несделанная часть. Что именно сделано — в разделе «Сделано 2026-11-13» в конце части I.
 
-Это обновление существующих 2000 задач, без создания дубликатов и без изменения исторических ID. Rank остаётся исходным порядком triage; таблица ниже задаёт ближайшие пакеты с учётом уже принятого кода. `done` означает исторический результат в его scope, а не обязательство повторно реализовать задачу и не квалификацию любого будущего бинарника.
+### 1. Текущий статус OLAP/HTAP-задатков
+
+#### Что уже реализовано
+- **Колоночный дисковый движок (`DiskEngine`, `src/disk/`):**
+  - Immutable `mmap`-сегменты + delta `MemTable` + bitset-tombstones (`SegmentTombstones`).
+  - Типизированное хранение колонок: плотные fixed-width массивы (`MmapFixedCol` для `Int64`, `Float64`, `Bool`, `Time64`), адаптивный словарь (`MmapDictCol` с `u16` ординалами и `build_dict_allow_bitset`), блочный Zstd-текст (`MmapTextCol` по 32 KiB с шардированным кэшем блоков) и векторные колонки (`MmapVecCol` с `f32`, `SQ8` и `IVF`).
+  - Zone-map метаданные (`FixedZoneMap` по 4096 строк) и zero-row агрегации (`count_cmp_and_optional_eq`, `count_text_contains`, `sum_f64_col`, `sum_f64_by_col`, `group_count_str1`/`2`/`3`).
+- **In-memory SoA и словарное сжатие (`src/store/`):**
+  - `DictColumn` (`Vec<u8>` индексы + автоматический spill при превышении 255 уникальных значений).
+  - Выделенные SoA-колонки для `docs`, `orders`, `users`, `facts` и плотный NUL-разделённый буфер `docs_title_packed` для многопоточного SIMD-скана через `memchr`.
+- **Батч-исполнение и аналитика:**
+  - `RecordBatch` (`src/batch.rs`) и `Db::run_batch` / `run_prepared_batch` (`src/exec/join.rs`, `src/exec/mod.rs`) для `filter? | project | skip* | take?` и FK-join `orders ⋈ users` без материализации `BTreeMap` на строку.
+  - Out-of-core spill-to-disk агрегации в 16 hash-партиций (`src/exec/agg.rs`) при превышении `max_aggregate_bytes`.
+  - Оконные функции (`src/window.rs`, `src/exec/eval.rs`): `row_number`, `rank`, `dense_rank`, `lead`, `lag`, `first_value`, `last_value`, `sum`, `avg`, `min`, `max`, `count` с партиционированием, сортировкой и фреймами `rows between ...`.
+  - Bitmap-индексы (`PostingList::Bitmap` на `Vec<u64>` в `src/index.rs`), Top-K partial sort (`select_nth_unstable_by`), morsel-driven CPU-параллелизм и опциональные GPU-кернелы `wgpu` (`src/exec/gpu_ops.rs`).
+- **Ускорение непроецированного курсора `LazyJoinSoa` (`src/store/value.rs`, `src/cursor.rs`):** `cell_from_arc_inline` (`SmallText` до 22 байт без аллокаций) + предсобранный шаблонный `Row` и однократный резолв колонок/пробника при открытии курсора (`join_inner/lin_cursor`: `805.7 µs` против `2,115.4 µs` у SQLite и `2,687.4 µs` у DuckDB — ускорение с `1,949.3 µs` в `2.42×`).
+- **Фундамент overlay-мутаций `DiskEngine` / `Store` (`src/disk/`, `src/store/mod.rs`, `src/store/checkpoint.rs`):** `apply_mem_overlay_op`, savepoints `begin_mem_savepoint` / `discard_mem_savepoint`, `drain_dirty_overlays`, инкрементальный сброс дельта-сегментов и tombstones `merge_overlay_and_flush` в `Store::write_snapshot`, отложенная пересборка `dirty_fts_disk` и WAL replay через `pack_to_disk_wal_ops`.
+
+#### Что сдерживает универсальный OLAP
+- In-memory SoA захардкожен под встроенные коллекции (`docs`, `orders`, `users`, `facts`), а пользовательские коллекции в памяти хранятся построчно в `Vec<Row>` (`BTreeMap<String, Cell>`).
+- Колонки в `RecordBatch` хранятся как `Vec<Vec<Cell>>` (24 байта на элемент с тегом enum), без плотных типизированных массивов и bit-packed null-масок.
+- Сложные многошаговые аналитические цепочки откатываются на материализацию `Vec<Row>`.
+- В шагах агрегации (`src/ast.rs`) вычисляется одна метрика за шаг и поддерживается группировка только по одному полю (`by: Option<Field>`).
+
+---
+
+### 2. Приоритет 1 — Быстрые победы с высоким ROI (`DiskEngine` и `agg.rs`)
+
+#### P1.0. Zero-Promote DML и транзакции поверх холодных таблиц (`DiskEngine` Overlay)
+- **Сделано:** одиночные `insert` (до 4096 строк, без рёбер), `update` и `delete` (точечные и по предикату) на cold-коллекции идут через overlay без `promote_disk_col`: проверки CAS, guards, FK и уникальности (`id`, `docs.uri`, одноколоночные уникальные индексы) выполняются по диску. Программы из нескольких таких операторов выполняются атомарно под savepoint overlay (`cold_overlay_program`): в WAL уходит один пакет, ошибка любого оператора откатывает всё. WAL replay и follower-apply накладывают пакеты на overlay даже при уникальных индексах. Кэш запросов `hot_cache` инвалидируется эпохой overlay. `fk_target_exists` читает холодную целевую коллекцию через `disk_has_key`, в том числе по `id` (раньше FK на холодную таблицу по `id` не находил строку). `Store::index_seek*` для дисковых коллекций возвращает `None` вместо чтения пустого placeholder-индекса.
+- **Проблема (осталось):** интерактивные транзакции (`src/exec/tx.rs`), программы с `cas each`, с `let` / запросами или со схемными декларациями, `insert` с рёбрами или больше 4096 строк, `update`, меняющий уникальный ключ, составные и частичные уникальные индексы и `Store::mem_backup` по-прежнему вызывают `promote_disk_col` / `collection_mut`. Любой DML при построенном HNSW тоже идёт через promote. Режим native disk (`Db::open` на каталоге `DiskEngine` без основного WAL) overlay-путь не использует.
+- **Решение (оставшаяся обвязка):**
+  1. В `src/exec/tx.rs` перевести cold-вставки и DML на overlay-путь и вызывать `commit_disk_overlay_savepoint` / `rollback_disk_overlay_savepoint` при `commit` / `rollback`.
+  2. Перенести учёт `cas each` (снимок хэшей и множество записанных строк) в overlay-путь; разрешить `let` и запросы внутри cold-программ.
+  3. Закрыть оставшиеся инварианты: отказ от `promote_disk_col` в `Store::mem_backup` / `mem_restore`; пропуск `is_disk_backed` в `rebuild_all_fts_inplace` и сброс `overlay_savepoint_fts = None` при `write_snapshot`.
+  4. Распространить overlay-путь на native disk, на коллекции с HNSW и на пакетную проверку уникальности для больших вставок.
+
+#### P1.2. Late Materialization и Zone-Map pushdown в `DiskEngine::query_filter`
+- **Сделано:** фильтрованный скан с проекцией (`scan_filter_late`) пропускает блоки по 4096 строк через `FixedZoneMap`, пропускает сегмент целиком, если словарь колонки не содержит ни одного подходящего значения, и декодирует выходные колонки только для прошедших строк. Конъюнкция range-сравнений по fixed-width колонкам и текстовых `==`, `in [...]`, `~` по словарным колонкам вычисляется напрямую по данным колонки без `Row`.
+- **Проблема (осталось):** `or` / `not`, `has`, regex и любые текстовые условия по блочно-сжатому тексту вычисляются через `eval_pred` по переиспользуемому `Row`; скан без проекции (`project_fields == None`) и путь через `extract_index_pushdown` материализуют полные строки.
+- **Решение:** битсет прошедших `rid` для смешанных предикатов (`or` / `not` поверх типизированных термов), тот же поздний декодинг для индексного пути и для скана без проекции.
+
+#### P1.4. Команды CLI для холодного уровня и совместимость формата
+- **Сделано:** zone map пишется в `col_<name>.zmap` при записи сегмента и читается при открытии. Кластерный ключ задаётся через `Db::set_cluster_key`, хранится в `DiskTableSchema::cluster_by` и переживает checkpoint, переоткрытие и повторный сброс коллекции после загрузки в память. По ключу сортируются сегменты при сбросе overlay и при сбросе коллекции из памяти; `Db::compact_collection` (или `DiskEngine::compact_table` / `vacuum` / `compact_table_clustered`) убирает удалённые строки, сливает сегменты и даёт глобальный порядок по ключу.
+- **Проблема (осталось):** CLI (`src/main.rs`) открывает базу через `Db::open` без опции cold tier, поэтому команд для кластерного ключа и компакции нет. Не проверено, что предыдущая версия бинарника читает манифест и WAL-кадр со схемой нового формата. Сброс кластеризованной коллекции из памяти клонирует её строки для сортировки.
+- **Решение:** опция cold tier и команды `cluster` / `compact` в CLI; тест на чтение нового формата старым кодом или версия формата кадра; сортировка индексов вместо клонирования строк при сбросе.
+
+---
+
+### 3. Приоритет 2 — Архитектурные рычаги (2–10× по CPU и памяти)
+
+#### P2.1. Замена `Row = BTreeMap<String, Cell>` на компактный слотовый кортеж по схеме
+- **Сделано:** на холодных таблицах `run_batch` для `filter? | project` и для FK-join не строит `Row` вообще: `DiskEngine::scan_cells` выдаёт позиционные ячейки по заранее разрешённым колонкам, и они попадают прямо в колонки `RecordBatch`. Это позиционный доступ без `BTreeMap`, но только на этих двух путях.
+- **Проблема (осталось):** тип `Row` остаётся `BTreeMap<String, Cell>` (`src/store/value.rs`), и на всех остальных путях (`eval_pred`, сортировка, окна, join, DML, in-memory хранилище, построчный `run`, курсоры) поля ищутся строковым сравнением по узлам дерева с клонированием `String`-ключей.
+- **Решение:** ввести унифицированный позиционный кортеж `(Arc<Schema>, SmallVec<[Cell; 8]>)` (по аналогии с `ProjectedRow` в `src/cursor.rs`) с резолвом `Field -> col_idx: u16` на стадии `compile` / `prepare`, обеспечив доступ к полю за O(1); переводить потребителей по одному, начиная с `eval_pred` и построчного `run` по холодным таблицам.
+
+#### P2.2. Динамический SoA по `Catalog` и батчевое исполнение сквозь цепочки
+- **Сделано:** колонки `RecordBatch` (`src/batch.rs`) — это `Column`: `Int` / `Time` / `Float` / `Bool` лежат плотными нативными буферами (8 или 1 байт на значение вместо 24-байтного `Cell`) с битовой маской null, которая создаётся только при первом null; текст, векторы и смешанные по типу колонки остаются `Vec<Cell>`. Писатель сегмента читает плотные колонки напрямую. Публичное поле `RecordBatch::cols` сменило тип с `Vec<Vec<Cell>>` на `Vec<Column>`.
+- **Проблема (осталось):** текст хранится как `Vec<Cell>`, словарного варианта колонки нет; SoA в `Store` (`src/store/mod.rs`) ограничен жёстко зашитыми коллекциями `docs`, `orders`, `users`, `facts`; батчевое исполнение покрывает только `filter? | project` и FK-join, цепочки `filter -> join -> agg -> sort` откатываются на `Vec<Row>`; ни одно ядро исполнителя пока не использует плотные буферы (есть только `Column::sum_f64`).
+- **Решение:** `Text` / `Dict` варианты `Column`, in-memory хранение типизированных коллекций каталога на тех же буферах, батчевые операторы агрегации и сортировки поверх `Column`.
+
+---
+
+### 4. Приоритет 3 — Параллелизм и операторы запросов
+
+#### P3.1. Morsel-driven многопоточная агрегация
+- **Сделано:** `DiskEngine::map_segments` (feature `parallel`, от 65 536 строк и двух сегментов) распараллеливает по сегментам `count_cmp_and_optional_eq`, `count_text_contains`, `sum_f64_col`, `sum_f64_by_col` и `group_count_*`; частичные результаты сливаются в порядке сегментов, поэтому итог не зависит от числа потоков.
+- **Проблема (осталось):** общие `agg_count_filtered` / `agg_sum_filtered` (`src/exec/agg.rs`) и скан внутри одного сегмента выполняются в один поток; выигрыш от параллельного пути не измерен.
+- **Решение:** морсели внутри сегмента с локальными массивами счётчиков по словарю и thread-local `FxHashMap` с финальным слиянием; для сумм по `f64` зафиксировать порядок слияния, чтобы результат не зависел от числа потоков.
+
+#### P3.2. Join по не-`id` полю, курсоры и пакетный probe поверх `DiskEngine`
+- **Сделано:** `join | project` с холодной левой или правой стороной идёт через `Db::join_disk_batch` и в `run_batch`, и в построчном `run` (он делегирует в batch-путь): левая сторона стримится ячейками через `DiskEngine::scan_cells`, правая читается `get_projected_by_id` по первичному ключу один раз на уникальный ключ; коллекции в память не загружаются.
+- **Проблема (осталось):** join без завершающей проекции, ленивые курсоры и join по не-`id` полю работают корректно, но читают холодную коллекцию через ленивую материализацию всех её строк в RAM. Probe идёт по одному ключу, без сортировки найденных `(seg_id, rid)`.
+- **Решение:** тот же дисковый probe для курсоров и непроекционных join; пакетный probe по `MmapHashIndex` с сортировкой `(seg_id, rid)` перед материализацией; probe по вторичному индексу для не-`id` ключа.
+
+#### P3.3. Фреймы окна по плоскому буферу значений
+- **Сделано:** сортировка партиции идёт по массиву индексов `Vec<u32>` над плоским буфером заранее извлечённых ключей; партиционирование хранит каждый ключ один раз и раскладывает строки по индексу партиции; `rank` и `dense_rank` берут признак совпадения соседних строк из того же буфера ключей.
+- **Проблема (осталось):** `lead` / `lag`, `first_value` / `last_value` и агрегаты по фрейму ищут значение целевого поля через `BTreeMap::get` на каждую строку (у `sum` — дважды: проверка типа и накопление); строки партиции физически переставляются.
+- **Решение:** извлекать значение целевого поля один раз на партицию в плоский буфер и считать функции по нему; писать результат по индексам без перестановки строк.
+
+---
+
+### 5. Приоритет 4 — Запись, Bulk Ingest и Durable I/O
+
+#### P4.1. Колоночный Bulk Ingest на уровне `Db` (`Appender` / `insert_batch`)
+- **Сделано:** писатель сегмента читает колонку через `ColSrc` / `SegSrc` (`src/disk/segment.rs`), а `DiskEngine::write_bulk_segment_batch` пишет сегмент прямо из `RecordBatch` без промежуточных `Row`; данные и кодировки колонок совпадают с построчным путём. Это bulk-load, не upsert: повторяющийся или уже существующий `id` отклоняется.
+- **Проблема (осталось):** метод доступен только на уровне `DiskEngine` и не логируется в WAL; `Db` и `DiskWalOp::UpsertBatch` по-прежнему принимают `&[Row]`, in-memory SoA заполняется построчно; нет проверки FK, уникальных индексов, эмбеддингов и FTS для колоночного пути.
+- **Решение:** `Db::insert_batch` / `Appender` поверх `write_bulk_segment_batch` с проверками каталога и durable-записью (WAL-кадр или fsync сегмента с атомарной сменой манифеста); колоночный вариант `DiskWalOp`.
+
+#### P4.2. Preallocated WAL-сегменты фиксированного размера и group commit вне `AsyncDb`
+- **Сделано:** `AsyncDb::execute` и `AsyncDb::execute_prepared` объединяют конкурентные записи в группу: первый получивший блокировку писателя исполняет все ожидающие операторы по порядку (каждый атомарен сам по себе) и делает один sync WAL через `Db::execute_group_sync`. Явный атомарный `Db::run_group` и разовая преаллокация WAL через `F_PREALLOCATE` были и раньше.
+- **Проблема (осталось):** `AsyncDb::run`, `run_stmt`, `run_prepared` (возвращают строки) и транзакции группу не используют; синхронный `Db` с одним вызывающим потоком по-прежнему платит один `fcntl(F_FULLFSYNC)` на коммит (около 94% времени `durable_insert_1k` по [benchmark-results-2026-11-10.md](benchmark-results-2026-11-10.md)); длина файла WAL обновляется в ФС на каждый коммит.
+- **Решение:** распространить очередь на остальные пишущие методы `AsyncDb`; циклическое переиспользование заранее размеченных WAL-файлов фиксированного размера, чтобы исключить обновление метаданных длины файла.
+
+---
+
+### 6. Сводная матрица приоритизации и верификации
+
+| Пункт | Сложность | Ожидаемый эффект | Целевые бенчмарки / проверки |
+|---|---|---|---|
+| **P1.0** Zero-promote DML: интерактивные транзакции, `cas each`, native disk, HNSW | Средняя | `100×+` на cold DML внутри транзакций | cold rollback/WAL tests, `cold_update_1row_10k`, `cold_delete_1row_10k` |
+| **P1.2** Смешанные предикаты (`or` / `not`), индексный путь, скан без проекции | Средняя | 2–5× на фильтрах с `or` и на индексном пути | `cargo test` (`disk`), `cold_range_project`, сканы по Zstd-тексту |
+| **P1.4** CLI для холодного уровня, совместимость формата | Низкая | Управление кластеризацией без кода на Rust | `cargo test` (`disk`, `persist`), `cold_filter_range` |
+| **P2.1** Слотовый `Row` по схеме вместо `BTreeMap` на остальных путях | Высокая | 2–5× на общих запросах, join, window, DML | Вся матрица `cargo bench --bench compare` |
+| **P2.2** Текстовые и словарные колонки, динамический SoA, батчевые `agg` / `sort` | Высокая | SIMD-векторизация сквозь `filter \| join \| agg \| sort` | `join_inner`, `join_filter`, `agg_sum*`, `run_batch` |
+| **P3.1** Морсели внутри сегмента, общие `agg_*_filtered` | Средняя | Почти линейный скейл по ядрам на больших таблицах | `agg_sum_by`, `count_by` при `LIN_BENCH_N >= 100000`, `--features parallel` |
+| **P3.2** Курсоры, join без проекции и по не-`id`, пакетный probe | Средняя | Join без загрузки правой таблицы в RAM на оставшихся путях | `join_inner` / `join_filter` на дисковых таблицах, `cold_join_*` |
+| **P3.3** Фреймы по плоскому буферу значений | Низкая | 1.2–1.5× на `sum` / `lead` / `lag` по большим партициям | `cargo test` (`exec`, `window`), window-бенчмарки |
+| **P4.1** `Db::insert_batch` / `Appender`, durable колоночный путь | Средняя | Снятие оверхеда `BTreeMap` на 100k+ вставке | `insert_bulk_1k`, `insert_bulk_10k`, 100k peer matrix |
+| **P4.2** WAL-сегменты фиксированного размера, группа для остальных методов | Высокая | Рост TPS при конкурентном `SyncMode::Full` вне `execute` | `durable_insert_*`, `durable_append_log_*` |
+
+---
+
+### 7. План расширения бенчмарков `cold_*` и тестов
+
+#### Сравнительные бенчмарки в `benches/compare.rs` (тег `.tag("cold")`)
+Все сравнения раздела добавлены. Осталось: вариант `cold_update_1row` / `cold_delete_1row` с одинаковой для обоих движков семантикой sync (сейчас SQLite использует обычный `fsync`, Lin — `F_FULLFSYNC`) и DuckDB в качестве третьего peer.
+
+#### Обязательные интеграционные проверки
+- Подтвердить, что cold `point_update`, `point_delete`, `insert` (1-row и batch), `update` и `delete` с предикатом не вызывают `promote_disk_col` (`is_disk_backed == true`), корректно проверяют CAS и сразу видны в `point_get`, `filter_eq`, `filter_range`, `text_substr`, `count by`, `search lex`, `agg_sum*` и `join`.
+- Проверить `Transaction::rollback()` (включая `tx.run_prepared`, одиночную вставку `tx.run` и многошаговый `Undo::Full`): восстановление точных строк, счётчиков и FTS при сохранении `is_disk_backed == true`.
+- Проверить WAL replay при переоткрытии БД **без** `checkpoint()`, а также `db.checkpoint()` + reopen (сброс дельта-сегментов, tombstones и FTS).
+- Финальная приёмка: `cargo check --all-targets` (`0` предупреждений), `cargo test --release` (`100%` pass), превосходство Lin `>= 5%` над SQLite и DuckDB на всех сравнительных бенчмарках и успешный проход `AIRBUG_HUB="" ./scripts/ci-bench.sh` (`scripts/check-bench-budget.py` exit `0`).
+
+### Сделано 2026-11-13
+
+Реализовано поверх рабочего дерева; `cargo test --release` проходит целиком, cold-тесты проходят и с `--features parallel`.
+
+- **P1.1 (закрыт).** `execute_disk_agg_plan` и `execute_filter_count_cached` (`src/exec/agg.rs`) вызывают `count_cmp_and_optional_eq`, `count_text_contains`, `sum_f64_col`, `sum_f64_by_col`; проекция передаётся в `query_filter` и при наличии фильтра. Быстрый путь включается только когда тип значения совпадает с типом колонки по правилам `cmp_cell`.
+- **P1.3 (закрыт).** `DiskEngine::group_count_cells1` отдаёт `FxHashMap<Cell, i64>` напрямую, переиспользуя готовые ячейки словаря.
+- **P1.2 (частично).** `DiskEngine::scan_filter_late`, `MmapFixedCol::{zone_block_skips, fixed_rhs, cmp_at}`, ядра `==` / `in` / `~` по кодам словаря с отсечением сегмента, переиспользование строк формы `{ id, title }`.
+- **P1.4 (частично).** Персистентный `col_<name>.zmap` с CRC32C; `DiskTableSchema::cluster_by`, `Db::set_cluster_key` / `Db::cluster_key` / `Db::compact_collection`, `compact_table_clustered`, сортировка по ключу при компакции, сбросе overlay и сбросе коллекции из памяти.
+- **P1.0 (частично).** Одиночные cold `insert` / `update` / `delete` и атомарные программы из них через overlay (`cold_overlay_insert`, `cold_overlay_update`, `cold_overlay_delete`, `cold_overlay_program` в `src/exec/mod.rs`), эпоха кэша запросов, `Store::can_apply_disk_overlay`, исправление FK на холодную целевую коллекцию, `Store::index_seek*` возвращает `None` для дисковых коллекций. Исправлено точечное чтение по `id` / `docs.uri` из холодной коллекции после её ленивой материализации (например, после `search lex`): раньше оно уходило в пустые in-memory карты строк и не находило строку. `Store::row_index` / `get_by_id` / `get_by_uri` для дисковых коллекций работают через лениво материализованные строки с картой по `id` (`LazyRows`), так что пути без проекции (например, join без `{ ... }`) находят строки холодных таблиц.
+- **P2.1 (частично).** Пути `run_batch` по холодным таблицам без `Row` (`DiskEngine::scan_cells`, `has_index_pushdown`). `cold_range_project`: 196 мкс через `run_batch` против 355 мкс через построчный `run` (SQLite 540 мкс, DuckDB 727 мкс).
+- **P2.2 (частично).** `Column` и `Validity` в `src/batch.rs`, типизированное чтение в `ColSrc`. По быстрому замеру стоимость для join в пределах шума: `cold_join_inner` 774 мкс с типизированными колонками против 757 мкс с принудительно общим вариантом.
+- **P3.1 (частично).** `DiskEngine::map_segments`.
+- **P3.3 (частично).** Индексная сортировка партиций окна, партиционирование по индексу без дублирования ключей, ранги по буферу ключей сортировки.
+- **P3.2 (частично).** `Db::join_disk_batch` для `run_batch`: левая сторона стримится ячейками через `DiskEngine::scan_cells`, правая читается `get_projected_by_id` один раз на ключ.
+- **P4.1 (частично).** `ColSrc` / `SegSrc`, `DiskEngine::write_bulk_segment_batch`, `infer_schema_from_batch`.
+- **P4.2 (частично).** Group commit в `AsyncDb::execute` и `execute_prepared`, `Db::execute_group_sync`. Разовый замер на этой машине, 200 durable-вставок в `docs`: последовательно 49–85 мс, конкурентно 2,9–4,6 мс (три прогона). Сравнения с конкурентными вставками до изменения не делалось.
+- **Раздел 7 (закрыт по составу кейсов).** Добавлены `cold_filter_range`, `cold_text_substr`, `cold_range_project`, `cold_agg_sum`, `cold_agg_sum_by`, `cold_join_inner`, `cold_join_filter` для Lin, SQLite и DuckDB (peers на файле, не в памяти), `cold_update_1row_10k` и `cold_delete_1row_10k` для Lin и SQLite с проверкой, что `docs` остаётся на диске.
+- **Тесты** в `tests/persist.rs`: `cold_aggregates_match_in_memory`, `cold_filter_zone_skipping_matches_in_memory` (включая повреждённый `.zmap`), `cold_multi_segment_aggregates_match_in_memory` (сравнение cold с in-memory на тех же данных), `cold_point_update_delete_stay_disk_backed` и `cold_insert_stays_disk_backed` (overlay, уникальность, FK, WAL replay, checkpoint + reopen); `cold_join_batch_matches_in_memory`; `cold_multi_statement_program_is_atomic`; `cold_cluster_key_survives_promotion_and_respill`; `cold_compact_collection_orders_by_cluster_key`; `async_group_commit_is_durable_and_per_statement`. В `src/disk/tests.rs`: `clustered_compaction_orders_rows_and_tightens_zone_maps`, `bulk_segment_from_record_batch_matches_row_path`, `table_schema_without_cluster_key_still_decodes`. Сравнения cold с in-memory идут с явным `take all`: без него запрос неявно ограничен 50 строками, а порядок строк у уровней разный. В `src/batch.rs`: пять тестов на `Column` (типизация, откат к `Cells`, маска null на границах слов, `truncate` / `drain_prefix` / `extend`, совпадение строк `RecordBatch`).
+
+Замер `cargo bench --bench compare -- --profile quick --filter cold_`, 10 000 документов, один процесс, 8 сэмплов, медиана. Это быстрый профиль без чередующихся process-pairs, по [контракту бенчмарков](benchmark-contract.md) он не является приёмочным.
+
+| Кейс | Lin | SQLite | DuckDB |
+|---|---:|---:|---:|
+| `cold_filter_range` | 9,7 мкс | 68,3 мкс | 100,8 мкс |
+| `cold_text_substr` | 10,7 мкс | 298,3 мкс | 142,9 мкс |
+| `cold_range_project` | 371,5 мкс | 552,9 мкс | 718,3 мкс |
+| `cold_agg_sum` | 8,5 мкс | 186,0 мкс | 51,8 мкс |
+| `cold_agg_sum_by` | 299,7 мкс | 1286,2 мкс | 346,2 мкс |
+| `cold_join_inner` | 680,7 мкс | 2209,9 мкс | 1245,0 мкс |
+| `cold_join_filter` | 361,8 мкс | 1241,2 мкс | 766,5 мкс |
+| `cold_update_1row_10k` | 835,9 мкс | 264,0 мкс | — |
+| `cold_delete_1row_10k` | 992,1 мкс | 405,5 мкс | — |
+
+`cold_range_project` до типизированного ядра и переиспользования строк давал 738 мкс и проигрывал SQLite. Значения «до» для `cold_filter_range` и `cold_text_substr` не снимались. Между двумя прогонами цифры SQLite и DuckDB расходились в 2–3 раза (`cold_text_substr/sqlite` 664 и 298 мкс), поэтому отношения к peers ориентировочные. `cold_join_inner` и `cold_join_filter` до потоковой выдачи ячеек левой стороны давали 2757 и 974 мкс: первый проигрывал обоим peers, второй — DuckDB. В `cold_update_1row_10k` и `cold_delete_1row_10k` Lin проигрывает SQLite в 2,5–3 раза: каждый сэмпл — первая мутация на только что открытой базе, а время определяется sync (у Lin `F_FULLFSYNC`, у SQLite обычный `fsync`). Отдельный разовый замер: холодный `update` в установившемся режиме 360–470 мкс при 325 мкс на обычный durable-коммит в in-memory таблицу, то есть сам overlay-путь почти ничего не добавляет. Последующие прогоны `cold_join_inner` давали 775–825 мкс вместо 681 мкс; эксперимент исключил типизированные колонки как причину, сама причина не установлена (возможно, шум между прогонами).
+
+
+## Часть II. Общий backlog
+
+### Исполнимая очередь
 
 | Пакет | Задачи | Конкретный результат и условие перехода |
 |---|---|---|
-| 1. Доказательства | LIN-0029, LIN-0030, LIN-0001–LIN-0004 | Сопоставить текущие source/binary hashes с отчётами. Перезапускать затронутые сценарии; широкую peer matrix — на итоговом кандидате. Разделить native/Full durable, cold/warm и размеры 1k/10k/100k. |
-| 2. Измеренный проигрыш | LIN-0002, LIN-0081–LIN-0084 | Закрывать SQLite Full durable1k по свежему профилю одной гипотезой за раз. Уже принятые persistent worker, O(1) hint и NEON writer повторно не внедрять. Два набора минимум по шесть process-pairs, A/A, 10k и граничные контроли; сохранять проигрыши. |
+| 1. Доказательства | LIN-0001 | Сопоставить текущие source/binary hashes с отчётами. Перезапускать затронутые сценарии; широкую peer matrix — на итоговом кандидате. Разделить native/Full durable, cold/warm и размеры 1k/10k/100k. |
+| 2. Измеренный проигрыш | LIN-0002 | Закрывать SQLite Full durable1k по свежему профилю одной гипотезой за раз. Уже принятые persistent worker, O(1) hint и NEON writer повторно не внедрять. Два набора минимум по шесть process-pairs, A/A, 10k и граничные контроли; сохранять проигрыши. |
 | 3. Выбор WAL codec | LIN-0045, LIN-0046, LIN-0065, LIN-0071, LIN-0080 | Для dictionary сначала ограничить цену неудачного выбора на high-cardinality/dense/zero и скрытых поздних выбросах. Затем отдельно проверить настоящий frame, общий decoded budget, старый reader, replay и rollback миграции. CPU-прототип не включает default writer автоматически. |
 | 4. Сохранность данных | D02–D06, D43 | Переиспользовать существующие oracle/fault injection; дополнить конкретные пробелы. Последний подтверждённый commit, mixed codecs, checkpoint, backup/follower и ошибки диска. Воспроизведённая потеря данных опережает performance. |
 | 5. Память записи | LIN-0321–LIN-0328, LIN-0332, LIN-0349 | Сначала измерить allocations, hit rate и retained bytes существующих пулов. Любой новый reuse должен пройти cold start, полный жизненный цикл с Drop, лимиты, alias isolation и ошибки. Не переносить освобождение памяти за таймер ради результата. |
-| 6. Группировки | D19, LIN-0758 | Расширять покрытие от уже принятого fixed-text single-key COUNT: много ключей, другие агрегаты, mixed numeric/NaN/zero, Unicode и quota exhaustion. Не считать узкий index-only fast path реализацией произвольного GROUP BY. |
-| 7. Все восемь peers | LIN-0005–LIN-0008, D01 | SQLite, DuckDB, PostgreSQL, MySQL, MSSQL, MongoDB, Kusto, pandas: одинаковый объявленный контракт и независимый readback. MSSQL — реальный native CI, comparative evidence приватно. Kusto — только реальный разрешённый endpoint; до него измерение отсутствует. |
+| 6. Группировки | D19 | Расширять покрытие от уже принятого fixed-text single-key COUNT: много ключей, другие агрегаты, mixed numeric/NaN/zero, Unicode и quota exhaustion. Не считать узкий index-only fast path реализацией произвольного GROUP BY. |
+| 7. Все восемь peers | LIN-0006, D01 | SQLite, DuckDB, PostgreSQL, MySQL, MSSQL, MongoDB, Kusto, pandas: одинаковый объявленный контракт и независимый readback. MSSQL — реальный native CI, comparative evidence приватно. Kusto — только реальный разрешённый endpoint; до него измерение отсутствует. |
 | 8. Запросы и поиск | D10–D28, D31 | Выбирать по профилю: selectivity/skew, cardinality, ширина строк, index maintenance, joins/windows, FTS/vector и graph. Новая функция требует пользовательского сценария; ускорение — контроля fallback и стоимости обновлений. |
 | 9. Ограниченные ресурсы | D09, D17–D18, D29–D36, D45 | RSS, streaming/backpressure, cancellation, readers/writer, CPU/GPU equivalence, replication recovery. Поддержка компиляции GPU не равна проверке на физическом устройстве. |
 | 10. Поставка и API | D37–D44, D46–D50 | Стабильные API, schema/import/export, CLI и диагностика, воспроизводимая сборка, platform CI и документация. После каждого среза — runnable пример, релевантные проверки и ссылка на evidence. |
@@ -37,30 +220,7 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 
 Производительность принимать по [контракту бенчмарков](benchmark-contract.md). Новый [платформенный CI gate](../benches/results/2026-10-26-linux-ci-refresh/report.md) отделяет исторические абсолютные лимиты от same-run сравнений SQLite/DuckDB; изменение gate само по себе не ускоряет БД. Превосходство над всеми восемью peers остаётся отдельным незавершённым итоговым условием.
 
-## Порядок исполнения — историческая актуализация 2026-10-24
-
-Полный список ниже сохраняет стабильные ID и исходный порядок triage. Статусы `done` относятся к ранее сохранённой квалификации: они не доказывают превосходство текущего бинарника. Перед исполнением очереди сверять их с [историей измерений](benchmark-history.md) и конкретными raw reports. Проверка `python3 scripts/check-roadmap-2000.py` подтверждает структуру 2000 пунктов, но не корректность функций или актуальность статусов.
-
-Рабочие этапы, без обещания сроков:
-
-1. **Актуализировать доказательства:** LIN-0029, LIN-0030, LIN-0004. Зафиксировать source/binary hashes, текущие контракты и исходные измерения; сопоставить уже выполненные задачи с доказательствами. Сохранить прежние результаты как исторические.
-2. **Закрывать измеренные проигрыши записи:** LIN-0001–LIN-0003 после проверки текущих результатов; профили LIN-0081–LIN-0084 использовать для выбора одной гипотезы. Проверять CPU, commit latency, cold start, RSS и объём файлов отдельно. WAL preallocation впоследствии принят; актуальные границы и отчёты см. в истории измерений. Это не закрывает автоматически SQLite gap.
-3. **Доказать сохранность данных:** области D02–D06 и D43. Приоритет — последний подтверждённый commit, повреждённые/усечённые frames, rollback, совместимость reader/writer и checkpoint. Process-exit replay и физическое отключение питания — разные проверки.
-4. **Сопоставить все восемь peers:** LIN-0005–LIN-0008 и D01. SQLite, DuckDB, PostgreSQL, MySQL, MSSQL, MongoDB, Kusto и pandas проверять на явно согласованных сценариях. Недоступные MSSQL/Kusto сохраняют внешний блокер; mock-тесты адаптера не заменяют измерения сервера.
-5. **Ускорять запросы по профилю:** D10–D22, затем D23–D28. Проверять selectivity, skew, cardinality, размеры, Unicode и crossover; отдельно измерять построение/обновление индекса и выполнение запроса.
-6. **Ограничить ресурсы:** D09, D17–D18, D29–D34 и D45. Проверить bounded memory, streaming, отмену, backpressure, большие результаты, concurrent readers/writer и CPU/GPU equivalence.
-7. **Развивать продуктовые возможности:** D15, D21–D22, D31 и D35–D38, D46–D47. Для каждого пункта сначала подтвердить потребность и наличие текущей реализации, затем описать API, ошибки, лимиты и миграцию.
-8. **Закрепить эксплуатацию:** D39–D44 и D48–D50. Воспроизводимые сборки, диагностика, fault injection, platform CI, runnable примеры и проверенные процедуры восстановления.
-
-В работе — одна performance-гипотеза и её контроль. После каждого завершённого пункта: результат, ссылка на evidence, ограничения и обновлённый статус в обеих версиях списка. Переход к следующему этапу определяется зависимостями и риском, а не закрытием всех 40 пунктов каждой области. Цель превосходства над всеми peers остаётся отдельным итоговым gate.
-
-## Историческая исходная точка — 2026-10-21
-
-Последние [парные native/durable замеры](../benches/results/2026-10-21-current-native-durable/report.md): native 1k Lin 0,998 мс / SQLite 0,974 мс, 0/6 побед; native 10k — 12,832 / 13,019 мс, 5/6; durable 1k — 2,731 / 2,162 мс, 1/6; durable 10k — 20,716 / 18,092 мс, 1/6. Межпроцессная вариативность велика. Старые матрицы чтения и результаты 6 октября нельзя переносить на изменившийся main без повторного запуска. MSSQL и Kusto не настроены.
-
-В коде уже существуют SSO, HNSW/SQ8, row pooling, hash grouping, hardware CRC32C, streaming cursors, index/FTS fast paths и GPU-вычисления. Их названия в плане означают проверку инвариантов, измерение границ или развитие; не утверждение, что механизм отсутствует. Общая цель — проверяемое превосходство на согласованных сценариях против SQLite, DuckDB, PostgreSQL, MySQL, MSSQL, MongoDB, Kusto и pandas — сохраняется целиком.
-
-## Как исполнять
+### Как исполнять
 
 1. Начать с первых задач ниже; одновременно вести не более одной performance-гипотезы в одном benchmark checkout.
 2. Перед изменением записать контракт, источники, baseline, ресурсы и критерий отказа. Пункт `qualification` не предполагает заранее наличия ошибки.
@@ -71,7 +231,7 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 7. После каждого принятого изменения обновлять затронутые измерения и статус задач, не сдвигая стабильные ID.
 8. Завершение всего backlog не равно автоматически завершению benchmark-цели: нужен отдельный audit всех named peers и сценариев.
 
-## Очереди исполнения
+### Волны
 
 - **Волна A:** current baseline, CRC/format и Cell Hash/Eq qualification, profiling WAL, unmatched peer contracts.
 - **Волна B:** native 1k и durable 1k/10k; сначала текущий профиль, затем по одному кандидату.
@@ -82,7 +242,7 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 
 Пункты из разных волн могут понадобиться раньше при подтверждённом дефекте. Здесь нет календарного обещания реализовать все 2000.
 
-## Обозначения
+### Обозначения
 
 - `P1` — первый triage: текущий bottleneck, совместимость, ресурсы или потенциально значимый инвариант. Не синоним подтверждённого critical bug.
 - `P2` — следующий слой развития и квалификации.
@@ -91,7 +251,7 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 - `S/M/L` — приблизительный объём исследования, не срок и не измеренная трудоёмкость.
 - Связь с файлом означает релевантный модуль для triage, не найденный дефект на каждой его строке.
 
-## Критерии готовности
+### Критерии готовности
 
 - **G-PERF** (Оптимизации и измерительные гипотезы): Независимый oracle сохраняет значения/порядок/ошибки; baseline/candidate одного контракта, два набора ≥6 чередующихся process-pairs, контроль SQLite, 1k/10k native+durable при изменении записи; сохранить raw samples/hash/версии/RSS. Смешанный результат не считать ускорением.
 - **G-CORRECT** (Корректность и границы): Сначала минимальный reproducer или формальная ambiguity, затем согласованный контракт и независимый oracle. До исправления тест воспроизводит проблему; после исправления проходят релевантные rollback/reopen/replay и границы. Если реализация уже корректна, записать covered, не менять код.
@@ -103,153 +263,19 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 
 Для каждой строки итоговый критерий — её конкретный результат плюс указанный gate. Если критерий требует недоступной платформы/endpoint, статус остаётся непроверенным; mock/compile не заменяет live qualification.
 
-## Первые 25 пунктов
+### Приоритетный список — 1811 пунктов
 
-1. **LIN-0001: Закрыть native 1k SQLite gap** — P1, qualification, G-PERF.
-2. **LIN-0002: Закрыть durable 1k SQLite gap** — P1, qualification, G-PERF.
-3. **LIN-0003: Закрыть durable 10k SQLite gap** — P1, done, G-PERF.
-4. **LIN-0004: Обновить матрицу чтения текущего main** — P1, done, G-PERF.
-5. **LIN-0081: Профилировать текущий WAL encode** — P1, done, G-PERF.
-6. **LIN-0082: Профилировать текущий WAL pack** — P1, done, G-PERF.
-7. **LIN-0084: Профилировать текущий Full-sync** — P1, done, G-PERF.
-8. **LIN-0083: Профилировать текущий WAL checksum** — P1, done, G-PERF.
-9. **LIN-0281: Зафиксировать Cell equality contract** — P1, done, G-CORRECT.
-10. **LIN-0282: Согласовать Cell Hash и Eq** — P1, done, G-CORRECT.
-11. **LIN-0302: Проверить mixed numeric hash grouping** — P1, done, G-CORRECT.
-12. **LIN-0721: Проверить Cell Hash/Eq для GROUP BY** — P1, done, G-CORRECT.
-13. **LIN-0041: Зафиксировать версию checksum envelope** — P1, done, G-CORRECT.
-14. **LIN-0042: Обозначить polynomial CRC в формате** — P1, done, G-CORRECT.
-15. **LIN-0043: Проверить mixed CRC32/CRC32C replay** — P1, done, G-CORRECT.
-16. **LIN-1701: Проверить last-acknowledged prefix recovery** — P1, done, G-VERIFY.
-17. **LIN-0367: Проверить unique-conflict before early return** — P1, done, G-CORRECT.
-18. **LIN-0886: Проверить implicit snippet indexing** — P1, done, G-CORRECT.
-19. **LIN-0029: Сохранять источник измеряемого бинарника** — P1, done, G-PERF.
-20. **LIN-0030: Проверять source drift после прогона** — P1, done, G-PERF.
-21. **LIN-0005: Получить тестовый endpoint MSSQL** — P1, done, G-OPS.
-22. **LIN-0006: Получить тестовый endpoint Kusto** — P1, blocked_external, G-OPS.
-23. **LIN-0007: Сопоставить transaction boundaries peers** — P1, done, G-PERF.
-24. **LIN-0008: Сопоставить индексные ограничения peers** — P1, done, G-PERF.
-25. **LIN-0044: Проверить старый reader на новом WAL** — P1, done, G-CORRECT.
+Количества: P1: 3, P2: 1222, P3: 586; статусы: blocked_external: 1, candidate: 934, qualification: 876.
 
-## Полный приоритетный список — все 2000 пунктов
-
-
-### P1: 110 пунктов
+#### P1: 3 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
 | 1 | LIN-0001 | [D01](#d01) | Закрыть native 1k SQLite gap | PERF | qualification | M | G-PERF |
 | 2 | LIN-0002 | [D01](#d01) | Закрыть durable 1k SQLite gap | PERF | qualification | M | G-PERF |
-| 3 | LIN-0003 | [D01](#d01) | Закрыть durable 10k SQLite gap | PERF | done | M | G-PERF |
-| 4 | LIN-0004 | [D01](#d01) | Обновить матрицу чтения текущего main | PERF | done | M | G-PERF |
-| 5 | LIN-0081 | [D03](#d03) | Профилировать текущий WAL encode | PERF | done | M | G-PERF |
-| 6 | LIN-0082 | [D03](#d03) | Профилировать текущий WAL pack | PERF | done | M | G-PERF |
-| 7 | LIN-0084 | [D03](#d03) | Профилировать текущий Full-sync | PERF | done | M | G-PERF |
-| 8 | LIN-0083 | [D03](#d03) | Профилировать текущий WAL checksum | PERF | done | M | G-PERF |
-| 9 | LIN-0281 | [D08](#d08) | Зафиксировать Cell equality contract | CORRECTNESS | done | M | G-CORRECT |
-| 10 | LIN-0282 | [D08](#d08) | Согласовать Cell Hash и Eq | CORRECTNESS | done | M | G-CORRECT |
-| 11 | LIN-0302 | [D08](#d08) | Проверить mixed numeric hash grouping | CORRECTNESS | done | S | G-CORRECT |
-| 12 | LIN-0721 | [D19](#d19) | Проверить Cell Hash/Eq для GROUP BY | CORRECTNESS | done | S | G-CORRECT |
-| 13 | LIN-0041 | [D02](#d02) | Зафиксировать версию checksum envelope | CORRECTNESS | done | M | G-CORRECT |
-| 14 | LIN-0042 | [D02](#d02) | Обозначить polynomial CRC в формате | CORRECTNESS | done | M | G-CORRECT |
-| 15 | LIN-0043 | [D02](#d02) | Проверить mixed CRC32/CRC32C replay | CORRECTNESS | done | S | G-CORRECT |
-| 16 | LIN-1701 | [D43](#d43) | Проверить last-acknowledged prefix recovery | VERIFY | done | S | G-VERIFY |
-| 17 | LIN-0367 | [D10](#d10) | Проверить unique-conflict before early return | CORRECTNESS | done | S | G-CORRECT |
-| 18 | LIN-0886 | [D23](#d23) | Проверить implicit snippet indexing | CORRECTNESS | done | S | G-CORRECT |
-| 19 | LIN-0029 | [D01](#d01) | Сохранять источник измеряемого бинарника | PERF | done | M | G-PERF |
-| 20 | LIN-0030 | [D01](#d01) | Проверять source drift после прогона | PERF | done | M | G-PERF |
-| 21 | LIN-0005 | [D01](#d01) | Получить тестовый endpoint MSSQL | OPS | done | M | G-OPS |
 | 22 | LIN-0006 | [D01](#d01) | Получить тестовый endpoint Kusto | OPS | blocked_external | M | G-OPS |
-| 23 | LIN-0007 | [D01](#d01) | Сопоставить transaction boundaries peers | PERF | done | M | G-PERF |
-| 24 | LIN-0008 | [D01](#d01) | Сопоставить индексные ограничения peers | PERF | done | M | G-PERF |
-| 25 | LIN-0044 | [D02](#d02) | Проверить старый reader на новом WAL | CORRECTNESS | done | S | G-CORRECT |
-| 26 | LIN-0121 | [D04](#d04) | Проверить torn WAL header | CORRECTNESS | done | S | G-CORRECT |
-| 27 | LIN-0122 | [D04](#d04) | Проверить torn WAL body | CORRECTNESS | done | S | G-CORRECT |
-| 28 | LIN-0123 | [D04](#d04) | Проверить torn WAL checksum | CORRECTNESS | done | S | G-CORRECT |
-| 29 | LIN-0124 | [D04](#d04) | Проверить trailing garbage policy | CORRECTNESS | done | S | G-CORRECT |
-| 30 | LIN-0161 | [D05](#d05) | Профилировать snapshot serialization copies | PERF | done | M | G-PERF |
-| 31 | LIN-0162 | [D05](#d05) | Профилировать snapshot decode allocations | PERF | done | M | G-PERF |
-| 32 | LIN-0163 | [D05](#d05) | Измерить checkpoint pause budget | PERF | done | M | G-PERF |
-| 33 | LIN-0164 | [D05](#d05) | Измерить checkpoint peak memory | PERF | done | M | G-PERF |
-| 34 | LIN-0201 | [D06](#d06) | Зафиксировать transaction visibility contract | CORRECTNESS | done | M | G-CORRECT |
-| 35 | LIN-0202 | [D06](#d06) | Проверить rollback всех row maps | CORRECTNESS | done | S | G-CORRECT |
-| 36 | LIN-0203 | [D06](#d06) | Проверить rollback scalar postings | CORRECTNESS | done | S | G-CORRECT |
-| 37 | LIN-0204 | [D06](#d06) | Проверить rollback FTS pending edits | CORRECTNESS | done | S | G-CORRECT |
-| 38 | LIN-0241 | [D07](#d07) | Профилировать small bulk row construction | PERF | done | M | G-PERF |
-| 39 | LIN-0242 | [D07](#d07) | Профилировать bulk identity checks | PERF | done | M | G-PERF |
-| 40 | LIN-0243 | [D07](#d07) | Профилировать bulk FK checks | PERF | done | M | G-PERF |
-| 41 | LIN-0244 | [D07](#d07) | Профилировать bulk map registration | PERF | done | M | G-PERF |
-| 42 | LIN-0283 | [D08](#d08) | Проверить NaN grouping semantics | CORRECTNESS | done | S | G-CORRECT |
-| 43 | LIN-0284 | [D08](#d08) | Проверить signed-zero grouping semantics | CORRECTNESS | done | S | G-CORRECT |
-| 44 | LIN-0361 | [D10](#d10) | Профилировать composite key construction | PERF | done | M | G-PERF |
-| 45 | LIN-0362 | [D10](#d10) | Профилировать index reverse map writes | PERF | done | M | G-PERF |
-| 46 | LIN-0363 | [D10](#d10) | Профилировать posting list allocations | PERF | done | M | G-PERF |
-| 47 | LIN-0364 | [D10](#d10) | Профилировать BTree node locality | PERF | done | M | G-PERF |
-| 48 | LIN-0401 | [D11](#d11) | Проверить int выше 2^53 уникальность | CORRECTNESS | done | S | G-CORRECT |
-| 49 | LIN-0402 | [D11](#d11) | Проверить float integer tie-breaker | CORRECTNESS | done | S | G-CORRECT |
-| 50 | LIN-0403 | [D11](#d11) | Проверить negative infinity ordering | CORRECTNESS | done | S | G-CORRECT |
-| 51 | LIN-0404 | [D11](#d11) | Проверить positive infinity ordering | CORRECTNESS | done | S | G-CORRECT |
-| 52 | LIN-0481 | [D13](#d13) | Зафиксировать NULL predicate semantics | CORRECTNESS | done | M | G-CORRECT |
-| 53 | LIN-0482 | [D13](#d13) | Зафиксировать absent-field semantics | CORRECTNESS | done | M | G-CORRECT |
-| 54 | LIN-0483 | [D13](#d13) | Зафиксировать mixed numeric coercions | CORRECTNESS | done | M | G-CORRECT |
-| 55 | LIN-0484 | [D13](#d13) | Зафиксировать boolean coercion policy | CORRECTNESS | done | M | G-CORRECT |
-| 56 | LIN-0521 | [D14](#d14) | Проверить constant folding equivalence | CORRECTNESS | done | S | G-CORRECT |
-| 57 | LIN-0522 | [D14](#d14) | Проверить predicate simplification equivalence | CORRECTNESS | done | S | G-CORRECT |
-| 58 | LIN-0523 | [D14](#d14) | Проверить projection pushdown equivalence | CORRECTNESS | done | S | G-CORRECT |
-| 59 | LIN-0524 | [D14](#d14) | Проверить limit pushdown equivalence | CORRECTNESS | done | S | G-CORRECT |
-| 60 | LIN-0722 | [D19](#d19) | Проверить NaN groups cardinality | CORRECTNESS | done | S | G-CORRECT |
-| 61 | LIN-0723 | [D19](#d19) | Проверить signed-zero group identity | CORRECTNESS | done | S | G-CORRECT |
-| 62 | LIN-0724 | [D19](#d19) | Проверить mixed int/float group identity | CORRECTNESS | done | S | G-CORRECT |
-| 63 | LIN-0881 | [D23](#d23) | Профилировать FTS build tokenization | PERF | done | M | G-PERF |
-| 64 | LIN-0882 | [D23](#d23) | Профилировать FTS build postings | PERF | done | M | G-PERF |
-| 65 | LIN-0883 | [D23](#d23) | Профилировать lowercase scratch reuse | PERF | done | M | G-PERF |
-| 66 | LIN-0884 | [D23](#d23) | Профилировать token deduplication | PERF | done | M | G-PERF |
-| 67 | LIN-0961 | [D25](#d25) | Проверить token two-cursor diff | CORRECTNESS | done | S | G-CORRECT |
-| 68 | LIN-0962 | [D25](#d25) | Проверить snippet-only update | CORRECTNESS | done | S | G-CORRECT |
-| 69 | LIN-0963 | [D25](#d25) | Проверить removal последнего term | CORRECTNESS | done | S | G-CORRECT |
-| 70 | LIN-0964 | [D25](#d25) | Проверить insertion нового term | CORRECTNESS | done | S | G-CORRECT |
-| 71 | LIN-1041 | [D27](#d27) | Зафиксировать exact/approximate search contract | CORRECTNESS | done | M | G-CORRECT |
-| 72 | LIN-1042 | [D27](#d27) | Измерить HNSW recall против exact | PERF | done | L | G-PERF |
-| 73 | LIN-1043 | [D27](#d27) | Измерить HNSW build latency | PERF | done | L | G-PERF |
-| 74 | LIN-1044 | [D27](#d27) | Измерить HNSW resident memory | PERF | done | L | G-PERF |
-| 75 | LIN-1081 | [D28](#d28) | Проверить cosine dimensional mismatch | CORRECTNESS | done | S | G-CORRECT |
-| 76 | LIN-1082 | [D28](#d28) | Проверить cosine zero norms | CORRECTNESS | done | S | G-CORRECT |
-| 77 | LIN-1083 | [D28](#d28) | Проверить cosine NaN handling | CORRECTNESS | done | S | G-CORRECT |
-| 78 | LIN-1084 | [D28](#d28) | Проверить cosine infinity handling | CORRECTNESS | done | S | G-CORRECT |
-| 79 | LIN-1121 | [D29](#d29) | Проверить adapter selection diagnostics | CORRECTNESS | done | S | G-CORRECT |
-| 80 | LIN-1122 | [D29](#d29) | Проверить device allocation failure | CORRECTNESS | done | S | G-CORRECT |
-| 81 | LIN-1123 | [D29](#d29) | Проверить queue submission failure | CORRECTNESS | done | S | G-CORRECT |
-| 82 | LIN-1124 | [D29](#d29) | Проверить device lost recovery | CORRECTNESS | done | S | G-CORRECT |
-| 83 | LIN-1161 | [D30](#d30) | Проверить WGSL exact integer compares | CORRECTNESS | done | S | G-CORRECT |
-| 84 | LIN-1162 | [D30](#d30) | Проверить WGSL mixed numeric compares | CORRECTNESS | done | S | G-CORRECT |
-| 85 | LIN-1163 | [D30](#d30) | Проверить WGSL boolean combinations | CORRECTNESS | done | S | G-CORRECT |
-| 86 | LIN-1164 | [D30](#d30) | Проверить WGSL null masks | CORRECTNESS | done | S | G-CORRECT |
-| 87 | LIN-1321 | [D34](#d34) | Зафиксировать ReadDb visibility contract | CORRECTNESS | done | M | G-CORRECT |
-| 88 | LIN-1322 | [D34](#d34) | Проверить snapshot generation isolation | CORRECTNESS | done | S | G-CORRECT |
-| 89 | LIN-1323 | [D34](#d34) | Проверить snapshot index consistency | CORRECTNESS | done | S | G-CORRECT |
-| 90 | LIN-1324 | [D34](#d34) | Проверить snapshot FTS consistency | CORRECTNESS | done | S | G-CORRECT |
-| 91 | LIN-1361 | [D35](#d35) | Проверить handshake protocol version | CORRECTNESS | done | S | G-CORRECT |
-| 92 | LIN-1362 | [D35](#d35) | Проверить server identity validation | CORRECTNESS | done | S | G-CORRECT |
-| 93 | LIN-1363 | [D35](#d35) | Проверить transport framing limits | CORRECTNESS | done | S | G-CORRECT |
-| 94 | LIN-1364 | [D35](#d35) | Проверить replication byte order | CORRECTNESS | done | S | G-CORRECT |
-| 95 | LIN-1401 | [D36](#d36) | Проверить follower generation continuity | CORRECTNESS | done | S | G-CORRECT |
-| 96 | LIN-1402 | [D36](#d36) | Проверить duplicate incoming records | CORRECTNESS | done | S | G-CORRECT |
-| 97 | LIN-1403 | [D36](#d36) | Проверить out-of-order incoming records | CORRECTNESS | done | S | G-CORRECT |
-| 98 | LIN-1404 | [D36](#d36) | Проверить missing incoming generation | CORRECTNESS | done | S | G-CORRECT |
-| 99 | LIN-1641 | [D42](#d42) | Генерировать AST parser roundtrip cases | VERIFY | done | S | G-VERIFY |
-| 100 | LIN-1642 | [D42](#d42) | Генерировать typed/untyped roundtrip cases | VERIFY | done | S | G-VERIFY |
-| 101 | LIN-1643 | [D42](#d42) | Генерировать row/batch equivalence cases | VERIFY | done | S | G-VERIFY |
-| 102 | LIN-1644 | [D42](#d42) | Генерировать cursor/materialized equivalence cases | VERIFY | done | S | G-VERIFY |
-| 103 | LIN-1681 | [D43](#d43) | Инъецировать crash перед WAL append | VERIFY | done | S | G-VERIFY |
-| 104 | LIN-1682 | [D43](#d43) | Инъецировать crash после header write | VERIFY | done | S | G-VERIFY |
-| 105 | LIN-1683 | [D43](#d43) | Инъецировать crash после payload write | VERIFY | done | S | G-VERIFY |
-| 106 | LIN-1684 | [D43](#d43) | Инъецировать crash после checksum write | VERIFY | done | S | G-VERIFY |
-| 107 | LIN-1761 | [D45](#d45) | Ограничить untrusted query bytes | CORRECTNESS | done | M | G-CORRECT |
-| 108 | LIN-1762 | [D45](#d45) | Ограничить prepared AST bytes | CORRECTNESS | done | M | G-CORRECT |
-| 109 | LIN-1763 | [D45](#d45) | Ограничить query output bytes | CORRECTNESS | done | M | G-CORRECT |
-| 110 | LIN-1764 | [D45](#d45) | Ограничить query execution work | CORRECTNESS | done | M | G-CORRECT |
 
-### P2: 1290 пунктов
+#### P2: 1222 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -263,7 +289,6 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 118 | LIN-0016 | [D01](#d01) | Измерять cold constructor latency | PERF | candidate | M | G-PERF |
 | 119 | LIN-0017 | [D01](#d01) | Ввести matched mixed-case fixtures | VERIFY | qualification | S | G-VERIFY |
 | 120 | LIN-0018 | [D01](#d01) | Проверять adversarial строковые fixtures | VERIFY | qualification | S | G-VERIFY |
-| 121 | LIN-0019 | [D01](#d01) | Отдельно измерять tiny transactions | PERF | done | M | G-PERF |
 | 122 | LIN-0020 | [D01](#d01) | Отдельно измерять 1M-row ingestion | PERF | candidate | M | G-PERF |
 | 123 | LIN-0021 | [D01](#d01) | Измерять wide-row insertion | PERF | candidate | M | G-PERF |
 | 124 | LIN-0022 | [D01](#d01) | Измерять skewed-key insertion | PERF | candidate | M | G-PERF |
@@ -402,7 +427,6 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 257 | LIN-0173 | [D05](#d05) | Измерить incremental checkpoint | PERF | candidate | M | G-PERF |
 | 258 | LIN-0174 | [D05](#d05) | Измерить section-local compression | PERF | candidate | M | G-PERF |
 | 259 | LIN-0175 | [D05](#d05) | Измерить parallel snapshot sections | PERF | candidate | M | G-PERF |
-| 260 | LIN-0176 | [D05](#d05) | Измерить streaming snapshot encoder | PERF | done | M | G-PERF |
 | 261 | LIN-0177 | [D05](#d05) | Проверить atomic snapshot replacement | CORRECTNESS | qualification | S | G-CORRECT |
 | 262 | LIN-0178 | [D05](#d05) | Проверить failed rename cleanup | CORRECTNESS | qualification | S | G-CORRECT |
 | 263 | LIN-0179 | [D05](#d05) | Проверить temp snapshot ownership | CORRECTNESS | qualification | S | G-CORRECT |
@@ -411,19 +435,10 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 266 | LIN-0182 | [D05](#d05) | Проверить snapshot edge consistency | CORRECTNESS | qualification | S | G-CORRECT |
 | 267 | LIN-0183 | [D05](#d05) | Проверить snapshot derived indexes policy | CORRECTNESS | qualification | S | G-CORRECT |
 | 268 | LIN-0184 | [D05](#d05) | Проверить snapshot embedding identity | CORRECTNESS | qualification | S | G-CORRECT |
-| 269 | LIN-0205 | [D06](#d06) | Проверить rollback embeddings | CORRECTNESS | done | S | G-CORRECT |
-| 270 | LIN-0206 | [D06](#d06) | Проверить rollback graph edges | CORRECTNESS | done | S | G-CORRECT |
-| 271 | LIN-0207 | [D06](#d06) | Проверить rollback generated IDs | CORRECTNESS | done | S | G-CORRECT |
-| 272 | LIN-0208 | [D06](#d06) | Проверить rollback catalog changes | CORRECTNESS | done | S | G-CORRECT |
-| 273 | LIN-0209 | [D06](#d06) | Проверить mixed insert/update/delete rollback | CORRECTNESS | done | S | G-CORRECT |
-| 274 | LIN-0210 | [D06](#d06) | Проверить group commit failure atomicity | CORRECTNESS | done | S | G-CORRECT |
 | 275 | LIN-0211 | [D06](#d06) | Проверить commit после validation failure | CORRECTNESS | qualification | S | G-CORRECT |
 | 276 | LIN-0212 | [D06](#d06) | Проверить rollback после allocator failure | CORRECTNESS | qualification | S | G-CORRECT |
-| 277 | LIN-0213 | [D06](#d06) | Ограничить transaction journal bytes | CORRECTNESS | done | M | G-CORRECT |
-| 278 | LIN-0214 | [D06](#d06) | Ограничить transaction mutation count | CORRECTNESS | done | M | G-CORRECT |
 | 279 | LIN-0215 | [D06](#d06) | Измерить rollback work amplification | PERF | candidate | M | G-PERF |
 | 280 | LIN-0216 | [D06](#d06) | Измерить journal clone elimination | PERF | candidate | M | G-PERF |
-| 281 | LIN-0217 | [D06](#d06) | Подготовить explicit transaction API | CORRECTNESS | done | M | G-CORRECT |
 | 282 | LIN-0218 | [D06](#d06) | Спроектировать bounded savepoints | FEATURE | candidate | L | G-FEATURE |
 | 283 | LIN-0219 | [D06](#d06) | Спроектировать read-your-writes contract | FEATURE | candidate | L | G-FEATURE |
 | 284 | LIN-0220 | [D06](#d06) | Спроектировать nested transaction rejection | FEATURE | candidate | L | G-FEATURE |
@@ -483,11 +498,6 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 338 | LIN-0278 | [D07](#d07) | Добавить bulk cancellation boundary | FEATURE | candidate | M | G-FEATURE |
 | 339 | LIN-0279 | [D07](#d07) | Добавить per-collection ingestion limits | FEATURE | candidate | M | G-FEATURE |
 | 340 | LIN-0280 | [D07](#d07) | Добавить ingest backpressure diagnostics | FEATURE | candidate | M | G-FEATURE |
-| 341 | LIN-0285 | [D08](#d08) | Проверить Text/SmallText equality | CORRECTNESS | done | S | G-CORRECT |
-| 342 | LIN-0286 | [D08](#d08) | Проверить Text/SmallText ordering | CORRECTNESS | done | S | G-CORRECT |
-| 343 | LIN-0287 | [D08](#d08) | Проверить Text/SmallText hashing | CORRECTNESS | done | S | G-CORRECT |
-| 344 | LIN-0288 | [D08](#d08) | Проверить Text/SmallText serialization | CORRECTNESS | done | S | G-CORRECT |
-| 345 | LIN-0289 | [D08](#d08) | Проверить SSO exact capacity boundary | CORRECTNESS | done | S | G-CORRECT |
 | 346 | LIN-0290 | [D08](#d08) | Проверить SSO UTF-8 boundary | CORRECTNESS | qualification | S | G-CORRECT |
 | 347 | LIN-0291 | [D08](#d08) | Проверить SSO empty string | CORRECTNESS | qualification | S | G-CORRECT |
 | 348 | LIN-0292 | [D08](#d08) | Проверить SSO embedded NUL | CORRECTNESS | qualification | S | G-CORRECT |
@@ -562,7 +572,6 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 417 | LIN-0383 | [D10](#d10) | Проверить duplicate nonunique postings | CORRECTNESS | qualification | S | G-CORRECT |
 | 418 | LIN-0384 | [D10](#d10) | Проверить empty index definition | CORRECTNESS | qualification | S | G-CORRECT |
 | 419 | LIN-0385 | [D10](#d10) | Спроектировать covering index payload | FEATURE | candidate | L | G-FEATURE |
-| 420 | LIN-0386 | [D10](#d10) | Спроектировать partial index predicates | FEATURE | candidate | L | G-FEATURE |
 | 421 | LIN-0387 | [D10](#d10) | Спроектировать expression index contract | FEATURE | candidate | L | G-FEATURE |
 | 422 | LIN-0388 | [D10](#d10) | Спроектировать index visibility generations | FEATURE | candidate | L | G-FEATURE |
 | 423 | LIN-0389 | [D10](#d10) | Проверить index rebuild rollback | CORRECTNESS | qualification | S | G-CORRECT |
@@ -575,7 +584,6 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 430 | LIN-0396 | [D10](#d10) | Добавить index consistency inspector | FEATURE | candidate | M | G-FEATURE |
 | 431 | LIN-0397 | [D10](#d10) | Сравнить dense reverse map crossover | PERF | candidate | M | G-PERF |
 | 432 | LIN-0398 | [D10](#d10) | Сравнить adaptive posting representation | PERF | candidate | M | G-PERF |
-| 433 | LIN-0399 | [D10](#d10) | Сравнить bitmap postings для dense keys | PERF | done | M | G-PERF |
 | 434 | LIN-0400 | [D10](#d10) | Сравнить hash-only equality indexes | PERF | candidate | M | G-PERF |
 | 435 | LIN-0405 | [D11](#d11) | Проверить NaN unique key policy | CORRECTNESS | qualification | S | G-CORRECT |
 | 436 | LIN-0406 | [D11](#d11) | Проверить negative-zero unique policy | CORRECTNESS | qualification | S | G-CORRECT |
@@ -613,7 +621,6 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 468 | LIN-0454 | [D12](#d12) | Проверить associativity of chained operators | CORRECTNESS | qualification | S | G-CORRECT |
 | 469 | LIN-0455 | [D12](#d12) | Проверить unary minus boundaries | CORRECTNESS | qualification | S | G-CORRECT |
 | 470 | LIN-0456 | [D12](#d12) | Проверить parenthesis recovery policy | CORRECTNESS | qualification | S | G-CORRECT |
-| 471 | LIN-0457 | [D12](#d12) | Спроектировать parameter placeholder syntax | API | candidate | L | G-API |
 | 472 | LIN-0458 | [D12](#d12) | Спроектировать named parameter binding | API | candidate | L | G-API |
 | 473 | LIN-0459 | [D12](#d12) | Спроектировать batch statement separators | API | candidate | L | G-API |
 | 474 | LIN-0460 | [D12](#d12) | Спроектировать multiline query formatting | API | candidate | L | G-API |
@@ -685,7 +692,6 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 540 | LIN-0550 | [D14](#d14) | Добавить no-optimization execution mode | FEATURE | candidate | M | G-FEATURE |
 | 541 | LIN-0551 | [D14](#d14) | Добавить reproducible plan fingerprints | FEATURE | candidate | M | G-FEATURE |
 | 542 | LIN-0552 | [D14](#d14) | Добавить optimizer debug counters | FEATURE | candidate | M | G-FEATURE |
-| 543 | LIN-0553 | [D14](#d14) | Измерить prepared plan reuse | PERF | done | M | G-PERF |
 | 544 | LIN-0554 | [D14](#d14) | Измерить plan cache key construction | PERF | candidate | M | G-PERF |
 | 545 | LIN-0555 | [D14](#d14) | Ограничить retained plan-cache bytes | CORRECTNESS | qualification | M | G-CORRECT |
 | 546 | LIN-0556 | [D14](#d14) | Проверить schema-aware plan invalidation | CORRECTNESS | qualification | S | G-CORRECT |
@@ -790,9 +796,7 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 645 | LIN-0687 | [D18](#d18) | Измерить projected column materialization | PERF | candidate | M | G-PERF |
 | 646 | LIN-0688 | [D18](#d18) | Измерить batch ownership transfer | PERF | candidate | M | G-PERF |
 | 647 | LIN-0689 | [D18](#d18) | Спроектировать borrowed ColumnView | FEATURE | candidate | L | G-FEATURE |
-| 648 | LIN-0690 | [D18](#d18) | Спроектировать dictionary text columns | FEATURE | candidate | L | G-FEATURE |
 | 649 | LIN-0691 | [D18](#d18) | Спроектировать offset-based binary columns | FEATURE | candidate | L | G-FEATURE |
-| 650 | LIN-0692 | [D18](#d18) | Спроектировать dense numeric columns | FEATURE | candidate | L | G-FEATURE |
 | 651 | LIN-0693 | [D18](#d18) | Проверить heterogeneous column fallback | CORRECTNESS | qualification | S | G-CORRECT |
 | 652 | LIN-0694 | [D18](#d18) | Проверить all-null column type | CORRECTNESS | qualification | S | G-CORRECT |
 | 653 | LIN-0695 | [D18](#d18) | Проверить empty batch schema | CORRECTNESS | qualification | S | G-CORRECT |
@@ -805,9 +809,6 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 660 | LIN-0702 | [D18](#d18) | Измерить SIMD bitmap operations | PERF | candidate | M | G-PERF |
 | 661 | LIN-0703 | [D18](#d18) | Измерить packed UTF-8 projection | PERF | candidate | M | G-PERF |
 | 662 | LIN-0704 | [D18](#d18) | Измерить vector column alignment | PERF | candidate | M | G-PERF |
-| 663 | LIN-0725 | [D19](#d19) | Проверить SSO/Arc group identity | CORRECTNESS | done | S | G-CORRECT |
-| 664 | LIN-0726 | [D19](#d19) | Проверить NULL group identity | CORRECTNESS | done | S | G-CORRECT |
-| 665 | LIN-0727 | [D19](#d19) | Проверить deterministic group order | CORRECTNESS | done | S | G-CORRECT |
 | 666 | LIN-0728 | [D19](#d19) | Проверить empty-input aggregate results | CORRECTNESS | qualification | S | G-CORRECT |
 | 667 | LIN-0729 | [D19](#d19) | Проверить count/count-field distinction | CORRECTNESS | qualification | S | G-CORRECT |
 | 668 | LIN-0730 | [D19](#d19) | Проверить sum integer overflow | CORRECTNESS | qualification | S | G-CORRECT |
@@ -820,9 +821,7 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 675 | LIN-0737 | [D19](#d19) | Измерить FxHashMap grouping capacity | PERF | candidate | M | G-PERF |
 | 676 | LIN-0738 | [D19](#d19) | Измерить inline group key buffers | PERF | candidate | M | G-PERF |
 | 677 | LIN-0739 | [D19](#d19) | Измерить group aggregate state layout | PERF | candidate | M | G-PERF |
-| 678 | LIN-0740 | [D19](#d19) | Измерить grouped projection allocation | PERF | done | M | G-PERF |
 | 679 | LIN-0741 | [D19](#d19) | Спроектировать streaming aggregation | FEATURE | candidate | L | G-FEATURE |
-| 680 | LIN-0742 | [D19](#d19) | Спроектировать spillable hash aggregation | FEATURE | candidate | L | G-FEATURE |
 | 681 | LIN-0743 | [D19](#d19) | Спроектировать sorted-key aggregation | FEATURE | candidate | L | G-FEATURE |
 | 682 | LIN-0744 | [D19](#d19) | Спроектировать partial aggregate merge | FEATURE | candidate | L | G-FEATURE |
 | 683 | LIN-0745 | [D19](#d19) | Добавить variance aggregate contract | FEATURE | candidate | M | G-FEATURE |
@@ -834,11 +833,9 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 689 | LIN-0751 | [D19](#d19) | Проверить HAVING-like stage semantics | CORRECTNESS | qualification | S | G-CORRECT |
 | 690 | LIN-0752 | [D19](#d19) | Проверить nested aggregate rejection | CORRECTNESS | qualification | S | G-CORRECT |
 | 691 | LIN-0753 | [D19](#d19) | Согласовать row/batch aggregate bits | CORRECTNESS | qualification | M | G-CORRECT |
-| 692 | LIN-0754 | [D19](#d19) | Согласовать CPU/GPU aggregate results | CORRECTNESS | done | M | G-CORRECT |
 | 693 | LIN-0755 | [D19](#d19) | Проверить large-integer GPU grouping | CORRECTNESS | qualification | S | G-CORRECT |
 | 694 | LIN-0756 | [D19](#d19) | Проверить catastrophic float cancellation | CORRECTNESS | qualification | S | G-CORRECT |
 | 695 | LIN-0757 | [D19](#d19) | Добавить group cardinality limits | FEATURE | candidate | M | G-FEATURE |
-| 696 | LIN-0758 | [D19](#d19) | Добавить aggregate-state memory budget | FEATURE | candidate | M | G-FEATURE |
 | 697 | LIN-0759 | [D19](#d19) | Добавить aggregation skew diagnostics | FEATURE | candidate | M | G-FEATURE |
 | 698 | LIN-0760 | [D19](#d19) | Добавить group overflow diagnostics | FEATURE | candidate | M | G-FEATURE |
 | 699 | LIN-0761 | [D20](#d20) | Проверить stable equal-key sorting | CORRECTNESS | qualification | S | G-CORRECT |
@@ -889,10 +886,6 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 744 | LIN-0822 | [D21](#d21) | Добавить join memory budget | FEATURE | candidate | M | G-FEATURE |
 | 745 | LIN-0823 | [D21](#d21) | Добавить spillable hash partitions | FEATURE | candidate | L | G-FEATURE |
 | 746 | LIN-0824 | [D21](#d21) | Добавить join skew handling | FEATURE | candidate | M | G-FEATURE |
-| 747 | LIN-0841 | [D22](#d22) | Проверить partition key hashing | CORRECTNESS | done | S | G-CORRECT |
-| 748 | LIN-0842 | [D22](#d22) | Проверить NULL partition keys | CORRECTNESS | done | S | G-CORRECT |
-| 749 | LIN-0843 | [D22](#d22) | Проверить numeric partition equivalence | CORRECTNESS | done | S | G-CORRECT |
-| 750 | LIN-0844 | [D22](#d22) | Проверить SSO partition equivalence | CORRECTNESS | done | S | G-CORRECT |
 | 751 | LIN-0845 | [D22](#d22) | Проверить source-order window stability | CORRECTNESS | qualification | S | G-CORRECT |
 | 752 | LIN-0846 | [D22](#d22) | Проверить equal-order-key ties | CORRECTNESS | qualification | S | G-CORRECT |
 | 753 | LIN-0847 | [D22](#d22) | Проверить ascending/descending frame bounds | CORRECTNESS | qualification | S | G-CORRECT |
@@ -901,7 +894,6 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 756 | LIN-0850 | [D22](#d22) | Проверить large integer window sums | CORRECTNESS | qualification | S | G-CORRECT |
 | 757 | LIN-0851 | [D22](#d22) | Проверить float prefix cancellation | CORRECTNESS | qualification | S | G-CORRECT |
 | 758 | LIN-0852 | [D22](#d22) | Проверить negative-zero window sums | CORRECTNESS | qualification | S | G-CORRECT |
-| 759 | LIN-0853 | [D22](#d22) | Спроектировать ROWS frame syntax | FEATURE | candidate | L | G-FEATURE |
 | 760 | LIN-0854 | [D22](#d22) | Спроектировать RANGE frame semantics | FEATURE | candidate | L | G-FEATURE |
 | 761 | LIN-0855 | [D22](#d22) | Спроектировать GROUPS frame semantics | FEATURE | candidate | L | G-FEATURE |
 | 762 | LIN-0856 | [D22](#d22) | Спроектировать excluded-current-row frame | FEATURE | candidate | L | G-FEATURE |
@@ -962,7 +954,6 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 817 | LIN-0932 | [D24](#d24) | Проверить repeated-query-term weighting | CORRECTNESS | qualification | S | G-CORRECT |
 | 818 | LIN-0933 | [D24](#d24) | Спроектировать phrase search | FEATURE | candidate | L | G-FEATURE |
 | 819 | LIN-0934 | [D24](#d24) | Спроектировать proximity search | FEATURE | candidate | L | G-FEATURE |
-| 820 | LIN-0935 | [D24](#d24) | Спроектировать prefix term queries | FEATURE | candidate | L | G-FEATURE |
 | 821 | LIN-0936 | [D24](#d24) | Спроектировать fuzzy term opt-in | VERIFY | qualification | L | G-VERIFY |
 | 822 | LIN-0937 | [D24](#d24) | Спроектировать field-boost scoring | FEATURE | candidate | L | G-FEATURE |
 | 823 | LIN-0938 | [D24](#d24) | Спроектировать BM25 opt-in | FEATURE | candidate | L | G-FEATURE |
@@ -1032,12 +1023,6 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 887 | LIN-1022 | [D26](#d26) | Измерить cold thread-pool startup | PERF | candidate | M | G-PERF |
 | 888 | LIN-1023 | [D26](#d26) | Измерить scoped embedding crossover | PERF | candidate | M | G-PERF |
 | 889 | LIN-1024 | [D26](#d26) | Измерить concurrent embedding contention | PERF | candidate | M | G-PERF |
-| 890 | LIN-1045 | [D27](#d27) | Проверить HNSW insertion ordering | CORRECTNESS | done | L | G-CORRECT |
-| 891 | LIN-1046 | [D27](#d27) | Проверить HNSW duplicate identity handling | CORRECTNESS | done | L | G-CORRECT |
-| 892 | LIN-1047 | [D27](#d27) | Проверить HNSW row deletion repair | CORRECTNESS | done | L | G-CORRECT |
-| 893 | LIN-1048 | [D27](#d27) | Проверить HNSW swap-remove repair | CORRECTNESS | done | L | G-CORRECT |
-| 894 | LIN-1049 | [D27](#d27) | Проверить HNSW embedding updates | CORRECTNESS | done | L | G-CORRECT |
-| 895 | LIN-1050 | [D27](#d27) | Проверить HNSW collection isolation | CORRECTNESS | done | L | G-CORRECT |
 | 896 | LIN-1051 | [D27](#d27) | Проверить HNSW dimension changes | CORRECTNESS | qualification | L | G-CORRECT |
 | 897 | LIN-1052 | [D27](#d27) | Проверить HNSW model identity changes | CORRECTNESS | qualification | L | G-CORRECT |
 | 898 | LIN-1053 | [D27](#d27) | Спроектировать configurable ef_search | FEATURE | candidate | L | G-FEATURE |
@@ -1072,23 +1057,17 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 927 | LIN-1102 | [D28](#d28) | Добавить vector field selection | FEATURE | candidate | M | G-FEATURE |
 | 928 | LIN-1103 | [D28](#d28) | Добавить multi-vector row search | FEATURE | candidate | M | G-FEATURE |
 | 929 | LIN-1104 | [D28](#d28) | Добавить vector search explanation | FEATURE | candidate | M | G-FEATURE |
-| 930 | LIN-1125 | [D29](#d29) | Проверить resident cache generation keys | CORRECTNESS | done | S | G-CORRECT |
-| 931 | LIN-1126 | [D29](#d29) | Проверить vector cache model identity | CORRECTNESS | done | S | G-CORRECT |
-| 932 | LIN-1127 | [D29](#d29) | Проверить vector cache row ordering | CORRECTNESS | done | S | G-CORRECT |
-| 933 | LIN-1128 | [D29](#d29) | Проверить cache invalidation после mutation | CORRECTNESS | done | S | G-CORRECT |
 | 934 | LIN-1129 | [D29](#d29) | Ограничить resident GPU bytes | CORRECTNESS | qualification | M | G-CORRECT |
 | 935 | LIN-1130 | [D29](#d29) | Ограничить storage buffer sizes | CORRECTNESS | qualification | M | G-CORRECT |
 | 936 | LIN-1131 | [D29](#d29) | Ограничить bind-group count | CORRECTNESS | qualification | M | G-CORRECT |
 | 937 | LIN-1132 | [D29](#d29) | Ограничить dispatch dimensions | CORRECTNESS | qualification | M | G-CORRECT |
 | 938 | LIN-1133 | [D29](#d29) | Проверить readback map failure | CORRECTNESS | qualification | S | G-CORRECT |
 | 939 | LIN-1134 | [D29](#d29) | Проверить mapped buffer cancellation | CORRECTNESS | qualification | S | G-CORRECT |
-| 940 | LIN-1135 | [D29](#d29) | Проверить staging buffer reuse | CORRECTNESS | done | S | G-CORRECT |
 | 941 | LIN-1136 | [D29](#d29) | Проверить dropped GPU query cleanup | CORRECTNESS | qualification | S | G-CORRECT |
 | 942 | LIN-1137 | [D29](#d29) | Измерить upload/readback split | PERF | candidate | M | G-PERF |
 | 943 | LIN-1138 | [D29](#d29) | Измерить resident repeated query benefit | PERF | candidate | M | G-PERF |
 | 944 | LIN-1139 | [D29](#d29) | Измерить CPU/GPU crossover cardinality | PERF | candidate | M | G-PERF |
 | 945 | LIN-1140 | [D29](#d29) | Измерить GPU command encoding cost | PERF | candidate | M | G-PERF |
-| 946 | LIN-1141 | [D29](#d29) | Спроектировать buffer pool policy | FEATURE | done | L | G-FEATURE |
 | 947 | LIN-1142 | [D29](#d29) | Спроектировать shared resident columns | FEATURE | candidate | L | G-FEATURE |
 | 948 | LIN-1143 | [D29](#d29) | Спроектировать resident intermediate batches | FEATURE | candidate | L | G-FEATURE |
 | 949 | LIN-1144 | [D29](#d29) | Спроектировать explicit residency handles | FEATURE | candidate | L | G-FEATURE |
@@ -1148,8 +1127,6 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 1003 | LIN-1250 | [D32](#d32) | Измерить random madvise policy | PERF | candidate | M | G-PERF |
 | 1004 | LIN-1251 | [D32](#d32) | Измерить bounded prefetch windows | PERF | candidate | M | G-PERF |
 | 1005 | LIN-1252 | [D32](#d32) | Измерить page-aligned section layout | PERF | candidate | M | G-PERF |
-| 1006 | LIN-1253 | [D32](#d32) | Спроектировать chunked cold columns | FEATURE | candidate | L | G-FEATURE |
-| 1007 | LIN-1254 | [D32](#d32) | Спроектировать lazy field decoding | FEATURE | candidate | L | G-FEATURE |
 | 1008 | LIN-1255 | [D32](#d32) | Спроектировать hot/cold tier thresholds | FEATURE | candidate | L | G-FEATURE |
 | 1009 | LIN-1256 | [D32](#d32) | Спроектировать cold section checksums | FEATURE | candidate | L | G-FEATURE |
 | 1010 | LIN-1257 | [D32](#d32) | Проверить corrupted cold offsets | CORRECTNESS | qualification | S | G-CORRECT |
@@ -1249,7 +1226,6 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 1104 | LIN-1443 | [D37](#d37) | Зафиксировать query result ownership | CORRECTNESS | qualification | M | G-CORRECT |
 | 1105 | LIN-1444 | [D37](#d37) | Зафиксировать prepared handle invalidation | CORRECTNESS | qualification | M | G-CORRECT |
 | 1106 | LIN-1445 | [D37](#d37) | Спроектировать DbBuilder configuration | API | candidate | L | G-API |
-| 1107 | LIN-1446 | [D37](#d37) | Спроектировать resource-limit configuration | API | candidate | L | G-API |
 | 1108 | LIN-1447 | [D37](#d37) | Спроектировать storage capability introspection | API | candidate | L | G-API |
 | 1109 | LIN-1448 | [D37](#d37) | Спроектировать backend capability introspection | API | candidate | L | G-API |
 | 1110 | LIN-1449 | [D37](#d37) | Добавить explicit query cancellation handle | API | candidate | M | G-API |
@@ -1265,7 +1241,6 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 1120 | LIN-1459 | [D37](#d37) | Спроектировать prepared query schema info | API | candidate | L | G-API |
 | 1121 | LIN-1460 | [D37](#d37) | Спроектировать query execution receipts | API | candidate | L | G-API |
 | 1122 | LIN-1461 | [D37](#d37) | Добавить exact/approximate search options | API | candidate | M | G-API |
-| 1123 | LIN-1462 | [D37](#d37) | Добавить explicit durability options | API | candidate | M | G-API |
 | 1124 | LIN-1463 | [D37](#d37) | Добавить explain structured output | API | candidate | M | G-API |
 | 1125 | LIN-1464 | [D37](#d37) | Добавить structured runtime statistics | API | candidate | M | G-API |
 | 1126 | LIN-1481 | [D38](#d38) | Проверить derive field rename | CORRECTNESS | qualification | S | G-CORRECT |
@@ -1304,11 +1279,9 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 1159 | LIN-1530 | [D39](#d39) | Спроектировать multiline REPL input | API | candidate | L | G-API |
 | 1160 | LIN-1531 | [D39](#d39) | Спроектировать REPL history storage | API | candidate | L | G-API |
 | 1161 | LIN-1532 | [D39](#d39) | Спроектировать REPL completion metadata | API | candidate | L | G-API |
-| 1162 | LIN-1533 | [D39](#d39) | Добавить query file execution | API | candidate | M | G-API |
 | 1163 | LIN-1534 | [D39](#d39) | Добавить parameter file binding | API | candidate | M | G-API |
 | 1164 | LIN-1535 | [D39](#d39) | Добавить stdin streaming import | API | candidate | M | G-API |
 | 1165 | LIN-1536 | [D39](#d39) | Добавить stdout streaming export | API | candidate | M | G-API |
-| 1166 | LIN-1537 | [D39](#d39) | Добавить dry-run plan command | API | candidate | M | G-API |
 | 1167 | LIN-1538 | [D39](#d39) | Добавить storage inspect command | API | candidate | M | G-API |
 | 1168 | LIN-1539 | [D39](#d39) | Добавить WAL inspect command | API | candidate | M | G-API |
 | 1169 | LIN-1540 | [D39](#d39) | Добавить index consistency command | API | candidate | M | G-API |
@@ -1427,26 +1400,11 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 1282 | LIN-1742 | [D44](#d44) | Добавить benchmark source hash checks | OPS | candidate | M | G-OPS |
 | 1283 | LIN-1743 | [D44](#d44) | Добавить dependency lock drift checks | OPS | candidate | M | G-OPS |
 | 1284 | LIN-1744 | [D44](#d44) | Добавить baseline approval metadata | OPS | candidate | M | G-OPS |
-| 1285 | LIN-1765 | [D45](#d45) | Ограничить regex automaton size | CORRECTNESS | done | M | G-CORRECT |
-| 1286 | LIN-1766 | [D45](#d45) | Ограничить graph expansion count | CORRECTNESS | done | M | G-CORRECT |
-| 1287 | LIN-1767 | [D45](#d45) | Ограничить Cartesian join expansion | CORRECTNESS | done | M | G-CORRECT |
-| 1288 | LIN-1768 | [D45](#d45) | Ограничить aggregate state bytes | CORRECTNESS | done | M | G-CORRECT |
-| 1289 | LIN-1769 | [D45](#d45) | Проверить archive path traversal rejection | CORRECTNESS | done | S | G-CORRECT |
-| 1290 | LIN-1770 | [D45](#d45) | Проверить backup symlink policy | CORRECTNESS | done | S | G-CORRECT |
-| 1291 | LIN-1771 | [D45](#d45) | Проверить data-directory traversal policy | CORRECTNESS | done | S | G-CORRECT |
-| 1292 | LIN-1772 | [D45](#d45) | Проверить temp-file permission policy | CORRECTNESS | done | S | G-CORRECT |
-| 1293 | LIN-1773 | [D45](#d45) | Проверить replication token comparison | CORRECTNESS | done | S | G-CORRECT |
-| 1294 | LIN-1774 | [D45](#d45) | Проверить secret lifetime in diagnostics | CORRECTNESS | done | S | G-CORRECT |
-| 1295 | LIN-1775 | [D45](#d45) | Проверить HTTP remote TLS requirement | CORRECTNESS | done | S | G-CORRECT |
-| 1296 | LIN-1776 | [D45](#d45) | Проверить accidental insecure endpoint reuse | CORRECTNESS | done | S | G-CORRECT |
 | 1297 | LIN-1777 | [D45](#d45) | Спроектировать read-only capabilities | FEATURE | candidate | L | G-FEATURE |
 | 1298 | LIN-1778 | [D45](#d45) | Спроектировать collection-level capabilities | FEATURE | candidate | L | G-FEATURE |
 | 1299 | LIN-1779 | [D45](#d45) | Спроектировать extension trust boundaries | FEATURE | candidate | L | G-FEATURE |
 | 1300 | LIN-1780 | [D45](#d45) | Спроектировать untrusted model isolation | FEATURE | candidate | L | G-FEATURE |
-| 1301 | LIN-1781 | [D45](#d45) | Проверить compressed payload bomb rejection | CORRECTNESS | done | S | G-CORRECT |
-| 1302 | LIN-1782 | [D45](#d45) | Проверить nested format recursion limits | CORRECTNESS | done | S | G-CORRECT |
 | 1303 | LIN-1783 | [D45](#d45) | Проверить pathological UTF-8 scan cost | CORRECTNESS | qualification | S | G-CORRECT |
-| 1304 | LIN-1784 | [D45](#d45) | Проверить adversarial hash collision handling | CORRECTNESS | done | S | G-CORRECT |
 | 1305 | LIN-1801 | [D46](#d46) | Спроектировать schema generation counters | FEATURE | candidate | L | G-FEATURE |
 | 1306 | LIN-1802 | [D46](#d46) | Спроектировать explicit schema version | FEATURE | candidate | L | G-FEATURE |
 | 1307 | LIN-1803 | [D46](#d46) | Спроектировать migration transaction contract | FEATURE | candidate | L | G-FEATURE |
@@ -1544,7 +1502,7 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 1399 | LIN-1971 | [D50](#d50) | Описать replication version compatibility | DOC | candidate | S | G-DOC |
 | 1400 | LIN-1972 | [D50](#d50) | Описать downgrade support boundaries | DOC | candidate | S | G-DOC |
 
-### P3: 600 пунктов
+#### P3: 586 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -1558,7 +1516,6 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 1408 | LIN-0192 | [D05](#d05) | Добавить checkpoint error provenance | FEATURE | candidate | M | G-FEATURE |
 | 1409 | LIN-0193 | [D05](#d05) | Сравнить cold snapshot formats | PERF | candidate | M | G-PERF |
 | 1410 | LIN-0194 | [D05](#d05) | Сравнить snapshot encode chunk sizes | PERF | candidate | M | G-PERF |
-| 1411 | LIN-0195 | [D05](#d05) | Сравнить mmap и buffered decode | PERF | done | M | G-PERF |
 | 1412 | LIN-0196 | [D05](#d05) | Сравнить dictionary text snapshots | PERF | candidate | M | G-PERF |
 | 1413 | LIN-0197 | [D05](#d05) | Проверить snapshot disk quota | CORRECTNESS | qualification | S | G-CORRECT |
 | 1414 | LIN-0198 | [D05](#d05) | Проверить snapshot corruption isolation | CORRECTNESS | qualification | S | G-CORRECT |
@@ -1652,7 +1609,6 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 1502 | LIN-0710 | [D18](#d18) | Спроектировать Arrow import ownership | FEATURE | candidate | L | G-FEATURE |
 | 1503 | LIN-0711 | [D18](#d18) | Спроектировать Arrow export release callbacks | FEATURE | candidate | L | G-FEATURE |
 | 1504 | LIN-0712 | [D18](#d18) | Спроектировать Arrow schema mapping | FEATURE | candidate | L | G-FEATURE |
-| 1505 | LIN-0713 | [D18](#d18) | Добавить batch byte-size estimation | FEATURE | candidate | M | G-FEATURE |
 | 1506 | LIN-0714 | [D18](#d18) | Добавить batch allocation limits | FEATURE | candidate | M | G-FEATURE |
 | 1507 | LIN-0715 | [D18](#d18) | Добавить column memory diagnostics | FEATURE | candidate | M | G-FEATURE |
 | 1508 | LIN-0716 | [D18](#d18) | Добавить batch consistency inspector | FEATURE | candidate | M | G-FEATURE |
@@ -1776,9 +1732,6 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 1626 | LIN-1146 | [D29](#d29) | Проверить invalid shader recovery | CORRECTNESS | qualification | S | G-CORRECT |
 | 1627 | LIN-1147 | [D29](#d29) | Проверить invalid binding recovery | CORRECTNESS | qualification | S | G-CORRECT |
 | 1628 | LIN-1148 | [D29](#d29) | Проверить invalid dispatch recovery | CORRECTNESS | qualification | S | G-CORRECT |
-| 1629 | LIN-1149 | [D29](#d29) | Добавить adapter capability report | FEATURE | done | M | G-FEATURE |
-| 1630 | LIN-1150 | [D29](#d29) | Добавить resident allocation counters | FEATURE | done | M | G-FEATURE |
-| 1631 | LIN-1151 | [D29](#d29) | Добавить transfer byte counters | FEATURE | done | M | G-FEATURE |
 | 1632 | LIN-1152 | [D29](#d29) | Добавить device error provenance | FEATURE | candidate | M | G-FEATURE |
 | 1633 | LIN-1153 | [D29](#d29) | Проверить Metal backend conformance | CORRECTNESS | qualification | S | G-CORRECT |
 | 1634 | LIN-1154 | [D29](#d29) | Проверить Vulkan backend conformance | CORRECTNESS | qualification | S | G-CORRECT |
@@ -1828,7 +1781,6 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 1678 | LIN-1270 | [D32](#d32) | Проверить cold collection deletion | CORRECTNESS | qualification | S | G-CORRECT |
 | 1679 | LIN-1271 | [D32](#d32) | Проверить cold tier snapshot copying | CORRECTNESS | qualification | S | G-CORRECT |
 | 1680 | LIN-1272 | [D32](#d32) | Проверить cold checkpoint handoff | CORRECTNESS | qualification | S | G-CORRECT |
-| 1681 | LIN-1273 | [D32](#d32) | Спроектировать explicit warmup API | FEATURE | candidate | L | G-FEATURE |
 | 1682 | LIN-1274 | [D32](#d32) | Спроектировать bounded warmup operation | FEATURE | candidate | L | G-FEATURE |
 | 1683 | LIN-1275 | [D32](#d32) | Спроектировать cache purge inspection | FEATURE | candidate | L | G-FEATURE |
 | 1684 | LIN-1276 | [D32](#d32) | Спроектировать cold retention policy | FEATURE | candidate | L | G-FEATURE |
@@ -1842,7 +1794,6 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 1692 | LIN-1308 | [D33](#d33) | Проверить blocking pool shutdown | CORRECTNESS | qualification | S | G-CORRECT |
 | 1693 | LIN-1309 | [D33](#d33) | Спроектировать bounded embedding requests | API | candidate | L | G-API |
 | 1694 | LIN-1310 | [D33](#d33) | Спроектировать async replica reads | API | candidate | L | G-API |
-| 1695 | LIN-1311 | [D33](#d33) | Спроектировать batched async writes | API | candidate | L | G-API |
 | 1696 | LIN-1312 | [D33](#d33) | Спроектировать async checkpoint API | API | candidate | L | G-API |
 | 1697 | LIN-1313 | [D33](#d33) | Проверить async Send/Sync guarantees | CORRECTNESS | qualification | S | G-CORRECT |
 | 1698 | LIN-1314 | [D33](#d33) | Проверить borrowed input lifetime restrictions | CORRECTNESS | qualification | S | G-CORRECT |
@@ -2033,17 +1984,10 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 1883 | LIN-1787 | [D45](#d45) | Добавить explicit network model permissions | FEATURE | candidate | M | G-FEATURE |
 | 1884 | LIN-1788 | [D45](#d45) | Добавить import file-root restrictions | FEATURE | candidate | M | G-FEATURE |
 | 1885 | LIN-1789 | [D45](#d45) | Проверить C ABI pointer validation design | CORRECTNESS | qualification | S | G-CORRECT |
-| 1886 | LIN-1790 | [D45](#d45) | Проверить unsafe GPU buffer boundaries | CORRECTNESS | done | S | G-CORRECT |
-| 1887 | LIN-1791 | [D45](#d45) | Проверить mmap bounds arithmetic | CORRECTNESS | done | S | G-CORRECT |
-| 1888 | LIN-1792 | [D45](#d45) | Проверить SIMD unaligned tail safety | CORRECTNESS | done | S | G-CORRECT |
 | 1889 | LIN-1793 | [D45](#d45) | Добавить security regression corpus | VERIFY | qualification | S | G-VERIFY |
 | 1890 | LIN-1794 | [D45](#d45) | Добавить responsible disclosure guidance | FEATURE | candidate | M | G-FEATURE |
 | 1891 | LIN-1795 | [D45](#d45) | Добавить dependency provenance inventory | FEATURE | candidate | M | G-FEATURE |
 | 1892 | LIN-1796 | [D45](#d45) | Добавить offline execution qualification | FEATURE | candidate | M | G-FEATURE |
-| 1893 | LIN-1797 | [D45](#d45) | Проверить no implicit executable loading | CORRECTNESS | done | S | G-CORRECT |
-| 1894 | LIN-1798 | [D45](#d45) | Проверить no silent external requests | CORRECTNESS | done | S | G-CORRECT |
-| 1895 | LIN-1799 | [D45](#d45) | Проверить CLI history secret filtering | CORRECTNESS | done | S | G-CORRECT |
-| 1896 | LIN-1800 | [D45](#d45) | Проверить logs bounded-value formatting | CORRECTNESS | done | S | G-CORRECT |
 | 1897 | LIN-1825 | [D46](#d46) | Проверить unknown catalog versions | CORRECTNESS | qualification | S | G-CORRECT |
 | 1898 | LIN-1826 | [D46](#d46) | Проверить duplicate collection declarations | CORRECTNESS | qualification | S | G-CORRECT |
 | 1899 | LIN-1827 | [D46](#d46) | Проверить reserved field policy | CORRECTNESS | qualification | S | G-CORRECT |
@@ -2149,419 +2093,206 @@ ID `LIN-xxxx` стабилен; `rank` задаёт порядок triage. Яв�
 | 1999 | LIN-1999 | [D50](#d50) | Ввести architecture decision records | DOC | candidate | S | G-DOC |
 | 2000 | LIN-2000 | [D50](#d50) | Ввести completion evidence checklist | DOC | candidate | S | G-DOC |
 
-## Области и привязка к коду
+### Области и привязка к коду
 
-Ниже 50 областей по 40 пунктов. Зависимости областей — контекст для чтения и qualification, а не требование полностью закончить все 40 задач одной области перед другой. Взаимные связи архитектурных областей не являются циклом исполнения; реальные зависимости отдельных задач перечислены отдельно.
+Зависимости областей — контекст для чтения, а не требование закончить одну область перед другой.
 
 <a id="d01"></a>
 
-### D01. Бенчмарки и доказательства
-
-Модули: [benches/compare.rs](../benches/compare.rs), [scripts/bench-peers.py](../scripts/bench-peers.py), [docs/benchmark-contract.md](../docs/benchmark-contract.md). 40 пунктов: `LIN-0001`–`LIN-0040`.
+**D01. Бенчмарки и доказательства** — открыто 32 из 40. Модули: [benches/compare.rs](../benches/compare.rs), [scripts/bench-peers.py](../scripts/bench-peers.py), [docs/benchmark-contract.md](../docs/benchmark-contract.md).
 
 <a id="d02"></a>
 
-### D02. Формат WAL и checksum
-
-Модули: [src/persist/mod.rs](../src/persist/mod.rs), [src/crc.rs](../src/crc.rs), [tests/persist.rs](../tests/persist.rs). 40 пунктов: `LIN-0041`–`LIN-0080`.
-
-Контекст: [D01](#d01).
+**D02. Формат WAL и checksum** — открыто 36 из 40. Модули: [src/persist/mod.rs](../src/persist/mod.rs), [src/crc.rs](../src/crc.rs), [tests/persist.rs](../tests/persist.rs). Контекст: [D01](#d01).
 
 <a id="d03"></a>
 
-### D03. Durable I/O и sync
-
-Модули: [src/persist/mod.rs](../src/persist/mod.rs), [src/ship.rs](../src/ship.rs), [tests/persist.rs](../tests/persist.rs). 40 пунктов: `LIN-0081`–`LIN-0120`.
-
-Контекст: [D01](#d01), [D02](#d02).
+**D03. Durable I/O и sync** — открыто 36 из 40. Модули: [src/persist/mod.rs](../src/persist/mod.rs), [src/ship.rs](../src/ship.rs), [tests/persist.rs](../tests/persist.rs). Контекст: [D01](#d01), [D02](#d02).
 
 <a id="d04"></a>
 
-### D04. Replay и восстановление
-
-Модули: [src/persist/mod.rs](../src/persist/mod.rs), [src/store/mod.rs](../src/store/mod.rs), [tests/persist.rs](../tests/persist.rs). 40 пунктов: `LIN-0121`–`LIN-0160`.
-
-Контекст: [D02](#d02), [D03](#d03).
+**D04. Replay и восстановление** — открыто 36 из 40. Модули: [src/persist/mod.rs](../src/persist/mod.rs), [src/store/mod.rs](../src/store/mod.rs), [tests/persist.rs](../tests/persist.rs). Контекст: [D02](#d02), [D03](#d03).
 
 <a id="d05"></a>
 
-### D05. Snapshot и checkpoint
-
-Модули: [src/persist/mod.rs](../src/persist/mod.rs), [src/store/mod.rs](../src/store/mod.rs), [src/cold.rs](../src/cold.rs). 40 пунктов: `LIN-0161`–`LIN-0200`.
-
-Контекст: [D02](#d02), [D03](#d03), [D04](#d04).
+**D05. Snapshot и checkpoint** — открыто 34 из 40. Модули: [src/persist/mod.rs](../src/persist/mod.rs), [src/store/mod.rs](../src/store/mod.rs), [src/disk/mod.rs](../src/disk/mod.rs). Контекст: [D02](#d02), [D03](#d03), [D04](#d04).
 
 <a id="d06"></a>
 
-### D06. Транзакции и atomicity
-
-Модули: [src/exec/mod.rs](../src/exec/mod.rs), [src/store/mod.rs](../src/store/mod.rs), [tests/exec.rs](../tests/exec.rs). 40 пунктов: `LIN-0201`–`LIN-0240`.
-
-Контекст: [D02](#d02), [D04](#d04).
+**D06. Транзакции и atomicity** — открыто 27 из 40. Модули: [src/exec/mod.rs](../src/exec/mod.rs), [src/store/mod.rs](../src/store/mod.rs), [tests/exec.rs](../tests/exec.rs). Контекст: [D02](#d02), [D04](#d04).
 
 <a id="d07"></a>
 
-### D07. Mutations и bulk ingestion
-
-Модули: [src/exec/mod.rs](../src/exec/mod.rs), [src/store/mod.rs](../src/store/mod.rs), [tests/exec.rs](../tests/exec.rs). 40 пунктов: `LIN-0241`–`LIN-0280`.
-
-Контекст: [D06](#d06), [D08](#d08), [D10](#d10).
+**D07. Mutations и bulk ingestion** — открыто 36 из 40. Модули: [src/exec/mod.rs](../src/exec/mod.rs), [src/store/mod.rs](../src/store/mod.rs), [tests/exec.rs](../tests/exec.rs). Контекст: [D06](#d06), [D08](#d08), [D10](#d10).
 
 <a id="d08"></a>
 
-### D08. Cell и строковое представление
-
-Модули: [src/store/mod.rs](../src/store/mod.rs), [src/row.rs](../src/row.rs), [src/ast.rs](../src/ast.rs). 40 пунктов: `LIN-0281`–`LIN-0320`.
-
-Контекст: [D01](#d01).
+**D08. Cell и строковое представление** — открыто 30 из 40. Модули: [src/store/mod.rs](../src/store/mod.rs), [src/row.rs](../src/row.rs), [src/ast.rs](../src/ast.rs). Контекст: [D01](#d01).
 
 <a id="d09"></a>
 
-### D09. Владение и пулы памяти
-
-Модули: [src/row.rs](../src/row.rs), [src/batch.rs](../src/batch.rs), [src/cursor.rs](../src/cursor.rs). 40 пунктов: `LIN-0321`–`LIN-0360`.
-
-Контекст: [D08](#d08).
+**D09. Владение и пулы памяти** — открыто 40 из 40. Модули: [src/row.rs](../src/row.rs), [src/batch.rs](../src/batch.rs), [src/cursor.rs](../src/cursor.rs). Контекст: [D08](#d08).
 
 <a id="d10"></a>
 
-### D10. Scalar indexes
-
-Модули: [src/index.rs](../src/index.rs), [src/store/mod.rs](../src/store/mod.rs), [tests/query.rs](../tests/query.rs). 40 пунктов: `LIN-0361`–`LIN-0400`.
-
-Контекст: [D08](#d08), [D11](#d11).
+**D10. Scalar indexes** — открыто 33 из 40. Модули: [src/index.rs](../src/index.rs), [src/store/mod.rs](../src/store/mod.rs), [tests/query.rs](../tests/query.rs). Контекст: [D08](#d08), [D11](#d11).
 
 <a id="d11"></a>
 
-### D11. Ограничения и числовые ключи
-
-Модули: [src/index.rs](../src/index.rs), [src/check.rs](../src/check.rs), [tests/exec.rs](../tests/exec.rs). 40 пунктов: `LIN-0401`–`LIN-0440`.
-
-Контекст: [D08](#d08), [D13](#d13).
+**D11. Ограничения и числовые ключи** — открыто 36 из 40. Модули: [src/index.rs](../src/index.rs), [src/check.rs](../src/check.rs), [tests/exec.rs](../tests/exec.rs). Контекст: [D08](#d08), [D13](#d13).
 
 <a id="d12"></a>
 
-### D12. Парсер и синтаксис
-
-Модули: [src/parse.rs](../src/parse.rs), [src/ast.rs](../src/ast.rs), [tests/lang.rs](../tests/lang.rs). 40 пунктов: `LIN-0441`–`LIN-0480`.
-
-Контекст: [D13](#d13).
+**D12. Парсер и синтаксис** — открыто 39 из 40. Модули: [src/parse.rs](../src/parse.rs), [src/ast.rs](../src/ast.rs), [tests/lang.rs](../tests/lang.rs). Контекст: [D13](#d13).
 
 <a id="d13"></a>
 
-### D13. Type checking и semantics
-
-Модули: [src/check.rs](../src/check.rs), [src/catalog.rs](../src/catalog.rs), [tests/lang.rs](../tests/lang.rs). 40 пунктов: `LIN-0481`–`LIN-0520`.
-
-Контекст: [D08](#d08), [D46](#d46).
+**D13. Type checking и semantics** — открыто 36 из 40. Модули: [src/check.rs](../src/check.rs), [src/catalog.rs](../src/catalog.rs), [tests/lang.rs](../tests/lang.rs). Контекст: [D08](#d08), [D46](#d46).
 
 <a id="d14"></a>
 
-### D14. Логический planner
-
-Модули: [src/plan.rs](../src/plan.rs), [src/explain.rs](../src/explain.rs), [tests/query.rs](../tests/query.rs). 40 пунктов: `LIN-0521`–`LIN-0560`.
-
-Контекст: [D13](#d13).
+**D14. Логический planner** — открыто 35 из 40. Модули: [src/plan.rs](../src/plan.rs), [src/explain.rs](../src/explain.rs), [tests/query.rs](../tests/query.rs). Контекст: [D13](#d13).
 
 <a id="d15"></a>
 
-### D15. Статистика и cost model
-
-Модули: [src/plan.rs](../src/plan.rs), [src/catalog.rs](../src/catalog.rs), [src/index.rs](../src/index.rs). 40 пунктов: `LIN-0561`–`LIN-0600`.
-
-Контекст: [D14](#d14), [D10](#d10).
+**D15. Статистика и cost model** — открыто 40 из 40. Модули: [src/plan.rs](../src/plan.rs), [src/catalog.rs](../src/catalog.rs), [src/index.rs](../src/index.rs). Контекст: [D14](#d14), [D10](#d10).
 
 <a id="d16"></a>
 
-### D16. Execution pipeline
-
-Модули: [src/exec/mod.rs](../src/exec/mod.rs), [src/row.rs](../src/row.rs), [src/batch.rs](../src/batch.rs). 40 пунктов: `LIN-0601`–`LIN-0640`.
-
-Контекст: [D13](#d13), [D14](#d14).
+**D16. Execution pipeline** — открыто 40 из 40. Модули: [src/exec/mod.rs](../src/exec/mod.rs), [src/row.rs](../src/row.rs), [src/batch.rs](../src/batch.rs). Контекст: [D13](#d13), [D14](#d14).
 
 <a id="d17"></a>
 
-### D17. Cursors и streaming
-
-Модули: [src/cursor.rs](../src/cursor.rs), [src/query.rs](../src/query.rs), [src/async_db.rs](../src/async_db.rs). 40 пунктов: `LIN-0641`–`LIN-0680`.
-
-Контекст: [D16](#d16), [D34](#d34).
+**D17. Cursors и streaming** — открыто 40 из 40. Модули: [src/cursor.rs](../src/cursor.rs), [src/query.rs](../src/query.rs), [src/async_db.rs](../src/async_db.rs). Контекст: [D16](#d16), [D34](#d34).
 
 <a id="d18"></a>
 
-### D18. Колонки и RecordBatch
-
-Модули: [src/batch.rs](../src/batch.rs), [src/row.rs](../src/row.rs), [src/query.rs](../src/query.rs). 40 пунктов: `LIN-0681`–`LIN-0720`.
-
-Контекст: [D08](#d08).
+**D18. Колонки и RecordBatch** — открыто 37 из 40. Модули: [src/batch.rs](../src/batch.rs), [src/row.rs](../src/row.rs), [src/query.rs](../src/query.rs). Контекст: [D08](#d08).
 
 <a id="d19"></a>
 
-### D19. Aggregations и GROUP BY
-
-Модули: [src/exec/mod.rs](../src/exec/mod.rs), [src/store/mod.rs](../src/store/mod.rs), [tests/query.rs](../tests/query.rs). 40 пунктов: `LIN-0721`–`LIN-0760`.
-
-Контекст: [D08](#d08), [D13](#d13).
+**D19. Aggregations и GROUP BY** — открыто 29 из 40. Модули: [src/exec/mod.rs](../src/exec/mod.rs), [src/store/mod.rs](../src/store/mod.rs), [tests/query.rs](../tests/query.rs). Контекст: [D08](#d08), [D13](#d13).
 
 <a id="d20"></a>
 
-### D20. Sorting и Top-K
-
-Модули: [src/exec/mod.rs](../src/exec/mod.rs), [src/cursor.rs](../src/cursor.rs), [src/store/mod.rs](../src/store/mod.rs). 40 пунктов: `LIN-0761`–`LIN-0800`.
-
-Контекст: [D08](#d08), [D13](#d13).
+**D20. Sorting и Top-K** — открыто 40 из 40. Модули: [src/exec/mod.rs](../src/exec/mod.rs), [src/cursor.rs](../src/cursor.rs), [src/store/mod.rs](../src/store/mod.rs). Контекст: [D08](#d08), [D13](#d13).
 
 <a id="d21"></a>
 
-### D21. Joins и relational composition
-
-Модули: [src/exec/mod.rs](../src/exec/mod.rs), [src/cursor.rs](../src/cursor.rs), [src/batch.rs](../src/batch.rs). 40 пунктов: `LIN-0801`–`LIN-0840`.
-
-Контекст: [D08](#d08), [D14](#d14).
+**D21. Joins и relational composition** — открыто 40 из 40. Модули: [src/exec/mod.rs](../src/exec/mod.rs), [src/cursor.rs](../src/cursor.rs), [src/batch.rs](../src/batch.rs). Контекст: [D08](#d08), [D14](#d14).
 
 <a id="d22"></a>
 
-### D22. Window functions
-
-Модули: [src/window.rs](../src/window.rs), [src/exec/mod.rs](../src/exec/mod.rs), [tests/query.rs](../tests/query.rs). 40 пунктов: `LIN-0841`–`LIN-0880`.
-
-Контекст: [D08](#d08), [D19](#d19), [D20](#d20).
+**D22. Window functions** — открыто 35 из 40. Модули: [src/window.rs](../src/window.rs), [src/exec/mod.rs](../src/exec/mod.rs), [tests/query.rs](../tests/query.rs). Контекст: [D08](#d08), [D19](#d19), [D20](#d20).
 
 <a id="d23"></a>
 
-### D23. FTS build и tokenizer
-
-Модули: [src/fts.rs](../src/fts.rs), [src/catalog.rs](../src/catalog.rs), [tests/query.rs](../tests/query.rs). 40 пунктов: `LIN-0881`–`LIN-0920`.
-
-Контекст: [D08](#d08), [D46](#d46).
+**D23. FTS build и tokenizer** — открыто 35 из 40. Модули: [src/fts.rs](../src/fts.rs), [src/catalog.rs](../src/catalog.rs), [tests/query.rs](../tests/query.rs). Контекст: [D08](#d08), [D46](#d46).
 
 <a id="d24"></a>
 
-### D24. FTS query и scoring
-
-Модули: [src/fts.rs](../src/fts.rs), [src/exec/mod.rs](../src/exec/mod.rs), [src/cursor.rs](../src/cursor.rs). 40 пунктов: `LIN-0921`–`LIN-0960`.
-
-Контекст: [D23](#d23).
+**D24. FTS query и scoring** — открыто 39 из 40. Модули: [src/fts.rs](../src/fts.rs), [src/exec/mod.rs](../src/exec/mod.rs), [src/cursor.rs](../src/cursor.rs). Контекст: [D23](#d23).
 
 <a id="d25"></a>
 
-### D25. FTS mutation и compaction
-
-Модули: [src/fts.rs](../src/fts.rs), [src/store/mod.rs](../src/store/mod.rs), [tests/delete_readback.rs](../tests/delete_readback.rs). 40 пунктов: `LIN-0961`–`LIN-1000`.
-
-Контекст: [D06](#d06), [D23](#d23).
+**D25. FTS mutation и compaction** — открыто 36 из 40. Модули: [src/fts.rs](../src/fts.rs), [src/store/mod.rs](../src/store/mod.rs), [tests/delete_readback.rs](../tests/delete_readback.rs). Контекст: [D06](#d06), [D23](#d23).
 
 <a id="d26"></a>
 
-### D26. Hashing embeddings
-
-Модули: [src/embed.rs](../src/embed.rs), [src/exec/mod.rs](../src/exec/mod.rs), [tests/embed.rs](../tests/embed.rs). 40 пунктов: `LIN-1001`–`LIN-1040`.
-
-Контекст: [D08](#d08), [D13](#d13).
+**D26. Hashing embeddings** — открыто 40 из 40. Модули: [src/embed.rs](../src/embed.rs), [src/exec/mod.rs](../src/exec/mod.rs), [tests/embed.rs](../tests/embed.rs). Контекст: [D08](#d08), [D13](#d13).
 
 <a id="d27"></a>
 
-### D27. ANN и HNSW
-
-Модули: [src/embed.rs](../src/embed.rs), [src/store/mod.rs](../src/store/mod.rs), [src/exec/mod.rs](../src/exec/mod.rs). 40 пунктов: `LIN-1041`–`LIN-1080`.
-
-Контекст: [D26](#d26), [D28](#d28).
+**D27. ANN и HNSW** — открыто 30 из 40. Модули: [src/embed.rs](../src/embed.rs), [src/store/mod.rs](../src/store/mod.rs), [src/exec/mod.rs](../src/exec/mod.rs). Контекст: [D26](#d26), [D28](#d28).
 
 <a id="d28"></a>
 
-### D28. Vector search semantics
-
-Модули: [src/embed.rs](../src/embed.rs), [src/exec/mod.rs](../src/exec/mod.rs), [src/cursor.rs](../src/cursor.rs). 40 пунктов: `LIN-1081`–`LIN-1120`.
-
-Контекст: [D26](#d26).
+**D28. Vector search semantics** — открыто 36 из 40. Модули: [src/embed.rs](../src/embed.rs), [src/exec/mod.rs](../src/exec/mod.rs), [src/cursor.rs](../src/cursor.rs). Контекст: [D26](#d26).
 
 <a id="d29"></a>
 
-### D29. GPU resources и residency
-
-Модули: [src/gpu.rs](../src/gpu.rs), [src/gpu_regex.rs](../src/gpu_regex.rs), [tests/gpu.rs](../tests/gpu.rs). 40 пунктов: `LIN-1121`–`LIN-1160`.
-
-Контекст: [D18](#d18).
+**D29. GPU resources и residency** — открыто 27 из 40. Модули: [src/gpu.rs](../src/gpu.rs), [src/gpu_regex.rs](../src/gpu_regex.rs), [tests/gpu.rs](../tests/gpu.rs). Контекст: [D18](#d18).
 
 <a id="d30"></a>
 
-### D30. GPU kernels и equivalence
-
-Модули: [src/gpu.rs](../src/gpu.rs), [src/shaders/compare.wgsl](../src/shaders/compare.wgsl), [tests/shaders.rs](../tests/shaders.rs). 40 пунктов: `LIN-1161`–`LIN-1200`.
-
-Контекст: [D29](#d29).
+**D30. GPU kernels и equivalence** — открыто 36 из 40. Модули: [src/gpu.rs](../src/gpu.rs), [src/shaders/compare.wgsl](../src/shaders/compare.wgsl), [tests/shaders.rs](../tests/shaders.rs). Контекст: [D29](#d29).
 
 <a id="d31"></a>
 
-### D31. Graph queries
-
-Модули: [src/graph.rs](../src/graph.rs), [src/store/mod.rs](../src/store/mod.rs), [src/cursor.rs](../src/cursor.rs). 40 пунктов: `LIN-1201`–`LIN-1240`.
-
-Контекст: [D08](#d08), [D06](#d06).
+**D31. Graph queries** — открыто 40 из 40. Модули: [src/graph.rs](../src/graph.rs), [src/store/mod.rs](../src/store/mod.rs), [src/cursor.rs](../src/cursor.rs). Контекст: [D08](#d08), [D06](#d06).
 
 <a id="d32"></a>
 
-### D32. Cold storage и mmap
-
-Модули: [src/cold.rs](../src/cold.rs), [src/store/mod.rs](../src/store/mod.rs), [src/persist/mod.rs](../src/persist/mod.rs). 40 пунктов: `LIN-1241`–`LIN-1280`.
-
-Контекст: [D04](#d04), [D05](#d05).
+**D32. Cold storage и mmap** — открыто 37 из 40. Модули: [src/disk/mod.rs](../src/disk/mod.rs), [src/store/mod.rs](../src/store/mod.rs), [src/persist/mod.rs](../src/persist/mod.rs). Контекст: [D04](#d04), [D05](#d05).
 
 <a id="d33"></a>
 
-### D33. Async execution и backpressure
-
-Модули: [src/async_db.rs](../src/async_db.rs), [src/query.rs](../src/query.rs), [tests/query.rs](../tests/query.rs). 40 пунктов: `LIN-1281`–`LIN-1320`.
-
-Контекст: [D16](#d16), [D34](#d34).
+**D33. Async execution и backpressure** — открыто 39 из 40. Модули: [src/async_db.rs](../src/async_db.rs), [src/query.rs](../src/query.rs), [tests/query.rs](../tests/query.rs). Контекст: [D16](#d16), [D34](#d34).
 
 <a id="d34"></a>
 
-### D34. Concurrency и read snapshots
-
-Модули: [src/exec/mod.rs](../src/exec/mod.rs), [src/store/mod.rs](../src/store/mod.rs), [src/async_db.rs](../src/async_db.rs). 40 пунктов: `LIN-1321`–`LIN-1360`.
-
-Контекст: [D06](#d06).
+**D34. Concurrency и read snapshots** — открыто 36 из 40. Модули: [src/exec/mod.rs](../src/exec/mod.rs), [src/store/mod.rs](../src/store/mod.rs), [src/async_db.rs](../src/async_db.rs). Контекст: [D06](#d06).
 
 <a id="d35"></a>
 
-### D35. Replication transport
-
-Модули: [src/ship.rs](../src/ship.rs), [src/main.rs](../src/main.rs), [tests/persist.rs](../tests/persist.rs). 40 пунктов: `LIN-1361`–`LIN-1400`.
-
-Контекст: [D02](#d02), [D04](#d04).
+**D35. Replication transport** — открыто 36 из 40. Модули: [src/ship.rs](../src/ship.rs), [src/main.rs](../src/main.rs), [tests/persist.rs](../tests/persist.rs). Контекст: [D02](#d02), [D04](#d04).
 
 <a id="d36"></a>
 
-### D36. Followers и catch-up
-
-Модули: [src/ship.rs](../src/ship.rs), [src/persist/mod.rs](../src/persist/mod.rs), [src/main.rs](../src/main.rs). 40 пунктов: `LIN-1401`–`LIN-1440`.
-
-Контекст: [D35](#d35).
+**D36. Followers и catch-up** — открыто 36 из 40. Модули: [src/ship.rs](../src/ship.rs), [src/persist/mod.rs](../src/persist/mod.rs), [src/main.rs](../src/main.rs). Контекст: [D35](#d35).
 
 <a id="d37"></a>
 
-### D37. Public Rust API
-
-Модули: [src/lib.rs](../src/lib.rs), [src/query.rs](../src/query.rs), [src/exec/mod.rs](../src/exec/mod.rs). 40 пунктов: `LIN-1441`–`LIN-1480`.
-
-Контекст: [D13](#d13).
+**D37. Public Rust API** — открыто 38 из 40. Модули: [src/lib.rs](../src/lib.rs), [src/query.rs](../src/query.rs), [src/exec/mod.rs](../src/exec/mod.rs). Контекст: [D13](#d13).
 
 <a id="d38"></a>
 
-### D38. Typed queries и derive
-
-Модули: [lin-derive/src/lib.rs](../lin-derive/src/lib.rs), [src/row.rs](../src/row.rs), [src/query.rs](../src/query.rs). 40 пунктов: `LIN-1481`–`LIN-1520`.
-
-Контекст: [D37](#d37).
+**D38. Typed queries и derive** — открыто 40 из 40. Модули: [lin-derive/src/lib.rs](../lin-derive/src/lib.rs), [src/row.rs](../src/row.rs), [src/query.rs](../src/query.rs). Контекст: [D37](#d37).
 
 <a id="d39"></a>
 
-### D39. CLI и интерактивность
-
-Модули: [src/main.rs](../src/main.rs), [src/explain.rs](../src/explain.rs), [tests/compute_cli.rs](../tests/compute_cli.rs). 40 пунктов: `LIN-1521`–`LIN-1560`.
-
-Контекст: [D37](#d37).
+**D39. CLI и интерактивность** — открыто 38 из 40. Модули: [src/main.rs](../src/main.rs), [src/explain.rs](../src/explain.rs), [tests/compute_cli.rs](../tests/compute_cli.rs). Контекст: [D37](#d37).
 
 <a id="d40"></a>
 
-### D40. Errors и диагностика
-
-Модули: [src/error.rs](../src/error.rs), [src/parse.rs](../src/parse.rs), [src/check.rs](../src/check.rs). 40 пунктов: `LIN-1561`–`LIN-1600`.
-
-Контекст: [D13](#d13).
+**D40. Errors и диагностика** — открыто 40 из 40. Модули: [src/error.rs](../src/error.rs), [src/parse.rs](../src/parse.rs), [src/check.rs](../src/check.rs). Контекст: [D13](#d13).
 
 <a id="d41"></a>
 
-### D41. Observability
-
-Модули: [src/exec/mod.rs](../src/exec/mod.rs), [src/persist/mod.rs](../src/persist/mod.rs), [src/explain.rs](../src/explain.rs). 40 пунктов: `LIN-1601`–`LIN-1640`.
-
-Контекст: [D40](#d40).
+**D41. Observability** — открыто 40 из 40. Модули: [src/exec/mod.rs](../src/exec/mod.rs), [src/persist/mod.rs](../src/persist/mod.rs), [src/explain.rs](../src/explain.rs). Контекст: [D40](#d40).
 
 <a id="d42"></a>
 
-### D42. Property и differential testing
-
-Модули: [tests/lang.rs](../tests/lang.rs), [tests/query.rs](../tests/query.rs), [tests/persist.rs](../tests/persist.rs). 40 пунктов: `LIN-1641`–`LIN-1680`.
-
-Контекст: [D13](#d13).
+**D42. Property и differential testing** — открыто 36 из 40. Модули: [tests/lang.rs](../tests/lang.rs), [tests/query.rs](../tests/query.rs), [tests/persist.rs](../tests/persist.rs). Контекст: [D13](#d13).
 
 <a id="d43"></a>
 
-### D43. Crash и fault injection
-
-Модули: [src/persist/mod.rs](../src/persist/mod.rs), [src/ship.rs](../src/ship.rs), [tests/persist.rs](../tests/persist.rs). 40 пунктов: `LIN-1681`–`LIN-1720`.
-
-Контекст: [D02](#d02), [D03](#d03), [D04](#d04).
+**D43. Crash и fault injection** — открыто 35 из 40. Модули: [src/persist/mod.rs](../src/persist/mod.rs), [src/ship.rs](../src/ship.rs), [tests/persist.rs](../tests/persist.rs). Контекст: [D02](#d02), [D03](#d03), [D04](#d04).
 
 <a id="d44"></a>
 
-### D44. CI и платформы
-
-Модули: [.github/workflows/bench.yml](../.github/workflows/bench.yml), [scripts/ci-bench.sh](../scripts/ci-bench.sh), [tests/shaders.rs](../tests/shaders.rs). 40 пунктов: `LIN-1721`–`LIN-1760`.
-
-Контекст: [D01](#d01), [D42](#d42).
+**D44. CI и платформы** — открыто 40 из 40. Модули: [.github/workflows/bench.yml](../.github/workflows/bench.yml), [scripts/ci-bench.sh](../scripts/ci-bench.sh), [tests/shaders.rs](../tests/shaders.rs). Контекст: [D01](#d01), [D42](#d42).
 
 <a id="d45"></a>
 
-### D45. Безопасность и resource limits
-
-Модули: [src/exec/mod.rs](../src/exec/mod.rs), [src/persist/mod.rs](../src/persist/mod.rs), [src/ship.rs](../src/ship.rs). 40 пунктов: `LIN-1761`–`LIN-1800`.
-
-Контекст: [D40](#d40).
+**D45. Безопасность и resource limits** — открыто 14 из 40. Модули: [src/exec/mod.rs](../src/exec/mod.rs), [src/persist/mod.rs](../src/persist/mod.rs), [src/ship.rs](../src/ship.rs). Контекст: [D40](#d40).
 
 <a id="d46"></a>
 
-### D46. Catalog и schema evolution
-
-Модули: [src/catalog.rs](../src/catalog.rs), [src/check.rs](../src/check.rs), [src/exec/mod.rs](../src/exec/mod.rs). 40 пунктов: `LIN-1801`–`LIN-1840`.
-
-Контекст: [D06](#d06).
+**D46. Catalog и schema evolution** — открыто 40 из 40. Модули: [src/catalog.rs](../src/catalog.rs), [src/check.rs](../src/check.rs), [src/exec/mod.rs](../src/exec/mod.rs). Контекст: [D06](#d06).
 
 <a id="d47"></a>
 
-### D47. Import и export
-
-Модули: [src/main.rs](../src/main.rs), [src/row.rs](../src/row.rs), [src/batch.rs](../src/batch.rs). 40 пунктов: `LIN-1841`–`LIN-1880`.
-
-Контекст: [D18](#d18), [D46](#d46).
+**D47. Import и export** — открыто 40 из 40. Модули: [src/main.rs](../src/main.rs), [src/row.rs](../src/row.rs), [src/batch.rs](../src/batch.rs). Контекст: [D18](#d18), [D46](#d46).
 
 <a id="d48"></a>
 
-### D48. Operations и lifecycle
-
-Модули: [src/main.rs](../src/main.rs), [src/persist/mod.rs](../src/persist/mod.rs), [src/ship.rs](../src/ship.rs). 40 пунктов: `LIN-1881`–`LIN-1920`.
-
-Контекст: [D03](#d03), [D04](#d04), [D05](#d05).
+**D48. Operations и lifecycle** — открыто 40 из 40. Модули: [src/main.rs](../src/main.rs), [src/persist/mod.rs](../src/persist/mod.rs), [src/ship.rs](../src/ship.rs). Контекст: [D03](#d03), [D04](#d04), [D05](#d05).
 
 <a id="d49"></a>
 
-### D49. Build и distribution
-
-Модули: [Cargo.toml](../Cargo.toml), [Cargo.lock](../Cargo.lock), [src/lib.rs](../src/lib.rs). 40 пунктов: `LIN-1921`–`LIN-1960`.
-
-Контекст: [D44](#d44).
+**D49. Build и distribution** — открыто 40 из 40. Модули: [Cargo.toml](../Cargo.toml), [Cargo.lock](../Cargo.lock), [src/lib.rs](../src/lib.rs). Контекст: [D44](#d44).
 
 <a id="d50"></a>
 
-### D50. Документация и продуктовый контракт
-
-Модули: [README.md](../README.md), [CHANGELOG.md](../CHANGELOG.md), [docs/benchmark-contract.md](../docs/benchmark-contract.md). 40 пунктов: `LIN-1961`–`LIN-2000`.
-
-Контекст: [D01](#d01), [D37](#d37).
-
-## Явные зависимости отдельных задач
-
-- `LIN-0001` → `LIN-0029`.
-- `LIN-0002` → `LIN-0081`, `LIN-0082`, `LIN-0084`.
-- `LIN-0003` → `LIN-0081`, `LIN-0082`, `LIN-0084`.
-- `LIN-0004` → `LIN-0029`.
-
-## Происхождение и контроль полноты
-
-Основа: текущие модули и история коммитов, [контракт бенчмарков](benchmark-contract.md), [история измерений](benchmark-history.md), [текущий baseline](../benches/results/2026-10-21-current-native-durable/report.md), [compute qualification](compute-support.md). Старый RAG-каталог `4d4d3e41-29ff-4236-8c12-8624850067e6` использован только как источник направлений: его пропущенные диапазоны и широкие заявления не переносятся как выполненные проверки или готовые задачи.
-
-Машиночитаемый источник — [roadmap-2000.json](roadmap-2000.json). Проверка: `python3 scripts/check-roadmap-2000.py`. Она проверяет количество, уникальность ID/названий, ранги, области, зависимости, gate, существование файлов и соответствие Markdown JSON. Она не доказывает актуальность каждой гипотезы или наличие каждого предполагаемого дефекта; это предмет triage.
-
-Итоговые количества: P1: 110, P2: 1290, P3: 600; статусы: blocked_external: 1, candidate: 951, done: 172, qualification: 876.
+**D50. Документация и продуктовый контракт** — открыто 40 из 40. Модули: [README.md](../README.md), [CHANGELOG.md](../CHANGELOG.md), [docs/benchmark-contract.md](../docs/benchmark-contract.md). Контекст: [D01](#d01), [D37](#d37).

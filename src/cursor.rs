@@ -22,7 +22,7 @@ use crate::exec::{
     pred_total_gt, project_join_fields,
 };
 use crate::query::Queryable;
-use crate::store::{Cell, Row, Store, now_ms, project_fields, row_text};
+use crate::store::{Cell, Row, Store, cell_from_arc_inline, now_ms, project_fields, row_text};
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 use smallvec::{SmallVec, smallvec};
 
@@ -33,7 +33,7 @@ thread_local! {
 /// Sync pull cursor over query results.
 pub struct QueryCursor<'a> {
     db: CursorDb<'a>,
-    state: CursorState,
+    state: CursorState<'a>,
 }
 
 /// Compact cursor projection: one shared field schema plus row-local cells.
@@ -90,15 +90,15 @@ enum CursorDb<'a> {
     Reader(&'a ReadDb),
 }
 
-impl CursorDb<'_> {
-    fn inner(&self) -> &Db {
+impl<'a> CursorDb<'a> {
+    fn inner(&self) -> &'a Db {
         match self {
             Self::Writer(db) => db,
             Self::Reader(db) => db.as_db(),
         }
     }
 
-    fn store_catalog(&self) -> (&Store, &crate::catalog::Catalog) {
+    fn store_catalog(&self) -> (&'a Store, &'a crate::catalog::Catalog) {
         let inner = self.inner();
         (&inner.store, &inner.catalog)
     }
@@ -165,13 +165,13 @@ impl CursorDb<'_> {
 }
 
 #[allow(clippy::large_enum_variant)]
-enum CursorState {
+enum CursorState<'a> {
     #[cfg(feature = "gpu")]
     GpuStream(GpuStreamCursor),
     Lazy(LazyCursor),
     LazyJoin(LazyJoinCursor),
     /// Hot SoA: `orders [| total >] | join users on user_id | { id, users.email, total }`
-    LazyJoinSoa(LazyJoinSoa),
+    LazyJoinSoa(LazyJoinSoa<'a>),
     Buffered(std::vec::IntoIter<Row>),
     Done,
 }
@@ -204,18 +204,38 @@ struct LazyJoinCursor {
     pending: VecDeque<Row>,
 }
 
+enum UserProbe<'a> {
+    Borrowed(&'a FxHashMap<Arc<str>, usize>),
+    Owned(FxHashMap<Arc<str>, usize>),
+}
+
+impl UserProbe<'_> {
+    #[inline]
+    fn map(&self) -> &FxHashMap<Arc<str>, usize> {
+        match self {
+            Self::Borrowed(m) => m,
+            Self::Owned(m) => m,
+        }
+    }
+}
+
 /// Columnar left + user-index probe; emits compact 3-field rows.
-struct LazyJoinSoa {
+struct LazyJoinSoa<'a> {
     source: RowSource,
     pos: usize,
     left_join: bool,
     /// When set, filter `orders.total > min` without row maps.
     total_gt: Option<f64>,
-    /// Fallback user_id → index into users SoA columns when `store.by_id["users"]` is not aligned.
-    probe: Option<FxHashMap<Arc<str>, usize>>,
+    orders_id: &'a [Arc<str>],
+    orders_uid: &'a [Arc<str>],
+    orders_total: &'a [f64],
+    users_email: &'a [Arc<str>],
+    probe: UserProbe<'a>,
     skip_left: usize,
     take_left: Option<usize>,
     fields: Arc<[String]>,
+    /// Pre-seeded row with sorted keys `"id"`, `"total"`, `"users.email"` for zero-search cloning.
+    template_row: Row,
 }
 
 enum RowSource {
@@ -321,7 +341,7 @@ impl<'a> QueryCursor<'a> {
                 })
             }),
             CursorState::Lazy(lazy) => next_lazy_projected(store, lazy),
-            CursorState::LazyJoinSoa(join) => next_lazy_join_soa_projected(store, join),
+            CursorState::LazyJoinSoa(join) => next_lazy_join_soa_projected(join),
             _ => unreachable!("native projected state checked above"),
         };
         if item.is_none() {
@@ -357,7 +377,7 @@ impl Iterator for QueryCursor<'_> {
             CursorState::GpuStream(stream) => next_gpu_stream(&self.db, stream),
             CursorState::Lazy(lazy) => next_lazy(store, lazy),
             CursorState::LazyJoin(join) => next_lazy_join(store, join),
-            CursorState::LazyJoinSoa(join) => next_lazy_join_soa(store, join),
+            CursorState::LazyJoinSoa(join) => next_lazy_join_soa(join),
             _ => None,
         };
 
@@ -1013,23 +1033,21 @@ fn collect_seed_keys_arc(
     seen: &mut FxHashSet<Arc<str>>,
 ) {
     let rows = store.collection(collection);
-    let mut push_cell = |c: Option<&Cell>| {
-        match c {
-            Some(Cell::Text(a)) if !a.is_empty() => {
-                if seen.insert(Arc::clone(a)) {
-                    out.push(Arc::clone(a));
-                }
+    let mut push_cell = |c: Option<&Cell>| match c {
+        Some(Cell::Text(a)) if !a.is_empty() => {
+            if seen.insert(Arc::clone(a)) {
+                out.push(Arc::clone(a));
             }
-            Some(other) => {
-                if let Some(s) = other.text().filter(|s| !s.is_empty()) {
-                    let a: Arc<str> = Arc::from(s);
-                    if seen.insert(Arc::clone(&a)) {
-                        out.push(a);
-                    }
-                }
-            }
-            None => {}
         }
+        Some(other) => {
+            if let Some(s) = other.text().filter(|s| !s.is_empty()) {
+                let a: Arc<str> = Arc::from(s);
+                if seen.insert(Arc::clone(&a)) {
+                    out.push(a);
+                }
+            }
+        }
+        None => {}
     };
     let mut push = |row: &Row| {
         push_cell(row.get("id"));
@@ -1066,174 +1084,116 @@ fn collect_seed_keys_arc(
     }
 }
 
-fn next_lazy_join_soa(store: &Store, join: &mut LazyJoinSoa) -> Option<Result<Row, Error>> {
-    let orders_id = store.orders_id();
-    let orders_uid = store.orders_user_id();
-    let orders_total = store.orders_total();
-    let users_email = store.users_email();
-    let n = orders_id.len();
+impl<'a> LazyJoinSoa<'a> {
+    #[inline]
+    fn next_matched(&mut self) -> Option<(&'a Arc<str>, f64, Option<&'a Arc<str>>)> {
+        let probe = self.probe.map();
+        let n = self.orders_id.len();
 
-    loop {
-        if join.take_left == Some(0) {
-            return None;
-        }
-        let idx = match &join.source {
-            RowSource::Idxs(idxs) => {
-                if join.pos >= idxs.len() {
-                    return None;
-                }
-                let i = idxs[join.pos];
-                join.pos += 1;
-                i
+        loop {
+            if self.take_left == Some(0) {
+                return None;
             }
-            RowSource::Scan { len } => {
-                if join.pos >= *len {
-                    return None;
+            let idx = match &self.source {
+                RowSource::Idxs(idxs) => {
+                    if self.pos >= idxs.len() {
+                        return None;
+                    }
+                    let i = idxs[self.pos];
+                    self.pos += 1;
+                    i
                 }
-                let i = join.pos;
-                join.pos += 1;
-                i
+                RowSource::Scan { len } => {
+                    if self.pos >= *len {
+                        return None;
+                    }
+                    let i = self.pos;
+                    self.pos += 1;
+                    i
+                }
+            };
+            if idx >= n {
+                continue;
             }
-        };
-        if idx >= n {
-            continue;
+            debug_assert_eq!(self.orders_id.len(), self.orders_uid.len());
+            debug_assert_eq!(self.orders_id.len(), self.orders_total.len());
+            // SAFETY: `LazyJoinSoa` is constructed only after `orders_soa_ready()`;
+            // `idx < orders_id.len()` was checked above, and `'a` borrows the immutable `Store`.
+            let (order_id, uid, total) = unsafe {
+                (
+                    self.orders_id.get_unchecked(idx),
+                    self.orders_uid.get_unchecked(idx).as_ref(),
+                    *self.orders_total.get_unchecked(idx),
+                )
+            };
+            if let Some(min) = self.total_gt
+                && total.partial_cmp(&min) != Some(std::cmp::Ordering::Greater)
+            {
+                continue;
+            }
+            let right = probe.get(uid).copied();
+            if right.is_none() && !self.left_join {
+                continue;
+            }
+            if self.skip_left > 0 {
+                self.skip_left -= 1;
+                continue;
+            }
+            if let Some(t) = self.take_left.as_mut() {
+                *t = t.saturating_sub(1);
+            }
+            // SAFETY: probe indices point into aligned `users_email` after `users_soa_ready()`.
+            let email = right.map(|ui| {
+                debug_assert!(ui < self.users_email.len());
+                unsafe { self.users_email.get_unchecked(ui) }
+            });
+            return Some((order_id, total, email));
         }
-        let (order_id, uid, total) = unsafe {
-            (
-                orders_id.get_unchecked(idx),
-                orders_uid.get_unchecked(idx).as_ref(),
-                *orders_total.get_unchecked(idx),
-            )
-        };
-        if let Some(min) = join.total_gt
-            && total.partial_cmp(&min) != Some(std::cmp::Ordering::Greater)
-        {
-            continue;
-        }
-        let right = join
-            .probe
-            .as_ref()
-            .or_else(|| store.by_id.get("users"))
-            .and_then(|m| m.get(uid).copied());
-        if right.is_none() && !join.left_join {
-            continue;
-        }
-        if join.skip_left > 0 {
-            join.skip_left -= 1;
-            continue;
-        }
-        if let Some(t) = join.take_left.as_mut() {
-            *t = t.saturating_sub(1);
-        }
-
-        let mut row = crate::store::acquire_row();
-        row.insert(join.fields[0].clone(), Cell::Text(Arc::clone(order_id)));
-        row.insert(join.fields[2].clone(), Cell::Float(total));
-        row.insert(
-            join.fields[1].clone(),
-            match right {
-                Some(ui) => Cell::Text(Arc::clone(unsafe { users_email.get_unchecked(ui) })),
-                None => Cell::Null,
-            },
-        );
-        return Some(Ok(row));
     }
 }
 
-#[inline]
-fn next_lazy_join_soa_projected(
-    store: &Store,
-    join: &mut LazyJoinSoa,
-) -> Option<Result<ProjectedRow, Error>> {
-    let orders_id = store.orders_id();
-    let orders_uid = store.orders_user_id();
-    let orders_total = store.orders_total();
-    let users_email = store.users_email();
-    let n = orders_id.len();
-
-    loop {
-        if join.take_left == Some(0) {
-            return None;
-        }
-        let idx = match &join.source {
-            RowSource::Idxs(idxs) => {
-                if join.pos >= idxs.len() {
-                    return None;
-                }
-                let i = idxs[join.pos];
-                join.pos += 1;
-                i
-            }
-            RowSource::Scan { len } => {
-                if join.pos >= *len {
-                    return None;
-                }
-                let i = join.pos;
-                join.pos += 1;
-                i
-            }
-        };
-        if idx >= n {
-            continue;
-        }
-        debug_assert_eq!(orders_id.len(), orders_uid.len());
-        debug_assert_eq!(orders_id.len(), orders_total.len());
-        // SAFETY: `LazyJoinSoa` is constructed only after `orders_soa_ready()`;
-        // `idx < orders_id.len()` was checked above, and the cursor's shared Db
-        // borrow prevents mutation while these parallel columns are consumed.
-        let (order_id, uid, total) = unsafe {
-            (
-                orders_id.get_unchecked(idx),
-                orders_uid.get_unchecked(idx).as_ref(),
-                *orders_total.get_unchecked(idx),
-            )
-        };
-        if let Some(min) = join.total_gt
-            && total.partial_cmp(&min) != Some(std::cmp::Ordering::Greater)
-        {
-            continue;
-        }
-        let right = join
-            .probe
-            .as_ref()
-            .or_else(|| store.by_id.get("users"))
-            .and_then(|m| m.get(uid).copied());
-        if right.is_none() && !join.left_join {
-            continue;
-        }
-        if join.skip_left > 0 {
-            join.skip_left -= 1;
-            continue;
-        }
-        if let Some(t) = join.take_left.as_mut() {
-            *t = t.saturating_sub(1);
-        }
-
-        let cells = smallvec![
-            Cell::Text(Arc::clone(order_id)),
-            match right {
-                Some(ui) => {
-                    debug_assert!(ui < users_email.len());
-                    // SAFETY: probe indices are built from aligned users SoA
-                    // columns after `users_soa_ready()` and cannot mutate here.
-                    Cell::Text(Arc::clone(unsafe { users_email.get_unchecked(ui) }))
-                }
-                None => Cell::Null,
-            },
-            Cell::Float(total),
-        ];
-        return Some(Ok(ProjectedRow {
-            fields: Arc::clone(&join.fields),
-            cells,
-        }));
+fn next_lazy_join_soa(join: &mut LazyJoinSoa<'_>) -> Option<Result<Row, Error>> {
+    let (order_id, total, email) = join.next_matched()?;
+    let mut row = join.template_row.clone();
+    let mut vals = row.values_mut();
+    // Sorted key order: "id" < "total" < "users.email".
+    if let Some(slot) = vals.next() {
+        *slot = cell_from_arc_inline(order_id);
     }
+    if let Some(slot) = vals.next() {
+        *slot = Cell::Float(total);
+    }
+    if let Some(slot) = vals.next() {
+        *slot = match email {
+            Some(e) => cell_from_arc_inline(e),
+            None => Cell::Null,
+        };
+    }
+    Some(Ok(row))
+}
+
+#[inline]
+fn next_lazy_join_soa_projected(join: &mut LazyJoinSoa<'_>) -> Option<Result<ProjectedRow, Error>> {
+    let (order_id, total, email) = join.next_matched()?;
+    let cells = smallvec![
+        cell_from_arc_inline(order_id),
+        match email {
+            Some(e) => cell_from_arc_inline(e),
+            None => Cell::Null,
+        },
+        Cell::Float(total),
+    ];
+    Some(Ok(ProjectedRow {
+        fields: Arc::clone(&join.fields),
+        cells,
+    }))
 }
 
 fn is_orders_users_id_email_total(fields: &[String]) -> bool {
     fields.len() == 3 && fields[0] == "id" && fields[1] == "users.email" && fields[2] == "total"
 }
 
-fn try_lazy_join_soa(db: &CursorDb<'_>, q: &Query) -> Result<Option<LazyJoinSoa>, Error> {
+fn try_lazy_join_soa<'a>(db: &CursorDb<'a>, q: &Query) -> Result<Option<LazyJoinSoa<'a>>, Error> {
     let Source::Collection(name) = &q.source else {
         return Ok(None);
     };
@@ -1325,30 +1285,41 @@ fn try_lazy_join_soa(db: &CursorDb<'_>, q: &Query) -> Result<Option<LazyJoinSoa>
         None => Some(50),
     };
 
-    let n = store.orders_id().len();
+    let orders_id = store.orders_id();
+    let orders_uid = store.orders_user_id();
+    let orders_total = store.orders_total();
+    let users_id = store.users_id();
+    let users_email = store.users_email();
+    let n = orders_id.len();
     let source = RowSource::Scan { len: n };
 
-    let users_id = store.users_id();
-    let probe = if store
-        .by_id
-        .get("users")
-        .is_some_and(|m| m.len() == users_id.len())
+    let probe = if let Some(by_id) = store.by_id.get("users")
+        && by_id.len() == users_id.len()
     {
-        None
+        UserProbe::Borrowed(by_id)
     } else {
         let mut map: FxHashMap<Arc<str>, usize> = FxHashMap::default();
         map.reserve(users_id.len());
         for (i, id) in users_id.iter().enumerate() {
             map.insert(Arc::clone(id), i);
         }
-        Some(map)
+        UserProbe::Owned(map)
     };
+
+    let mut template_row = crate::store::acquire_row();
+    template_row.insert(String::from("id"), Cell::Null);
+    template_row.insert(String::from("total"), Cell::Null);
+    template_row.insert(String::from("users.email"), Cell::Null);
 
     Ok(Some(LazyJoinSoa {
         source,
         pos: 0,
         left_join,
         total_gt,
+        orders_id,
+        orders_uid,
+        orders_total,
+        users_email,
         probe,
         skip_left: skip_n,
         take_left,
@@ -1358,6 +1329,7 @@ fn try_lazy_join_soa(db: &CursorDb<'_>, q: &Query) -> Result<Option<LazyJoinSoa>
             String::from("total"),
         ]
         .into(),
+        template_row,
     }))
 }
 

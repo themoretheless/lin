@@ -12,10 +12,12 @@ pub use columnar::DictColumn;
 pub use edges::Edge;
 pub(crate) use value::intern_wing;
 #[allow(unused_imports)]
+pub(crate) use value::take_recycled_id_title_vec;
+#[allow(unused_imports)]
 pub use value::{
-    Cell, InlineStr, Row, RowExt, acquire_orders_row, acquire_row, compact_row, content_hash_arc,
-    fnv1a64, now_ms, project_fields, release_id_title_rows, release_orders_row, row_byte_size,
-    row_text,
+    Cell, InlineStr, Row, RowExt, acquire_orders_row, acquire_row, cell_from_arc_inline,
+    compact_row, content_hash_arc, fnv1a64, now_ms, project_fields, release_id_title_rows,
+    release_orders_row, row_byte_size, row_text,
 };
 
 use std::collections::BTreeMap;
@@ -40,7 +42,34 @@ pub const COLD_MIN_ROWS: usize = 32;
 
 pub(crate) struct DiskColLazy {
     pub row_count: usize,
-    pub materialized: OnceLock<Vec<Row>>,
+    pub materialized: OnceLock<LazyRows>,
+}
+
+/// Rows of a disk-backed collection read into memory on demand, plus a primary-key map
+/// built the first time a caller needs to address them by `id`. Both are dropped together
+/// whenever the collection's disk state changes.
+#[derive(Default)]
+pub(crate) struct LazyRows {
+    pub rows: Vec<Row>,
+    by_id: OnceLock<FxHashMap<String, usize>>,
+}
+
+impl LazyRows {
+    fn index_of(&self, id: &str) -> Option<usize> {
+        self.by_id
+            .get_or_init(|| {
+                let mut map = FxHashMap::default();
+                map.reserve(self.rows.len());
+                for (i, r) in self.rows.iter().enumerate() {
+                    if let Some(id) = row_text(r, "id") {
+                        map.insert(id.to_string(), i);
+                    }
+                }
+                map
+            })
+            .get(id)
+            .copied()
+    }
 }
 
 impl std::fmt::Debug for DiskColLazy {
@@ -133,6 +162,18 @@ pub struct Store {
     facts_rows_stale: bool,
     /// Columnar mmap disk tier (`DiskEngine`) for out-of-core / cold collections.
     pub(crate) disk: Option<StoreDiskTier>,
+    /// FTS index field definitions for cold tables whose in-memory `fts` entry
+    /// was invalidated by a zero-promote overlay mutation (rebuilt lazily on checkpoint).
+    pub(crate) dirty_fts_disk: BTreeMap<String, Vec<String>>,
+    /// Stashed FTS state while a `Transaction` savepoint is open over a cold overlay.
+    pub(crate) overlay_savepoint_fts:
+        Option<(BTreeMap<String, crate::fts::FtsIndex>, BTreeMap<String, Vec<String>>)>,
+    /// Cluster keys declared this session (`collection -> column`). The disk tier is
+    /// attached read-only between checkpoints, so they are applied to the manifest by the
+    /// next checkpoint; they also outlive a collection being promoted and spilled again.
+    pub(crate) disk_cluster_keys: BTreeMap<String, String>,
+    /// Cold collections whose segments the next checkpoint should rewrite (compaction).
+    pub(crate) disk_compact_requests: Vec<String>,
 }
 
 /// Compact collection key for zero-allocation `AppendMark` snapshots.
@@ -168,7 +209,6 @@ pub struct AppendMark {
     edge_len: usize,
     facts_len: usize,
 }
-
 
 impl Store {
     pub fn empty(embed_id: impl Into<String>) -> Self {
@@ -230,6 +270,10 @@ impl Store {
             facts_o: Vec::new(),
             facts_rows_stale: false,
             disk: None,
+            dirty_fts_disk: BTreeMap::new(),
+            overlay_savepoint_fts: None,
+            disk_cluster_keys: BTreeMap::new(),
+            disk_compact_requests: Vec::new(),
         }
     }
 
@@ -238,6 +282,216 @@ impl Store {
         self.disk
             .as_ref()
             .is_some_and(|d| d.tables.contains_key(name))
+    }
+
+    /// An already validated pack (WAL replay, follower apply, executor after its own checks)
+    /// can be applied to the disk overlay whenever nothing tracks in-memory row positions.
+    /// Scalar `LiveIndex`es of a disk-backed collection are empty placeholders, so they need
+    /// no maintenance; an HNSW graph does.
+    #[inline]
+    pub fn can_apply_disk_overlay(&self, collection: &str) -> bool {
+        self.is_disk_backed(collection) && !self.hnsw.contains_key(collection)
+    }
+
+    /// Fields covered by single-column, unconditional unique indexes of `collection`.
+    /// `None` when some unique index is composite or partial: its key cannot be checked
+    /// against the disk engine with a plain equality lookup.
+    pub(crate) fn simple_unique_fields(&self, collection: &str) -> Option<Vec<String>> {
+        let mut out: Vec<String> = Vec::new();
+        let mut add = |fields: &[String], partial: bool| -> bool {
+            if fields.len() != 1 || partial {
+                return false;
+            }
+            if !out.contains(&fields[0]) {
+                out.push(fields[0].clone());
+            }
+            true
+        };
+        for li in self.indexes.values() {
+            if li.def.collection == collection
+                && li.def.unique
+                && !add(&li.def.fields, li.def.pred.is_some())
+            {
+                return None;
+            }
+        }
+        for ix in self.extra_indexes.values() {
+            if ix.collection == collection
+                && ix.unique
+                && !add(&ix.fields, ix.pred_src.is_some())
+            {
+                return None;
+            }
+        }
+        Some(out)
+    }
+
+    /// True when some live row of a disk-backed collection has `field == key` (text key).
+    pub(crate) fn disk_count_eq(&self, collection: &str, field: &str, key: &str) -> usize {
+        self.disk_engine_read()
+            .and_then(|eng| eng.count_by_eq(collection, field, &Cell::from_text(key)).ok())
+            .unwrap_or(0)
+    }
+
+    /// True when `field` takes part in a unique index of `collection`.
+    pub(crate) fn field_in_unique_index(&self, collection: &str, field: &str) -> bool {
+        self.extra_indexes.values().any(|ix| {
+            ix.collection == collection && ix.unique && ix.fields.iter().any(|f| f == field)
+        }) || self.indexes.values().any(|li| {
+            li.def.collection == collection
+                && li.def.unique
+                && li.def.fields.iter().any(|f| f == field)
+        })
+    }
+
+    #[inline]
+    pub fn can_mutate_disk_overlay(&self, collection: &str) -> bool {
+        self.is_disk_backed(collection)
+            && !self.hnsw.contains_key(collection)
+            && !self
+                .extra_indexes
+                .values()
+                .any(|ix| ix.collection == collection && ix.unique)
+            && !self
+                .indexes
+                .values()
+                .any(|li| li.def.collection == collection && li.def.unique)
+    }
+
+    /// First live row of a disk-backed collection with `field == key`, read through the
+    /// engine (segments + overlay) without promoting the collection into memory.
+    pub(crate) fn disk_point_row(&self, collection: &str, field: &str, key: &str) -> Option<Row> {
+        let eng = self.disk_engine_read()?;
+        if field == "id" {
+            return eng.get_by_id(collection, key).ok().flatten();
+        }
+        let mut found = None;
+        let _ = eng.for_each_by_eq_projected(
+            collection,
+            field,
+            &Cell::from_text(key),
+            None,
+            |row| {
+                found = Some(row.clone());
+                Ok(false)
+            },
+        );
+        found
+    }
+
+    pub fn disk_has_key(&self, collection: &str, field: &str, key: &str) -> bool {
+        let Some(eng) = self.disk_engine_read() else {
+            return false;
+        };
+        if field == "id" {
+            return eng.exists_by_id(collection, key);
+        }
+        let want_fields = ["id"];
+        let mut found = false;
+        let _ = eng.for_each_by_eq_projected(
+            collection,
+            field,
+            &Cell::from_text(key),
+            Some(&want_fields),
+            |_| {
+                found = true;
+                Ok(false)
+            },
+        );
+        if found {
+            return true;
+        }
+        false
+    }
+
+    pub(crate) fn apply_disk_overlay_ops(&mut self, ops: &[crate::disk::DiskWalOp]) -> Result<(), Error> {
+        if ops.is_empty() {
+            return Ok(());
+        }
+        let mut touched: smallvec::SmallVec<[String; 4]> = smallvec::SmallVec::new();
+        for op in ops {
+            let t = match op {
+                crate::disk::DiskWalOp::EnsureTable { schema } => &schema.name,
+                crate::disk::DiskWalOp::EnsureIndex { table, .. }
+                | crate::disk::DiskWalOp::UpsertBatch { table, .. }
+                | crate::disk::DiskWalOp::DeleteIds { table, .. } => table,
+            };
+            if !touched.iter().any(|x| x == t) {
+                touched.push(t.clone());
+            }
+        }
+        let Some(d) = self.disk.as_mut() else {
+            return Ok(());
+        };
+        for t in &touched {
+            if let Some(lazy) = d.tables.get_mut(t) {
+                lazy.materialized = OnceLock::new();
+            }
+            if let Some(fts_idx) = self.fts.remove(t) {
+                self.dirty_fts_disk.insert(t.clone(), fts_idx.fields.clone());
+                if let Some((saved_fts, _)) = self.overlay_savepoint_fts.as_mut() {
+                    saved_fts.entry(t.clone()).or_insert(fts_idx);
+                }
+            }
+        }
+        {
+            let mut eng = d
+                .engine
+                .write()
+                .map_err(|_| Error::runtime("disk engine lock poisoned"))?;
+            for op in ops {
+                eng.apply_mem_overlay_op(op.clone());
+            }
+            for t in &touched {
+                let nrows = eng.count_table(t);
+                if let Some(lazy) = d.tables.get_mut(t) {
+                    lazy.row_count = nrows;
+                }
+                self.col_counts.insert(t.clone(), nrows);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn begin_disk_overlay_savepoint(&mut self) {
+        if self.overlay_savepoint_fts.is_none() {
+            self.overlay_savepoint_fts = Some((BTreeMap::new(), self.dirty_fts_disk.clone()));
+        }
+        if let Some(d) = self.disk.as_ref()
+            && let Ok(mut eng) = d.engine.write()
+        {
+            eng.begin_mem_savepoint();
+        }
+    }
+
+    pub(crate) fn commit_disk_overlay_savepoint(&mut self) {
+        self.overlay_savepoint_fts = None;
+        if let Some(d) = self.disk.as_ref()
+            && let Ok(mut eng) = d.engine.write()
+        {
+            eng.discard_mem_savepoint();
+        }
+    }
+
+    pub(crate) fn rollback_disk_overlay_savepoint(&mut self) {
+        if let Some((saved_fts, saved_dirty)) = self.overlay_savepoint_fts.take() {
+            for (k, v) in saved_fts {
+                self.fts.insert(k, v);
+            }
+            self.dirty_fts_disk = saved_dirty;
+        }
+        let Some(d) = self.disk.as_mut() else {
+            return;
+        };
+        if let Ok(mut eng) = d.engine.write() {
+            eng.rollback_savepoint();
+            for (t, lazy) in d.tables.iter_mut() {
+                lazy.materialized = OnceLock::new();
+                let nrows = eng.count_table(t);
+                lazy.row_count = nrows;
+                self.col_counts.insert(t.clone(), nrows);
+            }
+        }
     }
 
     #[inline]
@@ -254,14 +508,56 @@ impl Store {
         self.disk.as_ref().and_then(|d| d.engine.read().ok())
     }
 
+    /// Declare (or clear) the column that the disk tier keeps `collection` ordered by.
+    /// Applies to segments written from now on; existing ones are reordered by compaction.
+    pub fn set_disk_cluster_key(&mut self, collection: &str, field: Option<&str>) -> Result<(), Error> {
+        if !self.is_disk_backed(collection) {
+            return Err(Error::runtime(format!(
+                "cluster key: {collection} is not in the disk tier"
+            )));
+        }
+        let Some(d) = self.disk.as_ref() else {
+            return Err(Error::runtime("cluster key needs a disk tier (open with cold: true)"));
+        };
+        let mut eng = d
+            .engine
+            .write()
+            .map_err(|_| Error::runtime("disk engine lock poisoned"))?;
+        if eng.is_read_only() {
+            // Cold tier: the attached engine is a read-only view. Record the key in memory
+            // (so compaction-free readers see it) and let the next checkpoint persist it.
+            eng.set_cluster_key_in_memory(collection, field)?;
+        } else {
+            eng.set_cluster_key(collection, field)?;
+        }
+        match field {
+            Some(f) => self.disk_cluster_keys.insert(collection.to_string(), f.to_string()),
+            None => self.disk_cluster_keys.insert(collection.to_string(), String::new()),
+        };
+        Ok(())
+    }
+
+    /// Cluster key of a disk-backed collection, if one is declared.
+    pub fn disk_cluster_key(&self, collection: &str) -> Option<String> {
+        if let Some(k) = self.disk_cluster_keys.get(collection) {
+            return (!k.is_empty()).then(|| k.clone());
+        }
+        self.disk_engine_read()?
+            .manifest
+            .tables
+            .get(collection)?
+            .cluster_by
+            .clone()
+    }
+
     /// Promote a disk-backed collection into `collections` (`Vec<Row>`) with full row maps & secondary indexes.
     pub fn promote_disk_col(&mut self, name: &str) {
         let Some((row_count, maybe_rows)) = (|| -> Option<(usize, Vec<Row>)> {
             let d = self.disk.as_mut()?;
             let lazy = d.tables.remove(name)?;
             let rc = lazy.row_count;
-            if let Some(rows) = lazy.materialized.into_inner() {
-                return Some((rc, rows));
+            if let Some(lazy_rows) = lazy.materialized.into_inner() {
+                return Some((rc, lazy_rows.rows));
             }
             let mut out = Vec::with_capacity(rc);
             if let Ok(eng) = d.engine.read() {
@@ -280,6 +576,11 @@ impl Store {
         self.collections.insert(name.to_string(), maybe_rows);
         self.rebuild_row_maps_collection(name);
         self.rebuild_indexes_collection(name);
+        if let Some(fields) = self.dirty_fts_disk.remove(name) {
+            let rows = self.collection(name);
+            self.fts
+                .insert(name.to_string(), crate::fts::FtsIndex::build(rows, &fields));
+        }
     }
 
     #[inline]
@@ -288,38 +589,38 @@ impl Store {
     }
 
     fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
-    let n = rows.len();
-    if n < 65536 {
-        return rows.to_vec();
-    }
-    let max_threads = if n >= 8192 { 8 } else { 4 };
-    let threads = std::thread::available_parallelism()
-        .map(|p| p.get())
-        .unwrap_or(1)
-        .min(max_threads)
-        .min((n + 511) / 512);
-    if threads <= 1 {
-        return rows.to_vec();
-    }
-    let chunk_size = (n + threads - 1) / threads;
-    std::thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(threads - 1);
-        let mut all_chunks = rows.chunks(chunk_size);
-        for _ in 0..threads - 1 {
-            if let Some(chunk) = all_chunks.next() {
-                handles.push(scope.spawn(move || chunk.to_vec()));
+        let n = rows.len();
+        if n < 65536 {
+            return rows.to_vec();
+        }
+        let max_threads = if n >= 8192 { 8 } else { 4 };
+        let threads = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(1)
+            .min(max_threads)
+            .min((n + 511) / 512);
+        if threads <= 1 {
+            return rows.to_vec();
+        }
+        let chunk_size = (n + threads - 1) / threads;
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(threads - 1);
+            let mut all_chunks = rows.chunks(chunk_size);
+            for _ in 0..threads - 1 {
+                if let Some(chunk) = all_chunks.next() {
+                    handles.push(scope.spawn(move || chunk.to_vec()));
+                }
             }
-        }
-        let my_chunk = all_chunks.next().unwrap_or(&[]);
-        let my_work = my_chunk.to_vec();
-        let mut out = Vec::with_capacity(n);
-        for handle in handles {
-            out.extend(handle.join().expect("row clone worker panicked"));
-        }
-        out.extend(my_work);
-        out
-    })
-}
+            let my_chunk = all_chunks.next().unwrap_or(&[]);
+            let my_work = my_chunk.to_vec();
+            let mut out = Vec::with_capacity(n);
+            for handle in handles {
+                out.extend(handle.join().expect("row clone worker panicked"));
+            }
+            out.extend(my_work);
+            out
+        })
+    }
 
     /// Deep-copy the memory image (no durable handle). Used for read snapshots.
     pub fn clone_mem(&mut self) -> Self {
@@ -405,9 +706,12 @@ impl Store {
             facts_o: self.facts_o.clone(),
             facts_rows_stale: false,
             disk: disk_snap,
+            dirty_fts_disk: self.dirty_fts_disk.clone(),
+            overlay_savepoint_fts: None,
+            disk_cluster_keys: BTreeMap::new(),
+            disk_compact_requests: Vec::new(),
         }
     }
-
 
     pub fn apply_pack(&mut self, pack: &Pack) {
         match pack {
@@ -416,6 +720,15 @@ impl Store {
                 row,
                 edges,
             } => {
+                if self.can_apply_disk_overlay(collection) {
+                    let mut ops = Vec::new();
+                    checkpoint::pack_to_disk_wal_ops(pack, &mut ops);
+                    let _ = self.apply_disk_overlay_ops(&ops);
+                    for e in edges {
+                        let _ = self.append_edge_parts(&e.rel, &e.from, &e.to);
+                    }
+                    return;
+                }
                 let emb = row.get("embedding").and_then(|c| match c {
                     Cell::Vec(v) => Some(Arc::clone(v)),
                     _ => None,
@@ -442,6 +755,15 @@ impl Store {
                 rows,
                 edges,
             } => {
+                if self.can_apply_disk_overlay(collection) {
+                    let mut ops = Vec::new();
+                    checkpoint::pack_to_disk_wal_ops(pack, &mut ops);
+                    let _ = self.apply_disk_overlay_ops(&ops);
+                    for e in edges {
+                        let _ = self.append_edge_parts(&e.rel, &e.from, &e.to);
+                    }
+                    return;
+                }
                 let start = self.collection(collection).len();
                 let n = rows.len();
                 self.collection_mut(collection).reserve(rows.len());
@@ -464,6 +786,15 @@ impl Store {
                 n,
                 edges,
             } => {
+                if self.can_apply_disk_overlay(collection) {
+                    let mut ops = Vec::new();
+                    checkpoint::pack_to_disk_wal_ops(pack, &mut ops);
+                    let _ = self.apply_disk_overlay_ops(&ops);
+                    for e in edges {
+                        let _ = self.append_edge_parts(&e.rel, &e.from, &e.to);
+                    }
+                    return;
+                }
                 let n = *n as usize;
                 let rows = persist::cols_to_rows(fields, cols, n);
                 let start = self.collection(collection).len();
@@ -500,6 +831,12 @@ impl Store {
                 }
             }
             Pack::Update { collection, rows } => {
+                if self.can_apply_disk_overlay(collection) {
+                    let mut ops = Vec::new();
+                    checkpoint::pack_to_disk_wal_ops(pack, &mut ops);
+                    let _ = self.apply_disk_overlay_ops(&ops);
+                    return;
+                }
                 let mut new_rows = 0;
                 for new in rows {
                     let id = row_text(new, "id").map(str::to_string);
@@ -515,9 +852,7 @@ impl Store {
                         self.row_maps_sync_updated(collection, i, &before, new);
                         let _ = self.index_update_row(collection, i, &before, new);
                         self.fts_sync_at(collection, i, &before);
-                        if emb_changed
-                            && let Some(hnsw) = self.hnsw.get_mut(collection)
-                        {
+                        if emb_changed && let Some(hnsw) = self.hnsw.get_mut(collection) {
                             if let Some(v) = new_emb {
                                 hnsw.insert(i, v);
                             } else {
@@ -543,6 +878,12 @@ impl Store {
             }
             Pack::Reembed => {}
             Pack::Delete { collection, rows } => {
+                if self.can_apply_disk_overlay(collection) {
+                    let mut ops = Vec::new();
+                    checkpoint::pack_to_disk_wal_ops(pack, &mut ops);
+                    let _ = self.apply_disk_overlay_ops(&ops);
+                    return;
+                }
                 let dead = self.dead_positions(collection, rows);
                 self.delete_rows_at(collection, &dead);
             }
@@ -837,13 +1178,23 @@ impl Store {
                     _ => None,
                 };
 
-                if !has_indexes && !has_fts && !has_hnsw && !is_docs && let Some(ids) = soa_ids {
+                if !has_indexes
+                    && !has_fts
+                    && !has_hnsw
+                    && !is_docs
+                    && let Some(ids) = soa_ids
+                {
                     if let Some(by_id) = self.by_id.get_mut(name) {
-                        for (offset, id_arc) in ids[prev_len..cur_len].iter().enumerate().rev() {
-                            let idx = prev_len + offset;
-                            let id = id_arc.as_ref();
-                            if !id.is_empty() && by_id.get(id) == Some(&idx) {
-                                by_id.remove(id);
+                        if prev_len == 0 {
+                            by_id.clear();
+                        } else {
+                            for (offset, id_arc) in ids[prev_len..cur_len].iter().enumerate().rev()
+                            {
+                                let idx = prev_len + offset;
+                                let id = id_arc.as_ref();
+                                if !id.is_empty() && by_id.get(id) == Some(&idx) {
+                                    by_id.remove(id);
+                                }
                             }
                         }
                     }
@@ -860,10 +1211,7 @@ impl Store {
                     }
                 } else {
                     for idx in (prev_len..cur_len).rev() {
-                        let Some(row) = self
-                            .collections
-                            .get_mut(name)
-                            .and_then(|rows| rows.pop())
+                        let Some(row) = self.collections.get_mut(name).and_then(|rows| rows.pop())
                         else {
                             break;
                         };
@@ -1068,7 +1416,6 @@ impl Store {
         self.facts_rows_stale = false;
     }
 
-
     /// True when rows live in `collections` (not disk-only), so position-keyed
     /// journals can be replayed against it.
     pub fn has_collection(&self, name: &str) -> bool {
@@ -1079,19 +1426,7 @@ impl Store {
         if let Some(d) = &self.disk
             && let Some(lazy) = d.tables.get(name)
         {
-            return lazy
-                .materialized
-                .get_or_init(|| {
-                    let mut out = Vec::with_capacity(lazy.row_count);
-                    if let Ok(eng) = d.engine.read() {
-                        let _ = eng.scan_projected(name, None, |r| {
-                            out.push(r.clone());
-                            Ok(true)
-                        });
-                    }
-                    out
-                })
-                .as_slice();
+            return Self::lazy_rows(d, lazy, name).rows.as_slice();
         }
         self.collections
             .get(name)
@@ -1166,12 +1501,42 @@ impl Store {
         self.get_by_id("docs", key).or_else(|| self.get_by_uri(key))
     }
 
+    fn lazy_rows<'a>(d: &'a StoreDiskTier, lazy: &'a DiskColLazy, name: &str) -> &'a LazyRows {
+        lazy.materialized.get_or_init(|| {
+            let mut rows = Vec::with_capacity(lazy.row_count);
+            if let Ok(eng) = d.engine.read() {
+                let _ = eng.scan_projected(name, None, |r| {
+                    rows.push(r.clone());
+                    Ok(true)
+                });
+            }
+            LazyRows {
+                rows,
+                by_id: OnceLock::new(),
+            }
+        })
+    }
+
+    /// Position of the row with this `id` inside the lazily materialized rows of a
+    /// disk-backed collection. Valid until the collection's disk state changes.
+    fn disk_row_index(&self, collection: &str, id: &str) -> Option<usize> {
+        let d = self.disk.as_ref()?;
+        let lazy = d.tables.get(collection)?;
+        Self::lazy_rows(d, lazy, collection).index_of(id)
+    }
+
     pub fn get_by_id(&self, collection: &str, id: &str) -> Option<&Row> {
         let idx = self.row_index(collection, id)?;
         self.get_by_idx(collection, idx)
     }
 
     fn doc_uri_index(&self, uri: &str) -> Option<usize> {
+        if self.is_disk_backed("docs") {
+            return self
+                .collection("docs")
+                .iter()
+                .position(|r| row_text(r, "uri") == Some(uri));
+        }
         if let Some(mut idx) = self.docs_by_uri.get(uri).copied() {
             for &(from, to) in &self.docs_moved_idxs {
                 if idx == to {
@@ -1200,6 +1565,10 @@ impl Store {
     }
 
     pub fn row_index(&self, collection: &str, id: &str) -> Option<usize> {
+        // A disk-backed collection has none of the in-memory row maps below.
+        if self.is_disk_backed(collection) {
+            return self.disk_row_index(collection, id);
+        }
         if collection == "docs" {
             let hint = self
                 .last_doc_id_idx
@@ -1312,9 +1681,10 @@ impl Store {
         key: &str,
         fields: Option<&[String]>,
     ) -> Option<Row> {
+        // A disk-backed collection has no in-memory row maps, whether or not some reader has
+        // lazily materialized its rows: point lookups always go to the engine.
         if let Some(d) = &self.disk
-            && let Some(lazy) = d.tables.get(collection)
-            && lazy.materialized.get().is_none()
+            && d.tables.contains_key(collection)
         {
             let eng = d.engine.read().ok()?;
             return match field {
@@ -1376,8 +1746,7 @@ impl Store {
     #[inline]
     pub fn point_get_docs_id_title(&self, id: &str) -> Option<Row> {
         if let Some(d) = &self.disk
-            && let Some(lazy) = d.tables.get("docs")
-            && lazy.materialized.get().is_none()
+            && d.tables.contains_key("docs")
         {
             let eng = d.engine.read().ok()?;
             return eng
@@ -1390,7 +1759,10 @@ impl Store {
             Some(row_id_title(&self.docs_id[idx], &self.docs_title[idx]))
         } else {
             let row = self.get_by_idx("docs", idx)?;
-            Some(project_fields(row, &[String::from("id"), String::from("title")]))
+            Some(project_fields(
+                row,
+                &[String::from("id"), String::from("title")],
+            ))
         }
     }
 
@@ -1431,12 +1803,15 @@ impl Store {
         self.facts_s.clear();
         self.facts_p.clear();
         self.facts_o.clear();
-        if let Some(facts) = self.collections.get("facts") && !facts.is_empty() {
+        if let Some(facts) = self.collections.get("facts")
+            && !facts.is_empty()
+        {
             self.facts_s.reserve(facts.len());
             self.facts_p.reserve(facts.len());
             self.facts_o.reserve(facts.len());
             for row in facts {
-                let (s, p, o) = spo_key(row).unwrap_or_else(|| (Arc::from(""), Arc::from(""), Arc::from("")));
+                let (s, p, o) =
+                    spo_key(row).unwrap_or_else(|| (Arc::from(""), Arc::from(""), Arc::from("")));
                 self.facts_s.push(s);
                 self.facts_p.push(p);
                 self.facts_o.push(o);
@@ -1445,7 +1820,6 @@ impl Store {
         self.facts_rows_stale = false;
         self.refresh_col_counts();
     }
-
 
     /// Physical positions in `collection` whose row key matches any of `rows`.
     /// Resolves each target through the id/uri maps for an O(D) path, mirroring
@@ -1712,15 +2086,18 @@ impl Store {
                 self.last_doc_id_idx
                     .store(usize::MAX, std::sync::atomic::Ordering::Relaxed);
             }
-            if p < self.docs_id.len() && last < self.docs_id.len() && self.docs_moved_ids.len() < 16 {
-                self.docs_moved_ids.push((Arc::clone(&self.docs_id[last]), p));
+            if p < self.docs_id.len() && last < self.docs_id.len() && self.docs_moved_ids.len() < 16
+            {
+                self.docs_moved_ids
+                    .push((Arc::clone(&self.docs_id[last]), p));
             } else {
                 let row = &self.collections["docs"][p];
-                let (dead_id_fast, tail_id_fast) = if p < self.docs_id.len() && last < self.docs_id.len() {
-                    (Some(&self.docs_id[p]), Some(&self.docs_id[last]))
-                } else {
-                    (None, None)
-                };
+                let (dead_id_fast, tail_id_fast) =
+                    if p < self.docs_id.len() && last < self.docs_id.len() {
+                        (Some(&self.docs_id[p]), Some(&self.docs_id[last]))
+                    } else {
+                        (None, None)
+                    };
                 if let Some(map) = self.by_id.get_mut("docs") {
                     if let Some(dead_id) = dead_id_fast {
                         map.remove(dead_id.as_ref());
@@ -1784,7 +2161,13 @@ impl Store {
     /// The collection already contains the moved row at `to`. Read it in place
     /// while editing disjoint derived indexes; retain only identity keys for
     /// the column/map step, avoiding a complete Row clone.
-    fn move_deleted_tail(&mut self, collection: &str, from: usize, to: usize, doomed: Option<&Row>) {
+    fn move_deleted_tail(
+        &mut self,
+        collection: &str,
+        from: usize,
+        to: usize,
+        doomed: Option<&Row>,
+    ) {
         let row = &self.collections[collection][to];
         if !self.fts.is_empty() {
             if let Some(fts) = self.fts.get_mut(collection) {
@@ -1808,12 +2191,17 @@ impl Store {
                     .store(usize::MAX, std::sync::atomic::Ordering::Relaxed);
             }
         }
-        let (dead_id_fast, tail_id_fast) = if is_docs && to < self.docs_id.len() && from < self.docs_id.len() {
-            (Some(&self.docs_id[to]), Some(&self.docs_id[from]))
+        let (dead_id_fast, tail_id_fast) =
+            if is_docs && to < self.docs_id.len() && from < self.docs_id.len() {
+                (Some(&self.docs_id[to]), Some(&self.docs_id[from]))
+            } else {
+                (None, None)
+            };
+        let id_str = if tail_id_fast.is_none() {
+            row_text(row, "id")
         } else {
-            (None, None)
+            None
         };
-        let id_str = if tail_id_fast.is_none() { row_text(row, "id") } else { None };
         let has_uri_map = is_docs && !self.docs_by_uri.is_empty();
         let uri_str = if has_uri_map {
             row_text(row, "uri")
@@ -1958,8 +2346,10 @@ impl Store {
             if !live {
                 continue;
             }
-            let old_row =
-                std::mem::replace(&mut self.collections.get_mut(collection).unwrap()[*idx], row.clone());
+            let old_row = std::mem::replace(
+                &mut self.collections.get_mut(collection).unwrap()[*idx],
+                row.clone(),
+            );
             if let Some(fts) = self.fts.get_mut(collection) {
                 fts.sync_row(*idx, &old_row, row);
             }
@@ -1976,7 +2366,10 @@ impl Store {
         if !live {
             return;
         }
-        let old_row = std::mem::replace(&mut self.collections.get_mut(collection).unwrap()[idx], Row::new());
+        let old_row = std::mem::replace(
+            &mut self.collections.get_mut(collection).unwrap()[idx],
+            Row::new(),
+        );
         if let Some(fts) = self.fts.get_mut(collection) {
             fts.sync_row(idx, &old_row, &row);
         }
@@ -2189,9 +2582,7 @@ impl Store {
                     let uid_arc: Arc<str> = uid_pos
                         .and_then(|p| cells[p].text_shared())
                         .unwrap_or_default();
-                    let total = total_pos
-                        .and_then(|p| cells[p].as_f64())
-                        .unwrap_or(0.0);
+                    let total = total_pos.and_then(|p| cells[p].as_f64()).unwrap_or(0.0);
                     if !id_arc.is_empty() {
                         by_id_map.insert(Arc::clone(&id_arc), i);
                     }
@@ -2498,7 +2889,10 @@ impl Store {
             let by_id = self.by_id.entry(collection.to_string()).or_default();
             for (i, row) in rows.iter().enumerate() {
                 let idx = start + i;
-                let id = row.get("id").and_then(Cell::text_shared).unwrap_or_default();
+                let id = row
+                    .get("id")
+                    .and_then(Cell::text_shared)
+                    .unwrap_or_default();
                 let uid = row
                     .get("user_id")
                     .and_then(Cell::text_shared)
@@ -2517,7 +2911,10 @@ impl Store {
             let by_id = self.by_id.entry(collection.to_string()).or_default();
             for (i, row) in rows.iter().enumerate() {
                 let idx = start + i;
-                let id = row.get("id").and_then(Cell::text_shared).unwrap_or_default();
+                let id = row
+                    .get("id")
+                    .and_then(Cell::text_shared)
+                    .unwrap_or_default();
                 let email = row
                     .get("email")
                     .and_then(Cell::text_shared)
@@ -2738,18 +3135,14 @@ impl Store {
                 let (fts_tx, fts_rx) = std::sync::mpsc::sync_channel::<FtsJob>(1);
                 let (fts_done_tx, fts_done) = std::sync::mpsc::sync_channel::<()>(1);
                 let (idx_tx, idx_rx) = std::sync::mpsc::sync_channel::<IdxJob>(1);
-                let (idx_done_tx, idx_done) =
-                    std::sync::mpsc::sync_channel::<Result<(), Error>>(1);
+                let (idx_done_tx, idx_done) = std::sync::mpsc::sync_channel::<Result<(), Error>>(1);
                 let ok1 = std::thread::Builder::new()
                     .name("lin-maint-fts".into())
                     .spawn(move || {
                         while let Ok(job) = fts_rx.recv() {
                             let fts = unsafe { &mut *(job.fts_ptr as *mut crate::fts::FtsIndex) };
                             let rows = unsafe {
-                                std::slice::from_raw_parts(
-                                    job.rows_ptr as *const Row,
-                                    job.rows_len,
-                                )
+                                std::slice::from_raw_parts(job.rows_ptr as *const Row, job.rows_len)
                             };
                             fts.append_slab(job.start, rows);
                             let _ = fts_done_tx.send(());
@@ -2764,10 +3157,7 @@ impl Store {
                                 &mut *(job.indexes_ptr as *mut BTreeMap<String, LiveIndex>)
                             };
                             let rows = unsafe {
-                                std::slice::from_raw_parts(
-                                    job.rows_ptr as *const Row,
-                                    job.rows_len,
-                                )
+                                std::slice::from_raw_parts(job.rows_ptr as *const Row, job.rows_len)
                             };
                             let mut res = Ok(());
                             for idx in idxs.values_mut() {
@@ -2976,7 +3366,13 @@ impl Store {
     }
 
     /// Swap-remove one row's index entries given `doomed` and the moved `tail` row now at `p`.
-    pub fn index_swap_remove_rows(&mut self, collection: &str, p: usize, doomed: &Row, last: usize) {
+    pub fn index_swap_remove_rows(
+        &mut self,
+        collection: &str,
+        p: usize,
+        doomed: &Row,
+        last: usize,
+    ) {
         if self.indexes.is_empty() {
             return;
         }
@@ -3171,10 +3567,8 @@ impl Store {
 
     /// Rebuild FTS postings from catalog `fts` fields (memory / missing durable blob).
     pub fn rebuild_fts(&mut self, catalog: &crate::catalog::Catalog) {
-        self.fts
-            .retain(|k, _| catalog.collections.contains_key(k));
-        let names: smallvec::SmallVec<[String; 4]> =
-            catalog.collections.keys().cloned().collect();
+        self.fts.retain(|k, _| catalog.collections.contains_key(k));
+        let names: smallvec::SmallVec<[String; 4]> = catalog.collections.keys().cloned().collect();
         for cname in names {
             let Some(cdef) = catalog.collections.get(&cname) else {
                 continue;
@@ -3217,7 +3611,9 @@ impl Store {
             if self.fts.contains_key(cname) {
                 continue;
             }
-            if self.is_disk_backed(cname) && (self.get_col_count(cname) == 0 || self.is_native_disk()) {
+            if self.is_disk_backed(cname)
+                && (self.get_col_count(cname) == 0 || self.is_native_disk())
+            {
                 if self.get_col_count(cname) == 0 {
                     self.fts
                         .insert(cname.clone(), crate::fts::FtsIndex::build(&[], &fields));
@@ -3457,6 +3853,12 @@ impl Store {
         uses: &[crate::index::IndexUse],
         now: i64,
     ) -> Option<Vec<usize>> {
+        // A disk-backed collection keeps only an empty placeholder `LiveIndex`; its secondary
+        // indexes live in the disk engine. Report "no usable index" so callers scan instead
+        // of trusting an empty seek result.
+        if self.is_disk_backed(collection) {
+            return None;
+        }
         if uses.is_empty() {
             return None;
         }
@@ -3490,6 +3892,12 @@ impl Store {
         uses: &[crate::index::IndexUse],
         now: i64,
     ) -> Option<usize> {
+        // A disk-backed collection keeps only an empty placeholder `LiveIndex`; its secondary
+        // indexes live in the disk engine. Report "no usable index" so callers scan instead
+        // of trusting an empty seek result.
+        if self.is_disk_backed(collection) {
+            return None;
+        }
         if uses.is_empty() {
             return None;
         }
@@ -3513,6 +3921,12 @@ impl Store {
         now: i64,
         threshold: usize,
     ) -> Option<usize> {
+        // A disk-backed collection keeps only an empty placeholder `LiveIndex`; its secondary
+        // indexes live in the disk engine. Report "no usable index" so callers scan instead
+        // of trusting an empty seek result.
+        if self.is_disk_backed(collection) {
+            return None;
+        }
         if uses.is_empty() {
             return None;
         }
@@ -3527,7 +3941,6 @@ impl Store {
         // For multiple uses, fall back to full seek
         Some(self.index_seek(collection, uses, now)?.len())
     }
-
 }
 
 #[derive(Clone)]
@@ -3545,7 +3958,6 @@ pub struct MemBackup {
     hnsw: BTreeMap<String, crate::embed::VectorIndex>,
 }
 
-
 fn same_row_key(collection: &str, a: &Row, b: &Row) -> bool {
     if collection == "facts" {
         return row_text(a, "s") == row_text(b, "s")
@@ -3559,7 +3971,6 @@ fn same_row_key(collection: &str, a: &Row, b: &Row) -> bool {
             .is_some_and(|(x, y)| x == y),
     }
 }
-
 
 #[cfg(test)]
 mod borrowed_delete_tests {

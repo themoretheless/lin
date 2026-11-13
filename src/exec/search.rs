@@ -611,7 +611,10 @@ impl Db {
                 row.insert("embedding".into(), crate::store::Cell::Null);
                 continue;
             }
-            row.insert("embedding".into(), crate::store::Cell::Vec(emb.embed(&text)));
+            row.insert(
+                "embedding".into(),
+                crate::store::Cell::Vec(emb.embed(&text)),
+            );
             n += 1;
         }
         self.store.rebuild_row_maps();
@@ -636,8 +639,11 @@ impl Db {
         }
 
         let first_needs = rows.first().is_some_and(|r| {
-            r.get("embedding").and_then(crate::store::Cell::as_vec).is_none()
-                && (r.get("title")
+            r.get("embedding")
+                .and_then(crate::store::Cell::as_vec)
+                .is_none()
+                && (r
+                    .get("title")
                     .or_else(|| r.get("body"))
                     .or_else(|| r.get("snippet"))
                     .and_then(crate::store::Cell::text)
@@ -646,8 +652,11 @@ impl Db {
         let all_need = rows.len() >= 64
             && first_needs
             && rows.iter().all(|r| {
-                r.get("embedding").and_then(crate::store::Cell::as_vec).is_none()
-                    && (r.get("title")
+                r.get("embedding")
+                    .and_then(crate::store::Cell::as_vec)
+                    .is_none()
+                    && (r
+                        .get("title")
                         .or_else(|| r.get("body"))
                         .or_else(|| r.get("snippet"))
                         .and_then(crate::store::Cell::text)
@@ -663,7 +672,11 @@ impl Db {
             row_ptrs.extend(rows.iter());
         } else {
             for (i, row) in rows.iter().enumerate() {
-                if row.get("embedding").and_then(crate::store::Cell::as_vec).is_some() {
+                if row
+                    .get("embedding")
+                    .and_then(crate::store::Cell::as_vec)
+                    .is_some()
+                {
                     continue;
                 }
                 let has_text = row

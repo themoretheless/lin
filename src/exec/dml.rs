@@ -3,22 +3,18 @@ use std::sync::Arc;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::ast::{
-    Decl, EdgeTarget, InsertEdge, Pred, Record, Stmt, TypeExpr, Value,
-};
+use crate::ast::{Decl, EdgeTarget, InsertEdge, Pred, Record, Stmt, TypeExpr, Value};
 use crate::error::Error;
 use crate::persist::Pack;
-use crate::store::{
-    Cell, Edge, Row, acquire_row, content_hash_arc, now_ms, row_text,
-};
+use crate::store::{Cell, Edge, Row, acquire_row, content_hash_arc, now_ms, row_text};
 
+use super::Db;
 use super::eval::{
     eval_pred, point_key, pred_needs_now, record_needs_now, value_cell, value_needs_now,
     value_text, value_to_arc_str,
 };
 use super::graph_ops::edge_row;
 use super::tx::{RowUndo, Undo};
-use super::Db;
 
 // Precomputed content hash cache: (body_str) -> precomputed_hash
 // Uses lock-free RefCell inside thread_local! to reuse Arc<str> for repeated bodies
@@ -213,7 +209,8 @@ impl Db {
                 continue;
             }
             ctx.want_rows = want_rows && si == last_idx;
-            let (rows, message, pack, wrote, affected) = self.exec_stmt(stmt, &bindings, &mut ctx)?;
+            let (rows, message, pack, wrote, affected) =
+                self.exec_stmt(stmt, &bindings, &mut ctx)?;
             last_rows = rows;
             last_msg = message;
             any_wrote |= wrote;
@@ -223,7 +220,13 @@ impl Db {
             }
         }
         Ok((
-            (last_rows, last_msg, fold_packs(packs), any_wrote, last_affected),
+            (
+                last_rows,
+                last_msg,
+                fold_packs(packs),
+                any_wrote,
+                last_affected,
+            ),
             ctx.prepared_encoding,
         ))
     }
@@ -329,9 +332,9 @@ impl Db {
                     }
                 }
                 let want_rows = ctx.want_rows && n <= 128;
-                let (rows, changed_n) =
-                    self.store
-                        .append_facts_spo_bulk(&bulk_s, &bulk_p, &bulk_o, want_rows);
+                let (rows, changed_n) = self
+                    .store
+                    .append_facts_spo_bulk(&bulk_s, &bulk_p, &bulk_o, want_rows);
                 let msg = if changed_n == 0 {
                     Some("idempotent".into())
                 } else {
@@ -360,11 +363,24 @@ impl Db {
                     Vec::new()
                 };
                 let mut changed_n = 0usize;
-                let mut bulk_rel = if durable { Vec::with_capacity(n) } else { Vec::new() };
-                let mut bulk_from = if durable { Vec::with_capacity(n) } else { Vec::new() };
-                let mut bulk_to = if durable { Vec::with_capacity(n) } else { Vec::new() };
+                let mut bulk_rel = if durable {
+                    Vec::with_capacity(n)
+                } else {
+                    Vec::new()
+                };
+                let mut bulk_from = if durable {
+                    Vec::with_capacity(n)
+                } else {
+                    Vec::new()
+                };
+                let mut bulk_to = if durable {
+                    Vec::with_capacity(n)
+                } else {
+                    Vec::new()
+                };
                 for e in edges {
-                    let (row, changed) = self.append_edge(&e.rel, &e.from, &e.to, ctx.want_rows || durable)?;
+                    let (row, changed) =
+                        self.append_edge(&e.rel, &e.from, &e.to, ctx.want_rows || durable)?;
                     if changed {
                         changed_n += 1;
                         if durable {
@@ -485,7 +501,8 @@ impl Db {
                 cas,
                 cas_each,
             } => {
-                let mut rows = self.delete_rows(collection, pred, cas.as_deref(), *cas_each, ctx)?;
+                let mut rows =
+                    self.delete_rows(collection, pred, cas.as_deref(), *cas_each, ctx)?;
                 let affected = rows.len();
                 let pack = if durable {
                     Some(Pack::Delete {
@@ -602,7 +619,13 @@ impl Db {
             Stmt::IdbPush => {
                 let frames = std::mem::take(&mut self.pulled_wal);
                 if frames.is_empty() {
-                    return Ok((Vec::new(), Some("push idb: nothing pulled".into()), None, false, 0));
+                    return Ok((
+                        Vec::new(),
+                        Some("push idb: nothing pulled".into()),
+                        None,
+                        false,
+                        0,
+                    ));
                 }
                 if self.persist.is_some() && !self.follower {
                     return Err(Error::runtime(
@@ -646,7 +669,10 @@ impl Db {
                 self.query_cache.clear();
                 Ok((
                     Vec::new(),
-                    Some(format!("memory pin restore {name:?} → gen={}", self.store.r#gen)),
+                    Some(format!(
+                        "memory pin restore {name:?} → gen={}",
+                        self.store.r#gen
+                    )),
                     None,
                     false,
                     0,
@@ -700,6 +726,10 @@ impl Db {
     }
 
     fn fk_target_exists(&self, to_col: &str, to_field: &str, val: &str) -> bool {
+        // A disk-backed target has no in-memory row map: ask the engine, for `id` as well.
+        if self.store.is_disk_backed(to_col) {
+            return self.store.disk_has_key(to_col, to_field, val);
+        }
         if to_field == "id" {
             return self.store.get_by_id(to_col, val).is_some();
         }
@@ -775,7 +805,10 @@ impl Db {
             if row.get("hash").and_then(Cell::text).is_none()
                 && let Some(body) = row.get("body").and_then(Cell::text_shared)
             {
-                row.insert("hash".into(), Cell::Text(cached_content_hash(body.as_ref())));
+                row.insert(
+                    "hash".into(),
+                    Cell::Text(cached_content_hash(body.as_ref())),
+                );
             }
             let col_len = self.store.collection(collection).len();
             if col_len > 0 {
@@ -991,8 +1024,7 @@ impl Db {
                     2 * 1024 * 1024
                 };
                 (minimum..=16 * 1024 * 1024).contains(&floats)
-            }
-        {
+            } {
             let generation = self.store.r#gen.wrapping_add(1);
             let next_id = self.store.next_id;
             let bytes = self
@@ -1039,11 +1071,7 @@ impl Db {
             built = Arc::try_unwrap(shared).expect("encoder retained input after reply");
             maintenance?;
             Some(staged)
-        } else if allow_preencode
-            && n >= 512
-            && edges.is_empty()
-            && self.persist.is_some()
-        {
+        } else if allow_preencode && n >= 512 && edges.is_empty() && self.persist.is_some() {
             let generation = self.store.r#gen.wrapping_add(1);
             let next_id = self.store.next_id;
             let mut encode_buf = self
@@ -1071,28 +1099,31 @@ impl Db {
                 p.encode_buf = direct_res.1;
             }
             maint_res?;
-            direct_res.0.map(|(magic, fields)| crate::persist::PreparedInsert {
-                pack: Some(Pack::InsertCols {
-                    collection: collection.to_string(),
-                    fields: fields.clone(),
-                    cols: Vec::new(),
-                    n: n as u32,
-                    edges: Vec::new(),
-                }),
-                encoding: crate::persist::PreparedEncoding::Direct {
-                    generation,
-                    next_id,
-                    collection: collection.to_string(),
-                    fields,
-                    rows: n as u32,
-                    magic,
-                },
-            })
+            direct_res
+                .0
+                .map(|(magic, fields)| crate::persist::PreparedInsert {
+                    pack: Some(Pack::InsertCols {
+                        collection: collection.to_string(),
+                        fields: fields.clone(),
+                        cols: Vec::new(),
+                        n: n as u32,
+                        edges: Vec::new(),
+                    }),
+                    encoding: crate::persist::PreparedEncoding::Direct {
+                        generation,
+                        next_id,
+                        collection: collection.to_string(),
+                        fields,
+                        rows: n as u32,
+                        magic,
+                    },
+                })
         } else {
             self.maintain_insert_slab(collection, start, &built)?;
             None
         };
-        self.store.update_col_count(collection, built.len() as isize);
+        self.store
+            .update_col_count(collection, built.len() as isize);
         let want_rows = caller_wants_rows && built.len() <= 128;
         if want_rows {
             self.store
@@ -1182,9 +1213,7 @@ impl Db {
             return Err(Error::runtime("update requires cas"));
         }
         let has_guards = !self.catalog.guards.is_empty();
-        let needs_now = pred.is_some_and(pred_needs_now)
-            || record_needs_now(record)
-            || has_guards;
+        let needs_now = pred.is_some_and(pred_needs_now) || record_needs_now(record) || has_guards;
         let now = if needs_now { now_ms() } else { 0 };
 
         let idxs = self.mutation_positions(collection, pred, now);
@@ -1238,9 +1267,7 @@ impl Db {
             for (k, v) in &record.fields {
                 updated.insert(k.clone(), value_cell(v, now));
             }
-            if has_body
-                && let Some(body) = row_text(&updated, "body").map(str::to_string)
-            {
+            if has_body && let Some(body) = row_text(&updated, "body").map(str::to_string) {
                 updated.insert("hash".into(), Cell::Text(cached_content_hash(&body)));
             }
             if has_fks {
@@ -1432,9 +1459,13 @@ impl Db {
                     0,
                 ))
             }
-            Decl::Fk { .. } | Decl::Guard { .. } => {
-                Ok((Vec::new(), Some("schema: session only".into()), None, false, 0))
-            }
+            Decl::Fk { .. } | Decl::Guard { .. } => Ok((
+                Vec::new(),
+                Some("schema: session only".into()),
+                None,
+                false,
+                0,
+            )),
             Decl::Filter {
                 collection,
                 pred: _,
@@ -1506,13 +1537,7 @@ thread_local! {
 }
 
 struct DedupSetsClearGuard<'a> {
-    guard: std::cell::RefMut<
-        'a,
-        (
-            FxHashSet<&'static str>,
-            FxHashSet<&'static str>,
-        ),
-    >,
+    guard: std::cell::RefMut<'a, (FxHashSet<&'static str>, FxHashSet<&'static str>)>,
 }
 
 impl Drop for DedupSetsClearGuard<'_> {

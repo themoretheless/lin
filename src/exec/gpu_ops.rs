@@ -16,9 +16,9 @@ use crate::store::Row;
 
 #[cfg(feature = "gpu")]
 use super::agg::{cell_key, hits_row};
+use super::eval::LexQuery;
 #[cfg(feature = "gpu")]
 use super::eval::{cmp_sort, eval_pred, field_cell, value_cell};
-use super::eval::LexQuery;
 #[cfg(feature = "gpu")]
 use super::graph_ops::edge_row;
 #[cfg(feature = "gpu")]
@@ -172,7 +172,11 @@ impl Db {
         }
     }
     #[cfg(feature = "gpu")]
-    pub(super) fn gpu_count_rows(&self, rows: &[Row], by: Option<&Field>) -> Result<Option<Vec<Row>>, Error> {
+    pub(super) fn gpu_count_rows(
+        &self,
+        rows: &[Row],
+        by: Option<&Field>,
+    ) -> Result<Option<Vec<Row>>, Error> {
         let Some(gpu) = &self.gpu else {
             return Ok(None);
         };

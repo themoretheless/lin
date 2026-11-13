@@ -409,7 +409,8 @@ fn seed_sqlite(n: usize) -> SqlWarm {
          CREATE INDEX docs_wing_ts ON docs(wing, ts);",
     )
     .expect("sqlite schema");
-    conn.execute_batch("BEGIN TRANSACTION;").expect("sqlite begin");
+    conn.execute_batch("BEGIN TRANSACTION;")
+        .expect("sqlite begin");
     {
         let mut stmt = conn
             .prepare("INSERT INTO docs (id, uri, wing, title, ts, body) VALUES (?1,?2,?3,?4,?5,?6)")
@@ -455,7 +456,8 @@ fn seed_duck(n: usize) -> DuckWarm {
          CREATE INDEX docs_wing_ts ON docs(wing, ts);",
     )
     .expect("duckdb schema");
-    conn.execute_batch("BEGIN TRANSACTION;").expect("duck begin");
+    conn.execute_batch("BEGIN TRANSACTION;")
+        .expect("duck begin");
     {
         let mut stmt = conn
             .prepare("INSERT INTO docs (id, uri, wing, title, ts, body) VALUES (?,?,?,?,?,?)")
@@ -878,8 +880,15 @@ struct JoinSql {
 }
 
 fn seed_join_sqlite() -> JoinSql {
-    let (users, orders) = join_data();
     let conn = rusqlite::Connection::open_in_memory().expect("sqlite open");
+    fill_join_sqlite(&conn);
+    JoinSql { conn }
+}
+
+fn fill_join_sqlite(conn: &rusqlite::Connection) {
+    let (users, orders) = join_data();
+    conn.execute_batch("BEGIN TRANSACTION;")
+        .expect("sqlite join begin");
     conn.execute_batch(
         "CREATE TABLE users (id TEXT PRIMARY KEY, email TEXT NOT NULL);
          CREATE TABLE orders (
@@ -906,9 +915,9 @@ fn seed_join_sqlite() -> JoinSql {
                 .expect("sqlite order");
         }
     }
+    conn.execute_batch("COMMIT;").expect("sqlite join commit");
     let _ = conn.prepare_cached(JOIN_INNER_SQL);
     let _ = conn.prepare_cached(JOIN_FILTER_SQL);
-    JoinSql { conn }
 }
 
 fn sqlite_join_n(conn: &rusqlite::Connection, sql: &str) -> usize {
@@ -930,8 +939,15 @@ struct JoinDuck {
 }
 
 fn seed_join_duck() -> JoinDuck {
-    let (users, orders) = join_data();
     let conn = duckdb::Connection::open_in_memory().expect("duckdb open");
+    fill_join_duck(&conn);
+    JoinDuck { conn }
+}
+
+fn fill_join_duck(conn: &duckdb::Connection) {
+    let (users, orders) = join_data();
+    conn.execute_batch("BEGIN TRANSACTION;")
+        .expect("duck join begin");
     conn.execute_batch(
         "CREATE TABLE users (id VARCHAR PRIMARY KEY, email VARCHAR NOT NULL);
          CREATE TABLE orders (
@@ -958,7 +974,105 @@ fn seed_join_duck() -> JoinDuck {
                 .expect("duck order");
         }
     }
-    JoinDuck { conn }
+    conn.execute_batch("COMMIT;").expect("duck join commit");
+}
+
+/// Disk-backed `orders ⋈ users` fixtures: Lin cold tier vs file-backed SQLite / DuckDB.
+struct ColdJoinLin {
+    _dir: TmpKeep,
+    db: lin::Db,
+    inner: lin::Prepared,
+    filter: lin::Prepared,
+    agg_sum: lin::Prepared,
+    agg_sum_by: lin::Prepared,
+}
+
+fn seed_cold_join_lin() -> ColdJoinLin {
+    let (users, orders) = join_data();
+    let dir = fresh_tmp("cold_join");
+    let opts = || lin::OpenOpts {
+        sync: lin::SyncMode::Full,
+        cold: true,
+    };
+    {
+        let mut db = lin::Db::open_with(&dir.0, opts()).expect("open cold join");
+        db.run("index orders [user_id]").expect("lin cold orders index");
+        for chunk in users.chunks(500) {
+            db.run(&lin_insert_users(chunk)).expect("lin cold seed users");
+        }
+        for chunk in orders.chunks(500) {
+            db.run(&lin_insert_orders(chunk)).expect("lin cold seed orders");
+        }
+        db.checkpoint().expect("cold join checkpoint");
+        db.close().expect("cold join close");
+    }
+    let mut db = lin::Db::open_with(&dir.0, opts()).expect("reopen cold join");
+    let inner = db
+        .prepare(r#"orders | join users on user_id | { id, users.email, total } | take all"#)
+        .expect("lin cold prepare join inner");
+    let filter = db
+        .prepare(
+            r#"orders | total > 100 | join users on user_id | { id, users.email, total } | take all"#,
+        )
+        .expect("lin cold prepare join filter");
+    let agg_sum = db
+        .prepare(r#"orders | sum total"#)
+        .expect("lin cold prepare agg_sum");
+    let agg_sum_by = db
+        .prepare(r#"orders | sum total by user_id"#)
+        .expect("lin cold prepare agg_sum_by");
+    assert_eq!(
+        inner.run_batch(&mut db).expect("lin cold join sanity").n(),
+        JOIN_ORDERS
+    );
+    assert_eq!(
+        filter.run_batch(&mut db).expect("lin cold join filter sanity").n(),
+        JOIN_FILTER_N
+    );
+    assert_eq!(
+        agg_sum_by.run(&mut db).expect("lin cold sum by sanity").done.n,
+        JOIN_USERS
+    );
+    let _ = agg_sum.run(&mut db).expect("lin cold sum sanity");
+    for c in ["orders", "users"] {
+        assert!(
+            db.store.is_disk_backed(c),
+            "cold join queries must not promote {c}"
+        );
+    }
+    ColdJoinLin {
+        _dir: dir,
+        db,
+        inner,
+        filter,
+        agg_sum,
+        agg_sum_by,
+    }
+}
+
+struct ColdJoinSql {
+    _dir: TmpKeep,
+    conn: rusqlite::Connection,
+}
+
+fn seed_cold_join_sqlite() -> ColdJoinSql {
+    let dir = fresh_tmp("sqlite_cold_join");
+    let conn = rusqlite::Connection::open(dir.0.join("join.sqlite")).expect("sqlite cold join");
+    fill_join_sqlite(&conn);
+    ColdJoinSql { _dir: dir, conn }
+}
+
+struct ColdJoinDuck {
+    _dir: TmpKeep,
+    conn: duckdb::Connection,
+}
+
+fn seed_cold_join_duck() -> ColdJoinDuck {
+    let dir = fresh_tmp("duck_cold_join");
+    let conn = duckdb::Connection::open(dir.0.join("join.duckdb")).expect("duck cold join");
+    fill_join_duck(&conn);
+    conn.execute_batch("CHECKPOINT;").expect("duck cold join checkpoint");
+    ColdJoinDuck { _dir: dir, conn }
 }
 
 fn duck_join_n(conn: &duckdb::Connection, sql: &str) -> usize {
@@ -1687,6 +1801,215 @@ fn setup_lin_hot_reopen(n: usize) -> LinColdReopen {
     db.checkpoint().expect("checkpoint");
     db.close().expect("close");
     LinColdReopen { dir }
+}
+
+struct LinColdWarm {
+    _dir: TmpKeep,
+    db: lin::Db,
+    point_get: lin::Prepared,
+    filter_eq: lin::Prepared,
+    materialize: lin::Prepared,
+    count_by_wing: lin::Prepared,
+    filter_range: lin::Prepared,
+    text_substr: lin::Prepared,
+    range_project: lin::Prepared,
+}
+
+fn seed_lin_cold(n: usize) -> LinColdWarm {
+    let rows = docs(n);
+    let dir = fresh_tmp("cold_warm");
+    let chunk_size = if n >= 100_000 { 5_000 } else { 500 };
+    {
+        let mut db = lin::Db::open_with(
+            &dir.0,
+            lin::OpenOpts {
+                sync: lin::SyncMode::Full,
+                cold: true,
+            },
+        )
+        .expect("open cold");
+        db.run("index docs [wing, ts]").expect("lin cold index");
+        for chunk in rows.chunks(chunk_size) {
+            db.run(&lin_insert_src(chunk)).expect("lin cold seed");
+        }
+        db.checkpoint().expect("cold checkpoint");
+        db.close().expect("cold close");
+    }
+    let mut db = lin::Db::open_with(
+        &dir.0,
+        lin::OpenOpts {
+            sync: lin::SyncMode::Full,
+            cold: true,
+        },
+    )
+    .expect("reopen cold");
+    assert!(db.stats().cold, "expected cold mode");
+    assert_eq!(db.stats().docs, n, "expected all docs in cold tier");
+    assert!(
+        db.store.is_disk_backed("docs"),
+        "expected docs to be disk-backed after cold reopen"
+    );
+    let probe_id = &rows[PROBE].id;
+    let point_get = db
+        .prepare(&format!(
+            r#"docs | id == "{}" | {{ id, title }}"#,
+            escape_lin(probe_id)
+        ))
+        .expect("lin cold prepare point_get");
+    let filter_eq = db
+        .prepare(r#"docs | wing == "rag" | count by wing"#)
+        .expect("lin cold prepare filter_eq");
+    let materialize = db
+        .prepare(r#"docs | wing == "rag" | { id, title } | take all"#)
+        .expect("lin cold prepare materialize");
+    let count_by_wing = db
+        .prepare(r#"docs | count by wing"#)
+        .expect("lin cold prepare count_by_wing");
+    let filter_range = db
+        .prepare(r#"docs | wing == "rag" and ts > ago 7d | count by wing"#)
+        .expect("lin cold prepare filter_range");
+    let text_substr = db
+        .prepare(r#"docs | title ~ "wal" | count"#)
+        .expect("lin cold prepare text_substr");
+    let range_project = db
+        .prepare(r#"docs | ts > ago 7d | { id, title } | take all"#)
+        .expect("lin cold prepare range_project");
+    assert_eq!(
+        lin_hits(&filter_range.run(&mut db).expect("lin cold filter_range sanity")),
+        (n / 2) as i64
+    );
+    assert_eq!(
+        lin_hits(&text_substr.run(&mut db).expect("lin cold text_substr sanity")),
+        n.div_ceil(10) as i64
+    );
+    assert_eq!(
+        range_project
+            .run(&mut db)
+            .expect("lin cold range_project sanity")
+            .done
+            .n,
+        n / 2
+    );
+    assert!(
+        db.store.is_disk_backed("docs"),
+        "cold queries must not promote docs"
+    );
+    let mat = materialize
+        .run(&mut db)
+        .expect("lin cold materialize sanity");
+    assert_eq!(
+        mat.done.n,
+        n / 2,
+        "cold materialize should take all rag rows"
+    );
+    assert_eq!(
+        lin_hits(&filter_eq.run(&mut db).expect("lin cold filter_eq sanity")),
+        (n / 2) as i64
+    );
+    LinColdWarm {
+        _dir: dir,
+        db,
+        point_get,
+        filter_eq,
+        materialize,
+        count_by_wing,
+        filter_range,
+        text_substr,
+        range_project,
+    }
+}
+
+struct SqlColdWarm {
+    _dir: TmpKeep,
+    conn: rusqlite::Connection,
+    probe_id: String,
+}
+
+fn seed_sqlite_cold(n: usize) -> SqlColdWarm {
+    let rows = docs(n);
+    let dir = fresh_tmp("sqlite_cold");
+    let path = dir.0.join("cold.sqlite");
+    let conn = rusqlite::Connection::open(&path).expect("sqlite cold open");
+    conn.execute_batch(
+        "CREATE TABLE docs (
+            id TEXT PRIMARY KEY,
+            uri TEXT UNIQUE NOT NULL,
+            wing TEXT NOT NULL,
+            title TEXT NOT NULL,
+            ts INTEGER NOT NULL,
+            body TEXT NOT NULL
+         );
+         CREATE INDEX docs_wing_ts ON docs(wing, ts);",
+    )
+    .expect("sqlite cold schema");
+    conn.execute_batch("BEGIN TRANSACTION;")
+        .expect("sqlite cold begin");
+    {
+        let mut stmt = conn
+            .prepare("INSERT INTO docs (id, uri, wing, title, ts, body) VALUES (?1,?2,?3,?4,?5,?6)")
+            .expect("sqlite cold prepare");
+        for d in &rows {
+            stmt.execute(rusqlite::params![
+                d.id, d.uri, d.wing, d.title, d.ts, d.body
+            ])
+            .expect("sqlite cold seed");
+        }
+    }
+    conn.execute_batch("COMMIT;").expect("sqlite cold commit");
+    {
+        let _ = conn.prepare_cached("SELECT COUNT(*) FROM docs WHERE id = ?1");
+        let _ = conn.prepare_cached("SELECT COUNT(*) FROM docs WHERE wing = 'rag'");
+        let _ = conn.prepare_cached("SELECT wing, COUNT(*) FROM docs GROUP BY wing");
+        let _ = conn.prepare_cached("SELECT id, title FROM docs WHERE wing = 'rag'");
+    }
+    SqlColdWarm {
+        _dir: dir,
+        probe_id: rows[PROBE].id.clone(),
+        conn,
+    }
+}
+
+struct DuckColdWarm {
+    _dir: TmpKeep,
+    conn: duckdb::Connection,
+    probe_id: String,
+}
+
+fn seed_duck_cold(n: usize) -> DuckColdWarm {
+    let rows = docs(n);
+    let dir = fresh_tmp("duck_cold");
+    let path = dir.0.join("cold.duckdb");
+    let conn = duckdb::Connection::open(&path).expect("duckdb cold open");
+    conn.execute_batch(
+        "CREATE TABLE docs (
+            id VARCHAR PRIMARY KEY,
+            uri VARCHAR UNIQUE NOT NULL,
+            wing VARCHAR NOT NULL,
+            title VARCHAR NOT NULL,
+            ts BIGINT NOT NULL,
+            body VARCHAR NOT NULL
+         );
+         CREATE INDEX docs_wing_ts ON docs(wing, ts);",
+    )
+    .expect("duckdb cold schema");
+    conn.execute_batch("BEGIN TRANSACTION;")
+        .expect("duckdb cold begin");
+    {
+        let mut stmt = conn
+            .prepare("INSERT INTO docs (id, uri, wing, title, ts, body) VALUES (?,?,?,?,?,?)")
+            .expect("duckdb cold prepare");
+        for d in &rows {
+            stmt.execute(duckdb::params![d.id, d.uri, d.wing, d.title, d.ts, d.body])
+                .expect("duckdb cold seed");
+        }
+    }
+    conn.execute_batch("COMMIT; CHECKPOINT;")
+        .expect("duckdb cold commit");
+    DuckColdWarm {
+        _dir: dir,
+        probe_id: rows[PROBE].id.clone(),
+        conn,
+    }
 }
 
 struct LinWalShip {
@@ -3071,6 +3394,583 @@ fn main() -> airbug_bench::Result<()> {
         .parameter("rows", COLD_N)
         .work_units("rows", COLD_N as u64);
 
+    // Out-of-core DiskEngine (cold: true) vs file-backed SQLite / DuckDB (10k docs).
+    const COLD_QUERY_N: usize = 10_000;
+    let lin_cold = Fixture::new(|| seed_lin_cold(COLD_QUERY_N));
+    let sql_cold = Fixture::new(|| seed_sqlite_cold(COLD_QUERY_N));
+    let duck_cold = Fixture::new(|| seed_duck_cold(COLD_QUERY_N));
+
+    suite
+        .bench_fixture("cold_point_get/lin", lin_cold.clone(), |s| {
+            black_box(s.point_get.run(&mut s.db).expect("lin cold get").done.n)
+        })
+        .tag("cold")
+        .tag("point_get")
+        .tag("lin")
+        .parameter("n", COLD_QUERY_N);
+    suite
+        .bench_fixture("cold_point_get/sqlite", sql_cold.clone(), |s| {
+            let mut stmt = s
+                .conn
+                .prepare_cached("SELECT COUNT(*) FROM docs WHERE id = ?1")
+                .expect("sqlite cold prep");
+            let n: i64 = stmt
+                .query_row(rusqlite::params![s.probe_id], |r| r.get(0))
+                .expect("sqlite cold get");
+            black_box(n)
+        })
+        .tag("cold")
+        .tag("point_get")
+        .tag("sqlite")
+        .parameter("n", COLD_QUERY_N);
+    suite
+        .bench_fixture("cold_point_get/duckdb", duck_cold.clone(), |s| {
+            let mut stmt = s
+                .conn
+                .prepare_cached("SELECT COUNT(*) FROM docs WHERE id = ?")
+                .expect("duck cold prep");
+            let n: i64 = stmt
+                .query_row(duckdb::params![s.probe_id], |r| r.get(0))
+                .expect("duck cold get");
+            black_box(n)
+        })
+        .tag("cold")
+        .tag("point_get")
+        .tag("duckdb")
+        .parameter("n", COLD_QUERY_N);
+
+    suite
+        .bench_fixture("cold_filter_eq/lin", lin_cold.clone(), |s| {
+            black_box(lin_hits(
+                &s.filter_eq.run(&mut s.db).expect("lin cold filter"),
+            ))
+        })
+        .tag("cold")
+        .tag("filter_eq")
+        .tag("lin")
+        .parameter("n", COLD_QUERY_N);
+    suite
+        .bench_fixture("cold_filter_eq/sqlite", sql_cold.clone(), |s| {
+            let mut stmt = s
+                .conn
+                .prepare_cached("SELECT COUNT(*) FROM docs WHERE wing = 'rag'")
+                .expect("sqlite cold prep");
+            let n: i64 = stmt
+                .query_row([], |r| r.get(0))
+                .expect("sqlite cold filter");
+            black_box(n)
+        })
+        .tag("cold")
+        .tag("filter_eq")
+        .tag("sqlite")
+        .parameter("n", COLD_QUERY_N);
+    suite
+        .bench_fixture("cold_filter_eq/duckdb", duck_cold.clone(), |s| {
+            let mut stmt = s
+                .conn
+                .prepare_cached("SELECT COUNT(*) FROM docs WHERE wing = 'rag'")
+                .expect("duck cold prep");
+            let n: i64 = stmt.query_row([], |r| r.get(0)).expect("duck cold filter");
+            black_box(n)
+        })
+        .tag("cold")
+        .tag("filter_eq")
+        .tag("duckdb")
+        .parameter("n", COLD_QUERY_N);
+
+    suite
+        .bench_fixture("cold_agg_count_by/lin", lin_cold.clone(), |s| {
+            let res = s.count_by_wing.run(&mut s.db).expect("lin cold count by");
+            black_box(res.done.n)
+        })
+        .tag("cold")
+        .tag("agg")
+        .tag("lin")
+        .parameter("docs", COLD_QUERY_N)
+        .work_units("rows", COLD_QUERY_N as u64);
+    suite
+        .bench_fixture("cold_agg_count_by/sqlite", sql_cold.clone(), |s| {
+            let mut stmt = s
+                .conn
+                .prepare_cached("SELECT wing, COUNT(*) FROM docs GROUP BY wing")
+                .expect("sqlite cold prep");
+            let mut rows = stmt.query([]).expect("sqlite cold count by");
+            let mut count = 0usize;
+            while let Some(row) = rows.next().expect("sqlite cold row") {
+                let _wing: String = row.get(0).expect("wing");
+                let _cnt: i64 = row.get(1).expect("cnt");
+                count += 1;
+            }
+            black_box(count)
+        })
+        .tag("cold")
+        .tag("agg")
+        .tag("sqlite")
+        .parameter("docs", COLD_QUERY_N)
+        .work_units("rows", COLD_QUERY_N as u64);
+    suite
+        .bench_fixture("cold_agg_count_by/duckdb", duck_cold.clone(), |s| {
+            let mut stmt = s
+                .conn
+                .prepare_cached("SELECT wing, COUNT(*) FROM docs GROUP BY wing")
+                .expect("duck cold prep");
+            let mut rows = stmt.query([]).expect("duck cold count by");
+            let mut count = 0usize;
+            while let Some(row) = rows.next().expect("duck cold row") {
+                let _wing: String = row.get(0).expect("wing");
+                let _cnt: i64 = row.get(1).expect("cnt");
+                count += 1;
+            }
+            black_box(count)
+        })
+        .tag("cold")
+        .tag("agg")
+        .tag("duckdb")
+        .parameter("docs", COLD_QUERY_N)
+        .work_units("rows", COLD_QUERY_N as u64);
+
+    suite
+        .bench_fixture("cold_filter_range/lin", lin_cold.clone(), |s| {
+            black_box(lin_hits(&s.filter_range.run(&mut s.db).expect("lin cold_filter_range")))
+        })
+        .tag("cold")
+        .tag("filter_range")
+        .tag("lin")
+        .parameter("n", COLD_QUERY_N);
+    suite
+        .bench_fixture("cold_filter_range/sqlite", sql_cold.clone(), |s| {
+            let mut stmt = s
+                .conn
+                .prepare_cached("SELECT COUNT(*) FROM docs WHERE wing = 'rag' AND ts > ?1")
+                .expect("sqlite cold_filter_range prep");
+            let n: i64 = stmt
+                .query_row(rusqlite::params![range_cutoff_ms()], |r| r.get(0))
+                .expect("sqlite cold_filter_range");
+            black_box(n)
+        })
+        .tag("cold")
+        .tag("filter_range")
+        .tag("sqlite")
+        .parameter("n", COLD_QUERY_N);
+    suite
+        .bench_fixture("cold_filter_range/duckdb", duck_cold.clone(), |s| {
+            let mut stmt = s
+                .conn
+                .prepare_cached("SELECT COUNT(*) FROM docs WHERE wing = 'rag' AND ts > ?")
+                .expect("duckdb cold_filter_range prep");
+            let n: i64 = stmt
+                .query_row(duckdb::params![range_cutoff_ms()], |r| r.get(0))
+                .expect("duckdb cold_filter_range");
+            black_box(n)
+        })
+        .tag("cold")
+        .tag("filter_range")
+        .tag("duckdb")
+        .parameter("n", COLD_QUERY_N);
+    suite
+        .bench_fixture("cold_text_substr/lin", lin_cold.clone(), |s| {
+            black_box(lin_hits(&s.text_substr.run(&mut s.db).expect("lin cold_text_substr")))
+        })
+        .tag("cold")
+        .tag("text_substr")
+        .tag("lin")
+        .parameter("n", COLD_QUERY_N);
+    suite
+        .bench_fixture("cold_text_substr/sqlite", sql_cold.clone(), |s| {
+            let mut stmt = s
+                .conn
+                .prepare_cached("SELECT COUNT(*) FROM docs WHERE title LIKE '%wal%'")
+                .expect("sqlite cold_text_substr prep");
+            let n: i64 = stmt
+                .query_row([], |r| r.get(0))
+                .expect("sqlite cold_text_substr");
+            black_box(n)
+        })
+        .tag("cold")
+        .tag("text_substr")
+        .tag("sqlite")
+        .parameter("n", COLD_QUERY_N);
+    suite
+        .bench_fixture("cold_text_substr/duckdb", duck_cold.clone(), |s| {
+            let mut stmt = s
+                .conn
+                .prepare_cached("SELECT COUNT(*) FROM docs WHERE title LIKE '%wal%'")
+                .expect("duckdb cold_text_substr prep");
+            let n: i64 = stmt
+                .query_row([], |r| r.get(0))
+                .expect("duckdb cold_text_substr");
+            black_box(n)
+        })
+        .tag("cold")
+        .tag("text_substr")
+        .tag("duckdb")
+        .parameter("n", COLD_QUERY_N);
+    suite
+        .bench_fixture("cold_range_project/lin", lin_cold.clone(), |s| {
+            black_box(s.range_project.run(&mut s.db).expect("lin cold_range_project").done.n)
+        })
+        .tag("cold")
+        .tag("range_project")
+        .tag("lin")
+        .parameter("n", COLD_QUERY_N);
+    suite
+        .bench_fixture("cold_range_project/lin_batch", lin_cold.clone(), |s| {
+            black_box(
+                s.range_project
+                    .run_batch(&mut s.db)
+                    .expect("lin cold_range_project batch")
+                    .n(),
+            )
+        })
+        .tag("cold")
+        .tag("range_project")
+        .tag("lin")
+        .tag("batch")
+        .parameter("n", COLD_QUERY_N);
+    suite
+        .bench_fixture("cold_range_project/sqlite", sql_cold.clone(), |s| {
+            let mut stmt = s
+                .conn
+                .prepare_cached("SELECT id, title FROM docs WHERE ts > ?1")
+                .expect("sqlite cold_range_project prep");
+            let mut rows = stmt.query(rusqlite::params![range_cutoff_ms()]).expect("sqlite cold_range_project");
+            let mut n = 0usize;
+            while let Some(row) = rows.next().expect("sqlite cold_range_project row") {
+                let id: String = row.get(0).expect("id");
+                let title: String = row.get(1).expect("title");
+                black_box((id, title));
+                n += 1;
+            }
+            black_box(n)
+        })
+        .tag("cold")
+        .tag("range_project")
+        .tag("sqlite")
+        .parameter("n", COLD_QUERY_N);
+    suite
+        .bench_fixture("cold_range_project/duckdb", duck_cold.clone(), |s| {
+            let mut stmt = s
+                .conn
+                .prepare_cached("SELECT id, title FROM docs WHERE ts > ?")
+                .expect("duckdb cold_range_project prep");
+            let mut rows = stmt.query(duckdb::params![range_cutoff_ms()]).expect("duckdb cold_range_project");
+            let mut n = 0usize;
+            while let Some(row) = rows.next().expect("duckdb cold_range_project row") {
+                let id: String = row.get(0).expect("id");
+                let title: String = row.get(1).expect("title");
+                black_box((id, title));
+                n += 1;
+            }
+            black_box(n)
+        })
+        .tag("cold")
+        .tag("range_project")
+        .tag("duckdb")
+        .parameter("n", COLD_QUERY_N);
+
+    let lin_cold_join = Fixture::new(seed_cold_join_lin);
+    let sql_cold_join = Fixture::new(seed_cold_join_sqlite);
+    let duck_cold_join = Fixture::new(seed_cold_join_duck);
+    suite
+        .bench_fixture("cold_join_inner/lin", lin_cold_join.clone(), |s| {
+            black_box(s.inner.run_batch(&mut s.db).expect("lin cold join_inner").n())
+        })
+        .tag("cold")
+        .tag("join_inner")
+        .tag("lin")
+        .parameter("users", JOIN_USERS)
+        .parameter("orders", JOIN_ORDERS)
+        .work_units("rows", JOIN_ORDERS as u64);
+    suite
+        .bench_fixture("cold_join_inner/sqlite", sql_cold_join.clone(), |s| {
+            black_box(sqlite_join_n(&s.conn, JOIN_INNER_SQL))
+        })
+        .tag("cold")
+        .tag("join_inner")
+        .tag("sqlite")
+        .parameter("users", JOIN_USERS)
+        .parameter("orders", JOIN_ORDERS)
+        .work_units("rows", JOIN_ORDERS as u64);
+    suite
+        .bench_fixture("cold_join_inner/duckdb", duck_cold_join.clone(), |s| {
+            black_box(duck_join_n(&s.conn, JOIN_INNER_SQL))
+        })
+        .tag("cold")
+        .tag("join_inner")
+        .tag("duckdb")
+        .parameter("users", JOIN_USERS)
+        .parameter("orders", JOIN_ORDERS)
+        .work_units("rows", JOIN_ORDERS as u64);
+    suite
+        .bench_fixture("cold_join_filter/lin", lin_cold_join.clone(), |s| {
+            black_box(s.filter.run_batch(&mut s.db).expect("lin cold join_filter").n())
+        })
+        .tag("cold")
+        .tag("join_filter")
+        .tag("lin")
+        .parameter("users", JOIN_USERS)
+        .parameter("orders", JOIN_ORDERS)
+        .work_units("rows", JOIN_FILTER_N as u64);
+    suite
+        .bench_fixture("cold_join_filter/sqlite", sql_cold_join.clone(), |s| {
+            black_box(sqlite_join_n(&s.conn, JOIN_FILTER_SQL))
+        })
+        .tag("cold")
+        .tag("join_filter")
+        .tag("sqlite")
+        .parameter("users", JOIN_USERS)
+        .parameter("orders", JOIN_ORDERS)
+        .work_units("rows", JOIN_FILTER_N as u64);
+    suite
+        .bench_fixture("cold_join_filter/duckdb", duck_cold_join.clone(), |s| {
+            black_box(duck_join_n(&s.conn, JOIN_FILTER_SQL))
+        })
+        .tag("cold")
+        .tag("join_filter")
+        .tag("duckdb")
+        .parameter("users", JOIN_USERS)
+        .parameter("orders", JOIN_ORDERS)
+        .work_units("rows", JOIN_FILTER_N as u64);
+    suite
+        .bench_fixture("cold_agg_sum/lin", lin_cold_join.clone(), |s| {
+            black_box(s.agg_sum.run(&mut s.db).expect("lin cold sum").done.n)
+        })
+        .tag("cold")
+        .tag("agg")
+        .tag("lin")
+        .parameter("users", JOIN_USERS)
+        .parameter("orders", JOIN_ORDERS)
+        .work_units("rows", JOIN_ORDERS as u64);
+    suite
+        .bench_fixture("cold_agg_sum/sqlite", sql_cold_join.clone(), |s| {
+            let mut stmt = s
+                .conn
+                .prepare_cached("SELECT SUM(total) FROM orders")
+                .expect("sqlite cold prep");
+            let sum: f64 = stmt.query_row([], |r| r.get(0)).expect("sqlite cold sum");
+            black_box(sum)
+        })
+        .tag("cold")
+        .tag("agg")
+        .tag("sqlite")
+        .parameter("users", JOIN_USERS)
+        .parameter("orders", JOIN_ORDERS)
+        .work_units("rows", JOIN_ORDERS as u64);
+    suite
+        .bench_fixture("cold_agg_sum/duckdb", duck_cold_join.clone(), |s| {
+            let mut stmt = s
+                .conn
+                .prepare_cached("SELECT SUM(total) FROM orders")
+                .expect("duckdb cold prep");
+            let sum: f64 = stmt.query_row([], |r| r.get(0)).expect("duckdb cold sum");
+            black_box(sum)
+        })
+        .tag("cold")
+        .tag("agg")
+        .tag("duckdb")
+        .parameter("users", JOIN_USERS)
+        .parameter("orders", JOIN_ORDERS)
+        .work_units("rows", JOIN_ORDERS as u64);
+    suite
+        .bench_fixture("cold_agg_sum_by/lin", lin_cold_join, |s| {
+            black_box(s.agg_sum_by.run(&mut s.db).expect("lin cold sum by").done.n)
+        })
+        .tag("cold")
+        .tag("agg")
+        .tag("lin")
+        .parameter("users", JOIN_USERS)
+        .parameter("orders", JOIN_ORDERS)
+        .work_units("rows", JOIN_ORDERS as u64);
+    suite
+        .bench_fixture("cold_agg_sum_by/sqlite", sql_cold_join, |s| {
+            let mut stmt = s
+                .conn
+                .prepare_cached("SELECT user_id, SUM(total) FROM orders GROUP BY user_id")
+                .expect("sqlite cold prep");
+            let mut rows = stmt.query([]).expect("sqlite cold sum by");
+            let mut count = 0usize;
+            while let Some(row) = rows.next().expect("sqlite cold row") {
+                let _user: String = row.get(0).expect("user");
+                let _sum: f64 = row.get(1).expect("sum");
+                count += 1;
+            }
+            black_box(count)
+        })
+        .tag("cold")
+        .tag("agg")
+        .tag("sqlite")
+        .parameter("users", JOIN_USERS)
+        .parameter("orders", JOIN_ORDERS)
+        .work_units("rows", JOIN_ORDERS as u64);
+    suite
+        .bench_fixture("cold_agg_sum_by/duckdb", duck_cold_join, |s| {
+            let mut stmt = s
+                .conn
+                .prepare_cached("SELECT user_id, SUM(total) FROM orders GROUP BY user_id")
+                .expect("duckdb cold prep");
+            let mut rows = stmt.query([]).expect("duckdb cold sum by");
+            let mut count = 0usize;
+            while let Some(row) = rows.next().expect("duckdb cold row") {
+                let _user: String = row.get(0).expect("user");
+                let _sum: f64 = row.get(1).expect("sum");
+                count += 1;
+            }
+            black_box(count)
+        })
+        .tag("cold")
+        .tag("agg")
+        .tag("duckdb")
+        .parameter("users", JOIN_USERS)
+        .parameter("orders", JOIN_ORDERS)
+        .work_units("rows", JOIN_ORDERS as u64);
+
+    // One-row durable mutations on a 10k-row cold table. Lin must keep `docs` on disk.
+    // Note: both engines sync every commit, but SQLite's default `fsync` on Apple
+    // platforms is weaker than Lin's `F_FULLFSYNC`, so absolute times mostly reflect that.
+    let probe_id = docs(COLD_QUERY_N)[PROBE].id.clone();
+    {
+        let update_src = format!(
+            r#"update docs[id == "{}"] cas each {{ title: "updated title" }}"#,
+            escape_lin(&probe_id)
+        );
+        let delete_src = format!(r#"delete docs[id == "{}"] cas each"#, escape_lin(&probe_id));
+        let id_for_check = probe_id.clone();
+        suite
+            .bench_checked(
+                "cold_update_1row_10k/lin",
+                || seed_lin_cold(COLD_QUERY_N),
+                move |s| {
+                    assert!(s.db.store.is_disk_backed("docs"), "docs cold before update");
+                    s.db.run(&update_src).expect("lin cold update").done.n
+                },
+                move |s, n| {
+                    assert_eq!(*n, 1);
+                    assert!(s.db.store.is_disk_backed("docs"), "update promoted docs");
+                    assert_eq!(s.db.stats().docs, COLD_QUERY_N);
+                    let _ = &id_for_check;
+                    Ok(())
+                },
+                DropPolicy::OutsideTiming,
+            )
+            .tag("cold")
+            .tag("update")
+            .tag("lin")
+            .parameter("n", COLD_QUERY_N);
+        suite
+            .bench_checked(
+                "cold_delete_1row_10k/lin",
+                || seed_lin_cold(COLD_QUERY_N),
+                move |s| {
+                    assert!(s.db.store.is_disk_backed("docs"), "docs cold before delete");
+                    s.db.run(&delete_src).expect("lin cold delete").done.n
+                },
+                |s, n| {
+                    assert_eq!(*n, 1);
+                    assert!(s.db.store.is_disk_backed("docs"), "delete promoted docs");
+                    assert_eq!(s.db.stats().docs, COLD_QUERY_N - 1);
+                    Ok(())
+                },
+                DropPolicy::OutsideTiming,
+            )
+            .tag("cold")
+            .tag("delete")
+            .tag("lin")
+            .parameter("n", COLD_QUERY_N);
+        suite
+            .bench_checked(
+                "cold_update_1row_10k/sqlite",
+                || seed_sqlite_cold(COLD_QUERY_N),
+                |s| {
+                    s.conn
+                        .execute(
+                            "UPDATE docs SET title = 'updated title' WHERE id = ?1",
+                            rusqlite::params![s.probe_id],
+                        )
+                        .expect("sqlite cold update")
+                },
+                |_, n| {
+                    assert_eq!(*n, 1);
+                    Ok(())
+                },
+                DropPolicy::OutsideTiming,
+            )
+            .tag("cold")
+            .tag("update")
+            .tag("sqlite")
+            .parameter("n", COLD_QUERY_N);
+        suite
+            .bench_checked(
+                "cold_delete_1row_10k/sqlite",
+                || seed_sqlite_cold(COLD_QUERY_N),
+                |s| {
+                    s.conn
+                        .execute(
+                            "DELETE FROM docs WHERE id = ?1",
+                            rusqlite::params![s.probe_id],
+                        )
+                        .expect("sqlite cold delete")
+                },
+                |_, n| {
+                    assert_eq!(*n, 1);
+                    Ok(())
+                },
+                DropPolicy::OutsideTiming,
+            )
+            .tag("cold")
+            .tag("delete")
+            .tag("sqlite")
+            .parameter("n", COLD_QUERY_N);
+    }
+
+    suite
+        .bench_fixture("cold_materialize/lin", lin_cold, |s| {
+            black_box(s.materialize.run(&mut s.db).expect("lin cold mat").done.n)
+        })
+        .tag("cold")
+        .tag("materialize")
+        .tag("lin")
+        .parameter("n", COLD_QUERY_N);
+    suite
+        .bench_fixture("cold_materialize/sqlite", sql_cold, |s| {
+            let mut stmt = s
+                .conn
+                .prepare_cached("SELECT id, title FROM docs WHERE wing = 'rag'")
+                .expect("sqlite cold prep");
+            let mut rows = stmt.query([]).expect("sqlite cold mat");
+            let mut n = 0usize;
+            while let Some(row) = rows.next().expect("sqlite cold row") {
+                let id: String = row.get(0).expect("id");
+                let title: String = row.get(1).expect("title");
+                black_box((id, title));
+                n += 1;
+            }
+            black_box(n)
+        })
+        .tag("cold")
+        .tag("materialize")
+        .tag("sqlite")
+        .parameter("n", COLD_QUERY_N);
+    suite
+        .bench_fixture("cold_materialize/duckdb", duck_cold, |s| {
+            let mut stmt = s
+                .conn
+                .prepare_cached("SELECT id, title FROM docs WHERE wing = 'rag'")
+                .expect("duck cold prep");
+            let mut rows = stmt.query([]).expect("duck cold mat");
+            let mut n = 0usize;
+            while let Some(row) = rows.next().expect("duck cold row") {
+                let id: String = row.get(0).expect("id");
+                let title: String = row.get(1).expect("title");
+                black_box((id, title));
+                n += 1;
+            }
+            black_box(n)
+        })
+        .tag("cold")
+        .tag("materialize")
+        .tag("duckdb")
+        .parameter("n", COLD_QUERY_N);
+
     suite
         .bench_fixture(
             "reopen_phase_5k/rebuild_row_maps",
@@ -3130,7 +4030,12 @@ fn main() -> airbug_bench::Result<()> {
 
     // Prepared single-row writes, sampled read-back validation outside timing.
     // Setup and fixture destruction are excluded by bench_checked's input lifecycle.
-    for (label, n) in [("1k", 1_000usize), ("10k", 10_000), ("100k", 100_000), ("1m", 1_000_000)] {
+    for (label, n) in [
+        ("1k", 1_000usize),
+        ("10k", 10_000),
+        ("100k", 100_000),
+        ("1m", 1_000_000),
+    ] {
         suite
             .bench_checked(
                 &format!("update_1row_{label}/lin"),

@@ -1,15 +1,16 @@
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
+use memchr::memmem::Finder;
 use memmap2::{Mmap, MmapOptions};
 
 use super::DiskColKind;
 use crate::embed::{cosine_with_q_norm, dot_sq8, l2_norm_f64, quantize_sq8};
 use crate::error::Error;
 use crate::persist::io_err;
-use crate::store::{Cell, InlineStr, Row};
+use crate::store::{Cell, InlineStr};
 
 /// Target uncompressed payload per Zstd block for variable-length text columns (32 KiB).
 pub(super) const TEXT_BLOCK_TARGET_BYTES: usize = 32 * 1024;
@@ -29,7 +30,7 @@ struct BlockCacheSlot {
     data: Arc<[u8]>,
 }
 
-pub(super) struct MmapTextCol {
+pub(crate) struct MmapTextCol {
     /// `row_count` entries of `(block_idx: u32, in_block_offset: u32, byte_len: u32, is_null: u32)` = 16 bytes/row.
     row_loc: Mmap,
     /// `block_count + 1` entries of `u64` byte offsets into `blocks_data`.
@@ -178,6 +179,149 @@ impl MmapTextCol {
         Ok(Cell::from_text(s))
     }
 
+    #[allow(dead_code)]
+    #[inline]
+    pub(crate) fn row_count(&self) -> u32 {
+        self.row_count
+    }
+
+    #[allow(dead_code)]
+    #[inline]
+    pub(crate) fn get_cell_cached(
+        &self,
+        row_id: u32,
+        cached: &mut Option<(u32, Arc<[u8]>)>,
+    ) -> Result<Cell, Error> {
+        let Some((block_idx, in_off, len)) = self.get_loc(row_id) else {
+            return Ok(Cell::Null);
+        };
+        if len == 0 {
+            return Ok(Cell::SmallText(InlineStr::new_truncate("")));
+        }
+        let need_load = match cached {
+            Some((lb, _)) => *lb != block_idx,
+            None => true,
+        };
+        if need_load {
+            let decoded = self.decode_block(block_idx)?;
+            *cached = Some((block_idx, decoded));
+        }
+        let (_, ref block) = *cached.as_ref().unwrap();
+        let s_off = in_off as usize;
+        let e_off = s_off + (len as usize);
+        if e_off > block.len() {
+            return Err(io_err("corrupt in-block text slice"));
+        }
+        let s = std::str::from_utf8(&block[s_off..e_off]).map_err(io_err)?;
+        Ok(Cell::from_text(s))
+    }
+
+    /// Count live rows whose string value contains `needle`, running SIMD `memmem`
+    /// over each decoded 32 KiB text block rather than per-row UTF-8 conversion.
+    pub(crate) fn count_contains_live(
+        &self,
+        needle: &[u8],
+        mut is_live: impl FnMut(u32) -> bool,
+    ) -> Result<usize, Error> {
+        if self.row_count == 0 {
+            return Ok(0);
+        }
+        if needle.is_empty() {
+            let mut count = 0usize;
+            for rid in 0..self.row_count {
+                if self.get_loc(rid).is_some() && is_live(rid) {
+                    count += 1;
+                }
+            }
+            return Ok(count);
+        }
+
+        let finder = Finder::new(needle);
+        let row_count = self.row_count as usize;
+        let loc = &self.row_loc[..];
+        let mut rid = 0usize;
+        let mut hits = 0usize;
+
+        #[inline]
+        fn read_loc(loc: &[u8], rid: usize) -> Option<(u32, usize, usize, u32)> {
+            let base = rid * 16;
+            if base + 16 > loc.len() {
+                return None;
+            }
+            let bidx = u32::from_le_bytes(loc[base..base + 4].try_into().ok()?);
+            let in_off = u32::from_le_bytes(loc[base + 4..base + 8].try_into().ok()?) as usize;
+            let len = u32::from_le_bytes(loc[base + 8..base + 12].try_into().ok()?) as usize;
+            let flags = u32::from_le_bytes(loc[base + 12..base + 16].try_into().ok()?);
+            Some((bidx, in_off, len, flags))
+        }
+
+        for bidx in 0..self.block_count {
+            while rid < row_count {
+                let Some((rb, _, _, flags)) = read_loc(loc, rid) else {
+                    break;
+                };
+                if flags != 0 {
+                    rid += 1;
+                    continue;
+                }
+                if rb > bidx {
+                    break;
+                }
+                let block = self.decode_block(bidx)?;
+                let mut search_pos = 0usize;
+                while search_pos < block.len() {
+                    let Some(rel) = finder.find(&block[search_pos..]) else {
+                        break;
+                    };
+                    let hit_pos = search_pos + rel;
+                    let mut matched_span: Option<(usize, usize)> = None;
+                    while rid < row_count {
+                        let Some((r_blk, in_off, len, flags)) = read_loc(loc, rid) else {
+                            break;
+                        };
+                        if flags != 0 {
+                            rid += 1;
+                            continue;
+                        }
+                        if r_blk > bidx {
+                            break;
+                        }
+                        if r_blk == bidx && in_off + len <= hit_pos {
+                            rid += 1;
+                            continue;
+                        }
+                        if r_blk == bidx {
+                            matched_span = Some((in_off, len));
+                        }
+                        break;
+                    }
+                    let Some((in_off, len)) = matched_span else {
+                        break;
+                    };
+                    if hit_pos >= in_off && hit_pos + needle.len() <= in_off + len {
+                        if is_live(rid as u32) {
+                            hits += 1;
+                        }
+                    }
+                    search_pos = in_off + len;
+                    rid += 1;
+                }
+                while rid < row_count {
+                    let Some((r_blk, _, _, flags)) = read_loc(loc, rid) else {
+                        break;
+                    };
+                    if flags != 0 || r_blk == bidx {
+                        rid += 1;
+                    } else {
+                        break;
+                    }
+                }
+                break;
+            }
+        }
+        Ok(hits)
+    }
+
     pub(super) fn with_str<R>(
         &self,
         row_id: u32,
@@ -201,8 +345,8 @@ impl MmapTextCol {
 }
 
 /// Memory-mapped Dictionary-Encoded UTF-8 string column (`col_<name>.dstr`, `.doff`, `.dord`).
-pub(super) struct MmapDictCol {
-    pub(super) strings: Vec<Box<str>>,
+pub(crate) struct MmapDictCol {
+    pub(crate) strings: Vec<Box<str>>,
     cells: Vec<Cell>,
     ordinals: Mmap,
     row_count: u32,
@@ -254,7 +398,7 @@ impl MmapDictCol {
     }
 
     #[inline]
-    pub(super) fn code_at(&self, row_id: u32) -> u16 {
+    pub(crate) fn code_at(&self, row_id: u32) -> u16 {
         if row_id >= self.row_count {
             return DICT_NULL_CODE;
         }
@@ -276,7 +420,7 @@ impl MmapDictCol {
     }
 
     #[inline]
-    pub(super) fn get_cell(&self, row_id: u32) -> Cell {
+    pub(crate) fn get_cell(&self, row_id: u32) -> Cell {
         let code = self.code_at(row_id);
         if code == DICT_NULL_CODE {
             Cell::Null
@@ -284,13 +428,350 @@ impl MmapDictCol {
             self.cells.get(code as usize).cloned().unwrap_or(Cell::Null)
         }
     }
+
+    #[inline]
+    pub(crate) fn get_cell_by_code(&self, code: u16) -> Cell {
+        if code == DICT_NULL_CODE {
+            Cell::Null
+        } else {
+            self.cells.get(code as usize).cloned().unwrap_or(Cell::Null)
+        }
+    }
+
+    #[inline]
+    pub(crate) fn find_code(&self, target: &str) -> Option<u16> {
+        self.strings
+            .iter()
+            .position(|s| s.as_ref() == target)
+            .map(|i| i as u16)
+    }
+
+    #[allow(dead_code)]
+    #[inline]
+    pub(crate) fn ordinals_bytes(&self) -> &[u8] {
+        &self.ordinals
+    }
+
+    #[allow(dead_code)]
+    #[inline]
+    pub(crate) fn row_count(&self) -> u32 {
+        self.row_count
+    }
+
+    pub(crate) fn count_contains_live(
+        &self,
+        needle: &[u8],
+        mut is_live: impl FnMut(u32) -> bool,
+    ) -> usize {
+        let n_dict = self.strings.len();
+        if n_dict == 0 || self.row_count == 0 {
+            return 0;
+        }
+        let n_words = (n_dict + 63) >> 6;
+        let mut allow = vec![0u64; n_words];
+        let mut any = false;
+        if needle.is_empty() {
+            allow.fill(u64::MAX);
+            any = true;
+        } else {
+            let finder = Finder::new(needle);
+            for (i, s) in self.strings.iter().enumerate() {
+                if finder.find(s.as_bytes()).is_some() {
+                    allow[i >> 6] |= 1u64 << (i & 63);
+                    any = true;
+                }
+            }
+        }
+        if !any {
+            return 0;
+        }
+        let mut count = 0usize;
+        for rid in 0..self.row_count {
+            let code = self.code_at(rid);
+            if code != DICT_NULL_CODE {
+                let ci = code as usize;
+                if (allow[ci >> 6] & (1u64 << (ci & 63))) != 0 && is_live(rid) {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
 }
 
-pub(super) struct MmapFixedCol {
+pub(crate) const ZONE_BLOCK_ROWS: usize = 4096;
+
+/// Comparison operand converted to a fixed-width column's native type.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum FixedRhs {
+    I(i64),
+    F(f64),
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct IntZoneBlock {
+    pub(crate) min: i64,
+    pub(crate) max: i64,
+    pub(crate) non_null: u32,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct FloatZoneBlock {
+    pub(crate) min: f64,
+    pub(crate) max: f64,
+    pub(crate) non_null: u32,
+    pub(crate) has_nan: bool,
+}
+
+pub(crate) enum FixedZoneMap {
+    Int(Vec<IntZoneBlock>),
+    Float(Vec<FloatZoneBlock>),
+    None,
+}
+
+/// Per-block min/max/non-null statistics of a fixed-width column.
+pub(super) fn build_fixed_zone_map(
+    kind: DiskColKind,
+    nulls: &[u8],
+    values: &[u8],
+    row_count: usize,
+) -> FixedZoneMap {
+    let n = row_count.min(nulls.len()).min(values.len() / 8);
+    let word = |idx: usize| -> [u8; 8] { values[idx * 8..idx * 8 + 8].try_into().unwrap_or([0; 8]) };
+    match kind {
+        DiskColKind::Int64 | DiskColKind::Time64 => {
+            let mut blks = Vec::with_capacity(n.div_ceil(ZONE_BLOCK_ROWS));
+            for start in (0..n).step_by(ZONE_BLOCK_ROWS) {
+                let end = (start + ZONE_BLOCK_ROWS).min(n);
+                let mut min = i64::MAX;
+                let mut max = i64::MIN;
+                let mut non_null = 0u32;
+                for idx in start..end {
+                    if nulls[idx] == 0 {
+                        let v = i64::from_le_bytes(word(idx));
+                        min = min.min(v);
+                        max = max.max(v);
+                        non_null += 1;
+                    }
+                }
+                blks.push(IntZoneBlock { min, max, non_null });
+            }
+            FixedZoneMap::Int(blks)
+        }
+        DiskColKind::Float64 => {
+            let mut blks = Vec::with_capacity(n.div_ceil(ZONE_BLOCK_ROWS));
+            for start in (0..n).step_by(ZONE_BLOCK_ROWS) {
+                let end = (start + ZONE_BLOCK_ROWS).min(n);
+                let mut min = f64::INFINITY;
+                let mut max = f64::NEG_INFINITY;
+                let mut non_null = 0u32;
+                let mut has_nan = false;
+                for idx in start..end {
+                    if nulls[idx] == 0 {
+                        let v = f64::from_le_bytes(word(idx));
+                        if v.is_nan() {
+                            has_nan = true;
+                        } else {
+                            if v < min {
+                                min = v;
+                            }
+                            if v > max {
+                                max = v;
+                            }
+                        }
+                        non_null += 1;
+                    }
+                }
+                blks.push(FloatZoneBlock {
+                    min,
+                    max,
+                    non_null,
+                    has_nan,
+                });
+            }
+            FixedZoneMap::Float(blks)
+        }
+        _ => FixedZoneMap::None,
+    }
+}
+
+const ZMAP_MAGIC: &[u8; 4] = b"LZM1";
+const ZMAP_HEADER: usize = 24;
+const ZMAP_BLOCK: usize = 24;
+
+/// Serialized zone map (`col_<name>.zmap`): magic, kind tag, row count, block size, block
+/// count, CRC32C of the body, then 24 bytes per block.
+pub(super) fn encode_zone_map(zm: &FixedZoneMap, row_count: u32) -> Option<Vec<u8>> {
+    let (tag, nblocks) = match zm {
+        FixedZoneMap::Int(b) => (0u32, b.len()),
+        FixedZoneMap::Float(b) => (1u32, b.len()),
+        FixedZoneMap::None => return None,
+    };
+    let mut body = Vec::with_capacity(nblocks * ZMAP_BLOCK);
+    match zm {
+        FixedZoneMap::Int(blks) => {
+            for b in blks {
+                body.extend_from_slice(&b.min.to_le_bytes());
+                body.extend_from_slice(&b.max.to_le_bytes());
+                body.extend_from_slice(&b.non_null.to_le_bytes());
+                body.extend_from_slice(&0u32.to_le_bytes());
+            }
+        }
+        FixedZoneMap::Float(blks) => {
+            for b in blks {
+                body.extend_from_slice(&b.min.to_bits().to_le_bytes());
+                body.extend_from_slice(&b.max.to_bits().to_le_bytes());
+                body.extend_from_slice(&b.non_null.to_le_bytes());
+                body.extend_from_slice(&u32::from(b.has_nan).to_le_bytes());
+            }
+        }
+        FixedZoneMap::None => {}
+    }
+    let mut crc = crate::crc::Hasher::new();
+    crc.update(&body);
+    let mut out = Vec::with_capacity(ZMAP_HEADER + body.len());
+    out.extend_from_slice(ZMAP_MAGIC);
+    out.extend_from_slice(&tag.to_le_bytes());
+    out.extend_from_slice(&row_count.to_le_bytes());
+    out.extend_from_slice(&(ZONE_BLOCK_ROWS as u32).to_le_bytes());
+    out.extend_from_slice(&(nblocks as u32).to_le_bytes());
+    out.extend_from_slice(&crc.finalize().to_le_bytes());
+    out.extend_from_slice(&body);
+    Some(out)
+}
+
+/// Inverse of [`encode_zone_map`]; `None` unless the file matches this column exactly.
+fn decode_zone_map(bytes: &[u8], kind: DiskColKind, row_count: u32) -> Option<FixedZoneMap> {
+    let u32_at = |off: usize| -> Option<u32> {
+        Some(u32::from_le_bytes(bytes.get(off..off + 4)?.try_into().ok()?))
+    };
+    if bytes.get(0..4)? != ZMAP_MAGIC {
+        return None;
+    }
+    let tag = u32_at(4)?;
+    let want_tag = match kind {
+        DiskColKind::Int64 | DiskColKind::Time64 => 0,
+        DiskColKind::Float64 => 1,
+        _ => return None,
+    };
+    let nblocks = u32_at(16)? as usize;
+    if tag != want_tag
+        || u32_at(8)? != row_count
+        || u32_at(12)? as usize != ZONE_BLOCK_ROWS
+        || nblocks != (row_count as usize).div_ceil(ZONE_BLOCK_ROWS)
+    {
+        return None;
+    }
+    let body = bytes.get(ZMAP_HEADER..)?;
+    if body.len() != nblocks * ZMAP_BLOCK {
+        return None;
+    }
+    let mut crc = crate::crc::Hasher::new();
+    crc.update(body);
+    if crc.finalize() != u32_at(20)? {
+        return None;
+    }
+    let u64_at = |b: &[u8], off: usize| u64::from_le_bytes(b[off..off + 8].try_into().unwrap_or([0; 8]));
+    let u32_in = |b: &[u8], off: usize| u32::from_le_bytes(b[off..off + 4].try_into().unwrap_or([0; 4]));
+    Some(if tag == 0 {
+        FixedZoneMap::Int(
+            body.chunks_exact(ZMAP_BLOCK)
+                .map(|b| IntZoneBlock {
+                    min: u64_at(b, 0) as i64,
+                    max: u64_at(b, 8) as i64,
+                    non_null: u32_in(b, 16),
+                })
+                .collect(),
+        )
+    } else {
+        FixedZoneMap::Float(
+            body.chunks_exact(ZMAP_BLOCK)
+                .map(|b| FloatZoneBlock {
+                    min: f64::from_bits(u64_at(b, 0)),
+                    max: f64::from_bits(u64_at(b, 8)),
+                    non_null: u32_in(b, 16),
+                    has_nan: u32_in(b, 20) != 0,
+                })
+                .collect(),
+        )
+    })
+}
+
+#[inline]
+fn eval_cmp_i64(lhs: i64, op: crate::ast::CmpOp, rhs: i64) -> bool {
+    match op {
+        crate::ast::CmpOp::Eq => lhs == rhs,
+        crate::ast::CmpOp::Ne => lhs != rhs,
+        crate::ast::CmpOp::Gt => lhs > rhs,
+        crate::ast::CmpOp::Ge => lhs >= rhs,
+        crate::ast::CmpOp::Lt => lhs < rhs,
+        crate::ast::CmpOp::Le => lhs <= rhs,
+    }
+}
+
+#[inline]
+fn eval_cmp_f64(lhs: f64, op: crate::ast::CmpOp, rhs: f64) -> bool {
+    match op {
+        crate::ast::CmpOp::Eq => lhs == rhs,
+        crate::ast::CmpOp::Ne => lhs != rhs,
+        crate::ast::CmpOp::Gt => lhs > rhs,
+        crate::ast::CmpOp::Ge => lhs >= rhs,
+        crate::ast::CmpOp::Lt => lhs < rhs,
+        crate::ast::CmpOp::Le => lhs <= rhs,
+    }
+}
+
+#[inline]
+fn int_zone_relation(blk: IntZoneBlock, op: crate::ast::CmpOp, rhs: i64) -> (bool, bool) {
+    if blk.non_null == 0 {
+        return (true, false);
+    }
+    match op {
+        crate::ast::CmpOp::Gt => (blk.max <= rhs, blk.min > rhs),
+        crate::ast::CmpOp::Ge => (blk.max < rhs, blk.min >= rhs),
+        crate::ast::CmpOp::Lt => (blk.min >= rhs, blk.max < rhs),
+        crate::ast::CmpOp::Le => (blk.min > rhs, blk.max <= rhs),
+        crate::ast::CmpOp::Eq => (
+            rhs < blk.min || rhs > blk.max,
+            blk.min == blk.max && blk.min == rhs,
+        ),
+        crate::ast::CmpOp::Ne => (
+            blk.min == blk.max && blk.min == rhs,
+            rhs < blk.min || rhs > blk.max,
+        ),
+    }
+}
+
+#[inline]
+fn float_zone_relation(blk: FloatZoneBlock, op: crate::ast::CmpOp, rhs: f64) -> (bool, bool) {
+    if blk.non_null == 0 || rhs.is_nan() {
+        return (true, false);
+    }
+    if blk.has_nan {
+        return (false, false);
+    }
+    match op {
+        crate::ast::CmpOp::Gt => (blk.max <= rhs, blk.min > rhs),
+        crate::ast::CmpOp::Ge => (blk.max < rhs, blk.min >= rhs),
+        crate::ast::CmpOp::Lt => (blk.min >= rhs, blk.max < rhs),
+        crate::ast::CmpOp::Le => (blk.min > rhs, blk.max <= rhs),
+        crate::ast::CmpOp::Eq => (
+            rhs < blk.min || rhs > blk.max,
+            blk.min == blk.max && blk.min == rhs,
+        ),
+        crate::ast::CmpOp::Ne => (
+            blk.min == blk.max && blk.min == rhs,
+            rhs < blk.min || rhs > blk.max,
+        ),
+    }
+}
+
+pub(crate) struct MmapFixedCol {
     kind: DiskColKind,
     nulls: Mmap,
     values: Mmap,
     row_count: u32,
+    zone_map: OnceLock<FixedZoneMap>,
 }
 
 impl MmapFixedCol {
@@ -304,16 +785,301 @@ impl MmapFixedCol {
         let vf = File::open(dir.join(format!("col_{col_name}.val"))).map_err(io_err)?;
         let nulls = unsafe { MmapOptions::new().map(&nf) }.map_err(io_err)?;
         let values = unsafe { MmapOptions::new().map(&vf) }.map_err(io_err)?;
+        // Zone map persisted at segment write time; a missing or invalid file just falls
+        // back to the lazy full-column scan in `zones()`.
+        let zone_map = OnceLock::new();
+        if let Ok(bytes) = std::fs::read(dir.join(format!("col_{col_name}.zmap")))
+            && let Some(zm) = decode_zone_map(&bytes, kind, row_count)
+        {
+            let _ = zone_map.set(zm);
+        }
         Ok(Self {
             kind,
             nulls,
             values,
             row_count,
+            zone_map,
         })
     }
 
     #[inline]
-    pub(super) fn get_cell(&self, row_id: u32) -> Cell {
+    pub(crate) fn kind(&self) -> DiskColKind {
+        self.kind
+    }
+
+    #[inline]
+    pub(crate) fn row_count(&self) -> u32 {
+        self.row_count
+    }
+
+    #[inline]
+    pub(crate) fn is_null(&self, row_id: u32) -> bool {
+        let idx = row_id as usize;
+        row_id >= self.row_count || idx >= self.nulls.len() || self.nulls[idx] != 0
+    }
+
+    #[inline]
+    pub(crate) fn read_i64(&self, row_id: u32) -> i64 {
+        let off = (row_id as usize) * 8;
+        if off + 8 > self.values.len() {
+            return 0;
+        }
+        i64::from_le_bytes(self.values[off..off + 8].try_into().unwrap_or([0; 8]))
+    }
+
+    #[inline]
+    pub(crate) fn read_f64(&self, row_id: u32) -> f64 {
+        let off = (row_id as usize) * 8;
+        if off + 8 > self.values.len() {
+            return 0.0;
+        }
+        f64::from_le_bytes(self.values[off..off + 8].try_into().unwrap_or([0; 8]))
+    }
+
+    pub(crate) fn zones(&self) -> &FixedZoneMap {
+        self.zone_map.get_or_init(|| {
+            build_fixed_zone_map(self.kind, &self.nulls, &self.values, self.row_count as usize)
+        })
+    }
+
+    /// Right-hand side of `col <op> value` in this column's native representation, under the
+    /// same type-strict rules as row-level comparison. `None` when the pairing has no
+    /// columnar equivalent (the row-level comparison is then always false or needs exact
+    /// int/float handling).
+    pub(crate) fn fixed_rhs(&self, rhs: &Cell) -> Option<FixedRhs> {
+        match (self.kind, rhs) {
+            (DiskColKind::Int64, Cell::Int(r)) | (DiskColKind::Time64, Cell::Time(r)) => {
+                Some(FixedRhs::I(*r))
+            }
+            (DiskColKind::Float64, Cell::Float(r)) if !r.is_nan() => Some(FixedRhs::F(*r)),
+            (DiskColKind::Float64, Cell::Int(r)) if r.unsigned_abs() <= (1u64 << 53) => {
+                Some(FixedRhs::F(*r as f64))
+            }
+            _ => None,
+        }
+    }
+
+    /// `col[rid] <op> rhs`; a null cell never matches.
+    #[inline]
+    pub(crate) fn cmp_at(&self, rid: u32, op: crate::ast::CmpOp, rhs: FixedRhs) -> bool {
+        if self.is_null(rid) {
+            return false;
+        }
+        match rhs {
+            FixedRhs::I(r) => eval_cmp_i64(self.read_i64(rid), op, r),
+            FixedRhs::F(r) => eval_cmp_f64(self.read_f64(rid), op, r),
+        }
+    }
+
+    /// True when zone-map block `bi` provably holds no row satisfying `col <op> rhs`.
+    /// Mirrors the type-strict rules of row-level comparison; any other pairing never skips.
+    pub(crate) fn zone_block_skips(&self, bi: usize, op: crate::ast::CmpOp, rhs: &Cell) -> bool {
+        match (self.zones(), self.kind, rhs) {
+            (FixedZoneMap::Int(blks), DiskColKind::Int64, Cell::Int(r))
+            | (FixedZoneMap::Int(blks), DiskColKind::Time64, Cell::Time(r)) => {
+                blks.get(bi).is_some_and(|b| int_zone_relation(*b, op, *r).0)
+            }
+            (FixedZoneMap::Float(blks), DiskColKind::Float64, Cell::Float(r)) if !r.is_nan() => {
+                blks.get(bi).is_some_and(|b| float_zone_relation(*b, op, *r).0)
+            }
+            (FixedZoneMap::Float(blks), DiskColKind::Float64, Cell::Int(r))
+                if r.unsigned_abs() <= (1u64 << 53) =>
+            {
+                blks.get(bi)
+                    .is_some_and(|b| float_zone_relation(*b, op, *r as f64).0)
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn count_cmp_with_opt_dict_eq(
+        &self,
+        op: crate::ast::CmpOp,
+        rhs_i64: Option<i64>,
+        rhs_f64: Option<f64>,
+        opt_dict: Option<(&MmapDictCol, u16)>,
+        seg_all_live: bool,
+        mut is_live: impl FnMut(u32) -> bool,
+    ) -> Option<usize> {
+        let n = (self.row_count as usize)
+            .min(self.nulls.len())
+            .min(self.values.len() / 8);
+        match (self.zones(), self.kind) {
+            (FixedZoneMap::Int(blks), DiskColKind::Int64 | DiskColKind::Time64) => {
+                let rhs = rhs_i64?;
+                let mut total = 0usize;
+                for (bi, blk) in blks.iter().enumerate() {
+                    let start = bi * ZONE_BLOCK_ROWS;
+                    let end = (start + ZONE_BLOCK_ROWS).min(n);
+                    let blk_len = end - start;
+                    let (skip, all_match) = int_zone_relation(*blk, op, rhs);
+                    if skip {
+                        continue;
+                    }
+                    if all_match && seg_all_live && blk.non_null as usize == blk_len {
+                        match opt_dict {
+                            None => total += blk_len,
+                            Some((dc, target_code)) => {
+                                for rid in start..end {
+                                    if dc.code_at(rid as u32) == target_code {
+                                        total += 1;
+                                    }
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    match opt_dict {
+                        None => {
+                            for idx in start..end {
+                                let rid = idx as u32;
+                                if self.nulls[idx] == 0
+                                    && eval_cmp_i64(self.read_i64(rid), op, rhs)
+                                    && (seg_all_live || is_live(rid))
+                                {
+                                    total += 1;
+                                }
+                            }
+                        }
+                        Some((dc, target_code)) => {
+                            for idx in start..end {
+                                let rid = idx as u32;
+                                if dc.code_at(rid) == target_code
+                                    && self.nulls[idx] == 0
+                                    && eval_cmp_i64(self.read_i64(rid), op, rhs)
+                                    && (seg_all_live || is_live(rid))
+                                {
+                                    total += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                Some(total)
+            }
+            (FixedZoneMap::Float(blks), DiskColKind::Float64) => {
+                let rhs = rhs_f64?;
+                let mut total = 0usize;
+                for (bi, blk) in blks.iter().enumerate() {
+                    let start = bi * ZONE_BLOCK_ROWS;
+                    let end = (start + ZONE_BLOCK_ROWS).min(n);
+                    let blk_len = end - start;
+                    let (skip, all_match) = float_zone_relation(*blk, op, rhs);
+                    if skip {
+                        continue;
+                    }
+                    if all_match && seg_all_live && blk.non_null as usize == blk_len {
+                        match opt_dict {
+                            None => total += blk_len,
+                            Some((dc, target_code)) => {
+                                for rid in start..end {
+                                    if dc.code_at(rid as u32) == target_code {
+                                        total += 1;
+                                    }
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    match opt_dict {
+                        None => {
+                            for idx in start..end {
+                                let rid = idx as u32;
+                                if self.nulls[idx] == 0
+                                    && eval_cmp_f64(self.read_f64(rid), op, rhs)
+                                    && (seg_all_live || is_live(rid))
+                                {
+                                    total += 1;
+                                }
+                            }
+                        }
+                        Some((dc, target_code)) => {
+                            for idx in start..end {
+                                let rid = idx as u32;
+                                if dc.code_at(rid) == target_code
+                                    && self.nulls[idx] == 0
+                                    && eval_cmp_f64(self.read_f64(rid), op, rhs)
+                                    && (seg_all_live || is_live(rid))
+                                {
+                                    total += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                Some(total)
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn sum_f64_live(
+        &self,
+        seg_all_live: bool,
+        mut is_live: impl FnMut(u32) -> bool,
+    ) -> Option<f64> {
+        let n = (self.row_count as usize)
+            .min(self.nulls.len())
+            .min(self.values.len() / 8);
+        match self.kind {
+            DiskColKind::Float64 => {
+                let mut acc = 0.0f64;
+                if seg_all_live && self.nulls[..n].iter().all(|&b| b == 0) {
+                    #[cfg(target_endian = "little")]
+                    {
+                        let ptr = self.values.as_ptr();
+                        if (ptr as usize).is_multiple_of(std::mem::align_of::<f64>()) {
+                            let slice = unsafe { std::slice::from_raw_parts(ptr as *const f64, n) };
+                            let mut s0 = 0.0f64;
+                            let mut s1 = 0.0f64;
+                            let mut s2 = 0.0f64;
+                            let mut s3 = 0.0f64;
+                            let mut chunks = slice.chunks_exact(4);
+                            for c in &mut chunks {
+                                s0 += c[0];
+                                s1 += c[1];
+                                s2 += c[2];
+                                s3 += c[3];
+                            }
+                            for &v in chunks.remainder() {
+                                s0 += v;
+                            }
+                            return Some((s0 + s1) + (s2 + s3));
+                        }
+                    }
+                    for rid in 0..n {
+                        acc += self.read_f64(rid as u32);
+                    }
+                    return Some(acc);
+                }
+                for rid in 0..n {
+                    if self.nulls[rid] == 0 && (seg_all_live || is_live(rid as u32)) {
+                        acc += self.read_f64(rid as u32);
+                    }
+                }
+                Some(acc)
+            }
+            DiskColKind::Int64 => {
+                let mut acc = 0.0f64;
+                if seg_all_live && self.nulls[..n].iter().all(|&b| b == 0) {
+                    for rid in 0..n {
+                        acc += self.read_i64(rid as u32) as f64;
+                    }
+                    return Some(acc);
+                }
+                for rid in 0..n {
+                    if self.nulls[rid] == 0 && (seg_all_live || is_live(rid as u32)) {
+                        acc += self.read_i64(rid as u32) as f64;
+                    }
+                }
+                Some(acc)
+            }
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn get_cell(&self, row_id: u32) -> Cell {
         let idx = row_id as usize;
         if row_id >= self.row_count || idx >= self.nulls.len() || self.nulls[idx] != 0 {
             return Cell::Null;
@@ -485,14 +1251,14 @@ pub(super) fn build_vec_ivf_file(
     seg_dir: &Path,
     col_name: &str,
     dim: usize,
-    rows: &[Row],
+    rows: super::segment::ColSrc<'_>,
 ) -> Result<(), Error> {
     if dim == 0 {
         return Ok(());
     }
     let mut live_rids: Vec<u32> = Vec::with_capacity(rows.len());
-    for (i, r) in rows.iter().enumerate() {
-        if let Some(Cell::Vec(v)) = r.get(col_name)
+    for i in 0..rows.len() {
+        if let Some(v) = rows.vec(i)
             && v.len() == dim
         {
             live_rids.push(i as u32);
@@ -508,7 +1274,7 @@ pub(super) fn build_vec_ivf_file(
     let mut centroids = vec![0.0f32; k * dim];
     for c in 0..k {
         let src_rid = live_rids[(c * n) / k] as usize;
-        if let Some(Cell::Vec(v)) = rows[src_rid].get(col_name) {
+        if let Some(v) = rows.vec(src_rid) {
             let norm = (l2_norm_f64(v) as f32).max(1e-12);
             let dst = &mut centroids[c * dim..(c + 1) * dim];
             for (j, &val) in v.iter().enumerate() {
@@ -528,7 +1294,7 @@ pub(super) fn build_vec_ivf_file(
         }
 
         let assign_fn = |&rid: &u32| -> usize {
-            let Some(Cell::Vec(v)) = rows[rid as usize].get(col_name) else {
+            let Some(v) = rows.vec(rid as usize) else {
                 return 0;
             };
             let vq = quantize_sq8(v);
@@ -555,7 +1321,7 @@ pub(super) fn build_vec_ivf_file(
         let mut sums = vec![0.0f64; k * dim];
         let mut counts = vec![0usize; k];
         for (&rid, &cid) in train_rids.iter().zip(train_assign.iter()) {
-            if let Some(Cell::Vec(v)) = rows[rid as usize].get(col_name) {
+            if let Some(v) = rows.vec(rid as usize) {
                 let vnorm = l2_norm_f64(v).max(1e-12);
                 let inv = 1.0 / vnorm;
                 let dst = &mut sums[cid * dim..(cid + 1) * dim];
@@ -588,9 +1354,9 @@ pub(super) fn build_vec_ivf_file(
     }
 
     let assign_all_fn = |&rid: &u32| -> (usize, u32, Arc<[i8]>) {
-        let v = match rows[rid as usize].get(col_name) {
-            Some(Cell::Vec(v)) => v.as_ref(),
-            _ => &[][..],
+        let v = match rows.vec(rid as usize) {
+            Some(v) => v.as_ref(),
+            None => &[][..],
         };
         let vq = quantize_sq8(v);
         let mut best_c = 0usize;
@@ -688,7 +1454,12 @@ pub struct MmapVecCol {
 }
 
 impl MmapVecCol {
-    pub(super) fn open(dir: &Path, col_name: &str, dim: u32, row_count: u32) -> Result<Self, Error> {
+    pub(super) fn open(
+        dir: &Path,
+        col_name: &str,
+        dim: u32,
+        row_count: u32,
+    ) -> Result<Self, Error> {
         let nf = File::open(dir.join(format!("col_{col_name}.vnull"))).map_err(io_err)?;
         let ff = File::open(dir.join(format!("col_{col_name}.vf32"))).map_err(io_err)?;
         let qf = File::open(dir.join(format!("col_{col_name}.vsq8"))).map_err(io_err)?;
@@ -768,7 +1539,7 @@ impl MmapVecCol {
     }
 }
 
-pub(super) enum MmapCol {
+pub(crate) enum MmapCol {
     Fixed(MmapFixedCol),
     Text(MmapTextCol),
     Dict(MmapDictCol),
@@ -777,7 +1548,7 @@ pub(super) enum MmapCol {
 
 impl MmapCol {
     #[inline]
-    pub(super) fn get_cell(&self, row_id: u32) -> Result<Cell, Error> {
+    pub(crate) fn get_cell(&self, row_id: u32) -> Result<Cell, Error> {
         match self {
             MmapCol::Fixed(c) => Ok(c.get_cell(row_id)),
             MmapCol::Text(c) => c.get_cell(row_id),

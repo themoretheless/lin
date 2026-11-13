@@ -34,6 +34,18 @@ pub struct AsyncDb {
     inner: Arc<Mutex<Db>>,
     write_epoch: Arc<AtomicU64>,
     cached_reader: Arc<RwLock<Option<(u64, ReadDb)>>>,
+    /// Writes waiting for the writer lock; whoever gets the lock commits all of them.
+    commit_queue: Arc<std::sync::Mutex<Vec<QueuedWrite>>>,
+}
+
+struct QueuedWrite {
+    work: QueuedWork,
+    reply: tokio::sync::oneshot::Sender<Result<Done, Error>>,
+}
+
+enum QueuedWork {
+    Src(String),
+    Prepared(Prepared),
 }
 
 impl AsyncDb {
@@ -42,6 +54,7 @@ impl AsyncDb {
             inner: Arc::new(Mutex::new(db)),
             write_epoch: Arc::new(AtomicU64::new(1)),
             cached_reader: Arc::new(RwLock::new(None)),
+            commit_queue: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -50,6 +63,7 @@ impl AsyncDb {
             inner,
             write_epoch: Arc::new(AtomicU64::new(1)),
             cached_reader: Arc::new(RwLock::new(None)),
+            commit_queue: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -138,18 +152,53 @@ impl AsyncDb {
             .map_err(|e| Error::runtime(format!("async join: {e}")))?
     }
 
+    /// Execute a write. Concurrent calls (of this method and [`Self::execute_prepared`])
+    /// form a commit group: the first task to take the writer lock runs every queued
+    /// statement in arrival order (each still atomic on its own) and syncs the WAL once for
+    /// all of them, so N concurrent durable writes cost one `fsync` instead of N. A call
+    /// returns only after the sync covering it has finished.
     pub async fn execute(&self, src: impl Into<String>) -> Result<Done, Error> {
-        let src = src.into();
+        self.group_commit(QueuedWork::Src(src.into())).await
+    }
+
+    async fn group_commit(&self, work: QueuedWork) -> Result<Done, Error> {
+        let (reply, done) = tokio::sync::oneshot::channel();
+        self.commit_queue
+            .lock()
+            .map_err(|_| Error::runtime("async commit queue poisoned"))?
+            .push(QueuedWrite { work, reply });
         let db = Arc::clone(&self.inner);
+        let queue = Arc::clone(&self.commit_queue);
         let write_epoch = Arc::clone(&self.write_epoch);
         spawn_blocking(move || {
             let mut g = db.blocking_lock();
-            let res = g.execute(&src);
+            // An earlier leader may already have committed this call's statement.
+            let batch = match queue.lock() {
+                Ok(mut q) => std::mem::take(&mut *q),
+                Err(_) => return,
+            };
+            if batch.is_empty() {
+                return;
+            }
+            let writes: Vec<crate::exec::GroupWrite<'_>> = batch
+                .iter()
+                .map(|w| match &w.work {
+                    QueuedWork::Src(src) => crate::exec::GroupWrite::Src(src),
+                    QueuedWork::Prepared(p) => crate::exec::GroupWrite::Prepared(p),
+                })
+                .collect();
+            let results = g.execute_group_sync_mixed(&writes);
+            drop(writes);
             write_epoch.fetch_add(1, Ordering::Release);
-            res
+            drop(g);
+            for (w, res) in batch.into_iter().zip(results) {
+                let _ = w.reply.send(res);
+            }
         })
         .await
-        .map_err(|e| Error::runtime(format!("async join: {e}")))?
+        .map_err(|e| Error::runtime(format!("async join: {e}")))?;
+        done.await
+            .map_err(|_| Error::runtime("async commit group dropped the statement"))?
     }
 
     pub async fn scalar(&self, src: impl Into<String>) -> Result<Cell, Error> {
@@ -200,6 +249,9 @@ impl AsyncDb {
     }
 
     pub async fn execute_prepared(&self, prepared: Prepared) -> Result<Done, Error> {
+        if prepared.writes {
+            return self.group_commit(QueuedWork::Prepared(prepared)).await;
+        }
         let db = Arc::clone(&self.inner);
         let write_epoch = Arc::clone(&self.write_epoch);
         spawn_blocking(move || {

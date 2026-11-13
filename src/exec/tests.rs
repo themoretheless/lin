@@ -4,7 +4,9 @@ use crate::ast::{Record, Stmt, Value};
 use crate::store::{Cell, Row, content_hash_arc, now_ms, row_text};
 
 use super::Db;
-use super::dml::{PREENCODE_TEST_ATTEMPTS, PREENCODE_TEST_MODE, append_batch_shape_rows, record_row};
+use super::dml::{
+    PREENCODE_TEST_ATTEMPTS, PREENCODE_TEST_MODE, append_batch_shape_rows, record_row,
+};
 use super::eval::{LexQuery, lex_score_prepared};
 
 fn append_bulk_worker_rows(
@@ -330,14 +332,18 @@ mod record_tests {
             .prepare("insert accounts { id: $id, balance: $bal }")
             .unwrap();
         assert!(ins.has_params);
-        ins.execute_with(&mut db, &[("id", Cell::text_arc("a1")), ("bal", Cell::Int(100))])
-            .unwrap();
-        ins.execute_with(&mut db, &[("id", Cell::text_arc("a2")), ("bal", Cell::Int(250))])
-            .unwrap();
+        ins.execute_with(
+            &mut db,
+            &[("id", Cell::text_arc("a1")), ("bal", Cell::Int(100))],
+        )
+        .unwrap();
+        ins.execute_with(
+            &mut db,
+            &[("id", Cell::text_arc("a2")), ("bal", Cell::Int(250))],
+        )
+        .unwrap();
 
-        let sel = db
-            .prepare("accounts | id == $id | { balance }")
-            .unwrap();
+        let sel = db.prepare("accounts | id == $id | { balance }").unwrap();
         assert_eq!(
             sel.scalar_with(&mut db, &[("id", Cell::text_arc("a2"))])
                 .unwrap(),
@@ -349,8 +355,11 @@ mod record_tests {
             .unwrap();
         {
             let mut tx = db.transaction().unwrap();
-            tx.execute_with(&upd, &[("id", Cell::text_arc("a1")), ("bal", Cell::Int(999))])
-                .unwrap();
+            tx.execute_with(
+                &upd,
+                &[("id", Cell::text_arc("a1")), ("bal", Cell::Int(999))],
+            )
+            .unwrap();
             tx.commit().unwrap();
         }
         assert_eq!(
@@ -668,7 +677,9 @@ mod preencoded_insert_tests {
     #[test]
     fn test_point_delete_and_update_extracted() {
         let mut db = Db::empty();
-        let prep = db.prepare(r#"delete docs[id == "d-20"] cas "h:123""#).unwrap();
+        let prep = db
+            .prepare(r#"delete docs[id == "d-20"] cas "h:123""#)
+            .unwrap();
         assert!(prep.point_delete.is_some());
         let prep_up = db
             .prepare(r#"update docs[id == "d-20"] cas "h:123" { wing: "sys" }"#)

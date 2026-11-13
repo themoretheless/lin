@@ -143,6 +143,38 @@ impl DiskSegment {
     }
 
     #[inline]
+    pub(crate) fn col(&self, field: &str) -> Option<&MmapCol> {
+        let pos = *self.col_pos.get(field)?;
+        Some(&self.cols[pos].1)
+    }
+
+    #[inline]
+    pub(crate) fn fixed_col(&self, field: &str) -> Option<&MmapFixedCol> {
+        match self.col(field)? {
+            MmapCol::Fixed(fc) => Some(fc),
+            _ => None,
+        }
+    }
+
+    #[allow(dead_code)]
+    #[inline]
+    pub(crate) fn dict_col(&self, field: &str) -> Option<&MmapDictCol> {
+        match self.col(field)? {
+            MmapCol::Dict(dc) => Some(dc),
+            _ => None,
+        }
+    }
+
+    #[allow(dead_code)]
+    #[inline]
+    pub(crate) fn text_col(&self, field: &str) -> Option<&MmapTextCol> {
+        match self.col(field)? {
+            MmapCol::Text(tc) => Some(tc),
+            _ => None,
+        }
+    }
+
+    #[inline]
     pub fn col_pos(&self, field: &str) -> Option<usize> {
         self.col_pos.get(field).copied()
     }
@@ -262,21 +294,33 @@ impl DiskSegment {
     }
 }
 
+/// Persist block min/max statistics next to a fixed-width column while its values are
+/// still in memory, so opening the segment never has to scan the column to rebuild them.
+fn write_zone_map(
+    seg_dir: &Path,
+    col_name: &str,
+    kind: DiskColKind,
+    nulls: &[u8],
+    vals: &[u8],
+) -> Result<(), Error> {
+    let zm = super::columns::build_fixed_zone_map(kind, nulls, vals, nulls.len());
+    if let Some(bytes) = super::columns::encode_zone_map(&zm, nulls.len() as u32) {
+        fs::write(seg_dir.join(format!("col_{col_name}.zmap")), bytes).map_err(io_err)?;
+    }
+    Ok(())
+}
+
 fn write_single_column(
     seg_dir: &Path,
     col: &DiskColSchema,
-    rows: &[Row],
+    src: ColSrc<'_>,
 ) -> Result<DiskColKind, Error> {
     match col.kind {
         DiskColKind::Int64 | DiskColKind::Time64 => {
-            let mut nulls = vec![1u8; rows.len()];
-            let mut vals = Vec::with_capacity(rows.len() * 8);
-            for (i, r) in rows.iter().enumerate() {
-                let v = match r.get(&col.name) {
-                    Some(Cell::Int(n)) => Some(*n),
-                    Some(Cell::Time(t)) => Some(*t),
-                    _ => None,
-                };
+            let mut nulls = vec![1u8; src.len()];
+            let mut vals = Vec::with_capacity(src.len() * 8);
+            for i in 0..src.len() {
+                let v = src.int_or_time(i);
                 if let Some(n) = v {
                     nulls[i] = 0;
                     vals.extend_from_slice(&n.to_le_bytes());
@@ -286,17 +330,14 @@ fn write_single_column(
             }
             fs::write(seg_dir.join(format!("col_{}.null", col.name)), &nulls).map_err(io_err)?;
             fs::write(seg_dir.join(format!("col_{}.val", col.name)), &vals).map_err(io_err)?;
+            write_zone_map(seg_dir, &col.name, col.kind, &nulls, &vals)?;
             Ok(col.kind)
         }
         DiskColKind::Float64 => {
-            let mut nulls = vec![1u8; rows.len()];
-            let mut vals = Vec::with_capacity(rows.len() * 8);
-            for (i, r) in rows.iter().enumerate() {
-                let v = match r.get(&col.name) {
-                    Some(Cell::Float(f)) => Some(*f),
-                    Some(Cell::Int(n)) => Some(*n as f64),
-                    _ => None,
-                };
+            let mut nulls = vec![1u8; src.len()];
+            let mut vals = Vec::with_capacity(src.len() * 8);
+            for i in 0..src.len() {
+                let v = src.float_or_int(i);
                 if let Some(f) = v {
                     nulls[i] = 0;
                     vals.extend_from_slice(&f.to_le_bytes());
@@ -306,15 +347,16 @@ fn write_single_column(
             }
             fs::write(seg_dir.join(format!("col_{}.null", col.name)), &nulls).map_err(io_err)?;
             fs::write(seg_dir.join(format!("col_{}.val", col.name)), &vals).map_err(io_err)?;
+            write_zone_map(seg_dir, &col.name, DiskColKind::Float64, &nulls, &vals)?;
             Ok(DiskColKind::Float64)
         }
         DiskColKind::Bool => {
-            let mut nulls = vec![1u8; rows.len()];
-            let mut vals = vec![0u8; rows.len()];
-            for (i, r) in rows.iter().enumerate() {
-                if let Some(Cell::Bool(b)) = r.get(&col.name) {
+            let mut nulls = vec![1u8; src.len()];
+            let mut vals = vec![0u8; src.len()];
+            for i in 0..src.len() {
+                if let Some(b) = src.bool(i) {
                     nulls[i] = 0;
-                    vals[i] = u8::from(*b);
+                    vals[i] = u8::from(b);
                 }
             }
             fs::write(seg_dir.join(format!("col_{}.null", col.name)), &nulls).map_err(io_err)?;
@@ -322,19 +364,19 @@ fn write_single_column(
             Ok(DiskColKind::Bool)
         }
         DiskColKind::TextZstd | DiskColKind::TextDict => {
-            if rows.len() >= DICT_MIN_SEGMENT_ROWS && col.name != "id" && col.name != "content" {
+            if src.len() >= DICT_MIN_SEGMENT_ROWS && col.name != "id" && col.name != "content" {
                 let mut dict_map: FxHashMap<&str, u16> = FxHashMap::default();
                 let mut dict_list: Vec<&str> = Vec::new();
                 let mut dict_bytes = 0usize;
-                let mut codes: Vec<u16> = Vec::with_capacity(rows.len());
+                let mut codes: Vec<u16> = Vec::with_capacity(src.len());
                 let mut eligible = true;
 
-                for (row_idx, r) in rows.iter().enumerate() {
-                    if row_idx == 64 && rows.len() >= 128 && dict_list.len() > 56 {
+                for row_idx in 0..src.len() {
+                    if row_idx == 64 && src.len() >= 128 && dict_list.len() > 56 {
                         eligible = false;
                         break;
                     }
-                    match r.get(&col.name).and_then(Cell::text) {
+                    match src.text(row_idx) {
                         None => codes.push(DICT_NULL_CODE),
                         Some(s) => {
                             if let Some(&c) = dict_map.get(s) {
@@ -356,7 +398,7 @@ fn write_single_column(
                     }
                 }
 
-                if eligible && dict_list.len() * 2 <= rows.len() {
+                if eligible && dict_list.len() * 2 <= src.len() {
                     let mut dstr_bytes = Vec::with_capacity(dict_bytes);
                     let mut doff_bytes = Vec::with_capacity((dict_list.len() + 1) * 4);
                     doff_bytes.extend_from_slice(&0u32.to_le_bytes());
@@ -378,7 +420,7 @@ fn write_single_column(
                 }
             }
 
-            let mut loc_bytes = Vec::with_capacity(rows.len() * 16);
+            let mut loc_bytes = Vec::with_capacity(src.len() * 16);
             let mut block_offsets: Vec<u64> = vec![0];
             let mut bdat_file = BufWriter::with_capacity(
                 128 * 1024,
@@ -436,8 +478,8 @@ fn write_single_column(
                 Ok(())
             };
 
-            for r in rows {
-                match r.get(&col.name).and_then(Cell::text) {
+            for i in 0..src.len() {
+                match src.text(i) {
                     None => {
                         loc_bytes.extend_from_slice(&0u32.to_le_bytes());
                         loc_bytes.extend_from_slice(&0u32.to_le_bytes());
@@ -486,14 +528,13 @@ fn write_single_column(
             Ok(DiskColKind::TextZstd)
         }
         DiskColKind::VecF32Sq8 { dim } => {
-            let d = rows
-                .iter()
-                .find_map(|r| match r.get(&col.name) {
-                    Some(Cell::Vec(v)) if !v.is_empty() => Some(v.len()),
+            let d = (0..src.len())
+                .find_map(|i| match src.vec(i) {
+                    Some(v) if !v.is_empty() => Some(v.len()),
                     _ => None,
                 })
                 .unwrap_or(dim as usize);
-            let mut nulls = vec![1u8; rows.len()];
+            let mut nulls = vec![1u8; src.len()];
             let mut f32_writer = BufWriter::with_capacity(
                 256 * 1024,
                 File::create(seg_dir.join(format!("col_{}.vf32", col.name))).map_err(io_err)?,
@@ -508,17 +549,16 @@ fn write_single_column(
             let mut f32_row_buf = vec![0u8; d * 4];
             let mut sq8_row_buf = vec![0i8; d];
 
-            for (i, r) in rows.iter().enumerate() {
+            for i in 0..src.len() {
                 if d > 0
-                    && let Some(Cell::Vec(v)) = r.get(&col.name)
+                    && let Some(v) = src.vec(i)
                     && v.len() == d
                 {
                     nulls[i] = 0;
                     #[cfg(target_endian = "little")]
                     {
-                        let f32_u8 = unsafe {
-                            std::slice::from_raw_parts(v.as_ptr() as *const u8, d * 4)
-                        };
+                        let f32_u8 =
+                            unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, d * 4) };
                         f32_writer.write_all(f32_u8).map_err(io_err)?;
                     }
                     #[cfg(not(target_endian = "little"))]
@@ -540,21 +580,21 @@ fn write_single_column(
             f32_writer.flush().map_err(io_err)?;
             sq8_writer.flush().map_err(io_err)?;
             fs::write(seg_dir.join(format!("col_{}.vnull", col.name)), &nulls).map_err(io_err)?;
-            if rows.len() >= IVF_MIN_SEGMENT_VECS && d > 0 {
-                build_vec_ivf_file(seg_dir, &col.name, d, rows)?;
+            if src.len() >= IVF_MIN_SEGMENT_VECS && d > 0 {
+                build_vec_ivf_file(seg_dir, &col.name, d, src)?;
             }
             Ok(DiskColKind::VecF32Sq8 { dim: d as u32 })
         }
     }
 }
 
-fn write_pk_index(seg_dir: &Path, rows: &[Row]) -> Result<(), Error> {
+fn write_pk_index(seg_dir: &Path, ids: ColSrc<'_>) -> Result<(), Error> {
     let mut pk_map: FxHashMap<Vec<u8>, Vec<u32>> = FxHashMap::default();
-    pk_map.reserve(rows.len());
+    pk_map.reserve(ids.len());
     let mut key_buf = Vec::with_capacity(64);
-    for (i, r) in rows.iter().enumerate() {
-        if let Some(id_cell) = r.get("id")
-            && encode_index_cell_key(id_cell, &mut key_buf)
+    for i in 0..ids.len() {
+        if let Some(id_cell) = ids.key_cell(i)
+            && encode_index_cell_key(&id_cell, &mut key_buf)
         {
             pk_map.entry(key_buf.clone()).or_default().push(i as u32);
         }
@@ -562,17 +602,148 @@ fn write_pk_index(seg_dir: &Path, rows: &[Row]) -> Result<(), Error> {
     MmapHashIndex::write_from_map(&seg_dir.join("pk_id.ht"), &pk_map)
 }
 
-fn write_sec_index(seg_dir: &Path, field: &str, rows: &[Row]) -> Result<(), Error> {
+fn write_sec_index(seg_dir: &Path, field: &str, src: ColSrc<'_>) -> Result<(), Error> {
     let mut sec_map: FxHashMap<Vec<u8>, Vec<u32>> = FxHashMap::default();
     let mut key_buf = Vec::with_capacity(64);
-    for (i, r) in rows.iter().enumerate() {
-        if let Some(cell) = r.get(field)
-            && encode_index_cell_key(cell, &mut key_buf)
+    for i in 0..src.len() {
+        if let Some(cell) = src.key_cell(i)
+            && encode_index_cell_key(&cell, &mut key_buf)
         {
             sec_map.entry(key_buf.clone()).or_default().push(i as u32);
         }
     }
     MmapHashIndex::write_from_map(&seg_dir.join(format!("sec_{field}.ht")), &sec_map)
+}
+
+/// Where the values of one column of a new segment come from.
+#[derive(Clone, Copy)]
+pub(super) enum ColSrc<'a> {
+    /// Field `name` of each row.
+    Rows(&'a [Row], &'a str),
+    /// A ready column of a [`RecordBatch`](crate::batch::RecordBatch); dense numeric
+    /// columns are read straight from their native buffers.
+    Col(&'a crate::batch::Column),
+    /// Column not present in the input: every value absent.
+    Absent(usize),
+}
+
+impl<'a> ColSrc<'a> {
+    #[inline]
+    pub(super) fn len(&self) -> usize {
+        match self {
+            ColSrc::Rows(rows, _) => rows.len(),
+            ColSrc::Col(col) => col.len(),
+            ColSrc::Absent(n) => *n,
+        }
+    }
+
+    /// Borrowed cell where the source stores one (rows and general columns).
+    #[inline]
+    fn cell_ref(&self, i: usize) -> Option<&'a Cell> {
+        match self {
+            ColSrc::Rows(rows, name) => rows[i].get(*name),
+            ColSrc::Col(col) => col.cell_ref(i),
+            ColSrc::Absent(_) => None,
+        }
+    }
+
+    /// Integer or timestamp value, for `Int64` / `Time64` columns.
+    #[inline]
+    pub(super) fn int_or_time(&self, i: usize) -> Option<i64> {
+        use crate::batch::Column;
+        match self {
+            ColSrc::Col(Column::Int { vals, valid } | Column::Time { vals, valid }) => {
+                valid.is_valid(i).then(|| vals[i])
+            }
+            _ => match self.cell_ref(i) {
+                Some(Cell::Int(n)) => Some(*n),
+                Some(Cell::Time(t)) => Some(*t),
+                _ => None,
+            },
+        }
+    }
+
+    /// Float value (integers widen), for `Float64` columns.
+    #[inline]
+    pub(super) fn float_or_int(&self, i: usize) -> Option<f64> {
+        use crate::batch::Column;
+        match self {
+            ColSrc::Col(Column::Float { vals, valid }) => valid.is_valid(i).then(|| vals[i]),
+            ColSrc::Col(Column::Int { vals, valid }) => valid.is_valid(i).then(|| vals[i] as f64),
+            _ => match self.cell_ref(i) {
+                Some(Cell::Float(f)) => Some(*f),
+                Some(Cell::Int(n)) => Some(*n as f64),
+                _ => None,
+            },
+        }
+    }
+
+    #[inline]
+    pub(super) fn bool(&self, i: usize) -> Option<bool> {
+        use crate::batch::Column;
+        match self {
+            ColSrc::Col(Column::Bool { vals, valid }) => valid.is_valid(i).then(|| vals[i]),
+            _ => match self.cell_ref(i) {
+                Some(Cell::Bool(b)) => Some(*b),
+                _ => None,
+            },
+        }
+    }
+
+    #[inline]
+    pub(super) fn text(&self, i: usize) -> Option<&'a str> {
+        self.cell_ref(i).and_then(Cell::text)
+    }
+
+    #[inline]
+    pub(super) fn vec(&self, i: usize) -> Option<&'a Arc<[f32]>> {
+        match self.cell_ref(i) {
+            Some(Cell::Vec(v)) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// Value as an index key: borrowed when the source holds a cell, rebuilt from the
+    /// native buffer otherwise.
+    #[inline]
+    pub(super) fn key_cell(&self, i: usize) -> Option<std::borrow::Cow<'a, Cell>> {
+        if let Some(c) = self.cell_ref(i) {
+            return (!matches!(c, Cell::Null)).then_some(std::borrow::Cow::Borrowed(c));
+        }
+        match self {
+            ColSrc::Col(col) if col.is_typed() => {
+                let c = col.get(i);
+                (!matches!(c, Cell::Null)).then_some(std::borrow::Cow::Owned(c))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Rows or columns a new segment is written from.
+#[derive(Clone, Copy)]
+pub(super) enum SegSrc<'a> {
+    Rows(&'a [Row]),
+    Batch(&'a crate::batch::RecordBatch),
+}
+
+impl<'a> SegSrc<'a> {
+    pub(super) fn len(&self) -> usize {
+        match self {
+            SegSrc::Rows(rows) => rows.len(),
+            SegSrc::Batch(b) => b.n(),
+        }
+    }
+
+    pub(super) fn col(&self, name: &'a str) -> ColSrc<'a> {
+        match self {
+            SegSrc::Rows(rows) => ColSrc::Rows(rows, name),
+            SegSrc::Batch(b) => match b.names.iter().position(|n| n == name) {
+                Some(i) => ColSrc::Col(&b.cols[i]),
+                None => ColSrc::Absent(b.n()),
+            },
+        }
+    }
 }
 
 /// Write a slice of `Row`s into a brand-new immutable columnar mmap segment on disk.
@@ -582,6 +753,16 @@ pub(super) fn write_segment_to_disk(
     seg_id: u64,
     schema: &DiskTableSchema,
     rows: &[Row],
+) -> Result<SegmentMeta, Error> {
+    write_segment_from(base_dir, seg_id, schema, SegSrc::Rows(rows))
+}
+
+/// Same as [`write_segment_to_disk`], from rows or straight from columns.
+pub(super) fn write_segment_from(
+    base_dir: &Path,
+    seg_id: u64,
+    schema: &DiskTableSchema,
+    rows: SegSrc<'_>,
 ) -> Result<SegmentMeta, Error> {
     let seg_dir = base_dir.join(SEGMENTS_DIR).join(format!("seg_{seg_id:08}"));
     fs::create_dir_all(&seg_dir).map_err(io_err)?;
@@ -595,13 +776,13 @@ pub(super) fn write_segment_to_disk(
                 .iter()
                 .map(|col| {
                     let seg_dir_ref = &seg_dir;
-                    s.spawn(move || write_single_column(seg_dir_ref, col, rows))
+                    s.spawn(move || write_single_column(seg_dir_ref, col, rows.col(&col.name)))
                 })
                 .collect();
 
             let pk_handle = {
                 let seg_dir_ref = &seg_dir;
-                s.spawn(move || write_pk_index(seg_dir_ref, rows))
+                s.spawn(move || write_pk_index(seg_dir_ref, rows.col("id")))
             };
 
             let sec_handles: Vec<_> = schema
@@ -610,7 +791,7 @@ pub(super) fn write_segment_to_disk(
                 .filter(|f| f.as_str() != "id")
                 .map(|field| {
                     let seg_dir_ref = &seg_dir;
-                    s.spawn(move || write_sec_index(seg_dir_ref, field, rows))
+                    s.spawn(move || write_sec_index(seg_dir_ref, field, rows.col(field)))
                 })
                 .collect();
 
@@ -631,12 +812,12 @@ pub(super) fn write_segment_to_disk(
         })?;
     } else {
         for col in &mut seg_columns {
-            col.kind = write_single_column(&seg_dir, col, rows)?;
+            col.kind = write_single_column(&seg_dir, col, rows.col(&col.name))?;
         }
-        write_pk_index(&seg_dir, rows)?;
+        write_pk_index(&seg_dir, rows.col("id"))?;
         for field in &schema.indexed_fields {
             if field != "id" {
-                write_sec_index(&seg_dir, field, rows)?;
+                write_sec_index(&seg_dir, field, rows.col(field))?;
             }
         }
     }

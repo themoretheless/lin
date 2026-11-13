@@ -111,7 +111,10 @@ fn cached_single_insert_plan(cat: &Catalog, collection: &str, has_body: bool) ->
             },
             explain: ExplainKind::Tree,
         });
-        cache.insert((cat_hash, collection.to_string(), has_body), Arc::clone(&plan));
+        cache.insert(
+            (cat_hash, collection.to_string(), has_body),
+            Arc::clone(&plan),
+        );
         plan
     })
 }
@@ -220,7 +223,9 @@ impl<'a> Transaction<'a> {
         if self.committed {
             return Err(Error::runtime("transaction already committed"));
         }
-        if let Some(prep) = self.db.plan_cache.get(src).cloned() {
+        if !self.db.plan_cache.is_empty()
+            && let Some(prep) = self.db.plan_cache.get(src).cloned()
+        {
             return self.run_prepared_ext(&prep, want_rows);
         }
         if src.len() > self.db.quotas.max_query_bytes {
@@ -235,7 +240,9 @@ impl<'a> Transaction<'a> {
             && src.len() <= self.db.quotas.max_ast_bytes.min(2048)
             && src.trim_start().starts_with("insert")
             && let Some((collection, fields)) = parse::try_parse_single_insert(src)
-            && !fields.iter().any(|(_, v)| matches!(v, crate::ast::Value::Param(_)))
+            && !fields
+                .iter()
+                .any(|(_, v)| matches!(v, crate::ast::Value::Param(_)))
         {
             check::check_single_insert_borrowed(collection, &fields, &self.db.catalog)?;
             return self.exec_single_insert_borrowed_tx(collection, fields, want_rows);
@@ -583,7 +590,9 @@ impl<'a> Transaction<'a> {
         {
             hnsw.insert(start, Arc::clone(v));
         }
-        self.db.store.row_maps_register_row(&collection, start, &row);
+        self.db
+            .store
+            .row_maps_register_row(&collection, start, &row);
         self.db.store.update_col_count(&collection, 1);
 
         let plan = if want_rows {
@@ -1068,9 +1077,9 @@ impl Db {
                         let old_k = Some(crate::index::LiveIndex::single_cell_key(
                             cur_cell.as_ref().unwrap_or(&Cell::Null),
                         ));
-                        let new_k = Some(crate::index::LiveIndex::single_cell_key(
-                            &Cell::Text(Arc::clone(&restored_wing_arc)),
-                        ));
+                        let new_k = Some(crate::index::LiveIndex::single_cell_key(&Cell::Text(
+                            Arc::clone(&restored_wing_arc),
+                        )));
                         let _ = live_idx.update_keys(idx, old_k, new_k);
                     } else if live_idx.def.fields.len() == 2
                         && live_idx.def.fields[0] == "wing"

@@ -68,7 +68,7 @@ fn test_row_batch_equivalence_cases_lin_1643() {
     for row_idx in 0..batch.n() {
         for (col_idx, name) in batch.names.iter().enumerate() {
             let row_cell = row_handle.rows[row_idx].get(name).unwrap();
-            let batch_cell = &batch.cols[col_idx][row_idx];
+            let batch_cell = &batch.cols[col_idx].get(row_idx);
             assert_eq!(row_cell, batch_cell, "mismatch at row {row_idx} col {name}");
         }
     }

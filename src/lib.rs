@@ -84,7 +84,7 @@ pub use ast::{
     CmpOp, DurUnit, Duration, ExplainKind, Field, MatchHop, Pred, Query, SearchMode, Source, Step,
     Stmt, Value,
 };
-pub use batch::RecordBatch;
+pub use batch::{Column, RecordBatch, Validity};
 pub use cursor::{ProjectedRow, QueryCursor};
 pub use disk::{
     CompactionReport, DiskColKind, DiskColSchema, DiskEngine, DiskManifest, DiskSegment,

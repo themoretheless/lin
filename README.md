@@ -185,7 +185,7 @@ unfilter docs
 
 ## Roadmap
 
-[Приоритетный план из 2000 пунктов](docs/roadmap-2000.md) — улучшения, qualification, API и развитие; [JSON](docs/roadmap-2000.json).
+[План развития](docs/roadmap.md) — производительность и OLAP-контур, улучшения, qualification, API.
 
 Кратко ниже; полный план — canvas / wiki `lin-roadmap`.
 

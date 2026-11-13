@@ -479,6 +479,10 @@ impl Store {
             facts_rows_stale: false,
             col_counts,
             disk: None,
+            dirty_fts_disk: BTreeMap::new(),
+            overlay_savepoint_fts: None,
+            disk_cluster_keys: BTreeMap::new(),
+            disk_compact_requests: Vec::new(),
         };
         for name in store.extra_collections.keys() {
             store.collections.entry(name.clone()).or_default();
@@ -726,9 +730,6 @@ impl Store {
             .map_err(persist::io_err)?;
         self.ensure_facts_rows();
 
-        // Write FTS files while all modified tables are accurate in `get_col_count`.
-        self.write_fts_files(&persist.dir)?;
-
         let mut cold_names = Vec::new();
         if !persist.cold {
             let disk_names: Vec<String> = self
@@ -744,7 +745,7 @@ impl Store {
                 cleanup_disk_files(&persist.dir);
             }
         } else {
-            // Preserve already-unmodified disk-backed tables without re-materializing them!
+            // Preserve already-unmodified (or overlay-dirty) disk-backed tables without re-materializing them!
             let untouched_disk: FxHashSet<String> = self
                 .disk
                 .as_ref()
@@ -769,8 +770,22 @@ impl Store {
                         .collect()
                 })
                 .unwrap_or_default();
-            for name in tiny_disk {
-                self.promote_disk_col(&name);
+            for name in &tiny_disk {
+                self.promote_disk_col(name);
+            }
+
+            // Drain any cold overlay mutations (new/updated memtable rows + tombstones) before releasing `ro`.
+            let (mut dirty_mem_rows, dirty_tombstones) = if let Some(d) = self.disk.as_ref()
+                && let Ok(mut eng) = d.engine.write()
+                && eng.has_dirty_overlay()
+            {
+                let (mr, ts) = eng.drain_dirty_overlays();
+                (mr, Some(ts))
+            } else {
+                (BTreeMap::new(), None)
+            };
+            for name in &tiny_disk {
+                dirty_mem_rows.remove(name);
             }
 
             // Close read-only mmap handles before opening DiskEngine writer to rewrite segments.
@@ -790,12 +805,43 @@ impl Store {
                 let mut eng = DiskEngine::open(&persist.dir, false)?;
                 eng.manifest.embed_id = self.embed_id.clone();
 
+                // Cluster keys already in the manifest must survive a table being dropped
+                // and spilled again below; keys declared this session win. An empty string
+                // records an explicit "no key".
+                for (t, schema) in &eng.manifest.tables {
+                    if let Some(k) = &schema.cluster_by {
+                        self.disk_cluster_keys
+                            .entry(t.clone())
+                            .or_insert_with(|| k.clone());
+                    }
+                }
+                let cluster_keys = self.disk_cluster_keys.clone();
+                let apply_cluster_keys = |eng: &mut DiskEngine| {
+                    for (t, key) in &cluster_keys {
+                        if let Some(schema) = eng.manifest.tables.get_mut(t) {
+                            schema.cluster_by = (!key.is_empty()
+                                && schema.columns.iter().any(|c| &c.name == key))
+                            .then(|| key.clone());
+                        }
+                    }
+                };
+                apply_cluster_keys(&mut eng);
+
                 // Drop any stale table from DiskEngine that is no longer cold or was promoted & modified in RAM.
                 let existing_tables: Vec<String> = eng.manifest.tables.keys().cloned().collect();
                 for t in existing_tables {
                     if !untouched_disk.contains(&t) {
                         eng.drop_table(&t)?;
                     }
+                }
+
+                // Flush incremental cold overlay mutations (delta segments + tombstones) for untouched disk tables.
+                if let Some(ts) = dirty_tombstones {
+                    let filtered_rows: BTreeMap<String, _> = dirty_mem_rows
+                        .into_iter()
+                        .filter(|(k, _)| untouched_disk.contains(k))
+                        .collect();
+                    eng.merge_overlay_and_flush(filtered_rows, &ts)?;
                 }
 
                 // Spill newly hot/modified large collections into columnar mmap segments.
@@ -817,16 +863,48 @@ impl Store {
                         schema.indexed_fields.push("user_id".to_string());
                     }
                     for idx_snap in self.extra_indexes.values() {
-                        if idx_snap.collection == *name && idx_snap.fields.len() == 1 {
-                            let f = &idx_snap.fields[0];
-                            if f != "id" && !schema.indexed_fields.contains(f) {
-                                schema.indexed_fields.push(f.clone());
+                        if idx_snap.collection == *name {
+                            for f in &idx_snap.fields {
+                                if f != "id" && !schema.indexed_fields.contains(f) {
+                                    schema.indexed_fields.push(f.clone());
+                                }
                             }
                         }
                     }
+                    let cluster_key = cluster_keys
+                        .get(name)
+                        .filter(|k| !k.is_empty() && schema.columns.iter().any(|c| &c.name == *k))
+                        .cloned();
+                    schema.cluster_by = cluster_key.clone();
                     eng.manifest.tables.insert(name.clone(), schema);
-                    for chunk in rows.chunks(65_536) {
-                        eng.write_bulk_segment(name, chunk)?;
+                    match cluster_key {
+                        // Spill a clustered collection in key order (the in-memory copy
+                        // keeps its own order).
+                        Some(key) => {
+                            let mut sorted = rows.clone();
+                            crate::disk::sort_rows_by_cluster_key(&mut sorted, &key);
+                            for chunk in sorted.chunks(65_536) {
+                                eng.write_bulk_segment(name, chunk)?;
+                            }
+                        }
+                        None => {
+                            for chunk in rows.chunks(65_536) {
+                                eng.write_bulk_segment(name, chunk)?;
+                            }
+                        }
+                    }
+                }
+                apply_cluster_keys(&mut eng);
+
+                // Requested compactions: reclaim dead rows and merge segments; a clustered
+                // table comes out globally ordered by its key.
+                for t in std::mem::take(&mut self.disk_compact_requests) {
+                    let key = eng.manifest.tables.get(&t).and_then(|s| s.cluster_by.clone());
+                    if eng.manifest.tables.contains_key(&t) {
+                        match key {
+                            Some(key) => eng.compact_table_clustered(&t, &key)?,
+                            None => eng.compact_table(&t, true)?,
+                        };
                     }
                 }
 
@@ -850,6 +928,26 @@ impl Store {
                             },
                         );
                     }
+                    let dirty_fts = std::mem::take(&mut self.dirty_fts_disk);
+                    for (name, fields) in dirty_fts {
+                        if !untouched_disk.contains(&name) {
+                            continue;
+                        }
+                        let mut proj: Vec<&str> = Vec::with_capacity(fields.len() + 1);
+                        proj.push("id");
+                        for f in &fields {
+                            if f != "id" {
+                                proj.push(f.as_str());
+                            }
+                        }
+                        let mut rows = Vec::new();
+                        ro.scan_projected(&name, Some(&proj), |row| {
+                            rows.push(row.clone());
+                            Ok(true)
+                        })?;
+                        let idx = crate::fts::FtsIndex::build(&rows, &fields);
+                        self.fts.insert(name, idx);
+                    }
                     self.disk = Some(StoreDiskTier {
                         engine: Arc::new(RwLock::new(ro)),
                         tables,
@@ -859,6 +957,9 @@ impl Store {
                 }
             }
         }
+
+        // Write FTS files after all promoted/dirty tables have rebuilt indexes and accurate counts.
+        self.write_fts_files(&persist.dir)?;
 
         let head = Head {
             r#gen: self.r#gen,
@@ -964,7 +1065,7 @@ impl Store {
     }
 }
 
-fn pack_to_disk_wal_ops(pack: &Pack, out: &mut Vec<crate::disk::DiskWalOp>) {
+pub(crate) fn pack_to_disk_wal_ops(pack: &Pack, out: &mut Vec<crate::disk::DiskWalOp>) {
     use crate::disk::DiskWalOp;
     match pack {
         Pack::Insert {
@@ -1047,6 +1148,7 @@ fn pack_to_disk_wal_ops(pack: &Pack, out: &mut Vec<crate::disk::DiskWalOp>) {
                     name: name.clone(),
                     columns,
                     indexed_fields: Vec::new(),
+                    cluster_by: None,
                 },
             });
         }
