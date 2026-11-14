@@ -1969,8 +1969,8 @@ mod storage_tests {
         };
 
         // Test with boolean field - should always use bitmap
-        let row_pending = Row::from([("status".into(), Cell::Bool(false))]);
-        let row_active = Row::from([("status".into(), Cell::Bool(true))]);
+        let row_pending = Row::from([("status", Cell::Bool(false))]);
+        let row_active = Row::from([("status", Cell::Bool(true))]);
         let sample = [row_pending.clone(), row_active.clone()];
 
         assert!(index.should_use_bitmap(0, &row_pending, &sample));
@@ -1998,7 +1998,7 @@ mod storage_tests {
 
         // Create sample data with low cardinality (only 3 distinct values)
         let rows: Vec<Row> = (0..100)
-            .map(|i| Row::from([("priority".into(), Cell::Int((i % 3) as i64))]))
+            .map(|i| Row::from([("priority", Cell::Int((i % 3) as i64))]))
             .collect();
 
         // With only 3 distinct values out of 100, should use bitmap
@@ -2027,7 +2027,7 @@ mod storage_tests {
 
         // Create sample data with high cardinality (100 distinct values in sample)
         let rows: Vec<Row> = (0..100)
-            .map(|i| Row::from([("id".into(), Cell::Int(i as i64))]))
+            .map(|i| Row::from([("id", Cell::Int(i as i64))]))
             .collect();
 
         // With 100 distinct values, should NOT use bitmap (> 16 threshold)
@@ -2045,8 +2045,8 @@ mod storage_tests {
                 pred: None,
                 bitmap_card_field: None,
             });
-            let a = Row::from([("key".into(), Cell::Int(1))]);
-            let b = Row::from([("key".into(), Cell::Int(2))]);
+            let a = Row::from([("key", Cell::Int(1))]);
+            let b = Row::from([("key", Cell::Int(2))]);
             index.insert_at_new(0, &a).unwrap();
             index
                 .insert_at_new(1, if unique { &b } else { &a })
@@ -2069,7 +2069,7 @@ mod storage_tests {
                 assert_eq!(index.reverse, reverse);
             }
             index
-                .insert_at(0, &Row::from([("key".into(), Cell::Int(3))]))
+                .insert_at(0, &Row::from([("key", Cell::Int(3))]))
                 .unwrap();
             assert_eq!(
                 index.forward[&index.reverse[&0]],
@@ -2092,7 +2092,7 @@ mod storage_tests {
                 pred: None,
                 bitmap_card_field: None,
             });
-            let row = Row::from([("key".into(), Cell::Int(1))]);
+            let row = Row::from([("key", Cell::Int(1))]);
             for i in 0..n {
                 index.insert_at_new(i, &row).unwrap();
             }
@@ -2105,7 +2105,7 @@ mod storage_tests {
             assert_eq!(index.reverse.len(), n);
         }
         let rows = (0..10000)
-            .map(|i| Row::from([("key".into(), Cell::Int(i))]))
+            .map(|i| Row::from([("key", Cell::Int(i))]))
             .collect::<Vec<_>>();
         let start = Instant::now();
         for _ in 0..20 {
@@ -2164,7 +2164,7 @@ mod storage_tests {
             index.insert_at_new(7, &row).unwrap();
             assert!(index.insert_at_new(8, &row).is_err());
             let mut updated = row.clone();
-            updated.insert("f0".into(), Cell::Int(99));
+            updated.insert("f0", Cell::Int(99));
             index.insert_at(7, &updated).unwrap();
             index.insert_at_new(8, &row).unwrap();
             index.remove_at(7);
@@ -2256,7 +2256,7 @@ mod bitmap_sample_once_tests {
         if populated > 0 {
             expected.def.bitmap_card_field = None;
             for i in 0..populated {
-                let row = Row::from([("key".into(), Cell::Int(-1 - i as i64))]);
+                let row = Row::from([("key", Cell::Int(-1 - i as i64))]);
                 expected.insert_at_new(i as usize, &row).unwrap();
             }
             expected.def.bitmap_card_field = def.bitmap_card_field;
@@ -2297,11 +2297,11 @@ mod bitmap_sample_once_tests {
                 let rows: Vec<Row> = (0..n)
                     .map(|i| {
                         let mut r = Row::from([
-                            ("key".into(), Cell::Int((i % 37) as i64)),
+                            ("key", Cell::Int((i % 37) as i64)),
                             ("keep".into(), Cell::Bool(i % 3 != 0)),
                         ]);
                         if cardinality > 0 {
-                            r.insert("sample".into(), Cell::Int((i % cardinality) as i64));
+                            r.insert("sample", Cell::Int((i % cardinality) as i64));
                         }
                         r
                     })
@@ -2310,7 +2310,7 @@ mod bitmap_sample_once_tests {
                     let mut case_rows = rows.clone();
                     if let Some(i) = boolean_at {
                         if let Some(row) = case_rows.get_mut(i) {
-                            row.insert("sample".into(), Cell::Bool(true));
+                            row.insert("sample", Cell::Bool(true));
                         }
                     }
                     for unique in [false, true] {
@@ -2324,7 +2324,7 @@ mod bitmap_sample_once_tests {
         let rows: Vec<Row> = (0..128)
             .map(|i| {
                 Row::from([
-                    ("key".into(), Cell::Int(i)),
+                    ("key", Cell::Int(i)),
                     ("sample".into(), Cell::Int(i % 24)),
                     ("keep".into(), Cell::Bool(true)),
                 ])

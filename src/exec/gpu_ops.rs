@@ -213,7 +213,7 @@ impl Db {
                 .map(|(cell, count)| {
                     let mut row = crate::store::acquire_row();
                     row.insert(field.clone(), cell);
-                    row.insert("hits".into(), Cell::Int(count));
+                    row.insert("hits", Cell::Int(count));
                     row
                 })
                 .collect(),
@@ -374,7 +374,7 @@ impl Db {
                 .map(|row| row.get(&fk).and_then(Cell::as_f64).unwrap_or(0.0))
                 .collect();
             let sums = gpu.group_sums(&vec![0u32; rows.len()], &values, 1)?;
-            let mut row = BTreeMap::new();
+            let mut row = Row::new();
             row.insert(fk, Cell::Float(sums[0]));
             return Ok(Some(vec![row]));
         };

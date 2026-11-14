@@ -40,22 +40,22 @@ fn disk_roundtrip_point_reads_tombstones_and_vectors() {
         .unwrap();
 
         let mut r1 = Row::new();
-        r1.insert("id".into(), Cell::from_text("c1"));
-        r1.insert("document_id".into(), Cell::from_text("d1"));
-        r1.insert("content".into(), Cell::from_text("hello disk backed world"));
-        r1.insert("chunk_index".into(), Cell::Int(0));
+        r1.insert("id", Cell::from_text("c1"));
+        r1.insert("document_id", Cell::from_text("d1"));
+        r1.insert("content", Cell::from_text("hello disk backed world"));
+        r1.insert("chunk_index", Cell::Int(0));
         r1.insert(
-            "embedding".into(),
+            "embedding",
             Cell::Vec(Arc::from([1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])),
         );
 
         let mut r2 = Row::new();
-        r2.insert("id".into(), Cell::from_text("c2"));
-        r2.insert("document_id".into(), Cell::from_text("d1"));
-        r2.insert("content".into(), Cell::from_text("second vector chunk"));
-        r2.insert("chunk_index".into(), Cell::Int(1));
+        r2.insert("id", Cell::from_text("c2"));
+        r2.insert("document_id", Cell::from_text("d1"));
+        r2.insert("content", Cell::from_text("second vector chunk"));
+        r2.insert("chunk_index", Cell::Int(1));
         r2.insert(
-            "embedding".into(),
+            "embedding",
             Cell::Vec(Arc::from([0.0f32, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])),
         );
 
@@ -250,9 +250,9 @@ fn compaction_reclaims_tombstones_and_ivf_recalls_target_vector() {
             v[bucket] = 1.0;
             v[(bucket + 1) % 16] = ((gid % 97) as f32) * 0.005;
             let mut r = Row::new();
-            r.insert("id".into(), Cell::from_text(format!("v-{gid}")));
-            r.insert("doc_id".into(), Cell::from_text(format!("d-{}", gid % 50)));
-            r.insert("embedding".into(), Cell::Vec(Arc::from(v)));
+            r.insert("id", Cell::from_text(format!("v-{gid}")));
+            r.insert("doc_id", Cell::from_text(format!("d-{}", gid % 50)));
+            r.insert("embedding", Cell::Vec(Arc::from(v)));
             rows.push(r);
         }
         eng.commit_ops(vec![DiskWalOp::UpsertBatch {
@@ -352,13 +352,13 @@ fn adaptive_text_dict_and_group_count_and_str3_visitor() {
     let mut rows = Vec::with_capacity(200);
     for i in 0..200 {
         let mut r = Row::new();
-        r.insert("id".into(), Cell::from_text(format!("doc-{i}")));
+        r.insert("id", Cell::from_text(format!("doc-{i}")));
         if i < 180 {
-            r.insert("wing".into(), Cell::from_text(format!("wing-{}", i % 3)));
-            r.insert("room".into(), Cell::from_text(format!("room-{}", i % 6)));
+            r.insert("wing", Cell::from_text(format!("wing-{}", i % 3)));
+            r.insert("room", Cell::from_text(format!("room-{}", i % 6)));
         }
         r.insert(
-            "layer".into(),
+            "layer",
             Cell::from_text(if i % 2 == 0 { "raw" } else { "wiki" }),
         );
         rows.push(r);
@@ -393,10 +393,10 @@ fn adaptive_text_dict_and_group_count_and_str3_visitor() {
             table: "docs".into(),
             rows: vec![{
                 let mut r = Row::new();
-                r.insert("id".into(), Cell::from_text("doc-200"));
-                r.insert("wing".into(), Cell::from_text("wing-0"));
-                r.insert("room".into(), Cell::from_text("room-0"));
-                r.insert("layer".into(), Cell::from_text("raw"));
+                r.insert("id", Cell::from_text("doc-200"));
+                r.insert("wing", Cell::from_text("wing-0"));
+                r.insert("room", Cell::from_text("room-0"));
+                r.insert("layer", Cell::from_text("raw"));
                 r
             }],
         },
@@ -455,11 +455,11 @@ fn parallel_segment_writer_and_corrupt_mmap_index_rejection() {
     let mut rows = Vec::with_capacity(1_500);
     for i in 0..1_500usize {
         let mut r = Row::new();
-        r.insert("id".into(), Cell::from_text(format!("item-{i}")));
-        r.insert("cat".into(), Cell::from_text(format!("c-{}", i % 5)));
-        r.insert("qty".into(), Cell::Int(i as i64));
-        r.insert("price".into(), Cell::Float((i as f64) * 1.25));
-        r.insert("active".into(), Cell::Bool(i % 2 == 0));
+        r.insert("id", Cell::from_text(format!("item-{i}")));
+        r.insert("cat", Cell::from_text(format!("c-{}", i % 5)));
+        r.insert("qty", Cell::Int(i as i64));
+        r.insert("price", Cell::Float((i as f64) * 1.25));
+        r.insert("active", Cell::Bool(i % 2 == 0));
         rows.push(r);
     }
     eng.commit_ops(vec![
@@ -560,11 +560,11 @@ fn clustered_compaction_orders_rows_and_tightens_zone_maps() {
         for i in 0..N / 2 {
             let gid = b * (N / 2) + i;
             let mut r = Row::new();
-            r.insert("id".into(), Cell::from_text(format!("e-{gid}")));
+            r.insert("id", Cell::from_text(format!("e-{gid}")));
             if gid % 1000 != 999 {
-                r.insert("ts".into(), Cell::Int(((gid * 7919) % N) as i64));
+                r.insert("ts", Cell::Int(((gid * 7919) % N) as i64));
             }
-            r.insert("kind".into(), Cell::from_text(["a", "b", "c"][gid % 3]));
+            r.insert("kind", Cell::from_text(["a", "b", "c"][gid % 3]));
             rows.push(r);
         }
         eng.commit_ops(vec![DiskWalOp::UpsertBatch {
@@ -598,8 +598,8 @@ fn clustered_compaction_orders_rows_and_tightens_zone_maps() {
                 let fc = seg.fixed_col("ts").unwrap();
                 (0..(seg.meta.row_count as usize).div_ceil(4096))
                     .filter(|&bi| {
-                        !fc.zone_block_skips(bi, crate::ast::CmpOp::Ge, &Cell::Int(5000))
-                            && !fc.zone_block_skips(bi, crate::ast::CmpOp::Lt, &Cell::Int(5200))
+                        !fc.zone_block_relation(bi, crate::ast::CmpOp::Ge, &Cell::Int(5000)).0
+                            && !fc.zone_block_relation(bi, crate::ast::CmpOp::Lt, &Cell::Int(5200)).0
                     })
                     .count()
             })
@@ -650,9 +650,9 @@ fn clustered_compaction_orders_rows_and_tightens_zone_maps() {
     let mut rows = Vec::new();
     for i in 0..9_000usize {
         let mut r = Row::new();
-        r.insert("id".into(), Cell::from_text(format!("late-{i}")));
-        r.insert("ts".into(), Cell::Int(((i * 6007) % N) as i64));
-        r.insert("kind".into(), Cell::from_text("late"));
+        r.insert("id", Cell::from_text(format!("late-{i}")));
+        r.insert("ts", Cell::Int(((i * 6007) % N) as i64));
+        r.insert("kind", Cell::from_text("late"));
         rows.push(r);
     }
     eng.commit_ops(vec![DiskWalOp::UpsertBatch {
@@ -895,4 +895,185 @@ fn table_schema_without_cluster_key_still_decodes() {
     let bytes = rmp_serde::to_vec(&OldOp::EnsureTable { schema: old }).unwrap();
     let op: DiskWalOp = rmp_serde::from_slice(&bytes).unwrap();
     assert!(matches!(op, DiskWalOp::EnsureTable { schema } if schema.cluster_by.is_none()));
+}
+
+#[test]
+fn manifest_format_version_is_stamped_and_newer_is_refused_for_write() {
+    let tmp = std::env::temp_dir().join(format!("lin_disk_fmt_version_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp);
+    let manifest_path = tmp.join(MANIFEST_FILE);
+    let read_version = |path: &Path| -> u32 {
+        let m: DiskManifest = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        m.version
+    };
+    let rewrite_version = |path: &Path, version: u32| {
+        let mut m: DiskManifest = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        m.version = version;
+        fs::write(path, serde_json::to_vec_pretty(&m).unwrap()).unwrap();
+    };
+
+    // A fresh directory is created at the current format version.
+    drop(DiskEngine::open(&tmp, false).unwrap());
+    assert_eq!(read_version(&manifest_path), DISK_FORMAT_VERSION);
+
+    // A manifest from an older build opens for writing and is upgraded on the next write.
+    rewrite_version(&manifest_path, 2);
+    {
+        let eng = DiskEngine::open(&tmp, false).unwrap();
+        assert_eq!(eng.manifest.version, 2);
+        eng.save_tombstones_and_manifest().unwrap();
+    }
+    assert_eq!(read_version(&manifest_path), DISK_FORMAT_VERSION);
+
+    // A manifest from a newer build is refused for writing and left byte-identical,
+    // while a read-only open still works.
+    rewrite_version(&manifest_path, DISK_FORMAT_VERSION + 1);
+    let before = fs::read(&manifest_path).unwrap();
+    let err = DiskEngine::open(&tmp, false).err().expect("newer format must be refused");
+    assert!(err.to_string().contains("newer than this build supports"), "{err}");
+    assert_eq!(fs::read(&manifest_path).unwrap(), before);
+    assert!(DiskEngine::open_read_only(&tmp).is_ok());
+    assert_eq!(fs::read(&manifest_path).unwrap(), before);
+
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+/// The zone-map pruning plan skips exactly the blocks min/max and null counts rule out,
+/// under `not` / `!=` / `is null`, and never a block that holds a match.
+#[test]
+fn zone_pruning_under_not_ne_and_null_checks() {
+    let tmp = std::env::temp_dir().join(format!("lin_disk_zone_prune_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp);
+    let mut eng = DiskEngine::open(&tmp, false).unwrap();
+    eng.commit_ops(vec![DiskWalOp::EnsureTable {
+        schema: DiskTableSchema {
+            name: "ev".into(),
+            columns: vec![
+                DiskColSchema { name: "id".into(), kind: DiskColKind::TextZstd },
+                DiskColSchema { name: "band".into(), kind: DiskColKind::Int64 },
+                DiskColSchema { name: "gap".into(), kind: DiskColKind::Int64 },
+            ],
+            indexed_fields: Vec::new(),
+            cluster_by: None,
+        },
+    }])
+    .unwrap();
+    // Four zone blocks: `band` is the block number, `gap` is set only in blocks 1 and 3,
+    // and in block 2 for every other row.
+    let block = columns::ZONE_BLOCK_ROWS;
+    let rows: Vec<Row> = (0..4 * block)
+        .map(|i| {
+            let b = i / block;
+            let mut r = Row::new();
+            r.insert("id", Cell::from_text(format!("e{i}")));
+            r.insert("band", Cell::Int(b as i64));
+            if b % 2 == 1 || (b == 2 && i % 2 == 0) {
+                r.insert("gap", Cell::Int((i % 7) as i64));
+            }
+            r
+        })
+        .collect();
+    eng.commit_ops(vec![DiskWalOp::UpsertBatch { table: "ev".into(), rows }]).unwrap();
+    eng.checkpoint().unwrap();
+    let seg = &eng.segments["ev"][0];
+    assert_eq!(seg.meta.row_count as usize, 4 * block);
+
+    let skipped = |src: &str| -> Vec<usize> {
+        let pred = crate::parse::parse_pred_src(src).unwrap();
+        let plan = ZonePrune::compile(seg, &pred, 0);
+        (0..4).filter(|&bi| plan.skips(bi)).collect()
+    };
+    for (src, want) in [
+        ("band != 2", vec![2]),
+        ("not band == 1", vec![1]),
+        ("not (band >= 1 and band <= 2)", vec![1, 2]),
+        ("not (band != 3)", vec![0, 1, 2]),
+        ("band != 0 and band != 3", vec![0, 3]),
+        ("gap is null", vec![1, 3]),
+        ("gap is not null", vec![0]),
+        ("not (gap is null)", vec![0]),
+        ("gap is null and band != 0", vec![0, 1, 3]),
+        ("gap is not null or band == 0", vec![]),
+        ("not (gap is not null or band != 2)", vec![0, 1, 3]),
+        // `!=` on a column with nulls in the block: a null satisfies `!=`, so no skip.
+        ("gap != 3", vec![]),
+        // Anything min/max cannot decide never skips.
+        ("band > 0 or id == \"e1\"", vec![]),
+    ] {
+        assert_eq!(skipped(src), want, "{src}");
+    }
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+/// The batched lookup answers exactly what one `get_by_id` per key answers: memtable rows
+/// over segment rows, newest segment first, deleted keys absent, duplicates and unknown
+/// keys tolerated.
+#[test]
+fn get_many_by_id_matches_point_reads() {
+    let tmp = std::env::temp_dir().join(format!("lin_disk_get_many_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp);
+    let mut eng = DiskEngine::open(&tmp, false).unwrap();
+    eng.commit_ops(vec![DiskWalOp::EnsureTable {
+        schema: DiskTableSchema {
+            name: "t".into(),
+            columns: vec![
+                DiskColSchema { name: "id".into(), kind: DiskColKind::TextZstd },
+                DiskColSchema { name: "v".into(), kind: DiskColKind::Int64 },
+                DiskColSchema { name: "note".into(), kind: DiskColKind::TextZstd },
+            ],
+            indexed_fields: Vec::new(),
+            cluster_by: None,
+        },
+    }])
+    .unwrap();
+    let row = |id: &str, v: i64| {
+        let mut r = Row::new();
+        r.insert("id", Cell::from_text(id));
+        r.insert("v", Cell::Int(v));
+        r.insert("note", Cell::from_text(format!("note for {id} version {v}")));
+        r
+    };
+    // Two segments (the second overwrites some keys), then an overlay with updates,
+    // inserts and deletes that is not flushed.
+    eng.commit_ops(vec![DiskWalOp::UpsertBatch {
+        table: "t".into(),
+        rows: (0..3000).map(|i| row(&format!("k{i}"), i)).collect(),
+    }])
+    .unwrap();
+    eng.checkpoint().unwrap();
+    eng.commit_ops(vec![DiskWalOp::UpsertBatch {
+        table: "t".into(),
+        rows: (0..3000).step_by(3).map(|i| row(&format!("k{i}"), 10_000 + i)).collect(),
+    }])
+    .unwrap();
+    eng.checkpoint().unwrap();
+    eng.commit_ops(vec![
+        DiskWalOp::UpsertBatch {
+            table: "t".into(),
+            rows: (0..3000).step_by(7).map(|i| row(&format!("k{i}"), 20_000 + i)).chain([row("fresh", 1)]).collect(),
+        },
+        DiskWalOp::DeleteIds {
+            table: "t".into(),
+            ids: (0..3000).step_by(11).map(|i| format!("k{i}")).collect(),
+        },
+    ])
+    .unwrap();
+
+    let mut keys: Vec<String> = (0..3100).rev().step_by(2).map(|i| format!("k{i}")).collect();
+    keys.extend(["fresh", "missing", "k4", "k4", "k22"].map(String::from));
+    // Twice: the second call is served partly from the hot cache the first one filled.
+    for round in 0..2 {
+        let batch = eng.get_many_by_id("t", keys.iter().map(String::as_str)).unwrap();
+        for k in &keys {
+            let point = eng.get_by_id("t", k).unwrap();
+            assert_eq!(batch.get(k.as_str()), point.as_ref(), "round {round}, key {k}");
+        }
+        let distinct: std::collections::BTreeSet<&str> = keys
+            .iter()
+            .map(String::as_str)
+            .filter(|k| eng.get_by_id("t", k).unwrap().is_some())
+            .collect();
+        assert_eq!(batch.len(), distinct.len(), "round {round}");
+    }
+    let _ = fs::remove_dir_all(&tmp);
 }

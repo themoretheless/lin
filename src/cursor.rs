@@ -18,8 +18,8 @@ use std::sync::Arc;
 use crate::ast::{Pred, Query, SearchMode, Source, Step, Stmt};
 use crate::error::Error;
 use crate::exec::{
-    Db, JoinFieldPlan, ReadDb, emit_join_row, eval_pred, field_names, plan_join_fields,
-    pred_total_gt, project_join_fields,
+    Db, JoinFieldPlan, PredSlots, ReadDb, emit_join_row, eval_pred, field_names,
+    plan_join_fields, pred_total_gt, project_join_fields,
 };
 use crate::query::Queryable;
 use crate::store::{Cell, Row, Store, cell_from_arc_inline, now_ms, project_fields, row_text};
@@ -172,8 +172,205 @@ enum CursorState<'a> {
     LazyJoin(LazyJoinCursor),
     /// Hot SoA: `orders [| total >] | join users on user_id | { id, users.email, total }`
     LazyJoinSoa(LazyJoinSoa<'a>),
+    /// Cold collection pulled from the disk engine chunk by chunk.
+    DiskStream(DiskStreamCursor),
+    /// Join whose left side streams from the disk engine and whose right side is probed
+    /// by `id`, without materializing either collection.
+    DiskJoin(DiskJoinCursor),
     Buffered(std::vec::IntoIter<Row>),
     Done,
+}
+
+/// `col | filter? | project? | skip* | take?` over a disk-backed collection, read through
+/// [`crate::disk::DiskEngine::scan_chunk`] without materializing the collection.
+struct DiskStreamCursor {
+    collection: String,
+    pred: Option<Pred>,
+    project: Option<Vec<String>>,
+    skip_left: usize,
+    take_left: Option<usize>,
+    now: i64,
+    pos: crate::disk::DiskScanPos,
+    pending: VecDeque<Row>,
+}
+
+/// Rows fetched per engine call; small enough that `take 10` does not read a segment.
+const DISK_STREAM_CHUNK: usize = 256;
+
+/// `left | filter? | join [left] right on f | project? | skip* | take?` with a cold side
+/// and an `id` foreign key: left rows come from [`DiskStreamCursor`] (filter pushed into
+/// the scan, no projection), right rows from one point read per distinct key.
+struct DiskJoinCursor {
+    left: DiskStreamCursor,
+    right_col: String,
+    on: String,
+    left_join: bool,
+    project: Option<Vec<String>>,
+    skip_left: usize,
+    take_left: Option<usize>,
+    memo: FxHashMap<String, Option<Row>>,
+}
+
+fn next_disk_join(store: &Store, cur: &mut DiskJoinCursor) -> Option<Result<Row, Error>> {
+    loop {
+        if cur.take_left == Some(0) {
+            return None;
+        }
+        let left = match next_disk_stream(store, &mut cur.left)? {
+            Ok(row) => row,
+            Err(e) => return Some(Err(e)),
+        };
+        let right = match left.get(&cur.on).and_then(Cell::text) {
+            None => None,
+            Some(key) => {
+                if !cur.memo.contains_key(key) {
+                    let found = if store.is_disk_backed(&cur.right_col) {
+                        match store.disk_engine_read() {
+                            Some(eng) => match eng.get_by_id(&cur.right_col, key) {
+                                Ok(row) => row,
+                                Err(e) => return Some(Err(e)),
+                            },
+                            None => None,
+                        }
+                    } else {
+                        store.get_by_id(&cur.right_col, key).cloned()
+                    };
+                    cur.memo.insert(key.to_string(), found);
+                }
+                cur.memo.get(key).and_then(Option::as_ref)
+            }
+        };
+        if right.is_none() && !cur.left_join {
+            continue;
+        }
+        if cur.skip_left > 0 {
+            cur.skip_left -= 1;
+            continue;
+        }
+        if let Some(n) = cur.take_left.as_mut() {
+            *n -= 1;
+        }
+        let row = match &cur.project {
+            Some(fields) => crate::exec::project_join_fields(&left, right, &cur.right_col, fields),
+            None => match right {
+                Some(r) => crate::exec::merge_join_row(left, r, &cur.right_col),
+                None => left,
+            },
+        };
+        return Some(Ok(row));
+    }
+}
+
+fn try_disk_join(db: &CursorDb<'_>, q: &Query) -> Option<DiskJoinCursor> {
+    let Source::Collection(name) = &q.source else {
+        return None;
+    };
+    let (store, catalog) = db.store_catalog();
+    let mut filter: Option<&Pred> = None;
+    let mut join: Option<(bool, &str, &str)> = None;
+    let mut project: Option<Vec<String>> = None;
+    let mut skip_n: usize = 0;
+    let mut take_n: Option<Option<i64>> = None;
+    for step in &q.steps {
+        match step {
+            Step::Filter(p) if join.is_none() && filter.is_none() => filter = Some(p),
+            Step::Join {
+                left,
+                collection,
+                on,
+            } if join.is_none() => join = Some((*left, collection.as_str(), on.as_str())),
+            Step::Project(f) if join.is_some() && project.is_none() && skip_n == 0 && take_n.is_none() => {
+                project = Some(field_names(f));
+            }
+            Step::Skip { n } if join.is_some() && take_n.is_none() => {
+                skip_n = skip_n.saturating_add((*n).max(0) as usize);
+            }
+            Step::Take { n } if join.is_some() && take_n.is_none() => take_n = Some(*n),
+            _ => return None,
+        }
+    }
+    let (left_join, right_col, on) = join?;
+    if !store.is_disk_backed(name) && !store.is_disk_backed(right_col) {
+        return None;
+    }
+    // Only an `id` foreign key maps to point reads; other keys go through the executor.
+    let to_field = catalog
+        .find_fk(name, on, right_col)
+        .map(|fk| fk.to_field.as_str())
+        .unwrap_or("id");
+    if to_field != "id" || !store.is_disk_backed(name) {
+        return None;
+    }
+    Some(DiskJoinCursor {
+        left: DiskStreamCursor {
+            collection: name.clone(),
+            pred: filter.cloned(),
+            project: None,
+            skip_left: 0,
+            take_left: None,
+            now: now_ms(),
+            pos: crate::disk::DiskScanPos::default(),
+            pending: VecDeque::new(),
+        },
+        right_col: right_col.to_string(),
+        on: on.to_string(),
+        left_join,
+        project,
+        skip_left: skip_n,
+        take_left: match take_n {
+            Some(Some(n)) => Some(n.max(0) as usize),
+            Some(None) => None,
+            None => Some(50),
+        },
+        memo: FxHashMap::default(),
+    })
+}
+
+fn next_disk_stream(store: &Store, cur: &mut DiskStreamCursor) -> Option<Result<Row, Error>> {
+    loop {
+        if cur.take_left == Some(0) {
+            return None;
+        }
+        if let Some(row) = cur.pending.pop_front() {
+            if cur.skip_left > 0 {
+                cur.skip_left -= 1;
+                continue;
+            }
+            if let Some(n) = cur.take_left.as_mut() {
+                *n -= 1;
+            }
+            return Some(Ok(match &cur.project {
+                // Absent fields come back as nulls, as on the in-memory path.
+                Some(fields) => project_fields(&row, fields),
+                None => row,
+            }));
+        }
+        let eng = store.disk_engine_read()?;
+        let want = cur
+            .take_left
+            .map_or(DISK_STREAM_CHUNK, |n| n.saturating_add(cur.skip_left))
+            .clamp(1, DISK_STREAM_CHUNK);
+        let fields: Option<Vec<&str>> = cur
+            .project
+            .as_ref()
+            .map(|fs| fs.iter().map(String::as_str).collect());
+        let chunk = eng.scan_chunk(
+            &cur.collection,
+            cur.pred.as_ref(),
+            fields.as_deref(),
+            cur.now,
+            &mut cur.pos,
+            want,
+        );
+        match chunk {
+            Ok(rows) if rows.is_empty() => return None,
+            Ok(rows) => cur.pending.extend(rows),
+            Err(e) => {
+                cur.take_left = Some(0);
+                return Some(Err(e));
+            }
+        }
+    }
 }
 
 struct LazyCursor {
@@ -267,6 +464,12 @@ impl<'a> QueryCursor<'a> {
                 state: CursorState::GpuStream(stream),
             });
         }
+        if let Some(join) = try_disk_join(&db, q) {
+            return Ok(Self {
+                db,
+                state: CursorState::DiskJoin(join),
+            });
+        }
         if let Some(join) = try_lazy_join_soa(&db, q)? {
             return Ok(Self {
                 db,
@@ -297,6 +500,12 @@ impl<'a> QueryCursor<'a> {
                 state: CursorState::Lazy(lazy),
             });
         }
+        if let Some(stream) = try_disk_stream(&db, q) {
+            return Ok(Self {
+                db,
+                state: CursorState::DiskStream(stream),
+            });
+        }
 
         let rows = db.run_query(q)?;
         Ok(Self {
@@ -310,7 +519,11 @@ impl<'a> QueryCursor<'a> {
         match &self.state {
             #[cfg(feature = "gpu")]
             CursorState::GpuStream(_) => true,
-            CursorState::Lazy(_) | CursorState::LazyJoin(_) | CursorState::LazyJoinSoa(_) => true,
+            CursorState::Lazy(_)
+            | CursorState::LazyJoin(_)
+            | CursorState::LazyJoinSoa(_)
+            | CursorState::DiskStream(_)
+            | CursorState::DiskJoin(_) => true,
             _ => false,
         }
     }
@@ -376,6 +589,8 @@ impl Iterator for QueryCursor<'_> {
             #[cfg(feature = "gpu")]
             CursorState::GpuStream(stream) => next_gpu_stream(&self.db, stream),
             CursorState::Lazy(lazy) => next_lazy(store, lazy),
+            CursorState::DiskStream(stream) => next_disk_stream(store, stream),
+            CursorState::DiskJoin(join) => next_disk_join(store, join),
             CursorState::LazyJoin(join) => next_lazy_join(store, join),
             CursorState::LazyJoinSoa(join) => next_lazy_join_soa(join),
             _ => None,
@@ -714,6 +929,10 @@ fn try_lazy_simple(db: &CursorDb<'_>, q: &Query) -> Result<Option<LazyCursor>, E
     }
 
     let (store, catalog) = db.store_catalog();
+    // Cold collections stream from the disk engine (see `try_disk_stream`).
+    if store.is_disk_backed(name) {
+        return Ok(None);
+    }
     let now = now_ms();
     let take_left = match take_n {
         Some(Some(n)) => Some(n.max(0) as usize),
@@ -733,6 +952,57 @@ fn try_lazy_simple(db: &CursorDb<'_>, q: &Query) -> Result<Option<LazyCursor>, E
         take_left,
         now,
     }))
+}
+
+/// `col | filter? | project? | skip* | take?` over a cold collection.
+fn try_disk_stream(db: &CursorDb<'_>, q: &Query) -> Option<DiskStreamCursor> {
+    let Source::Collection(name) = &q.source else {
+        return None;
+    };
+    let (store, _) = db.store_catalog();
+    if !store.is_disk_backed(name) {
+        return None;
+    }
+    let mut filter: Option<&Pred> = None;
+    let mut project: Option<Vec<String>> = None;
+    let mut skip_n: usize = 0;
+    let mut take_n: Option<Option<i64>> = None;
+    for step in &q.steps {
+        match step {
+            // The filter must come first: it runs inside the scan.
+            Step::Filter(p)
+                if filter.is_none() && project.is_none() && skip_n == 0 && take_n.is_none() =>
+            {
+                filter = Some(p);
+            }
+            Step::Project(f) if project.is_none() && skip_n == 0 && take_n.is_none() => {
+                // Nested paths need the row evaluator.
+                if f.iter().any(|field| field.leaf().is_none()) {
+                    return None;
+                }
+                project = Some(field_names(f));
+            }
+            Step::Skip { n } if take_n.is_none() => {
+                skip_n = skip_n.saturating_add((*n).max(0) as usize);
+            }
+            Step::Take { n } if take_n.is_none() => take_n = Some(*n),
+            _ => return None,
+        }
+    }
+    Some(DiskStreamCursor {
+        collection: name.clone(),
+        pred: filter.cloned(),
+        project,
+        skip_left: skip_n,
+        take_left: match take_n {
+            Some(Some(n)) => Some(n.max(0) as usize),
+            Some(None) => None,
+            None => Some(50),
+        },
+        now: now_ms(),
+        pos: crate::disk::DiskScanPos::default(),
+        pending: VecDeque::new(),
+    })
 }
 
 /// `col | search lex|hybrid … | project? | skip* | take?` via FTS-ordered idxs.
@@ -1053,6 +1323,7 @@ fn collect_seed_keys_arc(
         push_cell(row.get("id"));
         push_cell(row.get("uri"));
     };
+    let mut slots = pred.map(PredSlots::new);
     match source {
         RowSource::Idxs(idxs) => {
             for &i in idxs {
@@ -1060,8 +1331,8 @@ fn collect_seed_keys_arc(
                     continue;
                 };
                 if need_filter
-                    && let Some(p) = pred
-                    && !eval_pred(p, row, now)
+                    && let Some(slots) = slots.as_mut()
+                    && !slots.eval(row, now)
                 {
                     continue;
                 }
@@ -1073,8 +1344,8 @@ fn collect_seed_keys_arc(
                 let Some(row) = rows.get(i) else {
                     continue;
                 };
-                if let Some(p) = pred
-                    && !eval_pred(p, row, now)
+                if let Some(slots) = slots.as_mut()
+                    && !slots.eval(row, now)
                 {
                     continue;
                 }
@@ -1602,7 +1873,10 @@ fn next_gpu_stream(db: &CursorDb<'_>, stream: &mut GpuStreamCursor) -> Option<Re
                             let mut mask = mask.into_iter();
                             rows.retain(|_| mask.next().expect("one mask per row"));
                         }
-                        Ok(None) => rows.retain(|row| eval_pred(pred, row, stream.now)),
+                        Ok(None) => {
+                            let mut slots = PredSlots::new(pred);
+                            rows.retain(|row| slots.eval(row, stream.now));
+                        }
                         Err(error) => {
                             stream.stopped = true;
                             return Some(Err(error));
@@ -1681,9 +1955,10 @@ fn collect_gpu_seed_keys(
         } else {
             None
         };
+        let mut slots = pred.map(PredSlots::new);
         for (i, row) in rows.iter().enumerate() {
             let hit = mask.as_ref().map_or_else(
-                || pred.is_none_or(|p| eval_pred(p, row, now)),
+                || slots.as_mut().is_none_or(|s| s.eval(row, now)),
                 |mask| mask[i],
             );
             if hit {

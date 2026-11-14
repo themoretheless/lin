@@ -176,4 +176,106 @@ mod tests {
             );
         }
     }
+
+    /// The checksum of no bytes, in every form the WAL can ask for it.
+    #[test]
+    fn test_crc32c_empty_input() {
+        assert_eq!(hardware_crc32c(&[]), 0);
+        assert_eq!(!crc32c_table(!0u32, &[]), 0);
+        let mut h = Hasher::new();
+        h.update(&[]);
+        h.update(&[]);
+        assert_eq!(h.finalize(), 0);
+        // Empty updates between real ones change nothing.
+        let mut h = Hasher::new();
+        h.update(&[]);
+        h.update(b"1234");
+        h.update(&[]);
+        h.update(b"56789");
+        h.update(&[]);
+        assert_eq!(h.finalize(), 0xE3069283);
+    }
+
+    fn pattern(len: usize) -> Vec<u8> {
+        let mut x = 0x9E37_79B9u32;
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                (x >> 24) as u8
+            })
+            .collect()
+    }
+
+    /// Feeding the data in pieces gives the checksum of the whole, wherever it is cut:
+    /// a cut inside an 8-byte word must not change how the remaining bytes are folded.
+    #[test]
+    fn test_crc32c_segmented_updates_match_one_shot() {
+        let data = pattern(203);
+        let whole = hardware_crc32c(&data);
+        assert_eq!(whole, !crc32c_table(!0u32, &data));
+        for a in 0..=data.len() {
+            let mut h = Hasher::new();
+            h.update(&data[..a]);
+            h.update(&data[a..]);
+            assert_eq!(h.finalize(), whole, "split at {a}");
+        }
+        for a in (0..=data.len()).step_by(7) {
+            for b in (a..=data.len()).step_by(5) {
+                let mut h = Hasher::new();
+                h.update(&data[..a]);
+                h.update(&data[a..b]);
+                h.update(&data[b..]);
+                assert_eq!(h.finalize(), whole, "splits at {a} and {b}");
+            }
+        }
+        // One byte at a time, software and accelerated alike.
+        let mut h = Hasher::new();
+        let mut table = !0u32;
+        for byte in &data {
+            h.update(std::slice::from_ref(byte));
+            table = crc32c_table(table, std::slice::from_ref(byte));
+        }
+        assert_eq!(h.finalize(), whole);
+        assert_eq!(!table, whole);
+    }
+
+    /// The accelerated path reads 8-byte words from wherever the slice starts; the
+    /// result must not depend on the slice's alignment.
+    #[test]
+    fn test_crc32c_unaligned_slices() {
+        let data = pattern(16 + 300);
+        for offset in 0..16 {
+            for len in [0, 1, 7, 8, 9, 15, 16, 17, 63, 64, 65, 255, 300] {
+                let slice = &data[offset..offset + len];
+                // Same bytes in a fresh allocation, i.e. at the allocator's alignment.
+                let copy = slice.to_vec();
+                let want = !crc32c_table(!0u32, &copy);
+                assert_eq!(hardware_crc32c(slice), want, "offset {offset}, len {len}");
+                assert_eq!(hardware_crc32c(&copy), want, "offset {offset}, len {len}");
+            }
+        }
+    }
+
+    /// Long inputs with every possible tail after the last whole word: the accelerated
+    /// path and the software fallback agree, so a frame checksummed on one machine
+    /// verifies on a machine without the instruction.
+    #[test]
+    fn test_crc32c_long_inputs_match_software_fallback() {
+        let data = pattern((1 << 20) + 7);
+        for tail in 0..8 {
+            let slice = &data[..(1 << 20) + tail];
+            assert_eq!(
+                hardware_crc32c(slice),
+                !crc32c_table(!0u32, slice),
+                "tail {tail}"
+            );
+        }
+        // A flipped bit in the tail bytes is still detected.
+        let mut corrupt = data.clone();
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 0x80;
+        assert_ne!(hardware_crc32c(&corrupt), hardware_crc32c(&data));
+    }
 }

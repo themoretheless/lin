@@ -1575,7 +1575,7 @@ fn numeric_sort_orders_nan_after_numbers_and_keeps_zero_and_nan_ties_stable() {
         .iter_mut()
         .zip(values)
     {
-        row.insert("value".into(), lin::Cell::Float(value));
+        row.insert("value", lin::Cell::Float(value));
     }
     for (q, expected) in [
         (
@@ -2251,4 +2251,390 @@ fn explicit_take_all_does_not_prefetch_only_implicit_fifty_rows() {
             .collect();
         assert_eq!(ids(&result), expected, "{query}");
     }
+}
+
+/// Every window function, with and without frames, against a brute-force reference.
+/// Rows have a unique sort key per partition (no tie ambiguity) and some null values.
+#[test]
+fn window_functions_match_reference_over_frames() {
+    use lin::Cell;
+    const N: usize = 90;
+    let mut db = lin::Db::empty();
+    let mut src = String::from("col wt { id: text, grp: text, k: i64, v: i64 }\ninsert wt [\n");
+    // (grp, k, v)
+    let mut data: Vec<(String, i64, Option<i64>)> = Vec::new();
+    for i in 0..N {
+        let grp = format!("g{}", i % 3);
+        let k = ((i * 37) % 101) as i64;
+        let v = (i % 7 != 3).then(|| ((i * 13) % 50) as i64 - 20);
+        if i > 0 {
+            src.push(',');
+        }
+        match v {
+            Some(v) => src.push_str(&format!(
+                r#"{{ id: "r{i}", grp: "{grp}", k: {k}, v: {v} }}"#
+            )),
+            None => src.push_str(&format!(r#"{{ id: "r{i}", grp: "{grp}", k: {k} }}"#)),
+        }
+        data.push((grp, k, v));
+    }
+    src.push_str("\n]");
+    db.run(&src).unwrap();
+
+    // Partitions in sort order: grp -> [(row index, v)] ordered by k.
+    let mut parts: std::collections::BTreeMap<&str, Vec<(usize, Option<i64>)>> = Default::default();
+    for (i, (g, _, v)) in data.iter().enumerate() {
+        parts.entry(g.as_str()).or_default().push((i, *v));
+    }
+    for rows in parts.values_mut() {
+        rows.sort_by_key(|(i, _)| data[*i].1);
+    }
+
+    #[derive(Clone, Copy)]
+    enum B {
+        UnbPre,
+        Pre(usize),
+        Cur,
+        Fol(usize),
+        UnbFol,
+    }
+    let bound = |b: B, i: usize, n: usize| match b {
+        B::UnbPre => 0,
+        B::Pre(k) => i.saturating_sub(k),
+        B::Cur => i,
+        B::Fol(k) => (i + k).min(n - 1),
+        B::UnbFol => n - 1,
+    };
+    let frames: [(&str, Option<(B, B)>); 6] = [
+        ("", None),
+        ("rows between 2 preceding and current row", Some((B::Pre(2), B::Cur))),
+        ("rows between 1 preceding and 2 following", Some((B::Pre(1), B::Fol(2)))),
+        (
+            "rows between unbounded preceding and unbounded following",
+            Some((B::UnbPre, B::UnbFol)),
+        ),
+        (
+            "rows between current row and unbounded following",
+            Some((B::Cur, B::UnbFol)),
+        ),
+        ("rows between 3 preceding and 1 preceding", Some((B::Pre(3), B::Pre(1)))),
+    ];
+    let int = |c: Option<i64>| c.map(Cell::Int).unwrap_or(Cell::Null);
+
+    let mut checked = 0usize;
+    for func in [
+        "sum", "avg", "min", "max", "count", "first_value", "last_value", "lead", "lag",
+        "row_number",
+    ] {
+        for (frame_src, frame) in frames {
+            // Offsets and row numbers ignore frames; test them once.
+            if matches!(func, "lead" | "lag" | "row_number") && frame.is_some() {
+                continue;
+            }
+            let field = if func == "row_number" { "" } else { "v " };
+            let q = format!(
+                "wt | window {func} {field}by grp sort k asc {frame_src} as w | pick {{ id, w }} | take all"
+            );
+            let h = db.run(&q).unwrap_or_else(|e| panic!("{q}: {e}"));
+            assert_eq!(h.rows.len(), N, "{q}");
+            let got: std::collections::BTreeMap<String, Cell> = h
+                .rows
+                .iter()
+                .map(|r| {
+                    (
+                        r.get("id").and_then(|c| c.text()).unwrap().to_string(),
+                        r.get("w").cloned().unwrap_or(Cell::Null),
+                    )
+                })
+                .collect();
+            for rows in parts.values() {
+                let n = rows.len();
+                for (pos, (row_i, _)) in rows.iter().enumerate() {
+                    // Default frame with an ordering is "start of partition .. current row".
+                    let (s, e) = match frame {
+                        Some((a, b)) => (bound(a, pos, n), bound(b, pos, n)),
+                        None => (0, pos),
+                    };
+                    let win: &[(usize, Option<i64>)] = if s <= e { &rows[s..=e] } else { &[] };
+                    let vals: Vec<i64> = win.iter().filter_map(|(_, v)| *v).collect();
+                    let want = match func {
+                        "sum" => Cell::Int(vals.iter().sum()),
+                        "avg" => Cell::Float(if vals.is_empty() {
+                            0.0
+                        } else {
+                            vals.iter().sum::<i64>() as f64 / vals.len() as f64
+                        }),
+                        "min" => int(vals.iter().min().copied()),
+                        "max" => int(vals.iter().max().copied()),
+                        "count" => Cell::Int(vals.len() as i64),
+                        // Without a frame these span the whole partition.
+                        "first_value" => match frame {
+                            Some(_) => int(win.first().and_then(|(_, v)| *v)),
+                            None => int(rows[0].1),
+                        },
+                        "last_value" => match frame {
+                            Some(_) => int(win.last().and_then(|(_, v)| *v)),
+                            None => int(rows[n - 1].1),
+                        },
+                        "lead" => int(rows.get(pos + 1).and_then(|(_, v)| *v)),
+                        "lag" => int(pos.checked_sub(1).and_then(|p| rows[p].1)),
+                        "row_number" => Cell::Int(pos as i64 + 1),
+                        _ => unreachable!(),
+                    };
+                    let id = format!("r{row_i}");
+                    let have = &got[&id];
+                    let same = match (&want, have) {
+                        (Cell::Float(a), Cell::Float(b)) => (a - b).abs() < 1e-9,
+                        (a, b) => a == b,
+                    };
+                    assert!(same, "{q}\n  row {id} (pos {pos} of {n}): want {want:?}, got {have:?}");
+                    checked += 1;
+                }
+            }
+        }
+    }
+    assert!(checked > 3_000, "checked only {checked} cells");
+
+    // No ordering: aggregates cover the whole partition.
+    for (func, pick) in [("max", true), ("min", false)] {
+        let h = db
+            .run(&format!(
+                "wt | window {func} v by grp as w | pick {{ id, w }} | take all"
+            ))
+            .unwrap();
+        for r in &h.rows {
+            let id = r.get("id").and_then(|c| c.text()).unwrap();
+            let i: usize = id[1..].parse().unwrap();
+            let vals = parts[data[i].0.as_str()].iter().filter_map(|(_, v)| *v);
+            let want = if pick { vals.max() } else { vals.min() };
+            assert_eq!(r.get("w").cloned().unwrap_or(Cell::Null), int(want), "{func} {id}");
+        }
+    }
+}
+
+/// The columnar window path (taken for `window+ | pick | take`) must return the same rows
+/// in the same order as the row pipeline, which still runs the same windows when no
+/// projection follows.
+#[test]
+fn columnar_window_path_matches_row_pipeline_order() {
+    use lin::Cell;
+    let mut db = lin::Db::empty();
+    let mut src = String::from("col wo { id: text, grp: text, sub: text, k: i64, v: f64 }\ninsert wo [\n");
+    for i in 0..400 {
+        if i > 0 {
+            src.push(',');
+        }
+        // Ties on `k` inside partitions exercise stable ordering and ranks.
+        src.push_str(&format!(
+            r#"{{ id: "r{i}", grp: "g{}", sub: "s{}", k: {}"#,
+            i % 5,
+            i % 3,
+            (i * 7) % 23
+        ));
+        if i % 9 != 4 {
+            src.push_str(&format!(", v: {}.5", (i * 11) % 40));
+        }
+        src.push_str(" }");
+    }
+    src.push_str("\n]");
+    db.run(&src).unwrap();
+
+    let windows = [
+        "window row_number by grp sort k asc as w",
+        "window rank by grp sort k desc as w",
+        "window dense_rank by [grp, sub] sort k asc as w",
+        "window sum v by grp sort [k asc, id desc] as w",
+        "window avg v by grp sort k asc rows between 2 preceding and 1 following as w",
+        "window max v sort k asc as w",
+        "window min v by sub as w",
+        "window count v by grp as w",
+        "window lag v by grp sort k asc as w",
+        "window last_value v by grp sort k asc rows between current row and unbounded following as w",
+        // Two windows: the second partitions rows already re-sequenced by the first.
+        "window row_number by grp sort k asc as w0 | window sum v by sub sort k desc as w",
+        "window rank by sub sort k asc as w0 | window row_number sort id asc as w",
+    ];
+    let cells = |rows: &[lin::Row], fields: &[&str]| -> Vec<Vec<Cell>> {
+        rows.iter()
+            .map(|r| {
+                fields
+                    .iter()
+                    .map(|f| r.get(*f).cloned().unwrap_or(Cell::Null))
+                    .collect()
+            })
+            .collect()
+    };
+    for w in windows {
+        let fields: &[&str] = if w.contains("w0") { &["id", "w0", "w"] } else { &["id", "w"] };
+        let pick = fields.join(", ");
+        for filter in ["", "k > 4 | "] {
+            // Row pipeline: no projection after the windows.
+            let rows = db.run(&format!("wo | {filter}{w} | take all")).unwrap();
+            let want = cells(&rows.rows, fields);
+            assert!(want.len() > 100, "{w}");
+            // Columnar path, through both entry points.
+            let q = format!("wo | {filter}{w} | pick {{ {pick} }} | take all");
+            let got = db.run(&q).unwrap();
+            assert_eq!(cells(&got.rows, fields), want, "run: {q}");
+            let batch = db.run_batch(&q).unwrap();
+            assert_eq!(cells(&batch.to_rows(), fields), want, "run_batch: {q}");
+            // Offsets and limits apply after the windows.
+            let q = format!("wo | {filter}{w} | pick {{ {pick} }} | skip 7 | take 25");
+            let got = db.run(&q).unwrap();
+            assert_eq!(cells(&got.rows, fields), want[7..32], "{q}");
+            // A sort between the windows and the projection: by the window output, by a
+            // read column and by a column the projection drops, with ties in each.
+            for sort in ["sort w desc", "sort w", "sort id", "sort k desc", "sort v", "sort sub desc"] {
+                let rows = db.run(&format!("wo | {filter}{w} | {sort} | take all")).unwrap();
+                let want = cells(&rows.rows, fields);
+                let q = format!("wo | {filter}{w} | {sort} | pick {{ {pick} }} | take all");
+                let got = db.run(&q).unwrap();
+                assert_eq!(cells(&got.rows, fields), want, "run: {q}");
+                let batch = db.run_batch(&q).unwrap();
+                assert_eq!(cells(&batch.to_rows(), fields), want, "run_batch: {q}");
+                let q = format!("wo | {filter}{w} | {sort} | pick {{ {pick} }} | skip 3 | take 40");
+                let got = db.run(&q).unwrap();
+                assert_eq!(cells(&got.rows, fields), want[3..43], "{q}");
+            }
+        }
+    }
+}
+
+/// Grouped `count` / `sum` over a large in-memory collection (the size at which the
+/// `parallel` feature fans the fold out) must equal an independent computation.
+#[test]
+fn large_grouped_aggregates_match_reference() {
+    use lin::Cell;
+    use std::collections::BTreeMap;
+    const N: usize = 150_000;
+    let mut db = lin::Db::empty();
+    db.run("col big { id: text, grp: text, k: i64, v: f64 }").unwrap();
+    let mut count_all: BTreeMap<String, i64> = BTreeMap::new();
+    let mut count_f: BTreeMap<String, i64> = BTreeMap::new();
+    let mut sum_all: BTreeMap<String, f64> = BTreeMap::new();
+    let mut sum_f: BTreeMap<String, f64> = BTreeMap::new();
+    let (mut total, mut total_f) = (0.0f64, 0.0f64);
+    for chunk in 0..(N / 10_000) {
+        let mut src = String::from("insert big [");
+        for i in (chunk * 10_000)..((chunk + 1) * 10_000) {
+            if i > chunk * 10_000 {
+                src.push(',');
+            }
+            let grp = format!("g{}", (i * 31) % 97);
+            let k = (i * 7) % 1000;
+            // Halves are exact in f64, so the sum does not depend on the order of addition.
+            let v = ((i * 13) % 400) as f64 + 0.5;
+            src.push_str(&format!(r#"{{ id: "b{i}", grp: "{grp}", k: {k}, v: {v:?} }}"#));
+            *count_all.entry(grp.clone()).or_default() += 1;
+            *sum_all.entry(grp.clone()).or_default() += v;
+            total += v;
+            if k >= 300 {
+                *count_f.entry(grp.clone()).or_default() += 1;
+                *sum_f.entry(grp).or_default() += v;
+                total_f += v;
+            }
+        }
+        src.push(']');
+        db.run(&src).unwrap();
+    }
+    let text = |c: Option<&Cell>| match c {
+        Some(Cell::Text(s)) => s.to_string(),
+        Some(Cell::SmallText(s)) => s.as_str().to_string(),
+        other => panic!("group key {other:?}"),
+    };
+    let counts = |db: &mut lin::Db, q: &str| -> BTreeMap<String, i64> {
+        db.run(q)
+            .unwrap()
+            .rows
+            .iter()
+            .map(|r| match r.get("hits") {
+                Some(Cell::Int(n)) => (text(r.get("grp")), *n),
+                other => panic!("hits {other:?}"),
+            })
+            .collect()
+    };
+    let sums = |db: &mut lin::Db, q: &str| -> BTreeMap<String, f64> {
+        db.run(q)
+            .unwrap()
+            .rows
+            .iter()
+            .map(|r| (text(r.get("grp")), r.get("v").and_then(Cell::as_f64).unwrap()))
+            .collect()
+    };
+    assert_eq!(counts(&mut db, "big | count by grp | take all"), count_all);
+    assert_eq!(counts(&mut db, "big | k >= 300 | count by grp | take all"), count_f);
+    assert_eq!(sums(&mut db, "big | sum v by grp | take all"), sum_all);
+    assert_eq!(sums(&mut db, "big | k >= 300 | sum v by grp | take all"), sum_f);
+    let scalar = |db: &mut lin::Db, q: &str| -> f64 {
+        db.run(q).unwrap().rows[0].get("v").and_then(Cell::as_f64).unwrap()
+    };
+    assert_eq!(scalar(&mut db, "big | sum v"), total);
+    assert_eq!(scalar(&mut db, "big | k >= 300 | sum v"), total_f);
+
+    // avg / min / max per group, against the same data regenerated here.
+    let mut stats: BTreeMap<String, (f64, i64, f64, f64)> = BTreeMap::new();
+    for i in 0..N {
+        if (i * 7) % 1000 < 300 {
+            continue;
+        }
+        let v = ((i * 13) % 400) as f64 + 0.5;
+        let e = stats
+            .entry(format!("g{}", (i * 31) % 97))
+            .or_insert((0.0, 0, f64::MAX, f64::MIN));
+        e.0 += v;
+        e.1 += 1;
+        e.2 = e.2.min(v);
+        e.3 = e.3.max(v);
+    }
+    let avg = sums(&mut db, "big | k >= 300 | avg v by grp | take all");
+    let min = sums(&mut db, "big | k >= 300 | min v by grp | take all");
+    let max = sums(&mut db, "big | k >= 300 | max v by grp | take all");
+    assert_eq!(avg.len(), stats.len());
+    for (grp, (sum, n, lo, hi)) in &stats {
+        assert_eq!(avg[grp], sum / *n as f64, "avg {grp}");
+        assert_eq!(min[grp], *lo, "min {grp}");
+        assert_eq!(max[grp], *hi, "max {grp}");
+    }
+
+    // Ungrouped avg / min / max, with and without a filter.
+    let (sum_f, n_f, lo_f, hi_f) = stats.values().fold(
+        (0.0f64, 0i64, f64::MAX, f64::MIN),
+        |a, s| (a.0 + s.0, a.1 + s.1, a.2.min(s.2), a.3.max(s.3)),
+    );
+    assert_eq!(scalar(&mut db, "big | k >= 300 | avg v"), sum_f / n_f as f64);
+    assert_eq!(scalar(&mut db, "big | k >= 300 | min v"), lo_f);
+    assert_eq!(scalar(&mut db, "big | k >= 300 | max v"), hi_f);
+    assert_eq!(scalar(&mut db, "big | avg v"), total / N as f64);
+    assert_eq!(scalar(&mut db, "big | min v"), 0.5);
+    assert_eq!(scalar(&mut db, "big | max v"), 399.5);
+
+    // `skip` / `take N` after an aggregate slice the same ordered groups as `take all`.
+    for agg in ["count by grp", "sum v by grp", "k >= 300 | avg v by grp", "max v by grp"] {
+        let all = db.run(&format!("big | {agg} | take all")).unwrap().rows.clone();
+        assert_eq!(all.len(), 97);
+        for (tail, lo, hi) in [
+            ("take 5", 0, 5),
+            ("skip 90", 90, 97),
+            ("skip 10 | take 7", 10, 17),
+            ("take 20 | skip 15", 15, 20),
+            ("skip 200", 97, 97),
+            ("take 0", 0, 0),
+            ("sort grp | skip 3 | take 4", 3, 7),
+        ] {
+            let got = db.run(&format!("big | {agg} | {tail}")).unwrap().rows.clone();
+            assert_eq!(got, all[lo..hi], "{agg} | {tail}");
+        }
+    }
+    // Sorting groups by the aggregate value: descending counts, largest first.
+    let top = db.run("big | count by grp | sort hits desc | take 3").unwrap().rows.clone();
+    let mut expect: Vec<i64> = count_all.values().copied().collect();
+    expect.sort_unstable_by(|a, b| b.cmp(a));
+    let hits: Vec<i64> = top
+        .iter()
+        .map(|r| match r.get("hits") {
+            Some(Cell::Int(n)) => *n,
+            other => panic!("hits {other:?}"),
+        })
+        .collect();
+    assert_eq!(hits, expect[..3]);
 }

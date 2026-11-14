@@ -268,13 +268,30 @@ impl Store {
         let mut log = persist::open_log(dir)?;
         let min_gen = store.r#gen;
         let mut wal_index = Vec::new();
+        // Every catalog hash the store goes through while the log is replayed. `head` is
+        // refreshed only on checkpoint, open and close (the log is authoritative), so
+        // when the log carries schema records it may describe any of these states, not
+        // only the final one.
+        let hash_now = |store: &Store| -> String {
+            let mut seen = cat.clone();
+            store.merge_extras_into(&mut seen);
+            catalog_hash(&seen)
+        };
+        let mut replay_hashes: Vec<String> = vec![hash_now(&store)];
+        let mut order = ReplayOrder::new(min_gen);
         let end = persist::replay_log_indexed(
             &mut log,
             min_gen,
             start,
             Some(&mut wal_index),
             &mut |rec| {
+                if !order.admit(rec.r#gen)? {
+                    return Ok(());
+                }
                 store.apply_record(&rec);
+                if pack_changes_schema(&rec.pack) {
+                    replay_hashes.push(hash_now(&store));
+                }
                 Ok(())
             },
         )?;
@@ -289,6 +306,7 @@ impl Store {
         let head_disk = persist::read_head(dir)?;
         if let Some(ref head) = head_disk
             && head.catalog_hash != live_hash
+            && !replay_hashes.contains(&head.catalog_hash)
         {
             return Err(Error::runtime(format!(
                 "catalog_hash mismatch: store={} catalog={}",
@@ -299,6 +317,7 @@ impl Store {
             && snap_hash != live_hash
             && !snap_has_extras
             && snap_hash != fixture_hash
+            && !replay_hashes.contains(&snap_hash)
         {
             return Err(Error::runtime(format!(
                 "catalog_hash mismatch: snapshot={} catalog={}",
@@ -404,8 +423,11 @@ impl Store {
         let mut log = persist::open_log_read(dir)?;
         let min_gen = store.r#gen;
         if let Some(log) = log.as_mut() {
+            let mut order = ReplayOrder::new(min_gen);
             let _ = persist::replay_log(log, min_gen, start, |rec| {
-                store.apply_record(&rec);
+                if order.admit(rec.r#gen)? {
+                    store.apply_record(&rec);
+                }
                 Ok(())
             })?;
         }
@@ -481,6 +503,7 @@ impl Store {
             disk: None,
             dirty_fts_disk: BTreeMap::new(),
             overlay_savepoint_fts: None,
+            overlay_savepoint_edges: None,
             disk_cluster_keys: BTreeMap::new(),
             disk_compact_requests: Vec::new(),
         };
@@ -656,6 +679,8 @@ impl Store {
         pack: Pack,
         prepared: Option<crate::persist::PreparedEncoding>,
     ) -> Result<(), Error> {
+        let mut pack = pack;
+        slim_delete_rows(&mut pack);
         let rec = LogRecord {
             r#gen: self.r#gen + 1,
             next_id: self.next_id,
@@ -741,6 +766,8 @@ impl Store {
                 self.promote_disk_col(&name);
             }
             self.disk = None;
+            self.overlay_savepoint_fts = None;
+            self.overlay_savepoint_edges = None;
             if is_disk_dir(&persist.dir) {
                 cleanup_disk_files(&persist.dir);
             }
@@ -790,6 +817,8 @@ impl Store {
 
             // Close read-only mmap handles before opening DiskEngine writer to rewrite segments.
             self.disk = None;
+            self.overlay_savepoint_fts = None;
+            self.overlay_savepoint_edges = None;
 
             for (name, rows) in &self.collections {
                 if untouched_disk.contains(name) || rows.len() >= COLD_MIN_ROWS {
@@ -881,10 +910,14 @@ impl Store {
                         // Spill a clustered collection in key order (the in-memory copy
                         // keeps its own order).
                         Some(key) => {
-                            let mut sorted = rows.clone();
-                            crate::disk::sort_rows_by_cluster_key(&mut sorted, &key);
-                            for chunk in sorted.chunks(65_536) {
-                                eng.write_bulk_segment(name, chunk)?;
+                            // Sort positions, then copy one segment's worth of rows
+                            // at a time instead of cloning the whole collection.
+                            let order = crate::disk::cluster_key_order(rows, &key);
+                            let mut chunk: Vec<crate::Row> = Vec::new();
+                            for positions in order.chunks(65_536) {
+                                chunk.clear();
+                                chunk.extend(positions.iter().map(|&i| rows[i as usize].clone()));
+                                eng.write_bulk_segment(name, &chunk)?;
                             }
                         }
                         None => {
@@ -1033,19 +1066,18 @@ impl Store {
         }
         // Invalidate any stale OnceLock materializations on still-lazy tables.
         for op in &ops {
-            match op {
-                crate::disk::DiskWalOp::EnsureTable { schema } => {
-                    if let Some(lazy) = d.tables.get_mut(&schema.name) {
-                        lazy.materialized = OnceLock::new();
-                    }
-                }
+            let tbl = match op {
+                crate::disk::DiskWalOp::EnsureTable { schema } => &schema.name,
                 crate::disk::DiskWalOp::UpsertBatch { table, .. }
                 | crate::disk::DiskWalOp::DeleteIds { table, .. }
-                | crate::disk::DiskWalOp::EnsureIndex { table, .. } => {
-                    if let Some(lazy) = d.tables.get_mut(table) {
-                        lazy.materialized = OnceLock::new();
-                    }
-                }
+                | crate::disk::DiskWalOp::EnsureIndex { table, .. } => table,
+            };
+            if let Some(lazy) = d.tables.get_mut(tbl) {
+                lazy.materialized = OnceLock::new();
+            }
+            if let Some(fts_idx) = self.fts.remove(tbl) {
+                self.dirty_fts_disk
+                    .insert(tbl.clone(), fts_idx.fields.clone());
             }
         }
         let mut eng = d
@@ -1062,6 +1094,29 @@ impl Store {
             self.col_counts.insert(tname, nrows);
         }
         Ok(())
+    }
+}
+
+/// A logged delete only has to identify its rows: replay finds them by `id` (or `uri`), and
+/// facts by their `s` / `p` / `o` triple. Dropping every other field keeps the record small —
+/// whole rows carry bodies and embeddings, and a few thousand documents overflow the WAL
+/// record limit. Rows without any key field are logged unchanged.
+fn slim_delete_rows(pack: &mut Pack) {
+    match pack {
+        Pack::Delete { collection, rows } => {
+            let keys: &[&str] = if collection == "facts" {
+                &["s", "p", "o"]
+            } else {
+                &["id", "uri"]
+            };
+            for row in rows.iter_mut() {
+                if keys.iter().any(|k| row.contains_key(*k)) {
+                    row.retain(|k, _| keys.contains(&k.as_str()));
+                }
+            }
+        }
+        Pack::Batch { packs } => packs.iter_mut().for_each(slim_delete_rows),
+        _ => {}
     }
 }
 
@@ -1176,5 +1231,52 @@ pub(crate) fn pack_to_disk_wal_ops(pack: &Pack, out: &mut Vec<crate::disk::DiskW
         | Pack::SchemaRel { .. }
         | Pack::SchemaFilter { .. }
         | Pack::SchemaOwned { .. } => {}
+    }
+}
+
+/// True when applying `pack` can change the catalog (collections, relations, indexes,
+/// filters, ownership).
+fn pack_changes_schema(pack: &Pack) -> bool {
+    match pack {
+        Pack::SchemaCol { .. }
+        | Pack::SchemaRel { .. }
+        | Pack::SchemaIndex { .. }
+        | Pack::SchemaFilter { .. }
+        | Pack::SchemaOwned { .. } => true,
+        Pack::Batch { packs } => packs.iter().any(pack_changes_schema),
+        _ => false,
+    }
+}
+
+/// Generation order of log records during replay. Every committed write appends exactly
+/// one record with the next generation, so a valid log continues the snapshot's
+/// generation without holes. A record at or below the last applied generation is a
+/// repeat of one already applied (a duplicated frame) and is skipped instead of being
+/// applied twice; a hole means a committed record is missing, and opening stops before
+/// anything is truncated, as a follower does on the same condition.
+struct ReplayOrder {
+    applied: u64,
+}
+
+impl ReplayOrder {
+    fn new(min_gen: u64) -> Self {
+        ReplayOrder { applied: min_gen }
+    }
+
+    /// `Ok(true)` to apply the record, `Ok(false)` to skip it.
+    fn admit(&mut self, generation: u64) -> Result<bool, Error> {
+        if generation <= self.applied {
+            return Ok(false);
+        }
+        if generation != self.applied + 1 {
+            return Err(Error::runtime(format!(
+                "corrupt log: generation gap, expected {} after {}, found {}",
+                self.applied + 1,
+                self.applied,
+                generation
+            )));
+        }
+        self.applied = generation;
+        Ok(true)
     }
 }

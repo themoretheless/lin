@@ -78,7 +78,7 @@ let _ = Queryable::from("docs").search_vec("wal shipping").take(5).to_vec(&mut d
 
 **Lazy cursor:** `filter` / `project` / `skip` / `take`, один `join`/`left_join` по FK, **`hop` depth=1**, **`search lex|hybrid` + take** (FTS idxs). Для проекций `next_projected()` возвращает compact `ProjectedRow`; обычный `Iterator<Item=Row>` сохранён совместимым. `graph` / `match` / `sort` / `union` / `search vec` / hop depth>1 — buffered. Deep `skip` дороже keyset (`.after` + `take`).
 
-**Experimental (вне freeze):** `ship` (WAL `LIN\x06`, token, optional TLS, one sink), `RecordBatch` / `run_batch`, `Db::run_stmt`, `RowExt`. См. [CHANGELOG](CHANGELOG.md).
+**Experimental (вне freeze):** `ship` (WAL `LIN\x06`, token, optional TLS, one sink или `wal-serve --sinks N`), `RecordBatch` / `run_batch`, `Db::run_stmt`, `RowExt`. См. [CHANGELOG](CHANGELOG.md).
 
 **OLAP рядом с row-API:** `Db::run` / `Prepared::run` → `Vec<Row>`; `run_batch` → [`RecordBatch`] (колонки, experimental). Columnar: `filter?|project|take` и hot join `orders ⋈ users` (SoA); иначе fallback в row-maps.
 
@@ -185,23 +185,9 @@ unfilter docs
 
 ## Roadmap
 
-[План развития](docs/roadmap.md) — производительность и OLAP-контур, улучшения, qualification, API.
+[План развития](docs/roadmap.md) — единственный файл с планом: производительность и OLAP-контур, улучшения, qualification, API. Сделанное — в [CHANGELOG](CHANGELOG.md).
 
-Кратко ниже; полный план — canvas / wiki `lin-roadmap`.
-
-| Фаза | Статус |
-|---|---|
-| P0–P2: 0.2 + backup/FENCE/cold/SyncMode | **готово** |
-| P3 hot standby | **готово** (`open_follower` / `apply_wal`) |
-| P3c live vec/hybrid | **готово** (hashing embedder + RRF; neural → `with_embedder`) |
-| **0.2.x ship + ops** | **готово** (критерии met: n1–n4 · tests · README recipe) |
-| **0.3** | **готово** — Queryable/cursor/FromRow/async в stable + CHANGELOG |
-| **0.3.x** | **готово** — m1 Neural embed features · m4 filter+project `run_batch` · join SoA |
-| **0.4** | **готово** — m2 FTS postings / `FtsSeek` · m5 lazy hop d=1 + search lex\|hybrid |
-| **0.5** | m3 ANN · m6 wasm32 · o1 fanout (TLS/token/one-sink — в Unreleased) |
-| **Не 0.x** | Multi-writer / полный MVCC / consensus · DuckDB как storage backend |
-
-Подробный план (чеклисты, файлы, риски): см. wiki `lin-roadmap` / canvas.
+Вне плана: multi-writer, полный MVCC, consensus, DuckDB как storage backend.
 
 ## Hot standby (recipe)
 

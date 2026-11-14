@@ -9,7 +9,6 @@ use crate::error::Error;
 use crate::store::{Cell, Row, acquire_row};
 
 use super::agg::cell_key;
-use super::eval::eval_pred;
 use super::{Db, field_names};
 
 /// Output field for a projected FK join: left column or right probe slot.
@@ -190,7 +189,7 @@ pub(crate) fn project_join_fields(
     right_col: &str,
     fields: &[String],
 ) -> Row {
-    let mut out = BTreeMap::new();
+    let mut out = Row::new();
     for f in fields {
         let cell = if let Some(rest) = f.strip_prefix(right_col).and_then(|s| s.strip_prefix('.')) {
             right
@@ -351,6 +350,303 @@ impl Db {
         now: i64,
     ) -> Option<Vec<Row>> {
         Some(self.try_join_project_batch(q, bindings, now)?.to_rows())
+    }
+
+    /// Columnar `filter? | window+ | sort? | project | skip* | take`: only the columns the
+    /// windows, the sort and the projection need are read (one batch scan), partitions and ordering are computed on
+    /// row indices, and no per-row map exists until the caller asks for rows.
+    ///
+    /// Produces exactly what the row pipeline does, in the same order (partitions in
+    /// first-seen order, each in window order). Shapes whose semantics depend on details the
+    /// row pipeline owns are left to it: no explicit `take` (implicit limits), a window
+    /// reading another window's output, nested fields, an output name shadowing a column.
+    pub(super) fn try_window_project_batch(
+        &self,
+        q: &Query,
+        bindings: &BTreeMap<String, Vec<Row>>,
+        now: i64,
+    ) -> Option<RecordBatch> {
+        use crate::batch::Column;
+        let Source::Collection(name) = &q.source else {
+            return None;
+        };
+        if bindings.get(name).is_some() {
+            return None;
+        }
+        let mut filter: Option<&Pred> = None;
+        let mut windows: Vec<&Step> = Vec::new();
+        let mut fields: Option<&[Field]> = None;
+        let mut sort: Option<(&Field, bool)> = None;
+        let mut skip_n = 0usize;
+        let mut take: Option<Option<i64>> = None;
+        for step in &q.steps {
+            match step {
+                Step::Filter(p) if windows.is_empty() && filter.is_none() => filter = Some(p),
+                Step::Window { .. } if fields.is_none() && sort.is_none() => windows.push(step),
+                Step::Sort { field, desc }
+                    if !windows.is_empty() && fields.is_none() && sort.is_none() =>
+                {
+                    sort = Some((field, *desc));
+                }
+                Step::Project(f) if !windows.is_empty() && fields.is_none() => {
+                    fields = Some(f.as_slice())
+                }
+                Step::Skip { n } if fields.is_some() && take.is_none() => {
+                    skip_n = skip_n.saturating_add((*n).max(0) as usize);
+                }
+                Step::Take { n } if fields.is_some() && take.is_none() => take = Some(*n),
+                _ => return None,
+            }
+        }
+        let fields = fields?;
+        let take = take?;
+
+        // Columns to read: everything the windows consume plus the projected base columns.
+        let mut base: Vec<Field> = Vec::new();
+        let mut win_names: Vec<&str> = Vec::new();
+        let want = |f: &Field, win_names: &[&str], base: &mut Vec<Field>| -> Option<()> {
+            let leaf = f.leaf()?;
+            if win_names.contains(&leaf) {
+                return None;
+            }
+            if !base.iter().any(|b| b.leaf() == Some(leaf)) {
+                base.push(f.clone());
+            }
+            Some(())
+        };
+        for w in &windows {
+            let Step::Window {
+                field,
+                by,
+                order,
+                as_field,
+                ..
+            } = w
+            else {
+                return None;
+            };
+            for f in by.iter().chain(field.iter()).chain(order.iter().map(|o| &o.field)) {
+                want(f, &win_names, &mut base)?;
+            }
+            if win_names.contains(&as_field.as_str()) {
+                return None;
+            }
+            win_names.push(as_field.as_str());
+        }
+        for f in fields.iter().chain(sort.map(|(f, _)| f)) {
+            let leaf = f.leaf()?;
+            if !win_names.contains(&leaf) {
+                want(f, &[], &mut base)?;
+            }
+        }
+        if base.iter().any(|b| b.leaf().is_some_and(|l| win_names.contains(&l))) {
+            return None;
+        }
+
+        let mut steps = Vec::with_capacity(3);
+        if let Some(p) = filter {
+            steps.push(Step::Filter(p.clone()));
+        }
+        steps.push(Step::Project(base.clone()));
+        steps.push(Step::Take { n: None });
+        let base_q = Query {
+            source: q.source.clone(),
+            steps,
+            explain: None,
+            ignore_filter: q.ignore_filter,
+        };
+        let batch = self.try_filter_project_batch(&base_q, bindings, now)?;
+        let n = batch.n();
+        let cols: Vec<Vec<Cell>> = batch.cols.into_iter().map(Column::into_cells).collect();
+        let col_of = |f: &Field| -> Option<usize> {
+            let leaf = f.leaf()?;
+            base.iter().position(|b| b.leaf() == Some(leaf))
+        };
+
+        static NULL: Cell = Cell::Null;
+        // Current row sequence -> row of the base batch; window outputs follow the sequence.
+        let mut seq_rows: Vec<u32> = (0..n as u32).collect();
+        let mut win_cols: Vec<Vec<Cell>> = Vec::with_capacity(windows.len());
+        for w in &windows {
+            let Step::Window {
+                func,
+                field,
+                by,
+                order,
+                frame,
+                ..
+            } = w
+            else {
+                return None;
+            };
+            let by_cols: Vec<usize> = by.iter().map(col_of).collect::<Option<_>>()?;
+            let order_cols: Vec<(usize, bool)> = order
+                .iter()
+                .map(|o| col_of(&o.field).map(|c| (c, o.desc)))
+                .collect::<Option<_>>()?;
+            let target_col = match field {
+                Some(f) => Some(col_of(f)?),
+                None => None,
+            };
+            let cell = |c: usize, pos: u32| -> &Cell { &cols[c][seq_rows[pos as usize] as usize] };
+
+            // Partitions in first-seen order, laid out back to back in one buffer (`flat`):
+            // each row gets a partition slot, then a counting pass places positions, which
+            // keeps the source order inside a partition.
+            let mut bounds: Vec<u32> = Vec::new();
+            let mut flat: Vec<u32> = Vec::with_capacity(n);
+            if by_cols.is_empty() {
+                flat.extend(0..n as u32);
+                bounds.extend([0, n as u32]);
+            } else {
+                let mut slots: Vec<u32> = Vec::with_capacity(n);
+                let mut counts: Vec<u32> = Vec::new();
+                let mut assign = |slot: u32, counts: &mut Vec<u32>| {
+                    if slot as usize == counts.len() {
+                        counts.push(0);
+                    }
+                    counts[slot as usize] += 1;
+                    slots.push(slot);
+                };
+                if let [c] = by_cols[..] {
+                    let mut slot_of: FxHashMap<&Cell, u32> = FxHashMap::default();
+                    for pos in 0..n as u32 {
+                        let next = slot_of.len() as u32;
+                        let slot = *slot_of.entry(cell(c, pos)).or_insert(next);
+                        assign(slot, &mut counts);
+                    }
+                } else {
+                    let mut slot_of: FxHashMap<smallvec::SmallVec<[&Cell; 2]>, u32> =
+                        FxHashMap::default();
+                    for pos in 0..n as u32 {
+                        let key: smallvec::SmallVec<[&Cell; 2]> =
+                            by_cols.iter().map(|&c| cell(c, pos)).collect();
+                        let next = slot_of.len() as u32;
+                        let slot = *slot_of.entry(key).or_insert(next);
+                        assign(slot, &mut counts);
+                    }
+                }
+                bounds.reserve(counts.len() + 1);
+                let mut acc = 0u32;
+                for &c in &counts {
+                    bounds.push(acc);
+                    acc += c;
+                }
+                bounds.push(acc);
+                let mut next_at: Vec<u32> = bounds[..counts.len()].to_vec();
+                flat.resize(n, 0);
+                for (pos, &slot) in slots.iter().enumerate() {
+                    let at = &mut next_at[slot as usize];
+                    flat[*at as usize] = pos as u32;
+                    *at += 1;
+                }
+            }
+
+            let mut out: Vec<Cell> = Vec::with_capacity(n);
+            let mut ties: Vec<bool> = Vec::new();
+            let mut tv: Vec<&Cell> = Vec::new();
+            let has_order = !order_cols.is_empty();
+            for range in bounds.windows(2) {
+                let part = &mut flat[range[0] as usize..range[1] as usize];
+                if has_order && part.len() > 1 {
+                    // Stable, like the row sort.
+                    part.sort_by(|&a, &b| {
+                        for &(c, desc) in &order_cols {
+                            let ord = super::eval::cmp_sort(cell(c, a), cell(c, b));
+                            let ord = if desc { ord.reverse() } else { ord };
+                            if ord != std::cmp::Ordering::Equal {
+                                return ord;
+                            }
+                        }
+                        std::cmp::Ordering::Equal
+                    });
+                }
+                ties.clear();
+                if has_order && part.len() > 1 {
+                    ties.push(false);
+                    for w2 in part.windows(2) {
+                        ties.push(order_cols.iter().all(|&(c, _)| {
+                            super::eval::cmp_sort(cell(c, w2[0]), cell(c, w2[1]))
+                                == std::cmp::Ordering::Equal
+                        }));
+                    }
+                }
+                tv.clear();
+                match target_col {
+                    Some(c) => tv.extend(part.iter().map(|&pos| cell(c, pos))),
+                    None => tv.resize(part.len(), &NULL),
+                }
+                out.extend(super::eval::window_values(
+                    func,
+                    &tv,
+                    &ties,
+                    has_order,
+                    target_col.is_some(),
+                    frame.as_ref(),
+                ));
+            }
+            let new_seq = flat;
+            // Re-sequence: earlier window outputs move with their rows.
+            for wc in &mut win_cols {
+                let mut moved = Vec::with_capacity(n);
+                for &pos in &new_seq {
+                    moved.push(std::mem::replace(&mut wc[pos as usize], Cell::Null));
+                }
+                *wc = moved;
+            }
+            seq_rows = new_seq.iter().map(|&pos| seq_rows[pos as usize]).collect();
+            win_cols.push(out);
+        }
+
+        // `sort` after the windows: a stable sort of the final sequence by one key, which
+        // may be a window output. Ties keep the window order, as in the row pipeline.
+        if let Some((sort_field, desc)) = sort {
+            let leaf = sort_field.leaf()?;
+            let win_key = win_names.iter().position(|w| *w == leaf);
+            let base_key = match win_key {
+                Some(_) => None,
+                None => Some(col_of(sort_field)?),
+            };
+            let key = |pos: u32| -> &Cell {
+                match (win_key, base_key) {
+                    (Some(wi), _) => &win_cols[wi][pos as usize],
+                    (None, Some(c)) => &cols[c][seq_rows[pos as usize] as usize],
+                    (None, None) => &NULL,
+                }
+            };
+            let mut perm: Vec<u32> = (0..n as u32).collect();
+            perm.sort_by(|&a, &b| {
+                let ord = super::eval::cmp_sort(key(a), key(b));
+                if desc { ord.reverse() } else { ord }
+            });
+            for wc in &mut win_cols {
+                let mut moved = Vec::with_capacity(n);
+                for &pos in &perm {
+                    moved.push(std::mem::replace(&mut wc[pos as usize], Cell::Null));
+                }
+                *wc = moved;
+            }
+            seq_rows = perm.iter().map(|&pos| seq_rows[pos as usize]).collect();
+        }
+
+        let names = field_names(fields);
+        let names_arc: Arc<[String]> = names.into();
+        let mut result = RecordBatch::with_capacity(names_arc, n);
+        for (ci, f) in fields.iter().enumerate() {
+            let leaf = f.leaf()?;
+            if let Some(wi) = win_names.iter().position(|w| *w == leaf) {
+                for cell in &win_cols[wi] {
+                    result.cols[ci].push(cell.clone_for_borrow());
+                }
+            } else {
+                let c = col_of(f)?;
+                for &row in &seq_rows {
+                    result.cols[ci].push(cols[c][row as usize].clone_for_borrow());
+                }
+            }
+        }
+        finish_batch(&mut result, skip_n, Some(take));
+        Some(result)
     }
 
     /// Columnar filter? + project + skip*/take? (no join). Prefer [`Self::run_prepared_batch`].
@@ -517,6 +813,7 @@ impl Db {
                         handles.push(scope.spawn(move || {
                             let mut local_batch =
                                 RecordBatch::with_capacity(names_arc_clone, c_end - c_start);
+                            let mut slots = filter.map(super::eval::PredSlots::new);
                             for pos in c_start..c_end {
                                 let idx = match source_ref {
                                     JoinLeftSource::Idxs(idxs) => idxs[pos],
@@ -526,8 +823,8 @@ impl Db {
                                     continue;
                                 };
                                 if need_filter
-                                    && let Some(pred) = filter
-                                    && !eval_pred(pred, row, now)
+                                    && let Some(slots) = slots.as_mut()
+                                    && !slots.eval(row, now)
                                 {
                                     continue;
                                 }
@@ -554,6 +851,7 @@ impl Db {
         }
 
         let mut batch = RecordBatch::with_capacity(names_arc, left_len);
+        let mut slots = filter.map(super::eval::PredSlots::new);
         let mut pos = 0usize;
         loop {
             let idx = match &source {
@@ -578,8 +876,8 @@ impl Db {
                 continue;
             };
             if need_filter
-                && let Some(pred) = filter
-                && !eval_pred(pred, row, now)
+                && let Some(slots) = slots.as_mut()
+                && !slots.eval(row, now)
             {
                 continue;
             }
@@ -741,13 +1039,14 @@ impl Db {
             Some(build_right_probe(rights, &right_fields))
         } else {
             let mut needed: FxHashSet<&str> = FxHashSet::default();
+            let mut slots = filter.map(super::eval::PredSlots::new);
             for i in 0..left_len {
                 let idx = match &source {
                     JoinLeftSource::Idxs(idxs) => idxs[i],
                     JoinLeftSource::Scan { .. } => i,
                 };
                 if let Some(row) = self.store.get_by_idx(left_name, idx)
-                    && (!need_filter || filter.is_none_or(|p| eval_pred(p, row, now)))
+                    && (!need_filter || slots.as_mut().is_none_or(|s| s.eval(row, now)))
                     && let Some(k) = row.get(on).and_then(Cell::text)
                 {
                     needed.insert(k);
@@ -772,6 +1071,7 @@ impl Db {
         let names_arc: Arc<[String]> = names.clone().into();
         let mut batch = RecordBatch::with_capacity(names_arc, left_len);
         let mut cell_buf: smallvec::SmallVec<[Cell; 8]> = smallvec::SmallVec::new();
+        let mut slots = filter.map(super::eval::PredSlots::new);
         let mut pos = 0usize;
         loop {
             let idx = match &source {
@@ -796,8 +1096,8 @@ impl Db {
                 continue;
             };
             if need_filter
-                && let Some(pred) = filter
-                && !eval_pred(pred, left_row, now)
+                && let Some(slots) = slots.as_mut()
+                && !slots.eval(left_row, now)
             {
                 continue;
             }
@@ -954,9 +1254,10 @@ impl Db {
         let mut memo: FxHashMap<&str, Option<smallvec::SmallVec<[Cell; 8]>>> = FxHashMap::default();
 
         let mut batch = RecordBatch::with_capacity(names_arc, left_rows.len());
+        let mut slots = row_filter.map(super::eval::PredSlots::new);
         for left_row in left_rows {
-            if let Some(pred) = row_filter
-                && !eval_pred(pred, left_row, now)
+            if let Some(slots) = slots.as_mut()
+                && !slots.eval(left_row, now)
             {
                 continue;
             }
@@ -1086,6 +1387,7 @@ impl Db {
                         handles.push(scope.spawn(move || {
                             let mut local_batch =
                                 RecordBatch::with_capacity(names_arc_clone, c_end - c_start);
+                            let mut slots = filter.map(super::eval::PredSlots::new);
                             if fast_id_email_total {
                                 for pos in c_start..c_end {
                                     let idx = match source_ref {
@@ -1099,12 +1401,12 @@ impl Db {
                                         if orders_total[idx] <= min {
                                             continue;
                                         }
-                                    } else if need_row_filter && let Some(pred) = filter {
+                                    } else if need_row_filter && let Some(slots) = slots.as_mut() {
                                         let Some(left_row) = self.store.get_by_idx("orders", idx)
                                         else {
                                             continue;
                                         };
-                                        if !eval_pred(pred, left_row, now) {
+                                        if !slots.eval(left_row, now) {
                                             continue;
                                         }
                                     }
@@ -1138,12 +1440,12 @@ impl Db {
                                         if orders_total[idx] <= min {
                                             continue;
                                         }
-                                    } else if need_row_filter && let Some(pred) = filter {
+                                    } else if need_row_filter && let Some(slots) = slots.as_mut() {
                                         let Some(left_row) = self.store.get_by_idx("orders", idx)
                                         else {
                                             continue;
                                         };
-                                        if !eval_pred(pred, left_row, now) {
+                                        if !slots.eval(left_row, now) {
                                             continue;
                                         }
                                     }
@@ -1208,6 +1510,7 @@ impl Db {
             }
         }
 
+        let mut slots = filter.map(super::eval::PredSlots::new);
         let mut pos = 0usize;
         if fast_id_email_total {
             loop {
@@ -1236,11 +1539,11 @@ impl Db {
                     if orders_total[idx] <= min {
                         continue;
                     }
-                } else if need_row_filter && let Some(pred) = filter {
+                } else if need_row_filter && let Some(slots) = slots.as_mut() {
                     let Some(left_row) = self.store.get_by_idx("orders", idx) else {
                         continue;
                     };
-                    if !eval_pred(pred, left_row, now) {
+                    if !slots.eval(left_row, now) {
                         continue;
                     }
                 }
@@ -1287,11 +1590,11 @@ impl Db {
                 if orders_total[idx] <= min {
                     continue;
                 }
-            } else if need_row_filter && let Some(pred) = filter {
+            } else if need_row_filter && let Some(slots) = slots.as_mut() {
                 let Some(left_row) = self.store.get_by_idx("orders", idx) else {
                     continue;
                 };
-                if !eval_pred(pred, left_row, now) {
+                if !slots.eval(left_row, now) {
                     continue;
                 }
             }
@@ -1351,6 +1654,110 @@ impl Db {
 
         if left.is_empty() {
             return Ok(Vec::new());
+        }
+
+        // Cold right side: probe the disk engine instead of materializing the whole
+        // collection in memory.
+        if self.store.is_disk_backed(right_col)
+            && let Some(eng) = self.store.disk_engine_read()
+        {
+            let over_quota = |n: usize| -> Result<(), Error> {
+                if n > self.quotas.max_join_expansion {
+                    return Err(Error::runtime(format!(
+                        "Cartesian join expansion {} exceeds max_join_expansion quota {}",
+                        n, self.quotas.max_join_expansion
+                    )));
+                }
+                Ok(())
+            };
+            if to_field == "id" {
+                // Every distinct key is looked up once, in one batch ordered by position
+                // on disk.
+                let keys: Vec<Arc<str>> = left
+                    .iter()
+                    .filter_map(|l| l.get(on).and_then(Cell::text).map(Arc::from))
+                    .collect();
+                let found = eng.get_many_by_id(right_col, keys.iter().map(|k| &**k))?;
+                let mut out = Vec::with_capacity(left.len());
+                for l in left {
+                    let right = l.get(on).and_then(Cell::text).and_then(|k| found.get(k));
+                    match right {
+                        Some(r) => out.push(merge_join_row(l, r, right_col)),
+                        None if left_join => out.push(l),
+                        None => {}
+                    }
+                    over_quota(out.len())?;
+                }
+                return Ok(out);
+            }
+            // Non-id key: one streaming pass keeps only the right rows some left row needs.
+            let needed_keys: FxHashSet<String> = left
+                .iter()
+                .filter_map(|l| l.get(on).and_then(cell_key))
+                .collect();
+            if needed_keys.is_empty() {
+                return Ok(if left_join { left } else { Vec::new() });
+            }
+            let mut idx: FxHashMap<String, Vec<Row>> = FxHashMap::default();
+            let mut keep = |r: &Row| {
+                if let Some(k) = cell_key(r.get(to_field).unwrap_or(&Cell::Null))
+                    && needed_keys.contains(&k)
+                {
+                    idx.entry(k).or_default().push(r.clone());
+                }
+            };
+            // Text keys in a bounded number: push `key in [...]` into the scan, so segments
+            // are filtered on the key column (dictionary codes, secondary index) and only
+            // matching rows are materialized.
+            const MAX_PUSHED_KEYS: usize = 4096;
+            let text_keys: Option<Vec<crate::ast::Value>> = (needed_keys.len() <= MAX_PUSHED_KEYS
+                && left.iter().all(|l| match l.get(on) {
+                    None | Some(Cell::Null | Cell::Text(_) | Cell::SmallText(_)) => true,
+                    Some(_) => false,
+                }))
+            .then(|| {
+                needed_keys
+                    .iter()
+                    .map(|k| crate::ast::Value::String(Arc::from(k.as_str())))
+                    .collect()
+            });
+            match text_keys {
+                Some(values) => {
+                    let pred = Pred::In {
+                        field: Field::name(to_field),
+                        values,
+                    };
+                    for r in eng.query_filter(right_col, Some(&pred), None, None, 0)? {
+                        keep(&r);
+                    }
+                }
+                // Any other key set: one pass over the key column alone, materializing
+                // only the rows some left row joins to.
+                None => eng.scan_by_key_set(right_col, to_field, &needed_keys, |r| {
+                    keep(&r);
+                    Ok(true)
+                })?,
+            }
+            let mut out = Vec::with_capacity(left.len());
+            for mut l in left {
+                let hits = l.get(on).and_then(cell_key).and_then(|k| idx.get(&k));
+                match hits {
+                    Some(rs) => {
+                        for (i, r) in rs.iter().enumerate() {
+                            let base = if i + 1 == rs.len() {
+                                std::mem::take(&mut l)
+                            } else {
+                                l.clone()
+                            };
+                            out.push(merge_join_row(base, r, right_col));
+                            over_quota(out.len())?;
+                        }
+                    }
+                    None if left_join => out.push(l),
+                    None => {}
+                }
+            }
+            return Ok(out);
         }
 
         if to_field == "id" {

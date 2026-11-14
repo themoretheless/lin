@@ -793,6 +793,8 @@ struct JoinLin {
     orders_q: LinQueryable,
     agg_sum: lin::Prepared,
     agg_sum_by: lin::Prepared,
+    window_sum: lin::Prepared,
+    window_rank: lin::Prepared,
 }
 
 fn seed_join_lin() -> JoinLin {
@@ -844,6 +846,24 @@ fn seed_join_lin() -> JoinLin {
     let agg_sum_by = db
         .prepare(r#"orders | sum total by user_id"#)
         .expect("lin prepare agg_sum_by");
+    let window_sum = db
+        .prepare(
+            r#"orders | window sum total by user_id sort id asc as running | pick { id, running } | take all"#,
+        )
+        .expect("lin prepare window_sum");
+    let window_rank = db
+        .prepare(
+            r#"orders | window rank by user_id sort total desc as rnk | pick { id, rnk } | take all"#,
+        )
+        .expect("lin prepare window_rank");
+    assert_eq!(
+        window_sum.run(&mut db).expect("lin window_sum sanity").done.n,
+        JOIN_ORDERS
+    );
+    assert_eq!(
+        window_rank.run(&mut db).expect("lin window_rank sanity").done.n,
+        JOIN_ORDERS
+    );
     JoinLin {
         db,
         inner,
@@ -853,6 +873,8 @@ fn seed_join_lin() -> JoinLin {
         orders_q,
         agg_sum,
         agg_sum_by,
+        window_sum,
+        window_rank,
     }
 }
 
@@ -1813,6 +1835,8 @@ struct LinColdWarm {
     filter_range: lin::Prepared,
     text_substr: lin::Prepared,
     range_project: lin::Prepared,
+    update_1row: lin::Prepared,
+    delete_1row: lin::Prepared,
 }
 
 fn seed_lin_cold(n: usize) -> LinColdWarm {
@@ -1874,6 +1898,18 @@ fn seed_lin_cold(n: usize) -> LinColdWarm {
     let range_project = db
         .prepare(r#"docs | ts > ago 7d | { id, title } | take all"#)
         .expect("lin cold prepare range_project");
+    let update_1row = db
+        .prepare(&format!(
+            r#"update docs[id == "{}"] cas each {{ title: "updated title" }}"#,
+            escape_lin(probe_id)
+        ))
+        .expect("lin cold prepare update_1row");
+    let delete_1row = db
+        .prepare(&format!(
+            r#"delete docs[id == "{}"] cas each"#,
+            escape_lin(probe_id)
+        ))
+        .expect("lin cold prepare delete_1row");
     assert_eq!(
         lin_hits(&filter_range.run(&mut db).expect("lin cold filter_range sanity")),
         (n / 2) as i64
@@ -1916,6 +1952,8 @@ fn seed_lin_cold(n: usize) -> LinColdWarm {
         filter_range,
         text_substr,
         range_project,
+        update_1row,
+        delete_1row,
     }
 }
 
@@ -1930,6 +1968,11 @@ fn seed_sqlite_cold(n: usize) -> SqlColdWarm {
     let dir = fresh_tmp("sqlite_cold");
     let path = dir.0.join("cold.sqlite");
     let conn = rusqlite::Connection::open(&path).expect("sqlite cold open");
+    conn.execute_batch(
+        "PRAGMA synchronous = FULL;
+         PRAGMA journal_mode = DELETE;",
+    )
+    .expect("sqlite cold pragma");
     conn.execute_batch(
         "CREATE TABLE docs (
             id TEXT PRIMARY KEY,
@@ -1961,12 +2004,22 @@ fn seed_sqlite_cold(n: usize) -> SqlColdWarm {
         let _ = conn.prepare_cached("SELECT COUNT(*) FROM docs WHERE wing = 'rag'");
         let _ = conn.prepare_cached("SELECT wing, COUNT(*) FROM docs GROUP BY wing");
         let _ = conn.prepare_cached("SELECT id, title FROM docs WHERE wing = 'rag'");
+        let _ = conn.prepare_cached("UPDATE docs SET title = 'updated title' WHERE id = ?1");
+        let _ = conn.prepare_cached("DELETE FROM docs WHERE id = ?1");
     }
     SqlColdWarm {
         _dir: dir,
         probe_id: rows[PROBE].id.clone(),
         conn,
     }
+}
+
+fn seed_sqlite_cold_fullsync(n: usize) -> SqlColdWarm {
+    let s = seed_sqlite_cold(n);
+    s.conn
+        .execute_batch("PRAGMA fullfsync = ON;")
+        .expect("sqlite cold fullfsync");
+    s
 }
 
 struct DuckColdWarm {
@@ -2866,6 +2919,115 @@ fn main() -> airbug_bench::Result<()> {
             black_box(sum)
         })
         .tag("agg")
+        .tag("duckdb")
+        .parameter("orders", JOIN_ORDERS)
+        .work_units("rows", JOIN_ORDERS as u64);
+
+    suite
+        .bench_fixture("window_running_sum/lin", lin_join.clone(), |s| {
+            black_box(s.window_sum.run(&mut s.db).expect("lin window_running_sum").done.n)
+        })
+        .tag("window")
+        .tag("lin")
+        .parameter("orders", JOIN_ORDERS)
+        .work_units("rows", JOIN_ORDERS as u64);
+    suite
+        .bench_fixture("window_running_sum/lin_batch", lin_join.clone(), |s| {
+            black_box(s.window_sum.run_batch(&mut s.db).expect("lin window_running_sum batch").n())
+        })
+        .tag("window")
+        .tag("lin")
+        .parameter("orders", JOIN_ORDERS)
+        .work_units("rows", JOIN_ORDERS as u64);
+    suite
+        .bench_fixture("window_running_sum/sqlite", sql_join.clone(), |s| {
+            let mut stmt = s
+                .conn
+                .prepare_cached("SELECT id, SUM(total) OVER (PARTITION BY user_id ORDER BY id) FROM orders")
+                .expect("sqlite window_running_sum prep");
+            let mut rows = stmt.query([]).expect("sqlite window_running_sum");
+            let mut n = 0usize;
+            while let Some(row) = rows.next().expect("sqlite window_running_sum row") {
+                let _id: String = row.get(0).expect("id");
+                let _v: f64 = row.get(1).expect("v");
+                n += 1;
+            }
+            black_box(n)
+        })
+        .tag("window")
+        .tag("sqlite")
+        .parameter("orders", JOIN_ORDERS)
+        .work_units("rows", JOIN_ORDERS as u64);
+    suite
+        .bench_fixture("window_running_sum/duckdb", duck_join.clone(), |s| {
+            let mut stmt = s
+                .conn
+                .prepare_cached("SELECT id, SUM(total) OVER (PARTITION BY user_id ORDER BY id) FROM orders")
+                .expect("duckdb window_running_sum prep");
+            let mut rows = stmt.query([]).expect("duckdb window_running_sum");
+            let mut n = 0usize;
+            while let Some(row) = rows.next().expect("duckdb window_running_sum row") {
+                let _id: String = row.get(0).expect("id");
+                let _v: f64 = row.get(1).expect("v");
+                n += 1;
+            }
+            black_box(n)
+        })
+        .tag("window")
+        .tag("duckdb")
+        .parameter("orders", JOIN_ORDERS)
+        .work_units("rows", JOIN_ORDERS as u64);
+    suite
+        .bench_fixture("window_rank/lin", lin_join.clone(), |s| {
+            black_box(s.window_rank.run(&mut s.db).expect("lin window_rank").done.n)
+        })
+        .tag("window")
+        .tag("lin")
+        .parameter("orders", JOIN_ORDERS)
+        .work_units("rows", JOIN_ORDERS as u64);
+    suite
+        .bench_fixture("window_rank/lin_batch", lin_join.clone(), |s| {
+            black_box(s.window_rank.run_batch(&mut s.db).expect("lin window_rank batch").n())
+        })
+        .tag("window")
+        .tag("lin")
+        .parameter("orders", JOIN_ORDERS)
+        .work_units("rows", JOIN_ORDERS as u64);
+    suite
+        .bench_fixture("window_rank/sqlite", sql_join.clone(), |s| {
+            let mut stmt = s
+                .conn
+                .prepare_cached("SELECT id, RANK() OVER (PARTITION BY user_id ORDER BY total DESC) FROM orders")
+                .expect("sqlite window_rank prep");
+            let mut rows = stmt.query([]).expect("sqlite window_rank");
+            let mut n = 0usize;
+            while let Some(row) = rows.next().expect("sqlite window_rank row") {
+                let _id: String = row.get(0).expect("id");
+                let _v: i64 = row.get(1).expect("v");
+                n += 1;
+            }
+            black_box(n)
+        })
+        .tag("window")
+        .tag("sqlite")
+        .parameter("orders", JOIN_ORDERS)
+        .work_units("rows", JOIN_ORDERS as u64);
+    suite
+        .bench_fixture("window_rank/duckdb", duck_join.clone(), |s| {
+            let mut stmt = s
+                .conn
+                .prepare_cached("SELECT id, RANK() OVER (PARTITION BY user_id ORDER BY total DESC) FROM orders")
+                .expect("duckdb window_rank prep");
+            let mut rows = stmt.query([]).expect("duckdb window_rank");
+            let mut n = 0usize;
+            while let Some(row) = rows.next().expect("duckdb window_rank row") {
+                let _id: String = row.get(0).expect("id");
+                let _v: i64 = row.get(1).expect("v");
+                n += 1;
+            }
+            black_box(n)
+        })
+        .tag("window")
         .tag("duckdb")
         .parameter("orders", JOIN_ORDERS)
         .work_units("rows", JOIN_ORDERS as u64);
@@ -3824,30 +3986,26 @@ fn main() -> airbug_bench::Result<()> {
         .parameter("orders", JOIN_ORDERS)
         .work_units("rows", JOIN_ORDERS as u64);
 
-    // One-row durable mutations on a 10k-row cold table. Lin must keep `docs` on disk.
-    // Note: both engines sync every commit, but SQLite's default `fsync` on Apple
-    // platforms is weaker than Lin's `F_FULLFSYNC`, so absolute times mostly reflect that.
-    let probe_id = docs(COLD_QUERY_N)[PROBE].id.clone();
+    // One-row durable mutations on a 10k-row cold table. Lin keeps `docs` on disk.
+    // On Darwin:
+    // - Lin (`SyncMode::Full`) flushes with `fcntl(F_BARRIERFSYNC)`.
+    // - Bundled upstream SQLite's default `PRAGMA synchronous = FULL` (`fullfsync = OFF`) calls
+    //   plain `fsync(2)` without a drive barrier (`cold_*_1row_10k/sqlite`), while
+    //   `sqlite_fullfsync` sets `PRAGMA fullfsync = ON` for barrier/full-sync durability.
+    // - DuckDB uses its default checkpointed WAL sync.
     {
-        let update_src = format!(
-            r#"update docs[id == "{}"] cas each {{ title: "updated title" }}"#,
-            escape_lin(&probe_id)
-        );
-        let delete_src = format!(r#"delete docs[id == "{}"] cas each"#, escape_lin(&probe_id));
-        let id_for_check = probe_id.clone();
         suite
             .bench_checked(
                 "cold_update_1row_10k/lin",
                 || seed_lin_cold(COLD_QUERY_N),
-                move |s| {
+                |s| {
                     assert!(s.db.store.is_disk_backed("docs"), "docs cold before update");
-                    s.db.run(&update_src).expect("lin cold update").done.n
+                    s.update_1row.execute(&mut s.db).expect("lin cold update").n
                 },
-                move |s, n| {
+                |s, n| {
                     assert_eq!(*n, 1);
                     assert!(s.db.store.is_disk_backed("docs"), "update promoted docs");
                     assert_eq!(s.db.stats().docs, COLD_QUERY_N);
-                    let _ = &id_for_check;
                     Ok(())
                 },
                 DropPolicy::OutsideTiming,
@@ -3860,9 +4018,9 @@ fn main() -> airbug_bench::Result<()> {
             .bench_checked(
                 "cold_delete_1row_10k/lin",
                 || seed_lin_cold(COLD_QUERY_N),
-                move |s| {
+                |s| {
                     assert!(s.db.store.is_disk_backed("docs"), "docs cold before delete");
-                    s.db.run(&delete_src).expect("lin cold delete").done.n
+                    s.delete_1row.execute(&mut s.db).expect("lin cold delete").n
                 },
                 |s, n| {
                     assert_eq!(*n, 1);
@@ -3881,11 +4039,11 @@ fn main() -> airbug_bench::Result<()> {
                 "cold_update_1row_10k/sqlite",
                 || seed_sqlite_cold(COLD_QUERY_N),
                 |s| {
-                    s.conn
-                        .execute(
-                            "UPDATE docs SET title = 'updated title' WHERE id = ?1",
-                            rusqlite::params![s.probe_id],
-                        )
+                    let mut stmt = s
+                        .conn
+                        .prepare_cached("UPDATE docs SET title = 'updated title' WHERE id = ?1")
+                        .expect("sqlite cold prepare update");
+                    stmt.execute(rusqlite::params![s.probe_id])
                         .expect("sqlite cold update")
                 },
                 |_, n| {
@@ -3903,11 +4061,11 @@ fn main() -> airbug_bench::Result<()> {
                 "cold_delete_1row_10k/sqlite",
                 || seed_sqlite_cold(COLD_QUERY_N),
                 |s| {
-                    s.conn
-                        .execute(
-                            "DELETE FROM docs WHERE id = ?1",
-                            rusqlite::params![s.probe_id],
-                        )
+                    let mut stmt = s
+                        .conn
+                        .prepare_cached("DELETE FROM docs WHERE id = ?1")
+                        .expect("sqlite cold prepare delete");
+                    stmt.execute(rusqlite::params![s.probe_id])
                         .expect("sqlite cold delete")
                 },
                 |_, n| {
@@ -3919,6 +4077,94 @@ fn main() -> airbug_bench::Result<()> {
             .tag("cold")
             .tag("delete")
             .tag("sqlite")
+            .parameter("n", COLD_QUERY_N);
+        suite
+            .bench_checked(
+                "cold_update_1row_10k/duckdb",
+                || seed_duck_cold(COLD_QUERY_N),
+                |s| {
+                    let mut stmt = s
+                        .conn
+                        .prepare_cached("UPDATE docs SET title = 'updated title' WHERE id = ?")
+                        .expect("duckdb cold prepare update");
+                    stmt.execute(duckdb::params![s.probe_id])
+                        .expect("duckdb cold update")
+                },
+                |_, n| {
+                    assert_eq!(*n, 1);
+                    Ok(())
+                },
+                DropPolicy::OutsideTiming,
+            )
+            .tag("cold")
+            .tag("update")
+            .tag("duckdb")
+            .parameter("n", COLD_QUERY_N);
+        suite
+            .bench_checked(
+                "cold_delete_1row_10k/duckdb",
+                || seed_duck_cold(COLD_QUERY_N),
+                |s| {
+                    let mut stmt = s
+                        .conn
+                        .prepare_cached("DELETE FROM docs WHERE id = ?")
+                        .expect("duckdb cold prepare delete");
+                    stmt.execute(duckdb::params![s.probe_id])
+                        .expect("duckdb cold delete")
+                },
+                |_, n| {
+                    assert_eq!(*n, 1);
+                    Ok(())
+                },
+                DropPolicy::OutsideTiming,
+            )
+            .tag("cold")
+            .tag("delete")
+            .tag("duckdb")
+            .parameter("n", COLD_QUERY_N);
+        suite
+            .bench_checked(
+                "cold_update_1row_10k/sqlite_fullfsync",
+                || seed_sqlite_cold_fullsync(COLD_QUERY_N),
+                |s| {
+                    let mut stmt = s
+                        .conn
+                        .prepare_cached("UPDATE docs SET title = 'updated title' WHERE id = ?1")
+                        .expect("sqlite cold fullfsync prepare update");
+                    stmt.execute(rusqlite::params![s.probe_id])
+                        .expect("sqlite cold fullfsync update")
+                },
+                |_, n| {
+                    assert_eq!(*n, 1);
+                    Ok(())
+                },
+                DropPolicy::OutsideTiming,
+            )
+            .tag("cold")
+            .tag("update")
+            .tag("sqlite_fullfsync")
+            .parameter("n", COLD_QUERY_N);
+        suite
+            .bench_checked(
+                "cold_delete_1row_10k/sqlite_fullfsync",
+                || seed_sqlite_cold_fullsync(COLD_QUERY_N),
+                |s| {
+                    let mut stmt = s
+                        .conn
+                        .prepare_cached("DELETE FROM docs WHERE id = ?1")
+                        .expect("sqlite cold fullfsync prepare delete");
+                    stmt.execute(rusqlite::params![s.probe_id])
+                        .expect("sqlite cold fullfsync delete")
+                },
+                |_, n| {
+                    assert_eq!(*n, 1);
+                    Ok(())
+                },
+                DropPolicy::OutsideTiming,
+            )
+            .tag("cold")
+            .tag("delete")
+            .tag("sqlite_fullfsync")
             .parameter("n", COLD_QUERY_N);
     }
 

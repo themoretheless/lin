@@ -45,6 +45,11 @@ use crate::store::{Cell, InlineStr, Row};
 
 pub const DISK_DIR_MAGIC: &[u8; 8] = b"LINDISK\x01";
 pub const MANIFEST_FILE: &str = "manifest.json";
+/// On-disk format written by this build. Version 3 added `cluster_by` in table schemas
+/// and per-column `.zmap` files; version 2 manifests are read and upgraded on the next
+/// manifest write. A writable open refuses a newer version, because rewriting the
+/// manifest would silently drop whatever that format added.
+pub const DISK_FORMAT_VERSION: u32 = 3;
 pub const WAL_FILE: &str = "wal.log";
 pub const TOMBSTONES_FILE: &str = "tombstones.bin";
 pub const SEGMENTS_DIR: &str = "segments";
@@ -166,6 +171,239 @@ fn read_seg_cell(
     })
 }
 
+/// A predicate compiled against one segment. Typed leaves read raw column data, so a row
+/// is decided without decoding cells or building a `Row`; a subtree the columnar kernels
+/// cannot reproduce (block-compressed text, regex, word match, nested fields, mixed-type
+/// comparisons) stays a [`SegPred::Slow`] leaf evaluated by `eval_pred` over the
+/// predicate's columns, and only for rows the typed part has not already decided.
+/// Semantics mirror `eval_pred`, including nulls: comparisons, `in` and `~` are false on
+/// a null, `!=` and `not` of those are true.
+enum SegPred<'s> {
+    Const(bool),
+    And(Box<SegPred<'s>>, Box<SegPred<'s>>),
+    Or(Box<SegPred<'s>>, Box<SegPred<'s>>),
+    Not(Box<SegPred<'s>>),
+    Cmp(&'s columns::MmapFixedCol, crate::ast::CmpOp, columns::FixedRhs),
+    DictEq(&'s columns::MmapDictCol, u16),
+    DictSet(&'s columns::MmapDictCol, Vec<bool>),
+    FixedIsNull(&'s columns::MmapFixedCol),
+    DictIsNull(&'s columns::MmapDictCol),
+    Slow(&'s crate::ast::Pred),
+}
+
+impl SegPred<'_> {
+    fn eval(&self, rid: u32, slow: &mut SlowRow<'_>) -> bool {
+        match self {
+            SegPred::Const(b) => *b,
+            SegPred::And(a, b) => a.eval(rid, slow) && b.eval(rid, slow),
+            SegPred::Or(a, b) => a.eval(rid, slow) || b.eval(rid, slow),
+            SegPred::Not(inner) => !inner.eval(rid, slow),
+            SegPred::Cmp(fc, op, rhs) => fc.cmp_at(rid, *op, *rhs),
+            SegPred::DictEq(dc, code) => dc.code_at(rid) == *code,
+            SegPred::DictSet(dc, allowed) => allowed
+                .get(dc.code_at(rid) as usize)
+                .copied()
+                .unwrap_or(false),
+            SegPred::FixedIsNull(fc) => fc.is_null(rid),
+            SegPred::DictIsNull(dc) => dc.code_at(rid) == DICT_NULL_CODE,
+            SegPred::Slow(p) => slow.eval(p, rid),
+        }
+    }
+
+    fn has_slow(&self) -> bool {
+        match self {
+            SegPred::Slow(_) => true,
+            SegPred::And(a, b) | SegPred::Or(a, b) => a.has_slow() || b.has_slow(),
+            SegPred::Not(inner) => inner.has_slow(),
+            _ => false,
+        }
+    }
+}
+
+/// Decoded predicate columns of one row, for the [`SegPred::Slow`] leaves. The row is
+/// decoded at most once per `rid`, and only when a slow leaf is actually reached. A
+/// decode error is parked in `err` (the leaf then reports no match); the scan checks it
+/// after every evaluation.
+struct SlowRow<'a> {
+    seg: &'a DiskSegment,
+    /// (column name, position in the segment) of the predicate's columns present here.
+    pos: Vec<(&'a str, usize)>,
+    scratch: Row,
+    blocks: Vec<Option<(u32, Arc<[u8]>)>>,
+    loaded: Option<u32>,
+    err: Option<Error>,
+    now_ms: i64,
+}
+
+impl<'a> SlowRow<'a> {
+    fn new(seg: &'a DiskSegment, pred_cols: &[&'a str], now_ms: i64) -> Self {
+        let pos: Vec<(&'a str, usize)> = pred_cols
+            .iter()
+            .filter_map(|&f| seg.col_pos.get(f).map(|&p| (f, p)))
+            .collect();
+        let mut scratch = Row::new();
+        for &(f, _) in &pos {
+            scratch.insert(f.to_string(), Cell::Null);
+        }
+        let blocks = vec![None; pos.len()];
+        Self {
+            seg,
+            pos,
+            scratch,
+            blocks,
+            loaded: None,
+            err: None,
+            now_ms,
+        }
+    }
+
+    fn eval(&mut self, pred: &crate::ast::Pred, rid: u32) -> bool {
+        if self.loaded != Some(rid) {
+            self.loaded = None;
+            for (ci, &(f, pos)) in self.pos.iter().enumerate() {
+                match read_seg_cell(self.seg, pos, rid, &mut self.blocks[ci]) {
+                    Ok(cell) => {
+                        if let Some(slot) = self.scratch.get_mut(f) {
+                            *slot = cell;
+                        }
+                    }
+                    Err(e) => {
+                        self.err = Some(e);
+                        return false;
+                    }
+                }
+            }
+            self.loaded = Some(rid);
+        }
+        crate::exec::eval_pred(pred, &self.scratch, self.now_ms)
+    }
+
+    /// The decoded value of predicate column `f`, when this row has been decoded.
+    fn cell(&self, f: &str, rid: u32) -> Option<Cell> {
+        if self.loaded == Some(rid) {
+            self.scratch.get(f).cloned()
+        } else {
+            None
+        }
+    }
+}
+
+/// Compile `pred` against `seg`. Subtrees with a leaf the columnar kernels cannot decide
+/// become [`SegPred::Slow`]; under `and` / `or` the typed side is evaluated first, so the
+/// slow side only runs for rows the typed side leaves undecided.
+fn compile_seg_pred<'s>(
+    seg: &'s DiskSegment,
+    pred: &'s crate::ast::Pred,
+    now_ms: i64,
+) -> SegPred<'s> {
+    use crate::ast::Pred;
+    let pair = |a: &'s Pred, b: &'s Pred| {
+        let (l, r) = (
+            compile_seg_pred(seg, a, now_ms),
+            compile_seg_pred(seg, b, now_ms),
+        );
+        // Evaluation has no side effects, so the cheaper typed side may go first.
+        if l.has_slow() && !r.has_slow() {
+            (Box::new(r), Box::new(l))
+        } else {
+            (Box::new(l), Box::new(r))
+        }
+    };
+    match pred {
+        Pred::And(a, b) => {
+            let (l, r) = pair(a, b);
+            SegPred::And(l, r)
+        }
+        Pred::Or(a, b) => {
+            let (l, r) = pair(a, b);
+            SegPred::Or(l, r)
+        }
+        Pred::Not(inner) => SegPred::Not(Box::new(compile_seg_pred(seg, inner, now_ms))),
+        leaf => compile_seg_leaf(seg, leaf, now_ms).unwrap_or(SegPred::Slow(leaf)),
+    }
+}
+
+/// `None` when the leaf needs decoded cells (block-compressed text, regex, word match,
+/// nested fields, or a comparison whose types the columnar kernels do not reproduce).
+fn compile_seg_leaf<'s>(
+    seg: &'s DiskSegment,
+    pred: &'s crate::ast::Pred,
+    now_ms: i64,
+) -> Option<SegPred<'s>> {
+    use crate::ast::{CmpOp, Pred, Value};
+    let negate = |p: SegPred<'s>| SegPred::Not(Box::new(p));
+    Some(match pred {
+        Pred::Cmp { field, op, value } => match seg.col(field.leaf()?) {
+            // Every value is null here: only `!=` holds.
+            None => SegPred::Const(*op == CmpOp::Ne),
+            Some(MmapCol::Fixed(fc)) => {
+                let rhs = fc.fixed_rhs(&crate::exec::value_cell(value, now_ms))?;
+                match op {
+                    // `cmp_at` is false on null, but `null != x` is true.
+                    CmpOp::Ne => negate(SegPred::Cmp(fc, CmpOp::Eq, rhs)),
+                    _ => SegPred::Cmp(fc, *op, rhs),
+                }
+            }
+            Some(MmapCol::Dict(dc)) => {
+                let Value::String(want) = value else {
+                    return None;
+                };
+                let eq = match dc.find_code(want) {
+                    Some(code) => SegPred::DictEq(dc, code),
+                    None => SegPred::Const(false),
+                };
+                match op {
+                    CmpOp::Eq => eq,
+                    CmpOp::Ne => negate(eq),
+                    _ => return None,
+                }
+            }
+            Some(_) => return None,
+        },
+        Pred::In { field, values } => {
+            let texts: Vec<&str> = values
+                .iter()
+                .map(|v| match v {
+                    Value::String(s) => Some(s.as_ref()),
+                    _ => None,
+                })
+                .collect::<Option<_>>()?;
+            match seg.col(field.leaf()?) {
+                None => SegPred::Const(false),
+                Some(MmapCol::Dict(dc)) => {
+                    SegPred::DictSet(dc, TextSet::AnyOf(texts).allowed_codes(dc))
+                }
+                Some(_) => return None,
+            }
+        }
+        Pred::Contains { field, needle } => match seg.col(field.leaf()?) {
+            None => SegPred::Const(false),
+            Some(MmapCol::Dict(dc)) => {
+                SegPred::DictSet(dc, TextSet::Contains(needle.as_str()).allowed_codes(dc))
+            }
+            Some(_) => return None,
+        },
+        Pred::IsNull { field, negated } => {
+            let is_null = match seg.col(field.leaf()?) {
+                None => SegPred::Const(true),
+                Some(MmapCol::Fixed(fc)) => SegPred::FixedIsNull(fc),
+                Some(MmapCol::Dict(dc)) => SegPred::DictIsNull(dc),
+                Some(_) => return None,
+            };
+            if *negated { negate(is_null) } else { is_null }
+        }
+        _ => return None,
+    })
+}
+
+/// One matching row of a filtered scan.
+enum ScanHit<'a> {
+    /// Requested columns, positionally (`Cell::Null` when absent).
+    Cells(&'a [&'a str], &'a mut SmallVec<[Cell; 8]>),
+    /// The whole row.
+    Row(Row),
+}
+
 /// Top-level `AND` conjuncts of a predicate that can be evaluated on raw column data.
 struct PredTerms<'a> {
     /// `leaf <range-op> value`: a zone-map block whose min/max cannot satisfy one of them
@@ -250,6 +488,117 @@ fn zone_prunable_terms(pred: &crate::ast::Pred, now_ms: i64) -> PredTerms<'_> {
     };
     walk(pred, now_ms, &mut out);
     out
+}
+
+/// Position of a resumable scan ([`DiskEngine::scan_chunk`]).
+#[derive(Debug, Default, Clone)]
+pub(crate) struct DiskScanPos {
+    seg: usize,
+    rid: u32,
+    mem: usize,
+    done: bool,
+}
+
+/// Zone-map pruning plan of a predicate for one segment: which blocks provably hold no
+/// matching row. Each node answers two questions about a block from min/max and the null
+/// count alone: `none` (no row matches) and `all` (every row matches). `and` has no match
+/// when either side has none, `or` only when both have none, and `not` swaps the two
+/// answers, so ranges prune under any nesting of `and` / `or` / `not`, and `!=` prunes a
+/// block whose every value equals the literal. Anything min/max cannot decide answers
+/// "unknown" to both.
+enum ZonePrune<'s> {
+    Never,
+    Term(&'s columns::MmapFixedCol, crate::ast::CmpOp, Cell),
+    /// `is null` on a fixed-width column (`is not null` is `Not` of it).
+    IsNull(&'s columns::MmapFixedCol),
+    And(Vec<ZonePrune<'s>>),
+    Or(Vec<ZonePrune<'s>>),
+    Not(Box<ZonePrune<'s>>),
+}
+
+impl<'s> ZonePrune<'s> {
+    fn compile(seg: &'s DiskSegment, pred: &crate::ast::Pred, now_ms: i64) -> Self {
+        let tree = Self::build(seg, pred, now_ms);
+        // A tree with no decidable leaf can never skip: drop it so the scan does not
+        // walk it for every block.
+        if tree.has_term() { tree } else { ZonePrune::Never }
+    }
+
+    fn build(seg: &'s DiskSegment, pred: &crate::ast::Pred, now_ms: i64) -> Self {
+        use crate::ast::Pred;
+        match pred {
+            Pred::And(a, b) => {
+                let mut parts = Vec::new();
+                for side in [a, b] {
+                    match Self::build(seg, side, now_ms) {
+                        ZonePrune::And(inner) => parts.extend(inner),
+                        other => parts.push(other),
+                    }
+                }
+                ZonePrune::And(parts)
+            }
+            Pred::Or(a, b) => {
+                let mut parts = Vec::new();
+                for side in [a, b] {
+                    match Self::build(seg, side, now_ms) {
+                        ZonePrune::Or(inner) => parts.extend(inner),
+                        other => parts.push(other),
+                    }
+                }
+                ZonePrune::Or(parts)
+            }
+            Pred::Not(inner) => ZonePrune::Not(Box::new(Self::build(seg, inner, now_ms))),
+            Pred::IsNull { field, negated } => {
+                match field.leaf().and_then(|name| seg.fixed_col(name)) {
+                    Some(fc) if *negated => ZonePrune::Not(Box::new(ZonePrune::IsNull(fc))),
+                    Some(fc) => ZonePrune::IsNull(fc),
+                    None => ZonePrune::Never,
+                }
+            }
+            Pred::Cmp { field, op, value } => {
+                match field.leaf().and_then(|name| seg.fixed_col(name)) {
+                    Some(fc) => {
+                        ZonePrune::Term(fc, *op, crate::exec::value_cell(value, now_ms))
+                    }
+                    None => ZonePrune::Never,
+                }
+            }
+            _ => ZonePrune::Never,
+        }
+    }
+
+    fn has_term(&self) -> bool {
+        match self {
+            ZonePrune::Never => false,
+            ZonePrune::Term(..) | ZonePrune::IsNull(_) => true,
+            ZonePrune::And(parts) | ZonePrune::Or(parts) => parts.iter().any(Self::has_term),
+            ZonePrune::Not(inner) => inner.has_term(),
+        }
+    }
+
+    /// No row of block `bi` matches.
+    fn skips(&self, bi: usize) -> bool {
+        match self {
+            ZonePrune::Never => false,
+            ZonePrune::Term(fc, op, rhs) => fc.zone_block_relation(bi, *op, rhs).0,
+            ZonePrune::IsNull(fc) => fc.zone_block_null_relation(bi).0,
+            ZonePrune::And(parts) => parts.iter().any(|p| p.skips(bi)),
+            ZonePrune::Or(parts) => parts.iter().all(|p| p.skips(bi)),
+            ZonePrune::Not(inner) => inner.all(bi),
+        }
+    }
+
+    /// Every row of block `bi` matches.
+    fn all(&self, bi: usize) -> bool {
+        match self {
+            ZonePrune::Never => false,
+            ZonePrune::Term(fc, op, rhs) => fc.zone_block_relation(bi, *op, rhs).1,
+            ZonePrune::IsNull(fc) => fc.zone_block_null_relation(bi).1,
+            ZonePrune::And(parts) => parts.iter().all(|p| p.all(bi)),
+            ZonePrune::Or(parts) => parts.iter().any(|p| p.all(bi)),
+            ZonePrune::Not(inner) => inner.skips(bi),
+        }
+    }
 }
 
 /// Below this many rows a per-segment parallel scan costs more than it saves.
@@ -530,10 +879,20 @@ impl DiskEngine {
         let manifest_path = dir.join(MANIFEST_FILE);
         let manifest: DiskManifest = if manifest_path.exists() {
             let bytes = fs::read(&manifest_path).map_err(io_err)?;
-            serde_json::from_slice(&bytes).map_err(io_err)?
+            let m: DiskManifest = serde_json::from_slice(&bytes).map_err(io_err)?;
+            if m.version > DISK_FORMAT_VERSION {
+                return Err(Error::runtime(format!(
+                    "disk format version {} in '{}' is newer than this build supports ({}); \
+                     open it read-only or upgrade lin",
+                    m.version,
+                    dir.display(),
+                    DISK_FORMAT_VERSION
+                )));
+            }
+            m
         } else {
             let m = DiskManifest {
-                version: 2,
+                version: DISK_FORMAT_VERSION,
                 generation: 0,
                 next_seg_id: 1,
                 embed_id: "nomic-embed-text/768".into(),
@@ -887,7 +1246,9 @@ impl DiskEngine {
                                     DiskColKind::VecF32Sq8 { dim } if dim == v.len() as u32
                                 )
                             } else {
-                                false
+                                // A fraction arriving in an integer column widens it.
+                                existing.kind == DiskColKind::Int64
+                                    && matches!(cell, Cell::Float(_))
                             }
                         }
                     }
@@ -909,6 +1270,10 @@ impl DiskEngine {
                                 existing.kind = DiskColKind::VecF32Sq8 {
                                     dim: v.len() as u32,
                                 };
+                            } else if existing.kind == DiskColKind::Int64
+                                && matches!(cell, Cell::Float(_))
+                            {
+                                existing.kind = DiskColKind::Float64;
                             }
                         } else {
                             let kind = match cell {
@@ -1742,7 +2107,15 @@ impl DiskEngine {
         fs::rename(&tomb_tmp, self.dir.join(TOMBSTONES_FILE)).map_err(io_err)?;
 
         let man_tmp = self.dir.join("manifest.json.tmp");
-        let man_bytes = serde_json::to_vec_pretty(&self.manifest).map_err(io_err)?;
+        let man_bytes = if self.manifest.version < DISK_FORMAT_VERSION {
+            // Stamp the format actually written without mutating the in-memory manifest
+            // of a `&self` engine; the next open reads the upgraded version.
+            let mut upgraded = self.manifest.clone();
+            upgraded.version = DISK_FORMAT_VERSION;
+            serde_json::to_vec_pretty(&upgraded).map_err(io_err)?
+        } else {
+            serde_json::to_vec_pretty(&self.manifest).map_err(io_err)?
+        };
         fs::write(&man_tmp, man_bytes).map_err(io_err)?;
         fs::rename(&man_tmp, self.dir.join(MANIFEST_FILE)).map_err(io_err)?;
         Ok(())
@@ -2137,6 +2510,72 @@ impl DiskEngine {
         })
     }
 
+    /// [`Self::get_by_id`] for many keys at once. Keys found in the memtable or the hot
+    /// cache are answered from there; the rest are located through each segment's primary
+    /// index (newest segment first, tombstoned rows skipped, as in `get_by_id`), then
+    /// materialized in `(segment, row)` order, so rows sharing a compressed text block
+    /// decode it once instead of once per key. Absent and deleted keys have no entry.
+    pub fn get_many_by_id<'k>(
+        &self,
+        table: &str,
+        ids: impl IntoIterator<Item = &'k str>,
+    ) -> Result<FxHashMap<&'k str, Row>, Error> {
+        let mut out: FxHashMap<&'k str, Row> = FxHashMap::default();
+        let mut pending: Vec<&'k str> = Vec::new();
+        let mt = self.memtables.get(table);
+        for id in ids {
+            if out.contains_key(id) {
+                continue;
+            }
+            if let Some(mt) = mt {
+                if mt.deleted_ids.contains(id) {
+                    continue;
+                }
+                if let Some(&idx) = mt.by_id.get(id) {
+                    out.insert(id, mt.rows[idx].clone());
+                    continue;
+                }
+            }
+            if let Some(cached) = self.hot_cache.get_row(table, id) {
+                out.insert(id, (*cached).clone());
+                continue;
+            }
+            pending.push(id);
+        }
+        let Some(segs) = self.segments.get(table) else {
+            return Ok(out);
+        };
+        pending.sort_unstable();
+        pending.dedup();
+        let mut located: Vec<(usize, u32, &'k str)> = Vec::with_capacity(pending.len());
+        for id in pending {
+            with_text_index_key(id, |kbuf| {
+                for (pos, seg) in segs.iter().enumerate().rev() {
+                    let sid = seg.meta.seg_id;
+                    let mut live_rid = None;
+                    seg.pk_index.for_each_key(kbuf, |rid| {
+                        if !self.tombstones.is_dead(sid, rid) {
+                            live_rid = Some(rid);
+                            return false;
+                        }
+                        true
+                    });
+                    if let Some(rid) = live_rid {
+                        located.push((pos, rid, id));
+                        return;
+                    }
+                }
+            });
+        }
+        located.sort_unstable_by_key(|&(pos, rid, _)| (pos, rid));
+        for (pos, rid, id) in located {
+            let row = segs[pos].materialize_row(rid)?;
+            self.hot_cache.put_row(table, id, Arc::new(row.clone()));
+            out.insert(id, row);
+        }
+        Ok(out)
+    }
+
     pub fn get_arc_by_id(&self, table: &str, id: &str) -> Result<Option<Arc<Row>>, Error> {
         if let Some(mt) = self.memtables.get(table) {
             if mt.deleted_ids.contains(id) {
@@ -2525,6 +2964,122 @@ impl DiskEngine {
         Ok(())
     }
 
+    /// Index lookup with a residual predicate and late materialization: candidates come
+    /// from the secondary index on `field` exactly as in
+    /// [`Self::for_each_by_eq_projected`], but a segment row is decided by the compiled
+    /// predicate first (raw column data, plus the predicate's own columns for slow
+    /// leaves) and its output columns are decoded only when it matches. `seen_seg` /
+    /// `seen_mem` drop a row reached again through another key. Returns `Ok(false)` when
+    /// `visit` asked to stop.
+    #[allow(clippy::too_many_arguments)]
+    fn index_eq_late(
+        &self,
+        table: &str,
+        field: &str,
+        key: &Cell,
+        pred: &crate::ast::Pred,
+        pred_cols: &[&str],
+        out_fields: Option<&[&str]>,
+        now_ms: i64,
+        seen_seg: &mut FxHashSet<(u64, u32)>,
+        seen_mem: &mut FxHashSet<usize>,
+        mut visit: impl FnMut(Row) -> bool,
+    ) -> Result<bool, Error> {
+        let mut kbuf = Vec::with_capacity(64);
+        if !encode_index_cell_key(key, &mut kbuf) {
+            return Ok(true);
+        }
+        if let Some(mt) = self.memtables.get(table) {
+            let mut on_mem = |idx: usize, row: &Row| -> bool {
+                if !seen_mem.insert(idx) || !crate::exec::eval_pred(pred, row, now_ms) {
+                    return true;
+                }
+                visit(match out_fields {
+                    None => row.clone(),
+                    Some(fs) => {
+                        let mut pr = Row::new();
+                        for &f in fs {
+                            if let Some(c) = row.get(f) {
+                                pr.insert(f.to_string(), c.clone());
+                            }
+                        }
+                        pr
+                    }
+                })
+            };
+            if let Some(fmap) = mt.sec.get(field) {
+                if let Some(idxs) = fmap.get(&kbuf) {
+                    for &idx in idxs {
+                        if !mt.dead_mem.contains(&idx) && !on_mem(idx, &mt.rows[idx]) {
+                            return Ok(false);
+                        }
+                    }
+                }
+            } else {
+                for (idx, row) in mt.rows.iter().enumerate() {
+                    if !mt.dead_mem.contains(&idx)
+                        && row.get(field) == Some(key)
+                        && !on_mem(idx, row)
+                    {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+        if let Some(segs) = self.segments.get(table) {
+            for seg in segs {
+                let sid = seg.meta.seg_id;
+                let compiled = compile_seg_pred(seg, pred, now_ms);
+                let mut slow = SlowRow::new(
+                    seg,
+                    if compiled.has_slow() { pred_cols } else { &[] },
+                    now_ms,
+                );
+                let mut check = |rid: u32| -> Result<bool, Error> {
+                    if !seen_seg.insert((sid, rid)) {
+                        return Ok(true);
+                    }
+                    let hit = compiled.eval(rid, &mut slow);
+                    if let Some(e) = slow.err.take() {
+                        return Err(e);
+                    }
+                    if !hit {
+                        return Ok(true);
+                    }
+                    Ok(visit(match out_fields {
+                        Some(fs) => seg.materialize_projected(rid, fs)?,
+                        None => seg.materialize_row(rid)?,
+                    }))
+                };
+                if let Some(sec_idx) = seg.sec_indexes.get(field) {
+                    let mut matches = Vec::new();
+                    sec_idx.for_each_key(&kbuf, |rid| {
+                        if !self.tombstones.is_dead(sid, rid) {
+                            matches.push(rid);
+                        }
+                        true
+                    });
+                    matches.sort_unstable();
+                    for rid in matches {
+                        if !check(rid)? {
+                            return Ok(false);
+                        }
+                    }
+                } else {
+                    for rid in 0..seg.meta.row_count {
+                        if !self.tombstones.is_dead(sid, rid)
+                            && seg.get_cell(rid, field)? == *key
+                            && !check(rid)?
+                        {
+                            return Ok(false);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(true)
+    }
+
     /// True when `pred` can be answered through a secondary or primary-key index; such
     /// predicates are better served by [`Self::query_filter`] than by a column scan.
     pub(crate) fn has_index_pushdown(&self, table: &str, pred: &crate::ast::Pred, now_ms: i64) -> bool {
@@ -2572,6 +3127,27 @@ impl DiskEngine {
         now_ms: i64,
         mut emit: impl FnMut(&[&str], &mut SmallVec<[Cell; 8]>) -> bool,
     ) -> Result<(), Error> {
+        self.scan_filter_core(table, pred, pred_cols, Some(out_cols), now_ms, |hit| match hit {
+            ScanHit::Cells(cols, cells) => emit(cols, cells),
+            ScanHit::Row(_) => true,
+        })
+    }
+
+    /// Core of the filtered scans: the predicate is decided from its own columns first
+    /// (zone maps, dictionary codes, raw fixed-width values, or `eval_pred` over just those
+    /// columns), and only matching rows are decoded — as positional cells for `out_cols`,
+    /// or as whole rows when `out_cols` is `None`.
+    fn scan_filter_core(
+        &self,
+        table: &str,
+        pred: Option<&crate::ast::Pred>,
+        pred_cols: &[&str],
+        out_cols: Option<&[&str]>,
+        now_ms: i64,
+        mut emit: impl FnMut(ScanHit<'_>) -> bool,
+    ) -> Result<(), Error> {
+        let full_rows = out_cols.is_none();
+        let out_cols: &[&str] = out_cols.unwrap_or(&[]);
         // No predicate is the degenerate "exact, no terms" case: every live row matches.
         let terms = match pred {
             Some(p) => zone_prunable_terms(p, now_ms),
@@ -2582,7 +3158,6 @@ impl DiskEngine {
                 exact: true,
             },
         };
-        let zone_terms = &terms.ranges;
         // One cell per output column, `Cell::Null` for an absent value.
         let mut out_cells: SmallVec<[Cell; 8]> = SmallVec::new();
         if let Some(segs) = self.segments.get(table) {
@@ -2590,123 +3165,82 @@ impl DiskEngine {
                 let sid = seg.meta.seg_id;
                 let n = seg.meta.row_count as usize;
                 let has_dead = self.tombstones.dead_count(sid) > 0;
-                // Text equalities against dictionary columns become code comparisons; a
-                // segment whose dictionary (or schema) lacks the value cannot match at all.
-                let mut dict_eqs: Vec<(&columns::MmapDictCol, u16)> = Vec::new();
-                let mut eqs_typed = true;
+                // Segment pruning from top-level conjuncts: a text equality / `in` / `~` whose
+                // column is missing here, or whose value no dictionary entry satisfies, rules
+                // the whole segment out.
                 for &(f, want) in &terms.text_eqs {
                     match seg.col(f) {
                         None => continue 'segments,
-                        Some(MmapCol::Dict(dc)) => match dc.find_code(want) {
-                            Some(code) => dict_eqs.push((dc, code)),
-                            None => continue 'segments,
-                        },
-                        Some(_) => eqs_typed = false,
+                        Some(MmapCol::Dict(dc)) if dc.find_code(want).is_none() => {
+                            continue 'segments;
+                        }
+                        Some(_) => {}
                     }
                 }
-                let mut dict_sets: Vec<(&columns::MmapDictCol, Vec<bool>)> = Vec::new();
                 for (f, set) in &terms.text_sets {
                     match seg.col(f) {
-                        // No column: every value is null, which matches neither term.
                         None => continue 'segments,
-                        Some(MmapCol::Dict(dc)) => {
-                            let allowed = set.allowed_codes(dc);
-                            if !allowed.iter().any(|&a| a) {
-                                continue 'segments;
-                            }
-                            dict_sets.push((dc, allowed));
+                        Some(MmapCol::Dict(dc)) if !set.allowed_codes(dc).iter().any(|&a| a) => {
+                            continue 'segments;
                         }
-                        Some(_) => eqs_typed = false,
+                        Some(_) => {}
                     }
                 }
-                // When the predicate is nothing but range comparisons over fixed-width
-                // columns and text equalities over dictionary columns of this segment,
-                // evaluate it on the raw column values.
-                let typed: Option<Vec<(&columns::MmapFixedCol, crate::ast::CmpOp, columns::FixedRhs)>> =
-                    if terms.exact && eqs_typed {
-                        zone_terms
-                            .iter()
-                            .map(|(f, op, rhs)| {
-                                let fc = seg.fixed_col(f)?;
-                                Some((fc, *op, fc.fixed_rhs(rhs)?))
-                            })
-                            .collect()
-                    } else {
-                        None
-                    };
-                let pred_pos: Vec<(&str, usize)> = if typed.is_some() {
-                    Vec::new()
-                } else {
-                    pred_cols
-                        .iter()
-                        .filter_map(|&f| seg.col_pos.get(f).map(|&p| (f, p)))
-                        .collect()
+                // Compile the predicate against this segment's columns: leaves decided from
+                // raw column data (fixed-width values, dictionary codes, null flags) are
+                // typed, the rest fall back to `eval_pred` over just the predicate's columns,
+                // subtree by subtree.
+                let compiled: SegPred<'_> = match pred {
+                    None => SegPred::Const(true),
+                    Some(p) => compile_seg_pred(seg, p, now_ms),
                 };
-                // (name, column position, already decoded into `scratch` for the predicate)
+                let mut slow = SlowRow::new(
+                    seg,
+                    if compiled.has_slow() { pred_cols } else { &[] },
+                    now_ms,
+                );
+                // (name, column position, may already be decoded for the predicate)
                 let out_pos: Vec<(&str, Option<usize>, bool)> = out_cols
                     .iter()
                     .map(|&f| {
                         let pos = seg.col_pos.get(f).copied();
-                        (f, pos, pred_pos.iter().any(|&(pf, _)| pf == f))
+                        (f, pos, slow.pos.iter().any(|&(pf, _)| pf == f))
                     })
                     .collect();
-                let seg_zone_terms: Vec<(&columns::MmapFixedCol, crate::ast::CmpOp, &Cell)> =
-                    zone_terms
-                        .iter()
-                        .filter_map(|(f, op, rhs)| seg.fixed_col(f).map(|fc| (fc, *op, rhs)))
-                        .collect();
-                let mut scratch = Row::new();
-                for &(f, _) in &pred_pos {
-                    scratch.insert(f.to_string(), Cell::Null);
-                }
-                let mut pred_blocks: Vec<Option<(u32, Arc<[u8]>)>> = vec![None; pred_pos.len()];
+                let zone_prune = match pred {
+                    Some(p) => ZonePrune::compile(seg, p, now_ms),
+                    None => ZonePrune::Never,
+                };
                 let mut out_blocks: Vec<Option<(u32, Arc<[u8]>)>> = vec![None; out_pos.len()];
                 let mut start = 0usize;
                 while start < n {
                     let end = (start + columns::ZONE_BLOCK_ROWS).min(n);
                     let bi = start / columns::ZONE_BLOCK_ROWS;
-                    let skip = seg_zone_terms
-                        .iter()
-                        .any(|(fc, op, rhs)| fc.zone_block_skips(bi, *op, rhs));
+                    let skip = zone_prune.skips(bi);
                     if !skip {
                         for idx in start..end {
                             let rid = idx as u32;
                             if has_dead && self.tombstones.is_dead(sid, rid) {
                                 continue;
                             }
-                            let hit = match &typed {
-                                Some(ranges) => {
-                                    dict_eqs.iter().all(|(dc, code)| dc.code_at(rid) == *code)
-                                        && dict_sets.iter().all(|(dc, allowed)| {
-                                            allowed
-                                                .get(dc.code_at(rid) as usize)
-                                                .copied()
-                                                .unwrap_or(false)
-                                        })
-                                        && ranges
-                                            .iter()
-                                            .all(|(fc, op, rhs)| fc.cmp_at(rid, *op, *rhs))
-                                }
-                                None => {
-                                    for (ci, &(f, pos)) in pred_pos.iter().enumerate() {
-                                        let cell =
-                                            read_seg_cell(seg, pos, rid, &mut pred_blocks[ci])?;
-                                        if let Some(slot) = scratch.get_mut(f) {
-                                            *slot = cell;
-                                        }
-                                    }
-                                    pred.is_none_or(|p| {
-                                        crate::exec::eval_pred(p, &scratch, now_ms)
-                                    })
-                                }
-                            };
+                            let hit = compiled.eval(rid, &mut slow);
+                            if let Some(e) = slow.err.take() {
+                                return Err(e);
+                            }
                             if !hit {
+                                continue;
+                            }
+                            if full_rows {
+                                if !emit(ScanHit::Row(seg.materialize_row(rid)?)) {
+                                    return Ok(());
+                                }
                                 continue;
                             }
                             out_cells.clear();
                             for (ci, &(f, pos, in_scratch)) in out_pos.iter().enumerate() {
-                                let cell = if in_scratch {
-                                    scratch.get(f).cloned().unwrap_or(Cell::Null)
+                                let decoded = if in_scratch { slow.cell(f, rid) } else { None };
+                                let cell = if let Some(cell) = decoded {
+                                    cell
                                 } else if let Some(p) = pos {
                                     read_seg_cell(seg, p, rid, &mut out_blocks[ci])?
                                 } else {
@@ -2714,7 +3248,7 @@ impl DiskEngine {
                                 };
                                 out_cells.push(cell);
                             }
-                            if !emit(out_cols, &mut out_cells) {
+                            if !emit(ScanHit::Cells(out_cols, &mut out_cells)) {
                                 return Ok(());
                             }
                         }
@@ -2734,11 +3268,226 @@ impl DiskEngine {
                 if pred.is_some_and(|p| !crate::exec::eval_pred(p, src, now_ms)) {
                     continue;
                 }
+                if full_rows {
+                    if !emit(ScanHit::Row(src.clone())) {
+                        return Ok(());
+                    }
+                    continue;
+                }
                 out_cells.clear();
                 for &f in out_cols {
                     out_cells.push(src.get(f).cloned().unwrap_or(Cell::Null));
                 }
-                if !emit(out_cols, &mut out_cells) {
+                if !emit(ScanHit::Cells(out_cols, &mut out_cells)) {
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Resumable filtered scan: appends up to `max` matching rows starting at `pos` and
+    /// advances `pos`, so a cursor can pull a cold collection chunk by chunk without
+    /// materializing it. Same visibility and order as the one-shot scans: segments in
+    /// order (tombstoned rows skipped, zone-map blocks pruned), then the memtable.
+    pub(crate) fn scan_chunk(
+        &self,
+        table: &str,
+        pred: Option<&crate::ast::Pred>,
+        fields: Option<&[&str]>,
+        now_ms: i64,
+        pos: &mut DiskScanPos,
+        max: usize,
+    ) -> Result<Vec<Row>, Error> {
+        let mut out: Vec<Row> = Vec::new();
+        if pos.done || max == 0 {
+            return Ok(out);
+        }
+        let project = |row: &Row| -> Row {
+            match fields {
+                Some(fs) => fs
+                    .iter()
+                    .filter_map(|&f| row.get(f).map(|c| (f, c.clone())))
+                    .collect(),
+                None => row.clone(),
+            }
+        };
+        let segs: &[Arc<DiskSegment>] =
+            self.segments.get(table).map(Vec::as_slice).unwrap_or(&[]);
+        // Leaf column names of the predicate; `None` when it touches a nested field.
+        let pred_cols: Option<Vec<&str>> = pred.and_then(|p| {
+            let mut pfields = Vec::new();
+            p.walk_fields(&mut pfields);
+            let mut cols: Vec<&str> = Vec::with_capacity(pfields.len());
+            for pf in &pfields {
+                let name = pf.leaf()?;
+                if !cols.contains(&name) {
+                    cols.push(name);
+                }
+            }
+            Some(cols)
+        });
+        while pos.seg < segs.len() {
+            let seg = &segs[pos.seg];
+            let sid = seg.meta.seg_id;
+            let n = seg.meta.row_count as usize;
+            let has_dead = self.tombstones.dead_count(sid) > 0;
+            let compiled: SegPred<'_> = match pred {
+                None => SegPred::Const(true),
+                Some(p) => compile_seg_pred(seg, p, now_ms),
+            };
+            // Slow leaves decode only the predicate's columns; with a nested field in the
+            // predicate the whole row is decoded and checked instead.
+            let typed: Option<&SegPred<'_>> = match (&pred_cols, compiled.has_slow()) {
+                (_, false) | (Some(_), true) => Some(&compiled),
+                (None, true) => None,
+            };
+            let mut slow = SlowRow::new(
+                seg,
+                match &pred_cols {
+                    Some(cols) if compiled.has_slow() => cols,
+                    _ => &[],
+                },
+                now_ms,
+            );
+            let zone = match pred {
+                Some(p) => ZonePrune::compile(seg, p, now_ms),
+                None => ZonePrune::Never,
+            };
+            while (pos.rid as usize) < n {
+                let idx = pos.rid as usize;
+                let bi = idx / columns::ZONE_BLOCK_ROWS;
+                if idx % columns::ZONE_BLOCK_ROWS == 0 && zone.skips(bi) {
+                    pos.rid = ((bi + 1) * columns::ZONE_BLOCK_ROWS).min(n) as u32;
+                    continue;
+                }
+                pos.rid += 1;
+                let rid = idx as u32;
+                if has_dead && self.tombstones.is_dead(sid, rid) {
+                    continue;
+                }
+                let row = match (&typed, pred) {
+                    (Some(compiled), _) => {
+                        let hit = compiled.eval(rid, &mut slow);
+                        if let Some(e) = slow.err.take() {
+                            return Err(e);
+                        }
+                        if !hit {
+                            continue;
+                        }
+                        match fields {
+                            Some(fs) => seg.materialize_projected(rid, fs)?,
+                            None => seg.materialize_row(rid)?,
+                        }
+                    }
+                    (None, Some(p)) => {
+                        let full = seg.materialize_row(rid)?;
+                        if !crate::exec::eval_pred(p, &full, now_ms) {
+                            continue;
+                        }
+                        if fields.is_some() { project(&full) } else { full }
+                    }
+                    (None, None) => continue,
+                };
+                out.push(row);
+                if out.len() >= max {
+                    return Ok(out);
+                }
+            }
+            pos.seg += 1;
+            pos.rid = 0;
+        }
+        if let Some(mt) = self.memtables.get(table) {
+            let mut idxs: Vec<usize> = mt.by_id.values().copied().collect();
+            idxs.sort_unstable();
+            while pos.mem < idxs.len() {
+                let idx = idxs[pos.mem];
+                pos.mem += 1;
+                if mt.dead_mem.contains(&idx) {
+                    continue;
+                }
+                let src = &mt.rows[idx];
+                if pred.is_some_and(|p| !crate::exec::eval_pred(p, src, now_ms)) {
+                    continue;
+                }
+                out.push(project(src));
+                if out.len() >= max {
+                    return Ok(out);
+                }
+            }
+        }
+        pos.done = true;
+        Ok(out)
+    }
+
+    /// Whole rows whose `field` value is one of `keys`, compared the way a join compares
+    /// keys: text as is, an integer by its decimal form, anything else never matches.
+    /// Only the key column is decoded per row (dictionary codes are decided once per
+    /// segment); a row is materialized when it matches. Same order as
+    /// [`Self::scan_projected`]: segments, then the memtable.
+    pub(crate) fn scan_by_key_set(
+        &self,
+        table: &str,
+        field: &str,
+        keys: &FxHashSet<String>,
+        mut emit: impl FnMut(Row) -> Result<bool, Error>,
+    ) -> Result<(), Error> {
+        // Integer keys in their canonical decimal form, so an integer column is matched
+        // without formatting every value.
+        let int_keys: FxHashSet<i64> = keys
+            .iter()
+            .filter_map(|k| k.parse::<i64>().ok().filter(|n| n.to_string() == *k))
+            .collect();
+        let is_wanted = |cell: &Cell| -> bool {
+            match cell {
+                Cell::Int(n) => int_keys.contains(n),
+                other => other.text().is_some_and(|t| keys.contains(t)),
+            }
+        };
+        if let Some(segs) = self.segments.get(table) {
+            for seg in segs {
+                let Some(&pos) = seg.col_pos.get(field) else {
+                    continue;
+                };
+                let sid = seg.meta.seg_id;
+                let has_dead = self.tombstones.dead_count(sid) > 0;
+                let dict: Option<(&columns::MmapDictCol, Vec<bool>)> = match &seg.cols[pos].1 {
+                    MmapCol::Dict(dc) => Some((
+                        dc,
+                        dc.strings.iter().map(|s| keys.contains(s.as_ref())).collect(),
+                    )),
+                    _ => None,
+                };
+                if dict.as_ref().is_some_and(|(_, allowed)| !allowed.iter().any(|&a| a)) {
+                    continue;
+                }
+                let mut block: Option<(u32, Arc<[u8]>)> = None;
+                for rid in 0..seg.meta.row_count {
+                    if has_dead && self.tombstones.is_dead(sid, rid) {
+                        continue;
+                    }
+                    let hit = match &dict {
+                        Some((dc, allowed)) => allowed
+                            .get(dc.code_at(rid) as usize)
+                            .copied()
+                            .unwrap_or(false),
+                        None => is_wanted(&read_seg_cell(seg, pos, rid, &mut block)?),
+                    };
+                    if hit && !emit(seg.materialize_row(rid)?)? {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        if let Some(mt) = self.memtables.get(table) {
+            let mut idxs: Vec<usize> = mt.by_id.values().copied().collect();
+            idxs.sort_unstable();
+            for idx in idxs {
+                if mt.dead_mem.contains(&idx) {
+                    continue;
+                }
+                let row = &mt.rows[idx];
+                if row.get(field).is_some_and(&is_wanted) && !emit(row.clone())? {
                     return Ok(());
                 }
             }
@@ -4144,6 +4893,55 @@ impl DiskEngine {
                 return Ok(out);
             }
 
+            // A residual predicate over a secondary index: decide each candidate from the
+            // predicate's own columns and decode the output only for rows that pass. Worth
+            // it when the output is wider than the predicate (whole rows included);
+            // otherwise the cached lookup below already decodes no more than it must.
+            let has_residual = !matches!(
+                p,
+                crate::ast::Pred::Cmp { .. } | crate::ast::Pred::In { .. }
+            );
+            if has_residual && idx_field != "id" {
+                let mut pfields = Vec::new();
+                p.walk_fields(&mut pfields);
+                let mut pred_cols: Vec<&str> = Vec::with_capacity(pfields.len());
+                let mut all_leaf = true;
+                for pf in &pfields {
+                    match pf.leaf() {
+                        Some(name) if !pred_cols.contains(&name) => pred_cols.push(name),
+                        Some(_) => {}
+                        None => all_leaf = false,
+                    }
+                }
+                let output_is_wider =
+                    project_fields.is_none_or(|fs| fs.iter().any(|f| !pred_cols.contains(f)));
+                if all_leaf && output_is_wider {
+                    let mut seen_seg: FxHashSet<(u64, u32)> = FxHashSet::default();
+                    let mut seen_mem: FxHashSet<usize> = FxHashSet::default();
+                    for key_cell in &keys {
+                        let more = self.index_eq_late(
+                            table,
+                            &idx_field,
+                            key_cell,
+                            p,
+                            &pred_cols,
+                            project_fields,
+                            now_ms,
+                            &mut seen_seg,
+                            &mut seen_mem,
+                            |row| {
+                                out.push(row);
+                                limit.is_none_or(|lim| out.len() < lim)
+                            },
+                        )?;
+                        if !more {
+                            break;
+                        }
+                    }
+                    return Ok(out);
+                }
+            }
+
             let mut seen_ids: FxHashSet<String> = FxHashSet::default();
             'key_loop: for key_cell in keys {
                 let mut stop = false;
@@ -4233,6 +5031,30 @@ impl DiskEngine {
                 limit.is_none_or(|lim| out.len() < lim)
             })?;
             return Ok(out);
+        }
+
+        if project_fields.is_none() {
+            // Whole rows wanted: still decide the predicate from its own columns and
+            // materialize only the rows that pass.
+            let mut pfields = Vec::new();
+            p.walk_fields(&mut pfields);
+            if pfields.iter().all(|f| f.leaf().is_some()) {
+                let mut pred_cols: Vec<&str> = Vec::with_capacity(pfields.len());
+                for pf in &pfields {
+                    if let Some(name) = pf.leaf()
+                        && !pred_cols.contains(&name)
+                    {
+                        pred_cols.push(name);
+                    }
+                }
+                self.scan_filter_core(table, Some(p), &pred_cols, None, now_ms, |hit| {
+                    if let ScanHit::Row(row) = hit {
+                        out.push(row);
+                    }
+                    limit.is_none_or(|lim| out.len() < lim)
+                })?;
+                return Ok(out);
+            }
         }
 
         self.scan_projected(table, needed_cols.as_deref(), |row| {
@@ -4744,13 +5566,23 @@ impl SharedDiskEngine {
 /// Stable sort by the cluster key, rows without a value last (same order as
 /// [`DiskEngine::compact_table_clustered`]).
 pub(crate) fn sort_rows_by_cluster_key(rows: &mut [Row], key: &str) {
-    rows.sort_by(|a, b| {
-        let present = |r: &Row| r.get(key).filter(|c| !matches!(c, Cell::Null)).is_some();
-        match (a.get(key), b.get(key)) {
-            (Some(ka), Some(kb)) if present(a) && present(b) => crate::exec::cmp_sort(ka, kb),
-            _ => present(b).cmp(&present(a)),
-        }
-    });
+    rows.sort_by(|a, b| cmp_cluster_key(a, b, key));
+}
+
+fn cmp_cluster_key(a: &Row, b: &Row, key: &str) -> std::cmp::Ordering {
+    let present = |r: &Row| r.get(key).filter(|c| !matches!(c, Cell::Null)).is_some();
+    match (a.get(key), b.get(key)) {
+        (Some(ka), Some(kb)) if present(a) && present(b) => crate::exec::cmp_sort(ka, kb),
+        _ => present(b).cmp(&present(a)),
+    }
+}
+
+/// Positions of `rows` in cluster-key order (same order as [`sort_rows_by_cluster_key`]),
+/// leaving the rows themselves untouched.
+pub(crate) fn cluster_key_order(rows: &[Row], key: &str) -> Vec<u32> {
+    let mut order: Vec<u32> = (0..rows.len() as u32).collect();
+    order.sort_by(|&a, &b| cmp_cluster_key(&rows[a as usize], &rows[b as usize], key));
+    order
 }
 
 /// Column kinds of a batch: the first non-null cell of each column decides.
@@ -4771,6 +5603,12 @@ pub(crate) fn infer_schema_from_batch(
                 dim: vec.len() as u32,
             }),
         });
+        let kind = match kind {
+            Some(DiskColKind::Int64) if col.iter().any(|v| matches!(v, Cell::Float(_))) => {
+                Some(DiskColKind::Float64)
+            }
+            other => other,
+        };
         if let Some(kind) = kind {
             cols.entry(name.clone()).or_insert(kind);
         }
@@ -4790,7 +5628,11 @@ pub(crate) fn infer_schema_from_rows(table: &str, rows: &[Row]) -> DiskTableSche
     let mut cols: BTreeMap<String, DiskColKind> = BTreeMap::new();
     for r in rows {
         for (k, v) in r {
-            if cols.contains_key(k) {
+            if let Some(kind) = cols.get_mut(k) {
+                // Integers first, fractions later: the column is a float column.
+                if *kind == DiskColKind::Int64 && matches!(v, Cell::Float(_)) {
+                    *kind = DiskColKind::Float64;
+                }
                 continue;
             }
             let kind = match v {

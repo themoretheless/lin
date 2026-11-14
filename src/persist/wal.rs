@@ -458,9 +458,25 @@ pub(super) fn append_record_v1(
     write_frame(log, &LOG_MAGIC_V1, buf, sync, log_bytes)
 }
 
-pub(super) fn write_all_vectored(log: &mut File, slices: &[IoSlice<'_>]) -> io::Result<()> {
+/// Write every byte of `slices`, in order. One vectored write is attempted; whatever it
+/// leaves (a short write, or more slices than the OS takes in one call) is finished slice
+/// by slice. An interrupted call is retried, like `write_all` does, so a signal during a
+/// commit does not fail it; a writer that accepts nothing ends in `WriteZero`.
+pub(super) fn write_all_vectored<W: Write + ?Sized>(
+    log: &mut W,
+    slices: &[IoSlice<'_>],
+) -> io::Result<()> {
     let total: usize = slices.iter().map(|s| s.len()).sum();
-    let mut written = log.write_vectored(slices)?;
+    if total == 0 {
+        return Ok(());
+    }
+    let mut written = loop {
+        match log.write_vectored(slices) {
+            Ok(n) => break n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    };
     if written == total {
         return Ok(());
     }
@@ -891,6 +907,10 @@ pub fn export_wal_since(dir: &Path, since_gen: u64) -> Result<Vec<u8>, Error> {
     Ok(out)
 }
 
+/// Most bytes a compressed (codec 4) WAL record may decode to.
+#[cfg(any(feature = "compress-wal", feature = "compress-flate"))]
+pub(super) const MAX_COMPRESSED_RECORD_DECODED: usize = super::types::MAX_SPARSE_DECODED_BYTES;
+
 pub(super) fn decode_frame(magic: &[u8; 4], payload: &[u8]) -> Result<LogRecord, Error> {
     if *magic == LOG_MAGIC_CHECKSUM {
         if payload.len() < 5 {
@@ -911,9 +931,18 @@ pub(super) fn decode_frame(magic: &[u8; 4], payload: &[u8]) -> Result<LogRecord,
             4 => {
                 use flate2::read::GzDecoder;
                 use std::io::Read;
-                let mut decoder = GzDecoder::new(&payload[1..end]);
+                // A frame is at most `MAX_RECORD` bytes compressed, but gzip can expand a
+                // crafted one a thousandfold: stop at the same decoded budget the vector
+                // codecs use instead of allocating whatever the stream asks for.
+                let limit = MAX_COMPRESSED_RECORD_DECODED as u64;
                 let mut raw = Vec::new();
-                decoder.read_to_end(&mut raw).map_err(io_err)?;
+                GzDecoder::new(&payload[1..end])
+                    .take(limit + 1)
+                    .read_to_end(&mut raw)
+                    .map_err(io_err)?;
+                if raw.len() as u64 > limit {
+                    return Err(io_err("compressed wal record exceeds the decoded size limit"));
+                }
                 return rmp_serde::from_slice(&raw).map_err(io_err);
             }
             _ => return Err(io_err("unknown wal codec")),

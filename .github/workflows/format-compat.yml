@@ -1,0 +1,29 @@
+name: format-compat
+
+# The current tree and the previous release must read each other's cold-tier databases.
+# See scripts/format-compat.sh and examples/format_compat.rs.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  previous-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Tags are needed to find the previous release.
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
+      - uses: Swatinem/rust-cache@v2
+      - name: Read and write across versions
+        run: scripts/format-compat.sh

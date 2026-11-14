@@ -27,8 +27,8 @@ pub use tx::Transaction;
 pub(crate) use agg::*;
 pub(crate) use eval::*;
 pub(crate) use join::{
-    JoinFieldPlan, emit_join_row, plan_join_fields, pred_total_gt, project_join_fields,
-    rows_to_rough_batch,
+    JoinFieldPlan, emit_join_row, merge_join_row, plan_join_fields, pred_total_gt,
+    project_join_fields, rows_to_rough_batch,
 };
 
 use dml::{cached_content_hash, pack_has_schema, stmt_append_only, stmt_schema, stmt_writes};
@@ -297,14 +297,17 @@ impl Stats {
 /// One write of a commit group (see [`Db::execute_group_sync`]).
 #[cfg_attr(not(feature = "async"), allow(dead_code))]
 pub(crate) enum GroupWrite<'a> {
-    Src(&'a str),
-    Prepared(&'a Prepared),
+    Src { src: &'a str, want_rows: bool },
+    Prepared { prepared: &'a Prepared, want_rows: bool },
+    Stmt(&'a Stmt),
 }
 
 const PLAN_CACHE_MAX: usize = 512;
-/// Larger batches into a cold collection keep using the in-memory bulk path, whose
-/// uniqueness checks are batched rather than one disk probe per row.
-const COLD_OVERLAY_INSERT_MAX_ROWS: usize = 4096;
+/// Upper bound on one insert into the overlay of a cold collection. Beyond it the
+/// statement falls back to the in-memory path, which pulls the whole collection into
+/// RAM, so the bound is generous: uniqueness is checked with one index probe per row
+/// under a single engine guard, and the commit is still one WAL record.
+const COLD_OVERLAY_INSERT_MAX_ROWS: usize = 1_048_576;
 
 impl Db {
     fn default_embedder(catalog: &Catalog) -> Arc<dyn Embedder> {
@@ -1081,28 +1084,33 @@ impl Db {
     /// Only [`SyncMode::Full`] changes behaviour; other modes and non-durable databases
     /// just run the sources in order.
     pub fn execute_group_sync<S: AsRef<str>>(&mut self, sources: &[S]) -> Vec<Result<Done, Error>> {
-        self.group_sync(sources.len(), |db, i| {
-            db.run_src_ext(sources[i].as_ref(), false).map(|h| h.done)
-        })
+        self.group_sync(sources.len(), |db, i| db.run_src_ext(sources[i].as_ref(), false))
+            .into_iter()
+            .map(|r| r.map(|h| h.done))
+            .collect()
     }
 
-    /// [`Db::execute_group_sync`] over a mix of source texts and prepared statements.
-    #[cfg_attr(not(feature = "async"), allow(dead_code))]
-    pub(crate) fn execute_group_sync_mixed(
-        &mut self,
-        writes: &[GroupWrite<'_>],
-    ) -> Vec<Result<Done, Error>> {
-        self.group_sync(writes.len(), |db, i| match &writes[i] {
-            GroupWrite::Src(src) => db.run_src_ext(src, false).map(|h| h.done),
-            GroupWrite::Prepared(p) => db.execute_prepared(p),
-        })
+    /// [`Db::execute_group_sync`] over a mix of source texts, prepared statements and
+    /// statement ASTs, returning full handles.
+    /// One write of a commit group, outside any sync policy.
+    pub(crate) fn run_group_write(&mut self, write: &GroupWrite<'_>) -> Result<Handle, Error> {
+        match write {
+            GroupWrite::Src { src, want_rows } => self.run_src_ext(src, *want_rows),
+            GroupWrite::Prepared { prepared, want_rows } => {
+                self.run_prepared_ext(prepared, *want_rows)
+            }
+            GroupWrite::Stmt(stmt) => self.run_stmt((*stmt).clone()),
+        }
     }
 
-    fn group_sync(
+    /// Run `body` (a group of `n` commits) with per-commit fsync deferred, then make the
+    /// whole group durable with one sync. An error means the group reached the log but
+    /// was not confirmed durable: no commit of the group may be acknowledged.
+    pub(crate) fn with_group_sync(
         &mut self,
         n: usize,
-        mut run: impl FnMut(&mut Self, usize) -> Result<Done, Error>,
-    ) -> Vec<Result<Done, Error>> {
+        body: impl FnOnce(&mut Self),
+    ) -> Result<(), Error> {
         let deferred = n > 1
             && self.persist.as_mut().is_some_and(|p| {
                 if p.sync == SyncMode::Full {
@@ -1112,15 +1120,28 @@ impl Db {
                     false
                 }
             });
-        let mut results: Vec<Result<Done, Error>> = (0..n).map(|i| run(self, i)).collect();
+        body(self);
         if deferred && let Some(p) = self.persist.as_mut() {
             p.sync = SyncMode::Full;
-            if let Err(e) = crate::persist::durable_sync(&p.log) {
-                let err = Error::runtime(format!("group commit sync failed: {e}"));
-                for r in &mut results {
-                    if r.is_ok() {
-                        *r = Err(err.clone());
-                    }
+            crate::persist::durable_sync(&p.log)
+                .map_err(|e| Error::runtime(format!("group commit sync failed: {e}")))?;
+        }
+        Ok(())
+    }
+
+    fn group_sync(
+        &mut self,
+        n: usize,
+        mut run: impl FnMut(&mut Self, usize) -> Result<Handle, Error>,
+    ) -> Vec<Result<Handle, Error>> {
+        let mut results: Vec<Result<Handle, Error>> = Vec::with_capacity(n);
+        let synced = self.with_group_sync(n, |db| {
+            results.extend((0..n).map(|i| run(db, i)));
+        });
+        if let Err(err) = synced {
+            for r in &mut results {
+                if r.is_ok() {
+                    *r = Err(err.clone());
                 }
             }
         }
@@ -1136,23 +1157,27 @@ impl Db {
     }
 
     /// Point DML on a disk-backed collection can go through the engine overlay (no promotion
-    /// into memory) when the WAL is the main persist log and nothing needs in-memory row
-    /// positions: no HNSW graph to maintain. Callers must rule out unique-key changes themselves.
-    fn disk_overlay_point_dml(&self, collection: &str) -> bool {
-        self.persist.is_some()
-            && !self.store.is_native_disk()
+    /// into memory) when the WAL is the main persist log (or native disk / staged overlay) and
+    /// nothing needs in-memory row positions: no HNSW graph to maintain. Callers must rule out
+    /// unique-key changes themselves.
+    pub(crate) fn disk_overlay_point_dml(&self, collection: &str) -> bool {
+        (self.persist.is_some()
+            || self.store.is_native_disk()
+            || self.cold_program_packs.is_some())
             && self.store.can_apply_disk_overlay(collection)
     }
 
     /// `delete <collection>[pred]` against a disk-backed collection without promoting it.
     /// Same contract as the in-memory path: CAS is required unless the collection is
     /// append-only, every matched row must carry the expected hash, and no match is an error.
-    fn cold_overlay_delete(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn cold_overlay_delete(
         &mut self,
         collection: &str,
         pred: &Pred,
         cas: Option<&str>,
         cas_each: bool,
+        mut cas_written: Option<&mut FxHashSet<(String, String)>>,
         plan: &Arc<Plan>,
         want_rows: bool,
     ) -> Result<Handle, Error> {
@@ -1174,10 +1199,19 @@ impl Db {
         if rows.is_empty() {
             return Err(Error::runtime("delete: no matching row"));
         }
-        // `cas each` compares against the statement's own snapshot, which for a single
-        // statement is the row itself, so only an explicit `cas` can mismatch.
-        if !append_only
-            && !cas_each
+        if !append_only && cas_each {
+            if let Some(written) = cas_written.as_deref() {
+                for row in &rows {
+                    if let Some(id) = row_text(row, "id")
+                        && written.contains(&(collection.to_string(), id.to_string()))
+                    {
+                        return Err(Error::runtime(format!(
+                            "cas mismatch: row {id} changed mid-pack"
+                        )));
+                    }
+                }
+            }
+        } else if !append_only
             && let Some(cas) = cas
         {
             for row in &rows {
@@ -1186,6 +1220,13 @@ impl Db {
                     return Err(Error::runtime(format!(
                         "cas mismatch: expected {cas:?}, found {got:?}"
                     )));
+                }
+            }
+        }
+        if let Some(written) = cas_written.as_deref_mut() {
+            for row in &rows {
+                if let Some(id) = row_text(row, "id") {
+                    written.insert((collection.to_string(), id.to_string()));
                 }
             }
         }
@@ -1217,43 +1258,86 @@ impl Db {
     /// to the engine overlay after the same checks the in-memory path performs (duplicate
     /// id, unique keys, foreign keys, row quota). Returns `None` when a unique key cannot be
     /// verified against the disk engine, so the caller falls back to the in-memory path.
-    fn cold_overlay_insert(
+    pub(crate) fn cold_overlay_insert(
         &mut self,
         collection: &str,
         records: &[crate::ast::Record],
+        cas_written: Option<&mut FxHashSet<(String, String)>>,
         plan: &Arc<Plan>,
         want_rows: bool,
     ) -> Result<Option<Handle>, Error> {
-        let t0 = Instant::now();
-        let Some(mut unique_fields) = self.store.simple_unique_fields(collection) else {
-            return Ok(None);
-        };
-        unique_fields.retain(|f| f != "id");
-        // `docs.uri` is unique by contract (the in-memory path checks `docs_by_uri`), with or
-        // without an index declared on it.
-        if collection == "docs" && !unique_fields.iter().any(|f| f == "uri") {
-            unique_fields.push("uri".to_string());
-        }
-        let now = if records.iter().any(record_needs_now) {
+        self.cold_overlay_insert_edges(collection, records, &[], cas_written, plan, want_rows)
+    }
+
+    /// [`Self::cold_overlay_insert`] with the statement's `edge` clauses: edges start at the
+    /// first inserted row, exactly as in the in-memory path, and are logged in the same pack.
+    /// Edges live in memory; the overlay savepoint remembers how many there were, so a
+    /// rolled-back program or transaction drops the ones it added.
+    fn cold_overlay_insert_edges(
+        &mut self,
+        collection: &str,
+        records: &[crate::ast::Record],
+        edges: &[crate::ast::InsertEdge],
+        cas_written: Option<&mut FxHashSet<(String, String)>>,
+        plan: &Arc<Plan>,
+        want_rows: bool,
+    ) -> Result<Option<Handle>, Error> {
+        let edges_need_now = edges.iter().any(|e| match &e.target {
+            crate::ast::EdgeTarget::Value(v) => value_needs_now(v),
+            crate::ast::EdgeTarget::Page(_) => false,
+        });
+        let now = if edges_need_now || records.iter().any(record_needs_now) {
             now_ms()
         } else {
             0
         };
-        let mut rows: Vec<Row> = Vec::with_capacity(records.len());
-        for rec in records {
-            let mut row = crate::store::acquire_row();
-            for (k, v) in &rec.fields {
-                row.insert(k.clone(), value_cell(v, now));
-            }
-            // A unique key that is absent or not text has index semantics this path does
-            // not reproduce; decide before any id is allocated.
-            if unique_fields
-                .iter()
-                .any(|f| row.get(f).and_then(Cell::text).is_none())
+        let rows: Vec<Row> = records
+            .iter()
+            .map(|rec| {
+                let mut row = crate::store::acquire_row();
+                for (k, v) in &rec.fields {
+                    row.insert(k.clone(), value_cell(v, now));
+                }
+                row
+            })
+            .collect();
+        self.cold_overlay_insert_rows(collection, rows, edges, now, cas_written, plan, want_rows)
+    }
+
+    /// Core of [`Self::cold_overlay_insert_edges`], shared with [`Self::insert_batch`]:
+    /// `rows` are the new rows with absent fields left out. Returns `None` (nothing
+    /// written, no id allocated) when a key has semantics this path does not reproduce.
+    #[allow(clippy::too_many_arguments)]
+    fn cold_overlay_insert_rows(
+        &mut self,
+        collection: &str,
+        mut rows: Vec<Row>,
+        edges: &[crate::ast::InsertEdge],
+        now: i64,
+        mut cas_written: Option<&mut FxHashSet<(String, String)>>,
+        plan: &Arc<Plan>,
+        want_rows: bool,
+    ) -> Result<Option<Handle>, Error> {
+        let t0 = Instant::now();
+        // Unique constraints, composite and partial ones included, are checked against the
+        // disk engine.
+        let Some(unique_keys) = self.store.disk_unique_keys(collection) else {
+            return Ok(None);
+        };
+        let key_now = if unique_keys.iter().any(|k| k.pred.is_some()) {
+            now_ms()
+        } else {
+            0
+        };
+        for row in &rows {
+            // A key value this path does not reproduce (NaN, a vector) and `docs` without
+            // a text `uri` keep the in-memory path's own rules; decide before any id is
+            // allocated.
+            if unique_keys.iter().any(|k| !k.supports(row))
+                || (collection == "docs" && row.get("uri").and_then(Cell::text).is_none())
             {
                 return Ok(None);
             }
-            rows.push(row);
         }
         let n = rows.len();
         let total = self.total_rows();
@@ -1265,56 +1349,96 @@ impl Db {
             )));
         }
         let has_fks = self.catalog.fks.iter().any(|fk| fk.from_col == collection);
-        let mut seen: FxHashSet<(usize, String)> = FxHashSet::default();
         for row in &mut rows {
             if row.get("id").and_then(Cell::text).is_none() {
-                row.insert("id".into(), Cell::text_arc(self.store.alloc_id()));
+                row.insert("id", Cell::text_arc(self.store.alloc_id()));
             }
             if row.get("hash").and_then(Cell::text).is_none()
                 && let Some(body) = row.get("body").and_then(Cell::text_shared)
             {
                 row.insert(
-                    "hash".into(),
+                    "hash",
                     Cell::Text(cached_content_hash(body.as_ref())),
                 );
             }
-            let id = row_text(row, "id").unwrap_or("").to_string();
-            if !seen.insert((usize::MAX, id.clone())) || self.store.disk_count_eq(collection, "id", &id) > 0
-            {
-                return Err(Error::runtime(format!("duplicate id: {id}")));
-            }
-            for (fi, f) in unique_fields.iter().enumerate() {
-                let key = row_text(row, f).unwrap_or("").to_string();
-                if !seen.insert((fi, key.clone())) || self.store.disk_count_eq(collection, f, &key) > 0 {
-                    return Err(Error::runtime(if collection == "docs" && f == "uri" {
-                        format!("duplicate uri: {key}")
-                    } else {
-                        format!("unique index {collection}[{f}]: duplicate key")
-                    }));
+        }
+        {
+            // One engine guard for the whole batch, ids borrowed from the rows.
+            let eng = self.store.disk_engine_read();
+            let mut seen_ids: FxHashSet<&str> = FxHashSet::default();
+            seen_ids.reserve(rows.len());
+            let mut seen_keys: FxHashSet<(usize, String)> = FxHashSet::default();
+            for row in &rows {
+                let id = row_text(row, "id").unwrap_or("");
+                if !seen_ids.insert(id)
+                    || eng.as_ref().is_some_and(|e| e.exists_by_id(collection, id))
+                {
+                    return Err(Error::runtime(format!("duplicate id: {id}")));
+                }
+                for (ki, key) in unique_keys.iter().enumerate() {
+                    // Outside a partial index's predicate the row is not constrained.
+                    let Some(text) = key.indexed_text(row, key_now) else {
+                        continue;
+                    };
+                    if !seen_keys.insert((ki, text))
+                        || self.store.disk_unique_conflict(collection, key, row, None, key_now)
+                    {
+                        return Err(Error::runtime(
+                            if collection == "docs" && key.fields == ["uri"] {
+                                format!("duplicate uri: {}", row_text(row, "uri").unwrap_or(""))
+                            } else {
+                                format!("unique index {}: duplicate key", key.label(collection))
+                            },
+                        ));
+                    }
+                }
+                if has_fks {
+                    self.check_row_fks(collection, row)?;
                 }
             }
-            if has_fks {
-                self.check_row_fks(collection, row)?;
+        }
+        if let Some(written) = cas_written.as_deref_mut() {
+            for row in &rows {
+                if let Some(id) = row_text(row, "id") {
+                    written.insert((collection.to_string(), id.to_string()));
+                }
             }
         }
         self.maybe_embed_rows(collection, &mut rows);
-        let pack = if n == 1 {
-            Pack::Insert {
+        let new_edges: Vec<crate::store::Edge> = match rows.first().and_then(|r| row_text(r, "id")) {
+            Some(from_id) if !edges.is_empty() => edges
+                .iter()
+                .map(|e| crate::store::Edge {
+                    rel: e.rel.clone(),
+                    from: from_id.to_string(),
+                    to: match &e.target {
+                        // A page target resolves to the document's id when it exists.
+                        crate::ast::EdgeTarget::Page(uri) => {
+                            self.doc_id_for_key(uri).unwrap_or_else(|| uri.clone())
+                        }
+                        crate::ast::EdgeTarget::Value(v) => value_text(v, now),
+                    },
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        let rows = if n == 1 {
+            let pack = Pack::Insert {
                 collection: collection.to_string(),
                 row: rows.pop().unwrap_or_default(),
-                edges: Vec::new(),
+                edges: new_edges,
+            };
+            match self.commit_disk_overlay_pack(pack)? {
+                Pack::Insert { row, .. } if want_rows => vec![row],
+                _ => Vec::new(),
             }
         } else {
-            Pack::InsertBulk {
-                collection: collection.to_string(),
-                rows,
-                edges: Vec::new(),
-            }
-        };
-        let rows = match self.commit_disk_overlay_pack(pack)? {
-            Pack::Insert { row, .. } if want_rows => vec![row],
-            Pack::InsertBulk { rows, .. } if want_rows => rows,
-            _ => Vec::new(),
+            // Same compact columnar WAL record as the in-memory insert path: a row-shaped
+            // record repeats every field name per row and overflows the record limit on
+            // a few thousand documents with embeddings.
+            let pack = crate::persist::rows_to_insert_pack(collection, &rows, new_edges);
+            self.commit_disk_overlay_pack(pack)?;
+            if want_rows { rows } else { Vec::new() }
         };
         if !rows.is_empty() {
             self.check_output_quota(&rows)?;
@@ -1335,12 +1459,13 @@ impl Db {
     /// it. Mirrors the in-memory path: CAS, immutability guards, content hash refresh and
     /// foreign keys are checked for every matched row before anything is written.
     #[allow(clippy::too_many_arguments)]
-    fn cold_overlay_update(
+    pub(crate) fn cold_overlay_update(
         &mut self,
         collection: &str,
         pred: Option<&Pred>,
         cas: Option<&str>,
         cas_each: bool,
+        mut cas_written: Option<&mut FxHashSet<(String, String)>>,
         record: &crate::ast::Record,
         plan: &Arc<Plan>,
         want_rows: bool,
@@ -1361,7 +1486,24 @@ impl Db {
         if before_rows.is_empty() {
             return Err(Error::runtime("update: no matching row"));
         }
-        if !cas_each && let Some(cas) = cas {
+        let assigns_id = record.fields.iter().any(|(k, _)| k == "id");
+        let old_ids: Vec<Option<String>> = before_rows
+            .iter()
+            .map(|r| row_text(r, "id").map(str::to_string))
+            .collect();
+        if cas_each {
+            if let Some(written) = cas_written.as_deref() {
+                for row in &before_rows {
+                    if let Some(id) = row_text(row, "id")
+                        && written.contains(&(collection.to_string(), id.to_string()))
+                    {
+                        return Err(Error::runtime(format!(
+                            "cas mismatch: row {id} changed mid-pack"
+                        )));
+                    }
+                }
+            }
+        } else if let Some(cas) = cas {
             for row in &before_rows {
                 let got = row_text(row, "hash").unwrap_or("");
                 if got != cas {
@@ -1373,6 +1515,10 @@ impl Db {
         }
         let has_body = record.fields.iter().any(|(k, _)| k == "body");
         let has_fks = self.catalog.fks.iter().any(|fk| fk.from_col == collection);
+        let unique_keys = self
+            .store
+            .unique_keys_assigned(collection, record.fields.iter().map(|(k, _)| k.as_str()));
+        let mut seen_keys: FxHashSet<(usize, String)> = FxHashSet::default();
         let mut updated_rows = Vec::with_capacity(before_rows.len());
         for before in before_rows {
             if has_guards {
@@ -1389,26 +1535,38 @@ impl Db {
                     }
                 }
             }
+            let old_keys: Vec<Option<String>> = unique_keys
+                .iter()
+                .map(|k| k.indexed_text(&before, now_ms()))
+                .collect();
             let mut updated = before;
             for (k, v) in &record.fields {
                 updated.insert(k.clone(), value_cell(v, now));
             }
             if has_body && let Some(body) = row_text(&updated, "body").map(str::to_string) {
-                updated.insert("hash".into(), Cell::Text(cached_content_hash(&body)));
+                updated.insert("hash", Cell::Text(cached_content_hash(&body)));
             }
+            self.cold_check_unique_keys(collection, &unique_keys, &old_keys, &updated, &mut seen_keys)?;
             if has_fks {
                 self.check_row_fks(collection, &updated)?;
             }
             updated_rows.push(updated);
         }
+        if assigns_id {
+            self.cold_check_id_change(collection, &old_ids, &updated_rows)?;
+        }
+        if let Some(written) = cas_written.as_deref_mut() {
+            for id in old_ids.iter().flatten() {
+                written.insert((collection.to_string(), id.clone()));
+            }
+            for row in &updated_rows {
+                if let Some(id) = row_text(row, "id") {
+                    written.insert((collection.to_string(), id.to_string()));
+                }
+            }
+        }
         let n = updated_rows.len();
-        let pack = Pack::Update {
-            collection: collection.to_string(),
-            rows: updated_rows,
-        };
-        let Pack::Update { rows, .. } = self.commit_disk_overlay_pack(pack)? else {
-            unreachable!("commit_disk_overlay_pack returns its input pack");
-        };
+        let rows = self.commit_cold_update(collection, &old_ids, updated_rows)?;
         let rows = if want_rows { rows } else { Vec::new() };
         if !rows.is_empty() {
             self.check_output_quota(&rows)?;
@@ -1425,35 +1583,242 @@ impl Db {
         })
     }
 
-    /// A program of several `insert` / `update` / `delete` statements that all target cold
-    /// collections runs against the disk overlay under one savepoint: later statements see
-    /// earlier ones, nothing is promoted into memory, the whole program is logged as a
-    /// single batch, and any failure rolls every statement back. Returns `None` (with
-    /// nothing changed) when some statement needs the in-memory path.
-    fn cold_overlay_program(
+    pub(crate) fn exec_cold_point_delete(
         &mut self,
-        stmts: &[Stmt],
+        pd: &prepared::PointDeletePlan,
         plan: &Arc<Plan>,
         want_rows: bool,
-    ) -> Result<Option<Handle>, Error> {
-        // `cas each` inside a program compares against a start-of-program snapshot and
-        // rejects rows the program itself already wrote; that bookkeeping lives in the
-        // in-memory path, so such programs stay there.
-        let eligible = stmts.len() > 1
-            && !stmts.iter().any(|stmt| {
-                matches!(
-                    stmt,
-                    Stmt::Update { cas_each: true, .. } | Stmt::Delete { cas_each: true, .. }
-                )
+    ) -> Result<Handle, Error> {
+        let Some(row) = self
+            .store
+            .disk_point_row(&pd.collection, &pd.field, &pd.key)
+        else {
+            return Err(Error::runtime("delete: no matching row"));
+        };
+        if !pd.append_only && !pd.cas_each {
+            let got = row_text(&row, "hash").unwrap_or("");
+            let cas = pd.cas.as_deref().unwrap_or("");
+            if got != cas {
+                return Err(Error::runtime(format!(
+                    "cas mismatch: expected {cas:?}, found {got:?}"
+                )));
+            }
+        }
+        let pack = Pack::Delete {
+            collection: pd.collection.clone(),
+            rows: vec![row],
+        };
+        let Pack::Delete { rows: out, .. } = self.commit_disk_overlay_pack(pack)? else {
+            unreachable!("commit_disk_overlay_pack returns its input pack");
+        };
+        Ok(Handle {
+            plan: Arc::clone(plan),
+            rows: if want_rows { out } else { Vec::new() },
+            done: Done {
+                r#gen: self.store.r#gen,
+                n: 1,
+            },
+            message: None,
+            ms: 0.0,
+        })
+    }
+
+    /// Uniqueness of single-column unique keys changed by a cold `update`, checked against
+    /// the disk engine (and against the other rows of the same statement via `seen`).
+    /// An `update` of a cold collection that assigns `id`: like the in-memory path, it may
+    /// rename one row to an id no other live row holds.
+    fn cold_check_id_change(
+        &self,
+        collection: &str,
+        old_ids: &[Option<String>],
+        updated: &[Row],
+    ) -> Result<(), Error> {
+        let eng = self.store.disk_engine_read();
+        for (old, row) in old_ids.iter().zip(updated) {
+            let Some(new_id) = row_text(row, "id") else {
+                continue;
+            };
+            if old.as_deref() == Some(new_id) {
+                continue;
+            }
+            if updated.len() > 1
+                || eng.as_ref().is_some_and(|e| e.exists_by_id(collection, new_id))
+            {
+                return Err(Error::runtime(format!("duplicate id: {new_id}")));
+            }
+        }
+        Ok(())
+    }
+
+    /// Commit updated rows of a cold collection. Rows whose `id` changed are logged as a
+    /// delete of the old id plus an upsert of the new row, in one record, since an overlay
+    /// update is an upsert keyed by `id`.
+    fn commit_cold_update(
+        &mut self,
+        collection: &str,
+        old_ids: &[Option<String>],
+        rows: Vec<Row>,
+    ) -> Result<Vec<Row>, Error> {
+        let renamed: Vec<Row> = old_ids
+            .iter()
+            .zip(&rows)
+            .filter_map(|(old, row)| {
+                let old = old.as_deref()?;
+                (row_text(row, "id") != Some(old)).then(|| Row::from([("id", Cell::from_text(old))]))
             })
+            .collect();
+        let update = Pack::Update {
+            collection: collection.to_string(),
+            rows,
+        };
+        if renamed.is_empty() {
+            let Pack::Update { rows, .. } = self.commit_disk_overlay_pack(update)? else {
+                unreachable!("commit_disk_overlay_pack returns its input pack");
+            };
+            return Ok(rows);
+        }
+        let pack = Pack::Batch {
+            packs: vec![
+                Pack::Delete {
+                    collection: collection.to_string(),
+                    rows: renamed,
+                },
+                update,
+            ],
+        };
+        let Pack::Batch { mut packs } = self.commit_disk_overlay_pack(pack)? else {
+            unreachable!("commit_disk_overlay_pack returns its input pack");
+        };
+        match packs.pop() {
+            Some(Pack::Update { rows, .. }) => Ok(rows),
+            _ => unreachable!("the update is the last pack of the batch"),
+        }
+    }
+
+    /// Reject an update that moves a row onto a unique key another row already holds.
+    /// `old[i]` is the row's key under `keys[i]` before the update (`None` when it was
+    /// not indexed): an unchanged key needs no check.
+    fn cold_check_unique_keys(
+        &self,
+        collection: &str,
+        keys: &[crate::store::DiskUniqueKey],
+        old: &[Option<String>],
+        updated: &Row,
+        seen: &mut FxHashSet<(usize, String)>,
+    ) -> Result<(), Error> {
+        let now = now_ms();
+        for (i, key) in keys.iter().enumerate() {
+            let Some(new) = key.indexed_text(updated, now) else {
+                continue;
+            };
+            if old[i].as_deref() == Some(new.as_str()) {
+                continue;
+            }
+            let own_id = row_text(updated, "id");
+            if !seen.insert((i, new))
+                || self
+                    .store
+                    .disk_unique_conflict(collection, key, updated, own_id, now)
+            {
+                return Err(Error::runtime(
+                    if collection == "docs" && key.fields == ["uri"] {
+                        format!("duplicate uri: {}", row_text(updated, "uri").unwrap_or(""))
+                    } else {
+                        format!("unique index {}: duplicate key", key.label(collection))
+                    },
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn exec_cold_point_update(
+        &mut self,
+        pu: &prepared::PointUpdatePlan,
+        plan: &Arc<Plan>,
+        want_rows: bool,
+    ) -> Result<Handle, Error> {
+        let Some(before) = self
+            .store
+            .disk_point_row(&pu.collection, &pu.field, &pu.key)
+        else {
+            return Err(Error::runtime("update: no matching row"));
+        };
+        if !pu.cas_each {
+            let got = row_text(&before, "hash").unwrap_or("");
+            let cas = pu.cas.as_deref().unwrap_or("");
+            if got != cas {
+                return Err(Error::runtime(format!(
+                    "cas mismatch: expected {cas:?}, found {got:?}"
+                )));
+            }
+        }
+        let now = now_ms();
+        for (k, _) in &pu.record.fields {
+            for g in &self.catalog.guards {
+                if g.collection == pu.collection
+                    && &g.field == k
+                    && eval_pred(&g.pred, &before, now)
+                {
+                    return Err(Error::runtime(format!(
+                        "immutable field: {}.{k}",
+                        pu.collection
+                    )));
+                }
+            }
+        }
+        let unique_keys = self
+            .store
+            .unique_keys_assigned(&pu.collection, pu.record.fields.iter().map(|(k, _)| k.as_str()));
+        let old_keys: Vec<Option<String>> = unique_keys
+            .iter()
+            .map(|k| k.indexed_text(&before, now_ms()))
+            .collect();
+        let old_ids = vec![row_text(&before, "id").map(str::to_string)];
+        let mut updated = before;
+        for (k, v) in &pu.record.fields {
+            updated.insert(k.clone(), value_cell(v, now));
+        }
+        let has_body = pu.record.fields.iter().any(|(k, _)| k == "body");
+        if has_body && let Some(body) = row_text(&updated, "body").map(str::to_string) {
+            updated.insert("hash", Cell::Text(cached_content_hash(&body)));
+        }
+        self.cold_check_unique_keys(
+            &pu.collection,
+            &unique_keys,
+            &old_keys,
+            &updated,
+            &mut FxHashSet::default(),
+        )?;
+        self.check_row_fks(&pu.collection, &updated)?;
+        let updated = vec![updated];
+        if pu.record.fields.iter().any(|(k, _)| k == "id") {
+            self.cold_check_id_change(&pu.collection, &old_ids, &updated)?;
+        }
+        let out = self.commit_cold_update(&pu.collection, &old_ids, updated)?;
+        Ok(Handle {
+            plan: Arc::clone(plan),
+            rows: if want_rows { out } else { Vec::new() },
+            done: Done {
+                r#gen: self.store.r#gen,
+                n: 1,
+            },
+            message: None,
+            ms: 0.0,
+        })
+    }
+
+    fn cold_program_stmts_eligible(&self, stmts: &[Stmt], allow_non_disk_write_check: bool) -> bool {
+        let _ = allow_non_disk_write_check;
+        stmts.iter().any(dml::stmt_writes)
             && stmts.iter().all(|stmt| match stmt {
                 Stmt::Insert {
                     collection,
                     records,
                     edges,
                 } => {
-                    edges.is_empty()
-                        && !records.is_empty()
+                    let _ = edges;
+                    !records.is_empty()
                         && records.len() <= COLD_OVERLAY_INSERT_MAX_ROWS
                         && self.disk_overlay_point_dml(collection)
                 }
@@ -1462,32 +1827,218 @@ impl Db {
                 } => {
                     self.disk_overlay_point_dml(collection)
                         && !record.fields.iter().any(|(k, _)| {
-                            k == "id"
-                                || (collection == "docs" && k == "uri")
-                                || self.store.field_in_unique_index(collection, k)
+                            self.store.unique_key_needs_memory(collection, k)
                         })
                 }
                 Stmt::Delete { collection, .. } => self.disk_overlay_point_dml(collection),
+                Stmt::Let { .. } | Stmt::Query(_) => true,
                 _ => false,
-            });
-        if !eligible {
-            return Ok(None);
-        }
-        let t0 = Instant::now();
-        let saved_next_id = self.store.next_id;
-        self.store.begin_disk_overlay_savepoint();
-        self.cold_program_packs = Some(Vec::with_capacity(stmts.len()));
-        let last_idx = stmts.len() - 1;
+            })
+    }
+
+    fn exec_cold_overlay_program_steps(
+        &mut self,
+        stmts: &[Stmt],
+        plan: &Arc<Plan>,
+        want_rows: bool,
+    ) -> Result<Option<Handle>, Error> {
+        let track_written = stmts.iter().any(|stmt| {
+            matches!(
+                stmt,
+                Stmt::Update { cas_each: true, .. } | Stmt::Delete { cas_each: true, .. }
+            )
+        });
+        let mut written: FxHashSet<(String, String)> = FxHashSet::default();
+        let mut bindings: BTreeMap<String, Vec<Row>> = BTreeMap::new();
+        let last_idx = stmts.len().saturating_sub(1);
         let mut last: Option<Handle> = None;
-        let mut outcome: Result<bool, Error> = Ok(true);
         for (i, stmt) in stmts.iter().enumerate() {
             let rows_wanted = want_rows && i == last_idx;
-            let step = match stmt {
+            let cw = if track_written { Some(&mut written) } else { None };
+            match stmt {
                 Stmt::Insert {
                     collection,
                     records,
-                    ..
-                } => self.cold_overlay_insert(collection, records, plan, rows_wanted),
+                    edges,
+                } => match self.cold_overlay_insert_edges(
+                    collection,
+                    records,
+                    edges,
+                    cw,
+                    plan,
+                    rows_wanted,
+                )? {
+                    Some(h) => last = Some(h),
+                    None => return Ok(None),
+                },
+                Stmt::Update {
+                    collection,
+                    pred,
+                    cas,
+                    cas_each,
+                    record,
+                } => {
+                    last = Some(self.cold_overlay_update(
+                        collection,
+                        pred.as_ref(),
+                        cas.as_deref(),
+                        *cas_each,
+                        cw,
+                        record,
+                        plan,
+                        rows_wanted,
+                    )?);
+                }
+                Stmt::Delete {
+                    collection,
+                    pred,
+                    cas,
+                    cas_each,
+                } => {
+                    last = Some(self.cold_overlay_delete(
+                        collection,
+                        pred,
+                        cas.as_deref(),
+                        *cas_each,
+                        cw,
+                        plan,
+                        rows_wanted,
+                    )?);
+                }
+                Stmt::Let { name, query } => {
+                    let rows = self.exec_query(query, &bindings)?;
+                    let n = rows.len();
+                    let out_rows = if rows_wanted {
+                        rows.clone()
+                    } else {
+                        Vec::new()
+                    };
+                    bindings.insert(name.clone(), rows);
+                    last = Some(Handle {
+                        plan: Arc::clone(plan),
+                        rows: out_rows,
+                        done: Done {
+                            r#gen: self.store.r#gen,
+                            n,
+                        },
+                        message: None,
+                        ms: 0.0,
+                    });
+                }
+                Stmt::Query(q) => {
+                    let mut rows = self.exec_query(q, &bindings)?;
+                    let n = rows.len();
+                    if !rows_wanted {
+                        rows.clear();
+                    }
+                    if !rows.is_empty() {
+                        self.check_output_quota(&rows)?;
+                    }
+                    last = Some(Handle {
+                        plan: Arc::clone(plan),
+                        rows,
+                        done: Done {
+                            r#gen: self.store.r#gen,
+                            n,
+                        },
+                        message: None,
+                        ms: 0.0,
+                    });
+                }
+                _ => return Ok(None),
+            }
+        }
+        Ok(last)
+    }
+
+    /// Execute cold-overlay DML inside an active `Transaction` (which owns the savepoint and
+    /// defers WAL logging to `Transaction::commit`). Returns `Ok(None)` when the statements need
+    /// the in-memory path.
+    pub(crate) fn try_cold_overlay_in_tx(
+        &mut self,
+        stmts: &[Stmt],
+        plan: &Arc<Plan>,
+        base_gen: u64,
+        want_rows: bool,
+    ) -> Result<Option<(Handle, Option<Pack>, bool)>, Error> {
+        if stmts.is_empty() || !stmts.iter().any(dml::stmt_writes) {
+            return Ok(None);
+        }
+        if self.cold_program_packs.is_some() {
+            return Ok(None);
+        }
+        let eligible = if stmts.len() == 1 {
+            match &stmts[0] {
+                Stmt::Delete { collection, .. } => self.store.can_apply_disk_overlay(collection),
+                Stmt::Update {
+                    collection, record, ..
+                } => {
+                    self.store.can_apply_disk_overlay(collection)
+                        && !record.fields.iter().any(|(k, _)| {
+                            self.store.unique_key_needs_memory(collection, k)
+                        })
+                }
+                Stmt::Insert {
+                    collection,
+                    records,
+                    edges,
+                } => {
+                    let _ = edges;
+                    !records.is_empty()
+                        && records.len() <= COLD_OVERLAY_INSERT_MAX_ROWS
+                        && self.store.can_apply_disk_overlay(collection)
+                }
+                _ => false,
+            }
+        } else {
+            stmts.iter().all(|stmt| match stmt {
+                Stmt::Insert {
+                    collection,
+                    records,
+                    edges,
+                } => {
+                    let _ = edges;
+                    !records.is_empty()
+                        && records.len() <= COLD_OVERLAY_INSERT_MAX_ROWS
+                        && self.store.can_apply_disk_overlay(collection)
+                }
+                Stmt::Update {
+                    collection, record, ..
+                } => {
+                    self.store.can_apply_disk_overlay(collection)
+                        && !record.fields.iter().any(|(k, _)| {
+                            self.store.unique_key_needs_memory(collection, k)
+                        })
+                }
+                Stmt::Delete { collection, .. } => self.store.can_apply_disk_overlay(collection),
+                Stmt::Let { .. } | Stmt::Query(_) => true,
+                _ => false,
+            })
+        };
+        if !eligible {
+            return Ok(None);
+        }
+
+        let t0 = Instant::now();
+        self.cold_program_packs = Some(Vec::with_capacity(stmts.len()));
+        let res = if stmts.len() == 1 {
+            match &stmts[0] {
+                Stmt::Delete {
+                    collection,
+                    pred,
+                    cas,
+                    cas_each,
+                } => self
+                    .cold_overlay_delete(
+                        collection,
+                        pred,
+                        cas.as_deref(),
+                        *cas_each,
+                        None,
+                        plan,
+                        want_rows,
+                    )
+                    .map(Some),
                 Stmt::Update {
                     collection,
                     pred,
@@ -1500,57 +2051,99 @@ impl Db {
                         pred.as_ref(),
                         cas.as_deref(),
                         *cas_each,
+                        None,
                         record,
                         plan,
-                        rows_wanted,
+                        want_rows,
                     )
                     .map(Some),
-                Stmt::Delete {
+                Stmt::Insert {
                     collection,
-                    pred,
-                    cas,
-                    cas_each,
-                } => self
-                    .cold_overlay_delete(collection, pred, cas.as_deref(), *cas_each, plan, rows_wanted)
-                    .map(Some),
+                    records,
+                    edges,
+                } => self.cold_overlay_insert_edges(
+                    collection, records, edges, None, plan, want_rows,
+                ),
                 _ => Ok(None),
-            };
-            match step {
-                Ok(Some(h)) => last = Some(h),
-                // A statement that needs the in-memory path: undo and let the caller use it.
-                Ok(None) => {
-                    outcome = Ok(false);
-                    break;
-                }
-                Err(e) => {
-                    outcome = Err(e);
-                    break;
-                }
+            }
+        } else {
+            self.exec_cold_overlay_program_steps(stmts, plan, want_rows)
+        };
+        let packs = self.cold_program_packs.take().unwrap_or_default();
+        let handle = match res {
+            Ok(Some(h)) => h,
+            Ok(None) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let pack = dml::fold_packs(packs);
+        let wrote = pack.is_some();
+        if wrote {
+            if self.is_durable() {
+                self.store.r#gen = base_gen + 1;
+            } else {
+                self.store.r#gen += 1;
             }
         }
+        let mut h = handle;
+        h.done.r#gen = self.store.r#gen;
+        h.ms = t0.elapsed().as_secs_f64() * 1000.0;
+        Ok(Some((h, pack, wrote)))
+    }
+
+    /// A program of several statements targeting cold collections runs against the disk overlay
+    /// under one savepoint: later statements see earlier ones, `cas each` tracks per-row mid-pack
+    /// conflicts, `let` and queries bind/read overlay state, nothing is promoted into memory,
+    /// the whole program is logged as one batch, and any failure rolls every statement back.
+    /// Returns `None` (with nothing changed) when some statement needs the in-memory path.
+    fn cold_overlay_program(
+        &mut self,
+        stmts: &[Stmt],
+        plan: &Arc<Plan>,
+        want_rows: bool,
+    ) -> Result<Option<Handle>, Error> {
+        if stmts.len() <= 1 || !self.cold_program_stmts_eligible(stmts, false) {
+            return Ok(None);
+        }
+        let t0 = Instant::now();
+        let saved_next_id = self.store.next_id;
+        self.store.begin_disk_overlay_savepoint();
+        self.cold_program_packs = Some(Vec::with_capacity(stmts.len()));
+        let step = self.exec_cold_overlay_program_steps(stmts, plan, want_rows);
         let packs = self.cold_program_packs.take().unwrap_or_default();
-        let committed = match outcome {
-            Ok(true) => match (dml::fold_packs(packs), self.persist.as_mut()) {
-                (Some(batch), Some(p)) => self.store.durable_commit(p, batch).map(|()| true),
-                (None, _) => Ok(true),
-                (Some(_), None) => Err(Error::runtime("disk overlay requires a durable log")),
+        let is_native = self.store.is_native_disk();
+        let committed = match step {
+            Ok(Some(last)) => match dml::fold_packs(packs) {
+                Some(batch) => {
+                    if let Some(p) = self.persist.as_mut() {
+                        self.store.durable_commit(p, batch).map(|()| Some(last))
+                    } else if is_native {
+                        self.store.rollback_disk_overlay_savepoint();
+                        self.store
+                            .commit_pack_to_native_disk(&batch)
+                            .map(|()| Some(last))
+                    } else {
+                        Err(Error::runtime("disk overlay requires a durable log"))
+                    }
+                }
+                None => Ok(Some(last)),
             },
-            other => other,
+            Ok(None) => Ok(None),
+            Err(e) => Err(e),
         };
         match committed {
-            Ok(true) => {
-                self.store.commit_disk_overlay_savepoint();
+            Ok(Some(mut h)) => {
+                if !is_native {
+                    self.store.commit_disk_overlay_savepoint();
+                }
                 self.store.r#gen += 1;
                 if let Some(p) = self.persist.as_mut() {
                     self.store.maybe_checkpoint(p)?;
                 }
-                Ok(last.map(|mut h| {
-                    h.done.r#gen = self.store.r#gen;
-                    h.ms = t0.elapsed().as_secs_f64() * 1000.0;
-                    h
-                }))
+                h.done.r#gen = self.store.r#gen;
+                h.ms = t0.elapsed().as_secs_f64() * 1000.0;
+                Ok(Some(h))
             }
-            Ok(false) => {
+            Ok(None) => {
                 self.store.rollback_disk_overlay_savepoint();
                 self.store.next_id = saved_next_id;
                 Ok(None)
@@ -1563,13 +2156,34 @@ impl Db {
         }
     }
 
+    /// Id of the document addressed by `key` (an id or a uri), whether `docs` is in memory
+    /// or on disk; a cold collection is probed through the engine, not materialized.
+    fn doc_id_for_key(&self, key: &str) -> Option<String> {
+        if self.store.is_disk_backed("docs") {
+            let row = self
+                .store
+                .disk_point_row("docs", "id", key)
+                .or_else(|| self.store.disk_point_row("docs", "uri", key))?;
+            return row_text(&row, "id").map(str::to_string);
+        }
+        self.store
+            .find_doc_key(key)
+            .and_then(|r| row_text(r, "id"))
+            .map(str::to_string)
+    }
+
     /// Durably log `pack`, then apply it to the disk overlay. Returns the pack back.
     fn commit_disk_overlay_pack(&mut self, pack: Pack) -> Result<Pack, Error> {
-        // Inside a multi-statement program the pack only reaches the overlay now; the
-        // program logs all of its packs as one batch at the end.
+        // Inside a multi-statement program or interactive transaction the pack only reaches
+        // the overlay now; all packs are logged as one batch on completion/commit.
         if let Some(packs) = self.cold_program_packs.as_mut() {
             packs.push(pack.clone());
             self.store.apply_pack(&pack);
+            return Ok(pack);
+        }
+        if self.store.is_native_disk() {
+            self.store.commit_pack_to_native_disk(&pack)?;
+            self.store.r#gen += 1;
             return Ok(pack);
         }
         let Some(p) = self.persist.as_mut() else {
@@ -1612,42 +2226,11 @@ impl Db {
             });
         }
         if let Some(pd) = &prepared.point_delete {
-            if !pd.append_only && pd.cas.is_none() {
+            if !pd.append_only && !pd.cas_each && pd.cas.is_none() {
                 return Err(Error::runtime("delete requires cas"));
             }
             if self.disk_overlay_point_dml(&pd.collection) {
-                let Some(row) = self
-                    .store
-                    .disk_point_row(&pd.collection, &pd.field, &pd.key)
-                else {
-                    return Err(Error::runtime("delete: no matching row"));
-                };
-                if !pd.append_only {
-                    let got = row_text(&row, "hash").unwrap_or("");
-                    let cas = pd.cas.as_deref().unwrap_or("");
-                    if got != cas {
-                        return Err(Error::runtime(format!(
-                            "cas mismatch: expected {cas:?}, found {got:?}"
-                        )));
-                    }
-                }
-                let pack = Pack::Delete {
-                    collection: pd.collection.clone(),
-                    rows: vec![row],
-                };
-                let Pack::Delete { rows: out, .. } = self.commit_disk_overlay_pack(pack)? else {
-                    unreachable!("commit_disk_overlay_pack returns its input pack");
-                };
-                return Ok(Handle {
-                    plan: Arc::clone(&prepared.plan),
-                    rows: if want_rows { out } else { Vec::new() },
-                    done: Done {
-                        r#gen: self.store.r#gen,
-                        n: 1,
-                    },
-                    message: None,
-                    ms: 0.0,
-                });
+                return self.exec_cold_point_delete(pd, &prepared.plan, want_rows);
             }
             if self.store.is_disk_backed(&pd.collection) {
                 self.store.promote_disk_col(&pd.collection);
@@ -1676,7 +2259,7 @@ impl Db {
                 Some(i) => i,
                 None => return Err(Error::runtime("delete: no matching row")),
             };
-            if !pd.append_only {
+            if !pd.append_only && !pd.cas_each {
                 let rows = self.store.collection(&pd.collection);
                 let got = row_text(&rows[idx], "hash").unwrap_or("");
                 let cas = pd.cas.as_deref().unwrap_or("");
@@ -1733,71 +2316,17 @@ impl Db {
             });
         }
         if let Some(pu) = &prepared.point_update {
-            if pu.cas.is_none() {
+            if !pu.cas_each && pu.cas.is_none() {
                 return Err(Error::runtime("update requires cas"));
             }
             // Assigning a unique-indexed field needs a uniqueness check against the whole
             // collection, which only the promoted in-memory index provides.
             if self.disk_overlay_point_dml(&pu.collection)
-                && !pu
-                    .record
-                    .fields
-                    .iter()
-                    .any(|(k, _)| self.store.field_in_unique_index(&pu.collection, k))
+                && !pu.record.fields.iter().any(|(k, _)| {
+                    self.store.unique_key_needs_memory(&pu.collection, k)
+                })
             {
-                let Some(before) = self
-                    .store
-                    .disk_point_row(&pu.collection, &pu.field, &pu.key)
-                else {
-                    return Err(Error::runtime("update: no matching row"));
-                };
-                let got = row_text(&before, "hash").unwrap_or("");
-                let cas = pu.cas.as_deref().unwrap_or("");
-                if got != cas {
-                    return Err(Error::runtime(format!(
-                        "cas mismatch: expected {cas:?}, found {got:?}"
-                    )));
-                }
-                let now = now_ms();
-                for (k, _) in &pu.record.fields {
-                    for g in &self.catalog.guards {
-                        if g.collection == pu.collection
-                            && &g.field == k
-                            && eval_pred(&g.pred, &before, now)
-                        {
-                            return Err(Error::runtime(format!(
-                                "immutable field: {}.{k}",
-                                pu.collection
-                            )));
-                        }
-                    }
-                }
-                let mut updated = before;
-                for (k, v) in &pu.record.fields {
-                    updated.insert(k.clone(), value_cell(v, now));
-                }
-                let has_body = pu.record.fields.iter().any(|(k, _)| k == "body");
-                if has_body && let Some(body) = row_text(&updated, "body").map(str::to_string) {
-                    updated.insert("hash".into(), Cell::Text(cached_content_hash(&body)));
-                }
-                self.check_row_fks(&pu.collection, &updated)?;
-                let pack = Pack::Update {
-                    collection: pu.collection.clone(),
-                    rows: vec![updated],
-                };
-                let Pack::Update { rows: out, .. } = self.commit_disk_overlay_pack(pack)? else {
-                    unreachable!("commit_disk_overlay_pack returns its input pack");
-                };
-                return Ok(Handle {
-                    plan: Arc::clone(&prepared.plan),
-                    rows: if want_rows { out } else { Vec::new() },
-                    done: Done {
-                        r#gen: self.store.r#gen,
-                        n: 1,
-                    },
-                    message: None,
-                    ms: 0.0,
-                });
+                return self.exec_cold_point_update(pu, &prepared.plan, want_rows);
             }
             if self.store.is_disk_backed(&pu.collection) {
                 self.store.promote_disk_col(&pu.collection);
@@ -1840,12 +2369,14 @@ impl Db {
                 let docs_col = collections.get_mut(&pu.collection).unwrap();
                 let large_table = docs_col.len() >= 4096;
                 let row = &mut docs_col[idx];
-                let got = row_text(row, "hash").unwrap_or("");
-                let cas = pu.cas.as_deref().unwrap_or("");
-                if got != cas {
-                    return Err(Error::runtime(format!(
-                        "cas mismatch: expected {cas:?}, found {got:?}"
-                    )));
+                if !pu.cas_each {
+                    let got = row_text(row, "hash").unwrap_or("");
+                    let cas = pu.cas.as_deref().unwrap_or("");
+                    if got != cas {
+                        return Err(Error::runtime(format!(
+                            "cas mismatch: expected {cas:?}, found {got:?}"
+                        )));
+                    }
                 }
                 let (new_cell, wing_arc) = if let Some((c, a)) = &pu.const_wing {
                     (c.clone(), Arc::clone(a))
@@ -1989,12 +2520,14 @@ impl Db {
                 });
             }
             let rows = self.store.collection(&pu.collection);
-            let got = row_text(&rows[idx], "hash").unwrap_or("");
-            let cas = pu.cas.as_deref().unwrap_or("");
-            if got != cas {
-                return Err(Error::runtime(format!(
-                    "cas mismatch: expected {cas:?}, found {got:?}"
-                )));
+            if !pu.cas_each {
+                let got = row_text(&rows[idx], "hash").unwrap_or("");
+                let cas = pu.cas.as_deref().unwrap_or("");
+                if got != cas {
+                    return Err(Error::runtime(format!(
+                        "cas mismatch: expected {cas:?}, found {got:?}"
+                    )));
+                }
             }
             let now = now_ms();
             let before_ref = &rows[idx];
@@ -2013,6 +2546,7 @@ impl Db {
                     }
                 }
             }
+            self.check_update_id(&pu.collection, &pu.record, &[idx], now)?;
             let before = before_ref.clone();
             let mut updated = before.clone();
             for (k, v) in &pu.record.fields {
@@ -2020,7 +2554,7 @@ impl Db {
             }
             let has_body = pu.record.fields.iter().any(|(k, _)| k == "body");
             if has_body && let Some(body) = row_text(&updated, "body").map(str::to_string) {
-                updated.insert("hash".into(), Cell::Text(cached_content_hash(&body)));
+                updated.insert("hash", Cell::Text(cached_content_hash(&body)));
             }
             self.check_row_fks(&pu.collection, &updated)?;
             if let Some(rows) = self.store.collections.get_mut(&pu.collection) {
@@ -2147,6 +2681,7 @@ impl Db {
                 pred,
                 cas.as_deref(),
                 *cas_each,
+                None,
                 plan,
                 want_rows,
             );
@@ -2164,9 +2699,7 @@ impl Db {
         ] = stmts
             && self.disk_overlay_point_dml(collection)
             && !record.fields.iter().any(|(k, _)| {
-                k == "id"
-                    || (collection == "docs" && k == "uri")
-                    || self.store.field_in_unique_index(collection, k)
+                self.store.unique_key_needs_memory(collection, k)
             })
         {
             return self.cold_overlay_update(
@@ -2174,6 +2707,7 @@ impl Db {
                 pred.as_ref(),
                 cas.as_deref(),
                 *cas_each,
+                None,
                 record,
                 plan,
                 want_rows,
@@ -2186,21 +2720,24 @@ impl Db {
                 edges,
             },
         ] = stmts
-            && edges.is_empty()
             && !records.is_empty()
             && records.len() <= COLD_OVERLAY_INSERT_MAX_ROWS
             && self.disk_overlay_point_dml(collection)
-            && let Some(h) = self.cold_overlay_insert(collection, records, plan, want_rows)?
+            && let Some(h) =
+                self.cold_overlay_insert_edges(collection, records, edges, None, plan, want_rows)?
         {
             return Ok(h);
         }
         let base_gen = self.store.r#gen;
         let t0 = Instant::now();
+        // Writes to a cold collection need a full backup (see `stmts_write_disk_collection`).
+        let touches_disk = writes && tx::stmts_write_disk_collection(&self.store, stmts);
         let mut undo = if !writes {
             Undo::None
-        } else if append_only && !schema {
+        } else if append_only && !schema && !touches_disk {
             Undo::Append(self.store.append_mark())
         } else if !schema
+            && !touches_disk
             && stmts.iter().all(|s| {
                 matches!(
                     s,
@@ -2266,6 +2803,9 @@ impl Db {
                 }
             }
             self.store.r#gen += 1;
+            if matches!(undo, Undo::Full(_)) {
+                self.store.commit_disk_overlay_savepoint();
+            }
             if let Some(p) = self.persist.as_mut() {
                 self.store.maybe_checkpoint(p)?;
             }
@@ -2273,6 +2813,8 @@ impl Db {
                 self.append_rows += n as u64;
                 self.append_ms += ms;
             }
+        } else if matches!(undo, Undo::Full(_)) {
+            self.store.commit_disk_overlay_savepoint();
         }
         if schema {
             self.plan_cache.clear();
@@ -2314,6 +2856,12 @@ impl Db {
             if !self.uses_gpu_filter(&q)
                 && !self.uses_gpu_join(&q)
                 && let Some(batch) = self.try_join_project_batch(&q, &bindings, now)
+            {
+                return Ok(batch);
+            }
+            if !self.uses_gpu_filter(&q)
+                && !self.uses_gpu_join(&q)
+                && let Some(batch) = self.try_window_project_batch(&q, &bindings, now)
             {
                 return Ok(batch);
             }
@@ -2560,6 +3108,181 @@ impl Db {
         self.store.hnsw_resident_memory(collection)
     }
 
+    /// Insert the rows of a [`RecordBatch`] into `collection` as one atomic statement.
+    ///
+    /// This is the typed counterpart of `insert <collection> [...]`: no query text is built
+    /// or parsed, and the rows go through exactly the same checks and paths as that
+    /// statement (type check, generated ids and content hashes, uniqueness, foreign keys,
+    /// embeddings, WAL, cold overlay). Null cells mean "field absent". Vector columns are
+    /// rejected: embeddings are produced by the configured embedder, not supplied.
+    pub fn insert_batch(&mut self, collection: &str, batch: &RecordBatch) -> Result<Done, Error> {
+        let n = batch.n();
+        if batch.cols.iter().any(|c| c.len() != n) {
+            return Err(Error::runtime("insert_batch: columns have different lengths"));
+        }
+        if n == 0 {
+            return Ok(Done {
+                r#gen: self.store.r#gen,
+                n: 0,
+            });
+        }
+        if let Some(name) = batch
+            .names
+            .iter()
+            .zip(&batch.cols)
+            .find(|(_, col)| match col {
+                crate::batch::Column::Cells(cells) => {
+                    cells.iter().any(|c| matches!(c, Cell::Vec(_)))
+                }
+                _ => false,
+            })
+            .map(|(name, _)| name)
+        {
+            return Err(Error::runtime(format!(
+                "insert_batch: vector column {name} is not supported"
+            )));
+        }
+        if let Some(done) = self.insert_batch_cold(collection, batch)? {
+            return Ok(done);
+        }
+        let mut records: Vec<crate::ast::Record> = (0..n)
+            .map(|_| crate::ast::Record {
+                fields: Vec::with_capacity(batch.cols.len()),
+            })
+            .collect();
+        for (name, col) in batch.names.iter().zip(&batch.cols) {
+            for (i, record) in records.iter_mut().enumerate() {
+                let value = match col.get(i) {
+                    Cell::Null => continue,
+                    Cell::Int(v) => Value::Int(v),
+                    Cell::Float(v) => Value::Float(v),
+                    Cell::Bool(v) => Value::Bool(v),
+                    Cell::Time(v) => Value::Timestamp(v),
+                    Cell::Vec(_) => {
+                        return Err(Error::runtime(format!(
+                            "insert_batch: vector column {name} is not supported"
+                        )));
+                    }
+                    text => match text.text_shared() {
+                        Some(s) => Value::String(s),
+                        None => continue,
+                    },
+                };
+                record.fields.push((name.clone(), value));
+            }
+        }
+        // No source text is involved, so the parser's AST size quota does not apply: the
+        // caller already holds the batch in memory.
+        Ok(self
+            .run_prepared_ext(
+                &self.prepare_stmts_checked(vec![Stmt::Insert {
+                    collection: collection.to_string(),
+                    records,
+                    edges: Vec::new(),
+                }])?,
+                false,
+            )?
+            .done)
+    }
+
+    /// [`Self::insert_batch`] into a cold collection, straight from the columns: the rows
+    /// are built from the batch without a `Record` per row and go to the engine overlay.
+    /// `None` when the statement path must handle the batch (collection in memory, inside
+    /// a program, keys this path does not reproduce).
+    fn insert_batch_cold(
+        &mut self,
+        collection: &str,
+        batch: &RecordBatch,
+    ) -> Result<Option<Done>, Error> {
+        let n = batch.n();
+        if self.follower
+            || n > COLD_OVERLAY_INSERT_MAX_ROWS
+            || self.cold_program_packs.is_some()
+            || !self.disk_overlay_point_dml(collection)
+        {
+            return Ok(None);
+        }
+        // The checker's type rules depend only on the kind of each value, so one record
+        // per (column, kind of cell) with a placeholder value reproduces exactly what it
+        // would say about the batch.
+        use crate::batch::Column;
+        let mut probes: Vec<crate::ast::Record> = Vec::new();
+        let mut has_null = false;
+        for (name, col) in batch.names.iter().zip(&batch.cols) {
+            let mut kinds: smallvec::SmallVec<[Value; 2]> = smallvec::SmallVec::new();
+            match col {
+                Column::Nulls { .. } => has_null = true,
+                Column::Int { valid, .. } => {
+                    has_null |= valid.null_count() > 0;
+                    kinds.push(Value::Int(0));
+                }
+                Column::Float { valid, .. } => {
+                    has_null |= valid.null_count() > 0;
+                    kinds.push(Value::Float(0.0));
+                }
+                Column::Bool { valid, .. } => {
+                    has_null |= valid.null_count() > 0;
+                    kinds.push(Value::Bool(false));
+                }
+                Column::Time { valid, .. } => {
+                    has_null |= valid.null_count() > 0;
+                    kinds.push(Value::Timestamp(0));
+                }
+                Column::Cells(cells) => {
+                    let mut seen = [false; 5];
+                    for cell in cells {
+                        let (slot, value) = match cell {
+                            Cell::Null => {
+                                has_null = true;
+                                continue;
+                            }
+                            Cell::Text(_) | Cell::SmallText(_) => (0, Value::String(Arc::from(""))),
+                            Cell::Int(_) => (1, Value::Int(0)),
+                            Cell::Float(_) => (2, Value::Float(0.0)),
+                            Cell::Bool(_) => (3, Value::Bool(false)),
+                            Cell::Time(_) => (4, Value::Timestamp(0)),
+                            Cell::Vec(_) => continue,
+                        };
+                        if !seen[slot] {
+                            seen[slot] = true;
+                            kinds.push(value);
+                        }
+                    }
+                }
+            }
+            for value in kinds {
+                probes.push(crate::ast::Record {
+                    fields: vec![(name.clone(), value)],
+                });
+            }
+        }
+        if probes.is_empty() {
+            // Every cell is null: a record of absent fields; let the statement path decide.
+            return Ok(None);
+        }
+        check::check_program(
+            &[Stmt::Insert {
+                collection: collection.to_string(),
+                records: probes,
+                edges: Vec::new(),
+            }],
+            &self.catalog,
+        )?;
+        if !self.store.fts_deferred_doc_swaps.is_empty() {
+            self.store.flush_fts_deferred_docs();
+        }
+        let mut rows = batch.to_rows();
+        if has_null {
+            for row in &mut rows {
+                row.retain(|_, cell| !matches!(cell, Cell::Null));
+            }
+        }
+        let plan = tx::dummy_dml_plan();
+        Ok(self
+            .cold_overlay_insert_rows(collection, rows, &[], 0, None, &plan, false)?
+            .map(|h| h.done))
+    }
+
     /// Keep a cold collection physically ordered by `field` (pass `None` to stop).
     /// Range filters on the cluster key then skip most zone-map blocks. Requires the
     /// collection to be in the disk tier already.
@@ -2587,14 +3310,17 @@ impl Db {
     /// Begin an interactive ACID transaction.
     pub fn transaction(&mut self) -> Result<Transaction<'_>, Error> {
         let base_gen = self.store.r#gen;
+        let base_next_id = self.store.next_id;
         Ok(Transaction {
             db: self,
             base_gen,
+            base_next_id,
             committed: false,
             undo: Undo::None,
             cat_backup: None,
             packs: Vec::new(),
             schema_changed: false,
+            disk_savepoint: false,
             mutation_count: 0,
             journal_bytes: 0,
         })
@@ -2702,6 +3428,9 @@ impl Db {
             }
             if let Some(rows) = self.try_join_project(q, bindings, now) {
                 return Ok(rows);
+            }
+            if let Some(batch) = self.try_window_project_batch(q, bindings, now) {
+                return Ok(batch.to_rows());
             }
         }
 
@@ -2887,14 +3616,15 @@ impl Db {
                         rows.retain(|_| mask.next().expect("one GPU mask per row"));
                         continue;
                     }
-                    rows.retain(|r| eval_pred(pred, r, now));
+                    let mut slots = eval::PredSlots::new(pred);
+                    rows.retain(|r| slots.eval(r, now));
                 }
                 Step::Project(fields) => {
                     if skip_first_project {
                         skip_first_project = false;
                         continue;
                     }
-                    rows = project(&rows, fields);
+                    rows = project_owned(rows, fields);
                 }
                 Step::Join {
                     left,
@@ -3136,8 +3866,9 @@ impl Db {
         }
         let col = self.store.collection(name);
         let mut out = Vec::new();
+        let mut slots = eval::PredSlots::new(pred);
         for r in col {
-            if eval_pred(pred, r, now) {
+            if slots.eval(r, now) {
                 out.push(match names.as_deref() {
                     Some(fs) => project_fields(r, fs),
                     None => {
@@ -3174,17 +3905,18 @@ impl Db {
         let id_only = names
             .as_deref()
             .is_some_and(|fs| fs.len() == 1 && fs[0] == "id");
+        let mut slots = eval::PredSlots::new(pred);
         for &i in idxs {
             let Some(row) = self.store.get_by_idx(name, i) else {
                 continue;
             };
-            if !covered && !eval_pred(pred, row, now) {
+            if !covered && !slots.eval(row, now) {
                 continue;
             }
             if id_only {
                 let mut r = acquire_row();
                 r.insert(
-                    "id".into(),
+                    "id",
                     row.get("id")
                         .map(Cell::clone_for_borrow)
                         .unwrap_or(Cell::Null),
@@ -3581,8 +4313,8 @@ pub(crate) fn pack_affect_n(pack: Option<&Pack>) -> Option<usize> {
 }
 
 fn meta_row(kind: &str, name: &str) -> Row {
-    let mut r = BTreeMap::new();
-    r.insert("kind".into(), Cell::text_arc(kind));
-    r.insert("name".into(), Cell::text_arc(name));
+    let mut r = Row::new();
+    r.insert("kind", Cell::text_arc(kind));
+    r.insert("name", Cell::text_arc(name));
     r
 }

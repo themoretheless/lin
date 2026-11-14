@@ -23,6 +23,10 @@ pub struct DiskSegment {
     pub(super) col_pos: FxHashMap<String, usize>,
     pub(super) pk_index: MmapHashIndex,
     pub(super) sec_indexes: FxHashMap<String, MmapHashIndex>,
+    /// Column positions in field-name order, and the shape of a row carrying every
+    /// column: a row with no absent value is built from them without touching names.
+    name_order: Vec<usize>,
+    full_shape: Arc<crate::store::RowShape>,
 }
 
 impl DiskSegment {
@@ -70,25 +74,50 @@ impl DiskSegment {
             }
         }
 
+        let mut name_order: Vec<usize> = (0..cols.len()).collect();
+        name_order.sort_unstable_by(|&a, &b| cols[a].0.cmp(&cols[b].0));
+        let names: Vec<&str> = cols.iter().map(|(n, _)| n.as_str()).collect();
+        let full_shape = Row::shape_of(&names);
+
         Ok(Self {
             meta,
             cols,
             col_pos,
             pk_index,
             sec_indexes,
+            name_order,
+            full_shape,
         })
     }
 
     #[inline]
     pub fn materialize_row(&self, row_id: u32) -> Result<Row, Error> {
-        let mut row = Row::new();
-        for (name, col) in &self.cols {
-            let cell = col.get_cell(row_id)?;
-            if !matches!(cell, Cell::Null) {
-                row.insert(name.clone(), cell);
-            }
+        let mut cells: smallvec::SmallVec<[Cell; 8]> =
+            smallvec::SmallVec::with_capacity(self.name_order.len());
+        let mut absent = 0usize;
+        for &pos in &self.name_order {
+            let cell = self.cols[pos].1.get_cell(row_id)?;
+            absent += usize::from(matches!(cell, Cell::Null));
+            cells.push(cell);
         }
-        Ok(row)
+        if absent == cells.len() {
+            return Ok(Row::new());
+        }
+        if absent == 0 {
+            return Ok(Row::from_parts(Arc::clone(&self.full_shape), cells));
+        }
+        // Absent values are not stored in a row: keep the present ones, in name order.
+        let present: smallvec::SmallVec<[usize; 8]> = self
+            .name_order
+            .iter()
+            .zip(cells.iter())
+            .filter(|(_, c)| !matches!(c, Cell::Null))
+            .map(|(&pos, _)| pos)
+            .collect();
+        Ok(Row::from_sorted(
+            present.iter().map(|&pos| self.cols[pos].0.as_str()),
+            cells.into_iter().filter(|c| !matches!(c, Cell::Null)),
+        ))
     }
 
     #[inline]
@@ -315,7 +344,15 @@ fn write_single_column(
     col: &DiskColSchema,
     src: ColSrc<'_>,
 ) -> Result<DiskColKind, Error> {
-    match col.kind {
+    // A column typed `Int64` from its first values may later receive fractional numbers
+    // (`f64` fields accept integer literals). Writing those into an integer file would store
+    // them as nulls, so the segment's column widens to `Float64` instead.
+    let kind = if col.kind == DiskColKind::Int64 && src.has_float() {
+        DiskColKind::Float64
+    } else {
+        col.kind
+    };
+    match kind {
         DiskColKind::Int64 | DiskColKind::Time64 => {
             let mut nulls = vec![1u8; src.len()];
             let mut vals = Vec::with_capacity(src.len() * 8);
@@ -330,8 +367,8 @@ fn write_single_column(
             }
             fs::write(seg_dir.join(format!("col_{}.null", col.name)), &nulls).map_err(io_err)?;
             fs::write(seg_dir.join(format!("col_{}.val", col.name)), &vals).map_err(io_err)?;
-            write_zone_map(seg_dir, &col.name, col.kind, &nulls, &vals)?;
-            Ok(col.kind)
+            write_zone_map(seg_dir, &col.name, kind, &nulls, &vals)?;
+            Ok(kind)
         }
         DiskColKind::Float64 => {
             let mut nulls = vec![1u8; src.len()];
@@ -644,6 +681,19 @@ impl<'a> ColSrc<'a> {
             ColSrc::Rows(rows, name) => rows[i].get(*name),
             ColSrc::Col(col) => col.cell_ref(i),
             ColSrc::Absent(_) => None,
+        }
+    }
+
+    /// True when some value of the column is a float.
+    pub(super) fn has_float(&self) -> bool {
+        use crate::batch::Column;
+        match self {
+            ColSrc::Col(Column::Float { vals, valid }) => {
+                (0..vals.len()).any(|i| valid.is_valid(i))
+            }
+            ColSrc::Col(col) if col.is_typed() => false,
+            ColSrc::Absent(_) => false,
+            _ => (0..self.len()).any(|i| matches!(self.cell_ref(i), Some(Cell::Float(_)))),
         }
     }
 

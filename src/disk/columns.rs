@@ -871,24 +871,70 @@ impl MmapFixedCol {
         }
     }
 
-    /// True when zone-map block `bi` provably holds no row satisfying `col <op> rhs`.
-    /// Mirrors the type-strict rules of row-level comparison; any other pairing never skips.
-    pub(crate) fn zone_block_skips(&self, bi: usize, op: crate::ast::CmpOp, rhs: &Cell) -> bool {
-        match (self.zones(), self.kind, rhs) {
+
+    /// `(none, all)` for `is null` over block `bi`: whether no value, or every value, of
+    /// the block is null. `(false, false)` when the column keeps no zone map.
+    pub(crate) fn zone_block_null_relation(&self, bi: usize) -> (bool, bool) {
+        let rows = (self.row_count as usize).saturating_sub(bi * ZONE_BLOCK_ROWS);
+        let blk_len = rows.min(ZONE_BLOCK_ROWS) as u32;
+        let non_null = match self.zones() {
+            FixedZoneMap::Int(blks) => blks.get(bi).map(|b| b.non_null),
+            FixedZoneMap::Float(blks) => blks.get(bi).map(|b| b.non_null),
+            FixedZoneMap::None => None,
+        };
+        match non_null {
+            _ if blk_len == 0 => (true, false),
+            Some(nn) => (nn == blk_len, nn == 0),
+            None => (false, false),
+        }
+    }
+
+    /// `(none, all)` for one zone block under scan semantics: whether no row, or every
+    /// row, of the block satisfies `value <op> rhs`. A null never satisfies a comparison
+    /// except `!=`, which it always satisfies. `(false, false)` when min/max cannot decide.
+    pub(crate) fn zone_block_relation(
+        &self,
+        bi: usize,
+        op: crate::ast::CmpOp,
+        rhs: &Cell,
+    ) -> (bool, bool) {
+        let rows = (self.row_count as usize).saturating_sub(bi * ZONE_BLOCK_ROWS);
+        let blk_len = rows.min(ZONE_BLOCK_ROWS) as u32;
+        let (rel, non_null) = match (self.zones(), self.kind, rhs) {
             (FixedZoneMap::Int(blks), DiskColKind::Int64, Cell::Int(r))
-            | (FixedZoneMap::Int(blks), DiskColKind::Time64, Cell::Time(r)) => {
-                blks.get(bi).is_some_and(|b| int_zone_relation(*b, op, *r).0)
-            }
+            | (FixedZoneMap::Int(blks), DiskColKind::Time64, Cell::Time(r)) => match blks.get(bi) {
+                Some(b) => (int_zone_relation(*b, op, *r), b.non_null),
+                None => return (false, false),
+            },
             (FixedZoneMap::Float(blks), DiskColKind::Float64, Cell::Float(r)) if !r.is_nan() => {
-                blks.get(bi).is_some_and(|b| float_zone_relation(*b, op, *r).0)
+                match blks.get(bi) {
+                    Some(b) if !b.has_nan => (float_zone_relation(*b, op, *r), b.non_null),
+                    _ => return (false, false),
+                }
             }
             (FixedZoneMap::Float(blks), DiskColKind::Float64, Cell::Int(r))
                 if r.unsigned_abs() <= (1u64 << 53) =>
             {
-                blks.get(bi)
-                    .is_some_and(|b| float_zone_relation(*b, op, *r as f64).0)
+                match blks.get(bi) {
+                    Some(b) if !b.has_nan => (float_zone_relation(*b, op, *r as f64), b.non_null),
+                    _ => return (false, false),
+                }
             }
-            _ => false,
+            _ => return (false, false),
+        };
+        if blk_len == 0 {
+            return (true, false);
+        }
+        let is_ne = op == crate::ast::CmpOp::Ne;
+        if non_null == 0 {
+            // Every value is null: only `!=` holds, and it holds for all of them.
+            return (!is_ne, is_ne);
+        }
+        let no_nulls = non_null == blk_len;
+        if is_ne {
+            (rel.0 && no_nulls, rel.1)
+        } else {
+            (rel.0, rel.1 && no_nulls)
         }
     }
 

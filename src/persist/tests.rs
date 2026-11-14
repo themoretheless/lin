@@ -243,7 +243,7 @@ mod wal_integrity_tests {
         assert_eq!(rmp_serde::to_vec_named(&decoded).unwrap(), legacy);
         let text: Arc<str> = Arc::from("привет\0世界");
         let rows = [Row::from([(
-            "title".into(),
+            "title",
             Cell::text_arc(Arc::clone(&text)),
         )])];
         let Pack::InsertCols {
@@ -270,7 +270,7 @@ mod wal_integrity_tests {
         let values = vec![-0.0f32, f32::from_bits(0x7fc00001), f32::INFINITY];
         let rows = [
             Row::from([
-                ("bool".into(), Cell::Bool(true)),
+                ("bool", Cell::Bool(true)),
                 ("float".into(), Cell::Float(1.5)),
                 ("int".into(), Cell::Int(10)),
                 ("text".into(), Cell::text_arc("a")),
@@ -278,7 +278,7 @@ mod wal_integrity_tests {
                 ("vector".into(), Cell::vec_arc(values.clone())),
             ]),
             Row::from([
-                ("bool".into(), Cell::Null),
+                ("bool", Cell::Null),
                 ("float".into(), Cell::Int(7)),
                 ("int".into(), Cell::Float(8.5)),
                 ("text".into(), Cell::Int(99)),
@@ -324,8 +324,8 @@ mod wal_integrity_tests {
             assert_eq!(actual, expected);
         });
         let rows = [
-            Row::from([("x".into(), Cell::Null)]),
-            Row::from([("x".into(), Cell::Int(9))]),
+            Row::from([("x", Cell::Null)]),
+            Row::from([("x", Cell::Int(9))]),
         ];
         let Pack::InsertCols { cols, .. } = rows_to_insert_cols("test", &rows, vec![]) else {
             panic!("columns")
@@ -337,10 +337,10 @@ mod wal_integrity_tests {
     fn column_field_union_keeps_later_extra_and_replaced_fields() {
         use crate::store::{Cell, Row};
         let rows = [
-            Row::from([("a".into(), Cell::Int(1)), ("b".into(), Cell::Int(2))]),
-            Row::from([("a".into(), Cell::Int(3)), ("b".into(), Cell::Int(4))]),
-            Row::from([("a".into(), Cell::Int(5)), ("c".into(), Cell::Int(6))]),
-            Row::from([("d".into(), Cell::Int(7))]),
+            Row::from([("a", Cell::Int(1)), ("b", Cell::Int(2))]),
+            Row::from([("a", Cell::Int(3)), ("b", Cell::Int(4))]),
+            Row::from([("a", Cell::Int(5)), ("c", Cell::Int(6))]),
+            Row::from([("d", Cell::Int(7))]),
         ];
         let Pack::InsertCols {
             fields, cols, n, ..
@@ -497,7 +497,9 @@ mod wal_integrity_tests {
                 (cursor, u32::MAX),
                 (cursor + 4, 5),
                 (cursor + 8, 4),
+                // Second index equal to the first (repeated), then below it (unordered).
                 (cursor + 16, 1),
+                (cursor + 16, 0),
             ] {
                 let mut bad = raw.to_vec();
                 bad[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
@@ -580,6 +582,241 @@ mod wal_integrity_tests {
             assert!(replay_log(file, 0, 0, |_| Ok(())).is_err());
             assert_eq!(file.metadata().unwrap().len(), corrupt.len() as u64);
         });
+    }
+
+    /// The 8-byte frame header (magic + length) is outside the checksum, so a damaged
+    /// header has to be caught by the length bounds or by the payload no longer
+    /// verifying. No single-bit change of it may yield the original records, and no
+    /// length value may read outside the buffer.
+    #[test]
+    fn frame_header_mutations_and_length_bounds_are_rejected() {
+        with_log(|file| {
+            let one = frame(
+                file,
+                Pack::AppendFactsBulk {
+                    s: vec![Arc::from("subject")],
+                    p: vec![Arc::from("predicate")],
+                    o: vec![Arc::from("object")],
+                },
+            );
+            assert_eq!(&one[..4], &LOG_MAGIC_CHECKSUM);
+            let payload_len = u32::from_le_bytes(one[4..8].try_into().unwrap());
+            assert_eq!(payload_len as usize, one.len() - 8);
+            // Two frames back to back, so a shortened or lengthened first frame leaves
+            // real bytes for the parser to misread.
+            let mut two = one.clone();
+            two.extend_from_slice(&one);
+            assert_eq!(for_each_wal_frame(&two, |_| Ok(())).unwrap(), 2);
+
+            for byte in 0..8 {
+                for bit in 0..8 {
+                    let mut bad = two.clone();
+                    bad[byte] ^= 1 << bit;
+                    assert!(
+                        for_each_wal_frame(&bad, |_| Ok(())).is_err(),
+                        "header byte {byte} bit {bit}"
+                    );
+                }
+            }
+
+            let with_len = |len: u32| {
+                let mut bad = two.clone();
+                bad[4..8].copy_from_slice(&len.to_le_bytes());
+                bad
+            };
+            for len in [
+                0,
+                1,
+                payload_len - 1,
+                payload_len + 1,
+                // Exactly the rest of the buffer, i.e. both frames read as one payload.
+                (two.len() - 8) as u32,
+                (two.len() - 8) as u32 + 1,
+                MAX_RECORD,
+                MAX_RECORD + 1,
+                u32::MAX - 7,
+                u32::MAX,
+            ] {
+                assert!(
+                    for_each_wal_frame(&with_len(len), |_| Ok(())).is_err(),
+                    "length {len}"
+                );
+            }
+
+            // Replay of the same damage never yields a record that was not written and
+            // never panics: it stops at the damaged frame, as an error or a torn tail.
+            for len in [0, payload_len + 1, MAX_RECORD + 1, u32::MAX] {
+                file.set_len(0).unwrap();
+                file.seek(SeekFrom::Start(0)).unwrap();
+                file.write_all(&with_len(len)).unwrap();
+                let mut seen = 0;
+                let _ = replay_log(file, 0, 0, |_| {
+                    seen += 1;
+                    Ok(())
+                });
+                assert_eq!(seen, 0, "length {len}");
+            }
+        });
+    }
+
+    /// A compressed frame (codec 4) is read back, and one that expands past the decoded
+    /// budget is refused before the expansion is allocated.
+    #[cfg(any(feature = "compress-wal", feature = "compress-flate"))]
+    #[test]
+    fn compressed_frame_decodes_and_refuses_amplification() {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        let gz = |raw: &[u8]| -> Vec<u8> {
+            let mut enc = GzEncoder::new(Vec::new(), Compression::best());
+            enc.write_all(raw).unwrap();
+            enc.finish().unwrap()
+        };
+        // Checksummed payload: codec byte, body, CRC over both.
+        let payload = |body: &[u8]| -> Vec<u8> {
+            let mut p = vec![4u8];
+            p.extend_from_slice(body);
+            let crc = crate::crc::hardware_crc32c(&p);
+            p.extend_from_slice(&crc.to_le_bytes());
+            p
+        };
+        let record = LogRecord {
+            r#gen: 7,
+            next_id: 8,
+            pack: Pack::AppendFactsBulk {
+                s: vec![Arc::from("s")],
+                p: vec![Arc::from("p")],
+                o: vec![Arc::from("o")],
+            },
+        };
+        let mut raw = Vec::new();
+        rmp_serde::encode::write_named(&mut raw, &record).unwrap();
+        let decoded = decode_frame(&LOG_MAGIC_CHECKSUM, &payload(&gz(&raw))).unwrap();
+        assert_eq!(decoded.r#gen, 7);
+        assert!(matches!(decoded.pack, Pack::AppendFactsBulk { .. }));
+
+        // Zeros compress about a thousandfold: well under the frame limit on the wire,
+        // past the decoded budget once expanded.
+        let bomb = gz(&vec![0u8; MAX_COMPRESSED_RECORD_DECODED + 1024]);
+        assert!(bomb.len() < MAX_RECORD as usize / 16, "bomb is {} bytes", bomb.len());
+        let err = decode_frame(&LOG_MAGIC_CHECKSUM, &payload(&bomb)).err().expect("refused");
+        assert!(err.to_string().contains("decoded size limit"), "{err}");
+
+        // A truncated stream is an error, not a short record.
+        let cut = gz(&raw);
+        assert!(decode_frame(&LOG_MAGIC_CHECKSUM, &payload(&cut[..cut.len() - 5])).is_err());
+    }
+
+    /// A writer that takes at most `chunk` bytes per call and fails or stalls on a script.
+    struct ScriptedWriter {
+        out: Vec<u8>,
+        chunk: usize,
+        /// Outcome of each next call, front first; once empty every call writes.
+        script: std::collections::VecDeque<Option<io::ErrorKind>>,
+        vectored_calls: usize,
+        plain_calls: usize,
+    }
+
+    impl ScriptedWriter {
+        fn new(chunk: usize, script: &[Option<io::ErrorKind>]) -> Self {
+            ScriptedWriter {
+                out: Vec::new(),
+                chunk,
+                script: script.iter().copied().collect(),
+                vectored_calls: 0,
+                plain_calls: 0,
+            }
+        }
+
+        fn step(&mut self) -> io::Result<()> {
+            match self.script.pop_front() {
+                Some(Some(kind)) => Err(io::Error::from(kind)),
+                _ => Ok(()),
+            }
+        }
+    }
+
+    impl Write for ScriptedWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.plain_calls += 1;
+            self.step()?;
+            let n = buf.len().min(self.chunk);
+            self.out.extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
+
+        fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+            self.vectored_calls += 1;
+            self.step()?;
+            let mut left = self.chunk;
+            let mut n = 0;
+            for buf in bufs {
+                let take = buf.len().min(left);
+                self.out.extend_from_slice(&buf[..take]);
+                n += take;
+                left -= take;
+                if left == 0 {
+                    break;
+                }
+            }
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The vectored frame write delivers every byte in order whatever the writer does:
+    /// short writes of any size (including a cut inside each slice), empty slices, an
+    /// interrupted call, and it reports a writer that accepts nothing.
+    #[test]
+    fn vectored_frame_write_survives_short_writes_interrupts_and_zero() {
+        let parts: [&[u8]; 6] = [b"LIN\x06head", b"", b"payload-bytes-0123456789", b"", b"crc!", b""];
+        let slices: Vec<io::IoSlice<'_>> = parts.iter().map(|p| io::IoSlice::new(p)).collect();
+        let want: Vec<u8> = parts.concat();
+
+        for chunk in 1..=want.len() + 2 {
+            let mut w = ScriptedWriter::new(chunk, &[]);
+            write_all_vectored(&mut w, &slices).unwrap();
+            assert_eq!(w.out, want, "chunk {chunk}");
+            assert_eq!(w.vectored_calls, 1, "chunk {chunk}");
+        }
+
+        // Interrupted before anything was written, several times in a row, and again in
+        // the middle of finishing a short write.
+        let interrupted = Some(io::ErrorKind::Interrupted);
+        let mut w = ScriptedWriter::new(5, &[interrupted, interrupted, None, interrupted, None, interrupted]);
+        write_all_vectored(&mut w, &slices).unwrap();
+        assert_eq!(w.out, want);
+        assert_eq!(w.vectored_calls, 3, "two interrupted attempts, then the one that wrote");
+
+        // Any other error is returned as it is, with nothing retried.
+        let mut w = ScriptedWriter::new(5, &[Some(io::ErrorKind::PermissionDenied)]);
+        let err = write_all_vectored(&mut w, &slices).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(w.out.is_empty());
+        let mut w = ScriptedWriter::new(5, &[None, Some(io::ErrorKind::StorageFull)]);
+        let err = write_all_vectored(&mut w, &slices).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::StorageFull);
+        assert_eq!(w.out, want[..5], "the bytes before the failure stay written");
+
+        // A writer that takes nothing is an error, not a loop and not a silent success.
+        let mut w = ScriptedWriter::new(0, &[]);
+        let err = write_all_vectored(&mut w, &slices).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WriteZero);
+
+        // Nothing to write: no call at all.
+        let mut w = ScriptedWriter::new(8, &[Some(io::ErrorKind::PermissionDenied)]);
+        write_all_vectored(&mut w, &[]).unwrap();
+        write_all_vectored(&mut w, &[io::IoSlice::new(b""), io::IoSlice::new(b"")]).unwrap();
+        assert_eq!((w.vectored_calls, w.plain_calls), (0, 0));
+
+        // More slices than one vectored call takes (the writer stops after `chunk` bytes).
+        let many: Vec<Vec<u8>> = (0..3000u32).map(|i| i.to_le_bytes().to_vec()).collect();
+        let many_slices: Vec<io::IoSlice<'_>> = many.iter().map(|b| io::IoSlice::new(b)).collect();
+        let mut w = ScriptedWriter::new(4096, &[]);
+        write_all_vectored(&mut w, &many_slices).unwrap();
+        assert_eq!(w.out, many.concat());
     }
 
     #[test]
@@ -688,7 +925,7 @@ mod shared_vector_wire_tests {
         assert_eq!(rmp_serde::to_vec_named(&decoded).unwrap(), legacy);
         let embedding: Arc<[f32]> = Arc::from([0.0, -0.0, 1.25]);
         let rows = [Row::from([(
-            "embedding".into(),
+            "embedding",
             Cell::vec_arc(Arc::clone(&embedding)),
         )])];
         let Pack::InsertCols {
@@ -870,6 +1107,200 @@ mod dictionary_wal_tests {
             ]
         );
     }
+    /// One frame holding one vector column, encoded with the dictionary writer on or off.
+    fn vector_frame(vectors: &[Option<Vec<f32>>], dictionary: bool) -> Vec<u8> {
+        let path = fresh();
+        let mut f = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let rec = LogRecord {
+            r#gen: 1,
+            next_id: 2,
+            pack: Pack::InsertCols {
+                collection: "docs".into(),
+                fields: vec!["embedding".into()],
+                cols: vec![ColData::Vec(
+                    vectors.iter().map(|v| v.clone().map(std::sync::Arc::from)).collect(),
+                )],
+                n: vectors.len() as u32,
+                edges: vec![],
+            },
+        };
+        with_dictionary_writer(dictionary, || {
+            append_record(&mut f, &rec, &mut Vec::new(), SyncMode::Normal, &mut 0).unwrap()
+        });
+        f.seek(SeekFrom::Start(0)).unwrap();
+        let mut bytes = Vec::new();
+        f.read_to_end(&mut bytes).unwrap();
+        drop(f);
+        fs::remove_file(path).unwrap();
+        bytes
+    }
+
+    fn decoded_bits(frame: &[u8]) -> Vec<Option<Vec<u32>>> {
+        let rec = decode_frame(&LOG_MAGIC_CHECKSUM, &frame[8..]).unwrap();
+        let Pack::InsertCols { cols, .. } = rec.pack else {
+            panic!("insert cols")
+        };
+        let ColData::Vec(rows) = &cols[0] else {
+            panic!("vector column")
+        };
+        rows.iter()
+            .map(|r| r.as_ref().map(|v| v.iter().map(|x| x.to_bits()).collect()))
+            .collect()
+    }
+
+    fn bits_of(vectors: &[Option<Vec<f32>>]) -> Vec<Option<Vec<u32>>> {
+        vectors
+            .iter()
+            .map(|r| r.as_ref().map(|v| v.iter().map(|x| x.to_bits()).collect()))
+            .collect()
+    }
+
+    /// Vectors shaped like the default embedder's: wide, mostly zero, a handful of
+    /// distinct values.
+    fn few_valued(rows: usize, dim: usize, distinct: usize) -> Vec<Option<Vec<f32>>> {
+        (0..rows)
+            .map(|r| {
+                let mut v = vec![0.0f32; dim];
+                for k in 0..dim / 12 {
+                    let at = (r * 31 + k * 97) % dim;
+                    v[at] = 0.125 * (1 + (r + k) % distinct) as f32;
+                }
+                Some(v)
+            })
+            .collect()
+    }
+
+    /// With the writer on, a column that is smaller in the dictionary layout is framed
+    /// under codec 5 and reads back bit for bit, including absent and empty vectors,
+    /// `-0.0`, infinities and NaN payloads, rows with more than 16 distinct values (raw
+    /// escape) and the 16-bit / 32-bit index boundary.
+    #[test]
+    fn dictionary_writer_roundtrips_bits_and_is_smaller() {
+        let mut vectors = few_valued(64, 768, 5);
+        vectors[3] = None;
+        vectors[4] = Some(Vec::new());
+        vectors[5] = Some({
+            let mut v = vec![0.0f32; 768];
+            v[0] = -0.0;
+            v[1] = f32::INFINITY;
+            v[2] = f32::NEG_INFINITY;
+            v[3] = f32::from_bits(0x7fc0_0001);
+            v[4] = f32::from_bits(0xffc0_1234);
+            v[767] = f32::MIN_POSITIVE;
+            v
+        });
+        // 40 distinct values in one row: the raw escape.
+        vectors[6] = Some((0..768).map(|i| if i % 19 == 0 { 1.0 + i as f32 } else { 0.0 }).collect());
+        // Exactly 16 and exactly 17 distinct values.
+        vectors[7] = Some((0..768).map(|i| if i < 64 { 1.0 + (i % 16) as f32 } else { 0.0 }).collect());
+        vectors[8] = Some((0..768).map(|i| if i < 64 { 1.0 + (i % 17) as f32 } else { 0.0 }).collect());
+        // An all-zero vector is present, not absent.
+        vectors[9] = Some(vec![0.0f32; 768]);
+
+        let sparse = vector_frame(&vectors, false);
+        let dict = vector_frame(&vectors, true);
+        assert_eq!(sparse[8], 3, "writer off keeps the sparse codec");
+        assert_eq!(dict[8], 5, "writer on selects the dictionary codec");
+        assert!(dict.len() < sparse.len(), "dictionary {} vs sparse {}", dict.len(), sparse.len());
+        assert_eq!(decoded_bits(&dict), bits_of(&vectors));
+        assert_eq!(decoded_bits(&sparse), bits_of(&vectors));
+        // The frame is checksummed like any other: every flipped byte is caught.
+        for offset in (8..dict.len()).step_by(37) {
+            let mut bad = dict.clone();
+            bad[offset] ^= 0x10;
+            assert!(for_each_wal_frame(&bad, |_| Ok(())).is_err(), "offset {offset}");
+        }
+        assert_eq!(for_each_wal_frame(&dict, |_| Ok(())).unwrap(), 1);
+
+        // Index width: u16 up to dimension 65536, u32 above; the last position is used.
+        for dim in [65535usize, 65536, 65537] {
+            let rows: Vec<Option<Vec<f32>>> = (0..3)
+                .map(|r| {
+                    let mut v = vec![0.0f32; dim];
+                    for k in 0..200 {
+                        v[(k * 311 + r) % dim] = 0.5;
+                    }
+                    v[dim - 1] = -2.0;
+                    v[0] = 2.0;
+                    Some(v)
+                })
+                .collect();
+            let frame = vector_frame(&rows, true);
+            assert_eq!(frame[8], 5, "dimension {dim}");
+            assert_eq!(decoded_bits(&frame), bits_of(&rows), "dimension {dim}");
+        }
+    }
+
+    /// The dictionary layout is chosen only when it is strictly smaller. Dense vectors,
+    /// rows of all-distinct values and tiny columns keep the codec they had, byte for
+    /// byte, with the writer on.
+    #[test]
+    fn dictionary_writer_keeps_existing_codecs_when_it_does_not_help() {
+        // Dense: every value nonzero, so the column is not sparse to begin with.
+        let dense: Vec<Option<Vec<f32>>> =
+            (0..100).map(|r| Some((0..1024).map(|i| 1.0 + ((i + r) % 7) as f32).collect())).collect();
+        // Sparse with all-distinct values: the raw escape costs one byte more per row.
+        let distinct: Vec<Option<Vec<f32>>> = (0..64)
+            .map(|r| {
+                Some((0..768).map(|i| if i % 11 == 0 { 1.0 + (i * 64 + r) as f32 } else { 0.0 }).collect())
+            })
+            .collect();
+        // Below the size at which vectors are considered for sparse encoding at all.
+        let tiny: Vec<Option<Vec<f32>>> = vec![Some(vec![0.0, 1.0, 0.0, 1.0])];
+        for (name, vectors) in [("dense", &dense), ("distinct", &distinct), ("tiny", &tiny)] {
+            let off = vector_frame(vectors, false);
+            let on = vector_frame(vectors, true);
+            assert_ne!(on[8], 5, "{name}: dictionary codec selected");
+            assert_eq!(on, off, "{name}: bytes changed with the writer on");
+            assert_eq!(decoded_bits(&on), bits_of(vectors), "{name}");
+        }
+    }
+
+    /// Both encoders (from typed columns and straight from rows) make the same choice and
+    /// produce frames that decode to the same vectors.
+    #[test]
+    fn dictionary_writer_row_encoder_matches_column_encoder() {
+        let vectors = few_valued(48, 768, 4);
+        let rows: Vec<Row> = vectors
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                Row::from([
+                    ("embedding", crate::store::Cell::Vec(std::sync::Arc::from(v.clone().unwrap()))),
+                    ("id", crate::store::Cell::Text(std::sync::Arc::from(format!("d{i}")))),
+                ])
+            })
+            .collect();
+        for dictionary in [false, true] {
+            let mut buf = Vec::new();
+            let encoded = with_dictionary_writer(dictionary, || {
+                encode_insert_rows_direct(1, 2, "docs", &rows, &mut buf)
+            });
+            let Some((magic, _fields)) = encoded else {
+                panic!("rows were not eligible for the direct encoder");
+            };
+            assert_eq!(magic[3], if dictionary { 5 } else { 3 }, "dictionary={dictionary}");
+            let rec = decode_frame(&magic, &buf).unwrap();
+            let Pack::InsertCols { fields, cols, .. } = rec.pack else {
+                panic!("insert cols")
+            };
+            let at = fields.iter().position(|f| f == "embedding").unwrap();
+            let ColData::Vec(decoded) = &cols[at] else {
+                panic!("vector column")
+            };
+            let got: Vec<Option<Vec<u32>>> = decoded
+                .iter()
+                .map(|r| r.as_ref().map(|v| v.iter().map(|x| x.to_bits()).collect()))
+                .collect();
+            assert_eq!(got, bits_of(&vectors), "dictionary={dictionary}");
+        }
+    }
+
     #[test]
     fn dictionary_reader_does_not_enable_new_writer_codec() {
         let path = fresh();
@@ -1797,7 +2228,7 @@ mod prepared_metadata_tests {
     #[test]
     fn stale_prepared_metadata_falls_back_to_actual_record() {
         let rows = (0..3)
-            .map(|i| Row::from([("body".into(), Cell::Text(format!("body {i}").into()))]))
+            .map(|i| Row::from([("body", Cell::Text(format!("body {i}").into()))]))
             .collect::<Vec<_>>();
         for generation in [8, 9] {
             for next_id in [41, 42] {
@@ -1808,7 +2239,7 @@ mod prepared_metadata_tests {
                             if rename {
                                 for row in &mut staged_rows {
                                     let value = row.remove("body").unwrap();
-                                    row.insert("renamed".into(), value);
+                                    row.insert("renamed", value);
                                 }
                             }
                             let staged = prepare_insert_columns(
@@ -1906,7 +2337,7 @@ mod persistent_encoder_queue_tests {
                 handle: None,
             }));
             let mut row = Row::new();
-            row.insert("id".into(), crate::Cell::text_arc("queue-row"));
+            row.insert("id", crate::Cell::text_arc("queue-row"));
             let rows = Arc::new(vec![row]);
             let receiver = if full {
                 let (reply, _response) = mpsc::sync_channel(1);
@@ -2046,8 +2477,8 @@ mod neon_sparse_writer_tests {
         let mut docs = Vec::new();
         for i in 0..5000 {
             let mut r = crate::store::Row::new();
-            r.insert("id".into(), crate::store::Cell::text_arc(format!("doc-{}", i)));
-            r.insert("num".into(), crate::store::Cell::Int(i as i64));
+            r.insert("id", crate::store::Cell::text_arc(format!("doc-{}", i)));
+            r.insert("num", crate::store::Cell::Int(i as i64));
             docs.push(r);
         }
         collections.insert("docs".to_string(), docs);
@@ -2056,7 +2487,7 @@ mod neon_sparse_writer_tests {
         let mut users = Vec::new();
         for i in 0..10 {
             let mut r = crate::store::Row::new();
-            r.insert("id".into(), crate::store::Cell::text_arc(format!("u-{}", i)));
+            r.insert("id", crate::store::Cell::text_arc(format!("u-{}", i)));
             users.push(r);
         }
         collections.insert("users".to_string(), users);
@@ -2120,7 +2551,7 @@ mod neon_sparse_writer_tests {
         let mut docs = Vec::new();
         for i in 0..1000 {
             let mut r = crate::store::Row::new();
-            r.insert("id".into(), crate::store::Cell::text_arc(format!("doc-{}", i)));
+            r.insert("id", crate::store::Cell::text_arc(format!("doc-{}", i)));
             r.insert(
                 "content".into(),
                 crate::store::Cell::text_arc(

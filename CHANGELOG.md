@@ -1,5 +1,36 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- `append facts` with more than 128 rows in one statement reported the rows as written while the next query saw none of them; after a restart, facts replayed from the log were invisible and a fact deleted before the restart came back after the next write. Fact rows are now kept in step with their columns on every append.
+- A database with a `col` / `index` statement in the log and no checkpoint after it refused to open (`catalog_hash mismatch`). Opening now accepts every catalog state the log replay goes through; a different caller catalog is still rejected.
+- A compressed WAL frame (codec 4, features `compress-wal` / `compress-flate`) was decompressed without a size limit; it is now refused past 64 MiB decoded.
+- A vectored WAL write interrupted by a signal failed the commit instead of being retried.
+- `update` could rename a row onto an `id` another row already held, or give several rows one `id`, leaving duplicate primary keys. Both are now rejected with `duplicate id`.
+- After `update` changed a row's `id` in memory, a point lookup by the old `id` still returned the row and the new `id` was not found (the id map was rebuilt from the row before it was written). The same applied to rolling back such an update.
+- `docs | uri == "..." | pick { ... }` on a cold collection returned an overlay row with all its fields instead of the projection.
+- The `gpu` feature did not compile after the `Row` change (`gpu_sum_rows` and `tests/gpu.rs` still built `BTreeMap` rows).
+- Opening a database replayed log frames in file order without checking their generations: a frame present twice applied its rows twice (two documents with one `uri`), a frame out of order moved the generation backwards, and a missing frame was skipped silently. A repeated frame is now skipped; a log with a hole or frames out of order is refused (`corrupt log: generation gap`) and left unmodified, as a follower already did.
+- A failed write could empty a cold collection on disk: a multi-statement program or transaction that inserted into a cold collection and then failed (for example on a duplicate key in another collection) truncated the collection to its in-memory length, zero, and the next checkpoint wrote that. Writes to cold collections are now undone from a full backup that re-attaches the untouched disk table.
+- Interactive transaction rollback could lose or keep rows: a `delete` followed by an `insert` dropped the row the delete had moved into the gap, and once the journal switched to a full backup part way through (a schema statement, or an insert after updates or deletes), the writes made before the switch survived `rollback`. The journal now records every append point and keeps the earlier journal under a mid-transaction backup, so rollback undoes statements in exact reverse.
+
+### Added
+- `wal-serve --sinks N` / `ship::serve_blocking_fanout`: up to 64 followers pull at once, so a stalled one does not hold up the rest.
+- Cold tier format version 3 in the manifest: a writable open refuses a newer format. `scripts/format-compat.sh` and the `format-compat` workflow check that the current tree and the previous release read each other's databases.
+- `sort` / `skip` / `take N` after an aggregate are answered by the aggregate plan; ungrouped `avg` / `min` / `max` run in parallel under the `parallel` feature.
+- Cold tier scans: predicates are compiled per subtree (only leaves the columnar kernels cannot decide fall back to row evaluation), zone maps prune under `not` and `!=`, index lookups with a residual predicate decode output columns only for matching rows, and joins on a non-`id` key read only the key column.
+- The columnar window path accepts a `sort` between the windows and the projection.
+- Cold tier: zone maps also prune blocks for `is null` / `is not null` on fixed-width columns; a row join on `id` against a cold collection looks every distinct key up in one batch ordered by position on disk (`DiskEngine::get_many_by_id`).
+- Cold collections stay on disk for more writes: composite and partial unique indexes (text, numeric, boolean, time and missing key values) are checked against the disk engine, `insert ... with edge` works inside programs and transactions, a declared vector index no longer forces promotion, an `update` that changes `id` is logged as a delete plus an upsert, and one insert may carry up to 1,048,576 rows.
+- Cursors over a cold collection stream it from disk in chunks, joins included (left side streamed, right side read by `id`); row joins probe a cold right side instead of materializing it.
+- `AsyncDb::transaction` shares commit groups with statements (one sync per group).
+- `insert_batch` into a cold collection builds rows straight from the columns (no per-row statement record), about 1.5x faster on 60,000 rows; it is no longer capped by the parser's AST size quota.
+- `persist::set_wal_dictionary_writer`: opt-in writer for the dictionary vector WAL codec (codec 5). Off by default; a release without the codec cannot read such frames.
+
+### Changed
+- `lin::Row` is a slotted row (`src/store/row.rs`) instead of `BTreeMap<String, Cell>`. The map-like API is kept; code using `BTreeMap`-specific calls needs adjusting. New: `Row::from_parts`, `Row::from_sorted`, `Row::shape_of`, `store::row::FieldSlot`.
+
 ## [0.5.0] — 2026-11-11
 
 ### Added

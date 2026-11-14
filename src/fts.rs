@@ -980,11 +980,11 @@ mod tests {
     fn snippet_mutations_match_rebuilt_index() {
         for fields in [vec!["title".into()], vec!["title".into(), "snippet".into()]] {
             let before = Row::from([
-                ("title".into(), Cell::text_arc("shared")),
+                ("title", Cell::text_arc("shared")),
                 ("snippet".into(), Cell::text_arc("OLD shared ЁЖ")),
             ]);
             let after = Row::from([
-                ("title".into(), Cell::text_arc("shared")),
+                ("title", Cell::text_arc("shared")),
                 ("snippet".into(), Cell::text_arc("NEW shared ИГЛА")),
             ]);
             let mut index = FtsIndex::build(&[before.clone()], &fields);
@@ -1015,7 +1015,7 @@ mod tests {
             for new_mask in 0..32 {
                 let row = |mask: usize| {
                     Row::from([(
-                        "title".into(),
+                        "title",
                         Cell::text_arc(
                             (0..5)
                                 .filter(|i| mask & (1 << i) != 0)
@@ -1046,7 +1046,7 @@ mod tests {
             "РУССКИЙ ТЕКСТ ЁЖ",
         ] {
             let rows = (0..10000)
-                .map(|_| Row::from([("title".into(), Cell::text_arc(text))]))
+                .map(|_| Row::from([("title", Cell::text_arc(text))]))
                 .collect::<Vec<_>>();
             let start = Instant::now();
             for _ in 0..30 {
@@ -1057,7 +1057,7 @@ mod tests {
         for n in [10, 100, 1000] {
             let make = |shift| {
                 Row::from([(
-                    "title".into(),
+                    "title",
                     Cell::text_arc(
                         (shift..n + shift)
                             .map(|i| format!("word{i}"))
@@ -1087,7 +1087,7 @@ mod tests {
             .into_iter()
             .map(|title| {
                 Row::from([
-                    ("title".into(), Cell::text_arc(title)),
+                    ("title", Cell::text_arc(title)),
                     ("body".into(), Cell::text_arc("Body BODY")),
                     ("snippet".into(), Cell::text_arc("SNIPPET")),
                 ])
@@ -1111,7 +1111,7 @@ mod tests {
             .map(|i| {
                 Row::from([
                     (
-                        "title".into(),
+                        "title",
                         Cell::text_arc(if i % 2 == 0 { "wal WAL ёж" } else { "other" }),
                     ),
                     ("body".into(), Cell::text_arc("wal ЁЖ ёж")),
@@ -1126,7 +1126,7 @@ mod tests {
         }
         fast.remove_row(299, &rows[299]);
         reference.remove_row(299, &rows[299]);
-        let replacement = Row::from([("title".into(), Cell::text_arc("replacement"))]);
+        let replacement = Row::from([("title", Cell::text_arc("replacement"))]);
         fast.append_slab(299, std::slice::from_ref(&replacement));
         reference.insert_row(299, &replacement);
         fast.append_slab(300, &rows);
@@ -1148,7 +1148,7 @@ mod tests {
     #[test]
     fn repeated_term_removal_and_reinsertion_matches_current_rows() {
         let fields = vec!["title".to_owned()];
-        let row = Row::from([("title".into(), Cell::text_arc("foo"))]);
+        let row = Row::from([("title", Cell::text_arc("foo"))]);
         let mut index = FtsIndex::build(&[row.clone()], &fields);
         for i in 0..600 {
             index.remove_row(0, &row);
@@ -1167,7 +1167,7 @@ mod tests {
         let mut rows = (0..40)
             .map(|i| {
                 Row::from([(
-                    "title".into(),
+                    "title",
                     Cell::text_arc(if i % 2 == 0 { "WAL ёж" } else { "wal other" }),
                 )])
             })
@@ -1175,7 +1175,7 @@ mod tests {
         let mut index = FtsIndex::build(&rows, &fields);
         for i in (0..40).step_by(3) {
             index.remove_row(i, &rows[i]);
-            rows[i] = Row::from([("title".into(), Cell::text_arc("new ЁЖ"))]);
+            rows[i] = Row::from([("title", Cell::text_arc("new ЁЖ"))]);
             index.insert_row(i, &rows[i]);
         }
         for query in [
@@ -1206,7 +1206,7 @@ mod tests {
     #[test]
     fn borrowed_tokens_deduplicate_and_normalize_across_fields_and_edits() {
         let row = Row::from([
-            ("title".into(), Cell::text_arc("wal wal ёж WAL")),
+            ("title", Cell::text_arc("wal wal ёж WAL")),
             ("body".into(), Cell::text_arc("WAL ЁЖ ёж")),
         ]);
         let fields = vec!["title".to_owned(), "body".to_owned()];
@@ -1235,8 +1235,8 @@ mod tests {
     #[test]
     fn posting_codec_roundtrips_and_rejects_truncation() {
         let mut row = Row::new();
-        row.insert("title".into(), Cell::text_arc("durable wal"));
-        row.insert("body".into(), Cell::text_arc("checkpoint postings"));
+        row.insert("title", Cell::text_arc("durable wal"));
+        row.insert("body", Cell::text_arc("checkpoint postings"));
         let fields = vec![String::from("title"), String::from("body")];
         let index = FtsIndex::build(&[row], &fields);
         let encoded = index.encode(7, 1);
@@ -1288,9 +1288,9 @@ mod pending_order_tests {
     #[test]
     fn fts_matches_cow_and_ping_pong_union() {
         let rows = vec![
-            Row::from([("text".into(), Cell::from_text("apple banana cherry"))]),
-            Row::from([("text".into(), Cell::from_text("banana cherry date"))]),
-            Row::from([("text".into(), Cell::from_text("cherry date elderberry"))]),
+            Row::from([("text", Cell::from_text("apple banana cherry"))]),
+            Row::from([("text", Cell::from_text("banana cherry date"))]),
+            Row::from([("text", Cell::from_text("cherry date elderberry"))]),
         ];
         let index = FtsIndex::build(&rows, &["text".to_string()]);
 
@@ -1433,8 +1433,8 @@ mod pending_order_tests {
     #[test]
     fn implicit_snippet_indexing_and_two_cursor_token_diff() {
         let mut r0 = Row::new();
-        r0.insert("title".into(), Cell::from_text("alpha beta"));
-        r0.insert("snippet".into(), Cell::from_text("implicit_tok shared_tok"));
+        r0.insert("title", Cell::from_text("alpha beta"));
+        r0.insert("snippet", Cell::from_text("implicit_tok shared_tok"));
         let rows = vec![r0.clone()];
 
         // Even when "snippet" is omitted from declared FTS fields, FtsIndex indexes it implicitly.
@@ -1445,7 +1445,7 @@ mod pending_order_tests {
 
         // Update only snippet: removes "implicit_tok", keeps "shared_tok", adds "fresh_tok".
         let mut r1 = r0.clone();
-        r1.insert("snippet".into(), Cell::from_text("shared_tok fresh_tok"));
+        r1.insert("snippet", Cell::from_text("shared_tok fresh_tok"));
         index.sync_row(0, &r0, &r1);
         assert_eq!(
             index.matches("implicit_tok").unwrap_or_default(),

@@ -706,7 +706,7 @@ impl Store {
                                         continue;
                                     }
                                     if id_title {
-                                        let mut row = BTreeMap::new();
+                                        let mut row = Row::new();
                                         row.insert(
                                             k_id.clone(),
                                             Cell::Text(Arc::clone(&docs_id[i])),
@@ -718,7 +718,7 @@ impl Store {
                                         slot.write(row);
                                         continue;
                                     }
-                                    let mut row = BTreeMap::new();
+                                    let mut row = Row::new();
                                     for f in fields {
                                         let cell = match f.as_str() {
                                             "id" => Cell::Text(Arc::clone(&docs_id[i])),
@@ -756,7 +756,7 @@ impl Store {
                 out.push(row_id_title(&self.docs_id[i], &self.docs_title[i]));
                 continue;
             }
-            let mut row = BTreeMap::new();
+            let mut row = Row::new();
             for f in fields {
                 let cell = match f.as_str() {
                     "id" => Cell::Text(Arc::clone(&self.docs_id[i])),
@@ -819,7 +819,7 @@ impl Store {
                                     out.push(row_id_title(&docs_id[i], &docs_title[i]));
                                     continue;
                                 }
-                                let mut row = BTreeMap::new();
+                                let mut row = Row::new();
                                 for f in fields {
                                     let cell = match f.as_str() {
                                         "id" => Cell::Text(Arc::clone(&docs_id[i])),
@@ -857,7 +857,7 @@ impl Store {
                 out.push(row_id_title(&self.docs_id[i], &self.docs_title[i]));
                 continue;
             }
-            let mut row = BTreeMap::new();
+            let mut row = Row::new();
             for f in fields {
                 let cell = match f.as_str() {
                     "id" => Cell::Text(Arc::clone(&self.docs_id[i])),

@@ -31,7 +31,11 @@ mod wal;
 #[cfg(test)]
 mod tests;
 
-pub use codec::{cols_to_rows, rows_to_insert_cols};
+pub use codec::{
+    cols_to_rows, rows_to_insert_cols, rows_to_insert_pack, set_wal_dictionary_writer,
+    wal_dictionary_writer,
+};
+pub(crate) use codec::insert_cols_lossless;
 pub(crate) use codec::{
     PreparedEncoding, PreparedInsert, acquire_encoder, append_prepared_record,
     encode_insert_rows_direct, prepare_insert_columns_ext, start_insert_encoding,

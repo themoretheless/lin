@@ -32,6 +32,7 @@ pub(crate) struct PointDeletePlan {
     pub field: String,
     pub key: String,
     pub cas: Option<String>,
+    pub cas_each: bool,
     pub append_only: bool,
     pub prepared_gen: u64,
     pub prepared_docs_epoch: u64,
@@ -45,6 +46,7 @@ pub(crate) struct PointUpdatePlan {
     pub field: String,
     pub key: String,
     pub cas: Option<String>,
+    pub cas_each: bool,
     pub record: Record,
     pub is_docs_wing_only: bool,
     pub const_wing: Option<(Cell, Arc<str>)>,
@@ -69,6 +71,15 @@ pub(crate) struct AggPlan {
     pub kind: AggKind,
     pub needs_now: bool,
     pub index_plan: Option<(Vec<IndexUse>, bool)>,
+    /// Trailing `sort` / `skip` / `take N` steps, applied in order to the groups the plan returns.
+    pub tail: Vec<AggTail>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum AggTail {
+    Skip(usize),
+    Take(usize),
+    Sort { field: Field, desc: bool },
 }
 
 /// Compiled statement: parse + typecheck + plan once, run many times.
@@ -311,7 +322,7 @@ impl Db {
             collection,
             pred,
             cas,
-            cas_each: false,
+            cas_each,
         } = stmt
         else {
             return None;
@@ -337,7 +348,7 @@ impl Db {
                 && let Some(idx) = store.point_index("docs", field, key)
                 && idx < docs.len()
             {
-                let cas_ok = if append_only {
+                let cas_ok = if append_only || *cas_each {
                     true
                 } else if let Some(c) = cas {
                     row_text(&docs[idx], "hash") == Some(c.as_str())
@@ -365,6 +376,7 @@ impl Db {
             field: field.to_string(),
             key: key.to_string(),
             cas: cas.clone(),
+            cas_each: *cas_each,
             append_only,
             prepared_gen: store.r#gen,
             prepared_docs_epoch: store.docs_epoch,
@@ -378,7 +390,7 @@ impl Db {
             collection,
             pred: Some(pred),
             cas,
-            cas_each: false,
+            cas_each,
             record,
         } = stmt
         else {
@@ -417,6 +429,7 @@ impl Db {
             field: field.to_string(),
             key: key.to_string(),
             cas: cas.clone(),
+            cas_each: *cas_each,
             record: record.clone(),
             is_docs_wing_only,
             const_wing,

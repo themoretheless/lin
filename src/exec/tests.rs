@@ -85,7 +85,7 @@ mod record_tests {
             }
             let before = records.clone();
             for now in [123, 456] {
-                let mut actual = vec![Row::from([("prefix".into(), Cell::Int(9))])];
+                let mut actual = vec![Row::from([("prefix", Cell::Int(9))])];
                 append_batch_shape_rows(&mut actual, &records, now, false);
                 assert_eq!(actual.len(), n + 1);
                 assert_eq!(actual[0]["prefix"], Cell::Int(9));
@@ -296,7 +296,7 @@ mod record_tests {
             ("one", "two", "one two", 9),
         ] {
             let row = Row::from([
-                ("title".into(), Cell::text_arc(title)),
+                ("title", Cell::text_arc(title)),
                 ("body".into(), Cell::text_arc(body)),
             ]);
             assert_eq!(

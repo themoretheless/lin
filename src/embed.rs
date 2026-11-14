@@ -339,7 +339,7 @@ impl HashingEmbedder {
                 if let Some(cell) = row.get_mut("embedding") {
                     *cell = crate::store::Cell::Vec(vec);
                 } else {
-                    row.insert("embedding".into(), crate::store::Cell::Vec(vec));
+                    row.insert("embedding", crate::store::Cell::Vec(vec));
                 }
             }
         });
@@ -1788,7 +1788,7 @@ mod tests {
     fn single_embedding_field_borrows_the_row_text() {
         use crate::store::{Cell, Row};
         for field in ["title", "body", "snippet"] {
-            let row = Row::from([(field.into(), Cell::text_arc("Ёж wal"))]);
+            let row = Row::from([(field, Cell::text_arc("Ёж wal"))]);
             let text = row_embed_text(&row);
             assert!(matches!(text, std::borrow::Cow::Borrowed(_)));
             assert_eq!(text, "Ёж wal");

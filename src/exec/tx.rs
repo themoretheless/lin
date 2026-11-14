@@ -24,12 +24,39 @@ pub(crate) enum Undo {
         append: crate::store::AppendMark,
         events: smallvec::SmallVec<[RowUndo; 2]>,
     },
+    /// A transaction whose journal had to become a full backup part way through: `full`
+    /// restores the state at that point, `prior` then undoes what came before it.
+    Layered {
+        full: Box<crate::store::MemBackup>,
+        prior: Box<Undo>,
+    },
+}
+
+/// True when one of `stmts` writes a collection that lives in the disk tier. Such writes
+/// must be undone with a full backup: the collection-length marks of `Undo::Append` and
+/// the row positions of `Undo::Rows` describe in-memory rows only, and a cold collection
+/// promoted during the statement would be cut down to its (empty) in-memory length,
+/// which the next checkpoint then writes to disk. `Store::mem_restore` re-attaches the
+/// untouched disk table instead.
+pub(crate) fn stmts_write_disk_collection(store: &crate::store::Store, stmts: &[Stmt]) -> bool {
+    stmts.iter().any(|s| match s {
+        Stmt::Insert { collection, .. }
+        | Stmt::Update { collection, .. }
+        | Stmt::Delete { collection, .. }
+        | Stmt::Reembed { collection, .. } => store.is_disk_backed(collection),
+        _ => false,
+    })
 }
 
 pub(crate) enum RowUndo {
     DocsWing(usize, Option<Cell>),
     Update(String, usize, Row),
     Delete(String, Vec<usize>, Vec<Row>),
+    /// Collection lengths before an appending statement that follows row events. Undo
+    /// replays the journal in exact reverse, so the rows appended after this point are
+    /// truncated before any earlier delete is restored: restoring a swap-removed row
+    /// first would move a live row to the end, where the truncation would cut it off.
+    Append(crate::store::AppendMark),
 }
 
 /// Interactive ACID transaction handle.
@@ -40,11 +67,13 @@ pub(crate) enum RowUndo {
 pub struct Transaction<'a> {
     pub(crate) db: &'a mut Db,
     pub(crate) base_gen: u64,
+    pub(crate) base_next_id: u64,
     pub(crate) committed: bool,
     pub(crate) undo: Undo,
     pub(crate) cat_backup: Option<Box<Catalog>>,
     pub(crate) packs: Vec<Pack>,
     pub(crate) schema_changed: bool,
+    pub(crate) disk_savepoint: bool,
     pub(crate) mutation_count: usize,
     pub(crate) journal_bytes: usize,
 }
@@ -320,6 +349,15 @@ impl<'a> Transaction<'a> {
         fields: smallvec::SmallVec<[(&str, crate::ast::Value); 8]>,
         want_rows: bool,
     ) -> Result<Handle, Error> {
+        if self.db.store.can_apply_disk_overlay(collection) {
+            let rec = crate::ast::Record {
+                fields: fields
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v))
+                    .collect(),
+            };
+            return self.exec_single_insert_tx(collection.to_string(), rec, want_rows);
+        }
         if !matches!(self.undo, Undo::Append(_)) {
             self.ensure_undo_flags(&[], true, false);
         }
@@ -457,7 +495,7 @@ impl<'a> Transaction<'a> {
                         dummy_dml_plan()
                     };
                     let pack = if self.db.is_durable() {
-                        Some(crate::persist::rows_to_insert_cols(
+                        Some(crate::persist::rows_to_insert_pack(
                             "orders".to_string(),
                             std::slice::from_ref(&row),
                             Vec::new(),
@@ -501,11 +539,58 @@ impl<'a> Transaction<'a> {
         rec: crate::ast::Record,
         want_rows: bool,
     ) -> Result<Handle, Error> {
-        if !matches!(self.undo, Undo::Append(_)) {
-            self.ensure_undo_flags(&[], true, false);
-        }
         if !self.db.store.fts_deferred_doc_swaps.is_empty() {
             self.db.store.flush_fts_deferred_docs();
+        }
+        if self.db.store.can_apply_disk_overlay(&collection) {
+            let had_sp = self.disk_savepoint;
+            self.ensure_disk_savepoint();
+            let has_body = rec.fields.iter().any(|(k, _)| k == "body");
+            let plan = if want_rows {
+                cached_single_insert_plan(&self.db.catalog, &collection, has_body)
+            } else {
+                dummy_dml_plan()
+            };
+            self.db.cold_program_packs = Some(Vec::with_capacity(1));
+            let res = self.db.cold_overlay_insert(
+                &collection,
+                std::slice::from_ref(&rec),
+                None,
+                &plan,
+                want_rows,
+            );
+            let mut staged = self.db.cold_program_packs.take().unwrap_or_default();
+            match res {
+                Ok(Some(mut handle)) => {
+                    let pack = if self.db.is_durable() {
+                        self.db.store.r#gen = self.base_gen + 1;
+                        staged.pop()
+                    } else {
+                        self.db.store.r#gen += 1;
+                        None
+                    };
+                    handle.done.r#gen = self.db.store.r#gen;
+                    self.record_tx_write(1, pack)?;
+                    return Ok(handle);
+                }
+                Ok(None) => {
+                    if !had_sp {
+                        self.db.store.rollback_disk_overlay_savepoint();
+                        self.disk_savepoint = false;
+                    }
+                }
+                Err(e) => {
+                    if !had_sp {
+                        self.db.store.rollback_disk_overlay_savepoint();
+                        self.db.store.next_id = self.base_next_id;
+                        self.disk_savepoint = false;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        if !matches!(self.undo, Undo::Append(_)) {
+            self.ensure_undo_flags(&[], true, false);
         }
         if self.db.store.is_disk_backed(&collection) {
             self.db.store.promote_disk_col(&collection);
@@ -543,7 +628,7 @@ impl<'a> Transaction<'a> {
         }
         if id_arc.is_none() {
             let gen_id: Arc<str> = Arc::from(self.db.store.alloc_id());
-            row.insert("id".into(), Cell::Text(Arc::clone(&gen_id)));
+            row.insert("id", Cell::Text(Arc::clone(&gen_id)));
             id_arc = Some(gen_id);
         }
         if has_body
@@ -551,7 +636,7 @@ impl<'a> Transaction<'a> {
             && let Some(body) = body_arc
         {
             row.insert(
-                "hash".into(),
+                "hash",
                 Cell::Text(super::dml::cached_content_hash(body.as_ref())),
             );
         }
@@ -601,7 +686,7 @@ impl<'a> Transaction<'a> {
             dummy_dml_plan()
         };
         let pack = if self.db.is_durable() {
-            Some(crate::persist::rows_to_insert_cols(
+            Some(crate::persist::rows_to_insert_pack(
                 collection.clone(),
                 std::slice::from_ref(&row),
                 Vec::new(),
@@ -635,57 +720,117 @@ impl<'a> Transaction<'a> {
         })
     }
 
+    #[inline]
+    fn ensure_disk_savepoint(&mut self) {
+        if !self.disk_savepoint {
+            self.db.store.begin_disk_overlay_savepoint();
+            self.disk_savepoint = true;
+        }
+    }
+
+    fn has_cold_write_target(&self, stmts: &[Stmt]) -> bool {
+        stmts.iter().any(|s| match s {
+            Stmt::Insert { collection, .. }
+            | Stmt::Update { collection, .. }
+            | Stmt::Delete { collection, .. } => self.db.store.can_apply_disk_overlay(collection),
+            _ => false,
+        })
+    }
+
+    fn abort_into_rollback(&mut self) {
+        let undo = std::mem::replace(&mut self.undo, Undo::None);
+        let cat = self.cat_backup.take();
+        let had_disk_sp = self.disk_savepoint;
+        self.db.rollback(undo, cat, self.base_gen);
+        if had_disk_sp {
+            self.db.store.rollback_disk_overlay_savepoint();
+            self.db.store.next_id = self.base_next_id;
+            self.db.store.r#gen = self.base_gen;
+            self.db.reader_cache = None;
+            self.disk_savepoint = false;
+        }
+        self.packs.clear();
+    }
+
     fn ensure_undo_flags(&mut self, stmts: &[Stmt], append_only: bool, schema: bool) {
-        let can_row_undo = || {
-            stmts.iter().all(|s| {
+        // Writes to a cold collection need a full backup (see `stmts_write_disk_collection`).
+        let disk = stmts_write_disk_collection(&self.db.store, stmts);
+        let appends = append_only && !schema && !disk;
+        let row_undo = !schema
+            && !disk
+            && stmts.iter().all(|s| {
                 matches!(
                     s,
                     Stmt::Update { .. } | Stmt::Delete { .. } | Stmt::Query(_) | Stmt::Let { .. }
                 )
-            })
+            });
+        enum Next {
+            Keep,
+            Full,
+            Append,
+            Rows,
+            MixedFromAppend,
+            MixedFromRows,
+            MarkAppend,
+        }
+        let next = match &self.undo {
+            Undo::None if appends => Next::Append,
+            Undo::None if row_undo => Next::Rows,
+            Undo::None => Next::Full,
+            Undo::Append(_) if appends => Next::Keep,
+            Undo::Append(_) if row_undo => Next::MixedFromAppend,
+            Undo::Append(_) => Next::Full,
+            Undo::Rows(_) if appends => Next::MixedFromRows,
+            Undo::Rows(_) if row_undo => Next::Keep,
+            Undo::Rows(_) => Next::Full,
+            Undo::Mixed { .. } if appends => Next::MarkAppend,
+            Undo::Mixed { .. } if row_undo => Next::Keep,
+            Undo::Mixed { .. } => Next::Full,
+            Undo::Full(_) | Undo::Layered { .. } => Next::Keep,
         };
-        match &mut self.undo {
-            Undo::None => {
-                if append_only && !schema {
-                    self.undo = Undo::Append(self.db.store.append_mark());
-                } else if !schema && can_row_undo() {
-                    self.undo = Undo::Rows(smallvec::SmallVec::new());
-                } else {
-                    self.undo = Undo::Full(Box::new(self.db.store.mem_backup()));
+        match next {
+            Next::Keep => {}
+            Next::Append => self.undo = Undo::Append(self.db.store.append_mark()),
+            Next::Rows => self.undo = Undo::Rows(smallvec::SmallVec::new()),
+            Next::MixedFromAppend => {
+                // The appends came first: their mark opens the event journal.
+                if let Undo::Append(mark) = std::mem::replace(&mut self.undo, Undo::None) {
+                    let mut events = smallvec::SmallVec::new();
+                    events.push(RowUndo::Append(mark.clone()));
+                    self.undo = Undo::Mixed { append: mark, events };
                 }
             }
-            Undo::Append(mark) => {
-                if !append_only || schema {
-                    if !schema && can_row_undo() {
-                        let m = mark.clone();
-                        self.undo = Undo::Mixed {
-                            append: m,
-                            events: smallvec::SmallVec::new(),
-                        };
-                    } else {
-                        self.undo = Undo::Full(Box::new(self.db.store.mem_backup()));
-                    }
+            Next::MixedFromRows => {
+                if let Undo::Rows(mut events) = std::mem::replace(&mut self.undo, Undo::None) {
+                    let mark = self.db.store.append_mark();
+                    events.push(RowUndo::Append(mark.clone()));
+                    self.undo = Undo::Mixed { append: mark, events };
                 }
             }
-            Undo::Rows(events) => {
-                if schema {
-                    self.undo = Undo::Full(Box::new(self.db.store.mem_backup()));
-                } else if append_only {
-                    let ev = std::mem::take(events);
-                    self.undo = Undo::Mixed {
-                        append: self.db.store.append_mark(),
-                        events: ev,
-                    };
-                } else if !can_row_undo() {
-                    self.undo = Undo::Full(Box::new(self.db.store.mem_backup()));
+            Next::MarkAppend => {
+                // Appends after row events get their own mark (see `RowUndo::Append`).
+                let mark = self.db.store.append_mark();
+                if let Undo::Mixed { events, .. } = &mut self.undo
+                    && !events.is_empty()
+                {
+                    events.push(RowUndo::Append(mark));
                 }
             }
-            Undo::Mixed { .. } => {
-                if schema || (!append_only && !can_row_undo()) {
-                    self.undo = Undo::Full(Box::new(self.db.store.mem_backup()));
+            Next::Full => {
+                // Keep what the journal already holds: it undoes the writes made before
+                // this point, which the new backup does not cover.
+                let full = Box::new(self.db.store.mem_backup());
+                self.undo = match std::mem::replace(&mut self.undo, Undo::None) {
+                    Undo::None => Undo::Full(full),
+                    prior => Undo::Layered {
+                        full,
+                        prior: Box::new(prior),
+                    },
+                };
+                if self.db.store.disk.is_some() {
+                    self.disk_savepoint = true;
                 }
             }
-            Undo::Full(_) => {}
         }
     }
 
@@ -730,6 +875,41 @@ impl<'a> Transaction<'a> {
                 self.cat_backup = Some(Box::new(self.db.catalog.clone()));
             }
             self.schema_changed = true;
+        }
+        if writes
+            && !schema
+            && self.has_cold_write_target(stmts)
+            && (stmts.len() == 1 || !self.disk_savepoint)
+        {
+            if !self.db.store.fts_deferred_doc_swaps.is_empty() {
+                self.db.store.flush_fts_deferred_docs();
+            }
+            let had_sp = self.disk_savepoint;
+            self.ensure_disk_savepoint();
+            match self
+                .db
+                .try_cold_overlay_in_tx(stmts, &plan, self.base_gen, want_rows)
+            {
+                Ok(Some((handle, pack, _wrote))) => {
+                    let tx_pack = if self.db.is_durable() { pack } else { None };
+                    self.record_tx_write(handle.done.n, tx_pack)?;
+                    return Ok(handle);
+                }
+                Ok(None) => {
+                    if !had_sp {
+                        self.db.store.rollback_disk_overlay_savepoint();
+                        self.disk_savepoint = false;
+                    }
+                }
+                Err(e) => {
+                    if !had_sp {
+                        self.db.store.rollback_disk_overlay_savepoint();
+                        self.db.store.next_id = self.base_next_id;
+                        self.disk_savepoint = false;
+                    }
+                    return Err(e);
+                }
+            }
         }
         if writes {
             self.ensure_undo_flags(stmts, append_only, schema);
@@ -841,6 +1021,116 @@ impl<'a> Transaction<'a> {
             }
             self.schema_changed = true;
         }
+        if prep.writes && !prep.schema {
+            if let Some(pd) = &prep.point_delete
+                && self.db.store.can_apply_disk_overlay(&pd.collection)
+            {
+                if !pd.append_only && !pd.cas_each && pd.cas.is_none() {
+                    return Err(Error::runtime("delete requires cas"));
+                }
+                if !self.db.store.fts_deferred_doc_swaps.is_empty() {
+                    self.db.store.flush_fts_deferred_docs();
+                }
+                let had_sp = self.disk_savepoint;
+                self.ensure_disk_savepoint();
+                self.db.cold_program_packs = Some(Vec::with_capacity(1));
+                let res = self.db.exec_cold_point_delete(pd, &prep.plan, want_rows);
+                let mut staged = self.db.cold_program_packs.take().unwrap_or_default();
+                let mut handle = match res {
+                    Ok(h) => h,
+                    Err(e) => {
+                        if !had_sp {
+                            self.db.store.rollback_disk_overlay_savepoint();
+                            self.disk_savepoint = false;
+                        }
+                        return Err(e);
+                    }
+                };
+                let pack = if self.db.is_durable() {
+                    self.db.store.r#gen = self.base_gen + 1;
+                    staged.pop()
+                } else {
+                    self.db.store.r#gen += 1;
+                    None
+                };
+                handle.done.r#gen = self.db.store.r#gen;
+                self.record_tx_write(handle.done.n, pack)?;
+                return Ok(handle);
+            }
+            if let Some(pu) = &prep.point_update
+                && self.db.store.can_apply_disk_overlay(&pu.collection)
+                && !pu.record.fields.iter().any(|(k, _)| {
+                    self.db.store.unique_key_needs_memory(&pu.collection, k)
+                })
+            {
+                if !pu.cas_each && pu.cas.is_none() {
+                    return Err(Error::runtime("update requires cas"));
+                }
+                if !self.db.store.fts_deferred_doc_swaps.is_empty() {
+                    self.db.store.flush_fts_deferred_docs();
+                }
+                let had_sp = self.disk_savepoint;
+                self.ensure_disk_savepoint();
+                self.db.cold_program_packs = Some(Vec::with_capacity(1));
+                let res = self.db.exec_cold_point_update(pu, &prep.plan, want_rows);
+                let mut staged = self.db.cold_program_packs.take().unwrap_or_default();
+                let mut handle = match res {
+                    Ok(h) => h,
+                    Err(e) => {
+                        if !had_sp {
+                            self.db.store.rollback_disk_overlay_savepoint();
+                            self.disk_savepoint = false;
+                        }
+                        return Err(e);
+                    }
+                };
+                let pack = if self.db.is_durable() {
+                    self.db.store.r#gen = self.base_gen + 1;
+                    staged.pop()
+                } else {
+                    self.db.store.r#gen += 1;
+                    None
+                };
+                handle.done.r#gen = self.db.store.r#gen;
+                self.record_tx_write(handle.done.n, pack)?;
+                return Ok(handle);
+            }
+            if self.has_cold_write_target(&prep.stmts)
+                && (prep.stmts.len() == 1 || !self.disk_savepoint)
+            {
+                if !self.db.store.fts_deferred_doc_swaps.is_empty() {
+                    self.db.store.flush_fts_deferred_docs();
+                }
+                let had_sp = self.disk_savepoint;
+                self.ensure_disk_savepoint();
+                match self.db.try_cold_overlay_in_tx(
+                    &prep.stmts,
+                    &prep.plan,
+                    self.base_gen,
+                    want_rows,
+                ) {
+                    Ok(Some((handle, pack, _wrote))) => {
+                        let tx_pack = if self.db.is_durable() { pack } else { None };
+                        self.record_tx_write(handle.done.n, tx_pack)?;
+                        return Ok(handle);
+                    }
+                    Ok(None) => {
+                        if !had_sp {
+                            self.db.store.rollback_disk_overlay_savepoint();
+                            self.disk_savepoint = false;
+                        }
+                    }
+                    Err(e) => {
+                        if !had_sp {
+                            self.db.store.rollback_disk_overlay_savepoint();
+                            self.db.store.next_id = self.base_next_id;
+                            self.disk_savepoint = false;
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+        }
         if prep.writes {
             self.ensure_undo_flags(&prep.stmts, prep.append_only, prep.schema);
         }
@@ -861,23 +1151,19 @@ impl<'a> Transaction<'a> {
             return Ok(());
         }
         if let Err(e) = self.db.check_quotas() {
-            let undo = std::mem::replace(&mut self.undo, Undo::None);
-            let cat = self.cat_backup.take();
-            self.db.rollback(undo, cat, self.base_gen);
-            self.packs.clear();
+            self.abort_into_rollback();
             self.committed = true;
             return Err(e);
         }
         if !self.packs.is_empty() {
             let packs = std::mem::take(&mut self.packs);
             if let Some(combined) = coalesce_tx_packs(packs) {
-                if let Some(p) = self.db.persist.as_mut()
+                if !self.disk_savepoint
+                    && let Some(p) = self.db.persist.as_mut()
                     && p.log_bytes > self.db.quotas.max_log_bytes
                     && let Err(e) = self.db.store.checkpoint(p)
                 {
-                    let undo = std::mem::replace(&mut self.undo, Undo::None);
-                    let cat = self.cat_backup.take();
-                    self.db.rollback(undo, cat, self.base_gen);
+                    self.abort_into_rollback();
                     self.committed = true;
                     return Err(e);
                 }
@@ -888,25 +1174,37 @@ impl<'a> Transaction<'a> {
                     // Align store.gen so durable_commit writes sequential frame `base_gen + 1`.
                     self.db.store.r#gen = self.base_gen;
                     if let Err(e) = self.db.store.durable_commit(p, combined) {
-                        let undo = std::mem::replace(&mut self.undo, Undo::None);
-                        let cat = self.cat_backup.take();
-                        self.db.rollback(undo, cat, self.base_gen);
+                        self.abort_into_rollback();
                         self.committed = true;
                         return Err(e);
                     }
                     self.db.store.r#gen = self.base_gen + 1;
-                    self.db.store.maybe_checkpoint(p)?;
+                    if self.disk_savepoint {
+                        self.db.store.commit_disk_overlay_savepoint();
+                        self.disk_savepoint = false;
+                    }
+                    if p.log_bytes > self.db.quotas.max_log_bytes {
+                        self.db.store.checkpoint(p)?;
+                    } else {
+                        self.db.store.maybe_checkpoint(p)?;
+                    }
                 } else if self.db.store.is_native_disk() {
+                    if self.disk_savepoint {
+                        self.db.store.rollback_disk_overlay_savepoint();
+                        self.disk_savepoint = false;
+                    }
                     if let Err(e) = self.db.store.commit_pack_to_native_disk(&combined) {
-                        let undo = std::mem::replace(&mut self.undo, Undo::None);
-                        let cat = self.cat_backup.take();
-                        self.db.rollback(undo, cat, self.base_gen);
+                        self.abort_into_rollback();
                         self.committed = true;
                         return Err(e);
                     }
                     self.db.store.r#gen = self.base_gen + 1;
                 }
             }
+        }
+        if self.disk_savepoint {
+            self.db.store.commit_disk_overlay_savepoint();
+            self.disk_savepoint = false;
         }
         self.db.reader_cache = None;
         self.committed = true;
@@ -918,10 +1216,7 @@ impl<'a> Transaction<'a> {
         if self.committed {
             return Err(Error::runtime("transaction already committed"));
         }
-        let undo = std::mem::replace(&mut self.undo, Undo::None);
-        let cat = self.cat_backup.take();
-        self.db.rollback(undo, cat, self.base_gen);
-        self.packs.clear();
+        self.abort_into_rollback();
         self.committed = true;
         Ok(())
     }
@@ -935,10 +1230,7 @@ impl<'a> Transaction<'a> {
 impl Drop for Transaction<'_> {
     fn drop(&mut self) {
         if !self.committed {
-            let undo = std::mem::replace(&mut self.undo, Undo::None);
-            let cat = self.cat_backup.take();
-            self.db.rollback(undo, cat, self.base_gen);
-            self.packs.clear();
+            self.abort_into_rollback();
         }
     }
 }
@@ -946,42 +1238,7 @@ impl Drop for Transaction<'_> {
 impl Db {
     pub(crate) fn rollback(&mut self, undo: Undo, cat_backup: Option<Box<Catalog>>, base_gen: u64) {
         let had_undo = !matches!(undo, Undo::None) || cat_backup.is_some();
-        match undo {
-            Undo::None => {}
-            Undo::Append(mark) => self.store.append_rollback(mark),
-            Undo::Full(b) => self.store.mem_restore(*b),
-            Undo::Rows(events) => {
-                for event in events.into_iter().rev() {
-                    match event {
-                        RowUndo::DocsWing(idx, prev_cell) => {
-                            self.restore_docs_wing_cell(idx, prev_cell);
-                        }
-                        RowUndo::Update(collection, idx, row) => {
-                            self.store.restore_row_owned(&collection, idx, row);
-                        }
-                        RowUndo::Delete(collection, positions, rows) => {
-                            self.store.restore_rows_at(&collection, &positions, &rows);
-                        }
-                    }
-                }
-            }
-            Undo::Mixed { append, events } => {
-                for event in events.into_iter().rev() {
-                    match event {
-                        RowUndo::DocsWing(idx, prev_cell) => {
-                            self.restore_docs_wing_cell(idx, prev_cell);
-                        }
-                        RowUndo::Update(collection, idx, row) => {
-                            self.store.restore_row_owned(&collection, idx, row);
-                        }
-                        RowUndo::Delete(collection, positions, rows) => {
-                            self.store.restore_rows_at(&collection, &positions, &rows);
-                        }
-                    }
-                }
-                self.store.append_rollback(append);
-            }
-        }
+        self.undo_journal(undo);
         if had_undo {
             self.store.r#gen = base_gen;
             self.reader_cache = None;
@@ -990,6 +1247,38 @@ impl Db {
             self.catalog = *cat;
             self.plan_cache.clear();
             self.query_cache.clear();
+        }
+    }
+
+    /// Undo the writes `undo` journals, newest first.
+    fn undo_journal(&mut self, undo: Undo) {
+        match undo {
+            Undo::None => {}
+            Undo::Append(mark) => self.store.append_rollback(mark),
+            Undo::Full(b) => self.store.mem_restore(*b),
+            Undo::Layered { full, prior } => {
+                self.store.mem_restore(*full);
+                self.undo_journal(*prior);
+            }
+            // Every append is covered by a mark inside `events`, so the journal alone,
+            // replayed in reverse, undoes everything; truncating to the opening mark
+            // afterwards would cut rows a restored delete moved to the end.
+            Undo::Rows(events) | Undo::Mixed { events, .. } => {
+                for event in events.into_iter().rev() {
+                    match event {
+                        RowUndo::DocsWing(idx, prev_cell) => {
+                            self.restore_docs_wing_cell(idx, prev_cell);
+                        }
+                        RowUndo::Update(collection, idx, row) => {
+                            self.store.restore_row_owned(&collection, idx, row);
+                        }
+                        RowUndo::Delete(collection, positions, rows) => {
+                            self.store.restore_rows_at(&collection, &positions, &rows);
+                        }
+                        RowUndo::Append(mark) => self.store.append_rollback(mark),
+                    }
+                }
+            }
         }
     }
 
@@ -1166,7 +1455,7 @@ impl Db {
             && pu.is_docs_wing_only
             && !self.is_durable()
             && !self.store.is_disk_backed(&pu.collection)
-            && pu.cas.is_some()
+            && (pu.cas.is_some() || pu.cas_each)
             && !self
                 .catalog
                 .guards
@@ -1201,12 +1490,14 @@ impl Db {
             } = &mut self.store;
             let docs_col = collections.get_mut(&pu.collection).unwrap();
             let row = &mut docs_col[idx];
-            let got = row_text(row, "hash").unwrap_or("");
-            let cas = pu.cas.as_deref().unwrap_or("");
-            if got != cas {
-                return Err(Error::runtime(format!(
-                    "cas mismatch: expected {cas:?}, found {got:?}"
-                )));
+            if !pu.cas_each {
+                let got = row_text(row, "hash").unwrap_or("");
+                let cas = pu.cas.as_deref().unwrap_or("");
+                if got != cas {
+                    return Err(Error::runtime(format!(
+                        "cas mismatch: expected {cas:?}, found {got:?}"
+                    )));
+                }
             }
             let (new_cell, wing_arc) = if let Some((c, a)) = &pu.const_wing {
                 (c.clone(), Arc::clone(a))

@@ -3,6 +3,7 @@
 pub mod checkpoint;
 pub mod columnar;
 pub mod edges;
+pub mod row;
 pub mod value;
 
 #[allow(unused_imports)]
@@ -15,7 +16,7 @@ pub(crate) use value::intern_wing;
 pub(crate) use value::take_recycled_id_title_vec;
 #[allow(unused_imports)]
 pub use value::{
-    Cell, InlineStr, Row, RowExt, acquire_orders_row, acquire_row, cell_from_arc_inline,
+    Cell, InlineStr, Row, RowExt, Shape as RowShape, acquire_orders_row, acquire_row, cell_from_arc_inline,
     compact_row, content_hash_arc, fnv1a64, now_ms, project_fields, release_id_title_rows,
     release_orders_row, row_byte_size, row_text,
 };
@@ -49,6 +50,81 @@ pub(crate) struct DiskColLazy {
 /// built the first time a caller needs to address them by `id`. Both are dropped together
 /// whenever the collection's disk state changes.
 #[derive(Default)]
+/// A unique constraint checked against the disk engine: the key columns and, for a
+/// partial index, the predicate selecting the rows it covers.
+#[derive(Debug, Clone)]
+pub(crate) struct DiskUniqueKey {
+    pub fields: Vec<String>,
+    pub pred: Option<crate::ast::Pred>,
+}
+
+impl DiskUniqueKey {
+    /// `collection[a,b]`, as the in-memory index labels itself in error messages.
+    pub(crate) fn label(&self, collection: &str) -> String {
+        format!("{collection}[{}]", self.fields.join(","))
+    }
+
+    /// True when every key column of `row` has a type this check reproduces exactly:
+    /// text, number, boolean, time, or no value. NaN (a null key part in the in-memory
+    /// index) and vectors are left to the in-memory path.
+    pub(crate) fn supports(&self, row: &Row) -> bool {
+        self.fields.iter().all(|f| match row.get(f) {
+            Some(Cell::Float(x)) => !x.is_nan(),
+            Some(Cell::Vec(_)) => false,
+            _ => true,
+        })
+    }
+
+    /// Key of `row` under this constraint, with a type tag per column so that the text
+    /// `"5"` and the integer `5` stay distinct. An absent column is a null key part, as
+    /// in the in-memory index. `None` when the row is outside the partial predicate or a
+    /// key column has an unsupported type.
+    pub(crate) fn indexed_text(&self, row: &Row, now: i64) -> Option<String> {
+        use std::fmt::Write as _;
+        if !self.supports(row)
+            || self
+                .pred
+                .as_ref()
+                .is_some_and(|p| !crate::exec::eval_pred(p, row, now))
+        {
+            return None;
+        }
+        let mut out = String::new();
+        for (i, field) in self.fields.iter().enumerate() {
+            if i > 0 {
+                out.push('\u{1f}');
+            }
+            let cell = row.get(field).unwrap_or(&Cell::Null);
+            match cell {
+                Cell::Int(n) => {
+                    let _ = write!(out, "i{n}");
+                }
+                // The in-memory index orders integers and floats on one numeric axis:
+                // `5` and `5.0` are the same key.
+                Cell::Float(x) => {
+                    if x.fract() == 0.0 && x.abs() < 9_007_199_254_740_992.0 {
+                        let _ = write!(out, "i{}", *x as i64);
+                    } else {
+                        let _ = write!(out, "f{}", x.to_bits());
+                    }
+                }
+                Cell::Bool(b) => {
+                    let _ = write!(out, "b{b}");
+                }
+                Cell::Time(t) => {
+                    let _ = write!(out, "T{t}");
+                }
+                Cell::Null => out.push('0'),
+                other => {
+                    out.push('t');
+                    out.push_str(other.text()?);
+                }
+            }
+        }
+        Some(out)
+    }
+}
+
 pub(crate) struct LazyRows {
     pub rows: Vec<Row>,
     by_id: OnceLock<FxHashMap<String, usize>>,
@@ -166,6 +242,9 @@ pub struct Store {
     /// was invalidated by a zero-promote overlay mutation (rebuilt lazily on checkpoint).
     pub(crate) dirty_fts_disk: BTreeMap<String, Vec<String>>,
     /// Stashed FTS state while a `Transaction` savepoint is open over a cold overlay.
+    /// Number of edges when the overlay savepoint began: overlay inserts only append
+    /// edges, so a rollback truncates back to this length.
+    pub(crate) overlay_savepoint_edges: Option<usize>,
     pub(crate) overlay_savepoint_fts:
         Option<(BTreeMap<String, crate::fts::FtsIndex>, BTreeMap<String, Vec<String>>)>,
     /// Cluster keys declared this session (`collection -> column`). The disk tier is
@@ -272,6 +351,7 @@ impl Store {
             disk: None,
             dirty_fts_disk: BTreeMap::new(),
             overlay_savepoint_fts: None,
+            overlay_savepoint_edges: None,
             disk_cluster_keys: BTreeMap::new(),
             disk_compact_requests: Vec::new(),
         }
@@ -290,47 +370,160 @@ impl Store {
     /// no maintenance; an HNSW graph does.
     #[inline]
     pub fn can_apply_disk_overlay(&self, collection: &str) -> bool {
-        self.is_disk_backed(collection) && !self.hnsw.contains_key(collection)
+        self.is_disk_backed(collection) && !self.hnsw_tracks_rows(collection)
     }
 
-    /// Fields covered by single-column, unconditional unique indexes of `collection`.
-    /// `None` when some unique index is composite or partial: its key cannot be checked
-    /// against the disk engine with a plain equality lookup.
-    pub(crate) fn simple_unique_fields(&self, collection: &str) -> Option<Vec<String>> {
-        let mut out: Vec<String> = Vec::new();
-        let mut add = |fields: &[String], partial: bool| -> bool {
-            if fields.len() != 1 || partial {
-                return false;
+    /// True when the HNSW graph of `collection` holds in-memory row positions that DML
+    /// would have to maintain. A graph declared over a disk-backed collection is empty
+    /// (vector search scans the rows instead), so it does not stand in the way of
+    /// overlay writes.
+    fn hnsw_tracks_rows(&self, collection: &str) -> bool {
+        self.hnsw.get(collection).is_some_and(|h| !h.is_empty())
+    }
+
+    /// True when assigning `field` in an `update` needs the in-memory index: a column of a
+    /// unique index whose definition cannot be checked against the disk engine (see
+    /// [`Self::disk_unique_keys`]).
+    pub(crate) fn unique_key_needs_memory(&self, collection: &str, field: &str) -> bool {
+        // `id` is checked against the engine's primary index (see `cold_check_id_change`).
+        field != "id"
+            && self.field_in_unique_index(collection, field)
+            && self.disk_unique_keys(collection).is_none()
+    }
+
+    /// Unique constraints of `collection` other than the primary key, including composite
+    /// and partial indexes, plus `docs.uri` (unique by contract, with or without an index
+    /// declared on it). `None` when a partial predicate cannot be reconstructed.
+    pub(crate) fn disk_unique_keys(&self, collection: &str) -> Option<Vec<DiskUniqueKey>> {
+        let mut out: Vec<DiskUniqueKey> = Vec::new();
+        let mut add = |fields: &[String], pred: Option<crate::ast::Pred>| {
+            if fields.len() == 1 && fields[0] == "id" && pred.is_none() {
+                return;
             }
-            if !out.contains(&fields[0]) {
-                out.push(fields[0].clone());
+            let label = pred.as_ref().map(|p| p.to_string());
+            if !out.iter().any(|k| {
+                k.fields == fields && k.pred.as_ref().map(|p| p.to_string()) == label
+            }) {
+                out.push(DiskUniqueKey {
+                    fields: fields.to_vec(),
+                    pred,
+                });
             }
-            true
         };
         for li in self.indexes.values() {
-            if li.def.collection == collection
-                && li.def.unique
-                && !add(&li.def.fields, li.def.pred.is_some())
-            {
-                return None;
+            if li.def.collection == collection && li.def.unique {
+                add(&li.def.fields, li.def.pred.clone());
             }
         }
         for ix in self.extra_indexes.values() {
-            if ix.collection == collection
-                && ix.unique
-                && !add(&ix.fields, ix.pred_src.is_some())
-            {
-                return None;
+            if ix.collection == collection && ix.unique {
+                let pred = match &ix.pred_src {
+                    Some(src) => Some(crate::parse::parse_pred_src(src).ok()?),
+                    None => None,
+                };
+                add(&ix.fields, pred);
             }
+        }
+        if collection == "docs" {
+            add(&["uri".to_string()], None);
         }
         Some(out)
     }
 
-    /// True when some live row of a disk-backed collection has `field == key` (text key).
-    pub(crate) fn disk_count_eq(&self, collection: &str, field: &str, key: &str) -> usize {
-        self.disk_engine_read()
-            .and_then(|eng| eng.count_by_eq(collection, field, &Cell::from_text(key)).ok())
-            .unwrap_or(0)
+    /// Unique constraints that an `update` assigning `fields` can violate: its key, or the
+    /// predicate of a partial index, mentions one of them.
+    pub(crate) fn unique_keys_assigned<'a>(
+        &self,
+        collection: &str,
+        fields: impl Iterator<Item = &'a str>,
+    ) -> Vec<DiskUniqueKey> {
+        let assigned: Vec<&str> = fields.collect();
+        let mut keys = self.disk_unique_keys(collection).unwrap_or_default();
+        keys.retain(|k| {
+            k.fields.iter().any(|f| assigned.contains(&f.as_str()))
+                || k.pred.as_ref().is_some_and(|p| {
+                    let mut used = Vec::new();
+                    p.walk_fields(&mut used);
+                    used.iter()
+                        .any(|f| f.leaf().is_some_and(|leaf| assigned.contains(&leaf)))
+                })
+        });
+        keys
+    }
+
+    /// True when a live row of the disk-backed `collection`, other than `exclude_id`, is
+    /// indexed by `key` under the same key values as `row`.
+    pub(crate) fn disk_unique_conflict(
+        &self,
+        collection: &str,
+        key: &DiskUniqueKey,
+        row: &Row,
+        exclude_id: Option<&str>,
+        now: i64,
+    ) -> bool {
+        use crate::ast::{CmpOp, Field, Pred, Value};
+        let Some(eng) = self.disk_engine_read() else {
+            return false;
+        };
+        // Common case, a single text key: one index lookup.
+        if let ([field], None, None) = (key.fields.as_slice(), &key.pred, exclude_id)
+            && let Some(text) = row.get(field).and_then(Cell::text)
+        {
+            return eng
+                .count_by_eq(collection, field, &Cell::from_text(text))
+                .is_ok_and(|n| n > 0);
+        }
+        let mut pred: Option<Pred> = key.pred.clone();
+        let and = |term: Pred, pred: &mut Option<Pred>| {
+            *pred = Some(match pred.take() {
+                Some(rest) => Pred::And(Box::new(term), Box::new(rest)),
+                None => term,
+            });
+        };
+        let cmp = |field: &str, op: CmpOp, value: Value| Pred::Cmp {
+            field: Field::name(field),
+            op,
+            value,
+        };
+        for field in key.fields.iter().rev() {
+            match row.get(field).unwrap_or(&Cell::Null) {
+                // A number is matched as the range `[x, x]`: comparisons are numeric
+                // across integer and float storage, while an equality lookup goes through
+                // the type-strict index key and would miss a stored `5.0` for `5`.
+                Cell::Int(n) => {
+                    and(cmp(field, CmpOp::Le, Value::Int(*n)), &mut pred);
+                    and(cmp(field, CmpOp::Ge, Value::Int(*n)), &mut pred);
+                }
+                Cell::Float(x) if !x.is_nan() => {
+                    and(cmp(field, CmpOp::Le, Value::Float(*x)), &mut pred);
+                    and(cmp(field, CmpOp::Ge, Value::Float(*x)), &mut pred);
+                }
+                Cell::Bool(b) => and(cmp(field, CmpOp::Eq, Value::Bool(*b)), &mut pred),
+                Cell::Time(t) => and(cmp(field, CmpOp::Eq, Value::Timestamp(*t)), &mut pred),
+                // No value: conflicts with another row that has none either.
+                Cell::Null => and(
+                    Pred::IsNull {
+                        field: Field::name(field),
+                        negated: false,
+                    },
+                    &mut pred,
+                ),
+                Cell::Float(_) | Cell::Vec(_) => return false,
+                text => match text.text() {
+                    Some(t) => and(cmp(field, CmpOp::Eq, Value::String(Arc::from(t))), &mut pred),
+                    None => return false,
+                },
+            }
+        }
+        let Some(pred) = pred else {
+            return false;
+        };
+        // Two hits are enough to see a row other than the excluded one.
+        eng.query_filter(collection, Some(&pred), Some(2), Some(&["id"]), now)
+            .is_ok_and(|rows| {
+                rows.iter()
+                    .any(|r| r.get("id").and_then(Cell::text) != exclude_id || exclude_id.is_none())
+            })
     }
 
     /// True when `field` takes part in a unique index of `collection`.
@@ -347,7 +540,7 @@ impl Store {
     #[inline]
     pub fn can_mutate_disk_overlay(&self, collection: &str) -> bool {
         self.is_disk_backed(collection)
-            && !self.hnsw.contains_key(collection)
+            && !self.hnsw_tracks_rows(collection)
             && !self
                 .extra_indexes
                 .values()
@@ -457,6 +650,9 @@ impl Store {
         if self.overlay_savepoint_fts.is_none() {
             self.overlay_savepoint_fts = Some((BTreeMap::new(), self.dirty_fts_disk.clone()));
         }
+        if self.overlay_savepoint_edges.is_none() {
+            self.overlay_savepoint_edges = Some(self.edges.len());
+        }
         if let Some(d) = self.disk.as_ref()
             && let Ok(mut eng) = d.engine.write()
         {
@@ -466,6 +662,7 @@ impl Store {
 
     pub(crate) fn commit_disk_overlay_savepoint(&mut self) {
         self.overlay_savepoint_fts = None;
+        self.overlay_savepoint_edges = None;
         if let Some(d) = self.disk.as_ref()
             && let Ok(mut eng) = d.engine.write()
         {
@@ -479,6 +676,12 @@ impl Store {
                 self.fts.insert(k, v);
             }
             self.dirty_fts_disk = saved_dirty;
+        }
+        if let Some(len) = self.overlay_savepoint_edges.take()
+            && self.edges.len() > len
+        {
+            self.edges.truncate(len);
+            self.rebuild_edge_keys();
         }
         let Some(d) = self.disk.as_mut() else {
             return;
@@ -576,6 +779,13 @@ impl Store {
         self.collections.insert(name.to_string(), maybe_rows);
         self.rebuild_row_maps_collection(name);
         self.rebuild_indexes_collection(name);
+        // A vector index declared while the rows were on disk is empty: index the rows
+        // now, or later inserts would leave a graph that knows only the new rows.
+        match self.hnsw.get(name) {
+            Some(crate::embed::VectorIndex::Sq8(_)) => self.build_hnsw_sq8(name, 16, 64),
+            Some(_) => self.build_hnsw(name, 16, 64),
+            None => {}
+        }
         if let Some(fields) = self.dirty_fts_disk.remove(name) {
             let rows = self.collection(name);
             self.fts
@@ -708,6 +918,7 @@ impl Store {
             disk: disk_snap,
             dirty_fts_disk: self.dirty_fts_disk.clone(),
             overlay_savepoint_fts: None,
+            overlay_savepoint_edges: None,
             disk_cluster_keys: BTreeMap::new(),
             disk_compact_requests: Vec::new(),
         }
@@ -945,8 +1156,10 @@ impl Store {
                     bitmap_card_field: None,
                 };
                 let mut live = LiveIndex::new(def);
-                for (i, row) in self.collection(collection).iter().enumerate() {
-                    let _ = live.insert_at(i, row);
+                if !self.is_disk_backed(collection) {
+                    for (i, row) in self.collection(collection).iter().enumerate() {
+                        let _ = live.insert_at(i, row);
+                    }
                 }
                 self.indexes.insert(label, live);
                 if fields.iter().any(|f| f == "embedding") {
@@ -986,16 +1199,26 @@ impl Store {
         }
     }
 
+    /// Snapshot memory state for rollback without promoting disk-backed collections;
+    /// cold tables stay on disk behind an overlay savepoint.
     pub fn mem_backup(&mut self) -> MemBackup {
         self.flush_fts_deferred_docs();
         self.ensure_facts_rows();
-        let disk_names: Vec<String> = self
+        let disk_tables: Vec<String> = self
             .disk
             .as_ref()
             .map(|d| d.tables.keys().cloned().collect())
             .unwrap_or_default();
-        for name in disk_names {
-            self.promote_disk_col(&name);
+        let mut fts_cold = BTreeMap::new();
+        for name in &disk_tables {
+            if let Some(idx) = self.fts.get(name) {
+                fts_cold.insert(name.clone(), idx.clone());
+            }
+        }
+        let dirty_fts_disk = self.dirty_fts_disk.clone();
+        let restore_overlay_fts = self.overlay_savepoint_fts.is_none();
+        if !disk_tables.is_empty() {
+            self.begin_disk_overlay_savepoint();
         }
         // Deletions bitmap is not persisted (snapshots are always compacted)
         MemBackup {
@@ -1010,6 +1233,42 @@ impl Store {
             extra_filters: self.extra_filters.clone(),
             extra_owned: self.extra_owned.clone(),
             hnsw: self.hnsw.clone(),
+            disk_tables,
+            fts_cold,
+            dirty_fts_disk,
+            restore_overlay_fts,
+        }
+    }
+
+    /// Snapshot full state for long-lived named memory pins by promoting disk tables into RAM
+    /// so subsequent savepoints cannot interfere with the pin.
+    pub fn mem_backup_pin(&mut self) -> MemBackup {
+        self.flush_fts_deferred_docs();
+        self.ensure_facts_rows();
+        let disk_names: Vec<String> = self
+            .disk
+            .as_ref()
+            .map(|d| d.tables.keys().cloned().collect())
+            .unwrap_or_default();
+        for name in disk_names {
+            self.promote_disk_col(&name);
+        }
+        MemBackup {
+            r#gen: self.r#gen,
+            embed_id: self.embed_id.clone(),
+            next_id: self.next_id,
+            collections: self.collections.clone(),
+            edges: self.edges.clone(),
+            extra_collections: self.extra_collections.clone(),
+            extra_rels: self.extra_rels.clone(),
+            extra_indexes: self.extra_indexes.clone(),
+            extra_filters: self.extra_filters.clone(),
+            extra_owned: self.extra_owned.clone(),
+            hnsw: self.hnsw.clone(),
+            disk_tables: Vec::new(),
+            fts_cold: BTreeMap::new(),
+            dirty_fts_disk: BTreeMap::new(),
+            restore_overlay_fts: false,
         }
     }
 
@@ -1026,8 +1285,38 @@ impl Store {
         self.extra_owned = b.extra_owned;
         self.hnsw = b.hnsw;
         self.facts_rows_stale = false;
-        if let Some(d) = self.disk.as_mut() {
-            d.tables.clear();
+        if b.disk_tables.is_empty() {
+            if let Some(d) = self.disk.as_mut() {
+                d.tables.clear();
+            }
+            self.overlay_savepoint_fts = None;
+            self.overlay_savepoint_edges = None;
+        } else {
+            self.rollback_disk_overlay_savepoint();
+            if let Some(d) = self.disk.as_mut() {
+                d.tables.clear();
+                if let Ok(eng) = d.engine.read() {
+                    for name in &b.disk_tables {
+                        let nrows = eng.count_table(name);
+                        d.tables.insert(
+                            name.clone(),
+                            DiskColLazy {
+                                row_count: nrows,
+                                materialized: OnceLock::new(),
+                            },
+                        );
+                    }
+                }
+            }
+            if b.restore_overlay_fts {
+                for name in &b.disk_tables {
+                    self.fts.remove(name);
+                }
+                for (k, v) in b.fts_cold {
+                    self.fts.insert(k, v);
+                }
+                self.dirty_fts_disk = b.dirty_fts_disk;
+            }
         }
         self.rebuild_indexes();
         self.rebuild_row_maps();
@@ -1286,6 +1575,9 @@ impl Store {
     fn rebuild_all_fts_inplace(&mut self) {
         let names = self.fts.keys().cloned().collect::<Vec<_>>();
         for name in names {
+            if self.is_disk_backed(&name) {
+                continue;
+            }
             self.rebuild_fts_inplace(&name);
         }
     }
@@ -1407,10 +1699,10 @@ impl Store {
         facts.clear();
         facts.reserve(n);
         for i in 0..n {
-            let mut row = BTreeMap::new();
-            row.insert("s".into(), Cell::Text(Arc::clone(&self.facts_s[i])));
-            row.insert("p".into(), Cell::Text(Arc::clone(&self.facts_p[i])));
-            row.insert("o".into(), Cell::Text(Arc::clone(&self.facts_o[i])));
+            let mut row = Row::new();
+            row.insert("s", Cell::Text(Arc::clone(&self.facts_s[i])));
+            row.insert("p", Cell::Text(Arc::clone(&self.facts_p[i])));
+            row.insert("o", Cell::Text(Arc::clone(&self.facts_o[i])));
             facts.push(row);
         }
         self.facts_rows_stale = false;
@@ -1420,6 +1712,15 @@ impl Store {
     /// journals can be replayed against it.
     pub fn has_collection(&self, name: &str) -> bool {
         self.collections.contains_key(name) && !self.is_disk_backed(name)
+    }
+
+    /// Whether some reader has pulled a disk-backed collection's rows into memory
+    /// (see [`Self::collection`]). False for collections that are not disk-backed.
+    pub fn disk_rows_materialized(&self, name: &str) -> bool {
+        self.disk
+            .as_ref()
+            .and_then(|d| d.tables.get(name))
+            .is_some_and(|lazy| lazy.materialized.get().is_some())
     }
 
     pub fn collection(&self, name: &str) -> &[Row] {
@@ -1709,7 +2010,15 @@ impl Store {
                         &Cell::from_text(key),
                         refs.as_deref(),
                         |r| {
-                            found = Some(r.clone());
+                            // Segment rows arrive projected, overlay (memtable) rows
+                            // arrive whole: project those here.
+                            found = Some(match refs.as_deref() {
+                                Some(fs) if r.keys().any(|k| !fs.contains(&k.as_str())) => fs
+                                    .iter()
+                                    .filter_map(|&f| r.get(f).map(|c| (f, c.clone())))
+                                    .collect(),
+                                _ => r.clone(),
+                            });
                             Ok(false)
                         },
                     );
@@ -1774,7 +2083,7 @@ impl Store {
         if fields.len() == 2 && fields[0] == "id" && fields[1] == "title" {
             return Some(row_id_title(&self.docs_id[i], &self.docs_title[i]));
         }
-        let mut row = BTreeMap::new();
+        let mut row = Row::new();
         for f in fields {
             let cell = match f.as_str() {
                 "id" => Cell::Text(Arc::clone(&self.docs_id[i])),
@@ -2373,9 +2682,15 @@ impl Store {
         if let Some(fts) = self.fts.get_mut(collection) {
             fts.sync_row(idx, &old_row, &row);
         }
+        let identity_moved = row_text(&old_row, "id") != row_text(&row, "id")
+            || row_text(&old_row, "uri") != row_text(&row, "uri");
         self.row_maps_sync_updated(collection, idx, &old_row, &row);
         let _ = self.index_update_row(collection, idx, &old_row, &row);
         self.collections.get_mut(collection).unwrap()[idx] = row;
+        // Rolling back a rename: the row maps must be rebuilt from the restored row.
+        if identity_moved {
+            self.rebuild_row_maps_collection(collection);
+        }
     }
 
     /// Inverse of [`Self::delete_rows_at`]: drop each removed row back into its old
@@ -3956,6 +4271,10 @@ pub struct MemBackup {
     extra_filters: BTreeMap<String, String>,
     extra_owned: BTreeMap<String, Vec<(String, String)>>,
     hnsw: BTreeMap<String, crate::embed::VectorIndex>,
+    disk_tables: Vec<String>,
+    fts_cold: BTreeMap<String, crate::fts::FtsIndex>,
+    dirty_fts_disk: BTreeMap<String, Vec<String>>,
+    restore_overlay_fts: bool,
 }
 
 fn same_row_key(collection: &str, a: &Row, b: &Row) -> bool {
@@ -3985,13 +4304,13 @@ mod borrowed_delete_tests {
                     match (i + field.len()) % 4 {
                         0 => {}
                         1 => {
-                            row.insert(field.into(), Cell::Null);
+                            row.insert(field, Cell::Null);
                         }
                         2 => {
-                            row.insert(field.into(), Cell::Int(i as i64));
+                            row.insert(field, Cell::Int(i as i64));
                         }
                         _ => {
-                            row.insert(field.into(), Cell::text_arc(format!("{field}-{}", i % 9)));
+                            row.insert(field, Cell::text_arc(format!("{field}-{}", i % 9)));
                         }
                     }
                 }
@@ -4044,7 +4363,7 @@ mod borrowed_delete_tests {
             let rows = (0..31)
                 .map(|i| {
                     Row::from([
-                        ("id".into(), Cell::text_arc(format!("id{i}"))),
+                        ("id", Cell::text_arc(format!("id{i}"))),
                         ("uri".into(), Cell::text_arc(format!("uri{i}"))),
                         ("title".into(), Cell::text_arc(format!("shared title{i}"))),
                         ("body".into(), Cell::text_arc(format!("shared unique{i}"))),
@@ -4119,7 +4438,7 @@ mod borrowed_delete_tests {
         let rows = (0..4)
             .map(|i| {
                 Row::from([
-                    ("id".into(), Cell::text_arc(format!("id{i}"))),
+                    ("id", Cell::text_arc(format!("id{i}"))),
                     ("title".into(), Cell::text_arc(format!("title{i}"))),
                     ("group".into(), Cell::Int(i)),
                 ])

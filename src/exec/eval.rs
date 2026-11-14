@@ -314,27 +314,37 @@ pub(crate) fn eval_pred(pred: &Pred, row: &Row, now: i64) -> bool {
         Pred::And(a, b) => eval_pred(a, row, now) && eval_pred(b, row, now),
         Pred::Or(a, b) => eval_pred(a, row, now) || eval_pred(b, row, now),
         Pred::Not(inner) => !eval_pred(inner, row, now),
-        Pred::IsNull { field, negated } => {
-            let is_null = matches!(field_cell(row, field), Cell::Null);
+        Pred::IsNull { field, .. }
+        | Pred::In { field, .. }
+        | Pred::Cmp { field, .. }
+        | Pred::Has { field, .. }
+        | Pred::Contains { field, .. }
+        | Pred::Regex { field, .. } => eval_leaf(pred, field_cell(row, field), now),
+    }
+}
+
+/// A leaf predicate decided on the value of its field (`Cell::Null` when absent).
+/// `and` / `or` / `not` are not leaves and yield `false`.
+pub(crate) fn eval_leaf(pred: &Pred, cell: &Cell, now: i64) -> bool {
+    match pred {
+        Pred::And(..) | Pred::Or(..) | Pred::Not(..) => false,
+        Pred::IsNull { negated, .. } => {
+            let is_null = matches!(cell, Cell::Null);
             if *negated { !is_null } else { is_null }
         }
-        Pred::In { field, values } => {
-            let left = field_cell(row, field);
+        Pred::In { values, .. } => {
+            let left = cell;
             values.iter().any(|v| cell_eq_val(left, v, now))
         }
-        Pred::Cmp { field, op, value } => cmp_cell(field_cell(row, field), value, *op, now),
-        Pred::Has { field, ci, needle } => field_cell(row, field)
+        Pred::Cmp { op, value, .. } => cmp_cell(cell, value, *op, now),
+        Pred::Has { ci, needle, .. } => cell
             .text()
             .is_some_and(|s| has_word(s, needle, *ci)),
-        Pred::Contains { field, needle } => field_cell(row, field)
+        Pred::Contains { needle, .. } => cell
             .text()
             .is_some_and(|s| text_contains(s, needle)),
-        Pred::Regex {
-            field,
-            pattern,
-            flags,
-        } => {
-            let Some(text) = field_cell(row, field).text() else {
+        Pred::Regex { pattern, flags, .. } => {
+            let Some(text) = cell.text() else {
                 return false;
             };
 
@@ -364,6 +374,87 @@ pub(crate) fn eval_pred(pred: &Pred, row: &Row, now: i64) -> bool {
                 matched
             })
         }
+    }
+}
+
+
+/// A predicate prepared for many rows: every single-name field keeps a [`FieldSlot`], so a
+/// row with a shape seen before is read by position instead of a search by name. Results
+/// are exactly those of [`eval_pred`].
+pub(crate) struct PredSlots<'p> {
+    tree: SlotNode<'p>,
+    slots: Vec<crate::store::row::FieldSlot<'p>>,
+}
+
+enum SlotNode<'p> {
+    And(Box<SlotNode<'p>>, Box<SlotNode<'p>>),
+    Or(Box<SlotNode<'p>>, Box<SlotNode<'p>>),
+    Not(Box<SlotNode<'p>>),
+    /// Leaf over a single-name field: index into `slots`.
+    Leaf(&'p Pred, usize),
+    /// Leaf over a dotted path: resolved by name.
+    ByName(&'p Pred),
+}
+
+impl<'p> PredSlots<'p> {
+    pub(crate) fn new(pred: &'p Pred) -> Self {
+        fn build<'p>(
+            pred: &'p Pred,
+            slots: &mut Vec<crate::store::row::FieldSlot<'p>>,
+        ) -> SlotNode<'p> {
+            match pred {
+                Pred::And(a, b) => {
+                    SlotNode::And(Box::new(build(a, slots)), Box::new(build(b, slots)))
+                }
+                Pred::Or(a, b) => {
+                    SlotNode::Or(Box::new(build(a, slots)), Box::new(build(b, slots)))
+                }
+                Pred::Not(inner) => SlotNode::Not(Box::new(build(inner, slots))),
+                Pred::IsNull { field, .. }
+                | Pred::In { field, .. }
+                | Pred::Cmp { field, .. }
+                | Pred::Has { field, .. }
+                | Pred::Contains { field, .. }
+                | Pred::Regex { field, .. } => match field.leaf() {
+                    Some(name) => {
+                        let at = match slots.iter().position(|s| s.key() == name) {
+                            Some(at) => at,
+                            None => {
+                                slots.push(crate::store::row::FieldSlot::new(name));
+                                slots.len() - 1
+                            }
+                        };
+                        SlotNode::Leaf(pred, at)
+                    }
+                    None => SlotNode::ByName(pred),
+                },
+            }
+        }
+        let mut slots = Vec::new();
+        let tree = build(pred, &mut slots);
+        PredSlots { tree, slots }
+    }
+
+    #[inline]
+    pub(crate) fn eval(&mut self, row: &Row, now: i64) -> bool {
+        fn go(
+            node: &SlotNode<'_>,
+            slots: &mut [crate::store::row::FieldSlot<'_>],
+            row: &Row,
+            now: i64,
+        ) -> bool {
+            static NULL: Cell = Cell::Null;
+            match node {
+                SlotNode::And(a, b) => go(a, slots, row, now) && go(b, slots, row, now),
+                SlotNode::Or(a, b) => go(a, slots, row, now) || go(b, slots, row, now),
+                SlotNode::Not(inner) => !go(inner, slots, row, now),
+                SlotNode::Leaf(pred, at) => {
+                    eval_leaf(pred, slots[*at].get(row).unwrap_or(&NULL), now)
+                }
+                SlotNode::ByName(pred) => eval_pred(pred, row, now),
+            }
+        }
+        go(&self.tree, &mut self.slots, row, now)
     }
 }
 
@@ -619,6 +710,23 @@ pub(crate) fn project(rows: &[Row], fields: &[Field]) -> Vec<Row> {
     result
 }
 
+/// [`project`] for rows the caller owns: unwanted fields are dropped in place and missing
+/// ones filled with nulls, so no row, key string or cell is reallocated.
+pub(crate) fn project_owned(mut rows: Vec<Row>, fields: &[Field]) -> Vec<Row> {
+    let keys: Vec<String> = fields.iter().map(|f| f.as_str()).collect();
+    for row in &mut rows {
+        if row.len() != keys.len() || !keys.iter().all(|k| row.contains_key(k)) {
+            row.retain(|k, _| keys.iter().any(|want| want == k));
+            for k in &keys {
+                if !row.contains_key(k) {
+                    row.insert(k.clone(), Cell::Null);
+                }
+            }
+        }
+    }
+    rows
+}
+
 pub(crate) fn sort_rows_top_k(
     rows: &mut Vec<Row>,
     field: &Field,
@@ -652,17 +760,19 @@ pub(crate) fn sort_rows_top_k(
         return;
     }
 
-    // Decorate: extract sort keys once in O(N) instead of O(N log N) BTree lookups
+    // Decorate: extract sort keys once in O(N) instead of O(N log N) lookups by name.
+    let mut key_slot = crate::store::row::FieldSlot::new(&k);
     let mut keys: Vec<(Cell, usize)> = rows
         .iter()
         .enumerate()
         .map(|(i, r)| {
             (
-                r.get(&k).map(Cell::clone_for_borrow).unwrap_or(Cell::Null),
+                key_slot.get(r).map(Cell::clone_for_borrow).unwrap_or(Cell::Null),
                 i,
             )
         })
         .collect();
+    drop(key_slot);
 
     let cmp_keys = |a: &(Cell, usize), b: &(Cell, usize)| {
         let ord = cmp_sort(&a.0, &b.0);
@@ -743,6 +853,233 @@ fn get_frame_bounds(
                 (0, i)
             } else {
                 (0, n.saturating_sub(1))
+            }
+        }
+    }
+}
+
+/// Values of one window function over a partition already in window order.
+///
+/// `tv[i]` is the target field of row `i` (`Cell::Null` when absent, or for functions
+/// without a field); `ties[i]` says whether row `i` equals row `i - 1` on every sort key
+/// (empty when the window has no ordering). Shared by the row and the columnar executor.
+pub(crate) fn window_values(
+    func: &WindowFunction,
+    tv: &[&Cell],
+    ties: &[bool],
+    has_order: bool,
+    has_target: bool,
+    frame: Option<&WindowFrame>,
+) -> Vec<Cell> {
+    let n = tv.len();
+    match func {
+        WindowFunction::RowNumber => (0..n).map(|i| Cell::Int((i + 1) as i64)).collect(),
+        WindowFunction::Rank => {
+            let mut ranks = Vec::with_capacity(n);
+            let mut current_rank = 1i64;
+            for i in 0..n {
+                // `ties` is empty when there is nothing to order by: one shared rank.
+                if i > 0 && ties.get(i).is_some_and(|tied| !tied) {
+                    current_rank = (i + 1) as i64;
+                }
+                ranks.push(Cell::Int(current_rank));
+            }
+            ranks
+        }
+        WindowFunction::DenseRank => {
+            let mut ranks = Vec::with_capacity(n);
+            let mut current_rank = 1i64;
+            for i in 0..n {
+                if i > 0 && ties.get(i).is_some_and(|tied| !tied) {
+                    current_rank += 1;
+                }
+                ranks.push(Cell::Int(current_rank));
+            }
+            ranks
+        }
+        WindowFunction::Lead { offset } => {
+            let off = *offset;
+            (0..n)
+                .map(|i| {
+                    if i + off < n {
+                        tv[i + off].clone()
+                    } else {
+                        Cell::Null
+                    }
+                })
+                .collect()
+        }
+        WindowFunction::Lag { offset } => {
+            let off = *offset;
+            (0..n)
+                .map(|i| {
+                    if i >= off {
+                        tv[i - off].clone()
+                    } else {
+                        Cell::Null
+                    }
+                })
+                .collect()
+        }
+        WindowFunction::FirstValue => {
+            if let Some(fr) = frame {
+                (0..n)
+                    .map(|i| {
+                        let (s, e) = get_frame_bounds(i, n, Some(fr), has_order);
+                        if s <= e && s < n {
+                            tv[s].clone()
+                        } else {
+                            Cell::Null
+                        }
+                    })
+                    .collect()
+            } else {
+                let first_val = tv.first().map(|c| (*c).clone()).unwrap_or(Cell::Null);
+                vec![first_val; n]
+            }
+        }
+        WindowFunction::LastValue => {
+            if let Some(fr) = frame {
+                (0..n)
+                    .map(|i| {
+                        let (s, e) = get_frame_bounds(i, n, Some(fr), has_order);
+                        if s <= e && s < n {
+                            let end_idx = e.min(n - 1);
+                            tv[end_idx].clone()
+                        } else {
+                            Cell::Null
+                        }
+                    })
+                    .collect()
+            } else {
+                let last_val = tv.last().map(|c| (*c).clone()).unwrap_or(Cell::Null);
+                vec![last_val; n]
+            }
+        }
+        WindowFunction::Sum => {
+            let mut has_float = false;
+            let has_float_scan = tv.iter().any(|c| matches!(c, Cell::Float(_)));
+            has_float |= has_float_scan;
+            if has_float {
+                let mut prefix = Vec::with_capacity(n + 1);
+                prefix.push(0.0f64);
+                let mut acc = 0.0f64;
+                for c in tv {
+                    if let Some(v) = c.as_f64()
+                    {
+                        acc += v;
+                    }
+                    prefix.push(acc);
+                }
+                let mut sums = Vec::with_capacity(n);
+                for i in 0..n {
+                    let (s, e) = get_frame_bounds(i, n, frame, has_order);
+                    if s <= e && s < n {
+                        let end_idx = e.min(n - 1);
+                        let sum = prefix[end_idx + 1] - prefix[s];
+                        sums.push(Cell::Float(sum));
+                    } else {
+                        sums.push(Cell::Float(0.0));
+                    }
+                }
+                sums
+            } else {
+                let mut prefix = Vec::with_capacity(n + 1);
+                prefix.push(0i64);
+                let mut acc = 0i64;
+                for c in tv {
+                    if let Some(v) = c.as_int()
+                    {
+                        acc += v;
+                    }
+                    prefix.push(acc);
+                }
+                let mut sums = Vec::with_capacity(n);
+                for i in 0..n {
+                    let (s, e) = get_frame_bounds(i, n, frame, has_order);
+                    if s <= e && s < n {
+                        let end_idx = e.min(n - 1);
+                        let sum = prefix[end_idx + 1] - prefix[s];
+                        sums.push(Cell::Int(sum));
+                    } else {
+                        sums.push(Cell::Int(0));
+                    }
+                }
+                sums
+            }
+        }
+        WindowFunction::Avg => {
+            let mut prefix_sum = Vec::with_capacity(n + 1);
+            let mut prefix_cnt = Vec::with_capacity(n + 1);
+            prefix_sum.push(0.0f64);
+            prefix_cnt.push(0usize);
+            let mut sum_acc = 0.0f64;
+            let mut cnt_acc = 0usize;
+            for c in tv {
+                if let Some(v) = c.as_f64()
+                {
+                    sum_acc += v;
+                    cnt_acc += 1;
+                }
+                prefix_sum.push(sum_acc);
+                prefix_cnt.push(cnt_acc);
+            }
+            let mut avgs = Vec::with_capacity(n);
+            for i in 0..n {
+                let (s, e) = get_frame_bounds(i, n, frame, has_order);
+                if s <= e && s < n {
+                    let end_idx = e.min(n - 1);
+                    let sum = prefix_sum[end_idx + 1] - prefix_sum[s];
+                    let count = prefix_cnt[end_idx + 1] - prefix_cnt[s];
+                    let avg = if count == 0 { 0.0 } else { sum / count as f64 };
+                    avgs.push(Cell::Float(avg));
+                } else {
+                    avgs.push(Cell::Float(0.0));
+                }
+            }
+            avgs
+        }
+        WindowFunction::Min => {
+            eval_window_extremum(tv, frame, has_order, false)
+        }
+        WindowFunction::Max => {
+            eval_window_extremum(tv, frame, has_order, true)
+        }
+        WindowFunction::Count => {
+            if has_target {
+                let mut prefix_cnt = Vec::with_capacity(n + 1);
+                prefix_cnt.push(0usize);
+                let mut cnt_acc = 0usize;
+                for c in tv {
+                    if !matches!(c, Cell::Null) {
+                        cnt_acc += 1;
+                    }
+                    prefix_cnt.push(cnt_acc);
+                }
+                let mut counts = Vec::with_capacity(n);
+                for i in 0..n {
+                    let (s, e) = get_frame_bounds(i, n, frame, has_order);
+                    if s <= e && s < n {
+                        let end_idx = e.min(n - 1);
+                        let count = prefix_cnt[end_idx + 1] - prefix_cnt[s];
+                        counts.push(Cell::Int(count as i64));
+                    } else {
+                        counts.push(Cell::Int(0));
+                    }
+                }
+                counts
+            } else {
+                let mut counts = Vec::with_capacity(n);
+                for i in 0..n {
+                    let (s, e) = get_frame_bounds(i, n, frame, has_order);
+                    let count = if s <= e && s < n {
+                        e.min(n - 1) - s + 1
+                    } else {
+                        0
+                    };
+                    counts.push(Cell::Int(count as i64));
+                }
+                counts
             }
         }
     }
@@ -854,236 +1191,25 @@ pub(crate) fn eval_window(
                 .collect();
         }
 
-        let n = part.len();
-        let vals: Vec<Cell> = match func {
-            WindowFunction::RowNumber => (0..n).map(|i| Cell::Int((i + 1) as i64)).collect(),
-            WindowFunction::Rank => {
-                let mut ranks = Vec::with_capacity(n);
-                let mut current_rank = 1i64;
-                for i in 0..n {
-                    // `ties` is empty when there is nothing to order by: one shared rank.
-                    if i > 0 && ties.get(i).is_some_and(|tied| !tied) {
-                        current_rank = (i + 1) as i64;
-                    }
-                    ranks.push(Cell::Int(current_rank));
-                }
-                ranks
-            }
-            WindowFunction::DenseRank => {
-                let mut ranks = Vec::with_capacity(n);
-                let mut current_rank = 1i64;
-                for i in 0..n {
-                    if i > 0 && ties.get(i).is_some_and(|tied| !tied) {
-                        current_rank += 1;
-                    }
-                    ranks.push(Cell::Int(current_rank));
-                }
-                ranks
-            }
-            WindowFunction::Lead { offset } => {
-                let off = *offset;
-                (0..n)
-                    .map(|i| {
-                        if i + off < n {
-                            part[i + off].get(tf).cloned().unwrap_or(Cell::Null)
-                        } else {
-                            Cell::Null
-                        }
-                    })
-                    .collect()
-            }
-            WindowFunction::Lag { offset } => {
-                let off = *offset;
-                (0..n)
-                    .map(|i| {
-                        if i >= off {
-                            part[i - off].get(tf).cloned().unwrap_or(Cell::Null)
-                        } else {
-                            Cell::Null
-                        }
-                    })
-                    .collect()
-            }
-            WindowFunction::FirstValue => {
-                if let Some(fr) = frame {
-                    (0..n)
-                        .map(|i| {
-                            let (s, e) = get_frame_bounds(i, n, Some(fr), !order_keys.is_empty());
-                            if s <= e && s < n {
-                                part[s].get(tf).cloned().unwrap_or(Cell::Null)
-                            } else {
-                                Cell::Null
-                            }
-                        })
-                        .collect()
-                } else {
-                    let first_val = part
-                        .first()
-                        .and_then(|r| r.get(tf))
-                        .cloned()
-                        .unwrap_or(Cell::Null);
-                    vec![first_val; n]
-                }
-            }
-            WindowFunction::LastValue => {
-                if let Some(fr) = frame {
-                    (0..n)
-                        .map(|i| {
-                            let (s, e) = get_frame_bounds(i, n, Some(fr), !order_keys.is_empty());
-                            if s <= e && s < n {
-                                let end_idx = e.min(n - 1);
-                                part[end_idx].get(tf).cloned().unwrap_or(Cell::Null)
-                            } else {
-                                Cell::Null
-                            }
-                        })
-                        .collect()
-                } else {
-                    let last_val = part
-                        .last()
-                        .and_then(|r| r.get(tf))
-                        .cloned()
-                        .unwrap_or(Cell::Null);
-                    vec![last_val; n]
-                }
-            }
-            WindowFunction::Sum => {
-                let mut has_float = false;
-                for r in &part {
-                    if let Some(c) = r.get(tf) {
-                        if matches!(c, Cell::Float(_)) {
-                            has_float = true;
-                            break;
-                        }
-                    }
-                }
-                if has_float {
-                    let mut prefix = Vec::with_capacity(n + 1);
-                    prefix.push(0.0f64);
-                    let mut acc = 0.0f64;
-                    for r in &part {
-                        if let Some(c) = r.get(tf)
-                            && let Some(v) = c.as_f64()
-                        {
-                            acc += v;
-                        }
-                        prefix.push(acc);
-                    }
-                    let mut sums = Vec::with_capacity(n);
-                    for i in 0..n {
-                        let (s, e) = get_frame_bounds(i, n, frame, !order_keys.is_empty());
-                        if s <= e && s < n {
-                            let end_idx = e.min(n - 1);
-                            let sum = prefix[end_idx + 1] - prefix[s];
-                            sums.push(Cell::Float(sum));
-                        } else {
-                            sums.push(Cell::Float(0.0));
-                        }
-                    }
-                    sums
-                } else {
-                    let mut prefix = Vec::with_capacity(n + 1);
-                    prefix.push(0i64);
-                    let mut acc = 0i64;
-                    for r in &part {
-                        if let Some(c) = r.get(tf)
-                            && let Some(v) = c.as_int()
-                        {
-                            acc += v;
-                        }
-                        prefix.push(acc);
-                    }
-                    let mut sums = Vec::with_capacity(n);
-                    for i in 0..n {
-                        let (s, e) = get_frame_bounds(i, n, frame, !order_keys.is_empty());
-                        if s <= e && s < n {
-                            let end_idx = e.min(n - 1);
-                            let sum = prefix[end_idx + 1] - prefix[s];
-                            sums.push(Cell::Int(sum));
-                        } else {
-                            sums.push(Cell::Int(0));
-                        }
-                    }
-                    sums
-                }
-            }
-            WindowFunction::Avg => {
-                let mut prefix_sum = Vec::with_capacity(n + 1);
-                let mut prefix_cnt = Vec::with_capacity(n + 1);
-                prefix_sum.push(0.0f64);
-                prefix_cnt.push(0usize);
-                let mut sum_acc = 0.0f64;
-                let mut cnt_acc = 0usize;
-                for r in &part {
-                    if let Some(c) = r.get(tf)
-                        && let Some(v) = c.as_f64()
-                    {
-                        sum_acc += v;
-                        cnt_acc += 1;
-                    }
-                    prefix_sum.push(sum_acc);
-                    prefix_cnt.push(cnt_acc);
-                }
-                let mut avgs = Vec::with_capacity(n);
-                for i in 0..n {
-                    let (s, e) = get_frame_bounds(i, n, frame, !order_keys.is_empty());
-                    if s <= e && s < n {
-                        let end_idx = e.min(n - 1);
-                        let sum = prefix_sum[end_idx + 1] - prefix_sum[s];
-                        let count = prefix_cnt[end_idx + 1] - prefix_cnt[s];
-                        let avg = if count == 0 { 0.0 } else { sum / count as f64 };
-                        avgs.push(Cell::Float(avg));
-                    } else {
-                        avgs.push(Cell::Float(0.0));
-                    }
-                }
-                avgs
-            }
-            WindowFunction::Min => {
-                eval_window_extremum(&part, tf, frame, !order_keys.is_empty(), false)
-            }
-            WindowFunction::Max => {
-                eval_window_extremum(&part, tf, frame, !order_keys.is_empty(), true)
-            }
-            WindowFunction::Count => {
-                if target_field.is_some() {
-                    let mut prefix_cnt = Vec::with_capacity(n + 1);
-                    prefix_cnt.push(0usize);
-                    let mut cnt_acc = 0usize;
-                    for r in &part {
-                        if r.get(tf).is_some_and(|c| !matches!(c, Cell::Null)) {
-                            cnt_acc += 1;
-                        }
-                        prefix_cnt.push(cnt_acc);
-                    }
-                    let mut counts = Vec::with_capacity(n);
-                    for i in 0..n {
-                        let (s, e) = get_frame_bounds(i, n, frame, !order_keys.is_empty());
-                        if s <= e && s < n {
-                            let end_idx = e.min(n - 1);
-                            let count = prefix_cnt[end_idx + 1] - prefix_cnt[s];
-                            counts.push(Cell::Int(count as i64));
-                        } else {
-                            counts.push(Cell::Int(0));
-                        }
-                    }
-                    counts
-                } else {
-                    let mut counts = Vec::with_capacity(n);
-                    for i in 0..n {
-                        let (s, e) = get_frame_bounds(i, n, frame, !order_keys.is_empty());
-                        let count = if s <= e && s < n {
-                            e.min(n - 1) - s + 1
-                        } else {
-                            0
-                        };
-                        counts.push(Cell::Int(count as i64));
-                    }
-                    counts
-                }
-            }
+        // Target field of every row, looked up once: frame functions below index this flat
+        // buffer instead of probing each row's map (twice, for `sum`).
+        static NULL_CELL: Cell = Cell::Null;
+        let tv: Vec<&Cell> = if target_field.is_some() {
+            part.iter()
+                .map(|r| r.get(tf).unwrap_or(&NULL_CELL))
+                .collect()
+        } else {
+            // Functions that take no field still index by row.
+            vec![&NULL_CELL; part.len()]
         };
-
+        let vals = window_values(
+            func,
+            &tv,
+            &ties,
+            !order_keys.is_empty(),
+            target_field.is_some(),
+            frame,
+        );
         for (i, mut row) in part.into_iter().enumerate() {
             row.insert(as_field.to_string(), vals[i].clone());
             result_rows.push(row);
@@ -1094,13 +1220,13 @@ pub(crate) fn eval_window(
 }
 
 fn eval_window_extremum(
-    part: &[Row],
-    tf: &str,
+    // Target-field value of every row in the window (`Cell::Null` when absent).
+    tv: &[&Cell],
     frame: Option<&WindowFrame>,
     has_order: bool,
     is_max: bool,
 ) -> Vec<Cell> {
-    let n = part.len();
+    let n = tv.len();
     let is_better = |cand: &Cell, prev: &Cell| -> bool {
         if is_max {
             cmp_sort(cand, prev).is_gt()
@@ -1110,8 +1236,8 @@ fn eval_window_extremum(
     };
     if frame.is_none() && !has_order {
         let mut best: Option<Cell> = None;
-        for r in part {
-            if let Some(c) = r.get(tf).filter(|c| !matches!(c, Cell::Null)) {
+        for &c in tv {
+            if !matches!(c, Cell::Null) {
                 best = Some(match best {
                     None => c.clone_for_borrow(),
                     Some(prev) => {
@@ -1129,8 +1255,8 @@ fn eval_window_extremum(
     if frame.is_none() && has_order {
         let mut out = Vec::with_capacity(n);
         let mut best: Option<Cell> = None;
-        for r in part {
-            if let Some(c) = r.get(tf).filter(|c| !matches!(c, Cell::Null)) {
+        for &c in tv {
+            if !matches!(c, Cell::Null) {
                 best = Some(match best {
                     None => c.clone_for_borrow(),
                     Some(prev) => {
@@ -1163,14 +1289,10 @@ fn eval_window_extremum(
             }
             prev_s = s;
             while pushed_up_to <= end_idx {
-                if let Some(c) = part[pushed_up_to]
-                    .get(tf)
-                    .filter(|c| !matches!(c, Cell::Null))
-                {
+                let c = tv[pushed_up_to];
+                if !matches!(c, Cell::Null) {
                     while let Some(&back_idx) = deque.back() {
-                        if let Some(back_cell) = part[back_idx].get(tf)
-                            && !is_better(back_cell, c)
-                        {
+                        if !is_better(tv[back_idx], c) {
                             deque.pop_back();
                         } else {
                             break;
@@ -1185,7 +1307,7 @@ fn eval_window_extremum(
             }
             let cell = deque
                 .front()
-                .and_then(|&idx| part[idx].get(tf).map(Cell::clone_for_borrow))
+                .map(|&idx| tv[idx].clone_for_borrow())
                 .unwrap_or(Cell::Null);
             out.push(cell);
         } else {

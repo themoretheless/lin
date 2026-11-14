@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use rustc_hash::FxHashSet;
@@ -10,10 +10,10 @@ use crate::store::{Cell, Row, row_text};
 use super::Db;
 
 pub(crate) fn edge_row(rel: &str, from: &str, to: &str) -> Row {
-    let mut r = BTreeMap::new();
-    r.insert("rel".into(), Cell::text_arc(rel));
-    r.insert("from".into(), Cell::text_arc(from));
-    r.insert("to".into(), Cell::text_arc(to));
+    let mut r = Row::new();
+    r.insert("rel", Cell::text_arc(rel));
+    r.insert("from", Cell::text_arc(from));
+    r.insert("to", Cell::text_arc(to));
     r
 }
 
@@ -174,10 +174,10 @@ impl Db {
                             if seen_edges.insert((Arc::clone(&from), Arc::clone(&to)))
                                 && out.len() < 300
                             {
-                                let mut r = BTreeMap::new();
-                                r.insert("rel".into(), Cell::Text(Arc::clone(&rel_arc)));
-                                r.insert("from".into(), Cell::Text(from));
-                                r.insert("to".into(), Cell::Text(to));
+                                let mut r = Row::new();
+                                r.insert("rel", Cell::Text(Arc::clone(&rel_arc)));
+                                r.insert("from", Cell::Text(from));
+                                r.insert("to", Cell::Text(to));
                                 out.push(r);
                             }
                             if seen_nodes.insert(Arc::clone(dst)) {
@@ -223,10 +223,10 @@ impl Db {
                 let from_arc: Arc<str> = Arc::from(e.from.as_str());
                 let to_arc: Arc<str> = Arc::from(e.to.as_str());
                 if seen_edges.insert((Arc::clone(&from_arc), Arc::clone(&to_arc))) {
-                    let mut r = BTreeMap::new();
-                    r.insert("rel".into(), Cell::Text(Arc::clone(&rel_arc)));
-                    r.insert("from".into(), Cell::Text(from_arc));
-                    r.insert("to".into(), Cell::Text(to_arc));
+                    let mut r = Row::new();
+                    r.insert("rel", Cell::Text(Arc::clone(&rel_arc)));
+                    r.insert("from", Cell::Text(from_arc));
+                    r.insert("to", Cell::Text(to_arc));
                     out.push(r);
                     if out.len() >= 300 {
                         return Ok(out);

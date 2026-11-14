@@ -492,7 +492,28 @@ impl RecordBatch {
         }
         let end = end.min(self.n());
         let n = end - start;
-        let sorted_names = self.names.windows(2).all(|w| w[0] < w[1]);
+        // One template row carries the shape; every output row is a clone of it with its
+        // cells overwritten. `slots[c]` is where column `c` lands in field-name order.
+        let template: Row = self
+            .names
+            .iter()
+            .map(|k| (k.as_str(), Cell::Null))
+            .collect();
+        let slots: Vec<usize> = self
+            .names
+            .iter()
+            .map(|k| template.keys().position(|t| t == k).unwrap_or(0))
+            .collect();
+        // Duplicate column names collapse to one field; the last column wins, as with
+        // repeated inserts.
+        let fill = |i: usize| -> Row {
+            let mut row = template.clone();
+            let cells = row.cells_mut();
+            for (&slot, col) in slots.iter().zip(self.cols.iter()) {
+                cells[slot] = col.get(i);
+            }
+            row
+        };
 
         if n >= 65536 {
             let threads = std::thread::available_parallelism()
@@ -502,13 +523,7 @@ impl RecordBatch {
                 .min((n + 8191) / 8192);
             if threads > 1 {
                 let chunk_size = (n + threads - 1) / threads;
-                let template: Option<Row> = sorted_names.then(|| {
-                    self.names
-                        .iter()
-                        .map(|k| (k.clone(), Cell::Null))
-                        .collect()
-                });
-                let template_ref = template.as_ref();
+                let fill = &fill;
                 let chunks: Vec<Vec<Row>> = std::thread::scope(|scope| {
                     let mut handles = Vec::with_capacity(threads);
                     for chunk_idx in 0..threads {
@@ -517,27 +532,7 @@ impl RecordBatch {
                             break;
                         }
                         let c_end = (c_start + chunk_size).min(end);
-                        handles.push(scope.spawn(move || {
-                            let mut chunk_out = Vec::with_capacity(c_end - c_start);
-                            if let Some(tpl) = template_ref {
-                                for i in c_start..c_end {
-                                    let mut row = tpl.clone();
-                                    for (slot, col) in row.values_mut().zip(self.cols.iter()) {
-                                        *slot = col.get(i);
-                                    }
-                                    chunk_out.push(row);
-                                }
-                            } else {
-                                for i in c_start..c_end {
-                                    let mut row = crate::store::acquire_row();
-                                    for (name, col) in self.names.iter().zip(self.cols.iter()) {
-                                        row.insert(name.clone(), col.get(i));
-                                    }
-                                    chunk_out.push(row);
-                                }
-                            }
-                            chunk_out
-                        }));
+                        handles.push(scope.spawn(move || (c_start..c_end).map(fill).collect()));
                     }
                     handles.into_iter().map(|h| h.join().unwrap()).collect()
                 });
@@ -549,31 +544,7 @@ impl RecordBatch {
             }
         }
 
-        let mut out = Vec::with_capacity(n);
-        if n >= 2 && sorted_names {
-            let template: Row = self
-                .names
-                .iter()
-                .map(|k| (k.clone(), Cell::Null))
-                .collect();
-            for i in start..end {
-                let mut row = template.clone();
-                for (slot, col) in row.values_mut().zip(self.cols.iter()) {
-                    *slot = col.get(i);
-                }
-                out.push(row);
-            }
-            return out;
-        }
-
-        for i in start..end {
-            let mut row = crate::store::acquire_row();
-            for (name, col) in self.names.iter().zip(self.cols.iter()) {
-                row.insert(name.clone(), col.get(i));
-            }
-            out.push(row);
-        }
-        out
+        (start..end).map(fill).collect()
     }
 
     /// Drain and materialize all rows, consuming the batch efficiently without cloning cells

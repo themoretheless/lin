@@ -107,6 +107,9 @@ pub struct Fk {
     pub from_field: String,
     pub to_col: String,
     pub to_field: String,
+    /// Declared with `fk ...` in this session. Such declarations are not persisted, so
+    /// they stay out of [`catalog_hash`]: the stored hash must match on reopen.
+    pub session: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -114,6 +117,8 @@ pub struct Guard {
     pub collection: String,
     pub field: String,
     pub pred: Pred,
+    /// Declared with `guard ...` in this session (not persisted, not hashed).
+    pub session: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -303,6 +308,7 @@ impl Catalog {
                     from_field: from_field.clone(),
                     to_col: to_col.clone(),
                     to_field: to_field.clone(),
+                    session: true,
                 });
             }
             Decl::Guard {
@@ -314,6 +320,7 @@ impl Catalog {
                     collection: collection.clone(),
                     field: field.clone(),
                     pred: pred.clone(),
+                    session: true,
                 });
             }
             Decl::Filter {
@@ -560,6 +567,7 @@ pub fn fixture() -> Catalog {
             from_field: "user_id".into(),
             to_col: "users".into(),
             to_field: "id".into(),
+            session: false,
         }],
         guards: vec![Guard {
             collection: "docs".into(),
@@ -569,6 +577,7 @@ pub fn fixture() -> Catalog {
                 op: crate::ast::CmpOp::Eq,
                 value: crate::ast::Value::String("raw".into()),
             },
+            session: false,
         }],
         indexes: BTreeMap::new(),
         owned: BTreeMap::new(),
@@ -686,7 +695,7 @@ fn compute_catalog_hash_u64(cat: &Catalog) -> u64 {
         h.write_bytes(b"};");
     }
     h.write_byte(b'|');
-    for fk in &cat.fks {
+    for fk in cat.fks.iter().filter(|fk| !fk.session) {
         h.write_bytes(fk.from_col.as_bytes());
         h.write_byte(b'.');
         h.write_bytes(fk.from_field.as_bytes());
@@ -697,7 +706,7 @@ fn compute_catalog_hash_u64(cat: &Catalog) -> u64 {
         h.write_byte(b';');
     }
     h.write_byte(b'|');
-    for g in &cat.guards {
+    for g in cat.guards.iter().filter(|g| !g.session) {
         h.write_bytes(g.collection.as_bytes());
         h.write_byte(b'.');
         h.write_bytes(g.field.as_bytes());

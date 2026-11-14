@@ -608,11 +608,11 @@ impl Db {
         for row in rows.iter_mut() {
             let text = embed::row_embed_text(row);
             if text.is_empty() {
-                row.insert("embedding".into(), crate::store::Cell::Null);
+                row.insert("embedding", crate::store::Cell::Null);
                 continue;
             }
             row.insert(
-                "embedding".into(),
+                "embedding",
                 crate::store::Cell::Vec(emb.embed(&text)),
             );
             n += 1;
@@ -707,7 +707,7 @@ impl Db {
             if let Some(cell) = rows[i].get_mut("embedding") {
                 *cell = crate::store::Cell::Vec(vector);
             } else {
-                rows[i].insert("embedding".into(), crate::store::Cell::Vec(vector));
+                rows[i].insert("embedding", crate::store::Cell::Vec(vector));
             }
         }
     }

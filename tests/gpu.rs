@@ -376,7 +376,7 @@ fn numeric_filters_preserve_f64_i64_special_values_and_batch() {
         .iter_mut()
         .zip(values)
     {
-        row.insert("value".into(), value);
+        row.insert("value", value);
     }
     let mut accelerated = Db::empty().with_gpu(gpu.clone());
     accelerated.catalog = cpu.catalog.clone();
@@ -496,8 +496,7 @@ fn text_filters_match_cpu_unicode_empty_null_and_mixed_predicates() {
         .iter_mut()
         .zip(values)
     {
-        row.insert(
-            "text".into(),
+        row.insert("text",
             value.map(Cell::text_arc).unwrap_or(Cell::Null),
         );
     }
@@ -607,10 +606,10 @@ fn grouped_count_preserves_keys_empty_input_filters_and_batches() {
         .enumerate()
     {
         if i % 31 == 0 {
-            row.insert("key".into(), Cell::Null);
+            row.insert("key", Cell::Null);
         }
         if i % 17 == 0 {
-            row.insert("key".into(), Cell::text_arc("Привет \"quoted\""));
+            row.insert("key", Cell::text_arc("Привет \"quoted\""));
         }
     }
     let mut db = Db::empty().with_gpu(gpu.clone());
@@ -681,10 +680,10 @@ fn joins_match_cpu_duplicates_missing_rows_tiles_and_batches() {
         .enumerate()
     {
         if i % 11 == 0 {
-            row.insert("parent".into(), Cell::Null);
+            row.insert("parent", Cell::Null);
         }
         if i % 17 == 0 {
-            row.insert("parent".into(), Cell::text_arc("missing"));
+            row.insert("parent", Cell::text_arc("missing"));
         }
     }
     let check = |cpu: &mut Db| {
@@ -804,8 +803,7 @@ fn joins_match_cpu_duplicates_missing_rows_tiles_and_batches() {
         .iter_mut()
         .enumerate()
     {
-        row.insert(
-            "parent".into(),
+        row.insert("parent",
             if i % 11 == 0 {
                 Cell::Null
             } else {
@@ -814,7 +812,7 @@ fn joins_match_cpu_duplicates_missing_rows_tiles_and_batches() {
         );
     }
     let mut duplicate = cpu.store.collection("parents")[0].clone();
-    duplicate.insert("label".into(), Cell::text_arc("last duplicate"));
+    duplicate.insert("label", Cell::text_arc("last duplicate"));
     cpu.store
         .collections
         .get_mut("parents")
@@ -873,7 +871,7 @@ fn stable_sort_matches_cpu_all_cells_directions_and_odd_lengths() {
         .iter_mut()
         .enumerate()
     {
-        row.insert("key".into(), values[(i * 17) % values.len()].clone());
+        row.insert("key", values[(i * 17) % values.len()].clone());
     }
     let mut db = Db::empty().with_gpu(gpu.clone());
     db.catalog = cpu.catalog.clone();
@@ -1024,7 +1022,7 @@ fn gpu_cursor_defers_later_batch_errors_and_reports_each_error_once() {
     db.run(&format!("insert stream_errors [{}]", records.join(",")))
         .unwrap();
     db.store.collections.get_mut("stream_errors").unwrap()[1500]
-        .insert("text".into(), Cell::text_arc("x".repeat(2048)));
+        .insert("text", Cell::text_arc("x".repeat(2048)));
     let q = Queryable::from("stream_errors")
         .filter("text ~ \"hit\"")
         .select(["id"]);
@@ -1172,18 +1170,18 @@ fn executor_sum_matches_cpu_groups_batches_and_snapshots() {
         .iter_mut()
         .enumerate()
     {
-        row.insert("value".into(), variants[i % variants.len()].clone());
+        row.insert("value", variants[i % variants.len()].clone());
         if i % 31 == 0 {
-            row.insert("key".into(), Cell::Null);
+            row.insert("key", Cell::Null);
         }
         if i % 17 == 0 {
-            row.insert("key".into(), Cell::text_arc("Привет \"quoted\""));
+            row.insert("key", Cell::text_arc("Привет \"quoted\""));
         }
         if i == 511 {
-            row.insert("value".into(), Cell::Float(f64::INFINITY));
+            row.insert("value", Cell::Float(f64::INFINITY));
         }
         if i == 512 {
-            row.insert("value".into(), Cell::Float(f64::NAN));
+            row.insert("value", Cell::Float(f64::NAN));
         }
     }
     let mut db = Db::empty().with_gpu(gpu.clone());
@@ -1640,8 +1638,7 @@ fn regex_executor_and_lazy_cursor_match_cpu_and_dispatch() {
         .iter_mut()
         .enumerate()
     {
-        row.insert(
-            "text".into(),
+        row.insert("text",
             values[i % values.len()]
                 .map(Cell::text_arc)
                 .unwrap_or(Cell::Null),

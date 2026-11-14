@@ -34,37 +34,42 @@ dependencies = [
 
 [[package]]
 name = "airbug"
-version = "0.6.0"
-source = "git+https://github.com/themoretheless/airbug?branch=release#75b1321b5d7ff2cee983379f539c07726a7d27e5"
+version = "0.11.0"
+source = "git+https://github.com/themoretheless/airbug?branch=release#8a6f8be17bc3103cc96a9759a067bb0ba2a6cc57"
 dependencies = [
  "airbug-macros",
 ]
 
 [[package]]
 name = "airbug-bench"
-version = "0.6.0"
-source = "git+https://github.com/themoretheless/airbug?branch=release#75b1321b5d7ff2cee983379f539c07726a7d27e5"
+version = "0.11.0"
+source = "git+https://github.com/themoretheless/airbug?branch=release#8a6f8be17bc3103cc96a9759a067bb0ba2a6cc57"
 dependencies = [
+ "airbug",
  "airbug-bench-macros",
+ "libc",
+ "regex-automata",
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "terminal_size",
  "thiserror 2.0.20",
 ]
 
 [[package]]
 name = "airbug-bench-macros"
-version = "0.6.0"
-source = "git+https://github.com/themoretheless/airbug?branch=release#75b1321b5d7ff2cee983379f539c07726a7d27e5"
+version = "0.11.0"
+source = "git+https://github.com/themoretheless/airbug?branch=release#8a6f8be17bc3103cc96a9759a067bb0ba2a6cc57"
 dependencies = [
+ "proc-macro-crate",
  "quote",
  "syn 2.0.119",
 ]
 
 [[package]]
 name = "airbug-macros"
-version = "0.6.0"
-source = "git+https://github.com/themoretheless/airbug?branch=release#75b1321b5d7ff2cee983379f539c07726a7d27e5"
+version = "0.11.0"
+source = "git+https://github.com/themoretheless/airbug?branch=release#8a6f8be17bc3103cc96a9759a067bb0ba2a6cc57"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -3899,6 +3904,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06794f8f6c5c898b3275aebefa6b8a1cb24cd2c6c79397ab15774837a0bc5755"
 dependencies = [
  "winapi-util",
+]
+
+[[package]]
+name = "terminal_size"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "230a1b821ccbd75b185820a1f1ff7b14d21da1e442e22c0863ea5f08771a8874"
+dependencies = [
+ "rustix 1.1.4",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

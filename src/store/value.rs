@@ -1,15 +1,14 @@
 //! Core in-memory value types (`InlineStr`, `Cell`, `Row`), pooling, and scalar utilities.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-/// Construct a fresh `Row` (`BTreeMap::new()` is `const` and does not allocate on the heap).
+/// Construct a fresh `Row` (`Row::new()` is `const` and does not allocate on the heap).
 #[inline]
 pub const fn acquire_row() -> Row {
-    BTreeMap::new()
+    Row::new()
 }
 
 /// Convert an `Arc<str>` into a `Cell`, storing strings up to `InlineStr::MAX_LEN` inline
@@ -33,7 +32,7 @@ pub fn acquire_orders_row() -> Row {
         if let Some(row) = pool.borrow_mut().pop() {
             return row;
         }
-        let mut r = BTreeMap::new();
+        let mut r = Row::new();
         r.insert("id".to_string(), Cell::Null);
         r.insert("total".to_string(), Cell::Null);
         r.insert("user_id".to_string(), Cell::Null);
@@ -508,7 +507,7 @@ impl From<Arc<str>> for Cell {
     }
 }
 
-pub type Row = BTreeMap<String, Cell>;
+pub use super::row::{Row, Shape};
 
 /// Estimated in-memory byte size of a row (keys + values + container overhead).
 #[inline]
@@ -587,7 +586,7 @@ pub(super) fn docs_hot_field(f: &str) -> bool {
 
 #[inline]
 pub(super) fn row_id_title(id: &Arc<str>, title: &Arc<str>) -> Row {
-    let mut row = BTreeMap::new();
+    let mut row = Row::new();
     row.insert(String::from("id"), Cell::Text(Arc::clone(id)));
     row.insert(String::from("title"), Cell::Text(Arc::clone(title)));
     row
@@ -656,33 +655,33 @@ pub(super) struct DocSeed<'a> {
 }
 
 pub(super) fn doc_row(d: DocSeed<'_>) -> Row {
-    let mut r = BTreeMap::new();
-    r.insert("id".into(), Cell::text_arc(d.id));
-    r.insert("uri".into(), Cell::text_arc(d.uri));
-    r.insert("title".into(), Cell::text_arc(d.title));
-    r.insert("wing".into(), Cell::text_arc(d.wing));
-    r.insert("room".into(), Cell::text_arc(d.room));
-    r.insert("layer".into(), Cell::text_arc(d.layer));
-    r.insert("body".into(), Cell::text_arc(d.body));
-    r.insert("hash".into(), Cell::Text(content_hash_arc(d.body)));
-    r.insert("snippet".into(), Cell::text_arc(d.snippet));
-    r.insert("ts".into(), Cell::Time(d.ts));
+    let mut r = Row::new();
+    r.insert("id", Cell::text_arc(d.id));
+    r.insert("uri", Cell::text_arc(d.uri));
+    r.insert("title", Cell::text_arc(d.title));
+    r.insert("wing", Cell::text_arc(d.wing));
+    r.insert("room", Cell::text_arc(d.room));
+    r.insert("layer", Cell::text_arc(d.layer));
+    r.insert("body", Cell::text_arc(d.body));
+    r.insert("hash", Cell::Text(content_hash_arc(d.body)));
+    r.insert("snippet", Cell::text_arc(d.snippet));
+    r.insert("ts", Cell::Time(d.ts));
     r
 }
 
 pub(super) fn user_row(id: &str, email: &str) -> Row {
-    let mut r = BTreeMap::new();
-    r.insert("id".into(), Cell::text_arc(id));
-    r.insert("email".into(), Cell::text_arc(email));
+    let mut r = Row::new();
+    r.insert("id", Cell::text_arc(id));
+    r.insert("email", Cell::text_arc(email));
     r
 }
 
 pub(super) fn order_row(id: &str, user_id: &str, total: f64, ts: i64) -> Row {
-    let mut r = BTreeMap::new();
-    r.insert("id".into(), Cell::text_arc(id));
-    r.insert("user_id".into(), Cell::text_arc(user_id));
-    r.insert("total".into(), Cell::Float(total));
-    r.insert("ts".into(), Cell::Time(ts));
+    let mut r = Row::new();
+    r.insert("id", Cell::text_arc(id));
+    r.insert("user_id", Cell::text_arc(user_id));
+    r.insert("total", Cell::Float(total));
+    r.insert("ts", Cell::Time(ts));
     r
 }
 

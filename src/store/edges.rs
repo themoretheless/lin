@@ -1,6 +1,5 @@
 //! Graph edge storage, zero-allocation nested adjacency indexes, and SPO fact triple indexing.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
@@ -183,10 +182,10 @@ impl Store {
         self.facts_s.push(Arc::clone(&sa));
         self.facts_p.push(Arc::clone(&pa));
         self.facts_o.push(Arc::clone(&oa));
-        let mut built = BTreeMap::new();
-        built.insert("s".into(), Cell::Text(sa));
-        built.insert("p".into(), Cell::Text(pa));
-        built.insert("o".into(), Cell::Text(oa));
+        let mut built = Row::new();
+        built.insert("s", Cell::Text(sa));
+        built.insert("p", Cell::Text(pa));
+        built.insert("o", Cell::Text(oa));
         if self.facts_rows_stale {
             self.ensure_facts_rows();
         } else {
@@ -221,15 +220,16 @@ impl Store {
             Vec::new()
         };
         let mut changed = 0usize;
+        let first_new = self.facts_s.len();
         for i in 0..n {
             let key = (Arc::clone(&s[i]), Arc::clone(&p[i]), Arc::clone(&o[i]));
             match self.facts_by_spo.entry(key) {
                 std::collections::hash_map::Entry::Occupied(_) => {
                     if want_rows {
-                        let mut row = BTreeMap::new();
-                        row.insert("s".into(), Cell::Text(Arc::clone(&s[i])));
-                        row.insert("p".into(), Cell::Text(Arc::clone(&p[i])));
-                        row.insert("o".into(), Cell::Text(Arc::clone(&o[i])));
+                        let mut row = Row::new();
+                        row.insert("s", Cell::Text(Arc::clone(&s[i])));
+                        row.insert("p", Cell::Text(Arc::clone(&p[i])));
+                        row.insert("o", Cell::Text(Arc::clone(&o[i])));
                         rows.push(row);
                     }
                 }
@@ -239,13 +239,12 @@ impl Store {
                     self.facts_s.push(Arc::clone(&s[i]));
                     self.facts_p.push(Arc::clone(&p[i]));
                     self.facts_o.push(Arc::clone(&o[i]));
-                    self.facts_rows_stale = true;
                     changed += 1;
                     if want_rows {
-                        let mut row = BTreeMap::new();
-                        row.insert("s".into(), Cell::Text(Arc::clone(&self.facts_s[idx])));
-                        row.insert("p".into(), Cell::Text(Arc::clone(&self.facts_p[idx])));
-                        row.insert("o".into(), Cell::Text(Arc::clone(&self.facts_o[idx])));
+                        let mut row = Row::new();
+                        row.insert("s", Cell::Text(Arc::clone(&self.facts_s[idx])));
+                        row.insert("p", Cell::Text(Arc::clone(&self.facts_p[idx])));
+                        row.insert("o", Cell::Text(Arc::clone(&self.facts_o[idx])));
                         rows.push(row);
                     }
                 }
@@ -253,9 +252,34 @@ impl Store {
         }
         if changed > 0 {
             self.update_col_count("facts", changed as isize);
-        }
-        if want_rows && changed > 0 {
-            self.ensure_facts_rows();
+            // Readers go through `collections["facts"]` and cannot materialize it
+            // themselves, and a replayed delete looks its rows up there: keep the rows in
+            // step with the columns instead of leaving them stale until some later write.
+            if self.is_disk_backed("facts") {
+                self.facts_rows_stale = true;
+            } else {
+                let in_step = !self.facts_rows_stale
+                    && self.collections.get("facts").map_or(0, Vec::len) == first_new;
+                if in_step {
+                    // One shared shape: each row is an `Arc` clone plus three cells.
+                    let shape = Row::shape_of(&["o", "p", "s"]);
+                    let facts = self.collections.entry("facts".into()).or_default();
+                    facts.reserve(changed);
+                    for idx in first_new..self.facts_s.len() {
+                        facts.push(Row::from_parts(
+                            Arc::clone(&shape),
+                            [
+                                Cell::Text(Arc::clone(&self.facts_o[idx])),
+                                Cell::Text(Arc::clone(&self.facts_p[idx])),
+                                Cell::Text(Arc::clone(&self.facts_s[idx])),
+                            ],
+                        ));
+                    }
+                } else {
+                    self.facts_rows_stale = true;
+                    self.ensure_facts_rows();
+                }
+            }
         }
         (rows, changed)
     }

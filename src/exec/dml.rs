@@ -432,7 +432,7 @@ impl Db {
                     let pack = if let Some(staged) = staged {
                         ctx.prepared_encoding = Some(staged.encoding);
                         staged.pack.unwrap_or_else(|| {
-                            crate::persist::rows_to_insert_cols(
+                            crate::persist::rows_to_insert_pack(
                                 collection.clone(),
                                 inserted,
                                 new_edges,
@@ -441,6 +441,7 @@ impl Db {
                     } else if ctx.allow_preencode
                         && edges.is_empty()
                         && new_edges.is_empty()
+                        && crate::persist::insert_cols_lossless(inserted)
                         && let Some(persist) = self.persist.as_mut()
                         && let Some((magic, fields)) = crate::persist::encode_insert_rows_direct(
                             self.store.r#gen.wrapping_add(1),
@@ -469,7 +470,7 @@ impl Db {
                             edges: Vec::new(),
                         }
                     } else {
-                        crate::persist::rows_to_insert_cols(collection.clone(), inserted, new_edges)
+                        crate::persist::rows_to_insert_pack(collection.clone(), inserted, new_edges)
                     };
                     Some(pack)
                 } else {
@@ -585,23 +586,23 @@ impl Db {
                         return Ok(());
                     }
                     let mut row = Row::new();
-                    row.insert("gen".into(), Cell::Int(rec.r#gen as i64));
-                    row.insert("next_id".into(), Cell::Int(rec.next_id as i64));
-                    row.insert("bytes".into(), Cell::Int(0));
+                    row.insert("gen", Cell::Int(rec.r#gen as i64));
+                    row.insert("next_id", Cell::Int(rec.next_id as i64));
+                    row.insert("bytes", Cell::Int(0));
                     rows.push(row);
                     n += 1;
                     Ok(())
                 })?;
                 if rows.is_empty() {
                     let mut row = Row::new();
-                    row.insert("gen".into(), Cell::Int(since as i64));
-                    row.insert("frames".into(), Cell::Int(0));
-                    row.insert("bytes".into(), Cell::Int(0));
+                    row.insert("gen", Cell::Int(since as i64));
+                    row.insert("frames", Cell::Int(0));
+                    row.insert("bytes", Cell::Int(0));
                     rows.push(row);
                 } else {
                     for r in &mut rows {
-                        r.insert("bytes".into(), Cell::Int(frames.len() as i64));
-                        r.insert("frames".into(), Cell::Int(n));
+                        r.insert("bytes", Cell::Int(frames.len() as i64));
+                        r.insert("frames", Cell::Int(n));
                     }
                 }
                 let out_n = rows.len();
@@ -643,7 +644,7 @@ impl Db {
                 ))
             }
             Stmt::Snapshot { name } | Stmt::Pin { name } => {
-                self.pins.insert(name.clone(), self.store.mem_backup());
+                self.pins.insert(name.clone(), self.store.mem_backup_pin());
                 Ok((
                     Vec::new(),
                     Some(format!(
@@ -702,6 +703,36 @@ impl Db {
             Row::new()
         };
         Ok((row, changed))
+    }
+
+    /// An `update` that assigns `id` must keep the primary key unique: it may rename one
+    /// row to an id no other row holds. `targets` are the positions of the matched rows.
+    pub(crate) fn check_update_id(
+        &self,
+        collection: &str,
+        record: &crate::ast::Record,
+        targets: &[usize],
+        now: i64,
+    ) -> Result<(), Error> {
+        let Some((_, value)) = record.fields.iter().find(|(k, _)| k == "id") else {
+            return Ok(());
+        };
+        let cell = value_cell(value, now);
+        let Some(new_id) = cell.text() else {
+            return Ok(());
+        };
+        let taken = match targets {
+            [] => false,
+            [only] => self
+                .store
+                .row_index(collection, new_id)
+                .is_some_and(|holder| holder != *only),
+            _ => true,
+        };
+        if taken {
+            return Err(Error::runtime(format!("duplicate id: {new_id}")));
+        }
+        Ok(())
     }
 
     pub(crate) fn check_row_fks(&self, collection: &str, row: &Row) -> Result<(), Error> {
@@ -800,13 +831,13 @@ impl Db {
                 row.insert(k.clone(), value_cell(v, now));
             }
             if row.get("id").and_then(Cell::text).is_none() {
-                row.insert("id".into(), Cell::text_arc(self.store.alloc_id()));
+                row.insert("id", Cell::text_arc(self.store.alloc_id()));
             }
             if row.get("hash").and_then(Cell::text).is_none()
                 && let Some(body) = row.get("body").and_then(Cell::text_shared)
             {
                 row.insert(
-                    "hash".into(),
+                    "hash",
                     Cell::Text(cached_content_hash(body.as_ref())),
                 );
             }
@@ -936,13 +967,13 @@ impl Db {
             }
             for row in &mut built {
                 if needs_id && row.get("id").and_then(Cell::text).is_none() {
-                    row.insert("id".into(), Cell::text_arc(self.store.alloc_id()));
+                    row.insert("id", Cell::text_arc(self.store.alloc_id()));
                 }
                 if row.get("hash").and_then(Cell::text).is_none()
                     && let Some(body) = row.get("body").and_then(Cell::text_shared)
                 {
                     row.insert(
-                        "hash".into(),
+                        "hash",
                         Cell::Text(if n >= 512 && body.len() <= 64 {
                             content_hash_arc(body.as_ref())
                         } else {
@@ -1000,10 +1031,13 @@ impl Db {
 
         let start = self.store.collection(collection).len();
         let uniform_keys = all_uniform && !needs_id;
+        // The pre-encoded record is the compact columnar one; rows it cannot represent
+        // exactly (missing fields, mixed types) are logged row by row after the insert.
         let staged = if allow_preencode
             && (512..=16384).contains(&n)
             && edges.is_empty()
             && self.persist.is_some()
+            && crate::persist::insert_cols_lossless(&built)
             && (n >= 4096
                 || built
                     .first()
@@ -1190,11 +1224,12 @@ impl Db {
                 })
                 .collect();
         }
+        let mut slots = pred.map(super::eval::PredSlots::new);
         self.store
             .collection(collection)
             .iter()
             .enumerate()
-            .filter_map(|(i, row)| pred.is_none_or(|p| eval_pred(p, row, now)).then_some(i))
+            .filter_map(|(i, row)| slots.as_mut().is_none_or(|s| s.eval(row, now)).then_some(i))
             .collect()
     }
 
@@ -1237,6 +1272,7 @@ impl Db {
                 }
             }
         }
+        self.check_update_id(collection, record, &idxs, now)?;
         let has_body = record.fields.iter().any(|(k, _)| k == "body");
         let has_fks = self.catalog.fks.iter().any(|fk| fk.from_col == collection);
         let affected = idxs.len();
@@ -1268,7 +1304,7 @@ impl Db {
                 updated.insert(k.clone(), value_cell(v, now));
             }
             if has_body && let Some(body) = row_text(&updated, "body").map(str::to_string) {
-                updated.insert("hash".into(), Cell::Text(cached_content_hash(&body)));
+                updated.insert("hash", Cell::Text(cached_content_hash(&body)));
             }
             if has_fks {
                 self.check_row_fks(collection, &updated)?;
@@ -1285,9 +1321,15 @@ impl Db {
                     hnsw.remove(i);
                 }
             }
+            // A changed `id` / `uri` rebuilds the row maps, which must see the new row.
+            let identity_moved = row_text(&before, "id") != row_text(&updated, "id")
+                || row_text(&before, "uri") != row_text(&updated, "uri");
             self.store
                 .row_maps_sync_updated(collection, i, &before, &updated);
             self.store.collection_mut(collection)[i] = updated;
+            if identity_moved {
+                self.store.rebuild_row_maps_collection(collection);
+            }
             self.store.fts_sync_at(collection, i, &before);
             if let Undo::Rows(events) | Undo::Mixed { events, .. } = ctx.undo {
                 events.push(RowUndo::Update(collection.to_string(), i, before));
@@ -1812,10 +1854,10 @@ fn build_batch_shape_rows_into(
         .map(|(key, _)| (key.clone(), Cell::Null))
         .collect::<Row>();
     if needs_hash {
-        template.insert("hash".into(), Cell::Null);
+        template.insert("hash", Cell::Null);
     }
     if needs_embed {
-        template.insert("embedding".into(), Cell::Null);
+        template.insert("embedding", Cell::Null);
     }
 
     #[derive(Clone, Copy)]

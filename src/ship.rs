@@ -1,4 +1,4 @@
-//! WAL shipping: one sink, optional TLS + shared token.
+//! WAL shipping: one sink by default, optional fanout, optional TLS + shared token.
 //!
 //! Protocol (one request / response per connection):
 //! - client → server: `LIN\x06` + `u16` LE token_len + token + `u64` LE `since_gen`
@@ -8,8 +8,12 @@
 //! (`--tls-cert` / `--tls-key` / `--tls-ca`) and a shared token. A TLS pull
 //! verifies the server certificate against the DNS host in `--from`
 //! ([`PullOpts::server_name`]); a numeric peer keeps the `localhost` default.
-//! The server holds at most **one** live pull at a time (extra accepts are
-//! dropped).
+//! [`serve_blocking_opts`] holds at most **one** live pull at a time (extra accepts
+//! are dropped). [`serve_blocking_fanout`] serves up to `max_sinks` pulls at once, so a
+//! slow or stalled follower does not hold up the others; each follower keeps its own
+//! position (`since_gen`), and further connections wait for a free slot. The log cannot
+//! be compacted while a `Db` is being served (the server borrows it), so every follower
+//! can still read the tail it has not pulled yet.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
@@ -398,6 +402,88 @@ pub fn serve_blocking_opts(db: &Db, listener: TcpListener, opts: &ServeOpts) -> 
     }
 }
 
+/// Most pulls [`serve_blocking_fanout`] handles at once.
+pub const MAX_SINKS: usize = 64;
+
+/// Serve WAL pulls to several followers at once: up to `max_sinks` (clamped to
+/// `1..=`[`MAX_SINKS`]) connections are handled concurrently, the rest wait for a free
+/// slot. Blocks until accepting a connection fails. A failing or stalled client only
+/// occupies its own slot, for at most the 30-second I/O timeout.
+pub fn serve_blocking_fanout(
+    db: &Db,
+    listener: TcpListener,
+    opts: &ServeOpts,
+    max_sinks: usize,
+) -> Result<(), Error> {
+    serve_fanout(db, &listener, opts, max_sinks, None)
+}
+
+/// [`serve_blocking_fanout`] that returns after `max_conns` connections were accepted
+/// and handled, when given.
+fn serve_fanout(
+    db: &Db,
+    listener: &TcpListener,
+    opts: &ServeOpts,
+    max_sinks: usize,
+    max_conns: Option<usize>,
+) -> Result<(), Error> {
+    if !db.is_durable() {
+        return Err(Error::runtime(
+            "wal ship: serve requires durable primary (--data)",
+        ));
+    }
+    listener.set_nonblocking(false).map_err(io_err)?;
+    let tls = match &opts.tls {
+        Some(t) => Some(server_config(t)?),
+        None => None,
+    };
+    let workers = max_sinks.clamp(1, MAX_SINKS);
+    let token = opts.token.as_deref();
+    // Rendezvous channel: `send` returns once a worker took the connection, so at most
+    // `workers` pulls are in flight and the accept loop itself applies the backpressure.
+    let (tx, rx) = std::sync::mpsc::sync_channel::<TcpStream>(0);
+    let rx = std::sync::Mutex::new(rx);
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let tls = tls.clone();
+            let rx = &rx;
+            scope.spawn(move || {
+                loop {
+                    // The guard is dropped before the connection is handled.
+                    let next = match rx.lock() {
+                        Ok(guard) => guard.recv(),
+                        Err(_) => return,
+                    };
+                    let Ok(stream) = next else {
+                        return;
+                    };
+                    if let Err(e) = handle_conn(db, stream, token, tls.clone()) {
+                        eprintln!("wal ship: client error: {e}");
+                    }
+                }
+            });
+        }
+        let mut accepted = 0usize;
+        let result = loop {
+            if max_conns.is_some_and(|max| accepted >= max) {
+                break Ok(());
+            }
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    accepted += 1;
+                    if tx.send(stream).is_err() {
+                        break Err(Error::runtime("wal ship: no serving thread left"));
+                    }
+                }
+                Err(e) => break Err(io_err(e)),
+            }
+        };
+        // Closing the channel lets the workers finish their current pull and exit.
+        drop(tx);
+        result
+    })
+}
+
 /// Accept and handle a single pull connection (tests / controlled one-shot).
 pub fn serve_one(db: &Db, listener: &TcpListener) -> Result<(), Error> {
     serve_one_opts(db, listener, &ServeOpts::default())
@@ -548,6 +634,77 @@ mod tests {
         assert_eq!(mem.run(r#"docs | uri == "raw://ship""#).unwrap().done.n, 1);
 
         handle.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A client that connects and never sends its request must not hold up the other
+    /// followers: with one sink they would wait out its 30-second timeout.
+    #[test]
+    fn fanout_serves_followers_past_a_stalled_one() {
+        let dir = std::env::temp_dir().join(format!(
+            "lin-ship-fanout-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut db = Db::open(&dir).unwrap();
+        for i in 0..3 {
+            db.run(&format!(
+                r#"insert docs {{ uri: "raw://fan/{i}", title: "Fan {i}", layer: "wiki" }}"#
+            ))
+            .unwrap();
+        }
+
+        // What a follower at each position must receive.
+        let expected: Vec<Vec<u8>> = (0..2).map(|since| db.export_wal_since(since).unwrap()).collect();
+        assert!(!expected[0].is_empty());
+        let expected = Arc::new(expected);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        const FOLLOWERS: usize = 6;
+        let server = thread::spawn(move || {
+            // The stalled connection plus every follower.
+            serve_fanout(&db, &listener, &ServeOpts::default(), 3, Some(1 + FOLLOWERS)).unwrap();
+            let _ = db.close();
+        });
+
+        // Occupies one of the three slots until it is dropped.
+        let stalled = TcpStream::connect(addr).unwrap();
+        thread::sleep(Duration::from_millis(50));
+
+        let started = std::time::Instant::now();
+        let pulls: Vec<_> = (0..FOLLOWERS)
+            .map(|i| {
+                let expected = Arc::clone(&expected);
+                thread::spawn(move || {
+                    // Followers at different positions get different tails.
+                    let since = (i % 2) as u64;
+                    let frames = pull(addr, since).unwrap();
+                    assert_eq!(frames, expected[since as usize], "since {since}");
+                    if since == 0 {
+                        let mut mem = Db::empty();
+                        assert_eq!(mem.apply_wal(&frames).unwrap(), 3);
+                    }
+                })
+            })
+            .collect();
+        for p in pulls {
+            p.join().unwrap();
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "followers waited for the stalled client: {:?}",
+            started.elapsed()
+        );
+
+        drop(stalled);
+        server.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

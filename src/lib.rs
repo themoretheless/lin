@@ -24,7 +24,7 @@
 //! `embed-onnx` ([`OnnxEmbedder`]).
 //!
 //! Experimental (outside freeze): [`Db::run_stmt`], [`RowExt`], [`RecordBatch`]
-//! (columnar OLAP), [`ship`] WAL pull/serve (TLS + token, one sink).
+//! (columnar OLAP), [`ship`] WAL pull/serve (TLS + token, one sink or fanout).
 //!
 //! Semver: breaking changes to the stable list require a major bump after 1.0;
 //! until then minors may still adjust experimental surfaces (`Stmt`, plan IR,
@@ -108,7 +108,7 @@ pub use graph::GraphFmt;
 pub use plan::Plan;
 pub use query::{BoundFilter, BoundQueryable, Col, FilterArg, IntoFieldList, MatchPath, Queryable};
 pub use row::{FromCell, FromRow, LinRow, ToCell, cell_get, cell_opt, map_rows};
-pub use store::{Cell, InlineStr, Row, RowExt, Store};
+pub use store::{Cell, InlineStr, Row, RowExt, RowShape, Store};
 
 #[cfg(feature = "async")]
 pub use async_db::{AsyncDb, AsyncReadDb};

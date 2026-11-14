@@ -10,7 +10,7 @@ use crate::error::Error;
 use crate::store::{Edge, Row};
 
 use super::types::{
-    ColData, LOG_MAGIC_SPARSE, LOG_MAGIC_V2, LogRecord, MAX_SPARSE_DECODED_BYTES, Pack, Persist,
+    ColData, LOG_MAGIC_DICTIONARY, LOG_MAGIC_SPARSE, LOG_MAGIC_V2, LogRecord, MAX_SPARSE_DECODED_BYTES, Pack, Persist,
     SPARSE_VECTOR_THRESHOLD, SyncMode, V2_FACTS_BULK, V2_INSERT_COLS,
 };
 use super::wal::{
@@ -703,6 +703,7 @@ pub(super) fn encode_insert_cols_v2(
     buf.extend_from_slice(&n.to_le_bytes());
     buf.extend_from_slice(&(fields.len() as u32).to_le_bytes());
     let mut sparse_codec = false;
+    let mut dictionary_codec = false;
     let mut sparse_decoded_bytes = 0usize;
     for (f, c) in fields.iter().zip(cols.iter()) {
         put_str(buf, f);
@@ -779,6 +780,7 @@ pub(super) fn encode_insert_cols_v2(
                             .checked_add(storage)
                             .ok_or_else(|| io_err("sparse vector size overflow"))?;
                         sparse_codec = true;
+                        let mark = buf.len();
                         buf.push(7);
                         if v.iter()
                             .flatten()
@@ -816,6 +818,8 @@ pub(super) fn encode_insert_cols_v2(
                         if sparse_decoded_bytes > MAX_SPARSE_DECODED_BYTES {
                             return Err(io_err("sparse vectors exceed decoded 64MiB budget"));
                         }
+                        dictionary_codec |=
+                            rewrite_sparse_as_dictionary(buf, mark, v.iter().map(|r| r.as_deref()))?;
                         wrote_sparse = true;
                     } else {
                         let mark = buf.len();
@@ -857,6 +861,11 @@ pub(super) fn encode_insert_cols_v2(
                             }
                             sparse_decoded_bytes = next_decoded;
                             sparse_codec = true;
+                            dictionary_codec |= rewrite_sparse_as_dictionary(
+                                buf,
+                                mark,
+                                v.iter().map(|r| r.as_deref()),
+                            )?;
                             wrote_sparse = true;
                         }
                     }
@@ -893,7 +902,9 @@ pub(super) fn encode_insert_cols_v2(
             ColData::Null => buf.push(0),
         }
     }
-    Ok(if sparse_codec {
+    Ok(if dictionary_codec {
+        LOG_MAGIC_DICTIONARY
+    } else if sparse_codec {
         LOG_MAGIC_SPARSE
     } else {
         LOG_MAGIC_V2
@@ -902,6 +913,159 @@ pub(super) fn encode_insert_cols_v2(
 
 thread_local! {
     static CELL_PTR_SCRATCH: RefCell<Vec<*const Cell>> = RefCell::new(Vec::new());
+}
+
+/// Whether new WAL frames may use the dictionary vector codec (codec 5, column tag 8).
+/// Off by default: a reader built before the codec refuses such frames, so it may only
+/// be turned on once every consumer of the log (followers, backup tools, the previous
+/// release kept for rollback) can read it.
+static DICTIONARY_WRITER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+thread_local! {
+    /// Per-thread override of [`DICTIONARY_WRITER`], so a test can exercise the writer
+    /// without changing what other tests in the same process encode.
+    static DICTIONARY_WRITER_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Allow (or stop) writing the dictionary vector WAL codec in this process; returns the
+/// previous setting. Frames already written stay readable either way. Experimental: see
+/// `docs/wal-dictionary.md` for what must hold before turning it on.
+pub fn set_wal_dictionary_writer(enabled: bool) -> bool {
+    DICTIONARY_WRITER.swap(enabled, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether [`set_wal_dictionary_writer`] is on.
+pub fn wal_dictionary_writer() -> bool {
+    DICTIONARY_WRITER.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
+pub(super) fn with_dictionary_writer<R>(enabled: bool, f: impl FnOnce() -> R) -> R {
+    let before = DICTIONARY_WRITER_OVERRIDE.with(|o| o.replace(Some(enabled)));
+    let out = f();
+    DICTIONARY_WRITER_OVERRIDE.with(|o| o.set(before));
+    out
+}
+
+#[inline]
+fn dictionary_writer_enabled() -> bool {
+    DICTIONARY_WRITER_OVERRIDE
+        .with(std::cell::Cell::get)
+        .unwrap_or_else(wal_dictionary_writer)
+}
+
+/// Most distinct nonzero bit patterns a dictionary row may carry.
+const DICTIONARY_MAX_VALUES: usize = 16;
+
+/// Append vector rows in the dictionary layout (column tag 8), stopping as soon as the
+/// output reaches `give_up_at` bytes: `Ok(false)` then means "not smaller, discard `out`".
+///
+/// Per row: `u32` dimension code (0 = absent, otherwise dimension + 1), `u32` count of
+/// nonzero values, `u8` dictionary length `d`. With `d` in `1..=16` follow `d` distinct
+/// nonzero `f32` bit patterns and one `(index, u8 ordinal)` per nonzero value, the index
+/// being `u16` for dimensions up to 65536 and `u32` above; with `d = 0` (more than 16
+/// distinct values) follow raw `(u32 index, u32 bits)` entries. Values are compared and
+/// stored as bits, so `-0.0`, infinities and NaN payloads survive; `+0.0` is the absent
+/// value.
+pub(super) fn append_dictionary_rows<'a>(
+    rows: impl Iterator<Item = Option<&'a [f32]>>,
+    out: &mut Vec<u8>,
+    give_up_at: usize,
+) -> Result<bool, Error> {
+    for row in rows {
+        if out.len() >= give_up_at {
+            return Ok(false);
+        }
+        let Some(emb) = row else {
+            out.extend_from_slice(&0u32.to_le_bytes());
+            continue;
+        };
+        let code = u32::try_from(emb.len())
+            .ok()
+            .and_then(|n| n.checked_add(1))
+            .ok_or_else(|| io_err("dictionary vector dimension overflow"))?;
+        // First pass: the row's distinct nonzero bit patterns, in first-seen order.
+        let mut dictionary = [0u32; DICTIONARY_MAX_VALUES];
+        let mut d = 0usize;
+        let mut count = 0u32;
+        let mut raw = false;
+        for value in emb {
+            let bits = value.to_bits();
+            if bits == 0 {
+                continue;
+            }
+            count += 1;
+            if !raw && !dictionary[..d].contains(&bits) {
+                if d == DICTIONARY_MAX_VALUES {
+                    raw = true;
+                } else {
+                    dictionary[d] = bits;
+                    d += 1;
+                }
+            }
+        }
+        out.extend_from_slice(&code.to_le_bytes());
+        out.extend_from_slice(&count.to_le_bytes());
+        if raw {
+            out.push(0);
+            out.reserve(count as usize * 8);
+            for (index, value) in emb.iter().enumerate() {
+                let bits = value.to_bits();
+                if bits != 0 {
+                    out.extend_from_slice(&(index as u32).to_le_bytes());
+                    out.extend_from_slice(&bits.to_le_bytes());
+                }
+            }
+            continue;
+        }
+        out.push(d as u8);
+        for bits in &dictionary[..d] {
+            out.extend_from_slice(&bits.to_le_bytes());
+        }
+        let narrow = d > 0 && emb.len() <= 65536;
+        out.reserve(count as usize * if narrow { 3 } else { 5 });
+        for (index, value) in emb.iter().enumerate() {
+            let bits = value.to_bits();
+            if bits == 0 {
+                continue;
+            }
+            if narrow {
+                out.extend_from_slice(&(index as u16).to_le_bytes());
+            } else {
+                out.extend_from_slice(&(index as u32).to_le_bytes());
+            }
+            // Present by construction: every nonzero pattern of the row is in the table.
+            let ordinal = dictionary[..d].iter().position(|b| *b == bits).unwrap_or(0);
+            out.push(ordinal as u8);
+        }
+    }
+    Ok(out.len() < give_up_at)
+}
+
+/// A sparse vector column was just written at `mark` (its tag byte, then the rows). When
+/// the dictionary writer is on and the same rows are strictly smaller in the dictionary
+/// layout, replace the column in place and return `true`; the caller then frames the
+/// record under the dictionary codec. Decoded sizes are the same in both layouts, so the
+/// decoded-bytes budget the caller accounted for the sparse column still holds.
+fn rewrite_sparse_as_dictionary<'a>(
+    buf: &mut Vec<u8>,
+    mark: usize,
+    rows: impl Iterator<Item = Option<&'a [f32]>>,
+) -> Result<bool, Error> {
+    if !dictionary_writer_enabled() {
+        return Ok(false);
+    }
+    debug_assert_eq!(buf.get(mark), Some(&7));
+    let sparse_len = buf.len().saturating_sub(mark + 1);
+    let mut dict = Vec::with_capacity(sparse_len);
+    if !append_dictionary_rows(rows, &mut dict, sparse_len)? {
+        return Ok(false);
+    }
+    buf.truncate(mark);
+    buf.push(8);
+    buf.extend_from_slice(&dict);
+    Ok(true)
 }
 
 pub(super) fn append_sparse_cells_serial(
@@ -1009,6 +1173,8 @@ pub(crate) fn encode_insert_rows_direct_ext(
         buf.extend_from_slice(&(num_fields as u32).to_le_bytes());
 
         let mut sparse_codec = false;
+
+        let mut dictionary_codec = false;
         let mut sparse_decoded_bytes = 0usize;
 
         for (fi, f) in fields.iter().enumerate() {
@@ -1121,6 +1287,14 @@ pub(crate) fn encode_insert_rows_direct_ext(
                             }
                             sparse_decoded_bytes = next_decoded;
                             sparse_codec = true;
+                            let vectors = (0..rows.len()).map(|ri| {
+                                match unsafe { &*cells[ri * num_fields + fi] } {
+                                    Cell::Vec(emb) => Some(emb.as_ref()),
+                                    _ => None,
+                                }
+                            });
+                            dictionary_codec |=
+                                rewrite_sparse_as_dictionary(buf, mark, vectors).ok()?;
                             wrote_sparse = true;
                         }
                     }
@@ -1156,7 +1330,9 @@ pub(crate) fn encode_insert_rows_direct_ext(
         }
 
         Some((
-            if sparse_codec {
+            if dictionary_codec {
+                LOG_MAGIC_DICTIONARY
+            } else if sparse_codec {
                 LOG_MAGIC_SPARSE
             } else {
                 LOG_MAGIC_V2
@@ -1589,6 +1765,63 @@ pub(super) fn decode_column_record_mode(
 
 
 /// Build columnar insert pack in one pass (field set from first row + union).
+/// WAL pack for freshly inserted rows that replays to exactly those rows.
+///
+/// [`rows_to_insert_cols`] is compact but has no null marker and one type per column: a
+/// missing field comes back as `0` / `""` / `false`, and a float in an integer column as
+/// `0`. Batches it cannot represent exactly are therefore logged row by row.
+pub fn rows_to_insert_pack(
+    collection: impl Into<String>,
+    rows: &[crate::store::Row],
+    edges: Vec<Edge>,
+) -> Pack {
+    if insert_cols_lossless(rows) {
+        rows_to_insert_cols(collection, rows, edges)
+    } else {
+        Pack::InsertBulk {
+            collection: collection.into(),
+            rows: rows.to_vec(),
+            edges,
+        }
+    }
+}
+
+/// True when every row has the same fields, none of them null, and each field holds one
+/// value type throughout — the only shape [`ColData`] round-trips exactly.
+pub(crate) fn insert_cols_lossless(rows: &[crate::store::Row]) -> bool {
+    use crate::store::Cell;
+    fn kind(cell: &Cell) -> u8 {
+        match cell {
+            Cell::Null => 0,
+            Cell::Text(_) | Cell::SmallText(_) => 1,
+            Cell::Int(_) => 2,
+            Cell::Float(_) => 3,
+            Cell::Bool(_) => 4,
+            Cell::Time(_) => 5,
+            // An empty vector decodes as "no vector".
+            Cell::Vec(v) => {
+                if v.is_empty() {
+                    0
+                } else {
+                    6
+                }
+            }
+        }
+    }
+    let Some(first) = rows.first() else {
+        return true;
+    };
+    let kinds: Vec<u8> = first.values().map(kind).collect();
+    if kinds.contains(&0) {
+        return false;
+    }
+    rows[1..].iter().all(|r| {
+        r.len() == first.len()
+            && r.keys().eq(first.keys())
+            && r.values().zip(&kinds).all(|(c, k)| kind(c) == *k)
+    })
+}
+
 pub fn rows_to_insert_cols(
     collection: impl Into<String>,
     rows: &[crate::store::Row],

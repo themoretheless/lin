@@ -8,8 +8,9 @@ use crate::error::Error;
 use crate::store::{Cell, Row};
 
 use super::Db;
-use super::eval::{cmp_sort, eval_pred, pred_has_param, pred_needs_now};
-use super::prepared::{AggKind, AggPlan};
+use super::eval::{PredSlots, cmp_sort, eval_pred, pred_has_param, pred_needs_now};
+use crate::store::row::FieldSlot;
+use super::prepared::{AggKind, AggPlan, AggTail};
 
 static SPILL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
@@ -105,7 +106,7 @@ pub(crate) fn spill_agg_count<'a>(
         .map(|(cell, n)| {
             let mut row = crate::store::acquire_row();
             row.insert(k.clone(), cell);
-            row.insert("hits".into(), Cell::Int(n));
+            row.insert("hits", Cell::Int(n));
             row
         })
         .collect())
@@ -249,6 +250,69 @@ pub(crate) fn agg_count(
     agg_count_filtered(rows, None, 0, by, max_bytes, spill)
 }
 
+/// Below this many rows the fork/join overhead of a parallel aggregate outweighs the scan.
+#[cfg(feature = "parallel")]
+const PAR_AGG_MIN_ROWS: usize = 65_536;
+#[cfg(feature = "parallel")]
+const PAR_AGG_CHUNK_ROWS: usize = 16_384;
+
+/// Grouped aggregate over materialized rows on the rayon pool: each fixed-size chunk
+/// folds into its own map, and the partials merge in chunk order, so the result does not
+/// depend on scheduling. Returns `None` when the merged state exceeds `max_bytes`; the
+/// caller then runs the sequential path, which owns the quota error and the spill.
+#[cfg(feature = "parallel")]
+fn par_group_fold<V: Send + Default>(
+    rows: &[Row],
+    filter: Option<&Pred>,
+    now: i64,
+    key: &str,
+    value: Option<&str>,
+    max_bytes: usize,
+    add: impl Fn(&mut V, Option<&Cell>) + Sync,
+    merge: impl Fn(&mut V, V),
+) -> Option<FxHashMap<Cell, V>> {
+    use rayon::prelude::*;
+    let parts: Vec<FxHashMap<Cell, V>> = rows
+        .par_chunks(PAR_AGG_CHUNK_ROWS)
+        .map(|chunk| {
+            let mut map: FxHashMap<Cell, V> = FxHashMap::default();
+            let mut flt = filter.map(PredSlots::new);
+            let mut key_slot = FieldSlot::new(key);
+            let mut value_slot = value.map(FieldSlot::new);
+            for r in chunk {
+                if !flt.as_mut().is_none_or(|f| f.eval(r, now)) {
+                    continue;
+                }
+                let cell = key_slot.get(r).map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
+                let v = value_slot.as_mut().and_then(|s| s.get(r));
+                add(map.entry(cell).or_default(), v);
+            }
+            map
+        })
+        .collect();
+    let mut merged: FxHashMap<Cell, V> = FxHashMap::default();
+    let mut state_bytes = 0usize;
+    for part in parts {
+        for (cell, v) in part {
+            match merged.entry(cell) {
+                std::collections::hash_map::Entry::Occupied(mut e) => merge(e.get_mut(), v),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    let key_size = match e.key() {
+                        Cell::Text(s) => s.len() + 32,
+                        _ => 16,
+                    };
+                    state_bytes = state_bytes.saturating_add(key_size + 64);
+                    if state_bytes > max_bytes {
+                        return None;
+                    }
+                    e.insert(v);
+                }
+            }
+        }
+    }
+    Some(merged)
+}
+
 pub(crate) fn agg_count_filtered(
     rows: &[Row],
     filter: Option<&Pred>,
@@ -258,13 +322,30 @@ pub(crate) fn agg_count_filtered(
     spill: bool,
 ) -> Result<Vec<Row>, Error> {
     let k = by.as_str();
+    #[cfg(feature = "parallel")]
+    if rows.len() >= PAR_AGG_MIN_ROWS
+        && let Some(map) = par_group_fold::<i64>(
+            rows,
+            filter,
+            now,
+            &k,
+            None,
+            max_bytes,
+            |n, _| *n += 1,
+            |n, m| *n += m,
+        )
+    {
+        return Ok(count_cell_map_to_rows(&k, map));
+    }
     let mut map: FxHashMap<Cell, i64> = FxHashMap::default();
     let mut state_bytes = 0usize;
+    let mut flt = filter.map(PredSlots::new);
+    let mut key_slot = FieldSlot::new(&k);
     for r in rows {
-        if !filter.is_none_or(|p| eval_pred(p, r, now)) {
+        if !flt.as_mut().is_none_or(|f| f.eval(r, now)) {
             continue;
         }
-        let cell = r.get(&k).map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
+        let cell = key_slot.get(r).map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
         if !map.contains_key(&cell) {
             let key_size = match &cell {
                 Cell::Text(s) => s.len() + 32,
@@ -297,7 +378,7 @@ pub(crate) fn count_cell_map_to_rows(by: &str, map: FxHashMap<Cell, i64>) -> Vec
         .map(|(cell, n)| {
             let mut row = crate::store::acquire_row();
             row.insert(by.to_string(), cell);
-            row.insert("hits".into(), Cell::Int(n));
+            row.insert("hits", Cell::Int(n));
             row
         })
         .collect()
@@ -308,7 +389,7 @@ pub(crate) fn count_arc_map_to_rows(by: &str, map: BTreeMap<std::sync::Arc<str>,
         .map(|(g, n)| {
             let mut row = crate::store::acquire_row();
             row.insert(by.to_string(), Cell::Text(g));
-            row.insert("hits".into(), Cell::Int(n));
+            row.insert("hits", Cell::Int(n));
             row
         })
         .collect()
@@ -423,14 +504,14 @@ fn disk_cmp_rhs_compatible(kind: crate::disk::DiskColKind, rhs: &Cell) -> bool {
 
 pub(crate) fn hits_row(n: i64) -> Row {
     let mut row = crate::store::acquire_row();
-    row.insert("hits".into(), Cell::Int(n));
+    row.insert("hits", Cell::Int(n));
     row
 }
 
 pub(crate) fn count_row(by: &str, value: &str, n: i64) -> Row {
     let mut row = crate::store::acquire_row();
     row.insert(by.to_string(), Cell::text_arc(value));
-    row.insert("hits".into(), Cell::Int(n));
+    row.insert("hits", Cell::Int(n));
     row
 }
 
@@ -472,24 +553,71 @@ pub(crate) fn agg_sum_filtered(
 ) -> Result<Vec<Row>, Error> {
     let fk = field.as_str();
     let Some(by) = by else {
-        let mut total = 0.0f64;
-        for r in rows {
-            if filter.is_none_or(|p| eval_pred(p, r, now)) {
-                total += r.get(&fk).and_then(Cell::as_f64).unwrap_or(0.0);
+        let sum_rows = |rows: &[Row]| -> f64 {
+            let mut total = 0.0f64;
+            let mut flt = filter.map(PredSlots::new);
+            let mut value_slot = FieldSlot::new(&fk);
+            for r in rows {
+                if flt.as_mut().is_none_or(|f| f.eval(r, now)) {
+                    total += value_slot.get(r).and_then(Cell::as_f64).unwrap_or(0.0);
+                }
             }
-        }
+            total
+        };
+        #[cfg(feature = "parallel")]
+        let total: f64 = if rows.len() >= PAR_AGG_MIN_ROWS {
+            use rayon::prelude::*;
+            // Chunk sums are added in chunk order: the result is deterministic.
+            let partials: Vec<f64> = rows.par_chunks(PAR_AGG_CHUNK_ROWS).map(sum_rows).collect();
+            partials.into_iter().sum()
+        } else {
+            sum_rows(rows)
+        };
+        #[cfg(not(feature = "parallel"))]
+        let total = sum_rows(rows);
         let mut row = crate::store::acquire_row();
         row.insert(fk, Cell::Float(total));
         return Ok(vec![row]);
     };
     let bk = by.as_str();
+    let sum_rows_out = |map: FxHashMap<Cell, f64>| -> Vec<Row> {
+        let mut entries: Vec<(Cell, f64)> = map.into_iter().collect();
+        entries.sort_unstable_by(|(a, _), (b, _)| cmp_sort(a, b));
+        entries
+            .into_iter()
+            .map(|(cell, n)| {
+                let mut row = crate::store::acquire_row();
+                row.insert(bk.clone(), cell);
+                row.insert(fk.clone(), Cell::Float(n));
+                row
+            })
+            .collect()
+    };
+    #[cfg(feature = "parallel")]
+    if rows.len() >= PAR_AGG_MIN_ROWS
+        && let Some(map) = par_group_fold::<f64>(
+            rows,
+            filter,
+            now,
+            &bk,
+            Some(&fk),
+            max_bytes,
+            |n, v| *n += v.and_then(Cell::as_f64).unwrap_or(0.0),
+            |n, m| *n += m,
+        )
+    {
+        return Ok(sum_rows_out(map));
+    }
     let mut map: FxHashMap<Cell, f64> = FxHashMap::default();
     let mut state_bytes = 0usize;
+    let mut flt = filter.map(PredSlots::new);
+    let mut key_slot = FieldSlot::new(&bk);
+    let mut value_slot = FieldSlot::new(&fk);
     for r in rows {
-        if !filter.is_none_or(|p| eval_pred(p, r, now)) {
+        if !flt.as_mut().is_none_or(|f| f.eval(r, now)) {
             continue;
         }
-        let cell = r.get(&bk).map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
+        let cell = key_slot.get(r).map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
         if !map.contains_key(&cell) {
             let key_size = match &cell {
                 Cell::Text(s) => s.len() + 32,
@@ -510,20 +638,10 @@ pub(crate) fn agg_sum_filtered(
                 )));
             }
         }
-        let n = r.get(&fk).and_then(Cell::as_f64).unwrap_or(0.0);
+        let n = value_slot.get(r).and_then(Cell::as_f64).unwrap_or(0.0);
         *map.entry(cell).or_insert(0.0) += n;
     }
-    let mut entries: Vec<(Cell, f64)> = map.into_iter().collect();
-    entries.sort_unstable_by(|(a, _), (b, _)| cmp_sort(a, b));
-    Ok(entries
-        .into_iter()
-        .map(|(cell, n)| {
-            let mut row = crate::store::acquire_row();
-            row.insert(bk.clone(), cell);
-            row.insert(fk.clone(), Cell::Float(n));
-            row
-        })
-        .collect())
+    Ok(sum_rows_out(map))
 }
 
 pub(crate) fn agg_min(
@@ -566,23 +684,40 @@ pub(crate) fn agg_extremum_filtered(
         }
     };
     let Some(by) = by else {
-        let mut best: Option<Cell> = None;
-        for r in rows {
-            if filter.is_none_or(|p| eval_pred(p, r, now))
-                && let Some(c) = r.get(&fk).filter(|c| !matches!(c, Cell::Null))
-            {
-                best = Some(match best {
-                    None => c.clone_for_borrow(),
-                    Some(prev) => {
-                        if is_better(c, &prev) {
-                            c.clone_for_borrow()
-                        } else {
-                            prev
-                        }
-                    }
-                });
+        // Borrowed scan: the winning cell is cloned once at the end, not on every improvement.
+        let best_of = |rows: &'_ [Row]| -> Option<Cell> {
+            let mut best: Option<&Cell> = None;
+            let mut flt = filter.map(PredSlots::new);
+            let mut value_slot = FieldSlot::new(&fk);
+            for r in rows {
+                if flt.as_mut().is_none_or(|f| f.eval(r, now))
+                    && let Some(c) = value_slot.get(r).filter(|c| !matches!(c, Cell::Null))
+                    && best.is_none_or(|prev| is_better(c, prev))
+                {
+                    best = Some(c);
+                }
             }
-        }
+            best.map(Cell::clone_for_borrow)
+        };
+        #[cfg(feature = "parallel")]
+        let best: Option<Cell> = if rows.len() >= PAR_AGG_MIN_ROWS {
+            use rayon::prelude::*;
+            // Chunk winners merge in chunk order with the same strict comparison, so the
+            // first of equal values wins exactly as in the sequential loop.
+            let partials: Vec<Option<Cell>> =
+                rows.par_chunks(PAR_AGG_CHUNK_ROWS).map(best_of).collect();
+            let mut best: Option<Cell> = None;
+            for c in partials.into_iter().flatten() {
+                if best.as_ref().is_none_or(|prev| is_better(&c, prev)) {
+                    best = Some(c);
+                }
+            }
+            best
+        } else {
+            best_of(rows)
+        };
+        #[cfg(not(feature = "parallel"))]
+        let best = best_of(rows);
         let mut row = crate::store::acquire_row();
         row.insert(fk, best.unwrap_or(Cell::Null));
         return Ok(vec![row]);
@@ -590,11 +725,46 @@ pub(crate) fn agg_extremum_filtered(
     let bk = by.as_str();
     let mut map: FxHashMap<Cell, Option<Cell>> = FxHashMap::default();
     let mut state_bytes = 0usize;
-    for r in rows {
-        if !filter.is_none_or(|p| eval_pred(p, r, now)) {
+    #[allow(unused_mut)]
+    let mut seq_rows: &[Row] = rows;
+    // Chunk partials merge in order with the same strict comparison, so the first of
+    // equal values wins exactly as in the sequential loop.
+    #[cfg(feature = "parallel")]
+    if rows.len() >= PAR_AGG_MIN_ROWS
+        && let Some(folded) = par_group_fold::<Option<Cell>>(
+            rows,
+            filter,
+            now,
+            &bk,
+            Some(&fk),
+            max_bytes,
+            |best, v| {
+                if let Some(c) = v.filter(|c| !matches!(c, Cell::Null))
+                    && best.as_ref().is_none_or(|prev| is_better(c, prev))
+                {
+                    *best = Some(c.clone_for_borrow());
+                }
+            },
+            |best, other| {
+                if let Some(c) = other
+                    && best.as_ref().is_none_or(|prev| is_better(&c, prev))
+                {
+                    *best = Some(c);
+                }
+            },
+        )
+    {
+        map = folded;
+        seq_rows = &[];
+    }
+    let mut flt = filter.map(PredSlots::new);
+    let mut key_slot = FieldSlot::new(&bk);
+    let mut value_slot = FieldSlot::new(&fk);
+    for r in seq_rows {
+        if !flt.as_mut().is_none_or(|f| f.eval(r, now)) {
             continue;
         }
-        let cell = r.get(&bk).map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
+        let cell = key_slot.get(r).map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
         if !map.contains_key(&cell) {
             let key_size = match &cell {
                 Cell::Text(s) => s.len() + 32,
@@ -616,7 +786,7 @@ pub(crate) fn agg_extremum_filtered(
                 )));
             }
         }
-        let f_val = r.get(&fk).filter(|c| !matches!(c, Cell::Null));
+        let f_val = value_slot.get(r).filter(|c| !matches!(c, Cell::Null));
         let entry = map.entry(cell).or_insert(None);
         if let Some(c) = f_val {
             *entry = Some(match entry.take() {
@@ -665,16 +835,35 @@ pub(crate) fn agg_avg_filtered(
 ) -> Result<Vec<Row>, Error> {
     let fk = field.as_str();
     let Some(by) = by else {
-        let mut sum = 0.0f64;
-        let mut count = 0usize;
-        for r in rows {
-            if filter.is_none_or(|p| eval_pred(p, r, now))
-                && let Some(v) = r.get(&fk).and_then(Cell::as_f64)
-            {
-                sum += v;
-                count += 1;
+        let fold = |rows: &[Row]| -> (f64, usize) {
+            let mut sum = 0.0f64;
+            let mut count = 0usize;
+            let mut flt = filter.map(PredSlots::new);
+            let mut value_slot = FieldSlot::new(&fk);
+            for r in rows {
+                if flt.as_mut().is_none_or(|f| f.eval(r, now))
+                    && let Some(v) = value_slot.get(r).and_then(Cell::as_f64)
+                {
+                    sum += v;
+                    count += 1;
+                }
             }
-        }
+            (sum, count)
+        };
+        #[cfg(feature = "parallel")]
+        let (sum, count) = if rows.len() >= PAR_AGG_MIN_ROWS {
+            use rayon::prelude::*;
+            // Chunk partials are added in chunk order: the result is deterministic.
+            let partials: Vec<(f64, usize)> =
+                rows.par_chunks(PAR_AGG_CHUNK_ROWS).map(fold).collect();
+            partials
+                .into_iter()
+                .fold((0.0f64, 0usize), |a, b| (a.0 + b.0, a.1 + b.1))
+        } else {
+            fold(rows)
+        };
+        #[cfg(not(feature = "parallel"))]
+        let (sum, count) = fold(rows);
         let avg = if count == 0 {
             0.0
         } else {
@@ -687,11 +876,40 @@ pub(crate) fn agg_avg_filtered(
     let bk = by.as_str();
     let mut map: FxHashMap<Cell, (f64, usize)> = FxHashMap::default();
     let mut state_bytes = 0usize;
-    for r in rows {
-        if !filter.is_none_or(|p| eval_pred(p, r, now)) {
+    #[allow(unused_mut)]
+    let mut seq_rows: &[Row] = rows;
+    #[cfg(feature = "parallel")]
+    if rows.len() >= PAR_AGG_MIN_ROWS
+        && let Some(folded) = par_group_fold::<(f64, usize)>(
+            rows,
+            filter,
+            now,
+            &bk,
+            Some(&fk),
+            max_bytes,
+            |acc, v| {
+                if let Some(v) = v.and_then(Cell::as_f64) {
+                    acc.0 += v;
+                    acc.1 += 1;
+                }
+            },
+            |acc, other| {
+                acc.0 += other.0;
+                acc.1 += other.1;
+            },
+        )
+    {
+        map = folded;
+        seq_rows = &[];
+    }
+    let mut flt = filter.map(PredSlots::new);
+    let mut key_slot = FieldSlot::new(&bk);
+    let mut value_slot = FieldSlot::new(&fk);
+    for r in seq_rows {
+        if !flt.as_mut().is_none_or(|f| f.eval(r, now)) {
             continue;
         }
-        let cell = r.get(&bk).map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
+        let cell = key_slot.get(r).map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
         if !map.contains_key(&cell) {
             let key_size = match &cell {
                 Cell::Text(s) => s.len() + 32,
@@ -712,7 +930,7 @@ pub(crate) fn agg_avg_filtered(
                 )));
             }
         }
-        let v_opt = r.get(&fk).and_then(Cell::as_f64);
+        let v_opt = value_slot.get(r).and_then(Cell::as_f64);
         let entry = map.entry(cell).or_insert((0.0, 0));
         if let Some(v) = v_opt {
             entry.0 += v;
@@ -765,6 +983,7 @@ impl Db {
         };
         let mut filter: Option<Pred> = None;
         let mut kind: Option<AggKind> = None;
+        let mut tail: Vec<AggTail> = Vec::new();
         for step in &q.steps {
             match step {
                 Step::Filter(p) => {
@@ -815,7 +1034,32 @@ impl Db {
                         by: by.clone(),
                     });
                 }
+                // Trailing `skip` / `take` only slice the groups the plan returns; without
+                // this the query fell back to materializing the collection. `take all`
+                // keeps every group and needs no tail entry.
+                Step::Take { n: None } if kind.is_some() => {}
+                Step::Take { n: Some(n) } if kind.is_some() => {
+                    tail.push(AggTail::Take((*n).max(0) as usize));
+                }
+                Step::Skip { n } if kind.is_some() => {
+                    tail.push(AggTail::Skip((*n).max(0) as usize));
+                }
+                Step::Sort { field, desc } if kind.is_some() => {
+                    tail.push(AggTail::Sort {
+                        field: field.clone(),
+                        desc: *desc,
+                    });
+                }
                 _ => return None,
+            }
+            // Nothing but `sort` / `skip` / `take` may follow the first tail step.
+            if !tail.is_empty()
+                && !matches!(
+                    step,
+                    Step::Take { .. } | Step::Skip { .. } | Step::Sort { .. }
+                )
+            {
+                return None;
             }
         }
         let kind = kind?;
@@ -832,6 +1076,7 @@ impl Db {
             kind,
             needs_now,
             index_plan,
+            tail,
         })
     }
 
@@ -925,7 +1170,7 @@ impl Db {
                     }
                     let mut row = crate::store::acquire_row();
                     row.insert(by_f.as_str(), cell);
-                    row.insert("hits".into(), Cell::Int(n as i64));
+                    row.insert("hits", Cell::Int(n as i64));
                     return Ok(Some(vec![row]));
                 }
             }
@@ -949,7 +1194,7 @@ impl Db {
                     }
                     let mut row = crate::store::acquire_row();
                     row.insert(b.as_str(), Cell::from_text(s));
-                    row.insert("hits".into(), Cell::Int(n as i64));
+                    row.insert("hits", Cell::Int(n as i64));
                     return Ok(Some(vec![row]));
                 }
                 _ => {}
@@ -1117,6 +1362,22 @@ impl Db {
     }
 
     pub(crate) fn execute_agg_plan(&self, plan: &AggPlan, now: i64) -> Result<Vec<Row>, Error> {
+        let mut rows = self.execute_agg_plan_groups(plan, now)?;
+        for step in &plan.tail {
+            match step {
+                AggTail::Skip(n) => {
+                    rows.drain(..(*n).min(rows.len()));
+                }
+                AggTail::Take(n) => rows.truncate(*n),
+                AggTail::Sort { field, desc } => {
+                    super::eval::sort_rows_top_k(&mut rows, field, *desc, None);
+                }
+            }
+        }
+        Ok(rows)
+    }
+
+    fn execute_agg_plan_groups(&self, plan: &AggPlan, now: i64) -> Result<Vec<Row>, Error> {
         if let Some(rows) = self.execute_disk_agg_plan(plan, now)? {
             return Ok(rows);
         }
@@ -1162,7 +1423,7 @@ impl Db {
                     if by.is_none() && plan.filter.is_none() {
                         let total: f64 = self.store.orders_total().iter().sum();
                         let mut row = crate::store::acquire_row();
-                        row.insert("total".into(), Cell::Float(total));
+                        row.insert("total", Cell::Float(total));
                         return Ok(vec![row]);
                     }
                     if let Some(by_field) = by
@@ -1201,8 +1462,8 @@ impl Db {
                                         }
                                     }
                                     let mut row = crate::store::acquire_row();
-                                    row.insert("user_id".into(), uid_cell);
-                                    row.insert("total".into(), Cell::Float(sum));
+                                    row.insert("user_id", uid_cell);
+                                    row.insert("total", Cell::Float(sum));
                                     out.push(row);
                                 }
                                 return Ok(out);
@@ -1225,8 +1486,8 @@ impl Db {
                                 .into_iter()
                                 .map(|(uid, tot)| {
                                     let mut row = crate::store::acquire_row();
-                                    row.insert("user_id".into(), Cell::Text(uid));
-                                    row.insert("total".into(), Cell::Float(tot));
+                                    row.insert("user_id", Cell::Text(uid));
+                                    row.insert("total", Cell::Float(tot));
                                     row
                                 })
                                 .collect());
@@ -1262,8 +1523,8 @@ impl Db {
                                     .into_iter()
                                     .map(|(uid, tot)| {
                                         let mut row = crate::store::acquire_row();
-                                        row.insert("user_id".into(), Cell::Text(uid));
-                                        row.insert("total".into(), Cell::Float(tot));
+                                        row.insert("user_id", Cell::Text(uid));
+                                        row.insert("total", Cell::Float(tot));
                                         row
                                     })
                                     .collect());
@@ -1281,7 +1542,7 @@ impl Db {
                         totals.iter().sum::<f64>() / totals.len() as f64
                     };
                     let mut row = crate::store::acquire_row();
-                    row.insert("total".into(), Cell::Float(avg));
+                    row.insert("total", Cell::Float(avg));
                     return Ok(vec![row]);
                 }
                 _ => {}
@@ -1326,8 +1587,8 @@ impl Db {
                         .into_iter()
                         .map(|(w, count)| {
                             let mut row = crate::store::acquire_row();
-                            row.insert("wing".into(), Cell::Text(w));
-                            row.insert("hits".into(), Cell::Int(count));
+                            row.insert("wing", Cell::Text(w));
+                            row.insert("hits", Cell::Int(count));
                             row
                         })
                         .collect());
@@ -1347,8 +1608,8 @@ impl Db {
                         .into_iter()
                         .map(|(w, count)| {
                             let mut row = crate::store::acquire_row();
-                            row.insert("wing".into(), Cell::Text(w));
-                            row.insert("hits".into(), Cell::Int(count));
+                            row.insert("wing", Cell::Text(w));
+                            row.insert("hits", Cell::Int(count));
                             row
                         })
                         .collect());
@@ -1557,7 +1818,7 @@ impl Db {
                         }
                         let mut row = crate::store::acquire_row();
                         row.insert(by_f.as_str(), cell);
-                        row.insert("hits".into(), Cell::Int(n as i64));
+                        row.insert("hits", Cell::Int(n as i64));
                         return Some(vec![row]);
                     }
                 }

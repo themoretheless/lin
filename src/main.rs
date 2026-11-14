@@ -2,10 +2,14 @@ use std::io::{self, Read};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
 use lin::{Db, GraphFmt, explain_as};
+
+/// `--cold`: open the data directory with the disk tier enabled.
+static COLD: AtomicBool = AtomicBool::new(false);
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -19,6 +23,8 @@ fn main() -> ExitCode {
         Some("follower") => cmd_follower(&rest[1..], data),
         Some("cache") | Some("cacha") => cmd_cache(&rest[1..], data),
         Some("stats") => cmd_stats(data, follower),
+        Some("cluster") => cmd_cluster(&rest[1..], data, follower),
+        Some("compact") => cmd_compact(&rest[1..], data, follower),
         Some("version") | Some("--version") => {
             println!("lin {}", lin::VERSION);
             ExitCode::SUCCESS
@@ -44,6 +50,9 @@ fn parse_global(args: &[String]) -> (Option<PathBuf>, bool, Vec<String>) {
             }
         } else if args[i] == "--follower" {
             follower = true;
+            i += 1;
+        } else if args[i] == "--cold" {
+            COLD.store(true, Ordering::Relaxed);
             i += 1;
         } else {
             rest.push(args[i].clone());
@@ -236,8 +245,20 @@ fn with_data<T>(
 ) -> Result<T, lin::Error> {
     match data {
         Some(path) => {
+            let cold = COLD.load(Ordering::Relaxed);
             let mut db = if follower {
+                if cold {
+                    return Err(lin::Error::runtime("--cold is not supported with --follower"));
+                }
                 Db::open_follower(path)?
+            } else if cold {
+                Db::open_with(
+                    path,
+                    lin::OpenOpts {
+                        cold: true,
+                        ..lin::OpenOpts::default()
+                    },
+                )?
             } else {
                 Db::open(path)?
             };
@@ -280,7 +301,7 @@ fn usage(code: u8) -> ExitCode {
         "usage:\n  \
          lin [--data <dir>] [--follower] run [--gpu] [--explain] [--file <path> | - | '<query>']\n  \
          lin [--data <dir>] [--follower] explain [--graph mermaid|dot] '<query>'\n  \
-         lin --data <dir> wal-serve [--listen HOST:PORT] [--token TOKEN] [--tls-cert PEM --tls-key PEM]\n  \
+         lin --data <dir> wal-serve [--listen HOST:PORT] [--sinks N] [--token TOKEN] [--tls-cert PEM --tls-key PEM]\n  \
          lin --data <dir> follower status|bootstrap|sync …\n  \
          lin --data <dir> --follower apply-wal <frames.bin | ->\n  \
          lin [--data <dir>] backup export <file.json>\n  \
@@ -288,9 +309,75 @@ fn usage(code: u8) -> ExitCode {
          lin [--data <dir>] cache serve [--node-id ID] [--listen HOST:PORT] [--peer ID=HOST:PORT] [--max-entries N]\n  \
          lin cache cli [--connect HOST:PORT] [COMMAND...]\n  \
          lin [--data <dir>] [--follower] stats\n  \
+         lin --data <dir> --cold cluster <collection> [<field> | --none]\n  \
+         lin --data <dir> --cold compact <collection>\n  \
+         global: --cold opens <dir> with the disk tier (large collections spill to segments)\n  \
          lin version"
     );
     ExitCode::from(code)
+}
+
+/// `cluster <collection>` prints the cluster key; `cluster <collection> <field>` sets it;
+/// `cluster <collection> --none` clears it.
+fn cmd_cluster(args: &[String], data: Option<PathBuf>, follower: bool) -> ExitCode {
+    let (Some(collection), true) = (args.first(), args.len() <= 2) else {
+        return usage(2);
+    };
+    let field = args.get(1).map(String::as_str);
+    let out = cold_command(data, follower, |db| match field {
+        None => Ok(match db.cluster_key(collection) {
+            Some(key) => format!("{collection}: cluster key {key}"),
+            None => format!("{collection}: no cluster key"),
+        }),
+        Some("--none") => {
+            db.set_cluster_key(collection, None)?;
+            Ok(format!("{collection}: cluster key cleared"))
+        }
+        Some(key) => {
+            db.set_cluster_key(collection, Some(key))?;
+            Ok(format!("{collection}: cluster key {key}"))
+        }
+    });
+    report(out)
+}
+
+/// `compact <collection>`: checkpoint, reclaim deleted rows and merge the collection's
+/// segments (in cluster-key order when one is declared).
+fn cmd_compact(args: &[String], data: Option<PathBuf>, follower: bool) -> ExitCode {
+    let [collection] = args else {
+        return usage(2);
+    };
+    report(cold_command(data, follower, |db| {
+        db.compact_collection(collection)?;
+        Ok(format!("{collection}: compacted"))
+    }))
+}
+
+fn cold_command(
+    data: Option<PathBuf>,
+    follower: bool,
+    f: impl FnOnce(&mut Db) -> Result<String, lin::Error>,
+) -> Result<String, lin::Error> {
+    if !COLD.load(Ordering::Relaxed) {
+        return Err(lin::Error::runtime("this command requires --cold"));
+    }
+    with_data(data, follower, |db| match db {
+        Some(db) => f(db),
+        None => Err(lin::Error::runtime("this command requires --data <dir>")),
+    })
+}
+
+fn report(out: Result<String, lin::Error>) -> ExitCode {
+    match out {
+        Ok(line) => {
+            println!("{line}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::from(1)
+        }
+    }
 }
 
 fn cmd_stats(data: Option<PathBuf>, follower: bool) -> ExitCode {
@@ -393,7 +480,7 @@ fn cmd_apply_wal(args: &[String], data: Option<PathBuf>, follower: bool) -> Exit
 fn cmd_wal_serve(args: &[String], data: Option<PathBuf>) -> ExitCode {
     let Some(dir) = data else {
         eprintln!(
-            "usage: lin --data <dir> wal-serve [--listen HOST:PORT] [--token TOKEN] [--tls-cert PEM --tls-key PEM]"
+            "usage: lin --data <dir> wal-serve [--listen HOST:PORT] [--sinks N] [--token TOKEN] [--tls-cert PEM --tls-key PEM]"
         );
         return ExitCode::from(2);
     };
@@ -403,6 +490,7 @@ fn cmd_wal_serve(args: &[String], data: Option<PathBuf>) -> ExitCode {
         .filter(|s| !s.is_empty());
     let mut cert: Option<PathBuf> = None;
     let mut key: Option<PathBuf> = None;
+    let mut sinks = 1usize;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -415,8 +503,21 @@ fn cmd_wal_serve(args: &[String], data: Option<PathBuf>) -> ExitCode {
                     }
                     None => {
                         eprintln!(
-                            "usage: lin --data <dir> wal-serve [--listen HOST:PORT] [--token TOKEN] [--tls-cert PEM --tls-key PEM]"
+                            "usage: lin --data <dir> wal-serve [--listen HOST:PORT] [--sinks N] [--token TOKEN] [--tls-cert PEM --tls-key PEM]"
                         );
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            "--sinks" => {
+                i += 1;
+                match args.get(i).and_then(|a| a.parse::<usize>().ok()) {
+                    Some(n) if (1..=lin::ship::MAX_SINKS).contains(&n) => {
+                        sinks = n;
+                        i += 1;
+                    }
+                    _ => {
+                        eprintln!("--sinks requires a number from 1 to {}", lin::ship::MAX_SINKS);
                         return ExitCode::from(2);
                     }
                 }
@@ -499,14 +600,18 @@ fn cmd_wal_serve(args: &[String], data: Option<PathBuf>) -> ExitCode {
         .map(|a| a.to_string())
         .unwrap_or(listen);
     eprintln!(
-        "wal-serve {} on {addr} tls={} token={} one-sink (writer lock held)",
+        "wal-serve {} on {addr} tls={} token={} sinks={sinks} (writer lock held)",
         dir.display(),
         tls.is_some(),
         token.is_some()
     );
     let opts = lin::ship::ServeOpts { token, tls };
     match Db::open(&dir) {
-        Ok(db) => match lin::ship::serve_blocking_opts(&db, listener, &opts) {
+        Ok(db) => match if sinks > 1 {
+            lin::ship::serve_blocking_fanout(&db, listener, &opts, sinks)
+        } else {
+            lin::ship::serve_blocking_opts(&db, listener, &opts)
+        } {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("{e}");
