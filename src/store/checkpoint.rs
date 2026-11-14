@@ -304,7 +304,12 @@ impl Store {
         let live_hash = catalog_hash(&live);
 
         let head_disk = persist::read_head(dir)?;
+        // `head` is rewritten after the snapshot it describes, so a crash in between leaves
+        // a head older than the snapshot. Its catalog hash then describes a catalog from
+        // before the snapshot and proves nothing; the snapshot's own hash is checked below.
+        let head_is_stale = head_disk.as_ref().is_some_and(|h| h.r#gen < min_gen);
         if let Some(ref head) = head_disk
+            && !head_is_stale
             && head.catalog_hash != live_hash
             && !replay_hashes.contains(&head.catalog_hash)
         {

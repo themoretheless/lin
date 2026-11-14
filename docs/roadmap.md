@@ -2,7 +2,7 @@
 
 Срез: **2026-11-14**, коммит `58444cf6e` (релиз 0.7.1) плюс незакоммиченное рабочее дерево. Единственный файл с планом в репозитории: в нём только несделанное. Реализованное описано в [CHANGELOG](../CHANGELOG.md), в документах `docs/` по отдельным механизмам и в отчётах `benches/results/`.
 
-Открыто **1769** пунктов backlog (часть II) и 12 пунктов части I: 10 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
+Открыто **1760** пунктов backlog (часть II) и 12 пунктов части I: 10 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровывались, поэтому в них есть пропуски: закрытые пункты удалены. Пункты части II со статусами `candidate` и `qualification` по коду поштучно не сверялись: перед взятием пункта сначала проверить, не покрыт ли он уже.
 
@@ -191,9 +191,9 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 Для каждой строки итоговый критерий — её конкретный результат плюс указанный gate. Если критерий требует недоступной платформы/endpoint, статус остаётся непроверенным; mock/compile не заменяет live qualification.
 
-### Приоритетный список — 1769 пунктов
+### Приоритетный список — 1760 пунктов
 
-Количества: P1: 3, P2: 1180, P3: 586; статусы: blocked_external: 1, candidate: 934, qualification: 834.
+Количества: P1: 3, P2: 1171, P3: 586; статусы: blocked_external: 1, candidate: 934, qualification: 825.
 
 #### P1: 3 пунктов
 
@@ -203,7 +203,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 2 | LIN-0002 | [D01](#d01) | Закрыть durable 1k SQLite gap | PERF | qualification | M | G-PERF |
 | 22 | LIN-0006 | [D01](#d01) | Получить тестовый endpoint Kusto | OPS | blocked_external | M | G-OPS |
 
-#### P2: 1180 пунктов
+#### P2: 1171 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -328,19 +328,10 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 282 | LIN-0218 | [D06](#d06) | Спроектировать bounded savepoints | FEATURE | candidate | L | G-FEATURE |
 | 283 | LIN-0219 | [D06](#d06) | Спроектировать read-your-writes contract | FEATURE | candidate | L | G-FEATURE |
 | 284 | LIN-0220 | [D06](#d06) | Спроектировать nested transaction rejection | FEATURE | candidate | L | G-FEATURE |
-| 285 | LIN-0221 | [D06](#d06) | Проверить duplicate ID внутри batch | CORRECTNESS | qualification | S | G-CORRECT |
-| 286 | LIN-0222 | [D06](#d06) | Проверить duplicate URI внутри batch | CORRECTNESS | qualification | S | G-CORRECT |
-| 287 | LIN-0223 | [D06](#d06) | Проверить collision с existing ID | CORRECTNESS | qualification | S | G-CORRECT |
-| 288 | LIN-0224 | [D06](#d06) | Проверить collision с existing URI | CORRECTNESS | qualification | S | G-CORRECT |
-| 289 | LIN-0225 | [D06](#d06) | Проверить FK перед partial mutation | CORRECTNESS | qualification | S | G-CORRECT |
-| 290 | LIN-0226 | [D06](#d06) | Проверить unique index before commit | CORRECTNESS | qualification | S | G-CORRECT |
 | 291 | LIN-0227 | [D06](#d06) | Проверить deferred validation ordering | CORRECTNESS | qualification | S | G-CORRECT |
 | 292 | LIN-0228 | [D06](#d06) | Проверить deterministic failure precedence | CORRECTNESS | qualification | S | G-CORRECT |
 | 293 | LIN-0229 | [D06](#d06) | Проверить transaction cancellation semantics | CORRECTNESS | qualification | S | G-CORRECT |
-| 294 | LIN-0230 | [D06](#d06) | Проверить panic unwind rollback | CORRECTNESS | qualification | S | G-CORRECT |
-| 295 | LIN-0231 | [D06](#d06) | Проверить poisoned transaction reuse | CORRECTNESS | qualification | S | G-CORRECT |
 | 296 | LIN-0232 | [D06](#d06) | Проверить failed commit reopen consistency | CORRECTNESS | qualification | S | G-CORRECT |
-| 297 | LIN-0233 | [D06](#d06) | Проверить multi-collection transaction journal | CORRECTNESS | qualification | S | G-CORRECT |
 | 298 | LIN-0234 | [D06](#d06) | Проверить transaction schema drift | CORRECTNESS | qualification | S | G-CORRECT |
 | 299 | LIN-0235 | [D06](#d06) | Проверить concurrent snapshot visibility | CORRECTNESS | qualification | S | G-CORRECT |
 | 300 | LIN-0236 | [D06](#d06) | Проверить transaction result lifetime | CORRECTNESS | qualification | S | G-CORRECT |
