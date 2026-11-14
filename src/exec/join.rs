@@ -774,6 +774,103 @@ impl Db {
         Some(out)
     }
 
+    /// `filter? | join | count|sum|min|max|avg … (by …)? | take all?` with only the
+    /// columns the aggregate reads taken from the columnar FK join, instead of merging
+    /// every field of both sides into each row. The aggregate itself is the row
+    /// pipeline's, so groups, their order, value types, quotas and spilling are the same.
+    pub(super) fn try_join_agg(
+        &self,
+        q: &Query,
+        bindings: &BTreeMap<String, Vec<Row>>,
+        now: i64,
+    ) -> Result<Option<Vec<Row>>, Error> {
+        #[cfg(feature = "gpu")]
+        if self.gpu.is_some() {
+            return Ok(None);
+        }
+        let mut filter: Option<&Pred> = None;
+        let mut join: Option<&Step> = None;
+        let mut agg: Option<&Step> = None;
+        let mut tail_take_all = false;
+        for (i, step) in q.steps.iter().enumerate() {
+            match step {
+                Step::Filter(p) if i == 0 => filter = Some(p),
+                Step::Join { .. } if join.is_none() => join = Some(step),
+                Step::Count { .. }
+                | Step::Sum { .. }
+                | Step::Min { .. }
+                | Step::Max { .. }
+                | Step::Avg { .. }
+                    if join.is_some() && agg.is_none() =>
+                {
+                    agg = Some(step);
+                }
+                Step::Take { n: None } if agg.is_some() && !tail_take_all => tail_take_all = true,
+                _ => return Ok(None),
+            }
+        }
+        let (Some(join), Some(agg)) = (join, agg) else {
+            return Ok(None);
+        };
+        let (field, by): (Option<&Field>, Option<&Field>) = match agg {
+            Step::Count { by } => (None, by.as_ref()),
+            Step::Sum { field, by }
+            | Step::Min { field, by }
+            | Step::Max { field, by }
+            | Step::Avg { field, by } => (Some(field), by.as_ref()),
+            _ => return Ok(None),
+        };
+        // The columns the aggregate reads; a plain count still needs one column to count
+        // the joined rows by.
+        let id = Field::name("id");
+        let mut base: Vec<Field> = Vec::with_capacity(2);
+        for f in [by, field].into_iter().flatten() {
+            if !base.iter().any(|b| b.as_str() == f.as_str()) {
+                base.push(f.clone());
+            }
+        }
+        if base.is_empty() {
+            base.push(id);
+        }
+        let mut steps = Vec::with_capacity(4);
+        if let Some(p) = filter {
+            steps.push(Step::Filter(p.clone()));
+        }
+        steps.push(join.clone());
+        steps.push(Step::Project(base));
+        steps.push(Step::Take { n: None });
+        let base_q = Query {
+            source: q.source.clone(),
+            steps,
+            explain: None,
+            ignore_filter: q.ignore_filter,
+        };
+        let Some(batch) = self.try_join_project_batch(&base_q, bindings, now) else {
+            return Ok(None);
+        };
+        let rows = batch.to_rows();
+        let max_bytes = self.quotas.max_aggregate_bytes;
+        let spill = self.quotas.spill_enabled;
+        let out = match agg {
+            Step::Count { by: Some(by) } => super::agg::agg_count(&rows, by, max_bytes, spill)?,
+            Step::Count { by: None } => vec![super::agg::hits_row(rows.len() as i64)],
+            Step::Sum { field, by } => {
+                super::agg::agg_sum(&rows, field, by.as_ref(), max_bytes, spill)?
+            }
+            Step::Min { field, by } => {
+                super::agg::agg_min(&rows, field, by.as_ref(), max_bytes, spill)?
+            }
+            Step::Max { field, by } => {
+                super::agg::agg_max(&rows, field, by.as_ref(), max_bytes, spill)?
+            }
+            Step::Avg { field, by } => {
+                super::agg::agg_avg(&rows, field, by.as_ref(), max_bytes, spill)?
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(out))
+    }
+
     /// Columnar filter? + project + skip*/take? (no join). Prefer [`Self::run_prepared_batch`].
     pub(super) fn try_filter_project_batch(
         &self,

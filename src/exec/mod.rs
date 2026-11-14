@@ -3555,6 +3555,9 @@ impl Db {
             if let Some(rows) = self.try_join_project(q, bindings, now) {
                 return Ok(rows);
             }
+            if let Some(rows) = self.try_join_agg(q, bindings, now)? {
+                return Ok(rows);
+            }
             if let Some(batch) = self.try_window_project_batch(q, bindings, now) {
                 return Ok(batch.to_rows());
             }

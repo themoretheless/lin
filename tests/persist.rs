@@ -5754,3 +5754,96 @@ fn soa_join_keeps_total_types() {
         "sorted"
     );
 }
+
+/// Aggregates after an FK join read only the columns they need from the columnar join;
+/// the result must equal the row pipeline's exactly (groups, order, value types), in
+/// memory and on cold collections. Reference: the same query with `take all` repeated,
+/// which the join aggregate path does not take.
+#[test]
+fn join_aggregates_match_row_pipeline() {
+    fn seed(db: &mut Db) {
+        db.run("col acct { id: text, region: text }\ncol tx { id: text, acct: text, amount: i64, rate: f64 }\nfk tx.acct -> acct.id")
+            .unwrap();
+        let mut src = String::from("insert acct [");
+        for i in 0..50 {
+            if i > 0 {
+                src.push(',');
+            }
+            src.push_str(&format!(r#"{{ id: "a{i}", region: "r{}" }}"#, i % 6));
+        }
+        src.push(']');
+        db.run(&src).unwrap();
+        let mut src = String::from("insert tx [");
+        for i in 0..800 {
+            if i > 0 {
+                src.push(',');
+            }
+            src.push_str(&format!(r#"{{ id: "t{i}", acct: "a{}", amount: {}"#, (i * 7) % 50, (i * 13) % 90));
+            if i % 4 != 0 {
+                src.push_str(&format!(", rate: {}.25", i % 9));
+            }
+            src.push_str(" }");
+        }
+        src.push(']');
+        db.run(&src).unwrap();
+        let mut src = String::from("insert users [");
+        for i in 0..40 {
+            if i > 0 {
+                src.push(',');
+            }
+            src.push_str(&format!(r#"{{ id: "u{i}", email: "m{}@x" }}"#, i % 5));
+        }
+        src.push(']');
+        db.run(&src).unwrap();
+        let mut src = String::from("insert orders [");
+        for i in 0..600 {
+            if i > 0 {
+                src.push(',');
+            }
+            src.push_str(&format!(r#"{{ id: "o{i}", user_id: "u{}", total: {} }}"#, (i * 3) % 40, (i * 17) % 70));
+        }
+        src.push(']');
+        db.run(&src).unwrap();
+    }
+    let dir = tmp();
+    let opts = || lin::OpenOpts {
+        sync: lin::SyncMode::Full,
+        cold: true,
+    };
+    {
+        let mut db = Db::open_with(&dir, opts()).unwrap();
+        seed(&mut db);
+        db.checkpoint().unwrap();
+        db.close().unwrap();
+    }
+    let mut cold = Db::open_with(&dir, opts()).unwrap();
+    cold.run("fk tx.acct -> acct.id").unwrap();
+    assert!(cold.store.is_disk_backed("tx"));
+    let mut hot = Db::empty();
+    seed(&mut hot);
+    let queries = [
+        "tx | join acct on acct | count by acct.region",
+        "tx | amount > 40 | join acct on acct | count by acct.region",
+        "tx | join acct on acct | count",
+        "tx | join acct on acct | sum amount by acct.region",
+        "tx | join acct on acct | avg rate by acct.region",
+        "tx | join acct on acct | min rate by acct.region",
+        "tx | join acct on acct | max amount by acct.region",
+        "tx | join acct on acct | count by acct",
+        "tx | join left acct on acct | sum rate",
+        "orders | join users on user_id | sum total by users.email",
+        "orders | total > 30 | join users on user_id | count by users.email",
+        "orders | join users on user_id | max total",
+    ];
+    let rows = |db: &mut Db, q: &str| -> Vec<String> {
+        db.run(q).unwrap().rows.iter().map(|r| format!("{r:?}")).collect()
+    };
+    for (label, db) in [("in-memory", &mut hot), ("cold", &mut cold)] {
+        for q in queries {
+            let want = rows(db, &format!("{q} | take all | take all"));
+            assert!(!want.is_empty(), "{label}: {q}");
+            assert_eq!(rows(db, q), want, "{label}: {q}");
+            assert_eq!(rows(db, &format!("{q} | take all")), want, "{label}: {q} | take all");
+        }
+    }
+}
