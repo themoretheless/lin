@@ -129,6 +129,70 @@ impl Db {
             return Ok(Some(out));
         }
 
+        // Lexical search over a cold collection: the posting lists address documents by
+        // their position in the engine's scan order (the index is built from, or checked
+        // against, that scan and dropped on any overlay write). Candidates are scored from
+        // the three text fields the score reads, fetched by `id`; only the winners are
+        // read whole. The ranking (score desc, then position) is the in-memory one.
+        if mode == SearchMode::Lex
+            && self.store.is_disk_backed(name)
+            && let Some(fts) = self.store.fts.get(name)
+            && let Some(eng) = self.store.disk_engine_read()
+        {
+            if rank_limit == Some(0) {
+                return Ok(Some(Vec::new()));
+            }
+            let candidates = fts.candidate_idxs(query);
+            let mut ids: Vec<std::sync::Arc<str>> = Vec::new();
+            if !candidates.is_empty() {
+                eng.scan_projected(name, Some(&["id"]), |row| {
+                    ids.push(
+                        row.get("id")
+                            .and_then(crate::store::Cell::text_shared)
+                            .unwrap_or_default(),
+                    );
+                    Ok(true)
+                })?;
+            }
+            if candidates.iter().all(|&i| i < ids.len()) {
+                let lex = LexQuery::new(query);
+                let mut scored: Vec<(i64, usize)> = Vec::with_capacity(candidates.len());
+                for &i in &candidates {
+                    let Some(row) =
+                        eng.get_projected_by_id(name, &ids[i], &["title", "body", "snippet"])?
+                    else {
+                        continue;
+                    };
+                    let score = lex_score_prepared(&row, &lex);
+                    if score > 0 {
+                        scored.push((score, i));
+                    }
+                }
+                scored.sort_unstable_by(|(sa, ia), (sb, ib)| sb.cmp(sa).then_with(|| ia.cmp(ib)));
+                let start = skip_n.min(scored.len());
+                let slice = &scored[start..];
+                let end = limit.map_or(slice.len(), |n| n.min(slice.len()));
+                let names = proj.map(field_names);
+                let refs: Option<Vec<&str>> =
+                    names.as_ref().map(|n| n.iter().map(String::as_str).collect());
+                let mut out = Vec::with_capacity(end);
+                for &(_, i) in &slice[..end] {
+                    let row = match &refs {
+                        Some(fs) => eng.get_projected_by_id(name, &ids[i], fs)?,
+                        None => eng.get_by_id(name, &ids[i])?,
+                    };
+                    if let Some(row) = row {
+                        out.push(match &names {
+                            Some(n) => project_fields(&row, n),
+                            None => row,
+                        });
+                    }
+                }
+                return Ok(Some(out));
+            }
+            // An index that does not line up with the scan: answer from the rows instead.
+        }
+
         // Direct projected materialization without intermediate full-Row clones!
         if let Some(fields) = proj {
             let names = field_names(fields);

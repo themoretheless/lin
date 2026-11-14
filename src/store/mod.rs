@@ -1714,6 +1714,11 @@ impl Store {
         self.collections.contains_key(name) && !self.is_disk_backed(name)
     }
 
+    /// Whether `collection` has a live full-text index.
+    pub fn fts_indexed(&self, collection: &str) -> bool {
+        self.fts.contains_key(collection)
+    }
+
     /// Whether some reader has pulled a disk-backed collection's rows into memory
     /// (see [`Self::collection`]). False for collections that are not disk-backed.
     pub fn disk_rows_materialized(&self, name: &str) -> bool {

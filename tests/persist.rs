@@ -5289,3 +5289,97 @@ fn cold_hop_resolves_targets_without_materializing() {
         assert!(!db.store.disk_rows_materialized("docs"), "a hop cursor pulled docs into memory");
     }
 }
+
+/// Lexical search over a cold collection, as a statement and as a cursor: hits are read
+/// by `id` from the engine, so the collection stays on disk, and the results match the
+/// same search over in-memory data, with and without a projection, `skip` and `take`.
+#[test]
+fn cold_lexical_search_without_materializing() {
+    use lin::Queryable;
+    fn seed(db: &mut Db) {
+        let mut src = String::from("insert docs [");
+        for i in 0..400 {
+            if i > 0 {
+                src.push(',');
+            }
+            let topic = ["wal shipping", "vector search", "zone maps", "group commit"][i % 4];
+            src.push_str(&format!(
+                r#"{{ id: "d{i}", uri: "wiki://p/{i}", title: "{topic} {i}", body: "notes on {topic} number {i}", layer: "wiki" }}"#
+            ));
+        }
+        src.push(']');
+        db.run(&src).unwrap();
+    }
+    let dir = tmp();
+    let opts = || lin::OpenOpts {
+        sync: lin::SyncMode::Full,
+        cold: true,
+    };
+    {
+        let mut db = Db::open_with(&dir, opts()).unwrap();
+        seed(&mut db);
+        db.checkpoint().unwrap();
+        db.close().unwrap();
+    }
+    let mut hot = Db::empty();
+    seed(&mut hot);
+    let ids = |rows: &[lin::Row]| -> Vec<String> {
+        let mut v: Vec<String> = rows
+            .iter()
+            .filter_map(|r| r.get("id").and_then(lin::Cell::text).map(str::to_string))
+            .collect();
+        v.sort();
+        v
+    };
+    for q in [
+        r#"docs | search lex "shipping" | take all"#,
+        r#"docs | search lex "zone maps" | { id, title } | take all"#,
+        r#"docs | search lex "nothingmatches" | take all"#,
+    ] {
+        let want = ids(&hot.run(q).unwrap().rows);
+        let mut db = Db::open_with(&dir, opts()).unwrap();
+        let handle = db.run(q).unwrap();
+        assert_eq!(ids(&handle.rows), want, "{q}");
+        if q.contains("{ id, title }") {
+            let keys: Vec<&str> = handle.rows[0].keys().map(String::as_str).collect();
+            assert_eq!(keys, ["id", "title"], "{q}");
+        }
+        drop(handle);
+        assert!(!db.store.disk_rows_materialized("docs"), "{q}: docs pulled into memory");
+    }
+    // Ranked and limited: the same number of rows, all of them real hits.
+    {
+        let mut db = Db::open_with(&dir, opts()).unwrap();
+        let q = r#"docs | search lex "shipping" | skip 3 | take 10"#;
+        let in_order = |rows: &[lin::Row]| -> Vec<String> {
+            rows.iter()
+                .filter_map(|r| r.get("id").and_then(lin::Cell::text).map(str::to_string))
+                .collect()
+        };
+        let got = in_order(&db.run(q).unwrap().rows);
+        assert_eq!(got.len(), 10);
+        assert_eq!(got, in_order(&hot.run(q).unwrap().rows), "ranking differs from in-memory");
+        assert!(!db.store.disk_rows_materialized("docs"));
+    }
+    // The cursor takes the same path.
+    {
+        let db = Db::open_with(&dir, opts()).unwrap();
+        let rows: Vec<lin::Row> = Queryable::from("docs")
+            .search_lex("shipping")
+            .take_all()
+            .cursor(&db)
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(ids(&rows), ids(&hot.run(r#"docs | search lex "shipping" | take all"#).unwrap().rows));
+        assert!(!db.store.disk_rows_materialized("docs"), "a lexical cursor pulled docs into memory");
+    }
+    // After a write the index is rebuilt from the rows; the answer must stay correct.
+    {
+        let mut db = Db::open_with(&dir, opts()).unwrap();
+        db.run(r#"insert docs { id: "fresh", uri: "raw://fresh", title: "wal shipping fresh", body: "fresh shipping note", layer: "raw" }"#).unwrap();
+        hot.run(r#"insert docs { id: "fresh", uri: "raw://fresh", title: "wal shipping fresh", body: "fresh shipping note", layer: "raw" }"#).unwrap();
+        let q = r#"docs | search lex "shipping" | take all"#;
+        assert_eq!(ids(&db.run(q).unwrap().rows), ids(&hot.run(q).unwrap().rows));
+    }
+}
