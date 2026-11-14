@@ -917,9 +917,12 @@ impl Db {
         let store_empty = col_len == 0;
         let has_fks = self.catalog.fks.iter().any(|fk| fk.from_col == collection);
         let is_docs = collection == "docs";
-        let needs_id = records
-            .first()
-            .is_none_or(|r| !r.fields.iter().any(|(k, _)| k == "id"));
+        // Any record without an explicit id gets a generated one, wherever it sits in the
+        // batch (deciding from the first record left later id-less rows without an id).
+        let needs_id = records.is_empty()
+            || records
+                .iter()
+                .any(|r| !r.fields.iter().any(|(k, _)| k == "id"));
 
         let first_record = records.first();
         let id_rec_pos = first_record.and_then(|r| r.fields.iter().position(|(k, _)| k == "id"));
