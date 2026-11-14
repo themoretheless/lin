@@ -649,6 +649,119 @@ impl Db {
         Some(result)
     }
 
+    /// `filter? | sort* | project | sort* | skip* | take` (explicit take) without rows:
+    /// the projected columns plus any key column the projection drops come from the
+    /// columnar filter path, each `sort` permutes row positions exactly as
+    /// `sort_rows_top_k` permutes rows (same top-k lookahead, same order of equal keys),
+    /// and only the rows that survive `skip` / `take` are gathered.
+    pub(super) fn try_sort_project_batch(
+        &self,
+        q: &Query,
+        bindings: &BTreeMap<String, Vec<Row>>,
+        now: i64,
+    ) -> Option<RecordBatch> {
+        #[cfg(feature = "gpu")]
+        if self.gpu.is_some() {
+            return None;
+        }
+        let mut filter: Option<&Pred> = None;
+        let mut fields: Option<&[Field]> = None;
+        let mut sorts: Vec<(&Field, bool)> = Vec::new();
+        let mut skip_n: usize = 0;
+        let mut take: Option<Option<i64>> = None;
+        for (i, step) in q.steps.iter().enumerate() {
+            match step {
+                Step::Filter(p) if i == 0 => filter = Some(p),
+                Step::Sort { field, desc } if skip_n == 0 && take.is_none() => {
+                    field.leaf()?;
+                    sorts.push((field, *desc));
+                }
+                Step::Project(f) if fields.is_none() && skip_n == 0 && take.is_none() => {
+                    if f.iter().any(|x| x.leaf().is_none()) {
+                        return None;
+                    }
+                    fields = Some(f.as_slice());
+                }
+                Step::Skip { n } if fields.is_some() && take.is_none() => {
+                    skip_n = skip_n.saturating_add((*n).max(0) as usize);
+                }
+                Step::Take { n } if fields.is_some() && take.is_none() => take = Some(*n),
+                _ => return None,
+            }
+        }
+        let fields = fields?;
+        let take = take?;
+        if sorts.is_empty() {
+            return None;
+        }
+        // A sort after the projection sees only projected fields; one before it may use a
+        // field the projection drops, read as a hidden column.
+        let proj_at = q.steps.iter().position(|s| matches!(s, Step::Project(_)))?;
+        let names = field_names(fields);
+        let mut base: Vec<Field> = fields.to_vec();
+        for (i, step) in q.steps.iter().enumerate() {
+            if let Step::Sort { field, .. } = step {
+                let leaf = field.leaf()?;
+                if i > proj_at {
+                    if !names.iter().any(|n| n == leaf) {
+                        return None;
+                    }
+                } else if !base.iter().any(|b| b.leaf() == Some(leaf)) {
+                    base.push(field.clone());
+                }
+            }
+        }
+        let mut steps = Vec::with_capacity(3);
+        if let Some(p) = filter {
+            steps.push(Step::Filter(p.clone()));
+        }
+        steps.push(Step::Project(base.clone()));
+        steps.push(Step::Take { n: None });
+        let base_q = Query {
+            source: q.source.clone(),
+            steps,
+            explain: None,
+            ignore_filter: q.ignore_filter,
+        };
+        let batch = self.try_filter_project_batch(&base_q, bindings, now)?;
+        let cols: Vec<Vec<Cell>> = batch
+            .cols
+            .into_iter()
+            .map(crate::batch::Column::into_cells)
+            .collect();
+        let col_of = |leaf: &str| base.iter().position(|b| b.leaf() == Some(leaf));
+        let mut order: Vec<usize> = (0..cols.first().map_or(0, Vec::len)).collect();
+        let last_sort = sorts.len() - 1;
+        for (k, (field, desc)) in sorts.iter().enumerate() {
+            // Only the last sort sees the `take` ahead (an intervening sort ends the
+            // lookahead in the row pipeline too).
+            let top_k = match take {
+                Some(t) if k == last_sort => Some(skip_n.saturating_add(t.max(0) as usize)),
+                _ => None,
+            };
+            let c = col_of(field.leaf()?)?;
+            let keys: Vec<Cell> = order.iter().map(|&i| cols[c][i].clone_for_borrow()).collect();
+            order = sort_positions_top_k(&keys, *desc, top_k)
+                .into_iter()
+                .map(|p| order[p])
+                .collect();
+        }
+        let start = skip_n.min(order.len());
+        let mut slice = &order[start..];
+        if let Some(t) = take {
+            slice = &slice[..slice.len().min(t.max(0) as usize)];
+        }
+        let names_arc: Arc<[String]> = names.into();
+        let mut out = RecordBatch::with_capacity(names_arc, slice.len());
+        for (ci, f) in fields.iter().enumerate() {
+            let c = col_of(f.leaf()?)?;
+            for &row in slice {
+                out.cols[ci].push(cols[c][row].clone_for_borrow());
+            }
+        }
+        Some(out)
+    }
+
     /// Columnar filter? + project + skip*/take? (no join). Prefer [`Self::run_prepared_batch`].
     pub(super) fn try_filter_project_batch(
         &self,
@@ -1877,5 +1990,103 @@ impl Db {
             }
         }
         Ok(out)
+    }
+}
+
+/// Positions of `keys` in the order [`super::eval::sort_rows_top_k`] would put rows with
+/// these keys, equal keys included. The standard sorts pick their strategy by element
+/// type, so equal keys are only placed the same way when the same element type is
+/// sorted with the same comparator: up to 32 rows this sorts small `Row`s with
+/// `sort_rows_top_k` itself, above that the `(key, position)` pairs it sorts there.
+pub(crate) fn sort_positions_top_k(keys: &[Cell], desc: bool, top_k: Option<usize>) -> Vec<usize> {
+    use super::eval::cmp_sort;
+    let n = keys.len();
+    if n <= 32 {
+        let mut rows: Vec<Row> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| Row::from([("k", k.clone_for_borrow()), ("i", Cell::Int(i as i64))]))
+            .collect();
+        super::eval::sort_rows_top_k(&mut rows, &Field::name("k"), desc, top_k);
+        return rows
+            .iter()
+            .map(|r| match r.get("i") {
+                Some(Cell::Int(i)) => *i as usize,
+                _ => unreachable!("position column"),
+            })
+            .collect();
+    }
+    if top_k == Some(0) {
+        return Vec::new();
+    }
+    let mut decorated: Vec<(Cell, usize)> = keys
+        .iter()
+        .enumerate()
+        .map(|(i, k)| (k.clone_for_borrow(), i))
+        .collect();
+    let cmp_keys = |a: &(Cell, usize), b: &(Cell, usize)| {
+        let ord = cmp_sort(&a.0, &b.0);
+        let ord = if desc { ord.reverse() } else { ord };
+        ord.then_with(|| a.1.cmp(&b.1))
+    };
+    if let Some(limit) = top_k
+        && limit < decorated.len()
+    {
+        decorated.select_nth_unstable_by(limit - 1, cmp_keys);
+        decorated.truncate(limit);
+    }
+    decorated.sort_by(cmp_keys);
+    decorated.into_iter().map(|(_, i)| i).collect()
+}
+
+#[cfg(test)]
+mod sort_positions_tests {
+    use super::sort_positions_top_k;
+    use crate::ast::Field;
+    use crate::store::{Cell, Row};
+
+    /// The position permutation must reproduce the row sort exactly, ties included,
+    /// on both sides of the 32-row switch and for every kind of `take`.
+    #[test]
+    fn matches_row_sort_including_ties() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for n in 0..90usize {
+            for round in 0..6 {
+                let keys: Vec<Cell> = (0..n)
+                    .map(|_| match next() % 7 {
+                        0 => Cell::Null,
+                        1 => Cell::Float(f64::NAN),
+                        2 | 3 => Cell::Int((next() % 5) as i64),
+                        4 => Cell::Float((next() % 5) as f64 + 0.5),
+                        _ => Cell::from_text(["a", "b", "c"][(next() % 3) as usize]),
+                    })
+                    .collect();
+                for desc in [false, true] {
+                    for top_k in [None, Some(0), Some(1), Some(3), Some(n / 2 + 1), Some(n + 5)] {
+                        let mut rows: Vec<Row> = keys
+                            .iter()
+                            .enumerate()
+                            .map(|(i, k)| Row::from([("k", k.clone()), ("i", Cell::Int(i as i64))]))
+                            .collect();
+                        super::super::eval::sort_rows_top_k(&mut rows, &Field::name("k"), desc, top_k);
+                        let want: Vec<usize> = rows
+                            .iter()
+                            .map(|r| match r.get("i") {
+                                Some(Cell::Int(i)) => *i as usize,
+                                other => panic!("{other:?}"),
+                            })
+                            .collect();
+                        let got = sort_positions_top_k(&keys, desc, top_k);
+                        assert_eq!(got, want, "n={n} round={round} desc={desc} top_k={top_k:?}");
+                    }
+                }
+            }
+        }
     }
 }

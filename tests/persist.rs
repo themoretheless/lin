@@ -5549,3 +5549,76 @@ fn memory_insert_batch_matches_insert_statement() {
     let mut by_stmt = Db::open(&dir_stmt).unwrap();
     assert_eq!(snapshot(&mut by_batch), snapshot(&mut by_stmt));
 }
+
+/// `filter? | sort | pick | sort | skip | take` over in-memory and cold collections runs
+/// on columns; the answer must equal the row pipeline's, order of equal keys included.
+/// The reference is the same query with its `take` repeated, which the columnar path
+/// does not take and the row pipeline answers identically.
+#[test]
+fn columnar_sort_matches_row_pipeline() {
+    fn seed(db: &mut Db) {
+        db.run("col ev { id: text, grp: text, k: i64, v: f64, tag: text }").unwrap();
+        let mut src = String::from("insert ev [");
+        for i in 0..600 {
+            if i > 0 {
+                src.push(',');
+            }
+            src.push_str(&format!(r#"{{ id: "e{i}", grp: "g{}", k: {}"#, i % 7, (i * 37) % 11));
+            if i % 5 != 0 {
+                src.push_str(&format!(", v: {}.5", (i * 13) % 40));
+            }
+            if i % 3 == 0 {
+                src.push_str(&format!(r#", tag: "t{}""#, i % 4));
+            }
+            src.push_str(" }");
+        }
+        src.push(']');
+        db.run(&src).unwrap();
+    }
+    let dir = tmp();
+    let opts = || lin::OpenOpts {
+        sync: lin::SyncMode::Full,
+        cold: true,
+    };
+    {
+        let mut db = Db::open_with(&dir, opts()).unwrap();
+        seed(&mut db);
+        db.checkpoint().unwrap();
+        db.close().unwrap();
+    }
+    let mut cold = Db::open_with(&dir, opts()).unwrap();
+    assert!(cold.store.is_disk_backed("ev"));
+    let mut hot = Db::empty();
+    seed(&mut hot);
+    let queries = [
+        ("ev | sort k | { id, k } | take 10", " | take 10"),
+        ("ev | sort k desc | { id, k, v } | skip 7 | take 25", " | take 25"),
+        ("ev | k >= 3 | sort v desc | { id, v } | take all", " | take all"),
+        // Sort key dropped by the projection.
+        ("ev | sort v | { id, grp } | take 40", " | take 40"),
+        // Two sorts: the second is primary, equal keys keep the first sort's order.
+        ("ev | sort tag | { id, grp, tag } | sort grp desc | take 60", " | take 60"),
+        ("ev | grp == \"g2\" | sort tag desc | { id, tag } | skip 3 | take 5", " | take 5"),
+        // Fewer rows than the 32-row switch, with ties.
+        ("ev | k == 4 | grp == \"g1\" | sort v | { id, v } | take 3", " | take 3"),
+        ("ev | sort k | { id } | take 0", " | take 0"),
+    ];
+    let cells = |db: &mut Db, q: &str| -> Vec<String> {
+        db.run(q)
+            .unwrap()
+            .rows
+            .iter()
+            .map(|r| format!("{r:?}"))
+            .collect()
+    };
+    for (label, db) in [("in-memory", &mut hot), ("cold", &mut cold)] {
+        for (q, again) in queries {
+            let got = cells(db, q);
+            let want = cells(db, &format!("{q}{again}"));
+            assert_eq!(got, want, "{label}: {q}");
+            let batch = db.run_batch(q).unwrap().to_rows();
+            let batch: Vec<String> = batch.iter().map(|r| format!("{r:?}")).collect();
+            assert_eq!(batch, want, "{label}: run_batch {q}");
+        }
+    }
+}

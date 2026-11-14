@@ -2920,6 +2920,11 @@ impl Db {
             {
                 return Ok(batch);
             }
+            if !self.uses_gpu_filter(&q)
+                && let Some(batch) = self.try_sort_project_batch(&q, &bindings, now)
+            {
+                return Ok(batch);
+            }
         }
         let h = self.run_prepared(prepared)?;
         Ok(match &prepared.stmts[..] {
@@ -3551,6 +3556,9 @@ impl Db {
                 return Ok(rows);
             }
             if let Some(batch) = self.try_window_project_batch(q, bindings, now) {
+                return Ok(batch.to_rows());
+            }
+            if let Some(batch) = self.try_sort_project_batch(q, bindings, now) {
                 return Ok(batch.to_rows());
             }
         }
