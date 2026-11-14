@@ -2,7 +2,7 @@
 
 Срез: **2026-11-14**, коммит `58444cf6e` (релиз 0.7.1) плюс незакоммиченное рабочее дерево. Единственный файл с планом в репозитории: в нём только несделанное. Реализованное описано в [CHANGELOG](../CHANGELOG.md), в документах `docs/` по отдельным механизмам и в отчётах `benches/results/`.
 
-Открыто **1601** пунктов backlog (часть II) и 12 пунктов части I: 10 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
+Открыто **1599** пунктов backlog (часть II) и 12 пунктов части I: 10 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровывались, поэтому в них есть пропуски: закрытые пункты удалены. Пункты части II со статусами `candidate` и `qualification` по коду поштучно не сверялись: перед взятием пункта сначала проверить, не покрыт ли он уже.
 
@@ -194,9 +194,9 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 Для каждой строки итоговый критерий — её конкретный результат плюс указанный gate. Если критерий требует недоступной платформы/endpoint, статус остаётся непроверенным; mock/compile не заменяет live qualification.
 
-### Приоритетный список — 1601 пунктов
+### Приоритетный список — 1599 пунктов
 
-Количества: P1: 3, P2: 1024, P3: 574; статусы: blocked_external: 1, candidate: 934, qualification: 666.
+Количества: P1: 3, P2: 1022, P3: 574; статусы: blocked_external: 1, candidate: 934, qualification: 664.
 
 #### P1: 3 пунктов
 
@@ -206,7 +206,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 2 | LIN-0002 | [D01](#d01) | Закрыть durable 1k SQLite gap | PERF | qualification | M | G-PERF |
 | 22 | LIN-0006 | [D01](#d01) | Получить тестовый endpoint Kusto | OPS | blocked_external | M | G-OPS |
 
-#### P2: 1024 пунктов
+#### P2: 1022 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -401,11 +401,9 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 408 | LIN-0374 | [D10](#d10) | Измерить bounds scratch lifetime | PERF | candidate | M | G-PERF |
 | 409 | LIN-0375 | [D10](#d10) | Измерить seek_each allocation count | PERF | candidate | M | G-PERF |
 | 410 | LIN-0376 | [D10](#d10) | Измерить extend_into buffer reuse | PERF | candidate | M | G-PERF |
-| 418 | LIN-0384 | [D10](#d10) | Проверить empty index definition | CORRECTNESS | qualification | S | G-CORRECT |
 | 419 | LIN-0385 | [D10](#d10) | Спроектировать covering index payload | FEATURE | candidate | L | G-FEATURE |
 | 421 | LIN-0387 | [D10](#d10) | Спроектировать expression index contract | FEATURE | candidate | L | G-FEATURE |
 | 422 | LIN-0388 | [D10](#d10) | Спроектировать index visibility generations | FEATURE | candidate | L | G-FEATURE |
-| 423 | LIN-0389 | [D10](#d10) | Проверить index rebuild rollback | CORRECTNESS | qualification | S | G-CORRECT |
 | 424 | LIN-0390 | [D10](#d10) | Проверить index drop active cursor | CORRECTNESS | qualification | S | G-CORRECT |
 | 425 | LIN-0391 | [D10](#d10) | Проверить index build cancellation | CORRECTNESS | qualification | S | G-CORRECT |
 | 426 | LIN-0392 | [D10](#d10) | Проверить index schema mutation safety | CORRECTNESS | qualification | S | G-CORRECT |
