@@ -1106,7 +1106,7 @@ impl MmapFixedCol {
         &self,
         seg_all_live: bool,
         mut is_live: impl FnMut(u32) -> bool,
-    ) -> Option<f64> {
+    ) -> Option<crate::exact_sum::ExactSum> {
         let n = (self.row_count as usize)
             .min(self.nulls.len())
             .min(self.values.len() / 8);
@@ -1133,35 +1133,36 @@ impl MmapFixedCol {
                             for &v in chunks.remainder() {
                                 s0 += v;
                             }
-                            return Some((s0 + s1) + (s2 + s3));
+                            let mut out = crate::exact_sum::ExactSum::default();
+                            out.add_f64((s0 + s1) + (s2 + s3));
+                            return Some(out);
                         }
                     }
                     for rid in 0..n {
                         acc += self.read_f64(rid as u32);
                     }
-                    return Some(acc);
+                    let mut out = crate::exact_sum::ExactSum::default();
+                    out.add_f64(acc);
+                    return Some(out);
                 }
                 for rid in 0..n {
                     if self.nulls[rid] == 0 && (seg_all_live || is_live(rid as u32)) {
                         acc += self.read_f64(rid as u32);
                     }
                 }
-                Some(acc)
+                let mut out = crate::exact_sum::ExactSum::default();
+                out.add_f64(acc);
+                Some(out)
             }
             DiskColKind::Int64 => {
-                let mut acc = 0.0f64;
-                if seg_all_live && self.nulls[..n].iter().all(|&b| b == 0) {
-                    for rid in 0..n {
-                        acc += self.read_i64(rid as u32) as f64;
-                    }
-                    return Some(acc);
-                }
+                // i128 so totals through or beyond the i64 range stay exact until the end.
+                let mut out = crate::exact_sum::ExactSum::default();
                 for rid in 0..n {
                     if self.nulls[rid] == 0 && (seg_all_live || is_live(rid as u32)) {
-                        acc += self.read_i64(rid as u32) as f64;
+                        out.add_i64(self.read_i64(rid as u32));
                     }
                 }
-                Some(acc)
+                Some(out)
             }
             _ => None,
         }

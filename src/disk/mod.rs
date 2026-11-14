@@ -2324,10 +2324,10 @@ impl DiskEngine {
     /// Columnar `SUM(field)` across `MmapFixedCol` segments and live `MemTable` rows.
     pub fn sum_f64_col(&self, table: &str, field: &str) -> Result<Option<f64>, Error> {
         // Per-segment sums are added in segment order, exactly as the sequential scan does.
-        let partials = self.map_segments(table, |seg| -> Result<Option<f64>, Error> {
+        let partials = self.map_segments(table, |seg| -> Result<Option<crate::exact_sum::ExactSum>, Error> {
             let Some(fc) = seg.fixed_col(field) else {
                 return Ok(if seg.col(field).is_none() {
-                    Some(0.0)
+                    Some(crate::exact_sum::ExactSum::default())
                 } else {
                     None
                 });
@@ -2336,24 +2336,21 @@ impl DiskEngine {
             let seg_all_live = self.tombstones.dead_count(sid) == 0;
             Ok(fc.sum_f64_live(seg_all_live, |rid| !self.tombstones.is_dead(sid, rid)))
         })?;
-        let mut total = 0.0f64;
+        let mut total = crate::exact_sum::ExactSum::default();
         for p in partials {
             let Some(seg_sum) = p else {
                 return Ok(None);
             };
-            total += seg_sum;
+            total.merge(seg_sum);
         }
         if let Some(mt) = self.memtables.get(table) {
             for &idx in mt.by_id.values() {
                 if !mt.dead_mem.contains(&idx) {
-                    total += mt.rows[idx]
-                        .get(field)
-                        .and_then(Cell::as_f64)
-                        .unwrap_or(0.0);
+                    total.add_cell(mt.rows[idx].get(field));
                 }
             }
         }
-        Ok(Some(total))
+        Ok(Some(total.value()))
     }
 
     /// Columnar `SUM(val_field) GROUP BY by_field` using `MmapDictCol` ordinal indexing
@@ -2444,7 +2441,7 @@ impl DiskEngine {
                 None => {
                     let seg_sum = fc
                         .sum_f64_live(all_live, |rid| !self.tombstones.is_dead(sid, rid))
-                        .unwrap_or(0.0);
+                        .map_or(0.0, crate::exact_sum::ExactSum::value);
                     let live_cnt = seg
                         .meta
                         .row_count

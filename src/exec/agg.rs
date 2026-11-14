@@ -127,11 +127,12 @@ pub(crate) fn spill_agg_sum<'a>(
                 .as_ref()
                 .and_then(|k| r.get(k).map(Cell::clone_for_borrow))
                 .unwrap_or(Cell::Null);
-            let n = r.get(&fk).and_then(Cell::as_f64).unwrap_or(0.0);
+            let mut n = crate::exact_sum::ExactSum::default();
+            n.add_cell(r.get(&fk));
             (cell, n)
         },
-        || 0.0f64,
-        |acc, n| *acc += n,
+        crate::exact_sum::ExactSum::default,
+        |acc, n| acc.merge(n),
     )?;
     let group_col = bk.as_deref().unwrap_or("");
     Ok(entries
@@ -141,7 +142,7 @@ pub(crate) fn spill_agg_sum<'a>(
             if by.is_some() {
                 row.insert(group_col.to_string(), cell);
             }
-            row.insert(fk.clone(), Cell::Float(n));
+            row.insert(fk.clone(), Cell::Float(n.value()));
             row
         })
         .collect())
@@ -553,62 +554,67 @@ pub(crate) fn agg_sum_filtered(
 ) -> Result<Vec<Row>, Error> {
     let fk = field.as_str();
     let Some(by) = by else {
-        let sum_rows = |rows: &[Row]| -> f64 {
-            let mut total = 0.0f64;
+        let sum_rows = |rows: &[Row]| -> crate::exact_sum::ExactSum {
+            let mut total = crate::exact_sum::ExactSum::default();
             let mut flt = filter.map(PredSlots::new);
             let mut value_slot = FieldSlot::new(&fk);
             for r in rows {
                 if flt.as_mut().is_none_or(|f| f.eval(r, now)) {
-                    total += value_slot.get(r).and_then(Cell::as_f64).unwrap_or(0.0);
+                    total.add_cell(value_slot.get(r));
                 }
             }
             total
         };
         #[cfg(feature = "parallel")]
-        let total: f64 = if rows.len() >= PAR_AGG_MIN_ROWS {
+        let total = if rows.len() >= PAR_AGG_MIN_ROWS {
             use rayon::prelude::*;
             // Chunk sums are added in chunk order: the result is deterministic.
-            let partials: Vec<f64> = rows.par_chunks(PAR_AGG_CHUNK_ROWS).map(sum_rows).collect();
-            partials.into_iter().sum()
+            let partials: Vec<crate::exact_sum::ExactSum> =
+                rows.par_chunks(PAR_AGG_CHUNK_ROWS).map(sum_rows).collect();
+            let mut total = crate::exact_sum::ExactSum::default();
+            for p in partials {
+                total.merge(p);
+            }
+            total
         } else {
             sum_rows(rows)
         };
         #[cfg(not(feature = "parallel"))]
         let total = sum_rows(rows);
         let mut row = crate::store::acquire_row();
-        row.insert(fk, Cell::Float(total));
+        row.insert(fk, Cell::Float(total.value()));
         return Ok(vec![row]);
     };
     let bk = by.as_str();
-    let sum_rows_out = |map: FxHashMap<Cell, f64>| -> Vec<Row> {
-        let mut entries: Vec<(Cell, f64)> = map.into_iter().collect();
+    let sum_rows_out = |map: FxHashMap<Cell, crate::exact_sum::ExactSum>| -> Vec<Row> {
+        let mut entries: Vec<(Cell, crate::exact_sum::ExactSum)> = map.into_iter().collect();
         entries.sort_unstable_by(|(a, _), (b, _)| cmp_sort(a, b));
         entries
             .into_iter()
             .map(|(cell, n)| {
                 let mut row = crate::store::acquire_row();
                 row.insert(bk.clone(), cell);
-                row.insert(fk.clone(), Cell::Float(n));
+                row.insert(fk.clone(), Cell::Float(n.value()));
                 row
             })
             .collect()
     };
     #[cfg(feature = "parallel")]
     if rows.len() >= PAR_AGG_MIN_ROWS
-        && let Some(map) = par_group_fold::<f64>(
+        && let Some(map) = par_group_fold::<crate::exact_sum::ExactSum>(
             rows,
             filter,
             now,
             &bk,
             Some(&fk),
             max_bytes,
-            |n, v| *n += v.and_then(Cell::as_f64).unwrap_or(0.0),
-            |n, m| *n += m,
+            |n, v| n.add_cell(v),
+            |n, m| n.merge(m),
         )
     {
         return Ok(sum_rows_out(map));
     }
-    let mut map: FxHashMap<Cell, f64> = FxHashMap::default();
+    let mut map: FxHashMap<Cell, crate::exact_sum::ExactSum> = FxHashMap::default();
     let mut state_bytes = 0usize;
     let mut flt = filter.map(PredSlots::new);
     let mut key_slot = FieldSlot::new(&bk);
@@ -638,8 +644,7 @@ pub(crate) fn agg_sum_filtered(
                 )));
             }
         }
-        let n = value_slot.get(r).and_then(Cell::as_f64).unwrap_or(0.0);
-        *map.entry(cell).or_insert(0.0) += n;
+        map.entry(cell).or_default().add_cell(value_slot.get(r));
     }
     Ok(sum_rows_out(map))
 }
@@ -1626,16 +1631,16 @@ impl Db {
             match &plan.kind {
                 AggKind::Sum { field, by: None } => {
                     let fk = field.as_str();
-                    let mut total = 0.0f64;
+                    let mut total = crate::exact_sum::ExactSum::default();
                     for i in idxs {
                         if let Some(r) = col.get(i)
                             && pred_opt.is_none_or(|p| eval_pred(p, r, now))
                         {
-                            total += r.get(&fk).and_then(Cell::as_f64).unwrap_or(0.0);
+                            total.add_cell(r.get(&fk));
                         }
                     }
                     let mut row = crate::store::acquire_row();
-                    row.insert(fk, Cell::Float(total));
+                    row.insert(fk, Cell::Float(total.value()));
                     return Ok(vec![row]);
                 }
                 AggKind::Avg { field, by: None } => {
