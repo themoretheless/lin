@@ -2,7 +2,7 @@
 
 Срез: **2026-11-14**, коммит `58444cf6e` (релиз 0.7.1) плюс незакоммиченное рабочее дерево. Единственный файл с планом в репозитории: в нём только несделанное. Реализованное описано в [CHANGELOG](../CHANGELOG.md), в документах `docs/` по отдельным механизмам и в отчётах `benches/results/`.
 
-Открыто **1620** пунктов backlog (часть II) и 12 пунктов части I: 10 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
+Открыто **1616** пунктов backlog (часть II) и 12 пунктов части I: 10 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровывались, поэтому в них есть пропуски: закрытые пункты удалены. Пункты части II со статусами `candidate` и `qualification` по коду поштучно не сверялись: перед взятием пункта сначала проверить, не покрыт ли он уже.
 
@@ -120,6 +120,8 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 ### 8. Известные ограничения без плана исправления
 
+- Файлы сегментов холодного уровня не несут контрольных сумм: обнулённые или испорченные байты внутри колонки читаются молча как другие значения (`tests/cold_corruption_qualification.rs`: из 96 повреждённых копий 50 дают ошибку, остальные — именно такие случаи). Отсутствие и обрезка файлов обнаруживаются. Решение: CRC32C на файл колонки в манифесте сегмента с подъёмом `DISK_FORMAT_VERSION`.
+
 - Базы, записанные до исправления 2026-11-14 с `fk` или `guard` в хеше каталога, не открываются (`catalog_hash mismatch`). Нужен либо инструмент пересчёта хеша, либо решение не поддерживать такие базы.
 - Исправления потери фактов и отказа открытия после `col` и сбоя (CHANGELOG, Unreleased) не проверены запуском бинарника релиза 0.7.1: по коду ошибка там та же, но базы, записанные им, отдельно не тестировались.
 
@@ -192,9 +194,9 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 Для каждой строки итоговый критерий — её конкретный результат плюс указанный gate. Если критерий требует недоступной платформы/endpoint, статус остаётся непроверенным; mock/compile не заменяет live qualification.
 
-### Приоритетный список — 1620 пунктов
+### Приоритетный список — 1616 пунктов
 
-Количества: P1: 3, P2: 1040, P3: 577; статусы: blocked_external: 1, candidate: 934, qualification: 685.
+Количества: P1: 3, P2: 1036, P3: 577; статусы: blocked_external: 1, candidate: 934, qualification: 681.
 
 #### P1: 3 пунктов
 
@@ -204,7 +206,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 2 | LIN-0002 | [D01](#d01) | Закрыть durable 1k SQLite gap | PERF | qualification | M | G-PERF |
 | 22 | LIN-0006 | [D01](#d01) | Получить тестовый endpoint Kusto | OPS | blocked_external | M | G-OPS |
 
-#### P2: 1040 пунктов
+#### P2: 1036 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -874,7 +876,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 997 | LIN-1244 | [D32](#d32) | Профилировать cold index rebuilding | PERF | candidate | M | G-PERF |
 | 998 | LIN-1245 | [D32](#d32) | Проверить mmap lifetime pinning | CORRECTNESS | qualification | S | G-CORRECT |
 | 999 | LIN-1246 | [D32](#d32) | Проверить file replacement mapped readers | CORRECTNESS | qualification | S | G-CORRECT |
-| 1000 | LIN-1247 | [D32](#d32) | Проверить mmap truncation handling | CORRECTNESS | qualification | S | G-CORRECT |
 | 1001 | LIN-1248 | [D32](#d32) | Проверить cold buffer alias lifetime | CORRECTNESS | qualification | S | G-CORRECT |
 | 1002 | LIN-1249 | [D32](#d32) | Измерить sequential madvise policy | PERF | candidate | M | G-PERF |
 | 1003 | LIN-1250 | [D32](#d32) | Измерить random madvise policy | PERF | candidate | M | G-PERF |
@@ -882,9 +883,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 1005 | LIN-1252 | [D32](#d32) | Измерить page-aligned section layout | PERF | candidate | M | G-PERF |
 | 1008 | LIN-1255 | [D32](#d32) | Спроектировать hot/cold tier thresholds | FEATURE | candidate | L | G-FEATURE |
 | 1009 | LIN-1256 | [D32](#d32) | Спроектировать cold section checksums | FEATURE | candidate | L | G-FEATURE |
-| 1010 | LIN-1257 | [D32](#d32) | Проверить corrupted cold offsets | CORRECTNESS | qualification | S | G-CORRECT |
-| 1011 | LIN-1258 | [D32](#d32) | Проверить oversized cold sections | CORRECTNESS | qualification | S | G-CORRECT |
-| 1012 | LIN-1259 | [D32](#d32) | Проверить missing cold backing file | CORRECTNESS | qualification | S | G-CORRECT |
 | 1013 | LIN-1260 | [D32](#d32) | Проверить cold file permission errors | CORRECTNESS | qualification | S | G-CORRECT |
 | 1014 | LIN-1261 | [D32](#d32) | Измерить dictionary cold strings | PERF | candidate | M | G-PERF |
 | 1015 | LIN-1262 | [D32](#d32) | Измерить delta-encoded cold integers | PERF | candidate | M | G-PERF |

@@ -521,8 +521,24 @@ impl Store {
         for name in store.extra_collections.keys() {
             store.collections.entry(name.clone()).or_default();
         }
-        if !s.cold_collections.is_empty() && is_disk_dir(dir) {
+        // The snapshot holds no rows for its cold collections: they must come from the
+        // disk tier. Treating a missing manifest or table as an empty collection would
+        // lose the data silently, and the next checkpoint would make that permanent.
+        if !s.cold_collections.is_empty() && !is_disk_dir(dir) {
+            return Err(Error::runtime(format!(
+                "snapshot lists cold collections {:?} but the disk manifest is missing in '{}'",
+                s.cold_collections,
+                dir.display()
+            )));
+        }
+        if !s.cold_collections.is_empty() {
             let eng = DiskEngine::open_read_only(dir)?;
+            if let Some(missing) = s.cold_collections.iter().find(|name| !eng.has_table(name)) {
+                return Err(Error::runtime(format!(
+                    "cold collection {missing} is missing from the disk tier in '{}'",
+                    dir.display()
+                )));
+            }
             let mut tables = BTreeMap::new();
             for name in &s.cold_collections {
                 if eng.has_table(name) {

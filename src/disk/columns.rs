@@ -52,11 +52,46 @@ impl MmapTextCol {
         let block_offsets = unsafe { MmapOptions::new().map(&boff_f) }.map_err(io_err)?;
         let blocks_data = unsafe { MmapOptions::new().map(&bdat_f) }.map_err(io_err)?;
 
+        // A short file would otherwise read as missing values for the rows past its end.
+        let rows = row_count as usize;
+        if row_loc.len() < rows.saturating_mul(16) {
+            return Err(io_err(format!("corrupt cold column {col_name}: row index shorter than {rows} rows")));
+        }
+        if rows > 0 && (block_offsets.len() < 8 || block_offsets.len() % 8 != 0) {
+            return Err(io_err(format!("corrupt cold column {col_name}: bad block offsets")));
+        }
+        if let Some(last) = block_offsets.len().checked_sub(8)
+            && block_offsets.len() >= 8
+        {
+            let end = u64::from_le_bytes(block_offsets[last..last + 8].try_into().unwrap_or([0; 8]));
+            if end > blocks_data.len() as u64 {
+                return Err(io_err(format!("corrupt cold column {col_name}: block data shorter than its offsets")));
+            }
+        }
         let block_count = if block_offsets.len() >= 8 {
             ((block_offsets.len() / 8) - 1) as u32
         } else {
             0
         };
+        // Rows fill blocks in order, so the last stored row names the highest block; it
+        // must exist (a truncated offsets file would otherwise read as missing values).
+        for row in (0..rows).rev() {
+            let base = row * 16;
+            let flags = u32::from_le_bytes(row_loc[base + 12..base + 16].try_into().unwrap_or([1; 4]));
+            if flags != 0 {
+                continue;
+            }
+            let block = u32::from_le_bytes(row_loc[base..base + 4].try_into().unwrap_or([0; 4]));
+            let len = u32::from_le_bytes(row_loc[base + 8..base + 12].try_into().unwrap_or([0; 4]));
+            if len > 0 && block >= block_count {
+                return Err(io_err(format!(
+                    "corrupt cold column {col_name}: row {row} refers to block {block} of {block_count}"
+                )));
+            }
+            if len > 0 {
+                break;
+            }
+        }
 
         let cache_shards = std::array::from_fn(|_| {
             let mut slots = Vec::with_capacity(BLOCK_CACHE_SLOTS_PER_SHARD);
@@ -361,6 +396,9 @@ impl MmapDictCol {
         let dstr = unsafe { MmapOptions::new().map(&dstr_f) }.map_err(io_err)?;
         let doff = unsafe { MmapOptions::new().map(&doff_f) }.map_err(io_err)?;
         let ordinals = unsafe { MmapOptions::new().map(&dord_f) }.map_err(io_err)?;
+        if ordinals.len() < (row_count as usize).saturating_mul(2) {
+            return Err(io_err(format!("corrupt cold column {col_name}: codes shorter than {row_count} rows")));
+        }
 
         let dict_len = if doff.len() >= 4 {
             (doff.len() / 4).saturating_sub(1)
@@ -785,6 +823,11 @@ impl MmapFixedCol {
         let vf = File::open(dir.join(format!("col_{col_name}.val"))).map_err(io_err)?;
         let nulls = unsafe { MmapOptions::new().map(&nf) }.map_err(io_err)?;
         let values = unsafe { MmapOptions::new().map(&vf) }.map_err(io_err)?;
+        let rows = row_count as usize;
+        let width = if kind == DiskColKind::Bool { 1 } else { 8 };
+        if nulls.len() < rows || values.len() < rows.saturating_mul(width) {
+            return Err(io_err(format!("corrupt cold column {col_name}: shorter than {rows} rows")));
+        }
         // Zone map persisted at segment write time; a missing or invalid file just falls
         // back to the lazy full-column scan in `zones()`.
         let zone_map = OnceLock::new();

@@ -877,6 +877,19 @@ impl DiskEngine {
         fs::create_dir_all(dir.join(SEGMENTS_DIR)).map_err(io_err)?;
 
         let manifest_path = dir.join(MANIFEST_FILE);
+        // Without the manifest, segments on disk are unreachable; starting a fresh, empty
+        // manifest over them would silently drop the tables (and the next checkpoint
+        // would make that permanent).
+        if !manifest_path.exists()
+            && fs::read_dir(dir.join(SEGMENTS_DIR)).is_ok_and(|mut entries| {
+                entries.any(|e| e.is_ok_and(|e| e.file_name().to_string_lossy().starts_with("seg_")))
+            })
+        {
+            return Err(Error::runtime(format!(
+                "disk manifest missing in '{}' while segments exist; refusing to start empty",
+                dir.display()
+            )));
+        }
         let manifest: DiskManifest = if manifest_path.exists() {
             let bytes = fs::read(&manifest_path).map_err(io_err)?;
             let m: DiskManifest = serde_json::from_slice(&bytes).map_err(io_err)?;
