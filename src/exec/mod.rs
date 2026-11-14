@@ -424,6 +424,12 @@ impl Db {
     pub fn with_embedder(mut self, embedder: Arc<dyn Embedder>) -> Self {
         self.catalog.set_embed_id(embedder.id().to_string());
         self.store.embed_id = embedder.id().to_string();
+        // The embedder id is part of the catalog hash written to `head`; keep the cached
+        // hash in step, or `head` pairs the new id with the old hash and the database
+        // refuses to reopen.
+        if let Some(p) = self.persist.as_mut() {
+            p.catalog_hash = self.catalog.hash_str().to_string();
+        }
         self.embedder = Some(embedder);
         self.plan_cache.clear();
         self.query_cache.clear();
@@ -1527,6 +1533,14 @@ impl Db {
             .unique_keys_assigned(collection, record.fields.iter().map(|(k, _)| k.as_str()));
         let mut seen_keys: FxHashSet<(usize, String)> = FxHashSet::default();
         let mut updated_rows = Vec::with_capacity(before_rows.len());
+        // Same rule as the in-memory update: a changed title / body / snippet is
+        // embedded again unless the statement sets the embedding itself.
+        let reembed = self.embedder.is_some()
+            && record
+                .fields
+                .iter()
+                .any(|(k, _)| matches!(k.as_str(), "title" | "body" | "snippet"))
+            && !record.fields.iter().any(|(k, _)| k == "embedding");
         for before in before_rows {
             if has_guards {
                 for (k, _) in &record.fields {
@@ -1552,6 +1566,10 @@ impl Db {
             }
             if has_body && let Some(body) = row_text(&updated, "body").map(str::to_string) {
                 updated.insert("hash", Cell::Text(cached_content_hash(&body)));
+            }
+            if reembed {
+                updated.remove("embedding");
+                self.maybe_embed_rows(collection, std::slice::from_mut(&mut updated));
             }
             self.cold_check_unique_keys(collection, &unique_keys, &old_keys, &updated, &mut seen_keys)?;
             if has_fks {
@@ -1789,6 +1807,14 @@ impl Db {
         let has_body = pu.record.fields.iter().any(|(k, _)| k == "body");
         if has_body && let Some(body) = row_text(&updated, "body").map(str::to_string) {
             updated.insert("hash", Cell::Text(cached_content_hash(&body)));
+        }
+        // A changed title / body / snippet is embedded again (see the general update).
+        if self.embedder.is_some()
+            && pu.record.fields.iter().any(|(k, _)| matches!(k.as_str(), "title" | "body" | "snippet"))
+            && !pu.record.fields.iter().any(|(k, _)| k == "embedding")
+        {
+            updated.remove("embedding");
+            self.maybe_embed_rows(&pu.collection, std::slice::from_mut(&mut updated));
         }
         self.cold_check_unique_keys(
             &pu.collection,
@@ -2576,6 +2602,14 @@ impl Db {
             let has_body = pu.record.fields.iter().any(|(k, _)| k == "body");
             if has_body && let Some(body) = row_text(&updated, "body").map(str::to_string) {
                 updated.insert("hash", Cell::Text(cached_content_hash(&body)));
+            }
+            // A changed title / body / snippet is embedded again (see the general update).
+            if self.embedder.is_some()
+                && pu.record.fields.iter().any(|(k, _)| matches!(k.as_str(), "title" | "body" | "snippet"))
+                && !pu.record.fields.iter().any(|(k, _)| k == "embedding")
+            {
+                updated.remove("embedding");
+                self.maybe_embed_rows(&pu.collection, std::slice::from_mut(&mut updated));
             }
             self.check_row_fks(&pu.collection, &updated)?;
             if let Some(rows) = self.store.collections.get_mut(&pu.collection) {

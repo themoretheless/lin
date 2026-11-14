@@ -2,7 +2,7 @@
 
 Срез: **2026-11-14**, коммит `58444cf6e` (релиз 0.7.1) плюс незакоммиченное рабочее дерево. Единственный файл с планом в репозитории: в нём только несделанное. Реализованное описано в [CHANGELOG](../CHANGELOG.md), в документах `docs/` по отдельным механизмам и в отчётах `benches/results/`.
 
-Открыто **1638** пунктов backlog (часть II) и 12 пунктов части I: 10 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
+Открыто **1630** пунктов backlog (часть II) и 12 пунктов части I: 10 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровывались, поэтому в них есть пропуски: закрытые пункты удалены. Пункты части II со статусами `candidate` и `qualification` по коду поштучно не сверялись: перед взятием пункта сначала проверить, не покрыт ли он уже.
 
@@ -191,9 +191,9 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 Для каждой строки итоговый критерий — её конкретный результат плюс указанный gate. Если критерий требует недоступной платформы/endpoint, статус остаётся непроверенным; mock/compile не заменяет live qualification.
 
-### Приоритетный список — 1638 пунктов
+### Приоритетный список — 1630 пунктов
 
-Количества: P1: 3, P2: 1054, P3: 581; статусы: blocked_external: 1, candidate: 934, qualification: 703.
+Количества: P1: 3, P2: 1047, P3: 580; статусы: blocked_external: 1, candidate: 934, qualification: 695.
 
 #### P1: 3 пунктов
 
@@ -203,7 +203,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 2 | LIN-0002 | [D01](#d01) | Закрыть durable 1k SQLite gap | PERF | qualification | M | G-PERF |
 | 22 | LIN-0006 | [D01](#d01) | Получить тестовый endpoint Kusto | OPS | blocked_external | M | G-OPS |
 
-#### P2: 1054 пунктов
+#### P2: 1047 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -769,7 +769,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 867 | LIN-1002 | [D26](#d26) | Профилировать embedding text assembly | PERF | candidate | M | G-PERF |
 | 868 | LIN-1003 | [D26](#d26) | Профилировать scratch finish allocation | PERF | candidate | M | G-PERF |
 | 869 | LIN-1004 | [D26](#d26) | Профилировать feature hashing instructions | PERF | candidate | M | G-PERF |
-| 870 | LIN-1005 | [D26](#d26) | Проверить embedder identity persistence | CORRECTNESS | qualification | S | G-CORRECT |
 | 871 | LIN-1006 | [D26](#d26) | Проверить dimension parsing limits | CORRECTNESS | qualification | S | G-CORRECT |
 | 872 | LIN-1007 | [D26](#d26) | Проверить minimum dimension policy | CORRECTNESS | qualification | S | G-CORRECT |
 | 873 | LIN-1008 | [D26](#d26) | Проверить empty text embedding | CORRECTNESS | qualification | S | G-CORRECT |
@@ -804,13 +803,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 908 | LIN-1063 | [D27](#d27) | Измерить filtered ANN recall | PERF | candidate | L | G-PERF |
 | 909 | LIN-1064 | [D27](#d27) | Измерить skewed-cluster HNSW behavior | PERF | candidate | L | G-PERF |
 | 910 | LIN-1085 | [D28](#d28) | Проверить CPU f64 accumulation order | CORRECTNESS | qualification | S | G-CORRECT |
-| 911 | LIN-1086 | [D28](#d28) | Проверить vector threshold границу 0.01 | CORRECTNESS | qualification | S | G-CORRECT |
-| 912 | LIN-1087 | [D28](#d28) | Проверить vector score tie ordering | CORRECTNESS | qualification | S | G-CORRECT |
-| 913 | LIN-1088 | [D28](#d28) | Проверить duplicate vector identity ordering | CORRECTNESS | qualification | S | G-CORRECT |
-| 914 | LIN-1089 | [D28](#d28) | Проверить exact Top-K completeness | CORRECTNESS | qualification | S | G-CORRECT |
 | 915 | LIN-1090 | [D28](#d28) | Проверить filtered exact Top-K | CORRECTNESS | qualification | S | G-CORRECT |
-| 916 | LIN-1091 | [D28](#d28) | Проверить skip/take vector search | CORRECTNESS | qualification | S | G-CORRECT |
-| 917 | LIN-1092 | [D28](#d28) | Проверить vector query empty corpus | VERIFY | qualification | S | G-VERIFY |
 | 918 | LIN-1093 | [D28](#d28) | Проверить hybrid missing modality | CORRECTNESS | qualification | S | G-CORRECT |
 | 919 | LIN-1094 | [D28](#d28) | Проверить hybrid rank offsets | CORRECTNESS | qualification | S | G-CORRECT |
 | 920 | LIN-1095 | [D28](#d28) | Проверить hybrid duplicate candidate IDs | CORRECTNESS | qualification | S | G-CORRECT |
@@ -1262,7 +1255,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 1399 | LIN-1971 | [D50](#d50) | Описать replication version compatibility | DOC | candidate | S | G-DOC |
 | 1400 | LIN-1972 | [D50](#d50) | Описать downgrade support boundaries | DOC | candidate | S | G-DOC |
 
-#### P3: 581 пунктов
+#### P3: 580 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -1480,7 +1473,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 1618 | LIN-1114 | [D28](#d28) | Ограничить candidate reranking bytes | CORRECTNESS | qualification | M | G-CORRECT |
 | 1619 | LIN-1115 | [D28](#d28) | Ограничить neural embedding concurrency | CORRECTNESS | qualification | M | G-CORRECT |
 | 1620 | LIN-1116 | [D28](#d28) | Ограничить embedding RPC timeout | CORRECTNESS | qualification | M | G-CORRECT |
-| 1621 | LIN-1117 | [D28](#d28) | Добавить exact-search reference fixtures | VERIFY | qualification | S | G-VERIFY |
 | 1622 | LIN-1118 | [D28](#d28) | Добавить near-tie score corpus | VERIFY | qualification | S | G-VERIFY |
 | 1623 | LIN-1119 | [D28](#d28) | Добавить cross-platform vector golden tests | FEATURE | candidate | M | G-FEATURE |
 | 1624 | LIN-1120 | [D28](#d28) | Добавить vector cache invalidation diagnostics | FEATURE | candidate | M | G-FEATURE |

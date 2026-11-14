@@ -308,6 +308,12 @@ impl Store {
         // a head older than the snapshot. Its catalog hash then describes a catalog from
         // before the snapshot and proves nothing; the snapshot's own hash is checked below.
         let head_is_stale = head_disk.as_ref().is_some_and(|h| h.r#gen < min_gen);
+        // Releases before the embedder id was kept in step wrote `head` with the hash of
+        // the catalog as opened (the caller's embedder id) next to a different embedder
+        // id; that pairing describes the same catalog.
+        let mut caller_embed = live.clone();
+        caller_embed.set_embed_id(cat.embed_id.clone());
+        replay_hashes.push(catalog_hash(&caller_embed));
         if let Some(ref head) = head_disk
             && !head_is_stale
             && head.catalog_hash != live_hash

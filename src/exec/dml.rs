@@ -1340,6 +1340,15 @@ impl Db {
         }
         self.check_update_id(collection, record, &idxs, now)?;
         let has_body = record.fields.iter().any(|(k, _)| k == "body");
+        // The embedding is computed from title / body / snippet: when one of them changes
+        // and the statement does not set the embedding itself, compute it again, as an
+        // insert would, instead of keeping the vector of the old text.
+        let reembed = self.embedder.is_some()
+            && record
+                .fields
+                .iter()
+                .any(|(k, _)| matches!(k.as_str(), "title" | "body" | "snippet"))
+            && !record.fields.iter().any(|(k, _)| k == "embedding");
         let has_fks = self.catalog.fks.iter().any(|fk| fk.from_col == collection);
         let affected = idxs.len();
         let need_materialized = ctx.want_rows || durable || ctx.track_written;
@@ -1371,6 +1380,10 @@ impl Db {
             }
             if has_body && let Some(body) = row_text(&updated, "body").map(str::to_string) {
                 updated.insert("hash", Cell::Text(cached_content_hash(&body)));
+            }
+            if reembed {
+                updated.remove("embedding");
+                self.maybe_embed_rows(collection, std::slice::from_mut(&mut updated));
             }
             if has_fks {
                 self.check_row_fks(collection, &updated)?;
