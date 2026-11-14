@@ -160,3 +160,42 @@ async fn async_reads_streams_and_aborted_transactions() {
     assert!(err.is_err());
     assert_eq!(count(&adb.run_read(r#"t | id == "rolled" | count"#).await.unwrap()), 0);
 }
+
+#[test]
+fn snapshots_keep_their_catalog() {
+    let mut db = Db::empty();
+    seed(&mut db);
+    let old = db.reader();
+    db.run("col late { id: text, v: i64 }").unwrap();
+    db.run(r#"insert late { id: "l1", v: 1 }"#).unwrap();
+    let new = db.reader();
+    assert!(old.run("late | count").is_err(), "old snapshot sees a collection created after it");
+    assert_eq!(count(&new.run("late | count").unwrap()), 1);
+    assert_eq!(count(&old.run("t | count").unwrap()), 500);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dropped_futures_and_panicking_transactions_leave_the_db_usable() {
+    let mut db = Db::empty();
+    seed(&mut db);
+    let adb = AsyncDb::new(db);
+    for k in 0..30u64 {
+        let fut = adb.execute(format!(r#"insert t [{{ id: "d{k}-a", g: 8, n: 1 }}, {{ id: "d{k}-b", g: 8, n: 1 }}]"#));
+        let _ = tokio::time::timeout(std::time::Duration::from_micros(k * 30), fut).await;
+    }
+    adb.execute(r#"insert t { id: "barrier2", g: 0, n: 0 }"#).await.unwrap();
+    for k in 0..30 {
+        let n = count(&adb.run_read(format!(r#"t | id == "d{k}-a" or id == "d{k}-b" | count"#)).await.unwrap());
+        assert!(n == 0 || n == 2, "insert {k} half applied: {n}");
+    }
+    let r = adb
+        .transaction(|tx| -> Result<(), lin::Error> {
+            tx.run(r#"insert t { id: "panicked", g: 1, n: 1 }"#)?;
+            panic!("closure fails");
+        })
+        .await;
+    assert!(r.is_err(), "a panicking transaction must surface as an error");
+    assert_eq!(count(&adb.run_read(r#"t | id == "panicked" | count"#).await.unwrap()), 0);
+    adb.execute(r#"insert t { id: "after-panic-tx", g: 0, n: 0 }"#).await.unwrap();
+    assert_eq!(count(&adb.run_read(r#"t | id == "after-panic-tx" | count"#).await.unwrap()), 1);
+}
