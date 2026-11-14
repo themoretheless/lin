@@ -2,7 +2,7 @@
 
 Срез: **2026-11-14**, коммит `58444cf6e` (релиз 0.7.1) плюс незакоммиченное рабочее дерево. Единственный файл с планом в репозитории: в нём только несделанное. Реализованное описано в [CHANGELOG](../CHANGELOG.md), в документах `docs/` по отдельным механизмам и в отчётах `benches/results/`.
 
-Открыто **1666** пунктов backlog (часть II) и 12 пунктов части I: 10 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
+Открыто **1653** пунктов backlog (часть II) и 12 пунктов части I: 10 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровывались, поэтому в них есть пропуски: закрытые пункты удалены. Пункты части II со статусами `candidate` и `qualification` по коду поштучно не сверялись: перед взятием пункта сначала проверить, не покрыт ли он уже.
 
@@ -191,9 +191,9 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 Для каждой строки итоговый критерий — её конкретный результат плюс указанный gate. Если критерий требует недоступной платформы/endpoint, статус остаётся непроверенным; mock/compile не заменяет live qualification.
 
-### Приоритетный список — 1666 пунктов
+### Приоритетный список — 1653 пунктов
 
-Количества: P1: 3, P2: 1078, P3: 585; статусы: blocked_external: 1, candidate: 934, qualification: 731.
+Количества: P1: 3, P2: 1067, P3: 583; статусы: blocked_external: 1, candidate: 934, qualification: 718.
 
 #### P1: 3 пунктов
 
@@ -203,7 +203,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 2 | LIN-0002 | [D01](#d01) | Закрыть durable 1k SQLite gap | PERF | qualification | M | G-PERF |
 | 22 | LIN-0006 | [D01](#d01) | Получить тестовый endpoint Kusto | OPS | blocked_external | M | G-OPS |
 
-#### P2: 1078 пунктов
+#### P2: 1067 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -685,24 +685,13 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 745 | LIN-0823 | [D21](#d21) | Добавить spillable hash partitions | FEATURE | candidate | L | G-FEATURE |
 | 746 | LIN-0824 | [D21](#d21) | Добавить join skew handling | FEATURE | candidate | M | G-FEATURE |
 | 751 | LIN-0845 | [D22](#d22) | Проверить source-order window stability | CORRECTNESS | qualification | S | G-CORRECT |
-| 752 | LIN-0846 | [D22](#d22) | Проверить equal-order-key ties | CORRECTNESS | qualification | S | G-CORRECT |
-| 753 | LIN-0847 | [D22](#d22) | Проверить ascending/descending frame bounds | CORRECTNESS | qualification | S | G-CORRECT |
-| 754 | LIN-0848 | [D22](#d22) | Проверить empty frame outputs | CORRECTNESS | qualification | S | G-CORRECT |
 | 755 | LIN-0849 | [D22](#d22) | Проверить prefix-sum frame subtraction | CORRECTNESS | qualification | S | G-CORRECT |
-| 756 | LIN-0850 | [D22](#d22) | Проверить large integer window sums | CORRECTNESS | qualification | S | G-CORRECT |
 | 757 | LIN-0851 | [D22](#d22) | Проверить float prefix cancellation | CORRECTNESS | qualification | S | G-CORRECT |
 | 758 | LIN-0852 | [D22](#d22) | Проверить negative-zero window sums | CORRECTNESS | qualification | S | G-CORRECT |
 | 760 | LIN-0854 | [D22](#d22) | Спроектировать RANGE frame semantics | FEATURE | candidate | L | G-FEATURE |
 | 761 | LIN-0855 | [D22](#d22) | Спроектировать GROUPS frame semantics | FEATURE | candidate | L | G-FEATURE |
 | 762 | LIN-0856 | [D22](#d22) | Спроектировать excluded-current-row frame | FEATURE | candidate | L | G-FEATURE |
-| 763 | LIN-0857 | [D22](#d22) | Проверить row_number boundaries | CORRECTNESS | qualification | S | G-CORRECT |
-| 764 | LIN-0858 | [D22](#d22) | Проверить rank tie cases | VERIFY | qualification | S | G-VERIFY |
-| 765 | LIN-0859 | [D22](#d22) | Проверить dense_rank tie cases | VERIFY | qualification | S | G-VERIFY |
 | 766 | LIN-0860 | [D22](#d22) | Проверить percent_rank empty cases | VERIFY | qualification | S | G-VERIFY |
-| 767 | LIN-0861 | [D22](#d22) | Проверить lag default semantics | CORRECTNESS | qualification | S | G-CORRECT |
-| 768 | LIN-0862 | [D22](#d22) | Проверить lead default semantics | CORRECTNESS | qualification | S | G-CORRECT |
-| 769 | LIN-0863 | [D22](#d22) | Проверить first_value frame semantics | CORRECTNESS | qualification | S | G-CORRECT |
-| 770 | LIN-0864 | [D22](#d22) | Проверить last_value frame semantics | CORRECTNESS | qualification | S | G-CORRECT |
 | 771 | LIN-0885 | [D23](#d23) | Проверить declared FTS fields union | CORRECTNESS | qualification | S | G-CORRECT |
 | 772 | LIN-0887 | [D23](#d23) | Проверить empty token normalization | CORRECTNESS | qualification | S | G-CORRECT |
 | 773 | LIN-0888 | [D23](#d23) | Проверить repeated token uniqueness | CORRECTNESS | qualification | S | G-CORRECT |
@@ -1286,7 +1275,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 1399 | LIN-1971 | [D50](#d50) | Описать replication version compatibility | DOC | candidate | S | G-DOC |
 | 1400 | LIN-1972 | [D50](#d50) | Описать downgrade support boundaries | DOC | candidate | S | G-DOC |
 
-#### P3: 585 пунктов
+#### P3: 583 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -1446,8 +1435,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 1556 | LIN-0876 | [D22](#d22) | Проверить nested window rejection | CORRECTNESS | qualification | S | G-CORRECT |
 | 1557 | LIN-0877 | [D22](#d22) | Проверить partition size diagnostics | CORRECTNESS | qualification | S | G-CORRECT |
 | 1558 | LIN-0878 | [D22](#d22) | Проверить frame evaluation counters | CORRECTNESS | qualification | S | G-CORRECT |
-| 1559 | LIN-0879 | [D22](#d22) | Проверить window reference oracle | VERIFY | qualification | S | G-VERIFY |
-| 1560 | LIN-0880 | [D22](#d22) | Проверить window differential fixtures | VERIFY | qualification | S | G-VERIFY |
 | 1561 | LIN-0945 | [D24](#d24) | Измерить bounded candidate heaps | PERF | candidate | M | G-PERF |
 | 1562 | LIN-0946 | [D24](#d24) | Измерить score-only cursor path | PERF | candidate | M | G-PERF |
 | 1563 | LIN-0947 | [D24](#d24) | Измерить query-time allocation count | PERF | candidate | M | G-PERF |

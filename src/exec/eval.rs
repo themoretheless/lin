@@ -984,13 +984,14 @@ pub(crate) fn window_values(
                 }
                 sums
             } else {
-                let mut prefix = Vec::with_capacity(n + 1);
-                prefix.push(0i64);
-                let mut acc = 0i64;
+                // Prefix sums in i128 cannot overflow; a frame sum outside i64 becomes a
+                // float, as the table-level `sum` does, instead of wrapping around.
+                let mut prefix: Vec<i128> = Vec::with_capacity(n + 1);
+                prefix.push(0);
+                let mut acc = 0i128;
                 for c in tv {
-                    if let Some(v) = c.as_int()
-                    {
-                        acc += v;
+                    if let Some(v) = c.as_int() {
+                        acc += i128::from(v);
                     }
                     prefix.push(acc);
                 }
@@ -1000,7 +1001,10 @@ pub(crate) fn window_values(
                     if s <= e && s < n {
                         let end_idx = e.min(n - 1);
                         let sum = prefix[end_idx + 1] - prefix[s];
-                        sums.push(Cell::Int(sum));
+                        sums.push(match i64::try_from(sum) {
+                            Ok(v) => Cell::Int(v),
+                            Err(_) => Cell::Float(sum as f64),
+                        });
                     } else {
                         sums.push(Cell::Int(0));
                     }
