@@ -359,3 +359,63 @@ fn transaction_rollback_restores_every_statement_mix() {
         }
     }
 }
+
+/// A batch that breaks several rules at once fails with the same error every time, and
+/// the error names the first offending row in batch order, whatever the rule.
+#[test]
+fn several_violations_in_one_batch_fail_deterministically() {
+    let cases = [
+        // Duplicate id first, then a missing parent.
+        r#"insert child [{ id: "c1", p: "p1", n: 1 }, { id: "c5", p: "missing", n: 5 }]"#,
+        // Missing parent first, then a duplicate id.
+        r#"insert child [{ id: "c6", p: "missing", n: 6 }, { id: "c2", p: "p2", n: 2 }]"#,
+        // Unique index and duplicate id in one row, then a duplicate inside the batch.
+        r#"insert acct [{ id: "a5", org: "o1", name: "n1", n: 1 }, { id: "z", org: "q", name: "q", n: 2 }, { id: "z", org: "q", name: "r", n: 3 }]"#,
+    ];
+    for stmt in cases {
+        let mut errors = std::collections::BTreeSet::new();
+        for _ in 0..5 {
+            let mut db = Db::empty();
+            seed(&mut db);
+            let err = db.run(stmt).err().unwrap_or_else(|| panic!("{stmt}: accepted"));
+            errors.insert(err.to_string());
+        }
+        assert_eq!(errors.len(), 1, "{stmt}: {errors:?}");
+    }
+    // The first offending row decides the message.
+    let mut db = Db::empty();
+    seed(&mut db);
+    let first = db.run(cases[0]).unwrap_err().to_string();
+    assert!(first.contains("c1"), "{first}");
+    let second = db.run(cases[1]).unwrap_err().to_string();
+    assert!(second.contains("missing") || second.contains("fk"), "{second}");
+}
+
+/// A schema statement rolled back with its transaction leaves no trace in the catalog:
+/// the collection does not exist afterwards, can be declared again with another shape,
+/// and the database reopens (the catalog hash on disk is the one from before).
+#[test]
+fn rolled_back_schema_leaves_the_catalog_unchanged() {
+    let dir = tmp();
+    let mut db = Db::open(&dir).unwrap();
+    seed(&mut db);
+    {
+        let mut tx = db.transaction().unwrap();
+        tx.run("col drift { id: text, a: i64 }").unwrap();
+        tx.run(r#"insert drift { id: "d1", a: 1 }"#).unwrap();
+        tx.run("index acct [name]").unwrap();
+        tx.rollback().unwrap();
+    }
+    assert!(db.run("drift | take all").is_err(), "rolled-back collection still exists");
+    db.run("col drift { id: text, b: text }").unwrap();
+    db.run(r#"insert drift { id: "d2", b: "x" }"#).unwrap();
+    let rows = db.run("drift | take all").unwrap().rows.clone();
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].get("a").is_none());
+    db.close().unwrap();
+    drop(db);
+    let mut reopened = Db::open(&dir).unwrap();
+    assert_eq!(reopened.run("drift | take all").unwrap().rows.len(), 1);
+    let mut recovered = Db::open(crash_image(&dir)).unwrap();
+    assert_eq!(recovered.run("drift | take all").unwrap().rows.len(), 1);
+}

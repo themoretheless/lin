@@ -2,7 +2,7 @@
 
 Срез: **2026-11-14**, коммит `58444cf6e` (релиз 0.7.1) плюс незакоммиченное рабочее дерево. Единственный файл с планом в репозитории: в нём только несделанное. Реализованное описано в [CHANGELOG](../CHANGELOG.md), в документах `docs/` по отдельным механизмам и в отчётах `benches/results/`.
 
-Открыто **1752** пунктов backlog (часть II) и 12 пунктов части I: 10 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
+Открыто **1747** пунктов backlog (часть II) и 12 пунктов части I: 10 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровывались, поэтому в них есть пропуски: закрытые пункты удалены. Пункты части II со статусами `candidate` и `qualification` по коду поштучно не сверялись: перед взятием пункта сначала проверить, не покрыт ли он уже.
 
@@ -48,8 +48,8 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 - **Решение:** решить, включать ли `parallel` по умолчанию, после приёмочного замера по контракту бенчмарков; если битовая точность сумм объявляется контрактом, складывать чанки компенсированной суммой и в однопоточном пути.
 
 #### P3.2. Поиск, hop и потоковая левая сторона поверх `DiskEngine`
-- **Сделано (2026-11-14):** курсор `коллекция | filter? | join [left] … on f | project? | skip* | take?` с холодной левой стороной и FK на `id` читает левую сторону с диска порциями (фильтр в скане), правую точечными чтениями по `id` с кэшем по ключу (`CursorState::DiskJoin`); ни одна коллекция не поднимается в память. Тест `cold_join_cursor_streams_without_materializing`.
-- **Проблема:** курсоры с поиском и hop над холодными коллекциями, курсоры с join по не-`id` ключу или с холодной только правой стороной и левая сторона построчного join читаются через ленивую материализацию; колоночный путь join (`Db::join_disk_batch`) читает правую сторону по одному ключу через `get_projected_by_id`, без упорядочивания по позиции на диске, как это делает `DiskEngine::get_many_by_id` для построчного join. Выигрыш от дисковых путей join не замерен.
+- **Сделано (2026-11-14):** курсор `коллекция | filter? | join [left] … on f | project? | skip* | take?` с холодной левой стороной и FK на `id` читает левую сторону с диска порциями (фильтр в скане), правую точечными чтениями по `id` с кэшем по ключу (`CursorState::DiskJoin`); ни одна коллекция не поднимается в память. Тест `cold_join_cursor_streams_without_materializing`. Курсор с векторным поиском (`search vec`) над холодной коллекцией идёт через внекоренной поиск исполнителя (`search_vectors_out_of_core`), результат ограничен `take`; коллекция не поднимается в память (проверено в `cold_dml_with_vector_index_keeps_search_complete`).
+- **Проблема:** курсоры с лексическим и гибридным поиском и с hop над холодными коллекциями, курсоры с join по не-`id` ключу или с холодной только правой стороной и левая сторона построчного join читаются через ленивую материализацию; колоночный путь join (`Db::join_disk_batch`) читает правую сторону по одному ключу через `get_projected_by_id`, без упорядочивания по позиции на диске, как это делает `DiskEngine::get_many_by_id` для построчного join. Выигрыш от дисковых путей join не замерен.
 - **Решение:** потоковая левая сторона построчного join; пакетная проекционная выборка по `id` для `join_disk_batch`; замер на свободной машине.
 
 #### P3.3. Колоночное исполнение оконных функций: оставшиеся формы
@@ -191,9 +191,9 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 Для каждой строки итоговый критерий — её конкретный результат плюс указанный gate. Если критерий требует недоступной платформы/endpoint, статус остаётся непроверенным; mock/compile не заменяет live qualification.
 
-### Приоритетный список — 1752 пунктов
+### Приоритетный список — 1747 пунктов
 
-Количества: P1: 3, P2: 1163, P3: 586; статусы: blocked_external: 1, candidate: 934, qualification: 817.
+Количества: P1: 3, P2: 1158, P3: 586; статусы: blocked_external: 1, candidate: 934, qualification: 812.
 
 #### P1: 3 пунктов
 
@@ -203,7 +203,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 2 | LIN-0002 | [D01](#d01) | Закрыть durable 1k SQLite gap | PERF | qualification | M | G-PERF |
 | 22 | LIN-0006 | [D01](#d01) | Получить тестовый endpoint Kusto | OPS | blocked_external | M | G-OPS |
 
-#### P2: 1163 пунктов
+#### P2: 1158 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -313,18 +313,13 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 259 | LIN-0175 | [D05](#d05) | Измерить parallel snapshot sections | PERF | candidate | M | G-PERF |
 | 264 | LIN-0180 | [D05](#d05) | Проверить parent directory persistence | CORRECTNESS | qualification | S | G-CORRECT |
 | 267 | LIN-0183 | [D05](#d05) | Проверить snapshot derived indexes policy | CORRECTNESS | qualification | S | G-CORRECT |
-| 275 | LIN-0211 | [D06](#d06) | Проверить commit после validation failure | CORRECTNESS | qualification | S | G-CORRECT |
 | 276 | LIN-0212 | [D06](#d06) | Проверить rollback после allocator failure | CORRECTNESS | qualification | S | G-CORRECT |
 | 279 | LIN-0215 | [D06](#d06) | Измерить rollback work amplification | PERF | candidate | M | G-PERF |
 | 280 | LIN-0216 | [D06](#d06) | Измерить journal clone elimination | PERF | candidate | M | G-PERF |
 | 282 | LIN-0218 | [D06](#d06) | Спроектировать bounded savepoints | FEATURE | candidate | L | G-FEATURE |
 | 283 | LIN-0219 | [D06](#d06) | Спроектировать read-your-writes contract | FEATURE | candidate | L | G-FEATURE |
 | 284 | LIN-0220 | [D06](#d06) | Спроектировать nested transaction rejection | FEATURE | candidate | L | G-FEATURE |
-| 291 | LIN-0227 | [D06](#d06) | Проверить deferred validation ordering | CORRECTNESS | qualification | S | G-CORRECT |
-| 292 | LIN-0228 | [D06](#d06) | Проверить deterministic failure precedence | CORRECTNESS | qualification | S | G-CORRECT |
-| 293 | LIN-0229 | [D06](#d06) | Проверить transaction cancellation semantics | CORRECTNESS | qualification | S | G-CORRECT |
 | 296 | LIN-0232 | [D06](#d06) | Проверить failed commit reopen consistency | CORRECTNESS | qualification | S | G-CORRECT |
-| 298 | LIN-0234 | [D06](#d06) | Проверить transaction schema drift | CORRECTNESS | qualification | S | G-CORRECT |
 | 299 | LIN-0235 | [D06](#d06) | Проверить concurrent snapshot visibility | CORRECTNESS | qualification | S | G-CORRECT |
 | 300 | LIN-0236 | [D06](#d06) | Проверить transaction result lifetime | CORRECTNESS | qualification | S | G-CORRECT |
 | 301 | LIN-0237 | [D06](#d06) | Добавить transaction phase diagnostics | FEATURE | candidate | M | G-FEATURE |
