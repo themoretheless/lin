@@ -2,7 +2,7 @@
 
 Срез: **2026-11-14**, коммит `58444cf6e` (релиз 0.7.1) плюс незакоммиченное рабочее дерево. Единственный файл с планом в репозитории: в нём только несделанное. Реализованное описано в [CHANGELOG](../CHANGELOG.md), в документах `docs/` по отдельным механизмам и в отчётах `benches/results/`.
 
-Открыто **1684** пунктов backlog (часть II) и 12 пунктов части I: 10 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
+Открыто **1673** пунктов backlog (часть II) и 12 пунктов части I: 10 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровывались, поэтому в них есть пропуски: закрытые пункты удалены. Пункты части II со статусами `candidate` и `qualification` по коду поштучно не сверялись: перед взятием пункта сначала проверить, не покрыт ли он уже.
 
@@ -191,9 +191,9 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 Для каждой строки итоговый критерий — её конкретный результат плюс указанный gate. Если критерий требует недоступной платформы/endpoint, статус остаётся непроверенным; mock/compile не заменяет live qualification.
 
-### Приоритетный список — 1684 пунктов
+### Приоритетный список — 1673 пунктов
 
-Количества: P1: 3, P2: 1095, P3: 586; статусы: blocked_external: 1, candidate: 934, qualification: 749.
+Количества: P1: 3, P2: 1084, P3: 586; статусы: blocked_external: 1, candidate: 934, qualification: 738.
 
 #### P1: 3 пунктов
 
@@ -203,7 +203,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 2 | LIN-0002 | [D01](#d01) | Закрыть durable 1k SQLite gap | PERF | qualification | M | G-PERF |
 | 22 | LIN-0006 | [D01](#d01) | Получить тестовый endpoint Kusto | OPS | blocked_external | M | G-OPS |
 
-#### P2: 1095 пунктов
+#### P2: 1084 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -620,15 +620,12 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 660 | LIN-0702 | [D18](#d18) | Измерить SIMD bitmap operations | PERF | candidate | M | G-PERF |
 | 661 | LIN-0703 | [D18](#d18) | Измерить packed UTF-8 projection | PERF | candidate | M | G-PERF |
 | 662 | LIN-0704 | [D18](#d18) | Измерить vector column alignment | PERF | candidate | M | G-PERF |
-| 666 | LIN-0728 | [D19](#d19) | Проверить empty-input aggregate results | CORRECTNESS | qualification | S | G-CORRECT |
 | 667 | LIN-0729 | [D19](#d19) | Проверить count/count-field distinction | CORRECTNESS | qualification | S | G-CORRECT |
-| 668 | LIN-0730 | [D19](#d19) | Проверить sum integer overflow | CORRECTNESS | qualification | S | G-CORRECT |
 | 669 | LIN-0731 | [D19](#d19) | Проверить sum float order policy | CORRECTNESS | qualification | S | G-CORRECT |
 | 670 | LIN-0732 | [D19](#d19) | Проверить avg precision policy | CORRECTNESS | qualification | S | G-CORRECT |
 | 671 | LIN-0733 | [D19](#d19) | Проверить min/max mixed scalar types | CORRECTNESS | qualification | S | G-CORRECT |
 | 672 | LIN-0734 | [D19](#d19) | Проверить first/last source ordering | CORRECTNESS | qualification | S | G-CORRECT |
 | 673 | LIN-0735 | [D19](#d19) | Проверить distinct value semantics | CORRECTNESS | qualification | S | G-CORRECT |
-| 674 | LIN-0736 | [D19](#d19) | Проверить composite group keys | CORRECTNESS | qualification | S | G-CORRECT |
 | 675 | LIN-0737 | [D19](#d19) | Измерить FxHashMap grouping capacity | PERF | candidate | M | G-PERF |
 | 676 | LIN-0738 | [D19](#d19) | Измерить inline group key buffers | PERF | candidate | M | G-PERF |
 | 677 | LIN-0739 | [D19](#d19) | Измерить group aggregate state layout | PERF | candidate | M | G-PERF |
@@ -649,8 +646,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 695 | LIN-0757 | [D19](#d19) | Добавить group cardinality limits | FEATURE | candidate | M | G-FEATURE |
 | 697 | LIN-0759 | [D19](#d19) | Добавить aggregation skew diagnostics | FEATURE | candidate | M | G-FEATURE |
 | 698 | LIN-0760 | [D19](#d19) | Добавить group overflow diagnostics | FEATURE | candidate | M | G-FEATURE |
-| 699 | LIN-0761 | [D20](#d20) | Проверить stable equal-key sorting | CORRECTNESS | qualification | S | G-CORRECT |
-| 700 | LIN-0762 | [D20](#d20) | Проверить NULL placement policy | CORRECTNESS | qualification | S | G-CORRECT |
 | 701 | LIN-0763 | [D20](#d20) | Проверить NaN placement policy | CORRECTNESS | qualification | S | G-CORRECT |
 | 702 | LIN-0764 | [D20](#d20) | Проверить exact integer rank | CORRECTNESS | qualification | S | G-CORRECT |
 | 703 | LIN-0765 | [D20](#d20) | Измерить decorated sort key reuse | PERF | candidate | M | G-PERF |
@@ -658,11 +653,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 705 | LIN-0767 | [D20](#d20) | Измерить partial selection partition | PERF | candidate | M | G-PERF |
 | 706 | LIN-0768 | [D20](#d20) | Измерить multi-key comparator cost | PERF | candidate | M | G-PERF |
 | 707 | LIN-0769 | [D20](#d20) | Проверить mixed-type sort transitivity | CORRECTNESS | qualification | S | G-CORRECT |
-| 708 | LIN-0770 | [D20](#d20) | Проверить reverse order tie stability | CORRECTNESS | qualification | S | G-CORRECT |
-| 709 | LIN-0771 | [D20](#d20) | Проверить empty sort output | CORRECTNESS | qualification | S | G-CORRECT |
-| 710 | LIN-0772 | [D20](#d20) | Проверить sort take zero | CORRECTNESS | qualification | S | G-CORRECT |
-| 711 | LIN-0773 | [D20](#d20) | Проверить skip-plus-take overflow | CORRECTNESS | qualification | S | G-CORRECT |
-| 712 | LIN-0774 | [D20](#d20) | Проверить Top-K identity ties | CORRECTNESS | qualification | S | G-CORRECT |
 | 713 | LIN-0775 | [D20](#d20) | Проверить descending composite bounds | CORRECTNESS | qualification | S | G-CORRECT |
 | 714 | LIN-0776 | [D20](#d20) | Проверить post-projection sort keys | CORRECTNESS | qualification | S | G-CORRECT |
 | 715 | LIN-0777 | [D20](#d20) | Спроектировать spillable external sort | FEATURE | candidate | L | G-FEATURE |
@@ -673,7 +663,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 720 | LIN-0782 | [D20](#d20) | Добавить locale collation opt-in | FEATURE | candidate | M | G-FEATURE |
 | 721 | LIN-0783 | [D20](#d20) | Добавить binary collation baseline | FEATURE | candidate | M | G-FEATURE |
 | 722 | LIN-0784 | [D20](#d20) | Добавить natural-sort opt-in | FEATURE | candidate | M | G-FEATURE |
-| 725 | LIN-0803 | [D21](#d21) | Проверить NULL join keys | CORRECTNESS | qualification | S | G-CORRECT |
 | 726 | LIN-0804 | [D21](#d21) | Проверить numeric cross-type join keys | CORRECTNESS | qualification | S | G-CORRECT |
 | 727 | LIN-0805 | [D21](#d21) | Проверить asymmetric build-side selection | CORRECTNESS | qualification | S | G-CORRECT |
 | 728 | LIN-0806 | [D21](#d21) | Профилировать hash table build cost | PERF | candidate | M | G-PERF |
