@@ -2,7 +2,7 @@
 
 Срез: **2026-11-14**, коммит `58444cf6e` (релиз 0.7.1) плюс незакоммиченное рабочее дерево. Единственный файл с планом в репозитории: в нём только несделанное. Реализованное описано в [CHANGELOG](../CHANGELOG.md), в документах `docs/` по отдельным механизмам и в отчётах `benches/results/`.
 
-Открыто **1715** пунктов backlog (часть II) и 12 пунктов части I: 10 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
+Открыто **1703** пунктов backlog (часть II) и 12 пунктов части I: 10 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровывались, поэтому в них есть пропуски: закрытые пункты удалены. Пункты части II со статусами `candidate` и `qualification` по коду поштучно не сверялись: перед взятием пункта сначала проверить, не покрыт ли он уже.
 
@@ -191,9 +191,9 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 Для каждой строки итоговый критерий — её конкретный результат плюс указанный gate. Если критерий требует недоступной платформы/endpoint, статус остаётся непроверенным; mock/compile не заменяет live qualification.
 
-### Приоритетный список — 1715 пунктов
+### Приоритетный список — 1703 пунктов
 
-Количества: P1: 3, P2: 1126, P3: 586; статусы: blocked_external: 1, candidate: 934, qualification: 780.
+Количества: P1: 3, P2: 1114, P3: 586; статусы: blocked_external: 1, candidate: 934, qualification: 768.
 
 #### P1: 3 пунктов
 
@@ -203,7 +203,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 2 | LIN-0002 | [D01](#d01) | Закрыть durable 1k SQLite gap | PERF | qualification | M | G-PERF |
 | 22 | LIN-0006 | [D01](#d01) | Получить тестовый endpoint Kusto | OPS | blocked_external | M | G-OPS |
 
-#### P2: 1126 пунктов
+#### P2: 1114 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -419,19 +419,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 434 | LIN-0400 | [D10](#d10) | Сравнить hash-only equality indexes | PERF | candidate | M | G-PERF |
 | 435 | LIN-0405 | [D11](#d11) | Проверить NaN unique key policy | CORRECTNESS | qualification | S | G-CORRECT |
 | 436 | LIN-0406 | [D11](#d11) | Проверить negative-zero unique policy | CORRECTNESS | qualification | S | G-CORRECT |
-| 437 | LIN-0407 | [D11](#d11) | Проверить NULL unique key policy | CORRECTNESS | qualification | S | G-CORRECT |
-| 438 | LIN-0408 | [D11](#d11) | Проверить empty-string unique key | CORRECTNESS | qualification | S | G-CORRECT |
-| 439 | LIN-0409 | [D11](#d11) | Проверить Unicode normalization uniqueness | CORRECTNESS | qualification | S | G-CORRECT |
-| 440 | LIN-0410 | [D11](#d11) | Проверить case-sensitive URI uniqueness | CORRECTNESS | qualification | S | G-CORRECT |
-| 441 | LIN-0411 | [D11](#d11) | Проверить SSO/Arc duplicate collisions | CORRECTNESS | qualification | S | G-CORRECT |
-| 442 | LIN-0412 | [D11](#d11) | Проверить composite type-tag collisions | CORRECTNESS | qualification | S | G-CORRECT |
-| 443 | LIN-0413 | [D11](#d11) | Проверить duplicate index declaration | CORRECTNESS | qualification | S | G-CORRECT |
 | 444 | LIN-0414 | [D11](#d11) | Проверить conflicting index definition | CORRECTNESS | qualification | S | G-CORRECT |
-| 445 | LIN-0415 | [D11](#d11) | Проверить existing-data unique validation | CORRECTNESS | qualification | S | G-CORRECT |
-| 446 | LIN-0416 | [D11](#d11) | Проверить uniqueness после swap remove | CORRECTNESS | qualification | S | G-CORRECT |
-| 447 | LIN-0417 | [D11](#d11) | Проверить unique update self-match | CORRECTNESS | qualification | S | G-CORRECT |
-| 448 | LIN-0418 | [D11](#d11) | Проверить unique batch cross-conflicts | CORRECTNESS | qualification | S | G-CORRECT |
-| 449 | LIN-0419 | [D11](#d11) | Проверить unique rollback reverse map | CORRECTNESS | qualification | S | G-CORRECT |
 | 450 | LIN-0420 | [D11](#d11) | Проверить unique constraint error location | CORRECTNESS | qualification | S | G-CORRECT |
 | 451 | LIN-0421 | [D11](#d11) | Спроектировать named constraints | FEATURE | candidate | L | G-FEATURE |
 | 452 | LIN-0422 | [D11](#d11) | Спроектировать configurable NULL distinctness | FEATURE | candidate | L | G-FEATURE |
