@@ -5374,6 +5374,36 @@ fn cold_lexical_search_without_materializing() {
         assert_eq!(ids(&rows), ids(&hot.run(r#"docs | search lex "shipping" | take all"#).unwrap().rows));
         assert!(!db.store.disk_rows_materialized("docs"), "a lexical cursor pulled docs into memory");
     }
+    // Hybrid search merges the lexical and vector legs by reciprocal rank: the same set of
+    // documents as in memory, still without loading the collection.
+    for q in [
+        r#"docs | search "shipping" | take all"#,
+        r#"docs | search "zone maps" | { id, title } | take all"#,
+    ] {
+        let want = ids(&hot.run(q).unwrap().rows);
+        let mut db = Db::open_with(&dir, opts()).unwrap();
+        let got = ids(&db.run(q).unwrap().rows);
+        assert!(!want.is_empty(), "{q}");
+        assert_eq!(got, want, "{q}");
+        assert!(!db.store.disk_rows_materialized("docs"), "{q}: docs pulled into memory");
+    }
+    {
+        let mut db = Db::open_with(&dir, opts()).unwrap();
+        let q = r#"docs | search "shipping" | take 10"#;
+        let got = ids(&db.run(q).unwrap().rows);
+        let all = ids(&hot.run(r#"docs | search "shipping" | take all"#).unwrap().rows);
+        assert_eq!(got.len(), 10);
+        assert!(got.iter().all(|id| all.contains(id)), "{got:?}");
+        let rows: Vec<lin::Row> = Queryable::from("docs")
+            .search("shipping")
+            .take(10)
+            .cursor(&db)
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(ids(&rows), got, "cursor and statement differ");
+        assert!(!db.store.disk_rows_materialized("docs"), "hybrid search pulled docs into memory");
+    }
     // After a write the index is rebuilt from the rows; the answer must stay correct.
     {
         let mut db = Db::open_with(&dir, opts()).unwrap();

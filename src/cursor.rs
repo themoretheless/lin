@@ -1056,7 +1056,7 @@ fn try_lazy_search(db: &CursorDb<'_>, q: &Query) -> Result<Option<LazyCursor>, E
     // A cold collection is searched by the executor without materializing it (vector
     // search out of core, lexical hits fetched by `id`; the result is bounded by `take`);
     // reading row positions here would pull the whole collection into memory.
-    if matches!(mode, SearchMode::Vec | SearchMode::Lex) && store.is_disk_backed(name) {
+    if store.is_disk_backed(name) {
         return Ok(None);
     }
 

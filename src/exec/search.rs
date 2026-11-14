@@ -129,12 +129,10 @@ impl Db {
             return Ok(Some(out));
         }
 
-        // Lexical search over a cold collection: the posting lists address documents by
-        // their position in the engine's scan order (the index is built from, or checked
-        // against, that scan and dropped on any overlay write). Candidates are scored from
-        // the three text fields the score reads, fetched by `id`; only the winners are
-        // read whole. The ranking (score desc, then position) is the in-memory one.
-        if mode == SearchMode::Lex
+        // Lexical and hybrid search over a cold collection, without materializing it (see
+        // `cold_lex_scored`). Hybrid merges the lexical leg with the out-of-core vector
+        // leg by reciprocal rank, exactly as the in-memory merge does over positions.
+        if matches!(mode, SearchMode::Lex | SearchMode::Hybrid)
             && self.store.is_disk_backed(name)
             && let Some(fts) = self.store.fts.get(name)
             && let Some(eng) = self.store.disk_engine_read()
@@ -142,41 +140,74 @@ impl Db {
             if rank_limit == Some(0) {
                 return Ok(Some(Vec::new()));
             }
-            let candidates = fts.candidate_idxs(query);
-            let mut ids: Vec<std::sync::Arc<str>> = Vec::new();
-            if !candidates.is_empty() {
-                eng.scan_projected(name, Some(&["id"]), |row| {
-                    ids.push(
-                        row.get("id")
-                            .and_then(crate::store::Cell::text_shared)
-                            .unwrap_or_default(),
-                    );
-                    Ok(true)
-                })?;
-            }
-            if candidates.iter().all(|&i| i < ids.len()) {
-                let lex = LexQuery::new(query);
-                let mut scored: Vec<(i64, usize)> = Vec::with_capacity(candidates.len());
-                for &i in &candidates {
-                    let Some(row) =
-                        eng.get_projected_by_id(name, &ids[i], &["title", "body", "snippet"])?
-                    else {
-                        continue;
-                    };
-                    let score = lex_score_prepared(&row, &lex);
-                    if score > 0 {
-                        scored.push((score, i));
+            let hybrid = mode == SearchMode::Hybrid;
+            let leg_limit = if hybrid {
+                rank_limit.map(|k| k.saturating_mul(8).max(128))
+            } else {
+                rank_limit
+            };
+            if let Some((lex, ids)) = Self::cold_lex_scored(&eng, name, fts, query, leg_limit, hybrid)? {
+                let ranked: Vec<usize> = if hybrid {
+                    let mut vec_leg: Vec<usize> = Vec::new();
+                    if let Some(emb) = self.embedder.as_ref() {
+                        let qv = emb.embed(query);
+                        if !qv.is_empty() {
+                            let top_k = leg_limit.unwrap_or_else(|| eng.count_table(name).max(1));
+                            let pos_of: FxHashMap<&str, usize> = ids
+                                .iter()
+                                .enumerate()
+                                .map(|(i, id)| (id.as_ref(), i))
+                                .collect();
+                            for (score, row) in eng.search_vectors_out_of_core(
+                                name,
+                                "embedding",
+                                "id",
+                                &qv,
+                                top_k,
+                                true,
+                                None,
+                                None,
+                                |_| true,
+                            )? {
+                                if f64::from(score) > 0.01
+                                    && let Some(&i) =
+                                        row.get("id").and_then(|c| c.text()).and_then(|id| pos_of.get(id))
+                                {
+                                    vec_leg.push(i);
+                                }
+                            }
+                        }
                     }
-                }
-                scored.sort_unstable_by(|(sa, ia), (sb, ib)| sb.cmp(sa).then_with(|| ia.cmp(ib)));
-                let start = skip_n.min(scored.len());
-                let slice = &scored[start..];
+                    const RRF_K: f64 = 60.0;
+                    let mut scores: FxHashMap<usize, f64> = FxHashMap::default();
+                    for (rank, (_, i)) in lex.iter().enumerate() {
+                        *scores.entry(*i).or_default() += 1.0 / (RRF_K + rank as f64 + 1.0);
+                    }
+                    for (rank, i) in vec_leg.iter().enumerate() {
+                        *scores.entry(*i).or_default() += 1.0 / (RRF_K + rank as f64 + 1.0);
+                    }
+                    let mut merged: Vec<(f64, usize)> =
+                        scores.into_iter().map(|(i, score)| (score, i)).collect();
+                    merged.sort_by(|a, b| {
+                        b.0.partial_cmp(&a.0)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .then_with(|| a.1.cmp(&b.1))
+                    });
+                    if let Some(limit) = rank_limit {
+                        merged.truncate(limit);
+                    }
+                    merged.into_iter().map(|(_, i)| i).collect()
+                } else {
+                    lex.into_iter().map(|(_, i)| i).collect()
+                };
+                let start = skip_n.min(ranked.len());
+                let slice = &ranked[start..];
                 let end = limit.map_or(slice.len(), |n| n.min(slice.len()));
                 let names = proj.map(field_names);
                 let refs: Option<Vec<&str>> =
                     names.as_ref().map(|n| n.iter().map(String::as_str).collect());
                 let mut out = Vec::with_capacity(end);
-                for &(_, i) in &slice[..end] {
+                for &i in &slice[..end] {
                     let row = match &refs {
                         Some(fs) => eng.get_projected_by_id(name, &ids[i], fs)?,
                         None => eng.get_by_id(name, &ids[i])?,
@@ -227,6 +258,55 @@ impl Db {
             rows = project(&rows, fields);
         }
         Ok(Some(rows))
+    }
+
+    /// Lexical leg over a cold collection. The posting lists address documents by their
+    /// position in the engine's scan order (the index is built from, or checked against,
+    /// that scan and dropped on any overlay write), so positions map to ids through the
+    /// `id` column alone; candidates are scored from the three text fields the score
+    /// reads, fetched by id. Returns `(score, position)` ranked like the in-memory leg
+    /// (score desc, then position) and cut at `rank_limit`, plus the ids by position
+    /// (always read when `need_ids`). `None` when the index does not line up with the scan.
+    fn cold_lex_scored(
+        eng: &crate::disk::DiskEngine,
+        name: &str,
+        fts: &crate::fts::FtsIndex,
+        query: &str,
+        rank_limit: Option<usize>,
+        need_ids: bool,
+    ) -> Result<Option<(Vec<(i64, usize)>, Vec<std::sync::Arc<str>>)>, Error> {
+        let candidates = fts.candidate_idxs(query);
+        let mut ids: Vec<std::sync::Arc<str>> = Vec::new();
+        if need_ids || !candidates.is_empty() {
+            eng.scan_projected(name, Some(&["id"]), |row| {
+                ids.push(
+                    row.get("id")
+                        .and_then(crate::store::Cell::text_shared)
+                        .unwrap_or_default(),
+                );
+                Ok(true)
+            })?;
+        }
+        if candidates.iter().any(|&i| i >= ids.len()) {
+            return Ok(None);
+        }
+        let lex = LexQuery::new(query);
+        let mut scored: Vec<(i64, usize)> = Vec::with_capacity(candidates.len());
+        for &i in &candidates {
+            let Some(row) = eng.get_projected_by_id(name, &ids[i], &["title", "body", "snippet"])?
+            else {
+                continue;
+            };
+            let score = lex_score_prepared(&row, &lex);
+            if score > 0 {
+                scored.push((score, i));
+            }
+        }
+        scored.sort_unstable_by(|(sa, ia), (sb, ib)| sb.cmp(sa).then_with(|| ia.cmp(ib)));
+        if let Some(k) = rank_limit {
+            scored.truncate(k);
+        }
+        Ok(Some((scored, ids)))
     }
 
     pub(crate) fn search_fts_indices_ranked(
