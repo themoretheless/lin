@@ -4745,6 +4745,19 @@ fn cold_dml_with_vector_index_keeps_search_complete() {
         out
     };
     let q = r#"docs | search vec "wal shipping" | take 60"#;
+    // A cursor over the cold collection searches it out of core: same rows as the
+    // statement, and the collection is not pulled into memory.
+    {
+        let probe = &cold;
+        assert!(!probe.store.disk_rows_materialized("docs"), "docs was pulled into memory earlier");
+        let cur = lin::Queryable::from("docs").search_vec("wal shipping").take(60).cursor(probe).unwrap();
+        let mut via_cursor: Vec<String> = cur
+            .filter_map(|r| r.ok()?.get("uri").and_then(lin::Cell::text).map(str::to_string))
+            .collect();
+        via_cursor.sort();
+        assert!(via_cursor.len() >= 40, "cursor search found {}", via_cursor.len());
+        assert!(!probe.store.disk_rows_materialized("docs"), "a search cursor pulled docs into memory");
+    }
     let c = uris(&mut cold, q);
     let h = uris(&mut hot, q);
     assert!(c.len() >= 40, "search over the cold collection found only {} rows", c.len());

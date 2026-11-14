@@ -1053,6 +1053,11 @@ fn try_lazy_search(db: &CursorDb<'_>, q: &Query) -> Result<Option<LazyCursor>, E
         return Ok(None);
     };
     let (store, _) = db.store_catalog();
+    // A cold collection is searched out of core by the executor (the result is bounded by
+    // `take`); ranking row positions here would pull the whole collection into memory.
+    if mode == SearchMode::Vec && store.is_disk_backed(name) {
+        return Ok(None);
+    }
 
     let take_left = match take_n {
         Some(Some(n)) => Some(n.max(0) as usize),

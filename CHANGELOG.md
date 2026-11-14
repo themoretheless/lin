@@ -24,7 +24,7 @@
 - The columnar window path accepts a `sort` between the windows and the projection.
 - Cold tier: zone maps also prune blocks for `is null` / `is not null` on fixed-width columns; a row join on `id` against a cold collection looks every distinct key up in one batch ordered by position on disk (`DiskEngine::get_many_by_id`).
 - Cold collections stay on disk for more writes: composite and partial unique indexes (text, numeric, boolean, time and missing key values) are checked against the disk engine, `insert ... with edge` works inside programs and transactions, a declared vector index no longer forces promotion, an `update` that changes `id` is logged as a delete plus an upsert, and one insert may carry up to 1,048,576 rows.
-- Cursors over a cold collection stream it from disk in chunks, joins included (left side streamed, right side read by `id`); row joins probe a cold right side instead of materializing it.
+- Cursors over a cold collection stream it from disk in chunks, joins included (left side streamed, right side read by `id`), and vector search cursors use the out-of-core search; row joins probe a cold right side instead of materializing it.
 - `AsyncDb::transaction` shares commit groups with statements (one sync per group).
 - `insert_batch` into a cold collection builds rows straight from the columns (no per-row statement record), about 1.5x faster on 60,000 rows; it is no longer capped by the parser's AST size quota.
 - `persist::set_wal_dictionary_writer`: opt-in writer for the dictionary vector WAL codec (codec 5). Off by default; a release without the codec cannot read such frames.
