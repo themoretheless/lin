@@ -2,7 +2,7 @@
 
 Срез: **2026-11-14**, коммит `58444cf6e` (релиз 0.7.1) плюс незакоммиченное рабочее дерево. Единственный файл с планом в репозитории: в нём только несделанное. Реализованное описано в [CHANGELOG](../CHANGELOG.md), в документах `docs/` по отдельным механизмам и в отчётах `benches/results/`.
 
-Открыто **1653** пунктов backlog (часть II) и 12 пунктов части I: 10 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
+Открыто **1638** пунктов backlog (часть II) и 12 пунктов части I: 10 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровывались, поэтому в них есть пропуски: закрытые пункты удалены. Пункты части II со статусами `candidate` и `qualification` по коду поштучно не сверялись: перед взятием пункта сначала проверить, не покрыт ли он уже.
 
@@ -191,9 +191,9 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 Для каждой строки итоговый критерий — её конкретный результат плюс указанный gate. Если критерий требует недоступной платформы/endpoint, статус остаётся непроверенным; mock/compile не заменяет live qualification.
 
-### Приоритетный список — 1653 пунктов
+### Приоритетный список — 1638 пунктов
 
-Количества: P1: 3, P2: 1067, P3: 583; статусы: blocked_external: 1, candidate: 934, qualification: 718.
+Количества: P1: 3, P2: 1054, P3: 581; статусы: blocked_external: 1, candidate: 934, qualification: 703.
 
 #### P1: 3 пунктов
 
@@ -203,7 +203,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 2 | LIN-0002 | [D01](#d01) | Закрыть durable 1k SQLite gap | PERF | qualification | M | G-PERF |
 | 22 | LIN-0006 | [D01](#d01) | Получить тестовый endpoint Kusto | OPS | blocked_external | M | G-OPS |
 
-#### P2: 1067 пунктов
+#### P2: 1054 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -692,12 +692,8 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 761 | LIN-0855 | [D22](#d22) | Спроектировать GROUPS frame semantics | FEATURE | candidate | L | G-FEATURE |
 | 762 | LIN-0856 | [D22](#d22) | Спроектировать excluded-current-row frame | FEATURE | candidate | L | G-FEATURE |
 | 766 | LIN-0860 | [D22](#d22) | Проверить percent_rank empty cases | VERIFY | qualification | S | G-VERIFY |
-| 771 | LIN-0885 | [D23](#d23) | Проверить declared FTS fields union | CORRECTNESS | qualification | S | G-CORRECT |
 | 772 | LIN-0887 | [D23](#d23) | Проверить empty token normalization | CORRECTNESS | qualification | S | G-CORRECT |
-| 773 | LIN-0888 | [D23](#d23) | Проверить repeated token uniqueness | CORRECTNESS | qualification | S | G-CORRECT |
 | 774 | LIN-0889 | [D23](#d23) | Проверить Greek contextual lowercase | CORRECTNESS | qualification | S | G-CORRECT |
-| 775 | LIN-0890 | [D23](#d23) | Проверить Unicode whitespace classes | CORRECTNESS | qualification | S | G-CORRECT |
-| 776 | LIN-0891 | [D23](#d23) | Проверить vertical-tab token boundaries | CORRECTNESS | qualification | S | G-CORRECT |
 | 777 | LIN-0892 | [D23](#d23) | Проверить combining-mark token boundaries | CORRECTNESS | qualification | S | G-CORRECT |
 | 778 | LIN-0893 | [D23](#d23) | Измерить ASCII token fast path | PERF | candidate | M | G-PERF |
 | 779 | LIN-0894 | [D23](#d23) | Измерить byte-scan tokenizer crossover | PERF | candidate | M | G-PERF |
@@ -719,9 +715,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 795 | LIN-0910 | [D23](#d23) | Ограничить unique vocabulary bytes | CORRECTNESS | qualification | M | G-CORRECT |
 | 796 | LIN-0911 | [D23](#d23) | Ограничить pending FTS bytes | CORRECTNESS | qualification | M | G-CORRECT |
 | 797 | LIN-0912 | [D23](#d23) | Ограничить term length allocation | CORRECTNESS | qualification | M | G-CORRECT |
-| 798 | LIN-0913 | [D23](#d23) | Проверить FTS cold rebuild parity | CORRECTNESS | qualification | S | G-CORRECT |
-| 799 | LIN-0914 | [D23](#d23) | Проверить FTS serde rebuild parity | CORRECTNESS | qualification | S | G-CORRECT |
-| 800 | LIN-0915 | [D23](#d23) | Проверить SSO text tokenizer parity | CORRECTNESS | qualification | S | G-CORRECT |
 | 801 | LIN-0916 | [D23](#d23) | Проверить binary-invalid text rejection | CORRECTNESS | qualification | S | G-CORRECT |
 | 802 | LIN-0917 | [D23](#d23) | Добавить tokenizer inspection API | FEATURE | candidate | M | G-FEATURE |
 | 803 | LIN-0918 | [D23](#d23) | Добавить vocabulary statistics API | FEATURE | candidate | M | G-FEATURE |
@@ -729,15 +722,10 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 805 | LIN-0920 | [D23](#d23) | Добавить tokenizer regression corpus | VERIFY | qualification | S | G-VERIFY |
 | 806 | LIN-0921 | [D24](#d24) | Проверить borrowed posting view lifetime | CORRECTNESS | qualification | S | G-CORRECT |
 | 807 | LIN-0922 | [D24](#d24) | Проверить zero-copy single-term query | CORRECTNESS | qualification | S | G-CORRECT |
-| 808 | LIN-0923 | [D24](#d24) | Проверить multiword posting intersection | CORRECTNESS | qualification | S | G-CORRECT |
-| 809 | LIN-0924 | [D24](#d24) | Проверить multiword posting union | CORRECTNESS | qualification | S | G-CORRECT |
 | 810 | LIN-0925 | [D24](#d24) | Измерить shortest-list-first intersection | PERF | candidate | M | G-PERF |
 | 811 | LIN-0926 | [D24](#d24) | Измерить galloping posting intersection | PERF | candidate | M | G-PERF |
 | 812 | LIN-0927 | [D24](#d24) | Измерить bitmap/list adaptive intersection | PERF | candidate | M | G-PERF |
 | 813 | LIN-0928 | [D24](#d24) | Измерить query token cache | PERF | candidate | M | G-PERF |
-| 814 | LIN-0929 | [D24](#d24) | Проверить frequent-term Top-K exactness | CORRECTNESS | qualification | S | G-CORRECT |
-| 815 | LIN-0930 | [D24](#d24) | Проверить selective-term ranking exactness | CORRECTNESS | qualification | S | G-CORRECT |
-| 816 | LIN-0931 | [D24](#d24) | Проверить miss-query empty output | CORRECTNESS | qualification | S | G-CORRECT |
 | 817 | LIN-0932 | [D24](#d24) | Проверить repeated-query-term weighting | CORRECTNESS | qualification | S | G-CORRECT |
 | 818 | LIN-0933 | [D24](#d24) | Спроектировать phrase search | FEATURE | candidate | L | G-FEATURE |
 | 819 | LIN-0934 | [D24](#d24) | Спроектировать proximity search | FEATURE | candidate | L | G-FEATURE |
@@ -746,7 +734,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 823 | LIN-0938 | [D24](#d24) | Спроектировать BM25 opt-in | FEATURE | candidate | L | G-FEATURE |
 | 824 | LIN-0939 | [D24](#d24) | Спроектировать score explanation API | FEATURE | candidate | L | G-FEATURE |
 | 825 | LIN-0940 | [D24](#d24) | Спроектировать score model versioning | FEATURE | candidate | L | G-FEATURE |
-| 826 | LIN-0941 | [D24](#d24) | Проверить lexical score tie ordering | CORRECTNESS | qualification | S | G-CORRECT |
 | 827 | LIN-0942 | [D24](#d24) | Проверить hybrid candidate completeness | CORRECTNESS | qualification | S | G-CORRECT |
 | 828 | LIN-0943 | [D24](#d24) | Проверить hybrid RRF exactness | CORRECTNESS | qualification | S | G-CORRECT |
 | 829 | LIN-0944 | [D24](#d24) | Проверить hybrid bounded result equivalence | CORRECTNESS | qualification | S | G-CORRECT |
@@ -1275,7 +1262,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 1399 | LIN-1971 | [D50](#d50) | Описать replication version compatibility | DOC | candidate | S | G-DOC |
 | 1400 | LIN-1972 | [D50](#d50) | Описать downgrade support boundaries | DOC | candidate | S | G-DOC |
 
-#### P3: 583 пунктов
+#### P3: 581 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -1444,9 +1431,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 1567 | LIN-0951 | [D24](#d24) | Добавить hit-count estimation policy | FEATURE | candidate | M | G-FEATURE |
 | 1568 | LIN-0952 | [D24](#d24) | Добавить FTS query complexity budget | FEATURE | candidate | M | G-FEATURE |
 | 1569 | LIN-0953 | [D24](#d24) | Проверить query cancellation внутри postings | CORRECTNESS | qualification | S | G-CORRECT |
-| 1570 | LIN-0954 | [D24](#d24) | Проверить pending-delete candidate filtering | CORRECTNESS | qualification | S | G-CORRECT |
 | 1571 | LIN-0955 | [D24](#d24) | Проверить mutation-generation query visibility | CORRECTNESS | qualification | S | G-CORRECT |
-| 1572 | LIN-0956 | [D24](#d24) | Проверить rebuilt/live FTS score parity | CORRECTNESS | qualification | S | G-CORRECT |
 | 1573 | LIN-0957 | [D24](#d24) | Добавить query term fanout metrics | FEATURE | candidate | M | G-FEATURE |
 | 1574 | LIN-0958 | [D24](#d24) | Добавить candidate pruning counters | FEATURE | candidate | M | G-FEATURE |
 | 1575 | LIN-0959 | [D24](#d24) | Добавить score distribution diagnostics | FEATURE | candidate | M | G-FEATURE |

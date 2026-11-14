@@ -81,7 +81,7 @@ impl FtsIndex {
     fn append_row_with_scratch(&mut self, row_idx: usize, row: &Row, scratch: &mut String) {
         for text in fts_texts(row, &self.fields) {
             let lowered = lowercased(text, scratch);
-            for tok in lowered.split_ascii_whitespace() {
+            for tok in lowered.split_whitespace() {
                 add_posting(&mut self.postings, tok, row_idx);
             }
         }
@@ -92,7 +92,14 @@ impl FtsIndex {
     pub fn append_slab(&mut self, start: usize, rows: &[Row]) {
         if self.adds.is_empty() && self.dels.is_empty() && !rows.is_empty() {
             let first = &rows[0];
-            let uniform = rows[1..].iter().all(|r| r.len() == first.len());
+            // The slot mask below is computed from the first row's field positions, so
+            // every row must have the same fields, not merely as many (rows with one
+            // shape share it, which makes the common case a pointer comparison).
+            let same_fields = |r: &Row| match (r.shape(), first.shape()) {
+                (Some(a), Some(b)) if Arc::ptr_eq(a, b) => true,
+                _ => r.len() == first.len() && r.keys().eq(first.keys()),
+            };
+            let uniform = rows[1..].iter().all(same_fields);
             if uniform && first.len() <= 32 {
                 let has_snippet = self.fields.iter().any(|f| f == "snippet");
                 let mut target_fields: SmallVec<[&str; 4]> =
@@ -113,7 +120,9 @@ impl FtsIndex {
                         if (slot_mask & (1u32 << pos)) != 0 {
                             if let Some(text) = val.text() {
                                 let lowered = lowercased(text, &mut scratch);
-                                for tok in lowered.split_ascii_whitespace() {
+                                // Same word boundaries as single-row inserts, removals
+                                // and queries (Unicode whitespace, not ASCII only).
+                                for tok in lowered.split_whitespace() {
                                     add_posting(&mut self.postings, tok, row_idx);
                                 }
                             }
