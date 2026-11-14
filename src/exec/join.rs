@@ -649,11 +649,12 @@ impl Db {
         Some(result)
     }
 
-    /// `filter? | sort* | project | sort* | skip* | take` (explicit take) without rows:
-    /// the projected columns plus any key column the projection drops come from the
-    /// columnar filter path, each `sort` permutes row positions exactly as
+    /// `filter? | join? | sort* | project | sort* | skip* | take` (explicit take) without
+    /// rows: the projected columns plus any key column the projection drops come from
+    /// the columnar filter or FK-join path, each `sort` permutes row positions exactly as
     /// `sort_rows_top_k` permutes rows (same top-k lookahead, same order of equal keys),
-    /// and only the rows that survive `skip` / `take` are gathered.
+    /// and only the rows that survive `skip` / `take` are gathered. Keys are matched by
+    /// full field name, so `users.email` after a join works like any other field.
     pub(super) fn try_sort_project_batch(
         &self,
         q: &Query,
@@ -665,6 +666,7 @@ impl Db {
             return None;
         }
         let mut filter: Option<&Pred> = None;
+        let mut join: Option<&Step> = None;
         let mut fields: Option<&[Field]> = None;
         let mut sorts: Vec<(&Field, bool)> = Vec::new();
         let mut skip_n: usize = 0;
@@ -672,14 +674,13 @@ impl Db {
         for (i, step) in q.steps.iter().enumerate() {
             match step {
                 Step::Filter(p) if i == 0 => filter = Some(p),
+                Step::Join { .. } if join.is_none() && sorts.is_empty() && fields.is_none() => {
+                    join = Some(step);
+                }
                 Step::Sort { field, desc } if skip_n == 0 && take.is_none() => {
-                    field.leaf()?;
                     sorts.push((field, *desc));
                 }
                 Step::Project(f) if fields.is_none() && skip_n == 0 && take.is_none() => {
-                    if f.iter().any(|x| x.leaf().is_none()) {
-                        return None;
-                    }
                     fields = Some(f.as_slice());
                 }
                 Step::Skip { n } if fields.is_some() && take.is_none() => {
@@ -694,6 +695,21 @@ impl Db {
         if sorts.is_empty() {
             return None;
         }
+        // The `orders` / `users` SoA join reads `total` from an f64 buffer, so integer
+        // totals come back as floats; the row pipeline keeps them as stored. Leave that
+        // case to the rows rather than change what a sorted query returns.
+        if let Some(Step::Join {
+            collection, on, ..
+        }) = join
+            && let Source::Collection(left) = &q.source
+            && left == "orders"
+            && collection == "users"
+            && on == "user_id"
+            && self.store.orders_soa_ready()
+            && self.store.users_soa_ready()
+        {
+            return None;
+        }
         // A sort after the projection sees only projected fields; one before it may use a
         // field the projection drops, read as a hidden column.
         let proj_at = q.steps.iter().position(|s| matches!(s, Step::Project(_)))?;
@@ -701,19 +717,22 @@ impl Db {
         let mut base: Vec<Field> = fields.to_vec();
         for (i, step) in q.steps.iter().enumerate() {
             if let Step::Sort { field, .. } = step {
-                let leaf = field.leaf()?;
+                let key = field.as_str();
                 if i > proj_at {
-                    if !names.iter().any(|n| n == leaf) {
+                    if !names.iter().any(|n| *n == key) {
                         return None;
                     }
-                } else if !base.iter().any(|b| b.leaf() == Some(leaf)) {
+                } else if !base.iter().any(|b| b.as_str() == key) {
                     base.push(field.clone());
                 }
             }
         }
-        let mut steps = Vec::with_capacity(3);
+        let mut steps = Vec::with_capacity(4);
         if let Some(p) = filter {
             steps.push(Step::Filter(p.clone()));
+        }
+        if let Some(j) = join {
+            steps.push(j.clone());
         }
         steps.push(Step::Project(base.clone()));
         steps.push(Step::Take { n: None });
@@ -723,13 +742,21 @@ impl Db {
             explain: None,
             ignore_filter: q.ignore_filter,
         };
-        let batch = self.try_filter_project_batch(&base_q, bindings, now)?;
+        let batch = if join.is_some() {
+            self.try_join_project_batch(&base_q, bindings, now)?
+        } else {
+            self.try_filter_project_batch(&base_q, bindings, now)?
+        };
+        let base_names = field_names(&base);
+        if batch.names.len() != base_names.len() {
+            return None;
+        }
         let cols: Vec<Vec<Cell>> = batch
             .cols
             .into_iter()
             .map(crate::batch::Column::into_cells)
             .collect();
-        let col_of = |leaf: &str| base.iter().position(|b| b.leaf() == Some(leaf));
+        let col_of = |name: &str| base_names.iter().position(|b| b == name);
         let mut order: Vec<usize> = (0..cols.first().map_or(0, Vec::len)).collect();
         let last_sort = sorts.len() - 1;
         for (k, (field, desc)) in sorts.iter().enumerate() {
@@ -739,7 +766,7 @@ impl Db {
                 Some(t) if k == last_sort => Some(skip_n.saturating_add(t.max(0) as usize)),
                 _ => None,
             };
-            let c = col_of(field.leaf()?)?;
+            let c = col_of(&field.as_str())?;
             let keys: Vec<Cell> = order.iter().map(|&i| cols[c][i].clone_for_borrow()).collect();
             order = sort_positions_top_k(&keys, *desc, top_k)
                 .into_iter()
@@ -751,10 +778,10 @@ impl Db {
         if let Some(t) = take {
             slice = &slice[..slice.len().min(t.max(0) as usize)];
         }
-        let names_arc: Arc<[String]> = names.into();
+        let names_arc: Arc<[String]> = names.clone().into();
         let mut out = RecordBatch::with_capacity(names_arc, slice.len());
-        for (ci, f) in fields.iter().enumerate() {
-            let c = col_of(f.leaf()?)?;
+        for (ci, name) in names.iter().enumerate() {
+            let c = col_of(name)?;
             for &row in slice {
                 out.cols[ci].push(cols[c][row].clone_for_borrow());
             }

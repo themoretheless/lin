@@ -5622,3 +5622,96 @@ fn columnar_sort_matches_row_pipeline() {
         }
     }
 }
+
+/// Sorting after an FK join runs on the join's columns: keys from either side, before or
+/// after the projection, inner and left joins, in memory and on cold collections; the
+/// answer equals the row pipeline's (reference: the same query with its `take` repeated),
+/// value types included.
+#[test]
+fn columnar_sort_after_join_matches_row_pipeline() {
+    fn seed(db: &mut Db) {
+        // A generic pair as well as `orders` / `users` (which has its own SoA join).
+        db.run("col acct { id: text, region: text }\ncol tx { id: text, acct: text, amount: i64 }\nfk tx.acct -> acct.id")
+            .unwrap();
+        let mut src = String::from("insert acct [");
+        for i in 0..60 {
+            if i > 0 {
+                src.push(',');
+            }
+            src.push_str(&format!(r#"{{ id: "a{i}", region: "r{}" }}"#, i % 7));
+        }
+        src.push(']');
+        db.run(&src).unwrap();
+        let mut src = String::from("insert tx [");
+        for i in 0..700 {
+            if i > 0 {
+                src.push(',');
+            }
+            src.push_str(&format!(r#"{{ id: "t{i}", acct: "a{}", amount: {} }}"#, (i * 11) % 60, (i * 13) % 40));
+        }
+        src.push(']');
+        db.run(&src).unwrap();
+        let mut src = String::from("insert users [");
+        for i in 0..120 {
+            if i > 0 {
+                src.push(',');
+            }
+            src.push_str(&format!(r#"{{ id: "u{i}", email: "m{}@example.com" }}"#, i % 17));
+        }
+        src.push(']');
+        db.run(&src).unwrap();
+        let mut src = String::from("insert orders [");
+        for i in 0..900 {
+            if i > 0 {
+                src.push(',');
+            }
+            src.push_str(&format!(
+                r#"{{ id: "o{i}", user_id: "u{}", total: {} }}"#,
+                (i * 7) % 120,
+                (i * 31) % 50
+            ));
+        }
+        src.push(']');
+        db.run(&src).unwrap();
+    }
+    let dir = tmp();
+    let opts = || lin::OpenOpts {
+        sync: lin::SyncMode::Full,
+        cold: true,
+    };
+    {
+        let mut db = Db::open_with(&dir, opts()).unwrap();
+        seed(&mut db);
+        db.checkpoint().unwrap();
+        db.close().unwrap();
+    }
+    let mut cold = Db::open_with(&dir, opts()).unwrap();
+    cold.run("fk tx.acct -> acct.id").unwrap();
+    assert!(cold.store.is_disk_backed("orders"));
+    assert!(cold.store.is_disk_backed("tx"));
+    let mut hot = Db::empty();
+    seed(&mut hot);
+    let queries = [
+        ("tx | join acct on acct | sort acct.region | { id, acct.region, amount } | take 25", " | take 25"),
+        ("tx | amount > 10 | join acct on acct | { id, acct.region, amount } | sort amount desc | skip 4 | take 30", " | take 30"),
+        ("tx | join left acct on acct | sort acct.region desc | { id, amount } | sort amount | take all", " | take all"),
+        ("orders | join users on user_id | sort users.email | { id, users.email, total } | take 20", " | take 20"),
+        ("orders | join users on user_id | { id, users.email, total } | sort total desc | skip 5 | take 30", " | take 30"),
+        ("orders | total > 40 | join users on user_id | sort total | { id, users.email } | take all", " | take all"),
+        ("orders | join users on user_id | sort users.email desc | { id, total } | sort total | take 50", " | take 50"),
+        ("orders | join left users on user_id | sort users.email | { id, users.email } | take 40", " | take 40"),
+    ];
+    let cells = |db: &mut Db, q: &str| -> Vec<String> {
+        db.run(q).unwrap().rows.iter().map(|r| format!("{r:?}")).collect()
+    };
+    for (label, db) in [("in-memory", &mut hot), ("cold", &mut cold)] {
+        for (q, again) in queries {
+            let want = cells(db, &format!("{q}{again}"));
+            assert!(!want.is_empty(), "{label}: {q}");
+            assert_eq!(cells(db, q), want, "{label}: {q}");
+            let batch: Vec<String> =
+                db.run_batch(q).unwrap().to_rows().iter().map(|r| format!("{r:?}")).collect();
+            assert_eq!(batch, want, "{label}: run_batch {q}");
+        }
+    }
+}
