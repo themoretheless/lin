@@ -191,9 +191,18 @@ fn pull_io<S: Read + Write>(
             "wal ship: pull payload {len} exceeds max {MAX_PULL_BYTES}"
         )));
     }
-    let mut frames = vec![0u8; len as usize];
-    if len > 0 {
-        stream.read_exact(&mut frames).map_err(io_err)?;
+    // Grow with the data actually received instead of allocating the announced length up
+    // front: a broken or hostile server announcing the maximum and sending nothing must
+    // not cost 256 MiB.
+    let mut frames = Vec::with_capacity((len as usize).min(1 << 20));
+    Read::take(&mut stream, len)
+        .read_to_end(&mut frames)
+        .map_err(io_err)?;
+    if frames.len() as u64 != len {
+        return Err(Error::runtime(format!(
+            "wal ship: pull payload truncated at {} of {len} bytes",
+            frames.len()
+        )));
     }
     Ok(frames)
 }
@@ -706,6 +715,124 @@ mod tests {
         drop(stalled);
         server.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Clients that send garbage, an oversized token length, their request one byte at
+    /// a time, half-close their side, or vanish mid-connection are each handled without
+    /// disturbing the others, and a normal pull still gets the right frames.
+    #[test]
+    fn fanout_survives_hostile_and_sloppy_clients() {
+        use std::io::{Read, Write};
+        use std::net::Shutdown;
+        let dir = std::env::temp_dir().join(format!(
+            "lin-ship-hostile-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut db = Db::open(&dir).unwrap();
+        for i in 0..3 {
+            db.run(&format!(
+                r#"insert docs {{ uri: "raw://hostile/{i}", title: "H {i}", layer: "wiki" }}"#
+            ))
+            .unwrap();
+        }
+        let expected = db.export_wal_since(0).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        const CLIENTS: usize = 7;
+        let server = thread::spawn(move || {
+            serve_fanout(&db, &listener, &ServeOpts::default(), 4, Some(CLIENTS)).unwrap();
+            let _ = db.close();
+        });
+
+        let hello = {
+            let mut h = Vec::new();
+            write_hello(&mut h, "", 0).unwrap();
+            h
+        };
+        // 1. Garbage instead of the magic.
+        let mut garbage = TcpStream::connect(addr).unwrap();
+        garbage.write_all(b"GET / HTTP/1.1\r\n\r\n").unwrap();
+        // 2. A token length far past the limit.
+        let mut oversized = TcpStream::connect(addr).unwrap();
+        oversized.write_all(&PROTO_MAGIC).unwrap();
+        oversized.write_all(&u16::MAX.to_le_bytes()).unwrap();
+        // 3. Connect and vanish.
+        drop(TcpStream::connect(addr).unwrap());
+        // 4. The request one byte at a time.
+        let slow = thread::spawn({
+            let hello = hello.clone();
+            move || {
+                let mut s = TcpStream::connect(addr).unwrap();
+                for b in &hello {
+                    s.write_all(&[*b]).unwrap();
+                    thread::sleep(Duration::from_millis(2));
+                }
+                let mut len = [0u8; 8];
+                s.read_exact(&mut len).unwrap();
+                let mut body = vec![0u8; u64::from_le_bytes(len) as usize];
+                s.read_exact(&mut body).unwrap();
+                body
+            }
+        });
+        // 5. Request, then half-close the sending side.
+        let half = thread::spawn({
+            let hello = hello.clone();
+            move || {
+                let mut s = TcpStream::connect(addr).unwrap();
+                s.write_all(&hello).unwrap();
+                s.shutdown(Shutdown::Write).unwrap();
+                let mut out = Vec::new();
+                s.read_to_end(&mut out).unwrap();
+                out
+            }
+        });
+        // 6. Request, then reset before reading the answer.
+        {
+            let mut s = TcpStream::connect(addr).unwrap();
+            s.write_all(&hello).unwrap();
+        }
+        // 7. A normal pull.
+        let frames = pull(addr, 0).unwrap();
+        assert_eq!(frames, expected);
+        assert_eq!(slow.join().unwrap(), expected);
+        let half_out = half.join().unwrap();
+        assert_eq!(&half_out[8..], &expected[..]);
+        drop(garbage);
+        drop(oversized);
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A server that announces a huge payload and then closes is reported as a truncated
+    /// pull, not trusted for its announced size.
+    #[test]
+    fn pull_rejects_a_server_that_lies_about_the_payload_size() {
+        use std::io::Write;
+        for announced in [MAX_PULL_BYTES, 1024u64, MAX_PULL_BYTES + 1] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr: SocketAddr = listener.local_addr().unwrap();
+            let server = thread::spawn(move || {
+                let (mut s, _) = listener.accept().unwrap();
+                let _ = read_hello(&mut s);
+                s.write_all(&announced.to_le_bytes()).unwrap();
+                s.write_all(b"only a few bytes").unwrap();
+                // Closing here ends the payload long before the announced size.
+            });
+            let started = std::time::Instant::now();
+            let err = pull(addr, 0).err().expect("a short payload must fail");
+            assert!(
+                err.to_string().contains("truncated") || err.to_string().contains("exceeds"),
+                "{announced}: {err}"
+            );
+            assert!(started.elapsed() < Duration::from_secs(10));
+            server.join().unwrap();
+        }
     }
 
     #[test]

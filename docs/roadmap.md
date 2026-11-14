@@ -2,7 +2,7 @@
 
 Срез: **2026-11-14**, коммит `58444cf6e` (релиз 0.7.1) плюс незакоммиченное рабочее дерево. Единственный файл с планом в репозитории: в нём только несделанное. Реализованное описано в [CHANGELOG](../CHANGELOG.md), в документах `docs/` по отдельным механизмам и в отчётах `benches/results/`.
 
-Открыто **1673** пунктов backlog (часть II) и 12 пунктов части I: 10 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
+Открыто **1666** пунктов backlog (часть II) и 12 пунктов части I: 10 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровывались, поэтому в них есть пропуски: закрытые пункты удалены. Пункты части II со статусами `candidate` и `qualification` по коду поштучно не сверялись: перед взятием пункта сначала проверить, не покрыт ли он уже.
 
@@ -191,9 +191,9 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 Для каждой строки итоговый критерий — её конкретный результат плюс указанный gate. Если критерий требует недоступной платформы/endpoint, статус остаётся непроверенным; mock/compile не заменяет live qualification.
 
-### Приоритетный список — 1673 пунктов
+### Приоритетный список — 1666 пунктов
 
-Количества: P1: 3, P2: 1084, P3: 586; статусы: blocked_external: 1, candidate: 934, qualification: 738.
+Количества: P1: 3, P2: 1078, P3: 585; статусы: blocked_external: 1, candidate: 934, qualification: 731.
 
 #### P1: 3 пунктов
 
@@ -203,7 +203,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 2 | LIN-0002 | [D01](#d01) | Закрыть durable 1k SQLite gap | PERF | qualification | M | G-PERF |
 | 22 | LIN-0006 | [D01](#d01) | Получить тестовый endpoint Kusto | OPS | blocked_external | M | G-OPS |
 
-#### P2: 1084 пунктов
+#### P2: 1078 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -983,14 +983,8 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 1071 | LIN-1374 | [D35](#d35) | Спроектировать replication authorization scopes | FEATURE | candidate | L | G-FEATURE |
 | 1072 | LIN-1375 | [D35](#d35) | Спроектировать authenticated peer identity | FEATURE | candidate | L | G-FEATURE |
 | 1073 | LIN-1376 | [D35](#d35) | Спроектировать replay-resistant session nonce | FEATURE | candidate | L | G-FEATURE |
-| 1074 | LIN-1377 | [D35](#d35) | Ограничить incoming frame size | CORRECTNESS | qualification | M | G-CORRECT |
 | 1075 | LIN-1378 | [D35](#d35) | Ограничить handshake read duration | CORRECTNESS | qualification | M | G-CORRECT |
 | 1076 | LIN-1379 | [D35](#d35) | Ограничить idle connection lifetime | CORRECTNESS | qualification | M | G-CORRECT |
-| 1077 | LIN-1380 | [D35](#d35) | Ограничить active replication clients | CORRECTNESS | qualification | M | G-CORRECT |
-| 1078 | LIN-1381 | [D35](#d35) | Проверить partial network reads | CORRECTNESS | qualification | S | G-CORRECT |
-| 1079 | LIN-1382 | [D35](#d35) | Проверить partial network writes | CORRECTNESS | qualification | S | G-CORRECT |
-| 1080 | LIN-1383 | [D35](#d35) | Проверить connection reset handling | CORRECTNESS | qualification | S | G-CORRECT |
-| 1081 | LIN-1384 | [D35](#d35) | Проверить half-closed socket behavior | CORRECTNESS | qualification | S | G-CORRECT |
 | 1082 | LIN-1405 | [D36](#d36) | Проверить follower read-only enforcement | CORRECTNESS | qualification | S | G-CORRECT |
 | 1083 | LIN-1406 | [D36](#d36) | Проверить follower local mutation rejection | CORRECTNESS | qualification | S | G-CORRECT |
 | 1084 | LIN-1407 | [D36](#d36) | Проверить follower catalog propagation | CORRECTNESS | qualification | S | G-CORRECT |
@@ -1292,7 +1286,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 1399 | LIN-1971 | [D50](#d50) | Описать replication version compatibility | DOC | candidate | S | G-DOC |
 | 1400 | LIN-1972 | [D50](#d50) | Описать downgrade support boundaries | DOC | candidate | S | G-DOC |
 
-#### P3: 586 пунктов
+#### P3: 585 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -1619,7 +1613,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 1728 | LIN-1392 | [D35](#d35) | Спроектировать transport capability negotiation | FEATURE | candidate | L | G-FEATURE |
 | 1729 | LIN-1393 | [D35](#d35) | Проверить cancellation при transfer | CORRECTNESS | qualification | S | G-CORRECT |
 | 1730 | LIN-1394 | [D35](#d35) | Проверить slow follower backpressure | CORRECTNESS | qualification | S | G-CORRECT |
-| 1731 | LIN-1395 | [D35](#d35) | Проверить abusive sender resource bound | CORRECTNESS | qualification | S | G-CORRECT |
 | 1732 | LIN-1396 | [D35](#d35) | Проверить graceful server shutdown | CORRECTNESS | qualification | S | G-CORRECT |
 | 1733 | LIN-1397 | [D35](#d35) | Добавить network fault replay corpus | VERIFY | qualification | S | G-VERIFY |
 | 1734 | LIN-1398 | [D35](#d35) | Добавить TLS integration matrix | FEATURE | candidate | M | G-FEATURE |
