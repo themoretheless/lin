@@ -27,8 +27,8 @@ pub use tx::Transaction;
 pub(crate) use agg::*;
 pub(crate) use eval::*;
 pub(crate) use join::{
-    JoinFieldPlan, emit_join_row, merge_join_row, plan_join_fields, pred_total_gt,
-    project_join_fields, rows_to_rough_batch,
+    JoinFieldPlan, emit_join_row, merge_join_row, order_total_cell, plan_join_fields,
+    pred_total_gt, project_join_fields, rows_to_rough_batch,
 };
 
 use dml::{cached_content_hash, pack_has_schema, stmt_append_only, stmt_schema, stmt_writes};

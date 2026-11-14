@@ -426,6 +426,9 @@ struct LazyJoinSoa<'a> {
     orders_id: &'a [Arc<str>],
     orders_uid: &'a [Arc<str>],
     orders_total: &'a [f64],
+    /// Rows behind the SoA buffers: `total` is read from them to keep its stored type.
+    orders_rows: &'a [Row],
+    total_slot: crate::store::row::FieldSlot<'static>,
     users_email: &'a [Arc<str>],
     probe: UserProbe<'a>,
     skip_left: usize,
@@ -1371,7 +1374,7 @@ fn collect_seed_keys_arc(
 
 impl<'a> LazyJoinSoa<'a> {
     #[inline]
-    fn next_matched(&mut self) -> Option<(&'a Arc<str>, f64, Option<&'a Arc<str>>)> {
+    fn next_matched(&mut self) -> Option<(&'a Arc<str>, Cell, Option<&'a Arc<str>>)> {
         let probe = self.probe.map();
         let n = self.orders_id.len();
 
@@ -1432,6 +1435,12 @@ impl<'a> LazyJoinSoa<'a> {
                 debug_assert!(ui < self.users_email.len());
                 unsafe { self.users_email.get_unchecked(ui) }
             });
+            let total = crate::exec::order_total_cell(
+                &mut self.total_slot,
+                self.orders_rows,
+                self.orders_total,
+                idx,
+            );
             return Some((order_id, total, email));
         }
     }
@@ -1446,7 +1455,7 @@ fn next_lazy_join_soa(join: &mut LazyJoinSoa<'_>) -> Option<Result<Row, Error>> 
         *slot = cell_from_arc_inline(order_id);
     }
     if let Some(slot) = vals.next() {
-        *slot = Cell::Float(total);
+        *slot = total;
     }
     if let Some(slot) = vals.next() {
         *slot = match email {
@@ -1466,7 +1475,7 @@ fn next_lazy_join_soa_projected(join: &mut LazyJoinSoa<'_>) -> Option<Result<Pro
             Some(e) => cell_from_arc_inline(e),
             None => Cell::Null,
         },
-        Cell::Float(total),
+        total,
     ];
     Some(Ok(ProjectedRow {
         fields: Arc::clone(&join.fields),
@@ -1604,6 +1613,8 @@ fn try_lazy_join_soa<'a>(db: &CursorDb<'a>, q: &Query) -> Result<Option<LazyJoin
         orders_id,
         orders_uid,
         orders_total,
+        orders_rows: store.collection("orders"),
+        total_slot: crate::store::row::FieldSlot::new("total"),
         users_email,
         probe,
         skip_left: skip_n,

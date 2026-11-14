@@ -695,21 +695,6 @@ impl Db {
         if sorts.is_empty() {
             return None;
         }
-        // The `orders` / `users` SoA join reads `total` from an f64 buffer, so integer
-        // totals come back as floats; the row pipeline keeps them as stored. Leave that
-        // case to the rows rather than change what a sorted query returns.
-        if let Some(Step::Join {
-            collection, on, ..
-        }) = join
-            && let Source::Collection(left) = &q.source
-            && left == "orders"
-            && collection == "users"
-            && on == "user_id"
-            && self.store.orders_soa_ready()
-            && self.store.users_soa_ready()
-        {
-            return None;
-        }
         // A sort after the projection sees only projected fields; one before it may use a
         // field the projection drops, read as a hidden column.
         let proj_at = q.steps.iter().position(|s| matches!(s, Step::Project(_)))?;
@@ -1468,6 +1453,7 @@ impl Db {
         let orders_id = self.store.orders_id();
         let orders_uid = self.store.orders_user_id();
         let orders_total = self.store.orders_total();
+        let orders_rows = self.store.collection("orders");
         let n = orders_id.len();
 
         let total_gt = filter.and_then(pred_total_gt);
@@ -1528,6 +1514,7 @@ impl Db {
                             let mut local_batch =
                                 RecordBatch::with_capacity(names_arc_clone, c_end - c_start);
                             let mut slots = filter.map(super::eval::PredSlots::new);
+                            let mut total_slot = crate::store::row::FieldSlot::new("total");
                             if fast_id_email_total {
                                 for pos in c_start..c_end {
                                     let idx = match source_ref {
@@ -1557,7 +1544,7 @@ impl Db {
                                                 .push(Cell::Text(Arc::clone(&orders_id[idx])));
                                             local_batch.cols[1].push(Cell::Null);
                                             local_batch.cols[2]
-                                                .push(Cell::Float(orders_total[idx]));
+                                                .push(order_total_cell(&mut total_slot, orders_rows, orders_total, idx));
                                         }
                                         continue;
                                     };
@@ -1565,7 +1552,7 @@ impl Db {
                                         .push(Cell::Text(Arc::clone(&orders_id[idx])));
                                     local_batch.cols[1]
                                         .push(Cell::Text(Arc::clone(&users_email[ui])));
-                                    local_batch.cols[2].push(Cell::Float(orders_total[idx]));
+                                    local_batch.cols[2].push(order_total_cell(&mut total_slot, orders_rows, orders_total, idx));
                                 }
                             } else {
                                 for pos in c_start..c_end {
@@ -1601,7 +1588,7 @@ impl Db {
                                                 "user_id" => {
                                                     Cell::Text(Arc::clone(&orders_uid[idx]))
                                                 }
-                                                "total" => Cell::Float(orders_total[idx]),
+                                                "total" => order_total_cell(&mut total_slot, orders_rows, orders_total, idx),
                                                 _ => self
                                                     .store
                                                     .get_by_idx("orders", idx)
@@ -1651,6 +1638,7 @@ impl Db {
         }
 
         let mut slots = filter.map(super::eval::PredSlots::new);
+        let mut total_slot = crate::store::row::FieldSlot::new("total");
         let mut pos = 0usize;
         if fast_id_email_total {
             loop {
@@ -1692,13 +1680,13 @@ impl Db {
                     if left_join {
                         batch.cols[0].push(Cell::Text(Arc::clone(&orders_id[idx])));
                         batch.cols[1].push(Cell::Null);
-                        batch.cols[2].push(Cell::Float(orders_total[idx]));
+                        batch.cols[2].push(order_total_cell(&mut total_slot, orders_rows, orders_total, idx));
                     }
                     continue;
                 };
                 batch.cols[0].push(Cell::Text(Arc::clone(&orders_id[idx])));
                 batch.cols[1].push(Cell::Text(Arc::clone(&users_email[ui])));
-                batch.cols[2].push(Cell::Float(orders_total[idx]));
+                batch.cols[2].push(order_total_cell(&mut total_slot, orders_rows, orders_total, idx));
             }
             finish_batch(&mut batch, skip_n, explicit_take);
             return Some(batch);
@@ -1750,7 +1738,7 @@ impl Db {
                     JoinFieldPlan::Left(k) => match k.as_str() {
                         "id" => Cell::Text(Arc::clone(&orders_id[idx])),
                         "user_id" => Cell::Text(Arc::clone(&orders_uid[idx])),
-                        "total" => Cell::Float(orders_total[idx]),
+                        "total" => order_total_cell(&mut total_slot, orders_rows, orders_total, idx),
                         _ => self
                             .store
                             .get_by_idx("orders", idx)
@@ -2017,6 +2005,23 @@ impl Db {
             }
         }
         Ok(out)
+    }
+}
+
+/// `total` of the order at position `idx`, as stored: the SoA buffer is f64 and would
+/// turn integer totals into floats, so the value comes from the row (an absent field is
+/// null, as a row projection makes it); the buffer is only a fallback.
+/// `slot` caches the field's position for the rows' shape.
+#[inline]
+pub(crate) fn order_total_cell(
+    slot: &mut crate::store::row::FieldSlot<'static>,
+    rows: &[Row],
+    totals: &[f64],
+    idx: usize,
+) -> Cell {
+    match rows.get(idx) {
+        Some(row) => slot.get(row).map(Cell::clone_for_borrow).unwrap_or(Cell::Null),
+        None => Cell::Float(totals[idx]),
     }
 }
 

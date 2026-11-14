@@ -5715,3 +5715,42 @@ fn columnar_sort_after_join_matches_row_pipeline() {
         }
     }
 }
+
+/// The `orders` / `users` join through the SoA buffers returns `total` as stored (an
+/// integer stays an integer, an absent total is null), like the row pipeline, as a
+/// statement, a batch and a cursor.
+#[test]
+fn soa_join_keeps_total_types() {
+    use lin::Queryable;
+    let mut db = Db::empty();
+    db.run(r#"insert users [{ id: "u1", email: "a@x" }, { id: "u2", email: "b@x" }]"#).unwrap();
+    db.run(r#"insert orders [{ id: "o1", user_id: "u1", total: 5 }, { id: "o2", user_id: "u2", total: 7.5 }, { id: "o3", user_id: "u1" }]"#)
+        .unwrap();
+    let totals = |rows: &[lin::Row]| -> Vec<Option<lin::Cell>> {
+        rows.iter().map(|r| r.get("total").cloned()).collect()
+    };
+    let q = "orders | join users on user_id | { id, users.email, total } | take all";
+    // The row pipeline (a repeated take keeps the columnar paths out) is the reference.
+    let want = totals(&db.run(&format!("{q} | take all")).unwrap().rows);
+    assert_eq!(
+        want,
+        vec![Some(lin::Cell::Int(5)), Some(lin::Cell::Float(7.5)), Some(lin::Cell::Null)]
+    );
+    assert_eq!(totals(&db.run(q).unwrap().rows), want, "statement");
+    assert_eq!(totals(&db.run_batch(q).unwrap().to_rows()), want, "batch");
+    let cursor: Vec<lin::Row> = Queryable::from("orders")
+        .join("users", "user_id")
+        .select(["id", "users.email", "total"])
+        .take_all()
+        .cursor(&db)
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(totals(&cursor), want, "cursor");
+    let sorted = "orders | join users on user_id | sort total desc | { id, total } | take 2";
+    assert_eq!(
+        totals(&db.run(sorted).unwrap().rows),
+        totals(&db.run(&format!("{sorted} | take 2")).unwrap().rows),
+        "sorted"
+    );
+}
