@@ -881,6 +881,81 @@ impl Db {
                 }
             }
         }
+        // `min` / `max` likewise run on the columns: strict comparison by `cmp_sort`,
+        // nulls skipped, the first of equal values kept, groups in `cmp_sort` order, the
+        // same state accounting as `agg_extremum_filtered` (the row path below takes over
+        // past the quota).
+        if let Step::Min { field, by } | Step::Max { field, by } = agg {
+            let is_max = matches!(agg, Step::Max { .. });
+            let is_better = |cand: &Cell, prev: &Cell| -> bool {
+                let ord = super::eval::cmp_sort(cand, prev);
+                if is_max { ord.is_gt() } else { ord.is_lt() }
+            };
+            let fk = field.as_str();
+            let pos = |name: &str| batch.names.iter().position(|n| n == name);
+            if let Some(vi) = pos(&fk) {
+                let vcol = &batch.cols[vi];
+                match by {
+                    None => {
+                        let mut best: Option<Cell> = None;
+                        for i in 0..vcol.len() {
+                            let c = vcol.get(i);
+                            if !matches!(c, Cell::Null) && best.as_ref().is_none_or(|p| is_better(&c, p)) {
+                                best = Some(c);
+                            }
+                        }
+                        let mut row = crate::store::acquire_row();
+                        row.insert(fk, best.unwrap_or(Cell::Null));
+                        return Ok(Some(vec![row]));
+                    }
+                    Some(by) => {
+                        let bk = by.as_str();
+                        if let Some(ki) = pos(&bk) {
+                            let kcol = &batch.cols[ki];
+                            let mut map: FxHashMap<Cell, Option<Cell>> = FxHashMap::default();
+                            let mut state_bytes = 0usize;
+                            let mut within_quota = true;
+                            for i in 0..kcol.len() {
+                                let key = kcol.get(i);
+                                if !map.contains_key(&key) {
+                                    let key_size = match &key {
+                                        Cell::Text(s) => s.len() + 32,
+                                        _ => 16,
+                                    };
+                                    state_bytes = state_bytes.saturating_add(key_size + 64);
+                                    if state_bytes > max_bytes {
+                                        within_quota = false;
+                                        break;
+                                    }
+                                }
+                                let v = vcol.get(i);
+                                let entry = map.entry(key).or_insert(None);
+                                if !matches!(v, Cell::Null)
+                                    && entry.as_ref().is_none_or(|p| is_better(&v, p))
+                                {
+                                    *entry = Some(v);
+                                }
+                            }
+                            if within_quota {
+                                let mut entries: Vec<(Cell, Option<Cell>)> = map.into_iter().collect();
+                                entries.sort_unstable_by(|(a, _), (b, _)| super::eval::cmp_sort(a, b));
+                                return Ok(Some(
+                                    entries
+                                        .into_iter()
+                                        .map(|(g, v)| {
+                                            let mut row = crate::store::acquire_row();
+                                            row.insert(bk.clone(), g);
+                                            row.insert(fk.clone(), v.unwrap_or(Cell::Null));
+                                            row
+                                        })
+                                        .collect(),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let rows = batch.to_rows();
         let out = match agg {
             Step::Count { by: Some(by) } => super::agg::agg_count(&rows, by, max_bytes, spill)?,
