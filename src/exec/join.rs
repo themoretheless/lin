@@ -848,9 +848,40 @@ impl Db {
         let Some(batch) = self.try_join_project_batch(&base_q, bindings, now) else {
             return Ok(None);
         };
-        let rows = batch.to_rows();
         let max_bytes = self.quotas.max_aggregate_bytes;
         let spill = self.quotas.spill_enabled;
+        // Counting needs no rows: the group map is filled straight from the key column,
+        // with the same key handling, state accounting and output as `agg_count`. Past
+        // the state quota the row path below takes over (it spills or reports the quota).
+        if let Step::Count { by } = agg {
+            let Some(by) = by else {
+                return Ok(Some(vec![super::agg::hits_row(batch.n() as i64)]));
+            };
+            if let Some(col) = batch.cols.first() {
+                let mut map: FxHashMap<Cell, i64> = FxHashMap::default();
+                let mut state_bytes = 0usize;
+                let mut within_quota = true;
+                for i in 0..col.len() {
+                    let cell = col.get(i);
+                    if !map.contains_key(&cell) {
+                        let key_size = match &cell {
+                            Cell::Text(s) => s.len() + 32,
+                            _ => 16,
+                        };
+                        state_bytes = state_bytes.saturating_add(key_size + 64);
+                        if state_bytes > max_bytes {
+                            within_quota = false;
+                            break;
+                        }
+                    }
+                    *map.entry(cell).or_insert(0) += 1;
+                }
+                if within_quota {
+                    return Ok(Some(super::agg::count_cell_map_to_rows(&by.as_str(), map)));
+                }
+            }
+        }
+        let rows = batch.to_rows();
         let out = match agg {
             Step::Count { by: Some(by) } => super::agg::agg_count(&rows, by, max_bytes, spill)?,
             Step::Count { by: None } => vec![super::agg::hits_row(rows.len() as i64)],

@@ -5847,3 +5847,50 @@ fn join_aggregates_match_row_pipeline() {
         }
     }
 }
+
+/// Past the aggregate state quota, a grouped count after a join behaves like the row
+/// pipeline: an error without spilling, the same groups with spilling.
+#[test]
+fn join_count_respects_the_aggregate_quota() {
+    fn db(spill: bool) -> Db {
+        let mut db = Db::empty().with_quotas(lin::Quotas {
+            max_aggregate_bytes: 400,
+            spill_enabled: spill,
+            ..lin::Quotas::default()
+        });
+        db.run("col acct { id: text, region: text }\ncol tx { id: text, acct: text }\nfk tx.acct -> acct.id")
+            .unwrap();
+        let mut src = String::from("insert acct [");
+        for i in 0..40 {
+            if i > 0 {
+                src.push(',');
+            }
+            src.push_str(&format!(r#"{{ id: "a{i}", region: "region-{i}" }}"#));
+        }
+        src.push(']');
+        db.run(&src).unwrap();
+        let mut src = String::from("insert tx [");
+        for i in 0..400 {
+            if i > 0 {
+                src.push(',');
+            }
+            src.push_str(&format!(r#"{{ id: "t{i}", acct: "a{}" }}"#, i % 40));
+        }
+        src.push(']');
+        db.run(&src).unwrap();
+        db
+    }
+    let q = "tx | join acct on acct | count by acct.region";
+    let reference = format!("{q} | take all | take all");
+    let mut strict = db(false);
+    let got = strict.run(q).map(|h| h.rows.len()).map_err(|e| e.to_string());
+    let want = strict.run(&reference).map(|h| h.rows.len()).map_err(|e| e.to_string());
+    assert!(want.is_err(), "the quota is meant to be exceeded: {want:?}");
+    assert_eq!(got, want);
+    let mut spilling = db(true);
+    let got: Vec<String> = spilling.run(q).unwrap().rows.iter().map(|r| format!("{r:?}")).collect();
+    let want: Vec<String> =
+        spilling.run(&reference).unwrap().rows.iter().map(|r| format!("{r:?}")).collect();
+    assert_eq!(got.len(), 40);
+    assert_eq!(got, want);
+}
