@@ -87,6 +87,41 @@ mod wal_integrity_tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    /// A record written by a newer build can carry a `Pack` variant or field this build
+    /// does not know. Decoding must fail with an error (so open refuses the log) rather
+    /// than panic or decode it as something else; known records next to it still decode.
+    #[test]
+    fn unknown_record_variants_are_errors_not_panics() {
+        let record = LogRecord {
+            r#gen: 3,
+            next_id: 4,
+            pack: Pack::AppendFactsBulk {
+                s: vec![Arc::from("s")],
+                p: vec![Arc::from("p")],
+                o: vec![Arc::from("o")],
+            },
+        };
+        let mut raw = Vec::new();
+        rmp_serde::encode::write_named(&mut raw, &record).unwrap();
+        assert!(decode_frame(&LOG_MAGIC_V1, &raw).is_ok());
+        let name = b"append_facts_bulk";
+        let at = raw.windows(name.len()).position(|w| w == name).expect("variant name in bytes");
+        for replacement in [b"append_facts_bulx".as_slice(), b"zzzzzzzzzzzzzzzzz".as_slice()] {
+            let mut bad = raw.clone();
+            bad[at..at + name.len()].copy_from_slice(replacement);
+            let res = std::panic::catch_unwind(|| decode_frame(&LOG_MAGIC_V1, &bad));
+            assert!(matches!(res, Ok(Err(_))), "unknown variant must be an error");
+        }
+        // Every single-byte change of the record either decodes or errors; none panics.
+        for i in 0..raw.len() {
+            for flip in [0x01u8, 0x80, 0xff] {
+                let mut bad = raw.clone();
+                bad[i] ^= flip;
+                assert!(std::panic::catch_unwind(|| decode_frame(&LOG_MAGIC_V1, &bad)).is_ok(), "panic at byte {i}");
+            }
+        }
+    }
+
     #[test]
     fn parallel_sparse_rows_preserve_serial_bytes_and_worker_fallback() {
         let rows = (0..4101)
