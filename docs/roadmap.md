@@ -2,7 +2,7 @@
 
 Срез: **2026-11-14**, коммит `58444cf6e` (релиз 0.7.1) плюс незакоммиченное рабочее дерево. Единственный файл с планом в репозитории: в нём только несделанное. Реализованное описано в [CHANGELOG](../CHANGELOG.md), в документах `docs/` по отдельным механизмам и в отчётах `benches/results/`.
 
-Открыто **1703** пунктов backlog (часть II) и 12 пунктов части I: 10 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
+Открыто **1695** пунктов backlog (часть II) и 12 пунктов части I: 10 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровывались, поэтому в них есть пропуски: закрытые пункты удалены. Пункты части II со статусами `candidate` и `qualification` по коду поштучно не сверялись: перед взятием пункта сначала проверить, не покрыт ли он уже.
 
@@ -191,9 +191,9 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 Для каждой строки итоговый критерий — её конкретный результат плюс указанный gate. Если критерий требует недоступной платформы/endpoint, статус остаётся непроверенным; mock/compile не заменяет live qualification.
 
-### Приоритетный список — 1703 пунктов
+### Приоритетный список — 1695 пунктов
 
-Количества: P1: 3, P2: 1114, P3: 586; статусы: blocked_external: 1, candidate: 934, qualification: 768.
+Количества: P1: 3, P2: 1106, P3: 586; статусы: blocked_external: 1, candidate: 934, qualification: 760.
 
 #### P1: 3 пунктов
 
@@ -203,7 +203,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 2 | LIN-0002 | [D01](#d01) | Закрыть durable 1k SQLite gap | PERF | qualification | M | G-PERF |
 | 22 | LIN-0006 | [D01](#d01) | Получить тестовый endpoint Kusto | OPS | blocked_external | M | G-OPS |
 
-#### P2: 1114 пунктов
+#### P2: 1106 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -429,17 +429,9 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 456 | LIN-0442 | [D12](#d12) | Уточнить unexpected-token diagnostics | API | candidate | M | G-API |
 | 457 | LIN-0443 | [D12](#d12) | Уточнить unterminated-string diagnostics | API | candidate | M | G-API |
 | 458 | LIN-0444 | [D12](#d12) | Уточнить trailing-input diagnostics | API | candidate | M | G-API |
-| 459 | LIN-0445 | [D12](#d12) | Ограничить parser recursion depth | CORRECTNESS | qualification | M | G-CORRECT |
-| 460 | LIN-0446 | [D12](#d12) | Ограничить expression token count | CORRECTNESS | qualification | M | G-CORRECT |
-| 461 | LIN-0447 | [D12](#d12) | Ограничить numeric literal length | CORRECTNESS | qualification | M | G-CORRECT |
 | 462 | LIN-0448 | [D12](#d12) | Ограничить escaped string expansion | CORRECTNESS | qualification | M | G-CORRECT |
 | 463 | LIN-0449 | [D12](#d12) | Проверить Unicode identifiers policy | CORRECTNESS | qualification | S | G-CORRECT |
 | 464 | LIN-0450 | [D12](#d12) | Проверить whitespace lexical classes | CORRECTNESS | qualification | S | G-CORRECT |
-| 465 | LIN-0451 | [D12](#d12) | Проверить embedded NUL lexer input | CORRECTNESS | qualification | S | G-CORRECT |
-| 466 | LIN-0452 | [D12](#d12) | Проверить CRLF source spans | CORRECTNESS | qualification | S | G-CORRECT |
-| 467 | LIN-0453 | [D12](#d12) | Проверить operator precedence matrix | CORRECTNESS | qualification | S | G-CORRECT |
-| 468 | LIN-0454 | [D12](#d12) | Проверить associativity of chained operators | CORRECTNESS | qualification | S | G-CORRECT |
-| 469 | LIN-0455 | [D12](#d12) | Проверить unary minus boundaries | CORRECTNESS | qualification | S | G-CORRECT |
 | 470 | LIN-0456 | [D12](#d12) | Проверить parenthesis recovery policy | CORRECTNESS | qualification | S | G-CORRECT |
 | 472 | LIN-0458 | [D12](#d12) | Спроектировать named parameter binding | API | candidate | L | G-API |
 | 473 | LIN-0459 | [D12](#d12) | Спроектировать batch statement separators | API | candidate | L | G-API |

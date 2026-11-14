@@ -1151,21 +1151,19 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_pred(&mut self) -> Result<Pred, Error> {
-        let mut left = self.parse_and()?;
+        let mut terms = vec![self.parse_and()?];
         while self.eat_kw("or") {
-            let right = self.parse_and()?;
-            left = Pred::Or(Box::new(left), Box::new(right));
+            terms.push(self.parse_and()?);
         }
-        Ok(left)
+        Ok(join_chain(terms, Pred::Or))
     }
 
     fn parse_and(&mut self) -> Result<Pred, Error> {
-        let mut left = self.parse_unary_pred()?;
+        let mut terms = vec![self.parse_unary_pred()?];
         while self.eat_kw("and") {
-            let right = self.parse_unary_pred()?;
-            left = Pred::And(Box::new(left), Box::new(right));
+            terms.push(self.parse_unary_pred()?);
         }
-        Ok(left)
+        Ok(join_chain(terms, Pred::And))
     }
 
     fn parse_unary_pred(&mut self) -> Result<Pred, Error> {
@@ -1865,4 +1863,33 @@ mod absolute_timestamp_tests {
             assert!(Parser::new(src).parse_value().is_err(), "{src}");
         }
     }
+}
+
+/// Chains of more terms than this are joined as a balanced tree.
+const BALANCED_CHAIN_MIN: usize = 32;
+
+/// Join a chain of `and` / `or` terms. Short chains keep the left-nested shape. A long
+/// chain is joined pairwise into a balanced tree, so a million terms nest about twenty
+/// levels deep instead of a million: checking, planning, evaluating and dropping the
+/// predicate recurse along that depth, and a left-nested chain of that length overflowed
+/// the stack. Both operators are associative and side-effect free, and pairwise joining
+/// keeps the terms in source order, so results do not change.
+fn join_chain(mut terms: Vec<Pred>, join: fn(Box<Pred>, Box<Pred>) -> Pred) -> Pred {
+    if terms.len() < BALANCED_CHAIN_MIN {
+        let mut it = terms.into_iter();
+        let first = it.next().expect("a chain has at least one term");
+        return it.fold(first, |left, right| join(Box::new(left), Box::new(right)));
+    }
+    while terms.len() > 1 {
+        let mut next = Vec::with_capacity(terms.len().div_ceil(2));
+        let mut it = terms.into_iter();
+        while let Some(a) = it.next() {
+            match it.next() {
+                Some(b) => next.push(join(Box::new(a), Box::new(b))),
+                None => next.push(a),
+            }
+        }
+        terms = next;
+    }
+    terms.pop().expect("a chain has at least one term")
 }
