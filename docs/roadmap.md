@@ -2,7 +2,7 @@
 
 Срез: **2026-11-14**, коммит `58444cf6e` (релиз 0.7.1) плюс незакоммиченное рабочее дерево. Единственный файл с планом в репозитории: в нём только несделанное. Реализованное описано в [CHANGELOG](../CHANGELOG.md), в документах `docs/` по отдельным механизмам и в отчётах `benches/results/`.
 
-Открыто **1593** пунктов backlog (часть II) и 12 пунктов части I: 10 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
+Открыто **1591** пунктов backlog (часть II) и 12 пунктов части I: 10 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровывались, поэтому в них есть пропуски: закрытые пункты удалены. Пункты части II со статусами `candidate` и `qualification` по коду поштучно не сверялись: перед взятием пункта сначала проверить, не покрыт ли он уже.
 
@@ -194,9 +194,9 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 Для каждой строки итоговый критерий — её конкретный результат плюс указанный gate. Если критерий требует недоступной платформы/endpoint, статус остаётся непроверенным; mock/compile не заменяет live qualification.
 
-### Приоритетный список — 1593 пунктов
+### Приоритетный список — 1591 пунктов
 
-Количества: P1: 3, P2: 1016, P3: 574; статусы: blocked_external: 1, candidate: 934, qualification: 658.
+Количества: P1: 3, P2: 1014, P3: 574; статусы: blocked_external: 1, candidate: 934, qualification: 656.
 
 #### P1: 3 пунктов
 
@@ -206,7 +206,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 2 | LIN-0002 | [D01](#d01) | Закрыть durable 1k SQLite gap | PERF | qualification | M | G-PERF |
 | 22 | LIN-0006 | [D01](#d01) | Получить тестовый endpoint Kusto | OPS | blocked_external | M | G-OPS |
 
-#### P2: 1016 пунктов
+#### P2: 1014 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -351,7 +351,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 351 | LIN-0295 | [D08](#d08) | Измерить cloned inline strings | PERF | candidate | M | G-PERF |
 | 352 | LIN-0296 | [D08](#d08) | Измерить shared large strings | PERF | candidate | M | G-PERF |
 | 355 | LIN-0299 | [D08](#d08) | Проверить timestamp/value distinction | CORRECTNESS | qualification | S | G-CORRECT |
-| 359 | LIN-0304 | [D08](#d08) | Проверить scalar display roundtrip | CORRECTNESS | qualification | S | G-CORRECT |
 | 360 | LIN-0305 | [D08](#d08) | Спроектировать explicit decimal Cell | FEATURE | candidate | L | G-FEATURE |
 | 361 | LIN-0306 | [D08](#d08) | Спроектировать binary payload Cell | FEATURE | candidate | L | G-FEATURE |
 | 362 | LIN-0307 | [D08](#d08) | Спроектировать duration Cell | FEATURE | candidate | L | G-FEATURE |
@@ -362,7 +361,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 367 | LIN-0312 | [D08](#d08) | Спроектировать row version metadata | FEATURE | candidate | L | G-FEATURE |
 | 368 | LIN-0313 | [D08](#d08) | Проверить serde backward compatibility | CORRECTNESS | qualification | S | G-CORRECT |
 | 369 | LIN-0314 | [D08](#d08) | Проверить serde unknown variants | CORRECTNESS | qualification | S | G-CORRECT |
-| 370 | LIN-0315 | [D08](#d08) | Проверить serde text escaping | CORRECTNESS | qualification | S | G-CORRECT |
 | 371 | LIN-0316 | [D08](#d08) | Проверить serde allocation limits | CORRECTNESS | qualification | S | G-CORRECT |
 | 372 | LIN-0317 | [D08](#d08) | Измерить inline-key layout alternatives | PERF | candidate | M | G-PERF |
 | 373 | LIN-0318 | [D08](#d08) | Измерить hot/cold row metadata | PERF | candidate | M | G-PERF |

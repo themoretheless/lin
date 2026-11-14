@@ -399,17 +399,51 @@ impl<'a> Parser<'a> {
             match self.bump() {
                 None => return Err(self.err("unterminated string")),
                 Some('"') => return Ok(out),
-                Some('\\') => match self.bump() {
-                    Some('n') => out.push('\n'),
-                    Some('t') => out.push('\t'),
-                    Some('\\') => out.push('\\'),
-                    Some('"') => out.push('"'),
-                    Some(c) => out.push(c),
-                    None => return Err(self.err("unterminated string")),
-                },
+                Some('\\') => self.string_escape(&mut out)?,
                 Some(c) => out.push(c),
             }
         }
+    }
+
+    /// One escape after a backslash. Accepts the escapes string values are printed with
+    /// (Rust `{:?}` form: `\n \t \r \0 \\ \" \' \u{..}`), so printed text parses back to
+    /// the same value; any other escape is kept as written, backslash included.
+    fn string_escape(&mut self, out: &mut String) -> Result<(), Error> {
+        match self.bump() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some('0') => out.push('\0'),
+            Some('\\') => out.push('\\'),
+            Some('"') => out.push('"'),
+            Some('\'') => out.push('\''),
+            Some('u') => {
+                if self.bump() != Some('{') {
+                    return Err(self.err("expected `{` after \\u"));
+                }
+                let mut hex = String::new();
+                loop {
+                    match self.bump() {
+                        Some('}') => break,
+                        Some(c) if c.is_ascii_hexdigit() && hex.len() < 6 => hex.push(c),
+                        _ => return Err(self.err("bad \\u{..} escape")),
+                    }
+                }
+                let ch = u32::from_str_radix(&hex, 16)
+                    .ok()
+                    .and_then(char::from_u32)
+                    .ok_or_else(|| self.err("bad \\u{..} escape"))?;
+                out.push(ch);
+            }
+            // Any other escape keeps its backslash, so regex patterns such as `"\d+"`
+            // mean what they say (this used to drop the backslash and match `d+`).
+            Some(c) => {
+                out.push('\\');
+                out.push(c);
+            }
+            None => return Err(self.err("unterminated string")),
+        }
+        Ok(())
     }
 
     fn expect_string_arc(&mut self) -> Result<std::sync::Arc<str>, Error> {
@@ -442,14 +476,7 @@ impl<'a> Parser<'a> {
             match self.bump() {
                 None => return Err(self.err("unterminated string")),
                 Some('"') => return Ok(out),
-                Some('\\') => match self.bump() {
-                    Some('n') => out.push('\n'),
-                    Some('t') => out.push('\t'),
-                    Some('\\') => out.push('\\'),
-                    Some('"') => out.push('"'),
-                    Some(c) => out.push(c),
-                    None => return Err(self.err("unterminated string")),
-                },
+                Some('\\') => self.string_escape(&mut out)?,
                 Some(c) => out.push(c),
             }
         }
