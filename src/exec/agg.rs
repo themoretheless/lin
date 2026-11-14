@@ -1628,13 +1628,14 @@ impl Db {
         {
             let col = self.store.collection(&plan.collection);
             let pred_opt = if covered { None } else { plan.filter.as_ref() };
+            let mut residual = pred_opt.map(PredSlots::new);
             match &plan.kind {
                 AggKind::Sum { field, by: None } => {
                     let fk = field.as_str();
                     let mut total = crate::exact_sum::ExactSum::default();
                     for i in idxs {
                         if let Some(r) = col.get(i)
-                            && pred_opt.is_none_or(|p| eval_pred(p, r, now))
+                            && residual.as_mut().is_none_or(|f| f.eval(r, now))
                         {
                             total.add_cell(r.get(&fk));
                         }
@@ -1649,7 +1650,7 @@ impl Db {
                     let mut count = 0usize;
                     for i in idxs {
                         if let Some(r) = col.get(i)
-                            && pred_opt.is_none_or(|p| eval_pred(p, r, now))
+                            && residual.as_mut().is_none_or(|f| f.eval(r, now))
                             && let Some(v) = r.get(&fk).and_then(Cell::as_f64)
                         {
                             sum += v;
@@ -1671,7 +1672,7 @@ impl Db {
                     let mut best: Option<Cell> = None;
                     for i in idxs {
                         if let Some(r) = col.get(i)
-                            && pred_opt.is_none_or(|p| eval_pred(p, r, now))
+                            && residual.as_mut().is_none_or(|f| f.eval(r, now))
                             && let Some(c) = r.get(&fk).filter(|c| !matches!(c, Cell::Null))
                         {
                             best = Some(match best {
@@ -1705,8 +1706,11 @@ impl Db {
                 let Some(by) = by else {
                     let mut n = 0i64;
                     if let Some(p) = filter {
+                        // Cached field positions per row shape instead of a search by
+                        // name for every field of the predicate in every row.
+                        let mut flt = PredSlots::new(p);
                         for r in col {
-                            if eval_pred(p, r, now) {
+                            if flt.eval(r, now) {
                                 n += 1;
                             }
                         }
@@ -1933,12 +1937,11 @@ impl Db {
 
         let col = self.store.collection(name);
         let mut map: FxHashMap<Cell, i64> = FxHashMap::default();
+        let mut flt = PredSlots::new(pred);
+        let mut key_slot = FieldSlot::new(&by_key);
         for r in col {
-            if eval_pred(pred, r, now) {
-                let cell = r
-                    .get(&by_key)
-                    .map(Cell::clone_for_borrow)
-                    .unwrap_or(Cell::Null);
+            if flt.eval(r, now) {
+                let cell = key_slot.get(r).map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
                 *map.entry(cell).or_insert(0) += 1;
             }
         }
