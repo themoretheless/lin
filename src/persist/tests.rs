@@ -2568,7 +2568,7 @@ mod neon_sparse_writer_tests {
             let mut r = crate::store::Row::new();
             r.insert("id", crate::store::Cell::text_arc(format!("doc-{}", i)));
             r.insert(
-                "content".into(),
+                "content",
                 crate::store::Cell::text_arc(
                     "highly compressible repetitive content text data for zstd test",
                 ),
