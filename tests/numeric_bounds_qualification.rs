@@ -67,4 +67,15 @@ fn cold_tier_sums_are_exact_too() {
     db.run(r#"insert big { id: "c", v: 9223372036854775807, g: "y" }"#).unwrap();
     assert_eq!(one(&mut db, "big | sum v", "v").as_f64(), Some(i64::MAX as f64 - 1.0));
     assert_eq!(one(&mut db, r#"big | g == "x" | sum v"#, "v").as_f64(), Some(-1.0));
+    // Grouped, straight from the segment columns plus the overlay row.
+    let rows = db.run("big | sum v by g").unwrap().rows.clone();
+    let by = |g: &str| rows.iter().find(|r| r.get("g").and_then(|c| c.text()) == Some(g)).and_then(|r| r.get("v")).and_then(|c| c.as_f64());
+    assert_eq!(by("x"), Some(-1.0));
+    assert_eq!(by("y"), Some(i64::MAX as f64));
+    assert_eq!(by("z"), Some(0.0));
+    // The same groups after a checkpoint folds the overlay into a segment.
+    db.checkpoint().unwrap();
+    let rows = db.run("big | sum v by g").unwrap().rows.clone();
+    let by = |g: &str| rows.iter().find(|r| r.get("g").and_then(|c| c.text()) == Some(g)).and_then(|r| r.get("v")).and_then(|c| c.as_f64());
+    assert_eq!(by("x"), Some(-1.0));
 }

@@ -2363,8 +2363,8 @@ impl DiskEngine {
     ) -> Result<Option<FxHashMap<Cell, f64>>, Error> {
         // One partial map per segment (in parallel for large multi-segment tables), merged in
         // segment order so the float sums do not depend on scheduling.
-        let partials = self.map_segments(table, |seg| -> Result<Option<FxHashMap<Cell, f64>>, Error> {
-            let mut map: FxHashMap<Cell, f64> = FxHashMap::default();
+        let partials = self.map_segments(table, |seg| -> Result<Option<FxHashMap<Cell, crate::exact_sum::ExactSum>>, Error> {
+            let mut map: FxHashMap<Cell, crate::exact_sum::ExactSum> = FxHashMap::default();
             let Some(fc) = seg.fixed_col(val_field) else {
                 if seg.col(val_field).is_none() {
                     return Ok(Some(map));
@@ -2383,37 +2383,38 @@ impl DiskEngine {
             match seg.col(by_field) {
                 Some(MmapCol::Dict(dc)) => {
                     let nd = dc.strings.len();
-                    let mut ord_sums = vec![0.0f64; nd];
+                    let mut ord_sums = vec![crate::exact_sum::ExactSum::default(); nd];
                     let mut ord_seen = vec![false; nd];
-                    let mut null_sum = 0.0f64;
+                    let mut null_sum = crate::exact_sum::ExactSum::default();
                     let mut null_seen = false;
                     for rid in 0..rc {
                         if !all_live && self.tombstones.is_dead(sid, rid) {
                             continue;
                         }
-                        let val = if fc.is_null(rid) {
-                            0.0
-                        } else if is_int {
-                            fc.read_i64(rid) as f64
-                        } else {
-                            fc.read_f64(rid)
-                        };
+                        let mut val = crate::exact_sum::ExactSum::default();
+                        if !fc.is_null(rid) {
+                            if is_int {
+                                val.add_i64(fc.read_i64(rid));
+                            } else {
+                                val.add_f64(fc.read_f64(rid));
+                            }
+                        }
                         let code = dc.code_at(rid);
                         if code == DICT_NULL_CODE {
-                            null_sum += val;
+                            null_sum.merge(val);
                             null_seen = true;
                         } else if let Some(slot) = ord_sums.get_mut(code as usize) {
-                            *slot += val;
+                            slot.merge(val);
                             ord_seen[code as usize] = true;
                         }
                     }
                     if null_seen {
-                        *map.entry(Cell::Null).or_insert(0.0) += null_sum;
+                        map.entry(Cell::Null).or_default().merge(null_sum);
                     }
                     for (ci, (&sum_v, &seen)) in ord_sums.iter().zip(ord_seen.iter()).enumerate() {
                         if seen {
                             let cell = dc.get_cell_by_code(ci as u16);
-                            *map.entry(cell).or_insert(0.0) += sum_v;
+                            map.entry(cell).or_default().merge(sum_v);
                         }
                     }
                 }
@@ -2424,37 +2425,38 @@ impl DiskEngine {
                         if !all_live && self.tombstones.is_dead(sid, rid) {
                             continue;
                         }
-                        let val = if fc.is_null(rid) {
-                            0.0
-                        } else if is_int {
-                            fc.read_i64(rid) as f64
-                        } else {
-                            fc.read_f64(rid)
-                        };
+                        let mut val = crate::exact_sum::ExactSum::default();
+                        if !fc.is_null(rid) {
+                            if is_int {
+                                val.add_i64(fc.read_i64(rid));
+                            } else {
+                                val.add_f64(fc.read_f64(rid));
+                            }
+                        }
                         let cell = match seg.borrow_col_str(by_pos, rid, &mut lb)? {
                             Some(s) => Cell::from_text(s),
                             None => Cell::Null,
                         };
-                        *map.entry(cell).or_insert(0.0) += val;
+                        map.entry(cell).or_default().merge(val);
                     }
                 }
                 None => {
                     let seg_sum = fc
                         .sum_f64_live(all_live, |rid| !self.tombstones.is_dead(sid, rid))
-                        .map_or(0.0, crate::exact_sum::ExactSum::value);
+                        .unwrap_or_default();
                     let live_cnt = seg
                         .meta
                         .row_count
                         .saturating_sub(self.tombstones.dead_count(sid));
                     if live_cnt > 0 {
-                        *map.entry(Cell::Null).or_insert(0.0) += seg_sum;
+                        map.entry(Cell::Null).or_default().merge(seg_sum);
                     }
                 }
                 _ => return Ok(None),
             }
             Ok(Some(map))
         })?;
-        let mut map: FxHashMap<Cell, f64> = FxHashMap::default();
+        let mut map: FxHashMap<Cell, crate::exact_sum::ExactSum> = FxHashMap::default();
         for partial in partials {
             let Some(partial) = partial else {
                 return Ok(None);
@@ -2463,7 +2465,7 @@ impl DiskEngine {
                 map = partial;
             } else {
                 for (cell, v) in partial {
-                    *map.entry(cell).or_insert(0.0) += v;
+                    map.entry(cell).or_default().merge(v);
                 }
             }
         }
@@ -2477,11 +2479,10 @@ impl DiskEngine {
                     .get(by_field)
                     .map(Cell::clone_for_borrow)
                     .unwrap_or(Cell::Null);
-                let val = row.get(val_field).and_then(Cell::as_f64).unwrap_or(0.0);
-                *map.entry(key).or_insert(0.0) += val;
+                map.entry(key).or_default().add_cell(row.get(val_field));
             }
         }
-        Ok(Some(map))
+        Ok(Some(map.into_iter().map(|(k, v)| (k, v.value())).collect()))
     }
 
     pub fn get_by_id(&self, table: &str, id: &str) -> Result<Option<Row>, Error> {
