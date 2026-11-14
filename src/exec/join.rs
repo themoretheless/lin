@@ -956,6 +956,162 @@ impl Db {
                 }
             }
         }
+        // `sum` (exact, order-independent) and `avg` (f64, so the order of additions
+        // matters) run on the columns too. `avg` adds in the same chunks the row path
+        // uses under the `parallel` feature, merged in chunk order, so the bits match.
+        if let Step::Sum { field, by } | Step::Avg { field, by } = agg {
+            let is_sum = matches!(agg, Step::Sum { .. });
+            let fk = field.as_str();
+            let pos = |name: &str| batch.names.iter().position(|n| n == name);
+            let n = batch.n();
+            #[cfg(feature = "parallel")]
+            let chunk = if n >= super::agg::PAR_AGG_MIN_ROWS {
+                super::agg::PAR_AGG_CHUNK_ROWS
+            } else {
+                n.max(1)
+            };
+            #[cfg(not(feature = "parallel"))]
+            let chunk = n.max(1);
+            if let Some(vi) = pos(&fk) {
+                let vcol = &batch.cols[vi];
+                let key_col = match by {
+                    Some(b) => match pos(&b.as_str()) {
+                        Some(ki) => Some(&batch.cols[ki]),
+                        None => None,
+                    },
+                    None => None,
+                };
+                match (by, key_col) {
+                    (None, _) => {
+                        let value = if is_sum {
+                            let mut total = crate::exact_sum::ExactSum::default();
+                            let mut start = 0;
+                            while start < n {
+                                let end = (start + chunk).min(n);
+                                let mut part = crate::exact_sum::ExactSum::default();
+                                for i in start..end {
+                                    part.add_cell(Some(&vcol.get(i)));
+                                }
+                                total.merge(part);
+                                start = end;
+                            }
+                            total.value()
+                        } else {
+                            let (mut sum, mut count) = (0.0f64, 0usize);
+                            let mut start = 0;
+                            while start < n {
+                                let end = (start + chunk).min(n);
+                                let (mut s, mut c) = (0.0f64, 0usize);
+                                for i in start..end {
+                                    if let Some(v) = vcol.get(i).as_f64() {
+                                        s += v;
+                                        c += 1;
+                                    }
+                                }
+                                sum += s;
+                                count += c;
+                                start = end;
+                            }
+                            if count == 0 { 0.0 } else { sum / (count as f64) }
+                        };
+                        let mut row = crate::store::acquire_row();
+                        row.insert(fk, Cell::Float(value));
+                        return Ok(Some(vec![row]));
+                    }
+                    (Some(by), Some(kcol)) => {
+                        let bk = by.as_str();
+                        let key_cost = |c: &Cell| match c {
+                            Cell::Text(s) => s.len() + 32,
+                            _ => 16,
+                        };
+                        let mut state_bytes = 0usize;
+                        let mut within_quota = true;
+                        let out: Option<Vec<(Cell, f64)>> = if is_sum {
+                            let mut map: FxHashMap<Cell, crate::exact_sum::ExactSum> =
+                                FxHashMap::default();
+                            let mut start = 0;
+                            'sum_chunks: while start < n {
+                                let end = (start + chunk).min(n);
+                                let mut part: FxHashMap<Cell, crate::exact_sum::ExactSum> =
+                                    FxHashMap::default();
+                                for i in start..end {
+                                    part.entry(kcol.get(i)).or_default().add_cell(Some(&vcol.get(i)));
+                                }
+                                for (k, v) in part {
+                                    match map.get_mut(&k) {
+                                        Some(acc) => acc.merge(v),
+                                        None => {
+                                            state_bytes = state_bytes.saturating_add(key_cost(&k) + 64);
+                                            if state_bytes > max_bytes {
+                                                within_quota = false;
+                                                break 'sum_chunks;
+                                            }
+                                            map.insert(k, v);
+                                        }
+                                    }
+                                }
+                                start = end;
+                            }
+                            within_quota
+                                .then(|| map.into_iter().map(|(k, v)| (k, v.value())).collect())
+                        } else {
+                            let mut map: FxHashMap<Cell, (f64, usize)> = FxHashMap::default();
+                            let mut start = 0;
+                            'chunks: while start < n {
+                                let end = (start + chunk).min(n);
+                                let mut part: FxHashMap<Cell, (f64, usize)> = FxHashMap::default();
+                                for i in start..end {
+                                    let acc = part.entry(kcol.get(i)).or_insert((0.0, 0));
+                                    if let Some(v) = vcol.get(i).as_f64() {
+                                        acc.0 += v;
+                                        acc.1 += 1;
+                                    }
+                                }
+                                // Merge in chunk order, as the row path merges its chunk
+                                // partials: per group, partial sums are added chunk by chunk.
+                                for (k, v) in part {
+                                    match map.get_mut(&k) {
+                                        Some(acc) => {
+                                            acc.0 += v.0;
+                                            acc.1 += v.1;
+                                        }
+                                        None => {
+                                            state_bytes = state_bytes.saturating_add(key_cost(&k) + 64);
+                                            if state_bytes > max_bytes {
+                                                within_quota = false;
+                                                break 'chunks;
+                                            }
+                                            map.insert(k, v);
+                                        }
+                                    }
+                                }
+                                start = end;
+                            }
+                            within_quota.then(|| {
+                                map.into_iter()
+                                    .map(|(k, (s, c))| (k, if c == 0 { 0.0 } else { s / (c as f64) }))
+                                    .collect()
+                            })
+                        };
+                        if let Some(mut entries) = out {
+                            entries.sort_unstable_by(|(a, _), (b, _)| super::eval::cmp_sort(a, b));
+                            return Ok(Some(
+                                entries
+                                    .into_iter()
+                                    .map(|(g, v)| {
+                                        let mut row = crate::store::acquire_row();
+                                        row.insert(bk.clone(), g);
+                                        row.insert(fk.clone(), Cell::Float(v));
+                                        row
+                                    })
+                                    .collect(),
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
         let rows = batch.to_rows();
         let out = match agg {
             Step::Count { by: Some(by) } => super::agg::agg_count(&rows, by, max_bytes, spill)?,

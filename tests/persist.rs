@@ -5830,6 +5830,9 @@ fn join_aggregates_match_row_pipeline() {
         "tx | join acct on acct | min rate by acct.region",
         "tx | join acct on acct | max amount by acct.region",
         "tx | join acct on acct | min rate",
+        "tx | join acct on acct | sum rate by acct.region",
+        "tx | join acct on acct | avg amount",
+        "tx | amount > 20 | join acct on acct | avg amount by acct",
         "tx | join acct on acct | max acct.region by acct.region",
         "tx | amount > 80 | join acct on acct | min amount by acct",
         "tx | join acct on acct | count by acct",
@@ -5896,4 +5899,45 @@ fn join_count_respects_the_aggregate_quota() {
         spilling.run(&reference).unwrap().rows.iter().map(|r| format!("{r:?}")).collect();
     assert_eq!(got.len(), 40);
     assert_eq!(got, want);
+}
+
+/// `avg` after a join over enough rows to be chunked under the `parallel` feature: the
+/// column kernel must add in the same chunks as the row path, bit for bit.
+#[test]
+fn join_average_matches_row_pipeline_over_many_rows() {
+    let mut db = Db::empty();
+    db.run("col acct { id: text, region: text }\ncol tx { id: text, acct: text, rate: f64 }\nfk tx.acct -> acct.id")
+        .unwrap();
+    let mut src = String::from("insert acct [");
+    for i in 0..30 {
+        if i > 0 {
+            src.push(',');
+        }
+        src.push_str(&format!(r#"{{ id: "a{i}", region: "r{}" }}"#, i % 4));
+    }
+    src.push(']');
+    db.run(&src).unwrap();
+    for chunk in 0..14 {
+        let mut src = String::from("insert tx [");
+        for i in (chunk * 10_000)..((chunk + 1) * 10_000) {
+            if i > chunk * 10_000 {
+                src.push(',');
+            }
+            // Values with many significant bits, so the order of additions shows.
+            src.push_str(&format!(r#"{{ id: "t{i}", acct: "a{}", rate: {} }}"#, i % 30, (i as f64) * 0.1 + 1.0 / 3.0));
+        }
+        src.push(']');
+        db.run(&src).unwrap();
+    }
+    for q in ["tx | join acct on acct | avg rate", "tx | join acct on acct | avg rate by acct.region", "tx | join acct on acct | sum rate by acct.region"] {
+        let got: Vec<String> = db.run(q).unwrap().rows.iter().map(|r| format!("{r:?}")).collect();
+        let want: Vec<String> = db
+            .run(&format!("{q} | take all | take all"))
+            .unwrap()
+            .rows
+            .iter()
+            .map(|r| format!("{r:?}"))
+            .collect();
+        assert_eq!(got, want, "{q}");
+    }
 }

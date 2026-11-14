@@ -253,9 +253,9 @@ pub(crate) fn agg_count(
 
 /// Below this many rows the fork/join overhead of a parallel aggregate outweighs the scan.
 #[cfg(feature = "parallel")]
-const PAR_AGG_MIN_ROWS: usize = 65_536;
+pub(crate) const PAR_AGG_MIN_ROWS: usize = 65_536;
 #[cfg(feature = "parallel")]
-const PAR_AGG_CHUNK_ROWS: usize = 16_384;
+pub(crate) const PAR_AGG_CHUNK_ROWS: usize = 16_384;
 
 /// Grouped aggregate over materialized rows on the rayon pool: each fixed-size chunk
 /// folds into its own map, and the partials merge in chunk order, so the result does not
