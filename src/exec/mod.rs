@@ -13,6 +13,7 @@ mod eval;
 mod gpu_ops;
 mod graph_ops;
 mod join;
+mod mirror;
 mod prepared;
 mod search;
 mod tx;
@@ -178,8 +179,12 @@ pub struct Db {
     pub(crate) follower: bool,
     /// Active embedder (`search vec` / hybrid / auto-embed on insert).
     pub(crate) embedder: Option<Arc<dyn Embedder>>,
-    /// Cached read-only snapshot keyed by `(gen, docs_epoch, collections_len, edges_len, facts_len)`.
-    pub(crate) reader_cache: Option<((u64, u64, usize, usize, usize), ReadDb)>,
+    /// Cached read-only snapshot keyed by `(gen, docs_epoch, collections_epoch, collections_len, edges_len, facts_len)`.
+    pub(crate) reader_cache: Option<((u64, u64, u64, usize, usize, usize), ReadDb)>,
+    /// Fields per collection declared with [`Db::declare_columns`].
+    pub(crate) declared_cols: FxHashMap<String, Vec<String>>,
+    /// Lazily built mirrors of the declared fields, keyed by collection.
+    pub(crate) col_mirrors: std::sync::Mutex<FxHashMap<String, Arc<mirror::ColMirror>>>,
     #[cfg(feature = "gpu")]
     pub(crate) gpu: Option<Arc<crate::gpu::GpuCompute>>,
     #[cfg(feature = "gpu")]
@@ -297,7 +302,7 @@ impl Stats {
 }
 
 /// One write of a commit group (see [`Db::execute_group_sync`]).
-#[cfg_attr(not(feature = "async"), allow(dead_code))]
+#[cfg(feature = "async")]
 pub(crate) enum GroupWrite<'a> {
     Src { src: &'a str, want_rows: bool },
     Prepared { prepared: &'a Prepared, want_rows: bool },
@@ -337,6 +342,8 @@ impl Db {
             follower: false,
             embedder: Some(embedder),
             reader_cache: None,
+            declared_cols: Default::default(),
+            col_mirrors: Default::default(),
             #[cfg(feature = "gpu")]
             gpu: None,
             #[cfg(feature = "gpu")]
@@ -497,6 +504,8 @@ impl Db {
                 follower: false,
                 embedder: Some(embedder),
                 reader_cache: None,
+                declared_cols: Default::default(),
+                col_mirrors: Default::default(),
                 #[cfg(feature = "gpu")]
                 gpu: None,
                 #[cfg(feature = "gpu")]
@@ -528,6 +537,8 @@ impl Db {
             follower: false,
             embedder: Some(embedder),
             reader_cache: None,
+            declared_cols: Default::default(),
+            col_mirrors: Default::default(),
             #[cfg(feature = "gpu")]
             gpu: None,
             #[cfg(feature = "gpu")]
@@ -597,6 +608,8 @@ impl Db {
             follower: false,
             embedder: Some(embedder),
             reader_cache: None,
+            declared_cols: Default::default(),
+            col_mirrors: Default::default(),
             #[cfg(feature = "gpu")]
             gpu: None,
             #[cfg(feature = "gpu")]
@@ -658,6 +671,7 @@ impl Db {
         let cache_key = (
             self.store.r#gen,
             self.store.docs_epoch,
+            self.store.collections.epoch(),
             self.store.collections.len(),
             self.store.edges.len(),
             self.store.facts_len(),
@@ -668,6 +682,11 @@ impl Db {
         {
             return cached.clone();
         }
+        let mirrors = self
+            .col_mirrors
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let rdb = ReadDb {
             inner: Arc::new(Self {
                 catalog: self.catalog.clone(),
@@ -688,6 +707,8 @@ impl Db {
                 follower: false,
                 embedder: self.embedder.clone(),
                 reader_cache: None,
+                declared_cols: self.declared_cols.clone(),
+                col_mirrors: std::sync::Mutex::new(mirrors),
                 #[cfg(feature = "gpu")]
                 gpu: self.gpu.clone(),
                 #[cfg(feature = "gpu")]
@@ -1103,9 +1124,8 @@ impl Db {
             .collect()
     }
 
-    /// [`Db::execute_group_sync`] over a mix of source texts, prepared statements and
-    /// statement ASTs, returning full handles.
     /// One write of a commit group, outside any sync policy.
+    #[cfg(feature = "async")]
     pub(crate) fn run_group_write(&mut self, write: &GroupWrite<'_>) -> Result<Handle, Error> {
         match write {
             GroupWrite::Src { src, want_rows } => self.run_src_ext(src, *want_rows),
@@ -3433,6 +3453,62 @@ impl Db {
         self.store.disk_cluster_key(collection)
     }
 
+    /// Keep a columnar mirror of `fields` of an in-memory collection, so filters on
+    /// them scan dense codes instead of rows. The mirror is rebuilt on the first read
+    /// after any write; it is not persisted. An empty `fields` drops the declaration.
+    pub fn declare_columns(&mut self, collection: &str, fields: &[&str]) -> Result<(), Error> {
+        if !self.store.collections.contains_key(collection) || self.store.is_disk_backed(collection) {
+            return Err(Error::runtime(format!(
+                "declare columns: no in-memory collection `{collection}`"
+            )));
+        }
+        self.reader_cache = None;
+        self.col_mirrors
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(collection);
+        if fields.is_empty() {
+            self.declared_cols.remove(collection);
+        } else {
+            self.declared_cols.insert(
+                collection.to_string(),
+                fields.iter().map(|f| (*f).to_string()).collect(),
+            );
+        }
+        Ok(())
+    }
+
+    fn get_or_build_mirror(&self, name: &str) -> Option<Arc<mirror::ColMirror>> {
+        let fields = self.declared_cols.get(name)?;
+        if self.store.is_disk_backed(name)
+            || (name == "facts" && self.store.facts_rows_stale)
+            || (name == "docs" && !self.store.fts_deferred_doc_swaps.is_empty())
+        {
+            return None;
+        }
+        let rows = self.store.collections.get(name)?;
+        let epoch = self.store.collections.epoch();
+        let mut cache = self.col_mirrors.lock().unwrap_or_else(|e| e.into_inner());
+        match cache.get(name) {
+            Some(m) if m.epoch == epoch && m.len == rows.len() => Some(Arc::clone(m)),
+            _ => {
+                let m = Arc::new(mirror::ColMirror::build(rows, fields, epoch));
+                cache.insert(name.to_string(), Arc::clone(&m));
+                Some(m)
+            }
+        }
+    }
+
+    /// Positions of the rows of `name` matching `pred`, read from the declared mirror.
+    pub(crate) fn mirror_select(&self, name: &str, pred: &Pred, now: i64) -> Option<Vec<usize>> {
+        self.get_or_build_mirror(name)?.select(pred, now)
+    }
+
+    /// Count of the rows of `name` matching `pred`, read from the declared mirror.
+    pub(crate) fn mirror_count(&self, name: &str, pred: &Pred, now: i64) -> Option<usize> {
+        self.get_or_build_mirror(name)?.count(pred, now)
+    }
+
     /// Begin an interactive ACID transaction.
     pub fn transaction(&mut self) -> Result<Transaction<'_>, Error> {
         let base_gen = self.store.r#gen;
@@ -3706,7 +3782,11 @@ impl Db {
                             col_len, self.quotas.max_execution_work
                         )));
                     }
-                    self.filter_scan(name, pred, now, project_fields_step)
+                    if let Some(idxs) = self.mirror_select(name, pred, now) {
+                        self.fetch_idxs_filtered(name, &idxs, pred, now, project_fields_step, true)
+                    } else {
+                        self.filter_scan(name, pred, now, project_fields_step)
+                    }
                 } else if let Some(fields) = project_fields_step {
                     self.scan_projected(name, fields, scan_limit)
                 } else {

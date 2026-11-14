@@ -1894,10 +1894,14 @@ impl Db {
                 let n = self.store.index_seek_count(name, &uses, now)?;
                 return Some(vec![hits_row(n as i64)]);
             }
+            if let Some(n) = self.mirror_count(name, pred, now) {
+                return Some(vec![hits_row(n as i64)]);
+            }
             let col = self.store.collection(name);
+            let mut flt = PredSlots::new(pred);
             let mut n = 0i64;
             for row in col {
-                if eval_pred(pred, row, now) {
+                if flt.eval(row, now) {
                     n += 1;
                 }
             }
@@ -1928,6 +1932,22 @@ impl Db {
                 };
                 let cell = row
                     .get(&by_key)
+                    .map(Cell::clone_for_borrow)
+                    .unwrap_or(Cell::Null);
+                *map.entry(cell).or_insert(0) += 1;
+            }
+            return Some(count_cell_map_to_rows(&by_key, map));
+        }
+
+        if let Some(idxs) = self.mirror_select(name, pred, now) {
+            let mut map: FxHashMap<Cell, i64> = FxHashMap::default();
+            let mut key_slot = FieldSlot::new(&by_key);
+            for i in idxs {
+                let Some(row) = self.store.get_by_idx(name, i) else {
+                    continue;
+                };
+                let cell = key_slot
+                    .get(row)
                     .map(Cell::clone_for_borrow)
                     .unwrap_or(Cell::Null);
                 *map.entry(cell).or_insert(0) += 1;

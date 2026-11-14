@@ -4,6 +4,7 @@ pub mod checkpoint;
 pub mod columnar;
 pub mod edges;
 pub mod row;
+pub mod rowmap;
 pub mod value;
 
 #[allow(unused_imports)]
@@ -178,7 +179,7 @@ pub struct Store {
     pub r#gen: u64,
     pub embed_id: String,
     pub next_id: u64,
-    pub collections: BTreeMap<String, Vec<Row>>,
+    pub collections: rowmap::RowMap,
     pub edges: Vec<Edge>,
     pub extra_collections: BTreeMap<String, ColSnap>,
     pub extra_rels: BTreeMap<String, RelSnap>,
@@ -235,7 +236,7 @@ pub struct Store {
     facts_p: Vec<Arc<str>>,
     facts_o: Vec<Arc<str>>,
     /// When true, columnar facts are ahead of `collections["facts"]`.
-    facts_rows_stale: bool,
+    pub(crate) facts_rows_stale: bool,
     /// Columnar mmap disk tier (`DiskEngine`) for out-of-core / cold collections.
     pub(crate) disk: Option<StoreDiskTier>,
     /// FTS index field definitions for cold tables whose in-memory `fts` entry
@@ -308,7 +309,7 @@ impl Store {
             r#gen: 0,
             embed_id: embed_id.into(),
             next_id: 1,
-            collections,
+            collections: collections.into(),
             edges: Vec::new(),
             extra_collections: BTreeMap::new(),
             extra_rels: BTreeMap::new(),
@@ -868,7 +869,7 @@ impl Store {
             r#gen: self.r#gen,
             embed_id: self.embed_id.clone(),
             next_id: self.next_id,
-            collections,
+            collections: self.collections.clone_with_map(collections),
             edges: self.edges.clone(),
             extra_collections: self.extra_collections.clone(),
             extra_rels: self.extra_rels.clone(),
@@ -1225,7 +1226,7 @@ impl Store {
             r#gen: self.r#gen,
             embed_id: self.embed_id.clone(),
             next_id: self.next_id,
-            collections: self.collections.clone(),
+            collections: (*self.collections).clone(),
             edges: self.edges.clone(),
             extra_collections: self.extra_collections.clone(),
             extra_rels: self.extra_rels.clone(),
@@ -1257,7 +1258,7 @@ impl Store {
             r#gen: self.r#gen,
             embed_id: self.embed_id.clone(),
             next_id: self.next_id,
-            collections: self.collections.clone(),
+            collections: (*self.collections).clone(),
             edges: self.edges.clone(),
             extra_collections: self.extra_collections.clone(),
             extra_rels: self.extra_rels.clone(),
@@ -1276,7 +1277,7 @@ impl Store {
         self.r#gen = b.r#gen;
         self.embed_id = b.embed_id;
         self.next_id = b.next_id;
-        self.collections = b.collections;
+        self.collections = b.collections.into();
         self.edges = b.edges;
         self.extra_collections = b.extra_collections;
         self.extra_rels = b.extra_rels;

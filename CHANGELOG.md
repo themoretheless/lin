@@ -28,6 +28,7 @@
 - A truncated or empty cold column file read as missing values for the rows past its end. Segment columns are now checked against their row count when opened (row index, block offsets and the last stored block for text, codes for dictionaries, values and null flags for fixed-width columns).
 - A failed write could empty a cold collection on disk: a multi-statement program or transaction that inserted into a cold collection and then failed (for example on a duplicate key in another collection) truncated the collection to its in-memory length, zero, and the next checkpoint wrote that. Writes to cold collections are now undone from a full backup that re-attaches the untouched disk table.
 - Interactive transaction rollback could lose or keep rows: a `delete` followed by an `insert` dropped the row the delete had moved into the gap, and once the journal switched to a full backup part way through (a schema statement, or an insert after updates or deletes), the writes made before the switch survived `rollback`. The journal now records every append point and keeps the earlier journal under a mid-transaction backup, so rollback undoes statements in exact reverse.
+- Directory sync on Windows failed with `Access is denied` (`File::open` on a directory handle) when writing cold segments or snapshots; directory sync is now Unix-only while file syncs remain intact on all platforms.
 
 ### Added
 - `wal-serve --sinks N` / `ship::serve_blocking_fanout`: up to 64 followers pull at once, so a stalled one does not hold up the rest.
@@ -41,6 +42,7 @@
 - `AsyncDb::transaction` shares commit groups with statements (one sync per group).
 - `insert_batch` into a cold collection builds rows straight from the columns (no per-row statement record), about 1.5x faster on 60,000 rows; it is no longer capped by the parser's AST size quota.
 - `persist::set_wal_dictionary_writer`: opt-in writer for the dictionary vector WAL codec (codec 5). Off by default; a release without the codec cannot read such frames.
+- `Db::declare_columns`: opt-in, lazily built dictionary-coded mirrors (`ColMirror` over `RowMap` write epochs) for chosen fields of in-memory collections, accelerating filters, projections, sorts, windows, FK joins, and `count` / `count by` without adding write-path overhead; shared across `ReadDb` snapshots and automatically invalidated on writes or rollbacks.
 
 ### Changed
 - `lin::Row` is a slotted row (`src/store/row.rs`) instead of `BTreeMap<String, Cell>`. The map-like API is kept; code using `BTreeMap`-specific calls needs adjusting. New: `Row::from_parts`, `Row::from_sorted`, `Row::shape_of`, `store::row::FieldSlot`.

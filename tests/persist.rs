@@ -5941,3 +5941,136 @@ fn join_average_matches_row_pipeline_over_many_rows() {
         assert_eq!(got, want, "{q}");
     }
 }
+
+/// Filters on fields declared with `declare_columns` read the lazily built mirror; the
+/// answer equals an undeclared database's across `run`, `run_batch`, `ReadDb`, `count`,
+/// `count by`, `sort`, FK joins, mixed value types (including >22-byte strings and absent
+/// fields), updates, deletes, reads inside a transaction, rollback, and undeclaring.
+#[test]
+fn declared_column_mirror_matches_row_pipeline() {
+    fn seed(db: &mut Db) {
+        db.run("col acct { id: text, region: text }").unwrap();
+        db.run(
+            r#"insert acct [
+                { id: "g0", region: "eu" },
+                { id: "g1", region: "us" },
+                { id: "g2", region: "apac" },
+                { id: "g3", region: "eu" },
+                { id: "g4", region: "us" },
+                { id: "g5", region: "apac" },
+                { id: "g6", region: "latam" },
+                { id: "g9", region: "mena" }
+            ]"#,
+        )
+        .unwrap();
+        db.run(
+            "col ev { id: text, grp: text, acct: text, k: i64, v: f64, tag: text, mix: var }\nfk ev.acct -> acct.id",
+        )
+        .unwrap();
+        let mut src = String::from("insert ev [");
+        for i in 0..3000 {
+            if i > 0 {
+                src.push(',');
+            }
+            let g = i % 7;
+            src.push_str(&format!(
+                r#"{{ id: "e{i}", grp: "g{g}", acct: "g{g}", k: {}"#,
+                (i * 37) % 11
+            ));
+            if i % 5 != 0 {
+                src.push_str(&format!(", v: {}.5", (i * 13) % 40));
+            }
+            if i % 15 == 0 {
+                src.push_str(&format!(
+                    r#", tag: "long_tag_value_exceeding_22_bytes_{}""#,
+                    i % 4
+                ));
+            } else if i % 3 == 0 {
+                src.push_str(&format!(r#", tag: "t{}""#, i % 4));
+            }
+            if i % 4 == 0 {
+                src.push_str(", mix: 7");
+            } else if i % 4 == 1 {
+                src.push_str(r#", mix: "five""#);
+            }
+            src.push_str(" }");
+        }
+        src.push(']');
+        db.run(&src).unwrap();
+    }
+    let mut plain = Db::empty();
+    let mut decl = Db::empty();
+    seed(&mut plain);
+    seed(&mut decl);
+    assert!(decl.declare_columns("nope", &["x"]).is_err());
+    decl.declare_columns("ev", &["grp", "k", "v", "tag", "mix"])
+        .unwrap();
+    let queries = [
+        r#"ev | grp == "g3" | { id, k } | take all"#,
+        r#"ev | grp != "g3" and k >= 4 | { id, grp, v } | take all"#,
+        r#"ev | tag is null | { id } | take all"#,
+        r#"ev | not (tag in ["t1", "t2", "long_tag_value_exceeding_22_bytes_0"]) or v < 10 | { id, tag, v } | take all"#,
+        r#"ev | mix == 7 or mix == "five" | { id, mix } | take all"#,
+        r#"ev | v > 20 | { id, v } | skip 5 | take 30"#,
+        r#"ev | grp ~ "3" | { id } | take all"#,
+        r#"ev | grp == "g3" | count"#,
+        r#"ev | k >= 4 | count by grp"#,
+        r#"ev | grp == "g3" | sort k desc | { id, k } | take 20"#,
+        r#"ev | grp == "g3" | join acct on acct | { id, k, acct.region } | take all"#,
+        // `id` is not declared: the row path decides.
+        r#"ev | id == "e7" | { id, grp } | take all"#,
+    ];
+    let check = |plain: &mut Db, decl: &mut Db, stage: &str| {
+        let rdb = decl.reader();
+        for q in queries {
+            let want = format!("{:?}", plain.run(q).unwrap().rows);
+            let got = format!("{:?}", decl.run(q).unwrap().rows);
+            assert_eq!(got, want, "{stage}: run {q}");
+            let batch = format!("{:?}", decl.run_batch(q).unwrap().to_rows());
+            assert_eq!(batch, want, "{stage}: run_batch {q}");
+            let rgot = format!("{:?}", rdb.run(q).unwrap().rows);
+            assert_eq!(rgot, want, "{stage}: reader.run {q}");
+            let rbatch = format!("{:?}", rdb.run_batch(q).unwrap().to_rows());
+            assert_eq!(rbatch, want, "{stage}: reader.run_batch {q}");
+        }
+    };
+    check(&mut plain, &mut decl, "seeded");
+    let writes = [
+        r#"update ev[grp == "g3"] cas each { grp: "g9", acct: "g9", k: 100 }"#,
+        r#"delete ev[k == 4] cas each"#,
+        r#"insert ev [
+            { id: "x1", grp: "g3", acct: "g3", k: 5, v: 1.5, tag: "t1", mix: true },
+            { id: "x2", grp: "g9", tag: "long_tag_value_exceeding_22_bytes_9" }
+        ]"#,
+        r#"update ev[id == "e10"] cas each { tag: "t2", v: 99.5, mix: "five" }"#,
+    ];
+    for w in writes {
+        plain.run(w).unwrap();
+        decl.run(w).unwrap();
+        check(&mut plain, &mut decl, w);
+    }
+    // Reads inside a transaction see its writes; a rollback restores the old answer.
+    let before: Vec<String> = queries
+        .iter()
+        .map(|q| format!("{:?}", decl.run(q).unwrap().rows))
+        .collect();
+    {
+        let mut tx = decl.transaction().unwrap();
+        tx.run(r#"update ev[grp == "g1"] cas each { grp: "g3", acct: "g3" }"#)
+            .unwrap();
+        let inside = format!("{:?}", tx.run(queries[0]).unwrap().rows);
+        assert!(
+            !before[0].contains("\"e8\"") && inside.contains("\"e8\""),
+            "tx read missed its own write: {inside}"
+        );
+        drop(tx);
+    }
+    let after: Vec<String> = queries
+        .iter()
+        .map(|q| format!("{:?}", decl.run(q).unwrap().rows))
+        .collect();
+    assert_eq!(after, before, "rollback");
+    check(&mut plain, &mut decl, "after rollback");
+    decl.declare_columns("ev", &[]).unwrap();
+    check(&mut plain, &mut decl, "undeclared");
+}

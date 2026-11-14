@@ -218,6 +218,9 @@ impl Db {
         if bindings.get(name).is_some() {
             return None;
         }
+        if self.store.get_col_count(name) > self.quotas.max_execution_work {
+            return None;
+        }
         let mut filter: Option<&Pred> = None;
         let mut fields: Option<&[Field]> = None;
         let mut explicit_take: Option<Option<i64>> = None;
@@ -317,6 +320,25 @@ impl Db {
                 } else {
                     self.fetch_idxs_filtered(name, &idxs, pred, now, Some(fields), covered)
                 }
+            } else if let Some(idxs) = self.mirror_select(name, pred, now) {
+                let start = skip_n.min(idxs.len());
+                let take_n = match explicit_take {
+                    Some(Some(n)) => Some(n.max(0) as usize),
+                    Some(None) => None,
+                    None => Some(50),
+                };
+                let end = match take_n {
+                    Some(t) => start.saturating_add(t).min(idxs.len()),
+                    None => idxs.len(),
+                };
+                return Some(self.fetch_idxs_filtered(
+                    name,
+                    &idxs[start..end],
+                    pred,
+                    now,
+                    Some(fields),
+                    true,
+                ));
             } else {
                 self.filter_scan(name, pred, now, Some(fields))
             }
@@ -371,6 +393,9 @@ impl Db {
             return None;
         };
         if bindings.get(name).is_some() {
+            return None;
+        }
+        if self.store.get_col_count(name) > self.quotas.max_execution_work {
             return None;
         }
         let mut filter: Option<&Pred> = None;
@@ -1146,6 +1171,9 @@ impl Db {
         if bindings.get(name).is_some() {
             return None;
         }
+        if self.store.get_col_count(name) > self.quotas.max_execution_work {
+            return None;
+        }
 
         let mut filter: Option<&Pred> = None;
         let mut fields: Option<&[Field]> = None;
@@ -1251,6 +1279,8 @@ impl Db {
                     && let Some(idxs) = self.store.index_seek(name, &uses, now)
                 {
                     (JoinLeftSource::Idxs(idxs), !covered)
+                } else if let Some(idxs) = self.mirror_select(name, pred, now) {
+                    (JoinLeftSource::Idxs(idxs), false)
                 } else {
                     (
                         JoinLeftSource::Scan {
@@ -1487,6 +1517,8 @@ impl Db {
                     && let Some(idxs) = self.store.index_seek(left_name, &uses, now)
                 {
                     (JoinLeftSource::Idxs(idxs), !covered)
+                } else if let Some(idxs) = self.mirror_select(left_name, pred, now) {
+                    (JoinLeftSource::Idxs(idxs), false)
                 } else {
                     (
                         JoinLeftSource::Scan {
