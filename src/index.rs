@@ -1040,9 +1040,12 @@ impl LiveIndex {
         let mut lo: smallvec::SmallVec<[IndexPart; 2]> = smallvec::SmallVec::with_capacity(arity);
         let mut hi: smallvec::SmallVec<[IndexPart; 2]> = smallvec::SmallVec::with_capacity(arity);
         for (_, v) in &use_.eqs {
+            // Keys order exactly (an integer outside f64 precision keeps its exact
+            // offset from its f64 bucket), as row comparison does, so the bounds are the
+            // literal's own key and not its whole f64 bucket.
             let p = value_part(v, now);
-            lo.push(numeric_low(&p));
-            hi.push(numeric_high(&p));
+            lo.push(p.clone());
+            hi.push(p);
         }
         while lo.len() < arity {
             lo.push(IndexPart::Min);
@@ -1056,12 +1059,12 @@ impl LiveIndex {
             let p = value_part(val, now);
             match op {
                 CmpOp::Gt => {
-                    lo[pos] = numeric_high(&p);
+                    lo[pos] = p.clone();
                     lo[pos + 1..].fill(IndexPart::Max);
                 }
-                CmpOp::Ge => lo[pos] = numeric_low(&p),
+                CmpOp::Ge => lo[pos] = p.clone(),
                 CmpOp::Lt => {
-                    hi[pos] = numeric_low(&p);
+                    hi[pos] = p.clone();
                     hi[pos + 1..].fill(IndexPart::Min);
                     // Null has no numeric value and must not enter a covered range.
                     lo[pos] = match p {
@@ -1071,7 +1074,7 @@ impl LiveIndex {
                     };
                 }
                 CmpOp::Le => {
-                    hi[pos] = numeric_high(&p);
+                    hi[pos] = p.clone();
                     lo[pos] = match p {
                         IndexPart::Num(_, _) => IndexPart::Num(0, i32::MIN),
                         IndexPart::Time(_) => IndexPart::Time(i64::MIN),
@@ -1220,20 +1223,6 @@ impl LiveIndex {
                 out
             })
             .collect()
-    }
-}
-
-fn numeric_low(p: &IndexPart) -> IndexPart {
-    match p {
-        IndexPart::Num(bits, _) => IndexPart::Num(*bits, i32::MIN),
-        _ => p.clone(),
-    }
-}
-
-fn numeric_high(p: &IndexPart) -> IndexPart {
-    match p {
-        IndexPart::Num(bits, _) => IndexPart::Num(*bits, i32::MAX),
-        _ => p.clone(),
     }
 }
 
