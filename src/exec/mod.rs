@@ -161,6 +161,8 @@ pub struct Db {
     /// Packs of a multi-statement cold program in progress: applied to the disk overlay
     /// under a savepoint, logged as one batch when the program ends.
     pub(crate) cold_program_packs: Option<Vec<Pack>>,
+    /// Rows staged by `insert_batch` for the `InsertRows` statement it runs next.
+    pub(crate) pending_insert_rows: Option<(Vec<Row>, dml::BuiltShape)>,
     /// Hard limits (local prod).
     pub(crate) quotas: Quotas,
     /// Detailed wall-time phases of last open / open_read.
@@ -325,6 +327,7 @@ impl Db {
             query_cache: FxHashMap::default(),
             seen_dml_hashes: [0; 16],
             cold_program_packs: None,
+            pending_insert_rows: None,
             quotas: Quotas::default(),
             reopen: ReopenPhases::default(),
             append_rows: 0,
@@ -478,6 +481,7 @@ impl Db {
                 query_cache: FxHashMap::default(),
                 seen_dml_hashes: [0; 16],
                 cold_program_packs: None,
+                pending_insert_rows: None,
                 quotas: Quotas::default(),
                 reopen: store_phases.into(),
                 append_rows: 0,
@@ -508,6 +512,7 @@ impl Db {
             query_cache: FxHashMap::default(),
             seen_dml_hashes: [0; 16],
             cold_program_packs: None,
+            pending_insert_rows: None,
             quotas: Quotas::default(),
             reopen: store_phases.into(),
             append_rows: 0,
@@ -576,6 +581,7 @@ impl Db {
             query_cache: FxHashMap::default(),
             seen_dml_hashes: [0; 16],
             cold_program_packs: None,
+            pending_insert_rows: None,
             quotas: Quotas::default(),
             reopen: store_phases.into(),
             append_rows: 0,
@@ -666,6 +672,7 @@ impl Db {
                 query_cache: FxHashMap::default(),
                 seen_dml_hashes: [0; 16],
                 cold_program_packs: None,
+                pending_insert_rows: None,
                 quotas: self.quotas,
                 reopen: self.reopen,
                 append_rows: 0,
@@ -3159,6 +3166,9 @@ impl Db {
         if let Some(done) = self.insert_batch_cold(collection, batch)? {
             return Ok(done);
         }
+        if let Some(done) = self.insert_batch_rows(collection, batch)? {
+            return Ok(done);
+        }
         let mut records: Vec<crate::ast::Record> = (0..n)
             .map(|_| crate::ast::Record {
                 fields: Vec::with_capacity(batch.cols.len()),
@@ -3199,23 +3209,14 @@ impl Db {
             .done)
     }
 
-    /// [`Self::insert_batch`] into a cold collection, straight from the columns: the rows
-    /// are built from the batch without a `Record` per row and go to the engine overlay.
-    /// `None` when the statement path must handle the batch (collection in memory, inside
-    /// a program, keys this path does not reproduce).
-    fn insert_batch_cold(
-        &mut self,
+    /// Type-check a batch for `insert` into `collection` exactly as the checker would
+    /// check the equivalent statement. `None` when every cell is null; otherwise whether
+    /// some cell is null (an absent field).
+    fn check_batch_types(
+        &self,
         collection: &str,
         batch: &RecordBatch,
-    ) -> Result<Option<Done>, Error> {
-        let n = batch.n();
-        if self.follower
-            || n > COLD_OVERLAY_INSERT_MAX_ROWS
-            || self.cold_program_packs.is_some()
-            || !self.disk_overlay_point_dml(collection)
-        {
-            return Ok(None);
-        }
+    ) -> Result<Option<bool>, Error> {
         // The checker's type rules depend only on the kind of each value, so one record
         // per (column, kind of cell) with a placeholder value reproduces exactly what it
         // would say about the batch.
@@ -3271,7 +3272,6 @@ impl Db {
             }
         }
         if probes.is_empty() {
-            // Every cell is null: a record of absent fields; let the statement path decide.
             return Ok(None);
         }
         check::check_program(
@@ -3282,6 +3282,30 @@ impl Db {
             }],
             &self.catalog,
         )?;
+        Ok(Some(has_null))
+    }
+
+    /// [`Self::insert_batch`] into a cold collection, straight from the columns: the rows
+    /// are built from the batch without a `Record` per row and go to the engine overlay.
+    /// `None` when the statement path must handle the batch (collection in memory, inside
+    /// a program, keys this path does not reproduce).
+    fn insert_batch_cold(
+        &mut self,
+        collection: &str,
+        batch: &RecordBatch,
+    ) -> Result<Option<Done>, Error> {
+        let n = batch.n();
+        if self.follower
+            || n > COLD_OVERLAY_INSERT_MAX_ROWS
+            || self.cold_program_packs.is_some()
+            || !self.disk_overlay_point_dml(collection)
+        {
+            return Ok(None);
+        }
+        let Some(has_null) = self.check_batch_types(collection, batch)? else {
+            // Every cell is null: a record of absent fields; let the statement path decide.
+            return Ok(None);
+        };
         if !self.store.fts_deferred_doc_swaps.is_empty() {
             self.store.flush_fts_deferred_docs();
         }
@@ -3295,6 +3319,55 @@ impl Db {
         Ok(self
             .cold_overlay_insert_rows(collection, rows, &[], 0, None, &plan, false)?
             .map(|h| h.done))
+    }
+
+    /// [`Self::insert_batch`] into an in-memory collection: the rows are built straight
+    /// from the columns and run as an `InsertRows` statement, so they go through the same
+    /// insert, commit, log and undo path as `insert` without a `Record` per row.
+    fn insert_batch_rows(
+        &mut self,
+        collection: &str,
+        batch: &RecordBatch,
+    ) -> Result<Option<Done>, Error> {
+        if self.store.is_disk_backed(collection) || self.cold_program_packs.is_some() {
+            return Ok(None);
+        }
+        let Some(has_null) = self.check_batch_types(collection, batch)? else {
+            return Ok(None);
+        };
+        let mut rows = batch.to_rows();
+        if has_null {
+            for row in &mut rows {
+                row.retain(|_, cell| !matches!(cell, Cell::Null));
+            }
+        }
+        let needs_embed = self.embedder.is_some()
+            && self
+                .catalog
+                .collection(collection)
+                .is_some_and(|c| c.has_vec());
+        let shape = dml::BuiltShape {
+            // Without nulls every row has the batch's fields, in one sorted order.
+            all_uniform: !has_null,
+            all_embedded: !needs_embed,
+            needs_id: rows.iter().any(|r| r.get("id").and_then(Cell::text).is_none()),
+            hashing_dim: if needs_embed {
+                self.embedder.as_ref().and_then(|e| e.hashing_dim())
+            } else {
+                None
+            },
+            now: now_ms(),
+        };
+        let n = rows.len();
+        let prepared = self.prepare_stmts_checked(vec![Stmt::InsertRows {
+            collection: collection.to_string(),
+            rows: n,
+        }])?;
+        self.pending_insert_rows = Some((rows, shape));
+        let result = self.run_prepared_ext(&prepared, false);
+        // Never leave rows staged for a later statement, whatever happened.
+        self.pending_insert_rows = None;
+        Ok(Some(result?.done))
     }
 
     /// Keep a cold collection physically ordered by `field` (pass `None` to stop).

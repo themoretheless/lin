@@ -357,6 +357,21 @@ pub fn plan(stmt: &Stmt, cat: &Catalog) -> Result<Plan, Error> {
                 ExplainKind::Tree,
             ))
         }
+        Stmt::InsertRows { collection, rows } => Ok(write_plan(
+            cat,
+            vec![Effect::Create],
+            node(
+                NodeKind::InsertPack {
+                    collection: collection.clone(),
+                    edges: Vec::new(),
+                    n: *rows,
+                },
+                Backend::Native,
+                Effect::Create,
+                vec![],
+            ),
+            ExplainKind::Tree,
+        )),
         Stmt::Update {
             collection,
             pred,

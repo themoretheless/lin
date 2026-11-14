@@ -12,6 +12,13 @@ pub enum Stmt {
         records: Vec<Record>,
         edges: Vec<InsertEdge>,
     },
+    /// `rows` already built rows of `collection`, handed over by
+    /// [`crate::Db::insert_batch`] (no source text; never parsed). Executes like
+    /// `insert` without edges.
+    InsertRows {
+        collection: String,
+        rows: usize,
+    },
     Update {
         collection: String,
         pred: Option<Pred>,
@@ -768,6 +775,8 @@ impl Stmt {
             Stmt::Let { name, query } => {
                 bytes += name.len() + query.estimate_bytes();
             }
+            // Staged rows are not part of the statement text.
+            Stmt::InsertRows { collection, .. } => bytes += collection.len(),
             Stmt::Insert {
                 collection,
                 records,

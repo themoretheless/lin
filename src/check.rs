@@ -140,6 +140,21 @@ fn check_in(stmt: &Stmt, cat: &Catalog, env: &Bindings) -> Result<(), Error> {
                 }
             }
         }
+        // The rows were built by `insert_batch`, which checks their field types against
+        // the catalog with one probe record per kind of value before staging them.
+        Stmt::InsertRows { collection, rows } => {
+            let col = cat
+                .collection(collection)
+                .ok_or_else(|| Error::new(format!("unknown collection: {collection}")))?;
+            if col.append_only {
+                return Err(Error::new(format!(
+                    "{collection} is append-only; use `append`"
+                )));
+            }
+            if *rows == 0 {
+                return Err(Error::new("empty list"));
+            }
+        }
         Stmt::Update {
             collection,
             pred,

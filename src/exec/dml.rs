@@ -79,6 +79,7 @@ pub(crate) fn stmt_writes(s: &Stmt) -> bool {
         Stmt::AppendFacts { .. }
         | Stmt::AppendEdges { .. }
         | Stmt::Insert { .. }
+        | Stmt::InsertRows { .. }
         | Stmt::Update { .. }
         | Stmt::Delete { .. }
         | Stmt::DeleteEdge { .. }
@@ -90,7 +91,10 @@ pub(crate) fn stmt_writes(s: &Stmt) -> bool {
 pub(crate) fn stmt_append_only(s: &Stmt) -> bool {
     matches!(
         s,
-        Stmt::AppendFacts { .. } | Stmt::AppendEdges { .. } | Stmt::Insert { .. }
+        Stmt::AppendFacts { .. }
+            | Stmt::AppendEdges { .. }
+            | Stmt::Insert { .. }
+            | Stmt::InsertRows { .. }
     )
 }
 
@@ -410,19 +414,38 @@ impl Db {
                 };
                 Ok((rows, msg, pack, wrote, n))
             }
-            Stmt::Insert {
-                collection,
-                records,
-                edges,
-            } => {
+            Stmt::Insert { .. } | Stmt::InsertRows { .. } => {
+                let (collection, edges): (&String, &[InsertEdge]) = match stmt {
+                    Stmt::Insert {
+                        collection, edges, ..
+                    } => (collection, edges.as_slice()),
+                    Stmt::InsertRows { collection, .. } => (collection, &[]),
+                    _ => unreachable!("insert arm"),
+                };
                 let start = self.store.collection(collection).len();
-                let (rows, new_edges, staged) = self.insert_bulk_ext(
-                    collection,
-                    records,
-                    edges.as_slice(),
-                    ctx.allow_preencode,
-                    ctx.want_rows,
-                )?;
+                let (rows, new_edges, staged) = match stmt {
+                    Stmt::Insert { records, .. } => self.insert_bulk_ext(
+                        collection,
+                        records,
+                        edges,
+                        ctx.allow_preencode,
+                        ctx.want_rows,
+                    )?,
+                    _ => {
+                        let (built, shape) = self.pending_insert_rows.take().ok_or_else(|| {
+                            Error::runtime("insert_batch: no staged rows for this statement")
+                        })?;
+                        self.insert_bulk_built(
+                            collection,
+                            built,
+                            shape,
+                            None,
+                            &[],
+                            ctx.allow_preencode,
+                            ctx.want_rows,
+                        )?
+                    }
+                };
                 let inserted = &self.store.collection(collection)[start..];
                 let affected = inserted.len();
                 if ctx.track_written {
@@ -910,21 +933,60 @@ impl Db {
         } else {
             None
         };
-        let (mut built, all_uniform, all_embedded) =
+        let (built, all_uniform, all_embedded) =
             build_insert_rows(records, now, needs_embed, hashing_dim);
-
-        let col_len = self.store.collection(collection).len();
-        let store_empty = col_len == 0;
-        let has_fks = self.catalog.fks.iter().any(|fk| fk.from_col == collection);
-        let is_docs = collection == "docs";
         // Any record without an explicit id gets a generated one, wherever it sits in the
         // batch (deciding from the first record left later id-less rows without an id).
         let needs_id = records.is_empty()
             || records
                 .iter()
                 .any(|r| !r.fields.iter().any(|(k, _)| k == "id"));
+        self.insert_bulk_built(
+            collection,
+            built,
+            BuiltShape {
+                all_uniform,
+                all_embedded,
+                needs_id,
+                hashing_dim,
+                now,
+            },
+            Some(records),
+            edges,
+            allow_preencode,
+            caller_wants_rows,
+        )
+    }
 
-        let first_record = records.first();
+    /// Bulk insert of rows already built from the statement (or straight from a
+    /// [`crate::batch::RecordBatch`]): ids and hashes, uniqueness, foreign keys,
+    /// embeddings, edges, the pre-encoded log record and the store update. `records`,
+    /// when given, are the source records and enable the key check that works on them
+    /// directly.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn insert_bulk_built(
+        &mut self,
+        collection: &str,
+        mut built: Vec<Row>,
+        shape: BuiltShape,
+        records: Option<&[Record]>,
+        edges: &[InsertEdge],
+        allow_preencode: bool,
+        caller_wants_rows: bool,
+    ) -> Result<(Vec<Row>, Vec<Edge>, Option<crate::persist::PreparedInsert>), Error> {
+        let BuiltShape {
+            all_uniform,
+            all_embedded,
+            needs_id,
+            hashing_dim,
+            now,
+        } = shape;
+        let n = built.len();
+        let col_len = self.store.collection(collection).len();
+        let store_empty = col_len == 0;
+        let has_fks = self.catalog.fks.iter().any(|fk| fk.from_col == collection);
+        let is_docs = collection == "docs";
+        let first_record = records.and_then(|r| r.first());
         let id_rec_pos = first_record.and_then(|r| r.fields.iter().position(|(k, _)| k == "id"));
         let uri_rec_pos = if is_docs {
             first_record.and_then(|r| r.fields.iter().position(|(k, _)| k == "uri"))
@@ -932,7 +994,8 @@ impl Db {
             None
         };
 
-        let fast_checked = if all_uniform
+        let fast_checked = if let Some(records) = records
+            && all_uniform
             && !needs_id
             && !has_fks
             && id_rec_pos.is_some()
@@ -1665,6 +1728,20 @@ struct BuildRowsJob {
 struct BuildRowsPool {
     workers: Vec<std::sync::mpsc::SyncSender<BuildRowsJob>>,
     done_rx: std::sync::mpsc::Receiver<(bool, bool)>,
+}
+
+/// What [`build_insert_rows`] (or a column batch) established about the built rows.
+#[derive(Clone, Copy)]
+pub(crate) struct BuiltShape {
+    /// Every row has the same fields in the same order.
+    pub all_uniform: bool,
+    /// Every row that needs an embedding already has one.
+    pub all_embedded: bool,
+    /// Some row has no `id` and needs a generated one.
+    pub needs_id: bool,
+    pub hashing_dim: Option<usize>,
+    /// Time the rows were built at (edge targets such as `now` resolve to it).
+    pub now: i64,
 }
 
 fn build_insert_rows(

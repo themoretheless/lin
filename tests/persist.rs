@@ -5430,3 +5430,122 @@ fn cold_lexical_search_without_materializing() {
         }
     }
 }
+
+/// `insert_batch` into an in-memory collection runs as an `InsertRows` statement built
+/// straight from the columns: the same rows, errors, generated ids, embeddings and log
+/// records as the equivalent `insert`, before and after a reopen that replays the log.
+#[test]
+fn memory_insert_batch_matches_insert_statement() {
+    use lin::{Cell, RecordBatch};
+    fn batch(names: &[&str], rows: &[Vec<Cell>]) -> RecordBatch {
+        let names: Arc<[String]> =
+            names.iter().map(|s| s.to_string()).collect::<Vec<_>>().into();
+        let mut b = RecordBatch::with_capacity(names, rows.len());
+        for r in rows {
+            b.push_row(r);
+        }
+        b
+    }
+    fn statement(collection: &str, b: &RecordBatch) -> String {
+        let rows: Vec<String> = b
+            .to_rows()
+            .iter()
+            .map(|r| {
+                let fields: Vec<String> = r
+                    .iter()
+                    .filter(|(_, c)| !matches!(c, Cell::Null))
+                    .map(|(k, c)| match c {
+                        Cell::Int(n) => format!("{k}: {n}"),
+                        Cell::Float(x) => format!("{k}: {x:?}"),
+                        Cell::Bool(v) => format!("{k}: {v}"),
+                        other => format!("{k}: {:?}", other.text().unwrap_or("")),
+                    })
+                    .collect();
+                format!("{{ {} }}", fields.join(", "))
+            })
+            .collect();
+        format!("insert {collection} [{}]", rows.join(", "))
+    }
+    let t = |s: &str| Cell::from_text(s);
+    let big: Vec<Vec<Cell>> = (0..3000)
+        .map(|i| vec![t(&format!("b{i}")), t(&format!("g{}", i % 9)), Cell::Int(i), Cell::Float(i as f64 + 0.25)])
+        .collect();
+    let cases: Vec<(&str, &str, RecordBatch, bool)> = vec![
+        ("plain", "ev", batch(&["id", "grp", "k", "v"], &big), true),
+        (
+            "absent fields and generated ids",
+            "ev",
+            batch(&["id", "grp", "k"], &[vec![Cell::Null, t("g1"), Cell::Int(1)], vec![t("n2"), Cell::Null, Cell::Int(2)], vec![Cell::Null, t("g3"), Cell::Null]]),
+            true,
+        ),
+        (
+            "documents get embeddings and hashes",
+            "docs",
+            batch(&["uri", "title", "body", "layer"], &[vec![t("raw://a"), t("A"), t("alpha body"), t("raw")], vec![t("raw://b"), t("B"), t("beta body"), t("raw")]]),
+            true,
+        ),
+        ("duplicate id", "ev", batch(&["id"], &[vec![t("x1")], vec![t("b7")]]), false),
+        ("duplicate uri", "docs", batch(&["uri", "title", "layer"], &[vec![t("raw://a"), t("again"), t("raw")]]), false),
+        ("type mismatch", "ev", batch(&["id", "k"], &[vec![t("x2"), t("seven")]]), false),
+        ("unknown field", "ev", batch(&["id", "nope"], &[vec![t("x3"), Cell::Int(1)]]), false),
+    ];
+    let dir_batch = tmp();
+    let dir_stmt = tmp();
+    let snapshot = |db: &mut Db| -> Vec<String> {
+        let mut out = Vec::new();
+        for q in ["ev | take all", "docs | take all"] {
+            let handle = db.run(q).unwrap();
+            let mut rows: Vec<String> = handle
+                .rows
+                .iter()
+                .map(|r| {
+                    r.iter()
+                        // Generated ids differ between the two databases only by
+                        // allocation order, which is the same here; keep them.
+                        .map(|(k, c)| match (c.text(), c.as_f64(), c.as_vec()) {
+                            (Some(s), _, _) => format!("{k}={s}"),
+                            (None, Some(n), _) => format!("{k}={n}"),
+                            (_, _, Some(v)) => format!("{k}=vec{}", v.len()),
+                            _ => format!("{k}={c:?}"),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(";")
+                })
+                .collect();
+            rows.sort();
+            out.push(rows.join("\n"));
+        }
+        out
+    };
+    {
+        let mut by_batch = Db::open(&dir_batch).unwrap();
+        let mut by_stmt = Db::open(&dir_stmt).unwrap();
+        for db in [&mut by_batch, &mut by_stmt] {
+            db.run("col ev { id: text, grp: text, k: i64, v: f64 }").unwrap();
+        }
+        for (label, collection, b, ok) in &cases {
+            let gen_before = by_batch.r#gen();
+            let got = by_batch.insert_batch(collection, b).map(|d| d.n);
+            let want = by_stmt.run(&statement(collection, b)).map(|h| h.done.n);
+            assert_eq!(got.is_ok(), *ok, "{label}: insert_batch {got:?}");
+            assert_eq!(want.is_ok(), *ok, "{label}: statement {want:?}");
+            match (&got, &want) {
+                (Ok(g), Ok(w)) => assert_eq!(g, w, "{label}"),
+                (Err(g), Err(w)) => {
+                    assert_eq!(g.to_string(), w.to_string(), "{label}");
+                    assert_eq!(by_batch.r#gen(), gen_before, "{label}: a failed batch moved the generation");
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(snapshot(&mut by_batch), snapshot(&mut by_stmt));
+        // Nothing stays staged after a failed batch: a later statement is unaffected.
+        by_batch.run(r#"insert ev { id: "after", k: 1 }"#).unwrap();
+        by_stmt.run(r#"insert ev { id: "after", k: 1 }"#).unwrap();
+        assert_eq!(snapshot(&mut by_batch), snapshot(&mut by_stmt));
+    }
+    // A reopen replays both logs to the same state.
+    let mut by_batch = Db::open(&dir_batch).unwrap();
+    let mut by_stmt = Db::open(&dir_stmt).unwrap();
+    assert_eq!(snapshot(&mut by_batch), snapshot(&mut by_stmt));
+}
