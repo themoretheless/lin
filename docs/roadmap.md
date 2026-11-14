@@ -2,7 +2,7 @@
 
 Срез: **2026-11-14**, коммит `58444cf6e` (релиз 0.7.1) плюс незакоммиченное рабочее дерево. Единственный файл с планом в репозитории: в нём только несделанное. Реализованное описано в [CHANGELOG](../CHANGELOG.md), в документах `docs/` по отдельным механизмам и в отчётах `benches/results/`.
 
-Открыто **1616** пунктов backlog (часть II) и 12 пунктов части I: 10 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
+Открыто **1608** пунктов backlog (часть II) и 12 пунктов части I: 10 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровывались, поэтому в них есть пропуски: закрытые пункты удалены. Пункты части II со статусами `candidate` и `qualification` по коду поштучно не сверялись: перед взятием пункта сначала проверить, не покрыт ли он уже.
 
@@ -194,9 +194,9 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 Для каждой строки итоговый критерий — её конкретный результат плюс указанный gate. Если критерий требует недоступной платформы/endpoint, статус остаётся непроверенным; mock/compile не заменяет live qualification.
 
-### Приоритетный список — 1616 пунктов
+### Приоритетный список — 1608 пунктов
 
-Количества: P1: 3, P2: 1036, P3: 577; статусы: blocked_external: 1, candidate: 934, qualification: 681.
+Количества: P1: 3, P2: 1030, P3: 575; статусы: blocked_external: 1, candidate: 934, qualification: 673.
 
 #### P1: 3 пунктов
 
@@ -206,7 +206,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 2 | LIN-0002 | [D01](#d01) | Закрыть durable 1k SQLite gap | PERF | qualification | M | G-PERF |
 | 22 | LIN-0006 | [D01](#d01) | Получить тестовый endpoint Kusto | OPS | blocked_external | M | G-OPS |
 
-#### P2: 1036 пунктов
+#### P2: 1030 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -905,17 +905,13 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 1032 | LIN-1295 | [D33](#d33) | Измерить scheduler handoff overhead | PERF | candidate | M | G-PERF |
 | 1033 | LIN-1296 | [D33](#d33) | Измерить stream wakeup amplification | PERF | candidate | M | G-PERF |
 | 1034 | LIN-1297 | [D33](#d33) | Проверить dropped future cleanup | CORRECTNESS | qualification | S | G-CORRECT |
-| 1035 | LIN-1298 | [D33](#d33) | Проверить dropped receiver cleanup | CORRECTNESS | qualification | S | G-CORRECT |
 | 1036 | LIN-1299 | [D33](#d33) | Проверить slow consumer memory bound | CORRECTNESS | qualification | S | G-CORRECT |
-| 1037 | LIN-1300 | [D33](#d33) | Проверить canceled writer transaction rollback | CORRECTNESS | qualification | S | G-CORRECT |
 | 1038 | LIN-1301 | [D33](#d33) | Добавить stream completion receipts | API | candidate | M | G-API |
 | 1039 | LIN-1302 | [D33](#d33) | Добавить async queue wait metrics | API | candidate | M | G-API |
 | 1040 | LIN-1303 | [D33](#d33) | Добавить active-query gauges | API | candidate | M | G-API |
 | 1041 | LIN-1304 | [D33](#d33) | Добавить cancellation reason counters | API | candidate | M | G-API |
-| 1042 | LIN-1325 | [D34](#d34) | Проверить snapshot graph consistency | CORRECTNESS | qualification | S | G-CORRECT |
 | 1043 | LIN-1326 | [D34](#d34) | Проверить snapshot vector cache isolation | CORRECTNESS | qualification | S | G-CORRECT |
 | 1044 | LIN-1327 | [D34](#d34) | Проверить catalog consistency изолированных ReadDb | CORRECTNESS | qualification | S | G-CORRECT |
-| 1045 | LIN-1328 | [D34](#d34) | Проверить snapshot после failed write | CORRECTNESS | qualification | S | G-CORRECT |
 | 1046 | LIN-1329 | [D34](#d34) | Измерить read snapshot creation | PERF | candidate | M | G-PERF |
 | 1047 | LIN-1330 | [D34](#d34) | Измерить snapshot retained memory | PERF | candidate | M | G-PERF |
 | 1048 | LIN-1331 | [D34](#d34) | Измерить Arc contention concurrent readers | PERF | candidate | M | G-PERF |
@@ -924,10 +920,8 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 1051 | LIN-1334 | [D34](#d34) | Спроектировать generation-based reclamation | FEATURE | candidate | L | G-FEATURE |
 | 1052 | LIN-1335 | [D34](#d34) | Спроектировать reader lifetime diagnostics | FEATURE | candidate | L | G-FEATURE |
 | 1053 | LIN-1336 | [D34](#d34) | Спроектировать writer admission fairness | FEATURE | candidate | L | G-FEATURE |
-| 1054 | LIN-1337 | [D34](#d34) | Проверить many readers one writer | CORRECTNESS | qualification | S | G-CORRECT |
 | 1055 | LIN-1338 | [D34](#d34) | Проверить long reader checkpoint pressure | CORRECTNESS | qualification | S | G-CORRECT |
 | 1056 | LIN-1339 | [D34](#d34) | Проверить dropped reader reclamation | CORRECTNESS | qualification | S | G-CORRECT |
-| 1057 | LIN-1340 | [D34](#d34) | Проверить reader panic isolation | CORRECTNESS | qualification | S | G-CORRECT |
 | 1058 | LIN-1341 | [D34](#d34) | Добавить snapshot pin byte counters | FEATURE | candidate | M | G-FEATURE |
 | 1059 | LIN-1342 | [D34](#d34) | Добавить oldest-reader generation metric | FEATURE | candidate | M | G-FEATURE |
 | 1060 | LIN-1343 | [D34](#d34) | Добавить blocked-reclamation diagnostics | FEATURE | candidate | M | G-FEATURE |
@@ -1247,7 +1241,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 1399 | LIN-1971 | [D50](#d50) | Описать replication version compatibility | DOC | candidate | S | G-DOC |
 | 1400 | LIN-1972 | [D50](#d50) | Описать downgrade support boundaries | DOC | candidate | S | G-DOC |
 
-#### P3: 577 пунктов
+#### P3: 575 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -1525,8 +1519,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 1686 | LIN-1278 | [D32](#d32) | Проверить Darwin mmap behavior | CORRECTNESS | qualification | S | G-CORRECT |
 | 1687 | LIN-1279 | [D32](#d32) | Проверить Windows mapped-file behavior | CORRECTNESS | qualification | S | G-CORRECT |
 | 1688 | LIN-1280 | [D32](#d32) | Проверить network-backed cold policy | CORRECTNESS | qualification | S | G-CORRECT |
-| 1689 | LIN-1305 | [D33](#d33) | Проверить multiple simultaneous streams | CORRECTNESS | qualification | S | G-CORRECT |
-| 1690 | LIN-1306 | [D33](#d33) | Проверить async read-after-write | CORRECTNESS | qualification | S | G-CORRECT |
 | 1691 | LIN-1307 | [D33](#d33) | Проверить async query panic propagation | CORRECTNESS | qualification | S | G-CORRECT |
 | 1692 | LIN-1308 | [D33](#d33) | Проверить blocking pool shutdown | CORRECTNESS | qualification | S | G-CORRECT |
 | 1693 | LIN-1309 | [D33](#d33) | Спроектировать bounded embedding requests | API | candidate | L | G-API |
