@@ -2,7 +2,7 @@
 
 Срез: **2026-11-14**, коммит `58444cf6e` (релиз 0.7.1) плюс незакоммиченное рабочее дерево. Единственный файл с планом в репозитории: в нём только несделанное. Реализованное описано в [CHANGELOG](../CHANGELOG.md), в документах `docs/` по отдельным механизмам и в отчётах `benches/results/`.
 
-Открыто **1605** пунктов backlog (часть II) и 12 пунктов части I: 10 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
+Открыто **1601** пунктов backlog (часть II) и 12 пунктов части I: 10 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровывались, поэтому в них есть пропуски: закрытые пункты удалены. Пункты части II со статусами `candidate` и `qualification` по коду поштучно не сверялись: перед взятием пункта сначала проверить, не покрыт ли он уже.
 
@@ -194,9 +194,9 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 Для каждой строки итоговый критерий — её конкретный результат плюс указанный gate. Если критерий требует недоступной платформы/endpoint, статус остаётся непроверенным; mock/compile не заменяет live qualification.
 
-### Приоритетный список — 1605 пунктов
+### Приоритетный список — 1601 пунктов
 
-Количества: P1: 3, P2: 1028, P3: 574; статусы: blocked_external: 1, candidate: 934, qualification: 670.
+Количества: P1: 3, P2: 1024, P3: 574; статусы: blocked_external: 1, candidate: 934, qualification: 666.
 
 #### P1: 3 пунктов
 
@@ -206,7 +206,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 2 | LIN-0002 | [D01](#d01) | Закрыть durable 1k SQLite gap | PERF | qualification | M | G-PERF |
 | 22 | LIN-0006 | [D01](#d01) | Получить тестовый endpoint Kusto | OPS | blocked_external | M | G-OPS |
 
-#### P2: 1028 пунктов
+#### P2: 1024 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -334,7 +334,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 307 | LIN-0247 | [D07](#d07) | Измерить body hash cost | PERF | candidate | M | G-PERF |
 | 308 | LIN-0248 | [D07](#d07) | Измерить staged field validation | PERF | candidate | M | G-PERF |
 | 309 | LIN-0249 | [D07](#d07) | Проверить borrowed key lifetime | CORRECTNESS | qualification | S | G-CORRECT |
-| 315 | LIN-0255 | [D07](#d07) | Проверить explicit-null bulk semantics | CORRECTNESS | qualification | S | G-CORRECT |
 | 316 | LIN-0256 | [D07](#d07) | Проверить bulk timestamp capture | CORRECTNESS | qualification | S | G-CORRECT |
 | 320 | LIN-0260 | [D07](#d07) | Проверить large bulk memory release | CORRECTNESS | qualification | S | G-CORRECT |
 | 321 | LIN-0261 | [D07](#d07) | Измерить streaming bulk input | PERF | candidate | M | G-PERF |
@@ -345,9 +344,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 326 | LIN-0266 | [D07](#d07) | Измерить no-op update fast path | PERF | candidate | M | G-PERF |
 | 327 | LIN-0267 | [D07](#d07) | Измерить multirow delete compaction | PERF | candidate | M | G-PERF |
 | 328 | LIN-0268 | [D07](#d07) | Измерить swap-remove map repair | PERF | candidate | M | G-PERF |
-| 329 | LIN-0269 | [D07](#d07) | Проверить swap-delete duplicate positions | CORRECTNESS | qualification | S | G-CORRECT |
-| 330 | LIN-0270 | [D07](#d07) | Проверить update changing URI | CORRECTNESS | qualification | S | G-CORRECT |
-| 331 | LIN-0271 | [D07](#d07) | Проверить update changing ID | CORRECTNESS | qualification | S | G-CORRECT |
 | 334 | LIN-0274 | [D07](#d07) | Проверить mutation projection consistency | CORRECTNESS | qualification | S | G-CORRECT |
 | 335 | LIN-0275 | [D07](#d07) | Проверить mutation returning old/new values | CORRECTNESS | qualification | S | G-CORRECT |
 | 336 | LIN-0276 | [D07](#d07) | Проверить mutation counters overflow | CORRECTNESS | qualification | S | G-CORRECT |
