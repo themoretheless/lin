@@ -8,7 +8,11 @@ use std::path::PathBuf;
 use lin::Db;
 
 fn tmp() -> PathBuf {
-    let d = std::env::temp_dir().join(format!("lin-mut-{}-{}", std::process::id(), rand_suffix()));
+    // Tests run in parallel and can read the same clock value: the counter keeps their
+    // directories (and the writer lock in each) apart.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let d = std::env::temp_dir().join(format!("lin-mut-{}-{}-{n}", std::process::id(), rand_suffix()));
     std::fs::create_dir_all(&d).unwrap();
     d
 }
