@@ -357,6 +357,7 @@ pub struct Persist {
     pub log: File,
     /// Advisory exclusive flock on `LOCK` — released when Persist drops.
     pub lock: File,
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) lock_owner_pid: u32,
     pub catalog_hash: String,
     pub writes_since_snapshot: u32,

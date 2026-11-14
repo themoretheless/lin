@@ -21,7 +21,6 @@ pub(crate) enum Undo {
     Full(Box<crate::store::MemBackup>),
     Rows(smallvec::SmallVec<[RowUndo; 2]>),
     Mixed {
-        append: crate::store::AppendMark,
         events: smallvec::SmallVec<[RowUndo; 2]>,
     },
     /// A transaction whose journal had to become a full backup part way through: `full`
@@ -358,7 +357,9 @@ impl<'a> Transaction<'a> {
             };
             return self.exec_single_insert_tx(collection.to_string(), rec, want_rows);
         }
-        if !matches!(self.undo, Undo::Append(_)) {
+        if self.db.store.is_disk_backed(collection) {
+            self.ensure_undo_flags(&[], false, true);
+        } else if !matches!(self.undo, Undo::Append(_)) {
             self.ensure_undo_flags(&[], true, false);
         }
         if !self.db.store.fts_deferred_doc_swaps.is_empty() {
@@ -589,11 +590,11 @@ impl<'a> Transaction<'a> {
                 }
             }
         }
-        if !matches!(self.undo, Undo::Append(_)) {
-            self.ensure_undo_flags(&[], true, false);
-        }
         if self.db.store.is_disk_backed(&collection) {
+            self.ensure_undo_flags(&[], false, true);
             self.db.store.promote_disk_col(&collection);
+        } else if !matches!(self.undo, Undo::Append(_)) {
+            self.ensure_undo_flags(&[], true, false);
         }
         let needs_embed = self.db.embedder.is_some()
             && self
@@ -796,21 +797,20 @@ impl<'a> Transaction<'a> {
                 // The appends came first: their mark opens the event journal.
                 if let Undo::Append(mark) = std::mem::replace(&mut self.undo, Undo::None) {
                     let mut events = smallvec::SmallVec::new();
-                    events.push(RowUndo::Append(mark.clone()));
-                    self.undo = Undo::Mixed { append: mark, events };
+                    events.push(RowUndo::Append(mark));
+                    self.undo = Undo::Mixed { events };
                 }
             }
             Next::MixedFromRows => {
                 if let Undo::Rows(mut events) = std::mem::replace(&mut self.undo, Undo::None) {
-                    let mark = self.db.store.append_mark();
-                    events.push(RowUndo::Append(mark.clone()));
-                    self.undo = Undo::Mixed { append: mark, events };
+                    events.push(RowUndo::Append(self.db.store.append_mark()));
+                    self.undo = Undo::Mixed { events };
                 }
             }
             Next::MarkAppend => {
                 // Appends after row events get their own mark (see `RowUndo::Append`).
                 let mark = self.db.store.append_mark();
-                if let Undo::Mixed { events, .. } = &mut self.undo
+                if let Undo::Mixed { events } = &mut self.undo
                     && !events.is_empty()
                 {
                     events.push(RowUndo::Append(mark));
@@ -1263,7 +1263,7 @@ impl Db {
             // Every append is covered by a mark inside `events`, so the journal alone,
             // replayed in reverse, undoes everything; truncating to the opening mark
             // afterwards would cut rows a restored delete moved to the end.
-            Undo::Rows(events) | Undo::Mixed { events, .. } => {
+            Undo::Rows(events) | Undo::Mixed { events } => {
                 for event in events.into_iter().rev() {
                     match event {
                         RowUndo::DocsWing(idx, prev_cell) => {
@@ -1615,7 +1615,7 @@ impl Db {
                     }
                 }
             }
-            if let Undo::Rows(events) | Undo::Mixed { events, .. } = undo {
+            if let Undo::Rows(events) | Undo::Mixed { events } = undo {
                 events.push(RowUndo::DocsWing(idx, prev_cell));
             }
             if !same_wing {

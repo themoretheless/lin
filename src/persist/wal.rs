@@ -277,9 +277,15 @@ pub(crate) fn prune_bins(dir: &Path, keep: &[String]) -> Result<(), Error> {
     Ok(())
 }
 
+#[cfg(unix)]
 pub(super) fn sync_dir(dir: &Path) -> io::Result<()> {
     let f = File::open(dir)?;
     f.sync_all()
+}
+
+#[cfg(not(unix))]
+pub(super) fn sync_dir(_dir: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 // Best-effort physical allocation only; logical WAL bytes/length and sync stay unchanged.

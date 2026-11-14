@@ -1410,7 +1410,7 @@ impl Db {
                 self.store.rebuild_row_maps_collection(collection);
             }
             self.store.fts_sync_at(collection, i, &before);
-            if let Undo::Rows(events) | Undo::Mixed { events, .. } = ctx.undo {
+            if let Undo::Rows(events) | Undo::Mixed { events } = ctx.undo {
                 events.push(RowUndo::Update(collection.to_string(), i, before));
             }
         }
@@ -1472,7 +1472,7 @@ impl Db {
         idxs.sort_unstable();
         let out = self.store.delete_rows_at(collection, &idxs);
 
-        if let Undo::Rows(events) | Undo::Mixed { events, .. } = ctx.undo {
+        if let Undo::Rows(events) | Undo::Mixed { events } = ctx.undo {
             events.push(RowUndo::Delete(
                 collection.to_string(),
                 idxs.to_vec(),
