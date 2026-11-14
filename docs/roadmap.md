@@ -2,7 +2,7 @@
 
 Срез: **2026-11-14**, коммит `58444cf6e` (релиз 0.7.1) плюс незакоммиченное рабочее дерево. Единственный файл с планом в репозитории: в нём только несделанное. Реализованное описано в [CHANGELOG](../CHANGELOG.md), в документах `docs/` по отдельным механизмам и в отчётах `benches/results/`.
 
-Открыто **1630** пунктов backlog (часть II) и 12 пунктов части I: 10 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
+Открыто **1620** пунктов backlog (часть II) и 12 пунктов части I: 10 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровывались, поэтому в них есть пропуски: закрытые пункты удалены. Пункты части II со статусами `candidate` и `qualification` по коду поштучно не сверялись: перед взятием пункта сначала проверить, не покрыт ли он уже.
 
@@ -191,9 +191,9 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 Для каждой строки итоговый критерий — её конкретный результат плюс указанный gate. Если критерий требует недоступной платформы/endpoint, статус остаётся непроверенным; mock/compile не заменяет live qualification.
 
-### Приоритетный список — 1630 пунктов
+### Приоритетный список — 1620 пунктов
 
-Количества: P1: 3, P2: 1047, P3: 580; статусы: blocked_external: 1, candidate: 934, qualification: 695.
+Количества: P1: 3, P2: 1040, P3: 577; статусы: blocked_external: 1, candidate: 934, qualification: 685.
 
 #### P1: 3 пунктов
 
@@ -203,7 +203,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 2 | LIN-0002 | [D01](#d01) | Закрыть durable 1k SQLite gap | PERF | qualification | M | G-PERF |
 | 22 | LIN-0006 | [D01](#d01) | Получить тестовый endpoint Kusto | OPS | blocked_external | M | G-OPS |
 
-#### P2: 1047 пунктов
+#### P2: 1040 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -850,14 +850,8 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 967 | LIN-1182 | [D30](#d30) | Измерить projection kernel fusion | PERF | candidate | M | G-PERF |
 | 968 | LIN-1183 | [D30](#d30) | Измерить resident join intermediates | PERF | candidate | M | G-PERF |
 | 969 | LIN-1184 | [D30](#d30) | Измерить resident aggregation intermediates | PERF | candidate | M | G-PERF |
-| 970 | LIN-1201 | [D31](#d31) | Проверить BFS visited identity policy | CORRECTNESS | qualification | S | G-CORRECT |
 | 971 | LIN-1202 | [D31](#d31) | Проверить DFS path multiplicity | CORRECTNESS | qualification | S | G-CORRECT |
 | 972 | LIN-1203 | [D31](#d31) | Проверить reverse-edge traversal | CORRECTNESS | qualification | S | G-CORRECT |
-| 973 | LIN-1204 | [D31](#d31) | Проверить dangling-node traversal | CORRECTNESS | qualification | S | G-CORRECT |
-| 974 | LIN-1205 | [D31](#d31) | Проверить self-loop graph behavior | CORRECTNESS | qualification | S | G-CORRECT |
-| 975 | LIN-1206 | [D31](#d31) | Проверить multi-edge graph behavior | CORRECTNESS | qualification | S | G-CORRECT |
-| 976 | LIN-1207 | [D31](#d31) | Проверить cycle depth boundaries | CORRECTNESS | qualification | S | G-CORRECT |
-| 977 | LIN-1208 | [D31](#d31) | Проверить unresolved endpoint behavior | CORRECTNESS | qualification | S | G-CORRECT |
 | 978 | LIN-1209 | [D31](#d31) | Измерить adjacency map locality | PERF | candidate | M | G-PERF |
 | 979 | LIN-1210 | [D31](#d31) | Измерить for_each_neighbor borrowing | PERF | candidate | M | G-PERF |
 | 980 | LIN-1211 | [D31](#d31) | Измерить traversal scratch reuse | PERF | candidate | M | G-PERF |
@@ -873,7 +867,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 990 | LIN-1221 | [D31](#d31) | Ограничить traversal visited count | CORRECTNESS | qualification | M | G-CORRECT |
 | 991 | LIN-1222 | [D31](#d31) | Ограничить traversal frontier bytes | CORRECTNESS | qualification | M | G-CORRECT |
 | 992 | LIN-1223 | [D31](#d31) | Ограничить traversal emitted paths | CORRECTNESS | qualification | M | G-CORRECT |
-| 993 | LIN-1224 | [D31](#d31) | Ограничить graph recursion depth | CORRECTNESS | qualification | M | G-CORRECT |
 | 994 | LIN-1241 | [D32](#d32) | Профилировать cold page faults | PERF | candidate | M | G-PERF |
 | 995 | LIN-1242 | [D32](#d32) | Профилировать cold decode allocations | PERF | candidate | M | G-PERF |
 | 996 | LIN-1243 | [D32](#d32) | Профилировать cold projection access | PERF | candidate | M | G-PERF |
@@ -1255,7 +1248,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 1399 | LIN-1971 | [D50](#d50) | Описать replication version compatibility | DOC | candidate | S | G-DOC |
 | 1400 | LIN-1972 | [D50](#d50) | Описать downgrade support boundaries | DOC | candidate | S | G-DOC |
 
-#### P3: 580 пунктов
+#### P3: 577 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -1505,9 +1498,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 1654 | LIN-1198 | [D30](#d30) | Проверить zero-size dispatch behavior | CORRECTNESS | qualification | S | G-CORRECT |
 | 1655 | LIN-1199 | [D30](#d30) | Проверить one-element kernel behavior | CORRECTNESS | qualification | S | G-CORRECT |
 | 1656 | LIN-1200 | [D30](#d30) | Проверить maximum supported dispatch boundaries | CORRECTNESS | qualification | S | G-CORRECT |
-| 1657 | LIN-1225 | [D31](#d31) | Проверить graph mutation rollback | CORRECTNESS | qualification | S | G-CORRECT |
-| 1658 | LIN-1226 | [D31](#d31) | Проверить graph replay consistency | CORRECTNESS | qualification | S | G-CORRECT |
-| 1659 | LIN-1227 | [D31](#d31) | Проверить graph snapshot consistency | CORRECTNESS | qualification | S | G-CORRECT |
 | 1660 | LIN-1228 | [D31](#d31) | Проверить graph index rebuild consistency | CORRECTNESS | qualification | S | G-CORRECT |
 | 1661 | LIN-1229 | [D31](#d31) | Спроектировать graph snapshot cursors | FEATURE | candidate | L | G-FEATURE |
 | 1662 | LIN-1230 | [D31](#d31) | Спроектировать streaming path results | FEATURE | candidate | L | G-FEATURE |
