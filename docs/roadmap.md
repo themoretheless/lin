@@ -2,7 +2,7 @@
 
 Срез: **2026-11-14**, коммит `58444cf6e` (релиз 0.7.1) плюс незакоммиченное рабочее дерево. Единственный файл с планом в репозитории: в нём только несделанное. Реализованное описано в [CHANGELOG](../CHANGELOG.md), в документах `docs/` по отдельным механизмам и в отчётах `benches/results/`.
 
-Открыто **1760** пунктов backlog (часть II) и 12 пунктов части I: 10 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
+Открыто **1752** пунктов backlog (часть II) и 12 пунктов части I: 10 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровывались, поэтому в них есть пропуски: закрытые пункты удалены. Пункты части II со статусами `candidate` и `qualification` по коду поштучно не сверялись: перед взятием пункта сначала проверить, не покрыт ли он уже.
 
@@ -191,9 +191,9 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 Для каждой строки итоговый критерий — её конкретный результат плюс указанный gate. Если критерий требует недоступной платформы/endpoint, статус остаётся непроверенным; mock/compile не заменяет live qualification.
 
-### Приоритетный список — 1760 пунктов
+### Приоритетный список — 1752 пунктов
 
-Количества: P1: 3, P2: 1171, P3: 586; статусы: blocked_external: 1, candidate: 934, qualification: 825.
+Количества: P1: 3, P2: 1163, P3: 586; статусы: blocked_external: 1, candidate: 934, qualification: 817.
 
 #### P1: 3 пунктов
 
@@ -203,7 +203,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 2 | LIN-0002 | [D01](#d01) | Закрыть durable 1k SQLite gap | PERF | qualification | M | G-PERF |
 | 22 | LIN-0006 | [D01](#d01) | Получить тестовый endpoint Kusto | OPS | blocked_external | M | G-OPS |
 
-#### P2: 1171 пунктов
+#### P2: 1163 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -283,7 +283,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 210 | LIN-0118 | [D03](#d03) | Измерить large WAL commits | PERF | candidate | M | G-PERF |
 | 211 | LIN-0119 | [D03](#d03) | Измерить concurrent-reader sync impact | PERF | candidate | M | G-PERF |
 | 212 | LIN-0120 | [D03](#d03) | Измерить fsync на реальном диске | PERF | candidate | M | G-PERF |
-| 228 | LIN-0140 | [D04](#d04) | Проверить новый snapshot старый WAL | CORRECTNESS | qualification | S | G-CORRECT |
 | 229 | LIN-0141 | [D04](#d04) | Проверить replay partial transaction | CORRECTNESS | qualification | S | G-CORRECT |
 | 230 | LIN-0142 | [D04](#d04) | Проверить replay group boundaries | CORRECTNESS | qualification | S | G-CORRECT |
 | 231 | LIN-0143 | [D04](#d04) | Проверить rollback после decode failure | CORRECTNESS | qualification | S | G-CORRECT |
@@ -299,7 +298,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 242 | LIN-0154 | [D04](#d04) | Проверить replay удалённого catalog object | CORRECTNESS | qualification | S | G-CORRECT |
 | 243 | LIN-0155 | [D04](#d04) | Проверить replay несовместимого field type | CORRECTNESS | qualification | S | G-CORRECT |
 | 244 | LIN-0156 | [D04](#d04) | Проверить replay schema generation mismatch | CORRECTNESS | qualification | S | G-CORRECT |
-| 246 | LIN-0158 | [D04](#d04) | Проверить reopen после failed checkpoint | CORRECTNESS | qualification | S | G-CORRECT |
 | 247 | LIN-0159 | [D04](#d04) | Проверить reopen после failed backup | CORRECTNESS | qualification | S | G-CORRECT |
 | 248 | LIN-0160 | [D04](#d04) | Проверить reopen после truncated rotation | CORRECTNESS | qualification | S | G-CORRECT |
 | 249 | LIN-0165 | [D05](#d05) | Проверить SnapshotRef lifetime | CORRECTNESS | qualification | S | G-CORRECT |
@@ -313,14 +311,8 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 257 | LIN-0173 | [D05](#d05) | Измерить incremental checkpoint | PERF | candidate | M | G-PERF |
 | 258 | LIN-0174 | [D05](#d05) | Измерить section-local compression | PERF | candidate | M | G-PERF |
 | 259 | LIN-0175 | [D05](#d05) | Измерить parallel snapshot sections | PERF | candidate | M | G-PERF |
-| 261 | LIN-0177 | [D05](#d05) | Проверить atomic snapshot replacement | CORRECTNESS | qualification | S | G-CORRECT |
-| 262 | LIN-0178 | [D05](#d05) | Проверить failed rename cleanup | CORRECTNESS | qualification | S | G-CORRECT |
-| 263 | LIN-0179 | [D05](#d05) | Проверить temp snapshot ownership | CORRECTNESS | qualification | S | G-CORRECT |
 | 264 | LIN-0180 | [D05](#d05) | Проверить parent directory persistence | CORRECTNESS | qualification | S | G-CORRECT |
-| 265 | LIN-0181 | [D05](#d05) | Проверить snapshot catalog consistency | CORRECTNESS | qualification | S | G-CORRECT |
-| 266 | LIN-0182 | [D05](#d05) | Проверить snapshot edge consistency | CORRECTNESS | qualification | S | G-CORRECT |
 | 267 | LIN-0183 | [D05](#d05) | Проверить snapshot derived indexes policy | CORRECTNESS | qualification | S | G-CORRECT |
-| 268 | LIN-0184 | [D05](#d05) | Проверить snapshot embedding identity | CORRECTNESS | qualification | S | G-CORRECT |
 | 275 | LIN-0211 | [D06](#d06) | Проверить commit после validation failure | CORRECTNESS | qualification | S | G-CORRECT |
 | 276 | LIN-0212 | [D06](#d06) | Проверить rollback после allocator failure | CORRECTNESS | qualification | S | G-CORRECT |
 | 279 | LIN-0215 | [D06](#d06) | Измерить rollback work amplification | PERF | candidate | M | G-PERF |
