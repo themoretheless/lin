@@ -2,7 +2,7 @@
 
 Срез: **2026-11-14**, коммит `58444cf6e` (релиз 0.7.1) плюс незакоммиченное рабочее дерево. Единственный файл с планом в репозитории: в нём только несделанное. Реализованное описано в [CHANGELOG](../CHANGELOG.md), в документах `docs/` по отдельным механизмам и в отчётах `benches/results/`.
 
-Открыто **1594** пунктов backlog (часть II) и 12 пунктов части I: 10 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
+Открыто **1593** пунктов backlog (часть II) и 12 пунктов части I: 10 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровывались, поэтому в них есть пропуски: закрытые пункты удалены. Пункты части II со статусами `candidate` и `qualification` по коду поштучно не сверялись: перед взятием пункта сначала проверить, не покрыт ли он уже.
 
@@ -194,9 +194,9 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 Для каждой строки итоговый критерий — её конкретный результат плюс указанный gate. Если критерий требует недоступной платформы/endpoint, статус остаётся непроверенным; mock/compile не заменяет live qualification.
 
-### Приоритетный список — 1594 пунктов
+### Приоритетный список — 1593 пунктов
 
-Количества: P1: 3, P2: 1017, P3: 574; статусы: blocked_external: 1, candidate: 934, qualification: 659.
+Количества: P1: 3, P2: 1016, P3: 574; статусы: blocked_external: 1, candidate: 934, qualification: 658.
 
 #### P1: 3 пунктов
 
@@ -206,7 +206,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 2 | LIN-0002 | [D01](#d01) | Закрыть durable 1k SQLite gap | PERF | qualification | M | G-PERF |
 | 22 | LIN-0006 | [D01](#d01) | Получить тестовый endpoint Kusto | OPS | blocked_external | M | G-OPS |
 
-#### P2: 1017 пунктов
+#### P2: 1016 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -249,7 +249,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 162 | LIN-0066 | [D02](#d02) | Ввести явный decoder capability set | CORRECTNESS | qualification | M | G-CORRECT |
 | 163 | LIN-0067 | [D02](#d02) | Документировать frame layout байтами | CORRECTNESS | qualification | M | G-CORRECT |
 | 164 | LIN-0068 | [D02](#d02) | Подготовить независимый frame inspector | CORRECTNESS | qualification | M | G-CORRECT |
-| 165 | LIN-0069 | [D02](#d02) | Проверить compressed envelope nesting | CORRECTNESS | qualification | S | G-CORRECT |
 | 167 | LIN-0071 | [D02](#d02) | Проверить decoded vector budget | CORRECTNESS | qualification | S | G-CORRECT |
 | 173 | LIN-0077 | [D02](#d02) | Проверить одинаковые bytes разных CPU | CORRECTNESS | qualification | S | G-CORRECT |
 | 174 | LIN-0078 | [D02](#d02) | Создать corpus исторических WAL frames | VERIFY | qualification | S | G-VERIFY |

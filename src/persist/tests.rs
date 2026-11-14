@@ -704,6 +704,21 @@ mod wal_integrity_tests {
         // A truncated stream is an error, not a short record.
         let cut = gz(&raw);
         assert!(decode_frame(&LOG_MAGIC_CHECKSUM, &payload(&cut[..cut.len() - 5])).is_err());
+
+        // Envelopes do not nest: the decompressed bytes are a record, never another
+        // frame, so a compressed frame wrapping a compressed frame (or a gzip bomb
+        // wrapped in gzip) is rejected as a bad record instead of being unwrapped again.
+        let inner = payload(&gz(&raw));
+        assert!(decode_frame(&LOG_MAGIC_CHECKSUM, &payload(&gz(&inner))).is_err());
+        assert!(decode_frame(&LOG_MAGIC_CHECKSUM, &payload(&gz(&gz(&raw)))).is_err());
+        let nested_bomb = gz(&bomb);
+        assert!(decode_frame(&LOG_MAGIC_CHECKSUM, &payload(&nested_bomb)).is_err());
+        // An unknown codec byte inside the checksummed envelope is refused too.
+        let mut unknown = vec![9u8];
+        unknown.extend_from_slice(&raw);
+        let crc = crate::crc::hardware_crc32c(&unknown);
+        unknown.extend_from_slice(&crc.to_le_bytes());
+        assert!(decode_frame(&LOG_MAGIC_CHECKSUM, &unknown).is_err());
     }
 
     /// A writer that takes at most `chunk` bytes per call and fails or stalls on a script.
