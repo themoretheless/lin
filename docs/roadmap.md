@@ -2,7 +2,7 @@
 
 Срез: **2026-11-14**, коммит `58444cf6e` (релиз 0.7.1) плюс незакоммиченное рабочее дерево. Единственный файл с планом в репозитории: в нём только несделанное. Реализованное описано в [CHANGELOG](../CHANGELOG.md), в документах `docs/` по отдельным механизмам и в отчётах `benches/results/`.
 
-Открыто **1590** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
+Открыто **1589** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровывались, поэтому в них есть пропуски: закрытые пункты удалены. Пункты части II со статусами `candidate` и `qualification` по коду поштучно не сверялись: перед взятием пункта сначала проверить, не покрыт ли он уже.
 
@@ -194,7 +194,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 ### Приоритетный список — 1590 пунктов
 
-Количества: P1: 3, P2: 1013, P3: 574; статусы: blocked_external: 1, candidate: 934, qualification: 655.
+Количества: P1: 3, P2: 1012, P3: 574; статусы: blocked_external: 1, candidate: 934, qualification: 654.
 
 #### P1: 3 пунктов
 
@@ -204,7 +204,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 2 | LIN-0002 | [D01](#d01) | Закрыть durable 1k SQLite gap | PERF | qualification | M | G-PERF |
 | 22 | LIN-0006 | [D01](#d01) | Получить тестовый endpoint Kusto | OPS | blocked_external | M | G-OPS |
 
-#### P2: 1013 пунктов
+#### P2: 1012 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -277,7 +277,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 204 | LIN-0112 | [D03](#d03) | Проверить WAL rotation ordering | CORRECTNESS | qualification | S | G-CORRECT |
 | 205 | LIN-0113 | [D03](#d03) | Проверить out-of-space до sync | CORRECTNESS | qualification | S | G-CORRECT |
 | 206 | LIN-0114 | [D03](#d03) | Проверить file descriptor exhaustion | CORRECTNESS | qualification | S | G-CORRECT |
-| 207 | LIN-0115 | [D03](#d03) | Проверить read-only filesystem error | CORRECTNESS | qualification | S | G-CORRECT |
 | 208 | LIN-0116 | [D03](#d03) | Проверить quota exhaustion propagation | CORRECTNESS | qualification | S | G-CORRECT |
 | 209 | LIN-0117 | [D03](#d03) | Измерить tiny WAL commits | PERF | candidate | M | G-PERF |
 | 210 | LIN-0118 | [D03](#d03) | Измерить large WAL commits | PERF | candidate | M | G-PERF |
