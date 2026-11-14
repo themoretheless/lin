@@ -5411,5 +5411,22 @@ fn cold_lexical_search_without_materializing() {
         hot.run(r#"insert docs { id: "fresh", uri: "raw://fresh", title: "wal shipping fresh", body: "fresh shipping note", layer: "raw" }"#).unwrap();
         let q = r#"docs | search lex "shipping" | take all"#;
         assert_eq!(ids(&db.run(q).unwrap().rows), ids(&hot.run(q).unwrap().rows));
+        // The dropped index is rebuilt from the engine, not from loaded rows, and keeps
+        // following later writes, deletes included.
+        assert!(!db.store.disk_rows_materialized("docs"), "search after a write loaded docs");
+        for stmt in [
+            r#"delete docs[id == "d0"] cas each"#,
+            r#"insert docs { id: "fresh2", uri: "raw://fresh2", title: "shipping again", layer: "raw" }"#,
+        ] {
+            db.run(stmt).unwrap();
+            hot.run(stmt).unwrap();
+            for q in [
+                r#"docs | search lex "shipping" | take all"#,
+                r#"docs | search "shipping" | take all"#,
+            ] {
+                assert_eq!(ids(&db.run(q).unwrap().rows), ids(&hot.run(q).unwrap().rows), "{stmt}: {q}");
+            }
+            assert!(!db.store.disk_rows_materialized("docs"), "{stmt}: docs pulled into memory");
+        }
     }
 }

@@ -1714,6 +1714,37 @@ impl Store {
         self.collections.contains_key(name) && !self.is_disk_backed(name)
     }
 
+    /// Rebuild the full-text index of a disk-backed collection that an overlay write
+    /// dropped, from a scan of `id` and the indexed fields only (the rows are not
+    /// materialized). Positions follow the engine's scan order, which is what the cold
+    /// search paths map back to ids. No-op inside an overlay savepoint, whose rollback
+    /// restores the index state itself.
+    pub(crate) fn rebuild_dirty_disk_fts(&mut self, collection: &str) -> Result<(), Error> {
+        if self.overlay_savepoint_fts.is_some() || !self.is_disk_backed(collection) {
+            return Ok(());
+        }
+        let Some(fields) = self.dirty_fts_disk.get(collection).cloned() else {
+            return Ok(());
+        };
+        let mut proj: Vec<&str> = Vec::with_capacity(fields.len() + 1);
+        proj.push("id");
+        proj.extend(fields.iter().map(String::as_str).filter(|f| *f != "id"));
+        let mut rows = Vec::new();
+        {
+            let Some(eng) = self.disk_engine_read() else {
+                return Ok(());
+            };
+            eng.scan_projected(collection, Some(&proj), |row| {
+                rows.push(row.clone());
+                Ok(true)
+            })?;
+        }
+        self.fts
+            .insert(collection.to_string(), crate::fts::FtsIndex::build(&rows, &fields));
+        self.dirty_fts_disk.remove(collection);
+        Ok(())
+    }
+
     /// Whether `collection` has a live full-text index.
     pub fn fts_indexed(&self, collection: &str) -> bool {
         self.fts.contains_key(collection)

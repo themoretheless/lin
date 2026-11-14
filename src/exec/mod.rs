@@ -2207,6 +2207,20 @@ impl Db {
         if prepared.point_delete.is_none() && !self.store.fts_deferred_doc_swaps.is_empty() {
             self.store.flush_fts_deferred_docs();
         }
+        // A search over a cold collection whose full-text index an earlier write dropped:
+        // rebuild it from the engine first, so the search does not fall back to loading
+        // the collection.
+        if !self.store.dirty_fts_disk.is_empty() && self.cold_program_packs.is_none() {
+            for stmt in prepared.stmts.iter() {
+                if let Stmt::Query(q) = stmt
+                    && let Source::Collection(name) = &q.source
+                    && q.steps.iter().any(|s| matches!(s, Step::Search { .. }))
+                    && self.store.dirty_fts_disk.contains_key(name)
+                {
+                    self.store.rebuild_dirty_disk_fts(name)?;
+                }
+            }
+        }
         if let Some(pg) = &prepared.point_get {
             let row = self.execute_point_get(pg);
             let rows = match row {
