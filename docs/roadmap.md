@@ -2,7 +2,7 @@
 
 Срез: **2026-11-14**, коммит `58444cf6e` (релиз 0.7.1) плюс незакоммиченное рабочее дерево. Единственный файл с планом в репозитории: в нём только несделанное. Реализованное описано в [CHANGELOG](../CHANGELOG.md), в документах `docs/` по отдельным механизмам и в отчётах `benches/results/`.
 
-Открыто **1597** пунктов backlog (часть II) и 12 пунктов части I: 10 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
+Открыто **1594** пунктов backlog (часть II) и 12 пунктов части I: 10 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровывались, поэтому в них есть пропуски: закрытые пункты удалены. Пункты части II со статусами `candidate` и `qualification` по коду поштучно не сверялись: перед взятием пункта сначала проверить, не покрыт ли он уже.
 
@@ -194,9 +194,9 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 Для каждой строки итоговый критерий — её конкретный результат плюс указанный gate. Если критерий требует недоступной платформы/endpoint, статус остаётся непроверенным; mock/compile не заменяет live qualification.
 
-### Приоритетный список — 1597 пунктов
+### Приоритетный список — 1594 пунктов
 
-Количества: P1: 3, P2: 1020, P3: 574; статусы: blocked_external: 1, candidate: 934, qualification: 662.
+Количества: P1: 3, P2: 1017, P3: 574; статусы: blocked_external: 1, candidate: 934, qualification: 659.
 
 #### P1: 3 пунктов
 
@@ -206,7 +206,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 2 | LIN-0002 | [D01](#d01) | Закрыть durable 1k SQLite gap | PERF | qualification | M | G-PERF |
 | 22 | LIN-0006 | [D01](#d01) | Получить тестовый endpoint Kusto | OPS | blocked_external | M | G-OPS |
 
-#### P2: 1020 пунктов
+#### P2: 1017 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -303,7 +303,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 247 | LIN-0159 | [D04](#d04) | Проверить reopen после failed backup | CORRECTNESS | qualification | S | G-CORRECT |
 | 248 | LIN-0160 | [D04](#d04) | Проверить reopen после truncated rotation | CORRECTNESS | qualification | S | G-CORRECT |
 | 249 | LIN-0165 | [D05](#d05) | Проверить SnapshotRef lifetime | CORRECTNESS | qualification | S | G-CORRECT |
-| 250 | LIN-0166 | [D05](#d05) | Проверить mutation во время snapshot | CORRECTNESS | qualification | S | G-CORRECT |
 | 251 | LIN-0167 | [D05](#d05) | Проверить checkpoint generation fencing | CORRECTNESS | qualification | S | G-CORRECT |
 | 252 | LIN-0168 | [D05](#d05) | Проверить snapshot checksum coverage | CORRECTNESS | qualification | S | G-CORRECT |
 | 253 | LIN-0169 | [D05](#d05) | Ввести versioned snapshot manifest | PERF | candidate | M | G-PERF |
@@ -321,8 +320,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 282 | LIN-0218 | [D06](#d06) | Спроектировать bounded savepoints | FEATURE | candidate | L | G-FEATURE |
 | 283 | LIN-0219 | [D06](#d06) | Спроектировать read-your-writes contract | FEATURE | candidate | L | G-FEATURE |
 | 284 | LIN-0220 | [D06](#d06) | Спроектировать nested transaction rejection | FEATURE | candidate | L | G-FEATURE |
-| 296 | LIN-0232 | [D06](#d06) | Проверить failed commit reopen consistency | CORRECTNESS | qualification | S | G-CORRECT |
-| 299 | LIN-0235 | [D06](#d06) | Проверить concurrent snapshot visibility | CORRECTNESS | qualification | S | G-CORRECT |
 | 300 | LIN-0236 | [D06](#d06) | Проверить transaction result lifetime | CORRECTNESS | qualification | S | G-CORRECT |
 | 301 | LIN-0237 | [D06](#d06) | Добавить transaction phase diagnostics | FEATURE | candidate | M | G-FEATURE |
 | 302 | LIN-0238 | [D06](#d06) | Добавить rollback reason counters | FEATURE | candidate | M | G-FEATURE |
