@@ -102,6 +102,38 @@ impl Db {
             }
         }
         let mut out = Vec::with_capacity(reached.len().min(300));
+        // A cold collection resolves the reached keys with point reads on the engine
+        // instead of the in-memory id maps, which would pull it into memory.
+        let docs_cold = self.store.is_disk_backed("docs");
+        if docs_cold || self.store.is_disk_backed(primary) {
+            for key in reached {
+                let row = if docs_cold {
+                    self.store
+                        .disk_point_row("docs", "id", &key)
+                        .or_else(|| self.store.disk_point_row("docs", "uri", &key))
+                } else {
+                    self.store.find_doc_key(&key).cloned()
+                };
+                let row = match row {
+                    Some(row) => Some(row),
+                    None if primary != "docs" => {
+                        if self.store.is_disk_backed(primary) {
+                            self.store.disk_point_row(primary, "id", &key)
+                        } else {
+                            self.store.get_by_id(primary, &key).cloned()
+                        }
+                    }
+                    None => None,
+                };
+                if let Some(row) = row {
+                    out.push(row);
+                }
+                if out.len() >= 300 {
+                    break;
+                }
+            }
+            return Ok(out);
+        }
         for key in reached {
             if let Some(row) = self.store.find_doc_key(&key) {
                 out.push(row.clone());

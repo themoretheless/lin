@@ -1108,6 +1108,14 @@ fn try_lazy_hop(db: &CursorDb<'_>, q: &Query) -> Result<Option<LazyCursor>, Erro
     let Source::Collection(name) = &q.source else {
         return Ok(None);
     };
+    // Over a cold collection the executor resolves the hop with point reads (the result
+    // is capped); positions into the collection would pull it into memory.
+    {
+        let (store, _) = db.store_catalog();
+        if store.is_disk_backed(name) || store.is_disk_backed("docs") {
+            return Ok(None);
+        }
+    }
     let mut filter: Option<&Pred> = None;
     let mut hop_rel: Option<&str> = None;
     let mut project: Option<Vec<String>> = None;

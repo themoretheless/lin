@@ -5217,3 +5217,75 @@ fn cold_insert_batch_matches_insert_statement() {
     let handle = cold.run(r#"ev | id == "n3""#).unwrap();
     assert!(!handle.rows[0].contains_key("grp") || handle.rows[0].get("grp") == Some(&Cell::Null));
 }
+
+/// `hop` from a cold collection, as a statement and as a cursor: the reached documents
+/// are read by point lookups on the engine, so the collection stays on disk, and the
+/// result matches the same walk over in-memory data.
+#[test]
+fn cold_hop_resolves_targets_without_materializing() {
+    use lin::Queryable;
+    use lin::query::pred;
+    fn seed(db: &mut Db) {
+        let mut src = String::from("insert docs [");
+        for i in 0..300 {
+            if i > 0 {
+                src.push(',');
+            }
+            src.push_str(&format!(
+                r#"{{ id: "d{i}", uri: "wiki://p/{i}", title: "page {i}", layer: "wiki" }}"#
+            ));
+        }
+        src.push(']');
+        db.run(&src).unwrap();
+        for i in 0..20 {
+            db.run(&format!(
+                r#"insert docs {{ id: "n{i}", uri: "raw://n/{i}", title: "note {i}", layer: "raw" }} with edge wikilink -> page "wiki://p/{}""#,
+                i * 3
+            ))
+            .unwrap();
+        }
+    }
+    let dir = tmp();
+    let opts = || lin::OpenOpts {
+        sync: lin::SyncMode::Full,
+        cold: true,
+    };
+    {
+        let mut db = Db::open_with(&dir, opts()).unwrap();
+        seed(&mut db);
+        db.checkpoint().unwrap();
+        db.close().unwrap();
+    }
+    let mut hot = Db::empty();
+    seed(&mut hot);
+    let ids = |rows: &[lin::Row]| -> Vec<String> {
+        let mut v: Vec<String> = rows
+            .iter()
+            .filter_map(|r| r.get("id").and_then(lin::Cell::text).map(str::to_string))
+            .collect();
+        v.sort();
+        v
+    };
+    let q = r#"docs | layer == "raw" | hop wikilink | take all"#;
+    let want = ids(&hot.run(q).unwrap().rows);
+    assert_eq!(want.len(), 20);
+    {
+        let mut db = Db::open_with(&dir, opts()).unwrap();
+        let got = ids(&db.run(q).unwrap().rows);
+        assert_eq!(got, want);
+        assert!(!db.store.disk_rows_materialized("docs"), "a hop statement pulled docs into memory");
+    }
+    {
+        let db = Db::open_with(&dir, opts()).unwrap();
+        let rows: Vec<lin::Row> = Queryable::from("docs")
+            .filter(pred::eq("layer", "raw"))
+            .hop("wikilink")
+            .take_all()
+            .cursor(&db)
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(ids(&rows), want);
+        assert!(!db.store.disk_rows_materialized("docs"), "a hop cursor pulled docs into memory");
+    }
+}
