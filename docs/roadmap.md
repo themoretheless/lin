@@ -2,7 +2,7 @@
 
 Срез: **2026-11-14**, коммит `58444cf6e` (релиз 0.7.1) плюс незакоммиченное рабочее дерево. Единственный файл с планом в репозитории: в нём только несделанное. Реализованное описано в [CHANGELOG](../CHANGELOG.md), в документах `docs/` по отдельным механизмам и в отчётах `benches/results/`.
 
-Открыто **1598** пунктов backlog (часть II) и 12 пунктов части I: 10 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
+Открыто **1597** пунктов backlog (часть II) и 12 пунктов части I: 10 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровывались, поэтому в них есть пропуски: закрытые пункты удалены. Пункты части II со статусами `candidate` и `qualification` по коду поштучно не сверялись: перед взятием пункта сначала проверить, не покрыт ли он уже.
 
@@ -194,9 +194,9 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 Для каждой строки итоговый критерий — её конкретный результат плюс указанный gate. Если критерий требует недоступной платформы/endpoint, статус остаётся непроверенным; mock/compile не заменяет live qualification.
 
-### Приоритетный список — 1598 пунктов
+### Приоритетный список — 1597 пунктов
 
-Количества: P1: 3, P2: 1021, P3: 574; статусы: blocked_external: 1, candidate: 934, qualification: 663.
+Количества: P1: 3, P2: 1020, P3: 574; статусы: blocked_external: 1, candidate: 934, qualification: 662.
 
 #### P1: 3 пунктов
 
@@ -206,7 +206,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 2 | LIN-0002 | [D01](#d01) | Закрыть durable 1k SQLite gap | PERF | qualification | M | G-PERF |
 | 22 | LIN-0006 | [D01](#d01) | Получить тестовый endpoint Kusto | OPS | blocked_external | M | G-OPS |
 
-#### P2: 1021 пунктов
+#### P2: 1020 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -286,7 +286,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 210 | LIN-0118 | [D03](#d03) | Измерить large WAL commits | PERF | candidate | M | G-PERF |
 | 211 | LIN-0119 | [D03](#d03) | Измерить concurrent-reader sync impact | PERF | candidate | M | G-PERF |
 | 212 | LIN-0120 | [D03](#d03) | Измерить fsync на реальном диске | PERF | candidate | M | G-PERF |
-| 229 | LIN-0141 | [D04](#d04) | Проверить replay partial transaction | CORRECTNESS | qualification | S | G-CORRECT |
 | 230 | LIN-0142 | [D04](#d04) | Проверить replay group boundaries | CORRECTNESS | qualification | S | G-CORRECT |
 | 231 | LIN-0143 | [D04](#d04) | Проверить rollback после decode failure | CORRECTNESS | qualification | S | G-CORRECT |
 | 233 | LIN-0145 | [D04](#d04) | Измерить bounded replay memory | PERF | candidate | M | G-PERF |

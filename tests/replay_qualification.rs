@@ -441,3 +441,65 @@ fn log_replay_skips_repeated_frames_and_refuses_holes() {
         assert!(Db::open_read(&dir).is_err(), "{order:?}: read-only open");
     }
 }
+
+/// A crash part-way through writing a transaction's log frame leaves a torn tail. For
+/// every cut inside the last frame, reopening shows the transaction either complete
+/// (never: the frame is incomplete) or absent, never some of its statements, and the
+/// earlier committed work is intact. A transaction spanning several collections and
+/// statement kinds makes partial application visible if it happened.
+#[test]
+fn torn_transaction_frame_replays_as_all_or_nothing() {
+    let dir = tmp();
+    let image;
+    {
+        let mut db = Db::open(&dir).unwrap();
+        db.run("col pa { id: text, n: i64 }\ncol pb { id: text, n: i64 }").unwrap();
+        db.run(r#"insert pa [{ id: "a1", n: 1 }, { id: "a2", n: 2 }]"#).unwrap();
+        let mut tx = db.transaction().unwrap();
+        tx.run(r#"insert pa { id: "a3", n: 3 }"#).unwrap();
+        tx.run(r#"insert pb [{ id: "b1", n: 1 }, { id: "b2", n: 2 }]"#).unwrap();
+        tx.run(r#"update pa[id == "a1"] cas each { n: 100 }"#).unwrap();
+        tx.run(r#"delete pa[id == "a2"] cas each"#).unwrap();
+        tx.commit().unwrap();
+        // Copy while still open: a clean close would checkpoint and empty the log.
+        image = crash_image(&dir);
+    }
+    let log_path = image.join(lin::persist::LOG_NAME);
+    let full = fs::read(&log_path).unwrap();
+    let frames = log_frames(&image);
+    let last = frames.last().unwrap().len();
+    let start = full.len() - last;
+    let state = |db: &mut Db| -> Vec<String> {
+        let mut v = Vec::new();
+        for c in ["pa", "pb"] {
+            for r in db.run(&format!("{c} | {{ id, n }} | take all")).unwrap().rows.iter() {
+                v.push(format!("{c}:{}={}", r.get("id").and_then(|x| x.text()).unwrap(), r.get("n").and_then(|x| x.as_f64()).unwrap()));
+            }
+        }
+        v.sort();
+        v
+    };
+    let before = vec!["pa:a1=1".to_string(), "pa:a2=2".to_string()];
+    let after = {
+        let mut db = Db::open(crash_image(&image)).unwrap();
+        state(&mut db)
+    };
+    assert_eq!(after, vec!["pa:a1=100", "pa:a3=3", "pb:b1=1", "pb:b2=2"]);
+    let step = (last / 64).max(1);
+    let mut cut = start;
+    while cut < full.len() {
+        let copy = crash_image(&image);
+        fs::write(copy.join(lin::persist::LOG_NAME), &full[..cut]).unwrap();
+        match Db::open(&copy) {
+            Ok(mut db) => {
+                let s = state(&mut db);
+                assert!(s == before, "cut at {cut}/{}: partial transaction {s:?}", full.len());
+                // The database accepts writes after recovering from the torn tail.
+                db.run(r#"insert pa { id: "post", n: 0 }"#).unwrap();
+            }
+            Err(e) => panic!("cut at {cut}: torn tail refused: {e}"),
+        }
+        let _ = fs::remove_dir_all(&copy);
+        cut += step;
+    }
+}
