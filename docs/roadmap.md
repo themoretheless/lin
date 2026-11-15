@@ -2,7 +2,7 @@
 
 Срез: **2026-11-15**, коммит `58444cf6e` (релиз 0.7.1) плюс незакоммиченное рабочее дерево. Единственный файл с планом в репозитории: в нём только несделанное. Реализованное описано в [CHANGELOG](../CHANGELOG.md), в документах `docs/` по отдельным механизмам и в отчётах `benches/results/`.
 
-Открыто **1482** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
+Открыто **1471** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровывались, поэтому в них есть пропуски: закрытые пункты удалены. Пункты части II со статусами `candidate` и `qualification` по коду поштучно не сверялись: перед взятием пункта сначала проверить, не покрыт ли он уже.
 
@@ -193,7 +193,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 ### Приоритетный список — 1563 пунктов
 
-Количества: P1: 3, P2: 906, P3: 573; статусы: blocked_external: 1, candidate: 934, qualification: 547.
+Количества: P1: 3, P2: 895, P3: 573; статусы: blocked_external: 1, candidate: 934, qualification: 536.
 
 #### P1: 3 пунктов
 
@@ -203,7 +203,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 2 | LIN-0002 | [D01](#d01) | Закрыть durable 1k SQLite gap | PERF | qualification | M | G-PERF |
 | 22 | LIN-0006 | [D01](#d01) | Получить тестовый endpoint Kusto | OPS | blocked_external | M | G-OPS |
 
-#### P2: 906 пунктов
+#### P2: 895 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -385,9 +385,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 432 | LIN-0398 | [D10](#d10) | Сравнить adaptive posting representation | PERF | candidate | M | G-PERF |
 | 434 | LIN-0400 | [D10](#d10) | Сравнить hash-only equality indexes | PERF | candidate | M | G-PERF |
 | 435 | LIN-0405 | [D11](#d11) | Проверить NaN unique key policy | CORRECTNESS | qualification | S | G-CORRECT |
-| 436 | LIN-0406 | [D11](#d11) | Проверить negative-zero unique policy | CORRECTNESS | qualification | S | G-CORRECT |
-| 444 | LIN-0414 | [D11](#d11) | Проверить conflicting index definition | CORRECTNESS | qualification | S | G-CORRECT |
-| 450 | LIN-0420 | [D11](#d11) | Проверить unique constraint error location | CORRECTNESS | qualification | S | G-CORRECT |
 | 451 | LIN-0421 | [D11](#d11) | Спроектировать named constraints | FEATURE | candidate | L | G-FEATURE |
 | 452 | LIN-0422 | [D11](#d11) | Спроектировать configurable NULL distinctness | FEATURE | candidate | L | G-FEATURE |
 | 453 | LIN-0423 | [D11](#d11) | Спроектировать CHECK predicates | FEATURE | candidate | L | G-FEATURE |
@@ -398,20 +395,12 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 458 | LIN-0444 | [D12](#d12) | Уточнить trailing-input diagnostics | API | candidate | M | G-API |
 | 462 | LIN-0448 | [D12](#d12) | Ограничить escaped string expansion | CORRECTNESS | qualification | M | G-CORRECT |
 | 463 | LIN-0449 | [D12](#d12) | Проверить Unicode identifiers policy | CORRECTNESS | qualification | S | G-CORRECT |
-| 464 | LIN-0450 | [D12](#d12) | Проверить whitespace lexical classes | CORRECTNESS | qualification | S | G-CORRECT |
-| 470 | LIN-0456 | [D12](#d12) | Проверить parenthesis recovery policy | CORRECTNESS | qualification | S | G-CORRECT |
 | 472 | LIN-0458 | [D12](#d12) | Спроектировать named parameter binding | API | candidate | L | G-API |
 | 473 | LIN-0459 | [D12](#d12) | Спроектировать batch statement separators | API | candidate | L | G-API |
 | 474 | LIN-0460 | [D12](#d12) | Спроектировать multiline query formatting | API | candidate | L | G-API |
 | 475 | LIN-0461 | [D12](#d12) | Проверить quoted field names | CORRECTNESS | qualification | S | G-CORRECT |
 | 476 | LIN-0462 | [D12](#d12) | Проверить reserved keyword escaping | CORRECTNESS | qualification | S | G-CORRECT |
-| 477 | LIN-0463 | [D12](#d12) | Проверить nested projection grammar | CORRECTNESS | qualification | S | G-CORRECT |
-| 478 | LIN-0464 | [D12](#d12) | Проверить empty list grammar | CORRECTNESS | qualification | S | G-CORRECT |
-| 479 | LIN-0485 | [D13](#d13) | Проверить invalid field detection | CORRECTNESS | qualification | S | G-CORRECT |
-| 480 | LIN-0486 | [D13](#d13) | Проверить invalid collection detection | CORRECTNESS | qualification | S | G-CORRECT |
-| 481 | LIN-0487 | [D13](#d13) | Проверить incompatible operator types | CORRECTNESS | qualification | S | G-CORRECT |
 | 482 | LIN-0488 | [D13](#d13) | Проверить invalid projection aliases | CORRECTNESS | qualification | S | G-CORRECT |
-| 483 | LIN-0489 | [D13](#d13) | Проверить aggregate type inference | CORRECTNESS | qualification | S | G-CORRECT |
 | 484 | LIN-0490 | [D13](#d13) | Проверить window result type inference | CORRECTNESS | qualification | S | G-CORRECT |
 | 485 | LIN-0491 | [D13](#d13) | Проверить join output name collisions | CORRECTNESS | qualification | S | G-CORRECT |
 | 486 | LIN-0492 | [D13](#d13) | Проверить nested expression typing | CORRECTNESS | qualification | S | G-CORRECT |
