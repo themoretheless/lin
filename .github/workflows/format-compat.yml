@@ -24,6 +24,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.96.0"
+      - name: Pull latest airbug release
+        run: cargo update "https://github.com/themoretheless/airbug"
       - uses: Swatinem/rust-cache@v2
       - name: Read and write across versions
         run: scripts/format-compat.sh

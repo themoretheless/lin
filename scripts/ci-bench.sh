@@ -40,6 +40,10 @@ else
   echo "airbug dash: (AIRBUG_HUB unset — local output only)"
 fi
 
+if [[ "${AIRBUG_OFFLINE:-0}" != "1" ]]; then
+  cargo update "https://github.com/themoretheless/airbug" || echo "airbug update skipped (offline)"
+fi
+
 cargo bench --bench compare -- \
   --profile quick \
   --exclude 'compare/durable*' \
