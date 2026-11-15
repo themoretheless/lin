@@ -1440,46 +1440,14 @@ impl MmapFixedCol {
             .min(self.values.len() / 8);
         match self.kind {
             DiskColKind::Float64 => {
-                let mut acc = 0.0f64;
-                if seg_all_live && self.nulls[..n].iter().all(|&b| b == 0) {
-                    #[cfg(target_endian = "little")]
-                    {
-                        let ptr = self.values.as_ptr();
-                        if (ptr as usize).is_multiple_of(std::mem::align_of::<f64>()) {
-                            let slice = unsafe { std::slice::from_raw_parts(ptr as *const f64, n) };
-                            let mut s0 = 0.0f64;
-                            let mut s1 = 0.0f64;
-                            let mut s2 = 0.0f64;
-                            let mut s3 = 0.0f64;
-                            let mut chunks = slice.chunks_exact(4);
-                            for c in &mut chunks {
-                                s0 += c[0];
-                                s1 += c[1];
-                                s2 += c[2];
-                                s3 += c[3];
-                            }
-                            for &v in chunks.remainder() {
-                                s0 += v;
-                            }
-                            let mut out = crate::exact_sum::ExactSum::default();
-                            out.add_f64((s0 + s1) + (s2 + s3));
-                            return Some(out);
-                        }
-                    }
-                    for rid in 0..n {
-                        acc += self.read_f64(rid as u32);
-                    }
-                    let mut out = crate::exact_sum::ExactSum::default();
-                    out.add_f64(acc);
-                    return Some(out);
-                }
+                // Compensated, value by value in row order, like the in-memory `sum`, so a
+                // cold column and the same rows in memory give the same answer.
+                let mut out = crate::exact_sum::ExactSum::default();
                 for rid in 0..n {
                     if self.nulls[rid] == 0 && (seg_all_live || is_live(rid as u32)) {
-                        acc += self.read_f64(rid as u32);
+                        out.add_f64(self.read_f64(rid as u32));
                     }
                 }
-                let mut out = crate::exact_sum::ExactSum::default();
-                out.add_f64(acc);
                 Some(out)
             }
             DiskColKind::Int64 => {

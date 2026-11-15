@@ -79,3 +79,25 @@ fn cold_tier_sums_are_exact_too() {
     let by = |g: &str| rows.iter().find(|r| r.get("g").and_then(|c| c.text()) == Some(g)).and_then(|r| r.get("v")).and_then(|c| c.as_f64());
     assert_eq!(by("x"), Some(-1.0));
 }
+
+/// The cold tier's columnar float sum keeps a small value between two large values that
+/// cancel, like the in-memory sum.
+#[test]
+fn cold_float_sum_is_compensated() {
+    let n = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let dir = std::env::temp_dir().join(format!("lin-cold-fsum-{}-{n}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let opts = || lin::OpenOpts { sync: lin::SyncMode::Normal, cold: true };
+    {
+        let mut db = Db::open_with(&dir, opts()).unwrap();
+        db.run("col cf { id: text, f: f64 }").unwrap();
+        db.run(r#"insert cf [{ id: "a", f: 10000000000000000.0 }, { id: "b", f: 1.0 }, { id: "c", f: -10000000000000000.0 }]"#).unwrap();
+        let filler = (0..64).map(|i| format!(r#"{{ id: "z{i}", f: 0.0 }}"#)).collect::<Vec<_>>().join(",");
+        db.run(&format!("insert cf [{filler}]")).unwrap();
+        db.checkpoint().unwrap();
+        db.close().unwrap();
+    }
+    let mut db = Db::open_with(&dir, opts()).unwrap();
+    assert!(db.store.is_disk_backed("cf"));
+    assert_eq!(one(&mut db, "cf | sum f", "f").as_f64(), Some(1.0));
+}
