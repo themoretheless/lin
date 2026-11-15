@@ -10,8 +10,10 @@ use std::path::Path;
 use lin::Db;
 
 fn tmp() -> std::path::PathBuf {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-    let d = std::env::temp_dir().join(format!("lin-fs-err-{}-{n}", std::process::id()));
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let d = std::env::temp_dir().join(format!("lin-fs-err-{}-{n}-{seq}", std::process::id()));
     std::fs::create_dir_all(&d).unwrap();
     d
 }

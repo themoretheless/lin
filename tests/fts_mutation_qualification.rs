@@ -53,7 +53,7 @@ fn search_follows_every_mutation_and_replay() {
     let before = db.reader();
     let before_docs = docs.clone();
 
-    let mut set = |db: &mut Db, docs: &mut BTreeMap<String, String>, i: usize, t: &str| {
+    let set = |db: &mut Db, docs: &mut BTreeMap<String, String>, i: usize, t: &str| {
         db.run(&format!(r#"update docs[uri == "raw://f/{i}"] cas each {{ title: "{t}" }}"#)).unwrap();
         docs.insert(format!("raw://f/{i}"), t.to_string());
     };
