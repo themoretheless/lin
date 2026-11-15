@@ -2,7 +2,7 @@
 
 Срез: **2026-11-15**, коммит `58444cf6e` (релиз 0.7.1) плюс незакоммиченное рабочее дерево. Единственный файл с планом в репозитории: в нём только несделанное. Реализованное описано в [CHANGELOG](../CHANGELOG.md), в документах `docs/` по отдельным механизмам и в отчётах `benches/results/`.
 
-Открыто **1489** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
+Открыто **1488** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровывались, поэтому в них есть пропуски: закрытые пункты удалены. Пункты части II со статусами `candidate` и `qualification` по коду поштучно не сверялись: перед взятием пункта сначала проверить, не покрыт ли он уже.
 
@@ -193,7 +193,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 ### Приоритетный список — 1563 пунктов
 
-Количества: P1: 3, P2: 913, P3: 573; статусы: blocked_external: 1, candidate: 934, qualification: 554.
+Количества: P1: 3, P2: 912, P3: 573; статусы: blocked_external: 1, candidate: 934, qualification: 553.
 
 #### P1: 3 пунктов
 
@@ -203,7 +203,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 2 | LIN-0002 | [D01](#d01) | Закрыть durable 1k SQLite gap | PERF | qualification | M | G-PERF |
 | 22 | LIN-0006 | [D01](#d01) | Получить тестовый endpoint Kusto | OPS | blocked_external | M | G-OPS |
 
-#### P2: 913 пунктов
+#### P2: 912 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -336,7 +336,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 350 | LIN-0294 | [D08](#d08) | Измерить Cell size regression | PERF | candidate | M | G-PERF |
 | 351 | LIN-0295 | [D08](#d08) | Измерить cloned inline strings | PERF | candidate | M | G-PERF |
 | 352 | LIN-0296 | [D08](#d08) | Измерить shared large strings | PERF | candidate | M | G-PERF |
-| 355 | LIN-0299 | [D08](#d08) | Проверить timestamp/value distinction | CORRECTNESS | qualification | S | G-CORRECT |
 | 360 | LIN-0305 | [D08](#d08) | Спроектировать explicit decimal Cell | FEATURE | candidate | L | G-FEATURE |
 | 361 | LIN-0306 | [D08](#d08) | Спроектировать binary payload Cell | FEATURE | candidate | L | G-FEATURE |
 | 362 | LIN-0307 | [D08](#d08) | Спроектировать duration Cell | FEATURE | candidate | L | G-FEATURE |
