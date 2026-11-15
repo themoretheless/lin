@@ -84,3 +84,23 @@ fn hybrid_results_are_unique_complete_and_stable() {
         }
     }
 }
+
+/// Vector Top-K under a filter is exact: filtering then searching with `take k` gives
+/// the first k of the full filtered ranking, for every k.
+#[test]
+fn filtered_vector_top_k_is_a_prefix_of_the_filtered_ranking() {
+    let mut db = Db::empty().with_embedder(Arc::new(Seeded));
+    for i in 0..150 {
+        let layer = if i % 3 == 0 { "wiki" } else { "raw" };
+        db.run(&format!(r#"insert docs {{ uri: "raw://k/{i}", title: "entry {i} about birds", layer: "{layer}" }}"#)).unwrap();
+    }
+    for query in ["birds", "entry 42", "nothing alike"] {
+        let full = uris(&mut db, &format!(r#"docs | layer == "wiki" | search vec "{query}" | {{ uri }} | take all"#));
+        assert!(full.iter().all(|u| u[8..].parse::<usize>().unwrap() % 3 == 0), "{query}: filter leaked");
+        for k in [1usize, 5, 17, 49, 50, 200] {
+            let top = uris(&mut db, &format!(r#"docs | layer == "wiki" | search vec "{query}" | {{ uri }} | take {k}"#));
+            let want: Vec<String> = full.iter().take(k).cloned().collect();
+            assert_eq!(top, want, "{query}: take {k}");
+        }
+    }
+}
