@@ -7,8 +7,10 @@
 use lin::Db;
 
 fn tmp() -> std::path::PathBuf {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let n = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-    let d = std::env::temp_dir().join(format!("lin-replay-cat-{}-{n}", std::process::id()));
+    let d = std::env::temp_dir().join(format!("lin-replay-cat-{}-{n}-{seq}", std::process::id()));
     std::fs::create_dir_all(&d).unwrap();
     d
 }
