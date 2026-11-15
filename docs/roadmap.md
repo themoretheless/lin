@@ -2,7 +2,7 @@
 
 Срез: **2026-11-15**, коммит `58444cf6e` (релиз 0.7.1) плюс незакоммиченное рабочее дерево. Единственный файл с планом в репозитории: в нём только несделанное. Реализованное описано в [CHANGELOG](../CHANGELOG.md), в документах `docs/` по отдельным механизмам и в отчётах `benches/results/`.
 
-Открыто **1421** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
+Открыто **1420** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровывались, поэтому в них есть пропуски: закрытые пункты удалены. Пункты части II со статусами `candidate` и `qualification` по коду поштучно не сверялись: перед взятием пункта сначала проверить, не покрыт ли он уже.
 
@@ -194,7 +194,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 ### Приоритетный список — 1563 пунктов
 
-Количества: P1: 3, P2: 845, P3: 573; статусы: blocked_external: 1, candidate: 934, qualification: 486.
+Количества: P1: 3, P2: 844, P3: 573; статусы: blocked_external: 1, candidate: 934, qualification: 485.
 
 #### P1: 3 пунктов
 
@@ -204,7 +204,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 2 | LIN-0002 | [D01](#d01) | Закрыть durable 1k SQLite gap | PERF | qualification | M | G-PERF |
 | 22 | LIN-0006 | [D01](#d01) | Получить тестовый endpoint Kusto | OPS | blocked_external | M | G-OPS |
 
-#### P2: 845 пунктов
+#### P2: 844 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -708,7 +708,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 967 | LIN-1182 | [D30](#d30) | Измерить projection kernel fusion | PERF | candidate | M | G-PERF |
 | 968 | LIN-1183 | [D30](#d30) | Измерить resident join intermediates | PERF | candidate | M | G-PERF |
 | 969 | LIN-1184 | [D30](#d30) | Измерить resident aggregation intermediates | PERF | candidate | M | G-PERF |
-| 971 | LIN-1202 | [D31](#d31) | Проверить DFS path multiplicity | CORRECTNESS | qualification | S | G-CORRECT |
 | 978 | LIN-1209 | [D31](#d31) | Измерить adjacency map locality | PERF | candidate | M | G-PERF |
 | 979 | LIN-1210 | [D31](#d31) | Измерить for_each_neighbor borrowing | PERF | candidate | M | G-PERF |
 | 980 | LIN-1211 | [D31](#d31) | Измерить traversal scratch reuse | PERF | candidate | M | G-PERF |
