@@ -2,7 +2,7 @@
 
 Срез: **2026-11-15**, коммит `58444cf6e` (релиз 0.7.1) плюс незакоммиченное рабочее дерево. Единственный файл с планом в репозитории: в нём только несделанное. Реализованное описано в [CHANGELOG](../CHANGELOG.md), в документах `docs/` по отдельным механизмам и в отчётах `benches/results/`.
 
-Открыто **1378** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
+Открыто **1376** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровывались, поэтому в них есть пропуски: закрытые пункты удалены. Пункты части II со статусами `candidate` и `qualification` по коду поштучно не сверялись: перед взятием пункта сначала проверить, не покрыт ли он уже.
 
@@ -196,7 +196,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 ### Приоритетный список — 1563 пунктов
 
-Количества: P1: 3, P2: 830, P3: 545; статусы: blocked_external: 1, candidate: 934, qualification: 443.
+Количества: P1: 3, P2: 828, P3: 545; статусы: blocked_external: 1, candidate: 934, qualification: 441.
 
 #### P1: 3 пунктов
 
@@ -206,7 +206,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 2 | LIN-0002 | [D01](#d01) | Закрыть durable 1k SQLite gap | PERF | qualification | M | G-PERF |
 | 22 | LIN-0006 | [D01](#d01) | Получить тестовый endpoint Kusto | OPS | blocked_external | M | G-OPS |
 
-#### P2: 830 пунктов
+#### P2: 828 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -403,7 +403,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 475 | LIN-0461 | [D12](#d12) | Проверить quoted field names | CORRECTNESS | qualification | S | G-CORRECT |
 | 476 | LIN-0462 | [D12](#d12) | Проверить reserved keyword escaping | CORRECTNESS | qualification | S | G-CORRECT |
 | 482 | LIN-0488 | [D13](#d13) | Проверить invalid projection aliases | CORRECTNESS | qualification | S | G-CORRECT |
-| 484 | LIN-0490 | [D13](#d13) | Проверить window result type inference | CORRECTNESS | qualification | S | G-CORRECT |
 | 486 | LIN-0492 | [D13](#d13) | Проверить nested expression typing | CORRECTNESS | qualification | S | G-CORRECT |
 | 487 | LIN-0493 | [D13](#d13) | Спроектировать nullable schema fields | FEATURE | candidate | L | G-FEATURE |
 | 488 | LIN-0494 | [D13](#d13) | Спроектировать union scalar types | FEATURE | candidate | L | G-FEATURE |
@@ -439,7 +438,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 528 | LIN-0538 | [D14](#d14) | Добавить deterministic expression classification | FEATURE | candidate | M | G-FEATURE |
 | 529 | LIN-0539 | [D14](#d14) | Добавить volatile expression barriers | FEATURE | candidate | M | G-FEATURE |
 | 530 | LIN-0540 | [D14](#d14) | Добавить normalized predicate fingerprints | FEATURE | candidate | M | G-FEATURE |
-| 538 | LIN-0548 | [D14](#d14) | Проверить graph/filter commutation | CORRECTNESS | qualification | S | G-CORRECT |
 | 539 | LIN-0549 | [D14](#d14) | Добавить plan equivalence oracle | VERIFY | qualification | S | G-VERIFY |
 | 540 | LIN-0550 | [D14](#d14) | Добавить no-optimization execution mode | FEATURE | candidate | M | G-FEATURE |
 | 541 | LIN-0551 | [D14](#d14) | Добавить reproducible plan fingerprints | FEATURE | candidate | M | G-FEATURE |
