@@ -19,7 +19,9 @@ use crate::store::{Row, row_text};
 
 pub const FTS_DIR: &str = "fts";
 pub const FTS_MAGIC: [u8; 4] = *b"LIN\x05";
-const FTS_VERSION: u8 = 1;
+/// 2: tokens lowercased with `str::to_lowercase` (contextual: a word-final capital sigma
+/// becomes `ς`), matching the query side; version-1 files are rebuilt.
+const FTS_VERSION: u8 = 2;
 const FTS_CRC_MAGIC: [u8; 4] = *b"LCRC";
 
 /// Pending entries folded back into a term's base list. A removal from a sorted
@@ -691,10 +693,11 @@ pub(crate) fn lowercased<'a>(text: &'a str, scratch: &'a mut String) -> &'a str 
     if !text.chars().any(|c| c.to_lowercase().next() != Some(c)) {
         return text;
     }
+    // `str::to_lowercase`, not per character: it applies the contextual rules (a final
+    // capital sigma becomes `ς`), as query lowering and lex scoring do. Per-character
+    // lowering turned `ΟΔΟΣ` into `οδοσ`, so it never matched a stored `οδος`.
     scratch.clear();
-    for c in text.chars() {
-        scratch.extend(c.to_lowercase());
-    }
+    scratch.push_str(&text.to_lowercase());
     scratch
 }
 
@@ -1369,10 +1372,7 @@ mod pending_order_tests {
         let mut scratch = String::from("previous buffer contents");
         for _ in 0..3 {
             for text in cases {
-                let reference = text
-                    .chars()
-                    .flat_map(char::to_lowercase)
-                    .collect::<String>();
+                let reference = text.to_lowercase();
                 assert_eq!(lowercased(text, &mut scratch), reference);
             }
         }

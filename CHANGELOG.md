@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Fixed
+- Lexical search lowercased the index character by character but the query with the contextual Unicode rules, so an upper-case Greek word never found its lower-case form: `ΟΔΟΣ` became `οδοσ` in the index, while the stored `οδος` ends in `ς`. Both sides now use `str::to_lowercase`. The full-text index format moves to version 2, so existing index files are rebuilt on open. The built-in embedder uses the same lowering, so vectors of texts with a word-final capital sigma change.
 - `sum` and `avg` over floats lost small values between large values that cancel: `1e16, 1, -1e16` summed to `0`. In-memory, grouped, parallel, spilled, indexed and join aggregates now use Neumaier-compensated addition and give `1`. The cold tier's columnar float sum is compensated the same way.
 - Sliding-frame window `sum` and `avg` over floats subtracted running prefix sums, so small values vanished behind a large earlier value: after `1e16`, a frame of `1.0, 0.5, 1.0` summed to `0`. Frames up to 1024 rows that do not start at the first row are now summed from their own rows.
 - `lin cache cli` with commands piped in mixed its banner and `cacha (...)>` prompts into the output. The banner and prompts are now shown only when stdin is a terminal.
