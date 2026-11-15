@@ -50,3 +50,17 @@ fn nan_and_infinity_policy() {
     let mut db = Db::open(&dir).unwrap();
     check(&mut db, "after checkpoint");
 }
+
+/// A unique index treats NaN like any other key: a second NaN is a duplicate (NaN keys
+/// compare equal to each other in the index, as they do in `count by`).
+#[test]
+fn nan_in_a_unique_index_is_one_key() {
+    let mut db = Db::empty();
+    db.run("col u { id: text, v: f64 }").unwrap();
+    db.run("index u unique [v]").unwrap();
+    let p = db.prepare("insert u { id: $id, v: $v }").unwrap();
+    p.execute_with(&mut db, &[("id", Cell::text_arc("x")), ("v", Cell::Float(f64::NAN))]).unwrap();
+    let second = p.execute_with(&mut db, &[("id", Cell::text_arc("y")), ("v", Cell::Float(f64::NAN))]);
+    assert!(second.is_err(), "a second NaN key was accepted by a unique index");
+    assert_eq!(db.run("u | count").unwrap().rows[0].get("hits").and_then(|c| c.as_f64()), Some(1.0));
+}
