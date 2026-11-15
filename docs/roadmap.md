@@ -2,7 +2,7 @@
 
 Срез: **2026-11-15**, коммит `58444cf6e` (релиз 0.7.1) плюс незакоммиченное рабочее дерево. Единственный файл с планом в репозитории: в нём только несделанное. Реализованное описано в [CHANGELOG](../CHANGELOG.md), в документах `docs/` по отдельным механизмам и в отчётах `benches/results/`.
 
-Открыто **1449** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
+Открыто **1445** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровывались, поэтому в них есть пропуски: закрытые пункты удалены. Пункты части II со статусами `candidate` и `qualification` по коду поштучно не сверялись: перед взятием пункта сначала проверить, не покрыт ли он уже.
 
@@ -194,7 +194,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 ### Приоритетный список — 1563 пунктов
 
-Количества: P1: 3, P2: 873, P3: 573; статусы: blocked_external: 1, candidate: 934, qualification: 514.
+Количества: P1: 3, P2: 869, P3: 573; статусы: blocked_external: 1, candidate: 934, qualification: 510.
 
 #### P1: 3 пунктов
 
@@ -204,7 +204,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 2 | LIN-0002 | [D01](#d01) | Закрыть durable 1k SQLite gap | PERF | qualification | M | G-PERF |
 | 22 | LIN-0006 | [D01](#d01) | Получить тестовый endpoint Kusto | OPS | blocked_external | M | G-OPS |
 
-#### P2: 873 пунктов
+#### P2: 869 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -409,8 +409,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 490 | LIN-0496 | [D13](#d13) | Спроектировать inferred schema reporting | FEATURE | candidate | L | G-FEATURE |
 | 491 | LIN-0497 | [D13](#d13) | Проверить constant-fold overflow | CORRECTNESS | qualification | S | G-CORRECT |
 | 492 | LIN-0498 | [D13](#d13) | Проверить constant-fold NaN semantics | CORRECTNESS | qualification | S | G-CORRECT |
-| 493 | LIN-0499 | [D13](#d13) | Проверить short-circuit error visibility | CORRECTNESS | qualification | S | G-CORRECT |
-| 494 | LIN-0500 | [D13](#d13) | Проверить evaluation order side effects | CORRECTNESS | qualification | S | G-CORRECT |
 | 495 | LIN-0501 | [D13](#d13) | Проверить checked cast boundaries | CORRECTNESS | qualification | S | G-CORRECT |
 | 496 | LIN-0502 | [D13](#d13) | Проверить date/time literal validation | CORRECTNESS | qualification | S | G-CORRECT |
 | 498 | LIN-0504 | [D13](#d13) | Проверить vector dimension validation | CORRECTNESS | qualification | S | G-CORRECT |
@@ -483,7 +481,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 580 | LIN-0606 | [D16](#d16) | Измерить fused count/filter | PERF | candidate | M | G-PERF |
 | 581 | LIN-0607 | [D16](#d16) | Измерить reusable predicate scratch | PERF | candidate | M | G-PERF |
 | 582 | LIN-0608 | [D16](#d16) | Измерить field-ID expression access | PERF | candidate | M | G-PERF |
-| 584 | LIN-0610 | [D16](#d16) | Проверить filter side-effect ordering | CORRECTNESS | qualification | S | G-CORRECT |
 | 587 | LIN-0613 | [D16](#d16) | Спроектировать physical operator interface | FEATURE | candidate | L | G-FEATURE |
 | 588 | LIN-0614 | [D16](#d16) | Спроектировать explicit execution budgets | FEATURE | candidate | L | G-FEATURE |
 | 589 | LIN-0615 | [D16](#d16) | Спроектировать operator cancellation checkpoints | FEATURE | candidate | L | G-FEATURE |
@@ -493,7 +490,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 593 | LIN-0619 | [D16](#d16) | Добавить materialization reason diagnostics | FEATURE | candidate | M | G-FEATURE |
 | 594 | LIN-0620 | [D16](#d16) | Добавить backend transition traces | FEATURE | candidate | M | G-FEATURE |
 | 595 | LIN-0621 | [D16](#d16) | Проверить error после partial result | CORRECTNESS | qualification | S | G-CORRECT |
-| 596 | LIN-0622 | [D16](#d16) | Проверить nested execution reentrancy | CORRECTNESS | qualification | S | G-CORRECT |
 | 597 | LIN-0623 | [D16](#d16) | Проверить row pool между operators | CORRECTNESS | qualification | S | G-CORRECT |
 | 599 | LIN-0625 | [D16](#d16) | Измерить chunked batch execution | PERF | candidate | M | G-PERF |
 | 600 | LIN-0626 | [D16](#d16) | Измерить adaptive batch sizing | PERF | candidate | M | G-PERF |
