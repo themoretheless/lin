@@ -1,3 +1,5 @@
+#![cfg(all(feature = "derive", feature = "async"))]
+
 use futures_util::StreamExt;
 use lin::query::pred;
 use lin::{AsyncDb, Cell, Db, DurUnit, Duration, LinRow, MatchPath, Queryable, RowExt, Value};

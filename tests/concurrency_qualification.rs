@@ -7,7 +7,9 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use lin::{AsyncDb, Db};
+#[cfg(feature = "async")]
+use lin::AsyncDb;
+use lin::Db;
 
 fn count(rows: &lin::Handle) -> i64 {
     rows.rows[0].get("hits").and_then(|c| c.as_f64()).unwrap() as i64
@@ -93,6 +95,7 @@ fn reader_panic_and_failed_writes_affect_no_one() {
     assert_eq!(hop(&with_edge), 1);
 }
 
+#[cfg(feature = "async")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn async_reads_streams_and_aborted_transactions() {
     use futures_util::StreamExt;
@@ -174,6 +177,7 @@ fn snapshots_keep_their_catalog() {
     assert_eq!(count(&old.run("t | count").unwrap()), 500);
 }
 
+#[cfg(feature = "async")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dropped_futures_and_panicking_transactions_leave_the_db_usable() {
     let mut db = Db::empty();

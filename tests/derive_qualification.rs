@@ -3,6 +3,8 @@
 //! narrower integer are errors, extra stored fields are ignored, and time, vector and
 //! small-text cells convert to their Rust types.
 
+#![cfg(feature = "derive")]
+
 use lin::{Cell, Db, FromRow, InlineStr, LinRow};
 
 #[derive(Debug, LinRow)]
