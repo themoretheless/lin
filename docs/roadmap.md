@@ -2,7 +2,7 @@
 
 Срез: **2026-11-15**, коммит `58444cf6e` (релиз 0.7.1) плюс незакоммиченное рабочее дерево. Единственный файл с планом в репозитории: в нём только несделанное. Реализованное описано в [CHANGELOG](../CHANGELOG.md), в документах `docs/` по отдельным механизмам и в отчётах `benches/results/`.
 
-Открыто **1524** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
+Открыто **1522** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровывались, поэтому в них есть пропуски: закрытые пункты удалены. Пункты части II со статусами `candidate` и `qualification` по коду поштучно не сверялись: перед взятием пункта сначала проверить, не покрыт ли он уже.
 
@@ -193,7 +193,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 ### Приоритетный список — 1563 пунктов
 
-Количества: P1: 3, P2: 948, P3: 573; статусы: blocked_external: 1, candidate: 934, qualification: 589.
+Количества: P1: 3, P2: 946, P3: 573; статусы: blocked_external: 1, candidate: 934, qualification: 587.
 
 #### P1: 3 пунктов
 
@@ -203,7 +203,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 2 | LIN-0002 | [D01](#d01) | Закрыть durable 1k SQLite gap | PERF | qualification | M | G-PERF |
 | 22 | LIN-0006 | [D01](#d01) | Получить тестовый endpoint Kusto | OPS | blocked_external | M | G-OPS |
 
-#### P2: 948 пунктов
+#### P2: 946 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -810,9 +810,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 1016 | LIN-1263 | [D32](#d32) | Измерить compressed cold vectors | PERF | candidate | M | G-PERF |
 | 1017 | LIN-1264 | [D32](#d32) | Измерить compressed block random access | PERF | candidate | M | G-PERF |
 | 1018 | LIN-1281 | [D33](#d33) | Проверить spawn_blocking ownership | CORRECTNESS | qualification | S | G-CORRECT |
-| 1019 | LIN-1282 | [D33](#d33) | Проверить cancellation после queue admission | CORRECTNESS | qualification | S | G-CORRECT |
 | 1020 | LIN-1283 | [D33](#d33) | Проверить cancellation во время scan | CORRECTNESS | qualification | S | G-CORRECT |
-| 1021 | LIN-1284 | [D33](#d33) | Проверить cancellation во время streaming | CORRECTNESS | qualification | S | G-CORRECT |
 | 1022 | LIN-1285 | [D33](#d33) | Ограничить blocking worker concurrency | CORRECTNESS | qualification | M | G-CORRECT |
 | 1023 | LIN-1286 | [D33](#d33) | Ограничить queued query count | CORRECTNESS | qualification | M | G-CORRECT |
 | 1024 | LIN-1287 | [D33](#d33) | Ограничить queued input bytes | CORRECTNESS | qualification | M | G-CORRECT |
