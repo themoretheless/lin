@@ -1151,20 +1151,28 @@ fn cmd_cache(args: &[String], data: Option<PathBuf>) -> ExitCode {
                 }
             }
 
-            // Interactive REPL mode
-            use std::io::{BufRead, Write};
-            println!(
-                "Connected to cacha (Lin Distributed Cache) at {}. Type HELP or QUIT.",
-                client.addr()
-            );
+            // Interactive REPL mode. With commands piped in (stdin not a terminal) the
+            // banner and prompts are left out, so the output is just the replies.
+            use std::io::{BufRead, IsTerminal, Write};
             let stdin = io::stdin();
+            let interactive = stdin.is_terminal();
+            if interactive {
+                println!(
+                    "Connected to cacha (Lin Distributed Cache) at {}. Type HELP or QUIT.",
+                    client.addr()
+                );
+            }
             let mut stdout = io::stdout();
             let mut lines = stdin.lock().lines();
             loop {
-                print!("cacha ({})> ", client.addr());
-                let _ = stdout.flush();
+                if interactive {
+                    print!("cacha ({})> ", client.addr());
+                    let _ = stdout.flush();
+                }
                 let Some(Ok(line)) = lines.next() else {
-                    println!();
+                    if interactive {
+                        println!();
+                    }
                     break;
                 };
                 let trimmed = line.trim();

@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Fixed
+- `lin cache cli` with commands piped in mixed its banner and `cacha (...)>` prompts into the output. The banner and prompts are now shown only when stdin is a terminal.
 - The `lin` binary panicked with `failed printing to stdout: Broken pipe` (exit code 101) when its output went to a pipe that closed early, such as `lin run ... | head`. It now stops quietly on SIGPIPE like other command-line tools.
 - Error messages quoted user input in full: a statement made of a one-megabyte identifier produced a one-megabyte `unknown collection` error. Messages are now cut at 4 KiB on a character boundary, with a note of how many bytes were dropped.
 - `#[derive(LinRow)]` failed with `missing column` for an `Option<T>` field whose value was never set: rows are sparse, so such a field is absent rather than `Null`. An absent field now reads as `None`; required fields still report the missing column.
