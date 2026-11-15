@@ -37,7 +37,7 @@ fn invalid_and_oversized_patterns_are_errors() {
 #[test]
 fn valid_patterns_match_like_the_regex_crate() {
     let (mut db, rows) = seed();
-    for pat in [r"^order-\d+$", r"(a+)+b$", r"(?i)mixed", r"^$", r"line\nbreak", r"."] {
+    for pat in [r"^order-\d+$", r"(a+)+b$", r"(?i)mixed", r"^$", r"line\nbreak", r".", "", "^", "$", r"\b", r"(?m)^break$", r"^break$", r"\bCase\b", r"x*"] {
         let re = regex::Regex::new(pat).unwrap();
         let mut want: Vec<&str> = rows.iter().filter(|(_, s)| re.is_match(s)).map(|(id, _)| id.as_str()).collect();
         want.sort();

@@ -2,7 +2,7 @@
 
 Срез: **2026-11-15**, коммит `58444cf6e` (релиз 0.7.1) плюс незакоммиченное рабочее дерево. Единственный файл с планом в репозитории: в нём только несделанное. Реализованное описано в [CHANGELOG](../CHANGELOG.md), в документах `docs/` по отдельным механизмам и в отчётах `benches/results/`.
 
-Открыто **1546** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
+Открыто **1543** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровывались, поэтому в них есть пропуски: закрытые пункты удалены. Пункты части II со статусами `candidate` и `qualification` по коду поштучно не сверялись: перед взятием пункта сначала проверить, не покрыт ли он уже.
 
@@ -193,7 +193,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 ### Приоритетный список — 1563 пунктов
 
-Количества: P1: 3, P2: 970, P3: 573; статусы: blocked_external: 1, candidate: 934, qualification: 611.
+Количества: P1: 3, P2: 967, P3: 573; статусы: blocked_external: 1, candidate: 934, qualification: 608.
 
 #### P1: 3 пунктов
 
@@ -203,7 +203,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 2 | LIN-0002 | [D01](#d01) | Закрыть durable 1k SQLite gap | PERF | qualification | M | G-PERF |
 | 22 | LIN-0006 | [D01](#d01) | Получить тестовый endpoint Kusto | OPS | blocked_external | M | G-OPS |
 
-#### P2: 970 пунктов
+#### P2: 967 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -779,10 +779,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 951 | LIN-1166 | [D30](#d30) | Проверить GPU UTF-8 equality cases | VERIFY | qualification | S | G-VERIFY |
 | 952 | LIN-1167 | [D30](#d30) | Проверить GPU word boundary cases | VERIFY | qualification | S | G-VERIFY |
 | 953 | LIN-1168 | [D30](#d30) | Проверить GPU lowercase metadata parity | CORRECTNESS | qualification | S | G-CORRECT |
-| 954 | LIN-1169 | [D30](#d30) | Проверить regex empty-match semantics | CORRECTNESS | qualification | S | G-CORRECT |
-| 955 | LIN-1170 | [D30](#d30) | Проверить regex anchor semantics | CORRECTNESS | qualification | S | G-CORRECT |
 | 956 | LIN-1171 | [D30](#d30) | Проверить regex look assertion metadata | CORRECTNESS | qualification | S | G-CORRECT |
-| 957 | LIN-1172 | [D30](#d30) | Проверить regex resource exhaustion | CORRECTNESS | qualification | S | G-CORRECT |
 | 958 | LIN-1173 | [D30](#d30) | Проверить GPU grouped count overflow | CORRECTNESS | qualification | S | G-CORRECT |
 | 959 | LIN-1174 | [D30](#d30) | Проверить binary64 sum carry paths | CORRECTNESS | qualification | S | G-CORRECT |
 | 960 | LIN-1175 | [D30](#d30) | Проверить binary64 NaN canonicalization | CORRECTNESS | qualification | S | G-CORRECT |
