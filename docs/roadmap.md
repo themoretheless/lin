@@ -2,7 +2,7 @@
 
 Срез: **2026-11-15**, коммит `58444cf6e` (релиз 0.7.1) плюс незакоммиченное рабочее дерево. Единственный файл с планом в репозитории: в нём только несделанное. Реализованное описано в [CHANGELOG](../CHANGELOG.md), в документах `docs/` по отдельным механизмам и в отчётах `benches/results/`.
 
-Открыто **1390** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
+Открыто **1387** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровывались, поэтому в них есть пропуски: закрытые пункты удалены. Пункты части II со статусами `candidate` и `qualification` по коду поштучно не сверялись: перед взятием пункта сначала проверить, не покрыт ли он уже.
 
@@ -196,7 +196,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 ### Приоритетный список — 1563 пунктов
 
-Количества: P1: 3, P2: 831, P3: 556; статусы: blocked_external: 1, candidate: 934, qualification: 455.
+Количества: P1: 3, P2: 831, P3: 553; статусы: blocked_external: 1, candidate: 934, qualification: 452.
 
 #### P1: 3 пунктов
 
@@ -1042,7 +1042,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 1399 | LIN-1971 | [D50](#d50) | Описать replication version compatibility | DOC | candidate | S | G-DOC |
 | 1400 | LIN-1972 | [D50](#d50) | Описать downgrade support boundaries | DOC | candidate | S | G-DOC |
 
-#### P3: 556 пунктов
+#### P3: 553 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -1140,9 +1140,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 1506 | LIN-0714 | [D18](#d18) | Добавить batch allocation limits | FEATURE | candidate | M | G-FEATURE |
 | 1507 | LIN-0715 | [D18](#d18) | Добавить column memory diagnostics | FEATURE | candidate | M | G-FEATURE |
 | 1508 | LIN-0716 | [D18](#d18) | Добавить batch consistency inspector | FEATURE | candidate | M | G-FEATURE |
-| 1510 | LIN-0718 | [D18](#d18) | Проверить chunk boundary joins | CORRECTNESS | qualification | S | G-CORRECT |
-| 1511 | LIN-0719 | [D18](#d18) | Проверить chunk boundary sorting | CORRECTNESS | qualification | S | G-CORRECT |
-| 1512 | LIN-0720 | [D18](#d18) | Проверить chunk boundary cursor results | CORRECTNESS | qualification | S | G-CORRECT |
 | 1513 | LIN-0785 | [D20](#d20) | Измерить indirect row-index sorting | PERF | candidate | M | G-PERF |
 | 1514 | LIN-0786 | [D20](#d20) | Измерить inline sort keys | PERF | candidate | M | G-PERF |
 | 1515 | LIN-0787 | [D20](#d20) | Измерить column sort permutation | PERF | candidate | M | G-PERF |
