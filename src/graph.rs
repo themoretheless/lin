@@ -113,6 +113,7 @@ fn short_label(node: &Node) -> String {
         | NodeKind::BatchCAS { .. }
         | NodeKind::Schema { .. }
         | NodeKind::Project { .. }
+        | NodeKind::Without { .. }
         | NodeKind::Rrf { .. }
         | NodeKind::Union
         | NodeKind::Seq

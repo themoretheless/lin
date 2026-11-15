@@ -180,14 +180,26 @@ fn read_seg_cell(
 /// a null, `!=` and `not` of those are true.
 enum SegPred<'s> {
     Const(bool),
-    And(Box<SegPred<'s>>, Box<SegPred<'s>>),
-    Or(Box<SegPred<'s>>, Box<SegPred<'s>>),
+    And(Vec<SegPred<'s>>),
+    Or(Vec<SegPred<'s>>),
     Not(Box<SegPred<'s>>),
     Cmp(&'s columns::MmapFixedCol, crate::ast::CmpOp, columns::FixedRhs),
     DictEq(&'s columns::MmapDictCol, u16),
     DictSet(&'s columns::MmapDictCol, Vec<bool>),
     FixedIsNull(&'s columns::MmapFixedCol),
     DictIsNull(&'s columns::MmapDictCol),
+    TextIsNull(&'s columns::MmapTextCol),
+    TextContains {
+        col: &'s columns::MmapTextCol,
+        needle: &'s str,
+        mask: Option<columns::TgramMask>,
+    },
+    TextHas {
+        col: &'s columns::MmapTextCol,
+        word: &'s str,
+        case_insensitive: bool,
+        mask: Option<columns::TgramMask>,
+    },
     Slow(&'s crate::ast::Pred),
 }
 
@@ -195,8 +207,8 @@ impl SegPred<'_> {
     fn eval(&self, rid: u32, slow: &mut SlowRow<'_>) -> bool {
         match self {
             SegPred::Const(b) => *b,
-            SegPred::And(a, b) => a.eval(rid, slow) && b.eval(rid, slow),
-            SegPred::Or(a, b) => a.eval(rid, slow) || b.eval(rid, slow),
+            SegPred::And(parts) => parts.iter().all(|p| p.eval(rid, slow)),
+            SegPred::Or(parts) => parts.iter().any(|p| p.eval(rid, slow)),
             SegPred::Not(inner) => !inner.eval(rid, slow),
             SegPred::Cmp(fc, op, rhs) => fc.cmp_at(rid, *op, *rhs),
             SegPred::DictEq(dc, code) => dc.code_at(rid) == *code,
@@ -206,6 +218,52 @@ impl SegPred<'_> {
                 .unwrap_or(false),
             SegPred::FixedIsNull(fc) => fc.is_null(rid),
             SegPred::DictIsNull(dc) => dc.code_at(rid) == DICT_NULL_CODE,
+            SegPred::TextIsNull(tc) => tc.get_loc(rid).is_none(),
+            SegPred::TextContains { col, needle, mask } => {
+                let Some((bidx, off, len)) = col.get_loc(rid) else {
+                    return false;
+                };
+                if needle.is_empty() {
+                    return true;
+                }
+                if (len as usize) < needle.len() {
+                    return false;
+                }
+                if let Some(m) = mask
+                    && !col.block_may_match(bidx, m)
+                {
+                    return false;
+                }
+                let Some(bytes) = slow.text_slice(col, bidx, off, len) else {
+                    return false;
+                };
+                memchr::memmem::find(bytes, needle.as_bytes()).is_some()
+            }
+            SegPred::TextHas {
+                col,
+                word,
+                case_insensitive,
+                mask,
+            } => {
+                let Some((bidx, off, len)) = col.get_loc(rid) else {
+                    return false;
+                };
+                if len == 0 || (!*case_insensitive && (len as usize) < word.len()) {
+                    return false;
+                }
+                if let Some(m) = mask
+                    && !col.block_may_match(bidx, m)
+                {
+                    return false;
+                }
+                let Some(bytes) = slow.text_slice(col, bidx, off, len) else {
+                    return false;
+                };
+                let Ok(s) = std::str::from_utf8(bytes) else {
+                    return false;
+                };
+                crate::exec::has_word(s, word, *case_insensitive)
+            }
             SegPred::Slow(p) => slow.eval(p, rid),
         }
     }
@@ -213,9 +271,38 @@ impl SegPred<'_> {
     fn has_slow(&self) -> bool {
         match self {
             SegPred::Slow(_) => true,
-            SegPred::And(a, b) | SegPred::Or(a, b) => a.has_slow() || b.has_slow(),
+            SegPred::And(parts) | SegPred::Or(parts) => parts.iter().any(Self::has_slow),
             SegPred::Not(inner) => inner.has_slow(),
             _ => false,
+        }
+    }
+
+    fn cost(&self) -> u32 {
+        match self {
+            SegPred::Const(_) => 0,
+            SegPred::FixedIsNull(_) | SegPred::DictIsNull(_) | SegPred::TextIsNull(_) => 1,
+            SegPred::Cmp(..) | SegPred::DictEq(..) => 2,
+            SegPred::DictSet(..) => 4,
+            SegPred::TextContains { .. } => 20,
+            SegPred::TextHas {
+                case_insensitive, ..
+            } => {
+                if *case_insensitive {
+                    40
+                } else {
+                    30
+                }
+            }
+            SegPred::Not(inner) => inner.cost(),
+            SegPred::And(parts) => parts
+                .iter()
+                .fold(0u32, |acc, p| acc.saturating_add(p.cost()))
+                .max(1),
+            SegPred::Or(parts) => parts
+                .iter()
+                .fold(0u32, |acc, p| acc.saturating_add(p.cost()))
+                .saturating_add(2),
+            SegPred::Slow(p) => 100u32.saturating_add(crate::exec::pred_leaf_cost(p)),
         }
     }
 }
@@ -230,6 +317,7 @@ struct SlowRow<'a> {
     pos: Vec<(&'a str, usize)>,
     scratch: Row,
     blocks: Vec<Option<(u32, Arc<[u8]>)>>,
+    text_block: Option<(usize, u32, Arc<[u8]>)>,
     loaded: Option<u32>,
     err: Option<Error>,
     now_ms: i64,
@@ -251,10 +339,42 @@ impl<'a> SlowRow<'a> {
             pos,
             scratch,
             blocks,
+            text_block: None,
             loaded: None,
             err: None,
             now_ms,
         }
+    }
+
+    fn text_slice(
+        &mut self,
+        col: &columns::MmapTextCol,
+        bidx: u32,
+        off: u32,
+        len: u32,
+    ) -> Option<&[u8]> {
+        let key = col as *const columns::MmapTextCol as usize;
+        let need_load = match &self.text_block {
+            Some((k, b, _)) => *k != key || *b != bidx,
+            None => true,
+        };
+        if need_load {
+            match col.decode_block(bidx) {
+                Ok(arc) => self.text_block = Some((key, bidx, arc)),
+                Err(e) => {
+                    self.err = Some(e);
+                    return None;
+                }
+            }
+        }
+        let (_, _, ref block) = *self.text_block.as_ref().unwrap();
+        let s = off as usize;
+        let e = s + (len as usize);
+        if e > block.len() {
+            self.err = Some(io_err("corrupt in-block text slice"));
+            return None;
+        }
+        Some(&block[s..e])
     }
 
     fn eval(&mut self, pred: &crate::ast::Pred, rid: u32) -> bool {
@@ -288,37 +408,84 @@ impl<'a> SlowRow<'a> {
     }
 }
 
+fn fold_seg_not<'s>(p: SegPred<'s>) -> SegPred<'s> {
+    match p {
+        SegPred::Const(b) => SegPred::Const(!b),
+        other => SegPred::Not(Box::new(other)),
+    }
+}
+
 /// Compile `pred` against `seg`. Subtrees with a leaf the columnar kernels cannot decide
-/// become [`SegPred::Slow`]; under `and` / `or` the typed side is evaluated first, so the
-/// slow side only runs for rows the typed side leaves undecided.
+/// become [`SegPred::Slow`]; under `and` / `or` terms are flattened and ordered by evaluation
+/// cost so cheap columnar checks run before slow decoded-row or regex checks.
 fn compile_seg_pred<'s>(
     seg: &'s DiskSegment,
     pred: &'s crate::ast::Pred,
     now_ms: i64,
 ) -> SegPred<'s> {
     use crate::ast::Pred;
-    let pair = |a: &'s Pred, b: &'s Pred| {
-        let (l, r) = (
-            compile_seg_pred(seg, a, now_ms),
-            compile_seg_pred(seg, b, now_ms),
-        );
-        // Evaluation has no side effects, so the cheaper typed side may go first.
-        if l.has_slow() && !r.has_slow() {
-            (Box::new(r), Box::new(l))
-        } else {
-            (Box::new(l), Box::new(r))
-        }
-    };
     match pred {
-        Pred::And(a, b) => {
-            let (l, r) = pair(a, b);
-            SegPred::And(l, r)
+        Pred::And(..) => {
+            let mut terms = Vec::new();
+            let mut stack = vec![pred];
+            while let Some(p) = stack.pop() {
+                if let Pred::And(a, b) = p {
+                    stack.push(b);
+                    stack.push(a);
+                } else {
+                    terms.push(p);
+                }
+            }
+            let mut compiled = Vec::with_capacity(terms.len());
+            for t in terms {
+                let c = compile_seg_pred(seg, t, now_ms);
+                match c {
+                    SegPred::Const(false) => return SegPred::Const(false),
+                    SegPred::Const(true) => {}
+                    SegPred::And(inner) => compiled.extend(inner),
+                    other => compiled.push(other),
+                }
+            }
+            if compiled.is_empty() {
+                return SegPred::Const(true);
+            }
+            if compiled.len() == 1 {
+                return compiled.pop().unwrap();
+            }
+            compiled.sort_by_key(SegPred::cost);
+            SegPred::And(compiled)
         }
-        Pred::Or(a, b) => {
-            let (l, r) = pair(a, b);
-            SegPred::Or(l, r)
+        Pred::Or(..) => {
+            let mut terms = Vec::new();
+            let mut stack = vec![pred];
+            while let Some(p) = stack.pop() {
+                if let Pred::Or(a, b) = p {
+                    stack.push(b);
+                    stack.push(a);
+                } else {
+                    terms.push(p);
+                }
+            }
+            let mut compiled = Vec::with_capacity(terms.len());
+            for t in terms {
+                let c = compile_seg_pred(seg, t, now_ms);
+                match c {
+                    SegPred::Const(true) => return SegPred::Const(true),
+                    SegPred::Const(false) => {}
+                    SegPred::Or(inner) => compiled.extend(inner),
+                    other => compiled.push(other),
+                }
+            }
+            if compiled.is_empty() {
+                return SegPred::Const(false);
+            }
+            if compiled.len() == 1 {
+                return compiled.pop().unwrap();
+            }
+            compiled.sort_by_key(SegPred::cost);
+            SegPred::Or(compiled)
         }
-        Pred::Not(inner) => SegPred::Not(Box::new(compile_seg_pred(seg, inner, now_ms))),
+        Pred::Not(inner) => fold_seg_not(compile_seg_pred(seg, inner, now_ms)),
         leaf => compile_seg_leaf(seg, leaf, now_ms).unwrap_or(SegPred::Slow(leaf)),
     }
 }
@@ -331,7 +498,6 @@ fn compile_seg_leaf<'s>(
     now_ms: i64,
 ) -> Option<SegPred<'s>> {
     use crate::ast::{CmpOp, Pred, Value};
-    let negate = |p: SegPred<'s>| SegPred::Not(Box::new(p));
     Some(match pred {
         Pred::Cmp { field, op, value } => match seg.col(field.leaf()?) {
             // Every value is null here: only `!=` holds.
@@ -340,21 +506,19 @@ fn compile_seg_leaf<'s>(
                 let rhs = fc.fixed_rhs(&crate::exec::value_cell(value, now_ms))?;
                 match op {
                     // `cmp_at` is false on null, but `null != x` is true.
-                    CmpOp::Ne => negate(SegPred::Cmp(fc, CmpOp::Eq, rhs)),
+                    CmpOp::Ne => fold_seg_not(SegPred::Cmp(fc, CmpOp::Eq, rhs)),
                     _ => SegPred::Cmp(fc, *op, rhs),
                 }
             }
             Some(MmapCol::Dict(dc)) => {
-                let Value::String(want) = value else {
-                    return None;
-                };
+                let want = pred_text_lit(value)?;
                 let eq = match dc.find_code(want) {
                     Some(code) => SegPred::DictEq(dc, code),
                     None => SegPred::Const(false),
                 };
                 match op {
                     CmpOp::Eq => eq,
-                    CmpOp::Ne => negate(eq),
+                    CmpOp::Ne => fold_seg_not(eq),
                     _ => return None,
                 }
             }
@@ -371,7 +535,12 @@ fn compile_seg_leaf<'s>(
             match seg.col(field.leaf()?) {
                 None => SegPred::Const(false),
                 Some(MmapCol::Dict(dc)) => {
-                    SegPred::DictSet(dc, TextSet::AnyOf(texts).allowed_codes(dc))
+                    let allowed = TextSet::AnyOf(texts).allowed_codes(dc);
+                    if allowed.iter().any(|&a| a) {
+                        SegPred::DictSet(dc, allowed)
+                    } else {
+                        SegPred::Const(false)
+                    }
                 }
                 Some(_) => return None,
             }
@@ -379,7 +548,47 @@ fn compile_seg_leaf<'s>(
         Pred::Contains { field, needle } => match seg.col(field.leaf()?) {
             None => SegPred::Const(false),
             Some(MmapCol::Dict(dc)) => {
-                SegPred::DictSet(dc, TextSet::Contains(needle.as_str()).allowed_codes(dc))
+                let allowed = TextSet::Contains(needle.as_str()).allowed_codes(dc);
+                if allowed.iter().any(|&a| a) {
+                    SegPred::DictSet(dc, allowed)
+                } else {
+                    SegPred::Const(false)
+                }
+            }
+            Some(MmapCol::Text(tc)) => SegPred::TextContains {
+                col: tc,
+                needle: needle.as_str(),
+                mask: columns::query_tgram_mask_bytes(needle.as_bytes()),
+            },
+            Some(_) => return None,
+        },
+        Pred::Has { field, needle, ci } => match seg.col(field.leaf()?) {
+            None => SegPred::Const(false),
+            Some(MmapCol::Dict(dc)) => {
+                let allowed: Vec<bool> = dc
+                    .strings
+                    .iter()
+                    .map(|s| crate::exec::has_word(s.as_ref(), needle, *ci))
+                    .collect();
+                if allowed.iter().any(|&a| a) {
+                    SegPred::DictSet(dc, allowed)
+                } else {
+                    SegPred::Const(false)
+                }
+            }
+            Some(MmapCol::Text(tc)) => {
+                if needle.is_empty()
+                    || (!*ci && needle.chars().any(|c| !(c.is_alphanumeric() || c == '_')))
+                {
+                    SegPred::Const(false)
+                } else {
+                    SegPred::TextHas {
+                        col: tc,
+                        word: needle.as_str(),
+                        case_insensitive: *ci,
+                        mask: columns::query_tgram_mask(needle.as_str(), *ci),
+                    }
+                }
             }
             Some(_) => return None,
         },
@@ -388,9 +597,10 @@ fn compile_seg_leaf<'s>(
                 None => SegPred::Const(true),
                 Some(MmapCol::Fixed(fc)) => SegPred::FixedIsNull(fc),
                 Some(MmapCol::Dict(dc)) => SegPred::DictIsNull(dc),
+                Some(MmapCol::Text(tc)) => SegPred::TextIsNull(tc),
                 Some(_) => return None,
             };
-            if *negated { negate(is_null) } else { is_null }
+            if *negated { fold_seg_not(is_null) } else { is_null }
         }
         _ => return None,
     })
@@ -499,18 +709,40 @@ pub(crate) struct DiskScanPos {
     done: bool,
 }
 
+fn cmp_dict_str(s: &str, op: crate::ast::CmpOp, rhs: &str) -> bool {
+    use crate::ast::CmpOp;
+    match op {
+        CmpOp::Eq => s == rhs,
+        CmpOp::Ne => s != rhs,
+        CmpOp::Lt => s < rhs,
+        CmpOp::Le => s <= rhs,
+        CmpOp::Gt => s > rhs,
+        CmpOp::Ge => s >= rhs,
+    }
+}
+
+fn pred_text_lit(v: &crate::ast::Value) -> Option<&str> {
+    match v {
+        crate::ast::Value::String(s) => Some(s.as_ref()),
+        crate::ast::Value::Name(s) => Some(s.as_str()),
+        _ => None,
+    }
+}
+
 /// Zone-map pruning plan of a predicate for one segment: which blocks provably hold no
 /// matching row. Each node answers two questions about a block from min/max and the null
 /// count alone: `none` (no row matches) and `all` (every row matches). `and` has no match
 /// when either side has none, `or` only when both have none, and `not` swaps the two
-/// answers, so ranges prune under any nesting of `and` / `or` / `not`, and `!=` prunes a
-/// block whose every value equals the literal. Anything min/max cannot decide answers
-/// "unknown" to both.
+/// answers, so ranges and dictionary predicates prune under any nesting of `and` / `or` / `not`.
 enum ZonePrune<'s> {
     Never,
+    Const(bool),
     Term(&'s columns::MmapFixedCol, crate::ast::CmpOp, Cell),
     /// `is null` on a fixed-width column (`is not null` is `Not` of it).
     IsNull(&'s columns::MmapFixedCol),
+    DictEq(&'s columns::MmapDictCol, u16),
+    DictSet(&'s columns::MmapDictCol, Vec<bool>),
+    DictIsNull(&'s columns::MmapDictCol),
     And(Vec<ZonePrune<'s>>),
     Or(Vec<ZonePrune<'s>>),
     Not(Box<ZonePrune<'s>>),
@@ -519,48 +751,154 @@ enum ZonePrune<'s> {
 impl<'s> ZonePrune<'s> {
     fn compile(seg: &'s DiskSegment, pred: &crate::ast::Pred, now_ms: i64) -> Self {
         let tree = Self::build(seg, pred, now_ms);
-        // A tree with no decidable leaf can never skip: drop it so the scan does not
-        // walk it for every block.
-        if tree.has_term() { tree } else { ZonePrune::Never }
+        // A tree with no decidable leaf (or trivially `Const(true)`) can never skip: drop it.
+        if tree.has_term() && !matches!(tree, ZonePrune::Const(true)) {
+            tree
+        } else {
+            ZonePrune::Never
+        }
     }
 
     fn build(seg: &'s DiskSegment, pred: &crate::ast::Pred, now_ms: i64) -> Self {
-        use crate::ast::Pred;
+        use crate::ast::{CmpOp, Pred};
         match pred {
             Pred::And(a, b) => {
                 let mut parts = Vec::new();
                 for side in [a, b] {
                     match Self::build(seg, side, now_ms) {
+                        ZonePrune::Const(false) => return ZonePrune::Const(false),
+                        ZonePrune::Const(true) => {}
                         ZonePrune::And(inner) => parts.extend(inner),
                         other => parts.push(other),
                     }
                 }
-                ZonePrune::And(parts)
+                if parts.is_empty() {
+                    ZonePrune::Const(true)
+                } else if parts.len() == 1 {
+                    parts.pop().unwrap()
+                } else {
+                    ZonePrune::And(parts)
+                }
             }
             Pred::Or(a, b) => {
                 let mut parts = Vec::new();
                 for side in [a, b] {
                     match Self::build(seg, side, now_ms) {
+                        ZonePrune::Const(true) => return ZonePrune::Const(true),
+                        ZonePrune::Const(false) => {}
                         ZonePrune::Or(inner) => parts.extend(inner),
                         other => parts.push(other),
                     }
                 }
-                ZonePrune::Or(parts)
+                if parts.is_empty() {
+                    ZonePrune::Const(false)
+                } else if parts.len() == 1 {
+                    parts.pop().unwrap()
+                } else {
+                    ZonePrune::Or(parts)
+                }
             }
-            Pred::Not(inner) => ZonePrune::Not(Box::new(Self::build(seg, inner, now_ms))),
+            Pred::Not(inner) => match Self::build(seg, inner, now_ms) {
+                ZonePrune::Const(b) => ZonePrune::Const(!b),
+                other => ZonePrune::Not(Box::new(other)),
+            },
             Pred::IsNull { field, negated } => {
-                match field.leaf().and_then(|name| seg.fixed_col(name)) {
-                    Some(fc) if *negated => ZonePrune::Not(Box::new(ZonePrune::IsNull(fc))),
-                    Some(fc) => ZonePrune::IsNull(fc),
-                    None => ZonePrune::Never,
+                let Some(name) = field.leaf() else {
+                    return ZonePrune::Never;
+                };
+                if let Some(fc) = seg.fixed_col(name) {
+                    if *negated {
+                        ZonePrune::Not(Box::new(ZonePrune::IsNull(fc)))
+                    } else {
+                        ZonePrune::IsNull(fc)
+                    }
+                } else if let Some(dc) = seg.dict_col(name) {
+                    if *negated {
+                        ZonePrune::Not(Box::new(ZonePrune::DictIsNull(dc)))
+                    } else {
+                        ZonePrune::DictIsNull(dc)
+                    }
+                } else {
+                    ZonePrune::Never
                 }
             }
             Pred::Cmp { field, op, value } => {
-                match field.leaf().and_then(|name| seg.fixed_col(name)) {
-                    Some(fc) => {
-                        ZonePrune::Term(fc, *op, crate::exec::value_cell(value, now_ms))
-                    }
-                    None => ZonePrune::Never,
+                let Some(name) = field.leaf() else {
+                    return ZonePrune::Never;
+                };
+                if let Some(fc) = seg.fixed_col(name) {
+                    return ZonePrune::Term(fc, *op, crate::exec::value_cell(value, now_ms));
+                }
+                if let Some(dc) = seg.dict_col(name)
+                    && let Some(rhs) = pred_text_lit(value)
+                {
+                    return match op {
+                        CmpOp::Eq => match dc.find_code(rhs) {
+                            Some(code) => ZonePrune::DictEq(dc, code),
+                            None => ZonePrune::Const(false),
+                        },
+                        CmpOp::Ne => match dc.find_code(rhs) {
+                            Some(code) => ZonePrune::Not(Box::new(ZonePrune::DictEq(dc, code))),
+                            None => ZonePrune::Const(true),
+                        },
+                        _ => {
+                            let allowed: Vec<bool> = dc
+                                .strings
+                                .iter()
+                                .map(|s| cmp_dict_str(s.as_ref(), *op, rhs))
+                                .collect();
+                            if allowed.iter().any(|&a| a) {
+                                ZonePrune::DictSet(dc, allowed)
+                            } else {
+                                ZonePrune::Const(false)
+                            }
+                        }
+                    };
+                }
+                ZonePrune::Never
+            }
+            Pred::In { field, values } => {
+                let Some(name) = field.leaf() else {
+                    return ZonePrune::Never;
+                };
+                let Some(dc) = seg.dict_col(name) else {
+                    return ZonePrune::Never;
+                };
+                let Some(texts) = values.iter().map(pred_text_lit).collect::<Option<Vec<&str>>>()
+                else {
+                    return ZonePrune::Never;
+                };
+                let allowed = TextSet::AnyOf(texts).allowed_codes(dc);
+                if allowed.iter().any(|&a| a) {
+                    ZonePrune::DictSet(dc, allowed)
+                } else {
+                    ZonePrune::Const(false)
+                }
+            }
+            Pred::Contains { field, needle } => {
+                let Some(dc) = field.leaf().and_then(|n| seg.dict_col(n)) else {
+                    return ZonePrune::Never;
+                };
+                let allowed = TextSet::Contains(needle.as_str()).allowed_codes(dc);
+                if allowed.iter().any(|&a| a) {
+                    ZonePrune::DictSet(dc, allowed)
+                } else {
+                    ZonePrune::Const(false)
+                }
+            }
+            Pred::Has { field, needle, ci } => {
+                let Some(dc) = field.leaf().and_then(|n| seg.dict_col(n)) else {
+                    return ZonePrune::Never;
+                };
+                let allowed: Vec<bool> = dc
+                    .strings
+                    .iter()
+                    .map(|s| crate::exec::has_word(s.as_ref(), needle, *ci))
+                    .collect();
+                if allowed.iter().any(|&a| a) {
+                    ZonePrune::DictSet(dc, allowed)
+                } else {
+                    ZonePrune::Const(false)
                 }
             }
             _ => ZonePrune::Never,
@@ -570,7 +908,12 @@ impl<'s> ZonePrune<'s> {
     fn has_term(&self) -> bool {
         match self {
             ZonePrune::Never => false,
-            ZonePrune::Term(..) | ZonePrune::IsNull(_) => true,
+            ZonePrune::Const(_)
+            | ZonePrune::Term(..)
+            | ZonePrune::IsNull(_)
+            | ZonePrune::DictEq(..)
+            | ZonePrune::DictSet(..)
+            | ZonePrune::DictIsNull(_) => true,
             ZonePrune::And(parts) | ZonePrune::Or(parts) => parts.iter().any(Self::has_term),
             ZonePrune::Not(inner) => inner.has_term(),
         }
@@ -580,8 +923,12 @@ impl<'s> ZonePrune<'s> {
     fn skips(&self, bi: usize) -> bool {
         match self {
             ZonePrune::Never => false,
+            ZonePrune::Const(b) => !*b,
             ZonePrune::Term(fc, op, rhs) => fc.zone_block_relation(bi, *op, rhs).0,
             ZonePrune::IsNull(fc) => fc.zone_block_null_relation(bi).0,
+            ZonePrune::DictEq(dc, code) => dc.block_eq(bi, *code).0,
+            ZonePrune::DictSet(dc, allowed) => dc.block_in_set(bi, allowed).0,
+            ZonePrune::DictIsNull(dc) => dc.block_is_null(bi).0,
             ZonePrune::And(parts) => parts.iter().any(|p| p.skips(bi)),
             ZonePrune::Or(parts) => parts.iter().all(|p| p.skips(bi)),
             ZonePrune::Not(inner) => inner.all(bi),
@@ -592,8 +939,12 @@ impl<'s> ZonePrune<'s> {
     fn all(&self, bi: usize) -> bool {
         match self {
             ZonePrune::Never => false,
+            ZonePrune::Const(b) => *b,
             ZonePrune::Term(fc, op, rhs) => fc.zone_block_relation(bi, *op, rhs).1,
             ZonePrune::IsNull(fc) => fc.zone_block_null_relation(bi).1,
+            ZonePrune::DictEq(dc, code) => dc.block_eq(bi, *code).1,
+            ZonePrune::DictSet(dc, allowed) => dc.block_in_set(bi, allowed).1,
+            ZonePrune::DictIsNull(dc) => dc.block_is_null(bi).1,
             ZonePrune::And(parts) => parts.iter().all(|p| p.all(bi)),
             ZonePrune::Or(parts) => parts.iter().any(|p| p.all(bi)),
             ZonePrune::Not(inner) => inner.skips(bi),
@@ -1615,8 +1966,18 @@ impl DiskEngine {
     }
 
     /// Incremental checkpoint: flushes ONLY dirty MemTable rows into new immutable mmap segments
-    /// and persists updated tombstones + manifest, then truncates WAL to 0 bytes.
+    /// and persists updated tombstones + manifest, then truncates WAL to 0 bytes, drops any
+    /// 100%-dead segments in `O(1)`, and merges small delta segments when safe.
     pub fn checkpoint(&mut self) -> Result<(), Error> {
+        self.checkpoint_flush_only()?;
+        if self.active_savepoint.is_none() {
+            let _ = self.drop_fully_dead_segments(None);
+            let _ = self.maybe_merge_small_delta_segments();
+        }
+        Ok(())
+    }
+
+    fn checkpoint_flush_only(&mut self) -> Result<(), Error> {
         if self.read_only {
             return Ok(());
         }
@@ -1671,10 +2032,85 @@ impl DiskEngine {
             }
         }
         self.wal_bytes = 0;
-        if self.active_savepoint.is_none() {
-            let _ = self.maybe_merge_small_delta_segments();
-        }
         Ok(())
+    }
+
+    /// Reclaim segments whose every row is tombstoned (`O(1)` extent drop without rewriting
+    /// live segments). Skipped while a transaction savepoint is active so rollback stays valid.
+    fn drop_fully_dead_segments(
+        &mut self,
+        only_table: Option<&str>,
+    ) -> Result<CompactionReport, Error> {
+        if self.read_only || self.active_savepoint.is_some() {
+            return Ok(CompactionReport::default());
+        }
+        let table_names: Vec<String> = match only_table {
+            Some(t) => vec![t.to_string()],
+            None => self.segments.keys().cloned().collect(),
+        };
+        let mut dead_ids: Vec<u64> = Vec::new();
+        let mut dropped_arcs: Vec<Arc<DiskSegment>> = Vec::new();
+        let mut dead_rows_reclaimed = 0usize;
+        let mut tables_compacted = 0usize;
+
+        for tname in table_names {
+            let Some(segs) = self.segments.get(&tname) else {
+                continue;
+            };
+            let any_dead = segs
+                .iter()
+                .any(|s| self.tombstones.dead_count(s.meta.seg_id) >= s.meta.row_count);
+            if !any_dead {
+                continue;
+            }
+            tables_compacted += 1;
+            let mut kept = Vec::with_capacity(segs.len());
+            for seg in segs.iter() {
+                let sid = seg.meta.seg_id;
+                let dc = self.tombstones.dead_count(sid);
+                if dc >= seg.meta.row_count {
+                    dead_ids.push(sid);
+                    dead_rows_reclaimed += dc as usize;
+                    dropped_arcs.push(Arc::clone(seg));
+                } else {
+                    kept.push(Arc::clone(seg));
+                }
+            }
+            if kept.is_empty() {
+                self.segments.remove(&tname);
+            } else {
+                self.segments.insert(tname, kept);
+            }
+        }
+
+        if dead_ids.is_empty() {
+            return Ok(CompactionReport::default());
+        }
+
+        let dead_set: FxHashSet<u64> = dead_ids.iter().copied().collect();
+        self.manifest
+            .segments
+            .retain(|m| !dead_set.contains(&m.seg_id));
+        for &sid in &dead_ids {
+            self.tombstones.words_by_seg.remove(&sid);
+            self.tombstones.dead_counts.remove(&sid);
+        }
+        self.manifest.generation += 1;
+        self.hot_cache.clear_all();
+        self.save_tombstones_and_manifest()?;
+
+        drop(dropped_arcs);
+        for &sid in &dead_ids {
+            let seg_dir = self.dir.join(SEGMENTS_DIR).join(format!("seg_{sid:08}"));
+            let _ = fs::remove_dir_all(&seg_dir);
+        }
+
+        Ok(CompactionReport {
+            tables_compacted,
+            old_segments_removed: dead_ids.len(),
+            new_segments_written: 0,
+            dead_rows_reclaimed,
+        })
     }
 
     fn maybe_merge_small_delta_segments(&mut self) -> Result<CompactionReport, Error> {
@@ -1828,16 +2264,17 @@ impl DiskEngine {
                 "cannot compact DiskEngine while a transaction savepoint is active",
             ));
         }
-        self.checkpoint()?;
+        self.checkpoint_flush_only()?;
+        let dropped = self.drop_fully_dead_segments(Some(table))?;
 
         let Some(segs) = self.segments.get(table) else {
-            return Ok(CompactionReport::default());
+            return Ok(dropped);
         };
         if segs.is_empty() {
-            return Ok(CompactionReport::default());
+            return Ok(dropped);
         }
         let Some(schema) = self.manifest.tables.get(table).cloned() else {
-            return Ok(CompactionReport::default());
+            return Ok(dropped);
         };
 
         let mut total_rows = 0usize;
@@ -1903,7 +2340,7 @@ impl DiskEngine {
         };
 
         if !should_compact && !always {
-            return Ok(CompactionReport::default());
+            return Ok(dropped);
         }
 
         const TARGET_SEG_ROWS: usize = 65_536;
@@ -1992,14 +2429,14 @@ impl DiskEngine {
 
         Ok(CompactionReport {
             tables_compacted: 1,
-            old_segments_removed: old_seg_ids.len(),
+            old_segments_removed: old_seg_ids.len() + dropped.old_segments_removed,
             new_segments_written: new_count,
-            dead_rows_reclaimed: dead_rows,
+            dead_rows_reclaimed: dead_rows + dropped.dead_rows_reclaimed,
         })
     }
 
     pub fn compact_all(&mut self, force: bool) -> Result<CompactionReport, Error> {
-        self.checkpoint()?;
+        self.checkpoint_flush_only()?;
         let tables: Vec<String> = self.manifest.tables.keys().cloned().collect();
         let mut agg = CompactionReport::default();
         for t in tables {
@@ -3582,6 +4019,41 @@ impl DiskEngine {
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn table_columns_excluding(&self, table: &str, excluded: &[&str]) -> Vec<String> {
+        let mut seen: FxHashSet<String> = FxHashSet::default();
+        if let Some(tmeta) = self.manifest.tables.get(table) {
+            for col in &tmeta.columns {
+                if !excluded.contains(&col.name.as_str()) {
+                    seen.insert(col.name.clone());
+                }
+            }
+        }
+        if let Some(segs) = self.segments.get(table) {
+            for seg in segs {
+                for (name, _) in &seg.cols {
+                    if !excluded.contains(&name.as_str()) {
+                        seen.insert(name.clone());
+                    }
+                }
+            }
+        }
+        if let Some(mt) = self.memtables.get(table) {
+            for &idx in mt.by_id.values() {
+                if mt.dead_mem.contains(&idx) {
+                    continue;
+                }
+                for (name, _) in &mt.rows[idx] {
+                    if !excluded.contains(&name.as_str()) {
+                        seen.insert(name.clone());
+                    }
+                }
+            }
+        }
+        let mut out: Vec<String> = seen.into_iter().collect();
+        out.sort_unstable();
+        out
     }
 
     // ========================================================================

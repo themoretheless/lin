@@ -1,6 +1,8 @@
+use std::borrow::Cow;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use memchr::memmem::Finder;
@@ -40,6 +42,10 @@ pub(crate) struct MmapTextCol {
     row_count: u32,
     block_count: u32,
     cache_shards: [Mutex<Vec<Option<BlockCacheSlot>>>; BLOCK_CACHE_SHARDS],
+    /// Optional per-Zstd-block 4096-bit trigram Bloom filters (`col_<name>.tgram`).
+    tgram: Option<Box<[TgramBlock]>>,
+    /// Number of cache-miss block decodes performed on this column instance.
+    decoded_blocks: AtomicU64,
 }
 
 impl MmapTextCol {
@@ -99,6 +105,10 @@ impl MmapTextCol {
             Mutex::new(slots)
         });
 
+        let tgram = std::fs::read(dir.join(format!("col_{col_name}.tgram")))
+            .ok()
+            .and_then(|bytes| decode_tgram(&bytes, block_count));
+
         Ok(Self {
             row_loc,
             block_offsets,
@@ -106,6 +116,8 @@ impl MmapTextCol {
             row_count,
             block_count,
             cache_shards,
+            tgram,
+            decoded_blocks: AtomicU64::new(0),
         })
     }
 
@@ -187,6 +199,7 @@ impl MmapTextCol {
                 ));
             }
         };
+        self.decoded_blocks.fetch_add(1, Ordering::Relaxed);
         let arc: Arc<[u8]> = Arc::from(raw);
         if let Ok(mut guard) = self.cache_shards[shard_idx].lock() {
             guard[slot_idx] = Some(BlockCacheSlot {
@@ -195,6 +208,28 @@ impl MmapTextCol {
             });
         }
         Ok(arc)
+    }
+
+    #[inline]
+    pub(crate) fn block_may_match(&self, block_idx: u32, mask: &TgramMask) -> bool {
+        let Some(ref tgram) = self.tgram else {
+            return true;
+        };
+        let Some(blk) = tgram.get(block_idx as usize) else {
+            return true;
+        };
+        for &(wi, req) in &mask.probes {
+            if (blk[wi as usize] & req) != req {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[allow(dead_code)]
+    #[inline]
+    pub(crate) fn decoded_block_count(&self) -> u64 {
+        self.decoded_blocks.load(Ordering::Relaxed)
     }
 
     pub(super) fn get_cell(&self, row_id: u32) -> Result<Cell, Error> {
@@ -271,6 +306,7 @@ impl MmapTextCol {
             return Ok(count);
         }
 
+        let mask = query_tgram_mask_bytes(needle);
         let finder = Finder::new(needle);
         let row_count = self.row_count as usize;
         let loc = &self.row_loc[..];
@@ -291,6 +327,21 @@ impl MmapTextCol {
         }
 
         for bidx in 0..self.block_count {
+            if let Some(ref m) = mask
+                && !self.block_may_match(bidx, m)
+            {
+                while rid < row_count {
+                    let Some((rb, _, _, flags)) = read_loc(loc, rid) else {
+                        break;
+                    };
+                    if flags != 0 || rb <= bidx {
+                        rid += 1;
+                    } else {
+                        break;
+                    }
+                }
+                continue;
+            }
             while rid < row_count {
                 let Some((rb, _, _, flags)) = read_loc(loc, rid) else {
                     break;
@@ -385,6 +436,7 @@ pub(crate) struct MmapDictCol {
     cells: Vec<Cell>,
     ordinals: Mmap,
     row_count: u32,
+    zone_map: OnceLock<DictZoneMap>,
 }
 
 impl MmapDictCol {
@@ -432,6 +484,7 @@ impl MmapDictCol {
             cells,
             ordinals,
             row_count,
+            zone_map: OnceLock::new(),
         })
     }
 
@@ -535,6 +588,281 @@ impl MmapDictCol {
         }
         count
     }
+
+    #[inline]
+    fn zone_map(&self) -> &DictZoneMap {
+        self.zone_map
+            .get_or_init(|| DictZoneMap::build(self))
+    }
+
+    /// `(skips, all)`: for `col == strings[code]` within `ZONE_BLOCK_ROWS` block `bi`.
+    pub(crate) fn block_eq(&self, bi: usize, code: u16) -> (bool, bool) {
+        let zm = self.zone_map();
+        if bi >= zm.nblocks {
+            return (false, false);
+        }
+        let ci = code as usize;
+        let present = ci < self.strings.len() && zm.has_code(bi, ci);
+        let skips = !present;
+        let all = !zm.has_null[bi] && zm.single_code[bi] == Some(code);
+        (skips, all)
+    }
+
+    /// `(skips, all)`: for `col in allowed` within `ZONE_BLOCK_ROWS` block `bi`.
+    /// Null values are never allowed here (`allowed` indexes non-null dictionary codes only).
+    pub(crate) fn block_in_set(&self, bi: usize, allowed: &[bool]) -> (bool, bool) {
+        let zm = self.zone_map();
+        if bi >= zm.nblocks {
+            return (false, false);
+        }
+        if !zm.has_non_null[bi] {
+            return (true, false);
+        }
+        let mut any_match = false;
+        let mut any_disallowed = false;
+        for (wi, &word) in zm.block_words(bi).iter().enumerate() {
+            let mut w = word;
+            while w != 0 {
+                let bit = w.trailing_zeros() as usize;
+                let code = (wi << 6) | bit;
+                if allowed.get(code).copied().unwrap_or(false) {
+                    any_match = true;
+                } else {
+                    any_disallowed = true;
+                }
+                w &= w - 1;
+            }
+        }
+        let skips = !any_match;
+        let all = !zm.has_null[bi] && zm.has_non_null[bi] && !any_disallowed;
+        (skips, all)
+    }
+
+    /// `(skips, all)`: for `col is null` within `ZONE_BLOCK_ROWS` block `bi`.
+    pub(crate) fn block_is_null(&self, bi: usize) -> (bool, bool) {
+        let zm = self.zone_map();
+        if bi >= zm.nblocks {
+            return (false, false);
+        }
+        let skips = !zm.has_null[bi];
+        let all = zm.has_null[bi] && !zm.has_non_null[bi];
+        (skips, all)
+    }
+}
+
+struct DictZoneMap {
+    nblocks: usize,
+    words_per_block: usize,
+    has_null: Vec<bool>,
+    has_non_null: Vec<bool>,
+    single_code: Vec<Option<u16>>,
+    bits: Vec<u64>,
+}
+
+impl DictZoneMap {
+    fn build(dc: &MmapDictCol) -> Self {
+        let n = dc.row_count as usize;
+        let nblocks = n.div_ceil(ZONE_BLOCK_ROWS);
+        let words_per_block = dc.strings.len().div_ceil(64).max(1);
+        let mut has_null = Vec::with_capacity(nblocks);
+        let mut has_non_null = Vec::with_capacity(nblocks);
+        let mut single_code = Vec::with_capacity(nblocks);
+        let mut bits = vec![0u64; nblocks.saturating_mul(words_per_block)];
+
+        for (bi, start) in (0..n).step_by(ZONE_BLOCK_ROWS).enumerate() {
+            let end = (start + ZONE_BLOCK_ROWS).min(n);
+            let mut blk_null = false;
+            let mut blk_non_null = false;
+            let mut first_code: Option<u16> = None;
+            let mut mixed = false;
+            let blk_slice = &mut bits[bi * words_per_block..(bi + 1) * words_per_block];
+            for rid in start..end {
+                let c = dc.code_at(rid as u32);
+                if c == DICT_NULL_CODE {
+                    blk_null = true;
+                    continue;
+                }
+                blk_non_null = true;
+                match first_code {
+                    None => first_code = Some(c),
+                    Some(prev) if prev != c => mixed = true,
+                    _ => {}
+                }
+                let ci = c as usize;
+                let w = ci >> 6;
+                if w < blk_slice.len() {
+                    blk_slice[w] |= 1u64 << (ci & 63);
+                }
+            }
+            has_null.push(blk_null);
+            has_non_null.push(blk_non_null);
+            single_code.push(if blk_non_null && !mixed { first_code } else { None });
+        }
+
+        Self {
+            nblocks,
+            words_per_block,
+            has_null,
+            has_non_null,
+            single_code,
+            bits,
+        }
+    }
+
+    #[inline]
+    fn block_words(&self, bi: usize) -> &[u64] {
+        let off = bi * self.words_per_block;
+        &self.bits[off..off + self.words_per_block]
+    }
+
+    #[inline]
+    fn has_code(&self, bi: usize, code: usize) -> bool {
+        let w = code >> 6;
+        w < self.words_per_block && (self.block_words(bi)[w] & (1u64 << (code & 63))) != 0
+    }
+}
+
+pub(crate) const TGRAM_WORDS: usize = 64; // 4096 bits (512 bytes) per 32 KiB text block
+pub(crate) type TgramBlock = [u64; TGRAM_WORDS];
+
+/// Sparse probe mask compiled once per query literal for a 4096-bit block trigram Bloom filter.
+#[derive(Clone)]
+pub(crate) struct TgramMask {
+    probes: Vec<(u8, u64)>,
+}
+
+const TGRAM_MAGIC: &[u8; 4] = b"LTG1";
+const TGRAM_VERSION: u32 = 2;
+const TGRAM_HEADER: usize = 16;
+
+#[inline]
+fn add_tgram_bits(bits: &mut TgramBlock, tri: [u8; 3]) {
+    let k = u32::from(tri[0]) | (u32::from(tri[1]) << 8) | (u32::from(tri[2]) << 16);
+    let mut h = u64::from(k)
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .rotate_left(17)
+        .wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    h ^= h >> 31;
+    let b1 = (h & 4095) as usize;
+    let b2 = ((h >> 12) & 4095) as usize;
+    let b3 = ((h >> 24) & 4095) as usize;
+    bits[b1 >> 6] |= 1u64 << (b1 & 63);
+    bits[b2 >> 6] |= 1u64 << (b2 & 63);
+    bits[b3 >> 6] |= 1u64 << (b3 & 63);
+}
+
+#[inline]
+fn add_bytes_trigrams(bits: &mut TgramBlock, bytes: &[u8]) {
+    for w in bytes.windows(3) {
+        add_tgram_bits(
+            bits,
+            [
+                w[0].to_ascii_lowercase(),
+                w[1].to_ascii_lowercase(),
+                w[2].to_ascii_lowercase(),
+            ],
+        );
+    }
+}
+
+/// Add ASCII-lowercased byte trigrams of `s` (plus char-by-char Unicode-lowercased trigrams
+/// when non-ASCII, matching `exec::eval::has_word`) to a 4096-bit block Bloom filter.
+pub(super) fn add_str_trigrams(bits: &mut TgramBlock, s: &str) {
+    add_bytes_trigrams(bits, s.as_bytes());
+    if !s.is_ascii() {
+        let mut low = String::with_capacity(s.len());
+        for ch in s.chars() {
+            for lc in ch.to_lowercase() {
+                low.push(lc);
+            }
+        }
+        add_bytes_trigrams(bits, low.as_bytes());
+    }
+}
+
+#[inline]
+pub(crate) fn query_tgram_mask_bytes(needle: &[u8]) -> Option<TgramMask> {
+    if needle.len() < 3 {
+        return None;
+    }
+    let mut words: TgramBlock = [0u64; TGRAM_WORDS];
+    add_bytes_trigrams(&mut words, needle);
+    let probes: Vec<(u8, u64)> = words
+        .iter()
+        .enumerate()
+        .filter(|&(_, &w)| w != 0)
+        .map(|(i, &w)| (i as u8, w))
+        .collect();
+    if probes.is_empty() {
+        None
+    } else {
+        Some(TgramMask { probes })
+    }
+}
+
+pub(crate) fn query_tgram_mask(needle: &str, lower_unicode: bool) -> Option<TgramMask> {
+    let cow: Cow<'_, str> = if lower_unicode && !needle.is_ascii() {
+        let mut low = String::with_capacity(needle.len());
+        for ch in needle.chars() {
+            for lc in ch.to_lowercase() {
+                low.push(lc);
+            }
+        }
+        Cow::Owned(low)
+    } else {
+        Cow::Borrowed(needle)
+    };
+    query_tgram_mask_bytes(cow.as_bytes())
+}
+
+pub(super) fn encode_tgram(blocks: &[TgramBlock]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(blocks.len().saturating_mul(TGRAM_WORDS * 8));
+    for blk in blocks {
+        for &w in blk {
+            body.extend_from_slice(&w.to_le_bytes());
+        }
+    }
+    let mut crc = crate::crc::Hasher::new();
+    crc.update(&body);
+    let mut out = Vec::with_capacity(TGRAM_HEADER + body.len());
+    out.extend_from_slice(TGRAM_MAGIC);
+    out.extend_from_slice(&TGRAM_VERSION.to_le_bytes());
+    out.extend_from_slice(&(blocks.len() as u32).to_le_bytes());
+    out.extend_from_slice(&crc.finalize().to_le_bytes());
+    out.extend_from_slice(&body);
+    out
+}
+
+fn decode_tgram(bytes: &[u8], expected_blocks: u32) -> Option<Box<[TgramBlock]>> {
+    let u32_at = |off: usize| -> Option<u32> {
+        Some(u32::from_le_bytes(bytes.get(off..off + 4)?.try_into().ok()?))
+    };
+    if bytes.get(0..4)? != TGRAM_MAGIC {
+        return None;
+    }
+    if u32_at(4)? != TGRAM_VERSION || u32_at(8)? != expected_blocks {
+        return None;
+    }
+    let body = bytes.get(TGRAM_HEADER..)?;
+    let n = expected_blocks as usize;
+    let blk_bytes = TGRAM_WORDS * 8;
+    if body.len() != n.saturating_mul(blk_bytes) {
+        return None;
+    }
+    let mut crc = crate::crc::Hasher::new();
+    crc.update(body);
+    if crc.finalize() != u32_at(12)? {
+        return None;
+    }
+    let mut out = Vec::with_capacity(n);
+    for chunk in body.chunks_exact(blk_bytes) {
+        let mut blk = [0u64; TGRAM_WORDS];
+        for (dst, src) in blk.iter_mut().zip(chunk.chunks_exact(8)) {
+            *dst = u64::from_le_bytes(src.try_into().ok()?);
+        }
+        out.push(blk);
+    }
+    Some(out.into_boxed_slice())
 }
 
 pub(crate) const ZONE_BLOCK_ROWS: usize = 4096;

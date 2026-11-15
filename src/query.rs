@@ -2,7 +2,10 @@
 
 use std::marker::PhantomData;
 
-use crate::ast::{CmpOp, Field, MatchHop, Pred, Query, SearchMode, Source, Step, Stmt, Value};
+use crate::ast::{
+    AggFunc, AggSpec, CmpOp, Field, GroupKey, MatchHop, Pred, Query, SearchMode, Source, Step,
+    Stmt, Value,
+};
 use crate::cursor::QueryCursor;
 use crate::error::Error;
 use crate::exec::{Db, Handle, ReadDb};
@@ -385,6 +388,11 @@ impl Queryable {
         self
     }
 
+    pub fn without(mut self, fields: impl IntoFieldList) -> Self {
+        self.query.steps.push(Step::Without(fields.into_fields()));
+        self
+    }
+
     /// Project using [`LinRow::COLUMNS`].
     pub fn select_row<T: LinRow>(self) -> Self {
         self.select(T::COLUMNS)
@@ -566,6 +574,102 @@ impl Queryable {
             field: Field::path(field.as_ref()),
             by: Some(Field::path(by.as_ref())),
         });
+        self
+    }
+
+    pub fn dcount(mut self, field: impl AsRef<str>) -> Self {
+        self.query.steps.push(Step::Summarize {
+            specs: vec![AggSpec {
+                alias: "dcount".into(),
+                func: AggFunc::DCount(Field::path(field.as_ref())),
+            }],
+            by: Vec::new(),
+        });
+        self
+    }
+
+    pub fn dcount_by(mut self, field: impl AsRef<str>, by: impl AsRef<str>) -> Self {
+        self.query.steps.push(Step::Summarize {
+            specs: vec![AggSpec {
+                alias: "dcount".into(),
+                func: AggFunc::DCount(Field::path(field.as_ref())),
+            }],
+            by: vec![GroupKey::field(Field::path(by.as_ref()))],
+        });
+        self
+    }
+
+    pub fn percentile(mut self, field: impl AsRef<str>, pct: f64) -> Self {
+        self.query.steps.push(Step::Summarize {
+            specs: vec![AggSpec {
+                alias: AggFunc::default_percentile_alias(pct),
+                func: AggFunc::Percentile {
+                    field: Field::path(field.as_ref()),
+                    pct,
+                },
+            }],
+            by: Vec::new(),
+        });
+        self
+    }
+
+    pub fn percentile_by(
+        mut self,
+        field: impl AsRef<str>,
+        pct: f64,
+        by: impl AsRef<str>,
+    ) -> Self {
+        self.query.steps.push(Step::Summarize {
+            specs: vec![AggSpec {
+                alias: AggFunc::default_percentile_alias(pct),
+                func: AggFunc::Percentile {
+                    field: Field::path(field.as_ref()),
+                    pct,
+                },
+            }],
+            by: vec![GroupKey::field(Field::path(by.as_ref()))],
+        });
+        self
+    }
+
+    pub fn arg_max(mut self, order: impl AsRef<str>) -> Self {
+        self.query.steps.push(Step::ArgExtremum {
+            is_max: true,
+            order: Field::path(order.as_ref()),
+            by: Vec::new(),
+        });
+        self
+    }
+
+    pub fn arg_max_by(mut self, order: impl AsRef<str>, by: impl AsRef<str>) -> Self {
+        self.query.steps.push(Step::ArgExtremum {
+            is_max: true,
+            order: Field::path(order.as_ref()),
+            by: vec![GroupKey::field(Field::path(by.as_ref()))],
+        });
+        self
+    }
+
+    pub fn arg_min(mut self, order: impl AsRef<str>) -> Self {
+        self.query.steps.push(Step::ArgExtremum {
+            is_max: false,
+            order: Field::path(order.as_ref()),
+            by: Vec::new(),
+        });
+        self
+    }
+
+    pub fn arg_min_by(mut self, order: impl AsRef<str>, by: impl AsRef<str>) -> Self {
+        self.query.steps.push(Step::ArgExtremum {
+            is_max: false,
+            order: Field::path(order.as_ref()),
+            by: vec![GroupKey::field(Field::path(by.as_ref()))],
+        });
+        self
+    }
+
+    pub fn summarize(mut self, specs: Vec<AggSpec>, by: Vec<GroupKey>) -> Self {
+        self.query.steps.push(Step::Summarize { specs, by });
         self
     }
 
@@ -1019,6 +1123,11 @@ impl<'a, T> BoundQueryable<'a, T> {
         self
     }
 
+    pub fn without(mut self, fields: impl IntoFieldList) -> Self {
+        self.q = self.q.without(fields);
+        self
+    }
+
     pub fn select_row<U: LinRow>(mut self) -> Self {
         self.q = self.q.select_row::<U>();
         self
@@ -1141,6 +1250,56 @@ impl<'a, T> BoundQueryable<'a, T> {
 
     pub fn avg_by(mut self, field: impl AsRef<str>, by: impl AsRef<str>) -> Self {
         self.q = self.q.avg_by(field, by);
+        self
+    }
+
+    pub fn dcount(mut self, field: impl AsRef<str>) -> Self {
+        self.q = self.q.dcount(field);
+        self
+    }
+
+    pub fn dcount_by(mut self, field: impl AsRef<str>, by: impl AsRef<str>) -> Self {
+        self.q = self.q.dcount_by(field, by);
+        self
+    }
+
+    pub fn percentile(mut self, field: impl AsRef<str>, pct: f64) -> Self {
+        self.q = self.q.percentile(field, pct);
+        self
+    }
+
+    pub fn percentile_by(
+        mut self,
+        field: impl AsRef<str>,
+        pct: f64,
+        by: impl AsRef<str>,
+    ) -> Self {
+        self.q = self.q.percentile_by(field, pct, by);
+        self
+    }
+
+    pub fn arg_max(mut self, order: impl AsRef<str>) -> Self {
+        self.q = self.q.arg_max(order);
+        self
+    }
+
+    pub fn arg_max_by(mut self, order: impl AsRef<str>, by: impl AsRef<str>) -> Self {
+        self.q = self.q.arg_max_by(order, by);
+        self
+    }
+
+    pub fn arg_min(mut self, order: impl AsRef<str>) -> Self {
+        self.q = self.q.arg_min(order);
+        self
+    }
+
+    pub fn arg_min_by(mut self, order: impl AsRef<str>, by: impl AsRef<str>) -> Self {
+        self.q = self.q.arg_min_by(order, by);
+        self
+    }
+
+    pub fn summarize(mut self, specs: Vec<AggSpec>, by: Vec<GroupKey>) -> Self {
+        self.q = self.q.summarize(specs, by);
         self
     }
 

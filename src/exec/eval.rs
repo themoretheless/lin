@@ -378,17 +378,40 @@ pub(crate) fn eval_leaf(pred: &Pred, cell: &Cell, now: i64) -> bool {
 }
 
 
+pub(crate) fn pred_leaf_cost(pred: &Pred) -> u32 {
+    match pred {
+        Pred::IsNull { .. } => 1,
+        Pred::Cmp { value, .. } => match value {
+            Value::Bool(_)
+            | Value::Int(_)
+            | Value::Float(_)
+            | Value::Timestamp(_)
+            | Value::Duration(_)
+            | Value::NowMinus(_)
+            | Value::Now => 2,
+            Value::String(_) | Value::Name(_) | Value::Param(_) => 4,
+        },
+        Pred::In { values, .. } => 6u32.saturating_add((values.len().min(16)) as u32),
+        Pred::Contains { .. } => 25,
+        Pred::Has { ci: false, .. } => 40,
+        Pred::Has { ci: true, .. } => 55,
+        Pred::Regex { .. } => 100,
+        Pred::And(..) | Pred::Or(..) | Pred::Not(..) => 30,
+    }
+}
+
 /// A predicate prepared for many rows: every single-name field keeps a [`FieldSlot`], so a
-/// row with a shape seen before is read by position instead of a search by name. Results
-/// are exactly those of [`eval_pred`].
+/// row with a shape seen before is read by position instead of a search by name. Conjuncts
+/// and disjuncts are flattened and ordered by evaluation cost so cheap checks short-circuit
+/// expensive text/regex matching while keeping results identical to [`eval_pred`].
 pub(crate) struct PredSlots<'p> {
     tree: SlotNode<'p>,
     slots: Vec<crate::store::row::FieldSlot<'p>>,
 }
 
 enum SlotNode<'p> {
-    And(Box<SlotNode<'p>>, Box<SlotNode<'p>>),
-    Or(Box<SlotNode<'p>>, Box<SlotNode<'p>>),
+    And(Vec<SlotNode<'p>>),
+    Or(Vec<SlotNode<'p>>),
     Not(Box<SlotNode<'p>>),
     /// Leaf over a single-name field: index into `slots`.
     Leaf(&'p Pred, usize),
@@ -401,37 +424,80 @@ impl<'p> PredSlots<'p> {
         fn build<'p>(
             pred: &'p Pred,
             slots: &mut Vec<crate::store::row::FieldSlot<'p>>,
-        ) -> SlotNode<'p> {
+        ) -> (SlotNode<'p>, u32) {
             match pred {
-                Pred::And(a, b) => {
-                    SlotNode::And(Box::new(build(a, slots)), Box::new(build(b, slots)))
+                Pred::And(..) => {
+                    let mut terms = Vec::new();
+                    let mut stack = vec![pred];
+                    while let Some(p) = stack.pop() {
+                        if let Pred::And(a, b) = p {
+                            // Push rhs first so lhs pops first, keeping tie order stable.
+                            stack.push(b);
+                            stack.push(a);
+                        } else {
+                            terms.push(p);
+                        }
+                    }
+                    let mut built: Vec<(SlotNode<'p>, u32)> =
+                        terms.into_iter().map(|t| build(t, slots)).collect();
+                    built.sort_by_key(|&(_, c)| c);
+                    let total_cost = built
+                        .iter()
+                        .fold(0u32, |acc, &(_, c)| acc.saturating_add(c))
+                        .max(1);
+                    let nodes = built.into_iter().map(|(n, _)| n).collect();
+                    (SlotNode::And(nodes), total_cost)
                 }
-                Pred::Or(a, b) => {
-                    SlotNode::Or(Box::new(build(a, slots)), Box::new(build(b, slots)))
+                Pred::Or(..) => {
+                    let mut terms = Vec::new();
+                    let mut stack = vec![pred];
+                    while let Some(p) = stack.pop() {
+                        if let Pred::Or(a, b) = p {
+                            stack.push(b);
+                            stack.push(a);
+                        } else {
+                            terms.push(p);
+                        }
+                    }
+                    let mut built: Vec<(SlotNode<'p>, u32)> =
+                        terms.into_iter().map(|t| build(t, slots)).collect();
+                    built.sort_by_key(|&(_, c)| c);
+                    let total_cost = built
+                        .iter()
+                        .fold(0u32, |acc, &(_, c)| acc.saturating_add(c))
+                        .saturating_add(2);
+                    let nodes = built.into_iter().map(|(n, _)| n).collect();
+                    (SlotNode::Or(nodes), total_cost)
                 }
-                Pred::Not(inner) => SlotNode::Not(Box::new(build(inner, slots))),
+                Pred::Not(inner) => {
+                    let (node, cost) = build(inner, slots);
+                    (SlotNode::Not(Box::new(node)), cost)
+                }
                 Pred::IsNull { field, .. }
                 | Pred::In { field, .. }
                 | Pred::Cmp { field, .. }
                 | Pred::Has { field, .. }
                 | Pred::Contains { field, .. }
-                | Pred::Regex { field, .. } => match field.leaf() {
-                    Some(name) => {
-                        let at = match slots.iter().position(|s| s.key() == name) {
-                            Some(at) => at,
-                            None => {
-                                slots.push(crate::store::row::FieldSlot::new(name));
-                                slots.len() - 1
-                            }
-                        };
-                        SlotNode::Leaf(pred, at)
+                | Pred::Regex { field, .. } => {
+                    let cost = pred_leaf_cost(pred);
+                    match field.leaf() {
+                        Some(name) => {
+                            let at = match slots.iter().position(|s| s.key() == name) {
+                                Some(at) => at,
+                                None => {
+                                    slots.push(crate::store::row::FieldSlot::new(name));
+                                    slots.len() - 1
+                                }
+                            };
+                            (SlotNode::Leaf(pred, at), cost)
+                        }
+                        None => (SlotNode::ByName(pred), cost.saturating_add(10)),
                     }
-                    None => SlotNode::ByName(pred),
-                },
+                }
             }
         }
         let mut slots = Vec::new();
-        let tree = build(pred, &mut slots);
+        let (tree, _) = build(pred, &mut slots);
         PredSlots { tree, slots }
     }
 
@@ -445,8 +511,8 @@ impl<'p> PredSlots<'p> {
         ) -> bool {
             static NULL: Cell = Cell::Null;
             match node {
-                SlotNode::And(a, b) => go(a, slots, row, now) && go(b, slots, row, now),
-                SlotNode::Or(a, b) => go(a, slots, row, now) || go(b, slots, row, now),
+                SlotNode::And(parts) => parts.iter().all(|c| go(c, slots, row, now)),
+                SlotNode::Or(parts) => parts.iter().any(|c| go(c, slots, row, now)),
                 SlotNode::Not(inner) => !go(inner, slots, row, now),
                 SlotNode::Leaf(pred, at) => {
                     eval_leaf(pred, slots[*at].get(row).unwrap_or(&NULL), now)
@@ -727,6 +793,17 @@ pub(crate) fn project_owned(mut rows: Vec<Row>, fields: &[Field]) -> Vec<Row> {
     rows
 }
 
+/// Drop `fields` from owned rows in place without creating missing null entries.
+pub(crate) fn without_rows(mut rows: Vec<Row>, fields: &[Field]) -> Vec<Row> {
+    let keys: Vec<String> = fields.iter().map(Field::as_str).collect();
+    for row in &mut rows {
+        for k in &keys {
+            row.remove(k.as_str());
+        }
+    }
+    rows
+}
+
 pub(crate) fn sort_rows_top_k(
     rows: &mut Vec<Row>,
     field: &Field,
@@ -830,9 +907,11 @@ pub(crate) fn cmp_sort(a: &Cell, b: &Cell) -> std::cmp::Ordering {
         (Cell::Bool(x), Cell::Bool(y)) => x.cmp(y),
         // Integers compare exactly: through f64, values above 2^53 that differ by one
         // tie or swap (`2^53 + 1` sorted before `2^53`).
-        (Cell::Int(x), Cell::Int(y)) => x.cmp(y),
-        (Cell::Int(x), Cell::Float(y)) if !y.is_nan() => cmp_int_float(*x, *y),
-        (Cell::Float(x), Cell::Int(y)) if !x.is_nan() => cmp_int_float(*y, *x).reverse(),
+        (Cell::Int(x) | Cell::Time(x), Cell::Int(y) | Cell::Time(y)) => x.cmp(y),
+        (Cell::Int(x) | Cell::Time(x), Cell::Float(y)) if !y.is_nan() => cmp_int_float(*x, *y),
+        (Cell::Float(x), Cell::Int(y) | Cell::Time(y)) if !x.is_nan() => {
+            cmp_int_float(*y, *x).reverse()
+        }
         _ => match (a.as_f64(), b.as_f64()) {
             (Some(x), Some(y)) => match (x.is_nan(), y.is_nan()) {
                 (true, true) => Ordering::Equal,

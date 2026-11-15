@@ -1,9 +1,14 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::SmallVec;
 
-use crate::ast::{CmpOp, Field, Pred, Query, Source, Step, Value};
+use crate::ast::{
+    AggFunc, AggSpec, BinStep, CmpOp, Field, GroupExpr, GroupKey, Pred, Query, Source, Step,
+    Value,
+};
+use crate::catalog::Type;
 use crate::error::Error;
 use crate::store::{Cell, Row};
 
@@ -251,10 +256,8 @@ pub(crate) fn agg_count(
     agg_count_filtered(rows, None, 0, by, max_bytes, spill)
 }
 
-/// Below this many rows the fork/join overhead of a parallel aggregate outweighs the scan.
-#[cfg(feature = "parallel")]
+/// Below this many rows the fork/join overhead of a parallel aggregate or join outweighs the scan.
 pub(crate) const PAR_AGG_MIN_ROWS: usize = 65_536;
-#[cfg(feature = "parallel")]
 pub(crate) const PAR_AGG_CHUNK_ROWS: usize = 16_384;
 
 /// Grouped aggregate over materialized rows on the rayon pool: each fixed-size chunk
@@ -1967,4 +1970,1092 @@ impl Db {
         }
         Some(count_cell_map_to_rows(&by_key, map))
     }
+
+    pub(crate) fn try_summarize_fast(
+        &self,
+        q: &Query,
+        bindings: &BTreeMap<String, Vec<Row>>,
+        now: i64,
+    ) -> Result<Option<Vec<Row>>, Error> {
+        let Source::Collection(name) = &q.source else {
+            return Ok(None);
+        };
+        if bindings.get(name).is_some() {
+            return Ok(None);
+        }
+        let mut q = crate::catalog::with_catalog_filter(q, &self.catalog);
+        if q.needs_simplify() {
+            q.to_mut().simplify_predicates();
+        }
+        let q = &*q;
+        let Source::Collection(name) = &q.source else {
+            return Ok(None);
+        };
+
+        let mut filter: Option<&Pred> = None;
+        let mut summarize: Option<(&[AggSpec], &[GroupKey])> = None;
+        let mut tail: Vec<AggTail> = Vec::new();
+        for step in &q.steps {
+            match step {
+                Step::Filter(p) if filter.is_none() && summarize.is_none() => filter = Some(p),
+                Step::Summarize { specs, by } if summarize.is_none() => {
+                    summarize = Some((specs.as_slice(), by.as_slice()));
+                }
+                Step::Take { n: None } if summarize.is_some() => {}
+                Step::Take { n: Some(n) } if summarize.is_some() => {
+                    tail.push(AggTail::Take((*n).max(0) as usize));
+                }
+                Step::Skip { n } if summarize.is_some() => {
+                    tail.push(AggTail::Skip((*n).max(0) as usize));
+                }
+                Step::Sort { field, desc } if summarize.is_some() => {
+                    tail.push(AggTail::Sort {
+                        field: field.clone(),
+                        desc: *desc,
+                    });
+                }
+                _ => return Ok(None),
+            }
+            if !tail.is_empty()
+                && !matches!(
+                    step,
+                    Step::Take { .. } | Step::Skip { .. } | Step::Sort { .. }
+                )
+            {
+                return Ok(None);
+            }
+        }
+        let Some((specs, by)) = summarize else {
+            return Ok(None);
+        };
+        if filter.is_some_and(pred_has_param) {
+            return Ok(None);
+        }
+
+        let sum_f64_flags = sum_f64_flags_for(self.catalog.collections.get(name), specs);
+        let max_bytes = self.quotas.max_aggregate_bytes;
+        let mut rows = if self.store.is_disk_backed(name)
+            && let Some(eng) = self.store.disk_engine_read()
+        {
+            agg_summarize_disk(&eng, name, filter, now, specs, by, &sum_f64_flags, max_bytes)?
+        } else {
+            let col = self.store.collection(name);
+            agg_summarize(col, filter, now, specs, by, &sum_f64_flags, max_bytes)?
+        };
+
+        for step in &tail {
+            match step {
+                AggTail::Skip(n) => {
+                    rows.drain(..(*n).min(rows.len()));
+                }
+                AggTail::Take(n) => rows.truncate(*n),
+                AggTail::Sort { field, desc } => {
+                    super::eval::sort_rows_top_k(&mut rows, field, *desc, None);
+                }
+            }
+        }
+        Ok(Some(rows))
+    }
+}
+
+type GroupTuple = SmallVec<[Cell; 2]>;
+
+const DCOUNT_EXACT_LIMIT: usize = 512;
+const HLL_P: usize = 12;
+const HLL_M: usize = 1 << HLL_P;
+const HLL_BYTES: usize = HLL_M;
+
+const PERCENTILE_EXACT_LIMIT: usize = 2048;
+const TDIGEST_DELTA: f64 = 100.0;
+const TDIGEST_BUF_CAP: usize = 512;
+const TDIGEST_EST_BYTES: usize = 8192;
+
+pub(crate) fn sum_f64_flags_for(
+    col: Option<&crate::catalog::Collection>,
+    specs: &[AggSpec],
+) -> Vec<bool> {
+    specs
+        .iter()
+        .map(|spec| match &spec.func {
+            AggFunc::Sum(f) => col
+                .and_then(|c| c.field(&f.as_str()))
+                .is_some_and(|fi| fi.ty == Type::F64),
+            _ => false,
+        })
+        .collect()
+}
+
+#[inline]
+fn normalize_key_cell(cell: Cell) -> Cell {
+    match cell {
+        Cell::Float(f) if f == 0.0 => Cell::Float(0.0),
+        other => other,
+    }
+}
+
+fn bin_cell(cell: &Cell, step: BinStep) -> Cell {
+    if matches!(cell, Cell::Null) {
+        return Cell::Null;
+    }
+    match step {
+        BinStep::Duration(step_ms) => match cell {
+            Cell::Time(t) if step_ms > 0 => Cell::Time(t.div_euclid(step_ms).saturating_mul(step_ms)),
+            _ => Cell::Null,
+        },
+        BinStep::Int(s) => match cell {
+            Cell::Int(v) if s > 0 => Cell::Int(v.div_euclid(s).saturating_mul(s)),
+            Cell::Float(v) if s > 0 && v.is_finite() => {
+                let sf = s as f64;
+                let mut b = (v / sf).floor() * sf;
+                if b == 0.0 {
+                    b = 0.0;
+                }
+                Cell::Float(b)
+            }
+            _ => Cell::Null,
+        },
+        BinStep::Float(s) => match cell {
+            Cell::Float(v) if s > 0.0 && s.is_finite() && v.is_finite() => {
+                let mut b = (v / s).floor() * s;
+                if b == 0.0 {
+                    b = 0.0;
+                }
+                Cell::Float(b)
+            }
+            Cell::Int(v) if s > 0.0 && s.is_finite() => {
+                let mut b = ((*v as f64) / s).floor() * s;
+                if b == 0.0 {
+                    b = 0.0;
+                }
+                Cell::Float(b)
+            }
+            _ => Cell::Null,
+        },
+    }
+}
+
+#[inline]
+fn eval_group_cell(expr: &GroupExpr, raw: &Cell) -> Cell {
+    match expr {
+        GroupExpr::Field(_) => normalize_key_cell(raw.clone_for_borrow()),
+        GroupExpr::Bin { step, .. } => bin_cell(raw, *step),
+    }
+}
+
+fn canonical_cell_hash(cell: &Cell) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    if matches!(cell, Cell::Null) {
+        return None;
+    }
+    let mut h = rustc_hash::FxHasher::default();
+    match cell {
+        Cell::Null => return None,
+        Cell::Text(s) => {
+            1u8.hash(&mut h);
+            s.as_bytes().hash(&mut h);
+        }
+        Cell::SmallText(s) => {
+            1u8.hash(&mut h);
+            s.as_str().as_bytes().hash(&mut h);
+        }
+        Cell::Int(n) => {
+            2u8.hash(&mut h);
+            n.hash(&mut h);
+        }
+        Cell::Float(f) => {
+            3u8.hash(&mut h);
+            let bits = if *f == 0.0 {
+                0u64
+            } else if f.is_nan() {
+                f64::NAN.to_bits()
+            } else {
+                f.to_bits()
+            };
+            bits.hash(&mut h);
+        }
+        Cell::Bool(b) => {
+            4u8.hash(&mut h);
+            b.hash(&mut h);
+        }
+        Cell::Time(t) => {
+            5u8.hash(&mut h);
+            t.hash(&mut h);
+        }
+        Cell::Vec(v) => {
+            6u8.hash(&mut h);
+            v.len().hash(&mut h);
+            for &x in v.iter() {
+                let bits = if x == 0.0 { 0u32 } else { x.to_bits() };
+                bits.hash(&mut h);
+            }
+        }
+    }
+    let mut z = h.finish().wrapping_add(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    Some(z ^ (z >> 31))
+}
+
+#[inline]
+fn hll_add(regs: &mut [u8; HLL_M], hash: u64) {
+    let idx = (hash >> (64 - HLL_P)) as usize;
+    let w = (hash << HLL_P) | (1u64 << (HLL_P - 1));
+    let rho = (w.leading_zeros() as u8) + 1;
+    if rho > regs[idx] {
+        regs[idx] = rho;
+    }
+}
+
+enum DCountAcc {
+    Exact(FxHashSet<u64>),
+    Hll(Box<[u8; HLL_M]>),
+}
+
+impl DCountAcc {
+    fn new() -> Self {
+        Self::Exact(FxHashSet::default())
+    }
+
+    fn push(
+        &mut self,
+        cell: &Cell,
+        state_bytes: &mut usize,
+        max_bytes: usize,
+    ) -> Result<(), Error> {
+        let Some(hash) = canonical_cell_hash(cell) else {
+            return Ok(());
+        };
+        match self {
+            DCountAcc::Exact(set) => {
+                if set.contains(&hash) {
+                    return Ok(());
+                }
+                if set.len() < DCOUNT_EXACT_LIMIT {
+                    set.insert(hash);
+                    *state_bytes = state_bytes.saturating_add(16);
+                    check_agg_quota(*state_bytes, max_bytes)?;
+                    return Ok(());
+                }
+                let old_bytes = set.len().saturating_mul(16);
+                let mut regs = Box::new([0u8; HLL_M]);
+                for &existing in set.iter() {
+                    hll_add(&mut regs, existing);
+                }
+                hll_add(&mut regs, hash);
+                if HLL_BYTES > old_bytes {
+                    *state_bytes = state_bytes.saturating_add(HLL_BYTES - old_bytes);
+                    check_agg_quota(*state_bytes, max_bytes)?;
+                }
+                *self = DCountAcc::Hll(regs);
+                Ok(())
+            }
+            DCountAcc::Hll(regs) => {
+                hll_add(regs, hash);
+                Ok(())
+            }
+        }
+    }
+
+    fn finish(self) -> i64 {
+        match self {
+            DCountAcc::Exact(set) => set.len() as i64,
+            DCountAcc::Hll(regs) => {
+                let m = HLL_M as f64;
+                let alpha = 0.7213 / (1.0 + 1.079 / m);
+                let mut sum_inv = 0.0f64;
+                let mut zeros = 0usize;
+                for &r in regs.iter() {
+                    if r == 0 {
+                        zeros += 1;
+                    }
+                    sum_inv += 2.0f64.powi(-(i32::from(r)));
+                }
+                let raw = alpha * m * m / sum_inv;
+                let est = if raw <= 2.5 * m && zeros > 0 {
+                    m * (m / (zeros as f64)).ln()
+                } else {
+                    raw
+                };
+                est.round().max(0.0) as i64
+            }
+        }
+    }
+}
+
+struct TDigest {
+    centroids: Vec<(f64, f64)>,
+    buffer: Vec<f64>,
+    min: f64,
+    max: f64,
+    total: f64,
+}
+
+impl TDigest {
+    fn from_exact(vals: Vec<f64>) -> Self {
+        let mut td = Self {
+            centroids: Vec::with_capacity(128),
+            buffer: Vec::with_capacity(TDIGEST_BUF_CAP),
+            min: f64::INFINITY,
+            max: f64::NEG_INFINITY,
+            total: 0.0,
+        };
+        for v in vals {
+            td.min = td.min.min(v);
+            td.max = td.max.max(v);
+            td.total += 1.0;
+            td.centroids.push((v, 1.0));
+        }
+        td.compress();
+        td
+    }
+
+    fn push(&mut self, v: f64) {
+        self.min = self.min.min(v);
+        self.max = self.max.max(v);
+        self.total += 1.0;
+        self.buffer.push(v);
+        if self.buffer.len() >= TDIGEST_BUF_CAP {
+            self.compress();
+        }
+    }
+
+    fn compress(&mut self) {
+        if self.centroids.is_empty() && self.buffer.is_empty() {
+            return;
+        }
+        for v in self.buffer.drain(..) {
+            self.centroids.push((v, 1.0));
+        }
+        self.centroids.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let total = self.total;
+        if total <= 0.0 || self.centroids.len() <= 1 {
+            return;
+        }
+        let k_of = |q: f64| -> f64 {
+            (TDIGEST_DELTA / (2.0 * std::f64::consts::PI))
+                * (2.0 * q.clamp(0.0, 1.0) - 1.0).asin()
+        };
+        let mut merged: Vec<(f64, f64)> = Vec::with_capacity(self.centroids.len().min(128));
+        let mut it = self.centroids.drain(..);
+        let (mut cur_m, mut cur_w) = it.next().unwrap();
+        let mut weight_so_far = 0.0f64;
+        let mut k_limit = k_of(0.0) + 1.0;
+        for (m, w) in it {
+            let next_q = (weight_so_far + cur_w + w) / total;
+            if k_of(next_q) <= k_limit {
+                let new_w = cur_w + w;
+                cur_m = (cur_m * cur_w + m * w) / new_w;
+                cur_w = new_w;
+            } else {
+                merged.push((cur_m, cur_w));
+                weight_so_far += cur_w;
+                k_limit = k_of(weight_so_far / total) + 1.0;
+                cur_m = m;
+                cur_w = w;
+            }
+        }
+        merged.push((cur_m, cur_w));
+        self.centroids = merged;
+    }
+
+    fn quantile(&mut self, pct: f64) -> Option<f64> {
+        if !self.buffer.is_empty() {
+            self.compress();
+        }
+        if self.centroids.is_empty() {
+            return None;
+        }
+        if pct <= 0.0 {
+            return Some(self.min);
+        }
+        if pct >= 100.0 {
+            return Some(self.max);
+        }
+        if self.centroids.len() == 1 {
+            return Some(self.centroids[0].0);
+        }
+        let target = (pct / 100.0) * self.total;
+        let first = self.centroids[0];
+        if target < first.1 * 0.5 {
+            if first.1 <= 1.0 {
+                return Some(first.0);
+            }
+            let frac = target / (first.1 * 0.5);
+            return Some(self.min + (first.0 - self.min) * frac);
+        }
+        let mut prev_cum = 0.0f64;
+        for i in 0..(self.centroids.len() - 1) {
+            let (m0, w0) = self.centroids[i];
+            let (m1, w1) = self.centroids[i + 1];
+            let c0 = prev_cum + w0 * 0.5;
+            let c1 = prev_cum + w0 + w1 * 0.5;
+            if target <= c1 {
+                let denom = c1 - c0;
+                if denom <= 0.0 {
+                    return Some(m0);
+                }
+                let frac = (target - c0) / denom;
+                return Some(m0 + (m1 - m0) * frac);
+            }
+            prev_cum += w0;
+        }
+        let &(last_m, last_w) = self.centroids.last().unwrap();
+        let last_c = self.total - last_w * 0.5;
+        let tail_span = self.total - last_c;
+        if last_w <= 1.0 || tail_span <= 0.0 {
+            return Some(self.max);
+        }
+        let frac = ((target - last_c) / tail_span).clamp(0.0, 1.0);
+        Some(last_m + (self.max - last_m) * frac)
+    }
+}
+
+enum PercentileAcc {
+    Exact(Vec<f64>),
+    Digest(TDigest),
+}
+
+impl PercentileAcc {
+    fn new() -> Self {
+        Self::Exact(Vec::new())
+    }
+
+    fn push(
+        &mut self,
+        cell: &Cell,
+        state_bytes: &mut usize,
+        max_bytes: usize,
+    ) -> Result<(), Error> {
+        let Some(v) = cell.as_f64() else {
+            return Ok(());
+        };
+        if v.is_nan() {
+            return Ok(());
+        }
+        let v = if v == 0.0 { 0.0 } else { v };
+        match self {
+            PercentileAcc::Exact(vals) => {
+                if vals.len() < PERCENTILE_EXACT_LIMIT {
+                    vals.push(v);
+                    *state_bytes = state_bytes.saturating_add(8);
+                    check_agg_quota(*state_bytes, max_bytes)?;
+                    return Ok(());
+                }
+                let old_bytes = vals.len().saturating_mul(8);
+                let mut taken = std::mem::take(vals);
+                taken.push(v);
+                let td = TDigest::from_exact(taken);
+                if TDIGEST_EST_BYTES > old_bytes {
+                    *state_bytes = state_bytes.saturating_add(TDIGEST_EST_BYTES - old_bytes);
+                    check_agg_quota(*state_bytes, max_bytes)?;
+                }
+                *self = PercentileAcc::Digest(td);
+                Ok(())
+            }
+            PercentileAcc::Digest(td) => {
+                td.push(v);
+                Ok(())
+            }
+        }
+    }
+
+    fn finish(self, pct: f64) -> Cell {
+        let val = match self {
+            PercentileAcc::Exact(mut vals) => {
+                if vals.is_empty() {
+                    None
+                } else {
+                    vals.sort_by(f64::total_cmp);
+                    let n = vals.len();
+                    if pct <= 0.0 {
+                        Some(vals[0])
+                    } else if pct >= 100.0 {
+                        Some(vals[n - 1])
+                    } else {
+                        let pos = (pct / 100.0) * ((n - 1) as f64);
+                        let lo = pos.floor() as usize;
+                        let hi = pos.ceil() as usize;
+                        let w = pos - (lo as f64);
+                        Some(vals[lo] + (vals[hi] - vals[lo]) * w)
+                    }
+                }
+            }
+            PercentileAcc::Digest(mut td) => td.quantile(pct),
+        };
+        match val {
+            Some(v) => Cell::Float(if v == 0.0 { 0.0 } else { v }),
+            None => Cell::Null,
+        }
+    }
+}
+
+enum MetricAcc {
+    Count(i64),
+    Sum {
+        int_sum: i128,
+        exact: crate::exact_sum::ExactSum,
+        saw_float: bool,
+        int_overflow: bool,
+        prefer_f64: bool,
+    },
+    Avg {
+        sum: crate::exact_sum::ExactSum,
+        count: u64,
+    },
+    Min(Option<Cell>),
+    Max(Option<Cell>),
+    DCount(DCountAcc),
+    Percentile {
+        pct: f64,
+        acc: PercentileAcc,
+    },
+    ArgExtremumScalar {
+        is_max: bool,
+        best: Option<(Cell, Cell)>,
+    },
+}
+
+impl MetricAcc {
+    fn from_spec(spec: &AggSpec, prefer_f64: bool) -> Self {
+        match &spec.func {
+            AggFunc::Count => Self::Count(0),
+            AggFunc::Sum(_) => Self::Sum {
+                int_sum: 0,
+                exact: crate::exact_sum::ExactSum::default(),
+                saw_float: false,
+                int_overflow: false,
+                prefer_f64,
+            },
+            AggFunc::Avg(_) => Self::Avg {
+                sum: crate::exact_sum::ExactSum::default(),
+                count: 0,
+            },
+            AggFunc::Min(_) => Self::Min(None),
+            AggFunc::Max(_) => Self::Max(None),
+            AggFunc::DCount(_) => Self::DCount(DCountAcc::new()),
+            AggFunc::Percentile { pct, .. } => Self::Percentile {
+                pct: *pct,
+                acc: PercentileAcc::new(),
+            },
+            AggFunc::ArgMax { .. } => Self::ArgExtremumScalar {
+                is_max: true,
+                best: None,
+            },
+            AggFunc::ArgMin { .. } => Self::ArgExtremumScalar {
+                is_max: false,
+                best: None,
+            },
+        }
+    }
+
+    fn push(
+        &mut self,
+        c1: &Cell,
+        c2: Option<&Cell>,
+        state_bytes: &mut usize,
+        max_bytes: usize,
+    ) -> Result<(), Error> {
+        match self {
+            MetricAcc::Count(n) => {
+                *n += 1;
+            }
+            MetricAcc::Sum {
+                int_sum,
+                exact,
+                saw_float,
+                int_overflow,
+                ..
+            } => match c1 {
+                Cell::Null => {}
+                Cell::Int(i) => {
+                    exact.add_i64(*i);
+                    match int_sum.checked_add(i128::from(*i)) {
+                        Some(s) => *int_sum = s,
+                        None => *int_overflow = true,
+                    }
+                }
+                other => {
+                    if let Some(f) = other.as_f64() {
+                        *saw_float = true;
+                        exact.add_f64(f);
+                    }
+                }
+            },
+            MetricAcc::Avg { sum, count } => match c1 {
+                Cell::Null => {}
+                Cell::Int(i) => {
+                    sum.add_i64(*i);
+                    *count += 1;
+                }
+                other => {
+                    if let Some(f) = other.as_f64() {
+                        sum.add_f64(f);
+                        *count += 1;
+                    }
+                }
+            },
+            MetricAcc::Min(best) => {
+                if !matches!(c1, Cell::Null)
+                    && best.as_ref().is_none_or(|prev| cmp_sort(c1, prev).is_lt())
+                {
+                    *best = Some(c1.clone_for_borrow());
+                }
+            }
+            MetricAcc::Max(best) => {
+                if !matches!(c1, Cell::Null)
+                    && best.as_ref().is_none_or(|prev| cmp_sort(c1, prev).is_gt())
+                {
+                    *best = Some(c1.clone_for_borrow());
+                }
+            }
+            MetricAcc::DCount(acc) => acc.push(c1, state_bytes, max_bytes)?,
+            MetricAcc::Percentile { acc, .. } => acc.push(c1, state_bytes, max_bytes)?,
+            MetricAcc::ArgExtremumScalar { is_max, best } => {
+                if matches!(c1, Cell::Null) {
+                    return Ok(());
+                }
+                let take = match best {
+                    None => true,
+                    Some((prev_ord, _)) => {
+                        if *is_max {
+                            cmp_sort(c1, prev_ord).is_gt()
+                        } else {
+                            cmp_sort(c1, prev_ord).is_lt()
+                        }
+                    }
+                };
+                if take {
+                    let val = c2.map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
+                    *best = Some((c1.clone_for_borrow(), val));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Cell {
+        match self {
+            MetricAcc::Count(n) => Cell::Int(n),
+            MetricAcc::Sum {
+                int_sum,
+                exact,
+                saw_float,
+                int_overflow,
+                prefer_f64,
+            } => {
+                if saw_float
+                    || int_overflow
+                    || int_sum < i128::from(i64::MIN)
+                    || int_sum > i128::from(i64::MAX)
+                {
+                    Cell::Float(exact.value())
+                } else if int_sum == 0 && prefer_f64 {
+                    Cell::Float(0.0)
+                } else {
+                    Cell::Int(int_sum as i64)
+                }
+            }
+            MetricAcc::Avg { sum, count } => {
+                if count == 0 {
+                    Cell::Float(0.0)
+                } else {
+                    Cell::Float(sum.value() / (count as f64))
+                }
+            }
+            MetricAcc::Min(v) | MetricAcc::Max(v) => v.unwrap_or(Cell::Null),
+            MetricAcc::DCount(acc) => Cell::Int(acc.finish()),
+            MetricAcc::Percentile { pct, acc } => acc.finish(pct),
+            MetricAcc::ArgExtremumScalar { best, .. } => best.map(|(_, v)| v).unwrap_or(Cell::Null),
+        }
+    }
+}
+
+#[inline]
+fn check_agg_quota(state_bytes: usize, max_bytes: usize) -> Result<(), Error> {
+    if state_bytes > max_bytes {
+        return Err(Error::runtime(format!(
+            "aggregate state bytes {state_bytes} exceeds max_aggregate_bytes quota {max_bytes}"
+        )));
+    }
+    Ok(())
+}
+
+#[inline]
+fn group_key_bytes(keys: &[Cell], spec_count: usize) -> usize {
+    let mut bytes = 64usize.saturating_add(spec_count.saturating_mul(64));
+    for cell in keys {
+        bytes = bytes.saturating_add(match cell {
+            Cell::Text(s) => s.len() + 32,
+            Cell::SmallText(s) => s.as_str().len() + 32,
+            _ => 16,
+        });
+    }
+    bytes
+}
+
+#[inline]
+fn cmp_group_tuples(a: &[Cell], b: &[Cell]) -> std::cmp::Ordering {
+    for (x, y) in a.iter().zip(b.iter()) {
+        let ord = cmp_sort(x, y);
+        if !ord.is_eq() {
+            return ord;
+        }
+    }
+    a.len().cmp(&b.len())
+}
+
+fn build_accs(specs: &[AggSpec], sum_f64_flags: &[bool]) -> Vec<MetricAcc> {
+    specs
+        .iter()
+        .enumerate()
+        .map(|(i, s)| MetricAcc::from_spec(s, sum_f64_flags.get(i).copied().unwrap_or(false)))
+        .collect()
+}
+
+fn emit_summarize_row(by: &[GroupKey], keys: GroupTuple, specs: &[AggSpec], accs: Vec<MetricAcc>) -> Row {
+    let mut row = crate::store::acquire_row();
+    for (gk, kcell) in by.iter().zip(keys.into_iter()) {
+        row.insert(gk.alias.clone(), kcell);
+    }
+    for (spec, acc) in specs.iter().zip(accs.into_iter()) {
+        row.insert(spec.alias.clone(), acc.finish());
+    }
+    row
+}
+
+enum FieldReader<'k> {
+    Leaf(FieldSlot<'k>),
+    Path(&'k Field),
+}
+
+impl<'k> FieldReader<'k> {
+    fn new(field: &'k Field) -> Self {
+        match field.leaf() {
+            Some(lf) => Self::Leaf(FieldSlot::new(lf)),
+            None => Self::Path(field),
+        }
+    }
+
+    #[inline]
+    fn get<'a>(&mut self, row: &'a Row) -> &'a Cell {
+        static NULL: Cell = Cell::Null;
+        match self {
+            FieldReader::Leaf(slot) => slot.get(row).unwrap_or(&NULL),
+            FieldReader::Path(f) => super::eval::field_cell(row, f),
+        }
+    }
+}
+
+enum SpecReader<'k> {
+    None,
+    One(FieldReader<'k>),
+    Two(FieldReader<'k>, FieldReader<'k>),
+}
+
+impl<'k> SpecReader<'k> {
+    fn from_spec(spec: &'k AggSpec) -> Self {
+        match &spec.func {
+            AggFunc::Count => Self::None,
+            AggFunc::Sum(f)
+            | AggFunc::Avg(f)
+            | AggFunc::Min(f)
+            | AggFunc::Max(f)
+            | AggFunc::DCount(f)
+            | AggFunc::Percentile { field: f, .. } => Self::One(FieldReader::new(f)),
+            AggFunc::ArgMax { order, value } | AggFunc::ArgMin { order, value } => {
+                Self::Two(FieldReader::new(order), FieldReader::new(value))
+            }
+        }
+    }
+}
+
+pub(crate) fn agg_summarize(
+    rows: &[Row],
+    filter: Option<&Pred>,
+    now: i64,
+    specs: &[AggSpec],
+    by: &[GroupKey],
+    sum_f64_flags: &[bool],
+    max_bytes: usize,
+) -> Result<Vec<Row>, Error> {
+    static NULL: Cell = Cell::Null;
+    let mut flt = filter.map(PredSlots::new);
+    let mut by_readers: Vec<FieldReader<'_>> = by
+        .iter()
+        .map(|gk| FieldReader::new(gk.source_field()))
+        .collect();
+    let mut spec_readers: Vec<SpecReader<'_>> = specs.iter().map(SpecReader::from_spec).collect();
+    let mut state_bytes = 0usize;
+
+    if by.is_empty() {
+        let mut accs = build_accs(specs, sum_f64_flags);
+        for r in rows {
+            if !flt.as_mut().is_none_or(|f| f.eval(r, now)) {
+                continue;
+            }
+            for (acc, sr) in accs.iter_mut().zip(spec_readers.iter_mut()) {
+                let (c1, c2) = match sr {
+                    SpecReader::None => (&NULL, None),
+                    SpecReader::One(r1) => (r1.get(r), None),
+                    SpecReader::Two(r1, r2) => (r1.get(r), Some(r2.get(r))),
+                };
+                acc.push(c1, c2, &mut state_bytes, max_bytes)?;
+            }
+        }
+        return Ok(vec![emit_summarize_row(by, GroupTuple::new(), specs, accs)]);
+    }
+
+    let mut groups: FxHashMap<GroupTuple, Vec<MetricAcc>> = FxHashMap::default();
+    for r in rows {
+        if !flt.as_mut().is_none_or(|f| f.eval(r, now)) {
+            continue;
+        }
+        let mut gkey: GroupTuple = SmallVec::with_capacity(by.len());
+        for (gk, br) in by.iter().zip(by_readers.iter_mut()) {
+            gkey.push(eval_group_cell(&gk.expr, br.get(r)));
+        }
+        let accs = match groups.entry(gkey) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                state_bytes = state_bytes.saturating_add(group_key_bytes(e.key(), specs.len()));
+                check_agg_quota(state_bytes, max_bytes)?;
+                e.insert(build_accs(specs, sum_f64_flags))
+            }
+        };
+        for (acc, sr) in accs.iter_mut().zip(spec_readers.iter_mut()) {
+            let (c1, c2) = match sr {
+                SpecReader::None => (&NULL, None),
+                SpecReader::One(r1) => (r1.get(r), None),
+                SpecReader::Two(r1, r2) => (r1.get(r), Some(r2.get(r))),
+            };
+            acc.push(c1, c2, &mut state_bytes, max_bytes)?;
+        }
+    }
+
+    let mut entries: Vec<(GroupTuple, Vec<MetricAcc>)> = groups.into_iter().collect();
+    entries.sort_unstable_by(|(a, _), (b, _)| cmp_group_tuples(a, b));
+    Ok(entries
+        .into_iter()
+        .map(|(k, accs)| emit_summarize_row(by, k, specs, accs))
+        .collect())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn agg_summarize_disk(
+    eng: &crate::disk::DiskEngine,
+    table: &str,
+    filter: Option<&Pred>,
+    now: i64,
+    specs: &[AggSpec],
+    by: &[GroupKey],
+    sum_f64_flags: &[bool],
+    max_bytes: usize,
+) -> Result<Vec<Row>, Error> {
+    fn push_field<'a>(needed: &mut Vec<&'a str>, f: &'a Field) -> Option<usize> {
+        let lf = f.leaf()?;
+        if let Some(pos) = needed.iter().position(|&c| c == lf) {
+            Some(pos)
+        } else {
+            let pos = needed.len();
+            needed.push(lf);
+            Some(pos)
+        }
+    }
+    let mut needed: Vec<&str> = Vec::new();
+    let mut by_pos = Vec::with_capacity(by.len());
+    let mut all_leaf = true;
+    for gk in by {
+        if let Some(pos) = push_field(&mut needed, gk.source_field()) {
+            by_pos.push(pos);
+        } else {
+            all_leaf = false;
+            break;
+        }
+    }
+    let mut spec_pos: Vec<Option<(usize, Option<usize>)>> = Vec::with_capacity(specs.len());
+    if all_leaf {
+        for spec in specs {
+            match &spec.func {
+                AggFunc::Count => spec_pos.push(None),
+                AggFunc::Sum(f)
+                | AggFunc::Avg(f)
+                | AggFunc::Min(f)
+                | AggFunc::Max(f)
+                | AggFunc::DCount(f)
+                | AggFunc::Percentile { field: f, .. } => {
+                    let Some(p) = push_field(&mut needed, f) else {
+                        all_leaf = false;
+                        break;
+                    };
+                    spec_pos.push(Some((p, None)));
+                }
+                AggFunc::ArgMax { order, value } | AggFunc::ArgMin { order, value } => {
+                    let (Some(p1), Some(p2)) =
+                        (push_field(&mut needed, order), push_field(&mut needed, value))
+                    else {
+                        all_leaf = false;
+                        break;
+                    };
+                    spec_pos.push(Some((p1, Some(p2))));
+                }
+            }
+        }
+    }
+
+    if !all_leaf {
+        let rows = eng.query_filter(table, filter, None, None, now)?;
+        return agg_summarize(&rows, None, now, specs, by, sum_f64_flags, max_bytes);
+    }
+
+    static NULL: Cell = Cell::Null;
+    let mut state_bytes = 0usize;
+    let mut single = if by.is_empty() {
+        Some(build_accs(specs, sum_f64_flags))
+    } else {
+        None
+    };
+    let mut groups: FxHashMap<GroupTuple, Vec<MetricAcc>> = FxHashMap::default();
+    let mut loop_err: Option<Error> = None;
+
+    let scanned = eng.scan_cells(table, filter, &needed, now, |_, cells| {
+        let accs: &mut [MetricAcc] = if let Some(ref mut s) = single {
+            s.as_mut_slice()
+        } else {
+            let mut gkey: GroupTuple = SmallVec::with_capacity(by.len());
+            for (gk, &idx) in by.iter().zip(by_pos.iter()) {
+                let raw = cells.get(idx).unwrap_or(&NULL);
+                gkey.push(eval_group_cell(&gk.expr, raw));
+            }
+            match groups.entry(gkey) {
+                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    state_bytes = state_bytes.saturating_add(group_key_bytes(e.key(), specs.len()));
+                    if let Err(err) = check_agg_quota(state_bytes, max_bytes) {
+                        loop_err = Some(err);
+                        return false;
+                    }
+                    e.insert(build_accs(specs, sum_f64_flags))
+                }
+            }
+        };
+        for (acc, pos) in accs.iter_mut().zip(spec_pos.iter()) {
+            let (c1, c2) = match pos {
+                None => (&NULL, None),
+                Some((p1, None)) => (cells.get(*p1).unwrap_or(&NULL), None),
+                Some((p1, Some(p2))) => (
+                    cells.get(*p1).unwrap_or(&NULL),
+                    Some(cells.get(*p2).unwrap_or(&NULL)),
+                ),
+            };
+            if let Err(err) = acc.push(c1, c2, &mut state_bytes, max_bytes) {
+                loop_err = Some(err);
+                return false;
+            }
+        }
+        true
+    })?;
+
+    if let Some(err) = loop_err {
+        return Err(err);
+    }
+    if !scanned {
+        let rows = eng.query_filter(table, filter, None, Some(&needed), now)?;
+        return agg_summarize(&rows, None, now, specs, by, sum_f64_flags, max_bytes);
+    }
+
+    if let Some(accs) = single {
+        return Ok(vec![emit_summarize_row(by, GroupTuple::new(), specs, accs)]);
+    }
+    let mut entries: Vec<(GroupTuple, Vec<MetricAcc>)> = groups.into_iter().collect();
+    entries.sort_unstable_by(|(a, _), (b, _)| cmp_group_tuples(a, b));
+    Ok(entries
+        .into_iter()
+        .map(|(k, accs)| emit_summarize_row(by, k, specs, accs))
+        .collect())
+}
+
+#[inline]
+fn arg_extremum_better(is_max: bool, cand: &Cell, prev: &Cell) -> bool {
+    match (cand, prev) {
+        (Cell::Null, _) => false,
+        (_, Cell::Null) => true,
+        _ => {
+            if is_max {
+                cmp_sort(cand, prev).is_gt()
+            } else {
+                cmp_sort(cand, prev).is_lt()
+            }
+        }
+    }
+}
+
+pub(crate) fn agg_arg_extremum(
+    rows: &[Row],
+    filter: Option<&Pred>,
+    now: i64,
+    is_max: bool,
+    order: &Field,
+    by: &[GroupKey],
+    max_bytes: usize,
+) -> Result<Vec<Row>, Error> {
+    let mut flt = filter.map(PredSlots::new);
+    let mut order_reader = FieldReader::new(order);
+
+    if by.is_empty() {
+        let mut best: Option<(&Cell, &Row)> = None;
+        for r in rows {
+            if !flt.as_mut().is_none_or(|f| f.eval(r, now)) {
+                continue;
+            }
+            let ord = order_reader.get(r);
+            if best.is_none_or(|(prev, _)| arg_extremum_better(is_max, ord, prev)) {
+                best = Some((ord, r));
+            }
+        }
+        return Ok(best.into_iter().map(|(_, r)| r.clone()).collect());
+    }
+
+    let mut by_readers: Vec<FieldReader<'_>> = by
+        .iter()
+        .map(|gk| FieldReader::new(gk.source_field()))
+        .collect();
+    let mut groups: FxHashMap<GroupTuple, (Cell, &Row)> = FxHashMap::default();
+    let mut state_bytes = 0usize;
+
+    for r in rows {
+        if !flt.as_mut().is_none_or(|f| f.eval(r, now)) {
+            continue;
+        }
+        let mut gkey: GroupTuple = SmallVec::with_capacity(by.len());
+        for (gk, br) in by.iter().zip(by_readers.iter_mut()) {
+            gkey.push(eval_group_cell(&gk.expr, br.get(r)));
+        }
+        let ord = order_reader.get(r);
+        match groups.entry(gkey) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                state_bytes = state_bytes.saturating_add(group_key_bytes(e.key(), 1));
+                check_agg_quota(state_bytes, max_bytes)?;
+                e.insert((ord.clone_for_borrow(), r));
+            }
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                let (prev, _) = e.get();
+                if arg_extremum_better(is_max, ord, prev) {
+                    *e.get_mut() = (ord.clone_for_borrow(), r);
+                }
+            }
+        }
+    }
+
+    let mut entries: Vec<(GroupTuple, (Cell, &Row))> = groups.into_iter().collect();
+    entries.sort_unstable_by(|(a, _), (b, _)| cmp_group_tuples(a, b));
+    Ok(entries
+        .into_iter()
+        .map(|(k, (_, r))| {
+            let mut out = r.clone();
+            for (gk, kcell) in by.iter().zip(k.into_iter()) {
+                out.insert(gk.alias.clone(), kcell);
+            }
+            out
+        })
+        .collect())
 }

@@ -1,21 +1,20 @@
 # Lin — план развития
 
-Срез: **2026-11-14**, коммит `58444cf6e` (релиз 0.7.1) плюс незакоммиченное рабочее дерево. Единственный файл с планом в репозитории: в нём только несделанное. Реализованное описано в [CHANGELOG](../CHANGELOG.md), в документах `docs/` по отдельным механизмам и в отчётах `benches/results/`.
+Срез: **2026-11-15**, коммит `58444cf6e` (релиз 0.7.1) плюс незакоммиченное рабочее дерево. Единственный файл с планом в репозитории: в нём только несделанное. Реализованное описано в [CHANGELOG](../CHANGELOG.md), в документах `docs/` по отдельным механизмам и в отчётах `benches/results/`.
 
-Открыто **1565** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
+Открыто **1563** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровывались, поэтому в них есть пропуски: закрытые пункты удалены. Пункты части II со статусами `candidate` и `qualification` по коду поштучно не сверялись: перед взятием пункта сначала проверить, не покрыт ли он уже.
 
 ## Часть I. Производительность и OLAP-контур
 
-Пункты сверены с рабочим деревом 2026-11-14. В каждом оставлена только несделанная часть.
+Пункты сверены с рабочим деревом 2026-11-15. В каждом оставлена только несделанная часть.
 
 ### 1. Что сдерживает универсальный OLAP
 
 - In-memory SoA захардкожен под встроенные коллекции (`docs`, `orders`, `users`, `facts`); пользовательские коллекции в памяти хранятся построчно в `Vec<Row>`.
 - Текстовые колонки `RecordBatch` хранятся как `Vec<Cell>`; ядра исполнителя не используют плотные типизированные буферы.
 - Сложные многошаговые аналитические цепочки откатываются на материализацию `Vec<Row>`.
-- В шагах агрегации (`src/ast.rs`) вычисляется одна метрика за шаг и поддерживается группировка только по одному полю (`by: Option<Field>`).
 
 ### 2. Приоритет 1 — `DiskEngine` и холодный уровень
 
@@ -23,9 +22,9 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 - **Проблема:** `insert` больше 1 048 576 строк, `insert` с NaN в уникальном ключе либо в `docs` без текстового `uri` по-прежнему вызывают `promote_disk_col` / `collection_mut`. Это корректно, но поднимает коллекцию в память. Непустого графа HNSW над коллекцией на диске не бывает: после чекпойнта поднятая коллекция остаётся в памяти до конца сессии, а после переоткрытия граф пуст (проверено в `cold_dml_with_vector_index_keeps_search_complete`).
 - **Решение:** вставку больше 1 048 576 строк дробить на несколько записей WAL одной транзакцией; NaN в уникальном ключе и `docs` без текстового `uri` оставить на общем пути, пока нет пользовательского сценария.
 
-#### P1.2. Замер частичной компиляции предиката, кэш на индексном пути, отсечение по словарю
-- **Проблема:** выигрыш от частичной компиляции предиката (`SegPred::Slow`), отсечения блоков под `not` / `!=` / `is null` и позднего декодинга на индексном пути не замерен. Индексный поиск с остаточным предикатом и выводом шире предиката (`DiskEngine::index_eq_late`) не использует кэш повторных запросов `hot_cache`. Zone map не отсекает блоки по словарным колонкам: для них не хранится набор кодов на блок.
-- **Решение:** замер `cold_*` с текстовым и regex-условием в предикате на свободной машине; по его итогам решить, нужен ли кэш кандидатов для `index_eq_late`; при добавлении набора кодов словаря на блок (новый файл рядом с `.zmap`) поднять `DISK_FORMAT_VERSION` и добавить сценарий на новую возможность в `examples/format_compat.rs` (workflow `format-compat` проверен в CI, run `43633283121` зелёный).
+#### P1.2. Замер частичной компиляции предиката, `.tgram` / `DictZoneMap` и кэш на индексном пути
+- **Проблема:** `DictZoneMap` (битовые наборы словарных кодов на блок в памяти), опциональный 4096-битный Bloom-фильтр триграмм (`col_<name>.tgram` без повышения `DISK_FORMAT_VERSION`) и `O(1)`-удаление 100%-мёртвых сегментов на `checkpoint` / `vacuum` (при отсутствии активного `savepoint`) уже реализованы и проверены тестами, но чистый выигрыш от частичной компиляции предиката (`SegPred::Slow`), `.tgram`, отсечения блоков по словарю и позднего декодинга на индексном пути не замерен на свободной машине. Индексный поиск с остаточным предикатом и выводом шире предиката (`DiskEngine::index_eq_late`) не использует кэш повторных запросов `hot_cache`.
+- **Решение:** замер `cold_*` с текстовым, словарным и regex-условием в предикате на свободной машине; по его итогам решить, нужен ли кэш кандидатов для `index_eq_late`.
 
 ### 3. Приоритет 2 — Архитектурные рычаги
 
@@ -84,7 +83,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | Пункт | Сложность | Ожидаемый эффект | Целевые бенчмарки / проверки |
 |---|---|---|---|
 | **P1.0** Zero-promote DML: HNSW, смена `id`, рёбра в транзакции | Средняя | Нет загрузки таблицы в RAM на оставшихся видах DML | cold rollback/WAL tests, `cold_update_1row_10k`, `cold_delete_1row_10k` |
-| **P1.2** Замер частичной компиляции, кэш для `index_eq_late`, отсечение по словарю | Средняя | Подтверждённый выигрыш на тексте и regex в предикате | `cargo test --test cold_pred`, `cold_range_project`, сканы по Zstd-тексту |
+| **P1.2** Замер частичной компиляции, `.tgram` / `DictZoneMap` и кэша для `index_eq_late` | Средняя | Подтверждённый выигрыш на тексте и regex в предикате | `cargo test --test cold_pred`, `cold_range_project`, сканы по Zstd-тексту |
 | **P2.1** Позиции полей в `Prepared`, ленивые курсоры, проекции по готовой схеме | Высокая | Меньше поисков по имени на общих запросах, join, window, DML | Вся матрица `cargo bench --bench compare` |
 | **P2.2** Текстовые и словарные колонки, динамический SoA, батчевые `agg` / `sort` | Высокая | SIMD-векторизация сквозь `filter \| join \| agg \| sort` | `join_inner`, `join_filter`, `agg_sum*`, `run_batch` |
 | **P3.1** `parallel` по умолчанию, битовая точность сумм | Низкая | Скейл по ядрам без явного флага сборки | `agg_sum_by`, `count_by` при `LIN_BENCH_N >= 100000`, `--features parallel` |
@@ -97,7 +96,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 ### 7. Бенчмарки `cold_*` и приёмка
 
-- В `benches/compare.rs` (тег `.tag("cold")`) не хватает варианта `cold_update_1row` / `cold_delete_1row` с одинаковой для обоих движков семантикой sync (сейчас SQLite использует обычный `fsync`, Lin — `F_FULLFSYNC`, и Lin проигрывает в 2,5–3 раза) и DuckDB в качестве третьего peer.
+- В `benches/compare.rs` (тег `.tag("cold")`) `cold_update_1row_10k` и `cold_delete_1row_10k` теперь покрывают `lin` (`Prepared`), `sqlite` (по умолчанию `fullfsync = OFF`, обычный `fsync(2)` без drive barrier — на Darwin `Lin` с `F_BARRIERFSYNC` медленнее на одиночном cold-коммите примерно в 3–4 раза), `sqlite_fullfsync` (`PRAGMA fullfsync = ON`, где `Lin` быстрее примерно в 15 раз) и `duckdb`.
 - Причина разброса `cold_join_inner` между прогонами (681 и 775–825 мкс) не установлена.
 - Приёмочного замера `cold_*` по [контракту бенчмарков](benchmark-contract.md) (чередующиеся process-pairs) нет, есть только быстрый профиль.
 - Финальная приёмка: `cargo check --all-targets` (`0` предупреждений), `cargo test --release` (`100%` pass), превосходство Lin `>= 5%` над SQLite и DuckDB на всех сравнительных бенчмарках и успешный проход `AIRBUG_HUB="" ./scripts/ci-bench.sh` (`scripts/check-bench-budget.py` exit `0`).
@@ -192,9 +191,9 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 Для каждой строки итоговый критерий — её конкретный результат плюс указанный gate. Если критерий требует недоступной платформы/endpoint, статус остаётся непроверенным; mock/compile не заменяет live qualification.
 
-### Приоритетный список — 1590 пунктов
+### Приоритетный список — 1563 пунктов
 
-Количества: P1: 3, P2: 988, P3: 574; статусы: blocked_external: 1, candidate: 934, qualification: 630.
+Количества: P1: 3, P2: 987, P3: 573; статусы: blocked_external: 1, candidate: 934, qualification: 628.
 
 #### P1: 3 пунктов
 
@@ -204,7 +203,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 2 | LIN-0002 | [D01](#d01) | Закрыть durable 1k SQLite gap | PERF | qualification | M | G-PERF |
 | 22 | LIN-0006 | [D01](#d01) | Получить тестовый endpoint Kusto | OPS | blocked_external | M | G-OPS |
 
-#### P2: 988 пунктов
+#### P2: 987 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -302,7 +301,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 258 | LIN-0174 | [D05](#d05) | Измерить section-local compression | PERF | candidate | M | G-PERF |
 | 259 | LIN-0175 | [D05](#d05) | Измерить parallel snapshot sections | PERF | candidate | M | G-PERF |
 | 264 | LIN-0180 | [D05](#d05) | Проверить parent directory persistence | CORRECTNESS | qualification | S | G-CORRECT |
-| 267 | LIN-0183 | [D05](#d05) | Проверить snapshot derived indexes policy | CORRECTNESS | qualification | S | G-CORRECT |
 | 276 | LIN-0212 | [D06](#d06) | Проверить rollback после allocator failure | CORRECTNESS | qualification | S | G-CORRECT |
 | 279 | LIN-0215 | [D06](#d06) | Измерить rollback work amplification | PERF | candidate | M | G-PERF |
 | 280 | LIN-0216 | [D06](#d06) | Измерить journal clone elimination | PERF | candidate | M | G-PERF |
@@ -1197,7 +1195,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 1399 | LIN-1971 | [D50](#d50) | Описать replication version compatibility | DOC | candidate | S | G-DOC |
 | 1400 | LIN-1972 | [D50](#d50) | Описать downgrade support boundaries | DOC | candidate | S | G-DOC |
 
-#### P3: 574 пунктов
+#### P3: 573 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -1213,7 +1211,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 1410 | LIN-0194 | [D05](#d05) | Сравнить snapshot encode chunk sizes | PERF | candidate | M | G-PERF |
 | 1412 | LIN-0196 | [D05](#d05) | Сравнить dictionary text snapshots | PERF | candidate | M | G-PERF |
 | 1413 | LIN-0197 | [D05](#d05) | Проверить snapshot disk quota | CORRECTNESS | qualification | S | G-CORRECT |
-| 1414 | LIN-0198 | [D05](#d05) | Проверить snapshot corruption isolation | CORRECTNESS | qualification | S | G-CORRECT |
 | 1415 | LIN-0199 | [D05](#d05) | Проверить cross-version snapshot corpus | VERIFY | qualification | S | G-VERIFY |
 | 1416 | LIN-0200 | [D05](#d05) | Проверить checkpoint restart idempotence | CORRECTNESS | qualification | S | G-CORRECT |
 | 1417 | LIN-0345 | [D09](#d09) | Проверить clone_for_borrow contract | CORRECTNESS | qualification | S | G-CORRECT |
@@ -1798,7 +1795,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 <a id="d05"></a>
 
-**D05. Snapshot и checkpoint** — открыто 34 из 40. Модули: [src/persist/mod.rs](../src/persist/mod.rs), [src/store/mod.rs](../src/store/mod.rs), [src/disk/mod.rs](../src/disk/mod.rs). Контекст: [D02](#d02), [D03](#d03), [D04](#d04).
+**D05. Snapshot и checkpoint** — открыто 23 из 40. Модули: [src/persist/mod.rs](../src/persist/mod.rs), [src/store/mod.rs](../src/store/mod.rs), [src/disk/mod.rs](../src/disk/mod.rs). Контекст: [D02](#d02), [D03](#d03), [D04](#d04).
 
 <a id="d06"></a>
 

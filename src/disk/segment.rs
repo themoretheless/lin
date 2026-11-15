@@ -466,6 +466,8 @@ fn write_single_column(
             let mut cur_bdat_len: u64 = 0;
             let mut cur_block = Vec::with_capacity(TEXT_BLOCK_TARGET_BYTES + 4096);
             let mut cur_block_idx: u32 = 0;
+            let mut cur_tgram: super::columns::TgramBlock = [0u64; super::columns::TGRAM_WORDS];
+            let mut tgram_blocks: Vec<super::columns::TgramBlock> = Vec::new();
 
             #[cfg(feature = "compress-zstd")]
             let mut zstd_comp = zstd::bulk::Compressor::new(1).ok();
@@ -475,7 +477,9 @@ fn write_single_column(
                                    bdat: &mut BufWriter<File>,
                                    cur_len: &mut u64,
                                    boffs: &mut Vec<u64>,
-                                   bidx: &mut u32|
+                                   bidx: &mut u32,
+                                   tgram: &mut super::columns::TgramBlock,
+                                   tgrams: &mut Vec<super::columns::TgramBlock>|
              -> Result<(), Error> {
                 if raw.is_empty() {
                     return Ok(());
@@ -510,6 +514,10 @@ fn write_single_column(
                 bdat.write_all(&encoded).map_err(io_err)?;
                 *cur_len += encoded.len() as u64;
                 boffs.push(*cur_len);
+                tgrams.push(std::mem::replace(
+                    tgram,
+                    [0u64; super::columns::TGRAM_WORDS],
+                ));
                 raw.clear();
                 *bidx += 1;
                 Ok(())
@@ -534,8 +542,11 @@ fn write_single_column(
                                 &mut cur_bdat_len,
                                 &mut block_offsets,
                                 &mut cur_block_idx,
+                                &mut cur_tgram,
+                                &mut tgram_blocks,
                             )?;
                         }
+                        super::columns::add_str_trigrams(&mut cur_tgram, s);
                         let in_off = cur_block.len() as u32;
                         let blen = sb.len() as u32;
                         cur_block.extend_from_slice(sb);
@@ -552,6 +563,8 @@ fn write_single_column(
                 &mut cur_bdat_len,
                 &mut block_offsets,
                 &mut cur_block_idx,
+                &mut cur_tgram,
+                &mut tgram_blocks,
             )?;
             bdat_file.flush().map_err(io_err)?;
 
@@ -561,6 +574,9 @@ fn write_single_column(
             }
             fs::write(seg_dir.join(format!("col_{}.loc", col.name)), &loc_bytes).map_err(io_err)?;
             fs::write(seg_dir.join(format!("col_{}.boff", col.name)), &boff_bytes)
+                .map_err(io_err)?;
+            let tgram_bytes = super::columns::encode_tgram(&tgram_blocks);
+            fs::write(seg_dir.join(format!("col_{}.tgram", col.name)), &tgram_bytes)
                 .map_err(io_err)?;
             Ok(DiskColKind::TextZstd)
         }

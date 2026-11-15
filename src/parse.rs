@@ -707,6 +707,20 @@ impl<'a> Parser<'a> {
             }
             return Ok(Step::Project(self.parse_field_list()?));
         }
+        if self.eat_kw("without") {
+            self.skip();
+            if self.peek() == Some('{') {
+                let fields = self.parse_delimited(
+                    '{',
+                    '}',
+                    "expected `,` or `}` in without",
+                    Some("without requires at least one field"),
+                    Self::parse_field,
+                )?;
+                return Ok(Step::Without(fields));
+            }
+            return Ok(Step::Without(self.parse_field_list()?));
+        }
         if self.eat_kw("join") {
             let left = self.eat_kw("left");
             let collection = self.expect_ident()?;
@@ -741,28 +755,75 @@ impl<'a> Parser<'a> {
             return Ok(Step::Search { mode, query });
         }
         if self.eat_kw("count") {
-            let by = if self.eat_kw("by") {
-                Some(self.parse_field()?)
-            } else {
-                None
-            };
-            return Ok(Step::Count { by });
+            if self.eat_char('(') {
+                self.expect_char(')')?;
+            }
+            let by = self.parse_opt_by_keys()?;
+            if let Some(simple) = simple_by_field(&by) {
+                return Ok(Step::Count { by: simple });
+            }
+            return Ok(Step::Summarize {
+                specs: vec![AggSpec {
+                    alias: "hits".into(),
+                    func: AggFunc::Count,
+                }],
+                by,
+            });
         }
         if self.eat_kw("sum") {
-            let (field, by) = self.parse_agg_field_by()?;
-            return Ok(Step::Sum { field, by });
+            return self.parse_single_agg_step("total", AggFunc::Sum, |field, by| Step::Sum {
+                field,
+                by,
+            });
         }
         if self.eat_kw("min") {
-            let (field, by) = self.parse_agg_field_by()?;
-            return Ok(Step::Min { field, by });
+            return self.parse_single_agg_step("min", AggFunc::Min, |field, by| Step::Min {
+                field,
+                by,
+            });
         }
         if self.eat_kw("max") {
-            let (field, by) = self.parse_agg_field_by()?;
-            return Ok(Step::Max { field, by });
+            return self.parse_single_agg_step("max", AggFunc::Max, |field, by| Step::Max {
+                field,
+                by,
+            });
         }
         if self.eat_kw("avg") {
-            let (field, by) = self.parse_agg_field_by()?;
-            return Ok(Step::Avg { field, by });
+            return self.parse_single_agg_step("avg", AggFunc::Avg, |field, by| Step::Avg {
+                field,
+                by,
+            });
+        }
+        if self.eat_kw("dcount") {
+            let field = self.parse_window_field_arg()?;
+            let by = self.parse_opt_by_keys()?;
+            return Ok(Step::Summarize {
+                specs: vec![AggSpec {
+                    alias: "dcount".into(),
+                    func: AggFunc::DCount(field),
+                }],
+                by,
+            });
+        }
+        if self.eat_kw("percentile") {
+            let (field, pct) = self.parse_percentile_args()?;
+            let by = self.parse_opt_by_keys()?;
+            return Ok(Step::Summarize {
+                specs: vec![AggSpec {
+                    alias: default_pct_alias(pct),
+                    func: AggFunc::Percentile { field, pct },
+                }],
+                by,
+            });
+        }
+        if self.eat_kw("arg_max") {
+            return self.parse_arg_extremum_step(true);
+        }
+        if self.eat_kw("arg_min") {
+            return self.parse_arg_extremum_step(false);
+        }
+        if self.eat_kw("summarize") {
+            return self.parse_summarize_step();
         }
         if self.eat_kw("sort") {
             let field = self.parse_field()?;
@@ -831,14 +892,244 @@ impl<'a> Parser<'a> {
         Ok((rel, depth))
     }
 
-    fn parse_agg_field_by(&mut self) -> Result<(Field, Option<Field>), Error> {
-        let field = self.parse_field()?;
-        let by = if self.eat_kw("by") {
-            Some(self.parse_field()?)
+    fn parse_single_agg_step(
+        &mut self,
+        default_alias: &str,
+        make_func: impl FnOnce(Field) -> AggFunc,
+        make_legacy: impl FnOnce(Field, Option<Field>) -> Step,
+    ) -> Result<Step, Error> {
+        let field = self.parse_window_field_arg()?;
+        let by = self.parse_opt_by_keys()?;
+        if let Some(simple) = simple_by_field(&by) {
+            return Ok(make_legacy(field, simple));
+        }
+        Ok(Step::Summarize {
+            specs: vec![AggSpec {
+                alias: default_alias.to_string(),
+                func: make_func(field),
+            }],
+            by,
+        })
+    }
+
+    fn parse_opt_by_keys(&mut self) -> Result<Vec<GroupKey>, Error> {
+        if !self.eat_kw("by") {
+            return Ok(Vec::new());
+        }
+        self.skip();
+        if self.peek() == Some('[') {
+            return self.parse_delimited(
+                '[',
+                ']',
+                "expected `,` or `]` in `by` list",
+                Some("`by [...]` requires at least one key"),
+                Self::parse_group_key,
+            );
+        }
+        let mut keys = vec![self.parse_group_key()?];
+        while self.eat_char(',') {
+            keys.push(self.parse_group_key()?);
+        }
+        Ok(keys)
+    }
+
+    fn parse_group_key(&mut self) -> Result<GroupKey, Error> {
+        let save_alias = self.pos;
+        let explicit_alias = if let Some(id) = self.eat_ident_str() {
+            let id = id.to_owned();
+            if self.eat_char(':') {
+                Some(id)
+            } else {
+                self.pos = save_alias;
+                None
+            }
         } else {
+            self.pos = save_alias;
             None
         };
-        Ok((field, by))
+
+        let save_bin = self.pos;
+        if self.eat_kw("bin") && self.eat_char('(') {
+            let field = self.parse_field()?;
+            self.expect_char(',')?;
+            let step = self.parse_bin_step()?;
+            self.expect_char(')')?;
+            let alias = explicit_alias.unwrap_or_else(|| field.as_str());
+            return Ok(GroupKey::bin(alias, field, step));
+        }
+        self.pos = save_bin;
+        let field = self.parse_field()?;
+        let alias = explicit_alias.unwrap_or_else(|| field.as_str());
+        Ok(GroupKey {
+            alias,
+            expr: GroupExpr::Field(field),
+        })
+    }
+
+    fn parse_bin_step(&mut self) -> Result<BinStep, Error> {
+        self.skip();
+        match self.try_number()? {
+            Some(Value::Duration(d)) => Ok(BinStep::Duration(d.as_millis())),
+            Some(Value::Int(n)) => Ok(BinStep::Int(n)),
+            Some(Value::Float(f)) => Ok(BinStep::Float(f)),
+            _ => Err(self.err("expected positive duration (e.g. 1h, 5m) or number for bin step")),
+        }
+    }
+
+    fn expect_f64(&mut self) -> Result<f64, Error> {
+        self.skip();
+        match self.try_number()? {
+            Some(Value::Int(n)) => Ok(n as f64),
+            Some(Value::Float(f)) => Ok(f),
+            Some(Value::Duration(_)) => Err(self.err("expected number, got duration")),
+            _ => Err(self.err("expected number")),
+        }
+    }
+
+    fn parse_percentile_args(&mut self) -> Result<(Field, f64), Error> {
+        if self.eat_char('(') {
+            let field = self.parse_field()?;
+            self.expect_char(',')?;
+            let pct = self.expect_f64()?;
+            self.expect_char(')')?;
+            Ok((field, pct))
+        } else {
+            let field = self.parse_field()?;
+            let _ = self.eat_char(',');
+            let pct = self.expect_f64()?;
+            Ok((field, pct))
+        }
+    }
+
+    fn parse_arg_extremum_step(&mut self, is_max: bool) -> Result<Step, Error> {
+        if self.eat_char('(') {
+            let order = self.parse_field()?;
+            self.expect_char(',')?;
+            if self.eat_char('*') {
+                self.expect_char(')')?;
+                let by = self.parse_opt_by_keys()?;
+                return Ok(Step::ArgExtremum { is_max, order, by });
+            }
+            let value = self.parse_field()?;
+            self.expect_char(')')?;
+            let by = self.parse_opt_by_keys()?;
+            let alias = value.as_str();
+            let func = if is_max {
+                AggFunc::ArgMax { order, value }
+            } else {
+                AggFunc::ArgMin { order, value }
+            };
+            return Ok(Step::Summarize {
+                specs: vec![AggSpec { alias, func }],
+                by,
+            });
+        }
+        let order = self.parse_field()?;
+        let by = self.parse_opt_by_keys()?;
+        Ok(Step::ArgExtremum { is_max, order, by })
+    }
+
+    fn parse_summarize_step(&mut self) -> Result<Step, Error> {
+        self.skip();
+        let specs = if self.peek() == Some('{') {
+            self.parse_delimited(
+                '{',
+                '}',
+                "expected `,` or `}` in summarize",
+                Some("summarize requires at least one metric"),
+                Self::parse_agg_spec,
+            )?
+        } else {
+            let mut list = vec![self.parse_agg_spec()?];
+            while self.eat_char(',') {
+                list.push(self.parse_agg_spec()?);
+            }
+            list
+        };
+        let by = self.parse_opt_by_keys()?;
+        Ok(Step::Summarize { specs, by })
+    }
+
+    fn parse_agg_spec(&mut self) -> Result<AggSpec, Error> {
+        let save_alias = self.pos;
+        let explicit_alias = if let Some(id) = self.eat_ident_str() {
+            let id = id.to_owned();
+            if self.eat_char(':') {
+                Some(id)
+            } else {
+                self.pos = save_alias;
+                None
+            }
+        } else {
+            self.pos = save_alias;
+            None
+        };
+
+        let func_name = self.expect_ident_str()?;
+        let (default_alias, func) = if func_name == "count" {
+            if self.eat_char('(') {
+                if !self.eat_char(')') {
+                    return Err(self.err("`count()` in summarize takes no arguments (use `dcount field` for distinct count)"));
+                }
+            }
+            ("hits".to_string(), AggFunc::Count)
+        } else if func_name == "sum" {
+            let f = self.parse_window_field_arg()?;
+            ("total".to_string(), AggFunc::Sum(f))
+        } else if func_name == "avg" {
+            let f = self.parse_window_field_arg()?;
+            ("avg".to_string(), AggFunc::Avg(f))
+        } else if func_name == "min" {
+            let f = self.parse_window_field_arg()?;
+            ("min".to_string(), AggFunc::Min(f))
+        } else if func_name == "max" {
+            let f = self.parse_window_field_arg()?;
+            ("max".to_string(), AggFunc::Max(f))
+        } else if func_name == "dcount" {
+            let f = self.parse_window_field_arg()?;
+            ("dcount".to_string(), AggFunc::DCount(f))
+        } else if func_name == "percentile" {
+            let (f, pct) = self.parse_percentile_args()?;
+            (
+                default_pct_alias(pct),
+                AggFunc::Percentile { field: f, pct },
+            )
+        } else if func_name == "arg_max" || func_name == "arg_min" {
+            let is_max = func_name == "arg_max";
+            let (order, value) = if self.eat_char('(') {
+                let ord = self.parse_field()?;
+                self.expect_char(',')?;
+                if self.eat_char('*') {
+                    return Err(self.err(
+                        "use top-level `arg_max field [by ...]` for whole-row `*` selection, or specify a column: `arg_max(order, field)`",
+                    ));
+                }
+                let val = self.parse_field()?;
+                self.expect_char(')')?;
+                (ord, val)
+            } else {
+                let ord = self.parse_field()?;
+                let _ = self.eat_char(',');
+                let val = self.parse_field()?;
+                (ord, val)
+            };
+            let def = value.as_str();
+            let func = if is_max {
+                AggFunc::ArgMax { order, value }
+            } else {
+                AggFunc::ArgMin { order, value }
+            };
+            (def, func)
+        } else {
+            return Err(self.err(format!(
+                "unknown summarize metric `{func_name}`; supported: count, sum, avg, min, max, dcount, percentile, arg_max, arg_min"
+            )));
+        };
+
+        Ok(AggSpec {
+            alias: explicit_alias.unwrap_or(default_alias),
+            func,
+        })
     }
 
     fn parse_window_field_arg(&mut self) -> Result<Field, Error> {
@@ -1834,21 +2125,44 @@ fn is_ident_continue(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
 }
 
+fn simple_by_field(by: &[GroupKey]) -> Option<Option<Field>> {
+    if by.is_empty() {
+        Some(None)
+    } else if by.len() == 1
+        && let GroupExpr::Field(f) = &by[0].expr
+        && by[0].alias == f.as_str()
+    {
+        Some(Some(f.clone()))
+    } else {
+        None
+    }
+}
+
+fn default_pct_alias(pct: f64) -> String {
+    AggFunc::default_percentile_alias(pct)
+}
+
 fn is_step_keyword(s: &str) -> bool {
     matches!(
         s,
         "where"
             | "pick"
+            | "without"
             | "join"
             | "hop"
             | "graph"
             | "match"
             | "search"
+            | "summarize"
             | "count"
             | "sum"
             | "min"
             | "max"
             | "avg"
+            | "dcount"
+            | "percentile"
+            | "arg_max"
+            | "arg_min"
             | "sort"
             | "skip"
             | "offset"

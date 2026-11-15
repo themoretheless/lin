@@ -77,6 +77,19 @@ impl Validity {
         }
         *self = out;
     }
+
+    fn extend(&mut self, other: &Validity) {
+        if other.len == 0 {
+            return;
+        }
+        if self.nulls == 0 && other.nulls == 0 {
+            self.len += other.len;
+            return;
+        }
+        for i in 0..other.len {
+            self.push(other.is_valid(i));
+        }
+    }
 }
 
 /// One column of a [`RecordBatch`].
@@ -350,12 +363,41 @@ impl Column {
 
     /// Append every value of `other`.
     pub fn extend(&mut self, other: Column) {
+        if other.is_empty() {
+            return;
+        }
         if self.is_empty() && !matches!(self, Column::Cells(_)) {
+            let want_cap = match self {
+                Column::Nulls { cap, .. } => *cap,
+                _ => 0,
+            };
             *self = other;
+            if want_cap > self.len() {
+                self.reserve(want_cap - self.len());
+            }
             return;
         }
         match (&mut *self, other) {
             (Column::Cells(a), Column::Cells(b)) => a.extend(b),
+            (Column::Int { vals: a, valid: va }, Column::Int { vals: b, valid: vb })
+            | (Column::Time { vals: a, valid: va }, Column::Time { vals: b, valid: vb }) => {
+                va.extend(&vb);
+                a.extend(b);
+            }
+            (Column::Float { vals: a, valid: va }, Column::Float { vals: b, valid: vb }) => {
+                va.extend(&vb);
+                a.extend(b);
+            }
+            (Column::Bool { vals: a, valid: va }, Column::Bool { vals: b, valid: vb }) => {
+                va.extend(&vb);
+                a.extend(b);
+            }
+            (_, Column::Nulls { n, .. }) => {
+                self.reserve(n);
+                for _ in 0..n {
+                    self.push(Cell::Null);
+                }
+            }
             (_, other) => {
                 self.reserve(other.len());
                 for cell in other.into_cells() {

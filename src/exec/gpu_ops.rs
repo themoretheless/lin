@@ -135,18 +135,27 @@ fn gpu_comparison_record(left: &Cell, right: &Cell, _op: CmpOp) -> [u32; 5] {
             bits ^ (1u64 << 63)
         }
     };
+    let ord_pair = |ord: std::cmp::Ordering| match ord {
+        std::cmp::Ordering::Less => (0u64, 1u64),
+        std::cmp::Ordering::Equal => (1u64, 1u64),
+        std::cmp::Ordering::Greater => (2u64, 1u64),
+    };
     let keys = match (left, right) {
         (Cell::Bool(a), Cell::Bool(b)) => Some((*a as u64, *b as u64)),
         (Cell::Int(a), Cell::Int(b)) | (Cell::Time(a), Cell::Time(b)) => {
             Some((integer_key(*a), integer_key(*b)))
         }
-        (Cell::Float(_), Cell::Float(_))
-        | (Cell::Float(_), Cell::Int(_))
-        | (Cell::Int(_), Cell::Float(_)) => left
-            .as_f64()
-            .zip(right.as_f64())
-            .filter(|(a, b)| !a.is_nan() && !b.is_nan())
-            .map(|(a, b)| (float_key(a), float_key(b))),
+        (Cell::Float(a), Cell::Float(b)) => {
+            (!a.is_nan() && !b.is_nan()).then(|| (float_key(*a), float_key(*b)))
+        }
+        (Cell::Int(i) | Cell::Time(i), Cell::Float(f)) => {
+            super::eval::cmp_i64_f64(*i, *f).map(ord_pair)
+        }
+        (Cell::Float(f), Cell::Int(i) | Cell::Time(i)) => {
+            super::eval::cmp_i64_f64(*i, *f)
+                .map(std::cmp::Ordering::reverse)
+                .map(ord_pair)
+        }
         _ => None,
     };
     match keys {
@@ -315,7 +324,8 @@ pub(super) fn rows_to_query_batch(rows: &[Row], query: &Query) -> RecordBatch {
     for step in &query.steps {
         match step {
             Step::Project(fields) => projection = Some(field_names(fields)),
-            Step::Join { .. }
+            Step::Without(_)
+            | Step::Join { .. }
             | Step::Hop { .. }
             | Step::Graph { .. }
             | Step::Match { .. }
@@ -324,6 +334,8 @@ pub(super) fn rows_to_query_batch(rows: &[Row], query: &Query) -> RecordBatch {
             | Step::Min { .. }
             | Step::Max { .. }
             | Step::Avg { .. }
+            | Step::Summarize { .. }
+            | Step::ArgExtremum { .. }
             | Step::Union(_) => projection = None,
             _ => {}
         }

@@ -167,10 +167,131 @@ impl std::fmt::Display for MatchHop {
     }
 }
 
+/// Bucket width for [`GroupExpr::Bin`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BinStep {
+    /// Positive millisecond bucket width (for `Type::Time`, e.g. `1m`, `5m`, `1h`, `1d`).
+    Duration(i64),
+    /// Positive integer bucket width (for `Type::I64` or `Type::F64`).
+    Int(i64),
+    /// Positive finite float bucket width (for `Type::I64` or `Type::F64`).
+    Float(f64),
+}
+
+impl Eq for BinStep {}
+
+impl std::hash::Hash for BinStep {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            BinStep::Duration(n) | BinStep::Int(n) => n.hash(state),
+            BinStep::Float(f) => {
+                let bits = if *f == 0.0 { 0u64 } else { f.to_bits() };
+                bits.hash(state);
+            }
+        }
+    }
+}
+
+/// Grouping expression in `summarize` or `arg_max`/`arg_min`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum GroupExpr {
+    Field(Field),
+    Bin { field: Field, step: BinStep },
+}
+
+/// Output group key (column name + grouping expression).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct GroupKey {
+    /// Output column name in the grouped result (defaults to `field.as_str()` when omitted).
+    pub alias: String,
+    pub expr: GroupExpr,
+}
+
+impl GroupKey {
+    pub fn field(field: Field) -> Self {
+        Self {
+            alias: field.as_str(),
+            expr: GroupExpr::Field(field),
+        }
+    }
+
+    pub fn bin(alias: impl Into<String>, field: Field, step: BinStep) -> Self {
+        Self {
+            alias: alias.into(),
+            expr: GroupExpr::Bin { field, step },
+        }
+    }
+
+    pub fn source_field(&self) -> &Field {
+        match &self.expr {
+            GroupExpr::Field(f) | GroupExpr::Bin { field: f, .. } => f,
+        }
+    }
+}
+
+/// Aggregate metric function inside [`Step::Summarize`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum AggFunc {
+    Count,
+    Sum(Field),
+    Avg(Field),
+    Min(Field),
+    Max(Field),
+    DCount(Field),
+    Percentile { field: Field, pct: f64 },
+    ArgMax { order: Field, value: Field },
+    ArgMin { order: Field, value: Field },
+}
+
+impl Eq for AggFunc {}
+
+impl std::hash::Hash for AggFunc {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            AggFunc::Count => {}
+            AggFunc::Sum(f)
+            | AggFunc::Avg(f)
+            | AggFunc::Min(f)
+            | AggFunc::Max(f)
+            | AggFunc::DCount(f) => f.hash(state),
+            AggFunc::Percentile { field, pct } => {
+                field.hash(state);
+                let bits = if *pct == 0.0 { 0u64 } else { pct.to_bits() };
+                bits.hash(state);
+            }
+            AggFunc::ArgMax { order, value } | AggFunc::ArgMin { order, value } => {
+                order.hash(state);
+                value.hash(state);
+            }
+        }
+    }
+}
+
+impl AggFunc {
+    pub fn default_percentile_alias(pct: f64) -> String {
+        if pct.is_finite() && (0.0..=100.0).contains(&pct) && pct.fract() == 0.0 {
+            format!("p{}", pct as u64)
+        } else {
+            "percentile".to_string()
+        }
+    }
+}
+
+/// One named output metric inside [`Step::Summarize`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AggSpec {
+    pub alias: String,
+    pub func: AggFunc,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Step {
     Filter(Pred),
     Project(Vec<Field>),
+    /// Excluding projection (`without { a, b }` / `without a, b`): keeps all remaining fields.
+    Without(Vec<Field>),
     Join {
         left: bool,
         collection: String,
@@ -214,6 +335,17 @@ pub enum Step {
     Avg {
         field: Field,
         by: Option<Field>,
+    },
+    /// Multi-metric / multi-key / binned / sketch aggregation (`summarize ... [by ...]`).
+    Summarize {
+        specs: Vec<AggSpec>,
+        by: Vec<GroupKey>,
+    },
+    /// Whole-row arg-extremum per group (`arg_max ts [by ...]` / `arg_min ts [by ...]`).
+    ArgExtremum {
+        is_max: bool,
+        order: Field,
+        by: Vec<GroupKey>,
     },
     Sort {
         field: Field,
@@ -872,7 +1004,7 @@ impl Step {
         let mut bytes = std::mem::size_of::<Self>();
         match self {
             Step::Filter(p) => bytes += p.estimate_bytes(),
-            Step::Project(fields) => {
+            Step::Project(fields) | Step::Without(fields) => {
                 for f in fields {
                     bytes += f.estimate_bytes();
                 }
@@ -899,6 +1031,20 @@ impl Step {
                 bytes += field.estimate_bytes();
                 if let Some(b) = by {
                     bytes += b.estimate_bytes();
+                }
+            }
+            Step::Summarize { specs, by } => {
+                for s in specs {
+                    bytes += s.alias.len() + std::mem::size_of::<AggSpec>();
+                }
+                for g in by {
+                    bytes += g.alias.len() + g.source_field().estimate_bytes();
+                }
+            }
+            Step::ArgExtremum { order, by, .. } => {
+                bytes += order.estimate_bytes();
+                for g in by {
+                    bytes += g.alias.len() + g.source_field().estimate_bytes();
                 }
             }
             Step::Search { query, .. } => bytes += query.len(),

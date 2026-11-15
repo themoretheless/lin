@@ -1864,7 +1864,6 @@ impl Db {
         };
 
         let names_arc: Arc<[String]> = names.to_vec().into();
-        let mut batch = RecordBatch::with_capacity(names_arc.clone(), n);
 
         let fast_id_email_total = plan.len() == 3
             && matches!(plan[0], JoinFieldPlan::Left(ref k) if k == "id")
@@ -1880,12 +1879,12 @@ impl Db {
             JoinLeftSource::Scan { len } => *len,
         };
 
-        if left_len >= 8192 {
+        if left_len >= super::agg::PAR_AGG_MIN_ROWS {
             let threads = std::thread::available_parallelism()
                 .map(|p| p.get())
                 .unwrap_or(1)
                 .min(8)
-                .min(left_len.div_ceil(2048));
+                .min(left_len.div_ceil(super::agg::PAR_AGG_CHUNK_ROWS.max(8192)));
             if threads > 1 {
                 let chunk_size = left_len.div_ceil(threads);
                 let thread_batches: Vec<RecordBatch> = std::thread::scope(|scope| {
@@ -2028,10 +2027,13 @@ impl Db {
             }
         }
 
+        let mut batch = RecordBatch::with_capacity(names_arc, left_len);
         let mut slots = filter.map(super::eval::PredSlots::new);
         let mut total_slot = crate::store::row::FieldSlot::new("total");
         let mut pos = 0usize;
         if fast_id_email_total {
+            let mut col0 = Vec::with_capacity(left_len);
+            let mut col1 = Vec::with_capacity(left_len);
             loop {
                 let idx = match &source {
                     JoinLeftSource::Idxs(idxs) => {
@@ -2069,15 +2071,19 @@ impl Db {
                 let uid = orders_uid[idx].as_ref();
                 let Some(ui) = lookup_user(uid) else {
                     if left_join {
-                        batch.cols[0].push(Cell::Text(Arc::clone(&orders_id[idx])));
-                        batch.cols[1].push(Cell::Null);
+                        col0.push(Cell::Text(Arc::clone(&orders_id[idx])));
+                        col1.push(Cell::Null);
                         batch.cols[2].push(order_total_cell(&mut total_slot, orders_rows, orders_total, idx));
                     }
                     continue;
                 };
-                batch.cols[0].push(Cell::Text(Arc::clone(&orders_id[idx])));
-                batch.cols[1].push(Cell::Text(Arc::clone(&users_email[ui])));
+                col0.push(Cell::Text(Arc::clone(&orders_id[idx])));
+                col1.push(Cell::Text(Arc::clone(&users_email[ui])));
                 batch.cols[2].push(order_total_cell(&mut total_slot, orders_rows, orders_total, idx));
+            }
+            if !col0.is_empty() {
+                batch.cols[0] = crate::batch::Column::Cells(col0);
+                batch.cols[1] = crate::batch::Column::Cells(col1);
             }
             finish_batch(&mut batch, skip_n, explicit_take);
             return Some(batch);

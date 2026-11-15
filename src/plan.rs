@@ -79,6 +79,9 @@ pub enum NodeKind {
     Project {
         fields: Vec<String>,
     },
+    Without {
+        fields: Vec<String>,
+    },
     Join {
         left: bool,
         fk: String,
@@ -189,6 +192,7 @@ impl NodeKind {
             NodeKind::Scan { .. } => "Scan",
             NodeKind::Filter { .. } => "Filter",
             NodeKind::Project { .. } => "Project",
+            NodeKind::Without { .. } => "Without",
             NodeKind::Join { .. } => "Join",
             NodeKind::Hop { .. } => "Hop",
             NodeKind::Graph { .. } => "Graph",
@@ -591,6 +595,38 @@ fn plan_query_inner(q: &Query, cat: &Catalog, allow_implicit_take: bool) -> Resu
                     push_field(&mut needed, &by.as_str());
                 }
             }
+            Step::Summarize { specs, by } => {
+                implicit_take = false;
+                saw_agg = true;
+                for gk in by {
+                    push_field(&mut needed, &gk.source_field().as_str());
+                }
+                for spec in specs {
+                    match &spec.func {
+                        AggFunc::Count => {}
+                        AggFunc::Sum(f)
+                        | AggFunc::Avg(f)
+                        | AggFunc::Min(f)
+                        | AggFunc::Max(f)
+                        | AggFunc::DCount(f)
+                        | AggFunc::Percentile { field: f, .. } => {
+                            push_field(&mut needed, &f.as_str());
+                        }
+                        AggFunc::ArgMax { order, value } | AggFunc::ArgMin { order, value } => {
+                            push_field(&mut needed, &order.as_str());
+                            push_field(&mut needed, &value.as_str());
+                        }
+                    }
+                }
+            }
+            Step::ArgExtremum { order, by, .. } => {
+                implicit_take = false;
+                saw_agg = true;
+                push_field(&mut needed, &order.as_str());
+                for gk in by {
+                    push_field(&mut needed, &gk.source_field().as_str());
+                }
+            }
             Step::Search { mode, .. } => {
                 want_search = true;
                 if matches!(mode, SearchMode::Vec | SearchMode::Hybrid) {
@@ -601,6 +637,16 @@ fn plan_query_inner(q: &Query, cat: &Catalog, allow_implicit_take: bool) -> Resu
                 for f in fields {
                     push_field(&mut picked, &f.as_str());
                     push_field(&mut needed, &f.as_str());
+                }
+            }
+            Step::Without(excluded) => {
+                if let Some(col) = cat.collection(&collection) {
+                    for k in col.fields.keys() {
+                        if !excluded.iter().any(|ex| ex.leaf() == Some(k.as_str())) {
+                            push_field(&mut picked, k);
+                            push_field(&mut needed, k);
+                        }
+                    }
                 }
             }
             Step::Filter(pred) => collect_pred_fields(pred, &mut needed),
@@ -666,6 +712,16 @@ fn plan_query_inner(q: &Query, cat: &Catalog, allow_implicit_take: bool) -> Resu
             Step::Project(fields) => {
                 cur = node(
                     NodeKind::Project {
+                        fields: fields.iter().map(|f| f.as_str()).collect(),
+                    },
+                    Backend::Native,
+                    Effect::Read,
+                    vec![cur],
+                );
+            }
+            Step::Without(fields) => {
+                cur = node(
+                    NodeKind::Without {
                         fields: fields.iter().map(|f| f.as_str()).collect(),
                     },
                     Backend::Native,
@@ -809,6 +865,29 @@ fn plan_query_inner(q: &Query, cat: &Catalog, allow_implicit_take: bool) -> Resu
                             .as_ref()
                             .map(|b| b.as_str())
                             .unwrap_or_else(|| "*".into()),
+                    },
+                    Backend::Native,
+                    Effect::Read,
+                    vec![cur],
+                );
+            }
+            Step::Summarize { specs, by } => {
+                cur = node(
+                    NodeKind::Agg {
+                        op: fmt_summarize_op(specs),
+                        by: fmt_group_keys(by),
+                    },
+                    Backend::Native,
+                    Effect::Read,
+                    vec![cur],
+                );
+            }
+            Step::ArgExtremum { is_max, order, by } => {
+                let name = if *is_max { "arg_max" } else { "arg_min" };
+                cur = node(
+                    NodeKind::Agg {
+                        op: format!("{name}({})", order.as_str()),
+                        by: fmt_group_keys(by),
                     },
                     Backend::Native,
                     Effect::Read,
@@ -1076,6 +1155,50 @@ fn maybe_fts_seek(input: Node, mode: SearchMode, query: &str, cat: &Catalog) -> 
         Effect::Read,
         vec![],
     )
+}
+
+fn fmt_group_keys(by: &[GroupKey]) -> String {
+    if by.is_empty() {
+        return "*".into();
+    }
+    by.iter()
+        .map(|gk| match &gk.expr {
+            GroupExpr::Field(f) => f.as_str(),
+            GroupExpr::Bin { field, step } => {
+                let s = match step {
+                    BinStep::Duration(ms) => format!("{ms}ms"),
+                    BinStep::Int(n) => n.to_string(),
+                    BinStep::Float(f) => f.to_string(),
+                };
+                format!("bin({}, {s})", field.as_str())
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn fmt_summarize_op(specs: &[AggSpec]) -> String {
+    let parts: Vec<String> = specs
+        .iter()
+        .map(|s| match &s.func {
+            AggFunc::Count => "count".into(),
+            AggFunc::Sum(f) => format!("sum({})", f.as_str()),
+            AggFunc::Avg(f) => format!("avg({})", f.as_str()),
+            AggFunc::Min(f) => format!("min({})", f.as_str()),
+            AggFunc::Max(f) => format!("max({})", f.as_str()),
+            AggFunc::DCount(f) => format!("dcount({})", f.as_str()),
+            AggFunc::Percentile { field, pct } => {
+                format!("percentile({}, {pct})", field.as_str())
+            }
+            AggFunc::ArgMax { order, value } => {
+                format!("arg_max({}, {})", order.as_str(), value.as_str())
+            }
+            AggFunc::ArgMin { order, value } => {
+                format!("arg_min({}, {})", order.as_str(), value.as_str())
+            }
+        })
+        .collect();
+    format!("summarize({})", parts.join(", "))
 }
 
 fn scan_cols(

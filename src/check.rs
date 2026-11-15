@@ -390,6 +390,32 @@ fn check_query(q: &Query, cat: &Catalog, env: &Bindings) -> Result<Scope, Error>
                 }
                 scope.replace_fields(next);
             }
+            Step::Without(fields) => {
+                if fields.is_empty() {
+                    return Err(Error::new("without requires at least one field"));
+                }
+                let mut next: BTreeMap<String, Type> = scope
+                    .materialized_fields(cat)
+                    .into_iter()
+                    .map(|(k, ty)| (k.to_string(), ty))
+                    .collect();
+                for f in fields {
+                    let Some(name) = f.leaf() else {
+                        return Err(Error::new(format!(
+                            "without only removes top-level fields: {}",
+                            f.as_str()
+                        )));
+                    };
+                    if require_field(&scope, f, cat).is_err() {
+                        return Err(Error::new(format!("unknown field: {name}")));
+                    }
+                    next.remove(name);
+                }
+                if next.is_empty() {
+                    return Err(Error::new("without cannot remove all fields"));
+                }
+                scope.replace_fields(next);
+            }
             Step::Join { collection, on, .. } => {
                 if cat.collection(collection).is_none() {
                     return Err(Error::new(format!("unknown collection: {collection}")));
@@ -582,6 +608,94 @@ fn check_query(q: &Query, cat: &Catalog, env: &Bindings) -> Result<Scope, Error>
                     None => Scope::agg_total(&scope.primary, Type::F64, &field.as_str()),
                 };
             }
+            Step::Summarize { specs, by } => {
+                if specs.is_empty() {
+                    return Err(Error::new("summarize requires at least one metric"));
+                }
+                let mut out_fields = BTreeMap::new();
+                let mut seen = BTreeSet::new();
+                for gk in by {
+                    let ty = check_group_key(gk, &scope, cat)?;
+                    if !seen.insert(gk.alias.clone()) {
+                        return Err(Error::new(format!(
+                            "duplicate group key alias in summarize: {}",
+                            gk.alias
+                        )));
+                    }
+                    out_fields.insert(gk.alias.clone(), ty);
+                }
+                for spec in specs {
+                    let out_ty = match &spec.func {
+                        AggFunc::Count => Type::I64,
+                        AggFunc::Sum(f) => {
+                            let ty = require_field(&scope, f, cat)?;
+                            if !ty.is_numeric() {
+                                return Err(Error::new(format!(
+                                    "sum requires numeric field, found {}",
+                                    ty.name()
+                                )));
+                            }
+                            if ty == Type::I64 { Type::I64 } else { Type::F64 }
+                        }
+                        AggFunc::Avg(f) => {
+                            let ty = require_field(&scope, f, cat)?;
+                            if !ty.is_numeric() {
+                                return Err(Error::new(format!(
+                                    "avg requires numeric field, found {}",
+                                    ty.name()
+                                )));
+                            }
+                            Type::F64
+                        }
+                        AggFunc::Min(f) | AggFunc::Max(f) => require_field(&scope, f, cat)?,
+                        AggFunc::DCount(f) => {
+                            require_field(&scope, f, cat)?;
+                            Type::I64
+                        }
+                        AggFunc::Percentile { field, pct } => {
+                            if !pct.is_finite() || !(0.0..=100.0).contains(pct) {
+                                return Err(Error::new(
+                                    "percentile target must be between 0 and 100",
+                                ));
+                            }
+                            let ty = require_field(&scope, field, cat)?;
+                            if !ty.is_numeric() {
+                                return Err(Error::new(format!(
+                                    "percentile requires numeric field, found {}",
+                                    ty.name()
+                                )));
+                            }
+                            Type::F64
+                        }
+                        AggFunc::ArgMax { order, value } | AggFunc::ArgMin { order, value } => {
+                            require_field(&scope, order, cat)?;
+                            require_field(&scope, value, cat)?
+                        }
+                    };
+                    if !seen.insert(spec.alias.clone()) {
+                        return Err(Error::new(format!(
+                            "duplicate summarize output field `{}`",
+                            spec.alias
+                        )));
+                    }
+                    out_fields.insert(spec.alias.clone(), out_ty);
+                }
+                scope.replace_fields(out_fields);
+            }
+            Step::ArgExtremum { order, by, .. } => {
+                require_field(&scope, order, cat)?;
+                let mut seen_by = BTreeSet::new();
+                for gk in by {
+                    let gty = check_group_key(gk, &scope, cat)?;
+                    if !seen_by.insert(gk.alias.clone()) {
+                        return Err(Error::new(format!(
+                            "duplicate group key alias in arg_max/arg_min: {}",
+                            gk.alias
+                        )));
+                    }
+                    scope.insert_field(gk.alias.clone(), gty, cat);
+                }
+            }
             Step::Sort { field, .. } => {
                 require_field(&scope, field, cat)?;
             }
@@ -663,6 +777,52 @@ fn check_query(q: &Query, cat: &Catalog, env: &Bindings) -> Result<Scope, Error>
         }
     }
     Ok(scope)
+}
+
+fn check_group_key(gk: &GroupKey, scope: &Scope, cat: &Catalog) -> Result<Type, Error> {
+    match &gk.expr {
+        GroupExpr::Field(f) => require_field(scope, f, cat),
+        GroupExpr::Bin { field, step } => {
+            let fty = require_field(scope, field, cat)?;
+            match (fty, step) {
+                (Type::Time, BinStep::Duration(ms)) => {
+                    if *ms <= 0 {
+                        return Err(Error::new("bin duration step must be positive"));
+                    }
+                    Ok(Type::Time)
+                }
+                (Type::I64, BinStep::Int(n)) => {
+                    if *n <= 0 {
+                        return Err(Error::new("bin step must be positive"));
+                    }
+                    Ok(Type::I64)
+                }
+                (Type::F64, BinStep::Int(n)) => {
+                    if *n <= 0 {
+                        return Err(Error::new("bin step must be positive"));
+                    }
+                    Ok(Type::F64)
+                }
+                (Type::I64 | Type::F64, BinStep::Float(x)) => {
+                    if !x.is_finite() || *x <= 0.0 {
+                        return Err(Error::new("bin step must be positive and finite"));
+                    }
+                    Ok(Type::F64)
+                }
+                (Type::Time, _) => Err(Error::new(
+                    "bin() on a time field requires a positive duration step (e.g. 5m, 1h, 1d)",
+                )),
+                (_, BinStep::Duration(_)) => Err(Error::new(format!(
+                    "bin() with duration step requires a time field, found {}",
+                    fty.name()
+                ))),
+                (other, _) => Err(Error::new(format!(
+                    "bin() requires time or numeric field, found {}",
+                    other.name()
+                ))),
+            }
+        }
+    }
 }
 
 fn check_union_cols(left: &Scope, right: &Scope, cat: &Catalog) -> Result<(), Error> {

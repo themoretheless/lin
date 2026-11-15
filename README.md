@@ -123,6 +123,9 @@ orders | sum total by user_id
 orders | avg total by user_id
 orders | min total by user_id
 orders | max total by user_id
+orders | summarize { n: count, rev: sum total, p95: percentile(total, 95), uniq: dcount user_id } by bin(ts, 1h)
+orders | arg_max ts by user_id
+docs | without { body, embedding }
 employees | window row_number sort salary desc as rnk | rnk <= 10
 employees | window rank by dept sort salary desc as rnk | rnk <= 3
 employees | window dense_rank by [dept, role] sort [salary desc, id asc] as rnk
@@ -178,6 +181,8 @@ unfilter docs
 Составной индекс: порядок полей = leftmost prefix. `wing == "rag" and ts > ago 7d` по `[wing,ts]` — `IndexSeek index=docs[wing,ts]` (равенство слева + range на следующем). Только `wing ==` — тот же индекс. Только `ts >` — scan, leftmost не закрыт. `id ==` остаётся `Get`. `wing == "rag" or wing == "sys"` — несколько seek по индексу и объединение; если хоть одна ветка `or` не индексируется — scan.
 
 `has` — целое слово (граница токена). `~ "…"` — подстрока. `~ /…/i` — регулярка (литерал проверяется при компиляции). `ago 7d` = `now - 7d` (единица обязательна). `timestamp(1700000000123)` — абсолютное Unix-время в миллисекундах, тип `time`; принимает знаковое i64, включая даты до эпохи.
+
+`summarize { alias: agg, ... } by k1, bin(ts, 1h)` считает несколько метрик за один проход (`count`, `sum`, `avg`, `min`, `max`, точный/HLL `dcount`, точный/t-digest `percentile`, скалярные `arg_max`/`arg_min`) по нескольким ключам и интервалам `bin(...)` (длительность или числовой шаг). `arg_max field [by ...]` / `arg_min field [by ...]` возвращают целую строку с максимумом/минимумом; `without { ... }` / `without a, b` исключают указанные поля, сохраняя разреженность строк и пропуская ненужные колонки на холодном уровне.
 
 Запись — отдельный statement, не хвост пайпа. Неизвестный столбец, hop без `rel`, join без `fk`, `update` без `cas` — ошибка компиляции.
 

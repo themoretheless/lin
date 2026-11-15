@@ -3622,6 +3622,9 @@ impl Db {
             if let Some(rows) = self.try_agg(q, bindings, now)? {
                 return Ok(rows);
             }
+            if let Some(rows) = self.try_summarize_fast(q, bindings, now)? {
+                return Ok(rows);
+            }
             if let Some(rows) = self.try_filter_project(q, bindings, now) {
                 return Ok(rows);
             }
@@ -3652,7 +3655,11 @@ impl Db {
         let simple_scan = q.steps.iter().all(|s| {
             matches!(
                 s,
-                Step::Filter(_) | Step::Project(_) | Step::Skip { .. } | Step::Take { .. }
+                Step::Filter(_)
+                    | Step::Project(_)
+                    | Step::Without(_)
+                    | Step::Skip { .. }
+                    | Step::Take { .. }
             )
         });
         let project_fields_step = {
@@ -3670,6 +3677,27 @@ impl Db {
             if simple_scan && can_project_source {
                 q.steps.iter().find_map(|s| match s {
                     Step::Project(f) => Some(f.as_slice()),
+                    _ => None,
+                })
+            } else {
+                None
+            }
+        };
+        let without_fields_step = {
+            let can_exclude_source = (first_filter.is_some()
+                && matches!(q.steps.get(1), Some(Step::Without(_)))
+                && q.steps
+                    .iter()
+                    .skip(2)
+                    .all(|step| matches!(step, Step::Skip { .. } | Step::Take { .. })))
+                || (matches!(q.steps.first(), Some(Step::Without(_)))
+                    && q.steps
+                        .iter()
+                        .skip(1)
+                        .all(|step| matches!(step, Step::Skip { .. } | Step::Take { .. })));
+            if simple_scan && can_exclude_source {
+                q.steps.iter().find_map(|s| match s {
+                    Step::Without(f) => Some(f.as_slice()),
                     _ => None,
                 })
             } else {
@@ -3726,7 +3754,11 @@ impl Db {
                         }
                     );
                     if self.store.is_disk_backed(name) {
-                        let proj_names = project_fields_step.map(field_names);
+                        let proj_names = project_fields_step.map(field_names).or_else(|| {
+                            without_fields_step
+                                .and_then(|wf| self.cold_without_kept(name, wf))
+                                .filter(|kept| !kept.is_empty())
+                        });
                         let want_proj = if simple_eq {
                             proj_names.as_deref()
                         } else {
@@ -3735,7 +3767,10 @@ impl Db {
                         if let Some(row) = self.store.project_by_key(name, field, key, want_proj) {
                             if !simple_eq && !eval_pred(pred, &row, now) {
                                 Vec::new()
-                            } else if !simple_eq && let Some(ref fs) = proj_names {
+                            } else if !simple_eq
+                                && project_fields_step.is_some()
+                                && let Some(ref fs) = proj_names
+                            {
                                 vec![project_fields(&row, fs)]
                             } else {
                                 vec![row]
@@ -3782,13 +3817,21 @@ impl Db {
                             col_len, self.quotas.max_execution_work
                         )));
                     }
-                    if let Some(idxs) = self.mirror_select(name, pred, now) {
+                    if let Some(wf) = without_fields_step
+                        && let Some(rows) = self.scan_cold_without(name, wf, Some(pred), now, None)
+                    {
+                        rows
+                    } else if let Some(idxs) = self.mirror_select(name, pred, now) {
                         self.fetch_idxs_filtered(name, &idxs, pred, now, project_fields_step, true)
                     } else {
                         self.filter_scan(name, pred, now, project_fields_step)
                     }
                 } else if let Some(fields) = project_fields_step {
                     self.scan_projected(name, fields, scan_limit)
+                } else if let Some(wf) = without_fields_step
+                    && let Some(rows) = self.scan_cold_without(name, wf, None, now, scan_limit)
+                {
+                    rows
                 } else {
                     self.scan(name, scan_limit)
                 }
@@ -3837,6 +3880,9 @@ impl Db {
                         continue;
                     }
                     rows = project_owned(rows, fields);
+                }
+                Step::Without(fields) => {
+                    rows = without_rows(rows, fields);
                 }
                 Step::Join {
                     left,
@@ -3937,6 +3983,35 @@ impl Db {
                     )?;
                     primary = String::new();
                 }
+                Step::Summarize { specs, by } => {
+                    implicit_take = false;
+                    saw_agg = true;
+                    let sum_f64_flags =
+                        agg::sum_f64_flags_for(self.catalog.collections.get(&primary), specs);
+                    rows = agg::agg_summarize(
+                        &rows,
+                        None,
+                        now,
+                        specs,
+                        by,
+                        &sum_f64_flags,
+                        self.quotas.max_aggregate_bytes,
+                    )?;
+                    primary = String::new();
+                }
+                Step::ArgExtremum { is_max, order, by } => {
+                    implicit_take = false;
+                    saw_agg = true;
+                    rows = agg::agg_arg_extremum(
+                        &rows,
+                        None,
+                        now,
+                        *is_max,
+                        order,
+                        by,
+                        self.quotas.max_aggregate_bytes,
+                    )?;
+                }
                 Step::Sort { field, desc } => {
                     #[cfg(feature = "gpu")]
                     if let Some(gpu) = &self.gpu {
@@ -3963,7 +4038,7 @@ impl Db {
                                 look_skip = look_skip.saturating_add((*n).max(0) as usize);
                                 j += 1;
                             }
-                            Step::Project(_) => {
+                            Step::Project(_) | Step::Without(_) => {
                                 j += 1;
                             }
                             Step::Take { n: Some(n) } => {
@@ -4221,6 +4296,47 @@ impl Db {
         match limit {
             Some(lim) => col.iter().take(lim).cloned().collect(),
             None => col.to_vec(),
+        }
+    }
+
+    fn cold_without_kept(&self, name: &str, w_fields: &[Field]) -> Option<Vec<String>> {
+        if !self.store.is_disk_backed(name) || !w_fields.iter().all(|f| f.leaf().is_some()) {
+            return None;
+        }
+        let eng = self.store.disk_engine_read()?;
+        let excl: Vec<&str> = w_fields.iter().filter_map(Field::leaf).collect();
+        Some(eng.table_columns_excluding(name, &excl))
+    }
+
+    fn scan_cold_without(
+        &self,
+        name: &str,
+        w_fields: &[Field],
+        pred: Option<&Pred>,
+        now: i64,
+        limit: Option<usize>,
+    ) -> Option<Vec<Row>> {
+        let kept = self.cold_without_kept(name, w_fields)?;
+        let eng = self.store.disk_engine_read()?;
+        let kept_refs: Vec<&str> = kept.iter().map(String::as_str).collect();
+        if let Some(p) = pred {
+            eng.query_filter(name, Some(p), limit, Some(&kept_refs), now).ok()
+        } else {
+            if limit == Some(0) {
+                return Some(Vec::new());
+            }
+            let mut out = Vec::new();
+            eng.scan_projected(name, Some(&kept_refs), |r| {
+                out.push(r.clone());
+                if let Some(lim) = limit
+                    && out.len() >= lim
+                {
+                    return Ok(false);
+                }
+                Ok(true)
+            })
+            .ok()?;
+            Some(out)
         }
     }
 

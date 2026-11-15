@@ -82,8 +82,8 @@ pub mod async_db;
 use std::cell::RefCell;
 
 pub use ast::{
-    CmpOp, DurUnit, Duration, ExplainKind, Field, MatchHop, Pred, Query, SearchMode, Source, Step,
-    Stmt, Value,
+    AggFunc, AggSpec, BinStep, CmpOp, DurUnit, Duration, ExplainKind, Field, GroupExpr, GroupKey,
+    MatchHop, Pred, Query, SearchMode, Source, Step, Stmt, Value,
 };
 pub use batch::{Column, RecordBatch, Validity};
 pub use cursor::{ProjectedRow, QueryCursor};

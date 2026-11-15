@@ -1077,3 +1077,320 @@ fn get_many_by_id_matches_point_reads() {
     }
     let _ = fs::remove_dir_all(&tmp);
 }
+
+#[test]
+fn dict_zone_map_prunes_blocks_soundly() {
+    use super::columns::MmapCol;
+
+    let tmp = std::env::temp_dir().join(format!("lin_disk_dict_zm_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp);
+
+    let mut eng = DiskEngine::open(&tmp, false).unwrap();
+    eng.commit_ops(vec![DiskWalOp::EnsureTable {
+        schema: DiskTableSchema {
+            name: "ev".into(),
+            columns: vec![
+                DiskColSchema {
+                    name: "id".into(),
+                    kind: DiskColKind::TextZstd,
+                },
+                DiskColSchema {
+                    name: "region".into(),
+                    kind: DiskColKind::TextZstd,
+                },
+            ],
+            indexed_fields: Vec::new(),
+            cluster_by: None,
+        },
+    }])
+    .unwrap();
+
+    // 20,000 rows => 5 4096-row zone blocks; region is clustered in 4 bands plus an all-null tail.
+    let mut rows = Vec::with_capacity(20_000);
+    for i in 0..20_000usize {
+        let mut r = Row::new();
+        r.insert("id", Cell::from_text(format!("r-{i:05}")));
+        if i < 4_500 {
+            r.insert("region", Cell::from_text("alpha-east"));
+        } else if i < 9_000 {
+            r.insert("region", Cell::from_text("beta-west"));
+        } else if i < 15_000 {
+            r.insert("region", Cell::from_text("gamma-central"));
+        }
+        // rows 15_000..20_000 leave `region` absent (null), so block 4 (16384..20000) is all-null.
+        rows.push(r);
+    }
+    eng.commit_ops(vec![DiskWalOp::UpsertBatch {
+        table: "ev".into(),
+        rows,
+    }])
+    .unwrap();
+    eng.checkpoint().unwrap();
+
+    let seg = &eng.segments["ev"][0];
+    let dc = match seg.col("region").unwrap() {
+        MmapCol::Dict(dc) => dc,
+        _ => panic!("expected TextDict encoding for low-cardinality column"),
+    };
+    let alpha = dc.find_code("alpha-east").unwrap();
+    let gamma = dc.find_code("gamma-central").unwrap();
+
+    // Block 0 (0..4096): purely "alpha-east", no nulls.
+    assert_eq!(dc.block_eq(0, alpha), (false, true));
+    assert_eq!(dc.block_eq(0, gamma), (true, false));
+    assert_eq!(dc.block_is_null(0), (true, false));
+    // Block 4 (16384..20000): all null.
+    assert_eq!(dc.block_is_null(4), (false, true));
+    assert_eq!(dc.block_eq(4, alpha), (true, false));
+
+    // Verify `ZonePrune` + `query_filter` exactness across ==, !=, in, ~, has, is null, not.
+    let pred_eq = crate::parse::parse_pred_src(r#"region == "beta-west""#).unwrap();
+    let hit_eq = eng
+        .query_filter("ev", Some(&pred_eq), None, Some(&["id"]), 0)
+        .unwrap();
+    assert_eq!(hit_eq.len(), 4_500);
+
+    let pred_ne = crate::parse::parse_pred_src(r#"region != "alpha-east""#).unwrap();
+    let hit_ne = eng
+        .query_filter("ev", Some(&pred_ne), None, Some(&["id"]), 0)
+        .unwrap();
+    // 20,000 - 4,500 alpha rows = 15,500 (including all 5,000 nulls).
+    assert_eq!(hit_ne.len(), 15_500);
+
+    let pred_in = crate::parse::parse_pred_src(r#"region in ["gamma-central", "nope"]"#).unwrap();
+    let hit_in = eng
+        .query_filter("ev", Some(&pred_in), None, Some(&["id"]), 0)
+        .unwrap();
+    assert_eq!(hit_in.len(), 6_000);
+
+    let pred_null = crate::parse::parse_pred_src("region is null").unwrap();
+    assert_eq!(
+        eng.query_filter("ev", Some(&pred_null), None, Some(&["id"]), 0)
+            .unwrap()
+            .len(),
+        5_000
+    );
+
+    let pred_has_not = crate::parse::parse_pred_src(r#"not (region has "east")"#).unwrap();
+    assert_eq!(
+        eng.query_filter("ev", Some(&pred_has_not), None, Some(&["id"]), 0)
+            .unwrap()
+            .len(),
+        15_500
+    );
+
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn tgram_bloom_skips_blocks_handles_unicode_and_backcompat() {
+    let tmp = std::env::temp_dir().join(format!("lin_disk_tgram_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp);
+
+    let mut eng = DiskEngine::open(&tmp, false).unwrap();
+    eng.commit_ops(vec![DiskWalOp::EnsureTable {
+        schema: DiskTableSchema {
+            name: "logs".into(),
+            columns: vec![
+                DiskColSchema {
+                    name: "id".into(),
+                    kind: DiskColKind::TextZstd,
+                },
+                DiskColSchema {
+                    name: "body".into(),
+                    kind: DiskColKind::TextZstd,
+                },
+            ],
+            indexed_fields: Vec::new(),
+            cluster_by: None,
+        },
+    }])
+    .unwrap();
+
+    // ~240 KiB of unique lines (~8 Zstd 32 KiB blocks), keeping body out of dict encoding.
+    let mut rows = Vec::with_capacity(2_400);
+    for i in 0..2_400usize {
+        let mut r = Row::new();
+        r.insert("id", Cell::from_text(format!("l-{i:04}")));
+        let body = if i == 1_750 {
+            format!("event-{i:04} trace needle_xyz_unique payload Сигнал тревоги {i}")
+        } else {
+            format!("event-{i:04} normal operational payload filler-content-alpha-{i:08}-omega")
+        };
+        r.insert("body", Cell::from_text(body));
+        rows.push(r);
+    }
+    eng.commit_ops(vec![DiskWalOp::UpsertBatch {
+        table: "logs".into(),
+        rows,
+    }])
+    .unwrap();
+    eng.checkpoint().unwrap();
+
+    let sid = eng.segments["logs"][0].meta.seg_id;
+    let tgram_path = tmp
+        .join("segments")
+        .join(format!("seg_{sid:08}"))
+        .join("col_body.tgram");
+    assert!(tgram_path.exists(), "expected col_body.tgram sidecar");
+
+    // Reopen fresh to measure block decodes from zero cache.
+    drop(eng);
+    let eng = DiskEngine::open(&tmp, false).unwrap();
+    let seg = &eng.segments["logs"][0];
+    let tc = seg.text_col("body").unwrap();
+    assert_eq!(tc.decoded_block_count(), 0);
+
+    // Substring match via `count_text_contains` skips non-matching Zstd blocks.
+    assert_eq!(
+        eng.count_text_contains("logs", "body", "needle_xyz_unique")
+            .unwrap(),
+        Some(1)
+    );
+    let after_count = tc.decoded_block_count();
+    assert!(
+        after_count <= 2,
+        "expected Bloom filter to skip most blocks, decoded {after_count}"
+    );
+
+    // Reopen fresh for filtered scan with `has` + Cyrillic `has_ci` + `not`.
+    drop(eng);
+    let eng = DiskEngine::open(&tmp, false).unwrap();
+    let tc = eng.segments["logs"][0].text_col("body").unwrap();
+
+    let pred_cyr = crate::parse::parse_pred_src(r#"body has_ci "сигнал""#).unwrap();
+    let rows_cyr = eng
+        .query_filter("logs", Some(&pred_cyr), None, Some(&["id"]), 0)
+        .unwrap();
+    assert_eq!(rows_cyr.len(), 1);
+    assert_eq!(rows_cyr[0].get("id").and_then(Cell::text), Some("l-1750"));
+    assert!(tc.decoded_block_count() <= 2);
+
+    // Negation over trigram-filtered leaf remains 100% sound even when blocks skip decompression.
+    let pred_not = crate::parse::parse_pred_src(r#"not (body ~ "needle_xyz_unique")"#).unwrap();
+    let rows_not = eng
+        .query_filter("logs", Some(&pred_not), None, Some(&["id"]), 0)
+        .unwrap();
+    assert_eq!(rows_not.len(), 2_399);
+
+    // Deleting `.tgram` sidecar preserves full correctness (backward compatibility with old segments).
+    drop(eng);
+    fs::remove_file(&tgram_path).unwrap();
+    let eng = DiskEngine::open(&tmp, false).unwrap();
+    assert_eq!(
+        eng.count_text_contains("logs", "body", "needle_xyz_unique")
+            .unwrap(),
+        Some(1)
+    );
+    assert_eq!(
+        eng.query_filter("logs", Some(&pred_cyr), None, Some(&["id"]), 0)
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn drop_fully_dead_segments_o1_and_savepoint_guard() {
+    let tmp = std::env::temp_dir().join(format!("lin_disk_drop_ext_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp);
+
+    let mut eng = DiskEngine::open(&tmp, false).unwrap();
+    eng.commit_ops(vec![DiskWalOp::EnsureTable {
+        schema: DiskTableSchema {
+            name: "items".into(),
+            columns: vec![
+                DiskColSchema {
+                    name: "id".into(),
+                    kind: DiskColKind::TextZstd,
+                },
+                DiskColSchema {
+                    name: "n".into(),
+                    kind: DiskColKind::Int64,
+                },
+            ],
+            indexed_fields: Vec::new(),
+            cluster_by: None,
+        },
+    }])
+    .unwrap();
+
+    let make_rows = |range: std::ops::Range<usize>| -> Vec<Row> {
+        range
+            .map(|i| {
+                let mut r = Row::new();
+                r.insert("id", Cell::from_text(format!("i-{i:04}")));
+                r.insert("n", Cell::Int(i as i64));
+                r
+            })
+            .collect()
+    };
+
+    eng.commit_ops(vec![DiskWalOp::UpsertBatch {
+        table: "items".into(),
+        rows: make_rows(0..100),
+    }])
+    .unwrap();
+    eng.checkpoint().unwrap();
+
+    eng.commit_ops(vec![DiskWalOp::UpsertBatch {
+        table: "items".into(),
+        rows: make_rows(100..200),
+    }])
+    .unwrap();
+    eng.checkpoint().unwrap();
+
+    assert_eq!(eng.segments["items"].len(), 2);
+    let sid0 = eng.segments["items"][0].meta.seg_id;
+    let sid1 = eng.segments["items"][1].meta.seg_id;
+    let dir0 = tmp.join("segments").join(format!("seg_{sid0:08}"));
+    let dir1 = tmp.join("segments").join(format!("seg_{sid1:08}"));
+    assert!(dir0.exists() && dir1.exists());
+
+    // Savepoint guard: deleting an entire segment + checkpointing MUST NOT drop it while active.
+    eng.begin_savepoint().unwrap();
+    let del0: Vec<String> = (0..100).map(|i| format!("i-{i:04}")).collect();
+    eng.commit_ops(vec![DiskWalOp::DeleteIds {
+        table: "items".into(),
+        ids: del0.clone(),
+    }])
+    .unwrap();
+    eng.checkpoint().unwrap();
+    assert_eq!(eng.segments["items"].len(), 2);
+    assert!(dir0.exists());
+    eng.rollback_savepoint();
+    assert_eq!(eng.count_table("items"), 200);
+
+    // Outside savepoint: checkpoint drops 100%-dead seg0 in O(1) without rewriting seg1.
+    eng.commit_ops(vec![DiskWalOp::DeleteIds {
+        table: "items".into(),
+        ids: del0,
+    }])
+    .unwrap();
+    eng.checkpoint().unwrap();
+    assert_eq!(eng.segments["items"].len(), 1);
+    assert_eq!(eng.segments["items"][0].meta.seg_id, sid1);
+    assert!(!dir0.exists());
+    assert!(dir1.exists());
+    assert_eq!(eng.count_table("items"), 100);
+
+    // Delete all remaining rows of seg1 and vacuum: zero new segments should be written.
+    let del1: Vec<String> = (100..200).map(|i| format!("i-{i:04}")).collect();
+    eng.commit_ops(vec![DiskWalOp::DeleteIds {
+        table: "items".into(),
+        ids: del1,
+    }])
+    .unwrap();
+    let rep = eng.vacuum().unwrap();
+    assert_eq!(rep.tables_compacted, 1);
+    assert_eq!(rep.old_segments_removed, 1);
+    assert_eq!(rep.new_segments_written, 0);
+    assert_eq!(rep.dead_rows_reclaimed, 100);
+    assert!(!dir1.exists());
+    assert_eq!(eng.count_table("items"), 0);
+    assert!(!eng.segments.contains_key("items"));
+
+    let _ = fs::remove_dir_all(&tmp);
+}

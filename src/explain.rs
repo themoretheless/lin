@@ -153,6 +153,7 @@ fn head(node: &Node, kind: ExplainKind, ctx: &ExplainCtx) -> String {
         }
         NodeKind::Filter { pred } => format!("Filter {pred}"),
         NodeKind::Project { fields } => format!("Project [{}]", fields.join(", ")),
+        NodeKind::Without { fields } => format!("Without [{}]", fields.join(", ")),
         NodeKind::Join { left, fk } => {
             let how = if *left { "left" } else { "inner" };
             format!("Join {how} fk={fk} backend={}", node.backend.as_str())
@@ -375,6 +376,7 @@ fn est_rows(node: &Node, sizes: &CollectionSizes) -> f64 {
         NodeKind::FtsSeek { collection, .. } => (sizes.get(collection) * 0.15).max(1.0),
         NodeKind::Filter { .. } => (child(0) * 0.35).max(0.0),
         NodeKind::Project { .. }
+        | NodeKind::Without { .. }
         | NodeKind::Sort { .. }
         | NodeKind::Window { .. }
         | NodeKind::Skip { .. }
