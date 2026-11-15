@@ -46,7 +46,7 @@ pub use snapshot::{
     encode_snapshot_ref_to_writer, read_backup, read_snapshot, write_backup, write_snapshot,
     write_snapshot_ref, write_snapshot_ref_to_file,
 };
-pub(crate) use snapshot::write_snapshot_ref_to_file_ext;
+pub(crate) use snapshot::{decode_snapshot_bytes, write_snapshot_ref_to_file_ext};
 #[cfg(test)]
 pub use snapshot::encode_snapshot_ref_bytes;
 #[cfg(all(

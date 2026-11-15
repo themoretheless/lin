@@ -2,7 +2,7 @@
 
 Срез: **2026-11-15**, коммит `58444cf6e` (релиз 0.7.1) плюс незакоммиченное рабочее дерево. Единственный файл с планом в репозитории: в нём только несделанное. Реализованное описано в [CHANGELOG](../CHANGELOG.md), в документах `docs/` по отдельным механизмам и в отчётах `benches/results/`.
 
-Открыто **1358** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
+Открыто **1356** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровывались, поэтому в них есть пропуски: закрытые пункты удалены. Пункты части II со статусами `candidate` и `qualification` по коду поштучно не сверялись: перед взятием пункта сначала проверить, не покрыт ли он уже.
 
@@ -77,6 +77,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 #### P4.4. Fanout WAL-репликации: push-режим и лимит отставания
 - **Проблема:** `wal-serve --sinks N` (`ship::serve_blocking_fanout`) обслуживает до 64 получателей одновременно, но каждый получатель по-прежнему сам опрашивает сервер (`follower sync --loop`), а сервер держит блокировку писателя и не принимает записи, пока раздаёт WAL. Учёта получателей и их отставания нет.
 - **Решение:** раздача WAL из процесса, который сам пишет (поток раздачи рядом с писателем); долгоживущее соединение с досылкой новых кадров; список получателей с позициями и лимит отставания, после которого получателю нужен bootstrap.
+- **Сделано (сетевой контур `server`):** `LinServer` (`src/server.rs`) обслуживает чтение `ReadDb` без удержания блокировки писателя и отдаёт инкрементальные `PullSyncPayload` (WAL-кадры и автоматический cold-bootstrap со снимком и `.lseg`-сегментами при отставании/пробеле WAL) для `FollowerSyncOpts` и `ReplicaPoolClient`. Полный push-fanout со стороны основного процесса остаётся дальнейшим расширением.
 
 ### 6. Сводная матрица приоритизации и верификации
 
@@ -269,8 +270,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 195 | LIN-0103 | [D03](#d03) | Ввести per-commit sync telemetry | PERF | candidate | M | G-PERF |
 | 196 | LIN-0104 | [D03](#d03) | Разделить encode/write/sync histograms | PERF | candidate | M | G-PERF |
 | 197 | LIN-0105 | [D03](#d03) | Сопоставить групповой commit fairness | PERF | candidate | M | G-PERF |
-| 198 | LIN-0106 | [D03](#d03) | Ограничить group commit wait | CORRECTNESS | qualification | M | G-CORRECT |
-| 199 | LIN-0107 | [D03](#d03) | Ограничить group commit bytes | CORRECTNESS | qualification | M | G-CORRECT |
 | 200 | LIN-0108 | [D03](#d03) | Проверить mixed sync policies | CORRECTNESS | qualification | S | G-CORRECT |
 | 201 | LIN-0109 | [D03](#d03) | Проверить directory sync после rename | CORRECTNESS | qualification | S | G-CORRECT |
 | 202 | LIN-0110 | [D03](#d03) | Проверить file creation durability | CORRECTNESS | qualification | S | G-CORRECT |
@@ -1585,7 +1584,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 <a id="d03"></a>
 
-**D03. Durable I/O и sync** — открыто 36 из 40. Модули: [src/persist/mod.rs](../src/persist/mod.rs), [src/ship.rs](../src/ship.rs), [tests/persist.rs](../tests/persist.rs). Контекст: [D01](#d01), [D02](#d02).
+**D03. Durable I/O и sync** — открыто 34 из 40. Модули: [src/persist/mod.rs](../src/persist/mod.rs), [src/ship.rs](../src/ship.rs), [tests/persist.rs](../tests/persist.rs). Контекст: [D01](#d01), [D02](#d02).
 
 <a id="d04"></a>
 

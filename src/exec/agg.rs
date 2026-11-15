@@ -2306,6 +2306,72 @@ impl DCountAcc {
             }
         }
     }
+
+    fn merge(&mut self, other: DCountAcc, state_bytes: &mut usize, max_bytes: usize) -> Result<(), Error> {
+        match (self, other) {
+            (this @ DCountAcc::Exact(_), DCountAcc::Exact(b)) => {
+                let mut iter = b.into_iter();
+                while let Some(hash) = iter.next() {
+                    let DCountAcc::Exact(a) = this else { break };
+                    if a.contains(&hash) {
+                        continue;
+                    }
+                    if a.len() < DCOUNT_EXACT_LIMIT {
+                        a.insert(hash);
+                        *state_bytes = state_bytes.saturating_add(16);
+                        check_agg_quota(*state_bytes, max_bytes)?;
+                    } else {
+                        let old_bytes = a.len().saturating_mul(16);
+                        let mut regs = Box::new([0u8; HLL_M]);
+                        for &existing in a.iter() {
+                            hll_add(&mut regs, existing);
+                        }
+                        hll_add(&mut regs, hash);
+                        for rest_h in iter {
+                            hll_add(&mut regs, rest_h);
+                        }
+                        if HLL_BYTES > old_bytes {
+                            *state_bytes = state_bytes.saturating_add(HLL_BYTES - old_bytes);
+                            check_agg_quota(*state_bytes, max_bytes)?;
+                        }
+                        *this = DCountAcc::Hll(regs);
+                        return Ok(());
+                    }
+                }
+                Ok(())
+            }
+            (DCountAcc::Hll(regs), DCountAcc::Exact(b)) => {
+                for hash in b {
+                    hll_add(regs, hash);
+                }
+                Ok(())
+            }
+            (this @ DCountAcc::Exact(_), DCountAcc::Hll(mut regs)) => {
+                let old_bytes = if let DCountAcc::Exact(a) = &*this {
+                    for &hash in a.iter() {
+                        hll_add(&mut regs, hash);
+                    }
+                    a.len().saturating_mul(16)
+                } else {
+                    0
+                };
+                if HLL_BYTES > old_bytes {
+                    *state_bytes = state_bytes.saturating_add(HLL_BYTES - old_bytes);
+                    check_agg_quota(*state_bytes, max_bytes)?;
+                }
+                *this = DCountAcc::Hll(regs);
+                Ok(())
+            }
+            (DCountAcc::Hll(a), DCountAcc::Hll(b)) => {
+                for (ra, rb) in a.iter_mut().zip(b.iter()) {
+                    if *rb > *ra {
+                        *ra = *rb;
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 struct TDigest {
@@ -2434,6 +2500,27 @@ impl TDigest {
         let frac = ((target - last_c) / tail_span).clamp(0.0, 1.0);
         Some(last_m + (self.max - last_m) * frac)
     }
+
+    fn merge(&mut self, mut other: TDigest) {
+        if !other.buffer.is_empty() {
+            other.compress();
+        }
+        if other.centroids.is_empty() {
+            return;
+        }
+        if !self.buffer.is_empty() {
+            self.compress();
+        }
+        if self.centroids.is_empty() {
+            *self = other;
+            return;
+        }
+        self.min = self.min.min(other.min);
+        self.max = self.max.max(other.max);
+        self.total += other.total;
+        self.centroids.extend(other.centroids);
+        self.compress();
+    }
 }
 
 enum PercentileAcc {
@@ -2511,6 +2598,62 @@ impl PercentileAcc {
         match val {
             Some(v) => Cell::Float(if v == 0.0 { 0.0 } else { v }),
             None => Cell::Null,
+        }
+    }
+
+    fn merge(
+        &mut self,
+        other: PercentileAcc,
+        state_bytes: &mut usize,
+        max_bytes: usize,
+    ) -> Result<(), Error> {
+        match (self, other) {
+            (this @ PercentileAcc::Exact(_), PercentileAcc::Exact(b)) => {
+                let PercentileAcc::Exact(a) = this else {
+                    return Ok(());
+                };
+                if a.len() + b.len() <= PERCENTILE_EXACT_LIMIT {
+                    *state_bytes = state_bytes.saturating_add(b.len().saturating_mul(8));
+                    check_agg_quota(*state_bytes, max_bytes)?;
+                    a.extend(b);
+                } else {
+                    let old_bytes = a.len().saturating_mul(8);
+                    let mut all = std::mem::take(a);
+                    all.extend(b);
+                    let td = TDigest::from_exact(all);
+                    if TDIGEST_EST_BYTES > old_bytes {
+                        *state_bytes = state_bytes.saturating_add(TDIGEST_EST_BYTES - old_bytes);
+                        check_agg_quota(*state_bytes, max_bytes)?;
+                    }
+                    *this = PercentileAcc::Digest(td);
+                }
+                Ok(())
+            }
+            (PercentileAcc::Digest(td), PercentileAcc::Exact(b)) => {
+                for v in b {
+                    td.push(v);
+                }
+                Ok(())
+            }
+            (this @ PercentileAcc::Exact(_), PercentileAcc::Digest(mut td)) => {
+                let PercentileAcc::Exact(a) = this else {
+                    return Ok(());
+                };
+                let old_bytes = a.len().saturating_mul(8);
+                for v in a.drain(..) {
+                    td.push(v);
+                }
+                if TDIGEST_EST_BYTES > old_bytes {
+                    *state_bytes = state_bytes.saturating_add(TDIGEST_EST_BYTES - old_bytes);
+                    check_agg_quota(*state_bytes, max_bytes)?;
+                }
+                *this = PercentileAcc::Digest(td);
+                Ok(())
+            }
+            (PercentileAcc::Digest(a), PercentileAcc::Digest(b)) => {
+                a.merge(b);
+                Ok(())
+            }
         }
     }
 }
@@ -2694,6 +2837,96 @@ impl MetricAcc {
             MetricAcc::ArgExtremumScalar { best, .. } => best.map(|(_, v)| v).unwrap_or(Cell::Null),
         }
     }
+
+    fn merge(
+        &mut self,
+        other: MetricAcc,
+        state_bytes: &mut usize,
+        max_bytes: usize,
+    ) -> Result<(), Error> {
+        match (self, other) {
+            (MetricAcc::Count(a), MetricAcc::Count(b)) => {
+                *a = a.saturating_add(b);
+                Ok(())
+            }
+            (
+                MetricAcc::Sum {
+                    int_sum,
+                    exact,
+                    saw_float,
+                    int_overflow,
+                    prefer_f64,
+                },
+                MetricAcc::Sum {
+                    int_sum: o_int,
+                    exact: o_exact,
+                    saw_float: o_saw,
+                    int_overflow: o_ovf,
+                    prefer_f64: o_pref,
+                },
+            ) => {
+                match int_sum.checked_add(o_int) {
+                    Some(s) => *int_sum = s,
+                    None => *int_overflow = true,
+                }
+                exact.merge(o_exact);
+                *saw_float |= o_saw;
+                *int_overflow |= o_ovf;
+                *prefer_f64 |= o_pref;
+                Ok(())
+            }
+            (MetricAcc::Avg { sum, count }, MetricAcc::Avg { sum: o_sum, count: o_cnt }) => {
+                sum.merge(o_sum);
+                *count = count.saturating_add(o_cnt);
+                Ok(())
+            }
+            (MetricAcc::Min(best), MetricAcc::Min(other_best)) => {
+                if let Some(c) = other_best
+                    && best.as_ref().is_none_or(|prev| cmp_sort(&c, prev).is_lt())
+                {
+                    *best = Some(c);
+                }
+                Ok(())
+            }
+            (MetricAcc::Max(best), MetricAcc::Max(other_best)) => {
+                if let Some(c) = other_best
+                    && best.as_ref().is_none_or(|prev| cmp_sort(&c, prev).is_gt())
+                {
+                    *best = Some(c);
+                }
+                Ok(())
+            }
+            (MetricAcc::DCount(a), MetricAcc::DCount(b)) => a.merge(b, state_bytes, max_bytes),
+            (
+                MetricAcc::Percentile { acc, .. },
+                MetricAcc::Percentile { acc: o_acc, .. },
+            ) => acc.merge(o_acc, state_bytes, max_bytes),
+            (
+                MetricAcc::ArgExtremumScalar { is_max, best },
+                MetricAcc::ArgExtremumScalar { best: o_best, .. },
+            ) => {
+                if let Some((cand_ord, cand_val)) = o_best {
+                    let take = match best {
+                        None => true,
+                        Some((prev_ord, _)) => {
+                            if *is_max {
+                                cmp_sort(&cand_ord, prev_ord).is_gt()
+                            } else {
+                                cmp_sort(&cand_ord, prev_ord).is_lt()
+                            }
+                        }
+                    };
+                    if take {
+                        *best = Some((cand_ord, cand_val));
+                    }
+                }
+                Ok(())
+            }
+            _ => Err(Error::runtime(
+                "mismatched partial MetricAcc variants in distributed summarize merge",
+            )),
+        }
+    }
 }
 
 #[inline]
@@ -2795,7 +3028,32 @@ impl<'k> SpecReader<'k> {
     }
 }
 
-pub(crate) fn agg_summarize(
+enum PartialSummarizeState {
+    Single(Vec<MetricAcc>),
+    Grouped(FxHashMap<GroupTuple, Vec<MetricAcc>>),
+}
+
+fn finish_partial_state(
+    state: PartialSummarizeState,
+    by: &[GroupKey],
+    specs: &[AggSpec],
+) -> Vec<Row> {
+    match state {
+        PartialSummarizeState::Single(accs) => {
+            vec![emit_summarize_row(by, GroupTuple::new(), specs, accs)]
+        }
+        PartialSummarizeState::Grouped(groups) => {
+            let mut entries: Vec<(GroupTuple, Vec<MetricAcc>)> = groups.into_iter().collect();
+            entries.sort_unstable_by(|(a, _), (b, _)| cmp_group_tuples(a, b));
+            entries
+                .into_iter()
+                .map(|(k, accs)| emit_summarize_row(by, k, specs, accs))
+                .collect()
+        }
+    }
+}
+
+fn fold_summarize_rows(
     rows: &[Row],
     filter: Option<&Pred>,
     now: i64,
@@ -2803,7 +3061,7 @@ pub(crate) fn agg_summarize(
     by: &[GroupKey],
     sum_f64_flags: &[bool],
     max_bytes: usize,
-) -> Result<Vec<Row>, Error> {
+) -> Result<PartialSummarizeState, Error> {
     static NULL: Cell = Cell::Null;
     let mut flt = filter.map(PredSlots::new);
     let mut by_readers: Vec<FieldReader<'_>> = by
@@ -2828,7 +3086,7 @@ pub(crate) fn agg_summarize(
                 acc.push(c1, c2, &mut state_bytes, max_bytes)?;
             }
         }
-        return Ok(vec![emit_summarize_row(by, GroupTuple::new(), specs, accs)]);
+        return Ok(PartialSummarizeState::Single(accs));
     }
 
     let mut groups: FxHashMap<GroupTuple, Vec<MetricAcc>> = FxHashMap::default();
@@ -2858,16 +3116,24 @@ pub(crate) fn agg_summarize(
         }
     }
 
-    let mut entries: Vec<(GroupTuple, Vec<MetricAcc>)> = groups.into_iter().collect();
-    entries.sort_unstable_by(|(a, _), (b, _)| cmp_group_tuples(a, b));
-    Ok(entries
-        .into_iter()
-        .map(|(k, accs)| emit_summarize_row(by, k, specs, accs))
-        .collect())
+    Ok(PartialSummarizeState::Grouped(groups))
+}
+
+pub(crate) fn agg_summarize(
+    rows: &[Row],
+    filter: Option<&Pred>,
+    now: i64,
+    specs: &[AggSpec],
+    by: &[GroupKey],
+    sum_f64_flags: &[bool],
+    max_bytes: usize,
+) -> Result<Vec<Row>, Error> {
+    let state = fold_summarize_rows(rows, filter, now, specs, by, sum_f64_flags, max_bytes)?;
+    Ok(finish_partial_state(state, by, specs))
 }
 
 #[allow(clippy::too_many_arguments)]
-fn agg_summarize_disk(
+fn fold_summarize_disk(
     eng: &crate::disk::DiskEngine,
     table: &str,
     filter: Option<&Pred>,
@@ -2876,7 +3142,7 @@ fn agg_summarize_disk(
     by: &[GroupKey],
     sum_f64_flags: &[bool],
     max_bytes: usize,
-) -> Result<Vec<Row>, Error> {
+) -> Result<PartialSummarizeState, Error> {
     fn push_field<'a>(needed: &mut Vec<&'a str>, f: &'a Field) -> Option<usize> {
         let lf = f.leaf()?;
         if let Some(pos) = needed.iter().position(|&c| c == lf) {
@@ -2930,7 +3196,7 @@ fn agg_summarize_disk(
 
     if !all_leaf {
         let rows = eng.query_filter(table, filter, None, None, now)?;
-        return agg_summarize(&rows, None, now, specs, by, sum_f64_flags, max_bytes);
+        return fold_summarize_rows(&rows, None, now, specs, by, sum_f64_flags, max_bytes);
     }
 
     static NULL: Cell = Cell::Null;
@@ -2986,18 +3252,29 @@ fn agg_summarize_disk(
     }
     if !scanned {
         let rows = eng.query_filter(table, filter, None, Some(&needed), now)?;
-        return agg_summarize(&rows, None, now, specs, by, sum_f64_flags, max_bytes);
+        return fold_summarize_rows(&rows, None, now, specs, by, sum_f64_flags, max_bytes);
     }
 
-    if let Some(accs) = single {
-        return Ok(vec![emit_summarize_row(by, GroupTuple::new(), specs, accs)]);
-    }
-    let mut entries: Vec<(GroupTuple, Vec<MetricAcc>)> = groups.into_iter().collect();
-    entries.sort_unstable_by(|(a, _), (b, _)| cmp_group_tuples(a, b));
-    Ok(entries
-        .into_iter()
-        .map(|(k, accs)| emit_summarize_row(by, k, specs, accs))
-        .collect())
+    Ok(match single {
+        Some(accs) => PartialSummarizeState::Single(accs),
+        None => PartialSummarizeState::Grouped(groups),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn agg_summarize_disk(
+    eng: &crate::disk::DiskEngine,
+    table: &str,
+    filter: Option<&Pred>,
+    now: i64,
+    specs: &[AggSpec],
+    by: &[GroupKey],
+    sum_f64_flags: &[bool],
+    max_bytes: usize,
+) -> Result<Vec<Row>, Error> {
+    let state =
+        fold_summarize_disk(eng, table, filter, now, specs, by, sum_f64_flags, max_bytes)?;
+    Ok(finish_partial_state(state, by, specs))
 }
 
 #[inline]
@@ -3084,4 +3361,1081 @@ pub(crate) fn agg_arg_extremum(
             out
         })
         .collect())
+}
+
+// ============================================================================
+// Distributed Two-Phase Summarize (`LAGG\x01`), Post-Steps & Db Remote Bridges
+// ============================================================================
+
+const LAGG_MAGIC: &[u8; 5] = b"LAGG\x01";
+const LAGG_CRC_TAG: &[u8; 4] = b"LCRC";
+
+fn read_u16_le(cur: &mut &[u8]) -> Result<u16, Error> {
+    let s = crate::batch::read_slice(cur, 2)?;
+    Ok(u16::from_le_bytes([s[0], s[1]]))
+}
+
+fn read_i128_le(cur: &mut &[u8]) -> Result<i128, Error> {
+    let s = crate::batch::read_slice(cur, 16)?;
+    let arr: [u8; 16] = s.try_into().map_err(|_| Error::runtime("invalid i128 slice"))?;
+    Ok(i128::from_le_bytes(arr))
+}
+
+fn read_f64_le(cur: &mut &[u8]) -> Result<f64, Error> {
+    Ok(f64::from_bits(crate::batch::read_u64_le(cur)?))
+}
+
+fn write_metric_acc(out: &mut Vec<u8>, acc: &MetricAcc) -> Result<(), Error> {
+    match acc {
+        MetricAcc::Count(n) => {
+            out.push(0x01);
+            out.extend_from_slice(&n.to_le_bytes());
+        }
+        MetricAcc::Sum {
+            int_sum,
+            exact,
+            saw_float,
+            int_overflow,
+            prefer_f64,
+        } => {
+            out.push(0x02);
+            out.extend_from_slice(&int_sum.to_le_bytes());
+            let (ex_i, ex_f, ex_c) = exact.into_parts();
+            out.extend_from_slice(&ex_i.to_le_bytes());
+            out.extend_from_slice(&ex_f.to_bits().to_le_bytes());
+            out.extend_from_slice(&ex_c.to_bits().to_le_bytes());
+            let flags = (*saw_float as u8)
+                | ((*int_overflow as u8) << 1)
+                | ((*prefer_f64 as u8) << 2);
+            out.push(flags);
+        }
+        MetricAcc::Avg { sum, count } => {
+            out.push(0x03);
+            let (ex_i, ex_f, ex_c) = sum.into_parts();
+            out.extend_from_slice(&ex_i.to_le_bytes());
+            out.extend_from_slice(&ex_f.to_bits().to_le_bytes());
+            out.extend_from_slice(&ex_c.to_bits().to_le_bytes());
+            out.extend_from_slice(&count.to_le_bytes());
+        }
+        MetricAcc::Min(v) => {
+            out.push(0x04);
+            match v {
+                Some(c) => {
+                    out.push(1);
+                    crate::batch::write_wire_cell(out, c);
+                }
+                None => out.push(0),
+            }
+        }
+        MetricAcc::Max(v) => {
+            out.push(0x05);
+            match v {
+                Some(c) => {
+                    out.push(1);
+                    crate::batch::write_wire_cell(out, c);
+                }
+                None => out.push(0),
+            }
+        }
+        MetricAcc::DCount(dc) => {
+            out.push(0x06);
+            match dc {
+                DCountAcc::Exact(set) => {
+                    out.push(0);
+                    out.extend_from_slice(&(set.len() as u32).to_le_bytes());
+                    for &h in set {
+                        out.extend_from_slice(&h.to_le_bytes());
+                    }
+                }
+                DCountAcc::Hll(regs) => {
+                    out.push(1);
+                    out.extend_from_slice(regs.as_slice());
+                }
+            }
+        }
+        MetricAcc::Percentile { pct, acc } => {
+            out.push(0x07);
+            out.extend_from_slice(&pct.to_bits().to_le_bytes());
+            match acc {
+                PercentileAcc::Exact(vals) => {
+                    out.push(0);
+                    out.extend_from_slice(&(vals.len() as u32).to_le_bytes());
+                    for &v in vals {
+                        out.extend_from_slice(&v.to_bits().to_le_bytes());
+                    }
+                }
+                PercentileAcc::Digest(td) => {
+                    out.push(1);
+                    out.extend_from_slice(&td.min.to_bits().to_le_bytes());
+                    out.extend_from_slice(&td.max.to_bits().to_le_bytes());
+                    out.extend_from_slice(&td.total.to_bits().to_le_bytes());
+                    out.extend_from_slice(&(td.buffer.len() as u32).to_le_bytes());
+                    for &v in &td.buffer {
+                        out.extend_from_slice(&v.to_bits().to_le_bytes());
+                    }
+                    out.extend_from_slice(&(td.centroids.len() as u32).to_le_bytes());
+                    for &(m, w) in &td.centroids {
+                        out.extend_from_slice(&m.to_bits().to_le_bytes());
+                        out.extend_from_slice(&w.to_bits().to_le_bytes());
+                    }
+                }
+            }
+        }
+        MetricAcc::ArgExtremumScalar { is_max, best } => {
+            out.push(0x08);
+            out.push(u8::from(*is_max));
+            match best {
+                Some((ord, val)) => {
+                    out.push(1);
+                    crate::batch::write_wire_cell(out, ord);
+                    crate::batch::write_wire_cell(out, val);
+                }
+                None => out.push(0),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn read_metric_acc(cur: &mut &[u8]) -> Result<MetricAcc, Error> {
+    let tag = crate::batch::read_u8(cur)?;
+    match tag {
+        0x01 => Ok(MetricAcc::Count(crate::batch::read_i64_le(cur)?)),
+        0x02 => {
+            let int_sum = read_i128_le(cur)?;
+            let ex_i = read_i128_le(cur)?;
+            let ex_f = read_f64_le(cur)?;
+            let ex_c = read_f64_le(cur)?;
+            let flags = crate::batch::read_u8(cur)?;
+            Ok(MetricAcc::Sum {
+                int_sum,
+                exact: crate::exact_sum::ExactSum::from_parts(ex_i, ex_f, ex_c),
+                saw_float: (flags & 1) != 0,
+                int_overflow: (flags & 2) != 0,
+                prefer_f64: (flags & 4) != 0,
+            })
+        }
+        0x03 => {
+            let ex_i = read_i128_le(cur)?;
+            let ex_f = read_f64_le(cur)?;
+            let ex_c = read_f64_le(cur)?;
+            let count = crate::batch::read_u64_le(cur)?;
+            Ok(MetricAcc::Avg {
+                sum: crate::exact_sum::ExactSum::from_parts(ex_i, ex_f, ex_c),
+                count,
+            })
+        }
+        0x04 | 0x05 => {
+            let present = crate::batch::read_u8(cur)?;
+            let val = if present != 0 {
+                Some(crate::batch::read_wire_cell(cur)?)
+            } else {
+                None
+            };
+            if tag == 0x04 {
+                Ok(MetricAcc::Min(val))
+            } else {
+                Ok(MetricAcc::Max(val))
+            }
+        }
+        0x06 => {
+            let kind = crate::batch::read_u8(cur)?;
+            match kind {
+                0 => {
+                    let len = crate::batch::read_u32_le(cur)? as usize;
+                    let mut set = FxHashSet::with_capacity_and_hasher(
+                        len.min(DCOUNT_EXACT_LIMIT),
+                        Default::default(),
+                    );
+                    for _ in 0..len {
+                        set.insert(crate::batch::read_u64_le(cur)?);
+                    }
+                    Ok(MetricAcc::DCount(DCountAcc::Exact(set)))
+                }
+                1 => {
+                    let raw = crate::batch::read_slice(cur, HLL_M)?;
+                    let mut regs = Box::new([0u8; HLL_M]);
+                    regs.copy_from_slice(raw);
+                    Ok(MetricAcc::DCount(DCountAcc::Hll(regs)))
+                }
+                _ => Err(Error::runtime("invalid DCount tag in LAGG payload")),
+            }
+        }
+        0x07 => {
+            let pct = read_f64_le(cur)?;
+            let kind = crate::batch::read_u8(cur)?;
+            let acc = match kind {
+                0 => {
+                    let len = crate::batch::read_u32_le(cur)? as usize;
+                    let mut vals = Vec::with_capacity(len.min(PERCENTILE_EXACT_LIMIT));
+                    for _ in 0..len {
+                        vals.push(read_f64_le(cur)?);
+                    }
+                    PercentileAcc::Exact(vals)
+                }
+                1 => {
+                    let min = read_f64_le(cur)?;
+                    let max = read_f64_le(cur)?;
+                    let total = read_f64_le(cur)?;
+                    let buf_len = crate::batch::read_u32_le(cur)? as usize;
+                    let mut buffer = Vec::with_capacity(buf_len.min(TDIGEST_BUF_CAP));
+                    for _ in 0..buf_len {
+                        buffer.push(read_f64_le(cur)?);
+                    }
+                    let cent_len = crate::batch::read_u32_le(cur)? as usize;
+                    let mut centroids = Vec::with_capacity(cent_len.min(512));
+                    for _ in 0..cent_len {
+                        centroids.push((read_f64_le(cur)?, read_f64_le(cur)?));
+                    }
+                    PercentileAcc::Digest(TDigest {
+                        centroids,
+                        buffer,
+                        min,
+                        max,
+                        total,
+                    })
+                }
+                _ => return Err(Error::runtime("invalid Percentile tag in LAGG payload")),
+            };
+            Ok(MetricAcc::Percentile { pct, acc })
+        }
+        0x08 => {
+            let is_max = crate::batch::read_u8(cur)? != 0;
+            let present = crate::batch::read_u8(cur)?;
+            let best = if present != 0 {
+                let ord = crate::batch::read_wire_cell(cur)?;
+                let val = crate::batch::read_wire_cell(cur)?;
+                Some((ord, val))
+            } else {
+                None
+            };
+            Ok(MetricAcc::ArgExtremumScalar { is_max, best })
+        }
+        other => Err(Error::runtime(format!("unknown LAGG metric tag {other:#04x}"))),
+    }
+}
+
+fn encode_partial_groups(state: &PartialSummarizeState) -> Result<Vec<u8>, Error> {
+    let mut out = Vec::with_capacity(256);
+    out.extend_from_slice(LAGG_MAGIC);
+    match state {
+        PartialSummarizeState::Single(accs) => {
+            out.push(0);
+            out.extend_from_slice(&1u32.to_le_bytes());
+            out.extend_from_slice(&(accs.len() as u32).to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            for acc in accs {
+                write_metric_acc(&mut out, acc)?;
+            }
+        }
+        PartialSummarizeState::Grouped(groups) => {
+            out.push(1);
+            out.extend_from_slice(&(groups.len() as u32).to_le_bytes());
+            let spec_count = groups.values().next().map_or(0, Vec::len);
+            out.extend_from_slice(&(spec_count as u32).to_le_bytes());
+            for (gkey, accs) in groups {
+                let klen = u16::try_from(gkey.len())
+                    .map_err(|_| Error::runtime("group key tuple too long for LAGG"))?;
+                out.extend_from_slice(&klen.to_le_bytes());
+                for cell in gkey {
+                    crate::batch::write_wire_cell(&mut out, cell);
+                }
+                for acc in accs {
+                    write_metric_acc(&mut out, acc)?;
+                }
+            }
+        }
+    }
+    let crc = crate::crc::hardware_crc32c(&out);
+    out.extend_from_slice(LAGG_CRC_TAG);
+    out.extend_from_slice(&crc.to_le_bytes());
+    Ok(out)
+}
+
+enum DecodedPartialGroups {
+    Single(Vec<MetricAcc>),
+    Grouped(Vec<(GroupTuple, Vec<MetricAcc>)>),
+}
+
+fn decode_partial_groups(bytes: &[u8]) -> Result<DecodedPartialGroups, Error> {
+    if bytes.len() < LAGG_MAGIC.len() + 9 + LAGG_CRC_TAG.len() + 4 {
+        return Err(Error::runtime("truncated LAGG partial aggregate payload"));
+    }
+    if &bytes[..LAGG_MAGIC.len()] != LAGG_MAGIC {
+        return Err(Error::runtime("invalid LAGG magic"));
+    }
+    let crc_off = bytes.len() - 8;
+    if &bytes[crc_off..crc_off + 4] != LAGG_CRC_TAG {
+        return Err(Error::runtime("missing LCRC trailer in LAGG payload"));
+    }
+    let want_crc = u32::from_le_bytes([
+        bytes[crc_off + 4],
+        bytes[crc_off + 5],
+        bytes[crc_off + 6],
+        bytes[crc_off + 7],
+    ]);
+    let got_crc = crate::crc::hardware_crc32c(&bytes[..crc_off]);
+    if want_crc != got_crc {
+        return Err(Error::runtime(format!(
+            "corrupt LAGG payload (crc expected {want_crc:#010x}, got {got_crc:#010x})"
+        )));
+    }
+
+    let mut cur = &bytes[LAGG_MAGIC.len()..crc_off];
+    let has_by = crate::batch::read_u8(&mut cur)? != 0;
+    let group_count = crate::batch::read_u32_le(&mut cur)? as usize;
+    let spec_count = crate::batch::read_u32_le(&mut cur)? as usize;
+    let mut decoded = Vec::with_capacity(group_count.min(4096));
+    for _ in 0..group_count {
+        let klen = read_u16_le(&mut cur)? as usize;
+        let mut gkey = GroupTuple::with_capacity(klen);
+        for _ in 0..klen {
+            gkey.push(crate::batch::read_wire_cell(&mut cur)?);
+        }
+        let mut accs = Vec::with_capacity(spec_count);
+        for _ in 0..spec_count {
+            accs.push(read_metric_acc(&mut cur)?);
+        }
+        decoded.push((gkey, accs));
+    }
+    if !cur.is_empty() {
+        return Err(Error::runtime("trailing bytes in LAGG payload"));
+    }
+    if !has_by {
+        let (_, accs) = decoded
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::runtime("missing single group in LAGG payload"))?;
+        Ok(DecodedPartialGroups::Single(accs))
+    } else {
+        Ok(DecodedPartialGroups::Grouped(decoded))
+    }
+}
+
+pub(crate) fn eval_partial_summarize_on_reader(
+    reader: &super::ReadDb,
+    collection: &str,
+    filter: Option<&Pred>,
+    now: i64,
+    specs: &[AggSpec],
+    by: &[GroupKey],
+) -> Result<Vec<u8>, Error> {
+    let store = &reader.inner.store;
+    let col_def = reader.inner.catalog.collections.get(collection);
+    let sum_flags = sum_f64_flags_for(col_def, specs);
+    let max_bytes = reader.inner.quotas.max_aggregate_bytes;
+    let state = if store.is_disk_backed(collection) {
+        let tier = store
+            .disk
+            .as_ref()
+            .ok_or_else(|| Error::runtime("missing disk tier on disk-backed collection"))?;
+        let eng = tier
+            .engine
+            .read()
+            .map_err(|_| Error::runtime("disk engine lock poisoned"))?;
+        fold_summarize_disk(&eng, collection, filter, now, specs, by, &sum_flags, max_bytes)?
+    } else {
+        let rows = store.collection(collection);
+        fold_summarize_rows(&rows, filter, now, specs, by, &sum_flags, max_bytes)?
+    };
+    encode_partial_groups(&state)
+}
+
+pub(crate) fn empty_partial_summarize_wire(
+    specs: &[AggSpec],
+    by: &[GroupKey],
+    sum_f64_flags: &[bool],
+) -> Result<Vec<u8>, Error> {
+    let state = if by.is_empty() {
+        PartialSummarizeState::Single(build_accs(specs, sum_f64_flags))
+    } else {
+        PartialSummarizeState::Grouped(FxHashMap::default())
+    };
+    encode_partial_groups(&state)
+}
+
+pub(crate) fn merge_partial_summarize_wire(
+    payloads: &[Vec<u8>],
+    specs: &[AggSpec],
+    by: &[GroupKey],
+    sum_f64_flags: &[bool],
+    max_bytes: usize,
+) -> Result<Vec<Row>, Error> {
+    let mut state_bytes = 0usize;
+    if by.is_empty() {
+        let mut merged = build_accs(specs, sum_f64_flags);
+        for raw in payloads {
+            let DecodedPartialGroups::Single(accs) = decode_partial_groups(raw)? else {
+                return Err(Error::runtime(
+                    "expected ungrouped partial LAGG state, got grouped",
+                ));
+            };
+            if accs.len() != merged.len() {
+                return Err(Error::runtime("partial summarize metric count mismatch"));
+            }
+            for (dst, src) in merged.iter_mut().zip(accs.into_iter()) {
+                dst.merge(src, &mut state_bytes, max_bytes)?;
+            }
+        }
+        return Ok(vec![emit_summarize_row(by, GroupTuple::new(), specs, merged)]);
+    }
+
+    let mut merged: FxHashMap<GroupTuple, Vec<MetricAcc>> = FxHashMap::default();
+    for raw in payloads {
+        let DecodedPartialGroups::Grouped(items) = decode_partial_groups(raw)? else {
+            return Err(Error::runtime(
+                "expected grouped partial LAGG state, got ungrouped",
+            ));
+        };
+        for (gkey, accs) in items {
+            if accs.len() != specs.len() {
+                return Err(Error::runtime("partial summarize metric count mismatch"));
+            }
+            match merged.entry(gkey) {
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    state_bytes = state_bytes.saturating_add(group_key_bytes(e.key(), specs.len()));
+                    check_agg_quota(state_bytes, max_bytes)?;
+                    e.insert(accs);
+                }
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    for (dst, src) in e.get_mut().iter_mut().zip(accs.into_iter()) {
+                        dst.merge(src, &mut state_bytes, max_bytes)?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(finish_partial_state(
+        PartialSummarizeState::Grouped(merged),
+        by,
+        specs,
+    ))
+}
+
+pub(crate) fn apply_coordinator_post_steps(
+    mut rows: Vec<Row>,
+    steps: &[Step],
+    now: i64,
+    quotas: &crate::Quotas,
+) -> Result<Vec<Row>, Error> {
+    for (idx, step) in steps.iter().enumerate() {
+        match step {
+            Step::Filter(pred) => {
+                let mut flt = PredSlots::new(pred);
+                rows.retain(|r| flt.eval(r, now));
+            }
+            Step::Project(fields) => {
+                rows = super::eval::project_owned(rows, fields);
+            }
+            Step::Without(fields) => {
+                rows = super::eval::without_rows(rows, fields);
+            }
+            Step::Sort { field, desc } => {
+                let top_k = match steps.get(idx + 1) {
+                    Some(Step::Take { n: Some(limit) }) => {
+                        Some(usize::try_from((*limit).max(0)).unwrap_or(0))
+                    }
+                    _ => None,
+                };
+                super::eval::sort_rows_top_k(&mut rows, field, *desc, top_k);
+            }
+            Step::Skip { n } => {
+                let drop_n = usize::try_from((*n).max(0)).unwrap_or(usize::MAX);
+                if drop_n >= rows.len() {
+                    rows.clear();
+                } else if drop_n > 0 {
+                    rows.drain(..drop_n);
+                }
+            }
+            Step::Take { n } => {
+                if let Some(limit) = n {
+                    let keep = usize::try_from((*limit).max(0)).unwrap_or(0);
+                    rows.truncate(keep);
+                }
+            }
+            Step::Summarize { specs, by } => {
+                let flags = vec![false; specs.len()];
+                rows = agg_summarize(&rows, None, now, specs, by, &flags, quotas.max_aggregate_bytes)?;
+            }
+            Step::ArgExtremum { is_max, order, by } => {
+                rows = agg_arg_extremum(
+                    &rows,
+                    None,
+                    now,
+                    *is_max,
+                    order,
+                    by,
+                    quotas.max_aggregate_bytes,
+                )?;
+            }
+            Step::Count { by } => {
+                rows = match by {
+                    Some(f) => agg_count(
+                        &rows,
+                        f,
+                        quotas.max_aggregate_bytes,
+                        quotas.spill_enabled,
+                    )?,
+                    None => vec![hits_row(rows.len() as i64)],
+                };
+            }
+            Step::Sum { field, by } => {
+                rows = agg_sum(
+                    &rows,
+                    field,
+                    by.as_ref(),
+                    quotas.max_aggregate_bytes,
+                    quotas.spill_enabled,
+                )?;
+            }
+            Step::Min { field, by } => {
+                rows = agg_min(
+                    &rows,
+                    field,
+                    by.as_ref(),
+                    quotas.max_aggregate_bytes,
+                    quotas.spill_enabled,
+                )?;
+            }
+            Step::Max { field, by } => {
+                rows = agg_max(
+                    &rows,
+                    field,
+                    by.as_ref(),
+                    quotas.max_aggregate_bytes,
+                    quotas.spill_enabled,
+                )?;
+            }
+            Step::Avg { field, by } => {
+                rows = agg_avg(
+                    &rows,
+                    field,
+                    by.as_ref(),
+                    quotas.max_aggregate_bytes,
+                    quotas.spill_enabled,
+                )?;
+            }
+            Step::Window {
+                func,
+                field,
+                by,
+                order,
+                frame,
+                as_field,
+            } => {
+                rows = super::eval::eval_window(
+                    rows,
+                    func,
+                    field.as_ref(),
+                    by,
+                    order,
+                    frame.as_ref(),
+                    as_field,
+                );
+            }
+            other => {
+                return Err(Error::runtime(format!(
+                    "distributed coordinator post-step {other:?} requires single-node execution"
+                )));
+            }
+        }
+    }
+    Ok(rows)
+}
+
+fn collect_query_collections(query: &Query, out: &mut Vec<String>) {
+    if let Source::Collection(c) = &query.source
+        && !out.contains(c)
+    {
+        out.push(c.clone());
+    }
+    for step in &query.steps {
+        match step {
+            Step::Join { collection, .. } => {
+                if !out.contains(collection) {
+                    out.push(collection.clone());
+                }
+            }
+            Step::Union(sub) => collect_query_collections(sub, out),
+            _ => {}
+        }
+    }
+}
+
+impl super::Db {
+    pub(crate) fn cold_disk_engine_lock(
+        &self,
+    ) -> Option<&Arc<std::sync::RwLock<crate::disk::DiskEngine>>> {
+        self.store.disk.as_ref().map(|d| &d.engine)
+    }
+
+    pub(crate) fn capture_snapshot_wire_bytes(&self) -> Result<Vec<u8>, Error> {
+        let mut cold_names: Vec<String> = self
+            .store
+            .disk
+            .as_ref()
+            .map(|d| d.tables.keys().cloned().collect())
+            .unwrap_or_default();
+        if let Some(d) = self.store.disk.as_ref()
+            && let Ok(eng) = d.engine.read()
+        {
+            for name in eng.manifest.tables.keys() {
+                if !cold_names.contains(name) {
+                    cold_names.push(name.clone());
+                }
+            }
+        } else if let Some(p) = self
+            .persist
+            .as_ref()
+            .filter(|p| p.cold && crate::disk::is_disk_dir(&p.dir))
+            && let Ok(eng) = crate::disk::DiskEngine::open_read_only(&p.dir)
+        {
+            for name in eng.manifest.tables.keys() {
+                if !cold_names.contains(name) {
+                    cold_names.push(name.clone());
+                }
+            }
+        }
+        let mut collections_map: BTreeMap<String, Vec<Row>> = BTreeMap::new();
+        for (name, rows) in self.store.collections.iter() {
+            if cold_names.iter().any(|c| c == name) {
+                collections_map.insert(name.clone(), Vec::new());
+            } else {
+                collections_map.insert(name.clone(), rows.clone());
+            }
+        }
+        let cat_hash = self
+            .persist
+            .as_ref()
+            .map(|p| p.catalog_hash.clone())
+            .unwrap_or_else(|| self.catalog.hash_str().to_string());
+        let snap_ref = crate::persist::SnapshotRef {
+            r#gen: self.store.r#gen,
+            embed_id: &self.store.embed_id,
+            next_id: self.store.next_id,
+            catalog_hash: &cat_hash,
+            log_offset: 0,
+            collections: &collections_map,
+            edges: &self.store.edges,
+            extra_collections: &self.store.extra_collections,
+            extra_rels: &self.store.extra_rels,
+            extra_indexes: &self.store.extra_indexes,
+            extra_filters: &self.store.extra_filters,
+            extra_owned: &self.store.extra_owned,
+            cold_collections: &cold_names,
+        };
+        let mut buf = Vec::with_capacity(4096);
+        crate::persist::encode_snapshot_ref_to_writer(&mut buf, &snap_ref)?;
+        Ok(buf)
+    }
+
+    pub(crate) fn from_cold_engine_and_snapshot(
+        dir: &std::path::Path,
+        eng: crate::disk::DiskEngine,
+        snap_bytes: Option<&[u8]>,
+        quotas: crate::Quotas,
+    ) -> Result<Self, Error> {
+        let mut catalog = crate::catalog::fixture();
+        let mut store = if let Some(raw) = snap_bytes {
+            let mut snap = crate::persist::decode_snapshot_bytes(raw)
+                .ok_or_else(|| Error::runtime("corrupt or unsupported cold snapshot payload"))?;
+            if snap.cold_collections.is_empty() && !eng.manifest.tables.is_empty() {
+                snap.cold_collections = eng.manifest.tables.keys().cloned().collect();
+            }
+            crate::store::Store::from_snapshot_with_disk_engine(dir, snap, Some(eng))?
+        } else {
+            crate::store::checkpoint::populate_store_from_native_engine(eng, &catalog, None)
+        };
+        store.merge_extras_into(&mut catalog);
+        let col_names: Vec<String> = store
+            .collections
+            .keys()
+            .filter(|name| !store.is_disk_backed(name))
+            .cloned()
+            .collect();
+        for cname in col_names {
+            store.rebuild_fts_collection(&catalog, &cname);
+        }
+        let mut db = Self::bare(catalog, store);
+        db.quotas = quotas;
+        Ok(db)
+    }
+
+    pub(crate) fn hydrate_cold_collection_inner(&mut self, table: &str) -> Result<usize, Error> {
+        let Some(d) = self.store.disk.as_ref() else {
+            return Ok(0);
+        };
+        let mut eng = d
+            .engine
+            .write()
+            .map_err(|_| Error::runtime("cold disk engine lock poisoned"))?;
+        let n = eng.hydrate_table(table)?;
+        drop(eng);
+        if n > 0 {
+            self.reader_cache = None;
+            self.query_cache.clear();
+        }
+        Ok(n)
+    }
+
+    pub(crate) fn hydrate_query_cold_tables(&mut self, query: &Query) -> Result<bool, Error> {
+        let Some(d) = self.store.disk.as_ref() else {
+            return Ok(false);
+        };
+        let mut cols = Vec::new();
+        collect_query_collections(query, &mut cols);
+        let mut hydrated_any = false;
+        let mut eng = d
+            .engine
+            .write()
+            .map_err(|_| Error::runtime("cold disk engine lock poisoned"))?;
+        if eng.remote_tier.is_none() {
+            return Ok(false);
+        }
+        for col in cols {
+            if self.store.is_disk_backed(&col) && !eng.is_table_hydrated(&col) {
+                eng.hydrate_table(&col)?;
+                hydrated_any = true;
+            }
+        }
+        drop(eng);
+        if hydrated_any {
+            self.reader_cache = None;
+            self.query_cache.clear();
+        }
+        Ok(hydrated_any)
+    }
+
+    pub(crate) fn has_unhydrated_cold_tables(&self) -> bool {
+        let Some(d) = self.store.disk.as_ref() else {
+            return false;
+        };
+        d.engine
+            .read()
+            .map(|eng| eng.has_unhydrated_tables())
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn evict_cold_cache_inner(&mut self, max_bytes: u64) -> Result<u64, Error> {
+        let Some(d) = self.store.disk.as_ref() else {
+            return Ok(0);
+        };
+        let mut eng = d
+            .engine
+            .write()
+            .map_err(|_| Error::runtime("cold disk engine lock poisoned"))?;
+        let remaining = eng.evict_local_cache_to(max_bytes)?;
+        drop(eng);
+        self.reader_cache = None;
+        self.query_cache.clear();
+        Ok(remaining)
+    }
+
+    pub(crate) fn cold_local_cache_bytes_inner(&self) -> u64 {
+        let Some(d) = self.store.disk.as_ref() else {
+            return 0;
+        };
+        d.engine
+            .read()
+            .map(|eng| eng.local_cache_bytes())
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn capture_bootstrap_bundle(
+        &mut self,
+    ) -> Result<(u64, Vec<u8>, Vec<u8>, Vec<u8>, Vec<(u64, Vec<u8>)>), Error> {
+        let needs_ckpt = self.persist.as_ref().is_some_and(|p| {
+            p.writes_since_snapshot > 0
+                || ((self.store.is_native_disk() || self.store.disk.is_some() || p.cold)
+                    && !crate::disk::is_disk_dir(&p.dir))
+        });
+        if needs_ckpt {
+            let _ = self.checkpoint();
+        }
+        let cur_gen = self.store.r#gen;
+        let snap_bytes = self.capture_snapshot_wire_bytes()?;
+        let (manifest_json, tombstones_raw, segs) = if let Some(d) = self.store.disk.as_ref() {
+            let eng = d
+                .engine
+                .read()
+                .map_err(|_| Error::runtime("cold disk engine lock poisoned"))?;
+            eng.export_cold_bootstrap_parts()?
+        } else if let Some(p) = self
+            .persist
+            .as_ref()
+            .filter(|p| p.cold && crate::disk::is_disk_dir(&p.dir))
+        {
+            let eng = crate::disk::DiskEngine::open_read_only(&p.dir)?;
+            eng.export_cold_bootstrap_parts()?
+        } else {
+            (Vec::new(), Vec::new(), Vec::new())
+        };
+        Ok((cur_gen, snap_bytes, manifest_json, tombstones_raw, segs))
+    }
+
+    pub(crate) fn apply_bootstrap_bundle(
+        &mut self,
+        snap_bytes: &[u8],
+        cold_manifest_json: &[u8],
+        cold_tombstones: &[u8],
+        cold_segments: &[(u64, Vec<u8>)],
+    ) -> Result<u64, Error> {
+        let snap = crate::persist::decode_snapshot_bytes(snap_bytes)
+            .ok_or_else(|| Error::runtime("corrupt or unsupported bootstrap snapshot payload"))?;
+        let new_gen = snap.r#gen;
+        let has_cold = !cold_manifest_json.is_empty();
+        let persist_info = self.persist.as_ref().map(|p| (p.dir.clone(), p.sync));
+        let quotas = self.quotas;
+
+        if let Some((dir, sync)) = persist_info {
+            // Release all open WAL/mmap/lock handles before overwriting local files.
+            *self = Self::empty();
+            crate::persist::ensure_dir(&dir)?;
+            if has_cold {
+                let seg_root = dir.join(crate::disk::SEGMENTS_DIR);
+                if seg_root.exists() {
+                    let _ = std::fs::remove_dir_all(&seg_root);
+                }
+                std::fs::create_dir_all(&seg_root).map_err(crate::persist::io_err)?;
+                std::fs::write(dir.join(crate::disk::MANIFEST_FILE), cold_manifest_json)
+                    .map_err(crate::persist::io_err)?;
+                std::fs::write(dir.join(crate::disk::TOMBSTONES_FILE), cold_tombstones)
+                    .map_err(crate::persist::io_err)?;
+                for (seg_id, lseg) in cold_segments {
+                    crate::disk::unpack_segment_dir(
+                        lseg,
+                        &seg_root.join(format!("seg_{seg_id:08}")),
+                    )?;
+                }
+            }
+            crate::persist::write_snapshot(&dir, &snap)?;
+            crate::persist::write_head(
+                &dir,
+                &crate::persist::Head {
+                    r#gen: snap.r#gen,
+                    catalog_hash: snap.catalog_hash.clone(),
+                    embed_id: snap.embed_id.clone(),
+                },
+            )?;
+            std::fs::write(dir.join(crate::persist::LOG_NAME), [])
+                .map_err(crate::persist::io_err)?;
+            let mut reopened = Self::open_follower_with(
+                &dir,
+                crate::exec::OpenOpts {
+                    sync,
+                    cold: has_cold,
+                },
+            )?;
+            reopened.quotas = quotas;
+            *self = reopened;
+            return Ok(new_gen);
+        }
+
+        let mut catalog = crate::catalog::fixture();
+        let store = if has_cold {
+            let tmp_dir = std::env::temp_dir().join(format!(
+                "lin_mem_follower_cold_{}_{}",
+                std::process::id(),
+                new_gen
+            ));
+            let seg_root = tmp_dir.join(crate::disk::SEGMENTS_DIR);
+            if tmp_dir.exists() {
+                let _ = std::fs::remove_dir_all(&tmp_dir);
+            }
+            std::fs::create_dir_all(&seg_root).map_err(crate::persist::io_err)?;
+            std::fs::write(tmp_dir.join(crate::disk::MANIFEST_FILE), cold_manifest_json)
+                .map_err(crate::persist::io_err)?;
+            std::fs::write(tmp_dir.join(crate::disk::TOMBSTONES_FILE), cold_tombstones)
+                .map_err(crate::persist::io_err)?;
+            for (seg_id, lseg) in cold_segments {
+                crate::disk::unpack_segment_dir(lseg, &seg_root.join(format!("seg_{seg_id:08}")))?;
+            }
+            let eng = crate::disk::DiskEngine::open(&tmp_dir, false)?;
+            crate::store::Store::from_snapshot_with_disk_engine(&tmp_dir, snap, Some(eng))?
+        } else {
+            crate::store::Store::from_snapshot_with_disk_engine(
+                std::path::Path::new(""),
+                snap,
+                None,
+            )?
+        };
+        store.merge_extras_into(&mut catalog);
+        let mut rebuilt = Self::bare(catalog, store);
+        rebuilt.follower = true;
+        rebuilt.quotas = quotas;
+        *self = rebuilt;
+        Ok(new_gen)
+    }
+
+    pub(crate) fn hydrate_stmts_cold_tables(
+        &mut self,
+        stmts: &[crate::ast::Stmt],
+    ) -> Result<bool, Error> {
+        let mut any = false;
+        for stmt in stmts {
+            match stmt {
+                crate::ast::Stmt::Query(q) => {
+                    if self.hydrate_query_cold_tables(q)? {
+                        any = true;
+                    }
+                }
+                crate::ast::Stmt::Let { query, .. } => {
+                    if self.hydrate_query_cold_tables(query)? {
+                        any = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(any)
+    }
+}
+
+pub(crate) fn eval_partial_summarize_query_on_reader(
+    reader: &super::ReadDb,
+    q: &Query,
+) -> Result<Vec<u8>, Error> {
+    let q_cat = crate::catalog::with_catalog_filter(q, &reader.inner.catalog);
+    let Some(Step::Summarize { specs, by }) = q_cat.steps.last() else {
+        return Err(Error::runtime(
+            "partial summarize requires query ending with summarize",
+        ));
+    };
+    let pre_steps = &q_cat.steps[..q_cat.steps.len() - 1];
+    let now = super::now_ms();
+    if let Source::Collection(col) = &q_cat.source
+        && pre_steps.iter().all(|s| matches!(s, Step::Filter(_)))
+    {
+        let mut combined: Option<Pred> = None;
+        for step in pre_steps {
+            if let Step::Filter(p) = step {
+                combined = Some(match combined {
+                    Some(prev) => prev.and(p.clone()),
+                    None => p.clone(),
+                });
+            }
+        }
+        return eval_partial_summarize_on_reader(reader, col, combined.as_ref(), now, specs, by);
+    }
+
+    let mut steps = q.steps[..q.steps.len() - 1].to_vec();
+    steps.push(Step::Take { n: None });
+    let pre_q = Query {
+        source: q.source.clone(),
+        steps,
+        explain: None,
+        ignore_filter: q.ignore_filter,
+    };
+    let h = reader.run_stmt(crate::ast::Stmt::Query(pre_q))?;
+    let col_def = match &q.source {
+        Source::Collection(c) => reader.inner.catalog.collections.get(c),
+        _ => None,
+    };
+    let sum_flags = sum_f64_flags_for(col_def, specs);
+    let state = fold_summarize_rows(
+        &h.rows,
+        None,
+        now,
+        specs,
+        by,
+        &sum_flags,
+        reader.inner.quotas.max_aggregate_bytes,
+    )?;
+    encode_partial_groups(&state)
+}
+
+pub(crate) fn coordinator_agg_arg_extremum(
+    rows: &[Row],
+    is_max: bool,
+    order: &Field,
+    by: &[GroupKey],
+    max_bytes: usize,
+) -> Result<Vec<Row>, Error> {
+    agg_arg_extremum(rows, None, super::now_ms(), is_max, order, by, max_bytes)
+}
+
+fn rows_to_union_batch(rows: &[Row]) -> crate::batch::RecordBatch {
+    if rows.len() <= 1
+        || rows[1..]
+            .iter()
+            .all(|r| r.len() == rows[0].len() && r.keys().eq(rows[0].keys()))
+    {
+        return super::join::rows_to_rough_batch(rows);
+    }
+    let mut all_names = std::collections::BTreeSet::new();
+    for row in rows {
+        for k in row.keys() {
+            all_names.insert(k.clone());
+        }
+    }
+    let names: Vec<String> = all_names.into_iter().collect();
+    let names_arc: Arc<[String]> = names.clone().into();
+    let mut batch = crate::batch::RecordBatch::with_capacity(names_arc, rows.len());
+    for row in rows {
+        for (i, name) in names.iter().enumerate() {
+            batch.cols[i].push(row.get(name).cloned().unwrap_or(Cell::Null));
+        }
+    }
+    batch
+}
+
+pub(crate) fn rows_to_batch_for_query(rows: &[Row], q: &Query) -> crate::batch::RecordBatch {
+    let mut has_proj = false;
+    for step in &q.steps {
+        match step {
+            Step::Project(_) => has_proj = true,
+            Step::Without(_)
+            | Step::Join { .. }
+            | Step::Hop { .. }
+            | Step::Graph { .. }
+            | Step::Match { .. }
+            | Step::Count { .. }
+            | Step::Sum { .. }
+            | Step::Min { .. }
+            | Step::Max { .. }
+            | Step::Avg { .. }
+            | Step::Summarize { .. }
+            | Step::ArgExtremum { .. }
+            | Step::Union(_) => has_proj = false,
+            _ => {}
+        }
+    }
+    if has_proj {
+        super::rows_to_query_batch(rows, q)
+    } else {
+        rows_to_union_batch(rows)
+    }
+}
+
+impl super::ReadDb {
+    pub(crate) fn run_batch_lossless(&self, linql: &str) -> Result<crate::batch::RecordBatch, Error> {
+        let prepared = self.prepare(linql)?;
+        if prepared.writes {
+            return Err(Error::runtime("run_batch is read-only"));
+        }
+        if prepared.stmts.len() == 1
+            && let crate::ast::Stmt::Query(q) = &prepared.stmts[0]
+        {
+            let q_cat = crate::catalog::with_catalog_filter(q, &self.inner.catalog);
+            let now = super::now_ms();
+            let bindings = Default::default();
+            if !self.inner.uses_gpu_filter(&q_cat)
+                && !self.inner.uses_gpu_join(&q_cat)
+                && let Some(batch) = self.inner.try_filter_project_batch(&q_cat, &bindings, now)
+            {
+                return Ok(batch);
+            }
+            if !self.inner.uses_gpu_filter(&q_cat)
+                && !self.inner.uses_gpu_join(&q_cat)
+                && let Some(batch) = self.inner.try_join_project_batch(&q_cat, &bindings, now)
+            {
+                return Ok(batch);
+            }
+        }
+        let h = self.run_prepared(&prepared)?;
+        Ok(match &prepared.stmts[..] {
+            [crate::ast::Stmt::Query(q)] => rows_to_batch_for_query(&h.rows, q),
+            _ => rows_to_union_batch(&h.rows),
+        })
+    }
 }

@@ -72,8 +72,10 @@ mod store;
 mod window;
 
 pub mod cache;
+pub mod cluster;
 pub mod query;
 pub mod row;
+pub mod server;
 pub mod ship;
 
 #[cfg(feature = "async")]
@@ -88,10 +90,22 @@ pub use ast::{
 pub use batch::{Column, RecordBatch, Validity};
 pub use cursor::{ProjectedRow, QueryCursor};
 pub use disk::{
-    CompactionReport, DiskColKind, DiskColSchema, DiskEngine, DiskManifest, DiskSegment,
-    DiskTableSchema, DiskVecHit, DiskWalOp, HotCacheConfig, HotCacheStats, HotTierCache,
-    MmapBm25Builder, MmapBm25Index, MmapVecCol, MmapVecIvf, SharedDiskEngine, is_disk_dir,
+    ColdObjectStore, CompactionReport, DiskColKind, DiskColSchema, DiskEngine, DiskManifest,
+    DiskSegment, DiskTableSchema, DiskVecHit, DiskWalOp, FsObjectStore, HotCacheConfig,
+    HotCacheStats, HotTierCache, MemoryObjectStore, MmapBm25Builder, MmapBm25Index, MmapVecCol,
+    MmapVecIvf, ObjectStoreCounters, RemoteCacheConfig, RemoteSegEntry, RemoteSyncStats,
+    S3Config, S3HttpObjectStore, SharedDiskEngine, is_disk_dir, pack_segment_dir,
+    unpack_segment_dir,
 };
+pub use cluster::{
+    ClusterStats, ShardConfig, ShardRouter, ShardStrategy, ShardedCluster, jump_consistent_hash,
+    pick_shard, shard_hash_cell, shard_hash_value,
+};
+pub use server::{
+    ClientOpts, Consistency, ExecutionReceipt, FollowerSyncOpts, LinServer, NodeRole,
+    PullSyncPayload, ReplicaPoolClient, ServerClient, ServerConfig, ServerHandle, WorkloadGroup,
+};
+pub use ship::{PullOpts, TlsClient, TlsServer};
 pub use embed::{
     Embedder, HashingEmbedder, HnswIndex, HnswIndexSq8, VectorIndex, cosine, dequantize_sq8,
     dot_sq8, quantize_sq8,

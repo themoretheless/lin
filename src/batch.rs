@@ -1,8 +1,13 @@
 //! Columnar result batch — in-process OLAP shape beside row-API (`Vec<Row>`).
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use crate::error::Error;
 use crate::store::{Cell, Row};
+
+const BATCH_WIRE_MAGIC: &[u8; 5] = b"LINB\x01";
+const BATCH_CRC_TAG: &[u8; 4] = b"LCRC";
 
 /// Bit-packed validity of a typed column: a set bit means the value is present.
 /// While no null has been pushed the mask is not materialized at all.
@@ -98,6 +103,31 @@ impl Validity {
         for i in 0..other.len {
             self.push(other.is_valid(i));
         }
+    }
+
+    #[inline]
+    pub(crate) fn raw_parts(&self) -> (&[u64], usize, usize) {
+        (&self.words, self.len, self.nulls)
+    }
+
+    pub(crate) fn from_raw_parts(
+        words: Vec<u64>,
+        len: usize,
+        nulls: usize,
+    ) -> Result<Self, Error> {
+        if nulls > len {
+            return Err(Error::runtime(format!(
+                "batch: invalid validity nulls ({nulls}) > len ({len})"
+            )));
+        }
+        let expected_words = if nulls == 0 { 0 } else { len.div_ceil(64) };
+        if words.len() != expected_words {
+            return Err(Error::runtime(format!(
+                "batch: invalid validity word count {}, expected {expected_words}",
+                words.len()
+            )));
+        }
+        Ok(Self { words, len, nulls })
     }
 }
 
@@ -836,6 +866,382 @@ impl RecordBatch {
             self.push_cells(cells.into_iter());
         }
     }
+
+    /// Build a columnar batch directly from row maps.
+    pub fn from_rows(rows: &[Row]) -> Self {
+        if rows.is_empty() {
+            return Self::empty(Arc::<[String]>::from([]));
+        }
+        let first_shape = rows[0].shape();
+        let same_shape = first_shape.is_some()
+            && rows.iter().all(|r| match (first_shape, r.shape()) {
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                (None, None) => true,
+                _ => false,
+            });
+        if same_shape {
+            let names_vec: Vec<String> = rows[0].keys().cloned().collect();
+            let mut batch = Self::with_capacity(Arc::<[String]>::from(names_vec), rows.len());
+            for row in rows {
+                for (col, cell) in batch.cols.iter_mut().zip(row.values()) {
+                    col.push(cell.clone_for_borrow());
+                }
+            }
+            return batch;
+        }
+
+        let mut name_set: BTreeSet<&str> = BTreeSet::new();
+        for row in rows {
+            for k in row.keys() {
+                name_set.insert(k.as_str());
+            }
+        }
+        if name_set.is_empty() {
+            return Self::empty(Arc::<[String]>::from([]));
+        }
+        let names_vec: Vec<String> = name_set.into_iter().map(str::to_owned).collect();
+        let names_arc: Arc<[String]> = names_vec.into();
+        let mut batch = Self::with_capacity(Arc::clone(&names_arc), rows.len());
+        for (col, name) in batch.cols.iter_mut().zip(names_arc.iter()) {
+            for row in rows {
+                let cell = row
+                    .get(name.as_str())
+                    .map(Cell::clone_for_borrow)
+                    .unwrap_or(Cell::Null);
+                col.push(cell);
+            }
+        }
+        batch
+    }
+
+    /// Encode this batch into the checksummed `LINB\x01` columnar wire format.
+    pub fn to_wire_bytes(&self) -> Vec<u8> {
+        let row_count = self.n();
+        let est = 32
+            + self
+                .cols
+                .iter()
+                .map(|c| c.heap_bytes().max(row_count))
+                .sum::<usize>();
+        let mut out = Vec::with_capacity(est);
+        out.extend_from_slice(BATCH_WIRE_MAGIC);
+        out.extend_from_slice(&(self.names.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(row_count as u64).to_le_bytes());
+        for name in self.names.iter() {
+            let b = name.as_bytes();
+            out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+            out.extend_from_slice(b);
+        }
+        for col in &self.cols {
+            debug_assert_eq!(col.len(), row_count);
+            write_wire_column(&mut out, col);
+        }
+        let crc = crate::crc::hardware_crc32c(&out);
+        out.extend_from_slice(BATCH_CRC_TAG);
+        out.extend_from_slice(&crc.to_le_bytes());
+        out
+    }
+
+    /// Decode a batch from the checksummed `LINB\x01` columnar wire format.
+    pub fn from_wire_bytes(bytes: &[u8]) -> Result<Self, Error> {
+        let min_len = BATCH_WIRE_MAGIC.len() + 4 + 8 + BATCH_CRC_TAG.len() + 4;
+        if bytes.len() < min_len {
+            return Err(Error::runtime("batch: wire payload too short"));
+        }
+        if &bytes[..BATCH_WIRE_MAGIC.len()] != BATCH_WIRE_MAGIC {
+            return Err(Error::runtime("batch: bad wire magic"));
+        }
+        let payload_len = bytes.len() - 8;
+        if &bytes[payload_len..payload_len + 4] != BATCH_CRC_TAG {
+            return Err(Error::runtime("batch: missing wire LCRC trailer"));
+        }
+        let want_crc = u32::from_le_bytes(bytes[payload_len + 4..].try_into().unwrap());
+        let got_crc = crate::crc::hardware_crc32c(&bytes[..payload_len]);
+        if got_crc != want_crc {
+            return Err(Error::runtime(format!(
+                "batch: wire CRC32C mismatch (expected {want_crc:#010x}, got {got_crc:#010x})"
+            )));
+        }
+
+        let mut cur = &bytes[BATCH_WIRE_MAGIC.len()..payload_len];
+        let col_count = read_u32_le(&mut cur)? as usize;
+        let row_count_u64 = read_u64_le(&mut cur)?;
+        let row_count = usize::try_from(row_count_u64)
+            .map_err(|_| Error::runtime("batch: row count overflow"))?;
+        if col_count.saturating_mul(4) > cur.len() {
+            return Err(Error::runtime("batch: truncated column headers"));
+        }
+        let mut names = Vec::with_capacity(col_count);
+        for _ in 0..col_count {
+            let nlen = read_u32_le(&mut cur)? as usize;
+            let nbytes = read_slice(&mut cur, nlen)?;
+            let name = std::str::from_utf8(nbytes)
+                .map_err(|e| Error::runtime(format!("batch: invalid utf8 column name: {e}")))?;
+            names.push(name.to_owned());
+        }
+        let mut cols = Vec::with_capacity(col_count);
+        for _ in 0..col_count {
+            cols.push(read_wire_column(&mut cur, row_count)?);
+        }
+        if !cur.is_empty() {
+            return Err(Error::runtime("batch: trailing bytes in wire payload"));
+        }
+        Ok(Self {
+            names: names.into(),
+            cols,
+        })
+    }
+}
+
+#[inline]
+pub(crate) fn read_u8(cur: &mut &[u8]) -> Result<u8, Error> {
+    let (&b, rest) = cur
+        .split_first()
+        .ok_or_else(|| Error::runtime("batch: unexpected end of wire stream"))?;
+    *cur = rest;
+    Ok(b)
+}
+
+#[inline]
+pub(crate) fn read_u32_le(cur: &mut &[u8]) -> Result<u32, Error> {
+    let s = read_slice(cur, 4)?;
+    Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+}
+
+#[inline]
+pub(crate) fn read_u64_le(cur: &mut &[u8]) -> Result<u64, Error> {
+    let s = read_slice(cur, 8)?;
+    Ok(u64::from_le_bytes([
+        s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
+    ]))
+}
+
+#[inline]
+pub(crate) fn read_i64_le(cur: &mut &[u8]) -> Result<i64, Error> {
+    Ok(read_u64_le(cur)? as i64)
+}
+
+#[inline]
+pub(crate) fn read_slice<'a>(cur: &mut &'a [u8], len: usize) -> Result<&'a [u8], Error> {
+    if len > cur.len() {
+        return Err(Error::runtime("batch: truncated wire frame"));
+    }
+    let (head, tail) = cur.split_at(len);
+    *cur = tail;
+    Ok(head)
+}
+
+pub(crate) fn write_wire_cell(out: &mut Vec<u8>, cell: &Cell) {
+    match cell {
+        Cell::Null => out.push(0),
+        Cell::Int(i) => {
+            out.push(1);
+            out.extend_from_slice(&i.to_le_bytes());
+        }
+        Cell::Float(f) => {
+            out.push(2);
+            out.extend_from_slice(&f.to_bits().to_le_bytes());
+        }
+        Cell::Bool(b) => {
+            out.push(3);
+            out.push(u8::from(*b));
+        }
+        Cell::Time(t) => {
+            out.push(4);
+            out.extend_from_slice(&t.to_le_bytes());
+        }
+        Cell::Text(s) => {
+            let b = s.as_bytes();
+            out.push(5);
+            out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+            out.extend_from_slice(b);
+        }
+        Cell::SmallText(s) => {
+            let b = s.as_str().as_bytes();
+            out.push(5);
+            out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+            out.extend_from_slice(b);
+        }
+        Cell::Vec(v) => {
+            out.push(6);
+            out.extend_from_slice(&(v.len() as u32).to_le_bytes());
+            for &x in v.iter() {
+                out.extend_from_slice(&x.to_bits().to_le_bytes());
+            }
+        }
+    }
+}
+
+pub(crate) fn read_wire_cell(cur: &mut &[u8]) -> Result<Cell, Error> {
+    let tag = read_u8(cur)?;
+    match tag {
+        0 => Ok(Cell::Null),
+        1 => Ok(Cell::Int(read_i64_le(cur)?)),
+        2 => Ok(Cell::Float(f64::from_bits(read_u64_le(cur)?))),
+        3 => match read_u8(cur)? {
+            0 => Ok(Cell::Bool(false)),
+            1 => Ok(Cell::Bool(true)),
+            other => Err(Error::runtime(format!("batch: invalid bool byte {other}"))),
+        },
+        4 => Ok(Cell::Time(read_i64_le(cur)?)),
+        5 => {
+            let len = read_u32_le(cur)? as usize;
+            let bytes = read_slice(cur, len)?;
+            let s = std::str::from_utf8(bytes)
+                .map_err(|e| Error::runtime(format!("batch: invalid utf8 cell text: {e}")))?;
+            Ok(Cell::from_text(s))
+        }
+        6 => {
+            let dim = read_u32_le(cur)? as usize;
+            let byte_len = dim
+                .checked_mul(4)
+                .ok_or_else(|| Error::runtime("batch: vec dim overflow"))?;
+            let bytes = read_slice(cur, byte_len)?;
+            let mut vec = Vec::with_capacity(dim);
+            for chunk in bytes.chunks_exact(4) {
+                vec.push(f32::from_bits(u32::from_le_bytes([
+                    chunk[0], chunk[1], chunk[2], chunk[3],
+                ])));
+            }
+            Ok(Cell::Vec(vec.into()))
+        }
+        other => Err(Error::runtime(format!("batch: unknown cell tag {other}"))),
+    }
+}
+
+fn write_validity(out: &mut Vec<u8>, valid: &Validity) {
+    let (words, _, nulls) = valid.raw_parts();
+    out.extend_from_slice(&(nulls as u64).to_le_bytes());
+    out.extend_from_slice(&(words.len() as u32).to_le_bytes());
+    for &w in words {
+        out.extend_from_slice(&w.to_le_bytes());
+    }
+}
+
+fn read_validity(cur: &mut &[u8], row_count: usize) -> Result<Validity, Error> {
+    let nulls_u64 = read_u64_le(cur)?;
+    let nulls = usize::try_from(nulls_u64)
+        .map_err(|_| Error::runtime("batch: validity null count overflow"))?;
+    let word_count = read_u32_le(cur)? as usize;
+    let byte_len = word_count
+        .checked_mul(8)
+        .ok_or_else(|| Error::runtime("batch: validity byte overflow"))?;
+    let raw = read_slice(cur, byte_len)?;
+    let mut words = Vec::with_capacity(word_count);
+    for chunk in raw.chunks_exact(8) {
+        words.push(u64::from_le_bytes([
+            chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+        ]));
+    }
+    Validity::from_raw_parts(words, row_count, nulls)
+}
+
+fn write_wire_column(out: &mut Vec<u8>, col: &Column) {
+    match col {
+        Column::Nulls { .. } => out.push(0),
+        Column::Int { vals, valid } => {
+            out.push(1);
+            write_validity(out, valid);
+            for &v in vals {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        Column::Time { vals, valid } => {
+            out.push(2);
+            write_validity(out, valid);
+            for &v in vals {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        Column::Float { vals, valid } => {
+            out.push(3);
+            write_validity(out, valid);
+            for &v in vals {
+                out.extend_from_slice(&v.to_bits().to_le_bytes());
+            }
+        }
+        Column::Bool { vals, valid } => {
+            out.push(4);
+            write_validity(out, valid);
+            for &b in vals {
+                out.push(u8::from(b));
+            }
+        }
+        Column::Cells(cells) => {
+            out.push(5);
+            for c in cells {
+                write_wire_cell(out, c);
+            }
+        }
+    }
+}
+
+fn read_wire_column(cur: &mut &[u8], row_count: usize) -> Result<Column, Error> {
+    let tag = read_u8(cur)?;
+    match tag {
+        0 => Ok(Column::Nulls {
+            n: row_count,
+            cap: row_count,
+        }),
+        1 | 2 => {
+            let valid = read_validity(cur, row_count)?;
+            let byte_len = row_count
+                .checked_mul(8)
+                .ok_or_else(|| Error::runtime("batch: i64 column overflow"))?;
+            let raw = read_slice(cur, byte_len)?;
+            let mut vals = Vec::with_capacity(row_count);
+            for chunk in raw.chunks_exact(8) {
+                vals.push(i64::from_le_bytes([
+                    chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+                ]));
+            }
+            if tag == 1 {
+                Ok(Column::Int { vals, valid })
+            } else {
+                Ok(Column::Time { vals, valid })
+            }
+        }
+        3 => {
+            let valid = read_validity(cur, row_count)?;
+            let byte_len = row_count
+                .checked_mul(8)
+                .ok_or_else(|| Error::runtime("batch: f64 column overflow"))?;
+            let raw = read_slice(cur, byte_len)?;
+            let mut vals = Vec::with_capacity(row_count);
+            for chunk in raw.chunks_exact(8) {
+                vals.push(f64::from_bits(u64::from_le_bytes([
+                    chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+                ])));
+            }
+            Ok(Column::Float { vals, valid })
+        }
+        4 => {
+            let valid = read_validity(cur, row_count)?;
+            let raw = read_slice(cur, row_count)?;
+            let mut vals = Vec::with_capacity(row_count);
+            for &b in raw {
+                match b {
+                    0 => vals.push(false),
+                    1 => vals.push(true),
+                    other => {
+                        return Err(Error::runtime(format!("batch: invalid bool byte {other}")));
+                    }
+                }
+            }
+            Ok(Column::Bool { vals, valid })
+        }
+        5 => {
+            if row_count > cur.len() {
+                return Err(Error::runtime("batch: truncated cell column"));
+            }
+            let mut cells = Vec::with_capacity(row_count);
+            for _ in 0..row_count {
+                cells.push(read_wire_cell(cur)?);
+            }
+            Ok(Column::Cells(cells))
+        }
+        other => Err(Error::runtime(format!("batch: unknown column tag {other}"))),
+    }
 }
 
 #[cfg(test)]
@@ -996,5 +1402,43 @@ mod tests {
         batch.drain_prefix(1);
         batch.truncate(1);
         assert_eq!(batch.to_rows(), out[1..2]);
+    }
+
+    #[test]
+    fn wire_codec_round_trips_all_column_types_and_rejects_corruption() {
+        let mut r0 = Row::new();
+        r0.insert("id", Cell::from_text("r0"));
+        r0.insert("qty", Cell::Int(42));
+        r0.insert("ratio", Cell::Float(1.25));
+        r0.insert("ok", Cell::Bool(true));
+        r0.insert("ts", Cell::Time(1_700_000_000_000));
+        r0.insert("vec", Cell::Vec(Arc::from([0.25f32, 0.75f32])));
+
+        let mut r1 = Row::new();
+        r1.insert("id", Cell::from_text("a_much_longer_heap_allocated_string_value"));
+        r1.insert("qty", Cell::Null);
+        r1.insert("ok", Cell::Bool(false));
+        r1.insert("only_null", Cell::Null);
+
+        let batch = RecordBatch::from_rows(&[r0, r1]);
+        assert_eq!(batch.n(), 2);
+        let wire = batch.to_wire_bytes();
+        let decoded = RecordBatch::from_wire_bytes(&wire).unwrap();
+        assert_eq!(decoded, batch);
+        assert_eq!(decoded.to_rows(), batch.to_rows());
+
+        // Empty batch round-trips cleanly.
+        let empty = RecordBatch::from_rows(&[]);
+        assert_eq!(empty.n(), 0);
+        let empty_wire = empty.to_wire_bytes();
+        assert_eq!(RecordBatch::from_wire_bytes(&empty_wire).unwrap(), empty);
+
+        // Single bit flip in payload is rejected by CRC32C.
+        let mut bad = wire.clone();
+        bad[10] ^= 0x01;
+        assert!(RecordBatch::from_wire_bytes(&bad).is_err());
+
+        // Truncated wire payload is rejected cleanly.
+        assert!(RecordBatch::from_wire_bytes(&wire[..wire.len() - 1]).is_err());
     }
 }

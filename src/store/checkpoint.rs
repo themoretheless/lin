@@ -45,7 +45,7 @@ fn cleanup_disk_files(dir: &Path) {
     let _ = std::fs::remove_dir_all(dir.join(SEGMENTS_DIR));
 }
 
-fn populate_store_from_native_engine(
+pub(crate) fn populate_store_from_native_engine(
     eng: DiskEngine,
     cat: &Catalog,
     writer_lock: Option<Arc<std::fs::File>>,
@@ -148,6 +148,44 @@ fn populate_store_from_native_engine(
     });
     store.rebuild_indexes();
     store
+}
+
+fn attach_cold_disk_engine(
+    store: &mut Store,
+    eng: DiskEngine,
+    dir: &Path,
+    cold_collections: &[String],
+) -> Result<(), Error> {
+    if let Some(missing) = cold_collections.iter().find(|name| !eng.has_table(name)) {
+        return Err(Error::runtime(format!(
+            "cold collection {missing} is missing from the disk tier in '{}'",
+            dir.display()
+        )));
+    }
+    let mut tables = BTreeMap::new();
+    for name in cold_collections {
+        if eng.has_table(name) {
+            let nrows = eng.count_table(name);
+            store.col_counts.insert(name.clone(), nrows);
+            store.collections.insert(name.clone(), Vec::new());
+            tables.insert(
+                name.clone(),
+                DiskColLazy {
+                    row_count: nrows,
+                    materialized: OnceLock::new(),
+                },
+            );
+        }
+    }
+    if !tables.is_empty() {
+        store.disk = Some(StoreDiskTier {
+            engine: Arc::new(RwLock::new(eng)),
+            tables,
+            native_disk: false,
+            writer_lock: None,
+        });
+    }
+    Ok(())
 }
 
 impl Store {
@@ -459,6 +497,23 @@ impl Store {
         Ok(store)
     }
 
+    pub(crate) fn from_snapshot_with_disk_engine(
+        dir: &Path,
+        mut s: Snapshot,
+        eng: Option<DiskEngine>,
+    ) -> Result<Self, Error> {
+        let cold = std::mem::take(&mut s.cold_collections);
+        let mut store = Self::from_snapshot_unindexed(dir, s)?;
+        if !cold.is_empty()
+            && let Some(eng) = eng
+        {
+            attach_cold_disk_engine(&mut store, eng, dir, &cold)?;
+        }
+        store.rebuild_indexes();
+        store.rebuild_row_maps();
+        Ok(store)
+    }
+
     pub(super) fn from_snapshot_unindexed(dir: &Path, mut s: Snapshot) -> Result<Self, Error> {
         let col_counts = {
             let mut counts = FxHashMap::default();
@@ -534,35 +589,7 @@ impl Store {
         }
         if !s.cold_collections.is_empty() {
             let eng = DiskEngine::open_read_only(dir)?;
-            if let Some(missing) = s.cold_collections.iter().find(|name| !eng.has_table(name)) {
-                return Err(Error::runtime(format!(
-                    "cold collection {missing} is missing from the disk tier in '{}'",
-                    dir.display()
-                )));
-            }
-            let mut tables = BTreeMap::new();
-            for name in &s.cold_collections {
-                if eng.has_table(name) {
-                    let nrows = eng.count_table(name);
-                    store.col_counts.insert(name.clone(), nrows);
-                    store.collections.insert(name.clone(), Vec::new());
-                    tables.insert(
-                        name.clone(),
-                        DiskColLazy {
-                            row_count: nrows,
-                            materialized: OnceLock::new(),
-                        },
-                    );
-                }
-            }
-            if !tables.is_empty() {
-                store.disk = Some(StoreDiskTier {
-                    engine: Arc::new(RwLock::new(eng)),
-                    tables,
-                    native_disk: false,
-                    writer_lock: None,
-                });
-            }
+            attach_cold_disk_engine(&mut store, eng, dir, &s.cold_collections)?;
         }
         Ok(store)
     }

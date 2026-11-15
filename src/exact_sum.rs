@@ -48,10 +48,15 @@ impl ExactSum {
     }
 
     /// A sum assembled from an exact integer part and a float part computed elsewhere
-    /// (the GPU) with the same compensated additions as [`Self::add_f64`].
-    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+    /// (the GPU or a distributed shard partial state) with the same compensated additions
+    /// as [`Self::add_f64`].
     pub(crate) fn from_parts(int: i128, float: f64, comp: f64) -> Self {
         Self { int, float, comp }
+    }
+
+    /// Decompose into exact integer part, float part, and Neumaier compensation term.
+    pub(crate) fn into_parts(self) -> (i128, f64, f64) {
+        (self.int, self.float, self.comp)
     }
 
     #[inline]

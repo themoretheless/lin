@@ -143,16 +143,80 @@ pub async fn pull_with_async(
         .map_err(|e| Error::runtime(format!("async join: {e}")))?
 }
 
-/// Pull WAL frames with token / TLS.
-pub fn pull_with(addr: impl ToSocketAddrs, since: u64, opts: &PullOpts) -> Result<Vec<u8>, Error> {
+/// Transport stream shared between WAL shipping, cluster RPCs, and remote cold store.
+pub(crate) enum NetStream {
+    Plain(TcpStream),
+    TlsClient(Box<StreamOwned<rustls::ClientConnection, TcpStream>>),
+    TlsServer(Box<StreamOwned<ServerConnection, TcpStream>>),
+}
+
+impl NetStream {
+    pub(crate) fn set_timeout(&self, dur: Option<Duration>) -> Result<(), Error> {
+        let tcp = match self {
+            NetStream::Plain(s) => s,
+            NetStream::TlsClient(s) => &s.sock,
+            NetStream::TlsServer(s) => &s.sock,
+        };
+        tcp.set_read_timeout(dur).map_err(io_err)?;
+        tcp.set_write_timeout(dur).map_err(io_err)?;
+        Ok(())
+    }
+}
+
+impl Read for NetStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            NetStream::Plain(s) => s.read(buf),
+            NetStream::TlsClient(s) => s.read(buf),
+            NetStream::TlsServer(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for NetStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            NetStream::Plain(s) => s.write(buf),
+            NetStream::TlsClient(s) => s.write(buf),
+            NetStream::TlsServer(s) => s.write(buf),
+        }
+    }
+
+    fn write_vectored(&mut self, bufs: &[std::io::IoSlice<'_>]) -> std::io::Result<usize> {
+        match self {
+            NetStream::Plain(s) => s.write_vectored(bufs),
+            NetStream::TlsClient(s) => s.write_vectored(bufs),
+            NetStream::TlsServer(s) => s.write_vectored(bufs),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            NetStream::Plain(s) => s.flush(),
+            NetStream::TlsClient(s) => s.flush(),
+            NetStream::TlsServer(s) => s.flush(),
+        }
+    }
+}
+
+pub(crate) fn connect_net_stream(
+    addr: &str,
+    opts: &PullOpts,
+    timeout: Duration,
+) -> Result<NetStream, Error> {
+    connect_net_stream_addrs(addr, opts, timeout)
+}
+
+fn connect_net_stream_addrs(
+    addr: impl ToSocketAddrs,
+    opts: &PullOpts,
+    timeout: Duration,
+) -> Result<NetStream, Error> {
     let stream = TcpStream::connect(addr).map_err(io_err)?;
     let _ = stream.set_nodelay(true);
-    stream
-        .set_read_timeout(Some(Duration::from_secs(30)))
-        .map_err(io_err)?;
-    stream
-        .set_write_timeout(Some(Duration::from_secs(30)))
-        .map_err(io_err)?;
+    let dur = (!timeout.is_zero()).then_some(timeout);
+    stream.set_read_timeout(dur).map_err(io_err)?;
+    stream.set_write_timeout(dur).map_err(io_err)?;
     if let TlsClient::Insecure = &opts.tls {
         let is_local = stream
             .peer_addr()
@@ -165,16 +229,23 @@ pub fn pull_with(addr: impl ToSocketAddrs, since: u64, opts: &PullOpts) -> Resul
         }
     }
     match &opts.tls {
-        TlsClient::Off => pull_io(stream, since, opts.token.as_deref()),
+        TlsClient::Off => Ok(NetStream::Plain(stream)),
         other => {
             let cfg = client_config(other)?;
             let host = opts.server_name.as_deref().unwrap_or("localhost");
             let name = ServerName::try_from(host.to_owned()).map_err(io_err)?;
             let conn = rustls::ClientConnection::new(cfg, name).map_err(io_err)?;
-            let mut tls = StreamOwned::new(conn, stream);
-            pull_io(&mut tls, since, opts.token.as_deref())
+            Ok(NetStream::TlsClient(Box::new(StreamOwned::new(
+                conn, stream,
+            ))))
         }
     }
+}
+
+/// Pull WAL frames with token / TLS.
+pub fn pull_with(addr: impl ToSocketAddrs, since: u64, opts: &PullOpts) -> Result<Vec<u8>, Error> {
+    let stream = connect_net_stream_addrs(addr, opts, Duration::from_secs(30))?;
+    pull_io(stream, since, opts.token.as_deref())
 }
 
 fn pull_io<S: Read + Write>(
@@ -300,6 +371,30 @@ fn client_config(tls: &TlsClient) -> Result<Arc<ClientConfig>, Error> {
                     .with_no_client_auth(),
             ))
         }
+    }
+}
+
+pub(crate) fn build_server_tls(tls: &TlsServer) -> Result<Arc<ServerConfig>, Error> {
+    server_config(tls)
+}
+
+pub(crate) fn accept_net_stream(
+    stream: TcpStream,
+    tls: Option<Arc<ServerConfig>>,
+    timeout: Duration,
+) -> Result<NetStream, Error> {
+    let _ = stream.set_nodelay(true);
+    let dur = (!timeout.is_zero()).then_some(timeout);
+    stream.set_read_timeout(dur).map_err(io_err)?;
+    stream.set_write_timeout(dur).map_err(io_err)?;
+    match tls {
+        Some(cfg) => {
+            let conn = ServerConnection::new(cfg).map_err(io_err)?;
+            Ok(NetStream::TlsServer(Box::new(StreamOwned::new(
+                conn, stream,
+            ))))
+        }
+        None => Ok(NetStream::Plain(stream)),
     }
 }
 
@@ -530,21 +625,8 @@ fn handle_conn(
     expect_token: Option<&str>,
     tls: Option<Arc<ServerConfig>>,
 ) -> Result<(), Error> {
-    let _ = stream.set_nodelay(true);
-    stream
-        .set_read_timeout(Some(Duration::from_secs(30)))
-        .map_err(io_err)?;
-    stream
-        .set_write_timeout(Some(Duration::from_secs(30)))
-        .map_err(io_err)?;
-    match tls {
-        Some(cfg) => {
-            let conn = ServerConnection::new(cfg).map_err(io_err)?;
-            let mut tls = StreamOwned::new(conn, stream);
-            handle_io(db, &mut tls, expect_token)
-        }
-        None => handle_io(db, stream, expect_token),
-    }
+    let net = accept_net_stream(stream, tls, Duration::from_secs(30))?;
+    handle_io(db, net, expect_token)
 }
 
 fn handle_io<S: Read + Write>(

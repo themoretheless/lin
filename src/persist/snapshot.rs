@@ -414,7 +414,7 @@ pub fn encode_snapshot_compressed(snap: &Snapshot) -> Result<Vec<u8>, Error> {
     }
 }
 
-pub(super) fn decode_snapshot_bytes(bytes: &[u8]) -> Option<Snapshot> {
+pub(crate) fn decode_snapshot_bytes(bytes: &[u8]) -> Option<Snapshot> {
     if bytes.len() >= 5 && bytes[1..5] == SNAPSHOT_MAGIC {
         let compressor = bytes[0];
         let compressed_data = &bytes[5..];

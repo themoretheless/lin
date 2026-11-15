@@ -13,6 +13,7 @@
 mod cache;
 mod columns;
 mod index;
+pub mod remote;
 mod segment;
 #[cfg(test)]
 mod tests;
@@ -31,6 +32,11 @@ use smallvec::SmallVec;
 pub use cache::{HotCacheConfig, HotCacheStats, HotTierCache};
 pub use columns::{MmapVecCol, MmapVecIvf};
 pub use index::{MmapBm25Builder, MmapBm25Index};
+pub use remote::{
+    ColdObjectStore, FsObjectStore, MemoryObjectStore, ObjectStoreCounters, RemoteCacheConfig,
+    RemoteSegEntry, RemoteSyncStats, S3Config, S3HttpObjectStore, pack_segment_dir,
+    unpack_segment_dir,
+};
 pub use segment::DiskSegment;
 
 pub(crate) use columns::MmapCol;
@@ -1194,6 +1200,7 @@ pub struct DiskEngine {
     pub(crate) wal_bytes: u64,
     sync_full: bool,
     read_only: bool,
+    pub(crate) remote_tier: Option<remote::RemoteTier>,
 }
 
 #[derive(Debug, Clone)]
@@ -1307,6 +1314,7 @@ impl DiskEngine {
             wal_bytes: 0,
             sync_full,
             read_only: false,
+            remote_tier: None,
         };
         engine.replay_wal()?;
         Ok(engine)
@@ -1363,6 +1371,7 @@ impl DiskEngine {
             wal_bytes: 0,
             sync_full: false,
             read_only: true,
+            remote_tier: None,
         };
         let wal_path = dir.join(WAL_FILE);
         if wal_path.exists() {
@@ -1402,6 +1411,7 @@ impl DiskEngine {
             wal_bytes: 0,
             sync_full: false,
             read_only: true,
+            remote_tier: self.remote_tier.clone(),
         }
     }
 
@@ -2582,20 +2592,29 @@ impl DiskEngine {
     /// Exact live row count in O(#segments).
     pub fn count_table(&self, table: &str) -> usize {
         let mem_live = self.memtables.get(table).map_or(0, MemTable::live_count);
-        let seg_live: usize = self
-            .segments
-            .get(table)
-            .map(|segs| {
-                segs.iter()
-                    .map(|s| {
-                        (s.meta
-                            .row_count
-                            .saturating_sub(self.tombstones.dead_count(s.meta.seg_id)))
-                            as usize
-                    })
-                    .sum()
-            })
-            .unwrap_or(0);
+        let seg_live: usize = if let Some(segs) = self.segments.get(table) {
+            segs.iter()
+                .map(|s| {
+                    (s.meta
+                        .row_count
+                        .saturating_sub(self.tombstones.dead_count(s.meta.seg_id)))
+                        as usize
+                })
+                .sum()
+        } else if self.remote_tier.is_some() {
+            self.manifest
+                .segments
+                .iter()
+                .filter(|m| m.table == table)
+                .map(|m| {
+                    (m.row_count
+                        .saturating_sub(self.tombstones.dead_count(m.seg_id)))
+                        as usize
+                })
+                .sum()
+        } else {
+            0
+        };
         mem_live + seg_live
     }
 

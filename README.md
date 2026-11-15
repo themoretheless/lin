@@ -1,10 +1,13 @@
 # Lin
 
-Lin — язык своей локальной БД: пайпы, типизированный каталог, два мира записи (`append` / reducer), свой план. Не SQL и не Kusto.
+Lin — язык и движок БД (встраиваемый локально, сетевой primary/replica, горизонтально шардированный и с холодным уровнем в Object Storage): пайпы, типизированный каталог, два мира записи (`append` / reducer), свой план и Kusto-подобная аналитика поверх горячего и холодного уровней. Не SQL.
 
-**0.4** — встраиваемая локальная БД: durable `--data`, backup, multi-reader, compaction, flock, quotas, `SyncMode`, cold/mmap, WAL shipping, durable follower, **stable** Queryable/cursor/typed/async, **FTS postings** (`FtsSeek`) + lazy hop/search. Не multi-writer.
+**0.4** — быстрое single-writer ядро (durable `--data`, backup, multi-reader `ReadDb`, compaction, flock, quotas, `SyncMode`, cold/mmap + zone maps/trigram Bloom, WAL shipping, durable follower, **stable** Queryable/cursor/typed/async, **FTS postings** `FtsSeek` + lazy hop/search) **и распределённый контур**:
+1. Сетевой TCP/TLS-сервер (`LinServer` / `ServerClient` / `ReplicaPoolClient`, протокол `LINS\x01` + `LCRC`): batch group-commit на primary, lock-free пул читателей, `Consistency::{Weak, Session, AtLeastGen, Strong}`, `WorkloadGroup` и догон реплик (WAL + cold bootstrap).
+2. Горизонтальный шардинг (`ShardRouter` / `ShardedCluster`): Jump Consistent Hash, прунинг шардов по предикатам, параллельные DML/DDL и `insert_batch` (`Column::gather`), двухфазные распределённые `summarize` (HLL `dcount`, t-digest `percentile`, `arg_max`/`arg_min`), whole-row `ArgExtremum` и top-k pushdown (`sort | skip | take | window`).
+3. Холодный уровень в Object Storage (`ColdObjectStore`, `FsObjectStore`, HTTP/1.1 + `rustls` SigV4 `S3HttpObjectStore`): `.lseg` CRC32C-бандлы, манифест `LRMF\x01`, lazy 1-GET открытие (`RemoteCacheConfig`), гидратация таблиц по требованию (`run_remote`) и табличный LRU-кэш (`evict_cold_cache_to`).
 
-Сейчас есть парсер, typecheck, IR плана, in-memory store (один reducer, один `gen`), исполнитель, WAL+snapshot с compaction, `backup` CLI, durable follower, **живой search lex/vec/hybrid** (FTS postings + hashing-эмбеддер по `embed_id`). DuckDB/WASM backends и multi-writer в этом milestone нет.
+Сейчас в репозитории есть парсер, typecheck, IR плана, in-memory/cold columnar store (один писатель на шард/узел, lock-free `ReadDb`), WAL+snapshot с compaction, сетевой RPC, шардированный кластер и S3/FS cold offload, а также CLI-подкоманды `serve`, `client`, `shard` и `remote`. DuckDB/WASM backends и multi-master записи в один и тот же шард нет.
 
 ## Стабильный API (0.3+)
 
@@ -651,3 +654,83 @@ Workflow `.github/workflows/compute.yml` добавляет эту провер�
 API/примеров и сборку без GPU для Linux/macOS/Windows. Hardware-тесты запускаются
 отдельно командой `cargo test --release --features gpu --test gpu -- --ignored`;
 обычный CI не является доказательством исполнения на физическом GPU.
+
+---
+
+## Сетевой режим, шардирование и холодный уровень в Object Storage
+
+### 1. Сетевой сервер и read-your-writes реплики (`src/server.rs`, CLI `serve` / `client`)
+
+```rust
+use lin::{ClientOpts, Consistency, Db, LinServer, NodeRole, ReplicaPoolClient, ServerConfig};
+
+let db = Db::open_with("./data", lin::OpenOpts { cold: true, ..Default::default() })?;
+let primary = LinServer::start(db, ServerConfig {
+    bind_addr: "127.0.0.1:7443".into(),
+    role: NodeRole::Primary,
+    ..Default::default()
+})?;
+
+let pool = ReplicaPoolClient::connect(
+    primary.local_addr().to_string(),
+    &["127.0.0.1:7444".into()],
+    ClientOpts { consistency: Consistency::Session, ..Default::default() },
+)?;
+pool.execute(r#"insert events { id: "e1", tenant: "acme", val: 42 }"#)?;
+let batch = pool.query("events | summarize { n: count(), total: sum(val) } by [ tenant ]")?;
+```
+
+CLI:
+```sh
+lin --data ./primary --cold serve --listen 127.0.0.1:7443 --token secret
+lin --data ./replica --follower --cold serve --listen 127.0.0.1:7444 --primary 127.0.0.1:7443 --token secret
+lin client --connect 127.0.0.1:7443 --replica 127.0.0.1:7444 --consistency session --token secret 'events | take 10'
+```
+
+### 2. Горизонтальный шардинг (`src/cluster.rs`, CLI `shard`)
+
+```rust
+use std::collections::BTreeMap;
+use lin::{ShardStrategy, ShardedCluster};
+
+let keys = BTreeMap::from([("events".into(), "tenant".into())]);
+let cluster = ShardedCluster::start_in_memory(3, keys, ShardStrategy::JumpConsistentHash)?;
+let router = cluster.router();
+router.execute(r#"col events { id: text, tenant: text, val: i64 }"#)?;
+router.execute(r#"insert events { id: "e1", tenant: "acme", val: 10 }"#)?;
+let (batch, stats) = router.query_with_stats("events | summarize { n: count(), total: sum(val) } by [ tenant ]")?;
+assert_eq!(stats.shards_queried, 3);
+```
+
+CLI:
+```sh
+lin shard --shards 127.0.0.1:7441,127.0.0.1:7442,127.0.0.1:7443 --key events=tenant --strategy jump 'events | summarize { n: count() } by [ tenant ]'
+```
+
+### 3. Object Storage для холодного уровня (`src/disk/remote.rs`, CLI `remote`)
+
+```rust
+use std::sync::Arc;
+use lin::{Db, FsObjectStore, OpenOpts, RemoteCacheConfig};
+
+let store = Arc::new(FsObjectStore::open("./s3_mock")?);
+let mut local = Db::open_with("./hot_cold", OpenOpts { cold: true, ..Default::default() })?;
+// ... запись и checkpoint ...
+let _sync = local.push_cold_to_object_store(store.as_ref(), "prod/cluster1", true)?;
+
+let mut reader = Db::open_cold_from_object_store(
+    "./cold_cache",
+    store,
+    "prod/cluster1",
+    RemoteCacheConfig { lazy: true, max_local_bytes: 64 * 1024 * 1024 },
+)?;
+let h = reader.run_remote("events | tenant == \"acme\" | take 20")?;
+reader.evict_cold_cache_to(1024 * 1024)?;
+```
+
+CLI:
+```sh
+lin --data ./hot_cold --cold remote push --store ./obj --prefix prod/cluster1 --prune
+lin --data ./cold_cache remote run --store ./obj --prefix prod/cluster1 --lazy 'events | take 10'
+lin --data ./cold_cache remote evict --store ./obj --prefix prod/cluster1 --max-cache-bytes 1048576
+```

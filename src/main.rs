@@ -23,6 +23,10 @@ fn main() -> ExitCode {
         Some("wal-serve") => cmd_wal_serve(&rest[1..], data),
         Some("follower") => cmd_follower(&rest[1..], data),
         Some("cache") | Some("cacha") => cmd_cache(&rest[1..], data),
+        Some("serve") => cmd_serve(&rest[1..], data, follower),
+        Some("client") => cmd_client(&rest[1..]),
+        Some("shard") => cmd_shard(&rest[1..]),
+        Some("remote") => cmd_remote(&rest[1..], data),
         Some("stats") => cmd_stats(data, follower),
         Some("cluster") => cmd_cluster(&rest[1..], data, follower),
         Some("compact") => cmd_compact(&rest[1..], data, follower),
@@ -321,6 +325,10 @@ fn usage(code: u8) -> ExitCode {
          lin backup import <file.json> [--data <dir>]\n  \
          lin [--data <dir>] cache serve [--node-id ID] [--listen HOST:PORT] [--peer ID=HOST:PORT] [--max-entries N]\n  \
          lin cache cli [--connect HOST:PORT] [COMMAND...]\n  \
+         lin [--data <dir>] [--cold] [--follower] serve [--listen HOST:PORT] [--token TOKEN] [--tls-cert PEM --tls-key PEM] [--primary HOST:PORT] [--group-window-ms MS] [--max-group-size N] [--max-group-bytes BYTES]\n  \
+         lin client --connect HOST:PORT [--replica HOST:PORT ...] [--consistency weak|session|strong|gen:N] [--token TOKEN] [--tls-ca PEM | --tls-insecure] [--workload-group NAME] [--file <path> | - | '<query>']\n  \
+         lin shard --shards H1:P1,H2:P2 [--key COL=FIELD ...] [--strategy jump|mod] [--token TOKEN] [--file <path> | - | '<query>']\n  \
+         lin --data <dir> remote push|pull|hydrate|evict --store fs://<dir>|s3://<bucket>[/<prefix>] [--endpoint URL] [--region R] [--max-cache-bytes N] [--lazy] [COLLECTION | '<query>']\n  \
          lin [--data <dir>] [--follower] stats\n  \
          lin --data <dir> --cold cluster <collection> [<field> | --none]\n  \
          lin --data <dir> --cold compact <collection>\n  \
@@ -1226,4 +1234,706 @@ fn cmd_cache(args: &[String], data: Option<PathBuf>) -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+fn parse_consistency_flag(s: &str) -> Result<lin::Consistency, String> {
+    match s {
+        "weak" => Ok(lin::Consistency::Weak),
+        "session" => Ok(lin::Consistency::Session),
+        "strong" => Ok(lin::Consistency::Strong),
+        other => {
+            if let Some(rest) = other.strip_prefix("gen:") {
+                let g = rest
+                    .parse::<u64>()
+                    .map_err(|_| format!("invalid generation in consistency {other:?}"))?;
+                Ok(lin::Consistency::AtLeastGen(g))
+            } else {
+                Err(format!(
+                    "unknown consistency {other:?}; expected weak, session, strong, or gen:<n>"
+                ))
+            }
+        }
+    }
+}
+
+fn format_batch_cli(batch: &lin::RecordBatch) -> String {
+    let rows = batch.to_rows();
+    if rows.is_empty() {
+        return "(0 rows)".to_string();
+    }
+    let mut out = String::new();
+    for r in &rows {
+        let mut first = true;
+        out.push('{');
+        for (k, v) in r.iter() {
+            if !first {
+                out.push_str(", ");
+            }
+            first = false;
+            out.push_str(k);
+            out.push_str(": ");
+            match v {
+                lin::Cell::Null => out.push_str("null"),
+                lin::Cell::Bool(b) => out.push_str(&format!("{b}")),
+                lin::Cell::Int(i) => out.push_str(&format!("{i}")),
+                lin::Cell::Float(f) => out.push_str(&format!("{f}")),
+                lin::Cell::Time(t) => out.push_str(&format!("timestamp({t})")),
+                lin::Cell::Text(s) => out.push_str(&format!("{s:?}")),
+                lin::Cell::SmallText(s) => out.push_str(&format!("{:?}", s.as_str())),
+                lin::Cell::Vec(vec) => out.push_str(&format!("vec[{}]", vec.len())),
+            }
+        }
+        out.push_str("}\n");
+    }
+    out
+}
+
+fn cmd_serve(args: &[String], data: Option<PathBuf>, follower: bool) -> ExitCode {
+    let cold = COLD.load(Ordering::Relaxed);
+    let mut listen = "127.0.0.1:7443".to_string();
+    let mut token: Option<String> = None;
+    let mut tls_cert: Option<PathBuf> = None;
+    let mut tls_key: Option<PathBuf> = None;
+    let mut primary: Option<String> = None;
+    let mut tls_ca: Option<PathBuf> = None;
+    let mut tls_insecure = false;
+    let mut window_ms: u64 = 2;
+    let mut max_group_size: usize = 64;
+    let mut max_group_bytes: usize = 4 * 1024 * 1024;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--listen" => {
+                i += 1;
+                let Some(v) = args.get(i) else {
+                    eprintln!("--listen requires HOST:PORT");
+                    return ExitCode::from(2);
+                };
+                listen = v.clone();
+            }
+            "--token" => {
+                i += 1;
+                let Some(v) = args.get(i) else {
+                    eprintln!("--token requires TOKEN");
+                    return ExitCode::from(2);
+                };
+                token = Some(v.clone());
+            }
+            "--tls-cert" => {
+                i += 1;
+                let Some(v) = args.get(i) else {
+                    eprintln!("--tls-cert requires path");
+                    return ExitCode::from(2);
+                };
+                tls_cert = Some(PathBuf::from(v));
+            }
+            "--tls-key" => {
+                i += 1;
+                let Some(v) = args.get(i) else {
+                    eprintln!("--tls-key requires path");
+                    return ExitCode::from(2);
+                };
+                tls_key = Some(PathBuf::from(v));
+            }
+            "--primary" => {
+                i += 1;
+                let Some(v) = args.get(i) else {
+                    eprintln!("--primary requires HOST:PORT");
+                    return ExitCode::from(2);
+                };
+                primary = Some(v.clone());
+            }
+            "--tls-ca" => {
+                i += 1;
+                let Some(v) = args.get(i) else {
+                    eprintln!("--tls-ca requires path");
+                    return ExitCode::from(2);
+                };
+                tls_ca = Some(PathBuf::from(v));
+            }
+            "--tls-insecure" => tls_insecure = true,
+            "--group-window-ms" => {
+                i += 1;
+                let Some(Ok(v)) = args.get(i).map(|s| s.parse::<u64>()) else {
+                    eprintln!("--group-window-ms requires integer milliseconds");
+                    return ExitCode::from(2);
+                };
+                window_ms = v;
+            }
+            "--max-group-size" => {
+                i += 1;
+                let Some(Ok(v)) = args.get(i).map(|s| s.parse::<usize>()) else {
+                    eprintln!("--max-group-size requires positive integer");
+                    return ExitCode::from(2);
+                };
+                max_group_size = v.max(1);
+            }
+            "--max-group-bytes" => {
+                i += 1;
+                let Some(Ok(v)) = args.get(i).map(|s| s.parse::<usize>()) else {
+                    eprintln!("--max-group-bytes requires positive integer");
+                    return ExitCode::from(2);
+                };
+                max_group_bytes = v.max(1);
+            }
+            other => {
+                eprintln!("unknown serve arg {other}");
+                return ExitCode::from(2);
+            }
+        }
+        i += 1;
+    }
+
+    let tls = match (tls_cert, tls_key) {
+        (Some(c), Some(k)) => match (std::fs::read(&c), std::fs::read(&k)) {
+            (Ok(cert_pem), Ok(key_pem)) => Some(lin::TlsServer { cert_pem, key_pem }),
+            (Err(e), _) | (_, Err(e)) => {
+                eprintln!("tls file error: {e}");
+                return ExitCode::from(1);
+            }
+        },
+        (None, None) => None,
+        _ => {
+            eprintln!("tls requires both --tls-cert and --tls-key");
+            return ExitCode::from(2);
+        }
+    };
+
+    let client_tls = if tls_insecure {
+        lin::TlsClient::Insecure
+    } else if let Some(ca_path) = tls_ca {
+        match std::fs::read(&ca_path) {
+            Ok(pem) => lin::TlsClient::CaPem(pem),
+            Err(e) => {
+                eprintln!("tls-ca: {e}");
+                return ExitCode::from(1);
+            }
+        }
+    } else {
+        lin::TlsClient::Off
+    };
+
+    let role = if follower || primary.is_some() {
+        lin::NodeRole::Follower
+    } else {
+        lin::NodeRole::Primary
+    };
+    let follower_opts = primary.map(|paddr| {
+        let server_name = lin::ship::tls_server_name(&paddr);
+        lin::FollowerSyncOpts::new(
+            paddr,
+            lin::ClientOpts {
+                token: token.clone(),
+                tls: client_tls,
+                server_name,
+                ..lin::ClientOpts::default()
+            },
+        )
+    });
+
+    let open_opts = lin::OpenOpts {
+        cold,
+        ..lin::OpenOpts::default()
+    };
+    let db_res = match data {
+        Some(dir) => {
+            if role == lin::NodeRole::Follower {
+                Db::open_follower_with(dir, open_opts)
+            } else {
+                Db::open_with(dir, open_opts)
+            }
+        }
+        None => {
+            if role == lin::NodeRole::Follower && follower_opts.is_none() {
+                return report(Err(lin::Error::runtime("--follower requires --data <dir> or --primary")));
+            }
+            Ok(Db::empty())
+        }
+    };
+    let db = match db_res {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let cfg = lin::ServerConfig {
+        bind_addr: listen,
+        role,
+        follower: follower_opts,
+        token,
+        tls,
+        group_commit_window: Duration::from_millis(window_ms),
+        max_group_size,
+        max_group_bytes,
+        ..lin::ServerConfig::default()
+    };
+
+    match lin::LinServer::start(db, cfg) {
+        Ok(handle) => {
+            eprintln!("lin serve listening on {} (role={role:?})", handle.local_addr());
+            loop {
+                thread::sleep(Duration::from_secs(3600));
+            }
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn cmd_client(args: &[String]) -> ExitCode {
+    let mut connect: Option<String> = None;
+    let mut replicas: Vec<String> = Vec::new();
+    let mut consistency = lin::Consistency::Session;
+    let mut token: Option<String> = None;
+    let mut tls_ca: Option<PathBuf> = None;
+    let mut tls_insecure = false;
+    let mut wg: Option<String> = None;
+    let mut file: Option<PathBuf> = None;
+    let mut rest = Vec::new();
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--connect" => {
+                i += 1;
+                connect = args.get(i).cloned();
+            }
+            "--replica" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    replicas.push(v.clone());
+                }
+            }
+            "--consistency" => {
+                i += 1;
+                let Some(v) = args.get(i) else {
+                    eprintln!("--consistency requires weak|session|strong|gen:N");
+                    return ExitCode::from(2);
+                };
+                match parse_consistency_flag(v) {
+                    Ok(c) => consistency = c,
+                    Err(e) => {
+                        eprintln!("{e}");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            "--token" => {
+                i += 1;
+                token = args.get(i).cloned();
+            }
+            "--tls-ca" => {
+                i += 1;
+                tls_ca = args.get(i).map(PathBuf::from);
+            }
+            "--tls-insecure" => tls_insecure = true,
+            "--workload-group" => {
+                i += 1;
+                wg = args.get(i).cloned();
+            }
+            "--file" => {
+                i += 1;
+                file = args.get(i).map(PathBuf::from);
+            }
+            _ => rest.push(args[i].clone()),
+        }
+        i += 1;
+    }
+
+    let Some(primary_addr) = connect else {
+        eprintln!("client requires --connect HOST:PORT");
+        return ExitCode::from(2);
+    };
+    let linql = match load_program(file, &rest) {
+        Ok(s) if !s.trim().is_empty() => s,
+        Ok(_) => return usage(2),
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let tls = if tls_insecure {
+        lin::TlsClient::Insecure
+    } else if let Some(ca_path) = tls_ca {
+        match std::fs::read(&ca_path) {
+            Ok(pem) => lin::TlsClient::CaPem(pem),
+            Err(e) => {
+                eprintln!("tls-ca: {e}");
+                return ExitCode::from(1);
+            }
+        }
+    } else {
+        lin::TlsClient::Off
+    };
+
+    let opts = lin::ClientOpts {
+        token,
+        tls,
+        server_name: lin::ship::tls_server_name(&primary_addr),
+        consistency,
+        workload_group: wg,
+        ..lin::ClientOpts::default()
+    };
+
+    let res = if replicas.is_empty() {
+        lin::ServerClient::connect(primary_addr, opts)
+            .and_then(|c| c.execute_with_consistency(&linql, consistency))
+    } else {
+        lin::ReplicaPoolClient::connect(primary_addr, &replicas, opts).and_then(|pool| {
+            if lin::parse(&linql).is_ok_and(|s| matches!(s, lin::Stmt::Query(_))) {
+                let (_, r) = pool.query_with_consistency(&linql, consistency)?;
+                Ok(r)
+            } else {
+                pool.execute(&linql)
+            }
+        })
+    };
+
+    match res {
+        Ok(receipt) => {
+            if let Some(batch) = &receipt.batch {
+                print!("{}", format_batch_cli(batch));
+            }
+            println!(
+                "gen={} affected={} group={} elapsed_us={}",
+                receipt.r#gen, receipt.affected, receipt.group_size, receipt.elapsed_us
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn cmd_shard(args: &[String]) -> ExitCode {
+    let mut shard_addrs: Vec<String> = Vec::new();
+    let mut shard_keys = std::collections::BTreeMap::new();
+    let mut default_shard_key: Option<String> = None;
+    let mut strategy = lin::ShardStrategy::JumpConsistentHash;
+    let mut token: Option<String> = None;
+    let mut consistency = lin::Consistency::Session;
+    let mut file: Option<PathBuf> = None;
+    let mut rest = Vec::new();
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--shards" => {
+                i += 1;
+                let Some(v) = args.get(i) else {
+                    eprintln!("--shards requires H1:P1,H2:P2");
+                    return ExitCode::from(2);
+                };
+                shard_addrs.extend(v.split(',').filter(|s| !s.is_empty()).map(str::to_string));
+            }
+            "--shard" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    shard_addrs.push(v.clone());
+                }
+            }
+            "--key" => {
+                i += 1;
+                let Some(v) = args.get(i) else {
+                    eprintln!("--key requires COL=FIELD");
+                    return ExitCode::from(2);
+                };
+                if let Some((c, f)) = v.split_once('=') {
+                    shard_keys.insert(c.to_string(), f.to_string());
+                } else {
+                    eprintln!("--key expects COL=FIELD, got {v:?}");
+                    return ExitCode::from(2);
+                }
+            }
+            "--default-key" => {
+                i += 1;
+                default_shard_key = args.get(i).cloned();
+            }
+            "--strategy" => {
+                i += 1;
+                match args.get(i).map(String::as_str) {
+                    Some("jump") => strategy = lin::ShardStrategy::JumpConsistentHash,
+                    Some("mod") => strategy = lin::ShardStrategy::HashMod,
+                    _ => {
+                        eprintln!("--strategy must be jump or mod");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            "--token" => {
+                i += 1;
+                token = args.get(i).cloned();
+            }
+            "--consistency" => {
+                i += 1;
+                let Some(v) = args.get(i) else {
+                    return usage(2);
+                };
+                match parse_consistency_flag(v) {
+                    Ok(c) => consistency = c,
+                    Err(e) => {
+                        eprintln!("{e}");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            "--file" => {
+                i += 1;
+                file = args.get(i).map(PathBuf::from);
+            }
+            _ => rest.push(args[i].clone()),
+        }
+        i += 1;
+    }
+
+    if shard_addrs.is_empty() {
+        eprintln!("shard requires --shards H1:P1,H2:P2");
+        return ExitCode::from(2);
+    }
+    let linql = match load_program(file, &rest) {
+        Ok(s) if !s.trim().is_empty() => s,
+        Ok(_) => return usage(2),
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let cfg = lin::ShardConfig {
+        shard_addrs,
+        shard_keys,
+        default_shard_key,
+        strategy,
+        client: lin::ClientOpts {
+            token,
+            consistency,
+            ..lin::ClientOpts::default()
+        },
+        ..lin::ShardConfig::default()
+    };
+    let router = match lin::ShardRouter::connect(cfg) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    match router.execute(&linql) {
+        Ok(receipt) => {
+            if let Some(batch) = &receipt.batch {
+                print!("{}", format_batch_cli(batch));
+            }
+            println!(
+                "gen={} affected={} elapsed_us={}",
+                receipt.r#gen, receipt.affected, receipt.elapsed_us
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn parse_remote_store_uri(
+    uri: &str,
+    prefix_override: &Option<String>,
+    endpoint: &Option<String>,
+    region: &str,
+) -> Result<(std::sync::Arc<dyn lin::ColdObjectStore>, String), lin::Error> {
+    if let Some(path) = uri.strip_prefix("fs://") {
+        let store = lin::FsObjectStore::open(path)?;
+        let prefix = prefix_override.clone().unwrap_or_default();
+        return Ok((std::sync::Arc::new(store), prefix));
+    }
+    if let Some(rest) = uri.strip_prefix("s3://") {
+        let (bucket, key_pfx) = match rest.split_once('/') {
+            Some((b, p)) => (b.to_string(), p.to_string()),
+            None => (rest.to_string(), String::new()),
+        };
+        let prefix = prefix_override.clone().unwrap_or(key_pfx);
+        let cfg = lin::S3Config {
+            endpoint: endpoint
+                .clone()
+                .unwrap_or_else(|| "http://127.0.0.1:9000".to_string()),
+            region: region.to_string(),
+            bucket,
+            prefix: prefix.clone(),
+            access_key: std::env::var("AWS_ACCESS_KEY_ID").unwrap_or_default(),
+            secret_key: std::env::var("AWS_SECRET_ACCESS_KEY").unwrap_or_default(),
+            session_token: std::env::var("AWS_SESSION_TOKEN").ok(),
+            ..lin::S3Config::default()
+        };
+        let store = lin::S3HttpObjectStore::new(cfg)?;
+        return Ok((std::sync::Arc::new(store), prefix));
+    }
+    Err(lin::Error::runtime(format!(
+        "unsupported --store URI {uri:?}; expected fs://<dir> or s3://<bucket>[/<prefix>]"
+    )))
+}
+
+fn cmd_remote(args: &[String], data: Option<PathBuf>) -> ExitCode {
+    let Some(sub) = args.first().map(String::as_str) else {
+        return usage(2);
+    };
+    let mut store_uri: Option<String> = None;
+    let mut prefix: Option<String> = None;
+    let mut endpoint: Option<String> = None;
+    let mut region = "us-east-1".to_string();
+    let mut lazy = true;
+    let mut max_cache_bytes: u64 = 0;
+    let mut prune = false;
+    let mut rest = Vec::new();
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--store" => {
+                i += 1;
+                store_uri = args.get(i).cloned();
+            }
+            "--prefix" => {
+                i += 1;
+                prefix = args.get(i).cloned();
+            }
+            "--endpoint" => {
+                i += 1;
+                endpoint = args.get(i).cloned();
+            }
+            "--region" => {
+                i += 1;
+                if let Some(r) = args.get(i) {
+                    region = r.clone();
+                }
+            }
+            "--lazy" => lazy = true,
+            "--eager" => lazy = false,
+            "--prune" => prune = true,
+            "--max-cache-bytes" => {
+                i += 1;
+                let Some(Ok(v)) = args.get(i).map(|s| s.parse::<u64>()) else {
+                    eprintln!("--max-cache-bytes requires integer bytes");
+                    return ExitCode::from(2);
+                };
+                max_cache_bytes = v;
+            }
+            _ => rest.push(args[i].clone()),
+        }
+        i += 1;
+    }
+
+    let Some(dir) = data else {
+        eprintln!("remote {sub} requires --data <dir>");
+        return ExitCode::from(2);
+    };
+    let Some(uri) = store_uri else {
+        eprintln!("remote {sub} requires --store fs://<dir>|s3://<bucket>");
+        return ExitCode::from(2);
+    };
+    let (store, eff_prefix) = match parse_remote_store_uri(&uri, &prefix, &endpoint, &region) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let cfg = lin::RemoteCacheConfig {
+        lazy,
+        max_local_bytes: max_cache_bytes,
+    };
+
+    let out = match sub {
+        "push" => {
+            let mut db = match Db::open_with(
+                &dir,
+                lin::OpenOpts {
+                    cold: true,
+                    ..lin::OpenOpts::default()
+                },
+            ) {
+                Ok(d) => d,
+                Err(e) => return report(Err(e)),
+            };
+            let res = db
+                .push_cold_to_object_store(store.as_ref(), &eff_prefix, prune)
+                .map(|st| {
+                    format!(
+                        "gen={} uploaded={} reused={} deleted={} bytes={}",
+                        st.generation,
+                        st.segments_uploaded,
+                        st.segments_reused,
+                        st.segments_deleted_remote,
+                        st.bytes_uploaded
+                    )
+                });
+            let _ = db.close();
+            res
+        }
+        "pull" => {
+            let query = rest.join(" ");
+            let mut db = match Db::open_cold_from_object_store(&dir, store, &eff_prefix, cfg) {
+                Ok(d) => d,
+                Err(e) => return report(Err(e)),
+            };
+            let res = if query.trim().is_empty() {
+                Ok(format!(
+                    "opened remote store gen={} local_cache_bytes={}",
+                    db.r#gen(),
+                    db.cold_local_cache_bytes()
+                ))
+            } else {
+                db.run_remote(&query).map(|h| h.compact())
+            };
+            let _ = db.close();
+            res
+        }
+        "hydrate" => {
+            let Some(table) = rest.first() else {
+                eprintln!("remote hydrate requires COLLECTION");
+                return ExitCode::from(2);
+            };
+            let mut db = match Db::open_cold_from_object_store(&dir, store, &eff_prefix, cfg) {
+                Ok(d) => d,
+                Err(e) => return report(Err(e)),
+            };
+            let res = db.hydrate_cold_collection(table).map(|segs| {
+                format!(
+                    "hydrated {table}: segments={segs} local_cache_bytes={}",
+                    db.cold_local_cache_bytes()
+                )
+            });
+            let _ = db.close();
+            res
+        }
+        "evict" => {
+            let mut db = match Db::open_cold_from_object_store(&dir, store, &eff_prefix, cfg) {
+                Ok(d) => d,
+                Err(e) => return report(Err(e)),
+            };
+            let res = db.evict_cold_cache_to(max_cache_bytes).map(|evicted| {
+                format!(
+                    "evicted_bytes={evicted} local_cache_bytes={}",
+                    db.cold_local_cache_bytes()
+                )
+            });
+            let _ = db.close();
+            res
+        }
+        other => {
+            eprintln!("unknown remote subcommand {other}");
+            return usage(2);
+        }
+    };
+    report(out)
 }
