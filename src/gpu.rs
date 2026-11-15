@@ -1630,29 +1630,41 @@ impl GpuCompute {
         }
         let mut keys = Vec::with_capacity(cells.len() * 5);
         let mut text = Vec::new();
+        let ordered_float = |v: f64| -> u64 {
+            let v = if v == 0.0 { 0.0 } else { v };
+            let bits = v.to_bits();
+            if bits >> 63 != 0 {
+                !bits
+            } else {
+                bits ^ (1u64 << 63)
+            }
+        };
         for cell in cells {
             let mut compact_buf: Option<String> = None;
-            let (kind, value, str_ref) = match cell {
-                Cell::Null => (0u32, 0u64, None),
-                Cell::Text(s) => (1, 0, Some(s.as_ref())),
-                Cell::SmallText(s) => (1, 0, Some(s.as_str())),
-                Cell::Bool(b) => (2, *b as u64, None),
+            let (kind, value, word3, str_ref) = match cell {
+                Cell::Null => (0u32, 0u64, 0u32, None),
+                Cell::Text(s) => (1, 0, 0, Some(s.as_ref())),
+                Cell::SmallText(s) => (1, 0, 0, Some(s.as_str())),
+                Cell::Bool(b) => (2, *b as u64, 0, None),
                 Cell::Vec(_) => {
                     let s = compact_buf.insert(cell.compact());
-                    (3, 0, Some(s.as_str()))
+                    (3, 0, 0, Some(s.as_str()))
                 }
-                _ => {
-                    let v = cell.as_f64().unwrap_or(0.0);
+                Cell::Int(orig) | Cell::Time(orig) => {
+                    let n = *orig as f64;
+                    let key = ordered_float(n);
+                    let approx = n as i128;
+                    let tie = (i128::from(*orig) - approx)
+                        .clamp(i128::from(i32::MIN) + 2, i128::from(i32::MAX) - 1)
+                        as i32;
+                    let tie_u32 = (tie as u32) ^ (1u32 << 31);
+                    (4, key, tie_u32, None)
+                }
+                Cell::Float(v) => {
                     if v.is_nan() {
-                        (5, 0, None)
+                        (5, 0, 0, None)
                     } else {
-                        let bits = if v == 0.0 { 0 } else { v.to_bits() };
-                        let key = if bits >> 63 != 0 {
-                            !bits
-                        } else {
-                            bits ^ (1u64 << 63)
-                        };
-                        (4, key, None)
+                        (4, ordered_float(*v), 1u32 << 31, None)
                     }
                 }
             };
@@ -1668,7 +1680,11 @@ impl GpuCompute {
                 kind,
                 (value >> 32) as u32,
                 value as u32,
-                offset as u32,
+                if str_ref.is_some() {
+                    offset as u32
+                } else {
+                    word3
+                },
                 length as u32,
             ]);
         }

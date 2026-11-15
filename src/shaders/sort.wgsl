@@ -21,6 +21,7 @@ fn before(a: u32, b: u32) -> bool {
     } else {
         if keys[x + 1u] != keys[y + 1u] { order = select(1i, -1i, keys[x + 1u] < keys[y + 1u]); }
         else if keys[x + 2u] != keys[y + 2u] { order = select(1i, -1i, keys[x + 2u] < keys[y + 2u]); }
+        else if keys[x + 3u] != keys[y + 3u] { order = select(1i, -1i, keys[x + 3u] < keys[y + 3u]); }
     }
     // Original position breaks ties in both directions: stable descending too.
     if order == 0i { return a < b; }
