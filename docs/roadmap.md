@@ -2,7 +2,7 @@
 
 Срез: **2026-11-15**, коммит `58444cf6e` (релиз 0.7.1) плюс незакоммиченное рабочее дерево. Единственный файл с планом в репозитории: в нём только несделанное. Реализованное описано в [CHANGELOG](../CHANGELOG.md), в документах `docs/` по отдельным механизмам и в отчётах `benches/results/`.
 
-Открыто **1383** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
+Открыто **1379** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровывались, поэтому в них есть пропуски: закрытые пункты удалены. Пункты части II со статусами `candidate` и `qualification` по коду поштучно не сверялись: перед взятием пункта сначала проверить, не покрыт ли он уже.
 
@@ -196,7 +196,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 ### Приоритетный список — 1563 пунктов
 
-Количества: P1: 3, P2: 831, P3: 549; статусы: blocked_external: 1, candidate: 934, qualification: 448.
+Количества: P1: 3, P2: 831, P3: 545; статусы: blocked_external: 1, candidate: 934, qualification: 444.
 
 #### P1: 3 пунктов
 
@@ -1042,7 +1042,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 1399 | LIN-1971 | [D50](#d50) | Описать replication version compatibility | DOC | candidate | S | G-DOC |
 | 1400 | LIN-1972 | [D50](#d50) | Описать downgrade support boundaries | DOC | candidate | S | G-DOC |
 
-#### P3: 549 пунктов
+#### P3: 545 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -1073,8 +1073,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 1427 | LIN-0355 | [D09](#d09) | Измерить allocator fragmentation churn | PERF | candidate | M | G-PERF |
 | 1428 | LIN-0356 | [D09](#d09) | Измерить allocator multithread contention | PERF | candidate | M | G-PERF |
 | 1429 | LIN-0357 | [D09](#d09) | Проверить OOM error boundaries | CORRECTNESS | qualification | S | G-CORRECT |
-| 1430 | LIN-0358 | [D09](#d09) | Проверить capacity arithmetic saturation | CORRECTNESS | qualification | S | G-CORRECT |
-| 1431 | LIN-0359 | [D09](#d09) | Проверить oversized reserve rejection | CORRECTNESS | qualification | S | G-CORRECT |
 | 1432 | LIN-0360 | [D09](#d09) | Проверить memory release после cancel | CORRECTNESS | qualification | S | G-CORRECT |
 | 1436 | LIN-0428 | [D11](#d11) | Проверить FK target schema changes | CORRECTNESS | qualification | S | G-CORRECT |
 | 1437 | LIN-0429 | [D11](#d11) | Спроектировать constraint validation mode | FEATURE | candidate | L | G-FEATURE |
@@ -1095,9 +1093,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 1455 | LIN-0471 | [D12](#d12) | Добавить source-preserving query formatter | API | candidate | M | G-API |
 | 1456 | LIN-0472 | [D12](#d12) | Добавить syntax version declaration | API | candidate | M | G-API |
 | 1457 | LIN-0473 | [D12](#d12) | Проверить AST serde stability | CORRECTNESS | qualification | S | G-CORRECT |
-| 1458 | LIN-0474 | [D12](#d12) | Проверить AST literal roundtrip | CORRECTNESS | qualification | S | G-CORRECT |
 | 1459 | LIN-0475 | [D12](#d12) | Проверить AST constant fold provenance | CORRECTNESS | qualification | S | G-CORRECT |
-| 1460 | LIN-0476 | [D12](#d12) | Проверить AST depth after expansion | CORRECTNESS | qualification | S | G-CORRECT |
 | 1461 | LIN-0477 | [D12](#d12) | Подготовить parser fuzz target | VERIFY | qualification | S | G-VERIFY |
 | 1462 | LIN-0478 | [D12](#d12) | Подготовить tokenizer corpus | VERIFY | qualification | S | G-VERIFY |
 | 1463 | LIN-0479 | [D12](#d12) | Подготовить grammar conformance corpus | VERIFY | qualification | S | G-VERIFY |
