@@ -2,7 +2,7 @@
 
 Срез: **2026-11-15**, коммит `58444cf6e` (релиз 0.7.1) плюс незакоммиченное рабочее дерево. Единственный файл с планом в репозитории: в нём только несделанное. Реализованное описано в [CHANGELOG](../CHANGELOG.md), в документах `docs/` по отдельным механизмам и в отчётах `benches/results/`.
 
-Открыто **1554** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
+Открыто **1549** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровывались, поэтому в них есть пропуски: закрытые пункты удалены. Пункты части II со статусами `candidate` и `qualification` по коду поштучно не сверялись: перед взятием пункта сначала проверить, не покрыт ли он уже.
 
@@ -193,7 +193,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 ### Приоритетный список — 1563 пунктов
 
-Количества: P1: 3, P2: 978, P3: 573; статусы: blocked_external: 1, candidate: 934, qualification: 619.
+Количества: P1: 3, P2: 973, P3: 573; статусы: blocked_external: 1, candidate: 934, qualification: 614.
 
 #### P1: 3 пунктов
 
@@ -203,7 +203,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 2 | LIN-0002 | [D01](#d01) | Закрыть durable 1k SQLite gap | PERF | qualification | M | G-PERF |
 | 22 | LIN-0006 | [D01](#d01) | Получить тестовый endpoint Kusto | OPS | blocked_external | M | G-OPS |
 
-#### P2: 978 пунктов
+#### P2: 973 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -687,7 +687,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 827 | LIN-0942 | [D24](#d24) | Проверить hybrid candidate completeness | CORRECTNESS | qualification | S | G-CORRECT |
 | 828 | LIN-0943 | [D24](#d24) | Проверить hybrid RRF exactness | CORRECTNESS | qualification | S | G-CORRECT |
 | 829 | LIN-0944 | [D24](#d24) | Проверить hybrid bounded result equivalence | CORRECTNESS | qualification | S | G-CORRECT |
-| 834 | LIN-0969 | [D25](#d25) | Проверить pending add/delete cancellation | CORRECTNESS | qualification | S | G-CORRECT |
 | 835 | LIN-0970 | [D25](#d25) | Проверить fold duplicate elimination | CORRECTNESS | qualification | S | G-CORRECT |
 | 836 | LIN-0971 | [D25](#d25) | Проверить monotonic posting order | CORRECTNESS | qualification | S | G-CORRECT |
 | 838 | LIN-0973 | [D25](#d25) | Измерить pending fold trigger | PERF | candidate | M | G-PERF |
@@ -698,7 +697,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 843 | LIN-0978 | [D25](#d25) | Спроектировать tombstone density policy | FEATURE | candidate | L | G-FEATURE |
 | 844 | LIN-0979 | [D25](#d25) | Спроектировать incremental posting compaction | FEATURE | candidate | L | G-FEATURE |
 | 845 | LIN-0980 | [D25](#d25) | Спроектировать compaction backpressure | FEATURE | candidate | L | G-FEATURE |
-| 849 | LIN-0984 | [D25](#d25) | Проверить repeated no-op FTS updates | CORRECTNESS | qualification | S | G-CORRECT |
 | 850 | LIN-0985 | [D25](#d25) | Ограничить pending edits per term | CORRECTNESS | qualification | M | G-CORRECT |
 | 851 | LIN-0986 | [D25](#d25) | Ограничить stale posting retention | CORRECTNESS | qualification | M | G-CORRECT |
 | 852 | LIN-0987 | [D25](#d25) | Ограничить compaction temporary memory | CORRECTNESS | qualification | M | G-CORRECT |
@@ -711,10 +709,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 859 | LIN-0994 | [D25](#d25) | Сравнить shared scratch на Unicode | PERF | candidate | M | G-PERF |
 | 860 | LIN-0995 | [D25](#d25) | Сравнить posting delta representation | PERF | candidate | M | G-PERF |
 | 861 | LIN-0996 | [D25](#d25) | Сравнить batched term remapping | PERF | candidate | M | G-PERF |
-| 862 | LIN-0997 | [D25](#d25) | Проверить mutation после checkpoint | CORRECTNESS | qualification | S | G-CORRECT |
-| 863 | LIN-0998 | [D25](#d25) | Проверить mutation после replay | CORRECTNESS | qualification | S | G-CORRECT |
 | 864 | LIN-0999 | [D25](#d25) | Проверить mutation после schema FTS change | CORRECTNESS | qualification | S | G-CORRECT |
-| 865 | LIN-1000 | [D25](#d25) | Проверить mutation при concurrent readers | CORRECTNESS | qualification | S | G-CORRECT |
 | 866 | LIN-1001 | [D26](#d26) | Профилировать current embed_batch | PERF | candidate | M | G-PERF |
 | 867 | LIN-1002 | [D26](#d26) | Профилировать embedding text assembly | PERF | candidate | M | G-PERF |
 | 868 | LIN-1003 | [D26](#d26) | Профилировать scratch finish allocation | PERF | candidate | M | G-PERF |
