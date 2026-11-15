@@ -2,7 +2,7 @@
 
 Срез: **2026-11-15**, коммит `58444cf6e` (релиз 0.7.1) плюс незакоммиченное рабочее дерево. Единственный файл с планом в репозитории: в нём только несделанное. Реализованное описано в [CHANGELOG](../CHANGELOG.md), в документах `docs/` по отдельным механизмам и в отчётах `benches/results/`.
 
-Открыто **1457** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
+Открыто **1454** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровывались, поэтому в них есть пропуски: закрытые пункты удалены. Пункты части II со статусами `candidate` и `qualification` по коду поштучно не сверялись: перед взятием пункта сначала проверить, не покрыт ли он уже.
 
@@ -194,7 +194,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 ### Приоритетный список — 1563 пунктов
 
-Количества: P1: 3, P2: 881, P3: 573; статусы: blocked_external: 1, candidate: 934, qualification: 522.
+Количества: P1: 3, P2: 878, P3: 573; статусы: blocked_external: 1, candidate: 934, qualification: 519.
 
 #### P1: 3 пунктов
 
@@ -204,7 +204,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 2 | LIN-0002 | [D01](#d01) | Закрыть durable 1k SQLite gap | PERF | qualification | M | G-PERF |
 | 22 | LIN-0006 | [D01](#d01) | Получить тестовый endpoint Kusto | OPS | blocked_external | M | G-OPS |
 
-#### P2: 881 пунктов
+#### P2: 878 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -559,9 +559,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 685 | LIN-0747 | [D19](#d19) | Добавить exact quantile aggregate | FEATURE | candidate | M | G-FEATURE |
 | 686 | LIN-0748 | [D19](#d19) | Добавить approximate quantile opt-in | FEATURE | candidate | M | G-FEATURE |
 | 687 | LIN-0749 | [D19](#d19) | Проверить aggregate FILTER clauses | CORRECTNESS | qualification | S | G-CORRECT |
-| 688 | LIN-0750 | [D19](#d19) | Проверить aggregate alias visibility | CORRECTNESS | qualification | S | G-CORRECT |
-| 689 | LIN-0751 | [D19](#d19) | Проверить HAVING-like stage semantics | CORRECTNESS | qualification | S | G-CORRECT |
-| 690 | LIN-0752 | [D19](#d19) | Проверить nested aggregate rejection | CORRECTNESS | qualification | S | G-CORRECT |
 | 691 | LIN-0753 | [D19](#d19) | Согласовать row/batch aggregate bits | CORRECTNESS | qualification | M | G-CORRECT |
 | 693 | LIN-0755 | [D19](#d19) | Проверить large-integer GPU grouping | CORRECTNESS | qualification | S | G-CORRECT |
 | 694 | LIN-0756 | [D19](#d19) | Проверить catastrophic float cancellation | CORRECTNESS | qualification | S | G-CORRECT |
