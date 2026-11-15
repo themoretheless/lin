@@ -2,7 +2,7 @@
 
 Срез: **2026-11-15**, коммит `58444cf6e` (релиз 0.7.1) плюс незакоммиченное рабочее дерево. Единственный файл с планом в репозитории: в нём только несделанное. Реализованное описано в [CHANGELOG](../CHANGELOG.md), в документах `docs/` по отдельным механизмам и в отчётах `benches/results/`.
 
-Открыто **1416** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
+Открыто **1405** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровывались, поэтому в них есть пропуски: закрытые пункты удалены. Пункты части II со статусами `candidate` и `qualification` по коду поштучно не сверялись: перед взятием пункта сначала проверить, не покрыт ли он уже.
 
@@ -194,7 +194,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 ### Приоритетный список — 1563 пунктов
 
-Количества: P1: 3, P2: 840, P3: 573; статусы: blocked_external: 1, candidate: 934, qualification: 481.
+Количества: P1: 3, P2: 838, P3: 564; статусы: blocked_external: 1, candidate: 934, qualification: 470.
 
 #### P1: 3 пунктов
 
@@ -204,7 +204,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 2 | LIN-0002 | [D01](#d01) | Закрыть durable 1k SQLite gap | PERF | qualification | M | G-PERF |
 | 22 | LIN-0006 | [D01](#d01) | Получить тестовый endpoint Kusto | OPS | blocked_external | M | G-OPS |
 
-#### P2: 840 пунктов
+#### P2: 838 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -1004,7 +1004,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 1354 | LIN-1882 | [D48](#d48) | Спроектировать readiness command contract | OPS | candidate | L | G-OPS |
 | 1355 | LIN-1883 | [D48](#d48) | Спроектировать graceful shutdown sequence | OPS | candidate | L | G-OPS |
 | 1356 | LIN-1884 | [D48](#d48) | Спроектировать storage lock inspection | OPS | candidate | L | G-OPS |
-| 1357 | LIN-1885 | [D48](#d48) | Проверить multiple-writer lock refusal | CORRECTNESS | qualification | S | G-CORRECT |
 | 1358 | LIN-1886 | [D48](#d48) | Проверить stale lock recovery policy | CORRECTNESS | qualification | S | G-CORRECT |
 | 1359 | LIN-1887 | [D48](#d48) | Проверить lock error diagnostics | CORRECTNESS | qualification | S | G-CORRECT |
 | 1360 | LIN-1888 | [D48](#d48) | Проверить lock release после panic | CORRECTNESS | qualification | S | G-CORRECT |
@@ -1017,7 +1016,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 1367 | LIN-1895 | [D48](#d48) | Спроектировать restore rehearsal command | OPS | candidate | L | G-OPS |
 | 1368 | LIN-1896 | [D48](#d48) | Спроектировать backup encryption boundary | OPS | candidate | L | G-OPS |
 | 1369 | LIN-1897 | [D48](#d48) | Проверить restore wrong target refusal | CORRECTNESS | qualification | S | G-CORRECT |
-| 1370 | LIN-1898 | [D48](#d48) | Проверить restore existing-data preservation | CORRECTNESS | qualification | S | G-CORRECT |
 | 1371 | LIN-1899 | [D48](#d48) | Проверить restore partial-copy cleanup | CORRECTNESS | qualification | S | G-CORRECT |
 | 1372 | LIN-1900 | [D48](#d48) | Проверить restore generation compatibility | CORRECTNESS | qualification | S | G-CORRECT |
 | 1373 | LIN-1901 | [D48](#d48) | Добавить operator-safe maintenance mode | OPS | candidate | M | G-OPS |
@@ -1049,7 +1047,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 1399 | LIN-1971 | [D50](#d50) | Описать replication version compatibility | DOC | candidate | S | G-DOC |
 | 1400 | LIN-1972 | [D50](#d50) | Описать downgrade support boundaries | DOC | candidate | S | G-DOC |
 
-#### P3: 573 пунктов
+#### P3: 564 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -1084,7 +1082,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 1431 | LIN-0359 | [D09](#d09) | Проверить oversized reserve rejection | CORRECTNESS | qualification | S | G-CORRECT |
 | 1432 | LIN-0360 | [D09](#d09) | Проверить memory release после cancel | CORRECTNESS | qualification | S | G-CORRECT |
 | 1433 | LIN-0425 | [D11](#d11) | Проверить FK cycles policy | CORRECTNESS | qualification | S | G-CORRECT |
-| 1434 | LIN-0426 | [D11](#d11) | Проверить dangling edge policy | CORRECTNESS | qualification | S | G-CORRECT |
 | 1435 | LIN-0427 | [D11](#d11) | Проверить missing FK collection | CORRECTNESS | qualification | S | G-CORRECT |
 | 1436 | LIN-0428 | [D11](#d11) | Проверить FK target schema changes | CORRECTNESS | qualification | S | G-CORRECT |
 | 1437 | LIN-0429 | [D11](#d11) | Спроектировать constraint validation mode | FEATURE | candidate | L | G-FEATURE |
@@ -1095,9 +1092,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 1442 | LIN-0434 | [D11](#d11) | Ограничить DNF constraint expansion | CORRECTNESS | qualification | M | G-CORRECT |
 | 1443 | LIN-0435 | [D11](#d11) | Ограничить constraint diagnostic payload | CORRECTNESS | qualification | M | G-CORRECT |
 | 1444 | LIN-0436 | [D11](#d11) | Ограничить batch conflict reporting | CORRECTNESS | qualification | M | G-CORRECT |
-| 1445 | LIN-0437 | [D11](#d11) | Проверить exact numeric cross-backend parity | CORRECTNESS | qualification | S | G-CORRECT |
-| 1446 | LIN-0438 | [D11](#d11) | Проверить unique constraint snapshot replay | CORRECTNESS | qualification | S | G-CORRECT |
-| 1447 | LIN-0439 | [D11](#d11) | Проверить unique constraint WAL replay | CORRECTNESS | qualification | S | G-CORRECT |
 | 1448 | LIN-0440 | [D11](#d11) | Проверить constraint disabled-feature errors | CORRECTNESS | qualification | S | G-CORRECT |
 | 1449 | LIN-0465 | [D12](#d12) | Сократить temporary lexer strings | PERF | candidate | M | G-PERF |
 | 1450 | LIN-0466 | [D12](#d12) | Измерить zero-copy token spans | PERF | candidate | M | G-PERF |
@@ -1166,9 +1160,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 1514 | LIN-0786 | [D20](#d20) | Измерить inline sort keys | PERF | candidate | M | G-PERF |
 | 1515 | LIN-0787 | [D20](#d20) | Измерить column sort permutation | PERF | candidate | M | G-PERF |
 | 1516 | LIN-0788 | [D20](#d20) | Измерить sorting string dictionaries | PERF | candidate | M | G-PERF |
-| 1517 | LIN-0789 | [D20](#d20) | Проверить CPU/GPU stable ordering | CORRECTNESS | qualification | S | G-CORRECT |
-| 1518 | LIN-0790 | [D20](#d20) | Проверить GPU odd sort lengths | CORRECTNESS | qualification | S | G-CORRECT |
-| 1519 | LIN-0791 | [D20](#d20) | Проверить GPU i64 rank extremes | CORRECTNESS | qualification | S | G-CORRECT |
 | 1520 | LIN-0792 | [D20](#d20) | Проверить GPU sort allocation limits | CORRECTNESS | qualification | S | G-CORRECT |
 | 1521 | LIN-0793 | [D20](#d20) | Добавить sort memory estimates | FEATURE | candidate | M | G-FEATURE |
 | 1522 | LIN-0794 | [D20](#d20) | Добавить comparator evaluation counters | FEATURE | candidate | M | G-FEATURE |
@@ -1186,8 +1177,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 1534 | LIN-0830 | [D21](#d21) | Проверить join error atomicity | CORRECTNESS | qualification | S | G-CORRECT |
 | 1535 | LIN-0831 | [D21](#d21) | Проверить cursor join first-row latency | CORRECTNESS | qualification | S | G-CORRECT |
 | 1536 | LIN-0832 | [D21](#d21) | Проверить projected join field pruning | CORRECTNESS | qualification | S | G-CORRECT |
-| 1537 | LIN-0833 | [D21](#d21) | Проверить CPU/GPU join multiplicity | CORRECTNESS | qualification | S | G-CORRECT |
-| 1538 | LIN-0834 | [D21](#d21) | Проверить CPU/GPU join identity order | CORRECTNESS | qualification | S | G-CORRECT |
 | 1539 | LIN-0835 | [D21](#d21) | Проверить tiled join boundary sizes | CORRECTNESS | qualification | S | G-CORRECT |
 | 1540 | LIN-0836 | [D21](#d21) | Проверить GPU join no-match cases | VERIFY | qualification | S | G-VERIFY |
 | 1541 | LIN-0837 | [D21](#d21) | Добавить join estimates/actual metrics | FEATURE | candidate | M | G-FEATURE |
