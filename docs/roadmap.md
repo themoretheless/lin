@@ -2,7 +2,7 @@
 
 Срез: **2026-11-15**, коммит `58444cf6e` (релиз 0.7.1) плюс незакоммиченное рабочее дерево. Единственный файл с планом в репозитории: в нём только несделанное. Реализованное описано в [CHANGELOG](../CHANGELOG.md), в документах `docs/` по отдельным механизмам и в отчётах `benches/results/`.
 
-Открыто **1460** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
+Открыто **1457** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровывались, поэтому в них есть пропуски: закрытые пункты удалены. Пункты части II со статусами `candidate` и `qualification` по коду поштучно не сверялись: перед взятием пункта сначала проверить, не покрыт ли он уже.
 
@@ -194,7 +194,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 ### Приоритетный список — 1563 пунктов
 
-Количества: P1: 3, P2: 884, P3: 573; статусы: blocked_external: 1, candidate: 934, qualification: 525.
+Количества: P1: 3, P2: 881, P3: 573; статусы: blocked_external: 1, candidate: 934, qualification: 522.
 
 #### P1: 3 пунктов
 
@@ -204,7 +204,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 2 | LIN-0002 | [D01](#d01) | Закрыть durable 1k SQLite gap | PERF | qualification | M | G-PERF |
 | 22 | LIN-0006 | [D01](#d01) | Получить тестовый endpoint Kusto | OPS | blocked_external | M | G-OPS |
 
-#### P2: 884 пунктов
+#### P2: 881 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -385,7 +385,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 431 | LIN-0397 | [D10](#d10) | Сравнить dense reverse map crossover | PERF | candidate | M | G-PERF |
 | 432 | LIN-0398 | [D10](#d10) | Сравнить adaptive posting representation | PERF | candidate | M | G-PERF |
 | 434 | LIN-0400 | [D10](#d10) | Сравнить hash-only equality indexes | PERF | candidate | M | G-PERF |
-| 435 | LIN-0405 | [D11](#d11) | Проверить NaN unique key policy | CORRECTNESS | qualification | S | G-CORRECT |
 | 451 | LIN-0421 | [D11](#d11) | Спроектировать named constraints | FEATURE | candidate | L | G-FEATURE |
 | 452 | LIN-0422 | [D11](#d11) | Спроектировать configurable NULL distinctness | FEATURE | candidate | L | G-FEATURE |
 | 453 | LIN-0423 | [D11](#d11) | Спроектировать CHECK predicates | FEATURE | candidate | L | G-FEATURE |
@@ -507,7 +506,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 607 | LIN-0633 | [D16](#d16) | Проверить CPU feature dispatch fallback | CORRECTNESS | qualification | S | G-CORRECT |
 | 608 | LIN-0634 | [D16](#d16) | Проверить disabled backend explicit errors | CORRECTNESS | qualification | S | G-CORRECT |
 | 609 | LIN-0635 | [D16](#d16) | Проверить cross-backend output order | CORRECTNESS | qualification | S | G-CORRECT |
-| 610 | LIN-0636 | [D16](#d16) | Проверить expression exceptional values | CORRECTNESS | qualification | S | G-CORRECT |
 | 611 | LIN-0637 | [D16](#d16) | Создать per-operator reference evaluator | PERF | candidate | M | G-PERF |
 | 612 | LIN-0638 | [D16](#d16) | Создать execution differential corpus | VERIFY | qualification | S | G-VERIFY |
 | 613 | LIN-0639 | [D16](#d16) | Создать operator resource stress suite | PERF | candidate | M | G-PERF |
@@ -570,7 +568,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 695 | LIN-0757 | [D19](#d19) | Добавить group cardinality limits | FEATURE | candidate | M | G-FEATURE |
 | 697 | LIN-0759 | [D19](#d19) | Добавить aggregation skew diagnostics | FEATURE | candidate | M | G-FEATURE |
 | 698 | LIN-0760 | [D19](#d19) | Добавить group overflow diagnostics | FEATURE | candidate | M | G-FEATURE |
-| 701 | LIN-0763 | [D20](#d20) | Проверить NaN placement policy | CORRECTNESS | qualification | S | G-CORRECT |
 | 703 | LIN-0765 | [D20](#d20) | Измерить decorated sort key reuse | PERF | candidate | M | G-PERF |
 | 704 | LIN-0766 | [D20](#d20) | Измерить bounded Top-K crossover | PERF | candidate | M | G-PERF |
 | 705 | LIN-0767 | [D20](#d20) | Измерить partial selection partition | PERF | candidate | M | G-PERF |
