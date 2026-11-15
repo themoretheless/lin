@@ -112,6 +112,12 @@ mod wal_integrity_tests {
             let res = std::panic::catch_unwind(|| decode_frame(&LOG_MAGIC_V1, &bad));
             assert!(matches!(res, Ok(Err(_))), "unknown variant must be an error");
         }
+        // A text value whose bytes are not UTF-8 is refused, not decoded into a string.
+        let fixstr_s = [0xa1u8, b's'];
+        let at_s = raw.windows(2).position(|w| w == fixstr_s).expect("one-byte string \"s\"");
+        let mut invalid = raw.clone();
+        invalid[at_s + 1] = 0xff;
+        assert!(decode_frame(&LOG_MAGIC_V1, &invalid).is_err(), "invalid UTF-8 text accepted");
         // Every single-byte change of the record either decodes or errors; none panics.
         for i in 0..raw.len() {
             for flip in [0x01u8, 0x80, 0xff] {
