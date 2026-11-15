@@ -1022,22 +1022,22 @@ impl Db {
                             }
                             total.value()
                         } else {
-                            let (mut sum, mut count) = (0.0f64, 0usize);
+                            let (mut sum, mut count) = (crate::exact_sum::ExactSum::default(), 0usize);
                             let mut start = 0;
                             while start < n {
                                 let end = (start + chunk).min(n);
-                                let (mut s, mut c) = (0.0f64, 0usize);
+                                let (mut s, mut c) = (crate::exact_sum::ExactSum::default(), 0usize);
                                 for i in start..end {
                                     if let Some(v) = vcol.get(i).as_f64() {
-                                        s += v;
+                                        s.add_f64(v);
                                         c += 1;
                                     }
                                 }
-                                sum += s;
+                                sum.merge(s);
                                 count += c;
                                 start = end;
                             }
-                            if count == 0 { 0.0 } else { sum / (count as f64) }
+                            if count == 0 { 0.0 } else { sum.value() / (count as f64) }
                         };
                         let mut row = crate::store::acquire_row();
                         row.insert(fk, Cell::Float(value));
@@ -1080,15 +1080,15 @@ impl Db {
                             within_quota
                                 .then(|| map.into_iter().map(|(k, v)| (k, v.value())).collect())
                         } else {
-                            let mut map: FxHashMap<Cell, (f64, usize)> = FxHashMap::default();
+                            let mut map: FxHashMap<Cell, (crate::exact_sum::ExactSum, usize)> = FxHashMap::default();
                             let mut start = 0;
                             'chunks: while start < n {
                                 let end = (start + chunk).min(n);
-                                let mut part: FxHashMap<Cell, (f64, usize)> = FxHashMap::default();
+                                let mut part: FxHashMap<Cell, (crate::exact_sum::ExactSum, usize)> = FxHashMap::default();
                                 for i in start..end {
-                                    let acc = part.entry(kcol.get(i)).or_insert((0.0, 0));
+                                    let acc = part.entry(kcol.get(i)).or_default();
                                     if let Some(v) = vcol.get(i).as_f64() {
-                                        acc.0 += v;
+                                        acc.0.add_f64(v);
                                         acc.1 += 1;
                                     }
                                 }
@@ -1097,7 +1097,7 @@ impl Db {
                                 for (k, v) in part {
                                     match map.get_mut(&k) {
                                         Some(acc) => {
-                                            acc.0 += v.0;
+                                            acc.0.merge(v.0);
                                             acc.1 += v.1;
                                         }
                                         None => {
@@ -1114,7 +1114,7 @@ impl Db {
                             }
                             within_quota.then(|| {
                                 map.into_iter()
-                                    .map(|(k, (s, c))| (k, if c == 0 { 0.0 } else { s / (c as f64) }))
+                                    .map(|(k, (s, c))| (k, if c == 0 { 0.0 } else { s.value() / (c as f64) }))
                                     .collect()
                             })
                         };

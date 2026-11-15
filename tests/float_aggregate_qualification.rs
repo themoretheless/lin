@@ -51,3 +51,18 @@ fn float_sums_are_bit_stable_and_close_to_sequential() {
         assert_eq!(gsum, (0..n).map(|i| (i % 4) as f64).sum::<f64>(), "n={n}: integer sum");
     }
 }
+
+/// A small value between two large values that cancel survives `sum`, through every
+/// path: plain, filtered through an index, and grouped.
+#[test]
+fn cancelling_float_sums_keep_small_terms() {
+    let mut db = Db::empty();
+    db.run("col c { id: text, f: f64, g: i64 }").unwrap();
+    db.run("index c [g]").unwrap();
+    db.run(r#"insert c [{ id: "a", f: 10000000000000000.0, g: 1 }, { id: "b", f: 1.0, g: 1 }, { id: "c", f: -10000000000000000.0, g: 1 }]"#).unwrap();
+    assert_eq!(agg(&mut db, "c | sum f", "f"), 1.0);
+    assert_eq!(agg(&mut db, "c | g == 1 | sum f", "f"), 1.0);
+    let by = db.run("c | sum f by g").unwrap().rows[0].get("f").and_then(|c| c.as_f64()).unwrap();
+    assert_eq!(by, 1.0);
+    assert!((agg(&mut db, "c | avg f", "f") - 1.0 / 3.0).abs() < 1e-12);
+}

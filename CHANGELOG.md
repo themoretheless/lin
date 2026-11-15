@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Fixed
+- `sum` and `avg` over floats lost small values between large values that cancel: `1e16, 1, -1e16` summed to `0`. In-memory, grouped, parallel, spilled, indexed and join aggregates now use Neumaier-compensated addition and give `1`. The cold tier's columnar float sum is not compensated yet.
 - Sliding-frame window `sum` and `avg` over floats subtracted running prefix sums, so small values vanished behind a large earlier value: after `1e16`, a frame of `1.0, 0.5, 1.0` summed to `0`. Frames up to 1024 rows that do not start at the first row are now summed from their own rows.
 - `lin cache cli` with commands piped in mixed its banner and `cacha (...)>` prompts into the output. The banner and prompts are now shown only when stdin is a terminal.
 - The `lin` binary panicked with `failed printing to stdout: Broken pipe` (exit code 101) when its output went to a pipe that closed early, such as `lin run ... | head`. It now stops quietly on SIGPIPE like other command-line tools.

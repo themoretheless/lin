@@ -224,10 +224,10 @@ pub(crate) fn spill_agg_avg<'a>(
             let v_opt = r.get(&fk).and_then(Cell::as_f64);
             (cell, v_opt)
         },
-        || (0.0f64, 0usize),
+        || (crate::exact_sum::ExactSum::default(), 0usize),
         |entry, v_opt| {
             if let Some(v) = v_opt {
-                entry.0 += v;
+                entry.0.add_f64(v);
                 entry.1 += 1;
             }
         },
@@ -240,7 +240,7 @@ pub(crate) fn spill_agg_avg<'a>(
             if by.is_some() {
                 row.insert(group_col.to_string(), cell);
             }
-            let avg = if count > 0 { sum / count as f64 } else { 0.0 };
+            let avg = if count > 0 { sum.value() / count as f64 } else { 0.0 };
             row.insert(fk.clone(), Cell::Float(avg));
             row
         })
@@ -843,8 +843,8 @@ pub(crate) fn agg_avg_filtered(
 ) -> Result<Vec<Row>, Error> {
     let fk = field.as_str();
     let Some(by) = by else {
-        let fold = |rows: &[Row]| -> (f64, usize) {
-            let mut sum = 0.0f64;
+        let fold = |rows: &[Row]| -> (crate::exact_sum::ExactSum, usize) {
+            let mut sum = crate::exact_sum::ExactSum::default();
             let mut count = 0usize;
             let mut flt = filter.map(PredSlots::new);
             let mut value_slot = FieldSlot::new(&fk);
@@ -852,7 +852,7 @@ pub(crate) fn agg_avg_filtered(
                 if flt.as_mut().is_none_or(|f| f.eval(r, now))
                     && let Some(v) = value_slot.get(r).and_then(Cell::as_f64)
                 {
-                    sum += v;
+                    sum.add_f64(v);
                     count += 1;
                 }
             }
@@ -862,11 +862,12 @@ pub(crate) fn agg_avg_filtered(
         let (sum, count) = if rows.len() >= PAR_AGG_MIN_ROWS {
             use rayon::prelude::*;
             // Chunk partials are added in chunk order: the result is deterministic.
-            let partials: Vec<(f64, usize)> =
+            let partials: Vec<(crate::exact_sum::ExactSum, usize)> =
                 rows.par_chunks(PAR_AGG_CHUNK_ROWS).map(fold).collect();
-            partials
-                .into_iter()
-                .fold((0.0f64, 0usize), |a, b| (a.0 + b.0, a.1 + b.1))
+            partials.into_iter().fold((crate::exact_sum::ExactSum::default(), 0usize), |mut a, b| {
+                a.0.merge(b.0);
+                (a.0, a.1 + b.1)
+            })
         } else {
             fold(rows)
         };
@@ -875,20 +876,20 @@ pub(crate) fn agg_avg_filtered(
         let avg = if count == 0 {
             0.0
         } else {
-            sum / (count as f64)
+            sum.value() / (count as f64)
         };
         let mut row = crate::store::acquire_row();
         row.insert(fk, Cell::Float(avg));
         return Ok(vec![row]);
     };
     let bk = by.as_str();
-    let mut map: FxHashMap<Cell, (f64, usize)> = FxHashMap::default();
+    let mut map: FxHashMap<Cell, (crate::exact_sum::ExactSum, usize)> = FxHashMap::default();
     let mut state_bytes = 0usize;
     #[allow(unused_mut)]
     let mut seq_rows: &[Row] = rows;
     #[cfg(feature = "parallel")]
     if rows.len() >= PAR_AGG_MIN_ROWS
-        && let Some(folded) = par_group_fold::<(f64, usize)>(
+        && let Some(folded) = par_group_fold::<(crate::exact_sum::ExactSum, usize)>(
             rows,
             filter,
             now,
@@ -897,12 +898,12 @@ pub(crate) fn agg_avg_filtered(
             max_bytes,
             |acc, v| {
                 if let Some(v) = v.and_then(Cell::as_f64) {
-                    acc.0 += v;
+                    acc.0.add_f64(v);
                     acc.1 += 1;
                 }
             },
             |acc, other| {
-                acc.0 += other.0;
+                acc.0.merge(other.0);
                 acc.1 += other.1;
             },
         )
@@ -939,13 +940,13 @@ pub(crate) fn agg_avg_filtered(
             }
         }
         let v_opt = value_slot.get(r).and_then(Cell::as_f64);
-        let entry = map.entry(cell).or_insert((0.0, 0));
+        let entry = map.entry(cell).or_default();
         if let Some(v) = v_opt {
-            entry.0 += v;
+            entry.0.add_f64(v);
             entry.1 += 1;
         }
     }
-    let mut entries: Vec<(Cell, (f64, usize))> = map.into_iter().collect();
+    let mut entries: Vec<(Cell, (crate::exact_sum::ExactSum, usize))> = map.into_iter().collect();
     entries.sort_unstable_by(|(a, _), (b, _)| cmp_sort(a, b));
     Ok(entries
         .into_iter()
@@ -953,7 +954,7 @@ pub(crate) fn agg_avg_filtered(
             let avg = if count == 0 {
                 0.0
             } else {
-                sum / (count as f64)
+                sum.value() / (count as f64)
             };
             let mut row = crate::store::acquire_row();
             row.insert(bk.clone(), gcell);
@@ -1649,21 +1650,21 @@ impl Db {
                 }
                 AggKind::Avg { field, by: None } => {
                     let fk = field.as_str();
-                    let mut sum = 0.0f64;
+                    let mut sum = crate::exact_sum::ExactSum::default();
                     let mut count = 0usize;
                     for i in idxs {
                         if let Some(r) = col.get(i)
                             && residual.as_mut().is_none_or(|f| f.eval(r, now))
                             && let Some(v) = r.get(&fk).and_then(Cell::as_f64)
                         {
-                            sum += v;
+                            sum.add_f64(v);
                             count += 1;
                         }
                     }
                     let avg = if count == 0 {
                         0.0
                     } else {
-                        sum / (count as f64)
+                        sum.value() / (count as f64)
                     };
                     let mut row = crate::store::acquire_row();
                     row.insert(fk, Cell::Float(avg));

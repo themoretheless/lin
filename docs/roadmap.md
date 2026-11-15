@@ -2,7 +2,7 @@
 
 Срез: **2026-11-15**, коммит `58444cf6e` (релиз 0.7.1) плюс незакоммиченное рабочее дерево. Единственный файл с планом в репозитории: в нём только несделанное. Реализованное описано в [CHANGELOG](../CHANGELOG.md), в документах `docs/` по отдельным механизмам и в отчётах `benches/results/`.
 
-Открыто **1445** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
+Открыто **1443** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровывались, поэтому в них есть пропуски: закрытые пункты удалены. Пункты части II со статусами `candidate` и `qualification` по коду поштучно не сверялись: перед взятием пункта сначала проверить, не покрыт ли он уже.
 
@@ -194,7 +194,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 ### Приоритетный список — 1563 пунктов
 
-Количества: P1: 3, P2: 869, P3: 573; статусы: blocked_external: 1, candidate: 934, qualification: 510.
+Количества: P1: 3, P2: 867, P3: 573; статусы: blocked_external: 1, candidate: 934, qualification: 508.
 
 #### P1: 3 пунктов
 
@@ -204,7 +204,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 2 | LIN-0002 | [D01](#d01) | Закрыть durable 1k SQLite gap | PERF | qualification | M | G-PERF |
 | 22 | LIN-0006 | [D01](#d01) | Получить тестовый endpoint Kusto | OPS | blocked_external | M | G-OPS |
 
-#### P2: 869 пунктов
+#### P2: 867 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -552,7 +552,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 687 | LIN-0749 | [D19](#d19) | Проверить aggregate FILTER clauses | CORRECTNESS | qualification | S | G-CORRECT |
 | 691 | LIN-0753 | [D19](#d19) | Согласовать row/batch aggregate bits | CORRECTNESS | qualification | M | G-CORRECT |
 | 693 | LIN-0755 | [D19](#d19) | Проверить large-integer GPU grouping | CORRECTNESS | qualification | S | G-CORRECT |
-| 694 | LIN-0756 | [D19](#d19) | Проверить catastrophic float cancellation | CORRECTNESS | qualification | S | G-CORRECT |
 | 695 | LIN-0757 | [D19](#d19) | Добавить group cardinality limits | FEATURE | candidate | M | G-FEATURE |
 | 697 | LIN-0759 | [D19](#d19) | Добавить aggregation skew diagnostics | FEATURE | candidate | M | G-FEATURE |
 | 698 | LIN-0760 | [D19](#d19) | Добавить group overflow diagnostics | FEATURE | candidate | M | G-FEATURE |
@@ -689,7 +688,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 907 | LIN-1062 | [D27](#d27) | Измерить exact reranking budget | PERF | candidate | M | G-PERF |
 | 908 | LIN-1063 | [D27](#d27) | Измерить filtered ANN recall | PERF | candidate | L | G-PERF |
 | 909 | LIN-1064 | [D27](#d27) | Измерить skewed-cluster HNSW behavior | PERF | candidate | L | G-PERF |
-| 910 | LIN-1085 | [D28](#d28) | Проверить CPU f64 accumulation order | CORRECTNESS | qualification | S | G-CORRECT |
 | 915 | LIN-1090 | [D28](#d28) | Проверить filtered exact Top-K | CORRECTNESS | qualification | S | G-CORRECT |
 | 919 | LIN-1094 | [D28](#d28) | Проверить hybrid rank offsets | CORRECTNESS | qualification | S | G-CORRECT |
 | 922 | LIN-1097 | [D28](#d28) | Спроектировать explicit distance metric | FEATURE | candidate | L | G-FEATURE |
