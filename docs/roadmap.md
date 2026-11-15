@@ -2,7 +2,7 @@
 
 Срез: **2026-11-15**, коммит `58444cf6e` (релиз 0.7.1) плюс незакоммиченное рабочее дерево. Единственный файл с планом в репозитории: в нём только несделанное. Реализованное описано в [CHANGELOG](../CHANGELOG.md), в документах `docs/` по отдельным механизмам и в отчётах `benches/results/`.
 
-Открыто **1420** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
+Открыто **1416** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровывались, поэтому в них есть пропуски: закрытые пункты удалены. Пункты части II со статусами `candidate` и `qualification` по коду поштучно не сверялись: перед взятием пункта сначала проверить, не покрыт ли он уже.
 
@@ -194,7 +194,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 ### Приоритетный список — 1563 пунктов
 
-Количества: P1: 3, P2: 844, P3: 573; статусы: blocked_external: 1, candidate: 934, qualification: 485.
+Количества: P1: 3, P2: 840, P3: 573; статусы: blocked_external: 1, candidate: 934, qualification: 481.
 
 #### P1: 3 пунктов
 
@@ -204,7 +204,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 2 | LIN-0002 | [D01](#d01) | Закрыть durable 1k SQLite gap | PERF | qualification | M | G-PERF |
 | 22 | LIN-0006 | [D01](#d01) | Получить тестовый endpoint Kusto | OPS | blocked_external | M | G-OPS |
 
-#### P2: 844 пунктов
+#### P2: 840 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -727,9 +727,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 995 | LIN-1242 | [D32](#d32) | Профилировать cold decode allocations | PERF | candidate | M | G-PERF |
 | 996 | LIN-1243 | [D32](#d32) | Профилировать cold projection access | PERF | candidate | M | G-PERF |
 | 997 | LIN-1244 | [D32](#d32) | Профилировать cold index rebuilding | PERF | candidate | M | G-PERF |
-| 998 | LIN-1245 | [D32](#d32) | Проверить mmap lifetime pinning | CORRECTNESS | qualification | S | G-CORRECT |
-| 999 | LIN-1246 | [D32](#d32) | Проверить file replacement mapped readers | CORRECTNESS | qualification | S | G-CORRECT |
-| 1001 | LIN-1248 | [D32](#d32) | Проверить cold buffer alias lifetime | CORRECTNESS | qualification | S | G-CORRECT |
 | 1002 | LIN-1249 | [D32](#d32) | Измерить sequential madvise policy | PERF | candidate | M | G-PERF |
 | 1003 | LIN-1250 | [D32](#d32) | Измерить random madvise policy | PERF | candidate | M | G-PERF |
 | 1004 | LIN-1251 | [D32](#d32) | Измерить bounded prefetch windows | PERF | candidate | M | G-PERF |
@@ -767,7 +764,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 1051 | LIN-1334 | [D34](#d34) | Спроектировать generation-based reclamation | FEATURE | candidate | L | G-FEATURE |
 | 1052 | LIN-1335 | [D34](#d34) | Спроектировать reader lifetime diagnostics | FEATURE | candidate | L | G-FEATURE |
 | 1053 | LIN-1336 | [D34](#d34) | Спроектировать writer admission fairness | FEATURE | candidate | L | G-FEATURE |
-| 1055 | LIN-1338 | [D34](#d34) | Проверить long reader checkpoint pressure | CORRECTNESS | qualification | S | G-CORRECT |
 | 1056 | LIN-1339 | [D34](#d34) | Проверить dropped reader reclamation | CORRECTNESS | qualification | S | G-CORRECT |
 | 1058 | LIN-1341 | [D34](#d34) | Добавить snapshot pin byte counters | FEATURE | candidate | M | G-FEATURE |
 | 1059 | LIN-1342 | [D34](#d34) | Добавить oldest-reader generation metric | FEATURE | candidate | M | G-FEATURE |
