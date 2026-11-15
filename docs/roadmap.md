@@ -2,7 +2,7 @@
 
 Срез: **2026-11-15**, коммит `58444cf6e` (релиз 0.7.1) плюс незакоммиченное рабочее дерево. Единственный файл с планом в репозитории: в нём только несделанное. Реализованное описано в [CHANGELOG](../CHANGELOG.md), в документах `docs/` по отдельным механизмам и в отчётах `benches/results/`.
 
-Открыто **1436** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
+Открыто **1426** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровывались, поэтому в них есть пропуски: закрытые пункты удалены. Пункты части II со статусами `candidate` и `qualification` по коду поштучно не сверялись: перед взятием пункта сначала проверить, не покрыт ли он уже.
 
@@ -194,7 +194,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 ### Приоритетный список — 1563 пунктов
 
-Количества: P1: 3, P2: 860, P3: 573; статусы: blocked_external: 1, candidate: 934, qualification: 501.
+Количества: P1: 3, P2: 850, P3: 573; статусы: blocked_external: 1, candidate: 934, qualification: 491.
 
 #### P1: 3 пунктов
 
@@ -204,7 +204,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 2 | LIN-0002 | [D01](#d01) | Закрыть durable 1k SQLite gap | PERF | qualification | M | G-PERF |
 | 22 | LIN-0006 | [D01](#d01) | Получить тестовый endpoint Kusto | OPS | blocked_external | M | G-OPS |
 
-#### P2: 860 пунктов
+#### P2: 850 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -501,7 +501,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 606 | LIN-0632 | [D16](#d16) | Спроектировать fairness между queries | FEATURE | candidate | L | G-FEATURE |
 | 607 | LIN-0633 | [D16](#d16) | Проверить CPU feature dispatch fallback | CORRECTNESS | qualification | S | G-CORRECT |
 | 608 | LIN-0634 | [D16](#d16) | Проверить disabled backend explicit errors | CORRECTNESS | qualification | S | G-CORRECT |
-| 609 | LIN-0635 | [D16](#d16) | Проверить cross-backend output order | CORRECTNESS | qualification | S | G-CORRECT |
 | 611 | LIN-0637 | [D16](#d16) | Создать per-operator reference evaluator | PERF | candidate | M | G-PERF |
 | 612 | LIN-0638 | [D16](#d16) | Создать execution differential corpus | VERIFY | qualification | S | G-VERIFY |
 | 613 | LIN-0639 | [D16](#d16) | Создать operator resource stress suite | PERF | candidate | M | G-PERF |
@@ -551,7 +550,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 686 | LIN-0748 | [D19](#d19) | Добавить approximate quantile opt-in | FEATURE | candidate | M | G-FEATURE |
 | 687 | LIN-0749 | [D19](#d19) | Проверить aggregate FILTER clauses | CORRECTNESS | qualification | S | G-CORRECT |
 | 691 | LIN-0753 | [D19](#d19) | Согласовать row/batch aggregate bits | CORRECTNESS | qualification | M | G-CORRECT |
-| 693 | LIN-0755 | [D19](#d19) | Проверить large-integer GPU grouping | CORRECTNESS | qualification | S | G-CORRECT |
 | 695 | LIN-0757 | [D19](#d19) | Добавить group cardinality limits | FEATURE | candidate | M | G-FEATURE |
 | 697 | LIN-0759 | [D19](#d19) | Добавить aggregation skew diagnostics | FEATURE | candidate | M | G-FEATURE |
 | 698 | LIN-0760 | [D19](#d19) | Добавить group overflow diagnostics | FEATURE | candidate | M | G-FEATURE |
@@ -705,15 +703,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 947 | LIN-1142 | [D29](#d29) | Спроектировать shared resident columns | FEATURE | candidate | L | G-FEATURE |
 | 948 | LIN-1143 | [D29](#d29) | Спроектировать resident intermediate batches | FEATURE | candidate | L | G-FEATURE |
 | 949 | LIN-1144 | [D29](#d29) | Спроектировать explicit residency handles | FEATURE | candidate | L | G-FEATURE |
-| 950 | LIN-1165 | [D30](#d30) | Проверить GPU Unicode substring cases | VERIFY | qualification | S | G-VERIFY |
-| 951 | LIN-1166 | [D30](#d30) | Проверить GPU UTF-8 equality cases | VERIFY | qualification | S | G-VERIFY |
-| 952 | LIN-1167 | [D30](#d30) | Проверить GPU word boundary cases | VERIFY | qualification | S | G-VERIFY |
-| 953 | LIN-1168 | [D30](#d30) | Проверить GPU lowercase metadata parity | CORRECTNESS | qualification | S | G-CORRECT |
 | 956 | LIN-1171 | [D30](#d30) | Проверить regex look assertion metadata | CORRECTNESS | qualification | S | G-CORRECT |
-| 958 | LIN-1173 | [D30](#d30) | Проверить GPU grouped count overflow | CORRECTNESS | qualification | S | G-CORRECT |
-| 959 | LIN-1174 | [D30](#d30) | Проверить binary64 sum carry paths | CORRECTNESS | qualification | S | G-CORRECT |
-| 960 | LIN-1175 | [D30](#d30) | Проверить binary64 NaN canonicalization | CORRECTNESS | qualification | S | G-CORRECT |
-| 961 | LIN-1176 | [D30](#d30) | Проверить exceptional-value sum ordering | CORRECTNESS | qualification | S | G-CORRECT |
 | 962 | LIN-1177 | [D30](#d30) | Проверить GPU graph reverse traversal | CORRECTNESS | qualification | S | G-CORRECT |
 | 963 | LIN-1178 | [D30](#d30) | Проверить GPU graph unresolved nodes | CORRECTNESS | qualification | S | G-CORRECT |
 | 964 | LIN-1179 | [D30](#d30) | Проверить GPU graph cycle termination | CORRECTNESS | qualification | S | G-CORRECT |

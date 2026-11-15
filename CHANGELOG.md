@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Fixed
+- With a GPU attached, `sum` / `sum by` no longer differ from the CPU: the GPU summed integers as f64 (rounding past 2^53) and floats without the CPU's compensation. Integers are now summed exactly on the host, and the GPU sum kernel keeps the same Neumaier compensation as the CPU, so results match bit for bit. `GpuCompute::group_sums` still returns the plain left-to-right sum.
 - Lexical search lowercased the index character by character but the query with the contextual Unicode rules, so an upper-case Greek word never found its lower-case form: `ΟΔΟΣ` became `οδοσ` in the index, while the stored `οδος` ends in `ς`. Both sides now use `str::to_lowercase`. The full-text index format moves to version 2, so existing index files are rebuilt on open. The built-in embedder uses the same lowering, so vectors of texts with a word-final capital sigma change.
 - `sum` and `avg` over floats lost small values between large values that cancel: `1e16, 1, -1e16` summed to `0`. In-memory, grouped, parallel, spilled, indexed and join aggregates now use Neumaier-compensated addition and give `1`. The cold tier's columnar float sum is compensated the same way.
 - Sliding-frame window `sum` and `avg` over floats subtracted running prefix sums, so small values vanished behind a large earlier value: after `1e16`, a frame of `1.0, 0.5, 1.0` summed to `0`. Frames up to 1024 rows that do not start at the first row are now summed from their own rows.

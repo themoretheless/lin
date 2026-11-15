@@ -1810,6 +1810,18 @@ impl GpuCompute {
         values: &[f64],
         groups: usize,
     ) -> Result<Vec<f64>, Error> {
+        Ok(self.group_sums_compensated(ids, values, groups)?.into_iter().map(|[sum, _]| sum).collect())
+    }
+
+    /// Per-group `[sum, compensation]`: the plain left-to-right binary64 sum together
+    /// with the Neumaier compensation the CPU's `ExactSum` keeps, computed with the same
+    /// operations in the same order, so `sum + compensation` matches it bit for bit.
+    pub(crate) fn group_sums_compensated(
+        &self,
+        ids: &[u32],
+        values: &[f64],
+        groups: usize,
+    ) -> Result<Vec<[f64; 2]>, Error> {
         if ids.len() != values.len() || ids.iter().any(|&id| id as usize >= groups) {
             return Err(Error::runtime("GPU sum invalid groups or value count"));
         }
@@ -1819,7 +1831,7 @@ impl GpuCompute {
         let limits = self.device().limits();
         let max_bytes =
             (limits.max_storage_buffer_binding_size as usize).min(limits.max_buffer_size as usize);
-        if groups > max_bytes / 8
+        if groups > max_bytes / 16
             || groups.div_ceil(64) > limits.max_compute_workgroups_per_dimension as usize
         {
             return Err(Error::runtime("GPU sum groups exceed device limits"));
@@ -1829,11 +1841,11 @@ impl GpuCompute {
             return Err(Error::runtime("GPU limits cannot hold sum input"));
         }
         if ids.is_empty() {
-            return Ok(vec![0.0; groups]);
+            return Ok(vec![[0.0, 0.0]; groups]);
         }
         let kernel =
             self.builtin_kernel(|k| &mut k.sum, include_str!("shaders/sum.wgsl"), "main")?;
-        let output = self.zeroed_storage_buffer((groups * 8) as u64)?;
+        let output = self.zeroed_storage_buffer((groups * 16) as u64)?;
         for (id_chunk, value_chunk) in ids.chunks(chunk_rows).zip(values.chunks(chunk_rows)) {
             let words: Vec<u32> = id_chunk
                 .iter()
@@ -1865,9 +1877,10 @@ impl GpuCompute {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         let bytes = self.read_buffer(&output)?;
-        Ok(bytemuck::cast_slice::<u8, [u32; 2]>(&bytes)
+        let word = |lo: u32, hi: u32| f64::from_bits((lo as u64) | ((hi as u64) << 32));
+        Ok(bytemuck::cast_slice::<u8, [u32; 4]>(&bytes)
             .iter()
-            .map(|&[lo, hi]| f64::from_bits((lo as u64) | ((hi as u64) << 32)))
+            .map(|&[lo, hi, clo, chi]| [word(lo, hi), word(clo, chi)])
             .collect())
     }
 }
@@ -2207,7 +2220,7 @@ impl GpuCompute {
         let limits = self.device().limits();
         let max_bytes =
             (limits.max_storage_buffer_binding_size as usize).min(limits.max_buffer_size as usize);
-        if groups > max_bytes / 8
+        if groups > max_bytes / 16
             || groups.div_ceil(64) > limits.max_compute_workgroups_per_dimension as usize
         {
             return Err(Error::runtime("GPU RRF groups exceed device limits"));
@@ -2221,7 +2234,8 @@ impl GpuCompute {
         }
         let kernel =
             self.builtin_kernel(|k| &mut k.rrf, include_str!("shaders/sum.wgsl"), "rrf")?;
-        let output = self.zeroed_storage_buffer((groups * 8) as u64)?;
+        // Entries are 16 bytes (the sum kernel's total and compensation); RRF uses the first half.
+        let output = self.zeroed_storage_buffer((groups * 16) as u64)?;
         for (id_chunk, value_chunk) in ids.chunks(chunk_rows).zip(values.chunks(chunk_rows)) {
             let words: Vec<u32> = id_chunk
                 .iter()
@@ -2250,9 +2264,9 @@ impl GpuCompute {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         let bytes = self.read_buffer(&output)?;
-        Ok(bytemuck::cast_slice::<u8, [u32; 2]>(&bytes)
+        Ok(bytemuck::cast_slice::<u8, [u32; 4]>(&bytes)
             .iter()
-            .map(|&[lo, hi]| f64::from_bits((lo as u64) | ((hi as u64) << 32)))
+            .map(|&[lo, hi, _, _]| f64::from_bits((lo as u64) | ((hi as u64) << 32)))
             .collect())
     }
 }

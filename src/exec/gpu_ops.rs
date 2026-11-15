@@ -380,25 +380,20 @@ impl Db {
             return Ok(None);
         };
         let fk = field.as_str();
-        let Some(by) = by else {
-            let values: Vec<f64> = rows
-                .iter()
-                .map(|row| row.get(&fk).and_then(Cell::as_f64).unwrap_or(0.0))
-                .collect();
-            let sums = gpu.group_sums(&vec![0u32; rows.len()], &values, 1)?;
-            let mut row = Row::new();
-            row.insert(fk, Cell::Float(sums[0]));
-            return Ok(Some(vec![row]));
-        };
-        let bk = by.as_str();
+        // Split each value the way `ExactSum::add_cell` does: integers into an exact i128
+        // part (summed here), other numbers into the float part (summed on the GPU with
+        // the same compensation), and non-numeric cells skipped rather than added as 0.0.
+        let bk = by.map(Field::as_str);
         let mut group_ids: FxHashMap<Cell, u32> = FxHashMap::default();
         let mut group_cells: Vec<Cell> = Vec::new();
+        let mut int_parts: Vec<i128> = Vec::new();
         let mut ids: Vec<u32> = Vec::with_capacity(rows.len());
+        let mut values: Vec<f64> = Vec::with_capacity(rows.len());
         for row in rows {
-            let cell = row
-                .get(&bk)
-                .map(Cell::clone_for_borrow)
-                .unwrap_or(Cell::Null);
+            let cell = match &bk {
+                Some(k) => row.get(k).map(Cell::clone_for_borrow).unwrap_or(Cell::Null),
+                None => Cell::Null,
+            };
             let id = if let Some(&id) = group_ids.get(&cell) {
                 id
             } else {
@@ -406,15 +401,38 @@ impl Db {
                     .map_err(|_| Error::runtime("GPU sum has too many groups"))?;
                 group_cells.push(cell.clone());
                 group_ids.insert(cell, id);
+                int_parts.push(0);
                 id
             };
-            ids.push(id);
+            match row.get(&fk) {
+                Some(Cell::Int(i)) => int_parts[id as usize] += *i as i128,
+                Some(c) => {
+                    if let Some(v) = c.as_f64() {
+                        ids.push(id);
+                        values.push(v);
+                    }
+                }
+                None => {}
+            }
         }
-        let values: Vec<f64> = rows
+        if group_cells.is_empty() {
+            if bk.is_some() {
+                return Ok(Some(Vec::new()));
+            }
+            group_cells.push(Cell::Null);
+            int_parts.push(0);
+        }
+        let pairs = gpu.group_sums_compensated(&ids, &values, group_cells.len())?;
+        let sums: Vec<f64> = pairs
             .iter()
-            .map(|row| row.get(&fk).and_then(Cell::as_f64).unwrap_or(0.0))
+            .zip(&int_parts)
+            .map(|(&[float, comp], &int)| crate::exact_sum::ExactSum::from_parts(int, float, comp).value())
             .collect();
-        let sums = gpu.group_sums(&ids, &values, group_cells.len())?;
+        let Some(bk) = bk else {
+            let mut row = Row::new();
+            row.insert(fk, Cell::Float(sums[0]));
+            return Ok(Some(vec![row]));
+        };
         let mut entries: Vec<(Cell, f64)> = group_cells.into_iter().zip(sums).collect();
         entries.sort_unstable_by(|(a, _), (b, _)| cmp_sort(a, b));
         Ok(Some(

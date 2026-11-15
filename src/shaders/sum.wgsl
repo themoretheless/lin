@@ -1,8 +1,11 @@
 // IEEE-754 binary64 addition using paired u32 limbs. One invocation owns
 // a group and visits its values in source order, including across dispatches.
+// `main` keeps a Neumaier compensation next to each total (totals = sum, comp per
+// group), with the same operations in the same order as the CPU's `ExactSum`, so the
+// two produce identical bits. `rrf` uses the first half of each entry only.
 struct Record { group_id: u32, lo: u32, hi: u32 }
 @group(0) @binding(0) var<storage, read> records: array<Record>;
-@group(0) @binding(1) var<storage, read_write> totals: array<vec2<u32>>;
+@group(0) @binding(1) var<storage, read_write> totals: array<vec4<u32>>;
 fn nonzero(a: vec2<u32>) -> bool { return (a.x | a.y) != 0u; }
 fn less(a: vec2<u32>, b: vec2<u32>) -> bool { return a.y < b.y || (a.y == b.y && a.x < b.x); }
 fn plus(a: vec2<u32>, b: vec2<u32>) -> vec2<u32> {
@@ -83,15 +86,35 @@ fn add_double(a: vec2<u32>, b: vec2<u32>) -> vec2<u32> {
     if (rounded.y & 0x100000u) == 0u { exponent = 0u; }
     return vec2<u32>(rounded.x, (sign << 31u) | (exponent << 20u) | (rounded.y & 0xfffffu));
 }
+fn negate(a: vec2<u32>) -> vec2<u32> { return vec2<u32>(a.x, a.y ^ 0x80000000u); }
+fn finite(a: vec2<u32>) -> bool { return ((a.y >> 20u) & 2047u) != 2047u; }
+fn magnitude_ge(a: vec2<u32>, b: vec2<u32>) -> bool {
+    let ma = vec2<u32>(a.x, a.y & 0x7fffffffu);
+    let mb = vec2<u32>(b.x, b.y & 0x7fffffffu);
+    return !less(ma, mb);
+}
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     if id.x >= arrayLength(&totals) { return; }
-    var total = totals[id.x];
+    let entry = totals[id.x];
+    var total = entry.xy;
+    var comp = entry.zw;
     for (var i = 0u; i < arrayLength(&records); i += 1u) {
         let r = records[i];
-        if r.group_id == id.x { total = add_double(total, vec2<u32>(r.lo, r.hi)); }
+        if r.group_id == id.x {
+            let v = vec2<u32>(r.lo, r.hi);
+            let t = add_double(total, v);
+            if finite(t) {
+                if magnitude_ge(total, v) {
+                    comp = add_double(comp, add_double(add_double(total, negate(t)), v));
+                } else {
+                    comp = add_double(comp, add_double(add_double(v, negate(t)), total));
+                }
+            }
+            total = t;
+        }
     }
-    totals[id.x] = total;
+    totals[id.x] = vec4<u32>(total, comp);
 }
 
 // Correctly rounded 1 / positive u32, without native floating point.
@@ -126,10 +149,10 @@ fn reciprocal_u32(n: u32) -> vec2<u32> {
 @compute @workgroup_size(64)
 fn rrf(@builtin(global_invocation_id) id: vec3<u32>) {
     if id.x >= arrayLength(&totals) { return; }
-    var total = totals[id.x];
+    var total = totals[id.x].xy;
     for (var i = 0u; i < arrayLength(&records); i += 1u) {
         let r = records[i];
         if r.group_id == id.x { total = add_double(total, reciprocal_u32(r.lo)); }
     }
-    totals[id.x] = total;
+    totals[id.x] = vec4<u32>(total, 0u, 0u);
 }

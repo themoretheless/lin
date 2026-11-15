@@ -47,6 +47,13 @@ impl ExactSum {
         self.float = t;
     }
 
+    /// A sum assembled from an exact integer part and a float part computed elsewhere
+    /// (the GPU) with the same compensated additions as [`Self::add_f64`].
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+    pub(crate) fn from_parts(int: i128, float: f64, comp: f64) -> Self {
+        Self { int, float, comp }
+    }
+
     #[inline]
     pub(crate) fn merge(&mut self, other: ExactSum) {
         self.int += other.int;
