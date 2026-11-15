@@ -190,3 +190,33 @@ fn crash_at_every_checkpoint_step_recovers_committed_data() {
         }
     }
 }
+
+/// Checkpointing is idempotent: repeating it with no writes in between, and reopening
+/// between checkpoints, leaves the same answers, and a checkpoint with nothing new to
+/// write produces the same snapshot bytes.
+#[test]
+fn repeated_checkpoints_are_idempotent() {
+    let dir = tmp();
+    let mut db = Db::open(&dir).unwrap();
+    for stmt in statements(0) {
+        db.run(&stmt).unwrap();
+    }
+    db.checkpoint().unwrap();
+    let want = answers(&mut db);
+    let snap_of = |dir: &Path| -> Vec<u8> {
+        files(dir).into_iter().find(|(n, _)| n.starts_with("snapshot")).map(|(_, b)| b).unwrap_or_default()
+    };
+    let first = snap_of(&dir);
+    db.checkpoint().unwrap();
+    db.checkpoint().unwrap();
+    assert_eq!(answers(&mut db), want);
+    assert_eq!(snap_of(&dir), first, "a checkpoint with nothing new changed the snapshot");
+    db.close().unwrap();
+    drop(db);
+    for _ in 0..2 {
+        let mut db = Db::open(&dir).unwrap();
+        assert_eq!(answers(&mut db), want, "after reopen");
+        db.checkpoint().unwrap();
+        db.close().unwrap();
+    }
+}

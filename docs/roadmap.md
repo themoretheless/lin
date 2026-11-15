@@ -2,7 +2,7 @@
 
 Срез: **2026-11-15**, коммит `58444cf6e` (релиз 0.7.1) плюс незакоммиченное рабочее дерево. Единственный файл с планом в репозитории: в нём только несделанное. Реализованное описано в [CHANGELOG](../CHANGELOG.md), в документах `docs/` по отдельным механизмам и в отчётах `benches/results/`.
 
-Открыто **1376** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
+Открыто **1374** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровывались, поэтому в них есть пропуски: закрытые пункты удалены. Пункты части II со статусами `candidate` и `qualification` по коду поштучно не сверялись: перед взятием пункта сначала проверить, не покрыт ли он уже.
 
@@ -196,7 +196,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 ### Приоритетный список — 1563 пунктов
 
-Количества: P1: 3, P2: 828, P3: 545; статусы: blocked_external: 1, candidate: 934, qualification: 441.
+Количества: P1: 3, P2: 828, P3: 543; статусы: blocked_external: 1, candidate: 934, qualification: 439.
 
 #### P1: 3 пунктов
 
@@ -1039,13 +1039,12 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 1399 | LIN-1971 | [D50](#d50) | Описать replication version compatibility | DOC | candidate | S | G-DOC |
 | 1400 | LIN-1972 | [D50](#d50) | Описать downgrade support boundaries | DOC | candidate | S | G-DOC |
 
-#### P3: 545 пунктов
+#### P3: 543 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
 | 1401 | LIN-0185 | [D05](#d05) | Проверить checkpoint WAL truncation race | CORRECTNESS | qualification | S | G-CORRECT |
 | 1402 | LIN-0186 | [D05](#d05) | Проверить checkpoint follower pinning | CORRECTNESS | qualification | S | G-CORRECT |
-| 1403 | LIN-0187 | [D05](#d05) | Проверить checkpoint reader pinning | CORRECTNESS | qualification | S | G-CORRECT |
 | 1404 | LIN-0188 | [D05](#d05) | Проверить checkpoint cancellation cleanup | CORRECTNESS | qualification | S | G-CORRECT |
 | 1405 | LIN-0189 | [D05](#d05) | Добавить checkpoint progress metrics | FEATURE | candidate | M | G-FEATURE |
 | 1406 | LIN-0190 | [D05](#d05) | Добавить checkpoint debt metric | FEATURE | candidate | M | G-FEATURE |
@@ -1056,7 +1055,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 1412 | LIN-0196 | [D05](#d05) | Сравнить dictionary text snapshots | PERF | candidate | M | G-PERF |
 | 1413 | LIN-0197 | [D05](#d05) | Проверить snapshot disk quota | CORRECTNESS | qualification | S | G-CORRECT |
 | 1415 | LIN-0199 | [D05](#d05) | Проверить cross-version snapshot corpus | VERIFY | qualification | S | G-VERIFY |
-| 1416 | LIN-0200 | [D05](#d05) | Проверить checkpoint restart idempotence | CORRECTNESS | qualification | S | G-CORRECT |
 | 1417 | LIN-0345 | [D09](#d09) | Проверить clone_for_borrow contract | CORRECTNESS | qualification | S | G-CORRECT |
 | 1418 | LIN-0346 | [D09](#d09) | Проверить clone_for_borrow SSO behavior | CORRECTNESS | qualification | S | G-CORRECT |
 | 1419 | LIN-0347 | [D09](#d09) | Проверить cross-thread borrowed row ownership | CORRECTNESS | qualification | S | G-CORRECT |
