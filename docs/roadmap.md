@@ -2,7 +2,7 @@
 
 Срез: **2026-11-15**, коммит `58444cf6e` (релиз 0.7.1) плюс незакоммиченное рабочее дерево. Единственный файл с планом в репозитории: в нём только несделанное. Реализованное описано в [CHANGELOG](../CHANGELOG.md), в документах `docs/` по отдельным механизмам и в отчётах `benches/results/`.
 
-Открыто **1488** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
+Открыто **1484** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровывались, поэтому в них есть пропуски: закрытые пункты удалены. Пункты части II со статусами `candidate` и `qualification` по коду поштучно не сверялись: перед взятием пункта сначала проверить, не покрыт ли он уже.
 
@@ -193,7 +193,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 ### Приоритетный список — 1563 пунктов
 
-Количества: P1: 3, P2: 912, P3: 573; статусы: blocked_external: 1, candidate: 934, qualification: 553.
+Количества: P1: 3, P2: 908, P3: 573; статусы: blocked_external: 1, candidate: 934, qualification: 549.
 
 #### P1: 3 пунктов
 
@@ -203,7 +203,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 2 | LIN-0002 | [D01](#d01) | Закрыть durable 1k SQLite gap | PERF | qualification | M | G-PERF |
 | 22 | LIN-0006 | [D01](#d01) | Получить тестовый endpoint Kusto | OPS | blocked_external | M | G-OPS |
 
-#### P2: 912 пунктов
+#### P2: 908 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -278,8 +278,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 210 | LIN-0118 | [D03](#d03) | Измерить large WAL commits | PERF | candidate | M | G-PERF |
 | 211 | LIN-0119 | [D03](#d03) | Измерить concurrent-reader sync impact | PERF | candidate | M | G-PERF |
 | 212 | LIN-0120 | [D03](#d03) | Измерить fsync на реальном диске | PERF | candidate | M | G-PERF |
-| 230 | LIN-0142 | [D04](#d04) | Проверить replay group boundaries | CORRECTNESS | qualification | S | G-CORRECT |
-| 231 | LIN-0143 | [D04](#d04) | Проверить rollback после decode failure | CORRECTNESS | qualification | S | G-CORRECT |
 | 233 | LIN-0145 | [D04](#d04) | Измерить bounded replay memory | PERF | candidate | M | G-PERF |
 | 234 | LIN-0146 | [D04](#d04) | Измерить hot replay throughput | PERF | candidate | M | G-PERF |
 | 235 | LIN-0147 | [D04](#d04) | Измерить cold replay throughput | PERF | candidate | M | G-PERF |
@@ -344,8 +342,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 365 | LIN-0310 | [D08](#d08) | Спроектировать borrowed RowView | FEATURE | candidate | L | G-FEATURE |
 | 366 | LIN-0311 | [D08](#d08) | Спроектировать stable typed field IDs | FEATURE | candidate | L | G-FEATURE |
 | 367 | LIN-0312 | [D08](#d08) | Спроектировать row version metadata | FEATURE | candidate | L | G-FEATURE |
-| 368 | LIN-0313 | [D08](#d08) | Проверить serde backward compatibility | CORRECTNESS | qualification | S | G-CORRECT |
-| 371 | LIN-0316 | [D08](#d08) | Проверить serde allocation limits | CORRECTNESS | qualification | S | G-CORRECT |
 | 372 | LIN-0317 | [D08](#d08) | Измерить inline-key layout alternatives | PERF | candidate | M | G-PERF |
 | 373 | LIN-0318 | [D08](#d08) | Измерить hot/cold row metadata | PERF | candidate | M | G-PERF |
 | 374 | LIN-0319 | [D08](#d08) | Измерить compressed null metadata | PERF | candidate | M | G-PERF |
