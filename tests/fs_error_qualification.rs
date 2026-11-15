@@ -80,3 +80,54 @@ unsafe extern "C" {
     #[link_name = "geteuid"]
     fn libc_geteuid() -> u32;
 }
+
+/// Cold-tier segment files that cannot be read: opening or querying reports an error (or
+/// answers correctly if the file was already mapped), never panics and never answers as
+/// if the collection were empty.
+#[test]
+fn unreadable_cold_segments_are_errors_not_empty_results() {
+    if unsafe { libc_geteuid() } == 0 {
+        return;
+    }
+    let dir = tmp();
+    let opts = || lin::OpenOpts { sync: lin::SyncMode::Normal, cold: true };
+    {
+        let mut db = Db::open_with(&dir, opts()).unwrap();
+        db.run("col t { id: text, v: i64 }").unwrap();
+        let rows = (0..200).map(|i| format!(r#"{{ id: "r{i}", v: {i} }}"#)).collect::<Vec<_>>().join(",");
+        db.run(&format!("insert t [{rows}]")).unwrap();
+        db.checkpoint().unwrap();
+        db.close().unwrap();
+    }
+    let mut files = Vec::new();
+    fn walk(d: &Path, out: &mut Vec<std::path::PathBuf>) {
+        for e in std::fs::read_dir(d).unwrap() {
+            let e = e.unwrap();
+            if e.file_type().unwrap().is_dir() {
+                walk(&e.path(), out);
+            } else {
+                out.push(e.path());
+            }
+        }
+    }
+    walk(&dir, &mut files);
+    let segs: Vec<_> = files.iter().filter(|p| p.components().any(|c| c.as_os_str() == "disk" || c.as_os_str() == "cold" || c.as_os_str() == "segments")).cloned().collect();
+    assert!(!segs.is_empty(), "no cold files found in {files:?}");
+    for seg in &segs {
+        std::fs::set_permissions(seg, std::fs::Permissions::from_mode(0o000)).unwrap();
+    }
+    let res = std::panic::catch_unwind(|| match Db::open_with(&dir, opts()) {
+        Err(_) => None,
+        Ok(mut db) => Some(db.run("t | count").map(|h| h.rows[0].get("hits").and_then(|c| c.as_f64()))),
+    });
+    for seg in &segs {
+        std::fs::set_permissions(seg, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    match res {
+        Err(_) => panic!("unreadable cold files caused a panic"),
+        Ok(None) | Ok(Some(Err(_))) => {}
+        Ok(Some(Ok(n))) => assert_eq!(n, Some(200.0), "unreadable cold files answered as {n:?}"),
+    }
+    let mut db = Db::open_with(&dir, opts()).unwrap();
+    assert_eq!(count(&mut db), 200.0);
+}

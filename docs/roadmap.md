@@ -2,7 +2,7 @@
 
 Срез: **2026-11-15**, коммит `58444cf6e` (релиз 0.7.1) плюс незакоммиченное рабочее дерево. Единственный файл с планом в репозитории: в нём только несделанное. Реализованное описано в [CHANGELOG](../CHANGELOG.md), в документах `docs/` по отдельным механизмам и в отчётах `benches/results/`.
 
-Открыто **1543** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
+Открыто **1542** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровывались, поэтому в них есть пропуски: закрытые пункты удалены. Пункты части II со статусами `candidate` и `qualification` по коду поштучно не сверялись: перед взятием пункта сначала проверить, не покрыт ли он уже.
 
@@ -193,7 +193,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 ### Приоритетный список — 1563 пунктов
 
-Количества: P1: 3, P2: 967, P3: 573; статусы: blocked_external: 1, candidate: 934, qualification: 608.
+Количества: P1: 3, P2: 966, P3: 573; статусы: blocked_external: 1, candidate: 934, qualification: 607.
 
 #### P1: 3 пунктов
 
@@ -203,7 +203,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 2 | LIN-0002 | [D01](#d01) | Закрыть durable 1k SQLite gap | PERF | qualification | M | G-PERF |
 | 22 | LIN-0006 | [D01](#d01) | Получить тестовый endpoint Kusto | OPS | blocked_external | M | G-OPS |
 
-#### P2: 967 пунктов
+#### P2: 966 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -822,7 +822,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 1005 | LIN-1252 | [D32](#d32) | Измерить page-aligned section layout | PERF | candidate | M | G-PERF |
 | 1008 | LIN-1255 | [D32](#d32) | Спроектировать hot/cold tier thresholds | FEATURE | candidate | L | G-FEATURE |
 | 1009 | LIN-1256 | [D32](#d32) | Спроектировать cold section checksums | FEATURE | candidate | L | G-FEATURE |
-| 1013 | LIN-1260 | [D32](#d32) | Проверить cold file permission errors | CORRECTNESS | qualification | S | G-CORRECT |
 | 1014 | LIN-1261 | [D32](#d32) | Измерить dictionary cold strings | PERF | candidate | M | G-PERF |
 | 1015 | LIN-1262 | [D32](#d32) | Измерить delta-encoded cold integers | PERF | candidate | M | G-PERF |
 | 1016 | LIN-1263 | [D32](#d32) | Измерить compressed cold vectors | PERF | candidate | M | G-PERF |
