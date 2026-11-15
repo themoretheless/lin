@@ -2,7 +2,7 @@
 
 Срез: **2026-11-15**, коммит `58444cf6e` (релиз 0.7.1) плюс незакоммиченное рабочее дерево. Единственный файл с планом в репозитории: в нём только несделанное. Реализованное описано в [CHANGELOG](../CHANGELOG.md), в документах `docs/` по отдельным механизмам и в отчётах `benches/results/`.
 
-Открыто **1387** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
+Открыто **1383** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровывались, поэтому в них есть пропуски: закрытые пункты удалены. Пункты части II со статусами `candidate` и `qualification` по коду поштучно не сверялись: перед взятием пункта сначала проверить, не покрыт ли он уже.
 
@@ -196,7 +196,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 ### Приоритетный список — 1563 пунктов
 
-Количества: P1: 3, P2: 831, P3: 553; статусы: blocked_external: 1, candidate: 934, qualification: 452.
+Количества: P1: 3, P2: 831, P3: 549; статусы: blocked_external: 1, candidate: 934, qualification: 448.
 
 #### P1: 3 пунктов
 
@@ -1042,7 +1042,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 1399 | LIN-1971 | [D50](#d50) | Описать replication version compatibility | DOC | candidate | S | G-DOC |
 | 1400 | LIN-1972 | [D50](#d50) | Описать downgrade support boundaries | DOC | candidate | S | G-DOC |
 
-#### P3: 553 пунктов
+#### P3: 549 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -1123,14 +1123,10 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 1483 | LIN-0667 | [D17](#d17) | Добавить cursor cancellation receipt | API | candidate | M | G-API |
 | 1484 | LIN-0668 | [D17](#d17) | Добавить cursor leak diagnostics | API | candidate | M | G-API |
 | 1485 | LIN-0669 | [D17](#d17) | Проверить chained cursor error propagation | CORRECTNESS | qualification | S | G-CORRECT |
-| 1486 | LIN-0670 | [D17](#d17) | Проверить cursor union deduplication | CORRECTNESS | qualification | S | G-CORRECT |
-| 1488 | LIN-0672 | [D17](#d17) | Проверить cursor graph traversal boundaries | CORRECTNESS | qualification | S | G-CORRECT |
 | 1489 | LIN-0673 | [D17](#d17) | Измерить async stream chunk sizes | PERF | candidate | M | G-PERF |
 | 1490 | LIN-0674 | [D17](#d17) | Измерить cursor to RecordBatch path | PERF | candidate | M | G-PERF |
 | 1491 | LIN-0675 | [D17](#d17) | Измерить cursor iterator fusion | PERF | candidate | M | G-PERF |
 | 1492 | LIN-0676 | [D17](#d17) | Измерить cursor field-slot cache | PERF | candidate | M | G-PERF |
-| 1493 | LIN-0677 | [D17](#d17) | Проверить multi-cursor shared snapshots | CORRECTNESS | qualification | S | G-CORRECT |
-| 1494 | LIN-0678 | [D17](#d17) | Проверить nested cursor reads | CORRECTNESS | qualification | S | G-CORRECT |
 | 1495 | LIN-0679 | [D17](#d17) | Проверить cross-thread cursor restrictions | CORRECTNESS | qualification | S | G-CORRECT |
 | 1496 | LIN-0680 | [D17](#d17) | Проверить cursor serialization rejection | CORRECTNESS | qualification | S | G-CORRECT |
 | 1501 | LIN-0709 | [D18](#d18) | Спроектировать Arrow C data boundary | FEATURE | candidate | L | G-FEATURE |

@@ -88,3 +88,50 @@ fn dropped_cursor_and_catalog_change() {
     let parsed = parse(r#"c | id == "after" | take all"#);
     assert_eq!(db.cursor(&parsed).unwrap().count(), 1);
 }
+
+/// Cursors over a union and over graph traversal give the same rows as `run`, and several
+/// cursors open at once over the same database, read in interleaved order, each give
+/// their own query's full answer.
+#[test]
+fn union_graph_and_interleaved_cursors() {
+    let mut db = seed();
+    db.run("col u { id: text }").unwrap();
+    db.run(r#"insert u [{ id: "c0001" }, { id: "u-only" }]"#).unwrap();
+    db.run(r#"insert docs [{ uri: "raw://cg/0", title: "G0", layer: "wiki" }, { uri: "raw://cg/1", title: "G1", layer: "wiki" }, { uri: "raw://cg/2", title: "G2", layer: "wiki" }]"#).unwrap();
+    let id = |db: &mut Db, u: &str| db.run(&format!(r#"docs | uri == "{u}" | {{ id }}"#)).unwrap().rows[0].get("id").and_then(|c| c.text()).unwrap().to_string();
+    let (g0, g1, g2) = (id(&mut db, "raw://cg/0"), id(&mut db, "raw://cg/1"), id(&mut db, "raw://cg/2"));
+    db.run(&format!(r#"append edge wikilink "{g0}" -> "{g1}""#)).unwrap();
+    db.run(&format!(r#"append edge wikilink "{g1}" -> "{g2}""#)).unwrap();
+    db.run(&format!(r#"append edge wikilink "{g2}" -> "{g0}""#)).unwrap();
+    let queries = [
+        "c | n == 3 | { id } | union u | { id }".to_string(),
+        format!(r#"docs | id == "{g0}" | hop wikilink depth=3 | {{ id }} | take all"#),
+        format!(r#"docs | id == "{g0}" | match -wikilink*1..3-> b | {{ b.id }} | take all"#),
+    ];
+    for q in &queries {
+        let mut want: Vec<String> = db.run(q).unwrap().rows.iter().map(key).collect();
+        let parsed = parse(q);
+        let mut got: Vec<String> = db.cursor(&parsed).unwrap().map(|r| key(&r.unwrap())).collect();
+        want.sort();
+        got.sort();
+        assert_eq!(got, want, "{q}");
+    }
+    // Three cursors at once, read round-robin.
+    let qs = ["c | n == 1 | take all", "c | n == 2 | take all", "p | take all"];
+    let parsed: Vec<lin::Query> = qs.iter().map(|q| parse(q)).collect();
+    let wants: Vec<usize> = qs.iter().map(|q| db.run(q).unwrap().rows.len()).collect();
+    let mut cursors: Vec<_> = parsed.iter().map(|q| db.cursor(q).unwrap()).collect();
+    let mut counts = vec![0usize; cursors.len()];
+    let mut live = cursors.len();
+    while live > 0 {
+        live = 0;
+        for (i, c) in cursors.iter_mut().enumerate() {
+            if let Some(r) = c.next() {
+                r.unwrap();
+                counts[i] += 1;
+                live += 1;
+            }
+        }
+    }
+    assert_eq!(counts, wants);
+}
