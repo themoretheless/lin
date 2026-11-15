@@ -2,7 +2,7 @@
 
 Срез: **2026-11-14**, коммит `58444cf6e` (релиз 0.7.1) плюс незакоммиченное рабочее дерево. Единственный файл с планом в репозитории: в нём только несделанное. Реализованное описано в [CHANGELOG](../CHANGELOG.md), в документах `docs/` по отдельным механизмам и в отчётах `benches/results/`.
 
-Открыто **1583** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
+Открыто **1582** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровывались, поэтому в них есть пропуски: закрытые пункты удалены. Пункты части II со статусами `candidate` и `qualification` по коду поштучно не сверялись: перед взятием пункта сначала проверить, не покрыт ли он уже.
 
@@ -194,7 +194,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 ### Приоритетный список — 1590 пунктов
 
-Количества: P1: 3, P2: 1006, P3: 574; статусы: blocked_external: 1, candidate: 934, qualification: 648.
+Количества: P1: 3, P2: 1005, P3: 574; статусы: blocked_external: 1, candidate: 934, qualification: 647.
 
 #### P1: 3 пунктов
 
@@ -204,7 +204,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 2 | LIN-0002 | [D01](#d01) | Закрыть durable 1k SQLite gap | PERF | qualification | M | G-PERF |
 | 22 | LIN-0006 | [D01](#d01) | Получить тестовый endpoint Kusto | OPS | blocked_external | M | G-OPS |
 
-#### P2: 1006 пунктов
+#### P2: 1005 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -290,7 +290,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 238 | LIN-0150 | [D04](#d04) | Добавить cancellation recovery contract | FEATURE | candidate | M | G-FEATURE |
 | 239 | LIN-0151 | [D04](#d04) | Добавить dry-run recovery report | FEATURE | candidate | M | G-FEATURE |
 | 240 | LIN-0152 | [D04](#d04) | Добавить damaged-frame location diagnostics | FEATURE | candidate | M | G-FEATURE |
-| 241 | LIN-0153 | [D04](#d04) | Проверить replay unknown collection | CORRECTNESS | qualification | S | G-CORRECT |
 | 242 | LIN-0154 | [D04](#d04) | Проверить replay удалённого catalog object | CORRECTNESS | qualification | S | G-CORRECT |
 | 243 | LIN-0155 | [D04](#d04) | Проверить replay несовместимого field type | CORRECTNESS | qualification | S | G-CORRECT |
 | 244 | LIN-0156 | [D04](#d04) | Проверить replay schema generation mismatch | CORRECTNESS | qualification | S | G-CORRECT |
