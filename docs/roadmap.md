@@ -2,7 +2,7 @@
 
 Срез: **2026-11-14**, коммит `58444cf6e` (релиз 0.7.1) плюс незакоммиченное рабочее дерево. Единственный файл с планом в репозитории: в нём только несделанное. Реализованное описано в [CHANGELOG](../CHANGELOG.md), в документах `docs/` по отдельным механизмам и в отчётах `benches/results/`.
 
-Открыто **1582** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
+Открыто **1575** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровывались, поэтому в них есть пропуски: закрытые пункты удалены. Пункты части II со статусами `candidate` и `qualification` по коду поштучно не сверялись: перед взятием пункта сначала проверить, не покрыт ли он уже.
 
@@ -194,7 +194,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 ### Приоритетный список — 1590 пунктов
 
-Количества: P1: 3, P2: 1005, P3: 574; статусы: blocked_external: 1, candidate: 934, qualification: 647.
+Количества: P1: 3, P2: 998, P3: 574; статусы: blocked_external: 1, candidate: 934, qualification: 640.
 
 #### P1: 3 пунктов
 
@@ -204,7 +204,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 2 | LIN-0002 | [D01](#d01) | Закрыть durable 1k SQLite gap | PERF | qualification | M | G-PERF |
 | 22 | LIN-0006 | [D01](#d01) | Получить тестовый endpoint Kusto | OPS | blocked_external | M | G-OPS |
 
-#### P2: 1005 пунктов
+#### P2: 998 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -459,7 +459,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 517 | LIN-0527 | [D14](#d14) | Измерить conjunct flattening copies | PERF | candidate | M | G-PERF |
 | 518 | LIN-0528 | [D14](#d14) | Измерить plan-node allocation | PERF | candidate | M | G-PERF |
 | 519 | LIN-0529 | [D14](#d14) | Проверить index residual predicates | CORRECTNESS | qualification | S | G-CORRECT |
-| 520 | LIN-0530 | [D14](#d14) | Проверить OR branch duplicate elimination | CORRECTNESS | qualification | S | G-CORRECT |
 | 521 | LIN-0531 | [D14](#d14) | Проверить AND branch index intersection | CORRECTNESS | qualification | S | G-CORRECT |
 | 522 | LIN-0532 | [D14](#d14) | Проверить empty predicate plan | CORRECTNESS | qualification | S | G-CORRECT |
 | 523 | LIN-0533 | [D14](#d14) | Спроектировать logical rewrite registry | FEATURE | candidate | L | G-FEATURE |
@@ -474,9 +473,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 532 | LIN-0542 | [D14](#d14) | Проверить post-join alias resolution | CORRECTNESS | qualification | S | G-CORRECT |
 | 533 | LIN-0543 | [D14](#d14) | Проверить aggregate filter placement | CORRECTNESS | qualification | S | G-CORRECT |
 | 534 | LIN-0544 | [D14](#d14) | Проверить window filter placement | CORRECTNESS | qualification | S | G-CORRECT |
-| 535 | LIN-0545 | [D14](#d14) | Проверить sort/limit commutation rules | CORRECTNESS | qualification | S | G-CORRECT |
-| 536 | LIN-0546 | [D14](#d14) | Проверить skip/take commutation rules | CORRECTNESS | qualification | S | G-CORRECT |
-| 537 | LIN-0547 | [D14](#d14) | Проверить projection/filter commutation | CORRECTNESS | qualification | S | G-CORRECT |
 | 538 | LIN-0548 | [D14](#d14) | Проверить graph/filter commutation | CORRECTNESS | qualification | S | G-CORRECT |
 | 539 | LIN-0549 | [D14](#d14) | Добавить plan equivalence oracle | VERIFY | qualification | S | G-VERIFY |
 | 540 | LIN-0550 | [D14](#d14) | Добавить no-optimization execution mode | FEATURE | candidate | M | G-FEATURE |
@@ -521,7 +517,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 580 | LIN-0606 | [D16](#d16) | Измерить fused count/filter | PERF | candidate | M | G-PERF |
 | 581 | LIN-0607 | [D16](#d16) | Измерить reusable predicate scratch | PERF | candidate | M | G-PERF |
 | 582 | LIN-0608 | [D16](#d16) | Измерить field-ID expression access | PERF | candidate | M | G-PERF |
-| 583 | LIN-0609 | [D16](#d16) | Проверить limit early termination | CORRECTNESS | qualification | S | G-CORRECT |
 | 584 | LIN-0610 | [D16](#d16) | Проверить filter side-effect ordering | CORRECTNESS | qualification | S | G-CORRECT |
 | 585 | LIN-0611 | [D16](#d16) | Проверить NOW capture consistency | CORRECTNESS | qualification | S | G-CORRECT |
 | 586 | LIN-0612 | [D16](#d16) | Проверить per-query timestamp reuse | CORRECTNESS | qualification | S | G-CORRECT |
@@ -536,7 +531,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 595 | LIN-0621 | [D16](#d16) | Проверить error после partial result | CORRECTNESS | qualification | S | G-CORRECT |
 | 596 | LIN-0622 | [D16](#d16) | Проверить nested execution reentrancy | CORRECTNESS | qualification | S | G-CORRECT |
 | 597 | LIN-0623 | [D16](#d16) | Проверить row pool между operators | CORRECTNESS | qualification | S | G-CORRECT |
-| 598 | LIN-0624 | [D16](#d16) | Проверить huge skip handling | CORRECTNESS | qualification | S | G-CORRECT |
 | 599 | LIN-0625 | [D16](#d16) | Измерить chunked batch execution | PERF | candidate | M | G-PERF |
 | 600 | LIN-0626 | [D16](#d16) | Измерить adaptive batch sizing | PERF | candidate | M | G-PERF |
 | 601 | LIN-0627 | [D16](#d16) | Измерить branch-specialized scalar loops | PERF | candidate | M | G-PERF |
@@ -598,7 +592,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 660 | LIN-0702 | [D18](#d18) | Измерить SIMD bitmap operations | PERF | candidate | M | G-PERF |
 | 661 | LIN-0703 | [D18](#d18) | Измерить packed UTF-8 projection | PERF | candidate | M | G-PERF |
 | 662 | LIN-0704 | [D18](#d18) | Измерить vector column alignment | PERF | candidate | M | G-PERF |
-| 667 | LIN-0729 | [D19](#d19) | Проверить count/count-field distinction | CORRECTNESS | qualification | S | G-CORRECT |
 | 669 | LIN-0731 | [D19](#d19) | Проверить sum float order policy | CORRECTNESS | qualification | S | G-CORRECT |
 | 670 | LIN-0732 | [D19](#d19) | Проверить avg precision policy | CORRECTNESS | qualification | S | G-CORRECT |
 | 671 | LIN-0733 | [D19](#d19) | Проверить min/max mixed scalar types | CORRECTNESS | qualification | S | G-CORRECT |
