@@ -2,7 +2,7 @@
 
 Срез: **2026-11-15**, коммит `58444cf6e` (релиз 0.7.1) плюс незакоммиченное рабочее дерево. Единственный файл с планом в репозитории: в нём только несделанное. Реализованное описано в [CHANGELOG](../CHANGELOG.md), в документах `docs/` по отдельным механизмам и в отчётах `benches/results/`.
 
-Открыто **1437** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
+Открыто **1436** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровывались, поэтому в них есть пропуски: закрытые пункты удалены. Пункты части II со статусами `candidate` и `qualification` по коду поштучно не сверялись: перед взятием пункта сначала проверить, не покрыт ли он уже.
 
@@ -194,7 +194,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 ### Приоритетный список — 1563 пунктов
 
-Количества: P1: 3, P2: 861, P3: 573; статусы: blocked_external: 1, candidate: 934, qualification: 502.
+Количества: P1: 3, P2: 860, P3: 573; статусы: blocked_external: 1, candidate: 934, qualification: 501.
 
 #### P1: 3 пунктов
 
@@ -204,7 +204,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 2 | LIN-0002 | [D01](#d01) | Закрыть durable 1k SQLite gap | PERF | qualification | M | G-PERF |
 | 22 | LIN-0006 | [D01](#d01) | Получить тестовый endpoint Kusto | OPS | blocked_external | M | G-OPS |
 
-#### P2: 861 пунктов
+#### P2: 860 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -628,7 +628,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 823 | LIN-0938 | [D24](#d24) | Спроектировать BM25 opt-in | FEATURE | candidate | L | G-FEATURE |
 | 824 | LIN-0939 | [D24](#d24) | Спроектировать score explanation API | FEATURE | candidate | L | G-FEATURE |
 | 825 | LIN-0940 | [D24](#d24) | Спроектировать score model versioning | FEATURE | candidate | L | G-FEATURE |
-| 828 | LIN-0943 | [D24](#d24) | Проверить hybrid RRF exactness | CORRECTNESS | qualification | S | G-CORRECT |
 | 836 | LIN-0971 | [D25](#d25) | Проверить monotonic posting order | CORRECTNESS | qualification | S | G-CORRECT |
 | 838 | LIN-0973 | [D25](#d25) | Измерить pending fold trigger | PERF | candidate | M | G-PERF |
 | 839 | LIN-0974 | [D25](#d25) | Измерить incremental fold work | PERF | candidate | M | G-PERF |

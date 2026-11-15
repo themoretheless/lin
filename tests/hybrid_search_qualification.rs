@@ -104,3 +104,33 @@ fn filtered_vector_top_k_is_a_prefix_of_the_filtered_ranking() {
         }
     }
 }
+
+/// Hybrid ranking is exactly reciprocal rank fusion (k = 60) of the lexical and vector
+/// rankings, ties broken by the document key, recomputed here from those two rankings.
+#[test]
+fn hybrid_ranking_is_exact_rrf_of_lex_and_vec() {
+    let mut db = seed();
+    let key = |db: &mut Db, q: &str| -> Vec<(String, String)> {
+        db.run(q).unwrap().rows.iter().map(|r| {
+            let uri = r.get("uri").and_then(|c| c.text()).unwrap().to_string();
+            let id = r.get("id").and_then(|c| c.text()).map(str::to_string).unwrap_or_else(|| uri.clone());
+            (id, uri)
+        }).collect()
+    };
+    for query in ["kestrel", "heron field", "osprey note 7", "zero"] {
+        let lex = key(&mut db, &format!(r#"docs | search lex "{query}" | {{ id, uri }} | take all"#));
+        let vec = key(&mut db, &format!(r#"docs | search vec "{query}" | {{ id, uri }} | take all"#));
+        let mut scores: std::collections::BTreeMap<String, (f64, String)> = std::collections::BTreeMap::new();
+        for list in [&lex, &vec] {
+            for (rank, (id, uri)) in list.iter().enumerate() {
+                let e = scores.entry(id.clone()).or_insert((0.0, uri.clone()));
+                e.0 += 1.0 / (60.0 + rank as f64 + 1.0);
+            }
+        }
+        let mut want: Vec<(f64, String)> = scores.into_values().collect();
+        want.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+        let want: Vec<String> = want.into_iter().map(|(_, u)| u).collect();
+        let got = uris(&mut db, &format!(r#"docs | search "{query}" | {{ uri }} | take all"#));
+        assert_eq!(got, want, "{query}: hybrid is not RRF of lex and vec");
+    }
+}
