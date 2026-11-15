@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Fixed
+- `#[derive(LinRow)]` failed with `missing column` for an `Option<T>` field whose value was never set: rows are sparse, so such a field is absent rather than `Null`. An absent field now reads as `None`; required fields still report the missing column.
 - Sorting compared integers through f64: integers above 2^53 that differ by one tied or swapped (`2^53 + 1` sorted before `2^53`, `i64::MAX` before `i64::MAX - 1`), with or without an index. Integers now compare exactly with each other and with floats.
 - String literals dropped the backslash of any escape other than `\n \t \\ \"`: `regex "\d+"` matched `d+`, and `"\r"` became `r`. Literals now also accept `\r \0 \' \u{..}` (the form string values are printed in, so printed text parses back unchanged), and any other escape keeps its backslash. A malformed `\u{..}` is an error.
 - `sum` and grouped `sum` over integers added the values as floats, so totals lost precision once they passed 2^53: `i64::MAX + i64::MIN` came back as `0` instead of `-1`. Integers are now added exactly in 128 bits (in memory, in parallel chunks, when spilled, through an index and on the cold tier) and rounded to a float only at the end.

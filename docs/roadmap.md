@@ -2,7 +2,7 @@
 
 Срез: **2026-11-15**, коммит `58444cf6e` (релиз 0.7.1) плюс незакоммиченное рабочее дерево. Единственный файл с планом в репозитории: в нём только несделанное. Реализованное описано в [CHANGELOG](../CHANGELOG.md), в документах `docs/` по отдельным механизмам и в отчётах `benches/results/`.
 
-Открыто **1513** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
+Открыто **1505** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровывались, поэтому в них есть пропуски: закрытые пункты удалены. Пункты части II со статусами `candidate` и `qualification` по коду поштучно не сверялись: перед взятием пункта сначала проверить, не покрыт ли он уже.
 
@@ -193,7 +193,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 ### Приоритетный список — 1563 пунктов
 
-Количества: P1: 3, P2: 937, P3: 573; статусы: blocked_external: 1, candidate: 934, qualification: 578.
+Количества: P1: 3, P2: 929, P3: 573; статусы: blocked_external: 1, candidate: 934, qualification: 570.
 
 #### P1: 3 пунктов
 
@@ -203,7 +203,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 2 | LIN-0002 | [D01](#d01) | Закрыть durable 1k SQLite gap | PERF | qualification | M | G-PERF |
 | 22 | LIN-0006 | [D01](#d01) | Получить тестовый endpoint Kusto | OPS | blocked_external | M | G-OPS |
 
-#### P2: 937 пунктов
+#### P2: 929 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -895,14 +895,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 1122 | LIN-1461 | [D37](#d37) | Добавить exact/approximate search options | API | candidate | M | G-API |
 | 1124 | LIN-1463 | [D37](#d37) | Добавить explain structured output | API | candidate | M | G-API |
 | 1125 | LIN-1464 | [D37](#d37) | Добавить structured runtime statistics | API | candidate | M | G-API |
-| 1126 | LIN-1481 | [D38](#d38) | Проверить derive field rename | CORRECTNESS | qualification | S | G-CORRECT |
-| 1127 | LIN-1482 | [D38](#d38) | Проверить derive optional fields | CORRECTNESS | qualification | S | G-CORRECT |
-| 1128 | LIN-1483 | [D38](#d38) | Проверить derive missing required fields | CORRECTNESS | qualification | S | G-CORRECT |
-| 1129 | LIN-1484 | [D38](#d38) | Проверить derive unknown field policy | CORRECTNESS | qualification | S | G-CORRECT |
-| 1130 | LIN-1485 | [D38](#d38) | Проверить derive scalar numeric bounds | CORRECTNESS | qualification | S | G-CORRECT |
-| 1131 | LIN-1486 | [D38](#d38) | Проверить derive timestamp conversion | CORRECTNESS | qualification | S | G-CORRECT |
-| 1132 | LIN-1487 | [D38](#d38) | Проверить derive vector conversion | CORRECTNESS | qualification | S | G-CORRECT |
-| 1133 | LIN-1488 | [D38](#d38) | Проверить derive SmallText conversion | CORRECTNESS | qualification | S | G-CORRECT |
 | 1134 | LIN-1489 | [D38](#d38) | Улучшить proc-macro error spans | API | candidate | M | G-API |
 | 1135 | LIN-1490 | [D38](#d38) | Уточнить unsupported field-type errors | API | candidate | M | G-API |
 | 1136 | LIN-1491 | [D38](#d38) | Уточнить conflicting attribute errors | API | candidate | M | G-API |

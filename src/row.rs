@@ -300,10 +300,13 @@ pub trait LinRow: FromRow {
 
 /// Read a required column via [`FromCell`].
 pub fn cell_get<T: FromCell>(row: &Row, key: &str) -> Result<T, Error> {
-    let cell = row
-        .get(key)
-        .ok_or_else(|| Error::runtime(format!("missing column `{key}`")))?;
-    T::from_cell(cell)
+    match row.get(key) {
+        Some(cell) => T::from_cell(cell),
+        // Rows are sparse: a field never set is absent, not `Null`. A type that accepts
+        // `Null` (`Option<T>`) reads that as `None`; any other type reports the column.
+        None => T::from_cell(&Cell::Null)
+            .map_err(|_| Error::runtime(format!("missing column `{key}`"))),
+    }
 }
 
 /// Map a result set into typed rows.
