@@ -61,14 +61,24 @@ fn damaged_snapshot_is_refused_or_exact() {
         try_bytes(format!("byte {i}/{} flipped", good.len()), &b);
         i += step;
     }
-    for cut in [0, 1, good.len() / 3, good.len() / 2, good.len() - 4, good.len() - 1] {
+    for cut in [
+        0,
+        1,
+        good.len() / 3,
+        good.len() / 2,
+        good.len() - 7,
+        good.len() - 5,
+        good.len() - 4,
+        good.len() - 1,
+    ] {
         try_bytes(format!("truncated to {cut}"), &good[..cut]);
     }
     assert!(accepted_wrong.is_empty(), "opened with wrong data: {accepted_wrong:?}");
 
-    // A snapshot in the earlier format (`0x03`, no checksum trailer) still opens.
+    // A snapshot in the earlier format (`0x03`, no `LCRC` + CRC32C trailer) still opens.
     assert_eq!(good[0], 0x03);
-    let legacy = good[..good.len() - 4].to_vec();
+    assert_eq!(&good[good.len() - 8..good.len() - 4], b"LCRC");
+    let legacy = good[..good.len() - 8].to_vec();
     let image = tmp();
     for e in std::fs::read_dir(&dir).unwrap() {
         let e = e.unwrap();

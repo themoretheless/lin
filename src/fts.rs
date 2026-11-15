@@ -20,6 +20,7 @@ use crate::store::{Row, row_text};
 pub const FTS_DIR: &str = "fts";
 pub const FTS_MAGIC: [u8; 4] = *b"LIN\x05";
 const FTS_VERSION: u8 = 1;
+const FTS_CRC_MAGIC: [u8; 4] = *b"LCRC";
 
 /// Pending entries folded back into a term's base list. A removal from a sorted
 /// list costs a memmove over the whole list, which for a corpus-wide token is
@@ -537,10 +538,27 @@ impl FtsIndex {
                 out.extend_from_slice(&(*idx as u32).to_le_bytes());
             }
         }
+        out.extend_from_slice(&FTS_CRC_MAGIC);
+        let crc = crate::crc::hardware_crc32c(&out);
+        out.extend_from_slice(&crc.to_le_bytes());
         out
     }
 
     pub fn decode(bytes: &[u8]) -> Result<(u64, u64, Self), Error> {
+        // Verify the trailer before parsing anything: a damaged length field could
+        // otherwise make the parser consume the trailer as data and skip the check.
+        let body = match bytes.len().checked_sub(8) {
+            Some(t) if bytes[t..t + 4] == FTS_CRC_MAGIC => {
+                let stored = u32::from_le_bytes(bytes[t + 4..].try_into().unwrap());
+                if crate::crc::hardware_crc32c(&bytes[..t + 4]) != stored {
+                    return Err(io_err("corrupt fts checksum"));
+                }
+                &bytes[..t]
+            }
+            // Files written before the trailer existed.
+            _ => bytes,
+        };
+        let bytes = body;
         if bytes.len() < 4 + 1 + 8 + 8 + 4 || bytes[..4] != FTS_MAGIC {
             return Err(io_err("bad fts magic"));
         }
@@ -551,20 +569,28 @@ impl FtsIndex {
         let generation = read_u64(bytes, &mut i)?;
         let nrows = read_u64(bytes, &mut i)?;
         let nfields = read_u32(bytes, &mut i)? as usize;
-        let mut fields = Vec::with_capacity(nfields);
+        let mut fields = Vec::with_capacity(nfields.min((bytes.len() - i) / 4));
         for _ in 0..nfields {
             fields.push(read_str(bytes, &mut i)?);
         }
         let nterms = read_u32(bytes, &mut i)? as usize;
-        let mut postings = FxHashMap::with_capacity_and_hasher(nterms, Default::default());
+        let mut postings =
+            FxHashMap::with_capacity_and_hasher(nterms.min((bytes.len() - i) / 8), Default::default());
         for _ in 0..nterms {
             let tok = read_arc_str(bytes, &mut i)?;
             let n = read_u32(bytes, &mut i)? as usize;
-            let mut list = SmallVec::with_capacity(n);
+            let mut list = SmallVec::with_capacity(n.min((bytes.len() - i) / 4));
             for _ in 0..n {
-                list.push(read_u32(bytes, &mut i)? as usize);
+                let idx_u32 = read_u32(bytes, &mut i)?;
+                if (idx_u32 as u64) >= nrows {
+                    return Err(io_err("corrupt fts posting"));
+                }
+                list.push(idx_u32 as usize);
             }
             postings.insert(tok, list);
+        }
+        if i != bytes.len() {
+            return Err(io_err("corrupt fts trailer"));
         }
         Ok((
             generation,
@@ -1249,11 +1275,22 @@ mod tests {
         let fields = vec![String::from("title"), String::from("body")];
         let index = FtsIndex::build(&[row], &fields);
         let encoded = index.encode(7, 1);
+        assert_eq!(&encoded[encoded.len() - 8..encoded.len() - 4], b"LCRC");
         let (generation, rows, decoded) = FtsIndex::decode(&encoded).unwrap();
         assert_eq!((generation, rows), (7, 1));
         assert_eq!(decoded.fields, fields);
         assert_eq!(decoded.candidate_idxs("wal"), vec![0]);
         assert!(FtsIndex::decode(&encoded[..encoded.len() - 1]).is_err());
+        assert!(FtsIndex::decode(&encoded[..encoded.len() - 5]).is_err());
+        // Flipping a byte inside the header/body fails checksum verification.
+        let mut flipped = encoded.clone();
+        flipped[10] ^= 0x5a;
+        assert!(FtsIndex::decode(&flipped).is_err());
+        // Earlier trailer-less `LIN\x05` files still decode; truncating their body still fails.
+        let legacy = &encoded[..encoded.len() - 8];
+        let (_, _, legacy_dec) = FtsIndex::decode(legacy).unwrap();
+        assert_eq!(legacy_dec.candidate_idxs("wal"), vec![0]);
+        assert!(FtsIndex::decode(&legacy[..legacy.len() - 1]).is_err());
     }
 
     #[test]
