@@ -926,6 +926,30 @@ pub(crate) fn cmp_sort(a: &Cell, b: &Cell) -> std::cmp::Ordering {
     }
 }
 
+/// Widest frame summed row by row; wider frames that do not start at the first row use
+/// prefix-sum subtraction (O(1) per row) and accept its rounding.
+const DIRECT_FRAME_SUM_MAX: usize = 1024;
+
+/// Float sum of rows `s..=e`. Subtracting running prefix sums loses small values to a
+/// large earlier prefix (after `1e16`, a frame of `1.0, 0.5, 1.0` came out as `0`), so a
+/// frame that does not start at the first row is summed from its own rows when it is
+/// narrow enough; a frame from the first row is the running sum itself.
+fn float_frame_sum(tv: &[&Cell], prefix: &[f64], s: usize, e: usize) -> f64 {
+    if s == 0 {
+        return prefix[e + 1];
+    }
+    if e - s < DIRECT_FRAME_SUM_MAX {
+        let mut acc = 0.0f64;
+        for c in &tv[s..=e] {
+            if let Some(v) = c.as_f64() {
+                acc += v;
+            }
+        }
+        return acc;
+    }
+    prefix[e + 1] - prefix[s]
+}
+
 fn get_frame_bounds(
     i: usize,
     n: usize,
@@ -1078,7 +1102,7 @@ pub(crate) fn window_values(
                     let (s, e) = get_frame_bounds(i, n, frame, has_order);
                     if s <= e && s < n {
                         let end_idx = e.min(n - 1);
-                        let sum = prefix[end_idx + 1] - prefix[s];
+                        let sum = float_frame_sum(tv, &prefix, s, end_idx);
                         sums.push(Cell::Float(sum));
                     } else {
                         sums.push(Cell::Float(0.0));
@@ -1135,7 +1159,7 @@ pub(crate) fn window_values(
                 let (s, e) = get_frame_bounds(i, n, frame, has_order);
                 if s <= e && s < n {
                     let end_idx = e.min(n - 1);
-                    let sum = prefix_sum[end_idx + 1] - prefix_sum[s];
+                    let sum = float_frame_sum(tv, &prefix_sum, s, end_idx);
                     let count = prefix_cnt[end_idx + 1] - prefix_cnt[s];
                     let avg = if count == 0 { 0.0 } else { sum / count as f64 };
                     avgs.push(Cell::Float(avg));
