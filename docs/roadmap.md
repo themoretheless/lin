@@ -2,7 +2,7 @@
 
 Срез: **2026-11-15**, коммит `58444cf6e` (релиз 0.7.1) плюс незакоммиченное рабочее дерево. Единственный файл с планом в репозитории: в нём только несделанное. Реализованное описано в [CHANGELOG](../CHANGELOG.md), в документах `docs/` по отдельным механизмам и в отчётах `benches/results/`.
 
-Открыто **1401** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
+Открыто **1398** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровывались, поэтому в них есть пропуски: закрытые пункты удалены. Пункты части II со статусами `candidate` и `qualification` по коду поштучно не сверялись: перед взятием пункта сначала проверить, не покрыт ли он уже.
 
@@ -195,7 +195,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 ### Приоритетный список — 1563 пунктов
 
-Количества: P1: 3, P2: 834, P3: 564; статусы: blocked_external: 1, candidate: 934, qualification: 466.
+Количества: P1: 3, P2: 831, P3: 564; статусы: blocked_external: 1, candidate: 934, qualification: 463.
 
 #### P1: 3 пунктов
 
@@ -205,7 +205,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 2 | LIN-0002 | [D01](#d01) | Закрыть durable 1k SQLite gap | PERF | qualification | M | G-PERF |
 | 22 | LIN-0006 | [D01](#d01) | Получить тестовый endpoint Kusto | OPS | blocked_external | M | G-OPS |
 
-#### P2: 834 пунктов
+#### P2: 831 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -987,8 +987,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 1336 | LIN-1848 | [D47](#d47) | Добавить portable logical backup export | FEATURE | candidate | M | G-FEATURE |
 | 1337 | LIN-1849 | [D47](#d47) | Проверить CSV quotes/newlines | CORRECTNESS | qualification | S | G-CORRECT |
 | 1338 | LIN-1850 | [D47](#d47) | Проверить CSV empty/null distinction | CORRECTNESS | qualification | S | G-CORRECT |
-| 1339 | LIN-1851 | [D47](#d47) | Проверить JSON large integer preservation | CORRECTNESS | qualification | S | G-CORRECT |
-| 1340 | LIN-1852 | [D47](#d47) | Проверить JSON nonfinite float policy | CORRECTNESS | qualification | S | G-CORRECT |
 | 1341 | LIN-1853 | [D47](#d47) | Спроектировать import schema inference | FEATURE | candidate | L | G-FEATURE |
 | 1342 | LIN-1854 | [D47](#d47) | Спроектировать explicit import schema mapping | FEATURE | candidate | L | G-FEATURE |
 | 1343 | LIN-1855 | [D47](#d47) | Спроектировать import field rename mapping | FEATURE | candidate | L | G-FEATURE |
@@ -1014,7 +1012,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 1367 | LIN-1895 | [D48](#d48) | Спроектировать restore rehearsal command | OPS | candidate | L | G-OPS |
 | 1368 | LIN-1896 | [D48](#d48) | Спроектировать backup encryption boundary | OPS | candidate | L | G-OPS |
 | 1369 | LIN-1897 | [D48](#d48) | Проверить restore wrong target refusal | CORRECTNESS | qualification | S | G-CORRECT |
-| 1371 | LIN-1899 | [D48](#d48) | Проверить restore partial-copy cleanup | CORRECTNESS | qualification | S | G-CORRECT |
 | 1373 | LIN-1901 | [D48](#d48) | Добавить operator-safe maintenance mode | OPS | candidate | M | G-OPS |
 | 1374 | LIN-1902 | [D48](#d48) | Добавить maintenance cancellation policy | OPS | candidate | M | G-OPS |
 | 1375 | LIN-1903 | [D48](#d48) | Добавить background work budgets | OPS | candidate | M | G-OPS |

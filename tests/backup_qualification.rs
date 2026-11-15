@@ -107,3 +107,43 @@ fn restored_database_continues_generations() {
     assert_eq!(rows(&mut db).len(), 6);
     assert!(rows(&mut db).contains(&"after=99".to_string()));
 }
+
+/// Backup round trip keeps every value exactly: the integer extremes, NaN, infinities,
+/// negative zero, times, vectors and text with control characters and non-ASCII.
+#[test]
+fn backup_preserves_extreme_values() {
+    use lin::Cell;
+    let src = tmp("vals-src");
+    let file = tmp("vals-file").join("backup.json");
+    let values = [
+        Cell::Int(i64::MAX), Cell::Int(i64::MIN), Cell::Float(f64::NAN), Cell::Float(f64::INFINITY),
+        Cell::Float(f64::NEG_INFINITY), Cell::Float(-0.0), Cell::Float(f64::from_bits(1)), Cell::Float(0.1),
+    ];
+    {
+        let mut db = Db::open(&src).unwrap();
+        db.run("col x { id: text, n: f64, s: text, ts: time }").unwrap();
+        let p = db.prepare("insert x { id: $id, n: $n, s: $s, ts: $ts }").unwrap();
+        for (i, v) in values.iter().enumerate() {
+            p.execute_with(&mut db, &[("id", Cell::text_arc(format!("v{i}"))), ("n", v.clone()), ("s", Cell::text_arc(format!("line\n\t\"q\" ё 🦀 {i}"))), ("ts", Cell::Time(-1_000 + i as i64))]).unwrap();
+        }
+        db.run(r#"insert docs { uri: "raw://bk/v", title: "vector doc", layer: "raw" }"#).unwrap();
+        db.export_backup(&file).unwrap();
+    }
+    let mut a = Db::open(&src).unwrap();
+    let mut b = Db::import_backup(&file).unwrap();
+    let dump = |db: &mut Db| -> Vec<String> {
+        let mut v: Vec<String> = db.run("x | take all").unwrap().rows.iter().map(|r| {
+            let mut f: Vec<String> = r.iter().map(|(k, c)| match c {
+                Cell::Float(x) => format!("{k}=f{:x}", if x.is_nan() { f64::NAN.to_bits() } else { x.to_bits() }),
+                other => format!("{k}={other:?}"),
+            }).collect();
+            f.sort();
+            f.join(",")
+        }).collect();
+        v.sort();
+        v
+    };
+    assert_eq!(dump(&mut b), dump(&mut a));
+    let vec_of = |db: &mut Db| format!("{:?}", db.run(r#"docs | uri == "raw://bk/v" | { embedding }"#).unwrap().rows[0].get("embedding"));
+    assert_eq!(vec_of(&mut b), vec_of(&mut a));
+}
