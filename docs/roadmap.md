@@ -2,7 +2,7 @@
 
 Срез: **2026-11-15**, коммит `58444cf6e` (релиз 0.7.1) плюс незакоммиченное рабочее дерево. Единственный файл с планом в репозитории: в нём только несделанное. Реализованное описано в [CHANGELOG](../CHANGELOG.md), в документах `docs/` по отдельным механизмам и в отчётах `benches/results/`.
 
-Открыто **1462** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
+Открыто **1460** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровывались, поэтому в них есть пропуски: закрытые пункты удалены. Пункты части II со статусами `candidate` и `qualification` по коду поштучно не сверялись: перед взятием пункта сначала проверить, не покрыт ли он уже.
 
@@ -193,7 +193,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 ### Приоритетный список — 1563 пунктов
 
-Количества: P1: 3, P2: 886, P3: 573; статусы: blocked_external: 1, candidate: 934, qualification: 527.
+Количества: P1: 3, P2: 884, P3: 573; статусы: blocked_external: 1, candidate: 934, qualification: 525.
 
 #### P1: 3 пунктов
 
@@ -203,7 +203,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 2 | LIN-0002 | [D01](#d01) | Закрыть durable 1k SQLite gap | PERF | qualification | M | G-PERF |
 | 22 | LIN-0006 | [D01](#d01) | Получить тестовый endpoint Kusto | OPS | blocked_external | M | G-OPS |
 
-#### P2: 886 пунктов
+#### P2: 884 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -549,7 +549,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 660 | LIN-0702 | [D18](#d18) | Измерить SIMD bitmap operations | PERF | candidate | M | G-PERF |
 | 661 | LIN-0703 | [D18](#d18) | Измерить packed UTF-8 projection | PERF | candidate | M | G-PERF |
 | 662 | LIN-0704 | [D18](#d18) | Измерить vector column alignment | PERF | candidate | M | G-PERF |
-| 673 | LIN-0735 | [D19](#d19) | Проверить distinct value semantics | CORRECTNESS | qualification | S | G-CORRECT |
 | 675 | LIN-0737 | [D19](#d19) | Измерить FxHashMap grouping capacity | PERF | candidate | M | G-PERF |
 | 676 | LIN-0738 | [D19](#d19) | Измерить inline group key buffers | PERF | candidate | M | G-PERF |
 | 677 | LIN-0739 | [D19](#d19) | Измерить group aggregate state layout | PERF | candidate | M | G-PERF |
@@ -575,7 +574,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 704 | LIN-0766 | [D20](#d20) | Измерить bounded Top-K crossover | PERF | candidate | M | G-PERF |
 | 705 | LIN-0767 | [D20](#d20) | Измерить partial selection partition | PERF | candidate | M | G-PERF |
 | 706 | LIN-0768 | [D20](#d20) | Измерить multi-key comparator cost | PERF | candidate | M | G-PERF |
-| 714 | LIN-0776 | [D20](#d20) | Проверить post-projection sort keys | CORRECTNESS | qualification | S | G-CORRECT |
 | 715 | LIN-0777 | [D20](#d20) | Спроектировать spillable external sort | FEATURE | candidate | L | G-FEATURE |
 | 716 | LIN-0778 | [D20](#d20) | Спроектировать merge sorted runs | FEATURE | candidate | L | G-FEATURE |
 | 717 | LIN-0779 | [D20](#d20) | Спроектировать sorted-stream merge | FEATURE | candidate | L | G-FEATURE |
