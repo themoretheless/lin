@@ -2,7 +2,7 @@
 
 Срез: **2026-11-15**, коммит `58444cf6e` (релиз 0.7.1) плюс незакоммиченное рабочее дерево. Единственный файл с планом в репозитории: в нём только несделанное. Реализованное описано в [CHANGELOG](../CHANGELOG.md), в документах `docs/` по отдельным механизмам и в отчётах `benches/results/`.
 
-Открыто **1454** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
+Открыто **1449** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровывались, поэтому в них есть пропуски: закрытые пункты удалены. Пункты части II со статусами `candidate` и `qualification` по коду поштучно не сверялись: перед взятием пункта сначала проверить, не покрыт ли он уже.
 
@@ -194,7 +194,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 ### Приоритетный список — 1563 пунктов
 
-Количества: P1: 3, P2: 878, P3: 573; статусы: blocked_external: 1, candidate: 934, qualification: 519.
+Количества: P1: 3, P2: 873, P3: 573; статусы: blocked_external: 1, candidate: 934, qualification: 514.
 
 #### P1: 3 пунктов
 
@@ -204,7 +204,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 2 | LIN-0002 | [D01](#d01) | Закрыть durable 1k SQLite gap | PERF | qualification | M | G-PERF |
 | 22 | LIN-0006 | [D01](#d01) | Получить тестовый endpoint Kusto | OPS | blocked_external | M | G-OPS |
 
-#### P2: 878 пунктов
+#### P2: 873 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -529,17 +529,12 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 636 | LIN-0662 | [D17](#d17) | Спроектировать keyset pagination | API | candidate | L | G-API |
 | 637 | LIN-0663 | [D17](#d17) | Спроектировать cursor snapshot pinning | API | candidate | L | G-API |
 | 638 | LIN-0664 | [D17](#d17) | Спроектировать cursor generation errors | API | candidate | L | G-API |
-| 639 | LIN-0681 | [D18](#d18) | Проверить column length invariants | CORRECTNESS | qualification | S | G-CORRECT |
-| 640 | LIN-0682 | [D18](#d18) | Проверить validity bitmap semantics | CORRECTNESS | qualification | S | G-CORRECT |
-| 641 | LIN-0683 | [D18](#d18) | Проверить scalar column type stability | CORRECTNESS | qualification | S | G-CORRECT |
-| 642 | LIN-0684 | [D18](#d18) | Проверить vector column dimension policy | CORRECTNESS | qualification | S | G-CORRECT |
 | 643 | LIN-0685 | [D18](#d18) | Измерить row-to-column packing | PERF | candidate | M | G-PERF |
 | 644 | LIN-0686 | [D18](#d18) | Измерить column-to-row draining | PERF | candidate | M | G-PERF |
 | 645 | LIN-0687 | [D18](#d18) | Измерить projected column materialization | PERF | candidate | M | G-PERF |
 | 646 | LIN-0688 | [D18](#d18) | Измерить batch ownership transfer | PERF | candidate | M | G-PERF |
 | 647 | LIN-0689 | [D18](#d18) | Спроектировать borrowed ColumnView | FEATURE | candidate | L | G-FEATURE |
 | 649 | LIN-0691 | [D18](#d18) | Спроектировать offset-based binary columns | FEATURE | candidate | L | G-FEATURE |
-| 651 | LIN-0693 | [D18](#d18) | Проверить heterogeneous column fallback | CORRECTNESS | qualification | S | G-CORRECT |
 | 655 | LIN-0697 | [D18](#d18) | Добавить zero-copy batch slicing | FEATURE | candidate | M | G-FEATURE |
 | 656 | LIN-0698 | [D18](#d18) | Добавить shared bitmap slicing | FEATURE | candidate | M | G-FEATURE |
 | 657 | LIN-0699 | [D18](#d18) | Добавить batch concatenation contract | FEATURE | candidate | M | G-FEATURE |
