@@ -199,3 +199,27 @@ async fn dropped_futures_and_panicking_transactions_leave_the_db_usable() {
     adb.execute(r#"insert t { id: "after-panic-tx", g: 0, n: 0 }"#).await.unwrap();
     assert_eq!(count(&adb.run_read(r#"t | id == "after-panic-tx" | count"#).await.unwrap()), 1);
 }
+
+/// A reader snapshot keeps the vector-search answers of its moment: updates that
+/// re-embed documents, deletes and inserts after the snapshot change only newer readers.
+#[test]
+fn snapshot_vector_search_is_isolated() {
+    let mut db = Db::empty();
+    let titles = ["river stones", "mountain pass", "river delta", "desert wind", "river bend"];
+    for (i, t) in titles.iter().enumerate() {
+        db.run(&format!(r#"insert docs {{ uri: "raw://v/{i}", title: "{t}", layer: "raw" }}"#)).unwrap();
+    }
+    let q = r#"docs | search vec "river" | { uri } | take all"#;
+    let uris = |h: lin::Handle| -> Vec<String> { h.rows.iter().map(|r| r.get("uri").and_then(|c| c.text()).unwrap().to_string()).collect() };
+    let old = db.reader();
+    let old_answer = uris(old.run(q).unwrap());
+    assert!(!old_answer.is_empty());
+    db.run(r#"update docs[uri == "raw://v/0"] cas each { title: "mountain stones" }"#).unwrap();
+    db.run(r#"delete docs[uri == "raw://v/2"] cas each"#).unwrap();
+    db.run(r#"insert docs { uri: "raw://v/9", title: "river river", layer: "raw" }"#).unwrap();
+    let new_answer = uris(db.reader().run(q).unwrap());
+    assert_ne!(new_answer, old_answer, "the changes did not affect a new reader");
+    for _ in 0..3 {
+        assert_eq!(uris(old.run(q).unwrap()), old_answer, "old snapshot's vector answer changed");
+    }
+}
