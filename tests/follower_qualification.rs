@@ -96,3 +96,63 @@ fn follower_lagging_across_a_leader_checkpoint() {
         }
     }
 }
+
+/// A transfer cut off at any byte: applying the truncated batch either fails or applies
+/// a prefix of whole frames, never part of one, and resuming from the follower's own
+/// generation brings it to exactly the leader's state.
+#[test]
+fn follower_recovers_from_a_partial_transfer() {
+    let leader_dir = tmp();
+    let mut leader = Db::open(&leader_dir).unwrap();
+    leader.run("col ev { id: text, n: i64 }").unwrap();
+    for b in 0..6 {
+        let rows = (0..4).map(|i| format!(r#"{{ id: "e{b}-{i}", n: {i} }}"#)).collect::<Vec<_>>().join(",");
+        leader.run(&format!("insert ev [{rows}]")).unwrap();
+    }
+    let frames = leader.export_wal_since(0).unwrap();
+    let want = count(&mut leader, "ev | count");
+    let step = (frames.len() / 40).max(1);
+    let mut cut = 1;
+    while cut < frames.len() {
+        let mut follower = Db::open_follower(tmp()).unwrap();
+        let _ = follower.apply_wal(&frames[..cut]);
+        let have = follower.run("ev | count").map(|h| h.rows[0].get("hits").and_then(|c| c.as_f64()).unwrap()).unwrap_or(0.0);
+        assert!(have as i64 % 4 == 0, "cut {cut}: part of a frame applied ({have} rows)");
+        let rest = leader.export_wal_since(follower.r#gen()).unwrap();
+        follower.apply_wal(&rest).unwrap_or_else(|e| panic!("cut {cut}: resume failed: {e}"));
+        assert_eq!(count(&mut follower, "ev | count"), want, "cut {cut}: state after resume");
+        assert_eq!(follower.r#gen(), leader.r#gen(), "cut {cut}: generation after resume");
+        cut += step;
+    }
+}
+
+/// The follower's own log loses its tail (a crash mid-write on the follower): reopening
+/// keeps a consistent prefix, and resuming from the follower's generation restores the
+/// leader's state exactly.
+#[test]
+fn follower_with_a_torn_local_log_resumes() {
+    let leader_dir = tmp();
+    let follower_dir = tmp();
+    let mut leader = Db::open(&leader_dir).unwrap();
+    leader.run("col ev { id: text, n: i64 }").unwrap();
+    for b in 0..5 {
+        let rows = (0..3).map(|i| format!(r#"{{ id: "e{b}-{i}", n: {i} }}"#)).collect::<Vec<_>>().join(",");
+        leader.run(&format!("insert ev [{rows}]")).unwrap();
+    }
+    {
+        let mut follower = Db::open_follower(&follower_dir).unwrap();
+        follower.apply_wal(&leader.export_wal_since(0).unwrap()).unwrap();
+    }
+    let log = follower_dir.join(lin::persist::LOG_NAME);
+    let len = std::fs::metadata(&log).map(|m| m.len()).unwrap_or(0);
+    if len > 10 {
+        let f = std::fs::OpenOptions::new().write(true).open(&log).unwrap();
+        f.set_len(len - 7).unwrap();
+    }
+    let mut follower = Db::open_follower(&follower_dir).unwrap();
+    let have = count(&mut follower, "ev | count");
+    assert!(have as i64 % 3 == 0, "torn log left part of a frame ({have} rows)");
+    follower.apply_wal(&leader.export_wal_since(follower.r#gen()).unwrap()).unwrap();
+    assert_eq!(count(&mut follower, "ev | count"), count(&mut leader, "ev | count"));
+    assert_eq!(follower.r#gen(), leader.r#gen());
+}
