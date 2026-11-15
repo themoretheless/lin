@@ -37,3 +37,18 @@ fn repeated_and_reordered_terms() {
     assert_eq!(set(&ranked(&mut db, "alpha beta")), set(&ranked(&mut db, "beta alpha")), "word order changed which documents match");
     assert_eq!(ranked(&mut db, "ALPHA"), one, "case changed the result");
 }
+
+/// Empty and whitespace-only queries match nothing (and are not errors); runs of
+/// whitespace between words are one separator, so they never form empty tokens that
+/// would match every document.
+#[test]
+fn empty_tokens_match_nothing() {
+    let mut db = seed();
+    for q in ["", "   ", "\t \t"] {
+        let rows = db.run(&format!("docs | search lex {q:?} | {{ uri }} | take all")).unwrap().rows.len();
+        assert_eq!(rows, 0, "{q:?} matched {rows} documents");
+    }
+    let spaced = db.run("docs | search lex \"alpha   \\t  beta\" | { uri } | take all").unwrap().rows.len();
+    let plain = ranked(&mut db, "alpha beta").len();
+    assert_eq!(spaced, plain, "extra whitespace changed the result");
+}
