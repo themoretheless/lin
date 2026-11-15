@@ -2,7 +2,7 @@
 
 Срез: **2026-11-15**, коммит `58444cf6e` (релиз 0.7.1) плюс незакоммиченное рабочее дерево. Единственный файл с планом в репозитории: в нём только несделанное. Реализованное описано в [CHANGELOG](../CHANGELOG.md), в документах `docs/` по отдельным механизмам и в отчётах `benches/results/`.
 
-Открыто **1539** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
+Открыто **1537** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровывались, поэтому в них есть пропуски: закрытые пункты удалены. Пункты части II со статусами `candidate` и `qualification` по коду поштучно не сверялись: перед взятием пункта сначала проверить, не покрыт ли он уже.
 
@@ -193,7 +193,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 ### Приоритетный список — 1563 пунктов
 
-Количества: P1: 3, P2: 963, P3: 573; статусы: blocked_external: 1, candidate: 934, qualification: 604.
+Количества: P1: 3, P2: 961, P3: 573; статусы: blocked_external: 1, candidate: 934, qualification: 602.
 
 #### P1: 3 пунктов
 
@@ -203,7 +203,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 2 | LIN-0002 | [D01](#d01) | Закрыть durable 1k SQLite gap | PERF | qualification | M | G-PERF |
 | 22 | LIN-0006 | [D01](#d01) | Получить тестовый endpoint Kusto | OPS | blocked_external | M | G-OPS |
 
-#### P2: 963 пунктов
+#### P2: 961 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -625,13 +625,11 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 736 | LIN-0814 | [D21](#d21) | Спроектировать left outer join | FEATURE | candidate | L | G-FEATURE |
 | 737 | LIN-0815 | [D21](#d21) | Спроектировать anti-join semantics | FEATURE | candidate | L | G-FEATURE |
 | 738 | LIN-0816 | [D21](#d21) | Спроектировать existence-only joins | FEATURE | candidate | L | G-FEATURE |
-| 739 | LIN-0817 | [D21](#d21) | Проверить join output ordering | CORRECTNESS | qualification | S | G-CORRECT |
 | 742 | LIN-0820 | [D21](#d21) | Проверить multi-join associative rewrites | CORRECTNESS | qualification | S | G-CORRECT |
 | 743 | LIN-0821 | [D21](#d21) | Добавить join output cardinality limit | FEATURE | candidate | M | G-FEATURE |
 | 744 | LIN-0822 | [D21](#d21) | Добавить join memory budget | FEATURE | candidate | M | G-FEATURE |
 | 745 | LIN-0823 | [D21](#d21) | Добавить spillable hash partitions | FEATURE | candidate | L | G-FEATURE |
 | 746 | LIN-0824 | [D21](#d21) | Добавить join skew handling | FEATURE | candidate | M | G-FEATURE |
-| 751 | LIN-0845 | [D22](#d22) | Проверить source-order window stability | CORRECTNESS | qualification | S | G-CORRECT |
 | 755 | LIN-0849 | [D22](#d22) | Проверить prefix-sum frame subtraction | CORRECTNESS | qualification | S | G-CORRECT |
 | 757 | LIN-0851 | [D22](#d22) | Проверить float prefix cancellation | CORRECTNESS | qualification | S | G-CORRECT |
 | 758 | LIN-0852 | [D22](#d22) | Проверить negative-zero window sums | CORRECTNESS | qualification | S | G-CORRECT |
