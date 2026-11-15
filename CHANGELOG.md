@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Fixed
+- Snapshot files had no checksum: a single changed byte in the row data opened as different rows, with no error, and after a checkpoint the snapshot is the only copy. Snapshots are now written as version `0x05`, the same layout with a CRC32C of the whole file at the end, and a mismatch refuses to open. Snapshots in the earlier `0x03` format still open.
 - String literals dropped the backslash of any escape other than `\n \t \\ \"`: `regex "\d+"` matched `d+`, and `"\r"` became `r`. Literals now also accept `\r \0 \' \u{..}` (the form string values are printed in, so printed text parses back unchanged), and any other escape keeps its backslash. A malformed `\u{..}` is an error.
 - `sum` and grouped `sum` over integers added the values as floats, so totals lost precision once they passed 2^53: `i64::MAX + i64::MIN` came back as `0` instead of `-1`. Integers are now added exactly in 128 bits (in memory, in parallel chunks, when spilled, through an index and on the cold tier) and rounded to a float only at the end.
 - `append facts` with more than 128 rows in one statement reported the rows as written while the next query saw none of them; after a restart, facts replayed from the log were invisible and a fact deleted before the restart came back after the next write. Fact rows are now kept in step with their columns on every append.

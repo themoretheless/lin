@@ -2,7 +2,7 @@
 
 Срез: **2026-11-14**, коммит `58444cf6e` (релиз 0.7.1) плюс незакоммиченное рабочее дерево. Единственный файл с планом в репозитории: в нём только несделанное. Реализованное описано в [CHANGELOG](../CHANGELOG.md), в документах `docs/` по отдельным механизмам и в отчётах `benches/results/`.
 
-Открыто **1585** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
+Открыто **1583** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровывались, поэтому в них есть пропуски: закрытые пункты удалены. Пункты части II со статусами `candidate` и `qualification` по коду поштучно не сверялись: перед взятием пункта сначала проверить, не покрыт ли он уже.
 
@@ -194,7 +194,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 ### Приоритетный список — 1590 пунктов
 
-Количества: P1: 3, P2: 1008, P3: 574; статусы: blocked_external: 1, candidate: 934, qualification: 650.
+Количества: P1: 3, P2: 1006, P3: 574; статусы: blocked_external: 1, candidate: 934, qualification: 648.
 
 #### P1: 3 пунктов
 
@@ -204,7 +204,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 2 | LIN-0002 | [D01](#d01) | Закрыть durable 1k SQLite gap | PERF | qualification | M | G-PERF |
 | 22 | LIN-0006 | [D01](#d01) | Получить тестовый endpoint Kusto | OPS | blocked_external | M | G-OPS |
 
-#### P2: 1008 пунктов
+#### P2: 1006 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -296,9 +296,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 244 | LIN-0156 | [D04](#d04) | Проверить replay schema generation mismatch | CORRECTNESS | qualification | S | G-CORRECT |
 | 249 | LIN-0165 | [D05](#d05) | Проверить SnapshotRef lifetime | CORRECTNESS | qualification | S | G-CORRECT |
 | 251 | LIN-0167 | [D05](#d05) | Проверить checkpoint generation fencing | CORRECTNESS | qualification | S | G-CORRECT |
-| 252 | LIN-0168 | [D05](#d05) | Проверить snapshot checksum coverage | CORRECTNESS | qualification | S | G-CORRECT |
 | 253 | LIN-0169 | [D05](#d05) | Ввести versioned snapshot manifest | PERF | candidate | M | G-PERF |
-| 254 | LIN-0170 | [D05](#d05) | Проверить snapshot footer validation | CORRECTNESS | qualification | S | G-CORRECT |
 | 255 | LIN-0171 | [D05](#d05) | Ограничить snapshot section sizes | CORRECTNESS | qualification | M | G-CORRECT |
 | 256 | LIN-0172 | [D05](#d05) | Ограничить nested collection sizes | CORRECTNESS | qualification | M | G-CORRECT |
 | 257 | LIN-0173 | [D05](#d05) | Измерить incremental checkpoint | PERF | candidate | M | G-PERF |

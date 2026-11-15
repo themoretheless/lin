@@ -44,7 +44,40 @@ pub fn read_snapshot(dir: &Path) -> Result<Option<Snapshot>, Error> {
 }
 
 /// Encode a snapshot ref to a writer using the chunked parallel snapshot format (`0x03` + `LIN\x04`).
+///
+/// Appends a 4-byte CRC32C trailer (little endian) over the entire snapshot payload while keeping
+/// the `0x03` leading version byte so previous releases (`v0.7.1`) still decode the chunks and
+/// current builds validate integrity; legacy `0x03` files without a trailer also decode.
 pub fn encode_snapshot_ref_to_writer<W: std::io::Write>(
+    writer: &mut W,
+    snap: &SnapshotRef<'_>,
+) -> Result<(), Error> {
+    let mut hashing = CrcWriter { inner: writer, crc: crate::crc::Hasher::new() };
+    encode_chunked_body(&mut hashing, snap)?;
+    let crc = hashing.crc.finalize();
+    writer.write_all(&crc.to_le_bytes()).map_err(io_err)
+}
+
+/// Passes writes through while feeding them to a CRC32C.
+struct CrcWriter<'a, W: std::io::Write> {
+    inner: &'a mut W,
+    crc: crate::crc::Hasher,
+}
+
+impl<W: std::io::Write> std::io::Write for CrcWriter<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.crc.update(&buf[..n]);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Version byte, magic, header and chunks of a checksummed (`0x03` + CRC32C trailer) snapshot.
+fn encode_chunked_body<W: std::io::Write>(
     writer: &mut W,
     snap: &SnapshotRef<'_>,
 ) -> Result<(), Error> {
@@ -413,7 +446,18 @@ pub(super) fn decode_snapshot_bytes(bytes: &[u8]) -> Option<Snapshot> {
                     return None;
                 }
             }
-            0x03 => return decode_chunked_snapshot(compressed_data),
+            0x03 => return decode_chunked_snapshot(compressed_data, Some(bytes)),
+            0x05 => {
+                let body_end = bytes.len().checked_sub(4)?;
+                if body_end < 5 {
+                    return None;
+                }
+                let stored = u32::from_le_bytes(bytes[body_end..].try_into().ok()?);
+                if crate::crc::hardware_crc32c(&bytes[..body_end]) != stored {
+                    return None;
+                }
+                return decode_chunked_snapshot(&bytes[5..body_end], None);
+            }
             0x04 => {
                 #[cfg(feature = "compress-zstd")]
                 {
@@ -493,7 +537,10 @@ pub(super) fn decode_snapshot_chunk<'a>(c: &ChunkSlice<'a>) -> Result<(&'a str, 
     Ok((c.name, rows))
 }
 
-pub(super) fn decode_chunked_snapshot(data: &[u8]) -> Option<Snapshot> {
+pub(super) fn decode_chunked_snapshot(
+    data: &[u8],
+    full_bytes: Option<&[u8]>,
+) -> Option<Snapshot> {
     if data.len() < 8 {
         return None;
     }
@@ -531,6 +578,21 @@ pub(super) fn decode_chunked_snapshot(data: &[u8]) -> Option<Snapshot> {
             name,
             data: chunk_data,
         });
+    }
+
+    if let Some(full) = full_bytes {
+        match data.len() - offset {
+            0 => {}
+            4 => {
+                let stored = u32::from_le_bytes(data[offset..offset + 4].try_into().ok()?);
+                if crate::crc::hardware_crc32c(&full[..5 + offset]) != stored {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    } else if offset != data.len() {
+        return None;
     }
 
     let decoded_chunks: Vec<Result<(&str, Vec<Row>), ()>> = if chunk_slices.len() > 1 {
