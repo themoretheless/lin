@@ -2,7 +2,7 @@
 
 Срез: **2026-11-15**, коммит `58444cf6e` (релиз 0.7.1) плюс незакоммиченное рабочее дерево. Единственный файл с планом в репозитории: в нём только несделанное. Реализованное описано в [CHANGELOG](../CHANGELOG.md), в документах `docs/` по отдельным механизмам и в отчётах `benches/results/`.
 
-Открыто **1405** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
+Открыто **1402** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровывались, поэтому в них есть пропуски: закрытые пункты удалены. Пункты части II со статусами `candidate` и `qualification` по коду поштучно не сверялись: перед взятием пункта сначала проверить, не покрыт ли он уже.
 
@@ -194,7 +194,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 ### Приоритетный список — 1563 пунктов
 
-Количества: P1: 3, P2: 838, P3: 564; статусы: blocked_external: 1, candidate: 934, qualification: 470.
+Количества: P1: 3, P2: 835, P3: 564; статусы: blocked_external: 1, candidate: 934, qualification: 467.
 
 #### P1: 3 пунктов
 
@@ -204,7 +204,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 2 | LIN-0002 | [D01](#d01) | Закрыть durable 1k SQLite gap | PERF | qualification | M | G-PERF |
 | 22 | LIN-0006 | [D01](#d01) | Получить тестовый endpoint Kusto | OPS | blocked_external | M | G-OPS |
 
-#### P2: 838 пунктов
+#### P2: 835 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -1004,9 +1004,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 1354 | LIN-1882 | [D48](#d48) | Спроектировать readiness command contract | OPS | candidate | L | G-OPS |
 | 1355 | LIN-1883 | [D48](#d48) | Спроектировать graceful shutdown sequence | OPS | candidate | L | G-OPS |
 | 1356 | LIN-1884 | [D48](#d48) | Спроектировать storage lock inspection | OPS | candidate | L | G-OPS |
-| 1358 | LIN-1886 | [D48](#d48) | Проверить stale lock recovery policy | CORRECTNESS | qualification | S | G-CORRECT |
-| 1359 | LIN-1887 | [D48](#d48) | Проверить lock error diagnostics | CORRECTNESS | qualification | S | G-CORRECT |
-| 1360 | LIN-1888 | [D48](#d48) | Проверить lock release после panic | CORRECTNESS | qualification | S | G-CORRECT |
 | 1361 | LIN-1889 | [D48](#d48) | Добавить disk-space preflight checks | OPS | candidate | M | G-OPS |
 | 1362 | LIN-1890 | [D48](#d48) | Добавить checkpoint scheduling policy | OPS | candidate | M | G-OPS |
 | 1363 | LIN-1891 | [D48](#d48) | Добавить WAL retention budget | OPS | candidate | M | G-OPS |
