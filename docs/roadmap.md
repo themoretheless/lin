@@ -2,7 +2,7 @@
 
 Срез: **2026-11-14**, коммит `58444cf6e` (релиз 0.7.1) плюс незакоммиченное рабочее дерево. Единственный файл с планом в репозитории: в нём только несделанное. Реализованное описано в [CHANGELOG](../CHANGELOG.md), в документах `docs/` по отдельным механизмам и в отчётах `benches/results/`.
 
-Открыто **1570** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
+Открыто **1569** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровывались, поэтому в них есть пропуски: закрытые пункты удалены. Пункты части II со статусами `candidate` и `qualification` по коду поштучно не сверялись: перед взятием пункта сначала проверить, не покрыт ли он уже.
 
@@ -194,7 +194,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 ### Приоритетный список — 1590 пунктов
 
-Количества: P1: 3, P2: 993, P3: 574; статусы: blocked_external: 1, candidate: 934, qualification: 635.
+Количества: P1: 3, P2: 992, P3: 574; статусы: blocked_external: 1, candidate: 934, qualification: 634.
 
 #### P1: 3 пунктов
 
@@ -204,7 +204,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 2 | LIN-0002 | [D01](#d01) | Закрыть durable 1k SQLite gap | PERF | qualification | M | G-PERF |
 | 22 | LIN-0006 | [D01](#d01) | Получить тестовый endpoint Kusto | OPS | blocked_external | M | G-OPS |
 
-#### P2: 993 пунктов
+#### P2: 992 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -436,7 +436,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 494 | LIN-0500 | [D13](#d13) | Проверить evaluation order side effects | CORRECTNESS | qualification | S | G-CORRECT |
 | 495 | LIN-0501 | [D13](#d13) | Проверить checked cast boundaries | CORRECTNESS | qualification | S | G-CORRECT |
 | 496 | LIN-0502 | [D13](#d13) | Проверить date/time literal validation | CORRECTNESS | qualification | S | G-CORRECT |
-| 497 | LIN-0503 | [D13](#d13) | Проверить regex literal validation | CORRECTNESS | qualification | S | G-CORRECT |
 | 498 | LIN-0504 | [D13](#d13) | Проверить vector dimension validation | CORRECTNESS | qualification | S | G-CORRECT |
 | 499 | LIN-0505 | [D13](#d13) | Добавить type error suggestions | FEATURE | candidate | M | G-FEATURE |
 | 500 | LIN-0506 | [D13](#d13) | Добавить related source spans | FEATURE | candidate | M | G-FEATURE |
