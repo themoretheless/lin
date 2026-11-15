@@ -2,7 +2,7 @@
 
 Срез: **2026-11-15**, коммит `58444cf6e` (релиз 0.7.1) плюс незакоммиченное рабочее дерево. Единственный файл с планом в репозитории: в нём только несделанное. Реализованное описано в [CHANGELOG](../CHANGELOG.md), в документах `docs/` по отдельным механизмам и в отчётах `benches/results/`.
 
-Открыто **1563** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
+Открыто **1559** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровывались, поэтому в них есть пропуски: закрытые пункты удалены. Пункты части II со статусами `candidate` и `qualification` по коду поштучно не сверялись: перед взятием пункта сначала проверить, не покрыт ли он уже.
 
@@ -193,7 +193,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 ### Приоритетный список — 1563 пунктов
 
-Количества: P1: 3, P2: 987, P3: 573; статусы: blocked_external: 1, candidate: 934, qualification: 628.
+Количества: P1: 3, P2: 983, P3: 573; статусы: blocked_external: 1, candidate: 934, qualification: 624.
 
 #### P1: 3 пунктов
 
@@ -203,7 +203,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 2 | LIN-0002 | [D01](#d01) | Закрыть durable 1k SQLite gap | PERF | qualification | M | G-PERF |
 | 22 | LIN-0006 | [D01](#d01) | Получить тестовый endpoint Kusto | OPS | blocked_external | M | G-OPS |
 
-#### P2: 987 пунктов
+#### P2: 983 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -544,13 +544,9 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 616 | LIN-0642 | [D17](#d17) | Проверить first-row latency | CORRECTNESS | qualification | S | G-CORRECT |
 | 617 | LIN-0643 | [D17](#d17) | Проверить take без полного scan | CORRECTNESS | qualification | S | G-CORRECT |
 | 618 | LIN-0644 | [D17](#d17) | Проверить skip без лишней projection | CORRECTNESS | qualification | S | G-CORRECT |
-| 619 | LIN-0645 | [D17](#d17) | Проверить next_projected field filtering | CORRECTNESS | qualification | S | G-CORRECT |
 | 620 | LIN-0646 | [D17](#d17) | Проверить projected row pool reuse | CORRECTNESS | qualification | S | G-CORRECT |
 | 621 | LIN-0647 | [D17](#d17) | Проверить cursor output lifetime | CORRECTNESS | qualification | S | G-CORRECT |
-| 622 | LIN-0648 | [D17](#d17) | Проверить cursor exhausted reuse | CORRECTNESS | qualification | S | G-CORRECT |
-| 623 | LIN-0649 | [D17](#d17) | Проверить dropped cursor cleanup | CORRECTNESS | qualification | S | G-CORRECT |
 | 624 | LIN-0650 | [D17](#d17) | Проверить canceled cursor cleanup | CORRECTNESS | qualification | S | G-CORRECT |
-| 626 | LIN-0652 | [D17](#d17) | Проверить cursor after catalog change | CORRECTNESS | qualification | S | G-CORRECT |
 | 627 | LIN-0653 | [D17](#d17) | Спроектировать borrowed cursor items | API | candidate | L | G-API |
 | 628 | LIN-0654 | [D17](#d17) | Спроектировать batched cursor fetch | API | candidate | L | G-API |
 | 629 | LIN-0655 | [D17](#d17) | Спроектировать cursor size hints | API | candidate | L | G-API |
