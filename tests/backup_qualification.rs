@@ -78,3 +78,32 @@ fn damaged_backups_are_refused_and_do_not_touch_the_target() {
         assert_eq!(rows(&mut db), vec!["keep=7"], "{what}: target changed");
     }
 }
+
+/// A database restored from a backup continues from the backup's generation: writes after
+/// the restore get later generations, survive a reopen, and the restored rows are intact.
+#[test]
+fn restored_database_continues_generations() {
+    let src = tmp("gen-src");
+    let file = tmp("gen-file").join("backup.json");
+    let gen_at_backup;
+    {
+        let mut db = Db::open(&src).unwrap();
+        db.run("col t { id: text, v: i64 }").unwrap();
+        for i in 0..5 {
+            db.run(&format!(r#"insert t {{ id: "b{i}", v: {i} }}"#)).unwrap();
+        }
+        gen_at_backup = db.r#gen();
+        db.export_backup(&file).unwrap();
+    }
+    let target = tmp("gen-target");
+    let mut db = Db::import_backup_into(&file, &target).unwrap();
+    assert!(db.r#gen() >= gen_at_backup, "restored generation went backwards");
+    assert_eq!(rows(&mut db).len(), 5);
+    let before = db.r#gen();
+    db.run(r#"insert t { id: "after", v: 99 }"#).unwrap();
+    assert!(db.r#gen() > before);
+    drop(db);
+    let mut db = Db::open(&target).unwrap();
+    assert_eq!(rows(&mut db).len(), 6);
+    assert!(rows(&mut db).contains(&"after=99".to_string()));
+}
