@@ -2,7 +2,7 @@
 
 Срез: **2026-11-15**, коммит `58444cf6e` (релиз 0.7.1) плюс незакоммиченное рабочее дерево. Единственный файл с планом в репозитории: в нём только несделанное. Реализованное описано в [CHANGELOG](../CHANGELOG.md), в документах `docs/` по отдельным механизмам и в отчётах `benches/results/`.
 
-Открыто **1522** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
+Открыто **1513** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровывались, поэтому в них есть пропуски: закрытые пункты удалены. Пункты части II со статусами `candidate` и `qualification` по коду поштучно не сверялись: перед взятием пункта сначала проверить, не покрыт ли он уже.
 
@@ -193,7 +193,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 ### Приоритетный список — 1563 пунктов
 
-Количества: P1: 3, P2: 946, P3: 573; статусы: blocked_external: 1, candidate: 934, qualification: 587.
+Количества: P1: 3, P2: 937, P3: 573; статусы: blocked_external: 1, candidate: 934, qualification: 578.
 
 #### P1: 3 пунктов
 
@@ -203,7 +203,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 2 | LIN-0002 | [D01](#d01) | Закрыть durable 1k SQLite gap | PERF | qualification | M | G-PERF |
 | 22 | LIN-0006 | [D01](#d01) | Получить тестовый endpoint Kusto | OPS | blocked_external | M | G-OPS |
 
-#### P2: 946 пунктов
+#### P2: 937 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -1001,13 +1001,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 1231 | LIN-1654 | [D42](#d42) | Добавить WAL corruption shrinking | VERIFY | qualification | S | G-VERIFY |
 | 1232 | LIN-1655 | [D42](#d42) | Добавить graph failure shrinking | VERIFY | qualification | S | G-VERIFY |
 | 1233 | LIN-1656 | [D42](#d42) | Добавить SQL peer mismatch shrinking | VERIFY | qualification | S | G-VERIFY |
-| 1234 | LIN-1657 | [D42](#d42) | Проверить aggregation against independent oracle | VERIFY | qualification | S | G-VERIFY |
-| 1235 | LIN-1658 | [D42](#d42) | Проверить windows against naive oracle | VERIFY | qualification | S | G-VERIFY |
-| 1236 | LIN-1659 | [D42](#d42) | Проверить sorting against total-order oracle | VERIFY | qualification | S | G-VERIFY |
-| 1237 | LIN-1660 | [D42](#d42) | Проверить Top-K against full-rank oracle | VERIFY | qualification | S | G-VERIFY |
-| 1238 | LIN-1661 | [D42](#d42) | Проверить graph against adjacency reference | VERIFY | qualification | S | G-VERIFY |
-| 1239 | LIN-1662 | [D42](#d42) | Проверить joins against nested-loop oracle | VERIFY | qualification | S | G-VERIFY |
-| 1240 | LIN-1663 | [D42](#d42) | Проверить regex against CPU reference | VERIFY | qualification | S | G-VERIFY |
 | 1241 | LIN-1664 | [D42](#d42) | Проверить sparse vectors against scalar encoder | VERIFY | qualification | S | G-VERIFY |
 | 1242 | LIN-1685 | [D43](#d43) | Инъецировать crash перед durable sync | VERIFY | qualification | S | G-VERIFY |
 | 1243 | LIN-1686 | [D43](#d43) | Инъецировать crash после durable sync | VERIFY | qualification | S | G-VERIFY |
@@ -1025,8 +1018,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 1255 | LIN-1698 | [D43](#d43) | Инъецировать network drop при catch-up | VERIFY | qualification | S | G-VERIFY |
 | 1256 | LIN-1699 | [D43](#d43) | Инъецировать TLS failure при reconnect | VERIFY | qualification | S | G-VERIFY |
 | 1257 | LIN-1700 | [D43](#d43) | Инъецировать slow replica acknowledgement | VERIFY | qualification | S | G-VERIFY |
-| 1258 | LIN-1702 | [D43](#d43) | Проверить no unacknowledged partial transaction | VERIFY | qualification | S | G-VERIFY |
-| 1259 | LIN-1703 | [D43](#d43) | Проверить no duplicate replay effects | VERIFY | qualification | S | G-VERIFY |
 | 1260 | LIN-1704 | [D43](#d43) | Проверить recovery idempotence after faults | VERIFY | qualification | S | G-VERIFY |
 | 1261 | LIN-1721 | [D44](#d44) | Зафиксировать Rust toolchain policy | CORRECTNESS | qualification | M | G-CORRECT |
 | 1262 | LIN-1722 | [D44](#d44) | Проверять declared MSRV build | OPS | candidate | M | G-OPS |
