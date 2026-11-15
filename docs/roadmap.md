@@ -2,7 +2,7 @@
 
 Срез: **2026-11-14**, коммит `58444cf6e` (релиз 0.7.1) плюс незакоммиченное рабочее дерево. Единственный файл с планом в репозитории: в нём только несделанное. Реализованное описано в [CHANGELOG](../CHANGELOG.md), в документах `docs/` по отдельным механизмам и в отчётах `benches/results/`.
 
-Открыто **1569** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
+Открыто **1565** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровывались, поэтому в них есть пропуски: закрытые пункты удалены. Пункты части II со статусами `candidate` и `qualification` по коду поштучно не сверялись: перед взятием пункта сначала проверить, не покрыт ли он уже.
 
@@ -194,7 +194,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 ### Приоритетный список — 1590 пунктов
 
-Количества: P1: 3, P2: 992, P3: 574; статусы: blocked_external: 1, candidate: 934, qualification: 634.
+Количества: P1: 3, P2: 988, P3: 574; статусы: blocked_external: 1, candidate: 934, qualification: 630.
 
 #### P1: 3 пунктов
 
@@ -204,7 +204,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 2 | LIN-0002 | [D01](#d01) | Закрыть durable 1k SQLite gap | PERF | qualification | M | G-PERF |
 | 22 | LIN-0006 | [D01](#d01) | Получить тестовый endpoint Kusto | OPS | blocked_external | M | G-OPS |
 
-#### P2: 992 пунктов
+#### P2: 988 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -441,10 +441,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 500 | LIN-0506 | [D13](#d13) | Добавить related source spans | FEATURE | candidate | M | G-FEATURE |
 | 501 | LIN-0507 | [D13](#d13) | Добавить explain type annotations | FEATURE | candidate | L | G-FEATURE |
 | 502 | LIN-0508 | [D13](#d13) | Добавить machine-readable check diagnostics | FEATURE | candidate | M | G-FEATURE |
-| 503 | LIN-0509 | [D13](#d13) | Проверить prepared query schema generation | CORRECTNESS | qualification | S | G-CORRECT |
 | 504 | LIN-0510 | [D13](#d13) | Проверить prepared query stale field IDs | CORRECTNESS | qualification | S | G-CORRECT |
-| 505 | LIN-0511 | [D13](#d13) | Проверить prepared query missing index | CORRECTNESS | qualification | S | G-CORRECT |
-| 506 | LIN-0512 | [D13](#d13) | Проверить prepared parameter type changes | CORRECTNESS | qualification | S | G-CORRECT |
 | 507 | LIN-0513 | [D13](#d13) | Измерить repeated check caching | PERF | candidate | M | G-PERF |
 | 508 | LIN-0514 | [D13](#d13) | Измерить catalog lookup interning | PERF | candidate | M | G-PERF |
 | 509 | LIN-0515 | [D13](#d13) | Измерить type constraint sharing | PERF | candidate | M | G-PERF |
@@ -479,7 +476,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 542 | LIN-0552 | [D14](#d14) | Добавить optimizer debug counters | FEATURE | candidate | M | G-FEATURE |
 | 544 | LIN-0554 | [D14](#d14) | Измерить plan cache key construction | PERF | candidate | M | G-PERF |
 | 545 | LIN-0555 | [D14](#d14) | Ограничить retained plan-cache bytes | CORRECTNESS | qualification | M | G-CORRECT |
-| 546 | LIN-0556 | [D14](#d14) | Проверить schema-aware plan invalidation | CORRECTNESS | qualification | S | G-CORRECT |
 | 547 | LIN-0557 | [D14](#d14) | Спроектировать row/batch backend selection | FEATURE | candidate | L | G-FEATURE |
 | 548 | LIN-0558 | [D14](#d14) | Спроектировать GPU eligibility explanation | FEATURE | candidate | L | G-FEATURE |
 | 549 | LIN-0559 | [D14](#d14) | Спроектировать exact/approximate plan labels | FEATURE | candidate | L | G-FEATURE |
