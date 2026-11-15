@@ -13,10 +13,28 @@ pub struct Error {
     pub phase: Phase,
 }
 
+/// Longest message an error keeps. Messages quote user input (names, literals); a
+/// statement carrying a megabyte identifier must not produce a megabyte error.
+const MAX_MESSAGE_BYTES: usize = 4096;
+
+fn bounded(message: impl Into<String>) -> String {
+    let mut m = message.into();
+    if m.len() > MAX_MESSAGE_BYTES {
+        let mut cut = MAX_MESSAGE_BYTES;
+        while !m.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        let dropped = m.len() - cut;
+        m.truncate(cut);
+        m.push_str(&format!("… [{dropped} bytes truncated]"));
+    }
+    m
+}
+
 impl Error {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
-            message: message.into(),
+            message: bounded(message),
             pos: None,
             phase: Phase::Compile,
         }
@@ -24,7 +42,7 @@ impl Error {
 
     pub fn at(pos: usize, message: impl Into<String>) -> Self {
         Self {
-            message: message.into(),
+            message: bounded(message),
             pos: Some(pos),
             phase: Phase::Compile,
         }
@@ -32,7 +50,7 @@ impl Error {
 
     pub fn runtime(message: impl Into<String>) -> Self {
         Self {
-            message: message.into(),
+            message: bounded(message),
             pos: None,
             phase: Phase::Runtime,
         }
@@ -53,3 +71,18 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn long_messages_are_truncated_on_a_char_boundary() {
+        let short = Error::new("short");
+        assert_eq!(short.message, "short");
+        let long = Error::runtime("é".repeat(5000));
+        assert!(long.message.len() < MAX_MESSAGE_BYTES + 64);
+        assert!(long.message.ends_with("bytes truncated]"));
+        assert!(long.message.starts_with("éé"));
+    }
+}

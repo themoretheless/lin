@@ -2,7 +2,7 @@
 
 Срез: **2026-11-15**, коммит `58444cf6e` (релиз 0.7.1) плюс незакоммиченное рабочее дерево. Единственный файл с планом в репозитории: в нём только несделанное. Реализованное описано в [CHANGELOG](../CHANGELOG.md), в документах `docs/` по отдельным механизмам и в отчётах `benches/results/`.
 
-Открыто **1505** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
+Открыто **1502** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровывались, поэтому в них есть пропуски: закрытые пункты удалены. Пункты части II со статусами `candidate` и `qualification` по коду поштучно не сверялись: перед взятием пункта сначала проверить, не покрыт ли он уже.
 
@@ -193,7 +193,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 ### Приоритетный список — 1563 пунктов
 
-Количества: P1: 3, P2: 929, P3: 573; статусы: blocked_external: 1, candidate: 934, qualification: 570.
+Количества: P1: 3, P2: 926, P3: 573; статусы: blocked_external: 1, candidate: 934, qualification: 567.
 
 #### P1: 3 пунктов
 
@@ -203,7 +203,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 2 | LIN-0002 | [D01](#d01) | Закрыть durable 1k SQLite gap | PERF | qualification | M | G-PERF |
 | 22 | LIN-0006 | [D01](#d01) | Получить тестовый endpoint Kusto | OPS | blocked_external | M | G-OPS |
 
-#### P2: 929 пунктов
+#### P2: 926 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -953,9 +953,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 1191 | LIN-1578 | [D40](#d40) | Уточнить missing feature remediation | CORRECTNESS | qualification | M | G-CORRECT |
 | 1192 | LIN-1579 | [D40](#d40) | Уточнить stale prepared handle remediation | CORRECTNESS | qualification | M | G-CORRECT |
 | 1193 | LIN-1580 | [D40](#d40) | Уточнить incompatible model remediation | CORRECTNESS | qualification | M | G-CORRECT |
-| 1194 | LIN-1581 | [D40](#d40) | Проверить error display без panic | CORRECTNESS | qualification | S | G-CORRECT |
-| 1195 | LIN-1582 | [D40](#d40) | Проверить invalid UTF-8 error rendering | CORRECTNESS | qualification | S | G-CORRECT |
-| 1196 | LIN-1583 | [D40](#d40) | Проверить huge value diagnostic truncation | CORRECTNESS | qualification | S | G-CORRECT |
 | 1197 | LIN-1584 | [D40](#d40) | Проверить cyclic error source defense | CORRECTNESS | qualification | S | G-CORRECT |
 | 1198 | LIN-1601 | [D41](#d41) | Добавить per-query execution ID | OPS | candidate | M | G-OPS |
 | 1199 | LIN-1602 | [D41](#d41) | Добавить query phase timing schema | OPS | candidate | M | G-OPS |

@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Fixed
+- Error messages quoted user input in full: a statement made of a one-megabyte identifier produced a one-megabyte `unknown collection` error. Messages are now cut at 4 KiB on a character boundary, with a note of how many bytes were dropped.
 - `#[derive(LinRow)]` failed with `missing column` for an `Option<T>` field whose value was never set: rows are sparse, so such a field is absent rather than `Null`. An absent field now reads as `None`; required fields still report the missing column.
 - Sorting compared integers through f64: integers above 2^53 that differ by one tied or swapped (`2^53 + 1` sorted before `2^53`, `i64::MAX` before `i64::MAX - 1`), with or without an index. Integers now compare exactly with each other and with floats.
 - String literals dropped the backslash of any escape other than `\n \t \\ \"`: `regex "\d+"` matched `d+`, and `"\r"` became `r`. Literals now also accept `\r \0 \' \u{..}` (the form string values are printed in, so printed text parses back unchanged), and any other escape keeps its backslash. A malformed `\u{..}` is an error.
