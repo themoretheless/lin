@@ -150,14 +150,10 @@ fn read_seg_cell(
             None => Cell::Null,
             Some((_, _, 0)) => Cell::SmallText(InlineStr::new_truncate("")),
             Some((bidx, in_off, len)) => {
-                let block = match last_block {
-                    Some((lb, arc)) if *lb == bidx => Arc::clone(arc),
-                    _ => {
-                        let decoded = tc.decode_block(bidx)?;
-                        *last_block = Some((bidx, Arc::clone(&decoded)));
-                        decoded
-                    }
-                };
+                if !matches!(last_block, Some((lb, _)) if *lb == bidx) {
+                    *last_block = Some((bidx, tc.decode_block(bidx)?));
+                }
+                let block: &[u8] = &last_block.as_ref().unwrap().1;
                 let s_off = in_off as usize;
                 let e_off = s_off + (len as usize);
                 if e_off > block.len() {
@@ -1459,6 +1455,9 @@ impl DiskEngine {
         let valid_end = self.replay_wal_from_file(&mut f, true)?;
         f.set_len(valid_end).map_err(io_err)?;
         f.seek(SeekFrom::End(0)).map_err(io_err)?;
+        if valid_end == 0 {
+            crate::persist::reserve_wal_space(&f, 256 * 1024, true);
+        }
         self.wal_bytes = valid_end;
         self.wal_file = Some(f);
         Ok(())
@@ -1515,22 +1514,22 @@ impl DiskEngine {
         };
         let frame = DiskWalFrameRef { generation, ops };
         self.wal_buf.clear();
+        self.wal_buf.extend_from_slice(&[0u8; 12]);
         rmp_serde::encode::write(&mut self.wal_buf, &frame).map_err(io_err)?;
-        let crc = crate::crc::hardware_crc32c(&self.wal_buf);
+        let payload_len = self.wal_buf.len() - 12;
+        let crc = crate::crc::hardware_crc32c(&self.wal_buf[12..]);
 
-        let mut header = [0u8; 12];
-        header[0..4].copy_from_slice(b"LWAL");
-        header[4..8].copy_from_slice(&(self.wal_buf.len() as u32).to_le_bytes());
-        header[8..12].copy_from_slice(&crc.to_le_bytes());
+        self.wal_buf[0..4].copy_from_slice(b"LWAL");
+        self.wal_buf[4..8].copy_from_slice(&(payload_len as u32).to_le_bytes());
+        self.wal_buf[8..12].copy_from_slice(&crc.to_le_bytes());
 
-        f.write_all(&header).map_err(io_err)?;
         f.write_all(&self.wal_buf).map_err(io_err)?;
         if self.sync_full {
             crate::persist::durable_sync(f)
                 .or_else(|_| f.sync_data())
                 .map_err(io_err)?;
         }
-        self.wal_bytes += 12 + (self.wal_buf.len() as u64);
+        self.wal_bytes += self.wal_buf.len() as u64;
         Ok(())
     }
 
@@ -2025,6 +2024,7 @@ impl DiskEngine {
         if let Some(f) = self.wal_file.as_mut() {
             f.set_len(0).map_err(io_err)?;
             f.seek(SeekFrom::Start(0)).map_err(io_err)?;
+            crate::persist::reserve_wal_space(f, 256 * 1024, true);
             if self.sync_full {
                 crate::persist::durable_sync(f)
                     .or_else(|_| f.sync_all())
@@ -2855,26 +2855,50 @@ impl DiskEngine {
                         }
                     }
                 }
-                Some(MmapCol::Text(_)) => {
-                    let by_pos = seg.col_pos(by_field);
-                    let mut lb = None;
+                Some(MmapCol::Text(tc)) => {
+                    let mut blocks = Vec::with_capacity(tc.block_count as usize);
+                    for b in 0..tc.block_count {
+                        blocks.push(tc.decode_block(b)?);
+                    }
+                    let mut seg_map: FxHashMap<&str, crate::exact_sum::ExactSum> =
+                        FxHashMap::default();
+                    let mut null_sum: Option<crate::exact_sum::ExactSum> = None;
                     for rid in 0..rc {
                         if !all_live && self.tombstones.is_dead(sid, rid) {
                             continue;
                         }
-                        let mut val = crate::exact_sum::ExactSum::default();
+                        let s_opt = match tc.get_loc(rid) {
+                            None => None,
+                            Some((_, _, 0)) => Some(""),
+                            Some((bidx, in_off, len)) => {
+                                let block = blocks
+                                    .get(bidx as usize)
+                                    .ok_or_else(|| io_err("corrupt block index"))?;
+                                let s_off = in_off as usize;
+                                let e_off = s_off + (len as usize);
+                                if e_off > block.len() {
+                                    return Err(io_err("corrupt in-block text slice"));
+                                }
+                                Some(std::str::from_utf8(&block[s_off..e_off]).map_err(io_err)?)
+                            }
+                        };
+                        let acc = match s_opt {
+                            Some(s) => seg_map.entry(s).or_default(),
+                            None => null_sum.get_or_insert_with(Default::default),
+                        };
                         if !fc.is_null(rid) {
                             if is_int {
-                                val.add_i64(fc.read_i64(rid));
+                                acc.add_i64(fc.read_i64(rid));
                             } else {
-                                val.add_f64(fc.read_f64(rid));
+                                acc.add_f64(fc.read_f64(rid));
                             }
                         }
-                        let cell = match seg.borrow_col_str(by_pos, rid, &mut lb)? {
-                            Some(s) => Cell::from_text(s),
-                            None => Cell::Null,
-                        };
-                        map.entry(cell).or_default().merge(val);
+                    }
+                    for (k, sum_v) in seg_map {
+                        map.entry(Cell::from_text(k)).or_default().merge(sum_v);
+                    }
+                    if let Some(ns) = null_sum {
+                        map.entry(Cell::Null).or_default().merge(ns);
                     }
                 }
                 None => {
@@ -5481,26 +5505,35 @@ impl DiskEngine {
                     pred_cols.push(name);
                 }
             }
-            // Rows handed back by a previous result of the same shape keep their keys, so
-            // refilling them costs no key or node allocation.
-            let mut recycled = if fs == ["id", "title"] {
+            // Rows handed back by a previous result of the same shape keep their backing Vec and
+            // precomputed Shape, so refilling in place avoids Vec reallocations and key lookups.
+            let mut out = if fs == ["id", "title"] {
                 crate::store::take_recycled_id_title_vec().unwrap_or_default()
             } else {
-                Vec::new()
+                out
             };
+            let id_title_shape = if fs == ["id", "title"] {
+                Some(Row::shape_of(&["id", "title"]))
+            } else {
+                None
+            };
+            let mut written = 0usize;
             self.scan_filter_late(table, Some(p), &pred_cols, fs, now_ms, |cols, cells| {
-                let reusable = recycled.last().is_some_and(|slot| {
-                    slot.len() == cols.len()
-                        && cells.iter().all(|c| !matches!(c, Cell::Null))
-                        && cols.iter().all(|&f| slot.contains_key(f))
-                });
-                let row = if reusable && let Some(mut slot) = recycled.pop() {
-                    for (&f, cell) in cols.iter().zip(cells.drain(..)) {
-                        if let Some(v) = slot.get_mut(f) {
-                            *v = cell;
-                        }
+                if let Some(ref shape) = id_title_shape
+                    && cols == ["id", "title"]
+                    && cells.len() == 2
+                    && !matches!(cells[0], Cell::Null)
+                    && !matches!(cells[1], Cell::Null)
+                {
+                    let mut it = cells.drain(..);
+                    let c0 = it.next().unwrap();
+                    let c1 = it.next().unwrap();
+                    if written < out.len() {
+                        out[written].reset_from_parts(Arc::clone(shape), [c0, c1]);
+                    } else {
+                        out.push(Row::from_parts(Arc::clone(shape), [c0, c1]));
                     }
-                    slot
+                    written += 1;
                 } else {
                     let mut row = Row::new();
                     for (&f, cell) in cols.iter().zip(cells.drain(..)) {
@@ -5508,11 +5541,16 @@ impl DiskEngine {
                             row.insert(f.to_string(), cell);
                         }
                     }
-                    row
-                };
-                out.push(row);
-                limit.is_none_or(|lim| out.len() < lim)
+                    if written < out.len() {
+                        out[written] = row;
+                    } else {
+                        out.push(row);
+                    }
+                    written += 1;
+                }
+                limit.is_none_or(|lim| written < lim)
             })?;
+            out.truncate(written);
             return Ok(out);
         }
 

@@ -40,7 +40,7 @@ pub(crate) struct MmapTextCol {
     /// Concatenated Zstd-compressed blocks.
     blocks_data: Mmap,
     row_count: u32,
-    block_count: u32,
+    pub(super) block_count: u32,
     cache_shards: [Mutex<Vec<Option<BlockCacheSlot>>>; BLOCK_CACHE_SHARDS],
     /// Optional per-Zstd-block 4096-bit trigram Bloom filters (`col_<name>.tgram`).
     tgram: Option<Box<[TgramBlock]>>,

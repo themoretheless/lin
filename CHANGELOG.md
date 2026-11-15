@@ -40,6 +40,7 @@
 - Directory sync on Windows failed with `Access is denied` (`File::open` on a directory handle) when writing cold segments or snapshots; directory sync is now Unix-only while file syncs remain intact on all platforms.
 - Snapshot (`0x03`) and durable FTS posting (`fts/<collection>.bin`) files had no whole-file checksum, so a corrupted or partially truncated file could panic on decoded capacity headers, serve stale postings, or open with altered snapshot data when the log was empty after a checkpoint. Both formats now append an 8-byte `LCRC` + CRC32C trailer verified on open (with bounded capacity preallocation and posting bounds checks on FTS) while remaining readable by `0.7.1` and continuing to accept earlier trailer-less files.
 - Batch `orders` / `users` SoA joins now raise the parallel worker spawn threshold to `PAR_AGG_MIN_ROWS` (avoiding OS thread-spawn and cross-core refcount contention on small batches), fill text columns directly, and extend typed `RecordBatch` columns by slice instead of converting to `Vec<Cell>`.
+- `delete` dropped rows that another row still referenced through a declared `fk`, leaving dangling keys that vanished from `join`. Deleting a referenced row is now refused (in memory and on the cold tier); self-referencing rows deleted in the same statement are still allowed.
 
 ### Added
 - `wal-serve --sinks N` / `ship::serve_blocking_fanout`: up to 64 followers pull at once, so a stalled one does not hold up the rest.

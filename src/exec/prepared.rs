@@ -327,6 +327,11 @@ impl Db {
         else {
             return None;
         };
+        // Deletes from a foreign-key target take the general path, which checks that no
+        // row still references what is deleted.
+        if catalog.fks.iter().any(|fk| fk.to_col == *collection) {
+            return None;
+        }
         if pred_has_param(pred) {
             return None;
         }

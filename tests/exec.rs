@@ -1051,11 +1051,14 @@ fn delete_rollback_restores_positions_and_structures() {
 #[test]
 fn delete_rollback_across_collections_keeps_soa_and_maps() {
     let mut db = Db::fixture();
-    let users = db.run(r#"users | { email } | take 1"#).unwrap();
+    let users = db.run(r#"users | { id, email } | take 1"#).unwrap();
     let email = text(&users.rows[0], "email").to_string();
+    let uid = text(&users.rows[0], "id").to_string();
     let before = digest(&mut db);
+    // The user's orders go first: a user still referenced by orders cannot be deleted.
     let e = db
         .run_group([
+            format!(r#"delete orders[user_id == "{uid}"] cas each"#),
             format!(r#"delete users[email == "{email}"] cas each"#),
             r#"delete docs[uri == "wiki://rag-overview"] cas each"#.to_string(),
             r#"delete orders[total > 100000] cas each"#.to_string(),

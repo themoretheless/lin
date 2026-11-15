@@ -157,7 +157,7 @@ impl Db {
         allow_preencode: bool,
         want_rows: bool,
     ) -> Result<(StmtExecOut, Option<crate::persist::PreparedEncoding>), Error> {
-        if !self.store.fts_deferred_doc_swaps.is_empty() {
+        if self.store.has_deferred_doc_ops() {
             self.store.flush_fts_deferred_docs();
         }
         for stmt in stmts {
@@ -779,6 +779,57 @@ impl Db {
         Ok(())
     }
 
+    /// Refuse to delete rows a foreign key still points at. `deleting` are the rows about
+    /// to leave `collection`; a referencing row that is itself being deleted (a key into
+    /// its own collection) does not count. Each referencing collection is read once.
+    pub(crate) fn ensure_not_referenced(&self, collection: &str, deleting: &[Row]) -> Result<(), Error> {
+        for fk in &self.catalog.fks {
+            if fk.to_col != collection {
+                continue;
+            }
+            let targets: FxHashSet<&str> = deleting
+                .iter()
+                .filter_map(|r| row_text(r, &fk.to_field))
+                .filter(|v| !v.is_empty())
+                .collect();
+            if targets.is_empty() {
+                continue;
+            }
+            let self_ref = fk.from_col == collection;
+            let deleted_ids: FxHashSet<&str> = if self_ref {
+                deleting.iter().filter_map(|r| row_text(r, "id")).collect()
+            } else {
+                FxHashSet::default()
+            };
+            let referenced = if self.store.is_disk_backed(&fk.from_col) {
+                // No in-memory rows to scan: ask the engine per value. A self-reference
+                // inside the deleted set cannot be told apart here, so it counts.
+                targets
+                    .iter()
+                    .find(|v| self.store.disk_has_key(&fk.from_col, &fk.from_field, v))
+                    .map(|v| v.to_string())
+            } else {
+                self.store.collection(&fk.from_col).iter().find_map(|r| {
+                    let v = row_text(r, &fk.from_field)?;
+                    if !targets.contains(v) {
+                        return None;
+                    }
+                    if self_ref && row_text(r, "id").is_some_and(|id| deleted_ids.contains(id)) {
+                        return None;
+                    }
+                    Some(v.to_string())
+                })
+            };
+            if let Some(val) = referenced {
+                return Err(Error::runtime(format!(
+                    "fk: {}.{} → {collection}.{} still references {val}; delete or update the referencing rows first",
+                    fk.from_col, fk.from_field, fk.to_field
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn fk_target_exists(&self, to_col: &str, to_field: &str, val: &str) -> bool {
         // A disk-backed target has no in-memory row map: ask the engine, for `id` as well.
         if self.store.is_disk_backed(to_col) {
@@ -1182,11 +1233,12 @@ impl Db {
             let built_ref: &[Row] = &built;
             let (maint_res, direct_res) = std::thread::scope(|s| {
                 let enc_handle = s.spawn(move || {
-                    let res = crate::persist::encode_insert_rows_direct(
+                    let res = crate::persist::encode_insert_rows_direct_ext(
                         generation,
                         next_id,
                         collection,
                         built_ref,
+                        uniform_keys,
                         &mut encode_buf,
                     );
                     (res, encode_buf)
@@ -1470,6 +1522,10 @@ impl Db {
             }
         }
         idxs.sort_unstable();
+        if self.catalog.fks.iter().any(|fk| fk.to_col == collection) {
+            let deleting: Vec<Row> = idxs.iter().map(|&i| rows[i].clone()).collect();
+            self.ensure_not_referenced(collection, &deleting)?;
+        }
         let out = self.store.delete_rows_at(collection, &idxs);
 
         if let Undo::Rows(events) | Undo::Mixed { events } = ctx.undo {
@@ -1774,7 +1830,7 @@ fn build_insert_rows(
             let threads = std::thread::available_parallelism()
                 .map(|p| p.get())
                 .unwrap_or(1)
-                .min(4);
+                .min(8);
             if threads <= 1 {
                 return std::sync::Mutex::new(None);
             }
@@ -1826,7 +1882,7 @@ fn build_insert_rows(
         if let Ok(guard) = mutex.try_lock()
             && let Some(pool) = guard.as_ref()
         {
-            let total_ways = (pool.workers.len() + 1).min(n.div_ceil(256)).max(1);
+            let total_ways = (pool.workers.len() + 1).min(n.div_ceil(128)).max(1);
             if total_ways > 1 {
                 let mut rows: Vec<Row> = Vec::with_capacity(n);
                 let spare = &mut rows.spare_capacity_mut()[..n];
@@ -1980,86 +2036,90 @@ fn build_batch_shape_rows_into(
         .collect::<Vec<_>>();
     let mut all_same = true;
     let mut all_embedded = !needs_embed || can_inline_embed;
-    for (slot_out, record) in out.iter_mut().zip(records) {
-        let same_shape = record.fields.len() == first.fields.len()
-            && record
-                .fields
-                .iter()
-                .zip(&first.fields)
-                .all(|(a, b)| a.0 == b.0);
-        if !same_shape {
-            all_same = false;
-            if needs_embed {
-                all_embedded = false;
+    let mut process_rows = |mut embed_batch: Option<&mut crate::embed::HashingBatch<'_>>| {
+        for (slot_out, record) in out.iter_mut().zip(records) {
+            let same_shape = record.fields.len() == first.fields.len()
+                && record
+                    .fields
+                    .iter()
+                    .zip(&first.fields)
+                    .all(|(a, b)| a.0 == b.0);
+            if !same_shape {
+                all_same = false;
+                if needs_embed {
+                    all_embedded = false;
+                }
+                slot_out.write(record_row(record, now));
+                continue;
             }
-            slot_out.write(record_row(record, now));
-            continue;
-        }
-        let mut emb_vec = if let Some(dim) = hashing_dim.filter(|_| can_inline_embed) {
-            let t_opt = title_idx.map(|i| &record.fields[i].1);
-            let b_opt = body_idx.map(|i| &record.fields[i].1);
-            let s_opt = snippet_idx.map(|i| &record.fields[i].1);
-            let t_str = match t_opt {
-                Some(Value::String(s)) => Some(s.as_ref()),
-                None => None,
-                _ => {
+            let mut emb_vec = if let Some(batch) = embed_batch.as_deref_mut() {
+                let t_opt = title_idx.map(|i| &record.fields[i].1);
+                let b_opt = body_idx.map(|i| &record.fields[i].1);
+                let s_opt = snippet_idx.map(|i| &record.fields[i].1);
+                let t_str = match t_opt {
+                    Some(Value::String(s)) => Some(s.as_ref()),
+                    None => None,
+                    _ => {
+                        all_embedded = false;
+                        None
+                    }
+                };
+                let b_str = match b_opt {
+                    Some(Value::String(s)) => Some(s.as_ref()),
+                    None => None,
+                    _ => {
+                        all_embedded = false;
+                        None
+                    }
+                };
+                let s_str = match s_opt {
+                    Some(Value::String(s)) => Some(s.as_ref()),
+                    None => None,
+                    _ => {
+                        all_embedded = false;
+                        None
+                    }
+                };
+                if all_embedded && t_str.or(b_str).or(s_str).is_some_and(|s| !s.is_empty()) {
+                    Some(batch.embed_parts([t_str, b_str, s_str]))
+                } else {
                     all_embedded = false;
                     None
                 }
-            };
-            let b_str = match b_opt {
-                Some(Value::String(s)) => Some(s.as_ref()),
-                None => None,
-                _ => {
-                    all_embedded = false;
-                    None
-                }
-            };
-            let s_str = match s_opt {
-                Some(Value::String(s)) => Some(s.as_ref()),
-                None => None,
-                _ => {
-                    all_embedded = false;
-                    None
-                }
-            };
-            if all_embedded && t_str.or(b_str).or(s_str).is_some_and(|s| !s.is_empty()) {
-                Some(crate::embed::embed_texts_hashing(
-                    dim,
-                    [t_str, b_str, s_str],
-                ))
             } else {
-                all_embedded = false;
                 None
-            }
-        } else {
-            None
-        };
-        let mut row = template.clone();
-        for (cell, slot) in row.values_mut().zip(&slots) {
-            match slot {
-                ShapeSlot::Source(src) => {
-                    *cell = value_cell(&record.fields[*src].1, now);
-                }
-                ShapeSlot::Hash(b_src) => {
-                    if let Value::String(body) = &record.fields[*b_src].1 {
-                        *cell = Cell::Text(if total_n >= 512 && body.len() <= 64 {
-                            content_hash_arc(body.as_ref())
+            };
+            let mut row = template.clone();
+            for (cell, slot) in row.values_mut().zip(&slots) {
+                match slot {
+                    ShapeSlot::Source(src) => {
+                        *cell = value_cell(&record.fields[*src].1, now);
+                    }
+                    ShapeSlot::Hash(b_src) => {
+                        if let Value::String(body) = &record.fields[*b_src].1 {
+                            *cell = Cell::Text(if total_n >= 512 && body.len() <= 64 {
+                                content_hash_arc(body.as_ref())
+                            } else {
+                                cached_content_hash(body.as_ref())
+                            });
                         } else {
-                            cached_content_hash(body.as_ref())
-                        });
-                    } else {
-                        all_same = false;
+                            all_same = false;
+                        }
                     }
-                }
-                ShapeSlot::Embed => {
-                    if let Some(v) = emb_vec.take() {
-                        *cell = Cell::Vec(v);
+                    ShapeSlot::Embed => {
+                        if let Some(v) = emb_vec.take() {
+                            *cell = Cell::Vec(v);
+                        }
                     }
                 }
             }
+            slot_out.write(row);
         }
-        slot_out.write(row);
+    };
+    if let Some(dim) = hashing_dim.filter(|_| can_inline_embed) {
+        crate::embed::with_hashing_scratch(dim, |batch| process_rows(Some(batch)));
+    } else {
+        process_rows(None);
     }
     (all_same, all_embedded)
 }

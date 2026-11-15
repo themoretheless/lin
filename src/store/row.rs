@@ -214,6 +214,16 @@ impl Row {
         }
     }
 
+    /// Replace this row's contents in place from a precomputed [`Shape`] and cells in
+    /// sorted field-name order, reusing the row's inline buffer.
+    #[inline]
+    pub fn reset_from_parts(&mut self, shape: Arc<Shape>, cells: impl IntoIterator<Item = Cell>) {
+        self.cells.clear();
+        self.cells.extend(cells);
+        debug_assert_eq!(self.cells.len(), shape.names.len());
+        self.shape = Some(shape);
+    }
+
     /// A row from names in strictly ascending order and their cells, without a search
     /// per field.
     pub fn from_sorted<'a>(

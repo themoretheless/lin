@@ -38,7 +38,8 @@ pub use codec::{
 pub(crate) use codec::insert_cols_lossless;
 pub(crate) use codec::{
     PreparedEncoding, PreparedInsert, acquire_encoder, append_prepared_record,
-    encode_insert_rows_direct, prepare_insert_columns_ext, start_insert_encoding,
+    encode_insert_rows_direct, encode_insert_rows_direct_ext, prepare_insert_columns_ext,
+    start_insert_encoding,
 };
 
 pub use snapshot::{
@@ -75,5 +76,5 @@ pub use wal::{
 pub use wal::append_batch_records;
 pub(crate) use wal::{
     append_validated_frame_slices, append_validated_frames, durable_sync, prune_bins,
-    replay_log_indexed, sync_dir_checked, write_frame, write_head_no_dir_sync,
+    replay_log_indexed, reserve_wal_space, sync_dir_checked, write_frame, write_head_no_dir_sync,
 };

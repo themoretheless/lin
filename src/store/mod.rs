@@ -174,6 +174,14 @@ impl std::fmt::Debug for StoreDiskTier {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct DeferredDocWingUpdate {
+    pub idx: usize,
+    pub prev_wing: Cell,
+    pub new_wing: Arc<str>,
+    pub ts: Cell,
+}
+
 #[derive(Debug)]
 pub struct Store {
     pub r#gen: u64,
@@ -222,6 +230,7 @@ pub struct Store {
     pub(crate) retired_doc_ids: smallvec::SmallVec<[Arc<str>; 16]>,
     pub(crate) retired_arcs: smallvec::SmallVec<[Arc<str>; 16]>,
     pub(crate) fts_deferred_doc_swaps: smallvec::SmallVec<[(usize, usize, usize); 8]>,
+    pub(crate) deferred_doc_wing_updates: smallvec::SmallVec<[DeferredDocWingUpdate; 8]>,
     pub(crate) retired_rows: smallvec::SmallVec<[Row; 2]>,
     pub(crate) retired_cells: smallvec::SmallVec<[Cell; 8]>,
     /// SoA for orders / users — FK join + OLAP project without per-row maps.
@@ -338,6 +347,7 @@ impl Store {
             retired_doc_ids: smallvec::SmallVec::new(),
             retired_arcs: smallvec::SmallVec::new(),
             fts_deferred_doc_swaps: smallvec::SmallVec::new(),
+            deferred_doc_wing_updates: smallvec::SmallVec::new(),
             retired_rows: smallvec::SmallVec::new(),
             retired_cells: smallvec::SmallVec::new(),
             orders_id: Vec::new(),
@@ -905,6 +915,7 @@ impl Store {
             retired_doc_ids: self.retired_doc_ids.clone(),
             retired_arcs: smallvec::SmallVec::new(),
             fts_deferred_doc_swaps: smallvec::SmallVec::new(),
+            deferred_doc_wing_updates: smallvec::SmallVec::new(),
             retired_rows: smallvec::SmallVec::new(),
             retired_cells: smallvec::SmallVec::new(),
             orders_id: self.orders_id.clone(),
@@ -1321,6 +1332,7 @@ impl Store {
         }
         self.rebuild_indexes();
         self.rebuild_row_maps();
+        self.deferred_doc_wing_updates.clear();
         self.rebuild_all_fts_inplace();
         self.refresh_col_counts();
     }
@@ -2307,7 +2319,47 @@ impl Store {
         removed
     }
 
+    #[inline]
+    pub fn has_deferred_doc_ops(&self) -> bool {
+        !self.fts_deferred_doc_swaps.is_empty() || !self.deferred_doc_wing_updates.is_empty()
+    }
+
     pub fn flush_fts_deferred_docs(&mut self) {
+        if !self.has_deferred_doc_ops() {
+            return;
+        }
+        if !self.deferred_doc_wing_updates.is_empty() {
+            let updates = std::mem::take(&mut self.deferred_doc_wing_updates);
+            for upd in updates {
+                let new_cell = Cell::Text(Arc::clone(&upd.new_wing));
+                for live_idx in self.indexes.values_mut() {
+                    if live_idx.def.collection == "docs"
+                        && live_idx.def.pred.is_none()
+                        && !live_idx.def.unique
+                    {
+                        if live_idx.def.fields.len() == 1 && live_idx.def.fields[0] == "wing" {
+                            let old_k =
+                                Some(crate::index::LiveIndex::single_cell_key(&upd.prev_wing));
+                            let new_k =
+                                Some(crate::index::LiveIndex::single_cell_key(&new_cell));
+                            let _ = live_idx.update_keys(upd.idx, old_k, new_k);
+                        } else if live_idx.def.fields.len() == 2
+                            && live_idx.def.fields[0] == "wing"
+                            && live_idx.def.fields[1] == "ts"
+                        {
+                            let old_k = Some(crate::index::LiveIndex::two_cell_key(
+                                &upd.prev_wing,
+                                &upd.ts,
+                            ));
+                            let new_k = Some(crate::index::LiveIndex::two_cell_key(
+                                &new_cell, &upd.ts,
+                            ));
+                            let _ = live_idx.update_keys(upd.idx, old_k, new_k);
+                        }
+                    }
+                }
+            }
+        }
         if self.fts_deferred_doc_swaps.is_empty() {
             return;
         }
@@ -2366,7 +2418,7 @@ impl Store {
         p: usize,
         _precomputed_idx_keys: Option<&(crate::index::IndexKey, crate::index::IndexKey)>,
     ) {
-        if !self.fts_deferred_doc_swaps.is_empty() {
+        if self.has_deferred_doc_ops() {
             self.flush_fts_deferred_docs();
         }
         let old_n = match self.collections.get("docs") {
@@ -2813,6 +2865,7 @@ impl Store {
             self.docs_moved_idxs.clear();
             self.retired_doc_ids.clear();
             self.fts_deferred_doc_swaps.clear();
+            self.deferred_doc_wing_updates.clear();
         }
         if collection == "orders" {
             self.orders_id.clear();
@@ -3793,6 +3846,7 @@ impl Store {
 
     pub fn rebuild_indexes(&mut self) {
         self.indexes.clear();
+        self.deferred_doc_wing_updates.clear();
         let labels: smallvec::SmallVec<[String; 4]> = self.extra_indexes.keys().cloned().collect();
         if labels.len() >= 2 && self.collections.values().map(Vec::len).sum::<usize>() >= 2048 {
             let built: Vec<Option<(String, LiveIndex)>> = std::thread::scope(|s| {
@@ -4162,6 +4216,9 @@ impl Store {
     }
 
     pub fn rebuild_indexes_collection(&mut self, collection: &str) {
+        if collection == "docs" {
+            self.deferred_doc_wing_updates.clear();
+        }
         let labels: Vec<String> = self
             .indexes
             .iter()
@@ -4208,7 +4265,9 @@ impl Store {
         // A disk-backed collection keeps only an empty placeholder `LiveIndex`; its secondary
         // indexes live in the disk engine. Report "no usable index" so callers scan instead
         // of trusting an empty seek result.
-        if self.is_disk_backed(collection) {
+        if self.is_disk_backed(collection)
+            || (collection == "docs" && !self.deferred_doc_wing_updates.is_empty())
+        {
             return None;
         }
         if uses.is_empty() {
@@ -4247,7 +4306,9 @@ impl Store {
         // A disk-backed collection keeps only an empty placeholder `LiveIndex`; its secondary
         // indexes live in the disk engine. Report "no usable index" so callers scan instead
         // of trusting an empty seek result.
-        if self.is_disk_backed(collection) {
+        if self.is_disk_backed(collection)
+            || (collection == "docs" && !self.deferred_doc_wing_updates.is_empty())
+        {
             return None;
         }
         if uses.is_empty() {
@@ -4276,7 +4337,9 @@ impl Store {
         // A disk-backed collection keeps only an empty placeholder `LiveIndex`; its secondary
         // indexes live in the disk engine. Report "no usable index" so callers scan instead
         // of trusting an empty seek result.
-        if self.is_disk_backed(collection) {
+        if self.is_disk_backed(collection)
+            || (collection == "docs" && !self.deferred_doc_wing_updates.is_empty())
+        {
             return None;
         }
         if uses.is_empty() {

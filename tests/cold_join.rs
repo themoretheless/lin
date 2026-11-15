@@ -121,6 +121,10 @@ fn cold_join_on_integer_and_large_text_key_sets_matches_in_memory() {
                 )
                 .unwrap();
                 db.run(r#"update parents[id == "p30"] cas each { num: 6450, label: "moved" }"#).unwrap();
+                // A referenced parent cannot be deleted: remove its kids first.
+                let code = db.run(r#"parents | id == "p45" | { code }"#).unwrap().rows[0]
+                    .get("code").and_then(|c| c.text()).unwrap().to_string();
+                let _ = db.run(&format!(r#"delete kids[pcode == "{code}"] cas each"#));
                 db.run(r#"delete parents[id == "p45"] cas each"#).unwrap();
             }
             assert!(cold.store.is_disk_backed("parents"), "overlay DML promoted parents");

@@ -289,7 +289,7 @@ pub(super) fn sync_dir(_dir: &Path) -> io::Result<()> {
 }
 
 // Best-effort physical allocation only; logical WAL bytes/length and sync stay unchanged.
-pub(super) fn reserve_wal_space(log: &File, additional: usize, empty_only: bool) {
+pub(crate) fn reserve_wal_space(log: &File, additional: usize, empty_only: bool) {
     #[cfg(target_vendor = "apple")]
     {
         use std::os::unix::{fs::MetadataExt, io::AsRawFd};

@@ -362,7 +362,7 @@ impl<'a> Transaction<'a> {
         } else if !matches!(self.undo, Undo::Append(_)) {
             self.ensure_undo_flags(&[], true, false);
         }
-        if !self.db.store.fts_deferred_doc_swaps.is_empty() {
+        if self.db.store.has_deferred_doc_ops() {
             self.db.store.flush_fts_deferred_docs();
         }
         if self.db.store.is_disk_backed(collection) {
@@ -540,7 +540,7 @@ impl<'a> Transaction<'a> {
         rec: crate::ast::Record,
         want_rows: bool,
     ) -> Result<Handle, Error> {
-        if !self.db.store.fts_deferred_doc_swaps.is_empty() {
+        if self.db.store.has_deferred_doc_ops() {
             self.db.store.flush_fts_deferred_docs();
         }
         if self.db.store.can_apply_disk_overlay(&collection) {
@@ -881,7 +881,7 @@ impl<'a> Transaction<'a> {
             && self.has_cold_write_target(stmts)
             && (stmts.len() == 1 || !self.disk_savepoint)
         {
-            if !self.db.store.fts_deferred_doc_swaps.is_empty() {
+            if self.db.store.has_deferred_doc_ops() {
                 self.db.store.flush_fts_deferred_docs();
             }
             let had_sp = self.disk_savepoint;
@@ -1028,7 +1028,7 @@ impl<'a> Transaction<'a> {
                 if !pd.append_only && !pd.cas_each && pd.cas.is_none() {
                     return Err(Error::runtime("delete requires cas"));
                 }
-                if !self.db.store.fts_deferred_doc_swaps.is_empty() {
+                if self.db.store.has_deferred_doc_ops() {
                     self.db.store.flush_fts_deferred_docs();
                 }
                 let had_sp = self.disk_savepoint;
@@ -1066,7 +1066,7 @@ impl<'a> Transaction<'a> {
                 if !pu.cas_each && pu.cas.is_none() {
                     return Err(Error::runtime("update requires cas"));
                 }
-                if !self.db.store.fts_deferred_doc_swaps.is_empty() {
+                if self.db.store.has_deferred_doc_ops() {
                     self.db.store.flush_fts_deferred_docs();
                 }
                 let had_sp = self.disk_savepoint;
@@ -1098,7 +1098,7 @@ impl<'a> Transaction<'a> {
             if self.has_cold_write_target(&prep.stmts)
                 && (prep.stmts.len() == 1 || !self.disk_savepoint)
             {
-                if !self.db.store.fts_deferred_doc_swaps.is_empty() {
+                if self.db.store.has_deferred_doc_ops() {
                     self.db.store.flush_fts_deferred_docs();
                 }
                 let had_sp = self.disk_savepoint;
@@ -1399,7 +1399,7 @@ impl Db {
         base_gen: u64,
         want_rows: bool,
     ) -> Result<(Handle, Option<Pack>, bool), Error> {
-        if !self.store.fts_deferred_doc_swaps.is_empty() {
+        if self.store.has_deferred_doc_ops() {
             self.store.flush_fts_deferred_docs();
         }
         if let Some(pg) = &prepared.point_get {

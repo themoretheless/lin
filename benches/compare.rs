@@ -1914,9 +1914,14 @@ fn seed_lin_cold(n: usize) -> LinColdWarm {
         lin_hits(&filter_range.run(&mut db).expect("lin cold filter_range sanity")),
         (n / 2) as i64
     );
+    let expected_substr = if std::env::var_os("LIN_BENCH_MIXED_CASE").is_some() {
+        0
+    } else {
+        n.div_ceil(10) as i64
+    };
     assert_eq!(
         lin_hits(&text_substr.run(&mut db).expect("lin cold text_substr sanity")),
-        n.div_ceil(10) as i64
+        expected_substr
     );
     assert_eq!(
         range_project

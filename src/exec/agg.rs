@@ -1244,17 +1244,42 @@ impl Db {
                             let fk = field.as_str();
                             let mut entries: Vec<(Cell, f64)> = map.into_iter().collect();
                             entries.sort_unstable_by(|(a, _), (b, _)| cmp_sort(a, b));
-                            return Ok(Some(
-                                entries
-                                    .into_iter()
-                                    .map(|(cell, n)| {
-                                        let mut row = crate::store::acquire_row();
-                                        row.insert(bk.clone(), cell);
-                                        row.insert(fk.clone(), Cell::Float(n));
-                                        row
-                                    })
-                                    .collect(),
-                            ));
+                            let rows = match bk.cmp(&fk) {
+                                std::cmp::Ordering::Less => {
+                                    let shape = Row::shape_of(&[bk.as_str(), fk.as_str()]);
+                                    entries
+                                        .into_iter()
+                                        .map(|(cell, n)| {
+                                            Row::from_parts(
+                                                Arc::clone(&shape),
+                                                [cell, Cell::Float(n)],
+                                            )
+                                        })
+                                        .collect()
+                                }
+                                std::cmp::Ordering::Greater => {
+                                    let shape = Row::shape_of(&[fk.as_str(), bk.as_str()]);
+                                    entries
+                                        .into_iter()
+                                        .map(|(cell, n)| {
+                                            Row::from_parts(
+                                                Arc::clone(&shape),
+                                                [Cell::Float(n), cell],
+                                            )
+                                        })
+                                        .collect()
+                                }
+                                std::cmp::Ordering::Equal => {
+                                    let shape = Row::shape_of(&[fk.as_str()]);
+                                    entries
+                                        .into_iter()
+                                        .map(|(_, n)| {
+                                            Row::from_parts(Arc::clone(&shape), [Cell::Float(n)])
+                                        })
+                                        .collect()
+                                }
+                            };
+                            return Ok(Some(rows));
                         }
                     }
                 }

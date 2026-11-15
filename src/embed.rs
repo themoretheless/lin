@@ -176,39 +176,74 @@ impl Embedder for HashingEmbedder {
 }
 
 #[inline]
-pub(crate) fn embed_texts_hashing(dim: usize, texts: [Option<&str>; 3]) -> Arc<[f32]> {
+pub(crate) fn with_hashing_scratch<R>(dim: usize, f: impl FnOnce(&mut HashingBatch) -> R) -> R {
     EMBED_SCRATCH.with(|cell| {
         let mut guard = cell.borrow_mut();
         let (scratch, lower, text_buf) = &mut *guard;
         scratch.ensure_dim(dim);
-        let dummy = HashingEmbedder {
-            id: String::new(),
-            dim,
+        let mut batch = HashingBatch {
+            embedder: HashingEmbedder {
+                id: String::new(),
+                dim,
+            },
+            scratch,
+            lower,
+            text_buf,
         };
-        let bytes = texts.iter().flatten().map(|t| t.len()).sum::<usize>();
+        f(&mut batch)
+    })
+}
+
+pub(crate) struct HashingBatch<'a> {
+    embedder: HashingEmbedder,
+    scratch: &'a mut Scratch,
+    lower: &'a mut String,
+    text_buf: &'a mut String,
+}
+
+impl HashingBatch<'_> {
+    #[inline]
+    pub(crate) fn embed_parts(&mut self, texts: [Option<&str>; 3]) -> Arc<[f32]> {
+        let bytes: usize = texts.iter().flatten().map(|t| t.len()).sum();
         if bytes == 0 {
-            return scratch.finish();
+            return self.scratch.finish();
         }
         if let Some(first) = texts.iter().position(|t| t.is_some_and(|s| !s.is_empty()))
             && texts[first + 1..].iter().all(Option::is_none)
         {
-            dummy.fill(
-                scratch,
-                crate::fts::lowercased(texts[first].unwrap(), lower),
+            self.embedder.fill(
+                self.scratch,
+                crate::fts::lowercased(texts[first].unwrap(), self.lower),
             );
-            return scratch.finish();
+            return self.scratch.finish();
         }
-        text_buf.clear();
-        text_buf.reserve(bytes + 2);
-        for text in texts.into_iter().flatten() {
-            if !text_buf.is_empty() {
-                text_buf.push(' ');
+        if texts.iter().flatten().all(|t| t.is_ascii()) {
+            self.lower.clear();
+            self.lower.reserve(bytes + 2);
+            for text in texts.into_iter().flatten() {
+                if !self.lower.is_empty() {
+                    self.lower.push(' ');
+                }
+                self.lower.push_str(text);
             }
-            text_buf.push_str(text);
+            self.lower.make_ascii_lowercase();
+            self.embedder.fill(self.scratch, self.lower);
+            return self.scratch.finish();
         }
-        dummy.fill(scratch, crate::fts::lowercased(text_buf, lower));
-        scratch.finish()
-    })
+        self.text_buf.clear();
+        self.text_buf.reserve(bytes + 2);
+        for text in texts.into_iter().flatten() {
+            if !self.text_buf.is_empty() {
+                self.text_buf.push(' ');
+            }
+            self.text_buf.push_str(text);
+        }
+        self.embedder.fill(
+            self.scratch,
+            crate::fts::lowercased(self.text_buf, self.lower),
+        );
+        self.scratch.finish()
+    }
 }
 
 struct EmbedInPlaceJob {
@@ -228,7 +263,7 @@ fn embed_rows_in_place_pooled(dim: usize, rows: &mut [crate::store::Row]) -> boo
         let threads = std::thread::available_parallelism()
             .map(|p| p.get())
             .unwrap_or(1)
-            .min(4);
+            .min(8);
         if threads <= 1 {
             return std::sync::Mutex::new(None);
         }
@@ -275,8 +310,8 @@ fn embed_rows_in_place_pooled(dim: usize, rows: &mut [crate::store::Row]) -> boo
     let Some(pool) = guard.as_ref() else {
         return false;
     };
-    let total_ways = pool.workers.len() + 1;
     let n = rows.len();
+    let total_ways = (pool.workers.len() + 1).min(n.div_ceil(128)).max(1);
     let chunk_size = (n + total_ways - 1) / total_ways;
     let mut chunks = rows.chunks_mut(chunk_size);
     let Some(first_chunk) = chunks.next() else {
@@ -428,7 +463,6 @@ thread_local! {
 /// a batch reuses one allocation and normalizes only its own features.
 struct Scratch {
     v: Vec<f32>,
-    seen: Vec<bool>,
     touched: Vec<u32>,
 }
 
@@ -436,7 +470,6 @@ impl Scratch {
     fn new(dim: usize) -> Self {
         Self {
             v: vec![0f32; dim],
-            seen: vec![false; dim],
             touched: Vec::with_capacity(dim / 4),
         }
     }
@@ -444,7 +477,6 @@ impl Scratch {
     fn ensure_dim(&mut self, dim: usize) {
         if self.v.len() != dim {
             self.v = vec![0f32; dim];
-            self.seen = vec![false; dim];
             self.touched.clear();
         }
     }
@@ -479,12 +511,12 @@ impl Scratch {
 
     #[inline]
     fn bump_slot(&mut self, i: usize, w: f32) {
-        let i = i as u32;
-        if !self.seen[i as usize] {
-            self.seen[i as usize] = true;
-            self.touched.push(i);
+        let cur = self.v[i];
+        // All feature weights (1.0, 0.5, 0.25) are strictly > 0, so a slot's bits are 0 iff untouched.
+        if cur.to_bits() == 0 {
+            self.touched.push(i as u32);
         }
-        self.v[i as usize] += w;
+        self.v[i] = cur + w;
     }
 
     /// L2-normalize and hand out the vector. Untouched slots are exact `0.0`, so
@@ -519,7 +551,6 @@ impl Scratch {
         let out = Arc::from(&self.v[..]);
         for &i in &self.touched {
             self.v[i as usize] = 0.0;
-            self.seen[i as usize] = false;
         }
         self.touched.clear();
         out
@@ -1844,7 +1875,6 @@ mod tests {
             for (k, q) in quarters.iter().enumerate() {
                 let i = (k * 37 + 19) % 768;
                 scratch.v[i] = *q as f32 / 4.0;
-                scratch.seen[i] = true;
                 scratch.touched.push(i as u32);
             }
             scratch.touched.reverse();

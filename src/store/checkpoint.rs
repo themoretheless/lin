@@ -499,6 +499,7 @@ impl Store {
             retired_doc_ids: smallvec::SmallVec::new(),
             retired_arcs: smallvec::SmallVec::new(),
             fts_deferred_doc_swaps: smallvec::SmallVec::new(),
+            deferred_doc_wing_updates: smallvec::SmallVec::new(),
             retired_rows: smallvec::SmallVec::new(),
             retired_cells: smallvec::SmallVec::new(),
             orders_id: Vec::new(),

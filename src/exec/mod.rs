@@ -676,7 +676,7 @@ impl Db {
             self.store.edges.len(),
             self.store.facts_len(),
         );
-        if self.store.fts_deferred_doc_swaps.is_empty()
+        if !self.store.has_deferred_doc_ops()
             && let Some((k, cached)) = &self.reader_cache
             && *k == cache_key
         {
@@ -1232,6 +1232,7 @@ impl Db {
         if rows.is_empty() {
             return Err(Error::runtime("delete: no matching row"));
         }
+        self.ensure_not_referenced(collection, &rows)?;
         if !append_only && cas_each {
             if let Some(written) = cas_written.as_deref() {
                 for row in &rows {
@@ -1634,21 +1635,50 @@ impl Db {
         plan: &Arc<Plan>,
         want_rows: bool,
     ) -> Result<Handle, Error> {
-        let Some(row) = self
-            .store
-            .disk_point_row(&pd.collection, &pd.field, &pd.key)
-        else {
-            return Err(Error::runtime("delete: no matching row"));
-        };
-        if !pd.append_only && !pd.cas_each {
-            let got = row_text(&row, "hash").unwrap_or("");
-            let cas = pd.cas.as_deref().unwrap_or("");
-            if got != cas {
-                return Err(Error::runtime(format!(
-                    "cas mismatch: expected {cas:?}, found {got:?}"
-                )));
+        let has_incoming_fk = self
+            .catalog
+            .fks
+            .iter()
+            .any(|fk| fk.to_col == pd.collection);
+        let can_id_only = !want_rows
+            && pd.field == "id"
+            && (pd.append_only || pd.cas_each)
+            && !has_incoming_fk
+            && self.store.is_native_disk()
+            && self.cold_program_packs.is_none()
+            && !self.store.fts.contains_key(&pd.collection);
+        let row = if can_id_only {
+            let Some(found) = self
+                .store
+                .disk_engine_read()
+                .and_then(|eng| {
+                    eng.get_projected_by_id(&pd.collection, &pd.key, &["id"])
+                        .ok()
+                        .flatten()
+                })
+            else {
+                return Err(Error::runtime("delete: no matching row"));
+            };
+            found
+        } else {
+            let Some(row) = self
+                .store
+                .disk_point_row(&pd.collection, &pd.field, &pd.key)
+            else {
+                return Err(Error::runtime("delete: no matching row"));
+            };
+            if !pd.append_only && !pd.cas_each {
+                let got = row_text(&row, "hash").unwrap_or("");
+                let cas = pd.cas.as_deref().unwrap_or("");
+                if got != cas {
+                    return Err(Error::runtime(format!(
+                        "cas mismatch: expected {cas:?}, found {got:?}"
+                    )));
+                }
             }
-        }
+            self.ensure_not_referenced(&pd.collection, std::slice::from_ref(&row))?;
+            row
+        };
         let pack = Pack::Delete {
             collection: pd.collection.clone(),
             rows: vec![row],
@@ -2257,7 +2287,15 @@ impl Db {
                 "follower: read-only — apply_wal for replication, open primary for writes",
             ));
         }
-        if prepared.point_delete.is_none() && !self.store.fts_deferred_doc_swaps.is_empty() {
+        let can_coalesce_wing_update = prepared
+            .point_update
+            .as_ref()
+            .is_some_and(|pu| pu.is_docs_wing_only)
+            && self.store.deferred_doc_wing_updates.len()
+                < self.store.deferred_doc_wing_updates.inline_size();
+        if (prepared.point_delete.is_none() && !self.store.fts_deferred_doc_swaps.is_empty())
+            || (!self.store.deferred_doc_wing_updates.is_empty() && !can_coalesce_wing_update)
+        {
             self.store.flush_fts_deferred_docs();
         }
         // A search over a cold collection whose full-text index an earlier write dropped:
@@ -2431,6 +2469,7 @@ impl Db {
                     collections,
                     indexes,
                     retired_cells,
+                    deferred_doc_wing_updates,
                     ..
                 } = &mut self.store;
                 let docs_col = collections.get_mut(&pu.collection).unwrap();
@@ -2458,9 +2497,13 @@ impl Db {
                     (cell, arc)
                 };
                 let mut has_complex_idx = false;
+                let mut has_unique_idx = false;
                 let mut needs_ts = false;
                 for live_idx in indexes.values() {
                     if live_idx.def.collection == pu.collection {
+                        if live_idx.def.unique {
+                            has_unique_idx = true;
+                        }
                         if live_idx.def.pred.is_none()
                             && live_idx.def.fields.len() == 1
                             && live_idx.def.fields[0] == "wing"
@@ -2520,42 +2563,57 @@ impl Db {
                         }
                     }
                 } else if !same_wing {
-                    for live_idx in indexes.values_mut() {
-                        if live_idx.def.collection == pu.collection {
-                            if live_idx.def.fields.len() == 1 && live_idx.def.fields[0] == "wing" {
-                                let old_k = Some(crate::index::LiveIndex::single_cell_key(
-                                    prev_cell.as_ref().unwrap_or(&Cell::Null),
-                                ));
-                                let new_k = Some(crate::index::LiveIndex::single_cell_key(
-                                    &Cell::Text(Arc::clone(&wing_arc)),
-                                ));
-                                if let Err(e) = live_idx.update_keys(idx, old_k, new_k) {
-                                    if let Some(prev) = prev_cell {
-                                        row.insert("wing".to_string(), prev);
-                                    } else {
-                                        row.remove("wing");
+                    if large_table
+                        && !has_unique_idx
+                        && deferred_doc_wing_updates.len()
+                            < deferred_doc_wing_updates.inline_size()
+                    {
+                        deferred_doc_wing_updates.push(crate::store::DeferredDocWingUpdate {
+                            idx,
+                            prev_wing: prev_cell.clone().unwrap_or(Cell::Null),
+                            new_wing: Arc::clone(&wing_arc),
+                            ts: ts_cell,
+                        });
+                    } else {
+                        for live_idx in indexes.values_mut() {
+                            if live_idx.def.collection == pu.collection {
+                                if live_idx.def.fields.len() == 1
+                                    && live_idx.def.fields[0] == "wing"
+                                {
+                                    let old_k = Some(crate::index::LiveIndex::single_cell_key(
+                                        prev_cell.as_ref().unwrap_or(&Cell::Null),
+                                    ));
+                                    let new_k = Some(crate::index::LiveIndex::single_cell_key(
+                                        &Cell::Text(Arc::clone(&wing_arc)),
+                                    ));
+                                    if let Err(e) = live_idx.update_keys(idx, old_k, new_k) {
+                                        if let Some(prev) = prev_cell {
+                                            row.insert("wing".to_string(), prev);
+                                        } else {
+                                            row.remove("wing");
+                                        }
+                                        return Err(Error::runtime(e));
                                     }
-                                    return Err(Error::runtime(e));
-                                }
-                            } else if live_idx.def.fields.len() == 2
-                                && live_idx.def.fields[0] == "wing"
-                                && live_idx.def.fields[1] == "ts"
-                            {
-                                let old_k = Some(crate::index::LiveIndex::two_cell_key(
-                                    prev_cell.as_ref().unwrap_or(&Cell::Null),
-                                    &ts_cell,
-                                ));
-                                let new_k = Some(crate::index::LiveIndex::two_cell_key(
-                                    &Cell::Text(Arc::clone(&wing_arc)),
-                                    &ts_cell,
-                                ));
-                                if let Err(e) = live_idx.update_keys(idx, old_k, new_k) {
-                                    if let Some(prev) = prev_cell {
-                                        row.insert("wing".to_string(), prev);
-                                    } else {
-                                        row.remove("wing");
+                                } else if live_idx.def.fields.len() == 2
+                                    && live_idx.def.fields[0] == "wing"
+                                    && live_idx.def.fields[1] == "ts"
+                                {
+                                    let old_k = Some(crate::index::LiveIndex::two_cell_key(
+                                        prev_cell.as_ref().unwrap_or(&Cell::Null),
+                                        &ts_cell,
+                                    ));
+                                    let new_k = Some(crate::index::LiveIndex::two_cell_key(
+                                        &Cell::Text(Arc::clone(&wing_arc)),
+                                        &ts_cell,
+                                    ));
+                                    if let Err(e) = live_idx.update_keys(idx, old_k, new_k) {
+                                        if let Some(prev) = prev_cell {
+                                            row.insert("wing".to_string(), prev);
+                                        } else {
+                                            row.remove("wing");
+                                        }
+                                        return Err(Error::runtime(e));
                                     }
-                                    return Err(Error::runtime(e));
                                 }
                             }
                         }
@@ -3365,7 +3423,7 @@ impl Db {
             // Every cell is null: a record of absent fields; let the statement path decide.
             return Ok(None);
         };
-        if !self.store.fts_deferred_doc_swaps.is_empty() {
+        if self.store.has_deferred_doc_ops() {
             self.store.flush_fts_deferred_docs();
         }
         let mut rows = batch.to_rows();
@@ -3482,7 +3540,7 @@ impl Db {
         let fields = self.declared_cols.get(name)?;
         if self.store.is_disk_backed(name)
             || (name == "facts" && self.store.facts_rows_stale)
-            || (name == "docs" && !self.store.fts_deferred_doc_swaps.is_empty())
+            || (name == "docs" && self.store.has_deferred_doc_ops())
         {
             return None;
         }
@@ -3511,6 +3569,9 @@ impl Db {
 
     /// Begin an interactive ACID transaction.
     pub fn transaction(&mut self) -> Result<Transaction<'_>, Error> {
+        if self.store.has_deferred_doc_ops() {
+            self.store.flush_fts_deferred_docs();
+        }
         let base_gen = self.store.r#gen;
         let base_next_id = self.store.next_id;
         Ok(Transaction {
@@ -4133,9 +4194,11 @@ impl Db {
             {
                 if let Some(ref fs) = names {
                     for row in &mut rows {
-                        for f in fs {
-                            if !row.contains_key(f.as_str()) {
-                                row.insert(f.clone(), Cell::Null);
+                        if row.len() < fs.len() {
+                            for f in fs {
+                                if !row.contains_key(f.as_str()) {
+                                    row.insert(f.clone(), Cell::Null);
+                                }
                             }
                         }
                     }

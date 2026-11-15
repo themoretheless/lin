@@ -15,6 +15,15 @@ pub struct Validity {
 }
 
 impl Validity {
+    #[inline]
+    pub(crate) fn all_valid(n: usize) -> Self {
+        Self {
+            words: Vec::new(),
+            len: n,
+            nulls: 0,
+        }
+    }
+
     fn all_null(n: usize) -> Self {
         Self {
             words: if n == 0 { Vec::new() } else { vec![0; n.div_ceil(64)] },
@@ -295,6 +304,122 @@ impl Column {
         }
     }
 
+    #[inline]
+    pub(crate) fn from_ints(vals: Vec<i64>) -> Self {
+        let len = vals.len();
+        Column::Int {
+            vals,
+            valid: Validity::all_valid(len),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn from_floats(vals: Vec<f64>) -> Self {
+        let len = vals.len();
+        Column::Float {
+            vals,
+            valid: Validity::all_valid(len),
+        }
+    }
+
+    pub(crate) fn gather(&self, indices: &[u32]) -> Self {
+        let n = indices.len();
+        match self {
+            Column::Nulls { .. } => Column::Nulls { n, cap: n },
+            Column::Int { vals, valid } => {
+                if valid.null_count() == 0 {
+                    Column::Int {
+                        vals: indices.iter().map(|&i| vals[i as usize]).collect(),
+                        valid: Validity::all_valid(n),
+                    }
+                } else {
+                    let mut out_vals = Vec::with_capacity(n);
+                    let mut out_valid = Validity::default();
+                    for &i in indices {
+                        let idx = i as usize;
+                        out_vals.push(vals[idx]);
+                        out_valid.push(valid.is_valid(idx));
+                    }
+                    Column::Int {
+                        vals: out_vals,
+                        valid: out_valid,
+                    }
+                }
+            }
+            Column::Time { vals, valid } => {
+                if valid.null_count() == 0 {
+                    Column::Time {
+                        vals: indices.iter().map(|&i| vals[i as usize]).collect(),
+                        valid: Validity::all_valid(n),
+                    }
+                } else {
+                    let mut out_vals = Vec::with_capacity(n);
+                    let mut out_valid = Validity::default();
+                    for &i in indices {
+                        let idx = i as usize;
+                        out_vals.push(vals[idx]);
+                        out_valid.push(valid.is_valid(idx));
+                    }
+                    Column::Time {
+                        vals: out_vals,
+                        valid: out_valid,
+                    }
+                }
+            }
+            Column::Float { vals, valid } => {
+                if valid.null_count() == 0 {
+                    Column::Float {
+                        vals: indices.iter().map(|&i| vals[i as usize]).collect(),
+                        valid: Validity::all_valid(n),
+                    }
+                } else {
+                    let mut out_vals = Vec::with_capacity(n);
+                    let mut out_valid = Validity::default();
+                    for &i in indices {
+                        let idx = i as usize;
+                        out_vals.push(vals[idx]);
+                        out_valid.push(valid.is_valid(idx));
+                    }
+                    Column::Float {
+                        vals: out_vals,
+                        valid: out_valid,
+                    }
+                }
+            }
+            Column::Bool { vals, valid } => {
+                if valid.null_count() == 0 {
+                    Column::Bool {
+                        vals: indices.iter().map(|&i| vals[i as usize]).collect(),
+                        valid: Validity::all_valid(n),
+                    }
+                } else {
+                    let mut out_vals = Vec::with_capacity(n);
+                    let mut out_valid = Validity::default();
+                    for &i in indices {
+                        let idx = i as usize;
+                        out_vals.push(vals[idx]);
+                        out_valid.push(valid.is_valid(idx));
+                    }
+                    Column::Bool {
+                        vals: out_vals,
+                        valid: out_valid,
+                    }
+                }
+            }
+            Column::Cells(c) => Column::Cells(
+                indices
+                    .iter()
+                    .map(|&i| c[i as usize].clone_for_borrow())
+                    .collect(),
+            ),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn permute_in_place(&mut self, perm: &[u32]) {
+        *self = self.gather(perm);
+    }
+
     pub fn reserve(&mut self, additional: usize) {
         match self {
             Column::Nulls { n, cap } => *cap = (*cap).max(*n + additional),
@@ -534,6 +659,44 @@ impl RecordBatch {
         }
         let end = end.min(self.n());
         let n = end - start;
+        if self.names.len() == 2 && self.names[0] != self.names[1] {
+            let shape = Row::shape_of(&self.names);
+            let swap = self.names[0] > self.names[1];
+            let fill = |i: usize| -> Row {
+                let c0 = self.cols[0].get(i);
+                let c1 = self.cols[1].get(i);
+                Row::from_parts(Arc::clone(&shape), if swap { [c1, c0] } else { [c0, c1] })
+            };
+            if n >= 65536 {
+                let threads = std::thread::available_parallelism()
+                    .map(|p| p.get())
+                    .unwrap_or(1)
+                    .min(8)
+                    .min((n + 8191) / 8192);
+                if threads > 1 {
+                    let chunk_size = (n + threads - 1) / threads;
+                    let fill = &fill;
+                    let chunks: Vec<Vec<Row>> = std::thread::scope(|scope| {
+                        let mut handles = Vec::with_capacity(threads);
+                        for chunk_idx in 0..threads {
+                            let c_start = start + chunk_idx * chunk_size;
+                            if c_start >= end {
+                                break;
+                            }
+                            let c_end = (c_start + chunk_size).min(end);
+                            handles.push(scope.spawn(move || (c_start..c_end).map(fill).collect()));
+                        }
+                        handles.into_iter().map(|h| h.join().unwrap()).collect()
+                    });
+                    let mut out = Vec::with_capacity(n);
+                    for chunk in chunks {
+                        out.extend(chunk);
+                    }
+                    return out;
+                }
+            }
+            return (start..end).map(fill).collect();
+        }
         // One template row carries the shape; every output row is a clone of it with its
         // cells overwritten. `slots[c]` is where column `c` lands in field-name order.
         let template: Row = self

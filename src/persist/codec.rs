@@ -199,33 +199,50 @@ pub(super) fn append_sparse_iter_scalar<'a>(
             .ok()
             .and_then(|n| n.checked_add(1))
             .ok_or_else(|| io_err("sparse vector dimension overflow"))?;
-        buf.extend_from_slice(&dim.to_le_bytes());
-        let count_offset = buf.len();
-        buf.extend_from_slice(&0u32.to_le_bytes());
+        let max_bytes = emb
+            .len()
+            .checked_mul(8)
+            .and_then(|n| n.checked_add(8))
+            .ok_or_else(|| io_err("sparse vector size overflow"))?;
+        let base = buf.len();
+        buf.reserve(max_bytes);
         let mut count = 0u32;
-        for (block, values) in emb.chunks(8).enumerate() {
-            // Bitwise zero preserves negative zero and NaN payloads.
-            // Skip empty blocks without branching for each element.
-            if values
-                .iter()
-                .fold(0u32, |bits, value| bits | value.to_bits())
-                == 0
-            {
-                continue;
-            }
-            for (offset, value) in values.iter().enumerate() {
-                let bits = value.to_bits();
-                if bits != 0 {
-                    let index = (block * 8 + offset) as u32;
-                    let mut entry = [0u8; 8];
-                    entry[..4].copy_from_slice(&index.to_le_bytes());
-                    entry[4..].copy_from_slice(&bits.to_le_bytes());
-                    buf.extend_from_slice(&entry);
-                    count += 1;
+        unsafe {
+            let start_ptr = buf.as_mut_ptr().add(base);
+            std::ptr::copy_nonoverlapping(dim.to_le_bytes().as_ptr(), start_ptr, 4);
+            let mut cur = start_ptr.add(8);
+            for (block, values) in emb.chunks(8).enumerate() {
+                // Bitwise zero preserves negative zero and NaN payloads.
+                // Skip empty blocks without branching for each element.
+                if values
+                    .iter()
+                    .fold(0u32, |bits, value| bits | value.to_bits())
+                    == 0
+                {
+                    continue;
+                }
+                for (offset, value) in values.iter().enumerate() {
+                    let bits = value.to_bits();
+                    if bits != 0 {
+                        let index = (block * 8 + offset) as u32;
+                        #[cfg(target_endian = "little")]
+                        {
+                            let packed = (index as u64) | ((bits as u64) << 32);
+                            std::ptr::write_unaligned(cur as *mut u64, packed);
+                        }
+                        #[cfg(not(target_endian = "little"))]
+                        {
+                            std::ptr::copy_nonoverlapping(index.to_le_bytes().as_ptr(), cur, 4);
+                            std::ptr::copy_nonoverlapping(bits.to_le_bytes().as_ptr(), cur.add(4), 4);
+                        }
+                        cur = cur.add(8);
+                        count += 1;
+                    }
                 }
             }
+            std::ptr::copy_nonoverlapping(count.to_le_bytes().as_ptr(), start_ptr.add(4), 4);
+            buf.set_len(cur.offset_from(buf.as_ptr()) as usize);
         }
-        buf[count_offset..count_offset + 4].copy_from_slice(&count.to_le_bytes());
     }
     Ok(())
 }
@@ -271,31 +288,50 @@ pub(super) unsafe fn append_sparse_iter_neon<'a>(
             .ok()
             .and_then(|n| n.checked_add(1))
             .ok_or_else(|| io_err("sparse vector dimension overflow"))?;
-        buf.extend_from_slice(&dim.to_le_bytes());
-        let count_offset = buf.len();
-        buf.extend_from_slice(&0u32.to_le_bytes());
+        let max_bytes = emb
+            .len()
+            .checked_mul(8)
+            .and_then(|n| n.checked_add(8))
+            .ok_or_else(|| io_err("sparse vector size overflow"))?;
+        let base = buf.len();
+        buf.reserve(max_bytes);
         let mut count = 0u32;
-        for (block, values) in emb.chunks(8).enumerate() {
-            let mut mask = if values.len() == 8 {
-                unsafe { presence_mask8(values) }
-            } else {
-                values
-                    .iter()
-                    .enumerate()
-                    .fold(0u32, |m, (i, x)| m | (u32::from(x.to_bits() != 0) << i))
-            };
-            while mask != 0 {
-                let offset = mask.trailing_zeros() as usize;
-                let index = (block * 8 + offset) as u32;
-                let mut entry = [0u8; 8];
-                entry[..4].copy_from_slice(&index.to_le_bytes());
-                entry[4..].copy_from_slice(&values[offset].to_bits().to_le_bytes());
-                buf.extend_from_slice(&entry);
-                count += 1;
-                mask &= mask - 1;
+        unsafe {
+            let start_ptr = buf.as_mut_ptr().add(base);
+            std::ptr::copy_nonoverlapping(dim.to_le_bytes().as_ptr(), start_ptr, 4);
+            let mut cur = start_ptr.add(8);
+            for (block, values) in emb.chunks(8).enumerate() {
+                let mut mask = if values.len() == 8 {
+                    presence_mask8(values)
+                } else {
+                    values
+                        .iter()
+                        .enumerate()
+                        .fold(0u32, |m, (i, x)| m | (u32::from(x.to_bits() != 0) << i))
+                };
+                let base_idx = (block * 8) as u32;
+                while mask != 0 {
+                    let offset = mask.trailing_zeros() as usize;
+                    let index = base_idx + (offset as u32);
+                    let bits = values[offset].to_bits();
+                    #[cfg(target_endian = "little")]
+                    {
+                        let packed = (index as u64) | ((bits as u64) << 32);
+                        std::ptr::write_unaligned(cur as *mut u64, packed);
+                    }
+                    #[cfg(not(target_endian = "little"))]
+                    {
+                        std::ptr::copy_nonoverlapping(index.to_le_bytes().as_ptr(), cur, 4);
+                        std::ptr::copy_nonoverlapping(bits.to_le_bytes().as_ptr(), cur.add(4), 4);
+                    }
+                    cur = cur.add(8);
+                    count += 1;
+                    mask &= mask - 1;
+                }
             }
+            std::ptr::copy_nonoverlapping(count.to_le_bytes().as_ptr(), start_ptr.add(4), 4);
+            buf.set_len(cur.offset_from(buf.as_ptr()) as usize);
         }
-        buf[count_offset..count_offset + 4].copy_from_slice(&count.to_le_bytes());
     }
     Ok(())
 }
@@ -531,16 +567,14 @@ pub(crate) fn prepare_insert_columns_ext(
     uniform_keys: bool,
     mut bytes: Vec<u8>,
 ) -> PreparedInsert {
-    if rows.len() < 4096
-        && let Some((magic, fields)) = encode_insert_rows_direct_ext(
-            generation,
-            next_id,
-            collection,
-            rows,
-            uniform_keys,
-            &mut bytes,
-        )
-    {
+    if let Some((magic, fields)) = encode_insert_rows_direct_ext(
+        generation,
+        next_id,
+        collection,
+        rows,
+        uniform_keys,
+        &mut bytes,
+    ) {
         let n = rows.len() as u32;
         let checksum = compute_frame_checksum(&magic, &bytes);
         let pack = Pack::InsertCols {
@@ -680,11 +714,13 @@ pub(super) fn encode_insert_cols_v2(
     for col in cols {
         match col {
             ColData::Vec(v) => {
-                let dim = v
-                    .first()
-                    .and_then(|opt| opt.as_ref())
-                    .map_or(0, |vec| vec.len());
-                est_per_row = est_per_row.saturating_add(8 + dim * 4);
+                if let Some(first_v) = v.iter().find_map(|opt| opt.as_deref()) {
+                    let sparse_est = 8usize.saturating_add(
+                        count_non_zero_floats(first_v).saturating_mul(8),
+                    );
+                    let dense_est = 8usize.saturating_add(first_v.len().saturating_mul(4));
+                    est_per_row = est_per_row.saturating_add(sparse_est.min(dense_est));
+                }
             }
             ColData::Text(_) => est_per_row = est_per_row.saturating_add(16),
             ColData::Int(_) | ColData::Float(_) | ColData::Time(_) => {
@@ -1068,6 +1104,23 @@ fn rewrite_sparse_as_dictionary<'a>(
     Ok(true)
 }
 
+#[inline]
+pub(super) fn append_sparse_cells_range(
+    cells: &[*const Cell],
+    num_fields: usize,
+    fi: usize,
+    start_row: usize,
+    end_row: usize,
+    buf: &mut Vec<u8>,
+) -> Result<(), Error> {
+    // Safety: all pointers in `cells` borrow from `rows: &[Row]` live for the duration of `encode_insert_rows_direct_ext`.
+    let iter = (start_row..end_row).map(|ri| match unsafe { &*cells[ri * num_fields + fi] } {
+        Cell::Vec(emb) => Some(emb.as_ref()),
+        _ => None,
+    });
+    append_sparse_iter_serial(iter, buf)
+}
+
 pub(super) fn append_sparse_cells_serial(
     cells: &[*const Cell],
     num_fields: usize,
@@ -1075,12 +1128,200 @@ pub(super) fn append_sparse_cells_serial(
     num_rows: usize,
     buf: &mut Vec<u8>,
 ) -> Result<(), Error> {
-    // Safety: all pointers in `cells` borrow from `rows: &[Row]` live for the duration of `encode_insert_rows_direct_ext`.
-    let iter = (0..num_rows).map(|ri| match unsafe { &*cells[ri * num_fields + fi] } {
-        Cell::Vec(emb) => Some(emb.as_ref()),
-        _ => None,
+    append_sparse_cells_range(cells, num_fields, fi, 0, num_rows, buf)
+}
+
+struct SparseEncodeJob {
+    chunk_idx: usize,
+    cells_ptr: usize,
+    cells_len: usize,
+    num_fields: usize,
+    fi: usize,
+    start_row: usize,
+    end_row: usize,
+    buf: Vec<u8>,
+}
+
+struct SparseEncodePool {
+    workers: Vec<std::sync::mpsc::SyncSender<SparseEncodeJob>>,
+    done_rx: std::sync::mpsc::Receiver<(usize, Result<(), Error>, Vec<u8>)>,
+    reusable_bufs: Vec<Vec<u8>>,
+}
+
+pub(super) fn append_sparse_cells_parallel(
+    cells: &[*const Cell],
+    num_fields: usize,
+    fi: usize,
+    num_rows: usize,
+    buf: &mut Vec<u8>,
+) -> Result<(), Error> {
+    if num_rows < 512 {
+        return append_sparse_cells_serial(cells, num_fields, fi, num_rows, buf);
+    }
+    static POOL: std::sync::OnceLock<std::sync::Mutex<Option<SparseEncodePool>>> =
+        std::sync::OnceLock::new();
+    let mutex = POOL.get_or_init(|| {
+        let threads = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(1)
+            .min(8);
+        if threads <= 1 {
+            return std::sync::Mutex::new(None);
+        }
+        let num_workers = threads - 1;
+        let (done_tx, done_rx) =
+            std::sync::mpsc::sync_channel::<(usize, Result<(), Error>, Vec<u8>)>(num_workers);
+        let mut workers = Vec::with_capacity(num_workers);
+        let mut reusable_bufs = Vec::with_capacity(num_workers);
+        for idx in 0..num_workers {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<SparseEncodeJob>(1);
+            let done = done_tx.clone();
+            if std::thread::Builder::new()
+                .name(format!("lin-sparse-enc-{idx}"))
+                .spawn(move || {
+                    while let Ok(mut job) = rx.recv() {
+                        job.buf.clear();
+                        let slice = unsafe {
+                            std::slice::from_raw_parts(
+                                job.cells_ptr as *const *const Cell,
+                                job.cells_len,
+                            )
+                        };
+                        let res = append_sparse_cells_range(
+                            slice,
+                            job.num_fields,
+                            job.fi,
+                            job.start_row,
+                            job.end_row,
+                            &mut job.buf,
+                        );
+                        let _ = done.send((job.chunk_idx, res, job.buf));
+                    }
+                })
+                .is_ok()
+            {
+                workers.push(tx);
+                reusable_bufs.push(Vec::new());
+            }
+        }
+        if workers.is_empty() {
+            std::sync::Mutex::new(None)
+        } else {
+            std::sync::Mutex::new(Some(SparseEncodePool {
+                workers,
+                done_rx,
+                reusable_bufs,
+            }))
+        }
     });
-    append_sparse_iter_serial(iter, buf)
+
+    let Ok(mut guard) = mutex.try_lock() else {
+        return append_sparse_cells_serial(cells, num_fields, fi, num_rows, buf);
+    };
+    let Some(pool) = guard.as_mut() else {
+        return append_sparse_cells_serial(cells, num_fields, fi, num_rows, buf);
+    };
+    let total_ways = (pool.workers.len() + 1).min(num_rows.div_ceil(128)).max(1);
+    if total_ways <= 1 {
+        return append_sparse_cells_serial(cells, num_fields, fi, num_rows, buf);
+    }
+
+    let chunk_size = num_rows.div_ceil(total_ways);
+    let first_end = chunk_size.min(num_rows);
+
+    struct SparseDrainGuard<'a> {
+        done_rx: &'a std::sync::mpsc::Receiver<(usize, Result<(), Error>, Vec<u8>)>,
+        reusable_bufs: &'a mut Vec<Vec<u8>>,
+        pending: usize,
+    }
+    impl Drop for SparseDrainGuard<'_> {
+        fn drop(&mut self) {
+            while self.pending > 0 {
+                self.pending -= 1;
+                if let Ok((_, _, mut b)) = self.done_rx.recv() {
+                    b.clear();
+                    self.reusable_bufs.push(b);
+                }
+            }
+        }
+    }
+
+    let mut slots: smallvec::SmallVec<[Option<(Result<(), Error>, Vec<u8>)>; 8]> =
+        smallvec::SmallVec::from_elem(None, total_ways - 1);
+    let mut drain_guard = SparseDrainGuard {
+        done_rx: &pool.done_rx,
+        reusable_bufs: &mut pool.reusable_bufs,
+        pending: 0,
+    };
+    let mut dispatched = 0usize;
+    let mut fallback_start = first_end;
+    for chunk_idx in 1..total_ways {
+        let start_row = chunk_idx * chunk_size;
+        if start_row >= num_rows {
+            break;
+        }
+        let end_row = (start_row + chunk_size).min(num_rows);
+        let work_buf = drain_guard.reusable_bufs.pop().unwrap_or_default();
+        let job = SparseEncodeJob {
+            chunk_idx,
+            cells_ptr: cells.as_ptr() as usize,
+            cells_len: cells.len(),
+            num_fields,
+            fi,
+            start_row,
+            end_row,
+            buf: work_buf,
+        };
+        match pool.workers[chunk_idx - 1].send(job) {
+            Ok(()) => {
+                drain_guard.pending += 1;
+                dispatched += 1;
+                fallback_start = end_row;
+            }
+            Err(err) => {
+                let mut b = err.0.buf;
+                b.clear();
+                drain_guard.reusable_bufs.push(b);
+                break;
+            }
+        }
+    }
+
+    let first_res = append_sparse_cells_range(cells, num_fields, fi, 0, first_end, buf);
+
+    while drain_guard.pending > 0 {
+        drain_guard.pending -= 1;
+        if let Ok((cidx, res, b)) = drain_guard.done_rx.recv() {
+            if let Some(slot) = slots.get_mut(cidx - 1) {
+                *slot = Some((res, b));
+            } else {
+                let mut b = b;
+                b.clear();
+                drain_guard.reusable_bufs.push(b);
+            }
+        }
+    }
+
+    let mut out_res = first_res;
+    for slot in &mut slots[..dispatched] {
+        if let Some((res, mut chunk_buf)) = slot.take() {
+            if out_res.is_ok() {
+                if let Err(e) = res {
+                    out_res = Err(e);
+                } else {
+                    buf.extend_from_slice(&chunk_buf);
+                }
+            }
+            chunk_buf.clear();
+            drain_guard.reusable_bufs.push(chunk_buf);
+        }
+    }
+    drop(drain_guard);
+
+    if out_res.is_ok() && fallback_start < num_rows {
+        append_sparse_cells_range(cells, num_fields, fi, fallback_start, num_rows, buf)?;
+    }
+    out_res
 }
 
 pub(crate) fn encode_insert_rows_direct(
@@ -1120,7 +1361,7 @@ pub(crate) fn encode_insert_rows_direct_ext(
         Vec,
     }
     let mut col_types = smallvec::SmallVec::<[DirectColType; 8]>::with_capacity(num_fields);
-    let mut has_vec = false;
+    let mut est_vec_per_row = 0usize;
     for val in first.values() {
         let t = match val {
             Cell::Text(_) | Cell::SmallText(_) => DirectColType::Text,
@@ -1128,16 +1369,16 @@ pub(crate) fn encode_insert_rows_direct_ext(
             Cell::Float(_) => DirectColType::Float,
             Cell::Bool(_) => DirectColType::Bool,
             Cell::Time(_) => DirectColType::Time,
-            Cell::Vec(_) => {
-                has_vec = true;
+            Cell::Vec(emb) => {
+                let sparse_est =
+                    8usize.saturating_add(count_non_zero_floats(emb).saturating_mul(8));
+                let dense_est = 4usize.saturating_add(emb.len().saturating_mul(4));
+                est_vec_per_row = est_vec_per_row.saturating_add(sparse_est.min(dense_est));
                 DirectColType::Vec
             }
             _ => return None,
         };
         col_types.push(t);
-    }
-    if has_vec && rows.len() >= 4096 {
-        return None;
     }
 
     CELL_PTR_SCRATCH.with(|scratch| {
@@ -1164,7 +1405,9 @@ pub(crate) fn encode_insert_rows_direct_ext(
         let n = rows.len() as u32;
 
         buf.clear();
-        buf.reserve(64 + fields.len() * 16 + (rows.len() * num_fields * 32));
+        buf.reserve(
+            64 + fields.len() * 16 + rows.len() * (num_fields * 24 + est_vec_per_row),
+        );
         buf.push(V2_INSERT_COLS);
         buf.extend_from_slice(&rec_gen.to_le_bytes());
         buf.extend_from_slice(&next_id.to_le_bytes());
@@ -1263,7 +1506,7 @@ pub(crate) fn encode_insert_rows_direct_ext(
                         let mark = buf.len();
                         buf.push(7);
                         let payload_start = buf.len();
-                        if append_sparse_cells_serial(&cells, num_fields, fi, rows.len(), buf)
+                        if append_sparse_cells_parallel(&cells, num_fields, fi, rows.len(), buf)
                             .is_err()
                         {
                             buf.truncate(mark);

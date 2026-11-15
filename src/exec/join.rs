@@ -4,9 +4,10 @@ use std::sync::Arc;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::ast::{CmpOp, Field, Pred, Query, Source, Step, Value};
-use crate::batch::RecordBatch;
+use crate::batch::{Column, RecordBatch};
 use crate::error::Error;
 use crate::store::{Cell, Row, acquire_row};
+use crate::window::WindowFunction;
 
 use super::agg::cell_key;
 use super::{Db, field_names};
@@ -282,9 +283,11 @@ impl Db {
                     .query_filter(name, Some(pred), dict_limit, Some(&proj_refs), now)
                     .ok()?;
                 for row in &mut r {
-                    for f in &names {
-                        if !row.contains_key(f.as_str()) {
-                            row.insert(f.clone(), Cell::Null);
+                    if row.len() < names.len() {
+                        for f in &names {
+                            if !row.contains_key(f.as_str()) {
+                                row.insert(f.clone(), Cell::Null);
+                            }
                         }
                     }
                 }
@@ -388,7 +391,6 @@ impl Db {
         bindings: &BTreeMap<String, Vec<Row>>,
         now: i64,
     ) -> Option<RecordBatch> {
-        use crate::batch::Column;
         let Source::Collection(name) = &q.source else {
             return None;
         };
@@ -480,9 +482,291 @@ impl Db {
             explain: None,
             ignore_filter: q.ignore_filter,
         };
+#[inline]
+fn cmp_f64_sort(a: f64, b: f64) -> std::cmp::Ordering {
+    match a.partial_cmp(&b) {
+        Some(ord) => ord,
+        None => match (a.is_nan(), b.is_nan()) {
+            (true, true) => std::cmp::Ordering::Equal,
+            (true, false) => std::cmp::Ordering::Greater,
+            (false, true) => std::cmp::Ordering::Less,
+            (false, false) => std::cmp::Ordering::Equal,
+        },
+    }
+}
+
+#[inline]
+fn cmp_col_rows(col: &Column, r1: usize, r2: usize) -> std::cmp::Ordering {
+    match col {
+        Column::Nulls { .. } => std::cmp::Ordering::Equal,
+        Column::Int { vals, valid } | Column::Time { vals, valid } => {
+            if valid.null_count() == 0 {
+                vals[r1].cmp(&vals[r2])
+            } else {
+                match (valid.is_valid(r1), valid.is_valid(r2)) {
+                    (true, true) => vals[r1].cmp(&vals[r2]),
+                    (false, false) => std::cmp::Ordering::Equal,
+                    _ => super::eval::cmp_sort(&col.get(r1), &col.get(r2)),
+                }
+            }
+        }
+        Column::Float { vals, valid } => {
+            if valid.null_count() == 0 {
+                cmp_f64_sort(vals[r1], vals[r2])
+            } else {
+                match (valid.is_valid(r1), valid.is_valid(r2)) {
+                    (true, true) => cmp_f64_sort(vals[r1], vals[r2]),
+                    (false, false) => std::cmp::Ordering::Equal,
+                    _ => super::eval::cmp_sort(&col.get(r1), &col.get(r2)),
+                }
+            }
+        }
+        Column::Bool { vals, valid } => {
+            if valid.null_count() == 0 {
+                vals[r1].cmp(&vals[r2])
+            } else {
+                match (valid.is_valid(r1), valid.is_valid(r2)) {
+                    (true, true) => vals[r1].cmp(&vals[r2]),
+                    (false, false) => std::cmp::Ordering::Equal,
+                    _ => super::eval::cmp_sort(&col.get(r1), &col.get(r2)),
+                }
+            }
+        }
+        Column::Cells(c) => super::eval::cmp_sort(&c[r1], &c[r2]),
+    }
+}
+
+#[inline]
+fn mapped_row(seq_rows: Option<&[u32]>, pos: u32) -> usize {
+    match seq_rows {
+        Some(s) => s[pos as usize] as usize,
+        None => pos as usize,
+    }
+}
+
+fn sort_part_by_col(part: &mut [u32], col: &Column, desc: bool, seq_rows: Option<&[u32]>) {
+    match col {
+        Column::Nulls { .. } => {}
+        Column::Int { vals, valid } | Column::Time { vals, valid } if valid.null_count() == 0 => {
+            if desc {
+                part.sort_by(|&a, &b| {
+                    vals[mapped_row(seq_rows, b)].cmp(&vals[mapped_row(seq_rows, a)])
+                });
+            } else {
+                part.sort_by(|&a, &b| {
+                    vals[mapped_row(seq_rows, a)].cmp(&vals[mapped_row(seq_rows, b)])
+                });
+            }
+        }
+        Column::Float { vals, valid } if valid.null_count() == 0 => {
+            if desc {
+                part.sort_by(|&a, &b| {
+                    cmp_f64_sort(vals[mapped_row(seq_rows, b)], vals[mapped_row(seq_rows, a)])
+                });
+            } else {
+                part.sort_by(|&a, &b| {
+                    cmp_f64_sort(vals[mapped_row(seq_rows, a)], vals[mapped_row(seq_rows, b)])
+                });
+            }
+        }
+        Column::Cells(cells) => {
+            if desc {
+                part.sort_by(|&a, &b| {
+                    super::eval::cmp_sort(
+                        &cells[mapped_row(seq_rows, b)],
+                        &cells[mapped_row(seq_rows, a)],
+                    )
+                });
+            } else {
+                part.sort_by(|&a, &b| {
+                    super::eval::cmp_sort(
+                        &cells[mapped_row(seq_rows, a)],
+                        &cells[mapped_row(seq_rows, b)],
+                    )
+                });
+            }
+        }
+        _ => {
+            if desc {
+                part.sort_by(|&a, &b| {
+                    cmp_col_rows(col, mapped_row(seq_rows, b), mapped_row(seq_rows, a))
+                });
+            } else {
+                part.sort_by(|&a, &b| {
+                    cmp_col_rows(col, mapped_row(seq_rows, a), mapped_row(seq_rows, b))
+                });
+            }
+        }
+    }
+}
+
+fn sort_part(
+    part: &mut [u32],
+    cols: &[Column],
+    order_cols: &[(usize, bool)],
+    seq_rows: &[u32],
+) {
+    if part.len() <= 1 || order_cols.is_empty() {
+        return;
+    }
+    if let [(c, desc)] = *order_cols {
+        sort_part_by_col(part, &cols[c], desc, Some(seq_rows));
+        return;
+    }
+    // Stable, like the row sort.
+    part.sort_by(|&a, &b| {
+        let ra = seq_rows[a as usize] as usize;
+        let rb = seq_rows[b as usize] as usize;
+        for &(c, desc) in order_cols {
+            let ord = cmp_col_rows(&cols[c], ra, rb);
+            let ord = if desc { ord.reverse() } else { ord };
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+}
+
+fn partition_into(
+    cols: &[Column],
+    by_cols: &[usize],
+    seq_rows: &[u32],
+    n: usize,
+    bounds: &mut Vec<u32>,
+    flat: &mut Vec<u32>,
+) {
+    if by_cols.is_empty() {
+        flat.extend(0..n as u32);
+        bounds.extend([0, n as u32]);
+        return;
+    }
+    if n == 0 {
+        bounds.push(0);
+        return;
+    }
+    if let [c] = *by_cols
+        && matches!(&cols[c], Column::Nulls { .. })
+    {
+        flat.extend(0..n as u32);
+        bounds.extend([0, n as u32]);
+        return;
+    }
+
+    let mut slots: Vec<u32> = Vec::with_capacity(n);
+    let mut counts: Vec<u32> = Vec::new();
+    let mut assign = |slot: u32, counts: &mut Vec<u32>| {
+        if slot as usize == counts.len() {
+            counts.push(0);
+        }
+        counts[slot as usize] += 1;
+        slots.push(slot);
+    };
+
+    if let [c] = *by_cols {
+        match &cols[c] {
+            Column::Cells(cells) => {
+                let mut slot_of: FxHashMap<&Cell, u32> = FxHashMap::default();
+                for &r in seq_rows {
+                    let next = slot_of.len() as u32;
+                    let slot = *slot_of.entry(&cells[r as usize]).or_insert(next);
+                    assign(slot, &mut counts);
+                }
+            }
+            Column::Int { vals, valid } | Column::Time { vals, valid } => {
+                if valid.null_count() == 0 {
+                    let mut slot_of: FxHashMap<i64, u32> = FxHashMap::default();
+                    for &r in seq_rows {
+                        let next = slot_of.len() as u32;
+                        let slot = *slot_of.entry(vals[r as usize]).or_insert(next);
+                        assign(slot, &mut counts);
+                    }
+                } else {
+                    let mut slot_of: FxHashMap<Option<i64>, u32> = FxHashMap::default();
+                    for &r in seq_rows {
+                        let idx = r as usize;
+                        let key = valid.is_valid(idx).then_some(vals[idx]);
+                        let next = slot_of.len() as u32;
+                        let slot = *slot_of.entry(key).or_insert(next);
+                        assign(slot, &mut counts);
+                    }
+                }
+            }
+            Column::Bool { vals, valid } => {
+                let mut map = [u32::MAX; 3];
+                for &r in seq_rows {
+                    let idx = r as usize;
+                    let bucket = if !valid.is_valid(idx) {
+                        0
+                    } else if vals[idx] {
+                        2
+                    } else {
+                        1
+                    };
+                    if map[bucket] == u32::MAX {
+                        map[bucket] = counts.len() as u32;
+                    }
+                    assign(map[bucket], &mut counts);
+                }
+            }
+            col => {
+                let mut slot_of: FxHashMap<Cell, u32> = FxHashMap::default();
+                for &r in seq_rows {
+                    let next = slot_of.len() as u32;
+                    let slot = *slot_of.entry(col.get(r as usize)).or_insert(next);
+                    assign(slot, &mut counts);
+                }
+            }
+        }
+    } else if by_cols
+        .iter()
+        .all(|&c| matches!(&cols[c], Column::Cells(_)))
+    {
+        let mut slot_of: FxHashMap<smallvec::SmallVec<[&Cell; 2]>, u32> = FxHashMap::default();
+        for &r in seq_rows {
+            let idx = r as usize;
+            let key: smallvec::SmallVec<[&Cell; 2]> = by_cols
+                .iter()
+                .map(|&c| match &cols[c] {
+                    Column::Cells(cv) => &cv[idx],
+                    _ => unreachable!(),
+                })
+                .collect();
+            let next = slot_of.len() as u32;
+            let slot = *slot_of.entry(key).or_insert(next);
+            assign(slot, &mut counts);
+        }
+    } else {
+        let mut slot_of: FxHashMap<smallvec::SmallVec<[Cell; 2]>, u32> = FxHashMap::default();
+        for &r in seq_rows {
+            let idx = r as usize;
+            let key: smallvec::SmallVec<[Cell; 2]> =
+                by_cols.iter().map(|&c| cols[c].get(idx)).collect();
+            let next = slot_of.len() as u32;
+            let slot = *slot_of.entry(key).or_insert(next);
+            assign(slot, &mut counts);
+        }
+    }
+
+    bounds.reserve(counts.len() + 1);
+    let mut acc = 0u32;
+    for &c in &counts {
+        bounds.push(acc);
+        acc += c;
+    }
+    bounds.push(acc);
+    let mut next_at: Vec<u32> = bounds[..counts.len()].to_vec();
+    flat.resize(n, 0);
+    for (pos, &slot) in slots.iter().enumerate() {
+        let at = &mut next_at[slot as usize];
+        flat[*at as usize] = pos as u32;
+        *at += 1;
+    }
+}
+
         let batch = self.try_filter_project_batch(&base_q, bindings, now)?;
         let n = batch.n();
-        let cols: Vec<Vec<Cell>> = batch.cols.into_iter().map(Column::into_cells).collect();
+        let cols: Vec<Column> = batch.cols;
         let col_of = |f: &Field| -> Option<usize> {
             let leaf = f.leaf()?;
             base.iter().position(|b| b.leaf() == Some(leaf))
@@ -491,7 +775,7 @@ impl Db {
         static NULL: Cell = Cell::Null;
         // Current row sequence -> row of the base batch; window outputs follow the sequence.
         let mut seq_rows: Vec<u32> = (0..n as u32).collect();
-        let mut win_cols: Vec<Vec<Cell>> = Vec::with_capacity(windows.len());
+        let mut win_cols: Vec<Column> = Vec::with_capacity(windows.len());
         for w in &windows {
             let Step::Window {
                 func,
@@ -513,114 +797,147 @@ impl Db {
                 Some(f) => Some(col_of(f)?),
                 None => None,
             };
-            let cell = |c: usize, pos: u32| -> &Cell { &cols[c][seq_rows[pos as usize] as usize] };
 
             // Partitions in first-seen order, laid out back to back in one buffer (`flat`):
             // each row gets a partition slot, then a counting pass places positions, which
             // keeps the source order inside a partition.
             let mut bounds: Vec<u32> = Vec::new();
             let mut flat: Vec<u32> = Vec::with_capacity(n);
-            if by_cols.is_empty() {
-                flat.extend(0..n as u32);
-                bounds.extend([0, n as u32]);
-            } else {
-                let mut slots: Vec<u32> = Vec::with_capacity(n);
-                let mut counts: Vec<u32> = Vec::new();
-                let mut assign = |slot: u32, counts: &mut Vec<u32>| {
-                    if slot as usize == counts.len() {
-                        counts.push(0);
-                    }
-                    counts[slot as usize] += 1;
-                    slots.push(slot);
-                };
-                if let [c] = by_cols[..] {
-                    let mut slot_of: FxHashMap<&Cell, u32> = FxHashMap::default();
-                    for pos in 0..n as u32 {
-                        let next = slot_of.len() as u32;
-                        let slot = *slot_of.entry(cell(c, pos)).or_insert(next);
-                        assign(slot, &mut counts);
-                    }
-                } else {
-                    let mut slot_of: FxHashMap<smallvec::SmallVec<[&Cell; 2]>, u32> =
-                        FxHashMap::default();
-                    for pos in 0..n as u32 {
-                        let key: smallvec::SmallVec<[&Cell; 2]> =
-                            by_cols.iter().map(|&c| cell(c, pos)).collect();
-                        let next = slot_of.len() as u32;
-                        let slot = *slot_of.entry(key).or_insert(next);
-                        assign(slot, &mut counts);
-                    }
-                }
-                bounds.reserve(counts.len() + 1);
-                let mut acc = 0u32;
-                for &c in &counts {
-                    bounds.push(acc);
-                    acc += c;
-                }
-                bounds.push(acc);
-                let mut next_at: Vec<u32> = bounds[..counts.len()].to_vec();
-                flat.resize(n, 0);
-                for (pos, &slot) in slots.iter().enumerate() {
-                    let at = &mut next_at[slot as usize];
-                    flat[*at as usize] = pos as u32;
-                    *at += 1;
-                }
-            }
+            partition_into(&cols, &by_cols, &seq_rows, n, &mut bounds, &mut flat);
 
-            let mut out: Vec<Cell> = Vec::with_capacity(n);
-            let mut ties: Vec<bool> = Vec::new();
-            let mut tv: Vec<&Cell> = Vec::new();
             let has_order = !order_cols.is_empty();
-            for range in bounds.windows(2) {
-                let part = &mut flat[range[0] as usize..range[1] as usize];
-                if has_order && part.len() > 1 {
-                    // Stable, like the row sort.
-                    part.sort_by(|&a, &b| {
-                        for &(c, desc) in &order_cols {
-                            let ord = super::eval::cmp_sort(cell(c, a), cell(c, b));
-                            let ord = if desc { ord.reverse() } else { ord };
-                            if ord != std::cmp::Ordering::Equal {
-                                return ord;
+            let win_col = if matches!(func, WindowFunction::RowNumber)
+                || (matches!(func, WindowFunction::Rank | WindowFunction::DenseRank) && has_order)
+            {
+                let mut out_i64: Vec<i64> = Vec::with_capacity(n);
+                for range in bounds.windows(2) {
+                    let part = &mut flat[range[0] as usize..range[1] as usize];
+                    sort_part(part, &cols, &order_cols, &seq_rows);
+                    if part.is_empty() {
+                        continue;
+                    }
+                    match func {
+                        WindowFunction::RowNumber => {
+                            out_i64.extend(1..=part.len() as i64);
+                        }
+                        WindowFunction::Rank => {
+                            let mut rank = 1i64;
+                            out_i64.push(1);
+                            for i in 1..part.len() {
+                                let r_prev = seq_rows[part[i - 1] as usize] as usize;
+                                let r_cur = seq_rows[part[i] as usize] as usize;
+                                let tied = order_cols.iter().all(|&(c, _)| {
+                                    cmp_col_rows(&cols[c], r_prev, r_cur)
+                                        == std::cmp::Ordering::Equal
+                                });
+                                if !tied {
+                                    rank = (i + 1) as i64;
+                                }
+                                out_i64.push(rank);
                             }
                         }
-                        std::cmp::Ordering::Equal
-                    });
-                }
-                ties.clear();
-                if has_order && part.len() > 1 {
-                    ties.push(false);
-                    for w2 in part.windows(2) {
-                        ties.push(order_cols.iter().all(|&(c, _)| {
-                            super::eval::cmp_sort(cell(c, w2[0]), cell(c, w2[1]))
-                                == std::cmp::Ordering::Equal
-                        }));
+                        WindowFunction::DenseRank => {
+                            let mut dense = 1i64;
+                            out_i64.push(1);
+                            for i in 1..part.len() {
+                                let r_prev = seq_rows[part[i - 1] as usize] as usize;
+                                let r_cur = seq_rows[part[i] as usize] as usize;
+                                let tied = order_cols.iter().all(|&(c, _)| {
+                                    cmp_col_rows(&cols[c], r_prev, r_cur)
+                                        == std::cmp::Ordering::Equal
+                                });
+                                if !tied {
+                                    dense += 1;
+                                }
+                                out_i64.push(dense);
+                            }
+                        }
+                        _ => unreachable!(),
                     }
                 }
-                tv.clear();
-                match target_col {
-                    Some(c) => tv.extend(part.iter().map(|&pos| cell(c, pos))),
-                    None => tv.resize(part.len(), &NULL),
+                Column::from_ints(out_i64)
+            } else if matches!(func, WindowFunction::Sum)
+                && frame.is_none()
+                && n > 0
+                && let Some(c) = target_col
+                && let Column::Float { vals, valid } = &cols[c]
+                && valid.null_count() == 0
+            {
+                let mut out_f64: Vec<f64> = Vec::with_capacity(n);
+                for range in bounds.windows(2) {
+                    let part = &mut flat[range[0] as usize..range[1] as usize];
+                    sort_part(part, &cols, &order_cols, &seq_rows);
+                    if has_order {
+                        let mut acc = 0.0f64;
+                        for &pos in part.iter() {
+                            acc += vals[seq_rows[pos as usize] as usize];
+                            out_f64.push(acc);
+                        }
+                    } else {
+                        let mut acc = 0.0f64;
+                        for &pos in part.iter() {
+                            acc += vals[seq_rows[pos as usize] as usize];
+                        }
+                        out_f64.resize(out_f64.len() + part.len(), acc);
+                    }
                 }
-                out.extend(super::eval::window_values(
-                    func,
-                    &tv,
-                    &ties,
-                    has_order,
-                    target_col.is_some(),
-                    frame.as_ref(),
-                ));
-            }
+                Column::from_floats(out_f64)
+            } else {
+                let owned_target: Option<Vec<Cell>> = match target_col {
+                    Some(c) if !matches!(&cols[c], Column::Cells(_)) => {
+                        Some((0..n).map(|i| cols[c].get(i)).collect())
+                    }
+                    _ => None,
+                };
+                let mut out: Vec<Cell> = Vec::with_capacity(n);
+                let mut ties: Vec<bool> = Vec::new();
+                let mut tv: Vec<&Cell> = Vec::new();
+                for range in bounds.windows(2) {
+                    let part = &mut flat[range[0] as usize..range[1] as usize];
+                    sort_part(part, &cols, &order_cols, &seq_rows);
+                    ties.clear();
+                    if has_order && part.len() > 1 {
+                        ties.push(false);
+                        for w2 in part.windows(2) {
+                            let r1 = seq_rows[w2[0] as usize] as usize;
+                            let r2 = seq_rows[w2[1] as usize] as usize;
+                            ties.push(order_cols.iter().all(|&(c, _)| {
+                                cmp_col_rows(&cols[c], r1, r2) == std::cmp::Ordering::Equal
+                            }));
+                        }
+                    }
+                    tv.clear();
+                    match target_col {
+                        Some(c) => match &cols[c] {
+                            Column::Cells(cv) => {
+                                tv.extend(part.iter().map(|&pos| &cv[seq_rows[pos as usize] as usize]));
+                            }
+                            _ => {
+                                let cv = owned_target.as_deref().unwrap();
+                                tv.extend(part.iter().map(|&pos| &cv[seq_rows[pos as usize] as usize]));
+                            }
+                        },
+                        None => tv.resize(part.len(), &NULL),
+                    }
+                    out.extend(super::eval::window_values(
+                        func,
+                        &tv,
+                        &ties,
+                        has_order,
+                        target_col.is_some(),
+                        frame.as_ref(),
+                    ));
+                }
+                Column::Cells(out)
+            };
+
             let new_seq = flat;
             // Re-sequence: earlier window outputs move with their rows.
             for wc in &mut win_cols {
-                let mut moved = Vec::with_capacity(n);
-                for &pos in &new_seq {
-                    moved.push(std::mem::replace(&mut wc[pos as usize], Cell::Null));
-                }
-                *wc = moved;
+                wc.permute_in_place(&new_seq);
             }
             seq_rows = new_seq.iter().map(|&pos| seq_rows[pos as usize]).collect();
-            win_cols.push(out);
+            win_cols.push(win_col);
         }
 
         // `sort` after the windows: a stable sort of the final sequence by one key, which
@@ -632,44 +949,55 @@ impl Db {
                 Some(_) => None,
                 None => Some(col_of(sort_field)?),
             };
-            let key = |pos: u32| -> &Cell {
-                match (win_key, base_key) {
-                    (Some(wi), _) => &win_cols[wi][pos as usize],
-                    (None, Some(c)) => &cols[c][seq_rows[pos as usize] as usize],
-                    (None, None) => &NULL,
-                }
-            };
             let mut perm: Vec<u32> = (0..n as u32).collect();
-            perm.sort_by(|&a, &b| {
-                let ord = super::eval::cmp_sort(key(a), key(b));
-                if desc { ord.reverse() } else { ord }
-            });
+            if let Some(wi) = win_key {
+                sort_part_by_col(&mut perm, &win_cols[wi], desc, None);
+            } else if let Some(c) = base_key {
+                sort_part_by_col(&mut perm, &cols[c], desc, Some(&seq_rows));
+            }
             for wc in &mut win_cols {
-                let mut moved = Vec::with_capacity(n);
-                for &pos in &perm {
-                    moved.push(std::mem::replace(&mut wc[pos as usize], Cell::Null));
-                }
-                *wc = moved;
+                wc.permute_in_place(&perm);
             }
             seq_rows = perm.iter().map(|&pos| seq_rows[pos as usize]).collect();
         }
 
-        let names = field_names(fields);
-        let names_arc: Arc<[String]> = names.into();
-        let mut result = RecordBatch::with_capacity(names_arc, n);
-        for (ci, f) in fields.iter().enumerate() {
+        enum OutCol {
+            Win(usize),
+            Base(usize),
+        }
+        let mut plan_cols: Vec<OutCol> = Vec::with_capacity(fields.len());
+        let mut win_rem: smallvec::SmallVec<[usize; 4]> =
+            smallvec::SmallVec::from_elem(0, win_cols.len());
+        for f in fields {
             let leaf = f.leaf()?;
             if let Some(wi) = win_names.iter().position(|w| *w == leaf) {
-                for cell in &win_cols[wi] {
-                    result.cols[ci].push(cell.clone_for_borrow());
-                }
+                win_rem[wi] += 1;
+                plan_cols.push(OutCol::Win(wi));
             } else {
-                let c = col_of(f)?;
-                for &row in &seq_rows {
-                    result.cols[ci].push(cols[c][row as usize].clone_for_borrow());
+                plan_cols.push(OutCol::Base(col_of(f)?));
+            }
+        }
+        let mut out_cols: Vec<Column> = Vec::with_capacity(fields.len());
+        for src in plan_cols {
+            match src {
+                OutCol::Win(wi) => {
+                    win_rem[wi] -= 1;
+                    if win_rem[wi] == 0 {
+                        out_cols.push(std::mem::replace(&mut win_cols[wi], Column::new()));
+                    } else {
+                        out_cols.push(win_cols[wi].clone());
+                    }
+                }
+                OutCol::Base(c) => {
+                    out_cols.push(cols[c].gather(&seq_rows));
                 }
             }
         }
+        let names_arc: Arc<[String]> = field_names(fields).into();
+        let mut result = RecordBatch {
+            names: names_arc,
+            cols: out_cols,
+        };
         finish_batch(&mut result, skip_n, Some(take));
         Some(result)
     }
@@ -1240,7 +1568,9 @@ impl Db {
             if fetch_limit != Some(0)
                 && filter.is_none_or(|p| !eng.has_index_pushdown(name, p, now))
             {
-                let mut batch = RecordBatch::with_capacity(Arc::clone(&names_arc), 1024);
+                let cap =
+                    fetch_limit.unwrap_or_else(|| (eng.count_table(name) / 2).clamp(64, 65_536));
+                let mut batch = RecordBatch::with_capacity(Arc::clone(&names_arc), cap);
                 let mut remaining = fetch_limit;
                 let streamed = eng
                     .scan_cells(name, filter, &proj_refs, now, |_, cells| {
@@ -1696,7 +2026,62 @@ impl Db {
                     JoinFieldPlan::Right { idx, .. } => Err(*idx),
                 })
                 .collect();
-            let mut batch = RecordBatch::with_capacity(Arc::clone(&names_arc), 1024);
+            let est_cap = explicit_take
+                .and_then(|o| o)
+                .map(|t| skip_n.saturating_add(t.max(0) as usize))
+                .unwrap_or_else(|| eng.count_table(left_name))
+                .clamp(64, 65_536);
+            let mut seen_left = smallvec::SmallVec::<[bool; 8]>::from_elem(false, cols.len());
+            let mut can_take_left = true;
+            for s in &slots {
+                if let Ok(i) = *s {
+                    if seen_left[i] {
+                        can_take_left = false;
+                        break;
+                    }
+                    seen_left[i] = true;
+                }
+            }
+            let preloaded: Option<FxHashMap<Box<str>, smallvec::SmallVec<[Cell; 8]>>> =
+                if right_on_disk {
+                    let right_count = eng.count_table(right_col);
+                    if right_count <= 65_536 {
+                        let mut r_scan_cols: Vec<&str> = Vec::with_capacity(1 + right_refs.len());
+                        r_scan_cols.push("id");
+                        let r_slots: smallvec::SmallVec<[usize; 8]> = right_refs
+                            .iter()
+                            .map(|&f| {
+                                if let Some(pos) = r_scan_cols.iter().position(|c| *c == f) {
+                                    pos
+                                } else {
+                                    r_scan_cols.push(f);
+                                    r_scan_cols.len() - 1
+                                }
+                            })
+                            .collect();
+                        let mut map: FxHashMap<Box<str>, smallvec::SmallVec<[Cell; 8]>> =
+                            FxHashMap::with_capacity_and_hasher(right_count, Default::default());
+                        let ok = eng
+                            .scan_cells(right_col, None, &r_scan_cols, now, |_, r_cells| {
+                                if let Some(k) = r_cells[0].text() {
+                                    let key: Box<str> = k.into();
+                                    let vals: smallvec::SmallVec<[Cell; 8]> = r_slots
+                                        .iter()
+                                        .map(|&idx| r_cells[idx].clone_for_borrow())
+                                        .collect();
+                                    map.insert(key, vals);
+                                }
+                                true
+                            })
+                            .unwrap_or(false);
+                        if ok { Some(map) } else { None }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+            let mut batch = RecordBatch::with_capacity(Arc::clone(&names_arc), est_cap);
             let mut memo: FxHashMap<String, Option<smallvec::SmallVec<[Cell; 8]>>> =
                 FxHashMap::default();
             let mut failed = false;
@@ -1705,29 +2090,33 @@ impl Db {
                     let right_cells = match cells[0].text() {
                         None => None,
                         Some(k) => {
-                            if !memo.contains_key(k) {
-                                let found = if right_on_disk {
-                                    match eng.get_projected_by_id(right_col, k, &right_refs) {
-                                        Ok(r) => r,
-                                        Err(_) => {
-                                            failed = true;
-                                            return false;
+                            if let Some(ref pre) = preloaded {
+                                pre.get(k).map(|v| v.as_slice())
+                            } else {
+                                if !memo.contains_key(k) {
+                                    let found = if right_on_disk {
+                                        match eng.get_projected_by_id(right_col, k, &right_refs) {
+                                            Ok(r) => r,
+                                            Err(_) => {
+                                                failed = true;
+                                                return false;
+                                            }
                                         }
-                                    }
-                                } else {
-                                    self.store.get_by_id(right_col, k).cloned()
-                                };
-                                memo.insert(
-                                    k.to_string(),
-                                    found.map(|r| {
-                                        right_fields
-                                            .iter()
-                                            .map(|f| r.get(f).cloned().unwrap_or(Cell::Null))
-                                            .collect()
-                                    }),
-                                );
+                                    } else {
+                                        self.store.get_by_id(right_col, k).cloned()
+                                    };
+                                    memo.insert(
+                                        k.to_string(),
+                                        found.map(|r| {
+                                            right_fields
+                                                .iter()
+                                                .map(|f| r.get(f).cloned().unwrap_or(Cell::Null))
+                                                .collect()
+                                        }),
+                                    );
+                                }
+                                memo.get(k).and_then(|v| v.as_deref())
                             }
-                            memo.get(k).and_then(|v| v.as_deref())
                         }
                     };
                     if right_cells.is_none() && !left_join {
@@ -1735,7 +2124,13 @@ impl Db {
                     }
                     for (col_i, slot) in slots.iter().enumerate() {
                         let cell = match slot {
-                            Ok(i) => cells[*i].clone(),
+                            Ok(i) => {
+                                if can_take_left {
+                                    std::mem::replace(&mut cells[*i], Cell::Null)
+                                } else {
+                                    cells[*i].clone()
+                                }
+                            }
                             Err(idx) => right_cells
                                 .and_then(|r| r.get(*idx).cloned())
                                 .unwrap_or(Cell::Null),
