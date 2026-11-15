@@ -158,3 +158,34 @@ fn follower_with_a_torn_local_log_resumes() {
     assert_eq!(count(&mut follower, "ev | count"), count(&mut leader, "ev | count"));
     assert_eq!(follower.r#gen(), leader.r#gen());
 }
+
+/// The leader restarts (closes and reopens without a checkpoint in between) while the
+/// follower keeps its position: shipping resumes from the follower's generation and
+/// nothing is lost or applied twice; a follower restart resumes the same way.
+#[test]
+fn shipping_resumes_across_leader_and_follower_restarts() {
+    let leader_dir = tmp();
+    let follower_dir = tmp();
+    let mut leader = Db::open(&leader_dir).unwrap();
+    leader.run("col ev { id: text, n: i64 }").unwrap();
+    leader.run(r#"insert ev [{ id: "a", n: 1 }, { id: "b", n: 2 }]"#).unwrap();
+    let mut follower = Db::open_follower(&follower_dir).unwrap();
+    follower.apply_wal(&leader.export_wal_since(0).unwrap()).unwrap();
+    // Leader crash-restart: drop without close, reopen from its directory.
+    drop(leader);
+    let mut leader = Db::open(&leader_dir).unwrap();
+    leader.run(r#"insert ev { id: "c", n: 3 }"#).unwrap();
+    follower.apply_wal(&leader.export_wal_since(follower.r#gen()).unwrap()).unwrap();
+    assert_eq!(count(&mut follower, "ev | count"), 3.0);
+    // Follower restart.
+    drop(follower);
+    leader.run(r#"insert ev { id: "d", n: 4 }"#).unwrap();
+    let mut follower = Db::open_follower(&follower_dir).unwrap();
+    follower.apply_wal(&leader.export_wal_since(follower.r#gen()).unwrap()).unwrap();
+    assert_eq!(count(&mut follower, "ev | count"), 4.0);
+    assert_eq!(follower.r#gen(), leader.r#gen());
+    // Shipping the same range again is refused or a no-op, never a duplicate.
+    let again = leader.export_wal_since(follower.r#gen() - 1).unwrap();
+    let _ = follower.apply_wal(&again);
+    assert_eq!(count(&mut follower, "ev | count"), 4.0, "re-shipped frames applied twice");
+}

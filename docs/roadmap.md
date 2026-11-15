@@ -2,7 +2,7 @@
 
 Срез: **2026-11-15**, коммит `58444cf6e` (релиз 0.7.1) плюс незакоммиченное рабочее дерево. Единственный файл с планом в репозитории: в нём только несделанное. Реализованное описано в [CHANGELOG](../CHANGELOG.md), в документах `docs/` по отдельным механизмам и в отчётах `benches/results/`.
 
-Открыто **1493** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
+Открыто **1490** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровывались, поэтому в них есть пропуски: закрытые пункты удалены. Пункты части II со статусами `candidate` и `qualification` по коду поштучно не сверялись: перед взятием пункта сначала проверить, не покрыт ли он уже.
 
@@ -193,7 +193,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 ### Приоритетный список — 1563 пунктов
 
-Количества: P1: 3, P2: 917, P3: 573; статусы: blocked_external: 1, candidate: 934, qualification: 558.
+Количества: P1: 3, P2: 914, P3: 573; статусы: blocked_external: 1, candidate: 934, qualification: 555.
 
 #### P1: 3 пунктов
 
@@ -203,7 +203,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 2 | LIN-0002 | [D01](#d01) | Закрыть durable 1k SQLite gap | PERF | qualification | M | G-PERF |
 | 22 | LIN-0006 | [D01](#d01) | Получить тестовый endpoint Kusto | OPS | blocked_external | M | G-OPS |
 
-#### P2: 917 пунктов
+#### P2: 914 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -856,14 +856,11 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 1073 | LIN-1376 | [D35](#d35) | Спроектировать replay-resistant session nonce | FEATURE | candidate | L | G-FEATURE |
 | 1075 | LIN-1378 | [D35](#d35) | Ограничить handshake read duration | CORRECTNESS | qualification | M | G-CORRECT |
 | 1076 | LIN-1379 | [D35](#d35) | Ограничить idle connection lifetime | CORRECTNESS | qualification | M | G-CORRECT |
-| 1085 | LIN-1408 | [D36](#d36) | Проверить follower index rebuild policy | CORRECTNESS | qualification | S | G-CORRECT |
-| 1088 | LIN-1411 | [D36](#d36) | Проверить source restart reconnect | CORRECTNESS | qualification | S | G-CORRECT |
 | 1090 | LIN-1413 | [D36](#d36) | Спроектировать snapshot bootstrap protocol | FEATURE | candidate | L | G-FEATURE |
 | 1091 | LIN-1414 | [D36](#d36) | Спроектировать bounded replay catch-up | FEATURE | candidate | L | G-FEATURE |
 | 1092 | LIN-1415 | [D36](#d36) | Спроектировать catch-up progress receipts | FEATURE | candidate | L | G-FEATURE |
 | 1093 | LIN-1416 | [D36](#d36) | Спроектировать stale follower detection | FEATURE | candidate | L | G-FEATURE |
 | 1094 | LIN-1417 | [D36](#d36) | Проверить follower disk-full behavior | CORRECTNESS | qualification | S | G-CORRECT |
-| 1097 | LIN-1420 | [D36](#d36) | Проверить follower version incompatibility | CORRECTNESS | qualification | S | G-CORRECT |
 | 1098 | LIN-1421 | [D36](#d36) | Спроектировать retention pinned by followers | FEATURE | candidate | L | G-FEATURE |
 | 1099 | LIN-1422 | [D36](#d36) | Спроектировать follower lag admission | FEATURE | candidate | L | G-FEATURE |
 | 1100 | LIN-1423 | [D36](#d36) | Спроектировать read consistency modes | FEATURE | candidate | L | G-FEATURE |
