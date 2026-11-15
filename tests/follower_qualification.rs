@@ -65,3 +65,34 @@ fn follower_refuses_every_write_and_receives_the_catalog() {
     assert!(follower.run(r#"insert team { id: "t3", acct: "a1", label: "x" }"#).is_err());
 }
 
+
+/// The leader checkpoints (emptying its log) while a follower lags behind. Catching up
+/// must either deliver every missed change or fail loudly: a follower must never end up
+/// silently missing rows while believing it is current.
+#[test]
+fn follower_lagging_across_a_leader_checkpoint() {
+    let leader_dir = tmp();
+    let follower_dir = tmp();
+    let mut leader = Db::open(&leader_dir).unwrap();
+    leader.run("col ev { id: text, n: i64 }").unwrap();
+    leader.run(r#"insert ev { id: "e0", n: 0 }"#).unwrap();
+    let mut follower = Db::open_follower(&follower_dir).unwrap();
+    follower.apply_wal(&leader.export_wal_since(0).unwrap()).unwrap();
+    let lag_gen = follower.r#gen();
+    for i in 1..=5 {
+        leader.run(&format!(r#"insert ev {{ id: "e{i}", n: {i} }}"#)).unwrap();
+    }
+    leader.checkpoint().unwrap();
+    leader.run(r#"insert ev { id: "e6", n: 6 }"#).unwrap();
+    let catch_up = leader.export_wal_since(lag_gen).and_then(|frames| follower.apply_wal(&frames));
+    match catch_up {
+        Ok(_) => {
+            assert_eq!(count(&mut follower, "ev | count"), 7.0, "follower caught up with rows missing");
+            assert_eq!(follower.r#gen(), leader.r#gen());
+        }
+        Err(e) => {
+            // Refused: the follower must still hold exactly what it had before.
+            assert_eq!(count(&mut follower, "ev | count"), 1.0, "failed catch-up changed the follower: {e}");
+        }
+    }
+}
