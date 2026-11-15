@@ -12,6 +12,7 @@ use lin::{Db, GraphFmt, explain_as};
 static COLD: AtomicBool = AtomicBool::new(false);
 
 fn main() -> ExitCode {
+    restore_default_sigpipe();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (data, follower, rest) = parse_global(&args);
     match rest.first().map(String::as_str) {
@@ -30,6 +31,18 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         _ => usage(2),
+    }
+}
+
+/// The Rust runtime ignores SIGPIPE, so writing to a closed pipe (`lin run ... | head`)
+/// turns into a `failed printing to stdout` panic and exit code 101. Command-line tools
+/// are expected to stop quietly instead: restore the default action.
+fn restore_default_sigpipe() {
+    #[cfg(unix)]
+    // SAFETY: called first thing in `main`, before any other thread exists; setting a
+    // signal's disposition to its default has no other preconditions.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
 }
 
