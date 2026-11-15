@@ -2,7 +2,7 @@
 
 Срез: **2026-11-15**, коммит `58444cf6e` (релиз 0.7.1) плюс незакоммиченное рабочее дерево. Единственный файл с планом в репозитории: в нём только несделанное. Реализованное описано в [CHANGELOG](../CHANGELOG.md), в документах `docs/` по отдельным механизмам и в отчётах `benches/results/`.
 
-Открыто **1396** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
+Открыто **1390** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровывались, поэтому в них есть пропуски: закрытые пункты удалены. Пункты части II со статусами `candidate` и `qualification` по коду поштучно не сверялись: перед взятием пункта сначала проверить, не покрыт ли он уже.
 
@@ -196,7 +196,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 ### Приоритетный список — 1563 пунктов
 
-Количества: P1: 3, P2: 831, P3: 562; статусы: blocked_external: 1, candidate: 934, qualification: 461.
+Количества: P1: 3, P2: 831, P3: 556; статусы: blocked_external: 1, candidate: 934, qualification: 455.
 
 #### P1: 3 пунктов
 
@@ -1042,7 +1042,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 1399 | LIN-1971 | [D50](#d50) | Описать replication version compatibility | DOC | candidate | S | G-DOC |
 | 1400 | LIN-1972 | [D50](#d50) | Описать downgrade support boundaries | DOC | candidate | S | G-DOC |
 
-#### P3: 562 пунктов
+#### P3: 556 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -1124,7 +1124,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 1484 | LIN-0668 | [D17](#d17) | Добавить cursor leak diagnostics | API | candidate | M | G-API |
 | 1485 | LIN-0669 | [D17](#d17) | Проверить chained cursor error propagation | CORRECTNESS | qualification | S | G-CORRECT |
 | 1486 | LIN-0670 | [D17](#d17) | Проверить cursor union deduplication | CORRECTNESS | qualification | S | G-CORRECT |
-| 1487 | LIN-0671 | [D17](#d17) | Проверить cursor post-sort stability | CORRECTNESS | qualification | S | G-CORRECT |
 | 1488 | LIN-0672 | [D17](#d17) | Проверить cursor graph traversal boundaries | CORRECTNESS | qualification | S | G-CORRECT |
 | 1489 | LIN-0673 | [D17](#d17) | Измерить async stream chunk sizes | PERF | candidate | M | G-PERF |
 | 1490 | LIN-0674 | [D17](#d17) | Измерить cursor to RecordBatch path | PERF | candidate | M | G-PERF |
@@ -1134,10 +1133,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 1494 | LIN-0678 | [D17](#d17) | Проверить nested cursor reads | CORRECTNESS | qualification | S | G-CORRECT |
 | 1495 | LIN-0679 | [D17](#d17) | Проверить cross-thread cursor restrictions | CORRECTNESS | qualification | S | G-CORRECT |
 | 1496 | LIN-0680 | [D17](#d17) | Проверить cursor serialization rejection | CORRECTNESS | qualification | S | G-CORRECT |
-| 1497 | LIN-0705 | [D18](#d18) | Проверить SmallText batch roundtrip | CORRECTNESS | qualification | S | G-CORRECT |
-| 1498 | LIN-0706 | [D18](#d18) | Проверить Arc text batch roundtrip | CORRECTNESS | qualification | S | G-CORRECT |
-| 1499 | LIN-0707 | [D18](#d18) | Проверить exact float bits batch | CORRECTNESS | qualification | S | G-CORRECT |
-| 1500 | LIN-0708 | [D18](#d18) | Проверить timestamp batch roundtrip | CORRECTNESS | qualification | S | G-CORRECT |
 | 1501 | LIN-0709 | [D18](#d18) | Спроектировать Arrow C data boundary | FEATURE | candidate | L | G-FEATURE |
 | 1502 | LIN-0710 | [D18](#d18) | Спроектировать Arrow import ownership | FEATURE | candidate | L | G-FEATURE |
 | 1503 | LIN-0711 | [D18](#d18) | Спроектировать Arrow export release callbacks | FEATURE | candidate | L | G-FEATURE |
@@ -1145,7 +1140,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 1506 | LIN-0714 | [D18](#d18) | Добавить batch allocation limits | FEATURE | candidate | M | G-FEATURE |
 | 1507 | LIN-0715 | [D18](#d18) | Добавить column memory diagnostics | FEATURE | candidate | M | G-FEATURE |
 | 1508 | LIN-0716 | [D18](#d18) | Добавить batch consistency inspector | FEATURE | candidate | M | G-FEATURE |
-| 1509 | LIN-0717 | [D18](#d18) | Проверить chunk boundary aggregation | CORRECTNESS | qualification | S | G-CORRECT |
 | 1510 | LIN-0718 | [D18](#d18) | Проверить chunk boundary joins | CORRECTNESS | qualification | S | G-CORRECT |
 | 1511 | LIN-0719 | [D18](#d18) | Проверить chunk boundary sorting | CORRECTNESS | qualification | S | G-CORRECT |
 | 1512 | LIN-0720 | [D18](#d18) | Проверить chunk boundary cursor results | CORRECTNESS | qualification | S | G-CORRECT |
