@@ -799,6 +799,24 @@ pub(crate) fn sort_rows_top_k(
     }
 }
 
+/// Exact order of an integer and a non-NaN float, without rounding the integer to f64.
+pub(crate) fn cmp_int_float(i: i64, f: f64) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    // 2^63 is exactly representable; every i64 is below it and at or above -2^63.
+    const TWO_63: f64 = 9_223_372_036_854_775_808.0;
+    if f >= TWO_63 {
+        return Ordering::Less;
+    }
+    if f < -TWO_63 {
+        return Ordering::Greater;
+    }
+    let t = f.trunc();
+    match i.cmp(&(t as i64)) {
+        Ordering::Equal => 0.0f64.partial_cmp(&(f - t)).unwrap_or(Ordering::Equal),
+        o => o,
+    }
+}
+
 pub(crate) fn cmp_sort(a: &Cell, b: &Cell) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     match (a, b) {
@@ -810,6 +828,11 @@ pub(crate) fn cmp_sort(a: &Cell, b: &Cell) -> std::cmp::Ordering {
         (Cell::Text(x), Cell::SmallText(y)) => x.as_ref().cmp(y.as_str()),
         (Cell::SmallText(x), Cell::Text(y)) => x.as_str().cmp(y.as_ref()),
         (Cell::Bool(x), Cell::Bool(y)) => x.cmp(y),
+        // Integers compare exactly: through f64, values above 2^53 that differ by one
+        // tie or swap (`2^53 + 1` sorted before `2^53`).
+        (Cell::Int(x), Cell::Int(y)) => x.cmp(y),
+        (Cell::Int(x), Cell::Float(y)) if !y.is_nan() => cmp_int_float(*x, *y),
+        (Cell::Float(x), Cell::Int(y)) if !x.is_nan() => cmp_int_float(*y, *x).reverse(),
         _ => match (a.as_f64(), b.as_f64()) {
             (Some(x), Some(y)) => match (x.is_nan(), y.is_nan()) {
                 (true, true) => Ordering::Equal,
