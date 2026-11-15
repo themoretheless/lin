@@ -2,7 +2,7 @@
 
 Срез: **2026-11-15**, коммит `58444cf6e` (релиз 0.7.1) плюс незакоммиченное рабочее дерево. Единственный файл с планом в репозитории: в нём только несделанное. Реализованное описано в [CHANGELOG](../CHANGELOG.md), в документах `docs/` по отдельным механизмам и в отчётах `benches/results/`.
 
-Открыто **1532** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
+Открыто **1528** пунктов backlog (часть II) и 11 пунктов части I: 9 по OLAP-контуру, словарный WAL-кодек и fanout репликации. Это предлагаемый план работ, не список доказанных дефектов и не обещание ускорений.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровывались, поэтому в них есть пропуски: закрытые пункты удалены. Пункты части II со статусами `candidate` и `qualification` по коду поштучно не сверялись: перед взятием пункта сначала проверить, не покрыт ли он уже.
 
@@ -193,7 +193,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 ### Приоритетный список — 1563 пунктов
 
-Количества: P1: 3, P2: 956, P3: 573; статусы: blocked_external: 1, candidate: 934, qualification: 597.
+Количества: P1: 3, P2: 952, P3: 573; статусы: blocked_external: 1, candidate: 934, qualification: 593.
 
 #### P1: 3 пунктов
 
@@ -203,7 +203,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 2 | LIN-0002 | [D01](#d01) | Закрыть durable 1k SQLite gap | PERF | qualification | M | G-PERF |
 | 22 | LIN-0006 | [D01](#d01) | Получить тестовый endpoint Kusto | OPS | blocked_external | M | G-OPS |
 
-#### P2: 956 пунктов
+#### P2: 952 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -709,12 +709,8 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 869 | LIN-1004 | [D26](#d26) | Профилировать feature hashing instructions | PERF | candidate | M | G-PERF |
 | 871 | LIN-1006 | [D26](#d26) | Проверить dimension parsing limits | CORRECTNESS | qualification | S | G-CORRECT |
 | 872 | LIN-1007 | [D26](#d26) | Проверить minimum dimension policy | CORRECTNESS | qualification | S | G-CORRECT |
-| 873 | LIN-1008 | [D26](#d26) | Проверить empty text embedding | CORRECTNESS | qualification | S | G-CORRECT |
-| 874 | LIN-1009 | [D26](#d26) | Проверить ASCII/Unicode feature parity | CORRECTNESS | qualification | S | G-CORRECT |
 | 875 | LIN-1010 | [D26](#d26) | Проверить whole-text bigram semantics | CORRECTNESS | qualification | S | G-CORRECT |
 | 876 | LIN-1011 | [D26](#d26) | Проверить token trigram semantics | CORRECTNESS | qualification | S | G-CORRECT |
-| 877 | LIN-1012 | [D26](#d26) | Проверить repeated-token normalization | CORRECTNESS | qualification | S | G-CORRECT |
-| 878 | LIN-1013 | [D26](#d26) | Проверить dense/sparse normalization bits | CORRECTNESS | qualification | S | G-CORRECT |
 | 879 | LIN-1014 | [D26](#d26) | Проверить touched slot reset | CORRECTNESS | qualification | S | G-CORRECT |
 | 880 | LIN-1015 | [D26](#d26) | Проверить long-input sum fallback | CORRECTNESS | qualification | S | G-CORRECT |
 | 881 | LIN-1016 | [D26](#d26) | Проверить variable-dimension slot mapping | CORRECTNESS | qualification | S | G-CORRECT |
