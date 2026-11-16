@@ -37,9 +37,9 @@ pub use codec::{
 };
 pub(crate) use codec::insert_cols_lossless;
 pub(crate) use codec::{
-    PreparedEncoding, PreparedInsert, acquire_encoder, append_prepared_record,
-    encode_insert_rows_direct, encode_insert_rows_direct_ext, prepare_insert_columns_ext,
-    start_insert_encoding,
+    PreparedEncoding, PreparedInsert, acquire_encoder, append_facts_v2_preencoded,
+    append_prepared_record, encode_insert_rows_direct, encode_insert_rows_direct_ext,
+    prepare_insert_columns_ext, put_str, start_insert_encoding,
 };
 
 pub use snapshot::{

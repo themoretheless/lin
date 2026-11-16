@@ -960,6 +960,23 @@ pub fn write_fts(
     write_fts_ext(data, name, idx, generation, nrows, true)
 }
 
+fn write_fts_encoded(
+    data: &Path,
+    name: &str,
+    body: &[u8],
+    sync_parent: bool,
+) -> Result<(), Error> {
+    let dir = fts_dir(data);
+    fs::create_dir_all(&dir).map_err(io_err)?;
+    let path = fts_path(data, name);
+    let tmp = path.with_extension("bin.tmp");
+    crate::persist::write_through_tmp(&path, &tmp, body)?;
+    if sync_parent {
+        crate::persist::sync_dir_checked(&dir)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn write_fts_ext(
     data: &Path,
     name: &str,
@@ -968,17 +985,21 @@ pub(crate) fn write_fts_ext(
     nrows: u64,
     sync_parent: bool,
 ) -> Result<(), Error> {
-    let dir = fts_dir(data);
-    fs::create_dir_all(&dir).map_err(io_err)?;
-    let path = fts_path(data, name);
-    let tmp = path.with_extension("bin.tmp");
     idx.fold_all();
     let body = idx.encode(generation, nrows);
-    crate::persist::write_through_tmp(&path, &tmp, &body)?;
-    if sync_parent {
-        crate::persist::sync_dir_checked(&dir)?;
-    }
-    Ok(())
+    write_fts_encoded(data, name, &body, sync_parent)
+}
+
+pub(crate) fn write_fts_readonly(
+    data: &Path,
+    name: &str,
+    idx: &FtsIndex,
+    generation: u64,
+    nrows: u64,
+    sync_parent: bool,
+) -> Result<(), Error> {
+    let body = idx.encode(generation, nrows);
+    write_fts_encoded(data, name, &body, sync_parent)
 }
 
 pub fn read_fts(data: &Path, name: &str) -> Result<(u64, u64, FtsIndex), Error> {

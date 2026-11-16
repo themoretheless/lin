@@ -473,7 +473,10 @@ impl Store {
     /// True when orders SoA matches `collections["orders"]` length.
     pub fn orders_soa_ready(&self) -> bool {
         let n = self.collection("orders").len();
-        self.orders_id.len() == n && self.orders_user_id.len() == n && self.orders_total.len() == n
+        self.orders_id.len() == n
+            && self.orders_user_id.len() == n
+            && self.orders_total.len() == n
+            && self.orders_total_tag.len() == n
     }
 
     /// True when users SoA matches `collections["users"]` length.
@@ -490,6 +493,9 @@ impl Store {
     }
     pub fn orders_total(&self) -> &[f64] {
         &self.orders_total
+    }
+    pub fn orders_total_tag(&self) -> &[u8] {
+        &self.orders_total_tag
     }
     pub fn docs_wing(&self) -> &DictColumn {
         &self.docs_wing

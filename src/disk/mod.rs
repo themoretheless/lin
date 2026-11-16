@@ -2966,6 +2966,28 @@ impl DiskEngine {
     }
 
     pub fn get_by_id(&self, table: &str, id: &str) -> Result<Option<Row>, Error> {
+        self.get_by_id_inner(table, id, &[], true)
+    }
+
+    pub fn get_by_id_skipping(
+        &self,
+        table: &str,
+        id: &str,
+        skip: &[&str],
+    ) -> Result<Option<Row>, Error> {
+        if skip.is_empty() {
+            return self.get_by_id(table, id);
+        }
+        self.get_by_id_inner(table, id, skip, false)
+    }
+
+    fn get_by_id_inner(
+        &self,
+        table: &str,
+        id: &str,
+        skip: &[&str],
+        cache_hot: bool,
+    ) -> Result<Option<Row>, Error> {
         if let Some(mt) = self.memtables.get(table) {
             if mt.deleted_ids.contains(id) {
                 return Ok(None);
@@ -2992,8 +3014,10 @@ impl DiskEngine {
                     true
                 });
                 if let Some(rid) = live_rid {
-                    let row = seg.materialize_row(rid)?;
-                    self.hot_cache.put_row(table, id, Arc::new(row.clone()));
+                    let row = seg.materialize_row_skipping(rid, skip)?;
+                    if cache_hot {
+                        self.hot_cache.put_row(table, id, Arc::new(row.clone()));
+                    }
                     return Ok(Some(row));
                 }
             }

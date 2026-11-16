@@ -1,6 +1,5 @@
 //! Columnar, sparse-vector, and dictionary WAL codecs plus background encoder worker pool.
 
-use std::cell::RefCell;
 use std::fs::File;
 use std::io;
 use std::sync::Arc;
@@ -19,10 +18,30 @@ use super::wal::{
 };
 
 #[inline(always)]
-pub(super) fn put_str(buf: &mut Vec<u8>, s: &str) {
+pub(crate) fn put_str(buf: &mut Vec<u8>, s: &str) {
     let b = s.as_bytes();
     buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
     buf.extend_from_slice(b);
+}
+
+pub(crate) fn append_facts_v2_preencoded(
+    log: &mut File,
+    rec_gen: u64,
+    next_id: u64,
+    n: u32,
+    encoded_spo: &[u8],
+    buf: &mut Vec<u8>,
+    sync: SyncMode,
+    log_bytes: &mut u64,
+) -> Result<(), Error> {
+    buf.clear();
+    buf.reserve(21 + encoded_spo.len());
+    buf.push(V2_FACTS_BULK);
+    buf.extend_from_slice(&rec_gen.to_le_bytes());
+    buf.extend_from_slice(&next_id.to_le_bytes());
+    buf.extend_from_slice(&n.to_le_bytes());
+    buf.extend_from_slice(encoded_spo);
+    write_frame(log, &LOG_MAGIC_V2, buf, sync, log_bytes)
 }
 
 pub(super) fn append_facts_v2(
@@ -947,10 +966,6 @@ pub(super) fn encode_insert_cols_v2(
     })
 }
 
-thread_local! {
-    static CELL_PTR_SCRATCH: RefCell<Vec<*const Cell>> = RefCell::new(Vec::new());
-}
-
 /// Whether new WAL frames may use the dictionary vector codec (codec 5, column tag 8).
 /// Off by default: a reader built before the codec refuses such frames, so it may only
 /// be turned on once every consumer of the log (followers, backup tools, the previous
@@ -1105,37 +1120,35 @@ fn rewrite_sparse_as_dictionary<'a>(
 }
 
 #[inline]
-pub(super) fn append_sparse_cells_range(
-    cells: &[*const Cell],
-    num_fields: usize,
+pub(super) fn append_sparse_rows_range(
+    rows: &[Row],
     fi: usize,
     start_row: usize,
     end_row: usize,
     buf: &mut Vec<u8>,
 ) -> Result<(), Error> {
-    // Safety: all pointers in `cells` borrow from `rows: &[Row]` live for the duration of `encode_insert_rows_direct_ext`.
-    let iter = (start_row..end_row).map(|ri| match unsafe { &*cells[ri * num_fields + fi] } {
-        Cell::Vec(emb) => Some(emb.as_ref()),
-        _ => None,
+    let iter = rows[start_row..end_row].iter().map(|r| {
+        match r.cells_slice().get(fi) {
+            Some(Cell::Vec(emb)) => Some(emb.as_ref()),
+            _ => None,
+        }
     });
     append_sparse_iter_serial(iter, buf)
 }
 
-pub(super) fn append_sparse_cells_serial(
-    cells: &[*const Cell],
-    num_fields: usize,
+pub(super) fn append_sparse_rows_field_serial(
+    rows: &[Row],
     fi: usize,
     num_rows: usize,
     buf: &mut Vec<u8>,
 ) -> Result<(), Error> {
-    append_sparse_cells_range(cells, num_fields, fi, 0, num_rows, buf)
+    append_sparse_rows_range(rows, fi, 0, num_rows, buf)
 }
 
 struct SparseEncodeJob {
     chunk_idx: usize,
-    cells_ptr: usize,
-    cells_len: usize,
-    num_fields: usize,
+    rows_ptr: usize,
+    rows_len: usize,
     fi: usize,
     start_row: usize,
     end_row: usize,
@@ -1148,15 +1161,14 @@ struct SparseEncodePool {
     reusable_bufs: Vec<Vec<u8>>,
 }
 
-pub(super) fn append_sparse_cells_parallel(
-    cells: &[*const Cell],
-    num_fields: usize,
+pub(super) fn append_sparse_rows_field_parallel(
+    rows: &[Row],
     fi: usize,
     num_rows: usize,
     buf: &mut Vec<u8>,
 ) -> Result<(), Error> {
     if num_rows < 512 {
-        return append_sparse_cells_serial(cells, num_fields, fi, num_rows, buf);
+        return append_sparse_rows_field_serial(rows, fi, num_rows, buf);
     }
     static POOL: std::sync::OnceLock<std::sync::Mutex<Option<SparseEncodePool>>> =
         std::sync::OnceLock::new();
@@ -1183,13 +1195,12 @@ pub(super) fn append_sparse_cells_parallel(
                         job.buf.clear();
                         let slice = unsafe {
                             std::slice::from_raw_parts(
-                                job.cells_ptr as *const *const Cell,
-                                job.cells_len,
+                                job.rows_ptr as *const Row,
+                                job.rows_len,
                             )
                         };
-                        let res = append_sparse_cells_range(
+                        let res = append_sparse_rows_range(
                             slice,
-                            job.num_fields,
                             job.fi,
                             job.start_row,
                             job.end_row,
@@ -1216,14 +1227,14 @@ pub(super) fn append_sparse_cells_parallel(
     });
 
     let Ok(mut guard) = mutex.try_lock() else {
-        return append_sparse_cells_serial(cells, num_fields, fi, num_rows, buf);
+        return append_sparse_rows_field_serial(rows, fi, num_rows, buf);
     };
     let Some(pool) = guard.as_mut() else {
-        return append_sparse_cells_serial(cells, num_fields, fi, num_rows, buf);
+        return append_sparse_rows_field_serial(rows, fi, num_rows, buf);
     };
     let total_ways = (pool.workers.len() + 1).min(num_rows.div_ceil(128)).max(1);
     if total_ways <= 1 {
-        return append_sparse_cells_serial(cells, num_fields, fi, num_rows, buf);
+        return append_sparse_rows_field_serial(rows, fi, num_rows, buf);
     }
 
     let chunk_size = num_rows.div_ceil(total_ways);
@@ -1264,9 +1275,8 @@ pub(super) fn append_sparse_cells_parallel(
         let work_buf = drain_guard.reusable_bufs.pop().unwrap_or_default();
         let job = SparseEncodeJob {
             chunk_idx,
-            cells_ptr: cells.as_ptr() as usize,
-            cells_len: cells.len(),
-            num_fields,
+            rows_ptr: rows.as_ptr() as usize,
+            rows_len: rows.len(),
             fi,
             start_row,
             end_row,
@@ -1287,7 +1297,7 @@ pub(super) fn append_sparse_cells_parallel(
         }
     }
 
-    let first_res = append_sparse_cells_range(cells, num_fields, fi, 0, first_end, buf);
+    let first_res = append_sparse_rows_range(rows, fi, 0, first_end, buf);
 
     while drain_guard.pending > 0 {
         drain_guard.pending -= 1;
@@ -1319,7 +1329,7 @@ pub(super) fn append_sparse_cells_parallel(
     drop(drain_guard);
 
     if out_res.is_ok() && fallback_start < num_rows {
-        append_sparse_cells_range(cells, num_fields, fi, fallback_start, num_rows, buf)?;
+        append_sparse_rows_range(rows, fi, fallback_start, num_rows, buf)?;
     }
     out_res
 }
@@ -1381,208 +1391,198 @@ pub(crate) fn encode_insert_rows_direct_ext(
         col_types.push(t);
     }
 
-    CELL_PTR_SCRATCH.with(|scratch| {
-        let mut cells = scratch.borrow_mut();
-        cells.clear();
-        cells.reserve(rows.len() * num_fields);
-        if uniform_keys {
-            for r in rows {
-                if r.len() != num_fields {
-                    return None;
-                }
-                cells.extend(r.values().map(|c| c as *const Cell));
-            }
-        } else {
-            for r in rows {
-                if r.len() != num_fields || !r.keys().eq(first.keys()) {
-                    return None;
-                }
-                cells.extend(r.values().map(|c| c as *const Cell));
+    let first_shape = first.shape_arc()?;
+    if uniform_keys {
+        for r in rows {
+            if r.cells_slice().len() != num_fields {
+                return None;
             }
         }
+    } else {
+        for r in &rows[1..] {
+            if r.cells_slice().len() != num_fields
+                || (!r.shape_arc().is_some_and(|s| Arc::ptr_eq(s, first_shape))
+                    && !r.keys().eq(first.keys()))
+            {
+                return None;
+            }
+        }
+    }
 
-        let fields: Vec<String> = first.keys().cloned().collect();
-        let n = rows.len() as u32;
+    let fields: Vec<String> = first.keys().cloned().collect();
+    let n = rows.len() as u32;
 
-        buf.clear();
-        buf.reserve(
-            64 + fields.len() * 16 + rows.len() * (num_fields * 24 + est_vec_per_row),
-        );
-        buf.push(V2_INSERT_COLS);
-        buf.extend_from_slice(&rec_gen.to_le_bytes());
-        buf.extend_from_slice(&next_id.to_le_bytes());
-        put_str(buf, collection);
-        buf.extend_from_slice(&n.to_le_bytes());
-        buf.extend_from_slice(&(num_fields as u32).to_le_bytes());
+    buf.clear();
+    buf.reserve(64 + fields.len() * 16 + rows.len() * (num_fields * 24 + est_vec_per_row));
+    buf.push(V2_INSERT_COLS);
+    buf.extend_from_slice(&rec_gen.to_le_bytes());
+    buf.extend_from_slice(&next_id.to_le_bytes());
+    put_str(buf, collection);
+    buf.extend_from_slice(&n.to_le_bytes());
+    buf.extend_from_slice(&(num_fields as u32).to_le_bytes());
 
-        let mut sparse_codec = false;
+    let mut sparse_codec = false;
+    let mut dictionary_codec = false;
+    let mut sparse_decoded_bytes = 0usize;
 
-        let mut dictionary_codec = false;
-        let mut sparse_decoded_bytes = 0usize;
-
-        for (fi, f) in fields.iter().enumerate() {
-            put_str(buf, f);
-            match col_types[fi] {
-                DirectColType::Text => {
-                    buf.push(1);
-                    for ri in 0..rows.len() {
-                        if let Some(s) = unsafe { (*cells[ri * num_fields + fi]).text() } {
-                            put_str(buf, s);
-                        } else {
-                            return None;
-                        }
-                    }
-                }
-                DirectColType::Int => {
-                    buf.push(2);
-                    for ri in 0..rows.len() {
-                        match unsafe { &*cells[ri * num_fields + fi] } {
-                            Cell::Int(x) => buf.extend_from_slice(&x.to_le_bytes()),
-                            _ => return None,
-                        }
-                    }
-                }
-                DirectColType::Float => {
-                    buf.push(3);
-                    for ri in 0..rows.len() {
-                        match unsafe { &*cells[ri * num_fields + fi] } {
-                            Cell::Float(x) => buf.extend_from_slice(&x.to_le_bytes()),
-                            _ => return None,
-                        }
-                    }
-                }
-                DirectColType::Bool => {
-                    buf.push(4);
-                    for ri in 0..rows.len() {
-                        match unsafe { &*cells[ri * num_fields + fi] } {
-                            Cell::Bool(x) => buf.push(u8::from(*x)),
-                            _ => return None,
-                        }
-                    }
-                }
-                DirectColType::Time => {
-                    buf.push(5);
-                    for ri in 0..rows.len() {
-                        match unsafe { &*cells[ri * num_fields + fi] } {
-                            Cell::Time(x) => buf.extend_from_slice(&x.to_le_bytes()),
-                            _ => return None,
-                        }
-                    }
-                }
-                DirectColType::Vec => {
-                    let mut dense = 0usize;
-                    let mut has_empty = false;
-                    let mut first_emb: Option<&[f32]> = None;
-                    for ri in 0..rows.len() {
-                        match unsafe { &*cells[ri * num_fields + fi] } {
-                            Cell::Vec(emb) => {
-                                if ri == 0 {
-                                    first_emb = Some(emb.as_ref());
-                                }
-                                if emb.is_empty() {
-                                    has_empty = true;
-                                }
-                                dense = dense.saturating_add(
-                                    4usize.saturating_add(emb.len().saturating_mul(4)),
-                                );
-                            }
-                            _ => return None,
-                        }
-                    }
-                    let try_sparse = if has_empty {
-                        true
-                    } else if dense < SPARSE_VECTOR_THRESHOLD {
-                        false
-                    } else if let Some(first_v) = first_emb
-                        && 8usize.saturating_add(count_non_zero_floats(first_v).saturating_mul(8))
-                            > 4usize.saturating_add(first_v.len().saturating_mul(4))
-                    {
-                        return None;
+    for (fi, f) in fields.iter().enumerate() {
+        put_str(buf, f);
+        match col_types[fi] {
+            DirectColType::Text => {
+                buf.push(1);
+                for r in rows {
+                    if let Some(s) = r.cells_slice()[fi].text() {
+                        put_str(buf, s);
                     } else {
-                        true
-                    };
-                    let mut wrote_sparse = false;
-                    if try_sparse {
-                        let mark = buf.len();
-                        buf.push(7);
-                        let payload_start = buf.len();
-                        if append_sparse_cells_parallel(&cells, num_fields, fi, rows.len(), buf)
-                            .is_err()
-                        {
-                            buf.truncate(mark);
-                            return None;
-                        }
-                        let sparse_bytes = buf.len() - payload_start;
-                        if !has_empty && sparse_bytes >= dense {
-                            buf.truncate(mark);
-                        } else {
-                            let storage = rows
-                                .len()
-                                .checked_mul(std::mem::size_of::<Option<Vec<f32>>>())?;
-                            let mut next_decoded = sparse_decoded_bytes.checked_add(storage)?;
-                            for ri in 0..rows.len() {
-                                if let Cell::Vec(emb) = unsafe { &*cells[ri * num_fields + fi] } {
-                                    let bytes = emb.len().checked_mul(4)?;
-                                    next_decoded = next_decoded
-                                        .checked_add(bytes)
-                                        .filter(|&b| b <= MAX_SPARSE_DECODED_BYTES)?;
-                                }
-                            }
-                            sparse_decoded_bytes = next_decoded;
-                            sparse_codec = true;
-                            let vectors = (0..rows.len()).map(|ri| {
-                                match unsafe { &*cells[ri * num_fields + fi] } {
-                                    Cell::Vec(emb) => Some(emb.as_ref()),
-                                    _ => None,
-                                }
-                            });
-                            dictionary_codec |=
-                                rewrite_sparse_as_dictionary(buf, mark, vectors).ok()?;
-                            wrote_sparse = true;
-                        }
+                        return None;
                     }
-                    if !wrote_sparse {
-                        buf.push(6);
-                        for ri in 0..rows.len() {
-                            match unsafe { &*cells[ri * num_fields + fi] } {
-                                Cell::Vec(emb) if !emb.is_empty() => {
-                                    buf.extend_from_slice(&(emb.len() as u32).to_le_bytes());
-                                    #[cfg(target_endian = "little")]
-                                    {
-                                        let bytes = unsafe {
-                                            std::slice::from_raw_parts(
-                                                emb.as_ptr() as *const u8,
-                                                emb.len() * std::mem::size_of::<f32>(),
-                                            )
-                                        };
-                                        buf.extend_from_slice(bytes);
-                                    }
-                                    #[cfg(not(target_endian = "little"))]
-                                    {
-                                        for x in emb.iter() {
-                                            buf.extend_from_slice(&x.to_le_bytes());
-                                        }
+                }
+            }
+            DirectColType::Int => {
+                buf.push(2);
+                for r in rows {
+                    match &r.cells_slice()[fi] {
+                        Cell::Int(x) => buf.extend_from_slice(&x.to_le_bytes()),
+                        _ => return None,
+                    }
+                }
+            }
+            DirectColType::Float => {
+                buf.push(3);
+                for r in rows {
+                    match &r.cells_slice()[fi] {
+                        Cell::Float(x) => buf.extend_from_slice(&x.to_le_bytes()),
+                        _ => return None,
+                    }
+                }
+            }
+            DirectColType::Bool => {
+                buf.push(4);
+                for r in rows {
+                    match &r.cells_slice()[fi] {
+                        Cell::Bool(x) => buf.push(u8::from(*x)),
+                        _ => return None,
+                    }
+                }
+            }
+            DirectColType::Time => {
+                buf.push(5);
+                for r in rows {
+                    match &r.cells_slice()[fi] {
+                        Cell::Time(x) => buf.extend_from_slice(&x.to_le_bytes()),
+                        _ => return None,
+                    }
+                }
+            }
+            DirectColType::Vec => {
+                let mut dense = 0usize;
+                let mut has_empty = false;
+                let mut first_emb: Option<&[f32]> = None;
+                for (ri, r) in rows.iter().enumerate() {
+                    match &r.cells_slice()[fi] {
+                        Cell::Vec(emb) => {
+                            if ri == 0 {
+                                first_emb = Some(emb.as_ref());
+                            }
+                            if emb.is_empty() {
+                                has_empty = true;
+                            }
+                            dense = dense.saturating_add(
+                                4usize.saturating_add(emb.len().saturating_mul(4)),
+                            );
+                        }
+                        _ => return None,
+                    }
+                }
+                let try_sparse = if has_empty {
+                    true
+                } else if dense < SPARSE_VECTOR_THRESHOLD {
+                    false
+                } else if let Some(first_v) = first_emb
+                    && 8usize.saturating_add(count_non_zero_floats(first_v).saturating_mul(8))
+                        > 4usize.saturating_add(first_v.len().saturating_mul(4))
+                {
+                    return None;
+                } else {
+                    true
+                };
+                let mut wrote_sparse = false;
+                if try_sparse {
+                    let mark = buf.len();
+                    buf.push(7);
+                    let payload_start = buf.len();
+                    if append_sparse_rows_field_parallel(rows, fi, rows.len(), buf).is_err() {
+                        buf.truncate(mark);
+                        return None;
+                    }
+                    let sparse_bytes = buf.len() - payload_start;
+                    if !has_empty && sparse_bytes >= dense {
+                        buf.truncate(mark);
+                    } else {
+                        let storage = rows
+                            .len()
+                            .checked_mul(std::mem::size_of::<Option<Vec<f32>>>())?;
+                        let mut next_decoded = sparse_decoded_bytes.checked_add(storage)?;
+                        for r in rows {
+                            if let Cell::Vec(emb) = &r.cells_slice()[fi] {
+                                let bytes = emb.len().checked_mul(4)?;
+                                next_decoded = next_decoded
+                                    .checked_add(bytes)
+                                    .filter(|&b| b <= MAX_SPARSE_DECODED_BYTES)?;
+                            }
+                        }
+                        sparse_decoded_bytes = next_decoded;
+                        sparse_codec = true;
+                        let vectors = rows.iter().map(|r| match &r.cells_slice()[fi] {
+                            Cell::Vec(emb) => Some(emb.as_ref()),
+                            _ => None,
+                        });
+                        dictionary_codec |=
+                            rewrite_sparse_as_dictionary(buf, mark, vectors).ok()?;
+                        wrote_sparse = true;
+                    }
+                }
+                if !wrote_sparse {
+                    buf.push(6);
+                    for r in rows {
+                        match &r.cells_slice()[fi] {
+                            Cell::Vec(emb) if !emb.is_empty() => {
+                                buf.extend_from_slice(&(emb.len() as u32).to_le_bytes());
+                                #[cfg(target_endian = "little")]
+                                {
+                                    let bytes = unsafe {
+                                        std::slice::from_raw_parts(
+                                            emb.as_ptr() as *const u8,
+                                            emb.len() * std::mem::size_of::<f32>(),
+                                        )
+                                    };
+                                    buf.extend_from_slice(bytes);
+                                }
+                                #[cfg(not(target_endian = "little"))]
+                                {
+                                    for x in emb.iter() {
+                                        buf.extend_from_slice(&x.to_le_bytes());
                                     }
                                 }
-                                _ => buf.extend_from_slice(&0u32.to_le_bytes()),
                             }
+                            _ => buf.extend_from_slice(&0u32.to_le_bytes()),
                         }
                     }
                 }
             }
         }
+    }
 
-        Some((
-            if dictionary_codec {
-                LOG_MAGIC_DICTIONARY
-            } else if sparse_codec {
-                LOG_MAGIC_SPARSE
-            } else {
-                LOG_MAGIC_V2
-            },
-            fields,
-        ))
-    })
+    Some((
+        if dictionary_codec {
+            LOG_MAGIC_DICTIONARY
+        } else if sparse_codec {
+            LOG_MAGIC_SPARSE
+        } else {
+            LOG_MAGIC_V2
+        },
+        fields,
+    ))
 }
 
 
@@ -2054,14 +2054,25 @@ pub(crate) fn insert_cols_lossless(rows: &[crate::store::Row]) -> bool {
     let Some(first) = rows.first() else {
         return true;
     };
-    let kinds: Vec<u8> = first.values().map(kind).collect();
-    if kinds.contains(&0) {
-        return false;
+    let Some(first_shape) = first.shape_arc() else {
+        return rows.len() == 1 || rows[1..].iter().all(crate::store::Row::is_empty);
+    };
+    let first_cells = first.cells_slice();
+    let mut kinds: smallvec::SmallVec<[u8; 16]> =
+        smallvec::SmallVec::with_capacity(first_cells.len());
+    for c in first_cells {
+        let k = kind(c);
+        if k == 0 {
+            return false;
+        }
+        kinds.push(k);
     }
     rows[1..].iter().all(|r| {
-        r.len() == first.len()
-            && r.keys().eq(first.keys())
-            && r.values().zip(&kinds).all(|(c, k)| kind(c) == *k)
+        let cells = r.cells_slice();
+        cells.len() == kinds.len()
+            && (r.shape_arc().is_some_and(|s| Arc::ptr_eq(s, first_shape))
+                || r.keys().eq(first.keys()))
+            && cells.iter().zip(&kinds).all(|(c, k)| kind(c) == *k)
     })
 }
 

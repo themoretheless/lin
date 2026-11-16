@@ -6,7 +6,9 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::ast::{Decl, EdgeTarget, InsertEdge, Pred, Record, Stmt, TypeExpr, Value};
 use crate::error::Error;
 use crate::persist::Pack;
-use crate::store::{Cell, Edge, Row, acquire_row, content_hash_arc, now_ms, row_text};
+use crate::store::{
+    Cell, Edge, Row, acquire_row, cell_from_arc_inline, content_hash_inline, now_ms, row_text,
+};
 
 use super::Db;
 use super::eval::{
@@ -15,28 +17,6 @@ use super::eval::{
 };
 use super::graph_ops::edge_row;
 use super::tx::{RowUndo, Undo};
-
-// Precomputed content hash cache: (body_str) -> precomputed_hash
-// Uses lock-free RefCell inside thread_local! to reuse Arc<str> for repeated bodies
-thread_local! {
-    static CONTENT_HASH_CACHE: std::cell::RefCell<FxHashMap<String, Arc<str>>> =
-        std::cell::RefCell::new(FxHashMap::default());
-}
-
-pub(crate) fn cached_content_hash(body: &str) -> Arc<str> {
-    CONTENT_HASH_CACHE.with(|cache| {
-        let mut guard = cache.borrow_mut();
-        if let Some(cached) = guard.get(body) {
-            return Arc::clone(cached);
-        }
-        let hash = content_hash_arc(body);
-        if guard.len() >= 1024 {
-            guard.clear();
-        }
-        guard.insert(body.to_owned(), Arc::clone(&hash));
-        hash
-    })
-}
 
 pub(crate) type StmtExecOut = (Vec<Row>, Option<String>, Option<Pack>, bool, usize);
 
@@ -908,12 +888,10 @@ impl Db {
                 row.insert("id", Cell::text_arc(self.store.alloc_id()));
             }
             if row.get("hash").and_then(Cell::text).is_none()
-                && let Some(body) = row.get("body").and_then(Cell::text_shared)
+                && let Some(body) = row.get("body").and_then(Cell::text)
             {
-                row.insert(
-                    "hash",
-                    Cell::Text(cached_content_hash(body.as_ref())),
-                );
+                let h = content_hash_inline(body);
+                row.insert("hash", Cell::SmallText(h));
             }
             let col_len = self.store.collection(collection).len();
             if col_len > 0 {
@@ -984,7 +962,7 @@ impl Db {
         } else {
             None
         };
-        let (built, all_uniform, all_embedded) =
+        let (built, all_uniform, all_embedded, lossless_cols) =
             build_insert_rows(records, now, needs_embed, hashing_dim);
         // Any record without an explicit id gets a generated one, wherever it sits in the
         // batch (deciding from the first record left later id-less rows without an id).
@@ -999,6 +977,7 @@ impl Db {
                 all_uniform,
                 all_embedded,
                 needs_id,
+                lossless_cols,
                 hashing_dim,
                 now,
             },
@@ -1029,6 +1008,7 @@ impl Db {
             all_uniform,
             all_embedded,
             needs_id,
+            lossless_cols,
             hashing_dim,
             now,
         } = shape;
@@ -1087,16 +1067,10 @@ impl Db {
                     row.insert("id", Cell::text_arc(self.store.alloc_id()));
                 }
                 if row.get("hash").and_then(Cell::text).is_none()
-                    && let Some(body) = row.get("body").and_then(Cell::text_shared)
+                    && let Some(body) = row.get("body").and_then(Cell::text)
                 {
-                    row.insert(
-                        "hash",
-                        Cell::Text(if n >= 512 && body.len() <= 64 {
-                            content_hash_arc(body.as_ref())
-                        } else {
-                            cached_content_hash(body.as_ref())
-                        }),
-                    );
+                    let h = content_hash_inline(body);
+                    row.insert("hash", Cell::SmallText(h));
                 }
                 if let Some(id) = row.get("id").and_then(Cell::text)
                     && (!batch_ids.insert(id)
@@ -1154,7 +1128,7 @@ impl Db {
             && (512..=16384).contains(&n)
             && edges.is_empty()
             && self.persist.is_some()
-            && crate::persist::insert_cols_lossless(&built)
+            && ((lossless_cols && !needs_id) || crate::persist::insert_cols_lossless(&built))
             && (n >= 4096
                 || built
                     .first()
@@ -1430,8 +1404,9 @@ impl Db {
             for (k, v) in &record.fields {
                 updated.insert(k.clone(), value_cell(v, now));
             }
-            if has_body && let Some(body) = row_text(&updated, "body").map(str::to_string) {
-                updated.insert("hash", Cell::Text(cached_content_hash(&body)));
+            if has_body && let Some(body) = row_text(&updated, "body") {
+                let h = content_hash_inline(body);
+                updated.insert("hash", Cell::SmallText(h));
             }
             if reembed {
                 updated.remove("embedding");
@@ -1784,6 +1759,25 @@ fn check_batch_unique_records(
     })
 }
 
+#[inline]
+fn cell_lossless_kind(cell: &Cell) -> u8 {
+    match cell {
+        Cell::Null => 0,
+        Cell::Text(_) | Cell::SmallText(_) => 1,
+        Cell::Int(_) => 2,
+        Cell::Float(_) => 3,
+        Cell::Bool(_) => 4,
+        Cell::Time(_) => 5,
+        Cell::Vec(v) => {
+            if v.is_empty() {
+                0
+            } else {
+                6
+            }
+        }
+    }
+}
+
 struct BuildRowsJob {
     records_ptr: usize,
     records_len: usize,
@@ -1796,7 +1790,7 @@ struct BuildRowsJob {
 
 struct BuildRowsPool {
     workers: Vec<std::sync::mpsc::SyncSender<BuildRowsJob>>,
-    done_rx: std::sync::mpsc::Receiver<(bool, bool)>,
+    done_rx: std::sync::mpsc::Receiver<(bool, bool, bool)>,
 }
 
 /// What [`build_insert_rows`] (or a column batch) established about the built rows.
@@ -1808,6 +1802,8 @@ pub(crate) struct BuiltShape {
     pub all_embedded: bool,
     /// Some row has no `id` and needs a generated one.
     pub needs_id: bool,
+    /// Every built row shares a single shape and uniform non-null column types.
+    pub lossless_cols: bool,
     pub hashing_dim: Option<usize>,
     /// Time the rows were built at (edge targets such as `now` resolve to it).
     pub now: i64,
@@ -1818,10 +1814,10 @@ fn build_insert_rows(
     now: i64,
     needs_embed: bool,
     hashing_dim: Option<usize>,
-) -> (Vec<Row>, bool, bool) {
+) -> (Vec<Row>, bool, bool, bool) {
     let n = records.len();
     if n == 0 {
-        return (Vec::new(), false, !needs_embed);
+        return (Vec::new(), false, !needs_embed, false);
     }
     if n >= 512 {
         static POOL: std::sync::OnceLock<std::sync::Mutex<Option<BuildRowsPool>>> =
@@ -1835,7 +1831,8 @@ fn build_insert_rows(
                 return std::sync::Mutex::new(None);
             }
             let num_workers = threads - 1;
-            let (done_tx, done_rx) = std::sync::mpsc::sync_channel::<(bool, bool)>(num_workers);
+            let (done_tx, done_rx) =
+                std::sync::mpsc::sync_channel::<(bool, bool, bool)>(num_workers);
             let mut workers = Vec::with_capacity(num_workers);
             for idx in 0..num_workers {
                 let (tx, rx) = std::sync::mpsc::sync_channel::<BuildRowsJob>(1);
@@ -1892,7 +1889,7 @@ fn build_insert_rows(
                 let first_recs = rec_chunks.next().unwrap();
                 let first_out = out_chunks.next().unwrap();
                 struct DispatchedDrainGuard<'a> {
-                    done_rx: &'a std::sync::mpsc::Receiver<(bool, bool)>,
+                    done_rx: &'a std::sync::mpsc::Receiver<(bool, bool, bool)>,
                     pending: usize,
                 }
                 impl Drop for DispatchedDrainGuard<'_> {
@@ -1906,6 +1903,7 @@ fn build_insert_rows(
                     done_rx: &pool.done_rx,
                     pending: 0,
                 };
+                let mut boundaries: smallvec::SmallVec<[usize; 8]> = smallvec::SmallVec::new();
                 let mut fallback_start = first_recs.len();
                 for ((worker, r_chunk), o_chunk) in
                     pool.workers.iter().zip(rec_chunks).zip(out_chunks)
@@ -1921,21 +1919,24 @@ fn build_insert_rows(
                     };
                     if worker.send(job).is_ok() {
                         drain_guard.pending += 1;
+                        boundaries.push(fallback_start);
                         fallback_start += r_chunk.len();
                     } else {
                         break;
                     }
                 }
-                let (mut all_uniform, mut all_embedded) = build_batch_shape_rows_into(
-                    first_out,
-                    first_recs,
-                    now,
-                    needs_embed,
-                    hashing_dim,
-                    n,
-                );
+                let (mut all_uniform, mut all_embedded, mut lossless_cols) =
+                    build_batch_shape_rows_into(
+                        first_out,
+                        first_recs,
+                        now,
+                        needs_embed,
+                        hashing_dim,
+                        n,
+                    );
                 if fallback_start < n {
-                    let (u, e) = build_batch_shape_rows_into(
+                    boundaries.push(fallback_start);
+                    let (u, e, l) = build_batch_shape_rows_into(
                         &mut spare[fallback_start..n],
                         &records[fallback_start..n],
                         now,
@@ -1945,31 +1946,54 @@ fn build_insert_rows(
                     );
                     all_uniform &= u;
                     all_embedded &= e;
+                    lossless_cols &= l;
                 }
                 while drain_guard.pending > 0 {
                     drain_guard.pending -= 1;
-                    if let Ok((u, e)) = drain_guard.done_rx.recv() {
+                    if let Ok((u, e, l)) = drain_guard.done_rx.recv() {
                         all_uniform &= u;
                         all_embedded &= e;
+                        lossless_cols &= l;
                     }
                 }
                 drop(drain_guard);
                 unsafe {
                     rows.set_len(n);
                 }
-                return (rows, all_uniform, all_embedded);
+                if (all_uniform || lossless_cols) && let Some(fs) = rows[0].shape_arc() {
+                    let first_cells = rows[0].cells_slice();
+                    for &bi in &boundaries {
+                        let same_shape = rows[bi]
+                            .shape_arc()
+                            .is_some_and(|s| Arc::ptr_eq(s, fs));
+                        all_uniform &= same_shape;
+                        if lossless_cols {
+                            lossless_cols = same_shape
+                                && rows[bi].cells_slice().len() == first_cells.len()
+                                && rows[bi]
+                                    .cells_slice()
+                                    .iter()
+                                    .zip(first_cells)
+                                    .all(|(a, b)| cell_lossless_kind(a) == cell_lossless_kind(b));
+                        }
+                    }
+                } else {
+                    all_uniform = false;
+                    lossless_cols = false;
+                }
+                return (rows, all_uniform, all_embedded, lossless_cols);
             }
         }
     }
 
     let mut rows: Vec<Row> = Vec::with_capacity(n);
     let spare = &mut rows.spare_capacity_mut()[..n];
-    let (all_uniform, all_embedded) =
+    let (all_uniform, all_embedded, lossless_cols) =
         build_batch_shape_rows_into(spare, records, now, needs_embed, hashing_dim, n);
     unsafe {
         rows.set_len(n);
     }
-    (rows, all_uniform, all_embedded)
+    (rows, all_uniform, all_embedded, lossless_cols)
 }
 
 fn build_batch_shape_rows_into(
@@ -1979,15 +2003,15 @@ fn build_batch_shape_rows_into(
     needs_embed: bool,
     hashing_dim: Option<usize>,
     total_n: usize,
-) -> (bool, bool) {
+) -> (bool, bool, bool) {
     let Some(first) = records.first() else {
-        return (false, !needs_embed);
+        return (false, !needs_embed, false);
     };
     if total_n < 128 || first.fields.is_empty() || first.fields.len() > 32 {
         for (slot_out, record) in out.iter_mut().zip(records) {
             slot_out.write(record_row(record, now));
         }
-        return (false, !needs_embed);
+        return (false, !needs_embed, false);
     }
     let body_idx = first.fields.iter().rposition(|(k, _)| k == "body");
     let has_hash = first.fields.iter().any(|(k, _)| k == "hash");
@@ -2008,10 +2032,14 @@ fn build_batch_shape_rows_into(
     if needs_embed {
         template.insert("embedding", Cell::Null);
     }
+    let Some(shape) = template.shape_arc().cloned() else {
+        return (false, !needs_embed, false);
+    };
 
     #[derive(Clone, Copy)]
     enum ShapeSlot {
         Source(usize),
+        Body(usize),
         Hash(usize),
         Embed,
     }
@@ -2024,18 +2052,33 @@ fn build_batch_shape_rows_into(
             } else if key == "embedding" && needs_embed {
                 ShapeSlot::Embed
             } else {
-                ShapeSlot::Source(
-                    first
-                        .fields
-                        .iter()
-                        .rposition(|(field, _)| field == key)
-                        .unwrap(),
-                )
+                let src = first
+                    .fields
+                    .iter()
+                    .rposition(|(field, _)| field == key)
+                    .unwrap();
+                if key == "body" {
+                    ShapeSlot::Body(src)
+                } else {
+                    ShapeSlot::Source(src)
+                }
             }
         })
         .collect::<Vec<_>>();
+    let width = slots.len();
+    if width > 32 {
+        for (slot_out, record) in out.iter_mut().zip(records) {
+            slot_out.write(record_row(record, now));
+        }
+        return (false, !needs_embed, false);
+    }
+
     let mut all_same = true;
     let mut all_embedded = !needs_embed || can_inline_embed;
+    let mut lossless_cols = true;
+    let mut first_kinds = [0u8; 32];
+    let mut have_first_kinds = false;
+
     let mut process_rows = |mut embed_batch: Option<&mut crate::embed::HashingBatch<'_>>| {
         for (slot_out, record) in out.iter_mut().zip(records) {
             let same_shape = record.fields.len() == first.fields.len()
@@ -2046,6 +2089,7 @@ fn build_batch_shape_rows_into(
                     .all(|(a, b)| a.0 == b.0);
             if !same_shape {
                 all_same = false;
+                lossless_cols = false;
                 if needs_embed {
                     all_embedded = false;
                 }
@@ -2089,31 +2133,80 @@ fn build_batch_shape_rows_into(
             } else {
                 None
             };
-            let mut row = template.clone();
-            for (cell, slot) in row.values_mut().zip(&slots) {
-                match slot {
-                    ShapeSlot::Source(src) => {
-                        *cell = value_cell(&record.fields[*src].1, now);
-                    }
-                    ShapeSlot::Hash(b_src) => {
-                        if let Value::String(body) = &record.fields[*b_src].1 {
-                            *cell = Cell::Text(if total_n >= 512 && body.len() <= 64 {
-                                content_hash_arc(body.as_ref())
+
+            macro_rules! eval_slot_cell {
+                ($slot:expr) => {
+                    match $slot {
+                        ShapeSlot::Source(src) => value_cell(&record.fields[*src].1, now),
+                        ShapeSlot::Body(src) => match &record.fields[*src].1 {
+                            Value::String(s) => cell_from_arc_inline(s),
+                            other => value_cell(other, now),
+                        },
+                        ShapeSlot::Hash(b_src) => {
+                            if let Value::String(body) = &record.fields[*b_src].1 {
+                                Cell::SmallText(content_hash_inline(body.as_ref()))
                             } else {
-                                cached_content_hash(body.as_ref())
-                            });
-                        } else {
-                            all_same = false;
+                                all_same = false;
+                                lossless_cols = false;
+                                Cell::Null
+                            }
                         }
+                        ShapeSlot::Embed => match emb_vec.take() {
+                            Some(v) => Cell::Vec(v),
+                            None => Cell::Null,
+                        },
                     }
-                    ShapeSlot::Embed => {
-                        if let Some(v) = emb_vec.take() {
-                            *cell = Cell::Vec(v);
+                };
+            }
+
+            if width <= 8 {
+                let mut cells: smallvec::SmallVec<[Cell; 8]> =
+                    smallvec::SmallVec::with_capacity(width);
+                if !have_first_kinds {
+                    for (ci, slot) in slots.iter().enumerate() {
+                        let cell = eval_slot_cell!(slot);
+                        let k = cell_lossless_kind(&cell);
+                        first_kinds[ci] = k;
+                        if k == 0 {
+                            lossless_cols = false;
                         }
+                        cells.push(cell);
+                    }
+                    have_first_kinds = true;
+                } else {
+                    for (ci, slot) in slots.iter().enumerate() {
+                        let cell = eval_slot_cell!(slot);
+                        if lossless_cols && cell_lossless_kind(&cell) != first_kinds[ci] {
+                            lossless_cols = false;
+                        }
+                        cells.push(cell);
                     }
                 }
+                slot_out.write(Row::from_parts(Arc::clone(&shape), cells));
+            } else {
+                let mut cells = Vec::with_capacity(width);
+                if !have_first_kinds {
+                    for (ci, slot) in slots.iter().enumerate() {
+                        let cell = eval_slot_cell!(slot);
+                        let k = cell_lossless_kind(&cell);
+                        first_kinds[ci] = k;
+                        if k == 0 {
+                            lossless_cols = false;
+                        }
+                        cells.push(cell);
+                    }
+                    have_first_kinds = true;
+                } else {
+                    for (ci, slot) in slots.iter().enumerate() {
+                        let cell = eval_slot_cell!(slot);
+                        if lossless_cols && cell_lossless_kind(&cell) != first_kinds[ci] {
+                            lossless_cols = false;
+                        }
+                        cells.push(cell);
+                    }
+                }
+                slot_out.write(Row::from_vec_parts(Arc::clone(&shape), cells));
             }
-            slot_out.write(row);
         }
     };
     if let Some(dim) = hashing_dim.filter(|_| can_inline_embed) {
@@ -2121,7 +2214,7 @@ fn build_batch_shape_rows_into(
     } else {
         process_rows(None);
     }
-    (all_same, all_embedded)
+    (all_same, all_embedded, lossless_cols && all_same)
 }
 
 #[cfg(test)]
@@ -2138,7 +2231,7 @@ pub(super) fn append_batch_shape_rows(
     rows.reserve(n);
     let old_len = rows.len();
     let spare = &mut rows.spare_capacity_mut()[..n];
-    let (all_same, _) = build_batch_shape_rows_into(spare, records, now, needs_embed, None, n);
+    let (all_same, _, _) = build_batch_shape_rows_into(spare, records, now, needs_embed, None, n);
     unsafe {
         rows.set_len(old_len + n);
     }

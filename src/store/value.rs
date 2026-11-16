@@ -633,6 +633,20 @@ pub fn content_hash_arc(body: &str) -> Arc<str> {
     Arc::from(unsafe { std::str::from_utf8_unchecked(&buf) })
 }
 
+#[inline]
+pub fn content_hash_inline(body: &str) -> InlineStr {
+    let h = fnv1a64(body.as_bytes());
+    let mut buf = [0u8; 22];
+    buf[0] = b'h';
+    buf[1] = b':';
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for i in 0..16 {
+        let shift = (15 - i) * 4;
+        buf[2 + i] = HEX[((h >> shift) & 0xf) as usize];
+    }
+    InlineStr { len: 18, buf }
+}
+
 pub fn fnv1a64(bytes: &[u8]) -> u64 {
     let mut h = 0xcbf29ce484222325u64;
     for b in bytes {

@@ -214,6 +214,25 @@ impl Row {
         }
     }
 
+    #[inline]
+    pub fn from_vec_parts(shape: Arc<Shape>, vec: Vec<Cell>) -> Self {
+        debug_assert_eq!(vec.len(), shape.names.len());
+        Row {
+            shape: Some(shape),
+            cells: SmallVec::from_vec(vec),
+        }
+    }
+
+    #[inline]
+    pub fn shape_arc(&self) -> Option<&Arc<Shape>> {
+        self.shape.as_ref()
+    }
+
+    #[inline]
+    pub fn cells_slice(&self) -> &[Cell] {
+        &self.cells
+    }
+
     /// Replace this row's contents in place from a precomputed [`Shape`] and cells in
     /// sorted field-name order, reusing the row's inline buffer.
     #[inline]

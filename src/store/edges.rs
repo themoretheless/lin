@@ -1,12 +1,18 @@
 //! Graph edge storage, zero-allocation nested adjacency indexes, and SPO fact triple indexing.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
 use super::Store;
 use super::value::{Cell, Row, spo_key};
+
+#[inline]
+pub(super) fn facts_ops_shape() -> &'static Arc<super::row::Shape> {
+    static SHAPE: OnceLock<Arc<super::row::Shape>> = OnceLock::new();
+    SHAPE.get_or_init(|| Row::shape_of(&["o", "p", "s"]))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Edge {
@@ -182,10 +188,14 @@ impl Store {
         self.facts_s.push(Arc::clone(&sa));
         self.facts_p.push(Arc::clone(&pa));
         self.facts_o.push(Arc::clone(&oa));
-        let mut built = Row::new();
-        built.insert("s", Cell::Text(sa));
-        built.insert("p", Cell::Text(pa));
-        built.insert("o", Cell::Text(oa));
+        let built = Row::from_parts(
+            Arc::clone(facts_ops_shape()),
+            [
+                Cell::Text(oa),
+                Cell::Text(pa),
+                Cell::Text(sa),
+            ],
+        );
         if self.facts_rows_stale {
             self.ensure_facts_rows();
         } else {
@@ -226,11 +236,14 @@ impl Store {
             match self.facts_by_spo.entry(key) {
                 std::collections::hash_map::Entry::Occupied(_) => {
                     if want_rows {
-                        let mut row = Row::new();
-                        row.insert("s", Cell::Text(Arc::clone(&s[i])));
-                        row.insert("p", Cell::Text(Arc::clone(&p[i])));
-                        row.insert("o", Cell::Text(Arc::clone(&o[i])));
-                        rows.push(row);
+                        rows.push(Row::from_parts(
+                            Arc::clone(facts_ops_shape()),
+                            [
+                                Cell::Text(Arc::clone(&o[i])),
+                                Cell::Text(Arc::clone(&p[i])),
+                                Cell::Text(Arc::clone(&s[i])),
+                            ],
+                        ));
                     }
                 }
                 std::collections::hash_map::Entry::Vacant(e) => {
@@ -241,11 +254,14 @@ impl Store {
                     self.facts_o.push(Arc::clone(&o[i]));
                     changed += 1;
                     if want_rows {
-                        let mut row = Row::new();
-                        row.insert("s", Cell::Text(Arc::clone(&self.facts_s[idx])));
-                        row.insert("p", Cell::Text(Arc::clone(&self.facts_p[idx])));
-                        row.insert("o", Cell::Text(Arc::clone(&self.facts_o[idx])));
-                        rows.push(row);
+                        rows.push(Row::from_parts(
+                            Arc::clone(facts_ops_shape()),
+                            [
+                                Cell::Text(Arc::clone(&self.facts_o[idx])),
+                                Cell::Text(Arc::clone(&self.facts_p[idx])),
+                                Cell::Text(Arc::clone(&self.facts_s[idx])),
+                            ],
+                        ));
                     }
                 }
             }
@@ -261,13 +277,13 @@ impl Store {
                 let in_step = !self.facts_rows_stale
                     && self.collections.get("facts").map_or(0, Vec::len) == first_new;
                 if in_step {
-                    // One shared shape: each row is an `Arc` clone plus three cells.
-                    let shape = Row::shape_of(&["o", "p", "s"]);
+                    // One shared shape: each row is an `Arc` clone plus three `Cell::Text(Arc::clone)` cells.
+                    let shape = facts_ops_shape();
                     let facts = self.collections.entry("facts".into()).or_default();
                     facts.reserve(changed);
                     for idx in first_new..self.facts_s.len() {
                         facts.push(Row::from_parts(
-                            Arc::clone(&shape),
+                            Arc::clone(shape),
                             [
                                 Cell::Text(Arc::clone(&self.facts_o[idx])),
                                 Cell::Text(Arc::clone(&self.facts_p[idx])),
@@ -282,6 +298,15 @@ impl Store {
             }
         }
         (rows, changed)
+    }
+
+    pub(crate) fn append_prepared_facts(
+        &mut self,
+        s: &[Arc<str>],
+        p: &[Arc<str>],
+        o: &[Arc<str>],
+    ) -> usize {
+        self.append_facts_spo_bulk(s, p, o, false).1
     }
 
     pub fn append_edge_parts(&mut self, rel: &str, from: &str, to: &str) -> bool {

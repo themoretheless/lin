@@ -4739,7 +4739,7 @@ fn run_suite(mut suite: Suite<'_>, args: &[String]) -> airbug_bench::Result<()> 
     }
     let mut selection = airbug_bench::Selection::default();
     let mut list = false;
-    let mut json = false;
+    let mut json = std::env::var_os("AIRBUG_BENCH_RUNNER").is_some_and(|v| v == "1");
     let mut output = None;
     let mut i = 0;
     while i < args.len() {
@@ -4835,29 +4835,26 @@ fn run_suite(mut suite: Suite<'_>, args: &[String]) -> airbug_bench::Result<()> 
             "benchmarks require an optimized build; use cargo bench or cargo run --release",
         ));
     }
-    let selected = suite.list_selected(&selection);
-    let total = selected.len();
+    let runner_mode = std::env::var_os("AIRBUG_BENCH_RUNNER").is_some_and(|v| v == "1");
+    let otlp = OtlpEmitter::from_env(output.is_some());
+    let selected_ids: Vec<String> = suite
+        .list_selected(&selection)
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let total = selected_ids.len();
+
     if let Some(p) = output.as_ref() {
         let dir = std::path::Path::new(p);
-        if let Some(parent) = dir.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent).map_err(|e| airbug_bench::error(e.to_string()))?;
-            }
+        if dir.join("run.json").exists() {
+            return Err(airbug_bench::error(format!(
+                "run.json already exists in {}",
+                dir.display()
+            )));
         }
-        if !dir.exists() {
-            std::fs::create_dir(dir).map_err(|e| airbug_bench::error(e.to_string()))?;
-        }
-        let progress = serde_json::json!({
-            "state": "running",
-            "completed": 0,
-            "total": total,
-            "variant": "compare"
-        });
-        std::fs::write(
-            dir.join("progress.json"),
-            serde_json::to_string_pretty(&progress)?,
-        )
-        .map_err(|e| airbug_bench::error(e.to_string()))?;
+        std::fs::create_dir_all(dir.join("logs"))
+            .map_err(|e| airbug_bench::error(e.to_string()))?;
+        write_progress_atomic(dir, "running", 0, total, "compare")?;
         if let Ok(url) = std::env::var("AIRBUG_DASH_URL") {
             eprintln!("airbug dash: {url}");
         } else if let Ok(hub) = std::env::var("AIRBUG_HUB") {
@@ -4868,53 +4865,525 @@ fn run_suite(mut suite: Suite<'_>, args: &[String]) -> airbug_bench::Result<()> 
     } else {
         eprintln!("airbug dash: http://127.0.0.1:8790/#/bench");
     }
-    let run_result = suite.run_selected(&selection);
-    if let Some(p) = output.as_ref() {
+
+    let run = if let (Some(p), false) = (output.as_ref(), runner_mode || selected_ids.is_empty()) {
         let dir = std::path::Path::new(p);
-        let final_state = if run_result.is_ok() {
-            "complete"
-        } else {
-            "failed"
-        };
-        let _ = std::fs::write(
-            dir.join("status-final.json"),
-            serde_json::to_string_pretty(&serde_json::json!({
-                "state": final_state,
-                "error": run_result.as_ref().err().map(|e| e.to_string()),
-            }))?,
-        );
-        let progress = serde_json::json!({
-            "state": final_state,
-            "completed": total,
-            "total": total,
-            "variant": "compare"
-        });
-        let _ = std::fs::write(
-            dir.join("progress.json"),
-            serde_json::to_string_pretty(&progress)?,
-        );
-    }
-    let run = run_result?;
-    if let Some(p) = output {
-        let dir = std::path::Path::new(&p);
-        // Hub may have already created the directory; write artifacts in place.
-        let run_path = dir.join("run.json");
-        if run_path.exists() {
-            return Err(airbug_bench::error(format!(
-                "run.json already exists in {}",
-                dir.display()
-            )));
+        let mut combined = airbug_bench::Run::new();
+        combined.status = airbug_bench::Status::Incomplete;
+
+        for (idx, case_id) in selected_ids.iter().enumerate() {
+            write_progress_atomic(
+                dir,
+                "running",
+                idx,
+                total,
+                &format!("{case_id} ({}/{total})", idx + 1),
+            )?;
+            append_compare_log(dir, &format!("[{}/{total}] running {case_id}\n", idx + 1));
+
+            let mut single_sel = airbug_bench::Selection::default();
+            single_sel.pattern = case_id.clone();
+            single_sel.exact = true;
+            single_sel.include_ignored = selection.include_ignored;
+            single_sel.only_ignored = selection.only_ignored;
+
+            let start_ns = now_unix_nanos();
+            let part_res = suite.run_selected(&single_sel);
+            let end_ns = now_unix_nanos().max(start_ns.saturating_add(1));
+
+            let part = match part_res {
+                Ok(part) => part,
+                Err(err) => {
+                    let msg = err.to_string();
+                    append_compare_log(
+                        dir,
+                        &format!("[{}/{total}] failed  {case_id}: {msg}\n", idx + 1),
+                    );
+                    let _ = write_status_final_atomic(dir, "failed", Some(&msg));
+                    let _ = write_progress_atomic(dir, "failed", idx, total, case_id);
+                    return Err(err);
+                }
+            };
+
+            let (median_ns, throughput) = summarize_single_case(&part);
+            merge_bench_run(&mut combined, part);
+
+            write_atomic(
+                dir,
+                "run.json",
+                serde_json::to_string_pretty(&combined)?.as_bytes(),
+            )?;
+            write_progress_atomic(
+                dir,
+                "running",
+                idx + 1,
+                total,
+                &format!("done {case_id} ({}/{total})", idx + 1),
+            )?;
+            let summary_line = format_case_log(idx + 1, total, case_id, median_ns, throughput.as_ref());
+            append_compare_log(dir, &summary_line);
+            otlp.emit_case(
+                idx as u64 + 1,
+                case_id,
+                start_ns,
+                end_ns,
+                median_ns,
+                throughput.as_ref().map(|(r, u)| (*r, u.as_str())),
+            );
         }
-        std::fs::write(&run_path, serde_json::to_string_pretty(&run)?)
-            .map_err(|e| airbug_bench::error(e.to_string()))?;
-        let html = airbug_bench::report::html_run(&run)?;
-        std::fs::write(dir.join("report.html"), html)
-            .map_err(|e| airbug_bench::error(e.to_string()))?;
-    }
+
+        combined.status = airbug_bench::Status::Complete;
+        combined.validate()?;
+        write_atomic(
+            dir,
+            "run.json",
+            serde_json::to_string_pretty(&combined)?.as_bytes(),
+        )?;
+        let html = airbug_bench::report::html_run(&combined)?;
+        write_atomic(dir, "report.html", html.as_bytes())?;
+        write_progress_atomic(dir, "complete", total, total, "complete")?;
+        write_status_final_atomic(dir, "complete", None)?;
+        combined
+    } else {
+        let start_ns = now_unix_nanos();
+        let run_result = suite.run_selected(&selection);
+        let end_ns = now_unix_nanos().max(start_ns.saturating_add(1));
+        if let Some(p) = output.as_ref() {
+            let dir = std::path::Path::new(p);
+            let final_state = if run_result.is_ok() { "complete" } else { "failed" };
+            let err_str = run_result.as_ref().err().map(|e| e.to_string());
+            let _ = write_status_final_atomic(dir, final_state, err_str.as_deref());
+            let _ = write_progress_atomic(dir, final_state, total, total, "compare");
+        }
+        let run = run_result?;
+        emit_batch_otlp(&otlp, &run, start_ns, end_ns);
+        if let Some(p) = output.as_ref() {
+            let dir = std::path::Path::new(p);
+            write_atomic(
+                dir,
+                "run.json",
+                serde_json::to_string_pretty(&run)?.as_bytes(),
+            )?;
+            let html = airbug_bench::report::html_run(&run)?;
+            write_atomic(dir, "report.html", html.as_bytes())?;
+        }
+        run
+    };
+
     if json {
-        println!("RBENCH_RESULT={}", serde_json::to_string(&run)?);
+        println!("BENCH_RESULT={}", serde_json::to_string(&run)?);
     } else {
         println!("{}", airbug_bench::report::markdown(&run)?);
     }
     Ok(())
+}
+
+fn now_unix_nanos() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+}
+
+fn write_atomic(dir: &std::path::Path, name: &str, bytes: &[u8]) -> airbug_bench::Result<()> {
+    let tmp = dir.join(format!(".{name}.tmp"));
+    std::fs::write(&tmp, bytes).map_err(|e| airbug_bench::error(e.to_string()))?;
+    std::fs::rename(&tmp, dir.join(name)).map_err(|e| airbug_bench::error(e.to_string()))
+}
+
+fn write_progress_atomic(
+    dir: &std::path::Path,
+    state: &str,
+    completed: usize,
+    total: usize,
+    variant: &str,
+) -> airbug_bench::Result<()> {
+    let progress = serde_json::json!({
+        "state": state,
+        "completed": completed,
+        "total": total,
+        "variant": variant
+    });
+    write_atomic(
+        dir,
+        "progress.json",
+        serde_json::to_string_pretty(&progress)?.as_bytes(),
+    )
+}
+
+fn write_status_final_atomic(
+    dir: &std::path::Path,
+    state: &str,
+    error: Option<&str>,
+) -> airbug_bench::Result<()> {
+    write_atomic(
+        dir,
+        "status-final.json",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "state": state,
+            "error": error,
+        }))?
+        .as_bytes(),
+    )
+}
+
+fn append_compare_log(dir: &std::path::Path, line: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("logs").join("compare.log"))
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
+fn merge_bench_run(dst: &mut airbug_bench::Run, src: airbug_bench::Run) {
+    dst.provenance.extend(src.provenance);
+    dst.cases.extend(src.cases);
+    dst.observations.extend(src.observations);
+    dst.worker_allocations.extend(src.worker_allocations);
+    dst.worker_timings.extend(src.worker_timings);
+    for note in src.notes {
+        if !dst.notes.contains(&note) {
+            dst.notes.push(note);
+        }
+    }
+}
+
+fn summarize_case_by_id(run: &airbug_bench::Run, case: &airbug_bench::Case) -> (Option<f64>, Option<(f64, String)>) {
+    let is_batch_total = case
+        .metrics
+        .iter()
+        .find(|m| m.id == "wall")
+        .is_some_and(|m| m.statistic == "batch_total");
+    let mut vals: Vec<f64> = run
+        .observations
+        .iter()
+        .filter(|o| {
+            o.case == case.id
+                && o.metric == "wall"
+                && o.availability == airbug_bench::Availability::Available
+        })
+        .filter_map(|o| {
+            let v = o.number().ok().flatten()?;
+            let per_op = if is_batch_total {
+                v / (o.operations.max(1) as f64)
+            } else {
+                v
+            };
+            (per_op.is_finite() && per_op > 0.0).then_some(per_op)
+        })
+        .collect();
+    if vals.is_empty() {
+        return (None, None);
+    }
+    vals.sort_by(f64::total_cmp);
+    let mid = vals.len() / 2;
+    let med = if vals.len() % 2 == 1 {
+        vals[mid]
+    } else {
+        (vals[mid - 1] + vals[mid]) * 0.5
+    };
+    let throughput = case.contract.get("work.unit").and_then(|unit| {
+        let count = case
+            .contract
+            .get("work.count")
+            .and_then(|s| s.parse::<f64>().ok())?;
+        if count > 0.0 && med > 0.0 {
+            Some((count * 1_000_000_000.0 / med, format!("{unit}/s")))
+        } else {
+            None
+        }
+    });
+    (Some(med), throughput)
+}
+
+fn summarize_single_case(run: &airbug_bench::Run) -> (Option<f64>, Option<(f64, String)>) {
+    let Some(case) = run.cases.first() else {
+        return (None, None);
+    };
+    summarize_case_by_id(run, case)
+}
+
+fn format_case_log(
+    step: usize,
+    total: usize,
+    case_id: &str,
+    median_ns: Option<f64>,
+    throughput: Option<&(f64, String)>,
+) -> String {
+    let med = match median_ns {
+        Some(ns) if ns >= 1_000_000.0 => format!("{:.2} ms", ns / 1_000_000.0),
+        Some(ns) if ns >= 1_000.0 => format!("{:.2} us", ns / 1_000.0),
+        Some(ns) => format!("{ns:.2} ns"),
+        None => "n/a".into(),
+    };
+    match throughput {
+        Some((rate, unit)) => format!("[{step}/{total}] done    {case_id} · median={med} · {rate:.1} {unit}\n"),
+        None => format!("[{step}/{total}] done    {case_id} · median={med}\n"),
+    }
+}
+
+fn emit_batch_otlp(otlp: &OtlpEmitter, run: &airbug_bench::Run, start_ns: u128, end_ns: u128) {
+    if !otlp.is_enabled() {
+        return;
+    }
+    let count = run.cases.len().max(1) as u128;
+    let span = end_ns.saturating_sub(start_ns).max(count);
+    for (idx, case) in run.cases.iter().enumerate() {
+        let s_ns = start_ns + (span * idx as u128) / count;
+        let e_ns = (start_ns + (span * (idx as u128 + 1)) / count).max(s_ns.saturating_add(1));
+        let (median_ns, throughput) = summarize_case_by_id(run, case);
+        otlp.emit_case(
+            idx as u64 + 1,
+            &case.id,
+            s_ns,
+            e_ns,
+            median_ns,
+            throughput.as_ref().map(|(r, u)| (*r, u.as_str())),
+        );
+    }
+}
+
+struct OtlpEmitter {
+    addrs: Vec<std::net::SocketAddr>,
+    host_header: String,
+    base_path: String,
+    resource_attrs: Vec<serde_json::Value>,
+}
+
+impl OtlpEmitter {
+    fn from_env(has_output: bool) -> Self {
+        let raw_endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                std::env::var("AIRBUG_HUB")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+            })
+            .or_else(|| {
+                (has_output && std::env::var_os("AIRBUG_HUB").is_none())
+                    .then(|| "http://127.0.0.1:8790".to_string())
+            });
+
+        let mut addrs = Vec::new();
+        let mut host_header = String::new();
+        let mut base_path = String::new();
+        if let Some((hh, bp, resolved)) = raw_endpoint.as_deref().and_then(parse_http_endpoint) {
+            host_header = hh;
+            base_path = bp;
+            addrs = resolved;
+        }
+
+        let mut attr_map = std::collections::BTreeMap::<String, String>::new();
+        attr_map.insert("service.name".into(), "lin-bench".into());
+        if let Ok(raw_attrs) = std::env::var("OTEL_RESOURCE_ATTRIBUTES") {
+            for pair in raw_attrs.split(',') {
+                if let Some((k, v)) = pair.split_once('=') {
+                    let k = k.trim();
+                    let v = v.trim();
+                    if !k.is_empty() && !v.is_empty() {
+                        attr_map.insert(k.to_string(), v.to_string());
+                    }
+                }
+            }
+        }
+        let resource_attrs = attr_map
+            .into_iter()
+            .map(|(k, v)| serde_json::json!({ "key": k, "value": { "stringValue": v } }))
+            .collect();
+
+        Self {
+            addrs,
+            host_header,
+            base_path,
+            resource_attrs,
+        }
+    }
+
+    fn is_enabled(&self) -> bool {
+        !self.addrs.is_empty()
+    }
+
+    fn emit_case(
+        &self,
+        seq: u64,
+        case_id: &str,
+        start_ns: u128,
+        end_ns: u128,
+        median_ns: Option<f64>,
+        throughput: Option<(f64, &str)>,
+    ) {
+        if self.addrs.is_empty() {
+            return;
+        }
+        let (trace_id, span_id) = trace_ids_for(seq, case_id, end_ns);
+        let mut span_attrs = vec![serde_json::json!({
+            "key": "bench.case",
+            "value": { "stringValue": case_id }
+        })];
+        if let Some(m) = median_ns {
+            span_attrs.push(serde_json::json!({
+                "key": "bench.median_ns",
+                "value": { "doubleValue": m }
+            }));
+        }
+        let trace_body = serde_json::json!({
+            "resourceSpans": [{
+                "resource": { "attributes": self.resource_attrs },
+                "scopeSpans": [{
+                    "scope": { "name": "lin.bench", "version": env!("CARGO_PKG_VERSION") },
+                    "spans": [{
+                        "traceId": trace_id,
+                        "spanId": span_id,
+                        "name": case_id,
+                        "kind": 1,
+                        "startTimeUnixNano": start_ns.to_string(),
+                        "endTimeUnixNano": end_ns.to_string(),
+                        "status": { "code": 1 },
+                        "attributes": span_attrs
+                    }]
+                }]
+            }]
+        });
+        if let Ok(bytes) = serde_json::to_vec(&trace_body) {
+            self.post_json("/v1/traces", &bytes);
+        }
+
+        if let Some(m) = median_ns {
+            let mut metrics = vec![serde_json::json!({
+                "name": "lin.bench.median_ns",
+                "unit": "ns",
+                "gauge": {
+                    "dataPoints": [{
+                        "timeUnixNano": end_ns.to_string(),
+                        "asDouble": m,
+                        "attributes": [{ "key": "bench.case", "value": { "stringValue": case_id } }]
+                    }]
+                }
+            })];
+            if let Some((rate, unit)) = throughput {
+                metrics.push(serde_json::json!({
+                    "name": "lin.bench.throughput",
+                    "unit": unit,
+                    "gauge": {
+                        "dataPoints": [{
+                            "timeUnixNano": end_ns.to_string(),
+                            "asDouble": rate,
+                            "attributes": [{ "key": "bench.case", "value": { "stringValue": case_id } }]
+                        }]
+                    }
+                }));
+            }
+            let metric_body = serde_json::json!({
+                "resourceMetrics": [{
+                    "resource": { "attributes": self.resource_attrs },
+                    "scopeMetrics": [{
+                        "scope": { "name": "lin.bench", "version": env!("CARGO_PKG_VERSION") },
+                        "metrics": metrics
+                    }]
+                }]
+            });
+            if let Ok(bytes) = serde_json::to_vec(&metric_body) {
+                self.post_json("/v1/metrics", &bytes);
+            }
+        }
+
+        let log_msg = match (median_ns, throughput) {
+            (Some(m), Some((rate, unit))) => {
+                format!("{case_id}: median {m:.2} ns ({rate:.1} {unit})")
+            }
+            (Some(m), None) => format!("{case_id}: median {m:.2} ns"),
+            (None, _) => format!("{case_id}: completed"),
+        };
+        let log_body = serde_json::json!({
+            "resourceLogs": [{
+                "resource": { "attributes": self.resource_attrs },
+                "scopeLogs": [{
+                    "scope": { "name": "lin.bench", "version": env!("CARGO_PKG_VERSION") },
+                    "logRecords": [{
+                        "timeUnixNano": end_ns.to_string(),
+                        "severityText": "INFO",
+                        "traceId": trace_id,
+                        "spanId": span_id,
+                        "body": { "stringValue": log_msg },
+                        "attributes": [{ "key": "bench.case", "value": { "stringValue": case_id } }]
+                    }]
+                }]
+            }]
+        });
+        if let Ok(bytes) = serde_json::to_vec(&log_body) {
+            self.post_json("/v1/logs", &bytes);
+        }
+    }
+
+    fn post_json(&self, suffix: &str, body: &[u8]) {
+        use std::io::{Read, Write};
+        let path = format!("{}{}", self.base_path, suffix);
+        let Some(&addr) = self.addrs.first() else {
+            return;
+        };
+        let Ok(mut stream) =
+            std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(100))
+        else {
+            return;
+        };
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(150)));
+        let _ = stream.set_write_timeout(Some(Duration::from_millis(150)));
+        let head = format!(
+            "POST {path} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            self.host_header,
+            body.len()
+        );
+        if stream.write_all(head.as_bytes()).is_err() || stream.write_all(body).is_err() {
+            return;
+        }
+        let mut sink = [0u8; 256];
+        let _ = stream.read(&mut sink);
+    }
+}
+
+fn parse_http_endpoint(raw: &str) -> Option<(String, String, Vec<std::net::SocketAddr>)> {
+    use std::net::ToSocketAddrs;
+    let rest = raw.trim().strip_prefix("http://")?;
+    let (host_port, base_path) = match rest.find('/') {
+        Some(pos) => (&rest[..pos], rest[pos..].trim_end_matches('/').to_string()),
+        None => (rest, String::new()),
+    };
+    if host_port.is_empty() {
+        return None;
+    }
+    let lookup = if host_port.starts_with('[') {
+        if host_port.contains("]:") {
+            host_port.to_string()
+        } else {
+            format!("{host_port}:80")
+        }
+    } else if host_port.contains(':') {
+        host_port.to_string()
+    } else {
+        format!("{host_port}:80")
+    };
+    let addrs: Vec<std::net::SocketAddr> = lookup.to_socket_addrs().ok()?.collect();
+    (!addrs.is_empty()).then_some((host_port.to_string(), base_path, addrs))
+}
+
+fn fnv1a_64(mut h: u64, bytes: &[u8]) -> u64 {
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x1000_0000_01b3);
+    }
+    h
+}
+
+fn trace_ids_for(seq: u64, case_id: &str, ns: u128) -> (String, String) {
+    let seed = (ns as u64)
+        ^ ((std::process::id() as u64).rotate_left(17))
+        ^ seq.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    let lo = fnv1a_64(seed ^ 0xcbf2_9ce4_8422_2325, case_id.as_bytes()) | 1;
+    let hi = fnv1a_64(lo.rotate_left(29), &(ns as u64).to_le_bytes()) | 1;
+    let span = fnv1a_64(hi ^ seq, case_id.as_bytes()) | 1;
+    (format!("{hi:016x}{lo:016x}"), format!("{span:016x}"))
 }

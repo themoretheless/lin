@@ -74,7 +74,7 @@ impl Db {
             return Ok(None);
         };
 
-        if mode != SearchMode::Vec && !self.store.fts.contains_key(name) {
+        if mode != SearchMode::Vec && !self.store.fts_indexed(name) {
             return Ok(None);
         }
 
@@ -134,8 +134,8 @@ impl Db {
         // leg by reciprocal rank, exactly as the in-memory merge does over positions.
         if matches!(mode, SearchMode::Lex | SearchMode::Hybrid)
             && self.store.is_disk_backed(name)
-            && let Some(fts) = self.store.fts.get(name)
             && let Some(eng) = self.store.disk_engine_read()
+            && let Some(fts) = self.store.fts_get_with_engine(name, Some(&eng))
         {
             if rank_limit == Some(0) {
                 return Ok(Some(Vec::new()));
@@ -146,7 +146,7 @@ impl Db {
             } else {
                 rank_limit
             };
-            if let Some((lex, ids)) = Self::cold_lex_scored(&eng, name, fts, query, leg_limit, hybrid)? {
+            if let Some((lex, ids)) = Self::cold_lex_scored(&eng, name, &fts, query, leg_limit, hybrid)? {
                 let ranked: Vec<usize> = if hybrid {
                     let mut vec_leg: Vec<usize> = Vec::new();
                     if let Some(emb) = self.embedder.as_ref() {
@@ -413,8 +413,7 @@ impl Db {
         }
         let fts = self
             .store
-            .fts
-            .get(collection)
+            .fts_get(collection)
             .expect("checked FTS collection");
         let mut idxs = fts.candidate_idxs(query);
         let col = self.store.collection(collection);

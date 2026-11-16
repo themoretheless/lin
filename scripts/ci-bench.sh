@@ -44,6 +44,8 @@ if [[ "${AIRBUG_OFFLINE:-0}" != "1" ]]; then
   cargo update "https://github.com/themoretheless/airbug" || echo "airbug update skipped (offline)"
 fi
 
+mkdir -p "$OUT/logs"
+
 cargo bench --bench compare -- \
   --profile quick \
   --exclude 'compare/durable*' \
@@ -53,6 +55,7 @@ cargo bench --bench compare -- \
   --exclude 'compare/*1row*' \
   --exclude 'compare/*phase*' \
   --output "$OUT" \
+  2> >(tee -a "$OUT/logs/stderr.log" >&2) \
   | tee "$REPORT"
 
 cp "$REPORT" "$OUT/bench-report.md"

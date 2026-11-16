@@ -38,6 +38,9 @@ pub(crate) enum Undo {
 /// which the next checkpoint then writes to disk. `Store::mem_restore` re-attaches the
 /// untouched disk table instead.
 pub(crate) fn stmts_write_disk_collection(store: &crate::store::Store, stmts: &[Stmt]) -> bool {
+    if store.disk.is_none() {
+        return false;
+    }
     stmts.iter().any(|s| match s {
         Stmt::Insert { collection, .. }
         | Stmt::Update { collection, .. }
@@ -449,6 +452,7 @@ impl<'a> Transaction<'a> {
                             }
                         }
                     }
+                    let tot_tag = crate::store::order_total_tag(Some(&tot_c));
                     let mut row = crate::store::acquire_orders_row();
                     let mut vals = row.values_mut();
                     if let (Some(s_id), Some(s_tot), Some(s_uid)) =
@@ -488,6 +492,7 @@ impl<'a> Transaction<'a> {
                     self.db.store.orders_id.push(id_a);
                     self.db.store.orders_user_id.push(uid_a);
                     self.db.store.orders_total.push(total_f64);
+                    self.db.store.orders_total_tag.push(tot_tag);
                     self.db.store.update_col_count("orders", 1);
 
                     let plan = if want_rows {
@@ -638,7 +643,7 @@ impl<'a> Transaction<'a> {
         {
             row.insert(
                 "hash",
-                Cell::Text(super::dml::cached_content_hash(body.as_ref())),
+                Cell::SmallText(crate::store::content_hash_inline(body.as_ref())),
             );
         }
         if !self.db.store.collection(&collection).is_empty() {
@@ -730,6 +735,9 @@ impl<'a> Transaction<'a> {
     }
 
     fn has_cold_write_target(&self, stmts: &[Stmt]) -> bool {
+        if self.db.store.disk.is_none() {
+            return false;
+        }
         stmts.iter().any(|s| match s {
             Stmt::Insert { collection, .. }
             | Stmt::Update { collection, .. }
@@ -1021,7 +1029,7 @@ impl<'a> Transaction<'a> {
             }
             self.schema_changed = true;
         }
-        if prep.writes && !prep.schema {
+        if prep.writes && !prep.schema && self.db.store.disk.is_some() {
             if let Some(pd) = &prep.point_delete
                 && self.db.store.can_apply_disk_overlay(&pd.collection)
             {

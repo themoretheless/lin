@@ -32,7 +32,7 @@ pub(crate) use join::{
     pred_total_gt, project_join_fields, rows_to_rough_batch,
 };
 
-use dml::{cached_content_hash, pack_has_schema, stmt_append_only, stmt_schema, stmt_writes};
+use dml::{pack_has_schema, stmt_append_only, stmt_schema, stmt_writes};
 use gpu_ops::rows_to_query_batch;
 use prepared::stmt_has_param;
 use tx::{Undo, dummy_dml_plan};
@@ -48,7 +48,10 @@ use crate::graph::GraphFmt;
 use crate::parse;
 use crate::persist::{Pack, Persist};
 use crate::plan::{self, Plan};
-use crate::store::{Cell, Row, Store, acquire_row, compact_row, now_ms, project_fields, row_text};
+use crate::store::{
+    Cell, Row, Store, acquire_row, compact_row, content_hash_inline, now_ms, project_fields,
+    row_text,
+};
 
 type StmtOut = (Vec<Row>, Option<String>, Option<Pack>);
 
@@ -1067,6 +1070,11 @@ impl Db {
         } else {
             None
         };
+        let append_facts = if !has_params && stmts.len() == 1 {
+            Self::try_extract_append_facts(&stmts[0]).map(Arc::new)
+        } else {
+            None
+        };
         Ok(Prepared {
             src: String::new(),
             stmts: Arc::from(stmts),
@@ -1079,6 +1087,7 @@ impl Db {
             agg_plan,
             point_delete,
             point_update,
+            append_facts,
         })
     }
 
@@ -1388,12 +1397,10 @@ impl Db {
                 row.insert("id", Cell::text_arc(self.store.alloc_id()));
             }
             if row.get("hash").and_then(Cell::text).is_none()
-                && let Some(body) = row.get("body").and_then(Cell::text_shared)
+                && let Some(body) = row.get("body").and_then(Cell::text)
             {
-                row.insert(
-                    "hash",
-                    Cell::Text(cached_content_hash(body.as_ref())),
-                );
+                let h = content_hash_inline(body);
+                row.insert("hash", Cell::SmallText(h));
             }
         }
         {
@@ -1585,8 +1592,9 @@ impl Db {
             for (k, v) in &record.fields {
                 updated.insert(k.clone(), value_cell(v, now));
             }
-            if has_body && let Some(body) = row_text(&updated, "body").map(str::to_string) {
-                updated.insert("hash", Cell::Text(cached_content_hash(&body)));
+            if has_body && let Some(body) = row_text(&updated, "body") {
+                let h = content_hash_inline(body);
+                updated.insert("hash", Cell::SmallText(h));
             }
             if reembed {
                 updated.remove("embedding");
@@ -1642,24 +1650,34 @@ impl Db {
             .any(|fk| fk.to_col == pd.collection);
         let can_id_only = !want_rows
             && pd.field == "id"
-            && (pd.append_only || pd.cas_each)
-            && !has_incoming_fk
-            && self.store.is_native_disk()
-            && self.cold_program_packs.is_none()
-            && !self.store.fts.contains_key(&pd.collection);
+            && pd.collection != "facts"
+            && !has_incoming_fk;
         let row = if can_id_only {
-            let Some(found) = self
-                .store
-                .disk_engine_read()
-                .and_then(|eng| {
-                    eng.get_projected_by_id(&pd.collection, &pd.key, &["id"])
-                        .ok()
-                        .flatten()
-                })
-            else {
-                return Err(Error::runtime("delete: no matching row"));
-            };
-            found
+            if pd.append_only || pd.cas_each {
+                if !self.store.disk_has_key(&pd.collection, "id", &pd.key) {
+                    return Err(Error::runtime("delete: no matching row"));
+                }
+            } else {
+                let Some(found) = self
+                    .store
+                    .disk_engine_read()
+                    .and_then(|eng| {
+                        eng.get_projected_by_id(&pd.collection, &pd.key, &["id", "hash"])
+                            .ok()
+                            .flatten()
+                    })
+                else {
+                    return Err(Error::runtime("delete: no matching row"));
+                };
+                let got = row_text(&found, "hash").unwrap_or("");
+                let cas = pd.cas.as_deref().unwrap_or("");
+                if got != cas {
+                    return Err(Error::runtime(format!(
+                        "cas mismatch: expected {cas:?}, found {got:?}"
+                    )));
+                }
+            }
+            Row::from([("id", Cell::from_text(&pd.key))])
         } else {
             let Some(row) = self
                 .store
@@ -1813,9 +1831,38 @@ impl Db {
         plan: &Arc<Plan>,
         want_rows: bool,
     ) -> Result<Handle, Error> {
+        let unique_keys = self
+            .store
+            .unique_keys_assigned(&pu.collection, pu.record.fields.iter().map(|(k, _)| k.as_str()));
+        let has_guards = self
+            .catalog
+            .guards
+            .iter()
+            .any(|g| g.collection == pu.collection);
+        let will_reembed = self.embedder.is_some()
+            && pu.record.fields.iter().any(|(k, _)| matches!(k.as_str(), "title" | "body" | "snippet"))
+            && !pu.record.fields.iter().any(|(k, _)| k == "embedding");
+        let mut skip: smallvec::SmallVec<[&str; 4]> = smallvec::SmallVec::new();
+        if pu.field == "id" && !has_guards {
+            for (k, _) in &pu.record.fields {
+                let ks = k.as_str();
+                if ks != "id"
+                    && (pu.cas_each || ks != "hash")
+                    && !unique_keys.iter().any(|uk| uk.fields.iter().any(|f| f == ks))
+                {
+                    skip.push(ks);
+                }
+            }
+            if will_reembed
+                && !unique_keys.iter().any(|uk| uk.fields.iter().any(|f| f == "embedding"))
+                && !skip.contains(&"embedding")
+            {
+                skip.push("embedding");
+            }
+        }
         let Some(before) = self
             .store
-            .disk_point_row(&pu.collection, &pu.field, &pu.key)
+            .disk_point_row_skipping(&pu.collection, &pu.field, &pu.key, &skip)
         else {
             return Err(Error::runtime("update: no matching row"));
         };
@@ -1842,9 +1889,6 @@ impl Db {
                 }
             }
         }
-        let unique_keys = self
-            .store
-            .unique_keys_assigned(&pu.collection, pu.record.fields.iter().map(|(k, _)| k.as_str()));
         let old_keys: Vec<Option<String>> = unique_keys
             .iter()
             .map(|k| k.indexed_text(&before, now_ms()))
@@ -1855,14 +1899,12 @@ impl Db {
             updated.insert(k.clone(), value_cell(v, now));
         }
         let has_body = pu.record.fields.iter().any(|(k, _)| k == "body");
-        if has_body && let Some(body) = row_text(&updated, "body").map(str::to_string) {
-            updated.insert("hash", Cell::Text(cached_content_hash(&body)));
+        if has_body && let Some(body) = row_text(&updated, "body") {
+            let h = content_hash_inline(body);
+            updated.insert("hash", Cell::SmallText(h));
         }
         // A changed title / body / snippet is embedded again (see the general update).
-        if self.embedder.is_some()
-            && pu.record.fields.iter().any(|(k, _)| matches!(k.as_str(), "title" | "body" | "snippet"))
-            && !pu.record.fields.iter().any(|(k, _)| k == "embedding")
-        {
+        if will_reembed {
             updated.remove("embedding");
             self.maybe_embed_rows(&pu.collection, std::slice::from_mut(&mut updated));
         }
@@ -2678,8 +2720,9 @@ impl Db {
                 updated.insert(k.clone(), value_cell(v, now));
             }
             let has_body = pu.record.fields.iter().any(|(k, _)| k == "body");
-            if has_body && let Some(body) = row_text(&updated, "body").map(str::to_string) {
-                updated.insert("hash", Cell::Text(cached_content_hash(&body)));
+            if has_body && let Some(body) = row_text(&updated, "body") {
+                let h = content_hash_inline(body);
+                updated.insert("hash", Cell::SmallText(h));
             }
             // A changed title / body / snippet is embedded again (see the general update).
             if self.embedder.is_some()
@@ -2738,6 +2781,71 @@ impl Db {
                 },
                 message: None,
                 ms: 0.0,
+            });
+        }
+        if let Some(pf) = &prepared.append_facts
+            && (!want_rows || pf.s.len() > 128)
+            && self.cold_program_packs.is_none()
+            && !self.store.is_disk_backed("facts")
+            && !self.store.is_native_disk()
+            && self.catalog.collections.contains_key("facts")
+        {
+            let t0 = Instant::now();
+            let base_gen = self.store.r#gen;
+            let mark = self.store.append_mark();
+            let changed = self.store.append_prepared_facts(&pf.s, &pf.p, &pf.o);
+            if changed == 0 {
+                return Ok(Handle {
+                    plan: Arc::clone(&prepared.plan),
+                    rows: Vec::new(),
+                    done: Done {
+                        r#gen: self.store.r#gen,
+                        n: 0,
+                    },
+                    message: Some("idempotent".into()),
+                    ms: t0.elapsed().as_secs_f64() * 1000.0,
+                });
+            }
+            if let Err(e) = self.check_quotas() {
+                self.store.append_rollback(mark);
+                self.store.r#gen = base_gen;
+                return Err(e);
+            }
+            if let Some(p) = self.persist.as_mut() {
+                if p.log_bytes > self.quotas.max_log_bytes
+                    && let Err(e) = self.store.checkpoint(p)
+                {
+                    self.store.append_rollback(mark);
+                    self.store.r#gen = base_gen;
+                    return Err(e);
+                }
+                if let Err(e) = self.store.durable_commit_facts_preencoded(
+                    p,
+                    pf.s.len() as u32,
+                    &pf.encoded_spo,
+                ) {
+                    self.store.append_rollback(mark);
+                    self.store.r#gen = base_gen;
+                    return Err(e);
+                }
+            }
+            self.store.r#gen += 1;
+            if let Some(p) = self.persist.as_mut() {
+                self.store.maybe_checkpoint(p)?;
+            }
+            let ms = t0.elapsed().as_secs_f64() * 1000.0;
+            let n = pf.s.len();
+            self.append_rows += n as u64;
+            self.append_ms += ms;
+            return Ok(Handle {
+                plan: Arc::clone(&prepared.plan),
+                rows: Vec::new(),
+                done: Done {
+                    r#gen: self.store.r#gen,
+                    n,
+                },
+                message: None,
+                ms,
             });
         }
         #[cfg(feature = "gpu")]
@@ -3468,6 +3576,7 @@ impl Db {
             all_uniform: !has_null,
             all_embedded: !needs_embed,
             needs_id: rows.iter().any(|r| r.get("id").and_then(Cell::text).is_none()),
+            lossless_cols: false,
             hashing_dim: if needs_embed {
                 self.embedder.as_ref().and_then(|e| e.hashing_dim())
             } else {

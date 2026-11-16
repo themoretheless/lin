@@ -510,7 +510,7 @@ pub(super) fn write_frame_bytes(
     checksum: [u8; 4],
     len: u32,
 ) -> io::Result<()> {
-    const INLINE_MAX: usize = 4096;
+    const INLINE_MAX: usize = 64 * 1024 - 16;
     if payload.len() >= 64 * 1024 {
         reserve_wal_space(log, payload.len().saturating_add(13), false);
     }
@@ -787,12 +787,26 @@ pub(super) fn read_one(log: &mut File, file_len: u64, pos: u64, buf: &mut Vec<u8
 
 
 pub fn truncate_log(log: &mut File, end: u64) -> Result<(), Error> {
-    let current_len = log.metadata().map_err(io_err)?.len();
+    let metadata = log.metadata().map_err(io_err)?;
+    let current_len = metadata.len();
     if current_len != end {
         log.set_len(end).map_err(io_err)?;
+        if end == 0 {
+            reserve_wal_space(log, 1024 * 1024, true);
+        }
         log.seek(SeekFrom::End(0)).map_err(io_err)?;
         durable_sync(log).or_else(|_| log.sync_all()).map_err(io_err)?;
     } else {
+        if end == 0 {
+            #[cfg(target_vendor = "apple")]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if metadata.blocks().saturating_mul(512) < 1024 * 1024 {
+                    reserve_wal_space(log, 1024 * 1024, true);
+                    durable_sync(log).or_else(|_| log.sync_all()).map_err(io_err)?;
+                }
+            }
+        }
         log.seek(SeekFrom::End(0)).map_err(io_err)?;
     }
     Ok(())

@@ -18,8 +18,8 @@ pub(crate) use value::take_recycled_id_title_vec;
 #[allow(unused_imports)]
 pub use value::{
     Cell, InlineStr, Row, RowExt, Shape as RowShape, acquire_orders_row, acquire_row, cell_from_arc_inline,
-    compact_row, content_hash_arc, fnv1a64, now_ms, project_fields, release_id_title_rows,
-    release_orders_row, row_byte_size, row_text,
+    compact_row, content_hash_arc, content_hash_inline, fnv1a64, now_ms, project_fields,
+    release_id_title_rows, release_orders_row, row_byte_size, row_text,
 };
 
 use std::collections::BTreeMap;
@@ -41,6 +41,15 @@ use value::{
 
 /// Minimum collection size to spill into columnar `DiskEngine` segments on `cold: true` checkpoint.
 pub const COLD_MIN_ROWS: usize = 32;
+
+#[inline]
+pub(crate) fn order_total_tag(cell: Option<&Cell>) -> u8 {
+    match cell {
+        Some(Cell::Int(n)) if n.unsigned_abs() <= (1u64 << 53) => 0,
+        Some(Cell::Float(_)) => 1,
+        _ => 2,
+    }
+}
 
 pub(crate) struct DiskColLazy {
     pub row_count: usize,
@@ -174,6 +183,88 @@ impl std::fmt::Debug for StoreDiskTier {
     }
 }
 
+/// Lazy FTS descriptor for cold collections: defers `fts/<name>.bin` deserialization
+/// (and corrupt-file fallback rebuilds) until the first lexical or hybrid query, so
+/// cold opens and cold point mutations that never search pay zero FTS load or drop cost.
+#[derive(Debug)]
+pub(crate) struct ColdFtsDisk {
+    pub(crate) dir: std::path::PathBuf,
+    pub(crate) generation: u64,
+    pub(crate) expected_rows: u64,
+    pub(crate) fields: Vec<String>,
+    pub(crate) index: OnceLock<Arc<crate::fts::FtsIndex>>,
+}
+
+impl Clone for ColdFtsDisk {
+    fn clone(&self) -> Self {
+        let index = match self.index.get() {
+            Some(arc) => {
+                let cell = OnceLock::new();
+                let _ = cell.set(Arc::clone(arc));
+                cell
+            }
+            None => OnceLock::new(),
+        };
+        Self {
+            dir: self.dir.clone(),
+            generation: self.generation,
+            expected_rows: self.expected_rows,
+            fields: self.fields.clone(),
+            index,
+        }
+    }
+}
+
+impl ColdFtsDisk {
+    pub(crate) fn get_or_init(
+        &self,
+        eng: Option<&crate::disk::DiskEngine>,
+        collection: &str,
+    ) -> Arc<crate::fts::FtsIndex> {
+        Arc::clone(self.index.get_or_init(|| {
+            if let Ok((generation, file_rows, idx)) = crate::fts::read_fts(&self.dir, collection)
+                && generation == self.generation
+                && file_rows == self.expected_rows
+                && idx.fields == self.fields
+            {
+                return Arc::new(idx);
+            }
+            let mut proj: Vec<&str> = Vec::with_capacity(self.fields.len() + 1);
+            proj.push("id");
+            for f in &self.fields {
+                if f != "id" {
+                    proj.push(f.as_str());
+                }
+            }
+            let mut rows = Vec::new();
+            if let Some(eng) = eng {
+                let _ = eng.scan_projected(collection, Some(&proj), |row| {
+                    rows.push(row.clone());
+                    Ok(true)
+                });
+            }
+            Arc::new(crate::fts::FtsIndex::build(&rows, &self.fields))
+        }))
+    }
+}
+
+pub(crate) enum FtsRef<'a> {
+    Borrowed(&'a crate::fts::FtsIndex),
+    Owned(Arc<crate::fts::FtsIndex>),
+}
+
+impl std::ops::Deref for FtsRef<'_> {
+    type Target = crate::fts::FtsIndex;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Borrowed(r) => r,
+            Self::Owned(a) => a,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct DeferredDocWingUpdate {
     pub idx: usize,
@@ -237,6 +328,7 @@ pub struct Store {
     pub(crate) orders_id: Vec<Arc<str>>,
     pub(crate) orders_user_id: Vec<Arc<str>>,
     pub(crate) orders_total: Vec<f64>,
+    pub(crate) orders_total_tag: Vec<u8>,
     users_id: Vec<Arc<str>>,
     users_email: Vec<Arc<str>>,
     /// Columnar facts (append hot path). `collections["facts"]` may lag until
@@ -248,6 +340,8 @@ pub struct Store {
     pub(crate) facts_rows_stale: bool,
     /// Columnar mmap disk tier (`DiskEngine`) for out-of-core / cold collections.
     pub(crate) disk: Option<StoreDiskTier>,
+    /// Lazy checkpointed FTS descriptors for cold collections not yet queried.
+    pub(crate) cold_fts_disk: BTreeMap<String, ColdFtsDisk>,
     /// FTS index field definitions for cold tables whose in-memory `fts` entry
     /// was invalidated by a zero-promote overlay mutation (rebuilt lazily on checkpoint).
     pub(crate) dirty_fts_disk: BTreeMap<String, Vec<String>>,
@@ -255,8 +349,11 @@ pub struct Store {
     /// Number of edges when the overlay savepoint began: overlay inserts only append
     /// edges, so a rollback truncates back to this length.
     pub(crate) overlay_savepoint_edges: Option<usize>,
-    pub(crate) overlay_savepoint_fts:
-        Option<(BTreeMap<String, crate::fts::FtsIndex>, BTreeMap<String, Vec<String>>)>,
+    pub(crate) overlay_savepoint_fts: Option<(
+        BTreeMap<String, crate::fts::FtsIndex>,
+        BTreeMap<String, ColdFtsDisk>,
+        BTreeMap<String, Vec<String>>,
+    )>,
     /// Cluster keys declared this session (`collection -> column`). The disk tier is
     /// attached read-only between checkpoints, so they are applied to the manifest by the
     /// next checkpoint; they also outlive a collection being promoted and spilled again.
@@ -353,6 +450,7 @@ impl Store {
             orders_id: Vec::new(),
             orders_user_id: Vec::new(),
             orders_total: Vec::new(),
+            orders_total_tag: Vec::new(),
             users_id: Vec::new(),
             users_email: Vec::new(),
             facts_s: Vec::new(),
@@ -360,6 +458,7 @@ impl Store {
             facts_o: Vec::new(),
             facts_rows_stale: false,
             disk: None,
+            cold_fts_disk: BTreeMap::new(),
             dirty_fts_disk: BTreeMap::new(),
             overlay_savepoint_fts: None,
             overlay_savepoint_edges: None,
@@ -583,6 +682,22 @@ impl Store {
         found
     }
 
+    pub(crate) fn disk_point_row_skipping(
+        &self,
+        collection: &str,
+        field: &str,
+        key: &str,
+        skip: &[&str],
+    ) -> Option<Row> {
+        if !skip.is_empty()
+            && field == "id"
+            && let Some(eng) = self.disk_engine_read()
+        {
+            return eng.get_by_id_skipping(collection, key, skip).ok().flatten();
+        }
+        self.disk_point_row(collection, field, key)
+    }
+
     pub fn disk_has_key(&self, collection: &str, field: &str, key: &str) -> bool {
         let Some(eng) = self.disk_engine_read() else {
             return false;
@@ -631,9 +746,15 @@ impl Store {
             if let Some(lazy) = d.tables.get_mut(t) {
                 lazy.materialized = OnceLock::new();
             }
+            if let Some(cold) = self.cold_fts_disk.remove(t) {
+                self.dirty_fts_disk.insert(t.clone(), cold.fields.clone());
+                if let Some((_, saved_cold, _)) = self.overlay_savepoint_fts.as_mut() {
+                    saved_cold.entry(t.clone()).or_insert(cold);
+                }
+            }
             if let Some(fts_idx) = self.fts.remove(t) {
                 self.dirty_fts_disk.insert(t.clone(), fts_idx.fields.clone());
-                if let Some((saved_fts, _)) = self.overlay_savepoint_fts.as_mut() {
+                if let Some((saved_fts, _, _)) = self.overlay_savepoint_fts.as_mut() {
                     saved_fts.entry(t.clone()).or_insert(fts_idx);
                 }
             }
@@ -659,7 +780,11 @@ impl Store {
 
     pub(crate) fn begin_disk_overlay_savepoint(&mut self) {
         if self.overlay_savepoint_fts.is_none() {
-            self.overlay_savepoint_fts = Some((BTreeMap::new(), self.dirty_fts_disk.clone()));
+            self.overlay_savepoint_fts = Some((
+                BTreeMap::new(),
+                BTreeMap::new(),
+                self.dirty_fts_disk.clone(),
+            ));
         }
         if self.overlay_savepoint_edges.is_none() {
             self.overlay_savepoint_edges = Some(self.edges.len());
@@ -682,9 +807,12 @@ impl Store {
     }
 
     pub(crate) fn rollback_disk_overlay_savepoint(&mut self) {
-        if let Some((saved_fts, saved_dirty)) = self.overlay_savepoint_fts.take() {
+        if let Some((saved_fts, saved_cold, saved_dirty)) = self.overlay_savepoint_fts.take() {
             for (k, v) in saved_fts {
                 self.fts.insert(k, v);
+            }
+            for (k, v) in saved_cold {
+                self.cold_fts_disk.insert(k, v);
             }
             self.dirty_fts_disk = saved_dirty;
         }
@@ -797,7 +925,22 @@ impl Store {
             Some(_) => self.build_hnsw(name, 16, 64),
             None => {}
         }
-        if let Some(fields) = self.dirty_fts_disk.remove(name) {
+        if let Some(cold) = self.cold_fts_disk.remove(name) {
+            self.dirty_fts_disk.remove(name);
+            let idx = if let Some(arc) = cold.index.into_inner() {
+                Arc::try_unwrap(arc).unwrap_or_else(|a| (*a).clone())
+            } else if let Ok((generation, file_rows, idx)) = crate::fts::read_fts(&cold.dir, name)
+                && generation == cold.generation
+                && file_rows == cold.expected_rows
+                && idx.fields == cold.fields
+            {
+                idx
+            } else {
+                let rows = self.collection(name);
+                crate::fts::FtsIndex::build(rows, &cold.fields)
+            };
+            self.fts.insert(name.to_string(), idx);
+        } else if let Some(fields) = self.dirty_fts_disk.remove(name) {
             let rows = self.collection(name);
             self.fts
                 .insert(name.to_string(), crate::fts::FtsIndex::build(rows, &fields));
@@ -921,6 +1064,7 @@ impl Store {
             orders_id: self.orders_id.clone(),
             orders_user_id: self.orders_user_id.clone(),
             orders_total: self.orders_total.clone(),
+            orders_total_tag: self.orders_total_tag.clone(),
             users_id: self.users_id.clone(),
             users_email: self.users_email.clone(),
             facts_s: self.facts_s.clone(),
@@ -928,6 +1072,7 @@ impl Store {
             facts_o: self.facts_o.clone(),
             facts_rows_stale: false,
             disk: disk_snap,
+            cold_fts_disk: self.cold_fts_disk.clone(),
             dirty_fts_disk: self.dirty_fts_disk.clone(),
             overlay_savepoint_fts: None,
             overlay_savepoint_edges: None,
@@ -1227,6 +1372,7 @@ impl Store {
                 fts_cold.insert(name.clone(), idx.clone());
             }
         }
+        let cold_fts_disk = self.cold_fts_disk.clone();
         let dirty_fts_disk = self.dirty_fts_disk.clone();
         let restore_overlay_fts = self.overlay_savepoint_fts.is_none();
         if !disk_tables.is_empty() {
@@ -1247,6 +1393,7 @@ impl Store {
             hnsw: self.hnsw.clone(),
             disk_tables,
             fts_cold,
+            cold_fts_disk,
             dirty_fts_disk,
             restore_overlay_fts,
         }
@@ -1279,6 +1426,7 @@ impl Store {
             hnsw: self.hnsw.clone(),
             disk_tables: Vec::new(),
             fts_cold: BTreeMap::new(),
+            cold_fts_disk: BTreeMap::new(),
             dirty_fts_disk: BTreeMap::new(),
             restore_overlay_fts: false,
         }
@@ -1323,9 +1471,13 @@ impl Store {
             if b.restore_overlay_fts {
                 for name in &b.disk_tables {
                     self.fts.remove(name);
+                    self.cold_fts_disk.remove(name);
                 }
                 for (k, v) in b.fts_cold {
                     self.fts.insert(k, v);
+                }
+                for (k, v) in b.cold_fts_disk {
+                    self.cold_fts_disk.insert(k, v);
                 }
                 self.dirty_fts_disk = b.dirty_fts_disk;
             }
@@ -1552,6 +1704,7 @@ impl Store {
                         self.orders_id.truncate(prev_len);
                         self.orders_user_id.truncate(prev_len);
                         self.orders_total.truncate(prev_len);
+                        self.orders_total_tag.truncate(prev_len);
                     }
                     "users" => {
                         self.users_id.truncate(prev_len);
@@ -1708,15 +1861,19 @@ impl Store {
             return;
         }
         let n = self.facts_s.len();
+        let shape = edges::facts_ops_shape();
         let facts = self.collections.entry("facts".into()).or_default();
         facts.clear();
         facts.reserve(n);
         for i in 0..n {
-            let mut row = Row::new();
-            row.insert("s", Cell::Text(Arc::clone(&self.facts_s[i])));
-            row.insert("p", Cell::Text(Arc::clone(&self.facts_p[i])));
-            row.insert("o", Cell::Text(Arc::clone(&self.facts_o[i])));
-            facts.push(row);
+            facts.push(Row::from_parts(
+                Arc::clone(shape),
+                [
+                    Cell::Text(Arc::clone(&self.facts_o[i])),
+                    Cell::Text(Arc::clone(&self.facts_p[i])),
+                    Cell::Text(Arc::clone(&self.facts_s[i])),
+                ],
+            ));
         }
         self.facts_rows_stale = false;
     }
@@ -1758,9 +1915,33 @@ impl Store {
         Ok(())
     }
 
-    /// Whether `collection` has a live full-text index.
+    /// Whether `collection` has a live (or lazily attached cold) full-text index.
     pub fn fts_indexed(&self, collection: &str) -> bool {
-        self.fts.contains_key(collection)
+        self.fts.contains_key(collection) || self.cold_fts_disk.contains_key(collection)
+    }
+
+    pub(crate) fn fts_get(&self, collection: &str) -> Option<FtsRef<'_>> {
+        if let Some(idx) = self.fts.get(collection) {
+            return Some(FtsRef::Borrowed(idx));
+        }
+        let cold = self.cold_fts_disk.get(collection)?;
+        if let Some(arc) = cold.index.get() {
+            return Some(FtsRef::Owned(Arc::clone(arc)));
+        }
+        let eng = self.disk_engine_read();
+        Some(FtsRef::Owned(cold.get_or_init(eng.as_deref(), collection)))
+    }
+
+    pub(crate) fn fts_get_with_engine(
+        &self,
+        collection: &str,
+        eng: Option<&crate::disk::DiskEngine>,
+    ) -> Option<FtsRef<'_>> {
+        if let Some(idx) = self.fts.get(collection) {
+            return Some(FtsRef::Borrowed(idx));
+        }
+        let cold = self.cold_fts_disk.get(collection)?;
+        Some(FtsRef::Owned(cold.get_or_init(eng, collection)))
     }
 
     /// Whether some reader has pulled a disk-backed collection's rows into memory
@@ -2682,6 +2863,7 @@ impl Store {
                 swap_pop_at(&mut self.orders_id, p, len);
                 swap_pop_at(&mut self.orders_user_id, p, len);
                 swap_pop_at(&mut self.orders_total, p, len);
+                swap_pop_at(&mut self.orders_total_tag, p, len);
             }
             "users" => {
                 swap_pop_at(&mut self.users_id, p, len);
@@ -2871,6 +3053,7 @@ impl Store {
             self.orders_id.clear();
             self.orders_user_id.clear();
             self.orders_total.clear();
+            self.orders_total_tag.clear();
         }
         if collection == "users" {
             self.users_id.clear();
@@ -2970,6 +3153,7 @@ impl Store {
             self.orders_id.reserve(n);
             self.orders_user_id.reserve(n);
             self.orders_total.reserve(n);
+            self.orders_total_tag.reserve(n);
             let first = &rows[0];
             let id_pos = first.keys().position(|k| k == "id");
             let uid_pos = first.keys().position(|k| k == "user_id");
@@ -2987,13 +3171,16 @@ impl Store {
                     let uid_arc: Arc<str> = uid_pos
                         .and_then(|p| cells[p].text_shared())
                         .unwrap_or_default();
-                    let total = total_pos.and_then(|p| cells[p].as_f64()).unwrap_or(0.0);
+                    let total_cell = total_pos.map(|p| cells[p]);
+                    let total = total_cell.and_then(Cell::as_f64).unwrap_or(0.0);
+                    let total_tag = order_total_tag(total_cell);
                     if !id_arc.is_empty() {
                         by_id_map.insert(Arc::clone(&id_arc), i);
                     }
                     self.orders_id.push(id_arc);
                     self.orders_user_id.push(uid_arc);
                     self.orders_total.push(total);
+                    self.orders_total_tag.push(total_tag);
                 }
                 return;
             }
@@ -3001,11 +3188,15 @@ impl Store {
                 let mut id = None;
                 let mut uid = None;
                 let mut total = 0.0;
+                let mut total_tag = 2u8;
                 for (k, v) in row {
                     match k.as_str() {
                         "id" => id = v.text_shared(),
                         "user_id" => uid = v.text_shared(),
-                        "total" => total = v.as_f64().unwrap_or(0.0),
+                        "total" => {
+                            total = v.as_f64().unwrap_or(0.0);
+                            total_tag = order_total_tag(Some(v));
+                        }
                         _ => {}
                     }
                 }
@@ -3015,6 +3206,7 @@ impl Store {
                 self.orders_id.push(id.unwrap_or_default());
                 self.orders_user_id.push(uid.unwrap_or_default());
                 self.orders_total.push(total);
+                self.orders_total_tag.push(total_tag);
             }
             return;
         }
@@ -3165,16 +3357,20 @@ impl Store {
                 .get("user_id")
                 .and_then(Cell::text_shared)
                 .unwrap_or_default();
-            let total = row.get("total").and_then(Cell::as_f64).unwrap_or(0.0);
+            let total_cell = row.get("total");
+            let total = total_cell.and_then(Cell::as_f64).unwrap_or(0.0);
+            let total_tag = order_total_tag(total_cell);
             let did = id.clone().unwrap_or_default();
             if idx == self.orders_id.len() {
                 self.orders_id.push(did);
                 self.orders_user_id.push(uid);
                 self.orders_total.push(total);
+                self.orders_total_tag.push(total_tag);
             } else if idx < self.orders_id.len() {
                 self.orders_id[idx] = did;
                 self.orders_user_id[idx] = uid;
                 self.orders_total[idx] = total;
+                self.orders_total_tag[idx] = total_tag;
             } else {
                 self.rebuild_row_maps_collection("orders");
             }
@@ -3302,13 +3498,16 @@ impl Store {
                     .get("user_id")
                     .and_then(Cell::text_shared)
                     .unwrap_or_default();
-                let total = row.get("total").and_then(Cell::as_f64).unwrap_or(0.0);
+                let total_cell = row.get("total");
+                let total = total_cell.and_then(Cell::as_f64).unwrap_or(0.0);
+                let total_tag = order_total_tag(total_cell);
                 if !id.is_empty() {
                     by_id.insert(Arc::clone(&id), idx);
                 }
                 self.orders_id.push(id);
                 self.orders_user_id.push(uid);
                 self.orders_total.push(total);
+                self.orders_total_tag.push(total_tag);
             }
             return;
         }
@@ -3365,6 +3564,7 @@ impl Store {
             self.orders_id.reserve(additional);
             self.orders_user_id.reserve(additional);
             self.orders_total.reserve(additional);
+            self.orders_total_tag.reserve(additional);
         }
         if collection == "users" {
             self.users_id.reserve(additional);
@@ -3415,9 +3615,15 @@ impl Store {
                 self.docs_layer.set(idx, text("layer"));
                 self.docs_wing.set(idx, text("wing"));
             }
-            "orders" if idx < self.orders_user_id.len() && idx < self.orders_total.len() => {
+            "orders"
+                if idx < self.orders_user_id.len()
+                    && idx < self.orders_total.len()
+                    && idx < self.orders_total_tag.len() =>
+            {
                 self.orders_user_id[idx] = text("user_id");
-                self.orders_total[idx] = after.get("total").and_then(Cell::as_f64).unwrap_or(0.0);
+                let total_cell = after.get("total");
+                self.orders_total[idx] = total_cell.and_then(Cell::as_f64).unwrap_or(0.0);
+                self.orders_total_tag[idx] = order_total_tag(total_cell);
             }
             "users" if idx < self.users_email.len() => self.users_email[idx] = text("email"),
             "docs" | "orders" | "users" => self.rebuild_row_maps_collection(collection),
@@ -3500,7 +3706,7 @@ impl Store {
             .values()
             .any(|idx| idx.def.collection == collection && idx.def.unique);
         if collection == "docs"
-            && built.len() >= 512
+            && built.len() >= 256
             && !has_unique
             && self.docs_id.len() == start
             && self.fts.contains_key(collection)
@@ -3652,7 +3858,7 @@ impl Store {
                 }
             }
 
-            let keep_uri = !docs_by_uri.is_empty();
+            let keep_uri = !docs_by_uri.is_empty() || built.len() < 512;
             let first = &built[0];
             let id_pos = first.keys().position(|k| k == "id");
             let uri_pos = if keep_uri {
@@ -3931,6 +4137,7 @@ impl Store {
     }
 
     /// Load checkpointed posting lists when gen/nrows/fields match; ignore stale files.
+    /// Cold disk-backed collections stay lazy until the first lexical or hybrid query.
     pub(super) fn try_load_fts(&mut self, dir: &Path, catalog: &crate::catalog::Catalog) {
         for cname in catalog.collections.keys() {
             let fields = crate::fts::fts_fields(catalog, cname);
@@ -3938,6 +4145,19 @@ impl Store {
                 continue;
             }
             let nrows = self.get_col_count(cname) as u64;
+            if self.is_disk_backed(cname) && !self.is_native_disk() {
+                self.cold_fts_disk.insert(
+                    cname.clone(),
+                    ColdFtsDisk {
+                        dir: dir.to_path_buf(),
+                        generation: self.r#gen,
+                        expected_rows: nrows,
+                        fields,
+                        index: OnceLock::new(),
+                    },
+                );
+                continue;
+            }
             match crate::fts::read_fts(dir, cname) {
                 Ok((generation, file_rows, idx))
                     if generation == self.r#gen && file_rows == nrows && idx.fields == fields =>
@@ -3964,6 +4184,30 @@ impl Store {
             }
             keep.push(name);
         }
+        let cold_entries: Vec<(String, u64)> = self
+            .cold_fts_disk
+            .keys()
+            .map(|name| (name.clone(), self.get_col_count(name) as u64))
+            .collect();
+        if !cold_entries.is_empty() {
+            let eng = self.disk_engine_read();
+            for (name, nrows) in &cold_entries {
+                if let Some(cold) = self.cold_fts_disk.get(name) {
+                    let idx = cold.get_or_init(eng.as_deref(), name);
+                    crate::fts::write_fts_readonly(dir, name, &idx, generation, *nrows, false)?;
+                    keep.push(name.clone());
+                }
+            }
+            drop(eng);
+            for (name, nrows) in cold_entries {
+                if let Some(cold) = self.cold_fts_disk.get_mut(&name) {
+                    cold.dir = dir.to_path_buf();
+                    cold.generation = generation;
+                    cold.expected_rows = nrows;
+                    cold.index = OnceLock::new();
+                }
+            }
+        }
         crate::fts::prune_fts(dir, &keep)?;
         if !keep.is_empty() {
             persist::sync_dir_checked(&crate::fts::fts_dir(dir))?;
@@ -3974,6 +4218,10 @@ impl Store {
     /// Rebuild FTS postings from catalog `fts` fields (memory / missing durable blob).
     pub fn rebuild_fts(&mut self, catalog: &crate::catalog::Catalog) {
         self.fts.retain(|k, _| catalog.collections.contains_key(k));
+        self.cold_fts_disk
+            .retain(|k, _| catalog.collections.contains_key(k));
+        self.dirty_fts_disk
+            .retain(|k, _| catalog.collections.contains_key(k));
         let names: smallvec::SmallVec<[String; 4]> = catalog.collections.keys().cloned().collect();
         for cname in names {
             let Some(cdef) = catalog.collections.get(&cname) else {
@@ -3987,8 +4235,12 @@ impl Store {
                 .collect();
             if fields.is_empty() {
                 self.fts.remove(&cname);
+                self.cold_fts_disk.remove(&cname);
+                self.dirty_fts_disk.remove(&cname);
                 continue;
             }
+            self.cold_fts_disk.remove(&cname);
+            self.dirty_fts_disk.remove(&cname);
             let mut existing = self.fts.remove(&cname);
             let rows = self.collection(&cname);
             let idx = if let Some(mut fts) = existing.take() {
@@ -4012,19 +4264,21 @@ impl Store {
                 .collect();
             if fields.is_empty() {
                 self.fts.remove(cname);
+                self.cold_fts_disk.remove(cname);
                 continue;
             }
-            if self.fts.contains_key(cname) {
+            if self.fts.contains_key(cname) || self.cold_fts_disk.contains_key(cname) {
                 continue;
             }
-            if self.is_disk_backed(cname)
-                && (self.get_col_count(cname) == 0 || self.is_native_disk())
-            {
+            if self.is_disk_backed(cname) {
                 if self.get_col_count(cname) == 0 {
                     self.fts
                         .insert(cname.clone(), crate::fts::FtsIndex::build(&[], &fields));
+                    continue;
                 }
-                continue;
+                if self.is_native_disk() || self.dirty_fts_disk.contains_key(cname) {
+                    continue;
+                }
             }
             let rows = self.collection(cname);
             self.fts
@@ -4035,6 +4289,8 @@ impl Store {
     pub fn rebuild_fts_collection(&mut self, catalog: &crate::catalog::Catalog, collection: &str) {
         let Some(cdef) = catalog.collections.get(collection) else {
             self.fts.remove(collection);
+            self.cold_fts_disk.remove(collection);
+            self.dirty_fts_disk.remove(collection);
             return;
         };
         let fields: Vec<String> = cdef
@@ -4045,8 +4301,12 @@ impl Store {
             .collect();
         if fields.is_empty() {
             self.fts.remove(collection);
+            self.cold_fts_disk.remove(collection);
+            self.dirty_fts_disk.remove(collection);
             return;
         }
+        self.cold_fts_disk.remove(collection);
+        self.dirty_fts_disk.remove(collection);
         let rows = self.collection(collection);
         self.fts.insert(
             collection.to_string(),
@@ -4373,6 +4633,7 @@ pub struct MemBackup {
     hnsw: BTreeMap<String, crate::embed::VectorIndex>,
     disk_tables: Vec<String>,
     fts_cold: BTreeMap<String, crate::fts::FtsIndex>,
+    cold_fts_disk: BTreeMap<String, ColdFtsDisk>,
     dirty_fts_disk: BTreeMap<String, Vec<String>>,
     restore_overlay_fts: bool,
 }
@@ -4508,6 +4769,7 @@ mod borrowed_delete_tests {
                 assert_eq!(store.orders_id, expected.orders_id);
                 assert_eq!(store.orders_user_id, expected.orders_user_id);
                 assert_eq!(store.orders_total, expected.orders_total);
+                assert_eq!(store.orders_total_tag, expected.orders_total_tag);
                 assert_eq!(store.users_id, expected.users_id);
                 assert_eq!(store.users_email, expected.users_email);
                 assert_eq!(store.facts_s, expected.facts_s);

@@ -2239,6 +2239,7 @@ fn partition_into(
         let orders_id = self.store.orders_id();
         let orders_uid = self.store.orders_user_id();
         let orders_total = self.store.orders_total();
+        let orders_total_tag = self.store.orders_total_tag();
         let orders_rows = self.store.collection("orders");
         let n = orders_id.len();
 
@@ -2427,8 +2428,28 @@ fn partition_into(
         let mut total_slot = crate::store::row::FieldSlot::new("total");
         let mut pos = 0usize;
         if fast_id_email_total {
+            enum TotalCol {
+                Int(Vec<i64>),
+                Float(Vec<f64>),
+                Cells,
+            }
+            let uniform_tag = if !left_join && !orders_total_tag.is_empty() {
+                let t0 = orders_total_tag[0];
+                if (t0 == 0 || t0 == 1) && orders_total_tag.iter().all(|&t| t == t0) {
+                    Some(t0)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             let mut col0 = Vec::with_capacity(left_len);
             let mut col1 = Vec::with_capacity(left_len);
+            let mut total_col = match uniform_tag {
+                Some(0) => TotalCol::Int(Vec::with_capacity(left_len)),
+                Some(1) => TotalCol::Float(Vec::with_capacity(left_len)),
+                _ => TotalCol::Cells,
+            };
             loop {
                 let idx = match &source {
                     JoinLeftSource::Idxs(idxs) => {
@@ -2468,17 +2489,51 @@ fn partition_into(
                     if left_join {
                         col0.push(Cell::Text(Arc::clone(&orders_id[idx])));
                         col1.push(Cell::Null);
-                        batch.cols[2].push(order_total_cell(&mut total_slot, orders_rows, orders_total, idx));
+                        match &mut total_col {
+                            TotalCol::Int(vals) => vals.push(orders_total[idx] as i64),
+                            TotalCol::Float(vals) => vals.push(orders_total[idx]),
+                            TotalCol::Cells => batch.cols[2].push(order_total_cell(
+                                &mut total_slot,
+                                orders_rows,
+                                orders_total,
+                                idx,
+                            )),
+                        }
                     }
                     continue;
                 };
                 col0.push(Cell::Text(Arc::clone(&orders_id[idx])));
                 col1.push(Cell::Text(Arc::clone(&users_email[ui])));
-                batch.cols[2].push(order_total_cell(&mut total_slot, orders_rows, orders_total, idx));
+                match &mut total_col {
+                    TotalCol::Int(vals) => vals.push(orders_total[idx] as i64),
+                    TotalCol::Float(vals) => vals.push(orders_total[idx]),
+                    TotalCol::Cells => batch.cols[2].push(order_total_cell(
+                        &mut total_slot,
+                        orders_rows,
+                        orders_total,
+                        idx,
+                    )),
+                }
             }
             if !col0.is_empty() {
+                let n_out = col0.len();
                 batch.cols[0] = crate::batch::Column::Cells(col0);
                 batch.cols[1] = crate::batch::Column::Cells(col1);
+                match total_col {
+                    TotalCol::Int(vals) => {
+                        batch.cols[2] = crate::batch::Column::Int {
+                            vals,
+                            valid: crate::batch::Validity::all_valid(n_out),
+                        };
+                    }
+                    TotalCol::Float(vals) => {
+                        batch.cols[2] = crate::batch::Column::Float {
+                            vals,
+                            valid: crate::batch::Validity::all_valid(n_out),
+                        };
+                    }
+                    TotalCol::Cells => {}
+                }
             }
             finish_batch(&mut batch, skip_n, explicit_take);
             return Some(batch);

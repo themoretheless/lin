@@ -92,11 +92,20 @@ impl DiskSegment {
 
     #[inline]
     pub fn materialize_row(&self, row_id: u32) -> Result<Row, Error> {
+        self.materialize_row_skipping(row_id, &[])
+    }
+
+    #[inline]
+    pub fn materialize_row_skipping(&self, row_id: u32, skip: &[&str]) -> Result<Row, Error> {
         let mut cells: smallvec::SmallVec<[Cell; 8]> =
             smallvec::SmallVec::with_capacity(self.name_order.len());
         let mut absent = 0usize;
         for &pos in &self.name_order {
-            let cell = self.cols[pos].1.get_cell(row_id)?;
+            let cell = if !skip.is_empty() && skip.contains(&self.cols[pos].0.as_str()) {
+                Cell::Null
+            } else {
+                self.cols[pos].1.get_cell(row_id)?
+            };
             absent += usize::from(matches!(cell, Cell::Null));
             cells.push(cell);
         }

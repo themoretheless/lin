@@ -1087,7 +1087,7 @@ fn try_lazy_search(db: &CursorDb<'_>, q: &Query) -> Result<Option<LazyCursor>, E
         }));
     }
 
-    if !store.fts.contains_key(name) {
+    if !store.fts_indexed(name) {
         return Ok(None);
     }
 

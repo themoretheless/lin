@@ -10,7 +10,7 @@ use crate::store::{Cell, Row, Store, now_ms, row_text};
 
 use super::eval::{
     bind_stmt_params, eval_pred, point_key, pred_has_param, pred_needs_now, project,
-    record_has_param, value_cell, value_needs_now,
+    record_has_param, record_needs_now, value_cell, value_needs_now, value_to_arc_str,
 };
 use super::{Db, Done, ReadDb, field_names};
 
@@ -82,6 +82,14 @@ pub(crate) enum AggTail {
     Sort { field: Field, desc: bool },
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedAppendFacts {
+    pub s: Vec<Arc<str>>,
+    pub p: Vec<Arc<str>>,
+    pub o: Vec<Arc<str>>,
+    pub encoded_spo: Vec<u8>,
+}
+
 /// Compiled statement: parse + typecheck + plan once, run many times.
 #[derive(Debug, Clone)]
 pub struct Prepared {
@@ -100,6 +108,7 @@ pub struct Prepared {
     pub(crate) agg_plan: Option<Arc<AggPlan>>,
     pub(crate) point_delete: Option<Arc<PointDeletePlan>>,
     pub(crate) point_update: Option<Arc<PointUpdatePlan>>,
+    pub(crate) append_facts: Option<Arc<PreparedAppendFacts>>,
 }
 
 impl Prepared {
@@ -228,6 +237,83 @@ pub(crate) fn stmt_has_param(stmt: &Stmt) -> bool {
 }
 
 impl Db {
+    pub(crate) fn try_extract_append_facts(stmt: &Stmt) -> Option<PreparedAppendFacts> {
+        let Stmt::AppendFacts { records } = stmt else {
+            return None;
+        };
+        if records.is_empty()
+            || records.iter().any(record_needs_now)
+            || records
+                .iter()
+                .any(|r| r.fields.iter().any(|(k, _)| !matches!(k.as_str(), "s" | "p" | "o")))
+        {
+            return None;
+        }
+        static EMPTY_ARC: std::sync::LazyLock<Arc<str>> =
+            std::sync::LazyLock::new(|| Arc::from(""));
+        let n = records.len();
+        let mut s = Vec::with_capacity(n);
+        let mut p = Vec::with_capacity(n);
+        let mut o = Vec::with_capacity(n);
+        let mut encoded_spo = Vec::with_capacity(n * 48);
+        let mut last_p_val: Option<&Value> = None;
+        let mut last_p_arc: Option<Arc<str>> = None;
+        for record in records {
+            if record.fields.len() == 3
+                && record.fields[0].0 == "s"
+                && record.fields[1].0 == "p"
+                && record.fields[2].0 == "o"
+            {
+                let sa = value_to_arc_str(&record.fields[0].1, 0);
+                let pv = &record.fields[1].1;
+                let pa = if last_p_val == Some(pv)
+                    && let Some(cached) = &last_p_arc
+                {
+                    Arc::clone(cached)
+                } else {
+                    let arc = value_to_arc_str(pv, 0);
+                    last_p_arc = Some(Arc::clone(&arc));
+                    last_p_val = Some(pv);
+                    arc
+                };
+                let oa = value_to_arc_str(&record.fields[2].1, 0);
+                crate::persist::put_str(&mut encoded_spo, &sa);
+                crate::persist::put_str(&mut encoded_spo, &pa);
+                crate::persist::put_str(&mut encoded_spo, &oa);
+                s.push(sa);
+                p.push(pa);
+                o.push(oa);
+            } else {
+                let mut sr = None;
+                let mut pr = None;
+                let mut or = None;
+                for (k, v) in &record.fields {
+                    match k.as_str() {
+                        "s" => sr = Some(value_to_arc_str(v, 0)),
+                        "p" => pr = Some(value_to_arc_str(v, 0)),
+                        "o" => or = Some(value_to_arc_str(v, 0)),
+                        _ => {}
+                    }
+                }
+                let sa = sr.unwrap_or_else(|| Arc::clone(&EMPTY_ARC));
+                let pa = pr.unwrap_or_else(|| Arc::clone(&EMPTY_ARC));
+                let oa = or.unwrap_or_else(|| Arc::clone(&EMPTY_ARC));
+                crate::persist::put_str(&mut encoded_spo, &sa);
+                crate::persist::put_str(&mut encoded_spo, &pa);
+                crate::persist::put_str(&mut encoded_spo, &oa);
+                s.push(sa);
+                p.push(pa);
+                o.push(oa);
+            }
+        }
+        Some(PreparedAppendFacts {
+            s,
+            p,
+            o,
+            encoded_spo,
+        })
+    }
+
     pub(crate) fn try_extract_point_get(q: &Query, cat: &Catalog) -> Option<PointGetPlan> {
         if !matches!(q.source, Source::Collection(_)) {
             return None;

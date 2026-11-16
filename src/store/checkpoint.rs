@@ -560,6 +560,7 @@ impl Store {
             orders_id: Vec::new(),
             orders_user_id: Vec::new(),
             orders_total: Vec::new(),
+            orders_total_tag: Vec::new(),
             users_id: Vec::new(),
             users_email: Vec::new(),
             facts_s: Vec::new(),
@@ -568,6 +569,7 @@ impl Store {
             facts_rows_stale: false,
             col_counts,
             disk: None,
+            cold_fts_disk: BTreeMap::new(),
             dirty_fts_disk: BTreeMap::new(),
             overlay_savepoint_fts: None,
             overlay_savepoint_edges: None,
@@ -722,6 +724,38 @@ impl Store {
         }
     }
 
+    pub(crate) fn durable_commit_facts_preencoded(
+        &self,
+        persist: &mut Persist,
+        n: u32,
+        encoded_spo: &[u8],
+    ) -> Result<(), Error> {
+        let rec_gen = self.r#gen + 1;
+        let prev_log_bytes = persist.log_bytes;
+        {
+            let Persist {
+                log,
+                encode_buf,
+                log_bytes,
+                sync,
+                ..
+            } = persist;
+            persist::append_facts_v2_preencoded(
+                log,
+                rec_gen,
+                self.next_id,
+                n,
+                encoded_spo,
+                encode_buf,
+                *sync,
+                log_bytes,
+            )?;
+        }
+        persist.wal_index.push((rec_gen, prev_log_bytes));
+        persist.writes_since_snapshot += 1;
+        Ok(())
+    }
+
     /// Flush one committed pack to the log (data sync). Head is updated durably
     /// on checkpoint/close only (soft head skipped on the hot path).
     pub fn durable_commit(&self, persist: &mut Persist, pack: Pack) -> Result<(), Error> {
@@ -821,6 +855,7 @@ impl Store {
                 self.promote_disk_col(&name);
             }
             self.disk = None;
+            self.cold_fts_disk.clear();
             self.overlay_savepoint_fts = None;
             self.overlay_savepoint_edges = None;
             if is_disk_dir(&persist.dir) {
@@ -872,6 +907,7 @@ impl Store {
 
             // Close read-only mmap handles before opening DiskEngine writer to rewrite segments.
             self.disk = None;
+            self.cold_fts_disk.retain(|k, _| untouched_disk.contains(k));
             self.overlay_savepoint_fts = None;
             self.overlay_savepoint_edges = None;
 
@@ -1034,7 +1070,17 @@ impl Store {
                             Ok(true)
                         })?;
                         let idx = crate::fts::FtsIndex::build(&rows, &fields);
-                        self.fts.insert(name, idx);
+                        let nrows = ro.count_table(&name) as u64;
+                        self.cold_fts_disk.insert(
+                            name,
+                            crate::store::ColdFtsDisk {
+                                dir: persist.dir.clone(),
+                                generation: self.r#gen,
+                                expected_rows: nrows,
+                                fields,
+                                index: OnceLock::from(Arc::new(idx)),
+                            },
+                        );
                     }
                     self.disk = Some(StoreDiskTier {
                         engine: Arc::new(RwLock::new(ro)),
@@ -1129,6 +1175,11 @@ impl Store {
             };
             if let Some(lazy) = d.tables.get_mut(tbl) {
                 lazy.materialized = OnceLock::new();
+            }
+            if let Some(cold) = self.cold_fts_disk.remove(tbl) {
+                self.dirty_fts_disk
+                    .entry(tbl.clone())
+                    .or_insert(cold.fields);
             }
             if let Some(fts_idx) = self.fts.remove(tbl) {
                 self.dirty_fts_disk
