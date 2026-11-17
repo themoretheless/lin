@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use memchr::memmem::Finder;
@@ -42,6 +42,8 @@ pub(crate) struct MmapTextCol {
     row_count: u32,
     pub(super) block_count: u32,
     cache_shards: [Mutex<Vec<Option<BlockCacheSlot>>>; BLOCK_CACHE_SHARDS],
+    /// Per-block UTF-8 validation cache for uncompressed blocks: `0` = unchecked, `1` = valid UTF-8, `2` = invalid.
+    utf8_state: Box<[AtomicU8]>,
     /// Optional per-Zstd-block 4096-bit trigram Bloom filters (`col_<name>.tgram`).
     tgram: Option<Box<[TgramBlock]>>,
     /// Number of cache-miss block decodes performed on this column instance.
@@ -99,11 +101,11 @@ impl MmapTextCol {
             }
         }
 
-        let cache_shards = std::array::from_fn(|_| {
-            let mut slots = Vec::with_capacity(BLOCK_CACHE_SLOTS_PER_SHARD);
-            slots.resize_with(BLOCK_CACHE_SLOTS_PER_SHARD, || None);
-            Mutex::new(slots)
-        });
+        let cache_shards = std::array::from_fn(|_| Mutex::new(Vec::new()));
+        let utf8_state = (0..block_count as usize)
+            .map(|_| AtomicU8::new(0))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
 
         let tgram = std::fs::read(dir.join(format!("col_{col_name}.tgram")))
             .ok()
@@ -116,6 +118,7 @@ impl MmapTextCol {
             row_count,
             block_count,
             cache_shards,
+            utf8_state,
             tgram,
             decoded_blocks: AtomicU64::new(0),
         })
@@ -140,16 +143,8 @@ impl MmapTextCol {
         Some((block_idx, in_off, len))
     }
 
-    pub(super) fn decode_block(&self, block_idx: u32) -> Result<Arc<[u8]>, Error> {
-        let shard_idx = (block_idx as usize) & (BLOCK_CACHE_SHARDS - 1);
-        let slot_idx = ((block_idx as usize) >> 4) & (BLOCK_CACHE_SLOTS_PER_SHARD - 1);
-        if let Ok(guard) = self.cache_shards[shard_idx].lock()
-            && let Some(ref entry) = guard[slot_idx]
-            && entry.block_idx == block_idx
-        {
-            return Ok(Arc::clone(&entry.data));
-        }
-
+    #[inline]
+    fn block_slice(&self, block_idx: u32) -> Result<&[u8], Error> {
         if block_idx >= self.block_count {
             return Err(io_err("text block index out of range"));
         }
@@ -167,7 +162,72 @@ impl MmapTextCol {
         if end > self.blocks_data.len() || start > end {
             return Err(io_err("corrupt text block bounds"));
         }
-        let slice = &self.blocks_data[start..end];
+        Ok(&self.blocks_data[start..end])
+    }
+
+    #[inline]
+    pub(crate) fn raw_uncompressed_block(&self, block_idx: u32) -> Result<Option<&[u8]>, Error> {
+        let slice = self.block_slice(block_idx)?;
+        if slice.is_empty() {
+            Ok(Some(&[]))
+        } else if slice[0] == 0x00 {
+            Ok(Some(&slice[1..]))
+        } else {
+            Ok(None)
+        }
+    }
+
+    #[inline]
+    pub(crate) fn raw_uncompressed_block_checked(
+        &self,
+        block_idx: u32,
+    ) -> Result<Option<(&[u8], bool)>, Error> {
+        let Some(raw) = self.raw_uncompressed_block(block_idx)? else {
+            return Ok(None);
+        };
+        let state = &self.utf8_state[block_idx as usize];
+        let st = state.load(Ordering::Relaxed);
+        let ok = if st == 0 {
+            let valid = std::str::from_utf8(raw).is_ok();
+            state.store(if valid { 1 } else { 2 }, Ordering::Relaxed);
+            valid
+        } else {
+            st == 1
+        };
+        Ok(Some((raw, ok)))
+    }
+
+    #[inline]
+    pub(crate) fn slice_block_str(
+        raw: &[u8],
+        block_utf8_ok: bool,
+        s_off: usize,
+        e_off: usize,
+    ) -> Result<&str, Error> {
+        if s_off > e_off || e_off > raw.len() {
+            return Err(io_err("corrupt in-block text slice"));
+        }
+        if block_utf8_ok
+            && (s_off == raw.len() || (raw[s_off] & 0xC0) != 0x80)
+            && (e_off == raw.len() || (raw[e_off] & 0xC0) != 0x80)
+        {
+            // SAFETY: `raw` is validated UTF-8 and neither boundary falls on a UTF-8 continuation byte.
+            return Ok(unsafe { std::str::from_utf8_unchecked(&raw[s_off..e_off]) });
+        }
+        std::str::from_utf8(&raw[s_off..e_off]).map_err(io_err)
+    }
+
+    pub(super) fn decode_block(&self, block_idx: u32) -> Result<Arc<[u8]>, Error> {
+        let shard_idx = (block_idx as usize) & (BLOCK_CACHE_SHARDS - 1);
+        let slot_idx = ((block_idx as usize) >> 4) & (BLOCK_CACHE_SLOTS_PER_SHARD - 1);
+        if let Ok(guard) = self.cache_shards[shard_idx].lock()
+            && let Some(Some(entry)) = guard.get(slot_idx)
+            && entry.block_idx == block_idx
+        {
+            return Ok(Arc::clone(&entry.data));
+        }
+
+        let slice = self.block_slice(block_idx)?;
         let raw: Vec<u8> = if slice.is_empty() {
             Vec::new()
         } else if slice[0] == 0x00 {
@@ -202,6 +262,9 @@ impl MmapTextCol {
         self.decoded_blocks.fetch_add(1, Ordering::Relaxed);
         let arc: Arc<[u8]> = Arc::from(raw);
         if let Ok(mut guard) = self.cache_shards[shard_idx].lock() {
+            if guard.is_empty() {
+                guard.resize_with(BLOCK_CACHE_SLOTS_PER_SHARD, || None);
+            }
             guard[slot_idx] = Some(BlockCacheSlot {
                 block_idx,
                 data: Arc::clone(&arc),
@@ -239,9 +302,13 @@ impl MmapTextCol {
         if len == 0 {
             return Ok(Cell::SmallText(InlineStr::new_truncate("")));
         }
-        let block = self.decode_block(block_idx)?;
         let s_off = in_off as usize;
         let e_off = s_off + (len as usize);
+        if let Some((raw, utf8_ok)) = self.raw_uncompressed_block_checked(block_idx)? {
+            let s = Self::slice_block_str(raw, utf8_ok, s_off, e_off)?;
+            return Ok(Cell::from_text(s));
+        }
+        let block = self.decode_block(block_idx)?;
         if e_off > block.len() {
             return Err(io_err("corrupt in-block text slice"));
         }
@@ -268,6 +335,12 @@ impl MmapTextCol {
         if len == 0 {
             return Ok(Cell::SmallText(InlineStr::new_truncate("")));
         }
+        let s_off = in_off as usize;
+        let e_off = s_off + (len as usize);
+        if let Some((raw, utf8_ok)) = self.raw_uncompressed_block_checked(block_idx)? {
+            let s = Self::slice_block_str(raw, utf8_ok, s_off, e_off)?;
+            return Ok(Cell::from_text(s));
+        }
         let need_load = match cached {
             Some((lb, _)) => *lb != block_idx,
             None => true,
@@ -277,8 +350,6 @@ impl MmapTextCol {
             *cached = Some((block_idx, decoded));
         }
         let (_, ref block) = *cached.as_ref().unwrap();
-        let s_off = in_off as usize;
-        let e_off = s_off + (len as usize);
         if e_off > block.len() {
             return Err(io_err("corrupt in-block text slice"));
         }
@@ -353,7 +424,13 @@ impl MmapTextCol {
                 if rb > bidx {
                     break;
                 }
-                let block = self.decode_block(bidx)?;
+                let decoded_arc: Arc<[u8]>;
+                let block: &[u8] = if let Some(raw) = self.raw_uncompressed_block(bidx)? {
+                    raw
+                } else {
+                    decoded_arc = self.decode_block(bidx)?;
+                    &decoded_arc
+                };
                 let mut search_pos = 0usize;
                 while search_pos < block.len() {
                     let Some(rel) = finder.find(&block[search_pos..]) else {
@@ -419,9 +496,13 @@ impl MmapTextCol {
         if len == 0 {
             return Ok(f(Some("")));
         }
-        let block = self.decode_block(block_idx)?;
         let s_off = in_off as usize;
         let e_off = s_off + (len as usize);
+        if let Some((raw, utf8_ok)) = self.raw_uncompressed_block_checked(block_idx)? {
+            let s = Self::slice_block_str(raw, utf8_ok, s_off, e_off)?;
+            return Ok(f(Some(s)));
+        }
+        let block = self.decode_block(block_idx)?;
         if e_off > block.len() {
             return Err(io_err("corrupt in-block text slice"));
         }

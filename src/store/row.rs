@@ -243,6 +243,40 @@ impl Row {
         self.shape = Some(shape);
     }
 
+    /// Replace a 2-column row's shape and cells in place without atomic shape refcount traffic
+    /// when `shape` already matches `self.shape`.
+    #[inline]
+    pub fn set_pair_with_shape(&mut self, shape: &Arc<Shape>, c0: Cell, c1: Cell) {
+        if !self.shape.as_ref().is_some_and(|s| Arc::ptr_eq(s, shape)) {
+            self.shape = Some(Arc::clone(shape));
+        }
+        debug_assert_eq!(shape.names.len(), 2);
+        if self.cells.len() == 2 {
+            self.cells[0] = c0;
+            self.cells[1] = c1;
+        } else {
+            self.cells.clear();
+            self.cells.push(c0);
+            self.cells.push(c1);
+        }
+    }
+
+    /// Replace this row's contents in place using a shared shape reference without atomic
+    /// refcount churn when the shape pointer already matches.
+    #[inline]
+    pub fn reset_with_shape_ref(
+        &mut self,
+        shape: &Arc<Shape>,
+        cells: impl IntoIterator<Item = Cell>,
+    ) {
+        if !self.shape.as_ref().is_some_and(|s| Arc::ptr_eq(s, shape)) {
+            self.shape = Some(Arc::clone(shape));
+        }
+        self.cells.clear();
+        self.cells.extend(cells);
+        debug_assert_eq!(self.cells.len(), shape.names.len());
+    }
+
     /// A row from names in strictly ascending order and their cells, without a search
     /// per field.
     pub fn from_sorted<'a>(

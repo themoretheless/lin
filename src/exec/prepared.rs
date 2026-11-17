@@ -24,6 +24,8 @@ pub(crate) struct PointGetPlan {
     pub pred: Option<Pred>,
     pub needs_now: bool,
     pub is_docs_id_title: bool,
+    pub prepared_docs_epoch: u64,
+    pub prepared_idx: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -256,6 +258,8 @@ impl Db {
         let mut p = Vec::with_capacity(n);
         let mut o = Vec::with_capacity(n);
         let mut encoded_spo = Vec::with_capacity(n * 48);
+        let mut last_s_val: Option<&Value> = None;
+        let mut last_s_arc: Option<Arc<str>> = None;
         let mut last_p_val: Option<&Value> = None;
         let mut last_p_arc: Option<Arc<str>> = None;
         for record in records {
@@ -264,7 +268,17 @@ impl Db {
                 && record.fields[1].0 == "p"
                 && record.fields[2].0 == "o"
             {
-                let sa = value_to_arc_str(&record.fields[0].1, 0);
+                let sv = &record.fields[0].1;
+                let sa = if last_s_val == Some(sv)
+                    && let Some(cached) = &last_s_arc
+                {
+                    Arc::clone(cached)
+                } else {
+                    let arc = value_to_arc_str(sv, 0);
+                    last_s_arc = Some(Arc::clone(&arc));
+                    last_s_val = Some(sv);
+                    arc
+                };
                 let pv = &record.fields[1].1;
                 let pa = if last_p_val == Some(pv)
                     && let Some(cached) = &last_p_arc
@@ -314,7 +328,11 @@ impl Db {
         })
     }
 
-    pub(crate) fn try_extract_point_get(q: &Query, cat: &Catalog) -> Option<PointGetPlan> {
+    pub(crate) fn try_extract_point_get(
+        q: &Query,
+        cat: &Catalog,
+        store: &Store,
+    ) -> Option<PointGetPlan> {
         if !matches!(q.source, Source::Collection(_)) {
             return None;
         }
@@ -387,6 +405,13 @@ impl Db {
                 .map(|fs| fs.len() == 2 && fs[0] == "id" && fs[1] == "title")
                 .unwrap_or(false);
         let needs_now = !simple_eq && pred_needs_now(pred);
+        let prepared_idx =
+            if simple_eq && name == "docs" && (field == "id" || field == "uri") && !store.is_disk_backed("docs") {
+                store.point_index("docs", field, key)
+            } else {
+                None
+            };
+        let prepared_docs_epoch = store.docs_epoch;
         Some(PointGetPlan {
             collection: name,
             field: field.to_string(),
@@ -396,6 +421,8 @@ impl Db {
             pred: if simple_eq { None } else { Some(pred.clone()) },
             needs_now,
             is_docs_id_title,
+            prepared_docs_epoch,
+            prepared_idx,
         })
     }
 
@@ -533,6 +560,26 @@ impl Db {
     #[inline]
     pub(crate) fn execute_point_get(&self, pg: &PointGetPlan) -> Option<Row> {
         if pg.is_docs_id_title {
+            if self.store.disk.is_none() && self.store.fts_deferred_doc_swaps.is_empty() {
+                let idx = if let Some(i) = pg.prepared_idx
+                    && i < self.store.docs_id.len()
+                    && (self.store.docs_epoch == pg.prepared_docs_epoch
+                        || self.store.docs_id[i].as_ref() == pg.key.as_str())
+                {
+                    i
+                } else {
+                    self.store.row_index("docs", &pg.key)?
+                };
+                if idx < self.store.docs_id.len() && idx < self.store.docs_title.len() {
+                    return Some(Row::from_parts(
+                        Arc::clone(crate::store::shape_id_title()),
+                        [
+                            Cell::Text(Arc::clone(&self.store.docs_id[idx])),
+                            Cell::Text(Arc::clone(&self.store.docs_title[idx])),
+                        ],
+                    ));
+                }
+            }
             self.store.point_get_docs_id_title(&pg.key)
         } else if pg.is_simple_eq {
             self.store

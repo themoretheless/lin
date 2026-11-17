@@ -303,7 +303,7 @@ impl Store {
         let mut fts_ms = fts_t0.elapsed().as_secs_f64() * 1000.0;
 
         let phase = Instant::now();
-        let mut log = persist::open_log(dir)?;
+        let mut log = persist::open_log_unreserved(dir)?;
         let min_gen = store.r#gen;
         let mut wal_index = Vec::new();
         // Every catalog hash the store goes through while the log is replayed. `head` is
@@ -333,7 +333,7 @@ impl Store {
                 Ok(())
             },
         )?;
-        persist::truncate_log(&mut log, end)?;
+        persist::truncate_log_with_sync(&mut log, end, opts.sync)?;
         phases.wal_ms = phase.elapsed().as_secs_f64() * 1000.0;
 
         let phase = Instant::now();
@@ -760,6 +760,32 @@ impl Store {
     /// on checkpoint/close only (soft head skipped on the hot path).
     pub fn durable_commit(&self, persist: &mut Persist, pack: Pack) -> Result<(), Error> {
         self.durable_commit_prepared(persist, pack, None)
+    }
+
+    pub(crate) fn durable_commit_ref(&self, persist: &mut Persist, pack: &Pack) -> Result<(), Error> {
+        let prev_log_bytes = persist.log_bytes;
+        let rec_gen = self.r#gen + 1;
+        {
+            let Persist {
+                log,
+                encode_buf,
+                log_bytes,
+                sync,
+                ..
+            } = persist;
+            persist::append_record_v1_ref(
+                log,
+                rec_gen,
+                self.next_id,
+                pack,
+                encode_buf,
+                *sync,
+                log_bytes,
+            )?;
+        }
+        persist.wal_index.push((rec_gen, prev_log_bytes));
+        persist.writes_since_snapshot += 1;
+        Ok(())
     }
 
     pub(crate) fn durable_commit_prepared(
@@ -1223,6 +1249,38 @@ fn slim_delete_rows(pack: &mut Pack) {
         }
         Pack::Batch { packs } => packs.iter_mut().for_each(slim_delete_rows),
         _ => {}
+    }
+}
+
+pub(crate) fn pack_into_disk_wal_ops(pack: Pack, out: &mut Vec<crate::disk::DiskWalOp>) {
+    use crate::disk::DiskWalOp;
+    match pack {
+        Pack::Update { collection, rows } => {
+            if !rows.is_empty() {
+                out.push(DiskWalOp::UpsertBatch {
+                    table: collection,
+                    rows,
+                });
+            }
+        }
+        Pack::Delete { collection, rows } => {
+            let ids: Vec<String> = rows
+                .iter()
+                .filter_map(|r| r.get("id").and_then(|c| c.text()).map(str::to_string))
+                .collect();
+            if !ids.is_empty() {
+                out.push(DiskWalOp::DeleteIds {
+                    table: collection,
+                    ids,
+                });
+            }
+        }
+        Pack::Batch { packs } => {
+            for p in packs {
+                pack_into_disk_wal_ops(p, out);
+            }
+        }
+        other => pack_to_disk_wal_ops(&other, out),
     }
 }
 

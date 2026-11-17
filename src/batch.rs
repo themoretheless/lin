@@ -249,6 +249,48 @@ impl Column {
         }
     }
 
+    #[inline]
+    pub fn push_float_opt(&mut self, v: Option<f64>) {
+        if let Column::Float { vals, valid } = self {
+            match v {
+                Some(x) => {
+                    vals.push(x);
+                    valid.push(true);
+                }
+                None => {
+                    vals.push(0.0);
+                    valid.push(false);
+                }
+            }
+            return;
+        }
+        self.push(match v {
+            Some(x) => Cell::Float(x),
+            None => Cell::Null,
+        });
+    }
+
+    #[inline]
+    pub fn push_int_opt(&mut self, v: Option<i64>) {
+        if let Column::Int { vals, valid } = self {
+            match v {
+                Some(x) => {
+                    vals.push(x);
+                    valid.push(true);
+                }
+                None => {
+                    vals.push(0);
+                    valid.push(false);
+                }
+            }
+            return;
+        }
+        self.push(match v {
+            Some(x) => Cell::Int(x),
+            None => Cell::Null,
+        });
+    }
+
     /// Value at `i` (`Cell::Null` when absent or out of range).
     pub fn get(&self, i: usize) -> Cell {
         match self {
@@ -448,6 +490,20 @@ impl Column {
     #[inline]
     pub(crate) fn permute_in_place(&mut self, perm: &[u32]) {
         *self = self.gather(perm);
+    }
+
+    /// Reorder elements according to a permutation `indices` without duplicates, moving inline
+    /// or shared text cells out of `self` to avoid atomic refcount bumps.
+    pub(crate) fn gather_unique_owned(self, indices: &[u32]) -> Self {
+        match self {
+            Column::Cells(mut c) => Column::Cells(
+                indices
+                    .iter()
+                    .map(|&i| std::mem::replace(&mut c[i as usize], Cell::Null))
+                    .collect(),
+            ),
+            other => other.gather(indices),
+        }
     }
 
     pub fn reserve(&mut self, additional: usize) {
@@ -676,6 +732,113 @@ impl RecordBatch {
     /// Materialize row-maps (row-API) with zero-copy Cell cloning
     pub fn to_rows(&self) -> Vec<Row> {
         self.to_rows_batch(0, self.n())
+    }
+
+    /// Consume `self` and materialize rows, moving `Cells` out without atomic refcount churn
+    /// and reusing pooled `Vec<Row>` buffers when available.
+    pub fn into_rows(mut self) -> Vec<Row> {
+        let n = self.n();
+        if n == 0 {
+            return Vec::new();
+        }
+        #[inline]
+        fn take_col_cell(col: &mut Column, i: usize) -> Cell {
+            match col {
+                Column::Cells(c) => std::mem::replace(&mut c[i], Cell::Null),
+                _ => col.get(i),
+            }
+        }
+        if n < 65536
+            && self.cols.len() == 2
+            && self.names.len() == 2
+            && self.names[0] != self.names[1]
+        {
+            let shape = if self.names.as_ref() == ["id", "title"] {
+                Arc::clone(crate::store::shape_id_title())
+            } else {
+                Row::shape_of(&self.names)
+            };
+            let swap = self.names[0] > self.names[1];
+            let (col0_slice, col1_slice) = self.cols.split_at_mut(1);
+            let col0 = &mut col0_slice[0];
+            let col1 = &mut col1_slice[0];
+            let mut out = if n >= 1024 {
+                crate::store::take_general_rows().unwrap_or_else(|| Vec::with_capacity(n))
+            } else {
+                Vec::with_capacity(n)
+            };
+            if out.capacity() < n {
+                out.reserve(n - out.len());
+            }
+            let reuse_len = out.len().min(n);
+            for i in 0..reuse_len {
+                let c0 = take_col_cell(col0, i);
+                let c1 = take_col_cell(col1, i);
+                let (a, b) = if swap { (c1, c0) } else { (c0, c1) };
+                out[i].set_pair_with_shape(&shape, a, b);
+            }
+            for i in reuse_len..n {
+                let c0 = take_col_cell(col0, i);
+                let c1 = take_col_cell(col1, i);
+                let (a, b) = if swap { (c1, c0) } else { (c0, c1) };
+                out.push(Row::from_parts(Arc::clone(&shape), [a, b]));
+            }
+            out.truncate(n);
+            return out;
+        }
+        if n < 65536
+            && self.cols.len() == 3
+            && self.names.len() == 3
+            && self.names[0] != self.names[1]
+            && self.names[1] != self.names[2]
+            && self.names[0] != self.names[2]
+        {
+            let shape = Row::shape_of(&self.names);
+            let pos_of = |c: usize| {
+                shape
+                    .names()
+                    .iter()
+                    .position(|t| t == &self.names[c])
+                    .unwrap_or(c)
+            };
+            let slots = [pos_of(0), pos_of(1), pos_of(2)];
+            let (s0, s12) = self.cols.split_at_mut(1);
+            let (s1, s2) = s12.split_at_mut(1);
+            let c0 = &mut s0[0];
+            let c1 = &mut s1[0];
+            let c2 = &mut s2[0];
+            let mut out = if n >= 1024 {
+                crate::store::take_general_rows().unwrap_or_else(|| Vec::with_capacity(n))
+            } else {
+                Vec::with_capacity(n)
+            };
+            if out.capacity() < n {
+                out.reserve(n - out.len());
+            }
+            let order = |v0: Cell, v1: Cell, v2: Cell| -> [Cell; 3] {
+                let mut arr = [Cell::Null, Cell::Null, Cell::Null];
+                arr[slots[0]] = v0;
+                arr[slots[1]] = v1;
+                arr[slots[2]] = v2;
+                arr
+            };
+            let reuse_len = out.len().min(n);
+            for i in 0..reuse_len {
+                let v0 = take_col_cell(c0, i);
+                let v1 = take_col_cell(c1, i);
+                let v2 = take_col_cell(c2, i);
+                out[i].reset_with_shape_ref(&shape, order(v0, v1, v2));
+            }
+            for i in reuse_len..n {
+                let v0 = take_col_cell(c0, i);
+                let v1 = take_col_cell(c1, i);
+                let v2 = take_col_cell(c2, i);
+                out.push(Row::from_parts(Arc::clone(&shape), order(v0, v1, v2)));
+            }
+            out.truncate(n);
+            return out;
+        }
+        self.to_rows()
     }
 
     /// Materialize a slice of rows with zero-copy Cell cloning - avoids per-row allocations

@@ -9,12 +9,13 @@ use crate::error::Error;
 use crate::store::{Edge, Row};
 
 use super::types::{
-    ColData, LOG_MAGIC_DICTIONARY, LOG_MAGIC_SPARSE, LOG_MAGIC_V2, LogRecord, MAX_SPARSE_DECODED_BYTES, Pack, Persist,
-    SPARSE_VECTOR_THRESHOLD, SyncMode, V2_FACTS_BULK, V2_INSERT_COLS,
+    ColData, LOG_MAGIC_CHECKSUM, LOG_MAGIC_DICTIONARY, LOG_MAGIC_SPARSE, LOG_MAGIC_V2, LogRecord,
+    MAX_RECORD, MAX_SPARSE_DECODED_BYTES, Pack, Persist, SPARSE_VECTOR_THRESHOLD, SyncMode,
+    V2_FACTS_BULK, V2_INSERT_COLS,
 };
 use super::wal::{
-    append_record, append_record_v1, compute_frame_checksum, io_err, write_frame,
-    write_frame_precomputed,
+    append_record, append_record_v1, compute_frame_checksum, durable_sync, io_err,
+    reserve_wal_space, write_all_vectored, write_frame, write_frame_precomputed,
 };
 
 #[inline(always)]
@@ -30,18 +31,48 @@ pub(crate) fn append_facts_v2_preencoded(
     next_id: u64,
     n: u32,
     encoded_spo: &[u8],
-    buf: &mut Vec<u8>,
+    _buf: &mut Vec<u8>,
     sync: SyncMode,
     log_bytes: &mut u64,
 ) -> Result<(), Error> {
-    buf.clear();
-    buf.reserve(21 + encoded_spo.len());
-    buf.push(V2_FACTS_BULK);
-    buf.extend_from_slice(&rec_gen.to_le_bytes());
-    buf.extend_from_slice(&next_id.to_le_bytes());
-    buf.extend_from_slice(&n.to_le_bytes());
-    buf.extend_from_slice(encoded_spo);
-    write_frame(log, &LOG_MAGIC_V2, buf, sync, log_bytes)
+    let Some(payload_len) = 21usize.checked_add(encoded_spo.len()) else {
+        return Err(io_err("log record exceeds 16MiB"));
+    };
+    let Some(len) = payload_len
+        .checked_add(5)
+        .filter(|&n| n <= MAX_RECORD as usize)
+    else {
+        return Err(io_err("log record exceeds 16MiB"));
+    };
+    let codec = LOG_MAGIC_V2[3];
+    let mut hdr = [0u8; 30];
+    hdr[..4].copy_from_slice(&LOG_MAGIC_CHECKSUM);
+    hdr[4..8].copy_from_slice(&(len as u32).to_le_bytes());
+    hdr[8] = codec;
+    hdr[9] = V2_FACTS_BULK;
+    hdr[10..18].copy_from_slice(&rec_gen.to_le_bytes());
+    hdr[18..26].copy_from_slice(&next_id.to_le_bytes());
+    hdr[26..30].copy_from_slice(&n.to_le_bytes());
+
+    let mut hasher = crate::crc::Hasher::new();
+    hasher.update(&hdr[8..30]);
+    hasher.update(encoded_spo);
+    let checksum = hasher.finalize().to_le_bytes();
+
+    if payload_len >= 64 * 1024 {
+        reserve_wal_space(log, payload_len.saturating_add(13), false);
+    }
+    let slices = [
+        io::IoSlice::new(&hdr),
+        io::IoSlice::new(encoded_spo),
+        io::IoSlice::new(&checksum),
+    ];
+    write_all_vectored(log, &slices).map_err(io_err)?;
+    if sync == SyncMode::Full {
+        durable_sync(log).map_err(io_err)?;
+    }
+    *log_bytes += 8 + len as u64;
+    Ok(())
 }
 
 pub(super) fn append_facts_v2(

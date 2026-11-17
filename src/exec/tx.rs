@@ -919,6 +919,9 @@ impl<'a> Transaction<'a> {
                 }
             }
         }
+        if writes && !append_only && !schema && self.db.store.has_deferred_doc_ops() {
+            self.db.store.flush_fts_deferred_docs();
+        }
         if writes {
             self.ensure_undo_flags(stmts, append_only, schema);
         }
@@ -1291,6 +1294,38 @@ impl Db {
     }
 
     pub(crate) fn restore_docs_wing_cell(&mut self, idx: usize, prev_cell: Option<Cell>) {
+        if let Some(docs_col) = self.store.collections.get_mut("docs")
+            && idx < docs_col.len()
+            && self.store.deferred_doc_wing_updates.last().is_some_and(|d| {
+                d.idx == idx
+                    && d.prev_wing.text() == prev_cell.as_ref().and_then(Cell::text)
+                    && docs_col[idx].get("wing").and_then(Cell::text) == Some(d.new_wing.as_ref())
+            })
+        {
+            self.store.deferred_doc_wing_updates.pop();
+            let restored_wing_arc = prev_cell
+                .as_ref()
+                .and_then(Cell::text_shared)
+                .unwrap_or_default();
+            let row = &mut docs_col[idx];
+            match prev_cell {
+                Some(prev) => {
+                    if let Some(slot) = row.get_mut("wing") {
+                        *slot = prev;
+                    } else {
+                        row.insert("wing".to_string(), prev);
+                    }
+                }
+                None => {
+                    row.remove("wing");
+                }
+            }
+            self.store.sync_docs_wing_only(idx, restored_wing_arc);
+            return;
+        }
+        if !self.store.deferred_doc_wing_updates.is_empty() {
+            self.store.flush_fts_deferred_docs();
+        }
         let Store {
             collections,
             indexes,
@@ -1407,10 +1442,43 @@ impl Db {
         base_gen: u64,
         want_rows: bool,
     ) -> Result<(Handle, Option<Pack>, bool), Error> {
-        if self.store.has_deferred_doc_ops() {
+        let can_coalesce_wing_update = prepared
+            .point_update
+            .as_ref()
+            .is_some_and(|pu| pu.is_docs_wing_only)
+            && self.store.deferred_doc_wing_updates.len()
+                < self.store.deferred_doc_wing_updates.inline_size();
+        if !self.store.fts_deferred_doc_swaps.is_empty()
+            || (!self.store.deferred_doc_wing_updates.is_empty() && !can_coalesce_wing_update)
+        {
             self.store.flush_fts_deferred_docs();
         }
         if let Some(pg) = &prepared.point_get {
+            if !want_rows
+                && pg.is_docs_id_title
+                && self.store.disk.is_none()
+                && self.store.fts_deferred_doc_swaps.is_empty()
+            {
+                let exists = (pg.prepared_idx.is_some_and(|i| {
+                    i < self.store.docs_id.len()
+                        && (self.store.docs_epoch == pg.prepared_docs_epoch
+                            || self.store.docs_id[i].as_ref() == pg.key.as_str())
+                })) || self.store.row_index("docs", &pg.key).is_some();
+                return Ok((
+                    Handle {
+                        plan: Arc::clone(&prepared.plan),
+                        rows: Vec::new(),
+                        done: Done {
+                            r#gen: self.store.r#gen,
+                            n: usize::from(exists),
+                        },
+                        message: None,
+                        ms: 0.0,
+                    },
+                    None,
+                    false,
+                ));
+            }
             let row = self.execute_point_get(pg);
             let rows = match row {
                 Some(r) => vec![r],
@@ -1420,7 +1488,7 @@ impl Db {
             return Ok((
                 Handle {
                     plan: Arc::clone(&prepared.plan),
-                    rows,
+                    rows: if want_rows { rows } else { Vec::new() },
                     done: Done {
                         r#gen: self.store.r#gen,
                         n,
@@ -1494,9 +1562,11 @@ impl Db {
             let Store {
                 collections,
                 indexes,
+                deferred_doc_wing_updates,
                 ..
             } = &mut self.store;
             let docs_col = collections.get_mut(&pu.collection).unwrap();
+            let large_table = docs_col.len() >= 64;
             let row = &mut docs_col[idx];
             if !pu.cas_each {
                 let got = row_text(row, "hash").unwrap_or("");
@@ -1520,9 +1590,13 @@ impl Db {
                 (cell, arc)
             };
             let mut has_complex_idx = false;
+            let mut has_unique_idx = false;
             let mut needs_ts = false;
             for live_idx in indexes.values() {
                 if live_idx.def.collection == pu.collection {
+                    if live_idx.def.unique {
+                        has_unique_idx = true;
+                    }
                     if live_idx.def.pred.is_none()
                         && live_idx.def.fields.len() == 1
                         && live_idx.def.fields[0] == "wing"
@@ -1582,42 +1656,54 @@ impl Db {
                     }
                 }
             } else if !same_wing {
-                for live_idx in indexes.values_mut() {
-                    if live_idx.def.collection == pu.collection {
-                        if live_idx.def.fields.len() == 1 && live_idx.def.fields[0] == "wing" {
-                            let old_k = Some(crate::index::LiveIndex::single_cell_key(
-                                prev_cell.as_ref().unwrap_or(&Cell::Null),
-                            ));
-                            let new_k = Some(crate::index::LiveIndex::single_cell_key(
-                                &Cell::Text(Arc::clone(&wing_arc)),
-                            ));
-                            if let Err(e) = live_idx.update_keys(idx, old_k, new_k) {
-                                if let Some(prev) = prev_cell {
-                                    row.insert("wing".to_string(), prev);
-                                } else {
-                                    row.remove("wing");
+                if large_table
+                    && !has_unique_idx
+                    && deferred_doc_wing_updates.len() < deferred_doc_wing_updates.inline_size()
+                {
+                    deferred_doc_wing_updates.push(crate::store::DeferredDocWingUpdate {
+                        idx,
+                        prev_wing: prev_cell.clone().unwrap_or(Cell::Null),
+                        new_wing: Arc::clone(&wing_arc),
+                        ts: ts_cell,
+                    });
+                } else {
+                    for live_idx in indexes.values_mut() {
+                        if live_idx.def.collection == pu.collection {
+                            if live_idx.def.fields.len() == 1 && live_idx.def.fields[0] == "wing" {
+                                let old_k = Some(crate::index::LiveIndex::single_cell_key(
+                                    prev_cell.as_ref().unwrap_or(&Cell::Null),
+                                ));
+                                let new_k = Some(crate::index::LiveIndex::single_cell_key(
+                                    &Cell::Text(Arc::clone(&wing_arc)),
+                                ));
+                                if let Err(e) = live_idx.update_keys(idx, old_k, new_k) {
+                                    if let Some(prev) = prev_cell {
+                                        row.insert("wing".to_string(), prev);
+                                    } else {
+                                        row.remove("wing");
+                                    }
+                                    return Err(Error::runtime(e));
                                 }
-                                return Err(Error::runtime(e));
-                            }
-                        } else if live_idx.def.fields.len() == 2
-                            && live_idx.def.fields[0] == "wing"
-                            && live_idx.def.fields[1] == "ts"
-                        {
-                            let old_k = Some(crate::index::LiveIndex::two_cell_key(
-                                prev_cell.as_ref().unwrap_or(&Cell::Null),
-                                &ts_cell,
-                            ));
-                            let new_k = Some(crate::index::LiveIndex::two_cell_key(
-                                &Cell::Text(Arc::clone(&wing_arc)),
-                                &ts_cell,
-                            ));
-                            if let Err(e) = live_idx.update_keys(idx, old_k, new_k) {
-                                if let Some(prev) = prev_cell {
-                                    row.insert("wing".to_string(), prev);
-                                } else {
-                                    row.remove("wing");
+                            } else if live_idx.def.fields.len() == 2
+                                && live_idx.def.fields[0] == "wing"
+                                && live_idx.def.fields[1] == "ts"
+                            {
+                                let old_k = Some(crate::index::LiveIndex::two_cell_key(
+                                    prev_cell.as_ref().unwrap_or(&Cell::Null),
+                                    &ts_cell,
+                                ));
+                                let new_k = Some(crate::index::LiveIndex::two_cell_key(
+                                    &Cell::Text(Arc::clone(&wing_arc)),
+                                    &ts_cell,
+                                ));
+                                if let Err(e) = live_idx.update_keys(idx, old_k, new_k) {
+                                    if let Some(prev) = prev_cell {
+                                        row.insert("wing".to_string(), prev);
+                                    } else {
+                                        row.remove("wing");
+                                    }
+                                    return Err(Error::runtime(e));
                                 }
-                                return Err(Error::runtime(e));
                             }
                         }
                     }

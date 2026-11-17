@@ -72,6 +72,14 @@ pub struct Handle {
 
 impl Drop for Handle {
     fn drop(&mut self) {
+        if self.rows.len() == 1
+            && self.rows[0]
+                .shape_arc()
+                .is_some_and(|s| Arc::ptr_eq(s, crate::store::shape_id_title()))
+        {
+            crate::store::release_single_id_title_vec(std::mem::take(&mut self.rows));
+            return;
+        }
         if self.rows.len() >= 1024
             && self.rows.len() <= 2_500_000
             && self
@@ -80,6 +88,11 @@ impl Drop for Handle {
                 .is_some_and(|r| r.len() == 2 && r.contains_key("id") && r.contains_key("title"))
         {
             crate::store::release_id_title_rows(std::mem::take(&mut self.rows));
+        } else if self.rows.len() >= 1024
+            && self.rows.len() <= 262_144
+            && self.rows[0].len() <= 4
+        {
+            crate::store::release_general_rows(std::mem::take(&mut self.rows));
         } else if self.rows.len() == 1 && self.rows[0].len() == 3 {
             let is_orders_shape = {
                 let mut ks = self.rows[0].keys();
@@ -1046,7 +1059,7 @@ impl Db {
             && let Stmt::Query(q) = &stmts[0]
             && !writes
         {
-            Self::try_extract_point_get(q, plan_cat).map(Arc::new)
+            Self::try_extract_point_get(q, plan_cat, &self.store).map(Arc::new)
         } else {
             None
         };
@@ -1701,12 +1714,18 @@ impl Db {
             collection: pd.collection.clone(),
             rows: vec![row],
         };
-        let Pack::Delete { rows: out, .. } = self.commit_disk_overlay_pack(pack)? else {
-            unreachable!("commit_disk_overlay_pack returns its input pack");
+        let out = if want_rows {
+            let Pack::Delete { rows: out, .. } = self.commit_disk_overlay_pack(pack)? else {
+                unreachable!("commit_disk_overlay_pack returns its input pack");
+            };
+            out
+        } else {
+            self.commit_disk_overlay_pack_discard(pack)?;
+            Vec::new()
         };
         Ok(Handle {
             plan: Arc::clone(plan),
-            rows: if want_rows { out } else { Vec::new() },
+            rows: out,
             done: Done {
                 r#gen: self.store.r#gen,
                 n: 1,
@@ -1746,11 +1765,12 @@ impl Db {
     /// Commit updated rows of a cold collection. Rows whose `id` changed are logged as a
     /// delete of the old id plus an upsert of the new row, in one record, since an overlay
     /// update is an upsert keyed by `id`.
-    fn commit_cold_update(
+    fn commit_cold_update_ext(
         &mut self,
         collection: &str,
         old_ids: &[Option<String>],
         rows: Vec<Row>,
+        want_rows: bool,
     ) -> Result<Vec<Row>, Error> {
         let renamed: Vec<Row> = old_ids
             .iter()
@@ -1765,6 +1785,10 @@ impl Db {
             rows,
         };
         if renamed.is_empty() {
+            if !want_rows {
+                self.commit_disk_overlay_pack_discard(update)?;
+                return Ok(Vec::new());
+            }
             let Pack::Update { rows, .. } = self.commit_disk_overlay_pack(update)? else {
                 unreachable!("commit_disk_overlay_pack returns its input pack");
             };
@@ -1779,6 +1803,10 @@ impl Db {
                 update,
             ],
         };
+        if !want_rows {
+            self.commit_disk_overlay_pack_discard(pack)?;
+            return Ok(Vec::new());
+        }
         let Pack::Batch { mut packs } = self.commit_disk_overlay_pack(pack)? else {
             unreachable!("commit_disk_overlay_pack returns its input pack");
         };
@@ -1786,6 +1814,15 @@ impl Db {
             Some(Pack::Update { rows, .. }) => Ok(rows),
             _ => unreachable!("the update is the last pack of the batch"),
         }
+    }
+
+    fn commit_cold_update(
+        &mut self,
+        collection: &str,
+        old_ids: &[Option<String>],
+        rows: Vec<Row>,
+    ) -> Result<Vec<Row>, Error> {
+        self.commit_cold_update_ext(collection, old_ids, rows, true)
     }
 
     /// Reject an update that moves a row onto a unique key another row already holds.
@@ -1799,6 +1836,9 @@ impl Db {
         updated: &Row,
         seen: &mut FxHashSet<(usize, String)>,
     ) -> Result<(), Error> {
+        if keys.is_empty() {
+            return Ok(());
+        }
         let now = now_ms();
         for (i, key) in keys.iter().enumerate() {
             let Some(new) = key.indexed_text(updated, now) else {
@@ -1875,7 +1915,14 @@ impl Db {
                 )));
             }
         }
-        let now = now_ms();
+        let needs_now = has_guards
+            || !unique_keys.is_empty()
+            || pu
+                .record
+                .fields
+                .iter()
+                .any(|(_, v)| eval::value_needs_now(v));
+        let now = if needs_now { now_ms() } else { 0 };
         for (k, _) in &pu.record.fields {
             for g in &self.catalog.guards {
                 if g.collection == pu.collection
@@ -1889,11 +1936,12 @@ impl Db {
                 }
             }
         }
-        let old_keys: Vec<Option<String>> = unique_keys
+        let old_keys: smallvec::SmallVec<[Option<String>; 4]> = unique_keys
             .iter()
-            .map(|k| k.indexed_text(&before, now_ms()))
+            .map(|k| k.indexed_text(&before, now))
             .collect();
-        let old_ids = vec![row_text(&before, "id").map(str::to_string)];
+        let mut old_ids: smallvec::SmallVec<[Option<String>; 1]> = smallvec::SmallVec::new();
+        old_ids.push(row_text(&before, "id").map(str::to_string));
         let mut updated = before;
         for (k, v) in &pu.record.fields {
             updated.insert(k.clone(), value_cell(v, now));
@@ -1920,10 +1968,10 @@ impl Db {
         if pu.record.fields.iter().any(|(k, _)| k == "id") {
             self.cold_check_id_change(&pu.collection, &old_ids, &updated)?;
         }
-        let out = self.commit_cold_update(&pu.collection, &old_ids, updated)?;
+        let out = self.commit_cold_update_ext(&pu.collection, &old_ids, updated, want_rows)?;
         Ok(Handle {
             plan: Arc::clone(plan),
-            rows: if want_rows { out } else { Vec::new() },
+            rows: out,
             done: Done {
                 r#gen: self.store.r#gen,
                 n: 1,
@@ -2323,7 +2371,117 @@ impl Db {
         Ok(pack)
     }
 
+    /// Durably log `pack` and move it into the disk overlay without cloning when rows aren't needed.
+    fn commit_disk_overlay_pack_discard(&mut self, pack: Pack) -> Result<(), Error> {
+        if let Some(packs) = self.cold_program_packs.as_mut() {
+            self.store.apply_pack(&pack);
+            packs.push(pack);
+            return Ok(());
+        }
+        if self.store.is_native_disk() {
+            self.store.commit_pack_to_native_disk(&pack)?;
+            self.store.r#gen += 1;
+            return Ok(());
+        }
+        let Some(p) = self.persist.as_mut() else {
+            return Err(Error::runtime("disk overlay requires a durable log"));
+        };
+        let can_ref = match &pack {
+            Pack::Update { .. } => true,
+            Pack::Delete { collection, rows } => {
+                let keys: &[&str] = if collection == "facts" {
+                    &["s", "p", "o"]
+                } else {
+                    &["id", "uri"]
+                };
+                rows.iter()
+                    .all(|r| r.iter().all(|(k, _)| keys.contains(&k.as_str())))
+            }
+            _ => false,
+        };
+        if can_ref {
+            self.store.durable_commit_ref(p, &pack)?;
+        } else {
+            self.store.durable_commit(p, pack.clone())?;
+        }
+        let mut ops = Vec::new();
+        crate::store::checkpoint::pack_into_disk_wal_ops(pack, &mut ops);
+        if !ops.is_empty() {
+            let _ = self.store.apply_disk_overlay_ops_owned(ops);
+        }
+        self.store.r#gen += 1;
+        if let Some(p) = self.persist.as_mut() {
+            self.store.maybe_checkpoint(p)?;
+        }
+        Ok(())
+    }
+
     fn run_prepared_ext(&mut self, prepared: &Prepared, want_rows: bool) -> Result<Handle, Error> {
+        if let Some(pg) = &prepared.point_get {
+            if !self.store.fts_deferred_doc_swaps.is_empty()
+                || (!pg.is_docs_id_title && !self.store.deferred_doc_wing_updates.is_empty())
+            {
+                self.store.flush_fts_deferred_docs();
+            }
+            if pg.is_docs_id_title
+                && self.store.disk.is_none()
+                && self.store.fts_deferred_doc_swaps.is_empty()
+            {
+                let idx_opt = pg
+                    .prepared_idx
+                    .filter(|&i| {
+                        i < self.store.docs_id.len()
+                            && (self.store.docs_epoch == pg.prepared_docs_epoch
+                                || self.store.docs_id[i].as_ref() == pg.key.as_str())
+                    })
+                    .or_else(|| self.store.row_index("docs", &pg.key));
+                if let Some(idx) = idx_opt
+                    && idx < self.store.docs_id.len()
+                    && idx < self.store.docs_title.len()
+                {
+                    let rows = if want_rows {
+                        crate::store::take_single_id_title_vec_with_arcs(
+                            &self.store.docs_id[idx],
+                            &self.store.docs_title[idx],
+                        )
+                    } else {
+                        Vec::new()
+                    };
+                    return Ok(Handle {
+                        plan: prepared.plan.clone(),
+                        rows,
+                        done: Done {
+                            r#gen: self.store.r#gen,
+                            n: 1,
+                        },
+                        message: None,
+                        ms: 0.0,
+                    });
+                }
+            }
+            let row = self.execute_point_get(pg);
+            let (rows, n) = match row {
+                Some(r) => (
+                    if want_rows {
+                        crate::store::wrap_single_row_vec(r)
+                    } else {
+                        Vec::new()
+                    },
+                    1,
+                ),
+                None => (Vec::new(), 0),
+            };
+            return Ok(Handle {
+                plan: prepared.plan.clone(),
+                rows,
+                done: Done {
+                    r#gen: self.store.r#gen,
+                    n,
+                },
+                message: None,
+                ms: 0.0,
+            });
+        }
         if self.follower && prepared.writes {
             return Err(Error::runtime(
                 "follower: read-only — apply_wal for replication, open primary for writes",
@@ -2353,24 +2511,6 @@ impl Db {
                     self.store.rebuild_dirty_disk_fts(name)?;
                 }
             }
-        }
-        if let Some(pg) = &prepared.point_get {
-            let row = self.execute_point_get(pg);
-            let rows = match row {
-                Some(r) => vec![r],
-                None => Vec::new(),
-            };
-            let n = rows.len();
-            return Ok(Handle {
-                plan: prepared.plan.clone(),
-                rows: if want_rows { rows } else { Vec::new() },
-                done: Done {
-                    r#gen: self.store.r#gen,
-                    n,
-                },
-                message: None,
-                ms: 0.0,
-            });
         }
         if let Some(pd) = &prepared.point_delete {
             if !pd.append_only && !pd.cas_each && pd.cas.is_none() {
@@ -2515,7 +2655,8 @@ impl Db {
                     ..
                 } = &mut self.store;
                 let docs_col = collections.get_mut(&pu.collection).unwrap();
-                let large_table = docs_col.len() >= 4096;
+                let defer_wing_idx = docs_col.len() >= 64;
+                let large_table = docs_col.len() >= 512;
                 let row = &mut docs_col[idx];
                 if !pu.cas_each {
                     let got = row_text(row, "hash").unwrap_or("");
@@ -2605,7 +2746,7 @@ impl Db {
                         }
                     }
                 } else if !same_wing {
-                    if large_table
+                    if defer_wing_idx
                         && !has_unique_idx
                         && deferred_doc_wing_updates.len()
                             < deferred_doc_wing_updates.inline_size()
@@ -3678,7 +3819,7 @@ impl Db {
 
     /// Begin an interactive ACID transaction.
     pub fn transaction(&mut self) -> Result<Transaction<'_>, Error> {
-        if self.store.has_deferred_doc_ops() {
+        if !self.store.fts_deferred_doc_swaps.is_empty() {
             self.store.flush_fts_deferred_docs();
         }
         let base_gen = self.store.r#gen;
@@ -3808,10 +3949,10 @@ impl Db {
                 return Ok(rows);
             }
             if let Some(batch) = self.try_window_project_batch(q, bindings, now) {
-                return Ok(batch.to_rows());
+                return Ok(batch.into_rows());
             }
             if let Some(batch) = self.try_sort_project_batch(q, bindings, now) {
-                return Ok(batch.to_rows());
+                return Ok(batch.into_rows());
             }
         }
 

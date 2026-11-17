@@ -27,6 +27,8 @@ pub struct DiskSegment {
     /// column: a row with no absent value is built from them without touching names.
     name_order: Vec<usize>,
     full_shape: Arc<crate::store::RowShape>,
+    id_col_pos: Option<usize>,
+    title_col_pos: Option<usize>,
 }
 
 impl DiskSegment {
@@ -78,6 +80,8 @@ impl DiskSegment {
         name_order.sort_unstable_by(|&a, &b| cols[a].0.cmp(&cols[b].0));
         let names: Vec<&str> = cols.iter().map(|(n, _)| n.as_str()).collect();
         let full_shape = Row::shape_of(&names);
+        let id_col_pos = col_pos.get("id").copied();
+        let title_col_pos = col_pos.get("title").copied();
 
         Ok(Self {
             meta,
@@ -87,6 +91,8 @@ impl DiskSegment {
             sec_indexes,
             name_order,
             full_shape,
+            id_col_pos,
+            title_col_pos,
         })
     }
 
@@ -131,6 +137,18 @@ impl DiskSegment {
 
     #[inline]
     pub fn materialize_projected(&self, row_id: u32, fields: &[&str]) -> Result<Row, Error> {
+        if fields == ["id", "title"]
+            && let (Some(id_pos), Some(title_pos)) = (self.id_col_pos, self.title_col_pos)
+        {
+            let c_id = self.cols[id_pos].1.get_cell(row_id)?;
+            let c_title = self.cols[title_pos].1.get_cell(row_id)?;
+            if !matches!(c_id, Cell::Null) && !matches!(c_title, Cell::Null) {
+                return Ok(Row::from_parts(
+                    Arc::clone(crate::store::shape_id_title()),
+                    [c_id, c_title],
+                ));
+            }
+        }
         let mut row = Row::new();
         for &fname in fields {
             if let Some(&pos) = self.col_pos.get(fname) {
@@ -236,6 +254,15 @@ impl DiskSegment {
                 if len == 0 {
                     return Ok(Some(""));
                 }
+                let s_off = in_off as usize;
+                let e_off = s_off + (len as usize);
+                if let Some(raw) = tc.raw_uncompressed_block(bidx)? {
+                    if e_off > raw.len() {
+                        return Err(io_err("corrupt in-block text slice"));
+                    }
+                    let s = std::str::from_utf8(&raw[s_off..e_off]).map_err(io_err)?;
+                    return Ok(Some(s));
+                }
                 let need_load = match last_block {
                     Some((lb, _)) => *lb != bidx,
                     None => true,
@@ -245,8 +272,6 @@ impl DiskSegment {
                     *last_block = Some((bidx, decoded));
                 }
                 let (_, ref block) = *last_block.as_ref().unwrap();
-                let s_off = in_off as usize;
-                let e_off = s_off + (len as usize);
                 if e_off > block.len() {
                     return Err(io_err("corrupt in-block text slice"));
                 }
@@ -418,7 +443,7 @@ fn write_single_column(
                 let mut eligible = true;
 
                 for row_idx in 0..src.len() {
-                    if row_idx == 64 && src.len() >= 128 && dict_list.len() > 56 {
+                    if row_idx == 2048 && src.len() >= 4096 && dict_list.len() > 1920 {
                         eligible = false;
                         break;
                     }

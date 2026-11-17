@@ -12,14 +12,16 @@ pub use crate::catalog::catalog_hash;
 pub(crate) use checkpoint::StoreOpenPhases;
 pub use columnar::DictColumn;
 pub use edges::Edge;
-pub(crate) use value::intern_wing;
-#[allow(unused_imports)]
-pub(crate) use value::take_recycled_id_title_vec;
+pub(crate) use value::{
+    intern_wing, shape_id_title, take_general_rows, take_recycled_id_title_vec,
+    take_single_id_title_vec_with_arcs, wrap_single_row_vec,
+};
 #[allow(unused_imports)]
 pub use value::{
     Cell, InlineStr, Row, RowExt, Shape as RowShape, acquire_orders_row, acquire_row, cell_from_arc_inline,
     compact_row, content_hash_arc, content_hash_inline, fnv1a64, now_ms, project_fields,
-    release_id_title_rows, release_orders_row, row_byte_size, row_text,
+    release_general_rows, release_id_title_rows, release_orders_row, release_single_id_title_vec,
+    row_byte_size, row_text,
 };
 
 use std::collections::BTreeMap;
@@ -310,7 +312,7 @@ pub struct Store {
     /// Parallel Arc columns for docs — contains scans + projected materialize
     /// without cloning full `BTreeMap` rows. Organized SoA (struct-of-arrays) for cache locality.
     pub(crate) docs_id: Vec<Arc<str>>,
-    docs_title: Vec<Arc<str>>,
+    pub(crate) docs_title: Vec<Arc<str>>,
     docs_title_packed: OnceLock<(Vec<u8>, bool)>,
     pub(crate) docs_epoch: u64,
     docs_layer: DictColumn,
@@ -724,11 +726,18 @@ impl Store {
     }
 
     pub(crate) fn apply_disk_overlay_ops(&mut self, ops: &[crate::disk::DiskWalOp]) -> Result<(), Error> {
+        self.apply_disk_overlay_ops_owned(ops.to_vec())
+    }
+
+    pub(crate) fn apply_disk_overlay_ops_owned(
+        &mut self,
+        ops: Vec<crate::disk::DiskWalOp>,
+    ) -> Result<(), Error> {
         if ops.is_empty() {
             return Ok(());
         }
         let mut touched: smallvec::SmallVec<[String; 4]> = smallvec::SmallVec::new();
-        for op in ops {
+        for op in &ops {
             let t = match op {
                 crate::disk::DiskWalOp::EnsureTable { schema } => &schema.name,
                 crate::disk::DiskWalOp::EnsureIndex { table, .. }
@@ -765,7 +774,7 @@ impl Store {
                 .write()
                 .map_err(|_| Error::runtime("disk engine lock poisoned"))?;
             for op in ops {
-                eng.apply_mem_overlay_op(op.clone());
+                eng.apply_mem_overlay_op(op);
             }
             for t in &touched {
                 let nrows = eng.count_table(t);
@@ -1699,6 +1708,7 @@ impl Store {
                         self.docs_title.truncate(prev_len);
                         self.docs_layer.truncate(prev_len);
                         self.docs_wing.truncate(prev_len);
+                        self.invalidate_docs_cache();
                     }
                     "orders" => {
                         self.orders_id.truncate(prev_len);

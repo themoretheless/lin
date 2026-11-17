@@ -75,6 +75,7 @@ pub use wal::{
 #[cfg(all(test, feature = "parallel"))]
 pub use wal::append_batch_records;
 pub(crate) use wal::{
-    append_validated_frame_slices, append_validated_frames, durable_sync, prune_bins,
-    replay_log_indexed, reserve_wal_space, sync_dir_checked, write_frame, write_head_no_dir_sync,
+    append_record_v1_ref, append_validated_frame_slices, append_validated_frames, durable_sync,
+    open_log_unreserved, prune_bins, replay_log_indexed, reserve_wal_space, sync_dir_checked,
+    truncate_log_with_sync, write_frame, write_head_no_dir_sync,
 };

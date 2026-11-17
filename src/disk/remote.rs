@@ -1592,6 +1592,7 @@ impl DiskEngine {
             sync_full: false,
             read_only: true,
             remote_tier: Some(tier),
+            join_dim_cache: Mutex::new(None),
         };
 
         if !cfg.lazy {

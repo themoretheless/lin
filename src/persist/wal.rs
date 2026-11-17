@@ -5,6 +5,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, IoSlice, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+use serde::Serialize;
+
 use crate::error::Error;
 
 use super::codec::{
@@ -337,14 +339,22 @@ pub(crate) fn reserve_wal_space(log: &File, additional: usize, empty_only: bool)
     let _ = (log, additional, empty_only);
 }
 
-pub fn open_log(dir: &Path) -> Result<File, Error> {
-    let file = OpenOptions::new()
+fn open_log_file(dir: &Path) -> Result<File, Error> {
+    OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
         .open(log_path(dir))
-        .map_err(io_err)?;
+        .map_err(io_err)
+}
+
+pub(crate) fn open_log_unreserved(dir: &Path) -> Result<File, Error> {
+    open_log_file(dir)
+}
+
+pub fn open_log(dir: &Path) -> Result<File, Error> {
+    let file = open_log_file(dir)?;
     reserve_wal_space(&file, 1024 * 1024, true);
     Ok(file)
 }
@@ -449,6 +459,38 @@ pub fn append_record(
     }
 }
 
+#[derive(Serialize)]
+struct LogRecordRef<'a> {
+    r#gen: u64,
+    next_id: u64,
+    pack: &'a Pack,
+}
+
+pub(crate) fn append_record_v1_ref(
+    log: &mut File,
+    r#gen: u64,
+    next_id: u64,
+    pack: &Pack,
+    buf: &mut Vec<u8>,
+    sync: SyncMode,
+    log_bytes: &mut u64,
+) -> Result<(), Error> {
+    buf.clear();
+    rmp_serde::encode::write_named(
+        buf,
+        &LogRecordRef {
+            r#gen,
+            next_id,
+            pack,
+        },
+    )
+    .map_err(io_err)?;
+    if buf.len() > MAX_RECORD as usize {
+        return Err(io_err("log record exceeds 16MiB"));
+    }
+    write_frame(log, &LOG_MAGIC_V1, buf, sync, log_bytes)
+}
+
 pub(super) fn append_record_v1(
     log: &mut File,
     rec: &LogRecord,
@@ -456,12 +498,7 @@ pub(super) fn append_record_v1(
     sync: SyncMode,
     log_bytes: &mut u64,
 ) -> Result<(), Error> {
-    buf.clear();
-    rmp_serde::encode::write_named(buf, rec).map_err(io_err)?;
-    if buf.len() > MAX_RECORD as usize {
-        return Err(io_err("log record exceeds 16MiB"));
-    }
-    write_frame(log, &LOG_MAGIC_V1, buf, sync, log_bytes)
+    append_record_v1_ref(log, rec.r#gen, rec.next_id, &rec.pack, buf, sync, log_bytes)
 }
 
 /// Write every byte of `slices`, in order. One vectored write is attempted; whatever it
@@ -786,7 +823,11 @@ pub(super) fn read_one(log: &mut File, file_len: u64, pos: u64, buf: &mut Vec<u8
 }
 
 
-pub fn truncate_log(log: &mut File, end: u64) -> Result<(), Error> {
+pub(crate) fn truncate_log_with_sync(
+    log: &mut File,
+    end: u64,
+    sync: SyncMode,
+) -> Result<(), Error> {
     let metadata = log.metadata().map_err(io_err)?;
     let current_len = metadata.len();
     if current_len != end {
@@ -803,13 +844,21 @@ pub fn truncate_log(log: &mut File, end: u64) -> Result<(), Error> {
                 use std::os::unix::fs::MetadataExt;
                 if metadata.blocks().saturating_mul(512) < 1024 * 1024 {
                     reserve_wal_space(log, 1024 * 1024, true);
-                    durable_sync(log).or_else(|_| log.sync_all()).map_err(io_err)?;
+                    if sync == SyncMode::Full {
+                        durable_sync(log).or_else(|_| log.sync_all()).map_err(io_err)?;
+                    }
                 }
             }
+            #[cfg(not(target_vendor = "apple"))]
+            let _ = sync;
         }
         log.seek(SeekFrom::End(0)).map_err(io_err)?;
     }
     Ok(())
+}
+
+pub fn truncate_log(log: &mut File, end: u64) -> Result<(), Error> {
+    truncate_log_with_sync(log, end, SyncMode::Full)
 }
 
 /// After a durable snapshot of the full memory image, drop the covered log prefix

@@ -1229,11 +1229,11 @@ impl Db {
                 }
                 Some(by_field) => {
                     if let Some(by_name) = by_field.leaf()
-                        && let Some(map) = eng.sum_f64_by_col(col, fname, by_name)?
+                        && let Some(mut entries) = eng.sum_f64_by_col_entries(col, fname, by_name)?
                     {
-                        let state_bytes: usize = map
-                            .keys()
-                            .map(|cell| match cell {
+                        let state_bytes: usize = entries
+                            .iter()
+                            .map(|(cell, _)| match cell {
                                 Cell::Text(s) => s.len() + 32 + 64,
                                 _ => 16 + 64,
                             })
@@ -1242,7 +1242,6 @@ impl Db {
                         if state_bytes <= max_bytes {
                             let bk = by_field.as_str();
                             let fk = field.as_str();
-                            let mut entries: Vec<(Cell, f64)> = map.into_iter().collect();
                             entries.sort_unstable_by(|(a, _), (b, _)| cmp_sort(a, b));
                             let rows = match bk.cmp(&fk) {
                                 std::cmp::Ordering::Less => {

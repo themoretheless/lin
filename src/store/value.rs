@@ -98,6 +98,89 @@ pub(crate) fn take_recycled_id_title_vec() -> Option<Vec<Row>> {
         .and_then(|mut guard| guard.take().map(|r| r.rows))
 }
 
+thread_local! {
+    static SINGLE_ID_TITLE_VEC: std::cell::RefCell<Option<Vec<Row>>> =
+        const { std::cell::RefCell::new(None) };
+    static GENERAL_ROW_VEC_POOL: std::cell::RefCell<Option<Vec<Row>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[inline]
+pub fn release_single_id_title_vec(rows: Vec<Row>) {
+    if rows.len() == 1 {
+        let _ = SINGLE_ID_TITLE_VEC.try_with(|cell| {
+            if let Ok(mut slot) = cell.try_borrow_mut() {
+                *slot = Some(rows);
+            }
+        });
+    }
+}
+
+#[inline]
+pub(crate) fn take_single_id_title_vec_with_arcs(id: &Arc<str>, title: &Arc<str>) -> Vec<Row> {
+    let shape = shape_id_title();
+    let reused = SINGLE_ID_TITLE_VEC
+        .try_with(|cell| cell.try_borrow_mut().ok().and_then(|mut s| s.take()))
+        .ok()
+        .flatten();
+    if let Some(mut v) = reused
+        && v.len() == 1
+    {
+        let r0 = &mut v[0];
+        let matches = r0.shape_arc().is_some_and(|s| Arc::ptr_eq(s, shape))
+            && match r0.cells_slice() {
+                [Cell::Text(a0), Cell::Text(a1)] => Arc::ptr_eq(a0, id) && Arc::ptr_eq(a1, title),
+                _ => false,
+            };
+        if !matches {
+            r0.set_pair_with_shape(
+                shape,
+                Cell::Text(Arc::clone(id)),
+                Cell::Text(Arc::clone(title)),
+            );
+        }
+        return v;
+    }
+    vec![row_id_title(id, title)]
+}
+
+#[inline]
+pub(crate) fn wrap_single_row_vec(row: Row) -> Vec<Row> {
+    let reused = SINGLE_ID_TITLE_VEC
+        .try_with(|cell| cell.try_borrow_mut().ok().and_then(|mut s| s.take()))
+        .ok()
+        .flatten();
+    if let Some(mut v) = reused {
+        v.clear();
+        v.push(row);
+        return v;
+    }
+    vec![row]
+}
+
+#[inline]
+pub fn release_general_rows(rows: Vec<Row>) {
+    if rows.len() >= 1024 && rows.len() <= 262_144 {
+        let _ = GENERAL_ROW_VEC_POOL.try_with(|cell| {
+            if let Ok(mut slot) = cell.try_borrow_mut()
+                && slot
+                    .as_ref()
+                    .is_none_or(|prev| prev.capacity() <= rows.capacity())
+            {
+                *slot = Some(rows);
+            }
+        });
+    }
+}
+
+#[inline]
+pub(crate) fn take_general_rows() -> Option<Vec<Row>> {
+    GENERAL_ROW_VEC_POOL
+        .try_with(|cell| cell.try_borrow_mut().ok().and_then(|mut s| s.take()))
+        .ok()
+        .flatten()
+}
+
 #[inline]
 pub(super) fn row_matches_id_title(row: &Row, id: &Arc<str>, title: &Arc<str>) -> bool {
     if row.len() != 2 {
@@ -355,6 +438,16 @@ impl Cell {
         }
     }
 
+    /// Construct an inline text cell when `arc` fits within SSO, otherwise share `Arc::clone`.
+    #[inline]
+    pub fn from_arc_str(arc: &Arc<str>) -> Self {
+        if let Some(inline) = InlineStr::try_new(arc.as_ref()) {
+            Cell::SmallText(inline)
+        } else {
+            Cell::Text(Arc::clone(arc))
+        }
+    }
+
     /// Construct an inline text cell if `s` fits within 22 bytes.
     #[inline]
     pub fn inline(s: &str) -> Option<Self> {
@@ -584,12 +677,18 @@ pub(super) fn docs_hot_field(f: &str) -> bool {
     matches!(f, "id" | "title" | "layer" | "wing")
 }
 
+pub(crate) fn shape_id_title() -> &'static Arc<super::RowShape> {
+    static SHAPE: std::sync::LazyLock<Arc<super::RowShape>> =
+        std::sync::LazyLock::new(|| Row::shape_of(&["id", "title"]));
+    &SHAPE
+}
+
 #[inline]
 pub(super) fn row_id_title(id: &Arc<str>, title: &Arc<str>) -> Row {
-    let mut row = Row::new();
-    row.insert(String::from("id"), Cell::Text(Arc::clone(id)));
-    row.insert(String::from("title"), Cell::Text(Arc::clone(title)));
-    row
+    Row::from_parts(
+        Arc::clone(shape_id_title()),
+        [Cell::Text(Arc::clone(id)), Cell::Text(Arc::clone(title))],
+    )
 }
 
 pub(super) fn spo_key(row: &Row) -> Option<(Arc<str>, Arc<str>, Arc<str>)> {
