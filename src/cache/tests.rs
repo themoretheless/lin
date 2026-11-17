@@ -236,7 +236,7 @@ fn test_durable_persistence_across_restart() {
             CacheResponse::Int(2)
         );
         // Checkpoint & close underlying Db cleanly
-        let mut st = node.state.lock().unwrap();
+        let mut st = node.state.write().unwrap();
         st.db.close().unwrap();
     }
 
@@ -255,7 +255,7 @@ fn test_durable_persistence_across_restart() {
             node2.execute(parse_cli_command("SISMEMBER persist_set m2").unwrap()),
             CacheResponse::Int(1)
         );
-        let mut st = node2.state.lock().unwrap();
+        let mut st = node2.state.write().unwrap();
         st.db.close().unwrap();
     }
 

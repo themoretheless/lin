@@ -9,7 +9,7 @@ use super::unix_ms;
 impl CacheNode {
     pub(crate) fn propose_and_apply_mutation(&self, cmd: RaftCommand) {
         let (entry, prev_idx, prev_term, term, peers) = {
-            let mut st = self.state.lock().unwrap();
+            let mut st = self.state.write().unwrap();
             let prev_idx = st.raft.last_log_index();
             let prev_term = st.raft.last_log_term();
             let term = st.raft.current_term;
@@ -55,7 +55,7 @@ impl CacheNode {
 
     pub(crate) fn propose_raft_only(&self, cmd: RaftCommand) {
         let (entry, prev_idx, prev_term, term, peers) = {
-            let mut st = self.state.lock().unwrap();
+            let mut st = self.state.write().unwrap();
             let prev_idx = st.raft.last_log_index();
             let prev_term = st.raft.last_log_term();
             let term = st.raft.current_term;
@@ -104,7 +104,7 @@ impl CacheNode {
         incoming_members: Vec<NodeMember>,
         pubsub_events: Vec<PubSubEvent>,
     ) -> CacheResponse {
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.state.write().unwrap();
         let now = unix_ms();
 
         // Ensure sender is in the ring & membership table
@@ -167,7 +167,7 @@ impl CacheNode {
         last_log_index: u64,
         last_log_term: u64,
     ) -> CacheResponse {
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.state.write().unwrap();
         if term < st.raft.current_term {
             return CacheResponse::RaftVoteReply {
                 term: st.raft.current_term,
@@ -219,7 +219,7 @@ impl CacheNode {
         entries: Vec<RaftLogEntry>,
         leader_commit: u64,
     ) -> CacheResponse {
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.state.write().unwrap();
         if term < st.raft.current_term {
             return CacheResponse::RaftAppendReply {
                 term: st.raft.current_term,
@@ -262,7 +262,7 @@ impl CacheNode {
     /// Trigger a Raft leader election across known cluster peers.
     pub fn run_leader_election(&self) -> bool {
         let (term, last_idx, last_term, peers, total_nodes) = {
-            let mut st = self.state.lock().unwrap();
+            let mut st = self.state.write().unwrap();
             st.raft.current_term += 1;
             st.raft.role = NodeRole::Candidate;
             st.raft.voted_for = Some(self.cfg.node_id.clone());
@@ -303,7 +303,7 @@ impl CacheNode {
             }) = send_rpc(peer_addr, &req)
             {
                 if reply_term > term {
-                    let mut st = self.state.lock().unwrap();
+                    let mut st = self.state.write().unwrap();
                     st.raft.current_term = reply_term;
                     st.raft.role = NodeRole::Follower;
                     st.raft.voted_for = None;
@@ -317,7 +317,7 @@ impl CacheNode {
 
         let won = votes >= quorum;
         if won {
-            let mut st = self.state.lock().unwrap();
+            let mut st = self.state.write().unwrap();
             if st.raft.current_term == term {
                 st.raft.role = NodeRole::Leader;
                 st.raft.leader_id = Some(self.cfg.node_id.clone());
@@ -348,7 +348,7 @@ impl CacheNode {
     /// Perform one Gossip round with a specific peer address.
     pub fn gossip_once_with(&self, peer_addr: &str) -> Result<(), Error> {
         let req = {
-            let mut st = self.state.lock().unwrap();
+            let mut st = self.state.write().unwrap();
             st.heartbeat += 1;
             let hb = st.heartbeat;
             let now = unix_ms();
@@ -375,7 +375,7 @@ impl CacheNode {
             members,
         } = resp
         {
-            let mut st = self.state.lock().unwrap();
+            let mut st = self.state.write().unwrap();
             let now = unix_ms();
             for inc in members {
                 if inc.node_id == self.cfg.node_id {

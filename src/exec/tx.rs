@@ -51,7 +51,7 @@ pub(crate) fn stmts_write_disk_collection(store: &crate::store::Store, stmts: &[
 }
 
 pub(crate) enum RowUndo {
-    DocsWing(usize, Option<Cell>),
+    DocsWing(usize, Option<u8>, Option<Cell>),
     Update(String, usize, Row),
     Delete(String, Vec<usize>, Vec<Row>),
     /// Collection lengths before an appending statement that follows row events. Undo
@@ -1288,8 +1288,8 @@ impl Db {
             Undo::Rows(events) | Undo::Mixed { events } => {
                 for event in events.into_iter().rev() {
                     match event {
-                        RowUndo::DocsWing(idx, prev_cell) => {
-                            self.restore_docs_wing_cell(idx, prev_cell);
+                        RowUndo::DocsWing(idx, wing_slot, prev_cell) => {
+                            self.restore_docs_wing_cell(idx, wing_slot, prev_cell);
                         }
                         RowUndo::Update(collection, idx, row) => {
                             self.store.restore_row_owned(&collection, idx, row);
@@ -1304,7 +1304,24 @@ impl Db {
         }
     }
 
-    pub(crate) fn restore_docs_wing_cell(&mut self, idx: usize, prev_cell: Option<Cell>) {
+    pub(crate) fn restore_docs_wing_cell(
+        &mut self,
+        idx: usize,
+        wing_slot: Option<u8>,
+        prev_cell: Option<Cell>,
+    ) {
+        let valid_wing_slot = |row: &Row, wing_slot: Option<u8>| -> Option<usize> {
+            let ws = wing_slot? as usize;
+            if row
+                .shape_arc()
+                .is_some_and(|sh| sh.names().get(ws).map(String::as_str) == Some("wing"))
+                && ws < row.cells_slice().len()
+            {
+                Some(ws)
+            } else {
+                None
+            }
+        };
         let Store {
             collections,
             docs_wing,
@@ -1313,31 +1330,43 @@ impl Db {
         } = &mut self.store;
         if let Some(docs_col) = collections.get_mut("docs")
             && idx < docs_col.len()
-            && deferred_doc_wing_updates.last().is_some_and(|d| {
+        {
+            let row = &docs_col[idx];
+            let slot_idx = valid_wing_slot(row, wing_slot);
+            if deferred_doc_wing_updates.last().is_some_and(|d| {
+                let cur_wing = match slot_idx {
+                    Some(ws) => row.cells_slice()[ws].text(),
+                    None => row.get("wing").and_then(Cell::text),
+                };
                 d.idx == idx
                     && d.prev_wing.text() == prev_cell.as_ref().and_then(Cell::text)
-                    && docs_col[idx].get("wing").and_then(Cell::text) == Some(d.new_wing.as_ref())
-            })
-        {
-            deferred_doc_wing_updates.pop();
-            let row = &mut docs_col[idx];
-            match prev_cell {
-                Some(prev) => {
-                    if let Some(slot) = row.get_mut("wing") {
-                        *slot = prev;
-                    } else {
-                        row.insert("wing".to_string(), prev);
+                    && cur_wing == Some(d.new_wing.as_ref())
+            }) {
+                deferred_doc_wing_updates.pop();
+                let row = &mut docs_col[idx];
+                let wing_str = match prev_cell {
+                    Some(prev) => {
+                        if let Some(ws) = slot_idx {
+                            row.cells_mut()[ws] = prev;
+                            row.cells_slice()[ws].text().unwrap_or("")
+                        } else if let Some(slot) = row.get_mut("wing") {
+                            *slot = prev;
+                            slot.text().unwrap_or("")
+                        } else {
+                            row.insert("wing".to_string(), prev);
+                            row.get("wing").and_then(Cell::text).unwrap_or("")
+                        }
                     }
+                    None => {
+                        row.remove("wing");
+                        ""
+                    }
+                };
+                if idx < docs_wing.len() {
+                    docs_wing.set_str(idx, wing_str);
                 }
-                None => {
-                    row.remove("wing");
-                }
+                return;
             }
-            let wing_str = row.get("wing").and_then(Cell::text).unwrap_or("");
-            if idx < docs_wing.len() {
-                docs_wing.set_str(idx, wing_str);
-            }
-            return;
         }
         if !deferred_doc_wing_updates.is_empty() {
             self.store.flush_fts_deferred_docs();
@@ -1354,6 +1383,7 @@ impl Db {
             return;
         }
         let row = &mut docs_col[idx];
+        let slot_idx = valid_wing_slot(row, wing_slot);
         let restored_wing_arc = prev_cell
             .as_ref()
             .and_then(Cell::text_shared)
@@ -1397,7 +1427,9 @@ impl Db {
         };
         let cur_cell = match prev_cell {
             Some(prev) => {
-                if let Some(slot) = row.get_mut("wing") {
+                if let Some(ws) = slot_idx {
+                    Some(std::mem::replace(&mut row.cells_mut()[ws], prev))
+                } else if let Some(slot) = row.get_mut("wing") {
                     Some(std::mem::replace(slot, prev))
                 } else {
                     row.insert("wing".to_string(), prev)
@@ -1561,9 +1593,10 @@ impl Db {
                     None => return Err(Error::runtime("update: no matching row")),
                 }
             };
-            let (prev_cell, _) = self.exec_docs_wing_update_core(pu, idx, false, true)?;
+            let (prev_cell, wing_slot, _) =
+                self.exec_docs_wing_update_core(pu, idx, false, true)?;
             if let Undo::Rows(events) | Undo::Mixed { events } = undo {
-                events.push(RowUndo::DocsWing(idx, prev_cell));
+                events.push(RowUndo::DocsWing(idx, wing_slot, prev_cell));
             }
             self.store.r#gen += 1;
             return Ok((

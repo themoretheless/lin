@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
 
@@ -19,7 +19,7 @@ use super::{CacheConfig, cache_err, unix_ms};
 #[derive(Clone)]
 pub struct CacheNode {
     pub(crate) cfg: Arc<CacheConfig>,
-    pub(crate) state: Arc<Mutex<EngineState>>,
+    pub(crate) state: Arc<RwLock<EngineState>>,
     pub(crate) stop: Arc<AtomicBool>,
     stop_signal: Arc<(Mutex<bool>, Condvar)>,
 }
@@ -46,7 +46,7 @@ impl CacheNode {
         let state = EngineState::new(db, &cfg)?;
         Ok(Self {
             cfg: Arc::new(cfg),
-            state: Arc::new(Mutex::new(state)),
+            state: Arc::new(RwLock::new(state)),
             stop: Arc::new(AtomicBool::new(false)),
             stop_signal: Arc::new((Mutex::new(false), Condvar::new())),
         })
@@ -69,7 +69,7 @@ impl CacheNode {
     pub fn meet(&self, peer_id: impl Into<String>, peer_addr: impl Into<String>) {
         let peer_id = peer_id.into();
         let peer_addr = peer_addr.into();
-        if let Ok(mut st) = self.state.lock() {
+        if let Ok(mut st) = self.state.write() {
             st.ring.add_node(&peer_id, &peer_addr);
             let term = st.raft.current_term;
             st.members
@@ -109,7 +109,7 @@ impl CacheNode {
             && let Some(key) = Self::extract_routing_key(&req)
         {
             let target_peer = {
-                let st = self.state.lock().unwrap();
+                let st = self.state.read().unwrap();
                 st.ring.primary_for_key(key).and_then(|(owner_id, addr)| {
                     if owner_id != self.cfg.node_id
                         && st.members.get(&owner_id).is_some_and(|m| m.alive)
@@ -137,7 +137,7 @@ impl CacheNode {
                 CacheResponse::Pong(msg.unwrap_or_else(|| self.cfg.node_id.clone()))
             }
             CacheRequest::Get { key } => {
-                let mut st = self.state.lock().unwrap();
+                let mut st = self.state.write().unwrap();
                 if st.touch_or_remove_expired(&key)
                     && let Some(entry) = st.entries.get(&key)
                 {
@@ -166,7 +166,7 @@ impl CacheNode {
             CacheRequest::Del { keys } => {
                 let mut removed_count = 0i64;
                 {
-                    let mut st = self.state.lock().unwrap();
+                    let mut st = self.state.write().unwrap();
                     for k in &keys {
                         if st.touch_or_remove_expired(k) {
                             removed_count += 1;
@@ -177,13 +177,13 @@ impl CacheNode {
                 CacheResponse::Int(removed_count)
             }
             CacheRequest::Exists { key } => {
-                let mut st = self.state.lock().unwrap();
+                let mut st = self.state.write().unwrap();
                 let exists = st.touch_or_remove_expired(&key);
                 CacheResponse::Int(i64::from(exists))
             }
             CacheRequest::IncrBy { key, delta } => {
                 let (new_val, expires_at_ms) = {
-                    let mut st = self.state.lock().unwrap();
+                    let mut st = self.state.write().unwrap();
                     let _ = st.touch_or_remove_expired(&key);
                     match st.entries.get(&key) {
                         Some(entry) => {
@@ -222,7 +222,7 @@ impl CacheNode {
             }
             CacheRequest::Expire { key, ttl_ms } => {
                 let updated = {
-                    let mut st = self.state.lock().unwrap();
+                    let mut st = self.state.write().unwrap();
                     if !st.touch_or_remove_expired(&key) {
                         None
                     } else {
@@ -243,7 +243,7 @@ impl CacheNode {
             }
             CacheRequest::Persist { key } => {
                 let updated = {
-                    let mut st = self.state.lock().unwrap();
+                    let mut st = self.state.write().unwrap();
                     if !st.touch_or_remove_expired(&key) {
                         None
                     } else {
@@ -265,7 +265,7 @@ impl CacheNode {
                 }
             }
             CacheRequest::Ttl { key } => {
-                let mut st = self.state.lock().unwrap();
+                let mut st = self.state.write().unwrap();
                 if !st.touch_or_remove_expired(&key) {
                     return CacheResponse::Int(-2);
                 }
@@ -279,7 +279,7 @@ impl CacheNode {
                 }
             }
             CacheRequest::Keys { prefix } => {
-                let mut st = self.state.lock().unwrap();
+                let mut st = self.state.write().unwrap();
                 st.evict_expired_and_lru(self.cfg.max_entries, self.cfg.max_bytes);
                 let pat = prefix.trim_end_matches('*');
                 let mut matching: Vec<String> = st
@@ -304,7 +304,7 @@ impl CacheNode {
             // --- Hashes ---
             CacheRequest::HSet { key, field, value } => {
                 let (map, is_new, exp) = {
-                    let mut st = self.state.lock().unwrap();
+                    let mut st = self.state.write().unwrap();
                     let _ = st.touch_or_remove_expired(&key);
                     match st.entries.get(&key) {
                         Some(entry) => match &entry.value {
@@ -332,7 +332,7 @@ impl CacheNode {
                 CacheResponse::Int(i64::from(is_new))
             }
             CacheRequest::HGet { key, field } => {
-                let mut st = self.state.lock().unwrap();
+                let mut st = self.state.write().unwrap();
                 if !st.touch_or_remove_expired(&key) {
                     st.misses += 1;
                     return CacheResponse::Nil;
@@ -354,7 +354,7 @@ impl CacheNode {
             }
             CacheRequest::HDel { key, fields } => {
                 let res = {
-                    let mut st = self.state.lock().unwrap();
+                    let mut st = self.state.write().unwrap();
                     if !st.touch_or_remove_expired(&key) {
                         return CacheResponse::Int(0);
                     }
@@ -392,7 +392,7 @@ impl CacheNode {
                 }
             }
             CacheRequest::HGetAll { key } => {
-                let mut st = self.state.lock().unwrap();
+                let mut st = self.state.write().unwrap();
                 if !st.touch_or_remove_expired(&key) {
                     return CacheResponse::Map(BTreeMap::new());
                 }
@@ -413,7 +413,7 @@ impl CacheNode {
             CacheRequest::LPop { key } => self.exec_list_pop(key, true),
             CacheRequest::RPop { key } => self.exec_list_pop(key, false),
             CacheRequest::LRange { key, start, stop } => {
-                let mut st = self.state.lock().unwrap();
+                let mut st = self.state.write().unwrap();
                 if !st.touch_or_remove_expired(&key) {
                     return CacheResponse::Array(Vec::new());
                 }
@@ -453,7 +453,7 @@ impl CacheNode {
             // --- Sets ---
             CacheRequest::SAdd { key, members } => {
                 let (set, added, exp) = {
-                    let mut st = self.state.lock().unwrap();
+                    let mut st = self.state.write().unwrap();
                     let _ = st.touch_or_remove_expired(&key);
                     match st.entries.get(&key) {
                         Some(entry) => match &entry.value {
@@ -492,7 +492,7 @@ impl CacheNode {
             }
             CacheRequest::SRem { key, members } => {
                 let res = {
-                    let mut st = self.state.lock().unwrap();
+                    let mut st = self.state.write().unwrap();
                     if !st.touch_or_remove_expired(&key) {
                         return CacheResponse::Int(0);
                     }
@@ -530,7 +530,7 @@ impl CacheNode {
                 }
             }
             CacheRequest::SMembers { key } => {
-                let mut st = self.state.lock().unwrap();
+                let mut st = self.state.write().unwrap();
                 if !st.touch_or_remove_expired(&key) {
                     return CacheResponse::Array(Vec::new());
                 }
@@ -548,7 +548,7 @@ impl CacheNode {
                 }
             }
             CacheRequest::SIsMember { key, member } => {
-                let mut st = self.state.lock().unwrap();
+                let mut st = self.state.write().unwrap();
                 if !st.touch_or_remove_expired(&key) {
                     return CacheResponse::Int(0);
                 }
@@ -562,7 +562,7 @@ impl CacheNode {
             // --- Pub/Sub ---
             CacheRequest::Publish { channel, message } => {
                 let (local_subs, event, peers, members_snap) = {
-                    let mut st = self.state.lock().unwrap();
+                    let mut st = self.state.write().unwrap();
                     let eid = (crc32fast::hash(self.cfg.node_id.as_bytes()) as u64) << 32
                         | st.pubsub.next_event_id;
                     st.pubsub.next_event_id += 1;
@@ -622,7 +622,7 @@ impl CacheNode {
                         || trimmed.starts_with("index ")
                 };
                 let res = {
-                    let mut st = self.state.lock().unwrap();
+                    let mut st = self.state.write().unwrap();
                     let out = st.db.run(&query).map(|h| h.compact());
                     if out.is_ok() && is_write {
                         st.refresh_kv_prepared_if_needed();
@@ -642,7 +642,7 @@ impl CacheNode {
 
             // --- Cluster / Ring / Raft Introspection ---
             CacheRequest::ClusterInfo => {
-                let st = self.state.lock().unwrap();
+                let st = self.state.read().unwrap();
                 let db_stats = st.db.stats();
                 let info = format!(
                     "node_id:{}\n\
@@ -687,7 +687,7 @@ impl CacheNode {
                 CacheResponse::Text(info)
             }
             CacheRequest::ClusterNodes => {
-                let st = self.state.lock().unwrap();
+                let st = self.state.read().unwrap();
                 let mut lines = Vec::new();
                 for m in st.members.values() {
                     let self_tag = if m.node_id == self.cfg.node_id {
@@ -716,7 +716,7 @@ impl CacheNode {
                 CacheResponse::Ok
             }
             CacheRequest::ClusterKeySlot { key } => {
-                let st = self.state.lock().unwrap();
+                let st = self.state.read().unwrap();
                 let hash = ConsistentHashRing::hash_key(&key);
                 let replicas = st.ring.replicas_for_key(&key);
                 let owners: Vec<String> = replicas
@@ -729,7 +729,7 @@ impl CacheNode {
                 ))
             }
             CacheRequest::RaftStatus => {
-                let st = self.state.lock().unwrap();
+                let st = self.state.read().unwrap();
                 CacheResponse::Text(format!(
                     "role={} term={} leader={} voted_for={} log_len={} commit_index={} last_applied={}",
                     st.raft.role.as_str(),
@@ -743,7 +743,7 @@ impl CacheNode {
             }
             CacheRequest::RaftTriggerElection => {
                 let won = self.run_leader_election();
-                let st = self.state.lock().unwrap();
+                let st = self.state.read().unwrap();
                 CacheResponse::Text(format!(
                     "election_won={} role={} term={} leader={}",
                     won,
@@ -816,7 +816,7 @@ impl CacheNode {
 
     fn exec_list_push(&self, key: String, values: Vec<Vec<u8>>, left: bool) -> CacheResponse {
         let (list, len, exp) = {
-            let mut st = self.state.lock().unwrap();
+            let mut st = self.state.write().unwrap();
             let _ = st.touch_or_remove_expired(&key);
             match st.entries.get(&key) {
                 Some(entry) => match &entry.value {
@@ -858,7 +858,7 @@ impl CacheNode {
 
     fn exec_list_pop(&self, key: String, left: bool) -> CacheResponse {
         let res = {
-            let mut st = self.state.lock().unwrap();
+            let mut st = self.state.write().unwrap();
             if !st.touch_or_remove_expired(&key) {
                 return CacheResponse::Nil;
             }
@@ -940,7 +940,7 @@ impl CacheNode {
                 }
             }
             let peers: Vec<(String, String)> = {
-                let mut st = self.state.lock().unwrap();
+                let mut st = self.state.write().unwrap();
                 st.evict_expired_and_lru(self.cfg.max_entries, self.cfg.max_bytes);
                 let now = unix_ms();
                 let timeout = self.cfg.node_timeout_ms;
@@ -964,7 +964,7 @@ impl CacheNode {
 
             for (peer_id, peer_addr) in peers {
                 if self.gossip_once_with(&peer_addr).is_err() {
-                    let mut st = self.state.lock().unwrap();
+                    let mut st = self.state.write().unwrap();
                     let now = unix_ms();
                     if let Some(m) = st.members.get_mut(&peer_id)
                         && now.saturating_sub(m.last_seen_ms) > self.cfg.node_timeout_ms
@@ -992,7 +992,7 @@ impl CacheNode {
             if let CacheRequest::Subscribe { channels } = req {
                 let queue = Arc::new((Mutex::new(VecDeque::new()), Condvar::new()));
                 {
-                    let mut st = self.state.lock().unwrap();
+                    let mut st = self.state.write().unwrap();
                     for ch in &channels {
                         st.pubsub
                             .subscribers

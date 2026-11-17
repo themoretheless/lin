@@ -1199,13 +1199,14 @@ impl Db {
         } else if allow_preencode && n >= 512 && edges.is_empty() && self.persist.is_some() {
             let generation = self.store.r#gen.wrapping_add(1);
             let next_id = self.store.next_id;
+            use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
             let mut encode_buf = self
                 .persist
                 .as_mut()
                 .map(|p| std::mem::take(&mut p.encode_buf))
                 .unwrap_or_default();
             let built_ref: &[Row] = &built;
-            struct DirectEncJob {
+            struct DirectEncTask {
                 generation: u64,
                 next_id: u64,
                 col_ptr: usize,
@@ -1213,68 +1214,83 @@ impl Db {
                 rows_ptr: usize,
                 rows_len: usize,
                 uniform_keys: bool,
-                encode_buf: Vec<u8>,
+                state: AtomicU8,
+                done: AtomicBool,
+                panicked: AtomicBool,
+                caller: std::thread::Thread,
+                buf_slot: std::sync::Mutex<Option<Vec<u8>>>,
+                res_slot: std::sync::Mutex<Option<(Option<([u8; 4], Vec<String>)>, Vec<u8>)>>,
             }
-            struct DirectEncPool {
-                tx: std::sync::mpsc::SyncSender<DirectEncJob>,
-                done_rx: std::sync::mpsc::Receiver<(Option<([u8; 4], Vec<String>)>, Vec<u8>)>,
-            }
-            static DIRECT_ENC_POOL: std::sync::OnceLock<std::sync::Mutex<Option<DirectEncPool>>> =
-                std::sync::OnceLock::new();
-            let pool_mutex = DIRECT_ENC_POOL.get_or_init(|| {
-                let (tx, rx) = std::sync::mpsc::sync_channel::<DirectEncJob>(1);
-                let (done_tx, done_rx) =
-                    std::sync::mpsc::sync_channel::<(Option<([u8; 4], Vec<String>)>, Vec<u8>)>(1);
+            static DIRECT_ENC_TX: std::sync::OnceLock<
+                Option<std::sync::mpsc::SyncSender<std::sync::Arc<DirectEncTask>>>,
+            > = std::sync::OnceLock::new();
+            let tx_opt = DIRECT_ENC_TX.get_or_init(|| {
+                let (tx, rx) =
+                    std::sync::mpsc::sync_channel::<std::sync::Arc<DirectEncTask>>(8);
                 let spawned = std::thread::Builder::new()
                     .name("lin-direct-enc".into())
                     .spawn(move || {
-                        while let Ok(mut job) = rx.recv() {
-                            // SAFETY: sender drains `done_rx` (via `DirectEncDrain`) before
-                            // releasing `collection` or `built_ref`.
+                        while let Ok(task) = rx.recv() {
+                            if task
+                                .state
+                                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                                .is_err()
+                            {
+                                continue;
+                            }
+                            struct WorkerDone<'a>(&'a DirectEncTask, bool);
+                            impl Drop for WorkerDone<'_> {
+                                fn drop(&mut self) {
+                                    if self.1 {
+                                        self.0.panicked.store(true, Ordering::Release);
+                                    }
+                                    self.0.done.store(true, Ordering::Release);
+                                    self.0.caller.unpark();
+                                }
+                            }
+                            let mut wd = WorkerDone(&task, true);
+                            // SAFETY: `DirectEncGuard` keeps `collection` and `built_ref` live
+                            // until `task.done` is stored `true`.
                             let col = unsafe {
                                 std::str::from_utf8_unchecked(std::slice::from_raw_parts(
-                                    job.col_ptr as *const u8,
-                                    job.col_len,
+                                    task.col_ptr as *const u8,
+                                    task.col_len,
                                 ))
                             };
                             let rows = unsafe {
                                 std::slice::from_raw_parts(
-                                    job.rows_ptr as *const Row,
-                                    job.rows_len,
+                                    task.rows_ptr as *const Row,
+                                    task.rows_len,
                                 )
                             };
+                            let mut job_buf = task
+                                .buf_slot
+                                .lock()
+                                .ok()
+                                .and_then(|mut g| g.take())
+                                .unwrap_or_default();
                             let res = crate::persist::encode_insert_rows_direct_ext(
-                                job.generation,
-                                job.next_id,
+                                task.generation,
+                                task.next_id,
                                 col,
                                 rows,
-                                job.uniform_keys,
-                                &mut job.encode_buf,
+                                task.uniform_keys,
+                                &mut job_buf,
                             );
-                            let _ = done_tx.send((res, job.encode_buf));
+                            if let Ok(mut g) = task.res_slot.lock() {
+                                *g = Some((res, job_buf));
+                            }
+                            wd.1 = false;
                         }
                     });
                 if spawned.is_ok() {
-                    std::sync::Mutex::new(Some(DirectEncPool { tx, done_rx }))
+                    Some(tx)
                 } else {
-                    std::sync::Mutex::new(None)
+                    None
                 }
             });
-            let (maint_res, direct_res) = if let Ok(guard) = pool_mutex.try_lock()
-                && let Some(pool) = guard.as_ref()
-            {
-                struct DirectEncDrain<'a>(
-                    &'a std::sync::mpsc::Receiver<(Option<([u8; 4], Vec<String>)>, Vec<u8>)>,
-                    bool,
-                );
-                impl Drop for DirectEncDrain<'_> {
-                    fn drop(&mut self) {
-                        if self.1 {
-                            let _ = self.0.recv();
-                        }
-                    }
-                }
-                let job = DirectEncJob {
+            let (maint_res, direct_res) = if let Some(tx) = tx_opt.as_ref() {
+                let task = std::sync::Arc::new(DirectEncTask {
                     generation,
                     next_id,
                     col_ptr: collection.as_ptr() as usize,
@@ -1282,29 +1298,72 @@ impl Db {
                     rows_ptr: built_ref.as_ptr() as usize,
                     rows_len: built_ref.len(),
                     uniform_keys,
-                    encode_buf,
-                };
-                match pool.tx.send(job) {
-                    Ok(()) => {
-                        let mut drain = DirectEncDrain(&pool.done_rx, true);
-                        let maint = self.maintain_insert_slab(collection, start, built_ref);
-                        drain.1 = false;
-                        let direct = pool.done_rx.recv().unwrap_or((None, Vec::new()));
-                        (maint, direct)
-                    }
-                    Err(std::sync::mpsc::SendError(mut job)) => {
-                        let maint = self.maintain_insert_slab(collection, start, built_ref);
-                        let res = crate::persist::encode_insert_rows_direct_ext(
-                            generation,
-                            next_id,
-                            collection,
-                            built_ref,
-                            uniform_keys,
-                            &mut job.encode_buf,
-                        );
-                        (maint, (res, job.encode_buf))
+                    state: AtomicU8::new(0),
+                    done: AtomicBool::new(false),
+                    panicked: AtomicBool::new(false),
+                    caller: std::thread::current(),
+                    buf_slot: std::sync::Mutex::new(Some(encode_buf)),
+                    res_slot: std::sync::Mutex::new(None),
+                });
+                struct DirectEncGuard<'a>(&'a DirectEncTask);
+                impl Drop for DirectEncGuard<'_> {
+                    fn drop(&mut self) {
+                        if self
+                            .0
+                            .state
+                            .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
+                            .err()
+                            == Some(1)
+                        {
+                            while !self.0.done.load(Ordering::Acquire) {
+                                std::thread::park_timeout(std::time::Duration::from_micros(50));
+                            }
+                        }
                     }
                 }
+                let _guard = DirectEncGuard(&task);
+                let _ = tx.try_send(std::sync::Arc::clone(&task));
+                let maint = self.maintain_insert_slab(collection, start, built_ref);
+                let direct = if task
+                    .state
+                    .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    let mut buf = task
+                        .buf_slot
+                        .lock()
+                        .ok()
+                        .and_then(|mut g| g.take())
+                        .unwrap_or_default();
+                    let res = crate::persist::encode_insert_rows_direct_ext(
+                        generation,
+                        next_id,
+                        collection,
+                        built_ref,
+                        uniform_keys,
+                        &mut buf,
+                    );
+                    (res, buf)
+                } else {
+                    for _ in 0..64 {
+                        if task.done.load(Ordering::Acquire) {
+                            break;
+                        }
+                        std::hint::spin_loop();
+                    }
+                    while !task.done.load(Ordering::Acquire) {
+                        std::thread::park_timeout(std::time::Duration::from_micros(50));
+                    }
+                    if task.panicked.load(Ordering::Acquire) {
+                        panic!("direct encode worker panicked");
+                    }
+                    task.res_slot
+                        .lock()
+                        .ok()
+                        .and_then(|mut g| g.take())
+                        .unwrap_or((None, Vec::new()))
+                };
+                (maint, direct)
             } else {
                 let maint = self.maintain_insert_slab(collection, start, built_ref);
                 let res = crate::persist::encode_insert_rows_direct_ext(
@@ -1874,21 +1933,6 @@ fn cell_lossless_kind(cell: &Cell) -> u8 {
     }
 }
 
-struct BuildRowsJob {
-    records_ptr: usize,
-    records_len: usize,
-    out_ptr: usize,
-    now: i64,
-    needs_embed: bool,
-    hashing_dim: Option<usize>,
-    total_n: usize,
-}
-
-struct BuildRowsPool {
-    workers: Vec<std::sync::mpsc::SyncSender<BuildRowsJob>>,
-    done_rx: std::sync::mpsc::Receiver<(bool, bool, bool)>,
-}
-
 /// What [`build_insert_rows`] (or a column batch) established about the built rows.
 #[derive(Clone, Copy)]
 pub(crate) struct BuiltShape {
@@ -1916,169 +1960,186 @@ fn build_insert_rows(
         return (Vec::new(), false, !needs_embed, false);
     }
     if n >= 512 {
-        static POOL: std::sync::OnceLock<std::sync::Mutex<Option<BuildRowsPool>>> =
-            std::sync::OnceLock::new();
-        let mutex = POOL.get_or_init(|| {
+        use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+        struct BuildTask {
+            records_ptr: usize,
+            out_ptr: usize,
+            n: usize,
+            chunk_size: usize,
+            total_chunks: usize,
+            now: i64,
+            needs_embed: bool,
+            hashing_dim: Option<usize>,
+            next_chunk: AtomicUsize,
+            done_chunks: AtomicUsize,
+            neg_flags: AtomicU8,
+            panicked: AtomicBool,
+            finished: AtomicBool,
+            caller: std::thread::Thread,
+        }
+        fn run_build_chunks(task: &BuildTask, is_caller: bool) {
+            loop {
+                let c = task.next_chunk.fetch_add(1, Ordering::AcqRel);
+                if c >= task.total_chunks {
+                    break;
+                }
+                struct ChunkDone<'a>(&'a BuildTask, bool, bool);
+                impl Drop for ChunkDone<'_> {
+                    fn drop(&mut self) {
+                        if self.2 {
+                            self.0.panicked.store(true, Ordering::Release);
+                        }
+                        if self.0.done_chunks.fetch_add(1, Ordering::AcqRel) + 1
+                            == self.0.total_chunks
+                            && !self.1
+                        {
+                            self.0.finished.store(true, Ordering::Release);
+                            self.0.caller.unpark();
+                        }
+                    }
+                }
+                let mut guard = ChunkDone(task, is_caller, true);
+                let start = c * task.chunk_size;
+                let end = (start + task.chunk_size).min(task.n);
+                let recs = unsafe {
+                    &std::slice::from_raw_parts(task.records_ptr as *const Record, task.n)
+                        [start..end]
+                };
+                let out = unsafe {
+                    &mut std::slice::from_raw_parts_mut(
+                        task.out_ptr as *mut std::mem::MaybeUninit<Row>,
+                        task.n,
+                    )[start..end]
+                };
+                let (u, e, l) = build_batch_shape_rows_into(
+                    out,
+                    recs,
+                    task.now,
+                    task.needs_embed,
+                    task.hashing_dim,
+                    task.n,
+                );
+                let mask = u8::from(!u) | (u8::from(!e) << 1) | (u8::from(!l) << 2);
+                if mask != 0 {
+                    task.neg_flags.fetch_or(mask, Ordering::Relaxed);
+                }
+                guard.2 = false;
+            }
+        }
+        static BUILD_WORKERS: std::sync::OnceLock<
+            Vec<std::sync::mpsc::SyncSender<std::sync::Arc<BuildTask>>>,
+        > = std::sync::OnceLock::new();
+        let workers = BUILD_WORKERS.get_or_init(|| {
             let threads = std::thread::available_parallelism()
                 .map(|p| p.get())
                 .unwrap_or(1)
                 .min(8);
             if threads <= 1 {
-                return std::sync::Mutex::new(None);
+                return Vec::new();
             }
             let num_workers = threads - 1;
-            let (done_tx, done_rx) =
-                std::sync::mpsc::sync_channel::<(bool, bool, bool)>(num_workers);
-            let mut workers = Vec::with_capacity(num_workers);
+            let mut txs = Vec::with_capacity(num_workers);
             for idx in 0..num_workers {
-                let (tx, rx) = std::sync::mpsc::sync_channel::<BuildRowsJob>(1);
-                let done = done_tx.clone();
+                let (tx, rx) =
+                    std::sync::mpsc::sync_channel::<std::sync::Arc<BuildTask>>(16);
                 if std::thread::Builder::new()
                     .name(format!("lin-build-{idx}"))
                     .spawn(move || {
-                        while let Ok(job) = rx.recv() {
-                            let recs = unsafe {
-                                std::slice::from_raw_parts(
-                                    job.records_ptr as *const Record,
-                                    job.records_len,
-                                )
-                            };
-                            let out = unsafe {
-                                std::slice::from_raw_parts_mut(
-                                    job.out_ptr as *mut std::mem::MaybeUninit<Row>,
-                                    job.records_len,
-                                )
-                            };
-                            let res = build_batch_shape_rows_into(
-                                out,
-                                recs,
-                                job.now,
-                                job.needs_embed,
-                                job.hashing_dim,
-                                job.total_n,
-                            );
-                            let _ = done.send(res);
+                        while let Ok(task) = rx.recv() {
+                            run_build_chunks(&task, false);
                         }
                     })
                     .is_ok()
                 {
-                    workers.push(tx);
+                    txs.push(tx);
                 }
             }
-            if workers.is_empty() {
-                std::sync::Mutex::new(None)
-            } else {
-                std::sync::Mutex::new(Some(BuildRowsPool { workers, done_rx }))
-            }
+            txs
         });
-
-        if let Ok(guard) = mutex.try_lock()
-            && let Some(pool) = guard.as_ref()
-        {
-            let total_ways = (pool.workers.len() + 1).min(n.div_ceil(128)).max(1);
-            if total_ways > 1 {
-                let mut rows: Vec<Row> = Vec::with_capacity(n);
-                let spare = &mut rows.spare_capacity_mut()[..n];
-                let chunk_size = n.div_ceil(total_ways);
-                let mut rec_chunks = records.chunks(chunk_size);
-                let mut out_chunks = spare.chunks_mut(chunk_size);
-                let first_recs = rec_chunks.next().unwrap();
-                let first_out = out_chunks.next().unwrap();
-                struct DispatchedDrainGuard<'a> {
-                    done_rx: &'a std::sync::mpsc::Receiver<(bool, bool, bool)>,
-                    pending: usize,
-                }
-                impl Drop for DispatchedDrainGuard<'_> {
-                    fn drop(&mut self) {
-                        for _ in 0..self.pending {
-                            let _ = self.done_rx.recv();
+        if !workers.is_empty() {
+            let chunk_size = 64usize;
+            let total_chunks = n.div_ceil(chunk_size);
+            let mut rows: Vec<Row> = Vec::with_capacity(n);
+            let spare = &mut rows.spare_capacity_mut()[..n];
+            let task = std::sync::Arc::new(BuildTask {
+                records_ptr: records.as_ptr() as usize,
+                out_ptr: spare.as_mut_ptr() as usize,
+                n,
+                chunk_size,
+                total_chunks,
+                now,
+                needs_embed,
+                hashing_dim,
+                next_chunk: AtomicUsize::new(0),
+                done_chunks: AtomicUsize::new(0),
+                neg_flags: AtomicU8::new(0),
+                panicked: AtomicBool::new(false),
+                finished: AtomicBool::new(false),
+                caller: std::thread::current(),
+            });
+            struct WaitBuildGuard<'a>(&'a BuildTask);
+            impl Drop for WaitBuildGuard<'_> {
+                fn drop(&mut self) {
+                    if std::thread::panicking() {
+                        self.0
+                            .next_chunk
+                            .store(self.0.total_chunks, Ordering::Release);
+                    }
+                    while self.0.done_chunks.load(Ordering::Acquire) < self.0.total_chunks {
+                        if !self.0.finished.load(Ordering::Acquire) {
+                            std::thread::park_timeout(std::time::Duration::from_micros(50));
                         }
                     }
                 }
-                let mut drain_guard = DispatchedDrainGuard {
-                    done_rx: &pool.done_rx,
-                    pending: 0,
-                };
-                let mut boundaries: smallvec::SmallVec<[usize; 8]> = smallvec::SmallVec::new();
-                let mut fallback_start = first_recs.len();
-                for ((worker, r_chunk), o_chunk) in
-                    pool.workers.iter().zip(rec_chunks).zip(out_chunks)
-                {
-                    let job = BuildRowsJob {
-                        records_ptr: r_chunk.as_ptr() as usize,
-                        records_len: r_chunk.len(),
-                        out_ptr: o_chunk.as_mut_ptr() as usize,
-                        now,
-                        needs_embed,
-                        hashing_dim,
-                        total_n: n,
-                    };
-                    if worker.send(job).is_ok() {
-                        drain_guard.pending += 1;
-                        boundaries.push(fallback_start);
-                        fallback_start += r_chunk.len();
-                    } else {
-                        break;
-                    }
-                }
-                let (mut all_uniform, mut all_embedded, mut lossless_cols) =
-                    build_batch_shape_rows_into(
-                        first_out,
-                        first_recs,
-                        now,
-                        needs_embed,
-                        hashing_dim,
-                        n,
-                    );
-                if fallback_start < n {
-                    boundaries.push(fallback_start);
-                    let (u, e, l) = build_batch_shape_rows_into(
-                        &mut spare[fallback_start..n],
-                        &records[fallback_start..n],
-                        now,
-                        needs_embed,
-                        hashing_dim,
-                        n,
-                    );
-                    all_uniform &= u;
-                    all_embedded &= e;
-                    lossless_cols &= l;
-                }
-                while drain_guard.pending > 0 {
-                    drain_guard.pending -= 1;
-                    if let Ok((u, e, l)) = drain_guard.done_rx.recv() {
-                        all_uniform &= u;
-                        all_embedded &= e;
-                        lossless_cols &= l;
-                    }
-                }
-                drop(drain_guard);
-                unsafe {
-                    rows.set_len(n);
-                }
-                if (all_uniform || lossless_cols) && let Some(fs) = rows[0].shape_arc() {
-                    let first_cells = rows[0].cells_slice();
-                    for &bi in &boundaries {
-                        let same_shape = rows[bi]
-                            .shape_arc()
-                            .is_some_and(|s| Arc::ptr_eq(s, fs));
-                        all_uniform &= same_shape;
-                        if lossless_cols {
-                            lossless_cols = same_shape
-                                && rows[bi].cells_slice().len() == first_cells.len()
-                                && rows[bi]
-                                    .cells_slice()
-                                    .iter()
-                                    .zip(first_cells)
-                                    .all(|(a, b)| cell_lossless_kind(a) == cell_lossless_kind(b));
-                        }
-                    }
-                } else {
-                    all_uniform = false;
-                    lossless_cols = false;
-                }
-                return (rows, all_uniform, all_embedded, lossless_cols);
             }
+            let _wait_guard = WaitBuildGuard(&task);
+            let wake = (total_chunks - 1).min(workers.len());
+            for worker in workers.iter().take(wake) {
+                let _ = worker.try_send(std::sync::Arc::clone(&task));
+            }
+            run_build_chunks(&task, true);
+            for _ in 0..64 {
+                if task.done_chunks.load(Ordering::Acquire) >= total_chunks {
+                    break;
+                }
+                std::hint::spin_loop();
+            }
+            while task.done_chunks.load(Ordering::Acquire) < total_chunks {
+                if !task.finished.load(Ordering::Acquire) {
+                    std::thread::park_timeout(std::time::Duration::from_micros(50));
+                }
+            }
+            if task.panicked.load(Ordering::Acquire) {
+                panic!("build rows worker panicked");
+            }
+            unsafe {
+                rows.set_len(n);
+            }
+            let neg = task.neg_flags.load(Ordering::Acquire);
+            let mut all_uniform = (neg & 1) == 0;
+            let all_embedded = (neg & 2) == 0;
+            let mut lossless_cols = (neg & 4) == 0;
+            if (all_uniform || lossless_cols) && let Some(fs) = rows[0].shape_arc() {
+                let first_cells = rows[0].cells_slice();
+                for c in 1..total_chunks {
+                    let bi = c * chunk_size;
+                    let same_shape = rows[bi].shape_arc().is_some_and(|s| Arc::ptr_eq(s, fs));
+                    all_uniform &= same_shape;
+                    if lossless_cols {
+                        lossless_cols = same_shape
+                            && rows[bi].cells_slice().len() == first_cells.len()
+                            && rows[bi]
+                                .cells_slice()
+                                .iter()
+                                .zip(first_cells)
+                                .all(|(a, b)| cell_lossless_kind(a) == cell_lossless_kind(b));
+                    }
+                }
+            } else {
+                all_uniform = false;
+                lossless_cols = false;
+            }
+            return (rows, all_uniform, all_embedded, lossless_cols);
         }
     }
 

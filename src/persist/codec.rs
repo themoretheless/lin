@@ -1050,34 +1050,78 @@ const DICTIONARY_MAX_VALUES: usize = 16;
 /// distinct values) follow raw `(u32 index, u32 bits)` entries. Values are compared and
 /// stored as bits, so `-0.0`, infinities and NaN payloads survive; `+0.0` is the absent
 /// value.
-pub(super) fn append_dictionary_rows<'a>(
-    rows: impl Iterator<Item = Option<&'a [f32]>>,
-    out: &mut Vec<u8>,
-    give_up_at: usize,
-) -> Result<bool, Error> {
-    for row in rows {
-        if out.len() >= give_up_at {
-            return Ok(false);
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn collect_nz_and_dict_neon(
+    emb: &[f32],
+    nz: &mut smallvec::SmallVec<[(u32, u32); 32]>,
+    dictionary: &mut [u32; DICTIONARY_MAX_VALUES],
+) -> (usize, bool) {
+    let mut d = 0usize;
+    let mut raw = false;
+    for (block, values) in emb.chunks(8).enumerate() {
+        let base_idx = (block * 8) as u32;
+        if values.len() == 8 {
+            // SAFETY: target_feature(enable = "neon") covers presence_mask8 for 8-float slice.
+            let mut mask = unsafe { presence_mask8(values) };
+            while mask != 0 {
+                let offset = mask.trailing_zeros() as usize;
+                mask &= mask - 1;
+                let bits = values[offset].to_bits();
+                nz.push((base_idx + offset as u32, bits));
+                if !raw && !dictionary[..d].contains(&bits) {
+                    if d == DICTIONARY_MAX_VALUES {
+                        raw = true;
+                    } else {
+                        dictionary[d] = bits;
+                        d += 1;
+                    }
+                }
+            }
+        } else {
+            for (offset, value) in values.iter().enumerate() {
+                let bits = value.to_bits();
+                if bits == 0 {
+                    continue;
+                }
+                nz.push((base_idx + offset as u32, bits));
+                if !raw && !dictionary[..d].contains(&bits) {
+                    if d == DICTIONARY_MAX_VALUES {
+                        raw = true;
+                    } else {
+                        dictionary[d] = bits;
+                        d += 1;
+                    }
+                }
+            }
         }
-        let Some(emb) = row else {
-            out.extend_from_slice(&0u32.to_le_bytes());
+    }
+    (d, raw)
+}
+
+#[inline]
+fn collect_nz_and_dict_scalar(
+    emb: &[f32],
+    nz: &mut smallvec::SmallVec<[(u32, u32); 32]>,
+    dictionary: &mut [u32; DICTIONARY_MAX_VALUES],
+) -> (usize, bool) {
+    let mut d = 0usize;
+    let mut raw = false;
+    for (block, values) in emb.chunks(8).enumerate() {
+        if values
+            .iter()
+            .fold(0u32, |bits, value| bits | value.to_bits())
+            == 0
+        {
             continue;
-        };
-        let code = u32::try_from(emb.len())
-            .ok()
-            .and_then(|n| n.checked_add(1))
-            .ok_or_else(|| io_err("dictionary vector dimension overflow"))?;
-        // First pass: the row's distinct nonzero bit patterns, in first-seen order.
-        let mut dictionary = [0u32; DICTIONARY_MAX_VALUES];
-        let mut d = 0usize;
-        let mut count = 0u32;
-        let mut raw = false;
-        for value in emb {
+        }
+        let base_idx = (block * 8) as u32;
+        for (offset, value) in values.iter().enumerate() {
             let bits = value.to_bits();
             if bits == 0 {
                 continue;
             }
-            count += 1;
+            nz.push((base_idx + offset as u32, bits));
             if !raw && !dictionary[..d].contains(&bits) {
                 if d == DICTIONARY_MAX_VALUES {
                     raw = true;
@@ -1087,17 +1131,54 @@ pub(super) fn append_dictionary_rows<'a>(
                 }
             }
         }
+    }
+    (d, raw)
+}
+
+pub(super) fn append_dictionary_rows_counted<'a>(
+    rows: impl Iterator<Item = Option<&'a [f32]>>,
+    out: &mut Vec<u8>,
+    give_up_at: usize,
+) -> Result<(bool, usize), Error> {
+    #[cfg(target_arch = "aarch64")]
+    let use_neon = std::arch::is_aarch64_feature_detected!("neon");
+    let mut nz: smallvec::SmallVec<[(u32, u32); 32]> = smallvec::SmallVec::new();
+    let mut dictionary = [0u32; DICTIONARY_MAX_VALUES];
+    let mut exact_sparse_bytes = 0usize;
+    for row in rows {
+        if out.len() >= give_up_at {
+            return Ok((false, exact_sparse_bytes));
+        }
+        let Some(emb) = row else {
+            out.extend_from_slice(&0u32.to_le_bytes());
+            exact_sparse_bytes = exact_sparse_bytes.saturating_add(4);
+            continue;
+        };
+        let code = u32::try_from(emb.len())
+            .ok()
+            .and_then(|n| n.checked_add(1))
+            .ok_or_else(|| io_err("dictionary vector dimension overflow"))?;
+        nz.clear();
+        #[cfg(target_arch = "aarch64")]
+        let (d, raw) = if use_neon {
+            // SAFETY: guarded by runtime NEON detection above.
+            unsafe { collect_nz_and_dict_neon(emb, &mut nz, &mut dictionary) }
+        } else {
+            collect_nz_and_dict_scalar(emb, &mut nz, &mut dictionary)
+        };
+        #[cfg(not(target_arch = "aarch64"))]
+        let (d, raw) = collect_nz_and_dict_scalar(emb, &mut nz, &mut dictionary);
+        let count = nz.len() as u32;
+        exact_sparse_bytes = exact_sparse_bytes
+            .saturating_add(8usize.saturating_add(nz.len().saturating_mul(8)));
         out.extend_from_slice(&code.to_le_bytes());
         out.extend_from_slice(&count.to_le_bytes());
         if raw {
             out.push(0);
-            out.reserve(count as usize * 8);
-            for (index, value) in emb.iter().enumerate() {
-                let bits = value.to_bits();
-                if bits != 0 {
-                    out.extend_from_slice(&(index as u32).to_le_bytes());
-                    out.extend_from_slice(&bits.to_le_bytes());
-                }
+            out.reserve(nz.len() * 8);
+            for &(index, bits) in &nz {
+                out.extend_from_slice(&index.to_le_bytes());
+                out.extend_from_slice(&bits.to_le_bytes());
             }
             continue;
         }
@@ -1106,23 +1187,27 @@ pub(super) fn append_dictionary_rows<'a>(
             out.extend_from_slice(&bits.to_le_bytes());
         }
         let narrow = d > 0 && emb.len() <= 65536;
-        out.reserve(count as usize * if narrow { 3 } else { 5 });
-        for (index, value) in emb.iter().enumerate() {
-            let bits = value.to_bits();
-            if bits == 0 {
-                continue;
-            }
+        out.reserve(nz.len() * if narrow { 3 } else { 5 });
+        for &(index, bits) in &nz {
             if narrow {
                 out.extend_from_slice(&(index as u16).to_le_bytes());
             } else {
-                out.extend_from_slice(&(index as u32).to_le_bytes());
+                out.extend_from_slice(&index.to_le_bytes());
             }
             // Present by construction: every nonzero pattern of the row is in the table.
             let ordinal = dictionary[..d].iter().position(|b| *b == bits).unwrap_or(0);
             out.push(ordinal as u8);
         }
     }
-    Ok(out.len() < give_up_at)
+    Ok((out.len() < give_up_at, exact_sparse_bytes))
+}
+
+pub(super) fn append_dictionary_rows<'a>(
+    rows: impl Iterator<Item = Option<&'a [f32]>>,
+    out: &mut Vec<u8>,
+    give_up_at: usize,
+) -> Result<bool, Error> {
+    append_dictionary_rows_counted(rows, out, give_up_at).map(|(ok, _)| ok)
 }
 
 /// A sparse vector column was just written at `mark` (its tag byte, then the rows). When
@@ -1151,6 +1236,24 @@ fn rewrite_sparse_as_dictionary<'a>(
 }
 
 #[inline]
+pub(super) fn append_dictionary_rows_range(
+    rows: &[Row],
+    fi: usize,
+    start_row: usize,
+    end_row: usize,
+    buf: &mut Vec<u8>,
+) -> Result<usize, Error> {
+    let iter = rows[start_row..end_row].iter().map(|r| {
+        match r.cells_slice().get(fi) {
+            Some(Cell::Vec(emb)) => Some(emb.as_ref()),
+            _ => None,
+        }
+    });
+    let (_, exact_sparse_bytes) = append_dictionary_rows_counted(iter, buf, usize::MAX)?;
+    Ok(exact_sparse_bytes)
+}
+
+#[inline]
 pub(super) fn append_sparse_rows_range(
     rows: &[Row],
     fi: usize,
@@ -1176,193 +1279,249 @@ pub(super) fn append_sparse_rows_field_serial(
     append_sparse_rows_range(rows, fi, 0, num_rows, buf)
 }
 
-struct SparseEncodeJob {
-    chunk_idx: usize,
+struct VecEncodeTask {
     rows_ptr: usize,
     rows_len: usize,
     fi: usize,
-    start_row: usize,
-    end_row: usize,
-    buf: Vec<u8>,
+    chunk_size: usize,
+    total_chunks: usize,
+    dict_mode: bool,
+    give_up_bytes: usize,
+    next_chunk: std::sync::atomic::AtomicUsize,
+    done_chunks: std::sync::atomic::AtomicUsize,
+    accum_bytes: std::sync::atomic::AtomicUsize,
+    aborted: std::sync::atomic::AtomicBool,
+    panicked: std::sync::atomic::AtomicBool,
+    finished: std::sync::atomic::AtomicBool,
+    caller: std::thread::Thread,
+    slots: Vec<std::sync::Mutex<Option<Result<(Vec<u8>, usize), Error>>>>,
 }
 
-struct SparseEncodePool {
-    workers: Vec<std::sync::mpsc::SyncSender<SparseEncodeJob>>,
-    done_rx: std::sync::mpsc::Receiver<(usize, Result<(), Error>, Vec<u8>)>,
-    reusable_bufs: Vec<Vec<u8>>,
+fn run_vec_encode_chunks(task: &VecEncodeTask, is_caller: bool) {
+    use std::sync::atomic::Ordering;
+    loop {
+        let c = task.next_chunk.fetch_add(1, Ordering::AcqRel);
+        if c >= task.total_chunks {
+            break;
+        }
+        struct ChunkDone<'a> {
+            task: &'a VecEncodeTask,
+            is_caller: bool,
+            armed: bool,
+        }
+        impl Drop for ChunkDone<'_> {
+            fn drop(&mut self) {
+                if self.armed {
+                    self.task.panicked.store(true, Ordering::Release);
+                }
+                if self.task.done_chunks.fetch_add(1, Ordering::AcqRel) + 1
+                    == self.task.total_chunks
+                    && !self.is_caller
+                {
+                    self.task.finished.store(true, Ordering::Release);
+                    self.task.caller.unpark();
+                }
+            }
+        }
+        let mut guard = ChunkDone {
+            task,
+            is_caller,
+            armed: true,
+        };
+        if !task.aborted.load(Ordering::Relaxed) {
+            let rows = unsafe {
+                std::slice::from_raw_parts(task.rows_ptr as *const Row, task.rows_len)
+            };
+            let start = c * task.chunk_size;
+            let end = (start + task.chunk_size).min(task.rows_len);
+            let mut cbuf = Vec::with_capacity((end - start) * 64);
+            let res = if task.dict_mode {
+                append_dictionary_rows_range(rows, task.fi, start, end, &mut cbuf)
+                    .map(|exact| (cbuf, exact))
+            } else {
+                append_sparse_rows_range(rows, task.fi, start, end, &mut cbuf).map(|()| {
+                    let len = cbuf.len();
+                    (cbuf, len)
+                })
+            };
+            if let Ok((ref b, _)) = res {
+                let total = task.accum_bytes.fetch_add(b.len(), Ordering::Relaxed) + b.len();
+                if total >= task.give_up_bytes {
+                    task.aborted.store(true, Ordering::Relaxed);
+                }
+            } else {
+                task.aborted.store(true, Ordering::Relaxed);
+            }
+            if let Ok(mut slot) = task.slots[c].lock() {
+                *slot = Some(res);
+            }
+        }
+        guard.armed = false;
+    }
 }
 
-pub(super) fn append_sparse_rows_field_parallel(
+fn append_vec_rows_field_parallel(
     rows: &[Row],
     fi: usize,
     num_rows: usize,
+    dict_mode: bool,
+    give_up_bytes: usize,
     buf: &mut Vec<u8>,
-) -> Result<(), Error> {
-    if num_rows < 512 {
-        return append_sparse_rows_field_serial(rows, fi, num_rows, buf);
+) -> Result<(bool, usize), Error> {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    if num_rows < 128 {
+        if dict_mode {
+            let payload_start = buf.len();
+            let iter = rows[..num_rows].iter().map(|r| {
+                match r.cells_slice().get(fi) {
+                    Some(Cell::Vec(emb)) => Some(emb.as_ref()),
+                    _ => None,
+                }
+            });
+            return append_dictionary_rows_counted(
+                iter,
+                buf,
+                payload_start.saturating_add(give_up_bytes),
+            );
+        }
+        let payload_start = buf.len();
+        append_sparse_rows_field_serial(rows, fi, num_rows, buf)?;
+        let bytes = buf.len() - payload_start;
+        return Ok((bytes < give_up_bytes, bytes));
     }
-    static POOL: std::sync::OnceLock<std::sync::Mutex<Option<SparseEncodePool>>> =
-        std::sync::OnceLock::new();
-    let mutex = POOL.get_or_init(|| {
+
+    static POOL: std::sync::OnceLock<
+        Vec<std::sync::mpsc::SyncSender<std::sync::Arc<VecEncodeTask>>>,
+    > = std::sync::OnceLock::new();
+    let workers = POOL.get_or_init(|| {
         let threads = std::thread::available_parallelism()
             .map(|p| p.get())
             .unwrap_or(1)
             .min(8);
         if threads <= 1 {
-            return std::sync::Mutex::new(None);
+            return Vec::new();
         }
         let num_workers = threads - 1;
-        let (done_tx, done_rx) =
-            std::sync::mpsc::sync_channel::<(usize, Result<(), Error>, Vec<u8>)>(num_workers);
-        let mut workers = Vec::with_capacity(num_workers);
-        let mut reusable_bufs = Vec::with_capacity(num_workers);
+        let mut txs = Vec::with_capacity(num_workers);
         for idx in 0..num_workers {
-            let (tx, rx) = std::sync::mpsc::sync_channel::<SparseEncodeJob>(1);
-            let done = done_tx.clone();
+            let (tx, rx) = std::sync::mpsc::sync_channel::<std::sync::Arc<VecEncodeTask>>(16);
             if std::thread::Builder::new()
-                .name(format!("lin-sparse-enc-{idx}"))
+                .name(format!("lin-vec-enc-{idx}"))
                 .spawn(move || {
-                    while let Ok(mut job) = rx.recv() {
-                        job.buf.clear();
-                        let slice = unsafe {
-                            std::slice::from_raw_parts(
-                                job.rows_ptr as *const Row,
-                                job.rows_len,
-                            )
-                        };
-                        let res = append_sparse_rows_range(
-                            slice,
-                            job.fi,
-                            job.start_row,
-                            job.end_row,
-                            &mut job.buf,
-                        );
-                        let _ = done.send((job.chunk_idx, res, job.buf));
+                    while let Ok(task) = rx.recv() {
+                        run_vec_encode_chunks(&task, false);
                     }
                 })
                 .is_ok()
             {
-                workers.push(tx);
-                reusable_bufs.push(Vec::new());
+                txs.push(tx);
             }
         }
-        if workers.is_empty() {
-            std::sync::Mutex::new(None)
-        } else {
-            std::sync::Mutex::new(Some(SparseEncodePool {
-                workers,
-                done_rx,
-                reusable_bufs,
-            }))
-        }
+        txs
     });
 
-    let Ok(mut guard) = mutex.try_lock() else {
-        return append_sparse_rows_field_serial(rows, fi, num_rows, buf);
-    };
-    let Some(pool) = guard.as_mut() else {
-        return append_sparse_rows_field_serial(rows, fi, num_rows, buf);
-    };
-    let total_ways = (pool.workers.len() + 1).min(num_rows.div_ceil(128)).max(1);
-    if total_ways <= 1 {
-        return append_sparse_rows_field_serial(rows, fi, num_rows, buf);
+    if workers.is_empty() {
+        if dict_mode {
+            let payload_start = buf.len();
+            let iter = rows[..num_rows].iter().map(|r| {
+                match r.cells_slice().get(fi) {
+                    Some(Cell::Vec(emb)) => Some(emb.as_ref()),
+                    _ => None,
+                }
+            });
+            return append_dictionary_rows_counted(
+                iter,
+                buf,
+                payload_start.saturating_add(give_up_bytes),
+            );
+        }
+        let payload_start = buf.len();
+        append_sparse_rows_field_serial(rows, fi, num_rows, buf)?;
+        let bytes = buf.len() - payload_start;
+        return Ok((bytes < give_up_bytes, bytes));
     }
 
-    let chunk_size = num_rows.div_ceil(total_ways);
-    let first_end = chunk_size.min(num_rows);
-
-    struct SparseDrainGuard<'a> {
-        done_rx: &'a std::sync::mpsc::Receiver<(usize, Result<(), Error>, Vec<u8>)>,
-        reusable_bufs: &'a mut Vec<Vec<u8>>,
-        pending: usize,
+    let chunk_size = 64usize;
+    let total_chunks = num_rows.div_ceil(chunk_size);
+    let mut slots = Vec::with_capacity(total_chunks);
+    for _ in 0..total_chunks {
+        slots.push(std::sync::Mutex::new(None));
     }
-    impl Drop for SparseDrainGuard<'_> {
+    let task = std::sync::Arc::new(VecEncodeTask {
+        rows_ptr: rows.as_ptr() as usize,
+        rows_len: num_rows,
+        fi,
+        chunk_size,
+        total_chunks,
+        dict_mode,
+        give_up_bytes,
+        next_chunk: AtomicUsize::new(0),
+        done_chunks: AtomicUsize::new(0),
+        accum_bytes: AtomicUsize::new(0),
+        aborted: AtomicBool::new(false),
+        panicked: AtomicBool::new(false),
+        finished: AtomicBool::new(false),
+        caller: std::thread::current(),
+        slots,
+    });
+    struct VecTaskWaitGuard<'a>(&'a VecEncodeTask);
+    impl Drop for VecTaskWaitGuard<'_> {
         fn drop(&mut self) {
-            while self.pending > 0 {
-                self.pending -= 1;
-                if let Ok((_, _, mut b)) = self.done_rx.recv() {
-                    b.clear();
-                    self.reusable_bufs.push(b);
+            if std::thread::panicking() {
+                self.0.aborted.store(true, Ordering::Relaxed);
+            }
+            while self.0.done_chunks.load(Ordering::Acquire) < self.0.total_chunks {
+                if !self.0.finished.load(Ordering::Acquire) {
+                    std::thread::park_timeout(std::time::Duration::from_micros(50));
                 }
             }
         }
     }
+    let _wait_guard = VecTaskWaitGuard(&task);
 
-    let mut slots: smallvec::SmallVec<[Option<(Result<(), Error>, Vec<u8>)>; 8]> =
-        smallvec::SmallVec::from_elem(None, total_ways - 1);
-    let mut drain_guard = SparseDrainGuard {
-        done_rx: &pool.done_rx,
-        reusable_bufs: &mut pool.reusable_bufs,
-        pending: 0,
-    };
-    let mut dispatched = 0usize;
-    let mut fallback_start = first_end;
-    for chunk_idx in 1..total_ways {
-        let start_row = chunk_idx * chunk_size;
-        if start_row >= num_rows {
+    let wake = (total_chunks - 1).min(workers.len());
+    for worker in workers.iter().take(wake) {
+        let _ = worker.try_send(std::sync::Arc::clone(&task));
+    }
+    run_vec_encode_chunks(&task, true);
+
+    for _ in 0..64 {
+        if task.done_chunks.load(Ordering::Acquire) >= total_chunks {
             break;
         }
-        let end_row = (start_row + chunk_size).min(num_rows);
-        let work_buf = drain_guard.reusable_bufs.pop().unwrap_or_default();
-        let job = SparseEncodeJob {
-            chunk_idx,
-            rows_ptr: rows.as_ptr() as usize,
-            rows_len: rows.len(),
-            fi,
-            start_row,
-            end_row,
-            buf: work_buf,
-        };
-        match pool.workers[chunk_idx - 1].send(job) {
-            Ok(()) => {
-                drain_guard.pending += 1;
-                dispatched += 1;
-                fallback_start = end_row;
-            }
-            Err(err) => {
-                let mut b = err.0.buf;
-                b.clear();
-                drain_guard.reusable_bufs.push(b);
-                break;
-            }
+        std::hint::spin_loop();
+    }
+    while task.done_chunks.load(Ordering::Acquire) < total_chunks {
+        if !task.finished.load(Ordering::Acquire) {
+            std::thread::park_timeout(std::time::Duration::from_micros(50));
         }
     }
+    if task.panicked.load(Ordering::Acquire) {
+        panic!("vector encode worker panicked");
+    }
 
-    let first_res = append_sparse_rows_range(rows, fi, 0, first_end, buf);
-
-    while drain_guard.pending > 0 {
-        drain_guard.pending -= 1;
-        if let Ok((cidx, res, b)) = drain_guard.done_rx.recv() {
-            if let Some(slot) = slots.get_mut(cidx - 1) {
-                *slot = Some((res, b));
-            } else {
-                let mut b = b;
-                b.clear();
-                drain_guard.reusable_bufs.push(b);
+    if task.aborted.load(Ordering::Acquire) {
+        for slot in &task.slots {
+            if let Some(Err(e)) = slot.lock().ok().and_then(|mut g| g.take()) {
+                return Err(e);
             }
         }
+        return Ok((false, 0));
     }
 
-    let mut out_res = first_res;
-    for slot in &mut slots[..dispatched] {
-        if let Some((res, mut chunk_buf)) = slot.take() {
-            if out_res.is_ok() {
-                if let Err(e) = res {
-                    out_res = Err(e);
-                } else {
-                    buf.extend_from_slice(&chunk_buf);
-                }
-            }
-            chunk_buf.clear();
-            drain_guard.reusable_bufs.push(chunk_buf);
-        }
+    let mut total_exact_sparse = 0usize;
+    let total_payload = task.accum_bytes.load(Ordering::Acquire);
+    buf.reserve(total_payload);
+    for slot in &task.slots {
+        let item = slot
+            .lock()
+            .ok()
+            .and_then(|mut g| g.take())
+            .ok_or_else(|| io_err("missing vector encode chunk"))??;
+        buf.extend_from_slice(&item.0);
+        total_exact_sparse = total_exact_sparse.saturating_add(item.1);
     }
-    drop(drain_guard);
-
-    if out_res.is_ok() && fallback_start < num_rows {
-        append_sparse_rows_range(rows, fi, fallback_start, num_rows, buf)?;
-    }
-    out_res
+    Ok((true, total_exact_sparse))
 }
 
 pub(crate) fn encode_insert_rows_direct(
@@ -1539,17 +1698,64 @@ pub(crate) fn encode_insert_rows_direct_ext(
                 };
                 let mut wrote_sparse = false;
                 if try_sparse {
+                    let mut accepted_sparse = false;
+                    let mut used_dict = false;
                     let mark = buf.len();
-                    buf.push(7);
-                    let payload_start = buf.len();
-                    if append_sparse_rows_field_parallel(rows, fi, rows.len(), buf).is_err() {
-                        buf.truncate(mark);
-                        return None;
+                    let mut try_raw_sparse = !dictionary_writer_enabled();
+                    if !try_raw_sparse {
+                        let dict_give_up = if has_empty {
+                            usize::MAX
+                        } else {
+                            dense.saturating_add(rows.len().saturating_mul(65))
+                        };
+                        buf.push(8);
+                        let payload_start = buf.len();
+                        let Ok((dict_ok, exact_sparse_bytes)) = append_vec_rows_field_parallel(
+                            rows,
+                            fi,
+                            rows.len(),
+                            true,
+                            dict_give_up,
+                            buf,
+                        ) else {
+                            buf.truncate(mark);
+                            return None;
+                        };
+                        let dict_bytes = buf.len() - payload_start;
+                        if dict_ok
+                            && dict_bytes < exact_sparse_bytes
+                            && (has_empty || exact_sparse_bytes < dense)
+                        {
+                            accepted_sparse = true;
+                            used_dict = true;
+                        } else {
+                            buf.truncate(mark);
+                            try_raw_sparse = has_empty || (dict_ok && exact_sparse_bytes < dense);
+                        }
                     }
-                    let sparse_bytes = buf.len() - payload_start;
-                    if !has_empty && sparse_bytes >= dense {
-                        buf.truncate(mark);
-                    } else {
+                    if try_raw_sparse {
+                        buf.push(7);
+                        let payload_start = buf.len();
+                        let sparse_give_up = if has_empty { usize::MAX } else { dense };
+                        let Ok((sparse_ok, _)) = append_vec_rows_field_parallel(
+                            rows,
+                            fi,
+                            rows.len(),
+                            false,
+                            sparse_give_up,
+                            buf,
+                        ) else {
+                            buf.truncate(mark);
+                            return None;
+                        };
+                        let sparse_bytes = buf.len() - payload_start;
+                        if !has_empty && (!sparse_ok || sparse_bytes >= dense) {
+                            buf.truncate(mark);
+                        } else {
+                            accepted_sparse = true;
+                        }
+                    }
+                    if accepted_sparse {
                         let storage = rows
                             .len()
                             .checked_mul(std::mem::size_of::<Option<Vec<f32>>>())?;
@@ -1564,12 +1770,7 @@ pub(crate) fn encode_insert_rows_direct_ext(
                         }
                         sparse_decoded_bytes = next_decoded;
                         sparse_codec = true;
-                        let vectors = rows.iter().map(|r| match &r.cells_slice()[fi] {
-                            Cell::Vec(emb) => Some(emb.as_ref()),
-                            _ => None,
-                        });
-                        dictionary_codec |=
-                            rewrite_sparse_as_dictionary(buf, mark, vectors).ok()?;
+                        dictionary_codec |= used_dict;
                         wrote_sparse = true;
                     }
                 }

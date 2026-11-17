@@ -55,6 +55,10 @@ pub(crate) struct PointUpdatePlan {
     pub prepared_gen: u64,
     pub prepared_docs_epoch: u64,
     pub prepared_idx: Option<usize>,
+    pub prepared_shape: Option<Arc<crate::store::RowShape>>,
+    pub hash_slot: Option<u8>,
+    pub wing_slot: Option<u8>,
+    pub ts_slot: Option<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -114,6 +118,7 @@ pub struct Prepared {
 }
 
 impl Prepared {
+    #[inline]
     pub fn run(&self, db: &mut Db) -> Result<super::Handle, Error> {
         db.run_prepared(self)
     }
@@ -534,12 +539,29 @@ impl Db {
             None
         };
         let mut prepared_idx = None;
+        let mut prepared_shape = None;
+        let mut hash_slot = None;
+        let mut wing_slot = None;
+        let mut ts_slot = None;
         if collection == "docs" && !store.is_disk_backed("docs") {
             let docs = store.collection("docs");
             if let Some(idx) = store.point_index("docs", field, key)
                 && idx < docs.len()
             {
                 prepared_idx = Some(idx);
+                if is_docs_wing_only && let Some(shape) = docs[idx].shape_arc() {
+                    let names = shape.names();
+                    let find_slot = |target: &str| -> Option<u8> {
+                        names
+                            .iter()
+                            .position(|n| n == target)
+                            .and_then(|pos| u8::try_from(pos).ok())
+                    };
+                    hash_slot = find_slot("hash");
+                    wing_slot = find_slot("wing");
+                    ts_slot = find_slot("ts");
+                    prepared_shape = Some(Arc::clone(shape));
+                }
             }
         }
         Some(PointUpdatePlan {
@@ -554,6 +576,10 @@ impl Db {
             prepared_gen: store.r#gen,
             prepared_docs_epoch: store.docs_epoch,
             prepared_idx,
+            prepared_shape,
+            hash_slot,
+            wing_slot,
+            ts_slot,
         })
     }
 

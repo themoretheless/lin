@@ -70,16 +70,10 @@ pub struct Handle {
     pub ms: f64,
 }
 
-impl Drop for Handle {
-    fn drop(&mut self) {
-        if self.rows.len() == 1
-            && self.rows[0]
-                .shape_arc()
-                .is_some_and(|s| Arc::ptr_eq(s, crate::store::shape_id_title()))
-        {
-            crate::store::release_single_id_title_vec(std::mem::take(&mut self.rows));
-            return;
-        }
+impl Handle {
+    #[cold]
+    #[inline(never)]
+    fn recycle_rows_slow(&mut self) {
         if self.rows.len() >= 1024
             && self.rows.len() <= 2_500_000
             && self
@@ -103,6 +97,26 @@ impl Drop for Handle {
             if is_orders_shape && let Some(r) = self.rows.pop() {
                 crate::store::release_orders_row(r);
             }
+        }
+    }
+}
+
+impl Drop for Handle {
+    #[inline]
+    fn drop(&mut self) {
+        if self.rows.is_empty() {
+            return;
+        }
+        if self.rows.len() == 1
+            && self.rows[0]
+                .shape_arc()
+                .is_some_and(|s| Arc::ptr_eq(s, crate::store::shape_id_title()))
+        {
+            crate::store::release_single_id_title_vec(std::mem::take(&mut self.rows));
+            return;
+        }
+        if self.rows.len() >= 1024 || (self.rows.len() == 1 && self.rows[0].len() == 3) {
+            self.recycle_rows_slow();
         }
     }
 }
@@ -1203,7 +1217,49 @@ impl Db {
         results
     }
 
+    #[inline]
+    fn try_fast_docs_id_title_get(&self, prepared: &Prepared) -> Option<Handle> {
+        let pg = prepared.point_get.as_ref()?;
+        if !pg.is_docs_id_title
+            || self.store.disk.is_some()
+            || !self.store.fts_deferred_doc_swaps.is_empty()
+        {
+            return None;
+        }
+        let idx = match pg.prepared_idx {
+            Some(i)
+                if i < self.store.docs_id.len()
+                    && (self.store.docs_epoch == pg.prepared_docs_epoch
+                        || self.store.docs_id[i].as_ref() == pg.key.as_str()) =>
+            {
+                i
+            }
+            _ => self.store.row_index("docs", &pg.key)?,
+        };
+        if idx >= self.store.docs_id.len() || idx >= self.store.docs_title.len() {
+            return None;
+        }
+        let rows = crate::store::take_single_id_title_vec_with_arcs(
+            &self.store.docs_id[idx],
+            &self.store.docs_title[idx],
+        );
+        Some(Handle {
+            plan: Arc::clone(&prepared.plan),
+            rows,
+            done: Done {
+                r#gen: self.store.r#gen,
+                n: 1,
+            },
+            message: None,
+            ms: 0.0,
+        })
+    }
+
+    #[inline]
     pub fn run_prepared(&mut self, prepared: &Prepared) -> Result<Handle, Error> {
+        if let Some(h) = self.try_fast_docs_id_title_get(prepared) {
+            return Ok(h);
+        }
         self.run_prepared_ext(prepared, true)
     }
 
@@ -2445,7 +2501,7 @@ impl Db {
         idx: usize,
         want_rows: bool,
         tx_mode: bool,
-    ) -> Result<(Option<Cell>, Vec<Row>), Error> {
+    ) -> Result<(Option<Cell>, Option<u8>, Vec<Row>), Error> {
         let Store {
             collections,
             docs_wing,
@@ -2458,8 +2514,20 @@ impl Db {
         let defer_wing_idx = docs_col.len() >= 64;
         let large_table = docs_col.len() >= 512;
         let row = &mut docs_col[idx];
+        let shape_hit = row
+            .shape_arc()
+            .zip(pu.prepared_shape.as_ref())
+            .is_some_and(|(a, b)| Arc::ptr_eq(a, b));
+        let wing_slot_used = if shape_hit { pu.wing_slot } else { None };
         if !pu.cas_each {
-            let got = row_text(row, "hash").unwrap_or("");
+            let got = if shape_hit {
+                pu.hash_slot
+                    .and_then(|s| row.cells_slice().get(s as usize))
+                    .and_then(Cell::text)
+                    .unwrap_or("")
+            } else {
+                row_text(row, "hash").unwrap_or("")
+            };
             let cas = pu.cas.as_deref().unwrap_or("");
             if got != cas {
                 return Err(Error::runtime(format!(
@@ -2522,11 +2590,22 @@ impl Db {
             }
         }
         let ts_cell = if !has_complex_idx && needs_ts {
-            row.get("ts").cloned().unwrap_or(Cell::Null)
+            if shape_hit {
+                pu.ts_slot
+                    .and_then(|s| row.cells_slice().get(s as usize))
+                    .cloned()
+                    .unwrap_or(Cell::Null)
+            } else {
+                row.get("ts").cloned().unwrap_or(Cell::Null)
+            }
         } else {
             Cell::Null
         };
-        let prev_cell = if let Some(slot) = row.get_mut("wing") {
+        let prev_cell = if let Some(ws) = wing_slot_used
+            && let Some(slot) = row.cells_mut().get_mut(ws as usize)
+        {
+            Some(std::mem::replace(slot, new_cell))
+        } else if let Some(slot) = row.get_mut("wing") {
             Some(std::mem::replace(slot, new_cell))
         } else {
             row.insert("wing".to_string(), new_cell)
@@ -2543,7 +2622,13 @@ impl Db {
                     let new_k = Some(live_idx.key_of(row));
                     if let Err(e) = live_idx.update_keys(idx, old_k, new_k) {
                         if let Some(prev) = prev_cell {
-                            row.insert("wing".to_string(), prev);
+                            if let Some(ws) = wing_slot_used
+                                && let Some(slot) = row.cells_mut().get_mut(ws as usize)
+                            {
+                                *slot = prev;
+                            } else {
+                                row.insert("wing".to_string(), prev);
+                            }
                         } else {
                             row.remove("wing");
                         }
@@ -2567,7 +2652,9 @@ impl Db {
                     ts: ts_cell,
                 });
             } else {
-                let new_wing_cell = row.get("wing").unwrap_or(&Cell::Null);
+                let new_wing_cell = wing_slot_used
+                    .and_then(|ws| row.cells_slice().get(ws as usize))
+                    .unwrap_or_else(|| row.get("wing").unwrap_or(&Cell::Null));
                 for live_idx in indexes.values_mut() {
                     if live_idx.def.collection == pu.collection {
                         if live_idx.def.fields.len() == 1 && live_idx.def.fields[0] == "wing" {
@@ -2577,7 +2664,13 @@ impl Db {
                             let new_k = Some(crate::index::LiveIndex::single_cell_key(new_wing_cell));
                             if let Err(e) = live_idx.update_keys(idx, old_k, new_k) {
                                 if let Some(prev) = prev_cell {
-                                    row.insert("wing".to_string(), prev);
+                                    if let Some(ws) = wing_slot_used
+                                        && let Some(slot) = row.cells_mut().get_mut(ws as usize)
+                                    {
+                                        *slot = prev;
+                                    } else {
+                                        row.insert("wing".to_string(), prev);
+                                    }
                                 } else {
                                     row.remove("wing");
                                 }
@@ -2597,7 +2690,13 @@ impl Db {
                             ));
                             if let Err(e) = live_idx.update_keys(idx, old_k, new_k) {
                                 if let Some(prev) = prev_cell {
-                                    row.insert("wing".to_string(), prev);
+                                    if let Some(ws) = wing_slot_used
+                                        && let Some(slot) = row.cells_mut().get_mut(ws as usize)
+                                    {
+                                        *slot = prev;
+                                    } else {
+                                        row.insert("wing".to_string(), prev);
+                                    }
                                 } else {
                                     row.remove("wing");
                                 }
@@ -2612,7 +2711,7 @@ impl Db {
             docs_wing.set_str(idx, wing_str);
         }
         if tx_mode {
-            return Ok((prev_cell, Vec::new()));
+            return Ok((prev_cell, wing_slot_used, Vec::new()));
         }
         let out_rows = if !want_rows || large_table {
             if let Some(prev) = prev_cell
@@ -2624,7 +2723,7 @@ impl Db {
         } else {
             vec![row.clone()]
         };
-        Ok((None, out_rows))
+        Ok((None, wing_slot_used, out_rows))
     }
 
     fn run_prepared_ext(&mut self, prepared: &Prepared, want_rows: bool) -> Result<Handle, Error> {
@@ -2845,7 +2944,7 @@ impl Db {
                 }
             };
             if self.can_fast_docs_wing_update(pu) {
-                let (_, out_rows) =
+                let (_, _, out_rows) =
                     self.exec_docs_wing_update_core(pu, idx, want_rows, false)?;
                 self.store.r#gen += 1;
                 return Ok(Handle {
@@ -2965,7 +3064,7 @@ impl Db {
         {
             let t0 = Instant::now();
             let base_gen = self.store.r#gen;
-            let mark = self.store.append_mark();
+            let prev_facts_len = self.store.facts_len();
             let changed = self.store.append_prepared_facts(&pf.s, &pf.p, &pf.o);
             if changed == 0 {
                 return Ok(Handle {
@@ -2980,7 +3079,7 @@ impl Db {
                 });
             }
             if let Err(e) = self.check_quotas() {
-                self.store.append_rollback(mark);
+                self.store.rollback_facts_append(prev_facts_len);
                 self.store.r#gen = base_gen;
                 return Err(e);
             }
@@ -2988,7 +3087,7 @@ impl Db {
                 if p.log_bytes > self.quotas.max_log_bytes
                     && let Err(e) = self.store.checkpoint(p)
                 {
-                    self.store.append_rollback(mark);
+                    self.store.rollback_facts_append(prev_facts_len);
                     self.store.r#gen = base_gen;
                     return Err(e);
                 }
@@ -2997,7 +3096,7 @@ impl Db {
                     pf.s.len() as u32,
                     &pf.encoded_spo,
                 ) {
-                    self.store.append_rollback(mark);
+                    self.store.rollback_facts_append(prev_facts_len);
                     self.store.r#gen = base_gen;
                     return Err(e);
                 }
@@ -3980,8 +4079,8 @@ impl Db {
             if let Some(rows) = self.try_join_agg(q, bindings, now)? {
                 return Ok(rows);
             }
-            if let Some(batch) = self.try_window_project_batch(q, bindings, now) {
-                return Ok(batch.into_rows());
+            if let Some(rows) = self.try_window_project(q, bindings, now) {
+                return Ok(rows);
             }
             if let Some(batch) = self.try_sort_project_batch(q, bindings, now) {
                 return Ok(batch.into_rows());

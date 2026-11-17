@@ -1512,6 +1512,47 @@ impl Store {
         }
     }
 
+    fn truncate_facts_to(&mut self, facts_len: usize) {
+        if self.facts_s.len() > facts_len {
+            for idx in (facts_len..self.facts_s.len()).rev() {
+                let key = (
+                    Arc::clone(&self.facts_s[idx]),
+                    Arc::clone(&self.facts_p[idx]),
+                    Arc::clone(&self.facts_o[idx]),
+                );
+                if self.facts_by_spo.get(&key) == Some(&idx) {
+                    self.facts_by_spo.remove(&key);
+                }
+            }
+            self.facts_s.truncate(facts_len);
+            self.facts_p.truncate(facts_len);
+            self.facts_o.truncate(facts_len);
+            if !self.facts_rows_stale
+                && let Some(f_rows) = self.collections.get_mut("facts")
+            {
+                f_rows.truncate(facts_len);
+            }
+            if let Some(c) = self.col_counts.get_mut("facts") {
+                *c = facts_len;
+            } else {
+                self.col_counts.insert("facts".to_string(), facts_len);
+            }
+        } else if let Some(f_rows) = self.collections.get_mut("facts")
+            && f_rows.len() > facts_len
+        {
+            f_rows.truncate(facts_len);
+            if let Some(c) = self.col_counts.get_mut("facts") {
+                *c = facts_len;
+            } else {
+                self.col_counts.insert("facts".to_string(), facts_len);
+            }
+        }
+    }
+
+    pub(crate) fn rollback_facts_append(&mut self, facts_len: usize) {
+        self.truncate_facts_to(facts_len);
+    }
+
     pub fn append_rollback(&mut self, mark: AppendMark) {
         self.next_id = mark.next_id;
 
@@ -1551,40 +1592,7 @@ impl Store {
         }
 
         // 2. O(delta) facts rollback
-        if self.facts_s.len() > mark.facts_len {
-            for idx in (mark.facts_len..self.facts_s.len()).rev() {
-                let key = (
-                    Arc::clone(&self.facts_s[idx]),
-                    Arc::clone(&self.facts_p[idx]),
-                    Arc::clone(&self.facts_o[idx]),
-                );
-                if self.facts_by_spo.get(&key) == Some(&idx) {
-                    self.facts_by_spo.remove(&key);
-                }
-            }
-            self.facts_s.truncate(mark.facts_len);
-            self.facts_p.truncate(mark.facts_len);
-            self.facts_o.truncate(mark.facts_len);
-            if !self.facts_rows_stale
-                && let Some(f_rows) = self.collections.get_mut("facts")
-            {
-                f_rows.truncate(mark.facts_len);
-            }
-            if let Some(c) = self.col_counts.get_mut("facts") {
-                *c = mark.facts_len;
-            } else {
-                self.col_counts.insert("facts".to_string(), mark.facts_len);
-            }
-        } else if let Some(f_rows) = self.collections.get_mut("facts")
-            && f_rows.len() > mark.facts_len
-        {
-            f_rows.truncate(mark.facts_len);
-            if let Some(c) = self.col_counts.get_mut("facts") {
-                *c = mark.facts_len;
-            } else {
-                self.col_counts.insert("facts".to_string(), mark.facts_len);
-            }
-        }
+        self.truncate_facts_to(mark.facts_len);
 
         // 3. O(delta) collection row/index/map/FTS/HNSW rollback — collect only mutated collections
         let mut dirty: smallvec::SmallVec<[(AppendColKey, usize, usize); 2]> =
@@ -3739,133 +3747,195 @@ impl Store {
             let docs_layer = &mut self.docs_layer;
             let docs_wing = &mut self.docs_wing;
 
-            struct FtsJob {
+            use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+            struct FtsStealTask {
                 fts_ptr: usize,
                 start: usize,
                 rows_ptr: usize,
                 rows_len: usize,
+                state: AtomicU8,
+                done: AtomicBool,
+                panicked: AtomicBool,
+                caller: std::thread::Thread,
             }
-            struct IdxJob {
+            struct IdxStealTask {
                 indexes_ptr: usize,
                 start: usize,
                 rows_ptr: usize,
                 rows_len: usize,
+                state: AtomicU8,
+                done: AtomicBool,
+                panicked: AtomicBool,
+                caller: std::thread::Thread,
+                res: std::sync::Mutex<Option<Result<(), Error>>>,
             }
-            struct MaintPool {
-                fts_tx: std::sync::mpsc::SyncSender<FtsJob>,
-                fts_done: std::sync::mpsc::Receiver<()>,
-                idx_tx: std::sync::mpsc::SyncSender<IdxJob>,
-                idx_done: std::sync::mpsc::Receiver<Result<(), Error>>,
-            }
-            static MAINT_POOL: std::sync::OnceLock<std::sync::Mutex<Option<MaintPool>>> =
-                std::sync::OnceLock::new();
-            let pool_mutex = MAINT_POOL.get_or_init(|| {
-                let (fts_tx, fts_rx) = std::sync::mpsc::sync_channel::<FtsJob>(1);
-                let (fts_done_tx, fts_done) = std::sync::mpsc::sync_channel::<()>(1);
-                let (idx_tx, idx_rx) = std::sync::mpsc::sync_channel::<IdxJob>(1);
-                let (idx_done_tx, idx_done) = std::sync::mpsc::sync_channel::<Result<(), Error>>(1);
+            static MAINT_TXS: std::sync::OnceLock<
+                Option<(
+                    std::sync::mpsc::SyncSender<Arc<FtsStealTask>>,
+                    std::sync::mpsc::SyncSender<Arc<IdxStealTask>>,
+                )>,
+            > = std::sync::OnceLock::new();
+            let txs_opt = MAINT_TXS.get_or_init(|| {
+                let (fts_tx, fts_rx) =
+                    std::sync::mpsc::sync_channel::<Arc<FtsStealTask>>(8);
+                let (idx_tx, idx_rx) =
+                    std::sync::mpsc::sync_channel::<Arc<IdxStealTask>>(8);
                 let ok1 = std::thread::Builder::new()
                     .name("lin-maint-fts".into())
                     .spawn(move || {
-                        while let Ok(job) = fts_rx.recv() {
-                            let fts = unsafe { &mut *(job.fts_ptr as *mut crate::fts::FtsIndex) };
+                        while let Ok(task) = fts_rx.recv() {
+                            if task
+                                .state
+                                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                                .is_err()
+                            {
+                                continue;
+                            }
+                            struct WorkerDone<'a>(&'a FtsStealTask, bool);
+                            impl Drop for WorkerDone<'_> {
+                                fn drop(&mut self) {
+                                    if self.1 {
+                                        self.0.panicked.store(true, Ordering::Release);
+                                    }
+                                    self.0.done.store(true, Ordering::Release);
+                                    self.0.caller.unpark();
+                                }
+                            }
+                            let mut wd = WorkerDone(&task, true);
+                            let fts =
+                                unsafe { &mut *(task.fts_ptr as *mut crate::fts::FtsIndex) };
                             let rows = unsafe {
-                                std::slice::from_raw_parts(job.rows_ptr as *const Row, job.rows_len)
+                                std::slice::from_raw_parts(
+                                    task.rows_ptr as *const Row,
+                                    task.rows_len,
+                                )
                             };
-                            fts.append_slab(job.start, rows);
-                            let _ = fts_done_tx.send(());
+                            fts.append_slab(task.start, rows);
+                            wd.1 = false;
                         }
                     })
                     .is_ok();
                 let ok2 = std::thread::Builder::new()
                     .name("lin-maint-idx".into())
                     .spawn(move || {
-                        while let Ok(job) = idx_rx.recv() {
+                        while let Ok(task) = idx_rx.recv() {
+                            if task
+                                .state
+                                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                                .is_err()
+                            {
+                                continue;
+                            }
+                            struct WorkerDone<'a>(&'a IdxStealTask, bool);
+                            impl Drop for WorkerDone<'_> {
+                                fn drop(&mut self) {
+                                    if self.1 {
+                                        self.0.panicked.store(true, Ordering::Release);
+                                    }
+                                    self.0.done.store(true, Ordering::Release);
+                                    self.0.caller.unpark();
+                                }
+                            }
+                            let mut wd = WorkerDone(&task, true);
                             let idxs = unsafe {
-                                &mut *(job.indexes_ptr as *mut BTreeMap<String, LiveIndex>)
+                                &mut *(task.indexes_ptr as *mut BTreeMap<String, LiveIndex>)
                             };
                             let rows = unsafe {
-                                std::slice::from_raw_parts(job.rows_ptr as *const Row, job.rows_len)
+                                std::slice::from_raw_parts(
+                                    task.rows_ptr as *const Row,
+                                    task.rows_len,
+                                )
                             };
                             let mut res = Ok(());
                             for idx in idxs.values_mut() {
-                                if idx.def.collection == "docs" {
-                                    if let Err(e) =
-                                        idx.insert_slab_batch_no_reverse(job.start, rows)
-                                    {
-                                        res = Err(Error::runtime(e));
-                                        break;
-                                    }
+                                if idx.def.collection == "docs"
+                                    && let Err(e) =
+                                        idx.insert_slab_batch_no_reverse(task.start, rows)
+                                {
+                                    res = Err(Error::runtime(e));
+                                    break;
                                 }
                             }
-                            let _ = idx_done_tx.send(res);
+                            if let Ok(mut g) = task.res.lock() {
+                                *g = Some(res);
+                            }
+                            wd.1 = false;
                         }
                     })
                     .is_ok();
                 if ok1 && ok2 {
-                    std::sync::Mutex::new(Some(MaintPool {
-                        fts_tx,
-                        fts_done,
-                        idx_tx,
-                        idx_done,
-                    }))
+                    Some((fts_tx, idx_tx))
                 } else {
-                    std::sync::Mutex::new(None)
+                    None
                 }
             });
 
             let mut fts_opt = fts_opt;
-            let pool_guard = pool_mutex.try_lock().ok();
-            struct MaintDrainGuard<'a> {
-                fts_done: Option<&'a std::sync::mpsc::Receiver<()>>,
-                idx_done: Option<&'a std::sync::mpsc::Receiver<Result<(), Error>>>,
-                last_idx_res: Option<Result<(), Error>>,
-            }
-            impl Drop for MaintDrainGuard<'_> {
-                fn drop(&mut self) {
-                    if let Some(rx) = self.fts_done.take() {
-                        let _ = rx.recv();
-                    }
-                    if let Some(rx) = self.idx_done.take() {
-                        self.last_idx_res = rx.recv().ok();
-                    }
-                }
-            }
-            let mut maint_guard = MaintDrainGuard {
-                fts_done: None,
-                idx_done: None,
-                last_idx_res: None,
-            };
-            if let Some(ref guard) = pool_guard
-                && let Some(ref pool) = **guard
-            {
+            let mut fts_task: Option<Arc<FtsStealTask>> = None;
+            let mut idx_task: Option<Arc<IdxStealTask>> = None;
+            if let Some((fts_tx, idx_tx)) = txs_opt.as_ref() {
                 if let Some(fts) = fts_opt.as_deref_mut() {
-                    if pool
-                        .fts_tx
-                        .send(FtsJob {
-                            fts_ptr: fts as *mut crate::fts::FtsIndex as usize,
-                            start,
-                            rows_ptr: built.as_ptr() as usize,
-                            rows_len: built.len(),
-                        })
-                        .is_ok()
-                    {
-                        maint_guard.fts_done = Some(&pool.fts_done);
-                    }
-                }
-                if pool
-                    .idx_tx
-                    .send(IdxJob {
-                        indexes_ptr: indexes as *mut BTreeMap<String, LiveIndex> as usize,
+                    let t = Arc::new(FtsStealTask {
+                        fts_ptr: fts as *mut crate::fts::FtsIndex as usize,
                         start,
                         rows_ptr: built.as_ptr() as usize,
                         rows_len: built.len(),
-                    })
-                    .is_ok()
-                {
-                    maint_guard.idx_done = Some(&pool.idx_done);
+                        state: AtomicU8::new(0),
+                        done: AtomicBool::new(false),
+                        panicked: AtomicBool::new(false),
+                        caller: std::thread::current(),
+                    });
+                    if fts_tx.try_send(Arc::clone(&t)).is_ok() {
+                        fts_task = Some(t);
+                    }
+                }
+                let t = Arc::new(IdxStealTask {
+                    indexes_ptr: indexes as *mut BTreeMap<String, LiveIndex> as usize,
+                    start,
+                    rows_ptr: built.as_ptr() as usize,
+                    rows_len: built.len(),
+                    state: AtomicU8::new(0),
+                    done: AtomicBool::new(false),
+                    panicked: AtomicBool::new(false),
+                    caller: std::thread::current(),
+                    res: std::sync::Mutex::new(None),
+                });
+                if idx_tx.try_send(Arc::clone(&t)).is_ok() {
+                    idx_task = Some(t);
                 }
             }
+            struct MaintStealGuard<'a> {
+                fts_task: Option<&'a FtsStealTask>,
+                idx_task: Option<&'a IdxStealTask>,
+            }
+            impl Drop for MaintStealGuard<'_> {
+                fn drop(&mut self) {
+                    if let Some(t) = self.fts_task
+                        && t.state
+                            .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
+                            .err()
+                            == Some(1)
+                    {
+                        while !t.done.load(Ordering::Acquire) {
+                            std::thread::park_timeout(std::time::Duration::from_micros(50));
+                        }
+                    }
+                    if let Some(t) = self.idx_task
+                        && t.state
+                            .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
+                            .err()
+                            == Some(1)
+                    {
+                        while !t.done.load(Ordering::Acquire) {
+                            std::thread::park_timeout(std::time::Duration::from_micros(50));
+                        }
+                    }
+                }
+            }
+            let _maint_guard = MaintStealGuard {
+                fts_task: fts_task.as_deref(),
+                idx_task: idx_task.as_deref(),
+            };
 
             if let Some(hnsw) = hnsw_opt {
                 for (i, row) in built.iter().enumerate() {
@@ -3886,26 +3956,33 @@ impl Store {
             let title_pos = first.keys().position(|k| k == "title");
             let layer_pos = first.keys().position(|k| k == "layer");
             let wing_pos = first.keys().position(|k| k == "wing");
-            let uniform = built[1..].iter().all(|r| r.len() == first.len());
-            if uniform && first.len() <= 32 {
+            let same_shape = first.shape_arc().is_some_and(|fs| {
+                built[1..]
+                    .iter()
+                    .all(|r| r.shape_arc().is_some_and(|s| Arc::ptr_eq(s, fs)))
+            });
+            if same_shape {
                 for (i, row) in built.iter().enumerate() {
                     let idx = start + i;
-                    let mut cells: [&Cell; 32] = [&Cell::Null; 32];
-                    for (p, val) in row.values().enumerate().take(32) {
-                        cells[p] = val;
-                    }
+                    let cells = row.cells_slice();
                     let id_arc: Arc<str> = id_pos
-                        .and_then(|p| cells[p].text_shared())
+                        .and_then(|p| cells.get(p))
+                        .and_then(Cell::text_shared)
                         .unwrap_or_default();
-                    let uri_arc: Option<Arc<str>> = uri_pos.and_then(|p| cells[p].text_shared());
+                    let uri_arc: Option<Arc<str>> = uri_pos
+                        .and_then(|p| cells.get(p))
+                        .and_then(Cell::text_shared);
                     let title_arc: Arc<str> = title_pos
-                        .and_then(|p| cells[p].text_shared())
+                        .and_then(|p| cells.get(p))
+                        .and_then(Cell::text_shared)
                         .unwrap_or_default();
                     let layer_arc: Arc<str> = layer_pos
-                        .and_then(|p| cells[p].text_shared())
+                        .and_then(|p| cells.get(p))
+                        .and_then(Cell::text_shared)
                         .unwrap_or_default();
                     let wing_arc: Arc<str> = wing_pos
-                        .and_then(|p| cells[p].text_shared())
+                        .and_then(|p| cells.get(p))
+                        .and_then(Cell::text_shared)
                         .unwrap_or_default();
 
                     if !id_arc.is_empty() {
@@ -3948,28 +4025,63 @@ impl Store {
                 }
             }
 
-            if maint_guard.fts_done.is_none() {
-                if let Some(fts) = fts_opt {
-                    fts.append_slab(start, built);
+            if let Some(fts) = fts_opt {
+                match fts_task.as_deref() {
+                    Some(t)
+                        if t.state
+                            .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
+                            .is_err() =>
+                    {
+                        for _ in 0..64 {
+                            if t.done.load(Ordering::Acquire) {
+                                break;
+                            }
+                            std::hint::spin_loop();
+                        }
+                        while !t.done.load(Ordering::Acquire) {
+                            std::thread::park_timeout(std::time::Duration::from_micros(50));
+                        }
+                        if t.panicked.load(Ordering::Acquire) {
+                            panic!("fts maint worker panicked");
+                        }
+                    }
+                    _ => {
+                        fts.append_slab(start, built);
+                    }
                 }
             }
             let mut idx_res = Ok(());
-            if maint_guard.idx_done.is_none() {
-                for idx in indexes.values_mut() {
-                    if idx.def.collection == collection {
-                        if let Err(e) = idx.insert_slab_batch_no_reverse(start, built) {
+            match idx_task.as_deref() {
+                Some(t)
+                    if t.state
+                        .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
+                        .is_err() =>
+                {
+                    for _ in 0..64 {
+                        if t.done.load(Ordering::Acquire) {
+                            break;
+                        }
+                        std::hint::spin_loop();
+                    }
+                    while !t.done.load(Ordering::Acquire) {
+                        std::thread::park_timeout(std::time::Duration::from_micros(50));
+                    }
+                    if t.panicked.load(Ordering::Acquire) {
+                        panic!("index maint worker panicked");
+                    }
+                    if let Some(r) = t.res.lock().ok().and_then(|mut g| g.take()) {
+                        idx_res = r;
+                    }
+                }
+                _ => {
+                    for idx in indexes.values_mut() {
+                        if idx.def.collection == collection
+                            && let Err(e) = idx.insert_slab_batch_no_reverse(start, built)
+                        {
                             idx_res = Err(Error::runtime(e));
                             break;
                         }
                     }
-                }
-            }
-            if let Some(rx) = maint_guard.fts_done.take() {
-                let _ = rx.recv();
-            }
-            if let Some(rx) = maint_guard.idx_done.take() {
-                if let Ok(r) = rx.recv() {
-                    idx_res = r;
                 }
             }
             return idx_res;

@@ -24,6 +24,78 @@ enum JoinLeftSource {
     Scan { len: usize },
 }
 
+enum OrdersWinOut {
+    Floats(Vec<f64>),
+    Ints(Vec<i64>),
+}
+
+#[derive(Copy, Clone)]
+enum OrdersOrderKey {
+    Id,
+    Total,
+}
+
+#[inline]
+fn cmp_f64_sort(a: f64, b: f64) -> std::cmp::Ordering {
+    match a.partial_cmp(&b) {
+        Some(ord) => ord,
+        None => match (a.is_nan(), b.is_nan()) {
+            (true, true) => std::cmp::Ordering::Equal,
+            (true, false) => std::cmp::Ordering::Greater,
+            (false, true) => std::cmp::Ordering::Less,
+            (false, false) => std::cmp::Ordering::Equal,
+        },
+    }
+}
+
+#[inline]
+fn sort_indices_cmp(part: &mut [u32], mut cmp: impl FnMut(u32, u32) -> std::cmp::Ordering) {
+    if part.len() <= 32 {
+        for i in 1..part.len() {
+            let cur = part[i];
+            let mut j = i;
+            while j > 0 && cmp(part[j - 1], cur) == std::cmp::Ordering::Greater {
+                part[j] = part[j - 1];
+                j -= 1;
+            }
+            part[j] = cur;
+        }
+    } else {
+        part.sort_by(|&a, &b| cmp(a, b));
+    }
+}
+
+#[inline]
+fn sort_orders_partition(
+    part: &mut [u32],
+    order_key: OrdersOrderKey,
+    desc: bool,
+    orders_id: &[Arc<str>],
+    orders_total: &[f64],
+) {
+    if part.len() <= 1 {
+        return;
+    }
+    match (order_key, desc) {
+        (OrdersOrderKey::Id, false) => sort_indices_cmp(part, |a, b| {
+            orders_id[a as usize]
+                .as_ref()
+                .cmp(orders_id[b as usize].as_ref())
+        }),
+        (OrdersOrderKey::Id, true) => sort_indices_cmp(part, |a, b| {
+            orders_id[b as usize]
+                .as_ref()
+                .cmp(orders_id[a as usize].as_ref())
+        }),
+        (OrdersOrderKey::Total, false) => sort_indices_cmp(part, |a, b| {
+            cmp_f64_sort(orders_total[a as usize], orders_total[b as usize])
+        }),
+        (OrdersOrderKey::Total, true) => sort_indices_cmp(part, |a, b| {
+            cmp_f64_sort(orders_total[b as usize], orders_total[a as usize])
+        }),
+    }
+}
+
 pub(crate) fn merge_join_row(mut left: Row, right: &Row, right_col: &str) -> Row {
     for (k, v) in right {
         left.insert(format!("{right_col}.{k}"), v.clone_for_borrow());
@@ -385,12 +457,353 @@ impl Db {
     /// first-seen order, each in window order). Shapes whose semantics depend on details the
     /// row pipeline owns are left to it: no explicit `take` (implicit limits), a window
     /// reading another window's output, nested fields, an output name shadowing a column.
+    pub(super) fn try_window_project(
+        &self,
+        q: &Query,
+        bindings: &BTreeMap<String, Vec<Row>>,
+        now: i64,
+    ) -> Option<Vec<Row>> {
+        if let Some(rows) = self.try_orders_single_window_soa(q, bindings, |fields, as_field, flat, out| {
+            let n = flat.len();
+            let orders_id = &self.store.orders_id;
+            if fields.len() == 2
+                && let (Some(f0), Some(f1)) = (fields[0].leaf(), fields[1].leaf())
+                && ((f0 == "id" && f1 == as_field) || (f1 == "id" && f0 == as_field))
+            {
+                let shape = Row::shape_of(&[f0, f1]);
+                let swap = shape.names()[0].as_str() != "id";
+                let mut rows = if n >= 1024 {
+                    crate::store::take_general_rows().unwrap_or_else(|| Vec::with_capacity(n))
+                } else {
+                    Vec::with_capacity(n)
+                };
+                if rows.capacity() < n {
+                    rows.reserve(n - rows.len());
+                }
+                let reuse_len = rows.len().min(n);
+                match out {
+                    OrdersWinOut::Floats(vals) => {
+                        for i in 0..reuse_len {
+                            let c_id = Cell::from_arc_str(&orders_id[flat[i] as usize]);
+                            let c_win = Cell::Float(vals[i]);
+                            let (a, b) = if swap { (c_win, c_id) } else { (c_id, c_win) };
+                            rows[i].set_pair_with_shape(&shape, a, b);
+                        }
+                        for i in reuse_len..n {
+                            let c_id = Cell::from_arc_str(&orders_id[flat[i] as usize]);
+                            let c_win = Cell::Float(vals[i]);
+                            let (a, b) = if swap { (c_win, c_id) } else { (c_id, c_win) };
+                            rows.push(Row::from_parts(Arc::clone(&shape), [a, b]));
+                        }
+                    }
+                    OrdersWinOut::Ints(vals) => {
+                        for i in 0..reuse_len {
+                            let c_id = Cell::from_arc_str(&orders_id[flat[i] as usize]);
+                            let c_win = Cell::Int(vals[i]);
+                            let (a, b) = if swap { (c_win, c_id) } else { (c_id, c_win) };
+                            rows[i].set_pair_with_shape(&shape, a, b);
+                        }
+                        for i in reuse_len..n {
+                            let c_id = Cell::from_arc_str(&orders_id[flat[i] as usize]);
+                            let c_win = Cell::Int(vals[i]);
+                            let (a, b) = if swap { (c_win, c_id) } else { (c_id, c_win) };
+                            rows.push(Row::from_parts(Arc::clone(&shape), [a, b]));
+                        }
+                    }
+                }
+                rows.truncate(n);
+                return rows;
+            }
+            self.build_orders_window_batch(fields, as_field, flat, out).into_rows()
+        }) {
+            return Some(rows);
+        }
+        self.try_window_project_batch(q, bindings, now)
+            .map(RecordBatch::into_rows)
+    }
+
+    fn build_orders_window_batch(
+        &self,
+        fields: &[Field],
+        as_field: &str,
+        flat: &[u32],
+        out: OrdersWinOut,
+    ) -> RecordBatch {
+        let orders_id = &self.store.orders_id;
+        let orders_uid = &self.store.orders_user_id;
+        let orders_total = &self.store.orders_total;
+        let mut out_opt = Some(out);
+        let mut win_refs = fields
+            .iter()
+            .filter(|f| f.leaf() == Some(as_field))
+            .count();
+        let mut out_cols = Vec::with_capacity(fields.len());
+        for f in fields {
+            match f.leaf().unwrap_or("") {
+                "id" => out_cols.push(Column::Cells(
+                    flat.iter()
+                        .map(|&r| Cell::from_arc_str(&orders_id[r as usize]))
+                        .collect(),
+                )),
+                "user_id" => out_cols.push(Column::Cells(
+                    flat.iter()
+                        .map(|&r| Cell::from_arc_str(&orders_uid[r as usize]))
+                        .collect(),
+                )),
+                "total" => out_cols.push(Column::from_floats(
+                    flat.iter().map(|&r| orders_total[r as usize]).collect(),
+                )),
+                leaf if leaf == as_field => {
+                    win_refs -= 1;
+                    if win_refs == 0 {
+                        let col = match out_opt.take().unwrap() {
+                            OrdersWinOut::Floats(v) => Column::from_floats(v),
+                            OrdersWinOut::Ints(v) => Column::from_ints(v),
+                        };
+                        out_cols.push(col);
+                    } else {
+                        let col = match out_opt.as_ref().unwrap() {
+                            OrdersWinOut::Floats(v) => Column::from_floats(v.clone()),
+                            OrdersWinOut::Ints(v) => Column::from_ints(v.clone()),
+                        };
+                        out_cols.push(col);
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+        RecordBatch {
+            names: field_names(fields).into(),
+            cols: out_cols,
+        }
+    }
+
+    fn try_orders_single_window_soa<R>(
+        &self,
+        q: &Query,
+        bindings: &BTreeMap<String, Vec<Row>>,
+        build: impl Fn(&[Field], &str, &[u32], OrdersWinOut) -> R,
+    ) -> Option<R> {
+        #[derive(Default)]
+        struct OrdersWinScratch {
+            slots: Vec<u32>,
+            counts: Vec<u32>,
+            bounds: Vec<u32>,
+            next_at: Vec<u32>,
+            flat: Vec<u32>,
+        }
+        thread_local! {
+            static SCRATCH: std::cell::RefCell<OrdersWinScratch> =
+                std::cell::RefCell::new(OrdersWinScratch::default());
+        }
+        let Source::Collection(name) = &q.source else {
+            return None;
+        };
+        if name != "orders" || bindings.get("orders").is_some() || self.store.is_disk_backed("orders")
+        {
+            return None;
+        }
+        if self.store.get_col_count("orders") > self.quotas.max_execution_work {
+            return None;
+        }
+        let mut window_step: Option<&Step> = None;
+        let mut fields: Option<&[Field]> = None;
+        let mut skip_n = 0usize;
+        let mut take: Option<Option<i64>> = None;
+        for step in &q.steps {
+            match step {
+                Step::Window { .. } if window_step.is_none() && fields.is_none() => {
+                    window_step = Some(step)
+                }
+                Step::Project(f) if window_step.is_some() && fields.is_none() => {
+                    fields = Some(f.as_slice())
+                }
+                Step::Skip { n } if fields.is_some() && take.is_none() => {
+                    skip_n = skip_n.saturating_add((*n).max(0) as usize);
+                }
+                Step::Take { n } if fields.is_some() && take.is_none() => take = Some(*n),
+                _ => return None,
+            }
+        }
+        let Some(Step::Window {
+            func,
+            field,
+            by,
+            order,
+            frame: None,
+            as_field,
+        }) = window_step
+        else {
+            return None;
+        };
+        let fields = fields?;
+        if skip_n != 0 || !matches!(take, Some(None)) {
+            return None;
+        }
+        let n = self.store.collection("orders").len();
+        if n == 0 {
+            return None;
+        }
+        let orders_id = &self.store.orders_id;
+        let orders_uid = &self.store.orders_user_id;
+        let orders_total = &self.store.orders_total;
+        let orders_tag = &self.store.orders_total_tag;
+        if orders_id.len() != n
+            || orders_uid.len() != n
+            || orders_total.len() != n
+            || orders_tag.len() != n
+        {
+            return None;
+        }
+        if by.len() != 1 || by[0].leaf() != Some("user_id") || order.len() != 1 {
+            return None;
+        }
+        if matches!(as_field.as_str(), "id" | "user_id" | "total") {
+            return None;
+        }
+        let ord_desc = order[0].desc;
+        let order_key = match order[0].field.leaf()? {
+            "id" => OrdersOrderKey::Id,
+            "total" => OrdersOrderKey::Total,
+            _ => return None,
+        };
+        let is_sum_total = matches!(func, WindowFunction::Sum)
+            && field.as_ref().and_then(Field::leaf) == Some("total");
+        if !is_sum_total
+            && !matches!(
+                func,
+                WindowFunction::Rank | WindowFunction::DenseRank | WindowFunction::RowNumber
+            )
+        {
+            return None;
+        }
+        let mut need_id = matches!(order_key, OrdersOrderKey::Id);
+        let mut need_total = is_sum_total || matches!(order_key, OrdersOrderKey::Total);
+        for f in fields {
+            let leaf = f.leaf()?;
+            match leaf {
+                "id" => need_id = true,
+                "user_id" => {}
+                "total" => need_total = true,
+                s if s == as_field => {}
+                _ => return None,
+            }
+        }
+        if !orders_uid.iter().all(|s| !s.is_empty())
+            || (need_id && !orders_id.iter().all(|s| !s.is_empty()))
+            || (need_total && !orders_tag.iter().all(|&t| t == 1))
+        {
+            return None;
+        }
+
+        let run_with_scratch = |scratch: &mut OrdersWinScratch| -> R {
+            scratch.slots.clear();
+            scratch.slots.reserve(n);
+            scratch.counts.clear();
+            let mut slot_of: FxHashMap<&str, u32> =
+                FxHashMap::with_capacity_and_hasher((n / 8).clamp(16, 4096), Default::default());
+            for uid in orders_uid {
+                let next = scratch.counts.len() as u32;
+                let slot = *slot_of.entry(uid.as_ref()).or_insert_with(|| {
+                    scratch.counts.push(0);
+                    next
+                });
+                scratch.counts[slot as usize] += 1;
+                scratch.slots.push(slot);
+            }
+            scratch.bounds.clear();
+            scratch.bounds.reserve(scratch.counts.len() + 1);
+            scratch.next_at.clear();
+            scratch.next_at.reserve(scratch.counts.len());
+            let mut acc = 0u32;
+            for &c in &scratch.counts {
+                scratch.bounds.push(acc);
+                scratch.next_at.push(acc);
+                acc += c;
+            }
+            scratch.bounds.push(acc);
+            scratch.flat.resize(n, 0);
+            for (pos, &slot) in scratch.slots.iter().enumerate() {
+                let at = &mut scratch.next_at[slot as usize];
+                scratch.flat[*at as usize] = pos as u32;
+                *at += 1;
+            }
+
+            let out = if is_sum_total {
+                let mut out_f64: Vec<f64> = Vec::with_capacity(n);
+                for range in scratch.bounds.windows(2) {
+                    let part = &mut scratch.flat[range[0] as usize..range[1] as usize];
+                    sort_orders_partition(part, order_key, ord_desc, orders_id, orders_total);
+                    let mut running = 0.0f64;
+                    for &r in part.iter() {
+                        running += orders_total[r as usize];
+                        out_f64.push(running);
+                    }
+                }
+                OrdersWinOut::Floats(out_f64)
+            } else {
+                let mut out_i64: Vec<i64> = Vec::with_capacity(n);
+                for range in scratch.bounds.windows(2) {
+                    let part = &mut scratch.flat[range[0] as usize..range[1] as usize];
+                    if part.is_empty() {
+                        continue;
+                    }
+                    sort_orders_partition(part, order_key, ord_desc, orders_id, orders_total);
+                    match func {
+                        WindowFunction::RowNumber => {
+                            out_i64.extend(1..=part.len() as i64);
+                        }
+                        WindowFunction::Rank | WindowFunction::DenseRank => {
+                            let is_rank = matches!(func, WindowFunction::Rank);
+                            let mut rank = 1i64;
+                            out_i64.push(1);
+                            for i in 1..part.len() {
+                                let a = part[i - 1] as usize;
+                                let b = part[i] as usize;
+                                let tied = match order_key {
+                                    OrdersOrderKey::Id => {
+                                        orders_id[a].as_ref() == orders_id[b].as_ref()
+                                    }
+                                    OrdersOrderKey::Total => {
+                                        cmp_f64_sort(orders_total[a], orders_total[b])
+                                            == std::cmp::Ordering::Equal
+                                    }
+                                };
+                                if !tied {
+                                    rank = if is_rank { (i + 1) as i64 } else { rank + 1 };
+                                }
+                                out_i64.push(rank);
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                OrdersWinOut::Ints(out_i64)
+            };
+            build(fields, as_field.as_str(), &scratch.flat, out)
+        };
+        if let Ok(Some(res)) = SCRATCH.try_with(|c| {
+            c.try_borrow_mut()
+                .ok()
+                .map(|mut guard| run_with_scratch(&mut guard))
+        }) {
+            return Some(res);
+        }
+        let mut fallback_scratch = OrdersWinScratch::default();
+        Some(run_with_scratch(&mut fallback_scratch))
+    }
+
     pub(super) fn try_window_project_batch(
         &self,
         q: &Query,
         bindings: &BTreeMap<String, Vec<Row>>,
         now: i64,
     ) -> Option<RecordBatch> {
+        if let Some(batch) = self.try_orders_single_window_soa(q, bindings, |fields, as_field, flat, out| {
+            self.build_orders_window_batch(fields, as_field, flat, out)
+        }) {
+            return Some(batch);
+        }
         let Source::Collection(name) = &q.source else {
             return None;
         };
@@ -483,19 +896,6 @@ impl Db {
             ignore_filter: q.ignore_filter,
         };
 #[inline]
-fn cmp_f64_sort(a: f64, b: f64) -> std::cmp::Ordering {
-    match a.partial_cmp(&b) {
-        Some(ord) => ord,
-        None => match (a.is_nan(), b.is_nan()) {
-            (true, true) => std::cmp::Ordering::Equal,
-            (true, false) => std::cmp::Ordering::Greater,
-            (false, true) => std::cmp::Ordering::Less,
-            (false, false) => std::cmp::Ordering::Equal,
-        },
-    }
-}
-
-#[inline]
 fn cmp_col_rows(col: &Column, r1: usize, r2: usize) -> std::cmp::Ordering {
     match col {
         Column::Nulls { .. } => std::cmp::Ordering::Equal,
@@ -549,22 +949,22 @@ fn sort_part_by_col(part: &mut [u32], col: &Column, desc: bool, seq_rows: Option
         Column::Nulls { .. } => {}
         Column::Int { vals, valid } | Column::Time { vals, valid } if valid.null_count() == 0 => {
             if desc {
-                part.sort_by(|&a, &b| {
+                sort_indices_cmp(part, |a, b| {
                     vals[mapped_row(seq_rows, b)].cmp(&vals[mapped_row(seq_rows, a)])
                 });
             } else {
-                part.sort_by(|&a, &b| {
+                sort_indices_cmp(part, |a, b| {
                     vals[mapped_row(seq_rows, a)].cmp(&vals[mapped_row(seq_rows, b)])
                 });
             }
         }
         Column::Float { vals, valid } if valid.null_count() == 0 => {
             if desc {
-                part.sort_by(|&a, &b| {
+                sort_indices_cmp(part, |a, b| {
                     cmp_f64_sort(vals[mapped_row(seq_rows, b)], vals[mapped_row(seq_rows, a)])
                 });
             } else {
-                part.sort_by(|&a, &b| {
+                sort_indices_cmp(part, |a, b| {
                     cmp_f64_sort(vals[mapped_row(seq_rows, a)], vals[mapped_row(seq_rows, b)])
                 });
             }
@@ -578,27 +978,33 @@ fn sort_part_by_col(part: &mut [u32], col: &Column, desc: bool, seq_rows: Option
                 }
             }
             match (seq_rows, desc) {
-                (None, false) => {
-                    part.sort_by(|&a, &b| cmp_cell_fast(&cells[a as usize], &cells[b as usize]))
-                }
-                (None, true) => {
-                    part.sort_by(|&a, &b| cmp_cell_fast(&cells[b as usize], &cells[a as usize]))
-                }
-                (Some(sr), false) => part.sort_by(|&a, &b| {
-                    cmp_cell_fast(&cells[sr[a as usize] as usize], &cells[sr[b as usize] as usize])
+                (None, false) => sort_indices_cmp(part, |a, b| {
+                    cmp_cell_fast(&cells[a as usize], &cells[b as usize])
                 }),
-                (Some(sr), true) => part.sort_by(|&a, &b| {
-                    cmp_cell_fast(&cells[sr[b as usize] as usize], &cells[sr[a as usize] as usize])
+                (None, true) => sort_indices_cmp(part, |a, b| {
+                    cmp_cell_fast(&cells[b as usize], &cells[a as usize])
+                }),
+                (Some(sr), false) => sort_indices_cmp(part, |a, b| {
+                    cmp_cell_fast(
+                        &cells[sr[a as usize] as usize],
+                        &cells[sr[b as usize] as usize],
+                    )
+                }),
+                (Some(sr), true) => sort_indices_cmp(part, |a, b| {
+                    cmp_cell_fast(
+                        &cells[sr[b as usize] as usize],
+                        &cells[sr[a as usize] as usize],
+                    )
                 }),
             }
         }
         _ => {
             if desc {
-                part.sort_by(|&a, &b| {
+                sort_indices_cmp(part, |a, b| {
                     cmp_col_rows(col, mapped_row(seq_rows, b), mapped_row(seq_rows, a))
                 });
             } else {
-                part.sort_by(|&a, &b| {
+                sort_indices_cmp(part, |a, b| {
                     cmp_col_rows(col, mapped_row(seq_rows, a), mapped_row(seq_rows, b))
                 });
             }
