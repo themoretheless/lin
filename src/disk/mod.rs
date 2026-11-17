@@ -144,13 +144,23 @@ struct DiskWalFrameRef<'a> {
 }
 
 #[derive(Clone, Default)]
-struct SegBlockCache<'s> {
-    raw: Option<(u32, &'s [u8], bool)>,
-    decoded: Option<(u32, Arc<[u8]>)>,
+enum SegBlockCache<'s> {
+    #[default]
+    Empty,
+    Raw {
+        bidx: u32,
+        bytes: &'s [u8],
+        utf8_ok: bool,
+    },
+    Decoded {
+        bidx: u32,
+        bytes: Arc<[u8]>,
+        utf8_ok: bool,
+    },
 }
 
-/// Decode one cell of a segment column, reusing the last decoded or checked-raw text block when
-/// consecutive rows fall into the same block.
+/// Decode one cell of a segment column, reusing the last decoded or raw text block (and its cached
+/// block-level UTF-8 status) when consecutive rows fall into the same block.
 #[inline]
 fn read_seg_cell<'s>(
     seg: &'s DiskSegment,
@@ -165,26 +175,43 @@ fn read_seg_cell<'s>(
             Some((bidx, in_off, len)) => {
                 let s_off = in_off as usize;
                 let e_off = s_off + (len as usize);
-                if let Some((lb, raw, utf8_ok)) = cache.raw
-                    && lb == bidx
-                {
-                    let s = columns::MmapTextCol::slice_block_str(raw, utf8_ok, s_off, e_off)?;
-                    return Ok(Cell::from_text(s));
+                match *cache {
+                    SegBlockCache::Raw {
+                        bidx: lb,
+                        bytes,
+                        utf8_ok,
+                    } if lb == bidx => {
+                        let s = columns::MmapTextCol::slice_block_str(bytes, utf8_ok, s_off, e_off)?;
+                        return Ok(Cell::from_text(s));
+                    }
+                    SegBlockCache::Decoded {
+                        bidx: lb,
+                        ref bytes,
+                        utf8_ok,
+                    } if lb == bidx => {
+                        let s = columns::MmapTextCol::slice_block_str(bytes, utf8_ok, s_off, e_off)?;
+                        return Ok(Cell::from_text(s));
+                    }
+                    _ => {}
                 }
                 if let Some((raw, utf8_ok)) = tc.raw_uncompressed_block_checked(bidx)? {
-                    cache.raw = Some((bidx, raw, utf8_ok));
+                    *cache = SegBlockCache::Raw {
+                        bidx,
+                        bytes: raw,
+                        utf8_ok,
+                    };
                     let s = columns::MmapTextCol::slice_block_str(raw, utf8_ok, s_off, e_off)?;
                     return Ok(Cell::from_text(s));
                 }
-                if !matches!(cache.decoded, Some((lb, _)) if lb == bidx) {
-                    cache.decoded = Some((bidx, tc.decode_block(bidx)?));
-                }
-                let block: &[u8] = &cache.decoded.as_ref().unwrap().1;
-                if e_off > block.len() {
-                    return Err(io_err("corrupt in-block text slice"));
-                }
-                let s = std::str::from_utf8(&block[s_off..e_off]).map_err(io_err)?;
-                Cell::from_text(s)
+                let (bytes, utf8_ok) = tc.decode_block_checked(bidx)?;
+                let s = columns::MmapTextCol::slice_block_str(&bytes, utf8_ok, s_off, e_off)?;
+                let cell = Cell::from_text(s);
+                *cache = SegBlockCache::Decoded {
+                    bidx,
+                    bytes,
+                    utf8_ok,
+                };
+                cell
             }
         },
         other => other.get_cell(rid)?,
@@ -3512,49 +3539,54 @@ impl DiskEngine {
                         collected = None;
                     }
                     match project_fields {
+                        Some(["id", "title"])
+                            if seg.col_pos.contains_key("id")
+                                && seg.col_pos.contains_key("title") =>
+                        {
+                            let id_pos = seg.col_pos["id"];
+                            let title_pos = seg.col_pos["title"];
+                            let id_title_shape = crate::store::shape_id_title();
+                            let mut id_block = SegBlockCache::default();
+                            let mut title_block = SegBlockCache::default();
+                            let mut scratch = Row::new();
+                            for rid in matches {
+                                let c0 = read_seg_cell(seg, id_pos, rid, &mut id_block)?;
+                                let c1 = read_seg_cell(seg, title_pos, rid, &mut title_block)?;
+                                if !matches!(c0, Cell::Null) && !matches!(c1, Cell::Null) {
+                                    scratch.set_pair_with_shape(id_title_shape, c0, c1);
+                                } else {
+                                    scratch.clear();
+                                    if !matches!(c0, Cell::Null) {
+                                        scratch.insert("id".to_string(), c0);
+                                    }
+                                    if !matches!(c1, Cell::Null) {
+                                        scratch.insert("title".to_string(), c1);
+                                    }
+                                }
+                                if let Some(buf) = collected.as_mut() {
+                                    if buf.len() < max_cached_rows {
+                                        buf.push(scratch.clone());
+                                    } else {
+                                        collected = None;
+                                    }
+                                }
+                                if !visit(&scratch)? {
+                                    return Ok(());
+                                }
+                            }
+                        }
                         Some(fs) => {
                             let col_indices: Vec<(&str, usize)> = fs
                                 .iter()
                                 .filter_map(|&f| seg.col_pos.get(f).map(|&p| (f, p)))
                                 .collect();
-                            let mut last_blocks: Vec<Option<(u32, Arc<[u8]>)>> =
-                                vec![None; col_indices.len()];
+                            let mut blocks: Vec<SegBlockCache<'_>> =
+                                vec![SegBlockCache::default(); col_indices.len()];
                             let mut scratch = Row::new();
                             for rid in matches {
                                 scratch.clear();
                                 for (ci, &(fname, pos)) in col_indices.iter().enumerate() {
-                                    let cell = match &seg.cols[pos].1 {
-                                        MmapCol::Text(tc) => match tc.get_loc(rid) {
-                                            None => Cell::Null,
-                                            Some((_, _, 0)) => {
-                                                Cell::SmallText(InlineStr::new_truncate(""))
-                                            }
-                                            Some((bidx, in_off, len)) => {
-                                                let block = match &last_blocks[ci] {
-                                                    Some((lb, arc)) if *lb == bidx => {
-                                                        Arc::clone(arc)
-                                                    }
-                                                    _ => {
-                                                        let decoded = tc.decode_block(bidx)?;
-                                                        last_blocks[ci] =
-                                                            Some((bidx, Arc::clone(&decoded)));
-                                                        decoded
-                                                    }
-                                                };
-                                                let s_off = in_off as usize;
-                                                let e_off = s_off + (len as usize);
-                                                if e_off > block.len() {
-                                                    return Err(io_err(
-                                                        "corrupt in-block text slice",
-                                                    ));
-                                                }
-                                                let s = std::str::from_utf8(&block[s_off..e_off])
-                                                    .map_err(io_err)?;
-                                                Cell::from_text(s)
-                                            }
-                                        },
-                                        other => other.get_cell(rid)?,
-                                    };
+                                    let cell = read_seg_cell(seg, pos, rid, &mut blocks[ci])?;
                                     if !matches!(cell, Cell::Null) {
                                         scratch.insert(fname.to_string(), cell);
                                     }
@@ -5946,34 +5978,84 @@ impl DiskEngine {
                 && self.segments.get(table).is_none_or(|s| s.len() <= 1)
             {
                 if project_fields == Some(&["id", "title"]) {
-                    let mut recycled =
-                        crate::store::take_recycled_id_title_vec().unwrap_or_default();
+                    let shape = crate::store::shape_id_title();
+                    let mut out = crate::store::take_recycled_id_title_vec()
+                        .or_else(crate::store::take_general_rows)
+                        .unwrap_or_else(|| {
+                            Vec::with_capacity((self.count_table(table) / 2).clamp(64, 65_536))
+                        });
+                    let mut written = 0usize;
                     self.for_each_by_eq_projected(
                         table,
                         &idx_field,
                         &keys[0],
                         project_fields,
                         |row| {
-                            if let Some(mut slot) = recycled.pop()
-                                && slot.contains_key("id")
-                                && slot.contains_key("title")
-                                && let Some(id_val) = row.get("id")
-                                && let Some(title_val) = row.get("title")
+                            let pair = if row.shape_arc().is_some_and(|s| {
+                                Arc::ptr_eq(s, shape) || s.names() == ["id", "title"]
+                            }) && let [c0, c1] = row.cells_slice()
                             {
-                                *slot.get_mut("id").unwrap() = id_val.clone_for_borrow();
-                                *slot.get_mut("title").unwrap() = title_val.clone_for_borrow();
-                                out.push(slot);
+                                Some((c0, c1))
+                            } else if row.len() == 2
+                                && let Some(c0) = row.get("id")
+                                && let Some(c1) = row.get("title")
+                            {
+                                Some((c0, c1))
+                            } else {
+                                None
+                            };
+                            if let Some((id_val, title_val)) = pair {
+                                if written < out.len() {
+                                    let same = out[written]
+                                        .shape_arc()
+                                        .is_some_and(|s| Arc::ptr_eq(s, shape))
+                                        && match (out[written].cells_slice(), id_val, title_val) {
+                                            (
+                                                [Cell::SmallText(a0), Cell::SmallText(a1)],
+                                                Cell::SmallText(b0),
+                                                Cell::SmallText(b1),
+                                            ) => a0 == b0 && a1 == b1,
+                                            (
+                                                [Cell::SmallText(a0), Cell::Text(a1)],
+                                                Cell::SmallText(b0),
+                                                Cell::Text(b1),
+                                            ) => a0 == b0 && Arc::ptr_eq(a1, b1),
+                                            (
+                                                [Cell::Text(a0), Cell::Text(a1)],
+                                                Cell::Text(b0),
+                                                Cell::Text(b1),
+                                            ) => Arc::ptr_eq(a0, b0) && Arc::ptr_eq(a1, b1),
+                                            _ => false,
+                                        };
+                                    if !same {
+                                        out[written].set_pair_with_shape(
+                                            shape,
+                                            id_val.clone_for_borrow(),
+                                            title_val.clone_for_borrow(),
+                                        );
+                                    }
+                                } else {
+                                    out.push(Row::from_parts(
+                                        Arc::clone(shape),
+                                        [id_val.clone_for_borrow(), title_val.clone_for_borrow()],
+                                    ));
+                                }
+                            } else if written < out.len() {
+                                out[written] = row.clone();
                             } else {
                                 out.push(row.clone());
                             }
+                            written += 1;
                             if let Some(lim) = limit
-                                && out.len() >= lim
+                                && written >= lim
                             {
                                 return Ok(false);
                             }
                             Ok(true)
                         },
                     )?;
+                    out.truncate(written);
+                    return Ok(out);
                 } else {
                     self.for_each_by_eq_projected(
                         table,
@@ -6102,7 +6184,11 @@ impl DiskEngine {
             // Rows handed back by a previous result of the same shape keep their backing Vec and
             // precomputed Shape, so refilling in place avoids Vec reallocations and key lookups.
             let mut out = if fs == ["id", "title"] {
-                crate::store::take_recycled_id_title_vec().unwrap_or_default()
+                crate::store::take_recycled_id_title_vec()
+                    .or_else(crate::store::take_general_rows)
+                    .unwrap_or_else(|| {
+                        Vec::with_capacity((self.count_table(table) / 2).clamp(64, 65_536))
+                    })
             } else {
                 out
             };

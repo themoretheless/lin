@@ -592,44 +592,37 @@ impl Db {
             return Vec::new();
         }
         let n = vectors.len();
-        if n >= 8192 {
-            let threads = std::thread::available_parallelism()
-                .map(|p| p.get())
-                .unwrap_or(1)
-                .min(8);
-            let chunk_size = n.div_ceil(threads);
-            std::thread::scope(|scope| {
-                let mut handles = Vec::with_capacity(threads);
-                for chunk in vectors.chunks(chunk_size) {
-                    handles.push(scope.spawn(move || {
-                        let mut local = Vec::with_capacity(chunk.len());
-                        for &(i, v) in chunk {
-                            let score = crate::embed::cosine_with_q_norm(qv, q_norm, v);
-                            if score > 0.01 {
-                                local.push((score, i));
-                            }
+        #[cfg(feature = "parallel")]
+        if n >= 16_384 {
+            use rayon::prelude::*;
+            let parts: Vec<Vec<(f64, usize)>> = vectors
+                .par_chunks(4096)
+                .map(|chunk| {
+                    let mut local = Vec::with_capacity(chunk.len());
+                    for &(i, v) in chunk {
+                        let score = crate::embed::cosine_with_q_norm(qv, q_norm, v);
+                        if score > 0.01 {
+                            local.push((score, i));
                         }
-                        local
-                    }));
-                }
-                let mut all = Vec::with_capacity(n);
-                for handle in handles {
-                    if let Ok(part) = handle.join() {
-                        all.extend(part);
                     }
-                }
-                all
-            })
-        } else {
-            let mut all = Vec::with_capacity(n);
-            for &(i, v) in vectors {
-                let score = crate::embed::cosine_with_q_norm(qv, q_norm, v);
-                if score > 0.01 {
-                    all.push((score, i));
-                }
+                    local
+                })
+                .collect();
+            let total: usize = parts.iter().map(Vec::len).sum();
+            let mut all = Vec::with_capacity(total);
+            for p in parts {
+                all.extend(p);
             }
-            all
+            return all;
         }
+        let mut all = Vec::with_capacity(n);
+        for &(i, v) in vectors {
+            let score = crate::embed::cosine_with_q_norm(qv, q_norm, v);
+            if score > 0.01 {
+                all.push((score, i));
+            }
+        }
+        all
     }
 
     pub(super) fn search_rows(

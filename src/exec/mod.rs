@@ -2416,6 +2416,217 @@ impl Db {
         Ok(())
     }
 
+    #[inline]
+    pub(crate) fn can_fast_docs_wing_update(&self, pu: &prepared::PointUpdatePlan) -> bool {
+        pu.is_docs_wing_only
+            && !self.is_durable()
+            && !self.store.is_disk_backed(&pu.collection)
+            && (pu.cas.is_some() || pu.cas_each)
+            && (self.catalog.guards.is_empty()
+                || !self
+                    .catalog
+                    .guards
+                    .iter()
+                    .any(|g| g.collection == "docs" && g.field == "wing"))
+            && (self.catalog.fks.is_empty()
+                || !self.catalog.fks.iter().any(|fk| fk.from_col == "docs"))
+            && (self.store.fts.is_empty()
+                || !self
+                    .store
+                    .fts
+                    .get("docs")
+                    .is_some_and(|f| f.fields.iter().any(|fld| fld == "wing")))
+    }
+
+    #[inline]
+    pub(crate) fn exec_docs_wing_update_core(
+        &mut self,
+        pu: &prepared::PointUpdatePlan,
+        idx: usize,
+        want_rows: bool,
+        tx_mode: bool,
+    ) -> Result<(Option<Cell>, Vec<Row>), Error> {
+        let Store {
+            collections,
+            docs_wing,
+            indexes,
+            retired_cells,
+            deferred_doc_wing_updates,
+            ..
+        } = &mut self.store;
+        let docs_col = collections.get_mut(&pu.collection).unwrap();
+        let defer_wing_idx = docs_col.len() >= 64;
+        let large_table = docs_col.len() >= 512;
+        let row = &mut docs_col[idx];
+        if !pu.cas_each {
+            let got = row_text(row, "hash").unwrap_or("");
+            let cas = pu.cas.as_deref().unwrap_or("");
+            if got != cas {
+                return Err(Error::runtime(format!(
+                    "cas mismatch: expected {cas:?}, found {got:?}"
+                )));
+            }
+        }
+        let mut dyn_arc: Option<Arc<str>> = None;
+        let new_cell = if let Some((c, _)) = &pu.const_wing {
+            c.clone()
+        } else {
+            let now = if value_needs_now(&pu.record.fields[0].1) {
+                now_ms()
+            } else {
+                0
+            };
+            let cell = value_cell(&pu.record.fields[0].1, now);
+            dyn_arc = Some(cell.text_shared().unwrap_or_default());
+            cell
+        };
+        let wing_str: &str = if let Some((_, a)) = &pu.const_wing {
+            a.as_ref()
+        } else {
+            dyn_arc.as_deref().unwrap_or("")
+        };
+        let mut has_complex_idx = false;
+        let mut has_unique_idx = false;
+        let mut needs_ts = false;
+        for live_idx in indexes.values() {
+            if live_idx.def.collection == pu.collection {
+                if live_idx.def.unique {
+                    has_unique_idx = true;
+                }
+                if live_idx.def.pred.is_none()
+                    && live_idx.def.fields.len() == 1
+                    && live_idx.def.fields[0] == "wing"
+                {
+                    // simple wing index
+                } else if live_idx.def.pred.is_none()
+                    && live_idx.def.fields.len() == 2
+                    && live_idx.def.fields[0] == "wing"
+                    && live_idx.def.fields[1] == "ts"
+                {
+                    needs_ts = true;
+                } else if live_idx.def.pred.is_some()
+                    || live_idx.def.fields.iter().any(|f| f == "wing")
+                {
+                    has_complex_idx = true;
+                    break;
+                }
+            }
+        }
+        let mut old_keys: smallvec::SmallVec<[crate::index::IndexKey; 4]> =
+            smallvec::SmallVec::new();
+        if has_complex_idx {
+            for live_idx in indexes.values() {
+                if live_idx.def.collection == pu.collection {
+                    old_keys.push(live_idx.key_of(row));
+                }
+            }
+        }
+        let ts_cell = if !has_complex_idx && needs_ts {
+            row.get("ts").cloned().unwrap_or(Cell::Null)
+        } else {
+            Cell::Null
+        };
+        let prev_cell = if let Some(slot) = row.get_mut("wing") {
+            Some(std::mem::replace(slot, new_cell))
+        } else {
+            row.insert("wing".to_string(), new_cell)
+        };
+        let same_wing = prev_cell
+            .as_ref()
+            .and_then(Cell::text)
+            .is_some_and(|s| s == wing_str);
+        if has_complex_idx {
+            let mut key_iter = old_keys.into_iter();
+            for live_idx in indexes.values_mut() {
+                if live_idx.def.collection == pu.collection {
+                    let old_k = key_iter.next();
+                    let new_k = Some(live_idx.key_of(row));
+                    if let Err(e) = live_idx.update_keys(idx, old_k, new_k) {
+                        if let Some(prev) = prev_cell {
+                            row.insert("wing".to_string(), prev);
+                        } else {
+                            row.remove("wing");
+                        }
+                        return Err(Error::runtime(e));
+                    }
+                }
+            }
+        } else if !same_wing {
+            if defer_wing_idx
+                && !has_unique_idx
+                && deferred_doc_wing_updates.len() < deferred_doc_wing_updates.inline_size()
+            {
+                let new_wing = match &pu.const_wing {
+                    Some((_, a)) => Arc::clone(a),
+                    None => dyn_arc.as_ref().map(Arc::clone).unwrap_or_default(),
+                };
+                deferred_doc_wing_updates.push(crate::store::DeferredDocWingUpdate {
+                    idx,
+                    prev_wing: prev_cell.clone().unwrap_or(Cell::Null),
+                    new_wing,
+                    ts: ts_cell,
+                });
+            } else {
+                let new_wing_cell = row.get("wing").unwrap_or(&Cell::Null);
+                for live_idx in indexes.values_mut() {
+                    if live_idx.def.collection == pu.collection {
+                        if live_idx.def.fields.len() == 1 && live_idx.def.fields[0] == "wing" {
+                            let old_k = Some(crate::index::LiveIndex::single_cell_key(
+                                prev_cell.as_ref().unwrap_or(&Cell::Null),
+                            ));
+                            let new_k = Some(crate::index::LiveIndex::single_cell_key(new_wing_cell));
+                            if let Err(e) = live_idx.update_keys(idx, old_k, new_k) {
+                                if let Some(prev) = prev_cell {
+                                    row.insert("wing".to_string(), prev);
+                                } else {
+                                    row.remove("wing");
+                                }
+                                return Err(Error::runtime(e));
+                            }
+                        } else if live_idx.def.fields.len() == 2
+                            && live_idx.def.fields[0] == "wing"
+                            && live_idx.def.fields[1] == "ts"
+                        {
+                            let old_k = Some(crate::index::LiveIndex::two_cell_key(
+                                prev_cell.as_ref().unwrap_or(&Cell::Null),
+                                &ts_cell,
+                            ));
+                            let new_k = Some(crate::index::LiveIndex::two_cell_key(
+                                new_wing_cell,
+                                &ts_cell,
+                            ));
+                            if let Err(e) = live_idx.update_keys(idx, old_k, new_k) {
+                                if let Some(prev) = prev_cell {
+                                    row.insert("wing".to_string(), prev);
+                                } else {
+                                    row.remove("wing");
+                                }
+                                return Err(Error::runtime(e));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !same_wing && idx < docs_wing.len() {
+            docs_wing.set_str(idx, wing_str);
+        }
+        if tx_mode {
+            return Ok((prev_cell, Vec::new()));
+        }
+        let out_rows = if !want_rows || large_table {
+            if let Some(prev) = prev_cell
+                && retired_cells.len() < retired_cells.inline_size()
+            {
+                retired_cells.push(prev);
+            }
+            Vec::new()
+        } else {
+            vec![row.clone()]
+        };
+        Ok((None, out_rows))
+    }
+
     fn run_prepared_ext(&mut self, prepared: &Prepared, want_rows: bool) -> Result<Handle, Error> {
         if let Some(pg) = &prepared.point_get {
             if !self.store.fts_deferred_doc_swaps.is_empty()
@@ -2633,188 +2844,9 @@ impl Db {
                     None => return Err(Error::runtime("update: no matching row")),
                 }
             };
-            if pu.is_docs_wing_only
-                && !self.is_durable()
-                && !self
-                    .catalog
-                    .guards
-                    .iter()
-                    .any(|g| g.collection == "docs" && g.field == "wing")
-                && !self.catalog.fks.iter().any(|fk| fk.from_col == "docs")
-                && !self
-                    .store
-                    .fts
-                    .get("docs")
-                    .is_some_and(|f| f.fields.iter().any(|fld| fld == "wing"))
-            {
-                let Store {
-                    collections,
-                    indexes,
-                    retired_cells,
-                    deferred_doc_wing_updates,
-                    ..
-                } = &mut self.store;
-                let docs_col = collections.get_mut(&pu.collection).unwrap();
-                let defer_wing_idx = docs_col.len() >= 64;
-                let large_table = docs_col.len() >= 512;
-                let row = &mut docs_col[idx];
-                if !pu.cas_each {
-                    let got = row_text(row, "hash").unwrap_or("");
-                    let cas = pu.cas.as_deref().unwrap_or("");
-                    if got != cas {
-                        return Err(Error::runtime(format!(
-                            "cas mismatch: expected {cas:?}, found {got:?}"
-                        )));
-                    }
-                }
-                let (new_cell, wing_arc) = if let Some((c, a)) = &pu.const_wing {
-                    (c.clone(), Arc::clone(a))
-                } else {
-                    let now = if value_needs_now(&pu.record.fields[0].1) {
-                        now_ms()
-                    } else {
-                        0
-                    };
-                    let cell = value_cell(&pu.record.fields[0].1, now);
-                    let arc = cell.text_shared().unwrap_or_default();
-                    (cell, arc)
-                };
-                let mut has_complex_idx = false;
-                let mut has_unique_idx = false;
-                let mut needs_ts = false;
-                for live_idx in indexes.values() {
-                    if live_idx.def.collection == pu.collection {
-                        if live_idx.def.unique {
-                            has_unique_idx = true;
-                        }
-                        if live_idx.def.pred.is_none()
-                            && live_idx.def.fields.len() == 1
-                            && live_idx.def.fields[0] == "wing"
-                        {
-                            // simple wing index
-                        } else if live_idx.def.pred.is_none()
-                            && live_idx.def.fields.len() == 2
-                            && live_idx.def.fields[0] == "wing"
-                            && live_idx.def.fields[1] == "ts"
-                        {
-                            needs_ts = true;
-                        } else if live_idx.def.pred.is_some()
-                            || live_idx.def.fields.iter().any(|f| f == "wing")
-                        {
-                            has_complex_idx = true;
-                            break;
-                        }
-                    }
-                }
-                let mut old_keys: smallvec::SmallVec<[crate::index::IndexKey; 4]> =
-                    smallvec::SmallVec::new();
-                if has_complex_idx {
-                    for live_idx in indexes.values() {
-                        if live_idx.def.collection == pu.collection {
-                            old_keys.push(live_idx.key_of(row));
-                        }
-                    }
-                }
-                let ts_cell = if !has_complex_idx && needs_ts {
-                    row.get("ts").cloned().unwrap_or(Cell::Null)
-                } else {
-                    Cell::Null
-                };
-                let prev_cell = if let Some(slot) = row.get_mut("wing") {
-                    Some(std::mem::replace(slot, new_cell))
-                } else {
-                    row.insert("wing".to_string(), new_cell)
-                };
-                let same_wing = prev_cell
-                    .as_ref()
-                    .and_then(Cell::text)
-                    .is_some_and(|s| s == wing_arc.as_ref());
-                if has_complex_idx {
-                    let mut key_iter = old_keys.into_iter();
-                    for live_idx in indexes.values_mut() {
-                        if live_idx.def.collection == pu.collection {
-                            let old_k = key_iter.next();
-                            let new_k = Some(live_idx.key_of(row));
-                            if let Err(e) = live_idx.update_keys(idx, old_k, new_k) {
-                                if let Some(prev) = prev_cell {
-                                    row.insert("wing".to_string(), prev);
-                                } else {
-                                    row.remove("wing");
-                                }
-                                return Err(Error::runtime(e));
-                            }
-                        }
-                    }
-                } else if !same_wing {
-                    if defer_wing_idx
-                        && !has_unique_idx
-                        && deferred_doc_wing_updates.len()
-                            < deferred_doc_wing_updates.inline_size()
-                    {
-                        deferred_doc_wing_updates.push(crate::store::DeferredDocWingUpdate {
-                            idx,
-                            prev_wing: prev_cell.clone().unwrap_or(Cell::Null),
-                            new_wing: Arc::clone(&wing_arc),
-                            ts: ts_cell,
-                        });
-                    } else {
-                        for live_idx in indexes.values_mut() {
-                            if live_idx.def.collection == pu.collection {
-                                if live_idx.def.fields.len() == 1
-                                    && live_idx.def.fields[0] == "wing"
-                                {
-                                    let old_k = Some(crate::index::LiveIndex::single_cell_key(
-                                        prev_cell.as_ref().unwrap_or(&Cell::Null),
-                                    ));
-                                    let new_k = Some(crate::index::LiveIndex::single_cell_key(
-                                        &Cell::Text(Arc::clone(&wing_arc)),
-                                    ));
-                                    if let Err(e) = live_idx.update_keys(idx, old_k, new_k) {
-                                        if let Some(prev) = prev_cell {
-                                            row.insert("wing".to_string(), prev);
-                                        } else {
-                                            row.remove("wing");
-                                        }
-                                        return Err(Error::runtime(e));
-                                    }
-                                } else if live_idx.def.fields.len() == 2
-                                    && live_idx.def.fields[0] == "wing"
-                                    && live_idx.def.fields[1] == "ts"
-                                {
-                                    let old_k = Some(crate::index::LiveIndex::two_cell_key(
-                                        prev_cell.as_ref().unwrap_or(&Cell::Null),
-                                        &ts_cell,
-                                    ));
-                                    let new_k = Some(crate::index::LiveIndex::two_cell_key(
-                                        &Cell::Text(Arc::clone(&wing_arc)),
-                                        &ts_cell,
-                                    ));
-                                    if let Err(e) = live_idx.update_keys(idx, old_k, new_k) {
-                                        if let Some(prev) = prev_cell {
-                                            row.insert("wing".to_string(), prev);
-                                        } else {
-                                            row.remove("wing");
-                                        }
-                                        return Err(Error::runtime(e));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                let out_rows = if !want_rows || large_table {
-                    if let Some(prev) = prev_cell
-                        && retired_cells.len() < retired_cells.inline_size()
-                    {
-                        retired_cells.push(prev);
-                    }
-                    Vec::new()
-                } else {
-                    vec![row.clone()]
-                };
-                if !same_wing {
-                    self.store.sync_docs_wing_only(idx, wing_arc);
-                }
+            if self.can_fast_docs_wing_update(pu) {
+                let (_, out_rows) =
+                    self.exec_docs_wing_update_core(pu, idx, want_rows, false)?;
                 self.store.r#gen += 1;
                 return Ok(Handle {
                     plan: Arc::clone(&prepared.plan),

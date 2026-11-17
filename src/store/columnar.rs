@@ -157,6 +157,17 @@ impl DictColumn {
     }
 
     #[inline]
+    pub fn set_str(&mut self, i: usize, val: &str) {
+        if self.spilled.is_none()
+            && let Some(pos) = self.dict.iter().position(|x| x.as_ref() == val)
+        {
+            self.indices[i] = pos as u8;
+            return;
+        }
+        self.set(i, super::value::intern_wing_str(val));
+    }
+
+    #[inline]
     pub fn swap_remove(&mut self, i: usize) -> Arc<str> {
         if let Some(spilled) = &mut self.spilled {
             spilled.swap_remove(i)

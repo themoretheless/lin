@@ -316,7 +316,7 @@ pub struct Store {
     docs_title_packed: OnceLock<(Vec<u8>, bool)>,
     pub(crate) docs_epoch: u64,
     docs_layer: DictColumn,
-    docs_wing: DictColumn,
+    pub(crate) docs_wing: DictColumn,
     last_doc_id_idx: std::sync::atomic::AtomicUsize,
     pub(crate) docs_moved_ids: smallvec::SmallVec<[(Arc<str>, usize); 16]>,
     pub(crate) docs_moved_idxs: smallvec::SmallVec<[(usize, usize); 16]>,
@@ -3645,6 +3645,13 @@ impl Store {
     pub fn sync_docs_wing_only(&mut self, idx: usize, wing: Arc<str>) {
         if idx < self.docs_wing.len() {
             self.docs_wing.set(idx, intern_wing(wing));
+        }
+    }
+
+    #[inline]
+    pub fn sync_docs_wing_str(&mut self, idx: usize, wing: &str) {
+        if idx < self.docs_wing.len() {
+            self.docs_wing.set_str(idx, wing);
         }
     }
 

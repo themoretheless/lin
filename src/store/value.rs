@@ -99,8 +99,8 @@ pub(crate) fn take_recycled_id_title_vec() -> Option<Vec<Row>> {
 }
 
 thread_local! {
-    static SINGLE_ID_TITLE_VEC: std::cell::RefCell<Option<Vec<Row>>> =
-        const { std::cell::RefCell::new(None) };
+    static SINGLE_ID_TITLE_VEC: std::cell::Cell<Vec<Row>> =
+        const { std::cell::Cell::new(Vec::new()) };
     static GENERAL_ROW_VEC_POOL: std::cell::RefCell<Option<Vec<Row>>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -108,24 +108,17 @@ thread_local! {
 #[inline]
 pub fn release_single_id_title_vec(rows: Vec<Row>) {
     if rows.len() == 1 {
-        let _ = SINGLE_ID_TITLE_VEC.try_with(|cell| {
-            if let Ok(mut slot) = cell.try_borrow_mut() {
-                *slot = Some(rows);
-            }
-        });
+        let _ = SINGLE_ID_TITLE_VEC.try_with(|cell| cell.set(rows));
     }
 }
 
 #[inline]
 pub(crate) fn take_single_id_title_vec_with_arcs(id: &Arc<str>, title: &Arc<str>) -> Vec<Row> {
-    let shape = shape_id_title();
-    let reused = SINGLE_ID_TITLE_VEC
-        .try_with(|cell| cell.try_borrow_mut().ok().and_then(|mut s| s.take()))
-        .ok()
-        .flatten();
-    if let Some(mut v) = reused
-        && v.len() == 1
-    {
+    let mut v = SINGLE_ID_TITLE_VEC
+        .try_with(|cell| cell.take())
+        .unwrap_or_default();
+    if v.len() == 1 {
+        let shape = shape_id_title();
         let r0 = &mut v[0];
         let matches = r0.shape_arc().is_some_and(|s| Arc::ptr_eq(s, shape))
             && match r0.cells_slice() {
@@ -146,11 +139,10 @@ pub(crate) fn take_single_id_title_vec_with_arcs(id: &Arc<str>, title: &Arc<str>
 
 #[inline]
 pub(crate) fn wrap_single_row_vec(row: Row) -> Vec<Row> {
-    let reused = SINGLE_ID_TITLE_VEC
-        .try_with(|cell| cell.try_borrow_mut().ok().and_then(|mut s| s.take()))
-        .ok()
-        .flatten();
-    if let Some(mut v) = reused {
+    let mut v = SINGLE_ID_TITLE_VEC
+        .try_with(|cell| cell.take())
+        .unwrap_or_default();
+    if v.capacity() >= 1 {
         v.clear();
         v.push(row);
         return v;
@@ -657,20 +649,34 @@ pub fn row_text<'a>(row: &'a Row, key: &str) -> Option<&'a str> {
 }
 
 #[inline]
-pub(crate) fn intern_wing(wing: Arc<str>) -> Arc<str> {
+fn intern_known_wing(wing: &str) -> Option<Arc<str>> {
     static WING_RAG: std::sync::LazyLock<Arc<str>> = std::sync::LazyLock::new(|| Arc::from("rag"));
     static WING_SYS: std::sync::LazyLock<Arc<str>> = std::sync::LazyLock::new(|| Arc::from("sys"));
     static WING_CORE: std::sync::LazyLock<Arc<str>> =
         std::sync::LazyLock::new(|| Arc::from("core"));
     static WING_TEST: std::sync::LazyLock<Arc<str>> =
         std::sync::LazyLock::new(|| Arc::from("test"));
-    match wing.as_ref() {
-        "rag" => Arc::clone(&WING_RAG),
-        "sys" => Arc::clone(&WING_SYS),
-        "core" => Arc::clone(&WING_CORE),
-        "test" => Arc::clone(&WING_TEST),
-        _ => wing,
+    match wing {
+        "rag" => Some(Arc::clone(&WING_RAG)),
+        "sys" => Some(Arc::clone(&WING_SYS)),
+        "core" => Some(Arc::clone(&WING_CORE)),
+        "test" => Some(Arc::clone(&WING_TEST)),
+        _ => None,
     }
+}
+
+#[inline]
+pub(crate) fn intern_wing(wing: Arc<str>) -> Arc<str> {
+    intern_known_wing(wing.as_ref()).unwrap_or(wing)
+}
+
+#[inline]
+pub(crate) fn intern_wing_str(wing: &str) -> Arc<str> {
+    static EMPTY: std::sync::LazyLock<Arc<str>> = std::sync::LazyLock::new(|| Arc::from(""));
+    if wing.is_empty() {
+        return Arc::clone(&EMPTY);
+    }
+    intern_known_wing(wing).unwrap_or_else(|| Arc::from(wing))
 }
 
 pub(super) fn docs_hot_field(f: &str) -> bool {

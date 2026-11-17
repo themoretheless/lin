@@ -1205,22 +1205,118 @@ impl Db {
                 .map(|p| std::mem::take(&mut p.encode_buf))
                 .unwrap_or_default();
             let built_ref: &[Row] = &built;
-            let (maint_res, direct_res) = std::thread::scope(|s| {
-                let enc_handle = s.spawn(move || {
-                    let res = crate::persist::encode_insert_rows_direct_ext(
-                        generation,
-                        next_id,
-                        collection,
-                        built_ref,
-                        uniform_keys,
-                        &mut encode_buf,
-                    );
-                    (res, encode_buf)
-                });
-                let maint = self.maintain_insert_slab(collection, start, built_ref);
-                let (res, buf) = enc_handle.join().unwrap_or((None, Vec::new()));
-                (maint, (res, buf))
+            struct DirectEncJob {
+                generation: u64,
+                next_id: u64,
+                col_ptr: usize,
+                col_len: usize,
+                rows_ptr: usize,
+                rows_len: usize,
+                uniform_keys: bool,
+                encode_buf: Vec<u8>,
+            }
+            struct DirectEncPool {
+                tx: std::sync::mpsc::SyncSender<DirectEncJob>,
+                done_rx: std::sync::mpsc::Receiver<(Option<([u8; 4], Vec<String>)>, Vec<u8>)>,
+            }
+            static DIRECT_ENC_POOL: std::sync::OnceLock<std::sync::Mutex<Option<DirectEncPool>>> =
+                std::sync::OnceLock::new();
+            let pool_mutex = DIRECT_ENC_POOL.get_or_init(|| {
+                let (tx, rx) = std::sync::mpsc::sync_channel::<DirectEncJob>(1);
+                let (done_tx, done_rx) =
+                    std::sync::mpsc::sync_channel::<(Option<([u8; 4], Vec<String>)>, Vec<u8>)>(1);
+                let spawned = std::thread::Builder::new()
+                    .name("lin-direct-enc".into())
+                    .spawn(move || {
+                        while let Ok(mut job) = rx.recv() {
+                            // SAFETY: sender drains `done_rx` (via `DirectEncDrain`) before
+                            // releasing `collection` or `built_ref`.
+                            let col = unsafe {
+                                std::str::from_utf8_unchecked(std::slice::from_raw_parts(
+                                    job.col_ptr as *const u8,
+                                    job.col_len,
+                                ))
+                            };
+                            let rows = unsafe {
+                                std::slice::from_raw_parts(
+                                    job.rows_ptr as *const Row,
+                                    job.rows_len,
+                                )
+                            };
+                            let res = crate::persist::encode_insert_rows_direct_ext(
+                                job.generation,
+                                job.next_id,
+                                col,
+                                rows,
+                                job.uniform_keys,
+                                &mut job.encode_buf,
+                            );
+                            let _ = done_tx.send((res, job.encode_buf));
+                        }
+                    });
+                if spawned.is_ok() {
+                    std::sync::Mutex::new(Some(DirectEncPool { tx, done_rx }))
+                } else {
+                    std::sync::Mutex::new(None)
+                }
             });
+            let (maint_res, direct_res) = if let Ok(guard) = pool_mutex.try_lock()
+                && let Some(pool) = guard.as_ref()
+            {
+                struct DirectEncDrain<'a>(
+                    &'a std::sync::mpsc::Receiver<(Option<([u8; 4], Vec<String>)>, Vec<u8>)>,
+                    bool,
+                );
+                impl Drop for DirectEncDrain<'_> {
+                    fn drop(&mut self) {
+                        if self.1 {
+                            let _ = self.0.recv();
+                        }
+                    }
+                }
+                let job = DirectEncJob {
+                    generation,
+                    next_id,
+                    col_ptr: collection.as_ptr() as usize,
+                    col_len: collection.len(),
+                    rows_ptr: built_ref.as_ptr() as usize,
+                    rows_len: built_ref.len(),
+                    uniform_keys,
+                    encode_buf,
+                };
+                match pool.tx.send(job) {
+                    Ok(()) => {
+                        let mut drain = DirectEncDrain(&pool.done_rx, true);
+                        let maint = self.maintain_insert_slab(collection, start, built_ref);
+                        drain.1 = false;
+                        let direct = pool.done_rx.recv().unwrap_or((None, Vec::new()));
+                        (maint, direct)
+                    }
+                    Err(std::sync::mpsc::SendError(mut job)) => {
+                        let maint = self.maintain_insert_slab(collection, start, built_ref);
+                        let res = crate::persist::encode_insert_rows_direct_ext(
+                            generation,
+                            next_id,
+                            collection,
+                            built_ref,
+                            uniform_keys,
+                            &mut job.encode_buf,
+                        );
+                        (maint, (res, job.encode_buf))
+                    }
+                }
+            } else {
+                let maint = self.maintain_insert_slab(collection, start, built_ref);
+                let res = crate::persist::encode_insert_rows_direct_ext(
+                    generation,
+                    next_id,
+                    collection,
+                    built_ref,
+                    uniform_keys,
+                    &mut encode_buf,
+                );
+                (maint, (res, encode_buf))
+            };
             if let Some(p) = self.persist.as_mut() {
                 p.encode_buf = direct_res.1;
             }

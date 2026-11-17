@@ -178,6 +178,21 @@ impl MmapTextCol {
     }
 
     #[inline]
+    fn is_block_utf8_ok(&self, block_idx: u32, bytes: &[u8]) -> bool {
+        let Some(state) = self.utf8_state.get(block_idx as usize) else {
+            return std::str::from_utf8(bytes).is_ok();
+        };
+        let st = state.load(Ordering::Relaxed);
+        if st == 0 {
+            let valid = std::str::from_utf8(bytes).is_ok();
+            state.store(if valid { 1 } else { 2 }, Ordering::Relaxed);
+            valid
+        } else {
+            st == 1
+        }
+    }
+
+    #[inline]
     pub(crate) fn raw_uncompressed_block_checked(
         &self,
         block_idx: u32,
@@ -185,16 +200,18 @@ impl MmapTextCol {
         let Some(raw) = self.raw_uncompressed_block(block_idx)? else {
             return Ok(None);
         };
-        let state = &self.utf8_state[block_idx as usize];
-        let st = state.load(Ordering::Relaxed);
-        let ok = if st == 0 {
-            let valid = std::str::from_utf8(raw).is_ok();
-            state.store(if valid { 1 } else { 2 }, Ordering::Relaxed);
-            valid
-        } else {
-            st == 1
-        };
+        let ok = self.is_block_utf8_ok(block_idx, raw);
         Ok(Some((raw, ok)))
+    }
+
+    #[inline]
+    pub(crate) fn decode_block_checked(
+        &self,
+        block_idx: u32,
+    ) -> Result<(Arc<[u8]>, bool), Error> {
+        let bytes = self.decode_block(block_idx)?;
+        let ok = self.is_block_utf8_ok(block_idx, &bytes);
+        Ok((bytes, ok))
     }
 
     #[inline]
