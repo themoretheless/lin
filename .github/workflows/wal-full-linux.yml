@@ -1,0 +1,37 @@
+name: WAL FULL Linux baseline
+on:
+  push:
+    branches: [codex/wal-full-linux-baseline]
+    paths:
+      - .github/workflows/wal-full-linux.yml
+      - scripts/bench-wal-full.py
+      - tools/peer-worker/src/main.rs
+permissions:
+  contents: read
+jobs:
+  measure:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.96.0'
+      - name: Build locked release worker
+        run: cargo build --locked --release -p lin-peer-worker
+      - name: Measure fresh WAL FULL inserts
+        run: |
+          set -o pipefail
+          git rev-parse HEAD > wal-provenance.txt
+          uname -a >> wal-provenance.txt
+          rustc -Vv >> wal-provenance.txt
+          sha256sum target/release/lin-peer-worker >> wal-provenance.txt
+          python3 scripts/bench-wal-full.py target/release/lin-peer-worker wal-results.json | tee wal-summary.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: wal-full-linux-baseline
+          path: |
+            wal-results.json
+            wal-summary.txt
+            wal-provenance.txt

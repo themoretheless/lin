@@ -71,6 +71,7 @@ fn measure_insert(
     n: usize,
     samples: usize,
     timestamp: i64,
+    durable: Option<&std::path::Path>,
 ) -> Result<Value, Box<dyn std::error::Error>> {
     if n == 0 || samples == 0 {
         return Err("empty insert measurement".into());
@@ -107,7 +108,10 @@ fn measure_insert(
     let mut timings = Vec::with_capacity(samples);
     let mut result = Value::Null;
     for _ in 0..samples {
-        let mut db = Db::empty();
+        let mut db = match durable {
+            Some(path) => Db::open_with(path, lin::OpenOpts { sync: lin::SyncMode::Full, cold: false })?,
+            None => Db::empty(),
+        };
         db.run("index docs [wing, ts]")?;
         let prepared = sources
             .iter()
@@ -128,6 +132,10 @@ fn measure_insert(
         timings.push(start.elapsed().as_nanos() as f64);
         if affected != n {
             return Err("insert affected count mismatch".into());
+        }
+        if let Some(path) = durable {
+            drop(db);
+            db = Db::open(path)?;
         }
         let rows = db.store.collection("docs");
         if rows.len() != n
@@ -158,10 +166,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let timestamp = request["timestamp_ms"]
                 .as_i64()
                 .ok_or("timestamp missing")?;
+            let durable = request.get("durable_dir").and_then(Value::as_str).map(std::path::Path::new);
+            if durable.is_some() && (samples != 1 || n > 10_000) {
+                return Err("durable INSERT needs one sample of at most 10,000 rows per fresh directory".into());
+            }
             writeln!(
                 out,
                 "{}",
-                measure_insert(n as usize, samples as usize, timestamp)?
+                measure_insert(n as usize, samples as usize, timestamp, durable)?
             )?;
         } else if request.get("worker_version").and_then(Value::as_bool) == Some(true) {
             writeln!(out, "{}", json!({"version":lin::VERSION}))?;
@@ -208,7 +220,7 @@ mod tests {
     fn hundred_thousand_native_rows_respect_default_statement_quotas() {
         // A single AST for this fixture exceeds the default 8 MiB quota.
         // Exact six-field readback and default embeddings are checked by measure_insert.
-        let measured = measure_insert(100_000, 1, 123456).unwrap();
+        let measured = measure_insert(100_000, 1, 123456, None).unwrap();
         assert_eq!(measured["statements"], 10);
         assert_eq!(measured["samples_ns"].as_array().unwrap().len(), 1);
         assert_eq!(measured["result"].as_array().unwrap().len(), 100_000);
