@@ -60,23 +60,27 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("worker", type=Path)
     parser.add_argument("output", type=Path)
+    parser.add_argument("--candidate", type=Path)
     parser.add_argument("--blocks", type=int, default=4)
     args = parser.parse_args()
     if args.blocks < 1:
         parser.error("--blocks must be positive")
     rng = random.Random(2929273)
     report = dict(sqlite=sqlite3.sqlite_version, samples=[])
+    roles = ("lin", "lin_control", "sqlite")
+    if args.candidate:
+        roles += ("candidate",)
     for n in (1000, 10000):
         rows = fixture(n)
         for block in range(args.blocks):
-            orders = list(permutations(("lin", "lin_control", "sqlite")))
+            orders = list(permutations(roles))
             rng.shuffle(orders)
             for order in orders:
                 samples = {}
                 for role in order:
                     with tempfile.TemporaryDirectory() as directory:
                         elapsed = (run_sqlite(directory, rows) if role == "sqlite"
-                                   else run_lin(args.worker.resolve(), directory, rows))
+                                   else run_lin((args.candidate if role == "candidate" else args.worker).resolve(), directory, rows))
                     if elapsed <= 0:
                         raise ValueError(f"Nonpositive measurement: {role}, {elapsed}")
                     samples[role] = elapsed
