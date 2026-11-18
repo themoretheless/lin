@@ -39,8 +39,9 @@ def measure_batch(worker, rows, baseline=False):
     env = dict(os.environ)
     env["LIN_BENCH_BASELINE_SHAPE"] = "1"
     env.pop("LIN_BENCH_SEPARATE_EMBED", None)
+    env.pop("LIN_BENCH_SEPARATE_HASH", None)
     if baseline:
-        env["LIN_BENCH_SEPARATE_EMBED"] = "1"
+        env["LIN_BENCH_SEPARATE_HASH"] = "1"
     result = json.loads(subprocess.check_output(
         [worker], input=json.dumps(request) + "\n", text=True, env=env,
     ))

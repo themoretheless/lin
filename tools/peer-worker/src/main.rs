@@ -166,6 +166,7 @@ fn measure_insert(
             use std::hash::{Hash, Hasher};
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             for row in rows {
+                row.get("hash").and_then(Cell::text).hash(&mut hasher);
                 for value in row.get("embedding").and_then(Cell::as_vec).unwrap() {
                     value.to_bits().hash(&mut hasher);
                 }

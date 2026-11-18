@@ -1959,19 +1959,31 @@ pub(super) fn build_embedded_batch_rows(
     if n < 256 || batch.names.len() != batch.cols.len() {
         return None;
     }
-    let mut positions: Vec<_> = (0..batch.names.len()).collect();
-    positions.sort_unstable_by_key(|&i| &batch.names[i]);
-    if positions.windows(2).any(|p| batch.names[p[0]] == batch.names[p[1]])
-        || batch.names.iter().any(|name| name == "embedding")
-    {
+    enum Slot {
+        Input(usize),
+        Embedding,
+        ContentHash,
+    }
+    let mut layout: Vec<_> = batch.names.iter().enumerate()
+        .map(|(i, name)| (name.as_str(), Slot::Input(i))).collect();
+    if layout.iter().any(|(name, _)| *name == "embedding") {
         return None;
     }
-    let mut names: Vec<&str> = batch.names.iter().map(String::as_str).collect();
-    names.push("embedding");
-    let shape = Row::shape_of(&names);
-    let embedding_slot = positions.partition_point(|&i| batch.names[i].as_str() < "embedding");
     let text_cols = ["title", "body", "snippet"]
         .map(|name| batch.names.iter().position(|field| field == name));
+    let inline_hash = text_cols[1].is_some()
+        && !batch.names.iter().any(|name| name == "hash")
+        && std::env::var_os("LIN_BENCH_SEPARATE_HASH").is_none();
+    layout.push(("embedding", Slot::Embedding));
+    if inline_hash {
+        layout.push(("hash", Slot::ContentHash));
+    }
+    layout.sort_unstable_by_key(|(name, _)| *name);
+    if layout.windows(2).any(|p| p[0].0 == p[1].0) {
+        return None;
+    }
+    let names: Vec<_> = layout.iter().map(|(name, _)| *name).collect();
+    let shape = Row::shape_of(&names);
     let build = |start: usize, end: usize| {
         crate::embed::with_hashing_scratch(dim, |scratch| {
             let mut rows = Vec::with_capacity(end - start);
@@ -1986,10 +1998,14 @@ pub(super) fn build_embedded_batch_rows(
                 {
                     return None;
                 }
-                let embedding = Cell::Vec(scratch.embed_parts(texts));
-                let cells = positions[..embedding_slot].iter().map(|&i| batch.cols[i].get(row))
-                    .chain(std::iter::once(embedding))
-                    .chain(positions[embedding_slot..].iter().map(|&i| batch.cols[i].get(row)));
+                let mut embedding = Some(Cell::Vec(scratch.embed_parts(texts)));
+                let cells = layout.iter().map(|(_, slot)| match *slot {
+                    Slot::Input(i) => batch.cols[i].get(row),
+                    Slot::Embedding => embedding.take().expect("one embedding slot"),
+                    Slot::ContentHash => Cell::SmallText(content_hash_inline(
+                        texts[1].expect("validated body column"),
+                    )),
+                });
                 rows.push(Row::from_parts(Arc::clone(&shape), cells));
             }
             Some(rows)
