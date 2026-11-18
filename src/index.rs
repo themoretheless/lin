@@ -214,7 +214,9 @@ impl PostingList {
     pub fn insert(&mut self, pos: usize) {
         match self {
             PostingList::Standard(vec) => {
-                if vec.len() >= 32 {
+                // Checked at power-of-two lengths only: scanning for the maximum on every
+                // insert made a sparse list quadratic to build.
+                if vec.len() >= 32 && vec.len().is_power_of_two() {
                     let max_pos = vec.iter().copied().max().unwrap_or(0).max(pos);
                     if max_pos <= vec.len().saturating_mul(64) {
                         let mut set = BitSet::new(max_pos + 1);

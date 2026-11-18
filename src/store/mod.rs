@@ -2601,6 +2601,32 @@ impl Store {
                     }
                 }
             }
+            // The id map and the position translation are settled here too: left stale,
+            // the next row appended at `last` would be translated to `p` and never found.
+            if let Some(doomed) = self.retired_rows.get(r_idx)
+                && let Some(by_id) = self.by_id.get_mut("docs")
+            {
+                if let Some(dead_id) = row_text(doomed, "id") {
+                    by_id.remove(dead_id);
+                }
+                if p != last
+                    && let Some(tail_id) = self
+                        .collections
+                        .get("docs")
+                        .and_then(|docs| docs.get(p))
+                        .and_then(|tail| tail.get("id"))
+                        .and_then(Cell::text_shared)
+                {
+                    by_id.insert(tail_id, p);
+                }
+            }
+            if let Some(at) = self
+                .docs_moved_idxs
+                .iter()
+                .position(|&(from, to)| from == last && to == p)
+            {
+                self.docs_moved_idxs.remove(at);
+            }
             if self.docs_id.len() == old_n && p < old_n {
                 self.retired_doc_ids.push(self.docs_id.swap_remove(p));
             }
@@ -4654,8 +4680,7 @@ impl Store {
         // A disk-backed collection keeps only an empty placeholder `LiveIndex`; its secondary
         // indexes live in the disk engine. Report "no usable index" so callers scan instead
         // of trusting an empty seek result.
-        if self.is_disk_backed(collection)
-            || (collection == "docs" && !self.deferred_doc_wing_updates.is_empty())
+        if self.is_disk_backed(collection) || (collection == "docs" && self.has_deferred_doc_ops())
         {
             return None;
         }
@@ -4695,8 +4720,7 @@ impl Store {
         // A disk-backed collection keeps only an empty placeholder `LiveIndex`; its secondary
         // indexes live in the disk engine. Report "no usable index" so callers scan instead
         // of trusting an empty seek result.
-        if self.is_disk_backed(collection)
-            || (collection == "docs" && !self.deferred_doc_wing_updates.is_empty())
+        if self.is_disk_backed(collection) || (collection == "docs" && self.has_deferred_doc_ops())
         {
             return None;
         }
@@ -4726,8 +4750,7 @@ impl Store {
         // A disk-backed collection keeps only an empty placeholder `LiveIndex`; its secondary
         // indexes live in the disk engine. Report "no usable index" so callers scan instead
         // of trusting an empty seek result.
-        if self.is_disk_backed(collection)
-            || (collection == "docs" && !self.deferred_doc_wing_updates.is_empty())
+        if self.is_disk_backed(collection) || (collection == "docs" && self.has_deferred_doc_ops())
         {
             return None;
         }

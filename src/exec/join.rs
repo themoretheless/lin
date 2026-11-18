@@ -9,7 +9,7 @@ use crate::error::Error;
 use crate::store::{Cell, Row, acquire_row};
 use crate::window::WindowFunction;
 
-use super::agg::cell_key;
+use super::agg::{cell_key, cell_key_ref};
 use super::{Db, field_names};
 
 /// Output field for a projected FK join: left column or right probe slot.
@@ -3163,10 +3163,15 @@ fn partition_into(
             }
             let mut idx: FxHashMap<String, Vec<Row>> = FxHashMap::default();
             let mut keep = |r: &Row| {
-                if let Some(k) = cell_key(r.get(to_field).unwrap_or(&Cell::Null))
-                    && needed_keys.contains(&k)
+                if let Some(k) = cell_key_ref(r.get(to_field).unwrap_or(&Cell::Null))
+                    && needed_keys.contains(k.as_ref())
                 {
-                    idx.entry(k).or_default().push(r.clone());
+                    match idx.get_mut(k.as_ref()) {
+                        Some(rs) => rs.push(r.clone()),
+                        None => {
+                            idx.insert(k.into_owned(), vec![r.clone()]);
+                        }
+                    }
                 }
             };
             // Text keys in a bounded number: push `key in [...]` into the scan, so segments
@@ -3203,7 +3208,10 @@ fn partition_into(
             }
             let mut out = Vec::with_capacity(left.len());
             for mut l in left {
-                let hits = l.get(on).and_then(cell_key).and_then(|k| idx.get(&k));
+                let hits = l
+                    .get(on)
+                    .and_then(cell_key_ref)
+                    .and_then(|k| idx.get(k.as_ref()));
                 match hits {
                     Some(rs) => {
                         for (i, r) in rs.iter().enumerate() {
@@ -3309,16 +3317,23 @@ fn partition_into(
         let mut idx: FxHashMap<String, Vec<&Row>> = FxHashMap::default();
         idx.reserve(needed_keys.len());
         for r in right {
-            if let Some(k) = cell_key(r.get(to_field).unwrap_or(&Cell::Null))
-                && needed_keys.contains(&k)
+            if let Some(k) = cell_key_ref(r.get(to_field).unwrap_or(&Cell::Null))
+                && needed_keys.contains(k.as_ref())
             {
-                idx.entry(k).or_default().push(r);
+                match idx.get_mut(k.as_ref()) {
+                    Some(rs) => rs.push(r),
+                    None => {
+                        idx.insert(k.into_owned(), vec![r]);
+                    }
+                }
             }
         }
         let mut out = Vec::with_capacity(left.len());
         for mut l in left {
-            let key = l.get(on).and_then(cell_key);
-            let hits = key.as_ref().and_then(|k| idx.get(k));
+            let hits = l
+                .get(on)
+                .and_then(cell_key_ref)
+                .and_then(|k| idx.get(k.as_ref()));
             if let Some(rs) = hits {
                 for (i, r) in rs.iter().enumerate() {
                     let base = if i + 1 == rs.len() {

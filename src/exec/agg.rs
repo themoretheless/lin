@@ -964,6 +964,17 @@ pub(crate) fn agg_avg_filtered(
         .collect())
 }
 
+/// Join key of a cell without allocating for text (ints keep joining to equal text).
+#[inline]
+pub(crate) fn cell_key_ref(c: &Cell) -> Option<std::borrow::Cow<'_, str>> {
+    match c {
+        Cell::Text(s) => Some(std::borrow::Cow::Borrowed(s.as_ref())),
+        Cell::SmallText(s) => Some(std::borrow::Cow::Borrowed(s.as_str())),
+        Cell::Int(n) => Some(std::borrow::Cow::Owned(n.to_string())),
+        _ => None,
+    }
+}
+
 pub(crate) fn cell_key(c: &Cell) -> Option<String> {
     match c {
         Cell::Text(s) => Some(s.as_ref().to_owned()),
