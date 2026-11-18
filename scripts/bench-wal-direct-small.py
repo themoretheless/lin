@@ -29,9 +29,12 @@ for n in (1000, 10000):
     for block in range(1):
         orders = list(permutations(("base", "control", "serial", "compact", "sqlite")))
         rng.shuffle(orders)
-        orders = [o for o in orders if o.index("base") < o.index("control")]
+        rank = {role: i for i, role in enumerate(("base", "control", "serial", "compact", "sqlite"))}
+        # Even permutations balance every role's position and pairwise ordering.
+        orders = [o for o in orders if sum(rank[a] > rank[b] for i, a in enumerate(o) for b in o[i+1:]) % 2 == 0]
         for order in orders:
             results = {}
+            hashes = set()
             for role in order:
                 with tempfile.TemporaryDirectory() as path:
                     if role == "sqlite":
@@ -47,8 +50,11 @@ for n in (1000, 10000):
                     req = dict(insert_rows=n, samples=1, timestamp_ms=123456, durable_dir=path)
                     data = json.loads(subprocess.check_output([worker], input=json.dumps(req)+"\n", env=env, text=True))
                     assert [tuple(row) for row in data["result"]] == rows
+                    assert data["embedding_hash"] is not None
+                    hashes.add(data["embedding_hash"])
                     results[role] = {k: data[src][0] for k, src in [
                         ("insert_ns", "samples_ns"), ("reopen_ns", "reopen_ns"), ("wal_bytes", "wal_bytes")]}
+            assert len(hashes) == 1, "WAL replay embeddings differ"
             report["samples"].append(dict(rows=n, block=block, order=order, measurements=results))
             report["load_latest"] = os.getloadavg()
             temporary = output.with_suffix(".tmp")

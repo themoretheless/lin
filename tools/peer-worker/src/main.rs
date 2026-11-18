@@ -109,6 +109,7 @@ fn measure_insert(
     let mut result = Value::Null;
     let mut reopen_ns = Vec::new();
     let mut wal_bytes = Vec::new();
+    let mut embedding_hash = None;
     for _ in 0..samples {
         let mut db = match durable {
             Some(path) => Db::open_with(path, lin::OpenOpts { sync: lin::SyncMode::Full, cold: false })?,
@@ -156,6 +157,16 @@ fn measure_insert(
             if canonical(recovered_rows, &fields) != Value::Array(expected.clone()) {
                 return Err("WAL recovery exact values mismatch".into());
             }
+            use std::hash::Hasher;
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            for row in recovered_rows {
+                let vector = row.get("embedding").and_then(Cell::as_vec).ok_or("recovered embedding missing")?;
+                hasher.write_usize(vector.len());
+                for value in vector {
+                    hasher.write_u32(value.to_bits());
+                }
+            }
+            embedding_hash = Some(hasher.finish());
             drop(recovered);
             std::fs::remove_dir_all(recovery_dir)?;
             db.close()?;
@@ -174,7 +185,7 @@ fn measure_insert(
             return Err("insert exact values mismatch".into());
         }
     }
-    Ok(json!({"samples_ns":timings,"result":result,"reopen_ns":reopen_ns,"wal_bytes":wal_bytes,
+    Ok(json!({"samples_ns":timings,"result":result,"reopen_ns":reopen_ns,"wal_bytes":wal_bytes,"embedding_hash":embedding_hash,
         "statement_rows_limit":10_000,"statements":sources.len(),
         "api":if sources.len()==1 {"prepared run"} else {"prepared chunks in one memory transaction"}}))
 }
