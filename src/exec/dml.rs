@@ -962,8 +962,12 @@ impl Db {
         } else {
             None
         };
+        let build_start = std::time::Instant::now();
         let (built, all_uniform, all_embedded, lossless_cols) =
             build_insert_rows(records, now, needs_embed, hashing_dim);
+        if collection == "docs" && records.len() == 10_000 {
+            eprintln!("INSERT_BUILD {}", build_start.elapsed().as_nanos());
+        }
         // Any record without an explicit id gets a generated one, wherever it sits in the
         // batch (deciding from the first record left later id-less rows without an id).
         let needs_id = records.is_empty()
@@ -1025,6 +1029,7 @@ impl Db {
             None
         };
 
+        let check_start = std::time::Instant::now();
         let fast_checked = if let Some(records) = records
             && all_uniform
             && !needs_id
@@ -1090,8 +1095,13 @@ impl Db {
                 }
             }
         }
+        let check_ns = check_start.elapsed().as_nanos();
+        let embed_start = std::time::Instant::now();
         if !all_embedded {
             self.maybe_embed_rows(collection, &mut built);
+        }
+        if collection == "docs" && n == 10_000 {
+            eprintln!("INSERT_CHECK {check_ns} {} {all_embedded}", embed_start.elapsed().as_nanos());
         }
 
         let mut new_edges = Vec::with_capacity(edges.len());
@@ -1400,7 +1410,11 @@ impl Db {
                     },
                 })
         } else {
+            let maintenance_start = std::time::Instant::now();
             self.maintain_insert_slab(collection, start, &built)?;
+            if collection == "docs" && n == 10_000 {
+                eprintln!("INSERT_MAINTAIN {}", maintenance_start.elapsed().as_nanos());
+            }
             None
         };
         self.store
@@ -2236,6 +2250,8 @@ fn build_batch_shape_rows_into(
     let mut first_kinds = [0u8; 32];
     let mut have_first_kinds = false;
 
+    let mut embed_ns = 0;
+    let mut embed_count = 0;
     let mut process_rows = |mut embed_batch: Option<&mut crate::embed::HashingBatch<'_>>| {
         for (slot_out, record) in out.iter_mut().zip(records) {
             let same_shape = record.fields.len() == first.fields.len()
@@ -2282,7 +2298,11 @@ fn build_batch_shape_rows_into(
                     }
                 };
                 if all_embedded && t_str.or(b_str).or(s_str).is_some_and(|s| !s.is_empty()) {
-                    Some(batch.embed_parts([t_str, b_str, s_str]))
+                    let start = std::time::Instant::now();
+                    let vector = batch.embed_parts([t_str, b_str, s_str]);
+                    embed_ns += start.elapsed().as_nanos();
+                    embed_count += 1;
+                    Some(vector)
                 } else {
                     all_embedded = false;
                     None
@@ -2370,6 +2390,9 @@ fn build_batch_shape_rows_into(
         crate::embed::with_hashing_scratch(dim, |batch| process_rows(Some(batch)));
     } else {
         process_rows(None);
+    }
+    if embed_count > 0 {
+        eprintln!("INSERT_HASH_CHUNK {embed_count} {embed_ns}");
     }
     (all_same, all_embedded, lossless_cols && all_same)
 }
