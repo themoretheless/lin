@@ -1310,17 +1310,8 @@ impl Store {
                     pred_src: pred_src.clone(),
                 };
                 let label = format!("{}[{}]", collection, fields.join(","));
+                let def = index_def_of(&snap);
                 self.extra_indexes.insert(label.clone(), snap);
-                let pred = pred_src
-                    .as_deref()
-                    .and_then(|src| crate::parse::parse_pred_src(src).ok());
-                let def = crate::catalog::IndexDef {
-                    collection: collection.clone(),
-                    unique: *unique,
-                    fields: fields.clone(),
-                    pred,
-                    bitmap_card_field: None,
-                };
                 let mut live = LiveIndex::new(def);
                 if !self.is_disk_backed(collection) {
                     for (i, row) in self.collection(collection).iter().enumerate() {
@@ -4218,17 +4209,7 @@ impl Store {
                         let label = label.clone();
                         s.spawn(move || {
                             let snap = store_ref.extra_indexes.get(&label)?;
-                            let pred = snap
-                                .pred_src
-                                .as_deref()
-                                .and_then(|src| crate::parse::parse_pred_src(src).ok());
-                            let def = crate::catalog::IndexDef {
-                                collection: snap.collection.clone(),
-                                unique: snap.unique,
-                                fields: snap.fields.clone(),
-                                pred,
-                                bitmap_card_field: None,
-                            };
+                            let def = index_def_of(snap);
                             let mut live = LiveIndex::new(def);
                             if !store_ref.is_disk_backed(&snap.collection) {
                                 let rows = store_ref.collection(&snap.collection);
@@ -4260,17 +4241,7 @@ impl Store {
             let Some(snap) = self.extra_indexes.get(&label) else {
                 continue;
             };
-            let pred = snap
-                .pred_src
-                .as_deref()
-                .and_then(|src| crate::parse::parse_pred_src(src).ok());
-            let def = crate::catalog::IndexDef {
-                collection: snap.collection.clone(),
-                unique: snap.unique,
-                fields: snap.fields.clone(),
-                pred,
-                bitmap_card_field: None,
-            };
+            let def = index_def_of(snap);
             let mut live = LiveIndex::new(def);
             if !self.is_disk_backed(&snap.collection) {
                 let rows = self.collection(&snap.collection);
@@ -4645,17 +4616,7 @@ impl Store {
             let def = if let Some(existing) = self.indexes.get(&label) {
                 existing.def.clone()
             } else if let Some(snap) = self.extra_indexes.get(&label) {
-                let pred = snap
-                    .pred_src
-                    .as_deref()
-                    .and_then(|src| crate::parse::parse_pred_src(src).ok());
-                crate::catalog::IndexDef {
-                    collection: snap.collection.clone(),
-                    unique: snap.unique,
-                    fields: snap.fields.clone(),
-                    pred,
-                    bitmap_card_field: None,
-                }
+                index_def_of(snap)
             } else {
                 continue;
             };
@@ -4767,6 +4728,23 @@ impl Store {
         }
         // For multiple uses, fall back to full seek
         Some(self.index_seek(collection, uses, now)?.len())
+    }
+}
+
+
+/// The live definition of a persisted index. Its filter is stored as source text; one
+/// that no longer parses is dropped, leaving the index unfiltered (every caller has
+/// always treated it that way).
+pub(crate) fn index_def_of(snap: &IndexSnap) -> crate::catalog::IndexDef {
+    crate::catalog::IndexDef {
+        collection: snap.collection.clone(),
+        unique: snap.unique,
+        fields: snap.fields.clone(),
+        pred: snap
+            .pred_src
+            .as_deref()
+            .and_then(|src| crate::parse::parse_pred_src(src).ok()),
+        bitmap_card_field: None,
     }
 }
 
