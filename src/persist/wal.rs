@@ -601,11 +601,16 @@ pub(crate) fn write_frame_precomputed(
         return Err(io_err("log record exceeds 16MiB"));
     };
     let codec = magic[3];
+    let start = std::time::Instant::now();
     write_frame_bytes(log, codec, payload, checksum, len as u32).map_err(io_err)?;
+    let write_ns = start.elapsed().as_nanos();
 
+    let start = std::time::Instant::now();
     if sync == SyncMode::Full {
         durable_sync(log).map_err(io_err)?;
     }
+    let sync_ns = start.elapsed().as_nanos();
+    eprintln!("WAL_FRAME {} {} {} {:?}", payload.len(), write_ns, sync_ns, sync);
     *log_bytes += 8 + len as u64;
     Ok(())
 }

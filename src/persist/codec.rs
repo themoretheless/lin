@@ -1542,6 +1542,20 @@ pub(crate) fn encode_insert_rows_direct_ext(
     uniform_keys: bool,
     buf: &mut Vec<u8>,
 ) -> Option<([u8; 4], Vec<String>)> {
+    let start = std::time::Instant::now();
+    let result = encode_insert_rows_direct_profile_inner(rec_gen, next_id, collection, rows, uniform_keys, buf);
+    eprintln!("WAL_ENCODE {} {} {} {}", rows.len(), start.elapsed().as_nanos(), result.is_some(), buf.len());
+    result
+}
+
+fn encode_insert_rows_direct_profile_inner(
+    rec_gen: u64,
+    next_id: u64,
+    collection: &str,
+    rows: &[Row],
+    uniform_keys: bool,
+    buf: &mut Vec<u8>,
+) -> Option<([u8; 4], Vec<String>)> {
     if rows.is_empty() {
         return None;
     }
