@@ -6,8 +6,12 @@ permissions:
   contents: read
 jobs:
   profile:
-    runs-on: ubuntu-22.04
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-22.04, ubuntu-24.04-arm]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -20,11 +24,12 @@ jobs:
           mkdir -p wal-profile
           git rev-parse HEAD > wal-profile/provenance.txt
           uname -a >> wal-profile/provenance.txt
+          lscpu >> wal-profile/provenance.txt
           rustc -Vv >> wal-profile/provenance.txt
           sha256sum target/release/fresh_wal_profile >> wal-profile/provenance.txt
           python3 scripts/bench-wal-profile.py target/release/fresh_wal_profile wal-profile | tee wal-profile/summary.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: wal-full-linux-profile
+          name: wal-full-linux-profile-${{ matrix.runner }}
           path: wal-profile/
