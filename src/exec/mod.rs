@@ -3832,28 +3832,32 @@ impl Db {
         let Some(has_null) = self.check_batch_types(collection, batch)? else {
             return Ok(None);
         };
-        let mut rows = batch.to_rows();
+        let needs_embed = self.embedder.is_some()
+            && self.catalog.collection(collection).is_some_and(|c| c.has_vec());
+        let hashing_dim = if needs_embed {
+            self.embedder.as_ref().and_then(|e| e.hashing_dim())
+        } else {
+            None
+        };
+        let embedded = if has_null {
+            None
+        } else {
+            hashing_dim.and_then(|dim| dml::build_embedded_batch_rows(batch, dim))
+        };
+        let all_embedded = embedded.is_some() || !needs_embed;
+        let mut rows = embedded.unwrap_or_else(|| batch.to_rows());
         if has_null {
             for row in &mut rows {
                 row.retain(|_, cell| !matches!(cell, Cell::Null));
             }
         }
-        let needs_embed = self.embedder.is_some()
-            && self
-                .catalog
-                .collection(collection)
-                .is_some_and(|c| c.has_vec());
         let shape = dml::BuiltShape {
             // Without nulls every row has the batch's fields, in one sorted order.
             all_uniform: !has_null,
-            all_embedded: !needs_embed,
+            all_embedded,
             needs_id: rows.iter().any(|r| r.get("id").and_then(Cell::text).is_none()),
             lossless_cols: false,
-            hashing_dim: if needs_embed {
-                self.embedder.as_ref().and_then(|e| e.hashing_dim())
-            } else {
-                None
-            },
+            hashing_dim,
             now: now_ms(),
         };
         let n = rows.len();

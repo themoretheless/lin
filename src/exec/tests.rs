@@ -687,3 +687,44 @@ mod preencoded_insert_tests {
         assert!(prep_up.point_update.is_some());
     }
 }
+
+#[test]
+fn fused_column_insert_preserves_hashes_vectors_and_fallback() {
+    use crate::embed::{Embedder, HashingEmbedder, row_embed_text};
+    use crate::store::{Cell, content_hash_inline};
+
+    let fields = ["body", "id", "title"].map(String::from);
+    let mut batch = crate::RecordBatch::with_capacity(fields.to_vec(), 512);
+    for i in 0..512 {
+        let title = ["Short TEXT", "İstanbul Straße Δ", "Вставка 🍏"][i % 3];
+        batch.push_cells([
+            Cell::Text(format!("body {i}").into()),
+            Cell::Text(format!("doc-{i}").into()),
+            Cell::Text(title.into()),
+        ]);
+    }
+    let mut reference = batch.to_rows();
+    let embedder = HashingEmbedder::new("hash/768", 768);
+    for row in &mut reference {
+        let vector = embedder.embed(&row_embed_text(row));
+        let hash = content_hash_inline(row.get("body").and_then(Cell::text).unwrap());
+        row.insert("hash", Cell::SmallText(hash));
+        row.insert("embedding", Cell::Vec(vector));
+    }
+    let rows = super::dml::build_embedded_batch_rows(&batch, 768).unwrap();
+    assert_eq!(rows.len(), reference.len());
+    for (row, expected) in rows.iter().zip(&reference) {
+        for field in ["body", "id", "title", "hash"] {
+            assert_eq!(row.get(field).and_then(Cell::text), expected.get(field).and_then(Cell::text));
+        }
+        let vector = row.get("embedding").and_then(Cell::as_vec).unwrap();
+        let expected_vector = expected.get("embedding").and_then(Cell::as_vec).unwrap();
+        assert!(vector.iter().map(|f| f.to_bits()).eq(expected_vector.iter().map(|f| f.to_bits())));
+    }
+
+    let mut empty_title = crate::RecordBatch::with_capacity(fields.to_vec(), 256);
+    for _ in 0..256 {
+        empty_title.push_cells([Cell::Text("body".into()), Cell::Text("id".into()), Cell::Text("".into())]);
+    }
+    assert!(super::dml::build_embedded_batch_rows(&empty_title, 768).is_none());
+}
