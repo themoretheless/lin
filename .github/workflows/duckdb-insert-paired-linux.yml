@@ -1,0 +1,38 @@
+name: Paired DuckDB INSERT on Linux
+on:
+  push:
+    branches: [codex/linux-duckdb-insert-20261118]
+permissions:
+  contents: read
+jobs:
+  measure:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.96.0'
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+      - name: Build Lin peer worker and install pinned Python peers
+        run: |
+          cargo build --locked --release -p lin-peer-worker
+          python3 -m pip install -r scripts/bench-peers-requirements.lock
+      - name: Measure prepared INSERT and validate readback
+        run: |
+          set -o pipefail
+          git rev-parse HEAD > duckdb-provenance.txt
+          uname -a >> duckdb-provenance.txt
+          rustc -Vv >> duckdb-provenance.txt
+          sha256sum target/release/lin-peer-worker >> duckdb-provenance.txt
+          python3 scripts/bench-duckdb-insert-paired.py target/release/lin-peer-worker duckdb-results.json | tee duckdb-summary.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: paired-duckdb-insert-linux
+          path: |
+            duckdb-results.json
+            duckdb-summary.txt
+            duckdb-provenance.txt
