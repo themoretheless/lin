@@ -25,6 +25,8 @@
 
 mod codec;
 mod snapshot;
+pub(crate) mod spill;
+pub use spill::Spillable;
 mod types;
 mod wal;
 

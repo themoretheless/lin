@@ -11,6 +11,7 @@ use crate::ast::{
 use crate::catalog::Type;
 use crate::error::Error;
 use crate::store::{Cell, Row};
+use crate::persist::spill::Spillable;
 
 use super::Db;
 use super::eval::{PredSlots, cmp_sort, eval_pred, pred_has_param, pred_needs_now};
@@ -45,7 +46,7 @@ fn spill_partition_aggregate<'a, I, P, S, Extract, Fold>(
 ) -> Result<Vec<(Cell, S)>, Error>
 where
     I: IntoIterator<Item = &'a Row>,
-    P: serde::Serialize + serde::de::DeserializeOwned,
+    P: Spillable,
     Extract: FnMut(&'a Row) -> (Cell, P),
     Fold: FnMut(&mut S, P),
 {
@@ -66,20 +67,25 @@ where
     for r in rows {
         let (cell, payload) = extract(r);
         let part_idx = (cell_hash(&cell) as usize) % num_partitions;
-        rmp_serde::encode::write_named(&mut partition_files[part_idx], &(cell, payload))
-            .map_err(|e| Error::runtime(e.to_string()))?;
+        (cell, payload).serialize(&mut partition_files[part_idx])?;
     }
 
     for mut writer in partition_files {
-        use std::io::Write;
+        use std::io::{BufRead, Write};
         writer.flush().map_err(|e| Error::runtime(e.to_string()))?;
     }
 
     let mut final_map: FxHashMap<Cell, S> = FxHashMap::default();
     for path in &guard.0 {
         if let Ok(file) = std::fs::File::open(path) {
+        use std::io::{BufRead, Write};
             let mut reader = std::io::BufReader::new(file);
-            while let Ok((cell, payload)) = rmp_serde::from_read::<_, (Cell, P)>(&mut reader) {
+            loop {
+                let buf = reader.fill_buf().map_err(|e| Error::runtime(e.to_string()))?;
+                if buf.is_empty() {
+                    break;
+                }
+                let (cell, payload) = <(Cell, P)>::deserialize(&mut reader)?;
                 let entry = final_map.entry(cell).or_insert_with(&init_state);
                 fold(entry, payload);
             }
