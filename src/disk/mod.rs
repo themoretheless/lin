@@ -309,7 +309,7 @@ impl SegPred<'_> {
                 let Ok(s) = std::str::from_utf8(bytes) else {
                     return false;
                 };
-                crate::exec::has_word(s, word, *case_insensitive)
+                crate::eval::has_word(s, word, *case_insensitive)
             }
             SegPred::Slow(p) => slow.eval(p, rid),
         }
@@ -349,7 +349,7 @@ impl SegPred<'_> {
                 .iter()
                 .fold(0u32, |acc, p| acc.saturating_add(p.cost()))
                 .saturating_add(2),
-            SegPred::Slow(p) => 100u32.saturating_add(crate::exec::pred_leaf_cost(p)),
+            SegPred::Slow(p) => 100u32.saturating_add(crate::eval::pred_leaf_cost(p)),
         }
     }
 }
@@ -442,7 +442,7 @@ impl<'a> SlowRow<'a> {
             }
             self.loaded = Some(rid);
         }
-        crate::exec::eval_pred(pred, &self.scratch, self.now_ms)
+        crate::eval::eval_pred(pred, &self.scratch, self.now_ms)
     }
 
     /// The decoded value of predicate column `f`, when this row has been decoded.
@@ -550,7 +550,7 @@ fn compile_seg_leaf<'s>(
             // Every value is null here: only `!=` holds.
             None => SegPred::Const(*op == CmpOp::Ne),
             Some(MmapCol::Fixed(fc)) => {
-                let rhs = fc.fixed_rhs(&crate::exec::value_cell(value, now_ms))?;
+                let rhs = fc.fixed_rhs(&crate::eval::value_cell(value, now_ms))?;
                 match op {
                     // `cmp_at` is false on null, but `null != x` is true.
                     CmpOp::Ne => fold_seg_not(SegPred::Cmp(fc, CmpOp::Eq, rhs)),
@@ -615,7 +615,7 @@ fn compile_seg_leaf<'s>(
                 let allowed: Vec<bool> = dc
                     .strings
                     .iter()
-                    .map(|s| crate::exec::has_word(s.as_ref(), needle, *ci))
+                    .map(|s| crate::eval::has_word(s.as_ref(), needle, *ci))
                     .collect();
                 if allowed.iter().any(|&a| a) {
                     SegPred::DictSet(dc, allowed)
@@ -693,7 +693,7 @@ impl TextSet<'_> {
             TextSet::Contains(needle) => dc
                 .strings
                 .iter()
-                .map(|s| crate::exec::text_contains(s.as_ref(), needle))
+                .map(|s| crate::eval::text_contains(s.as_ref(), needle))
                 .collect(),
         }
     }
@@ -710,7 +710,7 @@ fn zone_prunable_terms(pred: &crate::ast::Pred, now_ms: i64) -> PredTerms<'_> {
             Pred::Cmp { field, op, value } => match (field.leaf(), op, value) {
                 (Some(name), CmpOp::Gt | CmpOp::Ge | CmpOp::Lt | CmpOp::Le, _) => {
                     out.ranges
-                        .push((name, *op, crate::exec::value_cell(value, now_ms)));
+                        .push((name, *op, crate::eval::value_cell(value, now_ms)));
                 }
                 (Some(name), CmpOp::Eq, Value::String(s)) => {
                     out.text_eqs.push((name, s.as_ref()));
@@ -874,7 +874,7 @@ impl<'s> ZonePrune<'s> {
                     return ZonePrune::Never;
                 };
                 if let Some(fc) = seg.fixed_col(name) {
-                    return ZonePrune::Term(fc, *op, crate::exec::value_cell(value, now_ms));
+                    return ZonePrune::Term(fc, *op, crate::eval::value_cell(value, now_ms));
                 }
                 if let Some(dc) = seg.dict_col(name)
                     && let Some(rhs) = pred_text_lit(value)
@@ -940,7 +940,7 @@ impl<'s> ZonePrune<'s> {
                 let allowed: Vec<bool> = dc
                     .strings
                     .iter()
-                    .map(|s| crate::exec::has_word(s.as_ref(), needle, *ci))
+                    .map(|s| crate::eval::has_word(s.as_ref(), needle, *ci))
                     .collect();
                 if allowed.iter().any(|&a| a) {
                     ZonePrune::DictSet(dc, allowed)
@@ -2447,7 +2447,7 @@ impl DiskEngine {
                     (true, true) => std::cmp::Ordering::Equal,
                     (true, false) => std::cmp::Ordering::Greater,
                     (false, true) => std::cmp::Ordering::Less,
-                    (false, false) => crate::exec::cmp_sort(ka, kb),
+                    (false, false) => crate::eval::cmp_sort(ka, kb),
                 }
             });
             order = perm.into_iter().map(|i| order[i as usize]).collect();
@@ -2793,7 +2793,7 @@ impl DiskEngine {
         }
         if let Some(mt) = self.memtables.get(table) {
             for &idx in mt.by_id.values() {
-                if !mt.dead_mem.contains(&idx) && crate::exec::eval_pred(full_pred, &mt.rows[idx], now_ms) {
+                if !mt.dead_mem.contains(&idx) && crate::eval::eval_pred(full_pred, &mt.rows[idx], now_ms) {
                     total += 1;
                 }
             }
@@ -3679,7 +3679,7 @@ impl DiskEngine {
         }
         if let Some(mt) = self.memtables.get(table) {
             let mut on_mem = |idx: usize, row: &Row| -> bool {
-                if !seen_mem.insert(idx) || !crate::exec::eval_pred(pred, row, now_ms) {
+                if !seen_mem.insert(idx) || !crate::eval::eval_pred(pred, row, now_ms) {
                     return true;
                 }
                 visit(match out_fields {
@@ -4147,7 +4147,7 @@ impl DiskEngine {
                     continue;
                 }
                 let src = &mt.rows[idx];
-                if filter.is_some_and(|p| !crate::exec::eval_pred(p, src, now_ms)) {
+                if filter.is_some_and(|p| !crate::eval::eval_pred(p, src, now_ms)) {
                     continue;
                 }
                 let right_cells = src
@@ -4360,7 +4360,7 @@ impl DiskEngine {
                     continue;
                 }
                 let src = &mt.rows[idx];
-                if pred.is_some_and(|p| !crate::exec::eval_pred(p, src, now_ms)) {
+                if pred.is_some_and(|p| !crate::eval::eval_pred(p, src, now_ms)) {
                     continue;
                 }
                 if full_rows {
@@ -4477,7 +4477,7 @@ impl DiskEngine {
                     }
                     (None, Some(p)) => {
                         let full = seg.materialize_row(rid)?;
-                        if !crate::exec::eval_pred(p, &full, now_ms) {
+                        if !crate::eval::eval_pred(p, &full, now_ms) {
                             continue;
                         }
                         if fields.is_some() { project(&full) } else { full }
@@ -4502,7 +4502,7 @@ impl DiskEngine {
                     continue;
                 }
                 let src = &mt.rows[idx];
-                if pred.is_some_and(|p| !crate::exec::eval_pred(p, src, now_ms)) {
+                if pred.is_some_and(|p| !crate::eval::eval_pred(p, src, now_ms)) {
                     continue;
                 }
                 out.push(project(src));
@@ -6139,7 +6139,7 @@ impl DiskEngine {
                         {
                             return Ok(true);
                         }
-                        if crate::exec::eval_pred(p, row, now_ms) {
+                        if crate::eval::eval_pred(p, row, now_ms) {
                             let emitted = match project_fields {
                                 None => row.clone(),
                                 Some(fs) => {
@@ -6259,7 +6259,7 @@ impl DiskEngine {
         }
 
         self.scan_projected(table, needed_cols.as_deref(), |row| {
-            if crate::exec::eval_pred(p, row, now_ms) {
+            if crate::eval::eval_pred(p, row, now_ms) {
                 let emitted = match project_fields {
                     None => row.clone(),
                     Some(fs) => {
@@ -6359,7 +6359,7 @@ impl DiskEngine {
             } => {
                 let fname = field.leaf()?;
                 if is_indexed(fname) {
-                    let c = crate::exec::value_cell(value, now_ms);
+                    let c = crate::eval::value_cell(value, now_ms);
                     if !matches!(c, Cell::Null) {
                         return Some((fname.to_string(), vec![c]));
                     }
@@ -6371,7 +6371,7 @@ impl DiskEngine {
                 if is_indexed(fname) {
                     let mut cells = Vec::with_capacity(values.len());
                     for v in values {
-                        let c = crate::exec::value_cell(v, now_ms);
+                        let c = crate::eval::value_cell(v, now_ms);
                         if !matches!(c, Cell::Null) {
                             cells.push(c);
                         }
@@ -6773,7 +6773,7 @@ pub(crate) fn sort_rows_by_cluster_key(rows: &mut [Row], key: &str) {
 fn cmp_cluster_key(a: &Row, b: &Row, key: &str) -> std::cmp::Ordering {
     let present = |r: &Row| r.get(key).filter(|c| !matches!(c, Cell::Null)).is_some();
     match (a.get(key), b.get(key)) {
-        (Some(ka), Some(kb)) if present(a) && present(b) => crate::exec::cmp_sort(ka, kb),
+        (Some(ka), Some(kb)) if present(a) && present(b) => crate::eval::cmp_sort(ka, kb),
         _ => present(b).cmp(&present(a)),
     }
 }

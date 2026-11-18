@@ -8,8 +8,8 @@ use std::time::Instant;
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 
 mod agg;
+mod cold;
 mod dml;
-mod eval;
 mod gpu_ops;
 mod graph_ops;
 mod join;
@@ -26,7 +26,8 @@ pub use prepared::Prepared;
 pub use tx::Transaction;
 
 pub(crate) use agg::*;
-pub(crate) use eval::*;
+pub(crate) use crate::eval;
+pub(crate) use crate::eval::*;
 pub(crate) use join::{
     JoinFieldPlan, emit_join_row, merge_join_row, order_total_cell, plan_join_fields,
     pred_total_gt, project_join_fields, rows_to_rough_batch,

@@ -97,7 +97,7 @@ impl DiskUniqueKey {
             || self
                 .pred
                 .as_ref()
-                .is_some_and(|p| !crate::exec::eval_pred(p, row, now))
+                .is_some_and(|p| !crate::eval::eval_pred(p, row, now))
         {
             return None;
         }
