@@ -589,15 +589,23 @@ impl Store {
                 let docs_id = &self.docs_id;
                 let docs_title = &self.docs_title;
                 let rows_ptr = rows.as_mut_ptr() as usize;
-                let threads = std::thread::available_parallelism()
-                    .map(|p| p.get())
-                    .unwrap_or(1)
-                    .min((total_idxs + 1023) / 1024);
+                let id_title_shape = super::value::shape_id_title();
+                // Checking a row is two pointer compares: below this many rows, spawning
+                // workers costs far more than the pass itself.
+                const PAR_REFILL_MIN_ROWS: usize = 65_536;
+                let threads = if total_idxs < PAR_REFILL_MIN_ROWS {
+                    1
+                } else {
+                    std::thread::available_parallelism()
+                        .map(|p| p.get())
+                        .unwrap_or(1)
+                        .min((total_idxs + 1023) / 1024)
+                };
                 let next_chunk = std::sync::atomic::AtomicUsize::new(0);
                 let chunk_size = 4096;
-                std::thread::scope(|scope| {
-                    for _ in 0..threads {
-                        scope.spawn(|| {
+                {
+                    {
+                        let work = || {
                             loop {
                                 let start = next_chunk
                                     .fetch_add(chunk_size, std::sync::atomic::Ordering::Relaxed);
@@ -608,36 +616,40 @@ impl Store {
                                 for offset in start..end {
                                     let i = idxs[offset];
                                     let row = unsafe { &mut *(rows_ptr as *mut Row).add(offset) };
-                                    if row.len() == 2 {
-                                        let mut it = row.iter_mut();
-                                        if let (Some((k1, v1)), Some((k2, v2))) =
-                                            (it.next(), it.next())
-                                            && k1 == "id"
-                                            && k2 == "title"
-                                        {
-                                            let same_id = match v1 {
-                                                Cell::Text(a) => Arc::ptr_eq(a, &docs_id[i]),
-                                                _ => false,
-                                            };
-                                            if !same_id {
-                                                *v1 = Cell::Text(Arc::clone(&docs_id[i]));
-                                            }
-                                            let same_title = match v2 {
-                                                Cell::Text(a) => Arc::ptr_eq(a, &docs_title[i]),
-                                                _ => false,
-                                            };
-                                            if !same_title {
-                                                *v2 = Cell::Text(Arc::clone(&docs_title[i]));
-                                            }
-                                            continue;
+                                    // Shapes are interned: one pointer compare stands
+                                    // for "exactly the fields id and title".
+                                    if row.shape().is_some_and(|s| Arc::ptr_eq(s, id_title_shape))
+                                        && let [v1, v2] = row.cells_mut()
+                                    {
+                                        let same_id = match v1 {
+                                            Cell::Text(a) => Arc::ptr_eq(a, &docs_id[i]),
+                                            _ => false,
+                                        };
+                                        if !same_id {
+                                            *v1 = Cell::Text(Arc::clone(&docs_id[i]));
                                         }
+                                        let same_title = match v2 {
+                                            Cell::Text(a) => Arc::ptr_eq(a, &docs_title[i]),
+                                            _ => false,
+                                        };
+                                        if !same_title {
+                                            *v2 = Cell::Text(Arc::clone(&docs_title[i]));
+                                        }
+                                        continue;
                                     }
                                     *row = row_id_title(&docs_id[i], &docs_title[i]);
                                 }
                             }
+                        };
+                        // The caller is one of the workers.
+                        std::thread::scope(|scope| {
+                            for _ in 1..threads {
+                                scope.spawn(&work);
+                            }
+                            work();
                         });
                     }
-                });
+                }
                 return Some(rows);
             }
         }
