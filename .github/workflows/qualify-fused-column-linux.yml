@@ -1,0 +1,50 @@
+name: Qualify fused column inserts on Linux
+on:
+  push:
+    branches: [codex/qualify-fused-column-20261118]
+permissions:
+  contents: read
+jobs:
+  measure:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        replica: [1, 2]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 3
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.96.0'
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+      - name: Build baseline and clean candidate
+        run: |
+          set -euo pipefail
+          git worktree add --detach "$RUNNER_TEMP/lin-baseline" 2929273fa9b06f8e5ddae4fccb9fc9076c22b382
+          cp tools/peer-worker/src/main.rs "$RUNNER_TEMP/lin-baseline/tools/peer-worker/src/main.rs"
+          cargo build --locked --release -p lin-peer-worker
+          CARGO_TARGET_DIR="$RUNNER_TEMP/lin-baseline-target" cargo build --manifest-path "$RUNNER_TEMP/lin-baseline/Cargo.toml" --locked --release -p lin-peer-worker
+          python3 -m pip install -r scripts/bench-peers-requirements.lock
+      - name: Compare both Lin builds with DuckDB
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD HEAD^ > provenance.txt
+          git -C "$RUNNER_TEMP/lin-baseline" rev-parse HEAD >> provenance.txt
+          uname -a >> provenance.txt
+          lscpu >> provenance.txt
+          rustc -Vv >> provenance.txt
+          sha256sum target/release/lin-peer-worker "$RUNNER_TEMP/lin-baseline-target/release/lin-peer-worker" >> provenance.txt
+          python3 scripts/bench-duckdb-insert-paired.py target/release/lin-peer-worker "$RUNNER_TEMP/lin-baseline-target/release/lin-peer-worker" results.json | tee summary.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: qualify-fused-column-linux-${{ matrix.replica }}
+          path: |
+            provenance.txt
+            results.json
+            summary.txt
