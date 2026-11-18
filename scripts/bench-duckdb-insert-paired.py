@@ -3,6 +3,7 @@ import hashlib
 import itertools
 import json
 from pathlib import Path
+import os
 import platform
 import random
 import runpy
@@ -33,16 +34,22 @@ def measure_duckdb(frame, rows):
         return elapsed
 
 
-def measure_batch(worker, rows):
+def measure_batch(worker, rows, baseline=False):
     request = dict(insert_rows=len(rows), samples=1, timestamp_ms=123456, column_batch=True)
-    result = json.loads(subprocess.check_output([worker], input=json.dumps(request) + "\n", text=True))
+    env = dict(os.environ)
+    env.pop("LIN_BENCH_BASELINE_SHAPE", None)
+    if baseline:
+        env["LIN_BENCH_BASELINE_SHAPE"] = "1"
+    result = json.loads(subprocess.check_output(
+        [worker], input=json.dumps(request) + "\n", text=True, env=env,
+    ))
     assert result["api"] == "column batch"
     assert [tuple(row) for row in result["result"]] == rows
     return result["samples_ns"][0]
 
 
 def main(worker, output):
-    roles = ("lin", "control", "duckdb", "batch")
+    roles = ("lin", "batch_base", "duckdb", "batch")
     report = dict(
         duckdb=duckdb.__version__, pandas=pd.__version__, host=platform.platform(),
         worker_sha256=hashlib.sha256(worker.read_bytes()).hexdigest(), samples=[],
@@ -62,7 +69,7 @@ def main(worker, output):
                 for role in order:
                     timings[role] = (
                         measure_duckdb(frame, rows) if role == "duckdb"
-                        else measure_batch(worker, rows) if role == "batch"
+                        else measure_batch(worker, rows, baseline=role == "batch_base") if role.startswith("batch")
                         else bench["run_lin"](worker, None, rows)
                     )
                 report["samples"].append(dict(rows=n, block=block, order=order, ns=timings))
@@ -70,11 +77,11 @@ def main(worker, output):
         pairs = [x["ns"] for x in report["samples"] if x["rows"] == n]
         timings = {role: median(x[role] for x in pairs) / 1e6 for role in roles}
         wins = sum(x["lin"] < x["duckdb"] for x in pairs)
-        noise = median(abs(1 - x["control"] / x["lin"]) for x in pairs)
+        noise = median(1 - x["batch"] / x["batch_base"] for x in pairs)
         gain = median(1 - x["lin"] / x["duckdb"] for x in pairs)
         batch_wins = sum(x["batch"] < x["duckdb"] for x in pairs)
         print(f"batch wins {batch_wins}/{len(pairs)}")
-        print(f"{n} rows {timings}, Lin wins {wins}/{len(pairs)}, paired gain {gain:.2%}, A/A {noise:.2%}", flush=True)
+        print(f"{n} rows {timings}, Lin wins {wins}/{len(pairs)}, paired gain {gain:.2%}, batch paired gain {noise:.2%}", flush=True)
 
 
 if __name__ == "__main__":

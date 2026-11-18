@@ -359,6 +359,11 @@ impl HashingEmbedder {
             let mut guard = cell.borrow_mut();
             let (scratch, lower, text_buf) = &mut *guard;
             scratch.ensure_dim(self.dim);
+            static OLD_SHAPE_WRITES: OnceLock<bool> = OnceLock::new();
+            let old_shape_writes = *OLD_SHAPE_WRITES.get_or_init(|| {
+                std::env::var_os("LIN_BENCH_BASELINE_SHAPE").is_some()
+            });
+            let mut writer = crate::store::row::RowFieldWriter::new("embedding");
             for row in rows {
                 let vec = match prepare_row_embed_text(row, text_buf) {
                     RowEmbedText::Empty => scratch.finish(),
@@ -371,7 +376,9 @@ impl HashingEmbedder {
                         scratch.finish()
                     }
                 };
-                if let Some(cell) = row.get_mut("embedding") {
+                if !old_shape_writes {
+                    writer.set(row, crate::store::Cell::Vec(vec));
+                } else if let Some(cell) = row.get_mut("embedding") {
                     *cell = crate::store::Cell::Vec(vec);
                 } else {
                     row.insert("embedding", crate::store::Cell::Vec(vec));

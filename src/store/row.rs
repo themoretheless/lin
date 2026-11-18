@@ -194,6 +194,43 @@ pub struct Row {
     cells: Cells,
 }
 
+/// Cache the last shape transition while assigning the same field to many rows.
+pub(crate) struct RowFieldWriter<'a> {
+    key: &'a str,
+    source: Option<Arc<Shape>>,
+    target: Option<Arc<Shape>>,
+    slot: usize,
+}
+
+impl<'a> RowFieldWriter<'a> {
+    pub(crate) fn new(key: &'a str) -> Self {
+        Self { key, source: None, target: None, slot: 0 }
+    }
+
+    pub(crate) fn set(&mut self, row: &mut Row, value: Cell) {
+        let shape = row.shape.as_ref().unwrap_or(&ROOT);
+        if self.source.as_ref().is_none_or(|source| !Arc::ptr_eq(source, shape)) {
+            self.source = Some(Arc::clone(shape));
+            match shape.find(self.key) {
+                Ok(slot) => {
+                    self.slot = slot;
+                    self.target = None;
+                }
+                Err(slot) => {
+                    self.slot = slot;
+                    self.target = Some(shape.with(slot, self.key));
+                }
+            }
+        }
+        if let Some(target) = &self.target {
+            row.cells.insert(self.slot, value);
+            row.shape = Some(Arc::clone(target));
+        } else {
+            row.cells[self.slot] = value;
+        }
+    }
+}
+
 impl Row {
     #[inline]
     pub const fn new() -> Self {
