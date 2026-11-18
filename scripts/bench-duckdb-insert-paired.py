@@ -7,6 +7,7 @@ import platform
 import random
 import runpy
 from statistics import median
+import subprocess
 import sys
 from time import perf_counter_ns
 
@@ -32,8 +33,16 @@ def measure_duckdb(frame, rows):
         return elapsed
 
 
+def measure_batch(worker, rows):
+    request = dict(insert_rows=len(rows), samples=1, timestamp_ms=123456, column_batch=True)
+    result = json.loads(subprocess.check_output([worker], input=json.dumps(request) + "\n", text=True))
+    assert result["api"] == "column batch"
+    assert [tuple(row) for row in result["result"]] == rows
+    return result["samples_ns"][0]
+
+
 def main(worker, output):
-    roles = ("lin", "control", "duckdb")
+    roles = ("lin", "control", "duckdb", "batch")
     report = dict(
         duckdb=duckdb.__version__, pandas=pd.__version__, host=platform.platform(),
         worker_sha256=hashlib.sha256(worker.read_bytes()).hexdigest(), samples=[],
@@ -44,7 +53,8 @@ def main(worker, output):
         frame = pd.DataFrame(rows, columns=FIELDS)
         measure_duckdb(frame, rows)
         bench["run_lin"](worker, None, rows)
-        for block in range(4):
+        measure_batch(worker, rows)
+        for block in range(1):
             orders = list(itertools.permutations(roles))
             rng.shuffle(orders)
             for order in orders:
@@ -52,6 +62,7 @@ def main(worker, output):
                 for role in order:
                     timings[role] = (
                         measure_duckdb(frame, rows) if role == "duckdb"
+                        else measure_batch(worker, rows) if role == "batch"
                         else bench["run_lin"](worker, None, rows)
                     )
                 report["samples"].append(dict(rows=n, block=block, order=order, ns=timings))
@@ -61,6 +72,8 @@ def main(worker, output):
         wins = sum(x["lin"] < x["duckdb"] for x in pairs)
         noise = median(abs(1 - x["control"] / x["lin"]) for x in pairs)
         gain = median(1 - x["lin"] / x["duckdb"] for x in pairs)
+        batch_wins = sum(x["batch"] < x["duckdb"] for x in pairs)
+        print(f"batch wins {batch_wins}/{len(pairs)}")
         print(f"{n} rows {timings}, Lin wins {wins}/{len(pairs)}, paired gain {gain:.2%}, A/A {noise:.2%}", flush=True)
 
 

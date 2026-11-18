@@ -72,11 +72,18 @@ fn measure_insert(
     samples: usize,
     timestamp: i64,
     durable: Option<&std::path::Path>,
+    column_batch: bool,
 ) -> Result<Value, Box<dyn std::error::Error>> {
     if n == 0 || samples == 0 {
         return Err("empty insert measurement".into());
     }
     let mut records = Vec::with_capacity(n);
+    let fields = ["id", "uri", "wing", "title", "ts", "body"].map(String::from);
+    let mut batch = column_batch.then(|| {
+        let mut names = fields.to_vec();
+        names.push("layer".to_string());
+        lin::RecordBatch::with_capacity(names, n)
+    });
     let mut expected = Vec::with_capacity(n);
     for i in 0..n {
         let id = format!("d-{i}");
@@ -88,7 +95,14 @@ fn measure_insert(
             format!("doc {i} plain")
         };
         let body = format!("body {i}");
-        records.push(format!(
+        if let Some(batch) = batch.as_mut() {
+            batch.push_cells([
+                Cell::Text(id.as_str().into()), Cell::Text(uri.as_str().into()),
+                Cell::Text(wing.into()), Cell::Text(title.as_str().into()),
+                Cell::Time(timestamp), Cell::Text(body.as_str().into()), Cell::Text("wiki".into()),
+            ]);
+        } else {
+            records.push(format!(
             r#"{{id:{},uri:{},wing:{},title:{},body:{},layer:"wiki",ts:timestamp({timestamp})}}"#,
             json!(id),
             json!(uri),
@@ -96,6 +110,7 @@ fn measure_insert(
             json!(title),
             json!(body)
         ));
+        }
         expected.push(json!([id, uri, wing, title, timestamp, body]));
     }
     // Respect the per-statement AST quota without relaxing production limits.
@@ -104,7 +119,6 @@ fn measure_insert(
         .chunks(10_000)
         .map(|chunk| format!("insert docs [{}]", chunk.join(",")))
         .collect::<Vec<_>>();
-    let fields = ["id", "uri", "wing", "title", "ts", "body"].map(String::from);
     let mut timings = Vec::with_capacity(samples);
     let mut result = Value::Null;
     for _ in 0..samples {
@@ -118,7 +132,9 @@ fn measure_insert(
             .map(|source| db.prepare(source))
             .collect::<Result<Vec<_>, _>>()?;
         let start = Instant::now();
-        let affected = if prepared.len() == 1 {
+        let affected = if let Some(batch) = &batch {
+            black_box(db.insert_batch("docs", batch)?).n
+        } else if prepared.len() == 1 {
             black_box(prepared[0].run(&mut db)?).done.n
         } else {
             let mut tx = db.transaction()?;
@@ -152,7 +168,7 @@ fn measure_insert(
     }
     Ok(json!({"samples_ns":timings,"result":result,
         "statement_rows_limit":10_000,"statements":sources.len(),
-        "api":if sources.len()==1 {"prepared run"} else {"prepared chunks in one memory transaction"}}))
+        "api":if column_batch {"column batch"} else if sources.len()==1 {"prepared run"} else {"prepared chunks in one memory transaction"}}))
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -173,7 +189,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             writeln!(
                 out,
                 "{}",
-                measure_insert(n as usize, samples as usize, timestamp, durable)?
+                measure_insert(n as usize, samples as usize, timestamp, durable, request["column_batch"].as_bool().unwrap_or(false))?
             )?;
         } else if request.get("worker_version").and_then(Value::as_bool) == Some(true) {
             writeln!(out, "{}", json!({"version":lin::VERSION}))?;
@@ -220,7 +236,7 @@ mod tests {
     fn hundred_thousand_native_rows_respect_default_statement_quotas() {
         // A single AST for this fixture exceeds the default 8 MiB quota.
         // Exact six-field readback and default embeddings are checked by measure_insert.
-        let measured = measure_insert(100_000, 1, 123456, None).unwrap();
+        let measured = measure_insert(100_000, 1, 123456, None, false).unwrap();
         assert_eq!(measured["statements"], 10);
         assert_eq!(measured["samples_ns"].as_array().unwrap().len(), 1);
         assert_eq!(measured["result"].as_array().unwrap().len(), 100_000);

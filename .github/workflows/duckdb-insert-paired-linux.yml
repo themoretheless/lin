@@ -1,7 +1,7 @@
-name: Paired DuckDB INSERT on Linux
+name: Lin column batch against DuckDB on Linux
 on:
   push:
-    branches: [codex/linux-duckdb-insert-20261118]
+    branches: [codex/linux-duckdb-column-insert-20261118]
 permissions:
   contents: read
 jobs:
@@ -31,7 +31,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: paired-duckdb-insert-linux
+          name: column-duckdb-insert-linux
           path: |
             duckdb-results.json
             duckdb-summary.txt
