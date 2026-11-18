@@ -1949,6 +1949,72 @@ pub(crate) struct BuiltShape {
     pub now: i64,
 }
 
+/// Build uniform column batches with the builtin hashing embedder. A shape or
+/// text combination outside this path falls back to the normal insert.
+pub(super) fn build_embedded_batch_rows(
+    batch: &crate::RecordBatch,
+    dim: usize,
+) -> Option<Vec<Row>> {
+    let n = batch.n();
+    if n < 256 || batch.names.len() != batch.cols.len() {
+        return None;
+    }
+    let mut positions: Vec<_> = (0..batch.names.len()).collect();
+    positions.sort_unstable_by_key(|&i| &batch.names[i]);
+    if positions.windows(2).any(|p| batch.names[p[0]] == batch.names[p[1]])
+        || batch.names.iter().any(|name| name == "embedding")
+    {
+        return None;
+    }
+    let mut names: Vec<&str> = batch.names.iter().map(String::as_str).collect();
+    names.push("embedding");
+    let shape = Row::shape_of(&names);
+    let embedding_slot = positions.partition_point(|&i| batch.names[i].as_str() < "embedding");
+    let text_cols = ["title", "body", "snippet"]
+        .map(|name| batch.names.iter().position(|field| field == name));
+    let build = |start: usize, end: usize| {
+        crate::embed::with_hashing_scratch(dim, |scratch| {
+            let mut rows = Vec::with_capacity(end - start);
+            for row in start..end {
+                let texts = text_cols.map(|col| {
+                    col.and_then(|i| batch.cols[i].cell_ref(row)).and_then(Cell::text)
+                });
+                // This matches the fallback path's first-present-field rule
+                // for text columns. Other cell types use the original path.
+                if text_cols.iter().zip(&texts).any(|(col, text)| col.is_some() && text.is_none())
+                    || !texts.into_iter().flatten().next().is_some_and(|s| !s.is_empty())
+                {
+                    return None;
+                }
+                let embedding = Cell::Vec(scratch.embed_parts(texts));
+                let cells = positions[..embedding_slot].iter().map(|&i| batch.cols[i].get(row))
+                    .chain(std::iter::once(embedding))
+                    .chain(positions[embedding_slot..].iter().map(|&i| batch.cols[i].get(row)));
+                rows.push(Row::from_parts(Arc::clone(&shape), cells));
+            }
+            Some(rows)
+        })
+    };
+    let workers = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(8)
+        .min(n.div_ceil(4096));
+    let grain = n.div_ceil(workers);
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(workers - 1);
+        let build = &build;
+        for start in (grain..n).step_by(grain) {
+            handles.push(scope.spawn(move || build(start, (start + grain).min(n))));
+        }
+        let mut rows = build(0, grain)?;
+        rows.reserve(n - grain);
+        for handle in handles {
+            rows.extend(handle.join().expect("column insert worker panicked")?);
+        }
+        Some(rows)
+    })
+}
+
 fn build_insert_rows(
     records: &[Record],
     now: i64,

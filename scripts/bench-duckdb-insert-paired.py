@@ -37,15 +37,16 @@ def measure_duckdb(frame, rows):
 def measure_batch(worker, rows, baseline=False):
     request = dict(insert_rows=len(rows), samples=1, timestamp_ms=123456, column_batch=True)
     env = dict(os.environ)
-    env.pop("LIN_BENCH_BASELINE_SHAPE", None)
+    env["LIN_BENCH_BASELINE_SHAPE"] = "1"
+    env.pop("LIN_BENCH_SEPARATE_EMBED", None)
     if baseline:
-        env["LIN_BENCH_BASELINE_SHAPE"] = "1"
+        env["LIN_BENCH_SEPARATE_EMBED"] = "1"
     result = json.loads(subprocess.check_output(
         [worker], input=json.dumps(request) + "\n", text=True, env=env,
     ))
     assert result["api"] == "column batch"
     assert [tuple(row) for row in result["result"]] == rows
-    return result["samples_ns"][0]
+    return result["samples_ns"][0], result["embedding_hash"]
 
 
 def main(worker, output):
@@ -60,18 +61,22 @@ def main(worker, output):
         frame = pd.DataFrame(rows, columns=FIELDS)
         measure_duckdb(frame, rows)
         bench["run_lin"](worker, None, rows)
-        measure_batch(worker, rows)
+        assert measure_batch(worker, rows)[1] == measure_batch(worker, rows, baseline=True)[1]
         for block in range(1):
             orders = list(itertools.permutations(roles))
             rng.shuffle(orders)
             for order in orders:
                 timings = {}
+                digests = []
                 for role in order:
-                    timings[role] = (
-                        measure_duckdb(frame, rows) if role == "duckdb"
-                        else measure_batch(worker, rows, baseline=role == "batch_base") if role.startswith("batch")
-                        else bench["run_lin"](worker, None, rows)
-                    )
+                    if role.startswith("batch"):
+                        timings[role], digest = measure_batch(worker, rows, baseline=role == "batch_base")
+                        digests.append(digest)
+                    elif role == "duckdb":
+                        timings[role] = measure_duckdb(frame, rows)
+                    else:
+                        timings[role] = bench["run_lin"](worker, None, rows)
+                assert len(digests) == 2 and digests[0] == digests[1]
                 report["samples"].append(dict(rows=n, block=block, order=order, ns=timings))
                 output.write_text(json.dumps(report, indent=2) + "\n")
         pairs = [x["ns"] for x in report["samples"] if x["rows"] == n]

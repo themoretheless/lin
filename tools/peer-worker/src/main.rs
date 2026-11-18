@@ -121,6 +121,7 @@ fn measure_insert(
         .collect::<Vec<_>>();
     let mut timings = Vec::with_capacity(samples);
     let mut result = Value::Null;
+    let mut embedding_hash = None;
     for _ in 0..samples {
         let mut db = match durable {
             Some(path) => Db::open_with(path, lin::OpenOpts { sync: lin::SyncMode::Full, cold: false })?,
@@ -161,12 +162,22 @@ fn measure_insert(
         {
             return Err("insert rows or default embeddings missing".into());
         }
+        if column_batch {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            for row in rows {
+                for value in row.get("embedding").and_then(Cell::as_vec).unwrap() {
+                    value.to_bits().hash(&mut hasher);
+                }
+            }
+            embedding_hash = Some(hasher.finish());
+        }
         result = canonical(rows, &fields);
         if result != Value::Array(expected.clone()) {
             return Err("insert exact values mismatch".into());
         }
     }
-    Ok(json!({"samples_ns":timings,"result":result,
+    Ok(json!({"samples_ns":timings,"result":result,"embedding_hash":embedding_hash,
         "statement_rows_limit":10_000,"statements":sources.len(),
         "api":if column_batch {"column batch"} else if sources.len()==1 {"prepared run"} else {"prepared chunks in one memory transaction"}}))
 }
