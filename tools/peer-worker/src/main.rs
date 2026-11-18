@@ -72,6 +72,7 @@ fn measure_insert(
     samples: usize,
     timestamp: i64,
     durable: Option<&std::path::Path>,
+    profile: bool,
 ) -> Result<Value, Box<dyn std::error::Error>> {
     if n == 0 || samples == 0 {
         return Err("empty insert measurement".into());
@@ -107,6 +108,7 @@ fn measure_insert(
     let fields = ["id", "uri", "wing", "title", "ts", "body"].map(String::from);
     let mut timings = Vec::with_capacity(samples);
     let mut result = Value::Null;
+    let mut phase_samples = Vec::new();
     for _ in 0..samples {
         let mut db = match durable {
             Some(path) => Db::open_with(path, lin::OpenOpts { sync: lin::SyncMode::Full, cold: false })?,
@@ -117,19 +119,28 @@ fn measure_insert(
             .iter()
             .map(|source| db.prepare(source))
             .collect::<Result<Vec<_>, _>>()?;
+        let mut chunks = Vec::new();
+        let mut begin_ns = None;
+        let mut commit_ns = None;
         let start = Instant::now();
         let affected = if prepared.len() == 1 {
             black_box(prepared[0].run(&mut db)?).done.n
         } else {
             let mut tx = db.transaction()?;
+            if profile { begin_ns = Some(start.elapsed().as_nanos() as u64); }
             let mut affected = 0;
             for statement in &prepared {
+                let chunk_start = profile.then(Instant::now);
                 affected += black_box(tx.run_prepared(statement)?).done.n;
+                if let Some(t) = chunk_start { chunks.push(t.elapsed().as_nanos() as u64); }
             }
+            let commit_start = profile.then(Instant::now);
             tx.commit()?;
+            commit_ns = commit_start.map(|t| t.elapsed().as_nanos() as u64);
             affected
         };
         timings.push(start.elapsed().as_nanos() as f64);
+        if profile { phase_samples.push(json!({ "begin_ns":begin_ns, "chunks_ns":chunks, "commit_ns":commit_ns })); }
         if affected != n {
             return Err("insert affected count mismatch".into());
         }
@@ -150,7 +161,7 @@ fn measure_insert(
             return Err("insert exact values mismatch".into());
         }
     }
-    Ok(json!({"samples_ns":timings,"result":result,
+    Ok(json!({"samples_ns":timings,"result":result,"phase_samples":phase_samples,
         "statement_rows_limit":10_000,"statements":sources.len(),
         "api":if sources.len()==1 {"prepared run"} else {"prepared chunks in one memory transaction"}}))
 }
@@ -173,7 +184,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             writeln!(
                 out,
                 "{}",
-                measure_insert(n as usize, samples as usize, timestamp, durable)?
+                measure_insert(n as usize, samples as usize, timestamp, durable, request["profile_insert"].as_bool().unwrap_or(false))?
             )?;
         } else if request.get("worker_version").and_then(Value::as_bool) == Some(true) {
             writeln!(out, "{}", json!({"version":lin::VERSION}))?;
@@ -220,7 +231,7 @@ mod tests {
     fn hundred_thousand_native_rows_respect_default_statement_quotas() {
         // A single AST for this fixture exceeds the default 8 MiB quota.
         // Exact six-field readback and default embeddings are checked by measure_insert.
-        let measured = measure_insert(100_000, 1, 123456, None).unwrap();
+        let measured = measure_insert(100_000, 1, 123456, None, false).unwrap();
         assert_eq!(measured["statements"], 10);
         assert_eq!(measured["samples_ns"].as_array().unwrap().len(), 1);
         assert_eq!(measured["result"].as_array().unwrap().len(), 100_000);
