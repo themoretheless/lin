@@ -27,7 +27,7 @@ jobs:
           uname -a >> duckdb-provenance.txt
           rustc -Vv >> duckdb-provenance.txt
           sha256sum target/release/lin-peer-worker >> duckdb-provenance.txt
-          python3 scripts/profile-column-insert.py target/release/lin-peer-worker duckdb-results.json | tee duckdb-summary.txt
+          python3 scripts/bench-duckdb-insert-paired.py target/release/lin-peer-worker duckdb-results.json | tee duckdb-summary.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with:

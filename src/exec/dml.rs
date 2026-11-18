@@ -1025,7 +1025,6 @@ impl Db {
             None
         };
 
-        let key_start = std::time::Instant::now();
         let fast_checked = if let Some(records) = records
             && all_uniform
             && !needs_id
@@ -1091,13 +1090,10 @@ impl Db {
                 }
             }
         }
-        let key_ns = key_start.elapsed().as_nanos();
-        let embed_start = std::time::Instant::now();
         if !all_embedded {
             self.maybe_embed_rows(collection, &mut built);
         }
 
-        let embed_ns = embed_start.elapsed().as_nanos();
         let mut new_edges = Vec::with_capacity(edges.len());
         if let Some(first) = built.first()
             && !edges.is_empty()
@@ -1404,11 +1400,7 @@ impl Db {
                     },
                 })
         } else {
-            let maintain_start = std::time::Instant::now();
             self.maintain_insert_slab(collection, start, &built)?;
-            if n == 100_000 {
-                eprintln!("BATCH_MAINTAIN {key_ns} {embed_ns} {}", maintain_start.elapsed().as_nanos());
-            }
             None
         };
         self.store

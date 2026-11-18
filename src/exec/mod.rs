@@ -3829,12 +3829,9 @@ impl Db {
         if self.store.is_disk_backed(collection) || self.cold_program_packs.is_some() {
             return Ok(None);
         }
-        let type_start = Instant::now();
         let Some(has_null) = self.check_batch_types(collection, batch)? else {
             return Ok(None);
         };
-        let type_ns = type_start.elapsed().as_nanos();
-        let row_start = Instant::now();
         let mut rows = batch.to_rows();
         if has_null {
             for row in &mut rows {
@@ -3860,9 +3857,6 @@ impl Db {
             now: now_ms(),
         };
         let n = rows.len();
-        if n == 100_000 {
-            eprintln!("BATCH_MATERIALIZE {type_ns} {}", row_start.elapsed().as_nanos());
-        }
         let prepared = self.prepare_stmts_checked(vec![Stmt::InsertRows {
             collection: collection.to_string(),
             rows: n,
