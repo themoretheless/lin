@@ -37,9 +37,9 @@ for n in (1000, 10000):
                         results[role] = {"insert_ns": module.run_sqlite(path, rows)}
                         continue
                     env = dict(os.environ)
-                    env.pop("LIN_BENCH_DIRECT_SMALL", None)
+                    env.pop("LIN_BENCH_SERIAL_WAL_VECTORS", None)
                     if role == "compact":
-                        env["LIN_BENCH_DIRECT_SMALL"] = "1"
+                        env["LIN_BENCH_SERIAL_WAL_VECTORS"] = "1"
                     req = dict(insert_rows=n, samples=1, timestamp_ms=123456, durable_dir=path)
                     data = json.loads(subprocess.check_output([worker], input=json.dumps(req)+"\n", env=env, text=True))
                     assert [tuple(row) for row in data["result"]] == rows

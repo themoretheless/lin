@@ -1124,12 +1124,7 @@ impl Db {
         let uniform_keys = all_uniform && !needs_id;
         // The pre-encoded record is the compact columnar one; rows it cannot represent
         // exactly (missing fields, mixed types) are logged row by row after the insert.
-        let prefer_direct = allow_preencode
-            && self.persist.is_some()
-            && uniform_keys
-            && (512..4096).contains(&n)
-            && std::env::var_os("LIN_BENCH_DIRECT_SMALL").is_some();
-        let staged = if !prefer_direct && allow_preencode
+        let staged = if allow_preencode
             && (512..=16384).contains(&n)
             && edges.is_empty()
             && self.persist.is_some()

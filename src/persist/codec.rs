@@ -1369,7 +1369,10 @@ fn append_vec_rows_field_parallel(
     buf: &mut Vec<u8>,
 ) -> Result<(bool, usize), Error> {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    if num_rows < 128 {
+    let use_serial_small = (128..4096).contains(&num_rows)
+        && !dict_mode
+        && std::env::var_os("LIN_BENCH_SERIAL_WAL_VECTORS").is_some();
+    if num_rows < 128 || use_serial_small {
         if dict_mode {
             let payload_start = buf.len();
             let iter = rows[..num_rows].iter().map(|r| {
