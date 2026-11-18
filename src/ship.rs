@@ -382,6 +382,16 @@ fn client_config(tls: &TlsClient) -> Result<Arc<ClientConfig>, Error> {
             })))
         }
         TlsClient::CaPem(pem) => {
+            // One config per CA: parsing the PEM per connection is wasted work, and TLS
+            // session resumption lives in the config, so a fresh one never resumes.
+            static CA_CFGS: std::sync::Mutex<Vec<(Vec<u8>, Arc<ClientConfig>)>> =
+                std::sync::Mutex::new(Vec::new());
+            const MAX_CA_CFGS: usize = 8;
+            if let Ok(cached) = CA_CFGS.lock()
+                && let Some((_, cfg)) = cached.iter().find(|(k, _)| k == pem)
+            {
+                return Ok(Arc::clone(cfg));
+            }
             let mut roots = RootCertStore::empty();
             let mut cursor = std::io::Cursor::new(pem.as_slice());
             for cert in rustls_pemfile::certs(&mut cursor) {
@@ -391,11 +401,18 @@ fn client_config(tls: &TlsClient) -> Result<Arc<ClientConfig>, Error> {
             if roots.is_empty() {
                 return Err(Error::runtime("wal ship: empty TLS CA"));
             }
-            Ok(Arc::new(
+            let cfg = Arc::new(
                 ClientConfig::builder()
                     .with_root_certificates(roots)
                     .with_no_client_auth(),
-            ))
+            );
+            if let Ok(mut cached) = CA_CFGS.lock() {
+                if cached.len() >= MAX_CA_CFGS {
+                    cached.remove(0);
+                }
+                cached.push((pem.clone(), Arc::clone(&cfg)));
+            }
+            Ok(cfg)
         }
     }
 }

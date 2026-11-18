@@ -490,9 +490,11 @@ impl ServerState {
     fn refresh_reader_locked(&self, db: &mut Db) {
         let cur_gen = db.r#gen();
         let cold = db.has_unhydrated_cold_tables();
-        let reader = Arc::new(db.reader());
+        // Only drop the snapshot here: rebuilding it copies the memory image, and doing
+        // that under the writer mutex after every commit group taxed writes that no read
+        // followed. The first read rebuilds it.
         if let Ok(mut guard) = self.cached_reader.write() {
-            *guard = Some(reader);
+            *guard = None;
         }
         self.cold_unhydrated.store(cold, Ordering::Release);
         if let Ok(mut g) = self.gen_state.lock() {
@@ -574,14 +576,32 @@ impl ServerState {
                 self.refresh_reader_locked(db);
             }
         }
-        let guard = self
+        if let Some(reader) = self
             .cached_reader
             .read()
-            .map_err(|_| Error::runtime("cached reader lock poisoned"))?;
-        guard
+            .map_err(|_| Error::runtime("cached reader lock poisoned"))?
             .as_ref()
-            .cloned()
-            .ok_or_else(|| Error::runtime("cached reader unavailable"))
+        {
+            return Ok(Arc::clone(reader));
+        }
+        let mut db_guard = self
+            .db
+            .lock()
+            .map_err(|_| Error::runtime("db lock poisoned"))?;
+        let db = db_guard
+            .as_mut()
+            .ok_or_else(|| Error::runtime("server database closed"))?;
+        let mut cached = self
+            .cached_reader
+            .write()
+            .map_err(|_| Error::runtime("cached reader lock poisoned"))?;
+        // Another reader may have rebuilt it while this one waited for the database.
+        if let Some(reader) = cached.as_ref() {
+            return Ok(Arc::clone(reader));
+        }
+        let reader = Arc::new(db.reader());
+        *cached = Some(Arc::clone(&reader));
+        Ok(reader)
     }
 }
 
