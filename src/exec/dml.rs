@@ -1999,14 +1999,7 @@ pub(super) fn build_embedded_batch_rows(
                 }
                 let mut embedding = Some(Cell::Vec(scratch.embed_parts(texts)));
                 let cells = layout.iter().map(|(_, slot)| match *slot {
-                    Slot::Input(i) => {
-                        let column = &batch.cols[i];
-                        match column.cell_ref(row) {
-                            Some(Cell::Text(value)) => cell_from_arc_inline(value),
-                            Some(value) => value.clone_for_borrow(),
-                            None => column.get(row),
-                        }
-                    }
+                    Slot::Input(i) => batch.cols[i].get(row),
                     Slot::Embedding => embedding.take().expect("one embedding slot"),
                     Slot::ContentHash => Cell::SmallText(content_hash_inline(
                         texts[1].expect("validated body column"),

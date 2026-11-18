@@ -3743,22 +3743,30 @@ impl Db {
                 Column::Cells(cells) => {
                     let mut seen = [false; 5];
                     for cell in cells {
-                        let (slot, value) = match cell {
+                        let slot = match cell {
                             Cell::Null => {
                                 has_null = true;
                                 continue;
                             }
-                            Cell::Text(_) | Cell::SmallText(_) => (0, Value::String(Arc::from(""))),
-                            Cell::Int(_) => (1, Value::Int(0)),
-                            Cell::Float(_) => (2, Value::Float(0.0)),
-                            Cell::Bool(_) => (3, Value::Bool(false)),
-                            Cell::Time(_) => (4, Value::Timestamp(0)),
+                            Cell::Text(_) | Cell::SmallText(_) => 0,
+                            Cell::Int(_) => 1,
+                            Cell::Float(_) => 2,
+                            Cell::Bool(_) => 3,
+                            Cell::Time(_) => 4,
                             Cell::Vec(_) => continue,
                         };
-                        if !seen[slot] {
-                            seen[slot] = true;
-                            kinds.push(value);
+                        if seen[slot] {
+                            continue;
                         }
+                        seen[slot] = true;
+                        kinds.push(match cell {
+                            Cell::Text(_) | Cell::SmallText(_) => Value::String(Arc::from("")),
+                            Cell::Int(_) => Value::Int(0),
+                            Cell::Float(_) => Value::Float(0.0),
+                            Cell::Bool(_) => Value::Bool(false),
+                            Cell::Time(_) => Value::Timestamp(0),
+                            Cell::Null | Cell::Vec(_) => unreachable!("non-probe cell"),
+                        });
                     }
                 }
             }
