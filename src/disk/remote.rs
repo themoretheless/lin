@@ -944,13 +944,17 @@ fn read_http_response<R: Read>(reader: &mut R, is_head: bool) -> Result<(u16, Ve
         return Ok((status, decoded));
     }
     if let Some(expected) = content_length {
-        while leftover.len() < expected {
+        if leftover.len() < expected {
+            // Read straight into spare capacity: zero-filling the whole remainder before
+            // every short read made large bodies quadratic.
             let need = expected - leftover.len();
-            let prev = leftover.len();
-            leftover.resize(prev + need, 0);
-            let n = reader.read(&mut leftover[prev..]).map_err(io_err)?;
-            leftover.truncate(prev + n);
-            if n == 0 {
+            leftover.reserve(need.min(1 << 20));
+            reader
+                .by_ref()
+                .take(need as u64)
+                .read_to_end(&mut leftover)
+                .map_err(io_err)?;
+            if leftover.len() < expected {
                 return Err(Error::runtime(format!(
                     "truncated HTTP response body: got {} of {} bytes",
                     leftover.len(),

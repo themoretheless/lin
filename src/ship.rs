@@ -212,7 +212,33 @@ fn connect_net_stream_addrs(
     opts: &PullOpts,
     timeout: Duration,
 ) -> Result<NetStream, Error> {
-    let stream = TcpStream::connect(addr).map_err(io_err)?;
+    let stream = if timeout.is_zero() {
+        TcpStream::connect(addr).map_err(io_err)?
+    } else {
+        // Bound the connect too: a blackholed peer otherwise blocks for the OS default.
+        let mut last = None;
+        let mut connected = None;
+        for a in addr.to_socket_addrs().map_err(io_err)? {
+            match TcpStream::connect_timeout(&a, timeout) {
+                Ok(s) => {
+                    connected = Some(s);
+                    break;
+                }
+                Err(e) => last = Some(e),
+            }
+        }
+        match connected {
+            Some(s) => s,
+            None => {
+                return Err(io_err(last.unwrap_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "could not resolve to any addresses",
+                    )
+                })));
+            }
+        }
+    };
     let _ = stream.set_nodelay(true);
     let dur = (!timeout.is_zero()).then_some(timeout);
     stream.set_read_timeout(dur).map_err(io_err)?;
