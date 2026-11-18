@@ -202,8 +202,41 @@ pub(crate) struct HashingBatch<'a> {
 }
 
 impl HashingBatch<'_> {
+    fn fill_lowercase_pair(&mut self, title: &str, body: &str) {
+        for token in title.split_ascii_whitespace().chain(body.split_ascii_whitespace()) {
+            self.scratch.bump_token(token);
+        }
+        let slots = bigram_slots();
+        let mut bump = |a: u8, b: u8| {
+            self.scratch.bump_slot(slots[usize::from(a) * 256 + usize::from(b)] as usize, 0.25);
+        };
+        let title = title.as_bytes();
+        let body = body.as_bytes();
+        for w in title.windows(2) {
+            bump(w[0], w[1]);
+        }
+        bump(title[title.len() - 1], b' ');
+        bump(b' ', body[0]);
+        for w in body.windows(2) {
+            bump(w[0], w[1]);
+        }
+    }
+
     #[inline]
     pub(crate) fn embed_parts(&mut self, texts: [Option<&str>; 3]) -> Arc<[f32]> {
+        static DIRECT_PARTS: OnceLock<bool> = OnceLock::new();
+        if self.embedder.dim == 768
+            && *DIRECT_PARTS.get_or_init(|| std::env::var_os("LIN_BENCH_DIRECT_EMBED_PARTS").is_some())
+            && let [Some(title), Some(body), None] = texts
+            && !title.is_empty()
+            && !body.is_empty()
+            && [title, body].into_iter().all(|part| {
+                part.bytes().all(|b| b.is_ascii() && !b.is_ascii_uppercase() && b != 0x0b)
+            })
+        {
+            self.fill_lowercase_pair(title, body);
+            return self.scratch.finish();
+        }
         let bytes: usize = texts.iter().flatten().map(|t| t.len()).sum();
         if bytes == 0 {
             return self.scratch.finish();

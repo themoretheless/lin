@@ -8,6 +8,10 @@ jobs:
   measure:
     runs-on: ubuntu-22.04
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        replica: [1, 2]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -20,6 +24,7 @@ jobs:
           set -o pipefail
           git rev-parse HEAD > wal-provenance.txt
           uname -a >> wal-provenance.txt
+          lscpu >> wal-provenance.txt
           rustc -Vv >> wal-provenance.txt
           sha256sum target/release/lin-peer-worker >> wal-provenance.txt
           python3 scripts/bench-wal-direct-small.py target/release/lin-peer-worker scripts/bench-wal-full.py wal-results.json
@@ -27,7 +32,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: wal-direct-small-linux
+          name: wal-direct-small-linux-${{ matrix.replica }}
           path: |
             wal-results.json
             wal-summary.txt
