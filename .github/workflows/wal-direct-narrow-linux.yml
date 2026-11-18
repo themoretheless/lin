@@ -1,0 +1,34 @@
+name: WAL direct narrow Linux benchmark
+on:
+  push:
+    branches: [codex/wal-narrow-raw-20261118]
+permissions:
+  contents: read
+jobs:
+  measure:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.96.0'
+      - name: Build locked release worker
+        run: cargo build --locked --release -p lin-peer-worker
+      - name: Measure WAL FULL with paired controls
+        run: |
+          set -o pipefail
+          git rev-parse HEAD > wal-provenance.txt
+          uname -a >> wal-provenance.txt
+          rustc -Vv >> wal-provenance.txt
+          sha256sum target/release/lin-peer-worker >> wal-provenance.txt
+          python3 scripts/bench-wal-direct-narrow.py target/release/lin-peer-worker scripts/bench-wal-full.py wal-results.json
+          python3 scripts/summarize-wal-direct-narrow.py wal-results.json | tee wal-summary.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: wal-direct-narrow-linux
+          path: |
+            wal-results.json
+            wal-summary.txt
+            wal-provenance.txt

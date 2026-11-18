@@ -329,19 +329,34 @@ pub(super) unsafe fn append_sparse_iter_neon<'a>(
     iter: impl Iterator<Item = Option<&'a [f32]>>,
     buf: &mut Vec<u8>,
 ) -> Result<(), Error> {
+    // SAFETY: the wrapper has the same target feature as the implementation.
+    unsafe { append_sparse_iter_neon_width::<false>(iter, buf) }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+pub(super) unsafe fn append_sparse_iter_neon_width<'a, const NARROW: bool>(
+    iter: impl Iterator<Item = Option<&'a [f32]>>,
+    buf: &mut Vec<u8>,
+) -> Result<(), Error> {
+    let header_bytes = if NARROW { 9 } else { 8 };
+    let entry_bytes = if NARROW { 6 } else { 8 };
     for row in iter {
         let Some(emb) = row else {
             buf.extend_from_slice(&0u32.to_le_bytes());
             continue;
         };
+        if NARROW && emb.len() > 65536 {
+            return Err(io_err("narrow sparse vector dimension overflow"));
+        }
         let dim = u32::try_from(emb.len())
             .ok()
             .and_then(|n| n.checked_add(1))
             .ok_or_else(|| io_err("sparse vector dimension overflow"))?;
         let max_bytes = emb
             .len()
-            .checked_mul(8)
-            .and_then(|n| n.checked_add(8))
+            .checked_mul(entry_bytes)
+            .and_then(|n| n.checked_add(header_bytes))
             .ok_or_else(|| io_err("sparse vector size overflow"))?;
         let base = buf.len();
         buf.reserve(max_bytes);
@@ -349,7 +364,10 @@ pub(super) unsafe fn append_sparse_iter_neon<'a>(
         unsafe {
             let start_ptr = buf.as_mut_ptr().add(base);
             std::ptr::copy_nonoverlapping(dim.to_le_bytes().as_ptr(), start_ptr, 4);
-            let mut cur = start_ptr.add(8);
+            if NARROW {
+                start_ptr.add(8).write(DICTIONARY_RAW_NARROW);
+            }
+            let mut cur = start_ptr.add(header_bytes);
             for (block, values) in emb.chunks(8).enumerate() {
                 let mut mask = if values.len() == 8 {
                     presence_mask8(values)
@@ -364,17 +382,22 @@ pub(super) unsafe fn append_sparse_iter_neon<'a>(
                     let offset = mask.trailing_zeros() as usize;
                     let index = base_idx + (offset as u32);
                     let bits = values[offset].to_bits();
-                    #[cfg(target_endian = "little")]
-                    {
-                        let packed = (index as u64) | ((bits as u64) << 32);
-                        std::ptr::write_unaligned(cur as *mut u64, packed);
+                    if NARROW {
+                        std::ptr::write_unaligned(cur.cast::<u16>(), (index as u16).to_le());
+                        std::ptr::write_unaligned(cur.add(2).cast::<u32>(), bits.to_le());
+                    } else {
+                        #[cfg(target_endian = "little")]
+                        {
+                            let packed = (index as u64) | ((bits as u64) << 32);
+                            std::ptr::write_unaligned(cur as *mut u64, packed);
+                        }
+                        #[cfg(not(target_endian = "little"))]
+                        {
+                            std::ptr::copy_nonoverlapping(index.to_le_bytes().as_ptr(), cur, 4);
+                            std::ptr::copy_nonoverlapping(bits.to_le_bytes().as_ptr(), cur.add(4), 4);
+                        }
                     }
-                    #[cfg(not(target_endian = "little"))]
-                    {
-                        std::ptr::copy_nonoverlapping(index.to_le_bytes().as_ptr(), cur, 4);
-                        std::ptr::copy_nonoverlapping(bits.to_le_bytes().as_ptr(), cur.add(4), 4);
-                    }
-                    cur = cur.add(8);
+                    cur = cur.add(entry_bytes);
                     count += 1;
                     mask &= mask - 1;
                 }
@@ -1039,6 +1062,7 @@ fn dictionary_writer_enabled() -> bool {
 
 /// Most distinct nonzero bit patterns a dictionary row may carry.
 const DICTIONARY_MAX_VALUES: usize = 16;
+pub(super) const DICTIONARY_RAW_NARROW: u8 = 255;
 
 /// Append vector rows in the dictionary layout (column tag 8), stopping as soon as the
 /// output reaches `give_up_at` bytes: `Ok(false)` then means "not smaller, discard `out`".
@@ -1047,7 +1071,8 @@ const DICTIONARY_MAX_VALUES: usize = 16;
 /// nonzero values, `u8` dictionary length `d`. With `d` in `1..=16` follow `d` distinct
 /// nonzero `f32` bit patterns and one `(index, u8 ordinal)` per nonzero value, the index
 /// being `u16` for dimensions up to 65536 and `u32` above; with `d = 0` (more than 16
-/// distinct values) follow raw `(u32 index, u32 bits)` entries. Values are compared and
+/// distinct values) follow raw `(u32 index, u32 bits)` entries. With marker 255,
+/// raw entries use a `u16` index and require a dimension at most 65536. Values are compared and
 /// stored as bits, so `-0.0`, infinities and NaN payloads survive; `+0.0` is the absent
 /// value.
 #[cfg(target_arch = "aarch64")]
@@ -1135,6 +1160,31 @@ fn collect_nz_and_dict_scalar(
     (d, raw)
 }
 
+// Experimental benchmark toggle. Defaults to the existing dictionary selection.
+fn direct_narrow_writer_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("LIN_BENCH_DIRECT_NARROW").is_some())
+}
+
+pub(super) fn append_direct_narrow_row(emb: &[f32], out: &mut Vec<u8>) -> usize {
+    debug_assert!(emb.len() <= 65536);
+    let start = out.len();
+    out.extend_from_slice(&(emb.len() as u32 + 1).to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.push(DICTIONARY_RAW_NARROW);
+    let mut count = 0u32;
+    for (index, value) in emb.iter().enumerate() {
+        let bits = value.to_bits();
+        if bits != 0 {
+            out.extend_from_slice(&(index as u16).to_le_bytes());
+            out.extend_from_slice(&bits.to_le_bytes());
+            count += 1;
+        }
+    }
+    out[start + 4..start + 8].copy_from_slice(&count.to_le_bytes());
+    count as usize
+}
+
 pub(super) fn append_dictionary_rows_counted<'a>(
     rows: impl Iterator<Item = Option<&'a [f32]>>,
     out: &mut Vec<u8>,
@@ -1142,6 +1192,7 @@ pub(super) fn append_dictionary_rows_counted<'a>(
 ) -> Result<(bool, usize), Error> {
     #[cfg(target_arch = "aarch64")]
     let use_neon = std::arch::is_aarch64_feature_detected!("neon");
+    let direct_narrow = direct_narrow_writer_enabled();
     let mut nz: smallvec::SmallVec<[(u32, u32); 32]> = smallvec::SmallVec::new();
     let mut dictionary = [0u32; DICTIONARY_MAX_VALUES];
     let mut exact_sparse_bytes = 0usize;
@@ -1154,6 +1205,21 @@ pub(super) fn append_dictionary_rows_counted<'a>(
             exact_sparse_bytes = exact_sparse_bytes.saturating_add(4);
             continue;
         };
+        if direct_narrow && emb.len() <= 65536 {
+            #[cfg(target_arch = "aarch64")]
+            let count = if use_neon {
+                let start = out.len();
+                // SAFETY: runtime NEON check and the dimension guard above.
+                unsafe { append_sparse_iter_neon_width::<true>(std::iter::once(Some(emb)), out)? };
+                (out.len() - start - 9) / 6
+            } else {
+                append_direct_narrow_row(emb, out)
+            };
+            #[cfg(not(target_arch = "aarch64"))]
+            let count = append_direct_narrow_row(emb, out);
+            exact_sparse_bytes = exact_sparse_bytes.saturating_add(8 + count * 8);
+            continue;
+        }
         let code = u32::try_from(emb.len())
             .ok()
             .and_then(|n| n.checked_add(1))
@@ -1174,10 +1240,15 @@ pub(super) fn append_dictionary_rows_counted<'a>(
         out.extend_from_slice(&code.to_le_bytes());
         out.extend_from_slice(&count.to_le_bytes());
         if raw {
-            out.push(0);
-            out.reserve(nz.len() * 8);
+            let narrow = emb.len() <= 65536;
+            out.push(if narrow { DICTIONARY_RAW_NARROW } else { 0 });
+            out.reserve(nz.len() * if narrow { 6 } else { 8 });
             for &(index, bits) in &nz {
-                out.extend_from_slice(&index.to_le_bytes());
+                if narrow {
+                    out.extend_from_slice(&(index as u16).to_le_bytes());
+                } else {
+                    out.extend_from_slice(&index.to_le_bytes());
+                }
                 out.extend_from_slice(&bits.to_le_bytes());
             }
             continue;
@@ -1701,7 +1772,9 @@ pub(crate) fn encode_insert_rows_direct_ext(
                     let mut accepted_sparse = false;
                     let mut used_dict = false;
                     let mark = buf.len();
-                    let mut try_raw_sparse = !dictionary_writer_enabled();
+                    // Snapshot and backup chunks pass an empty collection and use
+                    // readers that only support the original sparse codec.
+                    let mut try_raw_sparse = collection.is_empty() || !dictionary_writer_enabled();
                     if !try_raw_sparse {
                         let dict_give_up = if has_empty {
                             usize::MAX
@@ -1931,8 +2004,13 @@ pub(super) fn take_dictionary_vectors(
         }
         let dim = (code - 1) as usize;
         let count = take_u32(buf, i)? as usize;
-        let d = *buf.get(*i).ok_or(())? as usize;
+        let marker = *buf.get(*i).ok_or(())?;
         *i += 1;
+        let raw_narrow = marker == DICTIONARY_RAW_NARROW;
+        if raw_narrow && dim > 65536 {
+            return Err(());
+        }
+        let d = if raw_narrow { 0 } else { usize::from(marker) };
         if count > dim || d > 16 || d > count {
             return Err(());
         }
@@ -1944,7 +2022,7 @@ pub(super) fn take_dictionary_vectors(
             }
             dictionary[slot] = bits;
         }
-        let index_bytes = if d > 0 && dim <= 65536 {
+        let index_bytes = if raw_narrow || (d > 0 && dim <= 65536) {
             2usize
         } else {
             4usize

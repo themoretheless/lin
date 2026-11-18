@@ -1293,17 +1293,17 @@ mod dictionary_wal_tests {
     }
 
     /// The dictionary layout is chosen only when it is strictly smaller. Dense vectors,
-    /// rows of all-distinct values and tiny columns keep the codec they had, byte for
+    /// wide rows of all-distinct values and tiny columns keep the codec they had, byte for
     /// byte, with the writer on.
     #[test]
     fn dictionary_writer_keeps_existing_codecs_when_it_does_not_help() {
         // Dense: every value nonzero, so the column is not sparse to begin with.
         let dense: Vec<Option<Vec<f32>>> =
             (0..100).map(|r| Some((0..1024).map(|i| 1.0 + ((i + r) % 7) as f32).collect())).collect();
-        // Sparse with all-distinct values: the raw escape costs one byte more per row.
-        let distinct: Vec<Option<Vec<f32>>> = (0..64)
+        // Wide sparse rows use a 32-bit index, so the raw escape adds one byte per row.
+        let distinct: Vec<Option<Vec<f32>>> = (0..2)
             .map(|r| {
-                Some((0..768).map(|i| if i % 11 == 0 { 1.0 + (i * 64 + r) as f32 } else { 0.0 }).collect())
+                Some((0..65537).map(|i| if i % 11 == 0 { 1.0 + (i * 2 + r) as f32 } else { 0.0 }).collect())
             })
             .collect();
         // Below the size at which vectors are considered for sparse encoding at all.
@@ -1355,6 +1355,18 @@ mod dictionary_wal_tests {
                 .collect();
             assert_eq!(got, bits_of(&vectors), "dictionary={dictionary}");
         }
+
+        // The snapshot/backup encoder uses an empty collection in the same direct path.
+        let mut snapshot_payload = b"LCOL".to_vec();
+        let mut chunk = Vec::new();
+        let (magic, _) = with_dictionary_writer(true, || {
+            encode_insert_rows_direct(0, 0, "", &rows, &mut chunk)
+        }).expect("snapshot rows supported by direct encoder");
+        assert_eq!(magic, LOG_MAGIC_SPARSE);
+        snapshot_payload.extend_from_slice(&magic);
+        snapshot_payload.extend_from_slice(&chunk);
+        let decoded = super::super::snapshot::decode_snapshot_payload(&snapshot_payload).unwrap();
+        assert_eq!(decoded, rows);
     }
 
     #[test]
@@ -1502,6 +1514,44 @@ mod dictionary_wal_tests {
         let no_dictionary = payload(1, vec![("embedding", 7, vec![0; 4])]);
         assert!(decode_column_record_mode(&no_dictionary, true, true).is_err());
     }
+    #[test]
+    fn dictionary_raw_index_width_preserves_bits_at_boundary() {
+        for (dim, marker, entry_bytes) in [(65536, DICTIONARY_RAW_NARROW, 6), (65537, 0, 8)] {
+            let mut bits = vec![0; dim];
+            for (offset, slot) in bits[dim - 17..].iter_mut().enumerate() {
+                *slot = 0x7fc0_0001 + offset as u32;
+            }
+            let values: Vec<_> = bits.iter().copied().map(f32::from_bits).collect();
+            let mut encoded = Vec::new();
+            assert!(append_dictionary_rows([Some(values.as_slice())].into_iter(), &mut encoded, usize::MAX).unwrap());
+            assert_eq!(encoded[8], marker);
+            assert_eq!(encoded.len(), 9 + 17 * entry_bytes);
+            if dim == 65536 {
+                let mut direct = Vec::new();
+                assert_eq!(append_direct_narrow_row(&values, &mut direct), 17);
+                assert_eq!(direct, encoded);
+                #[cfg(target_arch = "aarch64")]
+                if std::arch::is_aarch64_feature_detected!("neon") {
+                    direct.clear();
+                    // SAFETY: runtime feature check and a bounded vector dimension.
+                    unsafe {
+                        append_sparse_iter_neon_width::<true>([Some(values.as_slice())].into_iter(), &mut direct)
+                            .unwrap();
+                    }
+                    assert_eq!(direct, encoded);
+                }
+            }
+            let mut cursor = 0;
+            let decoded = take_dictionary_vectors(&encoded, &mut cursor, 1, &mut 0).unwrap();
+            assert_eq!(cursor, encoded.len());
+            assert!(decoded[0].as_ref().unwrap().iter().map(|x| x.to_bits()).eq(bits));
+            let mut cursor = 0;
+            assert!(take_dictionary_vectors(
+                &encoded[..encoded.len() - 1], &mut cursor, 1, &mut 0,
+            ).is_err());
+        }
+    }
+
     #[test]
     fn dictionary_budget_covers_metadata_vectors_and_mixed_dense_columns() {
         let b = rows_bytes(&[Some(vec![0x3f800000])]);
