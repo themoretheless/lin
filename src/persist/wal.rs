@@ -335,7 +335,34 @@ pub(crate) fn reserve_wal_space(log: &File, additional: usize, empty_only: bool)
         // Unsupported filesystem / allocation failure retains the ordinary write path.
         let _ = unsafe { libc::fcntl(log.as_raw_fd(), libc::F_PREALLOCATE, &mut request) };
     }
-    #[cfg(not(target_vendor = "apple"))]
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::{fs::MetadataExt, io::AsRawFd};
+        const CHUNK: u64 = 1024 * 1024;
+        let Ok(metadata) = log.metadata() else {
+            return;
+        };
+        let offset = metadata.len();
+        if empty_only && offset != 0 {
+            return;
+        }
+        let Some(required) = offset.checked_add(additional as u64) else {
+            return;
+        };
+        if metadata.blocks().saturating_mul(512) >= required {
+            return;
+        }
+        let Some(end) = required.checked_add(CHUNK - 1).map(|n| n / CHUNK * CHUNK) else {
+            return;
+        };
+        let (Ok(offset), Ok(length)) = (i64::try_from(offset), i64::try_from(end - offset)) else {
+            return;
+        };
+        // Preserve the logical end of the WAL. Unsupported filesystems and
+        // reservation failures continue through the ordinary write path.
+        let _ = unsafe { libc::fallocate(log.as_raw_fd(), libc::FALLOC_FL_KEEP_SIZE, offset, length) };
+    }
+    #[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
     let _ = (log, additional, empty_only);
 }
 

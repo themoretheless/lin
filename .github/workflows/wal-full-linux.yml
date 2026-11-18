@@ -1,7 +1,7 @@
 name: WAL FULL Linux baseline
 on:
   push:
-    branches: [codex/wal-full-linux-baseline]
+    branches: [codex/linux-wal-preallocation]
     paths:
       - .github/workflows/wal-full-linux.yml
       - scripts/bench-wal-full.py
@@ -17,20 +17,24 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: '1.96.0'
-      - name: Build locked release worker
-        run: cargo build --locked --release -p lin-peer-worker
+      - name: Build locked release workers
+        run: |
+          git fetch --depth=1 origin b688b8ebf8f0015e57a72dc53d534ceea0afac28
+          git worktree add --detach /tmp/lin-wal-baseline FETCH_HEAD
+          cargo build --locked --release -p lin-peer-worker
+          cargo build --manifest-path /tmp/lin-wal-baseline/Cargo.toml --locked --release -p lin-peer-worker
       - name: Measure fresh WAL FULL inserts
         run: |
           set -o pipefail
           git rev-parse HEAD > wal-provenance.txt
           uname -a >> wal-provenance.txt
           rustc -Vv >> wal-provenance.txt
-          sha256sum target/release/lin-peer-worker >> wal-provenance.txt
-          python3 scripts/bench-wal-full.py target/release/lin-peer-worker wal-results.json | tee wal-summary.txt
+          sha256sum /tmp/lin-wal-baseline/target/release/lin-peer-worker target/release/lin-peer-worker >> wal-provenance.txt
+          python3 scripts/bench-wal-full.py /tmp/lin-wal-baseline/target/release/lin-peer-worker wal-results.json --candidate target/release/lin-peer-worker --blocks 2 | tee wal-summary.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: wal-full-linux-baseline
+          name: linux-wal-preallocation
           path: |
             wal-results.json
             wal-summary.txt
