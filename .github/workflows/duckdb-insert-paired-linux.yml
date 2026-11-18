@@ -36,3 +36,5 @@ jobs:
             duckdb-results.json
             duckdb-summary.txt
             duckdb-provenance.txt
+      - name: Verify fused insert including UTF-8 and fallback
+        run: cargo test --locked --lib fused_column_insert_preserves_hashes_vectors_and_fallback
