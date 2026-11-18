@@ -62,40 +62,18 @@ pub(super) fn next_docs_epoch() -> u64 {
     NEXT_DOCS_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
-pub(super) struct RecycledIdTitle {
-    pub(super) docs_epoch: u64,
-    pub(super) filter_tag: u64,
-    pub(super) first_idx: usize,
-    pub(super) last_idx: usize,
-    pub(super) rows: Vec<Row>,
-}
-
-pub(super) static ID_TITLE_POOL: std::sync::Mutex<Option<RecycledIdTitle>> =
-    std::sync::Mutex::new(None);
-
-thread_local! {
-    pub(super) static LAST_ID_TITLE_META: std::cell::Cell<(u64, u64, usize, usize)> =
-        const { std::cell::Cell::new((0, 0, 0, 0)) };
-}
+/// One recycled `{id, title}` result vector. Process-wide, so its contents are never
+/// trusted: users refill or clear it.
+pub(super) static ID_TITLE_POOL: std::sync::Mutex<Option<Vec<Row>>> = std::sync::Mutex::new(None);
 
 pub fn release_id_title_rows(rows: Vec<Row>) {
-    let (docs_epoch, filter_tag, first_idx, last_idx) = LAST_ID_TITLE_META.with(|c| c.get());
     if let Ok(mut guard) = ID_TITLE_POOL.lock() {
-        *guard = Some(RecycledIdTitle {
-            docs_epoch,
-            filter_tag,
-            first_idx,
-            last_idx,
-            rows,
-        });
+        *guard = Some(rows);
     }
 }
 
 pub(crate) fn take_recycled_id_title_vec() -> Option<Vec<Row>> {
-    ID_TITLE_POOL
-        .lock()
-        .ok()
-        .and_then(|mut guard| guard.take().map(|r| r.rows))
+    ID_TITLE_POOL.lock().ok().and_then(|mut guard| guard.take())
 }
 
 thread_local! {
@@ -171,21 +149,6 @@ pub(crate) fn take_general_rows() -> Option<Vec<Row>> {
         .try_with(|cell| cell.try_borrow_mut().ok().and_then(|mut s| s.take()))
         .ok()
         .flatten()
-}
-
-#[inline]
-pub(super) fn row_matches_id_title(row: &Row, id: &Arc<str>, title: &Arc<str>) -> bool {
-    if row.len() != 2 {
-        return false;
-    }
-    let mut it = row.iter();
-    let Some((k1, Cell::Text(v1))) = it.next() else {
-        return false;
-    };
-    let Some((k2, Cell::Text(v2))) = it.next() else {
-        return false;
-    };
-    k1 == "id" && k2 == "title" && Arc::ptr_eq(v1, id) && Arc::ptr_eq(v2, title)
 }
 
 /// Compact inline string storage for strings up to 22 bytes.

@@ -261,3 +261,54 @@ fn test_durable_persistence_across_restart() {
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
+
+#[test]
+fn concurrent_read_modify_write_commands_do_not_lose_updates() {
+    let cfg = CacheConfig {
+        node_id: "node-rmw".to_string(),
+        listen_addr: "127.0.0.1:0".to_string(),
+        max_entries: 1_000,
+        max_bytes: 64 * 1024 * 1024,
+        vnodes: 32,
+        replication_factor: 1,
+        sharding_enabled: false,
+        raft_replication: false,
+        gossip_interval_ms: 100,
+        node_timeout_ms: 5_000,
+    };
+    let node = CacheNode::new_in_memory(cfg).unwrap();
+    const THREADS: usize = 8;
+    const PER_THREAD: usize = 500;
+    thread::scope(|s| {
+        for t in 0..THREADS {
+            let node = &node;
+            s.spawn(move || {
+                for i in 0..PER_THREAD {
+                    node.execute(CacheRequest::IncrBy {
+                        key: "hits".into(),
+                        delta: 1,
+                    });
+                    node.execute(CacheRequest::RPush {
+                        key: "queue".into(),
+                        values: vec![format!("{t}-{i}").into_bytes()],
+                    });
+                }
+            });
+        }
+    });
+    let total = (THREADS * PER_THREAD) as i64;
+    assert_eq!(
+        node.execute(CacheRequest::IncrBy {
+            key: "hits".into(),
+            delta: 0,
+        }),
+        CacheResponse::Int(total)
+    );
+    assert_eq!(
+        node.execute(CacheRequest::RPush {
+            key: "queue".into(),
+            values: Vec::new(),
+        }),
+        CacheResponse::Int(total)
+    );
+}
