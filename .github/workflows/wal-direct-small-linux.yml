@@ -6,12 +6,12 @@ permissions:
   contents: read
 jobs:
   measure:
-    runs-on: ubuntu-22.04
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        replica: [1, 2]
+        runner: [ubuntu-22.04, ubuntu-24.04-arm]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -32,7 +32,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: wal-direct-small-linux-${{ matrix.replica }}
+          name: wal-direct-small-linux-${{ matrix.runner }}
           path: |
             wal-results.json
             wal-summary.txt

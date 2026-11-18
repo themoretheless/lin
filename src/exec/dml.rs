@@ -2057,7 +2057,13 @@ fn build_insert_rows(
             txs
         });
         if !workers.is_empty() {
-            let chunk_size = 64usize;
+            let chunk_size = if (512..2048).contains(&n)
+                && std::env::var_os("LIN_BENCH_WAL_BUILD_GRAIN").is_some()
+            {
+                128usize
+            } else {
+                64usize
+            };
             let total_chunks = n.div_ceil(chunk_size);
             let mut rows: Vec<Row> = Vec::with_capacity(n);
             let spare = &mut rows.spare_capacity_mut()[..n];

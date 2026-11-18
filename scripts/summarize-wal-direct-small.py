@@ -20,7 +20,7 @@ for n in (1000, 10000):
         gain = median(1 - x["compact"][metric] / x["base"][metric] for x in samples)
         print(metric, f"paired gain {gain:.2%}, median A/A noise {aa:.2%}")
     gain = median(1 - x["compact"]["insert_ns"] / x["serial"]["insert_ns"] for x in samples)
-    print("embedding-only paired gain", f"{gain:.2%}")
+    print("row-build-only paired gain", f"{gain:.2%}")
     for role in ("base", "control", "serial", "compact"):
         wins = sum(x[role]["insert_ns"] < x["sqlite"]["insert_ns"] for x in samples)
         print(f"{role} wins vs SQLite: {wins}/{len(samples)}")

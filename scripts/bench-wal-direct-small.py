@@ -42,11 +42,11 @@ for n in (1000, 10000):
                         continue
                     env = dict(os.environ)
                     env.pop("LIN_BENCH_SERIAL_WAL_VECTORS", None)
-                    env.pop("LIN_BENCH_DIRECT_EMBED_PARTS", None)
+                    env.pop("LIN_BENCH_WAL_BUILD_GRAIN", None)
                     if role in ("serial", "compact"):
                         env["LIN_BENCH_SERIAL_WAL_VECTORS"] = "1"
                     if role == "compact":
-                        env["LIN_BENCH_DIRECT_EMBED_PARTS"] = "1"
+                        env["LIN_BENCH_WAL_BUILD_GRAIN"] = "1"
                     req = dict(insert_rows=n, samples=1, timestamp_ms=123456, durable_dir=path)
                     data = json.loads(subprocess.check_output([worker], input=json.dumps(req)+"\n", env=env, text=True))
                     assert [tuple(row) for row in data["result"]] == rows
