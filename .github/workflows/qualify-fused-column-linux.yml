@@ -1,4 +1,4 @@
-name: Qualify fused column inserts on Linux
+name: Measure inline text in fused column inserts
 on:
   push:
     branches: [codex/qualify-fused-column-20261118]
@@ -25,7 +25,7 @@ jobs:
       - name: Build baseline and clean candidate
         run: |
           set -euo pipefail
-          git worktree add --detach "$RUNNER_TEMP/lin-baseline" 2929273fa9b06f8e5ddae4fccb9fc9076c22b382
+          git worktree add --detach "$RUNNER_TEMP/lin-baseline" 7c2353df1
           cp tools/peer-worker/src/main.rs "$RUNNER_TEMP/lin-baseline/tools/peer-worker/src/main.rs"
           cargo build --locked --release -p lin-peer-worker
           CARGO_TARGET_DIR="$RUNNER_TEMP/lin-baseline-target" cargo build --manifest-path "$RUNNER_TEMP/lin-baseline/Cargo.toml" --locked --release -p lin-peer-worker
@@ -33,7 +33,7 @@ jobs:
       - name: Compare both Lin builds with DuckDB
         run: |
           set -euo pipefail
-          git rev-parse HEAD HEAD^ > provenance.txt
+          git rev-parse HEAD > provenance.txt
           git -C "$RUNNER_TEMP/lin-baseline" rev-parse HEAD >> provenance.txt
           uname -a >> provenance.txt
           lscpu >> provenance.txt
