@@ -107,6 +107,8 @@ fn measure_insert(
     let fields = ["id", "uri", "wing", "title", "ts", "body"].map(String::from);
     let mut timings = Vec::with_capacity(samples);
     let mut result = Value::Null;
+    let mut reopen_ns = Vec::new();
+    let mut wal_bytes = Vec::new();
     for _ in 0..samples {
         let mut db = match durable {
             Some(path) => Db::open_with(path, lin::OpenOpts { sync: lin::SyncMode::Full, cold: false })?,
@@ -134,7 +136,29 @@ fn measure_insert(
             return Err("insert affected count mismatch".into());
         }
         if let Some(path) = durable {
-            drop(db);
+            let recovery_dir = path.join("recovery");
+            std::fs::create_dir(&recovery_dir)?;
+            let log = lin::persist::log_path(path);
+            wal_bytes.push(log.metadata()?.len());
+            std::fs::copy(&log, lin::persist::log_path(&recovery_dir))?;
+            let head = lin::persist::head_path(path);
+            if head.exists() {
+                std::fs::copy(&head, lin::persist::head_path(&recovery_dir))?;
+            }
+            let snapshot = lin::persist::snapshot_path(path);
+            if snapshot.exists() {
+                std::fs::copy(&snapshot, lin::persist::snapshot_path(&recovery_dir))?;
+            }
+            let reopen = Instant::now();
+            let recovered = Db::open(&recovery_dir)?;
+            reopen_ns.push(reopen.elapsed().as_nanos() as u64);
+            let recovered_rows = recovered.store.collection("docs");
+            if canonical(recovered_rows, &fields) != Value::Array(expected.clone()) {
+                return Err("WAL recovery exact values mismatch".into());
+            }
+            drop(recovered);
+            std::fs::remove_dir_all(recovery_dir)?;
+            db.close()?;
             db = Db::open(path)?;
         }
         let rows = db.store.collection("docs");
@@ -150,7 +174,7 @@ fn measure_insert(
             return Err("insert exact values mismatch".into());
         }
     }
-    Ok(json!({"samples_ns":timings,"result":result,
+    Ok(json!({"samples_ns":timings,"result":result,"reopen_ns":reopen_ns,"wal_bytes":wal_bytes,
         "statement_rows_limit":10_000,"statements":sources.len(),
         "api":if sources.len()==1 {"prepared run"} else {"prepared chunks in one memory transaction"}}))
 }
