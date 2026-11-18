@@ -743,7 +743,7 @@ fn next_lazy_join(store: &Store, join: &mut LazyJoinCursor) -> Option<Result<Row
             } else if let Some(r) = right {
                 let mut merged = left_row;
                 for (k, v) in r {
-                    merged.insert(format!("{}.{}", join.right_col, k), v.clone());
+                    crate::exec::insert_prefixed(&mut merged, &join.right_col, k, v.clone());
                 }
                 merged
             } else {
@@ -778,7 +778,7 @@ fn next_lazy_join(store: &Store, join: &mut LazyJoinCursor) -> Option<Result<Row
         for r in hits {
             let mut merged = left_row.clone();
             for (k, v) in r {
-                merged.insert(format!("{}.{}", join.right_col, k), v);
+                crate::exec::insert_prefixed(&mut merged, &join.right_col, &k, v);
             }
             let out = apply_project(&merged, join.project.as_deref());
             join.pending.push_back(out);

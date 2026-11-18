@@ -3450,7 +3450,7 @@ impl Store {
             let by_id = if let Some(m) = self.by_id.get_mut(collection) {
                 m
             } else {
-                self.by_id.entry(collection.to_string()).or_default()
+                by_id_slot(&mut self.by_id, collection)
             };
             let first = &rows[0];
             let id_pos = first.keys().position(|k| k == "id");
@@ -3522,7 +3522,7 @@ impl Store {
             return;
         }
         if collection == "orders" && self.orders_id.len() == start {
-            let by_id = self.by_id.entry(collection.to_string()).or_default();
+            let by_id = by_id_slot(&mut self.by_id, collection);
             for (i, row) in rows.iter().enumerate() {
                 let idx = start + i;
                 let id = row
@@ -3547,7 +3547,7 @@ impl Store {
             return;
         }
         if collection == "users" && self.users_id.len() == start {
-            let by_id = self.by_id.entry(collection.to_string()).or_default();
+            let by_id = by_id_slot(&mut self.by_id, collection);
             for (i, row) in rows.iter().enumerate() {
                 let idx = start + i;
                 let id = row
@@ -3567,7 +3567,7 @@ impl Store {
             return;
         }
         if !matches!(collection, "docs" | "orders" | "users" | "facts") {
-            let by_id = self.by_id.entry(collection.to_string()).or_default();
+            let by_id = by_id_slot(&mut self.by_id, collection);
             for (i, row) in rows.iter().enumerate() {
                 if let Some(id) = row.get("id").and_then(Cell::text_shared) {
                     by_id.insert(id, start + i);
@@ -3757,7 +3757,7 @@ impl Store {
             let indexes = &mut self.indexes;
             let fts_opt = self.fts.get_mut(collection);
             let hnsw_opt = self.hnsw.get_mut(collection);
-            let by_id = self.by_id.entry(collection.to_string()).or_default();
+            let by_id = by_id_slot(&mut self.by_id, collection);
             let docs_by_uri = &mut self.docs_by_uri;
             let docs_id = &mut self.docs_id;
             let docs_title = &mut self.docs_title;
@@ -4731,6 +4731,19 @@ impl Store {
     }
 }
 
+
+/// The id map of `collection`, created on first use. Looked up by `&str` first: the
+/// `entry` form allocated the collection name on every insert statement.
+#[inline]
+fn by_id_slot<'a>(
+    by_id: &'a mut BTreeMap<String, FxHashMap<Arc<str>, usize>>,
+    collection: &str,
+) -> &'a mut FxHashMap<Arc<str>, usize> {
+    if !by_id.contains_key(collection) {
+        by_id.insert(collection.to_string(), FxHashMap::default());
+    }
+    by_id.get_mut(collection).expect("slot inserted above")
+}
 
 /// The live definition of a persisted index. Its filter is stored as source text; one
 /// that no longer parses is dropped, leaving the index unfiltered (every caller has

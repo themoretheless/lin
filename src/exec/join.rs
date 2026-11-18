@@ -96,9 +96,27 @@ fn sort_orders_partition(
     }
 }
 
+/// Sets `prefix.key` on `row`. The name is assembled in a reused buffer: joins call this
+/// once per right-hand cell of every output row, and `Row::insert` only borrows the key.
+#[inline]
+pub(crate) fn insert_prefixed(row: &mut Row, prefix: &str, key: &str, value: Cell) {
+    thread_local! {
+        static NAME: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    }
+    NAME.with(|name| {
+        let mut name = name.borrow_mut();
+        name.clear();
+        name.reserve(prefix.len() + 1 + key.len());
+        name.push_str(prefix);
+        name.push('.');
+        name.push_str(key);
+        row.insert(name.as_str(), value);
+    });
+}
+
 pub(crate) fn merge_join_row(mut left: Row, right: &Row, right_col: &str) -> Row {
     for (k, v) in right {
-        left.insert(format!("{right_col}.{k}"), v.clone_for_borrow());
+        insert_prefixed(&mut left, right_col, k, v.clone_for_borrow());
     }
     left
 }

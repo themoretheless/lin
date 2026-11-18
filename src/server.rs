@@ -25,6 +25,9 @@ use crate::ship::{
 const WIRE_MAGIC: &[u8; 5] = b"LINS\x01";
 const WIRE_CRC_TAG: &[u8; 4] = b"LCRC";
 const MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
+/// Largest frame accepted before a connection has authenticated: enough for the hello,
+/// far below what an anonymous peer could otherwise make the server allocate.
+const PREAUTH_MAX_FRAME_BYTES: usize = 64 * 1024;
 const IDLE_POLL_SLICE: Duration = Duration::from_millis(80);
 const MAX_POOLED_CONNS: usize = 16;
 
@@ -364,6 +367,7 @@ fn read_frame_idle(
     stream: &mut NetStream,
     shutdown: Option<&AtomicBool>,
     io_timeout: Duration,
+    max_frame_bytes: usize,
 ) -> Result<ReadFrameResult, Error> {
     let mut hdr = [0u8; 10];
     let mut read_hdr = 0usize;
@@ -420,9 +424,9 @@ fn read_frame_idle(
     }
     let op = hdr[5];
     let len = u32::from_le_bytes(hdr[6..10].try_into().unwrap()) as usize;
-    if len > MAX_FRAME_BYTES {
+    if len > max_frame_bytes {
         return Err(Error::runtime(format!(
-            "frame payload {len} exceeds max {MAX_FRAME_BYTES}"
+            "frame payload {len} exceeds max {max_frame_bytes}"
         )));
     }
 
@@ -1075,6 +1079,11 @@ fn handle_client_connection(stream: &mut NetStream, state: &Arc<ServerState>) {
             stream,
             Some(&state.shutdown),
             state.config.io_timeout,
+            if authed {
+                MAX_FRAME_BYTES
+            } else {
+                PREAUTH_MAX_FRAME_BYTES
+            },
         ) {
             Ok(ReadFrameResult::Eof) => break,
             Ok(ReadFrameResult::Frame { op, payload }) => (op, payload),
@@ -1502,7 +1511,7 @@ impl ServerClient {
         push_str(&mut hello, self.opts.token.as_deref().unwrap_or(""))?;
         push_opt_str(&mut hello, self.opts.workload_group.as_deref())?;
         write_frame(&mut stream, OP_HELLO, &hello)?;
-        let resp = match read_frame_idle(&mut stream, None, self.opts.timeout)? {
+        let resp = match read_frame_idle(&mut stream, None, self.opts.timeout, MAX_FRAME_BYTES)? {
             ReadFrameResult::Frame { op, payload } if op == OP_HELLO => payload,
             ReadFrameResult::Frame { op, .. } => {
                 return Err(Error::runtime(format!("unexpected hello reply op {op}")));
@@ -1565,7 +1574,7 @@ impl ServerClient {
 
     fn send_and_recv(&self, stream: &mut NetStream, op: u8, payload: &[u8]) -> Result<Vec<u8>, Error> {
         write_frame(stream, op, payload)?;
-        match read_frame_idle(stream, None, self.opts.timeout)? {
+        match read_frame_idle(stream, None, self.opts.timeout, MAX_FRAME_BYTES)? {
             ReadFrameResult::Frame { op: resp_op, payload } => {
                 if resp_op != op {
                     return Err(Error::runtime(format!(

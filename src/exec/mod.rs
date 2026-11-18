@@ -29,7 +29,7 @@ pub(crate) use agg::*;
 pub(crate) use crate::eval;
 pub(crate) use crate::eval::*;
 pub(crate) use join::{
-    JoinFieldPlan, emit_join_row, merge_join_row, order_total_cell, plan_join_fields,
+    JoinFieldPlan, emit_join_row, insert_prefixed, merge_join_row, order_total_cell, plan_join_fields,
     pred_total_gt, project_join_fields, rows_to_rough_batch,
 };
 
