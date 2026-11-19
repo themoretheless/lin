@@ -894,8 +894,9 @@ fn cmd_backup(args: &[String], data: Option<PathBuf>) -> ExitCode {
                 eprintln!("usage: lin backup import <file.json> [--data <dir>]");
                 return ExitCode::from(2);
             };
-            // Allow `--data` after import path as well.
+            // Allow `--data` and `--force` after import path as well.
             let mut data = data;
+            let mut force = args.iter().any(|a| a == "--force" || a == "-f");
             let mut i = 2;
             while i < args.len() {
                 if args[i] == "--data" {
@@ -904,12 +905,15 @@ fn cmd_backup(args: &[String], data: Option<PathBuf>) -> ExitCode {
                         args.get(i).map(String::as_str).unwrap_or(".lin"),
                     ));
                     i += 1;
+                } else if args[i] == "--force" || args[i] == "-f" {
+                    force = true;
+                    i += 1;
                 } else {
                     i += 1;
                 }
             }
             match data {
-                Some(dir) => match Db::import_backup_into(path, &dir) {
+                Some(dir) => match Db::import_backup_into_checked(path, &dir, force) {
                     Ok(mut db) => {
                         let s = db.stats();
                         let _ = db.close();

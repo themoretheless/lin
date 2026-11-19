@@ -200,11 +200,87 @@ enum CursorState<'a> {
     LazyJoinSoa(LazyJoinSoa<'a>),
     /// Cold collection pulled from the disk engine chunk by chunk.
     DiskStream(DiskStreamCursor),
+    /// Cold search / hop cursor pulling ranked or reached keys lazily via point reads.
+    DiskIds(DiskIdsCursor),
     /// Join whose left side streams from the disk engine and whose right side is probed
     /// by `id`, without materializing either collection.
     DiskJoin(DiskJoinCursor),
     Buffered(std::vec::IntoIter<Row>),
     Done,
+}
+
+struct DiskIdsCursor {
+    collection: String,
+    resolve_doc_uri: bool,
+    fallback_col: Option<String>,
+    ids: Vec<Arc<str>>,
+    pos: usize,
+    project: Option<Arc<[String]>>,
+    skip_left: usize,
+    take_left: Option<usize>,
+}
+
+fn next_disk_ids(store: &Store, cur: &mut DiskIdsCursor) -> Option<Result<Row, Error>> {
+    loop {
+        if cur.take_left == Some(0) || cur.pos >= cur.ids.len() {
+            return None;
+        }
+        let key = &cur.ids[cur.pos];
+        cur.pos += 1;
+        let proj_slice = cur.project.as_deref();
+        let row = if cur.resolve_doc_uri {
+            let doc_row = if store.is_disk_backed("docs") {
+                store
+                    .project_by_key("docs", "id", key, proj_slice)
+                    .or_else(|| store.project_by_key("docs", "uri", key, proj_slice))
+            } else {
+                store.find_doc_key(key).map(|r| match &cur.project {
+                    Some(fs) => project_fields(r, fs),
+                    None => r.clone(),
+                })
+            };
+            match doc_row {
+                Some(r) => Some(r),
+                None => match cur.fallback_col.as_deref() {
+                    Some(fb) => store.project_by_key(fb, "id", key, proj_slice),
+                    None => None,
+                },
+            }
+        } else if store.is_disk_backed(&cur.collection) {
+            let Some(eng) = store.disk_engine_read() else {
+                return None;
+            };
+            let proj_refs: Option<Vec<&str>> =
+                proj_slice.map(|fs| fs.iter().map(String::as_str).collect());
+            let fetched = match &proj_refs {
+                Some(fs) => eng.get_projected_by_id(&cur.collection, key, fs),
+                None => eng.get_by_id(&cur.collection, key),
+            };
+            match fetched {
+                Ok(r) => r,
+                Err(e) => {
+                    cur.take_left = Some(0);
+                    return Some(Err(e));
+                }
+            }
+        } else {
+            store.project_by_key(&cur.collection, "id", key, proj_slice)
+        };
+        let Some(row) = row else {
+            continue;
+        };
+        if cur.skip_left > 0 {
+            cur.skip_left -= 1;
+            continue;
+        }
+        if let Some(n) = cur.take_left.as_mut() {
+            *n -= 1;
+        }
+        return Some(Ok(match &cur.project {
+            Some(fields) => project_fields(&row, fields),
+            None => row,
+        }));
+    }
 }
 
 /// `col | filter? | project? | skip* | take?` over a disk-backed collection, read through
@@ -514,17 +590,11 @@ impl<'a> QueryCursor<'a> {
                 state: CursorState::LazyJoin(join),
             });
         }
-        if let Some(lazy) = try_lazy_search(&db, q)? {
-            return Ok(Self {
-                db,
-                state: CursorState::Lazy(lazy),
-            });
+        if let Some(state) = try_lazy_search(&db, q)? {
+            return Ok(Self { db, state });
         }
-        if let Some(lazy) = try_lazy_hop(&db, q)? {
-            return Ok(Self {
-                db,
-                state: CursorState::Lazy(lazy),
-            });
+        if let Some(state) = try_lazy_hop(&db, q)? {
+            return Ok(Self { db, state });
         }
         if let Some(lazy) = try_lazy_simple(&db, q)? {
             return Ok(Self {
@@ -555,6 +625,7 @@ impl<'a> QueryCursor<'a> {
             | CursorState::LazyJoin(_)
             | CursorState::LazyJoinSoa(_)
             | CursorState::DiskStream(_)
+            | CursorState::DiskIds(_)
             | CursorState::DiskJoin(_) => true,
             _ => false,
         }
@@ -622,6 +693,7 @@ impl Iterator for QueryCursor<'_> {
             CursorState::GpuStream(stream) => next_gpu_stream(&self.db, stream),
             CursorState::Lazy(lazy) => next_lazy(store, lazy),
             CursorState::DiskStream(stream) => next_disk_stream(store, stream),
+            CursorState::DiskIds(ids) => next_disk_ids(store, ids),
             CursorState::DiskJoin(join) => next_disk_join(store, join),
             CursorState::LazyJoin(join) => next_lazy_join(store, join),
             CursorState::LazyJoinSoa(join) => next_lazy_join_soa(join),
@@ -1092,8 +1164,8 @@ fn try_disk_stream(db: &CursorDb<'_>, q: &Query) -> Option<DiskStreamCursor> {
     })
 }
 
-/// `col | search lex|hybrid … | project? | skip* | take?` via FTS-ordered idxs.
-fn try_lazy_search(db: &CursorDb<'_>, q: &Query) -> Result<Option<LazyCursor>, Error> {
+/// `col | search vec|lex|hybrid … | project? | skip* | take?`.
+fn try_lazy_search<'a>(db: &CursorDb<'a>, q: &Query) -> Result<Option<CursorState<'a>>, Error> {
     let Source::Collection(name) = &q.source else {
         return Ok(None);
     };
@@ -1114,7 +1186,7 @@ fn try_lazy_search(db: &CursorDb<'_>, q: &Query) -> Result<Option<LazyCursor>, E
                 query = Some(qq.as_str());
             }
             Step::Project(f) => {
-                if project.is_some() {
+                if project.is_some() || f.iter().any(|field| field.leaf().is_none()) {
                     return Ok(None);
                 }
                 project = Some(field_names(f));
@@ -1140,25 +1212,38 @@ fn try_lazy_search(db: &CursorDb<'_>, q: &Query) -> Result<Option<LazyCursor>, E
         return Ok(None);
     };
     let (store, _) = db.store_catalog();
-    // A cold collection is searched by the executor without materializing it (vector
-    // search out of core, lexical hits fetched by `id`; the result is bounded by `take`);
-    // reading row positions here would pull the whole collection into memory.
-    if store.is_disk_backed(name) {
-        return Ok(None);
-    }
 
     let take_left = match take_n {
         Some(Some(n)) => Some(n.max(0) as usize),
         Some(None) => None,
         None => Some(50),
     };
+    let rank_limit = take_left.map(|n| n.saturating_add(skip_n));
+
+    if store.is_disk_backed(name) {
+        let Some(ids) = db
+            .inner()
+            .cold_search_ranked_ids(name, mode, query, rank_limit)?
+        else {
+            return Ok(None);
+        };
+        return Ok(Some(CursorState::DiskIds(DiskIdsCursor {
+            collection: name.clone(),
+            resolve_doc_uri: false,
+            fallback_col: None,
+            ids,
+            pos: 0,
+            project: project.map(Into::into),
+            skip_left: skip_n,
+            take_left,
+        })));
+    }
 
     if mode == SearchMode::Vec {
         let col = store.collection(name);
-        let rank_limit = take_left.map(|n| n.saturating_add(skip_n));
         let ranked = db.vector_search_indices(col, query, rank_limit)?;
         let idxs: Vec<usize> = ranked.into_iter().map(|(_, i)| i).collect();
-        return Ok(Some(LazyCursor {
+        return Ok(Some(CursorState::Lazy(LazyCursor {
             collection: name.clone(),
             source: RowSource::Idxs(idxs),
             pos: 0,
@@ -1168,17 +1253,16 @@ fn try_lazy_search(db: &CursorDb<'_>, q: &Query) -> Result<Option<LazyCursor>, E
             skip_left: skip_n,
             take_left,
             now: now_ms(),
-        }));
+        })));
     }
 
     if !store.fts_indexed(name) {
         return Ok(None);
     }
 
-    let rank_limit = take_left.map(|n| n.saturating_add(skip_n));
     let idxs = db.search_fts_indices(name, mode, query, rank_limit)?;
 
-    Ok(Some(LazyCursor {
+    Ok(Some(CursorState::Lazy(LazyCursor {
         collection: name.clone(),
         source: RowSource::Idxs(idxs),
         pos: 0,
@@ -1188,22 +1272,14 @@ fn try_lazy_search(db: &CursorDb<'_>, q: &Query) -> Result<Option<LazyCursor>, E
         skip_left: skip_n,
         take_left,
         now: now_ms(),
-    }))
+    })))
 }
 
 /// `col | filter? | hop rel` (depth 1) `| project? | skip* | take?`.
-fn try_lazy_hop(db: &CursorDb<'_>, q: &Query) -> Result<Option<LazyCursor>, Error> {
+fn try_lazy_hop<'a>(db: &CursorDb<'a>, q: &Query) -> Result<Option<CursorState<'a>>, Error> {
     let Source::Collection(name) = &q.source else {
         return Ok(None);
     };
-    // Over a cold collection the executor resolves the hop with point reads (the result
-    // is capped); positions into the collection would pull it into memory.
-    {
-        let (store, _) = db.store_catalog();
-        if store.is_disk_backed(name) || store.is_disk_backed("docs") {
-            return Ok(None);
-        }
-    }
     let mut filter: Option<&Pred> = None;
     let mut hop_rel: Option<&str> = None;
     let mut project: Option<Vec<String>> = None;
@@ -1231,7 +1307,10 @@ fn try_lazy_hop(db: &CursorDb<'_>, q: &Query) -> Result<Option<LazyCursor>, Erro
                 hop_rel = Some(rel.as_str());
             }
             Step::Project(f) => {
-                if hop_rel.is_none() || project.is_some() {
+                if hop_rel.is_none()
+                    || project.is_some()
+                    || f.iter().any(|field| field.leaf().is_none())
+                {
                     return Ok(None);
                 }
                 project = Some(field_names(f));
@@ -1259,12 +1338,95 @@ fn try_lazy_hop(db: &CursorDb<'_>, q: &Query) -> Result<Option<LazyCursor>, Erro
 
     let (store, catalog) = db.store_catalog();
     let now = now_ms();
-    let (source, need_filter) = build_left_source(store, catalog, name, filter, now);
 
     let (edge_rel, reverse) = match catalog.rel(rel) {
         Some(r) if let Some(of) = &r.reverse_of => (of.as_str(), true),
         _ => (rel, false),
     };
+
+    let take_left = match take_n {
+        Some(Some(n)) => Some(n.max(0) as usize),
+        Some(None) => None,
+        None => Some(50),
+    };
+
+    // Cold hop: resolve seed keys without materializing the source table, walk in-memory
+    // edges, and pull reached rows lazily by `id` / `uri`.
+    if store.is_disk_backed(name) || store.is_disk_backed("docs") {
+        #[cfg(feature = "gpu")]
+        if db.inner().gpu().is_some() {
+            return Ok(None);
+        }
+        let mut frontier: Vec<Arc<str>> = Vec::new();
+        let mut seen: FxHashSet<Arc<str>> = FxHashSet::default();
+        if store.is_disk_backed(name) {
+            let Some(eng) = store.disk_engine_read() else {
+                return Ok(None);
+            };
+            let cols: &[&str] = if name == "docs" {
+                &["id", "uri"]
+            } else {
+                &["id"]
+            };
+            let seed_rows = eng.query_filter(name, filter, None, Some(cols), now)?;
+            for r in &seed_rows {
+                if let Some(id) = r.get("id").and_then(Cell::text_shared)
+                    && seen.insert(Arc::clone(&id))
+                {
+                    frontier.push(id);
+                }
+                if let Some(uri) = r.get("uri").and_then(Cell::text_shared)
+                    && seen.insert(Arc::clone(&uri))
+                {
+                    frontier.push(uri);
+                }
+            }
+        } else {
+            let (source, need_filter) = build_left_source(store, catalog, name, filter, now);
+            collect_seed_keys_arc(
+                store,
+                name,
+                &source,
+                filter,
+                need_filter,
+                now,
+                &mut frontier,
+                &mut seen,
+            );
+        }
+        let rel_arc: Arc<str> = Arc::from(edge_rel);
+        let mut reached: BTreeSet<Arc<str>> = BTreeSet::new();
+        for src in &frontier {
+            store.for_each_neighbor_arc(&rel_arc, src, reverse, |dst| {
+                if seen.insert(Arc::clone(dst)) {
+                    reached.insert(Arc::clone(dst));
+                }
+            });
+            if seen.len() > db.inner().quotas.max_graph_expansion {
+                return Err(Error::runtime(format!(
+                    "graph expansion count {} exceeds max_graph_expansion quota {}",
+                    seen.len(),
+                    db.inner().quotas.max_graph_expansion
+                )));
+            }
+            if reached.len() >= 300 {
+                break;
+            }
+        }
+        let ids: Vec<Arc<str>> = reached.into_iter().take(300).collect();
+        return Ok(Some(CursorState::DiskIds(DiskIdsCursor {
+            collection: "docs".to_string(),
+            resolve_doc_uri: true,
+            fallback_col: (name != "docs").then(|| name.clone()),
+            ids,
+            pos: 0,
+            project: project.map(Into::into),
+            skip_left: skip_n,
+            take_left,
+        })));
+    }
+
+    let (source, need_filter) = build_left_source(store, catalog, name, filter, now);
 
     let out_collection = if name == "docs" || store.collections.contains_key("docs") {
         // hop resolves via find_doc_key → docs first
@@ -1305,12 +1467,7 @@ fn try_lazy_hop(db: &CursorDb<'_>, q: &Query) -> Result<Option<LazyCursor>, Erro
                 break;
             }
         }
-        let take_left = match take_n {
-            Some(Some(n)) => Some(n.max(0) as usize),
-            Some(None) => None,
-            None => Some(50),
-        };
-        return Ok(Some(LazyCursor {
+        return Ok(Some(CursorState::Lazy(LazyCursor {
             collection: out_collection.to_string(),
             source: RowSource::Idxs(idxs),
             pos: 0,
@@ -1320,7 +1477,7 @@ fn try_lazy_hop(db: &CursorDb<'_>, q: &Query) -> Result<Option<LazyCursor>, Erro
             skip_left: skip_n,
             take_left,
             now,
-        }));
+        })));
     }
 
     let mut frontier: Vec<Arc<str>> = Vec::new();
@@ -1363,13 +1520,7 @@ fn try_lazy_hop(db: &CursorDb<'_>, q: &Query) -> Result<Option<LazyCursor>, Erro
         }
     }
 
-    let take_left = match take_n {
-        Some(Some(n)) => Some(n.max(0) as usize),
-        Some(None) => None,
-        None => Some(50),
-    };
-
-    Ok(Some(LazyCursor {
+    Ok(Some(CursorState::Lazy(LazyCursor {
         collection: out_collection.to_string(),
         source: RowSource::Idxs(idxs),
         pos: 0,
@@ -1379,7 +1530,7 @@ fn try_lazy_hop(db: &CursorDb<'_>, q: &Query) -> Result<Option<LazyCursor>, Erro
         skip_left: skip_n,
         take_left,
         now,
-    }))
+    })))
 }
 
 fn neighbor_idx(store: &Store, primary: &str, out_collection: &str, key: &str) -> Option<usize> {

@@ -1189,26 +1189,34 @@ impl<'a> Transaction<'a> {
                     self.committed = true;
                     return Err(e);
                 }
-                if let Some(p) = self.db.persist.as_mut() {
-                    if self.schema_changed {
+                if self.db.persist.is_some() {
+                    if self.schema_changed
+                        && let Some(p) = self.db.persist.as_mut()
+                    {
                         p.catalog_hash = self.db.catalog.hash_str().to_string();
                     }
-                    // Align store.gen so durable_commit writes sequential frame `base_gen + 1`.
-                    self.db.store.r#gen = self.base_gen;
-                    if let Err(e) = self.db.store.durable_commit(p, combined) {
-                        self.abort_into_rollback();
-                        self.committed = true;
-                        return Err(e);
-                    }
-                    self.db.store.r#gen = self.base_gen + 1;
+                    let new_gen = match self
+                        .db
+                        .durable_commit_batch_or_chunks(combined, self.base_gen)
+                    {
+                        Ok(g) => g,
+                        Err(e) => {
+                            self.abort_into_rollback();
+                            self.committed = true;
+                            return Err(e);
+                        }
+                    };
+                    self.db.store.r#gen = new_gen;
                     if self.disk_savepoint {
                         self.db.store.commit_disk_overlay_savepoint();
                         self.disk_savepoint = false;
                     }
-                    if p.log_bytes > self.db.quotas.max_log_bytes {
-                        self.db.store.checkpoint(p)?;
-                    } else {
-                        self.db.store.maybe_checkpoint(p)?;
+                    if let Some(p) = self.db.persist.as_mut() {
+                        if p.log_bytes > self.db.quotas.max_log_bytes {
+                            self.db.store.checkpoint(p)?;
+                        } else {
+                            self.db.store.maybe_checkpoint(p)?;
+                        }
                     }
                 } else if self.db.store.is_native_disk() {
                     if self.disk_savepoint {

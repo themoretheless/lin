@@ -349,11 +349,82 @@ pub(crate) enum GroupWrite<'a> {
 }
 
 const PLAN_CACHE_MAX: usize = 512;
-/// Upper bound on one insert into the overlay of a cold collection. Beyond it the
-/// statement falls back to the in-memory path, which pulls the whole collection into
-/// RAM, so the bound is generous: uniqueness is checked with one index probe per row
-/// under a single engine guard, and the commit is still one WAL record.
-const COLD_OVERLAY_INSERT_MAX_ROWS: usize = 1_048_576;
+/// Maximum rows and approximate payload bytes packed into a single WAL frame on cold
+/// overlay inserts (`MAX_RECORD` is 16 MiB); larger inserts split into consecutive
+/// frames under one group-synced commit so cold collections never promote into RAM.
+const COLD_WAL_CHUNK_ROWS: usize = 131_072;
+const COLD_WAL_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+
+#[inline]
+fn approx_row_wal_bytes(row: &Row) -> usize {
+    let mut b = 24usize;
+    for (k, c) in row.iter() {
+        b += k.len() + 12;
+        b += match c {
+            Cell::Text(s) => s.len(),
+            Cell::SmallText(s) => s.len(),
+            Cell::Vec(v) => v.len() * 4,
+            _ => 8,
+        };
+    }
+    b
+}
+
+fn split_cold_insert_ranges(rows: &[Row]) -> Vec<(usize, usize)> {
+    let n = rows.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut chunk_bytes = 0usize;
+    for (i, row) in rows.iter().enumerate() {
+        let rb = approx_row_wal_bytes(row);
+        let count = i - start;
+        if count > 0 && (count >= COLD_WAL_CHUNK_ROWS || chunk_bytes + rb > COLD_WAL_CHUNK_BYTES) {
+            out.push((start, i));
+            start = i;
+            chunk_bytes = 0;
+        }
+        chunk_bytes = chunk_bytes.saturating_add(rb);
+    }
+    if start < n {
+        out.push((start, n));
+    }
+    out
+}
+
+fn approx_pack_wal_bytes(pack: &Pack) -> usize {
+    use crate::persist::ColData;
+    match pack {
+        Pack::InsertCols {
+            fields,
+            cols,
+            n,
+            edges,
+            ..
+        } => {
+            let mut b = 64 + fields.iter().map(|f| f.len() + 8).sum::<usize>() + edges.len() * 64;
+            for col in cols {
+                b += match col {
+                    ColData::Text(v) => v.iter().map(|s| s.len() + 5).sum::<usize>(),
+                    ColData::Int(v) => v.len() * 9,
+                    ColData::Float(v) => v.len() * 9,
+                    ColData::Bool(v) => v.len() * 2,
+                    ColData::Time(v) => v.len() * 9,
+                    ColData::Vec(v) => v
+                        .iter()
+                        .map(|opt| opt.as_ref().map_or(1, |vec| vec.len() * 4 + 6))
+                        .sum::<usize>(),
+                    ColData::Null => 4,
+                };
+            }
+            b.max((*n as usize) * 8)
+        }
+        Pack::Batch { packs } => packs.iter().map(approx_pack_wal_bytes).sum::<usize>() + 32,
+        other => other.byte_size() + 64,
+    }
+}
 
 impl Db {
     fn default_embedder(catalog: &Catalog) -> Arc<dyn Embedder> {
@@ -791,6 +862,28 @@ impl Db {
         crate::persist::export_wal_since_indexed(&p.dir, since, &p.wal_index)
     }
 
+    /// Look up the `(dir, start_offset, end_offset, cur_gen)` byte range in `log` for
+    /// frames strictly newer than `since` in `O(log N)` without performing file I/O.
+    pub(crate) fn wal_export_window(&self, since: u64) -> Option<(std::path::PathBuf, u64, u64, u64)> {
+        let p = self.persist.as_ref()?;
+        let &(last_gen, _) = p.wal_index.last()?;
+        if last_gen <= since || last_gen != self.store.r#gen {
+            return None;
+        }
+        let idx = p.wal_index.partition_point(|&(g, _)| g <= since);
+        let &(first_gen, start_offset) = p.wal_index.get(idx)?;
+        if first_gen > since.saturating_add(1) {
+            return None;
+        }
+        if idx == 0 && p.wal_index.first().is_none_or(|&(_, off)| off != 0) {
+            return None;
+        }
+        if start_offset >= p.log_bytes {
+            return None;
+        }
+        Some((p.dir.clone(), start_offset, p.log_bytes, self.store.r#gen))
+    }
+
     /// Apply shipped WAL frames.
     pub fn apply_wal(&mut self, frames: &[u8]) -> Result<usize, Error> {
         if self.persist.is_some() && !self.follower {
@@ -986,8 +1079,30 @@ impl Db {
         backup: impl AsRef<Path>,
         data_dir: impl AsRef<Path>,
     ) -> Result<Self, Error> {
-        let snap = crate::persist::read_backup(backup.as_ref())?;
+        Self::import_backup_into_checked(backup, data_dir, true)
+    }
+
+    /// Import backup into a durable data directory. When `overwrite` is `false`, refuses
+    /// to clobber an existing non-empty directory.
+    pub fn import_backup_into_checked(
+        backup: impl AsRef<Path>,
+        data_dir: impl AsRef<Path>,
+        overwrite: bool,
+    ) -> Result<Self, Error> {
         let dir = data_dir.as_ref();
+        if !overwrite
+            && dir.exists()
+            && std::fs::read_dir(dir)
+                .map_err(|e| Error::runtime(format!("persist: {e}")))?
+                .next()
+                .is_some()
+        {
+            return Err(Error::runtime(format!(
+                "refusing to overwrite non-empty data directory '{}' (pass --force to overwrite)",
+                dir.display()
+            )));
+        }
+        let snap = crate::persist::read_backup(backup.as_ref())?;
         crate::persist::ensure_dir(dir)?;
         crate::persist::write_snapshot(dir, &snap)?;
         crate::persist::write_head(
@@ -1572,17 +1687,119 @@ impl Db {
                 row: rows.pop().unwrap_or_default(),
                 edges: new_edges,
             };
-            match self.commit_disk_overlay_pack(pack)? {
-                Pack::Insert { row, .. } if want_rows => vec![row],
-                _ => Vec::new(),
+            if !want_rows
+                && edges.is_empty()
+                && self.cold_program_packs.is_none()
+                && self.persist.is_some()
+            {
+                self.commit_disk_overlay_pack_discard(pack)?;
+                Vec::new()
+            } else {
+                match self.commit_disk_overlay_pack(pack)? {
+                    Pack::Insert { row, .. } if want_rows => vec![row],
+                    _ => Vec::new(),
+                }
             }
         } else {
-            // Same compact columnar WAL record as the in-memory insert path: a row-shaped
-            // record repeats every field name per row and overflows the record limit on
-            // a few thousand documents with embeddings.
-            let pack = crate::persist::rows_to_insert_pack(collection, &rows, new_edges);
-            self.commit_disk_overlay_pack(pack)?;
-            if want_rows { rows } else { Vec::new() }
+            let ranges = split_cold_insert_ranges(&rows);
+            if ranges.len() <= 1
+                && !want_rows
+                && new_edges.is_empty()
+                && self.cold_program_packs.is_none()
+                && self.persist.is_some()
+            {
+                let pack = crate::persist::rows_to_insert_pack(collection, &rows, Vec::new());
+                {
+                    let p = self.persist.as_mut().expect("persist checked");
+                    self.store.durable_commit(p, pack)?;
+                }
+                self.store
+                    .apply_disk_overlay_ops_owned(vec![crate::disk::DiskWalOp::UpsertBatch {
+                        table: collection.to_string(),
+                        rows,
+                    }])?;
+                self.store.r#gen += 1;
+                if let Some(p) = self.persist.as_mut() {
+                    self.store.maybe_checkpoint(p)?;
+                }
+                Vec::new()
+            } else if ranges.len() <= 1 {
+                let pack = crate::persist::rows_to_insert_pack(collection, &rows, new_edges);
+                self.commit_disk_overlay_pack(pack)?;
+                if want_rows { rows } else { Vec::new() }
+            } else if self.cold_program_packs.is_some() {
+                let mut edges_opt = Some(new_edges);
+                for (start, end) in ranges {
+                    let pack = crate::persist::rows_to_insert_pack(
+                        collection,
+                        &rows[start..end],
+                        edges_opt.take().unwrap_or_default(),
+                    );
+                    self.store.apply_pack(&pack);
+                    if let Some(packs) = self.cold_program_packs.as_mut() {
+                        packs.push(pack);
+                    }
+                }
+                if want_rows { rows } else { Vec::new() }
+            } else if self.store.is_native_disk() {
+                let edges_to_apply = new_edges.clone();
+                let mut edges_opt = Some(new_edges);
+                let mut packs = Vec::with_capacity(ranges.len());
+                for (start, end) in ranges {
+                    packs.push(crate::persist::rows_to_insert_pack(
+                        collection,
+                        &rows[start..end],
+                        edges_opt.take().unwrap_or_default(),
+                    ));
+                }
+                self.store
+                    .commit_pack_to_native_disk(&Pack::Batch { packs })?;
+                if !edges_to_apply.is_empty() {
+                    self.store.edges.extend(edges_to_apply);
+                }
+                self.store.r#gen += 1;
+                if want_rows { rows } else { Vec::new() }
+            } else {
+                let edges_to_apply = new_edges.clone();
+                let mut edges_opt = Some(new_edges);
+                let mut packs = Vec::with_capacity(ranges.len());
+                for (start, end) in ranges {
+                    packs.push(crate::persist::rows_to_insert_pack(
+                        collection,
+                        &rows[start..end],
+                        edges_opt.take().unwrap_or_default(),
+                    ));
+                }
+                let base_gen = self.store.r#gen;
+                let new_gen =
+                    self.durable_commit_batch_or_chunks(Pack::Batch { packs }, base_gen)?;
+                let out_rows = if want_rows {
+                    let cloned = rows.clone();
+                    self.store.apply_disk_overlay_ops_owned(vec![
+                        crate::disk::DiskWalOp::UpsertBatch {
+                            table: collection.to_string(),
+                            rows,
+                        },
+                    ])?;
+                    cloned
+                } else {
+                    self.store.apply_disk_overlay_ops_owned(vec![
+                        crate::disk::DiskWalOp::UpsertBatch {
+                            table: collection.to_string(),
+                            rows,
+                        },
+                    ])?;
+                    Vec::new()
+                };
+                if !edges_to_apply.is_empty() {
+                    self.store.edges.extend(edges_to_apply);
+                }
+                self.store.r#gen = new_gen;
+                if let Some(p) = self.persist.as_mut() {
+                    self.store.maybe_checkpoint(p)?;
+                }
+                out_rows
+            }
         };
         if !rows.is_empty() {
             self.check_output_quota(&rows)?;
@@ -2081,9 +2298,7 @@ impl Db {
                     edges,
                 } => {
                     let _ = edges;
-                    !records.is_empty()
-                        && records.len() <= COLD_OVERLAY_INSERT_MAX_ROWS
-                        && self.disk_overlay_point_dml(collection)
+                    !records.is_empty() && self.disk_overlay_point_dml(collection)
                 }
                 Stmt::Update {
                     collection, record, ..
@@ -2247,9 +2462,7 @@ impl Db {
                     edges,
                 } => {
                     let _ = edges;
-                    !records.is_empty()
-                        && records.len() <= COLD_OVERLAY_INSERT_MAX_ROWS
-                        && self.store.can_apply_disk_overlay(collection)
+                    !records.is_empty() && self.store.can_apply_disk_overlay(collection)
                 }
                 _ => false,
             }
@@ -2261,9 +2474,7 @@ impl Db {
                     edges,
                 } => {
                     let _ = edges;
-                    !records.is_empty()
-                        && records.len() <= COLD_OVERLAY_INSERT_MAX_ROWS
-                        && self.store.can_apply_disk_overlay(collection)
+                    !records.is_empty() && self.store.can_apply_disk_overlay(collection)
                 }
                 Stmt::Update {
                     collection, record, ..
@@ -2373,32 +2584,34 @@ impl Db {
         self.cold_program_packs = Some(Vec::with_capacity(stmts.len()));
         let step = self.exec_cold_overlay_program_steps(stmts, plan, want_rows);
         let packs = self.cold_program_packs.take().unwrap_or_default();
+        let base_gen = self.store.r#gen;
         let is_native = self.store.is_native_disk();
-        let committed = match step {
+        let committed: Result<Option<(Handle, u64)>, Error> = match step {
             Ok(Some(last)) => match dml::fold_packs(packs) {
                 Some(batch) => {
-                    if let Some(p) = self.persist.as_mut() {
-                        self.store.durable_commit(p, batch).map(|()| Some(last))
+                    if self.persist.is_some() {
+                        self.durable_commit_batch_or_chunks(batch, base_gen)
+                            .map(|new_gen| Some((last, new_gen)))
                     } else if is_native {
                         self.store.rollback_disk_overlay_savepoint();
                         self.store
                             .commit_pack_to_native_disk(&batch)
-                            .map(|()| Some(last))
+                            .map(|()| Some((last, base_gen + 1)))
                     } else {
                         Err(Error::runtime("disk overlay requires a durable log"))
                     }
                 }
-                None => Ok(Some(last)),
+                None => Ok(Some((last, base_gen + 1))),
             },
             Ok(None) => Ok(None),
             Err(e) => Err(e),
         };
         match committed {
-            Ok(Some(mut h)) => {
+            Ok(Some((mut h, new_gen))) => {
                 if !is_native {
                     self.store.commit_disk_overlay_savepoint();
                 }
-                self.store.r#gen += 1;
+                self.store.r#gen = new_gen;
                 if let Some(p) = self.persist.as_mut() {
                     self.store.maybe_checkpoint(p)?;
                 }
@@ -2417,6 +2630,84 @@ impl Db {
                 Err(e)
             }
         }
+    }
+
+    pub(crate) fn durable_commit_batch_or_chunks(
+        &mut self,
+        combined: Pack,
+        base_gen: u64,
+    ) -> Result<u64, Error> {
+        const SINGLE_FRAME_CAP: usize = 8 * 1024 * 1024;
+        if approx_pack_wal_bytes(&combined) <= SINGLE_FRAME_CAP {
+            let Some(p) = self.persist.as_mut() else {
+                return Err(Error::runtime("disk overlay requires a durable log"));
+            };
+            self.store.r#gen = base_gen;
+            self.store.durable_commit(p, combined)?;
+            return Ok(base_gen + 1);
+        }
+        fn flatten_packs(p: Pack, out: &mut Vec<Pack>) {
+            match p {
+                Pack::Batch { packs } => {
+                    for sub in packs {
+                        flatten_packs(sub, out);
+                    }
+                }
+                other => out.push(other),
+            }
+        }
+        let mut flat = Vec::new();
+        flatten_packs(combined, &mut flat);
+        let mut frames: Vec<Pack> = Vec::new();
+        let mut cur_group: Vec<Pack> = Vec::new();
+        let mut cur_bytes = 0usize;
+        for p in flat {
+            let pb = approx_pack_wal_bytes(&p);
+            if !cur_group.is_empty() && cur_bytes + pb > SINGLE_FRAME_CAP {
+                frames.push(dml::fold_packs(std::mem::take(&mut cur_group)).unwrap());
+                cur_bytes = 0;
+            }
+            cur_bytes = cur_bytes.saturating_add(pb);
+            cur_group.push(p);
+        }
+        if !cur_group.is_empty() {
+            frames.push(dml::fold_packs(cur_group).unwrap());
+        }
+        let (saved_log_bytes, saved_idx_len, saved_writes) = {
+            let Some(p) = self.persist.as_ref() else {
+                return Err(Error::runtime("disk overlay requires a durable log"));
+            };
+            (p.log_bytes, p.wal_index.len(), p.writes_since_snapshot)
+        };
+        let n_frames = frames.len();
+        let mut write_err: Option<Error> = None;
+        let sync_res = self.with_group_sync(n_frames, |db| {
+            db.store.r#gen = base_gen;
+            for frame in frames {
+                let Some(p) = db.persist.as_mut() else {
+                    write_err = Some(Error::runtime("disk overlay requires a durable log"));
+                    break;
+                };
+                if let Err(e) = db.store.durable_commit(p, frame) {
+                    write_err = Some(e);
+                    break;
+                }
+                db.store.r#gen += 1;
+            }
+        });
+        if let Some(err) = write_err.or_else(|| sync_res.err()) {
+            if let Some(p) = self.persist.as_mut() {
+                let _ = p.log.set_len(saved_log_bytes);
+                let _ =
+                    std::io::Seek::seek(&mut p.log, std::io::SeekFrom::Start(saved_log_bytes));
+                p.log_bytes = saved_log_bytes;
+                p.wal_index.truncate(saved_idx_len);
+                p.writes_since_snapshot = saved_writes;
+            }
+            self.store.r#gen = base_gen;
+            return Err(err);
+        }
+        Ok(base_gen + n_frames as u64)
     }
 
     /// Id of the document addressed by `key` (an id or a uri), whether `docs` is in memory
@@ -3268,7 +3559,6 @@ impl Db {
             },
         ] = stmts
             && !records.is_empty()
-            && records.len() <= COLD_OVERLAY_INSERT_MAX_ROWS
             && self.disk_overlay_point_dml(collection)
             && let Some(h) =
                 self.cold_overlay_insert_edges(collection, records, edges, None, plan, want_rows)?
@@ -3836,7 +4126,6 @@ impl Db {
     ) -> Result<Option<Done>, Error> {
         let n = batch.n();
         if self.follower
-            || n > COLD_OVERLAY_INSERT_MAX_ROWS
             || self.cold_program_packs.is_some()
             || !self.disk_overlay_point_dml(collection)
         {
@@ -3849,12 +4138,65 @@ impl Db {
         if self.store.has_deferred_doc_ops() {
             self.store.flush_fts_deferred_docs();
         }
-        let mut rows = batch.to_rows();
-        if has_null {
-            for row in &mut rows {
-                row.retain(|_, cell| !matches!(cell, Cell::Null));
+        let needs_embed = self.embedder.is_some()
+            && self
+                .catalog
+                .collection(collection)
+                .is_some_and(|c| c.has_vec());
+        // Direct columnar segment write on native disk: encodes straight from `RecordBatch`
+        // into an immutable segment without building any per-row maps.
+        if self.store.is_native_disk()
+            && !has_null
+            && n >= 4_096
+            && collection != "docs"
+            && collection != "facts"
+            && !needs_embed
+            && batch.names.iter().any(|c| c == "id")
+            && (!batch.names.iter().any(|c| c == "body")
+                || batch.names.iter().any(|c| c == "hash"))
+            && self
+                .store
+                .disk_unique_keys(collection)
+                .is_some_and(|uk| uk.is_empty())
+            && !self.catalog.fks.iter().any(|fk| fk.from_col == collection)
+            && !self.store.fts_indexed(collection)
+            && !self.store.dirty_fts_disk.contains_key(collection)
+        {
+            let total = self.total_rows();
+            if total + n > self.quotas.max_rows {
+                return Err(Error::runtime(format!(
+                    "quota: rows {} > max_rows {}",
+                    total + n,
+                    self.quotas.max_rows
+                )));
             }
+            self.store.bulk_load_native_disk_batch(collection, batch)?;
+            self.store.r#gen += 1;
+            self.reader_cache = None;
+            return Ok(Some(Done {
+                r#gen: self.store.r#gen,
+                n,
+            }));
         }
+        let hashing_dim = if needs_embed {
+            self.embedder.as_ref().and_then(|e| e.hashing_dim())
+        } else {
+            None
+        };
+        let rows = if !has_null
+            && let Some((built_rows, _)) =
+                dml::build_batch_insert_rows(batch, needs_embed, hashing_dim, now_ms())
+        {
+            built_rows
+        } else {
+            let mut rows = batch.to_rows();
+            if has_null {
+                for row in &mut rows {
+                    row.retain(|_, cell| !matches!(cell, Cell::Null));
+                }
+            }
+            rows
+        };
         let plan = tx::dummy_dml_plan();
         Ok(self
             .cold_overlay_insert_rows(collection, rows, &[], 0, None, &plan, false)?

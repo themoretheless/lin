@@ -1342,3 +1342,133 @@ fn pct_decode(s: &str) -> String {
     }
     String::from_utf8_lossy(&out).into_owned()
 }
+
+#[test]
+fn replica_push_wakeup_status_and_lag_cutoff_bootstrap() {
+    let pdir = TempDir::new("rep_push_p");
+    let fdir1 = TempDir::new("rep_push_f1");
+    let fdir2 = TempDir::new("rep_push_f2");
+
+    let mut p_db = Db::open_with(
+        pdir.path(),
+        OpenOpts {
+            cold: false,
+            sync: lin::SyncMode::Normal,
+        },
+    )
+    .unwrap();
+    p_db.run("col events { id: text, v: i64 }").unwrap();
+    p_db.close().unwrap();
+
+    let primary = LinServer::start(
+        Db::open_with(
+            pdir.path(),
+            OpenOpts {
+                cold: false,
+                sync: lin::SyncMode::Normal,
+            },
+        )
+        .unwrap(),
+        ServerConfig {
+            bind_addr: "127.0.0.1:0".into(),
+            role: NodeRole::Primary,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let p_addr = primary.local_addr().to_string();
+
+    // Follower 1 uses `poll_interval = 200ms` (within long-poll push window), so writes
+    // on primary wake `gen_cv` immediately rather than waiting 200ms.
+    let f1 = LinServer::start(
+        Db::open_follower_with(
+            fdir1.path(),
+            OpenOpts {
+                cold: false,
+                sync: lin::SyncMode::Normal,
+            },
+        )
+        .unwrap(),
+        ServerConfig {
+            bind_addr: "127.0.0.1:0".into(),
+            role: NodeRole::Follower,
+            follower: Some(FollowerSyncOpts {
+                primary_addr: p_addr.clone(),
+                client: ClientOpts::default(),
+                poll_interval: Duration::from_millis(200),
+            }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let p_cli = ServerClient::connect(&p_addr, ClientOpts::default()).unwrap();
+    let rec = p_cli
+        .execute(r#"insert events { id: "e1", v: 10 }"#)
+        .unwrap();
+    f1.wait_gen(rec.r#gen, Duration::from_secs(2)).unwrap();
+
+    // Wait briefly for f1's next long-poll request to report its updated generation.
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    while std::time::Instant::now() < deadline {
+        let statuses = primary.replica_statuses();
+        if statuses
+            .iter()
+            .any(|s| s.reported_gen >= rec.r#gen && s.lag_gens == 0)
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let statuses = primary.replica_statuses();
+    assert!(
+        statuses.iter().any(|s| s.reported_gen >= rec.r#gen),
+        "expected primary.replica_statuses() to report follower gen >= {}, got {statuses:?}",
+        rec.r#gen
+    );
+
+    // Enforce strict lag cutoff (`max_lag = 2`) and advance primary by 5 generations:
+    // direct `pull_sync(0, false)` must return `Bootstrap` instead of WAL tail!
+    primary.set_max_replica_lag_gens(Some(2));
+    assert_eq!(primary.max_replica_lag_gens(), Some(2));
+    for i in 2..=6 {
+        p_cli
+            .execute(&format!(r#"insert events {{ id: "e{i}", v: {} }}"#, i * 10))
+            .unwrap();
+    }
+    let payload = p_cli.pull_sync(0, false).unwrap();
+    assert!(
+        matches!(payload, lin::PullSyncPayload::Bootstrap { .. }),
+        "expected Bootstrap when lag exceeds max_replica_lag_gens, got {payload:?}"
+    );
+
+    // A fresh follower f2 still bootstraps and catches up cleanly under the lag cutoff.
+    let f2 = LinServer::start(
+        Db::open_follower_with(
+            fdir2.path(),
+            OpenOpts {
+                cold: false,
+                sync: lin::SyncMode::Normal,
+            },
+        )
+        .unwrap(),
+        ServerConfig {
+            bind_addr: "127.0.0.1:0".into(),
+            role: NodeRole::Follower,
+            follower: Some(FollowerSyncOpts::new(&p_addr, ClientOpts::default())),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    f2.wait_gen(primary.r#gen(), Duration::from_secs(2))
+        .unwrap();
+    let f2_cli = ServerClient::connect(f2.local_addr().to_string(), ClientOpts::default()).unwrap();
+    assert_eq!(
+        f2_cli.query("events | count").unwrap().to_rows()[0].get("hits"),
+        Some(&Cell::Int(6))
+    );
+
+    f2.shutdown().unwrap().close().unwrap();
+    f1.shutdown().unwrap().close().unwrap();
+    primary.shutdown().unwrap().close().unwrap();
+}

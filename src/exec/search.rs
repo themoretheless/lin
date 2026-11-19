@@ -1,6 +1,5 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap};
-#[cfg(feature = "gpu")]
 use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
@@ -8,9 +7,7 @@ use rustc_hash::FxHashMap;
 use crate::ast::{Field, Query, SearchMode, Source, Step};
 use crate::embed;
 use crate::error::Error;
-#[cfg(feature = "gpu")]
-use crate::store::Cell;
-use crate::store::{Row, project_fields, row_text};
+use crate::store::{Cell, Row, project_fields, row_text};
 
 use super::eval::{LexQuery, lex_score_prepared, project};
 #[cfg(feature = "gpu")]
@@ -94,143 +91,30 @@ impl Db {
         };
         let rank_limit = limit.map(|n| n.saturating_add(skip_n));
 
-        if mode == SearchMode::Vec
-            && self.store.is_disk_backed(name)
+        if self.store.is_disk_backed(name)
+            && let Some(ids) = self.cold_search_ranked_ids(name, mode, query, rank_limit)?
             && let Some(eng) = self.store.disk_engine_read()
         {
-            let Some(ref emb) = self.embedder else {
-                return Ok(Some(Vec::new()));
-            };
-            let qv = emb.embed(query);
-            if qv.is_empty() {
-                return Ok(Some(Vec::new()));
-            }
-            let top_k = match rank_limit {
-                Some(0) => return Ok(Some(Vec::new())),
-                Some(k) => k,
-                None => eng.count_table(name).max(1),
-            };
-            let hits = eng.search_vectors_out_of_core(
-                name,
-                "embedding",
-                "id",
-                &qv,
-                top_k,
-                true,
-                None,
-                None,
-                |_| true,
-            )?;
-            let start = skip_n.min(hits.len());
-            let slice = &hits[start..];
+            let start = skip_n.min(ids.len());
+            let slice = &ids[start..];
             let end = limit.map_or(slice.len(), |n| n.min(slice.len()));
+            let names = proj.map(field_names);
+            let refs: Option<Vec<&str>> =
+                names.as_ref().map(|n| n.iter().map(String::as_str).collect());
             let mut out = Vec::with_capacity(end);
-            if let Some(fields) = proj {
-                let names = field_names(fields);
-                for (_, row) in &slice[..end] {
-                    out.push(project_fields(row, &names));
-                }
-            } else {
-                for (_, row) in &slice[..end] {
-                    out.push(row.clone());
+            for id in &slice[..end] {
+                let row = match &refs {
+                    Some(fs) => eng.get_projected_by_id(name, id, fs)?,
+                    None => eng.get_by_id(name, id)?,
+                };
+                if let Some(row) = row {
+                    out.push(match &names {
+                        Some(n) => project_fields(&row, n),
+                        None => row,
+                    });
                 }
             }
             return Ok(Some(out));
-        }
-
-        // Lexical and hybrid search over a cold collection, without materializing it (see
-        // `cold_lex_scored`). Hybrid merges the lexical leg with the out-of-core vector
-        // leg by reciprocal rank, exactly as the in-memory merge does over positions.
-        if matches!(mode, SearchMode::Lex | SearchMode::Hybrid)
-            && self.store.is_disk_backed(name)
-            && let Some(eng) = self.store.disk_engine_read()
-            && let Some(fts) = self.store.fts_get_with_engine(name, Some(&eng))
-        {
-            if rank_limit == Some(0) {
-                return Ok(Some(Vec::new()));
-            }
-            let hybrid = mode == SearchMode::Hybrid;
-            let leg_limit = if hybrid {
-                rank_limit.map(|k| k.saturating_mul(8).max(128))
-            } else {
-                rank_limit
-            };
-            if let Some((lex, ids)) = Self::cold_lex_scored(&eng, name, &fts, query, leg_limit, hybrid)? {
-                let ranked: Vec<usize> = if hybrid {
-                    let mut vec_leg: Vec<usize> = Vec::new();
-                    if let Some(emb) = self.embedder.as_ref() {
-                        let qv = emb.embed(query);
-                        if !qv.is_empty() {
-                            let top_k = leg_limit.unwrap_or_else(|| eng.count_table(name).max(1));
-                            let pos_of: FxHashMap<&str, usize> = ids
-                                .iter()
-                                .enumerate()
-                                .map(|(i, id)| (id.as_ref(), i))
-                                .collect();
-                            for (score, row) in eng.search_vectors_out_of_core(
-                                name,
-                                "embedding",
-                                "id",
-                                &qv,
-                                top_k,
-                                true,
-                                None,
-                                None,
-                                |_| true,
-                            )? {
-                                if f64::from(score) > 0.01
-                                    && let Some(&i) =
-                                        row.get("id").and_then(|c| c.text()).and_then(|id| pos_of.get(id))
-                                {
-                                    vec_leg.push(i);
-                                }
-                            }
-                        }
-                    }
-                    const RRF_K: f64 = 60.0;
-                    let mut scores: FxHashMap<usize, f64> = FxHashMap::default();
-                    for (rank, (_, i)) in lex.iter().enumerate() {
-                        *scores.entry(*i).or_default() += 1.0 / (RRF_K + rank as f64 + 1.0);
-                    }
-                    for (rank, i) in vec_leg.iter().enumerate() {
-                        *scores.entry(*i).or_default() += 1.0 / (RRF_K + rank as f64 + 1.0);
-                    }
-                    let mut merged: Vec<(f64, usize)> =
-                        scores.into_iter().map(|(i, score)| (score, i)).collect();
-                    merged.sort_by(|a, b| {
-                        b.0.partial_cmp(&a.0)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                            .then_with(|| a.1.cmp(&b.1))
-                    });
-                    if let Some(limit) = rank_limit {
-                        merged.truncate(limit);
-                    }
-                    merged.into_iter().map(|(_, i)| i).collect()
-                } else {
-                    lex.into_iter().map(|(_, i)| i).collect()
-                };
-                let start = skip_n.min(ranked.len());
-                let slice = &ranked[start..];
-                let end = limit.map_or(slice.len(), |n| n.min(slice.len()));
-                let names = proj.map(field_names);
-                let refs: Option<Vec<&str>> =
-                    names.as_ref().map(|n| n.iter().map(String::as_str).collect());
-                let mut out = Vec::with_capacity(end);
-                for &i in &slice[..end] {
-                    let row = match &refs {
-                        Some(fs) => eng.get_projected_by_id(name, &ids[i], fs)?,
-                        None => eng.get_by_id(name, &ids[i])?,
-                    };
-                    if let Some(row) = row {
-                        out.push(match &names {
-                            Some(n) => project_fields(&row, n),
-                            None => row,
-                        });
-                    }
-                }
-                return Ok(Some(out));
-            }
-            // An index that does not line up with the scan: answer from the rows instead.
         }
 
         // Direct projected materialization without intermediate full-Row clones!
@@ -267,6 +151,140 @@ impl Db {
             rows = project(&rows, fields);
         }
         Ok(Some(rows))
+    }
+
+    /// Resolve ranked primary-key `id`s for `search vec|lex|hybrid` on a disk-backed
+    /// collection without materializing it into memory. Returns `Ok(None)` when the FTS
+    /// index is absent or misaligned so the caller can fall back cleanly.
+    pub(crate) fn cold_search_ranked_ids(
+        &self,
+        name: &str,
+        mode: SearchMode,
+        query: &str,
+        rank_limit: Option<usize>,
+    ) -> Result<Option<Vec<Arc<str>>>, Error> {
+        if matches!(mode, SearchMode::Vec | SearchMode::Hybrid)
+            && self.store.embed_id != self.catalog.embed_id
+        {
+            return Err(Error::runtime(format!(
+                "embed_id mismatch: store={} catalog={}",
+                self.store.embed_id, self.catalog.embed_id
+            )));
+        }
+        if !self.store.is_disk_backed(name) {
+            return Ok(None);
+        }
+        let Some(eng) = self.store.disk_engine_read() else {
+            return Ok(None);
+        };
+        if mode == SearchMode::Vec {
+            let Some(ref emb) = self.embedder else {
+                return Ok(Some(Vec::new()));
+            };
+            let qv = emb.embed(query);
+            if qv.is_empty() || rank_limit == Some(0) {
+                return Ok(Some(Vec::new()));
+            }
+            let top_k = match rank_limit {
+                Some(0) => return Ok(Some(Vec::new())),
+                Some(k) => k,
+                None => eng.count_table(name).max(1),
+            };
+            let hits = eng.search_vectors_out_of_core(
+                name,
+                "embedding",
+                "id",
+                &qv,
+                top_k,
+                true,
+                Some(&["id"]),
+                None,
+                |_| true,
+            )?;
+            let ids = hits
+                .into_iter()
+                .filter_map(|(_, row)| row.get("id").and_then(Cell::text_shared))
+                .collect();
+            return Ok(Some(ids));
+        }
+
+        if !self.store.fts_indexed(name) {
+            return Ok(None);
+        }
+        let Some(fts) = self.store.fts_get_with_engine(name, Some(&eng)) else {
+            return Ok(None);
+        };
+        if rank_limit == Some(0) {
+            return Ok(Some(Vec::new()));
+        }
+        let hybrid = mode == SearchMode::Hybrid;
+        let leg_limit = if hybrid {
+            rank_limit.map(|k| k.saturating_mul(8).max(128))
+        } else {
+            rank_limit
+        };
+        let Some((lex, ids)) = Self::cold_lex_scored(&eng, name, &fts, query, leg_limit, hybrid)?
+        else {
+            return Ok(None);
+        };
+        let ranked: Vec<usize> = if hybrid {
+            let mut vec_leg: Vec<usize> = Vec::new();
+            if let Some(emb) = self.embedder.as_ref() {
+                let qv = emb.embed(query);
+                if !qv.is_empty() {
+                    let top_k = leg_limit.unwrap_or_else(|| eng.count_table(name).max(1));
+                    let pos_of: FxHashMap<&str, usize> = ids
+                        .iter()
+                        .enumerate()
+                        .map(|(i, id)| (id.as_ref(), i))
+                        .collect();
+                    for (score, row) in eng.search_vectors_out_of_core(
+                        name,
+                        "embedding",
+                        "id",
+                        &qv,
+                        top_k,
+                        true,
+                        Some(&["id"]),
+                        None,
+                        |_| true,
+                    )? {
+                        if f64::from(score) > 0.01
+                            && let Some(&i) = row
+                                .get("id")
+                                .and_then(|c| c.text())
+                                .and_then(|id| pos_of.get(id))
+                        {
+                            vec_leg.push(i);
+                        }
+                    }
+                }
+            }
+            const RRF_K: f64 = 60.0;
+            let mut scores: FxHashMap<usize, f64> = FxHashMap::default();
+            for (rank, (_, i)) in lex.iter().enumerate() {
+                *scores.entry(*i).or_default() += 1.0 / (RRF_K + rank as f64 + 1.0);
+            }
+            for (rank, i) in vec_leg.iter().enumerate() {
+                *scores.entry(*i).or_default() += 1.0 / (RRF_K + rank as f64 + 1.0);
+            }
+            let mut merged: Vec<(f64, usize)> =
+                scores.into_iter().map(|(i, score)| (score, i)).collect();
+            merged.sort_by(|a, b| {
+                b.0.partial_cmp(&a.0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.1.cmp(&b.1))
+            });
+            if let Some(limit) = rank_limit {
+                merged.truncate(limit);
+            }
+            merged.into_iter().map(|(_, i)| i).collect()
+        } else {
+            lex.into_iter().map(|(_, i)| i).collect()
+        };
+        Ok(Some(
+            ranked.into_iter().map(|i| Arc::clone(&ids[i])).collect(),
+        ))
     }
 
     /// Lexical leg over a cold collection. The posting lists address documents by their

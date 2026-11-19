@@ -232,6 +232,15 @@ pub struct ExecutionReceipt {
 }
 
 /// Incremental WAL or full snapshot+cold bundle pulled by a follower.
+/// Observed replication progress of a connected follower on a primary [`LinServer`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplicaStatus {
+    pub follower_id: String,
+    pub reported_gen: u64,
+    pub lag_gens: u64,
+    pub last_seen_ms: u64,
+}
+
 #[derive(Clone, Debug)]
 pub enum PullSyncPayload {
     UpToDate {
@@ -509,6 +518,9 @@ struct ServerState {
     gen_state: Mutex<u64>,
     gen_cv: Condvar,
     shutdown: AtomicBool,
+    listen_addr: String,
+    replicas: Mutex<BTreeMap<String, (u64, Instant)>>,
+    max_replica_lag_gens: AtomicU64,
     config: ServerConfig,
     writer_tx: Option<mpsc::Sender<WriteReq>>,
 }
@@ -686,6 +698,9 @@ impl LinServer {
             gen_state: Mutex::new(initial_gen),
             gen_cv: Condvar::new(),
             shutdown: AtomicBool::new(false),
+            listen_addr: addr.to_string(),
+            replicas: Mutex::new(BTreeMap::new()),
+            max_replica_lag_gens: AtomicU64::new(0),
             config: config.clone(),
             writer_tx,
         });
@@ -786,7 +801,43 @@ impl ServerHandle {
             .as_ref()
             .ok_or_else(|| Error::runtime("sync_once requires FollowerSyncOpts"))?;
         let client = ServerClient::connect(&opts.primary_addr, opts.client.clone())?;
-        pull_and_apply_once(&self.state, &client)
+        let follower_id = format!("follower-{}", self.state.listen_addr);
+        pull_and_apply_wait(&self.state, &client, 0, Some(&follower_id)).map(|(g, _)| g)
+    }
+
+    /// Configure the maximum WAL generation lag permitted before forcing a full snapshot +
+    /// cold-segment bootstrap (`None` or `Some(0)` disables the lag cutoff).
+    pub fn set_max_replica_lag_gens(&self, max_lag: Option<u64>) {
+        self.state
+            .max_replica_lag_gens
+            .store(max_lag.unwrap_or(0), Ordering::Release);
+    }
+
+    /// Current maximum replica lag cutoff (`None` when unlimited).
+    pub fn max_replica_lag_gens(&self) -> Option<u64> {
+        match self.state.max_replica_lag_gens.load(Ordering::Acquire) {
+            0 => None,
+            n => Some(n),
+        }
+    }
+
+    /// Snapshot of connected followers and their reported generation lag relative to this node.
+    pub fn replica_statuses(&self) -> Vec<ReplicaStatus> {
+        let cur_gen = self.state.current_gen();
+        let now = Instant::now();
+        let Ok(guard) = self.state.replicas.lock() else {
+            return Vec::new();
+        };
+        guard
+            .iter()
+            .map(|(id, &(reported_gen, seen_at))| ReplicaStatus {
+                follower_id: id.clone(),
+                reported_gen,
+                lag_gens: cur_gen.saturating_sub(reported_gen),
+                last_seen_ms: u64::try_from(now.saturating_duration_since(seen_at).as_millis())
+                    .unwrap_or(u64::MAX),
+            })
+            .collect()
     }
 
     /// Gracefully stop accepting new connections, drain group-commit writes, join threads,
@@ -1018,36 +1069,63 @@ fn run_group_commit_writer(state: Arc<ServerState>, rx: mpsc::Receiver<WriteReq>
 fn run_follower_sync_loop(state: Arc<ServerState>, opts: FollowerSyncOpts) {
     let mut cached_client: Option<ServerClient> = None;
     let poll = opts.poll_interval.max(Duration::from_millis(2));
+    // Fast-sync followers (`poll_interval <= 500 ms`, including the 15 ms default) use
+    // server-side `gen_cv` long-polling for sub-millisecond push wakeup; callers that set
+    // a multi-second `poll_interval` (e.g. to simulate replica lag in tests) keep explicit
+    // sleep intervals between non-blocking pulls.
+    let long_poll = poll <= Duration::from_millis(500);
+    let max_wait_ms = if long_poll {
+        (opts.client.timeout.as_millis() / 2).min(200).max(25) as u64
+    } else {
+        0
+    };
+    let follower_id = format!("follower-{}", state.listen_addr);
     while !state.shutdown.load(Ordering::Acquire) {
         if cached_client.is_none()
             && let Ok(c) = ServerClient::connect(&opts.primary_addr, opts.client.clone())
         {
             cached_client = Some(c);
         }
-        if let Some(client) = cached_client.as_ref()
-            && pull_and_apply_once(&state, client).is_err()
-        {
-            cached_client = None;
+        if let Some(client) = cached_client.as_ref() {
+            match pull_and_apply_wait(&state, client, max_wait_ms, Some(&follower_id)) {
+                Ok((_, true)) if long_poll => continue,
+                Ok((_, false)) if long_poll => continue,
+                Ok(_) => {}
+                Err(_) => cached_client = None,
+            }
         }
+        let sleep_dur = if long_poll {
+            poll.min(Duration::from_millis(15))
+        } else {
+            poll
+        };
         let mut slept = Duration::ZERO;
-        while slept < poll && !state.shutdown.load(Ordering::Acquire) {
-            let chunk = (poll - slept).min(Duration::from_millis(15));
+        while slept < sleep_dur && !state.shutdown.load(Ordering::Acquire) {
+            let chunk = (sleep_dur - slept).min(Duration::from_millis(15));
             thread::sleep(chunk);
             slept += chunk;
         }
     }
 }
 
-fn pull_and_apply_once(state: &Arc<ServerState>, primary: &ServerClient) -> Result<u64, Error> {
+fn pull_and_apply_wait(
+    state: &Arc<ServerState>,
+    primary: &ServerClient,
+    wait_ms: u64,
+    follower_id: Option<&str>,
+) -> Result<(u64, bool), Error> {
     let cur_gen = state.current_gen();
-    let payload = primary.pull_sync(cur_gen, false)?;
-    apply_sync_payload(state, primary, payload)
+    let payload = primary.pull_sync_wait(cur_gen, false, wait_ms, follower_id)?;
+    let progressed = !matches!(payload, PullSyncPayload::UpToDate { .. });
+    let new_gen = apply_sync_payload(state, primary, payload, follower_id)?;
+    Ok((new_gen, progressed))
 }
 
 fn apply_sync_payload(
     state: &Arc<ServerState>,
     primary: &ServerClient,
     payload: PullSyncPayload,
+    follower_id: Option<&str>,
 ) -> Result<u64, Error> {
     match payload {
         PullSyncPayload::UpToDate { r#gen } => Ok(r#gen),
@@ -1067,8 +1145,8 @@ fn apply_sync_payload(
                 Err(e) if e.to_string().contains("gap") => {
                     let cur_gen = db.r#gen();
                     drop(db_guard);
-                    let boot = primary.pull_sync(cur_gen, true)?;
-                    apply_sync_payload(state, primary, boot)
+                    let boot = primary.pull_sync_wait(cur_gen, true, 0, follower_id)?;
+                    apply_sync_payload(state, primary, boot, follower_id)
                 }
                 Err(e) => Err(e),
             }
@@ -1439,19 +1517,148 @@ fn handle_partial_summarize(
     Ok(out)
 }
 
+fn record_replica_progress(state: &ServerState, follower_id: Option<&str>, reported_gen: u64) {
+    let Some(id) = follower_id.filter(|s| !s.is_empty() && s.len() <= 256) else {
+        return;
+    };
+    if let Ok(mut guard) = state.replicas.lock() {
+        if let Some(entry) = guard.get_mut(id) {
+            *entry = (reported_gen, Instant::now());
+        } else if guard.len() < 256 {
+            guard.insert(id.to_string(), (reported_gen, Instant::now()));
+        }
+    }
+}
+
+fn read_wal_window_lockfree(
+    dir: &std::path::Path,
+    start_offset: u64,
+    end_offset: u64,
+    since_gen: u64,
+    cur_gen: u64,
+) -> Option<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    if end_offset <= start_offset {
+        return None;
+    }
+    let len = usize::try_from(end_offset - start_offset).ok()?;
+    if len > MAX_FRAME_BYTES.saturating_sub(64) {
+        return None;
+    }
+    let mut f = std::fs::File::open(dir.join(crate::persist::LOG_NAME)).ok()?;
+    if f.metadata().ok()?.len() < end_offset {
+        return None;
+    }
+    f.seek(SeekFrom::Start(start_offset)).ok()?;
+    let mut wal_bytes = vec![0u8; len];
+    f.read_exact(&mut wal_bytes).ok()?;
+    let mut first_gen = None;
+    let mut last_gen = None;
+    let scan_ok = crate::persist::for_each_wal_frame_raw(&wal_bytes, |_, rec| {
+        if first_gen.is_none() {
+            first_gen = Some(rec.r#gen);
+        }
+        last_gen = Some(rec.r#gen);
+        Ok(())
+    })
+    .is_ok();
+    if scan_ok
+        && first_gen.is_some_and(|fg| fg <= since_gen.saturating_add(1))
+        && last_gen == Some(cur_gen)
+    {
+        Some(wal_bytes)
+    } else {
+        None
+    }
+}
+
 fn handle_pull_sync(mut cur: &[u8], state: &Arc<ServerState>) -> Result<Vec<u8>, (u8, String)> {
     let since_gen = read_u64_le(&mut cur).map_err(|e| (ERR_RUNTIME, e.to_string()))?;
     let force_bootstrap = read_u8(&mut cur).map_err(|e| (ERR_RUNTIME, e.to_string()))? != 0;
+    let wait_ms = if cur.len() >= 8 {
+        read_u64_le(&mut cur).map_err(|e| (ERR_RUNTIME, e.to_string()))?
+    } else {
+        0
+    };
+    let follower_id = if !cur.is_empty() {
+        Some(read_str(&mut cur).map_err(|e| (ERR_RUNTIME, e.to_string()))?)
+    } else {
+        None
+    };
 
-    // Idle follower polls answer from the published atomic generation and stay off both
-    // `gen_state` and the writer mutex; `refresh_reader_locked` publishes it after every mutation.
-    let published = state.current_gen();
+    record_replica_progress(state, follower_id.as_deref(), since_gen);
+
+    // Idle follower polls answer from the published atomic generation (or wait on `gen_cv`
+    // when long-polling) so they never touch the primary writer mutex while caught up.
+    let mut published = state.current_gen();
+    if !force_bootstrap && since_gen >= published && wait_ms > 0 {
+        let cap = Duration::from_millis(wait_ms.min(250));
+        let deadline = Instant::now() + cap;
+        let mut g = state
+            .gen_state
+            .lock()
+            .map_err(|_| (ERR_RUNTIME, "generation lock poisoned".to_string()))?;
+        while *g <= since_gen && !state.shutdown.load(Ordering::Acquire) {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let (guard, _) = state
+                .gen_cv
+                .wait_timeout(g, deadline - now)
+                .map_err(|_| (ERR_RUNTIME, "generation condvar poisoned".to_string()))?;
+            g = guard;
+        }
+        published = *g;
+    }
+
     if !force_bootstrap && since_gen >= published {
         let mut out = Vec::with_capacity(16);
         out.push(0);
         out.push(0); // UpToDate
         out.extend_from_slice(&published.to_le_bytes());
         return Ok(out);
+    }
+
+    let max_lag = state.max_replica_lag_gens.load(Ordering::Acquire);
+
+    // Fast lock-free WAL tail export: inspect `wal_index` in O(log N) under a brief lock,
+    // then drop `state.db` before reading `log` from disk and scanning frame CRCs so
+    // primary writes continue unimpeded while followers pull WAL frames.
+    if !force_bootstrap {
+        let window_opt = {
+            let db_guard = state
+                .db
+                .lock()
+                .map_err(|_| (ERR_RUNTIME, "db lock poisoned".to_string()))?;
+            let db = db_guard
+                .as_ref()
+                .ok_or_else(|| (ERR_RUNTIME, "server database closed".to_string()))?;
+            let cur_gen = db.r#gen();
+            if since_gen >= cur_gen {
+                let mut out = Vec::with_capacity(16);
+                out.push(0);
+                out.push(0); // UpToDate
+                out.extend_from_slice(&cur_gen.to_le_bytes());
+                return Ok(out);
+            }
+            if max_lag > 0 && cur_gen.saturating_sub(since_gen) > max_lag {
+                None
+            } else {
+                db.wal_export_window(since_gen)
+            }
+        };
+        if let Some((dir, start_off, end_off, cur_gen)) = window_opt
+            && let Some(wal_bytes) =
+                read_wal_window_lockfree(&dir, start_off, end_off, since_gen, cur_gen)
+        {
+            let mut out = Vec::with_capacity(16 + wal_bytes.len());
+            out.push(0);
+            out.push(1); // Wal
+            out.extend_from_slice(&cur_gen.to_le_bytes());
+            push_u32_bytes(&mut out, &wal_bytes).map_err(|e| (ERR_RUNTIME, e.to_string()))?;
+            return Ok(out);
+        }
     }
 
     let mut db_guard = state
@@ -1471,7 +1678,8 @@ fn handle_pull_sync(mut cur: &[u8], state: &Arc<ServerState>) -> Result<Vec<u8>,
         return Ok(out);
     }
 
-    if !force_bootstrap && db.is_durable() {
+    let lag_exceeded = max_lag > 0 && cur_gen.saturating_sub(since_gen) > max_lag;
+    if !force_bootstrap && !lag_exceeded && db.is_durable() {
         let wal_bytes = db
             .export_wal_since(since_gen)
             .map_err(|e| (ERR_RUNTIME, e.to_string()))?;
@@ -1780,9 +1988,25 @@ impl ServerClient {
         since_gen: u64,
         force_bootstrap: bool,
     ) -> Result<PullSyncPayload, Error> {
-        let mut req = Vec::with_capacity(9);
+        self.pull_sync_wait(since_gen, force_bootstrap, 0, None)
+    }
+
+    pub fn pull_sync_wait(
+        &self,
+        since_gen: u64,
+        force_bootstrap: bool,
+        wait_ms: u64,
+        follower_id: Option<&str>,
+    ) -> Result<PullSyncPayload, Error> {
+        let mut req = Vec::with_capacity(21 + follower_id.map_or(0, str::len));
         req.extend_from_slice(&since_gen.to_le_bytes());
         req.push(u8::from(force_bootstrap));
+        if wait_ms > 0 || follower_id.is_some() {
+            req.extend_from_slice(&wait_ms.to_le_bytes());
+            if let Some(fid) = follower_id {
+                push_str(&mut req, fid)?;
+            }
+        }
         let resp = self.rpc_call(OP_PULL_SYNC, &req, || true)?;
         let mut cur = resp.as_slice();
         if read_u8(&mut cur)? != 0 {

@@ -1227,6 +1227,53 @@ impl Store {
         }
         Ok(())
     }
+
+    pub(crate) fn bulk_load_native_disk_batch(
+        &mut self,
+        table: &str,
+        batch: &crate::batch::RecordBatch,
+    ) -> Result<(), Error> {
+        let Some(d) = self.disk.as_mut() else {
+            return Err(Error::runtime("database has no native DiskEngine"));
+        };
+        if !d.native_disk || d.writer_lock.is_none() {
+            return Err(Error::runtime("database is not writable native disk"));
+        }
+        if let Some(lazy) = d.tables.get_mut(table) {
+            lazy.materialized = OnceLock::new();
+        }
+        let nrows = {
+            let mut eng = d
+                .engine
+                .write()
+                .map_err(|_| Error::runtime("disk engine lock poisoned"))?;
+            if eng.wal_bytes > 0 {
+                eng.checkpoint()?;
+            }
+            eng.write_bulk_segment_batch(table, batch).map_err(|e| {
+                let msg = e.to_string();
+                if let Some(rest) = msg.strip_prefix("bulk batch: ") {
+                    Error::runtime(rest.to_string())
+                } else {
+                    e
+                }
+            })?;
+            eng.save_tombstones_and_manifest()?;
+            eng.count_table(table)
+        };
+        d.tables
+            .entry(table.to_string())
+            .and_modify(|lazy| {
+                lazy.row_count = nrows;
+                lazy.materialized = OnceLock::new();
+            })
+            .or_insert_with(|| DiskColLazy {
+                row_count: nrows,
+                materialized: OnceLock::new(),
+            });
+        self.col_counts.insert(table.to_string(), nrows);
+        Ok(())
+    }
 }
 
 /// A logged delete only has to identify its rows: replay finds them by `id` (or `uri`), and

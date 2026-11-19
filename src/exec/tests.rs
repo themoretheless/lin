@@ -1079,4 +1079,208 @@ mod preencoded_insert_tests {
             "expected HotTierCache sec_query_hits to advance"
         );
     }
+
+    #[test]
+    fn cold_chunked_insert_batch_stays_on_disk_and_reopens() {
+        let dir = Temp(std::env::temp_dir().join(format!(
+            "lin-cold-chunked-batch-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        )));
+        let opts = crate::OpenOpts {
+            cold: true,
+            sync: crate::persist::SyncMode::Normal,
+        };
+        let mut db = Db::open_with(&dir.0, opts).unwrap();
+        db.run("col big { id: text, grp: text, val: i64 }").unwrap();
+        let seeds: Vec<String> = (0..40)
+            .map(|i| format!(r#"{{ id: "seed-{i:02}", grp: "g0", val: {i} }}"#))
+            .collect();
+        db.run(&format!("insert big [{}]", seeds.join(",")))
+            .unwrap();
+        db.checkpoint().unwrap();
+        db.close().unwrap();
+
+        let mut db = Db::open_with(&dir.0, opts).unwrap();
+        db.quotas.max_rows = 2_000_000;
+        assert!(db.store.is_disk_backed("big"));
+
+        // 150_000 rows > COLD_WAL_CHUNK_ROWS (131_072), forcing multi-frame WAL commit
+        // without promoting `big` into memory.
+        let n = 150_000usize;
+        let ids: Vec<Cell> = (0..n).map(|i| Cell::from_text(&format!("b-{i:06}"))).collect();
+        let grps: Vec<Cell> = (0..n)
+            .map(|i| Cell::from_text(if i % 2 == 0 { "even" } else { "odd" }))
+            .collect();
+        let vals: Vec<i64> = (0..n).map(|i| i as i64).collect();
+        let batch = crate::batch::RecordBatch {
+            names: std::sync::Arc::from([
+                "id".to_string(),
+                "grp".to_string(),
+                "val".to_string(),
+            ]),
+            cols: vec![
+                crate::batch::Column::Cells(ids),
+                crate::batch::Column::Cells(grps),
+                crate::batch::Column::Int {
+                    vals,
+                    valid: crate::batch::Validity::all_valid(n),
+                },
+            ],
+        };
+        let done = db.insert_batch("big", &batch).unwrap();
+        assert_eq!(done.n, n);
+        assert!(
+            db.store.is_disk_backed("big")
+                && !db.store.disk_rows_materialized("big")
+                && db.store.collections.get("big").is_none_or(Vec::is_empty),
+            "cold table must not promote into RAM on chunked insert_batch"
+        );
+        assert_eq!(
+            db.run("big | count").unwrap().rows[0].get("hits"),
+            Some(&Cell::Int((n + 40) as i64))
+        );
+        db.close().unwrap();
+
+        let mut reopened = Db::open_with(&dir.0, opts).unwrap();
+        assert!(reopened.store.is_disk_backed("big"));
+        assert_eq!(
+            reopened.run("big | count").unwrap().rows[0].get("hits"),
+            Some(&Cell::Int((n + 40) as i64))
+        );
+    }
+
+    #[test]
+    fn cold_lazy_search_and_hop_cursors_stay_unhydrated() {
+        let dir = Temp(std::env::temp_dir().join(format!(
+            "lin-cold-lazy-search-hop-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        )));
+        let opts = crate::OpenOpts {
+            cold: true,
+            sync: crate::persist::SyncMode::Normal,
+        };
+        let mut db = Db::open_with(&dir.0, opts).unwrap();
+        db.run(
+            r#"
+            insert docs { id: "d1", uri: "lin://a", title: "Alpha Rust", body: "columnar vector engine", layer: "raw" } with edge wikilink -> "d2"
+            insert docs { id: "d2", uri: "lin://b", title: "Beta Storage", body: "mmap segment index", layer: "raw" }
+            insert docs { id: "d3", uri: "lin://c", title: "Gamma Rust", body: "hybrid lexical vector search", layer: "raw" }
+            "#,
+        )
+        .unwrap();
+        let pad: Vec<String> = (4..45)
+            .map(|i| format!(r#"{{ id: "d{i}", uri: "lin://p{i}", title: "Pad {i}", body: "filler document {i}", layer: "raw" }}"#))
+            .collect();
+        db.run(&format!("insert docs [{}]", pad.join(","))).unwrap();
+        db.checkpoint().unwrap();
+        db.close().unwrap();
+
+        let db = Db::open_with(&dir.0, opts).unwrap();
+        assert!(db.store.is_disk_backed("docs"));
+
+        for q_src in [
+            r#"docs | search lex "rust" | { id, title } | take 2"#,
+            r#"docs | search "vector engine" | { id, title } | take 2"#,
+            r#"docs | search vec "mmap segment" | { id, title } | take 2"#,
+            r#"docs | id == "d1" | hop wikilink | { id, title } | take 5"#,
+        ] {
+            let crate::Stmt::Query(q) = crate::parse(q_src).unwrap() else {
+                panic!("expected query");
+            };
+            let cur = crate::QueryCursor::open_db(&db, &q).unwrap();
+            assert!(cur.is_lazy(), "expected lazy cursor for `{q_src}`");
+            let rows: Vec<_> = cur.collect::<Result<Vec<_>, _>>().unwrap();
+            assert!(!rows.is_empty(), "expected rows for `{q_src}`");
+            assert!(
+                !db.store.disk_rows_materialized("docs"),
+                "`docs` materialized during `{q_src}`"
+            );
+        }
+    }
+
+    #[test]
+    fn multi_sort_and_cold_unprojected_window_match_row_pipeline() {
+        let dir = Temp(std::env::temp_dir().join(format!(
+            "lin-cold-win-unproj-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        )));
+        let opts = crate::OpenOpts {
+            cold: true,
+            sync: crate::persist::SyncMode::Normal,
+        };
+        let mut cold_db = Db::open_with(&dir.0, opts).unwrap();
+        let mut hot_db = Db::empty();
+        let recs: Vec<String> = (0..40)
+            .map(|i| {
+                format!(
+                    r#"{{ id: "m{i:02}", dept: "{}", score: {} }}"#,
+                    if i % 2 == 0 { "eng" } else { "ops" },
+                    10 + (i % 5) * 10
+                )
+            })
+            .collect();
+        let setup = format!(
+            "col metrics {{ id: text, dept: text, score: i64 }}\ninsert metrics [{}]",
+            recs.join(",")
+        );
+        cold_db.run(&setup).unwrap();
+        hot_db.run(&setup).unwrap();
+        cold_db.checkpoint().unwrap();
+        cold_db.close().unwrap();
+
+        let mut cold_db = Db::open_with(&dir.0, opts).unwrap();
+        assert!(cold_db.store.is_disk_backed("metrics"));
+
+        let q = "metrics | window rank by dept sort score desc as rnk | sort rnk asc | sort id desc | take all";
+        let cold_rows = cold_db.run(q).unwrap().into_rows();
+        assert!(
+            !cold_db.store.disk_rows_materialized("metrics"),
+            "cold unprojected window should run columnar without hydrating `metrics`"
+        );
+        let hot_rows = hot_db.run(q).unwrap().into_rows();
+        assert_eq!(cold_rows, hot_rows);
+    }
+
+    #[test]
+    fn import_backup_into_checked_refuses_non_empty_without_overwrite() {
+        let src_dir = Temp(std::env::temp_dir().join(format!(
+            "lin-bkp-src-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        )));
+        let dst_dir = Temp(std::env::temp_dir().join(format!(
+            "lin-bkp-dst-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        )));
+        std::fs::create_dir_all(&dst_dir.0).unwrap();
+        let bkp_file = src_dir.0.join("out.backup");
+
+        let mut db = Db::open_with(
+            &src_dir.0,
+            crate::OpenOpts {
+                cold: false,
+                sync: crate::persist::SyncMode::Normal,
+            },
+        )
+        .unwrap();
+        db.run(r#"insert docs { id: "b1", uri: "lin://b1", title: "Backup" }"#)
+            .unwrap();
+        db.export_backup(&bkp_file).unwrap();
+        db.close().unwrap();
+
+        std::fs::write(dst_dir.0.join("existing.txt"), b"keep").unwrap();
+        let err = Db::import_backup_into_checked(&bkp_file, &dst_dir.0, false)
+            .err()
+            .expect("expected refusal on non-empty target dir");
+        assert!(err.to_string().contains("refusing to overwrite"));
+        assert!(dst_dir.0.join("existing.txt").exists());
+
+        let mut imported = Db::import_backup_into_checked(&bkp_file, &dst_dir.0, true).unwrap();
+        assert_eq!(imported.stats().docs, 1);
+        imported.close().unwrap();
+    }
 }

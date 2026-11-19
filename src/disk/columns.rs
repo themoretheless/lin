@@ -2048,4 +2048,39 @@ impl MmapCol {
             MmapCol::Vec(c) => Ok(c.get_cell(row_id)),
         }
     }
+
+    pub(crate) fn has_live_null(
+        &self,
+        row_count: u32,
+        all_live: bool,
+        mut is_live: impl FnMut(u32) -> bool,
+    ) -> bool {
+        let n = row_count as usize;
+        match self {
+            MmapCol::Fixed(fc) => {
+                let bound = n.min(fc.nulls.len());
+                if bound < n {
+                    return true;
+                }
+                if all_live {
+                    fc.nulls[..n].iter().any(|&b| b != 0)
+                } else {
+                    (0..row_count).any(|rid| fc.nulls[rid as usize] != 0 && is_live(rid))
+                }
+            }
+            MmapCol::Dict(dc) => {
+                if all_live {
+                    dc.zone_map().has_null.iter().any(|&b| b)
+                } else {
+                    (0..row_count).any(|rid| dc.code_at(rid) == DICT_NULL_CODE && is_live(rid))
+                }
+            }
+            MmapCol::Text(tc) => {
+                (0..row_count).any(|rid| tc.get_loc(rid).is_none() && (all_live || is_live(rid)))
+            }
+            MmapCol::Vec(vc) => {
+                (0..row_count).any(|rid| !vc.is_present(rid) && (all_live || is_live(rid)))
+            }
+        }
+    }
 }

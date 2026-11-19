@@ -2657,7 +2657,15 @@ impl DiskEngine {
         let tomb_tmp = self.dir.join("tombstones.bin.tmp");
         let tomb_bytes = rmp_serde::to_vec(&self.tombstones).map_err(io_err)?;
         let tomb_crc = (tomb_bytes.len() as u64, crate::crc::hardware_crc32c(&tomb_bytes));
-        fs::write(&tomb_tmp, tomb_bytes).map_err(io_err)?;
+        {
+            let mut f = File::create(&tomb_tmp).map_err(io_err)?;
+            f.write_all(&tomb_bytes).map_err(io_err)?;
+            if self.sync_full {
+                crate::persist::durable_sync(&f)
+                    .or_else(|_| f.sync_all())
+                    .map_err(io_err)?;
+            }
+        }
         fs::rename(&tomb_tmp, self.dir.join(TOMBSTONES_FILE)).map_err(io_err)?;
 
         let man_tmp = self.dir.join("manifest.json.tmp");
@@ -2667,9 +2675,86 @@ impl DiskEngine {
         }
         stamped.tombstones_crc = Some(tomb_crc);
         let man_bytes = serde_json::to_vec_pretty(&stamped).map_err(io_err)?;
-        fs::write(&man_tmp, man_bytes).map_err(io_err)?;
+        {
+            let mut f = File::create(&man_tmp).map_err(io_err)?;
+            f.write_all(&man_bytes).map_err(io_err)?;
+            if self.sync_full {
+                crate::persist::durable_sync(&f)
+                    .or_else(|_| f.sync_all())
+                    .map_err(io_err)?;
+            }
+        }
         fs::rename(&man_tmp, self.dir.join(MANIFEST_FILE)).map_err(io_err)?;
+        if self.sync_full {
+            crate::persist::sync_dir_checked(&self.dir).map_err(io_err)?;
+        }
         Ok(())
+    }
+
+    /// Returns the sorted list of column names when every live row of `table` has the exact
+    /// same non-null field set (no absent/null cells and no dotted nested keys). Returns
+    /// `Some(Vec::new())` when `table` has zero live rows.
+    pub(crate) fn uniform_non_null_columns(&self, table: &str) -> Option<Vec<String>> {
+        if self.count_table(table) == 0 {
+            return Some(Vec::new());
+        }
+        let mut expected: Option<Vec<String>> = None;
+        if let Some(segs) = self.segments.get(table) {
+            for seg in segs {
+                let sid = seg.meta.seg_id;
+                let dead = self.tombstones.dead_count(sid);
+                if dead >= seg.meta.row_count {
+                    continue;
+                }
+                let all_live = dead == 0;
+                let mut seg_names: Vec<String> =
+                    seg.cols.iter().map(|(n, _)| n.clone()).collect();
+                if seg_names.iter().any(|n| n.contains('.')) {
+                    return None;
+                }
+                seg_names.sort_unstable();
+                match &expected {
+                    None => expected = Some(seg_names),
+                    Some(exp) if exp != &seg_names => return None,
+                    Some(_) => {}
+                }
+                for (_, mcol) in &seg.cols {
+                    if mcol.has_live_null(seg.meta.row_count, all_live, |rid| {
+                        !self.tombstones.is_dead(sid, rid)
+                    }) {
+                        return None;
+                    }
+                }
+            }
+        }
+        if let Some(mt) = self.memtables.get(table) {
+            for &idx in mt.by_id.values() {
+                if mt.dead_mem.contains(&idx) {
+                    continue;
+                }
+                let row = &mt.rows[idx];
+                match &expected {
+                    None => {
+                        if row.iter().any(|(k, c)| k.contains('.') || matches!(c, Cell::Null)) {
+                            return None;
+                        }
+                        let mut names: Vec<String> = row.keys().cloned().collect();
+                        names.sort_unstable();
+                        expected = Some(names);
+                    }
+                    Some(exp) => {
+                        if row.len() != exp.len()
+                            || exp
+                                .iter()
+                                .any(|k| matches!(row.get(k), None | Some(Cell::Null)))
+                        {
+                            return None;
+                        }
+                    }
+                }
+            }
+        }
+        expected
     }
 
     // ========================================================================

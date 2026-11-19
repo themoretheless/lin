@@ -856,25 +856,25 @@ impl Db {
         let mut filter: Option<&Pred> = None;
         let mut windows: Vec<&Step> = Vec::new();
         let mut fields: Option<&[Field]> = None;
-        let mut sort: Option<(&Field, bool)> = None;
+        let mut sorts: Vec<(&Field, bool)> = Vec::new();
         let mut skip_n = 0usize;
         let mut take: Option<Option<i64>> = None;
         for step in &q.steps {
             match step {
                 Step::Filter(p) if windows.is_empty() && filter.is_none() => filter = Some(p),
                 Step::Window { .. }
-                    if fields.is_none() && sort.is_none() && skip_n == 0 && take.is_none() =>
+                    if fields.is_none() && sorts.is_empty() && skip_n == 0 && take.is_none() =>
                 {
                     windows.push(step)
                 }
                 Step::Sort { field, desc }
                     if !windows.is_empty()
-                        && fields.is_none()
-                        && sort.is_none()
+                        && fields
+                            .is_none_or(|fs| fs.iter().any(|pf| pf.leaf() == field.leaf()))
                         && skip_n == 0
                         && take.is_none() =>
                 {
-                    sort = Some((field, *desc));
+                    sorts.push((field, *desc));
                 }
                 Step::Project(f)
                     if !windows.is_empty() && fields.is_none() && skip_n == 0 && take.is_none() =>
@@ -895,32 +895,55 @@ impl Db {
         let unprojected = fields.is_none();
         let synth_fields: Option<Vec<Field>> = if unprojected {
             if self.store.is_disk_backed(name) {
-                return None;
-            }
-            let col_rows = self.store.collection(name);
-            if col_rows.is_empty() {
-                return Some(RecordBatch::empty(Arc::<[String]>::from(Vec::<String>::new())));
-            }
-            let shape = col_rows[0].shape_arc()?;
-            if shape.names().iter().any(|n| n.contains('.'))
-                || !col_rows
-                    .iter()
-                    .all(|r| r.shape_arc().is_some_and(|rs| Arc::ptr_eq(rs, shape)))
-            {
-                return None;
-            }
-            let mut out_names: Vec<&str> = shape.names().iter().map(String::as_str).collect();
-            for w in &windows {
-                if let Step::Window { as_field, .. } = w {
-                    if as_field.contains('.') {
-                        return None;
-                    }
-                    out_names.push(as_field.as_str());
+                let Some(eng) = self.store.disk_engine_read() else {
+                    return None;
+                };
+                let col_names = eng.uniform_non_null_columns(name)?;
+                if col_names.is_empty() {
+                    return Some(RecordBatch::empty(Arc::<[String]>::from(
+                        Vec::<String>::new(),
+                    )));
                 }
+                let mut out_names: Vec<String> = col_names;
+                for w in &windows {
+                    if let Step::Window { as_field, .. } = w {
+                        if as_field.contains('.') {
+                            return None;
+                        }
+                        out_names.push(as_field.clone());
+                    }
+                }
+                out_names.sort_unstable();
+                out_names.dedup();
+                Some(out_names.into_iter().map(Field::name).collect())
+            } else {
+                let col_rows = self.store.collection(name);
+                if col_rows.is_empty() {
+                    return Some(RecordBatch::empty(Arc::<[String]>::from(
+                        Vec::<String>::new(),
+                    )));
+                }
+                let shape = col_rows[0].shape_arc()?;
+                if shape.names().iter().any(|n| n.contains('.'))
+                    || !col_rows
+                        .iter()
+                        .all(|r| r.shape_arc().is_some_and(|rs| Arc::ptr_eq(rs, shape)))
+                {
+                    return None;
+                }
+                let mut out_names: Vec<&str> = shape.names().iter().map(String::as_str).collect();
+                for w in &windows {
+                    if let Step::Window { as_field, .. } = w {
+                        if as_field.contains('.') {
+                            return None;
+                        }
+                        out_names.push(as_field.as_str());
+                    }
+                }
+                out_names.sort_unstable();
+                out_names.dedup();
+                Some(out_names.into_iter().map(Field::name).collect())
             }
-            out_names.sort_unstable();
-            out_names.dedup();
-            Some(out_names.into_iter().map(Field::name).collect())
         } else {
             None
         };
@@ -962,7 +985,7 @@ impl Db {
             }
             win_names.push(as_field.as_str());
         }
-        for f in fields.iter().chain(sort.map(|(f, _)| f)) {
+        for f in fields.iter().chain(sorts.iter().map(|(f, _)| *f)) {
             let leaf = f.leaf()?;
             if !win_names.contains(&leaf) {
                 want(f, &[], &mut base)?;
@@ -1468,9 +1491,9 @@ fn partition_into(
             win_cols.push(win_col);
         }
 
-        // `sort` after the windows: a stable sort of the final sequence by one key, which
-        // may be a window output. Ties keep the window order, as in the row pipeline.
-        if let Some((sort_field, desc)) = sort {
+        // `sort` steps after the windows: sequential stable sorts of the sequence, where
+        // each key may be a base column or a window output. Ties keep the prior order.
+        for (sort_field, desc) in sorts {
             let leaf = sort_field.leaf()?;
             let win_key = win_names.iter().position(|w| *w == leaf);
             let base_key = match win_key {

@@ -104,7 +104,8 @@ pub use cluster::{
 };
 pub use server::{
     ClientOpts, Consistency, ExecutionReceipt, FollowerSyncOpts, LinServer, NodeRole,
-    PullSyncPayload, ReplicaPoolClient, ServerClient, ServerConfig, ServerHandle, WorkloadGroup,
+    PullSyncPayload, ReplicaPoolClient, ReplicaStatus, ServerClient, ServerConfig, ServerHandle,
+    WorkloadGroup,
 };
 pub use ship::{PullOpts, TlsClient, TlsServer};
 pub use embed::{
