@@ -379,6 +379,122 @@ fn par_group_fold<V: Send + Default>(
     Some(merged)
 }
 
+pub(crate) fn scoped_par_filter_count(rows: &[Row], pred: &Pred, now: i64) -> i64 {
+    if rows.len() >= PAR_AGG_MIN_ROWS {
+        let threads = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(1)
+            .min(8)
+            .min((rows.len() + PAR_AGG_CHUNK_ROWS - 1) / PAR_AGG_CHUNK_ROWS);
+        if threads > 1 {
+            let chunk_size = (rows.len() + threads - 1) / threads;
+            return std::thread::scope(|scope| {
+                let mut handles = Vec::with_capacity(threads);
+                for chunk in rows.chunks(chunk_size) {
+                    handles.push(scope.spawn(move || {
+                        let mut flt = PredSlots::new(pred);
+                        let mut count = 0i64;
+                        for r in chunk {
+                            if flt.eval(r, now) {
+                                count += 1;
+                            }
+                        }
+                        count
+                    }));
+                }
+                handles.into_iter().map(|h| h.join().unwrap()).sum()
+            });
+        }
+    }
+    let mut flt = PredSlots::new(pred);
+    let mut count = 0i64;
+    for r in rows {
+        if flt.eval(r, now) {
+            count += 1;
+        }
+    }
+    count
+}
+
+fn scoped_par_count_by(
+    rows: &[Row],
+    filter: Option<&Pred>,
+    now: i64,
+    key: &str,
+    max_bytes: usize,
+) -> Option<FxHashMap<Cell, i64>> {
+    if rows.len() < PAR_AGG_MIN_ROWS {
+        return None;
+    }
+    let threads = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(1)
+        .min(8)
+        .min((rows.len() + PAR_AGG_CHUNK_ROWS - 1) / PAR_AGG_CHUNK_ROWS);
+    if threads <= 1 {
+        return None;
+    }
+    let chunk_size = (rows.len() + threads - 1) / threads;
+    let parts: Vec<Option<FxHashMap<Cell, i64>>> = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(threads);
+        for chunk in rows.chunks(chunk_size) {
+            handles.push(scope.spawn(move || {
+                let mut map: FxHashMap<Cell, i64> = FxHashMap::default();
+                let mut local_bytes = 0usize;
+                let mut flt = filter.map(PredSlots::new);
+                let mut key_slot = FieldSlot::new(key);
+                for r in chunk {
+                    if !flt.as_mut().is_none_or(|f| f.eval(r, now)) {
+                        continue;
+                    }
+                    let cell = key_slot
+                        .get(r)
+                        .map(Cell::clone_for_borrow)
+                        .unwrap_or(Cell::Null);
+                    match map.entry(cell) {
+                        std::collections::hash_map::Entry::Occupied(mut e) => *e.get_mut() += 1,
+                        std::collections::hash_map::Entry::Vacant(e) => {
+                            let key_size = match e.key() {
+                                Cell::Text(s) => s.len() + 32,
+                                _ => 16,
+                            };
+                            local_bytes = local_bytes.saturating_add(key_size + 64);
+                            if local_bytes > max_bytes {
+                                return None;
+                            }
+                            e.insert(1);
+                        }
+                    }
+                }
+                Some(map)
+            }));
+        }
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let mut merged: FxHashMap<Cell, i64> = FxHashMap::default();
+    let mut state_bytes = 0usize;
+    for part_opt in parts {
+        let part = part_opt?;
+        for (cell, v) in part {
+            match merged.entry(cell) {
+                std::collections::hash_map::Entry::Occupied(mut e) => *e.get_mut() += v,
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    let key_size = match e.key() {
+                        Cell::Text(s) => s.len() + 32,
+                        _ => 16,
+                    };
+                    state_bytes = state_bytes.saturating_add(key_size + 64);
+                    if state_bytes > max_bytes {
+                        return None;
+                    }
+                    e.insert(v);
+                }
+            }
+        }
+    }
+    Some(merged)
+}
+
 pub(crate) fn agg_count_filtered(
     rows: &[Row],
     filter: Option<&Pred>,
@@ -388,19 +504,7 @@ pub(crate) fn agg_count_filtered(
     spill: bool,
 ) -> Result<Vec<Row>, Error> {
     let k = by.as_str();
-    #[cfg(feature = "parallel")]
-    if rows.len() >= PAR_AGG_MIN_ROWS
-        && let Some(map) = par_group_fold::<i64>(
-            rows,
-            filter,
-            now,
-            &k,
-            None,
-            max_bytes,
-            |n, _| *n += 1,
-            |n, m| *n += m,
-        )
-    {
+    if let Some(map) = scoped_par_count_by(rows, filter, now, &k, max_bytes) {
         return Ok(count_cell_map_to_rows(&k, map));
     }
     let mut map: FxHashMap<Cell, i64> = FxHashMap::default();
@@ -437,13 +541,30 @@ pub(crate) fn agg_count_filtered(
 }
 
 pub(crate) fn count_cell_map_to_rows(by: &str, map: FxHashMap<Cell, i64>) -> Vec<Row> {
+    if map.is_empty() {
+        return Vec::new();
+    }
     let mut entries: Vec<(Cell, i64)> = map.into_iter().collect();
     entries.sort_unstable_by(|(a, _), (b, _)| cmp_sort(a, b));
+    if by != "hits" {
+        let shape = Row::shape_of(&[by, "hits"]);
+        let swap = by > "hits";
+        return entries
+            .into_iter()
+            .map(|(cell, n)| {
+                let hits = Cell::Int(n);
+                Row::from_parts(
+                    std::sync::Arc::clone(&shape),
+                    if swap { [hits, cell] } else { [cell, hits] },
+                )
+            })
+            .collect();
+    }
     entries
         .into_iter()
         .map(|(cell, n)| {
             let mut row = crate::store::acquire_row();
-            row.insert(by.to_string(), cell);
+            row.insert(by, cell);
             row.insert("hits", Cell::Int(n));
             row
         })
@@ -451,10 +572,28 @@ pub(crate) fn count_cell_map_to_rows(by: &str, map: FxHashMap<Cell, i64>) -> Vec
 }
 
 pub(crate) fn count_arc_map_to_rows(by: &str, map: BTreeMap<std::sync::Arc<str>, i64>) -> Vec<Row> {
+    if map.is_empty() {
+        return Vec::new();
+    }
+    if by != "hits" {
+        let shape = Row::shape_of(&[by, "hits"]);
+        let swap = by > "hits";
+        return map
+            .into_iter()
+            .map(|(g, n)| {
+                let cell = Cell::Text(g);
+                let hits = Cell::Int(n);
+                Row::from_parts(
+                    std::sync::Arc::clone(&shape),
+                    if swap { [hits, cell] } else { [cell, hits] },
+                )
+            })
+            .collect();
+    }
     map.into_iter()
         .map(|(g, n)| {
             let mut row = crate::store::acquire_row();
-            row.insert(by.to_string(), Cell::Text(g));
+            row.insert(by, Cell::Text(g));
             row.insert("hits", Cell::Int(n));
             row
         })
@@ -1794,19 +1933,10 @@ impl Db {
         match &plan.kind {
             AggKind::Count { by } => {
                 let Some(by) = by else {
-                    let mut n = 0i64;
-                    if let Some(p) = filter {
-                        // Cached field positions per row shape instead of a search by
-                        // name for every field of the predicate in every row.
-                        let mut flt = PredSlots::new(p);
-                        for r in col {
-                            if flt.eval(r, now) {
-                                n += 1;
-                            }
-                        }
-                    } else {
-                        n = col.len() as i64;
-                    }
+                    let n = match filter {
+                        Some(p) => scoped_par_filter_count(col, p, now),
+                        None => col.len() as i64,
+                    };
                     return Ok(vec![hits_row(n)]);
                 };
                 agg_count_filtered(col, filter, now, by, max_bytes, spill)
@@ -1988,14 +2118,7 @@ impl Db {
                 return Some(vec![hits_row(n as i64)]);
             }
             let col = self.store.collection(name);
-            let mut flt = PredSlots::new(pred);
-            let mut n = 0i64;
-            for row in col {
-                if flt.eval(row, now) {
-                    n += 1;
-                }
-            }
-            return Some(vec![hits_row(n)]);
+            return Some(vec![hits_row(scoped_par_filter_count(col, pred, now))]);
         };
         let by_key = by_field.as_str();
 
@@ -2046,6 +2169,9 @@ impl Db {
         }
 
         let col = self.store.collection(name);
+        if let Some(map) = scoped_par_count_by(col, Some(pred), now, &by_key, usize::MAX) {
+            return Some(count_cell_map_to_rows(&by_key, map));
+        }
         let mut map: FxHashMap<Cell, i64> = FxHashMap::default();
         let mut flt = PredSlots::new(pred);
         let mut key_slot = FieldSlot::new(&by_key);

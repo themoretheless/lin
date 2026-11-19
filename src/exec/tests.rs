@@ -686,4 +686,264 @@ mod preencoded_insert_tests {
             .unwrap();
         assert!(prep_up.point_update.is_some());
     }
+
+    #[test]
+    fn test_batch_into_rows_and_to_rows_widths() {
+        use crate::batch::{Column, RecordBatch};
+        for width in [1usize, 2, 3, 4, 5, 8] {
+            let names: std::sync::Arc<[String]> = (0..width)
+                .rev()
+                .map(|c| format!("col_{c}"))
+                .collect::<Vec<_>>()
+                .into();
+            let n = 1100;
+            let cols: Vec<Column> = (0..width)
+                .map(|c| {
+                    if c % 2 == 0 {
+                        Column::from_ints((0..n as i64).map(|i| i * 10 + c as i64).collect())
+                    } else {
+                        Column::Cells(
+                            (0..n)
+                                .map(|i| Cell::from_text(format!("v-{c}-{i}")))
+                                .collect(),
+                        )
+                    }
+                })
+                .collect();
+            let batch = RecordBatch { names, cols };
+            let via_to_rows = batch.to_rows();
+            let via_into_rows = batch.clone().into_rows();
+            assert_eq!(via_to_rows, via_into_rows);
+            crate::store::release_general_rows(via_into_rows);
+            let via_reused = batch.into_rows();
+            assert_eq!(via_to_rows, via_reused);
+        }
+    }
+
+    #[test]
+    fn test_insert_batch_one_pass_hash_and_embed_matches_stmt_insert() {
+        use crate::batch::{Column, RecordBatch};
+        let embedder = std::sync::Arc::new(crate::embed::HashingEmbedder::new("test/32", 32));
+        let mut db_stmt = Db::empty().with_embedder(embedder);
+        let n = 300usize;
+
+        let rows_src: Vec<String> = (0..n)
+            .map(|i| {
+                format!(
+                    r#"{{ id: "doc-{i:04}", uri: "lin://test/doc-{i:04}", title: "Title number {i}", body: "Body payload for document {i} with tokens", wing: "rag", ts: timestamp(1700000000000) }}"#
+                )
+            })
+            .collect();
+        db_stmt
+            .run(&format!("insert docs [{}]", rows_src.join(",")))
+            .unwrap();
+
+        let batch2 = RecordBatch {
+            names: vec![
+                "id".into(),
+                "uri".into(),
+                "title".into(),
+                "body".into(),
+                "wing".into(),
+                "ts".into(),
+            ]
+            .into(),
+            cols: vec![
+                Column::Cells((0..n).map(|i| Cell::from_text(format!("doc-{i:04}"))).collect()),
+                Column::Cells(
+                    (0..n)
+                        .map(|i| Cell::from_text(format!("lin://test/doc-{i:04}")))
+                        .collect(),
+                ),
+                Column::Cells((0..n).map(|i| Cell::from_text(format!("Title number {i}"))).collect()),
+                Column::Cells(
+                    (0..n)
+                        .map(|i| Cell::from_text(format!("Body payload for document {i} with tokens")))
+                        .collect(),
+                ),
+                Column::Cells((0..n).map(|_| Cell::from_text("rag")).collect()),
+                (0..n).map(|_| Cell::Time(1_700_000_000_000)).collect(),
+            ],
+        };
+        let mut db_batch2 = Db::empty().with_embedder(std::sync::Arc::new(
+            crate::embed::HashingEmbedder::new("test/32", 32),
+        ));
+        assert_eq!(db_batch2.insert_batch("docs", &batch2).unwrap().n, n);
+        assert!(db_batch2.insert_batch("docs", &batch2).is_err());
+
+        let r_batch = db_batch2
+            .run("docs | sort id asc | { id, uri, hash, embedding } | take all")
+            .unwrap()
+            .rows
+            .clone();
+        let r_stmt = db_stmt
+            .run("docs | sort id asc | { id, uri, hash, embedding } | take all")
+            .unwrap()
+            .rows
+            .clone();
+        assert_eq!(r_batch, r_stmt);
+    }
+
+    #[test]
+    fn test_window_without_projection_matches_projected_and_empty() {
+        let mut db = Db::empty();
+        db.run(
+            r#"
+            insert users [{ id: "u1", email: "u1@x.io" }, { id: "u2", email: "u2@x.io" }]
+            insert orders [
+                { id: "o1", user_id: "u1", total: 10.5 },
+                { id: "o2", user_id: "u1", total: 20.0 },
+                { id: "o3", user_id: "u2", total: 7.25 }
+            ]
+            col metrics { id: text, grp: text, v: i64 }
+            insert metrics [
+                { id: "m1", grp: "a", v: 5 },
+                { id: "m2", grp: "a", v: 15 },
+                { id: "m3", grp: "b", v: 9 }
+            ]
+            "#,
+        )
+        .unwrap();
+
+        let unproj = db
+            .run("orders | window sum total by user_id sort id asc as running | take all")
+            .unwrap()
+            .rows
+            .clone();
+        let proj = db
+            .run("orders | window sum total by user_id sort id asc as running | { id, running, total, user_id } | take all")
+            .unwrap()
+            .rows
+            .clone();
+        assert_eq!(unproj, proj);
+
+        let batch_unproj = db
+            .run_batch("orders | window sum total by user_id sort id asc as running | take all")
+            .unwrap();
+        assert_eq!(batch_unproj.to_rows(), proj);
+
+        let m_unproj = db
+            .run("metrics | v > 0 | window row_number by grp sort id asc as rn | sort id asc | take all")
+            .unwrap()
+            .rows
+            .clone();
+        let m_proj = db
+            .run("metrics | v > 0 | window row_number by grp sort id asc as rn | sort id asc | { grp, id, rn, v } | take all")
+            .unwrap()
+            .rows
+            .clone();
+        assert_eq!(m_unproj, m_proj);
+
+        let empty_batch = db
+            .run_batch("metrics | v > 9999 | window row_number by grp sort id asc as rn | take all")
+            .unwrap();
+        assert_eq!(empty_batch.n(), 0);
+        assert!(empty_batch.names.is_empty());
+    }
+
+    #[test]
+    fn test_parallel_filter_scan_and_counts_above_threshold() {
+        use crate::batch::{Column, RecordBatch};
+        let mut db = Db::empty();
+        db.run("col big { id: text, grp: text, val: i64 }").unwrap();
+        let n = 70_000usize;
+        let batch = RecordBatch {
+            names: vec!["id".into(), "grp".into(), "val".into()].into(),
+            cols: vec![
+                Column::Cells((0..n).map(|i| Cell::from_text(format!("k-{i:06}"))).collect()),
+                Column::Cells((0..n).map(|i| Cell::from_text(format!("g-{}", i % 7))).collect()),
+                Column::from_ints((0..n as i64).collect()),
+            ],
+        };
+        db.insert_batch("big", &batch).unwrap();
+
+        let cnt = db.run("big | val >= 10000 | count").unwrap().rows.clone();
+        assert_eq!(cnt[0].get("hits"), Some(&Cell::Int(60_000)));
+
+        let by = db
+            .run("big | val < 7000 | count by grp")
+            .unwrap()
+            .rows
+            .clone();
+        assert_eq!(by.len(), 7);
+        for row in &by {
+            assert_eq!(row.get("hits"), Some(&Cell::Int(1000)));
+        }
+
+        let scanned = db
+            .run("big | val >= 69995 | { id, val } | take all")
+            .unwrap()
+            .rows
+            .clone();
+        assert_eq!(scanned.len(), 5);
+        assert_eq!(scanned[0].get("val"), Some(&Cell::Int(69_995)));
+        assert_eq!(scanned[4].get("val"), Some(&Cell::Int(69_999)));
+    }
+
+    #[test]
+    fn test_hot_left_cold_right_join_and_get_many_projected_by_id() {
+        let dir = Temp(std::env::temp_dir().join(format!(
+            "lin-cold-join-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        )));
+        let opts = crate::OpenOpts {
+            sync: crate::persist::SyncMode::Normal,
+            cold: true,
+        };
+        let mut db = Db::open_with(&dir.0, opts).unwrap();
+        let users_src: Vec<String> = (0..80)
+            .map(|i| format!(r#"{{ id: "u-{i:03}", email: "u{i}@example.com" }}"#))
+            .collect();
+        db.run(&format!("insert users [{}]", users_src.join(",")))
+            .unwrap();
+        let orders_src: Vec<String> = (0..20)
+            .map(|i| {
+                let uid = format!("u-{:03}", (i * 3) % 80);
+                format!(
+                    r#"{{ id: "o-{i:02}", user_id: "{uid}", total: {}.5 }}"#,
+                    i + 1
+                )
+            })
+            .collect();
+        db.run(&format!("insert orders [{}]", orders_src.join(",")))
+            .unwrap();
+        db.close().unwrap();
+
+        let mut db = Db::open_with(&dir.0, opts).unwrap();
+        assert!(db.store.is_disk_backed("users"));
+        assert!(!db.store.is_disk_backed("orders"));
+
+        {
+            let eng = db.store.disk_engine_read().unwrap();
+            let got = eng
+                .get_many_projected_by_id(
+                    "users",
+                    ["u-075", "u-000", "u-999", "u-033", "u-000"],
+                    &["email"],
+                )
+                .unwrap();
+            assert_eq!(got.len(), 3);
+            assert_eq!(
+                got["u-033"].get("email").and_then(Cell::text),
+                Some("u33@example.com")
+            );
+            assert!(got["u-033"].get("id").is_none());
+        }
+
+        let joined = db
+            .run("orders | join users on user_id | sort id asc | { id, users.email } | take all")
+            .unwrap()
+            .rows
+            .clone();
+        assert_eq!(joined.len(), 20);
+        assert_eq!(
+            joined[0].get("users.email").and_then(Cell::text),
+            Some("u0@example.com")
+        );
+        assert_eq!(
+            joined[1].get("users.email").and_then(Cell::text),
+            Some("u3@example.com")
+        );
+    }
 }

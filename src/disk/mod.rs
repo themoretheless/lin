@@ -3275,6 +3275,26 @@ impl DiskEngine {
         })
     }
 
+    fn project_cached_row(src: &Row, fields: &[&str]) -> Row {
+        if fields == ["id", "title"]
+            && let (Some(cid), Some(ctitle)) = (src.get("id"), src.get("title"))
+            && !matches!(cid, Cell::Null)
+            && !matches!(ctitle, Cell::Null)
+        {
+            return Row::from_parts(
+                Arc::clone(crate::store::shape_id_title()),
+                [cid.clone(), ctitle.clone()],
+            );
+        }
+        let mut out = Row::new();
+        for &f in fields {
+            if let Some(c) = src.get(f) {
+                out.insert(f, c.clone());
+            }
+        }
+        out
+    }
+
     pub fn get_projected_by_id(
         &self,
         table: &str,
@@ -3286,44 +3306,11 @@ impl DiskEngine {
                 return Ok(None);
             }
             if let Some(&idx) = mt.by_id.get(id) {
-                let src = &mt.rows[idx];
-                if fields == ["id", "title"]
-                    && let (Some(cid), Some(ctitle)) = (src.get("id"), src.get("title"))
-                    && !matches!(cid, Cell::Null)
-                    && !matches!(ctitle, Cell::Null)
-                {
-                    return Ok(Some(Row::from_parts(
-                        Arc::clone(crate::store::shape_id_title()),
-                        [cid.clone(), ctitle.clone()],
-                    )));
-                }
-                let mut out = Row::new();
-                for &f in fields {
-                    if let Some(c) = src.get(f) {
-                        out.insert(f.to_string(), c.clone());
-                    }
-                }
-                return Ok(Some(out));
+                return Ok(Some(Self::project_cached_row(&mt.rows[idx], fields)));
             }
         }
         if let Some(cached) = self.hot_cache.get_row(table, id) {
-            if fields == ["id", "title"]
-                && let (Some(cid), Some(ctitle)) = (cached.get("id"), cached.get("title"))
-                && !matches!(cid, Cell::Null)
-                && !matches!(ctitle, Cell::Null)
-            {
-                return Ok(Some(Row::from_parts(
-                    Arc::clone(crate::store::shape_id_title()),
-                    [cid.clone(), ctitle.clone()],
-                )));
-            }
-            let mut out = Row::new();
-            for &f in fields {
-                if let Some(c) = cached.get(f) {
-                    out.insert(f.to_string(), c.clone());
-                }
-            }
-            return Ok(Some(out));
+            return Ok(Some(Self::project_cached_row(&cached, fields)));
         }
         let Some(segs) = self.segments.get(table) else {
             return Ok(None);
@@ -3345,6 +3332,72 @@ impl DiskEngine {
             }
             Ok(None)
         })
+    }
+
+    /// Projected multi-key lookup ordered by `(segment, rid)` so lookups sharing a compressed
+    /// column block decode it once instead of repeatedly in random order.
+    pub fn get_many_projected_by_id<'k>(
+        &self,
+        table: &str,
+        ids: impl IntoIterator<Item = &'k str>,
+        fields: &[&str],
+    ) -> Result<FxHashMap<&'k str, Row>, Error> {
+        let mut out: FxHashMap<&'k str, Row> = FxHashMap::default();
+        let mut pending: Vec<&'k str> = Vec::new();
+        let mt = self.memtables.get(table);
+        for id in ids {
+            if out.contains_key(id) {
+                continue;
+            }
+            if let Some(mt) = mt {
+                if mt.deleted_ids.contains(id) {
+                    continue;
+                }
+                if let Some(&idx) = mt.by_id.get(id) {
+                    out.insert(id, Self::project_cached_row(&mt.rows[idx], fields));
+                    continue;
+                }
+            }
+            if let Some(cached) = self.hot_cache.get_row(table, id) {
+                out.insert(id, Self::project_cached_row(&cached, fields));
+                continue;
+            }
+            pending.push(id);
+        }
+        if pending.is_empty() {
+            return Ok(out);
+        }
+        let Some(segs) = self.segments.get(table) else {
+            return Ok(out);
+        };
+        pending.sort_unstable();
+        pending.dedup();
+        let mut located: Vec<(usize, u32, &'k str)> = Vec::with_capacity(pending.len());
+        for id in pending {
+            with_text_index_key(id, |kbuf| {
+                for (pos, seg) in segs.iter().enumerate().rev() {
+                    let sid = seg.meta.seg_id;
+                    let mut live_rid = None;
+                    seg.pk_index.for_each_key(kbuf, |rid| {
+                        if !self.tombstones.is_dead(sid, rid) {
+                            live_rid = Some(rid);
+                            return false;
+                        }
+                        true
+                    });
+                    if let Some(rid) = live_rid {
+                        located.push((pos, rid, id));
+                        return;
+                    }
+                }
+            });
+        }
+        located.sort_unstable_by_key(|&(pos, rid, _)| (pos, rid));
+        for (pos, rid, id) in located {
+            let row = segs[pos].materialize_projected(rid, fields)?;
+            out.insert(id, row);
+        }
+        Ok(out)
     }
 
     pub fn count_by_eq(&self, table: &str, field: &str, key: &Cell) -> Result<usize, Error> {

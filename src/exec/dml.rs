@@ -1051,6 +1051,44 @@ impl Db {
                 docs_by_uri,
                 col_len,
             )?
+        } else if records.is_none()
+            && all_uniform
+            && !needs_id
+            && !has_fks
+            && let Some(row_shape) = built.first().and_then(Row::shape_arc)
+            && let Some(id_slot) = row_shape.names().iter().position(|k| k == "id")
+            && (!row_shape.names().iter().any(|k| k == "body")
+                || row_shape.names().iter().any(|k| k == "hash"))
+            && (!is_docs
+                || (row_shape.names().iter().any(|k| k == "uri")
+                    && self.store.docs_moved_ids.is_empty()
+                    && self.store.docs_moved_idxs.is_empty()
+                    && self.store.retired_doc_ids.is_empty()))
+        {
+            let uri_slot_opt = if is_docs {
+                row_shape.names().iter().position(|k| k == "uri")
+            } else {
+                None
+            };
+            let hash_slot_opt = if row_shape.names().iter().any(|k| k == "body") {
+                row_shape.names().iter().position(|k| k == "hash")
+            } else {
+                None
+            };
+            let existing_ids = if !store_empty {
+                self.store.by_id.get(collection)
+            } else {
+                None
+            };
+            check_batch_unique_rows(
+                &built,
+                id_slot,
+                uri_slot_opt,
+                hash_slot_opt,
+                existing_ids,
+                &self.store.docs_by_uri,
+                col_len,
+            )?
         } else {
             false
         };
@@ -1908,6 +1946,265 @@ fn check_batch_unique_records(
         }
         res
     })
+}
+
+fn check_batch_unique_rows(
+    rows: &[Row],
+    id_slot: usize,
+    uri_slot_opt: Option<usize>,
+    hash_slot_opt: Option<usize>,
+    existing_ids: Option<&FxHashMap<Arc<str>, usize>>,
+    docs_by_uri: &FxHashMap<Arc<str>, usize>,
+    col_len: usize,
+) -> Result<bool, Error> {
+    BATCH_DEDUP_SETS.with(|cell| {
+        let mut clear_guard = DedupSetsClearGuard {
+            guard: cell.borrow_mut(),
+        };
+        let (batch_ids, batch_uris) = &mut *clear_guard.guard;
+        batch_ids.clear();
+        batch_ids.reserve(rows.len());
+        if uri_slot_opt.is_some() {
+            batch_uris.clear();
+            batch_uris.reserve(rows.len());
+        }
+        let mut res = Ok(true);
+        for row in rows {
+            let cells = row.cells_slice();
+            if let Some(h_slot) = hash_slot_opt
+                && cells.get(h_slot).and_then(Cell::text).is_none()
+            {
+                res = Ok(false);
+                break;
+            }
+            if let Some(id) = cells.get(id_slot).and_then(Cell::text) {
+                if id.is_empty() {
+                    res = Ok(false);
+                    break;
+                }
+                // SAFETY: `clear_guard` clears `batch_ids` and `batch_uris` before `rows`
+                // can go out of scope, even on panic/unwind.
+                let id_static: &'static str = unsafe { std::mem::transmute(id) };
+                if !batch_ids.insert(id_static)
+                    || existing_ids.is_some_and(|m| m.get(id).is_some_and(|&i| i < col_len))
+                {
+                    res = Err(Error::runtime(format!("duplicate id: {id}")));
+                    break;
+                }
+            } else {
+                res = Ok(false);
+                break;
+            }
+            if let Some(u_pos) = uri_slot_opt {
+                if let Some(uri) = cells.get(u_pos).and_then(Cell::text) {
+                    let uri_static: &'static str = unsafe { std::mem::transmute(uri) };
+                    if !batch_uris.insert(uri_static)
+                        || (col_len > 0 && docs_by_uri.get(uri).is_some_and(|&i| i < col_len))
+                    {
+                        res = Err(Error::runtime(format!("duplicate uri: {uri}")));
+                        break;
+                    }
+                } else {
+                    res = Ok(false);
+                    break;
+                }
+            }
+        }
+        res
+    })
+}
+
+pub(crate) fn build_batch_insert_rows(
+    batch: &crate::batch::RecordBatch,
+    needs_embed: bool,
+    hashing_dim: Option<usize>,
+    now: i64,
+) -> Option<(Vec<Row>, BuiltShape)> {
+    use crate::batch::Column;
+    let n = batch.n();
+    let w = batch.cols.len();
+    if n == 0 || w == 0 || w > 30 || batch.names.len() != w {
+        return None;
+    }
+    if !(0..w).all(|i| (i + 1..w).all(|j| batch.names[i] != batch.names[j])) {
+        return None;
+    }
+    let find_col = |target: &str| batch.names.iter().position(|k| k == target);
+    let id_idx = find_col("id");
+    let body_idx = find_col("body");
+    let hash_idx = find_col("hash");
+    let title_idx = find_col("title");
+    let snippet_idx = find_col("snippet");
+    let has_embedding = find_col("embedding").is_some();
+
+    let col_all_text = |idx: usize| -> bool {
+        matches!(&batch.cols[idx], Column::Cells(cs) if cs.iter().all(|c| c.text().is_some()))
+    };
+    let col_all_nonempty_text = |idx: usize| -> bool {
+        matches!(
+            &batch.cols[idx],
+            Column::Cells(cs) if cs.iter().all(|c| c.text().is_some_and(|s| !s.is_empty()))
+        )
+    };
+    if hash_idx.is_some_and(|hi| !col_all_text(hi)) && body_idx.is_some() {
+        return None;
+    }
+    if let Some(bi) = body_idx
+        && !col_all_text(bi)
+        && matches!(&batch.cols[bi], Column::Cells(cs) if cs.iter().any(|c| c.text().is_some()))
+    {
+        return None;
+    }
+
+    let needs_hash = hash_idx.is_none() && body_idx.is_some_and(col_all_text);
+    let first_embed_col = title_idx.or(body_idx).or(snippet_idx);
+    let can_inline_embed = needs_embed
+        && !has_embedding
+        && hashing_dim.is_some_and(|d| d > 0)
+        && first_embed_col.is_some_and(col_all_nonempty_text)
+        && title_idx.is_none_or(col_all_text)
+        && body_idx.is_none_or(col_all_text)
+        && snippet_idx.is_none_or(col_all_text);
+    let needs_id = id_idx.is_none_or(|ii| !col_all_text(ii));
+
+    let mut all_names: smallvec::SmallVec<[&str; 32]> =
+        batch.names.iter().map(String::as_str).collect();
+    if needs_hash {
+        all_names.push("hash");
+    }
+    if can_inline_embed {
+        all_names.push("embedding");
+    }
+    let shape = Row::shape_of(&all_names);
+    let width = shape.names().len();
+
+    #[derive(Clone, Copy)]
+    enum BatchSlot {
+        Col(usize),
+        Hash(usize),
+        Embed,
+    }
+    let mut slots: smallvec::SmallVec<[BatchSlot; 32]> = smallvec::SmallVec::with_capacity(width);
+    for target in shape.names() {
+        if target == "hash" && needs_hash {
+            slots.push(BatchSlot::Hash(body_idx.unwrap()));
+        } else if target == "embedding" && can_inline_embed {
+            slots.push(BatchSlot::Embed);
+        } else {
+            slots.push(BatchSlot::Col(find_col(target)?));
+        }
+    }
+
+    let lossless_cols = batch.cols.iter().all(|col| match col {
+        Column::Nulls { .. } => false,
+        Column::Int { valid, .. }
+        | Column::Float { valid, .. }
+        | Column::Bool { valid, .. }
+        | Column::Time { valid, .. } => valid.null_count() == 0,
+        Column::Cells(cs) => {
+            let k0 = cell_lossless_kind(&cs[0]);
+            k0 != 0 && cs[1..].iter().all(|c| cell_lossless_kind(c) == k0)
+        }
+    });
+
+    let get_col_text = |col_opt: Option<usize>, row_i: usize| -> Option<&str> {
+        let ci = col_opt?;
+        match &batch.cols[ci] {
+            Column::Cells(cs) => cs[row_i].text(),
+            _ => None,
+        }
+    };
+
+    let build_range = |start: usize, end: usize| -> Vec<Row> {
+        let mut out = Vec::with_capacity(end - start);
+        let mut fill_with = |mut embed_batch: Option<&mut crate::embed::HashingBatch<'_>>| {
+            for i in start..end {
+                let mut emb_vec = embed_batch.as_deref_mut().map(|eb| {
+                    eb.embed_parts([
+                        get_col_text(title_idx, i),
+                        get_col_text(body_idx, i),
+                        get_col_text(snippet_idx, i),
+                    ])
+                });
+                let eval_slot = |slot: BatchSlot, emb_vec: &mut Option<Arc<[f32]>>| -> Cell {
+                    match slot {
+                        BatchSlot::Col(ci) => batch.cols[ci].get(i),
+                        BatchSlot::Hash(bi) => {
+                            let body = get_col_text(Some(bi), i).unwrap_or("");
+                            Cell::SmallText(content_hash_inline(body))
+                        }
+                        BatchSlot::Embed => Cell::Vec(emb_vec.take().unwrap()),
+                    }
+                };
+                if width <= 8 {
+                    let mut cells: smallvec::SmallVec<[Cell; 8]> =
+                        smallvec::SmallVec::with_capacity(width);
+                    for &slot in &slots {
+                        cells.push(eval_slot(slot, &mut emb_vec));
+                    }
+                    out.push(Row::from_parts(Arc::clone(&shape), cells));
+                } else {
+                    let mut cells = Vec::with_capacity(width);
+                    for &slot in &slots {
+                        cells.push(eval_slot(slot, &mut emb_vec));
+                    }
+                    out.push(Row::from_vec_parts(Arc::clone(&shape), cells));
+                }
+            }
+        };
+        if let Some(dim) = hashing_dim.filter(|_| can_inline_embed) {
+            crate::embed::with_hashing_scratch(dim, |eb| fill_with(Some(eb)));
+        } else {
+            fill_with(None);
+        }
+        out
+    };
+
+    let rows = if n >= 256 && (can_inline_embed || needs_hash || n >= 4096) {
+        let min_chunk = if can_inline_embed { 128 } else { 1024 };
+        let threads = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(1)
+            .min(8)
+            .min((n + min_chunk - 1) / min_chunk);
+        if threads > 1 {
+            let chunk_size = (n + threads - 1) / threads;
+            let build_range = &build_range;
+            let chunks: Vec<Vec<Row>> = std::thread::scope(|scope| {
+                let mut handles = Vec::with_capacity(threads);
+                for c in 0..threads {
+                    let start = c * chunk_size;
+                    if start >= n {
+                        break;
+                    }
+                    let end = (start + chunk_size).min(n);
+                    handles.push(scope.spawn(move || build_range(start, end)));
+                }
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            let mut out = Vec::with_capacity(n);
+            for chunk in chunks {
+                out.extend(chunk);
+            }
+            out
+        } else {
+            build_range(0, n)
+        }
+    } else {
+        build_range(0, n)
+    };
+
+    Some((
+        rows,
+        BuiltShape {
+            all_uniform: true,
+            all_embedded: !needs_embed || can_inline_embed,
+            needs_id,
+            lossless_cols,
+            hashing_dim,
+            now,
+        },
+    ))
 }
 
 #[inline]

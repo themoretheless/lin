@@ -1341,7 +1341,7 @@ pub(crate) fn eval_window(
             frame,
         );
         for (i, mut row) in part.into_iter().enumerate() {
-            row.insert(as_field.to_string(), vals[i].clone());
+            row.insert(as_field, vals[i].clone());
             result_rows.push(row);
         }
     }

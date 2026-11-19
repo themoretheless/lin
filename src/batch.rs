@@ -838,6 +838,46 @@ impl RecordBatch {
             out.truncate(n);
             return out;
         }
+        let width = self.cols.len();
+        if n < 65536
+            && (1..=8).contains(&width)
+            && self.names.len() == width
+            && (0..width).all(|i| (i + 1..width).all(|j| self.names[i] != self.names[j]))
+        {
+            let shape = Row::shape_of(&self.names);
+            let mut inv_slots = [0usize; 8];
+            for (pos, target) in shape.names().iter().enumerate() {
+                inv_slots[pos] = self
+                    .names
+                    .iter()
+                    .position(|name| name == target)
+                    .unwrap_or(pos);
+            }
+            let cols = self.cols.as_mut_slice();
+            let mut out = if n >= 1024 {
+                crate::store::take_general_rows().unwrap_or_else(|| Vec::with_capacity(n))
+            } else {
+                Vec::with_capacity(n)
+            };
+            if out.capacity() < n {
+                out.reserve(n - out.len());
+            }
+            let reuse_len = out.len().min(n);
+            for (i, row) in out[..reuse_len].iter_mut().enumerate() {
+                row.reset_with_shape_ref(
+                    &shape,
+                    (0..width).map(|pos| take_col_cell(&mut cols[inv_slots[pos]], i)),
+                );
+            }
+            for i in reuse_len..n {
+                out.push(Row::from_parts(
+                    Arc::clone(&shape),
+                    (0..width).map(|pos| take_col_cell(&mut cols[inv_slots[pos]], i)),
+                ));
+            }
+            out.truncate(n);
+            return out;
+        }
         self.to_rows()
     }
 
@@ -859,6 +899,56 @@ impl RecordBatch {
                 let c0 = self.cols[0].get(i);
                 let c1 = self.cols[1].get(i);
                 Row::from_parts(Arc::clone(&shape), if swap { [c1, c0] } else { [c0, c1] })
+            };
+            if n >= 65536 {
+                let threads = std::thread::available_parallelism()
+                    .map(|p| p.get())
+                    .unwrap_or(1)
+                    .min(8)
+                    .min((n + 8191) / 8192);
+                if threads > 1 {
+                    let chunk_size = (n + threads - 1) / threads;
+                    let fill = &fill;
+                    let chunks: Vec<Vec<Row>> = std::thread::scope(|scope| {
+                        let mut handles = Vec::with_capacity(threads);
+                        for chunk_idx in 0..threads {
+                            let c_start = start + chunk_idx * chunk_size;
+                            if c_start >= end {
+                                break;
+                            }
+                            let c_end = (c_start + chunk_size).min(end);
+                            handles.push(scope.spawn(move || (c_start..c_end).map(fill).collect()));
+                        }
+                        handles.into_iter().map(|h| h.join().unwrap()).collect()
+                    });
+                    let mut out = Vec::with_capacity(n);
+                    for chunk in chunks {
+                        out.extend(chunk);
+                    }
+                    return out;
+                }
+            }
+            return (start..end).map(fill).collect();
+        }
+        let width = self.names.len();
+        if (1..=8).contains(&width)
+            && self.cols.len() == width
+            && (0..width).all(|i| (i + 1..width).all(|j| self.names[i] != self.names[j]))
+        {
+            let shape = Row::shape_of(&self.names);
+            let mut inv_slots = [0usize; 8];
+            for (pos, target) in shape.names().iter().enumerate() {
+                inv_slots[pos] = self
+                    .names
+                    .iter()
+                    .position(|name| name == target)
+                    .unwrap_or(pos);
+            }
+            let fill = |i: usize| -> Row {
+                Row::from_parts(
+                    Arc::clone(&shape),
+                    (0..width).map(|pos| self.cols[inv_slots[pos]].get(i)),
+                )
             };
             if n >= 65536 {
                 let threads = std::thread::available_parallelism()

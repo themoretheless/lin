@@ -705,13 +705,89 @@ pub(super) fn spo_key(row: &Row) -> Option<(Arc<str>, Arc<str>, Arc<str>)> {
     ))
 }
 
+pub struct RowProjector<'a> {
+    shape: Option<Arc<Shape>>,
+    slots: smallvec::SmallVec<[super::row::FieldSlot<'a>; 8]>,
+}
+
+impl<'a> RowProjector<'a> {
+    #[inline]
+    pub fn new(fields: &'a [String]) -> Self {
+        if fields.is_empty() {
+            return Self {
+                shape: None,
+                slots: smallvec::SmallVec::new(),
+            };
+        }
+        let shape = if fields.len() == 2
+            && ((fields[0] == "id" && fields[1] == "title")
+                || (fields[0] == "title" && fields[1] == "id"))
+        {
+            Arc::clone(shape_id_title())
+        } else {
+            Row::shape_of(fields)
+        };
+        let slots = shape
+            .names()
+            .iter()
+            .map(|target| {
+                let src = fields
+                    .iter()
+                    .find(|f| f.as_str() == target.as_str())
+                    .map(String::as_str)
+                    .unwrap_or("");
+                super::row::FieldSlot::new(src)
+            })
+            .collect();
+        Self {
+            shape: Some(shape),
+            slots,
+        }
+    }
+
+    #[inline]
+    pub fn project(&mut self, row: &Row) -> Row {
+        let Some(ref shape) = self.shape else {
+            return Row::new();
+        };
+        Row::from_parts(
+            Arc::clone(shape),
+            self.slots
+                .iter_mut()
+                .map(|slot| slot.get(row).map(Cell::clone_for_borrow).unwrap_or(Cell::Null)),
+        )
+    }
+}
+
 pub fn project_fields(row: &Row, fields: &[String]) -> Row {
+    if fields.is_empty() {
+        return Row::new();
+    }
+    if fields.len() == 2 && fields[0] != fields[1] {
+        let shape = if (fields[0] == "id" && fields[1] == "title")
+            || (fields[0] == "title" && fields[1] == "id")
+        {
+            Arc::clone(shape_id_title())
+        } else {
+            Row::shape_of(fields)
+        };
+        let swap = fields[0] > fields[1];
+        let c0 = row
+            .get(&fields[0])
+            .map(Cell::clone_for_borrow)
+            .unwrap_or(Cell::Null);
+        let c1 = row
+            .get(&fields[1])
+            .map(Cell::clone_for_borrow)
+            .unwrap_or(Cell::Null);
+        return Row::from_parts(shape, if swap { [c1, c0] } else { [c0, c1] });
+    }
     let mut out = acquire_row();
     for f in fields {
-        if let Some((k, v)) = row.get_key_value(f) {
-            out.insert(k.clone(), v.clone_for_borrow());
+        if let Some(v) = row.get(f) {
+            out.insert(f.as_str(), v.clone_for_borrow());
         } else {
-            out.insert(f.clone(), Cell::Null);
+            out.insert(f.as_str(), Cell::Null);
         }
     }
     out

@@ -49,8 +49,7 @@ use crate::parse;
 use crate::persist::{Pack, Persist};
 use crate::plan::{self, Plan};
 use crate::store::{
-    Cell, Row, Store, acquire_row, compact_row, content_hash_inline, now_ms, project_fields,
-    row_text,
+    Cell, Row, Store, compact_row, content_hash_inline, now_ms, project_fields, row_text,
 };
 
 type StmtOut = (Vec<Row>, Option<String>, Option<Pack>);
@@ -84,7 +83,7 @@ impl Handle {
             crate::store::release_id_title_rows(std::mem::take(&mut self.rows));
         } else if self.rows.len() >= 1024
             && self.rows.len() <= 262_144
-            && self.rows[0].len() <= 4
+            && self.rows[0].len() <= 8
         {
             crate::store::release_general_rows(std::mem::take(&mut self.rows));
         } else if self.rows.len() == 1 && self.rows[0].len() == 3 {
@@ -2026,7 +2025,7 @@ impl Db {
         old_ids.push(row_text(&before, "id").map(str::to_string));
         let mut updated = before;
         for (k, v) in &pu.record.fields {
-            updated.insert(k.clone(), value_cell(v, now));
+            updated.insert(k.as_str(), value_cell(v, now));
         }
         let has_body = pu.record.fields.iter().any(|(k, _)| k == "body");
         if has_body && let Some(body) = row_text(&updated, "body") {
@@ -3691,22 +3690,6 @@ impl Db {
                 n: 0,
             });
         }
-        if let Some(name) = batch
-            .names
-            .iter()
-            .zip(&batch.cols)
-            .find(|(_, col)| match col {
-                crate::batch::Column::Cells(cells) => {
-                    cells.iter().any(|c| matches!(c, Cell::Vec(_)))
-                }
-                _ => false,
-            })
-            .map(|(name, _)| name)
-        {
-            return Err(Error::runtime(format!(
-                "insert_batch: vector column {name} is not supported"
-            )));
-        }
         if let Some(done) = self.insert_batch_cold(collection, batch)? {
             return Ok(done);
         }
@@ -3800,7 +3783,11 @@ impl Db {
                             Cell::Float(_) => (2, Value::Float(0.0)),
                             Cell::Bool(_) => (3, Value::Bool(false)),
                             Cell::Time(_) => (4, Value::Timestamp(0)),
-                            Cell::Vec(_) => continue,
+                            Cell::Vec(_) => {
+                                return Err(Error::runtime(format!(
+                                    "insert_batch: vector column {name} is not supported"
+                                )));
+                            }
                         };
                         if !seen[slot] {
                             seen[slot] = true;
@@ -3879,29 +3866,38 @@ impl Db {
         let Some(has_null) = self.check_batch_types(collection, batch)? else {
             return Ok(None);
         };
-        let mut rows = batch.to_rows();
-        if has_null {
-            for row in &mut rows {
-                row.retain(|_, cell| !matches!(cell, Cell::Null));
-            }
-        }
         let needs_embed = self.embedder.is_some()
             && self
                 .catalog
                 .collection(collection)
                 .is_some_and(|c| c.has_vec());
-        let shape = dml::BuiltShape {
-            // Without nulls every row has the batch's fields, in one sorted order.
-            all_uniform: !has_null,
-            all_embedded: !needs_embed,
-            needs_id: rows.iter().any(|r| r.get("id").and_then(Cell::text).is_none()),
-            lossless_cols: false,
-            hashing_dim: if needs_embed {
-                self.embedder.as_ref().and_then(|e| e.hashing_dim())
-            } else {
-                None
-            },
-            now: now_ms(),
+        let hashing_dim = if needs_embed {
+            self.embedder.as_ref().and_then(|e| e.hashing_dim())
+        } else {
+            None
+        };
+        let now = now_ms();
+        let (rows, shape) = if !has_null
+            && let Some(built) = dml::build_batch_insert_rows(batch, needs_embed, hashing_dim, now)
+        {
+            built
+        } else {
+            let mut rows = batch.to_rows();
+            if has_null {
+                for row in &mut rows {
+                    row.retain(|_, cell| !matches!(cell, Cell::Null));
+                }
+            }
+            let shape = dml::BuiltShape {
+                // Without nulls every row has the batch's fields, in one sorted order.
+                all_uniform: !has_null,
+                all_embedded: !needs_embed,
+                needs_id: rows.iter().any(|r| r.get("id").and_then(Cell::text).is_none()),
+                lossless_cols: false,
+                hashing_dim,
+                now,
+            };
+            (rows, shape)
         };
         let n = rows.len();
         let prepared = self.prepare_stmts_checked(vec![Stmt::InsertRows {
@@ -4653,19 +4649,51 @@ impl Db {
             return rows;
         }
         let col = self.store.collection(name);
+        if col.len() >= agg::PAR_AGG_MIN_ROWS {
+            let threads = std::thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(1)
+                .min(8)
+                .min((col.len() + agg::PAR_AGG_CHUNK_ROWS - 1) / agg::PAR_AGG_CHUNK_ROWS);
+            if threads > 1 {
+                let chunk_size = (col.len() + threads - 1) / threads;
+                let names_ref = names.as_deref();
+                let chunks: Vec<Vec<Row>> = std::thread::scope(|scope| {
+                    let mut handles = Vec::with_capacity(threads);
+                    for chunk in col.chunks(chunk_size) {
+                        handles.push(scope.spawn(move || {
+                            let mut local = Vec::new();
+                            let mut slots = eval::PredSlots::new(pred);
+                            let mut proj = names_ref.map(crate::store::RowProjector::new);
+                            for r in chunk {
+                                if slots.eval(r, now) {
+                                    local.push(match proj.as_mut() {
+                                        Some(p) => p.project(r),
+                                        None => r.clone(),
+                                    });
+                                }
+                            }
+                            local
+                        }));
+                    }
+                    handles.into_iter().map(|h| h.join().unwrap()).collect()
+                });
+                let total: usize = chunks.iter().map(Vec::len).sum();
+                let mut out = Vec::with_capacity(total);
+                for chunk in chunks {
+                    out.extend(chunk);
+                }
+                return out;
+            }
+        }
         let mut out = Vec::new();
         let mut slots = eval::PredSlots::new(pred);
+        let mut proj = names.as_deref().map(crate::store::RowProjector::new);
         for r in col {
             if slots.eval(r, now) {
-                out.push(match names.as_deref() {
-                    Some(fs) => project_fields(r, fs),
-                    None => {
-                        let mut row = acquire_row();
-                        for (k, v) in r {
-                            row.insert(k.clone(), v.clone_for_borrow());
-                        }
-                        row
-                    }
+                out.push(match proj.as_mut() {
+                    Some(p) => p.project(r),
+                    None => r.clone(),
                 });
             }
         }
@@ -4690,10 +4718,8 @@ impl Db {
             return rows;
         }
         let mut out = Vec::with_capacity(idxs.len());
-        let id_only = names
-            .as_deref()
-            .is_some_and(|fs| fs.len() == 1 && fs[0] == "id");
         let mut slots = eval::PredSlots::new(pred);
+        let mut proj = names.as_deref().map(crate::store::RowProjector::new);
         for &i in idxs {
             let Some(row) = self.store.get_by_idx(name, i) else {
                 continue;
@@ -4701,27 +4727,10 @@ impl Db {
             if !covered && !slots.eval(row, now) {
                 continue;
             }
-            if id_only {
-                let mut r = acquire_row();
-                r.insert(
-                    "id",
-                    row.get("id")
-                        .map(Cell::clone_for_borrow)
-                        .unwrap_or(Cell::Null),
-                );
-                out.push(r);
-            } else {
-                out.push(match names.as_deref() {
-                    Some(fs) => project_fields(row, fs),
-                    None => {
-                        let mut r = acquire_row();
-                        for (k, v) in row {
-                            r.insert(k.clone(), v.clone_for_borrow());
-                        }
-                        r
-                    }
-                });
-            }
+            out.push(match proj.as_mut() {
+                Some(p) => p.project(row),
+                None => row.clone(),
+            });
         }
         out
     }
@@ -4744,8 +4753,9 @@ impl Db {
             }
             let proj_refs: Vec<&str> = names.iter().map(String::as_str).collect();
             let mut out = Vec::new();
+            let mut proj = crate::store::RowProjector::new(&names);
             let _ = eng.scan_projected(name, Some(&proj_refs), |r| {
-                out.push(project_fields(r, &names));
+                out.push(proj.project(r));
                 if let Some(lim) = limit
                     && out.len() >= lim
                 {
@@ -4761,8 +4771,9 @@ impl Db {
             None => col.len(),
         };
         let mut out = Vec::with_capacity(count);
+        let mut proj = crate::store::RowProjector::new(&names);
         for r in col.iter().take(count) {
-            out.push(project_fields(r, &names));
+            out.push(proj.project(r));
         }
         out
     }

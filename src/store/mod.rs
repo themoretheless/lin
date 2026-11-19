@@ -18,10 +18,10 @@ pub(crate) use value::{
 };
 #[allow(unused_imports)]
 pub use value::{
-    Cell, InlineStr, Row, RowExt, Shape as RowShape, acquire_orders_row, acquire_row, cell_from_arc_inline,
-    compact_row, content_hash_arc, content_hash_inline, fnv1a64, now_ms, project_fields,
-    release_general_rows, release_id_title_rows, release_orders_row, release_single_id_title_vec,
-    row_byte_size, row_text,
+    Cell, InlineStr, Row, RowExt, RowProjector, Shape as RowShape, acquire_orders_row, acquire_row,
+    cell_from_arc_inline, compact_row, content_hash_arc, content_hash_inline, fnv1a64, now_ms,
+    project_fields, release_general_rows, release_id_title_rows, release_orders_row,
+    release_single_id_title_vec, row_byte_size, row_text,
 };
 
 use std::collections::BTreeMap;

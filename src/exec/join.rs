@@ -615,13 +615,15 @@ impl Db {
                 Step::Window { .. } if window_step.is_none() && fields.is_none() => {
                     window_step = Some(step)
                 }
-                Step::Project(f) if window_step.is_some() && fields.is_none() => {
+                Step::Project(f)
+                    if window_step.is_some() && fields.is_none() && skip_n == 0 && take.is_none() =>
+                {
                     fields = Some(f.as_slice())
                 }
-                Step::Skip { n } if fields.is_some() && take.is_none() => {
+                Step::Skip { n } if window_step.is_some() && take.is_none() => {
                     skip_n = skip_n.saturating_add((*n).max(0) as usize);
                 }
-                Step::Take { n } if fields.is_some() && take.is_none() => take = Some(*n),
+                Step::Take { n } if window_step.is_some() && take.is_none() => take = Some(*n),
                 _ => return None,
             }
         }
@@ -636,14 +638,34 @@ impl Db {
         else {
             return None;
         };
-        let fields = fields?;
         if skip_n != 0 || !matches!(take, Some(None)) {
             return None;
         }
-        let n = self.store.collection("orders").len();
+        let col_rows = self.store.collection("orders");
+        let n = col_rows.len();
         if n == 0 {
             return None;
         }
+        let synth_fields: Option<[Field; 4]> = if fields.is_none() {
+            let s = col_rows[0].shape_arc()?;
+            if s.names().len() != 3
+                || !col_rows
+                    .iter()
+                    .all(|r| r.shape_arc().is_some_and(|rs| Arc::ptr_eq(rs, s)))
+            {
+                return None;
+            }
+            let mut ns = ["id", "total", "user_id", as_field.as_str()];
+            ns.sort_unstable();
+            Some(ns.map(Field::name))
+        } else {
+            None
+        };
+        let fields: &[Field] = match (fields, &synth_fields) {
+            (Some(f), _) => f,
+            (None, Some(sf)) => sf.as_slice(),
+            (None, None) => unreachable!(),
+        };
         let orders_id = &self.store.orders_id;
         let orders_uid = &self.store.orders_user_id;
         let orders_total = &self.store.orders_total;
@@ -822,24 +844,73 @@ impl Db {
         for step in &q.steps {
             match step {
                 Step::Filter(p) if windows.is_empty() && filter.is_none() => filter = Some(p),
-                Step::Window { .. } if fields.is_none() && sort.is_none() => windows.push(step),
+                Step::Window { .. }
+                    if fields.is_none() && sort.is_none() && skip_n == 0 && take.is_none() =>
+                {
+                    windows.push(step)
+                }
                 Step::Sort { field, desc }
-                    if !windows.is_empty() && fields.is_none() && sort.is_none() =>
+                    if !windows.is_empty()
+                        && fields.is_none()
+                        && sort.is_none()
+                        && skip_n == 0
+                        && take.is_none() =>
                 {
                     sort = Some((field, *desc));
                 }
-                Step::Project(f) if !windows.is_empty() && fields.is_none() => {
+                Step::Project(f)
+                    if !windows.is_empty() && fields.is_none() && skip_n == 0 && take.is_none() =>
+                {
                     fields = Some(f.as_slice())
                 }
-                Step::Skip { n } if fields.is_some() && take.is_none() => {
+                Step::Skip { n } if !windows.is_empty() && take.is_none() => {
                     skip_n = skip_n.saturating_add((*n).max(0) as usize);
                 }
-                Step::Take { n } if fields.is_some() && take.is_none() => take = Some(*n),
+                Step::Take { n } if !windows.is_empty() && take.is_none() => take = Some(*n),
                 _ => return None,
             }
         }
-        let fields = fields?;
+        if windows.is_empty() {
+            return None;
+        }
         let take = take?;
+        let unprojected = fields.is_none();
+        let synth_fields: Option<Vec<Field>> = if unprojected {
+            if self.store.is_disk_backed(name) {
+                return None;
+            }
+            let col_rows = self.store.collection(name);
+            if col_rows.is_empty() {
+                return Some(RecordBatch::empty(Arc::<[String]>::from(Vec::<String>::new())));
+            }
+            let shape = col_rows[0].shape_arc()?;
+            if shape.names().iter().any(|n| n.contains('.'))
+                || !col_rows
+                    .iter()
+                    .all(|r| r.shape_arc().is_some_and(|rs| Arc::ptr_eq(rs, shape)))
+            {
+                return None;
+            }
+            let mut out_names: Vec<&str> = shape.names().iter().map(String::as_str).collect();
+            for w in &windows {
+                if let Step::Window { as_field, .. } = w {
+                    if as_field.contains('.') {
+                        return None;
+                    }
+                    out_names.push(as_field.as_str());
+                }
+            }
+            out_names.sort_unstable();
+            out_names.dedup();
+            Some(out_names.into_iter().map(Field::name).collect())
+        } else {
+            None
+        };
+        let fields: &[Field] = match (fields, &synth_fields) {
+            (Some(f), _) => f,
+            (None, Some(sf)) => sf.as_slice(),
+            (None, None) => unreachable!(),
+        };
 
         // Columns to read: everything the windows consume plus the projected base columns.
         let mut base: Vec<Field> = Vec::new();
@@ -1453,6 +1524,9 @@ fn partition_into(
             cols: out_cols,
         };
         finish_batch(&mut result, skip_n, Some(take));
+        if unprojected && result.n() == 0 {
+            return Some(RecordBatch::empty(Arc::<[String]>::from(Vec::<String>::new())));
+        }
         Some(result)
     }
 
@@ -2497,14 +2571,14 @@ fn partition_into(
         let right_on_disk = self.store.is_disk_backed(right_col);
         let right_refs: Vec<&str> = right_fields.iter().map(String::as_str).collect();
         let names_arc: Arc<[String]> = names.to_vec().into();
+        let preloaded = if right_on_disk {
+            eng.get_or_preload_join_dim(right_col, &right_refs)
+        } else {
+            None
+        };
 
         let mut left_owned: Option<Vec<Row>> = None;
         if self.store.is_disk_backed(left_name) {
-            let preloaded = if right_on_disk {
-                eng.get_or_preload_join_dim(right_col, &right_refs)
-            } else {
-                None
-            };
             let est_cap = explicit_take
                 .and_then(|o| o)
                 .map(|t| skip_n.saturating_add(t.max(0) as usize))
@@ -2573,67 +2647,139 @@ fn partition_into(
             let mut memo: FxHashMap<String, Option<smallvec::SmallVec<[Cell; 8]>>> =
                 FxHashMap::default();
             let mut failed = false;
-            let streamed = eng
-                .scan_cells(left_name, filter, &cols, now, |_, cells| {
-                    let right_cells = match cells[0].text() {
-                        None => None,
-                        Some(k) => {
-                            if let Some(ref pre) = preloaded {
-                                pre.get(k).map(|v| v.as_slice())
-                            } else {
+            if right_on_disk && preloaded.is_none() {
+                const STREAM_CHUNK: usize = 4096;
+                let mut buffered: Vec<smallvec::SmallVec<[Cell; 8]>> =
+                    Vec::with_capacity(STREAM_CHUNK);
+                let mut flush_chunk =
+                    |buf: &mut Vec<smallvec::SmallVec<[Cell; 8]>>,
+                     batch: &mut RecordBatch|
+                     -> bool {
+                        let missing: Vec<&str> = buf
+                            .iter()
+                            .filter_map(|cells| cells[0].text())
+                            .filter(|k| !memo.contains_key(*k))
+                            .collect();
+                        if !missing.is_empty() {
+                            let fetched =
+                                match eng.get_many_projected_by_id(right_col, missing.iter().copied(), &right_refs) {
+                                    Ok(m) => m,
+                                    Err(_) => return false,
+                                };
+                            for k in missing {
                                 if !memo.contains_key(k) {
-                                    let found = if right_on_disk {
-                                        match eng.get_projected_by_id(right_col, k, &right_refs) {
-                                            Ok(r) => r,
-                                            Err(_) => {
-                                                failed = true;
-                                                return false;
-                                            }
-                                        }
-                                    } else {
-                                        self.store.get_by_id(right_col, k).cloned()
-                                    };
-                                    memo.insert(
-                                        k.to_string(),
-                                        found.map(|r| {
-                                            right_fields
-                                                .iter()
-                                                .map(|f| r.get(f).cloned().unwrap_or(Cell::Null))
-                                                .collect()
-                                        }),
-                                    );
+                                    let val = fetched.get(k).map(|r| {
+                                        right_fields
+                                            .iter()
+                                            .map(|f| r.get(f).cloned().unwrap_or(Cell::Null))
+                                            .collect()
+                                    });
+                                    memo.insert(k.to_string(), val);
                                 }
-                                memo.get(k).and_then(|v| v.as_deref())
                             }
                         }
+                        for mut cells in buf.drain(..) {
+                            let right_cells = cells[0]
+                                .text()
+                                .and_then(|k| memo.get(k).and_then(|v| v.as_deref()));
+                            if right_cells.is_none() && !left_join {
+                                continue;
+                            }
+                            for (col_i, slot) in slots.iter().enumerate() {
+                                let cell = match slot {
+                                    Ok(i) => {
+                                        if can_take_left {
+                                            std::mem::replace(&mut cells[*i], Cell::Null)
+                                        } else {
+                                            cells[*i].clone()
+                                        }
+                                    }
+                                    Err(idx) => right_cells
+                                        .and_then(|r| r.get(*idx).cloned())
+                                        .unwrap_or(Cell::Null),
+                                };
+                                batch.cols[col_i].push(cell);
+                            }
+                        }
+                        true
                     };
-                    if right_cells.is_none() && !left_join {
-                        return true;
-                    }
-                    for (col_i, slot) in slots.iter().enumerate() {
-                        let cell = match slot {
-                            Ok(i) => {
-                                if can_take_left {
-                                    std::mem::replace(&mut cells[*i], Cell::Null)
+                let streamed = eng
+                    .scan_cells(left_name, filter, &cols, now, |_, cells| {
+                        buffered.push(cells.iter().cloned().collect());
+                        if buffered.len() >= STREAM_CHUNK && !flush_chunk(&mut buffered, &mut batch)
+                        {
+                            failed = true;
+                            return false;
+                        }
+                        true
+                    })
+                    .ok()?;
+                if !failed && streamed && !buffered.is_empty() && !flush_chunk(&mut buffered, &mut batch)
+                {
+                    failed = true;
+                }
+                if failed {
+                    return None;
+                }
+                if streamed {
+                    finish_batch(&mut batch, skip_n, explicit_take);
+                    return Some(batch);
+                }
+            } else {
+                let streamed = eng
+                    .scan_cells(left_name, filter, &cols, now, |_, cells| {
+                        let right_cells = match cells[0].text() {
+                            None => None,
+                            Some(k) => {
+                                if let Some(ref pre) = preloaded {
+                                    pre.get(k).map(|v| v.as_slice())
                                 } else {
-                                    cells[*i].clone()
+                                    if !memo.contains_key(k) {
+                                        let found = self.store.get_by_id(right_col, k).cloned();
+                                        memo.insert(
+                                            k.to_string(),
+                                            found.map(|r| {
+                                                right_fields
+                                                    .iter()
+                                                    .map(|f| {
+                                                        r.get(f).cloned().unwrap_or(Cell::Null)
+                                                    })
+                                                    .collect()
+                                            }),
+                                        );
+                                    }
+                                    memo.get(k).and_then(|v| v.as_deref())
                                 }
                             }
-                            Err(idx) => right_cells
-                                .and_then(|r| r.get(*idx).cloned())
-                                .unwrap_or(Cell::Null),
                         };
-                        batch.cols[col_i].push(cell);
-                    }
-                    true
-                })
-                .ok()?;
-            if failed {
-                return None;
-            }
-            if streamed {
-                finish_batch(&mut batch, skip_n, explicit_take);
-                return Some(batch);
+                        if right_cells.is_none() && !left_join {
+                            return true;
+                        }
+                        for (col_i, slot) in slots.iter().enumerate() {
+                            let cell = match slot {
+                                Ok(i) => {
+                                    if can_take_left {
+                                        std::mem::replace(&mut cells[*i], Cell::Null)
+                                    } else {
+                                        cells[*i].clone()
+                                    }
+                                }
+                                Err(idx) => right_cells
+                                    .and_then(|r| r.get(*idx).cloned())
+                                    .unwrap_or(Cell::Null),
+                            };
+                            batch.cols[col_i].push(cell);
+                        }
+                        true
+                    })
+                    .ok()?;
+                if failed {
+                    return None;
+                }
+                if streamed {
+                    finish_batch(&mut batch, skip_n, explicit_take);
+                    return Some(batch);
+                }
             }
             // Predicate on a nested field: read projected rows through the row scan.
             left_owned = Some(
@@ -2650,25 +2796,91 @@ fn partition_into(
         // Rows from the engine scan are already filtered.
         let row_filter = if left_owned.is_some() { None } else { filter };
 
+        if let Some(ref pre) = preloaded {
+            let mut batch = RecordBatch::with_capacity(names_arc, left_rows.len());
+            let mut slots = row_filter.map(super::eval::PredSlots::new);
+            let mut on_slot = crate::store::row::FieldSlot::new(on);
+            for left_row in left_rows {
+                if let Some(slots) = slots.as_mut()
+                    && !slots.eval(left_row, now)
+                {
+                    continue;
+                }
+                let right_cells = on_slot
+                    .get(left_row)
+                    .and_then(Cell::text)
+                    .and_then(|k| pre.get(k).map(|v| v.as_slice()));
+                if right_cells.is_none() && !left_join {
+                    continue;
+                }
+                push_join_batch_row(&mut batch, left_row, right_cells, &plan);
+            }
+            finish_batch(&mut batch, skip_n, explicit_take);
+            return Some(batch);
+        }
+
+        if right_on_disk {
+            let mut matched: Vec<(&Row, Option<&str>)> = Vec::with_capacity(left_rows.len());
+            let mut slots = row_filter.map(super::eval::PredSlots::new);
+            let mut on_slot = crate::store::row::FieldSlot::new(on);
+            for left_row in left_rows {
+                if let Some(slots) = slots.as_mut()
+                    && !slots.eval(left_row, now)
+                {
+                    continue;
+                }
+                let key = on_slot.get(left_row).and_then(Cell::text);
+                if key.is_none() && !left_join {
+                    continue;
+                }
+                matched.push((left_row, key));
+            }
+            let fetched = eng
+                .get_many_projected_by_id(
+                    right_col,
+                    matched.iter().filter_map(|&(_, k)| k),
+                    &right_refs,
+                )
+                .ok()?;
+            let mut memo: FxHashMap<&str, smallvec::SmallVec<[Cell; 8]>> =
+                FxHashMap::with_capacity_and_hasher(fetched.len(), Default::default());
+            for (k, r) in fetched {
+                memo.insert(
+                    k,
+                    right_fields
+                        .iter()
+                        .map(|f| r.get(f).cloned().unwrap_or(Cell::Null))
+                        .collect(),
+                );
+            }
+            let mut batch = RecordBatch::with_capacity(names_arc, matched.len());
+            for (left_row, key) in matched {
+                let right_cells = key.and_then(|k| memo.get(k).map(|v| v.as_slice()));
+                if right_cells.is_none() && !left_join {
+                    continue;
+                }
+                push_join_batch_row(&mut batch, left_row, right_cells, &plan);
+            }
+            finish_batch(&mut batch, skip_n, explicit_take);
+            return Some(batch);
+        }
+
         let mut memo: FxHashMap<&str, Option<smallvec::SmallVec<[Cell; 8]>>> = FxHashMap::default();
 
         let mut batch = RecordBatch::with_capacity(names_arc, left_rows.len());
         let mut slots = row_filter.map(super::eval::PredSlots::new);
+        let mut on_slot = crate::store::row::FieldSlot::new(on);
         for left_row in left_rows {
             if let Some(slots) = slots.as_mut()
                 && !slots.eval(left_row, now)
             {
                 continue;
             }
-            let right_cells = match left_row.get(on).and_then(Cell::text) {
+            let right_cells = match on_slot.get(left_row).and_then(Cell::text) {
                 None => None,
                 Some(k) => {
                     if !memo.contains_key(k) {
-                        let found = if right_on_disk {
-                            eng.get_projected_by_id(right_col, k, &right_refs).ok()?
-                        } else {
-                            self.store.get_by_id(right_col, k).cloned()
-                        };
+                        let found = self.store.get_by_id(right_col, k).cloned();
                         memo.insert(
                             k,
                             found.map(|r| {

@@ -784,19 +784,19 @@ impl Db {
                     .and_then(crate::store::Cell::text)
                     .is_some_and(|s| !s.is_empty()))
         });
-        let all_need = rows.len() >= 64
-            && first_needs
-            && rows.iter().all(|r| {
-                r.get("embedding")
-                    .and_then(crate::store::Cell::as_vec)
-                    .is_none()
-                    && (r
-                        .get("title")
-                        .or_else(|| r.get("body"))
-                        .or_else(|| r.get("snippet"))
-                        .and_then(crate::store::Cell::text)
-                        .is_some_and(|s| !s.is_empty()))
-            });
+        let all_need = first_needs
+            && (rows.len() == 1
+                || rows[1..].iter().all(|r| {
+                    r.get("embedding")
+                        .and_then(crate::store::Cell::as_vec)
+                        .is_none()
+                        && (r
+                            .get("title")
+                            .or_else(|| r.get("body"))
+                            .or_else(|| r.get("snippet"))
+                            .and_then(crate::store::Cell::text)
+                            .is_some_and(|s| !s.is_empty()))
+                }));
         if all_need && emb.embed_rows_in_place(rows) {
             return;
         }
