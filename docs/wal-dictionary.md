@@ -6,7 +6,7 @@ Status: **reader supported; writer available behind an explicit switch, off by d
 
 `lin::persist::set_wal_dictionary_writer(true)` lets this process write codec 5; it returns the previous setting, and `wal_dictionary_writer()` reads it. With the switch on, a vector column that the encoder would write in the sparse layout (tag 7) is also encoded in the dictionary layout (tag 8) and replaced only when the dictionary bytes are strictly fewer; the frame is then written under codec 5. Dense columns, rows with more than 16 distinct values (where the raw escape costs one byte more than sparse) and columns below the sparse threshold keep their existing codec byte for byte. Both encoders (typed columns and rows) apply the same rule. Decoded sizes are identical in both layouts, so the 64 MiB decoded budget is accounted exactly as for the sparse column.
 
-The column is currently encoded twice when the switch is on (sparse, then dictionary); the fused selector from the CPU gate is not integrated. Turn the switch on only when every reader of the log — followers, backup tooling and the previous release kept for rollback — can read codec 5: an older reader rejects such frames as corrupt.
+The encoder builds the dictionary layout in a single pass (`append_dictionary_rows_counted`), falling back to existing codecs only when a row exceeds 16 distinct nonzero values or the dictionary layout is not smaller. Turn the switch on only when every reader of the log — followers, backup tooling and the previous release kept for rollback — can read codec 5: an older reader rejects such frames as corrupt.
 
 ## Framing and compatibility
 
@@ -41,4 +41,4 @@ The evidence bundle is [dictionary-wal-reader](../benches/results/2026-10-24-dic
 
 Writer coverage: `dictionary_writer_roundtrips_bits_and_is_smaller`, `dictionary_writer_keeps_existing_codecs_when_it_does_not_help`, `dictionary_writer_row_encoder_matches_column_encoder` (unit) and `tests/wal_dictionary.rs` (durable insert, crash recovery with the switch on and off, follower apply, mixed-codec log, checkpoint and reopen, smaller log than the default codecs on the default embedder's vectors).
 
-Still required before writing by default: the fused selector/encoder (one pass instead of two), process-crash/acknowledged-write behaviour under fault injection, two independent six-pair end-to-end native/durable series with SQLite control and resource/dense/high-cardinality guards. Encoder CPU measurements alone do not establish database speed. The durable 1k gap and the full named-peer benchmark objective remain open.
+Remaining qualification gates before enabling codec 5 by default are tracked in [roadmap.md](roadmap.md) (`P4.3`).
