@@ -1267,8 +1267,7 @@ impl Db {
         }
         if let Some(cat) = cat_backup {
             self.catalog = *cat;
-            self.plan_cache.clear();
-            self.query_cache.clear();
+            self.clear_plan_cache();
         }
     }
 

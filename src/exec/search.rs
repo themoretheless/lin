@@ -757,8 +757,7 @@ impl Db {
         if self.store.hnsw.contains_key(collection) {
             self.store.build_hnsw(collection, 16, 64);
         }
-        self.plan_cache.clear();
-        self.query_cache.clear();
+        self.clear_plan_cache();
         Ok(n)
     }
 

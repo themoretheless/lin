@@ -14,7 +14,7 @@ use rustls::ServerConfig as RustlsServerConfig;
 
 use crate::ast::Stmt;
 use crate::batch::{RecordBatch, read_slice, read_u8, read_u32_le, read_u64_le};
-use crate::crc::hardware_crc32c;
+use crate::crc::Hasher as CrcHasher;
 use crate::error::Error;
 use crate::exec::{Db, ReadDb, eval_partial_summarize_query_on_reader};
 use crate::ship::{
@@ -343,15 +343,34 @@ fn write_frame(stream: &mut NetStream, op: u8, payload: &[u8]) -> Result<(), Err
     }
     let len_u32 = u32::try_from(payload.len())
         .map_err(|_| Error::runtime("frame payload length exceeds u32"))?;
-    let mut frame = Vec::with_capacity(10 + payload.len() + 8);
-    frame.extend_from_slice(WIRE_MAGIC);
-    frame.push(op);
-    frame.extend_from_slice(&len_u32.to_le_bytes());
-    frame.extend_from_slice(payload);
-    let crc = hardware_crc32c(&frame);
-    frame.extend_from_slice(WIRE_CRC_TAG);
-    frame.extend_from_slice(&crc.to_le_bytes());
-    stream.write_all(&frame).map_err(io_err)?;
+    let mut hdr = [0u8; 10];
+    hdr[..5].copy_from_slice(WIRE_MAGIC);
+    hdr[5] = op;
+    hdr[6..10].copy_from_slice(&len_u32.to_le_bytes());
+
+    let mut hasher = CrcHasher::new();
+    hasher.update(&hdr);
+    hasher.update(payload);
+    let crc = hasher.finalize();
+
+    let mut tail = [0u8; 8];
+    tail[..4].copy_from_slice(WIRE_CRC_TAG);
+    tail[4..8].copy_from_slice(&crc.to_le_bytes());
+
+    const STACK_MAX_PAYLOAD: usize = 4096;
+    if payload.len() <= STACK_MAX_PAYLOAD {
+        let mut buf = [0u8; 10 + STACK_MAX_PAYLOAD + 8];
+        buf[..10].copy_from_slice(&hdr);
+        buf[10..10 + payload.len()].copy_from_slice(payload);
+        buf[10 + payload.len()..18 + payload.len()].copy_from_slice(&tail);
+        stream
+            .write_all(&buf[..18 + payload.len()])
+            .map_err(io_err)?;
+    } else {
+        stream.write_all(&hdr).map_err(io_err)?;
+        stream.write_all(payload).map_err(io_err)?;
+        stream.write_all(&tail).map_err(io_err)?;
+    }
     stream.flush().map_err(io_err)
 }
 
@@ -437,10 +456,10 @@ fn read_frame_idle(
         return Err(Error::runtime("missing LCRC frame trailer"));
     }
     let expected_crc = u32::from_le_bytes(tail[4..8].try_into().unwrap());
-    let mut crc_buf = Vec::with_capacity(10 + payload.len());
-    crc_buf.extend_from_slice(&hdr);
-    crc_buf.extend_from_slice(&payload);
-    let actual_crc = hardware_crc32c(&crc_buf);
+    let mut hasher = CrcHasher::new();
+    hasher.update(&hdr);
+    hasher.update(&payload);
+    let actual_crc = hasher.finalize();
     if actual_crc != expected_crc {
         return Err(Error::runtime(format!(
             "LCRC mismatch: got {actual_crc:#x}, expected {expected_crc:#x}"
@@ -455,7 +474,10 @@ fn read_frame_idle(
 // =========================================================================
 
 enum WriteOp {
-    Linql(String),
+    Linql {
+        src: String,
+        stmts: Vec<Stmt>,
+    },
     InsertBatch {
         collection: String,
         batch: RecordBatch,
@@ -479,6 +501,7 @@ struct ServerState {
     db: Mutex<Option<Db>>,
     cached_reader: RwLock<Option<Arc<ReadDb>>>,
     cold_unhydrated: AtomicBool,
+    current_gen: AtomicU64,
     gen_state: Mutex<u64>,
     gen_cv: Condvar,
     shutdown: AtomicBool,
@@ -495,14 +518,16 @@ impl ServerState {
             *guard = Some(reader);
         }
         self.cold_unhydrated.store(cold, Ordering::Release);
+        self.current_gen.store(cur_gen, Ordering::Release);
         if let Ok(mut g) = self.gen_state.lock() {
             *g = cur_gen;
             self.gen_cv.notify_all();
         }
     }
 
+    #[inline]
     fn current_gen(&self) -> u64 {
-        self.gen_state.lock().map(|g| *g).unwrap_or(0)
+        self.current_gen.load(Ordering::Acquire)
     }
 
     fn ensure_consistency(&self, consistency: Consistency, deadline: Instant) -> Result<(), (u8, String)> {
@@ -520,7 +545,7 @@ impl ServerState {
                 return Ok(());
             }
         };
-        if min_gen == 0 {
+        if min_gen == 0 || self.current_gen() >= min_gen {
             return Ok(());
         }
         let Ok(mut cur) = self.gen_state.lock() else {
@@ -633,6 +658,7 @@ impl LinServer {
             db: Mutex::new(Some(db)),
             cached_reader: RwLock::new(Some(initial_reader)),
             cold_unhydrated: AtomicBool::new(cold_unhydrated),
+            current_gen: AtomicU64::new(initial_gen),
             gen_state: Mutex::new(initial_gen),
             gen_cv: Condvar::new(),
             shutdown: AtomicBool::new(false),
@@ -684,6 +710,10 @@ impl ServerHandle {
 
     /// Wait until the server reaches at least `target_gen` or `timeout` expires.
     pub fn wait_gen(&self, target_gen: u64, timeout: Duration) -> Result<u64, Error> {
+        let fast = self.state.current_gen();
+        if fast >= target_gen {
+            return Ok(fast);
+        }
         let deadline = Instant::now() + timeout;
         let mut cur = self
             .state
@@ -922,11 +952,13 @@ fn run_group_commit_writer(state: Arc<ServerState>, rx: mpsc::Receiver<WriteReq>
             Ok(mut guard) => match guard.as_mut() {
                 Some(db) => {
                     let sres = db.with_group_sync(group_size, |db| {
-                        for req in &batch {
-                            let res = match &req.op {
-                                WriteOp::Linql(src) => db.run(src).map(|h| (h.done.r#gen, h.done.n)),
+                        for req in &mut batch {
+                            let res = match std::mem::replace(&mut req.op, WriteOp::Shutdown) {
+                                WriteOp::Linql { src, stmts } => db
+                                    .run_preparsed_ext(&src, stmts, false)
+                                    .map(|h| (h.done.r#gen, h.done.n)),
                                 WriteOp::InsertBatch { collection, batch } => {
-                                    db.insert_batch(collection, batch).map(|d| (d.r#gen, d.n))
+                                    db.insert_batch(&collection, &batch).map(|d| (d.r#gen, d.n))
                                 }
                                 WriteOp::Shutdown => Ok((db.r#gen(), 0)),
                             };
@@ -1130,6 +1162,54 @@ fn dispatch_rpc(
     }
 }
 
+fn finish_read_execute(
+    t0: Instant,
+    read_gen: u64,
+    batch: RecordBatch,
+    wg: &WorkloadGroup,
+) -> Result<Vec<u8>, (u8, String)> {
+    if let Some(qto) = wg.query_timeout
+        && t0.elapsed() > qto
+    {
+        return Err((
+            ERR_WORKLOAD_LIMIT,
+            format!(
+                "query elapsed {:?} exceeds workload group {:?} timeout {:?}",
+                t0.elapsed(),
+                wg.name,
+                qto
+            ),
+        ));
+    }
+    if let Some(max_rows) = wg.max_scan_rows
+        && batch.n() > max_rows
+    {
+        return Err((
+            ERR_WORKLOAD_LIMIT,
+            format!(
+                "result rows {} exceeds workload group {:?} max_scan_rows {}",
+                batch.n(),
+                wg.name,
+                max_rows
+            ),
+        ));
+    }
+    let batch_wire = batch.to_wire_bytes();
+    if batch_wire.len() > wg.max_result_bytes || batch.byte_size() > wg.max_result_bytes {
+        return Err((
+            ERR_WORKLOAD_LIMIT,
+            format!(
+                "result bytes {} exceeds workload group {:?} max_result_bytes {}",
+                batch_wire.len().max(batch.byte_size()),
+                wg.name,
+                wg.max_result_bytes
+            ),
+        ));
+    }
+    let elapsed_us = u64::try_from(t0.elapsed().as_micros()).unwrap_or(u64::MAX);
+    encode_execute_ok(read_gen, 0, elapsed_us, 1, Some(&batch_wire), None)
+}
+
 fn handle_execute(
     mut cur: &[u8],
     state: &Arc<ServerState>,
@@ -1141,18 +1221,46 @@ fn handle_execute(
     let linql = read_str(&mut cur).map_err(|e| (ERR_RUNTIME, e.to_string()))?;
 
     let wg = state.resolve_workload_group(wg_name.as_deref(), conn_wg)?;
+    let mut wait_budget = state.config.consistency_wait_timeout;
+    if let Some(qto) = wg.query_timeout {
+        wait_budget = wait_budget.min(qto);
+    }
+    if timeout_ms > 0 {
+        wait_budget = wait_budget.min(Duration::from_millis(timeout_ms));
+    }
+    let t0 = Instant::now();
+
+    // Zero-parse fast path: if all cold tables are hydrated and the query is already compiled
+    // as a pure read-only query in ReadDb's shared plan cache, skip parsing `linql` completely.
+    if !state.cold_unhydrated.load(Ordering::Acquire)
+        && let Ok(guard) = state.cached_reader.read()
+        && let Some(reader) = guard.as_ref().cloned()
+        && let Some(prep) = reader.get_cached_prepared(&linql)
+        && !prep.writes
+        && !prep.stmts.is_empty()
+        && prep.stmts.iter().all(|s| matches!(s, Stmt::Query(_)))
+    {
+        let gen_before = reader.r#gen();
+        state.ensure_consistency(consistency, t0 + wait_budget)?;
+        let reader =
+            if state.current_gen() != gen_before || state.cold_unhydrated.load(Ordering::Acquire) {
+                state
+                    .get_reader_for_stmts(&prep.stmts)
+                    .map_err(|e| (ERR_RUNTIME, e.to_string()))?
+            } else {
+                reader
+            };
+        let read_gen = reader.r#gen();
+        let batch = reader
+            .run_prepared_batch_lossless(&prep)
+            .map_err(|e| (ERR_RUNTIME, e.to_string()))?;
+        return finish_read_execute(t0, read_gen, batch, &wg);
+    }
+
     let stmts = crate::parse::parse_program(&linql).map_err(|e| (ERR_RUNTIME, e.to_string()))?;
     let is_read_only = !stmts.is_empty() && stmts.iter().all(|s| matches!(s, Stmt::Query(_)));
 
-    let t0 = Instant::now();
     if is_read_only {
-        let mut wait_budget = state.config.consistency_wait_timeout;
-        if let Some(qto) = wg.query_timeout {
-            wait_budget = wait_budget.min(qto);
-        }
-        if timeout_ms > 0 {
-            wait_budget = wait_budget.min(Duration::from_millis(timeout_ms));
-        }
         state.ensure_consistency(consistency, t0 + wait_budget)?;
 
         let reader = state
@@ -1160,48 +1268,9 @@ fn handle_execute(
             .map_err(|e| (ERR_RUNTIME, e.to_string()))?;
         let read_gen = reader.r#gen();
         let batch = reader
-            .run_batch_lossless(&linql)
+            .run_batch_lossless_with_stmts(&linql, stmts)
             .map_err(|e| (ERR_RUNTIME, e.to_string()))?;
-        if let Some(qto) = wg.query_timeout
-            && t0.elapsed() > qto
-        {
-            return Err((
-                ERR_WORKLOAD_LIMIT,
-                format!(
-                    "query elapsed {:?} exceeds workload group {:?} timeout {:?}",
-                    t0.elapsed(),
-                    wg.name,
-                    qto
-                ),
-            ));
-        }
-        if let Some(max_rows) = wg.max_scan_rows
-            && batch.n() > max_rows
-        {
-            return Err((
-                ERR_WORKLOAD_LIMIT,
-                format!(
-                    "result rows {} exceeds workload group {:?} max_scan_rows {}",
-                    batch.n(),
-                    wg.name,
-                    max_rows
-                ),
-            ));
-        }
-        let batch_wire = batch.to_wire_bytes();
-        if batch_wire.len() > wg.max_result_bytes || batch.byte_size() > wg.max_result_bytes {
-            return Err((
-                ERR_WORKLOAD_LIMIT,
-                format!(
-                    "result bytes {} exceeds workload group {:?} max_result_bytes {}",
-                    batch_wire.len().max(batch.byte_size()),
-                    wg.name,
-                    wg.max_result_bytes
-                ),
-            ));
-        }
-        let elapsed_us = u64::try_from(t0.elapsed().as_micros()).unwrap_or(u64::MAX);
-        encode_execute_ok(read_gen, 0, elapsed_us, 1, Some(&batch_wire), None)
+        finish_read_execute(t0, read_gen, batch, &wg)
     } else {
         if state.config.role == NodeRole::Follower {
             return Err((
@@ -1216,7 +1285,7 @@ fn handle_execute(
         let approx_bytes = linql.len().max(1);
         let (resp_tx, resp_rx) = mpsc::channel();
         tx.send(WriteReq {
-            op: WriteOp::Linql(linql),
+            op: WriteOp::Linql { src: linql, stmts },
             approx_bytes,
             resp: resp_tx,
         })
@@ -1309,15 +1378,18 @@ fn handle_partial_summarize(
     state.ensure_consistency(consistency, t0 + wait_budget)?;
 
     let stmt = crate::parse::parse(&linql).map_err(|e| (ERR_RUNTIME, e.to_string()))?;
-    let Stmt::Query(q) = stmt else {
+    if !matches!(stmt, Stmt::Query(_)) {
         return Err((
             ERR_RUNTIME,
             "partial_summarize requires a query statement".to_string(),
         ));
-    };
+    }
     let reader = state
-        .get_reader_for_stmts(&[Stmt::Query(q.clone())])
+        .get_reader_for_stmts(std::slice::from_ref(&stmt))
         .map_err(|e| (ERR_RUNTIME, e.to_string()))?;
+    let Stmt::Query(q) = stmt else {
+        unreachable!()
+    };
     let read_gen = reader.r#gen();
     let lagg_bytes = eval_partial_summarize_query_on_reader(&reader, &q)
         .map_err(|e| (ERR_RUNTIME, e.to_string()))?;
@@ -1510,7 +1582,12 @@ impl ServerClient {
         }
     }
 
-    fn rpc_call(&self, op: u8, payload: &[u8], retry_stale: bool) -> Result<Vec<u8>, Error> {
+    fn rpc_call(
+        &self,
+        op: u8,
+        payload: &[u8],
+        retry_stale: impl FnOnce() -> bool,
+    ) -> Result<Vec<u8>, Error> {
         let had_pooled = self.pool.lock().map(|g| !g.is_empty()).unwrap_or(false);
         let mut stream = self.take_stream()?;
         match self.send_and_recv(&mut stream, op, payload) {
@@ -1518,7 +1595,7 @@ impl ServerClient {
                 self.return_stream(stream);
                 Ok(resp)
             }
-            Err(first_err) if retry_stale && had_pooled => {
+            Err(first_err) if had_pooled && retry_stale() => {
                 drop(stream);
                 let (mut fresh, cur_gen) = self.open_authenticated()?;
                 self.session_gen.fetch_max(cur_gen, Ordering::AcqRel);
@@ -1560,7 +1637,7 @@ impl ServerClient {
     }
 
     pub fn ping(&self) -> Result<(NodeRole, u64), Error> {
-        let resp = self.rpc_call(OP_PING, &[], true)?;
+        let resp = self.rpc_call(OP_PING, &[], || true)?;
         let mut cur = resp.as_slice();
         if read_u8(&mut cur)? != 0 {
             let code = read_u8(&mut cur)?;
@@ -1586,15 +1663,16 @@ impl ServerClient {
         consistency: Consistency,
     ) -> Result<ExecutionReceipt, Error> {
         let eff = self.effective_consistency(consistency);
-        let is_read = crate::parse::parse_program(linql)
-            .is_ok_and(|stmts| !stmts.is_empty() && stmts.iter().all(|s| matches!(s, Stmt::Query(_))));
         let mut req = Vec::with_capacity(32 + linql.len());
         encode_consistency(&mut req, eff);
         push_opt_str(&mut req, self.opts.workload_group.as_deref())?;
         let to_ms = u64::try_from(self.opts.timeout.as_millis()).unwrap_or(u64::MAX);
         req.extend_from_slice(&to_ms.to_le_bytes());
         push_str(&mut req, linql)?;
-        let resp = self.rpc_call(OP_EXECUTE, &req, is_read)?;
+        let resp = self.rpc_call(OP_EXECUTE, &req, || {
+            crate::parse::parse_program(linql)
+                .is_ok_and(|stmts| !stmts.is_empty() && stmts.iter().all(|s| matches!(s, Stmt::Query(_))))
+        })?;
         let receipt = decode_execute_resp(&resp)?;
         self.advance_session_gen(receipt.r#gen);
         Ok(receipt)
@@ -1628,7 +1706,7 @@ impl ServerClient {
         let mut req = Vec::with_capacity(16 + collection.len() + wire.len());
         push_str(&mut req, collection)?;
         push_u32_bytes(&mut req, &wire)?;
-        let resp = self.rpc_call(OP_INSERT_BATCH, &req, false)?;
+        let resp = self.rpc_call(OP_INSERT_BATCH, &req, || false)?;
         let receipt = decode_execute_resp(&resp)?;
         self.advance_session_gen(receipt.r#gen);
         Ok(receipt)
@@ -1644,7 +1722,7 @@ impl ServerClient {
         encode_consistency(&mut req, eff);
         push_opt_str(&mut req, self.opts.workload_group.as_deref())?;
         push_str(&mut req, linql)?;
-        let resp = self.rpc_call(OP_PARTIAL_SUMMARIZE, &req, true)?;
+        let resp = self.rpc_call(OP_PARTIAL_SUMMARIZE, &req, || true)?;
         let mut cur = resp.as_slice();
         if read_u8(&mut cur)? != 0 {
             let code = read_u8(&mut cur)?;
@@ -1665,7 +1743,7 @@ impl ServerClient {
         let mut req = Vec::with_capacity(9);
         req.extend_from_slice(&since_gen.to_le_bytes());
         req.push(u8::from(force_bootstrap));
-        let resp = self.rpc_call(OP_PULL_SYNC, &req, true)?;
+        let resp = self.rpc_call(OP_PULL_SYNC, &req, || true)?;
         let mut cur = resp.as_slice();
         if read_u8(&mut cur)? != 0 {
             let code = read_u8(&mut cur)?;

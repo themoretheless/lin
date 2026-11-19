@@ -11,8 +11,10 @@ use crate::exec::{Db, OpenOpts, SyncMode};
 
 use super::client::send_rpc;
 use super::cluster::{ConsistentHashRing, NodeMember, NodeRole, PubSubEvent, RaftCommand};
-use super::protocol::{CacheRequest, CacheResponse, CacheValue, read_frame, write_frame};
-use super::store::EngineState;
+use super::protocol::{
+    CacheEntry, CacheRequest, CacheResponse, CacheValue, read_frame, write_frame,
+};
+use super::store::{EngineState, ReadLookup};
 use super::{CacheConfig, cache_err, unix_ms};
 
 /// A running or embeddable distributed cache node backed by `lin::Db`.
@@ -96,6 +98,31 @@ impl CacheNode {
         self.execute_inner(req, true)
     }
 
+    #[inline]
+    fn with_live_entry<R>(
+        &self,
+        key: &str,
+        on_missing: impl FnOnce(&EngineState) -> R,
+        on_hit: impl FnOnce(&EngineState, &CacheEntry) -> R,
+    ) -> R {
+        {
+            let st = self.state.read().unwrap();
+            match st.read_live(key) {
+                ReadLookup::Hit(entry) => return on_hit(&st, entry),
+                ReadLookup::Miss => return on_missing(&st),
+                ReadLookup::Expired => {}
+            }
+        }
+        let mut st = self.state.write().unwrap();
+        if st.touch_or_remove_expired(key)
+            && let Some(stored) = st.entries.get(key)
+        {
+            on_hit(&st, &stored.entry)
+        } else {
+            on_missing(&st)
+        }
+    }
+
     fn execute_inner(&self, req: CacheRequest, allow_routing: bool) -> CacheResponse {
         // Unwrap InternalShardExec so routed requests execute locally without re-routing
         let (req, allow_routing) = match req {
@@ -136,23 +163,22 @@ impl CacheNode {
             CacheRequest::Ping(msg) => {
                 CacheResponse::Pong(msg.unwrap_or_else(|| self.cfg.node_id.clone()))
             }
-            CacheRequest::Get { key } => {
-                let mut st = self.state.write().unwrap();
-                if st.touch_or_remove_expired(&key)
-                    && let Some(entry) = st.entries.get(&key)
-                {
+            CacheRequest::Get { key } => self.with_live_entry(
+                &key,
+                |st| {
+                    st.misses.fetch_add(1, Ordering::Relaxed);
+                    CacheResponse::Nil
+                },
+                |st, entry| {
                     let val = match &entry.value {
                         CacheValue::String(b) => CacheResponse::Bulk(b.clone()),
                         CacheValue::Int(n) => CacheResponse::Bulk(n.to_string().into_bytes()),
                         other => CacheResponse::Text(other.as_str_lossy()),
                     };
-                    st.hits += 1;
+                    st.hits.fetch_add(1, Ordering::Relaxed);
                     val
-                } else {
-                    st.misses += 1;
-                    CacheResponse::Nil
-                }
-            }
+                },
+            ),
             CacheRequest::Set { key, value, ttl_ms } => {
                 let expires_at_ms = ttl_ms.map(|t| unix_ms() + t);
                 let val = CacheValue::String(value);
@@ -176,11 +202,11 @@ impl CacheNode {
                 self.propose_and_apply_mutation(RaftCommand::Del { keys });
                 CacheResponse::Int(removed_count)
             }
-            CacheRequest::Exists { key } => {
-                let mut st = self.state.write().unwrap();
-                let exists = st.touch_or_remove_expired(&key);
-                CacheResponse::Int(i64::from(exists))
-            }
+            CacheRequest::Exists { key } => self.with_live_entry(
+                &key,
+                |_| CacheResponse::Int(0),
+                |_, _| CacheResponse::Int(1),
+            ),
             CacheRequest::IncrBy { key, delta } => {
                 let (new_val, expires_at_ms) = {
                     let mut st = self.state.write().unwrap();
@@ -264,20 +290,14 @@ impl CacheNode {
                     CacheResponse::Int(0)
                 }
             }
-            CacheRequest::Ttl { key } => {
-                let mut st = self.state.write().unwrap();
-                if !st.touch_or_remove_expired(&key) {
-                    return CacheResponse::Int(-2);
-                }
-                match st.entries.get(&key).and_then(|e| e.expires_at_ms) {
-                    Some(exp) => {
-                        let now = unix_ms();
-                        let rem = exp.saturating_sub(now) as i64;
-                        CacheResponse::Int(rem)
-                    }
+            CacheRequest::Ttl { key } => self.with_live_entry(
+                &key,
+                |_| CacheResponse::Int(-2),
+                |_, entry| match entry.expires_at_ms {
+                    Some(exp) => CacheResponse::Int(exp.saturating_sub(unix_ms()) as i64),
                     None => CacheResponse::Int(-1),
-                }
-            }
+                },
+            ),
             CacheRequest::Keys { prefix } => {
                 let mut st = self.state.write().unwrap();
                 st.evict_expired_and_lru(self.cfg.max_entries, self.cfg.max_bytes);
@@ -331,27 +351,26 @@ impl CacheNode {
                 });
                 CacheResponse::Int(i64::from(is_new))
             }
-            CacheRequest::HGet { key, field } => {
-                let mut st = self.state.write().unwrap();
-                if !st.touch_or_remove_expired(&key) {
-                    st.misses += 1;
-                    return CacheResponse::Nil;
-                }
-                match st.entries.get(&key).map(|e| &e.value) {
-                    Some(CacheValue::Hash(m)) => match m.get(&field).cloned() {
+            CacheRequest::HGet { key, field } => self.with_live_entry(
+                &key,
+                |st| {
+                    st.misses.fetch_add(1, Ordering::Relaxed);
+                    CacheResponse::Nil
+                },
+                |st, entry| match &entry.value {
+                    CacheValue::Hash(m) => match m.get(&field).cloned() {
                         Some(v) => {
-                            st.hits += 1;
+                            st.hits.fetch_add(1, Ordering::Relaxed);
                             CacheResponse::Bulk(v)
                         }
                         None => {
-                            st.misses += 1;
+                            st.misses.fetch_add(1, Ordering::Relaxed);
                             CacheResponse::Nil
                         }
                     },
-                    Some(_) => CacheResponse::Error("WRONGTYPE Key is not a hash".into()),
-                    None => CacheResponse::Nil,
-                }
-            }
+                    _ => CacheResponse::Error("WRONGTYPE Key is not a hash".into()),
+                },
+            ),
             CacheRequest::HDel { key, fields } => {
                 let res = {
                     let mut st = self.state.write().unwrap();
@@ -391,34 +410,29 @@ impl CacheNode {
                     None => CacheResponse::Error("WRONGTYPE Key is not a hash".into()),
                 }
             }
-            CacheRequest::HGetAll { key } => {
-                let mut st = self.state.write().unwrap();
-                if !st.touch_or_remove_expired(&key) {
-                    return CacheResponse::Map(BTreeMap::new());
-                }
-                match st.entries.get(&key).map(|e| &e.value) {
-                    Some(CacheValue::Hash(m)) => {
+            CacheRequest::HGetAll { key } => self.with_live_entry(
+                &key,
+                |_| CacheResponse::Map(BTreeMap::new()),
+                |st, entry| match &entry.value {
+                    CacheValue::Hash(m) => {
                         let m = m.clone();
-                        st.hits += 1;
+                        st.hits.fetch_add(1, Ordering::Relaxed);
                         CacheResponse::Map(m)
                     }
-                    Some(_) => CacheResponse::Error("WRONGTYPE Key is not a hash".into()),
-                    None => CacheResponse::Map(BTreeMap::new()),
-                }
-            }
+                    _ => CacheResponse::Error("WRONGTYPE Key is not a hash".into()),
+                },
+            ),
 
             // --- Lists ---
             CacheRequest::LPush { key, values } => self.exec_list_push(key, values, true),
             CacheRequest::RPush { key, values } => self.exec_list_push(key, values, false),
             CacheRequest::LPop { key } => self.exec_list_pop(key, true),
             CacheRequest::RPop { key } => self.exec_list_pop(key, false),
-            CacheRequest::LRange { key, start, stop } => {
-                let mut st = self.state.write().unwrap();
-                if !st.touch_or_remove_expired(&key) {
-                    return CacheResponse::Array(Vec::new());
-                }
-                match st.entries.get(&key).map(|e| &e.value) {
-                    Some(CacheValue::List(list)) => {
+            CacheRequest::LRange { key, start, stop } => self.with_live_entry(
+                &key,
+                |_| CacheResponse::Array(Vec::new()),
+                |st, entry| match &entry.value {
+                    CacheValue::List(list) => {
                         let len = list.len() as isize;
                         if len == 0 {
                             return CacheResponse::Array(Vec::new());
@@ -442,13 +456,12 @@ impl CacheNode {
                             .take((e - s + 1) as usize)
                             .map(|v| CacheResponse::Bulk(v.clone()))
                             .collect();
-                        st.hits += 1;
+                        st.hits.fetch_add(1, Ordering::Relaxed);
                         CacheResponse::Array(slice)
                     }
-                    Some(_) => CacheResponse::Error("WRONGTYPE Key is not a list".into()),
-                    None => CacheResponse::Array(Vec::new()),
-                }
-            }
+                    _ => CacheResponse::Error("WRONGTYPE Key is not a list".into()),
+                },
+            ),
 
             // --- Sets ---
             CacheRequest::SAdd { key, members } => {
@@ -529,35 +542,29 @@ impl CacheNode {
                     None => CacheResponse::Error("WRONGTYPE Key is not a set".into()),
                 }
             }
-            CacheRequest::SMembers { key } => {
-                let mut st = self.state.write().unwrap();
-                if !st.touch_or_remove_expired(&key) {
-                    return CacheResponse::Array(Vec::new());
-                }
-                match st.entries.get(&key).map(|e| &e.value) {
-                    Some(CacheValue::Set(s)) => {
+            CacheRequest::SMembers { key } => self.with_live_entry(
+                &key,
+                |_| CacheResponse::Array(Vec::new()),
+                |st, entry| match &entry.value {
+                    CacheValue::Set(s) => {
                         let out = s
                             .iter()
                             .map(|m| CacheResponse::Bulk(m.as_bytes().to_vec()))
                             .collect();
-                        st.hits += 1;
+                        st.hits.fetch_add(1, Ordering::Relaxed);
                         CacheResponse::Array(out)
                     }
-                    Some(_) => CacheResponse::Error("WRONGTYPE Key is not a set".into()),
-                    None => CacheResponse::Array(Vec::new()),
-                }
-            }
-            CacheRequest::SIsMember { key, member } => {
-                let mut st = self.state.write().unwrap();
-                if !st.touch_or_remove_expired(&key) {
-                    return CacheResponse::Int(0);
-                }
-                match st.entries.get(&key).map(|e| &e.value) {
-                    Some(CacheValue::Set(s)) => CacheResponse::Int(i64::from(s.contains(&member))),
-                    Some(_) => CacheResponse::Error("WRONGTYPE Key is not a set".into()),
-                    None => CacheResponse::Int(0),
-                }
-            }
+                    _ => CacheResponse::Error("WRONGTYPE Key is not a set".into()),
+                },
+            ),
+            CacheRequest::SIsMember { key, member } => self.with_live_entry(
+                &key,
+                |_| CacheResponse::Int(0),
+                |_, entry| match &entry.value {
+                    CacheValue::Set(s) => CacheResponse::Int(i64::from(s.contains(&member))),
+                    _ => CacheResponse::Error("WRONGTYPE Key is not a set".into()),
+                },
+            ),
 
             // --- Pub/Sub ---
             CacheRequest::Publish { channel, message } => {
@@ -621,6 +628,26 @@ impl CacheNode {
                         || trimmed.starts_with("rel ")
                         || trimmed.starts_with("index ")
                 };
+                if !is_write {
+                    let fast_out = {
+                        let st = self.state.read().unwrap();
+                        if !st.db.store.has_deferred_doc_ops() {
+                            match st.db.run_readonly(&query) {
+                                Ok(h) => Some(Ok(h.compact())),
+                                Err(e) if e.to_string().contains("writes not allowed") => None,
+                                Err(e) => Some(Err(e)),
+                            }
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(res) = fast_out {
+                        return match res {
+                            Ok(out) => CacheResponse::Text(out),
+                            Err(e) => CacheResponse::Error(e.to_string()),
+                        };
+                    }
+                }
                 let res = {
                     let mut st = self.state.write().unwrap();
                     let out = st.db.run(&query).map(|h| h.compact());
@@ -676,8 +703,8 @@ impl CacheNode {
                     self.cfg.replication_factor,
                     st.entries.len(),
                     st.used_bytes,
-                    st.hits,
-                    st.misses,
+                    st.hits.load(Ordering::Relaxed),
+                    st.misses.load(Ordering::Relaxed),
                     st.evictions,
                     st.expired_cleaned,
                     db_stats.r#gen,

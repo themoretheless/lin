@@ -54,6 +54,7 @@ enum QueuedWork {
     Src { src: String, want_rows: bool },
     Prepared { prepared: Prepared, want_rows: bool },
     Stmt(Stmt),
+    Group(Vec<String>),
 }
 
 /// What one queued write produced, held until the group's sync.
@@ -217,6 +218,9 @@ impl AsyncDb {
                                     want_rows: *want_rows,
                                 },
                                 QueuedWork::Stmt(stmt) => crate::exec::GroupWrite::Stmt(stmt),
+                                QueuedWork::Group(sources) => {
+                                    crate::exec::GroupWrite::Group(sources)
+                                }
                             });
                             GroupOutcome::Statement(reply, res)
                         }
@@ -288,27 +292,19 @@ impl AsyncDb {
     }
 
     pub async fn execute_prepared(&self, prepared: Prepared) -> Result<Done, Error> {
-        if prepared.writes {
-            return Ok(self
-                .group_commit(QueuedWork::Prepared {
-                    prepared,
-                    want_rows: false,
-                })
-                .await?
-                .done);
+        if !prepared.writes {
+            let read = self.snapshot().await;
+            return spawn_blocking(move || read.run_prepared(&prepared).map(|h| h.done))
+                .await
+                .map_err(|e| Error::runtime(format!("async join: {e}")))?;
         }
-        let db = Arc::clone(&self.inner);
-        let write_epoch = Arc::clone(&self.write_epoch);
-        spawn_blocking(move || {
-            let mut g = db.blocking_lock();
-            let res = g.execute_prepared(&prepared);
-            if prepared.writes {
-                write_epoch.fetch_add(1, Ordering::Release);
-            }
-            res
-        })
-        .await
-        .map_err(|e| Error::runtime(format!("async join: {e}")))?
+        Ok(self
+            .group_commit(QueuedWork::Prepared {
+                prepared,
+                want_rows: false,
+            })
+            .await?
+            .done)
     }
 
     pub async fn run_with(
@@ -356,17 +352,7 @@ impl AsyncDb {
     }
 
     pub async fn run_group(&self, sources: Vec<String>) -> Result<Handle, Error> {
-        let db = Arc::clone(&self.inner);
-        let write_epoch = Arc::clone(&self.write_epoch);
-        spawn_blocking(move || {
-            let mut g = db.blocking_lock();
-            let refs: Vec<&str> = sources.iter().map(String::as_str).collect();
-            let res = g.run_group(&refs);
-            write_epoch.fetch_add(1, Ordering::Release);
-            res
-        })
-        .await
-        .map_err(|e| Error::runtime(format!("async join: {e}")))?
+        self.group_commit(QueuedWork::Group(sources)).await
     }
 
     /// Execute a synchronous transaction closure on Tokio's blocking thread pool,

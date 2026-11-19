@@ -211,10 +211,18 @@ pub struct Db {
     pub(crate) embedder: Option<Arc<dyn Embedder>>,
     /// Cached read-only snapshot keyed by `(gen, docs_epoch, collections_epoch, collections_len, edges_len, facts_len)`.
     pub(crate) reader_cache: Option<((u64, u64, u64, usize, usize, usize), ReadDb)>,
+    /// Shared read-only plan cache preserved across `reader()` snapshots while catalog is unchanged.
+    #[allow(clippy::type_complexity)]
+    pub(crate) reader_plan_cache: Option<
+        (
+            (u64, usize, usize),
+            Arc<std::sync::RwLock<FxHashMap<String, Prepared>>>,
+        ),
+    >,
     /// Fields per collection declared with [`Db::declare_columns`].
     pub(crate) declared_cols: FxHashMap<String, Vec<String>>,
     /// Lazily built mirrors of the declared fields, keyed by collection.
-    pub(crate) col_mirrors: std::sync::Mutex<FxHashMap<String, Arc<mirror::ColMirror>>>,
+    pub(crate) col_mirrors: std::sync::RwLock<FxHashMap<String, Arc<mirror::ColMirror>>>,
     #[cfg(feature = "gpu")]
     pub(crate) gpu: Option<Arc<crate::gpu::GpuCompute>>,
     #[cfg(feature = "gpu")]
@@ -227,7 +235,7 @@ pub struct Db {
 #[derive(Clone)]
 pub struct ReadDb {
     inner: Arc<Db>,
-    plan_cache: Arc<std::sync::Mutex<FxHashMap<String, Prepared>>>,
+    plan_cache: Arc<std::sync::RwLock<FxHashMap<String, Prepared>>>,
 }
 
 /// Row / edge / log byte / query resource caps. Defaults suit embeddable single-node.
@@ -337,6 +345,7 @@ pub(crate) enum GroupWrite<'a> {
     Src { src: &'a str, want_rows: bool },
     Prepared { prepared: &'a Prepared, want_rows: bool },
     Stmt(&'a Stmt),
+    Group(&'a [String]),
 }
 
 const PLAN_CACHE_MAX: usize = 512;
@@ -372,6 +381,7 @@ impl Db {
             follower: false,
             embedder: Some(embedder),
             reader_cache: None,
+            reader_plan_cache: None,
             declared_cols: Default::default(),
             col_mirrors: Default::default(),
             #[cfg(feature = "gpu")]
@@ -468,8 +478,7 @@ impl Db {
             p.catalog_hash = self.catalog.hash_str().to_string();
         }
         self.embedder = Some(embedder);
-        self.plan_cache.clear();
-        self.query_cache.clear();
+        self.clear_plan_cache();
         self.reader_cache = None;
         self
     }
@@ -481,8 +490,7 @@ impl Db {
         {
             self.gpu_cache = Default::default();
         }
-        self.plan_cache.clear();
-        self.query_cache.clear();
+        self.clear_plan_cache();
         self.reader_cache = None;
         self
     }
@@ -534,6 +542,7 @@ impl Db {
                 follower: false,
                 embedder: Some(embedder),
                 reader_cache: None,
+                reader_plan_cache: None,
                 declared_cols: Default::default(),
                 col_mirrors: Default::default(),
                 #[cfg(feature = "gpu")]
@@ -567,6 +576,7 @@ impl Db {
             follower: false,
             embedder: Some(embedder),
             reader_cache: None,
+            reader_plan_cache: None,
             declared_cols: Default::default(),
             col_mirrors: Default::default(),
             #[cfg(feature = "gpu")]
@@ -638,6 +648,7 @@ impl Db {
             follower: false,
             embedder: Some(embedder),
             reader_cache: None,
+            reader_plan_cache: None,
             declared_cols: Default::default(),
             col_mirrors: Default::default(),
             #[cfg(feature = "gpu")]
@@ -648,7 +659,7 @@ impl Db {
         inner.reopen.total_ms = t0.elapsed().as_secs_f64() * 1000.0;
         Ok(ReadDb {
             inner: Arc::new(inner),
-            plan_cache: Arc::new(std::sync::Mutex::new(FxHashMap::default())),
+            plan_cache: Arc::new(std::sync::RwLock::new(FxHashMap::default())),
         })
     }
 
@@ -714,9 +725,22 @@ impl Db {
         }
         let mirrors = self
             .col_mirrors
-            .lock()
+            .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+        let cat_sig = (
+            self.catalog.hash_u64(),
+            self.catalog.fks.len(),
+            self.catalog.guards.len(),
+        );
+        let shared_plans = match &self.reader_plan_cache {
+            Some((sig, arc)) if *sig == cat_sig => Arc::clone(arc),
+            _ => {
+                let arc = Arc::new(std::sync::RwLock::new(FxHashMap::default()));
+                self.reader_plan_cache = Some((cat_sig, Arc::clone(&arc)));
+                arc
+            }
+        };
         let rdb = ReadDb {
             inner: Arc::new(Self {
                 catalog: self.catalog.clone(),
@@ -737,14 +761,15 @@ impl Db {
                 follower: false,
                 embedder: self.embedder.clone(),
                 reader_cache: None,
+                reader_plan_cache: None,
                 declared_cols: self.declared_cols.clone(),
-                col_mirrors: std::sync::Mutex::new(mirrors),
+                col_mirrors: std::sync::RwLock::new(mirrors),
                 #[cfg(feature = "gpu")]
                 gpu: self.gpu.clone(),
                 #[cfg(feature = "gpu")]
                 gpu_cache: Default::default(),
             }),
-            plan_cache: Arc::new(std::sync::Mutex::new(FxHashMap::default())),
+            plan_cache: shared_plans,
         };
         self.reader_cache = Some((cache_key, rdb.clone()));
         rdb
@@ -845,8 +870,7 @@ impl Db {
             self.store.maybe_checkpoint(p)?;
         }
         if saw_schema {
-            self.plan_cache.clear();
-            self.query_cache.clear();
+            self.clear_plan_cache();
         }
         self.reader_cache = None;
         Ok(n)
@@ -975,6 +999,7 @@ impl Db {
         self.plan_cache.clear();
         self.query_cache.clear();
         self.seen_dml_hashes = [0; 16];
+        self.reader_plan_cache = None;
     }
 
     #[inline]
@@ -1169,6 +1194,7 @@ impl Db {
                 self.run_prepared_ext(prepared, *want_rows)
             }
             GroupWrite::Stmt(stmt) => self.run_stmt((*stmt).clone()),
+            GroupWrite::Group(sources) => self.run_group(*sources),
         }
     }
 
@@ -3330,9 +3356,7 @@ impl Db {
             self.store.commit_disk_overlay_savepoint();
         }
         if schema {
-            self.plan_cache.clear();
-            self.query_cache.clear();
-            self.seen_dml_hashes = [0; 16];
+            self.clear_plan_cache();
         }
         if !rows.is_empty() {
             self.check_output_quota(&rows)?;
@@ -3349,40 +3373,40 @@ impl Db {
         })
     }
 
-    /// Columnar read path: FK join+project or filter+project → [`RecordBatch`].
+    /// Shared DRY columnar OLAP dispatcher: filter/join/window/sort + project → [`RecordBatch`].
+    pub(crate) fn try_columnar_query_batch(&self, q: &Query) -> Option<RecordBatch> {
+        let q = crate::catalog::with_catalog_filter(q, &self.catalog);
+        let now = now_ms();
+        let bindings = Default::default();
+        if !self.uses_gpu_filter(&q) && !self.uses_gpu_join(&q) {
+            if let Some(batch) = self.try_filter_project_batch(&q, &bindings, now) {
+                return Some(batch);
+            }
+            if let Some(batch) = self.try_join_project_batch(&q, &bindings, now) {
+                return Some(batch);
+            }
+            if let Some(batch) = self.try_window_project_batch(&q, &bindings, now) {
+                return Some(batch);
+            }
+        }
+        if !self.uses_gpu_filter(&q)
+            && let Some(batch) = self.try_sort_project_batch(&q, &bindings, now)
+        {
+            return Some(batch);
+        }
+        None
+    }
+
+    /// Columnar read path: FK join+project, filter+project, window+project, or sort+project → [`RecordBatch`].
     pub fn run_prepared_batch(&mut self, prepared: &Prepared) -> Result<RecordBatch, Error> {
         if prepared.writes {
             return Err(Error::runtime("run_batch is read-only"));
         }
         if prepared.stmts.len() == 1
             && let Stmt::Query(q) = &prepared.stmts[0]
+            && let Some(batch) = self.try_columnar_query_batch(q)
         {
-            let q = crate::catalog::with_catalog_filter(q, &self.catalog);
-            let now = now_ms();
-            let bindings = Default::default();
-            if !self.uses_gpu_filter(&q)
-                && !self.uses_gpu_join(&q)
-                && let Some(batch) = self.try_filter_project_batch(&q, &bindings, now)
-            {
-                return Ok(batch);
-            }
-            if !self.uses_gpu_filter(&q)
-                && !self.uses_gpu_join(&q)
-                && let Some(batch) = self.try_join_project_batch(&q, &bindings, now)
-            {
-                return Ok(batch);
-            }
-            if !self.uses_gpu_filter(&q)
-                && !self.uses_gpu_join(&q)
-                && let Some(batch) = self.try_window_project_batch(&q, &bindings, now)
-            {
-                return Ok(batch);
-            }
-            if !self.uses_gpu_filter(&q)
-                && let Some(batch) = self.try_sort_project_batch(&q, &bindings, now)
-            {
-                return Ok(batch);
-            }
+            return Ok(batch);
         }
         let h = self.run_prepared(prepared)?;
         Ok(match &prepared.stmts[..] {
@@ -3406,13 +3430,15 @@ impl Db {
         if prepared.writes {
             return Err(Error::runtime("read-only snapshot: writes not allowed"));
         }
+        if let Some(h) = self.try_fast_docs_id_title_get(prepared) {
+            return Ok(h);
+        }
         if let Some(pg) = &prepared.point_get {
             let row = self.execute_point_get(pg);
-            let rows = match row {
-                Some(r) => vec![r],
-                None => Vec::new(),
+            let (rows, n) = match row {
+                Some(r) => (crate::store::wrap_single_row_vec(r), 1),
+                None => (Vec::new(), 0),
             };
-            let n = rows.len();
             return Ok(Handle {
                 plan: prepared.plan.clone(),
                 rows,
@@ -3562,6 +3588,27 @@ impl Db {
             self.quotas.max_query_bytes,
             self.quotas.max_ast_depth,
         )?;
+        self.run_preparsed_ext(src, stmts, want_rows)
+    }
+
+    /// Execute `src` when `stmts` was already parsed on a caller thread (e.g., `LinServer`),
+    /// consulting `plan_cache` first and avoiding redundant row/plan materialization when `!want_rows`.
+    pub(crate) fn run_preparsed_ext(
+        &mut self,
+        src: &str,
+        stmts: Vec<Stmt>,
+        want_rows: bool,
+    ) -> Result<Handle, Error> {
+        if let Some(prep) = self.plan_cache.get(src).cloned() {
+            return self.run_prepared_ext(&prep, want_rows);
+        }
+        if src.len() > self.quotas.max_query_bytes {
+            return Err(Error::new(format!(
+                "query length {} exceeds max_query_bytes quota {}",
+                src.len(),
+                self.quotas.max_query_bytes
+            )));
+        }
         let ast_bytes = crate::ast::estimate_ast_bytes(&stmts);
         if ast_bytes > self.quotas.max_ast_bytes {
             return Err(Error::new(format!(
@@ -3903,7 +3950,7 @@ impl Db {
         }
         self.reader_cache = None;
         self.col_mirrors
-            .lock()
+            .write()
             .unwrap_or_else(|e| e.into_inner())
             .remove(collection);
         if fields.is_empty() {
@@ -3927,7 +3974,17 @@ impl Db {
         }
         let rows = self.store.collections.get(name)?;
         let epoch = self.store.collections.epoch();
-        let mut cache = self.col_mirrors.lock().unwrap_or_else(|e| e.into_inner());
+        if let Ok(cache) = self.col_mirrors.read()
+            && let Some(m) = cache.get(name)
+            && m.epoch == epoch
+            && m.len == rows.len()
+        {
+            return Some(Arc::clone(m));
+        }
+        let mut cache = self
+            .col_mirrors
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         match cache.get(name) {
             Some(m) if m.epoch == epoch && m.len == rows.len() => Some(Arc::clone(m)),
             _ => {
@@ -4832,14 +4889,46 @@ impl ReadDb {
         self.inner.store.r#gen
     }
 
+    #[inline]
+    pub(crate) fn get_cached_prepared(&self, src: &str) -> Option<Prepared> {
+        self.plan_cache
+            .read()
+            .ok()
+            .and_then(|guard| guard.get(src).cloned())
+    }
+
+    pub(crate) fn prepare_with_stmts(
+        &self,
+        src: &str,
+        stmts: Vec<Stmt>,
+    ) -> Result<Prepared, Error> {
+        if let Some(p) = self.get_cached_prepared(src) {
+            return Ok(p);
+        }
+        if src.len() > self.inner.quotas.max_query_bytes {
+            return Err(Error::new(format!(
+                "query length {} exceeds max_query_bytes quota {}",
+                src.len(),
+                self.inner.quotas.max_query_bytes
+            )));
+        }
+        let mut prepared = self.inner.prepare_stmts(stmts)?;
+        prepared.src = src.to_string();
+        if let Ok(mut guard) = self.plan_cache.write() {
+            if guard.len() >= 1024 {
+                guard.clear();
+            }
+            guard.insert(src.to_string(), prepared.clone());
+        }
+        Ok(prepared)
+    }
+
     pub fn prepare(&self, src: &str) -> Result<Prepared, Error> {
-        if let Ok(guard) = self.plan_cache.lock()
-            && let Some(p) = guard.get(src)
-        {
-            return Ok(p.clone());
+        if let Some(p) = self.get_cached_prepared(src) {
+            return Ok(p);
         }
         let prepared = self.inner.prepare_uncached(src)?;
-        if let Ok(mut guard) = self.plan_cache.lock() {
+        if let Ok(mut guard) = self.plan_cache.write() {
             if guard.len() >= 1024 {
                 guard.clear();
             }
@@ -4885,22 +4974,9 @@ impl ReadDb {
         }
         if prepared.stmts.len() == 1
             && let Stmt::Query(q) = &prepared.stmts[0]
+            && let Some(batch) = self.inner.try_columnar_query_batch(q)
         {
-            let q = crate::catalog::with_catalog_filter(q, &self.inner.catalog);
-            let now = now_ms();
-            let bindings = Default::default();
-            if !self.inner.uses_gpu_filter(&q)
-                && !self.inner.uses_gpu_join(&q)
-                && let Some(batch) = self.inner.try_filter_project_batch(&q, &bindings, now)
-            {
-                return Ok(batch);
-            }
-            if !self.inner.uses_gpu_filter(&q)
-                && !self.inner.uses_gpu_join(&q)
-                && let Some(batch) = self.inner.try_join_project_batch(&q, &bindings, now)
-            {
-                return Ok(batch);
-            }
+            return Ok(batch);
         }
         let h = self.run_prepared(prepared)?;
         Ok(match &prepared.stmts[..] {

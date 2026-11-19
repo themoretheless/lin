@@ -37,62 +37,118 @@ impl Drop for SpillPathsGuard {
     }
 }
 
-fn spill_partition_aggregate<'a, I, P, S, Extract, Fold>(
+fn spill_partition_aggregate<'a, I, P, S, Extract, Init, Fold>(
     tag: &str,
     rows: I,
     mut extract: Extract,
-    init_state: impl Fn() -> S,
-    mut fold: Fold,
+    init_state: Init,
+    fold: Fold,
 ) -> Result<Vec<(Cell, S)>, Error>
 where
     I: IntoIterator<Item = &'a Row>,
-    P: Spillable,
+    P: Spillable + Send,
+    S: Send,
     Extract: FnMut(&'a Row) -> (Cell, P),
-    Fold: FnMut(&mut S, P),
+    Init: Fn() -> S + Sync,
+    Fold: Fn(&mut S, P) + Sync,
 {
-    let num_partitions = 16usize;
-    let temp_dir = std::env::temp_dir();
-    let run_id = SPILL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let mut partition_paths = Vec::with_capacity(num_partitions);
-    let mut partition_files = Vec::with_capacity(num_partitions);
+    use std::io::{BufRead, Write};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    for p in 0..num_partitions {
+    const NUM_PARTITIONS: usize = 16;
+    const SPILL_IO_BUF: usize = 64 * 1024;
+
+    let temp_dir = std::env::temp_dir();
+    let run_id = SPILL_SEQ.fetch_add(1, Ordering::Relaxed);
+    let mut partition_paths = Vec::with_capacity(NUM_PARTITIONS);
+    let mut partition_files = Vec::with_capacity(NUM_PARTITIONS);
+
+    for p in 0..NUM_PARTITIONS {
         let path = temp_dir.join(format!("lin_spill_{tag}_{run_id}_{p}.bin"));
         let file = std::fs::File::create(&path).map_err(|e| Error::runtime(e.to_string()))?;
         partition_paths.push(path);
-        partition_files.push(std::io::BufWriter::new(file));
+        partition_files.push(std::io::BufWriter::with_capacity(SPILL_IO_BUF, file));
     }
     let guard = SpillPathsGuard(partition_paths);
 
     for r in rows {
         let (cell, payload) = extract(r);
-        let part_idx = (cell_hash(&cell) as usize) % num_partitions;
+        let part_idx = (cell_hash(&cell) as usize) % NUM_PARTITIONS;
         (cell, payload).serialize(&mut partition_files[part_idx])?;
     }
 
     for mut writer in partition_files {
-        use std::io::{BufRead, Write};
         writer.flush().map_err(|e| Error::runtime(e.to_string()))?;
     }
 
-    let mut final_map: FxHashMap<Cell, S> = FxHashMap::default();
-    for path in &guard.0 {
-        if let Ok(file) = std::fs::File::open(path) {
-        use std::io::{BufRead, Write};
-            let mut reader = std::io::BufReader::new(file);
-            loop {
-                let buf = reader.fill_buf().map_err(|e| Error::runtime(e.to_string()))?;
-                if buf.is_empty() {
-                    break;
-                }
-                let (cell, payload) = <(Cell, P)>::deserialize(&mut reader)?;
-                let entry = final_map.entry(cell).or_insert_with(&init_state);
-                fold(entry, payload);
+    let fold_one = |path: &std::path::Path| -> Result<Vec<(Cell, S)>, Error> {
+        let Ok(file) = std::fs::File::open(path) else {
+            return Ok(Vec::new());
+        };
+        let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+        if len == 0 {
+            let _ = std::fs::remove_file(path);
+            return Ok(Vec::new());
+        }
+        let mut part_map: FxHashMap<Cell, S> = FxHashMap::default();
+        let mut reader = std::io::BufReader::with_capacity(SPILL_IO_BUF, file);
+        loop {
+            let buf = reader.fill_buf().map_err(|e| Error::runtime(e.to_string()))?;
+            if buf.is_empty() {
+                break;
             }
+            let (cell, payload) = <(Cell, P)>::deserialize(&mut reader)?;
+            let entry = part_map.entry(cell).or_insert_with(&init_state);
+            fold(entry, payload);
+        }
+        drop(reader);
+        let _ = std::fs::remove_file(path);
+        Ok(part_map.into_iter().collect())
+    };
+
+    let workers = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(1)
+        .min(4);
+
+    let mut entries: Vec<(Cell, S)> = Vec::new();
+    if workers <= 1 {
+        for path in &guard.0 {
+            entries.extend(fold_one(path)?);
+        }
+    } else {
+        let next_part = AtomicUsize::new(0);
+        let paths = guard.0.as_slice();
+        let worker_results: Vec<Result<Vec<(Cell, S)>, Error>> = std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(workers);
+            for _ in 0..workers {
+                let next_ref = &next_part;
+                let fold_ref = &fold_one;
+                handles.push(scope.spawn(move || -> Result<Vec<(Cell, S)>, Error> {
+                    let mut local_out = Vec::new();
+                    loop {
+                        let idx = next_ref.fetch_add(1, Ordering::Relaxed);
+                        if idx >= paths.len() {
+                            break;
+                        }
+                        local_out.extend(fold_ref(&paths[idx])?);
+                    }
+                    Ok(local_out)
+                }));
+            }
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.join()
+                        .unwrap_or_else(|_| Err(Error::runtime("spill partition worker panicked")))
+                })
+                .collect()
+        });
+        for res in worker_results {
+            entries.extend(res?);
         }
     }
 
-    let mut entries: Vec<(Cell, S)> = final_map.into_iter().collect();
     entries.sort_unstable_by(|(a, _), (b, _)| cmp_sort(a, b));
     Ok(entries)
 }
@@ -4413,34 +4469,32 @@ pub(crate) fn rows_to_batch_for_query(rows: &[Row], q: &Query) -> crate::batch::
 }
 
 impl super::ReadDb {
-    pub(crate) fn run_batch_lossless(&self, linql: &str) -> Result<crate::batch::RecordBatch, Error> {
-        let prepared = self.prepare(linql)?;
+    pub(crate) fn run_prepared_batch_lossless(
+        &self,
+        prepared: &super::Prepared,
+    ) -> Result<crate::batch::RecordBatch, Error> {
         if prepared.writes {
             return Err(Error::runtime("run_batch is read-only"));
         }
         if prepared.stmts.len() == 1
             && let crate::ast::Stmt::Query(q) = &prepared.stmts[0]
+            && let Some(batch) = self.inner.try_columnar_query_batch(q)
         {
-            let q_cat = crate::catalog::with_catalog_filter(q, &self.inner.catalog);
-            let now = super::now_ms();
-            let bindings = Default::default();
-            if !self.inner.uses_gpu_filter(&q_cat)
-                && !self.inner.uses_gpu_join(&q_cat)
-                && let Some(batch) = self.inner.try_filter_project_batch(&q_cat, &bindings, now)
-            {
-                return Ok(batch);
-            }
-            if !self.inner.uses_gpu_filter(&q_cat)
-                && !self.inner.uses_gpu_join(&q_cat)
-                && let Some(batch) = self.inner.try_join_project_batch(&q_cat, &bindings, now)
-            {
-                return Ok(batch);
-            }
+            return Ok(batch);
         }
-        let h = self.run_prepared(&prepared)?;
+        let h = self.run_prepared(prepared)?;
         Ok(match &prepared.stmts[..] {
             [crate::ast::Stmt::Query(q)] => rows_to_batch_for_query(&h.rows, q),
             _ => rows_to_union_batch(&h.rows),
         })
+    }
+
+    pub(crate) fn run_batch_lossless_with_stmts(
+        &self,
+        linql: &str,
+        stmts: Vec<crate::ast::Stmt>,
+    ) -> Result<crate::batch::RecordBatch, Error> {
+        let prepared = self.prepare_with_stmts(linql, stmts)?;
+        self.run_prepared_batch_lossless(&prepared)
     }
 }

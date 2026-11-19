@@ -669,8 +669,7 @@ impl Db {
                     ));
                 }
                 self.store.mem_restore(pin);
-                self.plan_cache.clear();
-                self.query_cache.clear();
+                self.clear_plan_cache();
                 Ok((
                     Vec::new(),
                     Some(format!(
@@ -1696,8 +1695,7 @@ impl Db {
                         .collect(),
                 };
                 self.store.apply_pack(&pack);
-                self.plan_cache.clear();
-                self.query_cache.clear();
+                self.clear_plan_cache();
                 Ok((
                     Vec::new(),
                     Some(format!("col {name}")),
@@ -1713,8 +1711,7 @@ impl Db {
                     reverse_of: None,
                 };
                 self.store.apply_pack(&pack);
-                self.plan_cache.clear();
-                self.query_cache.clear();
+                self.clear_plan_cache();
                 Ok((
                     Vec::new(),
                     Some(format!("rel {name}")),
@@ -1730,8 +1727,7 @@ impl Db {
                     reverse_of: Some(of.clone()),
                 };
                 self.store.apply_pack(&pack);
-                self.plan_cache.clear();
-                self.query_cache.clear();
+                self.clear_plan_cache();
                 Ok((
                     Vec::new(),
                     Some(format!("rel {name} = reverse {of}")),
@@ -1756,8 +1752,7 @@ impl Db {
                     pred_src: pred.as_ref().map(crate::plan::fmt_pred),
                 };
                 self.store.apply_pack(&pack);
-                self.plan_cache.clear();
-                self.query_cache.clear();
+                self.clear_plan_cache();
                 Ok((
                     Vec::new(),
                     Some(format!("index {}", pack_index_label(collection, fields))),
@@ -1766,13 +1761,16 @@ impl Db {
                     0,
                 ))
             }
-            Decl::Fk { .. } | Decl::Guard { .. } => Ok((
-                Vec::new(),
-                Some("schema: session only".into()),
-                None,
-                false,
-                0,
-            )),
+            Decl::Fk { .. } | Decl::Guard { .. } => {
+                self.clear_plan_cache();
+                Ok((
+                    Vec::new(),
+                    Some("schema: session only".into()),
+                    None,
+                    false,
+                    0,
+                ))
+            }
             Decl::Filter {
                 collection,
                 pred: _,
@@ -1787,8 +1785,7 @@ impl Db {
                     },
                 };
                 self.store.apply_pack(&pack);
-                self.plan_cache.clear();
-                self.query_cache.clear();
+                self.clear_plan_cache();
                 let msg = if src.is_empty() {
                     format!("unfilter {collection}")
                 } else {
@@ -1819,8 +1816,7 @@ impl Db {
                         .collect(),
                 };
                 self.store.apply_pack(&pack);
-                self.plan_cache.clear();
-                self.query_cache.clear();
+                self.clear_plan_cache();
                 Ok((
                     Vec::new(),
                     Some(format!("owned {name}")),

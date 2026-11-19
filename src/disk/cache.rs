@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
@@ -270,8 +271,8 @@ struct HotVecQueryCache {
     generation: u64,
     entries: FxHashMap<u64, Arc<[(f32, Row)]>>,
     order: VecDeque<u64>,
-    hits: u64,
-    misses: u64,
+    hits: AtomicU64,
+    misses: AtomicU64,
 }
 
 #[derive(Default)]
@@ -279,16 +280,16 @@ struct HotSecQueryShard {
     generation: u64,
     entries: FxHashMap<u64, Arc<[Row]>>,
     order: VecDeque<u64>,
-    hits: u64,
-    misses: u64,
+    hits: AtomicU64,
+    misses: AtomicU64,
 }
 
 /// Bounded, generation-coherent L1 in-memory Hot Cache sitting in front of cold `mmap` segments.
 pub struct HotTierCache {
     cfg: HotCacheConfig,
     row_shards: [Mutex<HotRowShard>; HOT_ROW_SHARDS],
-    sec_shards: [Mutex<HotSecQueryShard>; HOT_ROW_SHARDS],
-    vec_queries: Mutex<HotVecQueryCache>,
+    sec_shards: [RwLock<HotSecQueryShard>; HOT_ROW_SHARDS],
+    vec_queries: RwLock<HotVecQueryCache>,
 }
 
 impl HotTierCache {
@@ -296,8 +297,8 @@ impl HotTierCache {
         Self {
             cfg,
             row_shards: std::array::from_fn(|_| Mutex::new(HotRowShard::default())),
-            sec_shards: std::array::from_fn(|_| Mutex::new(HotSecQueryShard::default())),
-            vec_queries: Mutex::new(HotVecQueryCache::default()),
+            sec_shards: std::array::from_fn(|_| RwLock::new(HotSecQueryShard::default())),
+            vec_queries: RwLock::new(HotVecQueryCache::default()),
         }
     }
 
@@ -363,12 +364,12 @@ impl HotTierCache {
             }
         }
         for s in &self.sec_shards {
-            if let Ok(mut guard) = s.lock() {
+            if let Ok(mut guard) = s.write() {
                 guard.entries.clear();
                 guard.order.clear();
             }
         }
-        if let Ok(mut vq) = self.vec_queries.lock() {
+        if let Ok(mut vq) = self.vec_queries.write() {
             vq.entries.clear();
             vq.order.clear();
         }
@@ -380,21 +381,35 @@ impl HotTierCache {
             return None;
         }
         let sidx = (qhash as usize) & (HOT_ROW_SHARDS - 1);
-        let Ok(mut sq) = self.sec_shards[sidx].lock() else {
+        {
+            let Ok(sq) = self.sec_shards[sidx].read() else {
+                return None;
+            };
+            if sq.generation == generation {
+                return if let Some(hit) = sq.entries.get(&qhash).cloned() {
+                    sq.hits.fetch_add(1, Ordering::Relaxed);
+                    Some(hit)
+                } else {
+                    sq.misses.fetch_add(1, Ordering::Relaxed);
+                    None
+                };
+            }
+        }
+        let Ok(mut sq) = self.sec_shards[sidx].write() else {
             return None;
         };
         if sq.generation != generation {
             sq.generation = generation;
             sq.entries.clear();
             sq.order.clear();
-            sq.misses += 1;
+            sq.misses.fetch_add(1, Ordering::Relaxed);
             return None;
         }
         if let Some(hit) = sq.entries.get(&qhash).cloned() {
-            sq.hits += 1;
+            sq.hits.fetch_add(1, Ordering::Relaxed);
             Some(hit)
         } else {
-            sq.misses += 1;
+            sq.misses.fetch_add(1, Ordering::Relaxed);
             None
         }
     }
@@ -406,7 +421,7 @@ impl HotTierCache {
         }
         let max_per_shard = 512usize;
         let sidx = (qhash as usize) & (HOT_ROW_SHARDS - 1);
-        let Ok(mut sq) = self.sec_shards[sidx].lock() else {
+        let Ok(mut sq) = self.sec_shards[sidx].write() else {
             return;
         };
         if sq.generation != generation {
@@ -429,21 +444,35 @@ impl HotTierCache {
         if !self.cfg.enabled || self.cfg.max_vec_queries == 0 {
             return None;
         }
-        let Ok(mut vq) = self.vec_queries.lock() else {
+        {
+            let Ok(vq) = self.vec_queries.read() else {
+                return None;
+            };
+            if vq.generation == generation {
+                return if let Some(hit) = vq.entries.get(&qhash).cloned() {
+                    vq.hits.fetch_add(1, Ordering::Relaxed);
+                    Some(hit)
+                } else {
+                    vq.misses.fetch_add(1, Ordering::Relaxed);
+                    None
+                };
+            }
+        }
+        let Ok(mut vq) = self.vec_queries.write() else {
             return None;
         };
         if vq.generation != generation {
             vq.generation = generation;
             vq.entries.clear();
             vq.order.clear();
-            vq.misses += 1;
+            vq.misses.fetch_add(1, Ordering::Relaxed);
             return None;
         }
         if let Some(hit) = vq.entries.get(&qhash).cloned() {
-            vq.hits += 1;
+            vq.hits.fetch_add(1, Ordering::Relaxed);
             Some(hit)
         } else {
-            vq.misses += 1;
+            vq.misses.fetch_add(1, Ordering::Relaxed);
             None
         }
     }
@@ -452,7 +481,7 @@ impl HotTierCache {
         if !self.cfg.enabled || self.cfg.max_vec_queries == 0 {
             return;
         }
-        let Ok(mut vq) = self.vec_queries.lock() else {
+        let Ok(mut vq) = self.vec_queries.write() else {
             return;
         };
         if vq.generation != generation {
@@ -482,14 +511,14 @@ impl HotTierCache {
                 st.row_evictions += g.evictions;
             }
         }
-        if let Ok(vq) = self.vec_queries.lock() {
-            st.vec_query_hits = vq.hits;
-            st.vec_query_misses = vq.misses;
+        if let Ok(vq) = self.vec_queries.read() {
+            st.vec_query_hits = vq.hits.load(Ordering::Relaxed);
+            st.vec_query_misses = vq.misses.load(Ordering::Relaxed);
         }
         for s in &self.sec_shards {
-            if let Ok(sq) = s.lock() {
-                st.sec_query_hits += sq.hits;
-                st.sec_query_misses += sq.misses;
+            if let Ok(sq) = s.read() {
+                st.sec_query_hits += sq.hits.load(Ordering::Relaxed);
+                st.sec_query_misses += sq.misses.load(Ordering::Relaxed);
             }
         }
         st

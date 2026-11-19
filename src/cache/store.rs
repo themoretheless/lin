@@ -1,4 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -56,16 +58,58 @@ struct KvPrepared {
     del_k: Prepared,
 }
 
+pub(crate) struct StoredEntry {
+    pub(crate) entry: CacheEntry,
+    /// Latest access sequence updated lock-free under `RwLock::read()`.
+    pub(crate) live_seq: AtomicU64,
+    /// Sequence currently stored inside `lru_order`.
+    pub(crate) indexed_seq: u64,
+}
+
+impl StoredEntry {
+    #[inline]
+    pub(crate) fn new(entry: CacheEntry) -> Self {
+        let seq = entry.last_access_seq;
+        Self {
+            entry,
+            live_seq: AtomicU64::new(seq),
+            indexed_seq: seq,
+        }
+    }
+}
+
+impl Deref for StoredEntry {
+    type Target = CacheEntry;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.entry
+    }
+}
+
+impl DerefMut for StoredEntry {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.entry
+    }
+}
+
+pub(crate) enum ReadLookup<'a> {
+    Hit(&'a CacheEntry),
+    Miss,
+    Expired,
+}
+
 pub(crate) struct EngineState {
-    pub(crate) entries: FxHashMap<String, CacheEntry>,
-    /// `(last_access_seq, key)` ordered ascending for O(log N) LRU eviction.
+    pub(crate) entries: FxHashMap<String, StoredEntry>,
+    /// `(indexed_seq, key)` ordered ascending for O(log N) lazy-LRU eviction.
     lru_order: BTreeSet<(u64, String)>,
     /// `(expires_at_ms, key)` ordered ascending for O(log N) TTL expiration.
     ttl_index: BTreeSet<(u64, String)>,
-    pub(crate) access_seq: u64,
+    pub(crate) access_seq: AtomicU64,
     pub(crate) used_bytes: usize,
-    pub(crate) hits: u64,
-    pub(crate) misses: u64,
+    pub(crate) hits: AtomicU64,
+    pub(crate) misses: AtomicU64,
     pub(crate) evictions: u64,
     pub(crate) expired_cleaned: u64,
     /// Underlying `lin::Db` for durable persistence and pipe queries!
@@ -120,10 +164,10 @@ impl EngineState {
             entries: FxHashMap::default(),
             lru_order: BTreeSet::new(),
             ttl_index: BTreeSet::new(),
-            access_seq: 1,
+            access_seq: AtomicU64::new(1),
             used_bytes: 0,
-            hits: 0,
-            misses: 0,
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
             evictions: 0,
             expired_cleaned: 0,
             db,
@@ -138,6 +182,26 @@ impl EngineState {
         // Hydrate cache entries persisted in `lin::Db` (`cache_kv` collection)
         state.hydrate_from_lin_db();
         Ok(state)
+    }
+
+    #[inline]
+    fn next_seq(&self) -> u64 {
+        self.access_seq.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Lock-shared read lookup: stamps `live_seq` atomically without mutating `lru_order`
+    /// or cloning the key string, and skips `unix_ms()` when the entry has no TTL.
+    #[inline]
+    pub(crate) fn read_live(&self, key: &str) -> ReadLookup<'_> {
+        let Some(stored) = self.entries.get(key) else {
+            return ReadLookup::Miss;
+        };
+        if stored.expires_at_ms.is_some() && stored.is_expired(unix_ms()) {
+            return ReadLookup::Expired;
+        }
+        let seq = self.next_seq();
+        stored.live_seq.store(seq, Ordering::Relaxed);
+        ReadLookup::Hit(&stored.entry)
     }
 
     fn build_kv_prepared(db: &mut Db) -> Option<KvPrepared> {
@@ -191,7 +255,7 @@ impl EngineState {
             {
                 let key_owned = k.to_string();
                 if let Some(prev) = self.entries.remove(&key_owned) {
-                    self.lru_order.remove(&(prev.last_access_seq, key_owned.clone()));
+                    self.lru_order.remove(&(prev.indexed_seq, key_owned.clone()));
                     if let Some(prev_exp) = prev.expires_at_ms {
                         self.ttl_index.remove(&(prev_exp, key_owned.clone()));
                     }
@@ -200,20 +264,19 @@ impl EngineState {
                         .saturating_sub(key_owned.len() + prev.value.estimated_bytes());
                 }
                 let sz = key_owned.len() + value.estimated_bytes();
-                self.access_seq += 1;
-                let seq = self.access_seq;
+                let seq = self.next_seq();
                 self.lru_order.insert((seq, key_owned.clone()));
                 if let Some(exp) = exp_ms {
                     self.ttl_index.insert((exp, key_owned.clone()));
                 }
                 self.entries.insert(
                     key_owned,
-                    CacheEntry {
+                    StoredEntry::new(CacheEntry {
                         value,
                         expires_at_ms: exp_ms,
                         last_access_seq: seq,
                         version: ver,
-                    },
+                    }),
                 );
                 self.used_bytes += sz;
             }
@@ -299,7 +362,7 @@ impl EngineState {
             }
             let (_, k) = self.ttl_index.pop_first().unwrap();
             if let Some(removed) = self.entries.remove(&k) {
-                self.lru_order.remove(&(removed.last_access_seq, k.clone()));
+                self.lru_order.remove(&(removed.indexed_seq, k.clone()));
                 self.used_bytes = self
                     .used_bytes
                     .saturating_sub(k.len() + removed.value.estimated_bytes());
@@ -308,13 +371,22 @@ impl EngineState {
             }
         }
 
-        // 2. Pop LRU victims in O(log N) from `lru_order`
+        // 2. Pop LRU victims in O(log N) from `lru_order`, lazily re-indexing entries stamped on read
         while (self.entries.len() > max_entries || self.used_bytes > max_bytes)
             && !self.entries.is_empty()
         {
-            let Some((_, oldest_key)) = self.lru_order.pop_first() else {
+            let Some((popped_seq, oldest_key)) = self.lru_order.pop_first() else {
                 break;
             };
+            if let Some(stored) = self.entries.get_mut(&oldest_key) {
+                let live = stored.live_seq.load(Ordering::Relaxed);
+                if live > popped_seq {
+                    stored.indexed_seq = live;
+                    stored.entry.last_access_seq = live;
+                    self.lru_order.insert((live, oldest_key));
+                    continue;
+                }
+            }
             if let Some(removed) = self.entries.remove(&oldest_key) {
                 if let Some(exp) = removed.expires_at_ms {
                     self.ttl_index.remove(&(exp, oldest_key.clone()));
@@ -329,13 +401,13 @@ impl EngineState {
     }
 
     pub(crate) fn touch_or_remove_expired(&mut self, key: &str) -> bool {
-        let now = unix_ms();
         if let Some(e) = self.entries.get(key)
-            && e.is_expired(now)
+            && e.expires_at_ms.is_some()
+            && e.is_expired(unix_ms())
         {
             if let Some(removed) = self.entries.remove(key) {
                 let k_owned = key.to_string();
-                self.lru_order.remove(&(removed.last_access_seq, k_owned.clone()));
+                self.lru_order.remove(&(removed.indexed_seq, k_owned.clone()));
                 if let Some(exp) = removed.expires_at_ms {
                     self.ttl_index.remove(&(exp, k_owned));
                 }
@@ -347,13 +419,14 @@ impl EngineState {
             }
             return false;
         }
+        let new_seq = self.next_seq();
         if let Some(e) = self.entries.get_mut(key) {
-            let old_seq = e.last_access_seq;
-            self.access_seq += 1;
-            let new_seq = self.access_seq;
-            e.last_access_seq = new_seq;
+            let old_indexed = e.indexed_seq;
+            e.indexed_seq = new_seq;
+            e.entry.last_access_seq = new_seq;
+            e.live_seq.store(new_seq, Ordering::Relaxed);
             let k_owned = key.to_string();
-            self.lru_order.remove(&(old_seq, k_owned.clone()));
+            self.lru_order.remove(&(old_indexed, k_owned.clone()));
             self.lru_order.insert((new_seq, k_owned));
             true
         } else {
@@ -370,7 +443,7 @@ impl EngineState {
         max_bytes: usize,
     ) {
         if let Some(old) = self.entries.remove(&key) {
-            self.lru_order.remove(&(old.last_access_seq, key.clone()));
+            self.lru_order.remove(&(old.indexed_seq, key.clone()));
             if let Some(old_exp) = old.expires_at_ms {
                 self.ttl_index.remove(&(old_exp, key.clone()));
             }
@@ -378,8 +451,7 @@ impl EngineState {
                 .used_bytes
                 .saturating_sub(key.len() + old.value.estimated_bytes());
         }
-        self.access_seq += 1;
-        let seq = self.access_seq;
+        let seq = self.next_seq();
         let ver = self.raft.last_log_index() + 1;
         let entry = CacheEntry {
             value,
@@ -393,14 +465,14 @@ impl EngineState {
         if let Some(exp) = expires_at_ms {
             self.ttl_index.insert((exp, key.clone()));
         }
-        self.entries.insert(key, entry);
+        self.entries.insert(key, StoredEntry::new(entry));
         self.evict_expired_and_lru(max_entries, max_bytes);
     }
 
     pub(crate) fn remove_key(&mut self, key: &str) -> bool {
         if let Some(old) = self.entries.remove(key) {
             let k_owned = key.to_string();
-            self.lru_order.remove(&(old.last_access_seq, k_owned.clone()));
+            self.lru_order.remove(&(old.indexed_seq, k_owned.clone()));
             if let Some(old_exp) = old.expires_at_ms {
                 self.ttl_index.remove(&(old_exp, k_owned));
             }

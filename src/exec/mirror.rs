@@ -40,8 +40,8 @@ impl FieldMirror {
                     return None;
                 }
                 let next = dict.len() as u32;
-                let cloned = cell.clone();
-                dict.push(cloned.clone());
+                let cloned = cell.clone_for_borrow();
+                dict.push(cloned.clone_for_borrow());
                 index.insert(cloned, next);
                 next
             };
@@ -130,11 +130,22 @@ impl ColMirror {
                 let leaf = field.leaf()?;
                 let m = self.fields.get(leaf)?;
                 let table: Vec<bool> = m.dict.iter().map(|c| eval_leaf(pred, c, now)).collect();
-                let mut bits = vec![0u64; words];
-                for (i, &code) in m.codes.iter().enumerate() {
-                    if table[code as usize] {
-                        bits[i >> 6] |= 1u64 << (i & 63);
+                let mut bits = Vec::with_capacity(words);
+                let mut chunks = m.codes.chunks_exact(64);
+                for chunk in &mut chunks {
+                    let mut word = 0u64;
+                    for (b, &code) in chunk.iter().enumerate() {
+                        word |= u64::from(table[code as usize]) << b;
                     }
+                    bits.push(word);
+                }
+                let rem = chunks.remainder();
+                if !rem.is_empty() {
+                    let mut word = 0u64;
+                    for (b, &code) in rem.iter().enumerate() {
+                        word |= u64::from(table[code as usize]) << b;
+                    }
+                    bits.push(word);
                 }
                 Some(bits)
             }

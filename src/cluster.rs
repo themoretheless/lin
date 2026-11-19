@@ -116,6 +116,43 @@ pub fn shard_hash_cell(cell: &Cell) -> u64 {
     }
 }
 
+/// Zero-allocation canonical 64-bit hash for `col[row_idx]` without cloning `Cell` or `Arc<str>`.
+#[inline]
+fn shard_hash_col_row(col: &Column, row_idx: usize) -> u64 {
+    match col {
+        Column::Nulls { .. } => hash_bytes_tagged(6, &[]),
+        Column::Int { vals, valid } => {
+            if valid.is_valid(row_idx) {
+                hash_i64(vals[row_idx])
+            } else {
+                hash_bytes_tagged(6, &[])
+            }
+        }
+        Column::Time { vals, valid } => {
+            if valid.is_valid(row_idx) {
+                hash_u64_tagged(3, vals[row_idx] as u64)
+            } else {
+                hash_bytes_tagged(6, &[])
+            }
+        }
+        Column::Float { vals, valid } => {
+            if valid.is_valid(row_idx) {
+                hash_f64_canonical(vals[row_idx])
+            } else {
+                hash_bytes_tagged(6, &[])
+            }
+        }
+        Column::Bool { vals, valid } => {
+            if valid.is_valid(row_idx) {
+                hash_u64_tagged(4, u64::from(vals[row_idx]))
+            } else {
+                hash_bytes_tagged(6, &[])
+            }
+        }
+        Column::Cells(cells) => shard_hash_cell(&cells[row_idx]),
+    }
+}
+
 /// Deterministic canonical 64-bit hash for an AST [`Value`] literal (`None` for dynamic `now`/`$param`).
 pub fn shard_hash_value(val: &Value) -> Option<u64> {
     match val {
@@ -773,41 +810,68 @@ impl ShardRouter {
             None => batch.names.iter().position(|name| name == "id"),
         };
 
-        let mut per_shard: Vec<Vec<u32>> = vec![Vec::new(); self.shards.len()];
         let num_shards = self.shards.len();
-        for row_idx in 0..n {
-            let shard = match key_col_idx {
-                Some(cidx) => {
-                    let cell = batch.cols[cidx].get(row_idx);
-                    let h = shard_hash_cell(&cell);
-                    pick_shard(h, num_shards, self.config.strategy)
-                }
-                None => row_idx % num_shards,
-            };
-            per_shard[shard].push(row_idx as u32);
+        if num_shards == 1 {
+            let r = self.shards[0].insert_batch(collection, batch)?;
+            let elapsed_us = u64::try_from(t0.elapsed().as_micros()).unwrap_or(u64::MAX);
+            return Ok((
+                ExecutionReceipt {
+                    r#gen: r.r#gen,
+                    affected: r.affected,
+                    elapsed_us,
+                    group_size: r.group_size,
+                    batch: None,
+                    message: None,
+                },
+                ClusterStats {
+                    shards_queried: 1,
+                    total_shards: 1,
+                    max_gen: r.r#gen,
+                    elapsed_us,
+                },
+            ));
         }
 
-        let sub_batches: Vec<(usize, RecordBatch)> = per_shard
+        let est_cap = (n / num_shards).saturating_add(16);
+        let mut per_shard: Vec<Vec<u32>> = (0..num_shards)
+            .map(|_| Vec::with_capacity(est_cap))
+            .collect();
+        match key_col_idx {
+            Some(cidx) => {
+                let col = &batch.cols[cidx];
+                let strategy = self.config.strategy;
+                for row_idx in 0..n {
+                    let h = shard_hash_col_row(col, row_idx);
+                    let shard = pick_shard(h, num_shards, strategy);
+                    per_shard[shard].push(row_idx as u32);
+                }
+            }
+            None => {
+                for row_idx in 0..n {
+                    per_shard[row_idx % num_shards].push(row_idx as u32);
+                }
+            }
+        }
+
+        let non_empty: Vec<(usize, Vec<u32>)> = per_shard
             .into_iter()
             .enumerate()
             .filter(|(_, idx)| !idx.is_empty())
-            .map(|(shard, idx)| {
-                let cols: Vec<Column> = batch.cols.iter().map(|c| c.gather(&idx)).collect();
-                (
-                    shard,
-                    RecordBatch {
-                        names: Arc::clone(&batch.names),
-                        cols,
-                    },
-                )
-            })
             .collect();
+        let shards_queried = non_empty.len();
 
         let results: Vec<Result<ExecutionReceipt, Error>> = thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(sub_batches.len());
-            for (shard_idx, sub) in &sub_batches {
+            let mut handles = Vec::with_capacity(shards_queried);
+            for (shard_idx, idx) in &non_empty {
                 let client = &self.shards[*shard_idx];
-                handles.push(scope.spawn(move || client.insert_batch(collection, sub)));
+                handles.push(scope.spawn(move || {
+                    let cols: Vec<Column> = batch.cols.iter().map(|c| c.gather(idx)).collect();
+                    let sub = RecordBatch {
+                        names: Arc::clone(&batch.names),
+                        cols,
+                    };
+                    client.insert_batch(collection, &sub)
+                }));
             }
             handles
                 .into_iter()
@@ -838,7 +902,7 @@ impl ShardRouter {
                 message: None,
             },
             ClusterStats {
-                shards_queried: sub_batches.len(),
+                shards_queried,
                 total_shards: self.shards.len(),
                 max_gen,
                 elapsed_us,
