@@ -29,6 +29,26 @@ impl ExactSum {
         }
     }
 
+    /// Adds a numeric cell and reports whether it counted, for `avg`: integers stay exact
+    /// here exactly as they do for `sum`, instead of being rounded to `f64` one by one.
+    #[inline]
+    pub(crate) fn add_numeric(&mut self, cell: Option<&Cell>) -> bool {
+        match cell {
+            Some(Cell::Int(i)) => {
+                self.int += *i as i128;
+                true
+            }
+            Some(c) => match c.as_f64() {
+                Some(f) => {
+                    self.add_f64(f);
+                    true
+                }
+                None => false,
+            },
+            None => false,
+        }
+    }
+
     #[inline]
     pub(crate) fn add_i64(&mut self, v: i64) {
         self.int += v as i128;

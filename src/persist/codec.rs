@@ -443,7 +443,7 @@ pub(crate) fn acquire_encoder() -> Option<std::sync::Arc<EncoderWorker>> {
     if let Some(worker) = shared.as_ref() {
         return Some(std::sync::Arc::clone(worker));
     }
-    let (sender, receiver) = std::sync::mpsc::sync_channel::<EncodeJob>(1);
+    let (sender, receiver) = std::sync::mpsc::sync_channel::<EncodeJob>(0);
     let handle = std::thread::Builder::new()
         .name("lin-wal-encoder".into())
         .spawn(move || {

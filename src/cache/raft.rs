@@ -7,59 +7,43 @@ use super::server::CacheNode;
 use super::unix_ms;
 
 impl CacheNode {
+    /// Held from reading the current value until the resulting command is applied and
+    /// sent, so concurrent read-modify-write commands cannot overwrite each other and
+    /// peers receive entries in index order.
+    pub(crate) fn mutation_order(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.mutation_order
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     pub(crate) fn propose_and_apply_mutation(&self, cmd: RaftCommand) {
-        let (entry, prev_idx, prev_term, term, peers) = {
-            let mut st = self.state.write().unwrap();
-            let prev_idx = st.raft.last_log_index();
-            let prev_term = st.raft.last_log_term();
-            let term = st.raft.current_term;
-            let idx = prev_idx + 1;
-            let entry = RaftLogEntry {
-                index: idx,
-                term,
-                command: cmd.clone(),
-            };
-            st.raft.log.push(entry.clone());
-            st.apply_raft_command(&cmd, self.cfg.max_entries, self.cfg.max_bytes);
-            st.raft.commit_index = idx;
-            st.raft.last_applied = idx;
-            st.raft.maybe_compact();
+        let order = self.mutation_order();
+        self.propose(&order, cmd, true);
+    }
 
-            let peers: Vec<String> = if self.cfg.raft_replication {
-                st.members
-                    .values()
-                    .filter(|m| m.node_id != self.cfg.node_id && m.alive)
-                    .map(|m| m.addr.clone())
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            (entry, prev_idx, prev_term, term, peers)
-        };
-
-        if !peers.is_empty() {
-            let rpc = CacheRequest::RaftAppendEntries {
-                term,
-                leader_id: self.cfg.node_id.clone(),
-                leader_addr: self.cfg.listen_addr.clone(),
-                prev_log_index: prev_idx,
-                prev_log_term: prev_term,
-                entries: vec![entry],
-                leader_commit: prev_idx + 1,
-            };
-            for peer_addr in peers {
-                let _ = send_rpc(&peer_addr, &rpc);
-            }
-        }
+    pub(crate) fn propose_and_apply_held(
+        &self,
+        order: &std::sync::MutexGuard<'_, ()>,
+        cmd: RaftCommand,
+    ) {
+        self.propose(order, cmd, true);
     }
 
     pub(crate) fn propose_raft_only(&self, cmd: RaftCommand) {
+        let order = self.mutation_order();
+        self.propose(&order, cmd, false);
+    }
+
+    fn propose(&self, _order: &std::sync::MutexGuard<'_, ()>, cmd: RaftCommand, apply: bool) {
         let (entry, prev_idx, prev_term, term, peers) = {
             let mut st = self.state.write().unwrap();
             let prev_idx = st.raft.last_log_index();
             let prev_term = st.raft.last_log_term();
             let term = st.raft.current_term;
             let idx = prev_idx + 1;
+            if apply {
+                st.apply_raft_command(&cmd, self.cfg.max_entries, self.cfg.max_bytes);
+            }
             let entry = RaftLogEntry {
                 index: idx,
                 term,
@@ -69,6 +53,7 @@ impl CacheNode {
             st.raft.commit_index = idx;
             st.raft.last_applied = idx;
             st.raft.maybe_compact();
+
             let peers: Vec<String> = if self.cfg.raft_replication {
                 st.members
                     .values()
@@ -81,19 +66,30 @@ impl CacheNode {
             (entry, prev_idx, prev_term, term, peers)
         };
 
-        if !peers.is_empty() {
-            let rpc = CacheRequest::RaftAppendEntries {
-                term,
-                leader_id: self.cfg.node_id.clone(),
-                leader_addr: self.cfg.listen_addr.clone(),
-                prev_log_index: prev_idx,
-                prev_log_term: prev_term,
-                entries: vec![entry],
-                leader_commit: prev_idx + 1,
-            };
-            for peer_addr in peers {
-                let _ = send_rpc(&peer_addr, &rpc);
-            }
+        if peers.is_empty() {
+            return;
+        }
+        let rpc = CacheRequest::RaftAppendEntries {
+            term,
+            leader_id: self.cfg.node_id.clone(),
+            leader_addr: self.cfg.listen_addr.clone(),
+            prev_log_index: prev_idx,
+            prev_log_term: prev_term,
+            entries: vec![entry],
+            leader_commit: prev_idx + 1,
+        };
+        if let [only] = peers.as_slice() {
+            let _ = send_rpc(only, &rpc);
+        } else {
+            // One slow peer bounds the wait instead of adding to it.
+            let rpc = &rpc;
+            std::thread::scope(|s| {
+                for peer_addr in &peers {
+                    s.spawn(move || {
+                        let _ = send_rpc(peer_addr, rpc);
+                    });
+                }
+            });
         }
     }
 

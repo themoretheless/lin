@@ -97,7 +97,7 @@ impl DiskUniqueKey {
             || self
                 .pred
                 .as_ref()
-                .is_some_and(|p| !crate::exec::eval_pred(p, row, now))
+                .is_some_and(|p| !crate::eval::eval_pred(p, row, now))
         {
             return None;
         }
@@ -1310,17 +1310,8 @@ impl Store {
                     pred_src: pred_src.clone(),
                 };
                 let label = format!("{}[{}]", collection, fields.join(","));
+                let def = index_def_of(&snap);
                 self.extra_indexes.insert(label.clone(), snap);
-                let pred = pred_src
-                    .as_deref()
-                    .and_then(|src| crate::parse::parse_pred_src(src).ok());
-                let def = crate::catalog::IndexDef {
-                    collection: collection.clone(),
-                    unique: *unique,
-                    fields: fields.clone(),
-                    pred,
-                    bitmap_card_field: None,
-                };
                 let mut live = LiveIndex::new(def);
                 if !self.is_disk_backed(collection) {
                     for (i, row) in self.collection(collection).iter().enumerate() {
@@ -2601,6 +2592,32 @@ impl Store {
                     }
                 }
             }
+            // The id map and the position translation are settled here too: left stale,
+            // the next row appended at `last` would be translated to `p` and never found.
+            if let Some(doomed) = self.retired_rows.get(r_idx)
+                && let Some(by_id) = self.by_id.get_mut("docs")
+            {
+                if let Some(dead_id) = row_text(doomed, "id") {
+                    by_id.remove(dead_id);
+                }
+                if p != last
+                    && let Some(tail_id) = self
+                        .collections
+                        .get("docs")
+                        .and_then(|docs| docs.get(p))
+                        .and_then(|tail| tail.get("id"))
+                        .and_then(Cell::text_shared)
+                {
+                    by_id.insert(tail_id, p);
+                }
+            }
+            if let Some(at) = self
+                .docs_moved_idxs
+                .iter()
+                .position(|&(from, to)| from == last && to == p)
+            {
+                self.docs_moved_idxs.remove(at);
+            }
             if self.docs_id.len() == old_n && p < old_n {
                 self.retired_doc_ids.push(self.docs_id.swap_remove(p));
             }
@@ -3433,7 +3450,7 @@ impl Store {
             let by_id = if let Some(m) = self.by_id.get_mut(collection) {
                 m
             } else {
-                self.by_id.entry(collection.to_string()).or_default()
+                by_id_slot(&mut self.by_id, collection)
             };
             let first = &rows[0];
             let id_pos = first.keys().position(|k| k == "id");
@@ -3505,7 +3522,7 @@ impl Store {
             return;
         }
         if collection == "orders" && self.orders_id.len() == start {
-            let by_id = self.by_id.entry(collection.to_string()).or_default();
+            let by_id = by_id_slot(&mut self.by_id, collection);
             for (i, row) in rows.iter().enumerate() {
                 let idx = start + i;
                 let id = row
@@ -3530,7 +3547,7 @@ impl Store {
             return;
         }
         if collection == "users" && self.users_id.len() == start {
-            let by_id = self.by_id.entry(collection.to_string()).or_default();
+            let by_id = by_id_slot(&mut self.by_id, collection);
             for (i, row) in rows.iter().enumerate() {
                 let idx = start + i;
                 let id = row
@@ -3550,7 +3567,7 @@ impl Store {
             return;
         }
         if !matches!(collection, "docs" | "orders" | "users" | "facts") {
-            let by_id = self.by_id.entry(collection.to_string()).or_default();
+            let by_id = by_id_slot(&mut self.by_id, collection);
             for (i, row) in rows.iter().enumerate() {
                 if let Some(id) = row.get("id").and_then(Cell::text_shared) {
                     by_id.insert(id, start + i);
@@ -3740,7 +3757,7 @@ impl Store {
             let indexes = &mut self.indexes;
             let fts_opt = self.fts.get_mut(collection);
             let hnsw_opt = self.hnsw.get_mut(collection);
-            let by_id = self.by_id.entry(collection.to_string()).or_default();
+            let by_id = by_id_slot(&mut self.by_id, collection);
             let docs_by_uri = &mut self.docs_by_uri;
             let docs_id = &mut self.docs_id;
             let docs_title = &mut self.docs_title;
@@ -4192,17 +4209,7 @@ impl Store {
                         let label = label.clone();
                         s.spawn(move || {
                             let snap = store_ref.extra_indexes.get(&label)?;
-                            let pred = snap
-                                .pred_src
-                                .as_deref()
-                                .and_then(|src| crate::parse::parse_pred_src(src).ok());
-                            let def = crate::catalog::IndexDef {
-                                collection: snap.collection.clone(),
-                                unique: snap.unique,
-                                fields: snap.fields.clone(),
-                                pred,
-                                bitmap_card_field: None,
-                            };
+                            let def = index_def_of(snap);
                             let mut live = LiveIndex::new(def);
                             if !store_ref.is_disk_backed(&snap.collection) {
                                 let rows = store_ref.collection(&snap.collection);
@@ -4234,17 +4241,7 @@ impl Store {
             let Some(snap) = self.extra_indexes.get(&label) else {
                 continue;
             };
-            let pred = snap
-                .pred_src
-                .as_deref()
-                .and_then(|src| crate::parse::parse_pred_src(src).ok());
-            let def = crate::catalog::IndexDef {
-                collection: snap.collection.clone(),
-                unique: snap.unique,
-                fields: snap.fields.clone(),
-                pred,
-                bitmap_card_field: None,
-            };
+            let def = index_def_of(snap);
             let mut live = LiveIndex::new(def);
             if !self.is_disk_backed(&snap.collection) {
                 let rows = self.collection(&snap.collection);
@@ -4619,17 +4616,7 @@ impl Store {
             let def = if let Some(existing) = self.indexes.get(&label) {
                 existing.def.clone()
             } else if let Some(snap) = self.extra_indexes.get(&label) {
-                let pred = snap
-                    .pred_src
-                    .as_deref()
-                    .and_then(|src| crate::parse::parse_pred_src(src).ok());
-                crate::catalog::IndexDef {
-                    collection: snap.collection.clone(),
-                    unique: snap.unique,
-                    fields: snap.fields.clone(),
-                    pred,
-                    bitmap_card_field: None,
-                }
+                index_def_of(snap)
             } else {
                 continue;
             };
@@ -4654,8 +4641,7 @@ impl Store {
         // A disk-backed collection keeps only an empty placeholder `LiveIndex`; its secondary
         // indexes live in the disk engine. Report "no usable index" so callers scan instead
         // of trusting an empty seek result.
-        if self.is_disk_backed(collection)
-            || (collection == "docs" && !self.deferred_doc_wing_updates.is_empty())
+        if self.is_disk_backed(collection) || (collection == "docs" && self.has_deferred_doc_ops())
         {
             return None;
         }
@@ -4695,8 +4681,7 @@ impl Store {
         // A disk-backed collection keeps only an empty placeholder `LiveIndex`; its secondary
         // indexes live in the disk engine. Report "no usable index" so callers scan instead
         // of trusting an empty seek result.
-        if self.is_disk_backed(collection)
-            || (collection == "docs" && !self.deferred_doc_wing_updates.is_empty())
+        if self.is_disk_backed(collection) || (collection == "docs" && self.has_deferred_doc_ops())
         {
             return None;
         }
@@ -4726,8 +4711,7 @@ impl Store {
         // A disk-backed collection keeps only an empty placeholder `LiveIndex`; its secondary
         // indexes live in the disk engine. Report "no usable index" so callers scan instead
         // of trusting an empty seek result.
-        if self.is_disk_backed(collection)
-            || (collection == "docs" && !self.deferred_doc_wing_updates.is_empty())
+        if self.is_disk_backed(collection) || (collection == "docs" && self.has_deferred_doc_ops())
         {
             return None;
         }
@@ -4744,6 +4728,36 @@ impl Store {
         }
         // For multiple uses, fall back to full seek
         Some(self.index_seek(collection, uses, now)?.len())
+    }
+}
+
+
+/// The id map of `collection`, created on first use. Looked up by `&str` first: the
+/// `entry` form allocated the collection name on every insert statement.
+#[inline]
+fn by_id_slot<'a>(
+    by_id: &'a mut BTreeMap<String, FxHashMap<Arc<str>, usize>>,
+    collection: &str,
+) -> &'a mut FxHashMap<Arc<str>, usize> {
+    if !by_id.contains_key(collection) {
+        by_id.insert(collection.to_string(), FxHashMap::default());
+    }
+    by_id.get_mut(collection).expect("slot inserted above")
+}
+
+/// The live definition of a persisted index. Its filter is stored as source text; one
+/// that no longer parses is dropped, leaving the index unfiltered (every caller has
+/// always treated it that way).
+pub(crate) fn index_def_of(snap: &IndexSnap) -> crate::catalog::IndexDef {
+    crate::catalog::IndexDef {
+        collection: snap.collection.clone(),
+        unique: snap.unique,
+        fields: snap.fields.clone(),
+        pred: snap
+            .pred_src
+            .as_deref()
+            .and_then(|src| crate::parse::parse_pred_src(src).ok()),
+        bitmap_card_field: None,
     }
 }
 

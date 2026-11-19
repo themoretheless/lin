@@ -99,19 +99,32 @@ impl AsyncDb {
         {
             return rdb.clone();
         }
-        let mut g = self.inner.lock().await;
-        let epoch_now = self.write_epoch.load(Ordering::Acquire);
-        if let Ok(guard) = self.cached_reader.read()
-            && let Some((cached_epoch, ref rdb)) = *guard
-            && cached_epoch == epoch_now
-        {
-            return rdb.clone();
+        // Building a snapshot copies the memory image: keep it off the executor threads.
+        let inner = Arc::clone(&self.inner);
+        let write_epoch = Arc::clone(&self.write_epoch);
+        let cached_reader = Arc::clone(&self.cached_reader);
+        let built = spawn_blocking(move || {
+            let mut g = inner.blocking_lock();
+            let epoch_now = write_epoch.load(Ordering::Acquire);
+            if let Ok(guard) = cached_reader.read()
+                && let Some((cached_epoch, ref rdb)) = *guard
+                && cached_epoch == epoch_now
+            {
+                return rdb.clone();
+            }
+            let rdb = g.reader();
+            if let Ok(mut wguard) = cached_reader.write() {
+                *wguard = Some((epoch_now, rdb.clone()));
+            }
+            rdb
+        })
+        .await;
+        match built {
+            Ok(rdb) => rdb,
+            Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+            // Runtime is shutting down and refused the task: build inline.
+            Err(_) => self.inner.lock().await.reader(),
         }
-        let rdb = g.reader();
-        if let Ok(mut wguard) = self.cached_reader.write() {
-            *wguard = Some((epoch_now, rdb.clone()));
-        }
-        rdb
     }
 
     /// Run a statement on the writer. Like [`Self::execute`], concurrent calls share one

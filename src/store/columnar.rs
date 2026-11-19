@@ -4,10 +4,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 
 use super::Store;
-use super::value::{
-    Cell, ID_TITLE_POOL, LAST_ID_TITLE_META, Row, acquire_row, docs_hot_field, row_id_title,
-    row_matches_id_title,
-};
+use super::value::{Cell, ID_TITLE_POOL, Row, acquire_row, docs_hot_field, row_id_title};
 
 /// In-memory dictionary-encoded column for low-cardinality string columns (e.g. `wing`, `layer`).
 ///
@@ -400,6 +397,7 @@ impl Store {
                     rxs: &pool.rxs,
                     dispatched: [false; 11],
                 };
+                let mut orphaned = [false; 11];
                 for w in 0..workers {
                     let b_start = bounds[w];
                     let b_end = bounds[w + 1];
@@ -415,6 +413,9 @@ impl Store {
                             .is_ok()
                         {
                             scan_guard.dispatched[w] = true;
+                        } else {
+                            // Worker is gone: its chunk is scanned here, not dropped.
+                            orphaned[w] = true;
                         }
                     }
                 }
@@ -429,9 +430,13 @@ impl Store {
                 for w in 0..workers {
                     if scan_guard.dispatched[w] {
                         scan_guard.dispatched[w] = false;
-                        if let Ok(c) = scan_guard.rxs[w].recv() {
-                            total += c;
+                        match scan_guard.rxs[w].recv() {
+                            Ok(c) => total += c,
+                            Err(_) => orphaned[w] = true,
                         }
+                    }
+                    if orphaned[w] {
+                        total += scan_nul_chunk(&bytes[bounds[w]..bounds[w + 1]], &finder);
                     }
                 }
                 return total;
@@ -536,9 +541,9 @@ impl Store {
         if n != self.collections.get("docs").map_or(0, Vec::len) {
             return None;
         }
-        let (dict, field_tag) = match filter_field {
-            "wing" if self.docs_wing.len() == n => (&self.docs_wing, 1u64 << 32),
-            "layer" if self.docs_layer.len() == n => (&self.docs_layer, 2u64 << 32),
+        let dict = match filter_field {
+            "wing" if self.docs_wing.len() == n => &self.docs_wing,
+            "layer" if self.docs_layer.len() == n => &self.docs_layer,
             _ => return None,
         };
         let (codes, dict_vals) = dict.as_indices()?;
@@ -552,7 +557,6 @@ impl Store {
         if limit == Some(0) {
             return Some(Vec::new());
         }
-        let filter_tag = field_tag | (code as u64);
         let id_title = fields.len() == 2 && fields[0] == "id" && fields[1] == "title";
 
         let recycled = if id_title && limit.is_none() && n >= 1024 {
@@ -561,29 +565,9 @@ impl Store {
             None
         };
 
-        if let Some(ref rec) = recycled
-            && rec.docs_epoch == self.docs_epoch
-            && rec.filter_tag == filter_tag
-            && !rec.rows.is_empty()
-            && rec.first_idx < n
-            && rec.last_idx < n
-            && row_matches_id_title(
-                &rec.rows[0],
-                &self.docs_id[rec.first_idx],
-                &self.docs_title[rec.first_idx],
-            )
-            && row_matches_id_title(
-                rec.rows.last().unwrap(),
-                &self.docs_id[rec.last_idx],
-                &self.docs_title[rec.last_idx],
-            )
-        {
-            LAST_ID_TITLE_META.with(|c| {
-                c.set((self.docs_epoch, filter_tag, rec.first_idx, rec.last_idx));
-            });
-            return Some(recycled.unwrap().rows);
-        }
-
+        // The pooled vector is only a buffer: it may hold another query's rows (the pool
+        // is process-wide and tagged from a thread-local) or rows the caller edited, so
+        // every row is checked against the columns below before it is returned.
         let max_take = limit.unwrap_or(usize::MAX);
         let mut idxs = Vec::with_capacity(limit.unwrap_or(codes.len() / 2 + 16).min(codes.len()));
         for (i, &c) in codes.iter().enumerate() {
@@ -598,27 +582,30 @@ impl Store {
             return Some(Vec::new());
         }
         if id_title && limit.is_none() && idxs.len() >= 1024 {
-            let first_idx = idxs[0];
-            let last_idx = *idxs.last().unwrap();
-            LAST_ID_TITLE_META.with(|c| {
-                c.set((self.docs_epoch, filter_tag, first_idx, last_idx));
-            });
-            if let Some(mut rec) = recycled
-                && rec.rows.len() == idxs.len()
+            if let Some(mut rows) = recycled
+                && rows.len() == idxs.len()
             {
                 let total_idxs = idxs.len();
                 let docs_id = &self.docs_id;
                 let docs_title = &self.docs_title;
-                let rows_ptr = rec.rows.as_mut_ptr() as usize;
-                let threads = std::thread::available_parallelism()
-                    .map(|p| p.get())
-                    .unwrap_or(1)
-                    .min((total_idxs + 1023) / 1024);
+                let rows_ptr = rows.as_mut_ptr() as usize;
+                let id_title_shape = super::value::shape_id_title();
+                // Checking a row is two pointer compares: below this many rows, spawning
+                // workers costs far more than the pass itself.
+                const PAR_REFILL_MIN_ROWS: usize = 65_536;
+                let threads = if total_idxs < PAR_REFILL_MIN_ROWS {
+                    1
+                } else {
+                    std::thread::available_parallelism()
+                        .map(|p| p.get())
+                        .unwrap_or(1)
+                        .min((total_idxs + 1023) / 1024)
+                };
                 let next_chunk = std::sync::atomic::AtomicUsize::new(0);
                 let chunk_size = 4096;
-                std::thread::scope(|scope| {
-                    for _ in 0..threads {
-                        scope.spawn(|| {
+                {
+                    {
+                        let work = || {
                             loop {
                                 let start = next_chunk
                                     .fetch_add(chunk_size, std::sync::atomic::Ordering::Relaxed);
@@ -629,37 +616,41 @@ impl Store {
                                 for offset in start..end {
                                     let i = idxs[offset];
                                     let row = unsafe { &mut *(rows_ptr as *mut Row).add(offset) };
-                                    if row.len() == 2 {
-                                        let mut it = row.iter_mut();
-                                        if let (Some((k1, v1)), Some((k2, v2))) =
-                                            (it.next(), it.next())
-                                            && k1 == "id"
-                                            && k2 == "title"
-                                        {
-                                            let same_id = match v1 {
-                                                Cell::Text(a) => Arc::ptr_eq(a, &docs_id[i]),
-                                                _ => false,
-                                            };
-                                            if !same_id {
-                                                *v1 = Cell::Text(Arc::clone(&docs_id[i]));
-                                            }
-                                            let same_title = match v2 {
-                                                Cell::Text(a) => Arc::ptr_eq(a, &docs_title[i]),
-                                                _ => false,
-                                            };
-                                            if !same_title {
-                                                *v2 = Cell::Text(Arc::clone(&docs_title[i]));
-                                            }
-                                            continue;
+                                    // Shapes are interned: one pointer compare stands
+                                    // for "exactly the fields id and title".
+                                    if row.shape().is_some_and(|s| Arc::ptr_eq(s, id_title_shape))
+                                        && let [v1, v2] = row.cells_mut()
+                                    {
+                                        let same_id = match v1 {
+                                            Cell::Text(a) => Arc::ptr_eq(a, &docs_id[i]),
+                                            _ => false,
+                                        };
+                                        if !same_id {
+                                            *v1 = Cell::Text(Arc::clone(&docs_id[i]));
                                         }
+                                        let same_title = match v2 {
+                                            Cell::Text(a) => Arc::ptr_eq(a, &docs_title[i]),
+                                            _ => false,
+                                        };
+                                        if !same_title {
+                                            *v2 = Cell::Text(Arc::clone(&docs_title[i]));
+                                        }
+                                        continue;
                                     }
                                     *row = row_id_title(&docs_id[i], &docs_title[i]);
                                 }
                             }
+                        };
+                        // The caller is one of the workers.
+                        std::thread::scope(|scope| {
+                            for _ in 1..threads {
+                                scope.spawn(&work);
+                            }
+                            work();
                         });
                     }
-                });
-                return Some(rec.rows);
+                }
+                return Some(rows);
             }
         }
         self.project_docs_hot(&idxs, fields)

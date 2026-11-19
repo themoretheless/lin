@@ -6,9 +6,12 @@ use crate::ast::{CmpOp, Field, Pred, Value, WindowSort};
 use crate::store::{Cell, Row, row_text};
 use crate::window::{FrameBound, WindowFrame, WindowFunction};
 
+const REGEX_CACHE_MAX_PATTERNS: usize = 256;
+
 struct RegexCacheState {
     last: Option<(String, String, Option<Arc<regex::Regex>>)>,
-    map: FxHashMap<(String, String), Option<Arc<regex::Regex>>>,
+    /// pattern -> (flags, regex); probed by `&str`, so a hit allocates nothing.
+    map: FxHashMap<String, Vec<(String, Option<Arc<regex::Regex>>)>>,
 }
 
 // Thread-local regex compilation cache: (pattern, flags) -> Regex
@@ -356,21 +359,32 @@ pub(crate) fn eval_leaf(pred: &Pred, cell: &Cell, now: i64) -> bool {
                 {
                     return lre.as_ref().is_some_and(|re| re.is_match(text));
                 }
-                let key = (pattern.clone(), flags.clone());
-                let compiled = state
+                if let Some((_, re)) = state
                     .map
-                    .entry(key.clone())
-                    .or_insert_with(|| {
-                        let mut b = regex::RegexBuilder::new(pattern);
-                        b.size_limit(10 * 1024 * 1024);
-                        if flags.contains('i') {
-                            b.case_insensitive(true);
-                        }
-                        b.build().ok().map(Arc::new)
-                    })
-                    .clone();
+                    .get(pattern.as_str())
+                    .and_then(|v| v.iter().find(|(f, _)| f == flags))
+                {
+                    return re.as_ref().is_some_and(|re| re.is_match(text));
+                }
+                // Patterns can come from parameters: keep the cache bounded.
+                if state.map.len() >= REGEX_CACHE_MAX_PATTERNS {
+                    state.map.clear();
+                }
+                let compiled = {
+                    let mut b = regex::RegexBuilder::new(pattern);
+                    b.size_limit(10 * 1024 * 1024);
+                    if flags.contains('i') {
+                        b.case_insensitive(true);
+                    }
+                    b.build().ok().map(Arc::new)
+                };
+                state
+                    .map
+                    .entry(pattern.clone())
+                    .or_default()
+                    .push((flags.clone(), compiled.clone()));
                 let matched = compiled.as_ref().is_some_and(|re| re.is_match(text));
-                state.last = Some((key.0, key.1, compiled));
+                state.last = Some((pattern.clone(), flags.clone(), compiled));
                 matched
             })
         }

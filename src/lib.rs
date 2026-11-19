@@ -57,6 +57,7 @@ mod embed_ollama;
 #[cfg(feature = "embed-onnx")]
 mod embed_onnx;
 mod error;
+mod eval;
 mod exact_sum;
 mod exec;
 mod explain;

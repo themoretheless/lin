@@ -1051,9 +1051,8 @@ pub(crate) fn agg_avg_filtered(
             let mut value_slot = FieldSlot::new(&fk);
             for r in rows {
                 if flt.as_mut().is_none_or(|f| f.eval(r, now))
-                    && let Some(v) = value_slot.get(r).and_then(Cell::as_f64)
+                    && sum.add_numeric(value_slot.get(r))
                 {
-                    sum.add_f64(v);
                     count += 1;
                 }
             }
@@ -1098,8 +1097,7 @@ pub(crate) fn agg_avg_filtered(
             Some(&fk),
             max_bytes,
             |acc, v| {
-                if let Some(v) = v.and_then(Cell::as_f64) {
-                    acc.0.add_f64(v);
+                if acc.0.add_numeric(v) {
                     acc.1 += 1;
                 }
             },
@@ -1140,10 +1138,9 @@ pub(crate) fn agg_avg_filtered(
                 )));
             }
         }
-        let v_opt = value_slot.get(r).and_then(Cell::as_f64);
+        let value = value_slot.get(r);
         let entry = map.entry(cell).or_default();
-        if let Some(v) = v_opt {
-            entry.0.add_f64(v);
+        if entry.0.add_numeric(value) {
             entry.1 += 1;
         }
     }
@@ -1163,6 +1160,17 @@ pub(crate) fn agg_avg_filtered(
             row
         })
         .collect())
+}
+
+/// Join key of a cell without allocating for text (ints keep joining to equal text).
+#[inline]
+pub(crate) fn cell_key_ref(c: &Cell) -> Option<std::borrow::Cow<'_, str>> {
+    match c {
+        Cell::Text(s) => Some(std::borrow::Cow::Borrowed(s.as_ref())),
+        Cell::SmallText(s) => Some(std::borrow::Cow::Borrowed(s.as_str())),
+        Cell::Int(n) => Some(std::borrow::Cow::Owned(n.to_string())),
+        _ => None,
+    }
 }
 
 pub(crate) fn cell_key(c: &Cell) -> Option<String> {
@@ -1880,9 +1888,8 @@ impl Db {
                     for i in idxs {
                         if let Some(r) = col.get(i)
                             && residual.as_mut().is_none_or(|f| f.eval(r, now))
-                            && let Some(v) = r.get(&fk).and_then(Cell::as_f64)
+                            && sum.add_numeric(r.get(&fk))
                         {
-                            sum.add_f64(v);
                             count += 1;
                         }
                     }
@@ -2939,13 +2946,8 @@ impl MetricAcc {
             },
             MetricAcc::Avg { sum, count } => match c1 {
                 Cell::Null => {}
-                Cell::Int(i) => {
-                    sum.add_i64(*i);
-                    *count += 1;
-                }
                 other => {
-                    if let Some(f) = other.as_f64() {
-                        sum.add_f64(f);
+                    if sum.add_numeric(Some(other)) {
                         *count += 1;
                     }
                 }

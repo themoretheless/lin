@@ -24,6 +24,8 @@ pub struct CacheNode {
     pub(crate) state: Arc<RwLock<EngineState>>,
     pub(crate) stop: Arc<AtomicBool>,
     stop_signal: Arc<(Mutex<bool>, Condvar)>,
+    /// Serializes read-modify-write commands and keeps replication in log order.
+    pub(crate) mutation_order: Arc<Mutex<()>>,
 }
 
 impl CacheNode {
@@ -51,6 +53,7 @@ impl CacheNode {
             state: Arc::new(RwLock::new(state)),
             stop: Arc::new(AtomicBool::new(false)),
             stop_signal: Arc::new((Mutex::new(false), Condvar::new())),
+            mutation_order: Arc::new(Mutex::new(())),
         })
     }
 
@@ -190,6 +193,7 @@ impl CacheNode {
                 CacheResponse::Ok
             }
             CacheRequest::Del { keys } => {
+                let order = self.mutation_order();
                 let mut removed_count = 0i64;
                 {
                     let mut st = self.state.write().unwrap();
@@ -199,7 +203,7 @@ impl CacheNode {
                         }
                     }
                 }
-                self.propose_and_apply_mutation(RaftCommand::Del { keys });
+                self.propose_and_apply_held(&order, RaftCommand::Del { keys });
                 CacheResponse::Int(removed_count)
             }
             CacheRequest::Exists { key } => self.with_live_entry(
@@ -208,6 +212,7 @@ impl CacheNode {
                 |_, _| CacheResponse::Int(1),
             ),
             CacheRequest::IncrBy { key, delta } => {
+                let order = self.mutation_order();
                 let (new_val, expires_at_ms) = {
                     let mut st = self.state.write().unwrap();
                     let _ = st.touch_or_remove_expired(&key);
@@ -239,14 +244,18 @@ impl CacheNode {
                         None => (delta, None),
                     }
                 };
-                self.propose_and_apply_mutation(RaftCommand::Set {
-                    key,
-                    value: CacheValue::Int(new_val),
-                    expires_at_ms,
-                });
+                self.propose_and_apply_held(
+                    &order,
+                    RaftCommand::Set {
+                        key,
+                        value: CacheValue::Int(new_val),
+                        expires_at_ms,
+                    },
+                );
                 CacheResponse::Int(new_val)
             }
             CacheRequest::Expire { key, ttl_ms } => {
+                let order = self.mutation_order();
                 let updated = {
                     let mut st = self.state.write().unwrap();
                     if !st.touch_or_remove_expired(&key) {
@@ -257,17 +266,21 @@ impl CacheNode {
                 };
                 if let Some(value) = updated {
                     let expires_at_ms = Some(unix_ms() + ttl_ms);
-                    self.propose_and_apply_mutation(RaftCommand::Set {
-                        key,
-                        value,
-                        expires_at_ms,
-                    });
+                    self.propose_and_apply_held(
+                        &order,
+                        RaftCommand::Set {
+                            key,
+                            value,
+                            expires_at_ms,
+                        },
+                    );
                     CacheResponse::Int(1)
                 } else {
                     CacheResponse::Int(0)
                 }
             }
             CacheRequest::Persist { key } => {
+                let order = self.mutation_order();
                 let updated = {
                     let mut st = self.state.write().unwrap();
                     if !st.touch_or_remove_expired(&key) {
@@ -280,11 +293,14 @@ impl CacheNode {
                     }
                 };
                 if let Some(value) = updated {
-                    self.propose_and_apply_mutation(RaftCommand::Set {
-                        key,
-                        value,
-                        expires_at_ms: None,
-                    });
+                    self.propose_and_apply_held(
+                        &order,
+                        RaftCommand::Set {
+                            key,
+                            value,
+                            expires_at_ms: None,
+                        },
+                    );
                     CacheResponse::Int(1)
                 } else {
                     CacheResponse::Int(0)
@@ -323,6 +339,7 @@ impl CacheNode {
 
             // --- Hashes ---
             CacheRequest::HSet { key, field, value } => {
+                let order = self.mutation_order();
                 let (map, is_new, exp) = {
                     let mut st = self.state.write().unwrap();
                     let _ = st.touch_or_remove_expired(&key);
@@ -344,11 +361,14 @@ impl CacheNode {
                         }
                     }
                 };
-                self.propose_and_apply_mutation(RaftCommand::Set {
-                    key,
-                    value: CacheValue::Hash(map),
-                    expires_at_ms: exp,
-                });
+                self.propose_and_apply_held(
+                    &order,
+                    RaftCommand::Set {
+                        key,
+                        value: CacheValue::Hash(map),
+                        expires_at_ms: exp,
+                    },
+                );
                 CacheResponse::Int(i64::from(is_new))
             }
             CacheRequest::HGet { key, field } => self.with_live_entry(
@@ -372,6 +392,7 @@ impl CacheNode {
                 },
             ),
             CacheRequest::HDel { key, fields } => {
+                let order = self.mutation_order();
                 let res = {
                     let mut st = self.state.write().unwrap();
                     if !st.touch_or_remove_expired(&key) {
@@ -397,13 +418,19 @@ impl CacheNode {
                 match res {
                     Some((m, removed, exp)) => {
                         if m.is_empty() {
-                            self.propose_and_apply_mutation(RaftCommand::Del { keys: vec![key] });
+                            self.propose_and_apply_held(
+                                &order,
+                                RaftCommand::Del { keys: vec![key] },
+                            );
                         } else if removed > 0 {
-                            self.propose_and_apply_mutation(RaftCommand::Set {
-                                key,
-                                value: CacheValue::Hash(m),
-                                expires_at_ms: exp,
-                            });
+                            self.propose_and_apply_held(
+                                &order,
+                                RaftCommand::Set {
+                                    key,
+                                    value: CacheValue::Hash(m),
+                                    expires_at_ms: exp,
+                                },
+                            );
                         }
                         CacheResponse::Int(removed)
                     }
@@ -465,6 +492,7 @@ impl CacheNode {
 
             // --- Sets ---
             CacheRequest::SAdd { key, members } => {
+                let order = self.mutation_order();
                 let (set, added, exp) = {
                     let mut st = self.state.write().unwrap();
                     let _ = st.touch_or_remove_expired(&key);
@@ -496,14 +524,18 @@ impl CacheNode {
                         }
                     }
                 };
-                self.propose_and_apply_mutation(RaftCommand::Set {
-                    key,
-                    value: CacheValue::Set(set),
-                    expires_at_ms: exp,
-                });
+                self.propose_and_apply_held(
+                    &order,
+                    RaftCommand::Set {
+                        key,
+                        value: CacheValue::Set(set),
+                        expires_at_ms: exp,
+                    },
+                );
                 CacheResponse::Int(added)
             }
             CacheRequest::SRem { key, members } => {
+                let order = self.mutation_order();
                 let res = {
                     let mut st = self.state.write().unwrap();
                     if !st.touch_or_remove_expired(&key) {
@@ -529,13 +561,19 @@ impl CacheNode {
                 match res {
                     Some((s, removed, exp)) => {
                         if s.is_empty() {
-                            self.propose_and_apply_mutation(RaftCommand::Del { keys: vec![key] });
+                            self.propose_and_apply_held(
+                                &order,
+                                RaftCommand::Del { keys: vec![key] },
+                            );
                         } else if removed > 0 {
-                            self.propose_and_apply_mutation(RaftCommand::Set {
-                                key,
-                                value: CacheValue::Set(s),
-                                expires_at_ms: exp,
-                            });
+                            self.propose_and_apply_held(
+                                &order,
+                                RaftCommand::Set {
+                                    key,
+                                    value: CacheValue::Set(s),
+                                    expires_at_ms: exp,
+                                },
+                            );
                         }
                         CacheResponse::Int(removed)
                     }
@@ -842,6 +880,7 @@ impl CacheNode {
     }
 
     fn exec_list_push(&self, key: String, values: Vec<Vec<u8>>, left: bool) -> CacheResponse {
+        let order = self.mutation_order();
         let (list, len, exp) = {
             let mut st = self.state.write().unwrap();
             let _ = st.touch_or_remove_expired(&key);
@@ -875,15 +914,19 @@ impl CacheNode {
                 }
             }
         };
-        self.propose_and_apply_mutation(RaftCommand::Set {
-            key,
-            value: CacheValue::List(list),
-            expires_at_ms: exp,
-        });
+        self.propose_and_apply_held(
+            &order,
+            RaftCommand::Set {
+                key,
+                value: CacheValue::List(list),
+                expires_at_ms: exp,
+            },
+        );
         CacheResponse::Int(len)
     }
 
     fn exec_list_pop(&self, key: String, left: bool) -> CacheResponse {
+        let order = self.mutation_order();
         let res = {
             let mut st = self.state.write().unwrap();
             if !st.touch_or_remove_expired(&key) {
@@ -904,13 +947,16 @@ impl CacheNode {
         match res {
             Some((l, Some(popped), exp)) => {
                 if l.is_empty() {
-                    self.propose_and_apply_mutation(RaftCommand::Del { keys: vec![key] });
+                    self.propose_and_apply_held(&order, RaftCommand::Del { keys: vec![key] });
                 } else {
-                    self.propose_and_apply_mutation(RaftCommand::Set {
-                        key,
-                        value: CacheValue::List(l),
-                        expires_at_ms: exp,
-                    });
+                    self.propose_and_apply_held(
+                        &order,
+                        RaftCommand::Set {
+                            key,
+                            value: CacheValue::List(l),
+                            expires_at_ms: exp,
+                        },
+                    );
                 }
                 CacheResponse::Bulk(popped)
             }

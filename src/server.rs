@@ -25,6 +25,9 @@ use crate::ship::{
 const WIRE_MAGIC: &[u8; 5] = b"LINS\x01";
 const WIRE_CRC_TAG: &[u8; 4] = b"LCRC";
 const MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
+/// Largest frame accepted before a connection has authenticated: enough for the hello,
+/// far below what an anonymous peer could otherwise make the server allocate.
+const PREAUTH_MAX_FRAME_BYTES: usize = 64 * 1024;
 const IDLE_POLL_SLICE: Duration = Duration::from_millis(80);
 const MAX_POOLED_CONNS: usize = 16;
 
@@ -383,6 +386,7 @@ fn read_frame_idle(
     stream: &mut NetStream,
     shutdown: Option<&AtomicBool>,
     io_timeout: Duration,
+    max_frame_bytes: usize,
 ) -> Result<ReadFrameResult, Error> {
     let mut hdr = [0u8; 10];
     let mut read_hdr = 0usize;
@@ -439,9 +443,9 @@ fn read_frame_idle(
     }
     let op = hdr[5];
     let len = u32::from_le_bytes(hdr[6..10].try_into().unwrap()) as usize;
-    if len > MAX_FRAME_BYTES {
+    if len > max_frame_bytes {
         return Err(Error::runtime(format!(
-            "frame payload {len} exceeds max {MAX_FRAME_BYTES}"
+            "frame payload {len} exceeds max {max_frame_bytes}"
         )));
     }
 
@@ -513,9 +517,11 @@ impl ServerState {
     fn refresh_reader_locked(&self, db: &mut Db) {
         let cur_gen = db.r#gen();
         let cold = db.has_unhydrated_cold_tables();
-        let reader = Arc::new(db.reader());
+        // Only drop the snapshot here: rebuilding it copies the memory image, and doing
+        // that under the writer mutex after every commit group taxed writes that no read
+        // followed. The first read rebuilds it.
         if let Ok(mut guard) = self.cached_reader.write() {
-            *guard = Some(reader);
+            *guard = None;
         }
         self.cold_unhydrated.store(cold, Ordering::Release);
         self.current_gen.store(cur_gen, Ordering::Release);
@@ -599,14 +605,32 @@ impl ServerState {
                 self.refresh_reader_locked(db);
             }
         }
-        let guard = self
+        if let Some(reader) = self
             .cached_reader
             .read()
-            .map_err(|_| Error::runtime("cached reader lock poisoned"))?;
-        guard
+            .map_err(|_| Error::runtime("cached reader lock poisoned"))?
             .as_ref()
-            .cloned()
-            .ok_or_else(|| Error::runtime("cached reader unavailable"))
+        {
+            return Ok(Arc::clone(reader));
+        }
+        let mut db_guard = self
+            .db
+            .lock()
+            .map_err(|_| Error::runtime("db lock poisoned"))?;
+        let db = db_guard
+            .as_mut()
+            .ok_or_else(|| Error::runtime("server database closed"))?;
+        let mut cached = self
+            .cached_reader
+            .write()
+            .map_err(|_| Error::runtime("cached reader lock poisoned"))?;
+        // Another reader may have rebuilt it while this one waited for the database.
+        if let Some(reader) = cached.as_ref() {
+            return Ok(Arc::clone(reader));
+        }
+        let reader = Arc::new(db.reader());
+        *cached = Some(Arc::clone(&reader));
+        Ok(reader)
     }
 }
 
@@ -1087,6 +1111,11 @@ fn handle_client_connection(stream: &mut NetStream, state: &Arc<ServerState>) {
             stream,
             Some(&state.shutdown),
             state.config.io_timeout,
+            if authed {
+                MAX_FRAME_BYTES
+            } else {
+                PREAUTH_MAX_FRAME_BYTES
+            },
         ) {
             Ok(ReadFrameResult::Eof) => break,
             Ok(ReadFrameResult::Frame { op, payload }) => (op, payload),
@@ -1414,6 +1443,19 @@ fn handle_pull_sync(mut cur: &[u8], state: &Arc<ServerState>) -> Result<Vec<u8>,
     let since_gen = read_u64_le(&mut cur).map_err(|e| (ERR_RUNTIME, e.to_string()))?;
     let force_bootstrap = read_u8(&mut cur).map_err(|e| (ERR_RUNTIME, e.to_string()))? != 0;
 
+    // Idle follower polls answer from the published generation and stay off the writer
+    // mutex; `refresh_reader_locked` publishes it after every mutation.
+    if !force_bootstrap
+        && let Ok(published) = state.gen_state.lock().map(|g| *g)
+        && since_gen >= published
+    {
+        let mut out = Vec::with_capacity(16);
+        out.push(0);
+        out.push(0); // UpToDate
+        out.extend_from_slice(&published.to_le_bytes());
+        return Ok(out);
+    }
+
     let mut db_guard = state
         .db
         .lock()
@@ -1541,7 +1583,7 @@ impl ServerClient {
         push_str(&mut hello, self.opts.token.as_deref().unwrap_or(""))?;
         push_opt_str(&mut hello, self.opts.workload_group.as_deref())?;
         write_frame(&mut stream, OP_HELLO, &hello)?;
-        let resp = match read_frame_idle(&mut stream, None, self.opts.timeout)? {
+        let resp = match read_frame_idle(&mut stream, None, self.opts.timeout, MAX_FRAME_BYTES)? {
             ReadFrameResult::Frame { op, payload } if op == OP_HELLO => payload,
             ReadFrameResult::Frame { op, .. } => {
                 return Err(Error::runtime(format!("unexpected hello reply op {op}")));
@@ -1609,7 +1651,7 @@ impl ServerClient {
 
     fn send_and_recv(&self, stream: &mut NetStream, op: u8, payload: &[u8]) -> Result<Vec<u8>, Error> {
         write_frame(stream, op, payload)?;
-        match read_frame_idle(stream, None, self.opts.timeout)? {
+        match read_frame_idle(stream, None, self.opts.timeout, MAX_FRAME_BYTES)? {
             ReadFrameResult::Frame { op: resp_op, payload } => {
                 if resp_op != op {
                     return Err(Error::runtime(format!(

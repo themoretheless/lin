@@ -9,7 +9,7 @@ use crate::error::Error;
 use crate::store::{Cell, Row, acquire_row};
 use crate::window::WindowFunction;
 
-use super::agg::cell_key;
+use super::agg::{cell_key, cell_key_ref};
 use super::{Db, field_names};
 
 /// Output field for a projected FK join: left column or right probe slot.
@@ -96,9 +96,27 @@ fn sort_orders_partition(
     }
 }
 
+/// Sets `prefix.key` on `row`. The name is assembled in a reused buffer: joins call this
+/// once per right-hand cell of every output row, and `Row::insert` only borrows the key.
+#[inline]
+pub(crate) fn insert_prefixed(row: &mut Row, prefix: &str, key: &str, value: Cell) {
+    thread_local! {
+        static NAME: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    }
+    NAME.with(|name| {
+        let mut name = name.borrow_mut();
+        name.clear();
+        name.reserve(prefix.len() + 1 + key.len());
+        name.push_str(prefix);
+        name.push('.');
+        name.push_str(key);
+        row.insert(name.as_str(), value);
+    });
+}
+
 pub(crate) fn merge_join_row(mut left: Row, right: &Row, right_col: &str) -> Row {
     for (k, v) in right {
-        left.insert(format!("{right_col}.{k}"), v.clone_for_borrow());
+        insert_prefixed(&mut left, right_col, k, v.clone_for_borrow());
     }
     left
 }
@@ -3375,10 +3393,15 @@ fn partition_into(
             }
             let mut idx: FxHashMap<String, Vec<Row>> = FxHashMap::default();
             let mut keep = |r: &Row| {
-                if let Some(k) = cell_key(r.get(to_field).unwrap_or(&Cell::Null))
-                    && needed_keys.contains(&k)
+                if let Some(k) = cell_key_ref(r.get(to_field).unwrap_or(&Cell::Null))
+                    && needed_keys.contains(k.as_ref())
                 {
-                    idx.entry(k).or_default().push(r.clone());
+                    match idx.get_mut(k.as_ref()) {
+                        Some(rs) => rs.push(r.clone()),
+                        None => {
+                            idx.insert(k.into_owned(), vec![r.clone()]);
+                        }
+                    }
                 }
             };
             // Text keys in a bounded number: push `key in [...]` into the scan, so segments
@@ -3415,7 +3438,10 @@ fn partition_into(
             }
             let mut out = Vec::with_capacity(left.len());
             for mut l in left {
-                let hits = l.get(on).and_then(cell_key).and_then(|k| idx.get(&k));
+                let hits = l
+                    .get(on)
+                    .and_then(cell_key_ref)
+                    .and_then(|k| idx.get(k.as_ref()));
                 match hits {
                     Some(rs) => {
                         for (i, r) in rs.iter().enumerate() {
@@ -3521,16 +3547,23 @@ fn partition_into(
         let mut idx: FxHashMap<String, Vec<&Row>> = FxHashMap::default();
         idx.reserve(needed_keys.len());
         for r in right {
-            if let Some(k) = cell_key(r.get(to_field).unwrap_or(&Cell::Null))
-                && needed_keys.contains(&k)
+            if let Some(k) = cell_key_ref(r.get(to_field).unwrap_or(&Cell::Null))
+                && needed_keys.contains(k.as_ref())
             {
-                idx.entry(k).or_default().push(r);
+                match idx.get_mut(k.as_ref()) {
+                    Some(rs) => rs.push(r),
+                    None => {
+                        idx.insert(k.into_owned(), vec![r]);
+                    }
+                }
             }
         }
         let mut out = Vec::with_capacity(left.len());
         for mut l in left {
-            let key = l.get(on).and_then(cell_key);
-            let hits = key.as_ref().and_then(|k| idx.get(k));
+            let hits = l
+                .get(on)
+                .and_then(cell_key_ref)
+                .and_then(|k| idx.get(k.as_ref()));
             if let Some(rs) = hits {
                 for (i, r) in rs.iter().enumerate() {
                     let base = if i + 1 == rs.len() {

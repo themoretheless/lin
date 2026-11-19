@@ -301,7 +301,7 @@ impl Db {
             let mut r = row.clone();
             if let Some(alias) = start {
                 for (k, v) in &row {
-                    r.insert(format!("{alias}.{k}"), v.clone());
+                    super::join::insert_prefixed(&mut r, alias, k, v.clone());
                 }
             }
             cur.push(r);
@@ -371,7 +371,7 @@ impl Db {
                 {
                     let mut merged = row.clone();
                     for (k, v) in node {
-                        merged.insert(format!("{}.{k}", hop.bind), v.clone());
+                        super::join::insert_prefixed(&mut merged, &hop.bind, k, v.clone());
                     }
                     if let (Some(e_bind), Some((r, f, t))) = (&hop.edge, &last_edge) {
                         merged.insert(format!("{e_bind}.rel"), Cell::Text(Arc::clone(r)));

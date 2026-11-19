@@ -214,7 +214,9 @@ impl PostingList {
     pub fn insert(&mut self, pos: usize) {
         match self {
             PostingList::Standard(vec) => {
-                if vec.len() >= 32 {
+                // Checked at power-of-two lengths only: scanning for the maximum on every
+                // insert made a sparse list quadratic to build.
+                if vec.len() >= 32 && vec.len().is_power_of_two() {
                     let max_pos = vec.iter().copied().max().unwrap_or(0).max(pos);
                     if max_pos <= vec.len().saturating_mul(64) {
                         let mut set = BitSet::new(max_pos + 1);
@@ -610,7 +612,7 @@ impl LiveIndex {
     pub fn insert_at(&mut self, idx: usize, row: &Row) -> Result<(), String> {
         // Partial index check: only insert if pred matches (or no pred)
         if let Some(ref pred) = self.def.pred
-            && !crate::exec::eval_pred(pred, row, crate::store::now_ms())
+            && !crate::eval::eval_pred(pred, row, crate::store::now_ms())
         {
             // An update can move an indexed row out of the partial predicate.
             self.remove_at(idx);
@@ -625,7 +627,7 @@ impl LiveIndex {
     pub fn insert_at_new(&mut self, idx: usize, row: &Row) -> Result<(), String> {
         // Partial index check: only insert if pred matches (or no pred)
         if let Some(ref pred) = self.def.pred
-            && !crate::exec::eval_pred(pred, row, crate::store::now_ms())
+            && !crate::eval::eval_pred(pred, row, crate::store::now_ms())
         {
             return Ok(()); // Skip indexing for non-matching rows
         }
@@ -728,7 +730,7 @@ impl LiveIndex {
             let keyed_rows: Vec<(usize, &Row)> = rows
                 .iter()
                 .enumerate()
-                .filter(|(_, row)| crate::exec::eval_pred(pred, row, now))
+                .filter(|(_, row)| crate::eval::eval_pred(pred, row, now))
                 .map(|(i, row)| (start + i, row))
                 .collect();
 
@@ -832,13 +834,13 @@ impl LiveIndex {
             .def
             .pred
             .as_ref()
-            .is_none_or(|pred| crate::exec::eval_pred(pred, before, now))
+            .is_none_or(|pred| crate::eval::eval_pred(pred, before, now))
             .then(|| self.key_of(before));
         let new_key = self
             .def
             .pred
             .as_ref()
-            .is_none_or(|pred| crate::exec::eval_pred(pred, after, now))
+            .is_none_or(|pred| crate::eval::eval_pred(pred, after, now))
             .then(|| self.key_of(after));
         self.update_keys(idx, old_key, new_key)
     }
@@ -889,7 +891,7 @@ impl LiveIndex {
             .def
             .pred
             .as_ref()
-            .is_some_and(|pred| !crate::exec::eval_pred(pred, doomed, now))
+            .is_some_and(|pred| !crate::eval::eval_pred(pred, doomed, now))
         {
             return;
         }
@@ -939,8 +941,8 @@ impl LiveIndex {
         let (d_in, t_in) = if let Some(pred) = &self.def.pred {
             let now = crate::store::now_ms();
             (
-                crate::exec::eval_pred(pred, doomed, now),
-                crate::exec::eval_pred(pred, tail, now),
+                crate::eval::eval_pred(pred, doomed, now),
+                crate::eval::eval_pred(pred, tail, now),
             )
         } else {
             (true, true)
@@ -2179,7 +2181,7 @@ impl LiveIndex {
                 self.def
                     .pred
                     .as_ref()
-                    .is_none_or(|pred| crate::exec::eval_pred(pred, row, now))
+                    .is_none_or(|pred| crate::eval::eval_pred(pred, row, now))
             })
             .map(|(i, row)| (start + i, row))
             .collect();
