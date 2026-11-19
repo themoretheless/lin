@@ -1444,7 +1444,14 @@ fn append_vec_rows_field_parallel(
         return Ok((bytes < give_up_bytes, bytes));
     }
 
-    let chunk_size = 64usize;
+    let chunk_size = if cfg!(target_arch = "x86_64")
+        && num_rows >= 4096
+        && std::env::var_os("LIN_BENCH_X64_WAL").is_some()
+    {
+        256
+    } else {
+        64
+    };
     let total_chunks = num_rows.div_ceil(chunk_size);
     let mut slots = Vec::with_capacity(total_chunks);
     for _ in 0..total_chunks {

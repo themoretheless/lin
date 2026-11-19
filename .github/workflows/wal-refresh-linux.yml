@@ -35,16 +35,3 @@ jobs:
           path: |
             wal-results.json
             wal-provenance.txt
-      - name: Profile critical-path phases in a separate binary
-        run: |
-          set -euo pipefail
-          git apply scripts/wal-profile-refresh.patch
-          cargo build --locked --release -p lin-peer-worker --bin fresh_wal_profile
-          mkdir -p wal-profile
-          sha256sum target/release/fresh_wal_profile > wal-profile/profile-sha256.txt
-          python3 scripts/bench-wal-profile.py target/release/fresh_wal_profile wal-profile | tee wal-profile/summary.txt
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: wal-profile-refresh-linux-${{ matrix.runner }}
-          path: wal-profile/

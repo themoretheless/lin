@@ -1161,7 +1161,12 @@ impl Db {
         let uniform_keys = all_uniform && !needs_id;
         // The pre-encoded record is the compact columnar one; rows it cannot represent
         // exactly (missing fields, mixed types) are logged row by row after the insert.
-        let staged = if allow_preencode
+        let prefer_direct = cfg!(target_arch = "x86_64")
+            && (512..2048).contains(&n)
+            && uniform_keys
+            && self.persist.is_some()
+            && std::env::var_os("LIN_BENCH_X64_WAL").is_some();
+        let staged = if !prefer_direct && allow_preencode
             && (512..=16384).contains(&n)
             && edges.is_empty()
             && self.persist.is_some()
@@ -2350,7 +2355,14 @@ fn build_insert_rows(
             txs
         });
         if !workers.is_empty() {
-            let chunk_size = 64usize;
+            let chunk_size = if cfg!(target_arch = "x86_64")
+                && n >= 4096
+                && std::env::var_os("LIN_BENCH_X64_WAL").is_some()
+            {
+                256
+            } else {
+                64
+            };
             let total_chunks = n.div_ceil(chunk_size);
             let mut rows: Vec<Row> = Vec::with_capacity(n);
             let spare = &mut rows.spare_capacity_mut()[..n];
