@@ -777,31 +777,33 @@ pub(crate) fn lex_score_prepared(row: &Row, query: &LexQuery) -> i64 {
 }
 
 pub(crate) fn project(rows: &[Row], fields: &[Field]) -> Vec<Row> {
+    let keys: Vec<String> = fields.iter().map(Field::as_str).collect();
+    let mut proj = crate::store::RowProjector::new(&keys);
     let mut result = Vec::with_capacity(rows.len());
-    let keys: Vec<String> = fields.iter().map(|f| f.as_str()).collect();
     for r in rows {
-        let mut out = crate::store::acquire_row();
-        for k in &keys {
-            let cell = r.get(k).map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
-            out.insert(k.clone(), cell);
-        }
-        result.push(out);
+        result.push(proj.project(r));
     }
     result
 }
 
-/// [`project`] for rows the caller owns: unwanted fields are dropped in place and missing
-/// ones filled with nulls, so no row, key string or cell is reallocated.
+/// [`project`] for rows the caller owns: rows already matching the projected shape stay in
+/// place; all others are reshaped in O(1) per field via [`crate::store::RowProjector`].
 pub(crate) fn project_owned(mut rows: Vec<Row>, fields: &[Field]) -> Vec<Row> {
-    let keys: Vec<String> = fields.iter().map(|f| f.as_str()).collect();
+    let keys: Vec<String> = fields.iter().map(Field::as_str).collect();
+    if keys.is_empty() {
+        for row in &mut rows {
+            row.clear();
+        }
+        return rows;
+    }
+    let target_shape = Row::shape_of(&keys);
+    let mut proj = crate::store::RowProjector::new(&keys);
     for row in &mut rows {
-        if row.len() != keys.len() || !keys.iter().all(|k| row.contains_key(k)) {
-            row.retain(|k, _| keys.iter().any(|want| want == k));
-            for k in &keys {
-                if !row.contains_key(k) {
-                    row.insert(k.clone(), Cell::Null);
-                }
-            }
+        if !row
+            .shape_arc()
+            .is_some_and(|s| std::sync::Arc::ptr_eq(s, &target_shape))
+        {
+            *row = proj.project(row);
         }
     }
     rows

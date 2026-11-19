@@ -867,46 +867,118 @@ pub(super) fn encode_insert_cols_v2(
                             .ok_or_else(|| io_err("sparse vector size overflow"))?;
                         sparse_codec = true;
                         let mark = buf.len();
-                        buf.push(7);
-                        if v.iter()
+                        for emb in v.iter().flatten() {
+                            let bytes = emb
+                                .len()
+                                .checked_mul(4)
+                                .ok_or_else(|| io_err("sparse vector size overflow"))?;
+                            sparse_decoded_bytes = sparse_decoded_bytes
+                                .checked_add(bytes)
+                                .filter(|&bytes| bytes <= MAX_SPARSE_DECODED_BYTES)
+                                .ok_or_else(|| {
+                                    io_err("sparse vectors exceed decoded 64MiB budget")
+                                })?;
+                        }
+                        let large_vec = v
+                            .iter()
                             .flatten()
                             .fold(0usize, |n, emb| n.saturating_add(emb.len()))
-                            >= 2 * 1024 * 1024
-                        {
-                            for emb in v.iter().flatten() {
-                                let bytes = emb
-                                    .len()
-                                    .checked_mul(4)
-                                    .ok_or_else(|| io_err("sparse vector size overflow"))?;
-                                sparse_decoded_bytes = sparse_decoded_bytes
-                                    .checked_add(bytes)
-                                    .filter(|&bytes| bytes <= MAX_SPARSE_DECODED_BYTES)
-                                    .ok_or_else(|| {
-                                        io_err("sparse vectors exceed decoded 64MiB budget")
-                                    })?;
+                            >= 2 * 1024 * 1024;
+                        if dictionary_writer_enabled() {
+                            buf.push(8);
+                            let payload_start = buf.len();
+                            let (_, exact_sparse_bytes) = append_dictionary_rows_counted(
+                                v.iter().map(|r| r.as_deref()),
+                                buf,
+                                usize::MAX,
+                            )?;
+                            if buf.len() - payload_start < exact_sparse_bytes {
+                                dictionary_codec = true;
+                            } else {
+                                buf.truncate(mark);
+                                buf.push(7);
+                                if large_vec {
+                                    append_sparse_rows_parallel(v, buf)?;
+                                } else {
+                                    append_sparse_rows_serial(v, buf)?;
+                                }
                             }
-                            append_sparse_rows_parallel(v, buf)?;
                         } else {
-                            for emb in v.iter().flatten() {
-                                let bytes = emb
-                                    .len()
-                                    .checked_mul(4)
-                                    .ok_or_else(|| io_err("sparse vector size overflow"))?;
-                                sparse_decoded_bytes = sparse_decoded_bytes
-                                    .checked_add(bytes)
-                                    .filter(|&bytes| bytes <= MAX_SPARSE_DECODED_BYTES)
-                                    .ok_or_else(|| {
-                                        io_err("sparse vectors exceed decoded 64MiB budget")
-                                    })?;
+                            buf.push(7);
+                            if large_vec {
+                                append_sparse_rows_parallel(v, buf)?;
+                            } else {
+                                append_sparse_rows_serial(v, buf)?;
                             }
-                            append_sparse_rows_serial(v, buf)?;
                         }
                         if sparse_decoded_bytes > MAX_SPARSE_DECODED_BYTES {
                             return Err(io_err("sparse vectors exceed decoded 64MiB budget"));
                         }
-                        dictionary_codec |=
-                            rewrite_sparse_as_dictionary(buf, mark, v.iter().map(|r| r.as_deref()))?;
                         wrote_sparse = true;
+                    } else if dictionary_writer_enabled() {
+                        let mark = buf.len();
+                        buf.push(8);
+                        let payload_start = buf.len();
+                        let limit = if has_empty {
+                            usize::MAX
+                        } else {
+                            payload_start.saturating_add(dense)
+                        };
+                        let (under_limit, exact_sparse_bytes) = match append_dictionary_rows_counted(
+                            v.iter().map(|r| r.as_deref()),
+                            buf,
+                            limit,
+                        ) {
+                            Ok(pair) => pair,
+                            Err(e) => {
+                                buf.truncate(mark);
+                                return Err(e);
+                            }
+                        };
+                        let dict_bytes = buf.len() - payload_start;
+                        let use_dict = under_limit && dict_bytes < exact_sparse_bytes;
+                        if !use_dict {
+                            buf.truncate(mark);
+                            if has_empty || exact_sparse_bytes < dense {
+                                buf.push(7);
+                                if let Err(e) = append_sparse_rows_serial(v, buf) {
+                                    buf.truncate(mark);
+                                    return Err(e);
+                                }
+                            }
+                        }
+                        if buf.len() > mark {
+                            if v.len() != n as usize {
+                                buf.truncate(mark);
+                                return Err(io_err("sparse vector column length mismatch"));
+                            }
+                            let storage = v
+                                .len()
+                                .checked_mul(std::mem::size_of::<Option<Vec<f32>>>())
+                                .ok_or_else(|| io_err("sparse vector size overflow"))?;
+                            let mut next_decoded = sparse_decoded_bytes
+                                .checked_add(storage)
+                                .ok_or_else(|| io_err("sparse vector size overflow"))?;
+                            for emb in v.iter().flatten() {
+                                let bytes = emb
+                                    .len()
+                                    .checked_mul(4)
+                                    .ok_or_else(|| io_err("sparse vector size overflow"))?;
+                                next_decoded = next_decoded
+                                    .checked_add(bytes)
+                                    .filter(|&bytes| bytes <= MAX_SPARSE_DECODED_BYTES)
+                                    .ok_or_else(|| {
+                                        io_err("sparse vectors exceed decoded 64MiB budget")
+                                    })?;
+                            }
+                            if next_decoded > MAX_SPARSE_DECODED_BYTES {
+                                return Err(io_err("sparse vectors exceed decoded 64MiB budget"));
+                            }
+                            sparse_decoded_bytes = next_decoded;
+                            sparse_codec = true;
+                            dictionary_codec |= use_dict;
+                            wrote_sparse = true;
+                        }
                     } else {
                         let mark = buf.len();
                         buf.push(7);
@@ -947,11 +1019,6 @@ pub(super) fn encode_insert_cols_v2(
                             }
                             sparse_decoded_bytes = next_decoded;
                             sparse_codec = true;
-                            dictionary_codec |= rewrite_sparse_as_dictionary(
-                                buf,
-                                mark,
-                                v.iter().map(|r| r.as_deref()),
-                            )?;
                             wrote_sparse = true;
                         }
                     }
@@ -1200,39 +1267,6 @@ pub(super) fn append_dictionary_rows_counted<'a>(
         }
     }
     Ok((out.len() < give_up_at, exact_sparse_bytes))
-}
-
-pub(super) fn append_dictionary_rows<'a>(
-    rows: impl Iterator<Item = Option<&'a [f32]>>,
-    out: &mut Vec<u8>,
-    give_up_at: usize,
-) -> Result<bool, Error> {
-    append_dictionary_rows_counted(rows, out, give_up_at).map(|(ok, _)| ok)
-}
-
-/// A sparse vector column was just written at `mark` (its tag byte, then the rows). When
-/// the dictionary writer is on and the same rows are strictly smaller in the dictionary
-/// layout, replace the column in place and return `true`; the caller then frames the
-/// record under the dictionary codec. Decoded sizes are the same in both layouts, so the
-/// decoded-bytes budget the caller accounted for the sparse column still holds.
-fn rewrite_sparse_as_dictionary<'a>(
-    buf: &mut Vec<u8>,
-    mark: usize,
-    rows: impl Iterator<Item = Option<&'a [f32]>>,
-) -> Result<bool, Error> {
-    if !dictionary_writer_enabled() {
-        return Ok(false);
-    }
-    debug_assert_eq!(buf.get(mark), Some(&7));
-    let sparse_len = buf.len().saturating_sub(mark + 1);
-    let mut dict = Vec::with_capacity(sparse_len);
-    if !append_dictionary_rows(rows, &mut dict, sparse_len)? {
-        return Ok(false);
-    }
-    buf.truncate(mark);
-    buf.push(8);
-    buf.extend_from_slice(&dict);
-    Ok(true)
 }
 
 #[inline]

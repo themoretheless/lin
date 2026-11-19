@@ -945,5 +945,138 @@ mod preencoded_insert_tests {
             joined[1].get("users.email").and_then(Cell::text),
             Some("u3@example.com")
         );
+
+        // Verify lazy cursor over hot-left ⋈ cold-right streams without hydrating cold `users`.
+        let stmts = crate::parse::parse_program(
+            "orders | join users on user_id | { id, users.email } | take 5",
+        )
+        .unwrap();
+        let crate::ast::Stmt::Query(q) = &stmts[0] else {
+            panic!("expected query");
+        };
+        let cur = db.cursor(q).unwrap();
+        assert!(cur.is_lazy());
+        let cursor_rows: Vec<Row> = cur.map(Result::unwrap).collect();
+        assert_eq!(cursor_rows.len(), 5);
+        assert!(
+            db.store
+                .disk
+                .as_ref()
+                .unwrap()
+                .tables["users"]
+                .materialized
+                .get()
+                .is_none(),
+            "cold right table must stay unmaterialized during lazy cursor join"
+        );
+    }
+
+    #[test]
+    fn test_reembed_collection_wal_durability_and_embed_id_guard() {
+        let dir = Temp(std::env::temp_dir().join(format!(
+            "lin-reembed-wal-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        )));
+        let emb_a = std::sync::Arc::new(crate::embed::HashingEmbedder::new("model-a/16", 16));
+        let emb_b = std::sync::Arc::new(crate::embed::HashingEmbedder::new("model-b/32", 32));
+        {
+            let mut db = Db::open(&dir.0).unwrap().with_embedder(emb_a);
+            db.run(
+                r#"insert docs [
+                    { id: "d1", uri: "lin://re/1", title: "distributed consensus", body: "raft wal" },
+                    { id: "d2", uri: "lin://re/2", title: "columnar storage", body: "zstd mmap" }
+                ]"#,
+            )
+            .unwrap();
+            db.close().unwrap();
+        }
+        let expected_d1 = crate::embed::Embedder::embed(&*emb_b, "distributed consensus raft wal");
+        {
+            // Swap embedder on populated DB without reembedding: vector search must refuse.
+            let mut db = Db::open(&dir.0).unwrap().with_embedder(emb_b.clone());
+            let err = db
+                .run(r#"docs | search vec "raft" | { id } | take 5"#)
+                .unwrap_err();
+            assert!(err.to_string().contains("embed_id mismatch"), "{err}");
+
+            // Reembed logs to WAL and updates head; drop WITHOUT calling close/checkpoint!
+            assert_eq!(db.reembed_collection("docs").unwrap(), 2);
+            let hits = db
+                .run(r#"docs | search vec "raft" | { id } | take 5"#)
+                .unwrap()
+                .rows
+                .clone();
+            assert!(!hits.is_empty());
+        }
+        // Simulate crash recovery: reopen WITHOUT checkpoint must preserve 32-dim embeddings.
+        let mut recovered = Db::open(&dir.0).unwrap().with_embedder(emb_b);
+        let rows = recovered
+            .run(r#"docs | id == "d1" | { id, embedding }"#)
+            .unwrap()
+            .rows
+            .clone();
+        let got_vec = rows[0].get("embedding").and_then(Cell::as_vec).unwrap();
+        assert_eq!(got_vec.len(), 32);
+        assert_eq!(got_vec, expected_d1.as_ref());
+    }
+
+    #[test]
+    fn test_cold_index_eq_late_populates_hot_cache() {
+        let dir = Temp(std::env::temp_dir().join(format!(
+            "lin-late-idx-cache-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        )));
+        let opts = crate::OpenOpts {
+            sync: crate::persist::SyncMode::Normal,
+            cold: true,
+        };
+        let mut db = Db::open_with(&dir.0, opts).unwrap();
+        db.run("col logs { id: text, svc: text, code: i64 }").unwrap();
+        db.run("index logs [svc]").unwrap();
+        let rows_src: Vec<String> = (0..120)
+            .map(|i| {
+                format!(
+                    r#"{{ id: "l-{i:03}", svc: "{}", code: {} }}"#,
+                    if i % 3 == 0 { "auth" } else { "api" },
+                    200 + (i % 5) * 100
+                )
+            })
+            .collect();
+        db.run(&format!("insert logs [{}]", rows_src.join(",")))
+            .unwrap();
+        db.checkpoint().unwrap();
+        db.close().unwrap();
+
+        let mut db = Db::open_with(&dir.0, opts).unwrap();
+        assert!(db.store.is_disk_backed("logs"));
+        let r1 = db
+            .run(r#"logs | svc == "auth" | code >= 400 | sort id asc | { id, code } | take all"#)
+            .unwrap()
+            .rows
+            .clone();
+        let hits_before = db
+            .store
+            .disk_engine_read()
+            .unwrap()
+            .hot_cache_stats()
+            .sec_query_hits;
+        let r2 = db
+            .run(r#"logs | svc == "auth" | code >= 400 | sort id asc | { id, code } | take all"#)
+            .unwrap()
+            .rows
+            .clone();
+        let hits_after = db
+            .store
+            .disk_engine_read()
+            .unwrap()
+            .hot_cache_stats()
+            .sec_query_hits;
+        assert_eq!(r1, r2);
+        assert!(
+            hits_after > hits_before,
+            "expected HotTierCache sec_query_hits to advance"
+        );
     }
 }

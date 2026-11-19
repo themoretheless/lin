@@ -74,6 +74,15 @@ impl Db {
             return Ok(None);
         };
 
+        if matches!(mode, SearchMode::Vec | SearchMode::Hybrid)
+            && self.store.embed_id != self.catalog.embed_id
+        {
+            return Err(Error::runtime(format!(
+                "embed_id mismatch: store={} catalog={}",
+                self.store.embed_id, self.catalog.embed_id
+            )));
+        }
+
         if mode != SearchMode::Vec && !self.store.fts_indexed(name) {
             return Ok(None);
         }
@@ -723,8 +732,12 @@ impl Db {
         }
     }
 
-    /// Recompute `embedding` for every row in a collection that has a vec field.
+    /// Recompute `embedding` for every row in a collection that has a vec field,
+    /// durably logging the updated vectors and `embed_id` to the WAL when persistent.
     pub fn reembed_collection(&mut self, collection: &str) -> Result<usize, Error> {
+        if self.follower {
+            return Err(Error::runtime("follower is read-only"));
+        }
         let Some(emb) = self.embedder.clone() else {
             return Err(Error::runtime(format!("reembed {collection}: no embedder")));
         };
@@ -737,27 +750,58 @@ impl Db {
                 "reembed requires embedding: {collection}"
             )));
         }
-        self.store.embed_id = emb.id().to_string();
-        self.catalog.set_embed_id(emb.id().to_string());
+        let new_id = emb.id().to_string();
+        self.catalog.set_embed_id(new_id.clone());
         let rows = self.store.collection_mut(collection);
+        for row in rows.iter_mut() {
+            row.remove("embedding");
+        }
+        embed_rows_slice_with(emb.as_ref(), rows);
         let mut n = 0usize;
         for row in rows.iter_mut() {
-            let text = embed::row_embed_text(row);
-            if text.is_empty() {
+            if row
+                .get("embedding")
+                .and_then(crate::store::Cell::as_vec)
+                .is_some()
+            {
+                n += 1;
+            } else {
                 row.insert("embedding", crate::store::Cell::Null);
-                continue;
             }
-            row.insert(
-                "embedding",
-                crate::store::Cell::Vec(emb.embed(&text)),
-            );
-            n += 1;
         }
+        self.store.embed_id = new_id;
         self.store.rebuild_row_maps();
         if self.store.hnsw.contains_key(collection) {
             self.store.build_hnsw(collection, 16, 64);
         }
+        if let Some(p) = self.persist.as_mut() {
+            p.catalog_hash = self.catalog.hash_str().to_string();
+            let updated_rows: Vec<Row> = self
+                .store
+                .collection(collection)
+                .iter()
+                .filter(|r| row_text(r, "id").is_some())
+                .cloned()
+                .collect();
+            if !updated_rows.is_empty() {
+                let pack = crate::persist::Pack::Update {
+                    collection: collection.to_string(),
+                    rows: updated_rows,
+                };
+                self.store.durable_commit(p, pack)?;
+                self.store.r#gen += 1;
+            }
+            crate::persist::write_head(
+                &p.dir,
+                &crate::persist::Head {
+                    r#gen: self.store.r#gen,
+                    catalog_hash: p.catalog_hash.clone(),
+                    embed_id: self.store.embed_id.clone(),
+                },
+            )?;
+        }
         self.clear_plan_cache();
+        self.reader_cache = None;
         Ok(n)
     }
 
@@ -772,6 +816,11 @@ impl Db {
         {
             return;
         }
+        embed_rows_slice_with(emb.as_ref(), rows);
+    }
+}
+
+fn embed_rows_slice_with(emb: &dyn embed::Embedder, rows: &mut [Row]) {
 
         let first_needs = rows.first().is_some_and(|r| {
             r.get("embedding")
@@ -845,5 +894,4 @@ impl Db {
                 rows[i].insert("embedding", crate::store::Cell::Vec(vector));
             }
         }
-    }
 }

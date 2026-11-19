@@ -1486,8 +1486,13 @@ impl DiskEngine {
         }
 
         let tombstones_raw = rmp_serde::to_vec(&self.tombstones).map_err(io_err)?;
+        let mut disk_manifest = self.manifest.clone();
+        disk_manifest.tombstones_crc = Some((
+            tombstones_raw.len() as u64,
+            crate::crc::hardware_crc32c(&tombstones_raw),
+        ));
         let remote_manifest = RemoteColdManifest {
-            disk_manifest: self.manifest.clone(),
+            disk_manifest,
             remote_segs,
             tombstones_raw,
             db_snapshot: db_snapshot.map(|s| s.to_vec()),

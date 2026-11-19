@@ -136,15 +136,22 @@ fn damaged_cold_files_never_crash() {
                     Ok(mut db) => Some(answers(&mut db)),
                 }
             }));
-            // A missing manifest, or a missing, empty or truncated column file, is
-            // detectable from file presence and lengths alone: it must be reported, not
-            // read as missing values. (Zeroed or flipped bytes need checksums, which the
-            // segment format does not carry yet; for those only "no crash" is required.)
+            // Every actual mutation or deletion of manifest.json, tombstones.bin, PK/data
+            // segment files, or corrupted sec_*.ht is caught on open; damaged/missing pruning
+            // hints (.tgram/.zmap/.vivf) and missing sec_*.ht fall back to exact column scans
+            // and must never return wrong answers.
+            let changed = bytes.as_deref() != Some(original.as_slice());
             let name = rel.file_name().unwrap().to_string_lossy().to_string();
-            let must_detect = (name == "manifest.json" && how == "deleted")
-                || (name.starts_with("col_")
-                    && [".val", ".null", ".loc", ".boff", ".dord"].iter().any(|ext| name.ends_with(ext))
-                    && matches!(how, "deleted" | "empty" | "truncated"));
+            let is_hint =
+                name.ends_with(".tgram") || name.ends_with(".zmap") || name.ends_with(".vivf");
+            let is_deleted_sec_idx =
+                name.starts_with("sec_") && name.ends_with(".ht") && how == "deleted";
+            let must_detect = changed
+                && !is_hint
+                && !is_deleted_sec_idx
+                && (name == "manifest.json"
+                    || name == "tombstones.bin"
+                    || rel.starts_with("segments"));
             match outcome {
                 Err(_) => panic!("{what}: panicked"),
                 Ok(None) => detected += 1,
@@ -153,15 +160,8 @@ fn damaged_cold_files_never_crash() {
                 }
                 Ok(Some(got)) => {
                     for ((q, g), w) in QUERIES.iter().zip(&got).zip(&want) {
-                        // Each query either fails or answers as on the undamaged copy, unless
-                        // the damage is in bytes the query never reads.
-                        if let Ok(rows) = g
-                            && rows != w.as_ref().unwrap()
-                        {
-                            // A silently wrong answer: only acceptable when the damaged
-                            // file is not one this query depends on, which cannot be
-                            // decided here; record it.
-                            eprintln!("{what}: {q} answered differently");
+                        if let Ok(rows) = g {
+                            assert_eq!(rows, w.as_ref().unwrap(), "{what}: {q} answered differently");
                         }
                     }
                     if got.iter().any(Result::is_err) {

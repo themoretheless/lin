@@ -33,6 +33,11 @@ pub struct DiskSegment {
 
 impl DiskSegment {
     pub(super) fn open(seg_dir: &Path, meta: SegmentMeta) -> Result<Self, Error> {
+        let corrupt_hints = if !meta.file_crcs.is_empty() {
+            verify_segment_file_crcs(seg_dir, meta.seg_id, &meta.file_crcs)?
+        } else {
+            rustc_hash::FxHashSet::default()
+        };
         let mut cols = Vec::with_capacity(meta.columns.len());
         let mut col_pos = FxHashMap::default();
         for (i, col_schema) in meta.columns.iter().enumerate() {
@@ -40,28 +45,37 @@ impl DiskSegment {
                 DiskColKind::Int64
                 | DiskColKind::Float64
                 | DiskColKind::Bool
-                | DiskColKind::Time64 => MmapCol::Fixed(MmapFixedCol::open(
-                    seg_dir,
-                    &col_schema.name,
-                    col_schema.kind,
-                    meta.row_count,
-                )?),
-                DiskColKind::TextZstd => MmapCol::Text(MmapTextCol::open(
-                    seg_dir,
-                    &col_schema.name,
-                    meta.row_count,
-                )?),
+                | DiskColKind::Time64 => {
+                    let mut fc = MmapFixedCol::open(
+                        seg_dir,
+                        &col_schema.name,
+                        col_schema.kind,
+                        meta.row_count,
+                    )?;
+                    if corrupt_hints.contains(&format!("col_{}.zmap", col_schema.name)) {
+                        fc.clear_zone_map();
+                    }
+                    MmapCol::Fixed(fc)
+                }
+                DiskColKind::TextZstd => {
+                    let mut tc = MmapTextCol::open(seg_dir, &col_schema.name, meta.row_count)?;
+                    if corrupt_hints.contains(&format!("col_{}.tgram", col_schema.name)) {
+                        tc.clear_tgram();
+                    }
+                    MmapCol::Text(tc)
+                }
                 DiskColKind::TextDict => MmapCol::Dict(MmapDictCol::open(
                     seg_dir,
                     &col_schema.name,
                     meta.row_count,
                 )?),
-                DiskColKind::VecF32Sq8 { dim } => MmapCol::Vec(MmapVecCol::open(
-                    seg_dir,
-                    &col_schema.name,
-                    dim,
-                    meta.row_count,
-                )?),
+                DiskColKind::VecF32Sq8 { dim } => {
+                    let mut vc = MmapVecCol::open(seg_dir, &col_schema.name, dim, meta.row_count)?;
+                    if corrupt_hints.contains(&format!("col_{}.vivf", col_schema.name)) {
+                        vc.ivf = None;
+                    }
+                    MmapCol::Vec(vc)
+                }
             };
             col_pos.insert(col_schema.name.clone(), i);
             cols.push((col_schema.name.clone(), mcol));
@@ -149,16 +163,38 @@ impl DiskSegment {
                 ));
             }
         }
-        let mut row = Row::new();
+        let mut present: smallvec::SmallVec<[(&str, Cell); 8]> =
+            smallvec::SmallVec::with_capacity(fields.len());
         for &fname in fields {
             if let Some(&pos) = self.col_pos.get(fname) {
                 let cell = self.cols[pos].1.get_cell(row_id)?;
                 if !matches!(cell, Cell::Null) {
-                    row.insert(fname.to_string(), cell);
+                    present.push((fname, cell));
                 }
             }
         }
-        Ok(row)
+        if present.is_empty() {
+            return Ok(Row::new());
+        }
+        present.sort_by(|a, b| a.0.cmp(b.0));
+        // Keep last value on duplicate field names, matching repeated `Row::insert`.
+        if present.windows(2).any(|w| w[0].0 == w[1].0) {
+            let mut deduped: smallvec::SmallVec<[(&str, Cell); 8]> =
+                smallvec::SmallVec::with_capacity(present.len());
+            for (k, v) in present {
+                if let Some(last) = deduped.last_mut().filter(|(lk, _)| *lk == k) {
+                    last.1 = v;
+                } else {
+                    deduped.push((k, v));
+                }
+            }
+            present = deduped;
+        }
+        let names: smallvec::SmallVec<[&str; 8]> = present.iter().map(|&(k, _)| k).collect();
+        Ok(Row::from_sorted(
+            names.into_iter(),
+            present.into_iter().map(|(_, v)| v),
+        ))
     }
 
     #[inline]
@@ -922,11 +958,73 @@ pub(super) fn write_segment_from(
         }
     }
 
+    let file_crcs = compute_segment_file_crcs(&seg_dir)?;
+
     Ok(SegmentMeta {
         seg_id,
         table: schema.name.clone(),
         row_count,
         columns: seg_columns,
         indexed_fields: schema.indexed_fields.clone(),
+        file_crcs,
     })
+}
+
+fn crc32c_file(path: &Path) -> Result<(u64, u32), Error> {
+    let file = File::open(path).map_err(io_err)?;
+    let len = file.metadata().map_err(io_err)?.len();
+    if len == 0 {
+        return Ok((0, crate::crc::hardware_crc32c(&[])));
+    }
+    // SAFETY: segment files are immutable once written; mapping read-only avoids heap copies.
+    let mmap = unsafe { memmap2::MmapOptions::new().map(&file).map_err(io_err)? };
+    Ok((len, crate::crc::hardware_crc32c(&mmap)))
+}
+
+fn compute_segment_file_crcs(
+    seg_dir: &Path,
+) -> Result<std::collections::BTreeMap<String, (u64, u32)>, Error> {
+    let mut out = std::collections::BTreeMap::new();
+    for entry in fs::read_dir(seg_dir).map_err(io_err)? {
+        let entry = entry.map_err(io_err)?;
+        if entry.file_type().map_err(io_err)?.is_file() {
+            let fname = entry.file_name().to_string_lossy().into_owned();
+            let crc = crc32c_file(&entry.path())?;
+            out.insert(fname, crc);
+        }
+    }
+    Ok(out)
+}
+
+fn verify_segment_file_crcs(
+    seg_dir: &Path,
+    seg_id: u64,
+    expected: &std::collections::BTreeMap<String, (u64, u32)>,
+) -> Result<rustc_hash::FxHashSet<String>, Error> {
+    let mut corrupt_hints = rustc_hash::FxHashSet::default();
+    for (fname, &(exp_len, exp_crc)) in expected {
+        let is_hint =
+            fname.ends_with(".tgram") || fname.ends_with(".zmap") || fname.ends_with(".vivf");
+        let is_sec_idx = fname.starts_with("sec_") && fname.ends_with(".ht");
+        let path = seg_dir.join(fname);
+        if !path.exists() {
+            if is_hint || is_sec_idx {
+                continue;
+            }
+            return Err(Error::runtime(format!(
+                "missing segment file 'seg_{seg_id:08}/{fname}'"
+            )));
+        }
+        let (got_len, got_crc) = crc32c_file(&path)?;
+        if got_len != exp_len || got_crc != exp_crc {
+            if is_hint {
+                corrupt_hints.insert(fname.clone());
+                continue;
+            }
+            return Err(Error::runtime(format!(
+                "corrupt segment file 'seg_{seg_id:08}/{fname}': expected (len={exp_len}, crc={exp_crc:#010x}), got (len={got_len}, crc={got_crc:#010x})"
+            )));
+        }
+    }
+    Ok(corrupt_hints)
 }

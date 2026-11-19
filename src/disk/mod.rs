@@ -110,6 +110,10 @@ pub struct SegmentMeta {
     pub row_count: u32,
     pub columns: Vec<DiskColSchema>,
     pub indexed_fields: Vec<String>,
+    /// `(byte_len, crc32c)` per relative file name inside `segments/seg_XXXXXXXX/`.
+    /// Empty for segments written before per-file checksums were added.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub file_crcs: BTreeMap<String, (u64, u32)>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -120,6 +124,8 @@ pub struct DiskManifest {
     pub embed_id: String,
     pub tables: BTreeMap<String, DiskTableSchema>,
     pub segments: Vec<SegmentMeta>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tombstones_crc: Option<(u64, u32)>,
 }
 
 /// Durable WAL entry for uncommitted/unflushed MemTable mutations.
@@ -1318,6 +1324,7 @@ impl DiskEngine {
                 embed_id: "nomic-embed-text/768".into(),
                 tables: BTreeMap::new(),
                 segments: Vec::new(),
+                tombstones_crc: None,
             };
             let bytes = serde_json::to_vec_pretty(&m).map_err(io_err)?;
             fs::write(&manifest_path, bytes).map_err(io_err)?;
@@ -1325,12 +1332,7 @@ impl DiskEngine {
         };
 
         let tomb_path = dir.join(TOMBSTONES_FILE);
-        let tombstones: SegmentTombstones = if tomb_path.exists() {
-            let bytes = fs::read(&tomb_path).map_err(io_err)?;
-            rmp_serde::from_slice(&bytes).unwrap_or_default()
-        } else {
-            SegmentTombstones::default()
-        };
+        let tombstones = Self::load_verified_tombstones(&tomb_path, manifest.tombstones_crc)?;
 
         let mut segments: BTreeMap<String, Vec<Arc<DiskSegment>>> = BTreeMap::new();
         for seg_meta in &manifest.segments {
@@ -1394,11 +1396,7 @@ impl DiskEngine {
         let manifest: DiskManifest =
             serde_json::from_slice(&fs::read(&manifest_path).map_err(io_err)?).map_err(io_err)?;
         let tomb_path = dir.join(TOMBSTONES_FILE);
-        let tombstones: SegmentTombstones = if tomb_path.exists() {
-            rmp_serde::from_slice(&fs::read(&tomb_path).map_err(io_err)?).unwrap_or_default()
-        } else {
-            SegmentTombstones::default()
-        };
+        let tombstones = Self::load_verified_tombstones(&tomb_path, manifest.tombstones_crc)?;
         let mut segments: BTreeMap<String, Vec<Arc<DiskSegment>>> = BTreeMap::new();
         for seg_meta in &manifest.segments {
             let seg_dir = dir
@@ -2627,22 +2625,48 @@ impl DiskEngine {
         Ok(())
     }
 
+    fn load_verified_tombstones(
+        tomb_path: &Path,
+        expected: Option<(u64, u32)>,
+    ) -> Result<SegmentTombstones, Error> {
+        if !tomb_path.exists() {
+            if expected.is_some() {
+                return Err(Error::runtime(format!(
+                    "missing cold tombstones file '{}'",
+                    tomb_path.display()
+                )));
+            }
+            return Ok(SegmentTombstones::default());
+        }
+        let bytes = fs::read(tomb_path).map_err(io_err)?;
+        if let Some((exp_len, exp_crc)) = expected {
+            let got_len = bytes.len() as u64;
+            let got_crc = crate::crc::hardware_crc32c(&bytes);
+            if got_len != exp_len || got_crc != exp_crc {
+                return Err(Error::runtime(format!(
+                    "corrupt cold tombstones '{}': expected (len={exp_len}, crc={exp_crc:#010x}), got (len={got_len}, crc={got_crc:#010x})",
+                    tomb_path.display()
+                )));
+            }
+        }
+        rmp_serde::from_slice(&bytes)
+            .map_err(|e| Error::runtime(format!("corrupt cold tombstones '{}': {e}", tomb_path.display())))
+    }
+
     pub fn save_tombstones_and_manifest(&self) -> Result<(), Error> {
         let tomb_tmp = self.dir.join("tombstones.bin.tmp");
         let tomb_bytes = rmp_serde::to_vec(&self.tombstones).map_err(io_err)?;
+        let tomb_crc = (tomb_bytes.len() as u64, crate::crc::hardware_crc32c(&tomb_bytes));
         fs::write(&tomb_tmp, tomb_bytes).map_err(io_err)?;
         fs::rename(&tomb_tmp, self.dir.join(TOMBSTONES_FILE)).map_err(io_err)?;
 
         let man_tmp = self.dir.join("manifest.json.tmp");
-        let man_bytes = if self.manifest.version < DISK_FORMAT_VERSION {
-            // Stamp the format actually written without mutating the in-memory manifest
-            // of a `&self` engine; the next open reads the upgraded version.
-            let mut upgraded = self.manifest.clone();
-            upgraded.version = DISK_FORMAT_VERSION;
-            serde_json::to_vec_pretty(&upgraded).map_err(io_err)?
-        } else {
-            serde_json::to_vec_pretty(&self.manifest).map_err(io_err)?
-        };
+        let mut stamped = self.manifest.clone();
+        if stamped.version < DISK_FORMAT_VERSION {
+            stamped.version = DISK_FORMAT_VERSION;
+        }
+        stamped.tombstones_crc = Some(tomb_crc);
+        let man_bytes = serde_json::to_vec_pretty(&stamped).map_err(io_err)?;
         fs::write(&man_tmp, man_bytes).map_err(io_err)?;
         fs::rename(&man_tmp, self.dir.join(MANIFEST_FILE)).map_err(io_err)?;
         Ok(())
@@ -3730,23 +3754,52 @@ impl DiskEngine {
         if !encode_index_cell_key(key, &mut kbuf) {
             return Ok(true);
         }
+        let cacheable = seen_seg.is_empty()
+            && seen_mem.is_empty()
+            && !crate::eval::pred_needs_now(pred);
+        let qhash = if cacheable {
+            use std::hash::{Hash, Hasher};
+            let mut h = rustc_hash::FxHasher::default();
+            0x4c41_5445_4944_5801u64.hash(&mut h);
+            table.hash(&mut h);
+            field.hash(&mut h);
+            kbuf.hash(&mut h);
+            pred.hash(&mut h);
+            out_fields.hash(&mut h);
+            h.finish()
+        } else {
+            0
+        };
+        if cacheable
+            && let Some(cached) = self.hot_cache.get_sec_query(self.query_cache_gen(), qhash)
+        {
+            for row in cached.iter() {
+                if !visit(row.clone()) {
+                    return Ok(false);
+                }
+            }
+            return Ok(true);
+        }
+        let max_cached_rows = 4096usize;
+        let mut collected: Option<Vec<Row>> = cacheable.then(Vec::new);
+
         if let Some(mt) = self.memtables.get(table) {
             let mut on_mem = |idx: usize, row: &Row| -> bool {
                 if !seen_mem.insert(idx) || !crate::eval::eval_pred(pred, row, now_ms) {
                     return true;
                 }
-                visit(match out_fields {
+                let out_row = match out_fields {
                     None => row.clone(),
-                    Some(fs) => {
-                        let mut pr = Row::new();
-                        for &f in fs {
-                            if let Some(c) = row.get(f) {
-                                pr.insert(f.to_string(), c.clone());
-                            }
-                        }
-                        pr
+                    Some(fs) => Self::project_cached_row(row, fs),
+                };
+                if let Some(buf) = collected.as_mut() {
+                    if buf.len() < max_cached_rows {
+                        buf.push(out_row.clone());
+                    } else {
+                        collected = None;
                     }
-                })
+                }
+                visit(out_row)
             };
             if let Some(fmap) = mt.sec.get(field) {
                 if let Some(idxs) = fmap.get(&kbuf) {
@@ -3787,10 +3840,18 @@ impl DiskEngine {
                     if !hit {
                         return Ok(true);
                     }
-                    Ok(visit(match out_fields {
+                    let out_row = match out_fields {
                         Some(fs) => seg.materialize_projected(rid, fs)?,
                         None => seg.materialize_row(rid)?,
-                    }))
+                    };
+                    if let Some(buf) = collected.as_mut() {
+                        if buf.len() < max_cached_rows {
+                            buf.push(out_row.clone());
+                        } else {
+                            collected = None;
+                        }
+                    }
+                    Ok(visit(out_row))
                 };
                 if let Some(sec_idx) = seg.sec_indexes.get(field) {
                     let mut matches = Vec::new();
@@ -3817,6 +3878,10 @@ impl DiskEngine {
                     }
                 }
             }
+        }
+        if let Some(buf) = collected {
+            self.hot_cache
+                .put_sec_query(self.query_cache_gen(), qhash, Arc::from(buf));
         }
         Ok(true)
     }

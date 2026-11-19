@@ -488,7 +488,10 @@ impl Store {
     /// Project hot docs fields from parallel columns — Arc clone only, no full row clone.
     /// True when orders SoA matches `collections["orders"]` length.
     pub fn orders_soa_ready(&self) -> bool {
-        let n = self.collection("orders").len();
+        if self.is_disk_backed("orders") {
+            return false;
+        }
+        let n = self.collections.get("orders").map_or(0, Vec::len);
         self.orders_id.len() == n
             && self.orders_user_id.len() == n
             && self.orders_total.len() == n
@@ -497,7 +500,10 @@ impl Store {
 
     /// True when users SoA matches `collections["users"]` length.
     pub fn users_soa_ready(&self) -> bool {
-        let n = self.collection("users").len();
+        if self.is_disk_backed("users") {
+            return false;
+        }
+        let n = self.collections.get("users").map_or(0, Vec::len);
         self.users_id.len() == n && self.users_email.len() == n
     }
 

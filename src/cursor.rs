@@ -64,9 +64,35 @@ impl ProjectedRow {
     }
 
     pub fn into_row(self) -> Row {
+        if self.fields.is_empty() || self.cells.is_empty() {
+            return Row::new();
+        }
+        if self.fields.len() == self.cells.len()
+            && self.fields.windows(2).all(|w| w[0] < w[1])
+        {
+            return Row::from_sorted(self.fields.iter().map(String::as_str), self.cells);
+        }
+        let w = self.fields.len();
+        if w == self.cells.len()
+            && w <= 8
+            && (0..w).all(|i| (i + 1..w).all(|j| self.fields[i] != self.fields[j]))
+        {
+            let shape = Row::shape_of(&self.fields);
+            let mut src_cells = self.cells;
+            let mut ordered: SmallVec<[Cell; 8]> = SmallVec::with_capacity(w);
+            for target in shape.names() {
+                let pos = self
+                    .fields
+                    .iter()
+                    .position(|f| f == target)
+                    .unwrap_or(0);
+                ordered.push(std::mem::replace(&mut src_cells[pos], Cell::Null));
+            }
+            return Row::from_parts(shape, ordered);
+        }
         let mut row = crate::store::acquire_row();
-        for (f, c) in self.fields.iter().cloned().zip(self.cells) {
-            row.insert(f, c);
+        for (f, c) in self.fields.iter().zip(self.cells) {
+            row.insert(f.as_str(), c);
         }
         row
     }
@@ -396,6 +422,9 @@ struct LazyJoinCursor {
     right_probe: Option<FxHashMap<String, Vec<Cell>>>,
     join_plan: Option<Vec<JoinFieldPlan>>,
     left_fields: Option<Vec<String>>,
+    right_on_disk: bool,
+    right_proj_fields: Option<Vec<String>>,
+    disk_right_memo: FxHashMap<String, Option<Row>>,
     skip_left: usize,
     take_left: Option<usize>,
     pending: VecDeque<Row>,
@@ -718,6 +747,61 @@ fn next_lazy_join(store: &Store, join: &mut LazyJoinCursor) -> Option<Result<Row
                 continue;
             }
             let out = emit_join_row(&left_row, right_cells, plan);
+            if join.skip_left > 0 {
+                join.skip_left -= 1;
+                continue;
+            }
+            if let Some(t) = join.take_left.as_mut() {
+                *t = t.saturating_sub(1);
+            }
+            return Some(Ok(out));
+        }
+
+        if join.to_field == "id" && join.right_on_disk {
+            let owned_right: Option<Row> = match key {
+                None => None,
+                Some(k) => {
+                    if let Some(cached) = join.disk_right_memo.get(k) {
+                        cached.clone()
+                    } else {
+                        let Some(eng) = store.disk_engine_read() else {
+                            return Some(Err(Error::runtime("disk engine unavailable")));
+                        };
+                        let fetched = match &join.right_proj_fields {
+                            Some(rfs) => {
+                                let refs: SmallVec<[&str; 8]> =
+                                    rfs.iter().map(String::as_str).collect();
+                                eng.get_projected_by_id(&join.right_col, k, &refs)
+                            }
+                            None => eng
+                                .get_arc_by_id(&join.right_col, k)
+                                .map(|opt| opt.map(|arc| (*arc).clone())),
+                        };
+                        let row_opt = match fetched {
+                            Ok(r) => r,
+                            Err(e) => return Some(Err(e)),
+                        };
+                        if join.disk_right_memo.len() < 8192 {
+                            join.disk_right_memo.insert(k.to_string(), row_opt.clone());
+                        }
+                        row_opt
+                    }
+                }
+            };
+            if owned_right.is_none() && !join.left_join {
+                continue;
+            }
+            let out = if let Some(fields) = join.project.as_deref() {
+                project_join_fields(&left_row, owned_right.as_ref(), &join.right_col, fields)
+            } else if let Some(r) = owned_right {
+                let mut merged = left_row;
+                for (k, v) in r {
+                    crate::exec::insert_prefixed(&mut merged, &join.right_col, &k, v);
+                }
+                merged
+            } else {
+                left_row
+            };
             if join.skip_left > 0 {
                 join.skip_left -= 1;
                 continue;
@@ -1687,11 +1771,18 @@ fn try_lazy_join(db: &CursorDb<'_>, q: &Query) -> Result<Option<LazyJoinCursor>,
     };
 
     let (store, catalog) = db.store_catalog();
+    if store.is_disk_backed(name) {
+        return Ok(None);
+    }
+    let right_on_disk = store.is_disk_backed(&right_col);
     let now = now_ms();
     let to_field = catalog
         .find_fk(name, &on, &right_col)
         .map(|fk| fk.to_field.clone())
         .unwrap_or_else(|| "id".into());
+    if right_on_disk && to_field != "id" {
+        return Ok(None);
+    }
 
     let take_left = match take_n {
         Some(Some(n)) => Some(n.max(0) as usize),
@@ -1701,10 +1792,11 @@ fn try_lazy_join(db: &CursorDb<'_>, q: &Query) -> Result<Option<LazyJoinCursor>,
     let (source, need_filter) = build_left_source(store, catalog, name, filter, now);
 
     // When `to_field == "id"`, `next_lazy_join` already uses `store.get_by_id(&join.right_col, k)`
-    // in O(1) via `row_by_id`, so we avoid building an O(R) `FxHashMap` on every `cursor()` call!
-    let (right_probe, join_plan, left_fields) = if to_field == "id" {
+    // in O(1) via `row_by_id` (or `DiskEngine` point reads when `right_on_disk`), so we avoid
+    // building an O(R) `FxHashMap` on every `cursor()` call!
+    let (right_probe, join_plan, left_fields, right_proj_fields) = if to_field == "id" {
         if let Some(ref fields) = project {
-            let (_right_fields, plan) = plan_join_fields(&right_col, fields);
+            let (right_fields, plan) = plan_join_fields(&right_col, fields);
             let mut left_fields: Vec<String> = plan
                 .iter()
                 .filter_map(|p| match p {
@@ -1715,12 +1807,13 @@ fn try_lazy_join(db: &CursorDb<'_>, q: &Query) -> Result<Option<LazyJoinCursor>,
             if !left_fields.iter().any(|f| f == &on) {
                 left_fields.push(on.clone());
             }
-            (None, None, Some(left_fields))
+            let r_proj = right_on_disk.then_some(right_fields);
+            (None, None, Some(left_fields), r_proj)
         } else {
-            (None, None, None)
+            (None, None, None, None)
         }
     } else {
-        (None, None, None)
+        (None, None, None, None)
     };
 
     Ok(Some(LazyJoinCursor {
@@ -1743,6 +1836,9 @@ fn try_lazy_join(db: &CursorDb<'_>, q: &Query) -> Result<Option<LazyJoinCursor>,
         right_probe,
         join_plan,
         left_fields,
+        right_on_disk,
+        right_proj_fields,
+        disk_right_memo: FxHashMap::default(),
         skip_left: skip_n,
         take_left,
         pending: VecDeque::new(),

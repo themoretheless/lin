@@ -124,6 +124,10 @@ impl MmapTextCol {
         })
     }
 
+    pub(super) fn clear_tgram(&mut self) {
+        self.tgram = None;
+    }
+
     #[inline]
     pub(super) fn get_loc(&self, row_id: u32) -> Option<(u32, u32, u32)> {
         if row_id >= self.row_count {
@@ -1269,6 +1273,10 @@ impl MmapFixedCol {
             row_count,
             zone_map,
         })
+    }
+
+    pub(super) fn clear_zone_map(&mut self) {
+        self.zone_map = OnceLock::new();
     }
 
     #[inline]

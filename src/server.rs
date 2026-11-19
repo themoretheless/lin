@@ -1443,12 +1443,10 @@ fn handle_pull_sync(mut cur: &[u8], state: &Arc<ServerState>) -> Result<Vec<u8>,
     let since_gen = read_u64_le(&mut cur).map_err(|e| (ERR_RUNTIME, e.to_string()))?;
     let force_bootstrap = read_u8(&mut cur).map_err(|e| (ERR_RUNTIME, e.to_string()))? != 0;
 
-    // Idle follower polls answer from the published generation and stay off the writer
-    // mutex; `refresh_reader_locked` publishes it after every mutation.
-    if !force_bootstrap
-        && let Ok(published) = state.gen_state.lock().map(|g| *g)
-        && since_gen >= published
-    {
+    // Idle follower polls answer from the published atomic generation and stay off both
+    // `gen_state` and the writer mutex; `refresh_reader_locked` publishes it after every mutation.
+    let published = state.current_gen();
+    if !force_bootstrap && since_gen >= published {
         let mut out = Vec::with_capacity(16);
         out.push(0);
         out.push(0); // UpToDate

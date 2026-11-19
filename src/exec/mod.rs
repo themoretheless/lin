@@ -467,15 +467,23 @@ impl Db {
         self.gpu.as_ref().map(|g| g.adapter_report())
     }
 
-    /// Replace the active embedder. Updates `store.embed_id` / catalog to match.
+    /// Replace the active embedder. Updates `catalog.embed_id`, and updates `store.embed_id`
+    /// immediately when no vector-bearing collection currently holds stored rows (otherwise
+    /// `store.embed_id` remains at the stored vectors' model until [`Self::reembed_collection`]
+    /// recomputes them, so vector search refuses mixed-model queries).
     pub fn with_embedder(mut self, embedder: Arc<dyn Embedder>) -> Self {
-        self.catalog.set_embed_id(embedder.id().to_string());
-        self.store.embed_id = embedder.id().to_string();
-        // The embedder id is part of the catalog hash written to `head`; keep the cached
-        // hash in step, or `head` pairs the new id with the old hash and the database
-        // refuses to reopen.
-        if let Some(p) = self.persist.as_mut() {
-            p.catalog_hash = self.catalog.hash_str().to_string();
+        let new_id = embedder.id().to_string();
+        let has_stored_vec_rows = self
+            .catalog
+            .collections
+            .iter()
+            .any(|(name, col)| col.has_vec() && self.store.get_col_count(name) > 0);
+        self.catalog.set_embed_id(new_id.clone());
+        if !has_stored_vec_rows || self.store.embed_id == new_id {
+            self.store.embed_id = new_id;
+            if let Some(p) = self.persist.as_mut() {
+                p.catalog_hash = self.catalog.hash_str().to_string();
+            }
         }
         self.embedder = Some(embedder);
         self.clear_plan_cache();
