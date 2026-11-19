@@ -20,6 +20,7 @@ fn canonical(rows: &[lin::Row], fields: &[String]) -> Value {
                             };
                             match cell {
                                 Some(Cell::Text(v)) => json!(v.as_ref()),
+                                Some(Cell::SmallText(v)) => json!(v.as_str()),
                                 Some(Cell::Int(v)) | Some(Cell::Time(v)) => json!(v),
                                 Some(Cell::Float(v)) => json!(v),
                                 Some(Cell::Bool(v)) => json!(v),
@@ -70,6 +71,7 @@ fn measure_insert(
     n: usize,
     samples: usize,
     timestamp: i64,
+    durable: Option<&std::path::Path>,
 ) -> Result<Value, Box<dyn std::error::Error>> {
     if n == 0 || samples == 0 {
         return Err("empty insert measurement".into());
@@ -105,8 +107,14 @@ fn measure_insert(
     let fields = ["id", "uri", "wing", "title", "ts", "body"].map(String::from);
     let mut timings = Vec::with_capacity(samples);
     let mut result = Value::Null;
+    let mut reopen_ns = Vec::new();
+    let mut wal_bytes = Vec::new();
+    let mut embedding_hash = None;
     for _ in 0..samples {
-        let mut db = Db::empty();
+        let mut db = match durable {
+            Some(path) => Db::open_with(path, lin::OpenOpts { sync: lin::SyncMode::Full, cold: false })?,
+            None => Db::empty(),
+        };
         db.run("index docs [wing, ts]")?;
         let prepared = sources
             .iter()
@@ -128,6 +136,42 @@ fn measure_insert(
         if affected != n {
             return Err("insert affected count mismatch".into());
         }
+        if let Some(path) = durable {
+            let recovery_dir = path.join("recovery");
+            std::fs::create_dir(&recovery_dir)?;
+            let log = lin::persist::log_path(path);
+            wal_bytes.push(log.metadata()?.len());
+            std::fs::copy(&log, lin::persist::log_path(&recovery_dir))?;
+            let head = lin::persist::head_path(path);
+            if head.exists() {
+                std::fs::copy(&head, lin::persist::head_path(&recovery_dir))?;
+            }
+            let snapshot = lin::persist::snapshot_path(path);
+            if snapshot.exists() {
+                std::fs::copy(&snapshot, lin::persist::snapshot_path(&recovery_dir))?;
+            }
+            let reopen = Instant::now();
+            let recovered = Db::open(&recovery_dir)?;
+            reopen_ns.push(reopen.elapsed().as_nanos() as u64);
+            let recovered_rows = recovered.store.collection("docs");
+            if canonical(recovered_rows, &fields) != Value::Array(expected.clone()) {
+                return Err("WAL recovery exact values mismatch".into());
+            }
+            use std::hash::Hasher;
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            for row in recovered_rows {
+                let vector = row.get("embedding").and_then(Cell::as_vec).ok_or("recovered embedding missing")?;
+                hasher.write_usize(vector.len());
+                for value in vector {
+                    hasher.write_u32(value.to_bits());
+                }
+            }
+            embedding_hash = Some(hasher.finish());
+            drop(recovered);
+            std::fs::remove_dir_all(recovery_dir)?;
+            db.close()?;
+            db = Db::open(path)?;
+        }
         let rows = db.store.collection("docs");
         if rows.len() != n
             || rows
@@ -141,7 +185,7 @@ fn measure_insert(
             return Err("insert exact values mismatch".into());
         }
     }
-    Ok(json!({"samples_ns":timings,"result":result,
+    Ok(json!({"samples_ns":timings,"result":result,"reopen_ns":reopen_ns,"wal_bytes":wal_bytes,"embedding_hash":embedding_hash,
         "statement_rows_limit":10_000,"statements":sources.len(),
         "api":if sources.len()==1 {"prepared run"} else {"prepared chunks in one memory transaction"}}))
 }
@@ -157,10 +201,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let timestamp = request["timestamp_ms"]
                 .as_i64()
                 .ok_or("timestamp missing")?;
+            let durable = request.get("durable_dir").and_then(Value::as_str).map(std::path::Path::new);
+            if durable.is_some() && (samples != 1 || n > 10_000) {
+                return Err("durable INSERT needs one sample of at most 10,000 rows per fresh directory".into());
+            }
             writeln!(
                 out,
                 "{}",
-                measure_insert(n as usize, samples as usize, timestamp)?
+                measure_insert(n as usize, samples as usize, timestamp, durable)?
             )?;
         } else if request.get("worker_version").and_then(Value::as_bool) == Some(true) {
             writeln!(out, "{}", json!({"version":lin::VERSION}))?;
@@ -207,7 +255,7 @@ mod tests {
     fn hundred_thousand_native_rows_respect_default_statement_quotas() {
         // A single AST for this fixture exceeds the default 8 MiB quota.
         // Exact six-field readback and default embeddings are checked by measure_insert.
-        let measured = measure_insert(100_000, 1, 123456).unwrap();
+        let measured = measure_insert(100_000, 1, 123456, None).unwrap();
         assert_eq!(measured["statements"], 10);
         assert_eq!(measured["samples_ns"].as_array().unwrap().len(), 1);
         assert_eq!(measured["result"].as_array().unwrap().len(), 100_000);

@@ -1,0 +1,37 @@
+name: Current local main WAL FULL benchmark
+on:
+  push:
+    branches: [codex/wal-refresh-20261126]
+permissions:
+  contents: read
+jobs:
+  measure:
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-22.04, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.96.0'
+      - name: Build locked release worker
+        run: cargo build --locked --release -p lin-peer-worker
+      - name: Measure WAL FULL with paired controls
+        run: |
+          set -o pipefail
+          git rev-parse HEAD > wal-provenance.txt
+          uname -a >> wal-provenance.txt
+          lscpu >> wal-provenance.txt
+          rustc -Vv >> wal-provenance.txt
+          sha256sum target/release/lin-peer-worker >> wal-provenance.txt
+          python3 scripts/bench-wal-refresh.py target/release/lin-peer-worker scripts/bench-wal-full.py wal-results.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: wal-refresh-linux-${{ matrix.runner }}
+          path: |
+            wal-results.json
+            wal-provenance.txt
