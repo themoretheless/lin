@@ -1,0 +1,168 @@
+commit fdcba6411ae21a961e316e97220e0c6a673a0675
+Author: Denis Mezhov <d.o.mezhov@gmail.com>
+Date:   Wed Nov 18 16:14:48 2026 +0400
+
+    Profile WAL FULL insert phases on Linux
+
+diff --git a/src/exec/dml.rs b/src/exec/dml.rs
+index 01fb5a87c..51149cd8a 100644
+--- a/src/exec/dml.rs
++++ b/src/exec/dml.rs
+@@ -962,8 +962,10 @@ impl Db {
+         } else {
+             None
+         };
++        let phase_start = std::time::Instant::now();
+         let (built, all_uniform, all_embedded, lossless_cols) =
+             build_insert_rows(records, now, needs_embed, hashing_dim);
++        eprintln!("INSERT_BUILD {} {} {}", built.len(), phase_start.elapsed().as_nanos(), all_embedded);
+         // Any record without an explicit id gets a generated one, wherever it sits in the
+         // batch (deciding from the first record left later id-less rows without an id).
+         let needs_id = records.is_empty()
+@@ -1025,6 +1027,7 @@ impl Db {
+             None
+         };
+ 
++        let check_start = std::time::Instant::now();
+         let fast_checked = if let Some(records) = records
+             && all_uniform
+             && !needs_id
+@@ -1090,9 +1093,12 @@ impl Db {
+                 }
+             }
+         }
++        let check_ns = check_start.elapsed().as_nanos();
++        let embed_start = std::time::Instant::now();
+         if !all_embedded {
+             self.maybe_embed_rows(collection, &mut built);
+         }
++        eprintln!("INSERT_CHECK {} {} {}", n, check_ns, embed_start.elapsed().as_nanos());
+ 
+         let mut new_edges = Vec::with_capacity(edges.len());
+         if let Some(first) = built.first()
+@@ -1174,7 +1180,11 @@ impl Db {
+                 bytes,
+                 mode,
+             );
++            let phase_start = std::time::Instant::now();
+             let maintenance = self.maintain_insert_slab(collection, start, &shared);
++            let maintenance_ns = phase_start.elapsed().as_nanos();
++            let phase_start = std::time::Instant::now();
++            let asynchronous = task.is_ok();
+             let staged = match task {
+                 Ok(reply) => reply.recv().unwrap_or_else(|_| {
+                     crate::persist::prepare_insert_columns_ext(
+@@ -1193,6 +1203,7 @@ impl Db {
+                     job.encode()
+                 }
+             };
++            eprintln!("WAL_CRITICAL {} pooled {} {} {}", n, asynchronous, maintenance_ns, phase_start.elapsed().as_nanos());
+             built = Arc::try_unwrap(shared).expect("encoder retained input after reply");
+             maintenance?;
+             Some(staged)
+@@ -1323,7 +1334,11 @@ impl Db {
+                 }
+                 let _guard = DirectEncGuard(&task);
+                 let _ = tx.try_send(std::sync::Arc::clone(&task));
++                let phase_start = std::time::Instant::now();
+                 let maint = self.maintain_insert_slab(collection, start, built_ref);
++                let maintenance_ns = phase_start.elapsed().as_nanos();
++                let phase_start = std::time::Instant::now();
++                let mut asynchronous = false;
+                 let direct = if task
+                     .state
+                     .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
+@@ -1345,6 +1360,7 @@ impl Db {
+                     );
+                     (res, buf)
+                 } else {
++                    asynchronous = true;
+                     for _ in 0..64 {
+                         if task.done.load(Ordering::Acquire) {
+                             break;
+@@ -1363,6 +1379,7 @@ impl Db {
+                         .and_then(|mut g| g.take())
+                         .unwrap_or((None, Vec::new()))
+                 };
++                eprintln!("WAL_CRITICAL {} direct {} {} {}", n, asynchronous, maintenance_ns, phase_start.elapsed().as_nanos());
+                 (maint, direct)
+             } else {
+                 let maint = self.maintain_insert_slab(collection, start, built_ref);
+@@ -2236,6 +2253,8 @@ fn build_batch_shape_rows_into(
+     let mut first_kinds = [0u8; 32];
+     let mut have_first_kinds = false;
+ 
++    let mut embed_ns = 0;
++    let mut embed_count = 0;
+     let mut process_rows = |mut embed_batch: Option<&mut crate::embed::HashingBatch<'_>>| {
+         for (slot_out, record) in out.iter_mut().zip(records) {
+             let same_shape = record.fields.len() == first.fields.len()
+@@ -2282,7 +2301,11 @@ fn build_batch_shape_rows_into(
+                     }
+                 };
+                 if all_embedded && t_str.or(b_str).or(s_str).is_some_and(|s| !s.is_empty()) {
+-                    Some(batch.embed_parts([t_str, b_str, s_str]))
++                    let start = std::time::Instant::now();
++                    let vector = batch.embed_parts([t_str, b_str, s_str]);
++                    embed_ns += start.elapsed().as_nanos();
++                    embed_count += 1;
++                    Some(vector)
+                 } else {
+                     all_embedded = false;
+                     None
+@@ -2371,6 +2394,9 @@ fn build_batch_shape_rows_into(
+     } else {
+         process_rows(None);
+     }
++    if embed_count > 0 {
++        eprintln!("INSERT_HASH_CHUNK {} {} {}", records.len(), embed_count, embed_ns);
++    }
+     (all_same, all_embedded, lossless_cols && all_same)
+ }
+ 
+diff --git a/src/persist/codec.rs b/src/persist/codec.rs
+index 1dc3e041c..ea2875920 100644
+--- a/src/persist/codec.rs
++++ b/src/persist/codec.rs
+@@ -1541,6 +1541,20 @@ pub(crate) fn encode_insert_rows_direct_ext(
+     rows: &[Row],
+     uniform_keys: bool,
+     buf: &mut Vec<u8>,
++) -> Option<([u8; 4], Vec<String>)> {
++    let start = std::time::Instant::now();
++    let result = encode_insert_rows_direct_profile_inner(rec_gen, next_id, collection, rows, uniform_keys, buf);
++    eprintln!("WAL_ENCODE {} {} {} {}", rows.len(), start.elapsed().as_nanos(), result.is_some(), buf.len());
++    result
++}
++
++fn encode_insert_rows_direct_profile_inner(
++    rec_gen: u64,
++    next_id: u64,
++    collection: &str,
++    rows: &[Row],
++    uniform_keys: bool,
++    buf: &mut Vec<u8>,
+ ) -> Option<([u8; 4], Vec<String>)> {
+     if rows.is_empty() {
+         return None;
+diff --git a/src/persist/wal.rs b/src/persist/wal.rs
+index 8560d8376..1d24d3512 100644
+--- a/src/persist/wal.rs
++++ b/src/persist/wal.rs
+@@ -601,11 +601,16 @@ pub(crate) fn write_frame_precomputed(
+         return Err(io_err("log record exceeds 16MiB"));
+     };
+     let codec = magic[3];
++    let start = std::time::Instant::now();
+     write_frame_bytes(log, codec, payload, checksum, len as u32).map_err(io_err)?;
++    let write_ns = start.elapsed().as_nanos();
+ 
++    let start = std::time::Instant::now();
+     if sync == SyncMode::Full {
+         durable_sync(log).map_err(io_err)?;
+     }
++    let sync_ns = start.elapsed().as_nanos();
++    eprintln!("WAL_FRAME {} {} {} {:?}", payload.len(), write_ns, sync_ns, sync);
+     *log_bytes += 8 + len as u64;
+     Ok(())
+ }
