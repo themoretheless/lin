@@ -538,6 +538,148 @@ impl<'p> PredSlots<'p> {
     }
 }
 
+/// Owned, lifetime-free counterpart of [`PredSlots`] for [`crate::Prepared`] and [`crate::QueryCursor`].
+#[derive(Clone, Debug)]
+pub(crate) struct OwnedPredSlots {
+    tree: OwnedSlotNode,
+    slots: Vec<crate::store::row::OwnedFieldSlot>,
+}
+
+#[derive(Clone, Debug)]
+enum OwnedSlotNode {
+    And(Vec<OwnedSlotNode>),
+    Or(Vec<OwnedSlotNode>),
+    Not(Box<OwnedSlotNode>),
+    Leaf(Pred, usize),
+    ByName(Pred),
+}
+
+impl OwnedPredSlots {
+    pub(crate) fn new(pred: &Pred) -> Self {
+        fn build(
+            pred: &Pred,
+            slots: &mut Vec<crate::store::row::OwnedFieldSlot>,
+        ) -> (OwnedSlotNode, u32) {
+            match pred {
+                Pred::And(..) => {
+                    let mut terms = Vec::new();
+                    let mut stack = vec![pred];
+                    while let Some(p) = stack.pop() {
+                        if let Pred::And(a, b) = p {
+                            stack.push(b);
+                            stack.push(a);
+                        } else {
+                            terms.push(p);
+                        }
+                    }
+                    let mut built: Vec<(OwnedSlotNode, u32)> =
+                        terms.into_iter().map(|t| build(t, slots)).collect();
+                    built.sort_by_key(|&(_, c)| c);
+                    let total_cost = built
+                        .iter()
+                        .fold(0u32, |acc, &(_, c)| acc.saturating_add(c))
+                        .max(1);
+                    let nodes = built.into_iter().map(|(n, _)| n).collect();
+                    (OwnedSlotNode::And(nodes), total_cost)
+                }
+                Pred::Or(..) => {
+                    let mut terms = Vec::new();
+                    let mut stack = vec![pred];
+                    while let Some(p) = stack.pop() {
+                        if let Pred::Or(a, b) = p {
+                            stack.push(b);
+                            stack.push(a);
+                        } else {
+                            terms.push(p);
+                        }
+                    }
+                    let mut built: Vec<(OwnedSlotNode, u32)> =
+                        terms.into_iter().map(|t| build(t, slots)).collect();
+                    built.sort_by_key(|&(_, c)| c);
+                    let total_cost = built
+                        .iter()
+                        .fold(0u32, |acc, &(_, c)| acc.saturating_add(c))
+                        .saturating_add(2);
+                    let nodes = built.into_iter().map(|(n, _)| n).collect();
+                    (OwnedSlotNode::Or(nodes), total_cost)
+                }
+                Pred::Not(inner) => {
+                    let (node, cost) = build(inner, slots);
+                    (OwnedSlotNode::Not(Box::new(node)), cost)
+                }
+                Pred::IsNull { field, .. }
+                | Pred::In { field, .. }
+                | Pred::Cmp { field, .. }
+                | Pred::Has { field, .. }
+                | Pred::Contains { field, .. }
+                | Pred::Regex { field, .. } => {
+                    let cost = pred_leaf_cost(pred);
+                    match field.leaf() {
+                        Some(name) => {
+                            let at = match slots.iter().position(|s| s.key() == name) {
+                                Some(at) => at,
+                                None => {
+                                    slots.push(crate::store::row::OwnedFieldSlot::new(name));
+                                    slots.len() - 1
+                                }
+                            };
+                            (OwnedSlotNode::Leaf(pred.clone(), at), cost)
+                        }
+                        None => (OwnedSlotNode::ByName(pred.clone()), cost.saturating_add(10)),
+                    }
+                }
+            }
+        }
+        let mut slots = Vec::new();
+        let (tree, _) = build(pred, &mut slots);
+        OwnedPredSlots { tree, slots }
+    }
+
+    #[inline]
+    pub(crate) fn eval(&mut self, row: &Row, now: i64) -> bool {
+        fn go(
+            node: &OwnedSlotNode,
+            slots: &mut [crate::store::row::OwnedFieldSlot],
+            row: &Row,
+            now: i64,
+        ) -> bool {
+            static NULL: Cell = Cell::Null;
+            match node {
+                OwnedSlotNode::And(parts) => parts.iter().all(|c| go(c, slots, row, now)),
+                OwnedSlotNode::Or(parts) => parts.iter().any(|c| go(c, slots, row, now)),
+                OwnedSlotNode::Not(inner) => !go(inner, slots, row, now),
+                OwnedSlotNode::Leaf(pred, at) => {
+                    eval_leaf(pred, slots[*at].get(row).unwrap_or(&NULL), now)
+                }
+                OwnedSlotNode::ByName(pred) => eval_pred(pred, row, now),
+            }
+        }
+        go(&self.tree, &mut self.slots, row, now)
+    }
+
+    #[inline]
+    pub(crate) fn eval_sync(&self, row: &Row, now: i64) -> bool {
+        fn go(
+            node: &OwnedSlotNode,
+            slots: &[crate::store::row::OwnedFieldSlot],
+            row: &Row,
+            now: i64,
+        ) -> bool {
+            static NULL: Cell = Cell::Null;
+            match node {
+                OwnedSlotNode::And(parts) => parts.iter().all(|c| go(c, slots, row, now)),
+                OwnedSlotNode::Or(parts) => parts.iter().any(|c| go(c, slots, row, now)),
+                OwnedSlotNode::Not(inner) => !go(inner, slots, row, now),
+                OwnedSlotNode::Leaf(pred, at) => {
+                    eval_leaf(pred, slots[*at].get_sync(row).unwrap_or(&NULL), now)
+                }
+                OwnedSlotNode::ByName(pred) => eval_pred(pred, row, now),
+            }
+        }
+        go(&self.tree, &self.slots, row, now)
+    }
+}
+
 pub(crate) fn text_contains(hay: &str, needle: &str) -> bool {
     if needle.is_empty() {
         return true;

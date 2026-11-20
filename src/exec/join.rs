@@ -195,7 +195,21 @@ pub(crate) fn rows_to_rough_batch(rows: &[Row]) -> RecordBatch {
     if rows.is_empty() {
         return RecordBatch::empty(Arc::<[String]>::from(Vec::<String>::new()));
     }
-    let names: Vec<String> = rows[0].keys().cloned().collect();
+    let names: Vec<String> = if let Some(s0) = rows[0].shape_arc()
+        && rows
+            .iter()
+            .all(|r| r.shape_arc().is_some_and(|rs| Arc::ptr_eq(rs, s0)))
+    {
+        s0.names().to_vec()
+    } else {
+        let mut set = std::collections::BTreeSet::new();
+        for r in rows {
+            for k in r.keys() {
+                set.insert(k.as_str());
+            }
+        }
+        set.into_iter().map(str::to_string).collect()
+    };
     let names_arc: Arc<[String]> = names.clone().into();
     let mut batch = RecordBatch::with_capacity(names_arc, rows.len());
     for row in rows {
@@ -536,6 +550,9 @@ impl Db {
         }) {
             return Some(rows);
         }
+        if let Some(rows) = self.try_window_sparse_rows(q, bindings, now) {
+            return Some(rows);
+        }
         self.try_window_project_batch(q, bindings, now)
             .map(RecordBatch::into_rows)
     }
@@ -855,6 +872,9 @@ impl Db {
         }
         let mut filter: Option<&Pred> = None;
         let mut windows: Vec<&Step> = Vec::new();
+        let mut post_filters: Vec<&Pred> = Vec::new();
+        let mut group_step: Option<&Step> = None;
+        let mut without: Vec<&Field> = Vec::new();
         let mut fields: Option<&[Field]> = None;
         let mut sorts: Vec<(&Field, bool)> = Vec::new();
         let mut skip_n = 0usize;
@@ -863,9 +883,58 @@ impl Db {
             match step {
                 Step::Filter(p) if windows.is_empty() && filter.is_none() => filter = Some(p),
                 Step::Window { .. }
-                    if fields.is_none() && sorts.is_empty() && skip_n == 0 && take.is_none() =>
+                    if post_filters.is_empty()
+                        && group_step.is_none()
+                        && without.is_empty()
+                        && fields.is_none()
+                        && sorts.is_empty()
+                        && skip_n == 0
+                        && take.is_none() =>
                 {
                     windows.push(step)
+                }
+                Step::Filter(p)
+                    if !windows.is_empty()
+                        && group_step.is_none()
+                        && without.is_empty()
+                        && fields.is_none()
+                        && sorts.is_empty()
+                        && skip_n == 0
+                        && take.is_none() =>
+                {
+                    post_filters.push(p)
+                }
+                Step::Count { by: Some(_) }
+                | Step::Sum { by: Some(_), .. }
+                | Step::Min { by: Some(_), .. }
+                | Step::Max { by: Some(_), .. }
+                | Step::Avg { by: Some(_), .. }
+                    if !windows.is_empty()
+                        && group_step.is_none()
+                        && without.is_empty()
+                        && fields.is_none()
+                        && sorts.is_empty()
+                        && skip_n == 0
+                        && take.is_none() =>
+                {
+                    #[cfg(feature = "gpu")]
+                    if self.gpu.is_some() {
+                        return None;
+                    }
+                    group_step = Some(step);
+                }
+                Step::Without(wf)
+                    if !windows.is_empty()
+                        && group_step.is_none()
+                        && fields.is_none()
+                        && sorts.is_empty()
+                        && skip_n == 0
+                        && take.is_none() =>
+                {
+                    if wf.iter().any(|f| f.leaf().is_none()) {
+                        return None;
+                    }
+                    without.extend(wf.iter());
                 }
                 Step::Sort { field, desc }
                     if !windows.is_empty()
@@ -891,8 +960,14 @@ impl Db {
         if windows.is_empty() {
             return None;
         }
-        let take = take?;
-        let unprojected = fields.is_none();
+        // Grouped queries default to `take all` when `take` is omitted; ungrouped window
+        // queries require an explicit `take` on the columnar batch path unless grouped.
+        let take: Option<i64> = match (group_step.is_some(), take) {
+            (_, Some(t)) => t,
+            (true, None) => None,
+            (false, None) => return None,
+        };
+        let unprojected = fields.is_none() && group_step.is_none();
         let synth_fields: Option<Vec<Field>> = if unprojected {
             if self.store.is_disk_backed(name) {
                 let Some(eng) = self.store.disk_engine_read() else {
@@ -913,6 +988,7 @@ impl Db {
                         out_names.push(as_field.clone());
                     }
                 }
+                out_names.retain(|nm| !without.iter().any(|wf| wf.leaf() == Some(nm.as_str())));
                 out_names.sort_unstable();
                 out_names.dedup();
                 Some(out_names.into_iter().map(Field::name).collect())
@@ -923,15 +999,25 @@ impl Db {
                         Vec::<String>::new(),
                     )));
                 }
-                let shape = col_rows[0].shape_arc()?;
-                if shape.names().iter().any(|n| n.contains('.'))
-                    || !col_rows
-                        .iter()
-                        .all(|r| r.shape_arc().is_some_and(|rs| Arc::ptr_eq(rs, shape)))
-                {
-                    return None;
+                // Collect distinct shapes across `col_rows` so mixed-sparsity collections
+                // work on the columnar `RecordBatch` path too!
+                let mut seen_shapes: smallvec::SmallVec<[Arc<crate::store::RowShape>; 8]> =
+                    smallvec::SmallVec::new();
+                for r in col_rows {
+                    let rs = r.shape_arc()?;
+                    if !seen_shapes.iter().any(|s| Arc::ptr_eq(s, rs)) {
+                        if rs.names().iter().any(|n| n.contains('.')) {
+                            return None;
+                        }
+                        seen_shapes.push(Arc::clone(rs));
+                    }
                 }
-                let mut out_names: Vec<&str> = shape.names().iter().map(String::as_str).collect();
+                let mut out_names: Vec<&str> = Vec::new();
+                for s in &seen_shapes {
+                    for nm in s.names() {
+                        out_names.push(nm.as_str());
+                    }
+                }
                 for w in &windows {
                     if let Step::Window { as_field, .. } = w {
                         if as_field.contains('.') {
@@ -940,6 +1026,7 @@ impl Db {
                         out_names.push(as_field.as_str());
                     }
                 }
+                out_names.retain(|nm| !without.iter().any(|wf| wf.leaf() == Some(*nm)));
                 out_names.sort_unstable();
                 out_names.dedup();
                 Some(out_names.into_iter().map(Field::name).collect())
@@ -947,13 +1034,19 @@ impl Db {
         } else {
             None
         };
-        let fields: &[Field] = match (fields, &synth_fields) {
-            (Some(f), _) => f,
-            (None, Some(sf)) => sf.as_slice(),
-            (None, None) => unreachable!(),
+        let post_group_fields = fields;
+        let fields: &[Field] = if group_step.is_some() {
+            &[]
+        } else {
+            match (fields, &synth_fields) {
+                (Some(f), _) => f,
+                (None, Some(sf)) => sf.as_slice(),
+                (None, None) => unreachable!(),
+            }
         };
 
-        // Columns to read: everything the windows consume plus the projected base columns.
+        // Columns to read: everything the windows, post-filters, group step, sorts, and
+        // projected base columns consume.
         let mut base: Vec<Field> = Vec::new();
         let mut win_names: Vec<&str> = Vec::new();
         let want = |f: &Field, win_names: &[&str], base: &mut Vec<Field>| -> Option<()> {
@@ -985,10 +1078,41 @@ impl Db {
             }
             win_names.push(as_field.as_str());
         }
-        for f in fields.iter().chain(sorts.iter().map(|(f, _)| *f)) {
-            let leaf = f.leaf()?;
+        let mut pf_fields: Vec<&Field> = Vec::new();
+        for pf in &post_filters {
+            pf.walk_fields(&mut pf_fields);
+        }
+        for pf_f in &pf_fields {
+            let leaf = pf_f.leaf()?;
             if !win_names.contains(&leaf) {
-                want(f, &[], &mut base)?;
+                want(pf_f, &[], &mut base)?;
+            }
+        }
+        if let Some(gs) = group_step {
+            let (by_f, val_f) = match gs {
+                Step::Count { by: Some(by) } => (by, None),
+                Step::Sum { field, by: Some(by) }
+                | Step::Min { field, by: Some(by) }
+                | Step::Max { field, by: Some(by) }
+                | Step::Avg { field, by: Some(by) } => (by, Some(field)),
+                _ => return None,
+            };
+            let by_leaf = by_f.leaf()?;
+            if !win_names.contains(&by_leaf) {
+                want(by_f, &[], &mut base)?;
+            }
+            if let Some(vf) = val_f {
+                let v_leaf = vf.leaf()?;
+                if !win_names.contains(&v_leaf) {
+                    want(vf, &[], &mut base)?;
+                }
+            }
+        } else {
+            for f in fields.iter().chain(sorts.iter().map(|(f, _)| *f)) {
+                let leaf = f.leaf()?;
+                if !win_names.contains(&leaf) {
+                    want(f, &[], &mut base)?;
+                }
             }
         }
         if base.iter().any(|b| b.leaf().is_some_and(|l| win_names.contains(&l))) {
@@ -1310,7 +1434,7 @@ fn partition_into(
 }
 
         let batch = self.try_filter_project_batch(&base_q, bindings, now)?;
-        let n = batch.n();
+        let mut n = batch.n();
         let mut cols: Vec<Column> = batch.cols;
         let col_of = |f: &Field| -> Option<usize> {
             let leaf = f.leaf()?;
@@ -1491,6 +1615,291 @@ fn partition_into(
             win_cols.push(win_col);
         }
 
+        // Post-window `Filter` steps: evaluate over one reused scratch `Row` without
+        // materializing `Vec<Row>`.
+        if !post_filters.is_empty() && n > 0 {
+            let mut pf_uniq: Vec<&str> = pf_fields.iter().filter_map(|f| f.leaf()).collect();
+            pf_uniq.sort_unstable();
+            pf_uniq.dedup();
+            enum PfSrc {
+                Win(usize),
+                Base(usize),
+            }
+            let pf_srcs: Vec<PfSrc> = pf_uniq
+                .iter()
+                .map(|&leaf| {
+                    if let Some(wi) = win_names.iter().position(|w| *w == leaf) {
+                        Some(PfSrc::Win(wi))
+                    } else {
+                        base.iter().position(|b| b.leaf() == Some(leaf)).map(PfSrc::Base)
+                    }
+                })
+                .collect::<Option<_>>()?;
+            let pf_shape = Row::shape_of(&pf_uniq);
+            let mut scratch = crate::store::acquire_row();
+            let mut slots: Vec<super::eval::PredSlots<'_>> =
+                post_filters.iter().map(|p| super::eval::PredSlots::new(p)).collect();
+            let mut keep: Vec<u32> = Vec::with_capacity(n);
+            for pos in 0..n {
+                let raw_pos = mapped_row(seq_rows.as_deref(), pos as u32);
+                scratch.reset_with_shape_ref(
+                    &pf_shape,
+                    pf_srcs.iter().map(|src| match src {
+                        PfSrc::Win(wi) => win_cols[*wi].get(pos),
+                        PfSrc::Base(ci) => cols[*ci].get(raw_pos),
+                    }),
+                );
+                if slots.iter_mut().all(|s| s.eval(&scratch, now)) {
+                    keep.push(pos as u32);
+                }
+            }
+            if keep.len() < n {
+                for wc in &mut win_cols {
+                    let old = std::mem::replace(wc, Column::new());
+                    *wc = old.gather_unique_owned(&keep);
+                }
+                seq_rows = Some(match seq_rows {
+                    Some(prev) => keep.iter().map(|&p| prev[p as usize]).collect(),
+                    None => keep,
+                });
+                n = win_cols.first().map_or(0, Column::len);
+            }
+        }
+
+        // Grouped aggregation between window and projection (`count/sum/min/max/avg ... by k`).
+        if let Some(gs) = group_step {
+            let get_col_cell = |f: &Field, pos: usize| -> Option<Cell> {
+                let leaf = f.leaf()?;
+                if let Some(wi) = win_names.iter().position(|w| *w == leaf) {
+                    Some(win_cols[wi].get(pos))
+                } else {
+                    let ci = col_of(f)?;
+                    Some(cols[ci].get(mapped_row(seq_rows.as_deref(), pos as u32)))
+                }
+            };
+            let max_bytes = self.quotas.max_aggregate_bytes;
+            let mut grouped: RecordBatch = match gs {
+                Step::Count { by: Some(by) } => {
+                    let by_name = by.leaf()?;
+                    let mut map: FxHashMap<Cell, i64> = FxHashMap::default();
+                    let mut state_bytes = 0usize;
+                    for pos in 0..n {
+                        let kcell = get_col_cell(by, pos)?;
+                        if !map.contains_key(&kcell) {
+                            let ksz = match &kcell {
+                                Cell::Text(s) => s.len() + 32,
+                                _ => 16,
+                            };
+                            state_bytes = state_bytes.saturating_add(ksz + 64);
+                            if state_bytes > max_bytes {
+                                return None;
+                            }
+                        }
+                        *map.entry(kcell).or_insert(0) += 1;
+                    }
+                    let mut entries: Vec<(Cell, i64)> = map.into_iter().collect();
+                    entries.sort_unstable_by(|(a, _), (b, _)| super::eval::cmp_sort(a, b));
+                    if by_name == "hits" {
+                        RecordBatch {
+                            names: Arc::from([String::from("hits")]),
+                            cols: vec![Column::from_ints(
+                                entries.into_iter().map(|(_, c)| c).collect(),
+                            )],
+                        }
+                    } else {
+                        let mut kcol = Column::with_capacity(entries.len());
+                        let mut hvals = Vec::with_capacity(entries.len());
+                        for (k, c) in entries {
+                            kcol.push(k);
+                            hvals.push(c);
+                        }
+                        RecordBatch {
+                            names: Arc::from([by_name.to_string(), String::from("hits")]),
+                            cols: vec![kcol, Column::from_ints(hvals)],
+                        }
+                    }
+                }
+                Step::Sum {
+                    field: vf,
+                    by: Some(by),
+                } => {
+                    let by_name = by.leaf()?;
+                    let val_name = vf.leaf()?;
+                    if by_name == val_name {
+                        return None;
+                    }
+                    let mut map: FxHashMap<Cell, crate::exact_sum::ExactSum> = FxHashMap::default();
+                    let mut state_bytes = 0usize;
+                    for pos in 0..n {
+                        let kcell = get_col_cell(by, pos)?;
+                        let vcell = get_col_cell(vf, pos)?;
+                        if !map.contains_key(&kcell) {
+                            let ksz = match &kcell {
+                                Cell::Text(s) => s.len() + 32,
+                                _ => 16,
+                            };
+                            state_bytes = state_bytes.saturating_add(ksz + 64);
+                            if state_bytes > max_bytes {
+                                return None;
+                            }
+                        }
+                        map.entry(kcell).or_default().add_cell(Some(&vcell));
+                    }
+                    let mut entries: Vec<(Cell, f64)> =
+                        map.into_iter().map(|(k, s)| (k, s.value())).collect();
+                    entries.sort_unstable_by(|(a, _), (b, _)| super::eval::cmp_sort(a, b));
+                    let mut kcol = Column::with_capacity(entries.len());
+                    let mut fvals = Vec::with_capacity(entries.len());
+                    for (k, v) in entries {
+                        kcol.push(k);
+                        fvals.push(v);
+                    }
+                    RecordBatch {
+                        names: Arc::from([by_name.to_string(), val_name.to_string()]),
+                        cols: vec![kcol, Column::from_floats(fvals)],
+                    }
+                }
+                Step::Avg {
+                    field: vf,
+                    by: Some(by),
+                } => {
+                    let by_name = by.leaf()?;
+                    let val_name = vf.leaf()?;
+                    if by_name == val_name {
+                        return None;
+                    }
+                    let mut map: FxHashMap<Cell, (crate::exact_sum::ExactSum, usize)> =
+                        FxHashMap::default();
+                    let mut state_bytes = 0usize;
+                    for pos in 0..n {
+                        let kcell = get_col_cell(by, pos)?;
+                        let vcell = get_col_cell(vf, pos)?;
+                        if !map.contains_key(&kcell) {
+                            let ksz = match &kcell {
+                                Cell::Text(s) => s.len() + 32,
+                                _ => 16,
+                            };
+                            state_bytes = state_bytes.saturating_add(ksz + 64);
+                            if state_bytes > max_bytes {
+                                return None;
+                            }
+                        }
+                        let entry = map.entry(kcell).or_default();
+                        if entry.0.add_numeric(Some(&vcell)) {
+                            entry.1 += 1;
+                        }
+                    }
+                    let mut entries: Vec<(Cell, f64)> = map
+                        .into_iter()
+                        .map(|(k, (s, cnt))| (k, if cnt == 0 { 0.0 } else { s.value() / cnt as f64 }))
+                        .collect();
+                    entries.sort_unstable_by(|(a, _), (b, _)| super::eval::cmp_sort(a, b));
+                    let mut kcol = Column::with_capacity(entries.len());
+                    let mut fvals = Vec::with_capacity(entries.len());
+                    for (k, v) in entries {
+                        kcol.push(k);
+                        fvals.push(v);
+                    }
+                    RecordBatch {
+                        names: Arc::from([by_name.to_string(), val_name.to_string()]),
+                        cols: vec![kcol, Column::from_floats(fvals)],
+                    }
+                }
+                Step::Min {
+                    field: vf,
+                    by: Some(by),
+                }
+                | Step::Max {
+                    field: vf,
+                    by: Some(by),
+                } => {
+                    let is_max = matches!(gs, Step::Max { .. });
+                    let by_name = by.leaf()?;
+                    let val_name = vf.leaf()?;
+                    if by_name == val_name {
+                        return None;
+                    }
+                    let mut map: FxHashMap<Cell, Option<Cell>> = FxHashMap::default();
+                    let mut state_bytes = 0usize;
+                    for pos in 0..n {
+                        let kcell = get_col_cell(by, pos)?;
+                        let vcell = get_col_cell(vf, pos)?;
+                        if !map.contains_key(&kcell) {
+                            let ksz = match &kcell {
+                                Cell::Text(s) => s.len() + 32,
+                                _ => 16,
+                            };
+                            state_bytes = state_bytes.saturating_add(ksz + 64);
+                            if state_bytes > max_bytes {
+                                return None;
+                            }
+                        }
+                        let slot = map.entry(kcell).or_insert(None);
+                        if !matches!(vcell, Cell::Null) {
+                            *slot = Some(match slot.take() {
+                                None => vcell,
+                                Some(prev) => {
+                                    let better = if is_max {
+                                        super::eval::cmp_sort(&vcell, &prev).is_gt()
+                                    } else {
+                                        super::eval::cmp_sort(&vcell, &prev).is_lt()
+                                    };
+                                    if better { vcell } else { prev }
+                                }
+                            });
+                        }
+                    }
+                    let mut entries: Vec<(Cell, Cell)> = map
+                        .into_iter()
+                        .map(|(k, opt)| (k, opt.unwrap_or(Cell::Null)))
+                        .collect();
+                    entries.sort_unstable_by(|(a, _), (b, _)| super::eval::cmp_sort(a, b));
+                    let mut kcol = Column::with_capacity(entries.len());
+                    let mut vcol = Column::with_capacity(entries.len());
+                    for (k, v) in entries {
+                        kcol.push(k);
+                        vcol.push(v);
+                    }
+                    RecordBatch {
+                        names: Arc::from([by_name.to_string(), val_name.to_string()]),
+                        cols: vec![kcol, vcol],
+                    }
+                }
+                _ => return None,
+            };
+            let gn = grouped.n();
+            if !sorts.is_empty() && gn > 1 {
+                let mut gperm: Vec<u32> = (0..gn as u32).collect();
+                for (sf, desc) in sorts {
+                    let leaf = sf.leaf()?;
+                    let ci = grouped.names.iter().position(|nm| nm == leaf)?;
+                    sort_part_by_col(&mut gperm, &grouped.cols[ci], desc, None);
+                }
+                for gc in &mut grouped.cols {
+                    gc.permute_in_place(&gperm);
+                }
+            }
+            if let Some(pfs) = post_group_fields {
+                let mut proj_cols = Vec::with_capacity(pfs.len());
+                let mut proj_names = Vec::with_capacity(pfs.len());
+                for pf in pfs {
+                    let leaf = pf.leaf()?;
+                    proj_names.push(leaf.to_string());
+                    if let Some(ci) = grouped.names.iter().position(|nm| nm == leaf) {
+                        proj_cols.push(grouped.cols[ci].clone());
+                    } else {
+                        proj_cols.push(Column::Nulls { n: gn, cap: 0 });
+                    }
+                }
+                grouped = RecordBatch {
+                    names: proj_names.into(),
+                    cols: proj_cols,
+                };
+            }
+            finish_batch(&mut grouped, skip_n, Some(take));
+            return Some(grouped);
+        }
+
         // `sort` steps after the windows: sequential stable sorts of the sequence, where
         // each key may be a base column or a window output. Ties keep the prior order.
         for (sort_field, desc) in sorts {
@@ -1569,6 +1978,164 @@ fn partition_into(
             return Some(RecordBatch::empty(Arc::<[String]>::from(Vec::<String>::new())));
         }
         Some(result)
+    }
+
+    /// Row-API counterpart of [`Self::try_window_project_batch`] for unprojected (or `without`)
+    /// window queries over in-memory collections with mixed field sparsity (`!all_same_shape`):
+    /// computes window functions purely over dense columns, then clones only the surviving
+    /// `skip` / `take` rows from `col_rows` so absent fields stay absent rather than turning
+    /// into explicit `Cell::Null`.
+    fn try_window_sparse_rows(
+        &self,
+        q: &Query,
+        bindings: &BTreeMap<String, Vec<Row>>,
+        now: i64,
+    ) -> Option<Vec<Row>> {
+        let Source::Collection(name) = &q.source else {
+            return None;
+        };
+        if bindings.get(name).is_some() || self.store.is_disk_backed(name) {
+            return None;
+        }
+        let col_rows = self.store.collection(name);
+        if col_rows.is_empty() || col_rows.len() > self.quotas.max_execution_work {
+            return None;
+        }
+        let s0 = col_rows[0].shape_arc()?;
+        if col_rows
+            .iter()
+            .all(|r| r.shape_arc().is_some_and(|rs| Arc::ptr_eq(rs, s0)))
+        {
+            // Uniform shape is handled directly by `try_window_project_batch`.
+            return None;
+        }
+        let mut filter: Option<&Pred> = None;
+        let mut windows: Vec<&Step> = Vec::new();
+        let mut post_filters: Vec<&Pred> = Vec::new();
+        let mut without: Vec<&str> = Vec::new();
+        let mut sorts: Vec<(&Field, bool)> = Vec::new();
+        let mut skip_n = 0usize;
+        let mut take: Option<Option<i64>> = None;
+        for step in &q.steps {
+            match step {
+                Step::Filter(p) if windows.is_empty() && filter.is_none() => filter = Some(p),
+                Step::Window { .. }
+                    if post_filters.is_empty()
+                        && without.is_empty()
+                        && sorts.is_empty()
+                        && skip_n == 0
+                        && take.is_none() =>
+                {
+                    windows.push(step)
+                }
+                Step::Filter(p)
+                    if !windows.is_empty()
+                        && without.is_empty()
+                        && sorts.is_empty()
+                        && skip_n == 0
+                        && take.is_none() =>
+                {
+                    post_filters.push(p)
+                }
+                Step::Without(wf)
+                    if !windows.is_empty() && sorts.is_empty() && skip_n == 0 && take.is_none() =>
+                {
+                    for f in wf {
+                        without.push(f.leaf()?);
+                    }
+                }
+                Step::Sort { field, desc } if !windows.is_empty() && skip_n == 0 && take.is_none() => {
+                    sorts.push((field, *desc));
+                }
+                Step::Skip { n } if !windows.is_empty() && take.is_none() => {
+                    skip_n = skip_n.saturating_add((*n).max(0) as usize);
+                }
+                Step::Take { n } if !windows.is_empty() && take.is_none() => take = Some(*n),
+                _ => return None,
+            }
+        }
+        if windows.is_empty() {
+            return None;
+        }
+        let by_id = self.store.by_id.get(name)?;
+        if by_id.len() != col_rows.len()
+            || col_rows.iter().any(|r| r.get("id").and_then(Cell::text).is_none())
+        {
+            return None;
+        }
+        let mut proj_fields: Vec<Field> = vec![Field::name("id")];
+        let mut win_out_names: Vec<&str> = Vec::new();
+        for w in &windows {
+            if let Step::Window { as_field, .. } = w {
+                if as_field == "id" || as_field.contains('.') {
+                    return None;
+                }
+                win_out_names.push(as_field.as_str());
+                proj_fields.push(Field::name(as_field.as_str()));
+            }
+        }
+        // Build projected sub-query: `filter? | windows* | post_filters* | sorts* | pick { id, win... } | skip | take`.
+        let mut sub_steps: Vec<Step> = Vec::with_capacity(q.steps.len() + 2);
+        if let Some(p) = filter {
+            sub_steps.push(Step::Filter(p.clone()));
+        }
+        for w in &windows {
+            sub_steps.push((*w).clone());
+        }
+        for pf in &post_filters {
+            sub_steps.push(Step::Filter((*pf).clone()));
+        }
+        // Sorts must run BEFORE `Project` in `sub_q` if they sort by a base column not in `proj_fields`,
+        // so include sort keys in `proj_fields` temporarily!
+        for (sf, _) in &sorts {
+            let leaf = sf.leaf()?;
+            if without.contains(&leaf) {
+                // `without` ran before `sort`, so sorting by a removed column sees Nulls; bail out to row path.
+                return None;
+            }
+            if !proj_fields.iter().any(|pf| pf.leaf() == Some(leaf)) {
+                proj_fields.push((*sf).clone());
+            }
+        }
+        for (sf, desc) in &sorts {
+            sub_steps.push(Step::Sort {
+                field: (*sf).clone(),
+                desc: *desc,
+            });
+        }
+        sub_steps.push(Step::Project(proj_fields));
+        if skip_n > 0 {
+            sub_steps.push(Step::Skip { n: skip_n as i64 });
+        }
+        sub_steps.push(Step::Take {
+            n: match take {
+                Some(t) => t,
+                None => Some(50),
+            },
+        });
+        let sub_q = Query {
+            source: q.source.clone(),
+            steps: sub_steps,
+            explain: None,
+            ignore_filter: q.ignore_filter,
+        };
+        let batch = self.try_window_project_batch(&sub_q, bindings, now)?;
+        let out_n = batch.n();
+        let mut rows = Vec::with_capacity(out_n);
+        for i in 0..out_n {
+            let id_cell = batch.cols[0].get(i);
+            let id_str = id_cell.text()?;
+            let &row_idx = by_id.get(id_str)?;
+            let mut row = col_rows[row_idx].clone();
+            for (wi, &wname) in win_out_names.iter().enumerate() {
+                row.insert(wname, batch.cols[1 + wi].get(i));
+            }
+            for &rem in &without {
+                row.remove(rem);
+            }
+            rows.push(row);
+        }
+        Some(rows)
     }
 
     /// `filter? | join? | sort* | project | sort* | skip* | take` (explicit take) without

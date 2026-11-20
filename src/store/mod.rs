@@ -18,10 +18,11 @@ pub(crate) use value::{
 };
 #[allow(unused_imports)]
 pub use value::{
-    Cell, InlineStr, Row, RowExt, RowProjector, Shape as RowShape, acquire_orders_row, acquire_row,
-    cell_from_arc_inline, compact_row, content_hash_arc, content_hash_inline, fnv1a64, now_ms,
-    project_fields, release_general_rows, release_id_title_rows, release_orders_row,
-    release_single_id_title_vec, row_byte_size, row_text,
+    Cell, InlineStr, OwnedRowProjector, Row, RowExt, RowProjector, Shape as RowShape,
+    acquire_orders_row, acquire_row, cell_from_arc_inline, compact_row, content_hash_arc,
+    content_hash_inline, fnv1a64, now_ms, project_fields, release_general_rows,
+    release_id_title_rows, release_orders_row, release_single_id_title_vec, row_byte_size,
+    row_text,
 };
 
 use std::collections::BTreeMap;
@@ -68,6 +69,9 @@ pub(crate) struct DiskColLazy {
 pub(crate) struct DiskUniqueKey {
     pub fields: Vec<String>,
     pub pred: Option<crate::ast::Pred>,
+    /// `true` for the implicit `docs.uri` uniqueness rule when no explicit `unique index`
+    /// was declared: absent / non-text `uri` values do not conflict with each other.
+    pub null_distinct: bool,
 }
 
 impl DiskUniqueKey {
@@ -76,21 +80,19 @@ impl DiskUniqueKey {
         format!("{collection}[{}]", self.fields.join(","))
     }
 
-    /// True when every key column of `row` has a type this check reproduces exactly:
-    /// text, number, boolean, time, or no value. NaN (a null key part in the in-memory
-    /// index) and vectors are left to the in-memory path.
+    /// True when every key column of `row` has a type this check reproduces: text, number
+    /// (including `NaN`, which hashes as a null key part just like `IndexKey`), boolean,
+    /// time, or no value. Only vectors remain unsupported.
     pub(crate) fn supports(&self, row: &Row) -> bool {
-        self.fields.iter().all(|f| match row.get(f) {
-            Some(Cell::Float(x)) => !x.is_nan(),
-            Some(Cell::Vec(_)) => false,
-            _ => true,
-        })
+        self.fields
+            .iter()
+            .all(|f| !matches!(row.get(f), Some(Cell::Vec(_))))
     }
 
     /// Key of `row` under this constraint, with a type tag per column so that the text
-    /// `"5"` and the integer `5` stay distinct. An absent column is a null key part, as
-    /// in the in-memory index. `None` when the row is outside the partial predicate or a
-    /// key column has an unsupported type.
+    /// `"5"` and the integer `5` stay distinct. An absent column or `NaN` float is a null
+    /// key part (`'0'`), matching the in-memory `IndexKey`. `None` when the row is outside
+    /// the partial predicate, omits `docs.uri` under `null_distinct`, or has an unsupported type.
     pub(crate) fn indexed_text(&self, row: &Row, now: i64) -> Option<String> {
         use std::fmt::Write as _;
         if !self.supports(row)
@@ -98,6 +100,12 @@ impl DiskUniqueKey {
                 .pred
                 .as_ref()
                 .is_some_and(|p| !crate::eval::eval_pred(p, row, now))
+        {
+            return None;
+        }
+        if self.null_distinct
+            && self.fields.len() == 1
+            && row.get(&self.fields[0]).and_then(Cell::text).is_none()
         {
             return None;
         }
@@ -112,9 +120,11 @@ impl DiskUniqueKey {
                     let _ = write!(out, "i{n}");
                 }
                 // The in-memory index orders integers and floats on one numeric axis:
-                // `5` and `5.0` are the same key.
+                // `5` and `5.0` are the same key, while `NaN` maps to the null key part.
                 Cell::Float(x) => {
-                    if x.fract() == 0.0 && x.abs() < 9_007_199_254_740_992.0 {
+                    if x.is_nan() {
+                        out.push('0');
+                    } else if x.fract() == 0.0 && x.abs() < 9_007_199_254_740_992.0 {
                         let _ = write!(out, "i{}", *x as i64);
                     } else {
                         let _ = write!(out, "f{}", x.to_bits());
@@ -362,6 +372,9 @@ pub struct Store {
     pub(crate) disk_cluster_keys: BTreeMap<String, String>,
     /// Cold collections whose segments the next checkpoint should rewrite (compaction).
     pub(crate) disk_compact_requests: Vec<String>,
+    /// Data directory path when opened from disk (used to lazily attach `DiskEngine` when
+    /// replaying `Pack::RegisterSegment` before any snapshot listed cold collections).
+    pub(crate) data_dir: Option<std::path::PathBuf>,
 }
 
 /// Compact collection key for zero-allocation `AppendMark` snapshots.
@@ -466,6 +479,7 @@ impl Store {
             overlay_savepoint_edges: None,
             disk_cluster_keys: BTreeMap::new(),
             disk_compact_requests: Vec::new(),
+            data_dir: None,
         }
     }
 
@@ -508,23 +522,28 @@ impl Store {
     /// declared on it). `None` when a partial predicate cannot be reconstructed.
     pub(crate) fn disk_unique_keys(&self, collection: &str) -> Option<Vec<DiskUniqueKey>> {
         let mut out: Vec<DiskUniqueKey> = Vec::new();
-        let mut add = |fields: &[String], pred: Option<crate::ast::Pred>| {
+        let mut add = |fields: &[String], pred: Option<crate::ast::Pred>, null_distinct: bool| {
             if fields.len() == 1 && fields[0] == "id" && pred.is_none() {
                 return;
             }
             let label = pred.as_ref().map(|p| p.to_string());
-            if !out.iter().any(|k| {
+            if let Some(existing) = out.iter_mut().find(|k| {
                 k.fields == fields && k.pred.as_ref().map(|p| p.to_string()) == label
             }) {
+                if !null_distinct {
+                    existing.null_distinct = false;
+                }
+            } else {
                 out.push(DiskUniqueKey {
                     fields: fields.to_vec(),
                     pred,
+                    null_distinct,
                 });
             }
         };
         for li in self.indexes.values() {
             if li.def.collection == collection && li.def.unique {
-                add(&li.def.fields, li.def.pred.clone());
+                add(&li.def.fields, li.def.pred.clone(), false);
             }
         }
         for ix in self.extra_indexes.values() {
@@ -533,11 +552,11 @@ impl Store {
                     Some(src) => Some(crate::parse::parse_pred_src(src).ok()?),
                     None => None,
                 };
-                add(&ix.fields, pred);
+                add(&ix.fields, pred, false);
             }
         }
         if collection == "docs" {
-            add(&["uri".to_string()], None);
+            add(&["uri".to_string()], None, true);
         }
         Some(out)
     }
@@ -584,6 +603,78 @@ impl Store {
             return eng
                 .count_by_eq(collection, field, &Cell::from_text(text))
                 .is_ok_and(|n| n > 0);
+        }
+        // When a key column is NaN or absent/null on a float-capable column, both `Null`
+        // and `NaN` map to the same `'0'` null key part in `IndexKey`; scan only the key
+        // columns (+ predicate columns) to compare `indexed_text` directly without
+        // materializing the cold collection.
+        let has_nan_or_null_part = key.fields.iter().any(|f| match row.get(f) {
+            None | Some(Cell::Null) => true,
+            Some(Cell::Float(x)) => x.is_nan(),
+            _ => false,
+        });
+        if has_nan_or_null_part
+            && key.fields.iter().any(|f| {
+                matches!(row.get(f), Some(Cell::Float(x)) if x.is_nan())
+                    || eng.manifest.tables.get(collection).is_some_and(|sch| {
+                        sch.columns.iter().any(|c| {
+                            c.name == *f && matches!(c.kind, crate::disk::DiskColKind::Float64)
+                        })
+                    })
+            })
+        {
+            let Some(want) = key.indexed_text(row, now) else {
+                return false;
+            };
+            let mut proj: Vec<&str> = vec!["id"];
+            for f in &key.fields {
+                if !proj.contains(&f.as_str()) {
+                    proj.push(f.as_str());
+                }
+            }
+            if let Some(ref p) = key.pred {
+                let mut used = Vec::new();
+                p.walk_fields(&mut used);
+                // If partial predicate uses nested dotted paths, project all columns.
+                if used.iter().any(|uf| uf.leaf().is_none()) {
+                    return eng
+                        .query_filter(collection, Some(p), None, None, now)
+                        .is_ok_and(|rows| {
+                            rows.iter().any(|cand| {
+                                (exclude_id.is_none()
+                                    || cand.get("id").and_then(Cell::text) != exclude_id)
+                                    && key.indexed_text(cand, now).as_deref()
+                                        == Some(want.as_str())
+                            })
+                        });
+                }
+                for uf in &used {
+                    if let Some(leaf) = uf.leaf()
+                        && !proj.contains(&leaf)
+                    {
+                        proj.push(leaf);
+                    }
+                }
+                return eng
+                    .query_filter(collection, Some(p), None, Some(&proj), now)
+                    .is_ok_and(|rows| {
+                        rows.iter().any(|cand| {
+                            (exclude_id.is_none()
+                                || cand.get("id").and_then(Cell::text) != exclude_id)
+                                && key.indexed_text(cand, now).as_deref() == Some(want.as_str())
+                        })
+                    });
+            }
+            let mut hit = false;
+            let _ = eng.scan_projected(collection, Some(&proj), |cand| {
+                if (exclude_id.is_none() || cand.get("id").and_then(Cell::text) != exclude_id)
+                    && key.indexed_text(cand, now).as_deref() == Some(want.as_str())
+                {
+                    hit = true;
+                }
+                Ok(!hit)
+            });
+            return hit;
         }
         let mut pred: Option<Pred> = key.pred.clone();
         let and = |term: Pred, pred: &mut Option<Pred>| {
@@ -1087,6 +1178,7 @@ impl Store {
             overlay_savepoint_edges: None,
             disk_cluster_keys: BTreeMap::new(),
             disk_compact_requests: Vec::new(),
+            data_dir: self.data_dir.clone(),
         }
     }
 
@@ -1254,6 +1346,13 @@ impl Store {
                 self.update_col_count(collection, new_rows as isize);
             }
             Pack::Reembed => {}
+            Pack::RegisterSegment {
+                collection,
+                schema,
+                meta,
+            } => {
+                let _ = self.apply_register_segment_pack(collection, schema.clone(), meta.clone());
+            }
             Pack::Delete { collection, rows } => {
                 if self.can_apply_disk_overlay(collection) {
                     let mut ops = Vec::new();

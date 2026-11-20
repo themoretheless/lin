@@ -967,13 +967,63 @@ pub fn export_wal_since(dir: &Path, since_gen: u64) -> Result<Vec<u8>, Error> {
             ReadOne::Io(e) => return Err(e),
             ReadOne::Ok { rec, next } => {
                 if rec.r#gen > since_gen {
-                    out.extend_from_slice(&buf);
+                    if let Some(expanded_pack) = expand_segment_pack_for_export(dir, &rec.pack)? {
+                        let expanded_rec = LogRecord {
+                            r#gen: rec.r#gen,
+                            next_id: rec.next_id,
+                            pack: expanded_pack,
+                        };
+                        let payload = rmp_serde::to_vec_named(&expanded_rec).map_err(io_err)?;
+                        let len = payload
+                            .len()
+                            .checked_add(5)
+                            .and_then(|n| u32::try_from(n).ok())
+                            .filter(|&n| n <= MAX_RECORD)
+                            .ok_or_else(|| io_err("exported segment record exceeds 16MiB"))?;
+                        let checksum = compute_frame_checksum(&LOG_MAGIC_V1, &payload);
+                        out.extend_from_slice(&LOG_MAGIC_CHECKSUM);
+                        out.extend_from_slice(&len.to_le_bytes());
+                        out.push(LOG_MAGIC_V1[3]);
+                        out.extend_from_slice(&payload);
+                        out.extend_from_slice(&checksum);
+                    } else {
+                        out.extend_from_slice(&buf);
+                    }
                 }
                 pos = next;
             }
         }
     }
     Ok(out)
+}
+
+fn expand_segment_pack_for_export(dir: &Path, pack: &Pack) -> Result<Option<Pack>, Error> {
+    match pack {
+        Pack::RegisterSegment {
+            collection, meta, ..
+        } => {
+            let rows = crate::disk::DiskEngine::read_segment_rows(dir, meta)?;
+            Ok(Some(super::codec::rows_to_insert_pack(
+                collection,
+                &rows,
+                Vec::new(),
+            )))
+        }
+        Pack::Batch { packs } => {
+            let mut changed = false;
+            let mut new_packs = Vec::with_capacity(packs.len());
+            for p in packs {
+                if let Some(exp) = expand_segment_pack_for_export(dir, p)? {
+                    changed = true;
+                    new_packs.push(exp);
+                } else {
+                    new_packs.push(p.clone());
+                }
+            }
+            Ok(changed.then_some(Pack::Batch { packs: new_packs }))
+        }
+        _ => Ok(None),
+    }
 }
 
 /// Most bytes a compressed (codec 4) WAL record may decode to.

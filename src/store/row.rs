@@ -186,6 +186,85 @@ impl<'k> FieldSlot<'k> {
     }
 }
 
+/// Owned, `'static`-free counterpart of [`FieldSlot`], suitable for storing inside
+/// [`crate::Prepared`] plans and [`crate::QueryCursor`] states.
+pub struct OwnedFieldSlot {
+    key: Arc<str>,
+    seen: SmallVec<[(Arc<Shape>, Option<usize>); 4]>,
+    sync_seen: std::sync::OnceLock<(Arc<Shape>, Option<usize>)>,
+}
+
+impl Clone for OwnedFieldSlot {
+    fn clone(&self) -> Self {
+        let sync_seen = std::sync::OnceLock::new();
+        if let Some(cached) = self.sync_seen.get() {
+            let _ = sync_seen.set(cached.clone());
+        }
+        Self {
+            key: Arc::clone(&self.key),
+            seen: self.seen.clone(),
+            sync_seen,
+        }
+    }
+}
+
+impl fmt::Debug for OwnedFieldSlot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OwnedFieldSlot")
+            .field("key", &self.key)
+            .finish()
+    }
+}
+
+impl OwnedFieldSlot {
+    const KEPT_SHAPES: usize = 4;
+
+    #[inline]
+    pub fn new(key: impl Into<Arc<str>>) -> Self {
+        Self {
+            key: key.into(),
+            seen: SmallVec::new(),
+            sync_seen: std::sync::OnceLock::new(),
+        }
+    }
+
+    #[inline]
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    #[inline]
+    pub fn get<'r>(&mut self, row: &'r Row) -> Option<&'r Cell> {
+        let shape = row.shape.as_ref()?;
+        for (seen, at) in &self.seen {
+            if Arc::ptr_eq(seen, shape) {
+                return at.map(|i| &row.cells[i]);
+            }
+        }
+        let at = shape.find(&self.key).ok();
+        if self.seen.len() == Self::KEPT_SHAPES {
+            self.seen.remove(0);
+        }
+        self.seen.push((Arc::clone(shape), at));
+        at.map(|i| &row.cells[i])
+    }
+
+    /// Lock-free `&self` lookup for shared `Prepared` plans (`PointGetPlan`, `AggPlan`):
+    /// caches the collection's primary `Shape` on first call and falls back to `row.get`
+    /// only if a row has a different shape.
+    #[inline]
+    pub fn get_sync<'r>(&self, row: &'r Row) -> Option<&'r Cell> {
+        let shape = row.shape.as_ref()?;
+        let (cached_shape, cached_at) = self
+            .sync_seen
+            .get_or_init(|| (Arc::clone(shape), shape.find(&self.key).ok()));
+        if Arc::ptr_eq(cached_shape, shape) {
+            return cached_at.map(|i| &row.cells[i]);
+        }
+        shape.find(&self.key).ok().map(|i| &row.cells[i])
+    }
+}
+
 /// One record: field name -> [`Cell`], iterated in field-name order.
 #[derive(Clone, Default)]
 pub struct Row {

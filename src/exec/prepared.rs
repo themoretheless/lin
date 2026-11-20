@@ -20,8 +20,9 @@ pub(crate) struct PointGetPlan {
     pub field: String,
     pub key: String,
     pub fields: Option<Vec<String>>,
+    pub projector: Option<crate::store::OwnedRowProjector>,
     pub is_simple_eq: bool,
-    pub pred: Option<Pred>,
+    pub pred_slots: Option<crate::eval::OwnedPredSlots>,
     pub needs_now: bool,
     pub is_docs_id_title: bool,
     pub prepared_docs_epoch: u64,
@@ -74,6 +75,8 @@ pub(crate) enum AggKind {
 pub(crate) struct AggPlan {
     pub collection: String,
     pub filter: Option<Pred>,
+    pub pred_slots: Option<crate::eval::OwnedPredSlots>,
+    pub value_slot: Option<crate::store::row::OwnedFieldSlot>,
     pub kind: AggKind,
     pub needs_now: bool,
     pub index_plan: Option<(Vec<IndexUse>, bool)>,
@@ -417,13 +420,18 @@ impl Db {
                 None
             };
         let prepared_docs_epoch = store.docs_epoch;
+        let projector = fields
+            .as_deref()
+            .map(crate::store::OwnedRowProjector::new);
+        let pred_slots = (!simple_eq).then(|| crate::eval::OwnedPredSlots::new(pred));
         Some(PointGetPlan {
             collection: name,
             field: field.to_string(),
             key: key.to_string(),
             fields,
+            projector,
             is_simple_eq: simple_eq,
-            pred: if simple_eq { None } else { Some(pred.clone()) },
+            pred_slots,
             needs_now,
             is_docs_id_title,
             prepared_docs_epoch,
@@ -615,17 +623,13 @@ impl Db {
                 .store
                 .project_by_key(&pg.collection, &pg.field, &pg.key, None)?;
             let now = if pg.needs_now { now_ms() } else { 0 };
-            if let Some(pred) = &pg.pred
-                && !eval_pred(pred, &full, now)
+            if let Some(slots) = &pg.pred_slots
+                && !slots.eval_sync(&full, now)
             {
                 return None;
             }
-            if let Some(fs) = &pg.fields {
-                Some(
-                    self.store
-                        .project_by_key(&pg.collection, &pg.field, &pg.key, Some(fs))
-                        .unwrap_or(full),
-                )
+            if let Some(proj) = &pg.projector {
+                Some(proj.project_sync(&full))
             } else {
                 Some(full)
             }

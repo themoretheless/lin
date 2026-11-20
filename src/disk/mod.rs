@@ -1883,6 +1883,11 @@ impl DiskEngine {
         !self.dirty_overlay.is_empty()
     }
 
+    #[inline]
+    pub fn table_has_dirty_overlay(&self, table: &str) -> bool {
+        self.dirty_overlay.contains(table)
+    }
+
     pub(crate) fn drain_dirty_overlays(
         &mut self,
     ) -> (BTreeMap<String, Vec<Row>>, SegmentTombstones) {
@@ -2623,6 +2628,142 @@ impl DiskEngine {
         self.manifest.generation += 1;
         self.hot_cache.clear_all();
         Ok(())
+    }
+
+    /// Encodes `batch` into an immutable segment directory on disk without mutating `self`,
+    /// returning `(schema, meta)` so the caller can durably log `Pack::RegisterSegment` first
+    /// and then attach the segment via [`Self::attach_registered_segment`].
+    pub(crate) fn prepare_bulk_segment_batch(
+        &self,
+        table: &str,
+        batch: &crate::batch::RecordBatch,
+        sync_full: bool,
+    ) -> Result<(DiskTableSchema, SegmentMeta), Error> {
+        let n = batch.n();
+        if n == 0 {
+            return Err(Error::runtime("bulk batch: empty batch"));
+        }
+        if batch.cols.iter().any(|c| c.len() != n) {
+            return Err(Error::runtime("bulk batch: columns have different lengths"));
+        }
+        let Some(id_pos) = batch.names.iter().position(|c| c == "id") else {
+            return Err(Error::runtime("bulk batch: missing `id` column"));
+        };
+        let mut seen: FxHashSet<&str> = FxHashSet::default();
+        seen.reserve(n);
+        let id_col = &batch.cols[id_pos];
+        for i in 0..n {
+            let Some(id) = id_col.cell_ref(i).and_then(Cell::text) else {
+                return Err(Error::runtime("bulk batch: `id` must be text and present"));
+            };
+            if !seen.insert(id) || self.exists_by_id(table, id) {
+                return Err(Error::runtime(format!("duplicate id: {id}")));
+            }
+        }
+        let schema = match self.manifest.tables.get(table) {
+            Some(existing) => {
+                let mut schema = existing.clone();
+                for inferred in infer_schema_from_batch(table, batch).columns {
+                    if !schema.columns.iter().any(|c| c.name == inferred.name) {
+                        schema.columns.push(inferred);
+                    }
+                }
+                schema
+            }
+            None => infer_schema_from_batch(table, batch),
+        };
+        let seg_id = self.manifest.next_seg_id;
+        let meta = segment::write_segment_from(
+            &self.dir,
+            seg_id,
+            &schema,
+            segment::SegSrc::Batch(batch),
+        )?;
+        if sync_full {
+            let seg_dir = self.dir.join(SEGMENTS_DIR).join(format!("seg_{seg_id:08}"));
+            if let Ok(entries) = fs::read_dir(&seg_dir) {
+                for entry in entries.flatten() {
+                    if entry.file_type().map(|t| t.is_file()).unwrap_or(false)
+                        && let Ok(f) = File::open(entry.path())
+                    {
+                        let _ = crate::persist::durable_sync(&f).or_else(|_| f.sync_all());
+                    }
+                }
+            }
+            crate::persist::sync_dir_checked(&seg_dir)?;
+            crate::persist::sync_dir_checked(&self.dir.join(SEGMENTS_DIR))?;
+        }
+        Ok((schema, meta))
+    }
+
+    /// Attaches a segment registered via `Pack::RegisterSegment`. Returns `Ok(false)` when
+    /// `meta.seg_id` is already present in `self.manifest.segments` (idempotent WAL replay).
+    pub(crate) fn attach_registered_segment(
+        &mut self,
+        table: &str,
+        schema: DiskTableSchema,
+        meta: SegmentMeta,
+    ) -> Result<bool, Error> {
+        if self.manifest.segments.iter().any(|s| s.seg_id == meta.seg_id) {
+            return Ok(false);
+        }
+        let seg_dir = self
+            .dir
+            .join(SEGMENTS_DIR)
+            .join(format!("seg_{:08}", meta.seg_id));
+        let opened = DiskSegment::open(&seg_dir, meta.clone())?;
+        match self.manifest.tables.get_mut(table) {
+            Some(existing) => {
+                for col in schema.columns {
+                    if !existing.columns.iter().any(|c| c.name == col.name) {
+                        existing.columns.push(col);
+                    }
+                }
+            }
+            None => {
+                self.manifest.tables.insert(table.to_string(), schema);
+            }
+        }
+        self.segments
+            .entry(table.to_string())
+            .or_default()
+            .push(Arc::new(opened));
+        self.manifest.next_seg_id = self
+            .manifest
+            .next_seg_id
+            .max(meta.seg_id.saturating_add(1));
+        self.manifest.segments.push(meta);
+        self.manifest.generation += 1;
+        self.hot_cache.clear_all();
+        Ok(true)
+    }
+
+    /// Reads all rows of a registered segment so `export_wal_since` can synthesize portable
+    /// `Pack::InsertCols` frames for remote followers without shared disk storage.
+    pub(crate) fn read_segment_rows(dir: &Path, meta: &SegmentMeta) -> Result<Vec<Row>, Error> {
+        let seg_dir = dir.join(SEGMENTS_DIR).join(format!("seg_{:08}", meta.seg_id));
+        let seg = DiskSegment::open(&seg_dir, meta.clone())?;
+        let mut out = Vec::with_capacity(meta.row_count as usize);
+        let mut block = SegBlockCache::default();
+        for rid in 0..meta.row_count {
+            let mut row = crate::store::acquire_row();
+            for (pos, (cname, _)) in seg.cols.iter().enumerate() {
+                let cell = read_seg_cell(&seg, pos, rid, &mut block)?;
+                if !matches!(cell, Cell::Null) {
+                    row.insert(cname.clone(), cell);
+                }
+            }
+            out.push(row);
+        }
+        Ok(out)
+    }
+
+    pub(crate) fn save_tombstones_and_manifest_soft(&mut self) -> Result<(), Error> {
+        let prev = self.sync_full;
+        self.sync_full = false;
+        let res = self.save_tombstones_and_manifest();
+        self.sync_full = prev;
+        res
     }
 
     fn load_verified_tombstones(

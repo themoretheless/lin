@@ -859,6 +859,9 @@ impl Db {
         let Some(p) = self.persist.as_ref() else {
             return Ok(Vec::new());
         };
+        if p.has_segment_packs {
+            return crate::persist::export_wal_since(&p.dir, since);
+        }
         crate::persist::export_wal_since_indexed(&p.dir, since, &p.wal_index)
     }
 
@@ -866,6 +869,9 @@ impl Db {
     /// frames strictly newer than `since` in `O(log N)` without performing file I/O.
     pub(crate) fn wal_export_window(&self, since: u64) -> Option<(std::path::PathBuf, u64, u64, u64)> {
         let p = self.persist.as_ref()?;
+        if p.has_segment_packs {
+            return None;
+        }
         let &(last_gen, _) = p.wal_index.last()?;
         if last_gen <= since || last_gen != self.store.r#gen {
             return None;
@@ -1591,12 +1597,8 @@ impl Db {
             0
         };
         for row in &rows {
-            // A key value this path does not reproduce (NaN, a vector) and `docs` without
-            // a text `uri` keep the in-memory path's own rules; decide before any id is
-            // allocated.
-            if unique_keys.iter().any(|k| !k.supports(row))
-                || (collection == "docs" && row.get("uri").and_then(Cell::text).is_none())
-            {
+            // Vector keys are left to the in-memory path; decide before any id is allocated.
+            if unique_keys.iter().any(|k| !k.supports(row)) {
                 return Ok(None);
             }
         }
@@ -1651,9 +1653,9 @@ impl Db {
                         ));
                     }
                 }
-                if has_fks {
-                    self.check_row_fks(collection, row)?;
-                }
+            }
+            if has_fks {
+                self.check_batch_fks(collection, &rows)?;
             }
         }
         if let Some(written) = cas_written.as_deref_mut() {
@@ -4125,9 +4127,13 @@ impl Db {
         batch: &RecordBatch,
     ) -> Result<Option<Done>, Error> {
         let n = batch.n();
+        let can_init_cold_table = self.persist.as_ref().is_some_and(|p| p.cold)
+            && !self.store.is_disk_backed(collection)
+            && self.store.collection(collection).is_empty()
+            && !self.store.hnsw.contains_key(collection);
         if self.follower
             || self.cold_program_packs.is_some()
-            || !self.disk_overlay_point_dml(collection)
+            || (!self.disk_overlay_point_dml(collection) && !can_init_cold_table)
         {
             return Ok(None);
         }
@@ -4143,10 +4149,10 @@ impl Db {
                 .catalog
                 .collection(collection)
                 .is_some_and(|c| c.has_vec());
-        // Direct columnar segment write on native disk: encodes straight from `RecordBatch`
-        // into an immutable segment without building any per-row maps.
-        if self.store.is_native_disk()
-            && !has_null
+        // Direct columnar segment write on native disk OR persisted cold tier: encodes
+        // straight from `RecordBatch` into an immutable segment without building any per-row
+        // maps or touching the memtable overlay.
+        let clean_for_direct_segment = !has_null
             && n >= 4_096
             && collection != "docs"
             && collection != "facts"
@@ -4161,7 +4167,11 @@ impl Db {
             && !self.catalog.fks.iter().any(|fk| fk.from_col == collection)
             && !self.store.fts_indexed(collection)
             && !self.store.dirty_fts_disk.contains_key(collection)
-        {
+            && self
+                .store
+                .disk_engine_read()
+                .is_none_or(|eng| !eng.table_has_dirty_overlay(collection));
+        if clean_for_direct_segment && (self.store.is_native_disk() || self.persist.is_some()) {
             let total = self.total_rows();
             if total + n > self.quotas.max_rows {
                 return Err(Error::runtime(format!(
@@ -4170,13 +4180,23 @@ impl Db {
                     self.quotas.max_rows
                 )));
             }
-            self.store.bulk_load_native_disk_batch(collection, batch)?;
-            self.store.r#gen += 1;
+            if self.store.is_native_disk() {
+                self.store.bulk_load_native_disk_batch(collection, batch)?;
+                self.store.r#gen += 1;
+            } else {
+                let p = self.persist.as_mut().expect("persist checked");
+                self.store
+                    .bulk_load_persisted_disk_batch(p, collection, batch)?;
+            }
             self.reader_cache = None;
             return Ok(Some(Done {
                 r#gen: self.store.r#gen,
                 n,
             }));
+        }
+        if can_init_cold_table {
+            // Smaller or constrained batch on a still-empty table stays on the regular path.
+            return Ok(None);
         }
         let hashing_dim = if needs_embed {
             self.embedder.as_ref().and_then(|e| e.hashing_dim())
@@ -5513,6 +5533,7 @@ pub(crate) fn pack_affect_n(pack: Option<&Pack>) -> Option<usize> {
         Pack::AppendFactsBulk { s, .. } => Some(s.len()),
         Pack::AppendEdgesBulk { rel, .. } => Some(rel.len()),
         Pack::InsertCols { n, .. } => Some(*n as usize),
+        Pack::RegisterSegment { meta, .. } => Some(meta.row_count as usize),
         Pack::InsertBulk { rows, .. } => Some(rows.len()),
         Pack::Insert { .. } => Some(1),
         Pack::AppendFact { .. } | Pack::AppendEdge { .. } | Pack::DeleteEdge { .. } => Some(1),

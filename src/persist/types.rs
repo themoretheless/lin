@@ -133,6 +133,13 @@ pub enum Pack {
         name: String,
         fields: Vec<(String, String)>,
     },
+    /// Registers an immutable cold `DiskSegment` written directly by `insert_batch` under an
+    /// active `Persist` WAL without staging rows through the memtable overlay.
+    RegisterSegment {
+        collection: String,
+        schema: crate::disk::DiskTableSchema,
+        meta: crate::disk::SegmentMeta,
+    },
     Batch {
         packs: Vec<Pack>,
     },
@@ -371,6 +378,9 @@ pub struct Persist {
     pub log_bytes: u64,
     /// Monotonic `(gen, file_offset)` index of frames currently in `log` (cleared on compact).
     pub(crate) wal_index: Vec<(u64, u64)>,
+    /// True when `log` contains one or more `Pack::RegisterSegment` frames since the last
+    /// checkpoint (so remote WAL export re-materializes them into `Pack::InsertCols`).
+    pub(crate) has_segment_packs: bool,
 }
 
 impl Persist {

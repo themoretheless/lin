@@ -249,6 +249,7 @@ impl MmapTextCol {
         }
 
         let slice = self.block_slice(block_idx)?;
+        self.prefetch_blocks_ahead(block_idx);
         let raw: Vec<u8> = if slice.is_empty() {
             Vec::new()
         } else if slice[0] == 0x00 {
@@ -292,6 +293,54 @@ impl MmapTextCol {
             });
         }
         Ok(arc)
+    }
+
+    /// Issue a bounded `MADV_WILLNEED` readahead hint on the next up to 4 compressed blocks
+    /// (`<= 256 KiB`) so sequential cold text scans overlap SSD page-ins with Zstd decode.
+    #[inline]
+    pub(crate) fn prefetch_blocks_ahead(&self, block_idx: u32) {
+        #[cfg(unix)]
+        {
+            let next = block_idx.saturating_add(1);
+            if next >= self.block_count {
+                return;
+            }
+            let last = next.saturating_add(4).min(self.block_count);
+            let s_idx = (next as usize) * 8;
+            let e_idx = (last as usize) * 8;
+            if e_idx + 8 > self.block_offsets.len() {
+                return;
+            }
+            let Ok(sb) = self.block_offsets[s_idx..s_idx + 8].try_into() else {
+                return;
+            };
+            let Ok(eb) = self.block_offsets[e_idx..e_idx + 8].try_into() else {
+                return;
+            };
+            let start = u64::from_le_bytes(sb) as usize;
+            let end = (u64::from_le_bytes(eb) as usize).min(self.blocks_data.len());
+            if end <= start || end - start > 256 * 1024 {
+                return;
+            }
+            let page = 4096usize;
+            let aligned_start = start & !(page - 1);
+            let len = end - aligned_start;
+            if len > 0 && aligned_start + len <= self.blocks_data.len() {
+                // SAFETY: `aligned_start..aligned_start + len` lies within `self.blocks_data`
+                // and is page-aligned; `MADV_WILLNEED` is purely advisory.
+                unsafe {
+                    let _ = libc::madvise(
+                        self.blocks_data.as_ptr().add(aligned_start) as *mut libc::c_void,
+                        len,
+                        libc::MADV_WILLNEED,
+                    );
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = block_idx;
+        }
     }
 
     #[inline]

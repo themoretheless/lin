@@ -758,6 +758,58 @@ impl Db {
         Ok(())
     }
 
+    /// Slot-accelerated, deduplicated batch FK check: resolves each row's FK field via
+    /// [`crate::store::row::FieldSlot`] and probes `fk_target_exists` at most once per
+    /// distinct FK value in `rows`.
+    pub(crate) fn check_batch_fks(&self, collection: &str, rows: &[Row]) -> Result<(), Error> {
+        if rows.len() <= 1 {
+            return match rows.first() {
+                Some(r) => self.check_row_fks(collection, r),
+                None => Ok(()),
+            };
+        }
+        let mut watchers: smallvec::SmallVec<
+            [(
+                &crate::catalog::Fk,
+                crate::store::row::FieldSlot<'_>,
+                FxHashSet<&str>,
+            ); 2],
+        > = self
+            .catalog
+            .fks
+            .iter()
+            .filter(|fk| fk.from_col == collection)
+            .map(|fk| {
+                (
+                    fk,
+                    crate::store::row::FieldSlot::new(&fk.from_field),
+                    FxHashSet::default(),
+                )
+            })
+            .collect();
+        if watchers.is_empty() {
+            return Ok(());
+        }
+        for row in rows {
+            for (fk, slot, verified) in &mut watchers {
+                let Some(val) = slot.get(row).and_then(Cell::text) else {
+                    continue;
+                };
+                if val.is_empty() || verified.contains(val) {
+                    continue;
+                }
+                if !self.fk_target_exists(&fk.to_col, &fk.to_field, val) {
+                    return Err(Error::runtime(format!(
+                        "fk: {collection}.{} → {}.{} missing {val}",
+                        fk.from_field, fk.to_col, fk.to_field
+                    )));
+                }
+                verified.insert(val);
+            }
+        }
+        Ok(())
+    }
+
     /// Refuse to delete rows a foreign key still points at. `deleting` are the rows about
     /// to leave `collection`; a referencing row that is itself being deleted (a key into
     /// its own collection) does not count. Each referencing collection is read once.
@@ -1122,9 +1174,9 @@ impl Db {
                 {
                     return Err(Error::runtime(format!("duplicate uri: {uri}")));
                 }
-                if has_fks {
-                    self.check_row_fks(collection, row)?;
-                }
+            }
+            if has_fks {
+                self.check_batch_fks(collection, &built)?;
             }
         }
         if !all_embedded {

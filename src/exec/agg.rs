@@ -1288,9 +1288,19 @@ impl Db {
         let index_plan = filter
             .as_ref()
             .and_then(|pred| crate::index::pick_index_with_coverage(cat, &name, pred));
+        let pred_slots = filter.as_ref().map(crate::eval::OwnedPredSlots::new);
+        let value_slot = match &kind {
+            AggKind::Count { .. } => None,
+            AggKind::Sum { field, .. }
+            | AggKind::Avg { field, .. }
+            | AggKind::Min { field, .. }
+            | AggKind::Max { field, .. } => field.leaf().map(crate::store::row::OwnedFieldSlot::new),
+        };
         Some(AggPlan {
             collection: name,
             filter,
+            pred_slots,
+            value_slot,
             kind,
             needs_now,
             index_plan,
@@ -1864,17 +1874,24 @@ impl Db {
             && let Some(idxs) = self.store.index_seek(&plan.collection, uses, now)
         {
             let col = self.store.collection(&plan.collection);
-            let pred_opt = if covered { None } else { plan.filter.as_ref() };
-            let mut residual = pred_opt.map(PredSlots::new);
+            let residual_slots = if covered {
+                None
+            } else {
+                plan.pred_slots.as_ref()
+            };
             match &plan.kind {
                 AggKind::Sum { field, by: None } => {
                     let fk = field.as_str();
                     let mut total = crate::exact_sum::ExactSum::default();
                     for i in idxs {
                         if let Some(r) = col.get(i)
-                            && residual.as_mut().is_none_or(|f| f.eval(r, now))
+                            && residual_slots.is_none_or(|f| f.eval_sync(r, now))
                         {
-                            total.add_cell(r.get(&fk));
+                            let cell = match &plan.value_slot {
+                                Some(vs) => vs.get_sync(r),
+                                None => r.get(&fk),
+                            };
+                            total.add_cell(cell);
                         }
                     }
                     let mut row = crate::store::acquire_row();
@@ -1887,8 +1904,11 @@ impl Db {
                     let mut count = 0usize;
                     for i in idxs {
                         if let Some(r) = col.get(i)
-                            && residual.as_mut().is_none_or(|f| f.eval(r, now))
-                            && sum.add_numeric(r.get(&fk))
+                            && residual_slots.is_none_or(|f| f.eval_sync(r, now))
+                            && sum.add_numeric(match &plan.value_slot {
+                                Some(vs) => vs.get_sync(r),
+                                None => r.get(&fk),
+                            })
                         {
                             count += 1;
                         }
@@ -1908,8 +1928,12 @@ impl Db {
                     let mut best: Option<Cell> = None;
                     for i in idxs {
                         if let Some(r) = col.get(i)
-                            && residual.as_mut().is_none_or(|f| f.eval(r, now))
-                            && let Some(c) = r.get(&fk).filter(|c| !matches!(c, Cell::Null))
+                            && residual_slots.is_none_or(|f| f.eval_sync(r, now))
+                            && let Some(c) = match &plan.value_slot {
+                                Some(vs) => vs.get_sync(r),
+                                None => r.get(&fk),
+                            }
+                            .filter(|c| !matches!(c, Cell::Null))
                         {
                             best = Some(match best {
                                 None => c.clone_for_borrow(),

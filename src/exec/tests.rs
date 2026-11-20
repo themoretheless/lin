@@ -1283,4 +1283,279 @@ mod preencoded_insert_tests {
         assert_eq!(imported.stats().docs, 1);
         imported.close().unwrap();
     }
+
+    #[test]
+    fn cold_zero_promote_docs_without_uri_and_nan_unique_key() {
+        let dir = Temp(std::env::temp_dir().join(format!(
+            "lin-p10-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        )));
+        let opts = crate::OpenOpts {
+            cold: true,
+            sync: crate::persist::SyncMode::Normal,
+        };
+        let mut db = Db::open_with(&dir.0, opts).unwrap();
+        let docs_seed: Vec<String> = (0..40)
+            .map(|i| format!(r#"{{ id: "d{i:02}", uri: "lin://d{i:02}", title: "Doc {i}" }}"#))
+            .collect();
+        db.run(&format!("insert docs [{}]", docs_seed.join(","))).unwrap();
+
+        db.run("col floats { id: text, v: f64 }\nindex floats unique [v]")
+            .unwrap();
+        let floats_seed: Vec<String> = (0..40)
+            .map(|i| format!(r#"{{ id: "f{i:02}", v: {}.5 }}"#, i))
+            .collect();
+        db.run(&format!("insert floats [{}]", floats_seed.join(",")))
+            .unwrap();
+        db.checkpoint().unwrap();
+        db.close().unwrap();
+
+        let mut db = Db::open_with(&dir.0, opts).unwrap();
+        assert!(db.store.is_disk_backed("docs"));
+        assert!(db.store.is_disk_backed("floats"));
+
+        // Multiple docs without `uri` do not conflict and stay on the cold overlay!
+        db.run(r#"insert docs { id: "no_uri_1", title: "A" }"#).unwrap();
+        db.run(r#"insert docs { id: "no_uri_2", title: "B" }"#).unwrap();
+        assert!(
+            db.store.is_disk_backed("docs") && !db.store.disk_rows_materialized("docs"),
+            "docs without uri must remain cold without promotion"
+        );
+        assert_eq!(db.run("docs | count").unwrap().scalar().unwrap(), Cell::Int(42));
+
+        // First NaN in unique float key succeeds on cold overlay; second NaN conflicts!
+        let mut nan_batch = crate::batch::RecordBatch::with_capacity(
+            std::sync::Arc::from([String::from("id"), String::from("v")]),
+            1,
+        );
+        nan_batch.cols[0].push(Cell::from_text("nan1"));
+        nan_batch.cols[1].push(Cell::Float(f64::NAN));
+        db.insert_batch("floats", &nan_batch).unwrap();
+        assert!(
+            db.store.is_disk_backed("floats") && !db.store.disk_rows_materialized("floats"),
+            "NaN unique-key insert must remain cold without promotion"
+        );
+
+        let mut nan_dup = crate::batch::RecordBatch::with_capacity(
+            std::sync::Arc::from([String::from("id"), String::from("v")]),
+            1,
+        );
+        nan_dup.cols[0].push(Cell::from_text("nan2"));
+        nan_dup.cols[1].push(Cell::Float(f64::NAN));
+        let err = db.insert_batch("floats", &nan_dup).unwrap_err();
+        assert!(err.to_string().contains("unique index"));
+    }
+
+    #[test]
+    fn cold_lazy_cursors_non_id_join_and_multihop_without_hydration() {
+        let dir = Temp(std::env::temp_dir().join(format!(
+            "lin-p32-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        )));
+        let opts = crate::OpenOpts {
+            cold: true,
+            sync: crate::persist::SyncMode::Normal,
+        };
+        let mut cold_db = Db::open_with(&dir.0, opts).unwrap();
+        let mut hot_db = Db::empty();
+
+        let schema = "col accounts { id: text, code: text, tier: text }\ncol events { id: text, acct_code: text, amt: i64 }\nfk events.acct_code -> accounts.code";
+        cold_db.run(schema).unwrap();
+        hot_db.run(schema).unwrap();
+
+        let accts: Vec<String> = (0..40)
+            .map(|i| format!(r#"{{ id: "a{i:02}", code: "C{i:02}", tier: "t{}" }}"#, i % 3))
+            .collect();
+        let evs: Vec<String> = (0..40)
+            .map(|i| format!(r#"{{ id: "e{i:02}", acct_code: "C{:02}", amt: {} }}"#, i % 20, i * 5))
+            .collect();
+        let docs: Vec<String> = (4..40)
+            .map(|i| format!(r#"{{ id: "d{i:02}", uri: "lin://d{i:02}", title: "Node {i}" }}"#))
+            .collect();
+        let data = format!(
+            "insert accounts [{}]\ninsert events [{}]\ninsert docs {{ id: \"d00\", uri: \"lin://d00\", title: \"Node 0\" }} with edge wikilink -> \"d01\"\ninsert docs {{ id: \"d01\", uri: \"lin://d01\", title: \"Node 1\" }} with edge wikilink -> \"d02\"\ninsert docs {{ id: \"d02\", uri: \"lin://d02\", title: \"Node 2\" }} with edge wikilink -> \"d03\"\ninsert docs {{ id: \"d03\", uri: \"lin://d03\", title: \"Node 3\" }}\ninsert docs [{}]",
+            accts.join(","),
+            evs.join(","),
+            docs.join(",")
+        );
+        cold_db.run(&data).unwrap();
+        hot_db.run(&data).unwrap();
+        cold_db.checkpoint().unwrap();
+        cold_db.close().unwrap();
+
+        let mut cold_db = Db::open_with(&dir.0, opts).unwrap();
+        cold_db
+            .run("fk events.acct_code -> accounts.code\ncol small_ev { id: text, acct_code: text }\nfk small_ev.acct_code -> accounts.code\ninsert small_ev [{ id: \"s1\", acct_code: \"C03\" }, { id: \"s2\", acct_code: \"C07\" }]")
+            .unwrap();
+        assert!(cold_db.store.is_disk_backed("accounts"));
+        assert!(cold_db.store.is_disk_backed("events"));
+        assert!(cold_db.store.is_disk_backed("docs"));
+
+        // 1a. Cold DiskJoinCursor on non-`id` FK (`events.acct_code -> accounts.code`).
+        let crate::Stmt::Query(q_join) = crate::parse(
+            "events | join accounts on acct_code | pick { id, accounts.tier, amt } | take 10",
+        )
+        .unwrap() else {
+            panic!("expected query");
+        };
+        let cur_join = cold_db.cursor(&q_join).unwrap();
+        assert!(cur_join.is_lazy(), "expected lazy DiskJoinCursor for non-id FK");
+        let cur_rows: Vec<_> = cur_join.collect::<Result<Vec<_>, _>>().unwrap();
+        let hot_rows = hot_db
+            .run("events | join accounts on acct_code | pick { id, accounts.tier, amt } | take 10")
+            .unwrap()
+            .into_rows();
+        assert_eq!(cur_rows, hot_rows);
+        assert!(!cold_db.store.disk_rows_materialized("events"));
+        assert!(!cold_db.store.disk_rows_materialized("accounts"));
+
+        // 1b. Hot-left -> cold-right LazyJoinCursor on non-`id` FK (`small_ev.acct_code -> accounts.code`).
+        let crate::Stmt::Query(q_lazy_join) = crate::parse(
+            "small_ev | join accounts on acct_code | pick { id, accounts.tier } | take 10",
+        )
+        .unwrap() else {
+            panic!("expected query");
+        };
+        let cur_lazy_join = cold_db.cursor(&q_lazy_join).unwrap();
+        assert!(
+            cur_lazy_join.is_lazy(),
+            "expected lazy LazyJoinCursor for hot-left cold-right non-id FK"
+        );
+        let lazy_rows: Vec<_> = cur_lazy_join.collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(lazy_rows.len(), 2);
+        assert!(!cold_db.store.disk_rows_materialized("accounts"));
+
+        // 2. Cold multi-hop cursor (`hop wikilink depth=3`) without hydrating `docs`.
+        let crate::Stmt::Query(q_hop) = crate::parse(
+            r#"docs | id == "d00" | hop wikilink depth=3 | pick { id, title } | take all"#,
+        )
+        .unwrap() else {
+            panic!("expected query");
+        };
+        let cur_hop = cold_db.cursor(&q_hop).unwrap();
+        assert!(cur_hop.is_lazy(), "expected lazy DiskIdsCursor for depth-3 hop");
+        let hop_rows: Vec<_> = cur_hop.collect::<Result<Vec<_>, _>>().unwrap();
+        let hot_hop = hot_db
+            .run(r#"docs | id == "d00" | hop wikilink depth=3 | pick { id, title } | take all"#)
+            .unwrap()
+            .into_rows();
+        assert_eq!(hop_rows, hot_hop);
+        assert_eq!(hop_rows.len(), 3);
+        assert!(!cold_db.store.disk_rows_materialized("docs"));
+    }
+
+    #[test]
+    fn window_columnar_group_filter_without_and_sparse_rows() {
+        let mut db = Db::empty();
+        db.run("col items { id: text, grp: text, score: i64, note: text }")
+            .unwrap();
+        // Mix rows with `note` present and rows with `note` omitted!
+        db.run(
+            r#"insert items [
+                { id: "i1", grp: "a", score: 30, note: "present" },
+                { id: "i2", grp: "a", score: 10 },
+                { id: "i3", grp: "b", score: 20, note: "also" },
+                { id: "i4", grp: "b", score: 40 }
+            ]"#,
+        )
+        .unwrap();
+
+        // 1. Unprojected window over mixed-sparsity rows preserves absent vs present keys!
+        let rows = db
+            .run("items | window rank by grp sort score desc as rnk | sort id asc | take all")
+            .unwrap()
+            .into_rows();
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0].get("note").and_then(Cell::text), Some("present"));
+        assert!(!rows[1].contains_key("note"), "absent field must stay absent");
+        assert_eq!(rows[0].get("rnk"), Some(&Cell::Int(1)));
+        assert_eq!(rows[1].get("rnk"), Some(&Cell::Int(2)));
+
+        // 2. Post-window filter + group (`count by`) + project via `run_batch` and `run`!
+        let q_grp = "items | window rank by grp sort score desc as rnk | rnk <= 1 | count by grp";
+        let prep = db.prepare(q_grp).unwrap();
+        let batch_rows = prep.run_batch(&mut db).unwrap().to_rows();
+        let eager_rows = db.run(q_grp).unwrap().into_rows();
+        assert_eq!(batch_rows, eager_rows);
+        assert_eq!(batch_rows.len(), 2);
+
+        // 3. `without` after window.
+        let q_wo =
+            "items | window row_number by grp sort score desc as rn | without { note } | sort id asc | take all";
+        let wo_rows = db.run(q_wo).unwrap().into_rows();
+        assert!(wo_rows.iter().all(|r| !r.contains_key("note") && r.contains_key("rn")));
+    }
+
+    #[test]
+    fn persisted_insert_batch_registers_direct_segment_and_exports_wal() {
+        let primary_dir = Temp(std::env::temp_dir().join(format!(
+            "lin-p41-pri-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        )));
+        let follower_dir = Temp(std::env::temp_dir().join(format!(
+            "lin-p41-fol-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        )));
+        let opts = crate::OpenOpts {
+            cold: true,
+            sync: crate::persist::SyncMode::Normal,
+        };
+        let mut primary = Db::open_with(&primary_dir.0, opts).unwrap();
+        let mut follower = Db::open_follower_with(&follower_dir.0, opts).unwrap();
+
+        primary
+            .run("col telemetry { id: text, host: text, latency: i64 }")
+            .unwrap();
+        let n = 5_000usize;
+        let mut batch = crate::batch::RecordBatch::with_capacity(
+            std::sync::Arc::from([
+                String::from("id"),
+                String::from("host"),
+                String::from("latency"),
+            ]),
+            n,
+        );
+        for i in 0..n {
+            batch.cols[0].push(Cell::from_text(format!("t{i:05}")));
+            batch.cols[1].push(Cell::from_text(format!("h{}", i % 8)));
+            batch.cols[2].push(Cell::Int(i as i64));
+        }
+        let done = primary.insert_batch("telemetry", &batch).unwrap();
+        assert_eq!(done.n, n);
+        assert!(
+            primary.store.is_disk_backed("telemetry")
+                && !primary.store.disk_rows_materialized("telemetry"),
+            "5k insert_batch under Persist WAL should write an immutable cold segment directly"
+        );
+        assert!(
+            primary
+                .store
+                .disk_engine_read()
+                .is_some_and(|e| !e.table_has_dirty_overlay("telemetry")),
+            "direct segment insert_batch must bypass the memtable overlay"
+        );
+
+        // Export WAL to an isolated follower directory (no shared `segments/` folder!).
+        let wal = primary.export_wal_since(0).unwrap();
+        follower.apply_wal(&wal).unwrap();
+        assert_eq!(
+            follower.run("telemetry | count").unwrap().scalar().unwrap(),
+            Cell::Int(n as i64)
+        );
+
+        // Reopen primary without checkpointing to verify `Pack::RegisterSegment` WAL replay!
+        drop(primary);
+        let mut reopened = Db::open_with(&primary_dir.0, opts).unwrap();
+        assert!(reopened.store.is_disk_backed("telemetry"));
+        assert_eq!(
+            reopened.run("telemetry | count").unwrap().scalar().unwrap(),
+            Cell::Int(n as i64)
+        );
+        reopened.close().unwrap();
+        follower.close().unwrap();
+    }
 }

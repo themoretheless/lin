@@ -5,24 +5,27 @@
 //! - `collection | filter? | join|left_join right on f | project? | skip* | take?`
 //!   (nested-loop: left scan/index + point lookup on the right via FK)
 //! - Hot SoA: `orders [| total >] | join users on user_id | { id, users.email, total }`
-//! - `collection | filter? | hop rel` (depth 1) `| project? | skip* | take?`
+//! - `collection | filter? | hop rel [1..=3]` `| project? | skip* | take?`
 //! - `collection | search lex|hybrid|vec "…" | project? | skip* | take?` (FTS / vector candidates)
 //!
-//! graph / match / sort / union / hop depth>1 / multi-join → **buffered**.
+//! graph / match / sort / union / multi-join → **buffered**.
 
 use std::cell::RefCell;
 use std::collections::{BTreeSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use crate::ast::{Pred, Query, SearchMode, Source, Step, Stmt};
+use crate::ast::{CmpOp, Field, Pred, Query, SearchMode, Source, Step, Stmt, Value};
 use crate::error::Error;
+use crate::eval::OwnedPredSlots;
 use crate::exec::{
-    Db, JoinFieldPlan, PredSlots, ReadDb, emit_join_row, eval_pred, field_names,
-    plan_join_fields, pred_total_gt, project_join_fields,
+    Db, JoinFieldPlan, PredSlots, ReadDb, emit_join_row, field_names, plan_join_fields,
+    pred_total_gt, project_join_fields,
 };
 use crate::query::Queryable;
-use crate::store::{Cell, Row, Store, cell_from_arc_inline, now_ms, project_fields, row_text};
+use crate::store::{
+    Cell, OwnedRowProjector, Row, Store, cell_from_arc_inline, now_ms, project_fields, row_text,
+};
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 use smallvec::{SmallVec, smallvec};
 
@@ -215,6 +218,7 @@ struct DiskIdsCursor {
     fallback_col: Option<String>,
     ids: Vec<Arc<str>>,
     pos: usize,
+    resolved_left: Option<usize>,
     project: Option<Arc<[String]>>,
     skip_left: usize,
     take_left: Option<usize>,
@@ -222,7 +226,7 @@ struct DiskIdsCursor {
 
 fn next_disk_ids(store: &Store, cur: &mut DiskIdsCursor) -> Option<Result<Row, Error>> {
     loop {
-        if cur.take_left == Some(0) || cur.pos >= cur.ids.len() {
+        if cur.take_left == Some(0) || cur.resolved_left == Some(0) || cur.pos >= cur.ids.len() {
             return None;
         }
         let key = &cur.ids[cur.pos];
@@ -269,6 +273,9 @@ fn next_disk_ids(store: &Store, cur: &mut DiskIdsCursor) -> Option<Result<Row, E
         let Some(row) = row else {
             continue;
         };
+        if let Some(rem) = cur.resolved_left.as_mut() {
+            *rem -= 1;
+        }
         if cur.skip_left > 0 {
             cur.skip_left -= 1;
             continue;
@@ -299,18 +306,65 @@ struct DiskStreamCursor {
 /// Rows fetched per engine call; small enough that `take 10` does not read a segment.
 const DISK_STREAM_CHUNK: usize = 256;
 
-/// `left | filter? | join [left] right on f | project? | skip* | take?` with a cold side
-/// and an `id` foreign key: left rows come from [`DiskStreamCursor`] (filter pushed into
-/// the scan, no projection), right rows from one point read per distinct key.
+/// Fetch all live rows in a cold `right_col` matching `key` on non-`id` `to_field`,
+/// matching `eval_join`'s `cell_key` rules (`Text`/`SmallText` and decimal `Int`) without
+/// hydrating the cold table.
+fn fetch_cold_non_id_right_rows(
+    store: &Store,
+    right_col: &str,
+    to_field: &str,
+    key: &str,
+    proj_fields: Option<&[String]>,
+) -> Result<Vec<Row>, Error> {
+    let Some(eng) = store.disk_engine_read() else {
+        return Err(Error::runtime("disk engine unavailable"));
+    };
+    let can_use_text_eq = key.parse::<i64>().is_err()
+        && eng.manifest.tables.get(right_col).is_some_and(|sch| {
+            sch.columns.iter().all(|c| {
+                c.name != to_field || !matches!(c.kind, crate::disk::DiskColKind::Int64)
+            })
+        });
+    if can_use_text_eq {
+        let pred = Pred::Cmp {
+            field: Field::name(to_field),
+            op: CmpOp::Eq,
+            value: Value::String(Arc::from(key)),
+        };
+        let proj_refs: Option<Vec<&str>> =
+            proj_fields.map(|fs| fs.iter().map(String::as_str).collect());
+        return eng.query_filter(right_col, Some(&pred), None, proj_refs.as_deref(), 0);
+    }
+    let mut keys = FxHashSet::default();
+    keys.insert(key.to_string());
+    let mut hits = Vec::new();
+    eng.scan_by_key_set(right_col, to_field, &keys, |r| {
+        hits.push(match proj_fields {
+            Some(fs) => project_fields(&r, fs),
+            None => r,
+        });
+        Ok(true)
+    })?;
+    Ok(hits)
+}
+
+/// `left | filter? | join [left] right on f | project? | skip* | take?` with a cold left side:
+/// left rows come from [`DiskStreamCursor`] (filter pushed into the scan, no projection),
+/// right rows from point reads (`to_field == "id"`) or memoized key probes (`to_field != "id"`).
 struct DiskJoinCursor {
     left: DiskStreamCursor,
     right_col: String,
     on: String,
+    to_field: String,
     left_join: bool,
     project: Option<Vec<String>>,
     skip_left: usize,
     take_left: Option<usize>,
+    emitted: usize,
+    max_expansion: usize,
     memo: FxHashMap<String, Option<Row>>,
+    multi_memo: FxHashMap<String, Vec<Row>>,
+    pending: VecDeque<Row>,
 }
 
 fn next_disk_join(store: &Store, cur: &mut DiskJoinCursor) -> Option<Result<Row, Error>> {
@@ -318,48 +372,168 @@ fn next_disk_join(store: &Store, cur: &mut DiskJoinCursor) -> Option<Result<Row,
         if cur.take_left == Some(0) {
             return None;
         }
+        if let Some(row) = cur.pending.pop_front() {
+            if cur.skip_left > 0 {
+                cur.skip_left -= 1;
+                continue;
+            }
+            if let Some(n) = cur.take_left.as_mut() {
+                *n -= 1;
+            }
+            return Some(Ok(row));
+        }
         let left = match next_disk_stream(store, &mut cur.left)? {
             Ok(row) => row,
             Err(e) => return Some(Err(e)),
         };
-        let right = match left.get(&cur.on).and_then(Cell::text) {
-            None => None,
-            Some(key) => {
-                if !cur.memo.contains_key(key) {
-                    let found = if store.is_disk_backed(&cur.right_col) {
-                        match store.disk_engine_read() {
-                            Some(eng) => match eng.get_by_id(&cur.right_col, key) {
-                                Ok(row) => row,
-                                Err(e) => return Some(Err(e)),
-                            },
-                            None => None,
+        if cur.to_field == "id" {
+            let right = match left.get(&cur.on).and_then(Cell::text) {
+                None => None,
+                Some(key) => {
+                    if !cur.memo.contains_key(key) {
+                        let found = if store.is_disk_backed(&cur.right_col) {
+                            match store.disk_engine_read() {
+                                Some(eng) => match eng.get_by_id(&cur.right_col, key) {
+                                    Ok(row) => row,
+                                    Err(e) => return Some(Err(e)),
+                                },
+                                None => None,
+                            }
+                        } else {
+                            store.get_by_id(&cur.right_col, key).cloned()
+                        };
+                        if cur.memo.len() < 8192 {
+                            cur.memo.insert(key.to_string(), found.clone());
+                            cur.memo.get(key).and_then(Option::as_ref)
+                        } else {
+                            // Avoid unbounded memo growth on high-cardinality keys.
+                            cur.memo.clear();
+                            cur.memo.insert(key.to_string(), found);
+                            cur.memo.get(key).and_then(Option::as_ref)
                         }
                     } else {
-                        store.get_by_id(&cur.right_col, key).cloned()
-                    };
-                    cur.memo.insert(key.to_string(), found);
+                        cur.memo.get(key).and_then(Option::as_ref)
+                    }
                 }
-                cur.memo.get(key).and_then(Option::as_ref)
+            };
+            if right.is_none() && !cur.left_join {
+                continue;
+            }
+            cur.emitted += 1;
+            if cur.emitted > cur.max_expansion {
+                cur.take_left = Some(0);
+                return Some(Err(Error::runtime(format!(
+                    "Cartesian join expansion {} exceeds max_join_expansion quota {}",
+                    cur.emitted, cur.max_expansion
+                ))));
+            }
+            if cur.skip_left > 0 {
+                cur.skip_left -= 1;
+                continue;
+            }
+            if let Some(n) = cur.take_left.as_mut() {
+                *n -= 1;
+            }
+            let row = match &cur.project {
+                Some(fields) => {
+                    crate::exec::project_join_fields(&left, right, &cur.right_col, fields)
+                }
+                None => match right {
+                    Some(r) => crate::exec::merge_join_row(left, r, &cur.right_col),
+                    None => left,
+                },
+            };
+            return Some(Ok(row));
+        }
+
+        // Non-id foreign key: match `cell_key_ref` (`Text` / `SmallText` / `Int`).
+        let key_opt = left
+            .get(&cur.on)
+            .and_then(crate::exec::cell_key_ref)
+            .map(|c| c.into_owned());
+        let hits: Vec<Row> = match key_opt {
+            None => Vec::new(),
+            Some(ref k) => {
+                if let Some(cached) = cur.multi_memo.get(k.as_str()) {
+                    cached.clone()
+                } else {
+                    let fetched = if store.is_disk_backed(&cur.right_col) {
+                        match fetch_cold_non_id_right_rows(
+                            store,
+                            &cur.right_col,
+                            &cur.to_field,
+                            k,
+                            None,
+                        ) {
+                            Ok(rows) => rows,
+                            Err(e) => {
+                                cur.take_left = Some(0);
+                                return Some(Err(e));
+                            }
+                        }
+                    } else {
+                        store
+                            .collection(&cur.right_col)
+                            .iter()
+                            .filter(|r| {
+                                r.get(&cur.to_field)
+                                    .and_then(crate::exec::cell_key_ref)
+                                    .is_some_and(|rk| rk.as_ref() == k.as_str())
+                            })
+                            .cloned()
+                            .collect()
+                    };
+                    if cur.multi_memo.len() < 4096 {
+                        cur.multi_memo.insert(k.clone(), fetched.clone());
+                    }
+                    fetched
+                }
             }
         };
-        if right.is_none() && !cur.left_join {
+        if hits.is_empty() {
+            if cur.left_join {
+                cur.emitted += 1;
+                if cur.emitted > cur.max_expansion {
+                    cur.take_left = Some(0);
+                    return Some(Err(Error::runtime(format!(
+                        "Cartesian join expansion {} exceeds max_join_expansion quota {}",
+                        cur.emitted, cur.max_expansion
+                    ))));
+                }
+                let out = match &cur.project {
+                    Some(fields) => {
+                        crate::exec::project_join_fields(&left, None, &cur.right_col, fields)
+                    }
+                    None => left,
+                };
+                cur.pending.push_back(out);
+            }
             continue;
         }
-        if cur.skip_left > 0 {
-            cur.skip_left -= 1;
-            continue;
+        for (i, r) in hits.iter().enumerate() {
+            cur.emitted += 1;
+            if cur.emitted > cur.max_expansion {
+                cur.take_left = Some(0);
+                return Some(Err(Error::runtime(format!(
+                    "Cartesian join expansion {} exceeds max_join_expansion quota {}",
+                    cur.emitted, cur.max_expansion
+                ))));
+            }
+            let out = match &cur.project {
+                Some(fields) => {
+                    crate::exec::project_join_fields(&left, Some(r), &cur.right_col, fields)
+                }
+                None => {
+                    let base = if i + 1 == hits.len() {
+                        left.clone()
+                    } else {
+                        left.clone()
+                    };
+                    crate::exec::merge_join_row(base, r, &cur.right_col)
+                }
+            };
+            cur.pending.push_back(out);
         }
-        if let Some(n) = cur.take_left.as_mut() {
-            *n -= 1;
-        }
-        let row = match &cur.project {
-            Some(fields) => crate::exec::project_join_fields(&left, right, &cur.right_col, fields),
-            None => match right {
-                Some(r) => crate::exec::merge_join_row(left, r, &cur.right_col),
-                None => left,
-            },
-        };
-        return Some(Ok(row));
     }
 }
 
@@ -392,17 +566,13 @@ fn try_disk_join(db: &CursorDb<'_>, q: &Query) -> Option<DiskJoinCursor> {
         }
     }
     let (left_join, right_col, on) = join?;
-    if !store.is_disk_backed(name) && !store.is_disk_backed(right_col) {
+    if !store.is_disk_backed(name) {
         return None;
     }
-    // Only an `id` foreign key maps to point reads; other keys go through the executor.
     let to_field = catalog
         .find_fk(name, on, right_col)
         .map(|fk| fk.to_field.as_str())
         .unwrap_or("id");
-    if to_field != "id" || !store.is_disk_backed(name) {
-        return None;
-    }
     Some(DiskJoinCursor {
         left: DiskStreamCursor {
             collection: name.clone(),
@@ -416,6 +586,7 @@ fn try_disk_join(db: &CursorDb<'_>, q: &Query) -> Option<DiskJoinCursor> {
         },
         right_col: right_col.to_string(),
         on: on.to_string(),
+        to_field: to_field.to_string(),
         left_join,
         project,
         skip_left: skip_n,
@@ -424,7 +595,11 @@ fn try_disk_join(db: &CursorDb<'_>, q: &Query) -> Option<DiskJoinCursor> {
             Some(None) => None,
             None => Some(50),
         },
+        emitted: 0,
+        max_expansion: db.inner().quotas.max_join_expansion,
         memo: FxHashMap::default(),
+        multi_memo: FxHashMap::default(),
+        pending: VecDeque::new(),
     })
 }
 
@@ -479,12 +654,46 @@ struct LazyCursor {
     collection: String,
     source: RowSource,
     pos: usize,
-    pred: Option<Pred>,
+    pred_slots: Option<OwnedPredSlots>,
     need_filter: bool,
     project: Option<Arc<[String]>>,
+    projector: Option<OwnedRowProjector>,
     skip_left: usize,
     take_left: Option<usize>,
     now: i64,
+}
+
+impl LazyCursor {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        collection: String,
+        source: RowSource,
+        pred: Option<&Pred>,
+        need_filter: bool,
+        project: Option<Arc<[String]>>,
+        skip_left: usize,
+        take_left: Option<usize>,
+        now: i64,
+    ) -> Self {
+        let pred_slots = if need_filter {
+            pred.map(OwnedPredSlots::new)
+        } else {
+            None
+        };
+        let projector = project.as_deref().map(OwnedRowProjector::new);
+        Self {
+            collection,
+            source,
+            pos: 0,
+            pred_slots,
+            need_filter,
+            project,
+            projector,
+            skip_left,
+            take_left,
+            now,
+        }
+    }
 }
 
 struct LazyJoinCursor {
@@ -497,10 +706,13 @@ struct LazyJoinCursor {
     /// When `to_field == "id"` and project is set: hash-built right cells.
     right_probe: Option<FxHashMap<String, Vec<Cell>>>,
     join_plan: Option<Vec<JoinFieldPlan>>,
-    left_fields: Option<Vec<String>>,
+    left_projector: Option<OwnedRowProjector>,
     right_on_disk: bool,
     right_proj_fields: Option<Vec<String>>,
     disk_right_memo: FxHashMap<String, Option<Row>>,
+    multi_right_memo: FxHashMap<String, Vec<Row>>,
+    emitted: usize,
+    max_expansion: usize,
     skip_left: usize,
     take_left: Option<usize>,
     pending: VecDeque<Row>,
@@ -710,8 +922,8 @@ impl Iterator for QueryCursor<'_> {
 fn next_lazy(store: &Store, lazy: &mut LazyCursor) -> Option<Result<Row, Error>> {
     let idx = next_lazy_match_idx(store, lazy)?;
     let row = store.get_by_idx(&lazy.collection, idx)?;
-    let out = if let Some(fields) = &lazy.project {
-        project_fields(row, fields)
+    let out = if let Some(proj) = lazy.projector.as_mut() {
+        proj.project(row)
     } else {
         row.clone()
     };
@@ -725,19 +937,15 @@ fn next_lazy_projected(
 ) -> Option<Result<ProjectedRow, Error>> {
     let idx = next_lazy_match_idx(store, lazy)?;
     let row = store.get_by_idx(&lazy.collection, idx)?;
-    let fields = lazy.project.as_ref().expect("projected state checked");
-    let mut cells = SmallVec::with_capacity(fields.len());
-    for field in fields.iter() {
-        cells.push(
-            row.get(field)
-                .map(Cell::clone_for_borrow)
-                .unwrap_or(Cell::Null),
-        );
-    }
-    Some(Ok(ProjectedRow {
-        fields: Arc::clone(fields),
-        cells,
-    }))
+    let fields = Arc::clone(lazy.project.as_ref().expect("projected state checked"));
+    let cells = match lazy.projector.as_mut() {
+        Some(proj) => proj.project_cells(row),
+        None => fields
+            .iter()
+            .map(|f| row.get(f).map(Cell::clone_for_borrow).unwrap_or(Cell::Null))
+            .collect(),
+    };
+    Some(Ok(ProjectedRow { fields, cells }))
 }
 
 #[inline]
@@ -768,8 +976,8 @@ fn next_lazy_match_idx(store: &Store, lazy: &mut LazyCursor) -> Option<usize> {
             continue;
         };
         if lazy.need_filter
-            && let Some(pred) = &lazy.pred
-            && !eval_pred(pred, row, lazy.now)
+            && let Some(slots) = lazy.pred_slots.as_mut()
+            && !slots.eval(row, lazy.now)
         {
             continue;
         }
@@ -800,8 +1008,8 @@ fn next_lazy_join(store: &Store, join: &mut LazyJoinCursor) -> Option<Result<Row
             return Some(Ok(row));
         }
 
-        let left_row = if let Some(fields) = &join.left_fields {
-            next_lazy_raw_projected(store, &mut join.left, fields)?
+        let left_row = if let Some(proj) = join.left_projector.as_mut() {
+            next_lazy_raw_projected(store, &mut join.left, proj)?
         } else {
             next_lazy_raw(store, &mut join.left)?
         };
@@ -817,6 +1025,14 @@ fn next_lazy_join(store: &Store, join: &mut LazyJoinCursor) -> Option<Result<Row
             let right_cells = key.and_then(|k| probe.get(k).map(|v| v.as_slice()));
             if right_cells.is_none() && !join.left_join {
                 continue;
+            }
+            join.emitted += 1;
+            if join.emitted > join.max_expansion {
+                join.take_left = Some(0);
+                return Some(Err(Error::runtime(format!(
+                    "Cartesian join expansion {} exceeds max_join_expansion quota {}",
+                    join.emitted, join.max_expansion
+                ))));
             }
             let out = emit_join_row(&left_row, right_cells, plan);
             if join.skip_left > 0 {
@@ -863,6 +1079,14 @@ fn next_lazy_join(store: &Store, join: &mut LazyJoinCursor) -> Option<Result<Row
             if owned_right.is_none() && !join.left_join {
                 continue;
             }
+            join.emitted += 1;
+            if join.emitted > join.max_expansion {
+                join.take_left = Some(0);
+                return Some(Err(Error::runtime(format!(
+                    "Cartesian join expansion {} exceeds max_join_expansion quota {}",
+                    join.emitted, join.max_expansion
+                ))));
+            }
             let out = if let Some(fields) = join.project.as_deref() {
                 project_join_fields(&left_row, owned_right.as_ref(), &join.right_col, fields)
             } else if let Some(r) = owned_right {
@@ -894,6 +1118,14 @@ fn next_lazy_join(store: &Store, join: &mut LazyJoinCursor) -> Option<Result<Row
             if right.is_none() && !join.left_join {
                 continue;
             }
+            join.emitted += 1;
+            if join.emitted > join.max_expansion {
+                join.take_left = Some(0);
+                return Some(Err(Error::runtime(format!(
+                    "Cartesian join expansion {} exceeds max_join_expansion quota {}",
+                    join.emitted, join.max_expansion
+                ))));
+            }
             let out = if let Some(fields) = join.project.as_deref() {
                 project_join_fields(&left_row, right, &join.right_col, fields)
             } else if let Some(r) = right {
@@ -915,28 +1147,83 @@ fn next_lazy_join(store: &Store, join: &mut LazyJoinCursor) -> Option<Result<Row
             return Some(Ok(out));
         }
 
-        // Non-id: clone via project_by_key (rare for catalog FKs).
-        let mut hits = Vec::new();
-        if let Some(k) = key
-            && let Some(r) = store.project_by_key(&join.right_col, &join.to_field, k, None)
-        {
-            hits.push(r);
-        }
+        // Non-id join key (cold or hot right side): match `cell_key_ref` (`Text`/`SmallText`/`Int`).
+        let non_id_key = left_row
+            .get(&join.on)
+            .and_then(crate::exec::cell_key_ref)
+            .map(|c| c.into_owned());
+        let hits: Vec<Row> = match non_id_key {
+            None => Vec::new(),
+            Some(ref k) => {
+                if let Some(cached) = join.multi_right_memo.get(k.as_str()) {
+                    cached.clone()
+                } else {
+                    let fetched = if join.right_on_disk {
+                        match fetch_cold_non_id_right_rows(
+                            store,
+                            &join.right_col,
+                            &join.to_field,
+                            k,
+                            join.right_proj_fields.as_deref(),
+                        ) {
+                            Ok(rows) => rows,
+                            Err(e) => {
+                                join.take_left = Some(0);
+                                return Some(Err(e));
+                            }
+                        }
+                    } else {
+                        store
+                            .collection(&join.right_col)
+                            .iter()
+                            .filter(|r| {
+                                r.get(&join.to_field)
+                                    .and_then(crate::exec::cell_key_ref)
+                                    .is_some_and(|rk| rk.as_ref() == k.as_str())
+                            })
+                            .cloned()
+                            .collect()
+                    };
+                    if join.multi_right_memo.len() < 4096 {
+                        join.multi_right_memo.insert(k.clone(), fetched.clone());
+                    }
+                    fetched
+                }
+            }
+        };
 
         if hits.is_empty() {
             if join.left_join {
-                let out = apply_project(&left_row, join.project.as_deref());
+                join.emitted += 1;
+                if join.emitted > join.max_expansion {
+                    join.take_left = Some(0);
+                    return Some(Err(Error::runtime(format!(
+                        "Cartesian join expansion {} exceeds max_join_expansion quota {}",
+                        join.emitted, join.max_expansion
+                    ))));
+                }
+                let out = match join.project.as_deref() {
+                    Some(fields) => project_join_fields(&left_row, None, &join.right_col, fields),
+                    None => left_row,
+                };
                 join.pending.push_back(out);
             }
             continue;
         }
 
-        for r in hits {
-            let mut merged = left_row.clone();
-            for (k, v) in r {
-                crate::exec::insert_prefixed(&mut merged, &join.right_col, &k, v);
+        for r in &hits {
+            join.emitted += 1;
+            if join.emitted > join.max_expansion {
+                join.take_left = Some(0);
+                return Some(Err(Error::runtime(format!(
+                    "Cartesian join expansion {} exceeds max_join_expansion quota {}",
+                    join.emitted, join.max_expansion
+                ))));
             }
-            let out = apply_project(&merged, join.project.as_deref());
+            let out = match join.project.as_deref() {
+                Some(fields) => project_join_fields(&left_row, Some(r), &join.right_col, fields),
+                None => crate::exec::merge_join_row(left_row.clone(), r, &join.right_col),
+            };
             join.pending.push_back(out);
         }
     }
@@ -968,8 +1255,8 @@ fn next_lazy_raw(store: &Store, lazy: &mut LazyCursor) -> Option<Result<Row, Err
             continue;
         };
         if lazy.need_filter
-            && let Some(pred) = &lazy.pred
-            && !eval_pred(pred, row, lazy.now)
+            && let Some(slots) = lazy.pred_slots.as_mut()
+            && !slots.eval(row, lazy.now)
         {
             continue;
         }
@@ -980,7 +1267,7 @@ fn next_lazy_raw(store: &Store, lazy: &mut LazyCursor) -> Option<Result<Row, Err
 fn next_lazy_raw_projected(
     store: &Store,
     lazy: &mut LazyCursor,
-    fields: &[String],
+    projector: &mut OwnedRowProjector,
 ) -> Option<Result<Row, Error>> {
     loop {
         let idx = match &lazy.source {
@@ -1005,19 +1292,12 @@ fn next_lazy_raw_projected(
             continue;
         };
         if lazy.need_filter
-            && let Some(pred) = &lazy.pred
-            && !eval_pred(pred, row, lazy.now)
+            && let Some(slots) = lazy.pred_slots.as_mut()
+            && !slots.eval(row, lazy.now)
         {
             continue;
         }
-        return Some(Ok(project_fields(row, fields)));
-    }
-}
-
-fn apply_project(row: &Row, project: Option<&[String]>) -> Row {
-    match project {
-        Some(fields) => project_fields(row, fields),
-        None => row.clone(),
+        return Some(Ok(projector.project(row)));
     }
 }
 
@@ -1100,17 +1380,16 @@ fn try_lazy_simple(db: &CursorDb<'_>, q: &Query) -> Result<Option<LazyCursor>, E
     };
     let (source, need_filter) = build_left_source(store, catalog, name, filter, now);
 
-    Ok(Some(LazyCursor {
-        collection: name.clone(),
+    Ok(Some(LazyCursor::new(
+        name.clone(),
         source,
-        pos: 0,
-        pred: filter.cloned(),
+        filter,
         need_filter,
-        project: project.map(Into::into),
-        skip_left: skip_n,
+        project.map(Into::into),
+        skip_n,
         take_left,
         now,
-    }))
+    )))
 }
 
 /// `col | filter? | project? | skip* | take?` over a cold collection.
@@ -1233,6 +1512,7 @@ fn try_lazy_search<'a>(db: &CursorDb<'a>, q: &Query) -> Result<Option<CursorStat
             fallback_col: None,
             ids,
             pos: 0,
+            resolved_left: None,
             project: project.map(Into::into),
             skip_left: skip_n,
             take_left,
@@ -1243,17 +1523,16 @@ fn try_lazy_search<'a>(db: &CursorDb<'a>, q: &Query) -> Result<Option<CursorStat
         let col = store.collection(name);
         let ranked = db.vector_search_indices(col, query, rank_limit)?;
         let idxs: Vec<usize> = ranked.into_iter().map(|(_, i)| i).collect();
-        return Ok(Some(CursorState::Lazy(LazyCursor {
-            collection: name.clone(),
-            source: RowSource::Idxs(idxs),
-            pos: 0,
-            pred: None,
-            need_filter: false,
-            project: project.map(Into::into),
-            skip_left: skip_n,
+        return Ok(Some(CursorState::Lazy(LazyCursor::new(
+            name.clone(),
+            RowSource::Idxs(idxs),
+            None,
+            false,
+            project.map(Into::into),
+            skip_n,
             take_left,
-            now: now_ms(),
-        })));
+            now_ms(),
+        ))));
     }
 
     if !store.fts_indexed(name) {
@@ -1262,26 +1541,25 @@ fn try_lazy_search<'a>(db: &CursorDb<'a>, q: &Query) -> Result<Option<CursorStat
 
     let idxs = db.search_fts_indices(name, mode, query, rank_limit)?;
 
-    Ok(Some(CursorState::Lazy(LazyCursor {
-        collection: name.clone(),
-        source: RowSource::Idxs(idxs),
-        pos: 0,
-        pred: None,
-        need_filter: false,
-        project: project.map(Into::into),
-        skip_left: skip_n,
+    Ok(Some(CursorState::Lazy(LazyCursor::new(
+        name.clone(),
+        RowSource::Idxs(idxs),
+        None,
+        false,
+        project.map(Into::into),
+        skip_n,
         take_left,
-        now: now_ms(),
-    })))
+        now_ms(),
+    ))))
 }
 
-/// `col | filter? | hop rel` (depth 1) `| project? | skip* | take?`.
+/// `col | filter? | hop rel [1..=3]` `| project? | skip* | take?`.
 fn try_lazy_hop<'a>(db: &CursorDb<'a>, q: &Query) -> Result<Option<CursorState<'a>>, Error> {
     let Source::Collection(name) = &q.source else {
         return Ok(None);
     };
     let mut filter: Option<&Pred> = None;
-    let mut hop_rel: Option<&str> = None;
+    let mut hop_rel: Option<(&str, i64)> = None;
     let mut project: Option<Vec<String>> = None;
     let mut skip_n: usize = 0;
     let mut take_n: Option<Option<i64>> = None;
@@ -1299,12 +1577,11 @@ fn try_lazy_hop<'a>(db: &CursorDb<'a>, q: &Query) -> Result<Option<CursorState<'
                 if hop_rel.is_some() {
                     return Ok(None);
                 }
-                if let Some(d) = depth
-                    && *d != 1
-                {
+                let d = depth.unwrap_or(1);
+                if !(1..=3).contains(&d) {
                     return Ok(None);
                 }
-                hop_rel = Some(rel.as_str());
+                hop_rel = Some((rel.as_str(), d));
             }
             Step::Project(f) => {
                 if hop_rel.is_none()
@@ -1332,7 +1609,7 @@ fn try_lazy_hop<'a>(db: &CursorDb<'a>, q: &Query) -> Result<Option<CursorState<'
         }
     }
 
-    let Some(rel) = hop_rel else {
+    let Some((rel, hop_depth)) = hop_rel else {
         return Ok(None);
     };
 
@@ -1351,7 +1628,7 @@ fn try_lazy_hop<'a>(db: &CursorDb<'a>, q: &Query) -> Result<Option<CursorState<'
     };
 
     // Cold hop: resolve seed keys without materializing the source table, walk in-memory
-    // edges, and pull reached rows lazily by `id` / `uri`.
+    // edges across `1..=3` hops, and pull reached rows lazily by `id` / `uri`.
     if store.is_disk_backed(name) || store.is_disk_backed("docs") {
         #[cfg(feature = "gpu")]
         if db.inner().gpu().is_some() {
@@ -1396,12 +1673,16 @@ fn try_lazy_hop<'a>(db: &CursorDb<'a>, q: &Query) -> Result<Option<CursorState<'
         }
         let rel_arc: Arc<str> = Arc::from(edge_rel);
         let mut reached: BTreeSet<Arc<str>> = BTreeSet::new();
-        for src in &frontier {
-            store.for_each_neighbor_arc(&rel_arc, src, reverse, |dst| {
-                if seen.insert(Arc::clone(dst)) {
-                    reached.insert(Arc::clone(dst));
-                }
-            });
+        for _ in 0..hop_depth {
+            let mut next: Vec<Arc<str>> = Vec::new();
+            for src in &frontier {
+                store.for_each_neighbor_arc(&rel_arc, src, reverse, |dst| {
+                    if seen.insert(Arc::clone(dst)) {
+                        next.push(Arc::clone(dst));
+                        reached.insert(Arc::clone(dst));
+                    }
+                });
+            }
             if seen.len() > db.inner().quotas.max_graph_expansion {
                 return Err(Error::runtime(format!(
                     "graph expansion count {} exceeds max_graph_expansion quota {}",
@@ -1412,14 +1693,19 @@ fn try_lazy_hop<'a>(db: &CursorDb<'a>, q: &Query) -> Result<Option<CursorState<'
             if reached.len() >= 300 {
                 break;
             }
+            frontier = next;
+            if frontier.is_empty() {
+                break;
+            }
         }
-        let ids: Vec<Arc<str>> = reached.into_iter().take(300).collect();
+        let ids: Vec<Arc<str>> = reached.into_iter().collect();
         return Ok(Some(CursorState::DiskIds(DiskIdsCursor {
             collection: "docs".to_string(),
             resolve_doc_uri: true,
             fallback_col: (name != "docs").then(|| name.clone()),
             ids,
             pos: 0,
+            resolved_left: Some(300),
             project: project.map(Into::into),
             skip_left: skip_n,
             take_left,
@@ -1437,6 +1723,9 @@ fn try_lazy_hop<'a>(db: &CursorDb<'a>, q: &Query) -> Result<Option<CursorState<'
 
     #[cfg(feature = "gpu")]
     if db.inner().gpu().is_some() {
+        if hop_depth != 1 {
+            return Ok(None);
+        }
         let mut frontier: BTreeSet<String> = BTreeSet::new();
         collect_gpu_seed_keys(
             db.inner(),
@@ -1467,17 +1756,16 @@ fn try_lazy_hop<'a>(db: &CursorDb<'a>, q: &Query) -> Result<Option<CursorState<'
                 break;
             }
         }
-        return Ok(Some(CursorState::Lazy(LazyCursor {
-            collection: out_collection.to_string(),
-            source: RowSource::Idxs(idxs),
-            pos: 0,
-            pred: None,
-            need_filter: false,
-            project: project.map(Into::into),
-            skip_left: skip_n,
+        return Ok(Some(CursorState::Lazy(LazyCursor::new(
+            out_collection.to_string(),
+            RowSource::Idxs(idxs),
+            None,
+            false,
+            project.map(Into::into),
+            skip_n,
             take_left,
             now,
-        })));
+        ))));
     }
 
     let mut frontier: Vec<Arc<str>> = Vec::new();
@@ -1494,12 +1782,30 @@ fn try_lazy_hop<'a>(db: &CursorDb<'a>, q: &Query) -> Result<Option<CursorState<'
     );
     let rel_arc: Arc<str> = Arc::from(edge_rel);
     let mut reached: BTreeSet<Arc<str>> = BTreeSet::new();
-    for src in &frontier {
-        store.for_each_neighbor_arc(&rel_arc, src, reverse, |dst| {
-            if seen.insert(Arc::clone(dst)) {
-                reached.insert(Arc::clone(dst));
-            }
-        });
+    for _ in 0..hop_depth {
+        let mut next: Vec<Arc<str>> = Vec::new();
+        for src in &frontier {
+            store.for_each_neighbor_arc(&rel_arc, src, reverse, |dst| {
+                if seen.insert(Arc::clone(dst)) {
+                    next.push(Arc::clone(dst));
+                    reached.insert(Arc::clone(dst));
+                }
+            });
+        }
+        if seen.len() > db.inner().quotas.max_graph_expansion {
+            return Err(Error::runtime(format!(
+                "graph expansion count {} exceeds max_graph_expansion quota {}",
+                seen.len(),
+                db.inner().quotas.max_graph_expansion
+            )));
+        }
+        if reached.len() >= 300 {
+            break;
+        }
+        frontier = next;
+        if frontier.is_empty() {
+            break;
+        }
     }
 
     let mut idxs = Vec::new();
@@ -1520,17 +1826,16 @@ fn try_lazy_hop<'a>(db: &CursorDb<'a>, q: &Query) -> Result<Option<CursorState<'
         }
     }
 
-    Ok(Some(CursorState::Lazy(LazyCursor {
-        collection: out_collection.to_string(),
-        source: RowSource::Idxs(idxs),
-        pos: 0,
-        pred: None,
-        need_filter: false,
-        project: project.map(Into::into),
-        skip_left: skip_n,
+    Ok(Some(CursorState::Lazy(LazyCursor::new(
+        out_collection.to_string(),
+        RowSource::Idxs(idxs),
+        None,
+        false,
+        project.map(Into::into),
+        skip_n,
         take_left,
         now,
-    })))
+    ))))
 }
 
 fn neighbor_idx(store: &Store, primary: &str, out_collection: &str, key: &str) -> Option<usize> {
@@ -1931,9 +2236,6 @@ fn try_lazy_join(db: &CursorDb<'_>, q: &Query) -> Result<Option<LazyJoinCursor>,
         .find_fk(name, &on, &right_col)
         .map(|fk| fk.to_field.clone())
         .unwrap_or_else(|| "id".into());
-    if right_on_disk && to_field != "id" {
-        return Ok(None);
-    }
 
     let take_left = match take_n {
         Some(Some(n)) => Some(n.max(0) as usize),
@@ -1942,10 +2244,8 @@ fn try_lazy_join(db: &CursorDb<'_>, q: &Query) -> Result<Option<LazyJoinCursor>,
     };
     let (source, need_filter) = build_left_source(store, catalog, name, filter, now);
 
-    // When `to_field == "id"`, `next_lazy_join` already uses `store.get_by_id(&join.right_col, k)`
-    // in O(1) via `row_by_id` (or `DiskEngine` point reads when `right_on_disk`), so we avoid
-    // building an O(R) `FxHashMap` on every `cursor()` call!
-    let (right_probe, join_plan, left_fields, right_proj_fields) = if to_field == "id" {
+    // Push right-side column projection into cold reads for both `id` and non-`id` joins!
+    let (right_probe, join_plan, left_projector, right_proj_fields) =
         if let Some(ref fields) = project {
             let (right_fields, plan) = plan_join_fields(&right_col, fields);
             let mut left_fields: Vec<String> = plan
@@ -1959,26 +2259,27 @@ fn try_lazy_join(db: &CursorDb<'_>, q: &Query) -> Result<Option<LazyJoinCursor>,
                 left_fields.push(on.clone());
             }
             let r_proj = right_on_disk.then_some(right_fields);
-            (None, None, Some(left_fields), r_proj)
+            (
+                None,
+                None,
+                Some(OwnedRowProjector::new(&left_fields)),
+                r_proj,
+            )
         } else {
             (None, None, None, None)
-        }
-    } else {
-        (None, None, None, None)
-    };
+        };
 
     Ok(Some(LazyJoinCursor {
-        left: LazyCursor {
-            collection: name.clone(),
+        left: LazyCursor::new(
+            name.clone(),
             source,
-            pos: 0,
-            pred: filter.cloned(),
+            filter,
             need_filter,
-            project: None,
-            skip_left: 0,
-            take_left: None,
+            None,
+            0,
+            None,
             now,
-        },
+        ),
         right_col,
         on,
         to_field,
@@ -1986,10 +2287,13 @@ fn try_lazy_join(db: &CursorDb<'_>, q: &Query) -> Result<Option<LazyJoinCursor>,
         project,
         right_probe,
         join_plan,
-        left_fields,
+        left_projector,
         right_on_disk,
         right_proj_fields,
         disk_right_memo: FxHashMap::default(),
+        multi_right_memo: FxHashMap::default(),
+        emitted: 0,
+        max_expansion: db.inner().quotas.max_join_expansion,
         skip_left: skip_n,
         take_left,
         pending: VecDeque::new(),

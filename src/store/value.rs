@@ -722,6 +722,84 @@ impl<'a> RowProjector<'a> {
     }
 }
 
+/// Owned, lifetime-free counterpart of [`RowProjector`] for `Prepared` and `LazyCursor`.
+#[derive(Clone, Debug)]
+pub struct OwnedRowProjector {
+    shape: Option<Arc<Shape>>,
+    /// Slots ordered to match `shape.names()` for `Row::from_parts`.
+    sorted_slots: smallvec::SmallVec<[super::row::OwnedFieldSlot; 8]>,
+    /// Slots ordered to match the caller's requested field slice (for `ProjectedRow`).
+    input_slots: smallvec::SmallVec<[super::row::OwnedFieldSlot; 8]>,
+}
+
+impl OwnedRowProjector {
+    pub fn new(fields: &[String]) -> Self {
+        if fields.is_empty() {
+            return Self {
+                shape: None,
+                sorted_slots: smallvec::SmallVec::new(),
+                input_slots: smallvec::SmallVec::new(),
+            };
+        }
+        let shape = if fields.len() == 2
+            && ((fields[0] == "id" && fields[1] == "title")
+                || (fields[0] == "title" && fields[1] == "id"))
+        {
+            Arc::clone(shape_id_title())
+        } else {
+            Row::shape_of(fields)
+        };
+        let sorted_slots = shape
+            .names()
+            .iter()
+            .map(|target| super::row::OwnedFieldSlot::new(target.as_str()))
+            .collect();
+        let input_slots = fields
+            .iter()
+            .map(|f| super::row::OwnedFieldSlot::new(f.as_str()))
+            .collect();
+        Self {
+            shape: Some(shape),
+            sorted_slots,
+            input_slots,
+        }
+    }
+
+    #[inline]
+    pub fn project(&mut self, row: &Row) -> Row {
+        let Some(ref shape) = self.shape else {
+            return Row::new();
+        };
+        Row::from_parts(
+            Arc::clone(shape),
+            self.sorted_slots
+                .iter_mut()
+                .map(|slot| slot.get(row).map(Cell::clone_for_borrow).unwrap_or(Cell::Null)),
+        )
+    }
+
+    #[inline]
+    pub fn project_sync(&self, row: &Row) -> Row {
+        let Some(ref shape) = self.shape else {
+            return Row::new();
+        };
+        Row::from_parts(
+            Arc::clone(shape),
+            self.sorted_slots
+                .iter()
+                .map(|slot| slot.get_sync(row).map(Cell::clone_for_borrow).unwrap_or(Cell::Null)),
+        )
+    }
+
+    #[inline]
+    pub fn project_cells(&mut self, row: &Row) -> smallvec::SmallVec<[Cell; 4]> {
+        self.input_slots
+            .iter_mut()
+            .map(|slot| slot.get(row).map(Cell::clone_for_borrow).unwrap_or(Cell::Null))
+            .collect()
+    }
+}
+
 pub fn project_fields(row: &Row, fields: &[String]) -> Row {
     if fields.is_empty() {
         return Row::new();

@@ -215,7 +215,8 @@ impl Store {
         phases.snapshot_ms = t1.elapsed().as_secs_f64() * 1000.0;
 
         let t2 = Instant::now();
-        let store = populate_store_from_native_engine(eng, cat, Some(Arc::new(lock)));
+        let mut store = populate_store_from_native_engine(eng, cat, Some(Arc::new(lock)));
+        store.data_dir = Some(dir.to_path_buf());
         phases.indexes_ms = t2.elapsed().as_secs_f64() * 1000.0;
         Ok((store, phases))
     }
@@ -235,7 +236,8 @@ impl Store {
         phases.snapshot_ms = t1.elapsed().as_secs_f64() * 1000.0;
 
         let t2 = Instant::now();
-        let store = populate_store_from_native_engine(eng, cat, None);
+        let mut store = populate_store_from_native_engine(eng, cat, None);
+        store.data_dir = Some(dir.to_path_buf());
         phases.indexes_ms = t2.elapsed().as_secs_f64() * 1000.0;
         Ok((store, lock, phases))
     }
@@ -284,7 +286,9 @@ impl Store {
                 let embed = persist::read_head(dir)?
                     .map(|h| h.embed_id)
                     .unwrap_or_else(|| cat.embed_id.clone());
-                Self::empty(embed)
+                let mut st = Self::empty(embed);
+                st.data_dir = Some(dir.to_path_buf());
+                st
             }
         };
         phases.snapshot_ms = phase.elapsed().as_secs_f64() * 1000.0;
@@ -317,6 +321,7 @@ impl Store {
         };
         let mut replay_hashes: Vec<String> = vec![hash_now(&store)];
         let mut order = ReplayOrder::new(min_gen);
+        let mut has_segment_packs = false;
         let end = persist::replay_log_indexed(
             &mut log,
             min_gen,
@@ -325,6 +330,9 @@ impl Store {
             &mut |rec| {
                 if !order.admit(rec.r#gen)? {
                     return Ok(());
+                }
+                if pack_has_segment(&rec.pack) {
+                    has_segment_packs = true;
                 }
                 store.apply_record(&rec);
                 if pack_changes_schema(&rec.pack) {
@@ -412,6 +420,7 @@ impl Store {
             cold: opts.cold,
             log_bytes: end,
             wal_index,
+            has_segment_packs,
         };
         Ok((store, persist, phases))
     }
@@ -453,7 +462,9 @@ impl Store {
                 let embed = persist::read_head(dir)?
                     .map(|h| h.embed_id)
                     .unwrap_or_else(|| cat.embed_id.clone());
-                Self::empty(embed)
+                let mut st = Self::empty(embed);
+                st.data_dir = Some(dir.to_path_buf());
+                st
             }
         };
         phases.snapshot_ms = phase.elapsed().as_secs_f64() * 1000.0;
@@ -575,6 +586,7 @@ impl Store {
             overlay_savepoint_edges: None,
             disk_cluster_keys: BTreeMap::new(),
             disk_compact_requests: Vec::new(),
+            data_dir: Some(dir.to_path_buf()),
         };
         for name in store.extra_collections.keys() {
             store.collections.entry(name.clone()).or_default();
@@ -1170,6 +1182,7 @@ impl Store {
         persist.writes_since_snapshot = 0;
         persist.log_bytes = 0;
         persist.wal_index.clear();
+        persist.has_segment_packs = false;
         Ok(())
     }
 
@@ -1272,6 +1285,132 @@ impl Store {
                 materialized: OnceLock::new(),
             });
         self.col_counts.insert(table.to_string(), nrows);
+        Ok(())
+    }
+
+    /// Replays a `Pack::RegisterSegment` record by attaching its immutable segment directly
+    /// into `self.disk` (lazily opening a read-only `DiskEngine` on `self.data_dir` if the
+    /// snapshot did not yet list any cold collections).
+    pub(crate) fn apply_register_segment_pack(
+        &mut self,
+        table: &str,
+        schema: DiskTableSchema,
+        meta: crate::disk::SegmentMeta,
+    ) -> Result<(), Error> {
+        if self.disk.is_none() {
+            let Some(ref dir) = self.data_dir else {
+                return Err(Error::runtime(
+                    "RegisterSegment cannot replay without a data directory",
+                ));
+            };
+            let eng = if is_disk_dir(dir) {
+                DiskEngine::open_read_only(dir)?
+            } else {
+                DiskEngine::open(dir, false)?
+            };
+            self.disk = Some(StoreDiskTier {
+                engine: Arc::new(RwLock::new(eng)),
+                tables: BTreeMap::new(),
+                native_disk: false,
+                writer_lock: None,
+            });
+        }
+        let d = self.disk.as_mut().expect("disk tier initialized");
+        let nrows = {
+            let mut eng = d
+                .engine
+                .write()
+                .map_err(|_| Error::runtime("disk engine lock poisoned"))?;
+            eng.attach_registered_segment(table, schema, meta)?;
+            eng.count_table(table)
+        };
+        self.collections.insert(table.to_string(), Vec::new());
+        d.tables
+            .entry(table.to_string())
+            .and_modify(|lazy| {
+                lazy.row_count = nrows;
+                lazy.materialized = OnceLock::new();
+            })
+            .or_insert_with(|| DiskColLazy {
+                row_count: nrows,
+                materialized: OnceLock::new(),
+            });
+        self.col_counts.insert(table.to_string(), nrows);
+        Ok(())
+    }
+
+    /// Writes `batch` directly into an immutable `DiskSegment` under an active `Persist` WAL
+    /// and logs `Pack::RegisterSegment`, completely bypassing the memtable overlay.
+    pub(crate) fn bulk_load_persisted_disk_batch(
+        &mut self,
+        persist: &mut Persist,
+        table: &str,
+        batch: &crate::batch::RecordBatch,
+    ) -> Result<(), Error> {
+        if self.disk.is_none() {
+            let eng = if is_disk_dir(&persist.dir) {
+                DiskEngine::open_read_only(&persist.dir)?
+            } else {
+                let mut e =
+                    DiskEngine::open(&persist.dir, persist.sync == persist::SyncMode::Full)?;
+                e.manifest.embed_id = self.embed_id.clone();
+                e.save_tombstones_and_manifest()?;
+                e
+            };
+            self.disk = Some(StoreDiskTier {
+                engine: Arc::new(RwLock::new(eng)),
+                tables: BTreeMap::new(),
+                native_disk: false,
+                writer_lock: None,
+            });
+        }
+        let (schema, meta) = {
+            let d = self.disk.as_ref().expect("disk tier initialized");
+            let eng = d
+                .engine
+                .read()
+                .map_err(|_| Error::runtime("disk engine lock poisoned"))?;
+            eng.prepare_bulk_segment_batch(
+                table,
+                batch,
+                persist.sync == persist::SyncMode::Full,
+            )?
+        };
+        let pack = Pack::RegisterSegment {
+            collection: table.to_string(),
+            schema: schema.clone(),
+            meta: meta.clone(),
+        };
+        self.durable_commit_ref(persist, &pack)?;
+        persist.has_segment_packs = true;
+        let nrows = {
+            let d = self.disk.as_mut().expect("disk tier initialized");
+            let mut eng = d
+                .engine
+                .write()
+                .map_err(|_| Error::runtime("disk engine lock poisoned"))?;
+            eng.attach_registered_segment(table, schema, meta)?;
+            // Persist `manifest.json` soft-atomically so readers see the new segment without a
+            // second barrier fsync (the segment + `persist.log` are already crash-durable).
+            let _ = eng.save_tombstones_and_manifest_soft();
+            eng.count_table(table)
+        };
+        self.collections.insert(table.to_string(), Vec::new());
+        if let Some(d) = self.disk.as_mut() {
+            d.tables
+                .entry(table.to_string())
+                .and_modify(|lazy| {
+                    lazy.row_count = nrows;
+                    lazy.materialized = OnceLock::new();
+                })
+                .or_insert_with(|| DiskColLazy {
+                    row_count: nrows,
+                    materialized: OnceLock::new(),
+                });
+        }
+        self.col_counts.insert(table.to_string(), nrows);
+        self.r#gen += 1;
+        self.maybe_checkpoint(persist)?;
         Ok(())
     }
 }
@@ -1439,9 +1578,18 @@ pub(crate) fn pack_to_disk_wal_ops(pack: &Pack, out: &mut Vec<crate::disk::DiskW
         | Pack::AppendEdgesBulk { .. }
         | Pack::DeleteEdge { .. }
         | Pack::Reembed
+        | Pack::RegisterSegment { .. }
         | Pack::SchemaRel { .. }
         | Pack::SchemaFilter { .. }
         | Pack::SchemaOwned { .. } => {}
+    }
+}
+
+fn pack_has_segment(pack: &Pack) -> bool {
+    match pack {
+        Pack::RegisterSegment { .. } => true,
+        Pack::Batch { packs } => packs.iter().any(pack_has_segment),
+        _ => false,
     }
 }
 
