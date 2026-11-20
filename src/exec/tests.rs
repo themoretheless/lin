@@ -1724,4 +1724,279 @@ mod preencoded_insert_tests {
         recovered.close().unwrap();
         shared.close().unwrap();
     }
+
+    #[test]
+    fn parallel_and_sequential_exact_sum_chunk_bit_parity() {
+        use crate::ast::Field;
+        let n = 70_000usize; // > PAR_AGG_MIN_ROWS (65_536) across multiple 16_384-row chunks
+        let shape = Row::shape_of(&["grp", "v"]);
+        let mut rows = Vec::with_capacity(n);
+        for i in 0..n {
+            let val = match i % 4 {
+                0 => 1.0e16,
+                1 => (i as f64) * 1.0e-5 + 0.125,
+                2 => -1.0e16,
+                _ => -0.0625,
+            };
+            let grp = if i % 2 == 0 { "even" } else { "odd" };
+            rows.push(Row::from_parts(
+                Arc::clone(&shape),
+                [Cell::text_arc(grp), Cell::Float(val)],
+            ));
+        }
+
+        // Reference chunked ExactSum at PAR_AGG_CHUNK_ROWS = 16_384:
+        let mut ref_total = crate::exact_sum::ExactSum::default();
+        for chunk in rows.chunks(crate::exec::agg::PAR_AGG_CHUNK_ROWS) {
+            let mut part = crate::exact_sum::ExactSum::default();
+            for r in chunk {
+                part.add_cell(r.get("v"));
+            }
+            ref_total.merge(part);
+        }
+
+        let got_sum = crate::exec::agg::agg_sum_filtered(
+            &rows,
+            None,
+            0,
+            &Field::name("v"),
+            None,
+            64 * 1024 * 1024,
+            false,
+        )
+        .unwrap();
+        let got_bits = got_sum[0].get("v").unwrap().as_f64().unwrap().to_bits();
+        assert_eq!(
+            got_bits,
+            ref_total.value().to_bits(),
+            "agg_sum_filtered must match PAR_AGG_CHUNK_ROWS chunked ExactSum bit-for-bit"
+        );
+
+        let got_grp = crate::exec::agg::agg_sum_filtered(
+            &rows,
+            None,
+            0,
+            &Field::name("v"),
+            Some(&Field::name("grp")),
+            64 * 1024 * 1024,
+            false,
+        )
+        .unwrap();
+        assert_eq!(got_grp.len(), 2);
+        let mut ref_even = crate::exact_sum::ExactSum::default();
+        for chunk in rows.chunks(crate::exec::agg::PAR_AGG_CHUNK_ROWS) {
+            let mut p = crate::exact_sum::ExactSum::default();
+            for (idx, r) in chunk.iter().enumerate() {
+                if idx % 2 == 0 {
+                    p.add_cell(r.get("v"));
+                }
+            }
+            ref_even.merge(p);
+        }
+        let even_bits = got_grp[0].get("v").unwrap().as_f64().unwrap().to_bits();
+        assert_eq!(even_bits, ref_even.value().to_bits());
+    }
+
+    #[test]
+    fn materialized_summarize_view_incremental_append_and_rebuild_on_update() {
+        let mut db = Db::fixture();
+        let mut oracle = Db::fixture();
+        let ddl = "col sales { id: text, region: text, user_id: text, amount: i64, ts: time }";
+        db.run(ddl).unwrap();
+        oracle.run(ddl).unwrap();
+
+        let seed = r#"insert sales [
+            { id: "s1", region: "eu", user_id: "u1", amount: 100, ts: timestamp(60000) },
+            { id: "s2", region: "us", user_id: "u2", amount: 250, ts: timestamp(65000) },
+            { id: "s3", region: "eu", user_id: "u1", amount: 50, ts: timestamp(70000) }
+        ]"#;
+        db.run(seed).unwrap();
+        oracle.run(seed).unwrap();
+
+        let q = "sales | summarize { cnt: count(), rev: sum(amount), uniq_u: dcount(user_id) } by region, bin(ts, 1m) | sort region asc | take all";
+        db.create_materialized_view("sales_rollup", q).unwrap();
+        let s0 = db.materialized_view_stats("sales_rollup").unwrap();
+        assert_eq!(s0.full_rebuilds, 1);
+        assert_eq!(s0.incremental_refreshes, 0);
+
+        // Repeat query hits cached result without scanning:
+        let r_cached = db.run(q).unwrap().into_rows();
+        let r_oracle = oracle.run(q).unwrap().into_rows();
+        assert_eq!(r_cached, r_oracle);
+        let s1 = db.materialized_view_stats("sales_rollup").unwrap();
+        assert_eq!(s1.cache_hits, 1);
+        assert_eq!(s1.full_rebuilds, 1);
+
+        // Pure append updates view incrementally (`incremental_refreshes == 1`, `full_rebuilds == 1`):
+        let delta = r#"insert sales [
+            { id: "s4", region: "eu", user_id: "u3", amount: 400, ts: timestamp(80000) },
+            { id: "s5", region: "apac", user_id: "u9", amount: 90, ts: timestamp(130000) }
+        ]"#;
+        db.run(delta).unwrap();
+        oracle.run(delta).unwrap();
+
+        let r_inc = db.run(q).unwrap().into_rows();
+        assert_eq!(r_inc, oracle.run(q).unwrap().into_rows());
+        let s2 = db.materialized_view_stats("sales_rollup").unwrap();
+        assert_eq!(s2.incremental_refreshes, 1);
+        assert_eq!(s2.full_rebuilds, 1);
+
+        // In-place update bumps rewrite_epoch -> safe full rebuild matching oracle:
+        let upd = r#"update sales[id == "s1"] cas each { amount: 900 }"#;
+        db.run(upd).unwrap();
+        oracle.run(upd).unwrap();
+        let r_reb = db.run(q).unwrap().into_rows();
+        assert_eq!(r_reb, oracle.run(q).unwrap().into_rows());
+        let s3 = db.materialized_view_stats("sales_rollup").unwrap();
+        assert_eq!(s3.full_rebuilds, 2);
+    }
+
+    #[test]
+    fn interval_overlap_index_accelerates_time_range_queries_and_matches_scan() {
+        let mut indexed = Db::fixture();
+        let mut scan_oracle = Db::fixture();
+        let ddl = "col spans { id: text, service: text, start_ts: i64, end_ts: i64 }";
+        indexed.run(ddl).unwrap();
+        scan_oracle.run(ddl).unwrap();
+
+        let mut bulk = String::from("insert spans [");
+        for i in 0..800 {
+            if i > 0 {
+                bulk.push(',');
+            }
+            let st = i * 100;
+            let en = st + 250 + (i % 7) * 80;
+            let svc = if i % 2 == 0 { "auth" } else { "billing" };
+            bulk.push_str(&format!(
+                r#"{{ id: "sp-{i:04}", service: "{svc}", start_ts: {st}, end_ts: {en} }}"#
+            ));
+        }
+        bulk.push(']');
+        indexed.run(&bulk).unwrap();
+        scan_oracle.run(&bulk).unwrap();
+
+        indexed
+            .create_interval_index("spans", "start_ts", "end_ts")
+            .unwrap();
+        indexed.enable_catalog_columns(true);
+
+        // Append tail rows after index creation:
+        let tail = r#"insert spans [
+            { id: "sp-tail1", service: "auth", start_ts: 40050, end_ts: 40900 },
+            { id: "sp-tail2", service: "billing", start_ts: 10, end_ts: 99999 }
+        ]"#;
+        indexed.run(tail).unwrap();
+        scan_oracle.run(tail).unwrap();
+
+        for q in [
+            "spans | start_ts <= 40500 and end_ts >= 40200 | sort id asc | take all",
+            r#"spans | start_ts < 40500 and end_ts > 40200 and service == "auth" | pick { id, start_ts, end_ts } | sort id asc | take all"#,
+        ] {
+            let got = indexed.run(q).unwrap().into_rows();
+            let want = scan_oracle.run(q).unwrap().into_rows();
+            assert_eq!(got, want, "mismatch on interval query: {q}");
+            assert!(!got.is_empty());
+        }
+
+        let direct = indexed
+            .query_interval_overlap("spans", "start_ts", "end_ts", 40200, 40500)
+            .unwrap();
+        let want_direct = scan_oracle
+            .run("spans | start_ts <= 40500 and end_ts >= 40200 | take all")
+            .unwrap()
+            .into_rows();
+        assert_eq!(direct, want_direct);
+    }
+
+    #[test]
+    fn repair_catalog_hash_and_strict_embed_dim_policy() {
+        // 1. Db::repair_catalog_hash fixes legacy/mismatched catalog_hash in snapshot & head.
+        let dir = Temp(std::env::temp_dir().join(format!(
+            "lin-cat-repair-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        )));
+        let _ = std::fs::create_dir_all(&dir.0);
+        {
+            let mut db = Db::open(&dir.0).unwrap();
+            db.run("col custom { id: text, v: i64 }").unwrap();
+            db.run(r#"insert custom { id: "c1", v: 42 }"#).unwrap();
+            db.checkpoint().unwrap();
+            db.run(r#"insert custom { id: "c2", v: 99 }"#).unwrap();
+        }
+        // Overwrite `head` with a simulated pre-2026-11-14 catalog_hash:
+        let mut head = crate::persist::read_head(&dir.0).unwrap().unwrap();
+        head.catalog_hash = "h:00000000deadbeef".to_string();
+        crate::persist::write_head(&dir.0, &head).unwrap();
+
+        let err = Db::open(&dir.0).err().expect("stale catalog_hash must fail open");
+        assert!(err.to_string().contains("catalog_hash mismatch"), "{err}");
+
+        let repaired_hash = Db::repair_catalog_hash(&dir.0).unwrap();
+        assert!(repaired_hash.starts_with("h:"));
+        let mut reopened = Db::open(&dir.0).unwrap();
+        assert_eq!(
+            reopened.run("custom | sum v").unwrap().scalar().unwrap(),
+            Cell::Float(141.0)
+        );
+        reopened.close().unwrap();
+
+        // 2. Embedder::dim() policy (`LIN-0504`): strict_embed_dim rejects mismatched vectors.
+        struct BadDimEmbedder;
+        impl crate::embed::Embedder for BadDimEmbedder {
+            fn id(&self) -> &str {
+                "bad/16"
+            }
+            fn dim(&self) -> usize {
+                16
+            }
+            fn embed(&self, _: &str) -> Arc<[f32]> {
+                Arc::from([1.0f32, 0.0, 0.0, 0.0]) // len 4 != dim 16
+            }
+        }
+        let mut db_relaxed = Db::empty().with_embedder(Arc::new(BadDimEmbedder));
+        assert!(!db_relaxed.strict_embed_dim());
+        db_relaxed
+            .run(r#"insert docs { uri: "raw://ok", title: "Allowed when relaxed", layer: "raw" }"#)
+            .unwrap();
+
+        let mut db_strict = Db::empty()
+            .with_embedder(Arc::new(BadDimEmbedder))
+            .with_strict_embed_dim(true);
+        assert!(db_strict.strict_embed_dim());
+        let err = db_strict
+            .run(r#"insert docs { uri: "raw://bad", title: "Rejected when strict", layer: "raw" }"#)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("dimension mismatch"),
+            "expected dimension mismatch error, got: {err}"
+        );
+
+        // 3. Retained `encode_buf` cap (`LIN-0101`): oversized commits shrink back <= 1 MiB.
+        let cap_dir = Temp(std::env::temp_dir().join(format!(
+            "lin-enc-cap-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        )));
+        let _ = std::fs::create_dir_all(&cap_dir.0);
+        let mut cap_db = Db::open_with(
+            &cap_dir.0,
+            crate::OpenOpts {
+                sync: crate::SyncMode::Normal,
+                cold: false,
+            },
+        )
+        .unwrap();
+        let big_body = "x".repeat(2 * 1024 * 1024);
+        cap_db
+            .run(&format!(
+                r#"insert docs {{ uri: "raw://big", title: "Big", layer: "raw", body: "{big_body}" }}"#
+            ))
+            .unwrap();
+        assert!(
+            cap_db.persist.as_ref().unwrap().encode_buf.capacity() <= 1024 * 1024,
+            "retained encode_buf capacity must be bounded <= 1 MiB after oversized commit"
+        );
+        cap_db.close().unwrap();
+    }
 }

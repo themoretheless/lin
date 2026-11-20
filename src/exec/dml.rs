@@ -763,24 +763,20 @@ impl Db {
         Ok(())
     }
 
-    /// Slot-accelerated, deduplicated batch FK check: resolves each row's FK field via
-    /// [`crate::store::row::FieldSlot`] and probes `fk_target_exists` at most once per
-    /// distinct FK value in `rows`.
-    pub(crate) fn check_batch_fks(&self, collection: &str, rows: &[Row]) -> Result<(), Error> {
-        if rows.len() <= 1 {
-            return match rows.first() {
-                Some(r) => self.check_row_fks(collection, r),
-                None => Ok(()),
-            };
-        }
-        let mut watchers: smallvec::SmallVec<
-            [(
-                &crate::catalog::Fk,
-                crate::store::row::FieldSlot<'_>,
-                FxHashSet<&str>,
-            ); 2],
-        > = self
-            .catalog
+    /// Slot-accelerated, deduplicated batch FK checker that can be stepped row-by-row
+    /// (preserving exact first-offending-row error ordering across `duplicate id`, unique
+    /// indexes, and foreign keys) while probing `fk_target_exists` at most once per distinct key.
+    pub(crate) fn batch_fk_watchers<'a>(
+        &'a self,
+        collection: &str,
+    ) -> smallvec::SmallVec<
+        [(
+            &'a crate::catalog::Fk,
+            crate::store::row::FieldSlot<'a>,
+            FxHashSet<String>,
+        ); 2],
+    > {
+        self.catalog
             .fks
             .iter()
             .filter(|fk| fk.from_col == collection)
@@ -791,26 +787,34 @@ impl Db {
                     FxHashSet::default(),
                 )
             })
-            .collect();
-        if watchers.is_empty() {
-            return Ok(());
-        }
-        for row in rows {
-            for (fk, slot, verified) in &mut watchers {
-                let Some(val) = slot.get(row).and_then(Cell::text) else {
-                    continue;
-                };
-                if val.is_empty() || verified.contains(val) {
-                    continue;
-                }
-                if !self.fk_target_exists(&fk.to_col, &fk.to_field, val) {
-                    return Err(Error::runtime(format!(
-                        "fk: {collection}.{} → {}.{} missing {val}",
-                        fk.from_field, fk.to_col, fk.to_field
-                    )));
-                }
-                verified.insert(val);
+            .collect()
+    }
+
+    #[inline]
+    pub(crate) fn check_row_fks_dedup<'a>(
+        &self,
+        collection: &str,
+        row: &Row,
+        watchers: &mut [(
+            &'a crate::catalog::Fk,
+            crate::store::row::FieldSlot<'a>,
+            FxHashSet<String>,
+        )],
+    ) -> Result<(), Error> {
+        for (fk, slot, verified) in watchers.iter_mut() {
+            let Some(val) = slot.get(row).and_then(Cell::text) else {
+                continue;
+            };
+            if val.is_empty() || verified.contains(val) {
+                continue;
             }
+            if !self.fk_target_exists(&fk.to_col, &fk.to_field, val) {
+                return Err(Error::runtime(format!(
+                    "fk: {collection}.{} → {}.{} missing {val}",
+                    fk.from_field, fk.to_col, fk.to_field
+                )));
+            }
+            verified.insert(val.to_string());
         }
         Ok(())
     }
@@ -967,7 +971,7 @@ impl Db {
                 self.check_row_fks(collection, &row)?;
             }
             if needs_embed {
-                self.maybe_embed_rows(collection, std::slice::from_mut(&mut row));
+                self.maybe_embed_rows(collection, std::slice::from_mut(&mut row))?;
             }
             let mut new_edges = Vec::with_capacity(edges.len());
             if !edges.is_empty() {
@@ -1004,10 +1008,10 @@ impl Db {
             self.store.update_col_count(collection, 1);
             if caller_wants_rows {
                 let ret = row.clone();
-                self.store.collection_mut(collection).push(row);
+                self.store.collection_append_mut(collection).push(row);
                 return Ok((vec![ret], new_edges, None));
             } else {
-                self.store.collection_mut(collection).push(row);
+                self.store.collection_append_mut(collection).push(row);
                 return Ok((Vec::new(), new_edges, None));
             }
         }
@@ -1150,12 +1154,7 @@ impl Db {
             false
         };
         if !fast_checked {
-            let mut batch_ids: FxHashSet<&str> = FxHashSet::default();
-            batch_ids.reserve(n);
-            let mut batch_uris: FxHashSet<&str> = FxHashSet::default();
-            if is_docs {
-                batch_uris.reserve(n);
-            }
+            // Prepare any IDs/hashes first before immutable catalog borrow for FK watchers:
             for row in &mut built {
                 if needs_id && row.get("id").and_then(Cell::text).is_none() {
                     row.insert("id", Cell::text_arc(self.store.alloc_id()));
@@ -1166,6 +1165,19 @@ impl Db {
                     let h = content_hash_inline(body);
                     row.insert("hash", Cell::SmallText(h));
                 }
+            }
+            let mut batch_ids: FxHashSet<&str> = FxHashSet::default();
+            batch_ids.reserve(n);
+            let mut batch_uris: FxHashSet<&str> = FxHashSet::default();
+            if is_docs {
+                batch_uris.reserve(n);
+            }
+            let mut fk_watchers = if has_fks {
+                self.batch_fk_watchers(collection)
+            } else {
+                smallvec::SmallVec::new()
+            };
+            for row in &built {
                 if let Some(id) = row.get("id").and_then(Cell::text)
                     && (!batch_ids.insert(id)
                         || (!store_empty && self.store.get_by_id(collection, id).is_some()))
@@ -1179,13 +1191,13 @@ impl Db {
                 {
                     return Err(Error::runtime(format!("duplicate uri: {uri}")));
                 }
-            }
-            if has_fks {
-                self.check_batch_fks(collection, &built)?;
+                if !fk_watchers.is_empty() {
+                    self.check_row_fks_dedup(collection, row, &mut fk_watchers)?;
+                }
             }
         }
         if !all_embedded {
-            self.maybe_embed_rows(collection, &mut built);
+            self.maybe_embed_rows(collection, &mut built)?;
         }
 
         let mut new_edges = Vec::with_capacity(edges.len());
@@ -1517,11 +1529,11 @@ impl Db {
         let want_rows = caller_wants_rows && built.len() <= 128;
         if want_rows {
             self.store
-                .collection_mut(collection)
+                .collection_append_mut(collection)
                 .extend(built.iter().cloned());
             Ok((built, new_edges, staged))
         } else {
-            self.store.collection_mut(collection).extend(built);
+            self.store.collection_append_mut(collection).extend(built);
             Ok((Vec::new(), new_edges, staged))
         }
     }
@@ -1674,7 +1686,7 @@ impl Db {
             }
             if reembed {
                 updated.remove("embedding");
-                self.maybe_embed_rows(collection, std::slice::from_mut(&mut updated));
+                self.maybe_embed_rows(collection, std::slice::from_mut(&mut updated))?;
             }
             if has_fks {
                 self.check_row_fks(collection, &updated)?;

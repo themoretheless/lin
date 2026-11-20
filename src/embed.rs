@@ -15,6 +15,12 @@ use rustc_hash::{FxHashMap, FxHasher};
 pub trait Embedder: Send + Sync {
     /// Stable identity (should match [`crate::catalog::Catalog::embed_id`] when active).
     fn id(&self) -> &str;
+    /// Nominal vector dimension produced by this embedder.
+    ///
+    /// By default (`Db::strict_embed_dim() == false`), `dim()` acts as an advisory capacity
+    /// and WAL pre-encoding hint so mixed-dimension vector corpora remain valid; enable
+    /// [`crate::exec::Db::with_strict_embed_dim`] to reject any vector whose length differs
+    /// from `dim()`.
     fn dim(&self) -> usize;
     fn embed(&self, text: &str) -> Arc<[f32]>;
 

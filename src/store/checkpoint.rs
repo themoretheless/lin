@@ -242,6 +242,73 @@ impl Store {
         Ok((store, lock, phases))
     }
 
+    /// Recompute and rewrite `head` (and `snapshot` when present) with the current [`Catalog`]
+    /// hash after replaying any uncheckpointed WAL frames. Used to migrate pre-2026-11-14
+    /// databases whose `catalog_hash` included session `fk` / `guard` clauses.
+    pub fn repair_catalog_hash(path: impl AsRef<Path>, cat: &Catalog) -> Result<String, Error> {
+        let dir = path.as_ref();
+        persist::validate_data_dir(dir)?;
+        if !dir.exists() {
+            return Err(Error::runtime(format!(
+                "data dir not found: {}",
+                dir.display()
+            )));
+        }
+        let _lock = persist::acquire_writer_lock(dir)?;
+        let _fence = persist::acquire_fence_exclusive(dir)?;
+
+        let snap = persist::read_snapshot(dir)?;
+        let start = snap.as_ref().map(|s| s.log_offset).unwrap_or(0);
+        let mut store = match snap.clone() {
+            Some(s) => Self::from_snapshot_unindexed(dir, s)?,
+            None => {
+                let embed = persist::read_head(dir)?
+                    .map(|h| h.embed_id)
+                    .unwrap_or_else(|| cat.embed_id.clone());
+                let mut st = Self::empty(embed);
+                st.data_dir = Some(dir.to_path_buf());
+                st
+            }
+        };
+        store.rebuild_indexes();
+        store.rebuild_row_maps();
+
+        if let Some(mut log) = persist::open_log_read(dir)? {
+            let min_gen = store.r#gen;
+            let mut order = ReplayOrder::new(min_gen);
+            let end = persist::replay_log(&mut log, min_gen, start, |rec| {
+                if order.admit(rec.r#gen)? {
+                    store.apply_record(&rec);
+                }
+                Ok(())
+            })?;
+            drop(log);
+            let mut wlog = persist::open_log_unreserved(dir)?;
+            persist::truncate_log_with_sync(&mut wlog, end, persist::SyncMode::Full)?;
+        }
+
+        let mut live = cat.clone();
+        store.merge_extras_into(&mut live);
+        let live_hash = catalog_hash(&live);
+
+        if let Some(mut snap_val) = snap
+            && snap_val.catalog_hash != live_hash
+        {
+            snap_val.catalog_hash = live_hash.clone();
+            persist::write_snapshot(dir, &snap_val)?;
+        }
+        persist::write_head(
+            dir,
+            &Head {
+                r#gen: store.r#gen,
+                catalog_hash: live_hash.clone(),
+                embed_id: store.embed_id.clone(),
+            },
+        )?;
+        persist::sync_dir_checked(dir)?;
+        Ok(live_hash)
+    }
+
     /// Open durable data dir: memory image + exclusive Persist for writes.
     pub fn open_with(
         path: impl AsRef<Path>,
@@ -765,6 +832,10 @@ impl Store {
                 log_bytes,
             )?;
         }
+        if persist.encode_buf.capacity() > 1024 * 1024 {
+            persist.encode_buf.clear();
+            persist.encode_buf.shrink_to(256 * 1024);
+        }
         persist.wal_index.push((rec_gen, prev_log_bytes));
         persist.writes_since_snapshot += 1;
         Ok(())
@@ -796,6 +867,10 @@ impl Store {
                 *sync,
                 log_bytes,
             )?;
+        }
+        if persist.encode_buf.capacity() > 1024 * 1024 {
+            persist.encode_buf.clear();
+            persist.encode_buf.shrink_to(256 * 1024);
         }
         persist.wal_index.push((rec_gen, prev_log_bytes));
         persist.writes_since_snapshot += 1;
@@ -858,6 +933,10 @@ impl Store {
             }
             Ok(())
         })?;
+        if persist.encode_buf.capacity() > 1024 * 1024 {
+            persist.encode_buf.clear();
+            persist.encode_buf.shrink_to(256 * 1024);
+        }
         persist.wal_index.push((rec_gen, prev_log_bytes));
         persist.writes_since_snapshot += 1;
         Ok(())

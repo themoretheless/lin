@@ -664,7 +664,7 @@ impl<'a> Transaction<'a> {
         }
         if needs_embed {
             self.db
-                .maybe_embed_rows(&collection, std::slice::from_mut(&mut row));
+                .maybe_embed_rows(&collection, std::slice::from_mut(&mut row))?;
         }
 
         // Fast inline registration + index + FTS + HNSW without multi-slab overhead
@@ -705,7 +705,7 @@ impl<'a> Transaction<'a> {
         } else {
             Vec::new()
         };
-        self.db.store.collection_mut(&collection).push(row);
+        self.db.store.collection_append_mut(&collection).push(row);
 
         if self.db.is_durable() {
             self.db.store.r#gen = self.base_gen + 1;

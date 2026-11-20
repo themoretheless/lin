@@ -22,6 +22,7 @@ fn next_epoch() -> u64 {
 pub struct RowMap {
     map: BTreeMap<String, Vec<Row>>,
     epoch: u64,
+    rewrite_epoch: u64,
 }
 
 impl RowMap {
@@ -29,9 +30,16 @@ impl RowMap {
         Self::from(BTreeMap::new())
     }
 
-    /// Changes whenever any collection may have been mutated.
+    /// Changes whenever any collection may have been mutated (including appends).
     pub fn epoch(&self) -> u64 {
         self.epoch
+    }
+
+    /// Changes whenever any collection may have had non-append mutations (updates, deletes,
+    /// truncates, or rollbacks). Pure tail appends via [`Self::append_only_mut`] advance
+    /// [`Self::epoch`] while keeping `rewrite_epoch` stable.
+    pub fn rewrite_epoch(&self) -> u64 {
+        self.rewrite_epoch
     }
 
     /// Build a copy backed by `map` while preserving `self.epoch` (used by `Store::clone_mem`
@@ -40,11 +48,29 @@ impl RowMap {
         Self {
             map,
             epoch: self.epoch,
+            rewrite_epoch: self.rewrite_epoch,
         }
     }
 
     fn touch(&mut self) {
+        let next = next_epoch();
+        self.epoch = next;
+        self.rewrite_epoch = next;
+    }
+
+    fn touch_append_only(&mut self) {
         self.epoch = next_epoch();
+    }
+
+    /// Mutable access restricted by caller contract to reserving or appending at the end
+    /// (`push` / `extend` / `reserve`), keeping existing prefix `[0..old_len]` intact.
+    pub(crate) fn append_only_mut(&mut self, key: &str) -> &mut Vec<Row> {
+        self.touch_append_only();
+        if self.map.contains_key(key) {
+            self.map.get_mut(key).expect("existing collection")
+        } else {
+            self.map.entry(key.to_string()).or_default()
+        }
     }
 
     pub fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut Vec<Row>>
@@ -107,6 +133,7 @@ impl Clone for RowMap {
         Self {
             map: self.map.clone(),
             epoch: self.epoch,
+            rewrite_epoch: self.rewrite_epoch,
         }
     }
 }
@@ -120,9 +147,11 @@ impl Deref for RowMap {
 
 impl From<BTreeMap<String, Vec<Row>>> for RowMap {
     fn from(map: BTreeMap<String, Vec<Row>>) -> Self {
+        let ep = next_epoch();
         Self {
             map,
-            epoch: next_epoch(),
+            epoch: ep,
+            rewrite_epoch: ep,
         }
     }
 }

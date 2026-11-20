@@ -13,6 +13,7 @@ mod dml;
 mod gpu_ops;
 mod graph_ops;
 mod join;
+mod matview;
 mod mirror;
 mod prepared;
 mod search;
@@ -23,6 +24,7 @@ mod tx;
 mod tests;
 
 pub use crate::persist::{OpenConfig, OpenMemOpts as OpenOpts, SyncMode};
+pub use matview::MaterializedViewStats;
 pub use prepared::Prepared;
 pub use shared::{SharedDb, SharedTransaction};
 pub use tx::Transaction;
@@ -225,8 +227,14 @@ pub struct Db {
     pub(crate) declared_cols: FxHashMap<String, Vec<String>>,
     /// When enabled, catalog-declared collections lazily mirror all non-vector fields on read.
     pub(crate) catalog_soa: bool,
+    /// When enabled, reject vectors returned by a custom [`Embedder`] whose length != `dim()`.
+    pub(crate) strict_embed_dim: bool,
     /// Lazily built mirrors of the declared fields, keyed by collection.
     pub(crate) col_mirrors: std::sync::RwLock<FxHashMap<String, Arc<mirror::ColMirror>>>,
+    /// Registered incrementally maintained `summarize` views, shared across [`ReadDb`] snapshots.
+    pub(crate) mat_views: Arc<std::sync::RwLock<BTreeMap<String, Arc<matview::MaterializedSummarizeView>>>>,
+    /// Registered time-range interval overlap indexes, shared across [`ReadDb`] snapshots.
+    pub(crate) interval_indexes: Arc<std::sync::RwLock<Vec<Arc<matview::IntervalOverlapIndex>>>>,
     #[cfg(feature = "gpu")]
     pub(crate) gpu: Option<Arc<crate::gpu::GpuCompute>>,
     #[cfg(feature = "gpu")]
@@ -459,7 +467,10 @@ impl Db {
             reader_plan_cache: None,
             declared_cols: Default::default(),
             catalog_soa: false,
+            strict_embed_dim: false,
             col_mirrors: Default::default(),
+            mat_views: Default::default(),
+            interval_indexes: Default::default(),
             #[cfg(feature = "gpu")]
             gpu: None,
             #[cfg(feature = "gpu")]
@@ -615,6 +626,30 @@ impl Db {
             .unwrap_or_else(crate::persist::wal_dictionary_writer)
     }
 
+    /// Enforce (`strict = true`) or relax (`strict = false`, default) strict validation that
+    /// every vector returned by the active [`Embedder`] has length equal to [`Embedder::dim`].
+    pub fn with_strict_embed_dim(mut self, strict: bool) -> Self {
+        self.strict_embed_dim = strict;
+        self.reader_cache = None;
+        self
+    }
+
+    pub fn set_strict_embed_dim(&mut self, strict: bool) {
+        self.strict_embed_dim = strict;
+        self.reader_cache = None;
+    }
+
+    pub fn strict_embed_dim(&self) -> bool {
+        self.strict_embed_dim
+    }
+
+    /// Recompute and rewrite `head` (and `snapshot` when present) with the current [`Catalog`]
+    /// hash after replaying any uncheckpointed WAL frames (`catalog_hash` migration utility).
+    pub fn repair_catalog_hash(path: impl AsRef<Path>) -> Result<String, Error> {
+        let catalog = crate::catalog::fixture();
+        Store::repair_catalog_hash(path, &catalog)
+    }
+
     /// Open durable store. Default: [`SyncMode::Full`], `cold: false`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
         Self::open_with(path, OpenOpts::default())
@@ -654,7 +689,10 @@ impl Db {
                 reader_plan_cache: None,
                 declared_cols: Default::default(),
                 catalog_soa: false,
+                strict_embed_dim: false,
                 col_mirrors: Default::default(),
+                mat_views: Default::default(),
+                interval_indexes: Default::default(),
                 #[cfg(feature = "gpu")]
                 gpu: None,
                 #[cfg(feature = "gpu")]
@@ -689,7 +727,10 @@ impl Db {
             reader_plan_cache: None,
             declared_cols: Default::default(),
             catalog_soa: false,
+            strict_embed_dim: false,
             col_mirrors: Default::default(),
+            mat_views: Default::default(),
+            interval_indexes: Default::default(),
             #[cfg(feature = "gpu")]
             gpu: None,
             #[cfg(feature = "gpu")]
@@ -765,7 +806,10 @@ impl Db {
             reader_plan_cache: None,
             declared_cols: Default::default(),
             catalog_soa: false,
+            strict_embed_dim: false,
             col_mirrors: Default::default(),
+            mat_views: Default::default(),
+            interval_indexes: Default::default(),
             #[cfg(feature = "gpu")]
             gpu: None,
             #[cfg(feature = "gpu")]
@@ -879,7 +923,10 @@ impl Db {
                 reader_plan_cache: None,
                 declared_cols: self.declared_cols.clone(),
                 catalog_soa: self.catalog_soa,
+                strict_embed_dim: self.strict_embed_dim,
                 col_mirrors: std::sync::RwLock::new(mirrors),
+                mat_views: Arc::clone(&self.mat_views),
+                interval_indexes: Arc::clone(&self.interval_indexes),
                 #[cfg(feature = "gpu")]
                 gpu: self.gpu.clone(),
                 #[cfg(feature = "gpu")]
@@ -1666,6 +1713,11 @@ impl Db {
             let mut seen_ids: FxHashSet<&str> = FxHashSet::default();
             seen_ids.reserve(rows.len());
             let mut seen_keys: FxHashSet<(usize, String)> = FxHashSet::default();
+            let mut fk_watchers = if has_fks {
+                self.batch_fk_watchers(collection)
+            } else {
+                smallvec::SmallVec::new()
+            };
             for row in &rows {
                 let id = row_text(row, "id").unwrap_or("");
                 if !seen_ids.insert(id)
@@ -1690,9 +1742,9 @@ impl Db {
                         ));
                     }
                 }
-            }
-            if has_fks {
-                self.check_batch_fks(collection, &rows)?;
+                if !fk_watchers.is_empty() {
+                    self.check_row_fks_dedup(collection, row, &mut fk_watchers)?;
+                }
             }
         }
         if let Some(written) = cas_written.as_deref_mut() {
@@ -1702,7 +1754,7 @@ impl Db {
                 }
             }
         }
-        self.maybe_embed_rows(collection, &mut rows);
+        self.maybe_embed_rows(collection, &mut rows)?;
         let new_edges: Vec<crate::store::Edge> = match rows.first().and_then(|r| row_text(r, "id")) {
             Some(from_id) if !edges.is_empty() => edges
                 .iter()
@@ -1957,7 +2009,7 @@ impl Db {
             }
             if reembed {
                 updated.remove("embedding");
-                self.maybe_embed_rows(collection, std::slice::from_mut(&mut updated));
+                self.maybe_embed_rows(collection, std::slice::from_mut(&mut updated))?;
             }
             self.cold_check_unique_keys(collection, &unique_keys, &old_keys, &updated, &mut seen_keys)?;
             if has_fks {
@@ -2300,7 +2352,7 @@ impl Db {
         // A changed title / body / snippet is embedded again (see the general update).
         if will_reembed {
             updated.remove("embedding");
-            self.maybe_embed_rows(&pu.collection, std::slice::from_mut(&mut updated));
+            self.maybe_embed_rows(&pu.collection, std::slice::from_mut(&mut updated))?;
         }
         self.cold_check_unique_keys(
             &pu.collection,
@@ -3366,7 +3418,7 @@ impl Db {
                 && !pu.record.fields.iter().any(|(k, _)| k == "embedding")
             {
                 updated.remove("embedding");
-                self.maybe_embed_rows(&pu.collection, std::slice::from_mut(&mut updated));
+                self.maybe_embed_rows(&pu.collection, std::slice::from_mut(&mut updated))?;
             }
             self.check_row_fks(&pu.collection, &updated)?;
             if let Some(rows) = self.store.collections.get_mut(&pu.collection) {
@@ -4441,6 +4493,237 @@ impl Db {
         self.get_or_build_mirror(name)?.count(pred, now)
     }
 
+    /// Register an incrementally maintained materialized `summarize` view (`P2.3`).
+    ///
+    /// Subsequent matching queries via [`Db::run`], [`ReadDb::run`], or
+    /// [`Db::query_materialized_view`] fold only newly appended rows (`O(Δrows)`) whenever
+    /// no in-place updates/deletes occurred on the target collection.
+    pub fn create_materialized_view(
+        &mut self,
+        name: impl Into<String>,
+        query_src: &str,
+    ) -> Result<(), Error> {
+        let name = name.into();
+        let view = Arc::new(matview::MaterializedSummarizeView::compile(
+            query_src,
+            &self.catalog,
+        )?);
+        let _ = view.evaluate(&self.store, &self.quotas, false)?;
+        self.mat_views
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(name, view);
+        self.reader_cache = None;
+        Ok(())
+    }
+
+    pub fn drop_materialized_view(&mut self, name: &str) -> bool {
+        let removed = self
+            .mat_views
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(name)
+            .is_some();
+        if removed {
+            self.reader_cache = None;
+        }
+        removed
+    }
+
+    pub fn materialized_view_names(&self) -> Vec<String> {
+        self.mat_views
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    pub fn materialized_view_stats(&self, name: &str) -> Option<MaterializedViewStats> {
+        self.mat_views
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(name)
+            .map(|v| v.stats())
+    }
+
+    pub fn query_materialized_view(&self, name: &str) -> Result<Vec<Row>, Error> {
+        let view = self
+            .mat_views
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(name)
+            .cloned()
+            .ok_or_else(|| Error::runtime(format!("unknown materialized view: {name}")))?;
+        view.evaluate(&self.store, &self.quotas, false)?
+            .ok_or_else(|| Error::runtime(format!("materialized view '{name}' unavailable on cold/deferred collection")))
+    }
+
+    pub(crate) fn try_materialized_view_query(
+        &self,
+        q: &Query,
+        allow_implicit_take: bool,
+    ) -> Result<Option<Vec<Row>>, Error> {
+        let matched = {
+            let guard = self.mat_views.read().unwrap_or_else(|e| e.into_inner());
+            if guard.is_empty() {
+                return Ok(None);
+            }
+            guard.values().find(|v| v.matches_query(q)).cloned()
+        };
+        match matched {
+            Some(view) => view.evaluate(&self.store, &self.quotas, allow_implicit_take),
+            None => Ok(None),
+        }
+    }
+
+    /// Create an augmented time-range interval overlap index over `[start_field, end_field]`
+    /// (`Type::Time` or `Type::I64`) on `collection` (`P2.3`).
+    pub fn create_interval_index(
+        &mut self,
+        collection: &str,
+        start_field: &str,
+        end_field: &str,
+    ) -> Result<(), Error> {
+        let Some(cdef) = self.catalog.collection(collection) else {
+            return Err(Error::new(format!("unknown collection: {collection}")));
+        };
+        for f in [start_field, end_field] {
+            let Some(fi) = cdef.fields.get(f) else {
+                return Err(Error::new(format!("unknown field {collection}.{f}")));
+            };
+            if !matches!(
+                fi.ty,
+                crate::catalog::Type::Time | crate::catalog::Type::I64 | crate::catalog::Type::Var
+            ) {
+                return Err(Error::new(format!(
+                    "interval index field {collection}.{f} must be time or i64"
+                )));
+            }
+        }
+        let mut list = self
+            .interval_indexes
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        list.retain(|ix| {
+            !(ix.collection == collection
+                && ix.start_field == start_field
+                && ix.end_field == end_field)
+        });
+        let idx = Arc::new(matview::IntervalOverlapIndex::new(
+            collection.to_string(),
+            start_field.to_string(),
+            end_field.to_string(),
+        ));
+        let _ = idx.select_overlapping(&self.store, i64::MIN, true, i64::MAX, true);
+        list.push(idx);
+        drop(list);
+        self.reader_cache = None;
+        Ok(())
+    }
+
+    pub fn drop_interval_index(
+        &mut self,
+        collection: &str,
+        start_field: &str,
+        end_field: &str,
+    ) -> bool {
+        let mut list = self
+            .interval_indexes
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        let before = list.len();
+        list.retain(|ix| {
+            !(ix.collection == collection
+                && ix.start_field == start_field
+                && ix.end_field == end_field)
+        });
+        let removed = list.len() != before;
+        drop(list);
+        if removed {
+            self.reader_cache = None;
+        }
+        removed
+    }
+
+    /// Directly return rows in `collection` whose `[start_field, end_field]` overlaps
+    /// inclusive `[query_start, query_end]` (`start <= query_end && end >= query_start`).
+    pub fn query_interval_overlap(
+        &self,
+        collection: &str,
+        start_field: &str,
+        end_field: &str,
+        query_start: i64,
+        query_end: i64,
+    ) -> Result<Vec<Row>, Error> {
+        let idx = {
+            let list = self
+                .interval_indexes
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            list.iter()
+                .find(|ix| {
+                    ix.collection == collection
+                        && ix.start_field == start_field
+                        && ix.end_field == end_field
+                })
+                .cloned()
+        }
+        .ok_or_else(|| {
+            Error::runtime(format!(
+                "no interval index registered on {collection}[{start_field}, {end_field}]"
+            ))
+        })?;
+        let Some(pos) = idx.select_overlapping(&self.store, query_end, false, query_start, false)
+        else {
+            return Err(Error::runtime(format!(
+                "interval index on {collection} unavailable on cold/deferred collection"
+            )));
+        };
+        let Some(rows) = self.store.collections.get(collection) else {
+            return Ok(Vec::new());
+        };
+        Ok(pos.into_iter().filter_map(|i| rows.get(i).cloned()).collect())
+    }
+
+    pub(crate) fn has_matching_interval_index(&self, collection: &str, pred: &Pred, now: i64) -> bool {
+        let list = self
+            .interval_indexes
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        list.iter().any(|ix| {
+            ix.collection == collection
+                && matview::extract_interval_bounds(pred, &ix.start_field, &ix.end_field, now)
+                    .is_some()
+        })
+    }
+
+    pub(crate) fn interval_index_select(
+        &self,
+        collection: &str,
+        pred: &Pred,
+        now: i64,
+    ) -> Option<Vec<usize>> {
+        let (idx, bounds) = {
+            let list = self
+                .interval_indexes
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            if list.is_empty() {
+                return None;
+            }
+            list.iter().find_map(|ix| {
+                if ix.collection != collection {
+                    return None;
+                }
+                let b =
+                    matview::extract_interval_bounds(pred, &ix.start_field, &ix.end_field, now)?;
+                Some((Arc::clone(ix), b))
+            })?
+        };
+        idx.select_overlapping(&self.store, bounds.0, bounds.1, bounds.2, bounds.3)
+    }
+
     /// Begin an interactive ACID transaction.
     pub fn transaction(&mut self) -> Result<Transaction<'_>, Error> {
         if !self.store.fts_deferred_doc_swaps.is_empty() {
@@ -4580,6 +4863,11 @@ impl Db {
                 return Ok(rows);
             }
             if let Some(rows) = self.try_agg(q, bindings, now)? {
+                return Ok(rows);
+            }
+            if bindings.is_empty()
+                && let Some(rows) = self.try_materialized_view_query(q, allow_implicit_take)?
+            {
                 return Ok(rows);
             }
             if let Some(rows) = self.try_summarize_fast(q, bindings, now)? {
@@ -4762,6 +5050,11 @@ impl Db {
                     } else {
                         Vec::new()
                     }
+                } else if let Some(pred) = first_filter
+                    && !self.store.is_disk_backed(name)
+                    && let Some(idxs) = self.interval_index_select(name, pred, now)
+                {
+                    self.fetch_idxs_filtered(name, &idxs, pred, now, project_fields_step, false)
                 } else if let Some(pred) = first_filter
                     && !self.store.is_disk_backed(name)
                     && let Some((uses, covered)) =

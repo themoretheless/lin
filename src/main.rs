@@ -30,6 +30,8 @@ fn main() -> ExitCode {
         Some("stats") => cmd_stats(data, follower),
         Some("cluster") => cmd_cluster(&rest[1..], data, follower),
         Some("compact") => cmd_compact(&rest[1..], data, follower),
+        Some("repair-catalog-hash") => cmd_repair_catalog_hash(data),
+        Some("recover") => cmd_recover(&rest[1..], data),
         Some("version") | Some("--version") => {
             println!("lin {}", lin::VERSION);
             ExitCode::SUCCESS
@@ -2034,4 +2036,29 @@ fn cmd_remote(args: &[String], data: Option<PathBuf>) -> ExitCode {
         }
     };
     report(out)
+}
+
+fn cmd_repair_catalog_hash(data: Option<PathBuf>) -> ExitCode {
+    let Some(dir) = data else {
+        eprintln!("usage: lin --data <dir> repair-catalog-hash");
+        return ExitCode::from(2);
+    };
+    match Db::repair_catalog_hash(&dir) {
+        Ok(hash) => {
+            println!("repaired catalog_hash={hash} dir={}", dir.display());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn cmd_recover(args: &[String], data: Option<PathBuf>) -> ExitCode {
+    if args.iter().any(|a| a == "--fix-catalog-hash") {
+        return cmd_repair_catalog_hash(data);
+    }
+    eprintln!("usage: lin --data <dir> recover --fix-catalog-hash");
+    ExitCode::from(2)
 }

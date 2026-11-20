@@ -378,6 +378,9 @@ impl Db {
             None => Some(skip_n.saturating_add(50)),
         };
 
+        if !self.store.is_disk_backed(name) && self.has_matching_interval_index(name, pred, now) {
+            return None;
+        }
         let mut rows = {
             if self.store.is_disk_backed(name)
                 && let Some(eng) = self.store.disk_engine_read()

@@ -182,6 +182,8 @@ impl Db {
                 return Ok(Some(Vec::new()));
             };
             let qv = emb.embed(query);
+        self.check_embed_dim(emb.as_ref(), &qv)?;
+            self.check_embed_dim(emb.as_ref(), &qv)?;
             if qv.is_empty() || rank_limit == Some(0) {
                 return Ok(Some(Vec::new()));
             }
@@ -231,6 +233,8 @@ impl Db {
             let mut vec_leg: Vec<usize> = Vec::new();
             if let Some(emb) = self.embedder.as_ref() {
                 let qv = emb.embed(query);
+        self.check_embed_dim(emb.as_ref(), &qv)?;
+                self.check_embed_dim(emb.as_ref(), &qv)?;
                 if !qv.is_empty() {
                     let top_k = leg_limit.unwrap_or_else(|| eng.count_table(name).max(1));
                     let pos_of: FxHashMap<&str, usize> = ids
@@ -517,6 +521,7 @@ impl Db {
             return Ok(Vec::new());
         };
         let qv = emb.embed(query);
+        self.check_embed_dim(emb.as_ref(), &qv)?;
 
         // Fast-path: query maintained HNSW index if rows match collection
         for (col, hnsw) in &self.store.hnsw {
@@ -769,12 +774,28 @@ impl Db {
             )));
         }
         let new_id = emb.id().to_string();
+        let strict = self.strict_embed_dim;
+        let expected_dim = emb.dim();
         self.catalog.set_embed_id(new_id.clone());
         let rows = self.store.collection_mut(collection);
         for row in rows.iter_mut() {
             row.remove("embedding");
         }
         embed_rows_slice_with(emb.as_ref(), rows);
+        if strict {
+            for row in rows.iter() {
+                if let Some(v) = row.get("embedding").and_then(crate::store::Cell::as_vec)
+                    && v.len() != expected_dim
+                {
+                    return Err(Error::runtime(format!(
+                        "embedder '{}' dimension mismatch: expected {}, got {}",
+                        emb.id(),
+                        expected_dim,
+                        v.len()
+                    )));
+                }
+            }
+        }
         let mut n = 0usize;
         for row in rows.iter_mut() {
             if row
@@ -823,18 +844,54 @@ impl Db {
         Ok(n)
     }
 
-    pub(crate) fn maybe_embed_rows(&self, collection: &str, rows: &mut [Row]) {
+    #[inline]
+    pub(crate) fn check_embed_dim(
+        &self,
+        emb: &dyn embed::Embedder,
+        v: &[f32],
+    ) -> Result<(), Error> {
+        if self.strict_embed_dim && v.len() != emb.dim() {
+            return Err(Error::runtime(format!(
+                "embedder '{}' dimension mismatch: expected {}, got {}",
+                emb.id(),
+                emb.dim(),
+                v.len()
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn maybe_embed_rows(
+        &self,
+        collection: &str,
+        rows: &mut [Row],
+    ) -> Result<(), Error> {
         let Some(emb) = self.embedder.as_ref() else {
-            return;
+            return Ok(());
         };
         if self
             .catalog
             .collection(collection)
             .is_none_or(|c| !c.has_vec())
         {
-            return;
+            return Ok(());
         }
         embed_rows_slice_with(emb.as_ref(), rows);
+        if self.strict_embed_dim {
+            let expected = emb.dim();
+            for r in rows.iter() {
+                if let Some(v) = r.get("embedding").and_then(crate::store::Cell::as_vec)
+                    && v.len() != expected
+                {
+                    return Err(Error::runtime(format!(
+                        "embedder '{}' dimension mismatch: expected {expected}, got {}",
+                        emb.id(),
+                        v.len()
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 }
 

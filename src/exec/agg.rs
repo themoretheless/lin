@@ -784,7 +784,15 @@ pub(crate) fn agg_sum_filtered(
             sum_rows(rows)
         };
         #[cfg(not(feature = "parallel"))]
-        let total = sum_rows(rows);
+        let total = if rows.len() >= PAR_AGG_MIN_ROWS {
+            let mut total = crate::exact_sum::ExactSum::default();
+            for chunk in rows.chunks(PAR_AGG_CHUNK_ROWS) {
+                total.merge(sum_rows(chunk));
+            }
+            total
+        } else {
+            sum_rows(rows)
+        };
         let mut row = crate::store::acquire_row();
         row.insert(fk, Cell::Float(total.value()));
         return Ok(vec![row]);
@@ -817,6 +825,48 @@ pub(crate) fn agg_sum_filtered(
         )
     {
         return Ok(sum_rows_out(map));
+    }
+    #[cfg(not(feature = "parallel"))]
+    if rows.len() >= PAR_AGG_MIN_ROWS {
+        let mut merged: FxHashMap<Cell, crate::exact_sum::ExactSum> = FxHashMap::default();
+        let mut state_bytes = 0usize;
+        let mut exceeded = false;
+        for chunk in rows.chunks(PAR_AGG_CHUNK_ROWS) {
+            let mut part: FxHashMap<Cell, crate::exact_sum::ExactSum> = FxHashMap::default();
+            let mut flt = filter.map(PredSlots::new);
+            let mut key_slot = FieldSlot::new(&bk);
+            let mut value_slot = FieldSlot::new(&fk);
+            for r in chunk {
+                if !flt.as_mut().is_none_or(|f| f.eval(r, now)) {
+                    continue;
+                }
+                let cell = key_slot.get(r).map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
+                part.entry(cell).or_default().add_cell(value_slot.get(r));
+            }
+            for (cell, v) in part {
+                match merged.entry(cell) {
+                    std::collections::hash_map::Entry::Occupied(mut e) => e.get_mut().merge(v),
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        let key_size = match e.key() {
+                            Cell::Text(s) => s.len() + 32,
+                            _ => 16,
+                        };
+                        state_bytes = state_bytes.saturating_add(key_size + 64);
+                        if state_bytes > max_bytes {
+                            exceeded = true;
+                            break;
+                        }
+                        e.insert(v);
+                    }
+                }
+            }
+            if exceeded {
+                break;
+            }
+        }
+        if !exceeded {
+            return Ok(sum_rows_out(merged));
+        }
     }
     let mut map: FxHashMap<Cell, crate::exact_sum::ExactSum> = FxHashMap::default();
     let mut state_bytes = 0usize;
@@ -1072,7 +1122,16 @@ pub(crate) fn agg_avg_filtered(
             fold(rows)
         };
         #[cfg(not(feature = "parallel"))]
-        let (sum, count) = fold(rows);
+        let (sum, count) = if rows.len() >= PAR_AGG_MIN_ROWS {
+            rows.chunks(PAR_AGG_CHUNK_ROWS)
+                .map(fold)
+                .fold((crate::exact_sum::ExactSum::default(), 0usize), |mut a, b| {
+                    a.0.merge(b.0);
+                    (a.0, a.1 + b.1)
+                })
+        } else {
+            fold(rows)
+        };
         let avg = if count == 0 {
             0.0
         } else {
@@ -1109,6 +1168,57 @@ pub(crate) fn agg_avg_filtered(
     {
         map = folded;
         seq_rows = &[];
+    }
+    #[cfg(not(feature = "parallel"))]
+    if rows.len() >= PAR_AGG_MIN_ROWS {
+        let mut merged: FxHashMap<Cell, (crate::exact_sum::ExactSum, usize)> = FxHashMap::default();
+        let mut sb = 0usize;
+        let mut exceeded = false;
+        for chunk in rows.chunks(PAR_AGG_CHUNK_ROWS) {
+            let mut part: FxHashMap<Cell, (crate::exact_sum::ExactSum, usize)> =
+                FxHashMap::default();
+            let mut flt = filter.map(PredSlots::new);
+            let mut key_slot = FieldSlot::new(&bk);
+            let mut value_slot = FieldSlot::new(&fk);
+            for r in chunk {
+                if !flt.as_mut().is_none_or(|f| f.eval(r, now)) {
+                    continue;
+                }
+                let cell = key_slot.get(r).map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
+                let acc = part.entry(cell).or_default();
+                if acc.0.add_numeric(value_slot.get(r)) {
+                    acc.1 += 1;
+                }
+            }
+            for (cell, v) in part {
+                match merged.entry(cell) {
+                    std::collections::hash_map::Entry::Occupied(mut e) => {
+                        let cur = e.get_mut();
+                        cur.0.merge(v.0);
+                        cur.1 += v.1;
+                    }
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        let key_size = match e.key() {
+                            Cell::Text(s) => s.len() + 32,
+                            _ => 16,
+                        };
+                        sb = sb.saturating_add(key_size + 64);
+                        if sb > max_bytes {
+                            exceeded = true;
+                            break;
+                        }
+                        e.insert(v);
+                    }
+                }
+            }
+            if exceeded {
+                break;
+            }
+        }
+        if !exceeded {
+            map = merged;
+            seq_rows = &[];
+        }
     }
     let mut flt = filter.map(PredSlots::new);
     let mut key_slot = FieldSlot::new(&bk);
@@ -2450,7 +2560,8 @@ fn hll_add(regs: &mut [u8; HLL_M], hash: u64) {
     }
 }
 
-enum DCountAcc {
+#[derive(Clone)]
+pub(crate) enum DCountAcc {
     Exact(FxHashSet<u64>),
     Hll(Box<[u8; HLL_M]>),
 }
@@ -2592,7 +2703,8 @@ impl DCountAcc {
     }
 }
 
-struct TDigest {
+#[derive(Clone)]
+pub(crate) struct TDigest {
     centroids: Vec<(f64, f64)>,
     buffer: Vec<f64>,
     min: f64,
@@ -2741,7 +2853,8 @@ impl TDigest {
     }
 }
 
-enum PercentileAcc {
+#[derive(Clone)]
+pub(crate) enum PercentileAcc {
     Exact(Vec<f64>),
     Digest(TDigest),
 }
@@ -2876,7 +2989,8 @@ impl PercentileAcc {
     }
 }
 
-enum MetricAcc {
+#[derive(Clone)]
+pub(crate) enum MetricAcc {
     Count(i64),
     Sum {
         int_sum: i128,
@@ -3241,12 +3355,50 @@ impl<'k> SpecReader<'k> {
     }
 }
 
-enum PartialSummarizeState {
+#[derive(Clone)]
+pub(crate) enum PartialSummarizeState {
     Single(Vec<MetricAcc>),
     Grouped(FxHashMap<GroupTuple, Vec<MetricAcc>>),
 }
 
-fn finish_partial_state(
+pub(crate) fn merge_partial_states(
+    dst: &mut PartialSummarizeState,
+    src: PartialSummarizeState,
+    specs_len: usize,
+    max_bytes: usize,
+) -> Result<(), Error> {
+    let mut state_bytes = 0usize;
+    match (dst, src) {
+        (PartialSummarizeState::Single(da), PartialSummarizeState::Single(sa)) => {
+            for (d, s) in da.iter_mut().zip(sa.into_iter()) {
+                d.merge(s, &mut state_bytes, max_bytes)?;
+            }
+            Ok(())
+        }
+        (PartialSummarizeState::Grouped(dg), PartialSummarizeState::Grouped(sg)) => {
+            state_bytes = dg.len().saturating_mul(64 + specs_len * 32);
+            for (gkey, accs) in sg {
+                match dg.entry(gkey) {
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        state_bytes =
+                            state_bytes.saturating_add(group_key_bytes(e.key(), specs_len));
+                        check_agg_quota(state_bytes, max_bytes)?;
+                        e.insert(accs);
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut e) => {
+                        for (d, s) in e.get_mut().iter_mut().zip(accs.into_iter()) {
+                            d.merge(s, &mut state_bytes, max_bytes)?;
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+        _ => Err(Error::runtime("partial summarize state shape mismatch")),
+    }
+}
+
+pub(crate) fn finish_partial_state(
     state: PartialSummarizeState,
     by: &[GroupKey],
     specs: &[AggSpec],
@@ -3266,7 +3418,7 @@ fn finish_partial_state(
     }
 }
 
-fn fold_summarize_rows(
+pub(crate) fn fold_summarize_rows(
     rows: &[Row],
     filter: Option<&Pred>,
     now: i64,

@@ -1,8 +1,8 @@
 # Lin — план развития
 
-Срез: **2026-11-20**, коммит `5dd2b25d5`. Единственный файл с планом в репозитории: в нём хранится только несделанное. Всё реализованное перенесено в [CHANGELOG](../CHANGELOG.md), профильные документы `docs/` и отчёты `benches/results/`.
+Срез: **2026-11-20**, коммит `fc2923b74`. Единственный файл с планом в репозитории: в нём хранится только несделанное. Всё реализованное перенесено в [CHANGELOG](../CHANGELOG.md), профильные документы `docs/` и отчёты `benches/results/` ([2026-11-20-roadmap-acceptance](../benches/results/2026-11-20-roadmap-acceptance/report.md)).
 
-Открыто **1281** пунктов общего backlog (часть II) и **5** направлений части I. Это план работ и гипотез, не список подтверждённых дефектов и не обещание ускорений без приёмочного замера.
+Открыто **1276** пунктов общего backlog (часть II) и **1** платформенно-зависимый замер части I (`P4.2` на физическом Linux `ext4` / `xfs`). Это план работ и гипотез, не список подтверждённых дефектов и не обещание ускорений без приёмочного замера.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровываются (закрытые пункты удалены). Перед взятием пункта со статусом `candidate` или `qualification` сначала сверять с текущим кодом.
 
@@ -13,50 +13,18 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 - Полный eager in-memory SoA на этапе записи захардкожен под встроенные коллекции (`docs`, `orders`, `users`, `facts`); произвольные пользовательские коллекции в памяти используют построчный `Vec<Row>` с ленивым колоночным зеркалом (`Db::declare_columns` / `Db::enable_catalog_columns`).
 - Сложные многошаговые аналитические конвейеры вне покрытых колоночных форм откатываются на `Vec<Row>`.
 
-### 2. Приоритет 1 — `DiskEngine` и холодный уровень
+### 2. Открытые платформенные замеры части I
 
-#### P1.2. Изолированный замер частичной компиляции предиката, `.tgram` и `DictZoneMap`
-- Провести чистый чередующийся замер `cold_*` с текстовыми (`~`, `has`, `has_ci`), словарными и regex-условиями в предикате на свободной машине для оценки вклада `SegPred::Slow`, `.tgram` и `DictZoneMap`.
-
-### 3. Приоритет 2 — Архитектурные рычаги
-
-#### P2.3. Инкрементальные материализованные агрегаты и интервальные индексы времени
-- Спроектировать опциональные инкрементально обновляемые представления `summarize` для повторяющихся аналитических запросов по горячим коллекциям и специализированные интервальные индексы для запросов пересечения временных диапазонов.
-
-### 4. Приоритет 3 — Параллелизм и операторы запросов
-
-#### P3.1. `parallel` по умолчанию и приёмочный замер на больших объёмах
-- Провести приёмочный замер по контракту бенчмарков (`LIN_BENCH_N >= 100_000`) для безгрупповых и групповых агрегатов и решить, включать ли feature `parallel` в набор по умолчанию (с единым чанкованным компенсированным сложением в однопоточном и многопоточном путях при фиксации битовой точности).
-
-### 5. Приоритет 4 — Запись, Bulk Ingest и репликация
-
-#### P4.2. Замер WAL фиксированной длины на Linux
-- Замерить заранее размеченный WAL на Linux (`ext4` / `xfs`, `fallocate(FALLOC_FL_KEEP_SIZE)` + `fdatasync` против фиксированной длины с кадром-терминатором); менять формат кадра-терминатора только при подтверждённом выигрыше.
-
-#### P4.3. Приёмочный замер словарного WAL-кодека 5 для включения по умолчанию
-Описание формата: [wal-dictionary.md](wal-dictionary.md).
-- Провести две независимые серии по шесть process-pairs (`native` / `durable`, 1k и 10k с контролем SQLite и проверками dense / repeated / high-cardinality и RSS) перед решением о включении по умолчанию.
-
-### 6. Сводная матрица открытых задач части I
+#### P4.2. Замер WAL фиксированной длины на Linux (`ext4` / `xfs`)
+- Предвыделение экстентов `fallocate(FALLOC_FL_KEEP_SIZE)` внедрено в `reserve_wal_space`; остаётся провести нативный сравнительный замер на физическом Linux-хосте (`ext4` / `xfs`, `FALLOC_FL_KEEP_SIZE` + `fdatasync` против фиксированной длины с кадром-терминатором) и менять формат кадра-терминатора только при подтверждённом выигрыше.
 
 | Пункт | Сложность | Ожидаемый эффект | Целевые проверки и бенчмарки |
 |---|---|---|---|
-| **P1.2** Изолированный замер `SegPred::Slow`, `.tgram`, `DictZoneMap` | Низкая | Подтверждённый вклад отсечения блоков на тексте и regex | `cold_range_project`, сканы по Zstd-тексту |
-| **P2.3** Инкрементальные агрегаты и интервальные индексы | Высокая | Ускорение повторяющихся `summarize` и time-range запросов | аналитические и временные запросы |
-| **P3.1** `parallel` по умолчанию и битовая точность сумм | Низкая | Масштабирование по ядрам из коробки | `agg_sum_by`, `agg_count_by` при `LIN_BENCH_N >= 100000` |
 | **P4.2** Замер preallocated WAL на Linux (`ext4` / `xfs`) | Средняя | Оценка `FALLOC_FL_KEEP_SIZE` vs кадр-терминатор на Linux | `durable_insert_*` на Linux |
-| **P4.3** Приёмочный замер словарного WAL-кодека 5 | Средняя | Оценка включения кодека 5 по умолчанию | durable 1k/10k vs SQLite |
 
-### 7. Незакрытая приёмка бенчмарков `cold_*`
+### 3. Постоянные ворота приёмки
 
-- Установить причину межпрогонного разброса `cold_join_inner` на нагруженной хост-машине и провести полный приёмочный замер `cold_*` чередующимися process-pairs по [контракту бенчмарков](benchmark-contract.md).
-- Постоянные ворота приёмки: `cargo check --all-targets` и `--all-features` (`0` предупреждений), `cargo test --release --all-features` (`100%` pass), `./scripts/format-compat.sh` (`100%` pass) и `AIRBUG_HUB="" ./scripts/ci-bench.sh` (`exit 0`).
-
-### 8. Открытые вопросы совместимости и контрактов
-
-- Базы, записанные до 2026-11-14 с `fk` или `guard` в хеше каталога, отклоняются (`catalog_hash mismatch`): решить, нужен ли отдельный инструмент миграции хеша или поддержка таких дорелизных баз не требуется.
-- Проверить открытие баз после сценариев потери фактов и `col` без чекпойнта непосредственно бинарником `0.7.1` на артефактах, созданных `0.7.1`.
-- Решить политику валидации длины вектора из пользовательского `Embedder` относительно `Embedder::dim()` (`LIN-0504`) с учётом смешанной размерности в тестовом корпусе.
+- `cargo check --all-targets` и `--all-features` (`0` предупреждений), `cargo test --release --all-features` (`100%` pass), `./scripts/format-compat.sh` (`100%` pass) и `AIRBUG_HUB="" ./scripts/ci-bench.sh` (`exit 0`).
 
 ## Часть II. Общий backlog
 
@@ -64,8 +32,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 | Пакет | Задачи | Конкретный результат и условие перехода |
 |---|---|---|
-| 1. Доказательства | LIN-0001 | Сопоставить текущие source/binary hashes с отчётами. Перезапускать затронутые сценарии; широкую peer matrix — на итоговом кандидате. Разделить native/Full durable, cold/warm и размеры 1k/10k/100k. |
-| 2. Измеренный проигрыш | LIN-0002 | Закрывать SQLite Full durable1k по свежему профилю одной гипотезой за раз. Уже принятые persistent worker, O(1) hint и NEON writer повторно не внедрять. Два набора минимум по шесть process-pairs, A/A, 10k и граничные контроли; сохранять проигрыши. |
 | 4. Сохранность данных | D02–D06, D43 | Переиспользовать существующие oracle/fault injection; дополнить конкретные пробелы. Последний подтверждённый commit, mixed codecs, checkpoint, backup/follower и ошибки диска. Воспроизведённая потеря данных опережает performance. |
 | 5. Память записи | LIN-0321, LIN-0322, LIN-0349 | Сначала измерить allocations, hit rate и retained bytes существующих пулов. Любой новый reuse должен пройти cold start, полный жизненный цикл с Drop, лимиты, alias isolation и ошибки. Не переносить освобождение памяти за таймер ради результата. |
 | 6. Группировки | D19 | Расширять покрытие от уже принятого fixed-text single-key COUNT: много ключей, другие агрегаты, mixed numeric/NaN/zero, Unicode и quota exhaustion. Не считать узкий index-only fast path реализацией произвольного GROUP BY. |
@@ -125,19 +91,17 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 Для каждой строки итоговый критерий — её конкретный результат плюс указанный gate. Если критерий требует недоступной платформы/endpoint, статус остаётся непроверенным; mock/compile не заменяет live qualification.
 
-### Приоритетный список — 1281 пунктов
+### Приоритетный список — 1276 пунктов
 
-Количества: P1: 3, P2: 762, P3: 516; статусы: blocked_external: 1, candidate: 905, qualification: 375.
+Количества: P1: 1, P2: 759, P3: 516; статусы: blocked_external: 1, candidate: 905, qualification: 370.
 
-#### P1: 3 пунктов
+#### P1: 1 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
-| 1 | LIN-0001 | [D01](#d01) | Закрыть native 1k SQLite gap | PERF | qualification | M | G-PERF |
-| 2 | LIN-0002 | [D01](#d01) | Закрыть durable 1k SQLite gap | PERF | qualification | M | G-PERF |
 | 22 | LIN-0006 | [D01](#d01) | Получить тестовый endpoint Kusto | OPS | blocked_external | M | G-OPS |
 
-#### P2: 762 пунктов
+#### P2: 759 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -145,7 +109,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 112 | LIN-0010 | [D01](#d01) | Разделить prepare и execute latency | PERF | candidate | M | G-PERF |
 | 113 | LIN-0011 | [D01](#d01) | Уравнять подготовку DuckDB INSERT | PERF | candidate | M | G-PERF |
 | 114 | LIN-0012 | [D01](#d01) | Уравнять создание входных DataFrame | PERF | candidate | M | G-PERF |
-| 115 | LIN-0013 | [D01](#d01) | Зафиксировать actual engine versions | CORRECTNESS | qualification | M | G-CORRECT |
 | 116 | LIN-0014 | [D01](#d01) | Сохранять runtime feature flags | PERF | candidate | M | G-PERF |
 | 117 | LIN-0015 | [D01](#d01) | Проверять sample operation counts | PERF | candidate | M | G-PERF |
 | 118 | LIN-0016 | [D01](#d01) | Измерять cold constructor latency | PERF | candidate | M | G-PERF |
@@ -190,7 +153,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 190 | LIN-0098 | [D03](#d03) | Измерить append file fragmentation | PERF | candidate | M | G-PERF |
 | 191 | LIN-0099 | [D03](#d03) | Измерить buffered против direct I/O | PERF | candidate | M | G-PERF |
 | 192 | LIN-0100 | [D03](#d03) | Измерить sequential write advice | PERF | candidate | M | G-PERF |
-| 193 | LIN-0101 | [D03](#d03) | Ограничить рост retained encode buffer | CORRECTNESS | qualification | M | G-CORRECT |
 | 194 | LIN-0102 | [D03](#d03) | Разделить throughput и sync latency | PERF | candidate | M | G-PERF |
 | 195 | LIN-0103 | [D03](#d03) | Ввести per-commit sync telemetry | PERF | candidate | M | G-PERF |
 | 196 | LIN-0104 | [D03](#d03) | Разделить encode/write/sync histograms | PERF | candidate | M | G-PERF |
@@ -322,7 +284,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 492 | LIN-0498 | [D13](#d13) | Проверить constant-fold NaN semantics | CORRECTNESS | qualification | S | G-CORRECT |
 | 495 | LIN-0501 | [D13](#d13) | Проверить checked cast boundaries | CORRECTNESS | qualification | S | G-CORRECT |
 | 496 | LIN-0502 | [D13](#d13) | Проверить date/time literal validation | CORRECTNESS | qualification | S | G-CORRECT |
-| 498 | LIN-0504 | [D13](#d13) | Проверить vector dimension validation | CORRECTNESS | qualification | S | G-CORRECT |
 | 499 | LIN-0505 | [D13](#d13) | Добавить type error suggestions | FEATURE | candidate | M | G-FEATURE |
 | 500 | LIN-0506 | [D13](#d13) | Добавить related source spans | FEATURE | candidate | M | G-FEATURE |
 | 501 | LIN-0507 | [D13](#d13) | Добавить explain type annotations | FEATURE | candidate | L | G-FEATURE |
@@ -1431,7 +1392,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 <a id="d01"></a>
 
-**D01. Бенчмарки и доказательства** — открыто 32 из 40. Модули: [benches/compare.rs](../benches/compare.rs), [scripts/bench-peers.py](../scripts/bench-peers.py), [docs/benchmark-contract.md](../docs/benchmark-contract.md).
+**D01. Бенчмарки и доказательства** — открыто 29 из 40. Модули: [benches/compare.rs](../benches/compare.rs), [scripts/bench-peers.py](../scripts/bench-peers.py), [docs/benchmark-contract.md](../docs/benchmark-contract.md).
 
 <a id="d02"></a>
 
@@ -1439,7 +1400,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 <a id="d03"></a>
 
-**D03. Durable I/O и sync** — открыто 24 из 40. Модули: [src/persist/mod.rs](../src/persist/mod.rs), [src/ship.rs](../src/ship.rs), [tests/persist.rs](../tests/persist.rs). Контекст: [D01](#d01), [D02](#d02).
+**D03. Durable I/O и sync** — открыто 23 из 40. Модули: [src/persist/mod.rs](../src/persist/mod.rs), [src/ship.rs](../src/ship.rs), [tests/persist.rs](../tests/persist.rs). Контекст: [D01](#d01), [D02](#d02).
 
 <a id="d04"></a>
 
@@ -1479,7 +1440,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 <a id="d13"></a>
 
-**D13. Type checking и semantics** — открыто 23 из 40. Модули: [src/check.rs](../src/check.rs), [src/catalog.rs](../src/catalog.rs), [tests/lang.rs](../tests/lang.rs). Контекст: [D08](#d08), [D46](#d46).
+**D13. Type checking и semantics** — открыто 22 из 40. Модули: [src/check.rs](../src/check.rs), [src/catalog.rs](../src/catalog.rs), [tests/lang.rs](../tests/lang.rs). Контекст: [D08](#d08), [D46](#d46).
 
 <a id="d14"></a>
 

@@ -2136,6 +2136,19 @@ impl Store {
         }
     }
 
+    /// Mutable access for tail-only append (`push` / `extend` / `reserve`), preserving
+    /// `RowMap::rewrite_epoch` when the collection does not require disk promotion.
+    pub(crate) fn collection_append_mut(&mut self, name: &str) -> &mut Vec<Row> {
+        if name == "facts" {
+            self.ensure_facts_rows();
+        }
+        if self.is_disk_backed(name) {
+            self.promote_disk_col(name);
+            return self.collection_mut(name);
+        }
+        self.collections.append_only_mut(name)
+    }
+
     pub fn find_doc_key(&self, key: &str) -> Option<&Row> {
         self.get_by_id("docs", key).or_else(|| self.get_by_uri(key))
     }
@@ -3840,7 +3853,7 @@ impl Store {
         if collection == "docs" {
             self.flush_fts_deferred_docs();
         }
-        self.collection_mut(collection).reserve(built.len());
+        self.collection_append_mut(collection).reserve(built.len());
         self.row_maps_reserve(collection, built.len());
         let has_unique = self
             .indexes

@@ -2285,11 +2285,25 @@ fn fill_mysql_logs(conn: &mut MysqlBenchConn, n: usize) {
 }
 
 fn main() -> airbug_bench::Result<()> {
+    let wal_dict = std::env::var("LIN_BENCH_WAL_DICT")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "on"))
+        .unwrap_or(false);
+    lin::persist::set_wal_dictionary_writer(wal_dict);
     let pg = connect_pg();
     let mysql = connect_mysql();
 
-    let mut engines =
-        String::from("Lin | SQLite(rusqlite bundled) | DuckDB(bundled) | HashMap(point get only)");
+    let sqlite_ver: String = rusqlite::Connection::open_in_memory()
+        .ok()
+        .and_then(|c| c.query_row("SELECT sqlite_version()", [], |r| r.get(0)).ok())
+        .unwrap_or_else(|| "bundled".to_string());
+    let duck_ver: String = duckdb::Connection::open_in_memory()
+        .ok()
+        .and_then(|c| c.query_row("SELECT version()", [], |r| r.get(0)).ok())
+        .unwrap_or_else(|| "bundled".to_string());
+    let mut engines = format!(
+        "Lin({}) | SQLite({sqlite_ver}) | DuckDB({duck_ver}) | HashMap(point get only)",
+        lin::VERSION
+    );
     if let Some((ref url, _)) = pg {
         engines.push_str(&format!(" | Postgres({url})"));
     } else {

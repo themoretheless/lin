@@ -121,8 +121,8 @@ pub use embed_ollama::OllamaEmbedder;
 pub use embed_onnx::{EmbeddingModel, OnnxEmbedder};
 pub use error::Error;
 pub use exec::{
-    Db, Done, Handle, OpenConfig, OpenOpts, Prepared, Quotas, ReadDb, ReopenPhases, SharedDb,
-    SharedTransaction, Stats, SyncMode, Transaction,
+    Db, Done, Handle, MaterializedViewStats, OpenConfig, OpenOpts, Prepared, Quotas, ReadDb,
+    ReopenPhases, SharedDb, SharedTransaction, Stats, SyncMode, Transaction,
 };
 pub use graph::GraphFmt;
 pub use plan::Plan;
