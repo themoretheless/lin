@@ -246,17 +246,18 @@ impl Store {
     pub fn open_with(
         path: impl AsRef<Path>,
         cat: &Catalog,
-        opts: OpenMemOpts,
+        opts: impl Into<persist::OpenConfig>,
     ) -> Result<(Self, Persist), Error> {
-        let (store, persist, _) = Self::open_with_profiled(path, cat, opts)?;
+        let (store, persist, _) = Self::open_with_profiled(path, cat, opts.into())?;
         Ok((store, persist))
     }
 
     pub(crate) fn open_with_profiled(
         path: impl AsRef<Path>,
         cat: &Catalog,
-        opts: OpenMemOpts,
+        cfg: persist::OpenConfig,
     ) -> Result<(Self, Persist, StoreOpenPhases), Error> {
+        let opts = cfg.opts;
         let mut phases = StoreOpenPhases::default();
         let phase = Instant::now();
         let dir = path.as_ref();
@@ -418,6 +419,7 @@ impl Store {
             encoder: persist::acquire_encoder(),
             sync: opts.sync,
             cold: opts.cold,
+            wal_dictionary: cfg.wal_dictionary,
             log_bytes: end,
             wal_index,
             has_segment_packs,
@@ -814,9 +816,10 @@ impl Store {
             pack,
         };
         let sync = persist.sync;
+        let wal_dict = persist.wal_dictionary;
         let prev_log_bytes = persist.log_bytes;
         let rec_gen = rec.r#gen;
-        {
+        persist::with_dictionary_writer_opt(wal_dict, || -> Result<(), Error> {
             let Persist {
                 log,
                 encode_buf,
@@ -853,7 +856,8 @@ impl Store {
                 }
                 None => persist::append_record(log, &rec, encode_buf, sync, log_bytes)?,
             }
-        }
+            Ok(())
+        })?;
         persist.wal_index.push((rec_gen, prev_log_bytes));
         persist.writes_since_snapshot += 1;
         Ok(())

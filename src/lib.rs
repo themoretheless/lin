@@ -107,7 +107,10 @@ pub use server::{
     PullSyncPayload, ReplicaPoolClient, ReplicaStatus, ServerClient, ServerConfig, ServerHandle,
     WorkloadGroup,
 };
-pub use ship::{PullOpts, TlsClient, TlsServer};
+pub use ship::{
+    LiveServeOpts, PullOpts, ShipPullResult, ShipPullStatus, ShipReplicaStatus, ShipWalHub,
+    TlsClient, TlsServer,
+};
 pub use embed::{
     Embedder, HashingEmbedder, HnswIndex, HnswIndexSq8, VectorIndex, cosine, dequantize_sq8,
     dot_sq8, quantize_sq8,
@@ -118,8 +121,8 @@ pub use embed_ollama::OllamaEmbedder;
 pub use embed_onnx::{EmbeddingModel, OnnxEmbedder};
 pub use error::Error;
 pub use exec::{
-    Db, Done, Handle, OpenOpts, Prepared, Quotas, ReadDb, ReopenPhases, Stats, SyncMode,
-    Transaction,
+    Db, Done, Handle, OpenConfig, OpenOpts, Prepared, Quotas, ReadDb, ReopenPhases, SharedDb,
+    SharedTransaction, Stats, SyncMode, Transaction,
 };
 pub use graph::GraphFmt;
 pub use plan::Plan;

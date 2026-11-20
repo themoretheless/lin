@@ -32,7 +32,140 @@ use crate::exec::Db;
 /// Cap on a single pull payload (bytes).
 pub const MAX_PULL_BYTES: u64 = 256 * 1024 * 1024;
 const PROTO_MAGIC: [u8; 4] = *b"LIN\x06";
+const PROTO_MAGIC_V7: [u8; 4] = *b"LIN\x07";
 const MAX_TOKEN: usize = 4096;
+const MAX_FOLLOWER_ID: usize = 256;
+
+/// Outcome of an extended WAL pull ([`pull_wait`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShipPullStatus {
+    /// Incremental WAL frames returned (`frames` may be empty when already caught up).
+    Ok,
+    /// Follower is further behind than `max_lag_gens` or WAL was compacted past `since_gen`;
+    /// follower should re-bootstrap from a fresh primary snapshot/backup.
+    LagExceeded,
+}
+
+/// Response returned by [`pull_wait`].
+#[derive(Debug, Clone)]
+pub struct ShipPullResult {
+    pub status: ShipPullStatus,
+    pub primary_gen: u64,
+    pub frames: Vec<u8>,
+}
+
+/// Per-follower replication lag snapshot recorded by [`ShipWalHub`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShipReplicaStatus {
+    pub follower_id: String,
+    pub since_gen: u64,
+    pub primary_gen: u64,
+    pub lag_gens: u64,
+    pub lag_exceeded: bool,
+    pub last_pull_ms: i64,
+}
+
+/// Push-wakeup and replica-lag coordinator for standalone [`serve_dir_live`] WAL fanout.
+#[derive(Default)]
+pub struct ShipWalHub {
+    gen_state: std::sync::Mutex<u64>,
+    gen_cv: std::sync::Condvar,
+    max_lag_gens: std::sync::atomic::AtomicU64,
+    replicas: std::sync::Mutex<std::collections::BTreeMap<String, ShipReplicaStatus>>,
+}
+
+impl ShipWalHub {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    pub fn with_max_lag_gens(max_lag_gens: u64) -> Arc<Self> {
+        let hub = Self::new();
+        hub.set_max_lag_gens(Some(max_lag_gens));
+        hub
+    }
+
+    /// Configure maximum allowed follower generation lag (`None` or `Some(0)` disables the cap).
+    pub fn set_max_lag_gens(&self, max_lag: Option<u64>) {
+        self.max_lag_gens
+            .store(max_lag.unwrap_or(0), Ordering::Release);
+        self.gen_cv.notify_all();
+    }
+
+    pub fn max_lag_gens(&self) -> Option<u64> {
+        let v = self.max_lag_gens.load(Ordering::Acquire);
+        (v > 0).then_some(v)
+    }
+
+    /// Notify waiting long-poll followers that `new_gen` has been committed on the primary.
+    pub fn notify_commit(&self, new_gen: u64) {
+        if let Ok(mut g) = self.gen_state.lock()
+            && new_gen > *g
+        {
+            *g = new_gen;
+        }
+        self.gen_cv.notify_all();
+    }
+
+    /// Snapshot of tracked follower replication states.
+    pub fn replica_statuses(&self) -> Vec<ShipReplicaStatus> {
+        self.replicas
+            .lock()
+            .map(|m| m.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    fn record_pull(
+        &self,
+        follower_id: Option<&str>,
+        since_gen: u64,
+        primary_gen: u64,
+        lag_exceeded: bool,
+    ) {
+        let Some(id) = follower_id.map(str::trim).filter(|s| !s.is_empty()) else {
+            return;
+        };
+        let status = ShipReplicaStatus {
+            follower_id: id.to_owned(),
+            since_gen,
+            primary_gen,
+            lag_gens: primary_gen.saturating_sub(since_gen),
+            lag_exceeded,
+            last_pull_ms: crate::store::now_ms(),
+        };
+        if let Ok(mut map) = self.replicas.lock() {
+            if map.len() >= 256 && !map.contains_key(id)
+                && let Some(oldest) = map
+                    .iter()
+                    .min_by_key(|(_, v)| v.last_pull_ms)
+                    .map(|(k, _)| k.clone())
+            {
+                map.remove(&oldest);
+            }
+            map.insert(id.to_owned(), status);
+        }
+    }
+}
+
+/// Options for non-blocking directory WAL fanout ([`serve_dir_live`]).
+#[derive(Clone)]
+pub struct LiveServeOpts {
+    pub serve: ServeOpts,
+    pub max_sinks: usize,
+    pub max_lag_gens: Option<u64>,
+    pub hub: Option<Arc<ShipWalHub>>,
+}
+
+impl Default for LiveServeOpts {
+    fn default() -> Self {
+        Self {
+            serve: ServeOpts::default(),
+            max_sinks: 16,
+            max_lag_gens: None,
+            hub: None,
+        }
+    }
+}
 
 fn io_err(e: impl std::fmt::Display) -> Error {
     Error::runtime(format!("wal ship: {e}"))
@@ -274,6 +407,62 @@ pub fn pull_with(addr: impl ToSocketAddrs, since: u64, opts: &PullOpts) -> Resul
     pull_io(stream, since, opts.token.as_deref())
 }
 
+/// Pull WAL frames with optional server-side push long-polling (`wait_ms <= 30_000`),
+/// follower lag reporting (`follower_id`), and `LagExceeded` detection.
+pub fn pull_wait(
+    addr: impl ToSocketAddrs,
+    since: u64,
+    wait_ms: u32,
+    follower_id: Option<&str>,
+    opts: &PullOpts,
+) -> Result<ShipPullResult, Error> {
+    let clamped_wait = wait_ms.min(30_000);
+    let io_timeout = Duration::from_secs(30) + Duration::from_millis(u64::from(clamped_wait));
+    let mut stream = connect_net_stream_addrs(addr, opts, io_timeout)?;
+    write_hello_v7(
+        &mut stream,
+        opts.token.as_deref().unwrap_or(""),
+        since,
+        clamped_wait,
+        follower_id.unwrap_or(""),
+    )?;
+    let mut hdr = [0u8; 17];
+    stream.read_exact(&mut hdr).map_err(io_err)?;
+    let status = match hdr[0] {
+        0 => ShipPullStatus::Ok,
+        1 => ShipPullStatus::LagExceeded,
+        other => {
+            return Err(Error::runtime(format!(
+                "wal ship: unknown v7 status byte {other}"
+            )));
+        }
+    };
+    let primary_gen = u64::from_le_bytes(hdr[1..9].try_into().unwrap());
+    let len = u64::from_le_bytes(hdr[9..17].try_into().unwrap());
+    if len > MAX_PULL_BYTES {
+        return Err(Error::runtime(format!(
+            "wal ship: pull payload {len} exceeds max {MAX_PULL_BYTES}"
+        )));
+    }
+    let mut frames = Vec::with_capacity((len as usize).min(1 << 20));
+    if len > 0 {
+        Read::take(&mut stream, len)
+            .read_to_end(&mut frames)
+            .map_err(io_err)?;
+        if frames.len() as u64 != len {
+            return Err(Error::runtime(format!(
+                "wal ship: pull payload truncated at {} of {len} bytes",
+                frames.len()
+            )));
+        }
+    }
+    Ok(ShipPullResult {
+        status,
+        primary_gen,
+        frames,
+    })
+}
+
 fn pull_io<S: Read + Write>(
     mut stream: S,
     since: u64,
@@ -328,14 +517,54 @@ fn write_hello<W: Write>(w: &mut W, token: &str, since: u64) -> Result<(), Error
     Ok(())
 }
 
-fn read_hello<R: Read>(r: &mut R) -> Result<(String, u64), Error> {
+fn write_hello_v7<W: Write>(
+    w: &mut W,
+    token: &str,
+    since: u64,
+    wait_ms: u32,
+    follower_id: &str,
+) -> Result<(), Error> {
+    if token.len() > MAX_TOKEN {
+        return Err(Error::runtime("wal ship: token too long"));
+    }
+    let fid = if follower_id.len() > MAX_FOLLOWER_ID {
+        &follower_id[..MAX_FOLLOWER_ID]
+    } else {
+        follower_id
+    };
+    let mut buf = Vec::with_capacity(4 + 2 + token.len() + 8 + 4 + 2 + fid.len());
+    buf.extend_from_slice(&PROTO_MAGIC_V7);
+    buf.extend_from_slice(&(token.len() as u16).to_le_bytes());
+    buf.extend_from_slice(token.as_bytes());
+    buf.extend_from_slice(&since.to_le_bytes());
+    buf.extend_from_slice(&wait_ms.to_le_bytes());
+    buf.extend_from_slice(&(fid.len() as u16).to_le_bytes());
+    buf.extend_from_slice(fid.as_bytes());
+    w.write_all(&buf).map_err(io_err)?;
+    w.flush().map_err(io_err)?;
+    Ok(())
+}
+
+struct ShipHello {
+    v7: bool,
+    token: String,
+    since: u64,
+    wait_ms: u32,
+    follower_id: Option<String>,
+}
+
+fn read_hello_any<R: Read>(r: &mut R) -> Result<ShipHello, Error> {
     let mut mag = [0u8; 4];
     r.read_exact(&mut mag).map_err(io_err)?;
-    if mag != PROTO_MAGIC {
-        return Err(Error::runtime(
-            "wal ship: bad protocol magic (need LIN\\x06)",
-        ));
-    }
+    let v7 = match mag {
+        PROTO_MAGIC => false,
+        PROTO_MAGIC_V7 => true,
+        _ => {
+            return Err(Error::runtime(
+                "wal ship: bad protocol magic (need LIN\\x06 or LIN\\x07)",
+            ));
+        }
+    };
     let mut nbuf = [0u8; 2];
     r.read_exact(&mut nbuf).map_err(io_err)?;
     let n = u16::from_le_bytes(nbuf) as usize;
@@ -349,7 +578,39 @@ fn read_hello<R: Read>(r: &mut R) -> Result<(String, u64), Error> {
     let token = String::from_utf8(tok).map_err(io_err)?;
     let mut since_buf = [0u8; 8];
     r.read_exact(&mut since_buf).map_err(io_err)?;
-    Ok((token, u64::from_le_bytes(since_buf)))
+    let since = u64::from_le_bytes(since_buf);
+    if !v7 {
+        return Ok(ShipHello {
+            v7: false,
+            token,
+            since,
+            wait_ms: 0,
+            follower_id: None,
+        });
+    }
+    let mut wbuf = [0u8; 4];
+    r.read_exact(&mut wbuf).map_err(io_err)?;
+    let wait_ms = u32::from_le_bytes(wbuf).min(30_000);
+    let mut fbuf = [0u8; 2];
+    r.read_exact(&mut fbuf).map_err(io_err)?;
+    let fn_len = u16::from_le_bytes(fbuf) as usize;
+    if fn_len > MAX_FOLLOWER_ID {
+        return Err(Error::runtime("wal ship: follower_id too long"));
+    }
+    let follower_id = if fn_len > 0 {
+        let mut raw = vec![0u8; fn_len];
+        r.read_exact(&mut raw).map_err(io_err)?;
+        Some(String::from_utf8(raw).map_err(io_err)?)
+    } else {
+        None
+    };
+    Ok(ShipHello {
+        v7: true,
+        token,
+        since,
+        wait_ms,
+        follower_id,
+    })
 }
 
 pub fn token_eq(a: &str, b: &str) -> bool {
@@ -662,6 +923,184 @@ pub fn serve_blocking_addr(dir: impl AsRef<Path>, addr: impl ToSocketAddrs) -> R
     serve_dir(dir, listener)
 }
 
+/// Serve WAL pulls directly from durable `dir` **without holding the writer lock**, so a
+/// primary [`Db`] or [`crate::server::LinServer`] can write concurrently while up to
+/// `opts.max_sinks` followers pull WAL frames with push long-polling and lag bounds.
+pub fn serve_dir_live(
+    dir: impl AsRef<Path>,
+    listener: TcpListener,
+    opts: &LiveServeOpts,
+) -> Result<(), Error> {
+    serve_dir_live_limit(dir, &listener, opts, None)
+}
+
+/// Bounded variant of [`serve_dir_live`] returning after `max_conns` accepted connections.
+pub fn serve_dir_live_limit(
+    dir: impl AsRef<Path>,
+    listener: &TcpListener,
+    opts: &LiveServeOpts,
+    max_conns: Option<usize>,
+) -> Result<(), Error> {
+    let dir = dir.as_ref();
+    crate::persist::validate_data_dir(dir)?;
+    if !dir.exists()
+        || (!crate::persist::head_path(dir).exists()
+            && !crate::persist::snapshot_path(dir).exists()
+            && !crate::persist::log_path(dir).exists())
+    {
+        return Err(Error::runtime(
+            "wal ship: serve_dir_live requires an initialized durable data directory",
+        ));
+    }
+    listener.set_nonblocking(false).map_err(io_err)?;
+    let tls = match &opts.serve.tls {
+        Some(t) => Some(server_config(t)?),
+        None => None,
+    };
+    let hub = match &opts.hub {
+        Some(h) => {
+            if let Some(m) = opts.max_lag_gens {
+                h.set_max_lag_gens(Some(m));
+            }
+            Arc::clone(h)
+        }
+        None => {
+            let h = ShipWalHub::new();
+            if let Some(m) = opts.max_lag_gens {
+                h.set_max_lag_gens(Some(m));
+            }
+            h
+        }
+    };
+    let workers = opts.max_sinks.clamp(1, MAX_SINKS);
+    let token = opts.serve.token.as_deref();
+    let (tx, rx) = std::sync::mpsc::sync_channel::<TcpStream>(0);
+    let rx = std::sync::Mutex::new(rx);
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let tls = tls.clone();
+            let hub = Arc::clone(&hub);
+            let rx = &rx;
+            scope.spawn(move || {
+                loop {
+                    let next = match rx.lock() {
+                        Ok(guard) => guard.recv(),
+                        Err(_) => return,
+                    };
+                    let Ok(stream) = next else {
+                        return;
+                    };
+                    if let Err(e) = handle_dir_conn(dir, stream, token, tls.clone(), &hub) {
+                        eprintln!("wal ship: client error: {e}");
+                    }
+                }
+            });
+        }
+        let mut accepted = 0usize;
+        let result = loop {
+            if max_conns.is_some_and(|max| accepted >= max) {
+                break Ok(());
+            }
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    accepted += 1;
+                    if tx.send(stream).is_err() {
+                        break Err(Error::runtime("wal ship: no serving thread left"));
+                    }
+                }
+                Err(e) => break Err(io_err(e)),
+            }
+        };
+        drop(tx);
+        result
+    })
+}
+
+fn handle_dir_conn(
+    dir: &Path,
+    stream: TcpStream,
+    expect_token: Option<&str>,
+    tls: Option<Arc<ServerConfig>>,
+    hub: &ShipWalHub,
+) -> Result<(), Error> {
+    let mut net = accept_net_stream(stream, tls, Duration::from_secs(30))?;
+    let hello = read_hello_any(&mut net)?;
+    let want = expect_token.unwrap_or("");
+    if !token_eq(&hello.token, want) {
+        return Err(Error::runtime("wal ship: bad token"));
+    }
+    if hello.wait_ms > 0 {
+        net.set_timeout(Some(
+            Duration::from_secs(30) + Duration::from_millis(u64::from(hello.wait_ms)),
+        ))?;
+    }
+    let deadline = std::time::Instant::now() + Duration::from_millis(u64::from(hello.wait_ms));
+    let max_lag = hub.max_lag_gens.load(Ordering::Acquire);
+
+    let (head_gen, first_wal_gen, primary_gen) = loop {
+        let (hg, fwg, pg) = crate::persist::peek_wal_bounds(dir)?;
+        let gap = hello.since < hg && fwg.is_none_or(|fg| fg > hello.since.saturating_add(1));
+        let lag_over = max_lag > 0 && pg.saturating_sub(hello.since) > max_lag;
+        if pg > hello.since || gap || lag_over || hello.wait_ms == 0 {
+            break (hg, fwg, pg);
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            break (hg, fwg, pg);
+        }
+        let slice = (deadline - now).min(Duration::from_millis(5));
+        if let Ok(guard) = hub.gen_state.lock() {
+            if *guard > hello.since {
+                drop(guard);
+                continue;
+            }
+            let _ = hub.gen_cv.wait_timeout(guard, slice);
+        } else {
+            std::thread::sleep(slice);
+        }
+    };
+
+    let compacted_gap =
+        hello.since < head_gen && first_wal_gen.is_none_or(|fg| fg > hello.since.saturating_add(1));
+    let lag_exceeded =
+        compacted_gap || (max_lag > 0 && primary_gen.saturating_sub(hello.since) > max_lag);
+    hub.record_pull(
+        hello.follower_id.as_deref(),
+        hello.since,
+        primary_gen,
+        lag_exceeded,
+    );
+
+    if lag_exceeded {
+        if hello.v7 {
+            write_v7_response(&mut net, ShipPullStatus::LagExceeded, primary_gen, &[])?;
+            return Ok(());
+        }
+        return Err(Error::runtime(format!(
+            "wal ship: replica lag {} (since={}, primary={primary_gen}) exceeds max_lag_gens or compacted WAL",
+            primary_gen.saturating_sub(hello.since),
+            hello.since
+        )));
+    }
+
+    let frames = if primary_gen <= hello.since {
+        Vec::new()
+    } else {
+        crate::persist::export_wal_since(dir, hello.since)?
+    };
+    if frames.len() as u64 > MAX_PULL_BYTES {
+        return Err(Error::runtime(format!(
+            "wal ship: export {} exceeds max {MAX_PULL_BYTES}",
+            frames.len()
+        )));
+    }
+    if hello.v7 {
+        write_v7_response(&mut net, ShipPullStatus::Ok, primary_gen, &frames)
+    } else {
+        write_v6_response(&mut net, &frames)
+    }
+}
+
 fn handle_conn(
     db: &Db,
     stream: TcpStream,
@@ -677,18 +1116,47 @@ fn handle_io<S: Read + Write>(
     mut stream: S,
     expect_token: Option<&str>,
 ) -> Result<(), Error> {
-    let (got, since) = read_hello(&mut stream)?;
+    let hello = read_hello_any(&mut stream)?;
     let want = expect_token.unwrap_or("");
-    if !token_eq(&got, want) {
+    if !token_eq(&hello.token, want) {
         return Err(Error::runtime("wal ship: bad token"));
     }
-    let frames = db.export_wal_since(since)?;
+    let frames = db.export_wal_since(hello.since)?;
     if frames.len() as u64 > MAX_PULL_BYTES {
         return Err(Error::runtime(format!(
             "wal ship: export {} exceeds max {MAX_PULL_BYTES}",
             frames.len()
         )));
     }
+    if hello.v7 {
+        write_v7_response(&mut stream, ShipPullStatus::Ok, db.r#gen(), &frames)
+    } else {
+        write_v6_response(&mut stream, &frames)
+    }
+}
+
+fn write_v7_response<S: Write>(
+    stream: &mut S,
+    status: ShipPullStatus,
+    primary_gen: u64,
+    frames: &[u8],
+) -> Result<(), Error> {
+    let mut hdr = [0u8; 17];
+    hdr[0] = match status {
+        ShipPullStatus::Ok => 0,
+        ShipPullStatus::LagExceeded => 1,
+    };
+    hdr[1..9].copy_from_slice(&primary_gen.to_le_bytes());
+    hdr[9..17].copy_from_slice(&(frames.len() as u64).to_le_bytes());
+    stream.write_all(&hdr).map_err(io_err)?;
+    if !frames.is_empty() {
+        stream.write_all(frames).map_err(io_err)?;
+    }
+    stream.flush().map_err(io_err)?;
+    Ok(())
+}
+
+fn write_v6_response<S: Write>(stream: &mut S, frames: &[u8]) -> Result<(), Error> {
     let len_bytes = (frames.len() as u64).to_le_bytes();
     if frames.is_empty() {
         stream.write_all(&len_bytes).map_err(io_err)?;
@@ -944,7 +1412,7 @@ mod tests {
             let addr: SocketAddr = listener.local_addr().unwrap();
             let server = thread::spawn(move || {
                 let (mut s, _) = listener.accept().unwrap();
-                let _ = read_hello(&mut s);
+                let _ = read_hello_any(&mut s);
                 s.write_all(&announced.to_le_bytes()).unwrap();
                 s.write_all(b"only a few bytes").unwrap();
                 // Closing here ends the payload long before the announced size.
@@ -1065,6 +1533,101 @@ mod tests {
         .expect("named server verifies under its own name");
         assert!(!frames.is_empty());
         let _ = serve.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn serve_dir_live_concurrent_writer_push_wakeup_and_lag_bound() {
+        let dir = std::env::temp_dir().join(format!(
+            "lin-ship-live-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Keep primary Db open (holding writer lock!) while serve_dir_live_limit serves from `dir`.
+        let mut primary = Db::open(&dir).unwrap();
+        primary
+            .run(r#"insert docs { uri: "raw://live-1", title: "Live 1", layer: "wiki" }"#)
+            .unwrap();
+        let g1 = primary.r#gen();
+
+        let hub = ShipWalHub::with_max_lag_gens(2);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let dir_srv = dir.clone();
+        let hub_srv = Arc::clone(&hub);
+        let srv = thread::spawn(move || {
+            let live_opts = LiveServeOpts {
+                serve: ServeOpts::default(),
+                max_sinks: 4,
+                max_lag_gens: Some(2),
+                hub: Some(hub_srv),
+            };
+            serve_dir_live_limit(&dir_srv, &listener, &live_opts, Some(3))
+        });
+
+        // 1. Initial pull from since=0 (lag=1 <= max_lag=2): succeeds immediately.
+        let r1 = pull_wait(addr, 0, 0, Some("f-alpha"), &PullOpts::default()).unwrap();
+        assert_eq!(r1.status, ShipPullStatus::Ok);
+        assert_eq!(r1.primary_gen, g1);
+        assert!(!r1.frames.is_empty());
+        let mut follower = Db::empty();
+        follower.apply_wal(&r1.frames).unwrap();
+        assert_eq!(follower.r#gen(), g1);
+
+        // 2. Long-poll wait (`wait_ms = 2500`) wakes quickly when primary commits + hub notifies.
+        let hub_writer = Arc::clone(&hub);
+        let waiter = thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let res = pull_wait(addr, g1, 2500, Some("f-alpha"), &PullOpts::default()).unwrap();
+            (res, started.elapsed())
+        });
+        thread::sleep(Duration::from_millis(25));
+        primary
+            .run(r#"insert docs { uri: "raw://live-2", title: "Live 2", layer: "wiki" }"#)
+            .unwrap();
+        let g2 = primary.r#gen();
+        hub_writer.notify_commit(g2);
+
+        let (r2, elapsed) = waiter.join().unwrap();
+        assert_eq!(r2.status, ShipPullStatus::Ok);
+        assert_eq!(r2.primary_gen, g2);
+        assert!(!r2.frames.is_empty());
+        assert!(
+            elapsed < Duration::from_millis(800),
+            "push wakeup took too long: {elapsed:?}"
+        );
+        follower.apply_wal(&r2.frames).unwrap();
+        assert_eq!(follower.r#gen(), g2);
+
+        // 3. Advance primary to gen 4 so a stale follower at since=0 has lag 4 > max_lag=2.
+        primary
+            .run(r#"insert docs { uri: "raw://live-3", title: "Live 3", layer: "wiki" }"#)
+            .unwrap();
+        primary
+            .run(r#"insert docs { uri: "raw://live-4", title: "Live 4", layer: "wiki" }"#)
+            .unwrap();
+        let g4 = primary.r#gen();
+        hub.notify_commit(g4);
+
+        let r3 = pull_wait(addr, 0, 0, Some("f-stale"), &PullOpts::default()).unwrap();
+        assert_eq!(r3.status, ShipPullStatus::LagExceeded);
+        assert_eq!(r3.primary_gen, g4);
+        assert!(r3.frames.is_empty());
+
+        srv.join().unwrap().unwrap();
+        let statuses = hub.replica_statuses();
+        assert_eq!(statuses.len(), 2);
+        let stale = statuses.iter().find(|s| s.follower_id == "f-stale").unwrap();
+        assert!(stale.lag_exceeded);
+        assert_eq!(stale.lag_gens, g4);
+
+        primary.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

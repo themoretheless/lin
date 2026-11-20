@@ -358,6 +358,48 @@ pub struct OpenMemOpts {
     pub cold: bool,
 }
 
+impl OpenMemOpts {
+    /// Override per-database WAL dictionary vector codec (codec 5) writing without mutating
+    /// the process-wide [`super::set_wal_dictionary_writer`] flag.
+    pub const fn with_wal_dictionary(self, enabled: bool) -> OpenConfig {
+        OpenConfig {
+            opts: self,
+            wal_dictionary: Some(enabled),
+        }
+    }
+}
+
+/// Extended durable open configuration preserving struct-literal compatibility for [`OpenMemOpts`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct OpenConfig {
+    pub opts: OpenMemOpts,
+    /// Per-instance override for writing WAL dictionary codec 5 (`None` inherits process setting).
+    pub wal_dictionary: Option<bool>,
+}
+
+impl OpenConfig {
+    pub const fn new(opts: OpenMemOpts) -> Self {
+        Self {
+            opts,
+            wal_dictionary: None,
+        }
+    }
+
+    pub const fn with_wal_dictionary(mut self, enabled: bool) -> Self {
+        self.wal_dictionary = Some(enabled);
+        self
+    }
+}
+
+impl From<OpenMemOpts> for OpenConfig {
+    fn from(opts: OpenMemOpts) -> Self {
+        Self {
+            opts,
+            wal_dictionary: None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Persist {
     pub dir: PathBuf,
@@ -374,6 +416,8 @@ pub struct Persist {
     pub sync: SyncMode,
     /// Spill large collections to mmap cold files on checkpoint.
     pub cold: bool,
+    /// Per-database WAL dictionary codec 5 override (`None` falls back to process global).
+    pub wal_dictionary: Option<bool>,
     /// Cached `log` file length (avoids metadata() on every commit).
     pub log_bytes: u64,
     /// Monotonic `(gen, file_offset)` index of frames currently in `log` (cleared on compact).

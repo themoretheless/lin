@@ -38,7 +38,7 @@ impl Validity {
     }
 
     #[inline]
-    fn push(&mut self, valid: bool) {
+    pub(crate) fn push(&mut self, valid: bool) {
         if self.nulls == 0 {
             if valid {
                 self.len += 1;
@@ -146,6 +146,18 @@ pub enum Column {
     Time { vals: Vec<i64>, valid: Validity },
     Float { vals: Vec<f64>, valid: Validity },
     Bool { vals: Vec<bool>, valid: Validity },
+    /// Contiguous UTF-8 buffer with `len + 1` byte offsets (`offsets[0] == 0`).
+    Text {
+        offsets: Vec<u32>,
+        data: Vec<u8>,
+        valid: Validity,
+    },
+    /// Dictionary-encoded text column (`values` table + `u32` code per row).
+    Dict {
+        values: Vec<Arc<str>>,
+        codes: Vec<u32>,
+        valid: Validity,
+    },
     Cells(Vec<Cell>),
 }
 
@@ -170,6 +182,7 @@ impl Column {
             Column::Int { vals, .. } | Column::Time { vals, .. } => vals.len(),
             Column::Float { vals, .. } => vals.len(),
             Column::Bool { vals, .. } => vals.len(),
+            Column::Text { valid, .. } | Column::Dict { valid, .. } => valid.len,
             Column::Cells(c) => c.len(),
         }
     }
@@ -239,6 +252,63 @@ impl Column {
                 vals.push(false);
                 valid.push(false);
             }
+            (
+                Column::Text {
+                    offsets,
+                    data,
+                    valid,
+                },
+                Cell::Null,
+            ) => {
+                let cur_off = data.len() as u32;
+                offsets.push(cur_off);
+                valid.push(false);
+            }
+            (
+                Column::Text {
+                    offsets,
+                    data,
+                    valid,
+                },
+                cell,
+            ) if cell.text().is_some() => {
+                let s = cell.text().unwrap();
+                if let Some(next_len) = data.len().checked_add(s.len())
+                    && u32::try_from(next_len).is_ok()
+                {
+                    data.extend_from_slice(s.as_bytes());
+                    offsets.push(data.len() as u32);
+                    valid.push(true);
+                } else {
+                    let mut cells = std::mem::take(self).into_cells();
+                    cells.push(cell);
+                    *self = Column::Cells(cells);
+                }
+            }
+            (Column::Dict { codes, valid, .. }, Cell::Null) => {
+                codes.push(0);
+                valid.push(false);
+            }
+            (
+                Column::Dict {
+                    values,
+                    codes,
+                    valid,
+                },
+                cell,
+            ) if cell.text().is_some() => {
+                let s = cell.text().unwrap();
+                let code = match values.iter().position(|v| v.as_ref() == s) {
+                    Some(idx) => idx as u32,
+                    None => {
+                        let idx = values.len() as u32;
+                        values.push(cell.text_shared().unwrap_or_else(|| Arc::from(s)));
+                        idx
+                    }
+                };
+                codes.push(code);
+                valid.push(true);
+            }
             (Column::Cells(c), cell) => c.push(cell),
             (_, cell) => {
                 // A value of another type: give up the dense representation.
@@ -299,8 +369,50 @@ impl Column {
             Column::Time { vals, valid } if valid.is_valid(i) => Cell::Time(vals[i]),
             Column::Float { vals, valid } if valid.is_valid(i) => Cell::Float(vals[i]),
             Column::Bool { vals, valid } if valid.is_valid(i) => Cell::Bool(vals[i]),
+            Column::Text {
+                offsets,
+                data,
+                valid,
+            } if valid.is_valid(i) => {
+                let s = offsets[i] as usize;
+                let e = offsets[i + 1] as usize;
+                // SAFETY: `Column::Text` only accepts validated UTF-8 slices.
+                let txt = std::str::from_utf8(&data[s..e]).unwrap_or("");
+                Cell::from_text(txt)
+            }
+            Column::Dict {
+                values,
+                codes,
+                valid,
+            } if valid.is_valid(i) => values
+                .get(codes[i] as usize)
+                .map(Cell::from_arc_str)
+                .unwrap_or(Cell::Null),
             Column::Cells(c) => c.get(i).map(Cell::clone_for_borrow).unwrap_or(Cell::Null),
             _ => Cell::Null,
+        }
+    }
+
+    /// Borrowed string slice at `i` across `Text`, `Dict`, and `Cells` representations.
+    #[inline]
+    pub fn text_at(&self, i: usize) -> Option<&str> {
+        match self {
+            Column::Text {
+                offsets,
+                data,
+                valid,
+            } if valid.is_valid(i) => {
+                let s = offsets[i] as usize;
+                let e = offsets[i + 1] as usize;
+                std::str::from_utf8(&data[s..e]).ok()
+            }
+            Column::Dict {
+                values,
+                codes,
+                valid,
+            } if valid.is_valid(i) => values.get(codes[i] as usize).map(Arc::as_ref),
+            Column::Cells(c) => c.get(i).and_then(Cell::text),
+            _ => None,
         }
     }
 
@@ -310,7 +422,9 @@ impl Column {
             Column::Int { valid, .. }
             | Column::Time { valid, .. }
             | Column::Float { valid, .. }
-            | Column::Bool { valid, .. } => !valid.is_valid(i),
+            | Column::Bool { valid, .. }
+            | Column::Text { valid, .. }
+            | Column::Dict { valid, .. } => !valid.is_valid(i),
             Column::Cells(c) => c.get(i).is_none_or(|c| matches!(c, Cell::Null)),
         }
     }
@@ -337,6 +451,140 @@ impl Column {
             Column::Float { vals, valid } => Some((vals, valid)),
             _ => None,
         }
+    }
+
+    /// Contiguous UTF-8 offsets/bytes and null mask (`Text` columns only).
+    pub fn as_text(&self) -> Option<(&[u32], &[u8], &Validity)> {
+        match self {
+            Column::Text {
+                offsets,
+                data,
+                valid,
+            } => Some((offsets, data, valid)),
+            _ => None,
+        }
+    }
+
+    /// Dictionary values, row codes, and null mask (`Dict` columns only).
+    pub fn as_dict(&self) -> Option<(&[Arc<str>], &[u32], &Validity)> {
+        match self {
+            Column::Dict {
+                values,
+                codes,
+                valid,
+            } => Some((values, codes, valid)),
+            _ => None,
+        }
+    }
+
+    /// Construct an empty dense `Column::Text` with pre-allocated row and byte capacities.
+    pub fn new_text_with_capacity(row_cap: usize, byte_cap: usize) -> Self {
+        let mut offsets = Vec::with_capacity(row_cap + 1);
+        offsets.push(0);
+        Column::Text {
+            offsets,
+            data: Vec::with_capacity(byte_cap),
+            valid: Validity::default(),
+        }
+    }
+
+    /// Construct a dense `Column::Text` from optional string slices.
+    pub fn from_strs<'a>(iter: impl IntoIterator<Item = Option<&'a str>>) -> Self {
+        let it = iter.into_iter();
+        let (lo, _) = it.size_hint();
+        let mut col = Self::new_text_with_capacity(lo, lo * 8);
+        for opt in it {
+            match (&mut col, opt) {
+                (
+                    Column::Text {
+                        offsets,
+                        data,
+                        valid,
+                    },
+                    Some(s),
+                ) if data.len().checked_add(s.len()).is_some_and(|n| u32::try_from(n).is_ok()) => {
+                    data.extend_from_slice(s.as_bytes());
+                    offsets.push(data.len() as u32);
+                    valid.push(true);
+                }
+                (
+                    Column::Text {
+                        offsets,
+                        data,
+                        valid,
+                    },
+                    None,
+                ) => {
+                    offsets.push(data.len() as u32);
+                    valid.push(false);
+                }
+                (_, Some(s)) => col.push(Cell::from_text(s)),
+                (_, None) => col.push(Cell::Null),
+            }
+        }
+        col
+    }
+
+    /// Construct a `Column::Dict` from a dictionary, row codes, and validity mask.
+    pub fn from_dict(values: Vec<Arc<str>>, codes: Vec<u32>, valid: Validity) -> Result<Self, Error> {
+        if codes.len() != valid.len {
+            return Err(Error::runtime("batch: dict codes length mismatch"));
+        }
+        for (i, &c) in codes.iter().enumerate() {
+            if valid.is_valid(i) && (c as usize) >= values.len() {
+                return Err(Error::runtime("batch: dict code out of bounds"));
+            }
+        }
+        Ok(Column::Dict {
+            values,
+            codes,
+            valid,
+        })
+    }
+
+    /// Dictionary-encode a text-bearing column (`Text`, `Dict`, or all-text/null `Cells`).
+    /// Returns `None` if any non-null element is not text.
+    pub fn encode_dict(&self) -> Option<Self> {
+        if matches!(self, Column::Dict { .. }) {
+            return Some(self.clone());
+        }
+        let n = self.len();
+        let mut map: rustc_hash::FxHashMap<&str, u32> = rustc_hash::FxHashMap::default();
+        let mut values: Vec<Arc<str>> = Vec::new();
+        let mut codes: Vec<u32> = Vec::with_capacity(n);
+        let mut valid = Validity::default();
+        for i in 0..n {
+            if self.is_null(i) {
+                codes.push(0);
+                valid.push(false);
+            } else {
+                let s = self.text_at(i)?;
+                let code = match map.get(s) {
+                    Some(&c) => c,
+                    None => {
+                        let c = values.len() as u32;
+                        let arc: Arc<str> = match self {
+                            Column::Cells(cs) => cs[i].text_shared().unwrap_or_else(|| Arc::from(s)),
+                            _ => Arc::from(s),
+                        };
+                        values.push(arc);
+                        codes.push(c);
+                        valid.push(true);
+                        // Re-borrow from `values.last()` so `map` holds `'a` tied to `self`?
+                        // Wait: `s` already borrows from `self` (`'self`)!
+                        map.insert(s, c);
+                        continue;
+                    }
+                };
+                codes.push(code);
+                valid.push(true);
+            }
+        }
+        Some(Column::Dict {
+            values,
+            codes,
+            valid,
+        })
     }
 
     /// Sum of the numeric values, skipping nulls; `None` for non-numeric columns.
@@ -478,6 +726,60 @@ impl Column {
                     }
                 }
             }
+            Column::Text {
+                offsets,
+                data,
+                valid,
+            } => {
+                let mut out_offsets = Vec::with_capacity(n + 1);
+                out_offsets.push(0);
+                let mut out_data = Vec::new();
+                let mut out_valid = Validity::default();
+                for &i in indices {
+                    let idx = i as usize;
+                    if valid.is_valid(idx) {
+                        let s = offsets[idx] as usize;
+                        let e = offsets[idx + 1] as usize;
+                        out_data.extend_from_slice(&data[s..e]);
+                        out_offsets.push(out_data.len() as u32);
+                        out_valid.push(true);
+                    } else {
+                        out_offsets.push(out_data.len() as u32);
+                        out_valid.push(false);
+                    }
+                }
+                Column::Text {
+                    offsets: out_offsets,
+                    data: out_data,
+                    valid: out_valid,
+                }
+            }
+            Column::Dict {
+                values,
+                codes,
+                valid,
+            } => {
+                if valid.null_count() == 0 {
+                    Column::Dict {
+                        values: values.clone(),
+                        codes: indices.iter().map(|&i| codes[i as usize]).collect(),
+                        valid: Validity::all_valid(n),
+                    }
+                } else {
+                    let mut out_codes = Vec::with_capacity(n);
+                    let mut out_valid = Validity::default();
+                    for &i in indices {
+                        let idx = i as usize;
+                        out_codes.push(codes[idx]);
+                        out_valid.push(valid.is_valid(idx));
+                    }
+                    Column::Dict {
+                        values: values.clone(),
+                        codes: out_codes,
+                        valid: out_valid,
+                    }
+                }
+            }
             Column::Cells(c) => Column::Cells(
                 indices
                     .iter()
@@ -502,6 +804,33 @@ impl Column {
                     .map(|&i| std::mem::replace(&mut c[i as usize], Cell::Null))
                     .collect(),
             ),
+            Column::Dict {
+                values,
+                codes,
+                valid,
+            } => {
+                let n = indices.len();
+                if valid.null_count() == 0 {
+                    Column::Dict {
+                        values,
+                        codes: indices.iter().map(|&i| codes[i as usize]).collect(),
+                        valid: Validity::all_valid(n),
+                    }
+                } else {
+                    let mut out_codes = Vec::with_capacity(n);
+                    let mut out_valid = Validity::default();
+                    for &i in indices {
+                        let idx = i as usize;
+                        out_codes.push(codes[idx]);
+                        out_valid.push(valid.is_valid(idx));
+                    }
+                    Column::Dict {
+                        values,
+                        codes: out_codes,
+                        valid: out_valid,
+                    }
+                }
+            }
             other => other.gather(indices),
         }
     }
@@ -512,6 +841,8 @@ impl Column {
             Column::Int { vals, .. } | Column::Time { vals, .. } => vals.reserve(additional),
             Column::Float { vals, .. } => vals.reserve(additional),
             Column::Bool { vals, .. } => vals.reserve(additional),
+            Column::Text { offsets, .. } => offsets.reserve(additional),
+            Column::Dict { codes, .. } => codes.reserve(additional),
             Column::Cells(c) => c.reserve(additional),
         }
     }
@@ -532,6 +863,20 @@ impl Column {
             }
             Column::Bool { vals, valid } => {
                 vals.truncate(n);
+                valid.rebuild(0..n);
+            }
+            Column::Text {
+                offsets,
+                data,
+                valid,
+            } => {
+                offsets.truncate(n + 1);
+                let new_byte_len = offsets.last().copied().unwrap_or(0) as usize;
+                data.truncate(new_byte_len);
+                valid.rebuild(0..n);
+            }
+            Column::Dict { codes, valid, .. } => {
+                codes.truncate(n);
                 valid.rebuild(0..n);
             }
             Column::Cells(c) => c.truncate(n),
@@ -564,6 +909,23 @@ impl Column {
             }
             Column::Bool { vals, valid } => {
                 vals.drain(0..n);
+                valid.rebuild(n..len);
+            }
+            Column::Text {
+                offsets,
+                data,
+                valid,
+            } => {
+                let drop_bytes = offsets[n];
+                data.drain(0..drop_bytes as usize);
+                offsets.drain(0..n);
+                for off in offsets.iter_mut() {
+                    *off -= drop_bytes;
+                }
+                valid.rebuild(n..len);
+            }
+            Column::Dict { codes, valid, .. } => {
+                codes.drain(0..n);
                 valid.rebuild(n..len);
             }
             Column::Cells(c) => {
@@ -603,6 +965,61 @@ impl Column {
                 va.extend(&vb);
                 a.extend(b);
             }
+            (
+                Column::Text {
+                    offsets: oa,
+                    data: da,
+                    valid: va,
+                },
+                Column::Text {
+                    offsets: ob,
+                    data: db,
+                    valid: vb,
+                },
+            ) if da.len().checked_add(db.len()).is_some_and(|n| u32::try_from(n).is_ok()) => {
+                let base = da.len() as u32;
+                da.extend_from_slice(&db);
+                oa.extend(ob[1..].iter().map(|&o| base + o));
+                va.extend(&vb);
+            }
+            (
+                Column::Dict {
+                    values: va_vals,
+                    codes: ca,
+                    valid: va,
+                },
+                Column::Dict {
+                    values: vb_vals,
+                    codes: cb,
+                    valid: vb,
+                },
+            ) => {
+                if va_vals == &vb_vals {
+                    va.extend(&vb);
+                    ca.extend(cb);
+                } else {
+                    let mut remap = Vec::with_capacity(vb_vals.len());
+                    for s in vb_vals {
+                        if let Some(pos) = va_vals.iter().position(|x| x == &s) {
+                            remap.push(pos as u32);
+                        } else {
+                            let pos = va_vals.len() as u32;
+                            va_vals.push(s);
+                            remap.push(pos);
+                        }
+                    }
+                    ca.reserve(cb.len());
+                    for (i, code) in cb.into_iter().enumerate() {
+                        if vb.is_valid(i) {
+                            ca.push(remap[code as usize]);
+                            va.push(true);
+                        } else {
+                            ca.push(0);
+                            va.push(false);
+                        }
+                    }
+                }
+            }
             (_, Column::Nulls { n, .. }) => {
                 self.reserve(n);
                 for _ in 0..n {
@@ -627,6 +1044,21 @@ impl Column {
             }
             Column::Float { vals, valid } => vals.capacity() * 8 + valid.words.capacity() * 8,
             Column::Bool { vals, valid } => vals.capacity() + valid.words.capacity() * 8,
+            Column::Text {
+                offsets,
+                data,
+                valid,
+            } => offsets.capacity() * 4 + data.capacity() + valid.words.capacity() * 8,
+            Column::Dict {
+                values,
+                codes,
+                valid,
+            } => {
+                codes.capacity() * 4
+                    + valid.words.capacity() * 8
+                    + values.capacity() * std::mem::size_of::<Arc<str>>()
+                    + values.iter().map(|s| s.len()).sum::<usize>()
+            }
             Column::Cells(c) => {
                 let mut total = c.capacity() * std::mem::size_of::<Cell>();
                 for cell in c {
@@ -1426,6 +1858,36 @@ fn write_wire_column(out: &mut Vec<u8>, col: &Column) {
                 write_wire_cell(out, c);
             }
         }
+        Column::Text {
+            offsets,
+            data,
+            valid,
+        } => {
+            out.push(6);
+            write_validity(out, valid);
+            for &off in offsets {
+                out.extend_from_slice(&off.to_le_bytes());
+            }
+            out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            out.extend_from_slice(data);
+        }
+        Column::Dict {
+            values,
+            codes,
+            valid,
+        } => {
+            out.push(7);
+            write_validity(out, valid);
+            out.extend_from_slice(&(values.len() as u32).to_le_bytes());
+            for s in values {
+                let b = s.as_bytes();
+                out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+                out.extend_from_slice(b);
+            }
+            for &c in codes {
+                out.extend_from_slice(&c.to_le_bytes());
+            }
+        }
     }
 }
 
@@ -1492,6 +1954,69 @@ fn read_wire_column(cur: &mut &[u8], row_count: usize) -> Result<Column, Error> 
                 cells.push(read_wire_cell(cur)?);
             }
             Ok(Column::Cells(cells))
+        }
+        6 => {
+            let valid = read_validity(cur, row_count)?;
+            let off_count = row_count
+                .checked_add(1)
+                .ok_or_else(|| Error::runtime("batch: text offset count overflow"))?;
+            let off_bytes = off_count
+                .checked_mul(4)
+                .ok_or_else(|| Error::runtime("batch: text offsets byte overflow"))?;
+            let raw_offs = read_slice(cur, off_bytes)?;
+            let mut offsets = Vec::with_capacity(off_count);
+            for chunk in raw_offs.chunks_exact(4) {
+                offsets.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+            }
+            let data_len = read_u32_le(cur)? as usize;
+            let raw_data = read_slice(cur, data_len)?;
+            if offsets.first() != Some(&0) || offsets.last().copied().unwrap_or(0) as usize != data_len {
+                return Err(Error::runtime("batch: invalid text offsets bounds"));
+            }
+            for w in offsets.windows(2) {
+                if w[0] > w[1]
+                    || std::str::from_utf8(&raw_data[w[0] as usize..w[1] as usize]).is_err()
+                {
+                    return Err(Error::runtime("batch: invalid utf8 or monotonic text offset"));
+                }
+            }
+            Ok(Column::Text {
+                offsets,
+                data: raw_data.to_vec(),
+                valid,
+            })
+        }
+        7 => {
+            let valid = read_validity(cur, row_count)?;
+            let dict_len = read_u32_le(cur)? as usize;
+            if dict_len.saturating_mul(4) > cur.len() {
+                return Err(Error::runtime("batch: truncated dict entries"));
+            }
+            let mut values = Vec::with_capacity(dict_len);
+            for _ in 0..dict_len {
+                let slen = read_u32_le(cur)? as usize;
+                let sbytes = read_slice(cur, slen)?;
+                let s = std::str::from_utf8(sbytes)
+                    .map_err(|e| Error::runtime(format!("batch: invalid utf8 dict entry: {e}")))?;
+                values.push(Arc::from(s));
+            }
+            let code_bytes = row_count
+                .checked_mul(4)
+                .ok_or_else(|| Error::runtime("batch: dict codes byte overflow"))?;
+            let raw_codes = read_slice(cur, code_bytes)?;
+            let mut codes = Vec::with_capacity(row_count);
+            for (i, chunk) in raw_codes.chunks_exact(4).enumerate() {
+                let c = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                if valid.is_valid(i) && (c as usize) >= dict_len {
+                    return Err(Error::runtime("batch: dict code out of bounds"));
+                }
+                codes.push(c);
+            }
+            Ok(Column::Dict {
+                values,
+                codes,
+                valid,
+            })
         }
         other => Err(Error::runtime(format!("batch: unknown column tag {other}"))),
     }

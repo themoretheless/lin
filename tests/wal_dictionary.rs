@@ -180,4 +180,123 @@ fn dictionary_codec_is_written_only_when_enabled_and_read_everywhere() {
     db.close().unwrap();
     drop(db);
     assert_same(&answers(&mut Db::open(&dir).unwrap()), &want, "original after clean close");
+
+    // Per-instance OpenOpts::with_wal_dictionary(true) isolation + mid-frame crash truncation
+    // fault injection + unknown future codec rejection + rollback compaction.
+    assert!(
+        !lin::persist::wal_dictionary_writer(),
+        "process-wide dictionary flag must still be false"
+    );
+    let inst_on_dir = tmp();
+    let inst_off_dir = tmp();
+    let mut db_on = Db::open_with(
+        &inst_on_dir,
+        lin::OpenOpts::default().with_wal_dictionary(true),
+    )
+    .unwrap();
+    let mut db_off = Db::open_with(&inst_off_dir, lin::OpenOpts::default()).unwrap();
+    assert!(db_on.wal_dictionary_enabled());
+    assert!(!db_off.wal_dictionary_enabled());
+    assert!(
+        !lin::persist::wal_dictionary_writer(),
+        "per-instance OpenOpts must not flip global flag"
+    );
+
+    // Commit 1 (baseline doc that must survive a crash during Commit 2):
+    let base_stmt =
+        r#"insert docs { uri: "raw://base/0", title: "Committed before crash", layer: "raw" }"#;
+    db_on.run(base_stmt).unwrap();
+    db_off.run(base_stmt).unwrap();
+    let base_log_len = fs::metadata(inst_on_dir.join(lin::persist::LOG_NAME))
+        .unwrap()
+        .len() as usize;
+
+    // Commit 2 (300-row vector insert encoded with codec 5 on `db_on`, default codec on `db_off`):
+    let batch_stmt = &statements()[0];
+    db_on.run(batch_stmt).unwrap();
+    db_off.run(batch_stmt).unwrap();
+    assert!(
+        log_codecs(&inst_on_dir).contains(&5),
+        "OpenOpts::with_wal_dictionary(true) must write codec 5"
+    );
+    assert!(
+        !log_codecs(&inst_off_dir).contains(&5),
+        "sibling Db with default OpenOpts must NOT write codec 5"
+    );
+
+    // Fault-injection: simulate process crash mid-write at representative byte offsets across
+    // the entire codec-5 frame (envelope header, codec byte, column headers, dictionary table,
+    // ordinal payload, and trailing 4-byte CRC).
+    let full_wal = fs::read(inst_on_dir.join(lin::persist::LOG_NAME)).unwrap();
+    assert!(full_wal.len() > base_log_len + 64);
+    let second_frame_len = full_wal.len() - base_log_len;
+    let mut cut_points = Vec::new();
+    for delta in 1..=24 {
+        cut_points.push(base_log_len + delta);
+    }
+    for step in 0..16 {
+        let pos = base_log_len + ((second_frame_len * (step + 1)) / 17).max(1);
+        if pos < full_wal.len() {
+            cut_points.push(pos);
+        }
+    }
+    for tail in 1..=8 {
+        cut_points.push(full_wal.len() - tail);
+    }
+    cut_points.sort_unstable();
+    cut_points.dedup();
+
+    for cut in cut_points {
+        let crashed = crash_image(&inst_on_dir);
+        fs::write(crashed.join(lin::persist::LOG_NAME), &full_wal[..cut]).unwrap();
+        let mut rec = Db::open(&crashed).unwrap_or_else(|e| {
+            panic!("mid-frame codec-5 crash at byte {cut}/{} failed to recover: {e}", full_wal.len())
+        });
+        assert_eq!(
+            rec.run("docs | count").unwrap().scalar().unwrap(),
+            lin::Cell::Int(1),
+            "cut {cut}: only pre-crash commit may be visible"
+        );
+        // Appending after recovery must succeed cleanly over the truncated tail.
+        rec.run(r#"insert docs { uri: "raw://after/0", title: "Post crash", layer: "wiki" }"#)
+            .unwrap();
+        assert_eq!(
+            rec.run("docs | count").unwrap().scalar().unwrap(),
+            lin::Cell::Int(2)
+        );
+        rec.close().unwrap();
+        let _ = fs::remove_dir_all(&crashed);
+    }
+
+    // Unknown future codec byte (e.g. codec 9 with valid LIN\x06 envelope & CRC32C) must fail closed.
+    {
+        let future_dir = crash_image(&inst_off_dir);
+        let mut bad_wal = fs::read(future_dir.join(lin::persist::LOG_NAME)).unwrap();
+        let payload = [9u8, 2, 99, 0, 0, 0, 0, 0, 0, 0]; // codec = 9
+        let crc = lin::crc::hardware_crc32c(&payload).to_le_bytes();
+        let env_len = (payload.len() + 4) as u32;
+        bad_wal.extend_from_slice(b"LIN\x06");
+        bad_wal.extend_from_slice(&env_len.to_le_bytes());
+        bad_wal.extend_from_slice(&payload);
+        bad_wal.extend_from_slice(&crc);
+        fs::write(future_dir.join(lin::persist::LOG_NAME), &bad_wal).unwrap();
+        assert!(
+            Db::open(&future_dir).is_err(),
+            "unknown future WAL codec must fail closed instead of silently skipping"
+        );
+        let _ = fs::remove_dir_all(&future_dir);
+    }
+
+    // Rollback migration (`set_wal_dictionary(Some(false))` + checkpoint compacts codec-5 frames).
+    db_on.set_wal_dictionary(Some(false));
+    db_on.checkpoint().unwrap();
+    db_on
+        .run(r#"insert docs { uri: "raw://post-rb", title: "Rolled back writer", layer: "raw" }"#)
+        .unwrap();
+    assert!(
+        !log_codecs(&inst_on_dir).contains(&5),
+        "after disabling dictionary writer and checkpointing, log must contain zero codec-5 frames"
+    );
+    db_on.close().unwrap();
+    db_off.close().unwrap();
 }

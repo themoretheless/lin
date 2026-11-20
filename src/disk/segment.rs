@@ -828,7 +828,10 @@ impl<'a> ColSrc<'a> {
 
     #[inline]
     pub(super) fn text(&self, i: usize) -> Option<&'a str> {
-        self.cell_ref(i).and_then(Cell::text)
+        match self {
+            ColSrc::Col(c) => c.text_at(i),
+            _ => self.cell_ref(i).and_then(Cell::text),
+        }
     }
 
     #[inline]

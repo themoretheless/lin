@@ -16,13 +16,15 @@ mod join;
 mod mirror;
 mod prepared;
 mod search;
+mod shared;
 mod tx;
 
 #[cfg(test)]
 mod tests;
 
-pub use crate::persist::{OpenMemOpts as OpenOpts, SyncMode};
+pub use crate::persist::{OpenConfig, OpenMemOpts as OpenOpts, SyncMode};
 pub use prepared::Prepared;
+pub use shared::{SharedDb, SharedTransaction};
 pub use tx::Transaction;
 
 pub(crate) use agg::*;
@@ -221,6 +223,8 @@ pub struct Db {
     >,
     /// Fields per collection declared with [`Db::declare_columns`].
     pub(crate) declared_cols: FxHashMap<String, Vec<String>>,
+    /// When enabled, catalog-declared collections lazily mirror all non-vector fields on read.
+    pub(crate) catalog_soa: bool,
     /// Lazily built mirrors of the declared fields, keyed by collection.
     pub(crate) col_mirrors: std::sync::RwLock<FxHashMap<String, Arc<mirror::ColMirror>>>,
     #[cfg(feature = "gpu")]
@@ -454,6 +458,7 @@ impl Db {
             reader_cache: None,
             reader_plan_cache: None,
             declared_cols: Default::default(),
+            catalog_soa: false,
             col_mirrors: Default::default(),
             #[cfg(feature = "gpu")]
             gpu: None,
@@ -587,12 +592,37 @@ impl Db {
         self
     }
 
+    /// Override WAL dictionary vector codec (codec 5) writing for this [`Db`] instance
+    /// without changing the process-wide [`crate::persist::set_wal_dictionary_writer`] flag.
+    pub fn with_wal_dictionary(mut self, enabled: bool) -> Self {
+        self.set_wal_dictionary(Some(enabled));
+        self
+    }
+
+    /// Set (`Some(true/false)`) or clear (`None`, inheriting process global) this instance's
+    /// WAL dictionary codec 5 writer policy.
+    pub fn set_wal_dictionary(&mut self, enabled: Option<bool>) {
+        if let Some(p) = self.persist.as_mut() {
+            p.wal_dictionary = enabled;
+        }
+    }
+
+    /// Whether WAL dictionary codec 5 writing is currently active for this [`Db`] instance.
+    pub fn wal_dictionary_enabled(&self) -> bool {
+        self.persist
+            .as_ref()
+            .and_then(|p| p.wal_dictionary)
+            .unwrap_or_else(crate::persist::wal_dictionary_writer)
+    }
+
     /// Open durable store. Default: [`SyncMode::Full`], `cold: false`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
         Self::open_with(path, OpenOpts::default())
     }
 
-    pub fn open_with(path: impl AsRef<Path>, opts: OpenOpts) -> Result<Self, Error> {
+    pub fn open_with(path: impl AsRef<Path>, opts: impl Into<OpenConfig>) -> Result<Self, Error> {
+        let cfg = opts.into();
+        let opts = cfg.opts;
         let t0 = Instant::now();
         let catalog = crate::catalog::fixture();
         let dir = path.as_ref();
@@ -623,6 +653,7 @@ impl Db {
                 reader_cache: None,
                 reader_plan_cache: None,
                 declared_cols: Default::default(),
+                catalog_soa: false,
                 col_mirrors: Default::default(),
                 #[cfg(feature = "gpu")]
                 gpu: None,
@@ -632,7 +663,7 @@ impl Db {
             db.reopen.total_ms = t0.elapsed().as_secs_f64() * 1000.0;
             return Ok(db);
         }
-        let (store, persist, store_phases) = Store::open_with_profiled(dir, &catalog, opts)?;
+        let (store, persist, store_phases) = Store::open_with_profiled(dir, &catalog, cfg)?;
         let mut catalog = catalog;
         store.merge_extras_into(&mut catalog);
         let embedder = Self::default_embedder(&catalog);
@@ -657,6 +688,7 @@ impl Db {
             reader_cache: None,
             reader_plan_cache: None,
             declared_cols: Default::default(),
+            catalog_soa: false,
             col_mirrors: Default::default(),
             #[cfg(feature = "gpu")]
             gpu: None,
@@ -672,7 +704,10 @@ impl Db {
         Self::open_follower_with(path, OpenOpts::default())
     }
 
-    pub fn open_follower_with(path: impl AsRef<Path>, opts: OpenOpts) -> Result<Self, Error> {
+    pub fn open_follower_with(
+        path: impl AsRef<Path>,
+        opts: impl Into<OpenConfig>,
+    ) -> Result<Self, Error> {
         let mut db = Self::open_with(path, opts)?;
         db.follower = true;
         Ok(db)
@@ -729,6 +764,7 @@ impl Db {
             reader_cache: None,
             reader_plan_cache: None,
             declared_cols: Default::default(),
+            catalog_soa: false,
             col_mirrors: Default::default(),
             #[cfg(feature = "gpu")]
             gpu: None,
@@ -842,6 +878,7 @@ impl Db {
                 reader_cache: None,
                 reader_plan_cache: None,
                 declared_cols: self.declared_cols.clone(),
+                catalog_soa: self.catalog_soa,
                 col_mirrors: std::sync::RwLock::new(mirrors),
                 #[cfg(feature = "gpu")]
                 gpu: self.gpu.clone(),
@@ -4071,6 +4108,10 @@ impl Db {
                     has_null |= valid.null_count() > 0;
                     kinds.push(Value::Timestamp(0));
                 }
+                Column::Text { valid, .. } | Column::Dict { valid, .. } => {
+                    has_null |= valid.null_count() > 0;
+                    kinds.push(Value::String(Arc::from("")));
+                }
                 Column::Cells(cells) => {
                     let mut seen = [false; 5];
                     for cell in cells {
@@ -4331,8 +4372,36 @@ impl Db {
         Ok(())
     }
 
-    fn get_or_build_mirror(&self, name: &str) -> Option<Arc<mirror::ColMirror>> {
-        let fields = self.declared_cols.get(name)?;
+    /// Enable or disable dynamic `Catalog`-driven columnar SoA mirroring across all typed
+    /// collections in memory (`ColMirror` + `Column::Dict`).
+    pub fn enable_catalog_columns(&mut self, enabled: bool) {
+        self.catalog_soa = enabled;
+        self.reader_cache = None;
+        if !enabled
+            && let Ok(mut cache) = self.col_mirrors.write()
+        {
+            cache.retain(|k, _| self.declared_cols.contains_key(k));
+        }
+    }
+
+    pub(crate) fn get_or_build_mirror(&self, name: &str) -> Option<Arc<mirror::ColMirror>> {
+        let cat_fields: Option<Vec<String>> = if !self.declared_cols.contains_key(name) && self.catalog_soa {
+            let col_def = self.catalog.collection(name)?;
+            let fs: Vec<String> = col_def
+                .fields
+                .iter()
+                .filter(|(_, fi)| fi.ty != crate::catalog::Type::Vec)
+                .map(|(fname, _)| fname.clone())
+                .collect();
+            (!fs.is_empty()).then_some(fs)
+        } else {
+            None
+        };
+        let fields: &[String] = match (self.declared_cols.get(name), &cat_fields) {
+            (Some(f), _) => f.as_slice(),
+            (None, Some(cf)) => cf.as_slice(),
+            (None, None) => return None,
+        };
         if self.store.is_disk_backed(name)
             || (name == "facts" && self.store.facts_rows_stale)
             || (name == "docs" && self.store.has_deferred_doc_ops())
@@ -4404,6 +4473,31 @@ impl Db {
         let res = f(&mut tx)?;
         tx.commit()?;
         Ok(res)
+    }
+
+    /// Execute multiple independent interactive transactions sequentially while coalescing
+    /// their durable WAL flushes into a single `SyncMode::Full` sync barrier.
+    pub fn transactions_group_sync<T, I, F>(&mut self, txs: I) -> Vec<Result<T, Error>>
+    where
+        I: IntoIterator<Item = F>,
+        F: FnOnce(&mut Transaction<'_>) -> Result<T, Error>,
+    {
+        let list: Vec<F> = txs.into_iter().collect();
+        let n = list.len();
+        let mut out: Vec<Result<T, Error>> = Vec::with_capacity(n);
+        let synced = self.with_group_sync(n, |db| {
+            for f in list {
+                out.push(db.transaction_fn(f));
+            }
+        });
+        if let Err(err) = synced {
+            for r in &mut out {
+                if r.is_ok() {
+                    *r = Err(err.clone());
+                }
+            }
+        }
+        out
     }
 
     pub fn explain_as(&mut self, src: &str, graph: Option<GraphFmt>) -> Result<String, Error> {

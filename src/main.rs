@@ -511,7 +511,9 @@ fn cmd_wal_serve(args: &[String], data: Option<PathBuf>) -> ExitCode {
         .filter(|s| !s.is_empty());
     let mut cert: Option<PathBuf> = None;
     let mut key: Option<PathBuf> = None;
-    let mut sinks = 1usize;
+    let mut sinks = 16usize;
+    let mut max_lag_gens: Option<u64> = None;
+    let mut lock_writer = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -582,6 +584,23 @@ fn cmd_wal_serve(args: &[String], data: Option<PathBuf>) -> ExitCode {
                     }
                 }
             }
+            "--max-lag" => {
+                i += 1;
+                match args.get(i).and_then(|a| a.parse::<u64>().ok()) {
+                    Some(n) => {
+                        max_lag_gens = (n > 0).then_some(n);
+                        i += 1;
+                    }
+                    None => {
+                        eprintln!("--max-lag requires a non-negative generation count");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            "--lock-writer" => {
+                lock_writer = true;
+                i += 1;
+            }
             other => {
                 eprintln!("unknown wal-serve arg {other}");
                 return ExitCode::from(2);
@@ -621,27 +640,45 @@ fn cmd_wal_serve(args: &[String], data: Option<PathBuf>) -> ExitCode {
         .map(|a| a.to_string())
         .unwrap_or(listen);
     eprintln!(
-        "wal-serve {} on {addr} tls={} token={} sinks={sinks} (writer lock held)",
+        "wal-serve {} on {addr} tls={} token={} sinks={sinks} max_lag={:?} mode={}",
         dir.display(),
         tls.is_some(),
-        token.is_some()
+        token.is_some(),
+        max_lag_gens,
+        if lock_writer { "writer-locked" } else { "live-reader" }
     );
     let opts = lin::ship::ServeOpts { token, tls };
-    match Db::open(&dir) {
-        Ok(db) => match if sinks > 1 {
-            lin::ship::serve_blocking_fanout(&db, listener, &opts, sinks)
-        } else {
-            lin::ship::serve_blocking_opts(&db, listener, &opts)
-        } {
+    if lock_writer {
+        match Db::open(&dir) {
+            Ok(db) => match if sinks > 1 {
+                lin::ship::serve_blocking_fanout(&db, listener, &opts, sinks)
+            } else {
+                lin::ship::serve_blocking_opts(&db, listener, &opts)
+            } {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("{e}");
+                    ExitCode::from(1)
+                }
+            },
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::from(1)
+            }
+        }
+    } else {
+        let live = lin::ship::LiveServeOpts {
+            serve: opts,
+            max_sinks: sinks,
+            max_lag_gens,
+            hub: None,
+        };
+        match lin::ship::serve_dir_live(&dir, listener, &live) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("{e}");
                 ExitCode::from(1)
             }
-        },
-        Err(e) => {
-            eprintln!("{e}");
-            ExitCode::from(1)
         }
     }
 }
@@ -733,6 +770,8 @@ fn cmd_follower(args: &[String], data: Option<PathBuf>) -> ExitCode {
                 .filter(|s| !s.is_empty());
             let mut tls_ca: Option<PathBuf> = None;
             let mut tls_insecure = false;
+            let mut wait_ms: Option<u32> = None;
+            let mut follower_id: Option<String> = None;
             let mut i = 1;
             while i < args.len() {
                 match args[i].as_str() {
@@ -789,6 +828,32 @@ fn cmd_follower(args: &[String], data: Option<PathBuf>) -> ExitCode {
                         tls_insecure = true;
                         i += 1;
                     }
+                    "--wait-ms" => {
+                        i += 1;
+                        match args.get(i).and_then(|a| a.parse::<u32>().ok()) {
+                            Some(ms) => {
+                                wait_ms = Some(ms.min(30_000));
+                                i += 1;
+                            }
+                            None => {
+                                eprintln!("--wait-ms requires milliseconds (0..=30000)");
+                                return ExitCode::from(2);
+                            }
+                        }
+                    }
+                    "--follower-id" => {
+                        i += 1;
+                        match args.get(i) {
+                            Some(id) => {
+                                follower_id = Some(id.clone());
+                                i += 1;
+                            }
+                            None => {
+                                eprintln!("--follower-id requires a value");
+                                return ExitCode::from(2);
+                            }
+                        }
+                    }
                     other => {
                         eprintln!("unknown follower sync arg {other}");
                         return ExitCode::from(2);
@@ -820,11 +885,18 @@ fn cmd_follower(args: &[String], data: Option<PathBuf>) -> ExitCode {
                 server_name: lin::ship::tls_server_name(&addr),
             };
             loop {
-                match sync_once(&dir, &addr, &pull) {
+                match sync_once(
+                    &dir,
+                    &addr,
+                    &pull,
+                    wait_ms,
+                    follower_id.as_deref(),
+                ) {
                     Ok(()) => {}
                     Err(code) => return code,
                 }
                 match loop_secs {
+                    Some(0) if wait_ms.unwrap_or(0) > 0 => {}
                     Some(secs) => thread::sleep(Duration::from_secs(secs.max(1))),
                     None => return ExitCode::SUCCESS,
                 }
@@ -835,23 +907,45 @@ fn cmd_follower(args: &[String], data: Option<PathBuf>) -> ExitCode {
                 "usage:\n  \
                  lin --data <dir> follower status\n  \
                  lin --data <dir> follower bootstrap --backup <file>\n  \
-                 lin --data <dir> follower sync --from HOST:PORT [--loop SECS] [--token TOKEN] [--tls-ca PEM | --tls-insecure]"
+                 lin --data <dir> follower sync --from HOST:PORT [--loop SECS] [--wait-ms MS] [--follower-id ID] [--token TOKEN] [--tls-ca PEM | --tls-insecure]"
             );
             ExitCode::from(2)
         }
     }
 }
 
-fn sync_once(dir: &PathBuf, addr: &str, pull: &lin::ship::PullOpts) -> Result<(), ExitCode> {
+fn sync_once(
+    dir: &PathBuf,
+    addr: &str,
+    pull: &lin::ship::PullOpts,
+    wait_ms: Option<u32>,
+    follower_id: Option<&str>,
+) -> Result<(), ExitCode> {
     let mut db = Db::open_follower(dir).map_err(|e| {
         eprintln!("{e}");
         ExitCode::from(1)
     })?;
     let since = db.r#gen();
-    let frames = lin::ship::pull_with(addr, since, pull).map_err(|e| {
-        eprintln!("{e}");
-        ExitCode::from(1)
-    })?;
+    let frames = if wait_ms.is_some() || follower_id.is_some() {
+        let res = lin::ship::pull_wait(addr, since, wait_ms.unwrap_or(0), follower_id, pull)
+            .map_err(|e| {
+                eprintln!("{e}");
+                ExitCode::from(1)
+            })?;
+        if res.status == lin::ship::ShipPullStatus::LagExceeded {
+            eprintln!(
+                "wal ship: follower lag exceeded (since={since}, primary={}); hint: re-bootstrap from a fresh primary backup",
+                res.primary_gen
+            );
+            return Err(ExitCode::from(1));
+        }
+        res.frames
+    } else {
+        lin::ship::pull_with(addr, since, pull).map_err(|e| {
+            eprintln!("{e}");
+            ExitCode::from(1)
+        })?
+    };
     let n = db.apply_wal(&frames).map_err(|e| {
         eprintln!("{e}");
         if e.to_string().contains("gap") {

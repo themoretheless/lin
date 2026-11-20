@@ -2405,6 +2405,7 @@ mod persistent_encoder_queue_tests {
                             collection: "docs".into(),
                             rows: rows.clone(),
                             uniform_keys: false,
+                            wal_dictionary: None,
                             bytes: Vec::new(),
                             mode: 0,
                             reply

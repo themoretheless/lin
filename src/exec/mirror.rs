@@ -95,6 +95,121 @@ impl ColMirror {
         Some(bits.iter().map(|w| w.count_ones() as usize).sum())
     }
 
+    /// Projects `names` directly from mirrored dictionary columns into a dense [`crate::batch::RecordBatch`]
+    /// (emitting `Column::Dict` for text columns and typed `Int`/`Float`/`Bool`/`Time` columns
+    /// for homogeneous scalars) without touching `Vec<Row>`.
+    pub(crate) fn project_batch(
+        &self,
+        names: &[String],
+        idxs: Option<&[usize]>,
+    ) -> Option<crate::batch::RecordBatch> {
+        use crate::batch::{Column, RecordBatch, Validity};
+        let mirrors: Vec<&FieldMirror> = names
+            .iter()
+            .map(|nm| self.fields.get(nm.as_str()).map(Arc::as_ref))
+            .collect::<Option<_>>()?;
+        let out_n = idxs.map_or(self.len, |ix| ix.len());
+        let mut cols = Vec::with_capacity(mirrors.len());
+        for fm in mirrors {
+            let all_null = fm.dict.iter().all(|c| matches!(c, Cell::Null));
+            if all_null {
+                cols.push(Column::Nulls { n: out_n, cap: out_n });
+                continue;
+            }
+            let all_text = fm
+                .dict
+                .iter()
+                .all(|c| matches!(c, Cell::Null | Cell::Text(_) | Cell::SmallText(_)));
+            if all_text {
+                let mut values: Vec<Arc<str>> = Vec::with_capacity(fm.dict.len());
+                let mut code_remap: Vec<Option<u32>> = Vec::with_capacity(fm.dict.len());
+                for c in &fm.dict {
+                    match c {
+                        Cell::Null => code_remap.push(None),
+                        other => {
+                            let idx = values.len() as u32;
+                            values.push(
+                                other
+                                    .text_shared()
+                                    .unwrap_or_else(|| Arc::from(other.text().unwrap_or(""))),
+                            );
+                            code_remap.push(Some(idx));
+                        }
+                    }
+                }
+                let has_null_entry = code_remap.iter().any(Option::is_none);
+                if !has_null_entry {
+                    let codes: Vec<u32> = match idxs {
+                        None => fm
+                            .codes
+                            .iter()
+                            .map(|&c| code_remap[c as usize].unwrap_or(0))
+                            .collect(),
+                        Some(ix) => ix
+                            .iter()
+                            .map(|&r| code_remap[fm.codes[r] as usize].unwrap_or(0))
+                            .collect(),
+                    };
+                    cols.push(Column::Dict {
+                        values,
+                        codes,
+                        valid: Validity::all_valid(out_n),
+                    });
+                } else {
+                    let mut out_col = Column::Dict {
+                        values,
+                        codes: Vec::with_capacity(out_n),
+                        valid: Validity::default(),
+                    };
+                    if let Column::Dict { codes, valid, .. } = &mut out_col {
+                        let mut push_code = |raw_code: u32| match code_remap[raw_code as usize] {
+                            Some(mapped) => {
+                                codes.push(mapped);
+                                valid.push(true);
+                            }
+                            None => {
+                                codes.push(0);
+                                valid.push(false);
+                            }
+                        };
+                        match idxs {
+                            None => {
+                                for &c in &fm.codes {
+                                    push_code(c);
+                                }
+                            }
+                            Some(ix) => {
+                                for &r in ix {
+                                    push_code(fm.codes[r]);
+                                }
+                            }
+                        }
+                    }
+                    cols.push(out_col);
+                }
+            } else {
+                let mut col = Column::with_capacity(out_n);
+                match idxs {
+                    None => {
+                        for &c in &fm.codes {
+                            col.push(fm.dict[c as usize].clone_for_borrow());
+                        }
+                    }
+                    Some(ix) => {
+                        for &r in ix {
+                            col.push(fm.dict[fm.codes[r] as usize].clone_for_borrow());
+                        }
+                    }
+                }
+                cols.push(col);
+            }
+        }
+        Some(RecordBatch {
+            names: names.to_vec().into(),
+            cols,
+        })
+    }
+
     fn eval(&self, pred: &Pred, now: i64) -> Option<Vec<u64>> {
         let words = self.len.div_ceil(64);
         match pred {

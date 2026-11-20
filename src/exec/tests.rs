@@ -1558,4 +1558,170 @@ mod preencoded_insert_tests {
         reopened.close().unwrap();
         follower.close().unwrap();
     }
+
+    #[test]
+    fn column_text_and_dict_batch_wire_filter_group_and_catalog_soa() {
+        use crate::batch::{Column, RecordBatch};
+
+        // 1. Direct Column::Text & Column::Dict wire roundtrip + gather.
+        let text_col = Column::from_strs([Some("alpha"), None, Some("gamma"), Some("alpha")]);
+        assert!(matches!(text_col, Column::Text { .. }));
+        let dict_col = Column::from_strs([Some("eu"), Some("us"), None, Some("eu")])
+            .encode_dict()
+            .expect("low-cardinality text encodes to Column::Dict");
+        assert!(matches!(dict_col, Column::Dict { .. }));
+        let batch = RecordBatch {
+            names: std::sync::Arc::from(["name".to_string(), "region".to_string()]),
+            cols: vec![text_col, dict_col],
+        };
+        let wire = batch.to_wire_bytes();
+        let decoded = RecordBatch::from_wire_bytes(&wire).unwrap();
+        assert!(matches!(decoded.cols[0], Column::Text { .. }));
+        assert!(matches!(decoded.cols[1], Column::Dict { .. }));
+        assert_eq!(decoded.cols[0].text_at(0), Some("alpha"));
+        assert_eq!(decoded.cols[0].text_at(1), None);
+        assert_eq!(decoded.cols[1].text_at(2), None);
+        assert_eq!(decoded.cols[1].text_at(3), Some("eu"));
+
+        // 2. Dynamic Catalog SoA (`enable_catalog_columns`) + `orders.total` Int/Float preservation.
+        let mut db = Db::fixture();
+        db.enable_catalog_columns(true);
+        db.run("col metrics { id: text, region: text, val: i64 }")
+            .unwrap();
+        db.run(
+            r#"insert metrics [
+                { id: "m1", region: "eu", val: 10 },
+                { id: "m2", region: "us", val: 25 },
+                { id: "m3", region: "eu", val: 30 }
+            ]"#,
+        )
+        .unwrap();
+        let mb = db
+            .run_batch("metrics | val >= 10 | pick { id, region, val } | take all")
+            .unwrap();
+        assert_eq!(mb.n(), 3);
+        assert!(
+            matches!(mb.cols[1], Column::Dict { .. }),
+            "catalog SoA mirror should project text columns as Column::Dict"
+        );
+        let grp = db
+            .run("metrics | sum val by region | sort region | take all")
+            .unwrap()
+            .into_rows();
+        assert_eq!(grp.len(), 2);
+        assert_eq!(grp[0].get("val"), Some(&Cell::Float(40.0)));
+        assert_eq!(grp[1].get("val"), Some(&Cell::Float(25.0)));
+
+        // Mixed Int & Float in orders.total reconstructed from orders_total_tag without row hydration.
+        db.run(r#"insert users { id: "u1-ord", email: "u1-ord@example.com" }"#)
+            .unwrap();
+        db.run(
+            r#"insert orders [
+                { id: "oi1", user_id: "u1-ord", total: 100 },
+                { id: "of1", user_id: "u1-ord", total: 42.5 }
+            ]"#,
+        )
+        .unwrap();
+        let ob = db
+            .run("orders | id == \"oi1\" or id == \"of1\" | sort id | pick { id, total }")
+            .unwrap()
+            .into_rows();
+        assert_eq!(ob[0].get("total"), Some(&Cell::Float(42.5)));
+        assert_eq!(ob[1].get("total"), Some(&Cell::Int(100)));
+    }
+
+    #[test]
+    fn shared_db_interactive_transactions_coalesce_group_commit_syncs() {
+        use crate::SharedDb;
+        use std::sync::{Arc, Barrier};
+
+        let dir = Temp(std::env::temp_dir().join(format!(
+            "lin-shared-tx-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        )));
+        let _ = std::fs::create_dir_all(&dir.0);
+        let shared = SharedDb::open(&dir.0).unwrap();
+        shared
+            .execute("col ledger { id: text, owner: text, amount: i64 }")
+            .unwrap();
+
+        let workers = 12usize;
+        let barrier = Arc::new(Barrier::new(workers + 1));
+        std::thread::scope(|s| {
+            for t in 0..workers {
+                let sh = shared.clone();
+                let bar = Arc::clone(&barrier);
+                s.spawn(move || {
+                    bar.wait();
+                    let mut tx = sh.transaction().unwrap();
+                    tx.execute(&format!(
+                        r#"insert ledger {{ id: "tx-{t:02}", owner: "u{t}", amount: {} }}"#,
+                        (t as i64 + 1) * 10
+                    ))
+                    .unwrap();
+                    // Read-your-own-writes inside the interactive transaction:
+                    let cnt = tx
+                        .scalar(&format!(r#"ledger | id == "tx-{t:02}" | count"#))
+                        .unwrap();
+                    assert_eq!(cnt, Cell::Int(1));
+                    tx.commit().unwrap();
+                });
+            }
+            // One explicit rollback participant:
+            let sh = shared.clone();
+            let bar = Arc::clone(&barrier);
+            s.spawn(move || {
+                bar.wait();
+                let mut tx = sh.transaction().unwrap();
+                tx.execute(r#"insert ledger { id: "tx-aborted", owner: "bad", amount: 999 }"#)
+                    .unwrap();
+                tx.rollback().unwrap();
+            });
+        });
+
+        let syncs = shared.group_sync_count();
+        assert!(
+            (1..=workers as u64).contains(&syncs),
+            "expected positive group sync count <= {workers}, got {syncs}"
+        );
+        assert_eq!(
+            shared.run_read("ledger | count").unwrap().scalar().unwrap(),
+            Cell::Int(workers as i64)
+        );
+        assert_eq!(
+            shared
+                .run_read(r#"ledger | id == "tx-aborted" | count"#)
+                .unwrap()
+                .scalar()
+                .unwrap(),
+            Cell::Int(0)
+        );
+
+        // Simulate abrupt power loss (copy files without calling close/checkpoint) and verify durability!
+        let crash_dir = Temp(std::env::temp_dir().join(format!(
+            "lin-shared-tx-crash-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        )));
+        let _ = std::fs::create_dir_all(&crash_dir.0);
+        for entry in std::fs::read_dir(&dir.0).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() && entry.file_name() != "LOCK" {
+                std::fs::copy(entry.path(), crash_dir.0.join(entry.file_name())).unwrap();
+            }
+        }
+        let mut recovered = Db::open(&crash_dir.0).unwrap();
+        assert_eq!(
+            recovered.run("ledger | count").unwrap().scalar().unwrap(),
+            Cell::Int(workers as i64)
+        );
+        let expected_sum: i64 = (1..=workers as i64).map(|k| k * 10).sum();
+        assert_eq!(
+            recovered.run("ledger | sum amount").unwrap().scalar().unwrap(),
+            Cell::Float(expected_sum as f64)
+        );
+        recovered.close().unwrap();
+        shared.close().unwrap();
+    }
 }

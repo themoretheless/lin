@@ -446,12 +446,17 @@ impl Db {
                         && new_edges.is_empty()
                         && crate::persist::insert_cols_lossless(inserted)
                         && let Some(persist) = self.persist.as_mut()
-                        && let Some((magic, fields)) = crate::persist::encode_insert_rows_direct(
-                            self.store.r#gen.wrapping_add(1),
-                            self.store.next_id,
-                            collection,
-                            inserted,
-                            &mut persist.encode_buf,
+                        && let Some((magic, fields)) = crate::persist::with_dictionary_writer_opt(
+                            persist.wal_dictionary,
+                            || {
+                                crate::persist::encode_insert_rows_direct(
+                                    self.store.r#gen.wrapping_add(1),
+                                    self.store.next_id,
+                                    collection,
+                                    inserted,
+                                    &mut persist.encode_buf,
+                                )
+                            },
                         )
                     {
                         let n = inserted.len() as u32;
@@ -1266,14 +1271,17 @@ impl Db {
             let maintenance = self.maintain_insert_slab(collection, start, &shared);
             let staged = match task {
                 Ok(reply) => reply.recv().unwrap_or_else(|_| {
-                    crate::persist::prepare_insert_columns_ext(
-                        generation,
-                        next_id,
-                        collection,
-                        &shared,
-                        uniform_keys,
-                        Vec::new(),
-                    )
+                    let wal_dict = self.persist.as_ref().and_then(|p| p.wal_dictionary);
+                    crate::persist::with_dictionary_writer_opt(wal_dict, || {
+                        crate::persist::prepare_insert_columns_ext(
+                            generation,
+                            next_id,
+                            collection,
+                            &shared,
+                            uniform_keys,
+                            Vec::new(),
+                        )
+                    })
                 }),
                 Err(job) => {
                     if let Err(error) = maintenance {
@@ -1289,6 +1297,7 @@ impl Db {
             let generation = self.store.r#gen.wrapping_add(1);
             let next_id = self.store.next_id;
             use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+            let wal_dict = self.persist.as_ref().and_then(|p| p.wal_dictionary);
             let mut encode_buf = self
                 .persist
                 .as_mut()
@@ -1303,6 +1312,7 @@ impl Db {
                 rows_ptr: usize,
                 rows_len: usize,
                 uniform_keys: bool,
+                wal_dict: Option<bool>,
                 state: AtomicU8,
                 done: AtomicBool,
                 panicked: AtomicBool,
@@ -1358,13 +1368,18 @@ impl Db {
                                 .ok()
                                 .and_then(|mut g| g.take())
                                 .unwrap_or_default();
-                            let res = crate::persist::encode_insert_rows_direct_ext(
-                                task.generation,
-                                task.next_id,
-                                col,
-                                rows,
-                                task.uniform_keys,
-                                &mut job_buf,
+                            let res = crate::persist::with_dictionary_writer_opt(
+                                task.wal_dict,
+                                || {
+                                    crate::persist::encode_insert_rows_direct_ext(
+                                        task.generation,
+                                        task.next_id,
+                                        col,
+                                        rows,
+                                        task.uniform_keys,
+                                        &mut job_buf,
+                                    )
+                                },
                             );
                             if let Ok(mut g) = task.res_slot.lock() {
                                 *g = Some((res, job_buf));
@@ -1387,6 +1402,7 @@ impl Db {
                     rows_ptr: built_ref.as_ptr() as usize,
                     rows_len: built_ref.len(),
                     uniform_keys,
+                    wal_dict,
                     state: AtomicU8::new(0),
                     done: AtomicBool::new(false),
                     panicked: AtomicBool::new(false),
@@ -1424,14 +1440,16 @@ impl Db {
                         .ok()
                         .and_then(|mut g| g.take())
                         .unwrap_or_default();
-                    let res = crate::persist::encode_insert_rows_direct_ext(
-                        generation,
-                        next_id,
-                        collection,
-                        built_ref,
-                        uniform_keys,
-                        &mut buf,
-                    );
+                    let res = crate::persist::with_dictionary_writer_opt(wal_dict, || {
+                        crate::persist::encode_insert_rows_direct_ext(
+                            generation,
+                            next_id,
+                            collection,
+                            built_ref,
+                            uniform_keys,
+                            &mut buf,
+                        )
+                    });
                     (res, buf)
                 } else {
                     for _ in 0..64 {
@@ -1455,14 +1473,16 @@ impl Db {
                 (maint, direct)
             } else {
                 let maint = self.maintain_insert_slab(collection, start, built_ref);
-                let res = crate::persist::encode_insert_rows_direct_ext(
-                    generation,
-                    next_id,
-                    collection,
-                    built_ref,
-                    uniform_keys,
-                    &mut encode_buf,
-                );
+                let res = crate::persist::with_dictionary_writer_opt(wal_dict, || {
+                    crate::persist::encode_insert_rows_direct_ext(
+                        generation,
+                        next_id,
+                        collection,
+                        built_ref,
+                        uniform_keys,
+                        &mut encode_buf,
+                    )
+                });
                 (maint, (res, encode_buf))
             };
             if let Some(p) = self.persist.as_mut() {
@@ -2090,20 +2110,44 @@ pub(crate) fn build_batch_insert_rows(
     let has_embedding = find_col("embedding").is_some();
 
     let col_all_text = |idx: usize| -> bool {
-        matches!(&batch.cols[idx], Column::Cells(cs) if cs.iter().all(|c| c.text().is_some()))
+        match &batch.cols[idx] {
+            Column::Text { valid, .. } | Column::Dict { valid, .. } => valid.null_count() == 0,
+            Column::Cells(cs) => cs.iter().all(|c| c.text().is_some()),
+            _ => false,
+        }
     };
     let col_all_nonempty_text = |idx: usize| -> bool {
-        matches!(
-            &batch.cols[idx],
-            Column::Cells(cs) if cs.iter().all(|c| c.text().is_some_and(|s| !s.is_empty()))
-        )
+        match &batch.cols[idx] {
+            Column::Text {
+                offsets, valid, ..
+            } => valid.null_count() == 0 && offsets.windows(2).all(|w| w[1] > w[0]),
+            Column::Dict {
+                values,
+                codes,
+                valid,
+            } => {
+                valid.null_count() == 0
+                    && (values.iter().all(|s| !s.is_empty())
+                        || codes
+                            .iter()
+                            .all(|&c| values.get(c as usize).is_some_and(|s| !s.is_empty())))
+            }
+            Column::Cells(cs) => cs.iter().all(|c| c.text().is_some_and(|s| !s.is_empty())),
+            _ => false,
+        }
     };
     if hash_idx.is_some_and(|hi| !col_all_text(hi)) && body_idx.is_some() {
         return None;
     }
     if let Some(bi) = body_idx
         && !col_all_text(bi)
-        && matches!(&batch.cols[bi], Column::Cells(cs) if cs.iter().any(|c| c.text().is_some()))
+        && match &batch.cols[bi] {
+            Column::Text { valid, .. } | Column::Dict { valid, .. } => {
+                valid.null_count() < batch.cols[bi].len()
+            }
+            Column::Cells(cs) => cs.iter().any(|c| c.text().is_some()),
+            _ => false,
+        }
     {
         return None;
     }
@@ -2152,7 +2196,9 @@ pub(crate) fn build_batch_insert_rows(
         Column::Int { valid, .. }
         | Column::Float { valid, .. }
         | Column::Bool { valid, .. }
-        | Column::Time { valid, .. } => valid.null_count() == 0,
+        | Column::Time { valid, .. }
+        | Column::Text { valid, .. }
+        | Column::Dict { valid, .. } => valid.null_count() == 0,
         Column::Cells(cs) => {
             let k0 = cell_lossless_kind(&cs[0]);
             k0 != 0 && cs[1..].iter().all(|c| cell_lossless_kind(c) == k0)
@@ -2161,10 +2207,7 @@ pub(crate) fn build_batch_insert_rows(
 
     let get_col_text = |col_opt: Option<usize>, row_i: usize| -> Option<&str> {
         let ci = col_opt?;
-        match &batch.cols[ci] {
-            Column::Cells(cs) => cs[row_i].text(),
-            _ => None,
-        }
+        batch.cols[ci].text_at(row_i)
     };
 
     let build_range = |start: usize, end: usize| -> Vec<Row> {

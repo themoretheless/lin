@@ -743,7 +743,8 @@ struct LazyJoinSoa<'a> {
     orders_id: &'a [Arc<str>],
     orders_uid: &'a [Arc<str>],
     orders_total: &'a [f64],
-    /// Rows behind the SoA buffers: `total` is read from them to keep its stored type.
+    orders_total_tag: &'a [u8],
+    /// Fallback rows behind the SoA buffers (only consulted when `orders_total_tag` == `2`).
     orders_rows: &'a [Row],
     total_slot: crate::store::row::FieldSlot<'static>,
     users_email: &'a [Arc<str>],
@@ -1979,6 +1980,7 @@ impl<'a> LazyJoinSoa<'a> {
                 &mut self.total_slot,
                 self.orders_rows,
                 self.orders_total,
+                self.orders_total_tag,
                 idx,
             );
             return Some((order_id, total, email));
@@ -2153,6 +2155,7 @@ fn try_lazy_join_soa<'a>(db: &CursorDb<'a>, q: &Query) -> Result<Option<LazyJoin
         orders_id,
         orders_uid,
         orders_total,
+        orders_total_tag: store.orders_total_tag(),
         orders_rows: store.collection("orders"),
         total_slot: crate::store::row::FieldSlot::new("total"),
         users_email,

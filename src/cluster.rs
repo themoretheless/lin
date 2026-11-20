@@ -149,6 +149,10 @@ fn shard_hash_col_row(col: &Column, row_idx: usize) -> u64 {
                 hash_bytes_tagged(6, &[])
             }
         }
+        Column::Text { .. } | Column::Dict { .. } => match col.text_at(row_idx) {
+            Some(s) => hash_bytes_tagged(5, s.as_bytes()),
+            None => hash_bytes_tagged(6, &[]),
+        },
         Column::Cells(cells) => shard_hash_cell(&cells[row_idx]),
     }
 }

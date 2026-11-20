@@ -465,6 +465,7 @@ pub(crate) struct EncodeJob {
     pub(super) collection: String,
     pub(super) rows: std::sync::Arc<Vec<Row>>,
     pub(super) uniform_keys: bool,
+    pub(super) wal_dictionary: Option<bool>,
     pub(super) bytes: Vec<u8>,
     #[allow(dead_code)]
     pub(super) mode: u8,
@@ -478,6 +479,7 @@ impl EncodeJob {
             collection,
             rows,
             uniform_keys,
+            wal_dictionary,
             bytes,
             #[cfg(test)]
             mode,
@@ -491,14 +493,16 @@ impl EncodeJob {
                 panic!("injected WAL encoder panic");
             }
             #[allow(unused_mut)]
-            let mut staged = prepare_insert_columns_ext(
-                generation,
-                next_id,
-                &collection,
-                &rows,
-                uniform_keys,
-                bytes,
-            );
+            let mut staged = with_dictionary_writer_opt(wal_dictionary, || {
+                prepare_insert_columns_ext(
+                    generation,
+                    next_id,
+                    &collection,
+                    &rows,
+                    uniform_keys,
+                    bytes,
+                )
+            });
             #[cfg(test)]
             if mode == 3 {
                 staged.encoding =
@@ -536,6 +540,7 @@ pub(crate) fn start_insert_encoding(
         collection: collection.to_owned(),
         rows,
         uniform_keys,
+        wal_dictionary: persist.wal_dictionary,
         bytes,
         mode,
         reply,
@@ -1091,10 +1096,25 @@ pub fn wal_dictionary_writer() -> bool {
 
 #[cfg(test)]
 pub(super) fn with_dictionary_writer<R>(enabled: bool, f: impl FnOnce() -> R) -> R {
-    let before = DICTIONARY_WRITER_OVERRIDE.with(|o| o.replace(Some(enabled)));
-    let out = f();
-    DICTIONARY_WRITER_OVERRIDE.with(|o| o.set(before));
-    out
+    with_dictionary_writer_opt(Some(enabled), f)
+}
+
+#[inline]
+pub(crate) fn with_dictionary_writer_opt<R>(ovr: Option<bool>, f: impl FnOnce() -> R) -> R {
+    match ovr {
+        None => f(),
+        Some(enabled) => {
+            let before = DICTIONARY_WRITER_OVERRIDE.with(|o| o.replace(Some(enabled)));
+            struct Guard(Option<bool>);
+            impl Drop for Guard {
+                fn drop(&mut self) {
+                    DICTIONARY_WRITER_OVERRIDE.with(|o| o.set(self.0));
+                }
+            }
+            let _guard = Guard(before);
+            f()
+        }
+    }
 }
 
 #[inline]

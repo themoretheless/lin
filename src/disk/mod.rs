@@ -2588,7 +2588,7 @@ impl DiskEngine {
         seen.reserve(n);
         let id_col = &batch.cols[id_pos];
         for i in 0..n {
-            let Some(id) = id_col.cell_ref(i).and_then(Cell::text) else {
+            let Some(id) = id_col.text_at(i) else {
                 return Err(Error::runtime("bulk batch: `id` must be text and present"));
             };
             if !seen.insert(id) || self.exists_by_id(table, id) {
@@ -2653,7 +2653,7 @@ impl DiskEngine {
         seen.reserve(n);
         let id_col = &batch.cols[id_pos];
         for i in 0..n {
-            let Some(id) = id_col.cell_ref(i).and_then(Cell::text) else {
+            let Some(id) = id_col.text_at(i) else {
                 return Err(Error::runtime("bulk batch: `id` must be text and present"));
             };
             if !seen.insert(id) || self.exists_by_id(table, id) {

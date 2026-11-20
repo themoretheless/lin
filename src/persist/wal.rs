@@ -335,7 +335,41 @@ pub(crate) fn reserve_wal_space(log: &File, additional: usize, empty_only: bool)
         // Unsupported filesystem / allocation failure retains the ordinary write path.
         let _ = unsafe { libc::fcntl(log.as_raw_fd(), libc::F_PREALLOCATE, &mut request) };
     }
-    #[cfg(not(target_vendor = "apple"))]
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::{fs::MetadataExt, io::AsRawFd};
+        const CHUNK: u64 = 1024 * 1024;
+        let Ok(metadata) = log.metadata() else {
+            return;
+        };
+        if empty_only && metadata.len() != 0 {
+            return;
+        }
+        let Ok(additional) = u64::try_from(additional) else {
+            return;
+        };
+        let Some(required) = metadata.len().checked_add(additional) else {
+            return;
+        };
+        let allocated = metadata.blocks().saturating_mul(512);
+        if allocated >= required {
+            return;
+        }
+        let Some(rounded) = required.checked_add(CHUNK - 1).map(|n| n / CHUNK * CHUNK) else {
+            return;
+        };
+        let target_end = rounded.min(required.saturating_add(CHUNK));
+        let Ok(len) = libc::off_t::try_from(target_end) else {
+            return;
+        };
+        if len <= 0 {
+            return;
+        }
+        // Preallocate physical extents on ext4/xfs without advancing st_size, so fdatasync
+        // avoids block-allocation metadata updates while preserving exact WAL EOF framing.
+        let _ = unsafe { libc::fallocate(log.as_raw_fd(), libc::FALLOC_FL_KEEP_SIZE, 0, len) };
+    }
+    #[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
     let _ = (log, additional, empty_only);
 }
 
@@ -995,6 +1029,69 @@ pub fn export_wal_since(dir: &Path, since_gen: u64) -> Result<Vec<u8>, Error> {
         }
     }
     Ok(out)
+}
+
+/// Inspect `(head_gen, first_wal_gen, latest_gen)` of a durable directory without taking the
+/// writer lock. Used by non-blocking WAL shipping to detect new commits, WAL compaction gaps,
+/// and replica lag bounds.
+pub fn peek_wal_bounds(dir: &Path) -> Result<(u64, Option<u64>, u64), Error> {
+    let head_gen = super::wal::read_head(dir)?.map(|h| h.r#gen).unwrap_or(0);
+    let mut log = match open_log_read(dir)? {
+        Some(f) => f,
+        None => return Ok((head_gen, None, head_gen)),
+    };
+    let file_len = log.metadata().map_err(io_err)?.len();
+    if file_len == 0 {
+        return Ok((head_gen, None, head_gen));
+    }
+    let mut first_wal_gen: Option<u64> = None;
+    let mut latest_gen = head_gen;
+    let mut pos = 0u64;
+    let mut buf = Vec::with_capacity(4096);
+    loop {
+        if pos >= file_len {
+            break;
+        }
+        let mut hdr = [0u8; 18];
+        if pos + 18 <= file_len
+            && log.seek(SeekFrom::Start(pos)).is_ok()
+            && log.read_exact(&mut hdr).is_ok()
+        {
+            let magic: [u8; 4] = hdr[0..4].try_into().unwrap();
+            let len = u32::from_le_bytes(hdr[4..8].try_into().unwrap());
+            let next = pos + 8 + u64::from(len);
+            if magic == LOG_MAGIC_CHECKSUM
+                && len >= 14
+                && len <= MAX_RECORD
+                && next <= file_len
+                && matches!(hdr[8], 2 | 3 | 5)
+                && let Some(rec_gen) = peek_column_gen(&hdr[9..18])
+            {
+                if first_wal_gen.is_none() {
+                    first_wal_gen = Some(rec_gen);
+                }
+                latest_gen = latest_gen.max(rec_gen);
+                pos = next;
+                continue;
+            }
+            let _ = log.seek(SeekFrom::Start(pos));
+        } else {
+            let _ = log.seek(SeekFrom::Start(pos));
+        }
+        match read_one(&mut log, file_len, pos, &mut buf) {
+            ReadOne::Eof | ReadOne::Truncated => break,
+            ReadOne::Corrupt => return Err(io_err("corrupt log")),
+            ReadOne::Io(e) => return Err(e),
+            ReadOne::Ok { rec, next } => {
+                if first_wal_gen.is_none() {
+                    first_wal_gen = Some(rec.r#gen);
+                }
+                latest_gen = latest_gen.max(rec.r#gen);
+                pos = next;
+            }
+        }
+    }
+    Ok((head_gen, first_wal_gen, latest_gen))
 }
 
 fn expand_segment_pack_for_export(dir: &Path, pack: &Pack) -> Result<Option<Pack>, Error> {

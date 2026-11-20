@@ -41,7 +41,7 @@ pub(crate) use codec::insert_cols_lossless;
 pub(crate) use codec::{
     PreparedEncoding, PreparedInsert, acquire_encoder, append_facts_v2_preencoded,
     append_prepared_record, encode_insert_rows_direct, encode_insert_rows_direct_ext,
-    prepare_insert_columns_ext, put_str, start_insert_encoding,
+    prepare_insert_columns_ext, put_str, start_insert_encoding, with_dictionary_writer_opt,
 };
 
 pub use snapshot::{
@@ -63,16 +63,16 @@ pub use snapshot::encode_snapshot_compressed;
 
 pub use types::{
     BACKUP_MAGIC, ColData, ColSnap, FENCE_NAME, HEAD_NAME, Head, IndexSnap, LOCK_NAME, LOG_NAME,
-    LogRecord, OpenMemOpts, Pack, Persist, RelSnap, SNAPSHOT_EVERY, SNAPSHOT_MAGIC, SNAPSHOT_NAME,
-    Snapshot, SnapshotRef, SyncMode,
+    LogRecord, OpenConfig, OpenMemOpts, Pack, Persist, RelSnap, SNAPSHOT_EVERY, SNAPSHOT_MAGIC,
+    SNAPSHOT_NAME, Snapshot, SnapshotRef, SyncMode,
 };
 
 pub use wal::{
     acquire_fence_exclusive, acquire_reader_lock, acquire_writer_lock, append_raw_frames,
     append_record, compact_log, ensure_dir, export_wal_since, export_wal_since_indexed, fence_path,
     for_each_wal_frame, for_each_wal_frame_raw, head_path, io_err, lock_path, log_len, log_path,
-    open_log, open_log_read, read_head, replay_log, snapshot_path, truncate_log, validate_data_dir,
-    write_head, write_head_soft, write_through_tmp,
+    open_log, open_log_read, peek_wal_bounds, read_head, replay_log, snapshot_path, truncate_log,
+    validate_data_dir, write_head, write_head_soft, write_through_tmp,
 };
 #[cfg(all(test, feature = "parallel"))]
 pub use wal::append_batch_records;

@@ -1,8 +1,8 @@
 # Lin — план развития
 
-Срез: **2026-11-20**, коммит `887c79040`. Единственный файл с планом в репозитории: в нём хранится только несделанное. Всё реализованное перенесено в [CHANGELOG](../CHANGELOG.md), профильные документы `docs/` и отчёты `benches/results/`.
+Срез: **2026-11-20**, коммит `5dd2b25d5`. Единственный файл с планом в репозитории: в нём хранится только несделанное. Всё реализованное перенесено в [CHANGELOG](../CHANGELOG.md), профильные документы `docs/` и отчёты `benches/results/`.
 
-Открыто **1285** пунктов общего backlog (часть II) и **7** направлений части I. Это план работ и гипотез, не список подтверждённых дефектов и не обещание ускорений без приёмочного замера.
+Открыто **1281** пунктов общего backlog (часть II) и **5** направлений части I. Это план работ и гипотез, не список подтверждённых дефектов и не обещание ускорений без приёмочного замера.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровываются (закрытые пункты удалены). Перед взятием пункта со статусом `candidate` или `qualification` сначала сверять с текущим кодом.
 
@@ -10,8 +10,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 ### 1. Текущие архитектурные ограничения OLAP
 
-- Полный in-memory SoA захардкожен под встроенные коллекции (`docs`, `orders`, `users`, `facts`); произвольные пользовательские коллекции в памяти используют построчный `Vec<Row>` (с опциональным ленивым словарным зеркалом `Db::declare_columns`).
-- Текстовые и словарные колонки `RecordBatch` хранятся как `Vec<Cell>`; плотных строковых/словарных буферов `Column::Text` / `Column::Dict` нет.
+- Полный eager in-memory SoA на этапе записи захардкожен под встроенные коллекции (`docs`, `orders`, `users`, `facts`); произвольные пользовательские коллекции в памяти используют построчный `Vec<Row>` с ленивым колоночным зеркалом (`Db::declare_columns` / `Db::enable_catalog_columns`).
 - Сложные многошаговые аналитические конвейеры вне покрытых колоночных форм откатываются на `Vec<Row>`.
 
 ### 2. Приоритет 1 — `DiskEngine` и холодный уровень
@@ -20,10 +19,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 - Провести чистый чередующийся замер `cold_*` с текстовыми (`~`, `has`, `has_ci`), словарными и regex-условиями в предикате на свободной машине для оценки вклада `SegPred::Slow`, `.tgram` и `DictZoneMap`.
 
 ### 3. Приоритет 2 — Архитектурные рычаги
-
-#### P2.2. Типизированные `Column::Text` / `Column::Dict` и динамический SoA по `Catalog`
-- Добавить `Column::Text` (смещения + единый UTF-8 буфер) и `Column::Dict` в `RecordBatch`.
-- Перевести типизированные коллекции каталога (и встроенные `docs` / `orders` / `users` / `facts` по итогам замера) на единое колоночное представление в памяти с сохранением типа `orders.total` без чтения из `Row`.
 
 #### P2.3. Инкрементальные материализованные агрегаты и интервальные индексы времени
 - Спроектировать опциональные инкрементально обновляемые представления `summarize` для повторяющихся аналитических запросов по горячим коллекциям и специализированные интервальные индексы для запросов пересечения временных диапазонов.
@@ -35,29 +30,22 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 ### 5. Приоритет 4 — Запись, Bulk Ingest и репликация
 
-#### P4.2. WAL фиксированной длины на Linux и интерактивные транзакции в группе коммита
-- Замерить заранее размеченный WAL фиксированной длины на Linux (`ext4` / `xfs`, `fdatasync` без обновления размера файла); менять формат кадра-терминатора только при подтверждённом выигрыше.
-- Подключить интерактивные `Db::transaction()` к групповому коммиту при конкурентных писателях.
+#### P4.2. Замер WAL фиксированной длины на Linux
+- Замерить заранее размеченный WAL на Linux (`ext4` / `xfs`, `fallocate(FALLOC_FL_KEEP_SIZE)` + `fdatasync` против фиксированной длины с кадром-терминатором); менять формат кадра-терминатора только при подтверждённом выигрыше.
 
-#### P4.3. Приёмка словарного WAL-кодека 5 по умолчанию
-Описание формата: [wal-dictionary.md](wal-dictionary.md). Связанные пункты: `LIN-0045`, `LIN-0046`, `LIN-0065`, `LIN-0080`.
-- Провести две независимые серии по шесть process-pairs (`native` / `durable`, 1k и 10k с контролем SQLite и проверками dense / repeated / high-cardinality и RSS).
-- Добавить fault-injection тест обрыва процесса посреди записи кадра кодека 5 и перенести переключатель записи в `OpenOpts`.
-
-#### P4.4. Push-досылка и учёт отставания в автономном `wal-serve`
-- Перенести неблокирующую раздачу хвоста WAL, push-уведомление и учёт отставания получателей из `LinServer` в автономный CLI-контур `ship::serve_blocking_fanout` (`lin wal-serve`), либо объединить оба контура вокруг `lin serve`.
+#### P4.3. Приёмочный замер словарного WAL-кодека 5 для включения по умолчанию
+Описание формата: [wal-dictionary.md](wal-dictionary.md).
+- Провести две независимые серии по шесть process-pairs (`native` / `durable`, 1k и 10k с контролем SQLite и проверками dense / repeated / high-cardinality и RSS) перед решением о включении по умолчанию.
 
 ### 6. Сводная матрица открытых задач части I
 
 | Пункт | Сложность | Ожидаемый эффект | Целевые проверки и бенчмарки |
 |---|---|---|---|
 | **P1.2** Изолированный замер `SegPred::Slow`, `.tgram`, `DictZoneMap` | Низкая | Подтверждённый вклад отсечения блоков на тексте и regex | `cold_range_project`, сканы по Zstd-тексту |
-| **P2.2** `Column::Text` / `Column::Dict` и динамический SoA | Высокая | Плотное колоночное исполнение произвольных схем | `join_inner`, `join_filter`, `agg_sum*`, `run_batch` |
 | **P2.3** Инкрементальные агрегаты и интервальные индексы | Высокая | Ускорение повторяющихся `summarize` и time-range запросов | аналитические и временные запросы |
 | **P3.1** `parallel` по умолчанию и битовая точность сумм | Низкая | Масштабирование по ядрам из коробки | `agg_sum_by`, `agg_count_by` при `LIN_BENCH_N >= 100000` |
-| **P4.2** Preallocated WAL на Linux и `Db::transaction()` в группе | Высокая | Снижение цены одиночного durable-коммита на Linux | `durable_insert_*`, `group_commit_16` |
-| **P4.3** Приёмка словарного WAL-кодека 5 и `OpenOpts` | Средняя | Сжатие повторяющихся координат векторов по умолчанию | `tests/wal_dictionary.rs`, durable 1k/10k vs SQLite |
-| **P4.4** Push-режим и лимит отставания в `wal-serve` | Средняя | Единое поведение `wal-serve` и `lin serve` | `tests/persist.rs` (ship) |
+| **P4.2** Замер preallocated WAL на Linux (`ext4` / `xfs`) | Средняя | Оценка `FALLOC_FL_KEEP_SIZE` vs кадр-терминатор на Linux | `durable_insert_*` на Linux |
+| **P4.3** Приёмочный замер словарного WAL-кодека 5 | Средняя | Оценка включения кодека 5 по умолчанию | durable 1k/10k vs SQLite |
 
 ### 7. Незакрытая приёмка бенчмарков `cold_*`
 
@@ -78,7 +66,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 |---|---|---|
 | 1. Доказательства | LIN-0001 | Сопоставить текущие source/binary hashes с отчётами. Перезапускать затронутые сценарии; широкую peer matrix — на итоговом кандидате. Разделить native/Full durable, cold/warm и размеры 1k/10k/100k. |
 | 2. Измеренный проигрыш | LIN-0002 | Закрывать SQLite Full durable1k по свежему профилю одной гипотезой за раз. Уже принятые persistent worker, O(1) hint и NEON writer повторно не внедрять. Два набора минимум по шесть process-pairs, A/A, 10k и граничные контроли; сохранять проигрыши. |
-| 3. Выбор WAL codec | LIN-0045, LIN-0046, LIN-0065, LIN-0080 | Для dictionary сначала ограничить цену неудачного выбора на high-cardinality/dense/zero и скрытых поздних выбросах. Затем отдельно проверить настоящий frame, общий decoded budget, старый reader, replay и rollback миграции. CPU-прототип не включает default writer автоматически. |
 | 4. Сохранность данных | D02–D06, D43 | Переиспользовать существующие oracle/fault injection; дополнить конкретные пробелы. Последний подтверждённый commit, mixed codecs, checkpoint, backup/follower и ошибки диска. Воспроизведённая потеря данных опережает performance. |
 | 5. Память записи | LIN-0321, LIN-0322, LIN-0349 | Сначала измерить allocations, hit rate и retained bytes существующих пулов. Любой новый reuse должен пройти cold start, полный жизненный цикл с Drop, лимиты, alias isolation и ошибки. Не переносить освобождение памяти за таймер ради результата. |
 | 6. Группировки | D19 | Расширять покрытие от уже принятого fixed-text single-key COUNT: много ключей, другие агрегаты, mixed numeric/NaN/zero, Unicode и quota exhaustion. Не считать узкий index-only fast path реализацией произвольного GROUP BY. |
@@ -138,9 +125,9 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 Для каждой строки итоговый критерий — её конкретный результат плюс указанный gate. Если критерий требует недоступной платформы/endpoint, статус остаётся непроверенным; mock/compile не заменяет live qualification.
 
-### Приоритетный список — 1285 пунктов
+### Приоритетный список — 1281 пунктов
 
-Количества: P1: 3, P2: 766, P3: 516; статусы: blocked_external: 1, candidate: 905, qualification: 379.
+Количества: P1: 3, P2: 762, P3: 516; статусы: blocked_external: 1, candidate: 905, qualification: 375.
 
 #### P1: 3 пунктов
 
@@ -150,7 +137,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 2 | LIN-0002 | [D01](#d01) | Закрыть durable 1k SQLite gap | PERF | qualification | M | G-PERF |
 | 22 | LIN-0006 | [D01](#d01) | Получить тестовый endpoint Kusto | OPS | blocked_external | M | G-OPS |
 
-#### P2: 766 пунктов
+#### P2: 762 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -183,20 +170,16 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 138 | LIN-0038 | [D01](#d01) | Проверять incomplete при пропавшем peer | PERF | candidate | M | G-PERF |
 | 139 | LIN-0039 | [D01](#d01) | Проверять loss gate при проигрыше | PERF | candidate | M | G-PERF |
 | 140 | LIN-0040 | [D01](#d01) | Автоматизировать итоговый completion audit | PERF | candidate | M | G-PERF |
-| 141 | LIN-0045 | [D02](#d02) | Ограничить неоднозначность codec tags | CORRECTNESS | qualification | M | G-CORRECT |
-| 142 | LIN-0046 | [D02](#d02) | Определить неизвестный future codec | CORRECTNESS | qualification | M | G-CORRECT |
 | 157 | LIN-0061 | [D02](#d02) | Уменьшить vector frame copies | CORRECTNESS | qualification | M | G-CORRECT |
 | 158 | LIN-0062 | [D02](#d02) | Переиспользовать точный serialized size | CORRECTNESS | qualification | M | G-CORRECT |
 | 159 | LIN-0063 | [D02](#d02) | Измерить segmented WAL encoding | PERF | candidate | M | G-PERF |
 | 160 | LIN-0064 | [D02](#d02) | Измерить reserve buffer policy | PERF | candidate | M | G-PERF |
-| 161 | LIN-0065 | [D02](#d02) | Разделить codec policy и encoder | CORRECTNESS | qualification | M | G-CORRECT |
 | 162 | LIN-0066 | [D02](#d02) | Ввести явный decoder capability set | CORRECTNESS | qualification | M | G-CORRECT |
 | 163 | LIN-0067 | [D02](#d02) | Документировать frame layout байтами | CORRECTNESS | qualification | M | G-CORRECT |
 | 164 | LIN-0068 | [D02](#d02) | Подготовить независимый frame inspector | CORRECTNESS | qualification | M | G-CORRECT |
 | 173 | LIN-0077 | [D02](#d02) | Проверить одинаковые bytes разных CPU | CORRECTNESS | qualification | S | G-CORRECT |
 | 174 | LIN-0078 | [D02](#d02) | Создать corpus исторических WAL frames | VERIFY | qualification | S | G-VERIFY |
 | 175 | LIN-0079 | [D02](#d02) | Версионировать WAL golden fixtures | VERIFY | qualification | S | G-VERIFY |
-| 176 | LIN-0080 | [D02](#d02) | Проверить codec migration rollback | CORRECTNESS | qualification | S | G-CORRECT |
 | 177 | LIN-0085 | [D03](#d03) | Проверить barrier semantics Darwin | CORRECTNESS | qualification | S | G-CORRECT |
 | 178 | LIN-0086 | [D03](#d03) | Проверить fdatasync semantics Linux | CORRECTNESS | qualification | S | G-CORRECT |
 | 179 | LIN-0087 | [D03](#d03) | Проверить sync error propagation | CORRECTNESS | qualification | S | G-CORRECT |
@@ -1452,7 +1435,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 <a id="d02"></a>
 
-**D02. Формат WAL и checksum** — открыто 14 из 40. Модули: [src/persist/mod.rs](../src/persist/mod.rs), [src/crc.rs](../src/crc.rs), [tests/persist.rs](../tests/persist.rs). Контекст: [D01](#d01).
+**D02. Формат WAL и checksum** — открыто 10 из 40. Модули: [src/persist/mod.rs](../src/persist/mod.rs), [src/crc.rs](../src/crc.rs), [tests/persist.rs](../tests/persist.rs). Контекст: [D01](#d01).
 
 <a id="d03"></a>
 

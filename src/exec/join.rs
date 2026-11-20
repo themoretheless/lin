@@ -1168,6 +1168,11 @@ fn cmp_col_rows(col: &Column, r1: usize, r2: usize) -> std::cmp::Ordering {
                 }
             }
         }
+        Column::Text { .. } | Column::Dict { .. } => match (col.text_at(r1), col.text_at(r2)) {
+            (Some(sa), Some(sb)) => sa.cmp(sb),
+            (None, None) => std::cmp::Ordering::Equal,
+            _ => super::eval::cmp_sort(&col.get(r1), &col.get(r2)),
+        },
         Column::Cells(c) => super::eval::cmp_sort(&c[r1], &c[r2]),
     }
 }
@@ -1202,6 +1207,42 @@ fn sort_part_by_col(part: &mut [u32], col: &Column, desc: bool, seq_rows: Option
             } else {
                 sort_indices_cmp(part, |a, b| {
                     cmp_f64_sort(vals[mapped_row(seq_rows, a)], vals[mapped_row(seq_rows, b)])
+                });
+            }
+        }
+        Column::Dict {
+            values,
+            codes,
+            valid,
+        } if valid.null_count() == 0 => {
+            let mut order: Vec<u32> = (0..values.len() as u32).collect();
+            order.sort_unstable_by(|&a, &b| values[a as usize].cmp(&values[b as usize]));
+            let mut rank = vec![0u32; values.len()];
+            for (r, &code) in order.iter().enumerate() {
+                rank[code as usize] = r as u32;
+            }
+            if desc {
+                sort_indices_cmp(part, |a, b| {
+                    rank[codes[mapped_row(seq_rows, b)] as usize]
+                        .cmp(&rank[codes[mapped_row(seq_rows, a)] as usize])
+                });
+            } else {
+                sort_indices_cmp(part, |a, b| {
+                    rank[codes[mapped_row(seq_rows, a)] as usize]
+                        .cmp(&rank[codes[mapped_row(seq_rows, b)] as usize])
+                });
+            }
+        }
+        Column::Text { valid, .. } if valid.null_count() == 0 => {
+            if desc {
+                sort_indices_cmp(part, |a, b| {
+                    col.text_at(mapped_row(seq_rows, b))
+                        .cmp(&col.text_at(mapped_row(seq_rows, a)))
+                });
+            } else {
+                sort_indices_cmp(part, |a, b| {
+                    col.text_at(mapped_row(seq_rows, a))
+                        .cmp(&col.text_at(mapped_row(seq_rows, b)))
                 });
             }
         }
@@ -1372,6 +1413,36 @@ fn partition_into(
                         map[bucket] = counts.len() as u32;
                     }
                     assign(map[bucket], &mut counts);
+                }
+            }
+            Column::Dict {
+                values,
+                codes,
+                valid,
+            } => {
+                let mut map = vec![u32::MAX; values.len() + 1];
+                let null_bucket = values.len();
+                for pos in 0..n {
+                    let idx = mapped_row(seq_rows, pos as u32);
+                    let bucket = if valid.is_valid(idx) {
+                        codes[idx] as usize
+                    } else {
+                        null_bucket
+                    };
+                    if map[bucket] == u32::MAX {
+                        map[bucket] = counts.len() as u32;
+                    }
+                    assign(map[bucket], &mut counts);
+                }
+            }
+            col @ Column::Text { valid, .. } if valid.null_count() == 0 => {
+                let mut slot_of: FxHashMap<&str, u32> =
+                    FxHashMap::with_capacity_and_hasher(map_hint, Default::default());
+                for pos in 0..n {
+                    let r = mapped_row(seq_rows, pos as u32);
+                    let next = slot_of.len() as u32;
+                    let slot = *slot_of.entry(col.text_at(r).unwrap_or("")).or_insert(next);
+                    assign(slot, &mut counts);
                 }
             }
             col => {
@@ -2771,6 +2842,18 @@ fn partition_into(
         };
         let names_arc: Arc<[String]> = names.clone().into();
         if !need_filter
+            && let Some(mirror) = self.get_or_build_mirror(name)
+        {
+            let idx_slice = match &source {
+                JoinLeftSource::Idxs(idxs) => Some(idxs.as_slice()),
+                JoinLeftSource::Scan { .. } => None,
+            };
+            if let Some(mut batch) = mirror.project_batch(&names, idx_slice) {
+                finish_batch(&mut batch, skip_n, explicit_take);
+                return Some(batch);
+            }
+        }
+        if !need_filter
             && matches!(source, JoinLeftSource::Scan { .. })
             && skip_n == 0
             && matches!(explicit_take, Some(None))
@@ -3637,8 +3720,13 @@ fn partition_into(
                                             local_batch.cols[0]
                                                 .push(Cell::Text(Arc::clone(&orders_id[idx])));
                                             local_batch.cols[1].push(Cell::Null);
-                                            local_batch.cols[2]
-                                                .push(order_total_cell(&mut total_slot, orders_rows, orders_total, idx));
+                                            local_batch.cols[2].push(order_total_cell(
+                                                &mut total_slot,
+                                                orders_rows,
+                                                orders_total,
+                                                orders_total_tag,
+                                                idx,
+                                            ));
                                         }
                                         continue;
                                     };
@@ -3646,7 +3734,13 @@ fn partition_into(
                                         .push(Cell::Text(Arc::clone(&orders_id[idx])));
                                     local_batch.cols[1]
                                         .push(Cell::Text(Arc::clone(&users_email[ui])));
-                                    local_batch.cols[2].push(order_total_cell(&mut total_slot, orders_rows, orders_total, idx));
+                                    local_batch.cols[2].push(order_total_cell(
+                                        &mut total_slot,
+                                        orders_rows,
+                                        orders_total,
+                                        orders_total_tag,
+                                        idx,
+                                    ));
                                 }
                             } else {
                                 for pos in c_start..c_end {
@@ -3682,7 +3776,13 @@ fn partition_into(
                                                 "user_id" => {
                                                     Cell::Text(Arc::clone(&orders_uid[idx]))
                                                 }
-                                                "total" => order_total_cell(&mut total_slot, orders_rows, orders_total, idx),
+                                                "total" => order_total_cell(
+                                                    &mut total_slot,
+                                                    orders_rows,
+                                                    orders_total,
+                                                    orders_total_tag,
+                                                    idx,
+                                                ),
                                                 _ => self
                                                     .store
                                                     .get_by_idx("orders", idx)
@@ -3804,6 +3904,7 @@ fn partition_into(
                                 &mut total_slot,
                                 orders_rows,
                                 orders_total,
+                                orders_total_tag,
                                 idx,
                             )),
                         }
@@ -3819,6 +3920,7 @@ fn partition_into(
                         &mut total_slot,
                         orders_rows,
                         orders_total,
+                        orders_total_tag,
                         idx,
                     )),
                 }
@@ -3893,7 +3995,13 @@ fn partition_into(
                     JoinFieldPlan::Left(k) => match k.as_str() {
                         "id" => Cell::Text(Arc::clone(&orders_id[idx])),
                         "user_id" => Cell::Text(Arc::clone(&orders_uid[idx])),
-                        "total" => order_total_cell(&mut total_slot, orders_rows, orders_total, idx),
+                        "total" => order_total_cell(
+                            &mut total_slot,
+                            orders_rows,
+                            orders_total,
+                            orders_total_tag,
+                            idx,
+                        ),
                         _ => self
                             .store
                             .get_by_idx("orders", idx)
@@ -4178,20 +4286,24 @@ fn partition_into(
     }
 }
 
-/// `total` of the order at position `idx`, as stored: the SoA buffer is f64 and would
-/// turn integer totals into floats, so the value comes from the row (an absent field is
-/// null, as a row projection makes it); the buffer is only a fallback.
-/// `slot` caches the field's position for the rows' shape.
+/// `total` of the order at position `idx`, reconstructed directly from `(totals, tags)`
+/// without touching `rows[idx]` whenever `tags[idx]` is `0` (`Int` <= 2^53) or `1` (`Float`),
+/// falling back to `rows[idx]` only for `Null`/absent/large-integer edge cases (`tag == 2`).
 #[inline]
 pub(crate) fn order_total_cell(
     slot: &mut crate::store::row::FieldSlot<'static>,
     rows: &[Row],
     totals: &[f64],
+    tags: &[u8],
     idx: usize,
 ) -> Cell {
-    match rows.get(idx) {
-        Some(row) => slot.get(row).map(Cell::clone_for_borrow).unwrap_or(Cell::Null),
-        None => Cell::Float(totals[idx]),
+    match tags.get(idx).copied() {
+        Some(0) => Cell::Int(totals[idx] as i64),
+        Some(1) => Cell::Float(totals[idx]),
+        _ => match rows.get(idx) {
+            Some(row) => slot.get(row).map(Cell::clone_for_borrow).unwrap_or(Cell::Null),
+            None => Cell::Float(totals[idx]),
+        },
     }
 }
 
