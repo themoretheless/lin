@@ -25,54 +25,291 @@ pub struct DiskSegment {
     pub(super) sec_indexes: FxHashMap<String, MmapHashIndex>,
     /// Column positions in field-name order, and the shape of a row carrying every
     /// column: a row with no absent value is built from them without touching names.
-    name_order: Vec<usize>,
-    full_shape: Arc<crate::store::RowShape>,
-    id_col_pos: Option<usize>,
-    title_col_pos: Option<usize>,
+    pub(super) name_order: Vec<usize>,
+    pub(super) full_shape: Arc<crate::store::RowShape>,
+    pub(super) id_col_pos: Option<usize>,
+    pub(super) title_col_pos: Option<usize>,
+    pub(super) can_cache_full_row: bool,
+}
+
+/// Pre-resolved projection plan for materializing rows from a single [`DiskSegment`]
+/// without per-row `FxHashMap` lookups, field-name sorting, `Shape` lock probes, or
+/// shared Zstd block-cache mutex contention.
+pub(super) struct SegProjPlan<'s> {
+    seg: &'s DiskSegment,
+    cols: smallvec::SmallVec<[usize; 8]>,
+    shape: Option<Arc<crate::store::RowShape>>,
+    caches: smallvec::SmallVec<[super::SegBlockCache<'s>; 8]>,
+}
+
+impl<'s> SegProjPlan<'s> {
+    #[inline]
+    pub(super) fn materialize(&mut self, row_id: u32) -> Result<Row, Error> {
+        let Some(ref shape) = self.shape else {
+            return Ok(Row::new());
+        };
+        let n = self.cols.len();
+        let mut cells: smallvec::SmallVec<[Cell; 8]> = smallvec::SmallVec::with_capacity(n);
+        let mut absent = 0usize;
+        for (i, &pos) in self.cols.iter().enumerate() {
+            let cell = super::read_seg_cell(self.seg, pos, row_id, &mut self.caches[i])?;
+            absent += usize::from(matches!(cell, Cell::Null));
+            cells.push(cell);
+        }
+        if absent == 0 {
+            return Ok(Row::from_parts(Arc::clone(shape), cells));
+        }
+        if absent == n {
+            return Ok(Row::new());
+        }
+        let present_cols: smallvec::SmallVec<[usize; 8]> = self
+            .cols
+            .iter()
+            .zip(cells.iter())
+            .filter(|(_, c)| !matches!(c, Cell::Null))
+            .map(|(&pos, _)| pos)
+            .collect();
+        Ok(Row::from_sorted(
+            present_cols.iter().map(|&pos| self.seg.cols[pos].0.as_str()),
+            cells.into_iter().filter(|c| !matches!(c, Cell::Null)),
+        ))
+    }
+
+    #[inline]
+    pub(super) fn materialize_into(&mut self, row_id: u32, dst: &mut Row) -> Result<(), Error> {
+        let Some(ref shape) = self.shape else {
+            dst.clear();
+            return Ok(());
+        };
+        let n = self.cols.len();
+        if dst.shape().is_some_and(|s| Arc::ptr_eq(s, shape)) {
+            let dst_cells = dst.cells_mut();
+            let mut first_null: Option<usize> = None;
+            for i in 0..n {
+                let pos = self.cols[i];
+                if !super::write_seg_cell_in_place(
+                    self.seg,
+                    pos,
+                    row_id,
+                    &mut self.caches[i],
+                    &mut dst_cells[i],
+                )? {
+                    first_null = Some(i);
+                    break;
+                }
+            }
+            let Some(null_idx) = first_null else {
+                return Ok(());
+            };
+            let mut present_pos: smallvec::SmallVec<[usize; 8]> =
+                smallvec::SmallVec::with_capacity(n - 1);
+            let mut present_cells: smallvec::SmallVec<[Cell; 8]> =
+                smallvec::SmallVec::with_capacity(n - 1);
+            for i in 0..null_idx {
+                present_pos.push(self.cols[i]);
+                present_cells.push(std::mem::replace(&mut dst_cells[i], Cell::Null));
+            }
+            for i in (null_idx + 1)..n {
+                let pos = self.cols[i];
+                let cell = super::read_seg_cell(self.seg, pos, row_id, &mut self.caches[i])?;
+                if !matches!(cell, Cell::Null) {
+                    present_pos.push(pos);
+                    present_cells.push(cell);
+                }
+            }
+            if present_cells.is_empty() {
+                dst.clear();
+            } else {
+                *dst = Row::from_sorted(
+                    present_pos.iter().map(|&pos| self.seg.cols[pos].0.as_str()),
+                    present_cells,
+                );
+            }
+            return Ok(());
+        }
+
+        let mut cells: smallvec::SmallVec<[Cell; 8]> = smallvec::SmallVec::with_capacity(n);
+        let mut absent = 0usize;
+        for (i, &pos) in self.cols.iter().enumerate() {
+            let cell = super::read_seg_cell(self.seg, pos, row_id, &mut self.caches[i])?;
+            absent += usize::from(matches!(cell, Cell::Null));
+            cells.push(cell);
+        }
+        if absent == 0 {
+            dst.reset_with_shape_ref(shape, cells);
+        } else if absent == n {
+            dst.clear();
+        } else {
+            let present_cols: smallvec::SmallVec<[usize; 8]> = self
+                .cols
+                .iter()
+                .zip(cells.iter())
+                .filter(|(_, c)| !matches!(c, Cell::Null))
+                .map(|(&pos, _)| pos)
+                .collect();
+            *dst = Row::from_sorted(
+                present_cols.iter().map(|&pos| self.seg.cols[pos].0.as_str()),
+                cells.into_iter().filter(|c| !matches!(c, Cell::Null)),
+            );
+        }
+        Ok(())
+    }
+}
+
+#[inline]
+fn verify_slice_crc(
+    seg_id: u64,
+    fname: &str,
+    bytes: &[u8],
+    exp_len: u64,
+    exp_crc: u32,
+) -> Result<(), Error> {
+    let got_len = bytes.len() as u64;
+    let got_crc = crate::crc::hardware_crc32c(bytes);
+    if got_len != exp_len || got_crc != exp_crc {
+        return Err(Error::runtime(format!(
+            "corrupt segment file 'seg_{seg_id:08}/{fname}': expected (len={exp_len}, crc={exp_crc:#010x}), got (len={got_len}, crc={got_crc:#010x})"
+        )));
+    }
+    Ok(())
 }
 
 impl DiskSegment {
     pub(super) fn open(seg_dir: &Path, meta: SegmentMeta) -> Result<Self, Error> {
-        let corrupt_hints = if !meta.file_crcs.is_empty() {
-            verify_segment_file_crcs(seg_dir, meta.seg_id, &meta.file_crcs)?
-        } else {
-            rustc_hash::FxHashSet::default()
-        };
+        Self::open_inner(seg_dir, meta, true)
+    }
+
+    pub(super) fn open_newly_written(seg_dir: &Path, meta: SegmentMeta) -> Result<Self, Error> {
+        Self::open_inner(seg_dir, meta, false)
+    }
+
+    fn open_inner(seg_dir: &Path, meta: SegmentMeta, verify_crcs: bool) -> Result<Self, Error> {
+        let check_crcs = verify_crcs && !meta.file_crcs.is_empty();
+        let skip_tgram_body_crc = !meta.file_crcs.is_empty();
+        let mut checked_files = 0usize;
+        let seg_id = meta.seg_id;
+
         let mut cols = Vec::with_capacity(meta.columns.len());
         let mut col_pos = FxHashMap::default();
+        col_pos.reserve(meta.columns.len());
         for (i, col_schema) in meta.columns.iter().enumerate() {
+            let cname = &col_schema.name;
             let mcol = match col_schema.kind {
                 DiskColKind::Int64
                 | DiskColKind::Float64
                 | DiskColKind::Bool
                 | DiskColKind::Time64 => {
-                    let mut fc = MmapFixedCol::open(
-                        seg_dir,
-                        &col_schema.name,
-                        col_schema.kind,
-                        meta.row_count,
-                    )?;
-                    if corrupt_hints.contains(&format!("col_{}.zmap", col_schema.name)) {
-                        fc.clear_zone_map();
+                    let mut fc =
+                        MmapFixedCol::open(seg_dir, cname, col_schema.kind, meta.row_count)?;
+                    if check_crcs {
+                        let null_name = format!("col_{cname}.null");
+                        if let Some(&(el, ec)) = meta.file_crcs.get(&null_name) {
+                            verify_slice_crc(seg_id, &null_name, fc.nulls_bytes(), el, ec)?;
+                            checked_files += 1;
+                        }
+                        let val_name = format!("col_{cname}.val");
+                        if let Some(&(el, ec)) = meta.file_crcs.get(&val_name) {
+                            verify_slice_crc(seg_id, &val_name, fc.values_bytes(), el, ec)?;
+                            checked_files += 1;
+                        }
+                        let zmap_name = format!("col_{cname}.zmap");
+                        if let Some(&(el, ec)) = meta.file_crcs.get(&zmap_name) {
+                            checked_files += 1;
+                            match fc.zmap_bytes() {
+                                Some(zb)
+                                    if zb.len() as u64 == el
+                                        && crate::crc::hardware_crc32c(zb) == ec => {}
+                                _ => fc.clear_zone_map(),
+                            }
+                        }
                     }
                     MmapCol::Fixed(fc)
                 }
                 DiskColKind::TextZstd => {
-                    let mut tc = MmapTextCol::open(seg_dir, &col_schema.name, meta.row_count)?;
-                    if corrupt_hints.contains(&format!("col_{}.tgram", col_schema.name)) {
-                        tc.clear_tgram();
+                    let mut tc = MmapTextCol::open_with_opts(
+                        seg_dir,
+                        cname,
+                        meta.row_count,
+                        skip_tgram_body_crc,
+                    )?;
+                    if check_crcs {
+                        let loc_name = format!("col_{cname}.loc");
+                        if let Some(&(el, ec)) = meta.file_crcs.get(&loc_name) {
+                            verify_slice_crc(seg_id, &loc_name, tc.row_loc_bytes(), el, ec)?;
+                            checked_files += 1;
+                        }
+                        let boff_name = format!("col_{cname}.boff");
+                        if let Some(&(el, ec)) = meta.file_crcs.get(&boff_name) {
+                            verify_slice_crc(seg_id, &boff_name, tc.block_offsets_bytes(), el, ec)?;
+                            checked_files += 1;
+                        }
+                        let bdat_name = format!("col_{cname}.bdat");
+                        if let Some(&(el, ec)) = meta.file_crcs.get(&bdat_name) {
+                            verify_slice_crc(seg_id, &bdat_name, tc.blocks_data_bytes(), el, ec)?;
+                            checked_files += 1;
+                        }
+                        let tgram_name = format!("col_{cname}.tgram");
+                        if let Some(&(el, ec)) = meta.file_crcs.get(&tgram_name) {
+                            checked_files += 1;
+                            match tc.tgram_bytes() {
+                                Some(tb)
+                                    if tb.len() as u64 == el
+                                        && crate::crc::hardware_crc32c(tb) == ec => {}
+                                _ => tc.clear_tgram(),
+                            }
+                        }
                     }
                     MmapCol::Text(tc)
                 }
-                DiskColKind::TextDict => MmapCol::Dict(MmapDictCol::open(
-                    seg_dir,
-                    &col_schema.name,
-                    meta.row_count,
-                )?),
+                DiskColKind::TextDict => {
+                    let dc = MmapDictCol::open_checked(
+                        seg_dir,
+                        cname,
+                        meta.row_count,
+                        seg_id,
+                        if check_crcs {
+                            Some(&meta.file_crcs)
+                        } else {
+                            None
+                        },
+                    )?;
+                    if check_crcs {
+                        for ext in ["dstr", "doff", "dord"] {
+                            if meta.file_crcs.contains_key(&format!("col_{cname}.{ext}")) {
+                                checked_files += 1;
+                            }
+                        }
+                    }
+                    MmapCol::Dict(dc)
+                }
                 DiskColKind::VecF32Sq8 { dim } => {
-                    let mut vc = MmapVecCol::open(seg_dir, &col_schema.name, dim, meta.row_count)?;
-                    if corrupt_hints.contains(&format!("col_{}.vivf", col_schema.name)) {
-                        vc.ivf = None;
+                    let mut vc = MmapVecCol::open(seg_dir, cname, dim, meta.row_count)?;
+                    if check_crcs {
+                        let vnull_name = format!("col_{cname}.vnull");
+                        if let Some(&(el, ec)) = meta.file_crcs.get(&vnull_name) {
+                            verify_slice_crc(seg_id, &vnull_name, vc.nulls_bytes(), el, ec)?;
+                            checked_files += 1;
+                        }
+                        let vf32_name = format!("col_{cname}.vf32");
+                        if let Some(&(el, ec)) = meta.file_crcs.get(&vf32_name) {
+                            verify_slice_crc(seg_id, &vf32_name, vc.f32_bytes(), el, ec)?;
+                            checked_files += 1;
+                        }
+                        let vsq8_name = format!("col_{cname}.vsq8");
+                        if let Some(&(el, ec)) = meta.file_crcs.get(&vsq8_name) {
+                            verify_slice_crc(seg_id, &vsq8_name, vc.sq8_bytes(), el, ec)?;
+                            checked_files += 1;
+                        }
+                        let vivf_name = format!("col_{cname}.vivf");
+                        if let Some(&(el, ec)) = meta.file_crcs.get(&vivf_name) {
+                            checked_files += 1;
+                            match vc.ivf_bytes() {
+                                Some(ib)
+                                    if ib.len() as u64 == el
+                                        && crate::crc::hardware_crc32c(ib) == ec => {}
+                                _ => vc.ivf = None,
+                            }
+                        }
                     }
                     MmapCol::Vec(vc)
                 }
@@ -82,12 +319,34 @@ impl DiskSegment {
         }
 
         let pk_index = MmapHashIndex::open(&seg_dir.join("pk_id.ht"))?;
+        if check_crcs && let Some(&(el, ec)) = meta.file_crcs.get("pk_id.ht") {
+            verify_slice_crc(seg_id, "pk_id.ht", pk_index.as_bytes(), el, ec)?;
+            checked_files += 1;
+        }
         let mut sec_indexes = FxHashMap::default();
         for field in &meta.indexed_fields {
-            let p = seg_dir.join(format!("sec_{field}.ht"));
-            if p.exists() {
-                sec_indexes.insert(field.clone(), MmapHashIndex::open(&p)?);
+            let sec_name = format!("sec_{field}.ht");
+            let p = seg_dir.join(&sec_name);
+            match MmapHashIndex::open(&p) {
+                Ok(idx) => {
+                    if check_crcs && let Some(&(el, ec)) = meta.file_crcs.get(&sec_name) {
+                        verify_slice_crc(seg_id, &sec_name, idx.as_bytes(), el, ec)?;
+                        checked_files += 1;
+                    }
+                    sec_indexes.insert(field.clone(), idx);
+                }
+                Err(_) if !p.exists() => {
+                    if check_crcs && meta.file_crcs.contains_key(&sec_name) {
+                        checked_files += 1;
+                    }
+                }
+                Err(e) => return Err(e),
             }
+        }
+
+        // Fallback check only if `meta.file_crcs` listed any extra unmapped file.
+        if check_crcs && checked_files < meta.file_crcs.len() {
+            let _ = verify_segment_file_crcs(seg_dir, seg_id, &meta.file_crcs)?;
         }
 
         let mut name_order: Vec<usize> = (0..cols.len()).collect();
@@ -96,6 +355,8 @@ impl DiskSegment {
         let full_shape = Row::shape_of(&names);
         let id_col_pos = col_pos.get("id").copied();
         let title_col_pos = col_pos.get("title").copied();
+        let can_cache_full_row =
+            cols.len() <= 16 && !cols.iter().any(|(_, c)| matches!(c, MmapCol::Vec(_)));
 
         Ok(Self {
             meta,
@@ -107,7 +368,42 @@ impl DiskSegment {
             full_shape,
             id_col_pos,
             title_col_pos,
+            can_cache_full_row,
         })
+    }
+
+    pub(super) fn prepare_projection<'s>(&'s self, fields: &[&str]) -> SegProjPlan<'s> {
+        let mut cols: smallvec::SmallVec<[usize; 8]> = smallvec::SmallVec::with_capacity(fields.len());
+        for &fname in fields {
+            if let Some(&pos) = self.col_pos.get(fname) {
+                cols.push(pos);
+            }
+        }
+        cols.sort_unstable_by(|&a, &b| self.cols[a].0.cmp(&self.cols[b].0));
+        cols.dedup();
+        let shape = if cols.is_empty() {
+            None
+        } else if cols.len() == 2
+            && Some(cols[0]) == self.id_col_pos
+            && Some(cols[1]) == self.title_col_pos
+        {
+            Some(Arc::clone(crate::store::shape_id_title()))
+        } else if cols.as_slice() == self.name_order.as_slice() {
+            Some(Arc::clone(&self.full_shape))
+        } else {
+            let sorted_names: smallvec::SmallVec<[&str; 8]> =
+                cols.iter().map(|&pos| self.cols[pos].0.as_str()).collect();
+            Some(Row::shape_of(&sorted_names))
+        };
+        let caches = (0..cols.len())
+            .map(|_| super::SegBlockCache::Empty)
+            .collect();
+        SegProjPlan {
+            seg: self,
+            cols,
+            shape,
+            caches,
+        }
     }
 
     #[inline]
@@ -151,6 +447,17 @@ impl DiskSegment {
 
     #[inline]
     pub fn materialize_projected(&self, row_id: u32, fields: &[&str]) -> Result<Row, Error> {
+        if fields.len() == 1 {
+            let f0 = fields[0];
+            let Some(&pos) = self.col_pos.get(f0) else {
+                return Ok(Row::new());
+            };
+            let cell = self.cols[pos].1.get_cell(row_id)?;
+            if matches!(cell, Cell::Null) {
+                return Ok(Row::new());
+            }
+            return Ok(Row::from_sorted(std::iter::once(f0), std::iter::once(cell)));
+        }
         if fields == ["id", "title"]
             && let (Some(id_pos), Some(title_pos)) = (self.id_col_pos, self.title_col_pos)
         {
@@ -292,11 +599,8 @@ impl DiskSegment {
                 }
                 let s_off = in_off as usize;
                 let e_off = s_off + (len as usize);
-                if let Some(raw) = tc.raw_uncompressed_block(bidx)? {
-                    if e_off > raw.len() {
-                        return Err(io_err("corrupt in-block text slice"));
-                    }
-                    let s = std::str::from_utf8(&raw[s_off..e_off]).map_err(io_err)?;
+                if let Some((raw, utf8_ok)) = tc.raw_uncompressed_block_checked(bidx)? {
+                    let s = MmapTextCol::slice_block_str(raw, utf8_ok, s_off, e_off)?;
                     return Ok(Some(s));
                 }
                 let need_load = match last_block {
@@ -304,18 +608,29 @@ impl DiskSegment {
                     None => true,
                 };
                 if need_load {
-                    let decoded = tc.decode_block(bidx)?;
+                    let (decoded, _) = tc.decode_block_checked(bidx)?;
                     *last_block = Some((bidx, decoded));
                 }
                 let (_, ref block) = *last_block.as_ref().unwrap();
-                if e_off > block.len() {
-                    return Err(io_err("corrupt in-block text slice"));
-                }
-                let s = std::str::from_utf8(&block[s_off..e_off]).map_err(io_err)?;
+                let utf8_ok = tc.block_is_utf8_cached(bidx, block);
+                let s = MmapTextCol::slice_block_str(block, utf8_ok, s_off, e_off)?;
                 Ok(Some(s))
             }
             _ => Ok(None),
         }
+    }
+
+    #[inline]
+    pub(super) fn borrow_col_str_cached<'a, 's: 'a>(
+        &'s self,
+        col_pos: Option<usize>,
+        rid: u32,
+        cache: &'a mut super::SegBlockCache<'s>,
+    ) -> Result<Option<&'a str>, Error> {
+        let Some(pos) = col_pos else {
+            return Ok(None);
+        };
+        super::borrow_seg_str_cached(self, pos, rid, cache)
     }
 
     #[inline]
@@ -424,6 +739,24 @@ fn write_single_column(
     };
     match kind {
         DiskColKind::Int64 | DiskColKind::Time64 => {
+            #[cfg(target_endian = "little")]
+            if let ColSrc::Col(
+                crate::batch::Column::Int { vals, valid }
+                | crate::batch::Column::Time { vals, valid },
+            ) = src
+                && valid.null_count() == 0
+            {
+                let nulls = vec![0u8; vals.len()];
+                let vals_bytes = unsafe {
+                    std::slice::from_raw_parts(vals.as_ptr() as *const u8, vals.len() * 8)
+                };
+                fs::write(seg_dir.join(format!("col_{}.null", col.name)), &nulls)
+                    .map_err(io_err)?;
+                fs::write(seg_dir.join(format!("col_{}.val", col.name)), vals_bytes)
+                    .map_err(io_err)?;
+                write_zone_map(seg_dir, &col.name, kind, &nulls, vals_bytes)?;
+                return Ok(kind);
+            }
             let mut nulls = vec![1u8; src.len()];
             let mut vals = Vec::with_capacity(src.len() * 8);
             for i in 0..src.len() {
@@ -441,6 +774,21 @@ fn write_single_column(
             Ok(kind)
         }
         DiskColKind::Float64 => {
+            #[cfg(target_endian = "little")]
+            if let ColSrc::Col(crate::batch::Column::Float { vals, valid }) = src
+                && valid.null_count() == 0
+            {
+                let nulls = vec![0u8; vals.len()];
+                let vals_bytes = unsafe {
+                    std::slice::from_raw_parts(vals.as_ptr() as *const u8, vals.len() * 8)
+                };
+                fs::write(seg_dir.join(format!("col_{}.null", col.name)), &nulls)
+                    .map_err(io_err)?;
+                fs::write(seg_dir.join(format!("col_{}.val", col.name)), vals_bytes)
+                    .map_err(io_err)?;
+                write_zone_map(seg_dir, &col.name, DiskColKind::Float64, &nulls, vals_bytes)?;
+                return Ok(DiskColKind::Float64);
+            }
             let mut nulls = vec![1u8; src.len()];
             let mut vals = Vec::with_capacity(src.len() * 8);
             for i in 0..src.len() {
@@ -513,16 +861,27 @@ fn write_single_column(
                         dstr_bytes.extend_from_slice(s.as_bytes());
                         doff_bytes.extend_from_slice(&(dstr_bytes.len() as u32).to_le_bytes());
                     }
-                    let mut dord_bytes = Vec::with_capacity(codes.len() * 2);
-                    for &c in &codes {
-                        dord_bytes.extend_from_slice(&c.to_le_bytes());
-                    }
                     fs::write(seg_dir.join(format!("col_{}.dstr", col.name)), &dstr_bytes)
                         .map_err(io_err)?;
                     fs::write(seg_dir.join(format!("col_{}.doff", col.name)), &doff_bytes)
                         .map_err(io_err)?;
-                    fs::write(seg_dir.join(format!("col_{}.dord", col.name)), &dord_bytes)
-                        .map_err(io_err)?;
+                    #[cfg(target_endian = "little")]
+                    {
+                        let dord_bytes = unsafe {
+                            std::slice::from_raw_parts(codes.as_ptr() as *const u8, codes.len() * 2)
+                        };
+                        fs::write(seg_dir.join(format!("col_{}.dord", col.name)), dord_bytes)
+                            .map_err(io_err)?;
+                    }
+                    #[cfg(not(target_endian = "little"))]
+                    {
+                        let mut dord_bytes = Vec::with_capacity(codes.len() * 2);
+                        for &c in &codes {
+                            dord_bytes.extend_from_slice(&c.to_le_bytes());
+                        }
+                        fs::write(seg_dir.join(format!("col_{}.dord", col.name)), &dord_bytes)
+                            .map_err(io_err)?;
+                    }
                     return Ok(DiskColKind::TextDict);
                 }
             }
@@ -541,6 +900,8 @@ fn write_single_column(
 
             #[cfg(feature = "compress-zstd")]
             let mut zstd_comp = zstd::bulk::Compressor::new(1).ok();
+            #[cfg(feature = "compress-zstd")]
+            let mut comp_buf: Vec<u8> = Vec::new();
 
             #[allow(unused_mut)]
             let mut flush_block = |raw: &mut Vec<u8>,
@@ -554,35 +915,42 @@ fn write_single_column(
                 if raw.is_empty() {
                     return Ok(());
                 }
+                let written_len: usize;
                 #[cfg(feature = "compress-zstd")]
-                let encoded = {
-                    let compressed = if let Some(c) = zstd_comp.as_mut() {
-                        c.compress(&raw[..]).map_err(io_err)?
-                    } else {
-                        zstd::encode_all(&raw[..], 1).map_err(io_err)?
-                    };
-                    if compressed.len() + 1 < raw.len() {
-                        let mut out = Vec::with_capacity(1 + compressed.len());
-                        out.push(0x01);
-                        out.extend_from_slice(&compressed);
-                        out
-                    } else {
-                        let mut out = Vec::with_capacity(1 + raw.len());
-                        out.push(0x00);
-                        out.extend_from_slice(raw);
-                        out
+                {
+                    let bound = zstd::zstd_safe::compress_bound(raw.len());
+                    if comp_buf.len() < bound {
+                        comp_buf.resize(bound, 0);
                     }
-                };
+                    let comp_len = if let Some(c) = zstd_comp.as_mut() {
+                        c.compress_to_buffer(&raw[..], &mut comp_buf[..bound])
+                            .map_err(io_err)?
+                    } else {
+                        let v = zstd::encode_all(&raw[..], 1).map_err(io_err)?;
+                        if comp_buf.len() < v.len() {
+                            comp_buf.resize(v.len(), 0);
+                        }
+                        comp_buf[..v.len()].copy_from_slice(&v);
+                        v.len()
+                    };
+                    if comp_len + 1 < raw.len() {
+                        bdat.write_all(&[0x01]).map_err(io_err)?;
+                        bdat.write_all(&comp_buf[..comp_len]).map_err(io_err)?;
+                        written_len = 1 + comp_len;
+                    } else {
+                        bdat.write_all(&[0x00]).map_err(io_err)?;
+                        bdat.write_all(raw).map_err(io_err)?;
+                        written_len = 1 + raw.len();
+                    }
+                }
                 #[cfg(not(feature = "compress-zstd"))]
-                let encoded = {
-                    let mut out = Vec::with_capacity(1 + raw.len());
-                    out.push(0x00);
-                    out.extend_from_slice(raw);
-                    out
-                };
+                {
+                    bdat.write_all(&[0x00]).map_err(io_err)?;
+                    bdat.write_all(raw).map_err(io_err)?;
+                    written_len = 1 + raw.len();
+                }
 
-                bdat.write_all(&encoded).map_err(io_err)?;
-                *cur_len += encoded.len() as u64;
+                *cur_len += written_len as u64;
                 boffs.push(*cur_len);
                 tgrams.push(std::mem::replace(
                     tgram,
@@ -638,13 +1006,27 @@ fn write_single_column(
             )?;
             bdat_file.flush().map_err(io_err)?;
 
-            let mut boff_bytes = Vec::with_capacity(block_offsets.len() * 8);
-            for &off in &block_offsets {
-                boff_bytes.extend_from_slice(&off.to_le_bytes());
-            }
             fs::write(seg_dir.join(format!("col_{}.loc", col.name)), &loc_bytes).map_err(io_err)?;
-            fs::write(seg_dir.join(format!("col_{}.boff", col.name)), &boff_bytes)
-                .map_err(io_err)?;
+            #[cfg(target_endian = "little")]
+            {
+                let boff_bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        block_offsets.as_ptr() as *const u8,
+                        block_offsets.len() * 8,
+                    )
+                };
+                fs::write(seg_dir.join(format!("col_{}.boff", col.name)), boff_bytes)
+                    .map_err(io_err)?;
+            }
+            #[cfg(not(target_endian = "little"))]
+            {
+                let mut boff_bytes = Vec::with_capacity(block_offsets.len() * 8);
+                for &off in &block_offsets {
+                    boff_bytes.extend_from_slice(&off.to_le_bytes());
+                }
+                fs::write(seg_dir.join(format!("col_{}.boff", col.name)), &boff_bytes)
+                    .map_err(io_err)?;
+            }
             let tgram_bytes = super::columns::encode_tgram(&tgram_blocks);
             fs::write(seg_dir.join(format!("col_{}.tgram", col.name)), &tgram_bytes)
                 .map_err(io_err)?;
@@ -712,14 +1094,18 @@ fn write_single_column(
 }
 
 fn write_pk_index(seg_dir: &Path, ids: ColSrc<'_>) -> Result<(), Error> {
-    let mut pk_map: FxHashMap<Vec<u8>, Vec<u32>> = FxHashMap::default();
+    let mut pk_map: FxHashMap<Vec<u8>, smallvec::SmallVec<[u32; 1]>> = FxHashMap::default();
     pk_map.reserve(ids.len());
     let mut key_buf = Vec::with_capacity(64);
     for i in 0..ids.len() {
         if let Some(id_cell) = ids.key_cell(i)
             && encode_index_cell_key(&id_cell, &mut key_buf)
         {
-            pk_map.entry(key_buf.clone()).or_default().push(i as u32);
+            if let Some(v) = pk_map.get_mut(key_buf.as_slice()) {
+                v.push(i as u32);
+            } else {
+                pk_map.insert(key_buf.clone(), smallvec::smallvec![i as u32]);
+            }
         }
     }
     MmapHashIndex::write_from_map(&seg_dir.join("pk_id.ht"), &pk_map)
@@ -732,7 +1118,11 @@ fn write_sec_index(seg_dir: &Path, field: &str, src: ColSrc<'_>) -> Result<(), E
         if let Some(cell) = src.key_cell(i)
             && encode_index_cell_key(&cell, &mut key_buf)
         {
-            sec_map.entry(key_buf.clone()).or_default().push(i as u32);
+            if let Some(v) = sec_map.get_mut(key_buf.as_slice()) {
+                v.push(i as u32);
+            } else {
+                sec_map.insert(key_buf.clone(), vec![i as u32]);
+            }
         }
     }
     MmapHashIndex::write_from_map(&seg_dir.join(format!("sec_{field}.ht")), &sec_map)
@@ -774,9 +1164,7 @@ impl<'a> ColSrc<'a> {
     pub(super) fn has_float(&self) -> bool {
         use crate::batch::Column;
         match self {
-            ColSrc::Col(Column::Float { vals, valid }) => {
-                (0..vals.len()).any(|i| valid.is_valid(i))
-            }
+            ColSrc::Col(Column::Float { vals, valid }) => valid.null_count() < vals.len(),
             ColSrc::Col(col) if col.is_typed() => false,
             ColSrc::Absent(_) => false,
             _ => (0..self.len()).any(|i| matches!(self.cell_ref(i), Some(Cell::Float(_)))),

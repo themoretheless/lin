@@ -11,6 +11,7 @@ const MAX_SPILL_VEC_LEN: usize = 16 * 1024 * 1024;
 
 thread_local! {
     static SPILL_SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    static LAST_SPILL_TEXT: RefCell<Option<Arc<str>>> = const { RefCell::new(None) };
 }
 
 #[inline]
@@ -63,8 +64,22 @@ impl Spillable for Cell {
             Cell::Null => writer.write_all(&[0u8]).map_err(io_err),
             Cell::Text(s) => {
                 let b = s.as_bytes();
+                if b.len() <= InlineStr::MAX_LEN {
+                    let mut buf = [0u8; 2 + InlineStr::MAX_LEN];
+                    buf[0] = 2;
+                    buf[1] = b.len() as u8;
+                    buf[2..2 + b.len()].copy_from_slice(b);
+                    return writer.write_all(&buf[..2 + b.len()]).map_err(io_err);
+                }
                 let len = u32::try_from(b.len())
                     .map_err(|_| Error::runtime("spill text exceeds u32 length"))?;
+                if b.len() <= 250 {
+                    let mut buf = [0u8; 256];
+                    buf[0] = 1;
+                    buf[1..5].copy_from_slice(&len.to_le_bytes());
+                    buf[5..5 + b.len()].copy_from_slice(b);
+                    return writer.write_all(&buf[..5 + b.len()]).map_err(io_err);
+                }
                 let mut hdr = [0u8; 5];
                 hdr[0] = 1;
                 hdr[1..5].copy_from_slice(&len.to_le_bytes());
@@ -101,19 +116,40 @@ impl Spillable for Cell {
             Cell::Vec(v) => {
                 let len = u32::try_from(v.len())
                     .map_err(|_| Error::runtime("spill vector exceeds u32 length"))?;
-                let mut hdr = [0u8; 5];
-                hdr[0] = 7;
-                hdr[1..5].copy_from_slice(&len.to_le_bytes());
-                writer.write_all(&hdr).map_err(io_err)?;
-                let mut chunk_buf = [0u8; 256];
-                for chunk in v.chunks(64) {
-                    let byte_len = chunk.len() * 4;
-                    for (i, &x) in chunk.iter().enumerate() {
-                        chunk_buf[i * 4..i * 4 + 4].copy_from_slice(&x.to_le_bytes());
+                #[cfg(target_endian = "little")]
+                {
+                    let byte_len = v.len() * std::mem::size_of::<f32>();
+                    // SAFETY: `[f32]` on little-endian targets has exact IEEE-754 LE byte layout.
+                    let raw = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, byte_len) };
+                    if byte_len <= 250 {
+                        let mut buf = [0u8; 256];
+                        buf[0] = 7;
+                        buf[1..5].copy_from_slice(&len.to_le_bytes());
+                        buf[5..5 + byte_len].copy_from_slice(raw);
+                        return writer.write_all(&buf[..5 + byte_len]).map_err(io_err);
                     }
-                    writer.write_all(&chunk_buf[..byte_len]).map_err(io_err)?;
+                    let mut hdr = [0u8; 5];
+                    hdr[0] = 7;
+                    hdr[1..5].copy_from_slice(&len.to_le_bytes());
+                    writer.write_all(&hdr).map_err(io_err)?;
+                    writer.write_all(raw).map_err(io_err)
                 }
-                Ok(())
+                #[cfg(not(target_endian = "little"))]
+                {
+                    let mut hdr = [0u8; 5];
+                    hdr[0] = 7;
+                    hdr[1..5].copy_from_slice(&len.to_le_bytes());
+                    writer.write_all(&hdr).map_err(io_err)?;
+                    let mut chunk_buf = [0u8; 256];
+                    for chunk in v.chunks(64) {
+                        let byte_len = chunk.len() * 4;
+                        for (i, &x) in chunk.iter().enumerate() {
+                            chunk_buf[i * 4..i * 4 + 4].copy_from_slice(&x.to_le_bytes());
+                        }
+                        writer.write_all(&chunk_buf[..byte_len]).map_err(io_err)?;
+                    }
+                    Ok(())
+                }
             }
         }
     }
@@ -143,7 +179,20 @@ impl Spillable for Cell {
                     reader.read_exact(&mut scratch[..len]).map_err(io_err)?;
                     let s = std::str::from_utf8(&scratch[..len])
                         .map_err(|e| Error::runtime(e.to_string()))?;
-                    Ok(Cell::Text(Arc::from(s)))
+                    let arc = LAST_SPILL_TEXT.with(|last| {
+                        let mut slot = last.borrow_mut();
+                        if let Some(prev) = slot.as_ref()
+                            && prev.as_ref() == s
+                        {
+                            return Arc::clone(prev);
+                        }
+                        let created: Arc<str> = Arc::from(s);
+                        if len <= 256 {
+                            *slot = Some(Arc::clone(&created));
+                        }
+                        created
+                    });
+                    Ok(Cell::Text(arc))
                 })
             }
             2 => {
@@ -190,16 +239,32 @@ impl Spillable for Cell {
                     return Err(Error::runtime("corrupt spill vector length"));
                 }
                 let byte_len = len * 4;
-                SPILL_SCRATCH.with(|cell| {
-                    let mut scratch = cell.borrow_mut();
-                    scratch.resize(byte_len, 0);
-                    reader.read_exact(&mut scratch[..byte_len]).map_err(io_err)?;
-                    let v: Vec<f32> = scratch[..byte_len]
-                        .chunks_exact(4)
-                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                        .collect();
+                #[cfg(target_endian = "little")]
+                {
+                    let mut v = vec![0.0f32; len];
+                    if byte_len > 0 {
+                        // SAFETY: `v` has `len` initialized `f32` elements (`byte_len` bytes),
+                        // and every 4-byte pattern is a valid `f32` bit pattern.
+                        let raw = unsafe {
+                            std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, byte_len)
+                        };
+                        reader.read_exact(raw).map_err(io_err)?;
+                    }
                     Ok(Cell::Vec(Arc::from(v)))
-                })
+                }
+                #[cfg(not(target_endian = "little"))]
+                {
+                    SPILL_SCRATCH.with(|cell| {
+                        let mut scratch = cell.borrow_mut();
+                        scratch.resize(byte_len, 0);
+                        reader.read_exact(&mut scratch[..byte_len]).map_err(io_err)?;
+                        let v: Vec<f32> = scratch[..byte_len]
+                            .chunks_exact(4)
+                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                            .collect();
+                        Ok(Cell::Vec(Arc::from(v)))
+                    })
+                }
             }
             _ => Err(Error::runtime("invalid spill cell tag")),
         }

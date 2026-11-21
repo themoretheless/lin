@@ -1,5 +1,6 @@
 //! Snapshot and portable backup serialization, parallel chunked encoding, and mmap decoding.
 
+use std::cell::RefCell;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::Path;
@@ -7,19 +8,62 @@ use std::path::Path;
 use crate::error::Error;
 use crate::store::Row;
 
-use super::codec::{cols_to_rows, decode_column_record, encode_insert_rows_direct};
+use super::codec::{decode_lcol_to_rows, encode_insert_rows_lcol};
 use super::types::{
-    LOG_MAGIC_SPARSE, Pack, SNAPSHOT_MAGIC, Snapshot, SnapshotHeader, SnapshotHeaderRef,
-    SnapshotRef,
+    LOG_MAGIC_SPARSE, SNAPSHOT_MAGIC, Snapshot, SnapshotHeader, SnapshotHeaderRef, SnapshotRef,
 };
 use super::wal::{durable_sync, io_err, snapshot_path, sync_dir};
 
+type ShapeCacheSlot = Option<(Vec<String>, std::sync::Arc<crate::store::RowShape>)>;
+
+struct SnapTlsEncode {
+    raw_buf: Vec<u8>,
+    #[cfg(feature = "compress-zstd")]
+    compressor: Option<zstd::bulk::Compressor<'static>>,
+}
+
+impl SnapTlsEncode {
+    const fn new() -> Self {
+        Self {
+            raw_buf: Vec::new(),
+            #[cfg(feature = "compress-zstd")]
+            compressor: None,
+        }
+    }
+}
+
+struct SnapTlsDecode {
+    #[cfg(feature = "compress-zstd")]
+    decompressor: Option<zstd::bulk::Decompressor<'static>>,
+    #[cfg(feature = "compress-zstd")]
+    decomp_buf: Vec<u8>,
+    shape_cache: ShapeCacheSlot,
+}
+
+impl SnapTlsDecode {
+    const fn new() -> Self {
+        Self {
+            #[cfg(feature = "compress-zstd")]
+            decompressor: None,
+            #[cfg(feature = "compress-zstd")]
+            decomp_buf: Vec::new(),
+            shape_cache: None,
+        }
+    }
+}
+
+thread_local! {
+    static SNAP_TLS_ENC: RefCell<SnapTlsEncode> = const { RefCell::new(SnapTlsEncode::new()) };
+    static SNAP_TLS_DEC: RefCell<SnapTlsDecode> = const { RefCell::new(SnapTlsDecode::new()) };
+}
+
 pub fn read_snapshot(dir: &Path) -> Result<Option<Snapshot>, Error> {
     let path = snapshot_path(dir);
-    if !path.exists() {
-        return Ok(None);
-    }
-    let file = fs::File::open(&path).map_err(io_err)?;
+    let file = match fs::File::open(&path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(io_err(e)),
+    };
     let meta = file.metadata().map_err(io_err)?;
     let len = meta.len();
     if len == 0 {
@@ -137,25 +181,34 @@ fn encode_chunked_body<W: std::io::Write>(
         if rows.is_empty() {
             return Ok(Vec::new());
         }
-        let mut col_buf = Vec::new();
-        let raw = if let Some((magic, _)) = encode_insert_rows_direct(0, 0, "", rows, &mut col_buf)
-        {
-            let mut framed = Vec::with_capacity(8 + col_buf.len());
-            framed.extend_from_slice(b"LCOL");
-            framed.extend_from_slice(&magic);
-            framed.extend_from_slice(&col_buf);
-            framed
-        } else {
-            rmp_serde::encode::to_vec_named(rows).map_err(io_err)?
-        };
-        #[cfg(feature = "compress-zstd")]
-        {
-            zstd::encode_all(&raw[..], 1).map_err(io_err)
-        }
-        #[cfg(not(feature = "compress-zstd"))]
-        {
-            Ok(raw)
-        }
+        SNAP_TLS_ENC.with(|cell| {
+            let mut tls = cell.borrow_mut();
+            let SnapTlsEncode {
+                raw_buf,
+                #[cfg(feature = "compress-zstd")]
+                compressor,
+            } = &mut *tls;
+            if !encode_insert_rows_lcol(rows, raw_buf) {
+                raw_buf.clear();
+                rmp_serde::encode::write_named(&mut *raw_buf, rows).map_err(io_err)?;
+            }
+            #[cfg(feature = "compress-zstd")]
+            {
+                if compressor.is_none() {
+                    *compressor = zstd::bulk::Compressor::new(1).ok();
+                }
+                if let Some(comp) = compressor.as_mut()
+                    && let Ok(compressed) = comp.compress(raw_buf)
+                {
+                    return Ok(compressed);
+                }
+                zstd::encode_all(&raw_buf[..], 1).map_err(io_err)
+            }
+            #[cfg(not(feature = "compress-zstd"))]
+            {
+                Ok(raw_buf.clone())
+            }
+        })
     };
 
     let encoded_chunks: Vec<Result<Vec<u8>, Error>> = if chunk_defs.len() > 1 {
@@ -166,13 +219,36 @@ fn encode_chunked_body<W: std::io::Write>(
         }
         #[cfg(not(feature = "parallel"))]
         {
-            std::thread::scope(|s| {
-                let mut handles = Vec::with_capacity(chunk_defs.len());
-                for c in &chunk_defs {
-                    handles.push(s.spawn(move || encode_chunk(c.rows)));
-                }
-                handles.into_iter().map(|h| h.join().unwrap()).collect()
-            })
+            let num_workers = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+                .min(8)
+                .min(chunk_defs.len());
+            if num_workers > 1 {
+                let block_len = chunk_defs.len().div_ceil(num_workers);
+                std::thread::scope(|s| {
+                    let mut handles = Vec::with_capacity(num_workers);
+                    for block in chunk_defs.chunks(block_len) {
+                        handles.push(s.spawn(move || {
+                            let mut part = Vec::with_capacity(block.len());
+                            for c in block {
+                                part.push(encode_chunk(c.rows));
+                            }
+                            part
+                        }));
+                    }
+                    let mut all = Vec::with_capacity(chunk_defs.len());
+                    for h in handles {
+                        match h.join() {
+                            Ok(part) => all.extend(part),
+                            Err(_) => all.push(Err(io_err("snapshot encode worker panicked"))),
+                        }
+                    }
+                    all
+                })
+            } else {
+                chunk_defs.iter().map(|c| encode_chunk(c.rows)).collect()
+            }
         }
     } else {
         chunk_defs.iter().map(|c| encode_chunk(c.rows)).collect()
@@ -491,46 +567,109 @@ pub(super) struct ChunkSlice<'a> {
 
 pub(super) const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
 
-pub(super) fn decode_snapshot_payload(payload: &[u8]) -> Result<Vec<Row>, ()> {
+/// Parse the uncompressed `Frame_Content_Size` from a single-frame Zstandard header (RFC 8878 §3.1.1.1).
+#[cfg(feature = "compress-zstd")]
+#[inline]
+fn zstd_frame_content_size(frame: &[u8]) -> Option<usize> {
+    if frame.len() < 6 || frame[0..4] != ZSTD_MAGIC {
+        return None;
+    }
+    let fhd = frame[4];
+    let fcs_flag = fhd >> 6;
+    let single_segment = (fhd & 0x20) != 0;
+    let dict_id_bytes = match fhd & 0x03 {
+        0 => 0usize,
+        1 => 1,
+        2 => 2,
+        _ => 4,
+    };
+    let off = 5 + usize::from(!single_segment) + dict_id_bytes;
+    let size_u64 = match fcs_flag {
+        0 if single_segment => u64::from(*frame.get(off)?),
+        0 => return None,
+        1 => u64::from(u16::from_le_bytes(frame.get(off..off + 2)?.try_into().ok()?)) + 256,
+        2 => u64::from(u32::from_le_bytes(frame.get(off..off + 4)?.try_into().ok()?)),
+        _ => u64::from_le_bytes(frame.get(off..off + 8)?.try_into().ok()?),
+    };
+    usize::try_from(size_u64).ok()
+}
+
+#[inline]
+fn decode_snapshot_payload_cached(
+    payload: &[u8],
+    shape_cache: &mut ShapeCacheSlot,
+) -> Result<Vec<Row>, ()> {
     if payload.len() >= 8 && &payload[0..4] == b"LCOL" {
         let allow_sparse = payload[4..8] == LOG_MAGIC_SPARSE;
-        let rec = decode_column_record(&payload[8..], allow_sparse)?;
-        if let Pack::InsertCols {
-            fields, cols, n, ..
-        } = rec.pack
-        {
-            return Ok(cols_to_rows(&fields, &cols, n as usize));
-        }
-        return Err(());
+        return decode_lcol_to_rows(&payload[8..], allow_sparse, shape_cache);
     }
     rmp_serde::from_slice(payload).map_err(|_| ())
+}
+
+#[allow(dead_code)]
+pub(super) fn decode_snapshot_payload(payload: &[u8]) -> Result<Vec<Row>, ()> {
+    decode_snapshot_payload_cached(payload, &mut None)
 }
 
 pub(super) fn decode_snapshot_chunk<'a>(c: &ChunkSlice<'a>) -> Result<(&'a str, Vec<Row>), ()> {
     if c.data.is_empty() {
         return Ok((c.name, Vec::new()));
     }
-    if c.data.len() >= 4 && c.data[0..4] == ZSTD_MAGIC {
-        #[cfg(feature = "compress-zstd")]
-        {
-            use std::io::Read;
-            let decoder = zstd::Decoder::new(c.data).map_err(|_| ())?;
-            let mut limited = decoder.take(256 * 1024 * 1024 + 1);
-            let mut decompressed = Vec::with_capacity((c.data.len() * 3).clamp(16 * 1024, 2 * 1024 * 1024));
-            limited.read_to_end(&mut decompressed).map_err(|_| ())?;
-            if decompressed.len() > 256 * 1024 * 1024 {
+    SNAP_TLS_DEC.with(|cell| {
+        let mut tls = cell.borrow_mut();
+        let SnapTlsDecode {
+            #[cfg(feature = "compress-zstd")]
+            decompressor,
+            #[cfg(feature = "compress-zstd")]
+            decomp_buf,
+            shape_cache,
+        } = &mut *tls;
+        if c.data.len() >= 4 && c.data[0..4] == ZSTD_MAGIC {
+            #[cfg(feature = "compress-zstd")]
+            {
+                const MAX_SNAP_CHUNK_RAW: usize = 256 * 1024 * 1024;
+                if let Some(exact_len) = zstd_frame_content_size(c.data) {
+                    if exact_len > MAX_SNAP_CHUNK_RAW {
+                        return Err(());
+                    }
+                    if decompressor.is_none() {
+                        *decompressor = zstd::bulk::Decompressor::new().ok();
+                    }
+                    if let Some(dec) = decompressor.as_mut() {
+                        decomp_buf.clear();
+                        decomp_buf.reserve(exact_len);
+                        if dec.decompress_to_buffer(c.data, decomp_buf).is_ok()
+                            && decomp_buf.len() == exact_len
+                        {
+                            let rows = decode_snapshot_payload_cached(decomp_buf, shape_cache)?;
+                            return Ok((c.name, rows));
+                        }
+                    }
+                }
+                use std::io::Read;
+                let decoder = zstd::Decoder::new(c.data).map_err(|_| ())?;
+                let mut limited = decoder.take((MAX_SNAP_CHUNK_RAW as u64) + 1);
+                decomp_buf.clear();
+                let est = (c.data.len() * 3).clamp(16 * 1024, 2 * 1024 * 1024);
+                if decomp_buf.capacity() < est {
+                    decomp_buf.reserve(est - decomp_buf.capacity());
+                }
+                limited.read_to_end(decomp_buf).map_err(|_| ())?;
+                if decomp_buf.len() > MAX_SNAP_CHUNK_RAW {
+                    return Err(());
+                }
+                let rows = decode_snapshot_payload_cached(decomp_buf, shape_cache)?;
+                return Ok((c.name, rows));
+            }
+            #[cfg(not(feature = "compress-zstd"))]
+            {
+                let _ = shape_cache;
                 return Err(());
             }
-            let rows = decode_snapshot_payload(&decompressed)?;
-            return Ok((c.name, rows));
         }
-        #[cfg(not(feature = "compress-zstd"))]
-        {
-            return Err(());
-        }
-    }
-    let rows = decode_snapshot_payload(c.data)?;
-    Ok((c.name, rows))
+        let rows = decode_snapshot_payload_cached(c.data, shape_cache)?;
+        Ok((c.name, rows))
+    })
 }
 
 pub(super) fn decode_chunked_snapshot(
@@ -636,17 +775,38 @@ pub(super) fn decode_chunked_snapshot(
         chunk_slices.iter().map(decode_snapshot_chunk).collect()
     };
 
+    let mut ok_chunks: Vec<(&str, Vec<Row>)> = Vec::with_capacity(decoded_chunks.len());
+    for res in decoded_chunks {
+        ok_chunks.push(res.ok()?);
+    }
+
     let mut collections: std::collections::BTreeMap<String, Vec<Row>> =
         std::collections::BTreeMap::new();
-    for res in decoded_chunks {
-        let (name, rows) = res.ok()?;
-        if let Some(vec) = collections.get_mut(name) {
-            vec.extend(rows);
+    let mut idx = 0usize;
+    while idx < ok_chunks.len() {
+        let name = ok_chunks[idx].0;
+        let mut end = idx + 1;
+        let mut run_rows = ok_chunks[idx].1.len();
+        while end < ok_chunks.len() && ok_chunks[end].0 == name {
+            run_rows += ok_chunks[end].1.len();
+            end += 1;
+        }
+        if let Some(existing) = collections.get_mut(name) {
+            existing.reserve(run_rows);
+            for (_, part) in &mut ok_chunks[idx..end] {
+                existing.append(part);
+            }
+        } else if end == idx + 1 {
+            let single = std::mem::take(&mut ok_chunks[idx].1);
+            collections.insert(name.to_string(), single);
         } else {
-            let mut vec = Vec::with_capacity(rows.len());
-            vec.extend(rows);
+            let mut vec = Vec::with_capacity(run_rows);
+            for (_, part) in &mut ok_chunks[idx..end] {
+                vec.append(part);
+            }
             collections.insert(name.to_string(), vec);
         }
+        idx = end;
     }
 
     Some(Snapshot {

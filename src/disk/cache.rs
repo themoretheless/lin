@@ -1,8 +1,9 @@
 use std::collections::VecDeque;
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHasher};
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
@@ -67,8 +68,8 @@ struct HotRowShard {
     tail: u32,
     live_rows: usize,
     used_bytes: usize,
-    hits: u64,
-    misses: u64,
+    hits: AtomicU64,
+    misses: AtomicU64,
     evictions: u64,
 }
 
@@ -82,8 +83,8 @@ impl Default for HotRowShard {
             tail: LRU_NONE,
             live_rows: 0,
             used_bytes: 0,
-            hits: 0,
-            misses: 0,
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
             evictions: 0,
         }
     }
@@ -160,9 +161,9 @@ impl HotRowShard {
 
     /// Zero-allocation O(1) L1 cache hit + intrusive array MRU promotion!
     #[inline]
-    fn get(&mut self, hash: u64, table: &str, id: &str) -> Option<Arc<Row>> {
+    fn get_promote(&mut self, hash: u64, table: &str, id: &str) -> Option<Arc<Row>> {
         let Some(idx) = self.find_slot(hash, table, id) else {
-            self.misses += 1;
+            self.misses.fetch_add(1, Ordering::Relaxed);
             return None;
         };
         let out = Arc::clone(&self.slots[idx as usize].row);
@@ -170,7 +171,7 @@ impl HotRowShard {
             self.detach(idx);
             self.push_back_mru(idx);
         }
-        self.hits += 1;
+        self.hits.fetch_add(1, Ordering::Relaxed);
         Some(out)
     }
 
@@ -255,6 +256,21 @@ impl HotRowShard {
         }
     }
 
+    fn invalidate_table(&mut self, table: &str) {
+        if self.live_rows == 0 {
+            return;
+        }
+        let mut to_remove: SmallVec<[u32; 16]> = SmallVec::new();
+        for (i, s) in self.slots.iter().enumerate() {
+            if s.alive && s.table.as_ref() == table {
+                to_remove.push(i as u32);
+            }
+        }
+        for idx in to_remove {
+            self.remove_slot(idx);
+        }
+    }
+
     fn clear(&mut self) {
         self.slots.clear();
         self.free.clear();
@@ -287,7 +303,7 @@ struct HotSecQueryShard {
 /// Bounded, generation-coherent L1 in-memory Hot Cache sitting in front of cold `mmap` segments.
 pub struct HotTierCache {
     cfg: HotCacheConfig,
-    row_shards: [Mutex<HotRowShard>; HOT_ROW_SHARDS],
+    row_shards: [RwLock<HotRowShard>; HOT_ROW_SHARDS],
     sec_shards: [RwLock<HotSecQueryShard>; HOT_ROW_SHARDS],
     vec_queries: RwLock<HotVecQueryCache>,
 }
@@ -296,25 +312,24 @@ impl HotTierCache {
     pub fn new(cfg: HotCacheConfig) -> Self {
         Self {
             cfg,
-            row_shards: std::array::from_fn(|_| Mutex::new(HotRowShard::default())),
+            row_shards: std::array::from_fn(|_| RwLock::new(HotRowShard::default())),
             sec_shards: std::array::from_fn(|_| RwLock::new(HotSecQueryShard::default())),
             vec_queries: RwLock::new(HotVecQueryCache::default()),
         }
     }
 
     #[inline]
+    pub(super) fn is_enabled(&self) -> bool {
+        self.cfg.enabled
+    }
+
+    #[inline]
     fn hash_table_id(table: &str, id: &str) -> u64 {
-        let mut h = 0xcbf29ce484222325u64;
-        for &b in table.as_bytes() {
-            h ^= b as u64;
-            h = h.wrapping_mul(0x100000001b3);
-        }
-        h ^= 0xff;
-        for &b in id.as_bytes() {
-            h ^= b as u64;
-            h = h.wrapping_mul(0x100000001b3);
-        }
-        h
+        let mut h = FxHasher::default();
+        table.as_bytes().hash(&mut h);
+        0xffu8.hash(&mut h);
+        id.as_bytes().hash(&mut h);
+        h.finish()
     }
 
     #[inline]
@@ -324,10 +339,24 @@ impl HotTierCache {
         }
         let h = Self::hash_table_id(table, id);
         let idx = ((h >> 32) as usize ^ (h as usize)) & (HOT_ROW_SHARDS - 1);
-        let Ok(mut shard) = self.row_shards[idx].lock() else {
+        {
+            let Ok(shard) = self.row_shards[idx].read() else {
+                return None;
+            };
+            let Some(slot_idx) = shard.find_slot(h, table, id) else {
+                shard.misses.fetch_add(1, Ordering::Relaxed);
+                return None;
+            };
+            if shard.tail == slot_idx {
+                let out = Arc::clone(&shard.slots[slot_idx as usize].row);
+                shard.hits.fetch_add(1, Ordering::Relaxed);
+                return Some(out);
+            }
+        }
+        let Ok(mut shard) = self.row_shards[idx].write() else {
             return None;
         };
-        shard.get(h, table, id)
+        shard.get_promote(h, table, id)
     }
 
     #[inline]
@@ -340,7 +369,7 @@ impl HotTierCache {
         let approx = estimate_row_bytes(table, id, &row);
         let h = Self::hash_table_id(table, id);
         let idx = ((h >> 32) as usize ^ (h as usize)) & (HOT_ROW_SHARDS - 1);
-        if let Ok(mut shard) = self.row_shards[idx].lock() {
+        if let Ok(mut shard) = self.row_shards[idx].write() {
             shard.insert(h, table, id, row, approx, max_bytes, max_rows);
         }
     }
@@ -352,14 +381,47 @@ impl HotTierCache {
         }
         let h = Self::hash_table_id(table, id);
         let idx = ((h >> 32) as usize ^ (h as usize)) & (HOT_ROW_SHARDS - 1);
-        if let Ok(mut shard) = self.row_shards[idx].lock() {
+        {
+            let Ok(shard) = self.row_shards[idx].read() else {
+                return;
+            };
+            if shard.find_slot(h, table, id).is_none() {
+                return;
+            }
+        }
+        if let Ok(mut shard) = self.row_shards[idx].write() {
             shard.invalidate(h, table, id);
+        }
+    }
+
+    pub(super) fn invalidate_table(&self, table: &str) {
+        if !self.cfg.enabled {
+            return;
+        }
+        for s in &self.row_shards {
+            let has_any = s
+                .read()
+                .ok()
+                .is_some_and(|g| g.live_rows > 0 && g.slots.iter().any(|sl| sl.alive && sl.table.as_ref() == table));
+            if has_any && let Ok(mut guard) = s.write() {
+                guard.invalidate_table(table);
+            }
+        }
+        for s in &self.sec_shards {
+            if let Ok(mut guard) = s.write() {
+                guard.entries.clear();
+                guard.order.clear();
+            }
+        }
+        if let Ok(mut vq) = self.vec_queries.write() {
+            vq.entries.clear();
+            vq.order.clear();
         }
     }
 
     pub(super) fn clear_all(&self) {
         for s in &self.row_shards {
-            if let Ok(mut guard) = s.lock() {
+            if let Ok(mut guard) = s.write() {
                 guard.clear();
             }
         }
@@ -503,11 +565,11 @@ impl HotTierCache {
     pub fn stats(&self) -> HotCacheStats {
         let mut st = HotCacheStats::default();
         for s in &self.row_shards {
-            if let Ok(g) = s.lock() {
+            if let Ok(g) = s.read() {
                 st.used_bytes += g.used_bytes;
                 st.cached_rows += g.live_rows;
-                st.row_hits += g.hits;
-                st.row_misses += g.misses;
+                st.row_hits += g.hits.load(Ordering::Relaxed);
+                st.row_misses += g.misses.load(Ordering::Relaxed);
                 st.row_evictions += g.evictions;
             }
         }
@@ -525,10 +587,11 @@ impl HotTierCache {
     }
 }
 
+#[inline]
 fn estimate_row_bytes(table: &str, id: &str, row: &Row) -> usize {
-    let mut b = 96 + table.len() + id.len();
-    for (k, v) in row {
-        b += 32 + k.len();
+    let cells = row.cells_slice();
+    let mut b = 96 + table.len() + id.len() + cells.len() * 40;
+    for v in cells {
         b += match v {
             Cell::Null | Cell::Bool(_) | Cell::Int(_) | Cell::Float(_) | Cell::Time(_) => 16,
             Cell::SmallText(_) => 24,

@@ -1,6 +1,5 @@
 //! Write-Ahead Log (WAL) framing, locking, atomic file durability, replay, and replication export.
 
-use std::cell::RefCell;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, IoSlice, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -18,10 +17,6 @@ use super::types::{
     LOG_MAGIC_SPARSE, LOG_MAGIC_V1, LOG_MAGIC_V2, LOG_NAME, LogRecord, MAX_RECORD, Pack,
     SNAPSHOT_NAME, SyncMode, V2_FACTS_BULK, V2_INSERT_COLS,
 };
-
-thread_local! {
-    static FRAME_WRITE_SCRATCH: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(64 * 1024));
-}
 
 
 pub fn io_err(e: impl std::fmt::Display) -> Error {
@@ -66,11 +61,11 @@ pub fn fence_path(dir: &Path) -> PathBuf {
 }
 
 pub fn log_len(dir: &Path) -> Result<u64, Error> {
-    let path = log_path(dir);
-    if !path.exists() {
-        return Ok(0);
+    match fs::metadata(log_path(dir)) {
+        Ok(m) => Ok(m.len()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(0),
+        Err(e) => Err(io_err(e)),
     }
-    Ok(fs::metadata(&path).map_err(io_err)?.len())
 }
 
 /// Exclusive advisory lock for a writer (writer↔writer only).
@@ -107,23 +102,27 @@ pub fn acquire_writer_lock(dir: &Path) -> Result<File, Error> {
 pub fn acquire_reader_lock(dir: &Path) -> Result<File, Error> {
     validate_data_dir(dir)?;
     let path = fence_path(dir);
-    if !path.exists() {
-        let lock = lock_path(dir);
-        if !lock.exists() && !dir.exists() {
-            return Err(Error::runtime(format!(
-                "data dir not found: {}",
-                dir.display()
-            )));
+    let f = match OpenOptions::new().read(true).open(&path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let lock = lock_path(dir);
+            if !lock.exists() && !dir.exists() {
+                return Err(Error::runtime(format!(
+                    "data dir not found: {}",
+                    dir.display()
+                )));
+            }
+            let _ = OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&path)
+                .map_err(io_err)?;
+            OpenOptions::new().read(true).open(&path).map_err(io_err)?
         }
-        let _ = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&path)
-            .map_err(io_err)?;
-    }
-    let f = OpenOptions::new().read(true).open(&path).map_err(io_err)?;
+        Err(e) => return Err(io_err(e)),
+    };
     flock_nb(&f, false).map_err(|e| {
         if e.kind() == io::ErrorKind::WouldBlock {
             Error::runtime("data dir checkpoint in progress")
@@ -178,11 +177,11 @@ pub(super) fn flock_nb(_f: &File, _exclusive: bool) -> io::Result<()> {
 }
 
 pub fn read_head(dir: &Path) -> Result<Option<Head>, Error> {
-    let path = head_path(dir);
-    if !path.exists() {
-        return Ok(None);
-    }
-    let bytes = fs::read(&path).map_err(io_err)?;
+    let bytes = match fs::read(head_path(dir)) {
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(io_err(e)),
+    };
     if bytes.is_empty() {
         return Ok(None);
     }
@@ -259,10 +258,12 @@ pub fn write_through_tmp(path: &Path, tmp: &Path, bytes: &[u8]) -> Result<(), Er
 /// Drop `dir`'s `*.bin` files whose stem is not in `keep`, and every `*.tmp`
 /// still sitting there (see [`write_through_tmp`]).
 pub(crate) fn prune_bins(dir: &Path, keep: &[String]) -> Result<(), Error> {
-    if !dir.exists() {
-        return Ok(());
-    }
-    for ent in fs::read_dir(dir).map_err(io_err)? {
+    let rd = match fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(io_err(e)),
+    };
+    for ent in rd {
         let ent = ent.map_err(io_err)?;
         let path = ent.path();
         let extension = path.extension().and_then(|e| e.to_str());
@@ -396,15 +397,11 @@ pub fn open_log(dir: &Path) -> Result<File, Error> {
 /// Open log for read-only replay (no create / no truncate).
 /// Returns `None` if the log file does not exist yet.
 pub fn open_log_read(dir: &Path) -> Result<Option<File>, Error> {
-    let path = log_path(dir);
-    if !path.exists() {
-        return Ok(None);
+    match OpenOptions::new().read(true).open(log_path(dir)) {
+        Ok(f) => Ok(Some(f)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(io_err(e)),
     }
-    OpenOptions::new()
-        .read(true)
-        .open(&path)
-        .map(Some)
-        .map_err(io_err)
 }
 
 /// Append multiple records atomically with parallel encoding — feature-gated optimization
@@ -417,39 +414,31 @@ pub fn append_batch_records(
 ) -> Result<(), Error> {
     use rayon::prelude::*;
 
-    // Encode all records in parallel using rayon
+    // Encode all records in parallel using rayon, framing in-place inside each buffer.
     let encoded: Vec<Result<Vec<u8>, Error>> = records
         .par_iter()
-        .map(|rec| {
+        .enumerate()
+        .map(|(i, rec)| {
             let mut buf = Vec::with_capacity(256);
+            buf.extend_from_slice(&[0u8; 9]);
             rmp_serde::encode::write_named(&mut buf, rec).map_err(io_err)?;
+            let payload_len = buf.len() - 9;
+            if payload_len > MAX_RECORD as usize {
+                return Err(io_err(format!("batch record {} exceeds max size", i)));
+            }
+            let len = payload_len + 5;
+            if len > MAX_RECORD as usize {
+                return Err(io_err("encoded batch exceeds max size"));
+            }
+            finish_in_place_frame_buf(&LOG_MAGIC_V1, &mut buf)?;
             Ok(buf)
         })
         .collect();
 
     // Write all records sequentially to maintain order
-    for (i, result) in encoded.into_iter().enumerate() {
-        let payload = result?;
-
-        if payload.len() > MAX_RECORD as usize {
-            return Err(io_err(format!("batch record {} exceeds max size", i)));
-        }
-
-        // Write with checksum envelope (codec 1 = LOG_MAGIC_V1 MessagePack)
-        let len = payload.len() + 5; // codec byte + payload + CRC
-        if len > MAX_RECORD as usize {
-            return Err(io_err("encoded batch exceeds max size"));
-        }
-
-        let codec = LOG_MAGIC_V1[3];
-        let mut checksum = crate::crc::Hasher::new();
-        checksum.update(&[codec]);
-        checksum.update(&payload);
-        let checksum_bytes = checksum.finalize().to_le_bytes();
-
-        write_frame_bytes(log, codec, &payload, checksum_bytes, len as u32).map_err(io_err)?;
-
-        *log_bytes += 8 + len as u64;
+    for result in encoded {
+        let framed = result?;
+        write_in_place_frame_buf(log, &framed, SyncMode::Normal, log_bytes)?;
     }
 
     if sync == SyncMode::Full {
@@ -510,6 +499,7 @@ pub(crate) fn append_record_v1_ref(
     log_bytes: &mut u64,
 ) -> Result<(), Error> {
     buf.clear();
+    buf.extend_from_slice(&[0u8; 9]);
     rmp_serde::encode::write_named(
         buf,
         &LogRecordRef {
@@ -519,10 +509,10 @@ pub(crate) fn append_record_v1_ref(
         },
     )
     .map_err(io_err)?;
-    if buf.len() > MAX_RECORD as usize {
+    if buf.len() - 9 > MAX_RECORD as usize {
         return Err(io_err("log record exceeds 16MiB"));
     }
-    write_frame(log, &LOG_MAGIC_V1, buf, sync, log_bytes)
+    finish_in_place_frame(log, &LOG_MAGIC_V1, buf, sync, log_bytes)
 }
 
 pub(super) fn append_record_v1(
@@ -581,34 +571,73 @@ pub(super) fn write_frame_bytes(
     checksum: [u8; 4],
     len: u32,
 ) -> io::Result<()> {
-    const INLINE_MAX: usize = 64 * 1024 - 16;
     if payload.len() >= 64 * 1024 {
         reserve_wal_space(log, payload.len().saturating_add(13), false);
     }
-    if payload.len() <= INLINE_MAX {
-        FRAME_WRITE_SCRATCH.with(|cell| {
-            let mut scratch = cell.borrow_mut();
-            scratch.clear();
-            scratch.reserve(8 + 1 + payload.len() + 4);
-            scratch.extend_from_slice(&LOG_MAGIC_CHECKSUM);
-            scratch.extend_from_slice(&len.to_le_bytes());
-            scratch.push(codec_byte);
-            scratch.extend_from_slice(payload);
-            scratch.extend_from_slice(&checksum);
-            log.write_all(&scratch)
-        })
-    } else {
-        let mut hdr = [0u8; 9];
-        hdr[..4].copy_from_slice(&LOG_MAGIC_CHECKSUM);
-        hdr[4..8].copy_from_slice(&len.to_le_bytes());
-        hdr[8] = codec_byte;
-        let slices = [
-            IoSlice::new(&hdr),
-            IoSlice::new(payload),
-            IoSlice::new(&checksum),
-        ];
-        write_all_vectored(log, &slices)
+    let mut hdr = [0u8; 9];
+    hdr[..4].copy_from_slice(&LOG_MAGIC_CHECKSUM);
+    hdr[4..8].copy_from_slice(&len.to_le_bytes());
+    hdr[8] = codec_byte;
+    let slices = [
+        IoSlice::new(&hdr),
+        IoSlice::new(payload),
+        IoSlice::new(&checksum),
+    ];
+    write_all_vectored(log, &slices)
+}
+
+/// Complete an in-place `LIN\x06` WAL frame inside `buf` where `buf[0..9]` was reserved
+/// before encoding the payload into `buf[9..]`, computing the single-slice CRC32C over
+/// `&buf[8..]` and appending the 4-byte LE trailer without copying the payload.
+#[inline]
+pub(super) fn finish_in_place_frame_buf(
+    magic: &[u8; 4],
+    buf: &mut Vec<u8>,
+) -> Result<[u8; 4], Error> {
+    debug_assert!(buf.len() >= 9);
+    let payload_len = buf.len() - 9;
+    let Some(len) = payload_len
+        .checked_add(5)
+        .filter(|&n| n <= MAX_RECORD as usize)
+    else {
+        return Err(io_err("log record exceeds 16MiB"));
+    };
+    buf[..4].copy_from_slice(&LOG_MAGIC_CHECKSUM);
+    buf[4..8].copy_from_slice(&(len as u32).to_le_bytes());
+    buf[8] = magic[3];
+    let crc = crate::crc::hardware_crc32c(&buf[8..]).to_le_bytes();
+    buf.extend_from_slice(&crc);
+    Ok(crc)
+}
+
+#[inline]
+pub(super) fn write_in_place_frame_buf(
+    log: &mut File,
+    framed: &[u8],
+    sync: SyncMode,
+    log_bytes: &mut u64,
+) -> Result<(), Error> {
+    if framed.len() >= 64 * 1024 + 13 {
+        reserve_wal_space(log, framed.len(), false);
     }
+    log.write_all(framed).map_err(io_err)?;
+    if sync == SyncMode::Full {
+        durable_sync(log).map_err(io_err)?;
+    }
+    *log_bytes += framed.len() as u64;
+    Ok(())
+}
+
+#[inline]
+pub(super) fn finish_in_place_frame(
+    log: &mut File,
+    magic: &[u8; 4],
+    buf: &mut Vec<u8>,
+    sync: SyncMode,
+    log_bytes: &mut u64,
+) -> Result<(), Error> {
+    finish_in_place_frame_buf(magic, buf)?;
+    write_in_place_frame_buf(log, buf, sync, log_bytes)
 }
 
 pub(crate) fn compute_frame_checksum(magic: &[u8; 4], payload: &[u8]) -> [u8; 4] {
@@ -748,15 +777,28 @@ pub(super) fn replay_from(
 ) -> Result<u64, ReplayFail> {
     log.seek(SeekFrom::Start(start))
         .map_err(|e| ReplayFail::Io(io_err(e)))?;
+    if start >= file_len {
+        return Ok(start);
+    }
+    let cap = (file_len - start).clamp(4096, 128 * 1024) as usize;
+    let mut reader = io::BufReader::with_capacity(cap, log);
+    let skip_up_to = (min_gen > 0).then_some(min_gen);
     let mut pos = start;
     let mut saw_any = false;
     let mut buf = Vec::with_capacity(8192);
     loop {
-        match read_one(log, file_len, pos, &mut buf) {
+        match read_one_reader(&mut reader, file_len, pos, skip_up_to, &mut buf) {
             ReadOne::Eof | ReadOne::Truncated => break,
             ReadOne::Corrupt if !saw_any && start > 0 => return Err(ReplayFail::BadStart),
             ReadOne::Corrupt => return Err(ReplayFail::Io(io_err("corrupt log record"))),
             ReadOne::Io(e) => return Err(ReplayFail::Io(e)),
+            ReadOne::Skipped { rec_gen, next } => {
+                saw_any = true;
+                if let Some(idx) = wal_index.as_deref_mut() {
+                    idx.push((rec_gen, pos));
+                }
+                pos = next;
+            }
             ReadOne::Ok { rec, next } => {
                 saw_any = true;
                 if let Some(idx) = wal_index.as_deref_mut() {
@@ -774,13 +816,25 @@ pub(super) fn replay_from(
 
 pub(super) enum ReadOne {
     Ok { rec: LogRecord, next: u64 },
+    Skipped { rec_gen: u64, next: u64 },
     Eof,
     Truncated,
     Corrupt,
     Io(Error),
 }
 
+#[allow(dead_code)]
 pub(super) fn read_one(log: &mut File, file_len: u64, pos: u64, buf: &mut Vec<u8>) -> ReadOne {
+    read_one_reader(log, file_len, pos, None, buf)
+}
+
+pub(super) fn read_one_reader<R: Read>(
+    log: &mut R,
+    file_len: u64,
+    pos: u64,
+    skip_up_to: Option<u64>,
+    buf: &mut Vec<u8>,
+) -> ReadOne {
     if pos >= file_len {
         return ReadOne::Eof;
     }
@@ -790,7 +844,7 @@ pub(super) fn read_one(log: &mut File, file_len: u64, pos: u64, buf: &mut Vec<u8
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return ReadOne::Truncated,
         Err(e) => return ReadOne::Io(io_err(e)),
     }
-    // v1/v2 framed: magic + u32 len + payload
+    // v1/v2/v3 framed: magic + u32 len + payload
     if head == LOG_MAGIC_V1 || head == LOG_MAGIC_V2 || head == LOG_MAGIC_CHECKSUM {
         let mut len_buf = [0u8; 4];
         match log.read_exact(&mut len_buf) {
@@ -817,6 +871,26 @@ pub(super) fn read_one(log: &mut File, file_len: u64, pos: u64, buf: &mut Vec<u8
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return ReadOne::Truncated,
             Err(e) => return ReadOne::Io(io_err(e)),
+        }
+        if let Some(max_skip_gen) = skip_up_to
+            && head == LOG_MAGIC_CHECKSUM
+            && len >= 14
+            && matches!(buf[8], 2 | 3 | 5)
+            && let Some(rec_gen) = peek_column_gen(&buf[9..18])
+            && rec_gen > 0
+            && rec_gen <= max_skip_gen
+        {
+            let crc_off = buf.len() - 4;
+            let expected = u32::from_le_bytes(buf[crc_off..].try_into().unwrap());
+            let body = &buf[8..crc_off];
+            let hw_crc = crate::crc::hardware_crc32c(body);
+            if hw_crc == expected || crc32fast::hash(body) == expected {
+                return ReadOne::Skipped {
+                    rec_gen,
+                    next: pos + 8 + need,
+                };
+            }
+            return ReadOne::Corrupt;
         }
         let rec = match decode_frame(&head, &buf[8..]) {
             Ok(r) => r,
@@ -943,7 +1017,7 @@ pub fn export_wal_since_indexed(
 
 /// Export raw WAL frames with `gen > since_gen` (network / follower shipping).
 pub fn export_wal_since(dir: &Path, since_gen: u64) -> Result<Vec<u8>, Error> {
-    let mut log = match open_log_read(dir)? {
+    let log = match open_log_read(dir)? {
         Some(f) => f,
         None => return Ok(Vec::new()),
     };
@@ -951,6 +1025,9 @@ pub fn export_wal_since(dir: &Path, since_gen: u64) -> Result<Vec<u8>, Error> {
     if file_len == 0 {
         return Ok(Vec::new());
     }
+    let cap = file_len.clamp(4096, 128 * 1024) as usize;
+    let mut reader = io::BufReader::with_capacity(cap, log);
+    let skip_up_to = (since_gen > 0).then_some(since_gen);
     let mut out = Vec::with_capacity(file_len.min(64 * 1024) as usize);
     let mut pos = 0u64;
     let mut buf = Vec::with_capacity(8192);
@@ -958,47 +1035,13 @@ pub fn export_wal_since(dir: &Path, since_gen: u64) -> Result<Vec<u8>, Error> {
         if pos >= file_len {
             break;
         }
-        // Fast header + CRC check for modern LIN\x06 + v2/sparse/dict frames when skipping old generations,
-        // avoiding full LogRecord / vector / BTreeMap deserialization while preserving corruption detection.
-        let mut hdr = [0u8; 18];
-        if pos + 18 <= file_len
-            && log.seek(SeekFrom::Start(pos)).is_ok()
-            && log.read_exact(&mut hdr).is_ok()
-        {
-            let magic: [u8; 4] = hdr[0..4].try_into().unwrap();
-            let len = u32::from_le_bytes(hdr[4..8].try_into().unwrap());
-            let next = pos + 8 + u64::from(len);
-            if magic == LOG_MAGIC_CHECKSUM
-                && len >= 14
-                && len <= MAX_RECORD
-                && next <= file_len
-                && matches!(hdr[8], 2 | 3 | 5)
-                && let Some(rec_gen) = peek_column_gen(&hdr[9..18])
-                && rec_gen <= since_gen
-            {
-                let payload_len = len as usize;
-                buf.resize(payload_len, 0);
-                buf[..10].copy_from_slice(&hdr[8..18]);
-                if log.read_exact(&mut buf[10..]).is_ok() {
-                    let end = payload_len - 4;
-                    let expected = u32::from_le_bytes(buf[end..].try_into().unwrap());
-                    let hw_crc = crate::crc::hardware_crc32c(&buf[..end]);
-                    if hw_crc == expected || crc32fast::hash(&buf[..end]) == expected {
-                        pos = next;
-                        continue;
-                    }
-                    return Err(io_err("corrupt log"));
-                }
-            }
-            let _ = log.seek(SeekFrom::Start(pos));
-        } else {
-            let _ = log.seek(SeekFrom::Start(pos));
-        }
-
-        match read_one(&mut log, file_len, pos, &mut buf) {
+        match read_one_reader(&mut reader, file_len, pos, skip_up_to, &mut buf) {
             ReadOne::Eof | ReadOne::Truncated => break,
             ReadOne::Corrupt => return Err(io_err("corrupt log")),
             ReadOne::Io(e) => return Err(e),
+            ReadOne::Skipped { next, .. } => {
+                pos = next;
+            }
             ReadOne::Ok { rec, next } => {
                 if rec.r#gen > since_gen {
                     if let Some(expanded_pack) = expand_segment_pack_for_export(dir, &rec.pack)? {
@@ -1007,19 +1050,20 @@ pub fn export_wal_since(dir: &Path, since_gen: u64) -> Result<Vec<u8>, Error> {
                             next_id: rec.next_id,
                             pack: expanded_pack,
                         };
-                        let payload = rmp_serde::to_vec_named(&expanded_rec).map_err(io_err)?;
-                        let len = payload
-                            .len()
+                        let start = out.len();
+                        out.extend_from_slice(&[0u8; 9]);
+                        rmp_serde::encode::write_named(&mut out, &expanded_rec).map_err(io_err)?;
+                        let payload_len = out.len() - start - 9;
+                        let len = payload_len
                             .checked_add(5)
                             .and_then(|n| u32::try_from(n).ok())
                             .filter(|&n| n <= MAX_RECORD)
                             .ok_or_else(|| io_err("exported segment record exceeds 16MiB"))?;
-                        let checksum = compute_frame_checksum(&LOG_MAGIC_V1, &payload);
-                        out.extend_from_slice(&LOG_MAGIC_CHECKSUM);
-                        out.extend_from_slice(&len.to_le_bytes());
-                        out.push(LOG_MAGIC_V1[3]);
-                        out.extend_from_slice(&payload);
-                        out.extend_from_slice(&checksum);
+                        out[start..start + 4].copy_from_slice(&LOG_MAGIC_CHECKSUM);
+                        out[start + 4..start + 8].copy_from_slice(&len.to_le_bytes());
+                        out[start + 8] = LOG_MAGIC_V1[3];
+                        let crc = crate::crc::hardware_crc32c(&out[start + 8..]).to_le_bytes();
+                        out.extend_from_slice(&crc);
                     } else {
                         out.extend_from_slice(&buf);
                     }
@@ -1036,7 +1080,7 @@ pub fn export_wal_since(dir: &Path, since_gen: u64) -> Result<Vec<u8>, Error> {
 /// and replica lag bounds.
 pub fn peek_wal_bounds(dir: &Path) -> Result<(u64, Option<u64>, u64), Error> {
     let head_gen = super::wal::read_head(dir)?.map(|h| h.r#gen).unwrap_or(0);
-    let mut log = match open_log_read(dir)? {
+    let log = match open_log_read(dir)? {
         Some(f) => f,
         None => return Ok((head_gen, None, head_gen)),
     };
@@ -1044,6 +1088,8 @@ pub fn peek_wal_bounds(dir: &Path) -> Result<(u64, Option<u64>, u64), Error> {
     if file_len == 0 {
         return Ok((head_gen, None, head_gen));
     }
+    let cap = file_len.clamp(4096, 64 * 1024) as usize;
+    let mut reader = io::BufReader::with_capacity(cap, log);
     let mut first_wal_gen: Option<u64> = None;
     let mut latest_gen = head_gen;
     let mut pos = 0u64;
@@ -1052,44 +1098,99 @@ pub fn peek_wal_bounds(dir: &Path) -> Result<(u64, Option<u64>, u64), Error> {
         if pos >= file_len {
             break;
         }
-        let mut hdr = [0u8; 18];
-        if pos + 18 <= file_len
-            && log.seek(SeekFrom::Start(pos)).is_ok()
-            && log.read_exact(&mut hdr).is_ok()
-        {
-            let magic: [u8; 4] = hdr[0..4].try_into().unwrap();
-            let len = u32::from_le_bytes(hdr[4..8].try_into().unwrap());
-            let next = pos + 8 + u64::from(len);
-            if magic == LOG_MAGIC_CHECKSUM
-                && len >= 14
-                && len <= MAX_RECORD
-                && next <= file_len
-                && matches!(hdr[8], 2 | 3 | 5)
-                && let Some(rec_gen) = peek_column_gen(&hdr[9..18])
-            {
-                if first_wal_gen.is_none() {
-                    first_wal_gen = Some(rec_gen);
-                }
-                latest_gen = latest_gen.max(rec_gen);
-                pos = next;
-                continue;
-            }
-            let _ = log.seek(SeekFrom::Start(pos));
-        } else {
-            let _ = log.seek(SeekFrom::Start(pos));
+        let mut head = [0u8; 4];
+        match reader.read_exact(&mut head) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(io_err(e)),
         }
-        match read_one(&mut log, file_len, pos, &mut buf) {
-            ReadOne::Eof | ReadOne::Truncated => break,
-            ReadOne::Corrupt => return Err(io_err("corrupt log")),
-            ReadOne::Io(e) => return Err(e),
-            ReadOne::Ok { rec, next } => {
-                if first_wal_gen.is_none() {
-                    first_wal_gen = Some(rec.r#gen);
-                }
-                latest_gen = latest_gen.max(rec.r#gen);
-                pos = next;
+        if head == LOG_MAGIC_V1 || head == LOG_MAGIC_V2 || head == LOG_MAGIC_CHECKSUM {
+            let mut len_buf = [0u8; 4];
+            match reader.read_exact(&mut len_buf) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(io_err(e)),
             }
+            let len = u32::from_le_bytes(len_buf);
+            if len == 0 || len > MAX_RECORD {
+                if u64::from(len) > file_len.saturating_sub(pos + 8) || len == 0 {
+                    break;
+                }
+                return Err(io_err("corrupt log"));
+            }
+            let need = u64::from(len);
+            let next = pos + 8 + need;
+            if next > file_len {
+                break;
+            }
+            if head == LOG_MAGIC_CHECKSUM && len >= 14 {
+                let mut peek = [0u8; 10];
+                match reader.read_exact(&mut peek) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                    Err(e) => return Err(io_err(e)),
+                }
+                if matches!(peek[0], 2 | 3 | 5)
+                    && let Some(rec_gen) = peek_column_gen(&peek[1..10])
+                {
+                    reader
+                        .seek_relative(i64::from(len - 10))
+                        .map_err(io_err)?;
+                    if first_wal_gen.is_none() {
+                        first_wal_gen = Some(rec_gen);
+                    }
+                    latest_gen = latest_gen.max(rec_gen);
+                    pos = next;
+                    continue;
+                }
+                buf.resize(len as usize, 0);
+                buf[..10].copy_from_slice(&peek);
+                match reader.read_exact(&mut buf[10..]) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                    Err(e) => return Err(io_err(e)),
+                }
+            } else {
+                buf.resize(len as usize, 0);
+                match reader.read_exact(&mut buf) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                    Err(e) => return Err(io_err(e)),
+                }
+            }
+            let rec = decode_frame(&head, &buf).map_err(|_| io_err("corrupt log"))?;
+            if first_wal_gen.is_none() {
+                first_wal_gen = Some(rec.r#gen);
+            }
+            latest_gen = latest_gen.max(rec.r#gen);
+            pos = next;
+            continue;
         }
+        let len = u32::from_le_bytes(head);
+        if len == 0 || len > MAX_RECORD {
+            let remaining = file_len.saturating_sub(pos + 4);
+            if u64::from(len) > remaining || len == 0 {
+                break;
+            }
+            return Err(io_err("corrupt log"));
+        }
+        let need = u64::from(len);
+        let next = pos + 4 + need;
+        if next > file_len {
+            break;
+        }
+        buf.resize(len as usize, 0);
+        match reader.read_exact(&mut buf) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(io_err(e)),
+        }
+        let rec = serde_json::from_slice::<LogRecord>(&buf).map_err(|_| io_err("corrupt log"))?;
+        if first_wal_gen.is_none() {
+            first_wal_gen = Some(rec.r#gen);
+        }
+        latest_gen = latest_gen.max(rec.r#gen);
+        pos = next;
     }
     Ok((head_gen, first_wal_gen, latest_gen))
 }

@@ -345,21 +345,29 @@ const SHA256_K: [u32; 64] = [
     0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
 ];
 
-fn sha256(data: &[u8]) -> [u8; 32] {
-    let mut state: [u32; 8] = [
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
-        0x5be0cd19,
-    ];
-    let bit_len = (data.len() as u64).wrapping_mul(8);
-    let mut buf = Vec::with_capacity(data.len() + 72);
-    buf.extend_from_slice(data);
-    buf.push(0x80);
-    while (buf.len() % 64) != 56 {
-        buf.push(0);
-    }
-    buf.extend_from_slice(&bit_len.to_be_bytes());
+struct Sha256 {
+    state: [u32; 8],
+    buf: [u8; 64],
+    buf_len: usize,
+    total_bytes: u64,
+}
 
-    for block in buf.chunks_exact(64) {
+impl Sha256 {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            state: [
+                0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+                0x5be0cd19,
+            ],
+            buf: [0u8; 64],
+            buf_len: 0,
+            total_bytes: 0,
+        }
+    }
+
+    #[inline]
+    fn compress_block(state: &mut [u32; 8], block: &[u8; 64]) {
         let mut w = [0u32; 64];
         for i in 0..16 {
             let j = i * 4;
@@ -373,7 +381,7 @@ fn sha256(data: &[u8]) -> [u8; 32] {
                 .wrapping_add(w[i - 7])
                 .wrapping_add(s1);
         }
-        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = state;
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = *state;
         for i in 0..64 {
             let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
             let ch = (e & f) ^ ((!e) & g);
@@ -401,31 +409,91 @@ fn sha256(data: &[u8]) -> [u8; 32] {
         }
     }
 
-    let mut out = [0u8; 32];
-    for (i, word) in state.iter().enumerate() {
-        out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+    fn update(&mut self, mut data: &[u8]) {
+        self.total_bytes = self.total_bytes.wrapping_add(data.len() as u64);
+        if self.buf_len > 0 {
+            let need = 64 - self.buf_len;
+            if data.len() < need {
+                self.buf[self.buf_len..self.buf_len + data.len()].copy_from_slice(data);
+                self.buf_len += data.len();
+                return;
+            }
+            self.buf[self.buf_len..64].copy_from_slice(&data[..need]);
+            Self::compress_block(&mut self.state, &self.buf);
+            self.buf_len = 0;
+            data = &data[need..];
+        }
+        let mut chunks = data.chunks_exact(64);
+        for chunk in &mut chunks {
+            let block: &[u8; 64] = chunk.try_into().unwrap();
+            Self::compress_block(&mut self.state, block);
+        }
+        let rem = chunks.remainder();
+        if !rem.is_empty() {
+            self.buf[..rem.len()].copy_from_slice(rem);
+            self.buf_len = rem.len();
+        }
     }
-    out
+
+    fn finalize(mut self) -> [u8; 32] {
+        let bit_len = self.total_bytes.wrapping_mul(8);
+        self.buf[self.buf_len] = 0x80;
+        self.buf_len += 1;
+        if self.buf_len > 56 {
+            self.buf[self.buf_len..64].fill(0);
+            Self::compress_block(&mut self.state, &self.buf);
+            self.buf[..56].fill(0);
+        } else {
+            self.buf[self.buf_len..56].fill(0);
+        }
+        self.buf[56..64].copy_from_slice(&bit_len.to_be_bytes());
+        Self::compress_block(&mut self.state, &self.buf);
+
+        let mut out = [0u8; 32];
+        for (i, word) in self.state.iter().enumerate() {
+            out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+        }
+        out
+    }
+}
+
+fn sha256(data: &[u8]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(data);
+    h.finalize()
+}
+
+fn hmac_sha256_key_parts(key_a: &[u8], key_b: &[u8], data: &[u8]) -> [u8; 32] {
+    let mut key_block = [0u8; 64];
+    let total_klen = key_a.len() + key_b.len();
+    if total_klen > 64 {
+        let mut kh = Sha256::new();
+        kh.update(key_a);
+        kh.update(key_b);
+        key_block[..32].copy_from_slice(&kh.finalize());
+    } else {
+        key_block[..key_a.len()].copy_from_slice(key_a);
+        key_block[key_a.len()..total_klen].copy_from_slice(key_b);
+    }
+    let mut ipad = [0u8; 64];
+    let mut opad = [0u8; 64];
+    for i in 0..64 {
+        ipad[i] = key_block[i] ^ 0x36;
+        opad[i] = key_block[i] ^ 0x5c;
+    }
+    let mut inner = Sha256::new();
+    inner.update(&ipad);
+    inner.update(data);
+    let inner_hash = inner.finalize();
+
+    let mut outer = Sha256::new();
+    outer.update(&opad);
+    outer.update(&inner_hash);
+    outer.finalize()
 }
 
 fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
-    let mut key_block = [0u8; 64];
-    if key.len() > 64 {
-        let hashed = sha256(key);
-        key_block[..32].copy_from_slice(&hashed);
-    } else {
-        key_block[..key.len()].copy_from_slice(key);
-    }
-    let mut inner = Vec::with_capacity(64 + data.len());
-    let mut outer = Vec::with_capacity(96);
-    for &b in &key_block {
-        inner.push(b ^ 0x36);
-        outer.push(b ^ 0x5c);
-    }
-    inner.extend_from_slice(data);
-    let inner_hash = sha256(&inner);
-    outer.extend_from_slice(&inner_hash);
-    sha256(&outer)
+    hmac_sha256_key_parts(key, &[], data)
 }
 
 fn hex_lower(bytes: &[u8]) -> String {
@@ -479,10 +547,7 @@ fn uri_encode(input: &str, encode_slash: bool) -> String {
 }
 
 fn sigv4_signing_key(secret: &str, date: &str, region: &str, service: &str) -> [u8; 32] {
-    let mut k_secret = Vec::with_capacity(4 + secret.len());
-    k_secret.extend_from_slice(b"AWS4");
-    k_secret.extend_from_slice(secret.as_bytes());
-    let k_date = hmac_sha256(&k_secret, date.as_bytes());
+    let k_date = hmac_sha256_key_parts(b"AWS4", secret.as_bytes(), date.as_bytes());
     let k_region = hmac_sha256(&k_date, region.as_bytes());
     let k_service = hmac_sha256(&k_region, service.as_bytes());
     hmac_sha256(&k_service, b"aws4_request")
@@ -1068,7 +1133,12 @@ fn parse_list_v2_xml(xml: &str) -> ListV2Page {
 
 /// Pack a local immutable `DiskSegment` directory into one self-verifying `LSEG\x01` bundle.
 pub fn pack_segment_dir(seg_dir: &Path) -> Result<Vec<u8>, Error> {
-    let mut files: Vec<String> = Vec::new();
+    let (out, _) = pack_segment_dir_with_crc(seg_dir)?;
+    Ok(out)
+}
+
+fn pack_segment_dir_with_crc(seg_dir: &Path) -> Result<(Vec<u8>, u32), Error> {
+    let mut files: Vec<(String, u64)> = Vec::new();
     for ent in fs::read_dir(seg_dir).map_err(io_err)? {
         let ent = ent.map_err(io_err)?;
         let meta = ent.metadata().map_err(io_err)?;
@@ -1079,37 +1149,81 @@ pub fn pack_segment_dir(seg_dir: &Path) -> Result<Vec<u8>, Error> {
             .file_name()
             .into_string()
             .map_err(|_| Error::runtime("non-UTF8 file name in disk segment"))?;
-        files.push(name);
+        files.push((name, meta.len()));
     }
-    files.sort();
-    let mut out = Vec::with_capacity(4096);
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut total_cap: usize = LSEG_MAGIC.len() + 4 + FRAME_CRC_TAG.len() + 4;
+    for (name, flen) in &files {
+        total_cap = total_cap
+            .saturating_add(2 + name.len() + 8)
+            .saturating_add(*flen as usize);
+    }
+    let mut out = Vec::with_capacity(total_cap);
     out.extend_from_slice(LSEG_MAGIC);
     out.extend_from_slice(&(files.len() as u32).to_le_bytes());
-    for name in files {
-        let data = fs::read(seg_dir.join(&name)).map_err(io_err)?;
+    for (name, flen) in files {
         let nbytes = name.as_bytes();
         let nlen = u16::try_from(nbytes.len())
             .map_err(|_| Error::runtime("segment file name exceeds u16::MAX"))?;
         out.extend_from_slice(&nlen.to_le_bytes());
         out.extend_from_slice(nbytes);
-        out.extend_from_slice(&(data.len() as u64).to_le_bytes());
-        out.extend_from_slice(&data);
+        let len_slot_pos = out.len();
+        out.extend_from_slice(&flen.to_le_bytes());
+        let data_start = out.len();
+        let mut f = File::open(seg_dir.join(&name)).map_err(io_err)?;
+        f.read_to_end(&mut out).map_err(io_err)?;
+        let actual_len = (out.len() - data_start) as u64;
+        if actual_len != flen {
+            out[len_slot_pos..len_slot_pos + 8].copy_from_slice(&actual_len.to_le_bytes());
+        }
     }
-    let crc = hardware_crc32c(&out);
+    let mut hasher = crate::crc::Hasher::new();
+    hasher.update(&out);
+    let body_crc = hasher.finalize();
     out.extend_from_slice(FRAME_CRC_TAG);
-    out.extend_from_slice(&crc.to_le_bytes());
-    Ok(out)
+    out.extend_from_slice(&body_crc.to_le_bytes());
+    hasher.update(&out[out.len() - 8..]);
+    let bundle_crc = hasher.finalize();
+    Ok((out, bundle_crc))
 }
 
 /// Verify `LSEG\x01` + `LCRC` integrity first, then atomically extract into `dst_dir`.
 pub fn unpack_segment_dir(bytes: &[u8], dst_dir: &Path) -> Result<(), Error> {
+    unpack_segment_dir_checked(bytes, dst_dir, None)
+}
+
+fn unpack_segment_dir_checked(
+    bytes: &[u8],
+    dst_dir: &Path,
+    expected_bundle_crc: Option<(u64, u32)>,
+) -> Result<(), Error> {
     if bytes.len() < LSEG_MAGIC.len() + 4 + FRAME_CRC_TAG.len() + 4 {
+        if let Some((seg_id, exp_bundle_crc)) = expected_bundle_crc
+            && hardware_crc32c(bytes) != exp_bundle_crc
+        {
+            return Err(Error::runtime(format!(
+                "remote segment seg_{seg_id:08} CRC mismatch against manifest"
+            )));
+        }
         return Err(Error::runtime("truncated LSEG segment bundle"));
+    }
+    let crc_off = bytes.len() - 8;
+    let mut hasher = crate::crc::Hasher::new();
+    hasher.update(&bytes[..crc_off]);
+    let actual_crc = hasher.finalize();
+    if let Some((seg_id, exp_bundle_crc)) = expected_bundle_crc {
+        let mut bundle_hasher = hasher;
+        bundle_hasher.update(&bytes[crc_off..]);
+        if bundle_hasher.finalize() != exp_bundle_crc {
+            return Err(Error::runtime(format!(
+                "remote segment seg_{seg_id:08} CRC mismatch against manifest"
+            )));
+        }
     }
     if &bytes[..LSEG_MAGIC.len()] != LSEG_MAGIC {
         return Err(Error::runtime("invalid LSEG magic"));
     }
-    let crc_off = bytes.len() - 8;
     if &bytes[crc_off..crc_off + 4] != FRAME_CRC_TAG {
         return Err(Error::runtime("missing LCRC trailer in LSEG bundle"));
     }
@@ -1119,7 +1233,6 @@ pub fn unpack_segment_dir(bytes: &[u8], dst_dir: &Path) -> Result<(), Error> {
         bytes[crc_off + 6],
         bytes[crc_off + 7],
     ]);
-    let actual_crc = hardware_crc32c(&bytes[..crc_off]);
     if expected_crc != actual_crc {
         return Err(Error::runtime(format!(
             "corrupt LSEG segment bundle (crc expected {expected_crc:#010x}, got {actual_crc:#010x})"
@@ -1467,8 +1580,7 @@ impl DiskEngine {
                 .dir
                 .join(SEGMENTS_DIR)
                 .join(format!("seg_{:08}", meta.seg_id));
-            let bundle = pack_segment_dir(&seg_dir)?;
-            let seg_crc = hardware_crc32c(&bundle);
+            let (bundle, seg_crc) = pack_segment_dir_with_crc(&seg_dir)?;
             let seg_key = object_key(
                 &norm_prefix,
                 &format!("segments/seg_{:08}.lseg", meta.seg_id),
@@ -1697,16 +1809,12 @@ impl DiskEngine {
                     let bundle = rt.inner.store.get(&seg_key)?.ok_or_else(|| {
                         Error::runtime(format!("remote cold segment {seg_key:?} missing"))
                     })?;
-                    if let Some(entry) = rt.inner.seg_entries.get(&meta.seg_id) {
-                        let actual_crc = hardware_crc32c(&bundle);
-                        if actual_crc != entry.bundle_crc32c {
-                            return Err(Error::runtime(format!(
-                                "remote segment seg_{:08} CRC mismatch against manifest",
-                                meta.seg_id
-                            )));
-                        }
-                    }
-                    unpack_segment_dir(&bundle, &seg_dir)?;
+                    let exp_bundle_crc = rt
+                        .inner
+                        .seg_entries
+                        .get(&meta.seg_id)
+                        .map(|entry| (meta.seg_id, entry.bundle_crc32c));
+                    unpack_segment_dir_checked(&bundle, &seg_dir, exp_bundle_crc)?;
                     downloaded_dirs.push(seg_dir.clone());
                 }
                 total_bytes = total_bytes.saturating_add(dir_size_bytes(&seg_dir)?);
@@ -1728,7 +1836,7 @@ impl DiskEngine {
         };
 
         self.segments.insert(table.to_string(), opened);
-        self.hot_cache.clear_all();
+        self.hot_cache.invalidate_table(table);
         rt.touch_table(table, total_bytes);
         if rt.inner.cfg.max_local_bytes > 0
             && rt.local_bytes() > rt.inner.cfg.max_local_bytes
@@ -1778,7 +1886,7 @@ impl DiskEngine {
                     }
                 }
                 rt.record_evicted(&cand);
-                self.hot_cache.clear_all();
+                self.hot_cache.invalidate_table(&cand);
             }
         }
         let _ = evicted_bytes;

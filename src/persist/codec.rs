@@ -14,8 +14,9 @@ use super::types::{
     V2_FACTS_BULK, V2_INSERT_COLS,
 };
 use super::wal::{
-    append_record, append_record_v1, compute_frame_checksum, durable_sync, io_err,
-    reserve_wal_space, write_all_vectored, write_frame, write_frame_precomputed,
+    append_record, append_record_v1, durable_sync, finish_in_place_frame,
+    finish_in_place_frame_buf, io_err, reserve_wal_space, write_all_vectored,
+    write_in_place_frame_buf,
 };
 
 #[inline(always)]
@@ -88,7 +89,8 @@ pub(super) fn append_facts_v2(
 ) -> Result<(), Error> {
     let n = s.len().min(p.len()).min(o.len());
     buf.clear();
-    buf.reserve(25 + n * 48);
+    buf.reserve(9 + 25 + n * 48);
+    buf.extend_from_slice(&[0u8; 9]);
     buf.push(V2_FACTS_BULK);
     buf.extend_from_slice(&rec_gen.to_le_bytes());
     buf.extend_from_slice(&next_id.to_le_bytes());
@@ -98,7 +100,7 @@ pub(super) fn append_facts_v2(
         put_str(buf, &p[i]);
         put_str(buf, &o[i]);
     }
-    write_frame(log, &LOG_MAGIC_V2, buf, sync, log_bytes)
+    finish_in_place_frame(log, &LOG_MAGIC_V2, buf, sync, log_bytes)
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -579,8 +581,9 @@ pub(crate) struct EncodedColumns {
     pub(super) collection: String,
     pub(super) fields: Vec<String>,
     pub(super) rows: u32,
+    #[allow(dead_code)]
     pub(super) magic: [u8; 4],
-    pub(super) checksum: [u8; 4],
+    pub(super) framed_ok: bool,
     pub(super) bytes: Vec<u8>,
 }
 
@@ -622,7 +625,8 @@ pub(crate) fn prepare_insert_columns_ext(
     uniform_keys: bool,
     mut bytes: Vec<u8>,
 ) -> PreparedInsert {
-    if let Some((magic, fields)) = encode_insert_rows_direct_ext(
+    if let Some((magic, fields)) = encode_insert_rows_direct_at(
+        9,
         generation,
         next_id,
         collection,
@@ -631,7 +635,7 @@ pub(crate) fn prepare_insert_columns_ext(
         &mut bytes,
     ) {
         let n = rows.len() as u32;
-        let checksum = compute_frame_checksum(&magic, &bytes);
+        let framed_ok = finish_in_place_frame_buf(&magic, &mut bytes).is_ok();
         let pack = Pack::InsertCols {
             collection: collection.to_owned(),
             fields: fields.clone(),
@@ -648,7 +652,7 @@ pub(crate) fn prepare_insert_columns_ext(
                 fields,
                 rows: n,
                 magic,
-                checksum,
+                framed_ok,
                 bytes,
             }),
         };
@@ -658,12 +662,12 @@ pub(crate) fn prepare_insert_columns_ext(
         Pack::InsertCols {
             fields, cols, n, ..
         } => {
-            match encode_insert_cols_v2(
-                generation, next_id, collection, fields, cols, *n, &mut bytes,
+            match encode_insert_cols_v2_at(
+                9, generation, next_id, collection, fields, cols, *n, &mut bytes,
             ) {
                 Ok(magic) => {
                     cols.clear();
-                    let checksum = compute_frame_checksum(&magic, &bytes);
+                    let framed_ok = finish_in_place_frame_buf(&magic, &mut bytes).is_ok();
                     PreparedEncoding::Ready(EncodedColumns {
                         generation,
                         next_id,
@@ -671,7 +675,7 @@ pub(crate) fn prepare_insert_columns_ext(
                         fields: fields.clone(),
                         rows: *n,
                         magic,
-                        checksum,
+                        framed_ok,
                         bytes,
                     })
                 }
@@ -702,14 +706,10 @@ pub(crate) fn append_prepared_record(
                 && *n == prepared.rows && edges.is_empty());
     *buf = prepared.bytes;
     if valid {
-        write_frame_precomputed(
-            log,
-            &prepared.magic,
-            buf,
-            prepared.checksum,
-            sync,
-            log_bytes,
-        )
+        if !prepared.framed_ok {
+            return Err(io_err("log record exceeds 16MiB"));
+        }
+        write_in_place_frame_buf(log, buf, sync, log_bytes)
     } else {
         append_record(log, rec, buf, sync, log_bytes)
     }
@@ -748,12 +748,27 @@ pub(super) fn append_insert_cols_v2(
             log_bytes,
         );
     }
-    let magic = encode_insert_cols_v2(rec_gen, next_id, collection, fields, cols, n, buf)?;
-    write_frame(log, &magic, buf, sync, log_bytes)
+    let magic = encode_insert_cols_v2_at(9, rec_gen, next_id, collection, fields, cols, n, buf)?;
+    finish_in_place_frame(log, &magic, buf, sync, log_bytes)
 }
 
 /// Encode the existing typed-column payload without touching a file.
+#[allow(dead_code)]
 pub(super) fn encode_insert_cols_v2(
+    rec_gen: u64,
+    next_id: u64,
+    collection: &str,
+    fields: &[String],
+    cols: &[ColData],
+    n: u32,
+    buf: &mut Vec<u8>,
+) -> Result<[u8; 4], Error> {
+    encode_insert_cols_v2_at(0, rec_gen, next_id, collection, fields, cols, n, buf)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_insert_cols_v2_at(
+    start_off: usize,
     rec_gen: u64,
     next_id: u64,
     collection: &str,
@@ -777,7 +792,10 @@ pub(super) fn encode_insert_cols_v2(
                     est_per_row = est_per_row.saturating_add(sparse_est.min(dense_est));
                 }
             }
-            ColData::Text(_) => est_per_row = est_per_row.saturating_add(16),
+            ColData::Text(v) => {
+                let first_len = v.first().map_or(12, |s| s.len());
+                est_per_row = est_per_row.saturating_add(4 + first_len);
+            }
             ColData::Int(_) | ColData::Float(_) | ColData::Time(_) => {
                 est_per_row = est_per_row.saturating_add(8)
             }
@@ -786,7 +804,10 @@ pub(super) fn encode_insert_cols_v2(
         }
     }
     buf.clear();
-    buf.reserve(64 + fields.len() * 16 + (n as usize) * est_per_row);
+    buf.reserve(start_off + 68 + fields.len() * 16 + (n as usize) * est_per_row);
+    if start_off > 0 {
+        buf.resize(start_off, 0);
+    }
     buf.push(V2_INSERT_COLS);
     buf.extend_from_slice(&rec_gen.to_le_bytes());
     buf.extend_from_slice(&next_id.to_le_bytes());
@@ -807,24 +828,52 @@ pub(super) fn encode_insert_cols_v2(
             }
             ColData::Int(v) => {
                 buf.push(2);
+                #[cfg(target_endian = "little")]
+                {
+                    // SAFETY: `[i64]` on LE targets has exact 8-byte little-endian layout.
+                    let raw = unsafe {
+                        std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 8)
+                    };
+                    buf.extend_from_slice(raw);
+                }
+                #[cfg(not(target_endian = "little"))]
                 for x in v {
                     buf.extend_from_slice(&x.to_le_bytes());
                 }
             }
             ColData::Float(v) => {
                 buf.push(3);
+                #[cfg(target_endian = "little")]
+                {
+                    // SAFETY: `[f64]` on LE targets has exact IEEE-754 little-endian layout.
+                    let raw = unsafe {
+                        std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 8)
+                    };
+                    buf.extend_from_slice(raw);
+                }
+                #[cfg(not(target_endian = "little"))]
                 for x in v {
                     buf.extend_from_slice(&x.to_le_bytes());
                 }
             }
             ColData::Bool(v) => {
                 buf.push(4);
+                buf.reserve(v.len());
                 for x in v {
                     buf.push(u8::from(*x));
                 }
             }
             ColData::Time(v) => {
                 buf.push(5);
+                #[cfg(target_endian = "little")]
+                {
+                    // SAFETY: `[i64]` on LE targets has exact 8-byte little-endian layout.
+                    let raw = unsafe {
+                        std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 8)
+                    };
+                    buf.extend_from_slice(raw);
+                }
+                #[cfg(not(target_endian = "little"))]
                 for x in v {
                     buf.extend_from_slice(&x.to_le_bytes());
                 }
@@ -1535,6 +1584,29 @@ pub(crate) fn encode_insert_rows_direct_ext(
     uniform_keys: bool,
     buf: &mut Vec<u8>,
 ) -> Option<([u8; 4], Vec<String>)> {
+    encode_insert_rows_direct_at(0, rec_gen, next_id, collection, rows, uniform_keys, buf)
+}
+
+/// Encode snapshot rows directly into `buf` with an in-place 8-byte `LCOL` + `magic` header,
+/// avoiding a second buffer allocation and `memcpy` per chunk.
+pub(super) fn encode_insert_rows_lcol(rows: &[Row], buf: &mut Vec<u8>) -> bool {
+    let Some((magic, _)) = encode_insert_rows_direct_at(8, 0, 0, "", rows, false, buf) else {
+        return false;
+    };
+    buf[..4].copy_from_slice(b"LCOL");
+    buf[4..8].copy_from_slice(&magic);
+    true
+}
+
+fn encode_insert_rows_direct_at(
+    start_off: usize,
+    rec_gen: u64,
+    next_id: u64,
+    collection: &str,
+    rows: &[Row],
+    uniform_keys: bool,
+    buf: &mut Vec<u8>,
+) -> Option<([u8; 4], Vec<String>)> {
     if rows.is_empty() {
         return None;
     }
@@ -1554,19 +1626,38 @@ pub(crate) fn encode_insert_rows_direct_ext(
         Vec,
     }
     let mut col_types = smallvec::SmallVec::<[DirectColType; 8]>::with_capacity(num_fields);
-    let mut est_vec_per_row = 0usize;
+    let mut est_per_row = 0usize;
     for val in first.values() {
         let t = match val {
-            Cell::Text(_) | Cell::SmallText(_) => DirectColType::Text,
-            Cell::Int(_) => DirectColType::Int,
-            Cell::Float(_) => DirectColType::Float,
-            Cell::Bool(_) => DirectColType::Bool,
-            Cell::Time(_) => DirectColType::Time,
+            Cell::Text(s) => {
+                est_per_row = est_per_row.saturating_add(4 + s.len());
+                DirectColType::Text
+            }
+            Cell::SmallText(s) => {
+                est_per_row = est_per_row.saturating_add(4 + s.len());
+                DirectColType::Text
+            }
+            Cell::Int(_) => {
+                est_per_row = est_per_row.saturating_add(8);
+                DirectColType::Int
+            }
+            Cell::Float(_) => {
+                est_per_row = est_per_row.saturating_add(8);
+                DirectColType::Float
+            }
+            Cell::Bool(_) => {
+                est_per_row = est_per_row.saturating_add(1);
+                DirectColType::Bool
+            }
+            Cell::Time(_) => {
+                est_per_row = est_per_row.saturating_add(8);
+                DirectColType::Time
+            }
             Cell::Vec(emb) => {
                 let sparse_est =
                     8usize.saturating_add(count_non_zero_floats(emb).saturating_mul(8));
                 let dense_est = 4usize.saturating_add(emb.len().saturating_mul(4));
-                est_vec_per_row = est_vec_per_row.saturating_add(sparse_est.min(dense_est));
+                est_per_row = est_per_row.saturating_add(sparse_est.min(dense_est));
                 DirectColType::Vec
             }
             _ => return None,
@@ -1594,9 +1685,19 @@ pub(crate) fn encode_insert_rows_direct_ext(
 
     let fields: Vec<String> = first.keys().cloned().collect();
     let n = rows.len() as u32;
+    let fields_meta_bytes: usize = fields.iter().map(|f| 5 + f.len()).sum();
 
     buf.clear();
-    buf.reserve(64 + fields.len() * 16 + rows.len() * (num_fields * 24 + est_vec_per_row));
+    buf.reserve(
+        start_off
+            + 68
+            + collection.len()
+            + fields_meta_bytes
+            + rows.len().saturating_mul(est_per_row.saturating_add(num_fields * 2)),
+    );
+    if start_off > 0 {
+        buf.resize(start_off, 0);
+    }
     buf.push(V2_INSERT_COLS);
     buf.extend_from_slice(&rec_gen.to_le_bytes());
     buf.extend_from_slice(&next_id.to_le_bytes());
@@ -1623,38 +1724,78 @@ pub(crate) fn encode_insert_rows_direct_ext(
             }
             DirectColType::Int => {
                 buf.push(2);
-                for r in rows {
-                    match &r.cells_slice()[fi] {
-                        Cell::Int(x) => buf.extend_from_slice(&x.to_le_bytes()),
-                        _ => return None,
+                let base = buf.len();
+                let byte_len = rows.len().checked_mul(8)?;
+                buf.reserve(byte_len);
+                unsafe {
+                    let mut dst = buf.as_mut_ptr().add(base);
+                    for r in rows {
+                        match &r.cells_slice()[fi] {
+                            Cell::Int(x) => {
+                                std::ptr::copy_nonoverlapping(x.to_le_bytes().as_ptr(), dst, 8);
+                                dst = dst.add(8);
+                            }
+                            _ => return None,
+                        }
                     }
+                    buf.set_len(base + byte_len);
                 }
             }
             DirectColType::Float => {
                 buf.push(3);
-                for r in rows {
-                    match &r.cells_slice()[fi] {
-                        Cell::Float(x) => buf.extend_from_slice(&x.to_le_bytes()),
-                        _ => return None,
+                let base = buf.len();
+                let byte_len = rows.len().checked_mul(8)?;
+                buf.reserve(byte_len);
+                unsafe {
+                    let mut dst = buf.as_mut_ptr().add(base);
+                    for r in rows {
+                        match &r.cells_slice()[fi] {
+                            Cell::Float(x) => {
+                                std::ptr::copy_nonoverlapping(x.to_le_bytes().as_ptr(), dst, 8);
+                                dst = dst.add(8);
+                            }
+                            _ => return None,
+                        }
                     }
+                    buf.set_len(base + byte_len);
                 }
             }
             DirectColType::Bool => {
                 buf.push(4);
-                for r in rows {
-                    match &r.cells_slice()[fi] {
-                        Cell::Bool(x) => buf.push(u8::from(*x)),
-                        _ => return None,
+                let base = buf.len();
+                let byte_len = rows.len();
+                buf.reserve(byte_len);
+                unsafe {
+                    let mut dst = buf.as_mut_ptr().add(base);
+                    for r in rows {
+                        match &r.cells_slice()[fi] {
+                            Cell::Bool(x) => {
+                                *dst = u8::from(*x);
+                                dst = dst.add(1);
+                            }
+                            _ => return None,
+                        }
                     }
+                    buf.set_len(base + byte_len);
                 }
             }
             DirectColType::Time => {
                 buf.push(5);
-                for r in rows {
-                    match &r.cells_slice()[fi] {
-                        Cell::Time(x) => buf.extend_from_slice(&x.to_le_bytes()),
-                        _ => return None,
+                let base = buf.len();
+                let byte_len = rows.len().checked_mul(8)?;
+                buf.reserve(byte_len);
+                unsafe {
+                    let mut dst = buf.as_mut_ptr().add(base);
+                    for r in rows {
+                        match &r.cells_slice()[fi] {
+                            Cell::Time(x) => {
+                                std::ptr::copy_nonoverlapping(x.to_le_bytes().as_ptr(), dst, 8);
+                                dst = dst.add(8);
+                            }
+                            _ => return None,
+                        }
                     }
+                    buf.set_len(base + byte_len);
                 }
             }
             DirectColType::Vec => {
@@ -2142,11 +2283,29 @@ pub(super) fn decode_column_record_mode(
                             if allow_dictionary {
                                 dictionary_budget_add(&mut sparse_decoded_bytes, nbytes)?;
                             }
-                            let mut emb = Vec::with_capacity(dim);
-                            for _ in 0..dim {
-                                emb.push(f32::from_le_bytes(buf[i..i + 4].try_into().unwrap()));
-                                i += 4;
-                            }
+                            #[cfg(target_endian = "little")]
+                            let emb = {
+                                let mut emb = vec![0.0f32; dim];
+                                // SAFETY: `emb` has `dim * 4 == nbytes` initialized bytes and `buf[i..i+nbytes]` is in bounds.
+                                unsafe {
+                                    std::ptr::copy_nonoverlapping(
+                                        buf.as_ptr().add(i),
+                                        emb.as_mut_ptr() as *mut u8,
+                                        nbytes,
+                                    );
+                                }
+                                i += nbytes;
+                                emb
+                            };
+                            #[cfg(not(target_endian = "little"))]
+                            let emb = {
+                                let mut emb = Vec::with_capacity(dim);
+                                for _ in 0..dim {
+                                    emb.push(f32::from_le_bytes(buf[i..i + 4].try_into().unwrap()));
+                                    i += 4;
+                                }
+                                emb
+                            };
                             v.push(Some(emb.into()));
                         }
                         ColData::Vec(v)
@@ -2553,13 +2712,378 @@ fn col_cell_at(cols: &[ColData], fi: usize, i: usize) -> crate::store::Cell {
     }
 }
 
+/// Decode an `LCOL` snapshot column payload (`&payload[8..]`) directly into `Vec<Row>`
+/// without allocating intermediate `ColData` vectors or heap `Arc<str>`s for short strings
+/// (`<= InlineStr::MAX_LEN` = 22 bytes), reusing `shape_cache` across chunks of a collection.
+pub(super) fn decode_lcol_to_rows(
+    buf: &[u8],
+    allow_sparse: bool,
+    shape_cache: &mut Option<(Vec<String>, Arc<crate::store::RowShape>)>,
+) -> Result<Vec<Row>, ()> {
+    use crate::store::{InlineStr, RowShape};
+
+    if buf.is_empty() {
+        return Err(());
+    }
+    let mut i = 0usize;
+    let kind = buf[i];
+    i += 1;
+    if kind != V2_INSERT_COLS {
+        return Err(());
+    }
+    let _rec_gen = take_u64(buf, &mut i)?;
+    let _next_id = take_u64(buf, &mut i)?;
+    let _collection = take_str_ref(buf, &mut i)?;
+    let n = take_u32(buf, &mut i)? as usize;
+    let nf = take_u32(buf, &mut i)? as usize;
+    if allow_sparse
+        && (nf > buf.len().saturating_sub(i) / 5
+            || n.checked_mul(std::mem::size_of::<Option<Vec<f32>>>())
+                .is_none_or(|bytes| bytes > MAX_SPARSE_DECODED_BYTES))
+    {
+        return Err(());
+    }
+    if nf == 0 {
+        if allow_sparse {
+            return Err(());
+        }
+        return Ok(vec![Row::new(); n]);
+    }
+
+    // Pass 1: validate framing/bounds of all `nf` columns and collect `(field_name, col_offset, tag)`
+    // in O(nf) for scalar columns and O(n) bounds checks for variable-width columns.
+    let mut sparse_decoded_bytes = 0usize;
+    let mut saw_sparse = false;
+    let mut col_metas: smallvec::SmallVec<[(&str, usize, u8); 16]> =
+        smallvec::SmallVec::with_capacity(nf.min(64));
+    for _ in 0..nf {
+        let fname = take_str_ref(buf, &mut i)?;
+        if i >= buf.len() {
+            return Err(());
+        }
+        let ct = buf[i];
+        i += 1;
+        let col_start = i;
+        match ct {
+            0 => {}
+            1 => {
+                for _ in 0..n {
+                    let slen = take_u32(buf, &mut i)? as usize;
+                    i = i.checked_add(slen).filter(|&end| end <= buf.len()).ok_or(())?;
+                }
+            }
+            2 | 3 | 5 => {
+                let bytes = n.checked_mul(8).ok_or(())?;
+                i = i.checked_add(bytes).filter(|&end| end <= buf.len()).ok_or(())?;
+            }
+            4 => {
+                i = i.checked_add(n).filter(|&end| end <= buf.len()).ok_or(())?;
+            }
+            6 => {
+                for _ in 0..n {
+                    let dim = take_u32(buf, &mut i)? as usize;
+                    if dim > 0 {
+                        let nbytes = dim.checked_mul(4).ok_or(())?;
+                        i = i
+                            .checked_add(nbytes)
+                            .filter(|&end| end <= buf.len())
+                            .ok_or(())?;
+                    }
+                }
+            }
+            7 if allow_sparse => {
+                saw_sparse = true;
+                let storage = n
+                    .checked_mul(std::mem::size_of::<Option<Vec<f32>>>())
+                    .ok_or(())?;
+                sparse_decoded_bytes = sparse_decoded_bytes
+                    .checked_add(storage)
+                    .filter(|&bytes| bytes <= MAX_SPARSE_DECODED_BYTES)
+                    .ok_or(())?;
+                if n > buf.len().saturating_sub(i) / 4 {
+                    return Err(());
+                }
+                for _ in 0..n {
+                    let code = take_u32(buf, &mut i)?;
+                    if code == 0 {
+                        continue;
+                    }
+                    let dim = (code - 1) as usize;
+                    let count = take_u32(buf, &mut i)? as usize;
+                    if count > dim || count > buf.len().saturating_sub(i) / 8 {
+                        return Err(());
+                    }
+                    sparse_decoded_bytes = sparse_decoded_bytes
+                        .checked_add(dim.checked_mul(4).ok_or(())?)
+                        .filter(|&bytes| bytes <= MAX_SPARSE_DECODED_BYTES)
+                        .ok_or(())?;
+                    let mut previous = None;
+                    for _ in 0..count {
+                        let pos = take_u32(buf, &mut i)? as usize;
+                        let _bits = take_u32(buf, &mut i)?;
+                        if pos >= dim || previous.is_some_and(|last| pos <= last) {
+                            return Err(());
+                        }
+                        previous = Some(pos);
+                    }
+                }
+            }
+            _ => return Err(()),
+        }
+        col_metas.push((fname, col_start, ct));
+    }
+    if allow_sparse && (!saw_sparse || i != buf.len()) {
+        return Err(());
+    }
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+
+    // Resolve `Arc<RowShape>` (reusing `shape_cache` across chunks of the same collection).
+    let is_sorted = col_metas.windows(2).all(|w| w[0].0 < w[1].0);
+    let shape: Arc<RowShape> = if is_sorted {
+        if let Some((cached_names, cached_shape)) = shape_cache.as_ref()
+            && cached_names.len() == nf
+            && cached_names
+                .iter()
+                .zip(col_metas.iter())
+                .all(|(a, (b, _, _))| a == *b)
+        {
+            Arc::clone(cached_shape)
+        } else {
+            let names_vec: Vec<String> =
+                col_metas.iter().map(|(s, _, _)| (*s).to_owned()).collect();
+            let built = Row::shape_of(&names_vec);
+            *shape_cache = Some((names_vec, Arc::clone(&built)));
+            built
+        }
+    } else {
+        let names_ref: smallvec::SmallVec<[&str; 16]> =
+            col_metas.iter().map(|(s, _, _)| *s).collect();
+        let built = Row::shape_of(&names_ref);
+        if built.names().len() != nf {
+            // Duplicate field names fallback.
+            let rec = decode_column_record(buf, allow_sparse)?;
+            if let Pack::InsertCols {
+                fields, cols, n, ..
+            } = rec.pack
+            {
+                return Ok(cols_to_rows(&fields, &cols, n as usize));
+            }
+            return Err(());
+        }
+        built
+    };
+
+    let mut perm: smallvec::SmallVec<[usize; 16]> = smallvec::SmallVec::with_capacity(nf);
+    if is_sorted {
+        for fi in 0..nf {
+            perm.push(fi);
+        }
+    } else {
+        for (fname, _, _) in &col_metas {
+            let pos = shape
+                .names()
+                .binary_search_by(|s| s.as_str().cmp(fname))
+                .map_err(|_| ())?;
+            perm.push(pos);
+        }
+    }
+
+    let mut rows = Vec::with_capacity(n);
+    for _ in 0..n {
+        rows.push(Row::from_parts(
+            Arc::clone(&shape),
+            std::iter::repeat_n(Cell::Null, nf),
+        ));
+    }
+
+    // Pass 2: materialize each column directly into its row cell slot.
+    for (fi, &(fname, mut col_i, ct)) in col_metas.iter().enumerate() {
+        let slot = perm[fi];
+        match ct {
+            0 => {}
+            1 => {
+                // Fields mirrored as `Arc<str>` in `Store::rebuild_row_maps` stay `Cell::Text`
+                // so `rebuild_row_maps` shares the `Arc<str>` instead of re-allocating via
+                // `SmallText::text_shared`, and `Row` Debug output matches live inserts.
+                // All other short strings (`<= 22B`, e.g. `hash`, `room`, tags) use inline `SmallText`.
+                let needs_arc = matches!(
+                    fname,
+                    "id" | "uri" | "title" | "layer" | "wing" | "user_id" | "email" | "s" | "p" | "o"
+                );
+                if needs_arc {
+                    let mut recent: [Option<Arc<str>>; 4] = [None, None, None, None];
+                    let mut recent_idx = 0usize;
+                    for row in &mut rows {
+                        let slen =
+                            u32::from_le_bytes(buf[col_i..col_i + 4].try_into().unwrap()) as usize;
+                        col_i += 4;
+                        let s_ref =
+                            std::str::from_utf8(&buf[col_i..col_i + slen]).map_err(|_| ())?;
+                        col_i += slen;
+                        let arc = match s_ref {
+                            "wiki" => {
+                                static WIKI: std::sync::LazyLock<Arc<str>> =
+                                    std::sync::LazyLock::new(|| Arc::from("wiki"));
+                                Arc::clone(&WIKI)
+                            }
+                            "raw" => {
+                                static RAW: std::sync::LazyLock<Arc<str>> =
+                                    std::sync::LazyLock::new(|| Arc::from("raw"));
+                                Arc::clone(&RAW)
+                            }
+                            "rag" | "sys" | "core" | "test" => {
+                                crate::store::value::intern_wing_str(s_ref)
+                            }
+                            _ => {
+                                if slen <= 64
+                                    && let Some(hit) = recent
+                                        .iter()
+                                        .flatten()
+                                        .find(|prev| prev.as_ref() == s_ref)
+                                {
+                                    Arc::clone(hit)
+                                } else {
+                                    let a: Arc<str> = Arc::from(s_ref);
+                                    if slen <= 64 {
+                                        recent[recent_idx & 3] = Some(Arc::clone(&a));
+                                        recent_idx = recent_idx.wrapping_add(1);
+                                    }
+                                    a
+                                }
+                            }
+                        };
+                        row.cells_mut()[slot] = Cell::Text(arc);
+                    }
+                } else {
+                    let mut prev_arc: Option<Arc<str>> = None;
+                    for row in &mut rows {
+                        let slen =
+                            u32::from_le_bytes(buf[col_i..col_i + 4].try_into().unwrap()) as usize;
+                        col_i += 4;
+                        let s_ref =
+                            std::str::from_utf8(&buf[col_i..col_i + slen]).map_err(|_| ())?;
+                        col_i += slen;
+                        row.cells_mut()[slot] = if slen <= InlineStr::MAX_LEN {
+                            Cell::SmallText(InlineStr::new_truncate(s_ref))
+                        } else if let Some(ref prev) = prev_arc
+                            && prev.as_ref() == s_ref
+                        {
+                            Cell::Text(Arc::clone(prev))
+                        } else {
+                            let a: Arc<str> = Arc::from(s_ref);
+                            if slen <= 64 {
+                                prev_arc = Some(Arc::clone(&a));
+                            }
+                            Cell::Text(a)
+                        };
+                    }
+                }
+            }
+            2 => {
+                for (row, chunk) in rows.iter_mut().zip(buf[col_i..col_i + n * 8].chunks_exact(8))
+                {
+                    row.cells_mut()[slot] =
+                        Cell::Int(i64::from_le_bytes(chunk.try_into().unwrap()));
+                }
+            }
+            3 => {
+                for (row, chunk) in rows.iter_mut().zip(buf[col_i..col_i + n * 8].chunks_exact(8))
+                {
+                    row.cells_mut()[slot] =
+                        Cell::Float(f64::from_le_bytes(chunk.try_into().unwrap()));
+                }
+            }
+            4 => {
+                for (row, &b) in rows.iter_mut().zip(&buf[col_i..col_i + n]) {
+                    row.cells_mut()[slot] = Cell::Bool(b != 0);
+                }
+            }
+            5 => {
+                for (row, chunk) in rows.iter_mut().zip(buf[col_i..col_i + n * 8].chunks_exact(8))
+                {
+                    row.cells_mut()[slot] =
+                        Cell::Time(i64::from_le_bytes(chunk.try_into().unwrap()));
+                }
+            }
+            6 => {
+                for row in &mut rows {
+                    let dim =
+                        u32::from_le_bytes(buf[col_i..col_i + 4].try_into().unwrap()) as usize;
+                    col_i += 4;
+                    if dim == 0 {
+                        continue;
+                    }
+                    let nbytes = dim * 4;
+                    #[cfg(target_endian = "little")]
+                    let emb = {
+                        let mut emb = vec![0.0f32; dim];
+                        // SAFETY: bounds checked in Pass 1; `emb` has `nbytes` bytes.
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                buf.as_ptr().add(col_i),
+                                emb.as_mut_ptr() as *mut u8,
+                                nbytes,
+                            );
+                        }
+                        col_i += nbytes;
+                        emb
+                    };
+                    #[cfg(not(target_endian = "little"))]
+                    let emb = {
+                        let mut emb = Vec::with_capacity(dim);
+                        for _ in 0..dim {
+                            emb.push(f32::from_le_bytes(
+                                buf[col_i..col_i + 4].try_into().unwrap(),
+                            ));
+                            col_i += 4;
+                        }
+                        emb
+                    };
+                    row.cells_mut()[slot] = Cell::vec_arc(emb);
+                }
+            }
+            7 => {
+                for row in &mut rows {
+                    let code = u32::from_le_bytes(buf[col_i..col_i + 4].try_into().unwrap());
+                    col_i += 4;
+                    if code == 0 {
+                        continue;
+                    }
+                    let dim = (code - 1) as usize;
+                    let count =
+                        u32::from_le_bytes(buf[col_i..col_i + 4].try_into().unwrap()) as usize;
+                    col_i += 4;
+                    let mut values = vec![0.0f32; dim];
+                    for _ in 0..count {
+                        let pos =
+                            u32::from_le_bytes(buf[col_i..col_i + 4].try_into().unwrap()) as usize;
+                        let bits =
+                            u32::from_le_bytes(buf[col_i + 4..col_i + 8].try_into().unwrap());
+                        col_i += 8;
+                        values[pos] = f32::from_bits(bits);
+                    }
+                    row.cells_mut()[slot] = Cell::vec_arc(values);
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    Ok(rows)
+}
+
 pub fn cols_to_rows(fields: &[String], cols: &[ColData], n: usize) -> Vec<crate::store::Row> {
-    use crate::store::Cell;
-    if n >= 2 && fields.windows(2).all(|w| w[0] < w[1]) {
-        let template: crate::store::Row = fields
-            .iter()
-            .map(|f| (f.clone(), Cell::Null))
-            .collect();
+    if n == 0 {
+        return Vec::new();
+    }
+    if fields.is_empty() {
+        return vec![crate::store::Row::new(); n];
+    }
+    let nf = fields.len();
+    if fields.windows(2).all(|w| w[0] < w[1]) {
+        let shape = crate::store::Row::shape_of(fields);
         if n >= 4096 {
             let threads = std::thread::available_parallelism()
                 .map(|p| p.get())
@@ -2576,15 +3100,14 @@ pub fn cols_to_rows(fields: &[String], cols: &[ColData], n: usize) -> Vec<crate:
                                 return None;
                             }
                             let end = (start + chunk_size).min(n);
-                            let tmpl = template.clone();
+                            let sh = Arc::clone(&shape);
                             Some(s.spawn(move || {
                                 let mut part = Vec::with_capacity(end - start);
                                 for i in start..end {
-                                    let mut row = tmpl.clone();
-                                    for (fi, slot) in row.values_mut().enumerate() {
-                                        *slot = col_cell_at(cols, fi, i);
-                                    }
-                                    part.push(row);
+                                    part.push(crate::store::Row::from_parts(
+                                        Arc::clone(&sh),
+                                        (0..nf).map(|fi| col_cell_at(cols, fi, i)),
+                                    ));
                                 }
                                 part
                             }))
@@ -2607,19 +3130,37 @@ pub fn cols_to_rows(fields: &[String], cols: &[ColData], n: usize) -> Vec<crate:
         }
         let mut rows = Vec::with_capacity(n);
         for i in 0..n {
-            let mut row = template.clone();
-            for (fi, slot) in row.values_mut().enumerate() {
-                *slot = col_cell_at(cols, fi, i);
-            }
-            rows.push(row);
+            rows.push(crate::store::Row::from_parts(
+                Arc::clone(&shape),
+                (0..nf).map(|fi| col_cell_at(cols, fi, i)),
+            ));
         }
         return rows;
+    }
+    let shape = crate::store::Row::shape_of(fields);
+    if shape.names().len() == nf {
+        let mut sorted_to_fi: smallvec::SmallVec<[usize; 16]> = smallvec::SmallVec::with_capacity(nf);
+        for name in shape.names() {
+            if let Some(fi) = fields.iter().position(|f| f == name) {
+                sorted_to_fi.push(fi);
+            }
+        }
+        if sorted_to_fi.len() == nf {
+            let mut rows = Vec::with_capacity(n);
+            for i in 0..n {
+                rows.push(crate::store::Row::from_parts(
+                    Arc::clone(&shape),
+                    sorted_to_fi.iter().map(|&fi| col_cell_at(cols, fi, i)),
+                ));
+            }
+            return rows;
+        }
     }
     let mut rows = Vec::with_capacity(n);
     for i in 0..n {
         let mut row = crate::store::Row::new();
         for (fi, f) in fields.iter().enumerate() {
-            row.insert(f.clone(), col_cell_at(cols, fi, i));
+            row.insert(f.as_str(), col_cell_at(cols, fi, i));
         }
         rows.push(row);
     }

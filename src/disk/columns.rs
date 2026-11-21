@@ -9,7 +9,7 @@ use memchr::memmem::Finder;
 use memmap2::{Mmap, MmapOptions};
 
 use super::DiskColKind;
-use crate::embed::{cosine_with_q_norm, dot_sq8, l2_norm_f64, quantize_sq8};
+use crate::embed::{cosine_with_q_norm, dot_sq8, l2_norm_f64, quantize_sq8_into};
 use crate::error::Error;
 use crate::persist::io_err;
 use crate::store::{Cell, InlineStr};
@@ -32,6 +32,11 @@ struct BlockCacheSlot {
     data: Arc<[u8]>,
 }
 
+struct MmapTgram {
+    mmap: Mmap,
+    block_count: u32,
+}
+
 pub(crate) struct MmapTextCol {
     /// `row_count` entries of `(block_idx: u32, in_block_offset: u32, byte_len: u32, is_null: u32)` = 16 bytes/row.
     row_loc: Mmap,
@@ -42,16 +47,26 @@ pub(crate) struct MmapTextCol {
     row_count: u32,
     pub(super) block_count: u32,
     cache_shards: [Mutex<Vec<Option<BlockCacheSlot>>>; BLOCK_CACHE_SHARDS],
-    /// Per-block UTF-8 validation cache for uncompressed blocks: `0` = unchecked, `1` = valid UTF-8, `2` = invalid.
+    /// Per-block UTF-8 validation cache for raw and decoded blocks: `0` = unchecked, `1` = valid UTF-8, `2` = invalid.
     utf8_state: Box<[AtomicU8]>,
-    /// Optional per-Zstd-block 4096-bit trigram Bloom filters (`col_<name>.tgram`).
-    tgram: Option<Box<[TgramBlock]>>,
+    /// Optional memory-mapped per-Zstd-block 4096-bit trigram Bloom filters (`col_<name>.tgram`).
+    tgram: Option<MmapTgram>,
     /// Number of cache-miss block decodes performed on this column instance.
     decoded_blocks: AtomicU64,
 }
 
 impl MmapTextCol {
+    #[allow(dead_code)]
     pub(super) fn open(dir: &Path, col_name: &str, row_count: u32) -> Result<Self, Error> {
+        Self::open_with_opts(dir, col_name, row_count, false)
+    }
+
+    pub(super) fn open_with_opts(
+        dir: &Path,
+        col_name: &str,
+        row_count: u32,
+        skip_tgram_body_crc: bool,
+    ) -> Result<Self, Error> {
         let loc_f = File::open(dir.join(format!("col_{col_name}.loc"))).map_err(io_err)?;
         let boff_f = File::open(dir.join(format!("col_{col_name}.boff"))).map_err(io_err)?;
         let bdat_f = File::open(dir.join(format!("col_{col_name}.bdat"))).map_err(io_err)?;
@@ -107,9 +122,11 @@ impl MmapTextCol {
             .collect::<Vec<_>>()
             .into_boxed_slice();
 
-        let tgram = std::fs::read(dir.join(format!("col_{col_name}.tgram")))
-            .ok()
-            .and_then(|bytes| decode_tgram(&bytes, block_count));
+        let tgram = open_tgram_mmap(
+            &dir.join(format!("col_{col_name}.tgram")),
+            block_count,
+            skip_tgram_body_crc,
+        );
 
         Ok(Self {
             row_loc,
@@ -126,6 +143,26 @@ impl MmapTextCol {
 
     pub(super) fn clear_tgram(&mut self) {
         self.tgram = None;
+    }
+
+    #[inline]
+    pub(super) fn row_loc_bytes(&self) -> &[u8] {
+        &self.row_loc
+    }
+
+    #[inline]
+    pub(super) fn block_offsets_bytes(&self) -> &[u8] {
+        &self.block_offsets
+    }
+
+    #[inline]
+    pub(super) fn blocks_data_bytes(&self) -> &[u8] {
+        &self.blocks_data
+    }
+
+    #[inline]
+    pub(super) fn tgram_bytes(&self) -> Option<&[u8]> {
+        self.tgram.as_ref().map(|t| &t.mmap[..])
     }
 
     #[inline]
@@ -179,6 +216,11 @@ impl MmapTextCol {
         } else {
             Ok(None)
         }
+    }
+
+    #[inline]
+    pub(super) fn block_is_utf8_cached(&self, block_idx: u32, bytes: &[u8]) -> bool {
+        self.is_block_utf8_ok(block_idx, bytes)
     }
 
     #[inline]
@@ -348,11 +390,18 @@ impl MmapTextCol {
         let Some(ref tgram) = self.tgram else {
             return true;
         };
-        let Some(blk) = tgram.get(block_idx as usize) else {
+        if block_idx >= tgram.block_count {
             return true;
-        };
+        }
+        let base = TGRAM_HEADER + (block_idx as usize) * (TGRAM_WORDS * 8);
+        let bytes = &tgram.mmap[..];
+        if base + TGRAM_WORDS * 8 > bytes.len() {
+            return true;
+        }
         for &(wi, req) in &mask.probes {
-            if (blk[wi as usize] & req) != req {
+            let off = base + (wi as usize) * 8;
+            let word = u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap());
+            if (word & req) != req {
                 return false;
             }
         }
@@ -378,11 +427,8 @@ impl MmapTextCol {
             let s = Self::slice_block_str(raw, utf8_ok, s_off, e_off)?;
             return Ok(Cell::from_text(s));
         }
-        let block = self.decode_block(block_idx)?;
-        if e_off > block.len() {
-            return Err(io_err("corrupt in-block text slice"));
-        }
-        let s = std::str::from_utf8(&block[s_off..e_off]).map_err(io_err)?;
+        let (block, utf8_ok) = self.decode_block_checked(block_idx)?;
+        let s = Self::slice_block_str(&block, utf8_ok, s_off, e_off)?;
         Ok(Cell::from_text(s))
     }
 
@@ -416,14 +462,12 @@ impl MmapTextCol {
             None => true,
         };
         if need_load {
-            let decoded = self.decode_block(block_idx)?;
+            let (decoded, _) = self.decode_block_checked(block_idx)?;
             *cached = Some((block_idx, decoded));
         }
         let (_, ref block) = *cached.as_ref().unwrap();
-        if e_off > block.len() {
-            return Err(io_err("corrupt in-block text slice"));
-        }
-        let s = std::str::from_utf8(&block[s_off..e_off]).map_err(io_err)?;
+        let utf8_ok = self.is_block_utf8_ok(block_idx, block);
+        let s = Self::slice_block_str(block, utf8_ok, s_off, e_off)?;
         Ok(Cell::from_text(s))
     }
 
@@ -471,85 +515,76 @@ impl MmapTextCol {
             if let Some(ref m) = mask
                 && !self.block_may_match(bidx, m)
             {
-                while rid < row_count {
-                    let Some((rb, _, _, flags)) = read_loc(loc, rid) else {
-                        break;
-                    };
-                    if flags != 0 || rb <= bidx {
-                        rid += 1;
-                    } else {
-                        break;
-                    }
-                }
                 continue;
             }
-            while rid < row_count {
-                let Some((rb, _, _, flags)) = read_loc(loc, rid) else {
+            let decoded_arc: Arc<[u8]>;
+            let block: &[u8] = if let Some(raw) = self.raw_uncompressed_block(bidx)? {
+                raw
+            } else {
+                decoded_arc = self.decode_block(bidx)?;
+                &decoded_arc
+            };
+            let mut search_pos = 0usize;
+            while search_pos < block.len() {
+                let Some(rel) = finder.find(&block[search_pos..]) else {
                     break;
                 };
-                if flags != 0 {
-                    rid += 1;
-                    continue;
-                }
-                if rb > bidx {
-                    break;
-                }
-                let decoded_arc: Arc<[u8]>;
-                let block: &[u8] = if let Some(raw) = self.raw_uncompressed_block(bidx)? {
-                    raw
-                } else {
-                    decoded_arc = self.decode_block(bidx)?;
-                    &decoded_arc
-                };
-                let mut search_pos = 0usize;
-                while search_pos < block.len() {
-                    let Some(rel) = finder.find(&block[search_pos..]) else {
-                        break;
-                    };
-                    let hit_pos = search_pos + rel;
-                    let mut matched_span: Option<(usize, usize)> = None;
-                    while rid < row_count {
-                        let Some((r_blk, in_off, len, flags)) = read_loc(loc, rid) else {
-                            break;
-                        };
-                        if flags != 0 {
-                            rid += 1;
-                            continue;
-                        }
-                        if r_blk > bidx {
-                            break;
-                        }
-                        if r_blk == bidx && in_off + len <= hit_pos {
-                            rid += 1;
-                            continue;
-                        }
-                        if r_blk == bidx {
-                            matched_span = Some((in_off, len));
-                        }
-                        break;
-                    }
-                    let Some((in_off, len)) = matched_span else {
-                        break;
-                    };
-                    if hit_pos >= in_off && hit_pos + needle.len() <= in_off + len {
-                        if is_live(rid as u32) {
-                            hits += 1;
-                        }
-                    }
-                    search_pos = in_off + len;
-                    rid += 1;
-                }
-                while rid < row_count {
-                    let Some((r_blk, _, _, flags)) = read_loc(loc, rid) else {
-                        break;
-                    };
-                    if flags != 0 || r_blk == bidx {
-                        rid += 1;
+                let hit_pos = search_pos + rel;
+
+                // Non-null `(r_blk, in_off + len)` is monotonically non-decreasing across rows,
+                // so we can stride across skipped blocks and non-matching rows in `row_loc`.
+                while rid + 64 < row_count {
+                    if let Some((rb, ioff, rlen, rflags)) = read_loc(loc, rid + 64)
+                        && rflags == 0
+                        && (rb < bidx || (rb == bidx && ioff + rlen <= hit_pos))
+                    {
+                        rid += 64;
                     } else {
                         break;
                     }
                 }
-                break;
+                while rid + 8 < row_count {
+                    if let Some((rb, ioff, rlen, rflags)) = read_loc(loc, rid + 8)
+                        && rflags == 0
+                        && (rb < bidx || (rb == bidx && ioff + rlen <= hit_pos))
+                    {
+                        rid += 8;
+                    } else {
+                        break;
+                    }
+                }
+
+                let mut matched_span: Option<(usize, usize)> = None;
+                while rid < row_count {
+                    let Some((r_blk, in_off, len, flags)) = read_loc(loc, rid) else {
+                        break;
+                    };
+                    if flags != 0 || r_blk < bidx {
+                        rid += 1;
+                        continue;
+                    }
+                    if r_blk > bidx {
+                        break;
+                    }
+                    if in_off + len <= hit_pos {
+                        rid += 1;
+                        continue;
+                    }
+                    matched_span = Some((in_off, len));
+                    break;
+                }
+                let Some((in_off, len)) = matched_span else {
+                    break;
+                };
+                if hit_pos < in_off {
+                    search_pos = in_off;
+                    continue;
+                }
+                if hit_pos + needle.len() <= in_off + len && is_live(rid as u32) {
+                    hits += 1;
+                }
+                search_pos = in_off + len;
+                rid += 1;
             }
         }
         Ok(hits)
@@ -572,18 +607,15 @@ impl MmapTextCol {
             let s = Self::slice_block_str(raw, utf8_ok, s_off, e_off)?;
             return Ok(f(Some(s)));
         }
-        let block = self.decode_block(block_idx)?;
-        if e_off > block.len() {
-            return Err(io_err("corrupt in-block text slice"));
-        }
-        let s = std::str::from_utf8(&block[s_off..e_off]).map_err(io_err)?;
+        let (block, utf8_ok) = self.decode_block_checked(block_idx)?;
+        let s = Self::slice_block_str(&block, utf8_ok, s_off, e_off)?;
         Ok(f(Some(s)))
     }
 }
 
 /// Memory-mapped Dictionary-Encoded UTF-8 string column (`col_<name>.dstr`, `.doff`, `.dord`).
 pub(crate) struct MmapDictCol {
-    pub(crate) strings: Vec<Box<str>>,
+    pub(crate) strings: Vec<Arc<str>>,
     cells: Vec<Cell>,
     ordinals: Mmap,
     row_count: u32,
@@ -591,7 +623,18 @@ pub(crate) struct MmapDictCol {
 }
 
 impl MmapDictCol {
+    #[allow(dead_code)]
     pub(super) fn open(dir: &Path, col_name: &str, row_count: u32) -> Result<Self, Error> {
+        Self::open_checked(dir, col_name, row_count, 0, None)
+    }
+
+    pub(super) fn open_checked(
+        dir: &Path,
+        col_name: &str,
+        row_count: u32,
+        seg_id: u64,
+        expected_crcs: Option<&std::collections::BTreeMap<String, (u64, u32)>>,
+    ) -> Result<Self, Error> {
         let dstr_f = File::open(dir.join(format!("col_{col_name}.dstr"))).map_err(io_err)?;
         let doff_f = File::open(dir.join(format!("col_{col_name}.doff"))).map_err(io_err)?;
         let dord_f = File::open(dir.join(format!("col_{col_name}.dord"))).map_err(io_err)?;
@@ -599,6 +642,21 @@ impl MmapDictCol {
         let dstr = unsafe { MmapOptions::new().map(&dstr_f) }.map_err(io_err)?;
         let doff = unsafe { MmapOptions::new().map(&doff_f) }.map_err(io_err)?;
         let ordinals = unsafe { MmapOptions::new().map(&dord_f) }.map_err(io_err)?;
+        if let Some(crcs) = expected_crcs {
+            for (ext, bytes) in [("dstr", &dstr[..]), ("doff", &doff[..]), ("dord", &ordinals[..])]
+            {
+                let fname = format!("col_{col_name}.{ext}");
+                if let Some(&(exp_len, exp_crc)) = crcs.get(&fname) {
+                    let got_len = bytes.len() as u64;
+                    let got_crc = crate::crc::hardware_crc32c(bytes);
+                    if got_len != exp_len || got_crc != exp_crc {
+                        return Err(Error::runtime(format!(
+                            "corrupt segment file 'seg_{seg_id:08}/{fname}': expected (len={exp_len}, crc={exp_crc:#010x}), got (len={got_len}, crc={got_crc:#010x})"
+                        )));
+                    }
+                }
+            }
+        }
         if ordinals.len() < (row_count as usize).saturating_mul(2) {
             return Err(io_err(format!("corrupt cold column {col_name}: codes shorter than {row_count} rows")));
         }
@@ -626,8 +684,10 @@ impl MmapDictCol {
                 return Err(io_err("corrupt dstr bounds"));
             }
             let s = std::str::from_utf8(&dstr[s_off..e_off]).map_err(io_err)?;
-            strings.push(s.to_string().into_boxed_str());
-            cells.push(Cell::from_text(s));
+            let arc = crate::store::value::intern_wing_str(s);
+            let cell = Cell::from_arc_str(&arc);
+            strings.push(arc);
+            cells.push(cell);
         }
 
         Ok(Self {
@@ -984,36 +1044,34 @@ pub(super) fn encode_tgram(blocks: &[TgramBlock]) -> Vec<u8> {
     out
 }
 
-fn decode_tgram(bytes: &[u8], expected_blocks: u32) -> Option<Box<[TgramBlock]>> {
+fn open_tgram_mmap(path: &Path, expected_blocks: u32, skip_body_crc: bool) -> Option<MmapTgram> {
+    let f = File::open(path).ok()?;
+    let file_len = f.metadata().ok()?.len() as usize;
+    let blk_bytes = TGRAM_WORDS * 8;
+    let want_len = TGRAM_HEADER.checked_add((expected_blocks as usize).checked_mul(blk_bytes)?)?;
+    if file_len != want_len {
+        return None;
+    }
+    let mmap = unsafe { MmapOptions::new().map(&f) }.ok()?;
     let u32_at = |off: usize| -> Option<u32> {
-        Some(u32::from_le_bytes(bytes.get(off..off + 4)?.try_into().ok()?))
+        Some(u32::from_le_bytes(mmap.get(off..off + 4)?.try_into().ok()?))
     };
-    if bytes.get(0..4)? != TGRAM_MAGIC {
+    if mmap.get(0..4)? != TGRAM_MAGIC {
         return None;
     }
     if u32_at(4)? != TGRAM_VERSION || u32_at(8)? != expected_blocks {
         return None;
     }
-    let body = bytes.get(TGRAM_HEADER..)?;
-    let n = expected_blocks as usize;
-    let blk_bytes = TGRAM_WORDS * 8;
-    if body.len() != n.saturating_mul(blk_bytes) {
-        return None;
-    }
-    let mut crc = crate::crc::Hasher::new();
-    crc.update(body);
-    if crc.finalize() != u32_at(12)? {
-        return None;
-    }
-    let mut out = Vec::with_capacity(n);
-    for chunk in body.chunks_exact(blk_bytes) {
-        let mut blk = [0u64; TGRAM_WORDS];
-        for (dst, src) in blk.iter_mut().zip(chunk.chunks_exact(8)) {
-            *dst = u64::from_le_bytes(src.try_into().ok()?);
+    if !skip_body_crc {
+        let body = mmap.get(TGRAM_HEADER..)?;
+        if crate::crc::hardware_crc32c(body) != u32_at(12)? {
+            return None;
         }
-        out.push(blk);
     }
-    Some(out.into_boxed_slice())
+    Some(MmapTgram {
+        mmap,
+        block_count: expected_blocks,
+    })
 }
 
 pub(crate) const ZONE_BLOCK_ROWS: usize = 4096;
@@ -1283,11 +1341,216 @@ fn float_zone_relation(blk: FloatZoneBlock, op: crate::ast::CmpOp, rhs: f64) -> 
     }
 }
 
+#[inline]
+fn count_dense_i64(val_slice: &[u8], op: crate::ast::CmpOp, rhs: i64) -> usize {
+    use crate::ast::CmpOp;
+    let mut cnt = 0usize;
+    match op {
+        CmpOp::Eq => {
+            for chunk in val_slice.chunks_exact(8) {
+                let v = i64::from_le_bytes(chunk.try_into().unwrap());
+                cnt += usize::from(v == rhs);
+            }
+        }
+        CmpOp::Ne => {
+            for chunk in val_slice.chunks_exact(8) {
+                let v = i64::from_le_bytes(chunk.try_into().unwrap());
+                cnt += usize::from(v != rhs);
+            }
+        }
+        CmpOp::Gt => {
+            for chunk in val_slice.chunks_exact(8) {
+                let v = i64::from_le_bytes(chunk.try_into().unwrap());
+                cnt += usize::from(v > rhs);
+            }
+        }
+        CmpOp::Ge => {
+            for chunk in val_slice.chunks_exact(8) {
+                let v = i64::from_le_bytes(chunk.try_into().unwrap());
+                cnt += usize::from(v >= rhs);
+            }
+        }
+        CmpOp::Lt => {
+            for chunk in val_slice.chunks_exact(8) {
+                let v = i64::from_le_bytes(chunk.try_into().unwrap());
+                cnt += usize::from(v < rhs);
+            }
+        }
+        CmpOp::Le => {
+            for chunk in val_slice.chunks_exact(8) {
+                let v = i64::from_le_bytes(chunk.try_into().unwrap());
+                cnt += usize::from(v <= rhs);
+            }
+        }
+    }
+    cnt
+}
+
+#[inline]
+fn count_dense_i64_with_dict(
+    val_slice: &[u8],
+    ord_slice: &[u8],
+    op: crate::ast::CmpOp,
+    rhs: i64,
+    target_code: u16,
+) -> usize {
+    use crate::ast::CmpOp;
+    let mut cnt = 0usize;
+    match op {
+        CmpOp::Eq => {
+            for (vchunk, ochunk) in val_slice.chunks_exact(8).zip(ord_slice.chunks_exact(2)) {
+                let v = i64::from_le_bytes(vchunk.try_into().unwrap());
+                let c = u16::from_le_bytes([ochunk[0], ochunk[1]]);
+                cnt += usize::from((c == target_code) & (v == rhs));
+            }
+        }
+        CmpOp::Ne => {
+            for (vchunk, ochunk) in val_slice.chunks_exact(8).zip(ord_slice.chunks_exact(2)) {
+                let v = i64::from_le_bytes(vchunk.try_into().unwrap());
+                let c = u16::from_le_bytes([ochunk[0], ochunk[1]]);
+                cnt += usize::from((c == target_code) & (v != rhs));
+            }
+        }
+        CmpOp::Gt => {
+            for (vchunk, ochunk) in val_slice.chunks_exact(8).zip(ord_slice.chunks_exact(2)) {
+                let v = i64::from_le_bytes(vchunk.try_into().unwrap());
+                let c = u16::from_le_bytes([ochunk[0], ochunk[1]]);
+                cnt += usize::from((c == target_code) & (v > rhs));
+            }
+        }
+        CmpOp::Ge => {
+            for (vchunk, ochunk) in val_slice.chunks_exact(8).zip(ord_slice.chunks_exact(2)) {
+                let v = i64::from_le_bytes(vchunk.try_into().unwrap());
+                let c = u16::from_le_bytes([ochunk[0], ochunk[1]]);
+                cnt += usize::from((c == target_code) & (v >= rhs));
+            }
+        }
+        CmpOp::Lt => {
+            for (vchunk, ochunk) in val_slice.chunks_exact(8).zip(ord_slice.chunks_exact(2)) {
+                let v = i64::from_le_bytes(vchunk.try_into().unwrap());
+                let c = u16::from_le_bytes([ochunk[0], ochunk[1]]);
+                cnt += usize::from((c == target_code) & (v < rhs));
+            }
+        }
+        CmpOp::Le => {
+            for (vchunk, ochunk) in val_slice.chunks_exact(8).zip(ord_slice.chunks_exact(2)) {
+                let v = i64::from_le_bytes(vchunk.try_into().unwrap());
+                let c = u16::from_le_bytes([ochunk[0], ochunk[1]]);
+                cnt += usize::from((c == target_code) & (v <= rhs));
+            }
+        }
+    }
+    cnt
+}
+
+#[inline]
+fn count_dense_f64(val_slice: &[u8], op: crate::ast::CmpOp, rhs: f64) -> usize {
+    use crate::ast::CmpOp;
+    let mut cnt = 0usize;
+    match op {
+        CmpOp::Eq => {
+            for chunk in val_slice.chunks_exact(8) {
+                let v = f64::from_le_bytes(chunk.try_into().unwrap());
+                cnt += usize::from(v == rhs);
+            }
+        }
+        CmpOp::Ne => {
+            for chunk in val_slice.chunks_exact(8) {
+                let v = f64::from_le_bytes(chunk.try_into().unwrap());
+                cnt += usize::from(v != rhs);
+            }
+        }
+        CmpOp::Gt => {
+            for chunk in val_slice.chunks_exact(8) {
+                let v = f64::from_le_bytes(chunk.try_into().unwrap());
+                cnt += usize::from(v > rhs);
+            }
+        }
+        CmpOp::Ge => {
+            for chunk in val_slice.chunks_exact(8) {
+                let v = f64::from_le_bytes(chunk.try_into().unwrap());
+                cnt += usize::from(v >= rhs);
+            }
+        }
+        CmpOp::Lt => {
+            for chunk in val_slice.chunks_exact(8) {
+                let v = f64::from_le_bytes(chunk.try_into().unwrap());
+                cnt += usize::from(v < rhs);
+            }
+        }
+        CmpOp::Le => {
+            for chunk in val_slice.chunks_exact(8) {
+                let v = f64::from_le_bytes(chunk.try_into().unwrap());
+                cnt += usize::from(v <= rhs);
+            }
+        }
+    }
+    cnt
+}
+
+#[inline]
+fn count_dense_f64_with_dict(
+    val_slice: &[u8],
+    ord_slice: &[u8],
+    op: crate::ast::CmpOp,
+    rhs: f64,
+    target_code: u16,
+) -> usize {
+    use crate::ast::CmpOp;
+    let mut cnt = 0usize;
+    match op {
+        CmpOp::Eq => {
+            for (vchunk, ochunk) in val_slice.chunks_exact(8).zip(ord_slice.chunks_exact(2)) {
+                let v = f64::from_le_bytes(vchunk.try_into().unwrap());
+                let c = u16::from_le_bytes([ochunk[0], ochunk[1]]);
+                cnt += usize::from((c == target_code) & (v == rhs));
+            }
+        }
+        CmpOp::Ne => {
+            for (vchunk, ochunk) in val_slice.chunks_exact(8).zip(ord_slice.chunks_exact(2)) {
+                let v = f64::from_le_bytes(vchunk.try_into().unwrap());
+                let c = u16::from_le_bytes([ochunk[0], ochunk[1]]);
+                cnt += usize::from((c == target_code) & (v != rhs));
+            }
+        }
+        CmpOp::Gt => {
+            for (vchunk, ochunk) in val_slice.chunks_exact(8).zip(ord_slice.chunks_exact(2)) {
+                let v = f64::from_le_bytes(vchunk.try_into().unwrap());
+                let c = u16::from_le_bytes([ochunk[0], ochunk[1]]);
+                cnt += usize::from((c == target_code) & (v > rhs));
+            }
+        }
+        CmpOp::Ge => {
+            for (vchunk, ochunk) in val_slice.chunks_exact(8).zip(ord_slice.chunks_exact(2)) {
+                let v = f64::from_le_bytes(vchunk.try_into().unwrap());
+                let c = u16::from_le_bytes([ochunk[0], ochunk[1]]);
+                cnt += usize::from((c == target_code) & (v >= rhs));
+            }
+        }
+        CmpOp::Lt => {
+            for (vchunk, ochunk) in val_slice.chunks_exact(8).zip(ord_slice.chunks_exact(2)) {
+                let v = f64::from_le_bytes(vchunk.try_into().unwrap());
+                let c = u16::from_le_bytes([ochunk[0], ochunk[1]]);
+                cnt += usize::from((c == target_code) & (v < rhs));
+            }
+        }
+        CmpOp::Le => {
+            for (vchunk, ochunk) in val_slice.chunks_exact(8).zip(ord_slice.chunks_exact(2)) {
+                let v = f64::from_le_bytes(vchunk.try_into().unwrap());
+                let c = u16::from_le_bytes([ochunk[0], ochunk[1]]);
+                cnt += usize::from((c == target_code) & (v <= rhs));
+            }
+        }
+    }
+    cnt
+}
+
 pub(crate) struct MmapFixedCol {
     kind: DiskColKind,
     nulls: Mmap,
     values: Mmap,
     row_count: u32,
+    zmap_mmap: Option<Mmap>,
     zone_map: OnceLock<FixedZoneMap>,
 }
 
@@ -1307,25 +1570,45 @@ impl MmapFixedCol {
         if nulls.len() < rows || values.len() < rows.saturating_mul(width) {
             return Err(io_err(format!("corrupt cold column {col_name}: shorter than {rows} rows")));
         }
-        // Zone map persisted at segment write time; a missing or invalid file just falls
-        // back to the lazy full-column scan in `zones()`.
-        let zone_map = OnceLock::new();
-        if let Ok(bytes) = std::fs::read(dir.join(format!("col_{col_name}.zmap")))
-            && let Some(zm) = decode_zone_map(&bytes, kind, row_count)
-        {
-            let _ = zone_map.set(zm);
-        }
+        // Memory-map `.zmap` lazily without decoding on open; `zones()` decodes on first query
+        // and falls back to scanning the column if missing or invalid.
+        let zmap_mmap = File::open(dir.join(format!("col_{col_name}.zmap")))
+            .ok()
+            .and_then(|zf| {
+                let len = zf.metadata().ok()?.len() as usize;
+                if len < ZMAP_HEADER {
+                    return None;
+                }
+                unsafe { MmapOptions::new().map(&zf) }.ok()
+            });
         Ok(Self {
             kind,
             nulls,
             values,
             row_count,
-            zone_map,
+            zmap_mmap,
+            zone_map: OnceLock::new(),
         })
     }
 
     pub(super) fn clear_zone_map(&mut self) {
+        self.zmap_mmap = None;
         self.zone_map = OnceLock::new();
+    }
+
+    #[inline]
+    pub(crate) fn nulls_bytes(&self) -> &[u8] {
+        &self.nulls
+    }
+
+    #[inline]
+    pub(crate) fn values_bytes(&self) -> &[u8] {
+        &self.values
+    }
+
+    #[inline]
+    pub(super) fn zmap_bytes(&self) -> Option<&[u8]> {
+        self.zmap_mmap.as_deref()
     }
 
     #[inline]
@@ -1364,8 +1647,45 @@ impl MmapFixedCol {
 
     pub(crate) fn zones(&self) -> &FixedZoneMap {
         self.zone_map.get_or_init(|| {
+            if let Some(ref zm_mmap) = self.zmap_mmap
+                && let Some(zm) = decode_zone_map(zm_mmap, self.kind, self.row_count)
+            {
+                return zm;
+            }
             build_fixed_zone_map(self.kind, &self.nulls, &self.values, self.row_count as usize)
         })
+    }
+
+    /// True when every row in `0..limit_rows.min(self.row_count)` is non-null according to the zone map.
+    pub(crate) fn all_non_null(&self, limit_rows: u32) -> bool {
+        let n = (limit_rows.min(self.row_count) as usize)
+            .min(self.nulls.len())
+            .min(self.values.len() / 8);
+        if n < limit_rows.min(self.row_count) as usize {
+            return false;
+        }
+        if n == 0 {
+            return true;
+        }
+        match self.zones() {
+            FixedZoneMap::Int(blks) => blks.iter().enumerate().all(|(bi, b)| {
+                let s = bi * ZONE_BLOCK_ROWS;
+                if s >= n {
+                    return true;
+                }
+                let blk_len = (s + ZONE_BLOCK_ROWS).min(n) - s;
+                b.non_null as usize == blk_len
+            }),
+            FixedZoneMap::Float(blks) => blks.iter().enumerate().all(|(bi, b)| {
+                let s = bi * ZONE_BLOCK_ROWS;
+                if s >= n {
+                    return true;
+                }
+                let blk_len = (s + ZONE_BLOCK_ROWS).min(n) - s;
+                b.non_null as usize == blk_len
+            }),
+            FixedZoneMap::None => false,
+        }
     }
 
     /// Right-hand side of `col <op> value` in this column's native representation, under the
@@ -1482,24 +1802,59 @@ impl MmapFixedCol {
                 let mut total = 0usize;
                 for (bi, blk) in blks.iter().enumerate() {
                     let start = bi * ZONE_BLOCK_ROWS;
+                    if start >= n {
+                        break;
+                    }
                     let end = (start + ZONE_BLOCK_ROWS).min(n);
                     let blk_len = end - start;
                     let (skip, all_match) = int_zone_relation(*blk, op, rhs);
                     if skip {
                         continue;
                     }
-                    if all_match && seg_all_live && blk.non_null as usize == blk_len {
-                        match opt_dict {
-                            None => total += blk_len,
-                            Some((dc, target_code)) => {
-                                for rid in start..end {
-                                    if dc.code_at(rid as u32) == target_code {
-                                        total += 1;
+                    let (d_skip, d_all) = match opt_dict {
+                        Some((dc, target_code)) => dc.block_eq(bi, target_code),
+                        None => (false, true),
+                    };
+                    if d_skip {
+                        continue;
+                    }
+                    if seg_all_live && blk.non_null as usize == blk_len {
+                        if all_match {
+                            if d_all {
+                                total += blk_len;
+                            } else if let Some((dc, target_code)) = opt_dict {
+                                if let Some(ord_slice) = dc.ordinals_bytes().get(start * 2..end * 2) {
+                                    let mut blk_hits = 0usize;
+                                    for pair in ord_slice.chunks_exact(2) {
+                                        let c = u16::from_le_bytes([pair[0], pair[1]]);
+                                        blk_hits += usize::from(c == target_code);
+                                    }
+                                    total += blk_hits;
+                                } else {
+                                    for rid in start..end {
+                                        total += usize::from(dc.code_at(rid as u32) == target_code);
                                     }
                                 }
                             }
+                            continue;
                         }
-                        continue;
+                        let val_slice = &self.values[start * 8..end * 8];
+                        if d_all {
+                            total += count_dense_i64(val_slice, op, rhs);
+                            continue;
+                        }
+                        if let Some((dc, target_code)) = opt_dict
+                            && let Some(ord_slice) = dc.ordinals_bytes().get(start * 2..end * 2)
+                        {
+                            total += count_dense_i64_with_dict(
+                                val_slice,
+                                ord_slice,
+                                op,
+                                rhs,
+                                target_code,
+                            );
+                            continue;
+                        }
                     }
                     match opt_dict {
                         None => {
@@ -1534,24 +1889,59 @@ impl MmapFixedCol {
                 let mut total = 0usize;
                 for (bi, blk) in blks.iter().enumerate() {
                     let start = bi * ZONE_BLOCK_ROWS;
+                    if start >= n {
+                        break;
+                    }
                     let end = (start + ZONE_BLOCK_ROWS).min(n);
                     let blk_len = end - start;
                     let (skip, all_match) = float_zone_relation(*blk, op, rhs);
                     if skip {
                         continue;
                     }
-                    if all_match && seg_all_live && blk.non_null as usize == blk_len {
-                        match opt_dict {
-                            None => total += blk_len,
-                            Some((dc, target_code)) => {
-                                for rid in start..end {
-                                    if dc.code_at(rid as u32) == target_code {
-                                        total += 1;
+                    let (d_skip, d_all) = match opt_dict {
+                        Some((dc, target_code)) => dc.block_eq(bi, target_code),
+                        None => (false, true),
+                    };
+                    if d_skip {
+                        continue;
+                    }
+                    if seg_all_live && blk.non_null as usize == blk_len {
+                        if all_match {
+                            if d_all {
+                                total += blk_len;
+                            } else if let Some((dc, target_code)) = opt_dict {
+                                if let Some(ord_slice) = dc.ordinals_bytes().get(start * 2..end * 2) {
+                                    let mut blk_hits = 0usize;
+                                    for pair in ord_slice.chunks_exact(2) {
+                                        let c = u16::from_le_bytes([pair[0], pair[1]]);
+                                        blk_hits += usize::from(c == target_code);
+                                    }
+                                    total += blk_hits;
+                                } else {
+                                    for rid in start..end {
+                                        total += usize::from(dc.code_at(rid as u32) == target_code);
                                     }
                                 }
                             }
+                            continue;
                         }
-                        continue;
+                        let val_slice = &self.values[start * 8..end * 8];
+                        if d_all {
+                            total += count_dense_f64(val_slice, op, rhs);
+                            continue;
+                        }
+                        if let Some((dc, target_code)) = opt_dict
+                            && let Some(ord_slice) = dc.ordinals_bytes().get(start * 2..end * 2)
+                        {
+                            total += count_dense_f64_with_dict(
+                                val_slice,
+                                ord_slice,
+                                op,
+                                rhs,
+                                target_code,
+                            );
+                            continue;
+                        }
                     }
                     match opt_dict {
                         None => {
@@ -1598,6 +1988,33 @@ impl MmapFixedCol {
                 // Compensated, value by value in row order, like the in-memory `sum`, so a
                 // cold column and the same rows in memory give the same answer.
                 let mut out = crate::exact_sum::ExactSum::default();
+                if seg_all_live
+                    && let FixedZoneMap::Float(blks) = self.zones()
+                {
+                    for (bi, blk) in blks.iter().enumerate() {
+                        let start = bi * ZONE_BLOCK_ROWS;
+                        if start >= n {
+                            break;
+                        }
+                        if blk.non_null == 0 {
+                            continue;
+                        }
+                        let end = (start + ZONE_BLOCK_ROWS).min(n);
+                        let blk_len = end - start;
+                        if blk.non_null as usize == blk_len {
+                            for chunk in self.values[start * 8..end * 8].chunks_exact(8) {
+                                out.add_f64(f64::from_le_bytes(chunk.try_into().unwrap()));
+                            }
+                        } else {
+                            for rid in start..end {
+                                if self.nulls[rid] == 0 {
+                                    out.add_f64(self.read_f64(rid as u32));
+                                }
+                            }
+                        }
+                    }
+                    return Some(out);
+                }
                 for rid in 0..n {
                     if self.nulls[rid] == 0 && (seg_all_live || is_live(rid as u32)) {
                         out.add_f64(self.read_f64(rid as u32));
@@ -1607,6 +2024,36 @@ impl MmapFixedCol {
             }
             DiskColKind::Int64 => {
                 // i128 so totals through or beyond the i64 range stay exact until the end.
+                if seg_all_live
+                    && let FixedZoneMap::Int(blks) = self.zones()
+                {
+                    let mut acc_i128: i128 = 0;
+                    for (bi, blk) in blks.iter().enumerate() {
+                        let start = bi * ZONE_BLOCK_ROWS;
+                        if start >= n {
+                            break;
+                        }
+                        if blk.non_null == 0 {
+                            continue;
+                        }
+                        let end = (start + ZONE_BLOCK_ROWS).min(n);
+                        let blk_len = end - start;
+                        if blk.non_null as usize == blk_len {
+                            let mut blk_sum: i128 = 0;
+                            for chunk in self.values[start * 8..end * 8].chunks_exact(8) {
+                                blk_sum += i64::from_le_bytes(chunk.try_into().unwrap()) as i128;
+                            }
+                            acc_i128 += blk_sum;
+                        } else {
+                            for rid in start..end {
+                                if self.nulls[rid] == 0 {
+                                    acc_i128 += self.read_i64(rid as u32) as i128;
+                                }
+                            }
+                        }
+                    }
+                    return Some(crate::exact_sum::ExactSum::from_parts(acc_i128, 0.0, 0.0));
+                }
                 let mut out = crate::exact_sum::ExactSum::default();
                 for rid in 0..n {
                     if self.nulls[rid] == 0 && (seg_all_live || is_live(rid as u32)) {
@@ -1786,6 +2233,11 @@ impl MmapVecIvf {
         let sq8 = unsafe { std::slice::from_raw_parts(ptr, self.dim) };
         (rid, sq8)
     }
+
+    #[inline]
+    pub(super) fn as_bytes(&self) -> &[u8] {
+        &self.mmap
+    }
 }
 
 pub(super) fn build_vec_ivf_file(
@@ -1812,6 +2264,29 @@ pub(super) fn build_vec_ivf_file(
     let n = live_rids.len();
     let k = (n as f64).sqrt().round().clamp(16.0, 256.0) as usize;
 
+    // Quantize all `n` vectors once into a single flat `Vec<i8>` instead of `3 * N` `Arc<[i8]>` heap allocs.
+    let mut all_sq8 = vec![0i8; n * dim];
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        all_sq8
+            .par_chunks_mut(dim)
+            .enumerate()
+            .for_each(|(idx, dst)| {
+                if let Some(v) = rows.vec(live_rids[idx] as usize) {
+                    quantize_sq8_into(v, dst);
+                }
+            });
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        for (idx, dst) in all_sq8.chunks_mut(dim).enumerate() {
+            if let Some(v) = rows.vec(live_rids[idx] as usize) {
+                quantize_sq8_into(v, dst);
+            }
+        }
+    }
+
     let mut centroids = vec![0.0f32; k * dim];
     for c in 0..k {
         let src_rid = live_rids[(c * n) / k] as usize;
@@ -1825,24 +2300,23 @@ pub(super) fn build_vec_ivf_file(
     }
 
     let train_step = (n / 16_384).max(1);
-    let train_rids: Vec<u32> = live_rids.iter().copied().step_by(train_step).collect();
+    let train_indices: Vec<usize> = (0..n).step_by(train_step).collect();
 
-    let mut c_sq8: Vec<Arc<[i8]>> = Vec::with_capacity(k);
+    let mut c_sq8 = vec![0i8; k * dim];
     for _iter in 0..2 {
-        c_sq8.clear();
         for c in 0..k {
-            c_sq8.push(quantize_sq8(&centroids[c * dim..(c + 1) * dim]));
+            quantize_sq8_into(
+                &centroids[c * dim..(c + 1) * dim],
+                &mut c_sq8[c * dim..(c + 1) * dim],
+            );
         }
 
-        let assign_fn = |&rid: &u32| -> usize {
-            let Some(v) = rows.vec(rid as usize) else {
-                return 0;
-            };
-            let vq = quantize_sq8(v);
+        let assign_fn = |&idx: &usize| -> usize {
+            let vq = &all_sq8[idx * dim..(idx + 1) * dim];
             let mut best_c = 0usize;
             let mut best_d = f64::NEG_INFINITY;
-            for (c, cq) in c_sq8.iter().enumerate() {
-                let d = dot_sq8(&vq, cq);
+            for (c, cq) in c_sq8.chunks_exact(dim).enumerate() {
+                let d = dot_sq8(vq, cq);
                 if d > best_d {
                     best_d = d;
                     best_c = c;
@@ -1854,14 +2328,15 @@ pub(super) fn build_vec_ivf_file(
         #[cfg(feature = "parallel")]
         let train_assign: Vec<usize> = {
             use rayon::prelude::*;
-            train_rids.par_iter().map(assign_fn).collect()
+            train_indices.par_iter().map(assign_fn).collect()
         };
         #[cfg(not(feature = "parallel"))]
-        let train_assign: Vec<usize> = train_rids.iter().map(assign_fn).collect();
+        let train_assign: Vec<usize> = train_indices.iter().map(assign_fn).collect();
 
         let mut sums = vec![0.0f64; k * dim];
         let mut counts = vec![0usize; k];
-        for (&rid, &cid) in train_rids.iter().zip(train_assign.iter()) {
+        for (&idx, &cid) in train_indices.iter().zip(train_assign.iter()) {
+            let rid = live_rids[idx];
             if let Some(v) = rows.vec(rid as usize) {
                 let vnorm = l2_norm_f64(v).max(1e-12);
                 let inv = 1.0 / vnorm;
@@ -1889,42 +2364,41 @@ pub(super) fn build_vec_ivf_file(
         }
     }
 
-    c_sq8.clear();
     for c in 0..k {
-        c_sq8.push(quantize_sq8(&centroids[c * dim..(c + 1) * dim]));
+        quantize_sq8_into(
+            &centroids[c * dim..(c + 1) * dim],
+            &mut c_sq8[c * dim..(c + 1) * dim],
+        );
     }
 
-    let assign_all_fn = |&rid: &u32| -> (usize, u32, Arc<[i8]>) {
-        let v = match rows.vec(rid as usize) {
-            Some(v) => v.as_ref(),
-            None => &[][..],
-        };
-        let vq = quantize_sq8(v);
+    let assign_all_fn = |(idx, &rid): (usize, &u32)| -> (u16, u32, u32) {
+        let vq = &all_sq8[idx * dim..(idx + 1) * dim];
         let mut best_c = 0usize;
         let mut best_d = f64::NEG_INFINITY;
-        for (c, cq) in c_sq8.iter().enumerate() {
-            let d = dot_sq8(&vq, cq);
+        for (c, cq) in c_sq8.chunks_exact(dim).enumerate() {
+            let d = dot_sq8(vq, cq);
             if d > best_d {
                 best_d = d;
                 best_c = c;
             }
         }
-        (best_c, rid, vq)
+        (best_c as u16, rid, idx as u32)
     };
 
     #[cfg(feature = "parallel")]
-    let mut assigned: Vec<(usize, u32, Arc<[i8]>)> = {
+    let mut assigned: Vec<(u16, u32, u32)> = {
         use rayon::prelude::*;
-        live_rids.par_iter().map(assign_all_fn).collect()
+        live_rids.par_iter().enumerate().map(assign_all_fn).collect()
     };
     #[cfg(not(feature = "parallel"))]
-    let mut assigned: Vec<(usize, u32, Arc<[i8]>)> = live_rids.iter().map(assign_all_fn).collect();
+    let mut assigned: Vec<(u16, u32, u32)> =
+        live_rids.iter().enumerate().map(assign_all_fn).collect();
 
     assigned.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
 
     let mut cluster_counts = vec![0u32; k];
     for &(cid, _, _) in &assigned {
-        cluster_counts[cid] += 1;
+        cluster_counts[cid as usize] += 1;
     }
     let mut cluster_offsets = Vec::with_capacity(k + 1);
     let mut acc = 0u32;
@@ -1956,30 +2430,52 @@ pub(super) fn build_vec_ivf_file(
     hdr[48..56].copy_from_slice(&cluster_sq8_off.to_le_bytes());
     w.write_all(&hdr).map_err(io_err)?;
 
+    const ZERO_PAD_64: [u8; 64] = [0u8; 64];
+    #[cfg(target_endian = "little")]
+    {
+        let c_bytes = unsafe {
+            std::slice::from_raw_parts(centroids.as_ptr() as *const u8, centroids.len() * 4)
+        };
+        w.write_all(c_bytes).map_err(io_err)?;
+    }
+    #[cfg(not(target_endian = "little"))]
     for &val in &centroids {
         w.write_all(&val.to_le_bytes()).map_err(io_err)?;
     }
     let pad1 = (cluster_offsets_off - (centroids_off + centroids_bytes)) as usize;
     if pad1 > 0 {
-        w.write_all(&vec![0u8; pad1]).map_err(io_err)?;
+        w.write_all(&ZERO_PAD_64[..pad1]).map_err(io_err)?;
     }
+    #[cfg(target_endian = "little")]
+    {
+        let off_bytes = unsafe {
+            std::slice::from_raw_parts(
+                cluster_offsets.as_ptr() as *const u8,
+                cluster_offsets.len() * 4,
+            )
+        };
+        w.write_all(off_bytes).map_err(io_err)?;
+    }
+    #[cfg(not(target_endian = "little"))]
     for &off in &cluster_offsets {
         w.write_all(&off.to_le_bytes()).map_err(io_err)?;
     }
     let pad2 = (cluster_rids_off - (cluster_offsets_off + cluster_offsets_bytes)) as usize;
     if pad2 > 0 {
-        w.write_all(&vec![0u8; pad2]).map_err(io_err)?;
+        w.write_all(&ZERO_PAD_64[..pad2]).map_err(io_err)?;
     }
     for &(_, rid, _) in &assigned {
         w.write_all(&rid.to_le_bytes()).map_err(io_err)?;
     }
     let pad3 = (cluster_sq8_off - (cluster_rids_off + cluster_rids_bytes)) as usize;
     if pad3 > 0 {
-        w.write_all(&vec![0u8; pad3]).map_err(io_err)?;
+        w.write_all(&ZERO_PAD_64[..pad3]).map_err(io_err)?;
     }
-    for (_, _, sq8) in &assigned {
-        let sq8_u8 = unsafe { std::slice::from_raw_parts(sq8.as_ptr() as *const u8, sq8.len()) };
-        w.write_all(sq8_u8).map_err(io_err)?;
+    let all_sq8_u8 =
+        unsafe { std::slice::from_raw_parts(all_sq8.as_ptr() as *const u8, all_sq8.len()) };
+    for &(_, _, idx) in &assigned {
+        let base = (idx as usize) * dim;
+        w.write_all(&all_sq8_u8[base..base + dim]).map_err(io_err)?;
     }
     w.flush().map_err(io_err)?;
     Ok(())
@@ -2016,6 +2512,26 @@ impl MmapVecCol {
             sq8_mmap,
             ivf,
         })
+    }
+
+    #[inline]
+    pub(super) fn nulls_bytes(&self) -> &[u8] {
+        &self.nulls
+    }
+
+    #[inline]
+    pub(super) fn f32_bytes(&self) -> &[u8] {
+        &self.f32_mmap
+    }
+
+    #[inline]
+    pub(super) fn sq8_bytes(&self) -> &[u8] {
+        &self.sq8_mmap
+    }
+
+    #[inline]
+    pub(super) fn ivf_bytes(&self) -> Option<&[u8]> {
+        self.ivf.as_ref().map(|ivf| ivf.as_bytes())
     }
 
     #[inline]

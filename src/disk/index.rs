@@ -35,9 +35,9 @@ pub(super) struct MmapHashIndex {
 }
 
 impl MmapHashIndex {
-    pub(super) fn write_from_map(
+    pub(super) fn write_from_map<V: AsRef<[u32]>>(
         path: &Path,
-        map: &FxHashMap<Vec<u8>, Vec<u32>>,
+        map: &FxHashMap<Vec<u8>, V>,
     ) -> Result<(), Error> {
         let key_count = map.len();
         let cap = if key_count == 0 {
@@ -51,7 +51,8 @@ impl MmapHashIndex {
         let mut buckets = vec![0u8; buckets_bytes];
         let mut payload = Vec::with_capacity(key_count * 32);
 
-        for (key_bytes, row_ids) in map {
+        for (key_bytes, row_ids_v) in map {
+            let row_ids = row_ids_v.as_ref();
             if row_ids.is_empty() {
                 continue;
             }
@@ -98,6 +99,11 @@ impl MmapHashIndex {
         f.write_all(&payload).map_err(io_err)?;
         f.flush().map_err(io_err)?;
         Ok(())
+    }
+
+    #[inline]
+    pub(super) fn as_bytes(&self) -> &[u8] {
+        &self.mmap
     }
 
     pub(super) fn open(path: &Path) -> Result<Self, Error> {
@@ -202,6 +208,38 @@ pub(super) fn with_text_index_key<R>(s: &str, f: impl FnOnce(&[u8]) -> R) -> R {
 }
 
 #[inline]
+pub(super) fn with_index_cell_key<R>(cell: &Cell, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+    match cell {
+        Cell::Null | Cell::Vec(_) => None,
+        Cell::Text(s) => Some(with_text_index_key(s, f)),
+        Cell::SmallText(s) => Some(with_text_index_key(s.as_str(), f)),
+        Cell::Int(n) => {
+            let mut buf = [0u8; 9];
+            buf[0] = 2;
+            buf[1..9].copy_from_slice(&n.to_le_bytes());
+            Some(f(&buf))
+        }
+        Cell::Time(t) => {
+            let mut buf = [0u8; 9];
+            buf[0] = 3;
+            buf[1..9].copy_from_slice(&t.to_le_bytes());
+            Some(f(&buf))
+        }
+        Cell::Bool(b) => {
+            let buf = [4u8, u8::from(*b)];
+            Some(f(&buf))
+        }
+        Cell::Float(fl) => {
+            let mut buf = [0u8; 9];
+            buf[0] = 5;
+            let bits = if *fl == 0.0 { 0u64 } else { fl.to_bits() };
+            buf[1..9].copy_from_slice(&bits.to_le_bytes());
+            Some(f(&buf))
+        }
+    }
+}
+
+#[inline]
 pub(super) fn encode_index_cell_key(cell: &Cell, out: &mut Vec<u8>) -> bool {
     out.clear();
     match cell {
@@ -283,6 +321,7 @@ pub struct MmapBm25Builder {
     doc_id_bytes: Vec<u8>,
     total_tokens: u64,
     terms: FxHashMap<String, (u32, u32, Vec<u8>)>,
+    tf_scratch: FxHashMap<u64, SmallVec<[(usize, u32); 1]>>,
 }
 
 impl MmapBm25Builder {
@@ -296,6 +335,7 @@ impl MmapBm25Builder {
             doc_id_bytes: Vec::new(),
             total_tokens: 0,
             terms: FxHashMap::default(),
+            tf_scratch: FxHashMap::default(),
         }
     }
 
@@ -311,22 +351,31 @@ impl MmapBm25Builder {
         if tokens.is_empty() {
             return;
         }
-        let mut tf_map: FxHashMap<&str, u32> = FxHashMap::default();
-        for tok in tokens {
-            *tf_map.entry(tok.as_str()).or_insert(0) += 1;
-        }
-        for (term, tf) in tf_map {
-            if let Some(entry) = self.terms.get_mut(term) {
-                let delta = doc_idx - entry.1;
-                entry.0 += 1;
-                entry.1 = doc_idx;
-                push_uvarint32(&mut entry.2, delta);
-                push_uvarint32(&mut entry.2, tf);
+        for (i, tok) in tokens.iter().enumerate() {
+            let s = tok.as_str();
+            let h = fnv1a_hash64(s.as_bytes());
+            let bucket = self.tf_scratch.entry(h).or_default();
+            if let Some((_, tf)) = bucket.iter_mut().find(|(idx, _)| tokens[*idx].as_str() == s) {
+                *tf += 1;
             } else {
-                let mut post = Vec::with_capacity(8);
-                push_uvarint32(&mut post, doc_idx);
-                push_uvarint32(&mut post, tf);
-                self.terms.insert(term.to_string(), (1, doc_idx, post));
+                bucket.push((i, 1));
+            }
+        }
+        for (_, bucket) in self.tf_scratch.drain() {
+            for (tok_idx, tf) in bucket {
+                let term = tokens[tok_idx].as_str();
+                if let Some(entry) = self.terms.get_mut(term) {
+                    let delta = doc_idx - entry.1;
+                    entry.0 += 1;
+                    entry.1 = doc_idx;
+                    push_uvarint32(&mut entry.2, delta);
+                    push_uvarint32(&mut entry.2, tf);
+                } else {
+                    let mut post = Vec::with_capacity(8);
+                    push_uvarint32(&mut post, doc_idx);
+                    push_uvarint32(&mut post, tf);
+                    self.terms.insert(term.to_string(), (1, doc_idx, post));
+                }
             }
         }
     }
@@ -432,21 +481,44 @@ impl MmapBm25Builder {
         let nonce = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let tmp_path = dst_path.with_extension(format!("mmap.{}.{nonce}.tmp", std::process::id()));
         let res = (|| -> Result<(), Error> {
+            const ZERO_PAD_64: [u8; 64] = [0u8; 64];
             let mut w =
                 BufWriter::with_capacity(512 * 1024, File::create(&tmp_path).map_err(io_err)?);
             w.write_all(&hdr).map_err(io_err)?;
             let write_pad = |w: &mut BufWriter<File>, cur: u64, target: u64| -> Result<(), Error> {
                 let p = (target - cur) as usize;
                 if p > 0 {
-                    w.write_all(&vec![0u8; p]).map_err(io_err)?;
+                    w.write_all(&ZERO_PAD_64[..p]).map_err(io_err)?;
                 }
                 Ok(())
             };
             write_pad(&mut w, BM25_MMAP_HDR_LEN as u64, doc_lens_off)?;
+            #[cfg(target_endian = "little")]
+            {
+                let dl_bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        self.doc_lens.as_ptr() as *const u8,
+                        self.doc_lens.len() * 4,
+                    )
+                };
+                w.write_all(dl_bytes).map_err(io_err)?;
+            }
+            #[cfg(not(target_endian = "little"))]
             for &dl in &self.doc_lens {
                 w.write_all(&dl.to_le_bytes()).map_err(io_err)?;
             }
             write_pad(&mut w, doc_lens_off + doc_lens_bytes, doc_id_offs_off)?;
+            #[cfg(target_endian = "little")]
+            {
+                let off_bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        self.doc_id_offsets.as_ptr() as *const u8,
+                        self.doc_id_offsets.len() * 8,
+                    )
+                };
+                w.write_all(off_bytes).map_err(io_err)?;
+            }
+            #[cfg(not(target_endian = "little"))]
             for &off in &self.doc_id_offsets {
                 w.write_all(&off.to_le_bytes()).map_err(io_err)?;
             }
