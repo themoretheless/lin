@@ -1,11 +1,13 @@
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
+use smallvec::SmallVec;
 
 mod agg;
 mod cold;
@@ -35,6 +37,10 @@ pub(crate) use crate::eval::*;
 pub(crate) use join::{
     JoinFieldPlan, emit_join_row, insert_prefixed, merge_join_row, order_total_cell, plan_join_fields,
     pred_total_gt, project_join_fields, rows_to_rough_batch,
+};
+
+const _: () = {
+    let _ = (emit_join_row, insert_prefixed, project_join_fields);
 };
 
 use dml::{pack_has_schema, stmt_append_only, stmt_schema, stmt_writes};
@@ -74,16 +80,23 @@ pub struct Handle {
     pub ms: f64,
 }
 
+#[inline]
+fn shape_orders_3() -> &'static Arc<crate::store::RowShape> {
+    static SHAPE: OnceLock<Arc<crate::store::RowShape>> = OnceLock::new();
+    SHAPE.get_or_init(|| Row::shape_of(&["id", "total", "user_id"]))
+}
+
 impl Handle {
     #[cold]
     #[inline(never)]
     fn recycle_rows_slow(&mut self) {
         if self.rows.len() >= 1024
             && self.rows.len() <= 2_500_000
-            && self
-                .rows
-                .first()
-                .is_some_and(|r| r.len() == 2 && r.contains_key("id") && r.contains_key("title"))
+            && self.rows.first().is_some_and(|r| {
+                r.shape_arc()
+                    .is_some_and(|s| Arc::ptr_eq(s, crate::store::shape_id_title()))
+                    || (r.len() == 2 && r.contains_key("id") && r.contains_key("title"))
+            })
         {
             crate::store::release_id_title_rows(std::mem::take(&mut self.rows));
         } else if self.rows.len() >= 1024
@@ -92,12 +105,15 @@ impl Handle {
         {
             crate::store::release_general_rows(std::mem::take(&mut self.rows));
         } else if self.rows.len() == 1 && self.rows[0].len() == 3 {
-            let is_orders_shape = {
-                let mut ks = self.rows[0].keys();
-                ks.next().map(String::as_str) == Some("id")
-                    && ks.next().map(String::as_str) == Some("total")
-                    && ks.next().map(String::as_str) == Some("user_id")
-            };
+            let is_orders_shape = self.rows[0]
+                .shape_arc()
+                .is_some_and(|s| Arc::ptr_eq(s, shape_orders_3()))
+                || {
+                    let mut ks = self.rows[0].keys();
+                    ks.next().map(String::as_str) == Some("id")
+                        && ks.next().map(String::as_str) == Some("total")
+                        && ks.next().map(String::as_str) == Some("user_id")
+                };
             if is_orders_shape && let Some(r) = self.rows.pop() {
                 crate::store::release_orders_row(r);
             }
@@ -859,6 +875,12 @@ impl Db {
 
     /// Freeze a consistent in-memory snapshot at the current `gen` for concurrent readers.
     pub fn reader(&mut self) -> ReadDb {
+        if self.store.has_deferred_doc_ops() {
+            self.store.flush_fts_deferred_docs();
+        }
+        if self.store.facts_rows_stale {
+            self.store.ensure_facts_rows();
+        }
         let cache_key = (
             self.store.r#gen,
             self.store.docs_epoch,
@@ -867,8 +889,7 @@ impl Db {
             self.store.edges.len(),
             self.store.facts_len(),
         );
-        if !self.store.has_deferred_doc_ops()
-            && let Some((k, cached)) = &self.reader_cache
+        if let Some((k, cached)) = &self.reader_cache
             && *k == cache_key
         {
             return cached.clone();
@@ -1316,13 +1337,24 @@ impl Db {
         } else {
             None
         };
+        let scan_project = if !has_params
+            && stmts.len() == 1
+            && let Stmt::Query(q) = &stmts[0]
+            && !writes
+            && point_get.is_none()
+            && agg_plan.is_none()
+        {
+            Self::try_extract_scan_project(q, plan_cat).map(Arc::new)
+        } else {
+            None
+        };
         let point_delete = if !has_params && stmts.len() == 1 {
             Self::try_extract_point_delete(&stmts[0], &self.catalog, &self.store).map(Arc::new)
         } else {
             None
         };
         let point_update = if !has_params && stmts.len() == 1 {
-            Self::try_extract_point_update(&stmts[0], &self.store).map(Arc::new)
+            Self::try_extract_point_update(&stmts[0], &self.catalog, &self.store).map(Arc::new)
         } else {
             None
         };
@@ -1340,6 +1372,7 @@ impl Db {
             schema,
             has_params,
             point_get,
+            scan_project,
             agg_plan,
             point_delete,
             point_update,
@@ -1625,7 +1658,7 @@ impl Db {
             .map(|rec| {
                 let mut row = crate::store::acquire_row();
                 for (k, v) in &rec.fields {
-                    row.insert(k.clone(), value_cell(v, now));
+                    row.insert(k.as_str(), value_cell(v, now));
                 }
                 row
             })
@@ -2410,12 +2443,17 @@ impl Db {
                 Stmt::Let { name, query } => {
                     let rows = self.exec_query(query, &bindings)?;
                     let n = rows.len();
-                    let out_rows = if rows_wanted {
-                        rows.clone()
+                    let out_rows = if i == last_idx {
+                        if rows_wanted {
+                            self.check_output_quota(&rows)?;
+                            rows
+                        } else {
+                            Vec::new()
+                        }
                     } else {
+                        bindings.insert(name.clone(), rows);
                         Vec::new()
                     };
-                    bindings.insert(name.clone(), rows);
                     last = Some(Handle {
                         plan: Arc::clone(plan),
                         rows: out_rows,
@@ -2823,18 +2861,26 @@ impl Db {
 
     #[inline]
     pub(crate) fn can_fast_docs_wing_update(&self, pu: &prepared::PointUpdatePlan) -> bool {
-        pu.is_docs_wing_only
-            && !self.is_durable()
-            && !self.store.is_disk_backed(&pu.collection)
-            && (pu.cas.is_some() || pu.cas_each)
-            && (self.catalog.guards.is_empty()
+        if !pu.is_docs_wing_only
+            || self.is_durable()
+            || self.store.is_disk_backed(&pu.collection)
+            || !(pu.cas.is_some() || pu.cas_each)
+        {
+            return false;
+        }
+        let schema_ok = if self.catalog.hash_u64() == pu.prepared_cat_hash {
+            pu.schema_fast_eligible
+        } else {
+            (self.catalog.guards.is_empty()
                 || !self
                     .catalog
                     .guards
                     .iter()
                     .any(|g| g.collection == "docs" && g.field == "wing"))
-            && (self.catalog.fks.is_empty()
-                || !self.catalog.fks.iter().any(|fk| fk.from_col == "docs"))
+                && (self.catalog.fks.is_empty()
+                    || !self.catalog.fks.iter().any(|fk| fk.from_col == "docs"))
+        };
+        schema_ok
             && (self.store.fts.is_empty()
                 || !self
                     .store
@@ -2851,6 +2897,16 @@ impl Db {
         want_rows: bool,
         tx_mode: bool,
     ) -> Result<(Option<Cell>, Option<u8>, Vec<Row>), Error> {
+        let (has_unique_idx, wing_idx_kind) = if self.catalog.hash_u64() == pu.prepared_cat_hash
+            && self.store.indexes.len() == pu.prepared_indexes_len
+        {
+            (pu.has_unique_idx, pu.wing_idx_kind)
+        } else {
+            prepared::classify_docs_wing_indexes(&self.store.indexes, &pu.collection)
+        };
+        let has_complex_idx = wing_idx_kind == prepared::WingIdxKind::Complex;
+        let needs_ts = wing_idx_kind == prepared::WingIdxKind::WingTs;
+
         let Store {
             collections,
             docs_wing,
@@ -2902,35 +2958,7 @@ impl Db {
         } else {
             dyn_arc.as_deref().unwrap_or("")
         };
-        let mut has_complex_idx = false;
-        let mut has_unique_idx = false;
-        let mut needs_ts = false;
-        for live_idx in indexes.values() {
-            if live_idx.def.collection == pu.collection {
-                if live_idx.def.unique {
-                    has_unique_idx = true;
-                }
-                if live_idx.def.pred.is_none()
-                    && live_idx.def.fields.len() == 1
-                    && live_idx.def.fields[0] == "wing"
-                {
-                    // simple wing index
-                } else if live_idx.def.pred.is_none()
-                    && live_idx.def.fields.len() == 2
-                    && live_idx.def.fields[0] == "wing"
-                    && live_idx.def.fields[1] == "ts"
-                {
-                    needs_ts = true;
-                } else if live_idx.def.pred.is_some()
-                    || live_idx.def.fields.iter().any(|f| f == "wing")
-                {
-                    has_complex_idx = true;
-                    break;
-                }
-            }
-        }
-        let mut old_keys: smallvec::SmallVec<[crate::index::IndexKey; 4]> =
-            smallvec::SmallVec::new();
+        let mut old_keys: SmallVec<[crate::index::IndexKey; 4]> = SmallVec::new();
         if has_complex_idx {
             for live_idx in indexes.values() {
                 if live_idx.def.collection == pu.collection {
@@ -2938,7 +2966,7 @@ impl Db {
                 }
             }
         }
-        let ts_cell = if !has_complex_idx && needs_ts {
+        let ts_cell = if needs_ts {
             if shape_hit {
                 pu.ts_slot
                     .and_then(|s| row.cells_slice().get(s as usize))
@@ -2957,7 +2985,7 @@ impl Db {
         } else if let Some(slot) = row.get_mut("wing") {
             Some(std::mem::replace(slot, new_cell))
         } else {
-            row.insert("wing".to_string(), new_cell)
+            row.insert("wing", new_cell)
         };
         let same_wing = prev_cell
             .as_ref()
@@ -2976,7 +3004,7 @@ impl Db {
                             {
                                 *slot = prev;
                             } else {
-                                row.insert("wing".to_string(), prev);
+                                row.insert("wing", prev);
                             }
                         } else {
                             row.remove("wing");
@@ -2985,7 +3013,7 @@ impl Db {
                     }
                 }
             }
-        } else if !same_wing {
+        } else if !same_wing && wing_idx_kind != prepared::WingIdxKind::None {
             if defer_wing_idx
                 && !has_unique_idx
                 && deferred_doc_wing_updates.len() < deferred_doc_wing_updates.inline_size()
@@ -3018,7 +3046,7 @@ impl Db {
                                     {
                                         *slot = prev;
                                     } else {
-                                        row.insert("wing".to_string(), prev);
+                                        row.insert("wing", prev);
                                     }
                                 } else {
                                     row.remove("wing");
@@ -3044,7 +3072,7 @@ impl Db {
                                     {
                                         *slot = prev;
                                     } else {
-                                        row.insert("wing".to_string(), prev);
+                                        row.insert("wing", prev);
                                     }
                                 } else {
                                     row.remove("wing");
@@ -3060,7 +3088,12 @@ impl Db {
             docs_wing.set_str(idx, wing_str);
         }
         if tx_mode {
-            return Ok((prev_cell, wing_slot_used, Vec::new()));
+            let out_rows = if want_rows && !large_table {
+                vec![row.clone()]
+            } else {
+                Vec::new()
+            };
+            return Ok((prev_cell, wing_slot_used, out_rows));
         }
         let out_rows = if !want_rows || large_table {
             if let Some(prev) = prev_cell
@@ -3075,8 +3108,63 @@ impl Db {
         Ok((None, wing_slot_used, out_rows))
     }
 
+    #[inline]
     fn run_prepared_ext(&mut self, prepared: &Prepared, want_rows: bool) -> Result<Handle, Error> {
-        if let Some(pg) = &prepared.point_get {
+        self.run_exec_plan_core(
+            &prepared.stmts,
+            &prepared.plan,
+            prepared.writes,
+            prepared.append_only,
+            prepared.schema,
+            prepared.point_get.as_deref(),
+            prepared.scan_project.as_deref(),
+            prepared.agg_plan.as_deref(),
+            prepared.point_delete.as_deref(),
+            prepared.point_update.as_deref(),
+            prepared.append_facts.as_deref(),
+            want_rows,
+        )
+    }
+
+    #[inline]
+    pub(crate) fn run_exec_plan_ext(
+        &mut self,
+        ep: &prepared::ExecPlan,
+        want_rows: bool,
+    ) -> Result<Handle, Error> {
+        self.run_exec_plan_core(
+            &ep.stmts,
+            &ep.plan,
+            ep.writes,
+            ep.append_only,
+            ep.schema,
+            ep.point_get.as_deref(),
+            ep.scan_project.as_deref(),
+            ep.agg_plan.as_deref(),
+            ep.point_delete.as_deref(),
+            ep.point_update.as_deref(),
+            ep.append_facts.as_deref(),
+            want_rows,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_exec_plan_core(
+        &mut self,
+        stmts: &[Stmt],
+        plan: &Arc<Plan>,
+        writes: bool,
+        append_only: bool,
+        schema: bool,
+        point_get: Option<&prepared::PointGetPlan>,
+        scan_project: Option<&prepared::ScanProjectPlan>,
+        agg_plan: Option<&prepared::AggPlan>,
+        point_delete: Option<&prepared::PointDeletePlan>,
+        point_update: Option<&prepared::PointUpdatePlan>,
+        append_facts: Option<&prepared::PreparedAppendFacts>,
+        want_rows: bool,
+    ) -> Result<Handle, Error> {
+        if let Some(pg) = point_get {
             if !self.store.fts_deferred_doc_swaps.is_empty()
                 || (!pg.is_docs_id_title && !self.store.deferred_doc_wing_updates.is_empty())
             {
@@ -3107,7 +3195,7 @@ impl Db {
                         Vec::new()
                     };
                     return Ok(Handle {
-                        plan: prepared.plan.clone(),
+                        plan: Arc::clone(plan),
                         rows,
                         done: Done {
                             r#gen: self.store.r#gen,
@@ -3131,7 +3219,7 @@ impl Db {
                 None => (Vec::new(), 0),
             };
             return Ok(Handle {
-                plan: prepared.plan.clone(),
+                plan: Arc::clone(plan),
                 rows,
                 done: Done {
                     r#gen: self.store.r#gen,
@@ -3141,18 +3229,36 @@ impl Db {
                 ms: 0.0,
             });
         }
-        if self.follower && prepared.writes {
+        if let Some(sp) = scan_project {
+            if sp.collection == "docs" && self.store.has_deferred_doc_ops() {
+                self.store.flush_fts_deferred_docs();
+            } else if sp.collection == "facts"
+                && self.store.facts_rows_stale
+                && !self.store.is_disk_backed("facts")
+            {
+                self.store.ensure_facts_rows();
+            }
+            let (rows, n) = self.execute_scan_project(sp, want_rows)?;
+            return Ok(Handle {
+                plan: Arc::clone(plan),
+                rows,
+                done: Done {
+                    r#gen: self.store.r#gen,
+                    n,
+                },
+                message: None,
+                ms: 0.0,
+            });
+        }
+        if self.follower && writes {
             return Err(Error::runtime(
                 "follower: read-only — apply_wal for replication, open primary for writes",
             ));
         }
-        let can_coalesce_wing_update = prepared
-            .point_update
-            .as_ref()
-            .is_some_and(|pu| pu.is_docs_wing_only)
+        let can_coalesce_wing_update = point_update.is_some_and(|pu| pu.is_docs_wing_only)
             && self.store.deferred_doc_wing_updates.len()
                 < self.store.deferred_doc_wing_updates.inline_size();
-        if (prepared.point_delete.is_none() && !self.store.fts_deferred_doc_swaps.is_empty())
+        if (point_delete.is_none() && !self.store.fts_deferred_doc_swaps.is_empty())
             || (!self.store.deferred_doc_wing_updates.is_empty() && !can_coalesce_wing_update)
         {
             self.store.flush_fts_deferred_docs();
@@ -3161,7 +3267,7 @@ impl Db {
         // rebuild it from the engine first, so the search does not fall back to loading
         // the collection.
         if !self.store.dirty_fts_disk.is_empty() && self.cold_program_packs.is_none() {
-            for stmt in prepared.stmts.iter() {
+            for stmt in stmts.iter() {
                 if let Stmt::Query(q) = stmt
                     && let Source::Collection(name) = &q.source
                     && q.steps.iter().any(|s| matches!(s, Step::Search { .. }))
@@ -3171,12 +3277,12 @@ impl Db {
                 }
             }
         }
-        if let Some(pd) = &prepared.point_delete {
+        if let Some(pd) = point_delete {
             if !pd.append_only && !pd.cas_each && pd.cas.is_none() {
                 return Err(Error::runtime("delete requires cas"));
             }
             if self.disk_overlay_point_dml(&pd.collection) {
-                return self.exec_cold_point_delete(pd, &prepared.plan, want_rows);
+                return self.exec_cold_point_delete(pd, plan, want_rows);
             }
             if self.store.is_disk_backed(&pd.collection) {
                 self.store.promote_disk_col(&pd.collection);
@@ -3191,7 +3297,7 @@ impl Db {
                     .point_delete_docs_at_in_memory(idx, pd.prepared_kd_kt.as_ref());
                 self.store.r#gen += 1;
                 return Ok(Handle {
-                    plan: Arc::clone(&prepared.plan),
+                    plan: Arc::clone(plan),
                     rows: Vec::new(),
                     done: Done {
                         r#gen: self.store.r#gen,
@@ -3201,9 +3307,22 @@ impl Db {
                     ms: 0.0,
                 });
             }
-            let idx = match self.store.point_index(&pd.collection, &pd.field, &pd.key) {
-                Some(i) => i,
-                None => return Err(Error::runtime("delete: no matching row")),
+            let idx = if pd.collection == "docs"
+                && pd.field == "id"
+                && self.store.fts_deferred_doc_swaps.is_empty()
+                && let Some(i) = pd.prepared_idx
+                && self
+                    .store
+                    .docs_id
+                    .get(i)
+                    .is_some_and(|id| id.as_ref() == pd.key.as_str())
+            {
+                i
+            } else {
+                match self.store.point_index(&pd.collection, &pd.field, &pd.key) {
+                    Some(i) => i,
+                    None => return Err(Error::runtime("delete: no matching row")),
+                }
             };
             if !pd.append_only && !pd.cas_each {
                 let rows = self.store.collection(&pd.collection);
@@ -3222,7 +3341,7 @@ impl Db {
                 self.store.point_delete_docs_at_in_memory(idx, None);
                 self.store.r#gen += 1;
                 return Ok(Handle {
-                    plan: Arc::clone(&prepared.plan),
+                    plan: Arc::clone(plan),
                     rows: Vec::new(),
                     done: Done {
                         r#gen: self.store.r#gen,
@@ -3232,17 +3351,25 @@ impl Db {
                     ms: 0.0,
                 });
             }
-            let out = self.store.delete_rows_at(&pd.collection, &[idx]);
+            let mut out = self.store.delete_rows_at(&pd.collection, &[idx]);
             if let Some(p) = self.persist.as_mut() {
                 let pack = Pack::Delete {
                     collection: pd.collection.clone(),
-                    rows: out.clone(),
+                    rows: if want_rows {
+                        out.clone()
+                    } else {
+                        std::mem::take(&mut out)
+                    },
                 };
                 self.store.durable_commit(p, pack)?;
             } else if self.store.is_native_disk() {
                 let pack = Pack::Delete {
                     collection: pd.collection.clone(),
-                    rows: out.clone(),
+                    rows: if want_rows {
+                        out.clone()
+                    } else {
+                        std::mem::take(&mut out)
+                    },
                 };
                 self.store.commit_pack_to_native_disk(&pack)?;
             }
@@ -3251,7 +3378,7 @@ impl Db {
                 self.store.maybe_checkpoint(p)?;
             }
             return Ok(Handle {
-                plan: Arc::clone(&prepared.plan),
+                plan: Arc::clone(plan),
                 rows: if want_rows { out } else { Vec::new() },
                 done: Done {
                     r#gen: self.store.r#gen,
@@ -3261,7 +3388,7 @@ impl Db {
                 ms: 0.0,
             });
         }
-        if let Some(pu) = &prepared.point_update {
+        if let Some(pu) = point_update {
             if !pu.cas_each && pu.cas.is_none() {
                 return Err(Error::runtime("update requires cas"));
             }
@@ -3272,18 +3399,23 @@ impl Db {
                     self.store.unique_key_needs_memory(&pu.collection, k)
                 })
             {
-                return self.exec_cold_point_update(pu, &prepared.plan, want_rows);
+                return self.exec_cold_point_update(pu, plan, want_rows);
             }
             if self.store.is_disk_backed(&pu.collection) {
                 self.store.promote_disk_col(&pu.collection);
             }
             let idx = if pu.collection == "docs"
-                && self.store.docs_epoch == pu.prepared_docs_epoch
                 && self.store.fts_deferred_doc_swaps.is_empty()
                 && let Some(i) = pu.prepared_idx
-                && i < self.store.docs_id.len()
-                && (self.store.r#gen == pu.prepared_gen
-                    || (pu.field == "id" && self.store.docs_id[i].as_ref() == pu.key.as_str()))
+                && ((self.store.docs_epoch == pu.prepared_docs_epoch
+                    && self.store.collections.rewrite_epoch() == pu.prepared_rewrite_epoch
+                    && i < self.store.docs_id.len())
+                    || (pu.field == "id"
+                        && self
+                            .store
+                            .docs_id
+                            .get(i)
+                            .is_some_and(|id| id.as_ref() == pu.key.as_str())))
             {
                 i
             } else {
@@ -3297,7 +3429,7 @@ impl Db {
                     self.exec_docs_wing_update_core(pu, idx, want_rows, false)?;
                 self.store.r#gen += 1;
                 return Ok(Handle {
-                    plan: Arc::clone(&prepared.plan),
+                    plan: Arc::clone(plan),
                     rows: out_rows,
                     done: Done {
                         r#gen: self.store.r#gen,
@@ -3307,76 +3439,131 @@ impl Db {
                     ms: 0.0,
                 });
             }
-            let rows = self.store.collection(&pu.collection);
-            if !pu.cas_each {
-                let got = row_text(&rows[idx], "hash").unwrap_or("");
-                let cas = pu.cas.as_deref().unwrap_or("");
-                if got != cas {
-                    return Err(Error::runtime(format!(
-                        "cas mismatch: expected {cas:?}, found {got:?}"
-                    )));
-                }
-            }
-            let now = now_ms();
-            let before_ref = &rows[idx];
-            if !self.catalog.guards.is_empty() {
-                self.check_row_update_guards(&pu.collection, before_ref, &pu.record.fields, now)?;
-            }
-            self.check_update_id(&pu.collection, &pu.record, &[idx], now)?;
-            let before = before_ref.clone();
+            let has_guards = self
+                .catalog
+                .guards
+                .iter()
+                .any(|g| g.collection == pu.collection);
+            let now = if has_guards || record_needs_now(&pu.record) {
+                now_ms()
+            } else {
+                0
+            };
             let has_body = pu.record.fields.iter().any(|(k, _)| k == "body");
             let reembed = self.update_needs_reembed(&pu.record.fields);
-            let updated = self.patch_updated_row(
-                &pu.collection,
-                before.clone(),
-                &pu.record.fields,
-                now,
-                has_body,
-                reembed,
-            )?;
-            self.check_row_fks(&pu.collection, &updated)?;
-            if let Some(rows) = self.store.collections.get_mut(&pu.collection) {
-                rows[idx] = updated.clone();
-            }
-            if let Err(e) = self
-                .store
-                .index_update_row(&pu.collection, idx, &before, &updated)
-            {
-                if let Some(rows) = self.store.collections.get_mut(&pu.collection) {
-                    rows[idx] = before;
+            let updated = {
+                let rows = self.store.collection(&pu.collection);
+                let before_ref = &rows[idx];
+                if !pu.cas_each {
+                    let got = row_text(before_ref, "hash").unwrap_or("");
+                    let cas = pu.cas.as_deref().unwrap_or("");
+                    if got != cas {
+                        return Err(Error::runtime(format!(
+                            "cas mismatch: expected {cas:?}, found {got:?}"
+                        )));
+                    }
                 }
-                return Err(e);
+                if has_guards {
+                    self.check_row_update_guards(&pu.collection, before_ref, &pu.record.fields, now)?;
+                }
+                self.check_update_id(&pu.collection, &pu.record, &[idx], now)?;
+                self.patch_updated_row(
+                    &pu.collection,
+                    before_ref.clone(),
+                    &pu.record.fields,
+                    now,
+                    has_body,
+                    reembed,
+                )?
+            };
+            if !self.catalog.fks.is_empty() {
+                self.check_row_fks(&pu.collection, &updated)?;
             }
-            self.store.fts_sync_at(&pu.collection, idx, &before);
-            if let Some(hnsw) = self.store.hnsw.get_mut(&pu.collection) {
-                if let Some(Cell::Vec(v)) = updated.get("embedding") {
-                    hnsw.insert(idx, v.clone());
-                } else if before.contains_key("embedding") {
-                    hnsw.remove(idx);
+            if !self.store.indexes.is_empty() {
+                let Store {
+                    collections,
+                    indexes,
+                    ..
+                } = &mut self.store;
+                let before_ref = &collections.get(&pu.collection).unwrap()[idx];
+                let mut applied = 0usize;
+                let mut err_msg: Option<String> = None;
+                for live_idx in indexes.values_mut() {
+                    if live_idx.def.collection == pu.collection {
+                        if let Err(e) = live_idx.update_row(idx, before_ref, &updated) {
+                            err_msg = Some(e);
+                            break;
+                        }
+                        applied += 1;
+                    }
+                }
+                if let Some(e) = err_msg {
+                    for live_idx in indexes.values_mut() {
+                        if applied == 0 {
+                            break;
+                        }
+                        if live_idx.def.collection == pu.collection {
+                            let _ = live_idx.update_row(idx, &updated, before_ref);
+                            applied -= 1;
+                        }
+                    }
+                    return Err(Error::runtime(e));
                 }
             }
-            self.store
-                .row_maps_sync_updated(&pu.collection, idx, &before, &updated);
-            if let Some(p) = self.persist.as_mut() {
-                let pack = Pack::Update {
+            if !self.store.hnsw.is_empty() {
+                let Store {
+                    collections, hnsw, ..
+                } = &mut self.store;
+                if let Some(h) = hnsw.get_mut(&pu.collection) {
+                    if let Some(Cell::Vec(v)) = updated.get("embedding") {
+                        h.insert(idx, Arc::clone(v));
+                    } else if collections
+                        .get(&pu.collection)
+                        .is_some_and(|c| c[idx].contains_key("embedding"))
+                    {
+                        h.remove(idx);
+                    }
+                }
+            }
+            let durable = self.is_durable();
+            let ret_rows = if want_rows {
+                vec![updated.clone()]
+            } else {
+                Vec::new()
+            };
+            let pack = if durable {
+                Some(Pack::Update {
                     collection: pu.collection.clone(),
                     rows: vec![updated.clone()],
-                };
-                self.store.durable_commit(p, pack)?;
-            } else if self.store.is_native_disk() {
-                let pack = Pack::Update {
-                    collection: pu.collection.clone(),
-                    rows: vec![updated.clone()],
-                };
-                self.store.commit_pack_to_native_disk(&pack)?;
+                })
+            } else {
+                None
+            };
+            let has_fts = !self.store.fts.is_empty() && self.store.fts.contains_key(&pu.collection);
+            let before = {
+                let b = std::mem::take(&mut self.store.collections.get_mut(&pu.collection).unwrap()[idx]);
+                self.store
+                    .row_maps_sync_updated(&pu.collection, idx, &b, &updated);
+                self.store.collections.get_mut(&pu.collection).unwrap()[idx] = updated;
+                b
+            };
+            if has_fts {
+                self.store.fts_sync_at(&pu.collection, idx, &before);
+            }
+            if let Some(pack) = pack {
+                if let Some(p) = self.persist.as_mut() {
+                    self.store.durable_commit(p, pack)?;
+                } else if self.store.is_native_disk() {
+                    self.store.commit_pack_to_native_disk(&pack)?;
+                }
             }
             self.store.r#gen += 1;
             if let Some(p) = self.persist.as_mut() {
                 self.store.maybe_checkpoint(p)?;
             }
             return Ok(Handle {
-                plan: Arc::clone(&prepared.plan),
-                rows: if want_rows { vec![updated] } else { Vec::new() },
+                plan: Arc::clone(plan),
+                rows: ret_rows,
                 done: Done {
                     r#gen: self.store.r#gen,
                     n: 1,
@@ -3385,7 +3572,7 @@ impl Db {
                 ms: 0.0,
             });
         }
-        if let Some(pf) = &prepared.append_facts
+        if let Some(pf) = append_facts
             && (!want_rows || pf.s.len() > 128)
             && self.cold_program_packs.is_none()
             && !self.store.is_disk_backed("facts")
@@ -3398,7 +3585,7 @@ impl Db {
             let changed = self.store.append_prepared_facts(&pf.s, &pf.p, &pf.o);
             if changed == 0 {
                 return Ok(Handle {
-                    plan: Arc::clone(&prepared.plan),
+                    plan: Arc::clone(plan),
                     rows: Vec::new(),
                     done: Done {
                         r#gen: self.store.r#gen,
@@ -3440,7 +3627,7 @@ impl Db {
             self.append_rows += n as u64;
             self.append_ms += ms;
             return Ok(Handle {
-                plan: Arc::clone(&prepared.plan),
+                plan: Arc::clone(plan),
                 rows: Vec::new(),
                 done: Done {
                     r#gen: self.store.r#gen,
@@ -3452,21 +3639,21 @@ impl Db {
         }
         #[cfg(feature = "gpu")]
         let has_gpu_agg = self.gpu.is_some()
-            && prepared.stmts.first().is_some_and(|s| match s {
+            && stmts.first().is_some_and(|s| match s {
                 Stmt::Query(q) => self.uses_gpu_filter(q) || self.uses_gpu_count(q),
                 _ => false,
             });
         #[cfg(not(feature = "gpu"))]
         let has_gpu_agg = false;
 
-        if !has_gpu_agg && let Some(agg) = &prepared.agg_plan {
+        if !has_gpu_agg && let Some(agg) = agg_plan {
             let t0 = Instant::now();
             let now = if agg.needs_now { now_ms() } else { 0 };
             let rows = self.execute_agg_plan(agg, now)?;
             let ms = t0.elapsed().as_secs_f64() * 1000.0;
             let n = rows.len();
             return Ok(Handle {
-                plan: prepared.plan.clone(),
+                plan: Arc::clone(plan),
                 rows: if want_rows { rows } else { Vec::new() },
                 done: Done {
                     r#gen: self.store.r#gen,
@@ -3478,11 +3665,11 @@ impl Db {
         }
 
         self.run_bound_stmts(
-            &prepared.stmts,
-            &prepared.plan,
-            prepared.writes,
-            prepared.append_only,
-            prepared.schema,
+            stmts,
+            plan,
+            writes,
+            append_only,
+            schema,
             want_rows,
         )
     }
@@ -3679,7 +3866,11 @@ impl Db {
     /// Shared DRY columnar OLAP dispatcher: filter/join/window/sort + project → [`RecordBatch`].
     pub(crate) fn try_columnar_query_batch(&self, q: &Query) -> Option<RecordBatch> {
         let q = crate::catalog::with_catalog_filter(q, &self.catalog);
-        let now = now_ms();
+        let now = if query_needs_now(&q, &self.catalog) {
+            now_ms()
+        } else {
+            0
+        };
         let bindings = Default::default();
         if !self.uses_gpu_filter(&q) && !self.uses_gpu_join(&q) {
             if let Some(batch) = self.try_filter_project_batch(&q, &bindings, now) {
@@ -3743,7 +3934,25 @@ impl Db {
                 None => (Vec::new(), 0),
             };
             return Ok(Handle {
-                plan: prepared.plan.clone(),
+                plan: Arc::clone(&prepared.plan),
+                rows,
+                done: Done {
+                    r#gen: self.store.r#gen,
+                    n,
+                },
+                message: None,
+                ms: 0.0,
+            });
+        }
+        if let Some(sp) = &prepared.scan_project
+            && !(sp.collection == "docs" && self.store.has_deferred_doc_ops())
+            && !(sp.collection == "facts"
+                && self.store.facts_rows_stale
+                && !self.store.is_disk_backed("facts"))
+        {
+            let (rows, n) = self.execute_scan_project(sp, true)?;
+            return Ok(Handle {
+                plan: Arc::clone(&prepared.plan),
                 rows,
                 done: Done {
                     r#gen: self.store.r#gen,
@@ -3836,13 +4045,18 @@ impl Db {
         let mut bindings: BTreeMap<String, Vec<Row>> = BTreeMap::new();
         let mut last_rows = Vec::new();
         let mut last_msg = None;
-        for stmt in stmts {
+        let last_idx = stmts.len().saturating_sub(1);
+        for (i, stmt) in stmts.iter().enumerate() {
             match stmt {
                 Stmt::Let { name, query } => {
                     let rows = self.exec_query(query, &bindings)?;
-                    last_rows = rows.clone();
                     last_msg = None;
-                    bindings.insert(name.clone(), rows);
+                    if i == last_idx {
+                        last_rows = rows;
+                    } else {
+                        last_rows.clear();
+                        bindings.insert(name.clone(), rows);
+                    }
                 }
                 Stmt::Query(q) => {
                     last_rows = self.exec_query(q, &bindings)?;
@@ -3876,8 +4090,10 @@ impl Db {
     }
 
     fn run_src_ext(&mut self, src: &str, want_rows: bool) -> Result<Handle, Error> {
-        if let Some(prep) = self.plan_cache.get(src).cloned() {
-            return self.run_prepared_ext(&prep, want_rows);
+        if !self.plan_cache.is_empty()
+            && let Some(ep) = self.plan_cache.get(src).map(Prepared::exec_plan)
+        {
+            return self.run_exec_plan_ext(&ep, want_rows);
         }
         if src.len() > self.quotas.max_query_bytes {
             return Err(Error::new(format!(
@@ -3886,12 +4102,219 @@ impl Db {
                 self.quotas.max_query_bytes
             )));
         }
+        if !self.follower
+            && src.len() <= self.quotas.max_ast_bytes.min(2048)
+            && src.trim_start().starts_with("insert")
+            && let Some((collection, fields)) = parse::try_parse_single_insert(src)
+            && !self.store.is_disk_backed(collection)
+            && self.cold_program_packs.is_none()
+            && !fields
+                .iter()
+                .any(|(_, v)| matches!(v, crate::ast::Value::Param(_)))
+        {
+            check::check_single_insert_borrowed(collection, &fields, &self.catalog)?;
+            return self.exec_single_insert_borrowed(collection, fields, want_rows);
+        }
         let stmts = parse::parse_program_with_limits(
             src,
             self.quotas.max_query_bytes,
             self.quotas.max_ast_depth,
         )?;
         self.run_preparsed_ext(src, stmts, want_rows)
+    }
+
+    fn exec_single_insert_borrowed(
+        &mut self,
+        collection: &str,
+        fields: SmallVec<[(&str, crate::ast::Value); 8]>,
+        want_rows: bool,
+    ) -> Result<Handle, Error> {
+        if self.store.has_deferred_doc_ops() {
+            self.store.flush_fts_deferred_docs();
+        }
+        let next_rows = self.total_rows().saturating_add(1);
+        if next_rows > self.quotas.max_rows {
+            return Err(Error::runtime(format!(
+                "quota: rows {next_rows} > max_rows {}",
+                self.quotas.max_rows
+            )));
+        }
+        let edges_len = self.store.edges.len();
+        if edges_len > self.quotas.max_edges {
+            return Err(Error::runtime(format!(
+                "quota: edges {edges_len} > max_edges {}",
+                self.quotas.max_edges
+            )));
+        }
+        if let Some(p) = self.persist.as_ref()
+            && p.log_bytes > self.quotas.max_log_bytes
+        {
+            return Err(Error::runtime(format!(
+                "quota: log_bytes {} > max_log_bytes {}",
+                p.log_bytes, self.quotas.max_log_bytes
+            )));
+        }
+
+        let needs_embed = self.embedder.is_some()
+            && self
+                .catalog
+                .collection(collection)
+                .is_some_and(|c| c.has_vec());
+        let now = if fields.iter().any(|(_, v)| value_needs_now(v)) {
+            now_ms()
+        } else {
+            0
+        };
+        let prev_next_id = self.store.next_id;
+        let mut has_body = false;
+        let mut has_hash = false;
+        let mut id_arc: Option<Arc<str>> = None;
+        let mut uri_arc: Option<Arc<str>> = None;
+        let mut body_arc: Option<Arc<str>> = None;
+        let mut row = crate::store::acquire_row();
+        for (k, v) in fields {
+            let cell = value_cell(&v, now);
+            match k {
+                "id" => id_arc = cell.text_shared(),
+                "uri" if collection == "docs" => uri_arc = cell.text_shared(),
+                "body" => {
+                    has_body = true;
+                    body_arc = cell.text_shared();
+                }
+                "hash" => has_hash = cell.text().is_some(),
+                _ => {}
+            }
+            row.insert(k, cell);
+        }
+        if id_arc.is_none() {
+            let gen_id: Arc<str> = Arc::from(self.store.alloc_id());
+            row.insert("id", Cell::Text(Arc::clone(&gen_id)));
+            id_arc = Some(gen_id);
+        }
+        if has_body
+            && !has_hash
+            && let Some(body) = body_arc
+        {
+            row.insert("hash", Cell::SmallText(content_hash_inline(body.as_ref())));
+        }
+        if !self.store.collection(collection).is_empty() {
+            if let Some(ref id) = id_arc
+                && self.store.row_index(collection, id.as_ref()).is_some()
+            {
+                self.store.next_id = prev_next_id;
+                return Err(Error::runtime(format!("duplicate id: {id}")));
+            }
+            if collection == "docs"
+                && let Some(ref uri) = uri_arc
+                && self.store.get_by_uri(uri.as_ref()).is_some()
+            {
+                self.store.next_id = prev_next_id;
+                return Err(Error::runtime(format!("duplicate uri: {uri}")));
+            }
+        }
+        if !self.catalog.fks.is_empty()
+            && let Err(e) = self.check_row_fks(collection, &row)
+        {
+            self.store.next_id = prev_next_id;
+            return Err(e);
+        }
+        if needs_embed
+            && let Err(e) = self.maybe_embed_rows(collection, std::slice::from_mut(&mut row))
+        {
+            self.store.next_id = prev_next_id;
+            return Err(e);
+        }
+        if want_rows && let Err(e) = self.check_output_quota(std::slice::from_ref(&row)) {
+            self.store.next_id = prev_next_id;
+            return Err(e);
+        }
+
+        let start = self.store.collection(collection).len();
+        if !self.store.indexes.is_empty()
+            && let Err(e) = self.store.index_insert_row(collection, start, &row)
+        {
+            self.store.next_id = prev_next_id;
+            return Err(e);
+        }
+
+        let durable = self.is_durable();
+        let base_gen = self.store.r#gen;
+        let mark = if durable {
+            let cur_next_id = self.store.next_id;
+            self.store.next_id = prev_next_id;
+            let m = self.store.append_mark();
+            self.store.next_id = cur_next_id;
+            Some(m)
+        } else {
+            None
+        };
+
+        if !self.store.fts.is_empty() && self.store.fts.contains_key(collection) {
+            self.store.fts_insert_row(collection, start, &row);
+        }
+        if !self.store.hnsw.is_empty()
+            && let Some(Cell::Vec(v)) = row.get("embedding")
+            && let Some(hnsw) = self.store.hnsw.get_mut(collection)
+        {
+            hnsw.insert(start, Arc::clone(v));
+        }
+        self.store.row_maps_register_row(collection, start, &row);
+        self.store.update_col_count(collection, 1);
+
+        let pack = if durable {
+            Some(crate::persist::rows_to_insert_pack(
+                collection.to_string(),
+                std::slice::from_ref(&row),
+                Vec::new(),
+            ))
+        } else {
+            None
+        };
+        let out_rows = if want_rows {
+            vec![row.clone()]
+        } else {
+            Vec::new()
+        };
+        self.store.collection_append_mut(collection).push(row);
+
+        if let Some(pack) = pack {
+            if let Some(p) = self.persist.as_mut() {
+                if let Err(e) = self.store.durable_commit(p, pack) {
+                    if let Some(m) = mark {
+                        self.rollback(Undo::Append(m), None, base_gen);
+                    }
+                    return Err(e);
+                }
+            } else if self.store.is_native_disk()
+                && let Err(e) = self.store.commit_pack_to_native_disk(&pack)
+            {
+                if let Some(m) = mark {
+                    self.rollback(Undo::Append(m), None, base_gen);
+                }
+                return Err(e);
+            }
+        }
+        self.store.r#gen += 1;
+        self.reader_cache = None;
+        if let Some(p) = self.persist.as_mut() {
+            self.store.maybe_checkpoint(p)?;
+        }
+        self.append_rows += 1;
+        let plan = if want_rows {
+            tx::cached_single_insert_plan(&self.catalog, collection, has_body)
+        } else {
+            dummy_dml_plan()
+        };
+        Ok(Handle {
+            plan,
+            rows: out_rows,
+            done: Done {
+                r#gen: self.store.r#gen,
+                n: 1,
+            },
+            message: None,
+            ms: 0.0,
+        })
     }
 
     /// Execute `src` when `stmts` was already parsed on a caller thread (e.g., `LinServer`),
@@ -3902,8 +4325,10 @@ impl Db {
         stmts: Vec<Stmt>,
         want_rows: bool,
     ) -> Result<Handle, Error> {
-        if let Some(prep) = self.plan_cache.get(src).cloned() {
-            return self.run_prepared_ext(&prep, want_rows);
+        if !self.plan_cache.is_empty()
+            && let Some(ep) = self.plan_cache.get(src).map(Prepared::exec_plan)
+        {
+            return self.run_exec_plan_ext(&ep, want_rows);
         }
         if src.len() > self.quotas.max_query_bytes {
             return Err(Error::new(format!(
@@ -3924,19 +4349,24 @@ impl Db {
         if !writes || schema || self.note_dml_seen(src) {
             let mut prep = self.prepare_stmts_checked(stmts)?;
             prep.src = src.to_string();
-            self.insert_plan_cache(src.to_string(), prep.clone());
-            return self.run_prepared_ext(&prep, want_rows);
+            let ep = prep.exec_plan();
+            self.insert_plan_cache(src.to_string(), prep);
+            return self.run_exec_plan_ext(&ep, want_rows);
         }
         // A single point `update` / `delete` on a cold collection has an overlay fast path
-        // only in its prepared form; the generic statement executor would promote the whole
-        // collection into memory first.
-        if let [Stmt::Update { collection, .. } | Stmt::Delete { collection, .. }] = stmts.as_slice()
-            && self.disk_overlay_point_dml(collection)
-        {
-            let prep = self.prepare_stmts_checked(stmts.clone())?;
-            if prep.point_update.is_some() || prep.point_delete.is_some() {
-                return self.run_prepared_ext(&prep, want_rows);
-            }
+        // only in its prepared form; check `point_key` first so non-point DML never clones `stmts`.
+        let is_cold_point_candidate = match stmts.as_slice() {
+            [Stmt::Update {
+                collection, pred, ..
+            }] => self.disk_overlay_point_dml(collection) && pred.as_ref().and_then(point_key).is_some(),
+            [Stmt::Delete {
+                collection, pred, ..
+            }] => self.disk_overlay_point_dml(collection) && point_key(pred).is_some(),
+            _ => false,
+        };
+        if is_cold_point_candidate {
+            let prep = self.prepare_stmts_checked(stmts)?;
+            return self.run_prepared_ext(&prep, want_rows);
         }
         let (_, staged) = check::check_program(&stmts, &self.catalog)?;
         let plan = if want_rows {
@@ -4762,7 +5192,11 @@ impl Db {
             q.to_mut().simplify_predicates();
         }
         let q = &*q;
-        let now = now_ms();
+        let now = if query_needs_now(q, &self.catalog) {
+            now_ms()
+        } else {
+            0
+        };
 
         let gpu_filter = self.uses_gpu_filter(q)
             || self.uses_gpu_count(q)
@@ -4807,7 +5241,7 @@ impl Db {
             }
         }
 
-        let mut primary = check::collection_of(&q.source).to_string();
+        let mut primary: Cow<'_, str> = Cow::Borrowed(check::collection_of(&q.source));
         let mut implicit_take = true;
         let mut saw_agg = false;
         let first_filter = match q.steps.first() {
@@ -5068,7 +5502,7 @@ impl Db {
                 }
                 Step::Graph { rel, depth } => {
                     rows = self.graph_edges(&rows, rel, depth.unwrap_or(1))?;
-                    primary = "edges".into();
+                    primary = Cow::Borrowed("edges");
                 }
                 Step::Match { start, hops } => {
                     rows = self.match_path(&primary, rows, start.as_deref(), hops)?;
@@ -5082,7 +5516,7 @@ impl Db {
                     #[cfg(feature = "gpu")]
                     if let Some(result) = self.gpu_count_rows(&rows, by.as_ref())? {
                         rows = result;
-                        primary = String::new();
+                        primary = Cow::Borrowed("");
                         continue;
                     }
                     rows = match by {
@@ -5094,7 +5528,7 @@ impl Db {
                         )?,
                         None => vec![hits_row(rows.len() as i64)],
                     };
-                    primary = String::new();
+                    primary = Cow::Borrowed("");
                 }
                 Step::Sum { field, by } => {
                     implicit_take = false;
@@ -5102,7 +5536,7 @@ impl Db {
                     #[cfg(feature = "gpu")]
                     if let Some(result) = self.gpu_sum_rows(&rows, field, by.as_ref())? {
                         rows = result;
-                        primary = String::new();
+                        primary = Cow::Borrowed("");
                         continue;
                     }
                     rows = agg_sum(
@@ -5112,7 +5546,7 @@ impl Db {
                         self.quotas.max_aggregate_bytes,
                         self.quotas.spill_enabled,
                     )?;
-                    primary = String::new();
+                    primary = Cow::Borrowed("");
                 }
                 Step::Min { field, by } => {
                     implicit_take = false;
@@ -5124,7 +5558,7 @@ impl Db {
                         self.quotas.max_aggregate_bytes,
                         self.quotas.spill_enabled,
                     )?;
-                    primary = String::new();
+                    primary = Cow::Borrowed("");
                 }
                 Step::Max { field, by } => {
                     implicit_take = false;
@@ -5136,7 +5570,7 @@ impl Db {
                         self.quotas.max_aggregate_bytes,
                         self.quotas.spill_enabled,
                     )?;
-                    primary = String::new();
+                    primary = Cow::Borrowed("");
                 }
                 Step::Avg { field, by } => {
                     implicit_take = false;
@@ -5148,13 +5582,13 @@ impl Db {
                         self.quotas.max_aggregate_bytes,
                         self.quotas.spill_enabled,
                     )?;
-                    primary = String::new();
+                    primary = Cow::Borrowed("");
                 }
                 Step::Summarize { specs, by } => {
                     implicit_take = false;
                     saw_agg = true;
                     let sum_f64_flags =
-                        agg::sum_f64_flags_for(self.catalog.collections.get(&primary), specs);
+                        agg::sum_f64_flags_for(self.catalog.collections.get(primary.as_ref()), specs);
                     rows = agg::agg_summarize(
                         &rows,
                         None,
@@ -5164,7 +5598,7 @@ impl Db {
                         &sum_f64_flags,
                         self.quotas.max_aggregate_bytes,
                     )?;
-                    primary = String::new();
+                    primary = Cow::Borrowed("");
                 }
                 Step::ArgExtremum { is_max, order, by } => {
                     implicit_take = false;
@@ -5303,7 +5737,7 @@ impl Db {
                         if row.len() < fs.len() {
                             for f in fs {
                                 if !row.contains_key(f.as_str()) {
-                                    row.insert(f.clone(), Cell::Null);
+                                    row.insert(f.as_str(), Cell::Null);
                                 }
                             }
                         }
@@ -5416,16 +5850,20 @@ impl Db {
             }
             return r;
         }
-        let names = field_names(fields);
+        let names: SmallVec<[Cow<'_, str>; 8]> =
+            fields.iter().map(Field::as_cow_str).collect();
         if self.store.is_disk_backed(name)
             && let Some(eng) = self.store.disk_engine_read()
         {
             if limit == Some(0) {
                 return Vec::new();
             }
-            let proj_refs: Vec<&str> = names.iter().map(String::as_str).collect();
-            let mut out = Vec::new();
-            let mut proj = crate::store::RowProjector::new(&names);
+            let proj_refs: SmallVec<[&str; 8]> = names.iter().map(|s| s.as_ref()).collect();
+            let cap = limit
+                .unwrap_or_else(|| self.store.get_col_count(name))
+                .min(self.store.get_col_count(name));
+            let mut out = Vec::with_capacity(cap);
+            let mut proj = SliceRowProjector::new(&names);
             let _ = eng.scan_projected(name, Some(&proj_refs), |r| {
                 out.push(proj.project(r));
                 if let Some(lim) = limit
@@ -5443,7 +5881,7 @@ impl Db {
             None => col.len(),
         };
         let mut out = Vec::with_capacity(count);
-        let mut proj = crate::store::RowProjector::new(&names);
+        let mut proj = SliceRowProjector::new(&names);
         for r in col.iter().take(count) {
             out.push(proj.project(r));
         }
@@ -5464,7 +5902,10 @@ impl Db {
             if limit == Some(0) {
                 return Vec::new();
             }
-            let mut out = Vec::new();
+            let cap = limit
+                .unwrap_or_else(|| self.store.get_col_count(name))
+                .min(self.store.get_col_count(name));
+            let mut out = Vec::with_capacity(cap);
             let _ = eng.scan_projected(name, None, |r| {
                 out.push(r.clone());
                 if let Some(lim) = limit
@@ -5478,7 +5919,7 @@ impl Db {
         }
         let col = self.store.collection(name);
         match limit {
-            Some(lim) => col.iter().take(lim).cloned().collect(),
+            Some(lim) => col[..lim.min(col.len())].to_vec(),
             None => col.to_vec(),
         }
     }
@@ -5509,7 +5950,10 @@ impl Db {
             if limit == Some(0) {
                 return Some(Vec::new());
             }
-            let mut out = Vec::new();
+            let cap = limit
+                .unwrap_or_else(|| self.store.get_col_count(name))
+                .min(self.store.get_col_count(name));
+            let mut out = Vec::with_capacity(cap);
             eng.scan_projected(name, Some(&kept_refs), |r| {
                 out.push(r.clone());
                 if let Some(lim) = limit
@@ -5525,7 +5969,8 @@ impl Db {
     }
 
     fn scan_catalog(&self) -> Vec<Row> {
-        let mut rows = Vec::new();
+        let mut rows =
+            Vec::with_capacity(self.catalog.collections.len() + self.catalog.rels.len());
         for name in self.catalog.collections.keys() {
             rows.push(meta_row("col", name));
         }
@@ -5629,6 +6074,11 @@ impl ReadDb {
     }
 
     pub fn run(&self, src: &str) -> Result<Handle, Error> {
+        if let Ok(guard) = self.plan_cache.read()
+            && let Some(prepared) = guard.get(src)
+        {
+            return self.inner.run_prepared_readonly(prepared);
+        }
         let prepared = self.prepare(src)?;
         self.inner.run_prepared_readonly(&prepared)
     }
@@ -5669,6 +6119,11 @@ impl ReadDb {
     }
 
     pub fn run_batch(&self, src: &str) -> Result<RecordBatch, Error> {
+        if let Ok(guard) = self.plan_cache.read()
+            && let Some(prepared) = guard.get(src)
+        {
+            return self.run_prepared_batch(prepared);
+        }
         let prepared = self.prepare(src)?;
         self.run_prepared_batch(&prepared)
     }
@@ -5680,54 +6135,56 @@ impl ReadDb {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        let sources: Vec<String> = queries
-            .into_iter()
-            .map(|s| s.as_ref().to_string())
-            .collect();
-        match sources.len() {
-            0 => Ok(Vec::new()),
-            1 => Ok(vec![self.run(&sources[0])?]),
-            n => {
-                let threads = std::thread::available_parallelism()
-                    .map(|p| p.get())
-                    .unwrap_or(4)
-                    .min(n)
-                    .max(1);
-                if threads <= 1 {
-                    return sources.iter().map(|q| self.run(q)).collect();
-                }
-                let chunk_size = n.div_ceil(threads);
-                let chunks: Vec<&[String]> = sources.chunks(chunk_size).collect();
-                let results: Vec<Result<Vec<Handle>, Error>> = std::thread::scope(|s| {
-                    let handles: Vec<_> = chunks
-                        .into_iter()
-                        .map(|chunk| {
-                            let db = self;
-                            s.spawn(move || -> Result<Vec<Handle>, Error> {
-                                let mut out = Vec::with_capacity(chunk.len());
-                                for q in chunk {
-                                    out.push(db.run(q)?);
-                                }
-                                Ok(out)
-                            })
-                        })
-                        .collect();
-                    handles
-                        .into_iter()
-                        .map(|h| {
-                            h.join().unwrap_or_else(|_| {
-                                Err(Error::runtime("parallel query worker panicked"))
-                            })
-                        })
-                        .collect()
-                });
-                let mut all = Vec::with_capacity(n);
-                for r in results {
-                    all.extend(r?);
-                }
-                Ok(all)
-            }
+        let mut iter = queries.into_iter();
+        let Some(first) = iter.next() else {
+            return Ok(Vec::new());
+        };
+        let Some(second) = iter.next() else {
+            return Ok(vec![self.run(first.as_ref())?]);
+        };
+        let mut owned: Vec<S> = Vec::with_capacity(iter.size_hint().0.saturating_add(2));
+        owned.push(first);
+        owned.push(second);
+        owned.extend(iter);
+        let n = owned.len();
+        let threads = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(4)
+            .min(n)
+            .max(1);
+        if threads <= 1 {
+            return owned.iter().map(|q| self.run(q.as_ref())).collect();
         }
+        let refs: Vec<&str> = owned.iter().map(S::as_ref).collect();
+        let chunk_size = n.div_ceil(threads);
+        let results: Vec<Result<Vec<Handle>, Error>> = std::thread::scope(|s| {
+            let handles: Vec<_> = refs
+                .chunks(chunk_size)
+                .map(|chunk| {
+                    let db = self;
+                    s.spawn(move || -> Result<Vec<Handle>, Error> {
+                        let mut out = Vec::with_capacity(chunk.len());
+                        for &q in chunk {
+                            out.push(db.run(q)?);
+                        }
+                        Ok(out)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.join().unwrap_or_else(|_| {
+                        Err(Error::runtime("parallel query worker panicked"))
+                    })
+                })
+                .collect()
+        });
+        let mut all = Vec::with_capacity(n);
+        for r in results {
+            all.extend(r?);
+        }
+        Ok(all)
     }
 
     /// Execute multiple pre-prepared read-only queries concurrently across CPU cores
@@ -5844,9 +6301,37 @@ pub(crate) fn pack_affect_n(pack: Option<&Pack>) -> Option<usize> {
     }
 }
 
+fn query_needs_now(q: &Query, catalog: &Catalog) -> bool {
+    let mut saw_filter = false;
+    for step in &q.steps {
+        match step {
+            Step::Filter(p) => {
+                saw_filter = true;
+                if pred_needs_now(p) {
+                    return true;
+                }
+            }
+            Step::Union(rhs) => {
+                if query_needs_now(rhs, catalog) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    saw_filter
+        && !catalog.indexes.is_empty()
+        && catalog
+            .indexes
+            .values()
+            .any(|ix| ix.pred.as_ref().is_some_and(pred_needs_now))
+}
+
 fn meta_row(kind: &str, name: &str) -> Row {
-    let mut r = Row::new();
-    r.insert("kind", Cell::text_arc(kind));
-    r.insert("name", Cell::text_arc(name));
-    r
+    static SHAPE: OnceLock<Arc<crate::store::RowShape>> = OnceLock::new();
+    let shape = SHAPE.get_or_init(|| Row::shape_of(&["kind", "name"]));
+    Row::from_parts(
+        Arc::clone(shape),
+        [Cell::text_arc(kind), Cell::text_arc(name)],
+    )
 }

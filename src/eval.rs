@@ -94,6 +94,9 @@ fn cell_to_ast_value(c: &Cell) -> Value {
 }
 
 pub(crate) fn bind_pred_params(pred: &Pred, params: &[(&str, Cell)]) -> Pred {
+    if !pred_has_param(pred) {
+        return pred.clone();
+    }
     match pred {
         Pred::And(a, b) => Pred::And(
             Box::new(bind_pred_params(a, params)),
@@ -119,22 +122,18 @@ pub(crate) fn bind_pred_params(pred: &Pred, params: &[(&str, Cell)]) -> Pred {
             }
         }
         Pred::In { field, values } => {
-            if values.iter().any(|v| matches!(v, Value::Param(_))) {
-                let bound_vals = values
-                    .iter()
-                    .map(|v| match v {
-                        Value::Param(name) => lookup_param(params, name)
-                            .map(cell_to_ast_value)
-                            .unwrap_or_else(|| Value::Param(Arc::from(""))),
-                        other => other.clone(),
-                    })
-                    .collect();
-                Pred::In {
-                    field: field.clone(),
-                    values: bound_vals,
-                }
-            } else {
-                pred.clone()
+            let bound_vals = values
+                .iter()
+                .map(|v| match v {
+                    Value::Param(name) => lookup_param(params, name)
+                        .map(cell_to_ast_value)
+                        .unwrap_or_else(|| Value::Param(Arc::from(""))),
+                    other => other.clone(),
+                })
+                .collect();
+            Pred::In {
+                field: field.clone(),
+                values: bound_vals,
             }
         }
         _ => pred.clone(),
@@ -145,6 +144,9 @@ pub(crate) fn bind_record_params(
     record: &crate::ast::Record,
     params: &[(&str, Cell)],
 ) -> crate::ast::Record {
+    if !record_has_param(record) {
+        return record.clone();
+    }
     crate::ast::Record {
         fields: record
             .fields
@@ -176,6 +178,13 @@ pub(crate) fn bind_stmt_params(
         }
     };
     let bind_query = |q: &Query| -> Query {
+        if !q
+            .steps
+            .iter()
+            .any(|step| matches!(step, Step::Filter(p) if pred_has_param(p)))
+        {
+            return q.clone();
+        }
         Query {
             explain: q.explain,
             ignore_filter: q.ignore_filter,
@@ -326,6 +335,45 @@ pub(crate) fn eval_pred(pred: &Pred, row: &Row, now: i64) -> bool {
     }
 }
 
+fn resolve_cached_regex(pattern: &str, flags: &str) -> Option<Arc<regex::Regex>> {
+    REGEX_CACHE.with(|cache| {
+        let mut state = cache.borrow_mut();
+        if let Some((ref lp, ref lf, ref lre)) = state.last
+            && lp == pattern
+            && lf == flags
+        {
+            return lre.clone();
+        }
+        if let Some((_, re)) = state
+            .map
+            .get(pattern)
+            .and_then(|v| v.iter().find(|(f, _)| f == flags))
+        {
+            let cloned = re.clone();
+            state.last = Some((pattern.to_owned(), flags.to_owned(), cloned.clone()));
+            return cloned;
+        }
+        if state.map.len() >= REGEX_CACHE_MAX_PATTERNS {
+            state.map.clear();
+        }
+        let compiled = {
+            let mut b = regex::RegexBuilder::new(pattern);
+            b.size_limit(10 * 1024 * 1024);
+            if flags.contains('i') {
+                b.case_insensitive(true);
+            }
+            b.build().ok().map(Arc::new)
+        };
+        state
+            .map
+            .entry(pattern.to_owned())
+            .or_default()
+            .push((flags.to_owned(), compiled.clone()));
+        state.last = Some((pattern.to_owned(), flags.to_owned(), compiled.clone()));
+        compiled
+    })
+}
+
 /// A leaf predicate decided on the value of its field (`Cell::Null` when absent).
 /// `and` / `or` / `not` are not leaves and yield `false`.
 pub(crate) fn eval_leaf(pred: &Pred, cell: &Cell, now: i64) -> bool {
@@ -364,7 +412,10 @@ pub(crate) fn eval_leaf(pred: &Pred, cell: &Cell, now: i64) -> bool {
                     .get(pattern.as_str())
                     .and_then(|v| v.iter().find(|(f, _)| f == flags))
                 {
-                    return re.as_ref().is_some_and(|re| re.is_match(text));
+                    let cloned = re.clone();
+                    let matched = cloned.as_ref().is_some_and(|r| r.is_match(text));
+                    state.last = Some((pattern.clone(), flags.clone(), cloned));
+                    return matched;
                 }
                 // Patterns can come from parameters: keep the cache bounded.
                 if state.map.len() >= REGEX_CACHE_MAX_PATTERNS {
@@ -391,7 +442,6 @@ pub(crate) fn eval_leaf(pred: &Pred, cell: &Cell, now: i64) -> bool {
     }
 }
 
-
 pub(crate) fn pred_leaf_cost(pred: &Pred) -> u32 {
     match pred {
         Pred::IsNull { .. } => 1,
@@ -414,124 +464,165 @@ pub(crate) fn pred_leaf_cost(pred: &Pred) -> u32 {
     }
 }
 
+#[derive(Clone, Debug)]
+enum SlotTree<L> {
+    And(Vec<SlotTree<L>>),
+    Or(Vec<SlotTree<L>>),
+    Not(Box<SlotTree<L>>),
+    Leaf(L),
+}
+
+fn build_slot_tree<'p, L>(
+    pred: &'p Pred,
+    make_leaf: &mut impl FnMut(&'p Pred, &'p Field) -> (L, u32),
+) -> (SlotTree<L>, u32) {
+    match pred {
+        Pred::And(..) => {
+            let mut terms = Vec::new();
+            let mut stack = vec![pred];
+            while let Some(p) = stack.pop() {
+                if let Pred::And(a, b) = p {
+                    // Push rhs first so lhs pops first, keeping tie order stable.
+                    stack.push(b);
+                    stack.push(a);
+                } else {
+                    terms.push(p);
+                }
+            }
+            let mut built: Vec<(SlotTree<L>, u32)> = terms
+                .into_iter()
+                .map(|t| build_slot_tree(t, make_leaf))
+                .collect();
+            built.sort_by_key(|&(_, c)| c);
+            let total_cost = built
+                .iter()
+                .fold(0u32, |acc, &(_, c)| acc.saturating_add(c))
+                .max(1);
+            let nodes = built.into_iter().map(|(n, _)| n).collect();
+            (SlotTree::And(nodes), total_cost)
+        }
+        Pred::Or(..) => {
+            let mut terms = Vec::new();
+            let mut stack = vec![pred];
+            while let Some(p) = stack.pop() {
+                if let Pred::Or(a, b) = p {
+                    stack.push(b);
+                    stack.push(a);
+                } else {
+                    terms.push(p);
+                }
+            }
+            let mut built: Vec<(SlotTree<L>, u32)> = terms
+                .into_iter()
+                .map(|t| build_slot_tree(t, make_leaf))
+                .collect();
+            built.sort_by_key(|&(_, c)| c);
+            let total_cost = built
+                .iter()
+                .fold(0u32, |acc, &(_, c)| acc.saturating_add(c))
+                .saturating_add(2);
+            let nodes = built.into_iter().map(|(n, _)| n).collect();
+            (SlotTree::Or(nodes), total_cost)
+        }
+        Pred::Not(inner) => {
+            let (node, cost) = build_slot_tree(inner, make_leaf);
+            (SlotTree::Not(Box::new(node)), cost)
+        }
+        Pred::IsNull { field, .. }
+        | Pred::In { field, .. }
+        | Pred::Cmp { field, .. }
+        | Pred::Has { field, .. }
+        | Pred::Contains { field, .. }
+        | Pred::Regex { field, .. } => {
+            let (leaf, cost) = make_leaf(pred, field);
+            (SlotTree::Leaf(leaf), cost)
+        }
+    }
+}
+
 /// A predicate prepared for many rows: every single-name field keeps a [`FieldSlot`], so a
 /// row with a shape seen before is read by position instead of a search by name. Conjuncts
 /// and disjuncts are flattened and ordered by evaluation cost so cheap checks short-circuit
 /// expensive text/regex matching while keeping results identical to [`eval_pred`].
 pub(crate) struct PredSlots<'p> {
-    tree: SlotNode<'p>,
+    tree: SlotTree<BorrowedLeaf<'p>>,
     slots: Vec<crate::store::row::FieldSlot<'p>>,
 }
 
-enum SlotNode<'p> {
-    And(Vec<SlotNode<'p>>),
-    Or(Vec<SlotNode<'p>>),
-    Not(Box<SlotNode<'p>>),
+enum BorrowedLeaf<'p> {
     /// Leaf over a single-name field: index into `slots`.
-    Leaf(&'p Pred, usize),
+    Slot(&'p Pred, usize),
+    /// Pre-resolved regex over a single-name field.
+    SlotRegex(usize, Option<Arc<regex::Regex>>),
     /// Leaf over a dotted path: resolved by name.
     ByName(&'p Pred),
+    /// Pre-resolved regex over a dotted path.
+    ByNameRegex(&'p Field, Option<Arc<regex::Regex>>),
 }
 
 impl<'p> PredSlots<'p> {
     pub(crate) fn new(pred: &'p Pred) -> Self {
-        fn build<'p>(
-            pred: &'p Pred,
-            slots: &mut Vec<crate::store::row::FieldSlot<'p>>,
-        ) -> (SlotNode<'p>, u32) {
-            match pred {
-                Pred::And(..) => {
-                    let mut terms = Vec::new();
-                    let mut stack = vec![pred];
-                    while let Some(p) = stack.pop() {
-                        if let Pred::And(a, b) = p {
-                            // Push rhs first so lhs pops first, keeping tie order stable.
-                            stack.push(b);
-                            stack.push(a);
-                        } else {
-                            terms.push(p);
+        let mut slots: Vec<crate::store::row::FieldSlot<'p>> = Vec::new();
+        let (tree, _) = build_slot_tree(pred, &mut |p, field| {
+            let cost = pred_leaf_cost(p);
+            match field.leaf() {
+                Some(name) => {
+                    let at = match slots.iter().position(|s| s.key() == name) {
+                        Some(at) => at,
+                        None => {
+                            slots.push(crate::store::row::FieldSlot::new(name));
+                            slots.len() - 1
                         }
+                    };
+                    if let Pred::Regex { pattern, flags, .. } = p {
+                        (
+                            BorrowedLeaf::SlotRegex(at, resolve_cached_regex(pattern, flags)),
+                            cost,
+                        )
+                    } else {
+                        (BorrowedLeaf::Slot(p, at), cost)
                     }
-                    let mut built: Vec<(SlotNode<'p>, u32)> =
-                        terms.into_iter().map(|t| build(t, slots)).collect();
-                    built.sort_by_key(|&(_, c)| c);
-                    let total_cost = built
-                        .iter()
-                        .fold(0u32, |acc, &(_, c)| acc.saturating_add(c))
-                        .max(1);
-                    let nodes = built.into_iter().map(|(n, _)| n).collect();
-                    (SlotNode::And(nodes), total_cost)
                 }
-                Pred::Or(..) => {
-                    let mut terms = Vec::new();
-                    let mut stack = vec![pred];
-                    while let Some(p) = stack.pop() {
-                        if let Pred::Or(a, b) = p {
-                            stack.push(b);
-                            stack.push(a);
-                        } else {
-                            terms.push(p);
-                        }
-                    }
-                    let mut built: Vec<(SlotNode<'p>, u32)> =
-                        terms.into_iter().map(|t| build(t, slots)).collect();
-                    built.sort_by_key(|&(_, c)| c);
-                    let total_cost = built
-                        .iter()
-                        .fold(0u32, |acc, &(_, c)| acc.saturating_add(c))
-                        .saturating_add(2);
-                    let nodes = built.into_iter().map(|(n, _)| n).collect();
-                    (SlotNode::Or(nodes), total_cost)
-                }
-                Pred::Not(inner) => {
-                    let (node, cost) = build(inner, slots);
-                    (SlotNode::Not(Box::new(node)), cost)
-                }
-                Pred::IsNull { field, .. }
-                | Pred::In { field, .. }
-                | Pred::Cmp { field, .. }
-                | Pred::Has { field, .. }
-                | Pred::Contains { field, .. }
-                | Pred::Regex { field, .. } => {
-                    let cost = pred_leaf_cost(pred);
-                    match field.leaf() {
-                        Some(name) => {
-                            let at = match slots.iter().position(|s| s.key() == name) {
-                                Some(at) => at,
-                                None => {
-                                    slots.push(crate::store::row::FieldSlot::new(name));
-                                    slots.len() - 1
-                                }
-                            };
-                            (SlotNode::Leaf(pred, at), cost)
-                        }
-                        None => (SlotNode::ByName(pred), cost.saturating_add(10)),
+                None => {
+                    let c = cost.saturating_add(10);
+                    if let Pred::Regex { pattern, flags, .. } = p {
+                        (
+                            BorrowedLeaf::ByNameRegex(field, resolve_cached_regex(pattern, flags)),
+                            c,
+                        )
+                    } else {
+                        (BorrowedLeaf::ByName(p), c)
                     }
                 }
             }
-        }
-        let mut slots = Vec::new();
-        let (tree, _) = build(pred, &mut slots);
+        });
         PredSlots { tree, slots }
     }
 
     #[inline]
     pub(crate) fn eval(&mut self, row: &Row, now: i64) -> bool {
         fn go(
-            node: &SlotNode<'_>,
+            node: &SlotTree<BorrowedLeaf<'_>>,
             slots: &mut [crate::store::row::FieldSlot<'_>],
             row: &Row,
             now: i64,
         ) -> bool {
             static NULL: Cell = Cell::Null;
             match node {
-                SlotNode::And(parts) => parts.iter().all(|c| go(c, slots, row, now)),
-                SlotNode::Or(parts) => parts.iter().any(|c| go(c, slots, row, now)),
-                SlotNode::Not(inner) => !go(inner, slots, row, now),
-                SlotNode::Leaf(pred, at) => {
+                SlotTree::And(parts) => parts.iter().all(|c| go(c, slots, row, now)),
+                SlotTree::Or(parts) => parts.iter().any(|c| go(c, slots, row, now)),
+                SlotTree::Not(inner) => !go(inner, slots, row, now),
+                SlotTree::Leaf(BorrowedLeaf::Slot(pred, at)) => {
                     eval_leaf(pred, slots[*at].get(row).unwrap_or(&NULL), now)
                 }
-                SlotNode::ByName(pred) => eval_pred(pred, row, now),
+                SlotTree::Leaf(BorrowedLeaf::SlotRegex(at, re)) => slots[*at]
+                    .get(row)
+                    .and_then(Cell::text)
+                    .is_some_and(|t| re.as_ref().is_some_and(|r| r.is_match(t))),
+                SlotTree::Leaf(BorrowedLeaf::ByName(pred)) => eval_pred(pred, row, now),
+                SlotTree::Leaf(BorrowedLeaf::ByNameRegex(field, re)) => field_cell(row, field)
+                    .text()
+                    .is_some_and(|t| re.as_ref().is_some_and(|r| r.is_match(t))),
             }
         }
         go(&self.tree, &mut self.slots, row, now)
@@ -541,117 +632,84 @@ impl<'p> PredSlots<'p> {
 /// Owned, lifetime-free counterpart of [`PredSlots`] for [`crate::Prepared`] and [`crate::QueryCursor`].
 #[derive(Clone, Debug)]
 pub(crate) struct OwnedPredSlots {
-    tree: OwnedSlotNode,
+    tree: SlotTree<OwnedLeaf>,
     slots: Vec<crate::store::row::OwnedFieldSlot>,
 }
 
 #[derive(Clone, Debug)]
-enum OwnedSlotNode {
-    And(Vec<OwnedSlotNode>),
-    Or(Vec<OwnedSlotNode>),
-    Not(Box<OwnedSlotNode>),
-    Leaf(Pred, usize),
+enum OwnedLeaf {
+    Slot(Pred, usize),
+    SlotRegex(usize, Option<Arc<regex::Regex>>),
     ByName(Pred),
+    ByNameRegex(Field, Option<Arc<regex::Regex>>),
 }
 
 impl OwnedPredSlots {
     pub(crate) fn new(pred: &Pred) -> Self {
-        fn build(
-            pred: &Pred,
-            slots: &mut Vec<crate::store::row::OwnedFieldSlot>,
-        ) -> (OwnedSlotNode, u32) {
-            match pred {
-                Pred::And(..) => {
-                    let mut terms = Vec::new();
-                    let mut stack = vec![pred];
-                    while let Some(p) = stack.pop() {
-                        if let Pred::And(a, b) = p {
-                            stack.push(b);
-                            stack.push(a);
-                        } else {
-                            terms.push(p);
+        let mut slots: Vec<crate::store::row::OwnedFieldSlot> = Vec::new();
+        let (tree, _) = build_slot_tree(pred, &mut |p, field| {
+            let cost = pred_leaf_cost(p);
+            match field.leaf() {
+                Some(name) => {
+                    let at = match slots.iter().position(|s| s.key() == name) {
+                        Some(at) => at,
+                        None => {
+                            slots.push(crate::store::row::OwnedFieldSlot::new(name));
+                            slots.len() - 1
                         }
+                    };
+                    if let Pred::Regex { pattern, flags, .. } = p {
+                        (
+                            OwnedLeaf::SlotRegex(at, resolve_cached_regex(pattern, flags)),
+                            cost,
+                        )
+                    } else {
+                        (OwnedLeaf::Slot(p.clone(), at), cost)
                     }
-                    let mut built: Vec<(OwnedSlotNode, u32)> =
-                        terms.into_iter().map(|t| build(t, slots)).collect();
-                    built.sort_by_key(|&(_, c)| c);
-                    let total_cost = built
-                        .iter()
-                        .fold(0u32, |acc, &(_, c)| acc.saturating_add(c))
-                        .max(1);
-                    let nodes = built.into_iter().map(|(n, _)| n).collect();
-                    (OwnedSlotNode::And(nodes), total_cost)
                 }
-                Pred::Or(..) => {
-                    let mut terms = Vec::new();
-                    let mut stack = vec![pred];
-                    while let Some(p) = stack.pop() {
-                        if let Pred::Or(a, b) = p {
-                            stack.push(b);
-                            stack.push(a);
-                        } else {
-                            terms.push(p);
-                        }
-                    }
-                    let mut built: Vec<(OwnedSlotNode, u32)> =
-                        terms.into_iter().map(|t| build(t, slots)).collect();
-                    built.sort_by_key(|&(_, c)| c);
-                    let total_cost = built
-                        .iter()
-                        .fold(0u32, |acc, &(_, c)| acc.saturating_add(c))
-                        .saturating_add(2);
-                    let nodes = built.into_iter().map(|(n, _)| n).collect();
-                    (OwnedSlotNode::Or(nodes), total_cost)
-                }
-                Pred::Not(inner) => {
-                    let (node, cost) = build(inner, slots);
-                    (OwnedSlotNode::Not(Box::new(node)), cost)
-                }
-                Pred::IsNull { field, .. }
-                | Pred::In { field, .. }
-                | Pred::Cmp { field, .. }
-                | Pred::Has { field, .. }
-                | Pred::Contains { field, .. }
-                | Pred::Regex { field, .. } => {
-                    let cost = pred_leaf_cost(pred);
-                    match field.leaf() {
-                        Some(name) => {
-                            let at = match slots.iter().position(|s| s.key() == name) {
-                                Some(at) => at,
-                                None => {
-                                    slots.push(crate::store::row::OwnedFieldSlot::new(name));
-                                    slots.len() - 1
-                                }
-                            };
-                            (OwnedSlotNode::Leaf(pred.clone(), at), cost)
-                        }
-                        None => (OwnedSlotNode::ByName(pred.clone()), cost.saturating_add(10)),
+                None => {
+                    let c = cost.saturating_add(10);
+                    if let Pred::Regex { pattern, flags, .. } = p {
+                        (
+                            OwnedLeaf::ByNameRegex(
+                                field.clone(),
+                                resolve_cached_regex(pattern, flags),
+                            ),
+                            c,
+                        )
+                    } else {
+                        (OwnedLeaf::ByName(p.clone()), c)
                     }
                 }
             }
-        }
-        let mut slots = Vec::new();
-        let (tree, _) = build(pred, &mut slots);
+        });
         OwnedPredSlots { tree, slots }
     }
 
     #[inline]
     pub(crate) fn eval(&mut self, row: &Row, now: i64) -> bool {
         fn go(
-            node: &OwnedSlotNode,
+            node: &SlotTree<OwnedLeaf>,
             slots: &mut [crate::store::row::OwnedFieldSlot],
             row: &Row,
             now: i64,
         ) -> bool {
             static NULL: Cell = Cell::Null;
             match node {
-                OwnedSlotNode::And(parts) => parts.iter().all(|c| go(c, slots, row, now)),
-                OwnedSlotNode::Or(parts) => parts.iter().any(|c| go(c, slots, row, now)),
-                OwnedSlotNode::Not(inner) => !go(inner, slots, row, now),
-                OwnedSlotNode::Leaf(pred, at) => {
+                SlotTree::And(parts) => parts.iter().all(|c| go(c, slots, row, now)),
+                SlotTree::Or(parts) => parts.iter().any(|c| go(c, slots, row, now)),
+                SlotTree::Not(inner) => !go(inner, slots, row, now),
+                SlotTree::Leaf(OwnedLeaf::Slot(pred, at)) => {
                     eval_leaf(pred, slots[*at].get(row).unwrap_or(&NULL), now)
                 }
-                OwnedSlotNode::ByName(pred) => eval_pred(pred, row, now),
+                SlotTree::Leaf(OwnedLeaf::SlotRegex(at, re)) => slots[*at]
+                    .get(row)
+                    .and_then(Cell::text)
+                    .is_some_and(|t| re.as_ref().is_some_and(|r| r.is_match(t))),
+                SlotTree::Leaf(OwnedLeaf::ByName(pred)) => eval_pred(pred, row, now),
+                SlotTree::Leaf(OwnedLeaf::ByNameRegex(field, re)) => field_cell(row, field)
+                    .text()
+                    .is_some_and(|t| re.as_ref().is_some_and(|r| r.is_match(t))),
             }
         }
         go(&self.tree, &mut self.slots, row, now)
@@ -660,20 +718,27 @@ impl OwnedPredSlots {
     #[inline]
     pub(crate) fn eval_sync(&self, row: &Row, now: i64) -> bool {
         fn go(
-            node: &OwnedSlotNode,
+            node: &SlotTree<OwnedLeaf>,
             slots: &[crate::store::row::OwnedFieldSlot],
             row: &Row,
             now: i64,
         ) -> bool {
             static NULL: Cell = Cell::Null;
             match node {
-                OwnedSlotNode::And(parts) => parts.iter().all(|c| go(c, slots, row, now)),
-                OwnedSlotNode::Or(parts) => parts.iter().any(|c| go(c, slots, row, now)),
-                OwnedSlotNode::Not(inner) => !go(inner, slots, row, now),
-                OwnedSlotNode::Leaf(pred, at) => {
+                SlotTree::And(parts) => parts.iter().all(|c| go(c, slots, row, now)),
+                SlotTree::Or(parts) => parts.iter().any(|c| go(c, slots, row, now)),
+                SlotTree::Not(inner) => !go(inner, slots, row, now),
+                SlotTree::Leaf(OwnedLeaf::Slot(pred, at)) => {
                     eval_leaf(pred, slots[*at].get_sync(row).unwrap_or(&NULL), now)
                 }
-                OwnedSlotNode::ByName(pred) => eval_pred(pred, row, now),
+                SlotTree::Leaf(OwnedLeaf::SlotRegex(at, re)) => slots[*at]
+                    .get_sync(row)
+                    .and_then(Cell::text)
+                    .is_some_and(|t| re.as_ref().is_some_and(|r| r.is_match(t))),
+                SlotTree::Leaf(OwnedLeaf::ByName(pred)) => eval_pred(pred, row, now),
+                SlotTree::Leaf(OwnedLeaf::ByNameRegex(field, re)) => field_cell(row, field)
+                    .text()
+                    .is_some_and(|t| re.as_ref().is_some_and(|r| r.is_match(t))),
             }
         }
         go(&self.tree, &self.slots, row, now)
@@ -807,6 +872,11 @@ pub(crate) fn cmp_cell(left: &Cell, value: &Value, op: CmpOp, now: i64) -> bool 
     }
 }
 
+thread_local! {
+    static HAS_WORD_SCRATCH: std::cell::RefCell<(String, String)> =
+        std::cell::RefCell::new((String::with_capacity(64), String::with_capacity(64)));
+}
+
 pub(crate) fn has_word(hay: &str, needle: &str, ci: bool) -> bool {
     if needle.is_empty() {
         return false;
@@ -821,29 +891,31 @@ pub(crate) fn has_word(hay: &str, needle: &str, ci: bool) -> bool {
             .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
             .any(|w| w.eq_ignore_ascii_case(needle));
     }
-    // Case-insensitive without allocating per-token Vec.
-    let mut nbuf = String::new();
-    for ch in needle.chars() {
-        for c in ch.to_lowercase() {
-            nbuf.push(c);
-        }
-    }
-    let mut wbuf = String::new();
-    for tok in hay.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
-        if tok.is_empty() {
-            continue;
-        }
-        wbuf.clear();
-        for ch in tok.chars() {
+    // Case-insensitive without allocating per-row or per-token Strings.
+    HAS_WORD_SCRATCH.with(|cell| {
+        let (nbuf, wbuf) = &mut *cell.borrow_mut();
+        nbuf.clear();
+        for ch in needle.chars() {
             for c in ch.to_lowercase() {
-                wbuf.push(c);
+                nbuf.push(c);
             }
         }
-        if wbuf == nbuf {
-            return true;
+        for tok in hay.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
+            if tok.is_empty() {
+                continue;
+            }
+            wbuf.clear();
+            for ch in tok.chars() {
+                for c in ch.to_lowercase() {
+                    wbuf.push(c);
+                }
+            }
+            if *wbuf == *nbuf {
+                return true;
+            }
         }
-    }
-    false
+        false
+    })
 }
 
 pub(crate) struct LexQuery {
@@ -918,9 +990,71 @@ pub(crate) fn lex_score_prepared(row: &Row, query: &LexQuery) -> i64 {
     })
 }
 
+/// Zero-allocation generic projector accepting `&[S]` (`S: AsRef<str>`), such as
+/// `SmallVec<[Cow<'_, str>; 8]>`, without forcing `Vec<String>` allocations.
+pub(crate) struct SliceRowProjector<'a> {
+    shape: Option<Arc<crate::store::RowShape>>,
+    slots: smallvec::SmallVec<[crate::store::row::FieldSlot<'a>; 8]>,
+}
+
+impl<'a> SliceRowProjector<'a> {
+    #[inline]
+    pub(crate) fn new<S: AsRef<str>>(fields: &'a [S]) -> Self {
+        if fields.is_empty() {
+            return Self {
+                shape: None,
+                slots: smallvec::SmallVec::new(),
+            };
+        }
+        let shape = if fields.len() == 2
+            && ((fields[0].as_ref() == "id" && fields[1].as_ref() == "title")
+                || (fields[0].as_ref() == "title" && fields[1].as_ref() == "id"))
+        {
+            Arc::clone(crate::store::shape_id_title())
+        } else {
+            Row::shape_of(fields)
+        };
+        let slots = shape
+            .names()
+            .iter()
+            .map(|target| {
+                let src = fields
+                    .iter()
+                    .find(|f| f.as_ref() == target.as_str())
+                    .map(AsRef::as_ref)
+                    .unwrap_or("");
+                crate::store::row::FieldSlot::new(src)
+            })
+            .collect();
+        Self {
+            shape: Some(shape),
+            slots,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn shape(&self) -> Option<&Arc<crate::store::RowShape>> {
+        self.shape.as_ref()
+    }
+
+    #[inline]
+    pub(crate) fn project(&mut self, row: &Row) -> Row {
+        let Some(ref shape) = self.shape else {
+            return Row::new();
+        };
+        Row::from_parts(
+            Arc::clone(shape),
+            self.slots
+                .iter_mut()
+                .map(|slot| slot.get(row).map(Cell::clone_for_borrow).unwrap_or(Cell::Null)),
+        )
+    }
+}
+
 pub(crate) fn project(rows: &[Row], fields: &[Field]) -> Vec<Row> {
-    let keys: Vec<String> = fields.iter().map(Field::as_str).collect();
-    let mut proj = crate::store::RowProjector::new(&keys);
+    let keys: smallvec::SmallVec<[std::borrow::Cow<'_, str>; 8]> =
+        fields.iter().map(Field::as_cow_str).collect();
+    let mut proj = SliceRowProjector::new(&keys);
     let mut result = Vec::with_capacity(rows.len());
     for r in rows {
         result.push(proj.project(r));
@@ -929,34 +1063,99 @@ pub(crate) fn project(rows: &[Row], fields: &[Field]) -> Vec<Row> {
 }
 
 /// [`project`] for rows the caller owns: rows already matching the projected shape stay in
-/// place; all others are reshaped in O(1) per field via [`crate::store::RowProjector`].
+/// place; all others are reshaped in O(1) per field via [`SliceRowProjector`].
 pub(crate) fn project_owned(mut rows: Vec<Row>, fields: &[Field]) -> Vec<Row> {
-    let keys: Vec<String> = fields.iter().map(Field::as_str).collect();
+    let keys: smallvec::SmallVec<[std::borrow::Cow<'_, str>; 8]> =
+        fields.iter().map(Field::as_cow_str).collect();
     if keys.is_empty() {
         for row in &mut rows {
             row.clear();
         }
         return rows;
     }
-    let target_shape = Row::shape_of(&keys);
-    let mut proj = crate::store::RowProjector::new(&keys);
+    let mut proj = SliceRowProjector::new(&keys);
     for row in &mut rows {
-        if !row
+        let same_shape = row
             .shape_arc()
-            .is_some_and(|s| std::sync::Arc::ptr_eq(s, &target_shape))
-        {
+            .zip(proj.shape())
+            .is_some_and(|(a, b)| Arc::ptr_eq(a, b));
+        if !same_shape {
             *row = proj.project(row);
         }
     }
     rows
 }
 
-/// Drop `fields` from owned rows in place without creating missing null entries.
+/// Drop `fields` from owned rows in place without creating missing null entries or acquiring
+/// per-row/per-field `Shape` transition `RwLock`s.
 pub(crate) fn without_rows(mut rows: Vec<Row>, fields: &[Field]) -> Vec<Row> {
-    let keys: Vec<String> = fields.iter().map(Field::as_str).collect();
+    if rows.is_empty() || fields.is_empty() {
+        return rows;
+    }
+    let drop_keys: smallvec::SmallVec<[std::borrow::Cow<'_, str>; 8]> =
+        fields.iter().map(Field::as_cow_str).collect();
+    #[allow(clippy::type_complexity)]
+    let mut shape_cache: smallvec::SmallVec<
+        [(
+            Arc<crate::store::RowShape>,
+            Option<Arc<crate::store::RowShape>>,
+            smallvec::SmallVec<[usize; 8]>,
+        ); 4],
+    > = smallvec::SmallVec::new();
+
     for row in &mut rows {
-        for k in &keys {
-            row.remove(k.as_str());
+        let Some(src_shape_ref) = row.shape_arc() else {
+            continue;
+        };
+        let hit_idx = shape_cache
+            .iter()
+            .position(|(s, _, _)| Arc::ptr_eq(s, src_shape_ref));
+        let idx = match hit_idx {
+            Some(i) => i,
+            None => {
+                let src_shape = Arc::clone(src_shape_ref);
+                let mut keep_positions: smallvec::SmallVec<[usize; 8]> =
+                    smallvec::SmallVec::with_capacity(src_shape.names().len());
+                let dst_shape = {
+                    let mut kept_names: smallvec::SmallVec<[&str; 16]> =
+                        smallvec::SmallVec::with_capacity(src_shape.names().len());
+                    for (pos, name) in src_shape.names().iter().enumerate() {
+                        if !drop_keys.iter().any(|dk| dk.as_ref() == name.as_str()) {
+                            keep_positions.push(pos);
+                            kept_names.push(name.as_str());
+                        }
+                    }
+                    if keep_positions.is_empty() {
+                        None
+                    } else if keep_positions.len() == src_shape.names().len() {
+                        Some(Arc::clone(&src_shape))
+                    } else {
+                        Some(Row::shape_of(&kept_names))
+                    }
+                };
+                if shape_cache.len() == 4 {
+                    shape_cache.remove(0);
+                }
+                shape_cache.push((src_shape, dst_shape, keep_positions));
+                shape_cache.len() - 1
+            }
+        };
+        let (_, ref dst_shape_opt, ref keep_positions) = shape_cache[idx];
+        match dst_shape_opt {
+            None => row.clear(),
+            Some(dst_shape) if keep_positions.len() == row.len() => {
+                // None of `drop_keys` existed in `row`: keep untouched.
+                let _ = dst_shape;
+            }
+            Some(dst_shape) => {
+                let cells_mut = row.cells_mut();
+                let mut kept_cells: smallvec::SmallVec<[Cell; 8]> =
+                    smallvec::SmallVec::with_capacity(keep_positions.len());
+                for &pos in keep_positions.as_slice() {
+                    kept_cells.push(std::mem::replace(&mut cells_mut[pos], Cell::Null));
+                }
+                row.reset_from_parts(Arc::clone(dst_shape), kept_cells);
+            }
         }
     }
     rows
@@ -968,7 +1167,6 @@ pub(crate) fn sort_rows_top_k(
     desc: bool,
     top_k: Option<usize>,
 ) {
-    let k = field.as_str();
     let n = rows.len();
     if n <= 1 {
         return;
@@ -977,26 +1175,100 @@ pub(crate) fn sort_rows_top_k(
         rows.clear();
         return;
     }
+    let k = field.as_cow_str();
+    static NULL_CELL: Cell = Cell::Null;
 
     if n <= 32 {
-        let cmp = |a: &Row, b: &Row| {
-            let av = a.get(&k).unwrap_or(&Cell::Null);
-            let bv = b.get(&k).unwrap_or(&Cell::Null);
-            let ord = cmp_sort(av, bv);
-            if desc { ord.reverse() } else { ord }
-        };
-        if let Some(limit) = top_k {
-            if rows.len() > limit {
-                rows.select_nth_unstable_by(limit - 1, cmp);
-                rows.truncate(limit);
+        let mut key_slot = crate::store::row::FieldSlot::new(k.as_ref());
+        let mut order: smallvec::SmallVec<[u8; 32]> = (0..n as u8).collect();
+        {
+            let cells: smallvec::SmallVec<[&Cell; 32]> = rows
+                .iter()
+                .map(|r| key_slot.get(r).unwrap_or(&NULL_CELL))
+                .collect();
+            order.sort_by(|&a, &b| {
+                let ord = cmp_sort(cells[a as usize], cells[b as usize]);
+                if desc { ord.reverse() } else { ord }
+            });
+        }
+        if let Some(limit) = top_k
+            && limit < order.len()
+        {
+            order.truncate(limit);
+        }
+        let mut old_rows = std::mem::replace(rows, Vec::with_capacity(order.len()));
+        for orig_idx in order {
+            rows.push(std::mem::take(&mut old_rows[orig_idx as usize]));
+        }
+        return;
+    }
+
+    // Bounded max-heap fast path for small top-k over large inputs (`O(N + K log K)` with
+    // `&Cell` comparison before cloning non-qualifying cells).
+    if let Some(limit) = top_k
+        && limit <= 256
+        && n >= limit.saturating_mul(8)
+    {
+        struct HeapEntry {
+            cell: Cell,
+            idx: usize,
+            desc: bool,
+        }
+        impl PartialEq for HeapEntry {
+            fn eq(&self, other: &Self) -> bool {
+                self.idx == other.idx
             }
         }
-        rows.sort_by(cmp);
+        impl Eq for HeapEntry {}
+        impl PartialOrd for HeapEntry {
+            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+        impl Ord for HeapEntry {
+            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                let ord = cmp_sort(&self.cell, &other.cell);
+                let ord = if self.desc { ord.reverse() } else { ord };
+                ord.then_with(|| self.idx.cmp(&other.idx))
+            }
+        }
+
+        let mut key_slot = crate::store::row::FieldSlot::new(k.as_ref());
+        let mut heap: std::collections::BinaryHeap<HeapEntry> =
+            std::collections::BinaryHeap::with_capacity(limit);
+        for (i, r) in rows.iter().enumerate() {
+            let cand = key_slot.get(r).unwrap_or(&NULL_CELL);
+            if heap.len() < limit {
+                heap.push(HeapEntry {
+                    cell: cand.clone_for_borrow(),
+                    idx: i,
+                    desc,
+                });
+            } else if let Some(mut worst) = heap.peek_mut() {
+                // Since `i > worst.idx`, `cand` strictly beats `worst` iff its sort key is
+                // strictly before `worst.cell` (ties keep the earlier `worst.idx`).
+                let ord = cmp_sort(cand, &worst.cell);
+                let ord = if desc { ord.reverse() } else { ord };
+                if ord == std::cmp::Ordering::Less {
+                    *worst = HeapEntry {
+                        cell: cand.clone_for_borrow(),
+                        idx: i,
+                        desc,
+                    };
+                }
+            }
+        }
+        drop(key_slot);
+        let winners = heap.into_sorted_vec();
+        let mut old_rows = std::mem::replace(rows, Vec::with_capacity(winners.len()));
+        for entry in winners {
+            rows.push(std::mem::take(&mut old_rows[entry.idx]));
+        }
         return;
     }
 
     // Decorate: extract sort keys once in O(N) instead of O(N log N) lookups by name.
-    let mut key_slot = crate::store::row::FieldSlot::new(&k);
+    let mut key_slot = crate::store::row::FieldSlot::new(k.as_ref());
     let mut keys: Vec<(Cell, usize)> = rows
         .iter()
         .enumerate()
@@ -1147,6 +1419,7 @@ fn get_frame_bounds(
 /// `tv[i]` is the target field of row `i` (`Cell::Null` when absent, or for functions
 /// without a field); `ties[i]` says whether row `i` equals row `i - 1` on every sort key
 /// (empty when the window has no ordering). Shared by the row and the columnar executor.
+#[inline]
 pub(crate) fn window_values(
     func: &WindowFunction,
     tv: &[&Cell],
@@ -1155,7 +1428,22 @@ pub(crate) fn window_values(
     has_target: bool,
     frame: Option<&WindowFrame>,
 ) -> Vec<Cell> {
-    let n = tv.len();
+    window_values_len(func, tv, tv.len(), ties, has_order, has_target, frame)
+}
+
+pub(crate) fn window_values_len(
+    func: &WindowFunction,
+    tv: &[&Cell],
+    part_len: usize,
+    ties: &[bool],
+    has_order: bool,
+    has_target: bool,
+    frame: Option<&WindowFrame>,
+) -> Vec<Cell> {
+    let n = part_len;
+    if n == 0 {
+        return Vec::new();
+    }
     match func {
         WindowFunction::RowNumber => (0..n).map(|i| Cell::Int((i + 1) as i64)).collect(),
         WindowFunction::Rank => {
@@ -1182,11 +1470,14 @@ pub(crate) fn window_values(
             ranks
         }
         WindowFunction::Lead { offset } => {
+            if tv.is_empty() {
+                return vec![Cell::Null; n];
+            }
             let off = *offset;
             (0..n)
                 .map(|i| {
-                    if i + off < n {
-                        tv[i + off].clone()
+                    if i + off < tv.len() {
+                        tv[i + off].clone_for_borrow()
                     } else {
                         Cell::Null
                     }
@@ -1194,11 +1485,14 @@ pub(crate) fn window_values(
                 .collect()
         }
         WindowFunction::Lag { offset } => {
+            if tv.is_empty() {
+                return vec![Cell::Null; n];
+            }
             let off = *offset;
             (0..n)
                 .map(|i| {
-                    if i >= off {
-                        tv[i - off].clone()
+                    if i >= off && i - off < tv.len() {
+                        tv[i - off].clone_for_borrow()
                     } else {
                         Cell::Null
                     }
@@ -1206,51 +1500,59 @@ pub(crate) fn window_values(
                 .collect()
         }
         WindowFunction::FirstValue => {
+            if tv.is_empty() {
+                return vec![Cell::Null; n];
+            }
             if let Some(fr) = frame {
                 (0..n)
                     .map(|i| {
                         let (s, e) = get_frame_bounds(i, n, Some(fr), has_order);
-                        if s <= e && s < n {
-                            tv[s].clone()
+                        if s <= e && s < tv.len() {
+                            tv[s].clone_for_borrow()
                         } else {
                             Cell::Null
                         }
                     })
                     .collect()
             } else {
-                let first_val = tv.first().map(|c| (*c).clone()).unwrap_or(Cell::Null);
+                let first_val = tv.first().map(|c| c.clone_for_borrow()).unwrap_or(Cell::Null);
                 vec![first_val; n]
             }
         }
         WindowFunction::LastValue => {
+            if tv.is_empty() {
+                return vec![Cell::Null; n];
+            }
             if let Some(fr) = frame {
                 (0..n)
                     .map(|i| {
                         let (s, e) = get_frame_bounds(i, n, Some(fr), has_order);
                         if s <= e && s < n {
                             let end_idx = e.min(n - 1);
-                            tv[end_idx].clone()
+                            tv.get(end_idx)
+                                .map(|c| c.clone_for_borrow())
+                                .unwrap_or(Cell::Null)
                         } else {
                             Cell::Null
                         }
                     })
                     .collect()
             } else {
-                let last_val = tv.last().map(|c| (*c).clone()).unwrap_or(Cell::Null);
+                let last_val = tv.last().map(|c| c.clone_for_borrow()).unwrap_or(Cell::Null);
                 vec![last_val; n]
             }
         }
         WindowFunction::Sum => {
-            let mut has_float = false;
-            let has_float_scan = tv.iter().any(|c| matches!(c, Cell::Float(_)));
-            has_float |= has_float_scan;
+            if tv.is_empty() {
+                return vec![Cell::Int(0); n];
+            }
+            let has_float = tv.iter().any(|c| matches!(c, Cell::Float(_)));
             if has_float {
                 let mut prefix = Vec::with_capacity(n + 1);
                 prefix.push(0.0f64);
                 let mut acc = 0.0f64;
                 for c in tv {
-                    if let Some(v) = c.as_f64()
-                    {
+                    if let Some(v) = c.as_f64() {
                         acc += v;
                     }
                     prefix.push(acc);
@@ -1297,6 +1599,9 @@ pub(crate) fn window_values(
             }
         }
         WindowFunction::Avg => {
+            if tv.is_empty() {
+                return vec![Cell::Float(0.0); n];
+            }
             let mut prefix_sum = Vec::with_capacity(n + 1);
             let mut prefix_cnt = Vec::with_capacity(n + 1);
             prefix_sum.push(0.0f64);
@@ -1304,8 +1609,7 @@ pub(crate) fn window_values(
             let mut sum_acc = 0.0f64;
             let mut cnt_acc = 0usize;
             for c in tv {
-                if let Some(v) = c.as_f64()
-                {
+                if let Some(v) = c.as_f64() {
                     sum_acc += v;
                     cnt_acc += 1;
                 }
@@ -1328,13 +1632,24 @@ pub(crate) fn window_values(
             avgs
         }
         WindowFunction::Min => {
-            eval_window_extremum(tv, frame, has_order, false)
+            if tv.is_empty() {
+                vec![Cell::Null; n]
+            } else {
+                eval_window_extremum(tv, frame, has_order, false)
+            }
         }
         WindowFunction::Max => {
-            eval_window_extremum(tv, frame, has_order, true)
+            if tv.is_empty() {
+                vec![Cell::Null; n]
+            } else {
+                eval_window_extremum(tv, frame, has_order, true)
+            }
         }
         WindowFunction::Count => {
             if has_target {
+                if tv.is_empty() {
+                    return vec![Cell::Int(0); n];
+                }
                 let mut prefix_cnt = Vec::with_capacity(n + 1);
                 prefix_cnt.push(0usize);
                 let mut cnt_acc = 0usize;
@@ -1373,6 +1688,12 @@ pub(crate) fn window_values(
     }
 }
 
+#[inline]
+fn recycle_ref_vec<'a, 'b, T>(mut v: Vec<&'a T>) -> Vec<&'b T> {
+    v.clear();
+    v.into_iter().map(|_| unreachable!()).collect()
+}
+
 pub(crate) fn eval_window(
     rows: Vec<Row>,
     func: &WindowFunction,
@@ -1386,32 +1707,49 @@ pub(crate) fn eval_window(
         return rows;
     }
 
+    static NULL_CELL: Cell = Cell::Null;
     let total_len = rows.len();
-    let by_keys: Vec<std::borrow::Cow<'_, str>> = by.iter().map(|b| b.as_cow_str()).collect();
-    let order_keys: Vec<(std::borrow::Cow<'_, str>, bool)> = order
-        .iter()
-        .map(|s| (s.field.as_cow_str(), s.desc))
-        .collect();
+    let by_keys: smallvec::SmallVec<[std::borrow::Cow<'_, str>; 4]> =
+        by.iter().map(|b| b.as_cow_str()).collect();
+    let order_keys: smallvec::SmallVec<[(std::borrow::Cow<'_, str>, bool); 4]> =
+        order.iter().map(|s| (s.field.as_cow_str(), s.desc)).collect();
     let target_field: Option<std::borrow::Cow<'_, str>> = field.map(|f| f.as_cow_str());
-    let tf: &str = target_field.as_deref().unwrap_or_default();
 
     let partition_vec: Vec<Vec<Row>> = if by_keys.is_empty() {
         vec![rows]
+    } else if by_keys.len() == 1 {
+        let mut by_slot = crate::store::row::FieldSlot::new(by_keys[0].as_ref());
+        let mut partition_of: FxHashMap<Cell, usize> = FxHashMap::default();
+        let mut partitions: Vec<Vec<Row>> = Vec::new();
+        for row in rows {
+            let cell_ref = by_slot.get(&row).unwrap_or(&NULL_CELL);
+            let slot = match partition_of.get(cell_ref) {
+                Some(&slot) => slot,
+                None => {
+                    let slot = partitions.len();
+                    partition_of.insert(cell_ref.clone_for_borrow(), slot);
+                    partitions.push(Vec::new());
+                    slot
+                }
+            };
+            partitions[slot].push(row);
+        }
+        partitions
     } else {
         // Key -> position of its partition, partitions kept in first-seen order. Each key is
         // stored once, and rows move straight into their partition.
+        let mut by_slots: smallvec::SmallVec<[crate::store::row::FieldSlot<'_>; 4]> = by_keys
+            .iter()
+            .map(|bk| crate::store::row::FieldSlot::new(bk.as_ref()))
+            .collect();
         let mut partition_of: FxHashMap<Vec<Cell>, usize> = FxHashMap::default();
         let mut partitions: Vec<Vec<Row>> = Vec::new();
         let mut key_buf: Vec<Cell> = Vec::with_capacity(by_keys.len());
 
         for row in rows {
             key_buf.clear();
-            for bk in &by_keys {
-                key_buf.push(
-                    row.get(bk.as_ref())
-                        .map(Cell::clone_for_borrow)
-                        .unwrap_or(Cell::Null),
-                );
+            for bs in &mut by_slots {
+                key_buf.push(bs.get(&row).map(Cell::clone_for_borrow).unwrap_or(Cell::Null));
             }
             let slot = match partition_of.get(&key_buf) {
                 Some(&slot) => slot,
@@ -1428,30 +1766,53 @@ pub(crate) fn eval_window(
         partitions
     };
 
+    let mut order_slots: smallvec::SmallVec<[(crate::store::row::FieldSlot<'_>, bool); 4]> =
+        order_keys
+            .iter()
+            .map(|(ok, desc)| (crate::store::row::FieldSlot::new(ok.as_ref()), *desc))
+            .collect();
+    let mut target_slot = target_field
+        .as_deref()
+        .map(crate::store::row::FieldSlot::new);
+
+    let needs_ties = matches!(func, WindowFunction::Rank | WindowFunction::DenseRank);
+    let mut keys_buf: Vec<&'static Cell> = Vec::new();
+    let mut order_buf: Vec<u32> = Vec::new();
+    let mut ties_buf: Vec<bool> = Vec::new();
+    let mut tv_buf: Vec<&'static Cell> = Vec::new();
+    let mut scratch_part: Vec<Row> = Vec::new();
+
+    // Cache `(src_shape, pos, overwrite_in_place, dst_shape)` for O(1) `as_field` insertion.
+    #[allow(clippy::type_complexity)]
+    let mut shape_cache: smallvec::SmallVec<
+        [(
+            Arc<crate::store::RowShape>,
+            usize,
+            bool,
+            Arc<crate::store::RowShape>,
+        ); 4],
+    > = smallvec::SmallVec::new();
+
     let mut result_rows = Vec::with_capacity(total_len);
 
     for mut part in partition_vec {
-        // For `rank` / `dense_rank`: whether row `i` ties with row `i - 1` on every sort key,
-        // read off the key buffer built for sorting instead of re-probing both rows' maps.
-        let needs_ties = matches!(func, WindowFunction::Rank | WindowFunction::DenseRank);
-        let mut ties: Vec<bool> = Vec::new();
-        if !order_keys.is_empty() && part.len() > 1 {
-            // Look every sort key up once, then sort row indices over the flat key buffer
-            // instead of walking each row's map inside the comparator.
-            let k = order_keys.len();
-            let order: Vec<u32> = {
-                static NULL: Cell = Cell::Null;
-                let mut keys: Vec<&Cell> = Vec::with_capacity(part.len() * k);
+        let part_len = part.len();
+        ties_buf.clear();
+        if !order_slots.is_empty() && part_len > 1 {
+            let k = order_slots.len();
+            {
+                let mut keys: Vec<&Cell> = recycle_ref_vec(keys_buf);
+                keys.reserve(part_len * k);
                 for row in &part {
-                    for (ok, _) in &order_keys {
-                        keys.push(row.get(ok.as_ref()).unwrap_or(&NULL));
+                    for (slot, _) in &mut order_slots {
+                        keys.push(slot.get(row).unwrap_or(&NULL_CELL));
                     }
                 }
-                let mut order: Vec<u32> = (0..part.len() as u32).collect();
-                // Stable, like the row sort it replaces.
-                order.sort_by(|&a, &b| {
+                order_buf.clear();
+                order_buf.extend(0..part_len as u32);
+                order_buf.sort_by(|&a, &b| {
                     let (a, b) = (a as usize * k, b as usize * k);
-                    for (j, (_, desc)) in order_keys.iter().enumerate() {
+                    for (j, (_, desc)) in order_slots.iter().enumerate() {
                         let ord = cmp_sort(keys[a + j], keys[b + j]);
                         let ord = if *desc { ord.reverse() } else { ord };
                         if ord != std::cmp::Ordering::Equal {
@@ -1461,46 +1822,96 @@ pub(crate) fn eval_window(
                     std::cmp::Ordering::Equal
                 });
                 if needs_ties {
-                    ties = Vec::with_capacity(order.len());
-                    ties.push(false);
-                    for w in order.windows(2) {
+                    ties_buf.reserve(order_buf.len());
+                    ties_buf.push(false);
+                    for w in order_buf.windows(2) {
                         let (a, b) = (w[0] as usize * k, w[1] as usize * k);
-                        ties.push((0..k).all(|j| {
+                        ties_buf.push((0..k).all(|j| {
                             cmp_sort(keys[a + j], keys[b + j]) == std::cmp::Ordering::Equal
                         }));
                     }
                 }
-                order
-            };
-            let mut slots: Vec<Option<Row>> = part.into_iter().map(Some).collect();
-            part = order
-                .into_iter()
-                .filter_map(|i| slots[i as usize].take())
-                .collect();
+                keys_buf = recycle_ref_vec(keys);
+            }
+            scratch_part.clear();
+            scratch_part.reserve(part_len);
+            for &idx in &order_buf {
+                scratch_part.push(std::mem::take(&mut part[idx as usize]));
+            }
+            std::mem::swap(&mut part, &mut scratch_part);
         }
 
-        // Target field of every row, looked up once: frame functions below index this flat
-        // buffer instead of probing each row's map (twice, for `sum`).
-        static NULL_CELL: Cell = Cell::Null;
-        let tv: Vec<&Cell> = if target_field.is_some() {
-            part.iter()
-                .map(|r| r.get(tf).unwrap_or(&NULL_CELL))
-                .collect()
-        } else {
-            // Functions that take no field still index by row.
-            vec![&NULL_CELL; part.len()]
+        let vals = {
+            let mut tv: Vec<&Cell> = recycle_ref_vec(tv_buf);
+            if let Some(ref mut tslot) = target_slot {
+                tv.reserve(part_len);
+                for r in &part {
+                    tv.push(tslot.get(r).unwrap_or(&NULL_CELL));
+                }
+            }
+            let out = window_values_len(
+                func,
+                &tv,
+                part_len,
+                &ties_buf,
+                !order_slots.is_empty(),
+                target_slot.is_some(),
+                frame,
+            );
+            tv_buf = recycle_ref_vec(tv);
+            out
         };
-        let vals = window_values(
-            func,
-            &tv,
-            &ties,
-            !order_keys.is_empty(),
-            target_field.is_some(),
-            frame,
-        );
-        for (i, mut row) in part.into_iter().enumerate() {
-            row.insert(as_field, vals[i].clone());
-            result_rows.push(row);
+
+        for (mut row, val) in part.into_iter().zip(vals) {
+            let hit = row
+                .shape_arc()
+                .and_then(|s| shape_cache.iter().position(|(cs, _, _, _)| Arc::ptr_eq(cs, s)));
+            if let Some(ci) = hit {
+                let (_, pos, overwrite, ref dst_shape) = shape_cache[ci];
+                if overwrite {
+                    row.cells_mut()[pos] = val;
+                    result_rows.push(row);
+                } else {
+                    let new_len = row.len() + 1;
+                    let mut old_cells = row.into_values();
+                    let mut new_cells: smallvec::SmallVec<[Cell; 8]> =
+                        smallvec::SmallVec::with_capacity(new_len);
+                    for _ in 0..pos {
+                        if let Some(c) = old_cells.next() {
+                            new_cells.push(c);
+                        }
+                    }
+                    new_cells.push(val);
+                    new_cells.extend(old_cells);
+                    result_rows.push(Row::from_parts(Arc::clone(dst_shape), new_cells));
+                }
+            } else if let Some(s) = row.shape_arc() {
+                let src_shape = Arc::clone(s);
+                if let Some(pos) = src_shape.names().iter().position(|n| n == as_field) {
+                    row.cells_mut()[pos] = val;
+                    if shape_cache.len() == 4 {
+                        shape_cache.remove(0);
+                    }
+                    shape_cache.push((Arc::clone(&src_shape), pos, true, src_shape));
+                    result_rows.push(row);
+                } else {
+                    row.insert(as_field, val);
+                    let dst_shape = Arc::clone(row.shape_arc().expect("inserted field"));
+                    let insert_at = dst_shape
+                        .names()
+                        .iter()
+                        .position(|n| n == as_field)
+                        .expect("inserted field present");
+                    if shape_cache.len() == 4 {
+                        shape_cache.remove(0);
+                    }
+                    shape_cache.push((src_shape, insert_at, false, dst_shape));
+                    result_rows.push(row);
+                }
+            } else {
+                row.insert(as_field, val);
+                result_rows.push(row);
+            }
         }
     }
 

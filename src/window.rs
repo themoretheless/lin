@@ -4,7 +4,7 @@
 //! SUM, AVG, MIN, MAX, COUNT
 
 /// Window function types for analytical queries
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WindowFunction {
     Rank,                   // RANK() OVER (ORDER BY ...)
     DenseRank,              // DENSE_RANK() OVER (ORDER BY ...)
@@ -23,18 +23,18 @@ pub enum WindowFunction {
 impl std::fmt::Display for WindowFunction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            WindowFunction::Rank => write!(f, "RANK"),
-            WindowFunction::DenseRank => write!(f, "DENSE_RANK"),
-            WindowFunction::RowNumber => write!(f, "ROW_NUMBER"),
-            WindowFunction::Lead { offset } => write!(f, "LEAD({})", offset),
-            WindowFunction::Lag { offset } => write!(f, "LAG({})", offset),
-            WindowFunction::FirstValue => write!(f, "FIRST_VALUE"),
-            WindowFunction::LastValue => write!(f, "LAST_VALUE"),
-            WindowFunction::Sum => write!(f, "SUM"),
-            WindowFunction::Avg => write!(f, "AVG"),
-            WindowFunction::Min => write!(f, "MIN"),
-            WindowFunction::Max => write!(f, "MAX"),
-            WindowFunction::Count => write!(f, "COUNT"),
+            WindowFunction::Rank => f.write_str("RANK"),
+            WindowFunction::DenseRank => f.write_str("DENSE_RANK"),
+            WindowFunction::RowNumber => f.write_str("ROW_NUMBER"),
+            WindowFunction::Lead { offset } => write!(f, "LEAD({offset})"),
+            WindowFunction::Lag { offset } => write!(f, "LAG({offset})"),
+            WindowFunction::FirstValue => f.write_str("FIRST_VALUE"),
+            WindowFunction::LastValue => f.write_str("LAST_VALUE"),
+            WindowFunction::Sum => f.write_str("SUM"),
+            WindowFunction::Avg => f.write_str("AVG"),
+            WindowFunction::Min => f.write_str("MIN"),
+            WindowFunction::Max => f.write_str("MAX"),
+            WindowFunction::Count => f.write_str("COUNT"),
         }
     }
 }
@@ -65,9 +65,9 @@ pub enum FrameBound {
 impl std::fmt::Display for FrameBound {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            FrameBound::UnboundedPreceding => write!(f, "unbounded preceding"),
-            FrameBound::UnboundedFollowing => write!(f, "unbounded following"),
-            FrameBound::CurrentRow => write!(f, "current row"),
+            FrameBound::UnboundedPreceding => f.write_str("unbounded preceding"),
+            FrameBound::UnboundedFollowing => f.write_str("unbounded following"),
+            FrameBound::CurrentRow => f.write_str("current row"),
             FrameBound::Preceding(n) => write!(f, "{n} preceding"),
             FrameBound::Following(n) => write!(f, "{n} following"),
         }

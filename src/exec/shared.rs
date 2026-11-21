@@ -9,6 +9,7 @@
 
 use std::fs::File;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock};
 
 use crate::batch::RecordBatch;
@@ -30,6 +31,8 @@ struct SyncState {
 }
 
 pub(crate) struct WalSyncGroup {
+    written_seq: AtomicU64,
+    synced_seq: AtomicU64,
     state: Mutex<SyncState>,
     cv: Condvar,
 }
@@ -37,6 +40,8 @@ pub(crate) struct WalSyncGroup {
 impl WalSyncGroup {
     pub(crate) fn new() -> Self {
         Self {
+            written_seq: AtomicU64::new(0),
+            synced_seq: AtomicU64::new(0),
             state: Mutex::new(SyncState {
                 written_seq: 0,
                 synced_seq: 0,
@@ -49,22 +54,35 @@ impl WalSyncGroup {
     }
 
     #[inline]
+    #[allow(dead_code)]
     pub(crate) fn is_all_synced(&self) -> bool {
-        let g = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        g.synced_seq >= g.written_seq
+        let (s, w) = self.synced_and_written();
+        s >= w
+    }
+
+    #[inline]
+    fn synced_and_written(&self) -> (u64, u64) {
+        // Read `synced_seq` before `written_seq`: since `written_seq` is monotonic and
+        // `synced_seq <= written_seq`, `s >= w` guarantees `synced_seq == written_seq == s`.
+        let s = self.synced_seq.load(Ordering::Acquire);
+        let w = self.written_seq.load(Ordering::Acquire);
+        (s, w)
     }
 
     /// Record a deferred `SyncMode::Full` WAL append while holding `db` mutex.
     fn note_unsynced_write(&self) -> u64 {
         let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
         g.written_seq += 1;
-        g.written_seq
+        let seq = g.written_seq;
+        self.written_seq.store(seq, Ordering::Release);
+        seq
     }
 
     /// Mark all writes up to `written_seq` as already durable (e.g. after a full checkpoint).
     pub(crate) fn note_checkpointed(&self) {
         let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
         g.synced_seq = g.written_seq;
+        self.synced_seq.store(g.synced_seq, Ordering::Release);
         self.cv.notify_all();
     }
 
@@ -78,6 +96,10 @@ impl WalSyncGroup {
 
     /// Wait until all previously written WAL frames have been synced (used by durable readers).
     pub(crate) fn wait_all_written_synced(&self, sync_file: Option<File>) -> Result<u64, Error> {
+        let (s, w) = self.synced_and_written();
+        if s >= w {
+            return Ok(s);
+        }
         let target = {
             let g = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if g.synced_seq >= g.written_seq {
@@ -93,8 +115,7 @@ impl WalSyncGroup {
                 g = self.cv.wait(g).unwrap_or_else(|e| e.into_inner());
             }
         }
-        let g = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        Ok(g.synced_seq)
+        Ok(self.synced_seq.load(Ordering::Acquire))
     }
 
     /// Leader-follower group sync barrier: guarantees `target_seq` is durably flushed on disk
@@ -132,10 +153,12 @@ impl WalSyncGroup {
                     if g.last_error.as_ref().is_some_and(|(_, hi, _)| *hi <= batch_lo) {
                         g.last_error = None;
                     }
+                    self.synced_seq.store(g.synced_seq, Ordering::Release);
                 }
                 Err(err) => {
                     g.synced_seq = g.synced_seq.max(batch_hi);
                     g.last_error = Some((batch_lo, batch_hi, err));
+                    self.synced_seq.store(g.synced_seq, Ordering::Release);
                 }
             }
             self.cv.notify_all();
@@ -150,8 +173,19 @@ impl WalSyncGroup {
     }
 }
 
+#[inline]
+fn persist_will_auto_ckpt(db: &Db) -> bool {
+    db.persist.as_ref().is_some_and(|p| {
+        (p.writes_since_snapshot + 1 >= crate::persist::SNAPSHOT_EVERY
+            && p.log_bytes >= 4 * 1024 * 1024)
+            || p.writes_since_snapshot + 1 >= 4096
+            || p.log_bytes > db.quotas.max_log_bytes
+    })
+}
+
 struct SharedDbInner {
     db: Mutex<Db>,
+    db_gen: AtomicU64,
     sync_group: WalSyncGroup,
     cached_reader: RwLock<Option<(u64, u64, ReadDb)>>,
 }
@@ -167,9 +201,11 @@ pub struct SharedDb {
 
 impl SharedDb {
     pub fn new(db: Db) -> Self {
+        let init_gen = db.store.r#gen;
         Self {
             inner: Arc::new(SharedDbInner {
                 db: Mutex::new(db),
+                db_gen: AtomicU64::new(init_gen),
                 sync_group: WalSyncGroup::new(),
                 cached_reader: RwLock::new(None),
             }),
@@ -270,12 +306,7 @@ pub(crate) fn defer_db_write_op<T>(
 ) -> (Result<T, Error>, Option<(u64, File)>) {
     let prev_gen = db.store.r#gen;
     let prev_log_bytes = db.persist.as_ref().map(|p| p.log_bytes).unwrap_or(0);
-    let will_auto_ckpt = db.persist.as_ref().is_some_and(|p| {
-        (p.writes_since_snapshot + 1 >= crate::persist::SNAPSHOT_EVERY
-            && p.log_bytes >= 4 * 1024 * 1024)
-            || p.writes_since_snapshot + 1 >= 4096
-            || p.log_bytes > db.quotas.max_log_bytes
-    });
+    let will_auto_ckpt = persist_will_auto_ckpt(db);
     if will_auto_ckpt {
         sync_group.wait_idle();
     }
@@ -329,7 +360,9 @@ impl SharedDb {
     fn run_write_op<T>(&self, op: impl FnOnce(&mut Db) -> Result<T, Error>) -> Result<T, Error> {
         let (res, pending_sync) = {
             let mut db = self.lock_db()?;
-            defer_db_write_op(&mut db, &self.inner.sync_group, op)
+            let out = defer_db_write_op(&mut db, &self.inner.sync_group, op);
+            self.inner.db_gen.store(db.store.r#gen, Ordering::Release);
+            out
         };
         let val = res?;
         if let Some((seq, file)) = pending_sync {
@@ -341,28 +374,24 @@ impl SharedDb {
     /// Obtain a durable [`ReadDb`] snapshot (shared across concurrent readers without holding
     /// the writer lock).
     pub fn reader(&self) -> Result<ReadDb, Error> {
-        // Fast path when all writes are synced and cached reader matches current generation.
-        if self.inner.sync_group.is_all_synced() {
-            let sg = self
-                .inner
-                .sync_group
-                .state
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if sg.synced_seq >= sg.written_seq
-                && let Ok(rg) = self.inner.cached_reader.read()
-                && let Some((cached_seq, _, ref rdb)) = *rg
-                && cached_seq == sg.synced_seq
-            {
+        // Lock-free fast path: read cached snapshot first, then verify atomic sync & gen watermarks.
+        if let Ok(rg) = self.inner.cached_reader.read()
+            && let Some((cached_seq, cached_gen, ref rdb)) = *rg
+        {
+            let (s_seq, w_seq) = self.inner.sync_group.synced_and_written();
+            let cur_gen = self.inner.db_gen.load(Ordering::Acquire);
+            if s_seq >= w_seq && cached_seq == s_seq && cached_gen == cur_gen {
                 return Ok(rdb.clone());
             }
         }
         let mut db = self.lock_db()?;
-        let sync_file = db
-            .persist
-            .as_ref()
-            .and_then(|p| (p.sync == SyncMode::Full && p.log_bytes > 0).then(|| p.log.try_clone().ok()).flatten());
+        let sync_file = db.persist.as_ref().and_then(|p| {
+            (p.sync == SyncMode::Full && p.log_bytes > 0)
+                .then(|| p.log.try_clone().ok())
+                .flatten()
+        });
         let cur_gen = db.store.r#gen;
+        self.inner.db_gen.store(cur_gen, Ordering::Release);
         let rdb = db.reader();
         drop(db);
         let synced_seq = self.inner.sync_group.wait_all_written_synced(sync_file)?;
@@ -388,6 +417,7 @@ impl SharedDb {
         let mut db = self.lock_db()?;
         self.inner.sync_group.wait_idle();
         db.checkpoint()?;
+        self.inner.db_gen.store(db.store.r#gen, Ordering::Release);
         self.inner.sync_group.note_checkpointed();
         Ok(())
     }
@@ -396,6 +426,7 @@ impl SharedDb {
         let mut db = self.lock_db()?;
         self.inner.sync_group.wait_idle();
         db.close()?;
+        self.inner.db_gen.store(db.store.r#gen, Ordering::Release);
         self.inner.sync_group.note_checkpointed();
         Ok(())
     }
@@ -425,12 +456,10 @@ pub struct SharedTransaction<'a> {
 }
 
 impl SharedTransaction<'_> {
-    fn with_tx<R>(&mut self, f: impl FnOnce(&mut Transaction<'_>) -> R) -> Result<R, Error> {
-        let Some(guard) = self.guard.as_mut() else {
-            return Err(Error::runtime("transaction already finished"));
-        };
-        let mut tmp = Transaction {
-            db: &mut *guard,
+    #[inline]
+    fn take_into_tx<'b>(&mut self, db: &'b mut Db) -> Transaction<'b> {
+        Transaction {
+            db,
             base_gen: self.base_gen,
             base_next_id: self.base_next_id,
             committed: false,
@@ -441,7 +470,14 @@ impl SharedTransaction<'_> {
             disk_savepoint: self.disk_savepoint,
             mutation_count: self.mutation_count,
             journal_bytes: self.journal_bytes,
+        }
+    }
+
+    fn with_tx<R>(&mut self, f: impl FnOnce(&mut Transaction<'_>) -> R) -> Result<R, Error> {
+        let Some(mut guard) = self.guard.take() else {
+            return Err(Error::runtime("transaction already finished"));
         };
+        let mut tmp = self.take_into_tx(&mut guard);
         let out = f(&mut tmp);
         self.base_gen = tmp.base_gen;
         self.base_next_id = tmp.base_next_id;
@@ -454,6 +490,8 @@ impl SharedTransaction<'_> {
         self.journal_bytes = tmp.journal_bytes;
         // Suppress tmp's Drop rollback; SharedTransaction owns the lifecycle.
         tmp.committed = true;
+        drop(tmp);
+        self.guard = Some(guard);
         Ok(out)
     }
 
@@ -505,13 +543,7 @@ impl SharedTransaction<'_> {
         };
         let had_packs = !self.packs.is_empty();
         let prev_log_bytes = guard.persist.as_ref().map(|p| p.log_bytes).unwrap_or(0);
-        let will_auto_ckpt = had_packs
-            && guard.persist.as_ref().is_some_and(|p| {
-                (p.writes_since_snapshot + 1 >= crate::persist::SNAPSHOT_EVERY
-                    && p.log_bytes >= 4 * 1024 * 1024)
-                    || p.writes_since_snapshot + 1 >= 4096
-                    || p.log_bytes > guard.quotas.max_log_bytes
-            });
+        let will_auto_ckpt = had_packs && persist_will_auto_ckpt(&guard);
         if will_auto_ckpt {
             self.shared.inner.sync_group.wait_idle();
         }
@@ -526,23 +558,15 @@ impl SharedTransaction<'_> {
                 }
             });
 
-        let tmp = Transaction {
-            db: &mut *guard,
-            base_gen: self.base_gen,
-            base_next_id: self.base_next_id,
-            committed: false,
-            undo: std::mem::replace(&mut self.undo, Undo::None),
-            cat_backup: self.cat_backup.take(),
-            packs: std::mem::take(&mut self.packs),
-            schema_changed: self.schema_changed,
-            disk_savepoint: self.disk_savepoint,
-            mutation_count: self.mutation_count,
-            journal_bytes: self.journal_bytes,
-        };
+        let tmp = self.take_into_tx(&mut guard);
         let commit_res = tmp.commit();
         if defer_sync && let Some(p) = guard.persist.as_mut() {
             p.sync = SyncMode::Full;
         }
+        self.shared
+            .inner
+            .db_gen
+            .store(guard.store.r#gen, Ordering::Release);
         self.committed = true;
 
         let pending_sync = match (&commit_res, defer_sync, guard.persist.as_ref()) {
@@ -579,21 +603,14 @@ impl SharedTransaction<'_> {
         let Some(mut guard) = self.guard.take() else {
             return Err(Error::runtime("transaction already finished"));
         };
-        let tmp = Transaction {
-            db: &mut *guard,
-            base_gen: self.base_gen,
-            base_next_id: self.base_next_id,
-            committed: false,
-            undo: std::mem::replace(&mut self.undo, Undo::None),
-            cat_backup: self.cat_backup.take(),
-            packs: std::mem::take(&mut self.packs),
-            schema_changed: self.schema_changed,
-            disk_savepoint: self.disk_savepoint,
-            mutation_count: self.mutation_count,
-            journal_bytes: self.journal_bytes,
-        };
+        let tmp = self.take_into_tx(&mut guard);
         self.committed = true;
-        tmp.rollback()
+        let res = tmp.rollback();
+        self.shared
+            .inner
+            .db_gen
+            .store(guard.store.r#gen, Ordering::Release);
+        res
     }
 }
 
@@ -602,20 +619,12 @@ impl Drop for SharedTransaction<'_> {
         if !self.committed
             && let Some(mut guard) = self.guard.take()
         {
-            let tmp = Transaction {
-                db: &mut *guard,
-                base_gen: self.base_gen,
-                base_next_id: self.base_next_id,
-                committed: false,
-                undo: std::mem::replace(&mut self.undo, Undo::None),
-                cat_backup: self.cat_backup.take(),
-                packs: std::mem::take(&mut self.packs),
-                schema_changed: self.schema_changed,
-                disk_savepoint: self.disk_savepoint,
-                mutation_count: self.mutation_count,
-                journal_bytes: self.journal_bytes,
-            };
+            let tmp = self.take_into_tx(&mut guard);
             drop(tmp);
+            self.shared
+                .inner
+                .db_gen
+                .store(guard.store.r#gen, Ordering::Release);
             self.committed = true;
         }
     }

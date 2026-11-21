@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use smallvec::SmallVec;
+
 use crate::ast::{CmpOp, Field, Pred, Query, Record, Source, Step, Stmt, Value};
 use crate::batch::RecordBatch;
 use crate::catalog::Catalog;
@@ -25,8 +27,20 @@ pub(crate) struct PointGetPlan {
     pub pred_slots: Option<crate::eval::OwnedPredSlots>,
     pub needs_now: bool,
     pub is_docs_id_title: bool,
+    pub is_docs_hot_proj: bool,
     pub prepared_docs_epoch: u64,
+    pub prepared_rewrite_epoch: u64,
     pub prepared_idx: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ScanProjectPlan {
+    pub collection: String,
+    pub fields: Option<Vec<String>>,
+    pub projector: Option<crate::store::OwnedRowProjector>,
+    pub is_docs_hot: bool,
+    pub skip: usize,
+    pub take: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -43,6 +57,18 @@ pub(crate) struct PointDeletePlan {
     pub prepared_kd_kt: Option<(IndexKey, IndexKey)>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WingIdxKind {
+    /// No index on `"docs"` touches `"wing"` (nor any partial index on `"docs"`).
+    None,
+    /// Only `index docs[wing]` (non-partial).
+    WingOnly,
+    /// `index docs[wing, ts]` (non-partial), possibly alongside `index docs[wing]`.
+    WingTs,
+    /// Partial index or composite index involving `"wing"` other than `[wing]` / `[wing, ts]`.
+    Complex,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct PointUpdatePlan {
     pub collection: String,
@@ -53,8 +79,13 @@ pub(crate) struct PointUpdatePlan {
     pub record: Record,
     pub is_docs_wing_only: bool,
     pub const_wing: Option<(Cell, Arc<str>)>,
-    pub prepared_gen: u64,
+    pub schema_fast_eligible: bool,
+    pub has_unique_idx: bool,
+    pub wing_idx_kind: WingIdxKind,
+    pub prepared_cat_hash: u64,
+    pub prepared_indexes_len: usize,
     pub prepared_docs_epoch: u64,
+    pub prepared_rewrite_epoch: u64,
     pub prepared_idx: Option<usize>,
     pub prepared_shape: Option<Arc<crate::store::RowShape>>,
     pub hash_slot: Option<u8>,
@@ -99,6 +130,24 @@ pub(crate) struct PreparedAppendFacts {
     pub encoded_spo: Vec<u8>,
 }
 
+/// Cheap-to-clone execution payload of [`Prepared`] (all `Arc` handles + `Copy` flags,
+/// without cloning `src: String`) for zero-allocation `plan_cache` hits on `&mut Db` and
+/// `&mut Transaction`.
+#[derive(Debug, Clone)]
+pub(crate) struct ExecPlan {
+    pub stmts: Arc<[Stmt]>,
+    pub plan: Arc<Plan>,
+    pub writes: bool,
+    pub append_only: bool,
+    pub schema: bool,
+    pub point_get: Option<Arc<PointGetPlan>>,
+    pub scan_project: Option<Arc<ScanProjectPlan>>,
+    pub agg_plan: Option<Arc<AggPlan>>,
+    pub point_delete: Option<Arc<PointDeletePlan>>,
+    pub point_update: Option<Arc<PointUpdatePlan>>,
+    pub append_facts: Option<Arc<PreparedAppendFacts>>,
+}
+
 /// Compiled statement: parse + typecheck + plan once, run many times.
 #[derive(Debug, Clone)]
 pub struct Prepared {
@@ -114,6 +163,7 @@ pub struct Prepared {
     /// True if any statement contains `$param` placeholders.
     pub(crate) has_params: bool,
     pub(crate) point_get: Option<Arc<PointGetPlan>>,
+    pub(crate) scan_project: Option<Arc<ScanProjectPlan>>,
     pub(crate) agg_plan: Option<Arc<AggPlan>>,
     pub(crate) point_delete: Option<Arc<PointDeletePlan>>,
     pub(crate) point_update: Option<Arc<PointUpdatePlan>>,
@@ -121,6 +171,23 @@ pub struct Prepared {
 }
 
 impl Prepared {
+    #[inline]
+    pub(crate) fn exec_plan(&self) -> ExecPlan {
+        ExecPlan {
+            stmts: Arc::clone(&self.stmts),
+            plan: Arc::clone(&self.plan),
+            writes: self.writes,
+            append_only: self.append_only,
+            schema: self.schema,
+            point_get: self.point_get.as_ref().map(Arc::clone),
+            scan_project: self.scan_project.as_ref().map(Arc::clone),
+            agg_plan: self.agg_plan.as_ref().map(Arc::clone),
+            point_delete: self.point_delete.as_ref().map(Arc::clone),
+            point_update: self.point_update.as_ref().map(Arc::clone),
+            append_facts: self.append_facts.as_ref().map(Arc::clone),
+        }
+    }
+
     #[inline]
     pub fn run(&self, db: &mut Db) -> Result<super::Handle, Error> {
         db.run_prepared(self)
@@ -135,7 +202,7 @@ impl Prepared {
         if !self.has_params || params.is_empty() {
             return db.run_prepared(self);
         }
-        let bound: Vec<Stmt> = self
+        let bound: SmallVec<[Stmt; 2]> = self
             .stmts
             .iter()
             .map(|s| bind_stmt_params(s, params))
@@ -162,7 +229,7 @@ impl Prepared {
         if self.writes {
             return Err(Error::runtime("read-only snapshot: writes not allowed"));
         }
-        let bound: Vec<Stmt> = self
+        let bound: SmallVec<[Stmt; 2]> = self
             .stmts
             .iter()
             .map(|s| bind_stmt_params(s, params))
@@ -188,7 +255,7 @@ impl Prepared {
         if !self.has_params || params.is_empty() {
             return db.execute_prepared(self);
         }
-        let bound: Vec<Stmt> = self
+        let bound: SmallVec<[Stmt; 2]> = self
             .stmts
             .iter()
             .map(|s| bind_stmt_params(s, params))
@@ -244,6 +311,49 @@ pub(crate) fn stmt_has_param(stmt: &Stmt) -> bool {
         Stmt::DeleteEdge { from, to, .. } => val_has(from) || val_has(to),
         _ => false,
     }
+}
+
+pub(crate) fn classify_docs_wing_indexes(
+    indexes: &std::collections::BTreeMap<String, crate::index::LiveIndex>,
+    collection: &str,
+) -> (bool, WingIdxKind) {
+    let mut has_unique = false;
+    let mut has_wing_only = false;
+    let mut has_wing_ts = false;
+    let mut has_complex = false;
+    for live_idx in indexes.values() {
+        if live_idx.def.collection == collection {
+            if live_idx.def.unique {
+                has_unique = true;
+            }
+            if live_idx.def.pred.is_none()
+                && live_idx.def.fields.len() == 1
+                && live_idx.def.fields[0] == "wing"
+            {
+                has_wing_only = true;
+            } else if live_idx.def.pred.is_none()
+                && live_idx.def.fields.len() == 2
+                && live_idx.def.fields[0] == "wing"
+                && live_idx.def.fields[1] == "ts"
+            {
+                has_wing_ts = true;
+            } else if live_idx.def.pred.is_some()
+                || live_idx.def.fields.iter().any(|f| f == "wing")
+            {
+                has_complex = true;
+            }
+        }
+    }
+    let kind = if has_complex {
+        WingIdxKind::Complex
+    } else if has_wing_ts {
+        WingIdxKind::WingTs
+    } else if has_wing_only {
+        WingIdxKind::WingOnly
+    } else {
+        WingIdxKind::None
+    };
+    (has_unique, kind)
 }
 
 impl Db {
@@ -336,6 +446,69 @@ impl Db {
         })
     }
 
+    pub(crate) fn try_extract_scan_project(
+        q: &Query,
+        cat: &Catalog,
+    ) -> Option<ScanProjectPlan> {
+        let Source::Collection(collection) = &q.source else {
+            return None;
+        };
+        if !q.ignore_filter && cat.collection(collection).is_some_and(|c| c.filter.is_some()) {
+            return None;
+        }
+        let mut fields: Option<Vec<String>> = None;
+        let mut skip: usize = 0;
+        let mut take_step: Option<Option<i64>> = None;
+        let mut saw_take = false;
+        for step in &q.steps {
+            match step {
+                Step::Project(f) => {
+                    if fields.is_some() || f.iter().any(|fld| fld.leaf().is_none()) {
+                        return None;
+                    }
+                    fields = Some(field_names(f));
+                }
+                Step::Skip { n } => {
+                    if saw_take {
+                        return None;
+                    }
+                    skip = skip.saturating_add((*n).max(0) as usize);
+                }
+                Step::Take { n } => {
+                    if saw_take {
+                        return None;
+                    }
+                    saw_take = true;
+                    take_step = Some(*n);
+                }
+                _ => return None,
+            }
+        }
+        let take = match take_step {
+            Some(Some(n)) => Some(n.max(0) as usize),
+            Some(None) => None,
+            None => Some(50),
+        };
+        let is_docs_hot = collection == "docs"
+            && fields.as_ref().is_some_and(|fs| {
+                !fs.is_empty()
+                    && fs
+                        .iter()
+                        .all(|f| matches!(f.as_str(), "id" | "title" | "layer" | "wing"))
+            });
+        let projector = fields
+            .as_deref()
+            .map(crate::store::OwnedRowProjector::new);
+        Some(ScanProjectPlan {
+            collection: collection.clone(),
+            fields,
+            projector,
+            is_docs_hot,
+            skip,
+            take,
+        })
+    }
+
     pub(crate) fn try_extract_point_get(
         q: &Query,
         cat: &Catalog,
@@ -364,7 +537,14 @@ impl Db {
             Source::Collection(n) => n.clone(),
             _ => return None,
         };
-        if !matches!(q.steps.first(), Some(Step::Filter(_))) {
+        let Some(Step::Filter(first_pred)) = q.steps.first() else {
+            return None;
+        };
+        if pred_has_param(first_pred) {
+            return None;
+        }
+        let (field, key) = point_key(first_pred)?;
+        if field == "uri" && name != "docs" {
             return None;
         }
         let mut filter: Option<&Pred> = None;
@@ -390,13 +570,6 @@ impl Db {
             }
         }
         let pred = filter?;
-        if pred_has_param(pred) {
-            return None;
-        }
-        let (field, key) = point_key(pred)?;
-        if field == "uri" && name != "docs" {
-            return None;
-        }
         let simple_eq = matches!(
             pred,
             Pred::Cmp {
@@ -412,14 +585,23 @@ impl Db {
                 .as_deref()
                 .map(|fs| fs.len() == 2 && fs[0] == "id" && fs[1] == "title")
                 .unwrap_or(false);
+        let is_docs_hot_proj = name == "docs"
+            && fields.as_ref().is_some_and(|fs| {
+                !fs.is_empty()
+                    && fs
+                        .iter()
+                        .all(|f| matches!(f.as_str(), "id" | "title" | "layer" | "wing"))
+            });
         let needs_now = !simple_eq && pred_needs_now(pred);
-        let prepared_idx =
-            if simple_eq && name == "docs" && (field == "id" || field == "uri") && !store.is_disk_backed("docs") {
-                store.point_index("docs", field, key)
-            } else {
-                None
-            };
+        let prepared_idx = if (field == "id" || (field == "uri" && name == "docs"))
+            && !store.is_disk_backed(&name)
+        {
+            store.point_index(&name, field, key)
+        } else {
+            None
+        };
         let prepared_docs_epoch = store.docs_epoch;
+        let prepared_rewrite_epoch = store.collections.rewrite_epoch();
         let projector = fields
             .as_deref()
             .map(crate::store::OwnedRowProjector::new);
@@ -434,7 +616,9 @@ impl Db {
             pred_slots,
             needs_now,
             is_docs_id_title,
+            is_docs_hot_proj,
             prepared_docs_epoch,
+            prepared_rewrite_epoch,
             prepared_idx,
         })
     }
@@ -516,7 +700,11 @@ impl Db {
         })
     }
 
-    pub(crate) fn try_extract_point_update(stmt: &Stmt, store: &Store) -> Option<PointUpdatePlan> {
+    pub(crate) fn try_extract_point_update(
+        stmt: &Stmt,
+        catalog: &Catalog,
+        store: &Store,
+    ) -> Option<PointUpdatePlan> {
         let Stmt::Update {
             collection,
             pred: Some(pred),
@@ -545,6 +733,22 @@ impl Db {
             Some((cell, arc))
         } else {
             None
+        };
+        let schema_fast_eligible = is_docs_wing_only
+            && (cas.is_some() || *cas_each)
+            && !catalog
+                .guards
+                .iter()
+                .any(|g| g.collection == "docs" && g.field == "wing")
+            && !catalog.fks.iter().any(|fk| fk.from_col == "docs")
+            && !store
+                .fts
+                .get("docs")
+                .is_some_and(|f| f.fields.iter().any(|fld| fld == "wing"));
+        let (has_unique_idx, wing_idx_kind) = if is_docs_wing_only {
+            classify_docs_wing_indexes(&store.indexes, collection)
+        } else {
+            (false, WingIdxKind::None)
         };
         let mut prepared_idx = None;
         let mut prepared_shape = None;
@@ -581,8 +785,13 @@ impl Db {
             record: record.clone(),
             is_docs_wing_only,
             const_wing,
-            prepared_gen: store.r#gen,
+            schema_fast_eligible,
+            has_unique_idx,
+            wing_idx_kind,
+            prepared_cat_hash: catalog.hash_u64(),
+            prepared_indexes_len: store.indexes.len(),
             prepared_docs_epoch: store.docs_epoch,
+            prepared_rewrite_epoch: store.collections.rewrite_epoch(),
             prepared_idx,
             prepared_shape,
             hash_slot,
@@ -614,8 +823,55 @@ impl Db {
                     ));
                 }
             }
-            self.store.point_get_docs_id_title(&pg.key)
-        } else if pg.is_simple_eq {
+            return self.store.point_get_docs_id_title(&pg.key);
+        }
+
+        if !self.store.is_disk_backed(&pg.collection)
+            && !(pg.collection == "facts" && self.store.facts_rows_stale)
+        {
+            let idx = if let Some(i) = pg.prepared_idx
+                && self.store.fts_deferred_doc_swaps.is_empty()
+                && ((self.store.collections.rewrite_epoch() == pg.prepared_rewrite_epoch
+                    && (pg.collection != "docs"
+                        || self.store.docs_epoch == pg.prepared_docs_epoch))
+                    || (pg.collection == "docs"
+                        && pg.field == "id"
+                        && self
+                            .store
+                            .docs_id
+                            .get(i)
+                            .is_some_and(|id| id.as_ref() == pg.key.as_str())))
+            {
+                i
+            } else {
+                self.store
+                    .point_index(&pg.collection, &pg.field, &pg.key)?
+            };
+            if pg.is_simple_eq
+                && pg.is_docs_hot_proj
+                && self.store.fts_deferred_doc_swaps.is_empty()
+                && self.store.deferred_doc_wing_updates.is_empty()
+                && let Some(ref fs) = pg.fields
+                && let Some(r) = self.store.project_docs_hot_idx(idx, fs)
+            {
+                return Some(r);
+            }
+            let row = self.store.get_by_idx(&pg.collection, idx)?;
+            if !pg.is_simple_eq {
+                let now = if pg.needs_now { now_ms() } else { 0 };
+                if let Some(slots) = &pg.pred_slots
+                    && !slots.eval_sync(row, now)
+                {
+                    return None;
+                }
+            }
+            return Some(match &pg.projector {
+                Some(proj) => proj.project_sync(row),
+                None => row.clone(),
+            });
+        }
+
+        if pg.is_simple_eq {
             self.store
                 .project_by_key(&pg.collection, &pg.field, &pg.key, pg.fields.as_deref())
         } else {
@@ -636,6 +892,130 @@ impl Db {
         }
     }
 
+    pub(crate) fn execute_scan_project(
+        &self,
+        sp: &ScanProjectPlan,
+        want_rows: bool,
+    ) -> Result<(Vec<Row>, usize), Error> {
+        if sp.take == Some(0) {
+            return Ok((Vec::new(), 0));
+        }
+        if self.store.is_disk_backed(&sp.collection)
+            && let Some(eng) = self.store.disk_engine_read()
+        {
+            let proj_buf: SmallVec<[&str; 8]>;
+            let proj_arg = match &sp.fields {
+                Some(fs) => {
+                    proj_buf = fs.iter().map(String::as_str).collect();
+                    Some(proj_buf.as_slice())
+                }
+                None => None,
+            };
+            let mut skipped = 0usize;
+            let mut count = 0usize;
+            let cap = if want_rows {
+                sp.take
+                    .unwrap_or_else(|| self.store.get_col_count(&sp.collection).saturating_sub(sp.skip))
+                    .min(self.store.get_col_count(&sp.collection))
+            } else {
+                0
+            };
+            let mut out = Vec::with_capacity(cap);
+            eng.scan_projected(&sp.collection, proj_arg, |r| {
+                if skipped < sp.skip {
+                    skipped += 1;
+                    return Ok(true);
+                }
+                if want_rows {
+                    out.push(match &sp.projector {
+                        Some(p) => p.project_sync(r),
+                        None => r.clone(),
+                    });
+                }
+                count += 1;
+                if let Some(t) = sp.take
+                    && count >= t
+                {
+                    return Ok(false);
+                }
+                Ok(true)
+            })?;
+            if !out.is_empty() {
+                self.check_output_quota(&out)?;
+            }
+            return Ok((out, count));
+        }
+
+        let col = self.store.collection(&sp.collection);
+        let end = match sp.take {
+            Some(t) => sp.skip.saturating_add(t).min(col.len()),
+            None => col.len(),
+        };
+        if end > self.quotas.max_execution_work {
+            return Err(Error::runtime(format!(
+                "query execution work {} exceeds max_execution_work quota {}",
+                end, self.quotas.max_execution_work
+            )));
+        }
+        if sp.skip >= end {
+            return Ok((Vec::new(), 0));
+        }
+        let count = end - sp.skip;
+        if !want_rows {
+            return Ok((Vec::new(), count));
+        }
+
+        let out = if sp.is_docs_hot
+            && self.store.fts_deferred_doc_swaps.is_empty()
+            && self.store.deferred_doc_wing_updates.is_empty()
+            && let Some(ref fs) = sp.fields
+        {
+            if count < 16384
+                && fs.len() == 2
+                && fs[0] == "id"
+                && fs[1] == "title"
+                && end <= self.store.docs_id.len()
+                && end <= self.store.docs_title.len()
+            {
+                let shape = crate::store::shape_id_title();
+                let mut rows = Vec::with_capacity(count);
+                for i in sp.skip..end {
+                    rows.push(Row::from_parts(
+                        Arc::clone(shape),
+                        [
+                            Cell::Text(Arc::clone(&self.store.docs_id[i])),
+                            Cell::Text(Arc::clone(&self.store.docs_title[i])),
+                        ],
+                    ));
+                }
+                rows
+            } else if count <= 64 {
+                let idxs: SmallVec<[usize; 64]> = (sp.skip..end).collect();
+                self.store.project_docs_hot(&idxs, fs).unwrap_or_else(|| {
+                    let proj = sp.projector.as_ref().unwrap();
+                    col[sp.skip..end].iter().map(|r| proj.project_sync(r)).collect()
+                })
+            } else {
+                let idxs: Vec<usize> = (sp.skip..end).collect();
+                self.store.project_docs_hot(&idxs, fs).unwrap_or_else(|| {
+                    let proj = sp.projector.as_ref().unwrap();
+                    col[sp.skip..end].iter().map(|r| proj.project_sync(r)).collect()
+                })
+            }
+        } else if let Some(ref proj) = sp.projector {
+            let mut rows = Vec::with_capacity(count);
+            for r in &col[sp.skip..end] {
+                rows.push(proj.project_sync(r));
+            }
+            rows
+        } else {
+            col[sp.skip..end].to_vec()
+        };
+
+        self.check_output_quota(&out)?;
+        Ok((out, count))
+    }
+
     /// `docs | id == "…" | { … }` — direct map hit.
     pub(crate) fn try_point_get(&self, q: &Query) -> Option<Vec<Row>> {
         let name = match &q.source {
@@ -654,7 +1034,15 @@ impl Db {
                     .project_by_key("docs", "uri", uri, None)
                     .into_iter()
                     .collect();
-                let now = now_ms();
+                let now = if !rows.is_empty()
+                    && q.steps
+                        .iter()
+                        .any(|s| matches!(s, Step::Filter(p) if pred_needs_now(p)))
+                {
+                    now_ms()
+                } else {
+                    0
+                };
                 for step in &q.steps {
                     match step {
                         Step::Filter(pred) => rows.retain(|row| eval_pred(pred, row, now)),
@@ -668,18 +1056,23 @@ impl Db {
             }
             _ => return None,
         };
-        if !matches!(q.steps.first(), Some(Step::Filter(_))) {
+        let Step::Filter(first_pred) = q.steps.first()? else {
+            return None;
+        };
+        let (field, key) = point_key(first_pred)?;
+        if field == "uri" && name != "docs" {
             return None;
         }
-        let mut filter: Option<&Pred> = None;
+        let mut seen_filter = false;
         let mut fields: Option<Vec<String>> = None;
+        let mut empty_limit = false;
         for step in &q.steps {
             match step {
-                Step::Filter(p) => {
-                    if filter.is_some() {
+                Step::Filter(_) => {
+                    if seen_filter {
                         return None;
                     }
-                    filter = Some(p);
+                    seen_filter = true;
                 }
                 Step::Project(f) => {
                     if fields.is_some() {
@@ -687,22 +1080,26 @@ impl Db {
                     }
                     fields = Some(field_names(f));
                 }
-                Step::Take { .. } => {}
-                Step::Skip { .. } => {}
+                Step::Take { n: Some(n) } => {
+                    if *n <= 0 {
+                        empty_limit = true;
+                    }
+                }
+                Step::Skip { n } => {
+                    if *n > 0 {
+                        empty_limit = true;
+                    }
+                }
+                Step::Take { n: None } => {}
                 _ => return None,
             }
         }
-        let pred = filter?;
-        let (field, key) = point_key(pred)?;
-        if q.steps.iter().any(|step| {
-            matches!(step, Step::Skip { n } if *n > 0)
-                || matches!(step, Step::Take { n: Some(n) } if *n <= 0)
-        }) {
+        if empty_limit {
             return Some(Vec::new());
         }
 
         let simple_eq = matches!(
-            pred,
+            first_pred,
             Pred::Cmp {
                 op: CmpOp::Eq,
                 value: Value::String(_),
@@ -719,11 +1116,15 @@ impl Db {
             };
             return Some(row);
         }
-        let now = if pred_needs_now(pred) { now_ms() } else { 0 };
+        let now = if pred_needs_now(first_pred) {
+            now_ms()
+        } else {
+            0
+        };
         let Some(full) = self.store.project_by_key(name, field, key, None) else {
             return Some(Vec::new());
         };
-        if !eval_pred(pred, &full, now) {
+        if !eval_pred(first_pred, &full, now) {
             return Some(Vec::new());
         }
         Some(vec![

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -31,18 +31,25 @@ pub(crate) struct PackCtx<'a> {
     pub(crate) allow_preencode: bool,
     pub(crate) want_rows: bool,
     pub(crate) prepared_encoding: Option<crate::persist::PreparedEncoding>,
-    pub(crate) snap: BTreeMap<(String, String), String>,
-    pub(crate) written: BTreeSet<(String, String)>,
+    pub(crate) snap: FxHashMap<String, FxHashMap<String, String>>,
+    pub(crate) written: FxHashMap<String, FxHashSet<String>>,
     pub(crate) undo: &'a mut Undo,
 }
 
 fn mark_written(ctx: &mut PackCtx, collection: &str, rows: &[Row]) {
-    if !ctx.track_written {
+    if !ctx.track_written || rows.is_empty() {
         return;
     }
+    let set = match ctx.written.get_mut(collection) {
+        Some(s) => s,
+        None => ctx.written.entry(collection.to_string()).or_default(),
+    };
+    let mut id_slot = crate::store::row::FieldSlot::new("id");
     for r in rows {
-        if let Some(id) = row_text(r, "id") {
-            ctx.written.insert((collection.to_string(), id.to_string()));
+        if let Some(id) = id_slot.get(r).and_then(Cell::text)
+            && !set.contains(id)
+        {
+            set.insert(id.to_string());
         }
     }
 }
@@ -106,20 +113,30 @@ pub(crate) fn fold_packs(packs: Vec<Pack>) -> Option<Pack> {
     }
 }
 
-fn cas_each_ok(collection: &str, row: &Row, got: &str, ctx: &PackCtx) -> Result<(), Error> {
+fn cas_each_ok(
+    collection: &str,
+    row: &Row,
+    id_slot: &mut crate::store::row::FieldSlot<'_>,
+    got: &str,
+    ctx: &PackCtx,
+) -> Result<(), Error> {
     if !ctx.track_written {
         return Ok(());
     }
-    let Some(id) = row_text(row, "id") else {
+    let Some(id) = id_slot.get(row).and_then(Cell::text) else {
         return Ok(());
     };
-    let key = (collection.to_string(), id.to_string());
-    if ctx.written.contains(&key) {
+    if ctx
+        .written
+        .get(collection)
+        .is_some_and(|ids| ids.contains(id))
+    {
         return Err(Error::runtime(format!(
             "cas mismatch: row {id} changed mid-pack"
         )));
     }
-    if let Some(expect) = ctx.snap.get(&key)
+    if !ctx.snap.is_empty()
+        && let Some(expect) = ctx.snap.get(collection).and_then(|m| m.get(id))
         && expect.as_str() != got
     {
         return Err(Error::runtime(format!(
@@ -150,8 +167,9 @@ impl Db {
             }
         }
         let mut bindings: BTreeMap<String, Vec<Row>> = BTreeMap::new();
-        // CAS-each snapshot is only required when multiple statements execute in the same program,
-        // because within a single statement `written` is empty and `snap[k]` equals `got`.
+        // CAS-each tracking is only required when multiple statements execute in the same program;
+        // a full hash snapshot is only needed if `Restore` / `Unpin` / `IdbPush` could mutate rows
+        // outside `mark_written`.
         let need_snap = stmts.len() > 1
             && stmts.iter().any(|s| {
                 matches!(
@@ -159,17 +177,24 @@ impl Db {
                     Stmt::Update { cas_each: true, .. } | Stmt::Delete { cas_each: true, .. }
                 )
             });
+        let need_full_hash_snap = need_snap
+            && stmts.iter().any(|s| {
+                matches!(
+                    s,
+                    Stmt::Restore { .. } | Stmt::Unpin { .. } | Stmt::IdbPush
+                )
+            });
         let mut ctx = PackCtx {
             track_written: need_snap,
             allow_preencode: allow_preencode && stmts.len() == 1 && self.is_durable(),
             want_rows,
             prepared_encoding: None,
-            snap: if need_snap {
+            snap: if need_full_hash_snap {
                 self.hash_snapshot()
             } else {
-                BTreeMap::new()
+                FxHashMap::default()
             },
-            written: BTreeSet::new(),
+            written: FxHashMap::default(),
             undo,
         };
         let mut last_rows = Vec::new();
@@ -182,14 +207,14 @@ impl Db {
         for (si, stmt) in stmts.iter().enumerate() {
             if let Stmt::Let { name, query } = stmt {
                 let rows = self.exec_query(query, &bindings)?;
-                if want_rows && si == last_idx {
-                    last_rows = rows.clone();
-                } else {
-                    last_rows.clear();
-                }
                 last_msg = None;
                 last_affected = rows.len();
-                bindings.insert(name.clone(), rows);
+                if si == last_idx {
+                    last_rows = if want_rows { rows } else { Vec::new() };
+                } else {
+                    last_rows.clear();
+                    bindings.insert(name.clone(), rows);
+                }
                 continue;
             }
             ctx.want_rows = want_rows && si == last_idx;
@@ -215,17 +240,26 @@ impl Db {
         ))
     }
 
-    fn hash_snapshot(&self) -> BTreeMap<(String, String), String> {
-        let mut m = BTreeMap::new();
+    fn hash_snapshot(&self) -> FxHashMap<String, FxHashMap<String, String>> {
+        let mut m: FxHashMap<String, FxHashMap<String, String>> = FxHashMap::default();
         for (col, rows) in &self.store.collections {
+            let mut col_map = FxHashMap::default();
+            col_map.reserve(rows.len());
+            let mut id_slot = crate::store::row::FieldSlot::new("id");
+            let mut hash_slot = crate::store::row::FieldSlot::new("hash");
             for r in rows {
-                if let Some(id) = row_text(r, "id") {
-                    m.insert(
-                        (col.clone(), id.to_string()),
-                        row_text(r, "hash").unwrap_or("").to_string(),
+                if let Some(id) = id_slot.get(r).and_then(Cell::text) {
+                    col_map.insert(
+                        id.to_string(),
+                        hash_slot
+                            .get(r)
+                            .and_then(Cell::text)
+                            .unwrap_or("")
+                            .to_string(),
                     );
                 }
             }
+            m.insert(col.clone(), col_map);
         }
         m
     }
@@ -339,6 +373,14 @@ impl Db {
             }
             Stmt::AppendEdges { edges } => {
                 let n = edges.len();
+                let now = if edges
+                    .iter()
+                    .any(|e| value_needs_now(&e.from) || value_needs_now(&e.to))
+                {
+                    now_ms()
+                } else {
+                    0
+                };
                 self.store.edges.reserve(n);
                 self.store.edge_keys.reserve(n);
                 let mut rows = if ctx.want_rows {
@@ -363,18 +405,18 @@ impl Db {
                     Vec::new()
                 };
                 for e in edges {
-                    let (row, changed) =
-                        self.append_edge(&e.rel, &e.from, &e.to, ctx.want_rows || durable)?;
+                    let (from_s, to_s, changed) =
+                        self.append_edge(&e.rel, &e.from, &e.to, now);
+                    if ctx.want_rows {
+                        rows.push(edge_row(&e.rel, &from_s, &to_s));
+                    }
                     if changed {
                         changed_n += 1;
                         if durable {
                             bulk_rel.push(e.rel.clone());
-                            bulk_from.push(row_text(&row, "from").unwrap_or("").to_string());
-                            bulk_to.push(row_text(&row, "to").unwrap_or("").to_string());
+                            bulk_from.push(from_s);
+                            bulk_to.push(to_s);
                         }
-                    }
-                    if ctx.want_rows {
-                        rows.push(row);
                     }
                 }
                 let msg = if changed_n == 0 {
@@ -510,9 +552,8 @@ impl Db {
                 cas,
                 cas_each,
             } => {
-                let mut rows =
-                    self.delete_rows(collection, pred, cas.as_deref(), *cas_each, ctx)?;
-                let affected = rows.len();
+                let (mut rows, affected) =
+                    self.delete_rows(collection, pred, cas.as_deref(), *cas_each, ctx, durable)?;
                 let pack = if durable {
                     Some(Pack::Delete {
                         collection: collection.clone(),
@@ -689,27 +730,12 @@ impl Db {
         }
     }
 
-    fn append_edge(
-        &mut self,
-        rel: &str,
-        from: &Value,
-        to: &Value,
-        build_row: bool,
-    ) -> Result<(Row, bool), Error> {
-        let now = if value_needs_now(from) || value_needs_now(to) {
-            now_ms()
-        } else {
-            0
-        };
+    #[inline]
+    fn append_edge(&mut self, rel: &str, from: &Value, to: &Value, now: i64) -> (String, String, bool) {
         let from = value_text(from, now);
         let to = value_text(to, now);
         let changed = self.store.append_edge_parts(rel, &from, &to);
-        let row = if build_row {
-            edge_row(rel, &from, &to)
-        } else {
-            Row::new()
-        };
-        Ok((row, changed))
+        (from, to, changed)
     }
 
     /// An `update` that assigns `id` must keep the primary key unique: it may rename one
@@ -821,15 +847,36 @@ impl Db {
 
     /// Refuse to delete rows a foreign key still points at. `deleting` are the rows about
     /// to leave `collection`; a referencing row that is itself being deleted (a key into
-    /// its own collection) does not count. Each referencing collection is read once.
+    /// its own collection) does not count.
     pub(crate) fn ensure_not_referenced(&self, collection: &str, deleting: &[Row]) -> Result<(), Error> {
+        self.ensure_not_referenced_iter(collection, || deleting.iter())
+    }
+
+    pub(crate) fn ensure_not_referenced_idxs(
+        &self,
+        collection: &str,
+        rows: &[Row],
+        idxs: &[usize],
+    ) -> Result<(), Error> {
+        self.ensure_not_referenced_iter(collection, || idxs.iter().map(|&i| &rows[i]))
+    }
+
+    fn ensure_not_referenced_iter<'a, I, F>(
+        &self,
+        collection: &str,
+        deleting_rows: F,
+    ) -> Result<(), Error>
+    where
+        I: Iterator<Item = &'a Row>,
+        F: Fn() -> I,
+    {
         for fk in &self.catalog.fks {
             if fk.to_col != collection {
                 continue;
             }
-            let targets: FxHashSet<&str> = deleting
-                .iter()
-                .filter_map(|r| row_text(r, &fk.to_field))
+            let mut to_slot = crate::store::row::FieldSlot::new(&fk.to_field);
+            let targets: FxHashSet<&str> = deleting_rows()
+                .filter_map(|r| to_slot.get(r).and_then(Cell::text))
                 .filter(|v| !v.is_empty())
                 .collect();
             if targets.is_empty() {
@@ -837,7 +884,10 @@ impl Db {
             }
             let self_ref = fk.from_col == collection;
             let deleted_ids: FxHashSet<&str> = if self_ref {
-                deleting.iter().filter_map(|r| row_text(r, "id")).collect()
+                let mut id_slot = crate::store::row::FieldSlot::new("id");
+                deleting_rows()
+                    .filter_map(|r| id_slot.get(r).and_then(Cell::text))
+                    .collect()
             } else {
                 FxHashSet::default()
             };
@@ -847,14 +897,108 @@ impl Db {
                 targets
                     .iter()
                     .find(|v| self.store.disk_has_key(&fk.from_col, &fk.from_field, v))
-                    .map(|v| v.to_string())
+                    .map(|v| (*v).to_string())
+            } else if fk.from_field == "id" && !self_ref {
+                targets
+                    .iter()
+                    .find(|&&v| self.store.get_by_id(&fk.from_col, v).is_some())
+                    .map(|v| (*v).to_string())
+            } else if let Some(live_idx) = self.store.indexes.values().find(|ix| {
+                ix.def.collection == fk.from_col
+                    && ix.def.pred.is_none()
+                    && ix.def.fields.first().map(String::as_str) == Some(fk.from_field.as_str())
+            }) {
+                let from_rows = self.store.collection(&fk.from_col);
+                let mut id_slot = crate::store::row::FieldSlot::new("id");
+                let mut found: Option<String> = None;
+                for &v in &targets {
+                    let k = crate::index::LiveIndex::single_cell_key(&Cell::from_text(v));
+                    let hit = if live_idx.def.fields.len() == 1 {
+                        live_idx.forward.get(&k).is_some_and(|pl| {
+                            if !self_ref {
+                                !pl.is_empty()
+                            } else {
+                                let mut non_deleted = false;
+                                pl.for_each_ordered(false, |pos| {
+                                    let is_del = from_rows
+                                        .get(pos)
+                                        .and_then(|r| id_slot.get(r))
+                                        .and_then(Cell::text)
+                                        .is_some_and(|id| deleted_ids.contains(id));
+                                    if !is_del {
+                                        non_deleted = true;
+                                        return false;
+                                    }
+                                    true
+                                });
+                                non_deleted
+                            }
+                        })
+                    } else {
+                        let part = k.0[0].clone();
+                        let width = live_idx.def.fields.len();
+                        let mut lo = smallvec::SmallVec::with_capacity(width);
+                        let mut hi = smallvec::SmallVec::with_capacity(width);
+                        lo.push(part.clone());
+                        hi.push(part);
+                        for _ in 1..width {
+                            lo.push(crate::index::IndexPart::Min);
+                            hi.push(crate::index::IndexPart::Max);
+                        }
+                        live_idx
+                            .forward
+                            .range(crate::index::IndexKey(lo)..=crate::index::IndexKey(hi))
+                            .any(|(_, pl)| {
+                                if !self_ref {
+                                    !pl.is_empty()
+                                } else {
+                                    let mut non_deleted = false;
+                                    pl.for_each_ordered(false, |pos| {
+                                        let is_del = from_rows
+                                            .get(pos)
+                                            .and_then(|r| id_slot.get(r))
+                                            .and_then(Cell::text)
+                                            .is_some_and(|id| deleted_ids.contains(id));
+                                        if !is_del {
+                                            non_deleted = true;
+                                            return false;
+                                        }
+                                        true
+                                    });
+                                    non_deleted
+                                }
+                            })
+                    };
+                    if hit {
+                        found = Some(v.to_string());
+                        break;
+                    }
+                }
+                found
+            } else if !self_ref
+                && fk.from_col == "orders"
+                && fk.from_field == "user_id"
+                && self.store.orders_soa_ready()
+            {
+                self.store
+                    .orders_user_id()
+                    .iter()
+                    .find(|uid| targets.contains(uid.as_ref()))
+                    .map(|uid| uid.to_string())
             } else {
+                let mut from_slot = crate::store::row::FieldSlot::new(&fk.from_field);
+                let mut id_slot = crate::store::row::FieldSlot::new("id");
                 self.store.collection(&fk.from_col).iter().find_map(|r| {
-                    let v = row_text(r, &fk.from_field)?;
+                    let v = from_slot.get(r).and_then(Cell::text)?;
                     if !targets.contains(v) {
                         return None;
                     }
-                    if self_ref && row_text(r, "id").is_some_and(|id| deleted_ids.contains(id)) {
+                    if self_ref
+                        && id_slot
+                            .get(r)
+                            .and_then(Cell::text)
+                            .is_some_and(|id| deleted_ids.contains(id))
+                    {
                         return None;
                     }
                     Some(v.to_string())
@@ -878,10 +1022,44 @@ impl Db {
         if to_field == "id" {
             return self.store.get_by_id(to_col, val).is_some();
         }
+        if to_col == "docs" && to_field == "uri" {
+            return self.store.get_by_uri(val).is_some();
+        }
+        if let Some(live_idx) = self.store.indexes.values().find(|ix| {
+            ix.def.collection == to_col
+                && ix.def.pred.is_none()
+                && ix.def.fields.first().map(String::as_str) == Some(to_field)
+        }) {
+            let k = crate::index::LiveIndex::single_cell_key(&Cell::from_text(val));
+            if live_idx.def.fields.len() == 1 {
+                return live_idx.forward.get(&k).is_some_and(|pl| !pl.is_empty());
+            }
+            let part = k.0[0].clone();
+            let width = live_idx.def.fields.len();
+            let mut lo = smallvec::SmallVec::with_capacity(width);
+            let mut hi = smallvec::SmallVec::with_capacity(width);
+            lo.push(part.clone());
+            hi.push(part);
+            for _ in 1..width {
+                lo.push(crate::index::IndexPart::Min);
+                hi.push(crate::index::IndexPart::Max);
+            }
+            return live_idx
+                .forward
+                .range(crate::index::IndexKey(lo)..=crate::index::IndexKey(hi))
+                .any(|(_, pl)| !pl.is_empty());
+        }
+        if to_col == "orders" && to_field == "user_id" && self.store.orders_soa_ready() {
+            return self.store.orders_user_id().iter().any(|u| u.as_ref() == val);
+        }
+        if to_col == "users" && to_field == "email" && self.store.users_soa_ready() {
+            return self.store.users_email().iter().any(|e| e.as_ref() == val);
+        }
+        let mut slot = crate::store::row::FieldSlot::new(to_field);
         self.store
             .collection(to_col)
             .iter()
-            .any(|r| row_text(r, to_field) == Some(val))
+            .any(|r| slot.get(r).and_then(Cell::text) == Some(val))
     }
 
     fn assert_unique_index(&self, collection: &str, fields: &[String]) -> Result<(), Error> {
@@ -942,7 +1120,7 @@ impl Db {
             };
             let mut row = acquire_row();
             for (k, v) in &rec.fields {
-                row.insert(k.clone(), value_cell(v, now));
+                row.insert(k.as_str(), value_cell(v, now));
             }
             if row.get("id").and_then(Cell::text).is_none() {
                 row.insert("id", Cell::text_arc(self.store.alloc_id()));
@@ -997,9 +1175,14 @@ impl Db {
                 }
             }
             let start = self.store.collection(collection).len();
-            self.store.index_insert_row(collection, start, &row)?;
-            self.store.fts_insert_row(collection, start, &row);
-            if let Some(Cell::Vec(v)) = row.get("embedding")
+            if !self.store.indexes.is_empty() {
+                self.store.index_insert_row(collection, start, &row)?;
+            }
+            if !self.store.fts.is_empty() && self.store.fts.contains_key(collection) {
+                self.store.fts_insert_row(collection, start, &row);
+            }
+            if !self.store.hnsw.is_empty()
+                && let Some(Cell::Vec(v)) = row.get("embedding")
                 && let Some(hnsw) = self.store.hnsw.get_mut(collection)
             {
                 hnsw.insert(start, Arc::clone(v));
@@ -1411,21 +1594,39 @@ impl Db {
                 .collect();
         }
         if let Some(pred) = pred
-            && let Some((uses, covered)) =
-                crate::index::pick_index_with_coverage(&self.catalog, collection, pred)
-            && let Some(idxs) = self.store.index_seek(collection, &uses, now)
+            && !self.store.is_disk_backed(collection)
         {
-            if covered {
+            if let Some(idxs) = self.interval_index_select(collection, pred, now) {
+                let mut slots = super::eval::PredSlots::new(pred);
+                return idxs
+                    .into_iter()
+                    .filter(|&i| {
+                        self.store
+                            .get_by_idx(collection, i)
+                            .is_some_and(|row| slots.eval(row, now))
+                    })
+                    .collect();
+            }
+            if let Some((uses, covered)) =
+                crate::index::pick_index_with_coverage(&self.catalog, collection, pred)
+                && let Some(idxs) = self.store.index_seek(collection, &uses, now)
+            {
+                if covered {
+                    return idxs.into_iter().collect();
+                }
+                let mut slots = super::eval::PredSlots::new(pred);
+                return idxs
+                    .into_iter()
+                    .filter(|&i| {
+                        self.store
+                            .get_by_idx(collection, i)
+                            .is_some_and(|row| slots.eval(row, now))
+                    })
+                    .collect();
+            }
+            if let Some(idxs) = self.mirror_select(collection, pred, now) {
                 return idxs.into_iter().collect();
             }
-            return idxs
-                .into_iter()
-                .filter(|&i| {
-                    self.store
-                        .get_by_idx(collection, i)
-                        .is_some_and(|row| eval_pred(pred, row, now))
-                })
-                .collect();
         }
         let mut slots = pred.map(super::eval::PredSlots::new);
         self.store
@@ -1450,7 +1651,11 @@ impl Db {
         if !cas_each && cas.is_none() {
             return Err(Error::runtime("update requires cas"));
         }
-        let has_guards = !self.catalog.guards.is_empty();
+        let has_guards = self
+            .catalog
+            .guards
+            .iter()
+            .any(|g| g.collection == collection);
         let needs_now = pred.is_some_and(pred_needs_now) || record_needs_now(record) || has_guards;
         let now = if needs_now { now_ms() } else { 0 };
 
@@ -1460,11 +1665,13 @@ impl Db {
         }
         {
             let rows = self.store.collection(collection);
+            let mut hash_slot = crate::store::row::FieldSlot::new("hash");
+            let mut id_slot = crate::store::row::FieldSlot::new("id");
             for i in &idxs {
                 let row = &rows[*i];
-                let got = row_text(row, "hash").unwrap_or("");
+                let got = hash_slot.get(row).and_then(Cell::text).unwrap_or("");
                 if cas_each {
-                    cas_each_ok(collection, row, got, ctx)?;
+                    cas_each_ok(collection, row, &mut id_slot, got, ctx)?;
                 } else {
                     let cas = cas.ok_or_else(|| Error::runtime("update requires cas"))?;
                     if got != cas {
@@ -1482,6 +1689,7 @@ impl Db {
         // insert would, instead of keeping the vector of the old text.
         let reembed = self.update_needs_reembed(&record.fields);
         let has_fks = self.catalog.fks.iter().any(|fk| fk.from_col == collection);
+        let has_fts = !self.store.fts.is_empty() && self.store.fts.contains_key(collection);
         let affected = idxs.len();
         let need_materialized = ctx.want_rows || durable || ctx.track_written;
         let mut out = if need_materialized {
@@ -1491,43 +1699,96 @@ impl Db {
         };
 
         for i in idxs {
-            let before = self.store.collection(collection)[i].clone();
-            if has_guards {
-                self.check_row_update_guards(collection, &before, &record.fields, now)?;
-            }
-            let updated = self.patch_updated_row(
-                collection,
-                before.clone(),
-                &record.fields,
-                now,
-                has_body,
-                reembed,
-            )?;
+            let updated = {
+                let before_ref = &self.store.collection(collection)[i];
+                if has_guards {
+                    self.check_row_update_guards(collection, before_ref, &record.fields, now)?;
+                }
+                self.patch_updated_row(
+                    collection,
+                    before_ref.clone(),
+                    &record.fields,
+                    now,
+                    has_body,
+                    reembed,
+                )?
+            };
             if has_fks {
                 self.check_row_fks(collection, &updated)?;
             }
-            self.store
-                .index_update_row(collection, i, &before, &updated)?;
+            if !self.store.indexes.is_empty() {
+                let crate::store::Store {
+                    collections,
+                    indexes,
+                    ..
+                } = &mut self.store;
+                let before_ref = &collections.get(collection).unwrap()[i];
+                let mut applied = 0usize;
+                let mut err_msg: Option<String> = None;
+                for idx in indexes.values_mut() {
+                    if idx.def.collection == collection {
+                        if let Err(e) = idx.update_row(i, before_ref, &updated) {
+                            err_msg = Some(e);
+                            break;
+                        }
+                        applied += 1;
+                    }
+                }
+                if let Some(e) = err_msg {
+                    for idx in indexes.values_mut() {
+                        if applied == 0 {
+                            break;
+                        }
+                        if idx.def.collection == collection {
+                            let _ = idx.update_row(i, &updated, before_ref);
+                            applied -= 1;
+                        }
+                    }
+                    return Err(Error::runtime(e));
+                }
+            }
             if need_materialized {
                 out.push(updated.clone());
             }
-            if let Some(hnsw) = self.store.hnsw.get_mut(collection) {
-                if let Some(Cell::Vec(v)) = updated.get("embedding") {
-                    hnsw.insert(i, v.clone());
-                } else if before.contains_key("embedding") {
-                    hnsw.remove(i);
+            if !self.store.hnsw.is_empty() {
+                let crate::store::Store {
+                    collections, hnsw, ..
+                } = &mut self.store;
+                if let Some(h) = hnsw.get_mut(collection) {
+                    if let Some(Cell::Vec(v)) = updated.get("embedding") {
+                        h.insert(i, Arc::clone(v));
+                    } else if collections
+                        .get(collection)
+                        .is_some_and(|c| c[i].contains_key("embedding"))
+                    {
+                        h.remove(i);
+                    }
                 }
             }
-            // A changed `id` / `uri` rebuilds the row maps, which must see the new row.
-            let identity_moved = row_text(&before, "id") != row_text(&updated, "id")
-                || row_text(&before, "uri") != row_text(&updated, "uri");
-            self.store
-                .row_maps_sync_updated(collection, i, &before, &updated);
-            self.store.collection_mut(collection)[i] = updated;
-            if identity_moved {
+            // A changed `id` / `uri` or stale slot rebuilds the row maps, which must see the new row.
+            let (identity_moved, stale_slot) = {
+                let before_ref = &self.store.collection(collection)[i];
+                let new_id = row_text(&updated, "id");
+                let moved = row_text(before_ref, "id") != new_id
+                    || row_text(before_ref, "uri") != row_text(&updated, "uri");
+                let stale = !moved
+                    && new_id.is_some_and(|key| self.store.row_index(collection, key) != Some(i));
+                (moved, stale)
+            };
+            let before = if identity_moved || stale_slot {
+                let b = std::mem::replace(&mut self.store.collection_mut(collection)[i], updated);
                 self.store.rebuild_row_maps_collection(collection);
+                b
+            } else {
+                let b = std::mem::take(&mut self.store.collection_mut(collection)[i]);
+                self.store
+                    .row_maps_sync_updated(collection, i, &b, &updated);
+                self.store.collections.get_mut(collection).unwrap()[i] = updated;
+                b
+            };
+            if has_fts {
+                self.store.fts_sync_at(collection, i, &before);
             }
-            self.store.fts_sync_at(collection, i, &before);
             if let Undo::Rows(events) | Undo::Mixed { events } = ctx.undo {
                 events.push(RowUndo::Update(collection.to_string(), i, before));
             }
@@ -1558,7 +1819,8 @@ impl Db {
         cas: Option<&str>,
         cas_each: bool,
         ctx: &mut PackCtx,
-    ) -> Result<Vec<Row>, Error> {
+        durable: bool,
+    ) -> Result<(Vec<Row>, usize), Error> {
         let now = if pred_needs_now(pred) { now_ms() } else { 0 };
         let append_only = self
             .catalog
@@ -1573,10 +1835,13 @@ impl Db {
             return Err(Error::runtime("delete: no matching row"));
         }
         if !append_only {
+            let mut hash_slot = crate::store::row::FieldSlot::new("hash");
+            let mut id_slot = crate::store::row::FieldSlot::new("id");
             for i in &idxs {
-                let got = row_text(&rows[*i], "hash").unwrap_or("");
+                let row = &rows[*i];
+                let got = hash_slot.get(row).and_then(Cell::text).unwrap_or("");
                 if cas_each {
-                    cas_each_ok(collection, &rows[*i], got, ctx)?;
+                    cas_each_ok(collection, row, &mut id_slot, got, ctx)?;
                 } else {
                     let cas = cas.ok_or_else(|| Error::runtime("delete requires cas"))?;
                     if got != cas {
@@ -1589,20 +1854,25 @@ impl Db {
         }
         idxs.sort_unstable();
         if self.catalog.fks.iter().any(|fk| fk.to_col == collection) {
-            let deleting: Vec<Row> = idxs.iter().map(|&i| rows[i].clone()).collect();
-            self.ensure_not_referenced(collection, &deleting)?;
+            self.ensure_not_referenced_idxs(collection, rows, &idxs)?;
         }
-        let out = self.store.delete_rows_at(collection, &idxs);
+        let mut out = self.store.delete_rows_at(collection, &idxs);
+        let affected = out.len();
+        mark_written(ctx, collection, &out);
 
         if let Undo::Rows(events) | Undo::Mixed { events } = ctx.undo {
+            let undo_rows = if durable || ctx.want_rows {
+                out.clone()
+            } else {
+                std::mem::take(&mut out)
+            };
             events.push(RowUndo::Delete(
                 collection.to_string(),
                 idxs.to_vec(),
-                out.clone(),
+                undo_rows,
             ));
         }
-        mark_written(ctx, collection, &out);
-        Ok(out)
+        Ok((out, affected))
     }
 
     fn exec_decl(&mut self, d: &Decl) -> Result<StmtExecOut, Error> {
@@ -2613,7 +2883,7 @@ pub(super) fn append_batch_shape_rows(
 pub(crate) fn record_row(record: &Record, now: i64) -> Row {
     let mut row = acquire_row();
     for (k, v) in &record.fields {
-        row.insert(k.clone(), value_cell(v, now));
+        row.insert(k.as_str(), value_cell(v, now));
     }
     row
 }
