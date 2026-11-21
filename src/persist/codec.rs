@@ -860,30 +860,10 @@ pub(super) fn encode_insert_cols_v2(
                 let mut wrote_sparse = false;
                 if try_sparse {
                     if v.len() >= 4096 {
-                        if v.len() != n as usize {
-                            return Err(io_err("sparse vector column length mismatch"));
-                        }
-                        let storage = v
-                            .len()
-                            .checked_mul(std::mem::size_of::<Option<Vec<f32>>>())
-                            .ok_or_else(|| io_err("sparse vector size overflow"))?;
-                        sparse_decoded_bytes = sparse_decoded_bytes
-                            .checked_add(storage)
-                            .ok_or_else(|| io_err("sparse vector size overflow"))?;
+                        sparse_decoded_bytes =
+                            account_sparse_decoded_budget(v, n, sparse_decoded_bytes)?;
                         sparse_codec = true;
                         let mark = buf.len();
-                        for emb in v.iter().flatten() {
-                            let bytes = emb
-                                .len()
-                                .checked_mul(4)
-                                .ok_or_else(|| io_err("sparse vector size overflow"))?;
-                            sparse_decoded_bytes = sparse_decoded_bytes
-                                .checked_add(bytes)
-                                .filter(|&bytes| bytes <= MAX_SPARSE_DECODED_BYTES)
-                                .ok_or_else(|| {
-                                    io_err("sparse vectors exceed decoded 64MiB budget")
-                                })?;
-                        }
                         let large_vec = v
                             .iter()
                             .flatten()
@@ -915,9 +895,6 @@ pub(super) fn encode_insert_cols_v2(
                             } else {
                                 append_sparse_rows_serial(v, buf)?;
                             }
-                        }
-                        if sparse_decoded_bytes > MAX_SPARSE_DECODED_BYTES {
-                            return Err(io_err("sparse vectors exceed decoded 64MiB budget"));
                         }
                         wrote_sparse = true;
                     } else if dictionary_writer_enabled() {
@@ -953,33 +930,14 @@ pub(super) fn encode_insert_cols_v2(
                             }
                         }
                         if buf.len() > mark {
-                            if v.len() != n as usize {
-                                buf.truncate(mark);
-                                return Err(io_err("sparse vector column length mismatch"));
-                            }
-                            let storage = v
-                                .len()
-                                .checked_mul(std::mem::size_of::<Option<Vec<f32>>>())
-                                .ok_or_else(|| io_err("sparse vector size overflow"))?;
-                            let mut next_decoded = sparse_decoded_bytes
-                                .checked_add(storage)
-                                .ok_or_else(|| io_err("sparse vector size overflow"))?;
-                            for emb in v.iter().flatten() {
-                                let bytes = emb
-                                    .len()
-                                    .checked_mul(4)
-                                    .ok_or_else(|| io_err("sparse vector size overflow"))?;
-                                next_decoded = next_decoded
-                                    .checked_add(bytes)
-                                    .filter(|&bytes| bytes <= MAX_SPARSE_DECODED_BYTES)
-                                    .ok_or_else(|| {
-                                        io_err("sparse vectors exceed decoded 64MiB budget")
-                                    })?;
-                            }
-                            if next_decoded > MAX_SPARSE_DECODED_BYTES {
-                                return Err(io_err("sparse vectors exceed decoded 64MiB budget"));
-                            }
-                            sparse_decoded_bytes = next_decoded;
+                            sparse_decoded_bytes =
+                                match account_sparse_decoded_budget(v, n, sparse_decoded_bytes) {
+                                    Ok(next) => next,
+                                    Err(e) => {
+                                        buf.truncate(mark);
+                                        return Err(e);
+                                    }
+                                };
                             sparse_codec = true;
                             dictionary_codec |= use_dict;
                             wrote_sparse = true;
@@ -996,33 +954,14 @@ pub(super) fn encode_insert_cols_v2(
                         if !has_empty && sparse_bytes >= dense {
                             buf.truncate(mark);
                         } else {
-                            if v.len() != n as usize {
-                                buf.truncate(mark);
-                                return Err(io_err("sparse vector column length mismatch"));
-                            }
-                            let storage = v
-                                .len()
-                                .checked_mul(std::mem::size_of::<Option<Vec<f32>>>())
-                                .ok_or_else(|| io_err("sparse vector size overflow"))?;
-                            let mut next_decoded = sparse_decoded_bytes
-                                .checked_add(storage)
-                                .ok_or_else(|| io_err("sparse vector size overflow"))?;
-                            for emb in v.iter().flatten() {
-                                let bytes = emb
-                                    .len()
-                                    .checked_mul(4)
-                                    .ok_or_else(|| io_err("sparse vector size overflow"))?;
-                                next_decoded = next_decoded
-                                    .checked_add(bytes)
-                                    .filter(|&bytes| bytes <= MAX_SPARSE_DECODED_BYTES)
-                                    .ok_or_else(|| {
-                                        io_err("sparse vectors exceed decoded 64MiB budget")
-                                    })?;
-                            }
-                            if next_decoded > MAX_SPARSE_DECODED_BYTES {
-                                return Err(io_err("sparse vectors exceed decoded 64MiB budget"));
-                            }
-                            sparse_decoded_bytes = next_decoded;
+                            sparse_decoded_bytes =
+                                match account_sparse_decoded_budget(v, n, sparse_decoded_bytes) {
+                                    Ok(next) => next,
+                                    Err(e) => {
+                                        buf.truncate(mark);
+                                        return Err(e);
+                                    }
+                                };
                             sparse_codec = true;
                             wrote_sparse = true;
                         }
@@ -2563,6 +2502,57 @@ pub fn rows_to_insert_cols(
     }
 }
 
+fn account_sparse_decoded_budget(
+    v: &[Option<Arc<[f32]>>],
+    n: u32,
+    current: usize,
+) -> Result<usize, Error> {
+    if v.len() != n as usize {
+        return Err(io_err("sparse vector column length mismatch"));
+    }
+    let storage = v
+        .len()
+        .checked_mul(std::mem::size_of::<Option<Vec<f32>>>())
+        .ok_or_else(|| io_err("sparse vector size overflow"))?;
+    let mut next_decoded = current
+        .checked_add(storage)
+        .ok_or_else(|| io_err("sparse vector size overflow"))?;
+    for emb in v.iter().flatten() {
+        let bytes = emb
+            .len()
+            .checked_mul(4)
+            .ok_or_else(|| io_err("sparse vector size overflow"))?;
+        next_decoded = next_decoded
+            .checked_add(bytes)
+            .filter(|&b| b <= MAX_SPARSE_DECODED_BYTES)
+            .ok_or_else(|| io_err("sparse vectors exceed decoded 64MiB budget"))?;
+    }
+    if next_decoded > MAX_SPARSE_DECODED_BYTES {
+        return Err(io_err("sparse vectors exceed decoded 64MiB budget"));
+    }
+    Ok(next_decoded)
+}
+
+#[inline(always)]
+fn col_cell_at(cols: &[ColData], fi: usize, i: usize) -> crate::store::Cell {
+    use crate::store::Cell;
+    match cols.get(fi) {
+        Some(ColData::Text(v)) => v
+            .get(i)
+            .map(|s| Cell::Text(Arc::clone(s)))
+            .unwrap_or_else(|| Cell::text_arc("")),
+        Some(ColData::Int(v)) => Cell::Int(v.get(i).copied().unwrap_or(0)),
+        Some(ColData::Float(v)) => Cell::Float(v.get(i).copied().unwrap_or(0.0)),
+        Some(ColData::Bool(v)) => Cell::Bool(v.get(i).copied().unwrap_or(false)),
+        Some(ColData::Time(v)) => Cell::Time(v.get(i).copied().unwrap_or(0)),
+        Some(ColData::Vec(v)) => match v.get(i).and_then(|o| o.as_ref()) {
+            Some(emb) => Cell::vec_arc(Arc::clone(emb)),
+            None => Cell::Null,
+        },
+        Some(ColData::Null) | None => Cell::Null,
+    }
+}
+
 pub fn cols_to_rows(fields: &[String], cols: &[ColData], n: usize) -> Vec<crate::store::Row> {
     use crate::store::Cell;
     if n >= 2 && fields.windows(2).all(|w| w[0] < w[1]) {
@@ -2592,33 +2582,7 @@ pub fn cols_to_rows(fields: &[String], cols: &[ColData], n: usize) -> Vec<crate:
                                 for i in start..end {
                                     let mut row = tmpl.clone();
                                     for (fi, slot) in row.values_mut().enumerate() {
-                                        *slot = match cols.get(fi) {
-                                            Some(ColData::Text(v)) => v
-                                                .get(i)
-                                                .map(|s| Cell::Text(std::sync::Arc::clone(s)))
-                                                .unwrap_or_else(|| Cell::text_arc("")),
-                                            Some(ColData::Int(v)) => {
-                                                Cell::Int(v.get(i).copied().unwrap_or(0))
-                                            }
-                                            Some(ColData::Float(v)) => {
-                                                Cell::Float(v.get(i).copied().unwrap_or(0.0))
-                                            }
-                                            Some(ColData::Bool(v)) => {
-                                                Cell::Bool(v.get(i).copied().unwrap_or(false))
-                                            }
-                                            Some(ColData::Time(v)) => {
-                                                Cell::Time(v.get(i).copied().unwrap_or(0))
-                                            }
-                                            Some(ColData::Vec(v)) => {
-                                                match v.get(i).and_then(|o| o.as_ref()) {
-                                                    Some(emb) => {
-                                                        Cell::vec_arc(std::sync::Arc::clone(emb))
-                                                    }
-                                                    _ => Cell::Null,
-                                                }
-                                            }
-                                            Some(ColData::Null) | None => Cell::Null,
-                                        };
+                                        *slot = col_cell_at(cols, fi, i);
                                     }
                                     part.push(row);
                                 }
@@ -2645,21 +2609,7 @@ pub fn cols_to_rows(fields: &[String], cols: &[ColData], n: usize) -> Vec<crate:
         for i in 0..n {
             let mut row = template.clone();
             for (fi, slot) in row.values_mut().enumerate() {
-                *slot = match cols.get(fi) {
-                    Some(ColData::Text(v)) => v
-                        .get(i)
-                        .map(|s| Cell::Text(std::sync::Arc::clone(s)))
-                        .unwrap_or_else(|| Cell::text_arc("")),
-                    Some(ColData::Int(v)) => Cell::Int(v.get(i).copied().unwrap_or(0)),
-                    Some(ColData::Float(v)) => Cell::Float(v.get(i).copied().unwrap_or(0.0)),
-                    Some(ColData::Bool(v)) => Cell::Bool(v.get(i).copied().unwrap_or(false)),
-                    Some(ColData::Time(v)) => Cell::Time(v.get(i).copied().unwrap_or(0)),
-                    Some(ColData::Vec(v)) => match v.get(i).and_then(|o| o.as_ref()) {
-                        Some(emb) => Cell::vec_arc(std::sync::Arc::clone(emb)),
-                        _ => Cell::Null,
-                    },
-                    Some(ColData::Null) | None => Cell::Null,
-                };
+                *slot = col_cell_at(cols, fi, i);
             }
             rows.push(row);
         }
@@ -2669,22 +2619,7 @@ pub fn cols_to_rows(fields: &[String], cols: &[ColData], n: usize) -> Vec<crate:
     for i in 0..n {
         let mut row = crate::store::Row::new();
         for (fi, f) in fields.iter().enumerate() {
-            let cell = match cols.get(fi) {
-                Some(ColData::Text(v)) => v
-                    .get(i)
-                    .map(|s| Cell::Text(std::sync::Arc::clone(s)))
-                    .unwrap_or_else(|| Cell::text_arc("")),
-                Some(ColData::Int(v)) => Cell::Int(v.get(i).copied().unwrap_or(0)),
-                Some(ColData::Float(v)) => Cell::Float(v.get(i).copied().unwrap_or(0.0)),
-                Some(ColData::Bool(v)) => Cell::Bool(v.get(i).copied().unwrap_or(false)),
-                Some(ColData::Time(v)) => Cell::Time(v.get(i).copied().unwrap_or(0)),
-                Some(ColData::Vec(v)) => match v.get(i).and_then(|o| o.as_ref()) {
-                    Some(emb) => Cell::vec_arc(std::sync::Arc::clone(emb)),
-                    _ => Cell::Null,
-                },
-                Some(ColData::Null) | None => Cell::Null,
-            };
-            row.insert(f.clone(), cell);
+            row.insert(f.clone(), col_cell_at(cols, fi, i));
         }
         rows.push(row);
     }

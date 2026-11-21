@@ -29,13 +29,13 @@ struct SyncState {
     last_error: Option<(u64, u64, Error)>,
 }
 
-struct WalSyncGroup {
+pub(crate) struct WalSyncGroup {
     state: Mutex<SyncState>,
     cv: Condvar,
 }
 
 impl WalSyncGroup {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             state: Mutex::new(SyncState {
                 written_seq: 0,
@@ -48,6 +48,12 @@ impl WalSyncGroup {
         }
     }
 
+    #[inline]
+    pub(crate) fn is_all_synced(&self) -> bool {
+        let g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        g.synced_seq >= g.written_seq
+    }
+
     /// Record a deferred `SyncMode::Full` WAL append while holding `db` mutex.
     fn note_unsynced_write(&self) -> u64 {
         let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -56,14 +62,14 @@ impl WalSyncGroup {
     }
 
     /// Mark all writes up to `written_seq` as already durable (e.g. after a full checkpoint).
-    fn note_checkpointed(&self) {
+    pub(crate) fn note_checkpointed(&self) {
         let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
         g.synced_seq = g.written_seq;
         self.cv.notify_all();
     }
 
     /// Wait until no background `durable_sync` is mid-flight (called before log compaction).
-    fn wait_idle(&self) {
+    pub(crate) fn wait_idle(&self) {
         let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
         while g.syncing {
             g = self.cv.wait(g).unwrap_or_else(|e| e.into_inner());
@@ -71,7 +77,7 @@ impl WalSyncGroup {
     }
 
     /// Wait until all previously written WAL frames have been synced (used by durable readers).
-    fn wait_all_written_synced(&self, sync_file: Option<File>) -> Result<u64, Error> {
+    pub(crate) fn wait_all_written_synced(&self, sync_file: Option<File>) -> Result<u64, Error> {
         let target = {
             let g = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if g.synced_seq >= g.written_seq {
@@ -93,7 +99,7 @@ impl WalSyncGroup {
 
     /// Leader-follower group sync barrier: guarantees `target_seq` is durably flushed on disk
     /// before returning `Ok(())`.
-    fn wait_synced(&self, target_seq: u64, sync_file: File) -> Result<(), Error> {
+    pub(crate) fn wait_synced(&self, target_seq: u64, sync_file: File) -> Result<(), Error> {
         let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             if g.synced_seq >= target_seq {
@@ -252,52 +258,78 @@ impl SharedDb {
         }
         self.run_write_op(|db| db.execute_prepared(prep))
     }
+}
 
+/// Execute `op` under an already-held [`Db`] lock with `SyncMode::Full` temporarily
+/// downgraded to `SyncMode::Normal` so the caller can release the execution lock and flush
+/// the WAL through `sync_group`.
+pub(crate) fn defer_db_write_op<T>(
+    db: &mut Db,
+    sync_group: &WalSyncGroup,
+    op: impl FnOnce(&mut Db) -> Result<T, Error>,
+) -> (Result<T, Error>, Option<(u64, File)>) {
+    let prev_gen = db.store.r#gen;
+    let prev_log_bytes = db.persist.as_ref().map(|p| p.log_bytes).unwrap_or(0);
+    let will_auto_ckpt = db.persist.as_ref().is_some_and(|p| {
+        (p.writes_since_snapshot + 1 >= crate::persist::SNAPSHOT_EVERY
+            && p.log_bytes >= 4 * 1024 * 1024)
+            || p.writes_since_snapshot + 1 >= 4096
+            || p.log_bytes > db.quotas.max_log_bytes
+    });
+    if will_auto_ckpt {
+        sync_group.wait_idle();
+    }
+    let defer_sync = !will_auto_ckpt
+        && db.persist.as_mut().is_some_and(|p| {
+            if p.sync == SyncMode::Full {
+                p.sync = SyncMode::Normal;
+                true
+            } else {
+                false
+            }
+        });
+    let out = op(db);
+    if defer_sync && let Some(p) = db.persist.as_mut() {
+        p.sync = SyncMode::Full;
+    }
+    let pending = match (&out, defer_sync, db.persist.as_ref()) {
+        (Ok(_), true, Some(p)) if db.store.r#gen > prev_gen || p.log_bytes != prev_log_bytes => {
+            if p.log_bytes == 0 {
+                sync_group.note_checkpointed();
+                None
+            } else {
+                match p.log.try_clone() {
+                    Ok(f) => {
+                        let seq = sync_group.note_unsynced_write();
+                        Some((seq, f))
+                    }
+                    Err(_) => {
+                        if let Err(e) = crate::persist::durable_sync(&p.log) {
+                            return (
+                                Err(Error::runtime(format!("group commit sync failed: {e}"))),
+                                None,
+                            );
+                        }
+                        sync_group.note_checkpointed();
+                        None
+                    }
+                }
+            }
+        }
+        (Ok(_), false, Some(p)) if p.log_bytes == 0 && prev_log_bytes > 0 => {
+            sync_group.note_checkpointed();
+            None
+        }
+        _ => None,
+    };
+    (out, pending)
+}
+
+impl SharedDb {
     fn run_write_op<T>(&self, op: impl FnOnce(&mut Db) -> Result<T, Error>) -> Result<T, Error> {
         let (res, pending_sync) = {
             let mut db = self.lock_db()?;
-            let prev_gen = db.store.r#gen;
-            let prev_log_bytes = db.persist.as_ref().map(|p| p.log_bytes).unwrap_or(0);
-            let will_auto_ckpt = db.persist.as_ref().is_some_and(|p| {
-                (p.writes_since_snapshot + 1 >= crate::persist::SNAPSHOT_EVERY
-                    && p.log_bytes >= 4 * 1024 * 1024)
-                    || p.writes_since_snapshot + 1 >= 4096
-                    || p.log_bytes > db.quotas.max_log_bytes
-            });
-            if will_auto_ckpt {
-                self.inner.sync_group.wait_idle();
-            }
-            let defer_sync = !will_auto_ckpt
-                && db.persist.as_mut().is_some_and(|p| {
-                    if p.sync == SyncMode::Full {
-                        p.sync = SyncMode::Normal;
-                        true
-                    } else {
-                        false
-                    }
-                });
-            let out = op(&mut db);
-            if defer_sync && let Some(p) = db.persist.as_mut() {
-                p.sync = SyncMode::Full;
-            }
-            let pending = match (&out, defer_sync, db.persist.as_ref()) {
-                (Ok(_), true, Some(p)) if db.store.r#gen > prev_gen || p.log_bytes != prev_log_bytes => {
-                    if p.log_bytes == 0 {
-                        self.inner.sync_group.note_checkpointed();
-                        None
-                    } else {
-                        let f = p.log.try_clone().map_err(crate::persist::io_err)?;
-                        let seq = self.inner.sync_group.note_unsynced_write();
-                        Some((seq, f))
-                    }
-                }
-                (Ok(_), false, Some(p)) if p.log_bytes == 0 && prev_log_bytes > 0 => {
-                    self.inner.sync_group.note_checkpointed();
-                    None
-                }
-                _ => None,
-            };
-            (out, pending)
+            defer_db_write_op(&mut db, &self.inner.sync_group, op)
         };
         let val = res?;
         if let Some((seq, file)) = pending_sync {
@@ -310,7 +342,7 @@ impl SharedDb {
     /// the writer lock).
     pub fn reader(&self) -> Result<ReadDb, Error> {
         // Fast path when all writes are synced and cached reader matches current generation.
-        {
+        if self.inner.sync_group.is_all_synced() {
             let sg = self
                 .inner
                 .sync_group

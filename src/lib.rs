@@ -71,6 +71,7 @@ pub mod persist;
 mod plan;
 mod store;
 mod window;
+mod work_steal;
 
 pub mod cache;
 pub mod cluster;

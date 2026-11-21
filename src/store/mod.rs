@@ -3876,343 +3876,116 @@ impl Store {
             let docs_layer = &mut self.docs_layer;
             let docs_wing = &mut self.docs_wing;
 
-            use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-            struct FtsStealTask {
-                fts_ptr: usize,
-                start: usize,
-                rows_ptr: usize,
-                rows_len: usize,
-                state: AtomicU8,
-                done: AtomicBool,
-                panicked: AtomicBool,
-                caller: std::thread::Thread,
-            }
-            struct IdxStealTask {
-                indexes_ptr: usize,
-                start: usize,
-                rows_ptr: usize,
-                rows_len: usize,
-                state: AtomicU8,
-                done: AtomicBool,
-                panicked: AtomicBool,
-                caller: std::thread::Thread,
-                res: std::sync::Mutex<Option<Result<(), Error>>>,
-            }
-            static MAINT_TXS: std::sync::OnceLock<
-                Option<(
-                    std::sync::mpsc::SyncSender<Arc<FtsStealTask>>,
-                    std::sync::mpsc::SyncSender<Arc<IdxStealTask>>,
-                )>,
-            > = std::sync::OnceLock::new();
-            let txs_opt = MAINT_TXS.get_or_init(|| {
-                let (fts_tx, fts_rx) =
-                    std::sync::mpsc::sync_channel::<Arc<FtsStealTask>>(8);
-                let (idx_tx, idx_rx) =
-                    std::sync::mpsc::sync_channel::<Arc<IdxStealTask>>(8);
-                let ok1 = std::thread::Builder::new()
-                    .name("lin-maint-fts".into())
-                    .spawn(move || {
-                        while let Ok(task) = fts_rx.recv() {
-                            if task
-                                .state
-                                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-                                .is_err()
-                            {
-                                continue;
-                            }
-                            struct WorkerDone<'a>(&'a FtsStealTask, bool);
-                            impl Drop for WorkerDone<'_> {
-                                fn drop(&mut self) {
-                                    if self.1 {
-                                        self.0.panicked.store(true, Ordering::Release);
-                                    }
-                                    self.0.done.store(true, Ordering::Release);
-                                    self.0.caller.unpark();
-                                }
-                            }
-                            let mut wd = WorkerDone(&task, true);
-                            let fts =
-                                unsafe { &mut *(task.fts_ptr as *mut crate::fts::FtsIndex) };
-                            let rows = unsafe {
-                                std::slice::from_raw_parts(
-                                    task.rows_ptr as *const Row,
-                                    task.rows_len,
-                                )
-                            };
-                            fts.append_slab(task.start, rows);
-                            wd.1 = false;
-                        }
-                    })
-                    .is_ok();
-                let ok2 = std::thread::Builder::new()
-                    .name("lin-maint-idx".into())
-                    .spawn(move || {
-                        while let Ok(task) = idx_rx.recv() {
-                            if task
-                                .state
-                                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-                                .is_err()
-                            {
-                                continue;
-                            }
-                            struct WorkerDone<'a>(&'a IdxStealTask, bool);
-                            impl Drop for WorkerDone<'_> {
-                                fn drop(&mut self) {
-                                    if self.1 {
-                                        self.0.panicked.store(true, Ordering::Release);
-                                    }
-                                    self.0.done.store(true, Ordering::Release);
-                                    self.0.caller.unpark();
-                                }
-                            }
-                            let mut wd = WorkerDone(&task, true);
-                            let idxs = unsafe {
-                                &mut *(task.indexes_ptr as *mut BTreeMap<String, LiveIndex>)
-                            };
-                            let rows = unsafe {
-                                std::slice::from_raw_parts(
-                                    task.rows_ptr as *const Row,
-                                    task.rows_len,
-                                )
-                            };
-                            let mut res = Ok(());
-                            for idx in idxs.values_mut() {
-                                if idx.def.collection == "docs"
-                                    && let Err(e) =
-                                        idx.insert_slab_batch_no_reverse(task.start, rows)
-                                {
-                                    res = Err(Error::runtime(e));
-                                    break;
-                                }
-                            }
-                            if let Ok(mut g) = task.res.lock() {
-                                *g = Some(res);
-                            }
-                            wd.1 = false;
-                        }
-                    })
-                    .is_ok();
-                if ok1 && ok2 {
-                    Some((fts_tx, idx_tx))
-                } else {
-                    None
-                }
-            });
-
-            let mut fts_opt = fts_opt;
-            let mut fts_task: Option<Arc<FtsStealTask>> = None;
-            let mut idx_task: Option<Arc<IdxStealTask>> = None;
-            if let Some((fts_tx, idx_tx)) = txs_opt.as_ref() {
-                if let Some(fts) = fts_opt.as_deref_mut() {
-                    let t = Arc::new(FtsStealTask {
-                        fts_ptr: fts as *mut crate::fts::FtsIndex as usize,
-                        start,
-                        rows_ptr: built.as_ptr() as usize,
-                        rows_len: built.len(),
-                        state: AtomicU8::new(0),
-                        done: AtomicBool::new(false),
-                        panicked: AtomicBool::new(false),
-                        caller: std::thread::current(),
-                    });
-                    if fts_tx.try_send(Arc::clone(&t)).is_ok() {
-                        fts_task = Some(t);
-                    }
-                }
-                let t = Arc::new(IdxStealTask {
-                    indexes_ptr: indexes as *mut BTreeMap<String, LiveIndex> as usize,
-                    start,
-                    rows_ptr: built.as_ptr() as usize,
-                    rows_len: built.len(),
-                    state: AtomicU8::new(0),
-                    done: AtomicBool::new(false),
-                    panicked: AtomicBool::new(false),
-                    caller: std::thread::current(),
-                    res: std::sync::Mutex::new(None),
-                });
-                if idx_tx.try_send(Arc::clone(&t)).is_ok() {
-                    idx_task = Some(t);
-                }
-            }
-            struct MaintStealGuard<'a> {
-                fts_task: Option<&'a FtsStealTask>,
-                idx_task: Option<&'a IdxStealTask>,
-            }
-            impl Drop for MaintStealGuard<'_> {
-                fn drop(&mut self) {
-                    if let Some(t) = self.fts_task
-                        && t.state
-                            .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
-                            .err()
-                            == Some(1)
-                    {
-                        while !t.done.load(Ordering::Acquire) {
-                            std::thread::park_timeout(std::time::Duration::from_micros(50));
-                        }
-                    }
-                    if let Some(t) = self.idx_task
-                        && t.state
-                            .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
-                            .err()
-                            == Some(1)
-                    {
-                        while !t.done.load(Ordering::Acquire) {
-                            std::thread::park_timeout(std::time::Duration::from_micros(50));
-                        }
-                    }
-                }
-            }
-            let _maint_guard = MaintStealGuard {
-                fts_task: fts_task.as_deref(),
-                idx_task: idx_task.as_deref(),
-            };
-
-            if let Some(hnsw) = hnsw_opt {
-                for (i, row) in built.iter().enumerate() {
-                    if let Some(Cell::Vec(v)) = row.get("embedding") {
-                        hnsw.insert(start + i, v.clone());
-                    }
-                }
-            }
-
-            let keep_uri = !docs_by_uri.is_empty() || built.len() < 512;
-            let first = &built[0];
-            let id_pos = first.keys().position(|k| k == "id");
-            let uri_pos = if keep_uri {
-                first.keys().position(|k| k == "uri")
-            } else {
-                None
-            };
-            let title_pos = first.keys().position(|k| k == "title");
-            let layer_pos = first.keys().position(|k| k == "layer");
-            let wing_pos = first.keys().position(|k| k == "wing");
-            let same_shape = first.shape_arc().is_some_and(|fs| {
-                built[1..]
-                    .iter()
-                    .all(|r| r.shape_arc().is_some_and(|s| Arc::ptr_eq(s, fs)))
-            });
-            if same_shape {
-                for (i, row) in built.iter().enumerate() {
-                    let idx = start + i;
-                    let cells = row.cells_slice();
-                    let id_arc: Arc<str> = id_pos
-                        .and_then(|p| cells.get(p))
-                        .and_then(Cell::text_shared)
-                        .unwrap_or_default();
-                    let uri_arc: Option<Arc<str>> = uri_pos
-                        .and_then(|p| cells.get(p))
-                        .and_then(Cell::text_shared);
-                    let title_arc: Arc<str> = title_pos
-                        .and_then(|p| cells.get(p))
-                        .and_then(Cell::text_shared)
-                        .unwrap_or_default();
-                    let layer_arc: Arc<str> = layer_pos
-                        .and_then(|p| cells.get(p))
-                        .and_then(Cell::text_shared)
-                        .unwrap_or_default();
-                    let wing_arc: Arc<str> = wing_pos
-                        .and_then(|p| cells.get(p))
-                        .and_then(Cell::text_shared)
-                        .unwrap_or_default();
-
-                    if !id_arc.is_empty() {
-                        by_id.insert(Arc::clone(&id_arc), idx);
-                    }
-                    if let Some(uri) = uri_arc {
-                        docs_by_uri.insert(uri, idx);
-                    }
-                    docs_id.push(id_arc);
-                    docs_title.push(title_arc);
-                    docs_layer.push(layer_arc);
-                    docs_wing.push(intern_wing(wing_arc));
-                }
-            } else {
-                for (i, row) in built.iter().enumerate() {
-                    let idx = start + i;
-                    let mut texts: [Option<Arc<str>>; 5] = std::array::from_fn(|_| None);
-                    for (field, value) in row {
-                        let slot = match field.as_str() {
-                            "id" => 0,
-                            "uri" if keep_uri => 1,
-                            "title" => 2,
-                            "layer" => 3,
-                            "wing" => 4,
-                            _ => continue,
-                        };
-                        texts[slot] = value.text_shared();
-                    }
-                    let [id, uri, title, layer, wing] = texts;
-                    if let Some(ref id) = id {
-                        by_id.insert(Arc::clone(id), idx);
-                    }
-                    if let Some(uri) = uri {
-                        docs_by_uri.insert(uri, idx);
-                    }
-                    docs_id.push(id.unwrap_or_default());
-                    docs_title.push(title.unwrap_or_default());
-                    docs_layer.push(layer.unwrap_or_default());
-                    docs_wing.push(intern_wing(wing.unwrap_or_default()));
-                }
-            }
-
-            if let Some(fts) = fts_opt {
-                match fts_task.as_deref() {
-                    Some(t)
-                        if t.state
-                            .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
-                            .is_err() =>
-                    {
-                        for _ in 0..64 {
-                            if t.done.load(Ordering::Acquire) {
-                                break;
-                            }
-                            std::hint::spin_loop();
-                        }
-                        while !t.done.load(Ordering::Acquire) {
-                            std::thread::park_timeout(std::time::Duration::from_micros(50));
-                        }
-                        if t.panicked.load(Ordering::Acquire) {
-                            panic!("fts maint worker panicked");
-                        }
-                    }
-                    _ => {
+            let has_fts = fts_opt.is_some();
+            let ((), idx_res, ()) = crate::work_steal::steal3(
+                crate::work_steal::StealLane::MaintFts,
+                has_fts,
+                move || {
+                    if let Some(fts) = fts_opt {
                         fts.append_slab(start, built);
                     }
-                }
-            }
-            let mut idx_res = Ok(());
-            match idx_task.as_deref() {
-                Some(t)
-                    if t.state
-                        .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
-                        .is_err() =>
-                {
-                    for _ in 0..64 {
-                        if t.done.load(Ordering::Acquire) {
-                            break;
-                        }
-                        std::hint::spin_loop();
-                    }
-                    while !t.done.load(Ordering::Acquire) {
-                        std::thread::park_timeout(std::time::Duration::from_micros(50));
-                    }
-                    if t.panicked.load(Ordering::Acquire) {
-                        panic!("index maint worker panicked");
-                    }
-                    if let Some(r) = t.res.lock().ok().and_then(|mut g| g.take()) {
-                        idx_res = r;
-                    }
-                }
-                _ => {
+                },
+                crate::work_steal::StealLane::MaintIdx,
+                move || -> Result<(), Error> {
                     for idx in indexes.values_mut() {
                         if idx.def.collection == collection
                             && let Err(e) = idx.insert_slab_batch_no_reverse(start, built)
                         {
-                            idx_res = Err(Error::runtime(e));
-                            break;
+                            return Err(Error::runtime(e));
                         }
                     }
-                }
-            }
+                    Ok(())
+                },
+                move || {
+                    if let Some(hnsw) = hnsw_opt {
+                        for (i, row) in built.iter().enumerate() {
+                            if let Some(Cell::Vec(v)) = row.get("embedding") {
+                                hnsw.insert(start + i, v.clone());
+                            }
+                        }
+                    }
+
+                    let keep_uri = !docs_by_uri.is_empty() || built.len() < 512;
+                    let first = &built[0];
+                    let id_pos = first.keys().position(|k| k == "id");
+                    let uri_pos = if keep_uri {
+                        first.keys().position(|k| k == "uri")
+                    } else {
+                        None
+                    };
+                    let title_pos = first.keys().position(|k| k == "title");
+                    let layer_pos = first.keys().position(|k| k == "layer");
+                    let wing_pos = first.keys().position(|k| k == "wing");
+                    let same_shape = first.shape_arc().is_some_and(|fs| {
+                        built[1..]
+                            .iter()
+                            .all(|r| r.shape_arc().is_some_and(|s| Arc::ptr_eq(s, fs)))
+                    });
+                    if same_shape {
+                        for (i, row) in built.iter().enumerate() {
+                            let idx = start + i;
+                            let cells = row.cells_slice();
+                            let id_arc: Arc<str> = id_pos
+                                .and_then(|p| cells.get(p))
+                                .and_then(Cell::text_shared)
+                                .unwrap_or_default();
+                            let uri_arc: Option<Arc<str>> = uri_pos
+                                .and_then(|p| cells.get(p))
+                                .and_then(Cell::text_shared);
+                            let title_arc: Arc<str> = title_pos
+                                .and_then(|p| cells.get(p))
+                                .and_then(Cell::text_shared)
+                                .unwrap_or_default();
+                            let layer_arc: Arc<str> = layer_pos
+                                .and_then(|p| cells.get(p))
+                                .and_then(Cell::text_shared)
+                                .unwrap_or_default();
+                            let wing_arc: Arc<str> = wing_pos
+                                .and_then(|p| cells.get(p))
+                                .and_then(Cell::text_shared)
+                                .unwrap_or_default();
+
+                            if !id_arc.is_empty() {
+                                by_id.insert(Arc::clone(&id_arc), idx);
+                            }
+                            if let Some(uri) = uri_arc {
+                                docs_by_uri.insert(uri, idx);
+                            }
+                            docs_id.push(id_arc);
+                            docs_title.push(title_arc);
+                            docs_layer.push(layer_arc);
+                            docs_wing.push(intern_wing(wing_arc));
+                        }
+                    } else {
+                        for (i, row) in built.iter().enumerate() {
+                            let idx = start + i;
+                            let mut texts: [Option<Arc<str>>; 5] = std::array::from_fn(|_| None);
+                            for (field, value) in row {
+                                let slot = match field.as_str() {
+                                    "id" => 0,
+                                    "uri" if keep_uri => 1,
+                                    "title" => 2,
+                                    "layer" => 3,
+                                    "wing" => 4,
+                                    _ => continue,
+                                };
+                                texts[slot] = value.text_shared();
+                            }
+                            let [id, uri, title, layer, wing] = texts;
+                            if let Some(ref id) = id {
+                                by_id.insert(Arc::clone(id), idx);
+                            }
+                            if let Some(uri) = uri {
+                                docs_by_uri.insert(uri, idx);
+                            }
+                            docs_id.push(id.unwrap_or_default());
+                            docs_title.push(title.unwrap_or_default());
+                            docs_layer.push(layer.unwrap_or_default());
+                            docs_wing.push(intern_wing(wing.unwrap_or_default()));
+                        }
+                    }
+                },
+            );
             return idx_res;
         }
         self.index_insert_slab(collection, start, built)?;

@@ -322,12 +322,13 @@ pub(crate) fn agg_count(
 pub(crate) const PAR_AGG_MIN_ROWS: usize = 65_536;
 pub(crate) const PAR_AGG_CHUNK_ROWS: usize = 16_384;
 
-/// Grouped aggregate over materialized rows on the rayon pool: each fixed-size chunk
-/// folds into its own map, and the partials merge in chunk order, so the result does not
-/// depend on scheduling. Returns `None` when the merged state exceeds `max_bytes`; the
-/// caller then runs the sequential path, which owns the quota error and the spill.
-#[cfg(feature = "parallel")]
-fn par_group_fold<V: Send + Default>(
+/// Grouped aggregate over materialized rows in fixed `PAR_AGG_CHUNK_ROWS` chunks: each
+/// chunk folds into its own map (in parallel on the rayon pool when `parallel` is enabled,
+/// or sequentially otherwise), and the partials merge in chunk order so the result never
+/// depends on thread scheduling or build features. Returns `None` when the merged state
+/// exceeds `max_bytes`; the caller then runs the sequential path, which owns the quota
+/// error and disk spill.
+fn chunked_group_fold<V: Send + Default>(
     rows: &[Row],
     filter: Option<&Pred>,
     now: i64,
@@ -337,28 +338,24 @@ fn par_group_fold<V: Send + Default>(
     add: impl Fn(&mut V, Option<&Cell>) + Sync,
     merge: impl Fn(&mut V, V),
 ) -> Option<FxHashMap<Cell, V>> {
-    use rayon::prelude::*;
-    let parts: Vec<FxHashMap<Cell, V>> = rows
-        .par_chunks(PAR_AGG_CHUNK_ROWS)
-        .map(|chunk| {
-            let mut map: FxHashMap<Cell, V> = FxHashMap::default();
-            let mut flt = filter.map(PredSlots::new);
-            let mut key_slot = FieldSlot::new(key);
-            let mut value_slot = value.map(FieldSlot::new);
-            for r in chunk {
-                if !flt.as_mut().is_none_or(|f| f.eval(r, now)) {
-                    continue;
-                }
-                let cell = key_slot.get(r).map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
-                let v = value_slot.as_mut().and_then(|s| s.get(r));
-                add(map.entry(cell).or_default(), v);
+    let fold_chunk = |chunk: &[Row]| -> FxHashMap<Cell, V> {
+        let mut map: FxHashMap<Cell, V> = FxHashMap::default();
+        let mut flt = filter.map(PredSlots::new);
+        let mut key_slot = FieldSlot::new(key);
+        let mut value_slot = value.map(FieldSlot::new);
+        for r in chunk {
+            if !flt.as_mut().is_none_or(|f| f.eval(r, now)) {
+                continue;
             }
-            map
-        })
-        .collect();
+            let cell = key_slot.get(r).map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
+            let v = value_slot.as_mut().and_then(|s| s.get(r));
+            add(map.entry(cell).or_default(), v);
+        }
+        map
+    };
     let mut merged: FxHashMap<Cell, V> = FxHashMap::default();
     let mut state_bytes = 0usize;
-    for part in parts {
+    let mut merge_part = |part: FxHashMap<Cell, V>| -> bool {
         for (cell, v) in part {
             match merged.entry(cell) {
                 std::collections::hash_map::Entry::Occupied(mut e) => merge(e.get_mut(), v),
@@ -369,10 +366,30 @@ fn par_group_fold<V: Send + Default>(
                     };
                     state_bytes = state_bytes.saturating_add(key_size + 64);
                     if state_bytes > max_bytes {
-                        return None;
+                        return false;
                     }
                     e.insert(v);
                 }
+            }
+        }
+        true
+    };
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        let parts: Vec<FxHashMap<Cell, V>> =
+            rows.par_chunks(PAR_AGG_CHUNK_ROWS).map(fold_chunk).collect();
+        for part in parts {
+            if !merge_part(part) {
+                return None;
+            }
+        }
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        for chunk in rows.chunks(PAR_AGG_CHUNK_ROWS) {
+            if !merge_part(fold_chunk(chunk)) {
+                return None;
             }
         }
     }
@@ -811,9 +828,8 @@ pub(crate) fn agg_sum_filtered(
             })
             .collect()
     };
-    #[cfg(feature = "parallel")]
     if rows.len() >= PAR_AGG_MIN_ROWS
-        && let Some(map) = par_group_fold::<crate::exact_sum::ExactSum>(
+        && let Some(map) = chunked_group_fold::<crate::exact_sum::ExactSum>(
             rows,
             filter,
             now,
@@ -825,48 +841,6 @@ pub(crate) fn agg_sum_filtered(
         )
     {
         return Ok(sum_rows_out(map));
-    }
-    #[cfg(not(feature = "parallel"))]
-    if rows.len() >= PAR_AGG_MIN_ROWS {
-        let mut merged: FxHashMap<Cell, crate::exact_sum::ExactSum> = FxHashMap::default();
-        let mut state_bytes = 0usize;
-        let mut exceeded = false;
-        for chunk in rows.chunks(PAR_AGG_CHUNK_ROWS) {
-            let mut part: FxHashMap<Cell, crate::exact_sum::ExactSum> = FxHashMap::default();
-            let mut flt = filter.map(PredSlots::new);
-            let mut key_slot = FieldSlot::new(&bk);
-            let mut value_slot = FieldSlot::new(&fk);
-            for r in chunk {
-                if !flt.as_mut().is_none_or(|f| f.eval(r, now)) {
-                    continue;
-                }
-                let cell = key_slot.get(r).map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
-                part.entry(cell).or_default().add_cell(value_slot.get(r));
-            }
-            for (cell, v) in part {
-                match merged.entry(cell) {
-                    std::collections::hash_map::Entry::Occupied(mut e) => e.get_mut().merge(v),
-                    std::collections::hash_map::Entry::Vacant(e) => {
-                        let key_size = match e.key() {
-                            Cell::Text(s) => s.len() + 32,
-                            _ => 16,
-                        };
-                        state_bytes = state_bytes.saturating_add(key_size + 64);
-                        if state_bytes > max_bytes {
-                            exceeded = true;
-                            break;
-                        }
-                        e.insert(v);
-                    }
-                }
-            }
-            if exceeded {
-                break;
-            }
-        }
-        if !exceeded {
-            return Ok(sum_rows_out(merged));
-        }
     }
     let mut map: FxHashMap<Cell, crate::exact_sum::ExactSum> = FxHashMap::default();
     let mut state_bytes = 0usize;
@@ -990,7 +964,7 @@ pub(crate) fn agg_extremum_filtered(
     // equal values wins exactly as in the sequential loop.
     #[cfg(feature = "parallel")]
     if rows.len() >= PAR_AGG_MIN_ROWS
-        && let Some(folded) = par_group_fold::<Option<Cell>>(
+        && let Some(folded) = chunked_group_fold::<Option<Cell>>(
             rows,
             filter,
             now,
@@ -1144,11 +1118,9 @@ pub(crate) fn agg_avg_filtered(
     let bk = by.as_str();
     let mut map: FxHashMap<Cell, (crate::exact_sum::ExactSum, usize)> = FxHashMap::default();
     let mut state_bytes = 0usize;
-    #[allow(unused_mut)]
     let mut seq_rows: &[Row] = rows;
-    #[cfg(feature = "parallel")]
     if rows.len() >= PAR_AGG_MIN_ROWS
-        && let Some(folded) = par_group_fold::<(crate::exact_sum::ExactSum, usize)>(
+        && let Some(folded) = chunked_group_fold::<(crate::exact_sum::ExactSum, usize)>(
             rows,
             filter,
             now,
@@ -1168,57 +1140,6 @@ pub(crate) fn agg_avg_filtered(
     {
         map = folded;
         seq_rows = &[];
-    }
-    #[cfg(not(feature = "parallel"))]
-    if rows.len() >= PAR_AGG_MIN_ROWS {
-        let mut merged: FxHashMap<Cell, (crate::exact_sum::ExactSum, usize)> = FxHashMap::default();
-        let mut sb = 0usize;
-        let mut exceeded = false;
-        for chunk in rows.chunks(PAR_AGG_CHUNK_ROWS) {
-            let mut part: FxHashMap<Cell, (crate::exact_sum::ExactSum, usize)> =
-                FxHashMap::default();
-            let mut flt = filter.map(PredSlots::new);
-            let mut key_slot = FieldSlot::new(&bk);
-            let mut value_slot = FieldSlot::new(&fk);
-            for r in chunk {
-                if !flt.as_mut().is_none_or(|f| f.eval(r, now)) {
-                    continue;
-                }
-                let cell = key_slot.get(r).map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
-                let acc = part.entry(cell).or_default();
-                if acc.0.add_numeric(value_slot.get(r)) {
-                    acc.1 += 1;
-                }
-            }
-            for (cell, v) in part {
-                match merged.entry(cell) {
-                    std::collections::hash_map::Entry::Occupied(mut e) => {
-                        let cur = e.get_mut();
-                        cur.0.merge(v.0);
-                        cur.1 += v.1;
-                    }
-                    std::collections::hash_map::Entry::Vacant(e) => {
-                        let key_size = match e.key() {
-                            Cell::Text(s) => s.len() + 32,
-                            _ => 16,
-                        };
-                        sb = sb.saturating_add(key_size + 64);
-                        if sb > max_bytes {
-                            exceeded = true;
-                            break;
-                        }
-                        e.insert(v);
-                    }
-                }
-            }
-            if exceeded {
-                break;
-            }
-        }
-        if !exceeded {
-            map = merged;
-            seq_rows = &[];
-        }
     }
     let mut flt = filter.map(PredSlots::new);
     let mut key_slot = FieldSlot::new(&bk);

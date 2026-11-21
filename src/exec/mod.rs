@@ -17,7 +17,7 @@ mod matview;
 mod mirror;
 mod prepared;
 mod search;
-mod shared;
+pub(crate) mod shared;
 mod tx;
 
 #[cfg(test)]
@@ -349,15 +349,6 @@ impl Stats {
             (self.append_rows as f64) / (self.append_ms / 1000.0)
         }
     }
-}
-
-/// One write of a commit group (see [`Db::execute_group_sync`]).
-#[cfg(feature = "async")]
-pub(crate) enum GroupWrite<'a> {
-    Src { src: &'a str, want_rows: bool },
-    Prepared { prepared: &'a Prepared, want_rows: bool },
-    Stmt(&'a Stmt),
-    Group(&'a [String]),
 }
 
 const PLAN_CACHE_MAX: usize = 512;
@@ -1398,19 +1389,6 @@ impl Db {
             .collect()
     }
 
-    /// One write of a commit group, outside any sync policy.
-    #[cfg(feature = "async")]
-    pub(crate) fn run_group_write(&mut self, write: &GroupWrite<'_>) -> Result<Handle, Error> {
-        match write {
-            GroupWrite::Src { src, want_rows } => self.run_src_ext(src, *want_rows),
-            GroupWrite::Prepared { prepared, want_rows } => {
-                self.run_prepared_ext(prepared, *want_rows)
-            }
-            GroupWrite::Stmt(stmt) => self.run_stmt((*stmt).clone()),
-            GroupWrite::Group(sources) => self.run_group(*sources),
-        }
-    }
-
     /// Run `body` (a group of `n` commits) with per-commit fsync deferred, then make the
     /// whole group durable with one sync. An error means the group reached the log but
     /// was not confirmed durable: no commit of the group may be acknowledged.
@@ -1974,43 +1952,17 @@ impl Db {
         let mut updated_rows = Vec::with_capacity(before_rows.len());
         // Same rule as the in-memory update: a changed title / body / snippet is
         // embedded again unless the statement sets the embedding itself.
-        let reembed = self.embedder.is_some()
-            && record
-                .fields
-                .iter()
-                .any(|(k, _)| matches!(k.as_str(), "title" | "body" | "snippet"))
-            && !record.fields.iter().any(|(k, _)| k == "embedding");
+        let reembed = self.update_needs_reembed(&record.fields);
         for before in before_rows {
             if has_guards {
-                for (k, _) in &record.fields {
-                    for g in &self.catalog.guards {
-                        if g.collection == collection
-                            && &g.field == k
-                            && eval_pred(&g.pred, &before, now)
-                        {
-                            return Err(Error::runtime(format!(
-                                "immutable field: {collection}.{k}"
-                            )));
-                        }
-                    }
-                }
+                self.check_row_update_guards(collection, &before, &record.fields, now)?;
             }
             let old_keys: Vec<Option<String>> = unique_keys
                 .iter()
                 .map(|k| k.indexed_text(&before, now_ms()))
                 .collect();
-            let mut updated = before;
-            for (k, v) in &record.fields {
-                updated.insert(k.clone(), value_cell(v, now));
-            }
-            if has_body && let Some(body) = row_text(&updated, "body") {
-                let h = content_hash_inline(body);
-                updated.insert("hash", Cell::SmallText(h));
-            }
-            if reembed {
-                updated.remove("embedding");
-                self.maybe_embed_rows(collection, std::slice::from_mut(&mut updated))?;
-            }
+            let updated =
+                self.patch_updated_row(collection, before, &record.fields, now, has_body, reembed)?;
             self.cold_check_unique_keys(collection, &unique_keys, &old_keys, &updated, &mut seen_keys)?;
             if has_fks {
                 self.check_row_fks(collection, &updated)?;
@@ -2277,9 +2229,7 @@ impl Db {
             .guards
             .iter()
             .any(|g| g.collection == pu.collection);
-        let will_reembed = self.embedder.is_some()
-            && pu.record.fields.iter().any(|(k, _)| matches!(k.as_str(), "title" | "body" | "snippet"))
-            && !pu.record.fields.iter().any(|(k, _)| k == "embedding");
+        let will_reembed = self.update_needs_reembed(&pu.record.fields);
         let mut skip: smallvec::SmallVec<[&str; 4]> = smallvec::SmallVec::new();
         if pu.field == "id" && !has_guards {
             for (k, _) in &pu.record.fields {
@@ -2321,39 +2271,22 @@ impl Db {
                 .iter()
                 .any(|(_, v)| eval::value_needs_now(v));
         let now = if needs_now { now_ms() } else { 0 };
-        for (k, _) in &pu.record.fields {
-            for g in &self.catalog.guards {
-                if g.collection == pu.collection
-                    && &g.field == k
-                    && eval_pred(&g.pred, &before, now)
-                {
-                    return Err(Error::runtime(format!(
-                        "immutable field: {}.{k}",
-                        pu.collection
-                    )));
-                }
-            }
-        }
+        self.check_row_update_guards(&pu.collection, &before, &pu.record.fields, now)?;
         let old_keys: smallvec::SmallVec<[Option<String>; 4]> = unique_keys
             .iter()
             .map(|k| k.indexed_text(&before, now))
             .collect();
         let mut old_ids: smallvec::SmallVec<[Option<String>; 1]> = smallvec::SmallVec::new();
         old_ids.push(row_text(&before, "id").map(str::to_string));
-        let mut updated = before;
-        for (k, v) in &pu.record.fields {
-            updated.insert(k.as_str(), value_cell(v, now));
-        }
         let has_body = pu.record.fields.iter().any(|(k, _)| k == "body");
-        if has_body && let Some(body) = row_text(&updated, "body") {
-            let h = content_hash_inline(body);
-            updated.insert("hash", Cell::SmallText(h));
-        }
-        // A changed title / body / snippet is embedded again (see the general update).
-        if will_reembed {
-            updated.remove("embedding");
-            self.maybe_embed_rows(&pu.collection, std::slice::from_mut(&mut updated))?;
-        }
+        let updated = self.patch_updated_row(
+            &pu.collection,
+            before,
+            &pu.record.fields,
+            now,
+            has_body,
+            will_reembed,
+        )?;
         self.cold_check_unique_keys(
             &pu.collection,
             &unique_keys,
@@ -3387,39 +3320,20 @@ impl Db {
             let now = now_ms();
             let before_ref = &rows[idx];
             if !self.catalog.guards.is_empty() {
-                for (k, _) in &pu.record.fields {
-                    for g in &self.catalog.guards {
-                        if g.collection == pu.collection
-                            && &g.field == k
-                            && eval_pred(&g.pred, before_ref, now)
-                        {
-                            return Err(Error::runtime(format!(
-                                "immutable field: {}.{k}",
-                                pu.collection
-                            )));
-                        }
-                    }
-                }
+                self.check_row_update_guards(&pu.collection, before_ref, &pu.record.fields, now)?;
             }
             self.check_update_id(&pu.collection, &pu.record, &[idx], now)?;
             let before = before_ref.clone();
-            let mut updated = before.clone();
-            for (k, v) in &pu.record.fields {
-                updated.insert(k.clone(), value_cell(v, now));
-            }
             let has_body = pu.record.fields.iter().any(|(k, _)| k == "body");
-            if has_body && let Some(body) = row_text(&updated, "body") {
-                let h = content_hash_inline(body);
-                updated.insert("hash", Cell::SmallText(h));
-            }
-            // A changed title / body / snippet is embedded again (see the general update).
-            if self.embedder.is_some()
-                && pu.record.fields.iter().any(|(k, _)| matches!(k.as_str(), "title" | "body" | "snippet"))
-                && !pu.record.fields.iter().any(|(k, _)| k == "embedding")
-            {
-                updated.remove("embedding");
-                self.maybe_embed_rows(&pu.collection, std::slice::from_mut(&mut updated))?;
-            }
+            let reembed = self.update_needs_reembed(&pu.record.fields);
+            let updated = self.patch_updated_row(
+                &pu.collection,
+                before.clone(),
+                &pu.record.fields,
+                now,
+                has_body,
+                reembed,
+            )?;
             self.check_row_fks(&pu.collection, &updated)?;
             if let Some(rows) = self.store.collections.get_mut(&pu.collection) {
                 rows[idx] = updated.clone();

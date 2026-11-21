@@ -1308,7 +1308,6 @@ impl Db {
         } else if allow_preencode && n >= 512 && edges.is_empty() && self.persist.is_some() {
             let generation = self.store.r#gen.wrapping_add(1);
             let next_id = self.store.next_id;
-            use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
             let wal_dict = self.persist.as_ref().and_then(|p| p.wal_dictionary);
             let mut encode_buf = self
                 .persist
@@ -1316,142 +1315,9 @@ impl Db {
                 .map(|p| std::mem::take(&mut p.encode_buf))
                 .unwrap_or_default();
             let built_ref: &[Row] = &built;
-            struct DirectEncTask {
-                generation: u64,
-                next_id: u64,
-                col_ptr: usize,
-                col_len: usize,
-                rows_ptr: usize,
-                rows_len: usize,
-                uniform_keys: bool,
-                wal_dict: Option<bool>,
-                state: AtomicU8,
-                done: AtomicBool,
-                panicked: AtomicBool,
-                caller: std::thread::Thread,
-                buf_slot: std::sync::Mutex<Option<Vec<u8>>>,
-                res_slot: std::sync::Mutex<Option<(Option<([u8; 4], Vec<String>)>, Vec<u8>)>>,
-            }
-            static DIRECT_ENC_TX: std::sync::OnceLock<
-                Option<std::sync::mpsc::SyncSender<std::sync::Arc<DirectEncTask>>>,
-            > = std::sync::OnceLock::new();
-            let tx_opt = DIRECT_ENC_TX.get_or_init(|| {
-                let (tx, rx) =
-                    std::sync::mpsc::sync_channel::<std::sync::Arc<DirectEncTask>>(8);
-                let spawned = std::thread::Builder::new()
-                    .name("lin-direct-enc".into())
-                    .spawn(move || {
-                        while let Ok(task) = rx.recv() {
-                            if task
-                                .state
-                                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-                                .is_err()
-                            {
-                                continue;
-                            }
-                            struct WorkerDone<'a>(&'a DirectEncTask, bool);
-                            impl Drop for WorkerDone<'_> {
-                                fn drop(&mut self) {
-                                    if self.1 {
-                                        self.0.panicked.store(true, Ordering::Release);
-                                    }
-                                    self.0.done.store(true, Ordering::Release);
-                                    self.0.caller.unpark();
-                                }
-                            }
-                            let mut wd = WorkerDone(&task, true);
-                            // SAFETY: `DirectEncGuard` keeps `collection` and `built_ref` live
-                            // until `task.done` is stored `true`.
-                            let col = unsafe {
-                                std::str::from_utf8_unchecked(std::slice::from_raw_parts(
-                                    task.col_ptr as *const u8,
-                                    task.col_len,
-                                ))
-                            };
-                            let rows = unsafe {
-                                std::slice::from_raw_parts(
-                                    task.rows_ptr as *const Row,
-                                    task.rows_len,
-                                )
-                            };
-                            let mut job_buf = task
-                                .buf_slot
-                                .lock()
-                                .ok()
-                                .and_then(|mut g| g.take())
-                                .unwrap_or_default();
-                            let res = crate::persist::with_dictionary_writer_opt(
-                                task.wal_dict,
-                                || {
-                                    crate::persist::encode_insert_rows_direct_ext(
-                                        task.generation,
-                                        task.next_id,
-                                        col,
-                                        rows,
-                                        task.uniform_keys,
-                                        &mut job_buf,
-                                    )
-                                },
-                            );
-                            if let Ok(mut g) = task.res_slot.lock() {
-                                *g = Some((res, job_buf));
-                            }
-                            wd.1 = false;
-                        }
-                    });
-                if spawned.is_ok() {
-                    Some(tx)
-                } else {
-                    None
-                }
-            });
-            let (maint_res, direct_res) = if let Some(tx) = tx_opt.as_ref() {
-                let task = std::sync::Arc::new(DirectEncTask {
-                    generation,
-                    next_id,
-                    col_ptr: collection.as_ptr() as usize,
-                    col_len: collection.len(),
-                    rows_ptr: built_ref.as_ptr() as usize,
-                    rows_len: built_ref.len(),
-                    uniform_keys,
-                    wal_dict,
-                    state: AtomicU8::new(0),
-                    done: AtomicBool::new(false),
-                    panicked: AtomicBool::new(false),
-                    caller: std::thread::current(),
-                    buf_slot: std::sync::Mutex::new(Some(encode_buf)),
-                    res_slot: std::sync::Mutex::new(None),
-                });
-                struct DirectEncGuard<'a>(&'a DirectEncTask);
-                impl Drop for DirectEncGuard<'_> {
-                    fn drop(&mut self) {
-                        if self
-                            .0
-                            .state
-                            .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
-                            .err()
-                            == Some(1)
-                        {
-                            while !self.0.done.load(Ordering::Acquire) {
-                                std::thread::park_timeout(std::time::Duration::from_micros(50));
-                            }
-                        }
-                    }
-                }
-                let _guard = DirectEncGuard(&task);
-                let _ = tx.try_send(std::sync::Arc::clone(&task));
-                let maint = self.maintain_insert_slab(collection, start, built_ref);
-                let direct = if task
-                    .state
-                    .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-                {
-                    let mut buf = task
-                        .buf_slot
-                        .lock()
-                        .ok()
-                        .and_then(|mut g| g.take())
-                        .unwrap_or_default();
+            let (direct_res, maint_res) = crate::work_steal::steal2(
+                crate::work_steal::StealLane::DirectEnc,
+                move || {
                     let res = crate::persist::with_dictionary_writer_opt(wal_dict, || {
                         crate::persist::encode_insert_rows_direct_ext(
                             generation,
@@ -1459,44 +1325,13 @@ impl Db {
                             collection,
                             built_ref,
                             uniform_keys,
-                            &mut buf,
+                            &mut encode_buf,
                         )
                     });
-                    (res, buf)
-                } else {
-                    for _ in 0..64 {
-                        if task.done.load(Ordering::Acquire) {
-                            break;
-                        }
-                        std::hint::spin_loop();
-                    }
-                    while !task.done.load(Ordering::Acquire) {
-                        std::thread::park_timeout(std::time::Duration::from_micros(50));
-                    }
-                    if task.panicked.load(Ordering::Acquire) {
-                        panic!("direct encode worker panicked");
-                    }
-                    task.res_slot
-                        .lock()
-                        .ok()
-                        .and_then(|mut g| g.take())
-                        .unwrap_or((None, Vec::new()))
-                };
-                (maint, direct)
-            } else {
-                let maint = self.maintain_insert_slab(collection, start, built_ref);
-                let res = crate::persist::with_dictionary_writer_opt(wal_dict, || {
-                    crate::persist::encode_insert_rows_direct_ext(
-                        generation,
-                        next_id,
-                        collection,
-                        built_ref,
-                        uniform_keys,
-                        &mut encode_buf,
-                    )
-                });
-                (maint, (res, encode_buf))
-            };
+                    (res, encode_buf)
+                },
+                || self.maintain_insert_slab(collection, start, built_ref),
+            );
             if let Some(p) = self.persist.as_mut() {
                 p.encode_buf = direct_res.1;
             }
@@ -1645,12 +1480,7 @@ impl Db {
         // The embedding is computed from title / body / snippet: when one of them changes
         // and the statement does not set the embedding itself, compute it again, as an
         // insert would, instead of keeping the vector of the old text.
-        let reembed = self.embedder.is_some()
-            && record
-                .fields
-                .iter()
-                .any(|(k, _)| matches!(k.as_str(), "title" | "body" | "snippet"))
-            && !record.fields.iter().any(|(k, _)| k == "embedding");
+        let reembed = self.update_needs_reembed(&record.fields);
         let has_fks = self.catalog.fks.iter().any(|fk| fk.from_col == collection);
         let affected = idxs.len();
         let need_materialized = ctx.want_rows || durable || ctx.track_written;
@@ -1663,31 +1493,16 @@ impl Db {
         for i in idxs {
             let before = self.store.collection(collection)[i].clone();
             if has_guards {
-                for (k, _) in &record.fields {
-                    for g in &self.catalog.guards {
-                        if g.collection == collection
-                            && &g.field == k
-                            && eval_pred(&g.pred, &before, now)
-                        {
-                            return Err(Error::runtime(format!(
-                                "immutable field: {collection}.{k}"
-                            )));
-                        }
-                    }
-                }
+                self.check_row_update_guards(collection, &before, &record.fields, now)?;
             }
-            let mut updated = before.clone();
-            for (k, v) in &record.fields {
-                updated.insert(k.clone(), value_cell(v, now));
-            }
-            if has_body && let Some(body) = row_text(&updated, "body") {
-                let h = content_hash_inline(body);
-                updated.insert("hash", Cell::SmallText(h));
-            }
-            if reembed {
-                updated.remove("embedding");
-                self.maybe_embed_rows(collection, std::slice::from_mut(&mut updated))?;
-            }
+            let updated = self.patch_updated_row(
+                collection,
+                before.clone(),
+                &record.fields,
+                now,
+                has_body,
+                reembed,
+            )?;
             if has_fks {
                 self.check_row_fks(collection, &updated)?;
             }
@@ -2801,4 +2616,55 @@ pub(crate) fn record_row(record: &Record, now: i64) -> Row {
         row.insert(k.clone(), value_cell(v, now));
     }
     row
+}
+
+impl Db {
+    #[inline]
+    pub(crate) fn update_needs_reembed(&self, fields: &[(String, Value)]) -> bool {
+        self.embedder.is_some()
+            && fields
+                .iter()
+                .any(|(k, _)| matches!(k.as_str(), "title" | "body" | "snippet"))
+            && !fields.iter().any(|(k, _)| k == "embedding")
+    }
+
+    pub(crate) fn check_row_update_guards(
+        &self,
+        collection: &str,
+        before: &Row,
+        fields: &[(String, Value)],
+        now: i64,
+    ) -> Result<(), Error> {
+        for (k, _) in fields {
+            for g in &self.catalog.guards {
+                if g.collection == collection && &g.field == k && eval_pred(&g.pred, before, now) {
+                    return Err(Error::runtime(format!("immutable field: {collection}.{k}")));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn patch_updated_row(
+        &self,
+        collection: &str,
+        mut updated: Row,
+        fields: &[(String, Value)],
+        now: i64,
+        has_body: bool,
+        reembed: bool,
+    ) -> Result<Row, Error> {
+        for (k, v) in fields {
+            updated.insert(k.as_str(), value_cell(v, now));
+        }
+        if has_body && let Some(body) = row_text(&updated, "body") {
+            let h = content_hash_inline(body);
+            updated.insert("hash", Cell::SmallText(h));
+        }
+        if reembed {
+            updated.remove("embedding");
+            self.maybe_embed_rows(collection, std::slice::from_mut(&mut updated))?;
+        }
+        Ok(updated)
+    }
 }
