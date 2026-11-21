@@ -1,12 +1,16 @@
 //! Horizontal sharding, Jump Consistent Hash routing, predicate shard pruning,
 //! columnar `insert_batch` scattering, and two-phase distributed Kusto query execution.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
+
+use smallvec::SmallVec;
 
 use crate::ast::{
     AggFunc, AggSpec, BinStep, CmpOp, Decl, EdgeTarget, GroupExpr, GroupKey, MatchHop, Pred,
@@ -116,47 +120,6 @@ pub fn shard_hash_cell(cell: &Cell) -> u64 {
     }
 }
 
-/// Zero-allocation canonical 64-bit hash for `col[row_idx]` without cloning `Cell` or `Arc<str>`.
-#[inline]
-fn shard_hash_col_row(col: &Column, row_idx: usize) -> u64 {
-    match col {
-        Column::Nulls { .. } => hash_bytes_tagged(6, &[]),
-        Column::Int { vals, valid } => {
-            if valid.is_valid(row_idx) {
-                hash_i64(vals[row_idx])
-            } else {
-                hash_bytes_tagged(6, &[])
-            }
-        }
-        Column::Time { vals, valid } => {
-            if valid.is_valid(row_idx) {
-                hash_u64_tagged(3, vals[row_idx] as u64)
-            } else {
-                hash_bytes_tagged(6, &[])
-            }
-        }
-        Column::Float { vals, valid } => {
-            if valid.is_valid(row_idx) {
-                hash_f64_canonical(vals[row_idx])
-            } else {
-                hash_bytes_tagged(6, &[])
-            }
-        }
-        Column::Bool { vals, valid } => {
-            if valid.is_valid(row_idx) {
-                hash_u64_tagged(4, u64::from(vals[row_idx]))
-            } else {
-                hash_bytes_tagged(6, &[])
-            }
-        }
-        Column::Text { .. } | Column::Dict { .. } => match col.text_at(row_idx) {
-            Some(s) => hash_bytes_tagged(5, s.as_bytes()),
-            None => hash_bytes_tagged(6, &[]),
-        },
-        Column::Cells(cells) => shard_hash_cell(&cells[row_idx]),
-    }
-}
-
 /// Deterministic canonical 64-bit hash for an AST [`Value`] literal (`None` for dynamic `now`/`$param`).
 pub fn shard_hash_value(val: &Value) -> Option<u64> {
     match val {
@@ -228,6 +191,43 @@ impl ShardConfig {
 // Predicate shard pruning
 // =========================================================================
 
+fn prune_mask(pred: &Pred, shard_key: &str, num_shards: usize, strategy: ShardStrategy) -> Option<u64> {
+    match pred {
+        Pred::Cmp {
+            field,
+            op: CmpOp::Eq,
+            value,
+        } if field.as_str() == shard_key => {
+            shard_hash_value(value).map(|h| 1u64 << pick_shard(h, num_shards, strategy))
+        }
+        Pred::In { field, values } if field.as_str() == shard_key => {
+            let mut mask = 0u64;
+            for v in values {
+                let h = shard_hash_value(v)?;
+                mask |= 1u64 << pick_shard(h, num_shards, strategy);
+            }
+            Some(mask)
+        }
+        Pred::And(a, b) => match (
+            prune_mask(a, shard_key, num_shards, strategy),
+            prune_mask(b, shard_key, num_shards, strategy),
+        ) {
+            (Some(ma), Some(mb)) => Some(ma & mb),
+            (Some(ma), None) => Some(ma),
+            (None, Some(mb)) => Some(mb),
+            (None, None) => None,
+        },
+        Pred::Or(a, b) => match (
+            prune_mask(a, shard_key, num_shards, strategy),
+            prune_mask(b, shard_key, num_shards, strategy),
+        ) {
+            (Some(ma), Some(mb)) => Some(ma | mb),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn prune_set(pred: &Pred, shard_key: &str, num_shards: usize, strategy: ShardStrategy) -> Option<BTreeSet<usize>> {
     match pred {
         Pred::Cmp {
@@ -280,6 +280,20 @@ fn target_shards_for_pred(
     let Some(p) = pred else {
         return (0..num_shards).collect();
     };
+    if num_shards <= 64 {
+        return match prune_mask(p, key, num_shards, strategy) {
+            Some(mut m) => {
+                let mut out = Vec::with_capacity(m.count_ones() as usize);
+                while m != 0 {
+                    let s = m.trailing_zeros() as usize;
+                    out.push(s);
+                    m &= m - 1;
+                }
+                out
+            }
+            None => (0..num_shards).collect(),
+        };
+    }
     match prune_set(p, key, num_shards, strategy) {
         Some(set) => set.into_iter().collect(),
         None => (0..num_shards).collect(),
@@ -287,203 +301,265 @@ fn target_shards_for_pred(
 }
 
 // =========================================================================
-// Lossless AST -> LinQL formatter (no truncation, float `.0` preserved)
+// Lossless AST -> LinQL formatter (single-String buffer, float `.0` preserved)
 // =========================================================================
 
-fn fmt_float_literal(n: f64) -> String {
-    if n.is_nan() {
-        return "0.0".to_string();
+fn write_float_literal(out: &mut String, n: f64) {
+    if n.is_nan() || n == 0.0 {
+        out.push_str("0.0");
+        return;
     }
-    if n == 0.0 {
-        return "0.0".to_string();
-    }
-    let s = format!("{n}");
-    if s.contains('.') || s.contains('e') || s.contains('E') {
-        s
-    } else {
-        format!("{s}.0")
+    let start = out.len();
+    let _ = write!(out, "{n}");
+    if !out[start..]
+        .bytes()
+        .any(|b| b == b'.' || b == b'e' || b == b'E')
+    {
+        out.push_str(".0");
     }
 }
 
-fn fmt_value(v: &Value) -> String {
+fn write_value(out: &mut String, v: &Value) {
     match v {
-        Value::String(s) => format!("{s:?}"),
-        Value::Int(n) => format!("{n}"),
-        Value::Float(n) => fmt_float_literal(*n),
-        Value::Bool(b) => format!("{b}"),
-        Value::Timestamp(ms) => format!("timestamp({ms})"),
-        Value::Now => "now".to_string(),
-        Value::NowMinus(d) => format!("now - {d}"),
-        Value::Duration(d) => format!("{d}"),
-        Value::Name(n) => n.clone(),
-        Value::Param(p) => format!("${p}"),
+        Value::String(s) => {
+            let _ = write!(out, "{s:?}");
+        }
+        Value::Int(n) => {
+            let _ = write!(out, "{n}");
+        }
+        Value::Float(n) => write_float_literal(out, *n),
+        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        Value::Timestamp(ms) => {
+            let _ = write!(out, "timestamp({ms})");
+        }
+        Value::Now => out.push_str("now"),
+        Value::NowMinus(d) => {
+            let _ = write!(out, "now - {d}");
+        }
+        Value::Duration(d) => {
+            let _ = write!(out, "{d}");
+        }
+        Value::Name(n) => out.push_str(n),
+        Value::Param(p) => {
+            out.push('$');
+            out.push_str(p);
+        }
     }
 }
 
-fn fmt_pred(pred: &Pred) -> String {
+fn write_pred(out: &mut String, pred: &Pred) {
     match pred {
         Pred::And(a, b) => {
-            let sa = if matches!(**a, Pred::Or(..)) {
-                format!("({})", fmt_pred(a))
+            if matches!(**a, Pred::Or(..)) {
+                out.push('(');
+                write_pred(out, a);
+                out.push(')');
             } else {
-                fmt_pred(a)
-            };
-            let sb = if matches!(**b, Pred::Or(..)) {
-                format!("({})", fmt_pred(b))
+                write_pred(out, a);
+            }
+            out.push_str(" and ");
+            if matches!(**b, Pred::Or(..)) {
+                out.push('(');
+                write_pred(out, b);
+                out.push(')');
             } else {
-                fmt_pred(b)
-            };
-            format!("{sa} and {sb}")
+                write_pred(out, b);
+            }
         }
-        Pred::Or(a, b) => format!("{} or {}", fmt_pred(a), fmt_pred(b)),
-        Pred::Not(inner) => format!("not ({})", fmt_pred(inner)),
+        Pred::Or(a, b) => {
+            write_pred(out, a);
+            out.push_str(" or ");
+            write_pred(out, b);
+        }
+        Pred::Not(inner) => {
+            out.push_str("not (");
+            write_pred(out, inner);
+            out.push(')');
+        }
         Pred::Cmp { field, op, value } => {
-            format!("{field} {} {}", op.as_str(), fmt_value(value))
+            let _ = write!(out, "{field} {} ", op.as_str());
+            write_value(out, value);
         }
         Pred::IsNull { field, negated } => {
             if *negated {
-                format!("{field} is not null")
+                let _ = write!(out, "{field} is not null");
             } else {
-                format!("{field} is null")
+                let _ = write!(out, "{field} is null");
             }
         }
         Pred::In { field, values } => {
-            let mut out = format!("{field} in [");
+            let _ = write!(out, "{field} in [");
             for (i, v) in values.iter().enumerate() {
                 if i > 0 {
                     out.push_str(", ");
                 }
-                out.push_str(&fmt_value(v));
+                write_value(out, v);
             }
             out.push(']');
-            out
         }
         Pred::Has { field, ci, needle } => {
             if *ci {
-                format!("{field} has ci {needle:?}")
+                let _ = write!(out, "{field} has ci {needle:?}");
             } else {
-                format!("{field} has {needle:?}")
+                let _ = write!(out, "{field} has {needle:?}");
             }
         }
-        Pred::Contains { field, needle } => format!("{field} ~ {needle:?}"),
+        Pred::Contains { field, needle } => {
+            let _ = write!(out, "{field} ~ {needle:?}");
+        }
         Pred::Regex {
             field,
             pattern,
             flags,
-        } => format!("{field} ~ /{pattern}/{flags}"),
+        } => {
+            let _ = write!(out, "{field} ~ /{pattern}/{flags}");
+        }
     }
 }
 
-fn fmt_record(rec: &Record) -> String {
-    let mut out = String::from("{ ");
+fn write_record(out: &mut String, rec: &Record) {
+    out.push_str("{ ");
     for (i, (k, v)) in rec.fields.iter().enumerate() {
         if i > 0 {
             out.push_str(", ");
         }
         out.push_str(k);
         out.push_str(": ");
-        out.push_str(&fmt_value(v));
+        write_value(out, v);
     }
     out.push_str(" }");
-    out
 }
 
-fn fmt_bin_step(step: &BinStep) -> String {
+fn write_bin_step(out: &mut String, step: &BinStep) {
     match step {
         BinStep::Duration(ms) => {
             if *ms % 86_400_000 == 0 && *ms >= 86_400_000 {
-                format!("{}d", ms / 86_400_000)
+                let _ = write!(out, "{}d", ms / 86_400_000);
             } else if *ms % 3_600_000 == 0 && *ms >= 3_600_000 {
-                format!("{}h", ms / 3_600_000)
+                let _ = write!(out, "{}h", ms / 3_600_000);
             } else if *ms % 60_000 == 0 && *ms >= 60_000 {
-                format!("{}m", ms / 60_000)
+                let _ = write!(out, "{}m", ms / 60_000);
             } else if *ms % 1_000 == 0 && *ms >= 1_000 {
-                format!("{}s", ms / 1_000)
+                let _ = write!(out, "{}s", ms / 1_000);
             } else {
-                format!("{ms}")
+                let _ = write!(out, "{ms}");
             }
         }
-        BinStep::Int(n) => format!("{n}"),
-        BinStep::Float(f) => fmt_float_literal(*f),
+        BinStep::Int(n) => {
+            let _ = write!(out, "{n}");
+        }
+        BinStep::Float(f) => write_float_literal(out, *f),
     }
 }
 
-fn fmt_group_key(gk: &GroupKey) -> String {
+fn write_group_key(out: &mut String, gk: &GroupKey) {
     match &gk.expr {
         GroupExpr::Field(f) => {
             if gk.alias == f.as_str() {
-                format!("{f}")
+                let _ = write!(out, "{f}");
             } else {
-                format!("{}: {f}", gk.alias)
+                let _ = write!(out, "{}: {f}", gk.alias);
             }
         }
         GroupExpr::Bin { field, step } => {
-            format!("{}: bin({field}, {})", gk.alias, fmt_bin_step(step))
+            let _ = write!(out, "{}: bin({field}, ", gk.alias);
+            write_bin_step(out, step);
+            out.push(')');
         }
     }
 }
 
-fn fmt_agg_spec(spec: &AggSpec) -> String {
-    let body = match &spec.func {
-        AggFunc::Count => "count()".to_string(),
-        AggFunc::Sum(f) => format!("sum({f})"),
-        AggFunc::Avg(f) => format!("avg({f})"),
-        AggFunc::Min(f) => format!("min({f})"),
-        AggFunc::Max(f) => format!("max({f})"),
-        AggFunc::DCount(f) => format!("dcount({f})"),
+fn write_agg_spec(out: &mut String, spec: &AggSpec) {
+    out.push_str(&spec.alias);
+    out.push_str(": ");
+    match &spec.func {
+        AggFunc::Count => out.push_str("count()"),
+        AggFunc::Sum(f) => {
+            let _ = write!(out, "sum({f})");
+        }
+        AggFunc::Avg(f) => {
+            let _ = write!(out, "avg({f})");
+        }
+        AggFunc::Min(f) => {
+            let _ = write!(out, "min({f})");
+        }
+        AggFunc::Max(f) => {
+            let _ = write!(out, "max({f})");
+        }
+        AggFunc::DCount(f) => {
+            let _ = write!(out, "dcount({f})");
+        }
         AggFunc::Percentile { field, pct } => {
-            format!("percentile({field}, {})", fmt_float_literal(*pct))
+            let _ = write!(out, "percentile({field}, ");
+            write_float_literal(out, *pct);
+            out.push(')');
         }
-        AggFunc::ArgMax { order, value } => format!("arg_max({order}, {value})"),
-        AggFunc::ArgMin { order, value } => format!("arg_min({order}, {value})"),
-    };
-    format!("{}: {body}", spec.alias)
+        AggFunc::ArgMax { order, value } => {
+            let _ = write!(out, "arg_max({order}, {value})");
+        }
+        AggFunc::ArgMin { order, value } => {
+            let _ = write!(out, "arg_min({order}, {value})");
+        }
+    }
 }
 
-fn fmt_by_list(by: &[GroupKey]) -> String {
+fn write_by_list(out: &mut String, by: &[GroupKey]) {
     if by.is_empty() {
-        return String::new();
+        return;
     }
-    let mut out = String::from(" by [");
+    out.push_str(" by [");
     for (i, g) in by.iter().enumerate() {
         if i > 0 {
             out.push_str(", ");
         }
-        out.push_str(&fmt_group_key(g));
+        write_group_key(out, g);
     }
     out.push(']');
-    out
 }
 
-fn fmt_hop(h: &MatchHop) -> String {
-    let edge = h
-        .edge
-        .as_deref()
-        .map_or_else(|| h.rel.clone(), |e| format!("{e}:{}", h.rel));
-    let depth = if h.min_depth == 1 && h.max_depth == 1 {
-        String::new()
-    } else if h.min_depth == h.max_depth {
-        format!("*{}", h.min_depth)
-    } else {
-        format!("*{}..{}", h.min_depth, h.max_depth)
-    };
-    if h.reverse {
-        format!("<-[{edge}{depth}]- {}", h.bind)
-    } else {
-        format!("-[{edge}{depth}]-> {}", h.bind)
+fn write_hop(out: &mut String, h: &MatchHop) {
+    out.push_str(if h.reverse { "<-[" } else { "-[" });
+    if let Some(e) = h.edge.as_deref() {
+        out.push_str(e);
+        out.push(':');
     }
+    out.push_str(&h.rel);
+    if !(h.min_depth == 1 && h.max_depth == 1) {
+        if h.min_depth == h.max_depth {
+            let _ = write!(out, "*{}", h.min_depth);
+        } else {
+            let _ = write!(out, "*{}..{}", h.min_depth, h.max_depth);
+        }
+    }
+    out.push_str(if h.reverse { "]- " } else { "]-> " });
+    out.push_str(&h.bind);
 }
 
-fn fmt_step(step: &Step) -> String {
+fn write_step(out: &mut String, step: &Step) {
     match step {
-        Step::Filter(p) => format!("where {}", fmt_pred(p)),
+        Step::Filter(p) => {
+            out.push_str("where ");
+            write_pred(out, p);
+        }
         Step::Project(fields) => {
-            let list: Vec<String> = fields.iter().map(ToString::to_string).collect();
-            format!("pick {{ {} }}", list.join(", "))
+            out.push_str("pick { ");
+            for (i, f) in fields.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                let _ = write!(out, "{f}");
+            }
+            out.push_str(" }");
         }
         Step::Without(fields) => {
-            let list: Vec<String> = fields.iter().map(ToString::to_string).collect();
-            format!("without {{ {} }}", list.join(", "))
+            out.push_str("without { ");
+            for (i, f) in fields.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                let _ = write!(out, "{f}");
+            }
+            out.push_str(" }");
         }
         Step::Join {
             left,
@@ -491,21 +567,29 @@ fn fmt_step(step: &Step) -> String {
             on,
         } => {
             if *left {
-                format!("join left {collection} on {on}")
+                let _ = write!(out, "join left {collection} on {on}");
             } else {
-                format!("join {collection} on {on}")
+                let _ = write!(out, "join {collection} on {on}");
             }
         }
         Step::Hop { rel, depth } => match depth {
-            Some(d) => format!("hop {rel} depth={d}"),
-            None => format!("hop {rel}"),
+            Some(d) => {
+                let _ = write!(out, "hop {rel} depth={d}");
+            }
+            None => {
+                let _ = write!(out, "hop {rel}");
+            }
         },
         Step::Graph { rel, depth } => match depth {
-            Some(d) => format!("graph {rel} depth={d}"),
-            None => format!("graph {rel}"),
+            Some(d) => {
+                let _ = write!(out, "graph {rel} depth={d}");
+            }
+            None => {
+                let _ = write!(out, "graph {rel}");
+            }
         },
         Step::Match { start, hops } => {
-            let mut out = String::from("match ");
+            out.push_str("match ");
             if let Some(s) = start {
                 out.push_str(s);
                 out.push(' ');
@@ -514,49 +598,77 @@ fn fmt_step(step: &Step) -> String {
                 if i > 0 {
                     out.push(' ');
                 }
-                out.push_str(&fmt_hop(h));
+                write_hop(out, h);
             }
-            out
         }
         Step::Search { mode, query } => match mode {
-            SearchMode::Hybrid => format!("search {query:?}"),
-            SearchMode::Lex => format!("search lex {query:?}"),
-            SearchMode::Vec => format!("search vec {query:?}"),
+            SearchMode::Hybrid => {
+                let _ = write!(out, "search {query:?}");
+            }
+            SearchMode::Lex => {
+                let _ = write!(out, "search lex {query:?}");
+            }
+            SearchMode::Vec => {
+                let _ = write!(out, "search vec {query:?}");
+            }
         },
         Step::Count { by } => match by {
-            Some(f) => format!("count by {f}"),
-            None => "count".to_string(),
+            Some(f) => {
+                let _ = write!(out, "count by {f}");
+            }
+            None => out.push_str("count"),
         },
         Step::Sum { field, by } => match by {
-            Some(b) => format!("sum {field} by {b}"),
-            None => format!("sum {field}"),
+            Some(b) => {
+                let _ = write!(out, "sum {field} by {b}");
+            }
+            None => {
+                let _ = write!(out, "sum {field}");
+            }
         },
         Step::Min { field, by } => match by {
-            Some(b) => format!("min {field} by {b}"),
-            None => format!("min {field}"),
+            Some(b) => {
+                let _ = write!(out, "min {field} by {b}");
+            }
+            None => {
+                let _ = write!(out, "min {field}");
+            }
         },
         Step::Max { field, by } => match by {
-            Some(b) => format!("max {field} by {b}"),
-            None => format!("max {field}"),
+            Some(b) => {
+                let _ = write!(out, "max {field} by {b}");
+            }
+            None => {
+                let _ = write!(out, "max {field}");
+            }
         },
         Step::Avg { field, by } => match by {
-            Some(b) => format!("avg {field} by {b}"),
-            None => format!("avg {field}"),
+            Some(b) => {
+                let _ = write!(out, "avg {field} by {b}");
+            }
+            None => {
+                let _ = write!(out, "avg {field}");
+            }
         },
         Step::Summarize { specs, by } => {
-            let items: Vec<String> = specs.iter().map(fmt_agg_spec).collect();
-            format!("summarize {{ {} }}{}", items.join(", "), fmt_by_list(by))
+            out.push_str("summarize { ");
+            for (i, spec) in specs.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                write_agg_spec(out, spec);
+            }
+            out.push_str(" }");
+            write_by_list(out, by);
         }
         Step::ArgExtremum { is_max, order, by } => {
             let kw = if *is_max { "arg_max" } else { "arg_min" };
-            format!("{kw}({order}, *){}", fmt_by_list(by))
+            let _ = write!(out, "{kw}({order}, *)");
+            write_by_list(out, by);
         }
         Step::Sort { field, desc } => {
-            if *desc {
-                format!("sort {field} desc")
-            } else {
-                format!("sort {field} asc")
-            }
+            let dir = if *desc { "desc" } else { "asc" };
+            let _ = write!(out, "sort {field} {dir}");
         }
         Step::Window {
             func,
@@ -566,74 +678,92 @@ fn fmt_step(step: &Step) -> String {
             frame,
             as_field,
         } => {
-            let mut out = format!("window {func}");
+            let _ = write!(out, "window {func}");
             if let Some(f) = field {
-                out.push_str(&format!(" ({f})"));
+                let _ = write!(out, " ({f})");
             } else if matches!(func, crate::window::WindowFunction::Count) {
                 out.push_str(" (*)");
             }
             if !by.is_empty() {
-                let b: Vec<String> = by.iter().map(ToString::to_string).collect();
-                out.push_str(&format!(" by [{}]", b.join(", ")));
+                out.push_str(" by [");
+                for (i, b) in by.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    let _ = write!(out, "{b}");
+                }
+                out.push(']');
             }
             if !order.is_empty() {
-                let ord: Vec<String> = order
-                    .iter()
-                    .map(|o| {
-                        format!(
-                            "{} {}",
-                            o.field,
-                            if o.desc { "desc" } else { "asc" }
-                        )
-                    })
-                    .collect();
-                out.push_str(&format!(" sort [{}]", ord.join(", ")));
+                out.push_str(" sort [");
+                for (i, o) in order.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    let _ = write!(out, "{} {}", o.field, if o.desc { "desc" } else { "asc" });
+                }
+                out.push(']');
             }
             if let Some(fr) = frame {
-                out.push_str(&format!(" {fr}"));
+                let _ = write!(out, " {fr}");
             }
-            out.push_str(&format!(" as {as_field}"));
-            out
+            let _ = write!(out, " as {as_field}");
         }
-        Step::Skip { n } => format!("skip {n}"),
+        Step::Skip { n } => {
+            let _ = write!(out, "skip {n}");
+        }
         Step::Take { n } => match n {
-            Some(k) => format!("take {k}"),
-            None => "take all".to_string(),
+            Some(k) => {
+                let _ = write!(out, "take {k}");
+            }
+            None => out.push_str("take all"),
         },
-        Step::Union(rhs) => format!("union ({})", fmt_query(rhs)),
+        Step::Union(rhs) => {
+            out.push_str("union (");
+            write_query(out, rhs);
+            out.push(')');
+        }
     }
 }
 
-fn fmt_query(q: &Query) -> String {
-    let mut out = match &q.source {
-        Source::Collection(c) => c.clone(),
-        Source::Page(p) => format!("page {p:?}"),
-        Source::Catalog => "catalog".to_string(),
-    };
+fn write_query(out: &mut String, q: &Query) {
+    match &q.source {
+        Source::Collection(c) => out.push_str(c),
+        Source::Page(p) => {
+            let _ = write!(out, "page {p:?}");
+        }
+        Source::Catalog => out.push_str("catalog"),
+    }
     if q.ignore_filter {
         out.push_str(" all");
     }
     for s in &q.steps {
         out.push_str(" | ");
-        out.push_str(&fmt_step(s));
+        write_step(out, s);
     }
+}
+
+fn fmt_query(q: &Query) -> String {
+    let mut out = String::with_capacity(64 + q.steps.len() * 24);
+    write_query(&mut out, q);
     out
 }
 
-fn fmt_type_expr(t: &TypeExpr) -> String {
+fn write_type_expr(out: &mut String, t: &TypeExpr) {
     match t {
-        TypeExpr::Named(n) => n.clone(),
+        TypeExpr::Named(n) => out.push_str(n),
         TypeExpr::Vec { dim, model } => {
             if model.is_empty() {
-                format!("vec[{dim}]")
+                let _ = write!(out, "vec[{dim}]");
             } else {
-                format!("vec[{dim}, {model:?}]")
+                let _ = write!(out, "vec[{dim}, {model:?}]");
             }
         }
     }
 }
 
 fn fmt_decl(d: &Decl) -> String {
+    let mut out = String::with_capacity(64);
     match d {
         Decl::Col {
             name,
@@ -641,40 +771,53 @@ fn fmt_decl(d: &Decl) -> String {
             fields,
         } => {
             let kw = if *append { "append col" } else { "col" };
-            let cols: Vec<String> = fields
-                .iter()
-                .map(|(k, t)| format!("{k}: {}", fmt_type_expr(t)))
-                .collect();
-            format!("{kw} {name} {{ {} }}", cols.join(", "))
+            let _ = write!(out, "{kw} {name} {{ ");
+            for (i, (k, t)) in fields.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(k);
+                out.push_str(": ");
+                write_type_expr(&mut out, t);
+            }
+            out.push_str(" }");
         }
         Decl::Rel { name, stub } => {
             if *stub {
-                format!("rel stub {name}")
+                let _ = write!(out, "rel stub {name}");
             } else {
-                format!("rel {name}")
+                let _ = write!(out, "rel {name}");
             }
         }
-        Decl::RelReverse { name, of } => format!("rel {name} reverse {of}"),
+        Decl::RelReverse { name, of } => {
+            let _ = write!(out, "rel {name} reverse {of}");
+        }
         Decl::Fk {
             from_col,
             from_field,
             to_col,
             to_field,
-        } => format!("fk {from_col}.{from_field} -> {to_col}.{to_field}"),
+        } => {
+            let _ = write!(out, "fk {from_col}.{from_field} -> {to_col}.{to_field}");
+        }
         Decl::Guard {
             collection,
             field,
             pred,
-        } => format!("guard {collection}.{field} [{}]", fmt_pred(pred)),
+        } => {
+            let _ = write!(out, "guard {collection}.{field} [");
+            write_pred(&mut out, pred);
+            out.push(']');
+        }
         Decl::Filter {
             collection,
             pred: _,
             src,
         } => {
             if src.is_empty() {
-                format!("filter {collection} off")
+                let _ = write!(out, "filter {collection} off");
             } else {
-                format!("filter {collection} [{src}]")
+                let _ = write!(out, "filter {collection} [{src}]");
             }
         }
         Decl::Index {
@@ -684,34 +827,71 @@ fn fmt_decl(d: &Decl) -> String {
             pred,
         } => {
             let uniq = if *unique { "unique " } else { "" };
-            let p = pred
-                .as_ref()
-                .map_or_else(String::new, |p| format!(" where {}", fmt_pred(p)));
-            format!("index {uniq}{collection} [{}]{p}", fields.join(", "))
+            let _ = write!(out, "index {uniq}{collection} [");
+            for (i, f) in fields.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(f);
+            }
+            out.push(']');
+            if let Some(p) = pred {
+                out.push_str(" where ");
+                write_pred(&mut out, p);
+            }
         }
         Decl::Owned { name, fields } => {
-            let cols: Vec<String> = fields
-                .iter()
-                .map(|(k, t)| format!("{k}: {}", fmt_type_expr(t)))
-                .collect();
-            format!("owned {name} {{ {} }}", cols.join(", "))
+            let _ = write!(out, "owned {name} {{ ");
+            for (i, (k, t)) in fields.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(k);
+                out.push_str(": ");
+                write_type_expr(&mut out, t);
+            }
+            out.push_str(" }");
         }
     }
+    out
 }
 
-fn fmt_cas(cas: Option<&str>, cas_each: bool) -> String {
+fn write_cas(out: &mut String, cas: Option<&str>, cas_each: bool) {
     if cas_each {
-        " cas each".to_string()
+        out.push_str(" cas each");
     } else if let Some(c) = cas {
-        format!(" cas {c:?}")
-    } else {
-        String::new()
+        let _ = write!(out, " cas {c:?}");
     }
 }
 
 fn fmt_insert(collection: &str, records: &[Record]) -> String {
-    let items: Vec<String> = records.iter().map(fmt_record).collect();
-    format!("insert {collection} [{}]", items.join(", "))
+    let mut out = String::with_capacity(16 + collection.len() + records.len() * 32);
+    out.push_str("insert ");
+    out.push_str(collection);
+    out.push_str(" [");
+    for (i, rec) in records.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        write_record(&mut out, rec);
+    }
+    out.push(']');
+    out
+}
+
+fn fmt_insert_cow(collection: &str, records: &[Cow<'_, Record>]) -> String {
+    let mut out = String::with_capacity(16 + collection.len() + records.len() * 32);
+    out.push_str("insert ");
+    out.push_str(collection);
+    out.push_str(" [");
+    for (i, rec) in records.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        write_record(&mut out, rec.as_ref());
+    }
+    out.push(']');
+    out
 }
 
 fn fmt_update(
@@ -721,21 +901,29 @@ fn fmt_update(
     cas_each: bool,
     record: &Record,
 ) -> String {
-    let p = pred
-        .map_or_else(String::new, |p| format!(" [{}]", fmt_pred(p)));
-    format!(
-        "update {collection}{p}{} {}",
-        fmt_cas(cas, cas_each),
-        fmt_record(record)
-    )
+    let mut out = String::with_capacity(48 + collection.len() + record.fields.len() * 24);
+    out.push_str("update ");
+    out.push_str(collection);
+    if let Some(p) = pred {
+        out.push_str(" [");
+        write_pred(&mut out, p);
+        out.push(']');
+    }
+    write_cas(&mut out, cas, cas_each);
+    out.push(' ');
+    write_record(&mut out, record);
+    out
 }
 
 fn fmt_delete(collection: &str, pred: &Pred, cas: Option<&str>, cas_each: bool) -> String {
-    format!(
-        "delete {collection} [{}]{}",
-        fmt_pred(pred),
-        fmt_cas(cas, cas_each)
-    )
+    let mut out = String::with_capacity(32 + collection.len());
+    out.push_str("delete ");
+    out.push_str(collection);
+    out.push_str(" [");
+    write_pred(&mut out, pred);
+    out.push(']');
+    write_cas(&mut out, cas, cas_each);
+    out
 }
 
 // =========================================================================
@@ -844,10 +1032,166 @@ impl ShardRouter {
             Some(cidx) => {
                 let col = &batch.cols[cidx];
                 let strategy = self.config.strategy;
-                for row_idx in 0..n {
-                    let h = shard_hash_col_row(col, row_idx);
-                    let shard = pick_shard(h, num_shards, strategy);
-                    per_shard[shard].push(row_idx as u32);
+                let null_shard = pick_shard(hash_bytes_tagged(6, &[]), num_shards, strategy);
+                match col {
+                    Column::Nulls { .. } => {
+                        let r = self.shards[null_shard].insert_batch(collection, batch)?;
+                        let elapsed_us =
+                            u64::try_from(t0.elapsed().as_micros()).unwrap_or(u64::MAX);
+                        return Ok((
+                            ExecutionReceipt {
+                                r#gen: r.r#gen,
+                                affected: r.affected,
+                                elapsed_us,
+                                group_size: r.group_size,
+                                batch: None,
+                                message: None,
+                            },
+                            ClusterStats {
+                                shards_queried: 1,
+                                total_shards: num_shards,
+                                max_gen: r.r#gen,
+                                elapsed_us,
+                            },
+                        ));
+                    }
+                    Column::Int { vals, valid } => {
+                        if valid.null_count() == 0 {
+                            for (row_idx, &v) in vals.iter().enumerate() {
+                                per_shard[pick_shard(hash_i64(v), num_shards, strategy)]
+                                    .push(row_idx as u32);
+                            }
+                        } else {
+                            for (row_idx, &v) in vals.iter().enumerate() {
+                                let s = if valid.is_valid(row_idx) {
+                                    pick_shard(hash_i64(v), num_shards, strategy)
+                                } else {
+                                    null_shard
+                                };
+                                per_shard[s].push(row_idx as u32);
+                            }
+                        }
+                    }
+                    Column::Time { vals, valid } => {
+                        if valid.null_count() == 0 {
+                            for (row_idx, &v) in vals.iter().enumerate() {
+                                per_shard
+                                    [pick_shard(hash_u64_tagged(3, v as u64), num_shards, strategy)]
+                                    .push(row_idx as u32);
+                            }
+                        } else {
+                            for (row_idx, &v) in vals.iter().enumerate() {
+                                let s = if valid.is_valid(row_idx) {
+                                    pick_shard(hash_u64_tagged(3, v as u64), num_shards, strategy)
+                                } else {
+                                    null_shard
+                                };
+                                per_shard[s].push(row_idx as u32);
+                            }
+                        }
+                    }
+                    Column::Float { vals, valid } => {
+                        if valid.null_count() == 0 {
+                            for (row_idx, &v) in vals.iter().enumerate() {
+                                per_shard[pick_shard(hash_f64_canonical(v), num_shards, strategy)]
+                                    .push(row_idx as u32);
+                            }
+                        } else {
+                            for (row_idx, &v) in vals.iter().enumerate() {
+                                let s = if valid.is_valid(row_idx) {
+                                    pick_shard(hash_f64_canonical(v), num_shards, strategy)
+                                } else {
+                                    null_shard
+                                };
+                                per_shard[s].push(row_idx as u32);
+                            }
+                        }
+                    }
+                    Column::Bool { vals, valid } => {
+                        let bool_shards = [
+                            pick_shard(hash_u64_tagged(4, 0), num_shards, strategy),
+                            pick_shard(hash_u64_tagged(4, 1), num_shards, strategy),
+                        ];
+                        if valid.null_count() == 0 {
+                            for (row_idx, &b) in vals.iter().enumerate() {
+                                per_shard[bool_shards[usize::from(b)]].push(row_idx as u32);
+                            }
+                        } else {
+                            for (row_idx, &b) in vals.iter().enumerate() {
+                                let s = if valid.is_valid(row_idx) {
+                                    bool_shards[usize::from(b)]
+                                } else {
+                                    null_shard
+                                };
+                                per_shard[s].push(row_idx as u32);
+                            }
+                        }
+                    }
+                    Column::Text {
+                        offsets,
+                        data,
+                        valid,
+                    } => {
+                        if valid.null_count() == 0 {
+                            for row_idx in 0..n {
+                                let start = offsets[row_idx] as usize;
+                                let end = offsets[row_idx + 1] as usize;
+                                let s = pick_shard(
+                                    hash_bytes_tagged(5, &data[start..end]),
+                                    num_shards,
+                                    strategy,
+                                );
+                                per_shard[s].push(row_idx as u32);
+                            }
+                        } else {
+                            for row_idx in 0..n {
+                                let s = if valid.is_valid(row_idx) {
+                                    let start = offsets[row_idx] as usize;
+                                    let end = offsets[row_idx + 1] as usize;
+                                    pick_shard(
+                                        hash_bytes_tagged(5, &data[start..end]),
+                                        num_shards,
+                                        strategy,
+                                    )
+                                } else {
+                                    null_shard
+                                };
+                                per_shard[s].push(row_idx as u32);
+                            }
+                        }
+                    }
+                    Column::Dict {
+                        values,
+                        codes,
+                        valid,
+                    } => {
+                        let dict_shards: SmallVec<[usize; 32]> = values
+                            .iter()
+                            .map(|s| {
+                                pick_shard(hash_bytes_tagged(5, s.as_bytes()), num_shards, strategy)
+                            })
+                            .collect();
+                        if valid.null_count() == 0 {
+                            for (row_idx, &code) in codes.iter().enumerate() {
+                                per_shard[dict_shards[code as usize]].push(row_idx as u32);
+                            }
+                        } else {
+                            for (row_idx, &code) in codes.iter().enumerate() {
+                                let s = if valid.is_valid(row_idx) {
+                                    dict_shards[code as usize]
+                                } else {
+                                    null_shard
+                                };
+                                per_shard[s].push(row_idx as u32);
+                            }
+                        }
+                    }
+                    Column::Cells(cells) => {
+                        for (row_idx, cell) in cells.iter().enumerate() {
+                            let s = pick_shard(shard_hash_cell(cell), num_shards, strategy);
+                            per_shard[s].push(row_idx as u32);
+                        }
+                    }
                 }
             }
             None => {
@@ -864,26 +1208,55 @@ impl ShardRouter {
             .collect();
         let shards_queried = non_empty.len();
 
+        // Single target shard fast path: all `n` rows map to this shard in order `0..n`,
+        // so skip both `Column::gather` and `thread::scope`!
+        if let [(shard_idx, _)] = non_empty.as_slice() {
+            let r = self.shards[*shard_idx].insert_batch(collection, batch)?;
+            let elapsed_us = u64::try_from(t0.elapsed().as_micros()).unwrap_or(u64::MAX);
+            return Ok((
+                ExecutionReceipt {
+                    r#gen: r.r#gen,
+                    affected: r.affected,
+                    elapsed_us,
+                    group_size: r.group_size,
+                    batch: None,
+                    message: None,
+                },
+                ClusterStats {
+                    shards_queried: 1,
+                    total_shards: num_shards,
+                    max_gen: r.r#gen,
+                    elapsed_us,
+                },
+            ));
+        }
+
+        let send_sub_batch = |shard_idx: usize, idx: &[u32]| -> Result<ExecutionReceipt, Error> {
+            let cols: Vec<Column> = batch.cols.iter().map(|c| c.gather(idx)).collect();
+            let sub = RecordBatch {
+                names: Arc::clone(&batch.names),
+                cols,
+            };
+            self.shards[shard_idx].insert_batch(collection, &sub)
+        };
+
         let results: Vec<Result<ExecutionReceipt, Error>> = thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(shards_queried);
-            for (shard_idx, idx) in &non_empty {
-                let client = &self.shards[*shard_idx];
-                handles.push(scope.spawn(move || {
-                    let cols: Vec<Column> = batch.cols.iter().map(|c| c.gather(idx)).collect();
-                    let sub = RecordBatch {
-                        names: Arc::clone(&batch.names),
-                        cols,
-                    };
-                    client.insert_batch(collection, &sub)
-                }));
+            let (last, rest) = non_empty.split_last().unwrap();
+            let mut handles = Vec::with_capacity(rest.len());
+            for (shard_idx, idx) in rest {
+                let sidx = *shard_idx;
+                handles.push(scope.spawn(move || send_sub_batch(sidx, idx)));
             }
-            handles
+            let last_res = send_sub_batch(last.0, &last.1);
+            let mut out: Vec<Result<ExecutionReceipt, Error>> = handles
                 .into_iter()
                 .map(|h| {
                     h.join()
                         .unwrap_or_else(|_| Err(Error::runtime("shard insert_batch worker panicked")))
                 })
-                .collect()
+                .collect();
+            out.push(last_res);
+            out
         });
 
         let mut total_affected = 0usize;
@@ -1001,11 +1374,13 @@ impl ShardRouter {
                 if !edges.is_empty() {
                     let mut out = fmt_insert(collection, records);
                     for e in edges {
-                        let target = match &e.target {
-                            EdgeTarget::Page(p) => format!("{p:?}"),
-                            EdgeTarget::Value(v) => fmt_value(v),
-                        };
-                        out.push_str(&format!(" -> {} {target}", e.rel));
+                        let _ = write!(out, " -> {} ", e.rel);
+                        match &e.target {
+                            EdgeTarget::Page(p) => {
+                                let _ = write!(out, "{p:?}");
+                            }
+                            EdgeTarget::Value(v) => write_value(&mut out, v),
+                        }
                     }
                     return self.shards[0].execute(&out);
                 }
@@ -1074,10 +1449,10 @@ impl ShardRouter {
         }
     }
 
-    fn exec_sharded_insert(
+    fn exec_sharded_insert<'a>(
         &self,
         collection: &str,
-        records: &[Record],
+        records: &'a [Record],
     ) -> Result<ExecutionReceipt, Error> {
         if records.is_empty() {
             return Ok(ExecutionReceipt {
@@ -1091,14 +1466,15 @@ impl ShardRouter {
         }
         let shard_key = self.config.shard_key_for(collection);
         let num_shards = self.shards.len();
-        let mut buckets: Vec<Vec<Record>> = vec![Vec::new(); num_shards];
+        let est_cap = (records.len() / num_shards).saturating_add(4);
+        let mut buckets: Vec<Vec<Cow<'a, Record>>> =
+            (0..num_shards).map(|_| Vec::with_capacity(est_cap)).collect();
 
         for (idx, rec) in records.iter().enumerate() {
-            let mut rec_owned = rec.clone();
-            let shard = if let Some(sk) = shard_key {
-                if let Some((_, val)) = rec_owned.fields.iter().find(|(k, _)| k == sk) {
+            let (shard, item): (usize, Cow<'a, Record>) = if let Some(sk) = shard_key {
+                if let Some((_, val)) = rec.fields.iter().find(|(k, _)| k == sk) {
                     match shard_hash_value(val) {
-                        Some(h) => pick_shard(h, num_shards, self.config.strategy),
+                        Some(h) => (pick_shard(h, num_shards, self.config.strategy), Cow::Borrowed(rec)),
                         None => {
                             return Err(Error::runtime(format!(
                                 "shard key field {sk:?} must have literal value on insert"
@@ -1113,44 +1489,61 @@ impl ShardRouter {
                     );
                     let val = Value::String(Arc::from(gen_id));
                     let h = shard_hash_value(&val).unwrap_or(0);
+                    let mut rec_owned = rec.clone();
                     rec_owned.fields.push(("id".to_string(), val));
-                    pick_shard(h, num_shards, self.config.strategy)
+                    (
+                        pick_shard(h, num_shards, self.config.strategy),
+                        Cow::Owned(rec_owned),
+                    )
                 } else {
                     return Err(Error::runtime(format!(
                         "insert missing shard key field {sk:?} for collection {collection:?}"
                     )));
                 }
-            } else if let Some((_, val)) = rec_owned.fields.iter().find(|(k, _)| k == "id") {
-                match shard_hash_value(val) {
+            } else if let Some((_, val)) = rec.fields.iter().find(|(k, _)| k == "id") {
+                let s = match shard_hash_value(val) {
                     Some(h) => pick_shard(h, num_shards, self.config.strategy),
                     None => idx % num_shards,
-                }
+                };
+                (s, Cow::Borrowed(rec))
             } else {
-                idx % num_shards
+                (idx % num_shards, Cow::Borrowed(rec))
             };
-            buckets[shard].push(rec_owned);
+            buckets[shard].push(item);
         }
 
         let work: Vec<(usize, String)> = buckets
             .into_iter()
             .enumerate()
             .filter(|(_, recs)| !recs.is_empty())
-            .map(|(s, recs)| (s, fmt_insert(collection, &recs)))
+            .map(|(s, recs)| (s, fmt_insert_cow(collection, &recs)))
             .collect();
 
+        if let [(shard_idx, dsl)] = work.as_slice() {
+            let mut r = self.shards[*shard_idx].execute(dsl)?;
+            r.elapsed_us = 0;
+            r.batch = None;
+            r.message = None;
+            return Ok(r);
+        }
+
         let results: Vec<Result<ExecutionReceipt, Error>> = thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(work.len());
-            for (shard_idx, dsl) in &work {
+            let (last, rest) = work.split_last().unwrap();
+            let mut handles = Vec::with_capacity(rest.len());
+            for (shard_idx, dsl) in rest {
                 let client = &self.shards[*shard_idx];
                 handles.push(scope.spawn(move || client.execute(dsl)));
             }
-            handles
+            let last_res = self.shards[last.0].execute(&last.1);
+            let mut out: Vec<Result<ExecutionReceipt, Error>> = handles
                 .into_iter()
                 .map(|h| {
                     h.join()
                         .unwrap_or_else(|_| Err(Error::runtime("shard insert worker panicked")))
                 })
-                .collect()
+                .collect();
+            out.push(last_res);
+            out
         });
 
         let mut total_affected = 0usize;
@@ -1188,19 +1581,30 @@ impl ShardRouter {
                 message: None,
             });
         }
+        if let [only] = targets {
+            let mut r = self.shards[*only].execute(dsl)?;
+            r.elapsed_us = 0;
+            r.batch = None;
+            r.message = None;
+            return Ok(r);
+        }
         let results: Vec<Result<ExecutionReceipt, Error>> = thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(targets.len());
-            for &shard_idx in targets {
+            let (last, rest) = targets.split_last().unwrap();
+            let mut handles = Vec::with_capacity(rest.len());
+            for &shard_idx in rest {
                 let client = &self.shards[shard_idx];
                 handles.push(scope.spawn(move || client.execute(dsl)));
             }
-            handles
+            let last_res = self.shards[*last].execute(dsl);
+            let mut out: Vec<Result<ExecutionReceipt, Error>> = handles
                 .into_iter()
                 .map(|h| {
                     h.join()
                         .unwrap_or_else(|_| Err(Error::runtime("shard write worker panicked")))
                 })
-                .collect()
+                .collect();
+            out.push(last_res);
+            out
         });
 
         let mut total_affected = 0usize;
@@ -1223,9 +1627,196 @@ impl ShardRouter {
     }
 
     fn query_struct_with_stats(&self, q: &Query) -> Result<(RecordBatch, ClusterStats), Error> {
+        if let Some(res) = self.try_passthrough_batch_query(q)? {
+            return Ok(res);
+        }
         let (rows, stats, post_query) = self.exec_query_internal(q)?;
         let batch = rows_to_batch_for_query(&rows, &post_query);
         Ok((batch, stats))
+    }
+
+    /// Direct `RecordBatch` passthrough for Plan D queries when `post` is empty or only
+    /// `Step::Skip` / `Step::Take`, avoiding `RecordBatch -> Vec<Row> -> RecordBatch` round-trips.
+    fn try_passthrough_batch_query(
+        &self,
+        q: &Query,
+    ) -> Result<Option<(RecordBatch, ClusterStats)>, Error> {
+        let is_simple_pre_or_slice = q.steps.iter().all(|s| {
+            matches!(
+                s,
+                Step::Filter(_)
+                    | Step::Project(_)
+                    | Step::Without(_)
+                    | Step::Search { .. }
+                    | Step::Skip { .. }
+                    | Step::Take { .. }
+            )
+        });
+        if !is_simple_pre_or_slice {
+            return Ok(None);
+        }
+        let coord_idx = q
+            .steps
+            .iter()
+            .position(|s| matches!(s, Step::Skip { .. } | Step::Take { .. }))
+            .unwrap_or(q.steps.len());
+        let pre = &q.steps[..coord_idx];
+        let post = &q.steps[coord_idx..];
+        if !post
+            .iter()
+            .all(|s| matches!(s, Step::Skip { .. } | Step::Take { .. }))
+        {
+            return Ok(None);
+        }
+
+        let t0 = Instant::now();
+        let col_name = match &q.source {
+            Source::Collection(c) => Some(c.as_str()),
+            _ => None,
+        };
+        let shard_key = col_name.and_then(|c| self.config.shard_key_for(c));
+        let mut combined_leading_filter: Option<Pred> = None;
+        for step in &q.steps {
+            match step {
+                Step::Filter(p) => {
+                    combined_leading_filter = Some(match combined_leading_filter {
+                        Some(prev) => prev.and(p.clone()),
+                        None => p.clone(),
+                    });
+                }
+                _ => break,
+            }
+        }
+        let target_shards = target_shards_for_pred(
+            combined_leading_filter.as_ref(),
+            shard_key,
+            self.shards.len(),
+            self.config.strategy,
+        );
+
+        let has_explicit_take = post.iter().any(|s| matches!(s, Step::Take { .. }));
+        let mut total_skip: i64 = 0;
+        let mut take_limit: Option<i64> = None;
+        let mut pure_slice = !post.is_empty();
+        for s in post {
+            match s {
+                Step::Skip { n } if take_limit.is_none() => {
+                    total_skip = total_skip.saturating_add((*n).max(0));
+                }
+                Step::Take { n: Some(k) } => {
+                    take_limit = Some(match take_limit {
+                        Some(prev) => prev.min((*k).max(0)),
+                        None => (*k).max(0),
+                    });
+                }
+                _ => {
+                    pure_slice = false;
+                    break;
+                }
+            }
+        }
+
+        let shard_steps = if pure_slice {
+            let mut s = pre.to_vec();
+            if let Some(k) = take_limit {
+                s.push(Step::Take {
+                    n: Some(total_skip.saturating_add(k)),
+                });
+            } else if !has_explicit_take {
+                s.push(Step::Take {
+                    n: Some(total_skip.saturating_add(50)),
+                });
+            } else {
+                s.push(Step::Take { n: None });
+            }
+            s
+        } else if post.is_empty() && !has_explicit_take {
+            let mut s = pre.to_vec();
+            s.push(Step::Take { n: Some(50) });
+            s
+        } else {
+            let mut s = pre.to_vec();
+            s.push(Step::Take { n: None });
+            s
+        };
+
+        let shard_q = Query {
+            source: q.source.clone(),
+            steps: shard_steps,
+            explain: None,
+            ignore_filter: q.ignore_filter,
+        };
+
+        let (max_gen, batches) = if target_shards.is_empty() {
+            (self.max_shard_gen(), Vec::new())
+        } else {
+            self.fanout_query_batches(&target_shards, &fmt_query(&shard_q))?
+        };
+
+        let mut merged_batch = if batches.is_empty() {
+            rows_to_batch_for_query(&[], q)
+        } else {
+            let non_empty_count = batches.iter().filter(|b| !b.is_empty()).count();
+            if non_empty_count == 0 {
+                batches
+                    .into_iter()
+                    .find(|b| !b.names.is_empty())
+                    .unwrap_or_else(|| rows_to_batch_for_query(&[], q))
+            } else if non_empty_count == 1 {
+                batches.into_iter().find(|b| !b.is_empty()).unwrap()
+            } else {
+                let first_names = batches
+                    .iter()
+                    .find(|b| !b.is_empty())
+                    .map(|b| &b.names)
+                    .unwrap();
+                let uniform_schema = batches
+                    .iter()
+                    .filter(|b| !b.is_empty())
+                    .all(|b| b.names.as_ref() == first_names.as_ref());
+                if uniform_schema {
+                    let total_rows: usize = batches.iter().map(RecordBatch::n).sum();
+                    let mut iter = batches.into_iter().filter(|b| !b.is_empty());
+                    let mut base = iter.next().unwrap();
+                    base.reserve_cols(total_rows);
+                    for b in iter {
+                        for (dst, src) in base.cols.iter_mut().zip(b.cols) {
+                            dst.extend(src);
+                        }
+                    }
+                    base
+                } else {
+                    let mut rows = Vec::new();
+                    for b in batches {
+                        rows.extend(b.into_rows());
+                    }
+                    rows_to_batch_for_query(&rows, q)
+                }
+            }
+        };
+
+        for s in post {
+            match s {
+                Step::Skip { n } => merged_batch.drain_prefix((*n).max(0) as usize),
+                Step::Take { n: Some(k) } => merged_batch.truncate((*k).max(0) as usize),
+                Step::Take { n: None } => {}
+                _ => unreachable!(),
+            }
+        }
+        if !has_explicit_take && merged_batch.n() > 50 {
+            merged_batch.truncate(50);
+        }
+
+        let elapsed_us = u64::try_from(t0.elapsed().as_micros()).unwrap_or(u64::MAX);
+        Ok(Some((
+            merged_batch,
+            ClusterStats {
+                shards_queried: target_shards.len(),
+                total_shards: self.shards.len(),
+                max_gen,
+                elapsed_us,
+            },
+        )))
     }
 
     fn exec_query_internal(&self, q: &Query) -> Result<(Vec<Row>, ClusterStats, Query), Error> {
@@ -1677,19 +2268,27 @@ impl ShardRouter {
         dsl: &str,
     ) -> Result<(u64, Vec<Vec<u8>>), Error> {
         let consistency = self.config.client.consistency;
+        if let [only] = targets {
+            let (g, p) = self.shards[*only].partial_summarize(dsl, consistency)?;
+            return Ok((g, vec![p]));
+        }
         let results: Vec<Result<(u64, Vec<u8>), Error>> = thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(targets.len());
-            for &shard_idx in targets {
+            let (last, rest) = targets.split_last().unwrap();
+            let mut handles = Vec::with_capacity(rest.len());
+            for &shard_idx in rest {
                 let client = &self.shards[shard_idx];
                 handles.push(scope.spawn(move || client.partial_summarize(dsl, consistency)));
             }
-            handles
+            let last_res = self.shards[*last].partial_summarize(dsl, consistency);
+            let mut out: Vec<Result<(u64, Vec<u8>), Error>> = handles
                 .into_iter()
                 .map(|h| {
                     h.join()
                         .unwrap_or_else(|_| Err(Error::runtime("partial summarize worker panicked")))
                 })
-                .collect()
+                .collect();
+            out.push(last_res);
+            out
         });
 
         let mut max_gen = 0u64;
@@ -1702,33 +2301,55 @@ impl ShardRouter {
         Ok((max_gen, payloads))
     }
 
-    fn fanout_query_rows(
+    fn fanout_query_batches(
         &self,
         targets: &[usize],
         dsl: &str,
-    ) -> Result<(u64, Vec<Row>), Error> {
+    ) -> Result<(u64, Vec<RecordBatch>), Error> {
         let consistency = self.config.client.consistency;
+        if let [only] = targets {
+            let (batch, receipt) = self.shards[*only].query_with_consistency(dsl, consistency)?;
+            return Ok((receipt.r#gen, vec![batch]));
+        }
         let results: Vec<Result<(RecordBatch, ExecutionReceipt), Error>> = thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(targets.len());
-            for &shard_idx in targets {
+            let (last, rest) = targets.split_last().unwrap();
+            let mut handles = Vec::with_capacity(rest.len());
+            for &shard_idx in rest {
                 let client = &self.shards[shard_idx];
                 handles.push(scope.spawn(move || client.query_with_consistency(dsl, consistency)));
             }
-            handles
+            let last_res = self.shards[*last].query_with_consistency(dsl, consistency);
+            let mut out: Vec<Result<(RecordBatch, ExecutionReceipt), Error>> = handles
                 .into_iter()
                 .map(|h| {
                     h.join()
                         .unwrap_or_else(|_| Err(Error::runtime("shard query worker panicked")))
                 })
-                .collect()
+                .collect();
+            out.push(last_res);
+            out
         });
 
         let mut max_gen = 0u64;
-        let mut all_rows = Vec::new();
+        let mut batches = Vec::with_capacity(results.len());
         for res in results {
             let (batch, receipt) = res?;
             max_gen = max_gen.max(receipt.r#gen);
-            all_rows.extend(batch.to_rows());
+            batches.push(batch);
+        }
+        Ok((max_gen, batches))
+    }
+
+    fn fanout_query_rows(
+        &self,
+        targets: &[usize],
+        dsl: &str,
+    ) -> Result<(u64, Vec<Row>), Error> {
+        let (max_gen, batches) = self.fanout_query_batches(targets, dsl)?;
+        let total_rows: usize = batches.iter().map(RecordBatch::n).sum();
+        let mut all_rows = Vec::with_capacity(total_rows);
+        for batch in batches {
+            all_rows.extend(batch.into_rows());
         }
         Ok((max_gen, all_rows))
     }

@@ -1,12 +1,53 @@
 use crate::error::Error;
 
-use super::client::send_rpc;
+use super::client::send_peer_rpc;
 use super::cluster::{NodeMember, NodeRole, PubSubEvent, RaftCommand, RaftLogEntry};
 use super::protocol::{CacheRequest, CacheResponse};
 use super::server::CacheNode;
 use super::unix_ms;
 
 impl CacheNode {
+    /// Parallel inter-node RPC broadcast: 0 peers = no-op, 1 peer = inline on calling thread,
+    /// `K > 1` peers = `K - 1` scoped threads + last peer inline on calling thread.
+    pub(crate) fn broadcast_peer_rpc(peers: &[String], rpc: &CacheRequest) {
+        match peers {
+            [] => {}
+            [only] => {
+                let _ = send_peer_rpc(only, rpc);
+            }
+            [rest @ .., last] => {
+                std::thread::scope(|s| {
+                    for peer_addr in rest {
+                        s.spawn(move || {
+                            let _ = send_peer_rpc(peer_addr, rpc);
+                        });
+                    }
+                    let _ = send_peer_rpc(last, rpc);
+                });
+            }
+        }
+    }
+
+    fn collect_peer_rpcs(peers: &[String], rpc: &CacheRequest) -> Vec<Result<CacheResponse, Error>> {
+        match peers {
+            [] => Vec::new(),
+            [only] => vec![send_peer_rpc(only, rpc)],
+            [rest @ .., last] => std::thread::scope(|s| {
+                let mut handles = Vec::with_capacity(rest.len());
+                for peer_addr in rest {
+                    handles.push(s.spawn(move || send_peer_rpc(peer_addr, rpc)));
+                }
+                let last_res = send_peer_rpc(last, rpc);
+                let mut out: Vec<Result<CacheResponse, Error>> = handles
+                    .into_iter()
+                    .filter_map(|h| h.join().ok())
+                    .collect();
+                out.push(last_res);
+                out
+            }),
+        }
+    }
+
     /// Held from reading the current value until the resulting command is applied and
     /// sent, so concurrent read-modify-write commands cannot overwrite each other and
     /// peers receive entries in index order.
@@ -49,12 +90,7 @@ impl CacheNode {
                 term,
                 command: cmd,
             };
-            st.raft.log.push(entry.clone());
-            st.raft.commit_index = idx;
-            st.raft.last_applied = idx;
-            st.raft.maybe_compact();
-
-            let peers: Vec<String> = if self.cfg.raft_replication {
+            let peers: Vec<String> = if self.cfg.raft_replication && st.members.len() > 1 {
                 st.members
                     .values()
                     .filter(|m| m.node_id != self.cfg.node_id && m.alive)
@@ -63,12 +99,21 @@ impl CacheNode {
             } else {
                 Vec::new()
             };
-            (entry, prev_idx, prev_term, term, peers)
+            let entry_for_rpc = if peers.is_empty() {
+                None
+            } else {
+                Some(entry.clone())
+            };
+            st.raft.log.push(entry);
+            st.raft.commit_index = idx;
+            st.raft.last_applied = idx;
+            st.raft.maybe_compact();
+            (entry_for_rpc, prev_idx, prev_term, term, peers)
         };
 
-        if peers.is_empty() {
+        let Some(entry) = entry else {
             return;
-        }
+        };
         let rpc = CacheRequest::RaftAppendEntries {
             term,
             leader_id: self.cfg.node_id.clone(),
@@ -78,19 +123,7 @@ impl CacheNode {
             entries: vec![entry],
             leader_commit: prev_idx + 1,
         };
-        if let [only] = peers.as_slice() {
-            let _ = send_rpc(only, &rpc);
-        } else {
-            // One slow peer bounds the wait instead of adding to it.
-            let rpc = &rpc;
-            std::thread::scope(|s| {
-                for peer_addr in &peers {
-                    s.spawn(move || {
-                        let _ = send_rpc(peer_addr, rpc);
-                    });
-                }
-            });
-        }
+        Self::broadcast_peer_rpc(&peers, &rpc);
     }
 
     pub(crate) fn handle_gossip_sync(
@@ -103,31 +136,9 @@ impl CacheNode {
         let mut st = self.state.write().unwrap();
         let now = unix_ms();
 
-        // Ensure sender is in the ring & membership table
         st.ring.add_node(&sender_id, &sender_addr);
-        for inc in incoming_members {
-            if inc.node_id == self.cfg.node_id {
-                continue;
-            }
-            st.ring.add_node(&inc.node_id, &inc.addr);
-            st.members
-                .entry(inc.node_id.clone())
-                .and_modify(|m| {
-                    if inc.heartbeat >= m.heartbeat {
-                        m.heartbeat = inc.heartbeat;
-                        m.addr = inc.addr.clone();
-                        m.role = inc.role.clone();
-                        m.term = inc.term;
-                        m.alive = true;
-                        m.last_seen_ms = now;
-                    }
-                })
-                .or_insert_with(|| {
-                    let mut m = inc;
-                    m.last_seen_ms = now;
-                    m
-                });
-        }
+        st.merge_gossip_members(&self.cfg.node_id, incoming_members, now);
+        self.sync_has_peers(&st);
 
         // Process incoming Pub/Sub events
         for ev in pubsub_events {
@@ -137,17 +148,7 @@ impl CacheNode {
         }
 
         // Update our own heartbeat in membership table
-        st.heartbeat += 1;
-        let hb = st.heartbeat;
-        let role = st.raft.role.clone();
-        let term = st.raft.current_term;
-        if let Some(me) = st.members.get_mut(&self.cfg.node_id) {
-            me.heartbeat = hb;
-            me.last_seen_ms = now;
-            me.alive = true;
-            me.role = role;
-            me.term = term;
-        }
+        st.sync_local_member(&self.cfg.node_id, true, now);
 
         let members = st.members.values().cloned().collect();
         CacheResponse::GossipAck {
@@ -186,15 +187,12 @@ impl CacheNode {
             .is_none_or(|v| v == &candidate_id);
 
         if can_vote && log_ok {
-            st.raft.voted_for = Some(candidate_id.clone());
-            st.raft.last_leader_contact_ms = unix_ms();
-            let cur_term = st.raft.current_term;
-            if let Some(me) = st.members.get_mut(&self.cfg.node_id) {
-                me.role = NodeRole::Follower;
-                me.term = cur_term;
-            }
+            let now = unix_ms();
+            st.raft.voted_for = Some(candidate_id);
+            st.raft.last_leader_contact_ms = now;
+            st.sync_local_member(&self.cfg.node_id, false, now);
             CacheResponse::RaftVoteReply {
-                term: cur_term,
+                term: st.raft.current_term,
                 vote_granted: true,
             }
         } else {
@@ -224,17 +222,15 @@ impl CacheNode {
             };
         }
 
+        let now = unix_ms();
         st.raft.current_term = term;
         st.raft.role = NodeRole::Follower;
-        st.raft.leader_id = Some(leader_id.clone());
-        st.raft.leader_addr = Some(leader_addr.clone());
-        st.raft.last_leader_contact_ms = unix_ms();
         st.ring.add_node(&leader_id, &leader_addr);
-
-        if let Some(me) = st.members.get_mut(&self.cfg.node_id) {
-            me.role = NodeRole::Follower;
-            me.term = term;
-        }
+        st.raft.leader_id = Some(leader_id);
+        st.raft.leader_addr = Some(leader_addr);
+        st.raft.last_leader_contact_ms = now;
+        self.sync_has_peers(&st);
+        st.sync_local_member(&self.cfg.node_id, false, now);
 
         for entry in entries {
             if entry.index > st.raft.last_log_index() {
@@ -259,14 +255,12 @@ impl CacheNode {
     pub fn run_leader_election(&self) -> bool {
         let (term, last_idx, last_term, peers, total_nodes) = {
             let mut st = self.state.write().unwrap();
+            let now = unix_ms();
             st.raft.current_term += 1;
             st.raft.role = NodeRole::Candidate;
             st.raft.voted_for = Some(self.cfg.node_id.clone());
             let term = st.raft.current_term;
-            if let Some(me) = st.members.get_mut(&self.cfg.node_id) {
-                me.role = NodeRole::Candidate;
-                me.term = term;
-            }
+            st.sync_local_member(&self.cfg.node_id, false, now);
             let peers: Vec<String> = st
                 .members
                 .values()
@@ -292,17 +286,19 @@ impl CacheNode {
             last_log_term: last_term,
         };
 
-        for peer_addr in &peers {
+        for res in Self::collect_peer_rpcs(&peers, &req) {
             if let Ok(CacheResponse::RaftVoteReply {
                 term: reply_term,
                 vote_granted,
-            }) = send_rpc(peer_addr, &req)
+            }) = res
             {
                 if reply_term > term {
                     let mut st = self.state.write().unwrap();
+                    let now = unix_ms();
                     st.raft.current_term = reply_term;
                     st.raft.role = NodeRole::Follower;
                     st.raft.voted_for = None;
+                    st.sync_local_member(&self.cfg.node_id, false, now);
                     return false;
                 }
                 if vote_granted {
@@ -315,16 +311,14 @@ impl CacheNode {
         if won {
             let mut st = self.state.write().unwrap();
             if st.raft.current_term == term {
+                let now = unix_ms();
                 st.raft.role = NodeRole::Leader;
                 st.raft.leader_id = Some(self.cfg.node_id.clone());
                 st.raft.leader_addr = Some(self.cfg.listen_addr.clone());
-                if let Some(me) = st.members.get_mut(&self.cfg.node_id) {
-                    me.role = NodeRole::Leader;
-                    me.term = term;
-                }
+                st.sync_local_member(&self.cfg.node_id, false, now);
             }
             drop(st);
-            // Send immediate heartbeat AppendEntries to establish leadership
+            // Send immediate heartbeat AppendEntries in parallel to establish leadership
             let hb = CacheRequest::RaftAppendEntries {
                 term,
                 leader_id: self.cfg.node_id.clone(),
@@ -334,9 +328,7 @@ impl CacheNode {
                 entries: Vec::new(),
                 leader_commit: last_idx,
             };
-            for peer_addr in &peers {
-                let _ = send_rpc(peer_addr, &hb);
-            }
+            Self::broadcast_peer_rpc(&peers, &hb);
         }
         won
     }
@@ -345,18 +337,8 @@ impl CacheNode {
     pub fn gossip_once_with(&self, peer_addr: &str) -> Result<(), Error> {
         let req = {
             let mut st = self.state.write().unwrap();
-            st.heartbeat += 1;
-            let hb = st.heartbeat;
             let now = unix_ms();
-            let role = st.raft.role.clone();
-            let term = st.raft.current_term;
-            if let Some(me) = st.members.get_mut(&self.cfg.node_id) {
-                me.heartbeat = hb;
-                me.last_seen_ms = now;
-                me.alive = true;
-                me.role = role;
-                me.term = term;
-            }
+            st.sync_local_member(&self.cfg.node_id, true, now);
             CacheRequest::GossipSync {
                 sender_id: self.cfg.node_id.clone(),
                 sender_addr: self.cfg.listen_addr.clone(),
@@ -365,7 +347,7 @@ impl CacheNode {
             }
         };
 
-        let resp = send_rpc(peer_addr, &req)?;
+        let resp = send_peer_rpc(peer_addr, &req)?;
         if let CacheResponse::GossipAck {
             node_id: _,
             members,
@@ -373,29 +355,8 @@ impl CacheNode {
         {
             let mut st = self.state.write().unwrap();
             let now = unix_ms();
-            for inc in members {
-                if inc.node_id == self.cfg.node_id {
-                    continue;
-                }
-                st.ring.add_node(&inc.node_id, &inc.addr);
-                st.members
-                    .entry(inc.node_id.clone())
-                    .and_modify(|m| {
-                        if inc.heartbeat >= m.heartbeat {
-                            m.heartbeat = inc.heartbeat;
-                            m.addr = inc.addr.clone();
-                            m.role = inc.role.clone();
-                            m.term = inc.term;
-                            m.alive = true;
-                            m.last_seen_ms = now;
-                        }
-                    })
-                    .or_insert_with(|| {
-                        let mut m = inc;
-                        m.last_seen_ms = now;
-                        m
-                    });
-            }
+            st.merge_gossip_members(&self.cfg.node_id, members, now);
+            self.sync_has_peers(&st);
         }
         Ok(())
     }

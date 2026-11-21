@@ -125,16 +125,18 @@ impl ShipWalHub {
         let Some(id) = follower_id.map(str::trim).filter(|s| !s.is_empty()) else {
             return;
         };
-        let status = ShipReplicaStatus {
-            follower_id: id.to_owned(),
-            since_gen,
-            primary_gen,
-            lag_gens: primary_gen.saturating_sub(since_gen),
-            lag_exceeded,
-            last_pull_ms: crate::store::now_ms(),
-        };
+        let lag_gens = primary_gen.saturating_sub(since_gen);
+        let now_ms = crate::store::now_ms();
         if let Ok(mut map) = self.replicas.lock() {
-            if map.len() >= 256 && !map.contains_key(id)
+            if let Some(existing) = map.get_mut(id) {
+                existing.since_gen = since_gen;
+                existing.primary_gen = primary_gen;
+                existing.lag_gens = lag_gens;
+                existing.lag_exceeded = lag_exceeded;
+                existing.last_pull_ms = now_ms;
+                return;
+            }
+            if map.len() >= 256
                 && let Some(oldest) = map
                     .iter()
                     .min_by_key(|(_, v)| v.last_pull_ms)
@@ -142,7 +144,18 @@ impl ShipWalHub {
             {
                 map.remove(&oldest);
             }
-            map.insert(id.to_owned(), status);
+            let owned = id.to_owned();
+            map.insert(
+                owned.clone(),
+                ShipReplicaStatus {
+                    follower_id: owned,
+                    since_gen,
+                    primary_gen,
+                    lag_gens,
+                    lag_exceeded,
+                    last_pull_ms: now_ms,
+                },
+            );
         }
     }
 }
@@ -277,57 +290,91 @@ pub async fn pull_with_async(
 }
 
 /// Transport stream shared between WAL shipping, cluster RPCs, and remote cold store.
-pub(crate) enum NetStream {
+enum NetStreamInner {
     Plain(TcpStream),
     TlsClient(Box<StreamOwned<rustls::ClientConnection, TcpStream>>),
     TlsServer(Box<StreamOwned<ServerConnection, TcpStream>>),
 }
 
+pub(crate) struct NetStream {
+    inner: NetStreamInner,
+    read_timeout: Option<Option<Duration>>,
+    write_timeout: Option<Option<Duration>>,
+}
+
 impl NetStream {
-    pub(crate) fn set_timeout(&self, dur: Option<Duration>) -> Result<(), Error> {
-        let tcp = match self {
-            NetStream::Plain(s) => s,
-            NetStream::TlsClient(s) => &s.sock,
-            NetStream::TlsServer(s) => &s.sock,
-        };
-        tcp.set_read_timeout(dur).map_err(io_err)?;
-        tcp.set_write_timeout(dur).map_err(io_err)?;
+    #[inline]
+    fn new(inner: NetStreamInner, initial_timeout: Option<Duration>) -> Self {
+        Self {
+            inner,
+            read_timeout: Some(initial_timeout),
+            write_timeout: Some(initial_timeout),
+        }
+    }
+
+    #[inline]
+    fn tcp(&self) -> &TcpStream {
+        match &self.inner {
+            NetStreamInner::Plain(s) => s,
+            NetStreamInner::TlsClient(s) => &s.sock,
+            NetStreamInner::TlsServer(s) => &s.sock,
+        }
+    }
+
+    pub(crate) fn set_read_timeout(&mut self, dur: Option<Duration>) -> Result<(), Error> {
+        if self.read_timeout == Some(dur) {
+            return Ok(());
+        }
+        self.tcp().set_read_timeout(dur).map_err(io_err)?;
+        self.read_timeout = Some(dur);
+        Ok(())
+    }
+
+    pub(crate) fn set_timeout(&mut self, dur: Option<Duration>) -> Result<(), Error> {
+        if self.read_timeout != Some(dur) {
+            self.tcp().set_read_timeout(dur).map_err(io_err)?;
+            self.read_timeout = Some(dur);
+        }
+        if self.write_timeout != Some(dur) {
+            self.tcp().set_write_timeout(dur).map_err(io_err)?;
+            self.write_timeout = Some(dur);
+        }
         Ok(())
     }
 }
 
 impl Read for NetStream {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        match self {
-            NetStream::Plain(s) => s.read(buf),
-            NetStream::TlsClient(s) => s.read(buf),
-            NetStream::TlsServer(s) => s.read(buf),
+        match &mut self.inner {
+            NetStreamInner::Plain(s) => s.read(buf),
+            NetStreamInner::TlsClient(s) => s.read(buf),
+            NetStreamInner::TlsServer(s) => s.read(buf),
         }
     }
 }
 
 impl Write for NetStream {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        match self {
-            NetStream::Plain(s) => s.write(buf),
-            NetStream::TlsClient(s) => s.write(buf),
-            NetStream::TlsServer(s) => s.write(buf),
+        match &mut self.inner {
+            NetStreamInner::Plain(s) => s.write(buf),
+            NetStreamInner::TlsClient(s) => s.write(buf),
+            NetStreamInner::TlsServer(s) => s.write(buf),
         }
     }
 
     fn write_vectored(&mut self, bufs: &[std::io::IoSlice<'_>]) -> std::io::Result<usize> {
-        match self {
-            NetStream::Plain(s) => s.write_vectored(bufs),
-            NetStream::TlsClient(s) => s.write_vectored(bufs),
-            NetStream::TlsServer(s) => s.write_vectored(bufs),
+        match &mut self.inner {
+            NetStreamInner::Plain(s) => s.write_vectored(bufs),
+            NetStreamInner::TlsClient(s) => s.write_vectored(bufs),
+            NetStreamInner::TlsServer(s) => s.write_vectored(bufs),
         }
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        match self {
-            NetStream::Plain(s) => s.flush(),
-            NetStream::TlsClient(s) => s.flush(),
-            NetStream::TlsServer(s) => s.flush(),
+        match &mut self.inner {
+            NetStreamInner::Plain(s) => s.flush(),
+            NetStreamInner::TlsClient(s) => s.flush(),
+            NetStreamInner::TlsServer(s) => s.flush(),
         }
     }
 }
@@ -388,15 +435,16 @@ fn connect_net_stream_addrs(
         }
     }
     match &opts.tls {
-        TlsClient::Off => Ok(NetStream::Plain(stream)),
+        TlsClient::Off => Ok(NetStream::new(NetStreamInner::Plain(stream), dur)),
         other => {
             let cfg = client_config(other)?;
             let host = opts.server_name.as_deref().unwrap_or("localhost");
             let name = ServerName::try_from(host.to_owned()).map_err(io_err)?;
             let conn = rustls::ClientConnection::new(cfg, name).map_err(io_err)?;
-            Ok(NetStream::TlsClient(Box::new(StreamOwned::new(
-                conn, stream,
-            ))))
+            Ok(NetStream::new(
+                NetStreamInner::TlsClient(Box::new(StreamOwned::new(conn, stream))),
+                dur,
+            ))
         }
     }
 }
@@ -532,15 +580,33 @@ fn write_hello_v7<W: Write>(
     } else {
         follower_id
     };
-    let mut buf = Vec::with_capacity(4 + 2 + token.len() + 8 + 4 + 2 + fid.len());
-    buf.extend_from_slice(&PROTO_MAGIC_V7);
-    buf.extend_from_slice(&(token.len() as u16).to_le_bytes());
-    buf.extend_from_slice(token.as_bytes());
-    buf.extend_from_slice(&since.to_le_bytes());
-    buf.extend_from_slice(&wait_ms.to_le_bytes());
-    buf.extend_from_slice(&(fid.len() as u16).to_le_bytes());
-    buf.extend_from_slice(fid.as_bytes());
-    w.write_all(&buf).map_err(io_err)?;
+    let total = 4 + 2 + token.len() + 8 + 4 + 2 + fid.len();
+    if total <= 128 {
+        let mut buf = [0u8; 128];
+        buf[0..4].copy_from_slice(&PROTO_MAGIC_V7);
+        buf[4..6].copy_from_slice(&(token.len() as u16).to_le_bytes());
+        let mut pos = 6;
+        buf[pos..pos + token.len()].copy_from_slice(token.as_bytes());
+        pos += token.len();
+        buf[pos..pos + 8].copy_from_slice(&since.to_le_bytes());
+        pos += 8;
+        buf[pos..pos + 4].copy_from_slice(&wait_ms.to_le_bytes());
+        pos += 4;
+        buf[pos..pos + 2].copy_from_slice(&(fid.len() as u16).to_le_bytes());
+        pos += 2;
+        buf[pos..pos + fid.len()].copy_from_slice(fid.as_bytes());
+        w.write_all(&buf[..total]).map_err(io_err)?;
+    } else {
+        let mut buf = Vec::with_capacity(total);
+        buf.extend_from_slice(&PROTO_MAGIC_V7);
+        buf.extend_from_slice(&(token.len() as u16).to_le_bytes());
+        buf.extend_from_slice(token.as_bytes());
+        buf.extend_from_slice(&since.to_le_bytes());
+        buf.extend_from_slice(&wait_ms.to_le_bytes());
+        buf.extend_from_slice(&(fid.len() as u16).to_le_bytes());
+        buf.extend_from_slice(fid.as_bytes());
+        w.write_all(&buf).map_err(io_err)?;
+    }
     w.flush().map_err(io_err)?;
     Ok(())
 }
@@ -554,9 +620,9 @@ struct ShipHello {
 }
 
 fn read_hello_any<R: Read>(r: &mut R) -> Result<ShipHello, Error> {
-    let mut mag = [0u8; 4];
-    r.read_exact(&mut mag).map_err(io_err)?;
-    let v7 = match mag {
+    let mut hdr6 = [0u8; 6];
+    r.read_exact(&mut hdr6).map_err(io_err)?;
+    let v7 = match [hdr6[0], hdr6[1], hdr6[2], hdr6[3]] {
         PROTO_MAGIC => false,
         PROTO_MAGIC_V7 => true,
         _ => {
@@ -565,20 +631,29 @@ fn read_hello_any<R: Read>(r: &mut R) -> Result<ShipHello, Error> {
             ));
         }
     };
-    let mut nbuf = [0u8; 2];
-    r.read_exact(&mut nbuf).map_err(io_err)?;
-    let n = u16::from_le_bytes(nbuf) as usize;
+    let n = u16::from_le_bytes([hdr6[4], hdr6[5]]) as usize;
     if n > MAX_TOKEN {
         return Err(Error::runtime("wal ship: token too long"));
     }
-    let mut tok = vec![0u8; n];
-    if n > 0 {
-        r.read_exact(&mut tok).map_err(io_err)?;
-    }
-    let token = String::from_utf8(tok).map_err(io_err)?;
-    let mut since_buf = [0u8; 8];
-    r.read_exact(&mut since_buf).map_err(io_err)?;
-    let since = u64::from_le_bytes(since_buf);
+    let fixed_tail = if v7 { 14 } else { 8 };
+    let rem_len = n + fixed_tail;
+    let mut stack_buf = [0u8; 128 + 14];
+    let mut heap_buf = Vec::new();
+    let rem: &mut [u8] = if rem_len <= stack_buf.len() {
+        &mut stack_buf[..rem_len]
+    } else {
+        heap_buf.resize(rem_len, 0);
+        &mut heap_buf
+    };
+    r.read_exact(rem).map_err(io_err)?;
+    let token = if n == 0 {
+        String::new()
+    } else {
+        std::str::from_utf8(&rem[..n])
+            .map(str::to_owned)
+            .map_err(io_err)?
+    };
+    let since = u64::from_le_bytes(rem[n..n + 8].try_into().unwrap());
     if !v7 {
         return Ok(ShipHello {
             v7: false,
@@ -588,19 +663,19 @@ fn read_hello_any<R: Read>(r: &mut R) -> Result<ShipHello, Error> {
             follower_id: None,
         });
     }
-    let mut wbuf = [0u8; 4];
-    r.read_exact(&mut wbuf).map_err(io_err)?;
-    let wait_ms = u32::from_le_bytes(wbuf).min(30_000);
-    let mut fbuf = [0u8; 2];
-    r.read_exact(&mut fbuf).map_err(io_err)?;
-    let fn_len = u16::from_le_bytes(fbuf) as usize;
+    let wait_ms = u32::from_le_bytes(rem[n + 8..n + 12].try_into().unwrap()).min(30_000);
+    let fn_len = u16::from_le_bytes([rem[n + 12], rem[n + 13]]) as usize;
     if fn_len > MAX_FOLLOWER_ID {
         return Err(Error::runtime("wal ship: follower_id too long"));
     }
     let follower_id = if fn_len > 0 {
-        let mut raw = vec![0u8; fn_len];
-        r.read_exact(&mut raw).map_err(io_err)?;
-        Some(String::from_utf8(raw).map_err(io_err)?)
+        let mut raw = [0u8; MAX_FOLLOWER_ID];
+        r.read_exact(&mut raw[..fn_len]).map_err(io_err)?;
+        Some(
+            std::str::from_utf8(&raw[..fn_len])
+                .map(str::to_owned)
+                .map_err(io_err)?,
+        )
     } else {
         None
     };
@@ -645,11 +720,19 @@ fn client_config(tls: &TlsClient) -> Result<Arc<ClientConfig>, Error> {
         TlsClient::CaPem(pem) => {
             // One config per CA: parsing the PEM per connection is wasted work, and TLS
             // session resumption lives in the config, so a fresh one never resumes.
-            static CA_CFGS: std::sync::Mutex<Vec<(Vec<u8>, Arc<ClientConfig>)>> =
+            static CA_CFGS: std::sync::Mutex<Vec<(u64, Vec<u8>, Arc<ClientConfig>)>> =
                 std::sync::Mutex::new(Vec::new());
             const MAX_CA_CFGS: usize = 8;
+            let pem_hash = {
+                use std::hash::{Hash, Hasher};
+                let mut h = rustc_hash::FxHasher::default();
+                pem.hash(&mut h);
+                h.finish()
+            };
             if let Ok(cached) = CA_CFGS.lock()
-                && let Some((_, cfg)) = cached.iter().find(|(k, _)| k == pem)
+                && let Some((_, _, cfg)) = cached
+                    .iter()
+                    .find(|(h, k, _)| *h == pem_hash && k.len() == pem.len() && k == pem)
             {
                 return Ok(Arc::clone(cfg));
             }
@@ -671,7 +754,7 @@ fn client_config(tls: &TlsClient) -> Result<Arc<ClientConfig>, Error> {
                 if cached.len() >= MAX_CA_CFGS {
                     cached.remove(0);
                 }
-                cached.push((pem.clone(), Arc::clone(&cfg)));
+                cached.push((pem_hash, pem.clone(), Arc::clone(&cfg)));
             }
             Ok(cfg)
         }
@@ -694,11 +777,12 @@ pub(crate) fn accept_net_stream(
     match tls {
         Some(cfg) => {
             let conn = ServerConnection::new(cfg).map_err(io_err)?;
-            Ok(NetStream::TlsServer(Box::new(StreamOwned::new(
-                conn, stream,
-            ))))
+            Ok(NetStream::new(
+                NetStreamInner::TlsServer(Box::new(StreamOwned::new(conn, stream))),
+                dur,
+            ))
         }
-        None => Ok(NetStream::Plain(stream)),
+        None => Ok(NetStream::new(NetStreamInner::Plain(stream), dur)),
     }
 }
 
@@ -957,6 +1041,7 @@ pub fn serve_dir_live_limit(
         Some(t) => Some(server_config(t)?),
         None => None,
     };
+    let has_push_hub = opts.hub.is_some();
     let hub = match &opts.hub {
         Some(h) => {
             if let Some(m) = opts.max_lag_gens {
@@ -990,7 +1075,9 @@ pub fn serve_dir_live_limit(
                     let Ok(stream) = next else {
                         return;
                     };
-                    if let Err(e) = handle_dir_conn(dir, stream, token, tls.clone(), &hub) {
+                    if let Err(e) =
+                        handle_dir_conn(dir, stream, token, tls.clone(), &hub, has_push_hub)
+                    {
                         eprintln!("wal ship: client error: {e}");
                     }
                 }
@@ -1022,6 +1109,7 @@ fn handle_dir_conn(
     expect_token: Option<&str>,
     tls: Option<Arc<ServerConfig>>,
     hub: &ShipWalHub,
+    has_push_hub: bool,
 ) -> Result<(), Error> {
     let mut net = accept_net_stream(stream, tls, Duration::from_secs(30))?;
     let hello = read_hello_any(&mut net)?;
@@ -1035,10 +1123,18 @@ fn handle_dir_conn(
         ))?;
     }
     let deadline = std::time::Instant::now() + Duration::from_millis(u64::from(hello.wait_ms));
-    let max_lag = hub.max_lag_gens.load(Ordering::Acquire);
+    let mut max_lag = hub.max_lag_gens.load(Ordering::Acquire);
+
+    let (mut hg, mut fwg, mut pg) = crate::persist::peek_wal_bounds(dir)?;
+    let mut last_seen_gen = pg.max(hello.since);
+    let mut last_disk_check = std::time::Instant::now();
+    let wait_slice = if has_push_hub {
+        Duration::from_millis(50)
+    } else {
+        Duration::from_millis(15)
+    };
 
     let (head_gen, first_wal_gen, primary_gen) = loop {
-        let (hg, fwg, pg) = crate::persist::peek_wal_bounds(dir)?;
         let gap = hello.since < hg && fwg.is_none_or(|fg| fg > hello.since.saturating_add(1));
         let lag_over = max_lag > 0 && pg.saturating_sub(hello.since) > max_lag;
         if pg > hello.since || gap || lag_over || hello.wait_ms == 0 {
@@ -1048,15 +1144,31 @@ fn handle_dir_conn(
         if now >= deadline {
             break (hg, fwg, pg);
         }
-        let slice = (deadline - now).min(Duration::from_millis(5));
+        let slice = (deadline - now).min(wait_slice);
+        let mut hub_advanced = false;
         if let Ok(guard) = hub.gen_state.lock() {
-            if *guard > hello.since {
-                drop(guard);
-                continue;
+            if *guard > last_seen_gen {
+                last_seen_gen = *guard;
+                hub_advanced = true;
+            } else if let Ok((g, _)) = hub.gen_cv.wait_timeout(guard, slice)
+                && *g > last_seen_gen
+            {
+                last_seen_gen = *g;
+                hub_advanced = true;
             }
-            let _ = hub.gen_cv.wait_timeout(guard, slice);
         } else {
             std::thread::sleep(slice);
+        }
+        max_lag = hub.max_lag_gens.load(Ordering::Acquire);
+        let after = std::time::Instant::now();
+        if !has_push_hub
+            || hub_advanced
+            || after >= deadline
+            || last_disk_check.elapsed() >= Duration::from_millis(200)
+        {
+            (hg, fwg, pg) = crate::persist::peek_wal_bounds(dir)?;
+            last_seen_gen = last_seen_gen.max(pg);
+            last_disk_check = after;
         }
     };
 
@@ -1148,9 +1260,32 @@ fn write_v7_response<S: Write>(
     };
     hdr[1..9].copy_from_slice(&primary_gen.to_le_bytes());
     hdr[9..17].copy_from_slice(&(frames.len() as u64).to_le_bytes());
-    stream.write_all(&hdr).map_err(io_err)?;
-    if !frames.is_empty() {
-        stream.write_all(frames).map_err(io_err)?;
+    if frames.is_empty() {
+        stream.write_all(&hdr).map_err(io_err)?;
+    } else {
+        let mut head_done = 0usize;
+        let mut body_done = 0usize;
+        while head_done < 17 || body_done < frames.len() {
+            let n = if head_done < 17 {
+                let slices = [
+                    std::io::IoSlice::new(&hdr[head_done..]),
+                    std::io::IoSlice::new(&frames[body_done..]),
+                ];
+                stream.write_vectored(&slices).map_err(io_err)?
+            } else {
+                stream.write(&frames[body_done..]).map_err(io_err)?
+            };
+            if n == 0 {
+                return Err(Error::runtime("wal ship: write zero"));
+            }
+            let head_rem = 17 - head_done;
+            if n <= head_rem {
+                head_done += n;
+            } else {
+                head_done = 17;
+                body_done += n - head_rem;
+            }
+        }
     }
     stream.flush().map_err(io_err)?;
     Ok(())

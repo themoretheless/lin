@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::io::{IoSlice, Read, Write};
+use std::io::{Read, Write};
 
 use serde::{Deserialize, Serialize};
 
@@ -322,51 +322,64 @@ impl CacheResponse {
     }
 }
 
-/// Write a framed binary message (`LINC` + `u8` ver + `u32` LE len + MessagePack).
-pub fn write_frame<W: Write, T: Serialize>(w: &mut W, msg: &T) -> Result<(), Error> {
-    let payload = rmp_serde::to_vec_named(msg).map_err(cache_err)?;
-    if payload.len() as u64 > MAX_FRAME_LEN as u64 {
-        return Err(cache_err(format!(
-            "frame payload {} exceeds max {}",
-            payload.len(),
-            MAX_FRAME_LEN
-        )));
-    }
-    let len = payload.len() as u32;
+const RETAIN_FRAME_BUF_CAP: usize = 1024 * 1024;
+const SHRINK_FRAME_BUF_TO: usize = 64 * 1024;
+
+/// Serialize a framed binary message into `buf` and write to `w` without flushing `w`.
+pub(crate) fn write_frame_noflush_buf<W: Write, T: Serialize>(
+    w: &mut W,
+    msg: &T,
+    buf: &mut Vec<u8>,
+) -> Result<(), Error> {
+    buf.clear();
     let mut header = [0u8; 9];
     header[0..4].copy_from_slice(&CACHE_MAGIC);
     header[4] = CACHE_VERSION;
-    header[5..9].copy_from_slice(&len.to_le_bytes());
+    buf.extend_from_slice(&header);
 
-    let mut head_done = 0usize;
-    let mut body_done = 0usize;
-    while head_done < 9 || body_done < payload.len() {
-        let n = if head_done < 9 {
-            let slices = [
-                IoSlice::new(&header[head_done..]),
-                IoSlice::new(&payload[body_done..]),
-            ];
-            w.write_vectored(&slices).map_err(cache_err)?
-        } else {
-            w.write(&payload[body_done..]).map_err(cache_err)?
-        };
-        if n == 0 {
-            return Err(cache_err("write zero bytes"));
-        }
-        let head_rem = 9 - head_done;
-        if n <= head_rem {
-            head_done += n;
-        } else {
-            head_done = 9;
-            body_done += n - head_rem;
-        }
+    rmp_serde::encode::write_named(&mut *buf, msg).map_err(cache_err)?;
+    let payload_len = buf.len() - 9;
+    if payload_len as u64 > MAX_FRAME_LEN as u64 {
+        return Err(cache_err(format!(
+            "frame payload {payload_len} exceeds max {MAX_FRAME_LEN}"
+        )));
     }
-    w.flush().map_err(cache_err)?;
+    let len = payload_len as u32;
+    buf[5..9].copy_from_slice(&len.to_le_bytes());
+    w.write_all(buf).map_err(cache_err)?;
+
+    if buf.capacity() > RETAIN_FRAME_BUF_CAP && buf.len() < SHRINK_FRAME_BUF_TO {
+        buf.clear();
+        buf.shrink_to(SHRINK_FRAME_BUF_TO);
+    }
     Ok(())
 }
 
-/// Read a framed binary message (`LINC` + `u8` ver + `u32` LE len + MessagePack).
-pub fn read_frame<R: Read, T: for<'de> Deserialize<'de>>(r: &mut R) -> Result<T, Error> {
+/// Write a framed binary message (`LINC` + `u8` ver + `u32` LE len + MessagePack) reusing `buf`.
+pub fn write_frame_buf<W: Write, T: Serialize>(
+    w: &mut W,
+    msg: &T,
+    buf: &mut Vec<u8>,
+) -> Result<(), Error> {
+    write_frame_noflush_buf(w, msg, buf)?;
+    w.flush().map_err(cache_err)
+}
+
+/// Write a framed binary message (`LINC` + `u8` ver + `u32` LE len + MessagePack).
+pub fn write_frame<W: Write, T: Serialize>(w: &mut W, msg: &T) -> Result<(), Error> {
+    let mut buf = Vec::with_capacity(128);
+    write_frame_buf(w, msg, &mut buf)
+}
+
+/// Read a framed binary message (`LINC` + `u8` ver + `u32` LE len + MessagePack) reusing `buf`.
+pub fn read_frame_buf<R: Read, T: for<'de> Deserialize<'de>>(
+    r: &mut R,
+    buf: &mut Vec<u8>,
+) -> Result<T, Error> {
+    if buf.capacity() > RETAIN_FRAME_BUF_CAP {
+        buf.clear();
+        buf.shrink_to(SHRINK_FRAME_BUF_TO);
+    }
     let mut header = [0u8; 9];
     r.read_exact(&mut header).map_err(cache_err)?;
     if header[0..4] != CACHE_MAGIC {
@@ -382,7 +395,13 @@ pub fn read_frame<R: Read, T: for<'de> Deserialize<'de>>(r: &mut R) -> Result<T,
     if len > MAX_FRAME_LEN {
         return Err(cache_err(format!("frame length {len} exceeds maximum")));
     }
-    let mut buf = vec![0u8; len as usize];
-    r.read_exact(&mut buf).map_err(cache_err)?;
-    rmp_serde::from_slice(&buf).map_err(cache_err)
+    buf.resize(len as usize, 0);
+    r.read_exact(buf).map_err(cache_err)?;
+    rmp_serde::from_slice(buf).map_err(cache_err)
+}
+
+/// Read a framed binary message (`LINC` + `u8` ver + `u32` LE len + MessagePack).
+pub fn read_frame<R: Read, T: for<'de> Deserialize<'de>>(r: &mut R) -> Result<T, Error> {
+    let mut buf = Vec::new();
+    read_frame_buf(r, &mut buf)
 }

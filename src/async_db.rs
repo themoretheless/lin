@@ -34,7 +34,7 @@ use crate::store::{Cell, Row};
 pub struct AsyncDb {
     inner: Arc<Mutex<Db>>,
     write_epoch: Arc<AtomicU64>,
-    cached_reader: Arc<RwLock<Option<(u64, ReadDb)>>>,
+    cached_reader: Arc<RwLock<Option<(u64, ReadDb, Stats)>>>,
     sync_group: Arc<WalSyncGroup>,
 }
 
@@ -62,7 +62,7 @@ impl AsyncDb {
         let epoch = self.write_epoch.load(Ordering::Acquire);
         if self.sync_group.is_all_synced()
             && let Ok(guard) = self.cached_reader.read()
-            && let Some((cached_epoch, ref rdb)) = *guard
+            && let Some((cached_epoch, ref rdb, _)) = *guard
             && cached_epoch == epoch
         {
             return rdb.clone();
@@ -77,7 +77,7 @@ impl AsyncDb {
             let epoch_now = write_epoch.load(Ordering::Acquire);
             if sync_group.is_all_synced()
                 && let Ok(guard) = cached_reader.read()
-                && let Some((cached_epoch, ref rdb)) = *guard
+                && let Some((cached_epoch, ref rdb, _)) = *guard
                 && cached_epoch == epoch_now
             {
                 return rdb.clone();
@@ -87,11 +87,12 @@ impl AsyncDb {
                     .then(|| p.log.try_clone().ok())
                     .flatten()
             });
+            let stats = g.stats();
             let rdb = g.reader();
             drop(g);
             let _ = sync_group.wait_all_written_synced(sync_file);
             if let Ok(mut wguard) = cached_reader.write() {
-                *wguard = Some((epoch_now, rdb.clone()));
+                *wguard = Some((epoch_now, rdb.clone(), stats));
             }
             rdb
         })
@@ -280,12 +281,14 @@ impl AsyncDb {
     pub async fn checkpoint(&self) -> Result<(), Error> {
         let db = Arc::clone(&self.inner);
         let sync_group = Arc::clone(&self.sync_group);
+        let write_epoch = Arc::clone(&self.write_epoch);
         spawn_blocking(move || {
             let mut g = db.blocking_lock();
             sync_group.wait_idle();
             let res = g.checkpoint();
             if res.is_ok() {
                 sync_group.note_checkpointed();
+                write_epoch.fetch_add(1, Ordering::Release);
             }
             res
         })
@@ -294,6 +297,14 @@ impl AsyncDb {
     }
 
     pub async fn stats(&self) -> Stats {
+        let epoch = self.write_epoch.load(Ordering::Acquire);
+        if self.sync_group.is_all_synced()
+            && let Ok(guard) = self.cached_reader.read()
+            && let Some((cached_epoch, _, ref stats)) = *guard
+            && cached_epoch == epoch
+        {
+            return stats.clone();
+        }
         let g = self.inner.lock().await;
         g.stats()
     }
@@ -611,7 +622,18 @@ enum CursorJob {
     Query(Result<Query, Error>),
 }
 
-const STREAM_CHUNK_SIZE: usize = 64;
+const STREAM_INITIAL_CHUNK: usize = 64;
+const STREAM_MID_CHUNK: usize = 256;
+const STREAM_MAX_CHUNK: usize = 512;
+
+#[inline]
+fn next_stream_chunk_size(cur: usize) -> usize {
+    if cur < STREAM_MID_CHUNK {
+        STREAM_MID_CHUNK
+    } else {
+        STREAM_MAX_CHUNK
+    }
+}
 
 fn spawn_cursor_or_run(
     read: ReadDb,
@@ -622,76 +644,69 @@ fn spawn_cursor_or_run(
     let (tx, rx) = mpsc::channel::<Vec<Result<Row, Error>>>(8);
     spawn_blocking(move || {
         let send_rows = |rows: Vec<Row>| {
-            for chunk in rows.chunks(STREAM_CHUNK_SIZE) {
-                let batch: Vec<Result<Row, Error>> = chunk.iter().cloned().map(Ok).collect();
-                if tx.blocking_send(batch).is_err() {
+            let mut iter = rows.into_iter();
+            let mut chunk_cap = STREAM_INITIAL_CHUNK;
+            loop {
+                let batch: Vec<Result<Row, Error>> = iter.by_ref().take(chunk_cap).map(Ok).collect();
+                if batch.is_empty() || tx.blocking_send(batch).is_err() {
                     return;
                 }
+                chunk_cap = next_stream_chunk_size(chunk_cap);
             }
         };
         let send_err = |e: Error| {
             let _ = tx.blocking_send(vec![Err(e)]);
         };
-
-        let q = match job {
-            CursorJob::Query(Ok(q)) => q,
-            CursorJob::Query(Err(e)) => {
-                send_err(e);
-                return;
-            }
-            CursorJob::Stmt(Stmt::Query(q)) => q,
-            CursorJob::Stmt(other) => {
-                match read.run_stmt(other) {
-                    Ok(h) => send_rows(h.into_rows()),
-                    Err(e) => send_err(e),
-                }
-                return;
-            }
-            CursorJob::Src(src) => match crate::parse::parse_program(&src) {
-                Ok(stmts) if stmts.len() == 1 => match stmts.into_iter().next().unwrap() {
-                    Stmt::Query(q) => q,
-                    other => {
-                        match read.run_stmt(other) {
-                            Ok(h) => send_rows(h.into_rows()),
-                            Err(e) => send_err(e),
-                        }
-                        return;
-                    }
-                },
-                Ok(_) => {
-                    match read.run(&src) {
-                        Ok(h) => send_rows(h.into_rows()),
-                        Err(e) => send_err(e),
-                    }
-                    return;
-                }
+        let stream_cursor = |q: &Query| {
+            let mut cur = match read.cursor(q) {
+                Ok(c) => c,
                 Err(e) => {
                     send_err(e);
                     return;
                 }
-            },
-        };
-
-        let mut cur = match read.cursor(&q) {
-            Ok(c) => c,
-            Err(e) => {
-                send_err(e);
-                return;
-            }
-        };
-        let mut chunk = Vec::with_capacity(STREAM_CHUNK_SIZE);
-        for item in cur.by_ref() {
-            let is_err = item.is_err();
-            chunk.push(item);
-            if chunk.len() >= STREAM_CHUNK_SIZE || is_err {
-                let batch = std::mem::replace(&mut chunk, Vec::with_capacity(STREAM_CHUNK_SIZE));
-                if tx.blocking_send(batch).is_err() || is_err {
-                    return;
+            };
+            let mut chunk_cap = STREAM_INITIAL_CHUNK;
+            let mut chunk = Vec::with_capacity(chunk_cap);
+            for item in cur.by_ref() {
+                let is_err = item.is_err();
+                chunk.push(item);
+                if chunk.len() >= chunk_cap || is_err {
+                    let next_cap = next_stream_chunk_size(chunk_cap);
+                    let batch = std::mem::replace(&mut chunk, Vec::with_capacity(next_cap));
+                    chunk_cap = next_cap;
+                    if tx.blocking_send(batch).is_err() || is_err {
+                        return;
+                    }
                 }
             }
-        }
-        if !chunk.is_empty() {
-            let _ = tx.blocking_send(chunk);
+            if !chunk.is_empty() {
+                let _ = tx.blocking_send(chunk);
+            }
+        };
+
+        match job {
+            CursorJob::Query(Ok(q)) => stream_cursor(&q),
+            CursorJob::Query(Err(e)) => send_err(e),
+            CursorJob::Stmt(Stmt::Query(q)) => stream_cursor(&q),
+            CursorJob::Stmt(other) => match read.run_stmt(other) {
+                Ok(h) => send_rows(h.into_rows()),
+                Err(e) => send_err(e),
+            },
+            CursorJob::Src(src) => match read.prepare(&src) {
+                Ok(prep) => {
+                    if !prep.writes
+                        && let [Stmt::Query(q)] = &prep.stmts[..]
+                    {
+                        stream_cursor(q);
+                    } else {
+                        match read.run_prepared(&prep) {
+                            Ok(h) => send_rows(h.into_rows()),
+                            Err(e) => send_err(e),
+                        }
+                    }
+                }
+                Err(e) => send_err(e),
+            },
         }
     });
 

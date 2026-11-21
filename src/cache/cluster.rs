@@ -47,23 +47,25 @@ impl ConsistentHashRing {
         crc32fast::hash(key.as_bytes())
     }
 
-    pub fn add_node(&mut self, node_id: impl Into<String>, addr: impl Into<String>) {
-        let node_id = node_id.into();
-        let addr = addr.into();
-        if let Some(existing) = self.nodes.get_mut(&node_id) {
-            if *existing != addr {
-                *existing = addr;
+    pub fn add_node(&mut self, node_id: impl AsRef<str>, addr: impl AsRef<str>) {
+        let nid = node_id.as_ref();
+        let ad = addr.as_ref();
+        if let Some(existing) = self.nodes.get_mut(nid) {
+            if existing != ad {
+                existing.clear();
+                existing.push_str(ad);
             }
             return;
         }
-        self.nodes.insert(node_id.clone(), addr);
-        let mut vkey = String::with_capacity(node_id.len() + 8);
+        let nid_owned = nid.to_owned();
+        self.nodes.insert(nid_owned.clone(), ad.to_owned());
+        let mut vkey = String::with_capacity(nid.len() + 8);
         for v in 0..self.vnodes {
             vkey.clear();
             use std::fmt::Write;
-            let _ = write!(&mut vkey, "{node_id}#vn{v}");
+            let _ = write!(&mut vkey, "{nid}#vn{v}");
             let h = crc32fast::hash(vkey.as_bytes());
-            self.ring.insert(h, node_id.clone());
+            self.ring.insert(h, nid_owned.clone());
         }
     }
 
@@ -81,15 +83,36 @@ impl ConsistentHashRing {
         &self.nodes
     }
 
+    /// Borrowed primary owner `(node_id, addr)` for multi-node shard routing.
+    /// Returns `None` in O(1) when `self.nodes.len() <= 1` without hashing or allocating `String`s.
+    #[inline]
+    pub fn primary_for_key_ref(&self, key: &str) -> Option<(&str, &str)> {
+        if self.nodes.len() <= 1 || self.ring.is_empty() {
+            return None;
+        }
+        let h = Self::hash_key(key);
+        let (_, nid) = self
+            .ring
+            .range(h..)
+            .next()
+            .or_else(|| self.ring.first_key_value())?;
+        let addr = self.nodes.get(nid)?;
+        Some((nid.as_str(), addr.as_str()))
+    }
+
     /// Return the primary owner `(node_id, addr)` for `key`.
     pub fn primary_for_key(&self, key: &str) -> Option<(String, String)> {
         if self.ring.is_empty() {
             return None;
         }
-        let h = Self::hash_key(key);
-        let (_, nid) = self.ring.range(h..).next().or_else(|| self.ring.first_key_value())?;
-        let addr = self.nodes.get(nid)?;
-        Some((nid.clone(), addr.clone()))
+        if self.nodes.len() == 1 {
+            return self
+                .nodes
+                .first_key_value()
+                .map(|(nid, addr)| (nid.clone(), addr.clone()));
+        }
+        self.primary_for_key_ref(key)
+            .map(|(nid, addr)| (nid.to_owned(), addr.to_owned()))
     }
 
     /// Return up to `replication_factor` distinct physical nodes `(node_id, addr)` clockwise on the ring.
@@ -227,6 +250,13 @@ impl RaftState {
         }
         if index == self.base_index {
             return self.base_term;
+        }
+        if index > self.base_index
+            && let Ok(off) = usize::try_from(index - (self.base_index + 1))
+            && let Some(entry) = self.log.get(off)
+            && entry.index == index
+        {
+            return entry.term;
         }
         if let Ok(pos) = self.log.binary_search_by_key(&index, |e| e.index) {
             return self.log[pos].term;

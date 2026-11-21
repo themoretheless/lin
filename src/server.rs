@@ -291,17 +291,25 @@ fn read_len_bytes<'a>(cur: &mut &'a [u8]) -> Result<&'a [u8], Error> {
     read_slice(cur, len)
 }
 
-fn read_str(cur: &mut &[u8]) -> Result<String, Error> {
+fn read_str_ref<'a>(cur: &mut &'a [u8]) -> Result<&'a str, Error> {
     let bytes = read_len_bytes(cur)?;
-    String::from_utf8(bytes.to_vec()).map_err(|e| Error::runtime(format!("invalid utf-8: {e}")))
+    std::str::from_utf8(bytes).map_err(|e| Error::runtime(format!("invalid utf-8: {e}")))
+}
+
+fn read_opt_str_ref<'a>(cur: &mut &'a [u8]) -> Result<Option<&'a str>, Error> {
+    match read_u8(cur)? {
+        0 => Ok(None),
+        1 => Ok(Some(read_str_ref(cur)?)),
+        other => Err(Error::runtime(format!("invalid optional string tag {other}"))),
+    }
+}
+
+fn read_str(cur: &mut &[u8]) -> Result<String, Error> {
+    read_str_ref(cur).map(str::to_owned)
 }
 
 fn read_opt_str(cur: &mut &[u8]) -> Result<Option<String>, Error> {
-    match read_u8(cur)? {
-        0 => Ok(None),
-        1 => Ok(Some(read_str(cur)?)),
-        other => Err(Error::runtime(format!("invalid optional string tag {other}"))),
-    }
+    Ok(read_opt_str_ref(cur)?.map(str::to_owned))
 }
 
 fn encode_consistency(out: &mut Vec<u8>, c: Consistency) {
@@ -337,99 +345,97 @@ fn decode_consistency(cur: &mut &[u8]) -> Result<Consistency, Error> {
     }
 }
 
-fn encode_err_payload(code: u8, msg: &str) -> Result<Vec<u8>, Error> {
-    let mut out = Vec::with_capacity(8 + msg.len());
-    out.push(1);
-    out.push(code);
-    push_str(&mut out, msg)?;
-    Ok(out)
-}
+const RETAIN_BUF_CAP: usize = 4 * 1024 * 1024;
+const SHRINK_BUF_TO: usize = 64 * 1024;
 
-fn write_frame(stream: &mut NetStream, op: u8, payload: &[u8]) -> Result<(), Error> {
-    if payload.len() > MAX_FRAME_BYTES {
-        return Err(Error::runtime(format!(
-            "frame payload {} exceeds max {}",
-            payload.len(),
-            MAX_FRAME_BYTES
-        )));
-    }
-    let len_u32 = u32::try_from(payload.len())
-        .map_err(|_| Error::runtime("frame payload length exceeds u32"))?;
+#[inline]
+fn begin_frame_buf(write_buf: &mut Vec<u8>, op: u8) {
+    write_buf.clear();
     let mut hdr = [0u8; 10];
     hdr[..5].copy_from_slice(WIRE_MAGIC);
     hdr[5] = op;
-    hdr[6..10].copy_from_slice(&len_u32.to_le_bytes());
-
-    let mut hasher = CrcHasher::new();
-    hasher.update(&hdr);
-    hasher.update(payload);
-    let crc = hasher.finalize();
-
-    let mut tail = [0u8; 8];
-    tail[..4].copy_from_slice(WIRE_CRC_TAG);
-    tail[4..8].copy_from_slice(&crc.to_le_bytes());
-
-    const STACK_MAX_PAYLOAD: usize = 4096;
-    if payload.len() <= STACK_MAX_PAYLOAD {
-        let mut buf = [0u8; 10 + STACK_MAX_PAYLOAD + 8];
-        buf[..10].copy_from_slice(&hdr);
-        buf[10..10 + payload.len()].copy_from_slice(payload);
-        buf[10 + payload.len()..18 + payload.len()].copy_from_slice(&tail);
-        stream
-            .write_all(&buf[..18 + payload.len()])
-            .map_err(io_err)?;
-    } else {
-        stream.write_all(&hdr).map_err(io_err)?;
-        stream.write_all(payload).map_err(io_err)?;
-        stream.write_all(&tail).map_err(io_err)?;
-    }
-    stream.flush().map_err(io_err)
+    write_buf.extend_from_slice(&hdr);
 }
 
-enum ReadFrameResult {
-    Frame { op: u8, payload: Vec<u8> },
+fn write_err_into_frame(write_buf: &mut Vec<u8>, op: u8, code: u8, msg: &str) -> Result<(), Error> {
+    begin_frame_buf(write_buf, op);
+    write_buf.push(1);
+    write_buf.push(code);
+    push_str(write_buf, msg)
+}
+
+fn finish_and_write_frame(stream: &mut NetStream, write_buf: &mut Vec<u8>) -> Result<(), Error> {
+    debug_assert!(write_buf.len() >= 10);
+    let payload_len = write_buf.len() - 10;
+    if payload_len > MAX_FRAME_BYTES {
+        return Err(Error::runtime(format!(
+            "frame payload {payload_len} exceeds max {MAX_FRAME_BYTES}"
+        )));
+    }
+    let len_u32 = u32::try_from(payload_len)
+        .map_err(|_| Error::runtime("frame payload length exceeds u32"))?;
+    write_buf[6..10].copy_from_slice(&len_u32.to_le_bytes());
+
+    let mut hasher = CrcHasher::new();
+    hasher.update(write_buf);
+    let crc = hasher.finalize();
+
+    write_buf.extend_from_slice(WIRE_CRC_TAG);
+    write_buf.extend_from_slice(&crc.to_le_bytes());
+
+    stream.write_all(write_buf).map_err(io_err)?;
+    stream.flush().map_err(io_err)?;
+
+    if write_buf.capacity() > RETAIN_BUF_CAP && write_buf.len() < SHRINK_BUF_TO {
+        write_buf.clear();
+        write_buf.shrink_to(SHRINK_BUF_TO);
+    }
+    Ok(())
+}
+
+enum ReadFrameStatus {
+    Frame(u8),
     Eof,
 }
 
-fn read_frame_idle(
+fn read_frame_into(
     stream: &mut NetStream,
     shutdown: Option<&AtomicBool>,
     io_timeout: Duration,
     max_frame_bytes: usize,
-) -> Result<ReadFrameResult, Error> {
+    read_buf: &mut Vec<u8>,
+) -> Result<ReadFrameStatus, Error> {
+    if read_buf.capacity() > RETAIN_BUF_CAP {
+        read_buf.clear();
+        read_buf.shrink_to(SHRINK_BUF_TO);
+    }
     let mut hdr = [0u8; 10];
     let mut read_hdr = 0usize;
-    let deadline = Instant::now() + io_timeout;
+    let idle_slice = IDLE_POLL_SLICE.min(io_timeout);
 
     while read_hdr < 10 {
         if shutdown.is_some() && read_hdr == 0 {
-            let _ = stream.set_timeout(Some(IDLE_POLL_SLICE));
+            let _ = stream.set_read_timeout(Some(idle_slice));
         }
         match stream.read(&mut hdr[read_hdr..]) {
             Ok(0) => {
                 if read_hdr == 0 {
-                    return Ok(ReadFrameResult::Eof);
+                    return Ok(ReadFrameStatus::Eof);
                 }
                 return Err(io_err("unexpected EOF in frame header"));
             }
             Ok(n) => {
                 if read_hdr == 0 && shutdown.is_some() {
-                    let _ = stream.set_timeout(Some(io_timeout));
+                    let _ = stream.set_read_timeout(Some(io_timeout));
                 }
                 read_hdr += n;
             }
             Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
                 if let Some(flag) = shutdown {
                     if flag.load(Ordering::Acquire) {
-                        return Ok(ReadFrameResult::Eof);
+                        return Ok(ReadFrameStatus::Eof);
                     }
                     if read_hdr == 0 {
-                        // Still idle between frames: wait cleanly until shutdown or next frame
-                        // (client disconnect will trigger EOF).
-                        if Instant::now() >= deadline && io_timeout < Duration::from_secs(1) {
-                            // Keep short test timeouts effective on active idle sockets too if configured < 1s
-                            // Wait: keep-alive connections should stay open until closed or shutdown.
-                        }
                         continue;
                     }
                 }
@@ -437,14 +443,10 @@ fn read_frame_idle(
             }
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
             Err(e) if e.kind() == ErrorKind::ConnectionReset && read_hdr == 0 => {
-                return Ok(ReadFrameResult::Eof);
+                return Ok(ReadFrameStatus::Eof);
             }
             Err(e) => return Err(io_err(e)),
         }
-    }
-
-    if shutdown.is_some() {
-        let _ = stream.set_timeout(Some(io_timeout));
     }
 
     if &hdr[..5] != WIRE_MAGIC {
@@ -458,20 +460,30 @@ fn read_frame_idle(
         )));
     }
 
-    let mut payload = vec![0u8; len];
-    if len > 0 {
-        stream.read_exact(&mut payload).map_err(io_err)?;
+    let wire_tail_len = len + 8;
+    if wire_tail_len <= (1 << 20) || read_buf.capacity() >= wire_tail_len {
+        read_buf.resize(wire_tail_len, 0);
+        stream.read_exact(&mut read_buf[..wire_tail_len]).map_err(io_err)?;
+    } else {
+        read_buf.clear();
+        read_buf.reserve(1 << 20);
+        Read::take(&mut *stream, wire_tail_len as u64)
+            .read_to_end(read_buf)
+            .map_err(io_err)?;
+        if read_buf.len() != wire_tail_len {
+            return Err(io_err("unexpected EOF in frame payload"));
+        }
     }
 
-    let mut tail = [0u8; 8];
-    stream.read_exact(&mut tail).map_err(io_err)?;
-    if &tail[..4] != WIRE_CRC_TAG {
+    if &read_buf[len..len + 4] != WIRE_CRC_TAG {
         return Err(Error::runtime("missing LCRC frame trailer"));
     }
-    let expected_crc = u32::from_le_bytes(tail[4..8].try_into().unwrap());
+    let expected_crc = u32::from_le_bytes(read_buf[len + 4..len + 8].try_into().unwrap());
+    read_buf.truncate(len);
+
     let mut hasher = CrcHasher::new();
     hasher.update(&hdr);
-    hasher.update(&payload);
+    hasher.update(read_buf);
     let actual_crc = hasher.finalize();
     if actual_crc != expected_crc {
         return Err(Error::runtime(format!(
@@ -479,7 +491,7 @@ fn read_frame_idle(
         )));
     }
 
-    Ok(ReadFrameResult::Frame { op, payload })
+    Ok(ReadFrameStatus::Frame(op))
 }
 
 // =========================================================================
@@ -590,33 +602,23 @@ impl ServerState {
         Ok(())
     }
 
-    fn resolve_workload_group(&self, req_name: Option<&str>, conn_name: Option<&str>) -> Result<WorkloadGroup, (u8, String)> {
+    fn resolve_workload_group<'a>(
+        &'a self,
+        req_name: Option<&str>,
+        conn_name: Option<&str>,
+    ) -> Result<&'a WorkloadGroup, (u8, String)> {
         let chosen = req_name.or(conn_name);
         match chosen {
-            None | Some("default") | Some("") => Ok(self.config.default_workload_group.clone()),
+            None | Some("default") | Some("") => Ok(&self.config.default_workload_group),
             Some(name) => self
                 .config
                 .workload_groups
                 .get(name)
-                .cloned()
                 .ok_or_else(|| (ERR_WORKLOAD_LIMIT, format!("unknown workload group {name:?}"))),
         }
     }
 
-    fn get_reader_for_stmts(&self, stmts: &[Stmt]) -> Result<Arc<ReadDb>, Error> {
-        if self.cold_unhydrated.load(Ordering::Acquire) {
-            let mut db_guard = self
-                .db
-                .lock()
-                .map_err(|_| Error::runtime("db lock poisoned"))?;
-            let db = db_guard
-                .as_mut()
-                .ok_or_else(|| Error::runtime("server database closed"))?;
-            let hydrated = db.hydrate_stmts_cold_tables(stmts)?;
-            if hydrated {
-                self.refresh_reader_locked(db);
-            }
-        }
+    fn get_hydrated_reader(&self) -> Result<Arc<ReadDb>, Error> {
         if let Some(reader) = self
             .cached_reader
             .read()
@@ -636,13 +638,29 @@ impl ServerState {
             .cached_reader
             .write()
             .map_err(|_| Error::runtime("cached reader lock poisoned"))?;
-        // Another reader may have rebuilt it while this one waited for the database.
         if let Some(reader) = cached.as_ref() {
             return Ok(Arc::clone(reader));
         }
         let reader = Arc::new(db.reader());
         *cached = Some(Arc::clone(&reader));
         Ok(reader)
+    }
+
+    fn get_reader_for_stmts(&self, stmts: &[Stmt]) -> Result<Arc<ReadDb>, Error> {
+        if self.cold_unhydrated.load(Ordering::Acquire) {
+            let mut db_guard = self
+                .db
+                .lock()
+                .map_err(|_| Error::runtime("db lock poisoned"))?;
+            let db = db_guard
+                .as_mut()
+                .ok_or_else(|| Error::runtime("server database closed"))?;
+            let hydrated = db.hydrate_stmts_cold_tables(stmts)?;
+            if hydrated {
+                self.refresh_reader_locked(db);
+            }
+        }
+        self.get_hydrated_reader()
     }
 }
 
@@ -942,7 +960,6 @@ fn run_accept_loop(
             let Ok(mut stream) = accept_net_stream(tcp, tls, st.config.io_timeout) else {
                 return;
             };
-            let _ = stream.set_timeout(Some(st.config.io_timeout));
             handle_client_connection(&mut stream, &st);
         });
         if let Ok(mut list) = client_threads.lock() {
@@ -1177,15 +1194,47 @@ fn apply_sync_payload(
     }
 }
 
+type WriteAckChan = (
+    mpsc::Sender<Result<WriteAck, Error>>,
+    mpsc::Receiver<Result<WriteAck, Error>>,
+);
+
+fn send_write_and_wait(
+    state: &ServerState,
+    op: WriteOp,
+    approx_bytes: usize,
+    ack_chan: &mut Option<WriteAckChan>,
+) -> Result<WriteAck, (u8, String)> {
+    let tx = state
+        .writer_tx
+        .as_ref()
+        .ok_or_else(|| (ERR_RUNTIME, "writer channel unavailable".to_string()))?;
+    let (resp_tx, resp_rx) = ack_chan.get_or_insert_with(mpsc::channel);
+    while resp_rx.try_recv().is_ok() {}
+    tx.send(WriteReq {
+        op,
+        approx_bytes,
+        resp: resp_tx.clone(),
+    })
+    .map_err(|_| (ERR_RUNTIME, "writer channel closed".to_string()))?;
+    resp_rx
+        .recv()
+        .map_err(|_| (ERR_RUNTIME, "writer dropped response".to_string()))?
+        .map_err(|e| (ERR_RUNTIME, e.to_string()))
+}
+
 fn handle_client_connection(stream: &mut NetStream, state: &Arc<ServerState>) {
     let mut authed = state.config.token.is_none();
     let mut conn_wg: Option<String> = None;
+    let mut read_buf = Vec::with_capacity(512);
+    let mut write_buf = Vec::with_capacity(512);
+    let mut ack_chan: Option<WriteAckChan> = None;
 
     loop {
         if state.shutdown.load(Ordering::Acquire) {
             break;
         }
-        let (op, payload) = match read_frame_idle(
+        let op = match read_frame_into(
             stream,
             Some(&state.shutdown),
             state.config.io_timeout,
@@ -1194,21 +1243,27 @@ fn handle_client_connection(stream: &mut NetStream, state: &Arc<ServerState>) {
             } else {
                 PREAUTH_MAX_FRAME_BYTES
             },
+            &mut read_buf,
         ) {
-            Ok(ReadFrameResult::Eof) => break,
-            Ok(ReadFrameResult::Frame { op, payload }) => (op, payload),
+            Ok(ReadFrameStatus::Eof) => break,
+            Ok(ReadFrameStatus::Frame(op)) => op,
             Err(_) => break,
         };
 
-        let resp = dispatch_rpc(op, &payload, state, &mut authed, &mut conn_wg);
-        let resp_bytes = match resp {
-            Ok(b) => b,
-            Err((code, msg)) => match encode_err_payload(code, &msg) {
-                Ok(b) => b,
-                Err(_) => break,
-            },
-        };
-        if write_frame(stream, op, &resp_bytes).is_err() {
+        begin_frame_buf(&mut write_buf, op);
+        if let Err((code, msg)) = dispatch_rpc(
+            op,
+            &read_buf,
+            state,
+            &mut authed,
+            &mut conn_wg,
+            &mut ack_chan,
+            &mut write_buf,
+        ) && write_err_into_frame(&mut write_buf, op, code, &msg).is_err()
+        {
+            break;
+        }
+        if finish_and_write_frame(stream, &mut write_buf).is_err() {
             break;
         }
     }
@@ -1220,27 +1275,28 @@ fn dispatch_rpc(
     state: &Arc<ServerState>,
     authed: &mut bool,
     conn_wg: &mut Option<String>,
-) -> Result<Vec<u8>, (u8, String)> {
+    ack_chan: &mut Option<WriteAckChan>,
+    out: &mut Vec<u8>,
+) -> Result<(), (u8, String)> {
     let mut cur = payload;
     if op == OP_HELLO {
-        let token = read_str(&mut cur).map_err(|e| (ERR_RUNTIME, e.to_string()))?;
+        let token = read_str_ref(&mut cur).map_err(|e| (ERR_RUNTIME, e.to_string()))?;
         let wg = read_opt_str(&mut cur).map_err(|e| (ERR_RUNTIME, e.to_string()))?;
         if let Some(expected) = &state.config.token
-            && !token_eq(&token, expected)
+            && !token_eq(token, expected)
         {
             *authed = false;
             return Err((ERR_UNAUTHORIZED, "invalid authentication token".to_string()));
         }
         *authed = true;
         *conn_wg = wg;
-        let mut out = Vec::with_capacity(16);
         out.push(0);
         out.push(match state.config.role {
             NodeRole::Primary => 0,
             NodeRole::Follower => 1,
         });
         out.extend_from_slice(&state.current_gen().to_le_bytes());
-        return Ok(out);
+        return Ok(());
     }
 
     if !*authed {
@@ -1252,19 +1308,18 @@ fn dispatch_rpc(
 
     match op {
         OP_PING => {
-            let mut out = Vec::with_capacity(16);
             out.push(0);
             out.push(match state.config.role {
                 NodeRole::Primary => 0,
                 NodeRole::Follower => 1,
             });
             out.extend_from_slice(&state.current_gen().to_le_bytes());
-            Ok(out)
+            Ok(())
         }
-        OP_EXECUTE => handle_execute(cur, state, conn_wg.as_deref()),
-        OP_INSERT_BATCH => handle_insert_batch(cur, state),
-        OP_PARTIAL_SUMMARIZE => handle_partial_summarize(cur, state, conn_wg.as_deref()),
-        OP_PULL_SYNC => handle_pull_sync(cur, state),
+        OP_EXECUTE => handle_execute(cur, state, conn_wg.as_deref(), ack_chan, out),
+        OP_INSERT_BATCH => handle_insert_batch(cur, state, ack_chan, out),
+        OP_PARTIAL_SUMMARIZE => handle_partial_summarize(cur, state, conn_wg.as_deref(), out),
+        OP_PULL_SYNC => handle_pull_sync(cur, state, out),
         other => Err((ERR_RUNTIME, format!("unknown rpc op {other:#x}"))),
     }
 }
@@ -1274,7 +1329,8 @@ fn finish_read_execute(
     read_gen: u64,
     batch: RecordBatch,
     wg: &WorkloadGroup,
-) -> Result<Vec<u8>, (u8, String)> {
+    out: &mut Vec<u8>,
+) -> Result<(), (u8, String)> {
     if let Some(qto) = wg.query_timeout
         && t0.elapsed() > qto
     {
@@ -1314,20 +1370,22 @@ fn finish_read_execute(
         ));
     }
     let elapsed_us = u64::try_from(t0.elapsed().as_micros()).unwrap_or(u64::MAX);
-    encode_execute_ok(read_gen, 0, elapsed_us, 1, Some(&batch_wire), None)
+    encode_execute_ok(out, read_gen, 0, elapsed_us, 1, Some(&batch_wire), None)
 }
 
 fn handle_execute(
     mut cur: &[u8],
     state: &Arc<ServerState>,
     conn_wg: Option<&str>,
-) -> Result<Vec<u8>, (u8, String)> {
+    ack_chan: &mut Option<WriteAckChan>,
+    out: &mut Vec<u8>,
+) -> Result<(), (u8, String)> {
     let consistency = decode_consistency(&mut cur).map_err(|e| (ERR_RUNTIME, e.to_string()))?;
-    let wg_name = read_opt_str(&mut cur).map_err(|e| (ERR_RUNTIME, e.to_string()))?;
+    let wg_name = read_opt_str_ref(&mut cur).map_err(|e| (ERR_RUNTIME, e.to_string()))?;
     let timeout_ms = read_u64_le(&mut cur).map_err(|e| (ERR_RUNTIME, e.to_string()))?;
-    let linql = read_str(&mut cur).map_err(|e| (ERR_RUNTIME, e.to_string()))?;
+    let linql = read_str_ref(&mut cur).map_err(|e| (ERR_RUNTIME, e.to_string()))?;
 
-    let wg = state.resolve_workload_group(wg_name.as_deref(), conn_wg)?;
+    let wg = state.resolve_workload_group(wg_name, conn_wg)?;
     let mut wait_budget = state.config.consistency_wait_timeout;
     if let Some(qto) = wg.query_timeout {
         wait_budget = wait_budget.min(qto);
@@ -1342,7 +1400,7 @@ fn handle_execute(
     if !state.cold_unhydrated.load(Ordering::Acquire)
         && let Ok(guard) = state.cached_reader.read()
         && let Some(reader) = guard.as_ref().cloned()
-        && let Some(prep) = reader.get_cached_prepared(&linql)
+        && let Some(prep) = reader.get_cached_prepared(linql)
         && !prep.writes
         && !prep.stmts.is_empty()
         && prep.stmts.iter().all(|s| matches!(s, Stmt::Query(_)))
@@ -1361,10 +1419,10 @@ fn handle_execute(
         let batch = reader
             .run_prepared_batch_lossless(&prep)
             .map_err(|e| (ERR_RUNTIME, e.to_string()))?;
-        return finish_read_execute(t0, read_gen, batch, &wg);
+        return finish_read_execute(t0, read_gen, batch, wg, out);
     }
 
-    let stmts = crate::parse::parse_program(&linql).map_err(|e| (ERR_RUNTIME, e.to_string()))?;
+    let stmts = crate::parse::parse_program(linql).map_err(|e| (ERR_RUNTIME, e.to_string()))?;
     let is_read_only = !stmts.is_empty() && stmts.iter().all(|s| matches!(s, Stmt::Query(_)));
 
     if is_read_only {
@@ -1375,9 +1433,9 @@ fn handle_execute(
             .map_err(|e| (ERR_RUNTIME, e.to_string()))?;
         let read_gen = reader.r#gen();
         let batch = reader
-            .run_batch_lossless_with_stmts(&linql, stmts)
+            .run_batch_lossless_with_stmts(linql, stmts)
             .map_err(|e| (ERR_RUNTIME, e.to_string()))?;
-        finish_read_execute(t0, read_gen, batch, &wg)
+        finish_read_execute(t0, read_gen, batch, wg, out)
     } else {
         if state.config.role == NodeRole::Follower {
             return Err((
@@ -1385,36 +1443,31 @@ fn handle_execute(
                 "follower is read-only; writes must target primary".to_string(),
             ));
         }
-        let tx = state
-            .writer_tx
-            .as_ref()
-            .ok_or_else(|| (ERR_RUNTIME, "writer channel unavailable".to_string()))?;
         let approx_bytes = linql.len().max(1);
-        let (resp_tx, resp_rx) = mpsc::channel();
-        tx.send(WriteReq {
-            op: WriteOp::Linql { src: linql, stmts },
+        let ack = send_write_and_wait(
+            state,
+            WriteOp::Linql {
+                src: linql.to_owned(),
+                stmts,
+            },
             approx_bytes,
-            resp: resp_tx,
-        })
-        .map_err(|_| (ERR_RUNTIME, "writer channel closed".to_string()))?;
-        let ack = resp_rx
-            .recv()
-            .map_err(|_| (ERR_RUNTIME, "writer dropped response".to_string()))?
-            .map_err(|e| (ERR_RUNTIME, e.to_string()))?;
+            ack_chan,
+        )?;
         let elapsed_us = u64::try_from(t0.elapsed().as_micros()).unwrap_or(u64::MAX);
-        encode_execute_ok(ack.r#gen, ack.affected, elapsed_us, ack.group_size, None, None)
+        encode_execute_ok(out, ack.r#gen, ack.affected, elapsed_us, ack.group_size, None, None)
     }
 }
 
 fn encode_execute_ok(
+    out: &mut Vec<u8>,
     r#gen: u64,
     affected: usize,
     elapsed_us: u64,
     group_size: usize,
     batch_wire: Option<&[u8]>,
     message: Option<&str>,
-) -> Result<Vec<u8>, (u8, String)> {
-    let mut out = Vec::with_capacity(48 + batch_wire.map_or(0, |b| b.len()));
+) -> Result<(), (u8, String)> {
+    out.reserve(48 + batch_wire.map_or(0, |b| b.len()));
     out.push(0);
     out.extend_from_slice(&r#gen.to_le_bytes());
     out.extend_from_slice(&(affected as u64).to_le_bytes());
@@ -1423,15 +1476,20 @@ fn encode_execute_ok(
     match batch_wire {
         Some(b) => {
             out.push(1);
-            push_u32_bytes(&mut out, b).map_err(|e| (ERR_RUNTIME, e.to_string()))?;
+            push_u32_bytes(out, b).map_err(|e| (ERR_RUNTIME, e.to_string()))?;
         }
         None => out.push(0),
     }
-    push_opt_str(&mut out, message).map_err(|e| (ERR_RUNTIME, e.to_string()))?;
-    Ok(out)
+    push_opt_str(out, message).map_err(|e| (ERR_RUNTIME, e.to_string()))?;
+    Ok(())
 }
 
-fn handle_insert_batch(mut cur: &[u8], state: &Arc<ServerState>) -> Result<Vec<u8>, (u8, String)> {
+fn handle_insert_batch(
+    mut cur: &[u8],
+    state: &Arc<ServerState>,
+    ack_chan: &mut Option<WriteAckChan>,
+    out: &mut Vec<u8>,
+) -> Result<(), (u8, String)> {
     if state.config.role == NodeRole::Follower {
         return Err((
             ERR_READ_ONLY_FOLLOWER,
@@ -1447,36 +1505,28 @@ fn handle_insert_batch(mut cur: &[u8], state: &Arc<ServerState>) -> Result<Vec<u
         .saturating_add(wire_bytes.len().max(batch.byte_size()))
         .max(1);
 
-    let tx = state
-        .writer_tx
-        .as_ref()
-        .ok_or_else(|| (ERR_RUNTIME, "writer channel unavailable".to_string()))?;
     let t0 = Instant::now();
-    let (resp_tx, resp_rx) = mpsc::channel();
-    tx.send(WriteReq {
-        op: WriteOp::InsertBatch { collection, batch },
+    let ack = send_write_and_wait(
+        state,
+        WriteOp::InsertBatch { collection, batch },
         approx_bytes,
-        resp: resp_tx,
-    })
-    .map_err(|_| (ERR_RUNTIME, "writer channel closed".to_string()))?;
-    let ack = resp_rx
-        .recv()
-        .map_err(|_| (ERR_RUNTIME, "writer dropped response".to_string()))?
-        .map_err(|e| (ERR_RUNTIME, e.to_string()))?;
+        ack_chan,
+    )?;
     let elapsed_us = u64::try_from(t0.elapsed().as_micros()).unwrap_or(u64::MAX);
-    encode_execute_ok(ack.r#gen, ack.affected, elapsed_us, ack.group_size, None, None)
+    encode_execute_ok(out, ack.r#gen, ack.affected, elapsed_us, ack.group_size, None, None)
 }
 
 fn handle_partial_summarize(
     mut cur: &[u8],
     state: &Arc<ServerState>,
     conn_wg: Option<&str>,
-) -> Result<Vec<u8>, (u8, String)> {
+    out: &mut Vec<u8>,
+) -> Result<(), (u8, String)> {
     let consistency = decode_consistency(&mut cur).map_err(|e| (ERR_RUNTIME, e.to_string()))?;
-    let wg_name = read_opt_str(&mut cur).map_err(|e| (ERR_RUNTIME, e.to_string()))?;
-    let linql = read_str(&mut cur).map_err(|e| (ERR_RUNTIME, e.to_string()))?;
+    let wg_name = read_opt_str_ref(&mut cur).map_err(|e| (ERR_RUNTIME, e.to_string()))?;
+    let linql = read_str_ref(&mut cur).map_err(|e| (ERR_RUNTIME, e.to_string()))?;
 
-    let wg = state.resolve_workload_group(wg_name.as_deref(), conn_wg)?;
+    let wg = state.resolve_workload_group(wg_name, conn_wg)?;
     let t0 = Instant::now();
     let wait_budget = match wg.query_timeout {
         Some(qto) => state.config.consistency_wait_timeout.min(qto),
@@ -1484,22 +1534,41 @@ fn handle_partial_summarize(
     };
     state.ensure_consistency(consistency, t0 + wait_budget)?;
 
-    let stmt = crate::parse::parse(&linql).map_err(|e| (ERR_RUNTIME, e.to_string()))?;
-    if !matches!(stmt, Stmt::Query(_)) {
-        return Err((
-            ERR_RUNTIME,
-            "partial_summarize requires a query statement".to_string(),
-        ));
-    }
-    let reader = state
-        .get_reader_for_stmts(std::slice::from_ref(&stmt))
-        .map_err(|e| (ERR_RUNTIME, e.to_string()))?;
-    let Stmt::Query(q) = stmt else {
-        unreachable!()
+    let (read_gen, lagg_bytes) = if !state.cold_unhydrated.load(Ordering::Acquire) {
+        let reader = state
+            .get_hydrated_reader()
+            .map_err(|e| (ERR_RUNTIME, e.to_string()))?;
+        let prep = reader
+            .prepare(linql)
+            .map_err(|e| (ERR_RUNTIME, e.to_string()))?;
+        let [Stmt::Query(q)] = &prep.stmts[..] else {
+            return Err((
+                ERR_RUNTIME,
+                "partial_summarize requires a query statement".to_string(),
+            ));
+        };
+        let bytes = eval_partial_summarize_query_on_reader(&reader, q)
+            .map_err(|e| (ERR_RUNTIME, e.to_string()))?;
+        (reader.r#gen(), bytes)
+    } else {
+        let stmt = crate::parse::parse(linql).map_err(|e| (ERR_RUNTIME, e.to_string()))?;
+        if !matches!(stmt, Stmt::Query(_)) {
+            return Err((
+                ERR_RUNTIME,
+                "partial_summarize requires a query statement".to_string(),
+            ));
+        }
+        let reader = state
+            .get_reader_for_stmts(std::slice::from_ref(&stmt))
+            .map_err(|e| (ERR_RUNTIME, e.to_string()))?;
+        let Stmt::Query(q) = stmt else {
+            unreachable!()
+        };
+        let bytes = eval_partial_summarize_query_on_reader(&reader, &q)
+            .map_err(|e| (ERR_RUNTIME, e.to_string()))?;
+        (reader.r#gen(), bytes)
     };
-    let read_gen = reader.r#gen();
-    let lagg_bytes = eval_partial_summarize_query_on_reader(&reader, &q)
-        .map_err(|e| (ERR_RUNTIME, e.to_string()))?;
+
     if lagg_bytes.len() > wg.max_result_bytes {
         return Err((
             ERR_WORKLOAD_LIMIT,
@@ -1510,11 +1579,11 @@ fn handle_partial_summarize(
             ),
         ));
     }
-    let mut out = Vec::with_capacity(16 + lagg_bytes.len());
+    out.reserve(16 + lagg_bytes.len());
     out.push(0);
     out.extend_from_slice(&read_gen.to_le_bytes());
-    push_u32_bytes(&mut out, &lagg_bytes).map_err(|e| (ERR_RUNTIME, e.to_string()))?;
-    Ok(out)
+    push_u32_bytes(out, &lagg_bytes).map_err(|e| (ERR_RUNTIME, e.to_string()))?;
+    Ok(())
 }
 
 fn record_replica_progress(state: &ServerState, follower_id: Option<&str>, reported_gen: u64) {
@@ -1572,7 +1641,11 @@ fn read_wal_window_lockfree(
     }
 }
 
-fn handle_pull_sync(mut cur: &[u8], state: &Arc<ServerState>) -> Result<Vec<u8>, (u8, String)> {
+fn handle_pull_sync(
+    mut cur: &[u8],
+    state: &Arc<ServerState>,
+    out: &mut Vec<u8>,
+) -> Result<(), (u8, String)> {
     let since_gen = read_u64_le(&mut cur).map_err(|e| (ERR_RUNTIME, e.to_string()))?;
     let force_bootstrap = read_u8(&mut cur).map_err(|e| (ERR_RUNTIME, e.to_string()))? != 0;
     let wait_ms = if cur.len() >= 8 {
@@ -1581,12 +1654,12 @@ fn handle_pull_sync(mut cur: &[u8], state: &Arc<ServerState>) -> Result<Vec<u8>,
         0
     };
     let follower_id = if !cur.is_empty() {
-        Some(read_str(&mut cur).map_err(|e| (ERR_RUNTIME, e.to_string()))?)
+        Some(read_str_ref(&mut cur).map_err(|e| (ERR_RUNTIME, e.to_string()))?)
     } else {
         None
     };
 
-    record_replica_progress(state, follower_id.as_deref(), since_gen);
+    record_replica_progress(state, follower_id, since_gen);
 
     // Idle follower polls answer from the published atomic generation (or wait on `gen_cv`
     // when long-polling) so they never touch the primary writer mutex while caught up.
@@ -1613,11 +1686,10 @@ fn handle_pull_sync(mut cur: &[u8], state: &Arc<ServerState>) -> Result<Vec<u8>,
     }
 
     if !force_bootstrap && since_gen >= published {
-        let mut out = Vec::with_capacity(16);
         out.push(0);
         out.push(0); // UpToDate
         out.extend_from_slice(&published.to_le_bytes());
-        return Ok(out);
+        return Ok(());
     }
 
     let max_lag = state.max_replica_lag_gens.load(Ordering::Acquire);
@@ -1636,11 +1708,10 @@ fn handle_pull_sync(mut cur: &[u8], state: &Arc<ServerState>) -> Result<Vec<u8>,
                 .ok_or_else(|| (ERR_RUNTIME, "server database closed".to_string()))?;
             let cur_gen = db.r#gen();
             if since_gen >= cur_gen {
-                let mut out = Vec::with_capacity(16);
                 out.push(0);
                 out.push(0); // UpToDate
                 out.extend_from_slice(&cur_gen.to_le_bytes());
-                return Ok(out);
+                return Ok(());
             }
             if max_lag > 0 && cur_gen.saturating_sub(since_gen) > max_lag {
                 None
@@ -1652,12 +1723,12 @@ fn handle_pull_sync(mut cur: &[u8], state: &Arc<ServerState>) -> Result<Vec<u8>,
             && let Some(wal_bytes) =
                 read_wal_window_lockfree(&dir, start_off, end_off, since_gen, cur_gen)
         {
-            let mut out = Vec::with_capacity(16 + wal_bytes.len());
+            out.reserve(16 + wal_bytes.len());
             out.push(0);
             out.push(1); // Wal
             out.extend_from_slice(&cur_gen.to_le_bytes());
-            push_u32_bytes(&mut out, &wal_bytes).map_err(|e| (ERR_RUNTIME, e.to_string()))?;
-            return Ok(out);
+            push_u32_bytes(out, &wal_bytes).map_err(|e| (ERR_RUNTIME, e.to_string()))?;
+            return Ok(());
         }
     }
 
@@ -1671,11 +1742,10 @@ fn handle_pull_sync(mut cur: &[u8], state: &Arc<ServerState>) -> Result<Vec<u8>,
     let cur_gen = db.r#gen();
 
     if !force_bootstrap && since_gen >= cur_gen {
-        let mut out = Vec::with_capacity(16);
         out.push(0);
         out.push(0); // UpToDate
         out.extend_from_slice(&cur_gen.to_le_bytes());
-        return Ok(out);
+        return Ok(());
     }
 
     let lag_exceeded = max_lag > 0 && cur_gen.saturating_sub(since_gen) > max_lag;
@@ -1698,12 +1768,12 @@ fn handle_pull_sync(mut cur: &[u8], state: &Arc<ServerState>) -> Result<Vec<u8>,
                 && first_gen.is_some_and(|fg| fg <= since_gen.saturating_add(1))
                 && last_gen == Some(cur_gen)
             {
-                let mut out = Vec::with_capacity(16 + wal_bytes.len());
+                out.reserve(16 + wal_bytes.len());
                 out.push(0);
                 out.push(1); // Wal
                 out.extend_from_slice(&cur_gen.to_le_bytes());
-                push_u32_bytes(&mut out, &wal_bytes).map_err(|e| (ERR_RUNTIME, e.to_string()))?;
-                return Ok(out);
+                push_u32_bytes(out, &wal_bytes).map_err(|e| (ERR_RUNTIME, e.to_string()))?;
+                return Ok(());
             }
         }
     }
@@ -1712,34 +1782,40 @@ fn handle_pull_sync(mut cur: &[u8], state: &Arc<ServerState>) -> Result<Vec<u8>,
         .capture_bootstrap_bundle()
         .map_err(|e| (ERR_RUNTIME, e.to_string()))?;
     let seg_bytes: usize = cold_segments.iter().map(|(_, b)| 12 + b.len()).sum();
-    let mut out = Vec::with_capacity(
+    out.reserve(
         32 + snap_bytes.len() + cold_manifest_json.len() + cold_tombstones.len() + seg_bytes,
     );
     out.push(0);
     out.push(2); // Bootstrap
     out.extend_from_slice(&bundle_gen.to_le_bytes());
-    push_u32_bytes(&mut out, &snap_bytes).map_err(|e| (ERR_RUNTIME, e.to_string()))?;
-    push_u32_bytes(&mut out, &cold_manifest_json).map_err(|e| (ERR_RUNTIME, e.to_string()))?;
-    push_u32_bytes(&mut out, &cold_tombstones).map_err(|e| (ERR_RUNTIME, e.to_string()))?;
+    push_u32_bytes(out, &snap_bytes).map_err(|e| (ERR_RUNTIME, e.to_string()))?;
+    push_u32_bytes(out, &cold_manifest_json).map_err(|e| (ERR_RUNTIME, e.to_string()))?;
+    push_u32_bytes(out, &cold_tombstones).map_err(|e| (ERR_RUNTIME, e.to_string()))?;
     let seg_cnt = u32::try_from(cold_segments.len())
         .map_err(|_| (ERR_RUNTIME, "too many cold segments".to_string()))?;
     out.extend_from_slice(&seg_cnt.to_le_bytes());
     for (seg_id, lseg) in cold_segments {
         out.extend_from_slice(&seg_id.to_le_bytes());
-        push_u32_bytes(&mut out, &lseg).map_err(|e| (ERR_RUNTIME, e.to_string()))?;
+        push_u32_bytes(out, &lseg).map_err(|e| (ERR_RUNTIME, e.to_string()))?;
     }
-    Ok(out)
+    Ok(())
 }
 
 // =========================================================================
 // Keep-alive TCP/TLS RPC Client & ReplicaPoolClient
 // =========================================================================
 
+struct ClientConn {
+    stream: NetStream,
+    read_buf: Vec<u8>,
+    write_buf: Vec<u8>,
+}
+
 /// Thread-safe, keep-alive RPC client to a single [`LinServer`].
 pub struct ServerClient {
     addr: String,
     opts: ClientOpts,
-    pool: Mutex<Vec<NetStream>>,
+    pool: Mutex<Vec<ClientConn>>,
     session_gen: AtomicU64,
 }
 
@@ -1763,9 +1839,9 @@ impl ServerClient {
             pool: Mutex::new(Vec::new()),
             session_gen: AtomicU64::new(0),
         };
-        let (stream, cur_gen) = client.open_authenticated()?;
-        client.session_gen.fetch_max(cur_gen, Ordering::AcqRel);
-        client.return_stream(stream);
+        let (conn, cur_gen) = client.open_authenticated()?;
+        client.advance_session_gen(cur_gen);
+        client.return_conn(conn);
         Ok(client)
     }
 
@@ -1777,96 +1853,124 @@ impl ServerClient {
         self.session_gen.load(Ordering::Acquire)
     }
 
+    #[inline]
     pub fn advance_session_gen(&self, r#gen: u64) {
-        self.session_gen.fetch_max(r#gen, Ordering::AcqRel);
+        if r#gen > self.session_gen.load(Ordering::Relaxed) {
+            self.session_gen.fetch_max(r#gen, Ordering::AcqRel);
+        }
     }
 
-    fn open_authenticated(&self) -> Result<(NetStream, u64), Error> {
+    fn open_authenticated(&self) -> Result<(ClientConn, u64), Error> {
         let pull = self.opts.to_pull_opts();
         let mut stream = connect_net_stream(&self.addr, &pull, self.opts.timeout)?;
         stream.set_timeout(Some(self.opts.timeout))?;
-        let mut hello = Vec::with_capacity(64);
-        push_str(&mut hello, self.opts.token.as_deref().unwrap_or(""))?;
-        push_opt_str(&mut hello, self.opts.workload_group.as_deref())?;
-        write_frame(&mut stream, OP_HELLO, &hello)?;
-        let resp = match read_frame_idle(&mut stream, None, self.opts.timeout, MAX_FRAME_BYTES)? {
-            ReadFrameResult::Frame { op, payload } if op == OP_HELLO => payload,
-            ReadFrameResult::Frame { op, .. } => {
+        let mut write_buf = Vec::with_capacity(512);
+        let mut read_buf = Vec::with_capacity(512);
+        begin_frame_buf(&mut write_buf, OP_HELLO);
+        push_str(&mut write_buf, self.opts.token.as_deref().unwrap_or(""))?;
+        push_opt_str(&mut write_buf, self.opts.workload_group.as_deref())?;
+        finish_and_write_frame(&mut stream, &mut write_buf)?;
+        match read_frame_into(&mut stream, None, self.opts.timeout, MAX_FRAME_BYTES, &mut read_buf)? {
+            ReadFrameStatus::Frame(op) if op == OP_HELLO => {}
+            ReadFrameStatus::Frame(op) => {
                 return Err(Error::runtime(format!("unexpected hello reply op {op}")));
             }
-            ReadFrameResult::Eof => return Err(io_err("server closed connection during handshake")),
-        };
-        let mut cur = resp.as_slice();
+            ReadFrameStatus::Eof => return Err(io_err("server closed connection during handshake")),
+        }
+        let mut cur = read_buf.as_slice();
         match read_u8(&mut cur)? {
             0 => {
                 let _role = read_u8(&mut cur)?;
                 let cur_gen = read_u64_le(&mut cur)?;
-                Ok((stream, cur_gen))
+                Ok((
+                    ClientConn {
+                        stream,
+                        read_buf,
+                        write_buf,
+                    },
+                    cur_gen,
+                ))
             }
             _ => {
                 let code = read_u8(&mut cur)?;
-                let msg = read_str(&mut cur)?;
-                Err(wire_err(code, &msg))
+                let msg = read_str_ref(&mut cur)?;
+                Err(wire_err(code, msg))
             }
         }
     }
 
-    fn take_stream(&self) -> Result<NetStream, Error> {
+    fn take_stream(&self) -> Result<(ClientConn, bool), Error> {
         if let Ok(mut guard) = self.pool.lock()
-            && let Some(s) = guard.pop()
+            && let Some(conn) = guard.pop()
         {
-            return Ok(s);
+            return Ok((conn, true));
         }
-        let (stream, cur_gen) = self.open_authenticated()?;
-        self.session_gen.fetch_max(cur_gen, Ordering::AcqRel);
-        Ok(stream)
+        let (conn, cur_gen) = self.open_authenticated()?;
+        self.advance_session_gen(cur_gen);
+        Ok((conn, false))
     }
 
-    fn return_stream(&self, stream: NetStream) {
+    fn return_conn(&self, conn: ClientConn) {
         if let Ok(mut guard) = self.pool.lock()
             && guard.len() < MAX_POOLED_CONNS
         {
-            guard.push(stream);
+            guard.push(conn);
         }
     }
 
-    fn rpc_call(
+    fn rpc_call<R>(
         &self,
         op: u8,
-        payload: &[u8],
+        encode_req: impl Fn(&mut Vec<u8>) -> Result<(), Error>,
         retry_stale: impl FnOnce() -> bool,
-    ) -> Result<Vec<u8>, Error> {
-        let had_pooled = self.pool.lock().map(|g| !g.is_empty()).unwrap_or(false);
-        let mut stream = self.take_stream()?;
-        match self.send_and_recv(&mut stream, op, payload) {
-            Ok(resp) => {
-                self.return_stream(stream);
-                Ok(resp)
+        decode_resp: impl FnOnce(&[u8]) -> Result<R, Error>,
+    ) -> Result<R, Error> {
+        let (mut conn, from_pool) = self.take_stream()?;
+        match self.send_and_recv(&mut conn, op, &encode_req) {
+            Ok(()) => {
+                let decoded = decode_resp(&conn.read_buf);
+                self.return_conn(conn);
+                decoded
             }
-            Err(first_err) if had_pooled && retry_stale() => {
-                drop(stream);
+            Err(first_err) if from_pool && retry_stale() => {
+                drop(conn);
                 let (mut fresh, cur_gen) = self.open_authenticated()?;
-                self.session_gen.fetch_max(cur_gen, Ordering::AcqRel);
-                let resp = self.send_and_recv(&mut fresh, op, payload).map_err(|_| first_err)?;
-                self.return_stream(fresh);
-                Ok(resp)
+                self.advance_session_gen(cur_gen);
+                self.send_and_recv(&mut fresh, op, &encode_req)
+                    .map_err(|_| first_err)?;
+                let decoded = decode_resp(&fresh.read_buf);
+                self.return_conn(fresh);
+                decoded
             }
             Err(err) => Err(err),
         }
     }
 
-    fn send_and_recv(&self, stream: &mut NetStream, op: u8, payload: &[u8]) -> Result<Vec<u8>, Error> {
-        write_frame(stream, op, payload)?;
-        match read_frame_idle(stream, None, self.opts.timeout, MAX_FRAME_BYTES)? {
-            ReadFrameResult::Frame { op: resp_op, payload } => {
+    fn send_and_recv(
+        &self,
+        conn: &mut ClientConn,
+        op: u8,
+        encode_req: &impl Fn(&mut Vec<u8>) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        begin_frame_buf(&mut conn.write_buf, op);
+        encode_req(&mut conn.write_buf)?;
+        finish_and_write_frame(&mut conn.stream, &mut conn.write_buf)?;
+        match read_frame_into(
+            &mut conn.stream,
+            None,
+            self.opts.timeout,
+            MAX_FRAME_BYTES,
+            &mut conn.read_buf,
+        )? {
+            ReadFrameStatus::Frame(resp_op) => {
                 if resp_op != op {
                     return Err(Error::runtime(format!(
                         "mismatched rpc reply op: sent {op}, got {resp_op}"
                     )));
                 }
-                Ok(payload)
+                Ok(())
             }
-            ReadFrameResult::Eof => Err(io_err("unexpected EOF waiting for RPC response")),
+            ReadFrameStatus::Eof => Err(io_err("unexpected EOF waiting for RPC response")),
         }
     }
 
@@ -1885,18 +1989,25 @@ impl ServerClient {
     }
 
     pub fn ping(&self) -> Result<(NodeRole, u64), Error> {
-        let resp = self.rpc_call(OP_PING, &[], || true)?;
-        let mut cur = resp.as_slice();
-        if read_u8(&mut cur)? != 0 {
-            let code = read_u8(&mut cur)?;
-            let msg = read_str(&mut cur)?;
-            return Err(wire_err(code, &msg));
-        }
-        let role = match read_u8(&mut cur)? {
-            0 => NodeRole::Primary,
-            _ => NodeRole::Follower,
-        };
-        let cur_gen = read_u64_le(&mut cur)?;
+        let (role, cur_gen) = self.rpc_call(
+            OP_PING,
+            |_| Ok(()),
+            || true,
+            |resp| {
+                let mut cur = resp;
+                if read_u8(&mut cur)? != 0 {
+                    let code = read_u8(&mut cur)?;
+                    let msg = read_str_ref(&mut cur)?;
+                    return Err(wire_err(code, msg));
+                }
+                let role = match read_u8(&mut cur)? {
+                    0 => NodeRole::Primary,
+                    _ => NodeRole::Follower,
+                };
+                let cur_gen = read_u64_le(&mut cur)?;
+                Ok((role, cur_gen))
+            },
+        )?;
         self.advance_session_gen(cur_gen);
         Ok((role, cur_gen))
     }
@@ -1911,17 +2022,24 @@ impl ServerClient {
         consistency: Consistency,
     ) -> Result<ExecutionReceipt, Error> {
         let eff = self.effective_consistency(consistency);
-        let mut req = Vec::with_capacity(32 + linql.len());
-        encode_consistency(&mut req, eff);
-        push_opt_str(&mut req, self.opts.workload_group.as_deref())?;
         let to_ms = u64::try_from(self.opts.timeout.as_millis()).unwrap_or(u64::MAX);
-        req.extend_from_slice(&to_ms.to_le_bytes());
-        push_str(&mut req, linql)?;
-        let resp = self.rpc_call(OP_EXECUTE, &req, || {
-            crate::parse::parse_program(linql)
-                .is_ok_and(|stmts| !stmts.is_empty() && stmts.iter().all(|s| matches!(s, Stmt::Query(_))))
-        })?;
-        let receipt = decode_execute_resp(&resp)?;
+        let wg = self.opts.workload_group.as_deref();
+        let receipt = self.rpc_call(
+            OP_EXECUTE,
+            |req| {
+                req.reserve(32 + linql.len());
+                encode_consistency(req, eff);
+                push_opt_str(req, wg)?;
+                req.extend_from_slice(&to_ms.to_le_bytes());
+                push_str(req, linql)
+            },
+            || {
+                crate::parse::parse_program(linql).is_ok_and(|stmts| {
+                    !stmts.is_empty() && stmts.iter().all(|s| matches!(s, Stmt::Query(_)))
+                })
+            },
+            decode_execute_resp,
+        )?;
         self.advance_session_gen(receipt.r#gen);
         Ok(receipt)
     }
@@ -1937,10 +2055,10 @@ impl ServerClient {
         linql: &str,
         consistency: Consistency,
     ) -> Result<(RecordBatch, ExecutionReceipt), Error> {
-        let receipt = self.execute_with_consistency(linql, consistency)?;
+        let mut receipt = self.execute_with_consistency(linql, consistency)?;
         let batch = receipt
             .batch
-            .clone()
+            .take()
             .unwrap_or_else(|| RecordBatch::empty(Vec::<String>::new()));
         Ok((batch, receipt))
     }
@@ -1951,11 +2069,16 @@ impl ServerClient {
         batch: &RecordBatch,
     ) -> Result<ExecutionReceipt, Error> {
         let wire = batch.to_wire_bytes();
-        let mut req = Vec::with_capacity(16 + collection.len() + wire.len());
-        push_str(&mut req, collection)?;
-        push_u32_bytes(&mut req, &wire)?;
-        let resp = self.rpc_call(OP_INSERT_BATCH, &req, || false)?;
-        let receipt = decode_execute_resp(&resp)?;
+        let receipt = self.rpc_call(
+            OP_INSERT_BATCH,
+            |req| {
+                req.reserve(16 + collection.len() + wire.len());
+                push_str(req, collection)?;
+                push_u32_bytes(req, &wire)
+            },
+            || false,
+            decode_execute_resp,
+        )?;
         self.advance_session_gen(receipt.r#gen);
         Ok(receipt)
     }
@@ -1966,19 +2089,28 @@ impl ServerClient {
         consistency: Consistency,
     ) -> Result<(u64, Vec<u8>), Error> {
         let eff = self.effective_consistency(consistency);
-        let mut req = Vec::with_capacity(24 + linql.len());
-        encode_consistency(&mut req, eff);
-        push_opt_str(&mut req, self.opts.workload_group.as_deref())?;
-        push_str(&mut req, linql)?;
-        let resp = self.rpc_call(OP_PARTIAL_SUMMARIZE, &req, || true)?;
-        let mut cur = resp.as_slice();
-        if read_u8(&mut cur)? != 0 {
-            let code = read_u8(&mut cur)?;
-            let msg = read_str(&mut cur)?;
-            return Err(wire_err(code, &msg));
-        }
-        let r#gen = read_u64_le(&mut cur)?;
-        let bytes = read_len_bytes(&mut cur)?.to_vec();
+        let wg = self.opts.workload_group.as_deref();
+        let (r#gen, bytes) = self.rpc_call(
+            OP_PARTIAL_SUMMARIZE,
+            |req| {
+                req.reserve(24 + linql.len());
+                encode_consistency(req, eff);
+                push_opt_str(req, wg)?;
+                push_str(req, linql)
+            },
+            || true,
+            |resp| {
+                let mut cur = resp;
+                if read_u8(&mut cur)? != 0 {
+                    let code = read_u8(&mut cur)?;
+                    let msg = read_str_ref(&mut cur)?;
+                    return Err(wire_err(code, msg));
+                }
+                let r#gen = read_u64_le(&mut cur)?;
+                let bytes = read_len_bytes(&mut cur)?.to_vec();
+                Ok((r#gen, bytes))
+            },
+        )?;
         self.advance_session_gen(r#gen);
         Ok((r#gen, bytes))
     }
@@ -1998,51 +2130,59 @@ impl ServerClient {
         wait_ms: u64,
         follower_id: Option<&str>,
     ) -> Result<PullSyncPayload, Error> {
-        let mut req = Vec::with_capacity(21 + follower_id.map_or(0, str::len));
-        req.extend_from_slice(&since_gen.to_le_bytes());
-        req.push(u8::from(force_bootstrap));
-        if wait_ms > 0 || follower_id.is_some() {
-            req.extend_from_slice(&wait_ms.to_le_bytes());
-            if let Some(fid) = follower_id {
-                push_str(&mut req, fid)?;
-            }
-        }
-        let resp = self.rpc_call(OP_PULL_SYNC, &req, || true)?;
-        let mut cur = resp.as_slice();
-        if read_u8(&mut cur)? != 0 {
-            let code = read_u8(&mut cur)?;
-            let msg = read_str(&mut cur)?;
-            return Err(wire_err(code, &msg));
-        }
-        let kind = read_u8(&mut cur)?;
-        let r#gen = read_u64_le(&mut cur)?;
-        match kind {
-            0 => Ok(PullSyncPayload::UpToDate { r#gen }),
-            1 => {
-                let wal_bytes = read_len_bytes(&mut cur)?.to_vec();
-                Ok(PullSyncPayload::Wal { r#gen, wal_bytes })
-            }
-            2 => {
-                let snap_bytes = read_len_bytes(&mut cur)?.to_vec();
-                let cold_manifest_json = read_len_bytes(&mut cur)?.to_vec();
-                let cold_tombstones = read_len_bytes(&mut cur)?.to_vec();
-                let num_segs = read_u32_le(&mut cur)? as usize;
-                let mut cold_segments = Vec::with_capacity(num_segs);
-                for _ in 0..num_segs {
-                    let seg_id = read_u64_le(&mut cur)?;
-                    let lseg = read_len_bytes(&mut cur)?.to_vec();
-                    cold_segments.push((seg_id, lseg));
+        self.rpc_call(
+            OP_PULL_SYNC,
+            |req| {
+                req.reserve(21 + follower_id.map_or(0, str::len));
+                req.extend_from_slice(&since_gen.to_le_bytes());
+                req.push(u8::from(force_bootstrap));
+                if wait_ms > 0 || follower_id.is_some() {
+                    req.extend_from_slice(&wait_ms.to_le_bytes());
+                    if let Some(fid) = follower_id {
+                        push_str(req, fid)?;
+                    }
                 }
-                Ok(PullSyncPayload::Bootstrap {
-                    r#gen,
-                    snap_bytes,
-                    cold_manifest_json,
-                    cold_tombstones,
-                    cold_segments,
-                })
-            }
-            other => Err(Error::runtime(format!("unknown pull_sync kind {other}"))),
-        }
+                Ok(())
+            },
+            || true,
+            |resp| {
+                let mut cur = resp;
+                if read_u8(&mut cur)? != 0 {
+                    let code = read_u8(&mut cur)?;
+                    let msg = read_str_ref(&mut cur)?;
+                    return Err(wire_err(code, msg));
+                }
+                let kind = read_u8(&mut cur)?;
+                let r#gen = read_u64_le(&mut cur)?;
+                match kind {
+                    0 => Ok(PullSyncPayload::UpToDate { r#gen }),
+                    1 => {
+                        let wal_bytes = read_len_bytes(&mut cur)?.to_vec();
+                        Ok(PullSyncPayload::Wal { r#gen, wal_bytes })
+                    }
+                    2 => {
+                        let snap_bytes = read_len_bytes(&mut cur)?.to_vec();
+                        let cold_manifest_json = read_len_bytes(&mut cur)?.to_vec();
+                        let cold_tombstones = read_len_bytes(&mut cur)?.to_vec();
+                        let num_segs = read_u32_le(&mut cur)? as usize;
+                        let mut cold_segments = Vec::with_capacity(num_segs);
+                        for _ in 0..num_segs {
+                            let seg_id = read_u64_le(&mut cur)?;
+                            let lseg = read_len_bytes(&mut cur)?.to_vec();
+                            cold_segments.push((seg_id, lseg));
+                        }
+                        Ok(PullSyncPayload::Bootstrap {
+                            r#gen,
+                            snap_bytes,
+                            cold_manifest_json,
+                            cold_tombstones,
+                            cold_segments,
+                        })
+                    }
+                    other => Err(Error::runtime(format!("unknown pull_sync kind {other}"))),
+                }
+            },
+        )
     }
 }
 
@@ -2050,8 +2190,8 @@ fn decode_execute_resp(resp: &[u8]) -> Result<ExecutionReceipt, Error> {
     let mut cur = resp;
     if read_u8(&mut cur)? != 0 {
         let code = read_u8(&mut cur)?;
-        let msg = read_str(&mut cur)?;
-        return Err(wire_err(code, &msg));
+        let msg = read_str_ref(&mut cur)?;
+        return Err(wire_err(code, msg));
     }
     let r#gen = read_u64_le(&mut cur)?;
     let affected = read_u64_le(&mut cur)? as usize;
@@ -2128,7 +2268,11 @@ impl ReplicaPoolClient {
         self.session_gen.load(Ordering::Acquire)
     }
 
+    #[inline]
     pub fn advance_session_gen(&self, r#gen: u64) {
+        if r#gen <= self.session_gen.load(Ordering::Relaxed) {
+            return;
+        }
         self.session_gen.fetch_max(r#gen, Ordering::AcqRel);
         self.primary.advance_session_gen(r#gen);
         for r in &self.replicas {
@@ -2148,7 +2292,8 @@ impl ReplicaPoolClient {
         let is_read = crate::parse::parse_program(linql)
             .is_ok_and(|stmts| !stmts.is_empty() && stmts.iter().all(|s| matches!(s, Stmt::Query(_))));
         if is_read {
-            let (_, receipt) = self.query_with_consistency(linql, self.default_consistency)?;
+            let (batch, mut receipt) = self.query_with_consistency(linql, self.default_consistency)?;
+            receipt.batch = Some(batch);
             Ok(receipt)
         } else {
             let receipt = self.primary.execute_with_consistency(linql, Consistency::Strong)?;
