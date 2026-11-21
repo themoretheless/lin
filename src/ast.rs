@@ -467,11 +467,20 @@ impl Pred {
             }
             Pred::And(a, b) | Pred::Or(a, b) => a.needs_simplify() || b.needs_simplify(),
             Pred::In { values, .. } => {
-                values.len() == 1
-                    || values
+                if values.len() == 1 {
+                    true
+                } else if values.len() <= 16 {
+                    values
                         .iter()
                         .enumerate()
                         .any(|(i, v)| values[..i].contains(v))
+                } else {
+                    let mut seen = rustc_hash::FxHashSet::with_capacity_and_hasher(
+                        values.len(),
+                        Default::default(),
+                    );
+                    values.iter().any(|v| !seen.insert(v))
+                }
             }
             _ => false,
         }
@@ -649,9 +658,18 @@ impl Field {
     }
 
     /// Dotted path: `"users.email"` → `["users", "email"]`.
+    #[inline]
     pub fn path(path: impl AsRef<str>) -> Self {
-        let parts: Vec<String> = path
-            .as_ref()
+        let s = path.as_ref();
+        if memchr::memchr(b'.', s.as_bytes()).is_none() {
+            let parts = if s.is_empty() {
+                Vec::new()
+            } else {
+                vec![s.to_owned()]
+            };
+            return Self { parts };
+        }
+        let parts: Vec<String> = s
             .split('.')
             .filter(|p| !p.is_empty())
             .map(str::to_string)
@@ -659,8 +677,13 @@ impl Field {
         Self { parts }
     }
 
+    #[inline]
     pub fn as_str(&self) -> String {
-        self.parts.join(".")
+        match self.parts.as_slice() {
+            [] => String::new(),
+            [p] => p.clone(),
+            _ => self.parts.join("."),
+        }
     }
 
     /// Borrow a single-segment field name or join dotted parts on demand.

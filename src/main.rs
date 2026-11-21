@@ -243,11 +243,37 @@ fn cmd_run(args: &[String], data: Option<PathBuf>, follower: bool) -> ExitCode {
         }
     }) {
         Ok((h, plan)) => {
-            println!("{}", h.compact());
-            if let Some(p) = plan {
-                println!();
-                print!("{p}");
+            use io::Write as _;
+            let stdout = io::stdout();
+            let mut out = io::BufWriter::with_capacity(64 * 1024, stdout.lock());
+            let mut line = String::with_capacity(128);
+            for row in &h.rows {
+                line.clear();
+                line.push('{');
+                let mut first = true;
+                for (k, v) in row {
+                    if !matches!(v, lin::Cell::Null) {
+                        if !first {
+                            line.push_str(", ");
+                        }
+                        first = false;
+                        line.push_str(k);
+                        line.push_str(": ");
+                        v.compact_into(&mut line);
+                    }
+                }
+                line.push_str("}\n");
+                let _ = out.write_all(line.as_bytes());
             }
+            if let Some(msg) = &h.message {
+                let _ = writeln!(out, "{msg}");
+            }
+            let _ = writeln!(out, "gen={} n={}", h.done.r#gen, h.done.n);
+            if let Some(p) = plan {
+                let _ = writeln!(out);
+                let _ = out.write_all(p.as_bytes());
+            }
+            let _ = out.flush();
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -609,23 +635,9 @@ fn cmd_wal_serve(args: &[String], data: Option<PathBuf>) -> ExitCode {
             }
         }
     }
-    let tls = match (cert, key) {
-        (Some(c), Some(k)) => match (std::fs::read(&c), std::fs::read(&k)) {
-            (Ok(cert_pem), Ok(key_pem)) => Some(lin::ship::TlsServer { cert_pem, key_pem }),
-            (Err(e), _) => {
-                eprintln!("tls-cert: {e}");
-                return ExitCode::from(1);
-            }
-            (_, Err(e)) => {
-                eprintln!("tls-key: {e}");
-                return ExitCode::from(1);
-            }
-        },
-        (None, None) => None,
-        _ => {
-            eprintln!("tls requires both --tls-cert and --tls-key");
-            return ExitCode::from(2);
-        }
+    let tls = match load_tls_server(cert, key) {
+        Ok(t) => t,
+        Err(code) => return code,
     };
     if tls.is_none() && !listen.starts_with("127.") && !listen.starts_with("[::1]") {
         eprintln!("warning: plaintext wal-serve on {listen}; use --tls-cert/--tls-key and --token");
@@ -868,18 +880,9 @@ fn cmd_follower(args: &[String], data: Option<PathBuf>) -> ExitCode {
                 );
                 return ExitCode::from(2);
             };
-            let tls = if tls_insecure {
-                lin::ship::TlsClient::Insecure
-            } else if let Some(p) = tls_ca {
-                match std::fs::read(&p) {
-                    Ok(pem) => lin::ship::TlsClient::CaPem(pem),
-                    Err(e) => {
-                        eprintln!("tls-ca: {e}");
-                        return ExitCode::from(1);
-                    }
-                }
-            } else {
-                lin::ship::TlsClient::Off
+            let tls = match load_tls_client(tls_ca, tls_insecure) {
+                Ok(t) => t,
+                Err(code) => return code,
             };
             let pull = lin::ship::PullOpts {
                 token,
@@ -1238,10 +1241,15 @@ fn cmd_cache(args: &[String], data: Option<PathBuf>) -> ExitCode {
                         let is_sub = matches!(req, lin::cache::CacheRequest::Subscribe { .. });
                         match client.send(&req) {
                             Ok(resp) => {
-                                println!("{}", resp.format_cli());
+                                use io::Write as _;
+                                let stdout = io::stdout();
+                                let mut out = io::BufWriter::new(stdout.lock());
+                                let _ = writeln!(out, "{}", resp.format_cli());
+                                let _ = out.flush();
                                 if is_sub {
                                     while let Ok(msg) = client.read_next() {
-                                        println!("{}", msg.format_cli());
+                                        let _ = writeln!(out, "{}", msg.format_cli());
+                                        let _ = out.flush();
                                     }
                                 }
                                 return ExitCode::SUCCESS;
@@ -1264,22 +1272,24 @@ fn cmd_cache(args: &[String], data: Option<PathBuf>) -> ExitCode {
             use std::io::{BufRead, IsTerminal, Write};
             let stdin = io::stdin();
             let interactive = stdin.is_terminal();
+            let stdout_handle = io::stdout();
+            let mut stdout = io::BufWriter::new(stdout_handle.lock());
             if interactive {
-                println!(
+                let _ = writeln!(
+                    stdout,
                     "Connected to cacha (Lin Distributed Cache) at {}. Type HELP or QUIT.",
                     client.addr()
                 );
             }
-            let mut stdout = io::stdout();
             let mut lines = stdin.lock().lines();
             loop {
                 if interactive {
-                    print!("cacha ({})> ", client.addr());
+                    let _ = write!(stdout, "cacha ({})> ", client.addr());
                     let _ = stdout.flush();
                 }
                 let Some(Ok(line)) = lines.next() else {
                     if interactive {
-                        println!();
+                        let _ = writeln!(stdout);
                     }
                     break;
                 };
@@ -1291,7 +1301,8 @@ fn cmd_cache(args: &[String], data: Option<PathBuf>) -> ExitCode {
                     break;
                 }
                 if trimmed.eq_ignore_ascii_case("help") {
-                    println!(
+                    let _ = writeln!(
+                        stdout,
                         "Commands:\n  \
                          Strings: GET k | SET k v [EX s | PX ms] | DEL k.. | EXISTS k | INCR k | DECR k | INCRBY k n | EXPIRE k s | TTL k | KEYS prefix*\n  \
                          Hashes:  HSET k f v | HGET k f | HDEL k f.. | HGETALL k\n  \
@@ -1301,6 +1312,9 @@ fn cmd_cache(args: &[String], data: Option<PathBuf>) -> ExitCode {
                          Lin DB:  LIN <pipe-query>   (e.g. `LIN docs | take 3` or `LIN cache_kv | count`)\n  \
                          Cluster: INFO | CLUSTER INFO | CLUSTER NODES | CLUSTER MEET id addr | CLUSTER KEYSLOT k | RAFT STATUS | RAFT ELECT"
                     );
+                    if interactive {
+                        let _ = stdout.flush();
+                    }
                     continue;
                 }
                 match lin::cache::parse_cli_command(trimmed) {
@@ -1308,13 +1322,21 @@ fn cmd_cache(args: &[String], data: Option<PathBuf>) -> ExitCode {
                         let is_sub = matches!(req, lin::cache::CacheRequest::Subscribe { .. });
                         match client.send(&req) {
                             Ok(resp) => {
-                                println!("{}", resp.format_cli());
+                                let _ = writeln!(stdout, "{}", resp.format_cli());
                                 if is_sub {
-                                    println!("(listening for messages — Ctrl+C to exit)");
+                                    let _ = writeln!(
+                                        stdout,
+                                        "(listening for messages — Ctrl+C to exit)"
+                                    );
+                                    let _ = stdout.flush();
                                     while let Ok(msg) = client.read_next() {
-                                        println!("{}", msg.format_cli());
+                                        let _ = writeln!(stdout, "{}", msg.format_cli());
+                                        let _ = stdout.flush();
                                     }
                                     break;
+                                }
+                                if interactive {
+                                    let _ = stdout.flush();
                                 }
                             }
                             Err(e) => eprintln!("(io error) {e}"),
@@ -1323,6 +1345,7 @@ fn cmd_cache(args: &[String], data: Option<PathBuf>) -> ExitCode {
                     Err(e) => eprintln!("(syntax error) {e}"),
                 }
             }
+            let _ = stdout.flush();
             ExitCode::SUCCESS
         }
         _ => {
@@ -1356,36 +1379,204 @@ fn parse_consistency_flag(s: &str) -> Result<lin::Consistency, String> {
     }
 }
 
-fn format_batch_cli(batch: &lin::RecordBatch) -> String {
-    let rows = batch.to_rows();
-    if rows.is_empty() {
-        return "(0 rows)".to_string();
-    }
-    let mut out = String::new();
-    for r in &rows {
-        let mut first = true;
-        out.push('{');
-        for (k, v) in r.iter() {
-            if !first {
-                out.push_str(", ");
+fn load_tls_server(
+    cert: Option<PathBuf>,
+    key: Option<PathBuf>,
+) -> Result<Option<lin::TlsServer>, ExitCode> {
+    match (cert, key) {
+        (Some(c), Some(k)) => match (std::fs::read(&c), std::fs::read(&k)) {
+            (Ok(cert_pem), Ok(key_pem)) => Ok(Some(lin::TlsServer { cert_pem, key_pem })),
+            (Err(e), _) => {
+                eprintln!("tls-cert: {e}");
+                Err(ExitCode::from(1))
             }
-            first = false;
-            out.push_str(k);
-            out.push_str(": ");
-            match v {
-                lin::Cell::Null => out.push_str("null"),
-                lin::Cell::Bool(b) => out.push_str(&format!("{b}")),
-                lin::Cell::Int(i) => out.push_str(&format!("{i}")),
-                lin::Cell::Float(f) => out.push_str(&format!("{f}")),
-                lin::Cell::Time(t) => out.push_str(&format!("timestamp({t})")),
-                lin::Cell::Text(s) => out.push_str(&format!("{s:?}")),
-                lin::Cell::SmallText(s) => out.push_str(&format!("{:?}", s.as_str())),
-                lin::Cell::Vec(vec) => out.push_str(&format!("vec[{}]", vec.len())),
+            (_, Err(e)) => {
+                eprintln!("tls-key: {e}");
+                Err(ExitCode::from(1))
+            }
+        },
+        (None, None) => Ok(None),
+        _ => {
+            eprintln!("tls requires both --tls-cert and --tls-key");
+            Err(ExitCode::from(2))
+        }
+    }
+}
+
+fn load_tls_client(
+    tls_ca: Option<PathBuf>,
+    tls_insecure: bool,
+) -> Result<lin::TlsClient, ExitCode> {
+    if tls_insecure {
+        Ok(lin::TlsClient::Insecure)
+    } else if let Some(ca_path) = tls_ca {
+        match std::fs::read(&ca_path) {
+            Ok(pem) => Ok(lin::TlsClient::CaPem(pem)),
+            Err(e) => {
+                eprintln!("tls-ca: {e}");
+                Err(ExitCode::from(1))
             }
         }
-        out.push_str("}\n");
+    } else {
+        Ok(lin::TlsClient::Off)
     }
-    out
+}
+
+fn is_non_query_leading_kw(src: &str) -> bool {
+    let bytes = src.as_bytes();
+    let mut i = 0usize;
+    loop {
+        while i < bytes.len() {
+            let b = bytes[i];
+            if b.is_ascii_whitespace() {
+                i += 1;
+            } else if b >= 0x80 {
+                if let Some(c) = src[i..].chars().next()
+                    && c.is_whitespace()
+                {
+                    i += c.len_utf8();
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        if i + 1 < bytes.len() && bytes[i] == b'-' && bytes[i + 1] == b'-' {
+            i += 2;
+            match memchr::memchr(b'\n', &bytes[i..]) {
+                Some(nl) => {
+                    i += nl + 1;
+                    continue;
+                }
+                None => return false,
+            }
+        }
+        break;
+    }
+    let Some(&first) = bytes.get(i) else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == b'_') {
+        return false;
+    }
+    let mut end = i + 1;
+    while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+        end += 1;
+    }
+    matches!(
+        &src[i..end],
+        "let"
+            | "delete"
+            | "append"
+            | "insert"
+            | "update"
+            | "reembed"
+            | "index"
+            | "owned"
+            | "col"
+            | "rel"
+            | "fk"
+            | "guard"
+            | "filter"
+            | "unfilter"
+            | "idb"
+            | "pull"
+            | "push"
+            | "pin"
+            | "unpin"
+            | "snapshot"
+            | "restore"
+    )
+}
+
+fn write_cell_cli(w: &mut impl io::Write, cell: &lin::Cell) -> io::Result<()> {
+    match cell {
+        lin::Cell::Null => w.write_all(b"null"),
+        lin::Cell::Bool(b) => w.write_all(if *b { b"true" } else { b"false" }),
+        lin::Cell::Int(i) => write!(w, "{i}"),
+        lin::Cell::Float(f) => write!(w, "{f}"),
+        lin::Cell::Time(t) => write!(w, "timestamp({t})"),
+        lin::Cell::Text(s) => write!(w, "{s:?}"),
+        lin::Cell::SmallText(s) => write!(w, "{:?}", s.as_str()),
+        lin::Cell::Vec(vec) => write!(w, "vec[{}]", vec.len()),
+    }
+}
+
+fn write_batch_cli(w: &mut impl io::Write, batch: &lin::RecordBatch) -> io::Result<()> {
+    let n = batch.n();
+    if n == 0 {
+        return w.write_all(b"(0 rows)");
+    }
+    let width = batch.names.len().min(batch.cols.len());
+    let mut col_order: Vec<usize> = (0..width).collect();
+    col_order.sort_by(|&a, &b| batch.names[a].cmp(&batch.names[b]).then_with(|| a.cmp(&b)));
+    // Match `Row::insert` overwrite semantics when duplicate column names exist: last wins.
+    let mut write_pos = 0usize;
+    for idx in 0..col_order.len() {
+        if idx + 1 < col_order.len()
+            && batch.names[col_order[idx]] == batch.names[col_order[idx + 1]]
+        {
+            continue;
+        }
+        col_order[write_pos] = col_order[idx];
+        write_pos += 1;
+    }
+    col_order.truncate(write_pos);
+
+    for row_idx in 0..n {
+        w.write_all(b"{")?;
+        for (pos, &col_idx) in col_order.iter().enumerate() {
+            if pos > 0 {
+                w.write_all(b", ")?;
+            }
+            w.write_all(batch.names[col_idx].as_bytes())?;
+            w.write_all(b": ")?;
+            match &batch.cols[col_idx] {
+                lin::Column::Nulls { .. } => w.write_all(b"null")?,
+                lin::Column::Int { vals, valid } => {
+                    if valid.is_valid(row_idx) {
+                        write!(w, "{}", vals[row_idx])?;
+                    } else {
+                        w.write_all(b"null")?;
+                    }
+                }
+                lin::Column::Time { vals, valid } => {
+                    if valid.is_valid(row_idx) {
+                        write!(w, "timestamp({})", vals[row_idx])?;
+                    } else {
+                        w.write_all(b"null")?;
+                    }
+                }
+                lin::Column::Float { vals, valid } => {
+                    if valid.is_valid(row_idx) {
+                        write!(w, "{}", vals[row_idx])?;
+                    } else {
+                        w.write_all(b"null")?;
+                    }
+                }
+                lin::Column::Bool { vals, valid } => {
+                    if valid.is_valid(row_idx) {
+                        w.write_all(if vals[row_idx] { b"true" } else { b"false" })?;
+                    } else {
+                        w.write_all(b"null")?;
+                    }
+                }
+                col @ (lin::Column::Text { .. } | lin::Column::Dict { .. }) => {
+                    match col.text_at(row_idx) {
+                        Some(s) => write!(w, "{s:?}")?,
+                        None => w.write_all(b"null")?,
+                    }
+                }
+                lin::Column::Cells(cells) => {
+                    let cell = cells.get(row_idx).unwrap_or(&lin::Cell::Null);
+                    write_cell_cli(w, cell)?;
+                }
+            }
+        }
+        w.write_all(b"}\n")?;
+    }
+    Ok(())
 }
 
 fn cmd_serve(args: &[String], data: Option<PathBuf>, follower: bool) -> ExitCode {
@@ -1485,33 +1676,14 @@ fn cmd_serve(args: &[String], data: Option<PathBuf>, follower: bool) -> ExitCode
         i += 1;
     }
 
-    let tls = match (tls_cert, tls_key) {
-        (Some(c), Some(k)) => match (std::fs::read(&c), std::fs::read(&k)) {
-            (Ok(cert_pem), Ok(key_pem)) => Some(lin::TlsServer { cert_pem, key_pem }),
-            (Err(e), _) | (_, Err(e)) => {
-                eprintln!("tls file error: {e}");
-                return ExitCode::from(1);
-            }
-        },
-        (None, None) => None,
-        _ => {
-            eprintln!("tls requires both --tls-cert and --tls-key");
-            return ExitCode::from(2);
-        }
+    let tls = match load_tls_server(tls_cert, tls_key) {
+        Ok(t) => t,
+        Err(code) => return code,
     };
 
-    let client_tls = if tls_insecure {
-        lin::TlsClient::Insecure
-    } else if let Some(ca_path) = tls_ca {
-        match std::fs::read(&ca_path) {
-            Ok(pem) => lin::TlsClient::CaPem(pem),
-            Err(e) => {
-                eprintln!("tls-ca: {e}");
-                return ExitCode::from(1);
-            }
-        }
-    } else {
-        lin::TlsClient::Off
+    let client_tls = match load_tls_client(tls_ca, tls_insecure) {
+        Ok(t) => t,
+        Err(code) => return code,
     };
 
     let role = if follower || primary.is_some() {
@@ -1658,18 +1830,9 @@ fn cmd_client(args: &[String]) -> ExitCode {
         }
     };
 
-    let tls = if tls_insecure {
-        lin::TlsClient::Insecure
-    } else if let Some(ca_path) = tls_ca {
-        match std::fs::read(&ca_path) {
-            Ok(pem) => lin::TlsClient::CaPem(pem),
-            Err(e) => {
-                eprintln!("tls-ca: {e}");
-                return ExitCode::from(1);
-            }
-        }
-    } else {
-        lin::TlsClient::Off
+    let tls = match load_tls_client(tls_ca, tls_insecure) {
+        Ok(t) => t,
+        Err(code) => return code,
     };
 
     let opts = lin::ClientOpts {
@@ -1686,7 +1849,9 @@ fn cmd_client(args: &[String]) -> ExitCode {
             .and_then(|c| c.execute_with_consistency(&linql, consistency))
     } else {
         lin::ReplicaPoolClient::connect(primary_addr, &replicas, opts).and_then(|pool| {
-            if lin::parse(&linql).is_ok_and(|s| matches!(s, lin::Stmt::Query(_))) {
+            let is_read_query = !is_non_query_leading_kw(&linql)
+                && lin::parse(&linql).is_ok_and(|s| matches!(s, lin::Stmt::Query(_)));
+            if is_read_query {
                 let (_, r) = pool.query_with_consistency(&linql, consistency)?;
                 Ok(r)
             } else {
@@ -1697,13 +1862,18 @@ fn cmd_client(args: &[String]) -> ExitCode {
 
     match res {
         Ok(receipt) => {
+            use io::Write as _;
+            let stdout = io::stdout();
+            let mut out = io::BufWriter::with_capacity(64 * 1024, stdout.lock());
             if let Some(batch) = &receipt.batch {
-                print!("{}", format_batch_cli(batch));
+                let _ = write_batch_cli(&mut out, batch);
             }
-            println!(
+            let _ = writeln!(
+                out,
                 "gen={} affected={} group={} elapsed_us={}",
                 receipt.r#gen, receipt.affected, receipt.group_size, receipt.elapsed_us
             );
+            let _ = out.flush();
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -1829,13 +1999,18 @@ fn cmd_shard(args: &[String]) -> ExitCode {
 
     match router.execute(&linql) {
         Ok(receipt) => {
+            use io::Write as _;
+            let stdout = io::stdout();
+            let mut out = io::BufWriter::with_capacity(64 * 1024, stdout.lock());
             if let Some(batch) = &receipt.batch {
-                print!("{}", format_batch_cli(batch));
+                let _ = write_batch_cli(&mut out, batch);
             }
-            println!(
+            let _ = writeln!(
+                out,
                 "gen={} affected={} elapsed_us={}",
                 receipt.r#gen, receipt.affected, receipt.elapsed_us
             );
+            let _ = out.flush();
             ExitCode::SUCCESS
         }
         Err(e) => {

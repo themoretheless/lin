@@ -17,21 +17,31 @@ pub struct Error {
 /// statement carrying a megabyte identifier must not produce a megabyte error.
 const MAX_MESSAGE_BYTES: usize = 4096;
 
+#[cold]
+#[inline(never)]
+fn truncate_message(m: &mut String) {
+    use fmt::Write as _;
+    let mut cut = MAX_MESSAGE_BYTES;
+    while !m.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let dropped = m.len() - cut;
+    m.truncate(cut);
+    let _ = write!(m, "… [{dropped} bytes truncated]");
+}
+
+#[cold]
+#[inline(never)]
 fn bounded(message: impl Into<String>) -> String {
     let mut m = message.into();
     if m.len() > MAX_MESSAGE_BYTES {
-        let mut cut = MAX_MESSAGE_BYTES;
-        while !m.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        let dropped = m.len() - cut;
-        m.truncate(cut);
-        m.push_str(&format!("… [{dropped} bytes truncated]"));
+        truncate_message(&mut m);
     }
     m
 }
 
 impl Error {
+    #[cold]
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: bounded(message),
@@ -40,6 +50,7 @@ impl Error {
         }
     }
 
+    #[cold]
     pub fn at(pos: usize, message: impl Into<String>) -> Self {
         Self {
             message: bounded(message),
@@ -48,6 +59,7 @@ impl Error {
         }
     }
 
+    #[cold]
     pub fn runtime(message: impl Into<String>) -> Self {
         Self {
             message: bounded(message),

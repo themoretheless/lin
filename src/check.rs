@@ -22,7 +22,7 @@ pub(crate) fn check_single_insert(
             "{collection} is append-only; use `append`"
         )));
     }
-    check_record(rec, collection, cat, false)
+    check_record_col(rec, collection, col, cat, false)
 }
 
 pub(crate) fn check_single_insert_borrowed(
@@ -62,23 +62,56 @@ pub fn check_program(stmts: &[Stmt], cat: &Catalog) -> Result<(Bindings, Option<
     let mut env = Bindings::new();
     let mut staged: Option<Catalog> = None;
     for stmt in stmts {
-        check_in(stmt, staged.as_ref().unwrap_or(cat), &env)?;
-        if let Stmt::Decl(d) = stmt {
-            staged.get_or_insert_with(|| cat.clone()).apply_decl(d)?;
-        }
+        let view = staged.as_ref().unwrap_or(cat);
         if let Stmt::Let { name, query } = stmt {
-            let view = staged.as_ref().unwrap_or(cat);
             if view.collection(name).is_some() || name == "catalog" {
                 return Err(Error::new(format!("cannot bind over collection: {name}")));
             }
+            let scope = check_query(query, view, &env)?;
             if env.contains(name) {
                 return Err(Error::new(format!("binding exists: {name}")));
             }
-            let scope = check_query(query, view, &env)?;
             env.insert(name.clone(), scope);
+            continue;
+        }
+        check_in(stmt, view, &env)?;
+        if let Stmt::Decl(d) = stmt {
+            staged.get_or_insert_with(|| cat.clone()).apply_decl(d)?;
         }
     }
     Ok((env, staged))
+}
+
+fn check_records_bulk(
+    records: &[Record],
+    col: &catalog::Collection,
+    cat: &Catalog,
+) -> Result<(), Error> {
+    let mut shape_cache: smallvec::SmallVec<[(&str, Type); 12]> = smallvec::SmallVec::new();
+    for record in records {
+        if !shape_cache.is_empty()
+            && record.fields.len() == shape_cache.len()
+            && record
+                .fields
+                .iter()
+                .zip(shape_cache.iter())
+                .all(|((k, _), (ck, _))| k.as_str() == *ck)
+        {
+            for ((_, value), &(_, ty)) in record.fields.iter().zip(shape_cache.iter()) {
+                check_value_as(value, ty, cat)?;
+            }
+            continue;
+        }
+        shape_cache.clear();
+        for (name, value) in &record.fields {
+            let info = col
+                .field(name)
+                .ok_or_else(|| Error::new(format!("unknown field: {name}")))?;
+            check_value_as(value, info.ty, cat)?;
+            shape_cache.push((name.as_str(), info.ty));
+        }
+    }
+    Ok(())
 }
 
 fn check_in(stmt: &Stmt, cat: &Catalog, env: &Bindings) -> Result<(), Error> {
@@ -96,9 +129,7 @@ fn check_in(stmt: &Stmt, cat: &Catalog, env: &Bindings) -> Result<(), Error> {
             if records.is_empty() {
                 return Err(Error::new("empty list"));
             }
-            for record in records {
-                check_record(record, "facts", cat, false)?;
-            }
+            check_records_bulk(records, facts, cat)?;
         }
         Stmt::AppendEdges { edges } => {
             if edges.is_empty() {
@@ -131,9 +162,7 @@ fn check_in(stmt: &Stmt, cat: &Catalog, env: &Bindings) -> Result<(), Error> {
             if records.len() != 1 && !edges.is_empty() {
                 return Err(Error::new("with not allowed on bulk insert"));
             }
-            for record in records {
-                check_record(record, collection, cat, false)?;
-            }
+            check_records_bulk(records, col, cat)?;
             for e in edges {
                 if cat.rel(&e.rel).is_none() {
                     return Err(Error::new(format!("unknown rel: {}", e.rel)));
@@ -177,7 +206,7 @@ fn check_in(stmt: &Stmt, cat: &Catalog, env: &Bindings) -> Result<(), Error> {
                 let scope = Scope::from_col(collection, col);
                 check_pred(p, &scope, cat)?;
             }
-            check_record(record, collection, cat, true)?;
+            check_record_col(record, collection, col, cat, true)?;
         }
         Stmt::Reembed { collection, to } => {
             let col = cat
@@ -351,12 +380,14 @@ fn check_decl(d: &Decl, cat: &Catalog) -> Result<(), Error> {
                 }
             }
             if let Some(p) = pred {
-                let scope = scope_of(collection, cat)?;
+                let scope = Scope::from_col(collection, col);
                 check_pred(p, &scope, cat)?;
             }
-            let label = format!("{}[{}]", collection, fields.join(","));
-            if cat.indexes.contains_key(&label) {
-                return Err(Error::new(format!("index exists: {label}")));
+            if !cat.indexes.is_empty() {
+                let label = format!("{}[{}]", collection, fields.join(","));
+                if cat.indexes.contains_key(&label) {
+                    return Err(Error::new(format!("index exists: {label}")));
+                }
             }
         }
     }
@@ -421,7 +452,8 @@ fn check_query(q: &Query, cat: &Catalog, env: &Bindings) -> Result<Scope, Error>
                     return Err(Error::new(format!("unknown collection: {collection}")));
                 }
                 if scope.ty_of(on, cat).is_none()
-                    && scope.ty_of(&format!("{}.{on}", scope.primary), cat).is_none()
+                    && (scope.fields.is_empty()
+                        || scope.ty_of(&format!("{}.{on}", scope.primary), cat).is_none())
                 {
                     return Err(Error::new(format!("unknown field: {on}")));
                 }
@@ -461,14 +493,15 @@ fn check_query(q: &Query, cat: &Catalog, env: &Bindings) -> Result<Scope, Error>
                 if hops.len() > 3 {
                     return Err(Error::new("match hops max 3"));
                 }
-                let mut names = BTreeSet::new();
+                let mut names: smallvec::SmallVec<[&str; 8]> = smallvec::SmallVec::new();
                 if let Some(s) = start {
-                    if !names.insert(s.clone()) {
-                        return Err(Error::new(format!("duplicate match bind: {s}")));
-                    }
-                    let primary = scope.primary.clone();
-                    scope.add_bind(s, &primary, cat)?;
+                    names.push(s.as_str());
+                    let primary_col = cat.collection(&scope.primary).ok_or_else(|| {
+                        Error::new(format!("unknown collection: {}", scope.primary))
+                    })?;
+                    scope.add_bind_col(s, primary_col);
                 }
+                let docs_col = cat.collection("docs");
                 for h in hops {
                     if cat.rel(&h.rel).is_none() {
                         return Err(Error::new(format!("unknown rel: {}", h.rel)));
@@ -486,20 +519,23 @@ fn check_query(q: &Query, cat: &Catalog, env: &Bindings) -> Result<Scope, Error>
                         return Err(Error::new("edge bind requires depth 1"));
                     }
                     if let Some(e) = &h.edge {
-                        if !names.insert(e.clone()) {
+                        if names.contains(&e.as_str()) {
                             return Err(Error::new(format!("duplicate match bind: {e}")));
                         }
+                        names.push(e.as_str());
                         scope.add_edge_bind(e);
                     }
-                    if !names.insert(h.bind.clone()) {
+                    if names.contains(&h.bind.as_str()) {
                         return Err(Error::new(format!("duplicate match bind: {}", h.bind)));
                     }
-                    let node_col = if cat.collection("docs").is_some() {
-                        "docs".to_string()
-                    } else {
-                        scope.primary.clone()
+                    names.push(h.bind.as_str());
+                    let target_col = match docs_col {
+                        Some(c) => c,
+                        None => cat.collection(&scope.primary).ok_or_else(|| {
+                            Error::new(format!("unknown collection: {}", scope.primary))
+                        })?,
                     };
-                    scope.add_bind(&h.bind, &node_col, cat)?;
+                    scope.add_bind_col(&h.bind, target_col);
                 }
             }
             Step::Search { mode, .. } => {
@@ -546,12 +582,16 @@ fn check_query(q: &Query, cat: &Catalog, env: &Bindings) -> Result<Scope, Error>
                 }
             }
             Step::Count { by } => {
-                scope = match by {
-                    Some(by) => {
-                        let by_ty = require_field(&scope, by, cat)?;
-                        Scope::agg(&scope.primary, &by.as_str(), by_ty, Type::I64, "hits")
+                let by_ty = match by {
+                    Some(by) => Some(require_field(&scope, by, cat)?),
+                    None => None,
+                };
+                let primary = std::mem::take(&mut scope.primary);
+                scope = match (by, by_ty) {
+                    (Some(by), Some(by_ty)) => {
+                        Scope::agg(primary, by.as_str(), by_ty, Type::I64, "hits".into())
                     }
-                    None => Scope::agg_total(&scope.primary, Type::I64, "hits"),
+                    _ => Scope::agg_total(primary, Type::I64, "hits".into()),
                 };
             }
             Step::Sum { field, by } => {
@@ -562,28 +602,30 @@ fn check_query(q: &Query, cat: &Catalog, env: &Bindings) -> Result<Scope, Error>
                         ty.name()
                     )));
                 }
-                scope = match by {
-                    Some(by) => {
-                        let by_ty = require_field(&scope, by, cat)?;
-                        Scope::agg(
-                            &scope.primary,
-                            &by.as_str(),
-                            by_ty,
-                            Type::F64,
-                            &field.as_str(),
-                        )
+                let by_ty = match by {
+                    Some(by) => Some(require_field(&scope, by, cat)?),
+                    None => None,
+                };
+                let primary = std::mem::take(&mut scope.primary);
+                scope = match (by, by_ty) {
+                    (Some(by), Some(by_ty)) => {
+                        Scope::agg(primary, by.as_str(), by_ty, Type::F64, field.as_str())
                     }
-                    None => Scope::agg_total(&scope.primary, Type::F64, &field.as_str()),
+                    _ => Scope::agg_total(primary, Type::F64, field.as_str()),
                 };
             }
             Step::Min { field, by } | Step::Max { field, by } => {
                 let ty = require_field(&scope, field, cat)?;
-                scope = match by {
-                    Some(by) => {
-                        let by_ty = require_field(&scope, by, cat)?;
-                        Scope::agg(&scope.primary, &by.as_str(), by_ty, ty, &field.as_str())
+                let by_ty = match by {
+                    Some(by) => Some(require_field(&scope, by, cat)?),
+                    None => None,
+                };
+                let primary = std::mem::take(&mut scope.primary);
+                scope = match (by, by_ty) {
+                    (Some(by), Some(by_ty)) => {
+                        Scope::agg(primary, by.as_str(), by_ty, ty, field.as_str())
                     }
-                    None => Scope::agg_total(&scope.primary, ty, &field.as_str()),
+                    _ => Scope::agg_total(primary, ty, field.as_str()),
                 };
             }
             Step::Avg { field, by } => {
@@ -594,18 +636,16 @@ fn check_query(q: &Query, cat: &Catalog, env: &Bindings) -> Result<Scope, Error>
                         ty.name()
                     )));
                 }
-                scope = match by {
-                    Some(by) => {
-                        let by_ty = require_field(&scope, by, cat)?;
-                        Scope::agg(
-                            &scope.primary,
-                            &by.as_str(),
-                            by_ty,
-                            Type::F64,
-                            &field.as_str(),
-                        )
+                let by_ty = match by {
+                    Some(by) => Some(require_field(&scope, by, cat)?),
+                    None => None,
+                };
+                let primary = std::mem::take(&mut scope.primary);
+                scope = match (by, by_ty) {
+                    (Some(by), Some(by_ty)) => {
+                        Scope::agg(primary, by.as_str(), by_ty, Type::F64, field.as_str())
                     }
-                    None => Scope::agg_total(&scope.primary, Type::F64, &field.as_str()),
+                    _ => Scope::agg_total(primary, Type::F64, field.as_str()),
                 };
             }
             Step::Summarize { specs, by } => {
@@ -613,10 +653,10 @@ fn check_query(q: &Query, cat: &Catalog, env: &Bindings) -> Result<Scope, Error>
                     return Err(Error::new("summarize requires at least one metric"));
                 }
                 let mut out_fields = BTreeMap::new();
-                let mut seen = BTreeSet::new();
+                let mut seen: BTreeSet<&str> = BTreeSet::new();
                 for gk in by {
                     let ty = check_group_key(gk, &scope, cat)?;
-                    if !seen.insert(gk.alias.clone()) {
+                    if !seen.insert(gk.alias.as_str()) {
                         return Err(Error::new(format!(
                             "duplicate group key alias in summarize: {}",
                             gk.alias
@@ -672,7 +712,7 @@ fn check_query(q: &Query, cat: &Catalog, env: &Bindings) -> Result<Scope, Error>
                             require_field(&scope, value, cat)?
                         }
                     };
-                    if !seen.insert(spec.alias.clone()) {
+                    if !seen.insert(spec.alias.as_str()) {
                         return Err(Error::new(format!(
                             "duplicate summarize output field `{}`",
                             spec.alias
@@ -684,10 +724,10 @@ fn check_query(q: &Query, cat: &Catalog, env: &Bindings) -> Result<Scope, Error>
             }
             Step::ArgExtremum { order, by, .. } => {
                 require_field(&scope, order, cat)?;
-                let mut seen_by = BTreeSet::new();
+                let mut seen_by: BTreeSet<&str> = BTreeSet::new();
                 for gk in by {
                     let gty = check_group_key(gk, &scope, cat)?;
-                    if !seen_by.insert(gk.alias.clone()) {
+                    if !seen_by.insert(gk.alias.as_str()) {
                         return Err(Error::new(format!(
                             "duplicate group key alias in arg_max/arg_min: {}",
                             gk.alias
@@ -828,9 +868,14 @@ fn check_group_key(gk: &GroupKey, scope: &Scope, cat: &Catalog) -> Result<Type, 
 fn check_union_cols(left: &Scope, right: &Scope, cat: &Catalog) -> Result<(), Error> {
     let lf = left.materialized_fields(cat);
     let rf = right.materialized_fields(cat);
-    let l: Vec<&str> = lf.iter().map(|(k, _)| *k).collect();
-    let r: Vec<&str> = rf.iter().map(|(k, _)| *k).collect();
-    if l != r {
+    if lf.len() != rf.len()
+        || lf
+            .iter()
+            .zip(rf.iter())
+            .any(|((lk, _), (rk, _))| lk != rk)
+    {
+        let l: Vec<&str> = lf.iter().map(|(k, _)| *k).collect();
+        let r: Vec<&str> = rf.iter().map(|(k, _)| *k).collect();
         return Err(Error::new(format!(
             "union columns mismatch: [{}] vs [{}]",
             l.join(", "),
@@ -849,21 +894,35 @@ fn check_union_cols(left: &Scope, right: &Scope, cat: &Catalog) -> Result<(), Er
     Ok(())
 }
 
-fn check_record(
+fn pred_fields_present_in_record(pred: &Pred, record: &Record) -> bool {
+    match pred {
+        Pred::And(a, b) | Pred::Or(a, b) => {
+            pred_fields_present_in_record(a, record) && pred_fields_present_in_record(b, record)
+        }
+        Pred::Not(inner) => pred_fields_present_in_record(inner, record),
+        Pred::Cmp { field, .. }
+        | Pred::IsNull { field, .. }
+        | Pred::In { field, .. }
+        | Pred::Has { field, .. }
+        | Pred::Contains { field, .. }
+        | Pred::Regex { field, .. } => record_literal_val(record, field).is_some(),
+    }
+}
+
+fn check_record_col(
     record: &Record,
     collection: &str,
+    col: &catalog::Collection,
     cat: &Catalog,
     is_update: bool,
 ) -> Result<(), Error> {
-    let col = cat
-        .collection(collection)
-        .ok_or_else(|| Error::new(format!("unknown collection: {collection}")))?;
     let mut layer_raw = false;
     for (name, value) in &record.fields {
         let info = col
             .field(name)
             .ok_or_else(|| Error::new(format!("unknown field: {name}")))?;
-        if name == "layer"
+        if is_update
+            && name == "layer"
             && let Value::String(s) = value
         {
             layer_raw = s.as_ref() == "raw";
@@ -874,21 +933,17 @@ fn check_record(
         for (name, _) in &record.fields {
             for g in &cat.guards {
                 if g.collection == collection && &g.field == name {
-                    let mut pred_fields = Vec::new();
-                    g.pred.walk_fields(&mut pred_fields);
-                    let all_present = !pred_fields.is_empty()
-                        && pred_fields
-                            .iter()
-                            .all(|f| record_literal_val(record, f).is_some());
-                    if !all_present || eval_record_pred(&g.pred, record) {
+                    if !pred_fields_present_in_record(&g.pred, record)
+                        || eval_record_pred(&g.pred, record)
+                    {
                         return Err(Error::new(format!("immutable field: {collection}.{name}")));
                     }
                 }
             }
         }
-    }
-    if is_update && layer_raw && record.fields.iter().any(|(n, _)| n == "body") {
-        return Err(Error::new(format!("immutable field: {collection}.body")));
+        if layer_raw && record.fields.iter().any(|(n, _)| n == "body") {
+            return Err(Error::new(format!("immutable field: {collection}.body")));
+        }
     }
     Ok(())
 }
@@ -983,14 +1038,19 @@ fn eval_record_pred(pred: &Pred, record: &Record) -> bool {
             if needle.is_empty() {
                 return false;
             }
+            if !*ci {
+                return s
+                    .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                    .any(|w| w == needle);
+            }
+            if s.is_ascii() && needle.is_ascii() {
+                return s
+                    .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .any(|w| w.eq_ignore_ascii_case(needle));
+            }
+            let needle_lower = needle.to_lowercase();
             s.split(|c: char| !(c.is_alphanumeric() || c == '_'))
-                .any(|w| {
-                    if *ci {
-                        w.eq_ignore_ascii_case(needle) || w.to_lowercase() == needle.to_lowercase()
-                    } else {
-                        w == needle
-                    }
-                })
+                .any(|w| w.eq_ignore_ascii_case(needle) || w.to_lowercase() == needle_lower)
         }
         Pred::Regex {
             field,
@@ -1060,19 +1120,65 @@ fn types_ok(got: Type, expected: Type) -> bool {
 }
 
 fn check_pred(pred: &Pred, scope: &Scope, cat: &Catalog) -> Result<(), Error> {
+    let base_col = if scope.base_from_catalog {
+        cat.collection(&scope.primary)
+    } else {
+        None
+    };
+    let mut last_field: Option<(&str, Type)> = None;
+    check_pred_inner(pred, scope, base_col, cat, &mut last_field)
+}
+
+#[inline]
+fn require_pred_field<'p>(
+    scope: &Scope,
+    base_col: Option<&catalog::Collection>,
+    field: &'p Field,
+    cat: &Catalog,
+    last_field: &mut Option<(&'p str, Type)>,
+) -> Result<Type, Error> {
+    if let Some(leaf) = field.leaf() {
+        if let Some((prev_name, prev_ty)) = *last_field
+            && prev_name == leaf
+        {
+            return Ok(prev_ty);
+        }
+        let found = if scope.fields.is_empty() {
+            base_col.and_then(|c| c.field(leaf)).map(|i| i.ty)
+        } else {
+            scope
+                .fields
+                .get(leaf)
+                .copied()
+                .or_else(|| base_col.and_then(|c| c.field(leaf)).map(|i| i.ty))
+        };
+        let ty = found.ok_or_else(|| Error::new(format!("unknown field: {leaf}")))?;
+        *last_field = Some((leaf, ty));
+        return Ok(ty);
+    }
+    require_field(scope, field, cat)
+}
+
+fn check_pred_inner<'p>(
+    pred: &'p Pred,
+    scope: &Scope,
+    base_col: Option<&catalog::Collection>,
+    cat: &Catalog,
+    last_field: &mut Option<(&'p str, Type)>,
+) -> Result<(), Error> {
     match pred {
         Pred::And(a, b) | Pred::Or(a, b) => {
-            check_pred(a, scope, cat)?;
-            check_pred(b, scope, cat)?;
+            check_pred_inner(a, scope, base_col, cat, last_field)?;
+            check_pred_inner(b, scope, base_col, cat, last_field)?;
         }
         Pred::Not(inner) => {
-            check_pred(inner, scope, cat)?;
+            check_pred_inner(inner, scope, base_col, cat, last_field)?;
         }
         Pred::IsNull { field, .. } => {
-            require_field(scope, field, cat)?;
+            require_pred_field(scope, base_col, field, cat, last_field)?;
         }
         Pred::In { field, values } => {
-            let lty = require_field(scope, field, cat)?;
+            let lty = require_pred_field(scope, base_col, field, cat, last_field)?;
             if values.is_empty() {
                 return Err(Error::new("empty `in` list"));
             }
@@ -1088,7 +1194,7 @@ fn check_pred(pred: &Pred, scope: &Scope, cat: &Catalog) -> Result<(), Error> {
             }
         }
         Pred::Cmp { field, op, value } => {
-            let lty = require_field(scope, field, cat)?;
+            let lty = require_pred_field(scope, base_col, field, cat, last_field)?;
             let rty = value_type(value, cat)?;
             match op {
                 CmpOp::Eq | CmpOp::Ne => {
@@ -1122,7 +1228,7 @@ fn check_pred(pred: &Pred, scope: &Scope, cat: &Catalog) -> Result<(), Error> {
             }
         }
         Pred::Has { field, .. } => {
-            let ty = require_field(scope, field, cat)?;
+            let ty = require_pred_field(scope, base_col, field, cat, last_field)?;
             if !ty.is_textish() {
                 return Err(Error::new(format!(
                     "has requires text, found {} ({})",
@@ -1131,8 +1237,8 @@ fn check_pred(pred: &Pred, scope: &Scope, cat: &Catalog) -> Result<(), Error> {
                 )));
             }
         }
-        Pred::Contains { field, .. } | Pred::Regex { field, .. } => {
-            let ty = require_field(scope, field, cat)?;
+        Pred::Contains { field, .. } => {
+            let ty = require_pred_field(scope, base_col, field, cat, last_field)?;
             if !ty.is_textish() {
                 return Err(Error::new(format!(
                     "`~` requires text, found {} ({})",
@@ -1141,26 +1247,65 @@ fn check_pred(pred: &Pred, scope: &Scope, cat: &Catalog) -> Result<(), Error> {
                 )));
             }
         }
-    }
-    if let Pred::Regex { pattern, flags, .. } = pred {
-        validate_regex(pattern, flags)?;
+        Pred::Regex {
+            field,
+            pattern,
+            flags,
+        } => {
+            let ty = require_pred_field(scope, base_col, field, cat, last_field)?;
+            if !ty.is_textish() {
+                return Err(Error::new(format!(
+                    "`~` requires text, found {} ({})",
+                    ty.name(),
+                    field.as_str()
+                )));
+            }
+            validate_regex(pattern, flags)?;
+        }
     }
     Ok(())
 }
 
+const MAX_VALID_REGEX_CACHE: usize = 256;
+
+thread_local! {
+    static VALID_REGEX_CACHE: std::cell::RefCell<[rustc_hash::FxHashSet<Box<str>>; 2]> =
+        std::cell::RefCell::new([
+            rustc_hash::FxHashSet::default(),
+            rustc_hash::FxHashSet::default(),
+        ]);
+}
+
 pub fn validate_regex(pattern: &str, flags: &str) -> Result<(), Error> {
+    let mut ci = false;
     for f in flags.chars() {
-        if f != 'i' {
+        if f == 'i' {
+            ci = true;
+        } else {
             return Err(Error::new(format!("unknown regex flag `{f}`")));
         }
     }
+    let slot = usize::from(ci);
+    let cached = VALID_REGEX_CACHE
+        .try_with(|cell| cell.borrow()[slot].contains(pattern))
+        .unwrap_or(false);
+    if cached {
+        return Ok(());
+    }
     let mut b = regex::RegexBuilder::new(pattern);
     b.size_limit(10 * 1024 * 1024);
-    if flags.contains('i') {
+    if ci {
         b.case_insensitive(true);
     }
     b.build()
         .map_err(|e| Error::new(format!("invalid regex literal: {e}")))?;
+    let _ = VALID_REGEX_CACHE.try_with(|cell| {
+        let mut sets = cell.borrow_mut();
+        if sets[slot].len() >= MAX_VALID_REGEX_CACHE {
+            sets[slot].clear();
+        }
+        sets[slot].insert(Box::from(pattern));
+    });
     Ok(())
 }
 
@@ -1264,14 +1409,15 @@ impl Scope {
         Ok(())
     }
 
-    fn add_bind(&mut self, bind: &str, collection: &str, cat: &Catalog) -> Result<(), Error> {
-        let col = cat
-            .collection(collection)
-            .ok_or_else(|| Error::new(format!("unknown collection: {collection}")))?;
+    fn add_bind_col(&mut self, bind: &str, col: &catalog::Collection) {
+        let mut key = String::with_capacity(bind.len() + 16);
         for (name, info) in &col.fields {
-            self.fields.insert(format!("{bind}.{name}"), info.ty);
+            key.clear();
+            key.push_str(bind);
+            key.push('.');
+            key.push_str(name);
+            self.fields.insert(key.clone(), info.ty);
         }
-        Ok(())
     }
 
     fn add_edge_bind(&mut self, bind: &str) {
@@ -1280,22 +1426,22 @@ impl Scope {
         self.fields.insert(format!("{bind}.to"), Type::Text);
     }
 
-    fn agg(primary: &str, by: &str, by_ty: Type, metric_ty: Type, metric: &str) -> Self {
+    fn agg(primary: String, by: String, by_ty: Type, metric_ty: Type, metric: String) -> Self {
         let mut fields = BTreeMap::new();
-        fields.insert(by.to_string(), by_ty);
-        fields.insert(metric.to_string(), metric_ty);
+        fields.insert(by, by_ty);
+        fields.insert(metric, metric_ty);
         Self {
-            primary: primary.to_string(),
+            primary,
             base_from_catalog: false,
             fields,
         }
     }
 
-    fn agg_total(primary: &str, metric_ty: Type, metric: &str) -> Self {
+    fn agg_total(primary: String, metric_ty: Type, metric: String) -> Self {
         let mut fields = BTreeMap::new();
-        fields.insert(metric.to_string(), metric_ty);
+        fields.insert(metric, metric_ty);
         Self {
-            primary: primary.to_string(),
+            primary,
             base_from_catalog: false,
             fields,
         }

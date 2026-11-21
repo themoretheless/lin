@@ -682,11 +682,8 @@ impl Queryable {
         desc: bool,
         as_field: impl Into<String>,
     ) -> Self {
-        let by_vec: Vec<String> = by.map(|b| vec![b.as_ref().to_string()]).unwrap_or_default();
-        let order_vec: Vec<(String, bool)> = order
-            .map(|o| vec![(o.as_ref().to_string(), desc)])
-            .unwrap_or_default();
-        self.window_with_frame(func, field, by_vec, order_vec, None, as_field)
+        let order_iter = order.map(|o| (o, desc));
+        self.window_with_frame(func, field, by, order_iter, None, as_field)
     }
 
     pub fn window_with_frame(
@@ -850,18 +847,30 @@ impl Queryable {
 
     /// First row with explicit `take 1` (not implicit take 50).
     pub fn first(&self, db: &mut Db) -> Result<Row, Error> {
+        if matches!(self.query.steps.last(), Some(Step::Take { n: Some(0 | 1) })) {
+            return first_from_cursor(&mut self.cursor(db)?);
+        }
         first_from_cursor(&mut self.clone().take(1).cursor(db)?)
     }
 
     pub fn first_read(&self, db: &ReadDb) -> Result<Row, Error> {
+        if matches!(self.query.steps.last(), Some(Step::Take { n: Some(0 | 1) })) {
+            return first_from_cursor(&mut self.cursor_read(db)?);
+        }
         first_from_cursor(&mut self.clone().take(1).cursor_read(db)?)
     }
 
     pub fn first_or(&self, db: &mut Db) -> Result<Option<Row>, Error> {
+        if matches!(self.query.steps.last(), Some(Step::Take { n: Some(0 | 1) })) {
+            return first_or_from_cursor(&mut self.cursor(db)?);
+        }
         first_or_from_cursor(&mut self.clone().take(1).cursor(db)?)
     }
 
     pub fn first_or_read(&self, db: &ReadDb) -> Result<Option<Row>, Error> {
+        if matches!(self.query.steps.last(), Some(Step::Take { n: Some(0 | 1) })) {
+            return first_or_from_cursor(&mut self.cursor_read(db)?);
+        }
         first_or_from_cursor(&mut self.clone().take(1).cursor_read(db)?)
     }
 
@@ -889,10 +898,22 @@ impl Queryable {
 
     /// Exactly one row (`take 2` to detect extras).
     pub fn single(&self, db: &mut Db) -> Result<Row, Error> {
+        if matches!(
+            self.query.steps.last(),
+            Some(Step::Take { n: Some(0..=2) })
+        ) {
+            return single_from_cursor(&mut self.cursor(db)?);
+        }
         single_from_cursor(&mut self.clone().take(2).cursor(db)?)
     }
 
     pub fn single_read(&self, db: &ReadDb) -> Result<Row, Error> {
+        if matches!(
+            self.query.steps.last(),
+            Some(Step::Take { n: Some(0..=2) })
+        ) {
+            return single_from_cursor(&mut self.cursor_read(db)?);
+        }
         single_from_cursor(&mut self.clone().take(2).cursor_read(db)?)
     }
 
@@ -913,11 +934,13 @@ impl Queryable {
     }
 
     pub fn scalar_as<T: FromCell>(&self, db: &mut Db) -> Result<T, Error> {
-        T::from_cell(&self.scalar(db)?)
+        let row = self.first(db)?;
+        T::from_cell(scalar_ref_from_row(&row)?)
     }
 
     pub fn scalar_as_read<T: FromCell>(&self, db: &ReadDb) -> Result<T, Error> {
-        T::from_cell(&self.scalar_read(db)?)
+        let row = self.first_read(db)?;
+        T::from_cell(scalar_ref_from_row(&row)?)
     }
 
     pub fn explain(&self, db: &mut Db) -> Result<String, Error> {
@@ -1393,16 +1416,20 @@ impl<'a, T> BoundQueryable<'a, T> {
 
     pub fn explain(self) -> Result<String, Error> {
         self.q.ensure()?;
+        let stmt = Stmt::Query(self.q.query);
         match self.db {
-            BoundDb::Mut(db) => db.explain_stmt(self.q.stmt(), None),
-            BoundDb::Read(db) => db.explain_stmt(self.q.stmt(), None),
+            BoundDb::Mut(db) => db.explain_stmt(stmt, None),
+            BoundDb::Read(db) => db.explain_stmt(stmt, None),
         }
     }
 
     pub fn run(self) -> Result<Handle, Error> {
         match self.db {
             BoundDb::Mut(db) => self.q.run(db),
-            BoundDb::Read(db) => self.q.run_read(db),
+            BoundDb::Read(db) => {
+                self.q.ensure()?;
+                db.run_stmt(Stmt::Query(self.q.query))
+            }
         }
     }
 
@@ -1425,17 +1452,29 @@ impl<'a, T> BoundQueryable<'a, T> {
         }
     }
 
-    pub fn first(self) -> Result<Row, Error> {
+    pub fn first(mut self) -> Result<Row, Error> {
+        if !matches!(
+            self.q.query.steps.last(),
+            Some(Step::Take { n: Some(0 | 1) })
+        ) {
+            self.q.query.steps.push(Step::Take { n: Some(1) });
+        }
         match self.db {
-            BoundDb::Mut(db) => self.q.first(db),
-            BoundDb::Read(db) => self.q.first_read(db),
+            BoundDb::Mut(db) => first_from_cursor(&mut self.q.cursor(db)?),
+            BoundDb::Read(db) => first_from_cursor(&mut self.q.cursor_read(db)?),
         }
     }
 
-    pub fn first_or(self) -> Result<Option<Row>, Error> {
+    pub fn first_or(mut self) -> Result<Option<Row>, Error> {
+        if !matches!(
+            self.q.query.steps.last(),
+            Some(Step::Take { n: Some(0 | 1) })
+        ) {
+            self.q.query.steps.push(Step::Take { n: Some(1) });
+        }
         match self.db {
-            BoundDb::Mut(db) => self.q.first_or(db),
-            BoundDb::Read(db) => self.q.first_or_read(db),
+            BoundDb::Mut(db) => first_or_from_cursor(&mut self.q.cursor(db)?),
+            BoundDb::Read(db) => first_or_from_cursor(&mut self.q.cursor_read(db)?),
         }
     }
 
@@ -1450,10 +1489,16 @@ impl<'a, T> BoundQueryable<'a, T> {
         }
     }
 
-    pub fn single(self) -> Result<Row, Error> {
+    pub fn single(mut self) -> Result<Row, Error> {
+        if !matches!(
+            self.q.query.steps.last(),
+            Some(Step::Take { n: Some(0..=2) })
+        ) {
+            self.q.query.steps.push(Step::Take { n: Some(2) });
+        }
         match self.db {
-            BoundDb::Mut(db) => self.q.single(db),
-            BoundDb::Read(db) => self.q.single_read(db),
+            BoundDb::Mut(db) => single_from_cursor(&mut self.q.cursor(db)?),
+            BoundDb::Read(db) => single_from_cursor(&mut self.q.cursor_read(db)?),
         }
     }
 
@@ -1462,14 +1507,16 @@ impl<'a, T> BoundQueryable<'a, T> {
     }
 
     pub fn scalar(self) -> Result<Cell, Error> {
-        match self.db {
-            BoundDb::Mut(db) => self.q.scalar(db),
-            BoundDb::Read(db) => self.q.scalar_read(db),
-        }
+        let mut row = self.first()?;
+        row.values_mut()
+            .next()
+            .map(|c| std::mem::replace(c, Cell::Null))
+            .ok_or_else(|| Error::runtime("empty row"))
     }
 
     pub fn scalar_as<U: FromCell>(self) -> Result<U, Error> {
-        U::from_cell(&self.scalar()?)
+        let row = self.first()?;
+        U::from_cell(scalar_ref_from_row(&row)?)
     }
 }
 
@@ -1507,11 +1554,15 @@ fn single_from_cursor(cur: &mut QueryCursor<'_>) -> Result<Row, Error> {
     Ok(first)
 }
 
-fn scalar_from_row(row: &Row) -> Result<Cell, Error> {
-    row.values()
-        .next()
-        .cloned()
+#[inline]
+fn scalar_ref_from_row(row: &Row) -> Result<&Cell, Error> {
+    row.cells_slice()
+        .first()
         .ok_or_else(|| Error::runtime("empty row"))
+}
+
+fn scalar_from_row(row: &Row) -> Result<Cell, Error> {
+    scalar_ref_from_row(row).cloned()
 }
 
 impl From<&str> for Value {

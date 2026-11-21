@@ -1,5 +1,7 @@
 #[cfg(feature = "gpu")]
-use std::collections::{BTreeMap, BTreeSet};
+use std::borrow::Cow;
+#[cfg(feature = "gpu")]
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 #[cfg(feature = "gpu")]
@@ -13,20 +15,55 @@ use crate::error::Error;
 #[cfg(feature = "gpu")]
 use crate::store::Cell;
 use crate::store::Row;
+#[cfg(feature = "gpu")]
+use crate::store::row::FieldSlot;
 
 #[cfg(feature = "gpu")]
-use super::agg::{cell_key, hits_row};
+use super::agg::{cell_key_ref, hits_row};
 use super::eval::LexQuery;
 #[cfg(feature = "gpu")]
-use super::eval::{cmp_sort, eval_pred, field_cell, value_cell};
+use super::eval::{cmp_sort, eval_pred, value_cell};
 #[cfg(feature = "gpu")]
 use super::graph_ops::edge_row;
 #[cfg(feature = "gpu")]
 use super::join::merge_join_row;
 use super::join::{push_project_batch_row, rows_to_rough_batch};
 use super::{Db, field_names};
+
 #[cfg(feature = "gpu")]
-use crate::store::row_text;
+fn collect_field_texts<'a>(rows: &'a [Row], field: &Field) -> Vec<Option<&'a str>> {
+    let key = field.as_cow_str();
+    let mut slot = FieldSlot::new(&key);
+    rows.iter()
+        .map(|r| slot.get(r).and_then(Cell::text))
+        .collect()
+}
+
+#[cfg(feature = "gpu")]
+fn build_two_col_rows<V>(
+    k0: &str,
+    k1: &str,
+    entries: Vec<(Cell, V)>,
+    mut make_v: impl FnMut(V) -> Cell,
+) -> Vec<Row> {
+    if k0 == k1 {
+        let shape = Row::shape_of(&[k1]);
+        return entries
+            .into_iter()
+            .map(|(_, v)| Row::from_parts(Arc::clone(&shape), [make_v(v)]))
+            .collect();
+    }
+    let shape = Row::shape_of(&[k0, k1]);
+    let k0_first = k0 < k1;
+    entries
+        .into_iter()
+        .map(|(c0, v)| {
+            let c1 = make_v(v);
+            let pair = if k0_first { [c0, c1] } else { [c1, c0] };
+            Row::from_parts(Arc::clone(&shape), pair)
+        })
+        .collect()
+}
 
 impl Db {
     pub(super) fn uses_gpu_filter(&self, query: &Query) -> bool {
@@ -78,7 +115,7 @@ impl Db {
                     if !matches!(op, CmpOp::Eq | CmpOp::Ne) {
                         return Ok(Some(vec![false; rows.len()]));
                     }
-                    let texts: Vec<_> = rows.iter().map(|r| field_cell(r, field).text()).collect();
+                    let texts = collect_field_texts(rows, field);
                     return Ok(Some(gpu.text_mask(
                         &texts,
                         needle,
@@ -86,18 +123,20 @@ impl Db {
                         false,
                     )?));
                 }
+                let key = field.as_cow_str();
+                let mut slot = FieldSlot::new(&key);
                 let records: Vec<_> = rows
                     .iter()
-                    .map(|r| gpu_comparison_record(field_cell(r, field), &right, *op))
+                    .map(|r| gpu_comparison_record(slot.get(r).unwrap_or(&Cell::Null), &right, *op))
                     .collect();
                 Ok(Some(gpu.comparison_mask(&records, *op)?))
             }
             Pred::Contains { field, needle } => {
-                let texts: Vec<_> = rows.iter().map(|r| field_cell(r, field).text()).collect();
+                let texts = collect_field_texts(rows, field);
                 Ok(Some(gpu.text_mask(&texts, needle, 0, false)?))
             }
             Pred::Has { field, needle, ci } => {
-                let texts: Vec<_> = rows.iter().map(|r| field_cell(r, field).text()).collect();
+                let texts = collect_field_texts(rows, field);
                 Ok(Some(gpu.text_mask(&texts, needle, 3, *ci)?))
             }
             Pred::Regex {
@@ -105,10 +144,7 @@ impl Db {
                 pattern,
                 flags,
             } => {
-                let texts: Vec<_> = rows
-                    .iter()
-                    .map(|row| field_cell(row, field).text())
-                    .collect();
+                let texts = collect_field_texts(rows, field);
                 Ok(Some(gpu.regex_mask(&texts, pattern, flags)?))
             }
         }
@@ -193,22 +229,21 @@ impl Db {
             let counts = gpu.group_counts(&vec![0u32; rows.len()], 1)?;
             return Ok(Some(vec![hits_row(counts[0])]));
         };
-        let field = by.as_str();
+        let field = by.as_cow_str();
+        let mut by_slot = FieldSlot::new(&field);
         let mut group_ids: FxHashMap<Cell, u32> = FxHashMap::default();
         let mut group_cells: Vec<Cell> = Vec::new();
         let mut ids: Vec<u32> = Vec::with_capacity(rows.len());
         for row in rows {
-            let cell = row
-                .get(&field)
-                .map(Cell::clone_for_borrow)
-                .unwrap_or(Cell::Null);
-            let id = if let Some(&id) = group_ids.get(&cell) {
+            let cell_ref = by_slot.get(row).unwrap_or(&Cell::Null);
+            let id = if let Some(&id) = group_ids.get(cell_ref) {
                 id
             } else {
                 let id = u32::try_from(group_cells.len())
                     .map_err(|_| Error::runtime("GPU count has too many groups"))?;
-                group_cells.push(cell.clone());
-                group_ids.insert(cell, id);
+                let owned = cell_ref.clone_for_borrow();
+                group_cells.push(owned.clone_for_borrow());
+                group_ids.insert(owned, id);
                 id
             };
             ids.push(id);
@@ -216,17 +251,12 @@ impl Db {
         let counts = gpu.group_counts(&ids, group_cells.len())?;
         let mut entries: Vec<(Cell, i64)> = group_cells.into_iter().zip(counts).collect();
         entries.sort_unstable_by(|(a, _), (b, _)| cmp_sort(a, b));
-        Ok(Some(
-            entries
-                .into_iter()
-                .map(|(cell, count)| {
-                    let mut row = crate::store::acquire_row();
-                    row.insert(field.clone(), cell);
-                    row.insert("hits", Cell::Int(count));
-                    row
-                })
-                .collect(),
-        ))
+        Ok(Some(build_two_col_rows(
+            &field,
+            "hits",
+            entries,
+            Cell::Int,
+        )))
     }
 }
 
@@ -262,37 +292,50 @@ impl Db {
             .map(|fk| fk.to_field.as_str())
             .unwrap_or("id");
         let right = self.store.collection(right_col);
-        let mut dictionary: FxHashMap<String, u32> = FxHashMap::default();
-        let key = |row: &Row, field: &str| {
-            if to_field == "id" {
-                row.get(field).and_then(Cell::text).map(str::to_owned)
-            } else {
-                row.get(field).and_then(cell_key)
-            }
-        };
-        let mut encode = |value: Option<String>| -> Result<u32, Error> {
+        let mut dictionary: FxHashMap<Box<str>, u32> = FxHashMap::with_capacity_and_hasher(
+            right.len().min(left.len()),
+            Default::default(),
+        );
+        let id_join = to_field == "id";
+        let mut encode = |value: Option<Cow<'_, str>>| -> Result<u32, Error> {
             let Some(value) = value else {
                 return Ok(0);
             };
-            if let Some(&id) = dictionary.get(&value) {
+            if let Some(&id) = dictionary.get(value.as_ref()) {
                 return Ok(id);
             }
             let id = u32::try_from(dictionary.len() + 1)
                 .map_err(|_| Error::runtime("GPU join has too many distinct keys"))?;
-            dictionary.insert(value, id);
+            dictionary.insert(Box::from(value.as_ref()), id);
             Ok(id)
         };
+        let mut left_slot = FieldSlot::new(on);
         let left_keys: Vec<u32> = left
             .iter()
-            .map(|row| encode(key(row, on)))
+            .map(|row| {
+                let k = if id_join {
+                    left_slot.get(row).and_then(Cell::text).map(Cow::Borrowed)
+                } else {
+                    left_slot.get(row).and_then(cell_key_ref)
+                };
+                encode(k)
+            })
             .collect::<Result<_, _>>()?;
+        let mut right_slot = FieldSlot::new(to_field);
         let right_keys: Vec<u32> = right
             .iter()
-            .map(|row| encode(key(row, to_field)))
+            .map(|row| {
+                let k = if id_join {
+                    right_slot.get(row).and_then(Cell::text).map(Cow::Borrowed)
+                } else {
+                    right_slot.get(row).and_then(cell_key_ref)
+                };
+                encode(k)
+            })
             .collect::<Result<_, _>>()?;
-        if to_field == "id" {
+        if id_join {
             let hits = gpu.join_id_matches(&left_keys, &right_keys)?;
-            let mut out = Vec::new();
+            let mut out = Vec::with_capacity(left.len());
             for (row, hit) in left.into_iter().zip(hits) {
                 if let Some(hit) = hit {
                     out.push(merge_join_row(row, &right[hit], right_col));
@@ -303,15 +346,19 @@ impl Db {
             return Ok(out);
         }
         let hits = gpu.join_matches(&left_keys, &right_keys)?;
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(left.len());
         for (row, hits) in left.into_iter().zip(hits) {
-            if hits.is_empty() {
-                if left_join {
-                    out.push(row);
+            match hits.split_last() {
+                None => {
+                    if left_join {
+                        out.push(row);
+                    }
                 }
-            } else {
-                for &hit in &hits {
-                    out.push(merge_join_row(row.clone(), &right[hit], right_col));
+                Some((&last_hit, prefix)) => {
+                    for &hit in prefix {
+                        out.push(merge_join_row(row.clone(), &right[hit], right_col));
+                    }
+                    out.push(merge_join_row(row, &right[last_hit], right_col));
                 }
             }
         }
@@ -343,9 +390,10 @@ pub(super) fn rows_to_query_batch(rows: &[Row], query: &Query) -> RecordBatch {
     let Some(names) = projection else {
         return rows_to_rough_batch(rows);
     };
-    let mut batch = RecordBatch::with_capacity(Arc::<[String]>::from(names.clone()), rows.len());
+    let names_arc = Arc::<[String]>::from(names);
+    let mut batch = RecordBatch::with_capacity(Arc::clone(&names_arc), rows.len());
     for row in rows {
-        push_project_batch_row(&mut batch, row, &names);
+        push_project_batch_row(&mut batch, row, &names_arc);
     }
     batch
 }
@@ -379,32 +427,53 @@ impl Db {
         let Some(gpu) = &self.gpu else {
             return Ok(None);
         };
-        let fk = field.as_str();
+        let fk = field.as_cow_str();
+        let mut val_slot = FieldSlot::new(&fk);
         // Split each value the way `ExactSum::add_cell` does: integers into an exact i128
         // part (summed here), other numbers into the float part (summed on the GPU with
         // the same compensation), and non-numeric cells skipped rather than added as 0.0.
-        let bk = by.map(Field::as_str);
+        let mut ids: Vec<u32> = Vec::with_capacity(rows.len());
+        let mut values: Vec<f64> = Vec::with_capacity(rows.len());
+        let Some(by_field) = by else {
+            let mut int_part: i128 = 0;
+            for row in rows {
+                match val_slot.get(row) {
+                    Some(Cell::Int(i)) => int_part += *i as i128,
+                    Some(c) => {
+                        if let Some(v) = c.as_f64() {
+                            ids.push(0);
+                            values.push(v);
+                        }
+                    }
+                    None => {}
+                }
+            }
+            let pairs = gpu.group_sums_compensated(&ids, &values, 1)?;
+            let [float, comp] = pairs[0];
+            let sum = crate::exact_sum::ExactSum::from_parts(int_part, float, comp).value();
+            let shape = Row::shape_of(&[fk.as_ref()]);
+            return Ok(Some(vec![Row::from_parts(shape, [Cell::Float(sum)])]));
+        };
+
+        let bk = by_field.as_cow_str();
+        let mut by_slot = FieldSlot::new(&bk);
         let mut group_ids: FxHashMap<Cell, u32> = FxHashMap::default();
         let mut group_cells: Vec<Cell> = Vec::new();
         let mut int_parts: Vec<i128> = Vec::new();
-        let mut ids: Vec<u32> = Vec::with_capacity(rows.len());
-        let mut values: Vec<f64> = Vec::with_capacity(rows.len());
         for row in rows {
-            let cell = match &bk {
-                Some(k) => row.get(k).map(Cell::clone_for_borrow).unwrap_or(Cell::Null),
-                None => Cell::Null,
-            };
-            let id = if let Some(&id) = group_ids.get(&cell) {
+            let cell_ref = by_slot.get(row).unwrap_or(&Cell::Null);
+            let id = if let Some(&id) = group_ids.get(cell_ref) {
                 id
             } else {
                 let id = u32::try_from(group_cells.len())
                     .map_err(|_| Error::runtime("GPU sum has too many groups"))?;
-                group_cells.push(cell.clone());
-                group_ids.insert(cell, id);
+                let owned = cell_ref.clone_for_borrow();
+                group_cells.push(owned.clone_for_borrow());
+                group_ids.insert(owned, id);
                 int_parts.push(0);
                 id
             };
-            match row.get(&fk) {
+            match val_slot.get(row) {
                 Some(Cell::Int(i)) => int_parts[id as usize] += *i as i128,
                 Some(c) => {
                     if let Some(v) = c.as_f64() {
@@ -416,36 +485,19 @@ impl Db {
             }
         }
         if group_cells.is_empty() {
-            if bk.is_some() {
-                return Ok(Some(Vec::new()));
-            }
-            group_cells.push(Cell::Null);
-            int_parts.push(0);
+            return Ok(Some(Vec::new()));
         }
         let pairs = gpu.group_sums_compensated(&ids, &values, group_cells.len())?;
         let sums: Vec<f64> = pairs
             .iter()
             .zip(&int_parts)
-            .map(|(&[float, comp], &int)| crate::exact_sum::ExactSum::from_parts(int, float, comp).value())
+            .map(|(&[float, comp], &int)| {
+                crate::exact_sum::ExactSum::from_parts(int, float, comp).value()
+            })
             .collect();
-        let Some(bk) = bk else {
-            let mut row = Row::new();
-            row.insert(fk, Cell::Float(sums[0]));
-            return Ok(Some(vec![row]));
-        };
         let mut entries: Vec<(Cell, f64)> = group_cells.into_iter().zip(sums).collect();
         entries.sort_unstable_by(|(a, _), (b, _)| cmp_sort(a, b));
-        Ok(Some(
-            entries
-                .into_iter()
-                .map(|(cell, sum)| {
-                    let mut row = crate::store::acquire_row();
-                    row.insert(bk.clone(), cell);
-                    row.insert(fk.clone(), Cell::Float(sum));
-                    row
-                })
-                .collect(),
-        ))
+        Ok(Some(build_two_col_rows(&bk, &fk, entries, Cell::Float)))
     }
 }
 
@@ -480,23 +532,37 @@ impl Db {
             let Some(gpu) = &self.gpu else {
                 return Ok(None);
             };
-            let blobs: Vec<String> = rows
-                .map(|row| {
-                    let mut blob = String::new();
-                    for field in ["title", "body", "snippet"] {
-                        if let Some(text) = row_text(row, field) {
-                            blob.push_str(text);
-                            blob.push(' ');
-                        }
-                    }
-                    blob.to_lowercase()
-                })
-                .collect();
-            let texts: Vec<Option<&str>> = blobs.iter().map(|blob| Some(blob.as_str())).collect();
             if query.tokens.is_empty() && query.lower.is_empty() {
-                return Ok(Some(vec![0i64; blobs.len()]));
+                return Ok(Some(vec![0i64; rows.count()]));
             }
-            let mut scores = gpu.weight_accumulator(blobs.len())?;
+            let (low, _) = rows.size_hint();
+            let mut all_bytes = String::with_capacity(low * 64);
+            let mut ends = Vec::with_capacity(low);
+            let mut title_slot = FieldSlot::new("title");
+            let mut body_slot = FieldSlot::new("body");
+            let mut snippet_slot = FieldSlot::new("snippet");
+            for row in rows {
+                for slot in [&mut title_slot, &mut body_slot, &mut snippet_slot] {
+                    if let Some(text) = slot.get(row).and_then(Cell::text) {
+                        if text.is_ascii() {
+                            let start = all_bytes.len();
+                            all_bytes.push_str(text);
+                            all_bytes[start..].make_ascii_lowercase();
+                        } else {
+                            all_bytes.extend(text.chars().flat_map(char::to_lowercase));
+                        }
+                        all_bytes.push(' ');
+                    }
+                }
+                ends.push(all_bytes.len());
+            }
+            let mut texts: Vec<Option<&str>> = Vec::with_capacity(ends.len());
+            let mut prev = 0usize;
+            for &end in &ends {
+                texts.push(Some(&all_bytes[prev..end]));
+                prev = end;
+            }
+            let mut scores = gpu.weight_accumulator(ends.len())?;
             for token in &query.tokens {
                 gpu.text_accumulate(&texts, token, 0, &mut scores, 1)?;
                 // Punctuation-bearing tokens cannot equal a CPU-split word.
@@ -566,22 +632,26 @@ impl Db {
         depth: i64,
         graph: bool,
     ) -> Result<Vec<Row>, Error> {
-        let mut seeds = BTreeSet::new();
+        let mut id_slot = FieldSlot::new("id");
+        let mut uri_slot = FieldSlot::new("uri");
+        let mut seed_strs: Vec<&str> = Vec::with_capacity(rows.len() * 2);
         for row in rows {
-            for field in ["id", "uri"] {
-                if let Some(key) = row_text(row, field) {
-                    seeds.insert(key.to_owned());
-                }
+            if let Some(key) = id_slot.get(row).and_then(Cell::text) {
+                seed_strs.push(key);
+            }
+            if let Some(key) = uri_slot.get(row).and_then(Cell::text) {
+                seed_strs.push(key);
             }
         }
-        let (keys, reached) = self.gpu_walk_state(&seeds, relation, reverse, depth, graph)?;
+        let edges: Vec<_> = self
+            .store
+            .edges
+            .iter()
+            .filter(|edge| edge.rel == relation)
+            .collect();
+        let (keys, reached) =
+            self.gpu_walk_state_borrowed(&edges, &seed_strs, reverse, depth, graph)?;
         if graph {
-            let edges: Vec<_> = self
-                .store
-                .edges
-                .iter()
-                .filter(|edge| edge.rel == relation)
-                .collect();
             return Ok(reached
                 .into_iter()
                 .map(|i| {
@@ -592,7 +662,7 @@ impl Db {
         }
         Ok(reached
             .into_iter()
-            .filter_map(|i| self.resolve_node_ref(primary, &keys[i]).cloned())
+            .filter_map(|i| self.resolve_node_ref(primary, keys[i]).cloned())
             .take(300)
             .collect())
     }
@@ -602,34 +672,39 @@ impl Db {
         relation: &str,
         reverse: bool,
     ) -> Result<Vec<String>, Error> {
-        let (keys, reached) = self.gpu_walk_state(seeds, relation, reverse, 1, false)?;
-        Ok(reached.into_iter().map(|i| keys[i].clone()).collect())
-    }
-    fn gpu_walk_state(
-        &self,
-        seeds: &BTreeSet<String>,
-        relation: &str,
-        reverse: bool,
-        depth: i64,
-        graph: bool,
-    ) -> Result<(Vec<String>, Vec<usize>), Error> {
         let edges: Vec<_> = self
             .store
             .edges
             .iter()
             .filter(|edge| edge.rel == relation)
             .collect();
-        let mut keys = seeds.clone();
-        for edge in &edges {
-            keys.insert(edge.from.clone());
-            keys.insert(edge.to.clone());
+        let seed_strs: Vec<&str> = seeds.iter().map(String::as_str).collect();
+        let (keys, reached) = self.gpu_walk_state_borrowed(&edges, &seed_strs, reverse, 1, false)?;
+        Ok(reached.into_iter().map(|i| keys[i].to_owned()).collect())
+    }
+    fn gpu_walk_state_borrowed<'a>(
+        &self,
+        edges: &[&'a crate::store::Edge],
+        seeds: &[&'a str],
+        reverse: bool,
+        depth: i64,
+        graph: bool,
+    ) -> Result<(Vec<&'a str>, Vec<usize>), Error> {
+        let mut keys: Vec<&'a str> = Vec::with_capacity(seeds.len() + edges.len() * 2);
+        keys.extend_from_slice(seeds);
+        for edge in edges {
+            keys.push(edge.from.as_str());
+            keys.push(edge.to.as_str());
         }
-        let keys: Vec<String> = keys.into_iter().collect();
-        let id = |key: &str| {
-            keys.binary_search_by(|v| v.as_str().cmp(key))
-                .expect("known node") as u32
-        };
-        let mut identities = BTreeMap::new();
+        keys.sort_unstable();
+        keys.dedup();
+        let mut node_ids: FxHashMap<&'a str, u32> =
+            FxHashMap::with_capacity_and_hasher(keys.len(), Default::default());
+        for (i, &k) in keys.iter().enumerate() {
+            node_ids.insert(k, i as u32);
+        }
+        let mut identities: FxHashMap<(&'a str, &'a str), u32> =
+            FxHashMap::with_capacity_and_hasher(edges.len(), Default::default());
         let encoded: Vec<[u32; 4]> = edges
             .iter()
             .map(|edge| {
@@ -638,14 +713,16 @@ impl Db {
                     .entry((edge.from.as_str(), edge.to.as_str()))
                     .or_insert(next);
                 let (src, dst) = if reverse {
-                    (&edge.to, &edge.from)
+                    (edge.to.as_str(), edge.from.as_str())
                 } else {
-                    (&edge.from, &edge.to)
+                    (edge.from.as_str(), edge.to.as_str())
                 };
-                [id(src), id(dst), identity, 0]
+                [node_ids[src], node_ids[dst], identity, 0]
             })
             .collect();
-        let seed_ids: Vec<u32> = seeds.iter().map(|key| id(key)).collect();
+        let mut seed_ids: Vec<u32> = seeds.iter().map(|&key| node_ids[key]).collect();
+        seed_ids.sort_unstable();
+        seed_ids.dedup();
         let reached = self.gpu.as_ref().unwrap().walk_graph(
             &encoded,
             &seed_ids,
@@ -676,53 +753,75 @@ impl Db {
             .iter()
             .filter(|e| e.rel == relation)
             .collect();
-        let mut keys: BTreeSet<String> = seeds.iter().cloned().collect();
-        for edge in &edges {
-            keys.insert(edge.from.clone());
-            keys.insert(edge.to.clone());
+        let cap = seeds.len() + edges.len() * 2;
+        let mut node_ids: FxHashMap<&str, u32> =
+            FxHashMap::with_capacity_and_hasher(cap, Default::default());
+        let mut keys: Vec<&str> = Vec::with_capacity(cap);
+        for s in seeds {
+            let k = s.as_str();
+            if !node_ids.contains_key(k) {
+                let id = keys.len() as u32;
+                keys.push(k);
+                node_ids.insert(k, id);
+            }
         }
-        let keys: Vec<String> = keys.into_iter().collect();
-        let id = |key: &str| {
-            keys.binary_search_by(|s| s.as_str().cmp(key))
-                .expect("known key") as u32
-        };
+        for edge in &edges {
+            for k in [edge.from.as_str(), edge.to.as_str()] {
+                if !node_ids.contains_key(k) {
+                    let id = keys.len() as u32;
+                    keys.push(k);
+                    node_ids.insert(k, id);
+                }
+            }
+        }
         let encoded: Vec<[u32; 4]> = edges
             .iter()
             .map(|e| {
                 let (src, dst) = if reverse {
-                    (&e.to, &e.from)
+                    (e.to.as_str(), e.from.as_str())
                 } else {
-                    (&e.from, &e.to)
+                    (e.from.as_str(), e.to.as_str())
                 };
-                [id(src), id(dst), 0, 0]
+                [node_ids[src], node_ids[dst], 0, 0]
             })
             .collect();
-        let eligible: Vec<u32> = keys
+        let resolved: Vec<Option<&Row>> = keys
             .iter()
-            .map(|key| u32::from(self.resolve_node_ref(primary, key).is_some()))
+            .map(|&key| self.resolve_node_ref(primary, key))
             .collect();
+        let eligible: Vec<u32> = resolved.iter().map(|r| u32::from(r.is_some())).collect();
+        let edge_bind_keys = hop.edge.as_ref().map(|bind| {
+            (
+                format!("{bind}.rel"),
+                format!("{bind}.from"),
+                format!("{bind}.to"),
+            )
+        });
+        let mut field_key = String::with_capacity(hop.bind.len() + 16);
         for seed in seeds {
             let hits = self.gpu.as_ref().unwrap().match_dfs(
                 &encoded,
                 &eligible,
-                id(seed),
+                node_ids[seed.as_str()],
                 hop.min_depth as u32,
                 hop.max_depth as u32,
                 300usize.saturating_sub(out.len()),
             )?;
             for (node_id, edge_id) in hits {
-                let node = self
-                    .resolve_node_ref(primary, &keys[node_id])
-                    .expect("eligible node");
+                let node = resolved[node_id].expect("eligible node");
                 let mut merged = row.clone();
                 for (k, v) in node {
-                    merged.insert(format!("{}.{k}", hop.bind), v.clone());
+                    field_key.clear();
+                    field_key.push_str(&hop.bind);
+                    field_key.push('.');
+                    field_key.push_str(k);
+                    merged.insert(&field_key, v.clone());
                 }
-                if let Some(bind) = &hop.edge {
+                if let Some((rel_k, from_k, to_k)) = &edge_bind_keys {
                     let edge = edges[edge_id];
-                    merged.insert(format!("{bind}.rel"), Cell::text_arc(edge.rel.as_str()));
-                    merged.insert(format!("{bind}.from"), Cell::text_arc(edge.from.as_str()));
-                    merged.insert(format!("{bind}.to"), Cell::text_arc(edge.to.as_str()));
+                    merged.insert(rel_k.as_str(), Cell::text_arc(edge.rel.as_str()));
+                    merged.insert(from_k.as_str(), Cell::text_arc(edge.from.as_str()));
+                    merged.insert(to_k.as_str(), Cell::text_arc(edge.to.as_str()));
                 }
                 out.push(merged);
             }

@@ -63,7 +63,7 @@ impl Type {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct FieldInfo {
     pub ty: Type,
     pub fts: bool,
@@ -184,13 +184,46 @@ impl Catalog {
 
     #[inline]
     pub fn has_indexes_on(&self, collection: &str) -> bool {
-        self.indexes.values().any(|i| i.collection == collection)
+        if self.indexes.is_empty() {
+            return false;
+        }
+        if self.indexes.len() <= 8 {
+            return self.indexes.values().any(|i| i.collection == collection);
+        }
+        let mut buf: smallvec::SmallVec<[u8; 64]> =
+            smallvec::SmallVec::with_capacity(collection.len() + 1);
+        buf.extend_from_slice(collection.as_bytes());
+        buf.push(b'[');
+        // SAFETY: `collection` is valid UTF-8 and `b'['` is ASCII.
+        let prefix = unsafe { std::str::from_utf8_unchecked(&buf) };
+        self.indexes
+            .range::<str, _>((std::ops::Bound::Included(prefix), std::ops::Bound::Unbounded))
+            .next()
+            .is_some_and(|(k, i)| k.starts_with(prefix) && i.collection == collection)
     }
 
     pub fn indexes_on(&self, collection: &str) -> Vec<&IndexDef> {
+        if self.indexes.is_empty() {
+            return Vec::new();
+        }
+        if self.indexes.len() <= 8 {
+            return self
+                .indexes
+                .values()
+                .filter(|i| i.collection == collection)
+                .collect();
+        }
+        let mut buf: smallvec::SmallVec<[u8; 64]> =
+            smallvec::SmallVec::with_capacity(collection.len() + 1);
+        buf.extend_from_slice(collection.as_bytes());
+        buf.push(b'[');
+        // SAFETY: `collection` is valid UTF-8 and `b'['` is ASCII.
+        let prefix = unsafe { std::str::from_utf8_unchecked(&buf) };
         self.indexes
-            .values()
-            .filter(|i| i.collection == collection)
+            .range::<str, _>((std::ops::Bound::Included(prefix), std::ops::Bound::Unbounded))
+            .take_while(|(k, _)| k.starts_with(prefix))
+            .filter(|(_, i)| i.collection == collection)
+            .map(|(_, i)| i)
             .collect()
     }
 
@@ -219,28 +252,28 @@ impl Catalog {
                 let mut map = BTreeMap::new();
                 for (fname, ty) in fields {
                     match ty {
-                        TypeExpr::Named(n) if self.owned.contains_key(n) => {
-                            let owned = self.owned[n].clone();
-                            for (of, info) in owned {
-                                if map.contains_key(&of) {
-                                    return Err(Error::new(format!(
-                                        "owned field collision: {name}.{of}"
-                                    )));
-                                }
-                                map.insert(of, info);
-                            }
-                        }
                         TypeExpr::Named(n) => {
-                            let ty = Type::from_name(n)
-                                .ok_or_else(|| Error::new(format!("unknown type: {n}")))?;
-                            map.insert(
-                                fname.clone(),
-                                FieldInfo {
-                                    ty,
-                                    fts: ty == Type::Text,
-                                    unique: fname == "id" || fname == "uri",
-                                },
-                            );
+                            if let Some(owned) = self.owned.get(n) {
+                                for (of, info) in owned {
+                                    if map.contains_key(of) {
+                                        return Err(Error::new(format!(
+                                            "owned field collision: {name}.{of}"
+                                        )));
+                                    }
+                                    map.insert(of.clone(), *info);
+                                }
+                            } else {
+                                let ty = Type::from_name(n)
+                                    .ok_or_else(|| Error::new(format!("unknown type: {n}")))?;
+                                map.insert(
+                                    fname.clone(),
+                                    FieldInfo {
+                                        ty,
+                                        fts: ty == Type::Text,
+                                        unique: fname == "id" || fname == "uri",
+                                    },
+                                );
+                            }
                         }
                         TypeExpr::Vec { .. } => {
                             map.insert(
@@ -374,6 +407,10 @@ impl Catalog {
                 fields,
                 pred,
             } => {
+                let label = format!("{collection}[{}]", fields.join(","));
+                if self.indexes.contains_key(&label) {
+                    return Err(Error::new(format!("index exists: {label}")));
+                }
                 let def = IndexDef {
                     collection: collection.clone(),
                     unique: *unique,
@@ -381,10 +418,6 @@ impl Catalog {
                     pred: pred.clone(),
                     bitmap_card_field: None, // DEFAULT: No bitmap optimization
                 };
-                let label = def.label();
-                if self.indexes.contains_key(&label) {
-                    return Err(Error::new(format!("index exists: {label}")));
-                }
                 self.indexes.insert(label, def);
             }
         }

@@ -213,6 +213,7 @@ impl<'a> Parser<'a> {
         self.pos = self.skip_offset();
     }
 
+    #[inline]
     fn skip_offset(&self) -> usize {
         let mut i = self.pos;
         let bytes = self.src.as_bytes();
@@ -235,52 +236,68 @@ impl<'a> Parser<'a> {
             }
             if i + 1 < bytes.len() && bytes[i] == b'-' && bytes[i + 1] == b'-' {
                 i += 2;
-                while i < bytes.len() && bytes[i] != b'\n' {
-                    i += 1;
+                match memchr::memchr(b'\n', &bytes[i..]) {
+                    Some(nl) => {
+                        i += nl + 1;
+                        continue;
+                    }
+                    None => return bytes.len(),
                 }
-                continue;
             }
             break;
         }
         i
     }
 
+    #[inline]
     fn peek_after_skip(&self) -> Option<char> {
-        self.src[self.skip_offset()..].chars().next()
+        let i = self.skip_offset();
+        let b = *self.src.as_bytes().get(i)?;
+        if b < 0x80 {
+            Some(b as char)
+        } else {
+            self.src[i..].chars().next()
+        }
     }
 
+    #[inline]
     fn starts_ident(&self) -> bool {
-        matches!(self.peek(), Some(c) if is_ident_start(c))
+        self.src
+            .as_bytes()
+            .get(self.pos)
+            .is_some_and(|&b| is_ident_start_byte(b))
     }
 
+    #[inline]
     fn peek_ident(&self) -> Option<&'a str> {
-        let rest = &self.src[self.skip_offset()..];
-        let mut chars = rest.chars();
-        let first = chars.next()?;
-        if !is_ident_start(first) {
+        let start = self.skip_offset();
+        let bytes = self.src.as_bytes();
+        let &first = bytes.get(start)?;
+        if !is_ident_start_byte(first) {
             return None;
         }
-        let mut n = first.len_utf8();
-        for c in chars {
-            if !is_ident_continue(c) {
-                break;
-            }
-            n += c.len_utf8();
+        let mut end = start + 1;
+        while end < bytes.len() && is_ident_continue_byte(bytes[end]) {
+            end += 1;
         }
-        Some(&rest[..n])
+        Some(&self.src[start..end])
     }
 
+    #[inline]
     fn eat_ident_str(&mut self) -> Option<&'a str> {
         self.skip();
-        if !self.starts_ident() {
+        let bytes = self.src.as_bytes();
+        let start = self.pos;
+        let &first = bytes.get(start)?;
+        if !is_ident_start_byte(first) {
             return None;
         }
-        let start = self.pos;
-        self.bump();
-        while matches!(self.peek(), Some(c) if is_ident_continue(c)) {
-            self.bump();
+        let mut end = start + 1;
+        while end < bytes.len() && is_ident_continue_byte(bytes[end]) {
+            end += 1;
         }
-        Some(&self.src[start..self.pos])
+        self.pos = end;
+        Some(&self.src[start..end])
     }
 
     fn expect_ident_str(&mut self) -> Result<&'a str, Error> {
@@ -375,32 +392,22 @@ impl<'a> Parser<'a> {
 
     fn expect_string(&mut self) -> Result<String, Error> {
         self.skip();
-        if self.peek() != Some('"') {
+        let bytes = self.src.as_bytes();
+        if bytes.get(self.pos) != Some(&b'"') {
             return Err(self.err("expected string"));
         }
-        self.bump();
+        self.pos += 1;
         let start = self.pos;
-        let bytes = self.src.as_bytes();
-        let mut i = start;
-        while i < bytes.len() {
-            match bytes[i] {
-                b'"' => {
-                    self.pos = i + 1;
-                    return Ok(self.src[start..i].to_owned());
-                }
-                b'\\' => break,
-                _ => i += 1,
+        match memchr::memchr2(b'"', b'\\', &bytes[start..]) {
+            Some(rel) if bytes[start + rel] == b'"' => {
+                let end = start + rel;
+                self.pos = end + 1;
+                Ok(self.src[start..end].to_owned())
             }
-        }
-        let mut out = String::with_capacity((i - start) + 16);
-        out.push_str(&self.src[start..i]);
-        self.pos = i;
-        loop {
-            match self.bump() {
-                None => return Err(self.err("unterminated string")),
-                Some('"') => return Ok(out),
-                Some('\\') => self.string_escape(&mut out)?,
-                Some(c) => out.push(c),
+            Some(rel) => self.expect_string_escaped_tail(start, start + rel),
+            None => {
+                self.pos = bytes.len();
+                Err(self.err("unterminated string"))
             }
         }
     }
@@ -421,18 +428,25 @@ impl<'a> Parser<'a> {
                 if self.bump() != Some('{') {
                     return Err(self.err("expected `{` after \\u"));
                 }
-                let mut hex = String::new();
+                let mut val = 0u32;
+                let mut digits = 0usize;
                 loop {
                     match self.bump() {
                         Some('}') => break,
-                        Some(c) if c.is_ascii_hexdigit() && hex.len() < 6 => hex.push(c),
+                        Some(c) if digits < 6 => match c.to_digit(16) {
+                            Some(d) => {
+                                val = (val << 4) | d;
+                                digits += 1;
+                            }
+                            None => return Err(self.err("bad \\u{..} escape")),
+                        },
                         _ => return Err(self.err("bad \\u{..} escape")),
                     }
                 }
-                let ch = u32::from_str_radix(&hex, 16)
-                    .ok()
-                    .and_then(char::from_u32)
-                    .ok_or_else(|| self.err("bad \\u{..} escape"))?;
+                if digits == 0 {
+                    return Err(self.err("bad \\u{..} escape"));
+                }
+                let ch = char::from_u32(val).ok_or_else(|| self.err("bad \\u{..} escape"))?;
                 out.push(ch);
             }
             // Any other escape keeps its backslash, so regex patterns such as `"\d+"`
@@ -448,36 +462,54 @@ impl<'a> Parser<'a> {
 
     fn expect_string_arc(&mut self) -> Result<std::sync::Arc<str>, Error> {
         self.skip();
-        if self.peek() != Some('"') {
+        let bytes = self.src.as_bytes();
+        if bytes.get(self.pos) != Some(&b'"') {
             return Err(self.err("expected string"));
         }
-        self.bump();
+        self.pos += 1;
         let start = self.pos;
-        let bytes = self.src.as_bytes();
-        let mut i = start;
-        while i < bytes.len() {
-            match bytes[i] {
-                b'"' => {
-                    self.pos = i + 1;
-                    return Ok(std::sync::Arc::from(&self.src[start..i]));
-                }
-                b'\\' => break,
-                _ => i += 1,
+        match memchr::memchr2(b'"', b'\\', &bytes[start..]) {
+            Some(rel) if bytes[start + rel] == b'"' => {
+                let end = start + rel;
+                self.pos = end + 1;
+                Ok(std::sync::Arc::from(&self.src[start..end]))
+            }
+            Some(rel) => Ok(std::sync::Arc::from(
+                self.expect_string_escaped_tail(start, start + rel)?,
+            )),
+            None => {
+                self.pos = bytes.len();
+                Err(self.err("unterminated string"))
             }
         }
-        Ok(std::sync::Arc::from(self.expect_string_escaped_tail(start, i)?))
     }
 
-    fn expect_string_escaped_tail(&mut self, start: usize, esc_pos: usize) -> Result<String, Error> {
+    fn expect_string_escaped_tail(
+        &mut self,
+        start: usize,
+        mut esc_pos: usize,
+    ) -> Result<String, Error> {
+        let bytes = self.src.as_bytes();
         let mut out = String::with_capacity((esc_pos - start) + 16);
         out.push_str(&self.src[start..esc_pos]);
-        self.pos = esc_pos;
         loop {
-            match self.bump() {
-                None => return Err(self.err("unterminated string")),
-                Some('"') => return Ok(out),
-                Some('\\') => self.string_escape(&mut out)?,
-                Some(c) => out.push(c),
+            self.pos = esc_pos + 1;
+            self.string_escape(&mut out)?;
+            let seg_start = self.pos;
+            match memchr::memchr2(b'"', b'\\', &bytes[seg_start..]) {
+                Some(rel) => {
+                    let hit = seg_start + rel;
+                    out.push_str(&self.src[seg_start..hit]);
+                    if bytes[hit] == b'"' {
+                        self.pos = hit + 1;
+                        return Ok(out);
+                    }
+                    esc_pos = hit;
+                }
+                None => {
+                    self.pos = bytes.len();
+                    return Err(self.err("unterminated string"));
+                }
             }
         }
     }
@@ -697,158 +729,155 @@ impl<'a> Parser<'a> {
         if self.peek() == Some('{') {
             return Ok(Step::Project(self.parse_project_brace()?));
         }
-        if self.eat_kw("where") {
-            return Ok(Step::Filter(self.parse_pred()?));
-        }
-        if self.eat_kw("pick") {
-            self.skip();
-            if self.peek() == Some('{') {
-                return Ok(Step::Project(self.parse_project_brace()?));
+        let save = self.pos;
+        if let Some(kw) = self.eat_ident_str() {
+            match kw {
+                "where" => return Ok(Step::Filter(self.parse_pred()?)),
+                "pick" => {
+                    self.skip();
+                    if self.peek() == Some('{') {
+                        return Ok(Step::Project(self.parse_project_brace()?));
+                    }
+                    return Ok(Step::Project(self.parse_field_list()?));
+                }
+                "without" => {
+                    self.skip();
+                    if self.peek() == Some('{') {
+                        let fields = self.parse_delimited(
+                            '{',
+                            '}',
+                            "expected `,` or `}` in without",
+                            Some("without requires at least one field"),
+                            Self::parse_field,
+                        )?;
+                        return Ok(Step::Without(fields));
+                    }
+                    return Ok(Step::Without(self.parse_field_list()?));
+                }
+                "join" => {
+                    let left = self.eat_kw("left");
+                    let collection = self.expect_ident()?;
+                    self.expect_kw("on")?;
+                    let on = self.expect_ident()?;
+                    return Ok(Step::Join {
+                        left,
+                        collection,
+                        on,
+                    });
+                }
+                "hop" => {
+                    let (rel, depth) = self.parse_rel_depth()?;
+                    return Ok(Step::Hop { rel, depth });
+                }
+                "graph" => {
+                    let (rel, depth) = self.parse_rel_depth()?;
+                    return Ok(Step::Graph { rel, depth });
+                }
+                "match" => return self.parse_match_step(),
+                "search" => {
+                    let mode = if self.eat_kw("lex") {
+                        SearchMode::Lex
+                    } else if self.eat_kw("vec") {
+                        SearchMode::Vec
+                    } else {
+                        SearchMode::Hybrid
+                    };
+                    let query = self.expect_string()?;
+                    return Ok(Step::Search { mode, query });
+                }
+                "count" => {
+                    if self.eat_char('(') {
+                        self.expect_char(')')?;
+                    }
+                    let by = self.parse_opt_by_keys()?;
+                    return match try_into_simple_by_field(by) {
+                        Ok(simple) => Ok(Step::Count { by: simple }),
+                        Err(by) => Ok(Step::Summarize {
+                            specs: vec![AggSpec {
+                                alias: "hits".into(),
+                                func: AggFunc::Count,
+                            }],
+                            by,
+                        }),
+                    };
+                }
+                "sum" => {
+                    return self
+                        .parse_single_agg_step("total", AggFunc::Sum, |field, by| Step::Sum {
+                            field,
+                            by,
+                        });
+                }
+                "min" => {
+                    return self.parse_single_agg_step("min", AggFunc::Min, |field, by| {
+                        Step::Min { field, by }
+                    });
+                }
+                "max" => {
+                    return self.parse_single_agg_step("max", AggFunc::Max, |field, by| {
+                        Step::Max { field, by }
+                    });
+                }
+                "avg" => {
+                    return self.parse_single_agg_step("avg", AggFunc::Avg, |field, by| {
+                        Step::Avg { field, by }
+                    });
+                }
+                "dcount" => {
+                    let field = self.parse_window_field_arg()?;
+                    let by = self.parse_opt_by_keys()?;
+                    return Ok(Step::Summarize {
+                        specs: vec![AggSpec {
+                            alias: "dcount".into(),
+                            func: AggFunc::DCount(field),
+                        }],
+                        by,
+                    });
+                }
+                "percentile" => {
+                    let (field, pct) = self.parse_percentile_args()?;
+                    let by = self.parse_opt_by_keys()?;
+                    return Ok(Step::Summarize {
+                        specs: vec![AggSpec {
+                            alias: default_pct_alias(pct),
+                            func: AggFunc::Percentile { field, pct },
+                        }],
+                        by,
+                    });
+                }
+                "arg_max" => return self.parse_arg_extremum_step(true),
+                "arg_min" => return self.parse_arg_extremum_step(false),
+                "summarize" => return self.parse_summarize_step(),
+                "sort" => {
+                    let field = self.parse_field()?;
+                    let desc = self.eat_kw("desc");
+                    if !desc {
+                        self.eat_kw("asc");
+                    }
+                    return Ok(Step::Sort { field, desc });
+                }
+                "window" => return self.parse_window_step(),
+                "skip" | "offset" => {
+                    let n = self.expect_int()?;
+                    return Ok(Step::Skip { n });
+                }
+                "take" => {
+                    if self.eat_kw("all") {
+                        return Ok(Step::Take { n: None });
+                    }
+                    return Ok(Step::Take {
+                        n: Some(self.expect_int()?),
+                    });
+                }
+                "explain" | "union" => {
+                    self.pos = save;
+                }
+                _ => {
+                    self.pos = save;
+                    return Ok(Step::Filter(self.parse_pred()?));
+                }
             }
-            return Ok(Step::Project(self.parse_field_list()?));
-        }
-        if self.eat_kw("without") {
-            self.skip();
-            if self.peek() == Some('{') {
-                let fields = self.parse_delimited(
-                    '{',
-                    '}',
-                    "expected `,` or `}` in without",
-                    Some("without requires at least one field"),
-                    Self::parse_field,
-                )?;
-                return Ok(Step::Without(fields));
-            }
-            return Ok(Step::Without(self.parse_field_list()?));
-        }
-        if self.eat_kw("join") {
-            let left = self.eat_kw("left");
-            let collection = self.expect_ident()?;
-            self.expect_kw("on")?;
-            let on = self.expect_ident()?;
-            return Ok(Step::Join {
-                left,
-                collection,
-                on,
-            });
-        }
-        if self.eat_kw("hop") {
-            let (rel, depth) = self.parse_rel_depth()?;
-            return Ok(Step::Hop { rel, depth });
-        }
-        if self.eat_kw("graph") {
-            let (rel, depth) = self.parse_rel_depth()?;
-            return Ok(Step::Graph { rel, depth });
-        }
-        if self.eat_kw("match") {
-            return self.parse_match_step();
-        }
-        if self.eat_kw("search") {
-            let mode = if self.eat_kw("lex") {
-                SearchMode::Lex
-            } else if self.eat_kw("vec") {
-                SearchMode::Vec
-            } else {
-                SearchMode::Hybrid
-            };
-            let query = self.expect_string()?;
-            return Ok(Step::Search { mode, query });
-        }
-        if self.eat_kw("count") {
-            if self.eat_char('(') {
-                self.expect_char(')')?;
-            }
-            let by = self.parse_opt_by_keys()?;
-            if let Some(simple) = simple_by_field(&by) {
-                return Ok(Step::Count { by: simple });
-            }
-            return Ok(Step::Summarize {
-                specs: vec![AggSpec {
-                    alias: "hits".into(),
-                    func: AggFunc::Count,
-                }],
-                by,
-            });
-        }
-        if self.eat_kw("sum") {
-            return self.parse_single_agg_step("total", AggFunc::Sum, |field, by| Step::Sum {
-                field,
-                by,
-            });
-        }
-        if self.eat_kw("min") {
-            return self.parse_single_agg_step("min", AggFunc::Min, |field, by| Step::Min {
-                field,
-                by,
-            });
-        }
-        if self.eat_kw("max") {
-            return self.parse_single_agg_step("max", AggFunc::Max, |field, by| Step::Max {
-                field,
-                by,
-            });
-        }
-        if self.eat_kw("avg") {
-            return self.parse_single_agg_step("avg", AggFunc::Avg, |field, by| Step::Avg {
-                field,
-                by,
-            });
-        }
-        if self.eat_kw("dcount") {
-            let field = self.parse_window_field_arg()?;
-            let by = self.parse_opt_by_keys()?;
-            return Ok(Step::Summarize {
-                specs: vec![AggSpec {
-                    alias: "dcount".into(),
-                    func: AggFunc::DCount(field),
-                }],
-                by,
-            });
-        }
-        if self.eat_kw("percentile") {
-            let (field, pct) = self.parse_percentile_args()?;
-            let by = self.parse_opt_by_keys()?;
-            return Ok(Step::Summarize {
-                specs: vec![AggSpec {
-                    alias: default_pct_alias(pct),
-                    func: AggFunc::Percentile { field, pct },
-                }],
-                by,
-            });
-        }
-        if self.eat_kw("arg_max") {
-            return self.parse_arg_extremum_step(true);
-        }
-        if self.eat_kw("arg_min") {
-            return self.parse_arg_extremum_step(false);
-        }
-        if self.eat_kw("summarize") {
-            return self.parse_summarize_step();
-        }
-        if self.eat_kw("sort") {
-            let field = self.parse_field()?;
-            let desc = self.eat_kw("desc");
-            if !desc {
-                self.eat_kw("asc");
-            }
-            return Ok(Step::Sort { field, desc });
-        }
-        if self.eat_kw("window") {
-            return self.parse_window_step();
-        }
-        if self.eat_kw("skip") || self.eat_kw("offset") {
-            let n = self.expect_int()?;
-            return Ok(Step::Skip { n });
-        }
-        if self.eat_kw("take") {
-            if self.eat_kw("all") {
-                return Ok(Step::Take { n: None });
-            }
-            return Ok(Step::Take {
-                n: Some(self.expect_int()?),
-            });
-        }
-        if self.starts_pred() {
+        } else if matches!(self.peek(), Some('(' | '!')) {
             return Ok(Step::Filter(self.parse_pred()?));
         }
         Err(self.err("expected a named step or a predicate after `|`"))
@@ -900,16 +929,16 @@ impl<'a> Parser<'a> {
     ) -> Result<Step, Error> {
         let field = self.parse_window_field_arg()?;
         let by = self.parse_opt_by_keys()?;
-        if let Some(simple) = simple_by_field(&by) {
-            return Ok(make_legacy(field, simple));
+        match try_into_simple_by_field(by) {
+            Ok(simple) => Ok(make_legacy(field, simple)),
+            Err(by) => Ok(Step::Summarize {
+                specs: vec![AggSpec {
+                    alias: default_alias.to_string(),
+                    func: make_func(field),
+                }],
+                by,
+            }),
         }
-        Ok(Step::Summarize {
-            specs: vec![AggSpec {
-                alias: default_alias.to_string(),
-                func: make_func(field),
-            }],
-            by,
-        })
     }
 
     fn parse_opt_by_keys(&mut self) -> Result<Vec<GroupKey>, Error> {
@@ -936,9 +965,8 @@ impl<'a> Parser<'a> {
     fn parse_group_key(&mut self) -> Result<GroupKey, Error> {
         let save_alias = self.pos;
         let explicit_alias = if let Some(id) = self.eat_ident_str() {
-            let id = id.to_owned();
             if self.eat_char(':') {
-                Some(id)
+                Some(id.to_owned())
             } else {
                 self.pos = save_alias;
                 None
@@ -1053,9 +1081,8 @@ impl<'a> Parser<'a> {
     fn parse_agg_spec(&mut self) -> Result<AggSpec, Error> {
         let save_alias = self.pos;
         let explicit_alias = if let Some(id) = self.eat_ident_str() {
-            let id = id.to_owned();
             if self.eat_char(':') {
-                Some(id)
+                Some(id.to_owned())
             } else {
                 self.pos = save_alias;
                 None
@@ -1066,68 +1093,62 @@ impl<'a> Parser<'a> {
         };
 
         let func_name = self.expect_ident_str()?;
-        let (default_alias, func) = if func_name == "count" {
-            if self.eat_char('(') {
-                if !self.eat_char(')') {
+        let (default_alias, func): (&str, AggFunc) = match func_name {
+            "count" => {
+                if self.eat_char('(') && !self.eat_char(')') {
                     return Err(self.err("`count()` in summarize takes no arguments (use `dcount field` for distinct count)"));
                 }
+                ("hits", AggFunc::Count)
             }
-            ("hits".to_string(), AggFunc::Count)
-        } else if func_name == "sum" {
-            let f = self.parse_window_field_arg()?;
-            ("total".to_string(), AggFunc::Sum(f))
-        } else if func_name == "avg" {
-            let f = self.parse_window_field_arg()?;
-            ("avg".to_string(), AggFunc::Avg(f))
-        } else if func_name == "min" {
-            let f = self.parse_window_field_arg()?;
-            ("min".to_string(), AggFunc::Min(f))
-        } else if func_name == "max" {
-            let f = self.parse_window_field_arg()?;
-            ("max".to_string(), AggFunc::Max(f))
-        } else if func_name == "dcount" {
-            let f = self.parse_window_field_arg()?;
-            ("dcount".to_string(), AggFunc::DCount(f))
-        } else if func_name == "percentile" {
-            let (f, pct) = self.parse_percentile_args()?;
-            (
-                default_pct_alias(pct),
-                AggFunc::Percentile { field: f, pct },
-            )
-        } else if func_name == "arg_max" || func_name == "arg_min" {
-            let is_max = func_name == "arg_max";
-            let (order, value) = if self.eat_char('(') {
-                let ord = self.parse_field()?;
-                self.expect_char(',')?;
-                if self.eat_char('*') {
-                    return Err(self.err(
-                        "use top-level `arg_max field [by ...]` for whole-row `*` selection, or specify a column: `arg_max(order, field)`",
-                    ));
-                }
-                let val = self.parse_field()?;
-                self.expect_char(')')?;
-                (ord, val)
-            } else {
-                let ord = self.parse_field()?;
-                let _ = self.eat_char(',');
-                let val = self.parse_field()?;
-                (ord, val)
-            };
-            let def = value.as_str();
-            let func = if is_max {
-                AggFunc::ArgMax { order, value }
-            } else {
-                AggFunc::ArgMin { order, value }
-            };
-            (def, func)
-        } else {
-            return Err(self.err(format!(
-                "unknown summarize metric `{func_name}`; supported: count, sum, avg, min, max, dcount, percentile, arg_max, arg_min"
-            )));
+            "sum" => ("total", AggFunc::Sum(self.parse_window_field_arg()?)),
+            "avg" => ("avg", AggFunc::Avg(self.parse_window_field_arg()?)),
+            "min" => ("min", AggFunc::Min(self.parse_window_field_arg()?)),
+            "max" => ("max", AggFunc::Max(self.parse_window_field_arg()?)),
+            "dcount" => ("dcount", AggFunc::DCount(self.parse_window_field_arg()?)),
+            "percentile" => {
+                let (f, pct) = self.parse_percentile_args()?;
+                let alias = explicit_alias.unwrap_or_else(|| default_pct_alias(pct));
+                return Ok(AggSpec {
+                    alias,
+                    func: AggFunc::Percentile { field: f, pct },
+                });
+            }
+            "arg_max" | "arg_min" => {
+                let is_max = func_name == "arg_max";
+                let (order, value) = if self.eat_char('(') {
+                    let ord = self.parse_field()?;
+                    self.expect_char(',')?;
+                    if self.eat_char('*') {
+                        return Err(self.err(
+                            "use top-level `arg_max field [by ...]` for whole-row `*` selection, or specify a column: `arg_max(order, field)`",
+                        ));
+                    }
+                    let val = self.parse_field()?;
+                    self.expect_char(')')?;
+                    (ord, val)
+                } else {
+                    let ord = self.parse_field()?;
+                    let _ = self.eat_char(',');
+                    let val = self.parse_field()?;
+                    (ord, val)
+                };
+                let alias = explicit_alias.unwrap_or_else(|| value.as_str());
+                let func = if is_max {
+                    AggFunc::ArgMax { order, value }
+                } else {
+                    AggFunc::ArgMin { order, value }
+                };
+                return Ok(AggSpec { alias, func });
+            }
+            _ => {
+                return Err(self.err(format!(
+                    "unknown summarize metric `{func_name}`; supported: count, sum, avg, min, max, dcount, percentile, arg_max, arg_min"
+                )));
+            }
         };
 
         Ok(AggSpec {
-            alias: explicit_alias.unwrap_or(default_alias),
+            alias: explicit_alias.unwrap_or_else(|| default_alias.to_owned()),
             func,
         })
     }
@@ -1413,14 +1434,6 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn starts_pred(&self) -> bool {
-        match self.peek_after_skip() {
-            Some('(') | Some('!') => true,
-            Some(_) => matches!(self.peek_ident(), Some(id) if !is_step_keyword(id)),
-            None => false,
-        }
-    }
-
     fn parse_project_brace(&mut self) -> Result<Vec<Field>, Error> {
         self.expect_char('{')?;
         let fields = self.parse_field_list()?;
@@ -1469,7 +1482,18 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_pred(&mut self) -> Result<Pred, Error> {
-        let mut terms = vec![self.parse_and()?];
+        let first = self.parse_and()?;
+        if !self.eat_kw("or") {
+            return Ok(first);
+        }
+        let second = self.parse_and()?;
+        if !self.eat_kw("or") {
+            return Ok(Pred::Or(Box::new(first), Box::new(second)));
+        }
+        let mut terms = Vec::with_capacity(8);
+        terms.push(first);
+        terms.push(second);
+        terms.push(self.parse_and()?);
         while self.eat_kw("or") {
             terms.push(self.parse_and()?);
         }
@@ -1477,7 +1501,18 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_and(&mut self) -> Result<Pred, Error> {
-        let mut terms = vec![self.parse_unary_pred()?];
+        let first = self.parse_unary_pred()?;
+        if !self.eat_kw("and") {
+            return Ok(first);
+        }
+        let second = self.parse_unary_pred()?;
+        if !self.eat_kw("and") {
+            return Ok(Pred::And(Box::new(first), Box::new(second)));
+        }
+        let mut terms = Vec::with_capacity(8);
+        terms.push(first);
+        terms.push(second);
+        terms.push(self.parse_unary_pred()?);
         while self.eat_kw("and") {
             terms.push(self.parse_unary_pred()?);
         }
@@ -1505,89 +1540,117 @@ impl<'a> Parser<'a> {
     fn parse_cmp(&mut self) -> Result<Pred, Error> {
         let field = self.parse_field()?;
         self.skip();
-        if self.eat_kw("is") {
-            let negated = self.eat_kw("not");
-            self.expect_kw("null")?;
-            return Ok(Pred::IsNull { field, negated });
-        }
-        if self.eat_kw("in") {
-            let values = self.parse_delimited(
-                '[',
-                ']',
-                "expected `,` or `]` in `in` list",
-                Some("empty `in` list"),
-                Self::parse_value,
-            )?;
-            return Ok(Pred::In { field, values });
-        }
-        if self.eat_kw("has_ci") {
-            let needle = self.expect_string()?;
-            return Ok(Pred::Has {
-                field,
-                ci: true,
-                needle,
-            });
-        }
-        if self.eat_kw("has") {
-            let ci = self.eat_kw("ci");
-            let needle = self.expect_string()?;
-            return Ok(Pred::Has { field, ci, needle });
-        }
-        if self.eat_kw("regex") {
-            self.skip();
-            if self.peek() == Some('/') {
-                let (pattern, flags) = self.parse_regex_lit()?;
-                return Ok(Pred::Regex {
+        let bytes = self.src.as_bytes();
+        match bytes.get(self.pos).copied() {
+            Some(b'=') if bytes.get(self.pos + 1) == Some(&b'=') => {
+                self.pos += 2;
+                let value = self.parse_value()?;
+                return Ok(Pred::Cmp {
                     field,
-                    pattern,
-                    flags,
+                    op: CmpOp::Eq,
+                    value,
                 });
             }
-            let pattern = self.expect_string()?;
-            crate::check::validate_regex(&pattern, "")?;
-            return Ok(Pred::Regex {
-                field,
-                pattern,
-                flags: String::new(),
-            });
-        }
-        if self.eat_char('~') {
-            self.skip();
-            if self.peek() == Some('/') {
-                let (pattern, flags) = self.parse_regex_lit()?;
-                return Ok(Pred::Regex {
+            Some(b'!') if bytes.get(self.pos + 1) == Some(&b'=') => {
+                self.pos += 2;
+                let value = self.parse_value()?;
+                return Ok(Pred::Cmp {
                     field,
-                    pattern,
-                    flags,
+                    op: CmpOp::Ne,
+                    value,
                 });
             }
-            let needle = self.expect_string()?;
-            return Ok(Pred::Contains { field, needle });
-        }
-        let op = self.parse_cmp_op()?;
-        let value = self.parse_value()?;
-        Ok(Pred::Cmp { field, op, value })
-    }
-
-    fn parse_cmp_op(&mut self) -> Result<CmpOp, Error> {
-        self.skip();
-        if self.eat_op("==") {
-            return Ok(CmpOp::Eq);
-        }
-        if self.eat_op("!=") {
-            return Ok(CmpOp::Ne);
-        }
-        if self.eat_op(">=") {
-            return Ok(CmpOp::Ge);
-        }
-        if self.eat_op("<=") {
-            return Ok(CmpOp::Le);
-        }
-        if self.eat_char('>') {
-            return Ok(CmpOp::Gt);
-        }
-        if self.eat_char('<') {
-            return Ok(CmpOp::Lt);
+            Some(b'>') => {
+                let op = if bytes.get(self.pos + 1) == Some(&b'=') {
+                    self.pos += 2;
+                    CmpOp::Ge
+                } else {
+                    self.pos += 1;
+                    CmpOp::Gt
+                };
+                let value = self.parse_value()?;
+                return Ok(Pred::Cmp { field, op, value });
+            }
+            Some(b'<') => {
+                let op = if bytes.get(self.pos + 1) == Some(&b'=') {
+                    self.pos += 2;
+                    CmpOp::Le
+                } else {
+                    self.pos += 1;
+                    CmpOp::Lt
+                };
+                let value = self.parse_value()?;
+                return Ok(Pred::Cmp { field, op, value });
+            }
+            Some(b'~') => {
+                self.pos += 1;
+                self.skip();
+                if self.peek() == Some('/') {
+                    let (pattern, flags) = self.parse_regex_lit()?;
+                    return Ok(Pred::Regex {
+                        field,
+                        pattern,
+                        flags,
+                    });
+                }
+                let needle = self.expect_string()?;
+                return Ok(Pred::Contains { field, needle });
+            }
+            Some(b) if is_ident_start_byte(b) => {
+                let save = self.pos;
+                if let Some(kw) = self.eat_ident_str() {
+                    match kw {
+                        "is" => {
+                            let negated = self.eat_kw("not");
+                            self.expect_kw("null")?;
+                            return Ok(Pred::IsNull { field, negated });
+                        }
+                        "in" => {
+                            let values = self.parse_delimited(
+                                '[',
+                                ']',
+                                "expected `,` or `]` in `in` list",
+                                Some("empty `in` list"),
+                                Self::parse_value,
+                            )?;
+                            return Ok(Pred::In { field, values });
+                        }
+                        "has_ci" => {
+                            let needle = self.expect_string()?;
+                            return Ok(Pred::Has {
+                                field,
+                                ci: true,
+                                needle,
+                            });
+                        }
+                        "has" => {
+                            let ci = self.eat_kw("ci");
+                            let needle = self.expect_string()?;
+                            return Ok(Pred::Has { field, ci, needle });
+                        }
+                        "regex" => {
+                            self.skip();
+                            if self.peek() == Some('/') {
+                                let (pattern, flags) = self.parse_regex_lit()?;
+                                return Ok(Pred::Regex {
+                                    field,
+                                    pattern,
+                                    flags,
+                                });
+                            }
+                            let pattern = self.expect_string()?;
+                            crate::check::validate_regex(&pattern, "")?;
+                            return Ok(Pred::Regex {
+                                field,
+                                pattern,
+                                flags: String::new(),
+                            });
+                        }
+                        _ => self.pos = save,
+                    }
+                }
+            }
+            _ => {}
         }
         Err(self.err("expected comparison (`==`, `has`, `~`, …)"))
     }
@@ -1652,7 +1715,7 @@ impl<'a> Parser<'a> {
                     .get(self.pos + 1)
                     .is_some_and(u8::is_ascii_digit))
         {
-            if let Some(v) = self.try_number()? {
+            if let Some(v) = self.try_number_at_pos()? {
                 return Ok(v);
             }
         }
@@ -1664,14 +1727,13 @@ impl<'a> Parser<'a> {
             let start = self.pos;
             let bytes = self.src.as_bytes();
             let mut end = start + 1;
-            while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+            while end < bytes.len() && is_ident_continue_byte(bytes[end]) {
                 end += 1;
             }
             self.pos = end;
             return Ok(Value::Param(std::sync::Arc::from(&self.src[start..end])));
         }
-        if is_ident_start(b as char) {
-            let saved = self.pos;
+        if is_ident_start_byte(b) {
             let ident = self.expect_ident_str()?;
             match ident {
                 "true" => return Ok(Value::Bool(true)),
@@ -1690,8 +1752,7 @@ impl<'a> Parser<'a> {
                         self.expect_char(')')?;
                         return Ok(Value::Timestamp(millis));
                     }
-                    self.pos = saved;
-                    return Ok(Value::Name(self.expect_ident()?));
+                    return Ok(Value::Name(ident.to_owned()));
                 }
                 _ => return Ok(Value::Name(ident.to_owned())),
             }
@@ -1712,85 +1773,88 @@ impl<'a> Parser<'a> {
             }
             return Ok(Value::NowMinus(dur));
         }
-        if self.peek().is_some_and(|c| c.is_ascii_digit()) {
-            return Err(self.err("ago requires a duration with unit (7d, 3h, 15m, 30s, 1w)"));
-        }
         Err(self.err("ago requires a duration with unit (7d, 3h, 15m, 30s, 1w)"))
     }
 
     /// Number literal, optionally signed. A `-` only starts a number when a
     /// digit follows it, so `-rel->` match hops and `foo-bar` names still lex
     /// as before, and durations stay unsigned.
+    #[inline]
     fn try_number(&mut self) -> Result<Option<Value>, Error> {
         self.skip();
+        self.try_number_at_pos()
+    }
+
+    fn try_number_at_pos(&mut self) -> Result<Option<Value>, Error> {
+        let bytes = self.src.as_bytes();
         let start = self.pos;
-        let neg = self.peek() == Some('-')
-            && self
-                .rest()
-                .chars()
-                .nth(1)
-                .is_some_and(|c| c.is_ascii_digit());
-        if neg {
-            self.bump();
-        }
-        if !self.peek().is_some_and(|c| c.is_ascii_digit()) {
-            self.pos = start;
+        let Some(&b0) = bytes.get(start) else {
+            return Ok(None);
+        };
+        let neg = b0 == b'-' && bytes.get(start + 1).is_some_and(u8::is_ascii_digit);
+        let digit_start = start + usize::from(neg);
+        if !bytes.get(digit_start).is_some_and(u8::is_ascii_digit) {
             return Ok(None);
         }
-        if !neg {
-            if let Some(dur) = self.try_duration()? {
-                return Ok(Some(Value::Duration(dur)));
-            }
+        let mut i = digit_start + 1;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
         }
-        while self.peek().is_some_and(|c| c.is_ascii_digit()) {
-            self.bump();
-        }
-        let int_part = &self.src[start..self.pos];
-        if self.peek() == Some('.')
-            && self
-                .rest()
-                .chars()
-                .nth(1)
-                .is_some_and(|c| c.is_ascii_digit())
+        if !neg
+            && let Some(&ub) = bytes.get(i)
+            && let Some(unit) = DurUnit::from_char(ub as char)
+            && !bytes.get(i + 1).is_some_and(|&nb| is_ident_continue_byte(nb))
         {
-            self.bump();
-            while self.peek().is_some_and(|c| c.is_ascii_digit()) {
-                self.bump();
+            self.pos = i;
+            let n: i64 = self.src[digit_start..i]
+                .parse()
+                .map_err(|_| self.err("invalid duration"))?;
+            self.pos = i + 1;
+            return Ok(Some(Value::Duration(Duration { n, unit })));
+        }
+        if bytes.get(i) == Some(&b'.') && bytes.get(i + 1).is_some_and(u8::is_ascii_digit) {
+            let mut j = i + 2;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
             }
-            let s = &self.src[start..self.pos];
-            let n: f64 = s.parse().map_err(|_| self.err("invalid float"))?;
+            self.pos = j;
+            let n: f64 = self.src[start..j]
+                .parse()
+                .map_err(|_| self.err("invalid float"))?;
             return Ok(Some(Value::Float(n)));
         }
-        let n: i64 = int_part.parse().map_err(|_| self.err("invalid integer"))?;
+        self.pos = i;
+        let n: i64 = self.src[start..i]
+            .parse()
+            .map_err(|_| self.err("invalid integer"))?;
         Ok(Some(Value::Int(n)))
     }
 
     fn try_duration(&mut self) -> Result<Option<Duration>, Error> {
         self.skip();
-        let save = self.pos;
-        if !self.peek().is_some_and(|c| c.is_ascii_digit()) {
-            return Ok(None);
-        }
+        let bytes = self.src.as_bytes();
         let start = self.pos;
-        while self.peek().is_some_and(|c| c.is_ascii_digit()) {
-            self.bump();
-        }
-        let Some(unit_c) = self.peek() else {
-            self.pos = save;
-            return Ok(None);
-        };
-        let Some(unit) = DurUnit::from_char(unit_c) else {
-            self.pos = save;
-            return Ok(None);
-        };
-        if self.rest().chars().nth(1).is_some_and(is_ident_continue) {
-            self.pos = save;
+        if !bytes.get(start).is_some_and(u8::is_ascii_digit) {
             return Ok(None);
         }
-        let n: i64 = self.src[start..self.pos]
+        let mut i = start + 1;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        let Some(&ub) = bytes.get(i) else {
+            return Ok(None);
+        };
+        let Some(unit) = DurUnit::from_char(ub as char) else {
+            return Ok(None);
+        };
+        if bytes.get(i + 1).is_some_and(|&b| is_ident_continue_byte(b)) {
+            return Ok(None);
+        }
+        self.pos = i;
+        let n: i64 = self.src[start..i]
             .parse()
             .map_err(|_| self.err("invalid duration"))?;
-        self.bump();
+        self.pos = i + 1;
         Ok(Some(Duration { n, unit }))
     }
 
@@ -1801,7 +1865,7 @@ impl<'a> Parser<'a> {
 
     fn expect_int(&mut self) -> Result<i64, Error> {
         self.skip();
-        match self.try_number()? {
+        match self.try_number_at_pos()? {
             Some(Value::Int(n)) => Ok(n),
             Some(Value::Duration(_)) => Err(self.err("expected integer, got duration")),
             _ => Err(self.err("expected integer")),
@@ -1809,31 +1873,98 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_record(&mut self) -> Result<Record, Error> {
-        let fields = self.parse_delimited(
-            '{',
-            '}',
-            "expected `,` or `}` in record",
-            Some("record is empty"),
-            |p| {
-                let name = p.expect_ident()?;
-                p.expect_char(':')?;
-                let value = p.parse_value()?;
-                Ok((name, value))
-            },
-        )?;
+        self.parse_record_with_cap(4)
+    }
+
+    fn parse_record_with_cap(&mut self, expected_fields: usize) -> Result<Record, Error> {
+        self.expect_char('{')?;
+        let mut fields = Vec::with_capacity(expected_fields);
+        let bytes = self.src.as_bytes();
+        loop {
+            self.skip();
+            if bytes.get(self.pos) == Some(&b'}') {
+                self.pos += 1;
+                break;
+            }
+            let name = self.expect_ident()?;
+            self.expect_char(':')?;
+            let value = self.parse_value()?;
+            fields.push((name, value));
+            self.skip();
+            let comma = if bytes.get(self.pos) == Some(&b',') {
+                self.pos += 1;
+                self.skip();
+                true
+            } else {
+                false
+            };
+            if bytes.get(self.pos) == Some(&b'}') {
+                self.pos += 1;
+                break;
+            }
+            if !comma {
+                return Err(self.err("expected `,` or `}` in record"));
+            }
+        }
+        if fields.is_empty() {
+            return Err(self.err("record is empty"));
+        }
         Ok(Record { fields })
     }
 
     fn parse_record_list(&mut self) -> Result<Vec<Record>, Error> {
         self.skip();
-        if self.peek() == Some('[') {
-            return self.parse_delimited(
-                '[',
-                ']',
-                "expected `,` or `]` in list",
-                Some("empty list"),
-                Self::parse_record,
-            );
+        let bytes = self.src.as_bytes();
+        if bytes.get(self.pos) == Some(&b'[') {
+            self.pos += 1;
+            self.skip();
+            if bytes.get(self.pos) == Some(&b']') {
+                self.pos += 1;
+                return Err(self.err("empty list"));
+            }
+            let first_start = self.pos;
+            let first = self.parse_record_with_cap(8)?;
+            let mut expected_fields = first.fields.len().max(1);
+            let first_bytes = (self.pos - first_start).max(16);
+            self.skip();
+            let comma = if bytes.get(self.pos) == Some(&b',') {
+                self.pos += 1;
+                self.skip();
+                true
+            } else {
+                false
+            };
+            if bytes.get(self.pos) == Some(&b']') {
+                self.pos += 1;
+                return Ok(vec![first]);
+            }
+            if !comma {
+                return Err(self.err("expected `,` or `]` in list"));
+            }
+            let est_more = ((bytes.len() - self.pos) / first_bytes + 1).min(16_384);
+            let mut records = Vec::with_capacity(1 + est_more);
+            records.push(first);
+            loop {
+                let rec = self.parse_record_with_cap(expected_fields)?;
+                expected_fields = expected_fields.max(rec.fields.len());
+                records.push(rec);
+                self.skip();
+                let comma = if bytes.get(self.pos) == Some(&b',') {
+                    self.pos += 1;
+                    self.skip();
+                    true
+                } else {
+                    false
+                };
+                if bytes.get(self.pos) == Some(&b']') {
+                    self.pos += 1;
+                    break;
+                }
+                if !comma {
+                    return Err(self.err("expected `,` or `]` in list"));
+                }
+            }
+            return Ok(records);
         }
         Ok(vec![self.parse_record()?])
     }
@@ -2117,60 +2248,45 @@ impl<'a> Parser<'a> {
     }
 }
 
+#[inline]
+fn is_ident_start_byte(b: u8) -> bool {
+    b.is_ascii_alphabetic() || b == b'_'
+}
+
+#[inline]
+fn is_ident_continue_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+#[inline]
 fn is_ident_start(c: char) -> bool {
     c.is_ascii_alphabetic() || c == '_'
 }
 
-fn is_ident_continue(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '_'
-}
-
-fn simple_by_field(by: &[GroupKey]) -> Option<Option<Field>> {
+fn try_into_simple_by_field(mut by: Vec<GroupKey>) -> Result<Option<Field>, Vec<GroupKey>> {
     if by.is_empty() {
-        Some(None)
+        Ok(None)
     } else if by.len() == 1
-        && let GroupExpr::Field(f) = &by[0].expr
-        && by[0].alias == f.as_str()
+        && matches!(
+            &by[0].expr,
+            GroupExpr::Field(f) if by[0].alias == f.as_cow_str().as_ref()
+        )
     {
-        Some(Some(f.clone()))
+        let GroupKey {
+            expr: GroupExpr::Field(f),
+            ..
+        } = by.pop().unwrap()
+        else {
+            unreachable!()
+        };
+        Ok(Some(f))
     } else {
-        None
+        Err(by)
     }
 }
 
 fn default_pct_alias(pct: f64) -> String {
     AggFunc::default_percentile_alias(pct)
-}
-
-fn is_step_keyword(s: &str) -> bool {
-    matches!(
-        s,
-        "where"
-            | "pick"
-            | "without"
-            | "join"
-            | "hop"
-            | "graph"
-            | "match"
-            | "search"
-            | "summarize"
-            | "count"
-            | "sum"
-            | "min"
-            | "max"
-            | "avg"
-            | "dcount"
-            | "percentile"
-            | "arg_max"
-            | "arg_min"
-            | "sort"
-            | "skip"
-            | "offset"
-            | "take"
-            | "window"
-            | "explain"
-            | "union"
-    )
 }
 
 #[cfg(test)]

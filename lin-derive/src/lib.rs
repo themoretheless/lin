@@ -44,15 +44,20 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
 
     let mut col_lits = Vec::new();
     let mut assignments = Vec::new();
+    let mut slot_decls = Vec::new();
+    let mut batch_assignments = Vec::new();
     let mut col_fields = Vec::new();
     let mut col_inits = Vec::new();
 
-    for field in &fields.named {
+    for (idx, field) in fields.named.iter().enumerate() {
         let ident = field.ident.as_ref().unwrap();
         let ty = &field.ty;
         let owned = parse_owned(&field.attrs)?;
         if owned {
             assignments.push(quote! {
+                #ident: <#ty as ::lin::FromRow>::from_row(__row)?,
+            });
+            batch_assignments.push(quote! {
                 #ident: <#ty as ::lin::FromRow>::from_row(__row)?,
             });
             col_fields.push(quote! {
@@ -65,9 +70,16 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         }
         let col = parse_rename(&field.attrs)?.unwrap_or_else(|| ident.to_string());
         let col_lit = LitStr::new(&col, ident.span());
+        let slot_ident = quote::format_ident!("__lin_slot_{}", idx);
         col_lits.push(col_lit.clone());
         assignments.push(quote! {
             #ident: ::lin::cell_get::<_>(__row, #col_lit)?,
+        });
+        slot_decls.push(quote! {
+            let mut #slot_ident = ::lin::row::RowSlot::new(#col_lit);
+        });
+        batch_assignments.push(quote! {
+            #ident: #slot_ident.read::<_>(__row)?,
         });
         col_fields.push(quote! {
             pub #ident: ::lin::Col
@@ -93,6 +105,17 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
                 ::core::result::Result::Ok(Self {
                     #(#assignments)*
                 })
+            }
+
+            fn from_rows(__rows: &[::lin::Row]) -> ::core::result::Result<::std::vec::Vec<Self>, ::lin::Error> {
+                #(#slot_decls)*
+                let mut __out = ::std::vec::Vec::with_capacity(__rows.len());
+                for __row in __rows {
+                    __out.push(Self {
+                        #(#batch_assignments)*
+                    });
+                }
+                ::core::result::Result::Ok(__out)
             }
         }
 

@@ -159,13 +159,66 @@ pub struct GpuAdapterReport {
     pub max_compute_invocations_per_workgroup: u32,
 }
 
+type MapSignal = std::sync::Arc<std::sync::Mutex<Option<Result<(), wgpu::BufferAsyncError>>>>;
+
 /// Reusable Scratch/Pool buffers for cosine_batch and readback to eliminate per-call allocations.
-#[derive(Default)]
 struct GpuBufferPool {
     cosine: Option<CosineScratch>,
     readback: Option<wgpu::Buffer>,
     packed_f32: Vec<f32>,
     lengths_u32: Vec<u32>,
+    map_signal: MapSignal,
+}
+
+impl Default for GpuBufferPool {
+    fn default() -> Self {
+        Self {
+            cosine: None,
+            readback: None,
+            packed_f32: Vec::new(),
+            lengths_u32: Vec::new(),
+            map_signal: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+}
+
+#[inline]
+pub(crate) fn bind_entries<const N: usize>(
+    buffers: [&wgpu::Buffer; N],
+) -> [wgpu::BindGroupEntry<'_>; N] {
+    std::array::from_fn(|i| wgpu::BindGroupEntry {
+        binding: i as u32,
+        resource: buffers[i].as_entire_binding(),
+    })
+}
+
+fn map_read_sync(
+    device: &wgpu::Device,
+    slice: wgpu::BufferSlice<'_>,
+    submission: wgpu::SubmissionIndex,
+    signal: &MapSignal,
+) -> Result<(), Error> {
+    let sig_owner = if std::sync::Arc::strong_count(signal) == 1 {
+        if let Ok(mut slot) = signal.lock() {
+            *slot = None;
+        }
+        std::sync::Arc::clone(signal)
+    } else {
+        std::sync::Arc::new(std::sync::Mutex::new(None))
+    };
+    let sig_cb = std::sync::Arc::clone(&sig_owner);
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        if let Ok(mut slot) = sig_cb.lock() {
+            *slot = Some(result);
+        }
+    });
+    device.poll(wgpu::Maintain::WaitForSubmissionIndex(submission));
+    let res = sig_owner
+        .lock()
+        .map_err(|_| Error::runtime("GPU readback: lock poisoned"))?
+        .take()
+        .ok_or_else(|| Error::runtime("GPU readback: callback missing"))?;
+    res.map_err(|e| Error::runtime(format!("GPU mapping: {e}")))
 }
 
 struct CosineScratch {
@@ -314,6 +367,7 @@ impl WgpuCompute {
             cosine,
             packed_f32,
             lengths_u32,
+            map_signal,
             ..
         } = &mut *pool;
 
@@ -455,15 +509,7 @@ impl WgpuCompute {
         encoder.copy_buffer_to_buffer(&scratch.scores, 0, &scratch.readback, 0, s_size);
         let submission = self.queue.submit([encoder.finish()]);
         let slice = scratch.readback.slice(..s_size);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |result| {
-            let _ = tx.send(result);
-        });
-        self.device
-            .poll(wgpu::Maintain::WaitForSubmissionIndex(submission));
-        rx.recv()
-            .map_err(|e| Error::runtime(format!("GPU readback: {e}")))?
-            .map_err(|e| Error::runtime(format!("GPU mapping: {e}")))?;
+        map_read_sync(&self.device, slice, submission, map_signal)?;
         let mapped = slice.get_mapped_range();
         let result = bytemuck::cast_slice::<u8, f32>(&mapped).to_vec();
         drop(mapped);
@@ -665,15 +711,7 @@ impl GpuCompute {
             (buffer, submission)
         })?;
         let slice = buffer.slice(..size);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |result| {
-            let _ = tx.send(result);
-        });
-        self.device()
-            .poll(wgpu::Maintain::WaitForSubmissionIndex(submission));
-        rx.recv()
-            .map_err(|e| Error::runtime(format!("GPU readback: {e}")))?
-            .map_err(|e| Error::runtime(format!("GPU mapping: {e}")))?;
+        map_read_sync(self.device(), slice, submission, &pool.map_signal)?;
         let bytes = slice.get_mapped_range().to_vec();
         self.bytes_readback
             .fetch_add(size, std::sync::atomic::Ordering::Relaxed);
@@ -830,15 +868,7 @@ impl GpuCompute {
                         mapped_at_creation: false,
                     });
                     let q_ref = query.as_ref().expect("non-empty corpus query buffer");
-                    let buffers = [q_ref, &vectors_buf, &lengths_buf, &scores_buf];
-                    let entries: Vec<_> = buffers
-                        .iter()
-                        .enumerate()
-                        .map(|(i, b)| wgpu::BindGroupEntry {
-                            binding: i as u32,
-                            resource: b.as_entire_binding(),
-                        })
-                        .collect();
+                    let entries = bind_entries([q_ref, &vectors_buf, &lengths_buf, &scores_buf]);
                     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: Some("resident cosine"),
                         layout: &kernel.bind_group_layout(0),
@@ -915,14 +945,7 @@ impl GpuCompute {
             encoder.copy_buffer_to_buffer(&chunk.scores, 0, &buffer, 0, size);
             let submission = queue.submit([encoder.finish()]);
             let slice = buffer.slice(..size);
-            let (tx, rx) = std::sync::mpsc::channel();
-            slice.map_async(wgpu::MapMode::Read, move |res| {
-                let _ = tx.send(res);
-            });
-            device.poll(wgpu::Maintain::WaitForSubmissionIndex(submission));
-            rx.recv()
-                .map_err(|e| Error::runtime(format!("GPU readback: {e}")))?
-                .map_err(|e| Error::runtime(format!("GPU mapping: {e}")))?;
+            map_read_sync(device, slice, submission, &pool.map_signal)?;
             {
                 let mapped = slice.get_mapped_range();
                 result.extend_from_slice(bytemuck::cast_slice::<u8, f32>(&mapped));
@@ -1120,22 +1143,18 @@ impl GpuCompute {
             return Err(Error::runtime("GPU limits cannot hold a boolean mask"));
         }
         let mut result = Vec::with_capacity(a.len());
+        let mut a_words = Vec::with_capacity(a.len().min(count));
+        let mut b_words = Vec::with_capacity(b.len().min(count));
         for (a, b) in a.chunks(count).zip(b.chunks(count)) {
-            let a: Vec<u32> = a.iter().map(|v| *v as u32).collect();
-            let b: Vec<u32> = b.iter().map(|v| *v as u32).collect();
-            let a = self.storage_buffer(bytemuck::cast_slice(&a))?;
-            let b = self.storage_buffer(bytemuck::cast_slice(&b))?;
+            a_words.clear();
+            a_words.extend(a.iter().map(|v| *v as u32));
+            b_words.clear();
+            b_words.extend(b.iter().map(|v| *v as u32));
+            let a = self.storage_buffer(bytemuck::cast_slice(&a_words))?;
+            let b = self.storage_buffer(bytemuck::cast_slice(&b_words))?;
             let output = self.zeroed_storage_buffer(a.size())?;
-            let buffers = [&a, &b, &operation, &output];
             let group = self.checked(|device, _| {
-                let entries: Vec<_> = buffers
-                    .iter()
-                    .enumerate()
-                    .map(|(i, b)| wgpu::BindGroupEntry {
-                        binding: i as u32,
-                        resource: b.as_entire_binding(),
-                    })
-                    .collect();
+                let entries = bind_entries([&a, &b, &operation, &output]);
                 device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("boolean masks"),
                     layout: &kernel.bind_group_layout(0),
@@ -1158,14 +1177,21 @@ impl GpuCompute {
     }
 }
 
-fn encode_text(text: &str, fold: bool, words: bool) -> Vec<u32> {
+fn encode_text_into(
+    text: &str,
+    fold: bool,
+    words: bool,
+    encoded: &mut Vec<u32>,
+    chars: &mut Vec<char>,
+) {
     if !words {
-        return text.bytes().map(u32::from).collect();
+        encoded.extend(text.bytes().map(u32::from));
+        return;
     }
     if text.is_ascii() {
         let bytes = text.as_bytes();
         let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
-        let mut encoded = Vec::with_capacity(bytes.len());
+        encoded.reserve(bytes.len());
         for (i, &b) in bytes.iter().enumerate() {
             let token = is_word(b);
             let start = token && (i == 0 || !is_word(bytes[i - 1]));
@@ -1183,11 +1209,12 @@ fn encode_text(text: &str, fold: bool, words: bool) -> Vec<u32> {
             }
             encoded.push(word_bits);
         }
-        return encoded;
+        return;
     }
-    let chars: Vec<char> = text.chars().collect();
+    chars.clear();
+    chars.extend(text.chars());
     let word = |c: char| c.is_alphanumeric() || c == '_';
-    let mut encoded = Vec::with_capacity(text.len());
+    encoded.reserve(text.len());
     for (i, &c) in chars.iter().enumerate() {
         let token = word(c);
         let start = token && (i == 0 || !word(chars[i - 1]));
@@ -1209,11 +1236,10 @@ fn encode_text(text: &str, fold: bool, words: bool) -> Vec<u32> {
         if start && from < encoded.len() {
             encoded[from] |= 256;
         }
-        if end && let Some(last) = encoded.last_mut() {
-            *last |= 512;
+        if end && from < encoded.len() {
+            *encoded.last_mut().unwrap() |= 512;
         }
     }
-    encoded
 }
 impl GpuCompute {
     /// Successfully submitted text matching dispatches.
@@ -1257,25 +1283,37 @@ impl GpuCompute {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
-        let needle = if op == 3 && ci {
-            needle
-                .chars()
-                .flat_map(char::to_lowercase)
-                .collect::<String>()
+        let needle_folded: std::borrow::Cow<'_, str> = if op == 3 && ci {
+            if needle.is_ascii() {
+                std::borrow::Cow::Owned(needle.to_ascii_lowercase())
+            } else {
+                std::borrow::Cow::Owned(
+                    needle
+                        .chars()
+                        .flat_map(char::to_lowercase)
+                        .collect::<String>(),
+                )
+            }
         } else {
-            needle.to_owned()
+            std::borrow::Cow::Borrowed(needle)
         };
         let limits = self.device().limits();
         let max_words = (limits.max_storage_buffer_binding_size as usize)
             .min(limits.max_buffer_size as usize)
             / 4;
-        if needle.len().checked_add(2).is_none_or(|n| n > max_words) {
+        if needle_folded
+            .len()
+            .checked_add(2)
+            .is_none_or(|n| n > max_words)
+        {
             return Err(Error::runtime("GPU text needle exceeds buffer limits"));
         }
         let kernel =
             self.builtin_kernel(|k| &mut k.text, include_str!("shaders/text.wgsl"), "main")?;
-        let mut params = vec![op, needle.len() as u32];
-        params.extend(needle.bytes().map(u32::from));
+        let mut params = Vec::with_capacity(2 + needle_folded.len());
+        params.push(op);
+        params.push(needle_folded.len() as u32);
+        params.extend(needle_folded.bytes().map(u32::from));
         let params = self.storage_buffer(bytemuck::cast_slice(&params))?;
         let row_limit =
             (max_words / 3).min(limits.max_compute_workgroups_per_dimension as usize * 64);
@@ -1288,46 +1326,39 @@ impl GpuCompute {
             Vec::with_capacity(texts.len())
         };
         let mut position = 0;
+        let mut data = Vec::new();
+        let mut records = Vec::new();
+        let mut scratch_chars = Vec::new();
         while position < texts.len() {
             let batch_start = position;
-            let mut data = Vec::new();
-            let mut records = Vec::new();
+            data.clear();
+            records.clear();
             while position < texts.len() && records.len() / 3 < row_limit {
                 let text = texts[position];
-                let encoded = text
-                    .map(|t| encode_text(t, op == 3 && ci, op == 3))
-                    .unwrap_or_default();
-                if encoded.len() > max_words {
+                let row_start = data.len();
+                if let Some(t) = text {
+                    encode_text_into(t, op == 3 && ci, op == 3, &mut data, &mut scratch_chars);
+                }
+                let encoded_len = data.len() - row_start;
+                if encoded_len > max_words {
                     return Err(Error::runtime("GPU text row exceeds buffer limits"));
                 }
-                if !records.is_empty() && data.len() + encoded.len() > max_words {
+                if !records.is_empty() && data.len() > max_words {
+                    data.truncate(row_start);
                     break;
                 }
-                records.extend([
-                    data.len() as u32,
-                    encoded.len() as u32,
-                    text.is_some() as u32,
-                ]);
-                data.extend(encoded);
+                records.extend([row_start as u32, encoded_len as u32, text.is_some() as u32]);
                 position += 1;
             }
             if data.is_empty() {
                 data.push(0);
             }
-            let data = self.storage_buffer(bytemuck::cast_slice(&data))?;
-            let records = self.storage_buffer(bytemuck::cast_slice(&records))?;
-            let count = records.size() / 12;
+            let data_buf = self.storage_buffer(bytemuck::cast_slice(&data))?;
+            let records_buf = self.storage_buffer(bytemuck::cast_slice(&records))?;
+            let count = records_buf.size() / 12;
             let output = self.zeroed_storage_buffer(count * 4)?;
-            let buffers = [&data, &records, &params, &output];
             let group = self.checked(|device, _| {
-                let entries: Vec<_> = buffers
-                    .iter()
-                    .enumerate()
-                    .map(|(i, b)| wgpu::BindGroupEntry {
-                        binding: i as u32,
-                        resource: b.as_entire_binding(),
-                    })
-                    .collect();
+                let entries = bind_entries([&data_buf, &records_buf, &params, &output]);
                 device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("text matching"),
                     layout: &kernel.bind_group_layout(0),
@@ -1460,16 +1491,8 @@ impl GpuCompute {
                 let right_buffer = self.storage_buffer(bytemuck::cast_slice(right_keys))?;
                 let output =
                     self.zeroed_storage_buffer((left_keys.len() * right_keys.len() * 4) as u64)?;
-                let buffers = [&left_buffer, &right_buffer, &output];
                 let group = self.checked(|device, _| {
-                    let entries: Vec<_> = buffers
-                        .iter()
-                        .enumerate()
-                        .map(|(i, b)| wgpu::BindGroupEntry {
-                            binding: i as u32,
-                            resource: b.as_entire_binding(),
-                        })
-                        .collect();
+                    let entries = bind_entries([&left_buffer, &right_buffer, &output]);
                     device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: Some("join tile"),
                         layout: &kernel.bind_group_layout(0),
@@ -1731,64 +1754,60 @@ impl GpuCompute {
         let target = self.zeroed_storage_buffer((indices.len() * 4) as u64)?;
         let kernel =
             self.builtin_kernel(|k| &mut k.sort, include_str!("shaders/sort.wgsl"), "main")?;
-        let params = self.checked(|device, _| {
-            device.create_buffer(&wgpu::BufferDescriptor {
+        let mut pass_params: Vec<[u32; 4]> = Vec::with_capacity(32);
+        let mut width = 1u32;
+        while (width as usize) < rows {
+            pass_params.push([width, desc as u32, 0, 0]);
+            width *= 2;
+        }
+        let num_passes = pass_params.len();
+        let workgroups = (rows as u32).div_ceil(64);
+        self.checked(|device, queue| {
+            let params = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("sort parameters"),
                 size: 16,
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
-            })
-        })?;
-        let group_ab = self.checked(|device, _| {
-            let buffers = [&source, &target, &keys, &text, &params];
-            let entries: Vec<_> = buffers
-                .iter()
-                .enumerate()
-                .map(|(i, b)| wgpu::BindGroupEntry {
-                    binding: i as u32,
-                    resource: b.as_entire_binding(),
-                })
-                .collect();
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
+            });
+            let staging = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("sort pass staging"),
+                contents: bytemuck::cast_slice(&pass_params),
+                usage: wgpu::BufferUsages::COPY_SRC,
+            });
+            let entries_ab = bind_entries([&source, &target, &keys, &text, &params]);
+            let group_ab = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("stable merge sort A->B"),
                 layout: &kernel.bind_group_layout(0),
-                entries: &entries,
-            })
-        })?;
-        let group_ba = self.checked(|device, _| {
-            let buffers = [&target, &source, &keys, &text, &params];
-            let entries: Vec<_> = buffers
-                .iter()
-                .enumerate()
-                .map(|(i, b)| wgpu::BindGroupEntry {
-                    binding: i as u32,
-                    resource: b.as_entire_binding(),
-                })
-                .collect();
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                entries: &entries_ab,
+            });
+            let entries_ba = bind_entries([&target, &source, &keys, &text, &params]);
+            let group_ba = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("stable merge sort B->A"),
                 layout: &kernel.bind_group_layout(0),
-                entries: &entries,
-            })
+                entries: &entries_ba,
+            });
+            let mut encoder = device.create_command_encoder(&Default::default());
+            for pass_idx in 0..num_passes {
+                encoder.copy_buffer_to_buffer(&staging, (pass_idx * 16) as u64, &params, 0, 16);
+                let active_group = if pass_idx % 2 == 0 {
+                    &group_ab
+                } else {
+                    &group_ba
+                };
+                let mut pass = encoder.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&kernel.pipeline);
+                pass.set_bind_group(0, active_group, &[]);
+                pass.dispatch_workgroups(workgroups, 1, 1);
+            }
+            queue.submit([encoder.finish()])
         })?;
-        let mut width = 1u32;
-        let mut pass_idx = 0usize;
-        while (width as usize) < rows {
-            let values = [width, desc as u32, 0, 0];
-            self.queue()
-                .write_buffer(&params, 0, bytemuck::cast_slice(&values));
-            let active_group = if pass_idx % 2 == 0 {
-                &group_ab
-            } else {
-                &group_ba
-            };
-            self.dispatch(&kernel, &[active_group], [(rows as u32).div_ceil(64), 1, 1])?;
-            self.sort_dispatches
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            width *= 2;
-            pass_idx += 1;
-        }
-        let final_source = if pass_idx % 2 == 0 { &source } else { &target };
+        self.sort_dispatches
+            .fetch_add(num_passes as u64, std::sync::atomic::Ordering::Relaxed);
+        let final_source = if num_passes % 2 == 0 {
+            &source
+        } else {
+            &target
+        };
         let bytes = self.read_buffer(final_source)?;
         Ok(bytemuck::cast_slice::<u8, u32>(&bytes)
             .iter()
@@ -1811,6 +1830,40 @@ impl GpuCompute {
         groups: usize,
     ) -> Result<Vec<f64>, Error> {
         Ok(self.group_sums_compensated(ids, values, groups)?.into_iter().map(|[sum, _]| sum).collect())
+    }
+
+    fn run_group_accum_chunks<V: Copy>(
+        &self,
+        ids: &[u32],
+        values: &[V],
+        groups: usize,
+        chunk_rows: usize,
+        kernel: &ComputeKernel,
+        label: &'static str,
+        counter: &std::sync::atomic::AtomicU64,
+        mut pack: impl FnMut(u32, V) -> [u32; 3],
+    ) -> Result<Vec<u8>, Error> {
+        let output = self.zeroed_storage_buffer((groups * 16) as u64)?;
+        let mut words = Vec::with_capacity(ids.len().min(chunk_rows) * 3);
+        let wg = groups.div_ceil(64) as u32;
+        for (id_chunk, value_chunk) in ids.chunks(chunk_rows).zip(values.chunks(chunk_rows)) {
+            words.clear();
+            for (&id, &value) in id_chunk.iter().zip(value_chunk) {
+                words.extend_from_slice(&pack(id, value));
+            }
+            let input = self.storage_buffer(bytemuck::cast_slice(&words))?;
+            let bind = self.checked(|device, _| {
+                let entries = bind_entries([&input, &output]);
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some(label),
+                    layout: &kernel.bind_group_layout(0),
+                    entries: &entries,
+                })
+            })?;
+            self.dispatch(kernel, &[&bind], [wg, 1, 1])?;
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.read_buffer(&output)
     }
 
     /// Per-group `[sum, compensation]`: the plain left-to-right binary64 sum together
@@ -1845,38 +1898,19 @@ impl GpuCompute {
         }
         let kernel =
             self.builtin_kernel(|k| &mut k.sum, include_str!("shaders/sum.wgsl"), "main")?;
-        let output = self.zeroed_storage_buffer((groups * 16) as u64)?;
-        for (id_chunk, value_chunk) in ids.chunks(chunk_rows).zip(values.chunks(chunk_rows)) {
-            let words: Vec<u32> = id_chunk
-                .iter()
-                .zip(value_chunk)
-                .flat_map(|(&id, &value)| {
-                    let bits = value.to_bits();
-                    [id, bits as u32, (bits >> 32) as u32]
-                })
-                .collect();
-            let input = self.storage_buffer(bytemuck::cast_slice(&words))?;
-            let bind = self.checked(|device, _| {
-                device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("binary64 group sum"),
-                    layout: &kernel.bind_group_layout(0),
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: input.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: output.as_entire_binding(),
-                        },
-                    ],
-                })
-            })?;
-            self.dispatch(&kernel, &[&bind], [groups.div_ceil(64) as u32, 1, 1])?;
-            self.sum_dispatches
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        let bytes = self.read_buffer(&output)?;
+        let bytes = self.run_group_accum_chunks(
+            ids,
+            values,
+            groups,
+            chunk_rows,
+            &kernel,
+            "binary64 group sum",
+            &self.sum_dispatches,
+            |id, value| {
+                let bits = value.to_bits();
+                [id, bits as u32, (bits >> 32) as u32]
+            },
+        )?;
         let word = |lo: u32, hi: u32| f64::from_bits((lo as u64) | ((hi as u64) << 32));
         Ok(bytemuck::cast_slice::<u8, [u32; 4]>(&bytes)
             .iter()
@@ -1993,16 +2027,8 @@ impl GpuWeightAccumulator<'_> {
                 (end - begin) as u32,
             ];
             let params = self.gpu.storage_buffer(bytemuck::cast_slice(&params))?;
-            let buffers = [mask, &params, output];
             let group = self.gpu.checked(|device, _| {
-                let entries: Vec<_> = buffers
-                    .iter()
-                    .enumerate()
-                    .map(|(i, b)| wgpu::BindGroupEntry {
-                        binding: i as u32,
-                        resource: b.as_entire_binding(),
-                    })
-                    .collect();
+                let entries = bind_entries([mask, &params, output]);
                 device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("resident score weights"),
                     layout: &kernel.bind_group_layout(0),
@@ -2235,35 +2261,16 @@ impl GpuCompute {
         let kernel =
             self.builtin_kernel(|k| &mut k.rrf, include_str!("shaders/sum.wgsl"), "rrf")?;
         // Entries are 16 bytes (the sum kernel's total and compensation); RRF uses the first half.
-        let output = self.zeroed_storage_buffer((groups * 16) as u64)?;
-        for (id_chunk, value_chunk) in ids.chunks(chunk_rows).zip(values.chunks(chunk_rows)) {
-            let words: Vec<u32> = id_chunk
-                .iter()
-                .zip(value_chunk)
-                .flat_map(|(&id, &value)| [id, value, 0])
-                .collect();
-            let input = self.storage_buffer(bytemuck::cast_slice(&words))?;
-            let bind = self.checked(|device, _| {
-                device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("binary64 rank fusion"),
-                    layout: &kernel.bind_group_layout(0),
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: input.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: output.as_entire_binding(),
-                        },
-                    ],
-                })
-            })?;
-            self.dispatch(&kernel, &[&bind], [groups.div_ceil(64) as u32, 1, 1])?;
-            self.rrf_dispatches
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        let bytes = self.read_buffer(&output)?;
+        let bytes = self.run_group_accum_chunks(
+            ids,
+            values,
+            groups,
+            chunk_rows,
+            &kernel,
+            "binary64 rank fusion",
+            &self.rrf_dispatches,
+            |id, value| [id, value, 0],
+        )?;
         Ok(bytemuck::cast_slice::<u8, [u32; 4]>(&bytes)
             .iter()
             .map(|&[lo, hi, _, _]| f64::from_bits((lo as u64) | ((hi as u64) << 32)))
@@ -2322,16 +2329,8 @@ impl GpuCompute {
         let params = self.storage_buffer(bytemuck::cast_slice(&params))?;
         let state = self.zeroed_storage_buffer((state_words * 4) as u64)?;
         let output = self.zeroed_storage_buffer((output_words * 4) as u64)?;
-        let buffers = [&edge_buffer, &params, &state, &output];
         let group = self.checked(|device, _| {
-            let entries: Vec<_> = buffers
-                .iter()
-                .enumerate()
-                .map(|(i, b)| wgpu::BindGroupEntry {
-                    binding: i as u32,
-                    resource: b.as_entire_binding(),
-                })
-                .collect();
+            let entries = bind_entries([&edge_buffer, &params, &state, &output]);
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("resident graph walk"),
                 layout: &kernel.bind_group_layout(0),
@@ -2446,16 +2445,8 @@ impl GpuCompute {
         let params = self.storage_buffer(bytemuck::cast_slice(&params))?;
         let stack = self.zeroed_storage_buffer((stack_words * 4) as u64)?;
         let output = self.zeroed_storage_buffer((output_words * 4) as u64)?;
-        let buffers = [&edges, &params, &stack, &output];
         let group = self.checked(|device, _| {
-            let entries: Vec<_> = buffers
-                .iter()
-                .enumerate()
-                .map(|(i, b)| wgpu::BindGroupEntry {
-                    binding: i as u32,
-                    resource: b.as_entire_binding(),
-                })
-                .collect();
+            let entries = bind_entries([&edges, &params, &stack, &output]);
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("match DFS"),
                 layout: &kernel.bind_group_layout(0),

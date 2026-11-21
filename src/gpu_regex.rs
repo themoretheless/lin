@@ -21,18 +21,18 @@ enum CachedGpuRegex {
 
 const MAX_GPU_REGEX_CACHE: usize = 256;
 
-fn gpu_regex_cache() -> &'static Mutex<FxHashMap<(String, bool), CachedGpuRegex>> {
-    static CACHE: OnceLock<Mutex<FxHashMap<(String, bool), CachedGpuRegex>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(FxHashMap::default()))
+fn gpu_regex_cache() -> &'static Mutex<[FxHashMap<Box<str>, CachedGpuRegex>; 2]> {
+    static CACHE: OnceLock<Mutex<[FxHashMap<Box<str>, CachedGpuRegex>; 2]>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new([FxHashMap::default(), FxHashMap::default()]))
 }
 
 fn compile_or_get_gpu_regex(
     pattern: &str,
     case_insensitive: bool,
 ) -> Result<Option<Arc<CompiledGpuRegex>>, Error> {
-    let key = (pattern.to_string(), case_insensitive);
+    let slot = usize::from(case_insensitive);
     if let Ok(guard) = gpu_regex_cache().lock()
-        && let Some(cached) = guard.get(&key)
+        && let Some(cached) = guard[slot].get(pattern)
     {
         return Ok(match cached {
             CachedGpuRegex::Invalid => None,
@@ -43,10 +43,10 @@ fn compile_or_get_gpu_regex(
     builder.case_insensitive(case_insensitive);
     if builder.build().is_err() {
         if let Ok(mut guard) = gpu_regex_cache().lock() {
-            if guard.len() >= MAX_GPU_REGEX_CACHE {
-                guard.clear();
+            if guard[slot].len() >= MAX_GPU_REGEX_CACHE {
+                guard[slot].clear();
             }
-            guard.insert(key, CachedGpuRegex::Invalid);
+            guard[slot].insert(Box::from(pattern), CachedGpuRegex::Invalid);
         }
         return Ok(None);
     }
@@ -138,10 +138,10 @@ fn compile_or_get_gpu_regex(
         states,
     });
     if let Ok(mut guard) = gpu_regex_cache().lock() {
-        if guard.len() >= MAX_GPU_REGEX_CACHE {
-            guard.clear();
+        if guard[slot].len() >= MAX_GPU_REGEX_CACHE {
+            guard[slot].clear();
         }
-        guard.insert(key, CachedGpuRegex::Valid(Arc::clone(&compiled)));
+        guard[slot].insert(Box::from(pattern), CachedGpuRegex::Valid(Arc::clone(&compiled)));
     }
     Ok(Some(compiled))
 }
@@ -185,39 +185,46 @@ impl GpuCompute {
         let nfa = &compiled.nfa;
         let mut result = Vec::with_capacity(texts.len());
         let mut position = 0;
-        let mut records = Vec::new();
-        let mut data = Vec::new();
-        let mut input = Vec::new();
+        let mut input: Vec<u32> = Vec::new();
         while position < texts.len() {
-            records.clear();
-            data.clear();
-            while position < texts.len() && records.len() / 4 < row_limit {
-                let text = texts[position];
-                let bytes = text.unwrap_or("").as_bytes();
-                let words = bytes
-                    .len()
+            let mut end = position;
+            let mut total_data_words = 0usize;
+            while end < texts.len() && (end - position) < row_limit {
+                let bytes_len = texts[end].unwrap_or("").len();
+                let words = bytes_len
                     .checked_add(1)
                     .and_then(|n| n.checked_mul(2))
                     .ok_or_else(|| Error::runtime("GPU regex text size overflow"))?;
                 if words.checked_add(5).is_none_or(|n| n > max_words) {
                     return Err(Error::runtime("GPU regex text exceeds buffer limits"));
                 }
-                if !records.is_empty() && 1 + records.len() + 4 + data.len() + words > max_words {
+                let next_count = end - position + 1;
+                if end > position && 1 + next_count * 4 + total_data_words + words > max_words {
                     break;
                 }
-                records.extend([
-                    data.len() as u32,
-                    bytes.len() as u32,
-                    text.is_some() as u32,
-                    0,
-                ]);
+                total_data_words += words;
+                end += 1;
+            }
+            let count = end - position;
+            let header_words = 1 + count * 4;
+            input.clear();
+            input.reserve(header_words + total_data_words);
+            input.resize(header_words, 0);
+            input[0] = count as u32;
+            for (idx, &text) in texts[position..end].iter().enumerate() {
+                let bytes = text.unwrap_or("").as_bytes();
+                let data_offset = input.len() as u32;
+                let rec = 1 + idx * 4;
+                input[rec] = data_offset;
+                input[rec + 1] = bytes.len() as u32;
+                input[rec + 2] = text.is_some() as u32;
+                input[rec + 3] = 0;
                 if looks.is_empty() && text.is_some_and(|t| t.is_ascii()) {
                     const BOUNDARY: u32 = 1u32 << 31;
-                    data.reserve((bytes.len() + 1) * 2);
                     for &b in bytes {
-                        data.extend([b as u32, BOUNDARY]);
+                        input.extend([b as u32, BOUNDARY]);
                     }
-                    data.extend([0, BOUNDARY]);
+                    input.extend([0, BOUNDARY]);
                 } else {
                     for at in 0..=bytes.len() {
                         let mut assertions = if text.is_some_and(|t| t.is_char_boundary(at)) {
@@ -230,34 +237,16 @@ impl GpuCompute {
                                 assertions |= look as u32;
                             }
                         }
-                        data.extend([bytes.get(at).copied().unwrap_or(0) as u32, assertions]);
+                        input.extend([bytes.get(at).copied().unwrap_or(0) as u32, assertions]);
                     }
                 }
-                position += 1;
             }
-            let count = records.len() / 4;
-            let prefix = 1 + records.len();
-            for record in records.chunks_exact_mut(4) {
-                record[0] += prefix as u32;
-            }
-            input.clear();
-            input.reserve(1 + records.len() + data.len());
-            input.push(count as u32);
-            input.extend_from_slice(&records);
-            input.extend_from_slice(&data);
+            position = end;
             let input_buf = self.storage_buffer(bytemuck::cast_slice(&input))?;
             let scratch = self.zeroed_storage_buffer((count * scratch_words * 4) as u64)?;
             let output = self.zeroed_storage_buffer((count * 4) as u64)?;
-            let buffers = [&program, &input_buf, &scratch, &output];
             let group = self.checked(|device, _| {
-                let entries: Vec<_> = buffers
-                    .iter()
-                    .enumerate()
-                    .map(|(i, b)| wgpu::BindGroupEntry {
-                        binding: i as u32,
-                        resource: b.as_entire_binding(),
-                    })
-                    .collect();
+                let entries = super::bind_entries([&program, &input_buf, &scratch, &output]);
                 device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("regex NFA"),
                     layout: &kernel.bind_group_layout(0),

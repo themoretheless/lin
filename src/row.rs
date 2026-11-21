@@ -6,9 +6,22 @@ use crate::store::{Cell, Row};
 /// Convert a single [`Cell`] into a Rust value.
 pub trait FromCell: Sized {
     fn from_cell(cell: &Cell) -> Result<Self, Error>;
+
+    #[inline]
+    fn from_missing(key: &str) -> Result<Self, Error> {
+        Self::from_cell(&Cell::Null)
+            .map_err(|_| Error::runtime(format!("missing column `{key}`")))
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn missing_column_err(key: &str) -> Error {
+    Error::runtime(format!("missing column `{key}`"))
 }
 
 impl FromCell for String {
+    #[inline]
     fn from_cell(cell: &Cell) -> Result<Self, Error> {
         match cell {
             Cell::Text(s) => Ok(s.to_string()),
@@ -17,9 +30,15 @@ impl FromCell for String {
             other => Err(Error::runtime(format!("expected text, got {other:?}"))),
         }
     }
+
+    #[cold]
+    fn from_missing(key: &str) -> Result<Self, Error> {
+        Err(missing_column_err(key))
+    }
 }
 
 impl FromCell for i64 {
+    #[inline]
     fn from_cell(cell: &Cell) -> Result<Self, Error> {
         match cell {
             Cell::Int(n) => Ok(*n),
@@ -28,18 +47,30 @@ impl FromCell for i64 {
             other => Err(Error::runtime(format!("expected int, got {other:?}"))),
         }
     }
+
+    #[cold]
+    fn from_missing(key: &str) -> Result<Self, Error> {
+        Err(missing_column_err(key))
+    }
 }
 
 macro_rules! impl_int_cell {
     ($($t:ty),*) => {
         $(
             impl FromCell for $t {
+                #[inline]
                 fn from_cell(cell: &Cell) -> Result<Self, Error> {
                     let n = i64::from_cell(cell)?;
                     <$t>::try_from(n).map_err(|_| Error::runtime(format!("int {n} out of range for {}", stringify!($t))))
                 }
+
+                #[cold]
+                fn from_missing(key: &str) -> Result<Self, Error> {
+                    Err(missing_column_err(key))
+                }
             }
             impl ToCell for $t {
+                #[inline]
                 fn to_cell(&self) -> Cell {
                     Cell::Int(*self as i64)
                 }
@@ -51,19 +82,32 @@ macro_rules! impl_int_cell {
 impl_int_cell!(i32, i16, i8, u32, u16, u8, usize);
 
 impl FromCell for f64 {
+    #[inline]
     fn from_cell(cell: &Cell) -> Result<Self, Error> {
         cell.as_f64()
             .ok_or_else(|| Error::runtime(format!("expected float, got {cell:?}")))
     }
+
+    #[cold]
+    fn from_missing(key: &str) -> Result<Self, Error> {
+        Err(missing_column_err(key))
+    }
 }
 
 impl FromCell for f32 {
+    #[inline]
     fn from_cell(cell: &Cell) -> Result<Self, Error> {
         f64::from_cell(cell).map(|n| n as f32)
+    }
+
+    #[cold]
+    fn from_missing(key: &str) -> Result<Self, Error> {
+        Err(missing_column_err(key))
     }
 }
 
 impl FromCell for bool {
+    #[inline]
     fn from_cell(cell: &Cell) -> Result<Self, Error> {
         match cell {
             Cell::Bool(b) => Ok(*b),
@@ -71,9 +115,15 @@ impl FromCell for bool {
             other => Err(Error::runtime(format!("expected bool, got {other:?}"))),
         }
     }
+
+    #[cold]
+    fn from_missing(key: &str) -> Result<Self, Error> {
+        Err(missing_column_err(key))
+    }
 }
 
 impl FromCell for std::sync::Arc<str> {
+    #[inline]
     fn from_cell(cell: &Cell) -> Result<Self, Error> {
         match cell {
             Cell::Text(s) => Ok(s.clone()),
@@ -82,9 +132,15 @@ impl FromCell for std::sync::Arc<str> {
             other => Err(Error::runtime(format!("expected text, got {other:?}"))),
         }
     }
+
+    #[cold]
+    fn from_missing(key: &str) -> Result<Self, Error> {
+        Err(missing_column_err(key))
+    }
 }
 
 impl FromCell for crate::store::InlineStr {
+    #[inline]
     fn from_cell(cell: &Cell) -> Result<Self, Error> {
         match cell {
             Cell::SmallText(s) => Ok(*s),
@@ -96,9 +152,15 @@ impl FromCell for crate::store::InlineStr {
             ))),
         }
     }
+
+    #[cold]
+    fn from_missing(key: &str) -> Result<Self, Error> {
+        Err(missing_column_err(key))
+    }
 }
 
 impl FromCell for Vec<f32> {
+    #[inline]
     fn from_cell(cell: &Cell) -> Result<Self, Error> {
         match cell {
             Cell::Vec(v) => Ok(v.to_vec()),
@@ -106,9 +168,15 @@ impl FromCell for Vec<f32> {
             other => Err(Error::runtime(format!("expected vec, got {other:?}"))),
         }
     }
+
+    #[cold]
+    fn from_missing(key: &str) -> Result<Self, Error> {
+        Err(missing_column_err(key))
+    }
 }
 
 impl FromCell for std::sync::Arc<[f32]> {
+    #[inline]
     fn from_cell(cell: &Cell) -> Result<Self, Error> {
         match cell {
             Cell::Vec(v) => Ok(v.clone()),
@@ -116,14 +184,25 @@ impl FromCell for std::sync::Arc<[f32]> {
             other => Err(Error::runtime(format!("expected vec, got {other:?}"))),
         }
     }
+
+    #[cold]
+    fn from_missing(key: &str) -> Result<Self, Error> {
+        Err(missing_column_err(key))
+    }
 }
 
 impl<T: FromCell> FromCell for Option<T> {
+    #[inline]
     fn from_cell(cell: &Cell) -> Result<Self, Error> {
         match cell {
             Cell::Null => Ok(None),
             other => T::from_cell(other).map(Some),
         }
+    }
+
+    #[inline]
+    fn from_missing(_key: &str) -> Result<Self, Error> {
+        Ok(None)
     }
 }
 
@@ -213,79 +292,79 @@ impl<T: ToCell> ToCell for Option<T> {
     }
 }
 
+/// Cached column slot for `#[derive(LinRow)]` batch decoding (`FromRow::from_rows`).
+#[doc(hidden)]
+pub struct RowSlot<'k>(crate::store::row::FieldSlot<'k>);
+
+impl<'k> RowSlot<'k> {
+    #[inline]
+    pub fn new(key: &'k str) -> Self {
+        Self(crate::store::row::FieldSlot::new(key))
+    }
+
+    #[inline]
+    pub fn read<T: FromCell>(&mut self, row: &Row) -> Result<T, Error> {
+        match self.0.get(row) {
+            Some(cell) => T::from_cell(cell),
+            None => T::from_missing(self.0.key()),
+        }
+    }
+}
+
 /// Map a Lin [`Row`] into a typed Rust value.
 pub trait FromRow: Sized {
     fn from_row(row: &Row) -> Result<Self, Error>;
+
+    fn from_rows(rows: &[Row]) -> Result<Vec<Self>, Error> {
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            out.push(Self::from_row(row)?);
+        }
+        Ok(out)
+    }
 }
 
 impl FromRow for Row {
+    #[inline]
     fn from_row(row: &Row) -> Result<Self, Error> {
         Ok(row.clone())
     }
-}
 
-impl<A: FromCell> FromRow for (A,) {
-    fn from_row(row: &Row) -> Result<Self, Error> {
-        let mut it = row.values();
-        let a = it
-            .next()
-            .ok_or_else(|| Error::runtime("expected at least 1 column in row"))?;
-        Ok((A::from_cell(a)?,))
+    #[inline]
+    fn from_rows(rows: &[Row]) -> Result<Vec<Self>, Error> {
+        Ok(rows.to_vec())
     }
 }
 
-impl<A: FromCell, B: FromCell> FromRow for (A, B) {
-    fn from_row(row: &Row) -> Result<Self, Error> {
-        let mut it = row.values();
-        let a = it
-            .next()
-            .ok_or_else(|| Error::runtime("expected at least 2 columns in row"))?;
-        let b = it
-            .next()
-            .ok_or_else(|| Error::runtime("expected at least 2 columns in row"))?;
-        Ok((A::from_cell(a)?, B::from_cell(b)?))
-    }
+macro_rules! impl_tuple_from_row {
+    ($err:literal, $($T:ident : $c:ident),+ $(,)?) => {
+        impl<$($T: FromCell),+> FromRow for ($($T,)+) {
+            #[inline]
+            fn from_row(row: &Row) -> Result<Self, Error> {
+                let [$($c),+, ..] = row.cells_slice() else {
+                    return Err(Error::runtime($err));
+                };
+                Ok(($($T::from_cell($c)?,)+))
+            }
+
+            fn from_rows(rows: &[Row]) -> Result<Vec<Self>, Error> {
+                let mut out = Vec::with_capacity(rows.len());
+                for row in rows {
+                    let [$($c),+, ..] = row.cells_slice() else {
+                        return Err(Error::runtime($err));
+                    };
+                    out.push(($($T::from_cell($c)?,)+));
+                }
+                Ok(out)
+            }
+        }
+    };
 }
 
-impl<A: FromCell, B: FromCell, C: FromCell> FromRow for (A, B, C) {
-    fn from_row(row: &Row) -> Result<Self, Error> {
-        let mut it = row.values();
-        let a = it
-            .next()
-            .ok_or_else(|| Error::runtime("expected at least 3 columns in row"))?;
-        let b = it
-            .next()
-            .ok_or_else(|| Error::runtime("expected at least 3 columns in row"))?;
-        let c = it
-            .next()
-            .ok_or_else(|| Error::runtime("expected at least 3 columns in row"))?;
-        Ok((A::from_cell(a)?, B::from_cell(b)?, C::from_cell(c)?))
-    }
-}
-
-impl<A: FromCell, B: FromCell, C: FromCell, D: FromCell> FromRow for (A, B, C, D) {
-    fn from_row(row: &Row) -> Result<Self, Error> {
-        let mut it = row.values();
-        let a = it
-            .next()
-            .ok_or_else(|| Error::runtime("expected at least 4 columns in row"))?;
-        let b = it
-            .next()
-            .ok_or_else(|| Error::runtime("expected at least 4 columns in row"))?;
-        let c = it
-            .next()
-            .ok_or_else(|| Error::runtime("expected at least 4 columns in row"))?;
-        let d = it
-            .next()
-            .ok_or_else(|| Error::runtime("expected at least 4 columns in row"))?;
-        Ok((
-            A::from_cell(a)?,
-            B::from_cell(b)?,
-            C::from_cell(c)?,
-            D::from_cell(d)?,
-        ))
-    }
-}
+impl_tuple_from_row!("expected at least 1 column in row", A: a);
+impl_tuple_from_row!("expected at least 2 columns in row", A: a, B: b);
+impl_tuple_from_row!("expected at least 3 columns in row", A: a, B: b, C: c);
+impl_tuple_from_row!("expected at least 4 columns in row", A: a, B: b, C: c, D: d);
 
 /// Typed collection row: column list + optional default collection name.
 pub trait LinRow: FromRow {
@@ -299,19 +378,20 @@ pub trait LinRow: FromRow {
 }
 
 /// Read a required column via [`FromCell`].
+#[inline]
 pub fn cell_get<T: FromCell>(row: &Row, key: &str) -> Result<T, Error> {
     match row.get(key) {
         Some(cell) => T::from_cell(cell),
         // Rows are sparse: a field never set is absent, not `Null`. A type that accepts
         // `Null` (`Option<T>`) reads that as `None`; any other type reports the column.
-        None => T::from_cell(&Cell::Null)
-            .map_err(|_| Error::runtime(format!("missing column `{key}`"))),
+        None => T::from_missing(key),
     }
 }
 
 /// Map a result set into typed rows.
+#[inline]
 pub fn map_rows<T: FromRow>(rows: &[Row]) -> Result<Vec<T>, Error> {
-    rows.iter().map(T::from_row).collect()
+    T::from_rows(rows)
 }
 
 /// Optional column (`Null` or missing → `None`).

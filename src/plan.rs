@@ -329,9 +329,13 @@ pub fn plan(stmt: &Stmt, cat: &Catalog) -> Result<Plan, Error> {
             edges,
         } => {
             let mut effects = vec![Effect::Create];
-            if records
-                .iter()
-                .any(|r| r.fields.iter().any(|(n, _)| n == "body"))
+            let has_body_col = cat
+                .collection(collection)
+                .is_none_or(|c| c.field("body").is_some());
+            if has_body_col
+                && records
+                    .iter()
+                    .any(|r| r.fields.iter().any(|(n, _)| n == "body"))
             {
                 effects.push(Effect::Body);
             }
@@ -347,7 +351,7 @@ pub fn plan(stmt: &Stmt, cat: &Catalog) -> Result<Plan, Error> {
                 .collect();
             Ok(write_plan(
                 cat,
-                effects.clone(),
+                effects,
                 node(
                     NodeKind::InsertPack {
                         collection: collection.clone(),
@@ -555,7 +559,8 @@ fn plan_query(q: &Query, cat: &Catalog, explain: ExplainKind) -> Result<Plan, Er
 }
 
 fn plan_query_inner(q: &Query, cat: &Catalog, allow_implicit_take: bool) -> Result<Node, Error> {
-    let collection = check::collection_of(&q.source).to_string();
+    use std::borrow::Cow;
+    let collection = check::collection_of(&q.source);
     let mut implicit_take = true;
     let mut take_n: Option<Option<i64>> = None;
     let mut search_k = 50i64;
@@ -581,7 +586,7 @@ fn plan_query_inner(q: &Query, cat: &Catalog, allow_implicit_take: bool) -> Resu
                 implicit_take = false;
                 saw_agg = true;
                 if let Some(by) = by {
-                    push_field(&mut needed, &by.as_str());
+                    push_field(&mut needed, by.as_cow_str());
                 }
             }
             Step::Sum { field, by }
@@ -590,16 +595,16 @@ fn plan_query_inner(q: &Query, cat: &Catalog, allow_implicit_take: bool) -> Resu
             | Step::Avg { field, by } => {
                 implicit_take = false;
                 saw_agg = true;
-                push_field(&mut needed, &field.as_str());
+                push_field(&mut needed, field.as_cow_str());
                 if let Some(by) = by {
-                    push_field(&mut needed, &by.as_str());
+                    push_field(&mut needed, by.as_cow_str());
                 }
             }
             Step::Summarize { specs, by } => {
                 implicit_take = false;
                 saw_agg = true;
                 for gk in by {
-                    push_field(&mut needed, &gk.source_field().as_str());
+                    push_field(&mut needed, gk.source_field().as_cow_str());
                 }
                 for spec in specs {
                     match &spec.func {
@@ -610,11 +615,11 @@ fn plan_query_inner(q: &Query, cat: &Catalog, allow_implicit_take: bool) -> Resu
                         | AggFunc::Max(f)
                         | AggFunc::DCount(f)
                         | AggFunc::Percentile { field: f, .. } => {
-                            push_field(&mut needed, &f.as_str());
+                            push_field(&mut needed, f.as_cow_str());
                         }
                         AggFunc::ArgMax { order, value } | AggFunc::ArgMin { order, value } => {
-                            push_field(&mut needed, &order.as_str());
-                            push_field(&mut needed, &value.as_str());
+                            push_field(&mut needed, order.as_cow_str());
+                            push_field(&mut needed, value.as_cow_str());
                         }
                     }
                 }
@@ -622,9 +627,9 @@ fn plan_query_inner(q: &Query, cat: &Catalog, allow_implicit_take: bool) -> Resu
             Step::ArgExtremum { order, by, .. } => {
                 implicit_take = false;
                 saw_agg = true;
-                push_field(&mut needed, &order.as_str());
+                push_field(&mut needed, order.as_cow_str());
                 for gk in by {
-                    push_field(&mut needed, &gk.source_field().as_str());
+                    push_field(&mut needed, gk.source_field().as_cow_str());
                 }
             }
             Step::Search { mode, .. } => {
@@ -635,34 +640,35 @@ fn plan_query_inner(q: &Query, cat: &Catalog, allow_implicit_take: bool) -> Resu
             }
             Step::Project(fields) => {
                 for f in fields {
-                    push_field(&mut picked, &f.as_str());
-                    push_field(&mut needed, &f.as_str());
+                    let cow = f.as_cow_str();
+                    push_field(&mut picked, Cow::Borrowed(cow.as_ref()));
+                    push_field(&mut needed, cow);
                 }
             }
             Step::Without(excluded) => {
-                if let Some(col) = cat.collection(&collection) {
+                if let Some(col) = cat.collection(collection) {
                     for k in col.fields.keys() {
                         if !excluded.iter().any(|ex| ex.leaf() == Some(k.as_str())) {
-                            push_field(&mut picked, k);
-                            push_field(&mut needed, k);
+                            push_field(&mut picked, Cow::Borrowed(k.as_str()));
+                            push_field(&mut needed, Cow::Borrowed(k.as_str()));
                         }
                     }
                 }
             }
             Step::Filter(pred) => collect_pred_fields(pred, &mut needed),
-            Step::Join { on, .. } => push_field(&mut needed, on),
-            Step::Sort { field, .. } => push_field(&mut needed, &field.as_str()),
+            Step::Join { on, .. } => push_field(&mut needed, Cow::Borrowed(on.as_str())),
+            Step::Sort { field, .. } => push_field(&mut needed, field.as_cow_str()),
             Step::Window {
                 field, by, order, ..
             } => {
                 if let Some(f) = field {
-                    push_field(&mut needed, &f.as_str());
+                    push_field(&mut needed, f.as_cow_str());
                 }
                 for b in by {
-                    push_field(&mut needed, &b.as_str());
+                    push_field(&mut needed, b.as_cow_str());
                 }
                 for s in order {
-                    push_field(&mut needed, &s.field.as_str());
+                    push_field(&mut needed, s.field.as_cow_str());
                 }
             }
             Step::Hop { .. } => {}
@@ -672,7 +678,7 @@ fn plan_query_inner(q: &Query, cat: &Catalog, allow_implicit_take: bool) -> Resu
         }
     }
 
-    let cols = scan_cols(cat, &collection, &needed, &picked, want_search, want_vec);
+    let cols = scan_cols(cat, collection, &needed, &picked, want_search, want_vec);
 
     let mut cur = match &q.source {
         Source::Page(uri) => node(
@@ -687,7 +693,7 @@ fn plan_query_inner(q: &Query, cat: &Catalog, allow_implicit_take: bool) -> Resu
         Source::Catalog => node(
             NodeKind::Scan {
                 collection: "catalog".into(),
-                cols: cols.clone(),
+                cols,
             },
             Backend::Native,
             Effect::Read,
@@ -696,7 +702,7 @@ fn plan_query_inner(q: &Query, cat: &Catalog, allow_implicit_take: bool) -> Resu
         Source::Collection(name) => node(
             NodeKind::Scan {
                 collection: name.clone(),
-                cols: cols.clone(),
+                cols,
             },
             Backend::Native,
             Effect::Read,
@@ -735,7 +741,7 @@ fn plan_query_inner(q: &Query, cat: &Catalog, allow_implicit_take: bool) -> Resu
                 on,
             } => {
                 let fk = cat
-                    .find_fk(&collection, on, right)
+                    .find_fk(collection, on, right)
                     .map(|f| {
                         format!(
                             "{}.{}→{}.{}",
@@ -920,10 +926,10 @@ fn plan_query_inner(q: &Query, cat: &Catalog, allow_implicit_take: bool) -> Resu
                 cur = node(
                     NodeKind::Window {
                         func: func_str,
-                        by: by.iter().map(|b| b.as_str().to_string()).collect(),
+                        by: by.iter().map(Field::as_str).collect(),
                         order: order
                             .iter()
-                            .map(|s| (s.field.as_str().to_string(), s.desc))
+                            .map(|s| (s.field.as_str(), s.desc))
                             .collect(),
                         frame: frame.map(|fr| fr.to_string()),
                         as_field: as_field.clone(),
@@ -988,7 +994,7 @@ fn apply_filter(cur: Node, pred: &Pred, cat: &Catalog) -> Node {
         | NodeKind::IndexSeek { collection, .. } => collection.as_str(),
         _ => "",
     };
-    let extracted = extract_point(pred, cat, col_name);
+    let extracted = extract_point(pred, cat.collection(col_name));
     let mut out = cur;
     if let Some(((field, value), _)) = extracted.as_ref()
         && let NodeKind::Scan { collection, .. } = &out.kind
@@ -996,7 +1002,7 @@ fn apply_filter(cur: Node, pred: &Pred, cat: &Catalog) -> Node {
         out = node(
             NodeKind::Get {
                 collection: collection.clone(),
-                key: format!("{field}={value}"),
+                key: fmt_point_key(field, value),
             },
             Backend::Idb,
             Effect::Read,
@@ -1015,19 +1021,26 @@ fn apply_filter(cur: Node, pred: &Pred, cat: &Catalog) -> Node {
             vec![],
         );
     }
-    if let Some((_, rest)) = extracted {
-        if let Some(rest) = rest.as_ref()
-            && let NodeKind::Filter { pred: existing } = &out.kind
-        {
-            let merged = format!("{existing} and {rest}");
-            out.kind = NodeKind::Filter { pred: merged };
-            return out;
-        } else if let Some(rest) = rest {
-            out = filter_node(out, &rest);
+    if let Some((_, residuals)) = extracted {
+        if !residuals.is_empty() {
+            if let NodeKind::Filter { pred: existing } = &mut out.kind {
+                let extra: usize = residuals
+                    .iter()
+                    .map(|r| 5 + estimate_pred_fmt_len(r))
+                    .sum();
+                existing.reserve(extra);
+                for r in residuals {
+                    existing.push_str(" and ");
+                    fmt_pred_into(existing, r);
+                }
+                return out;
+            }
+            out = filter_node_slice(out, &residuals);
         }
-    } else if let NodeKind::Filter { pred: existing } = &out.kind {
-        let merged = format!("{existing} and {pred}");
-        out.kind = NodeKind::Filter { pred: merged };
+    } else if let NodeKind::Filter { pred: existing } = &mut out.kind {
+        existing.reserve(5 + estimate_pred_fmt_len(pred));
+        existing.push_str(" and ");
+        fmt_pred_into(existing, pred);
         return out;
     } else {
         out = filter_node(out, pred);
@@ -1038,7 +1051,7 @@ fn apply_filter(cur: Node, pred: &Pred, cat: &Catalog) -> Node {
 fn filter_node(inner: Node, pred: &Pred) -> Node {
     node(
         NodeKind::Filter {
-            pred: pred.to_string(),
+            pred: fmt_pred(pred),
         },
         Backend::Native,
         Effect::Read,
@@ -1046,11 +1059,38 @@ fn filter_node(inner: Node, pred: &Pred) -> Node {
     )
 }
 
-fn extract_point(
-    pred: &Pred,
-    cat: &Catalog,
-    collection: &str,
-) -> Option<((String, Value), Option<Pred>)> {
+fn filter_node_slice(inner: Node, preds: &[&Pred]) -> Node {
+    let cap: usize = preds
+        .iter()
+        .map(|p| estimate_pred_fmt_len(p) + 5)
+        .sum();
+    let mut s = String::with_capacity(cap);
+    for (i, p) in preds.iter().enumerate() {
+        if i > 0 {
+            s.push_str(" and ");
+        }
+        fmt_pred_into(&mut s, p);
+    }
+    node(
+        NodeKind::Filter { pred: s },
+        Backend::Native,
+        Effect::Read,
+        vec![inner],
+    )
+}
+
+fn fmt_point_key(field: &str, value: &Value) -> String {
+    let mut key = String::with_capacity(field.len() + 16);
+    key.push_str(field);
+    key.push('=');
+    fmt_value_into(&mut key, value);
+    key
+}
+
+fn extract_point<'a>(
+    pred: &'a Pred,
+    col: Option<&crate::catalog::Collection>,
+) -> Option<((&'a str, &'a Value), smallvec::SmallVec<[&'a Pred; 4]>)> {
     match pred {
         Pred::Cmp {
             field,
@@ -1058,28 +1098,22 @@ fn extract_point(
             value,
         } if field.parts.len() == 1
             && (matches!(field.parts[0].as_str(), "id" | "uri")
-                || cat
-                    .collection(collection)
+                || col
                     .and_then(|c| c.field(&field.parts[0]))
                     .is_some_and(|f| f.unique))
             && matches!(value, Value::String(_) | Value::Param(_)) =>
         {
-            Some(((field.parts[0].clone(), value.clone()), None))
+            Some(((field.parts[0].as_str(), value), smallvec::SmallVec::new()))
         }
         Pred::And(a, b) => {
-            if let Some((pa, ra)) = extract_point(a, cat, collection) {
-                let rest = Some(match ra {
-                    Some(r) => r.and((**b).clone()),
-                    None => (**b).clone(),
-                });
-                return Some((pa, rest));
+            if let Some((pa, mut ra)) = extract_point(a, col) {
+                ra.push(b);
+                return Some((pa, ra));
             }
-            if let Some((pb, rb)) = extract_point(b, cat, collection) {
-                let rest = Some(match rb {
-                    Some(r) => (**a).clone().and(r),
-                    None => (**a).clone(),
-                });
-                return Some((pb, rest));
+            if let Some((pb, rb)) = extract_point(b, col) {
+                let mut out = smallvec::smallvec![a.as_ref()];
+                out.extend(rb);
+                return Some((pb, out));
             }
             None
         }
@@ -1255,34 +1289,43 @@ fn join_right_cols(cat: &Catalog, collection: &str) -> Vec<String> {
 }
 
 fn collect_pred_fields(pred: &Pred, needed: &mut Vec<String>) {
-    let mut fields = Vec::new();
-    pred.walk_fields(&mut fields);
-    for f in fields {
-        push_field(needed, &f.as_cow_str());
+    match pred {
+        Pred::And(a, b) | Pred::Or(a, b) => {
+            collect_pred_fields(a, needed);
+            collect_pred_fields(b, needed);
+        }
+        Pred::Not(inner) => collect_pred_fields(inner, needed),
+        Pred::Cmp { field, .. }
+        | Pred::IsNull { field, .. }
+        | Pred::In { field, .. }
+        | Pred::Has { field, .. }
+        | Pred::Contains { field, .. }
+        | Pred::Regex { field, .. } => push_field(needed, field.as_cow_str()),
     }
 }
 
-fn push_field(out: &mut Vec<String>, name: &str) {
-    if !out.iter().any(|x| x == name) {
-        out.push(name.to_string());
+#[inline]
+fn push_field(out: &mut Vec<String>, name: std::borrow::Cow<'_, str>) {
+    if !out.iter().any(|x| x == name.as_ref()) {
+        out.push(name.into_owned());
     }
 }
 
 fn point_or_scan(collection: &str, pred: Option<&Pred>, cat: &Catalog) -> Node {
     if let Some(p) = pred
-        && let Some(((field, value), rest)) = extract_point(p, cat, collection)
+        && let Some(((field, value), residuals)) = extract_point(p, cat.collection(collection))
     {
         let mut n = node(
             NodeKind::Get {
                 collection: collection.to_string(),
-                key: format!("{field}={value}"),
+                key: fmt_point_key(field, value),
             },
             Backend::Idb,
             Effect::Read,
             vec![],
         );
-        if let Some(rest) = rest {
-            n = filter_node(n, &rest);
+        if !residuals.is_empty() {
+            n = filter_node_slice(n, &residuals);
         }
         return n;
     }
@@ -1431,10 +1474,201 @@ fn decl_detail(d: &Decl) -> String {
     }
 }
 
+#[inline]
+fn push_i64(out: &mut String, n: i64) {
+    let mut u = if n < 0 {
+        out.push('-');
+        n.wrapping_neg() as u64
+    } else {
+        n as u64
+    };
+    let mut buf = [0u8; 20];
+    let mut i = 20;
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (u % 10) as u8;
+        u /= 10;
+        if u == 0 {
+            break;
+        }
+    }
+    // SAFETY: `buf[i..]` contains only ASCII digits `'0'..='9'`.
+    out.push_str(unsafe { std::str::from_utf8_unchecked(&buf[i..]) });
+}
+
+#[inline]
+fn fmt_field_into(out: &mut String, field: &Field) {
+    match field.parts.as_slice() {
+        [p] => out.push_str(p),
+        parts => {
+            for (i, p) in parts.iter().enumerate() {
+                if i > 0 {
+                    out.push('.');
+                }
+                out.push_str(p);
+            }
+        }
+    }
+}
+
+#[inline]
+fn fmt_debug_str_into(out: &mut String, s: &str) {
+    let trivial = s
+        .as_bytes()
+        .iter()
+        .all(|&b| (0x20..=0x7E).contains(&b) && b != b'"' && b != b'\\');
+    if trivial {
+        out.push('"');
+        out.push_str(s);
+        out.push('"');
+    } else {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{s:?}");
+    }
+}
+
+#[inline]
+pub(crate) fn fmt_value_into(out: &mut String, v: &Value) {
+    match v {
+        Value::String(s) => fmt_debug_str_into(out, s),
+        Value::Int(n) => push_i64(out, *n),
+        Value::Float(n) => {
+            use std::fmt::Write as _;
+            let _ = write!(out, "{n}");
+        }
+        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        Value::Timestamp(millis) => {
+            out.push_str("timestamp(");
+            push_i64(out, *millis);
+            out.push(')');
+        }
+        Value::Now => out.push_str("now"),
+        Value::NowMinus(d) => {
+            out.push_str("now - ");
+            push_i64(out, d.n);
+            out.push(d.unit.as_char());
+        }
+        Value::Duration(d) => {
+            push_i64(out, d.n);
+            out.push(d.unit.as_char());
+        }
+        Value::Name(n) => out.push_str(n),
+        Value::Param(p) => {
+            out.push('$');
+            out.push_str(p);
+        }
+    }
+}
+
+fn estimate_pred_fmt_len(pred: &Pred) -> usize {
+    match pred {
+        Pred::And(a, b) => estimate_pred_fmt_len(a) + 5 + estimate_pred_fmt_len(b),
+        Pred::Or(a, b) => estimate_pred_fmt_len(a) + 4 + estimate_pred_fmt_len(b),
+        Pred::Not(inner) => 6 + estimate_pred_fmt_len(inner),
+        Pred::Cmp { field, value, .. } => {
+            let vlen = match value {
+                Value::String(s) => s.len() + 2,
+                Value::Name(s) => s.len(),
+                Value::Param(s) => s.len() + 1,
+                _ => 12,
+            };
+            field.parts.iter().map(String::len).sum::<usize>() + 5 + vlen
+        }
+        Pred::IsNull { field, negated } => {
+            field.parts.iter().map(String::len).sum::<usize>() + if *negated { 13 } else { 9 }
+        }
+        Pred::In { field, values } => {
+            field.parts.iter().map(String::len).sum::<usize>() + 6 + values.len() * 10
+        }
+        Pred::Has { field, ci, needle } => {
+            field.parts.iter().map(String::len).sum::<usize>()
+                + if *ci { 10 } else { 7 }
+                + needle.len()
+        }
+        Pred::Contains { field, needle } => {
+            field.parts.iter().map(String::len).sum::<usize>() + 5 + needle.len()
+        }
+        Pred::Regex {
+            field,
+            pattern,
+            flags,
+        } => {
+            field.parts.iter().map(String::len).sum::<usize>() + 5 + pattern.len() + flags.len()
+        }
+    }
+}
+
+pub(crate) fn fmt_pred_into(out: &mut String, pred: &Pred) {
+    match pred {
+        Pred::And(a, b) => {
+            fmt_pred_into(out, a);
+            out.push_str(" and ");
+            fmt_pred_into(out, b);
+        }
+        Pred::Or(a, b) => {
+            fmt_pred_into(out, a);
+            out.push_str(" or ");
+            fmt_pred_into(out, b);
+        }
+        Pred::Not(inner) => {
+            out.push_str("not (");
+            fmt_pred_into(out, inner);
+            out.push(')');
+        }
+        Pred::Cmp { field, op, value } => {
+            fmt_field_into(out, field);
+            out.push(' ');
+            out.push_str(op.as_str());
+            out.push(' ');
+            fmt_value_into(out, value);
+        }
+        Pred::IsNull { field, negated } => {
+            fmt_field_into(out, field);
+            out.push_str(if *negated { " is not null" } else { " is null" });
+        }
+        Pred::In { field, values } => {
+            fmt_field_into(out, field);
+            out.push_str(" in [");
+            for (i, v) in values.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                fmt_value_into(out, v);
+            }
+            out.push(']');
+        }
+        Pred::Has { field, ci, needle } => {
+            fmt_field_into(out, field);
+            out.push_str(if *ci { " has ci " } else { " has " });
+            fmt_debug_str_into(out, needle);
+        }
+        Pred::Contains { field, needle } => {
+            fmt_field_into(out, field);
+            out.push_str(" ~ ");
+            fmt_debug_str_into(out, needle);
+        }
+        Pred::Regex {
+            field,
+            pattern,
+            flags,
+        } => {
+            fmt_field_into(out, field);
+            out.push_str(" ~ /");
+            out.push_str(pattern);
+            out.push('/');
+            out.push_str(flags);
+        }
+    }
+}
+
 pub fn fmt_pred(pred: &Pred) -> String {
-    pred.to_string()
+    let mut out = String::with_capacity(estimate_pred_fmt_len(pred));
+    fmt_pred_into(&mut out, pred);
+    out
 }
 
 pub fn fmt_value(v: &Value) -> String {
-    v.to_string()
+    let mut out = String::with_capacity(16);
+    fmt_value_into(&mut out, v);
+    out
 }
